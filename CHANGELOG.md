@@ -7,6 +7,11 @@ threat-model citations because this crate's audit story is the point.
 
 ## [Unreleased]
 
+## [53.1.3] - UNRELEASED
+
+### Codex on #985 (CIRISPersist#986) — four findings against v53.1.2, confirmed and fixed
+_(bullets land with each fix)_
+
 ## [53.1.2] - 2026-10-05
 
 ### Operator ruling recorded — the canonical-1 serve-record split is ACCEPTED

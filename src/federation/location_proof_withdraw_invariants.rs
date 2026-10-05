@@ -140,6 +140,157 @@ pub(crate) mod bodies {
 }
 
 #[cfg(test)]
+pub(crate) mod reindex_bodies {
+    use crate::federation::tier_ingest::test_support as ts;
+    use crate::federation::types::LocationProof;
+    use crate::federation::wire_index::content_hash_of_bytes;
+    use crate::federation::{FederationDirectory, SignedLocationProof};
+    use chrono::{DateTime, Duration, Utc};
+
+    fn proof(
+        subject: &str,
+        cell: &str,
+        at: DateTime<Utc>,
+        withdrawn_at: Option<DateTime<Utc>>,
+    ) -> LocationProof {
+        LocationProof {
+            subject_key_id: subject.to_owned(),
+            cell_id: cell.to_owned(),
+            cell_resolution: 7,
+            asserted_at: at,
+            valid_until: None,
+            attestation_evidence: None,
+            withdrawn_at,
+            persist_row_hash: String::new(),
+        }
+    }
+
+    fn cell() -> String {
+        h3o::LatLng::new(37.0, -122.0)
+            .unwrap()
+            .to_cell(h3o::Resolution::Seven)
+            .to_string()
+    }
+
+    /// The row as A serves it for `subject`, and its wire content hash (what
+    /// `settle_if_held` / `lookup_signed_record_by_content_hash` key on).
+    async fn served(d: &dyn FederationDirectory, subject: &str) -> (SignedLocationProof, String) {
+        let s = d
+            .list_signed_location_proofs_since(None, 10_000)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|s| s.proof.location_proof.subject_key_id == subject)
+            .expect("the row is served");
+        let hash = content_hash_of_bytes(&serde_json::to_vec(&s.proof).unwrap());
+        (s.proof, hash)
+    }
+
+    /// **I523** (v53.1.3, Codex on #985 P1, #986) — **a withdrawal is
+    /// re-indexed.** The withdraw door rewrote the row's hash and signatures
+    /// and returned without `index_stored_record`, so the signed wire index
+    /// kept the OLD content hash: a peer re-offering the withdrawal found no
+    /// entry under its hash (full apply), and the old hash reloaded bytes that
+    /// no longer matched. After: the withdrawn row's hash resolves to the row;
+    /// the pre-withdrawal hash resolves to nothing.
+    pub(crate) async fn i523_a_withdrawal_is_reindexed(d: &dyn FederationDirectory, tag: &str) {
+        let subject = format!("i523-s-{tag}");
+        ts::register_hybrid_key(d, &subject).await;
+        let (cell, at) = (
+            cell(),
+            "2026-10-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap(),
+        );
+        d.put_location_proof(ts::sign_location_proof(
+            &subject,
+            proof(&subject, &cell, at, None),
+        ))
+        .await
+        .expect("the proof");
+        let (_, hash0) = served(d, &subject).await;
+        assert!(
+            d.lookup_signed_record_by_content_hash("LocationProof", &hash0)
+                .await
+                .unwrap()
+                .is_some(),
+            "I523 precondition — the put indexed the row"
+        );
+        d.withdraw_location_proof(ts::sign_location_proof(
+            &subject,
+            proof(&subject, &cell, at, Some(at + Duration::hours(1))),
+        ))
+        .await
+        .expect("the withdrawal");
+        let (withdrawn, hash1) = served(d, &subject).await;
+        assert!(withdrawn.location_proof.withdrawn_at.is_some());
+        let found = d
+            .lookup_signed_record_by_content_hash("LocationProof", &hash1)
+            .await
+            .unwrap();
+        assert_eq!(
+            found.as_deref(),
+            Some(serde_json::to_vec(&withdrawn).unwrap().as_slice()),
+            "I523 the withdrawn row resolves under its own content hash"
+        );
+        assert!(
+            d.lookup_signed_record_by_content_hash("LocationProof", &hash0)
+                .await
+                .unwrap()
+                .is_none(),
+            "I523 the pre-withdrawal hash resolves to nothing"
+        );
+    }
+
+    /// **I524** (v53.1.3, Codex on #985 P2, #986) — **the withdrawal write is
+    /// a compare-and-set.** Two valid withdrawals of one proof decided `Apply`
+    /// from the same `None` read; the later UPDATE overwrote the first's
+    /// instant and signature. With `… AND withdrawn_at IS NULL`, the loser
+    /// writes nothing, re-reads, and answers already-withdrawn. `arm` plants
+    /// the rival at the point between the door's read and its write.
+    pub(crate) async fn i524_the_withdrawal_write_is_a_compare_and_set<B>(
+        b: &B,
+        tag: &str,
+        arm: fn(&B, SignedLocationProof),
+    ) where
+        B: FederationDirectory + Sync,
+    {
+        let subject = format!("i524-s-{tag}");
+        ts::register_hybrid_key(b, &subject).await;
+        let (cell, at) = (
+            cell(),
+            "2026-10-02T00:00:00Z".parse::<DateTime<Utc>>().unwrap(),
+        );
+        b.put_location_proof(ts::sign_location_proof(
+            &subject,
+            proof(&subject, &cell, at, None),
+        ))
+        .await
+        .expect("the proof");
+        let (ta, tb) = (at + Duration::hours(1), at + Duration::hours(2));
+        let rival = ts::sign_location_proof(&subject, proof(&subject, &cell, at, Some(tb)));
+        arm(b, rival);
+        // A reads the row unwithdrawn and decides Apply; the rival (B, at tb)
+        // lands before A's write; A's write must not overwrite it.
+        b.withdraw_location_proof(ts::sign_location_proof(
+            &subject,
+            proof(&subject, &cell, at, Some(ta)),
+        ))
+        .await
+        .expect("I524 the loser answers already-withdrawn, not an error");
+        let held = b.list_location_proofs_for(&subject).await.unwrap();
+        assert_eq!(
+            held[0].withdrawn_at,
+            Some(tb),
+            "I524 the withdrawal that landed first stands: {held:?}"
+        );
+        let (srv, _) = served(b, &subject).await;
+        assert_eq!(srv.location_proof.withdrawn_at, Some(tb));
+        crate::federation::verify_location_proof_admission(b, &srv)
+            .await
+            .expect("I524 the served row is the first withdrawal, whole: its signature verifies");
+    }
+}
+
+#[cfg(test)]
 pub(crate) mod peer_bodies {
     use crate::federation::location::member_in_geographic_constraint;
     use crate::federation::tier_ingest::test_support as ts;
@@ -283,6 +434,15 @@ mod runners {
                     .await
                 }
                 #[tokio::test]
+                async fn i523() {
+                    let Some(d) = $fresh.await else { return };
+                    super::super::reindex_bodies::i523_a_withdrawal_is_reindexed(
+                        &d as &dyn FederationDirectory,
+                        &super::suffix(),
+                    )
+                    .await
+                }
+                #[tokio::test]
                 async fn i522() {
                     let Some(a) = $fresh.await else { return };
                     let Some(b) = $fresh.await else { return };
@@ -321,4 +481,41 @@ mod runners {
         b.run_migrations().await.unwrap();
         Some(b)
     });
+
+    /// I524 needs the backend's own rival seam (memory writes under one lock
+    /// and has no race to witness).
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn i524_sqlite() {
+        use crate::store::Backend as _;
+        let b = crate::store::sqlite::SqliteBackend::open_in_memory()
+            .await
+            .unwrap();
+        b.run_migrations().await.unwrap();
+        super::reindex_bodies::i524_the_withdrawal_write_is_a_compare_and_set(
+            &b,
+            &suffix(),
+            |b, rival| b.test_hooks().arm_rival_location_proof_withdrawal(rival),
+        )
+        .await
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn i524_postgres() {
+        use crate::store::Backend as _;
+        let Some(dsn) = crate::test_pg::empty_dsn() else {
+            return;
+        };
+        let b = crate::store::postgres::PostgresBackend::connect(&dsn)
+            .await
+            .unwrap();
+        b.run_migrations().await.unwrap();
+        super::reindex_bodies::i524_the_withdrawal_write_is_a_compare_and_set(
+            &b,
+            &suffix(),
+            |b, rival| b.test_hooks().arm_rival_location_proof_withdrawal(rival),
+        )
+        .await
+    }
 }

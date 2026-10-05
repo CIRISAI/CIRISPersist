@@ -306,6 +306,18 @@ impl SqliteBackend {
         Ok(())
     }
 
+    /// v53.1.3 (#986) — the test-only rival WITHDRAWAL armed for the point
+    /// between a withdrawal's held read and its write, applied through this
+    /// backend's own withdraw door. Never armed outside a test.
+    #[cfg(test)]
+    async fn test_rival_location_proof_withdrawal(&self) -> Result<(), crate::federation::Error> {
+        if let Some(rival) = self.test_hooks.take_rival_location_proof_withdrawal() {
+            Box::pin(crate::federation::FederationDirectory::withdraw_location_proof(self, rival))
+                .await?;
+        }
+        Ok(())
+    }
+
     /// #840 (I44) — normalise a V070 history row written by v43.0.0–v44.1.0.
     ///
     /// Those releases shipped V070 with one word changed inside a comment,
@@ -9776,6 +9788,8 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             LocationProofWithdrawal::AlreadyWithdrawn => return Ok(()),
             LocationProofWithdrawal::Apply => {}
         }
+        #[cfg(test)]
+        self.test_rival_location_proof_withdrawal().await?;
         let mut row = proof.location_proof;
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
         let withdrawn_at = row.withdrawn_at.map(|t| t.to_rfc3339());

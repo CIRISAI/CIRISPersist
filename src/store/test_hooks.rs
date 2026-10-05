@@ -41,6 +41,13 @@ pub(crate) struct TestHooks {
     /// replicated door when its next community write reaches `RivalPoint` —
     /// a rival that won the race at exactly that point.
     rival_community_write: Mutex<Option<(RivalPoint, crate::federation::SignedCommunity)>>,
+    /// v53.1.3 (Codex on #985, #986) — a withdrawn location proof the backend
+    /// applies to ITSELF through `withdraw_location_proof` when its next
+    /// withdrawal reaches the point between the door's held read (decided
+    /// `Apply`) and its UPDATE: a SECOND withdrawal of the same proof that
+    /// won the race at exactly that point. One point, so it carries no
+    /// `RivalPoint`.
+    rival_location_proof_withdrawal: Mutex<Option<crate::federation::SignedLocationProof>>,
 }
 
 // The witnesses that arm these are cfg'd on a database feature; under the
@@ -78,6 +85,28 @@ impl TestHooks {
         rival: crate::federation::SignedCommunity,
     ) {
         *self.rival_community_write.lock().expect("test hooks") = Some((at, rival));
+    }
+
+    /// v53.1.3 (#986) — arm a rival withdrawal: when the next location-proof
+    /// withdrawal reaches its write, the backend applies `rival` first.
+    pub(crate) fn arm_rival_location_proof_withdrawal(
+        &self,
+        rival: crate::federation::SignedLocationProof,
+    ) {
+        *self
+            .rival_location_proof_withdrawal
+            .lock()
+            .expect("test hooks") = Some(rival);
+    }
+
+    /// Taken (once) by the backend before its withdrawal write.
+    pub(crate) fn take_rival_location_proof_withdrawal(
+        &self,
+    ) -> Option<crate::federation::SignedLocationProof> {
+        self.rival_location_proof_withdrawal
+            .lock()
+            .expect("test hooks")
+            .take()
     }
 
     /// Taken (once) by the backend at `at`: the rival armed for that point.
