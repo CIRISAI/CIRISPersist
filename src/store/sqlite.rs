@@ -14551,11 +14551,13 @@ impl crate::federation::BlobStorage for SqliteBackend {
         cohort_scope: &str,
         floor: crate::federation::StorageFloor,
         author_key_id: Option<&str>,
+        group_key_id: Option<&str>,
     ) -> Result<(), crate::federation::BlobError> {
         floor.check_scope(cohort_scope)?;
         let scope = cohort_scope.to_owned();
         let tier = floor.tier().as_str().to_owned();
         let author = author_key_id.map(str::to_owned);
+        let group = group_key_id.map(str::to_owned);
         let cap = self.inline_bytes_cap();
         if let crate::federation::BlobBody::Inline(ref bytes) = body {
             if bytes.len() > cap {
@@ -14597,10 +14599,12 @@ impl crate::federation::BlobStorage for SqliteBackend {
 
         self.write(move |conn| -> Result<(), rusqlite::Error> {
             conn.execute(
+                // #984 (V177) — the group the write named, on the row.
                 "INSERT INTO federation_blobs (\
                     sha256, storage_kind, bytes_inline, external_ref, size_bytes, media_type, \
-                    last_accessed_at, access_count, cohort_scope, crypto_tier, author_key_id\
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8, ?9, ?10) \
+                    last_accessed_at, access_count, cohort_scope, crypto_tier, author_key_id, \
+                    group_key_id\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8, ?9, ?10, ?11) \
                  ON CONFLICT (sha256) DO NOTHING",
                 rusqlite::params![
                     sha_vec,
@@ -14613,6 +14617,7 @@ impl crate::federation::BlobStorage for SqliteBackend {
                     scope,
                     tier,
                     author,
+                    group,
                 ],
             )?;
             Ok(())
@@ -15646,28 +15651,32 @@ impl crate::federation::BlobStorage for SqliteBackend {
         &self,
         recipients: &[String],
         cohort_scope: &str,
+        group_key_id: &str,
     ) -> Result<Vec<crate::federation::StreamDekRecord>, crate::federation::BlobError> {
         if recipients.is_empty() {
             return Ok(Vec::new());
         }
         let recipients = recipients.to_vec();
         let scope = cohort_scope.to_owned();
+        let group = group_key_id.to_owned();
         self.read(
             move |conn| -> Result<Vec<crate::federation::StreamDekRecord>, rusqlite::Error> {
                 let marks = (0..recipients.len())
-                    .map(|i| format!("?{}", i + 2))
+                    .map(|i| format!("?{}", i + 3))
                     .collect::<Vec<_>>()
                     .join(", ");
+                // #984 (row 1) — the GROUP bounds the set: a recipient in two
+                // families holds both families' epochs.
                 let mut st = conn.prepare(&format!(
                     "{SQLITE_STREAM_DEK_SELECT} \
-                      WHERE d.cohort_scope = ?1 \
+                      WHERE d.cohort_scope = ?1 AND d.group_key_id = ?2 \
                         AND EXISTS(SELECT 1 FROM federation_stream_dek_grants g \
                                     WHERE g.stream_id = d.stream_id AND g.epoch = d.epoch \
                                       AND g.sealer_key_id = d.owner_key_id \
                                       AND g.recipient_key_id IN ({marks})) \
                       ORDER BY d.stream_id, d.epoch"
                 ))?;
-                let mut params: Vec<SqlValue> = vec![SqlValue::Text(scope)];
+                let mut params: Vec<SqlValue> = vec![SqlValue::Text(scope), SqlValue::Text(group)];
                 params.extend(recipients.into_iter().map(SqlValue::Text));
                 let rows = st.query_map(params_from_iter(params), sqlite_stream_dek_row)?;
                 rows.collect()
@@ -16598,19 +16607,22 @@ impl crate::federation::BlobStorage for SqliteBackend {
         &self,
         recipient_key_ids: &[String],
         cohort_scope: &str,
+        group_key_id: &str,
     ) -> Result<Vec<[u8; 32]>, crate::federation::BlobError> {
         if recipient_key_ids.is_empty() {
             return Ok(Vec::new());
         }
         let recipients: Vec<String> = recipient_key_ids.to_vec();
         let scope = cohort_scope.to_owned();
+        let group = group_key_id.to_owned();
         let shas = self
             .read(move |conn| -> Result<Vec<Vec<u8>>, rusqlite::Error> {
                 // The recipient IN-list is built from BOUND placeholders
-                // (?2, ?3, …) — values, not identifiers; no injection surface.
+                // (?3, ?4, …) — values, not identifiers; no injection surface.
                 let mut params: Vec<rusqlite::types::Value> =
-                    Vec::with_capacity(recipients.len() + 1);
+                    Vec::with_capacity(recipients.len() + 2);
                 params.push(scope.into());
+                params.push(group.into());
                 let placeholders: Vec<String> = recipients
                     .into_iter()
                     .map(|r| {
@@ -16618,8 +16630,12 @@ impl crate::federation::BlobStorage for SqliteBackend {
                         format!("?{}", params.len())
                     })
                     .collect();
+                // #984 (row 1, V177) — the blob ROW's group bounds the set; a
+                // NULL group (pre-V177, adopted) never matches: fail-secure.
                 let sql = format!(
                     "SELECT DISTINCT g.at_rest_sha256 FROM federation_blob_key_grants g \
+                 JOIN federation_blobs b ON b.sha256 = g.at_rest_sha256 \
+                                        AND b.group_key_id = ?2 \
                  WHERE g.cohort_scope = ?1 AND g.recipient_key_id IN ({}) \
                    AND EXISTS (SELECT 1 FROM federation_blob_key_grants s \
                                 WHERE s.at_rest_sha256 = g.at_rest_sha256 \
@@ -17046,6 +17062,8 @@ impl crate::federation::BlobStorage for SqliteBackend {
         let tier = floor.tier().as_str().to_owned();
         let media = media_type.map(str::to_owned);
         let bind = binding.clone();
+        // #984 (V177) — the group the seal named, on the root and each child.
+        let group = spec.group_key_id.clone();
         for c in &spec.children {
             if c.body.len() > cap {
                 return Err(crate::federation::BlobError::InlineSizeExceeded {
@@ -17105,9 +17123,11 @@ impl crate::federation::BlobStorage for SqliteBackend {
                 // this transaction. NULL for an unclaimed stream.
                 "INSERT INTO federation_blobs (\
                     sha256, storage_kind, bytes_inline, external_ref, size_bytes, media_type, \
-                    last_accessed_at, access_count, cohort_scope, crypto_tier, author_key_id\
+                    last_accessed_at, access_count, cohort_scope, crypto_tier, author_key_id, \
+                    group_key_id\
                  ) VALUES (?1, 'chunk_dag', ?2, NULL, ?3, ?4, ?5, 0, ?6, ?7, \
-                           (SELECT owner_key_id FROM federation_streams WHERE stream_id = ?8)) \
+                           (SELECT owner_key_id FROM federation_streams WHERE stream_id = ?8), \
+                           ?9) \
                  ON CONFLICT (sha256) DO NOTHING",
                 rusqlite::params![
                     sha_vec,
@@ -17117,7 +17137,8 @@ impl crate::federation::BlobStorage for SqliteBackend {
                     now_iso,
                     scope,
                     tier,
-                    stream_id_owned
+                    stream_id_owned,
+                    group
                 ],
             )?;
             if let Some(b) = &bind {
@@ -17155,11 +17176,22 @@ impl crate::federation::BlobStorage for SqliteBackend {
                 tx.execute(
                     "INSERT INTO federation_blobs (\
                         sha256, storage_kind, bytes_inline, external_ref, size_bytes, media_type, \
-                        last_accessed_at, access_count, cohort_scope, crypto_tier, author_key_id\
+                        last_accessed_at, access_count, cohort_scope, crypto_tier, author_key_id, \
+                        group_key_id\
                      ) VALUES (?1, 'inline', ?2, NULL, ?3, NULL, ?4, 0, ?5, ?6, \
-                               (SELECT owner_key_id FROM federation_streams WHERE stream_id = ?7)) \
+                               (SELECT owner_key_id FROM federation_streams WHERE stream_id = ?7), \
+                               ?8) \
                      ON CONFLICT (sha256) DO NOTHING",
-                    rusqlite::params![child_sha, body, len, now_iso, scope, tier, stream_id_owned],
+                    rusqlite::params![
+                        child_sha,
+                        body,
+                        len,
+                        now_iso,
+                        scope,
+                        tier,
+                        stream_id_owned,
+                        group
+                    ],
                 )?;
                 if let Some(b) = &bind {
                     let ep = i64::try_from(b.epoch).unwrap_or(i64::MAX);
@@ -17893,7 +17925,7 @@ impl crate::federation::BlobStorage for SqliteBackend {
         self.read(
             move |conn| -> Result<Option<crate::federation::BlobProvenanceRow>, rusqlite::Error> {
                 conn.query_row(
-                    "SELECT b.author_key_id, b.cohort_scope, e.community_key_id \
+                    "SELECT b.author_key_id, b.cohort_scope, e.community_key_id, b.group_key_id \
                        FROM federation_blobs b \
                        LEFT JOIN federation_community_blob_epoch e ON e.at_rest_sha256 = b.sha256 \
                       WHERE b.sha256 = ?1",
@@ -17903,6 +17935,7 @@ impl crate::federation::BlobStorage for SqliteBackend {
                             author_key_id: r.get(0)?,
                             cohort_scope: r.get(1)?,
                             community_key_id: r.get(2)?,
+                            group_key_id: r.get(3)?,
                         })
                     },
                 )
@@ -19388,6 +19421,9 @@ struct SqliteChunkTx<'a> {
     scope: &'a str,
     tier: &'a str,
     owner_key_id: Option<&'a str>,
+    /// #984 (V177) — the group the append named (the claim's
+    /// `community_key_id`: owner, family or community), on each chunk row.
+    group_key_id: Option<&'a str>,
     now_iso: &'a str,
     binding: Option<&'a crate::federation::EpochBinding>,
     bind_as_declared: bool,
@@ -19443,8 +19479,9 @@ fn sqlite_append_chunk_item(
         let mut st = conn.prepare_cached(
             "INSERT INTO federation_blobs (\
                 sha256, storage_kind, bytes_inline, external_ref, size_bytes, media_type, \
-                last_accessed_at, access_count, cohort_scope, crypto_tier, author_key_id\
-             ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, 0, ?7, ?8, ?9) \
+                last_accessed_at, access_count, cohort_scope, crypto_tier, author_key_id, \
+                group_key_id\
+             ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, 0, ?7, ?8, ?9, ?10) \
              ON CONFLICT (sha256) DO NOTHING",
         )?;
         st.execute(rusqlite::params![
@@ -19457,6 +19494,7 @@ fn sqlite_append_chunk_item(
             c.scope,
             c.tier,
             c.owner_key_id,
+            c.group_key_id,
         ])?;
         *steps += vm_steps(&st);
     }
@@ -19813,6 +19851,7 @@ impl SqliteBackend {
                     scope: &scope,
                     tier: &tier,
                     owner_key_id: claim_tx.owner_key_id.as_deref(),
+                    group_key_id: claim_tx.community_key_id.as_deref(),
                     now_iso: &now_iso,
                     binding: bind.as_ref(),
                     bind_as_declared,
@@ -42611,6 +42650,7 @@ mod tests {
                 crate::federation::StorageFloor::resolved(
                     crate::federation::types::cohort_scope::CryptoTier::Plaintext,
                 ),
+                None,
                 None,
             )
             .await

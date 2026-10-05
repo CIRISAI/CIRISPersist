@@ -1,0 +1,36 @@
+-- V177 — the blob row names the group it was sealed for, SQLite dialect
+-- CIRISPersist#984 (rows 1 and 4)
+--
+-- POSTGRES PARITY: migrations/postgres/lens/V177__blob_group_key_id.sql
+--
+-- A stream epoch's DEK row carried its group (`federation_stream_deks.
+-- group_key_id`, V166); the blob row did not. `federation_blobs` recorded
+-- the cohort (`cohort_scope`, V139) and the author (`author_key_id`, V144)
+-- and dropped the owner / family key every self/family cascade was handed.
+-- Two consequences:
+--
+--   row 1  the retroactive-ADD walk's cohort-visibility set was "every
+--          blob and every stream epoch at this scope that any existing
+--          member holds a wrap on". A person active in TWO families holds
+--          both families' keys, so growing family A by a newcomer wrapped
+--          family B's content to them — a disclosure across families.
+--   row 4  `durability_deficit` resolved a family blob's audience from the
+--          row's community binding, which a family row never has, so
+--          every family blob's audience was Unresolvable: an empty
+--          deficit, nothing ever reported missing.
+--
+--   group_key_id    the group the write NAMED: the owner identity (self),
+--                   the family key (family), or the community key — what
+--                   the scoped doors receive as their `community_key_id`
+--                   argument. NULL = unknown (a pre-V177 row, an adopted
+--                   row, or a write that named no group: the commons).
+--
+-- Backfill: NONE. Nothing on disk records the group of a pre-V177 row (a
+-- self/family row is never announced, and its grants name recipients, not
+-- the group), so any value written here would be a guess dressed as a
+-- fact. The retroactive-ADD listings join on this column and EXCLUDE a
+-- NULL-group row: an unknown family is not this family (fail-secure), and
+-- v53 carries no cross-version promise for rows sealed before it.
+
+ALTER TABLE federation_blobs
+    ADD COLUMN group_key_id TEXT NULL;

@@ -209,11 +209,16 @@ where
         .ok_or_else(|| BlobError::NotHeld {
             sha256_hex: hex::encode(at_rest_sha256),
         })?;
+    // v53.1.2 (#984 row 4) — the group is the epoch binding's community for
+    // a community row, else the group the row itself records (V177): a
+    // family row has no binding, and resolved to nothing before.
     let audience = content_audience(
         backend,
         &prov.cohort_scope,
         prov.author_key_id.as_deref(),
-        prov.community_key_id.as_deref(),
+        prov.community_key_id
+            .as_deref()
+            .or(prov.group_key_id.as_deref()),
     )
     .await
     .map_err(|e| BlobError::Backend(format!("durability deficit: audience: {e}")))?;

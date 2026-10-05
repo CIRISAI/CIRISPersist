@@ -1072,6 +1072,7 @@ pub mod orchestrate {
                             size_bytes: total_size,
                             expected_chunk_count: chunk_count,
                             children: Vec::new(),
+                            group_key_id: community_key_id.map(str::to_owned),
                         },
                         media_type,
                         cohort_scope,
@@ -1139,6 +1140,9 @@ pub mod orchestrate {
                             body,
                             expected_chunk_count: chunk_count,
                             children: child_rows,
+                            // #984 (V177) — the owner / family the manifest
+                            // (and its children) are sealed for.
+                            group_key_id: Some(owner.to_owned()),
                         },
                         media_type,
                         cohort_scope,
@@ -1280,6 +1284,7 @@ pub mod orchestrate {
                                 body: body.clone(),
                                 expected_chunk_count: chunk_count,
                                 children: child_rows,
+                                group_key_id: Some(comm.to_owned()),
                             },
                             media_type,
                             cohort_scope,
@@ -5129,6 +5134,7 @@ pub mod invariants {
                     body,
                     expected_chunk_count: 2,
                     children: Vec::new(),
+                    group_key_id: Some(comm.clone()),
                 },
                 None,
                 COMMUNITY,

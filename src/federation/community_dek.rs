@@ -890,6 +890,9 @@ pub mod orchestrate {
                 // #846 (§5) — the writer; the announce that follows a scoped
                 // put stamps the same key if this was `None`.
                 author_key_id,
+                // #984 (V177) — the community the row is sealed for (its
+                // epoch binding names it too; the row says so itself).
+                Some(community_key_id),
             )
             .await?;
         match backend

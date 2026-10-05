@@ -1538,6 +1538,11 @@ pub struct ManifestRowSpec {
     /// the same epoch at a community, and related to the root in
     /// `federation_manifest_children`). Empty for a v1 / v2 manifest.
     pub children: Vec<ManifestChildRow>,
+    /// v53.1.2 (CIRISPersist#984, V177) — the group the seal named (the
+    /// door's `community_key_id` argument: owner, family or community),
+    /// recorded on the manifest row and on every child row. `None` for a
+    /// seal that named no group (the commons).
+    pub group_key_id: Option<String>,
 }
 
 impl BlobBody {
@@ -1790,7 +1795,17 @@ pub trait BlobStorage: Send + Sync {
     /// `None` is recorded as NULL, which [`is_proxy_content`] treats as
     /// unknown ⇒ proxy; a cascade that knows its writer must say so.
     ///
+    /// v53.1.2 (CIRISPersist#984 rows 1 and 4, V177) — `group_key_id` is the
+    /// group the write NAMED: the owner identity (`self`), the family key
+    /// (`family`) or the community key — what the scoped door received as
+    /// its `community_key_id`. The retroactive-ADD walk joins its
+    /// cohort-visibility set on it, and durability resolves a family blob's
+    /// audience from it. `None` is NULL = unknown: a commons write, or a
+    /// door that has no group to name. A self/family cascade MUST name it,
+    /// or the row it stores is invisible to every later member-add.
+    ///
     /// [`is_proxy_content`]: crate::federation::replication::hold::is_proxy_content
+    #[allow(clippy::too_many_arguments)]
     fn store_blob_local(
         &self,
         sha256: &[u8; 32],
@@ -1799,6 +1814,7 @@ pub trait BlobStorage: Send + Sync {
         cohort_scope: &str,
         floor: StorageFloor,
         author_key_id: Option<&str>,
+        group_key_id: Option<&str>,
     ) -> impl Future<Output = Result<(), BlobError>> + Send;
 
     /// v45.0.0 (CIRISPersist#871, `FSD/MEDIA_SOURCE.md` §4; CIRISPersist#863
@@ -1845,6 +1861,8 @@ pub trait BlobStorage: Send + Sync {
             StorageFloor::resolved(crate::federation::types::cohort_scope::CryptoTier::Plaintext),
             // #846 — this door carries no signer; unknown classifies as proxy
             // (fail toward evictable), exactly as `store_blob_local_json`.
+            None,
+            // #984 — the commons names no group.
             None,
         )
     }
@@ -2322,11 +2340,19 @@ pub trait BlobStorage: Send + Sync {
     ) -> impl Future<Output = Result<Vec<StreamDekRecord>, BlobError>> + Send;
 
     /// The retroactive-ADD walk's set: every stream epoch THIS node sealed at
-    /// `cohort_scope` on which any of `recipients` holds a wrap.
+    /// `cohort_scope` **for `group_key_id`** on which any of `recipients`
+    /// holds a wrap.
+    ///
+    /// v53.1.2 (CIRISPersist#984 row 1) — the group is a filter, not a
+    /// label. A recipient active in two families holds wraps on both
+    /// families' epochs; without the group axis a member-add in one family
+    /// handed the newcomer the other family's epochs. The row's
+    /// `group_key_id` (V166) must equal the argument exactly.
     fn stream_dek_list_for_recipients(
         &self,
         recipients: &[String],
         cohort_scope: &str,
+        group_key_id: &str,
     ) -> impl Future<Output = Result<Vec<StreamDekRecord>, BlobError>> + Send;
 
     /// #832 (§12.4) — the row HEAD a read door dispatches on:
@@ -3031,10 +3057,21 @@ pub trait BlobStorage: Send + Sync {
     /// caller passes occurrence recipients, not the sentinel). Returns the
     /// SHAs in stable ascending hex order. Empty `Vec` if `recipient_key_ids`
     /// is empty or none hold any grant in scope.
+    ///
+    /// v53.1.2 (CIRISPersist#984 row 1, V177) — **and filtered by
+    /// `group_key_id`**: the blob row's `federation_blobs.group_key_id` must
+    /// equal the argument. The scope alone was not a boundary: a recipient
+    /// active in two families holds grants on both families' blobs, so a
+    /// member-add in one family handed the newcomer the other family's
+    /// blobs. A row whose group is NULL (sealed before V177, or adopted) is
+    /// EXCLUDED — an unknown family is not this family, and v53 carries no
+    /// cross-version promise for such rows; failing toward disclosure is
+    /// the defect this closes.
     fn list_at_rest_blobs_for_recipients(
         &self,
         recipient_key_ids: &[String],
         cohort_scope: &str,
+        group_key_id: &str,
     ) -> impl Future<Output = Result<Vec<[u8; 32]>, BlobError>> + Send;
 
     /// v4.14.0 (CIRISPersist#152) — load persist's software content
@@ -3907,6 +3944,12 @@ pub struct BlobProvenanceRow {
     pub cohort_scope: String,
     /// The community the row's epoch binding names, if it has one.
     pub community_key_id: Option<String>,
+    /// v53.1.2 (CIRISPersist#984 row 4, V177) — the group the write named
+    /// on the row itself: the owner (`self`), the family or the community.
+    /// `None` = unknown (a pre-V177 row, an adopted row, or a commons
+    /// write). This is what resolves a family blob's audience, which has
+    /// no epoch binding to name its group.
+    pub group_key_id: Option<String>,
 }
 
 /// CIRISPersist#851 §20.5 — **the one predicate every announcing door asks.**

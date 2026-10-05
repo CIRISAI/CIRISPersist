@@ -1033,6 +1033,50 @@ pub(crate) mod bodies {
             d.missing.contains(&p.key_b),
             "I507 so the silent device is reported missing: {d:?}"
         );
+        // The row itself names the family (V177), and that alone resolves
+        // the audience — no epoch binding is consulted for a family row.
+        let prov = sa
+            .blob_provenance(&blob)
+            .await
+            .unwrap()
+            .expect("I507 the blob row");
+        assert_eq!(
+            prov.group_key_id.as_deref(),
+            Some(fam.as_str()),
+            "I507 the row records the family it was sealed for: {prov:?}"
+        );
+        assert_eq!(
+            prov.community_key_id, None,
+            "I507 a family row has no binding"
+        );
+        assert_ne!(
+            crate::federation::durability::content_audience(
+                sa,
+                cohort_scope::FAMILY,
+                prov.author_key_id.as_deref(),
+                prov.group_key_id.as_deref(),
+            )
+            .await
+            .unwrap(),
+            crate::federation::durability::ContentAudience::Unresolvable,
+            "I507 the row's own group resolves"
+        );
+        // A sealed family stream's manifest records the family too.
+        let stream = format!("i507-stream-{run}");
+        p.a.put_blob_chunk_scoped(cohort_scope::FAMILY, Some(&fam), &stream, 0, b"c0", 0, None)
+            .await
+            .unwrap();
+        let root =
+            p.a.seal_stream_scoped(cohort_scope::FAMILY, Some(&fam), &stream, None, None)
+                .await
+                .unwrap()
+                .manifest_sha256;
+        let prov = sa.blob_provenance(&root).await.unwrap().expect("the root");
+        assert_eq!(
+            prov.group_key_id.as_deref(),
+            Some(fam.as_str()),
+            "I507 the sealed manifest records the family: {prov:?}"
+        );
     }
 
     pub(crate) async fn i314_the_cap_rolls_the_epoch<B>(
