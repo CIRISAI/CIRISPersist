@@ -427,7 +427,11 @@ if [ "$MODE" != "full" ]; then
         set -uo pipefail
         LF="$(python3 scripts/ci_feature_matrix.py set lint)" || exit 1
         [ -n "$LF" ] || { echo "EMPTY lint feature set" >&2; exit 1; }
-        cargo clippy --features "$LF" --all-targets -- -D warnings'
+        cargo clippy --features "$LF" --all-targets -- -D warnings || exit 1
+        # v53.1.2 - CI'"'"'s lint job ALSO runs --all-features: it compiles the
+        # test-anchor integration tests the lint shape does not (v53.1.1 lost
+        # a PR CI round to a redundant_guards lint certify never saw).
+        cargo clippy --all-features --all-targets -- -D warnings'
     wait
     qfail=0
     for g in default clippy; do

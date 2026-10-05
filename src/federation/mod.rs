@@ -168,6 +168,9 @@ pub(crate) mod held_settle_invariants;
 /// v49.0.0 (CIRISPersist#912) — I183: the membership listing plane.
 #[cfg(test)]
 pub mod listing_invariants;
+/// v53.1.2 (CIRISPersist#984 row 16) — withdrawing a location proof (I519).
+#[cfg(test)]
+mod location_proof_withdraw_invariants;
 /// v52.0.0 (CIRISPersist#955) — the joiner's signed acceptance.
 pub mod membership_acceptance;
 /// v52.0.0 (CIRISPersist#955) — I210–I219.
@@ -180,6 +183,9 @@ pub mod moderation_walk_asof_invariants;
 /// (I202–I209).
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod nested_manifest_invariants;
+/// v53.1.2 (CIRISPersist#984 row 12) — who may retract what (I516).
+#[cfg(test)]
+mod retraction_invariants;
 // v53.0.0 (CIRISPersist#969) — I310–I319: one DEK per (stream, epoch).
 /// CIRISPersist#972 — I335–I339, a node is seated without an acceptance.
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
@@ -4985,6 +4991,21 @@ pub trait FederationDirectory: Send + Sync {
     /// of defense after client UI gating). Append-only on the
     /// `(subject_key_id, asserted_at)` PK.
     async fn put_location_proof(&self, proof: SignedLocationProof) -> Result<(), Error>;
+
+    /// v53.1.2 (CIRISPersist#984 row 16, CC 3.3.3 "a `withdraws` ends a
+    /// proof") — **withdraw a held `location_proof`**: the held row at
+    /// `(subject_key_id, asserted_at)` re-offered by its own attester with
+    /// `withdrawn_at` set and re-signed. Verified exactly as a put
+    /// (`verify_location_proof_admission`: signature, then standing), then
+    /// [`location::check_location_proof_withdrawal`](crate::federation::location::check_location_proof_withdrawal):
+    /// the signer is the held row's `authority_key_id`, nothing but
+    /// `withdrawn_at` differs. Idempotent: a row already withdrawn keeps its
+    /// first instant and the re-offer is `Ok`. Refused by name for anyone
+    /// else, for a proof not held (`location_proof_withdraw_not_held`), and
+    /// for a row that is not a withdrawal. The row's serve position moves so
+    /// a peer past its cursor is served the withdrawal; readers that fold
+    /// `withdrawn_at` (`member_in_geographic_constraint`) see it ended.
+    async fn withdraw_location_proof(&self, proof: SignedLocationProof) -> Result<(), Error>;
 
     /// v4.10.0 — every stored `location_proof` for `subject_key_id`
     /// (in-force and withdrawn — full history; callers filter on

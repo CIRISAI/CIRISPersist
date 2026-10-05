@@ -247,10 +247,27 @@ pub fn recovery_version(
     }
 }
 
-/// The recovery statements this accord's version chain records, oldest first.
+/// The charter a stored version row named: the versions table snapshots the
+/// superseded `Family` (bare, or the signed wrapper around it).
+fn version_charter_digest(snapshot: &serde_json::Value) -> &str {
+    snapshot
+        .get("family")
+        .unwrap_or(snapshot)
+        .get("charter_digest")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+}
+
+/// The recovery statements this accord's version chain records, oldest
+/// first — every one, or (v53.1.2, CIRISPersist#984 row 3) only those made
+/// UNDER `under_charter`: a statement is the authorization of the version it
+/// superseded, and that version's `charter_digest` is the charter in force
+/// when the recovery was made. A new charter is a fresh commitments table;
+/// a recovery made under an older one carries no exception into it.
 pub(crate) async fn recorded_statements<F>(
     directory: &F,
     family_key_id: &str,
+    under_charter: Option<&str>,
 ) -> Result<Vec<serde_json::Value>, Error>
 where
     F: FederationDirectory + ?Sized,
@@ -259,6 +276,7 @@ where
         .list_group_versions(Cohort::Family, family_key_id)
         .await?
         .into_iter()
+        .filter(|v| under_charter.is_none_or(|c| version_charter_digest(&v.snapshot) == c))
         .filter_map(|v| v.authorization)
         .filter_map(|a| a.get("change_envelope").cloned())
         .filter(|e| e.get("kind").and_then(|k| k.as_str()) == Some(RECOVERY_STATEMENT_KIND))
@@ -266,8 +284,16 @@ where
 }
 
 /// **The recovery commitment in force for `holder`**: the one the latest
-/// recovery that seated `holder` named, else the entry in the charter the
-/// accord's head names ([`charter_in_force`]). `None` when neither names one.
+/// recovery that seated `holder` UNDER the charter in force named, else the
+/// entry in that charter ([`charter_in_force`], resolved to its live row).
+/// `None` when the head names no charter, or neither names one.
+///
+/// v53.1.2 (CIRISPersist#984 row 3) — bounded to the charter in force, as
+/// the version door's coverage rule is: a recovery under C₁ makes its next
+/// commitment stand in for C₁'s entry; once the head names C₂, C₂ commits
+/// every seat afresh (the version naming it was refused otherwise), and
+/// C₂'s entry is the one in force. (#984 row 5) The charter row is the live
+/// one — a withdrawn charter commits nothing.
 ///
 /// # Errors
 ///
@@ -280,7 +306,11 @@ pub async fn recovery_commitment_in_force<F>(
 where
     F: FederationDirectory + ?Sized,
 {
-    let seated_by_recovery = recorded_statements(directory, family_key_id)
+    let (charter_key, head) = charter_in_force(directory, family_key_id).await?;
+    let HeadCharter::Named(digest) = &head else {
+        return Ok(None);
+    };
+    let seated_by_recovery = recorded_statements(directory, family_key_id, Some(digest))
         .await?
         .into_iter()
         .rev()
@@ -293,22 +323,17 @@ where
     if seated_by_recovery.is_some() {
         return Ok(seated_by_recovery);
     }
-    let (charter_key, head) = charter_in_force(directory, family_key_id).await?;
-    if !matches!(head, HeadCharter::Named(_)) {
-        return Ok(None);
-    }
-    Ok(directory
-        .list_attestations_for(&charter_key)
-        .await?
-        .iter()
-        .find(|a| head.admits(a))
-        .and_then(|a| {
-            a.attestation_envelope
-                .get(super::envelope::paths::RECOVERY_COMMITMENTS)
-                .and_then(|m| m.get(holder))
-                .and_then(|v| v.as_str())
-                .map(str::to_owned)
-        }))
+    Ok(
+        super::canonical_community::live_charter_row(directory, &charter_key, digest)
+            .await?
+            .and_then(|a| {
+                a.attestation_envelope
+                    .get(super::envelope::paths::RECOVERY_COMMITMENTS)
+                    .and_then(|m| m.get(holder))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned)
+            }),
+    )
 }
 
 /// **Is `signed` a valid recovery version of the held accord?** `Ok(None)`
@@ -457,7 +482,9 @@ where
             "the new key's recovery commitment repeats the spent one",
         );
     }
-    let spent = recorded_statements(directory, &held.family_key_id)
+    // Over the WHOLE lineage: a recovery key that rotated a seat is spent
+    // under every charter since (#984 row 3 bounds the exception, not this).
+    let spent = recorded_statements(directory, &held.family_key_id, None)
         .await?
         .iter()
         .any(|s| s.get("recovery_key_id").and_then(|v| v.as_str()) == Some(recovery_key_id));

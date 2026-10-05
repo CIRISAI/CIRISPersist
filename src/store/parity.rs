@@ -854,6 +854,9 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("reject_future_dated_family_widening", Class::Gate),
     // v49.0.0 (#912) — the one listing door every backend runs.
     ("check_community_membership_listing", Class::Gate),
+    // v53.1.2 (#984 row 16) — the withdrawal check every backend's
+    // `withdraw_location_proof` runs after the admission gate.
+    ("check_location_proof_withdrawal", Class::Gate),
     ("verify_consent_record_transit_ingest", Class::Gate),
     ("verify_family_admission", Class::Gate),
     ("verify_family_membership_revocation_admission", Class::Gate),

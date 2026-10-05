@@ -377,6 +377,62 @@ pub(crate) mod bodies {
         );
     }
 
+    /// **I518** (v53.1.2, CIRISPersist#984 row 18) — **the charter members
+    /// are read from a LIVE charter row.** The in-force filter dropped
+    /// direction-denied rows but not retired ones, so a withdrawn charter the
+    /// head still names kept answering. Now it answers nothing until a fresh
+    /// charter is versioned in.
+    pub async fn i518_a_withdrawn_charter_has_no_members(d: &dyn FederationDirectory, tag: &str) {
+        let (holders, _) = people(d, tag).await;
+        let fam = format!("lf-{tag}");
+        let first = charter(
+            &fam,
+            &format!("{fam}-c1"),
+            &holders,
+            serde_json::json!({ "attach_window_secs": 111 }),
+        );
+        let first_digest = ops::charter_digest_of(&first);
+        ops::seed_test_family_naming(d, &fam, &holders, PROTOCOL, &first_digest)
+            .await
+            .unwrap();
+        put(d, first).await;
+        assert_eq!(
+            charter_members_for(d, &fam)
+                .await
+                .unwrap()
+                .and_then(|m| m.attach_window_secs),
+            Some(111),
+            "{tag} I518 precondition — the named charter answers"
+        );
+        ops::withdraw_attestation(d, &holders[0], &fam, &format!("{fam}-c1"))
+            .await
+            .unwrap();
+        assert_eq!(
+            charter_members_for(d, &fam).await.unwrap(),
+            None,
+            "{tag} I518: a withdrawn charter has no members to read"
+        );
+        let fresh = charter(
+            &fam,
+            &format!("{fam}-c2"),
+            &holders,
+            serde_json::json!({ "attach_window_secs": 222 }),
+        );
+        let digest = ops::charter_digest_of(&fresh);
+        put(d, fresh).await;
+        ops::version_family_naming_charter(d, &fam, &digest, &holders)
+            .await
+            .unwrap();
+        assert_eq!(
+            charter_members_for(d, &fam)
+                .await
+                .unwrap()
+                .and_then(|m| m.attach_window_secs),
+            Some(222),
+            "{tag} I518: the live charter's members"
+        );
+    }
+
     /// **I445** — the attach head moves with the version.
     pub async fn i445_attach_on_the_replaced_head_is_stale(d: &dyn FederationDirectory, tag: &str) {
         use crate::federation::canonical_community::{
@@ -708,6 +764,11 @@ mod run {
                 async fn i444() {
                     let Some(b) = $fresh.await else { return };
                     bodies::i444_members_follow_the_head(&b, &suffix()).await
+                }
+                #[tokio::test]
+                async fn i518() {
+                    let Some(b) = $fresh.await else { return };
+                    bodies::i518_a_withdrawn_charter_has_no_members(&b, &suffix()).await
                 }
                 #[tokio::test]
                 async fn i445() {

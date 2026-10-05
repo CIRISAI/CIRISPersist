@@ -318,12 +318,35 @@ impl CeremonyState {
     /// key or shared, no serve node, or anything the items cannot be formed
     /// from.
     pub fn plan(mut inputs: CeremonyInputs) -> Result<Self, CeremonyError> {
-        let bad = |d: String| Err(CeremonyError::InvalidInputs(d));
         // Every backend stores an instant at microsecond precision; an item
         // formed finer would not round-trip byte-equal.
         inputs.produced_at =
             chrono::DateTime::from_timestamp_micros(inputs.produced_at.timestamp_micros())
                 .ok_or_else(|| CeremonyError::InvalidInputs("produced_at out of range".into()))?;
+        let state = Self {
+            version: CEREMONY_STATE_VERSION,
+            inputs,
+            partials: BTreeMap::new(),
+        };
+        state.validate()?;
+        Ok(state)
+    }
+
+    /// **The one validation of a state**, run at plan and at parse (v53.1.2,
+    /// CIRISPersist#984 row 10 — a parsed state used to be checked for its
+    /// version only, and the first reader to index `holders[0]` panicked):
+    /// the inputs form a ceremony (holders listed once and committable, a
+    /// serve node, a successor set, one recovery key per holder held apart),
+    /// the items can be drafted, and every stored partial is keyed to an
+    /// item of this ceremony and a listed holder, each entry naming its own
+    /// keys.
+    ///
+    /// # Errors
+    ///
+    /// [`CeremonyError::InvalidInputs`].
+    fn validate(&self) -> Result<(), CeremonyError> {
+        let bad = |d: String| Err(CeremonyError::InvalidInputs(d));
+        let inputs = &self.inputs;
         if inputs.holders.is_empty() {
             return bad("a ceremony needs its accord holders".into());
         }
@@ -365,27 +388,53 @@ impl CeremonyState {
                 ));
             }
         }
-        let state = Self {
-            version: CEREMONY_STATE_VERSION,
-            inputs,
-            partials: BTreeMap::new(),
-        };
-        state.draft()?;
-        Ok(state)
+        let draft = self.draft()?;
+        for (item, by_holder) in &self.partials {
+            if !draft.items.iter().any(|d| &d.id == item) {
+                return bad(format!(
+                    "a partial names {item:?}, not an item of this ceremony"
+                ));
+            }
+            if by_holder.len() > inputs.holders.len() {
+                return bad(format!(
+                    "{item} carries {} partials for {} holders",
+                    by_holder.len(),
+                    inputs.holders.len()
+                ));
+            }
+            for (holder, p) in by_holder {
+                if !ids.contains(holder.as_str()) {
+                    return bad(format!(
+                        "a partial over {item} is keyed to {holder:?}, not a holder of this \
+                         ceremony"
+                    ));
+                }
+                if p.item != *item || p.holder_key_id != *holder {
+                    return bad(format!(
+                        "the partial keyed ({item}, {holder}) names ({}, {})",
+                        p.item, p.holder_key_id
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
-    /// Parse a serialized state, refusing a version this build cannot read.
+    /// Parse a serialized state, refusing a version this build cannot read,
+    /// and validating it as a planned state is ([`Self::validate`]).
     ///
     /// # Errors
     ///
-    /// [`CeremonyError::InvalidInputs`] on malformed JSON,
-    /// [`CeremonyError::StateVersion`] on another version.
+    /// [`CeremonyError::InvalidInputs`] on malformed JSON or a state that
+    /// does not form a ceremony, [`CeremonyError::StateVersion`] on another
+    /// version.
     pub fn from_json(json: &str) -> Result<Self, CeremonyError> {
         let state: Self = serde_json::from_str(json)
             .map_err(|e| CeremonyError::InvalidInputs(format!("ceremony state: {e}")))?;
         if state.version != CEREMONY_STATE_VERSION {
             return Err(CeremonyError::StateVersion(state.version));
         }
+        state.validate()?;
         Ok(state)
     }
 
@@ -958,5 +1007,91 @@ impl CeremonyState {
             bundle_json,
             verified,
         })
+    }
+}
+
+#[cfg(all(test, feature = "test-anchor"))]
+mod tests_984 {
+    use super::*;
+
+    fn planned() -> CeremonyState {
+        let seeds = [[1u8; 32], [2u8; 32], [3u8; 32]];
+        let at = chrono::DateTime::parse_from_rfc3339("2026-10-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let (_, _, inputs) = crate::federation::genesis::test_ceremony::test_ceremony_inputs(
+            &seeds, &[9u8; 32], at, None,
+        )
+        .expect("inputs");
+        CeremonyState::plan(inputs).expect("plan")
+    }
+
+    fn reparse(
+        mutate: impl FnOnce(&mut serde_json::Value),
+    ) -> Result<CeremonyState, CeremonyError> {
+        let mut v: serde_json::Value = serde_json::from_str(&planned().to_json().unwrap()).unwrap();
+        mutate(&mut v);
+        CeremonyState::from_json(&v.to_string())
+    }
+
+    fn invalid(r: Result<CeremonyState, CeremonyError>, what: &str) -> String {
+        match r {
+            Err(CeremonyError::InvalidInputs(d)) => d,
+            other => panic!("I515 {what}: expected InvalidInputs, got {other:?}"),
+        }
+    }
+
+    /// **I515** (v53.1.2, CIRISPersist#984 row 10) — a parsed state is
+    /// validated as a planned one is: no holders, a repeated holder, a partial
+    /// for an unlisted holder or an unknown item are `InvalidInputs` — never a
+    /// panic in the first reader that indexes `holders[0]` — and a valid
+    /// state round-trips equal.
+    #[test]
+    fn i515_a_parsed_state_is_validated_like_a_planned_one() {
+        let d = invalid(
+            reparse(|v| v["inputs"]["holders"] = serde_json::json!([])),
+            "no holders",
+        );
+        assert!(d.contains("holders"), "{d}");
+        let d = invalid(
+            reparse(|v| {
+                let dup = v["inputs"]["holders"][0].clone();
+                v["inputs"]["holders"].as_array_mut().unwrap().push(dup);
+            }),
+            "a holder listed twice",
+        );
+        assert!(d.contains("twice"), "{d}");
+        let ghost = serde_json::json!({
+            "item": "row:genesis-charter",
+            "holder_key_id": "ghost",
+            "signature_classical": "c2ln",
+            "signature_pqc": "c2ln",
+        });
+        let d = invalid(
+            reparse(|v| v["partials"]["row:genesis-charter"]["ghost"] = ghost.clone()),
+            "a partial by an unlisted holder",
+        );
+        assert!(d.contains("ghost"), "{d}");
+        let d = invalid(
+            reparse(|v| {
+                let holder = v["inputs"]["holders"][0]["record"]["key_id"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned();
+                let mut p = ghost.clone();
+                p["item"] = serde_json::json!("row:nothing");
+                p["holder_key_id"] = serde_json::json!(holder);
+                v["partials"]["row:nothing"][holder] = p;
+            }),
+            "a partial for an unknown item",
+        );
+        assert!(d.contains("row:nothing"), "{d}");
+        let state = planned();
+        let back = CeremonyState::from_json(&state.to_json().unwrap()).expect("I515 round-trip");
+        assert_eq!(back, state, "I515 a valid state round-trips equal");
+        assert!(matches!(
+            reparse(|v| v["version"] = serde_json::json!(99)),
+            Err(CeremonyError::StateVersion(99))
+        ));
     }
 }

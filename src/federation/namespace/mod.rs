@@ -1883,10 +1883,14 @@ mod tests {
         Plane::HardCaseEvent,
     ];
 
-    /// #848 — the KeyGrant plane's two axes, for the same sweeps.
-    const KEY_GRANT_PLANES: [Plane<'static>; 2] = [
+    /// #848 — the KeyGrant plane's axes, for the same sweeps. v53.1.2
+    /// (CIRISPersist#984 row 14): the `stream` axis (#969's
+    /// `key_grant:stream:v1`) joins — it had an arm in every door and no
+    /// representative here, so no sweep built on `all_planes()` looked at it.
+    const KEY_GRANT_PLANES: [Plane<'static>; 3] = [
         Plane::KeyGrant { axis: "epoch" },
         Plane::KeyGrant { axis: "content" },
+        Plane::KeyGrant { axis: "stream" },
     ];
 
     /// Every plane, with the Attestation plane fanned across [`FAMILY_DIMS`]

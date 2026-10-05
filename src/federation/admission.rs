@@ -8198,6 +8198,32 @@ pub async fn check_withdraws_admission_at(
     row: &super::Attestation,
     depth: usize,
 ) -> Result<Option<u8>, Error> {
+    // v53.1.2 (CIRISPersist#984 row 12, CC 2.4.1.1) — a `recants` is admitted
+    // only from the target's own attester: the ONE entitlement predicate the
+    // read-side fold runs (`precedence::retraction_entitled`), asked at the
+    // door, so the two cannot disagree. A target not yet held defers to that
+    // fold, as a `withdraws` does.
+    if row.attestation_type == attestation_type::RECANTS {
+        let Some(target_id) =
+            crate::federation::precedence::references_attestation_id_from_envelope(
+                &row.attestation_envelope,
+            )
+        else {
+            return Ok(None);
+        };
+        let Some(target) = directory.get_attestation(target_id).await? else {
+            return Ok(None);
+        };
+        if !crate::federation::precedence::retraction_entitled(row, &target) {
+            return Err(Error::InvalidArgument(format!(
+                "recants_not_admitted: {} is not the attester of {target_id} — only the original \
+                 attester recants (CC 2.4.1.1); a subject's path is `withdraws` or a \
+                 contradicting `scores`",
+                row.attesting_key_id
+            )));
+        }
+        return Ok(None);
+    }
     if row.attestation_type != attestation_type::WITHDRAWS {
         return Ok(None);
     }
@@ -8260,6 +8286,25 @@ pub async fn check_withdraws_admission_at(
         .attestation_type
         .starts_with(crate::federation::blobs::HOLDS_BYTES_ATTESTATION_TYPE_PREFIX)
     {
+        // v53.1.2 (CIRISPersist#984 row 13) — a holder's claim is retired by
+        // the holder alone, and the fold (`precedence::retraction_entitled`)
+        // never lets a resolved rule retire a carrier. So a non-holder's
+        // `withdraws` that ARRIVES with a `withdraws_admission_rule` stamp —
+        // which this door never resolves for a carrier target, so it can only
+        // be a replicated row's forged claim of entitlement — is refused by
+        // name rather than stored with a stamp nothing honours. An unstamped
+        // non-holder `withdraws` (the takedown handler's and `evict_actor`'s
+        // audit rows, whose authority is the moderation path's) is admitted
+        // with no rule, inert in every fold, exactly as before.
+        if row.attesting_key_id != target.attesting_key_id && row.withdraws_admission_rule.is_some()
+        {
+            return Err(Error::InvalidArgument(format!(
+                "carrier_withdraws_not_the_holder: {} is not the holder {} whose {} claim this \
+                 withdraws names, yet it carries a resolved admission rule — only the holder \
+                 retracts its own claim; a takedown is the CC 2.3 tombstone path (#984 row 13)",
+                row.attesting_key_id, target.attesting_key_id, target.attestation_type
+            )));
+        }
         return Ok(None);
     }
     // v25.x (CIRISPersist#578, CIRISConstitution rc3 CC 3.2) — **the recovery
@@ -27198,19 +27243,29 @@ pub(crate) mod ungated_doors_test_support {
             "references_attestation_id": edge_id.clone(),
         });
         seal_row_in_place(&foreign, &mut recants);
-        dir.put_attestation(SignedAttestation {
-            attestation: recants,
-        })
-        .await
-        .expect("no `check_recants_admission` exists, so the write door admits it");
+        // v53.1.2 (CIRISPersist#984 row 12) — the door now asks the fold's own
+        // entitlement predicate for a `recants` whose target is held: a key
+        // that is not the attester is refused by name, so nothing lands. The
+        // property this leg measures — a foreign `recants` never severs — holds
+        // one gate earlier than it used to (the fold is still the backstop for
+        // the out-of-order shape, exercised by `retraction_invariants::I516`).
+        let r = dir
+            .put_attestation(SignedAttestation {
+                attestation: recants,
+            })
+            .await;
+        assert!(
+            r.as_ref()
+                .is_err_and(|e| e.to_string().contains("recants_not_admitted")),
+            "#984 row 12: a foreign `recants` is refused at the door by name: {r:?}"
+        );
         let granters =
             live_delegation_granters(dir, &recipient, DelegationEdgeFilter::AnyDelegation)
                 .await
                 .expect("granters");
         assert!(
             granters.contains(&granter),
-            "FINDING 7 (#656): a foreign `recants` reaches the same fold and needs no race — it \
-             must not sever the edge either. Got {granters:?}"
+            "FINDING 7 (#656): a foreign `recants` must not sever the edge. Got {granters:?}"
         );
 
         // CONTROL — the SUBJECT's own revocation still severs it.

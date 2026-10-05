@@ -3764,7 +3764,7 @@ pub mod test_support {
     /// `expires_at` is stamped BEFORE the seal (it is bound in both directions
     /// since #598, so setting the column afterwards is the divergence the gate
     /// refuses).
-    async fn put_delegates_to<D: crate::federation::FederationDirectory + ?Sized>(
+    pub(crate) async fn put_delegates_to<D: crate::federation::FederationDirectory + ?Sized>(
         dir: &D,
         granter: &str,
         grantee: &str,

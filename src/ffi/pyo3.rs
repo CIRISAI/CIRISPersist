@@ -10310,6 +10310,8 @@ impl PyEngine {
                                 // #846 — this door carries no signer; unknown
                                 // classifies as proxy (fail toward evictable).
                                 None,
+                                // #984 — the commons names no group.
+                                None,
                             )
                             .await
                             .map_err(blob_err_to_py)
@@ -10331,6 +10333,8 @@ impl PyEngine {
                                 ),
                                 // #846 — this door carries no signer; unknown
                                 // classifies as proxy (fail toward evictable).
+                                None,
+                                // #984 — the commons names no group.
                                 None,
                             )
                             .await

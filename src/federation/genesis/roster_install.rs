@@ -40,7 +40,7 @@
 
 use super::{bundle_family_charter_digest, GenesisBakeReport, GenesisBundle};
 use crate::federation::types::{Family, SignedFamily};
-use crate::federation::{Attestation, Error, FederationDirectory};
+use crate::federation::{Error, FederationDirectory};
 use serde::{Deserialize, Serialize};
 
 /// Where a bundle's roster records come from. Only [`Bake`](Self::Bake) may
@@ -137,37 +137,19 @@ pub fn bundle_accord_genesis(bundle: &GenesisBundle) -> SignedFamily {
 
 /// Is the charter `digest` names a live charter of `family` here — a held,
 /// unretired `delegates_to` toward the family with the charter reading, whose
-/// direction reading stands (the same test `charter_members_for` applies)? An
-/// empty digest names nothing and is never live.
+/// direction reading stands? An empty digest names nothing and is never
+/// live. v53.1.2 (#984 row 5): the one predicate is
+/// [`live_charter_row`](crate::federation::canonical_community::live_charter_row);
+/// the accord version door asks it too.
 pub(super) async fn charter_row_live<D>(dir: &D, family: &str, digest: &str) -> Result<bool, Error>
 where
     D: FederationDirectory + ?Sized,
 {
-    if digest.is_empty() {
-        return Ok(false);
-    }
-    let is_charter = |a: &Attestation| {
-        a.attestation_type == crate::federation::types::attestation_type::DELEGATES_TO
-            && a.attested_key_id == family
-            && crate::federation::trust_root::job_dimension_admits(
-                &a.attestation_envelope,
-                crate::federation::trust_root::TRUST_CHARTER_DIMENSION,
-            )
-    };
-    let rows = dir.list_attestations_for(family).await?;
-    let refs: Vec<&Attestation> = rows.iter().collect();
-    let retired = crate::federation::precedence::retired_ids(&refs);
-    let denied = crate::federation::trust_root::direction_denied_ids(
-        dir,
-        rows.iter().filter(|a| is_charter(a)),
+    Ok(
+        crate::federation::canonical_community::live_charter_row(dir, family, digest)
+            .await?
+            .is_some(),
     )
-    .await?;
-    Ok(rows.iter().any(|a| {
-        a.persist_row_hash == digest
-            && is_charter(a)
-            && !denied.contains(&a.attestation_id)
-            && !retired.contains(&a.attestation_id)
-    }))
 }
 
 /// Everything a head does not carry is equal: the same accord.
@@ -353,6 +335,20 @@ where
         .map_err(|r| Error::GenesisBundleInvalid {
             detail: r.to_string(),
         })?;
+    // v53.1.2 (CIRISPersist#984 row 11) — the accord head FIRST, as the boot
+    // seed does (`seed_family_and_canonical` runs `seed_accord_family` before
+    // the delegation plane). The bake admits the charter THROUGH the family it
+    // names, so on a node holding no accord head the charter and lifecycle
+    // rows were skipped ("no constitutional trust root yet"); the head and
+    // birth then landed naming a charter no row held, and the next boot's
+    // compiled rows — of any vintage — filled the holes and took the head and
+    // the birth with them (`charter_superseded`). Only the node holding NO
+    // accord head takes the early install: a held head is judged once, by
+    // the successor rule, in the post-bake pass that reports it.
+    let accord = ciris_verify_core::accord_genesis::HUMANITY_ACCORD_FAMILY_KEY_ID;
+    if dir.lookup_family(accord).await?.is_none() {
+        let _ = install_accord_genesis_head(dir, bundle).await?;
+    }
     let bake = super::bake_assembled_genesis(dir, &json).await?;
     let records = install_bundle_roster_records(dir, bundle, RosterSource::Import).await?;
     Ok(RosterInstall { bake, records })

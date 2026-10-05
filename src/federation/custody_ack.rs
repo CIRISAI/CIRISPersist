@@ -523,6 +523,41 @@ where
         return Err(refuse_missing_row(backend, at_rest_sha256, viewer_key_id).await?);
     };
     authorize_viewer_by_tier(backend, at_rest_sha256, head.crypto_tier, viewer_key_id).await?;
+    // v53.1.2 (CIRISPersist#984 row 8) — a stream's receipts are the blob's
+    // only when the blob is OF that stream, through the relations persist
+    // writes: its own one-leaf log (#953), a position it sits at as a chunk
+    // (V175), or the stream its manifest's chunks sit at (V176). Any other
+    // stream is refused: its subscribers never received this blob.
+    if let Some(stream) = stream_id {
+        let sits_at = |chunk: [u8; 32]| async move {
+            Ok::<bool, BlobError>(
+                backend
+                    .stream_positions_of_chunk(&chunk)
+                    .await?
+                    .iter()
+                    .any(|(s, _)| s == stream),
+            )
+        };
+        let mut bound = super::stream_sth::inline_blob_stream_id(at_rest_sha256) == stream
+            || sits_at(*at_rest_sha256).await?;
+        if !bound {
+            if let Some((_, chunk)) = backend
+                .dag_chunks_of_manifest(at_rest_sha256)
+                .await?
+                .first()
+            {
+                bound = sits_at(*chunk).await?;
+            }
+        }
+        if !bound {
+            return Err(BlobError::InvalidArgument(format!(
+                "custody_view: {stream} is not the blob's stream — {}'s own log, a stream it \
+                 sits at as a chunk, or the stream its manifest's chunks sit at \
+                 (CIRISPersist#984 row 8)",
+                hex::encode(at_rest_sha256)
+            )));
+        }
+    }
     let mut devices = candidate_devices(backend, at_rest_sha256, head.crypto_tier).await?;
     let mut receipts: BTreeMap<String, DateTime<Utc>> = BTreeMap::new();
     if let Some(stream) = stream_id {
@@ -611,7 +646,17 @@ where
             // report's signer); a manifest it cannot open refuses `here`.
             if state == CustodyState::Here {
                 use super::chunk_dag_cascade::orchestrate::{held_dag_completeness, DagHolding};
-                let me = backend.node_key_id().unwrap_or_default();
+                // v53.1.2 (CIRISPersist#984 row 9) — asked as THIS node, or
+                // not at all: a backend that does not know its key would ask
+                // as "" and read every sealed DAG it holds as unverifiable.
+                let Some(me) = backend.node_key_id() else {
+                    return Err(Error::InvalidArgument(
+                        "custody_ack_here_node_key_unknown: this node does not know its own key, \
+                         so it cannot ask whether it holds the DAG whole (CC 3.1.3.3); the host's \
+                         Engine derives it before this door"
+                            .into(),
+                    ));
+                };
                 let holding =
                     match held_dag_completeness(backend, blob_sha256, &me, caller_aad).await {
                         Ok(h) => h,
@@ -664,14 +709,33 @@ where
             None,
         ),
     };
-    let target = match (cohort_target, scope.as_str()) {
-        (Some(t), _) => Some(t.to_owned()),
-        (None, cs::COMMUNITY) => backend
+    // v53.1.2 (CIRISPersist#984 row 7) — with a row held, the target is the
+    // ROW's: the sealing epoch's community, or the V177 group of a self/family
+    // row. A caller value that differs is malformed (a device in two rooms
+    // was filing A's blob as a copy held for room B); one that matches is
+    // accepted; `None` resolves to the row's. With no row held, or a row
+    // that records no group (pre-V177), the caller's value stands.
+    let row_target: Option<String> = match (&head, scope.as_str()) {
+        (Some(_), cs::COMMUNITY) => backend
             .community_dek_blob_epoch(blob_sha256)
             .await
             .map_err(blob_err)?
             .map(|(community, _, _)| community),
-        (None, _) => None,
+        (Some(_), cs::SELF | cs::FAMILY) => backend
+            .blob_provenance(blob_sha256)
+            .await
+            .map_err(blob_err)?
+            .and_then(|p| p.group_key_id),
+        _ => None,
+    };
+    let target = match (cohort_target, row_target) {
+        (Some(named), Some(rows)) if named != rows => {
+            return Err(malformed(format!(
+                "the blob is held for {scope} {rows:?}, not {named:?}"
+            )));
+        }
+        (Some(named), _) => Some(named.to_owned()),
+        (None, rows) => rows,
     };
     let env = custody_ack_envelope(blob_sha256, state, size, &scope, target.as_deref())?;
     let core: super::envelope::EnvelopeCore = serde_json::from_value(env)

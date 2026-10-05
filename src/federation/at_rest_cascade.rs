@@ -1307,6 +1307,9 @@ pub mod orchestrate {
                 // row is never announced, so this is the ONLY place its
                 // author can be written; `None` classifies as proxy.
                 author_key_id,
+                // #984 (V177) — the owner / family the row is sealed for: the
+                // retroactive-ADD walk's group axis, and the audience's.
+                Some(owner_or_family_key_id),
             )
             .await?;
 
@@ -1537,9 +1540,18 @@ pub mod orchestrate {
     /// append-only revocation that the `*_active` read composes against; it
     /// does not delete at-rest grant rows, and CEG §11.7.1 Option-A relies
     /// on forward secrecy rather than retroactive key destruction).
+    ///
+    /// v53.1.2 (CIRISPersist#984 row 1) — **the walk is bounded by
+    /// `group_key_id`** (the owner for `self`, the family key for `family`),
+    /// not by the scope alone. The cohort-visibility set used to be "every
+    /// blob and epoch at this scope that any existing recipient holds a wrap
+    /// on" — and a person active in two families holds wraps on both
+    /// families' content, so growing family A handed the newcomer family B's
+    /// keys. Both listings now join on the row's group (V177 / V166).
     pub async fn rekey_for_newcomers<B>(
         backend: &B,
         cohort_scope: &str,
+        group_key_id: &str,
         existing_recipients: &[String],
         newcomers: &[Newcomer],
     ) -> Result<RekeyResult, BlobError>
@@ -1550,6 +1562,13 @@ pub mod orchestrate {
             return Err(BlobError::InvalidArgument(format!(
                 "rekey_for_newcomers is only for self/family, got cohort_scope {cohort_scope:?}"
             )));
+        }
+        if group_key_id.is_empty() {
+            return Err(BlobError::InvalidArgument(
+                "rekey_for_newcomers: group_key_id is empty — the walk is bounded by the owner \
+                 or family it re-keys for (CIRISPersist#984)"
+                    .into(),
+            ));
         }
 
         // Split newcomers into wrap-able (keyed) and fail-secure-excluded.
@@ -1563,23 +1582,25 @@ pub mod orchestrate {
         }
 
         // The cohort-visibility set: blobs the existing cohort already
-        // holds grants on, in this scope. Empty existing-recipient set ⇒
-        // nothing to inherit (a brand-new cohort has no prior blobs).
+        // holds grants on, in this scope AND this group (#984). Empty
+        // existing-recipient set ⇒ nothing to inherit (a brand-new cohort
+        // has no prior blobs).
         let blobs = if existing_recipients.is_empty() {
             Vec::new()
         } else {
             backend
-                .list_at_rest_blobs_for_recipients(existing_recipients, cohort_scope)
+                .list_at_rest_blobs_for_recipients(existing_recipients, cohort_scope, group_key_id)
                 .await?
         };
 
-        // v53.0.0 (#969) — the stream epochs this node sealed that the
-        // existing cohort holds wraps on: O(epochs), walked beside the blobs.
+        // v53.0.0 (#969) — the stream epochs this node sealed for this group
+        // that the existing cohort holds wraps on: O(epochs), walked beside
+        // the blobs.
         let streams = if existing_recipients.is_empty() {
             Vec::new()
         } else {
             backend
-                .stream_dek_list_for_recipients(existing_recipients, cohort_scope)
+                .stream_dek_list_for_recipients(existing_recipients, cohort_scope, group_key_id)
                 .await?
         };
 
@@ -1929,7 +1950,8 @@ pub mod orchestrate {
             existing.extend(occ.into_iter().map(|o| o.occurrence_key_id));
         }
 
-        let result = rekey_for_newcomers(backend, FAMILY, &existing, &newcomers).await?;
+        let result =
+            rekey_for_newcomers(backend, FAMILY, family_key_id, &existing, &newcomers).await?;
         emit_membership_hard_cases(backend, FAMILY, family_key_id, &result, observed_at).await?;
         Ok(result)
     }
@@ -1983,7 +2005,8 @@ pub mod orchestrate {
             }
         }
 
-        let result = rekey_for_newcomers(backend, SELF, &existing, &newcomers).await?;
+        let result =
+            rekey_for_newcomers(backend, SELF, identity_key_id, &existing, &newcomers).await?;
         emit_membership_hard_cases(backend, SELF, identity_key_id, &result, observed_at).await?;
         Ok(result)
     }
@@ -2077,20 +2100,22 @@ pub mod orchestrate {
         }
 
         for (scope, group, others) in cohorts {
-            if !device_lacks_cohort_keys(backend, scope, &others, device).await? {
+            if !device_lacks_cohort_keys(backend, scope, &group, &others, device).await? {
                 continue;
             }
-            let r = rekey_for_newcomers(backend, scope, &others, &newcomer).await?;
+            let r = rekey_for_newcomers(backend, scope, &group, &others, &newcomer).await?;
             out.push((scope, group, r));
         }
         Ok(out)
     }
 
     /// Does `device` lack a blob or stream epoch wrap that `others` hold in
-    /// `scope` on this node? Index reads only.
+    /// `scope` for `group` on this node? Index reads only. #984: bounded by
+    /// the group, as the walk it gates is.
     async fn device_lacks_cohort_keys<B>(
         backend: &B,
         scope: &str,
+        group: &str,
         others: &[String],
         device: &str,
     ) -> Result<bool, BlobError>
@@ -2102,12 +2127,12 @@ pub mod orchestrate {
         }
         let me = [device.to_owned()];
         let held: std::collections::HashSet<[u8; 32]> = backend
-            .list_at_rest_blobs_for_recipients(&me, scope)
+            .list_at_rest_blobs_for_recipients(&me, scope, group)
             .await?
             .into_iter()
             .collect();
         if backend
-            .list_at_rest_blobs_for_recipients(others, scope)
+            .list_at_rest_blobs_for_recipients(others, scope, group)
             .await?
             .iter()
             .any(|sha| !held.contains(sha))
@@ -2118,13 +2143,13 @@ pub mod orchestrate {
             (r.stream_id.clone(), r.epoch, r.owner_key_id.clone())
         };
         let held: std::collections::HashSet<_> = backend
-            .stream_dek_list_for_recipients(&me, scope)
+            .stream_dek_list_for_recipients(&me, scope, group)
             .await?
             .iter()
             .map(key)
             .collect();
         Ok(backend
-            .stream_dek_list_for_recipients(others, scope)
+            .stream_dek_list_for_recipients(others, scope, group)
             .await?
             .iter()
             .any(|r| !held.contains(&key(r))))
@@ -5319,6 +5344,7 @@ pub mod blob_invariants {
                     scope,
                     StorageFloor::resolved(tier),
                     None,
+                    None,
                 )
                 .await;
             assert!(
@@ -6697,6 +6723,7 @@ pub mod blob_invariants {
                 FEDERATION,
                 crate::federation::StorageFloor::resolved(CryptoTier::Plaintext),
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -7096,6 +7123,7 @@ pub mod blob_invariants_fixture {
                 crate::federation::StorageFloor::resolved(
                     crate::federation::types::cohort_scope::CryptoTier::InvisibleEncrypted,
                 ),
+                None,
                 None,
             )
             .await
