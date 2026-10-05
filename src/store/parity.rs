@@ -857,9 +857,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // v53.1.2 (#984 row 16) — the withdrawal check every backend's
     // `withdraw_location_proof` runs after the admission gate.
     ("check_location_proof_withdrawal", Class::Gate),
-    // v53.1.2 (#984 row 19) — `put_location_proof` hands a held PK re-offered
-    // as a withdrawal to the withdraw door (another door that runs the gates).
-    ("withdraw_location_proof", Class::Delegates),
     ("verify_consent_record_transit_ingest", Class::Gate),
     ("verify_family_admission", Class::Gate),
     ("verify_family_membership_revocation_admission", Class::Gate),

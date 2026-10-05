@@ -342,10 +342,13 @@ where
     // rows were skipped ("no constitutional trust root yet"); the head and
     // birth then landed naming a charter no row held, and the next boot's
     // compiled rows — of any vintage — filled the holes and took the head and
-    // the birth with them (`charter_superseded`). A held head is judged by
-    // the successor rule exactly as the post-bake pass judges it; a refusal
-    // here writes nothing and is not an error.
-    let _ = install_accord_genesis_head(dir, bundle).await?;
+    // the birth with them (`charter_superseded`). Only the node holding NO
+    // accord head takes the early install: a held head is judged once, by
+    // the successor rule, in the post-bake pass that reports it.
+    let accord = ciris_verify_core::accord_genesis::HUMANITY_ACCORD_FAMILY_KEY_ID;
+    if dir.lookup_family(accord).await?.is_none() {
+        let _ = install_accord_genesis_head(dir, bundle).await?;
+    }
     let bake = super::bake_assembled_genesis(dir, &json).await?;
     let records = install_bundle_roster_records(dir, bundle, RosterSource::Import).await?;
     Ok(RosterInstall { bake, records })
