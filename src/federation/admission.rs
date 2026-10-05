@@ -27224,19 +27224,29 @@ pub(crate) mod ungated_doors_test_support {
             "references_attestation_id": edge_id.clone(),
         });
         seal_row_in_place(&foreign, &mut recants);
-        dir.put_attestation(SignedAttestation {
-            attestation: recants,
-        })
-        .await
-        .expect("no `check_recants_admission` exists, so the write door admits it");
+        // v53.1.2 (CIRISPersist#984 row 12) — the door now asks the fold's own
+        // entitlement predicate for a `recants` whose target is held: a key
+        // that is not the attester is refused by name, so nothing lands. The
+        // property this leg measures — a foreign `recants` never severs — holds
+        // one gate earlier than it used to (the fold is still the backstop for
+        // the out-of-order shape, exercised by `retraction_invariants::I516`).
+        let r = dir
+            .put_attestation(SignedAttestation {
+                attestation: recants,
+            })
+            .await;
+        assert!(
+            r.as_ref()
+                .is_err_and(|e| e.to_string().contains("recants_not_admitted")),
+            "#984 row 12: a foreign `recants` is refused at the door by name: {r:?}"
+        );
         let granters =
             live_delegation_granters(dir, &recipient, DelegationEdgeFilter::AnyDelegation)
                 .await
                 .expect("granters");
         assert!(
             granters.contains(&granter),
-            "FINDING 7 (#656): a foreign `recants` reaches the same fold and needs no race — it \
-             must not sever the edge either. Got {granters:?}"
+            "FINDING 7 (#656): a foreign `recants` must not sever the edge. Got {granters:?}"
         );
 
         // CONTROL — the SUBJECT's own revocation still severs it.
