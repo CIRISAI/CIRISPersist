@@ -139,7 +139,7 @@ pub fn bundle_accord_genesis(bundle: &GenesisBundle) -> SignedFamily {
 /// unretired `delegates_to` toward the family with the charter reading, whose
 /// direction reading stands (the same test `charter_members_for` applies)? An
 /// empty digest names nothing and is never live.
-async fn charter_row_live<D>(dir: &D, family: &str, digest: &str) -> Result<bool, Error>
+pub(super) async fn charter_row_live<D>(dir: &D, family: &str, digest: &str) -> Result<bool, Error>
 where
     D: FederationDirectory + ?Sized,
 {

@@ -3367,9 +3367,33 @@ where
         // birth: a genesis row (no predecessor) that names another charter.
         // A version chain (a roster that moved past some birth) is never
         // rolled back, and an import never replaces a rooted row.
+        // Codex on #983: only THE compiled asset's birth may replace (a
+        // caller's row never does), and a held birth is replaceable only
+        // when it names no charter, or names one that is no longer a live
+        // charter row while the baked birth's is — the family rule
+        // (`roster_install::genesis_head_replaceable`), so a NEWER birth a
+        // node imported is never rolled back by an older bake.
+        let is_compiled = canonical_community_asset().is_some_and(|c| {
+            super::types::compute_persist_row_hash(&c.community).ok()
+                == super::types::compute_persist_row_hash(&birth.community).ok()
+        });
+        let family = crate::federation::canonical_community::accord_family_key_id();
+        let charter_superseded = if held.charter_digest.is_empty() {
+            true
+        } else {
+            let held_live = roster_install::charter_row_live(dir, family, &held.charter_digest)
+                .await
+                .map_err(|e| GenesisFault::unreadable(LEG, format!("charter row: {e}")))?;
+            let baked_live =
+                roster_install::charter_row_live(dir, family, &birth.community.charter_digest)
+                    .await
+                    .map_err(|e| GenesisFault::unreadable(LEG, format!("charter row: {e}")))?;
+            !held_live && baked_live
+        };
         if source == RosterSource::Bake
+            && is_compiled
             && held.prev_head_digest.is_empty()
-            && held.charter_digest != birth.community.charter_digest
+            && charter_superseded
         {
             let snapshot = serde_json::to_value(birth)
                 .map_err(|e| GenesisFault::unreadable(LEG, format!("birth snapshot: {e}")))?;

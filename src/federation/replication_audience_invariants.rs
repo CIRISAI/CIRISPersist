@@ -1673,3 +1673,102 @@ mod consent_change_runners {
         }
     }
 }
+
+#[cfg(test)]
+mod codex_978_i505 {
+    use crate::federation::accord_test_support as ops;
+    use crate::federation::replication_audience as ra;
+    use crate::federation::trust_root::{
+        test_pre_rotation_commitment, INFRA_ATTEST_SCOPE, INFRA_SERVE_SCOPE,
+        TRUST_CHARTER_DIMENSION,
+    };
+    use crate::federation::types::attestation_type::DELEGATES_TO;
+    use crate::federation::{FederationDirectory, SignedAttestation};
+
+    /// **I505 — a family is public only by the charter its HEAD names** (Codex
+    /// on #978; CC 3.2 T6): a live `trust:charter:v1` row the head does not
+    /// name confers nothing and widens nothing; once a version names it, the
+    /// family is public.
+    async fn public_only_by_the_named_charter(d: &dyn FederationDirectory, tag: &str) {
+        let fid = format!("i505-family-{tag}");
+        let (a, b) = (format!("i505-a-{tag}"), format!("i505-b-{tag}"));
+        super::bodies::users(d, &[&a, &b]).await;
+        super::bodies::family(d, &fid, &[&a, &b]).await;
+        assert!(
+            !ra::is_public_group(d, &fid).await.unwrap(),
+            "{tag} I505: control — no charter, private"
+        );
+        // A live charter row, stored AHEAD of the version that adopts it.
+        let id = format!("i505-charter-{tag}");
+        let env = serde_json::json!({
+            "references_attestation_id": id,
+            "dimension": TRUST_CHARTER_DIMENSION,
+            "scope": [INFRA_ATTEST_SCOPE, INFRA_SERVE_SCOPE],
+            "pre_rotation_commitment": test_pre_rotation_commitment(&[
+                format!("{fid}-succ-a"),
+                format!("{fid}-succ-b"),
+            ])
+            .unwrap(),
+        });
+        let charter = ops::co_signed_trust_attestation(&id, &a, &fid, DELEGATES_TO, env, &[&b]);
+        d.put_attestation(SignedAttestation {
+            attestation: charter,
+        })
+        .await
+        .unwrap_or_else(|e| panic!("{tag} I505: the charter row admits: {e}"));
+        let digest = d
+            .get_attestation(&id)
+            .await
+            .unwrap()
+            .unwrap()
+            .persist_row_hash;
+        assert!(
+            !ra::is_public_group(d, &fid).await.unwrap(),
+            "{tag} I505: a charter the head does not name widens nothing"
+        );
+        // The version that names it.
+        let held = d.lookup_family(&fid).await.unwrap().unwrap();
+        let signed = crate::federation::types::SignedFamily {
+            family: {
+                let mut f = held.clone();
+                f.persist_row_hash = String::new();
+                f.prev_head_digest = held.persist_row_hash.clone();
+                f.charter_digest = digest;
+                f
+            },
+            authority_key_id: a.clone(),
+            scrub_signature_classical: String::new(),
+            scrub_signature_pqc: None,
+            supersede_proof: None,
+            cosignatures: Vec::new(),
+        };
+        d.supersede_group_row(
+            crate::federation::cohort::Cohort::Family,
+            serde_json::to_value(&signed).unwrap(),
+            None,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{tag} I505: the naming version: {e}"));
+        assert!(
+            ra::is_public_group(d, &fid).await.unwrap(),
+            "{tag} I505: the head names the charter — public"
+        );
+    }
+
+    #[tokio::test]
+    async fn i505_memory() {
+        let d = crate::store::memory::MemoryBackend::new();
+        public_only_by_the_named_charter(&d, "memory").await;
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn i505_sqlite() {
+        use crate::store::Backend as _;
+        let d = crate::store::sqlite::SqliteBackend::open_in_memory()
+            .await
+            .unwrap();
+        d.run_migrations().await.unwrap();
+        public_only_by_the_named_charter(&d, "sqlite").await;
+    }
+}

@@ -188,7 +188,17 @@ where
         new_holder_signature,
     );
     // Judged here with its reason, then admitted by the accord's one door.
-    verify_accord_recovery(directory, &signed).await?;
+    // Codex on #978: `Ok(None)` means "not the accord family" — a recovery
+    // is an ACCORD version and nothing else may reach the signed supersede.
+    if verify_accord_recovery(directory, &signed).await?.is_none() {
+        return Err(Error::CharterInvalid {
+            detail: format!(
+                "accord_recovery_not_an_accord_family: {} is not the accord family; a \
+                 recovery version exists only for the accord",
+                signed.family.family_key_id
+            ),
+        });
+    }
     let authorization = serde_json::json!({
         "change_envelope": draft.statement.clone(),
         "quorum_signatures": signed
@@ -484,4 +494,78 @@ where
         detail: format!("accord_recovery_signature: {e}"),
     })?;
     Ok(Some(new.to_owned()))
+}
+
+#[cfg(test)]
+mod codex_978 {
+    use super::*;
+    use crate::federation::accord_test_support as ops;
+    use crate::federation::genesis::accord_family_genesis_record_for;
+    use crate::federation::types::identity_type;
+
+    /// **I504 — a non-accord family cannot take the recovery door** (Codex on
+    /// #978): `verify_accord_recovery` answers `None` for any family that is
+    /// not the accord, and the door refuses by name instead of reaching the
+    /// already-verified supersede. The family is unchanged.
+    async fn non_accord_family_is_refused(d: &dyn FederationDirectory, tag: &str) {
+        let fid = format!("i504-family-{tag}");
+        let (a, b) = (format!("i504-a-{tag}"), format!("i504-b-{tag}"));
+        for k in [&a, &b] {
+            ops::register_typed_key(d, k, identity_type::USER)
+                .await
+                .unwrap();
+        }
+        let family =
+            accord_family_genesis_record_for(&fid, "quorum:2/2", [a.as_str(), b.as_str()], "");
+        d.put_family_local(family).await.unwrap();
+        let held = d.lookup_family(&fid).await.unwrap().unwrap();
+        // A hand-built draft (every field is public): the family renamed,
+        // chained on the held head, "signed" by nobody in particular.
+        let mut next = held.clone();
+        next.family_name = "hijacked".to_owned();
+        next.persist_row_hash = String::new();
+        next.prev_head_digest = held.persist_row_hash.clone();
+        let draft = AccordRecoveryDraft {
+            next,
+            statement: serde_json::json!({ "kind": "i504" }),
+            statement_bytes: b"i504".to_vec(),
+            record_bytes: b"i504".to_vec(),
+        };
+        let err = recover_accord_holder(
+            d,
+            draft,
+            ("c2ln".to_owned(), "c2ln".to_owned()),
+            ("c2ln".to_owned(), "c2ln".to_owned()),
+        )
+        .await
+        .expect_err("I504: refused");
+        assert!(
+            err.to_string()
+                .contains("accord_recovery_not_an_accord_family"),
+            "{tag} I504: {err}"
+        );
+        let after = d.lookup_family(&fid).await.unwrap().unwrap();
+        assert_eq!(
+            after.persist_row_hash, held.persist_row_hash,
+            "{tag} I504: unchanged"
+        );
+        assert_eq!(after.family_name, held.family_name, "{tag} I504: unchanged");
+    }
+
+    #[tokio::test]
+    async fn i504_memory() {
+        let d = crate::store::memory::MemoryBackend::new();
+        non_accord_family_is_refused(&d, "memory").await;
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn i504_sqlite() {
+        use crate::store::Backend as _;
+        let d = crate::store::sqlite::SqliteBackend::open_in_memory()
+            .await
+            .unwrap();
+        d.run_migrations().await.unwrap();
+        non_accord_family_is_refused(&d, "sqlite").await;
+    }
 }
