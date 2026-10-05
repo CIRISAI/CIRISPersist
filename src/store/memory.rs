@@ -8260,6 +8260,27 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // v21.0.0 (CIRISPersist#502 E4) — mechanistic authorship BEFORE any
         // other admission step.
         crate::federation::verify_location_proof_admission(self, &proof).await?;
+        // v53.1.2 (CIRISPersist#984 row 19) — a held PK re-offered as a
+        // WITHDRAWAL (the attester's re-signed row, as a peer serves it) is the
+        // withdraw door's case: the local and the replicated path run the one
+        // predicate. Any other re-offer keeps its path.
+        if proof.location_proof.withdrawn_at.is_some() {
+            let held = self
+                .state
+                .lock()
+                .expect("memory backend lock")
+                .federation_location_proofs
+                .contains_key(&(
+                    proof.location_proof.subject_key_id.clone(),
+                    proof.location_proof.asserted_at,
+                ));
+            if held {
+                return crate::federation::FederationDirectory::withdraw_location_proof(
+                    self, proof,
+                )
+                .await;
+            }
+        }
         let mut row = proof.location_proof;
         // §0.8 canonicalization + §0.8.1 rough-only gate before write.
         crate::federation::location::validate_location_cell(&row.cell_id, row.cell_resolution)?;

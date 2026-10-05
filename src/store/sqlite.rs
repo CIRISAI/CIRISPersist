@@ -9650,6 +9650,37 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         // v21.0.0 (CIRISPersist#502 E4) — mechanistic authorship BEFORE any
         // other admission step.
         crate::federation::verify_location_proof_admission(self, &proof).await?;
+        // v53.1.2 (CIRISPersist#984 row 19) — a held PK re-offered as a
+        // WITHDRAWAL (the attester's re-signed row, as a peer serves it) is the
+        // withdraw door's case: the local and the replicated path run the one
+        // predicate. Any other re-offer keeps its path (the PK refuses it).
+        if proof.location_proof.withdrawn_at.is_some() {
+            let (s, a) = (
+                proof.location_proof.subject_key_id.clone(),
+                proof.location_proof.asserted_at.to_rfc3339(),
+            );
+            let held = self
+                .read(move |conn| -> Result<Option<i64>, rusqlite::Error> {
+                    conn.query_row(
+                        "SELECT 1 FROM federation_location_proofs \
+                          WHERE subject_key_id = ?1 AND asserted_at = ?2",
+                        rusqlite::params![s, a],
+                        |r| r.get(0),
+                    )
+                    .optional()
+                })
+                .await
+                .map_err(|e| {
+                    crate::federation::Error::Backend(format!("put_location_proof held: {e}"))
+                })?
+                .is_some();
+            if held {
+                return crate::federation::FederationDirectory::withdraw_location_proof(
+                    self, proof,
+                )
+                .await;
+            }
+        }
         let mut row = proof.location_proof;
         crate::federation::location::validate_location_cell(&row.cell_id, row.cell_resolution)?;
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;

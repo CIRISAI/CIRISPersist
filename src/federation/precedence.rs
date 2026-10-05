@@ -195,6 +195,20 @@ pub fn retraction_entitled(g: &Attestation, target: &Attestation) -> bool {
     if g.attesting_key_id == target.attesting_key_id {
         return true;
     }
+    // v53.1.2 (CIRISPersist#984 row 13) — a registered CARRIER row (a
+    // `holds_bytes` claim, a `key_grant` set) is the holder's self-attestation
+    // and only the holder retracts it: a carrier has no subjects, and a
+    // resolved consent-revocation rule (arm 3) is about a Contribution, never
+    // about a holder's claim. Without this a replicated `withdraws` carrying a
+    // forged `withdraws_admission_rule` retired a holder's claim in this fold
+    // while `list_holders` — which folds the holder's own retractions only —
+    // still listed it.
+    if matches!(
+        super::row_type::classify(&target.attestation_type),
+        super::row_type::RowTypeClass::Carrier(_)
+    ) {
+        return false;
+    }
     // v53.1.2 (CIRISPersist#984 row 12, CC 2.4.1.1) — a `recants` is the
     // ATTESTER's act alone (a falsity admission about one's own statement);
     // the subject's path is `withdraws` (rule 2) or a contradicting `scores`.

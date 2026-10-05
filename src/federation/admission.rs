@@ -8286,6 +8286,25 @@ pub async fn check_withdraws_admission_at(
         .attestation_type
         .starts_with(crate::federation::blobs::HOLDS_BYTES_ATTESTATION_TYPE_PREFIX)
     {
+        // v53.1.2 (CIRISPersist#984 row 13) — a holder's claim is retired by
+        // the holder alone, and the fold (`precedence::retraction_entitled`)
+        // never lets a resolved rule retire a carrier. So a non-holder's
+        // `withdraws` that ARRIVES with a `withdraws_admission_rule` stamp —
+        // which this door never resolves for a carrier target, so it can only
+        // be a replicated row's forged claim of entitlement — is refused by
+        // name rather than stored with a stamp nothing honours. An unstamped
+        // non-holder `withdraws` (the takedown handler's and `evict_actor`'s
+        // audit rows, whose authority is the moderation path's) is admitted
+        // with no rule, inert in every fold, exactly as before.
+        if row.attesting_key_id != target.attesting_key_id && row.withdraws_admission_rule.is_some()
+        {
+            return Err(Error::InvalidArgument(format!(
+                "carrier_withdraws_not_the_holder: {} is not the holder {} whose {} claim this \
+                 withdraws names, yet it carries a resolved admission rule — only the holder \
+                 retracts its own claim; a takedown is the CC 2.3 tombstone path (#984 row 13)",
+                row.attesting_key_id, target.attesting_key_id, target.attestation_type
+            )));
+        }
         return Ok(None);
     }
     // v25.x (CIRISPersist#578, CIRISConstitution rc3 CC 3.2) — **the recovery

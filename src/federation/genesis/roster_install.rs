@@ -335,6 +335,17 @@ where
         .map_err(|r| Error::GenesisBundleInvalid {
             detail: r.to_string(),
         })?;
+    // v53.1.2 (CIRISPersist#984 row 11) — the accord head FIRST, as the boot
+    // seed does (`seed_family_and_canonical` runs `seed_accord_family` before
+    // the delegation plane). The bake admits the charter THROUGH the family it
+    // names, so on a node holding no accord head the charter and lifecycle
+    // rows were skipped ("no constitutional trust root yet"); the head and
+    // birth then landed naming a charter no row held, and the next boot's
+    // compiled rows — of any vintage — filled the holes and took the head and
+    // the birth with them (`charter_superseded`). A held head is judged by
+    // the successor rule exactly as the post-bake pass judges it; a refusal
+    // here writes nothing and is not an error.
+    let _ = install_accord_genesis_head(dir, bundle).await?;
     let bake = super::bake_assembled_genesis(dir, &json).await?;
     let records = install_bundle_roster_records(dir, bundle, RosterSource::Import).await?;
     Ok(RosterInstall { bake, records })
