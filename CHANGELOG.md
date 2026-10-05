@@ -7,6 +7,11 @@ threat-model citations because this crate's audit story is the point.
 
 ## [Unreleased]
 
+## [53.1.4] - UNRELEASED
+
+### Fixed — an upgraded node could not take the ceremony's serve record (CIRISServer's 0.5.221 dry-run)
+_(bullets land with the fix)_
+
 ## [53.1.3] - 2026-10-05
 
 ### Codex on #985 (CIRISPersist#986) — four findings against v53.1.2, confirmed and fixed
