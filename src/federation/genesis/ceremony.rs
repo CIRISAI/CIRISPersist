@@ -318,12 +318,35 @@ impl CeremonyState {
     /// key or shared, no serve node, or anything the items cannot be formed
     /// from.
     pub fn plan(mut inputs: CeremonyInputs) -> Result<Self, CeremonyError> {
-        let bad = |d: String| Err(CeremonyError::InvalidInputs(d));
         // Every backend stores an instant at microsecond precision; an item
         // formed finer would not round-trip byte-equal.
         inputs.produced_at =
             chrono::DateTime::from_timestamp_micros(inputs.produced_at.timestamp_micros())
                 .ok_or_else(|| CeremonyError::InvalidInputs("produced_at out of range".into()))?;
+        let state = Self {
+            version: CEREMONY_STATE_VERSION,
+            inputs,
+            partials: BTreeMap::new(),
+        };
+        state.validate()?;
+        Ok(state)
+    }
+
+    /// **The one validation of a state**, run at plan and at parse (v53.1.2,
+    /// CIRISPersist#984 row 10 — a parsed state used to be checked for its
+    /// version only, and the first reader to index `holders[0]` panicked):
+    /// the inputs form a ceremony (holders listed once and committable, a
+    /// serve node, a successor set, one recovery key per holder held apart),
+    /// the items can be drafted, and every stored partial is keyed to an
+    /// item of this ceremony and a listed holder, each entry naming its own
+    /// keys.
+    ///
+    /// # Errors
+    ///
+    /// [`CeremonyError::InvalidInputs`].
+    fn validate(&self) -> Result<(), CeremonyError> {
+        let bad = |d: String| Err(CeremonyError::InvalidInputs(d));
+        let inputs = &self.inputs;
         if inputs.holders.is_empty() {
             return bad("a ceremony needs its accord holders".into());
         }
@@ -365,27 +388,53 @@ impl CeremonyState {
                 ));
             }
         }
-        let state = Self {
-            version: CEREMONY_STATE_VERSION,
-            inputs,
-            partials: BTreeMap::new(),
-        };
-        state.draft()?;
-        Ok(state)
+        let draft = self.draft()?;
+        for (item, by_holder) in &self.partials {
+            if !draft.items.iter().any(|d| &d.id == item) {
+                return bad(format!(
+                    "a partial names {item:?}, not an item of this ceremony"
+                ));
+            }
+            if by_holder.len() > inputs.holders.len() {
+                return bad(format!(
+                    "{item} carries {} partials for {} holders",
+                    by_holder.len(),
+                    inputs.holders.len()
+                ));
+            }
+            for (holder, p) in by_holder {
+                if !ids.contains(holder.as_str()) {
+                    return bad(format!(
+                        "a partial over {item} is keyed to {holder:?}, not a holder of this \
+                         ceremony"
+                    ));
+                }
+                if p.item != *item || p.holder_key_id != *holder {
+                    return bad(format!(
+                        "the partial keyed ({item}, {holder}) names ({}, {})",
+                        p.item, p.holder_key_id
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
-    /// Parse a serialized state, refusing a version this build cannot read.
+    /// Parse a serialized state, refusing a version this build cannot read,
+    /// and validating it as a planned state is ([`Self::validate`]).
     ///
     /// # Errors
     ///
-    /// [`CeremonyError::InvalidInputs`] on malformed JSON,
-    /// [`CeremonyError::StateVersion`] on another version.
+    /// [`CeremonyError::InvalidInputs`] on malformed JSON or a state that
+    /// does not form a ceremony, [`CeremonyError::StateVersion`] on another
+    /// version.
     pub fn from_json(json: &str) -> Result<Self, CeremonyError> {
         let state: Self = serde_json::from_str(json)
             .map_err(|e| CeremonyError::InvalidInputs(format!("ceremony state: {e}")))?;
         if state.version != CEREMONY_STATE_VERSION {
             return Err(CeremonyError::StateVersion(state.version));
         }
+        state.validate()?;
         Ok(state)
     }
 

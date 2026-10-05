@@ -7036,6 +7036,9 @@ impl Engine {
         caller_aad: Option<&[u8]>,
     ) -> Result<String, crate::federation::Error> {
         use crate::federation::custody_ack::custody_ack_input_for;
+        // v53.1.2 (CIRISPersist#984 row 9) — the report is asked as THIS
+        // node: a shared backend learns its key here, as the #916 doors do.
+        self.ensure_backend_node_key().await;
         let input = match &self.backend {
             #[cfg(feature = "postgres")]
             BackendDispatch::Postgres(arc) => {

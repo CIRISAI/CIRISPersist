@@ -920,10 +920,14 @@ mod engine_bodies {
             .await
             .unwrap()
             .manifest_sha256;
+        // The ladder's own signer (deterministic by alias), as a host would
+        // rebuild it: the report is signed by it, so the engine needs it.
+        let local =
+            crate::federation::tier_ingest::test_support::local_signer(&format!("em-a-{run}"));
         let shared = crate::Engine::from_shared_with_local(
             share(l.ba.clone()),
             l.engine_a.signer().clone(),
-            None,
+            Some(local),
         );
         forget(l.ba.as_ref());
         assert!(
