@@ -7,7 +7,7 @@ threat-model citations because this crate's audit story is the point.
 
 ## [Unreleased]
 
-## [53.1.2] - UNRELEASED
+## [53.1.2] - 2026-10-05
 
 ### Operator ruling recorded — the canonical-1 serve-record split is ACCEPTED
 v53.1.1 documented that the final bundle's serve node `ciris-canonical-1-d7bdeu223k` carries its signed `registration_envelope.valid_from` unchanged from the v23.1 record, so an upgraded node keeps the v23.1 record while a fresh node holds the final bundle's. Operator ruling 2026-10-05 (verbatim on #973): "live with the canonical-1 record split. No re-mint." Accepted as shipped; CIRISServer#731 stamps future ceremonies.
