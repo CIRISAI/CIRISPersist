@@ -7,7 +7,18 @@ threat-model citations because this crate's audit story is the point.
 
 ## [Unreleased]
 
-## [53.1.1] - UNRELEASED
+## [53.1.2] - UNRELEASED
+
+### Operator ruling recorded — the canonical-1 serve-record split is ACCEPTED
+v53.1.1 documented that the final bundle's serve node `ciris-canonical-1-d7bdeu223k` carries its signed `registration_envelope.valid_from` unchanged from the v23.1 record, so an upgraded node keeps the v23.1 record while a fresh node holds the final bundle's. Operator ruling 2026-10-05 (verbatim on #973): "live with the canonical-1 record split. No re-mint." Accepted as shipped; CIRISServer#731 stamps future ceremonies.
+
+### Evidence — the four claims CC re-staged on #803
+`evidence/cc_impl.tsv` gains two rows each for `CLM-durability-every-tier` (S3: `durability_mode`, `content_audience`), `CLM-audience-claimed-nodes` (S1: `audience_nodes`, `occurrence_may_hold_key`), `CLM-canonical-founders-accord` (#972: `founder_arm_at`, `node_seated_without_acceptance`) and `CLM-attach-unlabelled` (#973/V167: `direction_denied_ids`, `names_no_trust_job`). The exact-count pin in `supersets.rs` moves 164 → 172.
+
+### Certify — the clippy leg runs CI's invocation too
+`scripts/certify.sh`'s `clippy` leg now also runs `cargo clippy --all-features --all-targets -- -D warnings` after the lint-shape pass: CI's lint job does, and it compiles the `test-anchor` integration tests the lint shape does not (v53.1.1 lost a PR CI round to a `redundant_guards` lint certify never saw).
+
+## [53.1.1] - 2026-10-05
 
 ### THE FINAL GENESIS IS BAKED
 `src/federation/genesis/canonical_seed.json` is now the real ceremony's bundle, verbatim: minted 2026-10-04T22:43:08Z on the operator's laptop, signed on hardware by A1, B1 and C1, through CIRISServer v0.5.220's ceremony routes on persist v53.0.1's `genesis::ceremony`; `finish` ran `verify_ceremony_outputs` and passed. `sha256(canonical_seed.json) = db5e8e8391261dca10c7e701e18bcd26bd8f43ab8e5b8c11ede999ca0befe9f2`, equal to the ceremony host's logged `bundle_sha256`, and pinned from disk (I500).
