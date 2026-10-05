@@ -26,6 +26,13 @@
 //!   `here` for a blob it holds (size from the stored row), the custody view
 //!   and `blob_custody` count it, `here` for a blob it does not hold is
 //!   refused, and a stranger learns nothing.
+//! - **I512** (sqlite, postgres; v53.1.2, CIRISPersist#984 row 7) — the
+//!   report's cohort target is the held row's: a caller value that differs is
+//!   malformed, one that matches is accepted, `None` resolves to the row's.
+//! - **I513** (#984 row 8) — a `stream_id` folds receipts only when the blob
+//!   is of that stream; any other stream is refused.
+//! - **I514** (#984 row 9) — the custody door tells a shared backend its node
+//!   key before asking as that node; the stored report is the node's.
 
 #[cfg(test)]
 pub(crate) mod bodies {
@@ -606,7 +613,7 @@ pub(crate) mod bodies {
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod engine_bodies {
     use crate::federation::custody_ack::{CustodyState, CustodyVerdict};
-    use crate::federation::epoch_minter_invariants::bodies::{ladder, Pick};
+    use crate::federation::epoch_minter_invariants::bodies::{ladder, Ladder, Pick};
     use crate::federation::types::cohort_scope::{COMMUNITY, SELF};
     use crate::federation::{BlobError, BlobStorage, FederationDirectory};
 
@@ -721,6 +728,230 @@ mod engine_bodies {
             "I400e a stranger is refused the custody view"
         );
     }
+
+    /// The stored custody row `id` names (its envelope and its signer).
+    async fn stored<B: FederationDirectory + Sync>(
+        b: &B,
+        id: &str,
+    ) -> crate::federation::Attestation {
+        b.get_attestation(id)
+            .await
+            .unwrap()
+            .unwrap_or_else(|| panic!("the custody row {id} is stored"))
+    }
+
+    /// **I512** (v53.1.2, CIRISPersist#984 row 7) — **a caller-named cohort
+    /// target is read against the held row.** With the blob held, the report's
+    /// community (or family) is the row's own — the sealing epoch's community,
+    /// the V177 group of a self/family row — and a caller value that differs
+    /// is `custody_ack_malformed`; one that matches is accepted; `None` resolves
+    /// to the row's. Before, the caller's value was written as given: a
+    /// device in two rooms could file A's blob as a copy held for room B.
+    pub(crate) async fn i512_the_target_is_the_rows<B>(
+        dsn_a: &str,
+        dsn_b: &str,
+        run: &str,
+        pick: Pick<B>,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync + 'static,
+    {
+        use crate::federation::replication_audience_invariants::bodies as ra;
+        use crate::federation::types::cohort_scope::FAMILY;
+        let l = ladder(dsn_a, dsn_b, run, pick).await;
+        let e = &l.engine_a;
+        let ba = l.ba.as_ref();
+        // A second room and two families alice is in: every target below is
+        // a cohort the reporting device IS in, so only the row can refuse.
+        let comm_b = format!("em-comm-b-{run}");
+        ra::room(ba as &dyn FederationDirectory, &comm_b, &[&l.alice]).await;
+        let (fam_a, fam_b) = (format!("em-fam-a-{run}"), format!("em-fam-b-{run}"));
+        ra::family(ba as &dyn FederationDirectory, &fam_a, &[&l.alice]).await;
+        ra::family(ba as &dyn FederationDirectory, &fam_b, &[&l.alice]).await;
+        let c = e
+            .put_blob_scoped(COMMUNITY, Some(&l.comm), b"room A bytes", None, None)
+            .await
+            .unwrap()
+            .at_rest_sha256;
+        let f = e
+            .put_blob_encrypted_self_family(FAMILY, &fam_a, b"family A bytes", None)
+            .await
+            .unwrap()
+            .at_rest_sha256;
+        for (what, sha, scope, own, other, member) in [
+            ("community", c, COMMUNITY, &l.comm, &comm_b, "community_id"),
+            ("family", f, FAMILY, &fam_a, &fam_b, "family_key_id"),
+        ] {
+            let r = e
+                .put_custody_ack(&sha, CustodyState::Here, None, Some(other), None)
+                .await;
+            assert!(
+                r.as_ref()
+                    .is_err_and(|e| e.to_string().contains("custody_ack_malformed")),
+                "I512 {what}: a target that is not the row's is malformed: {r:?}"
+            );
+            for named in [Some(own.as_str()), None] {
+                let id = e
+                    .put_custody_ack(&sha, CustodyState::Here, Some(scope), named, None)
+                    .await
+                    .unwrap_or_else(|e| panic!("I512 {what} target {named:?}: {e}"));
+                let row = stored(ba, &id).await;
+                assert_eq!(
+                    row.attestation_envelope
+                        .get(member)
+                        .and_then(|v| v.as_str()),
+                    Some(own.as_str()),
+                    "I512 {what} target {named:?}: the envelope names the row's {member}"
+                );
+            }
+        }
+    }
+
+    /// The one-leaf log of inline blob `sha` on A, with an STH and a delivery
+    /// receipt from node B. Returns the stream id.
+    async fn receipted_stream<B>(l: &Ladder<B>, run: &str, sha: &[u8; 32]) -> String
+    where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        use crate::federation::stream_receipt::{receipt_signing_bytes, DeliveryReceipt};
+        let sid = crate::federation::stream_sth::inline_blob_stream_id(sha);
+        let sth = l.engine_a.sign_stream_sth(&sid, &[*sha], 1).await.unwrap();
+        l.ba.put_stream_sth(sth.clone(), &l.node_a).await.unwrap();
+        let subscriber =
+            crate::federation::tier_ingest::test_support::local_signer(&format!("em-b-{run}"));
+        assert_eq!(subscriber.derived_key_id(), l.node_b);
+        let bytes = receipt_signing_bytes(&l.node_b, &sid, 0, &sth.root_hash, 1);
+        l.ba.put_delivery_receipt(DeliveryReceipt {
+            stream_id: sid.clone(),
+            subscriber_key_id: l.node_b.clone(),
+            epoch: 0,
+            k: 1,
+            chunk_root: sth.root_hash,
+            signature: subscriber.sign_hybrid(&bytes).await.unwrap(),
+        })
+        .await
+        .expect("the receipt is stored");
+        sid
+    }
+
+    /// **I513** (v53.1.2, CIRISPersist#984 row 8) — **a `stream_id` folds
+    /// receipts into a blob's view only when the blob is of that stream**: its
+    /// own one-leaf log, a stream it sits at as a chunk (V175), or the stream
+    /// of the chunks its manifest names (V176). Any other stream is
+    /// `InvalidArgument`. Before, any stream's receipts were folded in, so an
+    /// unrelated stream's subscriber read `received` for a blob it never got.
+    pub(crate) async fn i513_receipts_fold_only_for_the_blobs_stream<B>(
+        dsn_a: &str,
+        dsn_b: &str,
+        run: &str,
+        pick: Pick<B>,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync + 'static,
+    {
+        let l = ladder(dsn_a, dsn_b, run, pick).await;
+        let e = &l.engine_a;
+        let x = e
+            .put_blob_scoped(SELF, Some(&l.alice), b"blob X", None, None)
+            .await
+            .unwrap()
+            .at_rest_sha256;
+        let y = e
+            .put_blob_scoped(SELF, Some(&l.alice), b"blob Y", None, None)
+            .await
+            .unwrap()
+            .at_rest_sha256;
+        let s_y = receipted_stream(&l, run, &y).await;
+        let r = e.custody_view(&x, &l.node_a, Some(&s_y)).await;
+        assert!(
+            matches!(&r, Err(BlobError::InvalidArgument(m)) if m.contains("not the blob's stream")),
+            "I513 an unrelated stream is refused: {r:?}"
+        );
+        // Control: X's own log, receipted, folds node B as `received`.
+        let s_x = receipted_stream(&l, run, &x).await;
+        let v = e.custody_view(&x, &l.node_a, Some(&s_x)).await.unwrap();
+        let b = v
+            .devices
+            .iter()
+            .find(|d| d.device_key_id == l.node_b)
+            .unwrap_or_else(|| panic!("I513 the receipting subscriber is listed: {v:?}"));
+        assert_eq!(b.state, CustodyVerdict::Received, "I513 {v:?}");
+        assert!(v.receipts_consulted);
+        // And Y's subscriber never appears in X's view through X's own stream
+        // either: the fold reads the named stream's receipts only.
+        let v = e.custody_view(&y, &l.node_a, None).await.unwrap();
+        assert!(
+            v.devices.iter().all(|d| d.device_key_id != l.node_b),
+            "I513 no stream named, no receipt folded: {v:?}"
+        );
+    }
+
+    /// A shared `BackendDispatch` over a backend handle, and a way to make the
+    /// handle forget its node key — a handle the constructor could not tell
+    /// (a hardware signer that answers asynchronously).
+    pub(crate) type Share<B> = fn(std::sync::Arc<B>) -> crate::engine::BackendDispatch;
+    pub(crate) type Forget<B> = fn(&B);
+
+    /// **I514** (v53.1.2, CIRISPersist#984 row 9) — **the custody door tells
+    /// the backend its node key before it asks as that node.** A shared
+    /// Engine whose backend does not know its key reported `here` for a sealed
+    /// DAG as `""`: the completeness check, asked as nobody, read
+    /// `Unverifiable` and refused a copy the node holds whole. The door now
+    /// derives the key first; the stored report is the node's.
+    pub(crate) async fn i514_the_custody_door_knows_its_node<B>(
+        dsn_a: &str,
+        dsn_b: &str,
+        run: &str,
+        pick: Pick<B>,
+        share: Share<B>,
+        forget: Forget<B>,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync + 'static,
+    {
+        let l = ladder(dsn_a, dsn_b, run, pick).await;
+        let stream = format!("i514-{run}");
+        for (i, seg) in [&b"first"[..], &b"second"[..]].into_iter().enumerate() {
+            l.engine_a
+                .put_blob_chunk_scoped(SELF, Some(&l.alice), &stream, i as u64, seg, 0, None)
+                .await
+                .unwrap();
+        }
+        let root = l
+            .engine_a
+            .seal_stream_scoped(SELF, Some(&l.alice), &stream, None, None)
+            .await
+            .unwrap()
+            .manifest_sha256;
+        let shared = crate::Engine::from_shared_with_local(
+            share(l.ba.clone()),
+            l.engine_a.signer().clone(),
+            None,
+        );
+        forget(l.ba.as_ref());
+        assert!(
+            l.ba.node_key_id().is_none(),
+            "I514 precondition — the handle does not know its node key"
+        );
+        let id = shared
+            .put_custody_ack(&root, CustodyState::Here, None, None, None)
+            .await
+            .unwrap_or_else(|e| panic!("I514 the node reports a DAG it holds whole: {e}"));
+        let row = stored(l.ba.as_ref(), &id).await;
+        assert_eq!(
+            row.attesting_key_id, l.node_a,
+            "I514 the report is the node's own"
+        );
+        assert_eq!(
+            l.ba.node_key_id().as_deref(),
+            Some(l.node_a.as_str()),
+            "I514 the door told the backend its key"
+        );
+        let v = shared.custody_view(&root, &l.node_a, None).await.unwrap();
+        assert!(
+            v.devices
+                .iter()
+                .any(|d| d.device_key_id == l.node_a && d.state == CustodyVerdict::Here),
+            "I514 the node is a copy: {v:?}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -785,6 +1016,91 @@ mod runners {
         b.run_migrations().await.unwrap();
         Some(b)
     });
+
+    #[cfg(feature = "sqlite")]
+    macro_rules! sqlite_engine_case {
+        ($name:ident, $body:ident) => {
+            #[tokio::test]
+            async fn $name() {
+                super::engine_bodies::$body(
+                    "sqlite::memory:",
+                    "sqlite::memory:",
+                    &suffix(),
+                    (|e: &crate::Engine| e.sqlite_backend().expect("sqlite").clone())
+                        as crate::federation::epoch_minter_invariants::bodies::Pick<
+                            crate::store::sqlite::SqliteBackend,
+                        >,
+                )
+                .await;
+            }
+        };
+    }
+    #[cfg(feature = "sqlite")]
+    sqlite_engine_case!(i512_sqlite, i512_the_target_is_the_rows);
+    #[cfg(feature = "sqlite")]
+    sqlite_engine_case!(i513_sqlite, i513_receipts_fold_only_for_the_blobs_stream);
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn i514_sqlite() {
+        super::engine_bodies::i514_the_custody_door_knows_its_node(
+            "sqlite::memory:",
+            "sqlite::memory:",
+            &suffix(),
+            (|e: &crate::Engine| e.sqlite_backend().expect("sqlite").clone())
+                as crate::federation::epoch_minter_invariants::bodies::Pick<
+                    crate::store::sqlite::SqliteBackend,
+                >,
+            crate::engine::BackendDispatch::Sqlite,
+            |b| b.forget_node_key_id(),
+        )
+        .await;
+    }
+
+    #[cfg(feature = "postgres")]
+    macro_rules! postgres_engine_case {
+        ($name:ident, $body:ident) => {
+            #[tokio::test]
+            async fn $name() {
+                let (Some(a), Some(b)) = (crate::test_pg::empty_dsn(), crate::test_pg::empty_dsn())
+                else {
+                    return;
+                };
+                super::engine_bodies::$body(
+                    &a,
+                    &b,
+                    &suffix(),
+                    (|e: &crate::Engine| e.postgres_backend().expect("postgres").clone())
+                        as crate::federation::epoch_minter_invariants::bodies::Pick<
+                            crate::store::postgres::PostgresBackend,
+                        >,
+                )
+                .await;
+            }
+        };
+    }
+    #[cfg(feature = "postgres")]
+    postgres_engine_case!(i512_postgres, i512_the_target_is_the_rows);
+    #[cfg(feature = "postgres")]
+    postgres_engine_case!(i513_postgres, i513_receipts_fold_only_for_the_blobs_stream);
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn i514_postgres() {
+        let (Some(a), Some(b)) = (crate::test_pg::empty_dsn(), crate::test_pg::empty_dsn()) else {
+            return;
+        };
+        super::engine_bodies::i514_the_custody_door_knows_its_node(
+            &a,
+            &b,
+            &suffix(),
+            (|e: &crate::Engine| e.postgres_backend().expect("postgres").clone())
+                as crate::federation::epoch_minter_invariants::bodies::Pick<
+                    crate::store::postgres::PostgresBackend,
+                >,
+            crate::engine::BackendDispatch::Postgres,
+            |b| b.forget_node_key_id(),
+        )
+        .await;
+    }
 
     #[cfg(feature = "sqlite")]
     #[tokio::test]

@@ -867,6 +867,13 @@ impl SqliteBackend {
         *self.node_key_id.write().expect("node_key_id lock") = Some(key_id.into());
     }
 
+    /// Test seam (#984 row 9) — a handle no Engine has told its key: what a
+    /// host's own handle looks like under a signer that answers asynchronously.
+    #[cfg(test)]
+    pub(crate) fn forget_node_key_id(&self) {
+        *self.node_key_id.write().expect("node_key_id lock") = None;
+    }
+
     /// #848 — has [`Self::repair_minter_sentinel`] completed on this backend?
     pub fn minter_sentinel_resolved(&self) -> bool {
         self.minter_sentinel_resolved
