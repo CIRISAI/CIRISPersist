@@ -4133,4 +4133,34 @@ mod supersede_precheck_tests {
             "unsigned top-level valid_from must not override the signed envelope timestamp"
         );
     }
+
+    /// v53.1.4 — the live canonical's signed instant carries a 9-digit
+    /// fraction (`2026-07-31T13:58:22.147317128Z`). The arm is decided on the
+    /// PARSED instants: the same nanosecond in two spellings is equal, a
+    /// microsecond-truncated copy is 128 ns OLDER (refused), and the
+    /// nanosecond-exact record over the truncated one is NEWER.
+    #[test]
+    fn equal_instant_is_compared_at_nanosecond_precision() {
+        const T_NS: &str = "2026-07-31T13:58:22.147317128+00:00";
+        const T_NS_Z: &str = "2026-07-31T13:58:22.147317128Z";
+        const T_US: &str = "2026-07-31T13:58:22.147317+00:00";
+        assert_eq!(
+            supersede_precheck(&canonical(T_NS), &canonical(T_NS)),
+            P::EqualInstant
+        );
+        assert_eq!(
+            supersede_precheck(&canonical(T_NS), &canonical(T_NS_Z)),
+            P::EqualInstant,
+            "two spellings of one nanosecond are equal"
+        );
+        assert_eq!(
+            supersede_precheck(&canonical(T_NS), &canonical(T_US)),
+            P::Refuse,
+            "a microsecond-truncated copy is older by 128 ns, never equal"
+        );
+        assert_eq!(
+            supersede_precheck(&canonical(T_US), &canonical(T_NS)),
+            P::Newer
+        );
+    }
 }
