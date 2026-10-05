@@ -7,7 +7,7 @@ threat-model citations because this crate's audit story is the point.
 
 ## [Unreleased]
 
-## [53.1.3] - UNRELEASED
+## [53.1.3] - 2026-10-05
 
 ### Codex on #985 (CIRISPersist#986) — four findings against v53.1.2, confirmed and fixed
 - **P1 — a withdrawal was never re-indexed.** `withdraw_location_proof` rewrote the row's `persist_row_hash` and both signatures and returned; `put_location_proof` ends with `index_stored_record`, the withdraw door did not, so the signed wire index kept the OLD content hash — a peer re-offering the withdrawal found no entry under its hash, and the old hash reloaded bytes that no longer matched. All three backends now re-index after the durable write exactly as the put path does (postgres releases its pooled client first; memory scopes its lock so the await is outside it). **I523** (memory, sqlite, postgres): the withdrawn row resolves under its own content hash; the pre-withdrawal hash resolves to nothing.
