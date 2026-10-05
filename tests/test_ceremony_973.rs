@@ -207,7 +207,10 @@ async fn i351_boot_from_ceremony_sqlite() {
     // keys the family leg reports Absent; either way nothing past it seeds.
     match seed_family_and_canonical(&b).await {
         Ok(()) => {}
-        Err(GenesisFault::Absent { leg, .. }) if leg == GenesisLeg::Family => {}
+        Err(GenesisFault::Absent {
+            leg: GenesisLeg::Family,
+            ..
+        }) => {}
         Err(e) => panic!("sqlite I351 control: {e:?}"),
     }
     assert!(b.lookup_community(CANON).await.unwrap().is_none());
