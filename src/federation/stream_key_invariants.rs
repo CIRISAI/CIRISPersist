@@ -49,6 +49,9 @@
 //! - **I507** (sqlite, postgres; #984 row 4) — a family blob's row records
 //!   the family it was sealed for, so its durability deficit names the
 //!   family's nodes instead of an unresolvable (empty) audience.
+//! - **I508** (sqlite, postgres; #984 row 2) — a stream-keyed append naming
+//!   another cohort/group than the stream's is refused before the epoch
+//!   door wraps, terminates or mints anything.
 
 // Test-only (the module is `cfg(test)` at its declaration too); marked here
 // so the from-disk floor gate (I14) reads its direct floor calls as tests.
@@ -1079,6 +1082,110 @@ pub(crate) mod bodies {
         );
     }
 
+    /// **I508** (v53.1.2, CIRISPersist#984 row 2) — **a stream-keyed append
+    /// that names another cohort is refused BEFORE the epoch door acts.** The
+    /// newest DEK row was loaded by `stream_id` alone and taken as the
+    /// append's epoch whatever cohort it was sealed for, so an append naming
+    /// family A on a family-B stream (a) wrapped B's epoch DEK to A's extra
+    /// members before the floor refused the chunk, and (b) on a terminated
+    /// epoch minted a fresh DEK row under A before the floor refused. The
+    /// floor's own refusal now fires first; nothing is wrapped, terminated or
+    /// minted.
+    pub(crate) async fn i508_an_append_elsewhere_moves_no_key<B>(
+        dsn_a: &str,
+        dsn_b: &str,
+        run: &str,
+        pick: Pick<B>,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync + 'static,
+    {
+        use crate::federation::replication_audience_invariants::bodies as ra;
+        use crate::federation::tier_ingest::test_support as ts;
+        let p = pair(dsn_a, dsn_b, run, pick, "i508").await;
+        let sa = p.sa.as_ref();
+        let q = format!("i508-q-{run}");
+        ts::register_hybrid_key_as(sa, &q, &q, crate::federation::types::identity_type::USER).await;
+        let (fam_a, fam_b) = (format!("i508-fam-a-{run}"), format!("i508-fam-b-{run}"));
+        ra::family(sa as &dyn FederationDirectory, &fam_a, &[&p.owner, &q]).await;
+        ra::family(sa as &dyn FederationDirectory, &fam_b, &[&p.owner]).await;
+        let qdev = device_of(sa, &q, &format!("i508-qdev-{run}")).await;
+        let append = |stream: String, fam: String, seq: u64| {
+            let e = &p.a;
+            async move {
+                e.put_blob_chunk_scoped(
+                    cohort_scope::FAMILY,
+                    Some(&fam),
+                    &stream,
+                    seq,
+                    b"chunk",
+                    0,
+                    None,
+                )
+                .await
+            }
+        };
+        let refused_elsewhere = |r: &Result<_, BlobError>| matches!(r, Err(BlobError::InvalidArgument(m)) if m.contains("belongs to cohort"));
+        // (a) the disclosure arm: B's recipients ⊆ A's. The stream is family
+        // B's; an append naming family A is refused and q's device gains no
+        // wrap of B's epoch.
+        let s1 = format!("i508-s1-{run}");
+        append(s1.clone(), fam_b.clone(), 0).await.unwrap();
+        let r = append(s1.clone(), fam_a.clone(), 1).await;
+        assert!(
+            refused_elsewhere(&r),
+            "I508 (a) the append naming another family is the floor's refusal: {r:?}"
+        );
+        assert!(
+            !holds_stream(sa, &s1, 0, &p.key_a, &qdev).await,
+            "I508 (a) family B's epoch was not wrapped to family A's member"
+        );
+        let rows = sa.stream_dek_list(&s1).await.unwrap();
+        assert!(
+            rows.len() == 1 && rows[0].epoch == 0 && !rows[0].terminated,
+            "I508 (a) epoch 0 stands open and alone: {rows:?}"
+        );
+        assert!(
+            crate::federation::key_grant::dirty_axes(sa, &p.key_a)
+                .await
+                .unwrap()
+                .iter()
+                .all(|a| !matches!(a,
+                    crate::federation::key_grant::KeyGrantAxis::Stream { stream_id, .. }
+                        if *stream_id == s1)),
+            "I508 (a) nothing dirtied the stream's set"
+        );
+        // (b) the removal arm: A's recipients ⊄ B's. The stream is family
+        // A's; an append naming family B is refused, epoch 0 is not
+        // terminated and no DEK row is minted under B.
+        let s2 = format!("i508-s2-{run}");
+        append(s2.clone(), fam_a.clone(), 0).await.unwrap();
+        let r = append(s2.clone(), fam_b.clone(), 1).await;
+        assert!(
+            refused_elsewhere(&r),
+            "I508 (b) the append naming another family is the floor's refusal: {r:?}"
+        );
+        let rows = sa.stream_dek_list(&s2).await.unwrap();
+        assert!(
+            rows.len() == 1 && rows[0].epoch == 0 && !rows[0].terminated,
+            "I508 (b) epoch 0 is neither terminated nor followed: {rows:?}"
+        );
+        // (c) a terminated epoch: the seal closed A's epoch 0; an append
+        // naming B must not mint epoch 1 under B before the floor refuses.
+        p.a.seal_stream_scoped(cohort_scope::FAMILY, Some(&fam_a), &s2, None, None)
+            .await
+            .unwrap();
+        let r = append(s2.clone(), fam_b.clone(), 1).await;
+        assert!(
+            refused_elsewhere(&r),
+            "I508 (c) refused after the seal too: {r:?}"
+        );
+        let rows = sa.stream_dek_list(&s2).await.unwrap();
+        assert!(
+            rows.len() == 1 && rows[0].epoch == 0 && rows[0].terminated,
+            "I508 (c) no DEK row was minted for the refused cohort: {rows:?}"
+        );
+    }
+
     pub(crate) async fn i314_the_cap_rolls_the_epoch<B>(
         dsn_a: &str,
         dsn_b: &str,
@@ -1978,6 +2085,12 @@ mod runners {
                         $pick,
                     )
                     .await
+                }
+                #[tokio::test]
+                async fn i508() {
+                    let Some((a, b)) = $dsns else { return };
+                    bodies::i508_an_append_elsewhere_moves_no_key(&a, &b, &super::suffix(), $pick)
+                        .await
                 }
                 #[tokio::test]
                 async fn i315() {
