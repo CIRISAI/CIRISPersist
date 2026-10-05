@@ -246,6 +246,9 @@ pub(crate) mod reindex_bodies {
     /// instant and signature. With `… AND withdrawn_at IS NULL`, the loser
     /// writes nothing, re-reads, and answers already-withdrawn. `arm` plants
     /// the rival at the point between the door's read and its write.
+    // The rival seam exists on sqlite and postgres only (memory writes under
+    // one lock); the no-backend shapes build this module without a runner.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     pub(crate) async fn i524_the_withdrawal_write_is_a_compare_and_set<B>(
         b: &B,
         tag: &str,
