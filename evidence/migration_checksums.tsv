@@ -329,3 +329,5 @@ sqlite	175	stream_chunks_by_sha	17781262640384955740
 postgres	175	stream_chunks_by_sha	2121833823747604791
 sqlite	176	dag_chunk_links	8861214511825214801
 postgres	176	dag_chunk_links	12453302178328937307
+sqlite	177	blob_group_key_id	9363724209484060146
+postgres	177	blob_group_key_id	12164941800565710765

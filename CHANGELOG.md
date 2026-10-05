@@ -18,6 +18,11 @@ v53.1.1 documented that the final bundle's serve node `ciris-canonical-1-d7bdeu2
 ### Certify — the clippy leg runs CI's invocation too
 `scripts/certify.sh`'s `clippy` leg now also runs `cargo clippy --all-features --all-targets -- -D warnings` after the lint-shape pass: CI's lint job does, and it compiles the `test-anchor` integration tests the lint shape does not (v53.1.1 lost a PR CI round to a `redundant_guards` lint certify never saw).
 
+### Fixed — a family rekey crossed families; a family blob had no audience (#984 rows 1 and 4, V177)
+The retroactive key-grant ADD walk (`rekey_for_newcomers`) took its cohort-visibility set as "every blob and every stream epoch at this scope on which any existing recipient holds a wrap". A person active in TWO families holds wraps on both families' content, so growing family A by a newcomer wrapped family B's stream epochs and blobs to them — a disclosure across families (row 1). The same missing fact made row 4: `federation_blobs` recorded the cohort and the author but not the group the row was sealed for, so `durability_deficit` resolved every family blob's audience to `Unresolvable` — an empty deficit, nothing ever reported missing.
+
+**V177 `federation_blobs.group_key_id`** (both dialects; no backfill — nothing on disk records a pre-V177 row's group) is stamped by every local store door from what the scoped door was handed: `store_blob_local` and `ManifestRowSpec` take `group_key_id`, the chunk floor stamps the claim's `community_key_id`. `list_at_rest_blobs_for_recipients` and `stream_dek_list_for_recipients` take the group and join on it — a NULL-group row is excluded (fail-secure: an unknown family is not this family); `rekey_for_newcomers` and `device_lacks_cohort_keys` are bounded by it, and every driver passes the owner or family it re-keys for. `BlobProvenanceRow.group_key_id` is what `durability_deficit` resolves a family blob's audience from. **I506** (a member of two families; a family-A grow wraps exactly family A's epoch and blob) and **I507** (a family blob's deficit names the family's nodes; the row and the sealed manifest record the family), both red on the unfixed code, sqlite and postgres. Mutation-checked: dropping the group filter at any of the four SQL sites reds I506 on its backend.
+
 ## [53.1.1] - 2026-10-05
 
 ### THE FINAL GENESIS IS BAKED
