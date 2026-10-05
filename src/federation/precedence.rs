@@ -192,9 +192,17 @@ fn wins(a: &Attestation, b: &Attestation) -> bool {
 /// (deferred out-of-order admission, malformed, non-`withdraws`), so arm 3
 /// is only ever an ADMITTING arm, never the sole test.
 pub fn retraction_entitled(g: &Attestation, target: &Attestation) -> bool {
-    g.attesting_key_id == target.attesting_key_id
-        || target.subject_key_ids.contains(&g.attesting_key_id)
-        || g.withdraws_admission_rule.is_some()
+    if g.attesting_key_id == target.attesting_key_id {
+        return true;
+    }
+    // v53.1.2 (CIRISPersist#984 row 12, CC 2.4.1.1) — a `recants` is the
+    // ATTESTER's act alone (a falsity admission about one's own statement);
+    // the subject's path is `withdraws` (rule 2) or a contradicting `scores`.
+    // Arms 2 and 3 are `withdraws` entitlements, so they admit `withdraws`
+    // only — here, and therefore at the door that runs this predicate.
+    g.attestation_type == attestation_type::WITHDRAWS
+        && (target.subject_key_ids.contains(&g.attesting_key_id)
+            || g.withdraws_admission_rule.is_some())
 }
 
 /// v36.0.0 (CIRISPersist#686) — **THE consolidated retraction fold.**

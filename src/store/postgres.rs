@@ -11071,6 +11071,75 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         Ok(())
     }
 
+    async fn withdraw_location_proof(
+        &self,
+        proof: crate::federation::SignedLocationProof,
+    ) -> Result<(), crate::federation::Error> {
+        use crate::federation::location::{
+            check_location_proof_withdrawal, LocationProofWithdrawal,
+        };
+        // #984 row 16 — the signature and standing legs, exactly as a put.
+        crate::federation::verify_location_proof_admission(self, &proof).await?;
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let subject = proof.location_proof.subject_key_id.clone();
+        let asserted_at = proof.location_proof.asserted_at;
+        let held = client
+            .query_opt(
+                "SELECT * FROM cirislens.federation_location_proofs \
+                  WHERE subject_key_id = $1 AND asserted_at = $2",
+                &[&subject, &asserted_at],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("withdraw_location_proof read: {e}"))
+            })?
+            .map(pg_row_to_signed_location_proof)
+            .transpose()?;
+        let Some(held) = held else {
+            return Err(crate::federation::Error::InvalidArgument(format!(
+                "location_proof_withdraw_not_held: no proof by {subject} at {asserted_at} is held \
+                 here"
+            )));
+        };
+        match check_location_proof_withdrawal(&held, &proof)? {
+            LocationProofWithdrawal::AlreadyWithdrawn => return Ok(()),
+            LocationProofWithdrawal::Apply => {}
+        }
+        let mut row = proof.location_proof;
+        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+        // The row moves to a fresh serve position (V130) so a peer past its
+        // cursor is served the withdrawal.
+        let admitted_at = self
+            .next_plane_position(&client, "federation_location_proofs")
+            .await?;
+        client
+            .execute(
+                "UPDATE cirislens.federation_location_proofs \
+                    SET withdrawn_at = $3, persist_row_hash = $4, authority_key_id = $5, \
+                        scrub_signature_classical = $6, scrub_signature_pqc = $7, \
+                        admitted_at = $8 \
+                  WHERE subject_key_id = $1 AND asserted_at = $2",
+                &[
+                    &subject,
+                    &asserted_at,
+                    &row.withdrawn_at,
+                    &row.persist_row_hash,
+                    &proof.authority_key_id,
+                    &proof.scrub_signature_classical,
+                    &proof.scrub_signature_pqc,
+                    &admitted_at,
+                ],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("withdraw_location_proof: {e}"))
+            })?;
+        Ok(())
+    }
+
     async fn list_location_proofs_for(
         &self,
         subject_key_id: &str,

@@ -9705,6 +9705,82 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         Ok(())
     }
 
+    async fn withdraw_location_proof(
+        &self,
+        proof: crate::federation::SignedLocationProof,
+    ) -> Result<(), crate::federation::Error> {
+        use crate::federation::location::{
+            check_location_proof_withdrawal, LocationProofWithdrawal,
+        };
+        // #984 row 16 — the signature and standing legs, exactly as a put.
+        crate::federation::verify_location_proof_admission(self, &proof).await?;
+        let subject = proof.location_proof.subject_key_id.clone();
+        let asserted = proof.location_proof.asserted_at.to_rfc3339();
+        let (s, a) = (subject.clone(), asserted.clone());
+        let held = self
+            .read(
+                move |conn| -> Result<
+                    Option<crate::federation::SignedLocationProof>,
+                    rusqlite::Error,
+                > {
+                    conn.query_row(
+                        "SELECT * FROM federation_location_proofs \
+                          WHERE subject_key_id = ?1 AND asserted_at = ?2",
+                        rusqlite::params![s, a],
+                        sqlite_row_to_signed_location_proof,
+                    )
+                    .optional()
+                },
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("withdraw_location_proof read: {e}"))
+            })?;
+        let Some(held) = held else {
+            return Err(crate::federation::Error::InvalidArgument(format!(
+                "location_proof_withdraw_not_held: no proof by {subject} at {asserted} is held here"
+            )));
+        };
+        match check_location_proof_withdrawal(&held, &proof)? {
+            LocationProofWithdrawal::AlreadyWithdrawn => return Ok(()),
+            LocationProofWithdrawal::Apply => {}
+        }
+        let mut row = proof.location_proof;
+        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+        let withdrawn_at = row.withdrawn_at.map(|t| t.to_rfc3339());
+        let persist_row_hash = row.persist_row_hash;
+        let authority_key_id = proof.authority_key_id;
+        let scrub_signature_classical = proof.scrub_signature_classical;
+        let scrub_signature_pqc = proof.scrub_signature_pqc;
+        self.write(move |conn| -> Result<(), rusqlite::Error> {
+            // The row moves to a fresh serve position (V130) so a peer past
+            // its cursor is served the withdrawal.
+            let admitted_at =
+                sqlite_next_plane_position(conn, "federation_location_proofs", POS_ASSERTED)?;
+            conn.execute(
+                "UPDATE federation_location_proofs \
+                    SET withdrawn_at = ?3, persist_row_hash = ?4, authority_key_id = ?5, \
+                        scrub_signature_classical = ?6, scrub_signature_pqc = ?7, \
+                        admitted_at = ?8 \
+                  WHERE subject_key_id = ?1 AND asserted_at = ?2",
+                rusqlite::params![
+                    subject,
+                    asserted,
+                    withdrawn_at,
+                    persist_row_hash,
+                    authority_key_id,
+                    scrub_signature_classical,
+                    scrub_signature_pqc,
+                    admitted_at.to_rfc3339(),
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| crate::federation::Error::Backend(format!("withdraw_location_proof: {e}")))?;
+        Ok(())
+    }
+
     async fn list_location_proofs_for(
         &self,
         subject_key_id: &str,

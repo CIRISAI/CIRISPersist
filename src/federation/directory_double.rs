@@ -134,7 +134,7 @@ impl FaultInjectingDirectory {
     }
 }
 
-// 112 delegations, generated. Every one: fault first, then delegate.
+// 113 delegations, generated. Every one: fault first, then delegate.
 #[async_trait::async_trait]
 impl FederationDirectory for FaultInjectingDirectory {
     async fn accord_nonce_issued(&self, family_key_id: &str, nonce: &str) -> Result<bool, Error> {
@@ -1213,5 +1213,11 @@ impl FederationDirectory for FaultInjectingDirectory {
     }
     fn trust_root_standing_cache(&self) -> Option<&canonical_community::StandingCache> {
         self.inner.trust_root_standing_cache()
+    }
+    async fn withdraw_location_proof(&self, proof: SignedLocationProof) -> Result<(), Error> {
+        if let Some(e) = self.faulted("withdraw_location_proof") {
+            return Err(e);
+        }
+        self.inner.withdraw_location_proof(proof).await
     }
 }

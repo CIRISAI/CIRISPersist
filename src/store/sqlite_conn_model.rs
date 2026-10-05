@@ -607,6 +607,7 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("put_identity_occurrence_revocation_local", ConnClass::Write),
     ("put_installed_storage_budget", ConnClass::Write),
     ("put_location_proof", ConnClass::Write),
+    ("withdraw_location_proof", ConnClass::Write),
     ("put_org_membership", ConnClass::Write),
     ("put_organization", ConnClass::Write),
     ("put_partner_record", ConnClass::Write),

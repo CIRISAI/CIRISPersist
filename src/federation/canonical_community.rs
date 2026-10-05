@@ -1937,6 +1937,28 @@ where
     if digest.is_empty() {
         return Ok(None);
     }
+    Ok(live_charter_rows(directory, family)
+        .await?
+        .into_iter()
+        .find(|a| a.persist_row_hash == digest))
+}
+
+/// v53.1.2 (CIRISPersist#984 rows 5 and 18) — **every live charter row of
+/// `family`**: the predicate [`live_charter_row`] picks from, and the set
+/// [`charter_members_for`] reads the head's charter out of. One filter —
+/// charter-labelled `delegates_to` toward the family, direction standing,
+/// not retired — so a withdrawn charter is a charter to no reader.
+///
+/// # Errors
+///
+/// Directory read failures.
+pub async fn live_charter_rows<F>(
+    directory: &F,
+    family: &str,
+) -> Result<Vec<super::Attestation>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
     let is_charter = |a: &super::Attestation| {
         a.attestation_type == super::types::attestation_type::DELEGATES_TO
             && a.attested_key_id == family
@@ -1951,12 +1973,14 @@ where
     let denied =
         super::trust_root::direction_denied_ids(directory, rows.iter().filter(|a| is_charter(a)))
             .await?;
-    Ok(rows.into_iter().find(|a| {
-        a.persist_row_hash == digest
-            && is_charter(a)
-            && !denied.contains(&a.attestation_id)
-            && !retired.contains(&a.attestation_id)
-    }))
+    Ok(rows
+        .into_iter()
+        .filter(|a| {
+            is_charter(a)
+                && !denied.contains(&a.attestation_id)
+                && !retired.contains(&a.attestation_id)
+        })
+        .collect())
 }
 
 /// Read a root's charter members from the charter in force
@@ -1969,25 +1993,13 @@ where
     F: FederationDirectory + ?Sized,
 {
     use super::envelope::paths;
-    let is_charter = |a: &super::Attestation| {
-        a.attestation_type == super::types::attestation_type::DELEGATES_TO
-            && super::trust_root::job_dimension_admits(
-                &a.attestation_envelope,
-                super::trust_root::TRUST_CHARTER_DIMENSION,
-            )
-    };
     // The charter names its lineage as its ATTESTED key (a key root charters
-    // itself; the accord's holders charter their family).
+    // itself; the accord's holders charter their family). v53.1.2 (#984 row
+    // 18) — the LIVE rows (direction standing, not retired: the one filter
+    // `live_charter_rows` is), then those the head admits.
     let in_force = |owner: String, head: HeadCharter| async move {
-        let mut rows = directory.list_attestations_for(&owner).await?;
-        // #973 (CC 3.2 T4a) — an unlabelled row is a charter only where its
-        // direction reading stands (held, or a pinned-bundle row).
-        let denied = super::trust_root::direction_denied_ids(
-            directory,
-            rows.iter().filter(|a| is_charter(a)),
-        )
-        .await?;
-        rows.retain(|a| is_charter(a) && !denied.contains(&a.attestation_id) && head.admits(a));
+        let mut rows = live_charter_rows(directory, &owner).await?;
+        rows.retain(|a| head.admits(a));
         Ok::<_, Error>(rows)
     };
     let (owner, head) = charter_in_force(directory, root_key_id).await?;

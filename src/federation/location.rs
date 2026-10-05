@@ -121,6 +121,76 @@ pub fn geographic_constraint_cell(policy_blob: Option<&serde_json::Value>) -> Op
         .map(str::to_owned)
 }
 
+/// v53.1.2 (CIRISPersist#984 row 16, CC 3.3.3) — what a withdrawal of a held
+/// location proof resolves to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocationProofWithdrawal {
+    /// The held row is already withdrawn: a re-offer is a no-op (the first
+    /// withdrawal's instant stands).
+    AlreadyWithdrawn,
+    /// Apply the offered row's `withdrawn_at` (and its signature) to the held
+    /// row.
+    Apply,
+}
+
+/// v53.1.2 (CIRISPersist#984 row 16, CC 3.3.3 "a `withdraws` ends a proof")
+/// — **the one check every backend's `withdraw_location_proof` runs**, after
+/// the signature and standing legs (`verify_location_proof_admission`):
+/// the offered row IS a withdrawal (`withdrawn_at` set); it is the held proof
+/// (same cell, resolution, validity and evidence — only `withdrawn_at`
+/// differs), and it is signed by the proof's own attester (the held row's
+/// `authority_key_id`): a delegate who did not sign the proof cannot end it,
+/// nor can the subject end a delegate's.
+///
+/// The withdrawal is a RE-SIGNED row rather than a server-stamped column
+/// because the signing envelope covers `withdrawn_at`: a column written
+/// behind the signature would leave a held row whose stored signature no
+/// longer verifies, and the replication plane serves signed rows only.
+///
+/// # Errors
+///
+/// [`Error::InvalidArgument`] carrying `location_proof_withdraw_not_a_withdrawal`,
+/// `location_proof_withdraw_not_the_attester` or
+/// `location_proof_withdraw_mismatch`.
+pub fn check_location_proof_withdrawal(
+    held: &crate::federation::SignedLocationProof,
+    offered: &crate::federation::SignedLocationProof,
+) -> Result<LocationProofWithdrawal, Error> {
+    if offered.location_proof.withdrawn_at.is_none() {
+        return Err(Error::InvalidArgument(
+            "location_proof_withdraw_not_a_withdrawal: the offered row carries no `withdrawn_at` \
+             (CC 3.3.3)"
+                .into(),
+        ));
+    }
+    if offered.authority_key_id != held.authority_key_id {
+        return Err(Error::InvalidArgument(format!(
+            "location_proof_withdraw_not_the_attester: {} did not attest the held proof ({} did); \
+             only the proof's own attester ends it (CC 3.3.3)",
+            offered.authority_key_id, held.authority_key_id
+        )));
+    }
+    let (h, o) = (&held.location_proof, &offered.location_proof);
+    if h.subject_key_id != o.subject_key_id
+        || h.asserted_at != o.asserted_at
+        || h.cell_id != o.cell_id
+        || h.cell_resolution != o.cell_resolution
+        || h.valid_until != o.valid_until
+        || h.attestation_evidence != o.attestation_evidence
+    {
+        return Err(Error::InvalidArgument(
+            "location_proof_withdraw_mismatch: the offered row is not the held proof with \
+             `withdrawn_at` set — a withdrawal changes nothing else"
+                .into(),
+        ));
+    }
+    Ok(if h.withdrawn_at.is_some() {
+        LocationProofWithdrawal::AlreadyWithdrawn
+    } else {
+        LocationProofWithdrawal::Apply
+    })
+}
+
 /// v4.11.0 (CIRISPersist#154 Ask 4 / §8.1.13.2 geographic predicate) —
 /// is `member_proofs` sufficient to admit a member into a geographic
 /// community bounded by `constraint_cell`? True iff the member has at

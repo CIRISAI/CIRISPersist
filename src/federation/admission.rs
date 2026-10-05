@@ -8198,6 +8198,32 @@ pub async fn check_withdraws_admission_at(
     row: &super::Attestation,
     depth: usize,
 ) -> Result<Option<u8>, Error> {
+    // v53.1.2 (CIRISPersist#984 row 12, CC 2.4.1.1) — a `recants` is admitted
+    // only from the target's own attester: the ONE entitlement predicate the
+    // read-side fold runs (`precedence::retraction_entitled`), asked at the
+    // door, so the two cannot disagree. A target not yet held defers to that
+    // fold, as a `withdraws` does.
+    if row.attestation_type == attestation_type::RECANTS {
+        let Some(target_id) =
+            crate::federation::precedence::references_attestation_id_from_envelope(
+                &row.attestation_envelope,
+            )
+        else {
+            return Ok(None);
+        };
+        let Some(target) = directory.get_attestation(target_id).await? else {
+            return Ok(None);
+        };
+        if !crate::federation::precedence::retraction_entitled(row, &target) {
+            return Err(Error::InvalidArgument(format!(
+                "recants_not_admitted: {} is not the attester of {target_id} — only the original \
+                 attester recants (CC 2.4.1.1); a subject's path is `withdraws` or a \
+                 contradicting `scores`",
+                row.attesting_key_id
+            )));
+        }
+        return Ok(None);
+    }
     if row.attestation_type != attestation_type::WITHDRAWS {
         return Ok(None);
     }

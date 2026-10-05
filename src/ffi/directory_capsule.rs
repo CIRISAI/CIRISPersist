@@ -4306,6 +4306,12 @@ impl FederationDirectory for OpsDirectory {
             method: "list_location_proofs_for",
         })
     }
+
+    async fn withdraw_location_proof(&self, _proof: SignedLocationProof) -> Result<(), Error> {
+        Err(Error::Unsupported {
+            method: "withdraw_location_proof",
+        })
+    }
     async fn communities_containing(&self, cell_id: &str) -> Result<Vec<Community>, Error> {
         Err(Error::Unsupported {
             method: "communities_containing",
