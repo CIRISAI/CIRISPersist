@@ -18,6 +18,12 @@
 //!   rule and propagates its refusal.
 //! - **I450h** the standing roster is the HELD head's: cosigns from the holder
 //!   being added do not count toward the majority.
+//! - **I509** (v53.1.2, CIRISPersist#984 row 3) a recovery's exception
+//!   expires with its charter: a version naming a new charter must commit the
+//!   holder a recovery seated under the old one.
+//! - **I510** (#984 row 5) the charter a version names must be a LIVE charter
+//!   row: a withdrawn one is `accord_charter_not_held`.
+//! - **I511** (#984 row 6) a roster listing a seat twice is refused by name.
 
 #[cfg(test)]
 pub(crate) mod bodies {
@@ -132,6 +138,21 @@ pub(crate) mod bodies {
         yes: &[&str],
         author: &str,
     ) -> SignedFamily {
+        version_shaped(d, change, decision, charter, yes, author, |_| {}).await
+    }
+
+    /// [`version`] with the offered record reshaped by `shape` BEFORE the
+    /// envelope binds its hash — for a version that is bound and signed as
+    /// offered yet malformed (#984 row 6: a seat listed twice).
+    pub(crate) async fn version_shaped(
+        d: &dyn FederationDirectory,
+        change: &SeatChange,
+        decision: &str,
+        charter: &str,
+        yes: &[&str],
+        author: &str,
+        shape: impl FnOnce(&mut Family),
+    ) -> SignedFamily {
         let accord = accord_family_key_id();
         let head = held(d).await;
         let mut next = head.clone();
@@ -146,6 +167,7 @@ pub(crate) mod bodies {
         next.prev_head_digest = head.persist_row_hash.clone();
         next.charter_digest = charter.to_owned();
         next.persist_row_hash = String::new();
+        shape(&mut next);
         let mut c = serde_json::to_value(change).unwrap();
         c["decision"] = serde_json::json!(decision);
         let env = serde_json::json!({
@@ -497,6 +519,192 @@ pub(crate) mod bodies {
         assert!(!ids(&held(d).await).contains(&gone), "I450g: removed");
     }
 
+    /// The accord's held row of the charter `digest` names.
+    async fn charter_row(
+        d: &dyn FederationDirectory,
+        digest: &str,
+    ) -> crate::federation::Attestation {
+        d.list_attestations_for(accord_family_key_id())
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|a| a.persist_row_hash == digest)
+            .expect("the charter row is held")
+    }
+
+    /// A version of the accord naming `charter`, same roster, under the held
+    /// holders' quorum (the head-version shape).
+    async fn naming(d: &dyn FederationDirectory, charter: &str) -> Result<u32, Error> {
+        let holders = ids(&held(d).await);
+        ops::version_family_naming_charter(d, accord_family_key_id(), charter, &holders).await
+    }
+
+    /// **I509** (v53.1.2, CIRISPersist#984 row 3) — **a recovery's
+    /// exception expires with its charter.** A holder seated by a recovery
+    /// under charter C₁ needs no entry in C₁ (the recovery's next commitment
+    /// stands in). A later version naming C₂ is a fresh commitments table:
+    /// every seat is covered by C₂, or by a recovery made UNDER C₂. Before,
+    /// the recovery statements were folded over the whole lineage, so the
+    /// recovered key kept its exception under every later charter.
+    pub async fn i509_a_recovery_exception_expires_with_its_charter(
+        d: &dyn FederationDirectory,
+        tag: &str,
+    ) {
+        use crate::federation::accord_recovery::{
+            draft_accord_recovery, recover_accord_holder, AccordRecoveryRequest,
+        };
+        use crate::federation::trust_root::{recovery_commitment, test_committed_key};
+        stand_up(d).await;
+        let accord = accord_family_key_id();
+        let holders = ids(&held(d).await);
+        // C₁: the holders' test recovery pairs, in force.
+        let c1 = rescrub(d, &holders, &format!("{tag}-c1")).await;
+        naming(d, &c1)
+            .await
+            .unwrap_or_else(|e| panic!("I509: C₁ in force: {e}"));
+        // A recovery under C₁: holders[0] → k2 under holders[0]'s committed
+        // recovery key.
+        let k2 = newcomer(d, tag).await;
+        let rk = format!("{}-recovery", holders[0]);
+        ts::register_hybrid_key_as(d, &rk, &rk, identity_type::NODE).await;
+        let draft = draft_accord_recovery(
+            d,
+            &AccordRecoveryRequest {
+                family_key_id: accord.to_owned(),
+                old_holder_key_id: holders[0].clone(),
+                new_holder_key_id: k2.clone(),
+                recovery_key_id: rk.clone(),
+                next_recovery_commitment: recovery_commitment(&test_committed_key(&format!(
+                    "{k2}-recovery"
+                )))
+                .unwrap(),
+                joined_at: chrono::Utc::now(),
+            },
+        )
+        .await
+        .unwrap_or_else(|e| panic!("I509: draft: {e}"));
+        let r = ts::threshold_sign(&rk, &draft.statement_bytes);
+        let r = (
+            r.ed25519_signature_base64,
+            r.mldsa65_signature_base64.unwrap(),
+        );
+        let n = ops::Identity::new(&k2).sign_bytes(&draft.record_bytes);
+        recover_accord_holder(d, draft, r, n)
+            .await
+            .unwrap_or_else(|e| panic!("I509: the recovery under C₁: {e}"));
+        let after = held(d).await;
+        assert!(
+            ids(&after).contains(&k2) && !ids(&after).contains(&holders[0]),
+            "I509 precondition — k2 holds the seat: {after:?}"
+        );
+        assert_eq!(after.charter_digest, c1, "I509 precondition — still C₁");
+        // C₂ omits k2: the exception made under C₁ does not carry.
+        let rest = vec![holders[1].clone(), holders[2].clone()];
+        let c2_short = rescrub(d, &rest, &format!("{tag}-c2s")).await;
+        refused(
+            naming(d, &c2_short).await,
+            "accord_recovery_commitment_missing",
+            "I509: C₂ must commit the recovered holder",
+        );
+        assert_eq!(held(d).await, after, "I509: nothing written");
+        // Control: C₂ committing every seat, the recovered one included.
+        let seated = ids(&after);
+        let c2 = rescrub(d, &seated, &format!("{tag}-c2")).await;
+        naming(d, &c2)
+            .await
+            .unwrap_or_else(|e| panic!("I509: C₂ committing k2 is admitted: {e}"));
+        assert_eq!(held(d).await.charter_digest, c2, "I509: C₂ in force");
+    }
+
+    /// Withdraw `target` (an attestation id) as its own attester.
+    async fn withdraw(d: &dyn FederationDirectory, id: &str, attester: &str, target: &str) {
+        let env = serde_json::json!({
+            "references_attestation_id": target, "withdrawal_reason": "#984 row 5",
+        });
+        let mut w = ts::bare_attestation(id, attester, attester, &env);
+        w.attestation_type = attestation_type::WITHDRAWS.into();
+        w.cohort_scope = "federation".into();
+        ts::seal_row_in_place(attester, &mut w);
+        d.put_attestation(crate::federation::SignedAttestation { attestation: w })
+            .await
+            .unwrap_or_else(|e| panic!("withdraw {target}: {e}"));
+    }
+
+    /// **I510** (v53.1.2, CIRISPersist#984 row 5) — **the charter a version
+    /// names must be a LIVE charter row.** Before, any held attestation whose
+    /// row hash matched was taken — withdrawn or not, charter-labelled or
+    /// not. A version naming a withdrawn charter is `accord_charter_not_held`.
+    pub async fn i510_a_withdrawn_charter_is_not_held(d: &dyn FederationDirectory, tag: &str) {
+        stand_up(d).await;
+        let holders = ids(&held(d).await);
+        let c = rescrub(d, &holders, tag).await;
+        naming(d, &c)
+            .await
+            .unwrap_or_else(|e| panic!("I510: the charter is admitted in force: {e}"));
+        let before = held(d).await;
+        let row = charter_row(d, &c).await;
+        withdraw(
+            d,
+            &format!("ar-w-{tag}"),
+            &row.attesting_key_id,
+            &row.attestation_id,
+        )
+        .await;
+        refused(
+            naming(d, &c).await,
+            "accord_charter_not_held",
+            "I510: a version naming the withdrawn charter",
+        );
+        assert_eq!(held(d).await, before, "I510: nothing written");
+    }
+
+    /// **I511** (v53.1.2, CIRISPersist#984 row 6) — **a roster that lists a
+    /// seat twice is refused by name.** The set compare collapsed the
+    /// duplicate, so the version was admitted and stored with it, inflating
+    /// every later standing count.
+    pub async fn i511_a_seat_listed_twice_is_refused(d: &dyn FederationDirectory, tag: &str) {
+        stand_up(d).await;
+        let before = held(d).await;
+        let holders = ids(&before);
+        let new = newcomer(d, tag).await;
+        let change = adding(&new, before.members[0].role.clone());
+        let mut grown = holders.clone();
+        grown.push(new.clone());
+        let charter = rescrub(d, &grown, tag).await;
+        let decision = decide(
+            d,
+            &change,
+            chrono::Utc::now() - chrono::Duration::hours(1),
+            true,
+            &format!("ar-d-{tag}"),
+        )
+        .await;
+        let twice = version_shaped(
+            d,
+            &change,
+            &decision,
+            &charter,
+            &[&holders[0], &holders[1]],
+            &new,
+            |f| {
+                let seat = f
+                    .members
+                    .iter()
+                    .find(|m| m.key_id == new)
+                    .cloned()
+                    .expect("the added seat");
+                f.members.push(seat);
+            },
+        )
+        .await;
+        refused(
+            apply(d, twice).await,
+            "accord_roster_change_uncovered",
+            "I511: a seat listed twice",
+        );
+        assert_eq!(held(d).await, before, "I511: nothing written");
+    }
+
     /// **I450h** — the majority is of the HELD head's roster: the added
     /// holder's own cosign does not count toward it.
     pub async fn i450h_the_standing_roster_is_the_held_heads(
@@ -638,6 +846,21 @@ mod run {
                 async fn i450h() {
                     let Some(b) = $fresh.await else { return };
                     bodies::i450h_the_standing_roster_is_the_held_heads(&b, &suffix()).await
+                }
+                #[tokio::test]
+                async fn i509() {
+                    let Some(b) = $fresh.await else { return };
+                    bodies::i509_a_recovery_exception_expires_with_its_charter(&b, &suffix()).await
+                }
+                #[tokio::test]
+                async fn i510() {
+                    let Some(b) = $fresh.await else { return };
+                    bodies::i510_a_withdrawn_charter_is_not_held(&b, &suffix()).await
+                }
+                #[tokio::test]
+                async fn i511() {
+                    let Some(b) = $fresh.await else { return };
+                    bodies::i511_a_seat_listed_twice_is_refused(&b, &suffix()).await
                 }
             }
         };
