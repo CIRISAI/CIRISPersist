@@ -42,6 +42,13 @@
 //! - **I319** (sqlite, postgres) — single sender: a second floor append at an
 //!   already-used counter is refused `stream_counter_moved` and stores
 //!   nothing; a foreign writer is refused at its first chunk (I41).
+//! - **I506** (sqlite, postgres; v53.1.2, CIRISPersist#984 row 1) — a
+//!   family's retroactive ADD walk stays in its family: a member of two
+//!   families holds both families' keys, and growing one family wraps only
+//!   that family's stream epochs and blobs to the newcomer.
+//! - **I507** (sqlite, postgres; #984 row 4) — a family blob's row records
+//!   the family it was sealed for, so its durability deficit names the
+//!   family's nodes instead of an unresolvable (empty) audience.
 
 // Test-only (the module is `cfg(test)` at its declaration too); marked here
 // so the from-disk floor gate (I14) reads its direct floor calls as tests.
@@ -867,6 +874,165 @@ pub(crate) mod bodies {
                 "I397d the {label} row grants the server-class phone no self key"
             );
         }
+    }
+
+    /// q's device for the cross-family witnesses: a NODE key with its own
+    /// content-KEM keys, bound as q's occurrence on `sa` (owner binding too).
+    async fn device_of<B>(sa: &B, q: &str, alias: &str) -> String
+    where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        use crate::federation::tier_ingest::test_support as ts;
+        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+        let dev = ts::local_signer(alias).derived_key_id();
+        ts::register_hybrid_key_as(
+            sa,
+            &dev,
+            alias,
+            crate::federation::types::identity_type::NODE,
+        )
+        .await;
+        let (_x_priv, x_pub, _ml_priv, ml_pub) =
+            crate::federation::identity_aggregate::mint_content_kem_keypair().unwrap();
+        let kem = crate::federation::EncryptionPubkeys {
+            x25519_base64: B64.encode(x_pub),
+            ml_kem_768_base64: B64.encode(&ml_pub),
+        };
+        bind(sa, q, &dev, Some(kem)).await;
+        ts::put_owner_binding(sa, q, &dev).await;
+        dev
+    }
+
+    /// **I506** (v53.1.2, CIRISPersist#984 row 1) — **a family's retroactive
+    /// ADD walk stays in its family.** A person who is an active member of
+    /// TWO families holds wraps on both families' content. Growing family A
+    /// by a newcomer wraps family A's stream epochs and blobs to the newcomer
+    /// — and nothing of family B's, even though A's existing members hold
+    /// B's keys here.
+    pub(crate) async fn i506_a_family_rekey_stays_in_its_family<B>(
+        dsn_a: &str,
+        dsn_b: &str,
+        run: &str,
+        pick: Pick<B>,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync + 'static,
+    {
+        use crate::federation::replication_audience_invariants::bodies as ra;
+        use crate::federation::tier_ingest::test_support as ts;
+        let p = pair(dsn_a, dsn_b, run, pick, "i506").await;
+        let sa = p.sa.as_ref();
+        // q: a second person, in family A with the owner; family B is the
+        // owner's alone.
+        let q = format!("i506-q-{run}");
+        ts::register_hybrid_key_as(sa, &q, &q, crate::federation::types::identity_type::USER).await;
+        let (fam_a, fam_b) = (format!("i506-fam-a-{run}"), format!("i506-fam-b-{run}"));
+        ra::family(sa as &dyn FederationDirectory, &fam_a, &[&p.owner, &q]).await;
+        ra::family(sa as &dyn FederationDirectory, &fam_b, &[&p.owner]).await;
+        // While q has no occurrence: one stream epoch and one whole blob
+        // under each family, so the owner's devices hold both families' keys.
+        let (stream_a, stream_b) = (format!("i506-sa-{run}"), format!("i506-sb-{run}"));
+        for (fam, stream, body) in [
+            (&fam_a, &stream_a, &b"a-only"[..]),
+            (&fam_b, &stream_b, &b"b-only"[..]),
+        ] {
+            p.a.put_blob_chunk_scoped(cohort_scope::FAMILY, Some(fam), stream, 0, body, 0, None)
+                .await
+                .unwrap_or_else(|e| panic!("I506 chunk under {fam}: {e}"));
+        }
+        let blob_a =
+            p.a.put_blob_encrypted_self_family(cohort_scope::FAMILY, &fam_a, b"blob-a", None)
+                .await
+                .unwrap()
+                .at_rest_sha256;
+        let blob_b =
+            p.a.put_blob_encrypted_self_family(cohort_scope::FAMILY, &fam_b, b"blob-b", None)
+                .await
+                .unwrap()
+                .at_rest_sha256;
+        assert!(
+            holds_stream(sa, &stream_a, 0, &p.key_a, &p.key_b).await
+                && holds_stream(sa, &stream_b, 0, &p.key_a, &p.key_b).await,
+            "I506 precondition — the owner's laptop holds both families' epochs"
+        );
+        // q's device appears; q is already an active member of family A.
+        let qdev = device_of(sa, &q, &format!("i506-qdev-{run}")).await;
+        assert!(
+            !holds_stream(sa, &stream_a, 0, &p.key_a, &qdev).await
+                && !holds_stream(sa, &stream_b, 0, &p.key_a, &qdev).await,
+            "I506 precondition — the new device holds nothing yet"
+        );
+
+        let r =
+            p.a.rekey_family_member_add(&fam_a, &q)
+                .await
+                .unwrap_or_else(|e| panic!("I506 rekey_family_member_add: {e}"));
+        assert!(
+            holds_stream(sa, &stream_a, 0, &p.key_a, &qdev).await,
+            "I506 the newcomer holds family A's epoch: {r:?}"
+        );
+        assert!(
+            sa.list_at_rest_grant_recipients(&blob_a)
+                .await
+                .unwrap()
+                .contains(&qdev),
+            "I506 and family A's blob: {r:?}"
+        );
+        assert!(
+            !holds_stream(sa, &stream_b, 0, &p.key_a, &qdev).await,
+            "I506 family B's epoch is not disclosed by a family-A grow: {r:?}"
+        );
+        assert!(
+            !sa.list_at_rest_grant_recipients(&blob_b)
+                .await
+                .unwrap()
+                .contains(&qdev),
+            "I506 nor family B's blob: {r:?}"
+        );
+        assert_eq!(
+            r.changed_streams,
+            vec![(stream_a.clone(), 0, fam_a.clone())],
+            "I506 the walk reports exactly family A's epoch"
+        );
+        assert_eq!(
+            r.changed_blobs,
+            vec![blob_a],
+            "I506 and exactly family A's blob"
+        );
+    }
+
+    /// **I507** (v53.1.2, CIRISPersist#984 row 4) — **a family blob's row
+    /// resolves its audience.** The row records the family it was sealed for,
+    /// so the durability deficit names the family's nodes — before, no blob
+    /// row carried a group and every family blob's audience was
+    /// `Unresolvable`: an empty deficit, nothing ever reported missing.
+    pub(crate) async fn i507_a_family_blob_resolves_its_audience<B>(
+        dsn_a: &str,
+        dsn_b: &str,
+        run: &str,
+        pick: Pick<B>,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync + 'static,
+    {
+        use crate::federation::durability::DeficitAudience;
+        use crate::federation::replication_audience_invariants::bodies as ra;
+        let p = pair(dsn_a, dsn_b, run, pick, "i507").await;
+        let sa = p.sa.as_ref();
+        let fam = format!("i507-fam-{run}");
+        ra::family(sa as &dyn FederationDirectory, &fam, &[&p.owner]).await;
+        let blob =
+            p.a.put_blob_encrypted_self_family(cohort_scope::FAMILY, &fam, b"family blob", None)
+                .await
+                .unwrap()
+                .at_rest_sha256;
+        let d = p.a.durability_deficit(&blob, &p.key_a, None).await.unwrap();
+        assert!(
+            matches!(&d.audience, DeficitAudience::Nodes(n) if n.contains(&p.key_a) && n.contains(&p.key_b)),
+            "I507 the family's nodes are the blob's audience: {d:?}"
+        );
+        assert!(
+            d.missing.contains(&p.key_b),
+            "I507 so the silent device is reported missing: {d:?}"
+        );
     }
 
     pub(crate) async fn i314_the_cap_rolls_the_epoch<B>(
@@ -1751,6 +1917,23 @@ mod runners {
                     let Some((a, b)) = $dsns else { return };
                     bodies::i397d_a_stale_reclass_changes_nothing(&a, &b, &super::suffix(), $pick)
                         .await
+                }
+                #[tokio::test]
+                async fn i506() {
+                    let Some((a, b)) = $dsns else { return };
+                    bodies::i506_a_family_rekey_stays_in_its_family(&a, &b, &super::suffix(), $pick)
+                        .await
+                }
+                #[tokio::test]
+                async fn i507() {
+                    let Some((a, b)) = $dsns else { return };
+                    bodies::i507_a_family_blob_resolves_its_audience(
+                        &a,
+                        &b,
+                        &super::suffix(),
+                        $pick,
+                    )
+                    .await
                 }
                 #[tokio::test]
                 async fn i315() {
