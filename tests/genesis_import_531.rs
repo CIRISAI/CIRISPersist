@@ -725,6 +725,104 @@ async fn older_bake_keeps_the_newer_birth(
     );
 }
 
+/// I521 (v53.1.2, CIRISPersist#984 row 11) — **a binary whose compiled bundle
+/// is OLDER than the ceremony this node imported leaves every plane on the
+/// imported ceremony at boot**: the delegation rows (`genesis-charter` among
+/// them), the accord head's charter and the `ciris-canonical` birth are still
+/// the imported (newer) ceremony's after the boot, the node serves on that
+/// root (`Entrenched` — the mesh's root is ahead of this binary, which is
+/// allowed), and a boot with the newer bundle compiled in changes nothing.
+async fn older_bake_leaves_the_imported_planes(
+    d: &dyn FederationDirectory,
+    v2: &TestCeremonyOutputs,
+    v3: &TestCeremonyOutputs,
+    tag: &str,
+) {
+    install_test_ceremony_outputs(v3.bundle.clone());
+    let r = install_genesis_bundle_roster(d, &v3.bundle)
+        .await
+        .unwrap_or_else(|e| panic!("{tag} I521: import v3: {e}"));
+    assert_eq!(
+        outcome(&r, "community"),
+        &RosterRecordOutcome::Installed,
+        "{tag} I521: {r:?}"
+    );
+    let planes = snapshot(d).await;
+    let v3_charter = HeadCharter::Named(bundle_family_charter_digest(&v3.bundle));
+    assert_eq!(
+        charter_in_force(d, ACCORD).await.unwrap().1,
+        v3_charter,
+        "{tag} I521: control — v3's charter in force"
+    );
+    // The import is WHOLE on a fresh node: every delegation row is held, and
+    // the charter the head names is a live row (before: the rows were baked
+    // before the head existed, the charter and lifecycle were skipped, and the
+    // next boot's compiled rows filled the holes and took the head with them).
+    for (i, id) in test_ceremony_delegation_ids().iter().enumerate() {
+        assert!(
+            !planes[3 + i].is_empty(),
+            "{tag} I521: the import installed delegation row {id}"
+        );
+    }
+    assert!(
+        ciris_persist::federation::canonical_community::live_charter_row(
+            d,
+            ACCORD,
+            &bundle_family_charter_digest(&v3.bundle),
+        )
+        .await
+        .unwrap()
+        .is_some(),
+        "{tag} I521: the imported charter is a live row"
+    );
+    // The binary is older: v2 is compiled in, and the node boots.
+    boot(d, v2).await;
+    let after = snapshot(d).await;
+    let mut labels = vec![
+        "accord head".to_owned(),
+        "ciris-canonical birth".to_owned(),
+        "serve node record".to_owned(),
+    ];
+    labels.extend(test_ceremony_delegation_ids());
+    let moved: Vec<&String> = labels
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| after[*i] != planes[*i])
+        .map(|(_, l)| l)
+        .collect();
+    let v3_charter_live = ciris_persist::federation::canonical_community::live_charter_row(
+        d,
+        ACCORD,
+        &bundle_family_charter_digest(&v3.bundle),
+    )
+    .await
+    .unwrap()
+    .is_some();
+    assert!(
+        moved.is_empty(),
+        "{tag} I521: the older bake moved these planes: {moved:?} (v3 charter row live after the \
+         boot: {v3_charter_live})"
+    );
+    assert_eq!(
+        charter_in_force(d, ACCORD).await.unwrap().1,
+        v3_charter,
+        "{tag} I521: the accord head's charter is still v3's"
+    );
+    assert_eq!(
+        held_hash(d).await,
+        birth_hash(v3),
+        "{tag} I521: the community birth is still v3's"
+    );
+    let posture = genesis_posture(d).await;
+    assert!(
+        matches!(posture, GenesisPosture::Entrenched),
+        "{tag} I521: the node serves on the newer root: {posture:?}"
+    );
+    // Control: the newer bundle compiled in changes nothing.
+    boot(d, v3).await;
+    assert_eq!(snapshot(d).await, planes, "{tag} I521: idempotent");
+}
+
 /// I503 — **only the compiled-in asset's birth replaces** (Codex on #983):
 /// a caller-supplied row handed to the public seeding function under `Bake`
 /// is never written through the raw supersede door.
@@ -756,6 +854,16 @@ async fn i502_older_bake_keeps_the_newer_birth() {
     let _armed = Armed::with(&v2.block);
     older_bake_keeps_the_newer_birth(&memory().await, &v2, &v3, "memory").await;
     older_bake_keeps_the_newer_birth(&sqlite().await, &v2, &v3, "sqlite").await;
+}
+
+#[serial_test::serial(test_anchor_env)]
+#[tokio::test]
+async fn i521_older_bake_leaves_the_imported_planes() {
+    let (_v1, v2) = vintages();
+    let v3 = mint_test_ceremony(&SEEDS, &NODE_SEED, at(-1)).expect("mint v3");
+    let _armed = Armed::with(&v2.block);
+    older_bake_leaves_the_imported_planes(&memory().await, &v2, &v3, "memory").await;
+    older_bake_leaves_the_imported_planes(&sqlite().await, &v2, &v3, "sqlite").await;
 }
 
 #[serial_test::serial(test_anchor_env)]
@@ -830,5 +938,6 @@ async fn i490_i499_postgres() {
     on_pg!(b => replaced_only_once_the_bundle_charter_is_live(b, &v2, "postgres"));
     on_pg!(b => bake_replaces_the_prior_birth(b, &v1, &v2, &v3, "postgres"));
     on_pg!(b => older_bake_keeps_the_newer_birth(b, &v2, &v3, "postgres"));
+    on_pg!(b => older_bake_leaves_the_imported_planes(b, &v2, &v3, "postgres"));
     on_pg!(b => a_forged_birth_never_replaces(b, &v1, &v2, "postgres"));
 }

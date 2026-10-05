@@ -90,6 +90,98 @@ pub(crate) mod bodies {
         retired_ids(&refs).contains(target)
     }
 
+    /// **I520** (v53.1.2, CIRISPersist#984 row 13) — **only the holder
+    /// retracts its own carrier row.** A `holds_bytes` row is the holder's
+    /// self-attestation. The fold's resolved-rule arm honoured a
+    /// `withdraws_admission_rule` stamp on ANY `withdraws`, and the door's
+    /// `holds_bytes` bypass left a replicated row's stamp in place, so a
+    /// third party's `withdraws` carrying a forged rule retired the holder's
+    /// claim in the fold while `list_holders` (which folds the holder's own
+    /// retractions only) still listed it. Now the stamp is refused at the door
+    /// by name, the fold never lets a rule retire a carrier, and the holder's
+    /// own `withdraws` retires it in both.
+    pub(crate) async fn i520_only_the_holder_retracts_a_carrier(
+        d: &dyn FederationDirectory,
+        tag: &str,
+    ) {
+        use crate::federation::types::identity_type::NODE;
+        let (holder, third) = (format!("i520-h-{tag}"), format!("i520-t-{tag}"));
+        for k in [&holder, &third] {
+            ts::register_identity_key(d, k, NODE).await;
+        }
+        let sha: [u8; 32] = {
+            use sha2::Digest as _;
+            sha2::Sha256::digest(tag.as_bytes()).into()
+        };
+        let claim_id = format!("i520-hb-{tag}");
+        put(
+            d,
+            row(
+                &claim_id,
+                &holder,
+                &holder,
+                &crate::federation::holds_bytes_attestation_type(&sha),
+                serde_json::json!({
+                    "kind": "holds_bytes",
+                    "evidence_refs": [hex::encode(sha)],
+                    "size": 4096,
+                }),
+                Vec::new(),
+            ),
+        )
+        .await
+        .expect("I520 the holder's claim");
+        let listed = || async {
+            d.list_holders_sized(&sha)
+                .await
+                .unwrap()
+                .iter()
+                .any(|h| h.key_id == holder)
+        };
+        assert!(listed().await, "I520 precondition — the holder is listed");
+        // A third party's withdraws carrying a (forged, replicated) resolved
+        // rule: refused at the door by name…
+        let mut forged = composer(
+            &format!("i520-tw-{tag}"),
+            &third,
+            attestation_type::WITHDRAWS,
+            &claim_id,
+        );
+        forged.withdraws_admission_rule = Some(3);
+        ts::reseal(&mut forged);
+        let r = put(d, forged.clone()).await;
+        assert!(
+            r.as_ref()
+                .is_err_and(|e| e.to_string().contains("carrier_withdraws_not_the_holder")),
+            "I520 a third party's stamped withdraws of a carrier is refused by name: {r:?}"
+        );
+        // …and inert in the fold even when offered directly (out of order).
+        let stored = d.get_attestation(&claim_id).await.unwrap().expect("claim");
+        assert!(
+            !retired(&[stored, forged], &claim_id),
+            "I520 the fold never lets a resolved rule retire a carrier"
+        );
+        assert!(listed().await, "I520 the holder is still listed");
+        // The holder's own withdraws retires it in the fold and the listing.
+        put(
+            d,
+            composer(
+                &format!("i520-hw-{tag}"),
+                &holder,
+                attestation_type::WITHDRAWS,
+                &claim_id,
+            ),
+        )
+        .await
+        .expect("I520 the holder withdraws its own claim");
+        let mine = d.list_attestations_by(&holder).await.unwrap();
+        assert!(
+            retired(&mine, &claim_id),
+            "I520 the holder's own withdraws retires it"
+        );
+        assert!(!listed().await, "I520 and the listing agrees");
+    }
+
     /// **I516** — a subject may withdraw, never recant.
     pub(crate) async fn i516_a_subject_may_withdraw_but_not_recant(
         d: &dyn FederationDirectory,
@@ -180,6 +272,15 @@ mod runners {
                 async fn i516() {
                     let Some(d) = $fresh.await else { return };
                     super::super::bodies::i516_a_subject_may_withdraw_but_not_recant(
+                        &d as &dyn FederationDirectory,
+                        &super::suffix(),
+                    )
+                    .await
+                }
+                #[tokio::test]
+                async fn i520() {
+                    let Some(d) = $fresh.await else { return };
+                    super::super::bodies::i520_only_the_holder_retracts_a_carrier(
                         &d as &dyn FederationDirectory,
                         &super::suffix(),
                     )
