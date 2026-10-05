@@ -1310,13 +1310,24 @@ def test_ciris_canonical_trust_root_surface_926() -> None:
             pytest.skip("wheel built without the sqlite feature")
         raise
     try:
-        assert eng.resolve_community_json("ciris-canonical") is None
+        # v53.1.1 — the final genesis is baked: a fresh node boots holding the
+        # ciris-canonical birth (founders A1/B1/C1, the one serve node), live.
+        canon = json.loads(eng.resolve_community_json("ciris-canonical"))
+        assert canon["founders"] == ["A1", "B1", "C1"], canon
+        assert canon["members"] == ["ciris-canonical-1-d7bdeu223k"], canon
+        assert canon["cohort_subkind"] == "infrastructure" and canon["live"] is True, canon
         resp = json.loads(eng.trust_root_bundle_response_json())
         assert resp["charter_root_key_id"] == "humanity-accord"
-        assert resp["community"] is None
+        assert resp["community"]["community"]["community_key_id"] == "ciris-canonical", resp["community"]
         assert isinstance(resp["bundle"]["authorizations"], list)
-        with pytest.raises(ValueError, match="federation_invalid_argument"):
-            eng.pin_trust_from_bundle_response_json(json.dumps(resp))
+        # v53.1.1 — pinning trust from the node's own served response now
+        # succeeds: the response carries the final genesis's v3 bundle and
+        # its live community, and the pin verifies every holder.
+        pinned = json.loads(eng.pin_trust_from_bundle_response_json(json.dumps(resp)))
+        assert pinned["family"] == "humanity-accord", pinned
+        assert pinned["bundle_holders_verified"] == 3, pinned
+        assert pinned["community"]["community_key_id"] == "ciris-canonical", pinned
+        assert pinned["community"]["live"] is True, pinned
         now = "2026-06-25T00:00:00.000Z"
         kid = eng.register_self_federation_key("primitive", "ref", None, None, None)
         base = {

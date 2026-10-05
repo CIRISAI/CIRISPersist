@@ -444,9 +444,14 @@ mod run {
             .iter()
             .find(|a| a.attestation_id == "genesis-charter")
             .expect("the baked charter is stored");
+        // v53.1.1 — the shipped bundle is the FINAL genesis, whose charter is
+        // labelled `trust:charter:v1`: the label charters it, and the
+        // bundle-only rule below is the belt the pinned-bundle membership
+        // still provides (the unlabelled arm stays witnessed on synthetic
+        // rows by I356–I369).
         assert!(
-            crate::federation::trust_root::names_no_trust_job(&charter.attestation_envelope),
-            "I370 precondition: the shipped charter is unlabelled"
+            !crate::federation::trust_root::names_no_trust_job(&charter.attestation_envelope),
+            "I370 precondition: the final genesis's charter is labelled"
         );
         assert!(
             genesis::is_pinned_bundle_row(charter),

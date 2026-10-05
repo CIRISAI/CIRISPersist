@@ -132,7 +132,9 @@ pub(crate) mod bodies {
     pub async fn i345_inert_then_seeds(d: &dyn FederationDirectory) {
         stand_up(d).await;
         assert_eq!(
-            seed_canonical_community_from(d, None).await.unwrap(),
+            seed_canonical_community_from(d, None, crate::federation::genesis::RosterSource::Bake)
+                .await
+                .unwrap(),
             CommunityLegOutcome::NotBaked,
             "I345: no asset, nothing done"
         );
@@ -140,9 +142,11 @@ pub(crate) mod bodies {
         verify_canonical_community_seeded_for(d, None)
             .await
             .expect("I345: no asset, nothing to verify");
-        assert!(
-            crate::federation::genesis::canonical_community_asset().is_none(),
-            "I345: no ceremony has baked the asset on this branch"
+        assert_eq!(
+            crate::federation::genesis::canonical_community_asset()
+                .map(|b| b.community.community_key_id.as_str()),
+            Some(CANON),
+            "I345: the final genesis bakes the ciris-canonical birth (v53.1.1)"
         );
         let asset = birth();
         let fault = verify_canonical_community_seeded_for(d, Some(&asset))
@@ -159,9 +163,13 @@ pub(crate) mod bodies {
             "I345: {fault:?}"
         );
         assert_eq!(
-            seed_canonical_community_from(d, Some(&asset))
-                .await
-                .unwrap(),
+            seed_canonical_community_from(
+                d,
+                Some(&asset),
+                crate::federation::genesis::RosterSource::Bake
+            )
+            .await
+            .unwrap(),
             CommunityLegOutcome::Installed
         );
         let held = d.lookup_community(CANON).await.unwrap().expect("seeded");
@@ -170,9 +178,13 @@ pub(crate) mod bodies {
             .await
             .expect("I345: seeded");
         assert_eq!(
-            seed_canonical_community_from(d, Some(&asset))
-                .await
-                .unwrap(),
+            seed_canonical_community_from(
+                d,
+                Some(&asset),
+                crate::federation::genesis::RosterSource::Bake
+            )
+            .await
+            .unwrap(),
             CommunityLegOutcome::AlreadyHeld,
             "I345: a second boot is a no-op"
         );
@@ -190,9 +202,13 @@ pub(crate) mod bodies {
         // a birth on a node with no roster at all is covered by the fresh
         // backend below; here both refusals come from the signed door
         for (what, asset) in [("under-quorum", weak), ("tampered", forged)] {
-            let fault = seed_canonical_community_from(d, Some(&asset))
-                .await
-                .expect_err(what);
+            let fault = seed_canonical_community_from(
+                d,
+                Some(&asset),
+                crate::federation::genesis::RosterSource::Bake,
+            )
+            .await
+            .expect_err(what);
             assert!(
                 matches!(
                     fault,
@@ -214,9 +230,13 @@ pub(crate) mod bodies {
     /// **I346b — on a node with no accord roster (pre-genesis), the leg is
     /// `Absent` and the node boots.**
     pub async fn i346b_pre_genesis_is_absent(d: &dyn FederationDirectory) {
-        let fault = seed_canonical_community_from(d, Some(&birth()))
-            .await
-            .expect_err("I346b: no roster to verify against");
+        let fault = seed_canonical_community_from(
+            d,
+            Some(&birth()),
+            crate::federation::genesis::RosterSource::Bake,
+        )
+        .await
+        .expect_err("I346b: no roster to verify against");
         assert!(
             matches!(
                 fault,
@@ -239,9 +259,13 @@ pub(crate) mod bodies {
             .await
             .expect("the held record admits");
         assert_eq!(
-            seed_canonical_community_from(d, Some(&birth()))
-                .await
-                .unwrap(),
+            seed_canonical_community_from(
+                d,
+                Some(&birth()),
+                crate::federation::genesis::RosterSource::Bake
+            )
+            .await
+            .unwrap(),
             CommunityLegOutcome::HeldDiffers
         );
         assert_eq!(

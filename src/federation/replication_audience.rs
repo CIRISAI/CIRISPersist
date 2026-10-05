@@ -347,6 +347,20 @@ where
         Ok(None) | Err(Error::Unsupported { .. }) => {}
         Err(e) => return Err(e),
     }
+    // Codex on #978 (CC 3.2 T6, v53 R2a): for a root that holds a lineage
+    // record, the charter in force is the one its HEAD names — a charter row
+    // stored ahead of the version that adopts it confers nothing, so it must
+    // not widen the audience either. A key root has no head, so for it every
+    // live charter-shaped row still stands (the pre-R2a reading).
+    use super::canonical_community::{charter_in_force, HeadCharter};
+    // A head that names a charter: that row, and only that row, counts —
+    // and it must be a live, labelled charter row attested to the group (a
+    // head naming a digest no held row carries confers nothing).
+    let named = match charter_in_force(dir, group).await?.1 {
+        HeadCharter::Named(digest) => Some(digest),
+        HeadCharter::KeyRoot => None,
+        _ => return Ok(false),
+    };
     let about = dir.list_attestations_for(group).await?;
     let refs: Vec<&Attestation> = about.iter().collect();
     let dead = super::precedence::retired_ids(&refs);
@@ -356,6 +370,7 @@ where
             && !dead.contains(&a.attestation_id)
             && super::admission::envelope_dimension(&a.attestation_envelope)
                 == Some(super::trust_root::TRUST_CHARTER_DIMENSION)
+            && named.as_deref().is_none_or(|d| a.persist_row_hash == d)
     }))
 }
 

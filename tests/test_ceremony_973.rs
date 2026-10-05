@@ -201,8 +201,18 @@ async fn i351_boot_from_ceremony_sqlite() {
     let _armed = Armed::with(&c.block);
     let b = sqlite().await;
     // Control: with NO ceremony installed the override skips every leg past
-    // the family, and nothing of the ceremony is there.
-    seed_family_and_canonical(&b).await.unwrap();
+    // the family, and nothing of the ceremony is there. v53.1.1: the compiled
+    // bundle is the FINAL genesis, whose family names A1/B1/C1 — keys this
+    // bare directory does not hold — so on a backend that checks the member
+    // keys the family leg reports Absent; either way nothing past it seeds.
+    match seed_family_and_canonical(&b).await {
+        Ok(()) => {}
+        Err(GenesisFault::Absent {
+            leg: GenesisLeg::Family,
+            ..
+        }) => {}
+        Err(e) => panic!("sqlite I351 control: {e:?}"),
+    }
     assert!(b.lookup_community(CANON).await.unwrap().is_none());
     assert!(b
         .get_attestation("genesis-charter")
@@ -317,11 +327,25 @@ async fn i352_remint_supersedes_on_upgrade() {
             matches!(genesis_posture(d).await, GenesisPosture::Entrenched),
             "{tag} I352: seeded on the re-mint"
         );
-        // The held community is the OLD birth: left in place, never a fault.
+        // v53.1.1 (operator ruling 2026-10-04, I501): the re-mint's bake
+        // REPLACED the held prior-genesis birth at the re-boot; a repeat is
+        // idempotent.
+        assert_eq!(
+            d.lookup_community(CANON)
+                .await
+                .unwrap()
+                .unwrap()
+                .persist_row_hash,
+            ciris_persist::federation::types::compute_persist_row_hash(
+                &new.bundle.community_record(CANON).unwrap().community
+            )
+            .unwrap(),
+            "{tag} I352: the re-boot holds the re-mint's birth"
+        );
         assert_eq!(
             seed_canonical_community(d).await.unwrap(),
-            CommunityLegOutcome::HeldDiffers,
-            "{tag} I352: a held community is never overwritten by the asset"
+            CommunityLegOutcome::AlreadyHeld,
+            "{tag} I352: idempotent"
         );
     }
 }
@@ -493,9 +517,23 @@ async fn i355b_seam_is_inert_without_the_override() {
             baked_holder,
             "I355b: disarmed, the compiled bundle is what every reader sees"
         );
+        // v53.1.1 — disarmed, the compiled bundle is the FINAL genesis: its
+        // birth is the real one (founded by the baked holders), never the
+        // installed ceremony's.
+        let birth = canonical_community_asset()
+            .expect("I355b: disarmed, the compiled bundle carries the final genesis's birth");
         assert!(
-            canonical_community_asset().is_none(),
-            "I355b: disarmed, the compiled bundle (version 2) carries no birth"
+            birth
+                .community
+                .members
+                .iter()
+                .any(|m| m.key_id == baked_holder)
+                && !birth
+                    .community
+                    .members
+                    .iter()
+                    .any(|m| m.key_id == "test-accord-holder-0"),
+            "I355b: disarmed, the birth is the baked one, not the installed ceremony's"
         );
     }
 }
@@ -847,13 +885,22 @@ fn i425_digest_binds_record_content_not_signatures() {
     let mut dropped = c.bundle.clone();
     dropped.roster_records.pop();
     assert_ne!(authorization_digest(&dropped).unwrap(), base);
-    // The baked version-2 seed carries no records and still verifies (its
-    // authorizations were taken over the pre-v53 preimage).
-    let baked = parse_genesis_bundle(include_str!(
-        "../src/federation/genesis/canonical_seed.json"
-    ))
-    .unwrap();
-    assert_eq!((baked.version, baked.roster_records.len()), (2, 0));
+    // v53.1.1 — the baked seed IS the final genesis (minted 2026-10-04 on
+    // hardware by A1/B1/C1): version 3, carrying the humanity-accord family
+    // record and the ciris-canonical birth as members of `attestations`, so
+    // the authorization digest binds both heads.
+    let baked_src = include_str!("../src/federation/genesis/canonical_seed.json");
+    let baked = parse_genesis_bundle(baked_src).unwrap();
+    assert_eq!((baked.version, baked.roster_records.len()), (3, 2));
+    // The bake is the ceremony's bytes: sha256 of the compiled-in artifact
+    // equals the bundle_sha256 the ceremony host logged at `finish`. A re-bake
+    // moves this pin on purpose; anything else that moves it is a tamper.
+    use sha2::Digest as _;
+    assert_eq!(
+        hex::encode(sha2::Sha256::digest(baked_src.as_bytes())),
+        "db5e8e8391261dca10c7e701e18bcd26bd8f43ab8e5b8c11ede999ca0befe9f2",
+        "the baked canonical_seed.json must be the final genesis's bytes (I500)"
+    );
 }
 
 /// **I426 — the wire: the records are members of `attestations`, after every
@@ -1489,7 +1536,11 @@ async fn v2_bundle_keeps_the_root(
 ) {
     use ciris_persist::federation::canonical_community::{charter_in_force, HeadCharter};
     let accord = ciris_verify_core::accord_genesis::HUMANITY_ACCORD_FAMILY_KEY_ID;
-    assert_eq!(canonical_genesis_bundle().version, 2, "the shipped bundle");
+    assert_eq!(
+        canonical_genesis_bundle().version,
+        3,
+        "v53.1.1: the shipped bundle is the final genesis"
+    );
     let digest = genesis_family_charter_digest();
     assert!(
         !digest.is_empty(),

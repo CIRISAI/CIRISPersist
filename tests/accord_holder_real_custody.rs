@@ -221,8 +221,8 @@ async fn bundle_verifier_and_put_gate_agree_on_holder_evidence_554() {
         .expect("#554: the production bundle must verify");
     assert_eq!(
         verified.distinct_holders(),
-        2,
-        "A1 + B1 hybrid authorizations — 2-of-3"
+        3,
+        "v53.1.1: the final genesis carries A1, B1 and C1's hybrid authorizations (3 over a 2/3 quorum)"
     );
 
     // The SAME artifact's holders must pass the SAME gate the put path runs.

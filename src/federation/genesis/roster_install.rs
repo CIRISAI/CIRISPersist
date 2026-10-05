@@ -30,14 +30,28 @@
 //! the delegation plane's own successor rule, which installed (or refused) the
 //! bundle's charter row before this runs.
 //!
-//! The community birth is installed when the id is free and reported when a
-//! different record is held: a rooted birth is never replaced here (the #926
-//! ruling — the accord's lever over a rooted community is its founders).
+//! The community birth is installed when the id is free. When a DIFFERENT
+//! record is held: the BAKE (the compiled-in bundle at boot) replaces a held
+//! prior-genesis birth — a genesis row (no predecessor) naming another charter
+//! — with the baked birth and keeps the held row as the superseded prior
+//! (operator ruling 2026-10-04 on the final genesis: "a new seed even if it is
+//! the same settings"); an IMPORTED bundle never replaces a rooted row (the
+//! #926 rule — the accord's lever over a rooted community is its founders).
 
 use super::{bundle_family_charter_digest, GenesisBakeReport, GenesisBundle};
 use crate::federation::types::{Family, SignedFamily};
 use crate::federation::{Attestation, Error, FederationDirectory};
 use serde::{Deserialize, Serialize};
+
+/// Where a bundle's roster records come from. Only [`Bake`](Self::Bake) may
+/// replace a held `ciris-canonical` birth (module doc).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RosterSource {
+    /// The compiled-in bundle, at boot.
+    Bake,
+    /// A verified bundle received on a live node (`install_genesis_bundle_roster`).
+    Import,
+}
 
 /// What happened to one roster record.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -84,7 +98,24 @@ pub struct RosterInstall {
 pub fn bundle_accord_genesis(bundle: &GenesisBundle) -> SignedFamily {
     let accord = ciris_verify_core::accord_genesis::HUMANITY_ACCORD_FAMILY_KEY_ID;
     if let Some(carried) = bundle.family_record(accord) {
-        return carried.clone();
+        // v53.1.1 (the #449 seam) — under an ARMED test anchor with no ceremony
+        // installed, the compiled bundle is the real one while the roster the
+        // node holds is the software one; the family must follow that roster
+        // or the family leg refuses (members must be registered keys). In
+        // production, and whenever the roster is the carried record's, the
+        // carried record is returned as signed.
+        let effective = super::effective_accord_holder_records();
+        let roster: std::collections::BTreeSet<&str> =
+            effective.iter().map(|r| r.record.key_id.as_str()).collect();
+        let carried_members: std::collections::BTreeSet<&str> = carried
+            .family
+            .members
+            .iter()
+            .map(|m| m.key_id.as_str())
+            .collect();
+        if roster == carried_members || !super::test_anchor_override_active() {
+            return carried.clone();
+        }
     }
     let family = super::accord_family_genesis_record_for(
         accord,
@@ -108,7 +139,7 @@ pub fn bundle_accord_genesis(bundle: &GenesisBundle) -> SignedFamily {
 /// unretired `delegates_to` toward the family with the charter reading, whose
 /// direction reading stands (the same test `charter_members_for` applies)? An
 /// empty digest names nothing and is never live.
-async fn charter_row_live<D>(dir: &D, family: &str, digest: &str) -> Result<bool, Error>
+pub(super) async fn charter_row_live<D>(dir: &D, family: &str, digest: &str) -> Result<bool, Error>
 where
     D: FederationDirectory + ?Sized,
 {
@@ -245,6 +276,7 @@ where
 pub async fn install_bundle_roster_records<D>(
     dir: &D,
     bundle: &GenesisBundle,
+    source: RosterSource,
 ) -> Result<Vec<RosterRecordReport>, Error>
 where
     D: FederationDirectory + ?Sized,
@@ -259,12 +291,13 @@ where
     let canon = crate::federation::canonical_community::CIRIS_CANONICAL_COMMUNITY_KEY_ID;
     if let Some(birth) = bundle.community_record(canon) {
         use super::CommunityLegOutcome as C;
-        let outcome = match super::seed_canonical_community_from(dir, Some(birth)).await {
+        let outcome = match super::seed_canonical_community_from(dir, Some(birth), source).await {
             Ok(C::Installed) => RosterRecordOutcome::Installed,
             Ok(C::AlreadyHeld) => RosterRecordOutcome::AlreadyHeld,
+            Ok(C::Replaced) => RosterRecordOutcome::Successor,
             Ok(C::HeldDiffers) => RosterRecordOutcome::Refused {
                 reason: "community_held_differs: this node holds another record under the id; a \
-                         held birth is never replaced here"
+                         held birth is never replaced by an import, and the bake replaces only a prior-genesis birth"
                     .to_owned(),
             },
             Ok(C::NotBaked) => unreachable!("an asset was passed"),
@@ -321,7 +354,7 @@ where
             detail: r.to_string(),
         })?;
     let bake = super::bake_assembled_genesis(dir, &json).await?;
-    let records = install_bundle_roster_records(dir, bundle).await?;
+    let records = install_bundle_roster_records(dir, bundle, RosterSource::Import).await?;
     Ok(RosterInstall { bake, records })
 }
 

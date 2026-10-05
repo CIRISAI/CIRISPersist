@@ -163,12 +163,19 @@ pub async fn verify_ceremony_outputs(
     dir.seed_genesis_accord_holders(&roster)
         .await
         .map_err(|e| refused(R::HolderRosterMismatch, format!("seed holders: {e}")))?;
-    super::seed_accord_family(&dir).await.map_err(|e| {
-        refused(
-            R::HolderRosterMismatch,
-            format!("seed accord family: {e:?}"),
-        )
-    })?;
+    // v53.1.1 — the scratch node's family is the CANDIDATE's genesis record
+    // (`check_family_record` has just held it to this build's roster and its
+    // own charter), never the compiled bundle's: under a test anchor the
+    // compiled bundle may be another ceremony's, and on a bake this is the
+    // bundle being baked.
+    super::roster_install::install_accord_genesis_head(&dir, &bundle)
+        .await
+        .map_err(|e| {
+            refused(
+                R::HolderRosterMismatch,
+                format!("seed accord family: {e:?}"),
+            )
+        })?;
 
     super::verify_bundle_quorum(&dir, &bundle)
         .await
