@@ -362,3 +362,99 @@ async fn i529_the_upgraded_node_boots_postgres() {
     }
     drop_pg_database(&base, &name).await;
 }
+
+/// **I530 — the adopt door keeps the co-scrub set.** The canonical node's OWN
+/// self-signed `node` row is upgraded to the final record at boot (#394's
+/// `adopt_scrub_upgrade` arm of `seed_canonical_servers`). Before v53.1.4
+/// every `federation_keys` UPDATE door wrote scrub #1 alone, so the held row
+/// was a one-holder row and the community leg could not seat the node.
+async fn i530_the_adopt_door_keeps_the_quorum<D: Seeds + ?Sized>(
+    d: &D,
+    block: &TestAnchorBlock,
+    bundle: &GenesisBundle,
+    tag: &str,
+) {
+    use ciris_persist::federation::operational::test_support::{signed_canonical_record, Identity};
+    arm(block);
+    d.seed_holders().await;
+    // The node's own self-signed row, signed by its own software pair.
+    let me = Identity::from_seeds(
+        TEST_CEREMONY_NODE_KEY_ID,
+        &NODE_SEED,
+        &test_anchor_mldsa_seed(&NODE_SEED),
+    )
+    .expect("node identity");
+    let baked = &bundle.serve_nodes[0].record;
+    let own = signed_canonical_record(
+        TEST_CEREMONY_NODE_KEY_ID,
+        identity_type::NODE,
+        &baked.pubkey_ed25519_base64,
+        baked.pubkey_ml_dsa_65_base64.as_deref(),
+        serde_json::json!({ "purpose": "federation-peering" }),
+        &[&me],
+    );
+    assert_eq!(own.scrub_key_id, own.key_id, "self-signed");
+    d.put_public_key(SignedKeyRecord { record: own })
+        .await
+        .unwrap_or_else(|e| panic!("{tag} I530: the node registers its own row: {e}"));
+    assert!(!carries_quorum(d).await, "{tag} I530 precondition");
+
+    // The boot: the self-signed arm takes the baked record through adopt.
+    install_test_ceremony_outputs(bundle.clone());
+    seed_family_and_canonical(d).await.unwrap_or_else(|e| {
+        panic!("{tag} I530 EXPECT the canonical node boots fully seeded — OBSERVED {e:?}")
+    });
+    let row = held(d).await;
+    assert_eq!(
+        (row.scrub_key_id.as_str(), row.additional_scrubs.len()),
+        (baked.scrub_key_id.as_str(), 2),
+        "{tag} I530: the adopted row carries every scrub: {row:?}"
+    );
+    assert!(
+        carries_quorum(d).await,
+        "{tag} I530: the held row carries the accord co-scrub"
+    );
+    let posture = genesis_posture(d).await;
+    assert!(
+        matches!(posture, GenesisPosture::Entrenched),
+        "{tag} I530: every leg seeded: {posture:?}"
+    );
+    let r = resolve_community(d, CANON)
+        .await
+        .unwrap()
+        .unwrap_or_else(|| panic!("{tag} I530: the community resolves"));
+    assert!(
+        r.live && r.members.iter().any(|m| m == TEST_CEREMONY_NODE_KEY_ID),
+        "{tag} I530: the serve node is seated: {r:?}"
+    );
+}
+
+#[serial_test::serial(test_anchor_env)]
+#[tokio::test]
+async fn i530_the_adopt_door_keeps_the_quorum_sqlite() {
+    let (block, bundle) =
+        mint_with_signed_instant(chrono::Utc::now() - chrono::Duration::seconds(5));
+    let _armed = Armed;
+    let b = sqlite().await;
+    i530_the_adopt_door_keeps_the_quorum(&b, &block, &bundle, "sqlite").await;
+}
+
+#[cfg(feature = "postgres")]
+#[serial_test::serial(test_anchor_env)]
+#[tokio::test]
+async fn i530_the_adopt_door_keeps_the_quorum_postgres() {
+    let Some((base, name, dsn)) = own_pg_database().await else {
+        return;
+    };
+    let (block, bundle) =
+        mint_with_signed_instant(chrono::Utc::now() - chrono::Duration::seconds(5));
+    let _armed = Armed;
+    {
+        let b = ciris_persist::store::postgres::PostgresBackend::connect(&dsn)
+            .await
+            .unwrap();
+        b.run_migrations().await.unwrap();
+        i530_the_adopt_door_keeps_the_quorum(&b, &block, &bundle, "postgres").await;
+    }
+    drop_pg_database(&base, &name).await;
+}

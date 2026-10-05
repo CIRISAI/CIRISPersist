@@ -11717,11 +11717,28 @@ where
     let Some(row) = directory.lookup_public_key(key_id).await? else {
         return Ok(false);
     };
-    Ok(
-        verify_accord_family_coscrub(directory, &row, &accord_holder_roster_key_ids())
-            .await
-            .is_ok(),
-    )
+    record_carries_accord_scrub_over_roster(directory, &row, &accord_holder_roster_key_ids()).await
+}
+
+/// v53.1.4 — does `row`, as HELD, carry the accord's m-of-n co-scrub under
+/// `roster_key_ids`? The same question [`key_record_carries_accord_scrub`]
+/// asks for the community leg's seat, over an explicit roster so the
+/// canonical supersede rule's equal-instant arm
+/// ([`register::verify_canonical_supersede`](super::register::verify_canonical_supersede))
+/// asks it of the row it is about to replace, against the roster that judged
+/// the incoming record. No role claim is read; a refusal reason is `false`,
+/// only an infrastructure failure is `Err`.
+pub(crate) async fn record_carries_accord_scrub_over_roster<F>(
+    directory: &F,
+    row: &super::KeyRecord,
+    roster_key_ids: &[String],
+) -> Result<bool, Error>
+where
+    F: super::FederationDirectory + ?Sized,
+{
+    Ok(verify_accord_family_coscrub(directory, row, roster_key_ids)
+        .await
+        .is_ok())
 }
 
 /// [`has_accord_conferred_role`] with an explicit accord-holder roster (tests inject

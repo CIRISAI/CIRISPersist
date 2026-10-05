@@ -757,33 +757,90 @@ fn asserts_the_same_anchoring(existing: &KeyRecord, record: &KeyRecord) -> bool 
 ///    Load-bearing: [`check_canonical_role_admission`] fast-paths a NON-canonical
 ///    row to `Ok(())`, so without this a single-anchor re-scrub of a plain node
 ///    would bypass the quorum.
-/// 2. **Monotonic over the SIGNED timestamp** — the incoming envelope's
-///    `valid_from` is strictly greater than the stored envelope's. Reads
-///    `valid_from` INSIDE `registration_envelope` (the field the scrubs cover
-///    via `JCS(registration_envelope)`), NOT the unsigned top-level
+/// 2. **Monotonic over the SIGNED timestamp, with one repair arm** — the
+///    incoming envelope's `valid_from` is strictly greater than the stored
+///    envelope's ([`SupersedePrecheck::Newer`]), or EQUAL to it
+///    ([`SupersedePrecheck::EqualInstant`] — v53.1.4, narrowed by rule 3).
+///    Reads `valid_from` INSIDE `registration_envelope` (the field the scrubs
+///    cover via `JCS(registration_envelope)`), NOT the unsigned top-level
 ///    `KeyRecord::valid_from` — else a replay of an older validly-scrubbed
 ///    record with a bumped top-level timestamp could DOWNGRADE the address. An
 ///    absent/unparseable envelope timestamp on either side ⇒ `false`.
 /// 3. **m-of-n quorum re-verified from persist's OWN state** —
 ///    [`check_canonical_role_admission`] re-derives the strict-majority policy
 ///    over the LIVE accord roster (`verify_quorum_policy`) and re-checks every
-///    co-scrub; also enforces withdrawal-wins.
+///    co-scrub; also enforces withdrawal-wins. **At an equal instant one more
+///    condition: the EXISTING row must NOT carry the accord co-scrub under
+///    that same roster** (the v53.1.4 equal-instant authority repair).
+///
+/// # v53.1.4 — the equal-instant authority repair
+///
+/// CIRISServer's dry-run of 0.5.221 on a copy of the canonical's production
+/// data: an UPGRADED node held the July serve record for the canonical — same
+/// key, same pubkeys, the same SIGNED envelope `valid_from` as the final
+/// bundle's record — anchor-scrubbed by one holder in the admit-node era,
+/// never by the accord quorum. Strictly-newer refused the final record, the
+/// boot skipped it, and the community leg then could not seat the node (its
+/// held row carries no accord scrub): pre-genesis, trace plane dark, on every
+/// node seeded from the July bake.
+///
+/// Anti-rollback guards against replacing a VALID anchoring with an older one.
+/// A held row the live accord quorum never signed is not a valid canonical
+/// anchoring, so replacing it at the same signed instant with the
+/// quorum-signed record is a repair, not a rollback — and nobody can drive it
+/// without the live quorum's signatures (rule 3 runs on this arm exactly as on
+/// the newer one). Older stays refused; equal with the held row already
+/// quorum-signed stays refused and keeps its name (`AlreadyAnchoredIdentical`
+/// / `ReScrub`); equal without the quorum stays refused.
 #[cfg(any(feature = "postgres", feature = "sqlite"))]
 pub(crate) async fn verify_canonical_supersede(
     directory: &dyn FederationDirectory,
     existing: &KeyRecord,
     record: &KeyRecord,
 ) -> Result<bool, Error> {
-    if !supersede_precheck(existing, record) {
-        return Ok(false);
-    }
-    // m-of-n quorum re-verified from persist's own state (+ withdrawal-wins),
-    // against the PRODUCTION genesis accord roster.
-    match super::admission::check_canonical_role_admission(directory, record).await {
-        Ok(()) => Ok(true),
+    // Both quorum questions against the PRODUCTION genesis accord roster.
+    let roster = super::admission::accord_holder_roster_key_ids();
+    decide_canonical_supersede(
+        existing,
+        record,
+        super::admission::check_canonical_role_admission(directory, record),
+        super::admission::record_carries_accord_scrub_over_roster(directory, existing, &roster),
+    )
+    .await
+}
+
+/// The one decision both entry points share: the precheck's arm, then the
+/// incoming record's quorum (+ withdrawal-wins) on EVERY admitting arm, then —
+/// on the equal-instant arm only — the held row's own quorum, which must be
+/// ABSENT for the replacement to be a repair rather than a re-scrub.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+async fn decide_canonical_supersede<Admit, Held>(
+    existing: &KeyRecord,
+    record: &KeyRecord,
+    admit_incoming: Admit,
+    existing_carries_quorum: Held,
+) -> Result<bool, Error>
+where
+    Admit: std::future::Future<Output = Result<(), Error>>,
+    Held: std::future::Future<Output = Result<bool, Error>>,
+{
+    let arm = match supersede_precheck(existing, record) {
+        SupersedePrecheck::Refuse => return Ok(false),
+        arm => arm,
+    };
+    // m-of-n quorum re-verified from persist's own state (+ withdrawal-wins):
+    // nothing reaches the canonical row without the live quorum, on either arm.
+    match admit_incoming.await {
+        Ok(()) => {}
         Err(Error::CanonicalRoleNotAccordConferred { .. })
-        | Err(Error::CanonicalRoleWithdrawn { .. }) => Ok(false),
-        Err(e) => Err(e),
+        | Err(Error::CanonicalRoleWithdrawn { .. }) => return Ok(false),
+        Err(e) => return Err(e),
+    }
+    match arm {
+        SupersedePrecheck::Newer => Ok(true),
+        // v53.1.4 — a repair replaces only a held row the quorum never signed.
+        SupersedePrecheck::EqualInstant => Ok(!existing_carries_quorum.await?),
+        SupersedePrecheck::Refuse => Ok(false),
     }
 }
 
@@ -800,41 +857,57 @@ pub(crate) async fn verify_canonical_supersede_over_roster(
     record: &KeyRecord,
     roster_key_ids: &[String],
 ) -> Result<bool, Error> {
-    if !supersede_precheck(existing, record) {
-        return Ok(false);
-    }
-    match super::admission::check_canonical_role_admission_over_roster_legacy(
-        directory,
+    decide_canonical_supersede(
+        existing,
         record,
-        roster_key_ids,
+        super::admission::check_canonical_role_admission_over_roster_legacy(
+            directory,
+            record,
+            roster_key_ids,
+        ),
+        super::admission::record_carries_accord_scrub_over_roster(
+            directory,
+            existing,
+            roster_key_ids,
+        ),
     )
     .await
-    {
-        Ok(()) => Ok(true),
-        Err(Error::CanonicalRoleNotAccordConferred { .. })
-        | Err(Error::CanonicalRoleWithdrawn { .. }) => Ok(false),
-        Err(e) => Err(e),
-    }
+}
+
+/// The arm the quorum-independent half of the #405 supersede policy selects
+/// (canonical-scope + the SIGNED-envelope `valid_from` order).
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SupersedePrecheck {
+    /// Canonical-scoped, and the incoming SIGNED `valid_from` is strictly
+    /// newer than the stored one: the runtime address move (#405).
+    Newer,
+    /// Canonical-scoped, and the SIGNED `valid_from` is EQUAL: the v53.1.4
+    /// authority-repair arm, admitted only when the incoming record carries
+    /// the live quorum and the held row does not.
+    EqualInstant,
+    /// Not canonical-scoped, older, or an unreadable instant on either side.
+    Refuse,
 }
 
 /// The quorum-independent half of the #405 supersede policy (canonical-scope +
-/// strictly-newer SIGNED-envelope `valid_from`). Sync + crypto-free so the
+/// the SIGNED-envelope `valid_from` order). Sync + crypto-free so the
 /// monotonicity / replay-spoof / scope decisions are unit-testable in isolation
-/// from the m-of-n quorum. Returns `true` iff the incoming record is canonical
-/// AND its envelope `valid_from` is strictly newer than the stored one.
+/// from the m-of-n quorum. Guard (1) first: a non-canonical record never
+/// reaches either admitting arm.
 #[cfg(any(feature = "postgres", feature = "sqlite"))]
-pub(crate) fn supersede_precheck(existing: &KeyRecord, record: &KeyRecord) -> bool {
+pub(crate) fn supersede_precheck(existing: &KeyRecord, record: &KeyRecord) -> SupersedePrecheck {
     use super::types::identity_type;
 
     // (1) Canonical-scoped — a non-canonical anchor→anchor re-scrub stays the
     // fail-closed hijack refuse (check_canonical_role_admission fast-paths a
     // non-canonical row to Ok, so this guard is load-bearing).
     if !identity_type::set_contains(&record.identity_type, identity_type::CANONICAL) {
-        return false;
+        return SupersedePrecheck::Refuse;
     }
 
-    // (2) Strictly-newer SIGNED (envelope) valid_from. Reads the field the
-    // scrubs cover — JCS(registration_envelope) — NOT the unsigned top-level
+    // (2) The SIGNED (envelope) valid_from order. Reads the field the scrubs
+    // cover — JCS(registration_envelope) — NOT the unsigned top-level
     // KeyRecord::valid_from, which a replay could bump to forge recency.
     let envelope_valid_from = |rec: &KeyRecord| -> Option<chrono::DateTime<chrono::Utc>> {
         rec.registration_envelope
@@ -844,8 +917,13 @@ pub(crate) fn supersede_precheck(existing: &KeyRecord, record: &KeyRecord) -> bo
             .map(|t| t.with_timezone(&chrono::Utc))
     };
     match (envelope_valid_from(record), envelope_valid_from(existing)) {
-        (Some(incoming_vf), Some(existing_vf)) => incoming_vf > existing_vf,
-        _ => false,
+        (Some(incoming_vf), Some(existing_vf)) if incoming_vf > existing_vf => {
+            SupersedePrecheck::Newer
+        }
+        (Some(incoming_vf), Some(existing_vf)) if incoming_vf == existing_vf => {
+            SupersedePrecheck::EqualInstant
+        }
+        _ => SupersedePrecheck::Refuse,
     }
 }
 
@@ -3949,7 +4027,7 @@ mod tests {
 /// so the monotonicity / replay-spoof / scope decisions are proven in isolation.
 #[cfg(all(test, any(feature = "postgres", feature = "sqlite")))]
 mod supersede_precheck_tests {
-    use super::supersede_precheck;
+    use super::{supersede_precheck, SupersedePrecheck as P};
     use crate::federation::types::{algorithm, KeyRecord};
 
     const T0: &str = "2026-07-10T00:00:00+00:00";
@@ -3996,38 +4074,51 @@ mod supersede_precheck_tests {
 
     #[test]
     fn newer_canonical_envelope_passes() {
-        assert!(supersede_precheck(&canonical(T0), &canonical(T1)));
+        assert_eq!(supersede_precheck(&canonical(T0), &canonical(T1)), P::Newer);
     }
 
+    /// v53.1.4 — an equal SIGNED instant is the repair arm, not a refusal:
+    /// the quorum checks decide it (I528).
     #[test]
-    fn equal_envelope_valid_from_refused() {
-        assert!(!supersede_precheck(&canonical(T0), &canonical(T0)));
+    fn equal_envelope_valid_from_is_the_repair_arm() {
+        assert_eq!(
+            supersede_precheck(&canonical(T0), &canonical(T0)),
+            P::EqualInstant
+        );
     }
 
     #[test]
     fn older_envelope_valid_from_refused() {
         // incoming T0 is OLDER than existing T1 — downgrade refused.
-        assert!(!supersede_precheck(&canonical(T1), &canonical(T0)));
+        assert_eq!(
+            supersede_precheck(&canonical(T1), &canonical(T0)),
+            P::Refuse
+        );
     }
 
     #[test]
     fn non_canonical_incoming_refused_even_if_newer() {
         // A non-canonical anchor→anchor re-scrub must NOT reach the quorum.
         let incoming = mk("node", T1, chrono::Utc::now());
-        assert!(!supersede_precheck(&canonical(T0), &incoming));
+        assert_eq!(supersede_precheck(&canonical(T0), &incoming), P::Refuse);
+        // Nor the repair arm.
+        let equal = mk("node", T0, chrono::Utc::now());
+        assert_eq!(supersede_precheck(&canonical(T0), &equal), P::Refuse);
     }
 
     #[test]
     fn missing_envelope_valid_from_refused() {
         let mut incoming = canonical(T1);
         incoming.registration_envelope = serde_json::json!({});
-        assert!(!supersede_precheck(&canonical(T0), &incoming));
+        assert_eq!(supersede_precheck(&canonical(T0), &incoming), P::Refuse);
     }
 
     /// THE downgrade attack: replay the OLD record (envelope `valid_from` == the
     /// stored one) but bump the UNSIGNED top-level `valid_from` far into the
     /// future. The precheck reads the SIGNED envelope timestamp, so recency
-    /// cannot be forged — refused.
+    /// cannot be forged: never `Newer`. v53.1.4 — it is the equal-instant arm,
+    /// where a replayed record over a held row the quorum signed is refused by
+    /// the held row's own quorum (I528(c)).
     #[test]
     fn toplevel_valid_from_spoof_cannot_forge_recency() {
         let existing = canonical(T0);
@@ -4036,8 +4127,9 @@ mod supersede_precheck_tests {
             T0,
             chrono::Utc::now() + chrono::Duration::days(3650),
         );
-        assert!(
-            !supersede_precheck(&existing, &spoof),
+        assert_eq!(
+            supersede_precheck(&existing, &spoof),
+            P::EqualInstant,
             "unsigned top-level valid_from must not override the signed envelope timestamp"
         );
     }
