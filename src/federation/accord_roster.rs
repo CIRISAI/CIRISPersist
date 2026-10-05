@@ -228,6 +228,16 @@ where
             }
         }
     }
+    // v53.1.2 (CIRISPersist#984 row 6) — a seat listed twice is not the held
+    // roster with the decided changes applied; the set compare below would
+    // collapse it, and the stored duplicate inflates every standing count.
+    let mut listed = std::collections::BTreeSet::new();
+    if let Some(m) = offered.members.iter().find(|m| !listed.insert(&m.key_id)) {
+        return refuse(
+            "accord_roster_change_uncovered",
+            format!("{} is listed twice in the offered roster", m.key_id),
+        );
+    }
     let offered_seats: std::collections::BTreeMap<String, Option<String>> = offered
         .members
         .iter()
@@ -310,17 +320,21 @@ where
             "the accord's version names no charter, so no holder has a recovery commitment",
         );
     }
-    let charter = directory
-        .list_attestations_for(&offered.family_key_id)
-        .await?
-        .into_iter()
-        .find(|a| a.persist_row_hash == offered.charter_digest);
+    // v53.1.2 (CIRISPersist#984 row 5) — the LIVE charter row: a charter-
+    // labelled `delegates_to` toward the family, direction standing, not
+    // retired. A row-hash match on any held attestation was not that.
+    let charter = super::canonical_community::live_charter_row(
+        directory,
+        &offered.family_key_id,
+        &offered.charter_digest,
+    )
+    .await?;
     let Some(charter) = charter else {
         return refuse(
             "accord_charter_not_held",
             format!(
-                "the charter {} the version names is not held here (retryable: it may not \
-                 have arrived)",
+                "the charter {} the version names is not held here as a live charter row \
+                 (retryable if it has not arrived; final if it was withdrawn)",
                 offered.charter_digest
             ),
         );
@@ -330,8 +344,14 @@ where
         .get(RECOVERY_COMMITMENTS)
         .and_then(|v| serde_json::from_value(v.clone()).ok())
         .unwrap_or_default();
-    let mut statements =
-        super::accord_recovery::recorded_statements(directory, &offered.family_key_id).await?;
+    // v53.1.2 (#984 row 3) — only the recoveries made UNDER the charter the
+    // version names: a new charter commits every seat afresh.
+    let mut statements = super::accord_recovery::recorded_statements(
+        directory,
+        &offered.family_key_id,
+        Some(&offered.charter_digest),
+    )
+    .await?;
     if let Some(r) = recovery {
         statements.push(r.clone());
     }

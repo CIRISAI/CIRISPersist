@@ -616,20 +616,6 @@ pub(crate) mod bodies {
         assert_eq!(held(d).await.charter_digest, c2, "I509: C₂ in force");
     }
 
-    /// Withdraw `target` (an attestation id) as its own attester.
-    async fn withdraw(d: &dyn FederationDirectory, id: &str, attester: &str, target: &str) {
-        let env = serde_json::json!({
-            "references_attestation_id": target, "withdrawal_reason": "#984 row 5",
-        });
-        let mut w = ts::bare_attestation(id, attester, attester, &env);
-        w.attestation_type = attestation_type::WITHDRAWS.into();
-        w.cohort_scope = "federation".into();
-        ts::seal_row_in_place(attester, &mut w);
-        d.put_attestation(crate::federation::SignedAttestation { attestation: w })
-            .await
-            .unwrap_or_else(|e| panic!("withdraw {target}: {e}"));
-    }
-
     /// **I510** (v53.1.2, CIRISPersist#984 row 5) — **the charter a version
     /// names must be a LIVE charter row.** Before, any held attestation whose
     /// row hash matched was taken — withdrawn or not, charter-labelled or
@@ -642,14 +628,16 @@ pub(crate) mod bodies {
             .await
             .unwrap_or_else(|e| panic!("I510: the charter is admitted in force: {e}"));
         let before = held(d).await;
+        // Withdrawn by its attester, listed toward the family as the charter is.
         let row = charter_row(d, &c).await;
-        withdraw(
+        ops::withdraw_attestation(
             d,
-            &format!("ar-w-{tag}"),
             &row.attesting_key_id,
+            accord_family_key_id(),
             &row.attestation_id,
         )
-        .await;
+        .await
+        .unwrap_or_else(|e| panic!("I510: the charter's attester withdraws it: {e}"));
         refused(
             naming(d, &c).await,
             "accord_charter_not_held",

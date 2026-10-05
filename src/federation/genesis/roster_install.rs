@@ -40,7 +40,7 @@
 
 use super::{bundle_family_charter_digest, GenesisBakeReport, GenesisBundle};
 use crate::federation::types::{Family, SignedFamily};
-use crate::federation::{Attestation, Error, FederationDirectory};
+use crate::federation::{Error, FederationDirectory};
 use serde::{Deserialize, Serialize};
 
 /// Where a bundle's roster records come from. Only [`Bake`](Self::Bake) may
@@ -137,37 +137,19 @@ pub fn bundle_accord_genesis(bundle: &GenesisBundle) -> SignedFamily {
 
 /// Is the charter `digest` names a live charter of `family` here — a held,
 /// unretired `delegates_to` toward the family with the charter reading, whose
-/// direction reading stands (the same test `charter_members_for` applies)? An
-/// empty digest names nothing and is never live.
+/// direction reading stands? An empty digest names nothing and is never
+/// live. v53.1.2 (#984 row 5): the one predicate is
+/// [`live_charter_row`](crate::federation::canonical_community::live_charter_row);
+/// the accord version door asks it too.
 pub(super) async fn charter_row_live<D>(dir: &D, family: &str, digest: &str) -> Result<bool, Error>
 where
     D: FederationDirectory + ?Sized,
 {
-    if digest.is_empty() {
-        return Ok(false);
-    }
-    let is_charter = |a: &Attestation| {
-        a.attestation_type == crate::federation::types::attestation_type::DELEGATES_TO
-            && a.attested_key_id == family
-            && crate::federation::trust_root::job_dimension_admits(
-                &a.attestation_envelope,
-                crate::federation::trust_root::TRUST_CHARTER_DIMENSION,
-            )
-    };
-    let rows = dir.list_attestations_for(family).await?;
-    let refs: Vec<&Attestation> = rows.iter().collect();
-    let retired = crate::federation::precedence::retired_ids(&refs);
-    let denied = crate::federation::trust_root::direction_denied_ids(
-        dir,
-        rows.iter().filter(|a| is_charter(a)),
+    Ok(
+        crate::federation::canonical_community::live_charter_row(dir, family, digest)
+            .await?
+            .is_some(),
     )
-    .await?;
-    Ok(rows.iter().any(|a| {
-        a.persist_row_hash == digest
-            && is_charter(a)
-            && !denied.contains(&a.attestation_id)
-            && !retired.contains(&a.attestation_id)
-    }))
 }
 
 /// Everything a head does not carry is equal: the same accord.
