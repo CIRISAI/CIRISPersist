@@ -573,6 +573,7 @@ pub mod bodies {
             &signer,
             chrono::Utc::now(),
             uuid::Uuid::new_v4(),
+            None,
         )
         .await
         .expect("I153: announce");
@@ -620,6 +621,7 @@ pub mod bodies {
             &signer,
             chrono::Utc::now(),
             uuid::Uuid::new_v4(),
+            None,
         )
         .await
         .expect("I153: announce the second blob");

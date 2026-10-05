@@ -8343,55 +8343,72 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         };
         // #984 row 16 — the signature and standing legs, exactly as a put.
         crate::federation::verify_location_proof_admission(self, &proof).await?;
-        let mut state = self.state.lock().expect("memory backend lock");
-        let key = (
-            proof.location_proof.subject_key_id.clone(),
-            proof.location_proof.asserted_at,
-        );
-        let Some(held_row) = state.federation_location_proofs.get(&key).cloned() else {
-            return Err(crate::federation::Error::InvalidArgument(format!(
-                "location_proof_withdraw_not_held: no proof by {} at {} is held here",
-                key.0, key.1
-            )));
+        // The lock is scoped to this block: the guard is not `Send`, and the
+        // re-index below awaits after the write is durable.
+        let wire_index_key = {
+            let mut state = self.state.lock().expect("memory backend lock");
+            let key = (
+                proof.location_proof.subject_key_id.clone(),
+                proof.location_proof.asserted_at,
+            );
+            let Some(held_row) = state.federation_location_proofs.get(&key).cloned() else {
+                return Err(crate::federation::Error::InvalidArgument(format!(
+                    "location_proof_withdraw_not_held: no proof by {} at {} is held here",
+                    key.0, key.1
+                )));
+            };
+            let (authority_key_id, scrub_signature_classical, scrub_signature_pqc) = state
+                .federation_location_proof_authority_sigs
+                .get(&key)
+                .cloned()
+                .unwrap_or_default();
+            let held = crate::federation::SignedLocationProof {
+                location_proof: held_row,
+                authority_key_id,
+                scrub_signature_classical,
+                scrub_signature_pqc,
+            };
+            match check_location_proof_withdrawal(&held, &proof)? {
+                LocationProofWithdrawal::AlreadyWithdrawn => return Ok(()),
+                LocationProofWithdrawal::Apply => {}
+            }
+            let mut row = proof.location_proof;
+            row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+            // The row moves to a fresh serve position so a peer past its cursor
+            // is served the withdrawal.
+            let admitted_at = next_plane_position(
+                &state,
+                PLANE_LOCATION_PROOF,
+                location_proof_rows(&state).into_iter(),
+            );
+            let resume = crate::federation::types::compound_resume_id(&[
+                &row.subject_key_id,
+                &row.persist_row_hash,
+            ]);
+            state.federation_location_proof_authority_sigs.insert(
+                key.clone(),
+                (
+                    proof.authority_key_id,
+                    proof.scrub_signature_classical,
+                    proof.scrub_signature_pqc,
+                ),
+            );
+            let wire_index_key = crate::federation::wire_index::record_key(&[
+                ("subject_key_id", &row.subject_key_id),
+                (
+                    "asserted_at",
+                    &crate::federation::wire_index::locator_instant(&row.asserted_at),
+                ),
+            ]);
+            state.federation_location_proofs.insert(key, row);
+            stamp_plane_position(&mut state, PLANE_LOCATION_PROOF, resume, admitted_at);
+            wire_index_key
         };
-        let (authority_key_id, scrub_signature_classical, scrub_signature_pqc) = state
-            .federation_location_proof_authority_sigs
-            .get(&key)
-            .cloned()
-            .unwrap_or_default();
-        let held = crate::federation::SignedLocationProof {
-            location_proof: held_row,
-            authority_key_id,
-            scrub_signature_classical,
-            scrub_signature_pqc,
-        };
-        match check_location_proof_withdrawal(&held, &proof)? {
-            LocationProofWithdrawal::AlreadyWithdrawn => return Ok(()),
-            LocationProofWithdrawal::Apply => {}
-        }
-        let mut row = proof.location_proof;
-        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
-        // The row moves to a fresh serve position so a peer past its cursor
-        // is served the withdrawal.
-        let admitted_at = next_plane_position(
-            &state,
-            PLANE_LOCATION_PROOF,
-            location_proof_rows(&state).into_iter(),
-        );
-        let resume = crate::federation::types::compound_resume_id(&[
-            &row.subject_key_id,
-            &row.persist_row_hash,
-        ]);
-        state.federation_location_proof_authority_sigs.insert(
-            key.clone(),
-            (
-                proof.authority_key_id,
-                proof.scrub_signature_classical,
-                proof.scrub_signature_pqc,
-            ),
-        );
-        state.federation_location_proofs.insert(key, row);
-        stamp_plane_position(&mut state, PLANE_LOCATION_PROOF, resume, admitted_at);
+        // v53.1.3 (Codex on #985 P1, #986) — the row's bytes changed, so the
+        // signed wire index must learn the new content hash exactly as the
+        // put path teaches it.
+        self.index_stored_record("LocationProof", &wire_index_key)
+            .await?;
         Ok(())
     }
 

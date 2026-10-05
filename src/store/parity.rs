@@ -261,6 +261,12 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // (`store::test_hooks::RivalPoint`); never armed outside a test, so it
     // adds nothing to a door's production sequence.
     ("test_rival_at", Class::Plumbing),
+    // v53.1.3 (CIRISPersist#986) — Plumbing: the `cfg(test)` rival withdrawal
+    // I524 arms between the withdraw door's held read and its compare-and-set
+    // write (`store::test_hooks::arm_rival_location_proof_withdrawal`); never
+    // armed outside a test, so it adds nothing to the door's production
+    // sequence.
+    ("test_rival_location_proof_withdrawal", Class::Plumbing),
     // v50.0.0 (CIRISPersist#926) — Gate: refuses a trust-root-grade community
     // row (the reserved `ciris-canonical` id, or one declaring
     // `infrastructure_constraint`) whose shape, founders or chain fails — the

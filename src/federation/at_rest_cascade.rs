@@ -3437,6 +3437,7 @@ pub mod orchestrate {
                         local,
                         now,
                         uuid::Uuid::new_v4(),
+                        community_key_id,
                     )
                     .await?;
                 Ok(PutBlobScopedResult {
@@ -3522,6 +3523,7 @@ pub mod orchestrate {
                         local,
                         now,
                         uuid::Uuid::new_v4(),
+                        Some(comm),
                     )
                     .await?;
                 // #848 (§14, epoch axis) — emitted when the fan-out minted or
@@ -4499,6 +4501,7 @@ pub mod blob_invariants {
                 &signer,
                 chrono::Utc::now(),
                 uuid::Uuid::new_v4(),
+                None,
             )
             .await
             .unwrap_or_else(|e| panic!("{tag} I9: announce holds_bytes: {e}"));
@@ -4827,6 +4830,7 @@ pub mod blob_invariants {
                 &signer,
                 chrono::Utc::now(),
                 uuid::Uuid::new_v4(),
+                None,
             )
             .await
             .unwrap();
@@ -4902,6 +4906,7 @@ pub mod blob_invariants {
                 &signer,
                 chrono::Utc::now(),
                 uuid::Uuid::new_v4(),
+                None,
             )
             .await
             .unwrap();
@@ -5427,6 +5432,7 @@ pub mod blob_invariants {
                 &signer,
                 chrono::Utc::now(),
                 uuid::Uuid::new_v4(),
+                None,
             )
             .await;
         assert!(

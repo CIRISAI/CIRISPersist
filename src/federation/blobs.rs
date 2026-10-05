@@ -1981,6 +1981,7 @@ pub trait BlobStorage: Send + Sync {
         attestation: PutBlobAttestation,
         cohort_scope: &str,
         floor: StorageFloor,
+        group_key_id: Option<&str>,
     ) -> impl Future<Output = Result<(), BlobError>> + Send;
 
     /// v43.0.0 (§11.1) — the `cohort_scope` recorded when the blob was
@@ -2614,6 +2615,7 @@ pub trait BlobStorage: Send + Sync {
             local,
             now,
             attestation_id,
+            None,
         )
     }
 
@@ -2719,6 +2721,7 @@ pub trait BlobStorage: Send + Sync {
         local: &'s crate::signing::LocalSigner,
         now: chrono::DateTime<chrono::Utc>,
         attestation_id: uuid::Uuid,
+        group_key_id: Option<&'s str>,
     ) -> impl Future<Output = Result<(), BlobError>> + Send + 's
     where
         Self: Sync,
@@ -2760,6 +2763,7 @@ pub trait BlobStorage: Send + Sync {
                 att,
                 cohort_scope,
                 floor,
+                group_key_id,
             )
             .await
         }
@@ -2834,6 +2838,7 @@ pub trait BlobStorage: Send + Sync {
                         local,
                         now,
                         attestation_id,
+                        community_key_id,
                     )
                     .await
                 }

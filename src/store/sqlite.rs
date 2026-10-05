@@ -306,6 +306,18 @@ impl SqliteBackend {
         Ok(())
     }
 
+    /// v53.1.3 (#986) — the test-only rival WITHDRAWAL armed for the point
+    /// between a withdrawal's held read and its write, applied through this
+    /// backend's own withdraw door. Never armed outside a test.
+    #[cfg(test)]
+    async fn test_rival_location_proof_withdrawal(&self) -> Result<(), crate::federation::Error> {
+        if let Some(rival) = self.test_hooks.take_rival_location_proof_withdrawal() {
+            Box::pin(crate::federation::FederationDirectory::withdraw_location_proof(self, rival))
+                .await?;
+        }
+        Ok(())
+    }
+
     /// #840 (I44) — normalise a V070 history row written by v43.0.0–v44.1.0.
     ///
     /// Those releases shipped V070 with one word changed inside a comment,
@@ -9776,6 +9788,8 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             LocationProofWithdrawal::AlreadyWithdrawn => return Ok(()),
             LocationProofWithdrawal::Apply => {}
         }
+        #[cfg(test)]
+        self.test_rival_location_proof_withdrawal().await?;
         let mut row = proof.location_proof;
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
         let withdrawn_at = row.withdrawn_at.map(|t| t.to_rfc3339());
@@ -9783,32 +9797,81 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         let authority_key_id = proof.authority_key_id;
         let scrub_signature_classical = proof.scrub_signature_classical;
         let scrub_signature_pqc = proof.scrub_signature_pqc;
-        self.write(move |conn| -> Result<(), rusqlite::Error> {
-            // The row moves to a fresh serve position (V130) so a peer past
-            // its cursor is served the withdrawal.
-            let admitted_at =
-                sqlite_next_plane_position(conn, "federation_location_proofs", POS_ASSERTED)?;
-            conn.execute(
-                "UPDATE federation_location_proofs \
-                    SET withdrawn_at = ?3, persist_row_hash = ?4, authority_key_id = ?5, \
-                        scrub_signature_classical = ?6, scrub_signature_pqc = ?7, \
-                        admitted_at = ?8 \
-                  WHERE subject_key_id = ?1 AND asserted_at = ?2",
-                rusqlite::params![
-                    subject,
-                    asserted,
-                    withdrawn_at,
-                    persist_row_hash,
-                    authority_key_id,
-                    scrub_signature_classical,
-                    scrub_signature_pqc,
-                    admitted_at.to_rfc3339(),
-                ],
-            )?;
-            Ok(())
-        })
-        .await
-        .map_err(|e| crate::federation::Error::Backend(format!("withdraw_location_proof: {e}")))?;
+        let (s, a) = (subject.clone(), asserted.clone());
+        let written = self
+            .write(move |conn| -> Result<usize, rusqlite::Error> {
+                // The row moves to a fresh serve position (V130) so a peer
+                // past its cursor is served the withdrawal.
+                let admitted_at =
+                    sqlite_next_plane_position(conn, "federation_location_proofs", POS_ASSERTED)?;
+                // v53.1.3 (Codex on #985 P2, #986) — a COMPARE-AND-SET: the
+                // decision above was made from a read, and a rival withdrawal
+                // can land between that read and this write. The guard makes
+                // the loser write nothing; it re-reads below.
+                conn.execute(
+                    "UPDATE federation_location_proofs \
+                        SET withdrawn_at = ?3, persist_row_hash = ?4, authority_key_id = ?5, \
+                            scrub_signature_classical = ?6, scrub_signature_pqc = ?7, \
+                            admitted_at = ?8 \
+                      WHERE subject_key_id = ?1 AND asserted_at = ?2 AND withdrawn_at IS NULL",
+                    rusqlite::params![
+                        s,
+                        a,
+                        withdrawn_at,
+                        persist_row_hash,
+                        authority_key_id,
+                        scrub_signature_classical,
+                        scrub_signature_pqc,
+                        admitted_at.to_rfc3339(),
+                    ],
+                )
+            })
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("withdraw_location_proof: {e}"))
+            })?;
+        if written == 0 {
+            // Lost the race: the row is withdrawn by the rival (already
+            // withdrawn, the first instant stands), or gone.
+            let (s, a) = (subject.clone(), asserted.clone());
+            let now_held = self
+                .read(
+                    move |conn| -> Result<Option<Option<String>>, rusqlite::Error> {
+                        conn.query_row(
+                            "SELECT withdrawn_at FROM federation_location_proofs \
+                              WHERE subject_key_id = ?1 AND asserted_at = ?2",
+                            rusqlite::params![s, a],
+                            |r| r.get(0),
+                        )
+                        .optional()
+                    },
+                )
+                .await
+                .map_err(|e| {
+                    crate::federation::Error::Backend(format!(
+                        "withdraw_location_proof re-read: {e}"
+                    ))
+                })?;
+            return match now_held {
+                Some(Some(_)) => Ok(()),
+                _ => Err(crate::federation::Error::Backend(format!(
+                    "withdraw_location_proof: the held proof by {subject} at {asserted} changed \
+                     under the write and is not withdrawn"
+                ))),
+            };
+        }
+        // v53.1.3 (Codex on #985 P1, #986) — the row's bytes changed, so the
+        // signed wire index must learn the new content hash exactly as the
+        // put path teaches it (after the durable write; loud, never fatal).
+        let wire_index_key = crate::federation::wire_index::record_key(&[
+            ("subject_key_id", &subject),
+            (
+                "asserted_at",
+                &crate::federation::wire_index::locator_instant(&row.asserted_at),
+            ),
+        ]);
+        self.index_stored_record("LocationProof", &wire_index_key)
+            .await?;
         Ok(())
     }
 
@@ -14304,6 +14367,7 @@ impl crate::federation::BlobStorage for SqliteBackend {
             crate::federation::StorageFloor::resolved(
                 crate::federation::types::cohort_scope::CryptoTier::Plaintext,
             ),
+            None,
         )
         .await
     }
@@ -14317,10 +14381,12 @@ impl crate::federation::BlobStorage for SqliteBackend {
         attestation: crate::federation::PutBlobAttestation,
         cohort_scope: &str,
         floor: crate::federation::StorageFloor,
+        group_key_id: Option<&str>,
     ) -> Result<(), crate::federation::BlobError> {
         floor.check_scope(cohort_scope)?;
         let scope = cohort_scope.to_owned();
         let tier = floor.tier().as_str().to_owned();
+        let group = group_key_id.map(str::to_owned);
         // v3.4.0 (CIRISPersist#123) — admission ordering:
         //   1. empty-string → InvalidArgument
         //   2. trust-threshold → TrustBelowThreshold
@@ -14509,8 +14575,9 @@ impl crate::federation::BlobStorage for SqliteBackend {
                 tx.execute(
                     "INSERT INTO federation_blobs (\
                         sha256, storage_kind, bytes_inline, external_ref, size_bytes, media_type, \
-                        last_accessed_at, access_count, cohort_scope, crypto_tier, author_key_id\
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8, ?9, ?10) \
+                        last_accessed_at, access_count, cohort_scope, crypto_tier, author_key_id, \
+                        group_key_id\
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8, ?9, ?10, ?11) \
                      ON CONFLICT (sha256) DO NOTHING",
                     rusqlite::params![
                         sha_vec,
@@ -14523,6 +14590,7 @@ impl crate::federation::BlobStorage for SqliteBackend {
                         scope,
                         tier,
                         row_author,
+                        group,
                     ],
                 )?;
             }

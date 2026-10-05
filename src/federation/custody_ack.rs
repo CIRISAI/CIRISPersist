@@ -716,11 +716,26 @@ where
     // accepted; `None` resolves to the row's. With no row held, or a row
     // that records no group (pre-V177), the caller's value stands.
     let row_target: Option<String> = match (&head, scope.as_str()) {
-        (Some(_), cs::COMMUNITY) => backend
-            .community_dek_blob_epoch(blob_sha256)
-            .await
-            .map_err(blob_err)?
-            .map(|(community, _, _)| community),
+        // v53.1.3 (Codex on #985 P1, #986) — every ROOM shape: the sealing
+        // epoch's community where a binding exists, else the V177 group the
+        // row records — a PLAINTEXT room (an infrastructure community) has no
+        // binding, and an `affiliations` row is a room row too. Before, both
+        // fell to `None` and the caller's room was trusted.
+        (Some(_), cs::COMMUNITY | cs::AFFILIATIONS) => {
+            let bound = backend
+                .community_dek_blob_epoch(blob_sha256)
+                .await
+                .map_err(blob_err)?
+                .map(|(community, _, _)| community);
+            match bound {
+                Some(c) => Some(c),
+                None => backend
+                    .blob_provenance(blob_sha256)
+                    .await
+                    .map_err(blob_err)?
+                    .and_then(|p| p.group_key_id),
+            }
+        }
         (Some(_), cs::SELF | cs::FAMILY) => backend
             .blob_provenance(blob_sha256)
             .await

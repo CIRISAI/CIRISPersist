@@ -661,6 +661,7 @@ pub(crate) mod bodies {
                 wrong,
                 cohort_scope::FEDERATION,
                 StorageFloor::resolved(CryptoTier::Plaintext),
+                None,
             )
             .await
             .expect_err("I117d: the put door refuses a claim whose size is not the stored length");
@@ -684,6 +685,7 @@ pub(crate) mod bodies {
             right,
             cohort_scope::FEDERATION,
             StorageFloor::resolved(CryptoTier::Plaintext),
+            None,
         )
         .await
         .expect("I117d: the true length is admitted");

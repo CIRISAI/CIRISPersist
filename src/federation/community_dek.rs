@@ -2283,6 +2283,7 @@ pub mod lifecycle_harness {
                 &sweeper,
                 chrono::Utc::now(),
                 uuid::Uuid::new_v4(),
+                None,
             )
             .await
             .unwrap_or_else(|e| panic!("{tag}: announce epoch-0 bytes: {e}"));

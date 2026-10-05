@@ -884,6 +884,181 @@ mod engine_bodies {
         );
     }
 
+    /// An AUTHORIZED infrastructure room (its key typed `substrate_persist`,
+    /// `cohort_subkind: infrastructure`, founded by alice under `quorum:1/1`)
+    /// on A: the one room shape that resolves to the PLAINTEXT tier.
+    async fn infra_room<B>(l: &Ladder<B>, run: &str, tag: &str) -> String
+    where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        use crate::federation::tier_ingest::test_support as ts;
+        use crate::federation::types::{identity_type, Community, CommunityMember};
+        let room = format!("em-infra-{tag}-{run}");
+        let ba = l.ba.as_ref();
+        ts::register_hybrid_key_as(ba, &room, &room, identity_type::SUBSTRATE_PERSIST).await;
+        let joined = chrono::Utc::now() - chrono::Duration::days(3);
+        let c = Community {
+            prev_head_digest: String::new(),
+            charter_digest: String::new(),
+            community_key_id: room.clone(),
+            community_name: "infra".into(),
+            members: vec![CommunityMember {
+                key_id: l.alice.clone(),
+                joined_at: joined,
+                role: Some("founder".into()),
+            }],
+            founded_at: joined,
+            consensus_protocol: "quorum:1/1".into(),
+            policy_blob: Some(serde_json::json!({ "cohort_subkind": "infrastructure" })),
+            persist_row_hash: String::new(),
+        };
+        ba.put_community(ts::sign_community(&l.alice, c))
+            .await
+            .unwrap_or_else(|e| panic!("the infrastructure room {room}: {e}"));
+        room
+    }
+
+    /// **I525** (v53.1.3, Codex on #985, #986) — **the row-target arm reads
+    /// every room shape.** A PLAINTEXT room blob (an infrastructure
+    /// community: no DEK binding) and an `affiliations` blob (a binding under
+    /// `affiliations`, not `community`) both fell to `row_target = None`, so a
+    /// caller's room was trusted. The arm now reads the binding OR the row's
+    /// V177 group for `community | affiliations`.
+    pub(crate) async fn i525_the_target_arm_reads_every_room_shape<B>(
+        dsn_a: &str,
+        dsn_b: &str,
+        run: &str,
+        pick: Pick<B>,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync + 'static,
+    {
+        use crate::federation::replication_audience_invariants::bodies as ra;
+        use crate::federation::types::cohort_scope::AFFILIATIONS;
+        let l = ladder(dsn_a, dsn_b, run, pick).await;
+        let e = &l.engine_a;
+        let ba = l.ba.as_ref();
+        let other = format!("em-comm-o-{run}");
+        ra::room(ba as &dyn FederationDirectory, &other, &[&l.alice]).await;
+        // A plaintext room blob: the row carries the group (#986 item 4), and
+        // the custody arm reads it where no binding exists (item 3).
+        let room = infra_room(&l, run, "i525").await;
+        let p = e
+            .put_blob_scoped(COMMUNITY, Some(&room), b"plaintext room bytes", None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            p.tier,
+            crate::federation::types::cohort_scope::CryptoTier::Plaintext,
+            "I525 precondition — an infrastructure room is plaintext"
+        );
+        let r = e
+            .put_custody_ack(
+                &p.at_rest_sha256,
+                CustodyState::Here,
+                None,
+                Some(&other),
+                None,
+            )
+            .await;
+        assert!(
+            r.as_ref()
+                .is_err_and(|e| e.to_string().contains("custody_ack_malformed")),
+            "I525 plaintext room: a target that is not the row's is malformed: {r:?}"
+        );
+        let id = e
+            .put_custody_ack(
+                &p.at_rest_sha256,
+                CustodyState::Here,
+                None,
+                Some(&room),
+                None,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("I525 plaintext room, its own target: {e}"));
+        let row = stored(ba, &id).await;
+        assert_eq!(
+            row.attestation_envelope
+                .get("community_id")
+                .and_then(|v| v.as_str()),
+            Some(room.as_str()),
+            "I525 the envelope names the row's room"
+        );
+        // An affiliations blob: sealed under the room's DEK, bound under the
+        // `affiliations` cohort. A report naming another room is refused —
+        // today for its SCOPE (`affiliations` is not a custody cohort, CC
+        // 3.1.3.3), so the arm's `affiliations` reading is pinned by the
+        // plaintext room above and this leg records the scope refusal.
+        let a = e
+            .put_blob_scoped(
+                AFFILIATIONS,
+                Some(&l.comm),
+                b"affiliations bytes",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let r = e
+            .put_custody_ack(
+                &a.at_rest_sha256,
+                CustodyState::Here,
+                None,
+                Some(&other),
+                None,
+            )
+            .await;
+        assert!(
+            r.as_ref()
+                .is_err_and(|e| e.to_string().contains("custody_ack_malformed")),
+            "I525 affiliations: a report naming another room is malformed: {r:?}"
+        );
+    }
+
+    /// **I526** (v53.1.3, Codex on #985, #986) — **a plaintext room write
+    /// carries the group.** `put_blob_with_scope`'s INSERT stamped no
+    /// `group_key_id`, and a plaintext row has no DEK binding, so every
+    /// plaintext room blob's audience was `Unresolvable`.
+    pub(crate) async fn i526_a_plaintext_room_write_carries_the_group<B>(
+        dsn_a: &str,
+        dsn_b: &str,
+        run: &str,
+        pick: Pick<B>,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync + 'static,
+    {
+        use crate::federation::durability::DeficitAudience;
+        let l = ladder(dsn_a, dsn_b, run, pick).await;
+        let room = infra_room(&l, run, "i526").await;
+        let p = l
+            .engine_a
+            .put_blob_scoped(COMMUNITY, Some(&room), b"plaintext room bytes", None, None)
+            .await
+            .unwrap();
+        let prov =
+            l.ba.blob_provenance(&p.at_rest_sha256)
+                .await
+                .unwrap()
+                .expect("the row");
+        assert_eq!(
+            prov.group_key_id.as_deref(),
+            Some(room.as_str()),
+            "I526 the plaintext room row records its room: {prov:?}"
+        );
+        assert_eq!(
+            prov.community_key_id, None,
+            "I526 a plaintext row has no binding"
+        );
+        let d = l
+            .engine_a
+            .durability_deficit(&p.at_rest_sha256, &l.node_a, None)
+            .await
+            .unwrap();
+        assert!(
+            !matches!(d.audience, DeficitAudience::Unresolvable),
+            "I526 the audience resolves from the row's group: {d:?}"
+        );
+    }
+
     /// A shared `BackendDispatch` over a backend handle, and a way to make the
     /// handle forget its node key — a handle the constructor could not tell
     /// (a hardware signer that answers asynchronously).
@@ -1044,6 +1219,10 @@ mod runners {
     #[cfg(feature = "sqlite")]
     sqlite_engine_case!(i513_sqlite, i513_receipts_fold_only_for_the_blobs_stream);
     #[cfg(feature = "sqlite")]
+    sqlite_engine_case!(i525_sqlite, i525_the_target_arm_reads_every_room_shape);
+    #[cfg(feature = "sqlite")]
+    sqlite_engine_case!(i526_sqlite, i526_a_plaintext_room_write_carries_the_group);
+    #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn i514_sqlite() {
         super::engine_bodies::i514_the_custody_door_knows_its_node(
@@ -1086,6 +1265,10 @@ mod runners {
     postgres_engine_case!(i512_postgres, i512_the_target_is_the_rows);
     #[cfg(feature = "postgres")]
     postgres_engine_case!(i513_postgres, i513_receipts_fold_only_for_the_blobs_stream);
+    #[cfg(feature = "postgres")]
+    postgres_engine_case!(i525_postgres, i525_the_target_arm_reads_every_room_shape);
+    #[cfg(feature = "postgres")]
+    postgres_engine_case!(i526_postgres, i526_a_plaintext_room_write_carries_the_group);
     #[cfg(feature = "postgres")]
     #[tokio::test]
     async fn i514_postgres() {
