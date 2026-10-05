@@ -3337,6 +3337,13 @@ impl SqliteBackend {
         let original_content_hash = hex::decode(&row.original_content_hash).map_err(|e| {
             crate::federation::Error::InvalidArgument(format!("original_content_hash hex: {e}"))
         })?;
+        // v53.1.4 — the whole scrub set rides every rewrite of the scrub columns:
+        // a door that wrote scrub #1 alone stored a quorum-signed record as a
+        // one-holder row (the V096 JSON-array TEXT column; empty → "[]").
+        let additional_scrubs_text =
+            serde_json::to_string(&row.additional_scrubs).map_err(|e| {
+                crate::federation::Error::Backend(format!("additional_scrubs serialize: {e}"))
+            })?;
         let kid = row.key_id.clone();
         // v24.1.0 (CIRISPersist#547) — the Key-plane wire-index entry must
         // follow this UPDATE. Without it a scrub-upgraded node advertises its
@@ -3369,7 +3376,7 @@ impl SqliteBackend {
                     scrub_signature_classical = ?10, scrub_signature_pqc = ?11, \
                     scrub_key_id = ?12, scrub_timestamp = ?13, pqc_completed_at = ?14, \
                     persist_row_hash = ?15, roles = ?16, attestation_evidence = ?17, \
-                    mutated_at = ?19 \
+                    mutated_at = ?19, additional_scrubs = ?20 \
                  WHERE key_id = ?1 AND scrub_key_id = key_id AND pubkey_ed25519_base64 = ?18",
                     rusqlite::params![
                         row.key_id,
@@ -3391,6 +3398,7 @@ impl SqliteBackend {
                         attestation_text,
                         row.pubkey_ed25519_base64,
                         mutated_at.to_rfc3339(),
+                        additional_scrubs_text,
                     ],
                 )?;
                 Ok(n)
@@ -3526,6 +3534,13 @@ impl SqliteBackend {
             crate::federation::Error::InvalidArgument(format!("original_content_hash hex: {e}"))
         })?;
         let expected_prior_hash = existing.persist_row_hash.clone();
+        // v53.1.4 — the whole scrub set rides every rewrite of the scrub columns:
+        // a door that wrote scrub #1 alone stored a quorum-signed record as a
+        // one-holder row (the V096 JSON-array TEXT column; empty → "[]").
+        let additional_scrubs_text =
+            serde_json::to_string(&row.additional_scrubs).map_err(|e| {
+                crate::federation::Error::Backend(format!("additional_scrubs serialize: {e}"))
+            })?;
         let kid = row.key_id.clone();
         // v24.1.0 (CIRISPersist#547) — the successor must be indexed; a
         // canonical rotation that skipped this advertised the rotated record
@@ -3551,7 +3566,7 @@ impl SqliteBackend {
                     scrub_signature_classical = ?10, scrub_signature_pqc = ?11, \
                     scrub_key_id = ?12, scrub_timestamp = ?13, pqc_completed_at = ?14, \
                     persist_row_hash = ?15, roles = ?16, attestation_evidence = ?17, \
-                    mutated_at = ?20 \
+                    mutated_at = ?20, additional_scrubs = ?21 \
                  WHERE key_id = ?1 AND pubkey_ed25519_base64 = ?18 \
                     AND scrub_key_id != key_id AND persist_row_hash = ?19",
                     rusqlite::params![
@@ -3575,6 +3590,7 @@ impl SqliteBackend {
                         row.pubkey_ed25519_base64,
                         expected_prior_hash,
                         mutated_at.to_rfc3339(),
+                        additional_scrubs_text,
                     ],
                 )?;
                 Ok(n)
@@ -3864,6 +3880,13 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         let original_content_hash = hex::decode(&row.original_content_hash).map_err(|e| {
             crate::federation::Error::InvalidArgument(format!("original_content_hash hex: {e}"))
         })?;
+        // v53.1.4 — the whole scrub set rides every rewrite of the scrub columns:
+        // a door that wrote scrub #1 alone stored a quorum-signed record as a
+        // one-holder row (the V096 JSON-array TEXT column; empty → "[]").
+        let additional_scrubs_text =
+            serde_json::to_string(&row.additional_scrubs).map_err(|e| {
+                crate::federation::Error::Backend(format!("additional_scrubs serialize: {e}"))
+            })?;
         let kid = row.key_id.clone();
         let n = self
             .write(move |conn| -> Result<usize, rusqlite::Error> {
@@ -3896,7 +3919,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                         registration_envelope = ?2, original_content_hash = ?3, \
                         scrub_signature_classical = ?4, scrub_signature_pqc = ?5, \
                         scrub_timestamp = ?6, pqc_completed_at = ?7, \
-                        persist_row_hash = ?8, mutated_at = ?9 \
+                        persist_row_hash = ?8, mutated_at = ?9, additional_scrubs = ?12 \
                      WHERE key_id = ?1 AND scrub_key_id = key_id \
                        AND pubkey_ed25519_base64 = ?10 AND persist_row_hash = ?11",
                     rusqlite::params![
@@ -3911,6 +3934,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                         mutated_at.to_rfc3339(),
                         row.pubkey_ed25519_base64,
                         existing_hash,
+                        additional_scrubs_text,
                     ],
                 )?;
                 if n == 0 {
@@ -4167,6 +4191,11 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         };
         let original_content_hash = hex::decode(&row.original_content_hash)
             .map_err(|e| Error::InvalidArgument(format!("original_content_hash hex: {e}")))?;
+        // v53.1.4 — the whole scrub set rides every rewrite of the scrub columns:
+        // a door that wrote scrub #1 alone stored a quorum-signed record as a
+        // one-holder row (the V096 JSON-array TEXT column; empty → "[]").
+        let additional_scrubs_text = serde_json::to_string(&row.additional_scrubs)
+            .map_err(|e| Error::Backend(format!("additional_scrubs serialize: {e}")))?;
         let kid = row.key_id.clone();
         // v24.1.0 (CIRISPersist#547) — the re-anchored row must be indexed.
         // v31.0.0 (CIRISPersist#640) — from the stored row, after the UPDATE;
@@ -4189,7 +4218,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     scrub_signature_classical = ?10, scrub_signature_pqc = ?11, \
                     scrub_key_id = ?12, scrub_timestamp = ?13, pqc_completed_at = ?14, \
                     persist_row_hash = ?15, roles = ?16, attestation_evidence = ?17, \
-                    mutated_at = ?19 \
+                    mutated_at = ?19, additional_scrubs = ?20 \
                  WHERE key_id = ?1 AND pubkey_ed25519_base64 = ?18",
                     rusqlite::params![
                         row.key_id,
@@ -4211,6 +4240,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                         attestation_text,
                         row.pubkey_ed25519_base64,
                         mutated_at.to_rfc3339(),
+                        additional_scrubs_text,
                     ],
                 )?;
                 Ok(n)

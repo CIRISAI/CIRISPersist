@@ -11717,11 +11717,28 @@ where
     let Some(row) = directory.lookup_public_key(key_id).await? else {
         return Ok(false);
     };
-    Ok(
-        verify_accord_family_coscrub(directory, &row, &accord_holder_roster_key_ids())
-            .await
-            .is_ok(),
-    )
+    record_carries_accord_scrub_over_roster(directory, &row, &accord_holder_roster_key_ids()).await
+}
+
+/// v53.1.4 — does `row`, as HELD, carry the accord's m-of-n co-scrub under
+/// `roster_key_ids`? The same question [`key_record_carries_accord_scrub`]
+/// asks for the community leg's seat, over an explicit roster so the
+/// canonical supersede rule's equal-instant arm
+/// ([`register::verify_canonical_supersede`](super::register::verify_canonical_supersede))
+/// asks it of the row it is about to replace, against the roster that judged
+/// the incoming record. No role claim is read; a refusal reason is `false`,
+/// only an infrastructure failure is `Err`.
+pub(crate) async fn record_carries_accord_scrub_over_roster<F>(
+    directory: &F,
+    row: &super::KeyRecord,
+    roster_key_ids: &[String],
+) -> Result<bool, Error>
+where
+    F: super::FederationDirectory + ?Sized,
+{
+    Ok(verify_accord_family_coscrub(directory, row, roster_key_ids)
+        .await
+        .is_ok())
 }
 
 /// [`has_accord_conferred_role`] with an explicit accord-holder roster (tests inject
@@ -20615,6 +20632,140 @@ mod canonical_gate_tests {
             .await,
             "a non-canonical re-scrub must NOT reach supersede"
         );
+    }
+
+    /// **I528** (v53.1.4; CIRISServer's 0.5.221 dry-run on the canonical's
+    /// production data) — **the equal-instant authority repair.** An upgraded
+    /// node holds the July serve record for the canonical: same key, same
+    /// pubkeys, the SAME signed envelope `valid_from` as the final bundle's
+    /// record, anchor-scrubbed by ONE holder (the admit-node era), never by
+    /// the accord quorum. The strictly-newer rule refused the quorum-signed
+    /// record at the same instant, and the community leg then refused to seat
+    /// the node (its held row carries no accord scrub).
+    ///
+    /// The rule gains one arm: at an EQUAL signed instant the incoming record
+    /// is admitted iff it passes the live-roster quorum AND the held row does
+    /// NOT carry the quorum's co-scrub. Everything else is unchanged: older
+    /// stays refused; equal with the held row already quorum-signed stays
+    /// refused (a re-scrub by another quorum subset included); equal without
+    /// the quorum stays refused; a non-canonical record never reaches the
+    /// quorum; newer still supersedes.
+    async fn run_equal_instant_repair_matrix(dir: &dyn FederationDirectory, tag: &str) {
+        use super::super::register::verify_canonical_supersede_over_roster;
+        let founders = [
+            Identity::new(&format!("i528h0-{tag}")),
+            Identity::new(&format!("i528h1-{tag}")),
+            Identity::new(&format!("i528h2-{tag}")),
+        ];
+        for f in &founders {
+            register_founder(dir, f).await;
+        }
+        let roster: Vec<String> = founders.iter().map(|f| f.key_id.clone()).collect();
+        let kid = format!("i528-canon-{tag}");
+        let (t_minus, t0, t1) = (
+            "2026-07-30T13:58:22+00:00",
+            "2026-07-31T13:58:22+00:00",
+            "2026-08-01T13:58:22+00:00",
+        );
+        let rec = |identity_type: &str, vf: &str, scrubbers: &[&Identity]| {
+            signed_canonical_record(
+                &kid,
+                identity_type,
+                PLACEHOLDER_SUBJECT_ED25519_BASE64,
+                None,
+                serde_json::json!({ "key_id": kid, "valid_from": vf }),
+                scrubbers,
+            )
+        };
+        let one = [&founders[0]];
+        let two = [&founders[0], &founders[1]];
+        let other_two = [&founders[1], &founders[2]];
+        let held_single = rec("canonical,node", t0, &one);
+        let held_quorum = rec("canonical,node", t0, &two);
+        let check = |existing: KeyRecord, record: KeyRecord| {
+            let roster = roster.clone();
+            async move {
+                verify_canonical_supersede_over_roster(dir, &existing, &record, &roster)
+                    .await
+                    .expect("no infra error")
+            }
+        };
+
+        // (a) THE REPAIR: equal instant, the held row lacks the quorum, the
+        // incoming carries it → supersede.
+        assert!(
+            check(held_single.clone(), rec("canonical,node", t0, &two)).await,
+            "I528(a) {tag}: at an equal signed instant the quorum-signed record replaces a held row \
+             the quorum never signed"
+        );
+        // (b) OLDER incoming, quorum-signed → refused (anti-rollback, unchanged).
+        assert!(
+            !check(held_single.clone(), rec("canonical,node", t_minus, &two)).await,
+            "I528(b) {tag}: an older quorum-signed record never replaces"
+        );
+        // (c) equal, the held row ALREADY carries the quorum → refused: the
+        // same quorum subset, and another one.
+        assert!(
+            !check(held_quorum.clone(), rec("canonical,node", t0, &two)).await,
+            "I528(c) {tag}: a held row the quorum signed is not repaired"
+        );
+        assert!(
+            !check(held_quorum.clone(), rec("canonical,node", t0, &other_two)).await,
+            "I528(c') {tag}: a re-scrub by another quorum subset at the same instant is not a \
+             repair"
+        );
+        // (d) equal, the incoming lacks the quorum → refused.
+        assert!(
+            !check(
+                held_single.clone(),
+                rec("canonical,node", t0, &[&founders[1]])
+            )
+            .await,
+            "I528(d) {tag}: one holder cannot repair a one-holder row"
+        );
+        // (e) equal, non-canonical incoming → refused before any quorum read.
+        assert!(
+            !check(held_single.clone(), rec("node", t0, &two)).await,
+            "I528(e) {tag}: a non-canonical record never reaches the repair arm"
+        );
+        // (f) newer, quorum-signed → supersede (unchanged).
+        assert!(
+            check(held_single, rec("canonical,node", t1, &two)).await,
+            "I528(f) {tag}: strictly newer still supersedes"
+        );
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn i528_equal_instant_repair_sqlite() {
+        use crate::store::backend::Backend as _;
+        use crate::store::sqlite::SqliteBackend;
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        run_equal_instant_repair_matrix(&backend, "sq").await;
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn i528_equal_instant_repair_postgres() {
+        let Some(dsn) = crate::test_pg::dsn() else {
+            eprintln!(
+                "skipping i528_equal_instant_repair_postgres: CIRIS_PERSIST_TEST_PG_URL unset"
+            );
+            return;
+        };
+        super::run_in_isolated_pg_db(&dsn, |backend| async move {
+            run_equal_instant_repair_matrix(&backend, "pg").await;
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn i528_equal_instant_repair_memory() {
+        use crate::store::memory::MemoryBackend;
+        let backend = MemoryBackend::new();
+        run_equal_instant_repair_matrix(&backend, "mem").await;
     }
 
     /// End-to-end via the PRODUCTION `check_canonical_role_admission` on the

@@ -4581,6 +4581,13 @@ impl PostgresBackend {
         // registration content; an anchor-scrub upgrade must not clobber
         // an assigned role.
         // v31.0.0 (#644) — registration_envelope is TEXT since V122.
+        // v53.1.4 — the whole scrub set rides every rewrite of the scrub columns:
+        // a door that wrote scrub #1 alone stored a quorum-signed record as a
+        // one-holder row (the V096 JSON-array TEXT column; empty → "[]").
+        let additional_scrubs_text =
+            serde_json::to_string(&row.additional_scrubs).map_err(|e| {
+                crate::federation::Error::Backend(format!("additional_scrubs serialize: {e}"))
+            })?;
         let registration_envelope_text =
             pg_envelope_text(&row.registration_envelope, "registration_envelope")?;
         // v36.0.0 (CIRISPersist#707) — this door rewrites consumer-visible
@@ -4596,7 +4603,7 @@ impl PostgresBackend {
                     scrub_signature_classical = $10, scrub_signature_pqc = $11, \
                     scrub_key_id = $12, scrub_timestamp = $13, pqc_completed_at = $14, \
                     persist_row_hash = $15, roles = $16, attestation_evidence = $17, \
-                    mutated_at = $19 \
+                    mutated_at = $19, additional_scrubs = $20 \
                  WHERE key_id = $1 AND scrub_key_id = key_id AND pubkey_ed25519_base64 = $18",
                 &[
                     &row.key_id,
@@ -4618,6 +4625,7 @@ impl PostgresBackend {
                     &row.attestation_evidence,
                     &row.pubkey_ed25519_base64,
                     &mutated_at,
+                    &additional_scrubs_text,
                 ],
             )
             .await
@@ -4764,6 +4772,13 @@ impl PostgresBackend {
         // Atomic swap guarded on the planned-against version's persist_row_hash;
         // `consent_role` stays out of the SET (operational marker).
         // v31.0.0 (#644) — registration_envelope is TEXT since V122.
+        // v53.1.4 — the whole scrub set rides every rewrite of the scrub columns:
+        // a door that wrote scrub #1 alone stored a quorum-signed record as a
+        // one-holder row (the V096 JSON-array TEXT column; empty → "[]").
+        let additional_scrubs_text =
+            serde_json::to_string(&row.additional_scrubs).map_err(|e| {
+                crate::federation::Error::Backend(format!("additional_scrubs serialize: {e}"))
+            })?;
         let registration_envelope_text =
             pg_envelope_text(&row.registration_envelope, "registration_envelope")?;
         // v36.0.0 (CIRISPersist#707) — a canonical rotation rewrites the whole
@@ -4779,7 +4794,7 @@ impl PostgresBackend {
                     scrub_signature_classical = $10, scrub_signature_pqc = $11, \
                     scrub_key_id = $12, scrub_timestamp = $13, pqc_completed_at = $14, \
                     persist_row_hash = $15, roles = $16, attestation_evidence = $17, \
-                    mutated_at = $20 \
+                    mutated_at = $20, additional_scrubs = $21 \
                  WHERE key_id = $1 AND pubkey_ed25519_base64 = $18 \
                     AND scrub_key_id != key_id AND persist_row_hash = $19",
                 &[
@@ -4803,6 +4818,7 @@ impl PostgresBackend {
                     &row.pubkey_ed25519_base64,
                     &existing.persist_row_hash,
                     &mutated_at,
+                    &additional_scrubs_text,
                 ],
             )
             .await
@@ -5123,6 +5139,13 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let original_content_hash = hex::decode(&row.original_content_hash).map_err(|e| {
             crate::federation::Error::InvalidArgument(format!("original_content_hash hex: {e}"))
         })?;
+        // v53.1.4 — the whole scrub set rides every rewrite of the scrub columns:
+        // a door that wrote scrub #1 alone stored a quorum-signed record as a
+        // one-holder row (the V096 JSON-array TEXT column; empty → "[]").
+        let additional_scrubs_text =
+            serde_json::to_string(&row.additional_scrubs).map_err(|e| {
+                crate::federation::Error::Backend(format!("additional_scrubs serialize: {e}"))
+            })?;
         let registration_envelope_text =
             pg_envelope_text(&row.registration_envelope, "registration_envelope")?;
         let mut client = self
@@ -5168,7 +5191,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     registration_envelope = $2, original_content_hash = $3, \
                     scrub_signature_classical = $4, scrub_signature_pqc = $5, \
                     scrub_timestamp = $6, pqc_completed_at = $7, \
-                    persist_row_hash = $8, mutated_at = $9 \
+                    persist_row_hash = $8, mutated_at = $9, additional_scrubs = $12 \
                  WHERE key_id = $1 AND scrub_key_id = key_id \
                    AND pubkey_ed25519_base64 = $10 AND persist_row_hash = $11",
                 &[
@@ -5183,6 +5206,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     &mutated_at,
                     &row.pubkey_ed25519_base64,
                     &existing_hash,
+                    &additional_scrubs_text,
                 ],
             )
             .await
@@ -5439,6 +5463,11 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // No `scrub_key_id = key_id` WHERE condition — this path replaces an
         // ANCHORED row under the bundle-quorum authority verified above.
         // v31.0.0 (#644) — registration_envelope is TEXT since V122.
+        // v53.1.4 — the whole scrub set rides every rewrite of the scrub columns:
+        // a door that wrote scrub #1 alone stored a quorum-signed record as a
+        // one-holder row (the V096 JSON-array TEXT column; empty → "[]").
+        let additional_scrubs_text = serde_json::to_string(&row.additional_scrubs)
+            .map_err(|e| Error::Backend(format!("additional_scrubs serialize: {e}")))?;
         let registration_envelope_text =
             pg_envelope_text(&row.registration_envelope, "registration_envelope")?;
         // v36.0.0 (CIRISPersist#707) — a genesis re-anchor rewrites the whole
@@ -5454,7 +5483,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     scrub_signature_classical = $10, scrub_signature_pqc = $11, \
                     scrub_key_id = $12, scrub_timestamp = $13, pqc_completed_at = $14, \
                     persist_row_hash = $15, roles = $16, attestation_evidence = $17, \
-                    mutated_at = $19 \
+                    mutated_at = $19, additional_scrubs = $20 \
                  WHERE key_id = $1 AND pubkey_ed25519_base64 = $18",
                 &[
                     &row.key_id,
@@ -5476,6 +5505,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     &row.attestation_evidence,
                     &row.pubkey_ed25519_base64,
                     &mutated_at,
+                    &additional_scrubs_text,
                 ],
             )
             .await
