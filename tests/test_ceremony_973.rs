@@ -514,9 +514,23 @@ async fn i355b_seam_is_inert_without_the_override() {
             baked_holder,
             "I355b: disarmed, the compiled bundle is what every reader sees"
         );
+        // v53.1.1 — disarmed, the compiled bundle is the FINAL genesis: its
+        // birth is the real one (founded by the baked holders), never the
+        // installed ceremony's.
+        let birth = canonical_community_asset()
+            .expect("I355b: disarmed, the compiled bundle carries the final genesis's birth");
         assert!(
-            canonical_community_asset().is_none(),
-            "I355b: disarmed, the compiled bundle (version 2) carries no birth"
+            birth
+                .community
+                .members
+                .iter()
+                .any(|m| m.key_id == baked_holder)
+                && !birth
+                    .community
+                    .members
+                    .iter()
+                    .any(|m| m.key_id == "test-accord-holder-0"),
+            "I355b: disarmed, the birth is the baked one, not the installed ceremony's"
         );
     }
 }

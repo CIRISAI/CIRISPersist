@@ -98,7 +98,24 @@ pub struct RosterInstall {
 pub fn bundle_accord_genesis(bundle: &GenesisBundle) -> SignedFamily {
     let accord = ciris_verify_core::accord_genesis::HUMANITY_ACCORD_FAMILY_KEY_ID;
     if let Some(carried) = bundle.family_record(accord) {
-        return carried.clone();
+        // v53.1.1 (the #449 seam) — under an ARMED test anchor with no ceremony
+        // installed, the compiled bundle is the real one while the roster the
+        // node holds is the software one; the family must follow that roster
+        // or the family leg refuses (members must be registered keys). In
+        // production, and whenever the roster is the carried record's, the
+        // carried record is returned as signed.
+        let effective = super::effective_accord_holder_records();
+        let roster: std::collections::BTreeSet<&str> =
+            effective.iter().map(|r| r.record.key_id.as_str()).collect();
+        let carried_members: std::collections::BTreeSet<&str> = carried
+            .family
+            .members
+            .iter()
+            .map(|m| m.key_id.as_str())
+            .collect();
+        if roster == carried_members || !super::test_anchor_override_active() {
+            return carried.clone();
+        }
     }
     let family = super::accord_family_genesis_record_for(
         accord,
