@@ -379,8 +379,10 @@ async fn i529c_the_import_door_reanchors<D: Node + ?Sized>(
     );
     assert!(
         carries_quorum(d).await,
-        "{tag} I529c EXPECT the re-anchored row carries the accord co-scrub — OBSERVED {:?}",
-        held(d).await
+        "{tag} I529c EXPECT the re-anchored row carries the accord co-scrub — OBSERVED scrub_key_id \
+         {} with additional_scrubs {:?}",
+        held(d).await.scrub_key_id,
+        held(d).await.additional_scrubs
     );
     assert_eq!(held(d).await.additional_scrubs.len(), 2);
 }
