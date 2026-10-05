@@ -5283,8 +5283,8 @@ pub(crate) fn check_chunk_body_against_floor(
 /// #837 (§12.9 / I41) — the chunk floor's refusal of an append whose cohort
 /// or community is not the stream's: names the STREAM's (the two facts the
 /// refused writer is entitled to) and what the call named. One text for
-/// both backends.
-#[cfg(any(feature = "postgres", feature = "sqlite"))]
+/// both backends — and for the epoch door (#984 row 2), which refuses an
+/// append elsewhere before it touches a key.
 pub(crate) fn stream_elsewhere_refusal(
     stream_id: &str,
     stream_cohort: &str,

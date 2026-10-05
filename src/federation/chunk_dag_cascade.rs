@@ -479,6 +479,21 @@ pub mod orchestrate {
     {
         let target = stream_target_epoch(latest.as_ref(), w.epoch);
         if let Some(l) = latest {
+            // v53.1.2 (CIRISPersist#984 row 2) — the stream's epochs are the
+            // STREAM's cohort and group; an append naming another is refused
+            // HERE, with the floor's own refusal, before the door wraps the
+            // held epoch to the named cohort's members, terminates it, or
+            // mints a row under the named cohort. The floor would refuse the
+            // chunk afterwards; by then the key had moved.
+            if l.cohort_scope != w.cohort_scope || l.group_key_id != w.group_key_id {
+                return Err(crate::federation::blobs::stream_elsewhere_refusal(
+                    w.stream_id,
+                    &l.cohort_scope,
+                    Some(&l.group_key_id),
+                    w.cohort_scope,
+                    w.community_key_id,
+                ));
+            }
             if l.epoch == target {
                 return Ok(l);
             }
