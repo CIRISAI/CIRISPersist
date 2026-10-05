@@ -1109,6 +1109,7 @@ pub mod orchestrate {
                         local,
                         now,
                         uuid::Uuid::new_v4(),
+                        community_key_id,
                     )
                     .await?;
                 Ok(SealStreamScopedResult {
@@ -1328,6 +1329,7 @@ pub mod orchestrate {
                                     local,
                                     now,
                                     uuid::Uuid::new_v4(),
+                                    Some(comm),
                                 )
                                 .await?;
                             return Ok(SealStreamScopedResult {

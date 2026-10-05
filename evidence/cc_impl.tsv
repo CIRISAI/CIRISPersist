@@ -197,8 +197,8 @@ decimal_id	claim_id	repo	path#symbol	crate@version
 3.1.3.2	CLM-membership-consent	CIRISPersist	src/federation/membership_acceptance.rs#check_supersede_adds_no_member	ciris-persist@53.1.2
 6.1.5.3	CLM-durability-every-tier	CIRISPersist	src/federation/durability.rs#durability_mode	ciris-persist@53.1.2
 6.1.5.3	CLM-durability-every-tier	CIRISPersist	src/federation/durability.rs#content_audience	ciris-persist@53.1.2
-3.3.7	CLM-audience-claimed-nodes	CIRISPersist	src/federation/replication_audience.rs#audience_nodes	ciris-persist@53.1.2
-3.3.7	CLM-audience-claimed-nodes	CIRISPersist	src/federation/replication_audience.rs#occurrence_may_hold_key	ciris-persist@53.1.2
+6.1.5.3	CLM-audience-claimed-nodes	CIRISPersist	src/federation/replication_audience.rs#audience_nodes	ciris-persist@53.1.2
+6.1.5.3	CLM-audience-claimed-nodes	CIRISPersist	src/federation/replication_audience.rs#occurrence_may_hold_key	ciris-persist@53.1.2
 3.2	CLM-canonical-founders-accord	CIRISPersist	src/federation/canonical_community.rs#founder_arm_at	ciris-persist@53.1.2
 3.2	CLM-canonical-founders-accord	CIRISPersist	src/federation/membership_acceptance.rs#node_seated_without_acceptance	ciris-persist@53.1.2
 3.2	CLM-attach-unlabelled	CIRISPersist	src/federation/trust_root.rs#direction_denied_ids	ciris-persist@53.1.2

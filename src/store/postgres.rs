@@ -11160,13 +11160,17 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let admitted_at = self
             .next_plane_position(&client, "federation_location_proofs")
             .await?;
-        client
+        // v53.1.3 (Codex on #985 P2, #986) — a COMPARE-AND-SET: the decision
+        // above was made from a read, and a rival withdrawal can land between
+        // that read and this write. The guard makes the loser write nothing;
+        // it re-reads below.
+        let written = client
             .execute(
                 "UPDATE cirislens.federation_location_proofs \
                     SET withdrawn_at = $3, persist_row_hash = $4, authority_key_id = $5, \
                         scrub_signature_classical = $6, scrub_signature_pqc = $7, \
                         admitted_at = $8 \
-                  WHERE subject_key_id = $1 AND asserted_at = $2",
+                  WHERE subject_key_id = $1 AND asserted_at = $2 AND withdrawn_at IS NULL",
                 &[
                     &subject,
                     &asserted_at,
@@ -11182,6 +11186,50 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .map_err(|e| {
                 crate::federation::Error::Backend(format!("withdraw_location_proof: {e}"))
             })?;
+        if written == 0 {
+            // Lost the race: the row is withdrawn by the rival (already
+            // withdrawn, the first instant stands), or gone.
+            let now_held = client
+                .query_opt(
+                    "SELECT withdrawn_at FROM cirislens.federation_location_proofs \
+                      WHERE subject_key_id = $1 AND asserted_at = $2",
+                    &[&subject, &asserted_at],
+                )
+                .await
+                .map_err(|e| {
+                    crate::federation::Error::Backend(format!(
+                        "withdraw_location_proof re-read: {e}"
+                    ))
+                })?
+                .map(|r| {
+                    r.safe_get_with::<Option<chrono::DateTime<chrono::Utc>>, _, _, _>(
+                        "withdrawn_at",
+                        crate::federation::Error::Backend,
+                    )
+                })
+                .transpose()?;
+            return match now_held {
+                Some(Some(_)) => Ok(()),
+                _ => Err(crate::federation::Error::Backend(format!(
+                    "withdraw_location_proof: the held proof by {subject} at {asserted_at} \
+                     changed under the write and is not withdrawn"
+                ))),
+            };
+        }
+        // v53.1.3 (Codex on #985 P1, #986) — the row's bytes changed, so the
+        // signed wire index must learn the new content hash exactly as the
+        // put path teaches it: after the durable write, the pooled client
+        // released first (see `index_stored_record`).
+        let wire_index_key = crate::federation::wire_index::record_key(&[
+            ("subject_key_id", &subject),
+            (
+                "asserted_at",
+                &crate::federation::wire_index::locator_instant(&asserted_at),
+            ),
+        ]);
+        drop(client);
+        self.index_stored_record("LocationProof", &wire_index_key)
+            .await?;
         Ok(())
     }
 
@@ -15667,6 +15715,7 @@ impl crate::federation::BlobStorage for PostgresBackend {
             crate::federation::StorageFloor::resolved(
                 crate::federation::types::cohort_scope::CryptoTier::Plaintext,
             ),
+            None,
         )
         .await
     }
@@ -15680,10 +15729,12 @@ impl crate::federation::BlobStorage for PostgresBackend {
         attestation: crate::federation::PutBlobAttestation,
         cohort_scope: &str,
         floor: crate::federation::StorageFloor,
+        group_key_id: Option<&str>,
     ) -> Result<(), crate::federation::BlobError> {
         floor.check_scope(cohort_scope)?;
         let scope = cohort_scope.to_owned();
         let tier = floor.tier().as_str().to_owned();
+        let group = group_key_id.map(str::to_owned);
         // v3.4.0 (CIRISPersist#123) — admission ordering:
         //   1. empty-string → InvalidArgument
         //   2. trust-threshold → TrustBelowThreshold
@@ -15824,8 +15875,8 @@ impl crate::federation::BlobStorage for PostgresBackend {
             tx.execute(
                 "INSERT INTO cirislens.federation_blobs (\
                     sha256, storage_kind, bytes_inline, external_ref, size_bytes, media_type, \
-                    cohort_scope, crypto_tier, author_key_id\
-                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+                    cohort_scope, crypto_tier, author_key_id, group_key_id\
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
                  ON CONFLICT (sha256) DO NOTHING",
                 &[
                     &sha_vec,
@@ -15837,6 +15888,7 @@ impl crate::federation::BlobStorage for PostgresBackend {
                     &scope,
                     &tier,
                     &row_author,
+                    &group,
                 ],
             )
             .await
@@ -30994,6 +31046,7 @@ mod tests {
                             &s,
                             chrono::Utc::now(),
                             uuid::Uuid::new_v4(),
+                            None,
                         )
                         .await
                     )
