@@ -66,7 +66,9 @@ DELEGATED_DEFAULTS = (
     # delegated leaves (`list_attestations_by` / `_for` / `_referencing`),
     # so through the double they run the pin-compatible default — which is
     # exactly the pre-53.1.5 implementor I539 witnesses, and a fault on a
-    # leaf is observed.
+    # leaf is observed. v53.1.6's `list_attestations_for_type` /
+    # `list_attestations_by_type` / `list_attestations_by_dimension_citing`
+    # are compositions too, and stay out for the same reason.
     "insert_known_wire_hash",
     "known_wire_hash_contains",
     "list_known_wire_hashes_since",

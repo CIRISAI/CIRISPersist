@@ -5913,6 +5913,40 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         })
     }
 
+    /// v53.1.6 — V107's `(attesting_key_id, attestation_type, …)` prefix
+    /// seek (`federation_attestations_composer_ref`, V141-preserved).
+    async fn list_attestations_by_type(
+        &self,
+        attesting_key_id: &str,
+        attestation_type: &str,
+    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
+        let binds: Vec<SqlValue> = vec![
+            SqlValue::Text(attesting_key_id.to_owned()),
+            SqlValue::Text(attestation_type.to_owned()),
+        ];
+        let sql = sqlite_attestations_by_type_sql();
+        self.read(
+            move |conn| -> Result<Vec<crate::federation::Attestation>, rusqlite::Error> {
+                let mut stmt = conn.prepare(&sql)?;
+                let rows =
+                    stmt.query_map(params_from_iter(binds.iter()), sqlite_row_to_attestation)?;
+                rows.collect()
+            },
+        )
+        .await
+        .map_err(|e| crate::federation::Error::Backend(format!("list_attestations_by_type: {e}")))
+        .inspect(|rows| {
+            #[cfg(test)]
+            crate::federation::read_probe::record(
+                "list_attestations_by_type",
+                attesting_key_id,
+                rows,
+            );
+            #[cfg(not(test))]
+            let _ = rows;
+        })
+    }
+
     /// v53.1.6 — V180's `(attesting_key_id, dimension, evidence_refs[0])`
     /// seek; the expression is spelled exactly as the index is.
     async fn list_attestations_by_dimension_citing(
@@ -22658,6 +22692,24 @@ const SQLITE_ATTESTATION_COLUMNS: &str = "attestation_id, attesting_key_id, atte
     original_content_hash, scrub_signature_classical, scrub_signature_pqc, scrub_key_id, \
     scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, \
     withdraws_admission_rule, cohort_scope, tier, promoted_at, additional_scrubs";
+
+/// v53.1.6 — `list_attestations_by_type`'s statement (`?1` attester, `?2`
+/// type), spelled once so I545's plan check reads the statement the door runs.
+///
+/// `ORDER BY +asserted_at` is the documented unary-plus pin (a no-op on the
+/// value and its collation): without it the planner, with no `sqlite_stat1`,
+/// takes `federation_attestations_attesting (attesting_key_id, asserted_at
+/// DESC)` to skip the sort — and so visits EVERY row the attester authored
+/// to test its type, the very walk this read replaces. With the order term
+/// pinned off that index, V107's `composer_ref` seeks on both equalities and
+/// the handful of edges is sorted in a temp b-tree.
+fn sqlite_attestations_by_type_sql() -> String {
+    format!(
+        "SELECT {SQLITE_ATTESTATION_COLUMNS} FROM federation_attestations \
+         WHERE attesting_key_id = ?1 AND attestation_type = ?2 AND tier = 'federation' \
+         ORDER BY +asserted_at DESC"
+    )
+}
 
 /// v53.1.5 — the #817/#818 dimension-prefix predicate over V106's generated
 /// column: a half-open byte range when an upper bound is representable
@@ -45440,6 +45492,39 @@ mod tests {
         )
         .await;
         assert_eq!(page.items.len(), 300, "the room reader sees every trace");
+    }
+
+    /// I545 (sqlite) — `list_attestations_by_type`'s plan seeks V107's
+    /// `federation_attestations_composer_ref` on BOTH equality terms
+    /// (attester and type), so a steward's `delegates_to` edges are read
+    /// without visiting the steward's other rows.
+    #[tokio::test]
+    async fn i545_by_type_seeks_the_composer_ref_prefix() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let plan = sqlite_plan(
+            &backend,
+            &sqlite_attestations_by_type_sql(),
+            vec![
+                SqlValue::Text("steward".into()),
+                SqlValue::Text("delegates_to".into()),
+            ],
+        )
+        .await;
+        eprintln!("I545 list_attestations_by_type plan: {plan:?}");
+        assert!(
+            plan.iter().any(|l| l.contains(
+                "USING INDEX federation_attestations_composer_ref \
+                 (attesting_key_id=? AND attestation_type=?)"
+            )),
+            "the by-type read seeks the (attester, type) prefix: {plan:?}"
+        );
+        assert!(
+            !plan
+                .iter()
+                .any(|l| l.contains("federation_attestations_attesting ")),
+            "the by-type read does not walk the attester's whole slice in order: {plan:?}"
+        );
     }
 
     /// I532 (sqlite) — the plan. The v53.1.4 statement seeks the cohort-led

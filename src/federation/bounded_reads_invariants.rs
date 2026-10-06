@@ -1,4 +1,4 @@
-//! v53.1.6 — **I540–I544: four more reads bounded to what their folds use,
+//! v53.1.6 — **I540–I545: five more reads bounded to what their folds use,
 //! held to their verbatim pre-fix bodies.**
 //!
 //! CIRISEdge's heap harness (persist v53.1.4, sqlite) measured
@@ -23,6 +23,10 @@
 //!   the subject under the dimension and their composers.
 //! - **I544** `custody_acks_of(device, blob)`: the device's reports citing
 //!   that blob (V180) and the device's composers naming them.
+//! - **I545** `nodes_stewarded_by` / `nodes_owned_by` (= `nodes_of`, which
+//!   `send_set_for` asks per principal on every Edge memo refresh): the
+//!   steward's `delegates_to` edges (V107's `(attester, type)` prefix), never
+//!   its whole history; each candidate's verdict is unchanged.
 //!
 //! [`OwnerAudience`]: crate::federation::replication_audience::OwnerAudience
 
@@ -248,9 +252,6 @@ pub(crate) mod bodies {
                 let want = send_set_for_reference(d, k, scope).await.unwrap();
                 let _ = read_probe::take();
                 assert_eq!(got, want, "I540 send_set_for({k}, {scope})");
-                // (`nodes_of` → `nodes_stewarded_by` still reads the steward's
-                // history here; that read is not one of this slice's four and
-                // is left as measured — see the report.)
                 if scope != cs::COMMUNITY {
                     assert!(
                         calls_of(&log, "list_attestations_by_dimension_prefix", &o1) <= 1,
@@ -963,6 +964,263 @@ pub(crate) mod bodies {
         );
         let _ = HashSet::<String>::new();
     }
+
+    // ── I545 ─────────────────────────────────────────────────────────────
+
+    /// `admission::nodes_stewarded_by` as v53.1.5 shipped it.
+    pub async fn nodes_stewarded_by_reference(
+        directory: &dyn FederationDirectory,
+        steward_user_key_id: &str,
+    ) -> Result<Vec<String>, Error> {
+        let mut candidates: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for r in directory.list_attestations_by(steward_user_key_id).await? {
+            if r.attestation_type == attestation_type::DELEGATES_TO {
+                candidates.insert(r.attested_key_id);
+            }
+        }
+        for occ in directory
+            .list_identity_occurrences_for(steward_user_key_id)
+            .await?
+        {
+            candidates.insert(occ.occurrence_key_id);
+        }
+        candidates.insert(steward_user_key_id.to_owned());
+        let mut out: Vec<String> = Vec::new();
+        for cand in candidates {
+            if admission::steward_bindings_of(directory, &cand)
+                .await?
+                .iter()
+                .any(|anchor| anchor == steward_user_key_id)
+            {
+                out.push(cand);
+            }
+        }
+        out.sort();
+        Ok(out)
+    }
+
+    /// `admission::nodes_owned_by` (= `self_collective::nodes_of`) as v53.1.5
+    /// shipped it.
+    pub async fn nodes_owned_by_reference(
+        directory: &dyn FederationDirectory,
+        person: &str,
+    ) -> Result<Vec<String>, Error> {
+        let mut candidates = std::collections::BTreeSet::new();
+        for row in directory.list_attestations_by(person).await? {
+            if row.attestation_type == attestation_type::DELEGATES_TO
+                && admission::is_owner_binding_envelope(&row.attestation_envelope)
+                && !row.attested_key_id.is_empty()
+            {
+                candidates.insert(row.attested_key_id);
+            }
+        }
+        let mut out = Vec::new();
+        for node in candidates {
+            match admission::owner_of(directory, &node).await {
+                Ok(Some(owner)) if owner == person => out.push(node),
+                Ok(_) => {}
+                Err(Error::AmbiguousNodeOwner { .. }) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(out)
+    }
+
+    /// A plain (unmarked) delegation `delegates_to(user → node)`.
+    fn plain_delegation(user: &str, node: &str) -> Attestation {
+        let id = uuid::Uuid::new_v4().to_string();
+        let env = serde_json::json!({
+            "id": id, "kind": "delegates_to", "delegate_key_id": node,
+            "scope": [crate::federation::types::delegation_scope::INFRA_SERVE],
+            "sub_delegation": false,
+        });
+        let mut r = ts::bare_attestation(&id, user, node, &env);
+        r.attestation_type = attestation_type::DELEGATES_TO.to_owned();
+        ts::seal_row_in_place(user, &mut r);
+        r
+    }
+
+    /// **I545** — `nodes_stewarded_by` and `nodes_owned_by` / `nodes_of`
+    /// equal their v53.1.5 bodies over a steward with many unrelated rows
+    /// (self-reports, consent grants), claimed nodes, bindings withdrawn by
+    /// the steward, recanted, superseded and withdrawn by the node they name,
+    /// a plain delegation to a node, a conferral to an agent, and a second
+    /// steward; and the steward's whole history is never read — only its
+    /// `delegates_to` edges — while the v53.1.5 bodies read it every call.
+    pub async fn i545_nodes_of_reads_the_stewards_delegations(
+        d: &dyn FederationDirectory,
+        s: &str,
+    ) {
+        use crate::federation::replication_audience_invariants::bodies as rab;
+        let (u1, u2, u3) = (
+            format!("i545-u1-{s}"),
+            format!("i545-u2-{s}"),
+            format!("i545-u3-{s}"),
+        );
+        let n: Vec<String> = (1..=8).map(|i| format!("i545-n{i}-{s}")).collect();
+        let agent = format!("i545-agent-{s}");
+        rab::users(d, &[&u1, &u2, &u3]).await;
+        rab::nodes(d, &n.iter().map(String::as_str).collect::<Vec<_>>()).await;
+        ts::register_hybrid_key_as(d, &agent, &agent, AGENT).await;
+        // u1 claims n1 and n2 (occurrence + owner binding each).
+        rab::claim(d, &u1, &n[0], "laptop").await;
+        rab::claim(d, &u1, &n[1], "server").await;
+        // u1 binds n3, then recants it.
+        let b3 = ts::owner_binding_attestation(&format!("i545-b3-{s}"), &u1, &n[2]);
+        put(d, b3.clone()).await.expect("u1 → n3");
+        put(
+            d,
+            composer(&u1, &n[2], attestation_type::RECANTS, &b3.attestation_id),
+        )
+        .await
+        .expect("u1 recants n3");
+        // u1's plain delegation to n4 naming n4; n4 withdraws it (a subject
+        // may withdraw a row naming it — u1 retracted nothing). Plain, because
+        // a node withdrawing its OWNER binding is a reclaim, refused at the
+        // door without a deployment policy.
+        let mut b4 = plain_delegation(&u1, &n[3]);
+        b4.subject_key_ids = vec![n[3].clone()];
+        ts::reseal(&mut b4);
+        put(d, b4.clone()).await.expect("u1 → n4, naming n4");
+        put(
+            d,
+            composer(
+                &n[3],
+                &n[3],
+                attestation_type::WITHDRAWS,
+                &b4.attestation_id,
+            ),
+        )
+        .await
+        .expect("n4 withdraws u1's binding");
+        // u1 binds n5, then withdraws it.
+        let b5 = ts::owner_binding_attestation(&format!("i545-b5-{s}"), &u1, &n[4]);
+        put(d, b5.clone()).await.expect("u1 → n5");
+        put(
+            d,
+            composer(&u1, &n[4], attestation_type::WITHDRAWS, &b5.attestation_id),
+        )
+        .await
+        .expect("u1 withdraws n5");
+        // u1 binds n6, then supersedes that binding (whatever the fold makes
+        // of a superseded edge, both bodies must make the same of it).
+        let b6 = ts::owner_binding_attestation(&format!("i545-b6-{s}"), &u1, &n[5]);
+        put(d, b6.clone()).await.expect("u1 → n6");
+        put(
+            d,
+            composer(&u1, &n[5], attestation_type::SUPERSEDES, &b6.attestation_id),
+        )
+        .await
+        .expect("u1 supersedes n6's binding");
+        // u1's plain (unmarked) delegation to n7: a node has no agency, so it
+        // is a steward binding but not an ownership.
+        put(d, plain_delegation(&u1, &n[6]))
+            .await
+            .expect("u1 → n7 (plain)");
+        // u1 confers to an agent (unmarked: a conferral, not custody).
+        put(d, conferral(&u1, &agent)).await.expect("u1 → agent");
+        // u2 claims n8.
+        rab::claim(d, &u2, &n[7], "phone").await;
+        // u1's unrelated history: self-reports and consent grants.
+        for i in 0..12 {
+            put(d, self_report(&u1, &format!("i545-{i}")))
+                .await
+                .expect("u1 self-report");
+            rab::put(d, &rab::grant(&u1, Some(&n[0]), None))
+                .await
+                .expect("u1 grant");
+        }
+        // u3 owns nothing and has only noise.
+        for i in 0..4 {
+            put(d, self_report(&u3, &format!("i545-u3-{i}")))
+                .await
+                .expect("u3 self-report");
+        }
+        // u1's `delegates_to` edges: two claims, n3..n7, the agent.
+        let u1_edges = 2 + 5 + 1;
+
+        let _ = read_probe::take();
+        for k in [&u1, &u2, &u3, &n[0], &agent] {
+            let got = admission::nodes_stewarded_by(d, k).await.unwrap();
+            let log = read_probe::take();
+            let want = nodes_stewarded_by_reference(d, k).await.unwrap();
+            let ref_log = read_probe::take();
+            assert_eq!(got, want, "I545 nodes_stewarded_by({k})");
+            assert_eq!(
+                calls_of(&log, "list_attestations_by", k),
+                0,
+                "I545 nodes_stewarded_by({k}): the steward's history is not read: {log:?}"
+            );
+            assert_eq!(
+                calls_of(&ref_log, "list_attestations_by", k),
+                1,
+                "I545: the v53.1.5 body reads the steward's history (the red): {ref_log:?}"
+            );
+
+            let got = crate::federation::self_collective::nodes_of(d, k)
+                .await
+                .unwrap();
+            let log = read_probe::take();
+            let want = nodes_owned_by_reference(d, k).await.unwrap();
+            let ref_log = read_probe::take();
+            assert_eq!(got, want, "I545 nodes_of({k})");
+            assert_eq!(
+                calls_of(&log, "list_attestations_by", k),
+                0,
+                "I545 nodes_of({k}): the person's history is not read: {log:?}"
+            );
+            assert_eq!(
+                calls_of(&ref_log, "list_attestations_by", k),
+                1,
+                "I545: the v53.1.5 body reads the person's history (the red): {ref_log:?}"
+            );
+            if *k == u1 {
+                assert_eq!(
+                    rows_of(&log, "list_attestations_by_type", k),
+                    u1_edges,
+                    "I545: the type seek returns u1's delegates_to edges only: {log:?}"
+                );
+                assert!(
+                    rows_of(&ref_log, "list_attestations_by", k) > 3 * u1_edges,
+                    "I545: u1's history dwarfs its edges: {ref_log:?}"
+                );
+            }
+        }
+        // Literals: u1 owns n1, n2 (and n6 unless the fold retires a
+        // superseded binding — pinned by the reference above, not here);
+        // u1 stewards itself, its owned nodes and the plain-delegation n7.
+        let owned = crate::federation::self_collective::nodes_of(d, &u1)
+            .await
+            .unwrap();
+        for live in [&n[0], &n[1]] {
+            assert!(owned.contains(live), "I545: u1 owns {live}: {owned:?}");
+        }
+        for dead in [&n[2], &n[3], &n[4], &n[6], &n[7]] {
+            assert!(
+                !owned.contains(dead),
+                "I545: u1 does not own {dead}: {owned:?}"
+            );
+        }
+        let stewarded = admission::nodes_stewarded_by(d, &u1).await.unwrap();
+        for live in [&u1, &n[0], &n[1], &n[6]] {
+            assert!(
+                stewarded.contains(live),
+                "I545: u1 stewards {live}: {stewarded:?}"
+            );
+        }
+        for dead in [&n[2], &n[3], &n[4], &n[7], &agent] {
+            assert!(
+                !stewarded.contains(dead),
+                "I545: u1 does not steward {dead}: {stewarded:?}"
+            );
+        }
+        assert_eq!(
+            crate::federation::self_collective::nodes_of(d, &u2)
+                .await
+                .unwrap(),
+            vec![n[7].clone()]
+        );
+    }
 }
 
 #[cfg(test)]
@@ -990,6 +1248,7 @@ mod runners {
                 case!(i542, i542_live_granters_read_the_subjects_edges);
                 case!(i543, i543_the_config_renewal_check_reads_the_leaf);
                 case!(i544, i544_custody_acks_read_the_devices_reports_of_the_blob);
+                case!(i545, i545_nodes_of_reads_the_stewards_delegations);
                 $(case!($sql_only, $sql_body);)*
             }
         };

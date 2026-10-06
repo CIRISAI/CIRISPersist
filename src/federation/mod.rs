@@ -3438,6 +3438,26 @@ pub trait FederationDirectory: Send + Sync {
             .collect())
     }
 
+    /// v53.1.6 — the federation-tier rows `attesting_key_id` authored whose
+    /// `attestation_type` is `attestation_type` (a steward's outgoing
+    /// `delegates_to` edges — the candidates of [`admission::nodes_owned_by`]
+    /// and [`admission::nodes_stewarded_by`]). Ordered by `asserted_at` DESC.
+    /// Served by V107's `(attesting_key_id, attestation_type, …)` prefix.
+    /// Pin-compatible default over the unbounded read; every backend
+    /// overrides.
+    async fn list_attestations_by_type(
+        &self,
+        attesting_key_id: &str,
+        attestation_type: &str,
+    ) -> Result<Vec<Attestation>, Error> {
+        Ok(self
+            .list_attestations_by(attesting_key_id)
+            .await?
+            .into_iter()
+            .filter(|a| a.attestation_type == attestation_type)
+            .collect())
+    }
+
     /// v53.1.6 — the federation-tier rows `attesting_key_id` authored under
     /// exactly `dimension` whose envelope's `evidence_refs` FIRST element is
     /// `evidence_ref` — a device's `custody:ack:v1` reports about one blob.

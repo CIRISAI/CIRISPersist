@@ -4761,6 +4761,28 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         Ok(rows)
     }
 
+    async fn list_attestations_by_type(
+        &self,
+        attesting_key_id: &str,
+        attestation_type: &str,
+    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        let mut rows: Vec<_> = state
+            .federation_attestations
+            .iter()
+            .filter(|a| {
+                a.attesting_key_id == attesting_key_id
+                    && a.attestation_type == attestation_type
+                    && a.tier == crate::federation::types::attestation_tier::FEDERATION
+            })
+            .cloned()
+            .collect();
+        rows.sort_by_key(|a| std::cmp::Reverse(a.asserted_at));
+        #[cfg(test)]
+        crate::federation::read_probe::record("list_attestations_by_type", attesting_key_id, &rows);
+        Ok(rows)
+    }
+
     async fn list_attestations_by_dimension_citing(
         &self,
         attesting_key_id: &str,

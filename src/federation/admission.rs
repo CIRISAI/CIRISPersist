@@ -9462,7 +9462,7 @@ pub async fn steward_bindings_of(
 /// inherited verbatim, never re-implemented. Candidates:
 ///
 ///   * **clause (3)** — `U`'s OUTGOING `delegates_to` edges → each recipient
-///     (`list_attestations_by(U)`);
+///     (`list_attestations_by_type(U, delegates_to)`, v53.1.6);
 ///   * **clause (2)** — occurrences that speak for identity `U`
 ///     (`list_identity_occurrences_for(U)`);
 ///   * **clause (1)** — `U` itself (so the invariant holds exactly: `U` is
@@ -9478,11 +9478,15 @@ pub async fn nodes_stewarded_by(
 ) -> Result<Vec<String>, Error> {
     // Enumerate candidate nodes (cheap, indexed reads) — NOT a full scan.
     let mut candidates: std::collections::HashSet<String> = std::collections::HashSet::new();
-    // (3) U's outgoing delegates_to edges → recipients.
-    for r in directory.list_attestations_by(steward_user_key_id).await? {
-        if r.attestation_type == attestation_type::DELEGATES_TO {
-            candidates.insert(r.attested_key_id);
-        }
+    // (3) U's outgoing delegates_to edges → recipients. v53.1.6: the type
+    // seek, never U's whole history — Edge re-resolves send sets every 30 s,
+    // and this read ran once per principal per refresh. Retirement is decided
+    // below, on the candidate's side, so the candidate set needs no composers.
+    for r in directory
+        .list_attestations_by_type(steward_user_key_id, attestation_type::DELEGATES_TO)
+        .await?
+    {
+        candidates.insert(r.attested_key_id);
     }
     // (2) occurrences speaking for identity U.
     for occ in directory
@@ -9678,8 +9682,8 @@ pub async fn may_act_through(
 /// person is bound to*.
 ///
 /// **One fold, not two**: candidates come from the granter-side index
-/// ([`FederationDirectory::list_attestations_by`] filtered to owner-binding
-/// `delegates_to` envelopes), but each candidate's VERDICT is
+/// ([`FederationDirectory::list_attestations_by_type`]`(U, delegates_to)`,
+/// v53.1.6, filtered to owner-binding envelopes), but each candidate's VERDICT is
 /// [`owner_of`] itself — so liveness (expiry + admitted `withdraws`,
 /// #578/#584) and the single-owner rule are answered by the same spelling
 /// the forward walk uses, and `n ∈ nodes_owned_by(U) ⟺ owner_of(n) == U`
@@ -9695,11 +9699,14 @@ pub async fn nodes_owned_by<F: super::FederationDirectory + ?Sized>(
     person: &str,
 ) -> Result<Vec<String>, Error> {
     let mut candidates = std::collections::BTreeSet::new();
-    for row in directory.list_attestations_by(person).await? {
-        if row.attestation_type == super::types::attestation_type::DELEGATES_TO
-            && is_owner_binding_envelope(&row.attestation_envelope)
-            && !row.attested_key_id.is_empty()
-        {
+    // v53.1.6 — the type seek, not the person's whole history (`send_set_for`
+    // → `nodes_of` asks this per principal on every Edge memo refresh). The
+    // verdict is `owner_of` below, so the candidates need no composers.
+    for row in directory
+        .list_attestations_by_type(person, super::types::attestation_type::DELEGATES_TO)
+        .await?
+    {
+        if is_owner_binding_envelope(&row.attestation_envelope) && !row.attested_key_id.is_empty() {
             candidates.insert(row.attested_key_id);
         }
     }

@@ -7309,6 +7309,43 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             })
     }
 
+    /// v53.1.6 — V107's `(attesting_key_id, attestation_type, …)` prefix
+    /// seek (`federation_attestations_composer_ref`, V122-rebuilt).
+    async fn list_attestations_by_type(
+        &self,
+        attesting_key_id: &str,
+        attestation_type: &str,
+    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
+        let sql = format!(
+            "SELECT {PG_ATTESTATION_COLUMNS} FROM cirislens.federation_attestations \
+             WHERE attesting_key_id = $1 AND attestation_type = $2 AND tier = 'federation' \
+             ORDER BY asserted_at DESC"
+        );
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let rows = client
+            .query(&sql, &[&attesting_key_id, &attestation_type])
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("list_attestations_by_type: {e}"))
+            })?;
+        rows.into_iter()
+            .map(pg_row_to_attestation)
+            .collect::<Result<Vec<_>, _>>()
+            .inspect(|rows| {
+                #[cfg(test)]
+                crate::federation::read_probe::record(
+                    "list_attestations_by_type",
+                    attesting_key_id,
+                    rows,
+                );
+                #[cfg(not(test))]
+                let _ = rows;
+            })
+    }
+
     /// v53.1.6 — V180's `(attesting_key_id, dimension COLLATE "C",
     /// evidence_refs[0])` seek; the expression is spelled as the index is.
     async fn list_attestations_by_dimension_citing(

@@ -372,6 +372,7 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("list_composers_referencing_any", ConnClass::Read),
     // v53.1.6 — the type / citation / targeted seeks (V178, V180, V150).
     ("list_attestations_for_type", ConnClass::Read),
+    ("list_attestations_by_type", ConnClass::Read),
     ("list_attestations_by_dimension_citing", ConnClass::Read),
     ("list_targeted_by_dimension_prefix", ConnClass::Read),
     ("list_attestations_for_migration", ConnClass::Read),
