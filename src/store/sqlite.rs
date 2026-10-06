@@ -5876,6 +5876,138 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         })
     }
 
+    /// v53.1.6 — V178's `(attested_key_id, attestation_type, …)` prefix seek.
+    async fn list_attestations_for_type(
+        &self,
+        attested_key_id: &str,
+        attestation_type: &str,
+    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
+        let binds: Vec<SqlValue> = vec![
+            SqlValue::Text(attested_key_id.to_owned()),
+            SqlValue::Text(attestation_type.to_owned()),
+        ];
+        let sql = format!(
+            "SELECT {SQLITE_ATTESTATION_COLUMNS} FROM federation_attestations \
+             WHERE attested_key_id = ?1 AND attestation_type = ?2 AND tier = 'federation' \
+             ORDER BY asserted_at DESC"
+        );
+        self.read(
+            move |conn| -> Result<Vec<crate::federation::Attestation>, rusqlite::Error> {
+                let mut stmt = conn.prepare(&sql)?;
+                let rows =
+                    stmt.query_map(params_from_iter(binds.iter()), sqlite_row_to_attestation)?;
+                rows.collect()
+            },
+        )
+        .await
+        .map_err(|e| crate::federation::Error::Backend(format!("list_attestations_for_type: {e}")))
+        .inspect(|rows| {
+            #[cfg(test)]
+            crate::federation::read_probe::record(
+                "list_attestations_for_type",
+                attested_key_id,
+                rows,
+            );
+            #[cfg(not(test))]
+            let _ = rows;
+        })
+    }
+
+    /// v53.1.6 — V180's `(attesting_key_id, dimension, evidence_refs[0])`
+    /// seek; the expression is spelled exactly as the index is.
+    async fn list_attestations_by_dimension_citing(
+        &self,
+        attesting_key_id: &str,
+        dimension: &str,
+        evidence_ref: &str,
+    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
+        let binds: Vec<SqlValue> = vec![
+            SqlValue::Text(attesting_key_id.to_owned()),
+            SqlValue::Text(dimension.to_owned()),
+            SqlValue::Text(evidence_ref.to_owned()),
+        ];
+        let sql = format!(
+            "SELECT {SQLITE_ATTESTATION_COLUMNS} FROM federation_attestations \
+             WHERE attesting_key_id = ?1 AND dimension = ?2 \
+               AND json_extract(attestation_envelope, '$.evidence_refs[0]') = ?3 \
+               AND tier = 'federation' \
+             ORDER BY asserted_at DESC"
+        );
+        self.read(
+            move |conn| -> Result<Vec<crate::federation::Attestation>, rusqlite::Error> {
+                let mut stmt = conn.prepare(&sql)?;
+                let rows =
+                    stmt.query_map(params_from_iter(binds.iter()), sqlite_row_to_attestation)?;
+                rows.collect()
+            },
+        )
+        .await
+        .map_err(|e| {
+            crate::federation::Error::Backend(format!("list_attestations_by_dimension_citing: {e}"))
+        })
+        .inspect(|rows| {
+            #[cfg(test)]
+            crate::federation::read_probe::record(
+                "list_attestations_by_dimension_citing",
+                attesting_key_id,
+                rows,
+            );
+            #[cfg(not(test))]
+            let _ = rows;
+        })
+    }
+
+    /// v53.1.6 — V150's `(cohort_scope, cohort_target)` seek over the
+    /// generated column, then the dimension prefix.
+    async fn list_targeted_by_dimension_prefix(
+        &self,
+        cohort_scopes: &[&str],
+        cohort_target: &str,
+        dimension_prefix: &str,
+    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
+        if cohort_scopes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut binds: Vec<SqlValue> = vec![SqlValue::Text(cohort_target.to_owned())];
+        let prefix_sql = sqlite_dimension_prefix_clause(dimension_prefix, &mut binds);
+        let scope_phs: Vec<String> = cohort_scopes
+            .iter()
+            .map(|sc| {
+                binds.push(SqlValue::Text((*sc).to_owned()));
+                format!("?{}", binds.len())
+            })
+            .collect();
+        let sql = format!(
+            "SELECT {SQLITE_ATTESTATION_COLUMNS} FROM federation_attestations \
+             WHERE cohort_scope IN ({scopes}) AND cohort_target = ?1 AND tier = 'federation' \
+               AND {prefix_sql} \
+             ORDER BY asserted_at DESC",
+            scopes = scope_phs.join(", "),
+        );
+        self.read(
+            move |conn| -> Result<Vec<crate::federation::Attestation>, rusqlite::Error> {
+                let mut stmt = conn.prepare(&sql)?;
+                let rows =
+                    stmt.query_map(params_from_iter(binds.iter()), sqlite_row_to_attestation)?;
+                rows.collect()
+            },
+        )
+        .await
+        .map_err(|e| {
+            crate::federation::Error::Backend(format!("list_targeted_by_dimension_prefix: {e}"))
+        })
+        .inspect(|rows| {
+            #[cfg(test)]
+            crate::federation::read_probe::record(
+                "list_targeted_by_dimension_prefix",
+                cohort_target,
+                rows,
+            );
+            #[cfg(not(test))]
+            let _ = rows;
+        })
+    }
+
     /// v21.0.0 (CIRISPersist#502 E7) — the revocation-folded
     /// `consent_peer_set` read: `node_key_id`'s live peers, sorted +
     /// deduped. The fold already happened at write time (see

@@ -165,11 +165,18 @@ pub async fn send_set_for(
     // principals' families (the row's own family is not an argument here),
     // so it can name a node that receives another of those families; the
     // receiver's `is_audience` decides per row.
-    use super::replication_audience::{owner_node_receives, OwnerCohort};
+    // v53.1.6 — the owner's allow lists and occurrences are read ONCE per
+    // owner (`OwnerAudience`) and every node of the owner is decided against
+    // them; the per-node door re-read both for each node.
+    use super::replication_audience::{OwnerAudience, OwnerCohort};
     if cohort_scope == cohort_scope::SELF {
         for p in &principals_of(dir, k).await? {
+            let audience = OwnerAudience::read(dir, p).await?;
             for n in nodes_of(dir, p).await? {
-                if owner_node_receives(dir, p, &n, OwnerCohort::SelfContent).await? {
+                if audience
+                    .node_receives(dir, &n, OwnerCohort::SelfContent)
+                    .await?
+                {
                     set.insert(n);
                 }
             }
@@ -182,8 +189,9 @@ pub async fn send_set_for(
                     target: &fam.family_key_id,
                 };
                 for m in dir.active_family_members(&fam.family_key_id).await? {
+                    let audience = OwnerAudience::read(dir, &m.key_id).await?;
                     for n in nodes_of(dir, &m.key_id).await? {
-                        if owner_node_receives(dir, &m.key_id, &n, cohort).await? {
+                        if audience.node_receives(dir, &n, cohort).await? {
                             set.insert(n);
                         }
                     }

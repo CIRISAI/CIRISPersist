@@ -57,6 +57,9 @@ from pathlib import Path
 # predating this list, tracked separately rather than resolved by a sweep that
 # cannot tell a leaf from a composition.
 DELEGATED_DEFAULTS = (
+    # v53.1.6 — defaulted `Unsupported`, overridden by every backend (the
+    # V150 cohort_target seek has no unbounded twin to compose).
+    "list_targeted_by_dimension_prefix",
     # v53.1.5 — NOT here: `list_attestations_by_dimension_prefix`,
     # `list_attestations_for_dimension_prefix` and
     # `list_composers_referencing_any` are provided COMPOSITIONS over the

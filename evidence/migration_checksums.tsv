@@ -335,3 +335,5 @@ sqlite	178	attested_seek_indexes	15694997860845734773
 sqlite	179	trace_events_trace_ts_scope	18024954084176412140
 postgres	178	attested_seek_indexes	635513950952769989
 postgres	179	trace_events_trace_ts_scope	2025525238819942285
+sqlite	180	custody_ack_citation_index	10189599177617824388
+postgres	180	custody_ack_citation_index	14445688681878171875

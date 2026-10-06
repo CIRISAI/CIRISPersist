@@ -143,6 +143,164 @@ where
         .and_then(|o| NodeClass::of_device_class(&o.device_class)))
 }
 
+/// v53.1.6 — **an owner's allow lists, read ONCE.** The owner's
+/// `consent:replication:v1` grants (V137's attester+dimension seek) and the
+/// owner's own composers naming any of them (V107's seek). [`Self::list_for`]
+/// is [`owner_allow_list`]'s body for one node; a caller deciding many nodes
+/// of one owner (`send_set_for`, `owner_nodes_receiving`, the hold door's
+/// per-community walk) reads this once and asks it per node. CIRISEdge's
+/// heap harness measured the per-node re-read at ~7 KB of heap per row of
+/// the owner's history before v53.1.5 bounded it; this removes the
+/// per-node multiplier that remained.
+pub struct OwnerAllowLists {
+    owner: String,
+    grants: Vec<Attestation>,
+    retired: HashSet<String>,
+}
+
+impl OwnerAllowLists {
+    /// Read `owner`'s grants and the composers that retire them.
+    pub async fn read<D>(dir: &D, owner: &str) -> Result<Self, Error>
+    where
+        D: FederationDirectory + ?Sized,
+    {
+        let grants = dir
+            .list_attestations_by_dimension_prefix(owner, GRANT_DIMENSION)
+            .await?;
+        let ids: Vec<String> = grants.iter().map(|g| g.attestation_id.clone()).collect();
+        let retired: HashSet<String> = if ids.is_empty() {
+            HashSet::new()
+        } else {
+            dir.list_composers_referencing_any(&ids, None, Some(owner))
+                .await?
+                .iter()
+                .filter(|r| super::precedence::is_structural_composer(&r.attestation_type))
+                .filter_map(|r| {
+                    super::precedence::references_attestation_id_from_envelope(
+                        &r.attestation_envelope,
+                    )
+                    .map(str::to_owned)
+                })
+                .collect()
+        };
+        Ok(Self {
+            owner: owner.to_owned(),
+            grants,
+            retired,
+        })
+    }
+
+    /// The owner's allow list for `node` — [`owner_allow_list`]'s predicate,
+    /// verbatim, over the rows read once.
+    #[must_use]
+    pub fn list_for(&self, node: &str) -> Option<BTreeSet<CohortEntry>> {
+        let now = chrono::Utc::now();
+        let mut acc: Option<BTreeSet<CohortEntry>> = None;
+        for g in &self.grants {
+            if g.attesting_key_id != self.owner
+                || super::admission::envelope_dimension(&g.attestation_envelope)
+                    != Some(GRANT_DIMENSION)
+                || super::consent_by_humans::for_key_id_of(&g.attestation_envelope) != Some(node)
+                || self.retired.contains(g.attestation_id.as_str())
+                || g.expires_at.is_some_and(|e| e <= now)
+            {
+                continue;
+            }
+            // A grant that does not parse was refused at admission; one held from
+            // before the grammar is no allow list (fail toward the default, which
+            // the class already bounds).
+            let Ok(policy) = parse_grant_payload(&g.attestation_envelope) else {
+                continue;
+            };
+            if policy.valid_until.is_some_and(|v| v <= now) {
+                continue;
+            }
+            if let Some(list) = policy.cohorts {
+                let set: BTreeSet<CohortEntry> = list.into_iter().collect();
+                acc = Some(match acc {
+                    None => set,
+                    Some(prev) => prev.intersection(&set).cloned().collect(),
+                });
+            }
+        }
+        acc
+    }
+}
+
+/// v53.1.6 — **everything [`owner_node_receives`] needs about one owner,
+/// read ONCE**: the allow lists and the owner's ACTIVE occurrences. A
+/// caller walking the owner's nodes asks [`Self::node_receives`] per node;
+/// only the node's own `active_identities_for_occurrence` (the #932 rule)
+/// is read per node, as the single-node door reads it.
+pub struct OwnerAudience {
+    owner: String,
+    lists: OwnerAllowLists,
+    occurrences: Vec<super::types::IdentityOccurrence>,
+}
+
+impl OwnerAudience {
+    /// Read `owner`'s allow lists and active occurrences.
+    pub async fn read<D>(dir: &D, owner: &str) -> Result<Self, Error>
+    where
+        D: FederationDirectory + ?Sized,
+    {
+        Ok(Self {
+            owner: owner.to_owned(),
+            lists: OwnerAllowLists::read(dir, owner).await?,
+            occurrences: dir.list_identity_occurrences_active(owner).await?,
+        })
+    }
+
+    /// [`owner_node_receives`]'s decision for `node`, over the rows read once.
+    pub async fn node_receives<D>(
+        &self,
+        dir: &D,
+        node: &str,
+        cohort: OwnerCohort<'_>,
+    ) -> Result<bool, Error>
+    where
+        D: FederationDirectory + ?Sized,
+    {
+        if self.owner == node
+            || !dir
+                .active_identities_for_occurrence(node)
+                .await?
+                .contains(&self.owner)
+        {
+            return Ok(false);
+        }
+        let Some(occ) = self
+            .occurrences
+            .iter()
+            .filter(|o| o.occurrence_key_id == node)
+            .max_by_key(|o| o.asserted_at)
+        else {
+            return Ok(false);
+        };
+        Ok(self.occurrence_may_hold_key(occ, cohort))
+    }
+
+    /// [`occurrence_may_hold_key`]'s decision, over the lists read once.
+    #[must_use]
+    pub fn occurrence_may_hold_key(
+        &self,
+        occ: &super::types::IdentityOccurrence,
+        cohort: OwnerCohort<'_>,
+    ) -> bool {
+        if occ.occurrence_key_id == self.owner {
+            return true;
+        }
+        let Some(class) = NodeClass::of_device_class(&occ.device_class) else {
+            return false;
+        };
+        class_allows(
+            class,
+            self.lists.list_for(&occ.occurrence_key_id).as_ref(),
+            cohort,
+        )
+    }
+}
+
 /// The owner's allow list for `node`: the `cohorts` member of `owner`'s LIVE
 /// `consent:replication` grants FOR `node` (authored by `owner`, `for_key_id`
 /// = `node`, unexpired, not retired by a `withdraws` / `recants` /
@@ -158,62 +316,10 @@ pub async fn owner_allow_list<D>(
 where
     D: FederationDirectory + ?Sized,
 {
-    // v53.1.5 — the candidate rows, not every row the owner ever authored:
-    // the owner's `consent:replication:v1` grants (V137's attester+dimension
-    // seek) FOR this node, and the owner's own composers that reference
-    // exactly those (V107's attester+type+reference seek). The predicate
-    // below is unchanged; it simply no longer runs over the owner's whole
-    // history to reach the handful of rows it can select.
-    let rows: Vec<Attestation> = dir
-        .list_attestations_by_dimension_prefix(owner, GRANT_DIMENSION)
-        .await?
-        .into_iter()
-        .filter(|g| super::consent_by_humans::for_key_id_of(&g.attestation_envelope) == Some(node))
-        .collect();
-    if rows.is_empty() {
-        return Ok(None);
-    }
-    let ids: Vec<String> = rows.iter().map(|g| g.attestation_id.clone()).collect();
-    let composers = dir
-        .list_composers_referencing_any(&ids, None, Some(owner))
-        .await?;
-    let retired: HashSet<&str> = composers
-        .iter()
-        .filter(|r| super::precedence::is_structural_composer(&r.attestation_type))
-        .filter_map(|r| {
-            super::precedence::references_attestation_id_from_envelope(&r.attestation_envelope)
-        })
-        .collect();
-    let now = chrono::Utc::now();
-    let mut acc: Option<BTreeSet<CohortEntry>> = None;
-    for g in &rows {
-        if g.attesting_key_id != owner
-            || super::admission::envelope_dimension(&g.attestation_envelope)
-                != Some(GRANT_DIMENSION)
-            || super::consent_by_humans::for_key_id_of(&g.attestation_envelope) != Some(node)
-            || retired.contains(g.attestation_id.as_str())
-            || g.expires_at.is_some_and(|e| e <= now)
-        {
-            continue;
-        }
-        // A grant that does not parse was refused at admission; one held from
-        // before the grammar is no allow list (fail toward the default, which
-        // the class already bounds).
-        let Ok(policy) = parse_grant_payload(&g.attestation_envelope) else {
-            continue;
-        };
-        if policy.valid_until.is_some_and(|v| v <= now) {
-            continue;
-        }
-        if let Some(list) = policy.cohorts {
-            let set: BTreeSet<CohortEntry> = list.into_iter().collect();
-            acc = Some(match acc {
-                None => set,
-                Some(prev) => prev.intersection(&set).cloned().collect(),
-            });
-        }
-    }
-    Ok(acc)
+    // v53.1.6 — the single-node door: the owner's lists read once, asked
+    // for this node. A caller walking many nodes of one owner holds an
+    // [`OwnerAudience`] instead and pays the read once.
+    Ok(OwnerAllowLists::read(dir, owner).await?.list_for(node))
 }
 
 /// **Does `owner`'s `cohort` reach `node`?** [`class_allows`] over
@@ -313,15 +419,18 @@ pub async fn owner_nodes_receiving<D>(
 where
     D: FederationDirectory + ?Sized,
 {
+    // v53.1.6 — one read of the owner's lists and occurrences for every
+    // node, where each node used to re-read both.
+    let audience = OwnerAudience::read(dir, owner).await?;
     let mut nodes: BTreeSet<String> = BTreeSet::new();
-    for o in dir.list_identity_occurrences_active(owner).await? {
+    for o in &audience.occurrences {
         if o.occurrence_key_id != owner {
-            nodes.insert(o.occurrence_key_id);
+            nodes.insert(o.occurrence_key_id.clone());
         }
     }
     let mut out = Vec::new();
     for n in nodes {
-        if owner_node_receives(dir, owner, &n, cohort).await? {
+        if audience.node_receives(dir, &n, cohort).await? {
             out.push(n);
         }
     }

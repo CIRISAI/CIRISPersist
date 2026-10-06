@@ -414,8 +414,22 @@ pub async fn custody_acks_of<D>(
 where
     D: FederationDirectory + ?Sized,
 {
-    let rows = directory.list_attestations_by(device_key_id).await?;
-    let refs: Vec<&Attestation> = rows.iter().collect();
+    // v53.1.6 — the device's reports about THIS blob (V180's
+    // attester+dimension+citation seek) and the device's own composers
+    // naming them, not every row the device ever authored (CIRISEdge's heap
+    // harness: ~7 KB of heap per row of that history, per question).
+    let rows = directory
+        .list_attestations_by_dimension_citing(
+            device_key_id,
+            CUSTODY_ACK_DIMENSION,
+            blob_sha256_hex,
+        )
+        .await?;
+    let ids: Vec<String> = rows.iter().map(|r| r.attestation_id.clone()).collect();
+    let composers = directory
+        .list_composers_referencing_any(&ids, None, Some(device_key_id))
+        .await?;
+    let refs: Vec<&Attestation> = rows.iter().chain(composers.iter()).collect();
     let retired = super::precedence::retired_ids(&refs);
     Ok(rows
         .iter()
