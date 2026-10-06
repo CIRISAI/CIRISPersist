@@ -1,8 +1,8 @@
--- V179 — the attested-keyed seeks behind the bounded audience and consent
+-- V178 — the attested-keyed seeks behind the bounded audience and consent
 -- reads, SQLite dialect
 -- v53.1.5 (CIRISServer's canonical node, heap +500 MB vs v52, 2026-10-06)
 --
--- POSTGRES PARITY: migrations/postgres/lens/V179__attested_seek_indexes.sql
+-- POSTGRES PARITY: migrations/postgres/lens/V178__attested_seek_indexes.sql
 --
 -- Three per-call reads loaded an UNBOUNDED row set and decoded every
 -- envelope: `owner_allow_list` read every row its owner ever authored to

@@ -1,8 +1,8 @@
--- V179 — the attested-keyed seeks behind the bounded audience and consent
+-- V178 — the attested-keyed seeks behind the bounded audience and consent
 -- reads, Postgres dialect
 -- v53.1.5 (CIRISServer's canonical node, heap +500 MB vs v52, 2026-10-06)
 --
--- SQLITE PARITY: migrations/sqlite/lens/V179__attested_seek_indexes.sql
+-- SQLITE PARITY: migrations/sqlite/lens/V178__attested_seek_indexes.sql
 -- See that file's header for the rationale.
 --
 -- `COLLATE "C"` on the dimension column is LOAD-BEARING, as on V137: the

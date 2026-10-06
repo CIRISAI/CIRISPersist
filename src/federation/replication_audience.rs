@@ -379,9 +379,9 @@ where
         HeadCharter::KeyRoot => None,
         _ => return Ok(false),
     };
-    // v53.1.5 — the charter-shaped rows about the group (V179's
+    // v53.1.5 — the charter-shaped rows about the group (V178's
     // attested+dimension seek), not every row about it; then the composers
-    // attested to the group that reference exactly those (V179's
+    // attested to the group that reference exactly those (V178's
     // attested+type+reference seek). `retired_ids` over that pair answers
     // "retired" for each candidate exactly as it did over the whole slice:
     // a composer that retires a row about the group is itself attested to

@@ -5763,7 +5763,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         })
     }
 
-    /// v53.1.5 — V179's `(attested_key_id, dimension)` seek, the attested
+    /// v53.1.5 — V178's `(attested_key_id, dimension)` seek, the attested
     /// twin of the read above; the optional attester narrows in the same
     /// statement.
     async fn list_attestations_for_dimension_prefix(
@@ -5814,7 +5814,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
 
     /// v53.1.5 — `list_attestations_referencing` for a SET of ids (one
     /// `json_each` bind), with the attested / attesting axes the folds pin so
-    /// V179's `(attested_key_id, attestation_type, ref)` or V107's attesting
+    /// V178's `(attested_key_id, attestation_type, ref)` or V107's attesting
     /// twin serves it as a seek.
     async fn list_composers_referencing_any(
         &self,
@@ -24247,7 +24247,7 @@ fn sqlite_read_err(ctx: &str) -> impl Fn(rusqlite::Error) -> crate::read::Error 
 ///   ordered and limited. Its scope columns are written `+cohort_scope` /
 ///   `+cohort_target_id` — SQLite's documented way to keep a term from
 ///   constraining an index — so the planner cannot take the cohort seek
-///   and streams the trace-ordered index instead (V178 makes that scan
+///   and streams the trace-ordered index instead (V179 makes that scan
 ///   covering): no temp b-tree for the GROUP BY, and the ORDER BY sorter
 ///   holds (trace_id, ts) pairs, never a payload.
 /// - **`phase2`** runs the full aggregate select over ONLY the page's
@@ -25623,6 +25623,12 @@ impl crate::read::ReadEngine for SqliteBackend {
         limit: i64,
         scope: crate::scope::CallerScope,
     ) -> Result<crate::read::AttestationListPage, crate::read::Error> {
+        #[cfg(test)]
+        let probe_key = filter
+            .attested_key_id
+            .clone()
+            .or_else(|| filter.attesting_key_id.clone())
+            .unwrap_or_else(|| "*".to_owned());
         if !(1..=10_000).contains(&limit) {
             return Err(crate::read::Error::InvalidArgument(format!(
                 "limit must be in [1, 10000], got {limit}"
@@ -25865,6 +25871,12 @@ impl crate::read::ReadEngine for SqliteBackend {
             },
         )
         .await
+        .inspect(|page| {
+            #[cfg(test)]
+            crate::federation::read_probe::record("list_attestations", &probe_key, &page.items);
+            #[cfg(not(test))]
+            let _ = page;
+        })
     }
 
     /// #135 + part of #150 — list every attestation whose subject is
@@ -45301,7 +45313,7 @@ mod tests {
     /// I532 (sqlite) — the plan. The v53.1.4 statement seeks the cohort-led
     /// V060 index and sorts the WHOLE table for the GROUP BY (every
     /// aggregated column, payload included, in the sorter); phase 1 streams
-    /// V178 as a covering index with no temp b-tree for the GROUP BY, and
+    /// V179 as a covering index with no temp b-tree for the GROUP BY, and
     /// phase 2 seeks the page's trace_ids through the same index.
     #[tokio::test]
     async fn i532_phase1_streams_the_trace_index_without_a_group_by_sort() {
@@ -45337,7 +45349,7 @@ mod tests {
         assert!(
             p1.iter()
                 .any(|l| l.contains("COVERING INDEX trace_events_trace_ts_scope")),
-            "phase 1 streams V178 as a covering index: {p1:?}"
+            "phase 1 streams V179 as a covering index: {p1:?}"
         );
 
         let mut b2 = plan.phase2_binds.clone();
@@ -45373,7 +45385,7 @@ mod tests {
         );
     }
 
-    /// I532b — what V178 buys over V042's `trace_events_an_trace_summary`:
+    /// I532b — what V179 buys over V042's `trace_events_an_trace_summary`:
     /// without it phase 1 still streams a trace-ordered index (no GROUP BY
     /// sort — the `+cohort_scope` pin is what defeats the cohort seek), but
     /// that index does not carry the scope columns, so every event's heap
@@ -45381,12 +45393,12 @@ mod tests {
     #[tokio::test]
     async fn i532b_without_v178_phase1_reads_the_heap_per_event() {
         let backend = SqliteBackend::open_in_memory().await.unwrap();
-        backend.run_migrations_through(177).await.unwrap();
+        backend.run_migrations_through(178).await.unwrap();
         seed_i531_corpus(&backend, 50).await;
         let unauth = crate::scope::CallerScope::Unauthenticated;
         let plan = sqlite_trace_summary_plan(&TraceFilter::default(), None, 500, &unauth).unwrap();
         let p1 = sqlite_plan(&backend, &plan.phase1, plan.phase1_binds.clone()).await;
-        eprintln!("I532b phase-1 plan without V178: {p1:?}");
+        eprintln!("I532b phase-1 plan without V179: {p1:?}");
         assert!(
             !p1.iter()
                 .any(|l| l.contains("USE TEMP B-TREE FOR GROUP BY")),

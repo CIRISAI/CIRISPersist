@@ -32,6 +32,10 @@
 //!   ~15 KB envelopes; a 330-row author; a 500-row root) the new doors
 //!   return a handful of rows and under 1% of the bytes the v53.1.4 bodies
 //!   read — asserted as rows and envelope bytes, never wall time.
+//! - **I538** the scorer's pass at the canonical's shape (sqlite, postgres):
+//!   900 agents over a node with ~2,400 rows about it; no call reads the
+//!   node's slice, the pass decodes under 5% of what the v53.1.4 bodies
+//!   decode.
 
 #[cfg(test)]
 pub(crate) mod bodies {
@@ -1271,6 +1275,252 @@ pub(crate) mod bodies {
         assert_eq!(new_rows, 1, "the one charter row, and no composer");
         assert!(new_bytes * 100 < old_bytes, "{new_bytes} vs {old_bytes}");
     }
+
+    // ── I538 — the scorer's pass at the canonical's shape ────────────────
+
+    /// The totals one scorer pass decoded, from the probe.
+    #[derive(Default, Debug, Clone, Copy)]
+    pub struct PassTotals {
+        pub rows: usize,
+        pub bytes: usize,
+        /// Rows returned by reads keyed on the target node, summed.
+        pub rows_keyed_on_target: usize,
+        /// The largest single call's rows keyed on the target.
+        pub max_rows_keyed_on_target_per_agent: usize,
+    }
+
+    /// **I538** — the scorer's per-pass sequence at the canonical's shape
+    /// (CIRISServer's capped run: the FIRST pass took the node from 110 MB
+    /// to 2,040 MB in ~40 s). The target node T carries ~2,400 rows about
+    /// it (every agent's `analyze` consent, the stewards' FOR grants, T's
+    /// `consent:community_trust` rows, T's own config self-reports); 20
+    /// stewards; 900 agents, each an occurrence of a steward, each with a
+    /// 15 KB capacity score from T. Per agent the scorer asks
+    /// `resolve_scoped_consent_by_principals(T, agent, "analyze")` and
+    /// `list_attestations(attested = agent, type = scores, prefix
+    /// `capacity:`, limit 512)`; once per pass `list_trace_summaries`.
+    /// Asserted from the probe: no call reads T's slice (every read keyed
+    /// on T returns the agent's / its steward's consent rows only), and the
+    /// pass's rows keyed on T are a small multiple of the agent count. The
+    /// v53.1.4 bodies run on a 1-in-10 sample for the comparison.
+    pub async fn i538_the_scorers_pass_reads_each_agents_slice_not_the_nodes<B>(d: &B, s: &str)
+    where
+        B: FederationDirectory + crate::read::ReadEngine + Sync,
+    {
+        const AGENTS: usize = 900;
+        const STEWARDS: usize = 20;
+        let now = chrono::Utc::now();
+        let t = format!("i538-canon-{s}");
+        let stewards: Vec<String> = (0..STEWARDS).map(|i| format!("i538-s{i}-{s}")).collect();
+        let agents: Vec<String> = (0..AGENTS).map(|i| format!("i538-a{i}-{s}")).collect();
+        let mut reg: Vec<(&str, &str)> = vec![(t.as_str(), NODE)];
+        reg.extend(stewards.iter().map(|k| (k.as_str(), USER)));
+        reg.extend(agents.iter().map(|k| (k.as_str(), AGENT)));
+        keys(d, &reg).await;
+        // T's owner (its community_trust rows need a held binding).
+        put_patiently(
+            d,
+            ts::owner_binding_attestation(&format!("i538-ob-{s}"), &stewards[0], &t),
+            "I538 owner binding",
+        )
+        .await;
+        let started = std::time::Instant::now();
+        for (i, a) in agents.iter().enumerate() {
+            let steward = &stewards[i % STEWARDS];
+            d.put_identity_occurrence_local(crate::federation::IdentityOccurrence {
+                identity_key_id: steward.clone(),
+                occurrence_key_id: a.clone(),
+                device_class: "agent".to_owned(),
+                hardware_attestation: None,
+                asserted_at: now,
+                valid_until: None,
+                encryption_pubkeys: None,
+                transport_binding: None,
+                persist_row_hash: String::new(),
+            })
+            .await
+            .expect("occurrence row");
+            // The agent's own analyze consent to T — what lets T score it.
+            put_patiently(
+                d,
+                state(
+                    a,
+                    &t,
+                    "granted",
+                    "analyze".into(),
+                    None,
+                    "2026-05-01T00:00:00Z",
+                    &[],
+                ),
+                "I538 agent consent",
+            )
+            .await;
+            // Every third agent: its steward's grant FOR it, too.
+            if i % 3 == 0 {
+                put_patiently(
+                    d,
+                    state(
+                        steward,
+                        &t,
+                        "granted",
+                        "analyze".into(),
+                        Some(a),
+                        "2026-05-02T00:00:00Z",
+                        &[],
+                    ),
+                    "I538 steward grant",
+                )
+                .await;
+            }
+            // T's 15 KB capacity score about the agent (CC#46: admitted under
+            // the agent's live analyze consent covering T).
+            let mut score = scores(
+                &t,
+                a,
+                serde_json::json!({ "dimension": "capacity:core_identity:v1", "score": 0.5, "blob": blob(i) }),
+                now,
+            );
+            score.subject_key_ids = vec![a.clone()];
+            ts::reseal(&mut score);
+            put_patiently(d, score, "I538 capacity score").await;
+        }
+        // T's community_trust rows (100) and self-reports (1,100): the rest
+        // of the ~2,400 rows about it.
+        for i in 0..100 {
+            let mut ct = scores(
+                &t,
+                &t,
+                serde_json::json!({
+                    "dimension": crate::federation::community_trust_consent::COMMUNITY_TRUST_DIMENSION,
+                    "score": 1.0,
+                }),
+                now + chrono::Duration::milliseconds(i),
+            );
+            ct.subject_key_ids = vec![stewards[0].clone(), agents[i as usize].clone()];
+            ts::reseal(&mut ct);
+            put_patiently(d, ct, "I538 community_trust").await;
+        }
+        for i in 0..1_100 {
+            put_patiently(
+                d,
+                scores(
+                    &t,
+                    &t,
+                    serde_json::json!({ "dimension": format!("config:i538-{i}:v1"), "n": i }),
+                    now,
+                ),
+                "I538 self-report",
+            )
+            .await;
+        }
+        let about_t = FederationDirectory::list_attestations_for(d, &t)
+            .await
+            .unwrap()
+            .len();
+        eprintln!(
+            "I538 seeded in {:?}: {about_t} rows about T, {AGENTS} agents, {STEWARDS} stewards",
+            started.elapsed()
+        );
+        assert!(
+            about_t >= 2_300,
+            "the canonical's shape: {about_t} rows about T"
+        );
+        let _ = read_probe::take();
+
+        // ── the pass, through the new doors ──
+        let scope = crate::scope::CallerScope::Unauthenticated;
+        let mut new = PassTotals::default();
+        let pass_started = std::time::Instant::now();
+        for a in &agents {
+            cbh::resolve_scoped_consent_by_principals(d, &t, a, "analyze", None, now)
+                .await
+                .unwrap();
+            let page = d
+                .list_attestations(
+                    crate::read::AttestationFilter {
+                        attested_key_id: Some(a.clone()),
+                        attestation_type: Some(attestation_type::SCORES.to_owned()),
+                        dimension_prefixes: vec!["capacity:".to_owned()],
+                        ..Default::default()
+                    },
+                    None,
+                    512,
+                    scope.clone(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(page.items.len(), 1, "the agent's one capacity score");
+            let log = read_probe::take();
+            let (rows_t, _) = reads_keyed_on(&log, &t);
+            new.rows += log.iter().map(|r| r.rows).sum::<usize>();
+            new.bytes += log.iter().map(|r| r.bytes).sum::<usize>();
+            new.rows_keyed_on_target += rows_t;
+            new.max_rows_keyed_on_target_per_agent =
+                new.max_rows_keyed_on_target_per_agent.max(rows_t);
+            // The agent's own consent rows about T plus its steward's (a
+            // steward authored FOR grants for a third of its 45 agents: 15
+            // rows) — O(the principals' rows), never the slice.
+            assert!(
+                rows_t <= 64,
+                "I538 {a}: reads keyed on T returned {rows_t} rows — the agent's and its \
+                 steward's consent rows about T, never T's slice: {log:?}"
+            );
+        }
+        d.list_trace_summaries(
+            crate::read::TraceFilter::default(),
+            None,
+            500,
+            scope.clone(),
+        )
+        .await
+        .unwrap();
+        let pass_elapsed = pass_started.elapsed();
+
+        // ── the v53.1.4 bodies on every tenth agent ──
+        let mut old = PassTotals::default();
+        let mut sampled = 0usize;
+        for a in agents.iter().step_by(10) {
+            resolve_scoped_stance_by_principals_reference(d, &t, a, "analyze", None, now)
+                .await
+                .unwrap();
+            let log = read_probe::take();
+            let (rows_t, _) = reads_keyed_on(&log, &t);
+            old.rows += log.iter().map(|r| r.rows).sum::<usize>();
+            old.bytes += log.iter().map(|r| r.bytes).sum::<usize>();
+            old.rows_keyed_on_target += rows_t;
+            old.max_rows_keyed_on_target_per_agent =
+                old.max_rows_keyed_on_target_per_agent.max(rows_t);
+            sampled += 1;
+        }
+        eprintln!(
+            "I538 pass over {AGENTS} agents in {pass_elapsed:?} — NEW doors: {} rows / {} bytes \
+             decoded, {} rows keyed on T (max {} per agent). v53.1.4 consent body on {sampled} \
+             agents: {} rows / {} bytes, {} rows keyed on T (max {} per agent) — ×10 for the \
+             pass: {} rows / {} bytes.",
+            new.rows,
+            new.bytes,
+            new.rows_keyed_on_target,
+            new.max_rows_keyed_on_target_per_agent,
+            old.rows,
+            old.bytes,
+            old.rows_keyed_on_target,
+            old.max_rows_keyed_on_target_per_agent,
+            old.rows * 10,
+            old.bytes * 10
+        );
+        assert!(
+            old.max_rows_keyed_on_target_per_agent >= about_t,
+            "the v53.1.4 body reads T's whole slice per agent: {old:?}"
+        );
+        assert!(
+            new.rows_keyed_on_target <= 64 * AGENTS,
+            "the pass's reads keyed on T must be O(agents), not O(agents × slice): {new:?}"
+        );
+        assert!(
+            new.rows * 10 < old.rows * 10 / 20,
+            "the new pass decodes under 5% of the v53.1.4 pass's rows: {new:?} vs ×10 {old:?}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1327,4 +1577,33 @@ mod runners {
         b.run_migrations().await.unwrap();
         Some(b)
     });
+
+    /// I538 needs the CEG list read (`ReadEngine`), which the memory
+    /// backend does not serve: sqlite and postgres.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn i538_sqlite() {
+        use crate::store::Backend as _;
+        let b = crate::store::sqlite::SqliteBackend::open_in_memory()
+            .await
+            .unwrap();
+        b.run_migrations().await.unwrap();
+        super::bodies::i538_the_scorers_pass_reads_each_agents_slice_not_the_nodes(&b, &suffix())
+            .await
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn i538_postgres() {
+        use crate::store::Backend as _;
+        let Some(dsn) = crate::test_pg::empty_dsn() else {
+            return;
+        };
+        let b = crate::store::postgres::PostgresBackend::connect(&dsn)
+            .await
+            .unwrap();
+        b.run_migrations().await.unwrap();
+        super::bodies::i538_the_scorers_pass_reads_each_agents_slice_not_the_nodes(&b, &suffix())
+            .await
+    }
 }

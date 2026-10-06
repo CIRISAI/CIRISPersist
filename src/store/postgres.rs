@@ -7164,7 +7164,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             })
     }
 
-    /// v53.1.5 — V179's `(attested_key_id, dimension COLLATE "C")` seek, the
+    /// v53.1.5 — V178's `(attested_key_id, dimension COLLATE "C")` seek, the
     /// attested twin; the optional attester narrows in the same statement.
     async fn list_attestations_for_dimension_prefix(
         &self,
@@ -7215,7 +7215,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
 
     /// v53.1.5 — `list_attestations_referencing` for a SET of ids (one
     /// `text[]` bind), with the attested / attesting axes the folds pin so
-    /// V179's `(attested_key_id, attestation_type, ref)` or V107's attesting
+    /// V178's `(attested_key_id, attestation_type, ref)` or V107's attesting
     /// twin serves it as a seek.
     async fn list_composers_referencing_any(
         &self,
@@ -23470,7 +23470,7 @@ const PG_ATTESTATION_COLUMNS: &str = "attestation_id::text, attesting_key_id, at
     withdraws_admission_rule, cohort_scope, tier, promoted_at, additional_scrubs";
 
 /// v53.1.5 — the #817/#818 dimension-prefix predicate over V106's stored
-/// column, `COLLATE "C"` so the byte range is what the V137 / V179 indexes
+/// column, `COLLATE "C"` so the byte range is what the V137 / V178 indexes
 /// serve; `substr` when no upper bound is representable. Pushes its params
 /// and returns the clause.
 fn pg_dimension_prefix_clause(
@@ -26388,6 +26388,12 @@ impl crate::read::ReadEngine for PostgresBackend {
         limit: i64,
         scope: crate::scope::CallerScope,
     ) -> Result<crate::read::AttestationListPage, crate::read::Error> {
+        #[cfg(test)]
+        let probe_key = filter
+            .attested_key_id
+            .clone()
+            .or_else(|| filter.attesting_key_id.clone())
+            .unwrap_or_else(|| "*".to_owned());
         if !(1..=10_000).contains(&limit) {
             return Err(crate::read::Error::InvalidArgument(format!(
                 "limit must be in [1, 10000], got {limit}"
@@ -26620,6 +26626,8 @@ impl crate::read::ReadEngine for PostgresBackend {
         } else {
             None
         };
+        #[cfg(test)]
+        crate::federation::read_probe::record("list_attestations", &probe_key, &items);
         Ok(crate::read::AttestationListPage { items, next_cursor })
     }
 

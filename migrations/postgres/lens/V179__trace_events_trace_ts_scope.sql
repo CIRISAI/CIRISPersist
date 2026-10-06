@@ -1,7 +1,7 @@
--- V178 — the trace listing's page is named from an index, Postgres dialect
+-- V179 — the trace listing's page is named from an index, Postgres dialect
 -- v53.1.5 (CIRISServer's canonical node OOM-looped, 2026-10-06)
 --
--- SQLITE PARITY: migrations/sqlite/lens/V178__trace_events_trace_ts_scope.sql
+-- SQLITE PARITY: migrations/sqlite/lens/V179__trace_events_trace_ts_scope.sql
 -- See that file's header for the rationale. The production fault was
 -- SQLite's; the read is two-phase on both dialects so the page is named
 -- by (trace_id, MIN(ts)) and the aggregates run over those ids alone.

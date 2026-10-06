@@ -3311,7 +3311,19 @@ pub trait FederationDirectory: Send + Sync {
         &self,
         attesting_key_id: &str,
         dimension_prefix: &str,
-    ) -> Result<Vec<Attestation>, Error>;
+    ) -> Result<Vec<Attestation>, Error> {
+        // Pin-compatible default: today's semantics over the unbounded read.
+        // memory / sqlite / postgres override with the indexed seek.
+        Ok(self
+            .list_attestations_by(attesting_key_id)
+            .await?
+            .into_iter()
+            .filter(|a| {
+                admission::envelope_dimension(&a.attestation_envelope)
+                    .is_some_and(|d| d.starts_with(dimension_prefix))
+            })
+            .collect())
+    }
 
     /// v53.1.5 — the federation-tier rows attested TO `attested_key_id`
     /// whose envelope `dimension` starts with `dimension_prefix`, optionally
@@ -3319,14 +3331,27 @@ pub trait FederationDirectory: Send + Sync {
     /// The bounded read behind the consent fold
     /// ([`consent::scoped_fold_rows`]: a principal's `consent:state:*` rows
     /// about the target) and [`replication_audience::is_public_group`] (a
-    /// group's `trust:charter:v1` rows). Served by V179's
+    /// group's `trust:charter:v1` rows). Served by V178's
     /// `(attested_key_id, dimension)`.
     async fn list_attestations_for_dimension_prefix(
         &self,
         attested_key_id: &str,
         attesting_key_id: Option<&str>,
         dimension_prefix: &str,
-    ) -> Result<Vec<Attestation>, Error>;
+    ) -> Result<Vec<Attestation>, Error> {
+        // Pin-compatible default: today's semantics over the unbounded read.
+        // memory / sqlite / postgres override with the indexed seek.
+        Ok(self
+            .list_attestations_for(attested_key_id)
+            .await?
+            .into_iter()
+            .filter(|a| {
+                attesting_key_id.is_none_or(|k| a.attesting_key_id == k)
+                    && admission::envelope_dimension(&a.attestation_envelope)
+                        .is_some_and(|d| d.starts_with(dimension_prefix))
+            })
+            .collect())
+    }
 
     /// v53.1.5 — every federation-tier STRUCTURAL COMPOSER (`withdraws` /
     /// `recants` / `supersedes`) whose envelope `references_attestation_id`
@@ -3337,13 +3362,32 @@ pub trait FederationDirectory: Send + Sync {
     /// composer that retires a row about T is itself attested to T (the
     /// consent fold, the charter check), and an owner retires their own grant
     /// under their own key (the allow list). Served by V107's
-    /// `(attesting_key_id, attestation_type, ref)` and V179's attested twin.
+    /// `(attesting_key_id, attestation_type, ref)` and V178's attested twin.
     async fn list_composers_referencing_any(
         &self,
         target_attestation_ids: &[String],
         attested_key_id: Option<&str>,
         attesting_key_id: Option<&str>,
-    ) -> Result<Vec<Attestation>, Error>;
+    ) -> Result<Vec<Attestation>, Error> {
+        // Pin-compatible default: today's semantics over the unbounded reads
+        // (one `list_attestations_referencing` per id, then the axes).
+        // memory / sqlite / postgres override with the indexed seek.
+        let mut out = Vec::new();
+        for id in target_attestation_ids {
+            for a in self.list_attestations_referencing(id).await? {
+                if attested_key_id.is_none_or(|k| a.attested_key_id == k)
+                    && attesting_key_id.is_none_or(|k| a.attesting_key_id == k)
+                    && !out
+                        .iter()
+                        .any(|b: &Attestation| b.attestation_id == a.attestation_id)
+                {
+                    out.push(a);
+                }
+            }
+        }
+        out.sort_by_key(|a| std::cmp::Reverse(a.asserted_at));
+        Ok(out)
+    }
 
     /// v21.0.0 (CIRISPersist#502 E7) — the revocation-folded
     /// `consent_peer_set` projection (V109): `node_key_id`'s LIVE

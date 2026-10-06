@@ -57,6 +57,12 @@ from pathlib import Path
 # predating this list, tracked separately rather than resolved by a sweep that
 # cannot tell a leaf from a composition.
 DELEGATED_DEFAULTS = (
+    # v53.1.5 — defaulted to the unbounded reads for pin compatibility,
+    # overridden by every backend with an indexed seek; through the double
+    # they must reach the override.
+    "list_attestations_by_dimension_prefix",
+    "list_attestations_for_dimension_prefix",
+    "list_composers_referencing_any",
     "insert_known_wire_hash",
     "known_wire_hash_contains",
     "list_known_wire_hashes_since",

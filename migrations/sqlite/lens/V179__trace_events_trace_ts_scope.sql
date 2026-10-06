@@ -1,7 +1,7 @@
--- V178 — the trace listing's page is named from an index, SQLite dialect
+-- V179 — the trace listing's page is named from an index, SQLite dialect
 -- v53.1.5 (CIRISServer's canonical node OOM-looped, 2026-10-06)
 --
--- POSTGRES PARITY: migrations/postgres/lens/V178__trace_events_trace_ts_scope.sql
+-- POSTGRES PARITY: migrations/postgres/lens/V179__trace_events_trace_ts_scope.sql
 --
 -- `list_trace_summaries` ran ONE statement: twenty MIN/MAX aggregates over
 -- every column the summary carries (the JSON payload among them), GROUP BY
