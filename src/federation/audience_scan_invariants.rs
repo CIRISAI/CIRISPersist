@@ -28,6 +28,10 @@
 //!   subjects, scopes, qualifiers, stewards, causal edges, recants, retain
 //!   bounds and unrelated rows about the same target; and the same
 //!   boundedness leg.
+//! - **I537** sized: at the canonical's shape (2,461 rows about the target,
+//!   ~15 KB envelopes; a 330-row author; a 500-row root) the new doors
+//!   return a handful of rows and under 1% of the bytes the v53.1.4 bodies
+//!   read — asserted as rows and envelope bytes, never wall time.
 
 #[cfg(test)]
 pub(crate) mod bodies {
@@ -36,6 +40,7 @@ pub(crate) mod bodies {
     use crate::federation::consent::{self, ScopedStance};
     use crate::federation::consent_grammar::{parse_grant_payload, CohortEntry, GRANT_DIMENSION};
     use crate::federation::hard_case::ConsentState;
+    use crate::federation::read_probe;
     use crate::federation::tier_ingest::test_support as ts;
     use crate::federation::types::attestation_type;
     use crate::federation::types::identity_type::{AGENT, NODE, USER};
@@ -1010,15 +1015,19 @@ pub(crate) mod bodies {
     // ── I535 — boundedness ───────────────────────────────────────────────
 
     /// The whole-slice reads a door made over `key`, from the probe.
-    fn slice_reads_over(
-        log: &[(&'static str, String, usize)],
-        method: &str,
-        key: &str,
-    ) -> Vec<usize> {
+    /// The whole-slice reads a door made over `key`, from the probe.
+    fn slice_reads_over(log: &[read_probe::Read], method: &str, key: &str) -> Vec<usize> {
         log.iter()
-            .filter(|(m, k, _)| *m == method && k == key)
-            .map(|(_, _, n)| *n)
+            .filter(|r| r.method == method && r.key == key)
+            .map(|r| r.rows)
             .collect()
+    }
+
+    /// (rows, bytes) returned by every read keyed on `key`, whatever the method.
+    fn reads_keyed_on(log: &[read_probe::Read], key: &str) -> (usize, usize) {
+        log.iter()
+            .filter(|r| r.key == key)
+            .fold((0, 0), |(r, b), x| (r + x.rows, b + x.bytes))
     }
 
     /// **I535** — no new door reads the whole slice it used to: the probe
@@ -1032,7 +1041,6 @@ pub(crate) mod bodies {
         d: &dyn FederationDirectory,
         s: &str,
     ) {
-        use crate::federation::read_probe;
         let allow = seed_allow_corpus(d, s).await;
         let groups = seed_group_corpus(d, s).await;
         let consent = seed_consent_corpus(d, s).await;
@@ -1099,6 +1107,170 @@ pub(crate) mod bodies {
             }
         }
     }
+
+    // ── I537 — sized ─────────────────────────────────────────────────────
+
+    /// ~15 KB of envelope, the canonical's agent-authored average (15.3 KB).
+    fn blob(i: usize) -> String {
+        format!("{i:08}:").repeat(15 * 1024 / 9)
+    }
+
+    /// `put`, waiting out the untracked-tail byte quota (v24.3.0): fresh
+    /// keys share one tail bucket, and a corpus this size refuses with
+    /// "retry after 1s" — the quota is the door's, not this witness's.
+    async fn put_patiently(d: &dyn FederationDirectory, row: Attestation, what: &str) {
+        for attempt in 0..120 {
+            match put(d, row.clone()).await {
+                Ok(()) => return,
+                Err(e) if e.to_string().contains("rate limited") && attempt < 119 => {
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                }
+                Err(e) => panic!("{what}: {e}"),
+            }
+        }
+    }
+
+    /// `n` self-reports by `k` about `k`, one per leaf, each ~15 KB (the
+    /// renewal rule re-reads the attester's live rows per put, so this is
+    /// for the hundreds, not the thousands).
+    async fn bulk_self_reports(d: &dyn FederationDirectory, k: &str, tag: &str, n: usize) {
+        for i in 0..n {
+            put_patiently(
+                d,
+                scores(
+                    k,
+                    k,
+                    serde_json::json!({ "dimension": format!("config:{tag}-{i}:v1"), "blob": blob(i) }),
+                    chrono::Utc::now(),
+                ),
+                &format!("I537 bulk row {i} for {k}"),
+            )
+            .await;
+        }
+    }
+
+    /// `n` rows about `target`, each a `consent:state:granted` statement
+    /// (~15 KB) from its own registered user — the shape of the thousands
+    /// of rows a node accumulates from the people and agents it serves.
+    async fn bulk_rows_about(d: &dyn FederationDirectory, target: &str, tag: &str, n: usize) {
+        for i in 0..n {
+            let u = format!("{tag}-u{i}");
+            ts::register_hybrid_key_as(d, &u, &u, USER).await;
+            let row = state(
+                &u,
+                target,
+                "granted",
+                "view".into(),
+                None,
+                "2026-03-01T00:00:00Z",
+                &[("blob", blob(i).into())],
+            );
+            put_patiently(d, row, &format!("I537 bulk row {i} about {target}")).await;
+        }
+    }
+
+    /// **I537** — the bounds at the canonical's shape. Rows attested to the
+    /// consent target: 2,461 (the canonical-1 count), ~15 KB each; the allow
+    /// list's owner: 330 authored rows (~5 MB, the largest single author);
+    /// a key root with 500 rows about it. Asserted as ROWS and ENVELOPE
+    /// BYTES returned by every read keyed on the target / owner / root,
+    /// relative to the bounded set — never wall time. The v53.1.4 bodies
+    /// read the whole slice back; the new doors read a handful of rows.
+    pub async fn i537_sized_reads_are_bounded_by_the_set_the_fold_uses(
+        d: &dyn FederationDirectory,
+        s: &str,
+    ) {
+        let now = chrono::Utc::now();
+        // (a) the consent target: the small corpus (13 rows about T, of
+        // which the node's principals own 4 consent:state rows) plus the
+        // canonical's bulk — strangers' consent rows to 2,461 rows about T.
+        let consent = seed_consent_corpus(d, s).await;
+        let t = consent.target.as_str();
+        let node = consent.subjects[0].as_str();
+        bulk_rows_about(d, t, "i537t", 2_461 - 13).await;
+        // (b) the allow list's owner: 330 authored rows beside one grant.
+        let (owner, dev) = (format!("i537-owner-{s}"), format!("i537-dev-{s}"));
+        keys(d, &[(&owner, USER), (&dev, NODE)]).await;
+        bulk_self_reports(d, &owner, "i537o", 330).await;
+        put(
+            d,
+            grant(&owner, Some(&dev), Some(&[("community", "r1")]), None),
+        )
+        .await
+        .unwrap();
+        // (c) a key root with a live charter among 500 rows about it.
+        let (root, a, b) = (
+            format!("i537-root-{s}"),
+            format!("i537-a-{s}"),
+            format!("i537-b-{s}"),
+        );
+        keys(d, &[(&root, USER), (&a, USER), (&b, USER)]).await;
+        put(d, charter(&format!("i537-charter-{s}"), &root, &a, &b))
+            .await
+            .expect("I537 charter");
+        bulk_rows_about(d, &root, "i537r", 500).await;
+
+        let _ = read_probe::take();
+
+        // The consent doors for the node.
+        cbh::resolve_scoped_stance_by_principals(d, t, node, "analyze", None, now)
+            .await
+            .unwrap();
+        d.resolve_scoped_stance(t, node, "analyze", None, now)
+            .await
+            .unwrap();
+        d.resolve_consent_state(t, node, now).await.unwrap();
+        let (new_rows, new_bytes) = reads_keyed_on(&read_probe::take(), t);
+        resolve_scoped_stance_by_principals_reference(d, t, node, "analyze", None, now)
+            .await
+            .unwrap();
+        let (old_rows, old_bytes) = reads_keyed_on(&read_probe::take(), t);
+        eprintln!(
+            "I537 consent (three doors, one call each) keyed on the target: new {new_rows} rows / \
+             {new_bytes} bytes; v53.1.4 by-principals alone {old_rows} rows / {old_bytes} bytes"
+        );
+        assert!(
+            old_rows >= 2 * 2_461,
+            "the v53.1.4 body reads the slice twice: {old_rows}"
+        );
+        assert!(
+            new_rows <= 3 * 6,
+            "three doors × (the node's and alice's consent rows + nothing else): {new_rows}"
+        );
+        assert!(
+            new_bytes * 100 < old_bytes,
+            "new {new_bytes} bytes is not under 1% of the v53.1.4 {old_bytes}"
+        );
+
+        // The allow list for the owner's device.
+        assert_eq!(
+            ra::owner_allow_list(d, &owner, &dev).await.unwrap(),
+            Some(set(&[("community", "r1")]))
+        );
+        let (new_rows, new_bytes) = reads_keyed_on(&read_probe::take(), &owner);
+        owner_allow_list_reference(d, &owner, &dev).await.unwrap();
+        let (old_rows, old_bytes) = reads_keyed_on(&read_probe::take(), &owner);
+        eprintln!(
+            "I537 owner_allow_list keyed on the owner: new {new_rows} rows / {new_bytes} bytes; \
+             v53.1.4 {old_rows} rows / {old_bytes} bytes"
+        );
+        assert!(old_rows >= 331, "{old_rows}");
+        assert_eq!(new_rows, 1, "the one grant, and no composer");
+        assert!(new_bytes * 100 < old_bytes, "{new_bytes} vs {old_bytes}");
+
+        // The key root.
+        assert!(ra::is_public_group(d, &root).await.unwrap());
+        let (new_rows, new_bytes) = reads_keyed_on(&read_probe::take(), &root);
+        is_public_group_reference(d, &root).await.unwrap();
+        let (old_rows, old_bytes) = reads_keyed_on(&read_probe::take(), &root);
+        eprintln!(
+            "I537 is_public_group keyed on the root: new {new_rows} rows / {new_bytes} bytes; \
+             v53.1.4 {old_rows} rows / {old_bytes} bytes"
+        );
+        assert!(old_rows >= 501, "{old_rows}");
+        assert_eq!(new_rows, 1, "the one charter row, and no composer");
+        assert!(new_bytes * 100 < old_bytes, "{new_bytes} vs {old_bytes}");
+    }
 }
 
 #[cfg(test)]
@@ -1126,6 +1298,7 @@ mod runners {
                 case!(i534, i534_is_public_group_matches_the_whole_slice_body);
                 case!(i535, i535_the_bounded_reads_never_touch_the_whole_slice);
                 case!(i536, i536_consent_doors_match_the_whole_slice_bodies);
+                case!(i537, i537_sized_reads_are_bounded_by_the_set_the_fold_uses);
             }
         };
     }

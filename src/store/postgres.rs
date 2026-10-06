@@ -7081,7 +7081,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 crate::federation::read_probe::record(
                     "list_attestations_for",
                     attested_key_id,
-                    rows.len(),
+                    rows,
                 );
                 #[cfg(not(test))]
                 let _ = rows;
@@ -7118,7 +7118,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 crate::federation::read_probe::record(
                     "list_attestations_by",
                     attesting_key_id,
-                    rows.len(),
+                    rows,
                 );
                 #[cfg(not(test))]
                 let _ = rows;
@@ -7149,7 +7149,19 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let rows = client.query(&sql, &params_ref[..]).await.map_err(|e| {
             crate::federation::Error::Backend(format!("list_attestations_by_dimension_prefix: {e}"))
         })?;
-        rows.into_iter().map(pg_row_to_attestation).collect()
+        rows.into_iter()
+            .map(pg_row_to_attestation)
+            .collect::<Result<Vec<_>, _>>()
+            .inspect(|rows| {
+                #[cfg(test)]
+                crate::federation::read_probe::record(
+                    "list_attestations_by_dimension_prefix",
+                    attesting_key_id,
+                    rows,
+                );
+                #[cfg(not(test))]
+                let _ = rows;
+            })
     }
 
     /// v53.1.5 — V179's `(attested_key_id, dimension COLLATE "C")` seek, the
@@ -7186,7 +7198,19 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 "list_attestations_for_dimension_prefix: {e}"
             ))
         })?;
-        rows.into_iter().map(pg_row_to_attestation).collect()
+        rows.into_iter()
+            .map(pg_row_to_attestation)
+            .collect::<Result<Vec<_>, _>>()
+            .inspect(|rows| {
+                #[cfg(test)]
+                crate::federation::read_probe::record(
+                    "list_attestations_for_dimension_prefix",
+                    attested_key_id,
+                    rows,
+                );
+                #[cfg(not(test))]
+                let _ = rows;
+            })
     }
 
     /// v53.1.5 — `list_attestations_referencing` for a SET of ids (one
@@ -7234,7 +7258,19 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let rows = client.query(&sql, &params_ref[..]).await.map_err(|e| {
             crate::federation::Error::Backend(format!("list_composers_referencing_any: {e}"))
         })?;
-        rows.into_iter().map(pg_row_to_attestation).collect()
+        rows.into_iter()
+            .map(pg_row_to_attestation)
+            .collect::<Result<Vec<_>, _>>()
+            .inspect(|rows| {
+                #[cfg(test)]
+                crate::federation::read_probe::record(
+                    "list_composers_referencing_any",
+                    attested_key_id.or(attesting_key_id).unwrap_or("*"),
+                    rows,
+                );
+                #[cfg(not(test))]
+                let _ = rows;
+            })
     }
 
     /// v21.0.0 (CIRISPersist#502 E7) — the revocation-folded

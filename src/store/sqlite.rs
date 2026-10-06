@@ -5653,7 +5653,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         .map_err(|e| crate::federation::Error::Backend(format!("list_attestations_for: {e}")))
         .inspect(|rows| {
             #[cfg(test)]
-            crate::federation::read_probe::record("list_attestations_for", attested_key_id, rows.len());
+            crate::federation::read_probe::record("list_attestations_for", attested_key_id, rows);
             #[cfg(not(test))]
             let _ = rows;
         })
@@ -5718,7 +5718,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         .map_err(|e| crate::federation::Error::Backend(format!("list_attestations_by: {e}")))
         .inspect(|rows| {
             #[cfg(test)]
-            crate::federation::read_probe::record("list_attestations_by", attesting_key_id, rows.len());
+            crate::federation::read_probe::record("list_attestations_by", attesting_key_id, rows);
             #[cfg(not(test))]
             let _ = rows;
         })
@@ -5750,6 +5750,16 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         .await
         .map_err(|e| {
             crate::federation::Error::Backend(format!("list_attestations_by_dimension_prefix: {e}"))
+        })
+        .inspect(|rows| {
+            #[cfg(test)]
+            crate::federation::read_probe::record(
+                "list_attestations_by_dimension_prefix",
+                attesting_key_id,
+                rows,
+            );
+            #[cfg(not(test))]
+            let _ = rows;
         })
     }
 
@@ -5789,6 +5799,16 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             crate::federation::Error::Backend(format!(
                 "list_attestations_for_dimension_prefix: {e}"
             ))
+        })
+        .inspect(|rows| {
+            #[cfg(test)]
+            crate::federation::read_probe::record(
+                "list_attestations_for_dimension_prefix",
+                attested_key_id,
+                rows,
+            );
+            #[cfg(not(test))]
+            let _ = rows;
         })
     }
 
@@ -5843,6 +5863,16 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         .await
         .map_err(|e| {
             crate::federation::Error::Backend(format!("list_composers_referencing_any: {e}"))
+        })
+        .inspect(|rows| {
+            #[cfg(test)]
+            crate::federation::read_probe::record(
+                "list_composers_referencing_any",
+                attested_key_id.or(attesting_key_id).unwrap_or("*"),
+                rows,
+            );
+            #[cfg(not(test))]
+            let _ = rows;
         })
     }
 
@@ -45370,6 +45400,130 @@ mod tests {
         assert!(
             !p1.iter().any(|l| l.contains("COVERING INDEX")),
             "the V042 index is not covering for the scope predicate: {p1:?}"
+        );
+    }
+
+    /// sqlite's own heap high-water while `f` runs, in bytes above the heap
+    /// in use at entry (`sqlite3_memory_used` / `sqlite3_memory_highwater`,
+    /// process-wide — callers take the minimum of a few runs).
+    // `unsafe_code` is denied crate-wide; this test-only call reads two
+    // allocator counters the C API exposes and rusqlite does not wrap. No
+    // pointer crosses the boundary (the I55c precedent above).
+    #[allow(unsafe_code)]
+    async fn sqlite_heap_high_water_during<F, Fut>(f: F) -> i64
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        let base = unsafe { rusqlite::ffi::sqlite3_memory_used() };
+        unsafe { rusqlite::ffi::sqlite3_memory_highwater(1) };
+        f().await;
+        let peak = unsafe { rusqlite::ffi::sqlite3_memory_highwater(0) };
+        peak - base
+    }
+
+    /// I532c — sized: 1,000 traces × 4 events with ~15 KB payloads (the
+    /// canonical's agent-authored envelopes average 15.3 KB), in memory.
+    /// Measured as sqlite's heap high-water around each statement, with the
+    /// temp store in MEMORY so a spilled sorter is heap and not a temp file
+    /// — which is also what a node with a tmpfs temp dir pays, charged to
+    /// its cgroup (the minimum of three runs, since the counter is
+    /// process-wide): the v53.1.4 statement's GROUP BY sorter holds every
+    /// row's payload; the two-phase read's sorters hold (trace_id, ts)
+    /// pairs and the page's 500 traces. Rows decoded into Rust are the same
+    /// 500 on both.
+    #[tokio::test]
+    async fn i532c_sized_the_old_sorter_holds_payloads_the_new_one_does_not() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let blob = "x".repeat(15 * 1024);
+        let types = [
+            ReasoningEventType::ThoughtStart,
+            ReasoningEventType::DmaResults,
+            ReasoningEventType::ConscienceResult,
+            ReasoningEventType::ActionResult,
+        ];
+        let mut total_payload = 0usize;
+        for chunk in 0..10usize {
+            let mut rows = Vec::new();
+            for i in 0..100usize {
+                let n = chunk * 100 + i;
+                let tid = format!("i532c-{n:05}");
+                for (k, ty) in types.iter().enumerate() {
+                    let payload = serde_json::json!({ "thought_depth": k, "blob": blob });
+                    total_payload += payload.to_string().len();
+                    rows.push(re_event(
+                        &tid,
+                        &format!("{tid}-th{k}"),
+                        None,
+                        *ty,
+                        ((n % 500) * 2 + k) as i64,
+                        "agent-h",
+                        Some("Scout"),
+                        Some("legal"),
+                        payload,
+                    ));
+                }
+            }
+            let report = backend.insert_trace_events_batch(&rows).await.unwrap();
+            assert_eq!(report.inserted, rows.len());
+        }
+        backend
+            .write(|conn| conn.execute_batch("PRAGMA temp_store = MEMORY"))
+            .await
+            .unwrap();
+        let temp_store: i64 = backend
+            .read(|conn| {
+                conn.query_row("PRAGMA temp_store", [], |r| r.get(0))
+                    .unwrap()
+            })
+            .await;
+        assert_eq!(
+            temp_store, 2,
+            "the temp store is MEMORY for this measurement"
+        );
+        let unauth = crate::scope::CallerScope::Unauthenticated;
+
+        let mut old = i64::MAX;
+        let mut new = i64::MAX;
+        for _ in 0..3 {
+            old = old.min(
+                sqlite_heap_high_water_during(|| async {
+                    let page = v53_1_4_list_trace_summaries(
+                        &backend,
+                        TraceFilter::default(),
+                        None,
+                        500,
+                        unauth.clone(),
+                    )
+                    .await;
+                    assert_eq!(page.items.len(), 500);
+                })
+                .await,
+            );
+            new = new.min(
+                sqlite_heap_high_water_during(|| async {
+                    let page = backend
+                        .list_trace_summaries(TraceFilter::default(), None, 500, unauth.clone())
+                        .await
+                        .unwrap();
+                    assert_eq!(page.items.len(), 500);
+                })
+                .await,
+            );
+        }
+        eprintln!(
+            "I532c temp_store={temp_store} payload bytes={total_payload} sqlite heap high-water: \
+             v53.1.4 statement {old} bytes; two-phase read {new} bytes"
+        );
+        assert!(
+            new * 10 < total_payload as i64,
+            "the two-phase read's sqlite heap high-water must stay under 10% of the payload \
+             bytes: {new}"
+        );
+        assert!(
+            old * 2 >= total_payload as i64,
+            "the v53.1.4 statement materialises the payloads: {old} vs {total_payload}"
         );
     }
 

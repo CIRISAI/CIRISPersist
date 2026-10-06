@@ -4616,7 +4616,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // Match postgres ORDER BY asserted_at DESC.
         rows.sort_by_key(|a| std::cmp::Reverse(a.asserted_at));
         #[cfg(test)]
-        crate::federation::read_probe::record("list_attestations_for", attested_key_id, rows.len());
+        crate::federation::read_probe::record("list_attestations_for", attested_key_id, &rows);
         Ok(rows)
     }
 
@@ -4638,7 +4638,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             .collect();
         rows.sort_by_key(|a| std::cmp::Reverse(a.asserted_at));
         #[cfg(test)]
-        crate::federation::read_probe::record("list_attestations_by", attesting_key_id, rows.len());
+        crate::federation::read_probe::record("list_attestations_by", attesting_key_id, &rows);
         Ok(rows)
     }
 
@@ -4662,6 +4662,12 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             .cloned()
             .collect();
         rows.sort_by_key(|a| std::cmp::Reverse(a.asserted_at));
+        #[cfg(test)]
+        crate::federation::read_probe::record(
+            "list_attestations_by_dimension_prefix",
+            attesting_key_id,
+            &rows,
+        );
         Ok(rows)
     }
 
@@ -4685,6 +4691,12 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             .cloned()
             .collect();
         rows.sort_by_key(|a| std::cmp::Reverse(a.asserted_at));
+        #[cfg(test)]
+        crate::federation::read_probe::record(
+            "list_attestations_for_dimension_prefix",
+            attested_key_id,
+            &rows,
+        );
         Ok(rows)
     }
 
@@ -4718,6 +4730,12 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             .cloned()
             .collect();
         rows.sort_by_key(|a| std::cmp::Reverse(a.asserted_at));
+        #[cfg(test)]
+        crate::federation::read_probe::record(
+            "list_composers_referencing_any",
+            attested_key_id.or(attesting_key_id).unwrap_or("*"),
+            &rows,
+        );
         Ok(rows)
     }
 
