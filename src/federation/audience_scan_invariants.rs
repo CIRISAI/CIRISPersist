@@ -36,6 +36,9 @@
 //!   900 agents over a node with ~2,400 rows about it; no call reads the
 //!   node's slice, the pass decodes under 5% of what the v53.1.4 bodies
 //!   decode.
+//! - **I539** pin compatibility: an implementor of only the pre-53.1.5
+//!   required methods (the double, inheriting the three reads' default
+//!   bodies) answers every I533 / I534 / I536 question as the backend does.
 
 #[cfg(test)]
 pub(crate) mod bodies {
@@ -1521,10 +1524,123 @@ pub(crate) mod bodies {
             "the new pass decodes under 5% of the v53.1.4 pass's rows: {new:?} vs ×10 {old:?}"
         );
     }
+
+    // ── I539 — a pre-53.1.5 implementor ──────────────────────────────────
+
+    /// **I539** — an implementor of only the pre-53.1.5 required methods
+    /// (the double, which inherits the three reads' DEFAULT bodies over its
+    /// delegated `list_attestations_by` / `_for` / `_referencing`) answers
+    /// every I533 / I534 / I536 question exactly as the real backend does;
+    /// the probe shows the default took the unbounded path and the backend
+    /// did not. Pin compatibility: an out-of-crate implementor compiles
+    /// unchanged and keeps today's answers; the indexed overrides are an
+    /// optimisation, never a semantic.
+    pub async fn i539_a_pre_53_1_5_implementor_answers_as_the_backend_does(
+        plain: &dyn FederationDirectory,
+        legacy: &dyn FederationDirectory,
+        s: &str,
+    ) {
+        let allow = seed_allow_corpus(plain, s).await;
+        let groups = seed_group_corpus(plain, s).await;
+        let consent = seed_consent_corpus(plain, s).await;
+        let now = chrono::Utc::now();
+        let _ = read_probe::take();
+
+        let mut asked = 0usize;
+        for o in &allow.owners {
+            for n in &allow.nodes {
+                let want = ra::owner_allow_list(plain, o, n).await.unwrap();
+                assert!(
+                    slice_reads_over(&read_probe::take(), "list_attestations_by", o).is_empty(),
+                    "I539: the backend takes the bounded path"
+                );
+                assert_eq!(
+                    ra::owner_allow_list(legacy, o, n).await.unwrap(),
+                    want,
+                    "I539: owner_allow_list({o}, {n}) through the defaults"
+                );
+                assert!(
+                    !slice_reads_over(&read_probe::take(), "list_attestations_by", o).is_empty(),
+                    "I539: the default body reads the owner's slice — the probe sees it"
+                );
+                asked += 1;
+            }
+        }
+        for (g, _) in &groups {
+            let want = ra::is_public_group(plain, g).await.unwrap();
+            let _ = read_probe::take();
+            assert_eq!(
+                ra::is_public_group(legacy, g).await.unwrap(),
+                want,
+                "I539: is_public_group({g}) through the defaults"
+            );
+            asked += 1;
+        }
+        // A family with a charter reaches the slice read in the default.
+        let _ = read_probe::take();
+        ra::is_public_group(legacy, &groups[0].0).await.unwrap();
+        assert!(
+            !slice_reads_over(&read_probe::take(), "list_attestations_for", &groups[0].0)
+                .is_empty(),
+            "I539: the default body reads the group's slice — the probe sees it"
+        );
+        let t = consent.target.as_str();
+        for subject in &consent.subjects {
+            assert_eq!(
+                legacy.resolve_consent_state(t, subject, now).await.unwrap(),
+                plain.resolve_consent_state(t, subject, now).await.unwrap(),
+                "I539 unscoped: {subject}"
+            );
+            for scope in ["analyze", "view", "share:cohort:x"] {
+                for qualifier in [None, Some("x")] {
+                    assert_eq!(
+                        legacy
+                            .resolve_scoped_stance(t, subject, scope, qualifier, now)
+                            .await
+                            .unwrap(),
+                        plain
+                            .resolve_scoped_stance(t, subject, scope, qualifier, now)
+                            .await
+                            .unwrap(),
+                        "I539 scoped: {subject} {scope} {qualifier:?}"
+                    );
+                    let _ = read_probe::take();
+                    let want = cbh::resolve_scoped_stance_by_principals(
+                        plain, t, subject, scope, qualifier, now,
+                    )
+                    .await
+                    .unwrap();
+                    assert!(
+                        slice_reads_over(&read_probe::take(), "list_attestations_for", t)
+                            .is_empty(),
+                        "I539: the backend's consent doors take the bounded path"
+                    );
+                    assert_eq!(
+                        cbh::resolve_scoped_stance_by_principals(
+                            legacy, t, subject, scope, qualifier, now,
+                        )
+                        .await
+                        .unwrap(),
+                        want,
+                        "I539 by principals: {subject} {scope} {qualifier:?}"
+                    );
+                    assert!(
+                        !slice_reads_over(&read_probe::take(), "list_attestations_for", t)
+                            .is_empty(),
+                        "I539: the default body reads the target's slice — the probe sees it"
+                    );
+                    asked += 1;
+                }
+            }
+        }
+        assert_eq!(asked, 15 + groups.len() + 48);
+    }
 }
 
 #[cfg(test)]
 mod runners {
+    use crate::federation::FederationDirectory;
+
     fn suffix() -> String {
         uuid::Uuid::new_v4().simple().to_string()[..12].to_owned()
     }
@@ -1577,6 +1693,50 @@ mod runners {
         b.run_migrations().await.unwrap();
         Some(b)
     });
+
+    /// I539 — the double with no faults declared, which inherits the three
+    /// reads' default bodies, beside the real backend.
+    async fn legacy_beside<B: FederationDirectory + 'static>(b: B, s: &str) {
+        use crate::federation::directory_double::FaultInjectingDirectory;
+        let inner: std::sync::Arc<dyn FederationDirectory> = std::sync::Arc::new(b);
+        let legacy = FaultInjectingDirectory::new(inner.clone());
+        super::bodies::i539_a_pre_53_1_5_implementor_answers_as_the_backend_does(
+            &*inner,
+            &legacy as &dyn FederationDirectory,
+            s,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn i539_memory() {
+        legacy_beside(crate::store::memory::MemoryBackend::new(), &suffix()).await
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn i539_sqlite() {
+        use crate::store::Backend as _;
+        let b = crate::store::sqlite::SqliteBackend::open_in_memory()
+            .await
+            .unwrap();
+        b.run_migrations().await.unwrap();
+        legacy_beside(b, &suffix()).await
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn i539_postgres() {
+        use crate::store::Backend as _;
+        let Some(dsn) = crate::test_pg::empty_dsn() else {
+            return;
+        };
+        let b = crate::store::postgres::PostgresBackend::connect(&dsn)
+            .await
+            .unwrap();
+        b.run_migrations().await.unwrap();
+        legacy_beside(b, &suffix()).await
+    }
 
     /// I538 needs the CEG list read (`ReadEngine`), which the memory
     /// backend does not serve: sqlite and postgres.
