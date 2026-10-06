@@ -618,6 +618,30 @@ pub(crate) mod bodies {
         put(d, conferral(&peer, &agent))
             .await
             .expect("peer → agent");
+        // u4 confers naming the agent as the edge's subject; the AGENT
+        // withdraws it (CC 4.5.1.1 rule 2: a subject may withdraw a row
+        // naming it). Only the composers-attested-to-the-subject read sees
+        // this retraction — the per-granter check does not, because u4
+        // retracted nothing — which is what makes that read load-bearing.
+        let u4 = format!("i542-u4-{s}");
+        ts::register_hybrid_key_as(d, &u4, &u4, USER).await;
+        let mut e4 = conferral(&u4, &agent);
+        e4.subject_key_ids = vec![agent.clone()];
+        ts::reseal(&mut e4);
+        put(d, e4.clone())
+            .await
+            .expect("u4 → agent, naming the agent");
+        put(
+            d,
+            composer(
+                &agent,
+                &agent,
+                attestation_type::WITHDRAWS,
+                &e4.attestation_id,
+            ),
+        )
+        .await
+        .expect("the agent withdraws u4's edge");
         // u1 owns the node; u2 owns a second node, then withdraws that
         // binding (a node has exactly one owner, so two bindings on one node
         // are refused at the door).
@@ -671,7 +695,7 @@ pub(crate) mod bodies {
                     0,
                     "I542: the subject's whole slice is not read: {log:?}"
                 );
-                for g in [&u1, &u2, &u3, &peer] {
+                for g in [&u1, &u2, &u3, &u4, &peer] {
                     assert_eq!(
                         rows_of(&log, "list_attestations_by", g),
                         0,
@@ -685,7 +709,8 @@ pub(crate) mod bodies {
                 .await
                 .unwrap(),
             BTreeSet::from([u1.clone()]),
-            "I542: u1 stands; u2 withdrew, u3 recanted, the peer is no user"
+            "I542: u1 stands; u2 withdrew, u3 recanted, the peer is no user, the agent \
+             withdrew u4's"
         );
         assert_eq!(
             admission::live_delegation_granters(d, &node, OwnerBindingOnly)
