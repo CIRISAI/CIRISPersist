@@ -7,7 +7,7 @@ threat-model citations because this crate's audit story is the point.
 
 ## [Unreleased]
 
-## [53.1.5] - UNRELEASED
+## [53.1.5] - 2026-10-06
 
 ### Fixed — `list_trace_summaries` sorted the whole table before the LIMIT (CIRISServer's canonical node OOM-looped, 2026-10-06)
 
