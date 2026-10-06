@@ -134,7 +134,7 @@ impl FaultInjectingDirectory {
     }
 }
 
-// 113 delegations, generated. Every one: fault first, then delegate.
+// 116 delegations, generated. Every one: fault first, then delegate.
 #[async_trait::async_trait]
 impl FederationDirectory for FaultInjectingDirectory {
     async fn accord_nonce_issued(&self, family_key_id: &str, nonce: &str) -> Result<bool, Error> {
@@ -413,6 +413,18 @@ impl FederationDirectory for FaultInjectingDirectory {
         }
         self.inner.list_attestations_by(attesting_key_id).await
     }
+    async fn list_attestations_by_dimension_prefix(
+        &self,
+        attesting_key_id: &str,
+        dimension_prefix: &str,
+    ) -> Result<Vec<Attestation>, Error> {
+        if let Some(e) = self.faulted("list_attestations_by_dimension_prefix") {
+            return Err(e);
+        }
+        self.inner
+            .list_attestations_by_dimension_prefix(attesting_key_id, dimension_prefix)
+            .await
+    }
     async fn list_attestations_for(
         &self,
         attested_key_id: &str,
@@ -421,6 +433,23 @@ impl FederationDirectory for FaultInjectingDirectory {
             return Err(e);
         }
         self.inner.list_attestations_for(attested_key_id).await
+    }
+    async fn list_attestations_for_dimension_prefix(
+        &self,
+        attested_key_id: &str,
+        attesting_key_id: Option<&str>,
+        dimension_prefix: &str,
+    ) -> Result<Vec<Attestation>, Error> {
+        if let Some(e) = self.faulted("list_attestations_for_dimension_prefix") {
+            return Err(e);
+        }
+        self.inner
+            .list_attestations_for_dimension_prefix(
+                attested_key_id,
+                attesting_key_id,
+                dimension_prefix,
+            )
+            .await
     }
     async fn list_attestations_referencing(
         &self,
@@ -485,6 +514,23 @@ impl FederationDirectory for FaultInjectingDirectory {
         }
         self.inner
             .list_community_membership_widenings_for(community_key_id)
+            .await
+    }
+    async fn list_composers_referencing_any(
+        &self,
+        target_attestation_ids: &[String],
+        attested_key_id: Option<&str>,
+        attesting_key_id: Option<&str>,
+    ) -> Result<Vec<Attestation>, Error> {
+        if let Some(e) = self.faulted("list_composers_referencing_any") {
+            return Err(e);
+        }
+        self.inner
+            .list_composers_referencing_any(
+                target_attestation_ids,
+                attested_key_id,
+                attesting_key_id,
+            )
             .await
     }
     async fn list_derived_hex(

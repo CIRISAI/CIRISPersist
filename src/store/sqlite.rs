@@ -5651,6 +5651,12 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                 rows.collect()
             }).await
         .map_err(|e| crate::federation::Error::Backend(format!("list_attestations_for: {e}")))
+        .inspect(|rows| {
+            #[cfg(test)]
+            crate::federation::read_probe::record("list_attestations_for", attested_key_id, rows.len());
+            #[cfg(not(test))]
+            let _ = rows;
+        })
     }
 
     async fn list_attestations_referencing(
@@ -5710,6 +5716,134 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                 rows.collect()
             }).await
         .map_err(|e| crate::federation::Error::Backend(format!("list_attestations_by: {e}")))
+        .inspect(|rows| {
+            #[cfg(test)]
+            crate::federation::read_probe::record("list_attestations_by", attesting_key_id, rows.len());
+            #[cfg(not(test))]
+            let _ = rows;
+        })
+    }
+
+    /// v53.1.5 — V137's `(attesting_key_id, dimension)` seek; the prefix is
+    /// the #817/#818 half-open byte range (`substr` only when no upper bound
+    /// is representable — never `LIKE`).
+    async fn list_attestations_by_dimension_prefix(
+        &self,
+        attesting_key_id: &str,
+        dimension_prefix: &str,
+    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
+        let mut binds: Vec<SqlValue> = vec![SqlValue::Text(attesting_key_id.to_owned())];
+        let prefix_sql = sqlite_dimension_prefix_clause(dimension_prefix, &mut binds);
+        let sql = format!(
+            "SELECT {SQLITE_ATTESTATION_COLUMNS} FROM federation_attestations \
+             WHERE attesting_key_id = ?1 AND tier = 'federation' AND {prefix_sql} \
+             ORDER BY asserted_at DESC"
+        );
+        self.read(
+            move |conn| -> Result<Vec<crate::federation::Attestation>, rusqlite::Error> {
+                let mut stmt = conn.prepare(&sql)?;
+                let rows =
+                    stmt.query_map(params_from_iter(binds.iter()), sqlite_row_to_attestation)?;
+                rows.collect()
+            },
+        )
+        .await
+        .map_err(|e| {
+            crate::federation::Error::Backend(format!("list_attestations_by_dimension_prefix: {e}"))
+        })
+    }
+
+    /// v53.1.5 — V178's `(attested_key_id, dimension)` seek, the attested
+    /// twin of the read above; the optional attester narrows in the same
+    /// statement.
+    async fn list_attestations_for_dimension_prefix(
+        &self,
+        attested_key_id: &str,
+        attesting_key_id: Option<&str>,
+        dimension_prefix: &str,
+    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
+        let mut binds: Vec<SqlValue> = vec![SqlValue::Text(attested_key_id.to_owned())];
+        let prefix_sql = sqlite_dimension_prefix_clause(dimension_prefix, &mut binds);
+        let attester_sql = match attesting_key_id {
+            Some(k) => {
+                binds.push(SqlValue::Text(k.to_owned()));
+                format!(" AND attesting_key_id = ?{}", binds.len())
+            }
+            None => String::new(),
+        };
+        let sql = format!(
+            "SELECT {SQLITE_ATTESTATION_COLUMNS} FROM federation_attestations \
+             WHERE attested_key_id = ?1 AND tier = 'federation' AND {prefix_sql}{attester_sql} \
+             ORDER BY asserted_at DESC"
+        );
+        self.read(
+            move |conn| -> Result<Vec<crate::federation::Attestation>, rusqlite::Error> {
+                let mut stmt = conn.prepare(&sql)?;
+                let rows =
+                    stmt.query_map(params_from_iter(binds.iter()), sqlite_row_to_attestation)?;
+                rows.collect()
+            },
+        )
+        .await
+        .map_err(|e| {
+            crate::federation::Error::Backend(format!(
+                "list_attestations_for_dimension_prefix: {e}"
+            ))
+        })
+    }
+
+    /// v53.1.5 — `list_attestations_referencing` for a SET of ids (one
+    /// `json_each` bind), with the attested / attesting axes the folds pin so
+    /// V178's `(attested_key_id, attestation_type, ref)` or V107's attesting
+    /// twin serves it as a seek.
+    async fn list_composers_referencing_any(
+        &self,
+        target_attestation_ids: &[String],
+        attested_key_id: Option<&str>,
+        attesting_key_id: Option<&str>,
+    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
+        if target_attestation_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        use crate::federation::types::attestation_type;
+        let ids_json = serde_json::to_string(target_attestation_ids).map_err(|e| {
+            crate::federation::Error::Backend(format!("list_composers_referencing_any ids: {e}"))
+        })?;
+        let mut binds: Vec<SqlValue> = vec![
+            SqlValue::Text(ids_json),
+            SqlValue::Text(attestation_type::WITHDRAWS.to_owned()),
+            SqlValue::Text(attestation_type::RECANTS.to_owned()),
+            SqlValue::Text(attestation_type::SUPERSEDES.to_owned()),
+        ];
+        let mut axes = String::new();
+        if let Some(k) = attested_key_id {
+            binds.push(SqlValue::Text(k.to_owned()));
+            axes.push_str(&format!(" AND attested_key_id = ?{}", binds.len()));
+        }
+        if let Some(k) = attesting_key_id {
+            binds.push(SqlValue::Text(k.to_owned()));
+            axes.push_str(&format!(" AND attesting_key_id = ?{}", binds.len()));
+        }
+        let sql = format!(
+            "SELECT {SQLITE_ATTESTATION_COLUMNS} FROM federation_attestations \
+             WHERE tier = 'federation' \
+               AND attestation_type IN (?2, ?3, ?4) \
+               AND json_extract(attestation_envelope, '$.references_attestation_id') \
+                   IN (SELECT value FROM json_each(?1)){axes} \
+             ORDER BY asserted_at DESC"
+        );
+        self.read(
+            move |conn| -> Result<Vec<crate::federation::Attestation>, rusqlite::Error> {
+                let mut stmt = conn.prepare(&sql)?;
+                let rows =
+                    stmt.query_map(params_from_iter(binds.iter()), sqlite_row_to_attestation)?;
+                rows.collect()
+            },
+        )
+        .await
+        .map_err(|e| {
+            crate::federation::Error::Backend(format!("list_composers_referencing_any: {e}"))
+        })
     }
 
     /// v21.0.0 (CIRISPersist#502 E7) — the revocation-folded
@@ -22352,6 +22486,36 @@ fn sqlite_project_rendition_row(
         ],
     )?;
     Ok(())
+}
+
+/// v53.1.5 — the `federation_attestations` column list in
+/// [`sqlite_row_to_attestation`]'s order, for the reads that build their
+/// statement.
+const SQLITE_ATTESTATION_COLUMNS: &str = "attestation_id, attesting_key_id, attested_key_id, \
+    attestation_type, weight, asserted_at, expires_at, attestation_envelope, \
+    original_content_hash, scrub_signature_classical, scrub_signature_pqc, scrub_key_id, \
+    scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, \
+    withdraws_admission_rule, cohort_scope, tier, promoted_at, additional_scrubs";
+
+/// v53.1.5 — the #817/#818 dimension-prefix predicate over V106's generated
+/// column: a half-open byte range when an upper bound is representable
+/// (index-served), `substr` otherwise. Never `LIKE` (case-folding, and
+/// unindexed under ESCAPE). Pushes its binds and returns the clause.
+fn sqlite_dimension_prefix_clause(prefix: &str, binds: &mut Vec<SqlValue>) -> String {
+    match crate::ceg::list::federation::dimension_prefix_bounds(prefix) {
+        Some((lo, hi)) => {
+            binds.push(SqlValue::Text(lo));
+            let a = binds.len();
+            binds.push(SqlValue::Text(hi));
+            let b = binds.len();
+            format!("(dimension >= ?{a} AND dimension < ?{b})")
+        }
+        None => {
+            binds.push(SqlValue::Text(prefix.to_owned()));
+            let a = binds.len();
+            format!("substr(dimension, 1, {}) = ?{a}", prefix.chars().count())
+        }
+    }
 }
 
 fn sqlite_row_to_attestation(

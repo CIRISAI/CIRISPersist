@@ -7073,7 +7073,19 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .map_err(|e| {
                 crate::federation::Error::Backend(format!("list_attestations_for: {e}"))
             })?;
-        rows.into_iter().map(pg_row_to_attestation).collect()
+        rows.into_iter()
+            .map(pg_row_to_attestation)
+            .collect::<Result<Vec<_>, _>>()
+            .inspect(|rows| {
+                #[cfg(test)]
+                crate::federation::read_probe::record(
+                    "list_attestations_for",
+                    attested_key_id,
+                    rows.len(),
+                );
+                #[cfg(not(test))]
+                let _ = rows;
+            })
     }
 
     async fn list_attestations_by(
@@ -7098,6 +7110,130 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             )
             .await
             .map_err(|e| crate::federation::Error::Backend(format!("list_attestations_by: {e}")))?;
+        rows.into_iter()
+            .map(pg_row_to_attestation)
+            .collect::<Result<Vec<_>, _>>()
+            .inspect(|rows| {
+                #[cfg(test)]
+                crate::federation::read_probe::record(
+                    "list_attestations_by",
+                    attesting_key_id,
+                    rows.len(),
+                );
+                #[cfg(not(test))]
+                let _ = rows;
+            })
+    }
+
+    /// v53.1.5 — V137's `(attesting_key_id, dimension COLLATE "C")` seek;
+    /// the prefix is the #817/#818 half-open byte range under `COLLATE "C"`.
+    async fn list_attestations_by_dimension_prefix(
+        &self,
+        attesting_key_id: &str,
+        dimension_prefix: &str,
+    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
+        let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> =
+            vec![Box::new(attesting_key_id.to_owned())];
+        let prefix_sql = pg_dimension_prefix_clause(dimension_prefix, &mut params);
+        let sql = format!(
+            "SELECT {PG_ATTESTATION_COLUMNS} FROM cirislens.federation_attestations \
+             WHERE attesting_key_id = $1 AND tier = 'federation' AND {prefix_sql} \
+             ORDER BY asserted_at DESC"
+        );
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+            params.iter().map(|p| p.as_ref() as _).collect();
+        let rows = client.query(&sql, &params_ref[..]).await.map_err(|e| {
+            crate::federation::Error::Backend(format!("list_attestations_by_dimension_prefix: {e}"))
+        })?;
+        rows.into_iter().map(pg_row_to_attestation).collect()
+    }
+
+    /// v53.1.5 — V178's `(attested_key_id, dimension COLLATE "C")` seek, the
+    /// attested twin; the optional attester narrows in the same statement.
+    async fn list_attestations_for_dimension_prefix(
+        &self,
+        attested_key_id: &str,
+        attesting_key_id: Option<&str>,
+        dimension_prefix: &str,
+    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
+        let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> =
+            vec![Box::new(attested_key_id.to_owned())];
+        let prefix_sql = pg_dimension_prefix_clause(dimension_prefix, &mut params);
+        let attester_sql = match attesting_key_id {
+            Some(k) => {
+                params.push(Box::new(k.to_owned()));
+                format!(" AND attesting_key_id = ${}", params.len())
+            }
+            None => String::new(),
+        };
+        let sql = format!(
+            "SELECT {PG_ATTESTATION_COLUMNS} FROM cirislens.federation_attestations \
+             WHERE attested_key_id = $1 AND tier = 'federation' AND {prefix_sql}{attester_sql} \
+             ORDER BY asserted_at DESC"
+        );
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+            params.iter().map(|p| p.as_ref() as _).collect();
+        let rows = client.query(&sql, &params_ref[..]).await.map_err(|e| {
+            crate::federation::Error::Backend(format!(
+                "list_attestations_for_dimension_prefix: {e}"
+            ))
+        })?;
+        rows.into_iter().map(pg_row_to_attestation).collect()
+    }
+
+    /// v53.1.5 — `list_attestations_referencing` for a SET of ids (one
+    /// `text[]` bind), with the attested / attesting axes the folds pin so
+    /// V178's `(attested_key_id, attestation_type, ref)` or V107's attesting
+    /// twin serves it as a seek.
+    async fn list_composers_referencing_any(
+        &self,
+        target_attestation_ids: &[String],
+        attested_key_id: Option<&str>,
+        attesting_key_id: Option<&str>,
+    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
+        if target_attestation_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        use crate::federation::types::attestation_type;
+        let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = vec![
+            Box::new(target_attestation_ids.to_vec()),
+            Box::new(attestation_type::WITHDRAWS.to_owned()),
+            Box::new(attestation_type::RECANTS.to_owned()),
+            Box::new(attestation_type::SUPERSEDES.to_owned()),
+        ];
+        let mut axes = String::new();
+        if let Some(k) = attested_key_id {
+            params.push(Box::new(k.to_owned()));
+            axes.push_str(&format!(" AND attested_key_id = ${}", params.len()));
+        }
+        if let Some(k) = attesting_key_id {
+            params.push(Box::new(k.to_owned()));
+            axes.push_str(&format!(" AND attesting_key_id = ${}", params.len()));
+        }
+        let sql = format!(
+            "SELECT {PG_ATTESTATION_COLUMNS} FROM cirislens.federation_attestations \
+             WHERE tier = 'federation' \
+               AND attestation_type IN ($2, $3, $4) \
+               AND (attestation_envelope::jsonb->>'references_attestation_id') = ANY($1){axes} \
+             ORDER BY asserted_at DESC"
+        );
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+            params.iter().map(|p| p.as_ref() as _).collect();
+        let rows = client.query(&sql, &params_ref[..]).await.map_err(|e| {
+            crate::federation::Error::Backend(format!("list_composers_referencing_any: {e}"))
+        })?;
         rows.into_iter().map(pg_row_to_attestation).collect()
     }
 
@@ -23286,6 +23422,39 @@ where
             crate::federation::Error::Backend(format!("blob_renditions projection: {e}"))
         })?;
     Ok(())
+}
+
+/// v53.1.5 — the `federation_attestations` column list in
+/// [`pg_row_to_attestation`]'s order (`weight::float8` — see
+/// `list_attestations_for`), for the reads that build their statement.
+const PG_ATTESTATION_COLUMNS: &str = "attestation_id::text, attesting_key_id, attested_key_id, \
+    attestation_type, weight::float8 AS weight, asserted_at, expires_at, attestation_envelope, \
+    original_content_hash, scrub_signature_classical, scrub_signature_pqc, scrub_key_id, \
+    scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, \
+    withdraws_admission_rule, cohort_scope, tier, promoted_at, additional_scrubs";
+
+/// v53.1.5 — the #817/#818 dimension-prefix predicate over V106's stored
+/// column, `COLLATE "C"` so the byte range is what the V137 / V178 indexes
+/// serve; `substr` when no upper bound is representable. Pushes its params
+/// and returns the clause.
+fn pg_dimension_prefix_clause(
+    prefix: &str,
+    params: &mut Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>>,
+) -> String {
+    match crate::ceg::list::federation::dimension_prefix_bounds(prefix) {
+        Some((lo, hi)) => {
+            params.push(Box::new(lo));
+            let a = params.len();
+            params.push(Box::new(hi));
+            let b = params.len();
+            format!("(dimension COLLATE \"C\" >= ${a} AND dimension COLLATE \"C\" < ${b})")
+        }
+        None => {
+            params.push(Box::new(prefix.to_owned()));
+            let a = params.len();
+            format!("substr(dimension, 1, {}) = ${a}", prefix.chars().count())
+        }
+    }
 }
 
 fn pg_row_to_attestation(

@@ -531,7 +531,7 @@ pub fn grant_lapse_instant(a: &super::Attestation) -> Option<chrono::DateTime<ch
 /// else's, by emitting a row.
 fn substrate_expiry_bound_to_subject(
     a: &super::Attestation,
-    rows: &[super::Attestation],
+    rows: &[&super::Attestation],
     subject_key_id: &str,
 ) -> bool {
     if !envelope_dimension(a)
@@ -617,12 +617,99 @@ pub fn fold_stance(
     now: chrono::DateTime<chrono::Utc>,
     scoped: Option<(&str, Option<&str>)>,
 ) -> super::hard_case::ConsentState {
+    let refs: Vec<&super::Attestation> = rows.iter().collect();
+    fold_stance_refs(&refs, subject_key_id, now, scoped)
+}
+
+/// [`fold_stance`] over borrowed rows — the same body; a caller that
+/// already holds the rows filters by reference instead of cloning a
+/// universe per principal (v53.1.5).
+#[must_use]
+pub fn fold_stance_refs(
+    rows: &[&super::Attestation],
+    subject_key_id: &str,
+    now: chrono::DateTime<chrono::Utc>,
+    scoped: Option<(&str, Option<&str>)>,
+) -> super::hard_case::ConsentState {
     match scoped {
         Some((scope, qualifier)) => {
-            fold_scoped_stance(rows, subject_key_id, now, scope, qualifier).state
+            fold_scoped_stance_refs(rows, subject_key_id, now, scope, qualifier).state
         }
         None => fold_winner(rows, subject_key_id, now, None).0,
     }
+}
+
+/// v53.1.5 — **the rows the consent fold can USE about `target_key_id`**,
+/// read bounded instead of as every row about the target.
+///
+/// [`fold_stance`]'s universe is the subject's own `consent:state:*` rows
+/// about the target plus the substrate's `consent:state:expired` records
+/// bound to those by a resolved edge; retraction is
+/// [`crate::federation::precedence::retired_ids`] over the structural
+/// composers filed against the same target that reference those rows; a
+/// candidate's causal edge names an id, never a row. So the fold's answer
+/// for any principal in `principals` is a function of exactly: each
+/// principal's `consent:state:*` rows about the target, every
+/// `consent:state:expired` row about the target (whoever emitted it — the
+/// binding check runs in the fold, against the principal's grants, which are
+/// here), and the composers attested to the target that reference any of
+/// those. That is what this reads — three indexed seeks, not
+/// `list_attestations_for(target)` — deduped by `attestation_id` and ordered
+/// `asserted_at` DESC like the slice it replaces. On the canonical node the
+/// slice was ~5.6k rows per call, twice per call, per agent, per scorer
+/// tick (the +416 MB working set, 2026-10-06).
+///
+/// The fold itself is unchanged: hand it this set and it computes the same
+/// universe, candidates, retirements and ratchet it computed over the
+/// whole slice, because every row it would have selected is present and no
+/// row it would have ignored can change a selection.
+pub async fn scoped_fold_rows<D>(
+    dir: &D,
+    target_key_id: &str,
+    principals: &[&str],
+) -> Result<Vec<super::Attestation>, Error>
+where
+    D: FederationDirectory + ?Sized + Sync,
+{
+    let mut rows: Vec<super::Attestation> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for p in principals {
+        for a in dir
+            .list_attestations_for_dimension_prefix(
+                target_key_id,
+                Some(p),
+                consent_dimension::STATE_PREFIX,
+            )
+            .await?
+        {
+            if seen.insert(a.attestation_id.clone()) {
+                rows.push(a);
+            }
+        }
+    }
+    for a in dir
+        .list_attestations_for_dimension_prefix(
+            target_key_id,
+            None,
+            consent_dimension::STATE_EXPIRED_PREFIX,
+        )
+        .await?
+    {
+        if seen.insert(a.attestation_id.clone()) {
+            rows.push(a);
+        }
+    }
+    let ids: Vec<String> = rows.iter().map(|a| a.attestation_id.clone()).collect();
+    for a in dir
+        .list_composers_referencing_any(&ids, Some(target_key_id), None)
+        .await?
+    {
+        if seen.insert(a.attestation_id.clone()) {
+            rows.push(a);
+        }
+    }
+    rows.sort_by_key(|a| std::cmp::Reverse(a.asserted_at));
+    Ok(rows)
 }
 
 /// v44.8.0 (CIRISPersist#866 C1b) — the scoped fold WITH its bound: the same
@@ -633,6 +720,19 @@ pub fn fold_stance(
 #[must_use]
 pub fn fold_scoped_stance(
     rows: &[super::Attestation],
+    subject_key_id: &str,
+    now: chrono::DateTime<chrono::Utc>,
+    scope: &str,
+    qualifier: Option<&str>,
+) -> ScopedStance {
+    let refs: Vec<&super::Attestation> = rows.iter().collect();
+    fold_scoped_stance_refs(&refs, subject_key_id, now, scope, qualifier)
+}
+
+/// [`fold_scoped_stance`] over borrowed rows — the same body (v53.1.5).
+#[must_use]
+pub fn fold_scoped_stance_refs(
+    rows: &[&super::Attestation],
     subject_key_id: &str,
     now: chrono::DateTime<chrono::Utc>,
     scope: &str,
@@ -657,7 +757,7 @@ pub fn fold_scoped_stance(
 /// The fold proper: the stance, and the row that decided it (`None` when
 /// no candidate remained — `Unspecified`).
 fn fold_winner<'a>(
-    rows: &'a [super::Attestation],
+    rows: &[&'a super::Attestation],
     subject_key_id: &str,
     now: chrono::DateTime<chrono::Utc>,
     scoped: Option<(&str, Option<&str>)>,
@@ -671,8 +771,9 @@ fn fold_winner<'a>(
     // target, pre-expiry and pre-scope (see the doc: an edge resolves here),
     // plus the substrate's expiry records bound to those statements by a
     // resolved edge (`substrate_expiry_bound_to_subject`, v44.8.0 #866 C3).
-    let universe: Vec<&super::Attestation> = rows
+    let universe: Vec<&'a super::Attestation> = rows
         .iter()
+        .copied()
         .filter(|a| {
             envelope_dimension(a).is_some_and(|d| d.starts_with(consent_dimension::STATE_PREFIX))
         })
@@ -708,8 +809,7 @@ fn fold_winner<'a>(
     // statement can be causally dead: named by another candidate's consent
     // edge, or retired by the §6.1 retraction fold. Dead statements are
     // REMOVED, not out-sorted — see [`causal_rank`].
-    let refs: Vec<&super::Attestation> = rows.iter().collect();
-    let retired = crate::federation::precedence::retired_ids(&refs);
+    let retired = crate::federation::precedence::retired_ids(rows);
     let mut eliminated: HashSet<&str> = retired.iter().map(String::as_str).collect();
     for a in &candidates {
         if let ConsentCausalEdge::Names(target) = causal_edge(a) {

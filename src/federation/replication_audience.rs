@@ -158,8 +158,26 @@ pub async fn owner_allow_list<D>(
 where
     D: FederationDirectory + ?Sized,
 {
-    let rows = dir.list_attestations_by(owner).await?;
-    let retired: HashSet<&str> = rows
+    // v53.1.5 — the candidate rows, not every row the owner ever authored:
+    // the owner's `consent:replication:v1` grants (V137's attester+dimension
+    // seek) FOR this node, and the owner's own composers that reference
+    // exactly those (V107's attester+type+reference seek). The predicate
+    // below is unchanged; it simply no longer runs over the owner's whole
+    // history to reach the handful of rows it can select.
+    let rows: Vec<Attestation> = dir
+        .list_attestations_by_dimension_prefix(owner, GRANT_DIMENSION)
+        .await?
+        .into_iter()
+        .filter(|g| super::consent_by_humans::for_key_id_of(&g.attestation_envelope) == Some(node))
+        .collect();
+    if rows.is_empty() {
+        return Ok(None);
+    }
+    let ids: Vec<String> = rows.iter().map(|g| g.attestation_id.clone()).collect();
+    let composers = dir
+        .list_composers_referencing_any(&ids, None, Some(owner))
+        .await?;
+    let retired: HashSet<&str> = composers
         .iter()
         .filter(|r| super::precedence::is_structural_composer(&r.attestation_type))
         .filter_map(|r| {
@@ -361,17 +379,43 @@ where
         HeadCharter::KeyRoot => None,
         _ => return Ok(false),
     };
-    let about = dir.list_attestations_for(group).await?;
-    let refs: Vec<&Attestation> = about.iter().collect();
+    // v53.1.5 — the charter-shaped rows about the group (V178's
+    // attested+dimension seek), not every row about it; then the composers
+    // attested to the group that reference exactly those (V178's
+    // attested+type+reference seek). `retired_ids` over that pair answers
+    // "retired" for each candidate exactly as it did over the whole slice:
+    // a composer that retires a row about the group is itself attested to
+    // the group, its entitlement is decided against the target row alone,
+    // and the §6.1 winner is chosen among the composers naming that target.
+    let candidates: Vec<Attestation> = dir
+        .list_attestations_for_dimension_prefix(
+            group,
+            None,
+            super::trust_root::TRUST_CHARTER_DIMENSION,
+        )
+        .await?
+        .into_iter()
+        .filter(|a| {
+            a.attestation_type == super::types::attestation_type::DELEGATES_TO
+                && a.attested_key_id == group
+                && super::admission::envelope_dimension(&a.attestation_envelope)
+                    == Some(super::trust_root::TRUST_CHARTER_DIMENSION)
+                && named.as_deref().is_none_or(|d| a.persist_row_hash == d)
+        })
+        .collect();
+    if candidates.is_empty() {
+        return Ok(false);
+    }
+    let ids: Vec<String> = candidates
+        .iter()
+        .map(|a| a.attestation_id.clone())
+        .collect();
+    let composers = dir
+        .list_composers_referencing_any(&ids, Some(group), None)
+        .await?;
+    let refs: Vec<&Attestation> = candidates.iter().chain(composers.iter()).collect();
     let dead = super::precedence::retired_ids(&refs);
-    Ok(about.iter().any(|a| {
-        a.attestation_type == super::types::attestation_type::DELEGATES_TO
-            && a.attested_key_id == group
-            && !dead.contains(&a.attestation_id)
-            && super::admission::envelope_dimension(&a.attestation_envelope)
-                == Some(super::trust_root::TRUST_CHARTER_DIMENSION)
-            && named.as_deref().is_none_or(|d| a.persist_row_hash == d)
-    }))
+    Ok(candidates.iter().any(|a| !dead.contains(&a.attestation_id)))
 }
 
 /// Who a placed row's content reaches.

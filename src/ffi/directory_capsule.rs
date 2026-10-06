@@ -3288,6 +3288,37 @@ impl FederationDirectory for OpsDirectory {
             method: "list_attestations_by",
         })
     }
+    // v53.1.5 — the bounded reads, as their siblings: not proxied across
+    // the capsule.
+    async fn list_attestations_by_dimension_prefix(
+        &self,
+        attesting_key_id: &str,
+        dimension_prefix: &str,
+    ) -> Result<Vec<Attestation>, Error> {
+        Err(Error::Unsupported {
+            method: "list_attestations_by_dimension_prefix",
+        })
+    }
+    async fn list_attestations_for_dimension_prefix(
+        &self,
+        attested_key_id: &str,
+        attesting_key_id: Option<&str>,
+        dimension_prefix: &str,
+    ) -> Result<Vec<Attestation>, Error> {
+        Err(Error::Unsupported {
+            method: "list_attestations_for_dimension_prefix",
+        })
+    }
+    async fn list_composers_referencing_any(
+        &self,
+        target_attestation_ids: &[String],
+        attested_key_id: Option<&str>,
+        attesting_key_id: Option<&str>,
+    ) -> Result<Vec<Attestation>, Error> {
+        Err(Error::Unsupported {
+            method: "list_composers_referencing_any",
+        })
+    }
     async fn attestations_binding_content(
         &self,
         content_sha256: &str,
