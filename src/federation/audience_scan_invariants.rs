@@ -1283,6 +1283,7 @@ pub(crate) mod bodies {
 
     /// The totals one scorer pass decoded, from the probe.
     #[derive(Default, Debug, Clone, Copy)]
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     pub struct PassTotals {
         pub rows: usize,
         pub bytes: usize,
@@ -1306,6 +1307,7 @@ pub(crate) mod bodies {
     /// on T returns the agent's / its steward's consent rows only), and the
     /// pass's rows keyed on T are a small multiple of the agent count. The
     /// v53.1.4 bodies run on a 1-in-10 sample for the comparison.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     pub async fn i538_the_scorers_pass_reads_each_agents_slice_not_the_nodes<B>(d: &B, s: &str)
     where
         B: FederationDirectory + crate::read::ReadEngine + Sync,
