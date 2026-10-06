@@ -7,7 +7,7 @@ threat-model citations because this crate's audit story is the point.
 
 ## [Unreleased]
 
-## [53.1.6] - UNRELEASED
+## [53.1.6] - 2026-10-06
 
 ### Fixed — five more reads loaded an author's or a subject's whole history to select a handful of rows (CIRISEdge's heap harness, 2026-10-06)
 
