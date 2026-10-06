@@ -366,7 +366,7 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     // v47.2.0 (#853) — composers naming a target, by `references_attestation_id`.
     ("list_attestations_referencing", ConnClass::Read),
     // v53.1.5 — the bounded reads behind the audience resolver and the
-    // consent fold (V137 / V178 seeks).
+    // consent fold (V137 / V179 seeks).
     ("list_attestations_by_dimension_prefix", ConnClass::Read),
     ("list_attestations_for_dimension_prefix", ConnClass::Read),
     ("list_composers_referencing_any", ConnClass::Read),

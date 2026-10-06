@@ -1,0 +1,40 @@
+-- V178 — the trace listing's page is named from an index, SQLite dialect
+-- v53.1.5 (CIRISServer's canonical node OOM-looped, 2026-10-06)
+--
+-- POSTGRES PARITY: migrations/postgres/lens/V178__trace_events_trace_ts_scope.sql
+--
+-- `list_trace_summaries` ran ONE statement: twenty MIN/MAX aggregates over
+-- every column the summary carries (the JSON payload among them), GROUP BY
+-- trace_id, ORDER BY started_at DESC LIMIT n. The §4.3 scope predicate
+-- (`cohort_scope IN ('species','biosphere','federation')` for the scorer's
+-- unauthenticated read) matched the V060 covering index
+-- `idx_trace_events_v060_repository_stats` (cohort_scope leading), and
+-- with no `sqlite_stat1` the planner takes that equality seek over the
+-- trace-ordered scan every time. The seek returns the WHOLE table — every
+-- row is `federation` — and the GROUP BY then sorts it in a temp b-tree
+-- whose records carry every aggregated column, payload included: the
+-- whole 1.6 GB table materialised in memory before the LIMIT saw a row.
+-- Twice per capacity-scorer pass, ~600 MB RSS each, under a 2 GB cgroup.
+--
+-- The read is now two phases (see `SqliteBackend::list_trace_summaries`):
+--
+--   phase 1  `SELECT trace_id, MIN(ts) … GROUP BY trace_id … LIMIT n` —
+--            names the page's trace_ids. Its scope term is written
+--            `+cohort_scope` so no index can serve it, which leaves the
+--            planner the trace-ordered scan: GROUP BY streams the index
+--            with no temp b-tree, and the sorter holds (trace_id, ts)
+--            pairs, never a payload.
+--   phase 2  the twenty aggregates, restricted to those ids.
+--
+-- This index makes phase 1 COVERING for the scorer's call: V042's
+-- `trace_events_an_trace_summary` leads with (trace_id, ts) too, but does
+-- not carry the scope columns, so phase 1 over it reads the heap row —
+-- payload-sized pages — once per event to evaluate the predicate. With
+-- `cohort_scope` and `cohort_target_id` in the index, phase 1 under any
+-- caller scope and the default filter touches the index alone.
+--
+-- `IF NOT EXISTS`: a node that already carries the index re-applies as a
+-- no-op. No backfill: an index is derived.
+
+CREATE INDEX IF NOT EXISTS trace_events_trace_ts_scope
+    ON trace_events (trace_id, ts, cohort_scope, cohort_target_id);

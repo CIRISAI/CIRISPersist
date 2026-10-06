@@ -3319,7 +3319,7 @@ pub trait FederationDirectory: Send + Sync {
     /// The bounded read behind the consent fold
     /// ([`consent::scoped_fold_rows`]: a principal's `consent:state:*` rows
     /// about the target) and [`replication_audience::is_public_group`] (a
-    /// group's `trust:charter:v1` rows). Served by V178's
+    /// group's `trust:charter:v1` rows). Served by V179's
     /// `(attested_key_id, dimension)`.
     async fn list_attestations_for_dimension_prefix(
         &self,
@@ -3337,7 +3337,7 @@ pub trait FederationDirectory: Send + Sync {
     /// composer that retires a row about T is itself attested to T (the
     /// consent fold, the charter check), and an owner retires their own grant
     /// under their own key (the allow list). Served by V107's
-    /// `(attesting_key_id, attestation_type, ref)` and V178's attested twin.
+    /// `(attesting_key_id, attestation_type, ref)` and V179's attested twin.
     async fn list_composers_referencing_any(
         &self,
         target_attestation_ids: &[String],

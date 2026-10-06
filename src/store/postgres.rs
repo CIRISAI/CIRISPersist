@@ -7152,7 +7152,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         rows.into_iter().map(pg_row_to_attestation).collect()
     }
 
-    /// v53.1.5 — V178's `(attested_key_id, dimension COLLATE "C")` seek, the
+    /// v53.1.5 — V179's `(attested_key_id, dimension COLLATE "C")` seek, the
     /// attested twin; the optional attester narrows in the same statement.
     async fn list_attestations_for_dimension_prefix(
         &self,
@@ -7191,7 +7191,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
 
     /// v53.1.5 — `list_attestations_referencing` for a SET of ids (one
     /// `text[]` bind), with the attested / attesting axes the folds pin so
-    /// V178's `(attested_key_id, attestation_type, ref)` or V107's attesting
+    /// V179's `(attested_key_id, attestation_type, ref)` or V107's attesting
     /// twin serves it as a seek.
     async fn list_composers_referencing_any(
         &self,
@@ -23434,7 +23434,7 @@ const PG_ATTESTATION_COLUMNS: &str = "attestation_id::text, attesting_key_id, at
     withdraws_admission_rule, cohort_scope, tier, promoted_at, additional_scrubs";
 
 /// v53.1.5 — the #817/#818 dimension-prefix predicate over V106's stored
-/// column, `COLLATE "C"` so the byte range is what the V137 / V178 indexes
+/// column, `COLLATE "C"` so the byte range is what the V137 / V179 indexes
 /// serve; `substr` when no upper bound is representable. Pushes its params
 /// and returns the clause.
 fn pg_dimension_prefix_clause(
@@ -24945,7 +24945,7 @@ impl crate::read::ReadEngine for PostgresBackend {
             }
         }
 
-        let client = self
+        let mut client = self
             .pool
             .get()
             .await
@@ -24970,6 +24970,28 @@ impl crate::read::ReadEngine for PostgresBackend {
             where_parts.push(frag);
             params.extend(sparams);
         }
+        // v53.1.5 — two phases, the sqlite twin's shape (see
+        // `sqlite_trace_summary_plan` for the fault): phase 1 names the
+        // page's trace_ids from `(trace_id, MIN(ts))` alone; phase 2 runs
+        // the aggregate select over those ids (`= ANY($n)`, one text[]
+        // bind) under the same predicate. Phase 2's predicate + binds are
+        // fixed here, before the cursor/limit params join phase 1's.
+        let phase2_ids_p = params.len() + 1;
+        let phase2_where = {
+            let mut parts = where_parts.clone();
+            parts.push(format!("trace_id = ANY(${phase2_ids_p})"));
+            format!("WHERE {}", parts.join(" AND "))
+        };
+        let phase2_sql = format!(
+            "SELECT {select} \
+             FROM cirislens.trace_events \
+             {phase2_where} \
+             GROUP BY trace_id \
+             ORDER BY started_at DESC, trace_id DESC",
+            select = *TRACE_SUMMARY_SELECT,
+        );
+        let phase2_fixed = params.len();
+
         let where_sql = if where_parts.is_empty() {
             String::new()
         } else {
@@ -24994,29 +25016,54 @@ impl crate::read::ReadEngine for PostgresBackend {
         params.push(Box::new(limit));
         let limit_p = params.len();
 
-        let sql = format!(
-            "SELECT {select} \
+        let phase1_sql = format!(
+            "SELECT trace_id, MIN(ts) AS started_at \
              FROM cirislens.trace_events \
              {where_sql} \
              GROUP BY trace_id \
              {having_sql} \
              ORDER BY started_at DESC, trace_id DESC \
-             LIMIT ${limit_p}",
-            select = *TRACE_SUMMARY_SELECT,
+             LIMIT ${limit_p}"
         );
+
+        // One REPEATABLE READ snapshot for both phases, so an event landing
+        // between them cannot move a trace's started_at under the page.
+        let tx = client
+            .build_transaction()
+            .isolation_level(tokio_postgres::IsolationLevel::RepeatableRead)
+            .read_only(true)
+            .start()
+            .await
+            .map_err(|e| crate::read::Error::Backend(format!("list_trace_summaries begin: {e}")))?;
 
         let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
             params.iter().map(|p| p.as_ref() as _).collect();
-
-        let rows = client
-            .query(&sql, &params_ref[..])
+        let ids: Vec<String> = tx
+            .query(&phase1_sql, &params_ref[..])
             .await
-            .map_err(|e| crate::read::Error::Backend(format!("list_trace_summaries: {e}")))?;
+            .map_err(|e| crate::read::Error::Backend(format!("list_trace_summaries: {e}")))?
+            .iter()
+            .map(|r| r.safe_get_with(0, crate::read::Error::Backend))
+            .collect::<Result<_, _>>()?;
 
-        let mut items: Vec<crate::read::TraceSummary> = Vec::with_capacity(rows.len());
-        for row in &rows {
-            items.push(pg_row_to_trace_summary(row)?);
+        let mut items: Vec<crate::read::TraceSummary> = Vec::with_capacity(ids.len());
+        if !ids.is_empty() {
+            let mut phase2_params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+                params_ref[..phase2_fixed].to_vec();
+            phase2_params.push(&ids);
+            debug_assert_eq!(phase2_params.len(), phase2_ids_p);
+            let rows = tx
+                .query(&phase2_sql, &phase2_params[..])
+                .await
+                .map_err(|e| crate::read::Error::Backend(format!("list_trace_summaries: {e}")))?;
+            for row in &rows {
+                items.push(pg_row_to_trace_summary(row)?);
+            }
         }
+        // Reads only; nothing to commit, the pooled client goes back clean.
+        tx.rollback()
+            .await
+            .map_err(|e| crate::read::Error::Backend(format!("list_trace_summaries end: {e}")))?;
 
         // Cursor for next page: trailing edge of this page.
         let next_cursor = if items.len() as i64 == limit {
@@ -51655,5 +51702,304 @@ mod tests {
         )
         .await
         .expect("657 attestation wire-index exercise");
+    }
+
+    // ── v53.1.5 — the two-phase trace listing (I531, postgres) ─────────
+
+    /// The v53.1.4 one-statement listing, VERBATIM, as the oracle the
+    /// two-phase read is held to. See the sqlite twin for the fault.
+    async fn v53_1_4_list_trace_summaries(
+        backend: &PostgresBackend,
+        filter: crate::read::TraceFilter,
+        cursor: Option<crate::read::TraceCursor>,
+        limit: i64,
+        scope: crate::scope::CallerScope,
+    ) -> crate::read::TraceListPage {
+        let client = backend.pool.get().await.unwrap();
+        let (mut where_parts, mut params) = pg_trace_filter_parts(&filter).unwrap();
+        let (frag, sparams) = crate::store::scope_bind::scope_predicate_pg(
+            &scope,
+            "cohort_scope",
+            "cohort_target_id",
+            params.len(),
+        );
+        where_parts.push(frag);
+        params.extend(sparams);
+        let where_sql = format!("WHERE {}", where_parts.join(" AND "));
+        let having_sql = match &cursor {
+            Some(c) => {
+                params.push(Box::new(c.last_started_at));
+                let p1 = params.len();
+                params.push(Box::new(c.last_trace_id.clone()));
+                let p2 = params.len();
+                format!("HAVING (MIN(ts), MIN(trace_id)) < (${p1}, ${p2})")
+            }
+            None => String::new(),
+        };
+        params.push(Box::new(limit));
+        let limit_p = params.len();
+        let sql = format!(
+            "SELECT {select} FROM cirislens.trace_events {where_sql} GROUP BY trace_id \
+             {having_sql} ORDER BY started_at DESC, trace_id DESC LIMIT ${limit_p}",
+            select = *TRACE_SUMMARY_SELECT,
+        );
+        let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+            params.iter().map(|p| p.as_ref() as _).collect();
+        let rows = client.query(&sql, &params_ref[..]).await.unwrap();
+        let items: Vec<crate::read::TraceSummary> = rows
+            .iter()
+            .map(|r| pg_row_to_trace_summary(r).unwrap())
+            .collect();
+        let next_cursor = if items.len() as i64 == limit {
+            items
+                .last()
+                .map(|s| crate::read::TraceCursor::from_trailing(s.started_at, s.trace_id.clone()))
+        } else {
+            None
+        };
+        crate::read::TraceListPage { items, next_cursor }
+    }
+
+    /// The sqlite I531 corpus, on postgres: `n` traces, 2..=6 events each,
+    /// inserted out of ts order, trace_id order unrelated to time order,
+    /// started_at ties across traces, varied filter columns; every fifth
+    /// trace in a room, every seventh with ONE room row among federation
+    /// rows. Returns the unauthenticated-visible trace count.
+    async fn seed_i531_corpus_pg(backend: &PostgresBackend, n: usize) -> usize {
+        let base = chrono::Utc.with_ymd_and_hms(2026, 5, 1, 12, 0, 0).unwrap();
+        let mut rows = Vec::new();
+        let mut visible = 0usize;
+        let types = [
+            ReasoningEventType::ThoughtStart,
+            ReasoningEventType::DmaResults,
+            ReasoningEventType::ConscienceResult,
+            ReasoningEventType::ActionResult,
+            ReasoningEventType::IdmaResult,
+            ReasoningEventType::ThoughtStart,
+        ];
+        for i in 0..n {
+            let tid = format!("i531-{:05}", (i * 7919) % n);
+            let start = (i % 97) as i64 * 3;
+            let events = 2 + (i % 5);
+            let room_trace = i % 5 == 0;
+            let mixed_trace = !room_trace && i % 7 == 0;
+            if !room_trace {
+                visible += 1;
+            }
+            for (k, ty) in types.iter().enumerate().take(events) {
+                let k_ts = (events - 1 - k) as i64;
+                let payload = serde_json::json!({
+                    "csdma_plausibility_score": (i % 10) as f64 / 10.0,
+                    "conscience_passed": i % 3 != 0,
+                    "action_executed": "speak",
+                    "thought_depth": k,
+                });
+                let serde_json::Value::Object(payload) = payload else {
+                    unreachable!()
+                };
+                let room = room_trace || (mixed_trace && k == 0);
+                rows.push(TraceEventRow {
+                    trace_id: tid.clone(),
+                    thought_id: format!("{tid}-th{k}"),
+                    task_id: Some(format!("qa_{}", i % 11)),
+                    step_point: None,
+                    event_type: *ty,
+                    attempt_index: 0,
+                    ts: base + chrono::Duration::minutes(start + k_ts),
+                    agent_name: Some(if i % 2 == 0 { "Scout" } else { "Echo" }.to_owned()),
+                    agent_id_hash: format!("agent-{}", i % 3),
+                    cognitive_state: Some("WORK".to_owned()),
+                    trace_level: crate::schema::TraceLevel::Detailed,
+                    payload,
+                    cost_llm_calls: Some(2),
+                    cost_tokens: Some(150),
+                    cost_usd: Some((i % 13) as f64 * 0.001 + k as f64 * 0.0001),
+                    signature: "sig".to_owned(),
+                    signing_key_id: "key-1".to_owned(),
+                    signature_verified: true,
+                    verification_source: crate::store::VerificationSource::Persist,
+                    schema_version: "2.7.0".to_owned(),
+                    pii_scrubbed: false,
+                    original_content_hash: None,
+                    scrub_signature: None,
+                    scrub_key_id: None,
+                    scrub_timestamp: None,
+                    admitted_at: None,
+                    scrub_ner_ran: None,
+                    scrub_applied_trace_level: None,
+                    scrub_model_digest: None,
+                    agent_role: Some("ally".to_owned()),
+                    agent_template: Some("ally-v3".to_owned()),
+                    deployment_domain: Some(format!("dom-{}", i % 4)),
+                    deployment_type: Some("production".to_owned()),
+                    deployment_region: Some("us-east".to_owned()),
+                    deployment_trust_mode: None,
+                    cohort_scope: if room { "community" } else { "federation" }.to_owned(),
+                    cohort_target_id: room.then(|| "room-i531".to_owned()),
+                    signature_ml_dsa_65: None,
+                    pubkey_ml_dsa_65: None,
+                    pqc_key_id: None,
+                });
+            }
+        }
+        let total = rows.len();
+        let report = backend.insert_trace_events_batch(&rows).await.unwrap();
+        assert_eq!(report.inserted, total, "every corpus row lands");
+        visible
+    }
+
+    async fn assert_same_page_pg(
+        backend: &PostgresBackend,
+        filter: crate::read::TraceFilter,
+        cursor: Option<crate::read::TraceCursor>,
+        limit: i64,
+        scope: crate::scope::CallerScope,
+        label: &str,
+    ) -> crate::read::TraceListPage {
+        use crate::read::ReadEngine;
+        let reference = v53_1_4_list_trace_summaries(
+            backend,
+            filter.clone(),
+            cursor.clone(),
+            limit,
+            scope.clone(),
+        )
+        .await;
+        let page = backend
+            .list_trace_summaries(filter, cursor, limit, scope)
+            .await
+            .unwrap();
+        assert_eq!(
+            page.items.len(),
+            reference.items.len(),
+            "{label}: page length differs from the v53.1.4 statement"
+        );
+        for (a, b) in page.items.iter().zip(reference.items.iter()) {
+            assert_eq!(
+                a, b,
+                "{label}: a summary differs from the v53.1.4 statement"
+            );
+        }
+        assert_eq!(
+            page.next_cursor, reference.next_cursor,
+            "{label}: next_cursor differs from the v53.1.4 statement"
+        );
+        page
+    }
+
+    /// I531 (postgres) — the two-phase read returns exactly the pages the
+    /// v53.1.4 statement returned, on a database of this test's own so the
+    /// default-filter pages and the walk's count are the corpus and nothing
+    /// else.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn i531_two_phase_listing_matches_the_v53_1_4_statement_pg() {
+        let Some(dsn) = pg_isolated_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let visible = seed_i531_corpus_pg(&backend, 300).await;
+        let unauth = crate::scope::CallerScope::Unauthenticated;
+        let room = crate::scope::CallerScope::Authenticated {
+            admission: crate::scope::admission::CallerAdmission::for_test(
+                "reader-occ",
+                "reader-id",
+                [],
+                ["room-i531".to_string()],
+            ),
+        };
+
+        for limit in [1, 7, 500] {
+            let page = assert_same_page_pg(
+                &backend,
+                crate::read::TraceFilter::default(),
+                None,
+                limit,
+                unauth.clone(),
+                &format!("default filter, limit {limit}"),
+            )
+            .await;
+            assert_eq!(
+                page.items.len(),
+                usize::try_from(limit).unwrap().min(visible)
+            );
+        }
+        assert_same_page_pg(
+            &backend,
+            crate::read::TraceFilter {
+                agent_id_hash: Some("agent-1".to_owned()),
+                ..Default::default()
+            },
+            None,
+            50,
+            unauth.clone(),
+            "agent filter",
+        )
+        .await;
+        assert_same_page_pg(
+            &backend,
+            crate::read::TraceFilter {
+                deployment_domain: Some("dom-2".to_owned()),
+                agent_name: Some("Scout".to_owned()),
+                ..Default::default()
+            },
+            None,
+            500,
+            unauth.clone(),
+            "domain + name filter",
+        )
+        .await;
+        let base = chrono::Utc.with_ymd_and_hms(2026, 5, 1, 12, 0, 0).unwrap();
+        assert_same_page_pg(
+            &backend,
+            crate::read::TraceFilter {
+                time_window: Some(crate::read::TimeWindow {
+                    since: base + chrono::Duration::minutes(30),
+                    until: base + chrono::Duration::minutes(120),
+                }),
+                ..Default::default()
+            },
+            None,
+            500,
+            unauth.clone(),
+            "time window",
+        )
+        .await;
+
+        let mut cursor = None;
+        let mut seen = 0usize;
+        let mut pages = 0usize;
+        loop {
+            let page = assert_same_page_pg(
+                &backend,
+                crate::read::TraceFilter::default(),
+                cursor.clone(),
+                7,
+                unauth.clone(),
+                &format!("walk page {pages}"),
+            )
+            .await;
+            seen += page.items.len();
+            pages += 1;
+            match page.next_cursor {
+                Some(c) => cursor = Some(c),
+                None => break,
+            }
+        }
+        assert_eq!(seen, visible, "the walk reaches every visible trace once");
+        assert_eq!(pages, visible.div_ceil(7) + usize::from(visible % 7 == 0));
+
+        let page = assert_same_page_pg(
+            &backend,
+            crate::read::TraceFilter::default(),
+            None,
+            500,
+            room,
+            "room reader",
+        )
+        .await;
+        assert_eq!(page.items.len(), 300, "the room reader sees every trace");
     }
 }

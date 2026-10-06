@@ -5753,7 +5753,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         })
     }
 
-    /// v53.1.5 — V178's `(attested_key_id, dimension)` seek, the attested
+    /// v53.1.5 — V179's `(attested_key_id, dimension)` seek, the attested
     /// twin of the read above; the optional attester narrows in the same
     /// statement.
     async fn list_attestations_for_dimension_prefix(
@@ -5794,7 +5794,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
 
     /// v53.1.5 — `list_attestations_referencing` for a SET of ids (one
     /// `json_each` bind), with the attested / attesting axes the folds pin so
-    /// V178's `(attested_key_id, attestation_type, ref)` or V107's attesting
+    /// V179's `(attested_key_id, attestation_type, ref)` or V107's attesting
     /// twin serves it as a seek.
     async fn list_composers_referencing_any(
         &self,
@@ -24197,6 +24197,113 @@ fn sqlite_read_err(ctx: &str) -> impl Fn(rusqlite::Error) -> crate::read::Error 
     move |e| crate::read::Error::Backend(format!("{ctx}: {e}"))
 }
 
+/// v53.1.5 — the two statements behind [`SqliteBackend::list_trace_summaries`].
+///
+/// Until v53.1.4 the listing was ONE statement: every aggregate in
+/// [`SQLITE_TRACE_SUMMARY_SELECT`] over the whole filtered table, GROUP BY
+/// trace_id, ORDER BY started_at DESC, LIMIT n. The §4.3 scope term
+/// (`cohort_scope IN (…)`) matched V060's cohort-led covering index, and
+/// with no `sqlite_stat1` the planner takes that equality seek — which on a
+/// production node returns the entire table, every row being `federation`
+/// — and then sorts it for the GROUP BY in a temp b-tree whose records
+/// carry every aggregated column, the JSON payload included. The whole
+/// 1.6 GB table materialised before the LIMIT saw a row: CIRISServer's
+/// canonical node OOM-looped under its 2 GB cgroup (2026-10-06).
+///
+/// Now:
+///
+/// - **`phase1`** names the page: `trace_id, MIN(ts)` over the filter +
+///   scope predicate, grouped, cursor-gated by the SAME `HAVING` as before,
+///   ordered and limited. Its scope columns are written `+cohort_scope` /
+///   `+cohort_target_id` — SQLite's documented way to keep a term from
+///   constraining an index — so the planner cannot take the cohort seek
+///   and streams the trace-ordered index instead (V178 makes that scan
+///   covering): no temp b-tree for the GROUP BY, and the ORDER BY sorter
+///   holds (trace_id, ts) pairs, never a payload.
+/// - **`phase2`** runs the full aggregate select over ONLY the page's
+///   trace_ids (`json_each` over one JSON-array bind, so a 10 000-id page
+///   is one parameter) under the same filter + scope predicate, in the
+///   same order. Same rows, same aggregates, same order as the one
+///   statement produced; `next_cursor` is derived exactly as before.
+///
+/// The filter columns keep their plain spelling: an `agent_id_hash` filter
+/// still seeks `trace_events_dedup` (agent-led, trace_id second — grouped
+/// order preserved) and narrows phase 1 to that agent's rows.
+struct SqliteTraceSummaryPlan {
+    phase1: String,
+    phase1_binds: Vec<SqlValue>,
+    /// Phase 2's SQL; its binds are `phase2_binds` followed by ONE JSON
+    /// array of the phase-1 trace_ids at placeholder `?{phase2_ids_param}`.
+    phase2: String,
+    phase2_binds: Vec<SqlValue>,
+    phase2_ids_param: usize,
+}
+
+fn sqlite_trace_summary_plan(
+    filter: &crate::read::TraceFilter,
+    cursor: Option<&crate::read::TraceCursor>,
+    limit: i64,
+    scope: &crate::scope::CallerScope,
+) -> Result<SqliteTraceSummaryPlan, crate::read::Error> {
+    let (mut where_sql, mut binds) = sqlite_filter_where(filter)?;
+    // §4.3 scope gate — AND-composed onto the trace WHERE. Scope binds
+    // come right after the filter binds (numbered ?N continues), before
+    // the cursor/limit params. The `+` prefix is the plan pin described
+    // above; it changes which index serves the term, never its value.
+    {
+        let (frag, sbinds) = crate::store::scope_bind::scope_predicate_sqlite(
+            scope,
+            "+cohort_scope",
+            "+cohort_target_id",
+            binds.len(),
+        );
+        where_sql = crate::store::scope_bind::and_compose(&where_sql, &frag);
+        binds.extend(sbinds);
+    }
+    // Phase 2 shares the predicate and its binds, then adds the id list.
+    let phase2_where = crate::store::scope_bind::and_compose(
+        &where_sql,
+        &format!(
+            "trace_id IN (SELECT value FROM json_each(?{}))",
+            binds.len() + 1
+        ),
+    );
+    let phase2_binds = binds.clone();
+    let phase2_ids_param = binds.len() + 1;
+    let phase2 = format!(
+        "SELECT {select} FROM trace_events {phase2_where} \
+         GROUP BY trace_id ORDER BY started_at DESC, trace_id DESC",
+        select = *SQLITE_TRACE_SUMMARY_SELECT,
+    );
+    // HAVING gates the cursor on the GROUPED row's started_at /
+    // trace_id (aggregates can't go in WHERE). SQLite supports
+    // row-value comparison. Unchanged from the one-statement shape.
+    let having_sql = match cursor {
+        None => String::new(),
+        Some(c) => {
+            binds.push(SqlValue::Text(c.last_started_at.to_rfc3339()));
+            let p1 = binds.len();
+            binds.push(SqlValue::Text(c.last_trace_id.clone()));
+            let p2 = binds.len();
+            format!("HAVING (MIN(ts), MIN(trace_id)) < (?{p1}, ?{p2})")
+        }
+    };
+    binds.push(SqlValue::Integer(limit));
+    let p_limit = binds.len();
+    let phase1 = format!(
+        "SELECT trace_id, MIN(ts) AS started_at FROM trace_events \
+         {where_sql} GROUP BY trace_id {having_sql} \
+         ORDER BY started_at DESC, trace_id DESC LIMIT ?{p_limit}"
+    );
+    Ok(SqliteTraceSummaryPlan {
+        phase1,
+        phase1_binds: binds,
+        phase2,
+        phase2_binds,
+        phase2_ids_param,
+    })
+}
+
 impl crate::read::ReadEngine for SqliteBackend {
     async fn list_trace_summaries(
         &self,
@@ -24218,46 +24325,39 @@ impl crate::read::ReadEngine for SqliteBackend {
                 )));
             }
         }
-        let (mut where_sql, mut binds) = sqlite_filter_where(&filter)?;
-        // §4.3 scope gate — AND-composed onto the trace WHERE. Scope binds
-        // come right after the filter binds (numbered ?N continues), before
-        // the cursor/limit params.
-        {
-            let (frag, sbinds) = crate::store::scope_bind::scope_predicate_sqlite(
-                &scope,
-                "cohort_scope",
-                "cohort_target_id",
-                binds.len(),
-            );
-            where_sql = crate::store::scope_bind::and_compose(&where_sql, &frag);
-            binds.extend(sbinds);
-        }
-        // HAVING gates the cursor on the GROUPED row's started_at /
-        // trace_id (aggregates can't go in WHERE). SQLite supports
-        // row-value comparison.
-        let having_sql = match &cursor {
-            None => String::new(),
-            Some(c) => {
-                binds.push(SqlValue::Text(c.last_started_at.to_rfc3339()));
-                let p1 = binds.len();
-                binds.push(SqlValue::Text(c.last_trace_id.clone()));
-                let p2 = binds.len();
-                format!("HAVING (MIN(ts), MIN(trace_id)) < (?{p1}, ?{p2})")
-            }
-        };
-        binds.push(SqlValue::Integer(limit));
-        let p_limit = binds.len();
-        let sql = format!(
-            "SELECT {select} FROM trace_events \
-             {where_sql} GROUP BY trace_id {having_sql} \
-             ORDER BY started_at DESC, trace_id DESC LIMIT ?{p_limit}",
-            select = *SQLITE_TRACE_SUMMARY_SELECT,
-        );
+        // v53.1.5 — two phases (see `sqlite_trace_summary_plan`).
+        let plan = sqlite_trace_summary_plan(&filter, cursor.as_ref(), limit, &scope)?;
         let items = self
             .read(
                 move |conn| -> Result<Vec<crate::read::TraceSummary>, crate::read::Error> {
-                    let mut stmt = conn
-                        .prepare(&sql)
+                    // One deferred transaction: both phases read one
+                    // snapshot, so an event landing between them cannot
+                    // move a trace's started_at under the page.
+                    let tx = conn
+                        .unchecked_transaction()
+                        .map_err(sqlite_read_err("list_trace_summaries begin"))?;
+                    let mut stmt = tx
+                        .prepare(&plan.phase1)
+                        .map_err(sqlite_read_err("list_trace_summaries prepare"))?;
+                    let ids: Vec<String> = stmt
+                        .query_map(params_from_iter(plan.phase1_binds.iter()), |r| {
+                            r.get::<_, String>(0)
+                        })
+                        .map_err(sqlite_read_err("list_trace_summaries query"))?
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(sqlite_read_err("list_trace_summaries row"))?;
+                    drop(stmt);
+                    if ids.is_empty() {
+                        return Ok(Vec::new());
+                    }
+                    let ids_json = serde_json::to_string(&ids).map_err(|e| {
+                        crate::read::Error::Backend(format!("list_trace_summaries ids: {e}"))
+                    })?;
+                    let mut binds = plan.phase2_binds;
+                    binds.push(SqlValue::Text(ids_json));
+                    debug_assert_eq!(binds.len(), plan.phase2_ids_param);
+                    let mut stmt = tx
+                        .prepare(&plan.phase2)
                         .map_err(sqlite_read_err("list_trace_summaries prepare"))?;
                     let rows = stmt
                         .query_map(params_from_iter(binds.iter()), |r| {
@@ -44844,6 +44944,433 @@ mod tests {
             .unwrap();
         assert_eq!(page.items.len(), 1);
         assert_eq!(page.items[0].trace_id, "tr-b");
+    }
+
+    // ── v53.1.5 — the two-phase trace listing (I531 / I532) ─────────────
+
+    /// The v53.1.4 one-statement listing's SQL + binds, VERBATIM: the shape
+    /// that OOM-looped CIRISServer's canonical node (2026-10-06). It lives
+    /// here only as the oracle the two-phase read is held to (I531) and as
+    /// the plan I532 shows the fault in. Never the production path again.
+    fn v53_1_4_list_sql(
+        filter: &TraceFilter,
+        cursor: Option<&crate::read::TraceCursor>,
+        limit: i64,
+        scope: &crate::scope::CallerScope,
+    ) -> (String, Vec<SqlValue>) {
+        let (mut where_sql, mut binds) = sqlite_filter_where(filter).unwrap();
+        let (frag, sbinds) = crate::store::scope_bind::scope_predicate_sqlite(
+            scope,
+            "cohort_scope",
+            "cohort_target_id",
+            binds.len(),
+        );
+        where_sql = crate::store::scope_bind::and_compose(&where_sql, &frag);
+        binds.extend(sbinds);
+        let having_sql = match cursor {
+            None => String::new(),
+            Some(c) => {
+                binds.push(SqlValue::Text(c.last_started_at.to_rfc3339()));
+                let p1 = binds.len();
+                binds.push(SqlValue::Text(c.last_trace_id.clone()));
+                let p2 = binds.len();
+                format!("HAVING (MIN(ts), MIN(trace_id)) < (?{p1}, ?{p2})")
+            }
+        };
+        binds.push(SqlValue::Integer(limit));
+        let p_limit = binds.len();
+        let sql = format!(
+            "SELECT {select} FROM trace_events \
+             {where_sql} GROUP BY trace_id {having_sql} \
+             ORDER BY started_at DESC, trace_id DESC LIMIT ?{p_limit}",
+            select = *SQLITE_TRACE_SUMMARY_SELECT,
+        );
+        (sql, binds)
+    }
+
+    async fn v53_1_4_list_trace_summaries(
+        backend: &SqliteBackend,
+        filter: TraceFilter,
+        cursor: Option<crate::read::TraceCursor>,
+        limit: i64,
+        scope: crate::scope::CallerScope,
+    ) -> crate::read::TraceListPage {
+        let (sql, binds) = v53_1_4_list_sql(&filter, cursor.as_ref(), limit, &scope);
+        let items = backend
+            .read(move |conn| -> Vec<crate::read::TraceSummary> {
+                let mut stmt = conn.prepare(&sql).unwrap();
+                stmt.query_map(params_from_iter(binds.iter()), |r| {
+                    sqlite_row_to_trace_summary(r)
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+            })
+            .await;
+        let next_cursor = if items.len() as i64 == limit {
+            items
+                .last()
+                .map(|s| crate::read::TraceCursor::from_trailing(s.started_at, s.trace_id.clone()))
+        } else {
+            None
+        };
+        crate::read::TraceListPage { items, next_cursor }
+    }
+
+    /// `EXPLAIN QUERY PLAN` detail lines for `sql`, in plan order.
+    async fn sqlite_plan(backend: &SqliteBackend, sql: &str, binds: Vec<SqlValue>) -> Vec<String> {
+        let sql = format!("EXPLAIN QUERY PLAN {sql}");
+        backend
+            .read(move |conn| -> Vec<String> {
+                let mut stmt = conn.prepare(&sql).unwrap();
+                stmt.query_map(params_from_iter(binds.iter()), |r| r.get::<_, String>(3))
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap()
+            })
+            .await
+    }
+
+    /// I531's corpus: `n` traces, 2..=6 events each, inserted OUT of ts
+    /// order, trace_id order unrelated to time order, started_at TIES across
+    /// traces (every trace shares its start minute with ~n/97 others), three
+    /// agents, four domains, two agent names. Every fifth trace lives in a
+    /// `community` room (invisible to an unauthenticated reader); every
+    /// seventh carries ONE community row among federation rows, so the
+    /// per-row scope predicate must agree between the two phases.
+    async fn seed_i531_corpus(backend: &SqliteBackend, n: usize) -> I531Corpus {
+        let mut rows = Vec::new();
+        let mut visible = 0usize;
+        for i in 0..n {
+            // A permutation of 0..n: trace_id order is not insertion order.
+            let tid = format!("i531-{:05}", (i * 7919) % n);
+            let start = (i % 97) as i64 * 3;
+            let events = 2 + (i % 5) as i64;
+            let agent = format!("agent-{}", i % 3);
+            let domain = format!("dom-{}", i % 4);
+            let name = if i % 2 == 0 { "Scout" } else { "Echo" };
+            let room_trace = i % 5 == 0;
+            let mixed_trace = !room_trace && i % 7 == 0;
+            if !room_trace {
+                visible += 1;
+            }
+            let types = [
+                ReasoningEventType::ThoughtStart,
+                ReasoningEventType::DmaResults,
+                ReasoningEventType::ConscienceResult,
+                ReasoningEventType::ActionResult,
+                ReasoningEventType::IdmaResult,
+                ReasoningEventType::ThoughtStart,
+            ];
+            for k in 0..events {
+                // Out of order: the LAST event goes in first, the first last.
+                let k_ts = events - 1 - k;
+                let ku = usize::try_from(k).unwrap();
+                let mut row = re_event(
+                    &tid,
+                    &format!("{tid}-th{ku}"),
+                    Some(&format!("qa_{}", i % 11)),
+                    types[ku],
+                    start + k_ts,
+                    &agent,
+                    Some(name),
+                    Some(&domain),
+                    serde_json::json!({
+                        "csdma_plausibility_score": (i % 10) as f64 / 10.0,
+                        "conscience_passed": i % 3 != 0,
+                        "action_executed": "speak",
+                        "thought_depth": ku,
+                    }),
+                );
+                row.cost_usd = Some((i % 13) as f64 * 0.001 + ku as f64 * 0.0001);
+                if room_trace || (mixed_trace && k == 0) {
+                    row.cohort_scope = "community".to_owned();
+                    row.cohort_target_id = Some("room-i531".to_owned());
+                }
+                rows.push(row);
+            }
+        }
+        let total = rows.len();
+        let report = backend.insert_trace_events_batch(&rows).await.unwrap();
+        assert_eq!(report.inserted, total, "every corpus row lands");
+        I531Corpus { visible }
+    }
+
+    struct I531Corpus {
+        /// Traces an unauthenticated reader sees (not in a room).
+        visible: usize,
+    }
+
+    fn auth_in_room(room: &str) -> crate::scope::CallerScope {
+        crate::scope::CallerScope::Authenticated {
+            admission: crate::scope::admission::CallerAdmission::for_test(
+                "reader-occ",
+                "reader-id",
+                [],
+                [room.to_string()],
+            ),
+        }
+    }
+
+    /// Both listings over the same corpus, same arguments: items AND cursor
+    /// byte-equal. Returns the page so a walk can continue.
+    async fn assert_same_page(
+        backend: &SqliteBackend,
+        filter: TraceFilter,
+        cursor: Option<crate::read::TraceCursor>,
+        limit: i64,
+        scope: crate::scope::CallerScope,
+        label: &str,
+    ) -> crate::read::TraceListPage {
+        let reference = v53_1_4_list_trace_summaries(
+            backend,
+            filter.clone(),
+            cursor.clone(),
+            limit,
+            scope.clone(),
+        )
+        .await;
+        let page = backend
+            .list_trace_summaries(filter, cursor, limit, scope)
+            .await
+            .unwrap();
+        assert_eq!(
+            page.items.len(),
+            reference.items.len(),
+            "{label}: page length differs from the v53.1.4 statement"
+        );
+        for (a, b) in page.items.iter().zip(reference.items.iter()) {
+            assert_eq!(
+                a, b,
+                "{label}: a summary differs from the v53.1.4 statement"
+            );
+        }
+        assert_eq!(
+            page.next_cursor, reference.next_cursor,
+            "{label}: next_cursor differs from the v53.1.4 statement"
+        );
+        page
+    }
+
+    /// I531 (sqlite) — the two-phase read returns exactly the pages the
+    /// v53.1.4 statement returned: default filter at limits 1, 7, 500; an
+    /// agent filter; a domain + name filter; a time window; a cursor walk
+    /// to exhaustion; and a room reader whose scope admits the rows the
+    /// unauthenticated reader never sees.
+    #[tokio::test]
+    async fn i531_two_phase_listing_matches_the_v53_1_4_statement() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let corpus = seed_i531_corpus(&backend, 300).await;
+        let unauth = crate::scope::CallerScope::Unauthenticated;
+
+        for limit in [1, 7, 500] {
+            let page = assert_same_page(
+                &backend,
+                TraceFilter::default(),
+                None,
+                limit,
+                unauth.clone(),
+                &format!("default filter, limit {limit}"),
+            )
+            .await;
+            let expect = usize::try_from(limit).unwrap().min(corpus.visible);
+            assert_eq!(
+                page.items.len(),
+                expect,
+                "limit {limit} fills from the corpus"
+            );
+        }
+
+        assert_same_page(
+            &backend,
+            TraceFilter {
+                agent_id_hash: Some("agent-1".to_owned()),
+                ..Default::default()
+            },
+            None,
+            50,
+            unauth.clone(),
+            "agent filter",
+        )
+        .await;
+        assert_same_page(
+            &backend,
+            TraceFilter {
+                deployment_domain: Some("dom-2".to_owned()),
+                agent_name: Some("Scout".to_owned()),
+                ..Default::default()
+            },
+            None,
+            500,
+            unauth.clone(),
+            "domain + name filter",
+        )
+        .await;
+        let base = Utc.with_ymd_and_hms(2026, 5, 1, 12, 0, 0).unwrap();
+        assert_same_page(
+            &backend,
+            TraceFilter {
+                time_window: Some(TimeWindow {
+                    since: base + chrono::Duration::minutes(30),
+                    until: base + chrono::Duration::minutes(120),
+                }),
+                ..Default::default()
+            },
+            None,
+            500,
+            unauth.clone(),
+            "time window",
+        )
+        .await;
+
+        // The walk: every page equal, and it reaches every visible trace.
+        let mut cursor = None;
+        let mut seen = 0usize;
+        let mut pages = 0usize;
+        loop {
+            let page = assert_same_page(
+                &backend,
+                TraceFilter::default(),
+                cursor.clone(),
+                7,
+                unauth.clone(),
+                &format!("walk page {pages}"),
+            )
+            .await;
+            seen += page.items.len();
+            pages += 1;
+            match page.next_cursor {
+                Some(c) => cursor = Some(c),
+                None => break,
+            }
+        }
+        assert_eq!(
+            seen, corpus.visible,
+            "the walk reaches every visible trace once"
+        );
+        assert_eq!(
+            pages,
+            corpus.visible.div_ceil(7) + usize::from(corpus.visible % 7 == 0)
+        );
+
+        // A room reader: the room traces AND the mixed traces' community
+        // rows join the result set; the per-row predicate agrees per phase.
+        let page = assert_same_page(
+            &backend,
+            TraceFilter::default(),
+            None,
+            500,
+            auth_in_room("room-i531"),
+            "room reader",
+        )
+        .await;
+        assert_eq!(page.items.len(), 300, "the room reader sees every trace");
+    }
+
+    /// I532 (sqlite) — the plan. The v53.1.4 statement seeks the cohort-led
+    /// V060 index and sorts the WHOLE table for the GROUP BY (every
+    /// aggregated column, payload included, in the sorter); phase 1 streams
+    /// V178 as a covering index with no temp b-tree for the GROUP BY, and
+    /// phase 2 seeks the page's trace_ids through the same index.
+    #[tokio::test]
+    async fn i532_phase1_streams_the_trace_index_without_a_group_by_sort() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        seed_i531_corpus(&backend, 50).await;
+        let unauth = crate::scope::CallerScope::Unauthenticated;
+
+        let (old_sql, old_binds) = v53_1_4_list_sql(&TraceFilter::default(), None, 500, &unauth);
+        let old_plan = sqlite_plan(&backend, &old_sql, old_binds).await;
+        eprintln!("I532 v53.1.4 plan: {old_plan:?}");
+        assert!(
+            old_plan
+                .iter()
+                .any(|l| l.contains("USE TEMP B-TREE FOR GROUP BY")),
+            "the v53.1.4 statement sorts for its GROUP BY — the fault: {old_plan:?}"
+        );
+        assert!(
+            old_plan
+                .iter()
+                .any(|l| l.contains("idx_trace_events_v060_repository_stats")),
+            "…because the cohort seek wins the plan: {old_plan:?}"
+        );
+
+        let plan = sqlite_trace_summary_plan(&TraceFilter::default(), None, 500, &unauth).unwrap();
+        let p1 = sqlite_plan(&backend, &plan.phase1, plan.phase1_binds.clone()).await;
+        eprintln!("I532 phase-1 plan: {p1:?}");
+        assert!(
+            !p1.iter()
+                .any(|l| l.contains("USE TEMP B-TREE FOR GROUP BY")),
+            "phase 1 must not sort for its GROUP BY: {p1:?}"
+        );
+        assert!(
+            p1.iter()
+                .any(|l| l.contains("COVERING INDEX trace_events_trace_ts_scope")),
+            "phase 1 streams V178 as a covering index: {p1:?}"
+        );
+
+        let mut b2 = plan.phase2_binds.clone();
+        b2.push(SqlValue::Text(
+            serde_json::to_string(&["i531-00001", "i531-00002"]).unwrap(),
+        ));
+        let p2 = sqlite_plan(&backend, &plan.phase2, b2).await;
+        eprintln!("I532 phase-2 plan: {p2:?}");
+        assert!(
+            p2.iter()
+                .any(|l| l.contains("trace_events_trace_ts_scope (trace_id=?)")),
+            "phase 2 seeks the page's ids, never the cohort seek: {p2:?}"
+        );
+        assert!(
+            !p2.iter()
+                .any(|l| l.contains("USE TEMP B-TREE FOR GROUP BY")),
+            "phase 2 groups in index order: {p2:?}"
+        );
+
+        // With a cursor the HAVING joins; the plan shape is unchanged.
+        let cursor = crate::read::TraceCursor::from_trailing(
+            Utc.with_ymd_and_hms(2026, 5, 1, 13, 0, 0).unwrap(),
+            "i531-00010".to_owned(),
+        );
+        let plan = sqlite_trace_summary_plan(&TraceFilter::default(), Some(&cursor), 500, &unauth)
+            .unwrap();
+        let p1c = sqlite_plan(&backend, &plan.phase1, plan.phase1_binds.clone()).await;
+        eprintln!("I532 phase-1 plan (cursor): {p1c:?}");
+        assert!(
+            !p1c.iter()
+                .any(|l| l.contains("USE TEMP B-TREE FOR GROUP BY")),
+            "{p1c:?}"
+        );
+    }
+
+    /// I532b — what V178 buys over V042's `trace_events_an_trace_summary`:
+    /// without it phase 1 still streams a trace-ordered index (no GROUP BY
+    /// sort — the `+cohort_scope` pin is what defeats the cohort seek), but
+    /// that index does not carry the scope columns, so every event's heap
+    /// row — payload-sized — is read to evaluate the predicate.
+    #[tokio::test]
+    async fn i532b_without_v178_phase1_reads_the_heap_per_event() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations_through(177).await.unwrap();
+        seed_i531_corpus(&backend, 50).await;
+        let unauth = crate::scope::CallerScope::Unauthenticated;
+        let plan = sqlite_trace_summary_plan(&TraceFilter::default(), None, 500, &unauth).unwrap();
+        let p1 = sqlite_plan(&backend, &plan.phase1, plan.phase1_binds.clone()).await;
+        eprintln!("I532b phase-1 plan without V178: {p1:?}");
+        assert!(
+            !p1.iter()
+                .any(|l| l.contains("USE TEMP B-TREE FOR GROUP BY")),
+            "{p1:?}"
+        );
+        assert!(
+            p1.iter()
+                .any(|l| l.contains("USING INDEX trace_events_an_trace_summary")),
+            "{p1:?}"
+        );
+        assert!(
+            !p1.iter().any(|l| l.contains("COVERING INDEX")),
+            "the V042 index is not covering for the scope predicate: {p1:?}"
+        );
     }
 
     #[tokio::test]
