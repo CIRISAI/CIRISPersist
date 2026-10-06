@@ -7042,7 +7042,19 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .map_err(|e| {
                 crate::federation::Error::Backend(format!("list_attestations_referencing: {e}"))
             })?;
-        rows.into_iter().map(pg_row_to_attestation).collect()
+        rows.into_iter()
+            .map(pg_row_to_attestation)
+            .collect::<Result<Vec<_>, _>>()
+            .inspect(|rows| {
+                #[cfg(test)]
+                crate::federation::read_probe::record(
+                    "list_attestations_referencing",
+                    target_attestation_id,
+                    rows,
+                );
+                #[cfg(not(test))]
+                let _ = rows;
+            })
     }
 
     async fn list_attestations_for(

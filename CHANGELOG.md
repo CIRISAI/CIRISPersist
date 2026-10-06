@@ -7,6 +7,20 @@ threat-model citations because this crate's audit story is the point.
 
 ## [Unreleased]
 
+## [53.1.7] - UNRELEASED
+
+### Fixed — `list_attestations_referencing` scanned the whole table on every call (CIRISEdge PR #818)
+
+Edge measured it on sqlite against a canonical-like seed: `trust_root::live_conferrals` (the Rooted floor, `rooted_with`) calls `list_attestations_referencing(row)` once per conferral row, and that read was 13 of 16 stack samples — 96% of a 5,310 s round. The read pins the envelope's `references_attestation_id` and the three composer types, never the attester; V107's `federation_attestations_composer_ref` carries the same extraction but LEADS with `attesting_key_id`, so no index served it and every call was `SCAN federation_attestations`. Edge is adding a per-Deliver memo on its side; each call that remains now seeks.
+
+- **V181 `federation_attestations_reference_seek`** on both dialects — `(references_attestation_id, attestation_type)`, the expression spelled exactly as each read spells it (sqlite `json_extract(attestation_envelope, '$.references_attestation_id')`; postgres `attestation_envelope::jsonb ->> 'references_attestation_id'`, the column being TEXT since V122). The read is unchanged. `IF NOT EXISTS`, no backfill; rows appended to `evidence/migration_checksums.tsv`. It also serves `list_composers_referencing_any` when neither axis is pinned.
+- **`list_attestations_for_type` (v53.1.6) on sqlite walked the subject's whole slice.** With no `sqlite_stat1` the planner took `federation_attestations_attested (attested_key_id, asserted_at DESC)` to skip the sort, then tested every row about the subject for its type — the same planner choice v53.1.6 pinned off `list_attestations_by_type`. It now orders by `+asserted_at` (a no-op on value and collation) and seeks V178's `federation_attestations_attested_composer_ref` on both equalities. The cost was page reads, not heap (only matching rows were decoded).
+- `list_attestations_referencing` now records into the test read probe on every backend.
+- **Witnesses.** I546 (sqlite): the plan is `SEARCH federation_attestations USING INDEX federation_attestations_reference_seek (<expr>=? AND attestation_type=?)` and never a `SCAN`. I546b (sqlite): migrated through V180 only, the same statement is `SCAN federation_attestations` — the fault, pinned separately. I546c (sqlite): `list_attestations_for_type` is `SEARCH … federation_attestations_attested_composer_ref (attested_key_id=? AND attestation_type=?)`, never `federation_attestations_attested`. Postgres, on a scratch analyzed table shaped like the canonical (22k rows, ~1,100 withdraws, ~600 supersedes, V107 and V178's composer indexes present): before V181 a full `Index Scan using …attested_composer_ref` on its third column (cost 361); after, `Index Scan using …reference_seek` (cost 8). I546 (memory, sqlite, postgres): `live_conferrals` equals its verbatim v53.1.6 body for a grant rotated twice by its root, a foreign `supersedes`, and a second grant withdrawn, among unrelated self-reports and a bystander's recanted reports; each referencing read returns exactly the composers naming its row; no slice is read.
+- Mutation-checked: I546 run against a database migrated through V180 reds (`SCAN federation_attestations`); dropping the `+asserted_at` pin from `list_attestations_for_type` reds I546c (`federation_attestations_attested (attested_key_id=?)`); the memory backend's referencing read ignoring the reference reds I546's row check (10 rows returned for the head of the rotation).
+
+**Adopters.** Nothing to call. The index builds once at the first boot's migration. Edge: pin 53.1.7 under PR #818's harness.
+
 ## [53.1.6] - UNRELEASED
 
 ### Fixed — five more reads loaded an author's or a subject's whole history to select a handful of rows (CIRISEdge's heap harness, 2026-10-06)

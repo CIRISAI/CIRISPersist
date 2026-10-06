@@ -27,6 +27,10 @@
 //!   `send_set_for` asks per principal on every Edge memo refresh): the
 //!   steward's `delegates_to` edges (V107's `(attester, type)` prefix), never
 //!   its whole history; each candidate's verdict is unchanged.
+//! - **I546** (v53.1.7) `live_conferrals`: each conferral's composers through
+//!   `list_attestations_referencing`, now V181's `(reference, type)` seek
+//!   (CIRISEdge PR #818: a full table scan per conferral row); equivalence
+//!   here, the plan in `store::sqlite`'s I546.
 //!
 //! [`OwnerAudience`]: crate::federation::replication_audience::OwnerAudience
 
@@ -1221,6 +1225,192 @@ pub(crate) mod bodies {
             vec![n[7].clone()]
         );
     }
+    // ── I546 ─────────────────────────────────────────────────────────────
+
+    /// `trust_root::live_conferrals` as v53.1.6 shipped it.
+    pub async fn live_conferrals_reference<'a>(
+        directory: &dyn FederationDirectory,
+        shaped: Vec<&'a Attestation>,
+    ) -> Result<Vec<&'a Attestation>, Error> {
+        let mut live = Vec::with_capacity(shaped.len());
+        for row in shaped {
+            if row.attestation_type == attestation_type::SUPERSEDES
+                && !crate::federation::trust_root::rotates_own_grant(directory, row).await?
+            {
+                continue;
+            }
+            let superseded = directory
+                .list_attestations_referencing(&row.attestation_id)
+                .await?
+                .iter()
+                .any(|r| {
+                    r.attestation_type == attestation_type::SUPERSEDES
+                        && r.attesting_key_id == row.attesting_key_id
+                        && r.attestation_id != row.attestation_id
+                });
+            if !superseded {
+                live.push(row);
+            }
+        }
+        Ok(live)
+    }
+
+    /// **I546** — `live_conferrals` (the Rooted floor's per-conferral
+    /// `list_attestations_referencing`, CIRISEdge PR #818) equals its v53.1.6
+    /// body over a root's grant rotated twice, a foreign `supersedes`, a
+    /// second grant withdrawn, and a table full of unrelated rows and
+    /// composers naming OTHER rows; and each referencing read returns exactly
+    /// the composers naming that row — the seek, never a slice. (The scan
+    /// itself is invisible to a row probe; I546's sqlite plan check pins it.)
+    pub async fn i546_live_conferrals_read_each_rows_composers(
+        d: &dyn FederationDirectory,
+        s: &str,
+    ) {
+        use crate::federation::grant_supersede_invariants::bodies as gs;
+        use crate::federation::trust_root::{
+            capability_roots_to_trusted_root, live_conferrals, INFRA_ATTEST_SCOPE,
+            INFRA_SERVE_SCOPE,
+        };
+        let fx = gs::fixture(d, &format!("i546-{s}")).await;
+        let succ = format!("i546-succ-{s}");
+        let succ2 = format!("i546-succ2-{s}");
+        gs::supersede(
+            d,
+            &succ,
+            &fx.root,
+            &fx.subject,
+            &fx.grant,
+            INFRA_SERVE_SCOPE,
+        )
+        .await
+        .expect("the root rotates its grant");
+        gs::supersede(d, &succ2, &fx.root, &fx.subject, &succ, INFRA_SERVE_SCOPE)
+            .await
+            .expect("the root rotates it again");
+        let foreign = format!("i546-foreign-{s}");
+        ts::register_hybrid_key_as(d, &foreign, &foreign, NODE).await;
+        // The door may or may not admit it; either way both bodies must agree.
+        let _ = gs::supersede(
+            d,
+            &format!("i546-fsucc-{s}"),
+            &foreign,
+            &fx.subject,
+            &fx.grant,
+            INFRA_ATTEST_SCOPE,
+        )
+        .await;
+        let fx2 = gs::fixture(d, &format!("i546b-{s}")).await;
+        gs::withdraw(
+            d,
+            &format!("i546-w-{s}"),
+            &fx2.root,
+            &fx2.subject,
+            &fx2.grant,
+        )
+        .await;
+        // Unrelated rows: self-reports by the root, the subject and a bystander,
+        // and the bystander's composers over its own reports.
+        let bystander = format!("i546-bystander-{s}");
+        ts::register_hybrid_key_as(d, &bystander, &bystander, NODE).await;
+        for k in [&fx.root, &fx.subject, &bystander] {
+            for i in 0..8 {
+                put(d, self_report(k, &format!("i546-{i}")))
+                    .await
+                    .expect("noise");
+            }
+        }
+        for i in 0..6 {
+            let r = self_report(&bystander, &format!("i546-retired-{i}"));
+            put(d, r.clone()).await.expect("bystander report");
+            put(
+                d,
+                composer(
+                    &bystander,
+                    &bystander,
+                    attestation_type::RECANTS,
+                    &r.attestation_id,
+                ),
+            )
+            .await
+            .expect("bystander recants");
+        }
+
+        for f in [&fx, &fx2] {
+            let rows = d.list_attestations_for(&f.subject).await.unwrap();
+            let shaped: Vec<&Attestation> = rows
+                .iter()
+                .filter(|r| {
+                    r.attestation_type == attestation_type::DELEGATES_TO
+                        || r.attestation_type == attestation_type::SUPERSEDES
+                })
+                .collect();
+            assert!(!shaped.is_empty(), "I546: conferral-shaped rows exist");
+            let _ = read_probe::take();
+            let got: Vec<String> = live_conferrals(d, shaped.clone())
+                .await
+                .unwrap()
+                .iter()
+                .map(|r| r.attestation_id.clone())
+                .collect();
+            let log = read_probe::take();
+            let want: Vec<String> = live_conferrals_reference(d, shaped.clone())
+                .await
+                .unwrap()
+                .iter()
+                .map(|r| r.attestation_id.clone())
+                .collect();
+            let _ = read_probe::take();
+            assert_eq!(got, want, "I546 live_conferrals for {}", f.subject);
+            // Each referencing read returns exactly the composers naming its
+            // row (every composer here is attested to the subject, so the
+            // subject's slice holds them all); no read is keyed wider.
+            for r in &shaped {
+                if calls_of(&log, "list_attestations_referencing", &r.attestation_id) == 0 {
+                    continue;
+                }
+                let naming = rows
+                    .iter()
+                    .filter(|c| {
+                        crate::federation::precedence::is_structural_composer(&c.attestation_type)
+                            && crate::federation::precedence::references_attestation_id_from_envelope(
+                                &c.attestation_envelope,
+                            ) == Some(r.attestation_id.as_str())
+                    })
+                    .count();
+                assert_eq!(
+                    rows_of(&log, "list_attestations_referencing", &r.attestation_id),
+                    naming,
+                    "I546: the referencing read of {} returns the composers naming it: {log:?}",
+                    r.attestation_id
+                );
+            }
+            for m in [
+                "list_attestations_for",
+                "list_attestations_by",
+                "list_attestations",
+            ] {
+                assert!(
+                    !log.iter().any(|r| r.method == m),
+                    "I546: live_conferrals reads no slice ({m}): {log:?}"
+                );
+            }
+        }
+        assert_eq!(
+            capability_roots_to_trusted_root(d, &fx.user, &fx.subject, INFRA_SERVE_SCOPE)
+                .await
+                .unwrap()
+                .map(|g| g.grant_attestation_id),
+            Some(succ2.clone()),
+            "I546: the head of the rotation confers"
+        );
+        assert_eq!(
+            capability_roots_to_trusted_root(d, &fx2.user, &fx2.subject, INFRA_SERVE_SCOPE)
+                .await
+                .unwrap(),
+            None,
+            "I546: the withdrawn grant confers nothing"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1249,6 +1439,7 @@ mod runners {
                 case!(i543, i543_the_config_renewal_check_reads_the_leaf);
                 case!(i544, i544_custody_acks_read_the_devices_reports_of_the_blob);
                 case!(i545, i545_nodes_of_reads_the_stewards_delegations);
+                case!(i546, i546_live_conferrals_read_each_rows_composers);
                 $(case!($sql_only, $sql_body);)*
             }
         };

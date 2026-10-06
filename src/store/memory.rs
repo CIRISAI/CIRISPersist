@@ -4594,6 +4594,12 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             .cloned()
             .collect();
         rows.sort_by_key(|a| std::cmp::Reverse(a.asserted_at));
+        #[cfg(test)]
+        crate::federation::read_probe::record(
+            "list_attestations_referencing",
+            target_attestation_id,
+            &rows,
+        );
         Ok(rows)
     }
 

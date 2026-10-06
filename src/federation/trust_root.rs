@@ -1817,7 +1817,7 @@ const MAX_GRANT_ROTATIONS: usize = 64;
 /// successor's), and no caller of this walk asks it: every caller resolves
 /// standing at use, now. The lineage it would walk is kept (the superseded
 /// row is never deleted and its successor names it).
-async fn live_conferrals<'a, F>(
+pub(crate) async fn live_conferrals<'a, F>(
     directory: &F,
     shaped: Vec<&'a Attestation>,
 ) -> Result<Vec<&'a Attestation>, Error>
@@ -1849,7 +1849,7 @@ where
 
 /// Does the `supersedes` `succ` rotate a grant its own signer made — its chain
 /// reaching a `delegates_to`, every link by the same key?
-async fn rotates_own_grant<F>(directory: &F, succ: &Attestation) -> Result<bool, Error>
+pub(crate) async fn rotates_own_grant<F>(directory: &F, succ: &Attestation) -> Result<bool, Error>
 where
     F: FederationDirectory + ?Sized,
 {

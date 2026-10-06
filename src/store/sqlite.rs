@@ -5663,9 +5663,10 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         &self,
         target_attestation_id: &str,
     ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
-        // v47.2.0 (#853) — keyed on the envelope's `references_attestation_id`
-        // (the V141-preserved `federation_attestations_composer_ref` index
-        // carries that extraction).
+        // v47.2.0 (#853) — keyed on the envelope's `references_attestation_id`.
+        // v53.1.7 — served by V181's `federation_attestations_reference_seek`
+        // (V107's `composer_ref` carries the extraction too, but leads with the
+        // attester this read never pins, so it scanned the table).
         let target = target_attestation_id.to_owned();
         // The DISCRIMINATOR rides beside the reference (CC 4.5.1.1 op-separation):
         // only the three structural composers, named by the emitting ops.
@@ -5675,26 +5676,31 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             attestation_type::RECANTS,
             attestation_type::SUPERSEDES,
         ];
-        self.read(move |conn| -> Result<Vec<crate::federation::Attestation>, rusqlite::Error> {
-            let mut stmt = conn.prepare(
-                "SELECT attestation_id, attesting_key_id, attested_key_id, attestation_type, \
-                            weight, asserted_at, expires_at, attestation_envelope, \
-                            original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
-                            scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at, additional_scrubs \
-                 FROM federation_attestations \
-                 WHERE tier = 'federation' \
-                   AND attestation_type IN (?2, ?3, ?4) \
-                   AND json_extract(attestation_envelope, '$.references_attestation_id') = ?1 \
-                 ORDER BY asserted_at DESC",
-            )?;
-            let rows = stmt.query_map(
-                rusqlite::params![target, composers[0], composers[1], composers[2]],
-                sqlite_row_to_attestation,
-            )?;
-            rows.collect()
-        })
+        let sql = sqlite_attestations_referencing_sql();
+        self.read(
+            move |conn| -> Result<Vec<crate::federation::Attestation>, rusqlite::Error> {
+                let mut stmt = conn.prepare(&sql)?;
+                let rows = stmt.query_map(
+                    rusqlite::params![target, composers[0], composers[1], composers[2]],
+                    sqlite_row_to_attestation,
+                )?;
+                rows.collect()
+            },
+        )
         .await
-        .map_err(|e| crate::federation::Error::Backend(format!("list_attestations_referencing: {e}")))
+        .map_err(|e| {
+            crate::federation::Error::Backend(format!("list_attestations_referencing: {e}"))
+        })
+        .inspect(|rows| {
+            #[cfg(test)]
+            crate::federation::read_probe::record(
+                "list_attestations_referencing",
+                target_attestation_id,
+                rows,
+            );
+            #[cfg(not(test))]
+            let _ = rows;
+        })
     }
 
     async fn list_attestations_by(
@@ -5886,11 +5892,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             SqlValue::Text(attested_key_id.to_owned()),
             SqlValue::Text(attestation_type.to_owned()),
         ];
-        let sql = format!(
-            "SELECT {SQLITE_ATTESTATION_COLUMNS} FROM federation_attestations \
-             WHERE attested_key_id = ?1 AND attestation_type = ?2 AND tier = 'federation' \
-             ORDER BY asserted_at DESC"
-        );
+        let sql = sqlite_attestations_for_type_sql();
         self.read(
             move |conn| -> Result<Vec<crate::federation::Attestation>, rusqlite::Error> {
                 let mut stmt = conn.prepare(&sql)?;
@@ -22692,6 +22694,35 @@ const SQLITE_ATTESTATION_COLUMNS: &str = "attestation_id, attesting_key_id, atte
     original_content_hash, scrub_signature_classical, scrub_signature_pqc, scrub_key_id, \
     scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, \
     withdraws_admission_rule, cohort_scope, tier, promoted_at, additional_scrubs";
+
+/// v53.1.7 — `list_attestations_referencing`'s statement (`?1` the target
+/// id, `?2..?4` the composer types), spelled once so I546's plan check reads
+/// the statement the door runs.
+fn sqlite_attestations_referencing_sql() -> String {
+    format!(
+        "SELECT {SQLITE_ATTESTATION_COLUMNS} FROM federation_attestations \
+         WHERE tier = 'federation' \
+           AND attestation_type IN (?2, ?3, ?4) \
+           AND json_extract(attestation_envelope, '$.references_attestation_id') = ?1 \
+         ORDER BY asserted_at DESC"
+    )
+}
+
+/// v53.1.7 — `list_attestations_for_type`'s statement (`?1` attested, `?2`
+/// type), spelled once so I546's plan check reads the statement the door runs.
+///
+/// `ORDER BY +asserted_at`, as on [`sqlite_attestations_by_type_sql`]: without
+/// the pin the planner takes `federation_attestations_attested
+/// (attested_key_id, asserted_at DESC)` to skip the sort and walks every row
+/// about the subject to test its type; pinned, V178's `(attested_key_id,
+/// attestation_type, …)` seeks both equalities.
+fn sqlite_attestations_for_type_sql() -> String {
+    format!(
+        "SELECT {SQLITE_ATTESTATION_COLUMNS} FROM federation_attestations \
+         WHERE attested_key_id = ?1 AND attestation_type = ?2 AND tier = 'federation' \
+         ORDER BY +asserted_at DESC"
+    )
+}
 
 /// v53.1.6 — `list_attestations_by_type`'s statement (`?1` attester, `?2`
 /// type), spelled once so I545's plan check reads the statement the door runs.
@@ -45524,6 +45555,98 @@ mod tests {
                 .iter()
                 .any(|l| l.contains("federation_attestations_attesting ")),
             "the by-type read does not walk the attester's whole slice in order: {plan:?}"
+        );
+    }
+
+    fn i546_referencing_binds() -> Vec<SqlValue> {
+        use crate::federation::types::attestation_type as at;
+        vec![
+            SqlValue::Text("target".into()),
+            SqlValue::Text(at::WITHDRAWS.into()),
+            SqlValue::Text(at::RECANTS.into()),
+            SqlValue::Text(at::SUPERSEDES.into()),
+        ]
+    }
+
+    /// I546 (sqlite) — `list_attestations_referencing` SEEKS V181's
+    /// `federation_attestations_reference_seek` on the reference and the
+    /// composer type; it never scans the table.
+    #[tokio::test]
+    async fn i546_referencing_seeks_the_reference_index() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let plan = sqlite_plan(
+            &backend,
+            &sqlite_attestations_referencing_sql(),
+            i546_referencing_binds(),
+        )
+        .await;
+        eprintln!("I546 list_attestations_referencing plan: {plan:?}");
+        assert!(
+            plan.iter().any(|l| l.starts_with(
+                "SEARCH federation_attestations USING INDEX \
+                 federation_attestations_reference_seek (<expr>=? AND attestation_type=?)"
+            )),
+            "the referencing read seeks (reference, type): {plan:?}"
+        );
+        assert!(
+            !plan
+                .iter()
+                .any(|l| l.starts_with("SCAN federation_attestations")),
+            "the referencing read never scans the table: {plan:?}"
+        );
+    }
+
+    /// I546b (sqlite) — the fault, pinned separately: migrated through V180
+    /// only, the same statement SCANS `federation_attestations` (V107's
+    /// `composer_ref` carries the extraction behind the attester it never
+    /// pins) — what CIRISEdge measured at 96% of a round.
+    #[tokio::test]
+    async fn i546b_without_v181_the_referencing_read_scans() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations_through(180).await.unwrap();
+        let plan = sqlite_plan(
+            &backend,
+            &sqlite_attestations_referencing_sql(),
+            i546_referencing_binds(),
+        )
+        .await;
+        assert!(
+            plan.iter().any(|l| l == "SCAN federation_attestations"),
+            "through V180 the referencing read scans the table: {plan:?}"
+        );
+    }
+
+    /// I546c (sqlite) — `list_attestations_for_type` seeks V178's
+    /// `(attested_key_id, attestation_type, …)` on both equalities, never the
+    /// subject's whole slice in `asserted_at` order.
+    #[tokio::test]
+    async fn i546c_for_type_seeks_the_attested_type_prefix() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let plan = sqlite_plan(
+            &backend,
+            &sqlite_attestations_for_type_sql(),
+            vec![
+                SqlValue::Text("subject".into()),
+                SqlValue::Text("delegates_to".into()),
+            ],
+        )
+        .await;
+        eprintln!("I546c list_attestations_for_type plan: {plan:?}");
+        assert!(
+            plan.iter().any(|l| l.starts_with(
+                "SEARCH federation_attestations USING INDEX \
+                 federation_attestations_attested_composer_ref \
+                 (attested_key_id=? AND attestation_type=?)"
+            )),
+            "the for-type read seeks the (attested, type) prefix: {plan:?}"
+        );
+        assert!(
+            !plan
+                .iter()
+                .any(|l| l.contains("federation_attestations_attested ")),
+            "the for-type read does not walk the subject's whole slice in order: {plan:?}"
         );
     }
 
