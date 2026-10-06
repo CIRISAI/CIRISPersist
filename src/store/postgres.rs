@@ -7073,7 +7073,19 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .map_err(|e| {
                 crate::federation::Error::Backend(format!("list_attestations_for: {e}"))
             })?;
-        rows.into_iter().map(pg_row_to_attestation).collect()
+        rows.into_iter()
+            .map(pg_row_to_attestation)
+            .collect::<Result<Vec<_>, _>>()
+            .inspect(|rows| {
+                #[cfg(test)]
+                crate::federation::read_probe::record(
+                    "list_attestations_for",
+                    attested_key_id,
+                    rows,
+                );
+                #[cfg(not(test))]
+                let _ = rows;
+            })
     }
 
     async fn list_attestations_by(
@@ -7098,7 +7110,167 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             )
             .await
             .map_err(|e| crate::federation::Error::Backend(format!("list_attestations_by: {e}")))?;
-        rows.into_iter().map(pg_row_to_attestation).collect()
+        rows.into_iter()
+            .map(pg_row_to_attestation)
+            .collect::<Result<Vec<_>, _>>()
+            .inspect(|rows| {
+                #[cfg(test)]
+                crate::federation::read_probe::record(
+                    "list_attestations_by",
+                    attesting_key_id,
+                    rows,
+                );
+                #[cfg(not(test))]
+                let _ = rows;
+            })
+    }
+
+    /// v53.1.5 — V137's `(attesting_key_id, dimension COLLATE "C")` seek;
+    /// the prefix is the #817/#818 half-open byte range under `COLLATE "C"`.
+    async fn list_attestations_by_dimension_prefix(
+        &self,
+        attesting_key_id: &str,
+        dimension_prefix: &str,
+    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
+        let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> =
+            vec![Box::new(attesting_key_id.to_owned())];
+        let prefix_sql = pg_dimension_prefix_clause(dimension_prefix, &mut params);
+        let sql = format!(
+            "SELECT {PG_ATTESTATION_COLUMNS} FROM cirislens.federation_attestations \
+             WHERE attesting_key_id = $1 AND tier = 'federation' AND {prefix_sql} \
+             ORDER BY asserted_at DESC"
+        );
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+            params.iter().map(|p| p.as_ref() as _).collect();
+        let rows = client.query(&sql, &params_ref[..]).await.map_err(|e| {
+            crate::federation::Error::Backend(format!("list_attestations_by_dimension_prefix: {e}"))
+        })?;
+        rows.into_iter()
+            .map(pg_row_to_attestation)
+            .collect::<Result<Vec<_>, _>>()
+            .inspect(|rows| {
+                #[cfg(test)]
+                crate::federation::read_probe::record(
+                    "list_attestations_by_dimension_prefix",
+                    attesting_key_id,
+                    rows,
+                );
+                #[cfg(not(test))]
+                let _ = rows;
+            })
+    }
+
+    /// v53.1.5 — V178's `(attested_key_id, dimension COLLATE "C")` seek, the
+    /// attested twin; the optional attester narrows in the same statement.
+    async fn list_attestations_for_dimension_prefix(
+        &self,
+        attested_key_id: &str,
+        attesting_key_id: Option<&str>,
+        dimension_prefix: &str,
+    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
+        let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> =
+            vec![Box::new(attested_key_id.to_owned())];
+        let prefix_sql = pg_dimension_prefix_clause(dimension_prefix, &mut params);
+        let attester_sql = match attesting_key_id {
+            Some(k) => {
+                params.push(Box::new(k.to_owned()));
+                format!(" AND attesting_key_id = ${}", params.len())
+            }
+            None => String::new(),
+        };
+        let sql = format!(
+            "SELECT {PG_ATTESTATION_COLUMNS} FROM cirislens.federation_attestations \
+             WHERE attested_key_id = $1 AND tier = 'federation' AND {prefix_sql}{attester_sql} \
+             ORDER BY asserted_at DESC"
+        );
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+            params.iter().map(|p| p.as_ref() as _).collect();
+        let rows = client.query(&sql, &params_ref[..]).await.map_err(|e| {
+            crate::federation::Error::Backend(format!(
+                "list_attestations_for_dimension_prefix: {e}"
+            ))
+        })?;
+        rows.into_iter()
+            .map(pg_row_to_attestation)
+            .collect::<Result<Vec<_>, _>>()
+            .inspect(|rows| {
+                #[cfg(test)]
+                crate::federation::read_probe::record(
+                    "list_attestations_for_dimension_prefix",
+                    attested_key_id,
+                    rows,
+                );
+                #[cfg(not(test))]
+                let _ = rows;
+            })
+    }
+
+    /// v53.1.5 — `list_attestations_referencing` for a SET of ids (one
+    /// `text[]` bind), with the attested / attesting axes the folds pin so
+    /// V178's `(attested_key_id, attestation_type, ref)` or V107's attesting
+    /// twin serves it as a seek.
+    async fn list_composers_referencing_any(
+        &self,
+        target_attestation_ids: &[String],
+        attested_key_id: Option<&str>,
+        attesting_key_id: Option<&str>,
+    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
+        if target_attestation_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        use crate::federation::types::attestation_type;
+        let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = vec![
+            Box::new(target_attestation_ids.to_vec()),
+            Box::new(attestation_type::WITHDRAWS.to_owned()),
+            Box::new(attestation_type::RECANTS.to_owned()),
+            Box::new(attestation_type::SUPERSEDES.to_owned()),
+        ];
+        let mut axes = String::new();
+        if let Some(k) = attested_key_id {
+            params.push(Box::new(k.to_owned()));
+            axes.push_str(&format!(" AND attested_key_id = ${}", params.len()));
+        }
+        if let Some(k) = attesting_key_id {
+            params.push(Box::new(k.to_owned()));
+            axes.push_str(&format!(" AND attesting_key_id = ${}", params.len()));
+        }
+        let sql = format!(
+            "SELECT {PG_ATTESTATION_COLUMNS} FROM cirislens.federation_attestations \
+             WHERE tier = 'federation' \
+               AND attestation_type IN ($2, $3, $4) \
+               AND (attestation_envelope::jsonb->>'references_attestation_id') = ANY($1){axes} \
+             ORDER BY asserted_at DESC"
+        );
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+            params.iter().map(|p| p.as_ref() as _).collect();
+        let rows = client.query(&sql, &params_ref[..]).await.map_err(|e| {
+            crate::federation::Error::Backend(format!("list_composers_referencing_any: {e}"))
+        })?;
+        rows.into_iter()
+            .map(pg_row_to_attestation)
+            .collect::<Result<Vec<_>, _>>()
+            .inspect(|rows| {
+                #[cfg(test)]
+                crate::federation::read_probe::record(
+                    "list_composers_referencing_any",
+                    attested_key_id.or(attesting_key_id).unwrap_or("*"),
+                    rows,
+                );
+                #[cfg(not(test))]
+                let _ = rows;
+            })
     }
 
     /// v21.0.0 (CIRISPersist#502 E7) — the revocation-folded
@@ -23288,6 +23460,39 @@ where
     Ok(())
 }
 
+/// v53.1.5 — the `federation_attestations` column list in
+/// [`pg_row_to_attestation`]'s order (`weight::float8` — see
+/// `list_attestations_for`), for the reads that build their statement.
+const PG_ATTESTATION_COLUMNS: &str = "attestation_id::text, attesting_key_id, attested_key_id, \
+    attestation_type, weight::float8 AS weight, asserted_at, expires_at, attestation_envelope, \
+    original_content_hash, scrub_signature_classical, scrub_signature_pqc, scrub_key_id, \
+    scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, \
+    withdraws_admission_rule, cohort_scope, tier, promoted_at, additional_scrubs";
+
+/// v53.1.5 — the #817/#818 dimension-prefix predicate over V106's stored
+/// column, `COLLATE "C"` so the byte range is what the V137 / V178 indexes
+/// serve; `substr` when no upper bound is representable. Pushes its params
+/// and returns the clause.
+fn pg_dimension_prefix_clause(
+    prefix: &str,
+    params: &mut Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>>,
+) -> String {
+    match crate::ceg::list::federation::dimension_prefix_bounds(prefix) {
+        Some((lo, hi)) => {
+            params.push(Box::new(lo));
+            let a = params.len();
+            params.push(Box::new(hi));
+            let b = params.len();
+            format!("(dimension COLLATE \"C\" >= ${a} AND dimension COLLATE \"C\" < ${b})")
+        }
+        None => {
+            params.push(Box::new(prefix.to_owned()));
+            let a = params.len();
+            format!("substr(dimension, 1, {}) = ${a}", prefix.chars().count())
+        }
+    }
+}
+
 fn pg_row_to_attestation(
     row: tokio_postgres::Row,
 ) -> Result<crate::federation::Attestation, crate::federation::Error> {
@@ -24776,7 +24981,7 @@ impl crate::read::ReadEngine for PostgresBackend {
             }
         }
 
-        let client = self
+        let mut client = self
             .pool
             .get()
             .await
@@ -24801,6 +25006,28 @@ impl crate::read::ReadEngine for PostgresBackend {
             where_parts.push(frag);
             params.extend(sparams);
         }
+        // v53.1.5 — two phases, the sqlite twin's shape (see
+        // `sqlite_trace_summary_plan` for the fault): phase 1 names the
+        // page's trace_ids from `(trace_id, MIN(ts))` alone; phase 2 runs
+        // the aggregate select over those ids (`= ANY($n)`, one text[]
+        // bind) under the same predicate. Phase 2's predicate + binds are
+        // fixed here, before the cursor/limit params join phase 1's.
+        let phase2_ids_p = params.len() + 1;
+        let phase2_where = {
+            let mut parts = where_parts.clone();
+            parts.push(format!("trace_id = ANY(${phase2_ids_p})"));
+            format!("WHERE {}", parts.join(" AND "))
+        };
+        let phase2_sql = format!(
+            "SELECT {select} \
+             FROM cirislens.trace_events \
+             {phase2_where} \
+             GROUP BY trace_id \
+             ORDER BY started_at DESC, trace_id DESC",
+            select = *TRACE_SUMMARY_SELECT,
+        );
+        let phase2_fixed = params.len();
+
         let where_sql = if where_parts.is_empty() {
             String::new()
         } else {
@@ -24825,29 +25052,54 @@ impl crate::read::ReadEngine for PostgresBackend {
         params.push(Box::new(limit));
         let limit_p = params.len();
 
-        let sql = format!(
-            "SELECT {select} \
+        let phase1_sql = format!(
+            "SELECT trace_id, MIN(ts) AS started_at \
              FROM cirislens.trace_events \
              {where_sql} \
              GROUP BY trace_id \
              {having_sql} \
              ORDER BY started_at DESC, trace_id DESC \
-             LIMIT ${limit_p}",
-            select = *TRACE_SUMMARY_SELECT,
+             LIMIT ${limit_p}"
         );
+
+        // One REPEATABLE READ snapshot for both phases, so an event landing
+        // between them cannot move a trace's started_at under the page.
+        let tx = client
+            .build_transaction()
+            .isolation_level(tokio_postgres::IsolationLevel::RepeatableRead)
+            .read_only(true)
+            .start()
+            .await
+            .map_err(|e| crate::read::Error::Backend(format!("list_trace_summaries begin: {e}")))?;
 
         let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
             params.iter().map(|p| p.as_ref() as _).collect();
-
-        let rows = client
-            .query(&sql, &params_ref[..])
+        let ids: Vec<String> = tx
+            .query(&phase1_sql, &params_ref[..])
             .await
-            .map_err(|e| crate::read::Error::Backend(format!("list_trace_summaries: {e}")))?;
+            .map_err(|e| crate::read::Error::Backend(format!("list_trace_summaries: {e}")))?
+            .iter()
+            .map(|r| r.safe_get_with(0, crate::read::Error::Backend))
+            .collect::<Result<_, _>>()?;
 
-        let mut items: Vec<crate::read::TraceSummary> = Vec::with_capacity(rows.len());
-        for row in &rows {
-            items.push(pg_row_to_trace_summary(row)?);
+        let mut items: Vec<crate::read::TraceSummary> = Vec::with_capacity(ids.len());
+        if !ids.is_empty() {
+            let mut phase2_params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+                params_ref[..phase2_fixed].to_vec();
+            phase2_params.push(&ids);
+            debug_assert_eq!(phase2_params.len(), phase2_ids_p);
+            let rows = tx
+                .query(&phase2_sql, &phase2_params[..])
+                .await
+                .map_err(|e| crate::read::Error::Backend(format!("list_trace_summaries: {e}")))?;
+            for row in &rows {
+                items.push(pg_row_to_trace_summary(row)?);
+            }
         }
+        // Reads only; nothing to commit, the pooled client goes back clean.
+        tx.rollback()
+            .await
+            .map_err(|e| crate::read::Error::Backend(format!("list_trace_summaries end: {e}")))?;
 
         // Cursor for next page: trailing edge of this page.
         let next_cursor = if items.len() as i64 == limit {
@@ -26136,6 +26388,12 @@ impl crate::read::ReadEngine for PostgresBackend {
         limit: i64,
         scope: crate::scope::CallerScope,
     ) -> Result<crate::read::AttestationListPage, crate::read::Error> {
+        #[cfg(test)]
+        let probe_key = filter
+            .attested_key_id
+            .clone()
+            .or_else(|| filter.attesting_key_id.clone())
+            .unwrap_or_else(|| "*".to_owned());
         if !(1..=10_000).contains(&limit) {
             return Err(crate::read::Error::InvalidArgument(format!(
                 "limit must be in [1, 10000], got {limit}"
@@ -26368,6 +26626,8 @@ impl crate::read::ReadEngine for PostgresBackend {
         } else {
             None
         };
+        #[cfg(test)]
+        crate::federation::read_probe::record("list_attestations", &probe_key, &items);
         Ok(crate::read::AttestationListPage { items, next_cursor })
     }
 
@@ -51486,5 +51746,304 @@ mod tests {
         )
         .await
         .expect("657 attestation wire-index exercise");
+    }
+
+    // ── v53.1.5 — the two-phase trace listing (I531, postgres) ─────────
+
+    /// The v53.1.4 one-statement listing, VERBATIM, as the oracle the
+    /// two-phase read is held to. See the sqlite twin for the fault.
+    async fn v53_1_4_list_trace_summaries(
+        backend: &PostgresBackend,
+        filter: crate::read::TraceFilter,
+        cursor: Option<crate::read::TraceCursor>,
+        limit: i64,
+        scope: crate::scope::CallerScope,
+    ) -> crate::read::TraceListPage {
+        let client = backend.pool.get().await.unwrap();
+        let (mut where_parts, mut params) = pg_trace_filter_parts(&filter).unwrap();
+        let (frag, sparams) = crate::store::scope_bind::scope_predicate_pg(
+            &scope,
+            "cohort_scope",
+            "cohort_target_id",
+            params.len(),
+        );
+        where_parts.push(frag);
+        params.extend(sparams);
+        let where_sql = format!("WHERE {}", where_parts.join(" AND "));
+        let having_sql = match &cursor {
+            Some(c) => {
+                params.push(Box::new(c.last_started_at));
+                let p1 = params.len();
+                params.push(Box::new(c.last_trace_id.clone()));
+                let p2 = params.len();
+                format!("HAVING (MIN(ts), MIN(trace_id)) < (${p1}, ${p2})")
+            }
+            None => String::new(),
+        };
+        params.push(Box::new(limit));
+        let limit_p = params.len();
+        let sql = format!(
+            "SELECT {select} FROM cirislens.trace_events {where_sql} GROUP BY trace_id \
+             {having_sql} ORDER BY started_at DESC, trace_id DESC LIMIT ${limit_p}",
+            select = *TRACE_SUMMARY_SELECT,
+        );
+        let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+            params.iter().map(|p| p.as_ref() as _).collect();
+        let rows = client.query(&sql, &params_ref[..]).await.unwrap();
+        let items: Vec<crate::read::TraceSummary> = rows
+            .iter()
+            .map(|r| pg_row_to_trace_summary(r).unwrap())
+            .collect();
+        let next_cursor = if items.len() as i64 == limit {
+            items
+                .last()
+                .map(|s| crate::read::TraceCursor::from_trailing(s.started_at, s.trace_id.clone()))
+        } else {
+            None
+        };
+        crate::read::TraceListPage { items, next_cursor }
+    }
+
+    /// The sqlite I531 corpus, on postgres: `n` traces, 2..=6 events each,
+    /// inserted out of ts order, trace_id order unrelated to time order,
+    /// started_at ties across traces, varied filter columns; every fifth
+    /// trace in a room, every seventh with ONE room row among federation
+    /// rows. Returns the unauthenticated-visible trace count.
+    async fn seed_i531_corpus_pg(backend: &PostgresBackend, n: usize) -> usize {
+        let base = chrono::Utc.with_ymd_and_hms(2026, 5, 1, 12, 0, 0).unwrap();
+        let mut rows = Vec::new();
+        let mut visible = 0usize;
+        let types = [
+            ReasoningEventType::ThoughtStart,
+            ReasoningEventType::DmaResults,
+            ReasoningEventType::ConscienceResult,
+            ReasoningEventType::ActionResult,
+            ReasoningEventType::IdmaResult,
+            ReasoningEventType::ThoughtStart,
+        ];
+        for i in 0..n {
+            let tid = format!("i531-{:05}", (i * 7919) % n);
+            let start = (i % 97) as i64 * 3;
+            let events = 2 + (i % 5);
+            let room_trace = i % 5 == 0;
+            let mixed_trace = !room_trace && i % 7 == 0;
+            if !room_trace {
+                visible += 1;
+            }
+            for (k, ty) in types.iter().enumerate().take(events) {
+                let k_ts = (events - 1 - k) as i64;
+                let payload = serde_json::json!({
+                    "csdma_plausibility_score": (i % 10) as f64 / 10.0,
+                    "conscience_passed": i % 3 != 0,
+                    "action_executed": "speak",
+                    "thought_depth": k,
+                });
+                let serde_json::Value::Object(payload) = payload else {
+                    unreachable!()
+                };
+                let room = room_trace || (mixed_trace && k == 0);
+                rows.push(TraceEventRow {
+                    trace_id: tid.clone(),
+                    thought_id: format!("{tid}-th{k}"),
+                    task_id: Some(format!("qa_{}", i % 11)),
+                    step_point: None,
+                    event_type: *ty,
+                    attempt_index: 0,
+                    ts: base + chrono::Duration::minutes(start + k_ts),
+                    agent_name: Some(if i % 2 == 0 { "Scout" } else { "Echo" }.to_owned()),
+                    agent_id_hash: format!("agent-{}", i % 3),
+                    cognitive_state: Some("WORK".to_owned()),
+                    trace_level: crate::schema::TraceLevel::Detailed,
+                    payload,
+                    cost_llm_calls: Some(2),
+                    cost_tokens: Some(150),
+                    cost_usd: Some((i % 13) as f64 * 0.001 + k as f64 * 0.0001),
+                    signature: "sig".to_owned(),
+                    signing_key_id: "key-1".to_owned(),
+                    signature_verified: true,
+                    verification_source: crate::store::VerificationSource::Persist,
+                    schema_version: "2.7.0".to_owned(),
+                    pii_scrubbed: false,
+                    original_content_hash: None,
+                    scrub_signature: None,
+                    scrub_key_id: None,
+                    scrub_timestamp: None,
+                    admitted_at: None,
+                    scrub_ner_ran: None,
+                    scrub_applied_trace_level: None,
+                    scrub_model_digest: None,
+                    agent_role: Some("ally".to_owned()),
+                    agent_template: Some("ally-v3".to_owned()),
+                    deployment_domain: Some(format!("dom-{}", i % 4)),
+                    deployment_type: Some("production".to_owned()),
+                    deployment_region: Some("us-east".to_owned()),
+                    deployment_trust_mode: None,
+                    cohort_scope: if room { "community" } else { "federation" }.to_owned(),
+                    cohort_target_id: room.then(|| "room-i531".to_owned()),
+                    signature_ml_dsa_65: None,
+                    pubkey_ml_dsa_65: None,
+                    pqc_key_id: None,
+                });
+            }
+        }
+        let total = rows.len();
+        let report = backend.insert_trace_events_batch(&rows).await.unwrap();
+        assert_eq!(report.inserted, total, "every corpus row lands");
+        visible
+    }
+
+    async fn assert_same_page_pg(
+        backend: &PostgresBackend,
+        filter: crate::read::TraceFilter,
+        cursor: Option<crate::read::TraceCursor>,
+        limit: i64,
+        scope: crate::scope::CallerScope,
+        label: &str,
+    ) -> crate::read::TraceListPage {
+        use crate::read::ReadEngine;
+        let reference = v53_1_4_list_trace_summaries(
+            backend,
+            filter.clone(),
+            cursor.clone(),
+            limit,
+            scope.clone(),
+        )
+        .await;
+        let page = backend
+            .list_trace_summaries(filter, cursor, limit, scope)
+            .await
+            .unwrap();
+        assert_eq!(
+            page.items.len(),
+            reference.items.len(),
+            "{label}: page length differs from the v53.1.4 statement"
+        );
+        for (a, b) in page.items.iter().zip(reference.items.iter()) {
+            assert_eq!(
+                a, b,
+                "{label}: a summary differs from the v53.1.4 statement"
+            );
+        }
+        assert_eq!(
+            page.next_cursor, reference.next_cursor,
+            "{label}: next_cursor differs from the v53.1.4 statement"
+        );
+        page
+    }
+
+    /// I531 (postgres) — the two-phase read returns exactly the pages the
+    /// v53.1.4 statement returned, on a database of this test's own so the
+    /// default-filter pages and the walk's count are the corpus and nothing
+    /// else.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn i531_two_phase_listing_matches_the_v53_1_4_statement_pg() {
+        let Some(dsn) = pg_isolated_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let visible = seed_i531_corpus_pg(&backend, 300).await;
+        let unauth = crate::scope::CallerScope::Unauthenticated;
+        let room = crate::scope::CallerScope::Authenticated {
+            admission: crate::scope::admission::CallerAdmission::for_test(
+                "reader-occ",
+                "reader-id",
+                [],
+                ["room-i531".to_string()],
+            ),
+        };
+
+        for limit in [1, 7, 500] {
+            let page = assert_same_page_pg(
+                &backend,
+                crate::read::TraceFilter::default(),
+                None,
+                limit,
+                unauth.clone(),
+                &format!("default filter, limit {limit}"),
+            )
+            .await;
+            assert_eq!(
+                page.items.len(),
+                usize::try_from(limit).unwrap().min(visible)
+            );
+        }
+        assert_same_page_pg(
+            &backend,
+            crate::read::TraceFilter {
+                agent_id_hash: Some("agent-1".to_owned()),
+                ..Default::default()
+            },
+            None,
+            50,
+            unauth.clone(),
+            "agent filter",
+        )
+        .await;
+        assert_same_page_pg(
+            &backend,
+            crate::read::TraceFilter {
+                deployment_domain: Some("dom-2".to_owned()),
+                agent_name: Some("Scout".to_owned()),
+                ..Default::default()
+            },
+            None,
+            500,
+            unauth.clone(),
+            "domain + name filter",
+        )
+        .await;
+        let base = chrono::Utc.with_ymd_and_hms(2026, 5, 1, 12, 0, 0).unwrap();
+        assert_same_page_pg(
+            &backend,
+            crate::read::TraceFilter {
+                time_window: Some(crate::read::TimeWindow {
+                    since: base + chrono::Duration::minutes(30),
+                    until: base + chrono::Duration::minutes(120),
+                }),
+                ..Default::default()
+            },
+            None,
+            500,
+            unauth.clone(),
+            "time window",
+        )
+        .await;
+
+        let mut cursor = None;
+        let mut seen = 0usize;
+        let mut pages = 0usize;
+        loop {
+            let page = assert_same_page_pg(
+                &backend,
+                crate::read::TraceFilter::default(),
+                cursor.clone(),
+                7,
+                unauth.clone(),
+                &format!("walk page {pages}"),
+            )
+            .await;
+            seen += page.items.len();
+            pages += 1;
+            match page.next_cursor {
+                Some(c) => cursor = Some(c),
+                None => break,
+            }
+        }
+        assert_eq!(seen, visible, "the walk reaches every visible trace once");
+        assert_eq!(pages, visible.div_ceil(7) + usize::from(visible % 7 == 0));
+
+        let page = assert_same_page_pg(
+            &backend,
+            crate::read::TraceFilter::default(),
+            None,
+            500,
+            room,
+            "room reader",
+        )
+        .await;
+        assert_eq!(page.items.len(), 300, "the room reader sees every trace");
     }
 }

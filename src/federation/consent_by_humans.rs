@@ -187,36 +187,49 @@ pub async fn resolve_scoped_stance_by_principals(
     qualifier: Option<&str>,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<super::consent::ScopedStance, Error> {
-    let mut folded = vec![
-        directory
-            .resolve_scoped_stance(target_key_id, subject_key_id, scope, qualifier, now)
-            .await?,
-    ];
+    // v53.1.5 — ONE bounded read for every principal (the subject and each
+    // steward), shared by the subject's own fold and the per-steward folds;
+    // before this cut the target's whole slice was read twice per call (the
+    // default `resolve_scoped_stance`, then again here) and cloned once per
+    // steward. The subject's stance is the same body the default
+    // `resolve_scoped_stance` runs, over the same rows.
     let stewards = super::admission::steward_bindings_of(directory, subject_key_id).await?;
-    if !stewards.is_empty() {
-        // The steward's universe for `k`: only the rows that name `k`. Rows
-        // that do not are removed from the universe, not merely out-sorted,
-        // so a human's blanket-looking row never governs a machine it did not
-        // name. Composers (withdraws/recants/supersedes) are kept: they carry
-        // no `for_key_id` and the fold reads them for retraction only.
-        let rows = directory.list_attestations_for(target_key_id).await?;
-        for p in &stewards {
-            if p == subject_key_id {
-                continue;
-            }
-            let universe: Vec<super::Attestation> = rows
-                .iter()
-                .filter(|a| {
-                    a.attesting_key_id != *p
-                        || super::precedence::is_structural_composer(&a.attestation_type)
-                        || for_key_id_of(&a.attestation_envelope) == Some(subject_key_id)
-                })
-                .cloned()
-                .collect();
-            folded.push(super::consent::fold_scoped_stance(
-                &universe, p, now, scope, qualifier,
-            ));
+    let mut principals: Vec<&str> = vec![subject_key_id];
+    principals.extend(
+        stewards
+            .iter()
+            .map(String::as_str)
+            .filter(|p| *p != subject_key_id),
+    );
+    let rows = super::consent::scoped_fold_rows(directory, target_key_id, &principals).await?;
+    let refs: Vec<&super::Attestation> = rows.iter().collect();
+    let mut folded = vec![super::consent::fold_scoped_stance_refs(
+        &refs,
+        subject_key_id,
+        now,
+        scope,
+        qualifier,
+    )];
+    // The steward's universe for `k`: only the rows that name `k`. Rows
+    // that do not are removed from the universe, not merely out-sorted,
+    // so a human's blanket-looking row never governs a machine it did not
+    // name. Composers (withdraws/recants/supersedes) are kept: they carry
+    // no `for_key_id` and the fold reads them for retraction only.
+    for p in &stewards {
+        if p == subject_key_id {
+            continue;
         }
+        let universe: Vec<&super::Attestation> = rows
+            .iter()
+            .filter(|a| {
+                a.attesting_key_id != *p
+                    || super::precedence::is_structural_composer(&a.attestation_type)
+                    || for_key_id_of(&a.attestation_envelope) == Some(subject_key_id)
+            })
+            .collect();
+        folded.push(super::consent::fold_scoped_stance_refs(
+            &universe, p, now, scope, qualifier,
+        ));
     }
     let stances: Vec<ConsentState> = folded.iter().map(|s| s.state).collect();
     Ok(super::consent::ScopedStance {

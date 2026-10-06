@@ -495,6 +495,12 @@ pub mod replication;
 pub mod replication_audience;
 #[cfg(test)]
 pub mod replication_audience_invariants;
+// v53.1.5 — the bounded reads behind the audience resolver and the consent
+// fold, held to their v53.1.4 whole-slice bodies.
+#[cfg(test)]
+pub mod audience_scan_invariants;
+#[cfg(test)]
+pub mod read_probe;
 pub mod replication_policy;
 pub mod rooting;
 // v25.1.0 (CIRISPersist#570 ask 5) — quarantine: withhold from serving.
@@ -3293,6 +3299,95 @@ pub trait FederationDirectory: Send + Sync {
     /// "which keys does K vouch for?"). Ordered by `asserted_at` DESC.
     async fn list_attestations_by(&self, attesting_key_id: &str)
         -> Result<Vec<Attestation>, Error>;
+
+    /// v53.1.5 — the federation-tier rows `attesting_key_id` authored whose
+    /// envelope `dimension` starts with `dimension_prefix` (a byte prefix —
+    /// the #817/#818 half-open range, never `LIKE`). Ordered by `asserted_at`
+    /// DESC. The bounded read behind
+    /// [`replication_audience::owner_allow_list`]: an owner's
+    /// `consent:replication:v1` grants without every row the owner ever
+    /// authored. Served by V137's `(attesting_key_id, dimension)`.
+    async fn list_attestations_by_dimension_prefix(
+        &self,
+        attesting_key_id: &str,
+        dimension_prefix: &str,
+    ) -> Result<Vec<Attestation>, Error> {
+        // Pin-compatible default: today's semantics over the unbounded read.
+        // memory / sqlite / postgres override with the indexed seek.
+        Ok(self
+            .list_attestations_by(attesting_key_id)
+            .await?
+            .into_iter()
+            .filter(|a| {
+                admission::envelope_dimension(&a.attestation_envelope)
+                    .is_some_and(|d| d.starts_with(dimension_prefix))
+            })
+            .collect())
+    }
+
+    /// v53.1.5 — the federation-tier rows attested TO `attested_key_id`
+    /// whose envelope `dimension` starts with `dimension_prefix`, optionally
+    /// only those `attesting_key_id` authored. Ordered by `asserted_at` DESC.
+    /// The bounded read behind the consent fold
+    /// ([`consent::scoped_fold_rows`]: a principal's `consent:state:*` rows
+    /// about the target) and [`replication_audience::is_public_group`] (a
+    /// group's `trust:charter:v1` rows). Served by V178's
+    /// `(attested_key_id, dimension)`.
+    async fn list_attestations_for_dimension_prefix(
+        &self,
+        attested_key_id: &str,
+        attesting_key_id: Option<&str>,
+        dimension_prefix: &str,
+    ) -> Result<Vec<Attestation>, Error> {
+        // Pin-compatible default: today's semantics over the unbounded read.
+        // memory / sqlite / postgres override with the indexed seek.
+        Ok(self
+            .list_attestations_for(attested_key_id)
+            .await?
+            .into_iter()
+            .filter(|a| {
+                attesting_key_id.is_none_or(|k| a.attesting_key_id == k)
+                    && admission::envelope_dimension(&a.attestation_envelope)
+                        .is_some_and(|d| d.starts_with(dimension_prefix))
+            })
+            .collect())
+    }
+
+    /// v53.1.5 — every federation-tier STRUCTURAL COMPOSER (`withdraws` /
+    /// `recants` / `supersedes`) whose envelope `references_attestation_id`
+    /// names one of `target_attestation_ids`, optionally only those attested
+    /// to `attested_key_id` and/or authored by `attesting_key_id`. Ordered by
+    /// `asserted_at` DESC; empty for no ids. [`Self::list_attestations_referencing`]
+    /// for a SET of targets with the axes the retraction folds pin: a
+    /// composer that retires a row about T is itself attested to T (the
+    /// consent fold, the charter check), and an owner retires their own grant
+    /// under their own key (the allow list). Served by V107's
+    /// `(attesting_key_id, attestation_type, ref)` and V178's attested twin.
+    async fn list_composers_referencing_any(
+        &self,
+        target_attestation_ids: &[String],
+        attested_key_id: Option<&str>,
+        attesting_key_id: Option<&str>,
+    ) -> Result<Vec<Attestation>, Error> {
+        // Pin-compatible default: today's semantics over the unbounded reads
+        // (one `list_attestations_referencing` per id, then the axes).
+        // memory / sqlite / postgres override with the indexed seek.
+        let mut out = Vec::new();
+        for id in target_attestation_ids {
+            for a in self.list_attestations_referencing(id).await? {
+                if attested_key_id.is_none_or(|k| a.attested_key_id == k)
+                    && attesting_key_id.is_none_or(|k| a.attesting_key_id == k)
+                    && !out
+                        .iter()
+                        .any(|b: &Attestation| b.attestation_id == a.attestation_id)
+                {
+                    out.push(a);
+                }
+            }
+        }
+        out.sort_by_key(|a| std::cmp::Reverse(a.asserted_at));
+        Ok(out)
+    }
 
     /// v21.0.0 (CIRISPersist#502 E7) — the revocation-folded
     /// `consent_peer_set` projection (V109): `node_key_id`'s LIVE
@@ -8508,7 +8603,9 @@ pub trait FederationDirectory: Send + Sync {
         subject_key_id: &str,
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<hard_case::ConsentState, Error> {
-        let rows = self.list_attestations_for(target_key_id).await?;
+        // v53.1.5 — the rows the fold can use, not every row about the
+        // target (see `consent::scoped_fold_rows`).
+        let rows = consent::scoped_fold_rows(self, target_key_id, &[subject_key_id]).await?;
         Ok(consent::fold_stance(&rows, subject_key_id, now, None))
     }
 
@@ -8575,7 +8672,9 @@ pub trait FederationDirectory: Send + Sync {
         qualifier: Option<&str>,
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<consent::ScopedStance, Error> {
-        let rows = self.list_attestations_for(target_key_id).await?;
+        // v53.1.5 — the rows the fold can use, not every row about the
+        // target (see `consent::scoped_fold_rows`).
+        let rows = consent::scoped_fold_rows(self, target_key_id, &[subject_key_id]).await?;
         Ok(consent::fold_scoped_stance(
             &rows,
             subject_key_id,

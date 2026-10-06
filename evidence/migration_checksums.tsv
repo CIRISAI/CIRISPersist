@@ -331,3 +331,7 @@ sqlite	176	dag_chunk_links	8861214511825214801
 postgres	176	dag_chunk_links	12453302178328937307
 sqlite	177	blob_group_key_id	9363724209484060146
 postgres	177	blob_group_key_id	12164941800565710765
+sqlite	178	attested_seek_indexes	15694997860845734773
+sqlite	179	trace_events_trace_ts_scope	18024954084176412140
+postgres	178	attested_seek_indexes	635513950952769989
+postgres	179	trace_events_trace_ts_scope	2025525238819942285

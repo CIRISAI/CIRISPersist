@@ -4615,6 +4615,8 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             .collect();
         // Match postgres ORDER BY asserted_at DESC.
         rows.sort_by_key(|a| std::cmp::Reverse(a.asserted_at));
+        #[cfg(test)]
+        crate::federation::read_probe::record("list_attestations_for", attested_key_id, &rows);
         Ok(rows)
     }
 
@@ -4635,6 +4637,105 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             .cloned()
             .collect();
         rows.sort_by_key(|a| std::cmp::Reverse(a.asserted_at));
+        #[cfg(test)]
+        crate::federation::read_probe::record("list_attestations_by", attesting_key_id, &rows);
+        Ok(rows)
+    }
+
+    /// v53.1.5 — the same predicate the SQL backends seek: top-level
+    /// envelope `dimension`, byte prefix.
+    async fn list_attestations_by_dimension_prefix(
+        &self,
+        attesting_key_id: &str,
+        dimension_prefix: &str,
+    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        let mut rows: Vec<_> = state
+            .federation_attestations
+            .iter()
+            .filter(|a| {
+                a.attesting_key_id == attesting_key_id
+                    && a.tier == crate::federation::types::attestation_tier::FEDERATION
+                    && crate::federation::admission::envelope_dimension(&a.attestation_envelope)
+                        .is_some_and(|d| d.starts_with(dimension_prefix))
+            })
+            .cloned()
+            .collect();
+        rows.sort_by_key(|a| std::cmp::Reverse(a.asserted_at));
+        #[cfg(test)]
+        crate::federation::read_probe::record(
+            "list_attestations_by_dimension_prefix",
+            attesting_key_id,
+            &rows,
+        );
+        Ok(rows)
+    }
+
+    async fn list_attestations_for_dimension_prefix(
+        &self,
+        attested_key_id: &str,
+        attesting_key_id: Option<&str>,
+        dimension_prefix: &str,
+    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        let mut rows: Vec<_> = state
+            .federation_attestations
+            .iter()
+            .filter(|a| {
+                a.attested_key_id == attested_key_id
+                    && a.tier == crate::federation::types::attestation_tier::FEDERATION
+                    && attesting_key_id.is_none_or(|k| a.attesting_key_id == k)
+                    && crate::federation::admission::envelope_dimension(&a.attestation_envelope)
+                        .is_some_and(|d| d.starts_with(dimension_prefix))
+            })
+            .cloned()
+            .collect();
+        rows.sort_by_key(|a| std::cmp::Reverse(a.asserted_at));
+        #[cfg(test)]
+        crate::federation::read_probe::record(
+            "list_attestations_for_dimension_prefix",
+            attested_key_id,
+            &rows,
+        );
+        Ok(rows)
+    }
+
+    async fn list_composers_referencing_any(
+        &self,
+        target_attestation_ids: &[String],
+        attested_key_id: Option<&str>,
+        attesting_key_id: Option<&str>,
+    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
+        use crate::federation::types::attestation_type as at;
+        if target_attestation_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let state = self.state.lock().expect("memory backend lock");
+        let mut rows: Vec<_> = state
+            .federation_attestations
+            .iter()
+            .filter(|a| {
+                a.tier == crate::federation::types::attestation_tier::FEDERATION
+                    && matches!(
+                        a.attestation_type.as_str(),
+                        at::WITHDRAWS | at::RECANTS | at::SUPERSEDES
+                    )
+                    && attested_key_id.is_none_or(|k| a.attested_key_id == k)
+                    && attesting_key_id.is_none_or(|k| a.attesting_key_id == k)
+                    && crate::federation::precedence::references_attestation_id_from_envelope(
+                        &a.attestation_envelope,
+                    )
+                    .is_some_and(|r| target_attestation_ids.iter().any(|t| t == r))
+            })
+            .cloned()
+            .collect();
+        rows.sort_by_key(|a| std::cmp::Reverse(a.asserted_at));
+        #[cfg(test)]
+        crate::federation::read_probe::record(
+            "list_composers_referencing_any",
+            attested_key_id.or(attesting_key_id).unwrap_or("*"),
+            &rows,
+        );
         Ok(rows)
     }
 

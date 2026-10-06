@@ -57,6 +57,13 @@ from pathlib import Path
 # predating this list, tracked separately rather than resolved by a sweep that
 # cannot tell a leaf from a composition.
 DELEGATED_DEFAULTS = (
+    # v53.1.5 — NOT here: `list_attestations_by_dimension_prefix`,
+    # `list_attestations_for_dimension_prefix` and
+    # `list_composers_referencing_any` are provided COMPOSITIONS over the
+    # delegated leaves (`list_attestations_by` / `_for` / `_referencing`),
+    # so through the double they run the pin-compatible default — which is
+    # exactly the pre-53.1.5 implementor I539 witnesses, and a fault on a
+    # leaf is observed.
     "insert_known_wire_hash",
     "known_wire_hash_contains",
     "list_known_wire_hashes_since",
