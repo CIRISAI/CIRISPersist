@@ -1661,12 +1661,24 @@ mod runners {
                                 .await
                         }
                     };
+                    // A scale MEASUREMENT (~4 min to seed at the canonical's
+                    // sizes): run with `--ignored`. The bounded-read property
+                    // itself is gated in every run by I535.
+                    (measure $name:ident, $body:ident) => {
+                        #[tokio::test]
+                        #[ignore = "scale measurement at the canonical's sizes; run with --ignored"]
+                        async fn $name() {
+                            let Some(d) = $fresh.await else { return };
+                            super::super::bodies::$body(&d as &dyn FederationDirectory, &suffix())
+                                .await
+                        }
+                    };
                 }
                 case!(i533, i533_owner_allow_list_matches_the_whole_slice_body);
                 case!(i534, i534_is_public_group_matches_the_whole_slice_body);
                 case!(i535, i535_the_bounded_reads_never_touch_the_whole_slice);
                 case!(i536, i536_consent_doors_match_the_whole_slice_bodies);
-                case!(i537, i537_sized_reads_are_bounded_by_the_set_the_fold_uses);
+                case!(measure i537, i537_sized_reads_are_bounded_by_the_set_the_fold_uses);
             }
         };
     }
@@ -1744,6 +1756,7 @@ mod runners {
     /// backend does not serve: sqlite and postgres.
     #[cfg(feature = "sqlite")]
     #[tokio::test]
+    #[ignore = "scale measurement at the canonical's sizes (~4 min to seed); run with --ignored"]
     async fn i538_sqlite() {
         use crate::store::Backend as _;
         let b = crate::store::sqlite::SqliteBackend::open_in_memory()
@@ -1756,6 +1769,7 @@ mod runners {
 
     #[cfg(feature = "postgres")]
     #[tokio::test]
+    #[ignore = "scale measurement at the canonical's sizes (~4 min to seed); run with --ignored"]
     async fn i538_postgres() {
         use crate::store::Backend as _;
         let Some(dsn) = crate::test_pg::empty_dsn() else {
