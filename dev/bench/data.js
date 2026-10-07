@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1791203310341,
+  "lastUpdate": 1791340160171,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -102485,6 +102485,420 @@ window.BENCHMARK_DATA = {
             "name": "projection_for/publish_sweep",
             "value": 173,
             "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "projection_for/self_live",
+            "value": 0,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "projection_for/unrecognized_scope",
+            "value": 0,
+            "range": "± 0",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "954b598f532aa4a7b386f653633830e5fc2aea32",
+          "message": "v53.1.6 — four more bounded reads named by Edge's heap harness\n\npersist v53.1.6 — four more bounded reads named by CIRISEdge's heap harness: send sets read each owner's grants once, group invitees by the group's own proposals, delegation granters by the subject's incoming edges (and the config renewal check), custody acks by (device, blob) via V180. Pin-compatible with v53.1.5 adopters.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\nClaude-Session: https://claude.ai/code/session_01CLCD1C3iwKwvsUQzCyAmmg",
+          "timestamp": "2026-10-06T20:54:45-05:00",
+          "tree_id": "8c32cf43152a91c6f2763a22830276e6d3ffc491",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/954b598f532aa4a7b386f653633830e5fc2aea32"
+        },
+        "date": 1791340157987,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "calibration/splitmix64_10m",
+            "value": 28918609,
+            "range": "± 561687",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "calibration/dram_random_walk_500k",
+            "value": 1171126,
+            "range": "± 67089",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/1",
+            "value": 9498,
+            "range": "± 33",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 15072,
+            "range": "± 54",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 25724,
+            "range": "± 82",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 75369,
+            "range": "± 201",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 5,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 26,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 137,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 435,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 493,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 1601,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 6,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 77,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 243,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 1092,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 10,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 38222,
+            "range": "± 3571",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 77793,
+            "range": "± 5287",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 237193,
+            "range": "± 3776",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/1",
+            "value": 9430,
+            "range": "± 617",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/2",
+            "value": 10661,
+            "range": "± 720",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/8",
+            "value": 13727,
+            "range": "± 4662",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/32",
+            "value": 22210,
+            "range": "± 1438",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "engine_cold_start/sqlite_open_and_migrate",
+            "value": 8178673,
+            "range": "± 179001",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/1000",
+            "value": 1920485,
+            "range": "± 13411",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/1000",
+            "value": 384031,
+            "range": "± 15247",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/1000",
+            "value": 1158538,
+            "range": "± 15590",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/10000",
+            "value": 7356684,
+            "range": "± 77554",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/10000",
+            "value": 2584333,
+            "range": "± 72578",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/10000",
+            "value": 11439024,
+            "range": "± 173229",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/25000",
+            "value": 17824997,
+            "range": "± 568827",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/25000",
+            "value": 6904288,
+            "range": "± 571678",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/25000",
+            "value": 36164697,
+            "range": "± 797875",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/list_scores_seek/1000",
+            "value": 60328,
+            "range": "± 176",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/list_attestation_log_subject_seek/1000",
+            "value": 154213,
+            "range": "± 1690",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/list_attestation_log_full_walk/1000",
+            "value": 181658,
+            "range": "± 1396",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/list_scores_seek/4000",
+            "value": 924540,
+            "range": "± 22544",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/list_attestation_log_subject_seek/4000",
+            "value": 177345,
+            "range": "± 2085",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/list_attestation_log_full_walk/4000",
+            "value": 288683,
+            "range": "± 1447",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/list_scores_seek/16000",
+            "value": 14814818,
+            "range": "± 188491",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/list_attestation_log_subject_seek/16000",
+            "value": 273096,
+            "range": "± 2613",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/list_attestation_log_full_walk/16000",
+            "value": 712452,
+            "range": "± 2633",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/resolve_scores_fold/256",
+            "value": 60700,
+            "range": "± 186",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/resolve_scores_fold/1024",
+            "value": 257607,
+            "range": "± 6607",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/resolve_scores_fold/4096",
+            "value": 1429842,
+            "range": "± 4053",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/resolve_scores_fold/8192",
+            "value": 1715107,
+            "range": "± 6709",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "secrets_encrypt/64",
+            "value": 6,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "secrets_encrypt/1024",
+            "value": 10,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "secrets_encrypt/16384",
+            "value": 64,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "secrets_decrypt/64",
+            "value": 5,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "secrets_decrypt/1024",
+            "value": 9,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "secrets_decrypt/16384",
+            "value": 56,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/register_occurrence",
+            "value": 224390,
+            "range": "± 12838",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/heartbeat_occurrence",
+            "value": 203814,
+            "range": "± 8683",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/10",
+            "value": 9477,
+            "range": "± 94",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/100",
+            "value": 61663,
+            "range": "± 2512",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/1000",
+            "value": 537922,
+            "range": "± 6874",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/block_on_noop",
+            "value": 1,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/spawn_blocking_noop",
+            "value": 591,
+            "range": "± 19",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/raw_sqlite_write",
+            "value": 82,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/next_sequence_full",
+            "value": 179,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "projection_for/publish_sweep",
+            "value": 111,
+            "range": "± 0",
             "unit": "ns/iter"
           },
           {
