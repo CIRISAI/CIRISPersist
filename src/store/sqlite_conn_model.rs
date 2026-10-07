@@ -373,9 +373,9 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     // v53.1.6 — the type / citation / targeted seeks (V178, V180, V150).
     ("list_attestations_for_type", ConnClass::Read),
     ("list_attestations_by_type", ConnClass::Read),
-    // v53.1.7 — the trust-root walks' typed, job-filtered reads (V178 / V107).
-    ("list_attestations_for_types", ConnClass::Read),
-    ("list_attestations_by_types", ConnClass::Read),
+    // v53.1.7 — the trust-root walks' typed, job-filtered reads (V178 / V107):
+    // `list_attestations_for_types` / `_by_types` share this body.
+    ("sqlite_typed_read", ConnClass::Read),
     ("list_attestations_by_dimension_citing", ConnClass::Read),
     ("list_targeted_by_dimension_prefix", ConnClass::Read),
     ("list_attestations_for_migration", ConnClass::Read),
