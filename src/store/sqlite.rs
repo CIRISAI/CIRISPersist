@@ -2431,12 +2431,9 @@ impl SqliteBackend {
         key: &str,
         attestation_types: &[&str],
         excluded_dimensions: &[&str],
-    ) -> (
-        Result<Vec<crate::federation::Attestation>, rusqlite::Error>,
-        u64,
-    ) {
+    ) -> Result<(Vec<crate::federation::Attestation>, u64), rusqlite::Error> {
         if attestation_types.is_empty() {
-            return (Ok(Vec::new()), 0);
+            return Ok((Vec::new(), 0));
         }
         let sql = sqlite_attestations_typed_sql(
             key_column,
@@ -2448,15 +2445,17 @@ impl SqliteBackend {
             .chain(excluded_dimensions.iter().copied())
             .map(|v| SqlValue::Text(v.to_owned()))
             .collect();
-        self.read_measured(
-            move |conn| -> Result<Vec<crate::federation::Attestation>, rusqlite::Error> {
-                let mut stmt = conn.prepare(&sql)?;
-                let rows =
-                    stmt.query_map(params_from_iter(binds.iter()), sqlite_row_to_attestation)?;
-                rows.collect()
-            },
-        )
-        .await
+        let (rows, bytes) = self
+            .read_measured(
+                move |conn| -> Result<Vec<crate::federation::Attestation>, rusqlite::Error> {
+                    let mut stmt = conn.prepare(&sql)?;
+                    let rows =
+                        stmt.query_map(params_from_iter(binds.iter()), sqlite_row_to_attestation)?;
+                    rows.collect()
+                },
+            )
+            .await;
+        Ok((rows?, bytes))
     }
 
     /// #226 (V094) — assign `shard_key` to legacy `trace_events` rows that
@@ -6028,10 +6027,10 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                 attestation_types,
                 excluded_dimensions,
             )
-            .await;
-        let rows = rows.map_err(|e| {
-            crate::federation::Error::Backend(format!("list_attestations_for_types: {e}"))
-        })?;
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("list_attestations_for_types: {e}"))
+            })?;
         crate::observe::record_read(
             crate::observe::StoreBackend::Sqlite,
             crate::observe::Door::ListAttestationsForTypes,
@@ -6057,10 +6056,10 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                 attestation_types,
                 excluded_dimensions,
             )
-            .await;
-        let rows = rows.map_err(|e| {
-            crate::federation::Error::Backend(format!("list_attestations_by_types: {e}"))
-        })?;
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("list_attestations_by_types: {e}"))
+            })?;
         crate::observe::record_read(
             crate::observe::StoreBackend::Sqlite,
             crate::observe::Door::ListAttestationsByTypes,
