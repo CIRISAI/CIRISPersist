@@ -9053,6 +9053,28 @@ impl Engine {
         .await
     }
 
+    /// v53.1.8 (CIRISPersist#1013) — the consent-before-scoring stance, the
+    /// one fold the emit gate asks: by principals, scope `analyze:<family>`.
+    /// A scorer's precheck calls this and gets the gate's answer. See
+    /// [`consent_by_humans::capacity_consent_stance`](crate::federation::consent_by_humans::capacity_consent_stance).
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn capacity_consent_stance(
+        &self,
+        attester_key_id: &str,
+        subject_key_id: &str,
+        family: crate::federation::admission::ConsentGatedFamily,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<crate::federation::hard_case::ConsentState, crate::federation::Error> {
+        crate::federation::consent_by_humans::capacity_consent_stance(
+            self.federation_directory().as_ref(),
+            attester_key_id,
+            subject_key_id,
+            family,
+            now,
+        )
+        .await
+    }
+
     /// v44.8.0 (CIRISPersist#866 C1b) — [`Self::resolve_scoped_consent_by_principals`]
     /// WITH its bound: `retain_until` is the tightest `retain:<window>` any
     /// principal signed for this machine. The door a sweep asks before it

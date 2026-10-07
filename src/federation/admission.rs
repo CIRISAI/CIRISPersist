@@ -4041,6 +4041,22 @@ impl ConsentGatedFamily {
     /// Every variant, in declaration order — the closed set, for exhaustive
     /// gates and for a consumer enumerating the taxonomy it must handle.
     pub const ALL: &'static [Self] = &[Self::Capacity];
+
+    /// v53.1.8 (CIRISPersist#1013) — the variant whose [`Self::as_str`] is
+    /// `token`, or `None`. The inverse an FFI caller crosses with.
+    #[must_use]
+    pub fn from_token(token: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|f| f.as_str() == token)
+    }
+
+    /// v44.8.0 (CIRISPersist#866 C1) — the consent scope the gate asks for
+    /// this family, `analyze:<family>`. A bare `analyze` grant covers it; a
+    /// grant narrowed to another family does not. Spelled once (#1013) so the
+    /// gate, the fold and the refusal name the same scope.
+    #[must_use]
+    pub fn analyze_scope(&self) -> String {
+        format!("{ANALYZE_CONSENT_SCOPE}:{}", self.as_str())
+    }
 }
 
 impl std::fmt::Display for ConsentGatedFamily {
@@ -4318,28 +4334,34 @@ pub struct ConsentGateRefused {
     pub subject_key_id: String,
     /// P — the attester who tried to publish the claim.
     pub attester_key_id: String,
-    /// What [`resolve_scoped_consent`](super::FederationDirectory::resolve_scoped_consent)
-    /// resolved for (S → P, [`ANALYZE_CONSENT_SCOPE`]). Never `Granted` —
-    /// that is the admit path.
+    /// What [`capacity_consent_stance`](super::consent_by_humans::capacity_consent_stance)
+    /// resolved for (S → P, [`ConsentGatedFamily::analyze_scope`]). Never
+    /// `Granted` — that is the admit path.
     pub stance: super::hard_case::ConsentState,
 }
 
 impl std::fmt::Display for ConsentGateRefused {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // v53.1.8 (CIRISPersist#1013) — the scope the gate ASKED
+        // (`analyze:<family>`), derived from `family` rather than carried in a
+        // new field: the struct is exhaustive and public, and a field would
+        // break an out-of-crate constructor in a pin-compatible patch.
         write!(
             f,
             "no live consent covers this {dimension} emission ({family} rule): subject \
              {subject} has not granted attester {attester} the \"{scope}\" scope (resolved \
              stance: {stance:?}) — a party MUST NOT emit a score that judges a subject unless a \
-             live consent:scope:{scope} from that subject covers the attester \
-             (CIRISConstitution#46, ratified at CC 3.4.5). The subject authorizes it with a \
+             live consent covering \"{scope}\" from that subject, or from a steward naming it, \
+             covers the attester (CIRISConstitution#46, ratified at CC 3.4.5). The subject (or \
+             its steward, with for_key_id naming the subject) authorizes it with a \
              `{granted}:v1` row whose attested_key_id is the attester and whose envelope names \
-             scope \"{scope}\".",
+             scope \"{bare}\" or \"{scope}\".",
             dimension = self.dimension,
             family = self.family,
             subject = self.subject_key_id,
             attester = self.attester_key_id,
-            scope = ANALYZE_CONSENT_SCOPE,
+            scope = self.family.analyze_scope(),
+            bare = ANALYZE_CONSENT_SCOPE,
             stance = self.stance,
             granted = super::consent::consent_dimension::STATE_GRANTED_PREFIX,
         )
@@ -4399,6 +4421,13 @@ impl From<ConsentGateRefused> for Error {
 /// expiry-aware, a grant must name its scope exactly, a scope-less
 /// revocation is blanket. A bespoke parallel lookup here would be the
 /// two-lists-that-disagree class (#541); there is one list.
+///
+/// Since v53.1.8 (CIRISPersist#1013) that fold is taken BY PRINCIPALS
+/// ([`capacity_consent_stance`](super::consent_by_humans::capacity_consent_stance)):
+/// a steward's row naming S in `for_key_id` is S's consent too (#857), and a
+/// scorer's precheck asks the same function, so precheck and gate cannot
+/// disagree. Through v53.1.7 the gate folded S's own rows only and refused
+/// every machine whose sole grant was its steward's.
 ///
 /// # Scope — what it deliberately does NOT catch
 ///
@@ -4496,16 +4525,18 @@ pub async fn check_capacity_consent_admission(
     // narrowed to THIS family covers it, and a grant narrowed to another
     // family does not. The subject may consent to be scored on capacity and
     // nothing else, and the gate honours exactly that.
-    let query = format!("{}:{}", ANALYZE_CONSENT_SCOPE, claim.family.as_str());
-    let stance = directory
-        .resolve_scoped_consent(
-            &row.attesting_key_id, // the consent edge points AT the attester P
-            &row.attested_key_id,  // and is authored BY the subject S
-            &query,
-            None,
-            chrono::Utc::now(),
-        )
-        .await?;
+    //
+    // v53.1.8 (CIRISPersist#1013) — by principals (#857): a steward's grant
+    // naming the subject in `for_key_id` counts, as it does in a scorer's
+    // precheck, because both now ask the one fold.
+    let stance = super::consent_by_humans::capacity_consent_stance(
+        directory,
+        &row.attesting_key_id,
+        &row.attested_key_id,
+        claim.family,
+        chrono::Utc::now(),
+    )
+    .await?;
     if stance == super::hard_case::ConsentState::Granted {
         return Ok(());
     }
@@ -17595,7 +17626,7 @@ mod tests {
         for needle in [
             "capacity:core_identity:v1",
             "capacity",
-            ANALYZE_CONSENT_SCOPE,
+            "\"analyze:capacity\" scope",
             "Unspecified",
         ] {
             assert!(

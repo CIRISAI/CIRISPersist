@@ -7,6 +7,23 @@ threat-model citations because this crate's audit story is the point.
 
 ## [Unreleased]
 
+## [53.1.8] - UNRELEASED
+
+### Fixed — the score emit gate refused what its consent precheck granted (#1013)
+
+CIRISServer 0.5.223 on persist 53.1.7: the canonical's first scorer pass refused 13 agents at emit (`emit_attestation_self(capacity): no live consent covers this capacity:sustained_coherence:v1 emission`), after its precheck — `resolve_scoped_consent_by_principals(canonical, agent, "analyze")` — had returned Granted for every one. Each agent's only consent row is its steward's: a user-role key, attested to the canonical, `consent:state:granted:v1`, bare `analyze`, `for_key_id` = the agent, no expiry, nothing authored by the agent.
+
+`check_capacity_consent_admission` folded the subject's own rows only (`resolve_scoped_consent`); v44.6.0's principal walk (#857 — consent is by humans, for this machine) never reached it. The gap dates from v44.6.0; it is not a 53.1.x regression.
+
+- **One fold, `consent_by_humans::capacity_consent_stance(directory, attester, subject, family, now)`**: `resolve_scoped_consent_by_principals` asked for `analyze:<family>` (#866 C1). The gate calls it; `Engine::capacity_consent_stance` and PyO3 `Engine.capacity_consent_stance(attester_key_id, subject_key_id, family, now_iso=None)` expose it, so a scorer's precheck is the gate's own function. `family` crosses the FFI as its token (`"capacity"`); an unknown token raises `ValueError`. New `ConsentGatedFamily::from_token` and `ConsentGatedFamily::analyze_scope`.
+- **The scope.** The gate asks `analyze:capacity`; a precheck asking bare `analyze` disagrees with it on a grant narrowed to `analyze:capacity` (the gate admits, the bare precheck reads Unspecified). A grant narrowed to another family is refused by both. Server: switch the precheck to `capacity_consent_stance`.
+- **The refusal names the scope it asked** (`"analyze:capacity"`), not the constant `"analyze"`, and says a steward's row naming the subject also authorizes. `ConsentGateRefused` gains no field (it is exhaustive and public; a field would break an out-of-crate constructor): the scope is derived from `family`.
+- **Not changed, reported:** two retention paths still read the subject-only scoped fold for the `retain` window — `Engine::evict_fountain_content_by_consent` and the deletion-window breach sweep — so a steward's `retain:<window>` naming the machine does not bound them. Different consequence (deletion), separate ruling.
+- **Witnesses (memory, sqlite, postgres).** I548a: the production row shape is admitted by the gate and Granted by the fold (refused through 53.1.7). I548b: a grant narrowed to `analyze:trust` is refused by both; one narrowed to `analyze:capacity` admitted by both. I548c: gate verdict == (stance == Granted) and == the expected verdict across subject-only grant, steward-only grant, steward grant naming another machine, steward revoke + subject grant, expired, narrowed to this family, narrowed to another. I548d: the refusal contains `"analyze:capacity"`. I548e (from disk): the gate, the Engine door and the PyO3 door reach the one fold.
+- Mutation-checked: the gate reverted to the subject-only `resolve_scoped_consent` reds I548a, I548c (`steward-only-grant: the gate (false) and the precheck (Granted) disagree`) and I548e; the fold asking bare `analyze` reds I548b and I548c (`narrowed-to-this-family`); the refusal printing the constant again reds I548d and the Display test.
+
+**Adopters.** Pin-compatible with 53.1.7: no wire, ABI, migration or verify change; one new Engine / PyO3 method. Server: call `capacity_consent_stance(canonical, agent, "capacity")` as the precheck.
+
 ## [53.1.7] - 2026-10-07
 
 ### Fixed — `list_attestations_referencing` scanned the whole table on every call (CIRISEdge PR #818)
