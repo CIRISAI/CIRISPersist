@@ -35,7 +35,7 @@ CIRISServer's capped run on persist 53.1.5: four anti-entropy rounds of EMPTY ki
 
 **Adopters.** Nothing to call; the reads are additive and defaulted. CIRISServer: re-run the capped anti-entropy probe on 53.1.7.
 
-## [53.1.6] - UNRELEASED
+## [53.1.6] - 2026-10-06
 
 ### Fixed — five more reads loaded an author's or a subject's whole history to select a handful of rows (CIRISEdge's heap harness, 2026-10-06)
 
