@@ -7,7 +7,7 @@ threat-model citations because this crate's audit story is the point.
 
 ## [Unreleased]
 
-## [53.1.8] - UNRELEASED
+## [53.1.8] - 2026-10-07
 
 ### Fixed — the score emit gate refused what its consent precheck granted (#1013)
 
