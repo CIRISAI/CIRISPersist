@@ -7,7 +7,7 @@ threat-model citations because this crate's audit story is the point.
 
 ## [Unreleased]
 
-## [53.1.7] - UNRELEASED
+## [53.1.7] - 2026-10-07
 
 ### Fixed — `list_attestations_referencing` scanned the whole table on every call (CIRISEdge PR #818)
 
