@@ -25762,6 +25762,57 @@ impl PyEngine {
         })
     }
 
+    /// v53.1.8 (CIRISPersist#1013) — the consent-before-scoring stance the
+    /// emit gate asks: by principals, scope `analyze:<family>`. A scorer's
+    /// precheck calls this and gets the gate's answer. `family` is the
+    /// gated family's token (`"capacity"`); an unknown one raises
+    /// `ValueError`. Returns the stance name. FFI mirror of
+    /// [`Engine::capacity_consent_stance`](crate::Engine::capacity_consent_stance).
+    #[pyo3(signature = (attester_key_id, subject_key_id, family, now_iso = None))]
+    fn capacity_consent_stance(
+        &self,
+        py: Python<'_>,
+        attester_key_id: &str,
+        subject_key_id: &str,
+        family: &str,
+        now_iso: Option<&str>,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let now = match now_iso {
+                Some(v) => chrono::DateTime::parse_from_rfc3339(v)
+                    .map(|t| t.with_timezone(&chrono::Utc))
+                    .map_err(|e| PyValueError::new_err(format!("now_iso parse: {e}")))?,
+                None => chrono::Utc::now(),
+            };
+            let family = crate::federation::admission::ConsentGatedFamily::from_token(family)
+                .ok_or_else(|| {
+                    PyValueError::new_err(format!(
+                        "unknown consent-gated family {family:?}; known: {:?}",
+                        crate::federation::admission::ConsentGatedFamily::ALL
+                            .iter()
+                            .map(|f| f.as_str())
+                            .collect::<Vec<_>>()
+                    ))
+                })?;
+            let (a, sub) = (attester_key_id.to_owned(), subject_key_id.to_owned());
+            let engine = self.hold_engine_view();
+            py.detach(move || {
+                let stance = self
+                    .runtime
+                    .block_on(engine.capacity_consent_stance(&a, &sub, family, now))
+                    .map_err(federation_err_to_py)?;
+                Ok(match stance {
+                    crate::federation::hard_case::ConsentState::Granted => "granted",
+                    crate::federation::hard_case::ConsentState::Revoked => "revoked",
+                    crate::federation::hard_case::ConsentState::Expired => "expired",
+                    crate::federation::hard_case::ConsentState::Unspecified => "unspecified",
+                }
+                .to_owned())
+            })
+        })
+    }
+
     /// v44.8.0 (CIRISPersist#866 C1b) — `resolve_scoped_consent_by_principals`
     /// WITH its bound. Returns JSON `{"state": "granted"|"revoked"|"expired"|
     /// "unspecified", "retain_until": <RFC-3339>|null}`: `retain_until` is the

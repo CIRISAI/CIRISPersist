@@ -93,6 +93,9 @@ pub mod media_source;
 // v44.8.0 (#866 C3) — the substrate records a lapsed grant as `consent:state:expired`.
 #[cfg(any(test, feature = "test-anchor"))]
 pub mod consent_by_humans_invariants;
+// v53.1.8 (#1013) — I548: the capacity gate and a scorer's precheck ask one fold.
+#[cfg(test)]
+mod capacity_consent_invariants;
 pub mod consent_expiry;
 // CIRISPersist#866/#867 (`FSD/CONTEXTUAL_INTEGRITY_ENVELOPE.md`) — I104–I111: the scope
 // token grammar, the retain bound, the transfer principle, the expiry record.
