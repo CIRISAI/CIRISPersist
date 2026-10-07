@@ -2406,6 +2406,39 @@ struct RawAggregationRow {
 // JSONB→serde_json::Value decode. Wire shape matches PG byte-for-byte.
 
 impl SqliteBackend {
+    /// v53.1.7 — the body of `list_attestations_for_types` / `_by_types`
+    /// over `key_column` ([`sqlite_attestations_typed_sql`]).
+    async fn sqlite_typed_read(
+        &self,
+        key_column: &'static str,
+        key: &str,
+        attestation_types: &[&str],
+        excluded_dimensions: &[&str],
+    ) -> Result<Vec<crate::federation::Attestation>, rusqlite::Error> {
+        if attestation_types.is_empty() {
+            return Ok(Vec::new());
+        }
+        let sql = sqlite_attestations_typed_sql(
+            key_column,
+            attestation_types.len(),
+            excluded_dimensions.len(),
+        );
+        let binds: Vec<SqlValue> = std::iter::once(key)
+            .chain(attestation_types.iter().copied())
+            .chain(excluded_dimensions.iter().copied())
+            .map(|v| SqlValue::Text(v.to_owned()))
+            .collect();
+        self.read(
+            move |conn| -> Result<Vec<crate::federation::Attestation>, rusqlite::Error> {
+                let mut stmt = conn.prepare(&sql)?;
+                let rows =
+                    stmt.query_map(params_from_iter(binds.iter()), sqlite_row_to_attestation)?;
+                rows.collect()
+            },
+        )
+        .await
+    }
+
     /// #226 (V094) — assign `shard_key` to legacy `trace_events` rows that
     /// predate the sharded dedup index (their `shard_key` is `NULL`).
     ///
@@ -5947,6 +5980,63 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             #[cfg(not(test))]
             let _ = rows;
         })
+    }
+
+    /// v53.1.7 — V178's `(attested_key_id, attestation_type, …)` seek, one
+    /// probe per type; the dimension exclusion is evaluated on the table row,
+    /// so an excluded row is never decoded.
+    async fn list_attestations_for_types(
+        &self,
+        attested_key_id: &str,
+        attestation_types: &[&str],
+        excluded_dimensions: &[&str],
+    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
+        let rows = self
+            .sqlite_typed_read(
+                "attested_key_id",
+                attested_key_id,
+                attestation_types,
+                excluded_dimensions,
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("list_attestations_for_types: {e}"))
+            })?;
+        #[cfg(test)]
+        crate::federation::read_probe::record(
+            "list_attestations_for_types",
+            attested_key_id,
+            &rows,
+        );
+        Ok(rows)
+    }
+
+    /// v53.1.7 — V107's `(attesting_key_id, attestation_type, …)` seek, the
+    /// attesting twin of the read above.
+    async fn list_attestations_by_types(
+        &self,
+        attesting_key_id: &str,
+        attestation_types: &[&str],
+        excluded_dimensions: &[&str],
+    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
+        let rows = self
+            .sqlite_typed_read(
+                "attesting_key_id",
+                attesting_key_id,
+                attestation_types,
+                excluded_dimensions,
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("list_attestations_by_types: {e}"))
+            })?;
+        #[cfg(test)]
+        crate::federation::read_probe::record(
+            "list_attestations_by_types",
+            attesting_key_id,
+            &rows,
+        );
+        Ok(rows)
     }
 
     /// v53.1.6 — V180's `(attesting_key_id, dimension, evidence_refs[0])`
@@ -22739,6 +22829,36 @@ fn sqlite_attestations_by_type_sql() -> String {
         "SELECT {SQLITE_ATTESTATION_COLUMNS} FROM federation_attestations \
          WHERE attesting_key_id = ?1 AND attestation_type = ?2 AND tier = 'federation' \
          ORDER BY +asserted_at DESC"
+    )
+}
+
+/// v53.1.7 — `list_attestations_for_types` / `_by_types`'s statement over
+/// `key_column` (`attested_key_id` or `attesting_key_id`): `?1` the key, then
+/// `n_types` type binds, then `n_excluded` dimension binds. Spelled once so
+/// I547's plan check reads the statement the doors run. `+asserted_at` for
+/// the reason on [`sqlite_attestations_by_type_sql`]: V178 / V107 seek the
+/// (key, type) prefix; the key's `asserted_at`-ordered index would walk its
+/// whole slice. V106's generated `dimension` is the envelope's top-level
+/// `dimension` (`json_extract`, so a non-string value never equals a bound
+/// string); `NULL` is kept.
+fn sqlite_attestations_typed_sql(key_column: &str, n_types: usize, n_excluded: usize) -> String {
+    let types: Vec<String> = (0..n_types).map(|i| format!("?{}", i + 2)).collect();
+    let excluded: Vec<String> = (0..n_excluded)
+        .map(|i| format!("?{}", i + 2 + n_types))
+        .collect();
+    let dimension_sql = if excluded.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " AND (dimension IS NULL OR dimension NOT IN ({}))",
+            excluded.join(", ")
+        )
+    };
+    format!(
+        "SELECT {SQLITE_ATTESTATION_COLUMNS} FROM federation_attestations \
+         WHERE {key_column} = ?1 AND attestation_type IN ({}) AND tier = 'federation'{dimension_sql} \
+         ORDER BY +asserted_at DESC",
+        types.join(", ")
     )
 }
 
@@ -45648,6 +45768,57 @@ mod tests {
                 .any(|l| l.contains("federation_attestations_attested ")),
             "the for-type read does not walk the subject's whole slice in order: {plan:?}"
         );
+    }
+
+    /// I547 (sqlite) — the trust-root walks' typed, job-filtered reads seek
+    /// the (key, type) prefix — V178's `attested_composer_ref` for the
+    /// attested read, V107's `composer_ref` for the attesting one — with two
+    /// types and the dimension exclusion, and never walk the key's slice in
+    /// `asserted_at` order.
+    #[tokio::test]
+    async fn i547_typed_reads_seek_the_key_type_prefix() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        for (column, index, ordered) in [
+            (
+                "attested_key_id",
+                "federation_attestations_attested_composer_ref",
+                "federation_attestations_attested ",
+            ),
+            (
+                "attesting_key_id",
+                "federation_attestations_composer_ref",
+                "federation_attestations_attesting ",
+            ),
+        ] {
+            let plan = sqlite_plan(
+                &backend,
+                &sqlite_attestations_typed_sql(column, 2, 2),
+                [
+                    "key",
+                    "delegates_to",
+                    "supersedes",
+                    "trust:accepts:v1",
+                    "trust:confers:v1",
+                ]
+                .into_iter()
+                .map(|v| SqlValue::Text(v.into()))
+                .collect(),
+            )
+            .await;
+            eprintln!("I547 typed read over {column}: {plan:?}");
+            assert!(
+                plan.iter().any(|l| l.starts_with(&format!(
+                    "SEARCH federation_attestations USING INDEX {index} \
+                     ({column}=? AND attestation_type=?)"
+                ))),
+                "the typed read over {column} seeks {index}: {plan:?}"
+            );
+            assert!(
+                !plan.iter().any(|l| l.contains(ordered)),
+                "the typed read over {column} does not walk the key's slice in order: {plan:?}"
+            );
+        }
     }
 
     /// I532 (sqlite) — the plan. The v53.1.4 statement seeks the cohort-led

@@ -2601,6 +2601,17 @@ pub fn first_evidence_ref(envelope: &serde_json::Value) -> Option<&str> {
         .and_then(serde_json::Value::as_str)
 }
 
+/// v53.1.7 — the predicate of [`FederationDirectory::list_attestations_for_types`]
+/// / `_by_types`, as the memory backend and the default bodies compute it:
+/// the row's type is one of `types`, and its top-level envelope `dimension`
+/// (a string; anything else is no dimension) is none of `excluded`.
+#[must_use]
+pub fn types_and_dimension_admit(a: &Attestation, types: &[&str], excluded: &[&str]) -> bool {
+    types.contains(&a.attestation_type.as_str())
+        && !admission::envelope_dimension(&a.attestation_envelope)
+            .is_some_and(|d| excluded.contains(&d))
+}
+
 /// v53.1.6 — V150's `cohort_target` as the memory backend and the default
 /// bodies compute it: the first present of `community_id`,
 /// `community_key_id`, `cohort_key_id`, `family_key_id` (the generated
@@ -3455,6 +3466,49 @@ pub trait FederationDirectory: Send + Sync {
             .await?
             .into_iter()
             .filter(|a| a.attestation_type == attestation_type)
+            .collect())
+    }
+
+    /// v53.1.7 — the federation-tier rows attested TO `attested_key_id` whose
+    /// `attestation_type` is one of `attestation_types` and whose envelope
+    /// `dimension` is NOT one of `excluded_dimensions` (absent and non-string
+    /// dimensions are kept). Ordered by `asserted_at` DESC. The bounded read
+    /// behind the trust-root walks: a subject's conferrals or a root's
+    /// charters without every trust edge naming it (`excluded_dimensions` =
+    /// the `trust:{job}` labels the predicate refuses). Served by V178's
+    /// `(attested_key_id, attestation_type, …)` prefix. Pin-compatible default
+    /// over the unbounded read; every backend overrides.
+    async fn list_attestations_for_types(
+        &self,
+        attested_key_id: &str,
+        attestation_types: &[&str],
+        excluded_dimensions: &[&str],
+    ) -> Result<Vec<Attestation>, Error> {
+        Ok(self
+            .list_attestations_for(attested_key_id)
+            .await?
+            .into_iter()
+            .filter(|a| types_and_dimension_admit(a, attestation_types, excluded_dimensions))
+            .collect())
+    }
+
+    /// v53.1.7 — the federation-tier rows `attesting_key_id` authored, typed
+    /// and dimension-filtered as [`Self::list_attestations_for_types`]. Ordered
+    /// by `asserted_at` DESC. A user's or a node's trust edges without its
+    /// whole history. Served by V107's `(attesting_key_id, attestation_type,
+    /// …)` prefix. Pin-compatible default over the unbounded read; every
+    /// backend overrides.
+    async fn list_attestations_by_types(
+        &self,
+        attesting_key_id: &str,
+        attestation_types: &[&str],
+        excluded_dimensions: &[&str],
+    ) -> Result<Vec<Attestation>, Error> {
+        Ok(self
+            .list_attestations_by(attesting_key_id)
+            .await?
+            .into_iter()
+            .filter(|a| types_and_dimension_admit(a, attestation_types, excluded_dimensions))
             .collect())
     }
 

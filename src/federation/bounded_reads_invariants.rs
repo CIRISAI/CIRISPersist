@@ -31,6 +31,11 @@
 //!   `list_attestations_referencing`, now V181's `(reference, type)` seek
 //!   (CIRISEdge PR #818: a full table scan per conferral row); equivalence
 //!   here, the plan in `store::sqlite`'s I546.
+//! - **I547** (v53.1.7) the trust-root walks and `live_charter_rows`: each
+//!   key's trust edges, conferrals, charters and drills (typed, job-filtered,
+//!   with their composers), never the user's, root's, subject's or family's
+//!   whole slice (CIRISServer's OOM probe: empty-kind anti-entropy rounds,
+//!   410 → 2,084 MB in 16 s).
 //!
 //! [`OwnerAudience`]: crate::federation::replication_audience::OwnerAudience
 
@@ -1411,6 +1416,379 @@ pub(crate) mod bodies {
             "I546: the withdrawn grant confers nothing"
         );
     }
+    // ── I547 ─────────────────────────────────────────────────────────────
+
+    /// Calls of either whole-slice read, any key.
+    fn slice_reads(log: &[read_probe::Read]) -> usize {
+        log.iter()
+            .filter(|r| r.method == "list_attestations_by" || r.method == "list_attestations_for")
+            .count()
+    }
+
+    /// **I547** — the trust-root walks (`trusted_roots_of`, `trust_root_valid`,
+    /// `capability_roots_to_trusted_root_over_roster`, `transit_eligibility_walk`,
+    /// `owner_granted_scope`) and `canonical_community::live_charter_rows`
+    /// equal their verbatim v53.1.6 bodies over a family (accord) root with a
+    /// transit pair and ten bystanders' trust edges naming it, a key root
+    /// whose grant is rotated twice, a key root whose grant is withdrawn, a key
+    /// root that withdraws its own charter, a user's trust edges live,
+    /// withdrawn, recanted and expired, and unrelated self-reports under every
+    /// key; and no walk reads any key's whole slice (`list_attestations_by` /
+    /// `_for`), while the v53.1.6 bodies do.
+    pub async fn i547_trust_root_walks_read_what_they_select(d: &dyn FederationDirectory, s: &str) {
+        use crate::federation::canonical_community::{
+            live_charter_rows, v53_1_6_reference::live_charter_rows_reference,
+        };
+        use crate::federation::grant_supersede_invariants::bodies as gs;
+        use crate::federation::operational::test_support as ot;
+        use crate::federation::trust_root::{
+            self as tr, v53_1_6_reference as r, INFRA_ATTEST_SCOPE, INFRA_SERVE_SCOPE,
+        };
+
+        // (1) The family root and a transit pair that shares it.
+        let tag = format!("i547t-{s}");
+        ot::exercise_transit_eligibility_family_root(d, &tag)
+            .await
+            .expect("the family-root transit fixture");
+        let (accord, tuser, peer) = (
+            format!("{tag}-accord"),
+            format!("{tag}-user"),
+            format!("{tag}-peer"),
+        );
+        // (The exercise ends with that family's roster grown past its
+        // charter's quorum, so it is a family root that is NOT valid.) A second
+        // family, chartered at 2-of-3 and trusted by the pair: a valid one.
+        let accord2 = format!("i547-accord2-{s}");
+        let holders: Vec<String> = (0..3).map(|i| format!("i547-h{i}-{s}")).collect();
+        for h in &holders {
+            ot::register_typed_key(d, h, NODE).await.expect("holder");
+        }
+        ot::seed_chartered_family_root(d, &accord2, &holders, &tuser)
+            .await
+            .expect("the second family root");
+        ot::emit_trust_edge(d, &peer, &accord2, None)
+            .await
+            .expect("the peer trusts it too");
+        // A third family, chartered, then its charter withdrawn by the holder
+        // who signed it (a composer attested to the family).
+        let accord3 = format!("i547-accord3-{s}");
+        ot::seed_chartered_family_root(d, &accord3, &holders, &tuser)
+            .await
+            .expect("the third family root");
+        put(
+            d,
+            composer(
+                &holders[0],
+                &accord3,
+                attestation_type::WITHDRAWS,
+                &format!("{accord3}-charter"),
+            ),
+        )
+        .await
+        .expect("holder 0 withdraws accord3's charter");
+        // Ten bystanders trust each family: rows ABOUT a family no charter
+        // read needs.
+        for i in 0..10 {
+            let b = format!("i547-by{i}-{s}");
+            ts::register_hybrid_key_as(d, &b, &b, NODE).await;
+            for fam in [&accord, &accord2] {
+                ot::emit_trust_edge(d, &b, fam, None)
+                    .await
+                    .expect("a bystander's trust edge");
+            }
+        }
+        // (2) Key roots: a grant rotated twice; a grant withdrawn; a root that
+        // withdraws its own charter.
+        let fx = gs::fixture(d, &format!("i547a-{s}")).await;
+        let succ = format!("i547-succ-{s}");
+        gs::supersede(
+            d,
+            &succ,
+            &fx.root,
+            &fx.subject,
+            &fx.grant,
+            INFRA_SERVE_SCOPE,
+        )
+        .await
+        .expect("rotation 1");
+        gs::supersede(
+            d,
+            &format!("i547-succ2-{s}"),
+            &fx.root,
+            &fx.subject,
+            &succ,
+            INFRA_SERVE_SCOPE,
+        )
+        .await
+        .expect("rotation 2");
+        let fx2 = gs::fixture(d, &format!("i547b-{s}")).await;
+        gs::withdraw(
+            d,
+            &format!("i547-w-{s}"),
+            &fx2.root,
+            &fx2.subject,
+            &fx2.grant,
+        )
+        .await;
+        let fx3 = gs::fixture(d, &format!("i547c-{s}")).await;
+        let charter3 = d
+            .list_attestations_by(&fx3.root)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|a| {
+                a.attestation_type == attestation_type::DELEGATES_TO
+                    && a.attested_key_id == fx3.root
+            })
+            .expect("fx3's self-charter");
+        put(
+            d,
+            composer(
+                &fx3.root,
+                &fx3.root,
+                attestation_type::WITHDRAWS,
+                &charter3.attestation_id,
+            ),
+        )
+        .await
+        .expect("fx3's root withdraws its charter");
+        // fx's root drill, withdrawn by its witness (a composer attested to
+        // the root): the drill leg reads its composers too.
+        let drill = d
+            .list_attestations_for(&fx.root)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|a| {
+                admission::envelope_dimension(&a.attestation_envelope)
+                    == Some(tr::ACCORD_HEARTBEAT_DIMENSION)
+            })
+            .expect("fx's root drill");
+        put(
+            d,
+            composer(
+                &drill.attesting_key_id,
+                &fx.root,
+                attestation_type::WITHDRAWS,
+                &drill.attestation_id,
+            ),
+        )
+        .await
+        .expect("the witness withdraws fx's drill");
+        // (3) fx.user's own edges: to fx2's root, withdrawn; to fx3's root,
+        // recanted; to the accord, live; to fx2's root again, expired.
+        let e_w = ot::emit_trust_edge(d, &fx.user, &fx2.root, None)
+            .await
+            .expect("edge to fx2");
+        put(
+            d,
+            composer(&fx.user, &fx2.root, attestation_type::WITHDRAWS, &e_w),
+        )
+        .await
+        .expect("fx.user withdraws it");
+        let e_r = ot::emit_trust_edge(d, &fx.user, &fx3.root, None)
+            .await
+            .expect("edge to fx3");
+        put(
+            d,
+            composer(&fx.user, &fx3.root, attestation_type::RECANTS, &e_r),
+        )
+        .await
+        .expect("fx.user recants it");
+        ot::emit_trust_edge(d, &fx.user, &accord, None)
+            .await
+            .expect("fx.user trusts the accord");
+        let _ = ot::emit_trust_edge(
+            d,
+            &fx.user,
+            &fx2.root,
+            Some(chrono::Utc::now() - chrono::Duration::days(1)),
+        )
+        .await;
+        // (4) Unrelated history under every key.
+        for k in [&fx.user, &fx.root, &fx.subject, &tuser, &peer] {
+            for i in 0..6 {
+                put(d, self_report(k, &format!("i547-{i}")))
+                    .await
+                    .expect("noise");
+            }
+        }
+
+        let roster = admission::accord_holder_roster_key_ids();
+        let users = [&fx.user, &fx2.user, &fx3.user, &tuser, &peer];
+        let roots = [
+            &fx.root, &fx2.root, &fx3.root, &accord, &accord2, &accord3, &fx.user,
+        ];
+        let now = chrono::Utc::now();
+        let _ = read_probe::take();
+        macro_rules! same {
+            ($label:expr, $got:expr, $want:expr) => {{
+                let got = $got;
+                let log = read_probe::take();
+                let want = $want;
+                let ref_log = read_probe::take();
+                assert_eq!(got, want, "I547 {}", $label);
+                assert_eq!(
+                    slice_reads(&log),
+                    0,
+                    "I547 {}: no whole-slice read: {log:?}",
+                    $label
+                );
+                ref_log
+            }};
+        }
+        let mut reference_slice_reads = 0;
+        for k in users.into_iter().chain([&fx.subject]) {
+            let l = same!(
+                format!("trusted_roots_of({k})"),
+                tr::trusted_roots_of(d, k, now).await.unwrap(),
+                r::trusted_roots_of_reference(d, k, now).await.unwrap()
+            );
+            reference_slice_reads += slice_reads(&l);
+        }
+        for u in users {
+            for root in roots {
+                let l = same!(
+                    format!("trust_root_valid({u}, {root})"),
+                    tr::trust_root_valid(d, u, root).await.unwrap(),
+                    r::trust_root_valid_reference(d, u, root).await.unwrap()
+                );
+                reference_slice_reads += slice_reads(&l);
+            }
+        }
+        for (u, subj) in [
+            (&fx.user, &fx.subject),
+            (&fx2.user, &fx2.subject),
+            (&fx3.user, &fx3.subject),
+            (&tuser, &peer),
+        ] {
+            for scope in [INFRA_SERVE_SCOPE, INFRA_ATTEST_SCOPE] {
+                let l = same!(
+                    format!("capability_roots({u}, {subj}, {scope})"),
+                    tr::capability_roots_to_trusted_root_over_roster(d, u, subj, scope, &roster)
+                        .await
+                        .unwrap(),
+                    r::capability_roots_to_trusted_root_over_roster_reference(
+                        d, u, subj, scope, &roster
+                    )
+                    .await
+                    .unwrap()
+                );
+                reference_slice_reads += slice_reads(&l);
+            }
+        }
+        for (u, p) in [
+            (&tuser, &peer),
+            (&peer, &tuser),
+            (&fx.user, &peer),
+            (&fx.user, &tuser),
+        ] {
+            let l = same!(
+                format!("transit_eligibility_walk({u}, {p})"),
+                tr::transit_eligibility_walk(d, u, p).await.unwrap(),
+                r::transit_eligibility_walk_reference(d, u, p)
+                    .await
+                    .unwrap()
+            );
+            reference_slice_reads += slice_reads(&l);
+        }
+        for (subj, granter) in [
+            (&fx.subject, &fx.root),
+            (&fx2.subject, &fx2.root),
+            (&fx.subject, &fx2.root),
+            (&peer, &tuser),
+        ] {
+            for scope in [INFRA_SERVE_SCOPE, INFRA_ATTEST_SCOPE] {
+                let l = same!(
+                    format!("owner_granted_scope({subj}, {granter}, {scope})"),
+                    tr::owner_granted_scope(d, subj, granter, scope)
+                        .await
+                        .unwrap(),
+                    r::owner_granted_scope_reference(d, subj, granter, scope)
+                        .await
+                        .unwrap()
+                );
+                reference_slice_reads += slice_reads(&l);
+            }
+        }
+        for fam in [&accord, &accord2, &accord3, &fx.root, &fx3.root] {
+            let ids =
+                |v: Vec<Attestation>| v.into_iter().map(|a| a.attestation_id).collect::<Vec<_>>();
+            let l = same!(
+                format!("live_charter_rows({fam})"),
+                ids(live_charter_rows(d, fam).await.unwrap()),
+                ids(live_charter_rows_reference(d, fam).await.unwrap())
+            );
+            reference_slice_reads += slice_reads(&l);
+        }
+        assert!(
+            reference_slice_reads > 0,
+            "I547: the v53.1.6 bodies read whole slices (the red)"
+        );
+        // The family's about-read returns its charters, never the eleven
+        // trust edges naming it.
+        for fam in [&accord, &accord2] {
+            let _ = tr::trust_root_valid(d, &tuser, fam).await.unwrap();
+            let log = read_probe::take();
+            let typed = rows_of(&log, "list_attestations_for_types", fam);
+            assert!(
+                (1..=2).contains(&typed),
+                "I547: {fam}'s typed read returns its charters only ({typed} rows): {log:?}"
+            );
+        }
+        // Literals: the head of fx's rotation confers; fx2's withdrawn grant
+        // and fx3's withdrawn charter confer nothing; the pair shares the
+        // accord.
+        assert_eq!(
+            tr::capability_roots_to_trusted_root_over_roster(
+                d,
+                &fx.user,
+                &fx.subject,
+                INFRA_SERVE_SCOPE,
+                &roster
+            )
+            .await
+            .unwrap()
+            .map(|g| g.grant_attestation_id),
+            Some(format!("i547-succ2-{s}"))
+        );
+        assert!(
+            !tr::trust_root_valid(d, &fx3.user, &fx3.root)
+                .await
+                .unwrap()
+                .valid
+        );
+        assert_eq!(
+            tr::transit_eligibility_walk(d, &tuser, &peer)
+                .await
+                .unwrap()
+                .0
+                .via_root,
+            Some(accord2.clone())
+        );
+        assert!(
+            tr::trust_root_valid(d, &tuser, &accord2)
+                .await
+                .unwrap()
+                .valid
+        );
+        assert!(
+            !tr::trust_root_valid(d, &tuser, &accord)
+                .await
+                .unwrap()
+                .valid
+        );
+        assert!(
+            !tr::trust_root_valid(d, &tuser, &accord3)
+                .await
+                .unwrap()
+                .valid
+        );
+        assert!(
+            live_charter_rows(d, &accord3).await.unwrap().is_empty(),
+            "I547: accord3's withdrawn charter is no live charter"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1440,6 +1818,7 @@ mod runners {
                 case!(i544, i544_custody_acks_read_the_devices_reports_of_the_blob);
                 case!(i545, i545_nodes_of_reads_the_stewards_delegations);
                 case!(i546, i546_live_conferrals_read_each_rows_composers);
+                case!(i547, i547_trust_root_walks_read_what_they_select);
                 $(case!($sql_only, $sql_body);)*
             }
         };
