@@ -102,7 +102,7 @@ pub fn is_invitee_subject_list(row: &Attestation) -> bool {
 /// (… `consensus_protocol` admission)" (CC 4.4.3.2.8), so its membership
 /// ceremony is the community's. `None` for a scope no roster answers (self,
 /// the commons). Every membership comparison of two scopes asks this.
-fn membership_plane(scope: &str) -> Option<cohort_scope::TargetPlane> {
+pub(crate) fn membership_plane(scope: &str) -> Option<cohort_scope::TargetPlane> {
     match cohort_scope::Scope::parse(scope).map(cohort_scope::Scope::placement) {
         Some(cohort_scope::Placement::Targeted(plane)) => Some(plane),
         _ => None,
@@ -146,7 +146,7 @@ where
 }
 
 /// Do two placements name the same membership plane?
-fn same_membership_plane(a: &str, b: &str) -> bool {
+pub(crate) fn same_membership_plane(a: &str, b: &str) -> bool {
     membership_plane(a).is_some() && membership_plane(a) == membership_plane(b)
 }
 
@@ -244,15 +244,15 @@ pub fn check_membership_row_shape(row: &Attestation) -> Result<(), Error> {
 }
 
 /// A held proposal as the gate reads it.
-struct Proposal {
-    row: Attestation,
-    group: String,
-    invitee: String,
-    role: Option<String>,
-    expires_at: chrono::DateTime<chrono::Utc>,
+pub(crate) struct Proposal {
+    pub(crate) row: Attestation,
+    pub(crate) group: String,
+    pub(crate) invitee: String,
+    pub(crate) role: Option<String>,
+    pub(crate) expires_at: chrono::DateTime<chrono::Utc>,
 }
 
-fn as_proposal(row: Attestation) -> Option<Proposal> {
+pub(crate) fn as_proposal(row: Attestation) -> Option<Proposal> {
     if membership_row(&row) != Some(MembershipRow::Proposal) {
         return None;
     }
@@ -279,7 +279,7 @@ fn reply_matches(reply: &Attestation, p: &Proposal) -> bool {
             || env_role(reply).ok().flatten() == p.role)
 }
 
-async fn proposal_withdrawn<F>(dir: &F, p: &Proposal) -> Result<bool, Error>
+pub(crate) async fn proposal_withdrawn<F>(dir: &F, p: &Proposal) -> Result<bool, Error>
 where
     F: FederationDirectory + ?Sized,
 {
@@ -300,12 +300,14 @@ where
 }
 
 /// Every federation-tier reply by `member` held here.
-async fn replies_of<F>(dir: &F, member: &str) -> Result<Vec<Attestation>, Error>
+pub(crate) async fn replies_of<F>(dir: &F, member: &str) -> Result<Vec<Attestation>, Error>
 where
     F: FederationDirectory + ?Sized,
 {
+    // v53.1.6 — the member's `membership:*` rows (V178's attested+dimension
+    // seek), not every row about the member; the filter is unchanged.
     Ok(dir
-        .list_attestations_for(member)
+        .list_attestations_for_dimension_prefix(member, None, MEMBERSHIP_FAMILY_STEM)
         .await?
         .into_iter()
         .filter(|r| {
@@ -318,7 +320,10 @@ where
         .collect())
 }
 
-fn replies_to<'a>(replies: &'a [Attestation], proposal_id: &str) -> Vec<&'a Attestation> {
+pub(crate) fn replies_to<'a>(
+    replies: &'a [Attestation],
+    proposal_id: &str,
+) -> Vec<&'a Attestation> {
     replies
         .iter()
         .filter(|r| env_str(r, "references_attestation_id") == Some(proposal_id))
@@ -697,6 +702,24 @@ where
     Ok(out)
 }
 
+/// The members and every member's active occurrence — the keys whose
+/// proposals [`live_invitees_of`] counts (its pre-v53.1.6 universe).
+async fn signers_of_members<F>(
+    dir: &F,
+    members: &[String],
+) -> Result<std::collections::BTreeSet<String>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let mut signers: std::collections::BTreeSet<String> = members.iter().cloned().collect();
+    for m in members {
+        for o in dir.list_identity_occurrences_active(m).await? {
+            signers.insert(o.occurrence_key_id);
+        }
+    }
+    Ok(signers)
+}
+
 /// v53.0.0 (CIRISEdge#761, CC 5.4.6) — **the live invitees of a private
 /// group**: the subjects of held federation-tier proposals for `group` at
 /// `scope` that are unexpired, not withdrawn by their proposer and not
@@ -713,37 +736,74 @@ where
     F: FederationDirectory + ?Sized,
 {
     let now = chrono::Utc::now();
-    let mut signers: std::collections::BTreeSet<String> = members.iter().cloned().collect();
-    for m in members {
-        for o in dir.list_identity_occurrences_active(m).await? {
-            signers.insert(o.occurrence_key_id);
+    // v53.1.6 — the GROUP's proposal rows (V150's cohort_target seek: the
+    // rows placed on this plane naming this group), not every row every
+    // member and every member's occurrence ever authored. A proposal still
+    // counts only when a member or a member's active occurrence authored it
+    // (the old universe); the members' occurrences are resolved lazily, the
+    // first time a non-member attester turns up, and once.
+    let scopes: &[&str] = match membership_plane(scope) {
+        Some(cohort_scope::TargetPlane::Family) => &[cohort_scope::FAMILY],
+        Some(cohort_scope::TargetPlane::Room) => {
+            &[cohort_scope::COMMUNITY, cohort_scope::AFFILIATIONS]
         }
-    }
-    let mut out = std::collections::BTreeSet::new();
-    for s in &signers {
-        for row in dir.list_attestations_by(s).await? {
-            if row.tier != attestation_tier::FEDERATION {
-                continue;
+        None => return Ok(Vec::new()),
+    };
+    let member_set: std::collections::BTreeSet<&str> = members.iter().map(String::as_str).collect();
+    let candidates: Vec<Attestation> = match dir
+        .list_targeted_by_dimension_prefix(scopes, group, PROPOSAL_DIMENSION)
+        .await
+    {
+        Ok(rows) => rows,
+        // Pin compatibility: a directory without the targeted seek reads
+        // each signer's proposal rows by dimension (V137) — bounded, same set.
+        Err(Error::Unsupported { .. }) => {
+            let mut rows = Vec::new();
+            for s in &signers_of_members(dir, members).await? {
+                rows.extend(
+                    dir.list_attestations_by_dimension_prefix(s, PROPOSAL_DIMENSION)
+                        .await?,
+                );
             }
-            let Some(p) = as_proposal(row) else {
-                continue;
-            };
-            if !same_membership_plane(&p.row.cohort_scope, scope)
-                || p.group != group
-                || p.expires_at <= now
+            rows
+        }
+        Err(e) => return Err(e),
+    };
+    let mut signers: Option<std::collections::BTreeSet<String>> = None;
+    let mut out = std::collections::BTreeSet::new();
+    for row in candidates {
+        if row.tier != attestation_tier::FEDERATION {
+            continue;
+        }
+        if !member_set.contains(row.attesting_key_id.as_str()) {
+            if signers.is_none() {
+                signers = Some(signers_of_members(dir, members).await?);
+            }
+            if !signers
+                .as_ref()
+                .is_some_and(|s| s.contains(&row.attesting_key_id))
             {
                 continue;
             }
-            if proposal_withdrawn(dir, &p).await? {
-                continue;
-            }
-            let replies = replies_of(dir, &p.invitee).await?;
-            let declined = replies_to(&replies, &p.row.attestation_id)
-                .iter()
-                .any(|r| membership_row(r) == Some(MembershipRow::Decline));
-            if !declined {
-                out.insert(p.invitee);
-            }
+        }
+        let Some(p) = as_proposal(row) else {
+            continue;
+        };
+        if !same_membership_plane(&p.row.cohort_scope, scope)
+            || p.group != group
+            || p.expires_at <= now
+        {
+            continue;
+        }
+        if proposal_withdrawn(dir, &p).await? {
+            continue;
+        }
+        let replies = replies_of(dir, &p.invitee).await?;
+        let declined = replies_to(&replies, &p.row.attestation_id)
+            .iter()
+            .any(|r| membership_row(r) == Some(MembershipRow::Decline));
+        if !declined {
+            out.insert(p.invitee);
         }
     }
     Ok(out.into_iter().collect())

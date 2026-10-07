@@ -3296,10 +3296,22 @@ pub async fn check_config_renewal_supersedes<F: super::FederationDirectory + ?Si
         }
         return Ok(());
     }
+    // v53.1.6 (#997) — the attester's rows about the subject under this
+    // dimension (V178's attested+dimension seek) and the composers attested
+    // to the subject naming them — the only rows the loop below can select
+    // or retire by — not every row about the subject.
     let existing = directory
-        .list_attestations_for(&row.attested_key_id)
+        .list_attestations_for_dimension_prefix(
+            &row.attested_key_id,
+            Some(&row.attesting_key_id),
+            dimension,
+        )
         .await?;
-    let refs: Vec<&super::Attestation> = existing.iter().collect();
+    let ids: Vec<String> = existing.iter().map(|p| p.attestation_id.clone()).collect();
+    let composers = directory
+        .list_composers_referencing_any(&ids, Some(&row.attested_key_id), None)
+        .await?;
+    let refs: Vec<&super::Attestation> = existing.iter().chain(composers.iter()).collect();
     let retired = crate::federation::precedence::retired_ids(&refs);
     for prior in &existing {
         // An idempotent re-put of the SAME row is not a renewal.
@@ -6920,7 +6932,7 @@ impl DelegationWalkPolicy {
 /// and `withdraws` both outrank `supersedes`, so nothing a retraction used
 /// to kill is resurrected by the change; what changes is only that the three
 /// former folds can no longer disagree.
-fn retracted_edge_ids(rows: &[super::Attestation]) -> std::collections::HashSet<String> {
+pub(crate) fn retracted_edge_ids(rows: &[super::Attestation]) -> std::collections::HashSet<String> {
     let refs: Vec<&super::Attestation> = rows.iter().collect();
     crate::federation::precedence::retired_ids(&refs)
 }
@@ -9008,7 +9020,7 @@ pub async fn check_revocation_authority(
 /// Which incoming `delegates_to` edges [`live_delegation_granters`] admits.
 /// The ONLY axis on which its four consumers differ.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum DelegationEdgeFilter {
+pub(crate) enum DelegationEdgeFilter {
     /// Every `delegates_to` — the §11.10 steward-binding clause (3).
     AnyDelegation,
     /// Only CC 1.13.3.3 / CC 3.2 owner-binding edges
@@ -9071,7 +9083,7 @@ enum DelegationEdgeFilter {
 /// is a reach limit of the row index, not of this fold; widening it means a
 /// per-granter fan-out read on every steward-binding check, which is a
 /// separate decision with its own cost.
-async fn live_delegation_granters<F: super::FederationDirectory + ?Sized>(
+pub(crate) async fn live_delegation_granters<F: super::FederationDirectory + ?Sized>(
     directory: &F,
     subject: &str,
     filter: DelegationEdgeFilter,
@@ -9083,7 +9095,30 @@ async fn live_delegation_granters<F: super::FederationDirectory + ?Sized>(
     let mut granter_live: std::collections::HashMap<String, bool> =
         std::collections::HashMap::new();
     let now = chrono::Utc::now();
-    let rows = directory.list_attestations_for(subject).await?;
+    // v53.1.6 — the subject's incoming `delegates_to` edges (V178's
+    // attested+type seek) and the composers attested to the subject naming
+    // them — the rows the retraction fold below can use — not every row
+    // about the subject. The subject's `withdraws` / `recants` rows are read
+    // once more for the per-granter check (3), where each granter's whole
+    // history was read before.
+    let edges = directory
+        .list_attestations_for_type(subject, attestation_type::DELEGATES_TO)
+        .await?;
+    let edge_ids: Vec<String> = edges.iter().map(|e| e.attestation_id.clone()).collect();
+    let mut rows = edges;
+    rows.extend(
+        directory
+            .list_composers_referencing_any(&edge_ids, Some(subject), None)
+            .await?,
+    );
+    let mut retractions_about_subject = directory
+        .list_attestations_for_type(subject, attestation_type::WITHDRAWS)
+        .await?;
+    retractions_about_subject.extend(
+        directory
+            .list_attestations_for_type(subject, attestation_type::RECANTS)
+            .await?,
+    );
 
     // (2) — a binding withdrawn BY ANYONE the gate admitted is non-live, not
     // only one retracted by its own granter. Two lists that disagree about
@@ -9153,15 +9188,12 @@ async fn live_delegation_granters<F: super::FederationDirectory + ?Sized>(
         // of the granter's OUTGOING attestations whose `attested_key_id ==
         // subject`.
         let granter_retracted = is_user
-            && directory
-                .list_attestations_by(&r.attesting_key_id)
-                .await?
-                .into_iter()
-                .any(|g| {
-                    (g.attestation_type == attestation_type::WITHDRAWS
-                        || g.attestation_type == attestation_type::RECANTS)
-                        && g.attested_key_id == subject
-                });
+            && retractions_about_subject.iter().any(|g| {
+                (g.attestation_type == attestation_type::WITHDRAWS
+                    || g.attestation_type == attestation_type::RECANTS)
+                    && g.attested_key_id == subject
+                    && g.attesting_key_id == r.attesting_key_id
+            });
         let live = is_user && !granter_retracted;
         granter_live.insert(r.attesting_key_id.clone(), live);
         if live {
@@ -9430,7 +9462,7 @@ pub async fn steward_bindings_of(
 /// inherited verbatim, never re-implemented. Candidates:
 ///
 ///   * **clause (3)** — `U`'s OUTGOING `delegates_to` edges → each recipient
-///     (`list_attestations_by(U)`);
+///     (`list_attestations_by_type(U, delegates_to)`, v53.1.6);
 ///   * **clause (2)** — occurrences that speak for identity `U`
 ///     (`list_identity_occurrences_for(U)`);
 ///   * **clause (1)** — `U` itself (so the invariant holds exactly: `U` is
@@ -9446,11 +9478,15 @@ pub async fn nodes_stewarded_by(
 ) -> Result<Vec<String>, Error> {
     // Enumerate candidate nodes (cheap, indexed reads) — NOT a full scan.
     let mut candidates: std::collections::HashSet<String> = std::collections::HashSet::new();
-    // (3) U's outgoing delegates_to edges → recipients.
-    for r in directory.list_attestations_by(steward_user_key_id).await? {
-        if r.attestation_type == attestation_type::DELEGATES_TO {
-            candidates.insert(r.attested_key_id);
-        }
+    // (3) U's outgoing delegates_to edges → recipients. v53.1.6: the type
+    // seek, never U's whole history — Edge re-resolves send sets every 30 s,
+    // and this read ran once per principal per refresh. Retirement is decided
+    // below, on the candidate's side, so the candidate set needs no composers.
+    for r in directory
+        .list_attestations_by_type(steward_user_key_id, attestation_type::DELEGATES_TO)
+        .await?
+    {
+        candidates.insert(r.attested_key_id);
     }
     // (2) occurrences speaking for identity U.
     for occ in directory
@@ -9646,8 +9682,8 @@ pub async fn may_act_through(
 /// person is bound to*.
 ///
 /// **One fold, not two**: candidates come from the granter-side index
-/// ([`FederationDirectory::list_attestations_by`] filtered to owner-binding
-/// `delegates_to` envelopes), but each candidate's VERDICT is
+/// ([`FederationDirectory::list_attestations_by_type`]`(U, delegates_to)`,
+/// v53.1.6, filtered to owner-binding envelopes), but each candidate's VERDICT is
 /// [`owner_of`] itself — so liveness (expiry + admitted `withdraws`,
 /// #578/#584) and the single-owner rule are answered by the same spelling
 /// the forward walk uses, and `n ∈ nodes_owned_by(U) ⟺ owner_of(n) == U`
@@ -9663,11 +9699,14 @@ pub async fn nodes_owned_by<F: super::FederationDirectory + ?Sized>(
     person: &str,
 ) -> Result<Vec<String>, Error> {
     let mut candidates = std::collections::BTreeSet::new();
-    for row in directory.list_attestations_by(person).await? {
-        if row.attestation_type == super::types::attestation_type::DELEGATES_TO
-            && is_owner_binding_envelope(&row.attestation_envelope)
-            && !row.attested_key_id.is_empty()
-        {
+    // v53.1.6 — the type seek, not the person's whole history (`send_set_for`
+    // → `nodes_of` asks this per principal on every Edge memo refresh). The
+    // verdict is `owner_of` below, so the candidates need no composers.
+    for row in directory
+        .list_attestations_by_type(person, super::types::attestation_type::DELEGATES_TO)
+        .await?
+    {
+        if is_owner_binding_envelope(&row.attestation_envelope) && !row.attested_key_id.is_empty() {
             candidates.insert(row.attested_key_id);
         }
     }

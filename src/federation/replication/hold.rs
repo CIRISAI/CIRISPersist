@@ -280,7 +280,7 @@ pub async fn audience_memberships<D>(
 where
     D: FederationDirectory + ?Sized,
 {
-    use crate::federation::replication_audience::{owner_node_receives, OwnerCohort};
+    use crate::federation::replication_audience::{OwnerAudience, OwnerCohort};
     // v45.0.1 (CIRISPersist#873, `FSD/OCCURRENCE_PRINCIPAL.md` §3) — EVERY
     // principal, plus the node's own key: a shared device is party to both
     // humans' rooms, and the node's own memberships were always its own.
@@ -295,6 +295,9 @@ where
         out.insert(c.community_key_id);
     }
     for p in &principals {
+        // v53.1.6 — the principal's lists once for every community, not
+        // once per community.
+        let audience = OwnerAudience::read(directory, p).await?;
         for c in directory.list_communities_for_member_active(p).await? {
             if out.contains(&c.community_key_id) {
                 continue;
@@ -303,7 +306,10 @@ where
                 scope: cohort_scope,
                 target: &c.community_key_id,
             };
-            if owner_node_receives(directory, p, our_key_id, cohort).await? {
+            if audience
+                .node_receives(directory, our_key_id, cohort)
+                .await?
+            {
                 out.insert(c.community_key_id);
             }
         }

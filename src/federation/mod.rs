@@ -499,6 +499,10 @@ pub mod replication_audience_invariants;
 // fold, held to their v53.1.4 whole-slice bodies.
 #[cfg(test)]
 pub mod audience_scan_invariants;
+// v53.1.6 — four more reads bounded to what their folds use (CIRISEdge's
+// heap harness), held to their verbatim pre-fix bodies.
+#[cfg(test)]
+pub mod bounded_reads_invariants;
 #[cfg(test)]
 pub mod read_probe;
 pub mod replication_policy;
@@ -2587,6 +2591,32 @@ pub enum AttestationOutcome {
 /// entirely unpurgeable, so the sweep terminates rather than scanning it all.
 const MAX_REAP_PAGES: usize = 16;
 
+/// v53.1.6 — the envelope's first `evidence_refs` element, as V180 indexes it.
+#[must_use]
+pub fn first_evidence_ref(envelope: &serde_json::Value) -> Option<&str> {
+    envelope
+        .get("evidence_refs")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|a| a.first())
+        .and_then(serde_json::Value::as_str)
+}
+
+/// v53.1.6 — V150's `cohort_target` as the memory backend and the default
+/// bodies compute it: the first present of `community_id`,
+/// `community_key_id`, `cohort_key_id`, `family_key_id` (the generated
+/// column's COALESCE order, verbatim).
+#[must_use]
+pub fn cohort_target_of_envelope(envelope: &serde_json::Value) -> Option<&str> {
+    [
+        "community_id",
+        "community_key_id",
+        "cohort_key_id",
+        "family_key_id",
+    ]
+    .iter()
+    .find_map(|k| envelope.get(*k).and_then(serde_json::Value::as_str))
+}
+
 /// Federation directory trait — the registry/lens/agent's read+write
 /// surface over persist's three federation tables.
 ///
@@ -3387,6 +3417,89 @@ pub trait FederationDirectory: Send + Sync {
         }
         out.sort_by_key(|a| std::cmp::Reverse(a.asserted_at));
         Ok(out)
+    }
+
+    /// v53.1.6 — the federation-tier rows attested TO `attested_key_id`
+    /// whose `attestation_type` is `attestation_type` (a `delegates_to`
+    /// subject's incoming edges; a subject's `withdraws` / `recants`).
+    /// Ordered by `asserted_at` DESC. Served by V178's
+    /// `(attested_key_id, attestation_type, …)` prefix. Pin-compatible
+    /// default over the unbounded read; every backend overrides.
+    async fn list_attestations_for_type(
+        &self,
+        attested_key_id: &str,
+        attestation_type: &str,
+    ) -> Result<Vec<Attestation>, Error> {
+        Ok(self
+            .list_attestations_for(attested_key_id)
+            .await?
+            .into_iter()
+            .filter(|a| a.attestation_type == attestation_type)
+            .collect())
+    }
+
+    /// v53.1.6 — the federation-tier rows `attesting_key_id` authored whose
+    /// `attestation_type` is `attestation_type` (a steward's outgoing
+    /// `delegates_to` edges — the candidates of [`admission::nodes_owned_by`]
+    /// and [`admission::nodes_stewarded_by`]). Ordered by `asserted_at` DESC.
+    /// Served by V107's `(attesting_key_id, attestation_type, …)` prefix.
+    /// Pin-compatible default over the unbounded read; every backend
+    /// overrides.
+    async fn list_attestations_by_type(
+        &self,
+        attesting_key_id: &str,
+        attestation_type: &str,
+    ) -> Result<Vec<Attestation>, Error> {
+        Ok(self
+            .list_attestations_by(attesting_key_id)
+            .await?
+            .into_iter()
+            .filter(|a| a.attestation_type == attestation_type)
+            .collect())
+    }
+
+    /// v53.1.6 — the federation-tier rows `attesting_key_id` authored under
+    /// exactly `dimension` whose envelope's `evidence_refs` FIRST element is
+    /// `evidence_ref` — a device's `custody:ack:v1` reports about one blob.
+    /// Ordered by `asserted_at` DESC. Served by V180's
+    /// `(attesting_key_id, dimension, evidence_refs[0])`. Pin-compatible
+    /// default over the dimension read; every backend overrides.
+    async fn list_attestations_by_dimension_citing(
+        &self,
+        attesting_key_id: &str,
+        dimension: &str,
+        evidence_ref: &str,
+    ) -> Result<Vec<Attestation>, Error> {
+        Ok(self
+            .list_attestations_by_dimension_prefix(attesting_key_id, dimension)
+            .await?
+            .into_iter()
+            .filter(|a| {
+                admission::envelope_dimension(&a.attestation_envelope) == Some(dimension)
+                    && first_evidence_ref(&a.attestation_envelope) == Some(evidence_ref)
+            })
+            .collect())
+    }
+
+    /// v53.1.6 — the federation-tier rows placed at one of `cohort_scopes`
+    /// whose V150 `cohort_target` (the envelope's `community_id` /
+    /// `community_key_id` / `cohort_key_id` / `family_key_id`, first present)
+    /// is `cohort_target` and whose `dimension` starts with
+    /// `dimension_prefix` — a GROUP's `membership:proposal:v1` rows. Ordered
+    /// by `asserted_at` DESC. Served by V150's `(cohort_scope,
+    /// cohort_target)`. Defaulted `Unsupported` (no unbounded read is keyed
+    /// this way); every backend overrides, and `live_invitees_of` falls back
+    /// to per-signer dimension reads when it is not served.
+    async fn list_targeted_by_dimension_prefix(
+        &self,
+        cohort_scopes: &[&str],
+        cohort_target: &str,
+        dimension_prefix: &str,
+    ) -> Result<Vec<Attestation>, Error> {
+        let _ = (cohort_scopes, cohort_target, dimension_prefix);
+        Err(Error::Unsupported {
+            method: "list_targeted_by_dimension_prefix",
+        })
     }
 
     /// v21.0.0 (CIRISPersist#502 E7) — the revocation-folded
