@@ -7,6 +7,82 @@ threat-model citations because this crate's audit story is the point.
 
 ## [Unreleased]
 
+## [53.1.8] - 2026-10-07
+
+### Fixed — the score emit gate refused what its consent precheck granted (#1013)
+
+CIRISServer 0.5.223 on persist 53.1.7: the canonical's first scorer pass refused 13 agents at emit (`emit_attestation_self(capacity): no live consent covers this capacity:sustained_coherence:v1 emission`), after its precheck — `resolve_scoped_consent_by_principals(canonical, agent, "analyze")` — had returned Granted for every one. Each agent's only consent row is its steward's: a user-role key, attested to the canonical, `consent:state:granted:v1`, bare `analyze`, `for_key_id` = the agent, no expiry, nothing authored by the agent.
+
+`check_capacity_consent_admission` folded the subject's own rows only (`resolve_scoped_consent`); v44.6.0's principal walk (#857 — consent is by humans, for this machine) never reached it. The gap dates from v44.6.0; it is not a 53.1.x regression.
+
+- **One fold, `consent_by_humans::capacity_consent_stance(directory, attester, subject, family, now)`**: `resolve_scoped_consent_by_principals` asked for `analyze:<family>` (#866 C1). The gate calls it; `Engine::capacity_consent_stance` and PyO3 `Engine.capacity_consent_stance(attester_key_id, subject_key_id, family, now_iso=None)` expose it, so a scorer's precheck is the gate's own function. `family` crosses the FFI as its token (`"capacity"`); an unknown token raises `ValueError`. New `ConsentGatedFamily::from_token` and `ConsentGatedFamily::analyze_scope`.
+- **The scope.** The gate asks `analyze:capacity`; a precheck asking bare `analyze` disagrees with it on a grant narrowed to `analyze:capacity` (the gate admits, the bare precheck reads Unspecified). A grant narrowed to another family is refused by both. Server: switch the precheck to `capacity_consent_stance`.
+- **The refusal names the scope it asked** (`"analyze:capacity"`), not the constant `"analyze"`, and says a steward's row naming the subject also authorizes. `ConsentGateRefused` gains no field (it is exhaustive and public; a field would break an out-of-crate constructor): the scope is derived from `family`.
+- **Not changed, reported:** two retention paths still read the subject-only scoped fold for the `retain` window — `Engine::evict_fountain_content_by_consent` and the deletion-window breach sweep — so a steward's `retain:<window>` naming the machine does not bound them. Different consequence (deletion), separate ruling.
+- **Witnesses (memory, sqlite, postgres).** I548a: the production row shape is admitted by the gate and Granted by the fold (refused through 53.1.7). I548b: a grant narrowed to `analyze:trust` is refused by both; one narrowed to `analyze:capacity` admitted by both. I548c: gate verdict == (stance == Granted) and == the expected verdict across subject-only grant, steward-only grant, steward grant naming another machine, steward revoke + subject grant, expired, narrowed to this family, narrowed to another. I548d: the refusal contains `"analyze:capacity"`. I548e (from disk): the gate, the Engine door and the PyO3 door reach the one fold.
+- Mutation-checked: the gate reverted to the subject-only `resolve_scoped_consent` reds I548a, I548c (`steward-only-grant: the gate (false) and the precheck (Granted) disagree`) and I548e; the fold asking bare `analyze` reds I548b and I548c (`narrowed-to-this-family`); the refusal printing the constant again reds I548d and the Display test.
+
+**Adopters.** Pin-compatible with 53.1.7: no wire, ABI, migration or verify change; one new Engine / PyO3 method. Server: call `capacity_consent_stance(canonical, agent, "capacity")` as the precheck.
+
+### Added — read telemetry, always on (CIRISPersist#1014, CIRISServer#746 §4 P0)
+
+Telemetry work is priority one, and the next scale step waits until runtime behaviour is understood. Before this release persist could not report what it read at runtime: the read probe was `cfg(test)`, and the cache counters had no host accessor.
+
+- **`crate::observe`: door counters.** Process-wide relaxed atomics keyed by `(backend, door)`, counting reads, rows returned and envelope bytes decoded. No allocation, lock or key string on the read path. Every attestation-returning door feeds them through one helper, `observe::record_read`, and that helper also feeds the `cfg(test)` read probe, so the probe and the counters cannot drift. There are 22 doors: the 13 the probe already covered, plus nine reads it missed:
+  - `list_live_consent_grants_by` and `list_live_consent_grants_for`
+  - `list_local_tier_attestations`
+  - `list_widening_candidates`
+  - `list_attestations_for_migration`
+  - `attestations_binding_content`
+  - `get_attestation`
+  - `list_attestations_since`
+  - `list_attestation_log`
+
+  Memory has 21 of the 22, because `ReadEngine::list_attestations` is unsupported there.
+- **What "bytes" means.** The stored `attestation_envelope` TEXT length of every row the backend decoded to answer the read. It is never a re-serialization.
+  - **sqlite:** the length `sqlite_row_to_attestation` reads before parsing. It is accumulated on the reader thread and drained by `SqliteBackend::read_measured`.
+  - **postgres:** the TEXT column's octet length (V122), read from the row buffer as a borrowed `&str` before decode.
+  - **memory:** `0`. The backend holds parsed envelopes only, so a byte count would mean re-serializing.
+
+  A door that filters after decode (the live consent-grant reads, `attestations_binding_content`) reports the bytes it decoded. `rows` is always the number of rows it returned.
+- **Fold attribution.** `observe::fold` counts each entry into a fold. A task-local fold mask then credits every door read made while the fold runs to that fold. Attribution is inclusive, like a span: a nested fold credits both folds. The folds:
+  - consent: `resolve_scoped_stance_by_principals` and `FederationDirectory::resolve_scoped_stance`;
+  - trust root: `trusted_roots_of`, `trust_root_valid`, `owner_granted_scope`, and `resolve_serve_tier_over_roster` (which `resolve_serve_tier` calls);
+  - audience: `owner_allow_list`, `is_public_group` and `OwnerAudience::read`;
+  - attestation admission: entered through `put_attestation`, `put_attestation_authored` and the replicated-apply path.
+- **Host snapshot.**
+  - `Engine::telemetry_snapshot()` returns a plain serializable `TelemetrySnapshot`.
+  - `Engine::cache_stats()` returns `EngineCacheStats`, covering the repository-statistics and scoring-factor caches.
+  - `Engine::admission_cache_stats()` returns `None`, because no Engine installs an `AdmissionCache` today, and a zeroed struct would read as an idle cache.
+  - PyEngine mirrors all three, returning dicts, and the `.pyi` stub is updated.
+- **`observe::catalog::TELEMETRY_CATALOG`.** Seven counters, with names in the OTel style:
+  - `ciris.persist.read.calls`, `.rows` and `.bytes`, labelled by `backend` and `door`;
+  - `ciris.persist.fold.calls`, `.reads`, `.rows` and `.bytes`, labelled by `fold`.
+
+  Each label carries a hand-written, bounded value set.
+- **Gates filed.** `read_measured` is filed in the sqlite connection model as `Read`, and is recognised as a read-door token. `sqlite_typed_read` now returns `Result<(rows, bytes)>`, matching `pg_typed_read`, so the parity scan still sees its call propagate. The three PyEngine symbols are pinned `empirical` in `scripts/ffi_taxonomy.tsv`, and the stub and evidence are regenerated.
+- **Witnesses.**
+  - **I549** (memory, sqlite and postgres). The witness runs a seeded consent corpus, a key root with its charter and a trust edge, an owner's replication grant, one admission, both consent folds, all four trust-root walks, the serve tier and the three audience reads. For every `(backend, door)`, the counter delta equals the probe's totals for the same calls. Reads and rows match exactly. Bytes equal the probe's envelope bytes on sqlite and postgres, and are 0 on memory. No other backend's counters move. Each fold's delta is its entry plus every read the probe saw while it ran. A `cfg(test)` thread-local counter set (`observe::LocalCounters`, the `metrics::with_local_recorder` pattern) isolates the witness from tests running in parallel.
+  - **I550** (sqlite and postgres). `Engine::telemetry_snapshot` reads the counters and lists every fold. `cache_stats` is reachable through the Engine. `admission_cache_stats` is `None`. The snapshot serializes.
+  - **I551** (from disk, with comments stripped and string literals preserved). Every `observe::Door`, `Fold` and `StoreBackend` label that code names is catalogued, and every catalogued label is emitted. The enums agree with the catalogue. Each backend file records under its own label only. The snapshot's samples carry exactly the catalogued names, label keys and bounded values.
+- **Mutation-checked: 10 mutants, all killed.**
+  - Backend counters, killed by I549:
+    - `record_read` skipping sqlite's door increment (sqlite red, memory green);
+    - sqlite's row mapper not noting envelope bytes;
+    - `pg_envelope_bytes` returning 0;
+    - `record_read` skipping memory's door increment.
+  - Fold attribution, killed by I549:
+    - `trust_root_valid` called without its fold;
+    - the fold credit dropped from `record_read`;
+    - a fold scope that omits its own bit;
+    - `put_attestation` entering admission without the fold.
+  - Catalogue, killed by I551:
+    - a door dropped from `DOOR_VALUES` ("emitted but not catalogued");
+    - a bogus value added ("catalogued but never emitted").
+- **Not in this release (P1):** emission through the `metrics` facade, spans, duration histograms, and pool or `sqlite3_status` gauges. P1 emits through the facade on top of these counters.
+
+**Adopters.** This release is additive and pin-compatible with 53.1.7: no wire, capsule ABI or verify change, and no new `FederationDirectory` method. To use it, call `engine.telemetry_snapshot()`, `engine.cache_stats()` and `engine.admission_cache_stats()`.
+
 ## [53.1.7] - 2026-10-07
 
 ### Fixed — `list_attestations_referencing` scanned the whole table on every call (CIRISEdge PR #818)

@@ -173,6 +173,38 @@ pub async fn resolve_scoped_consent_by_principals(
     .state)
 }
 
+/// v53.1.8 (CIRISPersist#1013) — **may `attester` emit a `family` score about
+/// `subject`?** The ONE fold the consent-before-scoring gate
+/// ([`check_capacity_consent_admission`](super::admission::check_capacity_consent_admission))
+/// asks, and the one a scorer's precheck asks before it emits, so the two
+/// cannot disagree.
+///
+/// It walks the principals ([`resolve_scoped_consent_by_principals`]: the
+/// subject's own rows, and each steward's rows that name the subject in
+/// [`FOR_KEY_ID`]) and asks the family-narrowed scope `analyze:<family>`
+/// (#866 C1): a bare `analyze` grant covers it, a grant narrowed to this
+/// family covers it, a grant narrowed to another family does not. Before this
+/// cut the gate folded only the subject's own rows and a precheck asked bare
+/// `analyze`; a steward's grant for the machine passed the precheck and was
+/// refused at emit.
+pub async fn capacity_consent_stance(
+    directory: &dyn FederationDirectory,
+    attester_key_id: &str,
+    subject_key_id: &str,
+    family: super::admission::ConsentGatedFamily,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<ConsentState, Error> {
+    resolve_scoped_consent_by_principals(
+        directory,
+        attester_key_id, // the consent edge points AT the attester
+        subject_key_id,  // and is authored by the subject or a steward naming it
+        &family.analyze_scope(),
+        None,
+        now,
+    )
+    .await
+}
+
 /// v44.8.0 (CIRISPersist#866 C1b) — [`resolve_scoped_consent_by_principals`]
 /// WITH its bound ([`super::consent::ScopedStance`]): the stance combined by
 /// [`combine_principal_stances`], and `retain_until` the **tightest** window
@@ -180,6 +212,30 @@ pub async fn resolve_scoped_consent_by_principals(
 /// machine's own `retain:90d`, never the other way. The one body both doors
 /// run.
 pub async fn resolve_scoped_stance_by_principals(
+    directory: &dyn FederationDirectory,
+    target_key_id: &str,
+    subject_key_id: &str,
+    scope: &str,
+    qualifier: Option<&str>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<super::consent::ScopedStance, Error> {
+    crate::observe::fold(
+        crate::observe::Fold::ResolveScopedStanceByPrincipals,
+        resolve_scoped_stance_by_principals_body(
+            directory,
+            target_key_id,
+            subject_key_id,
+            scope,
+            qualifier,
+            now,
+        ),
+    )
+    .await
+}
+
+/// [`resolve_scoped_stance_by_principals`]'s fold, run inside its
+/// [`crate::observe::fold`].
+async fn resolve_scoped_stance_by_principals_body(
     directory: &dyn FederationDirectory,
     target_key_id: &str,
     subject_key_id: &str,

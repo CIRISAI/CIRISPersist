@@ -4119,6 +4119,75 @@ impl PyEngine {
         Ok(cfg.storage_budget_bytes)
     }
 
+    /// v53.1.8 (CIRISPersist#1014) — [`crate::Engine::telemetry_snapshot`]
+    /// as a dict: `{"reads": [{backend, door, reads, rows, bytes}, ...],
+    /// "folds": [{fold, calls, reads, rows, bytes}, ...]}`. `reads` lists
+    /// each `(backend, door)` that served a read; `folds` lists every fold.
+    /// Process-wide counters (`crate::observe`); names per
+    /// `TELEMETRY_CATALOG`.
+    fn telemetry_snapshot<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        self.ensure_usable()?;
+        let snap = crate::observe::snapshot();
+        let reads = pyo3::types::PyList::empty(py);
+        for r in &snap.reads {
+            let d = PyDict::new(py);
+            d.set_item("backend", r.backend)?;
+            d.set_item("door", r.door)?;
+            d.set_item("reads", r.reads)?;
+            d.set_item("rows", r.rows)?;
+            d.set_item("bytes", r.bytes)?;
+            reads.append(d)?;
+        }
+        let folds = pyo3::types::PyList::empty(py);
+        for f in &snap.folds {
+            let d = PyDict::new(py);
+            d.set_item("fold", f.fold)?;
+            d.set_item("calls", f.calls)?;
+            d.set_item("reads", f.reads)?;
+            d.set_item("rows", f.rows)?;
+            d.set_item("bytes", f.bytes)?;
+            folds.append(d)?;
+        }
+        let dict = PyDict::new(py);
+        dict.set_item("reads", reads)?;
+        dict.set_item("folds", folds)?;
+        Ok(dict)
+    }
+
+    /// v53.1.8 (CIRISPersist#1014) — [`crate::Engine::cache_stats`] as a
+    /// dict keyed by cache (`repository_statistics`, `scoring_factors`),
+    /// each `{hits, misses, evictions_lru, evictions_ttl,
+    /// invalidations_write, bytes_resident, entries_resident}`.
+    fn cache_stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        self.ensure_usable()?;
+        let stats = self.engine_dispatch().cache_stats();
+        let dict = PyDict::new(py);
+        for (name, c) in [
+            ("repository_statistics", stats.repository_statistics),
+            ("scoring_factors", stats.scoring_factors),
+        ] {
+            let d = PyDict::new(py);
+            d.set_item("hits", c.hits)?;
+            d.set_item("misses", c.misses)?;
+            d.set_item("evictions_lru", c.evictions_lru)?;
+            d.set_item("evictions_ttl", c.evictions_ttl)?;
+            d.set_item("invalidations_write", c.invalidations_write)?;
+            d.set_item("bytes_resident", c.bytes_resident)?;
+            d.set_item("entries_resident", c.entries_resident)?;
+            dict.set_item(name, d)?;
+        }
+        Ok(dict)
+    }
+
+    /// v53.1.8 (CIRISPersist#1014) —
+    /// [`crate::Engine::admission_cache_stats`]: always `None` today, because
+    /// no engine installs an admission cache (a zeroed dict would read as an
+    /// idle one). Declared so a host can probe for it now.
+    fn admission_cache_stats(&self) -> PyResult<Option<Py<PyDict>>> {
+        self.ensure_usable()?;
+        Ok(None)
+    }
+
     /// v6.8.0 (CIRISPersist#149) — live disk-pressure snapshot for
     /// monitoring. Re-polls the (injectable) free-bytes source, returns
     /// a dict: `{free_bytes, tier, refuses_proxy_writes,
@@ -25750,6 +25819,57 @@ impl PyEngine {
                         q.as_deref(),
                         now,
                     ))
+                    .map_err(federation_err_to_py)?;
+                Ok(match stance {
+                    crate::federation::hard_case::ConsentState::Granted => "granted",
+                    crate::federation::hard_case::ConsentState::Revoked => "revoked",
+                    crate::federation::hard_case::ConsentState::Expired => "expired",
+                    crate::federation::hard_case::ConsentState::Unspecified => "unspecified",
+                }
+                .to_owned())
+            })
+        })
+    }
+
+    /// v53.1.8 (CIRISPersist#1013) — the consent-before-scoring stance the
+    /// emit gate asks: by principals, scope `analyze:<family>`. A scorer's
+    /// precheck calls this and gets the gate's answer. `family` is the
+    /// gated family's token (`"capacity"`); an unknown one raises
+    /// `ValueError`. Returns the stance name. FFI mirror of
+    /// [`Engine::capacity_consent_stance`](crate::Engine::capacity_consent_stance).
+    #[pyo3(signature = (attester_key_id, subject_key_id, family, now_iso = None))]
+    fn capacity_consent_stance(
+        &self,
+        py: Python<'_>,
+        attester_key_id: &str,
+        subject_key_id: &str,
+        family: &str,
+        now_iso: Option<&str>,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let now = match now_iso {
+                Some(v) => chrono::DateTime::parse_from_rfc3339(v)
+                    .map(|t| t.with_timezone(&chrono::Utc))
+                    .map_err(|e| PyValueError::new_err(format!("now_iso parse: {e}")))?,
+                None => chrono::Utc::now(),
+            };
+            let family = crate::federation::admission::ConsentGatedFamily::from_token(family)
+                .ok_or_else(|| {
+                    PyValueError::new_err(format!(
+                        "unknown consent-gated family {family:?}; known: {:?}",
+                        crate::federation::admission::ConsentGatedFamily::ALL
+                            .iter()
+                            .map(|f| f.as_str())
+                            .collect::<Vec<_>>()
+                    ))
+                })?;
+            let (a, sub) = (attester_key_id.to_owned(), subject_key_id.to_owned());
+            let engine = self.hold_engine_view();
+            py.detach(move || {
+                let stance = self
+                    .runtime
+                    .block_on(engine.capacity_consent_stance(&a, &sub, family, now))
                     .map_err(federation_err_to_py)?;
                 Ok(match stance {
                     crate::federation::hard_case::ConsentState::Granted => "granted",

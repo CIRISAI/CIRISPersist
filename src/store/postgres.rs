@@ -328,9 +328,9 @@ impl PostgresBackend {
         key: &str,
         attestation_types: &[&str],
         excluded_dimensions: &[&str],
-    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
+    ) -> Result<(Vec<crate::federation::Attestation>, u64), crate::federation::Error> {
         if attestation_types.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), 0));
         }
         let sql = format!(
             "SELECT {PG_ATTESTATION_COLUMNS} FROM cirislens.federation_attestations \
@@ -348,7 +348,13 @@ impl PostgresBackend {
             .query(&sql, &[&key, &types, &excluded])
             .await
             .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
-        rows.into_iter().map(pg_row_to_attestation).collect()
+        let bytes = pg_envelope_bytes(&rows);
+        Ok((
+            rows.into_iter()
+                .map(pg_row_to_attestation)
+                .collect::<Result<_, _>>()?,
+            bytes,
+        ))
     }
 
     /// v53.1.0 (#979) — TEST SEAM: drop the V176 relation of a manifest (a
@@ -7075,18 +7081,18 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .map_err(|e| {
                 crate::federation::Error::Backend(format!("list_attestations_referencing: {e}"))
             })?;
+        let bytes = pg_envelope_bytes(&rows);
         rows.into_iter()
             .map(pg_row_to_attestation)
             .collect::<Result<Vec<_>, _>>()
             .inspect(|rows| {
-                #[cfg(test)]
-                crate::federation::read_probe::record(
-                    "list_attestations_referencing",
+                crate::observe::record_read(
+                    crate::observe::StoreBackend::Postgres,
+                    crate::observe::Door::ListAttestationsReferencing,
                     target_attestation_id,
                     rows,
-                );
-                #[cfg(not(test))]
-                let _ = rows;
+                    bytes,
+                )
             })
     }
 
@@ -7118,18 +7124,18 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .map_err(|e| {
                 crate::federation::Error::Backend(format!("list_attestations_for: {e}"))
             })?;
+        let bytes = pg_envelope_bytes(&rows);
         rows.into_iter()
             .map(pg_row_to_attestation)
             .collect::<Result<Vec<_>, _>>()
             .inspect(|rows| {
-                #[cfg(test)]
-                crate::federation::read_probe::record(
-                    "list_attestations_for",
+                crate::observe::record_read(
+                    crate::observe::StoreBackend::Postgres,
+                    crate::observe::Door::ListAttestationsFor,
                     attested_key_id,
                     rows,
-                );
-                #[cfg(not(test))]
-                let _ = rows;
+                    bytes,
+                )
             })
     }
 
@@ -7155,18 +7161,18 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             )
             .await
             .map_err(|e| crate::federation::Error::Backend(format!("list_attestations_by: {e}")))?;
+        let bytes = pg_envelope_bytes(&rows);
         rows.into_iter()
             .map(pg_row_to_attestation)
             .collect::<Result<Vec<_>, _>>()
             .inspect(|rows| {
-                #[cfg(test)]
-                crate::federation::read_probe::record(
-                    "list_attestations_by",
+                crate::observe::record_read(
+                    crate::observe::StoreBackend::Postgres,
+                    crate::observe::Door::ListAttestationsBy,
                     attesting_key_id,
                     rows,
-                );
-                #[cfg(not(test))]
-                let _ = rows;
+                    bytes,
+                )
             })
     }
 
@@ -7194,18 +7200,18 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let rows = client.query(&sql, &params_ref[..]).await.map_err(|e| {
             crate::federation::Error::Backend(format!("list_attestations_by_dimension_prefix: {e}"))
         })?;
+        let bytes = pg_envelope_bytes(&rows);
         rows.into_iter()
             .map(pg_row_to_attestation)
             .collect::<Result<Vec<_>, _>>()
             .inspect(|rows| {
-                #[cfg(test)]
-                crate::federation::read_probe::record(
-                    "list_attestations_by_dimension_prefix",
+                crate::observe::record_read(
+                    crate::observe::StoreBackend::Postgres,
+                    crate::observe::Door::ListAttestationsByDimensionPrefix,
                     attesting_key_id,
                     rows,
-                );
-                #[cfg(not(test))]
-                let _ = rows;
+                    bytes,
+                )
             })
     }
 
@@ -7243,18 +7249,18 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 "list_attestations_for_dimension_prefix: {e}"
             ))
         })?;
+        let bytes = pg_envelope_bytes(&rows);
         rows.into_iter()
             .map(pg_row_to_attestation)
             .collect::<Result<Vec<_>, _>>()
             .inspect(|rows| {
-                #[cfg(test)]
-                crate::federation::read_probe::record(
-                    "list_attestations_for_dimension_prefix",
+                crate::observe::record_read(
+                    crate::observe::StoreBackend::Postgres,
+                    crate::observe::Door::ListAttestationsForDimensionPrefix,
                     attested_key_id,
                     rows,
-                );
-                #[cfg(not(test))]
-                let _ = rows;
+                    bytes,
+                )
             })
     }
 
@@ -7303,18 +7309,18 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let rows = client.query(&sql, &params_ref[..]).await.map_err(|e| {
             crate::federation::Error::Backend(format!("list_composers_referencing_any: {e}"))
         })?;
+        let bytes = pg_envelope_bytes(&rows);
         rows.into_iter()
             .map(pg_row_to_attestation)
             .collect::<Result<Vec<_>, _>>()
             .inspect(|rows| {
-                #[cfg(test)]
-                crate::federation::read_probe::record(
-                    "list_composers_referencing_any",
+                crate::observe::record_read(
+                    crate::observe::StoreBackend::Postgres,
+                    crate::observe::Door::ListComposersReferencingAny,
                     attested_key_id.or(attesting_key_id).unwrap_or("*"),
                     rows,
-                );
-                #[cfg(not(test))]
-                let _ = rows;
+                    bytes,
+                )
             })
     }
 
@@ -7339,18 +7345,18 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .map_err(|e| {
                 crate::federation::Error::Backend(format!("list_attestations_for_type: {e}"))
             })?;
+        let bytes = pg_envelope_bytes(&rows);
         rows.into_iter()
             .map(pg_row_to_attestation)
             .collect::<Result<Vec<_>, _>>()
             .inspect(|rows| {
-                #[cfg(test)]
-                crate::federation::read_probe::record(
-                    "list_attestations_for_type",
+                crate::observe::record_read(
+                    crate::observe::StoreBackend::Postgres,
+                    crate::observe::Door::ListAttestationsForType,
                     attested_key_id,
                     rows,
-                );
-                #[cfg(not(test))]
-                let _ = rows;
+                    bytes,
+                )
             })
     }
 
@@ -7376,18 +7382,18 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .map_err(|e| {
                 crate::federation::Error::Backend(format!("list_attestations_by_type: {e}"))
             })?;
+        let bytes = pg_envelope_bytes(&rows);
         rows.into_iter()
             .map(pg_row_to_attestation)
             .collect::<Result<Vec<_>, _>>()
             .inspect(|rows| {
-                #[cfg(test)]
-                crate::federation::read_probe::record(
-                    "list_attestations_by_type",
+                crate::observe::record_read(
+                    crate::observe::StoreBackend::Postgres,
+                    crate::observe::Door::ListAttestationsByType,
                     attesting_key_id,
                     rows,
-                );
-                #[cfg(not(test))]
-                let _ = rows;
+                    bytes,
+                )
             })
     }
 
@@ -7400,7 +7406,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         attestation_types: &[&str],
         excluded_dimensions: &[&str],
     ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
-        let rows = self
+        let (rows, bytes) = self
             .pg_typed_read(
                 "attested_key_id",
                 attested_key_id,
@@ -7411,11 +7417,12 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .map_err(|e| {
                 crate::federation::Error::Backend(format!("list_attestations_for_types: {e}"))
             })?;
-        #[cfg(test)]
-        crate::federation::read_probe::record(
-            "list_attestations_for_types",
+        crate::observe::record_read(
+            crate::observe::StoreBackend::Postgres,
+            crate::observe::Door::ListAttestationsForTypes,
             attested_key_id,
             &rows,
+            bytes,
         );
         Ok(rows)
     }
@@ -7428,7 +7435,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         attestation_types: &[&str],
         excluded_dimensions: &[&str],
     ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
-        let rows = self
+        let (rows, bytes) = self
             .pg_typed_read(
                 "attesting_key_id",
                 attesting_key_id,
@@ -7439,11 +7446,12 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .map_err(|e| {
                 crate::federation::Error::Backend(format!("list_attestations_by_types: {e}"))
             })?;
-        #[cfg(test)]
-        crate::federation::read_probe::record(
-            "list_attestations_by_types",
+        crate::observe::record_read(
+            crate::observe::StoreBackend::Postgres,
+            crate::observe::Door::ListAttestationsByTypes,
             attesting_key_id,
             &rows,
+            bytes,
         );
         Ok(rows)
     }
@@ -7475,18 +7483,18 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     "list_attestations_by_dimension_citing: {e}"
                 ))
             })?;
+        let bytes = pg_envelope_bytes(&rows);
         rows.into_iter()
             .map(pg_row_to_attestation)
             .collect::<Result<Vec<_>, _>>()
             .inspect(|rows| {
-                #[cfg(test)]
-                crate::federation::read_probe::record(
-                    "list_attestations_by_dimension_citing",
+                crate::observe::record_read(
+                    crate::observe::StoreBackend::Postgres,
+                    crate::observe::Door::ListAttestationsByDimensionCiting,
                     attesting_key_id,
                     rows,
-                );
-                #[cfg(not(test))]
-                let _ = rows;
+                    bytes,
+                )
             })
     }
 
@@ -7520,18 +7528,18 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let rows = client.query(&sql, &params_ref[..]).await.map_err(|e| {
             crate::federation::Error::Backend(format!("list_targeted_by_dimension_prefix: {e}"))
         })?;
+        let bytes = pg_envelope_bytes(&rows);
         rows.into_iter()
             .map(pg_row_to_attestation)
             .collect::<Result<Vec<_>, _>>()
             .inspect(|rows| {
-                #[cfg(test)]
-                crate::federation::read_probe::record(
-                    "list_targeted_by_dimension_prefix",
+                crate::observe::record_read(
+                    crate::observe::StoreBackend::Postgres,
+                    crate::observe::Door::ListTargetedByDimensionPrefix,
                     cohort_target,
                     rows,
-                );
-                #[cfg(not(test))]
-                let _ = rows;
+                    bytes,
+                )
             })
     }
 
@@ -7631,17 +7639,26 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .map_err(|e| {
                 crate::federation::Error::Backend(format!("list_live_consent_grants_by: {e}"))
             })?;
+        let bytes = pg_envelope_bytes(&rows);
         let candidates: Vec<crate::federation::Attestation> = rows
             .into_iter()
             .map(pg_row_to_attestation)
             .collect::<Result<_, _>>()?;
-        Ok(candidates
+        let rows: Vec<crate::federation::Attestation> = candidates
             .into_iter()
             .filter(|a| {
                 crate::federation::admission::envelope_dimension(&a.attestation_envelope)
                     == Some(crate::federation::consent_peer_set::DIMENSION)
             })
-            .collect())
+            .collect();
+        crate::observe::record_read(
+            crate::observe::StoreBackend::Postgres,
+            crate::observe::Door::ListLiveConsentGrantsBy,
+            node_key_id,
+            &rows,
+            bytes,
+        );
+        Ok(rows)
     }
 
     // v48.0.0 (CIRISPersist#905) — the V147 projection's live sources for this
@@ -7675,17 +7692,26 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .map_err(|e| {
                 crate::federation::Error::Backend(format!("list_live_consent_grants_by: {e}"))
             })?;
+        let bytes = pg_envelope_bytes(&rows);
         let candidates: Vec<crate::federation::Attestation> = rows
             .into_iter()
             .map(pg_row_to_attestation)
             .collect::<Result<_, _>>()?;
-        Ok(candidates
+        let rows: Vec<crate::federation::Attestation> = candidates
             .into_iter()
             .filter(|a| {
                 crate::federation::admission::envelope_dimension(&a.attestation_envelope)
                     == Some(crate::federation::consent_peer_set::DIMENSION)
             })
-            .collect())
+            .collect();
+        crate::observe::record_read(
+            crate::observe::StoreBackend::Postgres,
+            crate::observe::Door::ListLiveConsentGrantsFor,
+            for_key_id,
+            &rows,
+            bytes,
+        );
+        Ok(rows)
     }
 
     /// v21.2.0 (CIRISPersist#509 FLOOR) — the `promote_consented_backlog`
@@ -7722,7 +7748,19 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .map_err(|e| {
                 crate::federation::Error::Backend(format!("list_local_tier_attestations: {e}"))
             })?;
-        rows.into_iter().map(pg_row_to_attestation).collect()
+        let bytes = pg_envelope_bytes(&rows);
+        rows.into_iter()
+            .map(pg_row_to_attestation)
+            .collect::<Result<Vec<_>, _>>()
+            .inspect(|rows| {
+                crate::observe::record_read(
+                    crate::observe::StoreBackend::Postgres,
+                    crate::observe::Door::ListLocalTierAttestations,
+                    after_attestation_id.unwrap_or("*"),
+                    rows,
+                    bytes,
+                )
+            })
     }
 
     /// v21.12.0 (CIRISPersist#530) — the repair sweep's page source: the
@@ -7792,7 +7830,19 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .map_err(|e| {
                 crate::federation::Error::Backend(format!("list_widening_candidates: {e}"))
             })?;
-        rows.into_iter().map(pg_row_to_attestation).collect()
+        let bytes = pg_envelope_bytes(&rows);
+        rows.into_iter()
+            .map(pg_row_to_attestation)
+            .collect::<Result<Vec<_>, _>>()
+            .inspect(|rows| {
+                crate::observe::record_read(
+                    crate::observe::StoreBackend::Postgres,
+                    crate::observe::Door::ListWideningCandidates,
+                    after_attestation_id.unwrap_or("*"),
+                    rows,
+                    bytes,
+                )
+            })
     }
 
     /// v31.0.0 (CIRISPersist#650) — the unfiltered corpus enumerator.
@@ -7826,7 +7876,19 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .map_err(|e| {
                 crate::federation::Error::Backend(format!("list_attestations_for_migration: {e}"))
             })?;
-        rows.into_iter().map(pg_row_to_attestation).collect()
+        let bytes = pg_envelope_bytes(&rows);
+        rows.into_iter()
+            .map(pg_row_to_attestation)
+            .collect::<Result<Vec<_>, _>>()
+            .inspect(|rows| {
+                crate::observe::record_read(
+                    crate::observe::StoreBackend::Postgres,
+                    crate::observe::Door::ListAttestationsForMigration,
+                    after_attestation_id.unwrap_or("*"),
+                    rows,
+                    bytes,
+                )
+            })
     }
 
     /// v31.0.0 (CIRISPersist#650) — re-seal in place. Gate stack is
@@ -8365,11 +8427,12 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // and memory: without it a mention was a binding here, and a custody
         // report (which names the sha and binds nothing) kept a withdrawn
         // file Live on postgres.
+        let bytes = pg_envelope_bytes(&rows);
         let atts: Vec<crate::federation::Attestation> = rows
             .into_iter()
             .map(pg_row_to_attestation)
             .collect::<Result<_, _>>()?;
-        Ok(atts
+        let rows: Vec<crate::federation::Attestation> = atts
             .into_iter()
             .filter(|a| {
                 crate::federation::admission::envelope_binds_content(
@@ -8377,7 +8440,15 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     content_sha256,
                 )
             })
-            .collect())
+            .collect();
+        crate::observe::record_read(
+            crate::observe::StoreBackend::Postgres,
+            crate::observe::Door::AttestationsBindingContent,
+            content_sha256,
+            &rows,
+            bytes,
+        );
+        Ok(rows)
     }
 
     async fn put_revocation(
@@ -13979,6 +14050,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .map_err(|e| {
                 crate::federation::Error::Backend(format!("list_attestations_since: {e}"))
             })?;
+        let bytes = pg_envelope_bytes(&rows);
         rows.into_iter()
             .map(|row| {
                 let admitted_at =
@@ -13988,7 +14060,16 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     admitted_at,
                 })
             })
-            .collect()
+            .collect::<Result<Vec<_>, _>>()
+            .inspect(|rows| {
+                crate::observe::record_read(
+                    crate::observe::StoreBackend::Postgres,
+                    crate::observe::Door::ListAttestationsSince,
+                    "*",
+                    rows,
+                    bytes,
+                )
+            })
     }
 
     async fn list_signed_identity_occurrence_revocations_since(
@@ -14303,7 +14384,19 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             )
             .await
             .map_err(|e| crate::federation::Error::Backend(format!("get_attestation: {e}")))?;
-        row_opt.map(pg_row_to_attestation).transpose()
+        let bytes = pg_envelope_bytes(row_opt.as_slice());
+        row_opt
+            .map(pg_row_to_attestation)
+            .transpose()
+            .inspect(|row| {
+                crate::observe::record_read(
+                    crate::observe::StoreBackend::Postgres,
+                    crate::observe::Door::GetAttestation,
+                    attestation_id,
+                    row.as_slice(),
+                    bytes,
+                )
+            })
     }
 
     /// v39.0.0 — the tier crossing. Everything that decides lives in
@@ -14646,6 +14739,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .query(&sql, &params_ref[..])
             .await
             .map_err(|e| Error::Backend(format!("list_attestation_log: {e}")))?;
+        let bytes = pg_envelope_bytes(&rows);
         let items: Vec<crate::federation::Attestation> = rows
             .into_iter()
             .map(pg_row_to_attestation)
@@ -14670,6 +14764,13 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let items =
             crate::federation::quarantine::filter_withheld_rows(self, items, chrono::Utc::now())
                 .await?;
+        crate::observe::record_read(
+            crate::observe::StoreBackend::Postgres,
+            crate::observe::Door::ListAttestationLog,
+            subject_key_id.unwrap_or("*"),
+            &items,
+            bytes,
+        );
         Ok(crate::read::ScoresPage { items, next_cursor })
     }
 
@@ -23755,6 +23856,19 @@ fn pg_dimension_prefix_clause(
     }
 }
 
+/// CIRISPersist#1014 — the `attestation_envelope` TEXT octets (V122) of
+/// `rows`, read from each row's buffer before decode (a borrowed `&str`, no
+/// copy): the `bytes` an attestation door reports to
+/// [`crate::observe::record_read`].
+fn pg_envelope_bytes(rows: &[tokio_postgres::Row]) -> u64 {
+    rows.iter()
+        .map(|r| {
+            r.try_get::<_, &str>("attestation_envelope")
+                .map_or(0, |t| t.len() as u64)
+        })
+        .sum()
+}
+
 fn pg_row_to_attestation(
     row: tokio_postgres::Row,
 ) -> Result<crate::federation::Attestation, crate::federation::Error> {
@@ -26656,6 +26770,9 @@ impl crate::read::ReadEngine for PostgresBackend {
             .clone()
             .or_else(|| filter.attesting_key_id.clone())
             .unwrap_or_else(|| "*".to_owned());
+        // The key reaches only the test probe; an empty `String` allocates nothing.
+        #[cfg(not(test))]
+        let probe_key = String::new();
         if !(1..=10_000).contains(&limit) {
             return Err(crate::read::Error::InvalidArgument(format!(
                 "limit must be in [1, 10000], got {limit}"
@@ -26875,6 +26992,7 @@ impl crate::read::ReadEngine for PostgresBackend {
             .query(&sql, &params_ref[..])
             .await
             .map_err(|e| crate::read::Error::Backend(format!("list_attestations: {e}")))?;
+        let bytes = pg_envelope_bytes(&rows);
         let items: Result<Vec<crate::federation::Attestation>, crate::federation::Error> =
             rows.into_iter().map(pg_row_to_attestation).collect();
         let items =
@@ -26888,8 +27006,13 @@ impl crate::read::ReadEngine for PostgresBackend {
         } else {
             None
         };
-        #[cfg(test)]
-        crate::federation::read_probe::record("list_attestations", &probe_key, &items);
+        crate::observe::record_read(
+            crate::observe::StoreBackend::Postgres,
+            crate::observe::Door::ListAttestations,
+            &probe_key,
+            &items,
+            bytes,
+        );
         Ok(crate::read::AttestationListPage { items, next_cursor })
     }
 

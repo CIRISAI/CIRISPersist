@@ -1006,6 +1006,22 @@ pub async fn trusted_roots_of<F>(
 where
     F: FederationDirectory + ?Sized,
 {
+    crate::observe::fold(
+        crate::observe::Fold::TrustedRootsOf,
+        trusted_roots_of_body(directory, node_key_id, now),
+    )
+    .await
+}
+
+/// [`trusted_roots_of`]'s walk, run inside its [`crate::observe::fold`].
+async fn trusted_roots_of_body<F>(
+    directory: &F,
+    node_key_id: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Vec<String>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
     // v53.1.7 — the node's trust edges (and their composers), never its whole
     // history: the canonical's own key authors thousands of rows.
     let by_node = match directory
@@ -1369,6 +1385,22 @@ where
 /// `has_accord_conferred_role` walks — this predicate composes beside them, it
 /// does not re-derive them.
 pub async fn trust_root_valid<F>(
+    directory: &F,
+    user_key_id: &str,
+    root_ref: &str,
+) -> Result<TrustRootVerdict, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    crate::observe::fold(
+        crate::observe::Fold::TrustRootValid,
+        trust_root_valid_body(directory, user_key_id, root_ref),
+    )
+    .await
+}
+
+/// [`trust_root_valid`]'s walk, run inside its [`crate::observe::fold`].
+async fn trust_root_valid_body<F>(
     directory: &F,
     user_key_id: &str,
     root_ref: &str,
@@ -3661,6 +3693,28 @@ pub async fn resolve_serve_tier_over_roster<F>(
 where
     F: FederationDirectory + ?Sized,
 {
+    crate::observe::fold(
+        crate::observe::Fold::ResolveServeTier,
+        resolve_serve_tier_over_roster_body(
+            directory,
+            subject_key_id,
+            resolver_key_id,
+            roster_key_ids,
+        ),
+    )
+    .await
+}
+
+/// [`resolve_serve_tier_over_roster`]'s walk, run inside its [`crate::observe::fold`].
+async fn resolve_serve_tier_over_roster_body<F>(
+    directory: &F,
+    subject_key_id: &str,
+    resolver_key_id: &str,
+    roster_key_ids: &[String],
+) -> Result<ServeTier, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
     // ── The subject must be a NODE before any rung is considered ──
     //
     // #788 review: `infra:serve` is server-class. Both rungs are defined over
@@ -3780,6 +3834,23 @@ where
 /// this into "roughly the same checks" is how one path starts honouring a
 /// tombstone the other ignores.
 pub(crate) async fn owner_granted_scope<F>(
+    directory: &F,
+    subject_key_id: &str,
+    granter_key_id: &str,
+    scope: &str,
+) -> Result<bool, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    crate::observe::fold(
+        crate::observe::Fold::OwnerGrantedScope,
+        owner_granted_scope_body(directory, subject_key_id, granter_key_id, scope),
+    )
+    .await
+}
+
+/// [`owner_granted_scope`]'s walk, run inside its [`crate::observe::fold`].
+async fn owner_granted_scope_body<F>(
     directory: &F,
     subject_key_id: &str,
     granter_key_id: &str,

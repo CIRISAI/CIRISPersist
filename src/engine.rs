@@ -663,6 +663,38 @@ pub enum BackendDispatch {
     Sqlite(Arc<SqliteBackend>),
 }
 
+impl BackendDispatch {
+    /// v53.1.8 (CIRISPersist#1014) — the backend's substrate-cache counters
+    /// ([`Engine::cache_stats`]).
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    #[must_use]
+    pub fn cache_stats(&self) -> EngineCacheStats {
+        match self {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(b) => EngineCacheStats {
+                repository_statistics: b.repo_stats_cache().stats(),
+                scoring_factors: b.scoring_factors_cache().stats(),
+            },
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(b) => EngineCacheStats {
+                repository_statistics: b.repo_stats_cache().stats(),
+                scoring_factors: b.scoring_factors_cache().stats(),
+            },
+        }
+    }
+}
+
+/// v53.1.8 (CIRISPersist#1014) — [`Engine::cache_stats`]: one
+/// [`CacheStats`](crate::cache::CacheStats) per substrate cache the backend
+/// holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct EngineCacheStats {
+    /// The repository-statistics aggregate cache.
+    pub repository_statistics: crate::cache::CacheStats,
+    /// The scoring-factors aggregate cache.
+    pub scoring_factors: crate::cache::CacheStats,
+}
+
 /// v1.1.0 (CIRISPersist#43) — Rust-side substrate handle composing
 /// a storage backend plus a federation signer.
 ///
@@ -1274,6 +1306,32 @@ impl Engine {
     /// idiomatic way to hand a backend handle to a worker task.
     pub fn backend(&self) -> &BackendDispatch {
         &self.backend
+    }
+
+    /// v53.1.8 (CIRISPersist#1014) — the read-telemetry counters: every
+    /// attestation door read by `(backend, door)` and every fold entry, with
+    /// the rows and envelope bytes attributed to it ([`crate::observe`]).
+    /// Process-wide: every Engine in the process reads the same counters.
+    #[must_use]
+    pub fn telemetry_snapshot(&self) -> crate::observe::TelemetrySnapshot {
+        crate::observe::snapshot()
+    }
+
+    /// v53.1.8 (CIRISPersist#1014) — the substrate caches' counters (FSD V4.0
+    /// §7.2): the per-backend repository-statistics and scoring-factor caches.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    #[must_use]
+    pub fn cache_stats(&self) -> EngineCacheStats {
+        self.backend.cache_stats()
+    }
+
+    /// v53.1.8 (CIRISPersist#1014) — the admission cache's counters (FSD
+    /// V4.0 §7.5). `None`: no Engine installs an
+    /// [`AdmissionCache`](crate::cache::AdmissionCache) today, so there is
+    /// nothing to count; a zeroed struct would read as an idle cache.
+    #[must_use]
+    pub fn admission_cache_stats(&self) -> Option<crate::cache::AdmissionStats> {
+        None
     }
 
     /// Accessor for the composed federation signer `Arc`.
@@ -9048,6 +9106,28 @@ impl Engine {
             subject_key_id,
             scope,
             qualifier,
+            now,
+        )
+        .await
+    }
+
+    /// v53.1.8 (CIRISPersist#1013) — the consent-before-scoring stance, the
+    /// one fold the emit gate asks: by principals, scope `analyze:<family>`.
+    /// A scorer's precheck calls this and gets the gate's answer. See
+    /// [`consent_by_humans::capacity_consent_stance`](crate::federation::consent_by_humans::capacity_consent_stance).
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn capacity_consent_stance(
+        &self,
+        attester_key_id: &str,
+        subject_key_id: &str,
+        family: crate::federation::admission::ConsentGatedFamily,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<crate::federation::hard_case::ConsentState, crate::federation::Error> {
+        crate::federation::consent_by_humans::capacity_consent_stance(
+            self.federation_directory().as_ref(),
+            attester_key_id,
+            subject_key_id,
+            family,
             now,
         )
         .await

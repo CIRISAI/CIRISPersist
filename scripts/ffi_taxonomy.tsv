@@ -148,6 +148,7 @@ Engine	active_family_members_json	empirical
 Engine	add_community_member	deontic	
 Engine	add_moderator	deontic	
 Engine	add_peer_record_json	deontic	
+Engine	admission_cache_stats	empirical	
 Engine	adopt_scrub_upgrade	deontic	
 Engine	adopt_sealed_blob_json	deontic	
 Engine	adopt_sealed_chunk_json	deontic	
@@ -183,6 +184,7 @@ Engine	audit_verify_chain	testimonial	self_audit
 Engine	backfill_trace_attestations	procedural	
 Engine	backfill_v020_trust_rows	procedural	
 Engine	bake_assembled_genesis	deontic	
+Engine	cache_stats	empirical	
 Engine	install_genesis_bundle_roster_json	deontic	
 Engine	blackhole_list_json	empirical	
 Engine	blackhole_prune_expired_iso	deontic	
@@ -663,6 +665,7 @@ Engine	telemetry_consolidate_period	procedural
 Engine	telemetry_list_metrics	empirical	
 Engine	telemetry_record_metric	empirical	
 Engine	telemetry_record_metrics_batch	empirical	
+Engine	telemetry_snapshot	empirical	
 Engine	temporal_drift	epistemic	
 Engine	thought_delete	empirical	
 Engine	thought_get	empirical	
@@ -742,6 +745,9 @@ ScoringFactorStream	__next__	structural
 ScoringFactorStream	summary	epistemic	
 Engine	consent_peers_by_principals	deontic	
 Engine	resolve_scoped_consent_by_principals	deontic	
+# v53.1.8 (CIRISPersist#1013) — `capacity_consent_stance` is DEONTIC: it is the
+# consent-before-scoring gate's own fold; a wrong answer admits or refuses a score.
+Engine	capacity_consent_stance	deontic	
 # v50.0.0 (CIRISPersist#926) — `resolve_community_json` and
 # `pin_trust_from_bundle_response_json` are DEONTIC: a wrong entry names the
 # founders a consumer trusts (or admits a row its accord did not found), which

@@ -671,6 +671,9 @@ class Engine:
     def build_storage_budget_v1(self, payload_json: str) -> str:
         """(derived) deontic — #356 (CC 6.1.5.2 §Q / CIRISVerify#170) — build a signed StorageBudgetV1 wire JSON from a payload JSON, bound-hybrid signing its CC 6.1.3 preimage w..."""
 
+    def capacity_consent_stance(self, attester_key_id: str, subject_key_id: str, family: str, now_iso: str | None = None) -> str:
+        """(derived) deontic — v53.1.8 (CIRISPersist#1013) — the consent-before-scoring stance the emit gate asks: by principals, scope analyze:<family>. A scorer's precheck call..."""
+
     def check_no_moderator_federate_json(self, community_id: str) -> str:
         """v13.0.0 (CIRISPersist#369, CC 4.5.4 / §11.11) — the directly drivable
         **no-moderator-no-federate admission verdict** for one community: exactly
@@ -2437,6 +2440,9 @@ class Engine:
     def active_family_members_json(self, family_key_id: str) -> str:
         """(derived) empirical — #249 Cut B — the active member roster of family_key_id. Returns a JSON array of [crate::federation::types::FamilyMember]."""
 
+    def admission_cache_stats(self) -> dict[str, Any] | None:
+        """(derived) empirical — v53.1.8 (CIRISPersist#1014) — [crate::Engine::admission_cache_stats]: always None today, because no engine installs an admission cache (a zeroed di..."""
+
     def attestation_insert_local(self, input_json: str) -> str:
         """(derived) empirical — v4.4.0 (CIRISPersist#171) — insert (append) a local-tier attestation for a multi-valued dimension (memory / per-thought verdicts). Same shape as [a..."""
 
@@ -2454,6 +2460,9 @@ class Engine:
 
     def blob_provenance_from_attestation_json(self, attestation_json: str, sha256_hex: str, epoch: int | None = None, minter_key_id: str | None = None) -> str:
         """(derived) empirical — v46.0.0 (CIRISPersist#876, FSD/EPOCH_MINTER.md) — the provenance of a blob, read off the attestation it flowed from."""
+
+    def cache_stats(self) -> dict[str, Any]:
+        """(derived) empirical — v53.1.8 (CIRISPersist#1014) — [crate::Engine::cache_stats] as a dict keyed by cache (repository_statistics, scoring_factors), each {hits, misses, e..."""
 
     def ceremony_get(self, ceremony_id: str) -> str | None:
         """v1.5.16 — Point lookup. Returns JSON-encoded
@@ -3331,6 +3340,9 @@ class Engine:
 
     def telemetry_record_metrics_batch(self, obs_json: str) -> int:
         """(derived) empirical — v0.8.2 — Bulk-record N observations. Returns affected row count. [build-conditional: #[cfg(feature = "telemetry")]]"""
+
+    def telemetry_snapshot(self) -> dict[str, Any]:
+        """(derived) empirical — v53.1.8 (CIRISPersist#1014) — [crate::Engine::telemetry_snapshot] as a dict: {"reads": [{backend, door, reads, rows, bytes}, ...], "folds": [{fold,..."""
 
     def thought_delete(self, thought_id: str) -> bool:
         """v1.5.20 (CIRISPersist#60) — Delete a thought by id.
