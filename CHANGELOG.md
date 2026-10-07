@@ -45,7 +45,28 @@ Telemetry work is priority one, and the next scale step waits until runtime beha
   - `ciris.persist.fold.calls`, `.reads`, `.rows` and `.bytes`, labelled by `fold`.
 
   Each label carries a hand-written, bounded value set.
+- **Gates filed.** `read_measured` is filed in the sqlite connection model as `Read`, and is recognised as a read-door token. `sqlite_typed_read` now returns `Result<(rows, bytes)>`, matching `pg_typed_read`, so the parity scan still sees its call propagate. The three PyEngine symbols are pinned `empirical` in `scripts/ffi_taxonomy.tsv`, and the stub and evidence are regenerated.
+- **Witnesses.**
+  - **I549** (memory, sqlite and postgres). The witness runs a seeded consent corpus, a key root with its charter and a trust edge, an owner's replication grant, one admission, both consent folds, all four trust-root walks, the serve tier and the three audience reads. For every `(backend, door)`, the counter delta equals the probe's totals for the same calls. Reads and rows match exactly. Bytes equal the probe's envelope bytes on sqlite and postgres, and are 0 on memory. No other backend's counters move. Each fold's delta is its entry plus every read the probe saw while it ran. A `cfg(test)` thread-local counter set (`observe::LocalCounters`, the `metrics::with_local_recorder` pattern) isolates the witness from tests running in parallel.
+  - **I550** (sqlite and postgres). `Engine::telemetry_snapshot` reads the counters and lists every fold. `cache_stats` is reachable through the Engine. `admission_cache_stats` is `None`. The snapshot serializes.
+  - **I551** (from disk, with comments stripped and string literals preserved). Every `observe::Door`, `Fold` and `StoreBackend` label that code names is catalogued, and every catalogued label is emitted. The enums agree with the catalogue. Each backend file records under its own label only. The snapshot's samples carry exactly the catalogued names, label keys and bounded values.
+- **Mutation-checked: 10 mutants, all killed.**
+  - Backend counters, killed by I549:
+    - `record_read` skipping sqlite's door increment (sqlite red, memory green);
+    - sqlite's row mapper not noting envelope bytes;
+    - `pg_envelope_bytes` returning 0;
+    - `record_read` skipping memory's door increment.
+  - Fold attribution, killed by I549:
+    - `trust_root_valid` called without its fold;
+    - the fold credit dropped from `record_read`;
+    - a fold scope that omits its own bit;
+    - `put_attestation` entering admission without the fold.
+  - Catalogue, killed by I551:
+    - a door dropped from `DOOR_VALUES` ("emitted but not catalogued");
+    - a bogus value added ("catalogued but never emitted").
 - **Not in this release (P1):** emission through the `metrics` facade, spans, duration histograms, and pool or `sqlite3_status` gauges. P1 emits through the facade on top of these counters.
+
+**Adopters.** This release is additive and pin-compatible with 53.1.7: no wire, capsule ABI or verify change, and no new `FederationDirectory` method. To use it, call `engine.telemetry_snapshot()`, `engine.cache_stats()` and `engine.admission_cache_stats()`.
 
 ## [53.1.7] - 2026-10-07
 
