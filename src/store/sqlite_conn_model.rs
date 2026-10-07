@@ -639,6 +639,7 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("read", ConnClass::Door),
     ("read_classifications", ConnClass::Read),
     ("read_features", ConnClass::Read),
+    ("read_measured", ConnClass::Read),
     ("read_pool_handle", ConnClass::Door),
     ("rebuild_signed_wire_index", ConnClass::Write),
     ("record_announced_peer", ConnClass::Write),
@@ -837,6 +838,7 @@ mod gate {
         "tx: &Transaction",
         "tx: &rusqlite::Transaction",
         "self.read(",
+        "self.read_measured(",
         "self.write(",
         "backend.read(",
         "backend.write(",
@@ -845,7 +847,9 @@ mod gate {
 
     /// The read door, as a body reaches it (methods say `self`, the two
     /// free async fns that take the backend say `backend`).
-    const DOOR_READ: &[&str] = &["self.read(", "backend.read("];
+    /// `read_measured` (CIRISPersist#1014) is `read` plus the decoded-envelope
+    /// byte count; it reaches the reader through `self.read(` and is filed `Read`.
+    const DOOR_READ: &[&str] = &["self.read(", "self.read_measured(", "backend.read("];
     /// The write door, likewise.
     const DOOR_WRITE: &[&str] = &["self.write(", "backend.write("];
     /// The fixed set of `Door`-class fns (FSD §5).

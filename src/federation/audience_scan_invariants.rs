@@ -224,7 +224,7 @@ pub(crate) mod bodies {
         admission::truncate_to_substrate_resolution(s.parse().unwrap())
     }
 
-    async fn keys(d: &dyn FederationDirectory, keys: &[(&str, &str)]) {
+    pub(crate) async fn keys(d: &dyn FederationDirectory, keys: &[(&str, &str)]) {
         for (k, t) in keys {
             ts::register_hybrid_key_as(d, k, k, t).await;
         }
@@ -256,7 +256,7 @@ pub(crate) mod bodies {
 
     /// `author`'s `consent:replication:v1` grant, optionally FOR `for_key`,
     /// with `cohorts` / `valid_until` as given.
-    fn grant(
+    pub(crate) fn grant(
         author: &str,
         for_key: Option<&str>,
         cohorts: Option<&[(&str, &str)]>,
@@ -528,7 +528,7 @@ pub(crate) mod bodies {
 
     /// A `trust:charter:v1` `delegates_to` toward `root`, attested by `a`
     /// and co-signed by `b`.
-    fn charter(id: &str, root: &str, a: &str, b: &str) -> Attestation {
+    pub(crate) fn charter(id: &str, root: &str, a: &str, b: &str) -> Attestation {
         use crate::federation::trust_root::{
             test_pre_rotation_commitment, INFRA_ATTEST_SCOPE, INFRA_SERVE_SCOPE,
             TRUST_CHARTER_DIMENSION,

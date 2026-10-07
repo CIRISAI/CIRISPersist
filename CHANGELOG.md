@@ -24,6 +24,65 @@ CIRISServer 0.5.223 on persist 53.1.7: the canonical's first scorer pass refused
 
 **Adopters.** Pin-compatible with 53.1.7: no wire, ABI, migration or verify change; one new Engine / PyO3 method. Server: call `capacity_consent_stance(canonical, agent, "capacity")` as the precheck.
 
+### Added — read telemetry, always on (CIRISPersist#1014, CIRISServer#746 §4 P0)
+
+Telemetry work is priority one, and the next scale step waits until runtime behaviour is understood. Before this release persist could not report what it read at runtime: the read probe was `cfg(test)`, and the cache counters had no host accessor.
+
+- **`crate::observe`: door counters.** Process-wide relaxed atomics keyed by `(backend, door)`, counting reads, rows returned and envelope bytes decoded. No allocation, lock or key string on the read path. Every attestation-returning door feeds them through one helper, `observe::record_read`, and that helper also feeds the `cfg(test)` read probe, so the probe and the counters cannot drift. There are 22 doors: the 13 the probe already covered, plus nine reads it missed:
+  - `list_live_consent_grants_by` and `list_live_consent_grants_for`
+  - `list_local_tier_attestations`
+  - `list_widening_candidates`
+  - `list_attestations_for_migration`
+  - `attestations_binding_content`
+  - `get_attestation`
+  - `list_attestations_since`
+  - `list_attestation_log`
+
+  Memory has 21 of the 22, because `ReadEngine::list_attestations` is unsupported there.
+- **What "bytes" means.** The stored `attestation_envelope` TEXT length of every row the backend decoded to answer the read. It is never a re-serialization.
+  - **sqlite:** the length `sqlite_row_to_attestation` reads before parsing. It is accumulated on the reader thread and drained by `SqliteBackend::read_measured`.
+  - **postgres:** the TEXT column's octet length (V122), read from the row buffer as a borrowed `&str` before decode.
+  - **memory:** `0`. The backend holds parsed envelopes only, so a byte count would mean re-serializing.
+
+  A door that filters after decode (the live consent-grant reads, `attestations_binding_content`) reports the bytes it decoded. `rows` is always the number of rows it returned.
+- **Fold attribution.** `observe::fold` counts each entry into a fold. A task-local fold mask then credits every door read made while the fold runs to that fold. Attribution is inclusive, like a span: a nested fold credits both folds. The folds:
+  - consent: `resolve_scoped_stance_by_principals` and `FederationDirectory::resolve_scoped_stance`;
+  - trust root: `trusted_roots_of`, `trust_root_valid`, `owner_granted_scope`, and `resolve_serve_tier_over_roster` (which `resolve_serve_tier` calls);
+  - audience: `owner_allow_list`, `is_public_group` and `OwnerAudience::read`;
+  - attestation admission: entered through `put_attestation`, `put_attestation_authored` and the replicated-apply path.
+- **Host snapshot.**
+  - `Engine::telemetry_snapshot()` returns a plain serializable `TelemetrySnapshot`.
+  - `Engine::cache_stats()` returns `EngineCacheStats`, covering the repository-statistics and scoring-factor caches.
+  - `Engine::admission_cache_stats()` returns `None`, because no Engine installs an `AdmissionCache` today, and a zeroed struct would read as an idle cache.
+  - PyEngine mirrors all three, returning dicts, and the `.pyi` stub is updated.
+- **`observe::catalog::TELEMETRY_CATALOG`.** Seven counters, with names in the OTel style:
+  - `ciris.persist.read.calls`, `.rows` and `.bytes`, labelled by `backend` and `door`;
+  - `ciris.persist.fold.calls`, `.reads`, `.rows` and `.bytes`, labelled by `fold`.
+
+  Each label carries a hand-written, bounded value set.
+- **Gates filed.** `read_measured` is filed in the sqlite connection model as `Read`, and is recognised as a read-door token. `sqlite_typed_read` now returns `Result<(rows, bytes)>`, matching `pg_typed_read`, so the parity scan still sees its call propagate. The three PyEngine symbols are pinned `empirical` in `scripts/ffi_taxonomy.tsv`, and the stub and evidence are regenerated.
+- **Witnesses.**
+  - **I549** (memory, sqlite and postgres). The witness runs a seeded consent corpus, a key root with its charter and a trust edge, an owner's replication grant, one admission, both consent folds, all four trust-root walks, the serve tier and the three audience reads. For every `(backend, door)`, the counter delta equals the probe's totals for the same calls. Reads and rows match exactly. Bytes equal the probe's envelope bytes on sqlite and postgres, and are 0 on memory. No other backend's counters move. Each fold's delta is its entry plus every read the probe saw while it ran. A `cfg(test)` thread-local counter set (`observe::LocalCounters`, the `metrics::with_local_recorder` pattern) isolates the witness from tests running in parallel.
+  - **I550** (sqlite and postgres). `Engine::telemetry_snapshot` reads the counters and lists every fold. `cache_stats` is reachable through the Engine. `admission_cache_stats` is `None`. The snapshot serializes.
+  - **I551** (from disk, with comments stripped and string literals preserved). Every `observe::Door`, `Fold` and `StoreBackend` label that code names is catalogued, and every catalogued label is emitted. The enums agree with the catalogue. Each backend file records under its own label only. The snapshot's samples carry exactly the catalogued names, label keys and bounded values.
+- **Mutation-checked: 10 mutants, all killed.**
+  - Backend counters, killed by I549:
+    - `record_read` skipping sqlite's door increment (sqlite red, memory green);
+    - sqlite's row mapper not noting envelope bytes;
+    - `pg_envelope_bytes` returning 0;
+    - `record_read` skipping memory's door increment.
+  - Fold attribution, killed by I549:
+    - `trust_root_valid` called without its fold;
+    - the fold credit dropped from `record_read`;
+    - a fold scope that omits its own bit;
+    - `put_attestation` entering admission without the fold.
+  - Catalogue, killed by I551:
+    - a door dropped from `DOOR_VALUES` ("emitted but not catalogued");
+    - a bogus value added ("catalogued but never emitted").
+- **Not in this release (P1):** emission through the `metrics` facade, spans, duration histograms, and pool or `sqlite3_status` gauges. P1 emits through the facade on top of these counters.
+
+**Adopters.** This release is additive and pin-compatible with 53.1.7: no wire, capsule ABI or verify change, and no new `FederationDirectory` method. To use it, call `engine.telemetry_snapshot()`, `engine.cache_stats()` and `engine.admission_cache_stats()`.
+
 ## [53.1.7] - 2026-10-07
 
 ### Fixed — `list_attestations_referencing` scanned the whole table on every call (CIRISEdge PR #818)

@@ -364,7 +364,12 @@ where
         Some(Plan::Refused { reason }) => return Ok(Outcome::Refused { reason }),
         Some(Plan::Insert) | None => {}
     }
-    match dir.put_attestation_with_origin(attestation, origin).await {
+    match crate::observe::fold(
+        crate::observe::Fold::AttestationAdmission,
+        dir.put_attestation_with_origin(attestation, origin),
+    )
+    .await
+    {
         Ok(stored) => {
             // §6.1: a structural-composer replay is a silent `Ok` with NO
             // row written. Ask the store what it actually did, so

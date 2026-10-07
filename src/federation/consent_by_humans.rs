@@ -219,6 +219,30 @@ pub async fn resolve_scoped_stance_by_principals(
     qualifier: Option<&str>,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<super::consent::ScopedStance, Error> {
+    crate::observe::fold(
+        crate::observe::Fold::ResolveScopedStanceByPrincipals,
+        resolve_scoped_stance_by_principals_body(
+            directory,
+            target_key_id,
+            subject_key_id,
+            scope,
+            qualifier,
+            now,
+        ),
+    )
+    .await
+}
+
+/// [`resolve_scoped_stance_by_principals`]'s fold, run inside its
+/// [`crate::observe::fold`].
+async fn resolve_scoped_stance_by_principals_body(
+    directory: &dyn FederationDirectory,
+    target_key_id: &str,
+    subject_key_id: &str,
+    scope: &str,
+    qualifier: Option<&str>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<super::consent::ScopedStance, Error> {
     // v53.1.5 — ONE bounded read for every principal (the subject and each
     // steward), shared by the subject's own fold and the per-steward folds;
     // before this cut the target's whole slice was read twice per call (the

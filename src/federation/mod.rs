@@ -3095,8 +3095,14 @@ pub trait FederationDirectory: Send + Sync {
         &self,
         attestation: SignedAttestation,
     ) -> Result<AttestationOutcome, Error> {
-        self.put_attestation_with_origin(attestation, replication::admission::WriteOrigin::Wire)
-            .await
+        crate::observe::fold(
+            crate::observe::Fold::AttestationAdmission,
+            self.put_attestation_with_origin(
+                attestation,
+                replication::admission::WriteOrigin::Wire,
+            ),
+        )
+        .await
     }
 
     /// v41.0.0 (CIRISPersist#804) — publish a row THIS NODE AUTHORED.
@@ -3116,8 +3122,14 @@ pub trait FederationDirectory: Send + Sync {
         &self,
         attestation: SignedAttestation,
     ) -> Result<AttestationOutcome, Error> {
-        self.put_attestation_with_origin(attestation, replication::admission::WriteOrigin::Authored)
-            .await
+        crate::observe::fold(
+            crate::observe::Fold::AttestationAdmission,
+            self.put_attestation_with_origin(
+                attestation,
+                replication::admission::WriteOrigin::Authored,
+            ),
+        )
+        .await
     }
 
     /// v50.0.0 (CIRISPersist#916, `FSD/SECOND_DEVICE.md` §3) — **re-wrap this
@@ -8842,16 +8854,19 @@ pub trait FederationDirectory: Send + Sync {
         qualifier: Option<&str>,
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<consent::ScopedStance, Error> {
-        // v53.1.5 — the rows the fold can use, not every row about the
-        // target (see `consent::scoped_fold_rows`).
-        let rows = consent::scoped_fold_rows(self, target_key_id, &[subject_key_id]).await?;
-        Ok(consent::fold_scoped_stance(
-            &rows,
-            subject_key_id,
-            now,
-            scope,
-            qualifier,
-        ))
+        crate::observe::fold(crate::observe::Fold::ResolveScopedStance, async {
+            // v53.1.5 — the rows the fold can use, not every row about the
+            // target (see `consent::scoped_fold_rows`).
+            let rows = consent::scoped_fold_rows(self, target_key_id, &[subject_key_id]).await?;
+            Ok(consent::fold_scoped_stance(
+                &rows,
+                subject_key_id,
+                now,
+                scope,
+                qualifier,
+            ))
+        })
+        .await
     }
 
     /// v31.0.0 (CIRISPersist#612, CC 4.5.13) — the **other half** of the
