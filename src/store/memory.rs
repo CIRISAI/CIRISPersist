@@ -4594,6 +4594,12 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             .cloned()
             .collect();
         rows.sort_by_key(|a| std::cmp::Reverse(a.asserted_at));
+        #[cfg(test)]
+        crate::federation::read_probe::record(
+            "list_attestations_referencing",
+            target_attestation_id,
+            &rows,
+        );
         Ok(rows)
     }
 
@@ -4780,6 +4786,68 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         rows.sort_by_key(|a| std::cmp::Reverse(a.asserted_at));
         #[cfg(test)]
         crate::federation::read_probe::record("list_attestations_by_type", attesting_key_id, &rows);
+        Ok(rows)
+    }
+
+    async fn list_attestations_for_types(
+        &self,
+        attested_key_id: &str,
+        attestation_types: &[&str],
+        excluded_dimensions: &[&str],
+    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        let mut rows: Vec<_> = state
+            .federation_attestations
+            .iter()
+            .filter(|a| {
+                a.attested_key_id == attested_key_id
+                    && a.tier == crate::federation::types::attestation_tier::FEDERATION
+                    && crate::federation::types_and_dimension_admit(
+                        a,
+                        attestation_types,
+                        excluded_dimensions,
+                    )
+            })
+            .cloned()
+            .collect();
+        rows.sort_by_key(|a| std::cmp::Reverse(a.asserted_at));
+        #[cfg(test)]
+        crate::federation::read_probe::record(
+            "list_attestations_for_types",
+            attested_key_id,
+            &rows,
+        );
+        Ok(rows)
+    }
+
+    async fn list_attestations_by_types(
+        &self,
+        attesting_key_id: &str,
+        attestation_types: &[&str],
+        excluded_dimensions: &[&str],
+    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        let mut rows: Vec<_> = state
+            .federation_attestations
+            .iter()
+            .filter(|a| {
+                a.attesting_key_id == attesting_key_id
+                    && a.tier == crate::federation::types::attestation_tier::FEDERATION
+                    && crate::federation::types_and_dimension_admit(
+                        a,
+                        attestation_types,
+                        excluded_dimensions,
+                    )
+            })
+            .cloned()
+            .collect();
+        rows.sort_by_key(|a| std::cmp::Reverse(a.asserted_at));
+        #[cfg(test)]
+        crate::federation::read_probe::record(
+            "list_attestations_by_types",
+            attesting_key_id,
+            &rows,
+        );
         Ok(rows)
     }
 

@@ -1967,7 +1967,21 @@ where
                 super::trust_root::TRUST_CHARTER_DIMENSION,
             )
     };
-    let rows = directory.list_attestations_for(family).await?;
+    // v53.1.7 — the charter-shaped rows and their composers, never every
+    // trust edge naming the family.
+    let rows = super::trust_root::with_slice_composers(
+        directory,
+        directory
+            .list_attestations_for_types(
+                family,
+                &[super::types::attestation_type::DELEGATES_TO],
+                &super::trust_root::jobs_other_than(super::trust_root::TRUST_CHARTER_DIMENSION),
+            )
+            .await?,
+        Some(family),
+        None,
+    )
+    .await?;
     let refs: Vec<&super::Attestation> = rows.iter().collect();
     let retired = super::precedence::retired_ids(&refs);
     let denied =
@@ -3733,4 +3747,45 @@ where
         .await?;
     }
     Ok(())
+}
+
+/// v53.1.7 — I547's oracle: [`live_charter_rows`] as v53.1.6 shipped it,
+/// VERBATIM (the family's whole about-slice), `super::` spelled from the crate
+/// root.
+#[cfg(test)]
+pub(crate) mod v53_1_6_reference {
+    use super::*;
+
+    pub(crate) async fn live_charter_rows_reference<F>(
+        directory: &F,
+        family: &str,
+    ) -> Result<Vec<crate::federation::Attestation>, Error>
+    where
+        F: FederationDirectory + ?Sized,
+    {
+        let is_charter = |a: &crate::federation::Attestation| {
+            a.attestation_type == crate::federation::types::attestation_type::DELEGATES_TO
+                && a.attested_key_id == family
+                && crate::federation::trust_root::job_dimension_admits(
+                    &a.attestation_envelope,
+                    crate::federation::trust_root::TRUST_CHARTER_DIMENSION,
+                )
+        };
+        let rows = directory.list_attestations_for(family).await?;
+        let refs: Vec<&crate::federation::Attestation> = rows.iter().collect();
+        let retired = crate::federation::precedence::retired_ids(&refs);
+        let denied = crate::federation::trust_root::direction_denied_ids(
+            directory,
+            rows.iter().filter(|a| is_charter(a)),
+        )
+        .await?;
+        Ok(rows
+            .into_iter()
+            .filter(|a| {
+                is_charter(a)
+                    && !denied.contains(&a.attestation_id)
+                    && !retired.contains(&a.attestation_id)
+            })
+            .collect())
+    }
 }

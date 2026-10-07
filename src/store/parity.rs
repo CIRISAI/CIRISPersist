@@ -697,6 +697,13 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // exactly as before, so nothing a door wraps goes dark.
     ("read", Class::Plumbing),
     ("write", Class::Plumbing),
+    // v53.1.7 — the shared body of `list_attestations_for_types` / `_by_types`
+    // on each SQL backend. Plumbing: a read that fails only on the substrate's
+    // own terms (connection, statement, row decode); it refuses nothing about
+    // the caller's input — the trust-root predicates that decide run over its
+    // rows unchanged.
+    ("pg_typed_read", Class::Plumbing),
+    ("sqlite_typed_read", Class::Plumbing),
     ("recompute_and_assert_root", Class::Gate),
     ("record_hard_case", Class::Delegates),
     ("references_attestation_id_from_envelope", Class::Plumbing),

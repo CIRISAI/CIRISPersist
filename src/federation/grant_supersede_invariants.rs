@@ -40,14 +40,14 @@ pub(crate) mod bodies {
     use crate::federation::types::{attestation_type, identity_type as it};
     use crate::federation::{FederationDirectory, SignedAttestation};
 
-    struct Fx {
-        user: String,
-        root: String,
-        subject: String,
-        grant: String,
+    pub(crate) struct Fx {
+        pub(crate) user: String,
+        pub(crate) root: String,
+        pub(crate) subject: String,
+        pub(crate) grant: String,
     }
 
-    async fn fixture(d: &dyn FederationDirectory, tag: &str) -> Fx {
+    pub(crate) async fn fixture(d: &dyn FederationDirectory, tag: &str) -> Fx {
         let user = format!("gs-user-{tag}");
         let root = format!("gs-root-{tag}");
         let subject = format!("gs-subject-{tag}");
@@ -80,7 +80,7 @@ pub(crate) mod bodies {
     }
 
     /// `by` writes a `supersedes` on `target` carrying a conferral body.
-    async fn supersede(
+    pub(crate) async fn supersede(
         d: &dyn FederationDirectory,
         id: &str,
         by: &str,
@@ -104,7 +104,7 @@ pub(crate) mod bodies {
             .map(|_| ())
     }
 
-    async fn withdraw(
+    pub(crate) async fn withdraw(
         d: &dyn FederationDirectory,
         id: &str,
         by: &str,

@@ -318,6 +318,39 @@ impl PostgresBackend {
 /// `apply_replicated_community` the replicated one (a record authored
 /// elsewhere, admitted as data). Every other gate is the same on both.
 impl PostgresBackend {
+    /// v53.1.7 — the body of `list_attestations_for_types` / `_by_types` over
+    /// `key_column`: the (key, type) prefix seek, the exclusion on V122's
+    /// generated `dimension` (`NULL` kept; `->>` of a non-string never equals
+    /// a bound string).
+    async fn pg_typed_read(
+        &self,
+        key_column: &'static str,
+        key: &str,
+        attestation_types: &[&str],
+        excluded_dimensions: &[&str],
+    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
+        if attestation_types.is_empty() {
+            return Ok(Vec::new());
+        }
+        let sql = format!(
+            "SELECT {PG_ATTESTATION_COLUMNS} FROM cirislens.federation_attestations \
+             WHERE {key_column} = $1 AND attestation_type = ANY($2) AND tier = 'federation' \
+               AND (dimension IS NULL OR NOT (dimension = ANY($3))) \
+             ORDER BY asserted_at DESC"
+        );
+        let types: Vec<&str> = attestation_types.to_vec();
+        let excluded: Vec<&str> = excluded_dimensions.to_vec();
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let rows = client
+            .query(&sql, &[&key, &types, &excluded])
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        rows.into_iter().map(pg_row_to_attestation).collect()
+    }
+
     /// v53.1.0 (#979) — TEST SEAM: drop the V176 relation of a manifest (a
     /// DAG from before V176) or add one row of it (a chunk shared by two DAGs,
     /// which two real streams never produce: each seal encrypts its own bytes).
@@ -7042,7 +7075,19 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .map_err(|e| {
                 crate::federation::Error::Backend(format!("list_attestations_referencing: {e}"))
             })?;
-        rows.into_iter().map(pg_row_to_attestation).collect()
+        rows.into_iter()
+            .map(pg_row_to_attestation)
+            .collect::<Result<Vec<_>, _>>()
+            .inspect(|rows| {
+                #[cfg(test)]
+                crate::federation::read_probe::record(
+                    "list_attestations_referencing",
+                    target_attestation_id,
+                    rows,
+                );
+                #[cfg(not(test))]
+                let _ = rows;
+            })
     }
 
     async fn list_attestations_for(
@@ -7344,6 +7389,63 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 #[cfg(not(test))]
                 let _ = rows;
             })
+    }
+
+    /// v53.1.7 — V178's `(attested_key_id, attestation_type, …)` seek; the
+    /// dimension exclusion is evaluated on V122's generated `dimension`, so an
+    /// excluded row is never decoded.
+    async fn list_attestations_for_types(
+        &self,
+        attested_key_id: &str,
+        attestation_types: &[&str],
+        excluded_dimensions: &[&str],
+    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
+        let rows = self
+            .pg_typed_read(
+                "attested_key_id",
+                attested_key_id,
+                attestation_types,
+                excluded_dimensions,
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("list_attestations_for_types: {e}"))
+            })?;
+        #[cfg(test)]
+        crate::federation::read_probe::record(
+            "list_attestations_for_types",
+            attested_key_id,
+            &rows,
+        );
+        Ok(rows)
+    }
+
+    /// v53.1.7 — V107's `(attesting_key_id, attestation_type, …)` seek, the
+    /// attesting twin of the read above.
+    async fn list_attestations_by_types(
+        &self,
+        attesting_key_id: &str,
+        attestation_types: &[&str],
+        excluded_dimensions: &[&str],
+    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
+        let rows = self
+            .pg_typed_read(
+                "attesting_key_id",
+                attesting_key_id,
+                attestation_types,
+                excluded_dimensions,
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("list_attestations_by_types: {e}"))
+            })?;
+        #[cfg(test)]
+        crate::federation::read_probe::record(
+            "list_attestations_by_types",
+            attesting_key_id,
+            &rows,
+        );
+        Ok(rows)
     }
 
     /// v53.1.6 — V180's `(attesting_key_id, dimension COLLATE "C",

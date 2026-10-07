@@ -2801,6 +2801,10 @@ mod tests {
             "attestation_type.as_str()",
             "attestation_type = $",
             "attestation_type LIKE $",
+            // v53.1.7 — the SQL membership test against a composer set, bound
+            // as placeholders (sqlite `IN (?2, ?3, ?4)`, the V181 seek's
+            // statement): the same guard as a Rust composer-set test.
+            "attestation_type IN (",
         ];
         let mut unguarded: Vec<String> = Vec::new();
         let mut checked = 0usize;
