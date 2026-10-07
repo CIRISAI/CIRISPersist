@@ -166,9 +166,9 @@ impl<T> Cache<T> {
         &self.config
     }
 
-    /// Snapshot of observability counters (§7.2). Exposed as a public
-    /// Rust method here; the PyO3 `Engine.cache_stats()` binding lands
-    /// in the FFI commit, not this one.
+    /// Snapshot of observability counters (§7.2). A host reaches the
+    /// backend's caches through `Engine::cache_stats` and
+    /// `PyEngine.cache_stats()` (v53.1.8, CIRISPersist#1014).
     pub fn stats(&self) -> CacheStats {
         self.stats.snapshot()
     }

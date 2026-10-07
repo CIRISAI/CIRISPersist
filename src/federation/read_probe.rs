@@ -33,12 +33,13 @@ thread_local! {
     static READS: RefCell<Vec<Read>> = const { RefCell::new(Vec::new()) };
 }
 
-/// Record one read: `method` over `key`, returning `rows`.
-pub fn record(method: &'static str, key: &str, rows: &[crate::federation::Attestation]) {
+/// Record one read: `method` over `key`, returning `rows`. Called only from
+/// [`crate::observe::record_read`], the one helper every door feeds.
+pub fn record<R: crate::observe::ReadRow>(method: &'static str, key: &str, rows: &[R]) {
     let bytes = rows
         .iter()
         .map(|a| {
-            serde_json::to_string(&a.attestation_envelope)
+            serde_json::to_string(&a.attestation().attestation_envelope)
                 .map(|s| s.len())
                 .unwrap_or(0)
         })

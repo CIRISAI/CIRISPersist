@@ -244,11 +244,14 @@ impl OwnerAudience {
     where
         D: FederationDirectory + ?Sized,
     {
-        Ok(Self {
-            owner: owner.to_owned(),
-            lists: OwnerAllowLists::read(dir, owner).await?,
-            occurrences: dir.list_identity_occurrences_active(owner).await?,
+        crate::observe::fold(crate::observe::Fold::OwnerAudience, async {
+            Ok(Self {
+                owner: owner.to_owned(),
+                lists: OwnerAllowLists::read(dir, owner).await?,
+                occurrences: dir.list_identity_occurrences_active(owner).await?,
+            })
         })
+        .await
     }
 
     /// [`owner_node_receives`]'s decision for `node`, over the rows read once.
@@ -319,7 +322,10 @@ where
     // v53.1.6 — the single-node door: the owner's lists read once, asked
     // for this node. A caller walking many nodes of one owner holds an
     // [`OwnerAudience`] instead and pays the read once.
-    Ok(OwnerAllowLists::read(dir, owner).await?.list_for(node))
+    crate::observe::fold(crate::observe::Fold::OwnerAllowList, async {
+        Ok(OwnerAllowLists::read(dir, owner).await?.list_for(node))
+    })
+    .await
 }
 
 /// **Does `owner`'s `cohort` reach `node`?** [`class_allows`] over
@@ -444,6 +450,18 @@ where
 /// deployment's WA family (`ReclaimPolicy::WA_FAMILY_ENV`). Config- and
 /// state-derived ids only; never a name match.
 pub async fn is_public_group<D>(dir: &D, group: &str) -> Result<bool, Error>
+where
+    D: FederationDirectory + ?Sized,
+{
+    crate::observe::fold(
+        crate::observe::Fold::IsPublicGroup,
+        is_public_group_body(dir, group),
+    )
+    .await
+}
+
+/// [`is_public_group`]'s walk, run inside its [`crate::observe::fold`].
+async fn is_public_group_body<D>(dir: &D, group: &str) -> Result<bool, Error>
 where
     D: FederationDirectory + ?Sized,
 {

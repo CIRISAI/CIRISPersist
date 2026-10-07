@@ -631,6 +631,23 @@ impl SqliteBackend {
         .await
     }
 
+    /// CIRISPersist#1014 — [`Self::read`], returning beside `f`'s result the
+    /// `attestation_envelope` TEXT bytes `sqlite_row_to_attestation` decoded on
+    /// the reader while `f` ran: the `bytes` an attestation door reports to
+    /// [`crate::observe::record_read`].
+    pub(crate) async fn read_measured<R, F>(&self, f: F) -> (R, u64)
+    where
+        R: Send + 'static,
+        F: FnOnce(&Connection) -> R + Send + 'static,
+    {
+        self.read(move |conn| {
+            let _ = crate::observe::take_decoded_bytes();
+            let out = f(conn);
+            (out, crate::observe::take_decoded_bytes())
+        })
+        .await
+    }
+
     /// CIRISPersist#829 — **the write door.** Runs `f` on the writer under
     /// its mutex, off the async runtime when one is current and inline
     /// otherwise. Every transaction that writes, every migration, every
@@ -2414,9 +2431,12 @@ impl SqliteBackend {
         key: &str,
         attestation_types: &[&str],
         excluded_dimensions: &[&str],
-    ) -> Result<Vec<crate::federation::Attestation>, rusqlite::Error> {
+    ) -> (
+        Result<Vec<crate::federation::Attestation>, rusqlite::Error>,
+        u64,
+    ) {
         if attestation_types.is_empty() {
-            return Ok(Vec::new());
+            return (Ok(Vec::new()), 0);
         }
         let sql = sqlite_attestations_typed_sql(
             key_column,
@@ -2428,7 +2448,7 @@ impl SqliteBackend {
             .chain(excluded_dimensions.iter().copied())
             .map(|v| SqlValue::Text(v.to_owned()))
             .collect();
-        self.read(
+        self.read_measured(
             move |conn| -> Result<Vec<crate::federation::Attestation>, rusqlite::Error> {
                 let mut stmt = conn.prepare(&sql)?;
                 let rows =
@@ -5670,7 +5690,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         attested_key_id: &str,
     ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
         let key = attested_key_id.to_owned();
-        self.read(move |conn| -> Result<Vec<crate::federation::Attestation>, rusqlite::Error> {
+        let (read, bytes) = self.read_measured(move |conn| -> Result<Vec<crate::federation::Attestation>, rusqlite::Error> {
                 let mut stmt = conn.prepare(
                     "SELECT attestation_id, attesting_key_id, attested_key_id, attestation_type, \
                         weight, asserted_at, expires_at, attestation_envelope, \
@@ -5682,14 +5702,17 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                 )?;
                 let rows = stmt.query_map([&key], sqlite_row_to_attestation)?;
                 rows.collect()
-            }).await
-        .map_err(|e| crate::federation::Error::Backend(format!("list_attestations_for: {e}")))
-        .inspect(|rows| {
-            #[cfg(test)]
-            crate::federation::read_probe::record("list_attestations_for", attested_key_id, rows);
-            #[cfg(not(test))]
-            let _ = rows;
-        })
+            }).await;
+        read.map_err(|e| crate::federation::Error::Backend(format!("list_attestations_for: {e}")))
+            .inspect(|rows| {
+                crate::observe::record_read(
+                    crate::observe::StoreBackend::Sqlite,
+                    crate::observe::Door::ListAttestationsFor,
+                    attested_key_id,
+                    rows,
+                    bytes,
+                )
+            })
     }
 
     async fn list_attestations_referencing(
@@ -5710,29 +5733,29 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             attestation_type::SUPERSEDES,
         ];
         let sql = sqlite_attestations_referencing_sql();
-        self.read(
-            move |conn| -> Result<Vec<crate::federation::Attestation>, rusqlite::Error> {
-                let mut stmt = conn.prepare(&sql)?;
-                let rows = stmt.query_map(
-                    rusqlite::params![target, composers[0], composers[1], composers[2]],
-                    sqlite_row_to_attestation,
-                )?;
-                rows.collect()
-            },
-        )
-        .await
-        .map_err(|e| {
+        let (read, bytes) = self
+            .read_measured(
+                move |conn| -> Result<Vec<crate::federation::Attestation>, rusqlite::Error> {
+                    let mut stmt = conn.prepare(&sql)?;
+                    let rows = stmt.query_map(
+                        rusqlite::params![target, composers[0], composers[1], composers[2]],
+                        sqlite_row_to_attestation,
+                    )?;
+                    rows.collect()
+                },
+            )
+            .await;
+        read.map_err(|e| {
             crate::federation::Error::Backend(format!("list_attestations_referencing: {e}"))
         })
         .inspect(|rows| {
-            #[cfg(test)]
-            crate::federation::read_probe::record(
-                "list_attestations_referencing",
+            crate::observe::record_read(
+                crate::observe::StoreBackend::Sqlite,
+                crate::observe::Door::ListAttestationsReferencing,
                 target_attestation_id,
                 rows,
-            );
-            #[cfg(not(test))]
-            let _ = rows;
+                bytes,
+            )
         })
     }
 
@@ -5741,7 +5764,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         attesting_key_id: &str,
     ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
         let key = attesting_key_id.to_owned();
-        self.read(move |conn| -> Result<Vec<crate::federation::Attestation>, rusqlite::Error> {
+        let (read, bytes) = self.read_measured(move |conn| -> Result<Vec<crate::federation::Attestation>, rusqlite::Error> {
                 let mut stmt = conn.prepare(
                     "SELECT attestation_id, attesting_key_id, attested_key_id, attestation_type, \
                         weight, asserted_at, expires_at, attestation_envelope, \
@@ -5753,14 +5776,17 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                 )?;
                 let rows = stmt.query_map([&key], sqlite_row_to_attestation)?;
                 rows.collect()
-            }).await
-        .map_err(|e| crate::federation::Error::Backend(format!("list_attestations_by: {e}")))
-        .inspect(|rows| {
-            #[cfg(test)]
-            crate::federation::read_probe::record("list_attestations_by", attesting_key_id, rows);
-            #[cfg(not(test))]
-            let _ = rows;
-        })
+            }).await;
+        read.map_err(|e| crate::federation::Error::Backend(format!("list_attestations_by: {e}")))
+            .inspect(|rows| {
+                crate::observe::record_read(
+                    crate::observe::StoreBackend::Sqlite,
+                    crate::observe::Door::ListAttestationsBy,
+                    attesting_key_id,
+                    rows,
+                    bytes,
+                )
+            })
     }
 
     /// v53.1.5 — V137's `(attesting_key_id, dimension)` seek; the prefix is
@@ -5778,27 +5804,27 @@ impl crate::federation::FederationDirectory for SqliteBackend {
              WHERE attesting_key_id = ?1 AND tier = 'federation' AND {prefix_sql} \
              ORDER BY asserted_at DESC"
         );
-        self.read(
-            move |conn| -> Result<Vec<crate::federation::Attestation>, rusqlite::Error> {
-                let mut stmt = conn.prepare(&sql)?;
-                let rows =
-                    stmt.query_map(params_from_iter(binds.iter()), sqlite_row_to_attestation)?;
-                rows.collect()
-            },
-        )
-        .await
-        .map_err(|e| {
+        let (read, bytes) = self
+            .read_measured(
+                move |conn| -> Result<Vec<crate::federation::Attestation>, rusqlite::Error> {
+                    let mut stmt = conn.prepare(&sql)?;
+                    let rows =
+                        stmt.query_map(params_from_iter(binds.iter()), sqlite_row_to_attestation)?;
+                    rows.collect()
+                },
+            )
+            .await;
+        read.map_err(|e| {
             crate::federation::Error::Backend(format!("list_attestations_by_dimension_prefix: {e}"))
         })
         .inspect(|rows| {
-            #[cfg(test)]
-            crate::federation::read_probe::record(
-                "list_attestations_by_dimension_prefix",
+            crate::observe::record_read(
+                crate::observe::StoreBackend::Sqlite,
+                crate::observe::Door::ListAttestationsByDimensionPrefix,
                 attesting_key_id,
                 rows,
-            );
-            #[cfg(not(test))]
-            let _ = rows;
+                bytes,
+            )
         })
     }
 
@@ -5825,29 +5851,29 @@ impl crate::federation::FederationDirectory for SqliteBackend {
              WHERE attested_key_id = ?1 AND tier = 'federation' AND {prefix_sql}{attester_sql} \
              ORDER BY asserted_at DESC"
         );
-        self.read(
-            move |conn| -> Result<Vec<crate::federation::Attestation>, rusqlite::Error> {
-                let mut stmt = conn.prepare(&sql)?;
-                let rows =
-                    stmt.query_map(params_from_iter(binds.iter()), sqlite_row_to_attestation)?;
-                rows.collect()
-            },
-        )
-        .await
-        .map_err(|e| {
+        let (read, bytes) = self
+            .read_measured(
+                move |conn| -> Result<Vec<crate::federation::Attestation>, rusqlite::Error> {
+                    let mut stmt = conn.prepare(&sql)?;
+                    let rows =
+                        stmt.query_map(params_from_iter(binds.iter()), sqlite_row_to_attestation)?;
+                    rows.collect()
+                },
+            )
+            .await;
+        read.map_err(|e| {
             crate::federation::Error::Backend(format!(
                 "list_attestations_for_dimension_prefix: {e}"
             ))
         })
         .inspect(|rows| {
-            #[cfg(test)]
-            crate::federation::read_probe::record(
-                "list_attestations_for_dimension_prefix",
+            crate::observe::record_read(
+                crate::observe::StoreBackend::Sqlite,
+                crate::observe::Door::ListAttestationsForDimensionPrefix,
                 attested_key_id,
                 rows,
-            );
-            #[cfg(not(test))]
-            let _ = rows;
+                bytes,
+            )
         })
     }
 
@@ -5891,27 +5917,27 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                    IN (SELECT value FROM json_each(?1)){axes} \
              ORDER BY asserted_at DESC"
         );
-        self.read(
-            move |conn| -> Result<Vec<crate::federation::Attestation>, rusqlite::Error> {
-                let mut stmt = conn.prepare(&sql)?;
-                let rows =
-                    stmt.query_map(params_from_iter(binds.iter()), sqlite_row_to_attestation)?;
-                rows.collect()
-            },
-        )
-        .await
-        .map_err(|e| {
+        let (read, bytes) = self
+            .read_measured(
+                move |conn| -> Result<Vec<crate::federation::Attestation>, rusqlite::Error> {
+                    let mut stmt = conn.prepare(&sql)?;
+                    let rows =
+                        stmt.query_map(params_from_iter(binds.iter()), sqlite_row_to_attestation)?;
+                    rows.collect()
+                },
+            )
+            .await;
+        read.map_err(|e| {
             crate::federation::Error::Backend(format!("list_composers_referencing_any: {e}"))
         })
         .inspect(|rows| {
-            #[cfg(test)]
-            crate::federation::read_probe::record(
-                "list_composers_referencing_any",
+            crate::observe::record_read(
+                crate::observe::StoreBackend::Sqlite,
+                crate::observe::Door::ListComposersReferencingAny,
                 attested_key_id.or(attesting_key_id).unwrap_or("*"),
                 rows,
-            );
-            #[cfg(not(test))]
-            let _ = rows;
+                bytes,
+            )
         })
     }
 
@@ -5926,25 +5952,27 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             SqlValue::Text(attestation_type.to_owned()),
         ];
         let sql = sqlite_attestations_for_type_sql();
-        self.read(
-            move |conn| -> Result<Vec<crate::federation::Attestation>, rusqlite::Error> {
-                let mut stmt = conn.prepare(&sql)?;
-                let rows =
-                    stmt.query_map(params_from_iter(binds.iter()), sqlite_row_to_attestation)?;
-                rows.collect()
-            },
-        )
-        .await
-        .map_err(|e| crate::federation::Error::Backend(format!("list_attestations_for_type: {e}")))
+        let (read, bytes) = self
+            .read_measured(
+                move |conn| -> Result<Vec<crate::federation::Attestation>, rusqlite::Error> {
+                    let mut stmt = conn.prepare(&sql)?;
+                    let rows =
+                        stmt.query_map(params_from_iter(binds.iter()), sqlite_row_to_attestation)?;
+                    rows.collect()
+                },
+            )
+            .await;
+        read.map_err(|e| {
+            crate::federation::Error::Backend(format!("list_attestations_for_type: {e}"))
+        })
         .inspect(|rows| {
-            #[cfg(test)]
-            crate::federation::read_probe::record(
-                "list_attestations_for_type",
+            crate::observe::record_read(
+                crate::observe::StoreBackend::Sqlite,
+                crate::observe::Door::ListAttestationsForType,
                 attested_key_id,
                 rows,
-            );
-            #[cfg(not(test))]
-            let _ = rows;
+                bytes,
+            )
         })
     }
 
@@ -5960,25 +5988,27 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             SqlValue::Text(attestation_type.to_owned()),
         ];
         let sql = sqlite_attestations_by_type_sql();
-        self.read(
-            move |conn| -> Result<Vec<crate::federation::Attestation>, rusqlite::Error> {
-                let mut stmt = conn.prepare(&sql)?;
-                let rows =
-                    stmt.query_map(params_from_iter(binds.iter()), sqlite_row_to_attestation)?;
-                rows.collect()
-            },
-        )
-        .await
-        .map_err(|e| crate::federation::Error::Backend(format!("list_attestations_by_type: {e}")))
+        let (read, bytes) = self
+            .read_measured(
+                move |conn| -> Result<Vec<crate::federation::Attestation>, rusqlite::Error> {
+                    let mut stmt = conn.prepare(&sql)?;
+                    let rows =
+                        stmt.query_map(params_from_iter(binds.iter()), sqlite_row_to_attestation)?;
+                    rows.collect()
+                },
+            )
+            .await;
+        read.map_err(|e| {
+            crate::federation::Error::Backend(format!("list_attestations_by_type: {e}"))
+        })
         .inspect(|rows| {
-            #[cfg(test)]
-            crate::federation::read_probe::record(
-                "list_attestations_by_type",
+            crate::observe::record_read(
+                crate::observe::StoreBackend::Sqlite,
+                crate::observe::Door::ListAttestationsByType,
                 attesting_key_id,
                 rows,
-            );
-            #[cfg(not(test))]
-            let _ = rows;
+                bytes,
+            )
         })
     }
 
@@ -5991,22 +6021,23 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         attestation_types: &[&str],
         excluded_dimensions: &[&str],
     ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
-        let rows = self
+        let (rows, bytes) = self
             .sqlite_typed_read(
                 "attested_key_id",
                 attested_key_id,
                 attestation_types,
                 excluded_dimensions,
             )
-            .await
-            .map_err(|e| {
-                crate::federation::Error::Backend(format!("list_attestations_for_types: {e}"))
-            })?;
-        #[cfg(test)]
-        crate::federation::read_probe::record(
-            "list_attestations_for_types",
+            .await;
+        let rows = rows.map_err(|e| {
+            crate::federation::Error::Backend(format!("list_attestations_for_types: {e}"))
+        })?;
+        crate::observe::record_read(
+            crate::observe::StoreBackend::Sqlite,
+            crate::observe::Door::ListAttestationsForTypes,
             attested_key_id,
             &rows,
+            bytes,
         );
         Ok(rows)
     }
@@ -6019,22 +6050,23 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         attestation_types: &[&str],
         excluded_dimensions: &[&str],
     ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
-        let rows = self
+        let (rows, bytes) = self
             .sqlite_typed_read(
                 "attesting_key_id",
                 attesting_key_id,
                 attestation_types,
                 excluded_dimensions,
             )
-            .await
-            .map_err(|e| {
-                crate::federation::Error::Backend(format!("list_attestations_by_types: {e}"))
-            })?;
-        #[cfg(test)]
-        crate::federation::read_probe::record(
-            "list_attestations_by_types",
+            .await;
+        let rows = rows.map_err(|e| {
+            crate::federation::Error::Backend(format!("list_attestations_by_types: {e}"))
+        })?;
+        crate::observe::record_read(
+            crate::observe::StoreBackend::Sqlite,
+            crate::observe::Door::ListAttestationsByTypes,
             attesting_key_id,
             &rows,
+            bytes,
         );
         Ok(rows)
     }
@@ -6059,27 +6091,27 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                AND tier = 'federation' \
              ORDER BY asserted_at DESC"
         );
-        self.read(
-            move |conn| -> Result<Vec<crate::federation::Attestation>, rusqlite::Error> {
-                let mut stmt = conn.prepare(&sql)?;
-                let rows =
-                    stmt.query_map(params_from_iter(binds.iter()), sqlite_row_to_attestation)?;
-                rows.collect()
-            },
-        )
-        .await
-        .map_err(|e| {
+        let (read, bytes) = self
+            .read_measured(
+                move |conn| -> Result<Vec<crate::federation::Attestation>, rusqlite::Error> {
+                    let mut stmt = conn.prepare(&sql)?;
+                    let rows =
+                        stmt.query_map(params_from_iter(binds.iter()), sqlite_row_to_attestation)?;
+                    rows.collect()
+                },
+            )
+            .await;
+        read.map_err(|e| {
             crate::federation::Error::Backend(format!("list_attestations_by_dimension_citing: {e}"))
         })
         .inspect(|rows| {
-            #[cfg(test)]
-            crate::federation::read_probe::record(
-                "list_attestations_by_dimension_citing",
+            crate::observe::record_read(
+                crate::observe::StoreBackend::Sqlite,
+                crate::observe::Door::ListAttestationsByDimensionCiting,
                 attesting_key_id,
                 rows,
-            );
-            #[cfg(not(test))]
-            let _ = rows;
+                bytes,
+            )
         })
     }
 
@@ -6110,27 +6142,27 @@ impl crate::federation::FederationDirectory for SqliteBackend {
              ORDER BY asserted_at DESC",
             scopes = scope_phs.join(", "),
         );
-        self.read(
-            move |conn| -> Result<Vec<crate::federation::Attestation>, rusqlite::Error> {
-                let mut stmt = conn.prepare(&sql)?;
-                let rows =
-                    stmt.query_map(params_from_iter(binds.iter()), sqlite_row_to_attestation)?;
-                rows.collect()
-            },
-        )
-        .await
-        .map_err(|e| {
+        let (read, bytes) = self
+            .read_measured(
+                move |conn| -> Result<Vec<crate::federation::Attestation>, rusqlite::Error> {
+                    let mut stmt = conn.prepare(&sql)?;
+                    let rows =
+                        stmt.query_map(params_from_iter(binds.iter()), sqlite_row_to_attestation)?;
+                    rows.collect()
+                },
+            )
+            .await;
+        read.map_err(|e| {
             crate::federation::Error::Backend(format!("list_targeted_by_dimension_prefix: {e}"))
         })
         .inspect(|rows| {
-            #[cfg(test)]
-            crate::federation::read_probe::record(
-                "list_targeted_by_dimension_prefix",
+            crate::observe::record_read(
+                crate::observe::StoreBackend::Sqlite,
+                crate::observe::Door::ListTargetedByDimensionPrefix,
                 cohort_target,
                 rows,
-            );
-            #[cfg(not(test))]
-            let _ = rows;
+                bytes,
+            )
         })
     }
 
@@ -6192,8 +6224,8 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         node_key_id: &str,
     ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
         let node = node_key_id.to_owned();
-        let candidates = self
-            .read(
+        let (candidates, bytes) = self
+            .read_measured(
                 move |conn| -> Result<Vec<crate::federation::Attestation>, rusqlite::Error> {
                     let mut stmt = conn.prepare(
                     "SELECT attestation_id, attesting_key_id, attested_key_id, attestation_type, \
@@ -6213,17 +6245,25 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     rows.collect()
                 },
             )
-            .await
-            .map_err(|e| {
-                crate::federation::Error::Backend(format!("list_live_consent_grants_by: {e}"))
-            })?;
-        Ok(candidates
+            .await;
+        let candidates = candidates.map_err(|e| {
+            crate::federation::Error::Backend(format!("list_live_consent_grants_by: {e}"))
+        })?;
+        let rows: Vec<crate::federation::Attestation> = candidates
             .into_iter()
             .filter(|a| {
                 crate::federation::admission::envelope_dimension(&a.attestation_envelope)
                     == Some(crate::federation::consent_peer_set::DIMENSION)
             })
-            .collect())
+            .collect();
+        crate::observe::record_read(
+            crate::observe::StoreBackend::Sqlite,
+            crate::observe::Door::ListLiveConsentGrantsBy,
+            node_key_id,
+            &rows,
+            bytes,
+        );
+        Ok(rows)
     }
 
     // v48.0.0 (CIRISPersist#905) — the V147 projection's live sources for this
@@ -6233,8 +6273,8 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         for_key_id: &str,
     ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
         let node = for_key_id.to_owned();
-        let candidates = self
-            .read(
+        let (candidates, bytes) = self
+            .read_measured(
                 move |conn| -> Result<Vec<crate::federation::Attestation>, rusqlite::Error> {
                     let mut stmt = conn.prepare(
                     "SELECT attestation_id, attesting_key_id, attested_key_id, attestation_type, \
@@ -6254,17 +6294,25 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     rows.collect()
                 },
             )
-            .await
-            .map_err(|e| {
-                crate::federation::Error::Backend(format!("list_live_consent_grants_by: {e}"))
-            })?;
-        Ok(candidates
+            .await;
+        let candidates = candidates.map_err(|e| {
+            crate::federation::Error::Backend(format!("list_live_consent_grants_by: {e}"))
+        })?;
+        let rows: Vec<crate::federation::Attestation> = candidates
             .into_iter()
             .filter(|a| {
                 crate::federation::admission::envelope_dimension(&a.attestation_envelope)
                     == Some(crate::federation::consent_peer_set::DIMENSION)
             })
-            .collect())
+            .collect();
+        crate::observe::record_read(
+            crate::observe::StoreBackend::Sqlite,
+            crate::observe::Door::ListLiveConsentGrantsFor,
+            for_key_id,
+            &rows,
+            bytes,
+        );
+        Ok(rows)
     }
 
     /// v21.2.0 (CIRISPersist#509 FLOOR) — the `promote_consented_backlog`
@@ -6277,7 +6325,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
     ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
         let after = after_attestation_id.map(str::to_owned);
         let limit = i64::from(limit);
-        self.read(move |conn| -> Result<Vec<crate::federation::Attestation>, rusqlite::Error> {
+        let (read, bytes) = self.read_measured(move |conn| -> Result<Vec<crate::federation::Attestation>, rusqlite::Error> {
             let mut stmt = conn.prepare(
                 "SELECT attestation_id, attesting_key_id, attested_key_id, attestation_type, \
                     weight, asserted_at, expires_at, attestation_envelope, \
@@ -6291,9 +6339,18 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             let rows =
                 stmt.query_map(rusqlite::params![after, limit], sqlite_row_to_attestation)?;
             rows.collect()
-        }).await
-        .map_err(|e| {
+        }).await;
+        read.map_err(|e| {
             crate::federation::Error::Backend(format!("list_local_tier_attestations: {e}"))
+        })
+        .inspect(|rows| {
+            crate::observe::record_read(
+                crate::observe::StoreBackend::Sqlite,
+                crate::observe::Door::ListLocalTierAttestations,
+                after_attestation_id.unwrap_or("*"),
+                rows,
+                bytes,
+            )
         })
     }
 
@@ -6318,7 +6375,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         let unplaced = crate::federation::admission::sqlite_envelope_names_no_cohort_target(
             "a.attestation_envelope",
         );
-        self.read(move |conn| -> Result<Vec<crate::federation::Attestation>, rusqlite::Error> {
+        let (read, bytes) = self.read_measured(move |conn| -> Result<Vec<crate::federation::Attestation>, rusqlite::Error> {
             let mut stmt = conn.prepare(&format!(
                 "SELECT attestation_id, attesting_key_id, attested_key_id, attestation_type, \
                     weight, asserted_at, expires_at, attestation_envelope, \
@@ -6363,9 +6420,18 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                 sqlite_row_to_attestation,
             )?;
             rows.collect()
-        }).await
-        .map_err(|e| {
+        }).await;
+        read.map_err(|e| {
             crate::federation::Error::Backend(format!("list_widening_candidates: {e}"))
+        })
+        .inspect(|rows| {
+            crate::observe::record_read(
+                crate::observe::StoreBackend::Sqlite,
+                crate::observe::Door::ListWideningCandidates,
+                after_attestation_id.unwrap_or("*"),
+                rows,
+                bytes,
+            )
         })
     }
 
@@ -6380,7 +6446,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
     ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
         let after = after_attestation_id.map(str::to_owned);
         let limit = i64::from(limit);
-        self.read(move |conn| -> Result<Vec<crate::federation::Attestation>, rusqlite::Error> {
+        let (read, bytes) = self.read_measured(move |conn| -> Result<Vec<crate::federation::Attestation>, rusqlite::Error> {
             let mut stmt = conn.prepare(
                 "SELECT attestation_id, attesting_key_id, attested_key_id, attestation_type, \
                     weight, asserted_at, expires_at, attestation_envelope, \
@@ -6394,9 +6460,18 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             let rows =
                 stmt.query_map(rusqlite::params![after, limit], sqlite_row_to_attestation)?;
             rows.collect()
-        }).await
-        .map_err(|e| {
+        }).await;
+        read.map_err(|e| {
             crate::federation::Error::Backend(format!("list_attestations_for_migration: {e}"))
+        })
+        .inspect(|rows| {
+            crate::observe::record_read(
+                crate::observe::StoreBackend::Sqlite,
+                crate::observe::Door::ListAttestationsForMigration,
+                after_attestation_id.unwrap_or("*"),
+                rows,
+                bytes,
+            )
         })
     }
 
@@ -6928,7 +7003,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         // table; this scan is over `federation_attestations`.
         let sha = content_sha256.to_owned();
         let like = format!("%{sha}%");
-        self.read(move |conn| -> Result<Vec<crate::federation::Attestation>, rusqlite::Error> {
+        let (read, bytes) = self.read_measured(move |conn| -> Result<Vec<crate::federation::Attestation>, rusqlite::Error> {
             let mut stmt = conn.prepare(
                 "SELECT attestation_id, attesting_key_id, attested_key_id, attestation_type, \
                         weight, asserted_at, expires_at, attestation_envelope, \
@@ -6942,8 +7017,8 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             )?;
             let rows = stmt.query_map([&like], sqlite_row_to_attestation)?;
             rows.collect::<Result<Vec<_>, _>>()
-        }).await
-        .map(|atts| {
+        }).await;
+        read.map(|atts| {
             atts.into_iter()
                 .filter(|a| {
                     crate::federation::admission::envelope_binds_content(
@@ -6951,10 +7026,19 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                         &sha,
                     )
                 })
-                .collect()
+                .collect::<Vec<_>>()
         })
         .map_err(|e| {
             crate::federation::Error::Backend(format!("attestations_binding_content: {e}"))
+        })
+        .inspect(|rows| {
+            crate::observe::record_read(
+                crate::observe::StoreBackend::Sqlite,
+                crate::observe::Door::AttestationsBindingContent,
+                content_sha256,
+                rows,
+                bytes,
+            )
         })
     }
 
@@ -12444,11 +12528,12 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         )
         .map(|p| format!(" AND {p}"))
         .unwrap_or_default();
-        self.read(move |conn| -> Result<Vec<_>, rusqlite::Error> {
-            // E5 invariant: `tier = 'federation'` only — a local-tier row
-            // must never reach the advertise/serve wire surface.
-            let mut stmt = conn.prepare(&format!(
-                "SELECT attestation_id, attesting_key_id, attested_key_id, attestation_type, \
+        let (read, bytes) = self
+            .read_measured(move |conn| -> Result<Vec<_>, rusqlite::Error> {
+                // E5 invariant: `tier = 'federation'` only — a local-tier row
+                // must never reach the advertise/serve wire surface.
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT attestation_id, attesting_key_id, attested_key_id, attestation_type, \
                     weight, asserted_at, expires_at, attestation_envelope, \
                     original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
                     scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, \
@@ -12458,19 +12543,28 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                  WHERE (?1 IS NULL OR {pos} > ?1 OR ({pos} = ?1 AND attestation_id > ?2)) \
                    AND tier = 'federation'{row_type_filter} \
                  ORDER BY {pos} ASC, attestation_id ASC LIMIT ?3",
-                pos = POS_ATTESTATION,
-            ))?;
-            let rows = stmt.query_map(rusqlite::params![since_at, since_id, limit], |row| {
-                let pos: String = row.get("_pos")?;
-                Ok(crate::federation::ServedAttestation {
-                    attestation: sqlite_row_to_attestation(row)?,
-                    admitted_at: parse_rfc3339(&pos),
-                })
-            })?;
-            rows.collect()
-        })
-        .await
-        .map_err(|e| crate::federation::Error::Backend(format!("list_attestations_since: {e}")))
+                    pos = POS_ATTESTATION,
+                ))?;
+                let rows = stmt.query_map(rusqlite::params![since_at, since_id, limit], |row| {
+                    let pos: String = row.get("_pos")?;
+                    Ok(crate::federation::ServedAttestation {
+                        attestation: sqlite_row_to_attestation(row)?,
+                        admitted_at: parse_rfc3339(&pos),
+                    })
+                })?;
+                rows.collect()
+            })
+            .await;
+        read.map_err(|e| crate::federation::Error::Backend(format!("list_attestations_since: {e}")))
+            .inspect(|rows| {
+                crate::observe::record_read(
+                    crate::observe::StoreBackend::Sqlite,
+                    crate::observe::Door::ListAttestationsSince,
+                    "*",
+                    rows,
+                    bytes,
+                )
+            })
     }
 
     async fn list_signed_identity_occurrence_revocations_since(
@@ -12765,7 +12859,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         attestation_id: &str,
     ) -> Result<Option<crate::federation::Attestation>, crate::federation::Error> {
         let id = attestation_id.to_owned();
-        self.read(move |conn| -> Result<Option<crate::federation::Attestation>, rusqlite::Error> {
+        let (read, bytes) = self.read_measured(move |conn| -> Result<Option<crate::federation::Attestation>, rusqlite::Error> {
             conn.query_row(
                 "SELECT attestation_id, attesting_key_id, attested_key_id, attestation_type, \
                     weight, asserted_at, expires_at, attestation_envelope, \
@@ -12777,8 +12871,17 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                 sqlite_row_to_attestation,
             )
             .optional()
-        }).await
-        .map_err(|e| crate::federation::Error::Backend(format!("get_attestation: {e}")))
+        }).await;
+        read.map_err(|e| crate::federation::Error::Backend(format!("get_attestation: {e}")))
+            .inspect(|row| {
+                crate::observe::record_read(
+                    crate::observe::StoreBackend::Sqlite,
+                    crate::observe::Door::GetAttestation,
+                    attestation_id,
+                    row.as_slice(),
+                    bytes,
+                )
+            })
     }
 
     /// v39.0.0 — the tier crossing. Everything that decides lives in
@@ -13042,8 +13145,8 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             parts.join(" AND ")
         );
         let limit_usize = limit as usize;
-        let page = self
-            .read(
+        let (page, bytes) = self
+            .read_measured(
                 move |conn| -> Result<crate::read::ScoresPage, crate::federation::Error> {
                     let mut stmt = conn.prepare(&sql).map_err(|e| {
                         Error::Backend(format!("list_attestation_log prepare: {e}"))
@@ -13065,7 +13168,8 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     Ok(crate::read::ScoresPage { items, next_cursor })
                 },
             )
-            .await?;
+            .await;
+        let page = page?;
 
         // v25.1.0 (CIRISPersist#570 ask 5) — THE SERVE CONSULT. This is the
         // relay read a peer's rows leave through, so it is where the
@@ -13085,6 +13189,13 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             chrono::Utc::now(),
         )
         .await?;
+        crate::observe::record_read(
+            crate::observe::StoreBackend::Sqlite,
+            crate::observe::Door::ListAttestationLog,
+            subject_key_id.unwrap_or("*"),
+            &items,
+            bytes,
+        );
         Ok(crate::read::ScoresPage { items, next_cursor })
     }
 
@@ -22887,6 +22998,7 @@ fn sqlite_row_to_attestation(
     row: &rusqlite::Row<'_>,
 ) -> rusqlite::Result<crate::federation::Attestation> {
     let envelope_text: String = row.get("attestation_envelope")?;
+    crate::observe::note_decoded_bytes(envelope_text.len());
     let envelope: serde_json::Value = serde_json::from_str(&envelope_text).map_err(|e| {
         rusqlite::Error::FromSqlConversionFailure(
             7,
@@ -25964,6 +26076,9 @@ impl crate::read::ReadEngine for SqliteBackend {
             .clone()
             .or_else(|| filter.attesting_key_id.clone())
             .unwrap_or_else(|| "*".to_owned());
+        // The key reaches only the test probe; an empty `String` allocates nothing.
+        #[cfg(not(test))]
+        let probe_key = String::new();
         if !(1..=10_000).contains(&limit) {
             return Err(crate::read::Error::InvalidArgument(format!(
                 "limit must be in [1, 10000], got {limit}"
@@ -26183,34 +26298,38 @@ impl crate::read::ReadEngine for SqliteBackend {
              ORDER BY asserted_at DESC, attestation_id DESC LIMIT ?{p_limit}"
         );
         let limit_usize = limit as usize;
-        self.read(
-            move |conn| -> Result<crate::read::AttestationListPage, crate::read::Error> {
-                let mut stmt = conn
-                    .prepare(&sql)
-                    .map_err(sqlite_read_err("list_attestations prepare"))?;
-                let items: Vec<crate::federation::Attestation> = stmt
-                    .query_map(params_from_iter(binds.iter()), sqlite_row_to_attestation)
-                    .map_err(sqlite_read_err("list_attestations query"))?
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(sqlite_read_err("list_attestations row"))?;
-                let next_cursor = if items.len() == limit_usize {
-                    let last = &items[items.len() - 1];
-                    Some(crate::read::AttestationCursor::from_trailing(
-                        last.asserted_at,
-                        last.attestation_id.clone(),
-                    ))
-                } else {
-                    None
-                };
-                Ok(crate::read::AttestationListPage { items, next_cursor })
-            },
-        )
-        .await
-        .inspect(|page| {
-            #[cfg(test)]
-            crate::federation::read_probe::record("list_attestations", &probe_key, &page.items);
-            #[cfg(not(test))]
-            let _ = page;
+        let (read, bytes) = self
+            .read_measured(
+                move |conn| -> Result<crate::read::AttestationListPage, crate::read::Error> {
+                    let mut stmt = conn
+                        .prepare(&sql)
+                        .map_err(sqlite_read_err("list_attestations prepare"))?;
+                    let items: Vec<crate::federation::Attestation> = stmt
+                        .query_map(params_from_iter(binds.iter()), sqlite_row_to_attestation)
+                        .map_err(sqlite_read_err("list_attestations query"))?
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(sqlite_read_err("list_attestations row"))?;
+                    let next_cursor = if items.len() == limit_usize {
+                        let last = &items[items.len() - 1];
+                        Some(crate::read::AttestationCursor::from_trailing(
+                            last.asserted_at,
+                            last.attestation_id.clone(),
+                        ))
+                    } else {
+                        None
+                    };
+                    Ok(crate::read::AttestationListPage { items, next_cursor })
+                },
+            )
+            .await;
+        read.inspect(|page| {
+            crate::observe::record_read(
+                crate::observe::StoreBackend::Sqlite,
+                crate::observe::Door::ListAttestations,
+                &probe_key,
+                &page.items,
+                bytes,
+            )
         })
     }
 

@@ -4486,6 +4486,13 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         let items =
             crate::federation::quarantine::filter_withheld_rows(self, rows, chrono::Utc::now())
                 .await?;
+        crate::observe::record_read(
+            crate::observe::StoreBackend::Memory,
+            crate::observe::Door::ListAttestationLog,
+            subject_key_id.unwrap_or("*"),
+            &items,
+            0,
+        );
         Ok(crate::read::ScoresPage { items, next_cursor })
     }
 
@@ -4594,11 +4601,12 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             .cloned()
             .collect();
         rows.sort_by_key(|a| std::cmp::Reverse(a.asserted_at));
-        #[cfg(test)]
-        crate::federation::read_probe::record(
-            "list_attestations_referencing",
+        crate::observe::record_read(
+            crate::observe::StoreBackend::Memory,
+            crate::observe::Door::ListAttestationsReferencing,
             target_attestation_id,
             &rows,
+            0,
         );
         Ok(rows)
     }
@@ -4621,8 +4629,13 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             .collect();
         // Match postgres ORDER BY asserted_at DESC.
         rows.sort_by_key(|a| std::cmp::Reverse(a.asserted_at));
-        #[cfg(test)]
-        crate::federation::read_probe::record("list_attestations_for", attested_key_id, &rows);
+        crate::observe::record_read(
+            crate::observe::StoreBackend::Memory,
+            crate::observe::Door::ListAttestationsFor,
+            attested_key_id,
+            &rows,
+            0,
+        );
         Ok(rows)
     }
 
@@ -4643,8 +4656,13 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             .cloned()
             .collect();
         rows.sort_by_key(|a| std::cmp::Reverse(a.asserted_at));
-        #[cfg(test)]
-        crate::federation::read_probe::record("list_attestations_by", attesting_key_id, &rows);
+        crate::observe::record_read(
+            crate::observe::StoreBackend::Memory,
+            crate::observe::Door::ListAttestationsBy,
+            attesting_key_id,
+            &rows,
+            0,
+        );
         Ok(rows)
     }
 
@@ -4668,11 +4686,12 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             .cloned()
             .collect();
         rows.sort_by_key(|a| std::cmp::Reverse(a.asserted_at));
-        #[cfg(test)]
-        crate::federation::read_probe::record(
-            "list_attestations_by_dimension_prefix",
+        crate::observe::record_read(
+            crate::observe::StoreBackend::Memory,
+            crate::observe::Door::ListAttestationsByDimensionPrefix,
             attesting_key_id,
             &rows,
+            0,
         );
         Ok(rows)
     }
@@ -4697,11 +4716,12 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             .cloned()
             .collect();
         rows.sort_by_key(|a| std::cmp::Reverse(a.asserted_at));
-        #[cfg(test)]
-        crate::federation::read_probe::record(
-            "list_attestations_for_dimension_prefix",
+        crate::observe::record_read(
+            crate::observe::StoreBackend::Memory,
+            crate::observe::Door::ListAttestationsForDimensionPrefix,
             attested_key_id,
             &rows,
+            0,
         );
         Ok(rows)
     }
@@ -4736,11 +4756,12 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             .cloned()
             .collect();
         rows.sort_by_key(|a| std::cmp::Reverse(a.asserted_at));
-        #[cfg(test)]
-        crate::federation::read_probe::record(
-            "list_composers_referencing_any",
+        crate::observe::record_read(
+            crate::observe::StoreBackend::Memory,
+            crate::observe::Door::ListComposersReferencingAny,
             attested_key_id.or(attesting_key_id).unwrap_or("*"),
             &rows,
+            0,
         );
         Ok(rows)
     }
@@ -4762,8 +4783,13 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             .cloned()
             .collect();
         rows.sort_by_key(|a| std::cmp::Reverse(a.asserted_at));
-        #[cfg(test)]
-        crate::federation::read_probe::record("list_attestations_for_type", attested_key_id, &rows);
+        crate::observe::record_read(
+            crate::observe::StoreBackend::Memory,
+            crate::observe::Door::ListAttestationsForType,
+            attested_key_id,
+            &rows,
+            0,
+        );
         Ok(rows)
     }
 
@@ -4784,8 +4810,13 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             .cloned()
             .collect();
         rows.sort_by_key(|a| std::cmp::Reverse(a.asserted_at));
-        #[cfg(test)]
-        crate::federation::read_probe::record("list_attestations_by_type", attesting_key_id, &rows);
+        crate::observe::record_read(
+            crate::observe::StoreBackend::Memory,
+            crate::observe::Door::ListAttestationsByType,
+            attesting_key_id,
+            &rows,
+            0,
+        );
         Ok(rows)
     }
 
@@ -4811,11 +4842,12 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             .cloned()
             .collect();
         rows.sort_by_key(|a| std::cmp::Reverse(a.asserted_at));
-        #[cfg(test)]
-        crate::federation::read_probe::record(
-            "list_attestations_for_types",
+        crate::observe::record_read(
+            crate::observe::StoreBackend::Memory,
+            crate::observe::Door::ListAttestationsForTypes,
             attested_key_id,
             &rows,
+            0,
         );
         Ok(rows)
     }
@@ -4842,11 +4874,12 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             .cloned()
             .collect();
         rows.sort_by_key(|a| std::cmp::Reverse(a.asserted_at));
-        #[cfg(test)]
-        crate::federation::read_probe::record(
-            "list_attestations_by_types",
+        crate::observe::record_read(
+            crate::observe::StoreBackend::Memory,
+            crate::observe::Door::ListAttestationsByTypes,
             attesting_key_id,
             &rows,
+            0,
         );
         Ok(rows)
     }
@@ -4872,11 +4905,12 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             .cloned()
             .collect();
         rows.sort_by_key(|a| std::cmp::Reverse(a.asserted_at));
-        #[cfg(test)]
-        crate::federation::read_probe::record(
-            "list_attestations_by_dimension_citing",
+        crate::observe::record_read(
+            crate::observe::StoreBackend::Memory,
+            crate::observe::Door::ListAttestationsByDimensionCiting,
             attesting_key_id,
             &rows,
+            0,
         );
         Ok(rows)
     }
@@ -4904,11 +4938,12 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             .cloned()
             .collect();
         rows.sort_by_key(|a| std::cmp::Reverse(a.asserted_at));
-        #[cfg(test)]
-        crate::federation::read_probe::record(
-            "list_targeted_by_dimension_prefix",
+        crate::observe::record_read(
+            crate::observe::StoreBackend::Memory,
+            crate::observe::Door::ListTargetedByDimensionPrefix,
             cohort_target,
             &rows,
+            0,
         );
         Ok(rows)
     }
@@ -4975,6 +5010,13 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             .cloned()
             .collect();
         rows.sort_by_key(|a| std::cmp::Reverse(a.asserted_at));
+        crate::observe::record_read(
+            crate::observe::StoreBackend::Memory,
+            crate::observe::Door::ListLiveConsentGrantsBy,
+            node_key_id,
+            &rows,
+            0,
+        );
         Ok(rows)
     }
 
@@ -5004,6 +5046,13 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             .cloned()
             .collect();
         rows.sort_by_key(|a| std::cmp::Reverse(a.asserted_at));
+        crate::observe::record_read(
+            crate::observe::StoreBackend::Memory,
+            crate::observe::Door::ListLiveConsentGrantsFor,
+            for_key_id,
+            &rows,
+            0,
+        );
         Ok(rows)
     }
 
@@ -5027,6 +5076,13 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             .collect();
         rows.sort_by(|a, b| a.attestation_id.cmp(&b.attestation_id));
         rows.truncate(limit as usize);
+        crate::observe::record_read(
+            crate::observe::StoreBackend::Memory,
+            crate::observe::Door::ListLocalTierAttestations,
+            after_attestation_id.unwrap_or("*"),
+            &rows,
+            0,
+        );
         Ok(rows)
     }
 
@@ -5096,6 +5152,13 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             .collect();
         rows.sort_by(|a, b| a.attestation_id.cmp(&b.attestation_id));
         rows.truncate(limit as usize);
+        crate::observe::record_read(
+            crate::observe::StoreBackend::Memory,
+            crate::observe::Door::ListWideningCandidates,
+            after_attestation_id.unwrap_or("*"),
+            &rows,
+            0,
+        );
         Ok(rows)
     }
 
@@ -5120,6 +5183,13 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             .collect();
         rows.sort_by(|a, b| a.attestation_id.cmp(&b.attestation_id));
         rows.truncate(limit as usize);
+        crate::observe::record_read(
+            crate::observe::StoreBackend::Memory,
+            crate::observe::Door::ListAttestationsForMigration,
+            after_attestation_id.unwrap_or("*"),
+            &rows,
+            0,
+        );
         Ok(rows)
     }
 
@@ -5506,6 +5576,13 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             .cloned()
             .collect();
         rows.sort_by_key(|a| std::cmp::Reverse(a.asserted_at));
+        crate::observe::record_read(
+            crate::observe::StoreBackend::Memory,
+            crate::observe::Door::AttestationsBindingContent,
+            content_sha256,
+            &rows,
+            0,
+        );
         Ok(rows)
     }
 
@@ -10075,6 +10152,13 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             })
         });
         rows.truncate(limit as usize);
+        crate::observe::record_read(
+            crate::observe::StoreBackend::Memory,
+            crate::observe::Door::ListAttestationsSince,
+            "*",
+            &rows,
+            0,
+        );
         Ok(rows)
     }
 
@@ -10316,11 +10400,19 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         attestation_id: &str,
     ) -> Result<Option<crate::federation::Attestation>, crate::federation::Error> {
         let state = self.state.lock().expect("memory backend lock");
-        Ok(state
+        let row = state
             .federation_attestations
             .iter()
             .find(|a| a.attestation_id == attestation_id)
-            .cloned())
+            .cloned();
+        crate::observe::record_read(
+            crate::observe::StoreBackend::Memory,
+            crate::observe::Door::GetAttestation,
+            attestation_id,
+            row.as_slice(),
+            0,
+        );
+        Ok(row)
     }
 
     /// v39.0.0 — the tier crossing. Everything that decides lives in
