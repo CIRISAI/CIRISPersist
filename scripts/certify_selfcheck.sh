@@ -93,15 +93,19 @@ mk foo-cccccccccccccccc 5000 1500                                               
 mk liblibc-dddddddddddddddd.rlib 100 1000; mk libc-dddddddddddddddd.d 10 1000      # crate `libc`, only gen
 mkdir -p "$INC/foo-1111111111111111" "$INC/foo-2222222222222222"
 touch -d @1000 "$INC/foo-1111111111111111"; touch -d @2000 "$INC/foo-2222222222222222"
+# Cargo's real incremental names: base-36 disambiguators of varying length,
+# not 16 hex (`build_script_build-05vyqsvijk35y`; Codex on PR #1039).
+mkdir -p "$INC/bar-05vyqsvijk35y" "$INC/bar-3n9zq0wpxk1ab2"
+touch -d @1000 "$INC/bar-05vyqsvijk35y"; touch -d @2000 "$INC/bar-3n9zq0wpxk1ab2"
 
 out="$(python3 scripts/prune_target.py --target "$T" --dry-run)"
 [ -f "$DEPS/libfoo-aaaaaaaaaaaaaaaa.rlib" ] && ok=1 || ok=0
 [ "$ok" -eq 1 ] && echo "  ok    dry-run          deleted nothing" || { echo "  FAIL  dry-run deleted files"; fails=$(( fails + 1 )); }
 
 out="$(python3 scripts/prune_target.py --target "$T")"
-survivors="$(cd "$DEPS" && ls | sort | tr '\n' ' ')"; inc="$(ls "$INC" | tr '\n' ' ')"
+survivors="$(cd "$DEPS" && ls | sort | tr '\n' ' ')"; inc="$(ls "$INC" | sort | tr '\n' ' ')"
 want_s="foo-bbbbbbbbbbbbbbbb.d foo-cccccccccccccccc libc-dddddddddddddddd.d libfoo-bbbbbbbbbbbbbbbb.rlib liblibc-dddddddddddddddd.rlib "
-if [ "$survivors" = "$want_s" ] && [ "$inc" = "foo-2222222222222222 " ] && grep -q '^prune_target: 3 superseded artifacts' <<<"$out"; then
+if [ "$survivors" = "$want_s" ] && [ "$inc" = "bar-3n9zq0wpxk1ab2 foo-2222222222222222 " ] && grep -q '^prune_target: 4 superseded artifacts' <<<"$out"; then
     echo "  ok    newest-per-name  $(tail -1 <<<"$out")"
 else
     echo "  FAIL  newest-per-name: survivors [$survivors] incremental [$inc]"; echo "        $out"
