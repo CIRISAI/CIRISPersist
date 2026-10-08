@@ -1,0 +1,6 @@
+# Renders the registry's metrics into telemetry/catalog.json: the shape the
+# I552 witness compares against src/observe/catalog.rs (CIRISPersist#1027).
+templates:
+  - template: catalog.json.j2
+    filter: .
+    application_mode: single

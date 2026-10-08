@@ -1,0 +1,63 @@
+{
+  "metrics": [
+    {
+      "name": "ciris.persist.fold.bytes",
+      "instrument": "counter",
+      "unit": "By",
+      "labels": [
+        {"key": "fold", "values": ["attestation_admission", "is_public_group", "owner_allow_list", "owner_audience", "owner_granted_scope", "resolve_scoped_stance", "resolve_scoped_stance_by_principals", "resolve_serve_tier", "trust_root_valid", "trusted_roots_of"]}
+      ]
+    },
+    {
+      "name": "ciris.persist.fold.calls",
+      "instrument": "counter",
+      "unit": "{call}",
+      "labels": [
+        {"key": "fold", "values": ["attestation_admission", "is_public_group", "owner_allow_list", "owner_audience", "owner_granted_scope", "resolve_scoped_stance", "resolve_scoped_stance_by_principals", "resolve_serve_tier", "trust_root_valid", "trusted_roots_of"]}
+      ]
+    },
+    {
+      "name": "ciris.persist.fold.reads",
+      "instrument": "counter",
+      "unit": "{read}",
+      "labels": [
+        {"key": "fold", "values": ["attestation_admission", "is_public_group", "owner_allow_list", "owner_audience", "owner_granted_scope", "resolve_scoped_stance", "resolve_scoped_stance_by_principals", "resolve_serve_tier", "trust_root_valid", "trusted_roots_of"]}
+      ]
+    },
+    {
+      "name": "ciris.persist.fold.rows",
+      "instrument": "counter",
+      "unit": "{row}",
+      "labels": [
+        {"key": "fold", "values": ["attestation_admission", "is_public_group", "owner_allow_list", "owner_audience", "owner_granted_scope", "resolve_scoped_stance", "resolve_scoped_stance_by_principals", "resolve_serve_tier", "trust_root_valid", "trusted_roots_of"]}
+      ]
+    },
+    {
+      "name": "ciris.persist.read.bytes",
+      "instrument": "counter",
+      "unit": "By",
+      "labels": [
+        {"key": "backend", "values": ["memory", "postgres", "sqlite"]},
+        {"key": "door", "values": ["attestations_binding_content", "get_attestation", "list_attestation_log", "list_attestations", "list_attestations_by", "list_attestations_by_dimension_citing", "list_attestations_by_dimension_prefix", "list_attestations_by_type", "list_attestations_by_types", "list_attestations_for", "list_attestations_for_dimension_prefix", "list_attestations_for_migration", "list_attestations_for_type", "list_attestations_for_types", "list_attestations_referencing", "list_attestations_since", "list_composers_referencing_any", "list_live_consent_grants_by", "list_live_consent_grants_for", "list_local_tier_attestations", "list_targeted_by_dimension_prefix", "list_widening_candidates"]}
+      ]
+    },
+    {
+      "name": "ciris.persist.read.calls",
+      "instrument": "counter",
+      "unit": "{read}",
+      "labels": [
+        {"key": "backend", "values": ["memory", "postgres", "sqlite"]},
+        {"key": "door", "values": ["attestations_binding_content", "get_attestation", "list_attestation_log", "list_attestations", "list_attestations_by", "list_attestations_by_dimension_citing", "list_attestations_by_dimension_prefix", "list_attestations_by_type", "list_attestations_by_types", "list_attestations_for", "list_attestations_for_dimension_prefix", "list_attestations_for_migration", "list_attestations_for_type", "list_attestations_for_types", "list_attestations_referencing", "list_attestations_since", "list_composers_referencing_any", "list_live_consent_grants_by", "list_live_consent_grants_for", "list_local_tier_attestations", "list_targeted_by_dimension_prefix", "list_widening_candidates"]}
+      ]
+    },
+    {
+      "name": "ciris.persist.read.rows",
+      "instrument": "counter",
+      "unit": "{row}",
+      "labels": [
+        {"key": "backend", "values": ["memory", "postgres", "sqlite"]},
+        {"key": "door", "values": ["attestations_binding_content", "get_attestation", "list_attestation_log", "list_attestations", "list_attestations_by", "list_attestations_by_dimension_citing", "list_attestations_by_dimension_prefix", "list_attestations_by_type", "list_attestations_by_types", "list_attestations_for", "list_attestations_for_dimension_prefix", "list_attestations_for_migration", "list_attestations_for_type", "list_attestations_for_types", "list_attestations_referencing", "list_attestations_since", "list_composers_referencing_any", "list_live_consent_grants_by", "list_live_consent_grants_for", "list_local_tier_attestations", "list_targeted_by_dimension_prefix", "list_widening_candidates"]}
+      ]
+    }
+  ]
+}

@@ -1,0 +1,134 @@
+# CIRISPersist telemetry registry — OpenTelemetry Weaver semantic-convention
+# YAML (CIRISPersist#1027, CIRISServer#746 §3.3). The source of the label
+# sets and metrics `src/observe/catalog.rs` declares; the I552 witness holds
+# the two equal in both directions (names, units, instruments, label keys,
+# label values). Check with `scripts/weaver_check.sh`.
+groups:
+  - id: registry.ciris.persist
+    type: attribute_group
+    display_name: CIRISPersist read-telemetry attributes
+    brief: The closed label sets persist's read counters carry.
+    attributes:
+      - id: backend
+        type:
+          members:
+          - id: memory
+            value: "memory"
+            stability: development
+          - id: sqlite
+            value: "sqlite"
+            stability: development
+          - id: postgres
+            value: "postgres"
+            stability: development
+        stability: development
+        brief: The storage backend a door read ran on.
+        examples: ["sqlite"]
+      - id: door
+        type:
+          members:
+          - id: list_attestations
+            value: "list_attestations"
+            stability: development
+          - id: list_attestations_by
+            value: "list_attestations_by"
+            stability: development
+          - id: list_attestations_by_dimension_citing
+            value: "list_attestations_by_dimension_citing"
+            stability: development
+          - id: list_attestations_by_dimension_prefix
+            value: "list_attestations_by_dimension_prefix"
+            stability: development
+          - id: list_attestations_by_type
+            value: "list_attestations_by_type"
+            stability: development
+          - id: list_attestations_by_types
+            value: "list_attestations_by_types"
+            stability: development
+          - id: list_attestations_for
+            value: "list_attestations_for"
+            stability: development
+          - id: list_attestations_for_dimension_prefix
+            value: "list_attestations_for_dimension_prefix"
+            stability: development
+          - id: list_attestations_for_type
+            value: "list_attestations_for_type"
+            stability: development
+          - id: list_attestations_for_types
+            value: "list_attestations_for_types"
+            stability: development
+          - id: list_attestations_referencing
+            value: "list_attestations_referencing"
+            stability: development
+          - id: list_composers_referencing_any
+            value: "list_composers_referencing_any"
+            stability: development
+          - id: list_targeted_by_dimension_prefix
+            value: "list_targeted_by_dimension_prefix"
+            stability: development
+          - id: list_live_consent_grants_by
+            value: "list_live_consent_grants_by"
+            stability: development
+          - id: list_live_consent_grants_for
+            value: "list_live_consent_grants_for"
+            stability: development
+          - id: list_local_tier_attestations
+            value: "list_local_tier_attestations"
+            stability: development
+          - id: list_widening_candidates
+            value: "list_widening_candidates"
+            stability: development
+          - id: list_attestations_for_migration
+            value: "list_attestations_for_migration"
+            stability: development
+          - id: attestations_binding_content
+            value: "attestations_binding_content"
+            stability: development
+          - id: get_attestation
+            value: "get_attestation"
+            stability: development
+          - id: list_attestations_since
+            value: "list_attestations_since"
+            stability: development
+          - id: list_attestation_log
+            value: "list_attestation_log"
+            stability: development
+        stability: development
+        brief: The attestation-returning read (the method name).
+        examples: ["get_attestation"]
+      - id: fold
+        type:
+          members:
+          - id: resolve_scoped_stance_by_principals
+            value: "resolve_scoped_stance_by_principals"
+            stability: development
+          - id: resolve_scoped_stance
+            value: "resolve_scoped_stance"
+            stability: development
+          - id: trusted_roots_of
+            value: "trusted_roots_of"
+            stability: development
+          - id: trust_root_valid
+            value: "trust_root_valid"
+            stability: development
+          - id: resolve_serve_tier
+            value: "resolve_serve_tier"
+            stability: development
+          - id: owner_granted_scope
+            value: "owner_granted_scope"
+            stability: development
+          - id: owner_allow_list
+            value: "owner_allow_list"
+            stability: development
+          - id: is_public_group
+            value: "is_public_group"
+            stability: development
+          - id: owner_audience
+            value: "owner_audience"
+            stability: development
+          - id: attestation_admission
+            value: "attestation_admission"
+            stability: development
+        stability: development
+        brief: The fold entry point a door read is attributed to.
+        examples: ["trusted_roots_of"]

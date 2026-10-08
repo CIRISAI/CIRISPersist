@@ -1,0 +1,78 @@
+# CIRISPersist read-telemetry metrics (CIRISPersist#1027). See attributes.yaml.
+groups:
+  - id: metric.ciris.persist.read.calls
+    type: metric
+    metric_name: ciris.persist.read.calls
+    instrument: counter
+    unit: "{read}"
+    stability: development
+    brief: "Attestation-returning door reads served, by backend and door."
+    attributes:
+      - ref: backend
+        requirement_level: required
+      - ref: door
+        requirement_level: required
+  - id: metric.ciris.persist.read.rows
+    type: metric
+    metric_name: ciris.persist.read.rows
+    instrument: counter
+    unit: "{row}"
+    stability: development
+    brief: "Rows the door reads returned, by backend and door."
+    attributes:
+      - ref: backend
+        requirement_level: required
+      - ref: door
+        requirement_level: required
+  - id: metric.ciris.persist.read.bytes
+    type: metric
+    metric_name: ciris.persist.read.bytes
+    instrument: counter
+    unit: "By"
+    stability: development
+    brief: "Stored attestation_envelope bytes the door reads decoded, by backend and door (sqlite/postgres: the TEXT column's length; memory: 0)."
+    attributes:
+      - ref: backend
+        requirement_level: required
+      - ref: door
+        requirement_level: required
+  - id: metric.ciris.persist.fold.calls
+    type: metric
+    metric_name: ciris.persist.fold.calls
+    instrument: counter
+    unit: "{call}"
+    stability: development
+    brief: "Entries into a fold (consent, trust-root walk, audience, serve tier, attestation admission)."
+    attributes:
+      - ref: fold
+        requirement_level: required
+  - id: metric.ciris.persist.fold.reads
+    type: metric
+    metric_name: ciris.persist.fold.reads
+    instrument: counter
+    unit: "{read}"
+    stability: development
+    brief: "Door reads made while the fold ran, inclusive of nested folds."
+    attributes:
+      - ref: fold
+        requirement_level: required
+  - id: metric.ciris.persist.fold.rows
+    type: metric
+    metric_name: ciris.persist.fold.rows
+    instrument: counter
+    unit: "{row}"
+    stability: development
+    brief: "Rows returned to the door reads made while the fold ran, inclusive of nested folds."
+    attributes:
+      - ref: fold
+        requirement_level: required
+  - id: metric.ciris.persist.fold.bytes
+    type: metric
+    metric_name: ciris.persist.fold.bytes
+    instrument: counter
+    unit: "By"
+    stability: development
+    brief: "Envelope bytes decoded by the door reads made while the fold ran, inclusive of nested folds."
+    attributes:
+      - ref: fold
+        requirement_level: required

@@ -34,8 +34,10 @@
 //! The counters are process-wide: two Engines in one process share them, as a
 //! `metrics` recorder would. [`snapshot`] (and `Engine::telemetry_snapshot`)
 //! reads them; [`catalog::TELEMETRY_CATALOG`] names every metric they back.
-//! Emission through the `metrics` facade is P1 (CIRISServer#746 §4) and reads
-//! these same counters.
+//! [`emit_metrics`] (v53.2.0, CIRISPersist#1027, CIRISServer#746 §4 P1)
+//! writes these same counters through the `metrics` facade at the host's
+//! scrape, so the read path stays free of the facade. The catalogue's source
+//! is the OpenTelemetry Weaver registry in `telemetry/registry/`.
 
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
@@ -352,6 +354,26 @@ pub(crate) fn take_decoded_bytes() -> u64 {
 #[must_use]
 pub fn snapshot() -> TelemetrySnapshot {
     counters().snapshot()
+}
+
+/// v53.2.0 (CIRISPersist#1027) — write every counter of [`snapshot`] to the
+/// `metrics` facade, under its catalogued name and labels, as the counter's
+/// current value (`Counter::absolute`). A host calls it when it scrapes. With
+/// no recorder installed every call is a no-op, and the read path never
+/// touches the facade: these counters stay the one source, and a recorder sees
+/// exactly what [`snapshot`] reads.
+pub fn emit_metrics() {
+    for entry in catalog::TELEMETRY_CATALOG {
+        metrics::describe_counter!(entry.name, entry.description);
+    }
+    for sample in snapshot().samples() {
+        let labels: Vec<metrics::Label> = sample
+            .labels
+            .iter()
+            .map(|(k, v)| metrics::Label::from_static_parts(k, v))
+            .collect();
+        metrics::counter!(sample.name, labels).absolute(sample.value);
+    }
 }
 
 /// Every read-telemetry counter, read once (relaxed; monotone per field, not
