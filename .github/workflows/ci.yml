@@ -2302,6 +2302,11 @@ jobs:
           REGISTRY_URL: ${{ vars.REGISTRY_URL }}
         run: scripts/build_manifest.sh preflight --out dist
       - name: register multi-target build with CIRISRegistry
+        # v53.2.0 — tag runs only. PR and main runs sign and gate (the
+        # artifacts and bits_changed.sh checks 1-4) but never write the live
+        # registry: through v53.2.0's PR runs this step upserted the release's
+        # rows from an unmerged head (PR run 37662321512 and earlier).
+        if: startsWith(github.ref, 'refs/tags/v')
         # `ciris-build-sign register`: per target a `builds` row (POST /v1/builds)
         # and a build-manifest row (POST /v1/verify/build-manifest), plus the one
         # binary_manifests map. REGISTRY_ADMIN_TOKEN is read by the binary.
@@ -2314,10 +2319,12 @@ jobs:
           scripts/build_manifest.sh register --version "${{ steps.version.outputs.version }}" \
             --commit "${{ github.sha }}" --out dist
       - name: round-trip verify GET /v1/builds/{version}
+        if: startsWith(github.ref, 'refs/tags/v')   # reads back what the tag run registered
         env:
           REGISTRY_URL: ${{ vars.REGISTRY_URL }}
         run: scripts/build_manifest.sh roundtrip --version "${{ steps.version.outputs.version }}" --out dist
       - name: bits-changed check 5 — each registered row carries this run's wheel
+        if: startsWith(github.ref, 'refs/tags/v')   # reads back what the tag run registered
         # v53.2.0 (#1029) — the registry upserts in place, so read back what it
         # now serves for (version, target) and compare with what we signed:
         # each wheel's sha256 and python-source-tree's tree hash.
