@@ -7,6 +7,77 @@ threat-model citations because this crate's audit story is the point.
 
 ## [Unreleased]
 
+## [53.2.0] - UNRELEASED
+
+### Changed — one build fingerprint locally: the pre-push hook builds certify's `core` leg; `certify.sh prebuild` (#1010)
+
+The pre-push hook ran `cargo test --features postgres,pyo3,server --lib` with no RUSTFLAGS,
+the release pipeline's pre-certify lanes ran two more feature sets, and certify ran nine under
+`-D warnings`. RUSTFLAGS and the feature set are in every unit's fingerprint, so one machine
+compiled the dependency graph three times per release and certify reused none of it.
+
+- `scripts/ci_env.sh` derives RUSTFLAGS from ci.yml, a leg's feature set from
+  `ci_feature_matrix.py`, and the single-leg thread count. certify.sh and the hook source it.
+- The hook now runs `cargo nextest run --features <core> --lib` under the derived RUSTFLAGS.
+  Its units are the ones certify's `core` leg compiles. A tree too old to derive them skips
+  the gate loudly; it never hand-spells a feature list.
+- `certify.sh prebuild` compiles every leg (`nextest --no-run`), both clippy invocations and
+  the dev wheel, and runs no tests. Use it before the bump commit instead of test lanes; `full`
+  then finds every leg warm.
+- `certify.sh fingerprint <full|prebuild> <leg>` prints the command `full` would run, built by
+  the same `leg_cmd`. `scripts/fingerprint_check.sh` compares the (RUSTFLAGS, features,
+  profile) triple across the hook, prebuild and full's core leg, and exits 1 on drift.
+  Mutation-checked: removing the hook's RUSTFLAGS, giving the hook the lint feature set, or
+  adding `--release` to prebuild each fails the check.
+- `full`'s clippy leg now also runs `--all-features`, as CI's lint job does. Before this,
+  only `quick` ran it.
+
+### Fixed — certify: a disk floor before every leg, and a verdict table that cannot print an ENOSPC leg as green (#1012)
+
+ENOSPC killed 2 of the last 4 certify runs 33–37 min in. The dead leg printed as
+`green rest exit= s`, because an empty `.rc` failed every integer test and fell through to the
+green branch.
+
+- Before each leg, free space on the target filesystem is checked against
+  `CERTIFY_MIN_FREE_GB` (default 25). Below the floor, certify drains in-flight legs (nextest
+  re-execs its binaries once per test, so pruning under a running leg is unsafe), then runs the
+  new `scripts/prune_target.py`, then checks again. `prune_target.py` keeps the newest unit per
+  crate name and kind in `deps/` and `incremental/`, has `--dry-run`, and refuses any directory
+  without a `CACHEDIR.TAG`. If space is still short, the leg is recorded as `DISK` and the run
+  continues.
+- One `classify` function produces every row in every table. Only an `.rc` containing `0`
+  prints green. Exit codes above 128 print `KILLED(<sig>)` with the elapsed time. A red leg
+  with `No space left on device` in its log prints `DISK`. An empty `.rc` prints `UNKNOWN`.
+- New exit code: 1 means a leg is RED. 3 means no leg is red but the machine lost at least one
+  leg (`INFRA: n legs skipped for disk, …`). Fast gates use the same rules.
+- `certify.sh verdict` re-prints the table for an existing log directory.
+  `scripts/certify_selfcheck.sh` runs 12 synthetic cases (137, 143, empty `.rc`, ENOSPC,
+  disk floor, not-run, red beats infra, …) plus the prune. Mutation-checked: restoring the
+  empty-`.rc`-is-green behavior, removing KILLED, or dropping the ENOSPC classification each
+  fails the selfcheck.
+
+### Changed — CI: `test-anchor` runs as its own matrix row instead of riding `cirisaudit` (#1009)
+
+The rider was described as "~2 min, rides the shortest leg". It had grown to 3,440 tests
+(15–17.5 min) and made `cirisaudit` the longest job of every run (60–71 min). It now has its
+own `linux-x86_64 (test-anchor)` row. It was not moved to the macOS job: on the v53.1.8 tag
+run, macOS jobs waited 40–48 min for a runner, so a longer mac job would lengthen the queue
+the manifest waits on. `ci_feature_matrix.py`'s RIDERS now supports an own-row host, and
+`check` requires the row.
+
+### Changed — CI: bench runs on schedule and dispatch only (bench schedule-only)
+
+`bench.yml` no longer runs on every push to main, which cost 34–47 min of the shared pool per
+merge. The gh-pages publish was gated on `event_name == 'push'`; it now publishes for
+schedule and dispatch runs on main, so the trend chart keeps updating.
+
+### Changed — CI: main's run is skipped when the merge tree equals a PR head that passed CI (skip main's run on tree equality)
+
+A new `tree` job runs only on push to main. It sets `skip=true` only when all three hold:
+HEAD is a merge, tree(HEAD) == tree(HEAD^2), and a pull_request CI run on HEAD^2 succeeded.
+Any error leaves `skip=false`. Root jobs gate on its output. Tag runs never skip, so the
+versioned cache still publishes.
+
 ## [53.1.8] - 2026-10-07
 
 ### Fixed — the score emit gate refused what its consent precheck granted (#1013)

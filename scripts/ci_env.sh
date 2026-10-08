@@ -1,6 +1,9 @@
+# shellcheck shell=bash
 # ci_env.sh — the build environment every LOCAL gate shares with CI. Sourced,
-# never executed: `certify.sh`, `hooks/pre-push`, `hooks/pre-commit` and
-# `fingerprint_check.sh` all ask these functions instead of restating them.
+# never executed: `certify.sh`, `hooks/pre-push` and `fingerprint_check.sh`
+# ask these functions instead of restating them. (`hooks/pre-commit`'s clippy
+# does not yet: it lints without RUSTFLAGS, so its check units do not match
+# certify's clippy leg.)
 #
 # ── WHY ONE FILE (CIRISPersist#1010) ─────────────────────────────────────
 # RUSTFLAGS, the feature set and the cargo profile are all part of every
