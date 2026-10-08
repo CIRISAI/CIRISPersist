@@ -7,6 +7,37 @@ threat-model citations because this crate's audit story is the point.
 
 ## [Unreleased]
 
+## [53.2.0] - UNRELEASED
+
+### Changed — the tag is pushed once main's run EXISTS, not once it completes (#1008)
+
+`scripts/release_ship.sh` waited for main's push run on the merge sha to finish before pushing the tag, which re-paid the full matrix that #881's tree-equality skip had already avoided: 64 min on v53.1.5 and 65 min on v53.1.6. That wait came from v50.0.0, where main's run and the tag run were queued in the same second, main's came second, and the #397 same-SHA concurrency group cancelled the tag run. The v50 failure needed main's run to be queued after the tag's, so waiting until main's run is visible is enough. The tag run is then the newer one and cancels main's, as #397 intended. v53.1.7 and v53.1.8 shipped this way from a scratch copy.
+
+- The script now waits until main's push run is visible (`queued`, `in_progress` or already `completed`), or about 5 min if it never appears, then pushes the tag.
+- The script ENDS after the tag push and prints `TAG_RUN_ID=<id>` and the `scripts/release_finish.sh` command. Waiting for tag CI, re-running a tag run cancelled by the dedup, and setting the release body moved to `scripts/release_finish.sh <version> <tag-run-id>`, so neither half can be killed by a 2-hour background cap (v53.1.8's ship script was).
+- Merging goes through the REST endpoint (`gh pr merge` selects Projects-classic fields over GraphQL, which error on this repo). An already-merged PR and an already-cut or already-pushed tag are accepted, so a killed run can be re-run as is. The merge sha is the PR's `merge_commit_sha`, not `origin/main`'s tip.
+- The comment that explains the ordering keeps the v50 and v51 history and adds the #1008 change.
+
+### Added — `scripts/release.sh`: one command from a written CHANGELOG section to a pushed tag
+
+On v53.1.8, certify was green at about 18:40 and PR CI at 19:02, but the merge happened at 21:49 because nothing chained the two greens to the merge. `scripts/release.sh <version> [--pr-body FILE] [--merge-body FILE]` runs the release as eight stages: preflight, cheap legs, bump commit, push + PR, `certify.sh full`, PR CI wait, ship, then stop with the `release_finish.sh` command.
+
+- **Resumable.** Each completed stage writes `.release/<version>/<stage>.done` (git-ignored), and a re-run skips it. The cheap legs, certify and the PR CI wait record the commit they passed on and count as done only while HEAD is still that commit. After a red certify, commit the fix and re-run the same command.
+- **Cheap legs first.** The five no-backend axes (read from `ci_feature_matrix.AXIS_LEGS`), the pyo3 lane, both clippy passes and `pyi_surface.py check` run under ci.yml's RUSTFLAGS, so the reds that usually arrive late arrive in minutes.
+- **Bump commit.** Cargo version, the `evidence/cc_impl.tsv` re-stamp (count asserted, so `@53.1.8` does not match `@53.1.80`), the CHANGELOG date, `cargo check --features sqlite`, and the evidence pin test. The subject is built from the section's `###` headings.
+- **PR CI wait.** A failed first attempt counts as final only once it has been re-run, once an `auto-retry` run that started after it has finished without re-running it, or after 15 min.
+- Every wait loop is bounded and prints its timeout. Each failure has its own exit code (20 to 29; 29 is certify's new INFRA exit 3: re-run, tree unjudged) and a one-line reason. There is no `--no-verify` and no `--amend`. `--dry-run` runs preflight and prints the plan without side effects.
+- `scripts/release_lib.sh` holds the shared functions (section cut, re-stamp, stage markers). `scripts/release_selftest.sh` tests them offline against a fixture CHANGELOG (41 checks). Mutation-checked: each of the following reds the self-test: an unbounded previous-version scan, a section that runs to EOF, a re-stamp without the version boundary, marking a failed stage, ignoring the recorded sha, and a `--no-verify` added to a release script.
+- `docs/RELEASE.md` documents the stages, the resume rule and what to do for each exit code.
+
+### Fixed — `owner_withdraw::postgres::i126` flaked on loaded runners (#1011)
+
+The test stamped an owner binding to expire 300 ms out, then asserted that `owner_of` named the owner right after the put. On a 4-vCPU hosted runner the reseal, the postgres put and the read took longer than 300 ms. The binding had lapsed, and the fold correctly returned `None` (`left: None, right: Some("ow-owner-…")`). This was a test-only race: production is right to treat a lapsed binding as unowned. Reproduced locally by pinning the test to 2 CPUs under 12 busy loops: stamp-to-read took 325–869 ms and the test was red 5 times out of 5 with the CI signature. Unloaded, it takes about 22 ms.
+
+- `put_lapsing_owner_binding` retries with a fresh binding and twice the window when the read FINISHED after the expiry (up to 6 attempts, 300 ms to 9.6 s). A `None` read that finished while the binding was live still fails, so the precondition still checks that a live binding reads as live. The fixed 400 ms sleep becomes "100 ms past the expiry".
+- Witness `i126_lapsing_binding_survives_a_put_slower_than_its_window` forces the interleaving by stalling the first read longer than the first window.
+- Mutation-checked: no retry (`LAPSE_ATTEMPTS = 1`) reds the witness (`binding lapsed before every read`), and flipping the lapse classification reds it (`owner_of read None … while … live until …`). Under the same 2-CPU, 12-loop load, the fixed test passed 5 of 5. Unloaded on postgres it passed 20 of 20 (1.9–2.7 s per run, real database). No nextest retries were added.
+
 ## [53.1.8] - 2026-10-07
 
 ### Fixed — the score emit gate refused what its consent precheck granted (#1013)
