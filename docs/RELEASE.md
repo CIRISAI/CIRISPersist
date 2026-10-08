@@ -30,7 +30,7 @@ scripts/release_finish.sh <version> <tag-run-id>                    # tag CI →
 | 7 | ship | `release_ship.sh <pr> <version> <head7> "<subject>" <merge-body>`: merge, tag at the merge commit, push the tag once main's run is visible, and print `TAG_RUN_ID`. | `ship.done` + `tag_run` |
 | 8 | stop | Prints `scripts/release_finish.sh <version> <tag-run-id>`. | — |
 
-Then run `release_finish.sh`. It checks that the run id is this tag's CI push run, waits for it (`FINISH_TIMEOUT_MIN`, default 180) and re-runs it if the same-SHA dedup cancelled it. It then waits for the release to exist, sets the body from the tag's annotation, asserts the body is at least the tag body's bytes minus 64, runs `scripts/verify_release.sh` (below), and prints `RELEASE_SHIP_DONE`.
+Then run `release_finish.sh`. It checks that the run id is this tag's CI push run, waits for it (`FINISH_TIMEOUT_MIN`, default 180) and re-runs it if the same-SHA dedup cancelled it. It then waits for the release to exist, sets the body from the annotation of origin's tag (never a local copy; a different local tag is refused), asserts the body is at least the tag body's bytes minus 64, runs `scripts/verify_release.sh` (below), and prints `RELEASE_SHIP_DONE`.
 
 ### Why the tag is pushed once main's run EXISTS (#1008)
 
@@ -85,6 +85,8 @@ PR CI after a failure: `auto-retry.yml` re-runs a first-attempt failure that has
 | 12 | release_finish.sh | tag CI did not finish within `FINISH_TIMEOUT_MIN` | re-run the same command |
 | 13, 14, 15 | release_finish.sh | the release never appeared, the edit failed, or the body is too short | re-run. If it repeats, `gh release edit v<version> --notes-file` with the tag annotation by hand |
 | 17 | release_finish.sh | `verify_release.sh` failed: an attestation did not verify, a wheel's bits check failed, a download failed, or `gh` has no `attestation` command | read its per-subject lines. `gh` older than 2.49: `GH=/path/to/newer/gh` and re-run. A FAIL on a provenance subject means the tag run's `attest` job did not sign those bytes: read that job before anything else. A FAIL on `bits (registered)` means the registry's row for that target is not this release's wheel: see "Remediating a registered manifest" |
+| 18 | release_finish.sh | a local `refs/tags/v<version>` is a different tag object than origin's (an abandoned tagging attempt). The annotation is read only from origin's tag, fetched into `refs/release-finish/v<version>` | `git tag -d v<version>` and re-run |
+| 19 | release_finish.sh | origin's tag could not be fetched; no local copy is used instead | check `git ls-remote origin refs/tags/v<version>` and the network, then re-run |
 
 ## Verifying a release
 
