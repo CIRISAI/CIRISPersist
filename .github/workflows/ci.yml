@@ -66,6 +66,68 @@ jobs:
   # the merge commit's TREE equals the PR head's, the PR run already certified
   # those bytes and the main-CI wait is skipped. That is where tree equality
   # belongs, and it is measured (−35 min on v46.4.0's ship).
+  #
+  # v53.2.0 — tree equality DOES now gate one run, and it is not the run #895
+  # removed: the `tree` job below skips MAIN's run of a merge commit whose
+  # tree equals its PR head's tree, when that PR head has a successful CI run.
+  # It never skips a tag run, so the tag still publishes the versioned
+  # CIRISCache blob (the #896 finding stands). Measured before this cut: 5 of
+  # the last 10 main runs were cancelled — by the tag push on the same SHA
+  # (#397's group) or by the next merge — after holding up to 2.5 h of
+  # runners for bytes the PR run had already certified.
+  tree:
+    name: tree equality (main merges only)
+    # Runs ONLY for a push to main. Everywhere else it is skipped, and the
+    # dependents' `!cancelled() && needs.tree.outputs.skip != 'true'` reads an
+    # empty output as "run" — so PR and tag runs do not wait for a runner for
+    # this job.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read   # list the PR head's CI runs
+    outputs:
+      skip: ${{ steps.cmp.outputs.skip }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 2   # HEAD and BOTH parents of a merge commit
+      - id: cmp
+        # Fails OPEN: any error leaves skip=false and the full run proceeds.
+        # Skips only when all three hold —
+        #   1. HEAD is a merge (has a second parent; a squash or direct push
+        #      to main always runs),
+        #   2. tree(HEAD) == tree(HEAD^2): the merge changed no bytes the PR
+        #      head did not already have,
+        #   3. a `pull_request` run of THIS workflow on HEAD^2 concluded
+        #      success — the PR run did certify those bytes; tree equality
+        #      alone would trust a run that may have been red or bypassed.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          WORKFLOW: ${{ github.workflow }}
+        run: |
+          skip=false
+          if head2="$(git rev-parse -q --verify 'HEAD^2' 2>/dev/null)"; then
+            t_head="$(git rev-parse 'HEAD^{tree}')"
+            t_pr="$(git rev-parse 'HEAD^2^{tree}' 2>/dev/null || echo none)"
+            echo "HEAD tree $t_head; PR head $head2 tree $t_pr"
+            if [ "$t_head" = "$t_pr" ]; then
+              ok="$(gh api "repos/$REPO/actions/runs?head_sha=$head2&event=pull_request&status=success" \
+                     --jq "[.workflow_runs[] | select(.name == \"$WORKFLOW\")] | length" 2>/dev/null || true)"
+              case "$ok" in ''|*[!0-9]*) echo "could not count PR runs (API: ${ok:-empty}) — running everything"; ok=0 ;; esac
+              echo "successful '$WORKFLOW' pull_request runs on $head2: $ok"
+              [ "$ok" -gt 0 ] && skip=true
+            fi
+          else
+            echo "HEAD has no second parent — not a merge commit; running everything."
+          fi
+          echo "skip=$skip"
+          echo "skip=$skip" >> "$GITHUB_OUTPUT"
+          if [ "$skip" = true ]; then
+            echo "::notice title=main run skipped::merge tree equals PR head $head2, whose CI run passed. Nothing new to test."
+          fi
+
   # Mission category §4 (PLATFORM_ARCHITECTURE.md §4):
   # the linux-x86_64 path that runs the full feature set with a
   # real Postgres backing the integration tests.
@@ -83,6 +145,8 @@ jobs:
     # exercises the full-features compile so a "all-substrates"
     # backstop entry isn't necessary here.
     name: linux-x86_64 (${{ matrix.substrate.name }})
+    needs: tree
+    if: ${{ !cancelled() && needs.tree.outputs.skip != 'true' }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -529,6 +593,8 @@ jobs:
   # Mission alignment: macOS dev path (PLATFORM_ARCHITECTURE.md §1).
   darwin-aarch64-test:
     name: darwin-aarch64 (no postgres)
+    needs: tree
+    if: ${{ !cancelled() && needs.tree.outputs.skip != 'true' }}
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v6
@@ -705,6 +771,8 @@ jobs:
   # (PyO3 PR #5605 requires libpython linking on iOS).
   ios-build:
     name: ios PyO3 abi3 (${{ matrix.dir }})
+    needs: tree
+    if: ${{ !cancelled() && needs.tree.outputs.skip != 'true' }}
     runs-on: macos-14
     # ci-perf — split the two iOS targets into a 2-entry matrix so they
     # build in PARALLEL (was one ~20m job building device then simulator
@@ -872,6 +940,11 @@ jobs:
     name: package ios artifacts
     runs-on: ubuntu-latest
     needs: [ios-build]
+    # v53.2.0 — explicit result check, because `tree` (an ANCESTOR) is skipped on
+    # every PR and tag run, and the implicit `success()` reads the whole
+    # ancestor chain: a skipped grandparent skips this job even though its
+    # direct need succeeded. Same semantics as before, minus that.
+    if: ${{ !cancelled() && needs.ios-build.result == 'success' }}
     steps:
       - uses: actions/checkout@v6
       - name: extract version from Cargo.toml
@@ -905,6 +978,8 @@ jobs:
   # Downstream android-package job collects artifacts into tarballs.
   android-ndk:
     name: android ${{ matrix.abi }}
+    needs: tree
+    if: ${{ !cancelled() && needs.tree.outputs.skip != 'true' }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -1109,6 +1184,11 @@ jobs:
     name: package android artifacts
     runs-on: ubuntu-latest
     needs: [android-ndk]
+    # v53.2.0 — explicit result check, because `tree` (an ANCESTOR) is skipped on
+    # every PR and tag run, and the implicit `success()` reads the whole
+    # ancestor chain: a skipped grandparent skips this job even though its
+    # direct need succeeded. Same semantics as before, minus that.
+    if: ${{ !cancelled() && needs.android-ndk.result == 'success' }}
     steps:
       - uses: actions/checkout@v6
       - name: extract version from Cargo.toml
@@ -1213,6 +1293,8 @@ jobs:
   # Mission category §4 "Mission rejection" + audit/lint.
   lint:
     name: clippy + fmt + audit
+    needs: tree
+    if: ${{ !cancelled() && needs.tree.outputs.skip != 'true' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -1367,6 +1449,8 @@ jobs:
   # plus a license-deny pass per CRATE_RECOMMENDATIONS §6.
   license-audit:
     name: cargo deny (license + advisories)
+    needs: tree
+    if: ${{ !cancelled() && needs.tree.outputs.skip != 'true' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -1397,6 +1481,8 @@ jobs:
   # the from-disk gate I57 pins those literals to the crate's.
   sqlite-portability:
     name: sqlite portability (debian bookworm, libsqlite3 3.40.1)
+    needs: tree
+    if: ${{ !cancelled() && needs.tree.outputs.skip != 'true' }}
     runs-on: ubuntu-latest
     container: debian:bookworm-slim
     steps:
@@ -1420,6 +1506,8 @@ jobs:
   # since 2025-01.
   pyo3-wheel:
     name: maturin abi3-py311 wheel (${{ matrix.label }})
+    needs: tree
+    if: ${{ !cancelled() && needs.tree.outputs.skip != 'true' }}
     # v30.9.0 — the CROSS-PLATFORM wheels build on TAGS ONLY.
     #
     # Measured on the last successful PR run (31397353461), which took 38m wall:
@@ -1869,6 +1957,11 @@ jobs:
     name: Sign + register multi-target build manifests (CanonicalBuild v2)
     runs-on: ubuntu-latest
     needs: pyo3-wheel
+    # v53.2.0 — explicit result check, because `tree` (an ANCESTOR) is skipped on
+    # every PR and tag run, and the implicit `success()` reads the whole
+    # ancestor chain: a skipped grandparent skips this job even though its
+    # direct need succeeded. Same semantics as before, minus that.
+    if: ${{ !cancelled() && needs.pyo3-wheel.result == 'success' }}
     # v3.6.6 — hard-fail restored. The hybrid-signing secrets
     # (CIRIS_BUILD_ED25519_SECRET / CIRIS_BUILD_MLDSA_SECRET) are now
     # configured; a manifest failure means either the secrets rotated
@@ -2326,7 +2419,14 @@ jobs:
       - android-package
       - lint
       - license-audit
-    if: startsWith(github.ref, 'refs/tags/v')
+    # v53.2.0 — explicit result check, because `tree` (an ANCESTOR) is skipped on
+    # every PR and tag run, and the implicit `success()` reads the whole
+    # ancestor chain: a skipped grandparent skips this job even though its
+    # direct need succeeded. Same semantics as before, minus that.
+    if: >-
+      ${{ startsWith(github.ref, 'refs/tags/v') && !cancelled()
+          && needs.ios-package.result == 'success' && needs.android-package.result == 'success'
+          && needs.lint.result == 'success' && needs.license-audit.result == 'success' }}
     permissions:
       contents: write
       actions: read
