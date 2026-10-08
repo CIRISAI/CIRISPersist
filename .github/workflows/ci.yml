@@ -88,6 +88,7 @@ jobs:
       actions: read   # list the PR head's CI runs
     outputs:
       skip: ${{ steps.cmp.outputs.skip }}
+      skip_ios: ${{ steps.cmp.outputs.skip_ios }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -102,31 +103,124 @@ jobs:
         #   3. a `pull_request` run of THIS workflow on HEAD^2 concluded
         #      success — the PR run did certify those bytes; tree equality
         #      alone would trust a run that may have been red or bypassed.
+        #
+        # `skip_ios` (CIRISPersist#1019) is stricter. The PR run builds iOS only
+        # when the diff touches an iOS-relevant path (`ios-paths` below), so a
+        # passing PR run need not have built iOS at all. iOS is skipped here
+        # only if that PR run's `ios PyO3 abi3` jobs ran AND all succeeded —
+        # otherwise main is where an iOS break is caught, at merge, not at the
+        # tag.
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           WORKFLOW: ${{ github.workflow }}
         run: |
-          skip=false
+          skip=false; skip_ios=false
           if head2="$(git rev-parse -q --verify 'HEAD^2' 2>/dev/null)"; then
             t_head="$(git rev-parse 'HEAD^{tree}')"
             t_pr="$(git rev-parse 'HEAD^2^{tree}' 2>/dev/null || echo none)"
             echo "HEAD tree $t_head; PR head $head2 tree $t_pr"
             if [ "$t_head" = "$t_pr" ]; then
-              ok="$(gh api "repos/$REPO/actions/runs?head_sha=$head2&event=pull_request&status=success" \
-                     --jq "[.workflow_runs[] | select(.name == \"$WORKFLOW\")] | length" 2>/dev/null || true)"
-              case "$ok" in ''|*[!0-9]*) echo "could not count PR runs (API: ${ok:-empty}) — running everything"; ok=0 ;; esac
-              echo "successful '$WORKFLOW' pull_request runs on $head2: $ok"
-              [ "$ok" -gt 0 ] && skip=true
+              run_id="$(gh api "repos/$REPO/actions/runs?head_sha=$head2&event=pull_request&status=success" \
+                     --jq "[.workflow_runs[] | select(.name == \"$WORKFLOW\") | .id] | first // empty" 2>/dev/null || true)"
+              case "$run_id" in ''|*[!0-9]*) echo "no successful '$WORKFLOW' pull_request run on $head2 (API: ${run_id:-none}) — running everything"; run_id="" ;; esac
+              if [ -n "$run_id" ]; then
+                echo "PR head $head2 passed '$WORKFLOW' in run $run_id"
+                skip=true
+                ios="$(gh api "repos/$REPO/actions/runs/$run_id/jobs?per_page=100" --paginate \
+                       --jq '.jobs[] | select(.name | startswith("ios PyO3 abi3")) | .conclusion' 2>/dev/null || true)"
+                echo "that run's iOS build jobs: $(echo "$ios" | tr '\n' ' ')"
+                if [ -n "$ios" ] && ! grep -qv '^success$' <<<"$ios"; then skip_ios=true; fi
+              fi
             fi
           else
             echo "HEAD has no second parent — not a merge commit; running everything."
           fi
-          echo "skip=$skip"
-          echo "skip=$skip" >> "$GITHUB_OUTPUT"
+          echo "skip=$skip skip_ios=$skip_ios"
+          { echo "skip=$skip"; echo "skip_ios=$skip_ios"; } >> "$GITHUB_OUTPUT"
           if [ "$skip" = true ]; then
             echo "::notice title=main run skipped::merge tree equals PR head $head2, whose CI run passed. Nothing new to test."
           fi
+          if [ "$skip" = true ] && [ "$skip_ios" != true ]; then
+            echo "::notice title=iOS runs on main::the PR run did not build iOS (paths filter), so main builds it."
+          fi
+
+  # v53.2.0 (CIRISPersist#1019) — the iOS build runs on a PR only when the diff
+  # can break it. `ios-build` was ungated: 48 and 52 min per PR (run
+  # 37662321512) on the macOS pool, which is the tag run's critical path. It
+  # still runs on every push to main (minus the tree-skip above, which keeps
+  # iOS unless the PR run built it green) and on every tag — so an iOS break is
+  # caught at merge, never first at the tag.
+  #
+  # iOS-relevant, by path: the FFI surface (`src/ffi/`), the manifest and lock
+  # (features, deps, the crate-type — but NOT a change that is only the
+  # package `version =` bump in either file, which every release PR carries),
+  # `pyproject.toml` (the PyO3/abi3 shape),
+  # `.cargo/` (the iOS target config), this workflow (the build itself lives
+  # inline here — there are no separate iOS scripts or xcconfig files), and the
+  # cache composite it restores through. By content: any changed `.rs` whose
+  # patch touches a `target_os`/`target_vendor`/`target_family`/`target_arch`/
+  # `target_env` cfg, or that already carries one — platform-gated code is the
+  # one thing a Linux leg cannot see. Fails OPEN: any error builds iOS.
+  ios-paths:
+    name: iOS-relevant paths (PRs only)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      ios: ${{ steps.diff.outputs.ios }}
+    steps:
+      - uses: actions/checkout@v6
+      - id: diff
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          NFILES: ${{ github.event.pull_request.changed_files }}
+        run: |
+          ios=true
+          why="fail-open default"
+          # The files API lists at most 3000; past that, do not guess.
+          if [ "${NFILES:-0}" -lt 3000 ] \
+             && gh api "repos/$REPO/pulls/$PR/files?per_page=100" --paginate > "$RUNNER_TEMP/files.json" 2>/dev/null \
+             && files="$(jq -r '.[] | .filename, (.previous_filename // empty)' "$RUNNER_TEMP/files.json")"; then
+            ios=false; why="no iOS-relevant path or platform cfg in the diff"
+            # A Cargo.toml / Cargo.lock change that is EXACTLY one
+            # `-version = "…"` and one `+version = "…"` line is the release
+            # bump. It cannot break the iOS build, and without this exception
+            # every release PR (both files, every time) would build iOS. A dep
+            # upgrade in the lock also moves `checksum`/`source` lines, so it
+            # never matches.
+            bump_only() {
+              jq -r --arg f "$1" '[.[] | select(.filename == $f) | .patch // "x"
+                 | split("\n")[] | select(test("^[-+]") and (test("^(\\+\\+\\+|---) ") | not))]
+                 | (length == 2) and all(test("^[-+]version = \"[^\"]+\"$"))' "$RUNNER_TEMP/files.json"
+            }
+            while IFS= read -r f; do
+              case "$f" in
+                Cargo.toml|Cargo.lock)
+                  [ "$(bump_only "$f")" = true ] && continue
+                  ios=true; why="path $f"; break ;;
+                src/ffi/*|pyproject.toml|.cargo/*|.github/workflows/ci.yml|.github/actions/ciriscache/*)
+                  ios=true; why="path $f"; break ;;
+              esac
+            done <<<"$files"
+            if [ "$ios" = false ]; then
+              cfg='target_(os|vendor|family|arch|env)[[:space:]]*='
+              hit="$(jq -r '.[] | select(.filename | endswith(".rs")) | select((.patch // "") | test("target_(os|vendor|family|arch|env)\\s*=")) | .filename' "$RUNNER_TEMP/files.json" | head -1)"
+              if [ -n "$hit" ]; then ios=true; why="platform cfg in the patch of $hit"; fi
+              if [ "$ios" = false ]; then
+                while IFS= read -r f; do
+                  case "$f" in *.rs) [ -f "$f" ] && grep -qE "$cfg" "$f" && { ios=true; why="$f carries a platform cfg"; break; } ;; esac
+                done <<<"$files"
+              fi
+            fi
+          fi
+          echo "ios=$ios ($why)"
+          echo "ios=$ios" >> "$GITHUB_OUTPUT"
+          [ "$ios" = true ] || echo "::notice title=iOS build skipped on this PR::$why. main and tag runs still build iOS."
 
   # Mission category §4 (PLATFORM_ARCHITECTURE.md §4):
   # the linux-x86_64 path that runs the full feature set with a
@@ -771,8 +865,11 @@ jobs:
   # (PyO3 PR #5605 requires libpython linking on iOS).
   ios-build:
     name: ios PyO3 abi3 (${{ matrix.dir }})
-    needs: tree
-    if: ${{ !cancelled() && needs.tree.outputs.skip != 'true' }}
+    # #1019: `ios-paths` runs on PRs only; its empty output on push/tag reads
+    # as "build". `skip_ios`, not `skip`: main keeps iOS unless the PR run
+    # actually built it green.
+    needs: [tree, ios-paths]
+    if: ${{ !cancelled() && needs.tree.outputs.skip_ios != 'true' && needs.ios-paths.outputs.ios != 'false' }}
     runs-on: macos-14
     # ci-perf — split the two iOS targets into a 2-entry matrix so they
     # build in PARALLEL (was one ~20m job building device then simulator

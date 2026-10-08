@@ -84,6 +84,29 @@ HEAD is a merge, tree(HEAD) == tree(HEAD^2), and a pull_request CI run on HEAD^2
 Any error leaves `skip=false`. Root jobs gate on its output. Tag runs never skip, so the
 versioned cache still publishes.
 
+### Changed — CI: a PR builds iOS only when the diff can break it; main and tags always do (#1019)
+
+`ios-build` had no gate and ran on every PR: 52 min for ios-simulator and 48 min for
+ios-device on PR run 37662321512, on the macOS pool that is the tag run's critical path. A new
+`ios-paths` job runs on pull_request only and lists the PR's files through the API. iOS builds
+when the diff touches `src/ffi/`, `Cargo.toml`/`Cargo.lock`, `pyproject.toml`, `.cargo/`,
+`ci.yml` or the cache composite. It also builds when a changed `.rs` file's patch touches a
+`target_os`/`target_vendor`/`target_family`/`target_arch`/`target_env` cfg, or the file already
+contains one. A Cargo change that is exactly the package `version =` bump does not count, so
+release PRs are not forced into iOS by the bump alone.
+
+Any error, or a diff of 3000 or more files, builds iOS. Push and tag runs skip `ios-paths`, and
+its empty output reads as "build". On main, the #1021 tree skip has a stricter `skip_ios`: iOS
+is skipped only if the PR run's `ios PyO3 abi3` jobs ran and all succeeded. An iOS break is
+therefore caught at merge, never first at the tag.
+
+Simulated against PRs #1016, #1000, #985, #978 and #959. #1000 skips iOS; the others build it,
+via `src/ffi/`, `ci.yml` or a lock change. Eleven synthetic diffs also gave the expected answer:
+a bump-only change skips; a dependency added or upgraded builds; a platform cfg in a patch or
+in the file builds; a rename out of `src/ffi/` builds; an API failure builds; 3000 files builds.
+`skip_ios` was simulated against the PR run's iOS job conclusions: success+success skips;
+skipped, failure and none build.
+
 ### Found, not changed — no Linux CIRISCache blob has been published since at least v53.1.3 (#1022)
 
 Every core-1 `CIRISCache/save@v1` on the v53.1.3–v53.1.8 tag runs and on main run
