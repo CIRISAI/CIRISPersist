@@ -238,6 +238,8 @@ Tested:
 Untested: the tag job, the dispatched workflow and the rebuild job. They need the signing
 secrets or a runner. Nothing was dispatched and nothing was written to the registry.
 
+Witness I190f (`i190_f_ci_preflight_gates_the_bundle_quorum`) followed the refactor: the tag job's sign/preflight/register steps now live in `scripts/build_manifest.sh`, so the witness asserts that `ci.yml` runs `build_manifest.sh preflight` BEFORE `build_manifest.sh register` and that the script runs the self-test and the steward-key gate. Mutations: preflight line deleted → red; self-test deleted → red; register before preflight → red. The pre-push hook caught the stale witness on the first `release.sh 53.2.0` push.
+
 ### Added — the telemetry catalogue as an OpenTelemetry Weaver registry, and emission through the `metrics` facade (#1027)
 
 - **Registry.** `telemetry/registry/` is the #1014 catalogue written as an OTel Weaver
