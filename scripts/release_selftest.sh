@@ -329,6 +329,69 @@ if git -C "$t/rs/stale" ls-remote --exit-code origin refs/tags/v9.9.0 >/dev/null
 rs_fixture light; git -C "$t/rs/light" tag v9.9.0 HEAD; rs light
 expect_eq "ship: a lightweight local tag is refused (exit 11)" "$rc" "11"
 
+echo "release.sh resume binding"
+# .release/<ver> is bound to the branch it was started on and to the release
+# commit bump made: resumed state from an abandoned attempt on another branch,
+# or on a branch reset past the bump, skipped preflight and the bump and
+# shipped the old version (Codex round 2 on PR #1039). The fixture is a repo
+# holding this checkout's release.sh, lib, feature matrix inputs, Cargo.toml
+# and CHANGELOG; --dry-run and a refused run reach no cargo stage.
+RB="$t/rb"; mkdir -p "$RB/scripts" "$RB/.github/workflows"
+cp scripts/release.sh scripts/release_lib.sh scripts/ci_feature_matrix.py "$RB/scripts/"
+cp Cargo.toml pyproject.toml CHANGELOG.md "$RB/"; cp .github/workflows/ci.yml "$RB/.github/workflows/"
+printf '/.release/\n__pycache__/\n' > "$RB/.gitignore"
+RV="$(grep -m1 '^version = "' Cargo.toml | sed -E 's/version = "([^"]+)"/\1/')"
+rbg() { git -C "$RB" -c user.name=t -c user.email=t@t "$@"; }
+(
+    set -e
+    git init -q -b main "$RB"
+    rbg add -A; rbg commit -q -m base
+    rbg checkout -q -b "release-$RV"
+    echo bumped > "$RB/BUMPED"; rbg add -A; rbg commit -q -m "release(v$RV): fixture bump"
+) || bad "resume fixture repo"
+RBS="$RB/.release/$RV"
+rb_state() {  # <branch-recorded> <bump-sha-recorded>; empty = not recorded
+    rm -rf "$RBS"; mkdir -p "$RBS"; rl_mark "$RBS" preflight; rl_mark "$RBS" bump
+    [ -z "$1" ] || rl_put "$RBS" branch "$1"
+    [ -z "$2" ] || rl_put "$RBS" bump_sha "$2"
+}
+# A refused run must stop before any stage; if it does not, these shims stop
+# it — the self-test never reaches a real cargo, git push or gh.
+mkdir -p "$t/rb-bin"
+for c in cargo gh; do printf '#!/bin/sh\necho "SHIM: %s reached: $*" >&2; exit 99\n' "$c" > "$t/rb-bin/$c"; chmod +x "$t/rb-bin/$c"; done
+rb() { out="$(cd "$RB" && PATH="$t/rb-bin:$PATH" bash scripts/release.sh "$@" 2>&1)"; rc=$?; [ -n "${RS_DEBUG:-}" ] && printf '[rb rc=%s]\n%s\n' "$rc" "$out"; }
+BUMP="$(rbg rev-parse HEAD)"
+rb_state "release-$RV" "$BUMP"; rb --dry-run "$RV"
+expect_eq "resume: same branch, bump in history, dry-run accepted" "$rc" "0"
+case "$out" in *"resume: .release/$RV bound to release-$RV"*) ok "resume: dry-run names the binding";; *) bad "resume: dry-run output: $out";; esac
+rbg checkout -q -b other-attempt
+rb --dry-run "$RV"
+expect_eq "resume: state from another branch is refused (dry-run, 32)" "$rc" "32"
+rb "$RV"
+expect_eq "resume: state from another branch is refused (run, 32)" "$rc" "32"
+case "$out" in *"belongs to branch 'release-$RV', not 'other-attempt'"*"rm -rf .release/$RV"*) ok "resume: the refusal names both branches and how to clear";; *) bad "resume: refusal text: $out";; esac
+case "$out" in *"--- stage"*|*"SHIM:"*) bad "resume: a refused run reached a stage";; *) ok "resume: a refused run reached no stage";; esac
+rbg checkout -q "release-$RV"; rbg reset -q --hard HEAD~1
+rb --dry-run "$RV"
+expect_eq "resume: branch reset past the release commit is refused (32)" "$rc" "32"
+case "$out" in *"not an ancestor of HEAD"*) ok "resume: says the release commit left HEAD's history";; *) bad "resume: reset text: $out";; esac
+rbg reset -q --hard "$BUMP"
+sed -i -E "0,/^version = \"[^\"]+\"/s//version = \"0.0.1\"/" "$RB/Cargo.toml"; rbg commit -q -am "an older version"
+rb --dry-run "$RV"
+expect_eq "resume: Cargo.toml not at the version is refused (32)" "$rc" "32"
+rbg reset -q --hard "$BUMP"
+sed -i -E "s/^## \[$RV\] - [0-9-]+\$/## [$RV] - UNRELEASED/" "$RB/CHANGELOG.md"; rbg commit -q -am "undated"
+rb --dry-run "$RV"
+expect_eq "resume: CHANGELOG header not dated is refused (32)" "$rc" "32"
+rbg reset -q --hard "$BUMP"
+rb_state "" ""; rb --dry-run "$RV"
+expect_eq "resume: unbound (pre-binding) state is refused (32)" "$rc" "32"
+case "$out" in *"echo release-$RV > .release/$RV/branch"*) ok "resume: unbound state says how to bind it by hand";; *) bad "resume: unbound text: $out";; esac
+rb_state "release-$RV" ""; rb --dry-run "$RV"
+expect_eq "resume: bump done with no release commit recorded is refused (32)" "$rc" "32"
+grep -q 'rl_put "$S" branch "$branch"' scripts/release.sh && ok "release.sh records the branch at preflight" || bad "release.sh does not record the branch"
+grep -q 'rl_put "$S" bump_sha "$(head_sha)"' scripts/release.sh && ok "release.sh records the release commit at bump" || bad "release.sh does not record the release commit"
+
 echo "syntax"
 for f in scripts/release.sh scripts/release_ship.sh scripts/release_finish.sh scripts/release_lib.sh scripts/release_selftest.sh; do
     if bash -n "$f"; then ok "bash -n $f"; else bad "bash -n $f"; fi

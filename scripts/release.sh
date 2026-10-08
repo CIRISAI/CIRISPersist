@@ -24,7 +24,9 @@
 #   9 stop        print the scripts/release_finish.sh command
 #
 # RESUME: every completed stage writes `.release/<version>/<stage>.done`; a
-# re-run skips it. Stages 2, 5, 6 and 7 record the commit they passed on, and
+# re-run skips it. The state is bound to the branch preflight ran on and the
+# release commit bump made: a resume on another branch, or once that commit has
+# left HEAD's history, Cargo.toml or the dated header changed, exits 32. Stages 2, 5, 6 and 7 record the commit they passed on, and
 # count as done only while HEAD is still that commit — commit a fix after a
 # red certify and re-run the same command: it re-checks, re-pushes,
 # re-certifies and waits on the new run.
@@ -33,7 +35,8 @@
 # 24 certify red · 25 PR CI red · 26 PR CI timeout · 27 ship (its own code is
 # printed) · 28 tree dirty mid-release · 29 certify INFRA (no leg red, a leg
 # lost to the machine — re-run) · 30 Codex left findings on HEAD (fix, commit,
-# re-run). Each prints one line saying why.
+# re-run) · 32 resumed state is not this branch's / release commit's (clear
+# .release/<version>). Each prints one line saying why.
 #
 # No `--no-verify` and no `--amend` anywhere: the hooks are the gate.
 set -uo pipefail
@@ -103,6 +106,7 @@ preflight() {
 
 if [ "$dry" -eq 1 ]; then
     rc=0
+    if [ -d "$S" ] && rl_done "$S" preflight; then rl_resume_check "$S" "$ver" "$branch" || rc=32; fi
     if [ -d "$S" ] && rl_done "$S" bump; then echo "bump already done — preflight not re-run"; else preflight || rc=$?; fi
     echo "plan for v$ver (state dir $S):"
     for st in preflight cheap bump pr certify prci codex ship; do
@@ -122,9 +126,14 @@ mkdir -p "$S"
 # .release/ is git-ignored, so the state dir never dirties the tree.
 if ! rl_done "$S" preflight; then
     preflight || exit 20
+    rl_put "$S" branch "$branch"
     rl_mark "$S" preflight
-elif [ -n "$(git status --porcelain)" ]; then
-    echo "DIRTY TREE mid-release — commit or stash, then re-run"; git status --short; exit 28
+else
+    # Resumed state is bound to its branch and release commit (exit 32).
+    rl_resume_check "$S" "$ver" "$branch" || exit 32
+    if [ -n "$(git status --porcelain)" ]; then
+        echo "DIRTY TREE mid-release — commit or stash, then re-run"; git status --short; exit 28
+    fi
 fi
 
 rustflags="$(rl_ci_rustflags)" || { echo "cannot derive RUSTFLAGS from ci.yml"; exit 21; }
@@ -176,6 +185,7 @@ bump() {
 if ! rl_done "$S" bump; then
     echo "--- stage bump"
     bump || exit 22
+    rl_put "$S" bump_sha "$(head_sha)"
     rl_mark "$S" bump
 fi
 
