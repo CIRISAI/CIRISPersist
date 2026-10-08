@@ -67,7 +67,7 @@ jobs:
   # those bytes and the main-CI wait is skipped. That is where tree equality
   # belongs, and it is measured (−35 min on v46.4.0's ship).
   #
-  # v53.2.0 — tree equality DOES now gate one run, and it is not the run #895
+  # v53.2.0 (CIRISPersist#1021) — tree equality DOES now gate one run, and it is not the run #895
   # removed: the `tree` job below skips MAIN's run of a merge commit whose
   # tree equals its PR head's tree, when that PR head has a successful CI run.
   # It never skips a tag run, so the tag still publishes the versioned

@@ -26,7 +26,7 @@ on:
   # the merge. `workflow_dispatch` covers the "I want to see this PR's
   # numbers" case on demand.
   #
-  # v53.2.0 — the `push: main` trigger is GONE too, for the same reason one
+  # v53.2.0 (CIRISPersist#1020) — the `push: main` trigger is GONE too, for the same reason one
   # step further along. Every merge booked 34–47 min of a 16–20-slot pool
   # while the merge's own CI matrix and the release tag run were queueing for
   # those slots. The trend chart does not need a point per merge: the weekly

@@ -71,18 +71,27 @@ run, macOS jobs waited 40–48 min for a runner, so a longer mac job would lengt
 the manifest waits on. `ci_feature_matrix.py`'s RIDERS now supports an own-row host, and
 `check` requires the row.
 
-### Changed — CI: bench runs on schedule and dispatch only (bench schedule-only)
+### Changed — CI: bench runs on schedule and dispatch only (#1020)
 
 `bench.yml` no longer runs on every push to main, which cost 34–47 min of the shared pool per
 merge. The gh-pages publish was gated on `event_name == 'push'`; it now publishes for
 schedule and dispatch runs on main, so the trend chart keeps updating.
 
-### Changed — CI: main's run is skipped when the merge tree equals a PR head that passed CI (skip main's run on tree equality)
+### Changed — CI: main's run is skipped when the merge tree equals a PR head that passed CI (#1021)
 
 A new `tree` job runs only on push to main. It sets `skip=true` only when all three hold:
 HEAD is a merge, tree(HEAD) == tree(HEAD^2), and a pull_request CI run on HEAD^2 succeeded.
 Any error leaves `skip=false`. Root jobs gate on its output. Tag runs never skip, so the
 versioned cache still publishes.
+
+### Found, not changed — no Linux CIRISCache blob has been published since at least v53.1.3 (#1022)
+
+Every core-1 `CIRISCache/save@v1` on the v53.1.3–v53.1.8 tag runs and on main run
+37559458619 fails in the LRU prune, before `tar`/`oras push`. The failing pipeline is
+`find | sort | while … break` under `pipefail`: `sort` gets SIGPIPE and the step exits 2, and
+`continue-on-error` hides the failure. As a result, every Linux leg restores
+`phead-…-v10.6.1` (verify v10), spends 6m53s extracting it, and still compiles 119 crates. The
+fix belongs in CIRISCache. The measurements and a one-leg A/B are in the #1022 comment.
 
 ## [53.1.8] - 2026-10-07
 
