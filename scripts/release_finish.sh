@@ -67,5 +67,5 @@ gh release edit "v$ver" --notes-file "$tmp/tagbody.md" >/dev/null || { echo "rel
 body_bytes=$(gh release view "v$ver" --json body --jq '.body' | wc -c)
 echo "release body bytes=$body_bytes (tag body $in_bytes)"
 [ "$body_bytes" -ge $(( in_bytes - 64 )) ] || { echo "release body too short — not the CHANGELOG section"; exit 15; }
-scripts/verify_release.sh "$ver" || { echo "attestations of v$ver not verified (verify_release.sh exit $?)"; exit 17; }
+scripts/verify_release.sh "$ver" "$rid" || { echo "attestations of v$ver not verified (verify_release.sh exit $?)"; exit 17; }
 echo "=== RELEASE_SHIP_DONE v$ver at $(git rev-list -n1 "v$ver") ==="

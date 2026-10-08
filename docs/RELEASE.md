@@ -98,7 +98,7 @@ Tag CI's `attest` job (CIRISPersist#1028) signs two kinds of GitHub artifact att
 There is no sdist: consumers build from the git tag and nothing builds one.
 
 ```
-scripts/verify_release.sh v<version>        # GH=/path/to/gh if the default gh is older than 2.49
+scripts/verify_release.sh v<version> [<tag-run-id>]   # GH=/path/to/gh if the default gh is older than 2.49
 ```
 
 It downloads each subject, runs `gh attestation verify` bound to `CIRISAI/CIRISPersist`, to `.github/workflows/ci.yml` as the signer workflow and to `refs/tags/v<version>` as the source ref (an attestation from a branch or PR run does not count), prints the conformance predicate, and checks its `crate_version` and `merge_sha` against the tag. Exit 0 means every subject verified; 1 lists each failure; 2 is usage or a `gh` without `attestation`; 3 is a failed download (nothing judged). Wheel artifacts expire after 90 days; for an older release `VERIFY_SKIP_WHEELS=1` skips them and says so.
@@ -132,27 +132,41 @@ Releases before v53.2.0 carry no attestations. Through v53.1.8 the wheel artifac
 | — | a registry read failed: not 200, and not a 404 where one is allowed | 17 |
 | — | no previous version could be found | 18 |
 
+`python-source-tree` is the fifth target. It is not a wheel: pass its tree hash as `--sha256 <hex>`. Checks 1 and 2 are skipped for it. Check 3 lets its hash equal the previous release's only when `git diff --quiet v<prev> v<version> -- python/ciris_persist` is empty, and the gate prints that it allowed it on that basis. That tree is three files, which were unchanged from v13.0.0 through v17.6.0, so an equal hash is often genuine. A wheel never gets this exemption, because it embeds its version. The tag job's `build-manifest` checkout fetches full history so the tags are there.
+
 The target map is `aarch64-unknown-linux-gnu` to `manylinux*_aarch64`, `x86_64-unknown-linux-gnu` to `manylinux*_x86_64`, `x86_64-pc-windows-msvc` to `win_amd64`, and `aarch64-apple-darwin` to `macosx*_arm64`. The previous version is the newest `v` tag below `<version>`, from `git tag`, or `git ls-remote` in a shallow checkout. `--prev` or `BITS_CHANGED_PREV` overrides it. The registry is `BITS_CHANGED_REGISTRY_BASE`; the tag job points it at the registry it writes to. A 429 or 5xx is retried, honouring `Retry-After`.
 
 Where it runs: the tag job runs checks 1 to 4 before each sign and check 5 after the round-trip, both through `scripts/build_manifest.sh`. `verify_release.sh` runs all five on each published wheel. `scripts/bits_changed_test.sh` is its offline witness set, a certify fast gate (`bitschanged`) and a CI lint step.
 
 ## Remediating a registered manifest
 
-CIRISRegistry keys manifest rows by (project, version, target) and upserts them in place. It keeps no history until CIRISRegistry#144 lands. To replace a wrong row:
+CIRISRegistry keys manifest rows by (project, version, target) and upserts them in place. It keeps no history until CIRISRegistry#144 lands. Each version has five targets: `python-source-tree`, a hash over `python/ciris_persist`, and one row per wheel.
 
-1. Snapshot the row and commit it. The snapshot is the only record of what is overwritten.
+The wheels exist only as each tag run's `ciris_persist-wheel-<label>` artifacts. PyPI publishing stopped at 22.0.1 (#615), and the GitHub release carries only the iOS and Android tarballs.
+
+1. **Check, writing nothing.** Dispatch `Re-register manifests` with `mode: check` (the default) and the versions:
+   ```
+   gh workflow run reregister-manifests.yml -f versions="53.0.1 53.1.0 53.1.8" -f mode=check
+   ```
+   `targets` defaults to all five. Per (version, target), the run prints the registered `binary_hash` beside the local hash, with `MATCH`, `MISMATCH` or `NOROW`.
+   - A wheel's local hash is the sha256 of that version's wheel. It is selected by version from the tag run's artifact. The tag run is the newest CI push run of `v<version>` with unexpired wheel artifacts.
+   - `python-source-tree`'s local hash is recomputed from the tag's own tree, with the tag job's walk and a throwaway keypair. The hash does not depend on the key.
+   - The table is in the step summary and in each version's `manifests-check-<v>` artifact.
+2. **Snapshot every MISMATCH row and commit it.** The snapshot is the only record of what is overwritten.
    ```
    scripts/snapshot_manifests.sh <version> <target>...
    git add evidence/manifest_remediation/<version>/ && git commit
    ```
-   The script refuses to overwrite an existing snapshot (exit 4) and writes nothing for a pair whose reads are not all 200 (exit 5).
-2. Merge that commit, then dispatch `Re-register manifests` from the ref that has it, with `versions`, `targets` and `dry_run: true` first:
-   ```
-   gh workflow run reregister-manifests.yml -f versions="<v> ..." -f targets="aarch64-unknown-linux-gnu x86_64-pc-windows-msvc" -f dry_run=true
-   ```
-   The dry run stops at `ciris-build-sign register --dry-run` and posts nothing. Read its log, then dispatch again with `dry_run=false`.
-3. Per version, the workflow refuses unless every named target's `.function.json` snapshot is committed and the live row still carries the snapshot's `binary_hash`. It finds the tag run by its `ciris-persist-build-manifest-<v>` artifact and downloads that artifact, which holds the PersistExtras and the other targets' signed manifests, plus the run's wheels. Run artifacts expire after 90 days, and an expired run is refused, not rebuilt. It re-signs the named targets after `bits_changed.sh` checks 1 to 4, with the previous version being the `v` tag below. It re-posts every other target unchanged, after checking each manifest's `binary_hash` against its wheel. A partial re-post would drop the others, because `register` writes one `binary_manifests` map per version. Then it registers through `POST /v1/builds` and `POST /v1/verify/build-manifest`, never the legacy function-manifest path, runs the round-trip, and runs `bits_changed.sh --after-publish` on every target.
-4. Run `scripts/verify_release.sh <v>` (or `VERIFY_SKIP_WHEELS=1` past 90 days, which skips the bits). Every `bits (registered)` line should read `ok`.
+   The script refuses to overwrite an existing snapshot (exit 4). It writes nothing for a pair whose reads are not all 200 (exit 5).
+3. **Repost.** Merge the snapshots, then dispatch `mode: repost` from a ref that has them, with `dry_run=true` first. That run stops at `ciris-build-sign register --dry-run` and posts nothing. A repost re-posts only the MISMATCH rows. It refuses a MISMATCH row with no committed `<version>/<target>.function.json`, or whose live row no longer carries that snapshot's `binary_hash`.
+   - The MISMATCH targets are re-signed after `bits_changed.sh` checks 1 to 4.
+   - Every other target is re-posted unchanged. First its manifest is checked against its wheel, or against the tag's tree. `register` writes one `binary_manifests` map per version, so a partial re-post would drop the rest.
+   - `register` also rewrites every target's `builds` row. The run therefore saves its own copy of all five live rows first, in the `manifests-repost-<v>` artifact.
+   - Rows go through `POST /v1/builds` and `POST /v1/verify/build-manifest`, never the legacy function-manifest path. Then come the round-trip and `bits_changed.sh --after-publish` on all five targets.
+4. Run `scripts/verify_release.sh <v> <tag-run-id>`. Every `bits (registered)` line should read `ok`.
 
-The workflow uses the tag job's secrets and adds none. Each version's re-signed manifests and its snapshots are uploaded as the run's `reregistered-manifests-<v>` artifact.
+**Where the bytes come from.** Each run prints which path it took.
+- **Wheels:** the tag run's artifact. When that artifact has expired after 90 days, the `rebuild` job builds the wheel from the tag in `pyo3-wheel`'s shape, under the tag's `rust-toolchain.toml`. The registration notes then say SAME-VERSION REBUILD, which CC 3.1.2.1 treats as a `supersedes`. Rebuilt bytes are not the released bytes, and they live only in that run's artifacts.
+- **PersistExtras and the unchanged manifests:** the tag run's `ciris-persist-build-manifest-<v>` artifact. When it has expired, they come from the registry itself: `GET /v1/verify/build-manifest` serves the posted manifest byte for byte, and its `extras` re-signs to the same `manifest_hash`.
 
+The workflow uses the tag job's secrets for `repost` only, and adds none.

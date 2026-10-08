@@ -20,6 +20,13 @@
 #
 #   scripts/bits_changed.sh [opts] <version> <target> <wheel-dir-or-file>
 #   scripts/bits_changed.sh [opts] <version> <target> --sha256 <hex> --filename <name>
+#   scripts/bits_changed.sh [opts] <version> python-source-tree --sha256 <tree-hash>
+#
+# python-source-tree (the fifth registered target, a hash over
+# python/ciris_persist) skips checks 1-2. Check 3 lets its hash equal the
+# previous release's ONLY when `git diff --quiet v<prev> v<version> --
+# python/ciris_persist` is empty, and says so; a wheel never gets that
+# exemption, because a wheel embeds its version.
 #
 #   --after-publish             run 1, 2, 5 instead of 1-4
 #   --attestation-digest <hex>  also assert sha256(wheel) == <hex>
@@ -68,7 +75,14 @@ done
 ver="${pos[0]:-}"; target="${pos[1]:-}"; src="${pos[2]:-}"
 ver="${ver#v}"
 case "$ver" in ""|*[!0-9.]*) echo "usage: version '$ver' is not N.N.N" >&2; exit 2;; esac
-if [ -n "$given_sha" ] || [ -n "$given_name" ]; then
+is_tree=0; [ "$target" = python-source-tree ] && is_tree=1
+if [ "$is_tree" = 1 ]; then
+  if [ -z "$given_sha" ] || [ -n "$given_name" ] || [ -n "$src" ]; then
+    echo "usage: python-source-tree is not a wheel: pass its tree hash as --sha256 <hex>, nothing else" >&2; exit 2
+  fi
+  given_sha="${given_sha#sha256:}"
+  [[ "$given_sha" =~ ^[0-9a-f]{64}$ ]] || { echo "usage: --sha256 is not 64 hex: $given_sha" >&2; exit 2; }
+elif [ -n "$given_sha" ] || [ -n "$given_name" ]; then
   if [ -z "$given_sha" ] || [ -z "$given_name" ] || [ -n "$src" ]; then
     echo "usage: --sha256 and --filename go together, in place of a wheel path" >&2; exit 2
   fi
@@ -89,7 +103,8 @@ case "$target" in
   x86_64-unknown-linux-gnu)  plat_glob='manylinux*_x86_64';;
   x86_64-pc-windows-msvc)    plat_glob='win_amd64';;
   aarch64-apple-darwin)      plat_glob='macosx*_arm64';;
-  *) echo "usage: unknown target '$target' (aarch64-unknown-linux-gnu, x86_64-unknown-linux-gnu, x86_64-pc-windows-msvc, aarch64-apple-darwin)" >&2; exit 2;;
+  python-source-tree)        plat_glob='';;
+  *) echo "usage: unknown target '$target' (aarch64-unknown-linux-gnu, x86_64-unknown-linux-gnu, x86_64-pc-windows-msvc, aarch64-apple-darwin, python-source-tree)" >&2; exit 2;;
 esac
 plat_fits() {  # $1 = platform tag, possibly a compressed set a.b.c
   local p; local IFS=.
@@ -106,8 +121,15 @@ base="${BITS_CHANGED_REGISTRY_BASE:-https://us.registry.ciris-services-1.ai}"; b
 denylist="${BITS_CHANGED_DENYLIST:-$repo_root/evidence/manifest_remediation/known_stale_hashes.txt}"
 tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
 
+# The paths the python-source-tree manifest hashes (build_manifest.sh signs
+# `--tree python/ --tree-include ciris_persist`).
+TREE_PATHS="python/ciris_persist"
+
 # ── 1. exactly one wheel for (version, target) ──────────────────────────────
-if [ -n "$given_sha" ]; then
+if [ "$is_tree" = 1 ]; then
+  wheel_name="python-source-tree"
+  echo "skip  1  python-source-tree is not a wheel: judging its tree hash ($TREE_PATHS)"
+elif [ -n "$given_sha" ]; then
   wheel_name="$given_name"
   echo "skip  1  no bytes (--sha256): judging $wheel_name by its published digest"
 else
@@ -134,7 +156,10 @@ else
 fi
 
 # ── 2. the wheel's own identity ─────────────────────────────────────────────
-if [ -n "$given_sha" ]; then
+if [ "$is_tree" = 1 ]; then
+  echo "skip  2  no METADATA or WHEEL in a source tree"
+  sha="$given_sha"
+elif [ -n "$given_sha" ]; then
   # ciris_persist-<ver>-<python>-<abi>-<plat>.whl: no bytes, so the filename.
   fver="$(echo "$wheel_name" | cut -d- -f2)"
   [ "$fver" = "$ver" ] || die 11 "2  filename $wheel_name names version '$fver', not $ver"
@@ -201,8 +226,25 @@ if [ "$after_publish" -eq 0 ]; then
     200)
       ph="$(row_hash "$tmp/prev.json")" || die 17 "3  registry row for $prev/$target is not JSON"
       [ -n "$ph" ] || die 17 "3  registry row for $prev/$target has no binary_hash"
-      [ "$ph" != "$sha" ] || die 13 "3  sha256 $sha is the hash registered for $prev on $target: the bits did not change"
-      echo "ok    3  differs from $prev's registered ${ph:0:16}…";;
+      if [ "$ph" != "$sha" ]; then
+        echo "ok    3  differs from $prev's registered ${ph:0:16}…"
+      elif [ "$is_tree" = 1 ]; then
+        # A source tree carries no version, so an unchanged tree hashes the
+        # same — allowed only when git shows the hashed paths did not change.
+        # A wheel embeds its version and never gets this exemption.
+        for tg in "v$prev" "v$ver"; do
+          git -C "$repo_root" rev-parse -q --verify "refs/tags/$tg^{commit}" >/dev/null \
+            || die 13 "3  sha256 $sha equals $prev's registered hash and tag $tg is not in this checkout, so 'unchanged' cannot be shown (fetch tags)"
+        done
+        git -C "$repo_root" diff --quiet "v$prev" "v$ver" -- $TREE_PATHS; drc=$?
+        case "$drc" in
+          0) echo "ok    3  equals $prev's registered hash; ALLOWED: $TREE_PATHS is unchanged between v$prev and v$ver (git diff empty)";;
+          1) die 13 "3  sha256 $sha is the hash registered for $prev on $target, but $TREE_PATHS changed between v$prev and v$ver: the bits did not change";;
+          *) die 13 "3  sha256 $sha equals $prev's registered hash and git diff v$prev v$ver failed (exit $drc)";;
+        esac
+      else
+        die 13 "3  sha256 $sha is the hash registered for $prev on $target: the bits did not change"
+      fi;;
     *) die 17 "3  registry read for $prev/$target returned HTTP $code ($(head -c 200 "$tmp/prev.json" 2>/dev/null; cat "$tmp/curlerr" 2>/dev/null))";;
   esac
 
