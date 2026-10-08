@@ -202,7 +202,20 @@ reg_row 1.0.0 "$TT" "$TH"; reg_row 1.1.0 "$TT" "$TH"
 expect "tree: same hash, tree unchanged"  0  'ALLOWED: python/ciris_persist is unchanged between v1.0.0 and v1.1.0' -- "$G2/scripts/bits_changed.sh" 1.1.0 "$TT" --sha256 "$TH"
 expect "tree: same hash, tree changed"    13 'python/ciris_persist changed between v1.1.0 and v1.2.0' -- "$G2/scripts/bits_changed.sh" 1.2.0 "$TT" --sha256 "$TH"
 expect "tree: hash differs"               0  'differs from 1.1.0'            -- "$G2/scripts/bits_changed.sh" 1.2.0 "$TT" --sha256 "$(printf 'b%.0s' $(seq 64))"
-expect "tree: prev tag missing locally"   13 'tag v9.9.9 is not in this checkout' -- env BITS_CHANGED_PREV=1.0.0 "$G2/scripts/bits_changed.sh" 9.9.9 "$TT" --sha256 "$TH"
+reg_row 0.9.0 "$TT" "$TH"
+expect "tree: prev tag missing locally"   13 'tag v0.9.0 is not in this checkout' -- env BITS_CHANGED_PREV=0.9.0 "$G2/scripts/bits_changed.sh" 1.1.0 "$TT" --sha256 "$TH"
+# A PR (or any pre-tag) run: v<version> does not exist yet, so "unchanged" is
+# judged between v<prev> and HEAD — the v53.2.0 PR run refused an unchanged
+# tree with "tag v53.2.0 is not in this checkout" (PR run 37803506058).
+G3="$WORK/git3"; mkdir -p "$G3/scripts" "$G3/python/ciris_persist"; cp "$GATE" "$G3/scripts/"
+gc3() { git -C "$G3" -c user.name=t -c user.email=t@t "$@"; }
+git -C "$G3" init -q || exit 2
+echo a >"$G3/python/ciris_persist/__init__.py"; gc3 add -A; gc3 commit -q -m 1; gc3 tag v1.0.0
+echo x >"$G3/README"; gc3 add -A; gc3 commit -q -m 2                        # no v1.1.0 tag; tree untouched
+reg_row 1.0.0 "$TT" "$TH"
+expect "tree: no version tag, unchanged"  0  'ALLOWED: python/ciris_persist is unchanged between v1.0.0 and HEAD \(tag v1.1.0 not yet' -- "$G3/scripts/bits_changed.sh" 1.1.0 "$TT" --sha256 "$TH"
+echo b >"$G3/python/ciris_persist/__init__.py"; gc3 add -A; gc3 commit -q -m 3   # tree changed, still untagged
+expect "tree: no version tag, changed"    13 'python/ciris_persist changed between v1.0.0 and HEAD' -- "$G3/scripts/bits_changed.sh" 1.1.0 "$TT" --sha256 "$TH"
 expect "tree: a wheel path is refused"    2  'python-source-tree is not a wheel' -- "$G2/scripts/bits_changed.sh" 1.1.0 "$TT" "$WORK/a"
 W11="$WORK/p/ciris_persist-1.1.0-cp310-abi3-$PLAT.whl"; mkwheel "$W11" 1.1.0 "$PLAT"
 reg_row 1.0.0 "$T" "$(sha "$W11")"

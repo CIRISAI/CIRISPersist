@@ -25,8 +25,9 @@
 # python-source-tree (the fifth registered target, a hash over
 # python/ciris_persist) skips checks 1-2. Check 3 lets its hash equal the
 # previous release's ONLY when `git diff --quiet v<prev> v<version> --
-# python/ciris_persist` is empty, and says so; a wheel never gets that
-# exemption, because a wheel embeds its version.
+# python/ciris_persist` is empty, and says so (before the tag exists, on a PR
+# or main run, HEAD stands in for v<version> and the line names it); a wheel
+# never gets that exemption, because a wheel embeds its version.
 #
 #   --after-publish             run 1, 2, 5 instead of 1-4
 #   --attestation-digest <hex>  also assert sha256(wheel) == <hex>
@@ -232,15 +233,22 @@ if [ "$after_publish" -eq 0 ]; then
         # A source tree carries no version, so an unchanged tree hashes the
         # same — allowed only when git shows the hashed paths did not change.
         # A wheel embeds its version and never gets this exemption.
-        for tg in "v$prev" "v$ver"; do
-          git -C "$repo_root" rev-parse -q --verify "refs/tags/$tg^{commit}" >/dev/null \
-            || die 13 "3  sha256 $sha equals $prev's registered hash and tag $tg is not in this checkout, so 'unchanged' cannot be shown (fetch tags)"
-        done
-        git -C "$repo_root" diff --quiet "v$prev" "v$ver" -- $TREE_PATHS; drc=$?
+        git -C "$repo_root" rev-parse -q --verify "refs/tags/v$prev^{commit}" >/dev/null \
+          || die 13 "3  sha256 $sha equals $prev's registered hash and tag v$prev is not in this checkout, so 'unchanged' cannot be shown (fetch tags)"
+        # On a PR (or any run before the tag) v<version> does not exist yet:
+        # the tree being signed is HEAD's, so judge against HEAD and say so.
+        if git -C "$repo_root" rev-parse -q --verify "refs/tags/v$ver^{commit}" >/dev/null; then
+          to="v$ver"; to_why=""
+        else
+          git -C "$repo_root" rev-parse -q --verify "HEAD^{commit}" >/dev/null \
+            || die 13 "3  sha256 $sha equals $prev's registered hash and neither tag v$ver nor HEAD resolves, so 'unchanged' cannot be shown"
+          to="HEAD"; to_why=" (tag v$ver not yet in this checkout: judged at HEAD $(git -C "$repo_root" rev-parse --short HEAD))"
+        fi
+        git -C "$repo_root" diff --quiet "v$prev" "$to" -- $TREE_PATHS; drc=$?
         case "$drc" in
-          0) echo "ok    3  equals $prev's registered hash; ALLOWED: $TREE_PATHS is unchanged between v$prev and v$ver (git diff empty)";;
-          1) die 13 "3  sha256 $sha is the hash registered for $prev on $target, but $TREE_PATHS changed between v$prev and v$ver: the bits did not change";;
-          *) die 13 "3  sha256 $sha equals $prev's registered hash and git diff v$prev v$ver failed (exit $drc)";;
+          0) echo "ok    3  equals $prev's registered hash; ALLOWED: $TREE_PATHS is unchanged between v$prev and $to$to_why (git diff empty)";;
+          1) die 13 "3  sha256 $sha is the hash registered for $prev on $target, but $TREE_PATHS changed between v$prev and $to$to_why: the bits did not change";;
+          *) die 13 "3  sha256 $sha equals $prev's registered hash and git diff v$prev $to failed (exit $drc)";;
         esac
       else
         die 13 "3  sha256 $sha is the hash registered for $prev on $target: the bits did not change"
