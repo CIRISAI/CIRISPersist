@@ -389,7 +389,9 @@ expect_eq "resume: unbound (pre-binding) state is refused (32)" "$rc" "32"
 case "$out" in *"echo release-$RV > .release/$RV/branch"*) ok "resume: unbound state says how to bind it by hand";; *) bad "resume: unbound text: $out";; esac
 rb_state "release-$RV" ""; rb --dry-run "$RV"
 expect_eq "resume: bump done with no release commit recorded is refused (32)" "$rc" "32"
+# shellcheck disable=SC2016  # literal: grep text, not an expansion
 grep -q 'rl_put "$S" branch "$branch"' scripts/release.sh && ok "release.sh records the branch at preflight" || bad "release.sh does not record the branch"
+# shellcheck disable=SC2016  # literal: grep text, not an expansion
 grep -q 'rl_put "$S" bump_sha "$(head_sha)"' scripts/release.sh && ok "release.sh records the release commit at bump" || bad "release.sh does not record the release commit"
 
 echo "syntax"

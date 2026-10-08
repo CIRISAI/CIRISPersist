@@ -442,7 +442,7 @@ done
 echo '{"dep_tree_sha256":"DEP-ARTIFACT"}' >"$d/persist-extras-53.1.8.json"
 GHEOF
 chmod +x "$GR/bin/gh"
-# shellcheck disable=SC2317  # invoked through `expect`
+# shellcheck disable=SC2317,SC2329  # invoked through `expect`
 reuse() { (cd "$GR" && env PATH="$GR/bin:$PATH" V="$GV" RUN=7 BM=true GITHUB_REPOSITORY=o/r REGISTRY_URL="$BITS_CHANGED_REGISTRY_BASE" SNAPSHOT_RETRIES=0 bash reuse.sh); }
 guard_fixture
 expect "reuse: live bodies, not the artifact" 0 'reuse source: the registry' -- reuse
