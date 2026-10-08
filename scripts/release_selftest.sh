@@ -280,6 +280,55 @@ if [ "$(_l '"--- stage prci"')" -lt "$(_l '"--- stage codex"')" ] && [ "$(_l '"-
 grep -q 'rl_done_at "$S" codex "$(head_sha)"' scripts/release.sh && ok "the codex marker is keyed to HEAD's sha" || bad "the codex marker is not keyed to HEAD"
 grep -q 'for st in preflight cheap bump pr certify prci codex ship' scripts/release.sh && ok "--dry-run lists the codex stage" || bad "--dry-run does not list the codex stage"
 
+echo "release_ship.sh local tag annotation"
+# A re-run that finds v<version> locally at the merge sha must also find the
+# CHANGELOG section's bytes in it: a stale or hand-written annotation was
+# accepted, pushed, and became the release body (Codex on PR #1039). A stub
+# `gh` reports PR 9 merged at the fixture's HEAD with a green PR run, main's
+# push run visible, and tag run 42; origin is a local bare repo.
+RS="$PWD/scripts/release_ship.sh"
+mkdir -p "$t/rs/bin"
+cat > "$t/rs/bin/gh" <<'GHEOF'
+#!/usr/bin/env bash
+case "$*" in
+  "repo view"*) echo o/r;;
+  *".head.sha"*|*".merge_commit_sha"*) cat "$RS_HEAD";;
+  *".merged"*) echo true;;
+  "run list"*databaseId*) echo 42;;
+  "run list"*) echo completed/success;;
+  *) exit 1;;
+esac
+GHEOF
+chmod +x "$t/rs/bin/gh"
+rs_fixture() {  # <name>: a clone whose HEAD carries CHANGELOG [9.9.0] and the lib
+    (
+        set -e
+        export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t
+        git init -q --bare -b main "$t/rs/$1.git"
+        git init -q -b main "$t/rs/$1"; cd "$t/rs/$1"
+        mkdir scripts; cp "$OLDPWD/scripts/release_lib.sh" scripts/; cp "$t/CHANGELOG.md" .
+        git add -A; git commit -q -m one
+        git remote add origin "$t/rs/$1.git"; git push -q origin HEAD:refs/heads/main
+        git rev-parse HEAD > "$t/rs/$1.head"
+    )
+}
+rs() {  # <name>
+    : > "$t/rs/body"
+    out="$(cd "$t/rs/$1" && PATH="$t/rs/bin:$PATH" RS_HEAD="$t/rs/$1.head" bash "$RS" 9 9.9.0 "$(cut -c1-7 "$t/rs/$1.head")" subj "$t/rs/body" 2>&1)"; rc=$?
+    [ -n "${RS_DEBUG:-}" ] && printf '[%s rc=%s]\n%s\n' "$1" "$rc" "$out"
+}
+rs_fixture fresh; rs fresh
+expect_eq "ship: no local tag: cut, pushed, tag run printed (exit 0)" "$rc" "0"
+if [ "$(git -C "$t/rs/fresh" ls-remote origin refs/tags/v9.9.0 | cut -f1)" = "$(git -C "$t/rs/fresh" rev-parse refs/tags/v9.9.0)" ]; then ok "ship: the cut tag is on origin"; else bad "ship: the cut tag is not on origin"; fi
+rs_fixture rerun; ( cd "$t/rs/rerun" && rl_changelog_section CHANGELOG.md 9.9.0 > "$t/rs/sec.md" && git -c user.name=t -c user.email=t@t tag -a v9.9.0 --cleanup=verbatim -F "$t/rs/sec.md" HEAD ); rs rerun
+expect_eq "ship: a re-run with the CHANGELOG's own annotation is accepted (exit 0)" "$rc" "0"
+rs_fixture stale; git -C "$t/rs/stale" -c user.name=t -c user.email=t@t tag -a v9.9.0 -m "a hand-written annotation that is long enough to pass a byte-count check, because it pads itself out with words and more words and more words and still more words until it is longer than the section" HEAD; rs stale
+expect_eq "ship: a stale local annotation at the right sha is refused (exit 11)" "$rc" "11"
+case "$out" in *"git tag -d v9.9.0"*) ok "ship: the refusal says how to clear it";; *) bad "ship: refusal text: $out";; esac
+if git -C "$t/rs/stale" ls-remote --exit-code origin refs/tags/v9.9.0 >/dev/null; then bad "ship: the stale tag was pushed"; else ok "ship: the stale tag was not pushed"; fi
+rs_fixture light; git -C "$t/rs/light" tag v9.9.0 HEAD; rs light
+expect_eq "ship: a lightweight local tag is refused (exit 11)" "$rc" "11"
+
 echo "syntax"
 for f in scripts/release.sh scripts/release_ship.sh scripts/release_finish.sh scripts/release_lib.sh scripts/release_selftest.sh; do
     if bash -n "$f"; then ok "bash -n $f"; else bad "bash -n $f"; fi

@@ -16,7 +16,8 @@
 #    which case the PR run already certified these exact bytes and the wait
 #    is skipped (−35 min wall per release, CIRISPersist#881);
 # 4. cuts the annotated tag v<version> from the CHANGELOG section
-#    (`--cleanup=verbatim`, headings kept; byte count asserted) at the merge sha;
+#    (`--cleanup=verbatim`, headings kept) at the merge sha; a local tag left by
+#    an earlier run is accepted only when its annotation equals the section;
 # 5. waits until main's push run on the merge sha is VISIBLE (not complete —
 #    CIRISPersist#1008), pushes the tag, and prints the tag's CI run id.
 #
@@ -27,7 +28,9 @@
 #
 # Exit codes: 2 dirty tree · 3 head moved / PR CI not green · 4 merge failed ·
 # 5 main CI red · 6 main CI timeout · 7 no CHANGELOG section · 8 tag cut failed ·
-# 9 tag sha/body mismatch · 10 tag push failed · 16 tag run never appeared.
+# 9 tag sha mismatch · 10 tag push failed · 11 the local tag's annotation is
+# not the CHANGELOG section byte for byte (or it is lightweight) · 16 tag run
+# never appeared.
 #
 # BEFORE running this for a release that names a CC version: run
 # `scripts/check_vendored_cc.sh <cc-tag>` — the vendored CC files must be the tag's bytes.
@@ -77,9 +80,27 @@ else
   git tag -a "v$ver" "$merge_sha" --cleanup=verbatim -F "$tmp/tagbody.md" || exit 8
 fi
 [ "$(git rev-list -n1 "v$ver")" = "$merge_sha" ] || { echo "tag SHA mismatch: v$ver is not at $merge_sha"; exit 9; }
-in_bytes=$(wc -c < "$tmp/tagbody.md"); out_bytes=$(git tag -l --format='%(contents)' "v$ver" | wc -c)
-echo "tag body bytes in=$in_bytes stored=$out_bytes headings=$(git tag -l --format='%(contents)' "v$ver" | grep -c '^#')"
-[ "$out_bytes" -ge "$in_bytes" ] || { echo "tag body LOST bytes"; exit 9; }
+# The annotation must BE the CHANGELOG section, byte for byte — a fresh cut
+# and a re-run alike. A re-run used to accept any local v<ver> at the right
+# sha whose body was at least as long; a stale or hand-written annotation was
+# then pushed and became the release body (Codex on PR #1039). The raw tag
+# object's message is everything after its header's blank line.
+if [ "$(git cat-file -t "refs/tags/v$ver")" != tag ]; then
+  echo "local v$ver is a lightweight tag, not the CHANGELOG annotation — clear it with: git tag -d v$ver, then re-run"; exit 11
+fi
+git cat-file tag "refs/tags/v$ver" | sed '1,/^$/d' > "$tmp/stored.md"
+in_bytes=$(wc -c < "$tmp/tagbody.md"); out_bytes=$(wc -c < "$tmp/stored.md")
+echo "tag body bytes in=$in_bytes stored=$out_bytes headings=$(grep -c '^#' "$tmp/stored.md")"
+if ! cmp -s "$tmp/tagbody.md" "$tmp/stored.md"; then
+  echo "local v$ver's annotation is not the CHANGELOG [$ver] section at $merge_sha (stale or hand-written):"
+  diff "$tmp/tagbody.md" "$tmp/stored.md" | head -20
+  if git ls-remote --exit-code origin "refs/tags/v$ver" >/dev/null 2>&1; then
+    echo "v$ver is ALREADY on origin — deleting it there is a human decision; nothing pushed"
+  else
+    echo "clear it with: git tag -d v$ver, then re-run (the tag is cut afresh)"
+  fi
+  exit 11
+fi
 # The tag run and main's push run share one concurrency group (#397, keyed on
 # the SHA, cancel-in-progress): whichever run is QUEUED LATER cancels the other.
 #
