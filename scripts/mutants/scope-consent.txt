@@ -1,0 +1,25 @@
+# Mutation scope: the consent gates and the read/fold counters (CIRISPersist#1024).
+#
+# The sites v53.1.8's hand rounds mutated (CHANGELOG `## [53.1.8]`: I548 3/3,
+# I549-I551 10/10), as the first scope the tool runs without hand selection.
+#
+# Format, one entry per line, `#` to end of line is a comment:
+#   tests: <nextest filterset>       the witnesses this scope is measured against
+#   witnesses: <path> ...            extra witness files for unvalidated_witnesses.py
+#                                    (every `*_invariants.rs` counts without listing)
+#   <path>                           every mutant in the file
+#   <path> <fn> [<fn> ...]           only mutants inside these functions; each name
+#                                    must define exactly one `fn` in the file
+#
+# Not in this scope, though v53.1.8's I549 round mutated them: the backend
+# byte meters (`sqlite_row_to_attestation`, `pg_envelope_bytes`) and the fold
+# entries in trust_root.rs and the admission path. They live in files of
+# 23k-28k lines; see scope-observe-sites.txt.
+
+tests: test(/i548|i549|i550|i551/)
+witnesses: src/observe/tests.rs
+
+src/federation/consent_by_humans.rs capacity_consent_stance resolve_scoped_stance_by_principals resolve_scoped_stance_by_principals_body
+src/federation/admission.rs check_capacity_consent_admission
+src/observe/mod.rs
+src/observe/catalog.rs

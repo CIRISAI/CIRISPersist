@@ -1,0 +1,14 @@
+# Mutation scope: the call sites that feed the read/fold counters (CIRISPersist#1024).
+#
+# v53.1.8's I549 hand round mutated these as well as src/observe/ itself:
+# the backend byte meters and the fold entries. They sit in files of 3k-28k
+# lines, so each is named by function, not by file. Grammar: scope-consent.txt.
+
+tests: test(/i548|i549|i550|i551/)
+witnesses: src/observe/tests.rs
+
+src/store/sqlite.rs sqlite_row_to_attestation
+src/store/postgres.rs pg_envelope_bytes
+src/federation/trust_root.rs trust_root_valid
+src/federation/mod.rs put_attestation put_attestation_authored
+src/federation/attestation_apply.rs apply_planned

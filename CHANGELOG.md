@@ -300,6 +300,32 @@ adoption. Every other save stays fail-open, followed by a step that prints the t
 and emits a `::warning::` when `published` is not `true`. The darwin-aarch64 save stays
 disabled (#762) and gets the pin only.
 
+### Added — a per-witness mutation matrix, without hand selection (#1024)
+
+Until now every mutation round was hand-picked per PR and lived only here ("the 10-mutant round"). Nothing said, after the merge, which witness was load-bearing for which site. `scripts/mutants.sh <cargo-mutants|mutest> <scope>` drives a mutation tool over a named scope and writes `target/certify-logs/mutants/<scope>/matrix.{json,md}`: every mutant, its outcome, and every witness that went red under it. Report-only: it exits 0 whenever a matrix is written. Format, scope grammar and cadence: `docs/MUTATION_TESTING.md`.
+
+- **`scripts/mutants_matrix.py`** resolves a scope file (`tests:` filterset, `witnesses:` files, `<path> [<fn> ...]` entries; a function name must define exactly one `fn`) into each tool's own filter, and turns either tool's output into one schema, `ciris-persist/mutants-matrix/v1`. An interrupted cargo-mutants run is marked INCOMPLETE: the mutants missing from `outcomes.json` are read from the tool's own `mutants.json` as `not_run`. Before that, a matrix built from a run cut off after 17 of 74 mutants said "complete".
+- **`scripts/unvalidated_witnesses.py`** lists each `*_invariants.rs` witness (or `witnesses:` file) that ran and killed nothing: an unvalidated witness in Beyer 2022's sense, never shown red. On an incomplete run a zero prints `ZERO SO FAR`, not `UNVALIDATED`. Report-only this cut.
+- **Two scopes.** `scripts/mutants/scope-consent.txt` holds the consent gates and `src/observe/`, which are the sites of 53.1.8's rounds. `scripts/mutants/scope-observe-sites.txt` holds the backend byte meters and the fold entries, named by function in 3k–28k-line files.
+- **Tool verdict: cargo-mutants 27.1.0**, on the pinned 1.97.0. mutest-rs (git 430efed9, `nightly-2026-07-18`) was measured and rejected. Its static call graph ran 1 of the 16 in-scope witnesses, the only synchronous one. It generated no mutant in `consent_by_humans.rs` or `admission.rs`. With `postgres` on it hits an internal compiler error (`mutest-emit` `analysis/res.rs:758`, `deadpool` path). Its build peaks at 8.2 GiB, and each run profiles the whole lib suite first (1688 s, 3351 tests). The ML-DSA tests survived its meta-mutant binary with no stack overflow.
+- **Measured on `scope-consent`.** cargo-mutants listed 74 in-scope mutants. Baseline: 267 s build, 9.8 s for the 22 witnesses. It ran 17 in 1162 s (15 caught, 2 unviable, 0 missed) before the session crashed. 57 were not run, including all 13 in the consent gate and fold.
+- **Against the hand rounds: the acceptance is NOT met yet.** Of I549–I551's 10 hand mutants, one has a tool analogue that ran: `Fold::bit -> 0` (`src/observe/mod.rs:175`), the hand round's "fold scope that omits its own bit". It was killed by `i549` on memory, sqlite and postgres, as by hand. Five more have analogues listed but not run (`record_read`, its fold credit, `note_decoded_bytes`). Three sit in `scope-observe-sites.txt`, which has not run. The two `DOOR_VALUES` edits cannot be generated: neither tool mutates a `const` slice, and neither generated a mutant in `catalog.rs`. I548's 3 hand mutants are semantic swaps no operator produces. The tool's 13 coarser mutants at that site did not run.
+- **Beyond the hand rounds**, 14 more mutants were caught: `Fold::bit` ×2, `Tally::add`, eight `Tally::load` constants, `Counters::snapshot` and its two `>` flips. All were killed by `i549` on all three backends, and 12 also by `i550`.
+- **Survivors.** None among cargo-mutants' 17. mutest's 12 survivors are all at `src/observe/mod.rs:431`, inside the `Vec::with_capacity` hint of `TelemetrySnapshot::samples`. They are equivalent mutants, not a witness gap.
+- **Not in this cut.** The `certify.sh mutants` tier and the scheduled CI job: `docs/CI_WIRING_53_2_0.md` has the exact lines for the merge. Also deferred: a complete `scope-consent` run (projected about 63 min serial, not measured); any run of `scope-observe-sites.txt`; a scope for the remaining `trust_root.rs` walks; and turning the unvalidated report into a gate.
+
+### Added — the feature powerset against certify's hand legs (#1025)
+
+"Certify per feature set, never a union" was enforced by a hand list. `scripts/powerset.sh list|count|check [M/N]` derives the sets with `cargo hack --feature-powerset --depth 2 --no-dev-deps`. `scripts/powerset_delta.py` compares them with every set certify.sh builds: LEGS, `lint`, AXES × 3 backend shapes, and the literal `run_bg` legs. It exits 1 if a hand set is not covered at least pairwise. Detail: `docs/FEATURE_MATRIX.md`.
+
+- **Enumeration.** 47 declared features, 4 excluded (`scrub-ner`, `scrub-ort`, `default-pipeline-ml`, `_pyffi`, all still compiled by the `--all-features` clippy pass). That leaves 43 features and **929 sets**: the empty set, 43 singles, and 885 pairs. Another 18 pairs are skipped as implied.
+- **Delta.** certify.sh builds 27 hand sets. 18 are built exactly by the powerset, 9 only pairwise (`core`, the five axis legs, `lint`, `pyo3sqlite`, `rest`: 4 to 34 features, beyond depth 2), and 0 are uncovered. 911 derived sets are built by nothing today, including 37 single features never compiled alone.
+- **Two configurations that do not compile**, found by the two partial `check` runs on disk (34 of 929 sets in 598 s; partition 41/80, 12 sets in 274 s at 3.0 GiB). Filed as #1030 (v54.0.0); not fixed here, because each is a feature-contract decision:
+  - `tls` without `postgres` (`Cargo.toml:525`). `tokio-postgres-rustls` fails on `tokio_postgres::tls::MakeTlsConnect`.
+  - `pyo3-sqlite` without `pyo3` (`Cargo.toml:43` enables only `_pyffi`). It fails with 184 × E0004 from `src/ffi/pyo3.rs:120`.
+- **No hand leg dropped.** The test legs stay hand-derived.
+- **Not in this cut.** Two parts of #1025 are deferred. First, the cheap-tier leg it asked for: at the measured 17.6–22.8 s per set, 929 sets is about 4.5–6 h, so the proposal is a weekly 8-partition CI job plus an opt-in `certify.sh powerset [M/N]`. Second, the `ci_feature_matrix.py powerset` mode. Both are written out in `docs/CI_WIRING_53_2_0.md`. A full `check` over all 929 sets has not run.
+
 ## [53.1.8] - 2026-10-07
 
 ### Fixed — the score emit gate refused what its consent precheck granted (#1013)
