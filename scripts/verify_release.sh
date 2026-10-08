@@ -13,7 +13,14 @@
 #    signing workflow and to `refs/tags/v<ver>` as the source ref, so an
 #    attestation from a branch or PR run does not count;
 # 5. prints the cc-conformance predicate and checks its crate_version and
-#    merge_sha against the tag.
+#    merge_sha against the tag;
+# 6. runs scripts/bits_changed.sh on each desktop wheel (CIRISPersist#1029):
+#    its METADATA Version and WHEEL Tag fit (version, target), its sha256 is
+#    not the previous release's registered hash nor a known stale one, and
+#    the registry's row for (version, target) carries exactly that sha256.
+#    With VERIFY_SKIP_WHEELS=1 the wheels' published sha256 digests are read
+#    from PyPI instead, when the version is there (nothing after 22.0.1 is,
+#    since #615), and otherwise the bits are reported as NOT checked.
 #
 # Needs a gh with `gh attestation` (2.49+). GH=/path/to/gh selects one.
 #
@@ -83,5 +90,41 @@ else
   echo "FAIL  cc-conformance  evidence/cc_impl.tsv: $(tail -1 "$tmp/err")"; fails=$((fails + 1))
 fi
 
+# 6. did the bits change, and does the registry carry them (#1029)?
+here="$(cd "$(dirname "$0")" && pwd)"
+bits_note="every wheel's bits checked against the registry"
+declare -A TARGET_OF=(
+  [linux-x86_64]=x86_64-unknown-linux-gnu [linux-aarch64]=aarch64-unknown-linux-gnu
+  [darwin-aarch64]=aarch64-apple-darwin [windows-x86_64]=x86_64-pc-windows-msvc
+)
+bits() {  # $1 label, then bits_changed.sh's arguments after <version> <target>
+  local label="$1" t; shift; t="${TARGET_OF[$label]}"
+  for mode in "" --after-publish; do
+    if "$here/bits_changed.sh" $mode "$v" "$t" "$@" >"$tmp/bits" 2>&1; then
+      echo "ok    bits${mode:+ (registered)}  $label: $(tail -1 "$tmp/bits" | cut -c1-120)"
+    else
+      echo "FAIL  bits${mode:+ (registered)}  $label: $(grep -m1 '^FAIL' "$tmp/bits" || tail -1 "$tmp/bits")"; fails=$((fails + 1))
+    fi
+  done
+}
+if [ "${VERIFY_SKIP_WHEELS:-0}" != 1 ]; then
+  for label in "${!TARGET_OF[@]}"; do bits "$label" "$tmp/wheels/ciris_persist-wheel-$label"; done
+elif curl -sSf -o "$tmp/pypi.json" "https://pypi.org/pypi/ciris-persist/$v/json" 2>/dev/null; then
+  for label in "${!TARGET_OF[@]}"; do
+    case "$label" in
+      linux-x86_64) g='*manylinux*_x86_64.whl';; linux-aarch64) g='*manylinux*_aarch64.whl';;
+      darwin-aarch64) g='*macosx*_arm64.whl';; windows-x86_64) g='*win_amd64.whl';;
+    esac
+    line="$(python3 -I -c 'import json,sys,fnmatch; d=json.load(open(sys.argv[1]))
+m=[u for u in d.get("urls",[]) if fnmatch.fnmatch(u["filename"], sys.argv[2])]
+print(" ".join((m[0]["digests"]["sha256"], m[0]["filename"])) if len(m)==1 else "")' "$tmp/pypi.json" "$g")"
+    if [ -z "$line" ]; then echo "FAIL  bits  $label: not exactly one PyPI file matching $g"; fails=$((fails + 1)); continue; fi
+    bits "$label" --sha256 "${line%% *}" --filename "${line#* }"
+  done
+else
+  echo "SKIP  bits  (VERIFY_SKIP_WHEELS=1 and $v is not on PyPI) — the registered wheel hashes are NOT checked"
+  bits_note="the wheels' bits were NOT checked"
+fi
+
 if [ "$fails" -ne 0 ]; then echo "VERIFY RELEASE $tag: $fails FAILED"; exit 1; fi
-echo "VERIFY RELEASE $tag: every attestation verified"
+echo "VERIFY RELEASE $tag: every attestation verified; $bits_note"

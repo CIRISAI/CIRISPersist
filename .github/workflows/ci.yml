@@ -1494,6 +1494,11 @@ jobs:
       # counts in rules/expected.json; inventory in docs/FROM_DISK_GATES.md.
       - name: ast-grep gate counts (rules/ vs rules/expected.json)
         run: scripts/ast_gates.sh
+      # v53.2.0 (#1029) — the bits-changed gate (scripts/bits_changed.sh) that the
+      # tag job runs before signing a wheel's manifest; offline witnesses with a
+      # stub registry, including the `ls | head -1` mutant.
+      - name: bits-changed gate witnesses
+        run: scripts/bits_changed_test.sh
       # v43.0.0 (BLOB_ENCRYPTION_AT_REST.md I22) — the storage floor token is
       # unconstructible outside the crate. The witness is a `compile_fail`
       # doctest, and nextest never runs doctests, so it gets its own step.
@@ -2232,6 +2237,8 @@ jobs:
         env:
           CIRIS_BUILD_ED25519_SECRET: ${{ secrets.CIRIS_BUILD_ED25519_SECRET }}
           CIRIS_BUILD_MLDSA_SECRET: ${{ secrets.CIRIS_BUILD_MLDSA_SECRET }}
+          # bits_changed.sh reads the registry this job writes to.
+          BITS_CHANGED_REGISTRY_BASE: ${{ vars.REGISTRY_URL || 'https://api.registry.ciris-services-1.ai' }}
         run: |
           if [ -z "${CIRIS_BUILD_ED25519_SECRET}" ] || [ -z "${CIRIS_BUILD_MLDSA_SECRET}" ]; then
             echo "::error::Hybrid signing secrets not configured."
@@ -2301,6 +2308,12 @@ jobs:
               exit 1
             fi
             WHEEL="${CANDIDATES[0]}"
+            # v53.2.0 (#1029) — did the bits change? One wheel for the target,
+            # its own METADATA Version and WHEEL Tag, not the previous
+            # release's registered hash, not a known stale hash. Refuse to sign
+            # otherwise: the v53.1.8 rows signed v29 bytes under 53.1.8.
+            scripts/bits_changed.sh "$VERSION" "$TARGET" "dist/wheels/${ARTDIR}" \
+              || { echo "::error::bits_changed.sh refused ${TARGET} (exit $?); not signing"; exit 1; }
             ciris-build-sign sign \
               --primitive persist \
               --build-id "$VERSION" \
@@ -2513,6 +2526,24 @@ jobs:
             echo "- targets verified:"
             for T in "${TARGETS[@]}"; do echo "  - \`${T}\`"; done
           } >> "$GITHUB_STEP_SUMMARY"
+      - name: bits-changed check 5 — each registered row carries this run's wheel
+        # v53.2.0 (#1029) — the registry upserts in place, so read back what it
+        # now serves for (version, target) and compare with the wheel we signed.
+        env:
+          BITS_CHANGED_REGISTRY_BASE: ${{ vars.REGISTRY_URL || 'https://api.registry.ciris-services-1.ai' }}
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          declare -A ARTDIR_OF=(
+            ["x86_64-unknown-linux-gnu"]="ciris_persist-wheel-linux-x86_64"
+            ["aarch64-unknown-linux-gnu"]="ciris_persist-wheel-linux-aarch64"
+            ["aarch64-apple-darwin"]="ciris_persist-wheel-darwin-aarch64"
+            ["x86_64-pc-windows-msvc"]="ciris_persist-wheel-windows-x86_64"
+          )
+          while IFS= read -r TARGET; do
+            [ -z "$TARGET" ] && continue
+            scripts/bits_changed.sh --after-publish "$VERSION" "$TARGET" "dist/wheels/${ARTDIR_OF[$TARGET]}" \
+              || { echo "::error::registered row for ${VERSION}/${TARGET} does not carry this run's wheel"; exit 1; }
+          done < dist/signed-binary-targets.txt
       - uses: actions/upload-artifact@v7
         with:
           name: ciris-persist-build-manifest-${{ steps.version.outputs.version }}
