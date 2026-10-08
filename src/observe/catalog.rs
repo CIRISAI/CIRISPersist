@@ -43,6 +43,23 @@ pub struct CatalogEntry {
     pub description: &'static str,
 }
 
+impl CatalogEntry {
+    /// The [`metrics::Unit`] [`super::emit_metrics`] describes this entry with:
+    /// `By` is [`metrics::Unit::Bytes`], and a UCUM annotation (`{row}`,
+    /// `{read}`, `{call}`) is a dimensionless count, [`metrics::Unit::Count`].
+    /// `None` for a unit this map does not know; I553 fails on any catalogued
+    /// entry that maps to `None`, so a new unit is mapped before it ships.
+    pub(crate) fn metrics_unit(&self) -> Option<metrics::Unit> {
+        match self.unit {
+            "By" => Some(metrics::Unit::Bytes),
+            u if u.len() > 2 && u.starts_with('{') && u.ends_with('}') => {
+                Some(metrics::Unit::Count)
+            }
+            _ => None,
+        }
+    }
+}
+
 /// The `backend` label key.
 pub const LABEL_BACKEND: &str = "backend";
 /// The `door` label key.
