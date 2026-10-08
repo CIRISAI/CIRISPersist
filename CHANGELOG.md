@@ -200,7 +200,8 @@ Persist's side follows.
   fetch-reuse, sign, preflight, register, roundtrip and read-back. ci.yml's `build-manifest`
   job and the new workflow both call it.
 - **Remediation.** `.github/workflows/reregister-manifests.yml` takes `versions`, `targets`
-  (default all five), `mode` and `dry_run`.
+  (default all five), `mode` (default `check`) and `dry_run` (default `true`). A dispatch with
+  the defaults writes nothing. Check first, then repost the MISMATCH rows with `dry_run: false`.
   - `mode: check`, the default, writes nothing. Per row it prints the registered hash beside
     the release's own: the wheel from the tag run's artifact, selected by version, or the tree
     recomputed from the tag. Each row is MATCH, MISMATCH or NOROW.

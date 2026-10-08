@@ -144,21 +144,31 @@ CIRISRegistry keys manifest rows by (project, version, target) and upserts them 
 
 The wheels exist only as each tag run's `ciris_persist-wheel-<label>` artifacts. PyPI publishing stopped at 22.0.1 (#615), and the GitHub release carries only the iOS and Android tarballs.
 
-1. **Check, writing nothing.** Dispatch `Re-register manifests` with `mode: check` (the default) and the versions:
+The rule is check first. A dispatch with the defaults (`mode: check`, `dry_run: true`, all five targets) writes nothing.
+
+1. **The first dispatch is always the check pass,** over every affected version and all five targets:
    ```
-   gh workflow run reregister-manifests.yml -f versions="53.0.1 53.1.0 53.1.8" -f mode=check
+   gh workflow run reregister-manifests.yml \
+     -f versions="53.0.1 53.1.0 53.1.1 53.1.2 53.1.3 53.1.4 53.1.5 53.1.6 53.1.7 53.1.8"
    ```
-   `targets` defaults to all five. Per (version, target), the run prints the registered `binary_hash` beside the local hash, with `MATCH`, `MISMATCH` or `NOROW`.
+   Per (version, target), the run prints the registered `binary_hash` beside the local hash, with `MATCH`, `MISMATCH` or `NOROW`.
    - A wheel's local hash is the sha256 of that version's wheel. It is selected by version from the tag run's artifact. The tag run is the newest CI push run of `v<version>` with unexpired wheel artifacts.
-   - `python-source-tree`'s local hash is recomputed from the tag's own tree, with the tag job's walk and a throwaway keypair. The hash does not depend on the key.
+   - `python-source-tree`'s local hash is recomputed from the version's tag exactly as the tag job signs it, with `ciris-build-sign sign --tree python/ --tree-include ciris_persist` and the same exemptions, using a throwaway keypair. The tree hash does not depend on the key. It is compared with the registered `binary_hash` like any other row.
    - The table is in the step summary and in each version's `manifests-check-<v>` artifact.
-2. **Snapshot every MISMATCH row and commit it.** The snapshot is the only record of what is overwritten.
+2. **Snapshot every MISMATCH row and commit it.** The snapshot is the only record of what is overwritten. The 11 pairs known from #1029 are already committed.
    ```
    scripts/snapshot_manifests.sh <version> <target>...
    git add evidence/manifest_remediation/<version>/ && git commit
    ```
    The script refuses to overwrite an existing snapshot (exit 4). It writes nothing for a pair whose reads are not all 200 (exit 5).
-3. **Repost.** Merge the snapshots, then dispatch `mode: repost` from a ref that has them, with `dry_run=true` first. That run stops at `ciris-build-sign register --dry-run` and posts nothing. A repost re-posts only the MISMATCH rows. It refuses a MISMATCH row with no committed `<version>/<target>.function.json`, or whose live row no longer carries that snapshot's `binary_hash`.
+3. **Repost** only the versions and targets that showed MISMATCH, with `mode: repost` and `dry_run: false`, from a ref that has the snapshots. A repost left at `dry_run: true` stops at `ciris-build-sign register --dry-run`. For #1029 the expected command is:
+   ```
+   gh workflow run reregister-manifests.yml -f mode=repost -f dry_run=false \
+     -f versions="53.0.1 53.1.0 53.1.1 53.1.2 53.1.3 53.1.4 53.1.5 53.1.6 53.1.7" -f targets="x86_64-pc-windows-msvc"
+   gh workflow run reregister-manifests.yml -f mode=repost -f dry_run=false \
+     -f versions="53.1.8" -f targets="aarch64-unknown-linux-gnu x86_64-pc-windows-msvc"
+   ```
+   Use the check pass's table, not this list, if they differ. Within the targets given, a repost re-signs only the rows its own check step finds MISMATCH. Any target, `python-source-tree` included, is re-signed only on MISMATCH. It refuses a MISMATCH row with no committed `<version>/<target>.function.json`, or whose live row no longer carries that snapshot's `binary_hash`.
    - The MISMATCH targets are re-signed after `bits_changed.sh` checks 1 to 4.
    - Every other target is re-posted unchanged. First its manifest is checked against its wheel, or against the tag's tree. `register` writes one `binary_manifests` map per version, so a partial re-post would drop the rest.
    - `register` also rewrites every target's `builds` row. The run therefore saves its own copy of all five live rows first, in the `manifests-repost-<v>` artifact.
