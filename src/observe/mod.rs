@@ -361,10 +361,16 @@ pub fn snapshot() -> TelemetrySnapshot {
 /// current value (`Counter::absolute`). A host calls it when it scrapes. With
 /// no recorder installed every call is a no-op, and the read path never
 /// touches the facade: these counters stay the one source, and a recorder sees
-/// exactly what [`snapshot`] reads.
+/// exactly what [`snapshot`] reads. Each counter is described with its
+/// catalogued unit (`By` as bytes, `{row}`/`{read}`/`{call}` as a count): the
+/// two-argument `describe_counter!` forwards no unit, and the exported metadata
+/// then contradicted the catalogue (Codex round 2 on PR #1039).
 pub fn emit_metrics() {
     for entry in catalog::TELEMETRY_CATALOG {
-        metrics::describe_counter!(entry.name, entry.description);
+        match entry.metrics_unit() {
+            Some(unit) => metrics::describe_counter!(entry.name, unit, entry.description),
+            None => metrics::describe_counter!(entry.name, entry.description),
+        }
     }
     for sample in snapshot().samples() {
         let labels: Vec<metrics::Label> = sample

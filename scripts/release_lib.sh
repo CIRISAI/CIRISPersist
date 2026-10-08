@@ -95,6 +95,39 @@ rl_get() { [ -f "$1/$2" ] && cat "$1/$2"; }
 
 # A stage that certifies a COMMIT (cheap legs, certify, PR CI) records the
 # sha it passed on, and is done only while that sha is still HEAD.
+# rl_resume_check <state-dir> <version> <branch>: resumed state must belong to
+# THIS attempt (Codex round 2 on PR #1039). Preflight records the branch and
+# bump records the release commit; on every resume the branch must match, and
+# once bumped, the release commit must be in HEAD's history, Cargo.toml must be
+# at <version> and the CHANGELOG header dated. Exit 32 with one line of reason
+# and how to clear; 0 (with a line naming the binding) otherwise, or when no
+# stage has completed yet.
+rl_resume_check() {
+    local S="$1" ver="$2" branch="$3" want sha cv
+    [ -f "$S/preflight.done" ] || return 0
+    want="$(rl_get "$S" branch)"
+    if [ -z "$want" ]; then
+        echo "RESUME: $S records no branch (state from before the binding, or hand-made) — if it is this attempt's, bind it: echo $branch > $S/branch$([ -f "$S/bump.done" ] && echo "; git rev-parse <release commit> > $S/bump_sha"); else clear it: rm -rf $S"
+        return 32
+    fi
+    [ "$want" = "$branch" ] || { echo "RESUME: $S belongs to branch '$want', not '$branch' — switch back to '$want', or clear it: rm -rf $S"; return 32; }
+    if [ -f "$S/bump.done" ]; then
+        sha="$(rl_get "$S" bump_sha)"
+        [ -n "$sha" ] || { echo "RESUME: bump is marked done in $S but no release commit is recorded — if HEAD's history has it, bind it: git rev-parse <release commit> > $S/bump_sha; else clear it: rm -rf $S"; return 32; }
+        git merge-base --is-ancestor "$sha" HEAD 2>/dev/null \
+            || { echo "RESUME: the release commit ${sha:0:12} recorded in $S is not an ancestor of HEAD (reset, rebased or another attempt) — clear it: rm -rf $S"; return 32; }
+        cv="$(grep -m1 '^version = "' Cargo.toml | sed -E 's/version = "([^"]+)"/\1/')"
+        [ "$cv" = "$ver" ] || { echo "RESUME: bump is done in $S but Cargo.toml is at $cv, not $ver — clear it: rm -rf $S"; return 32; }
+        grep -qE "^## \[${ver//./\\.}\] - [0-9]{4}-[0-9]{2}-[0-9]{2}\$" CHANGELOG.md \
+            || { echo "RESUME: bump is done in $S but CHANGELOG has no dated '## [$ver] - YYYY-MM-DD' header — clear it: rm -rf $S"; return 32; }
+    fi
+    if [ -n "${sha:-}" ]; then
+        echo "resume: $S bound to $branch, release commit ${sha:0:7} in the history of HEAD, Cargo.toml $ver, CHANGELOG dated"
+    else
+        echo "resume: $S bound to $branch"
+    fi
+}
+
 rl_mark_at() { printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$3" > "$1/$2.done"; }
 rl_done_at() { [ -f "$1/$2.done" ] && [ "$(cut -d' ' -f2 "$1/$2.done")" = "$3" ]; }
 

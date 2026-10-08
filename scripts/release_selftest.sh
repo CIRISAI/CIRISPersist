@@ -280,6 +280,120 @@ if [ "$(_l '"--- stage prci"')" -lt "$(_l '"--- stage codex"')" ] && [ "$(_l '"-
 grep -q 'rl_done_at "$S" codex "$(head_sha)"' scripts/release.sh && ok "the codex marker is keyed to HEAD's sha" || bad "the codex marker is not keyed to HEAD"
 grep -q 'for st in preflight cheap bump pr certify prci codex ship' scripts/release.sh && ok "--dry-run lists the codex stage" || bad "--dry-run does not list the codex stage"
 
+echo "release_ship.sh local tag annotation"
+# A re-run that finds v<version> locally at the merge sha must also find the
+# CHANGELOG section's bytes in it: a stale or hand-written annotation was
+# accepted, pushed, and became the release body (Codex on PR #1039). A stub
+# `gh` reports PR 9 merged at the fixture's HEAD with a green PR run, main's
+# push run visible, and tag run 42; origin is a local bare repo.
+RS="$PWD/scripts/release_ship.sh"
+mkdir -p "$t/rs/bin"
+cat > "$t/rs/bin/gh" <<'GHEOF'
+#!/usr/bin/env bash
+case "$*" in
+  "repo view"*) echo o/r;;
+  *".head.sha"*|*".merge_commit_sha"*) cat "$RS_HEAD";;
+  *".merged"*) echo true;;
+  "run list"*databaseId*) echo 42;;
+  "run list"*) echo completed/success;;
+  *) exit 1;;
+esac
+GHEOF
+chmod +x "$t/rs/bin/gh"
+rs_fixture() {  # <name>: a clone whose HEAD carries CHANGELOG [9.9.0] and the lib
+    (
+        set -e
+        export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t
+        git init -q --bare -b main "$t/rs/$1.git"
+        git init -q -b main "$t/rs/$1"; cd "$t/rs/$1"
+        mkdir scripts; cp "$OLDPWD/scripts/release_lib.sh" scripts/; cp "$t/CHANGELOG.md" .
+        git add -A; git commit -q -m one
+        git remote add origin "$t/rs/$1.git"; git push -q origin HEAD:refs/heads/main
+        git rev-parse HEAD > "$t/rs/$1.head"
+    )
+}
+rs() {  # <name>
+    : > "$t/rs/body"
+    out="$(cd "$t/rs/$1" && PATH="$t/rs/bin:$PATH" RS_HEAD="$t/rs/$1.head" bash "$RS" 9 9.9.0 "$(cut -c1-7 "$t/rs/$1.head")" subj "$t/rs/body" 2>&1)"; rc=$?
+    [ -n "${RS_DEBUG:-}" ] && printf '[%s rc=%s]\n%s\n' "$1" "$rc" "$out"
+}
+rs_fixture fresh; rs fresh
+expect_eq "ship: no local tag: cut, pushed, tag run printed (exit 0)" "$rc" "0"
+if [ "$(git -C "$t/rs/fresh" ls-remote origin refs/tags/v9.9.0 | cut -f1)" = "$(git -C "$t/rs/fresh" rev-parse refs/tags/v9.9.0)" ]; then ok "ship: the cut tag is on origin"; else bad "ship: the cut tag is not on origin"; fi
+rs_fixture rerun; ( cd "$t/rs/rerun" && rl_changelog_section CHANGELOG.md 9.9.0 > "$t/rs/sec.md" && git -c user.name=t -c user.email=t@t tag -a v9.9.0 --cleanup=verbatim -F "$t/rs/sec.md" HEAD ); rs rerun
+expect_eq "ship: a re-run with the CHANGELOG's own annotation is accepted (exit 0)" "$rc" "0"
+rs_fixture stale; git -C "$t/rs/stale" -c user.name=t -c user.email=t@t tag -a v9.9.0 -m "a hand-written annotation that is long enough to pass a byte-count check, because it pads itself out with words and more words and more words and still more words until it is longer than the section" HEAD; rs stale
+expect_eq "ship: a stale local annotation at the right sha is refused (exit 11)" "$rc" "11"
+case "$out" in *"git tag -d v9.9.0"*) ok "ship: the refusal says how to clear it";; *) bad "ship: refusal text: $out";; esac
+if git -C "$t/rs/stale" ls-remote --exit-code origin refs/tags/v9.9.0 >/dev/null; then bad "ship: the stale tag was pushed"; else ok "ship: the stale tag was not pushed"; fi
+rs_fixture light; git -C "$t/rs/light" tag v9.9.0 HEAD; rs light
+expect_eq "ship: a lightweight local tag is refused (exit 11)" "$rc" "11"
+
+echo "release.sh resume binding"
+# .release/<ver> is bound to the branch it was started on and to the release
+# commit bump made: resumed state from an abandoned attempt on another branch,
+# or on a branch reset past the bump, skipped preflight and the bump and
+# shipped the old version (Codex round 2 on PR #1039). The fixture is a repo
+# holding this checkout's release.sh, lib, feature matrix inputs, Cargo.toml
+# and CHANGELOG; --dry-run and a refused run reach no cargo stage.
+RB="$t/rb"; mkdir -p "$RB/scripts" "$RB/.github/workflows"
+cp scripts/release.sh scripts/release_lib.sh scripts/ci_feature_matrix.py "$RB/scripts/"
+cp Cargo.toml pyproject.toml CHANGELOG.md "$RB/"; cp .github/workflows/ci.yml "$RB/.github/workflows/"
+printf '/.release/\n__pycache__/\n' > "$RB/.gitignore"
+RV="$(grep -m1 '^version = "' Cargo.toml | sed -E 's/version = "([^"]+)"/\1/')"
+rbg() { git -C "$RB" -c user.name=t -c user.email=t@t "$@"; }
+(
+    set -e
+    git init -q -b main "$RB"
+    rbg add -A; rbg commit -q -m base
+    rbg checkout -q -b "release-$RV"
+    echo bumped > "$RB/BUMPED"; rbg add -A; rbg commit -q -m "release(v$RV): fixture bump"
+) || bad "resume fixture repo"
+RBS="$RB/.release/$RV"
+rb_state() {  # <branch-recorded> <bump-sha-recorded>; empty = not recorded
+    rm -rf "$RBS"; mkdir -p "$RBS"; rl_mark "$RBS" preflight; rl_mark "$RBS" bump
+    [ -z "$1" ] || rl_put "$RBS" branch "$1"
+    [ -z "$2" ] || rl_put "$RBS" bump_sha "$2"
+}
+# A refused run must stop before any stage; if it does not, these shims stop
+# it — the self-test never reaches a real cargo, git push or gh.
+mkdir -p "$t/rb-bin"
+for c in cargo gh; do printf '#!/bin/sh\necho "SHIM: %s reached: $*" >&2; exit 99\n' "$c" > "$t/rb-bin/$c"; chmod +x "$t/rb-bin/$c"; done
+rb() { out="$(cd "$RB" && PATH="$t/rb-bin:$PATH" bash scripts/release.sh "$@" 2>&1)"; rc=$?; [ -n "${RS_DEBUG:-}" ] && printf '[rb rc=%s]\n%s\n' "$rc" "$out"; }
+BUMP="$(rbg rev-parse HEAD)"
+rb_state "release-$RV" "$BUMP"; rb --dry-run "$RV"
+expect_eq "resume: same branch, bump in history, dry-run accepted" "$rc" "0"
+case "$out" in *"resume: .release/$RV bound to release-$RV"*) ok "resume: dry-run names the binding";; *) bad "resume: dry-run output: $out";; esac
+rbg checkout -q -b other-attempt
+rb --dry-run "$RV"
+expect_eq "resume: state from another branch is refused (dry-run, 32)" "$rc" "32"
+rb "$RV"
+expect_eq "resume: state from another branch is refused (run, 32)" "$rc" "32"
+case "$out" in *"belongs to branch 'release-$RV', not 'other-attempt'"*"rm -rf .release/$RV"*) ok "resume: the refusal names both branches and how to clear";; *) bad "resume: refusal text: $out";; esac
+case "$out" in *"--- stage"*|*"SHIM:"*) bad "resume: a refused run reached a stage";; *) ok "resume: a refused run reached no stage";; esac
+rbg checkout -q "release-$RV"; rbg reset -q --hard HEAD~1
+rb --dry-run "$RV"
+expect_eq "resume: branch reset past the release commit is refused (32)" "$rc" "32"
+case "$out" in *"not an ancestor of HEAD"*) ok "resume: says the release commit left HEAD's history";; *) bad "resume: reset text: $out";; esac
+rbg reset -q --hard "$BUMP"
+sed -i -E "0,/^version = \"[^\"]+\"/s//version = \"0.0.1\"/" "$RB/Cargo.toml"; rbg commit -q -am "an older version"
+rb --dry-run "$RV"
+expect_eq "resume: Cargo.toml not at the version is refused (32)" "$rc" "32"
+rbg reset -q --hard "$BUMP"
+sed -i -E "s/^## \[$RV\] - [0-9-]+\$/## [$RV] - UNRELEASED/" "$RB/CHANGELOG.md"; rbg commit -q -am "undated"
+rb --dry-run "$RV"
+expect_eq "resume: CHANGELOG header not dated is refused (32)" "$rc" "32"
+rbg reset -q --hard "$BUMP"
+rb_state "" ""; rb --dry-run "$RV"
+expect_eq "resume: unbound (pre-binding) state is refused (32)" "$rc" "32"
+case "$out" in *"echo release-$RV > .release/$RV/branch"*) ok "resume: unbound state says how to bind it by hand";; *) bad "resume: unbound text: $out";; esac
+rb_state "release-$RV" ""; rb --dry-run "$RV"
+expect_eq "resume: bump done with no release commit recorded is refused (32)" "$rc" "32"
+# shellcheck disable=SC2016  # literal: grep text, not an expansion
+grep -q 'rl_put "$S" branch "$branch"' scripts/release.sh && ok "release.sh records the branch at preflight" || bad "release.sh does not record the branch"
+# shellcheck disable=SC2016  # literal: grep text, not an expansion
+grep -q 'rl_put "$S" bump_sha "$(head_sha)"' scripts/release.sh && ok "release.sh records the release commit at bump" || bad "release.sh does not record the release commit"
+
 echo "syntax"
 for f in scripts/release.sh scripts/release_ship.sh scripts/release_finish.sh scripts/release_lib.sh scripts/release_selftest.sh; do
     if bash -n "$f"; then ok "bash -n $f"; else bad "bash -n $f"; fi

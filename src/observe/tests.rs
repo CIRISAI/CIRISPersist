@@ -384,6 +384,22 @@ async fn i553_emit_metrics_writes_exactly_the_catalogue() {
         })
         .await;
     }
+    // Every catalogued unit maps to a metrics::Unit: a `None` would describe
+    // that counter with no unit, silently.
+    for entry in TELEMETRY_CATALOG {
+        let want = match entry.unit {
+            "By" => metrics::Unit::Bytes,
+            "{read}" | "{row}" | "{call}" => metrics::Unit::Count,
+            other => panic!("I553 {}: unit {other:?} has no mapping here", entry.name),
+        };
+        assert_eq!(
+            entry.metrics_unit(),
+            Some(want),
+            "I553 {}: unit {:?}",
+            entry.name,
+            entry.unit
+        );
+    }
     let recorder = DebuggingRecorder::new();
     let snapshotter = recorder.snapshotter();
     metrics::with_local_recorder(&recorder, super::emit_metrics);
@@ -391,7 +407,7 @@ async fn i553_emit_metrics_writes_exactly_the_catalogue() {
     // (name, sorted labels) → value, on both sides.
     type Series = BTreeMap<(String, Vec<(String, String)>), u64>;
     let mut emitted = Series::new();
-    for (key, _unit, description, value) in snapshotter.snapshot().into_vec() {
+    for (key, unit, description, value) in snapshotter.snapshot().into_vec() {
         let key = key.key();
         let name = key.name().to_owned();
         let entry = TELEMETRY_CATALOG
@@ -402,6 +418,14 @@ async fn i553_emit_metrics_writes_exactly_the_catalogue() {
             description.as_ref().map(|d| d.to_string()).as_deref(),
             Some(entry.description),
             "I553 {name}: description"
+        );
+        // The recorder sees the catalogued unit, mapped: `By` as bytes, a
+        // `{...}` annotation as a count (Codex round 2 on PR #1039).
+        assert_eq!(
+            unit,
+            entry.metrics_unit(),
+            "I553 {name}: unit (catalogue {:?})",
+            entry.unit
         );
         let DebugValue::Counter(v) = value else {
             panic!("I553 {name}: not a counter: {value:?}")

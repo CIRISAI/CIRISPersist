@@ -163,9 +163,9 @@ The rule is check first. A dispatch with the defaults (`mode: check`, `dry_run: 
    - A wheel's local hash is the sha256 of that version's wheel. It is selected by version from the tag run's artifact. The tag run is the newest CI push run of `v<version>` with unexpired wheel artifacts.
    - `python-source-tree`'s local hash is recomputed from the version's tag exactly as the tag job signs it, with `ciris-build-sign sign --tree python/ --tree-include ciris_persist` and the same exemptions, using a throwaway keypair. The tree hash does not depend on the key. It is compared with the registered `binary_hash` like any other row.
    - The table is in the step summary and in each version's `manifests-check-<v>` artifact.
-2. **Snapshot every MISMATCH row and commit it.** The snapshot is the only record of what is overwritten. The 11 pairs known from #1029 are already committed.
+2. **Snapshot all five targets of every version you will repost, and commit them.** The snapshot is the only record of what is overwritten. `register` rewrites all five targets of a version, not only the MISMATCH ones, so the repost refuses a version unless all five are committed. The 11 MISMATCH pairs known from #1029 are already committed. The other targets of those versions are not yet.
    ```
-   scripts/snapshot_manifests.sh <version> <target>...
+   scripts/snapshot_manifests.sh <version> python-source-tree x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu aarch64-apple-darwin x86_64-pc-windows-msvc
    git add evidence/manifest_remediation/<version>/ && git commit
    ```
    The script refuses to overwrite an existing snapshot (exit 4). It writes nothing for a pair whose reads are not all 200 (exit 5).
@@ -176,15 +176,15 @@ The rule is check first. A dispatch with the defaults (`mode: check`, `dry_run: 
    gh workflow run reregister-manifests.yml -f mode=repost -f dry_run=false \
      -f versions="53.1.8" -f targets="aarch64-unknown-linux-gnu x86_64-pc-windows-msvc"
    ```
-   Use the check pass's table, not this list, if they differ. Within the targets given, a repost re-signs only the rows its own check step finds MISMATCH. Any target, `python-source-tree` included, is re-signed only on MISMATCH. It refuses a MISMATCH row with no committed `<version>/<target>.function.json`, or whose live row no longer carries that snapshot's `binary_hash`.
+   Use the check pass's table, not this list, if they differ. Within the targets given, a repost re-signs only the rows its own check step finds MISMATCH. Any target, `python-source-tree` included, is re-signed only on MISMATCH. It refuses a version unless all five targets have committed snapshots and every live row, compared whole as canonical JSON, still equals its snapshot.
    - The MISMATCH targets are re-signed after `bits_changed.sh` checks 1 to 4.
-   - Every other target is re-posted unchanged. First its manifest is checked against its wheel, or against the tag's tree. `register` writes one `binary_manifests` map per version, so a partial re-post would drop the rest.
+   - Every other target is re-posted unchanged, from the registry's live build-manifest read, never from the tag run's artifact. That fetched body must equal the committed snapshot, and its manifest is checked against its wheel or against the tag's tree. `register` writes one `binary_manifests` map per version, so a partial re-post would drop the rest.
    - `register` also rewrites every target's `builds` row. The run therefore saves its own copy of all five live rows first, in the `manifests-repost-<v>` artifact.
    - Rows go through `POST /v1/builds` and `POST /v1/verify/build-manifest`, never the legacy function-manifest path. Then come the round-trip and `bits_changed.sh --after-publish` on all five targets.
 4. Run `scripts/verify_release.sh <v> <tag-run-id>`. Every `bits (registered)` line should read `ok`.
 
 **Where the bytes come from.** Each run prints which path it took.
 - **Wheels:** the tag run's artifact. When that artifact has expired after 90 days, the `rebuild` job builds the wheel from the tag in `pyo3-wheel`'s shape, under the tag's `rust-toolchain.toml`. The registration notes then say SAME-VERSION REBUILD, which CC 3.1.2.1 treats as a `supersedes`. Rebuilt bytes are not the released bytes, and they live only in that run's artifacts.
-- **PersistExtras and the unchanged manifests:** the tag run's `ciris-persist-build-manifest-<v>` artifact. When it has expired, they come from the registry itself: `GET /v1/verify/build-manifest` serves the posted manifest byte for byte, and its `extras` re-signs to the same `manifest_hash`.
+- **PersistExtras and the unchanged manifests:** the registry itself, always. `GET /v1/verify/build-manifest` serves the posted manifest byte for byte, and its `extras` re-signs to the same `manifest_hash`. The tag run's `ciris-persist-build-manifest-<v>` artifact is not used: it can be older than the live row, and re-posting it would overwrite a newer one.
 
 The workflow uses the tag job's secrets for `repost` only, and adds none.
