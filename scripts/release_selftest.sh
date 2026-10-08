@@ -217,6 +217,69 @@ case "$notes" in *REMOTE*) ok "equal local tag: origin's annotation is published
 rf notag
 expect_eq "an unfetchable tag is refused (exit 19), not hidden" "$rc" "19"
 
+echo "codex review gate (rl_codex_review, stub gh)"
+# A stub `gh api --paginate <path>` serves $CX/<path with / as _>.json. HEAD is
+# h…, an older pushed head is o…. Waits are seconds here (CODEX_*_SECS).
+export CX="$t/cx"; mkdir -p "$CX/bin"
+cat > "$CX/bin/gh" <<'GHEOF'
+#!/usr/bin/env bash
+[ "$1" = api ] || exit 1
+for a in "$@"; do p="$a"; done
+f="$CX/$(printf '%s' "${p%%\?*}" | tr '/' '_').json"
+[ -f "$f" ] && cat "$f" || echo '[]'
+GHEOF
+chmod +x "$CX/bin/gh"
+H=1111111aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa; O=2222222bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+BOT='chatgpt-codex-connector[bot]'
+cx_reset() { rm -f "$CX"/*.json; }
+cx_review() {  # <id> <commit>
+    # shellcheck disable=SC2016  # literal: python / jq / grep text, expanded by them
+    python3 -I -c 'import json,sys,os; f=sys.argv[1]; a=json.load(open(f)) if os.path.exists(f) else []
+a.append({"id":int(sys.argv[2]),"commit_id":sys.argv[3],"user":{"login":sys.argv[4]},"body":"**Reviewed commit:** `"+sys.argv[3][:10]+"`"}); json.dump(a,open(f,"w"))' \
+        "$CX/repos_o_r_pulls_9_reviews.json" "$1" "$2" "$BOT"
+}
+cx_comment() {  # <review-id> <original_commit> <commit> <path> <line> <title> [login]
+    python3 -I -c 'import json,sys,os; f=sys.argv[1]; a=json.load(open(f)) if os.path.exists(f) else []
+a.append({"pull_request_review_id":int(sys.argv[2]),"original_commit_id":sys.argv[3],"commit_id":sys.argv[4],"path":sys.argv[5],"line":int(sys.argv[6]),
+"user":{"login":sys.argv[8]},"body":"**<sub><sub>![P2 Badge](https://x/y.svg)</sub></sub>  "+sys.argv[7]+"**\n\nmore text"}); json.dump(a,open(f,"w"))' \
+        "$CX/repos_o_r_pulls_9_comments.json" "$1" "$2" "$3" "$4" "$5" "$6" "${7:-$BOT}"
+}
+cx_summary() {  # <commit7> <status word>
+    # shellcheck disable=SC2016  # literal: python / jq / grep text, expanded by them
+    printf '[{"user":{"login":"%s"},"body":"<!-- codex-pull-request-review-summary -->\\n\\n| Review | Status | Commit |\\n| --- | --- | --- |\\n| Code Review | %s | `%s` |"}]' \
+        "$BOT" "$2" "$1" > "$CX/repos_o_r_issues_9_comments.json"
+}
+cx() { out="$(PATH="$CX/bin:$PATH" CODEX_TIMEOUT_SECS=2 CODEX_POLL_SECS=1 rl_codex_review o/r 9 "$H" 2>&1)"; rc=$?; }
+
+cx_reset; cx_review 100 "$H"; cx
+expect_eq "codex: a clean review of HEAD passes" "$rc" "0"
+cx_reset; cx_summary 1111111 "✅ **Completed**"; cx
+expect_eq "codex: a Completed summary row for HEAD (clean pass, no review) passes" "$rc" "0"
+cx_reset; cx_review 50 "$O"; cx_comment 50 "$O" "$O" src/a.rs 3 "old finding"; cx_summary 2222222 "✅ **Completed**"; cx
+expect_eq "codex: a review of an OLDER head only times out (31)" "$rc" "31"
+case "$out" in *"no review of 1111111 yet"*) ok "codex: it kept polling for HEAD";; *) bad "codex: did not poll: $out";; esac
+cx_reset; cx_summary 1111111 "⏳ **In progress**"; cx
+expect_eq "codex: an In-progress row for HEAD keeps waiting (31)" "$rc" "31"
+cx_reset; cx_review 100 "$H"; cx_comment 100 "$H" "$H" scripts/x.sh 26 "Preserve regex escapes passed to awk"; cx
+expect_eq "codex: a finding on HEAD stops with 30" "$rc" "30"
+case "$out" in *"scripts/x.sh:26  Preserve regex escapes passed to awk"*"fix, commit, re-run the same command"*) ok "codex: prints path:line, the finding's first line, and what to do";;
+    *) bad "codex: finding output: $out";; esac
+cx_reset; cx_review 50 "$O"; cx_review 100 "$H"; cx_comment 50 "$O" "$H" src/a.rs 3 "old finding re-anchored to HEAD"; cx
+expect_eq "codex: an OLDER head's finding whose commit_id moved to HEAD does not block" "$rc" "0"
+cx_reset; cx_review 100 "$H"; cx_comment 7 "$H" "$H" src/a.rs 3 "a human's comment" someone; cx
+expect_eq "codex: a non-Codex comment on HEAD does not block" "$rc" "0"
+cx_reset; cx_summary 1111111 "✅ **Completed**"; cx_comment 100 "$H" "$H" src/b.rs 9 "finding with no review object seen"; cx
+expect_eq "codex: summary says HEAD done, a finding on HEAD still stops (30)" "$rc" "30"
+
+echo "release.sh codex stage"
+expect_eq "--skip-codex is a known flag" "$(scripts/release.sh --skip-codex 1.2 2>&1 | grep -c 'unknown flag')" "0"
+_l() { grep -n "$1" scripts/release.sh | head -1 | cut -d: -f1; }
+if [ "$(_l '"--- stage prci"')" -lt "$(_l '"--- stage codex"')" ] && [ "$(_l '"--- stage codex"')" -lt "$(_l '"--- stage ship"')" ]; then
+    ok "the codex stage runs after prci and before ship"; else bad "the codex stage is not between prci and ship"; fi
+# shellcheck disable=SC2016  # literal: python / jq / grep text, expanded by them
+grep -q 'rl_done_at "$S" codex "$(head_sha)"' scripts/release.sh && ok "the codex marker is keyed to HEAD's sha" || bad "the codex marker is not keyed to HEAD"
+grep -q 'for st in preflight cheap bump pr certify prci codex ship' scripts/release.sh && ok "--dry-run lists the codex stage" || bad "--dry-run does not list the codex stage"
+
 echo "syntax"
 for f in scripts/release.sh scripts/release_ship.sh scripts/release_finish.sh scripts/release_lib.sh scripts/release_selftest.sh; do
     if bash -n "$f"; then ok "bash -n $f"; else bad "bash -n $f"; fi

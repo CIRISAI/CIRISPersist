@@ -125,3 +125,59 @@ rl_stage() {
     [ "$rc" -eq 0 ] && rl_mark "$dir" "$name"
     return "$rc"
 }
+
+# ── Codex review gate ───────────────────────────────────────────────────
+# rl_codex_review <repo> <pr> <head-sha> — wait for chatgpt-codex-connector's
+# review of <head-sha> and refuse to ship over its findings. Returns:
+#   0  Codex reviewed <head-sha> and left no inline finding on it
+#   30 Codex left findings on <head-sha> (each printed as path:line + first line)
+#   31 no review of <head-sha> arrived within CODEX_TIMEOUT_SECS (default 1800);
+#      the CALLER fails open, loudly — Codex is an external service
+#
+# v53.2.0: the chain would have merged and tagged ~10 min after Codex posted
+# six findings on PR #1039; it was stopped by hand.
+#
+# "Reviewed <head>" is either a review by the bot whose commit_id is <head>
+# (its body reads "**Reviewed commit:** `<sha prefix>`"), or the bot's summary
+# issue comment (`<!-- codex-pull-request-review-summary -->`) showing a
+# Completed row for `<head7>`: a clean pass posts no review, only a 👍 and that
+# row. A review of an OLDER head does not count: Codex re-reviews each push.
+#
+# A finding is a bot inline comment whose ORIGINAL commit is <head>, or that
+# belongs to a bot review of <head>. Not `commit_id == head`: GitHub moves a
+# comment's commit_id forward to the newest head while its line is unchanged,
+# so already-fixed findings from an older head would block forever.
+RL_CODEX_BOT="chatgpt-codex-connector[bot]"
+rl_codex_review() {
+    local repo="$1" pr="$2" head="$3" h7="${3:0:7}" waited=0 limit="${CODEX_TIMEOUT_SECS:-1800}"
+    local poll="${CODEX_POLL_SECS:-60}" reviews summary ids found
+    while :; do
+        reviews="$(gh api --paginate "repos/$repo/pulls/$pr/reviews" 2>/dev/null | jq -s 'add // []' 2>/dev/null)" || reviews="[]"
+        ids="$(jq -c --arg b "$RL_CODEX_BOT" --arg h "$head" \
+            '[.[] | select(.user.login == $b and .commit_id == $h) | .id]' <<<"${reviews:-[]}" 2>/dev/null)" || ids="[]"
+        summary="$(gh api --paginate "repos/$repo/issues/$pr/comments" 2>/dev/null | jq -s 'add // []' 2>/dev/null \
+            | jq -r --arg b "$RL_CODEX_BOT" --arg h7 "\`$h7\`" \
+                '[.[] | select(.user.login == $b and (.body | contains("<!-- codex-pull-request-review-summary -->")))
+                  | .body | split("\n")[] | select(contains($h7) and contains("Completed"))] | length' 2>/dev/null)" || summary=0
+        if [ "${ids:-[]}" != "[]" ] || [ "${summary:-0}" -gt 0 ]; then
+            found="$(gh api --paginate "repos/$repo/pulls/$pr/comments" 2>/dev/null | jq -s 'add // []' \
+                | jq -r --arg b "$RL_CODEX_BOT" --arg h "$head" --argjson ids "${ids:-[]}" \
+                    '.[] | select(.user.login == $b and (.original_commit_id == $h or (.pull_request_review_id as $r | $ids | index($r))))
+                     | "\(.path):\(.line // .original_line // "?")  \(.body | split("\n") | map(select(test("[A-Za-z]"))) | .[0] // "" | gsub("<[^>]*>|!\\[[^]]*\\]\\([^)]*\\)|\\*\\*"; "") | sub("^\\s+"; "") | .[0:160])"')" \
+                || { echo "codex: review of ${h7} found, but its inline comments could not be read — retrying"; found="?"; }
+            if [ "$found" != "?" ]; then
+                if [ -n "$found" ]; then
+                    echo "CODEX FINDINGS on ${h7} ($(wc -l <<<"$found")):"
+                    printf '%s\n' "$found" | sed 's/^/  /'
+                    echo "fix, commit, re-run the same command"
+                    return 30
+                fi
+                echo "codex: reviewed ${h7}, no findings"
+                return 0
+            fi
+        fi
+        [ "$waited" -lt "$limit" ] || return 31
+        echo "codex: no review of ${h7} yet ($(( waited / 60 )) of $(( limit / 60 )) min)"
+        sleep "$poll"; waited=$(( waited + poll ))
+    done
+}

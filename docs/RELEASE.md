@@ -3,7 +3,7 @@
 Three checked-in scripts take a release from a written CHANGELOG section to a published GitHub release. No agent or person has to act between their stages.
 
 ```
-scripts/release.sh <version> [--pr-body FILE] [--merge-body FILE]   # stages 1-8, ends at the tag push
+scripts/release.sh <version> [--pr-body FILE] [--merge-body FILE] [--skip-codex]   # stages 1-9, ends at the tag push
 scripts/release_finish.sh <version> <tag-run-id>                    # tag CI → release → release body
 ```
 
@@ -27,8 +27,9 @@ scripts/release_finish.sh <version> <tag-run-id>                    # tag CI →
 | 4 | pr | Pushes the branch if origin differs from HEAD, then opens the PR or reuses the open one, through REST. The body is `--pr-body` or the section. | runs every time (idempotent) |
 | 5 | certify | `LANES=${LANES:-1} scripts/certify.sh full` > `.release/<v>/certify.log`. Green means exit 0 **and** the line `EVERY CI LEG GREEN BY EXIT CODE.` | `certify.done`, **at a sha** |
 | 6 | prci | Waits for the PR's CI run on HEAD (`PRCI_TIMEOUT_MIN`, default 180). Auto-retry reruns are respected (see below). | `prci.done`, **at a sha** |
-| 7 | ship | `release_ship.sh <pr> <version> <head7> "<subject>" <merge-body>`: merge, tag at the merge commit, push the tag once main's run is visible, and print `TAG_RUN_ID`. | `ship.done` + `tag_run` |
-| 8 | stop | Prints `scripts/release_finish.sh <version> <tag-run-id>`. | — |
+| 7 | codex | Waits for `chatgpt-codex-connector[bot]`'s review of HEAD (`CODEX_TIMEOUT_SECS`, default 1800; polled every `CODEX_POLL_SECS`, default 60). Reviewed means a bot review whose `commit_id` is HEAD, or the bot's summary comment showing a Completed row for HEAD's short sha (a clean pass posts no review, only a 👍). A review of an older head does not count. Any bot inline comment made on HEAD (its `original_commit_id`, or it belongs to a bot review of HEAD) stops the release with exit 30 and prints each finding's `path:line` and title. If no review arrives in time, the stage fails OPEN with `::warning::Codex review did not arrive; shipping without it`. `--skip-codex` skips the stage (an operator override, printed loudly). | `codex.done`, **at a sha** |
+| 8 | ship | `release_ship.sh <pr> <version> <head7> "<subject>" <merge-body>`: merge, tag at the merge commit, push the tag once main's run is visible, and print `TAG_RUN_ID`. | `ship.done` + `tag_run` |
+| 9 | stop | Prints `scripts/release_finish.sh <version> <tag-run-id>`. | — |
 
 Then run `release_finish.sh`. It checks that the run id is this tag's CI push run, waits for it (`FINISH_TIMEOUT_MIN`, default 180) and re-runs it if the same-SHA dedup cancelled it. It then waits for the release to exist, sets the body from the annotation of origin's tag (never a local copy; a different local tag is refused), asserts the body is at least the tag body's bytes minus 64, runs `scripts/verify_release.sh` (below), and prints `RELEASE_SHIP_DONE`.
 
@@ -46,11 +47,15 @@ On a push to main, CI's `tree equality (main merges only)` job skips the whole r
 
 v53.1.8's ship script was killed at the harness's 2-hour background cap while tag CI queued on macOS. `release.sh` ends at the tag push. `release_finish.sh` is a separate, re-runnable command, so each half fits under the cap. If either one is killed, run the same command again.
 
+### Why release.sh waits for Codex (CIRISPersist#1039)
+
+On PR #1039 the chain would have merged and tagged v53.2.0 about ten minutes after Codex posted six findings, one of them a P1 that emptied the CHANGELOG cut under gawk. Certify and PR CI were green, and nothing in the chain read the review. It was stopped by hand. The `codex` stage reads it. Findings are keyed to the commit Codex reviewed, not to a comment's current `commit_id`: GitHub moves that forward to the newest head while the line is unchanged, so an old finding that was already fixed would otherwise block every later push. The stage fails open after its timeout because Codex is an external service, and its absence must not hold a release indefinitely. The warning line makes that visible.
+
 ## The resume rule
 
 State lives in `.release/<version>/`, which is git-ignored, so it never dirties the tree. Each completed stage writes `<stage>.done`, and a re-run skips any stage that has one.
 
-Stages 2, 5 and 6 certify a **commit**. Their markers record the sha and count as done only while HEAD is still that sha. After a fix:
+Stages 2, 5, 6 and 7 judge a **commit**. Their markers record the sha and count as done only while HEAD is still that sha. After a fix:
 
 1. commit the fix (never `--amend`; never `--no-verify`);
 2. re-run `scripts/release.sh <version>`.
@@ -76,6 +81,7 @@ PR CI after a failure: `auto-retry.yml` re-runs a first-attempt failure that has
 | 27 | release.sh | `release_ship.sh` failed; its own code is printed and logged in `.release/<v>/ship.log` | see the ship codes below, then re-run `release.sh`. Ship accepts an already-merged PR and an already-cut or pushed tag |
 | 28 | release.sh | the tree is dirty mid-release | commit or stash, re-run |
 | 29 | release.sh | certify exited 3 (INFRA): no leg is RED, but a leg was lost to the machine (disk floor `CERTIFY_MIN_FREE_GB`, a signal, an empty `.rc`, or a leg that never ran). The tree is unjudged | free disk or RAM (or lower `LANES`) and re-run. `scripts/certify.sh verdict` re-prints the table from the existing logs |
+| 30 | release.sh | Codex left inline findings on HEAD. Each is printed as `path:line  title` | fix, commit, re-run the same command. The new push is reviewed again; the stage passes once Codex has reviewed the new HEAD without findings. A finding you decide not to fix needs `--skip-codex`, stated in the PR |
 | 3 | release_ship.sh | the PR head moved, or PR CI is not green | the head moved: let `release.sh` re-certify it |
 | 4 | release_ship.sh | the merge failed after 5 attempts | check the PR's mergeability |
 | 5, 6 | release_ship.sh | main CI red, or it timed out (only when the merge tree differs from the PR head tree) | something landed on main in between. Investigate before tagging |
