@@ -18,7 +18,7 @@ threat-model citations because this crate's audit story is the point.
 - Merging goes through the REST endpoint (`gh pr merge` selects Projects-classic fields over GraphQL, which error on this repo). An already-merged PR and an already-cut or already-pushed tag are accepted, so a killed run can be re-run as is. The merge sha is the PR's `merge_commit_sha`, not `origin/main`'s tip.
 - The comment that explains the ordering keeps the v50 and v51 history and adds the #1008 change.
 
-### Added — `scripts/release.sh`: one command from a written CHANGELOG section to a pushed tag
+### Added — `scripts/release.sh`: one command from a written CHANGELOG section to a pushed tag (#1018)
 
 On v53.1.8, certify was green at about 18:40 and PR CI at 19:02, but the merge happened at 21:49 because nothing chained the two greens to the merge. `scripts/release.sh <version> [--pr-body FILE] [--merge-body FILE]` runs the release as eight stages: preflight, cheap legs, bump commit, push + PR, `certify.sh full`, PR CI wait, ship, then stop with the `release_finish.sh` command.
 
@@ -37,6 +37,113 @@ The test stamped an owner binding to expire 300 ms out, then asserted that `owne
 - `put_lapsing_owner_binding` retries with a fresh binding and twice the window when the read FINISHED after the expiry (up to 6 attempts, 300 ms to 9.6 s). A `None` read that finished while the binding was live still fails, so the precondition still checks that a live binding reads as live. The fixed 400 ms sleep becomes "100 ms past the expiry".
 - Witness `i126_lapsing_binding_survives_a_put_slower_than_its_window` forces the interleaving by stalling the first read longer than the first window.
 - Mutation-checked: no retry (`LAPSE_ATTEMPTS = 1`) reds the witness (`binding lapsed before every read`), and flipping the lapse classification reds it (`owner_of read None … while … live until …`). Under the same 2-CPU, 12-loop load, the fixed test passed 5 of 5. Unloaded on postgres it passed 20 of 20 (1.9–2.7 s per run, real database). No nextest retries were added.
+
+### Changed — one build fingerprint locally: the pre-push hook builds certify's `core` leg; `certify.sh prebuild` (#1010)
+
+The pre-push hook ran `cargo test --features postgres,pyo3,server --lib` with no RUSTFLAGS,
+the release pipeline's pre-certify lanes ran two more feature sets, and certify ran nine under
+`-D warnings`. RUSTFLAGS and the feature set are in every unit's fingerprint, so one machine
+compiled the dependency graph three times per release and certify reused none of it.
+
+- `scripts/ci_env.sh` derives RUSTFLAGS from ci.yml, a leg's feature set from
+  `ci_feature_matrix.py`, and the single-leg thread count. certify.sh and the hook source it.
+- The hook now runs `cargo nextest run --features <core> --lib` under the derived RUSTFLAGS.
+  Its units are the ones certify's `core` leg compiles. A tree too old to derive them skips
+  the gate loudly; it never hand-spells a feature list.
+- `certify.sh prebuild` compiles every leg (`nextest --no-run`), both clippy invocations and
+  the dev wheel, and runs no tests. Use it before the bump commit instead of test lanes. On a
+  cold worktree with `CARGO_BUILD_JOBS=3` it took 46 min: 11 min of fast gates, then 2071 s of
+  leg builds, including 549 s for the wheel. After it, `full` finds every dependency, the clippy units and the wheel
+  warm. The persist lib does not stay warm. `crate-type = ["cdylib", "rlib"]` makes cargo name
+  it without a hash (`deps/libciris_persist.{rlib,so}`), so every feature set shares one output.
+  Each leg other than the last one built gets `FeaturesChanged` and rebuilds the lib plus its
+  integration-test binaries (measured 1m04s–1m22s per leg, 0 dependencies recompiled). Making
+  that per-feature would need the cdylib split into its own crate; that is not done here.
+- `certify.sh fingerprint <full|prebuild> <leg>` prints the command `full` would run, built by
+  the same `leg_cmd`. `scripts/fingerprint_check.sh` compares the (RUSTFLAGS, features,
+  profile) triple across the hook, prebuild and full's core leg, and exits 1 on drift.
+  Mutation-checked: removing the hook's RUSTFLAGS, giving the hook the lint feature set, or
+  adding `--release` to prebuild each fails the check.
+- `full`'s clippy leg now also runs `--all-features`, as CI's lint job does. Before this,
+  only `quick` ran it.
+
+### Fixed — certify: a disk floor before every leg, and a verdict table that cannot print an ENOSPC leg as green (#1012)
+
+ENOSPC killed 2 of the last 4 certify runs 33–37 min in. The dead leg printed as
+`green rest exit= s`, because an empty `.rc` failed every integer test and fell through to the
+green branch.
+
+- Before each leg, free space on the target filesystem is checked against
+  `CERTIFY_MIN_FREE_GB` (default 25). Below the floor, certify drains in-flight legs (nextest
+  re-execs its binaries once per test, so pruning under a running leg is unsafe), then runs the
+  new `scripts/prune_target.py`, then checks again. `prune_target.py` keeps the newest unit per
+  crate name and kind in `deps/` and `incremental/`, has `--dry-run`, and refuses any directory
+  without a `CACHEDIR.TAG`. If space is still short, the leg is recorded as `DISK` and the run
+  continues.
+- One `classify` function produces every row in every table. Only an `.rc` containing `0`
+  prints green. Exit codes above 128 print `KILLED(<sig>)` with the elapsed time. A red leg
+  with `No space left on device` in its log prints `DISK`. An empty `.rc` prints `UNKNOWN`.
+- New exit code: 1 means a leg is RED. 3 means no leg is red but the machine lost at least one
+  leg (`INFRA: n legs skipped for disk, …`). Fast gates use the same rules.
+- `certify.sh verdict` re-prints the table for an existing log directory.
+  `scripts/certify_selfcheck.sh` runs 12 synthetic cases (137, 143, empty `.rc`, ENOSPC,
+  disk floor, not-run, red beats infra, …) plus the prune. Mutation-checked: restoring the
+  empty-`.rc`-is-green behavior, removing KILLED, or dropping the ENOSPC classification each
+  fails the selfcheck.
+
+### Changed — CI: `test-anchor` runs as its own matrix row instead of riding `cirisaudit` (#1009)
+
+The rider was described as "~2 min, rides the shortest leg". It had grown to 3,440 tests
+(15–17.5 min) and made `cirisaudit` the longest job of every run (60–71 min). It now has its
+own `linux-x86_64 (test-anchor)` row. It was not moved to the macOS job: on the v53.1.8 tag
+run, macOS jobs waited 40–48 min for a runner, so a longer mac job would lengthen the queue
+the manifest waits on. `ci_feature_matrix.py`'s RIDERS now supports an own-row host, and
+`check` requires the row.
+
+### Changed — CI: bench runs on schedule and dispatch only (#1020)
+
+`bench.yml` no longer runs on every push to main, which cost 34–47 min of the shared pool per
+merge. The gh-pages publish was gated on `event_name == 'push'`; it now publishes for
+schedule and dispatch runs on main, so the trend chart keeps updating.
+
+### Changed — CI: main's run is skipped when the merge tree equals a PR head that passed CI (#1021)
+
+A new `tree` job runs only on push to main. It sets `skip=true` only when all three hold:
+HEAD is a merge, tree(HEAD) == tree(HEAD^2), and a pull_request CI run on HEAD^2 succeeded.
+Any error leaves `skip=false`. Root jobs gate on its output. Tag runs never skip, so the
+versioned cache still publishes.
+
+### Changed — CI: a PR builds iOS only when the diff can break it; main and tags always do (#1019)
+
+`ios-build` had no gate and ran on every PR: 52 min for ios-simulator and 48 min for
+ios-device on PR run 37662321512, on the macOS pool that is the tag run's critical path. A new
+`ios-paths` job runs on pull_request only and lists the PR's files through the API. iOS builds
+when the diff touches `src/ffi/`, `Cargo.toml`/`Cargo.lock`, `pyproject.toml`, `.cargo/`,
+`ci.yml` or the cache composite. It also builds when a changed `.rs` file's patch touches a
+`target_os`/`target_vendor`/`target_family`/`target_arch`/`target_env` cfg, or the file already
+contains one. A Cargo change that is exactly the package `version =` bump does not count, so
+release PRs are not forced into iOS by the bump alone.
+
+Any error, or a diff of 3000 or more files, builds iOS. Push and tag runs skip `ios-paths`, and
+its empty output reads as "build". On main, the #1021 tree skip has a stricter `skip_ios`: iOS
+is skipped only if the PR run's `ios PyO3 abi3` jobs ran and all succeeded. An iOS break is
+therefore caught at merge, never first at the tag.
+
+Simulated against PRs #1016, #1000, #985, #978 and #959. #1000 skips iOS; the others build it,
+via `src/ffi/`, `ci.yml` or a lock change. Eleven synthetic diffs also gave the expected answer:
+a bump-only change skips; a dependency added or upgraded builds; a platform cfg in a patch or
+in the file builds; a rename out of `src/ffi/` builds; an API failure builds; 3000 files builds.
+`skip_ios` was simulated against the PR run's iOS job conclusions: success+success skips;
+skipped, failure and none build.
+
+### Found, not changed — no Linux CIRISCache blob has been published since at least v53.1.3 (#1022)
+
+Every core-1 `CIRISCache/save@v1` on the v53.1.3–v53.1.8 tag runs and on main run
+37559458619 fails in the LRU prune, before `tar`/`oras push`. The failing pipeline is
+`find | sort | while … break` under `pipefail`: `sort` gets SIGPIPE and the step exits 2, and
+`continue-on-error` hides the failure. As a result, every Linux leg restores
+`phead-…-v10.6.1` (verify v10), spends 6m53s extracting it, and still compiles 119 crates. The
+fix belongs in CIRISCache. The measurements and a one-leg A/B are in the #1022 comment.
 
 ## [53.1.8] - 2026-10-07
 

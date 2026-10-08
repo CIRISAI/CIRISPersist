@@ -66,6 +66,162 @@ jobs:
   # the merge commit's TREE equals the PR head's, the PR run already certified
   # those bytes and the main-CI wait is skipped. That is where tree equality
   # belongs, and it is measured (−35 min on v46.4.0's ship).
+  #
+  # v53.2.0 (CIRISPersist#1021) — tree equality DOES now gate one run, and it is not the run #895
+  # removed: the `tree` job below skips MAIN's run of a merge commit whose
+  # tree equals its PR head's tree, when that PR head has a successful CI run.
+  # It never skips a tag run, so the tag still publishes the versioned
+  # CIRISCache blob (the #896 finding stands). Measured before this cut: 5 of
+  # the last 10 main runs were cancelled — by the tag push on the same SHA
+  # (#397's group) or by the next merge — after holding up to 2.5 h of
+  # runners for bytes the PR run had already certified.
+  tree:
+    name: tree equality (main merges only)
+    # Runs ONLY for a push to main. Everywhere else it is skipped, and the
+    # dependents' `!cancelled() && needs.tree.outputs.skip != 'true'` reads an
+    # empty output as "run" — so PR and tag runs do not wait for a runner for
+    # this job.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read   # list the PR head's CI runs
+    outputs:
+      skip: ${{ steps.cmp.outputs.skip }}
+      skip_ios: ${{ steps.cmp.outputs.skip_ios }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 2   # HEAD and BOTH parents of a merge commit
+      - id: cmp
+        # Fails OPEN: any error leaves skip=false and the full run proceeds.
+        # Skips only when all three hold —
+        #   1. HEAD is a merge (has a second parent; a squash or direct push
+        #      to main always runs),
+        #   2. tree(HEAD) == tree(HEAD^2): the merge changed no bytes the PR
+        #      head did not already have,
+        #   3. a `pull_request` run of THIS workflow on HEAD^2 concluded
+        #      success — the PR run did certify those bytes; tree equality
+        #      alone would trust a run that may have been red or bypassed.
+        #
+        # `skip_ios` (CIRISPersist#1019) is stricter. The PR run builds iOS only
+        # when the diff touches an iOS-relevant path (`ios-paths` below), so a
+        # passing PR run need not have built iOS at all. iOS is skipped here
+        # only if that PR run's `ios PyO3 abi3` jobs ran AND all succeeded —
+        # otherwise main is where an iOS break is caught, at merge, not at the
+        # tag.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          WORKFLOW: ${{ github.workflow }}
+        run: |
+          skip=false; skip_ios=false
+          if head2="$(git rev-parse -q --verify 'HEAD^2' 2>/dev/null)"; then
+            t_head="$(git rev-parse 'HEAD^{tree}')"
+            t_pr="$(git rev-parse 'HEAD^2^{tree}' 2>/dev/null || echo none)"
+            echo "HEAD tree $t_head; PR head $head2 tree $t_pr"
+            if [ "$t_head" = "$t_pr" ]; then
+              run_id="$(gh api "repos/$REPO/actions/runs?head_sha=$head2&event=pull_request&status=success" \
+                     --jq "[.workflow_runs[] | select(.name == \"$WORKFLOW\") | .id] | first // empty" 2>/dev/null || true)"
+              case "$run_id" in ''|*[!0-9]*) echo "no successful '$WORKFLOW' pull_request run on $head2 (API: ${run_id:-none}) — running everything"; run_id="" ;; esac
+              if [ -n "$run_id" ]; then
+                echo "PR head $head2 passed '$WORKFLOW' in run $run_id"
+                skip=true
+                ios="$(gh api "repos/$REPO/actions/runs/$run_id/jobs?per_page=100" --paginate \
+                       --jq '.jobs[] | select(.name | startswith("ios PyO3 abi3")) | .conclusion' 2>/dev/null || true)"
+                echo "that run's iOS build jobs: $(echo "$ios" | tr '\n' ' ')"
+                if [ -n "$ios" ] && ! grep -qv '^success$' <<<"$ios"; then skip_ios=true; fi
+              fi
+            fi
+          else
+            echo "HEAD has no second parent — not a merge commit; running everything."
+          fi
+          echo "skip=$skip skip_ios=$skip_ios"
+          { echo "skip=$skip"; echo "skip_ios=$skip_ios"; } >> "$GITHUB_OUTPUT"
+          if [ "$skip" = true ]; then
+            echo "::notice title=main run skipped::merge tree equals PR head $head2, whose CI run passed. Nothing new to test."
+          fi
+          if [ "$skip" = true ] && [ "$skip_ios" != true ]; then
+            echo "::notice title=iOS runs on main::the PR run did not build iOS (paths filter), so main builds it."
+          fi
+
+  # v53.2.0 (CIRISPersist#1019) — the iOS build runs on a PR only when the diff
+  # can break it. `ios-build` was ungated: 48 and 52 min per PR (run
+  # 37662321512) on the macOS pool, which is the tag run's critical path. It
+  # still runs on every push to main (minus the tree-skip above, which keeps
+  # iOS unless the PR run built it green) and on every tag — so an iOS break is
+  # caught at merge, never first at the tag.
+  #
+  # iOS-relevant, by path: the FFI surface (`src/ffi/`), the manifest and lock
+  # (features, deps, the crate-type — but NOT a change that is only the
+  # package `version =` bump in either file, which every release PR carries),
+  # `pyproject.toml` (the PyO3/abi3 shape),
+  # `.cargo/` (the iOS target config), this workflow (the build itself lives
+  # inline here — there are no separate iOS scripts or xcconfig files), and the
+  # cache composite it restores through. By content: any changed `.rs` whose
+  # patch touches a `target_os`/`target_vendor`/`target_family`/`target_arch`/
+  # `target_env` cfg, or that already carries one — platform-gated code is the
+  # one thing a Linux leg cannot see. Fails OPEN: any error builds iOS.
+  ios-paths:
+    name: iOS-relevant paths (PRs only)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      ios: ${{ steps.diff.outputs.ios }}
+    steps:
+      - uses: actions/checkout@v6
+      - id: diff
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          NFILES: ${{ github.event.pull_request.changed_files }}
+        run: |
+          ios=true
+          why="fail-open default"
+          # The files API lists at most 3000; past that, do not guess.
+          if [ "${NFILES:-0}" -lt 3000 ] \
+             && gh api "repos/$REPO/pulls/$PR/files?per_page=100" --paginate > "$RUNNER_TEMP/files.json" 2>/dev/null \
+             && files="$(jq -r '.[] | .filename, (.previous_filename // empty)' "$RUNNER_TEMP/files.json")"; then
+            ios=false; why="no iOS-relevant path or platform cfg in the diff"
+            # A Cargo.toml / Cargo.lock change that is EXACTLY one
+            # `-version = "…"` and one `+version = "…"` line is the release
+            # bump. It cannot break the iOS build, and without this exception
+            # every release PR (both files, every time) would build iOS. A dep
+            # upgrade in the lock also moves `checksum`/`source` lines, so it
+            # never matches.
+            bump_only() {
+              jq -r --arg f "$1" '[.[] | select(.filename == $f) | .patch // "x"
+                 | split("\n")[] | select(test("^[-+]") and (test("^(\\+\\+\\+|---) ") | not))]
+                 | (length == 2) and all(test("^[-+]version = \"[^\"]+\"$"))' "$RUNNER_TEMP/files.json"
+            }
+            while IFS= read -r f; do
+              case "$f" in
+                Cargo.toml|Cargo.lock)
+                  [ "$(bump_only "$f")" = true ] && continue
+                  ios=true; why="path $f"; break ;;
+                src/ffi/*|pyproject.toml|.cargo/*|.github/workflows/ci.yml|.github/actions/ciriscache/*)
+                  ios=true; why="path $f"; break ;;
+              esac
+            done <<<"$files"
+            if [ "$ios" = false ]; then
+              cfg='target_(os|vendor|family|arch|env)[[:space:]]*='
+              hit="$(jq -r '.[] | select(.filename | endswith(".rs")) | select((.patch // "") | test("target_(os|vendor|family|arch|env)\\s*=")) | .filename' "$RUNNER_TEMP/files.json" | head -1)"
+              if [ -n "$hit" ]; then ios=true; why="platform cfg in the patch of $hit"; fi
+              if [ "$ios" = false ]; then
+                while IFS= read -r f; do
+                  case "$f" in *.rs) [ -f "$f" ] && grep -qE "$cfg" "$f" && { ios=true; why="$f carries a platform cfg"; break; } ;; esac
+                done <<<"$files"
+              fi
+            fi
+          fi
+          echo "ios=$ios ($why)"
+          echo "ios=$ios" >> "$GITHUB_OUTPUT"
+          [ "$ios" = true ] || echo "::notice title=iOS build skipped on this PR::$why. main and tag runs still build iOS."
+
   # Mission category §4 (PLATFORM_ARCHITECTURE.md §4):
   # the linux-x86_64 path that runs the full feature set with a
   # real Postgres backing the integration tests.
@@ -83,6 +239,8 @@ jobs:
     # exercises the full-features compile so a "all-substrates"
     # backstop entry isn't necessary here.
     name: linux-x86_64 (${{ matrix.substrate.name }})
+    needs: tree
+    if: ${{ !cancelled() && needs.tree.outputs.skip != 'true' }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -178,6 +336,30 @@ jobs:
           - { name: cirisnode,  leg: cirisnode,  gauntlet: false }
           - { name: cirisgraph, leg: cirisgraph, gauntlet: false }
           - { name: telemetry,  leg: telemetry,  gauntlet: false }
+          # v53.2.0 (CIRISPersist#1009) — the `test-anchor` CONFIGURATION gets
+          # its own row. It was a rider step on `cirisaudit`, chosen as "~2 min,
+          # rides the shortest leg"; it grew to 3,440 tests, ~900 s of test time
+          # plus a 2m29s rebuild, and made `cirisaudit` the longest job of every
+          # run (60–71 min against 47–55 for the other Linux legs). As a row it
+          # pays the ~8 min fixed cost (disk free + CIRISCache restore) on a
+          # runner of its own, in parallel, and the critical path drops by the
+          # rider's 15–17.5 min.
+          #
+          # Not moved to `darwin-aarch64 (no postgres)`, the cheaper-looking
+          # host: macOS runners are the SCARCE pool. On the v53.1.8 tag run
+          # (37692136047) the darwin wheel waited 40 min and the iOS simulator
+          # build 48 min for a macOS runner; adding ~20 min to a mac job would
+          # have lengthened exactly the queue the tag run's manifest waits on.
+          #
+          # Why it is an invocation of its own and not a flag on another leg
+          # (the env-switched genesis relaxation; nextest's per-test process
+          # isolation): RIDERS in scripts/ci_feature_matrix.py.
+          #
+          # `gauntlet: true` keeps the rider's exact selection: it ran with no
+          # `substrate_machine` exclusion (sqlite-only, so the sqlite arms). The
+          # row's postgres service starts and goes unused — `set test-anchor`
+          # carries no `postgres`.
+          - { name: test-anchor, leg: test-anchor, gauntlet: true }
     services:
       postgres:
         # CIRISPersist#222 — PLAIN postgres:16, NOT timescaledb. The
@@ -385,30 +567,6 @@ jobs:
         # this is a cache hit plus nine tests. A breach is a hang, not a slow box.
         timeout-minutes: 5
         run: cargo nextest run --test wire_format_fixtures
-      # v25.x (CIRISPersist#585) — the `test-anchor` CONFIGURATION, which CI
-      # had never run at all. It is not a flag that can ride another leg's
-      # feature list: the feature compiles the genesis relaxation in and
-      # `ciris_verify_core::test_anchor::test_anchor_active()` (reading
-      # `CIRIS_TEST_TRUST_ROOT`) switches it on, so with the env unset it is
-      # inert and a 30-feature leg carrying it would certify nothing. It needs
-      # its own invocation — and nextest specifically, because the genesis
-      # fixtures use `std::env::set_var` and per-test process isolation is what
-      # keeps that from leaking into the rest of the suite.
-      #
-      # A RIDER, not a matrix row: sqlite-only, ~1650 tests, ~2 min of test
-      # time. A whole runner for it would be the local-optimization /
-      # global-pessimization trade #543 already rejected, so it rides
-      # `cirisaudit` (the shortest leg) as an extra step.
-      # `scripts/ci_feature_matrix.py check` fails if this step is dropped or
-      # if its host leg changes.
-      - name: cargo nextest (test-anchor configuration — sqlite only)
-        if: matrix.substrate.leg == 'cirisaudit'
-        timeout-minutes: 25
-        run: |
-          set -euo pipefail
-          FEATURES="$(python3 scripts/ci_feature_matrix.py set test-anchor)"
-          echo "rider 'test-anchor' → --features \"${FEATURES}\""
-          cargo nextest run --no-fail-fast --features "${FEATURES}"
       # v0.5.4 (CIRISPersist#29) — Python regression test for the FFI
       # catch_panic layer. Builds the wheel with the `test-panic`
       # feature gate enabled (release wheels don't), then pytest
@@ -529,6 +687,8 @@ jobs:
   # Mission alignment: macOS dev path (PLATFORM_ARCHITECTURE.md §1).
   darwin-aarch64-test:
     name: darwin-aarch64 (no postgres)
+    needs: tree
+    if: ${{ !cancelled() && needs.tree.outputs.skip != 'true' }}
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v6
@@ -705,6 +865,11 @@ jobs:
   # (PyO3 PR #5605 requires libpython linking on iOS).
   ios-build:
     name: ios PyO3 abi3 (${{ matrix.dir }})
+    # #1019: `ios-paths` runs on PRs only; its empty output on push/tag reads
+    # as "build". `skip_ios`, not `skip`: main keeps iOS unless the PR run
+    # actually built it green.
+    needs: [tree, ios-paths]
+    if: ${{ !cancelled() && needs.tree.outputs.skip_ios != 'true' && needs.ios-paths.outputs.ios != 'false' }}
     runs-on: macos-14
     # ci-perf — split the two iOS targets into a 2-entry matrix so they
     # build in PARALLEL (was one ~20m job building device then simulator
@@ -872,6 +1037,11 @@ jobs:
     name: package ios artifacts
     runs-on: ubuntu-latest
     needs: [ios-build]
+    # v53.2.0 — explicit result check, because `tree` (an ANCESTOR) is skipped on
+    # every PR and tag run, and the implicit `success()` reads the whole
+    # ancestor chain: a skipped grandparent skips this job even though its
+    # direct need succeeded. Same semantics as before, minus that.
+    if: ${{ !cancelled() && needs.ios-build.result == 'success' }}
     steps:
       - uses: actions/checkout@v6
       - name: extract version from Cargo.toml
@@ -905,6 +1075,8 @@ jobs:
   # Downstream android-package job collects artifacts into tarballs.
   android-ndk:
     name: android ${{ matrix.abi }}
+    needs: tree
+    if: ${{ !cancelled() && needs.tree.outputs.skip != 'true' }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -1109,6 +1281,11 @@ jobs:
     name: package android artifacts
     runs-on: ubuntu-latest
     needs: [android-ndk]
+    # v53.2.0 — explicit result check, because `tree` (an ANCESTOR) is skipped on
+    # every PR and tag run, and the implicit `success()` reads the whole
+    # ancestor chain: a skipped grandparent skips this job even though its
+    # direct need succeeded. Same semantics as before, minus that.
+    if: ${{ !cancelled() && needs.android-ndk.result == 'success' }}
     steps:
       - uses: actions/checkout@v6
       - name: extract version from Cargo.toml
@@ -1213,6 +1390,8 @@ jobs:
   # Mission category §4 "Mission rejection" + audit/lint.
   lint:
     name: clippy + fmt + audit
+    needs: tree
+    if: ${{ !cancelled() && needs.tree.outputs.skip != 'true' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -1367,6 +1546,8 @@ jobs:
   # plus a license-deny pass per CRATE_RECOMMENDATIONS §6.
   license-audit:
     name: cargo deny (license + advisories)
+    needs: tree
+    if: ${{ !cancelled() && needs.tree.outputs.skip != 'true' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -1397,6 +1578,8 @@ jobs:
   # the from-disk gate I57 pins those literals to the crate's.
   sqlite-portability:
     name: sqlite portability (debian bookworm, libsqlite3 3.40.1)
+    needs: tree
+    if: ${{ !cancelled() && needs.tree.outputs.skip != 'true' }}
     runs-on: ubuntu-latest
     container: debian:bookworm-slim
     steps:
@@ -1420,6 +1603,8 @@ jobs:
   # since 2025-01.
   pyo3-wheel:
     name: maturin abi3-py311 wheel (${{ matrix.label }})
+    needs: tree
+    if: ${{ !cancelled() && needs.tree.outputs.skip != 'true' }}
     # v30.9.0 — the CROSS-PLATFORM wheels build on TAGS ONLY.
     #
     # Measured on the last successful PR run (31397353461), which took 38m wall:
@@ -1869,6 +2054,11 @@ jobs:
     name: Sign + register multi-target build manifests (CanonicalBuild v2)
     runs-on: ubuntu-latest
     needs: pyo3-wheel
+    # v53.2.0 — explicit result check, because `tree` (an ANCESTOR) is skipped on
+    # every PR and tag run, and the implicit `success()` reads the whole
+    # ancestor chain: a skipped grandparent skips this job even though its
+    # direct need succeeded. Same semantics as before, minus that.
+    if: ${{ !cancelled() && needs.pyo3-wheel.result == 'success' }}
     # v3.6.6 — hard-fail restored. The hybrid-signing secrets
     # (CIRIS_BUILD_ED25519_SECRET / CIRIS_BUILD_MLDSA_SECRET) are now
     # configured; a manifest failure means either the secrets rotated
@@ -2326,7 +2516,14 @@ jobs:
       - android-package
       - lint
       - license-audit
-    if: startsWith(github.ref, 'refs/tags/v')
+    # v53.2.0 — explicit result check, because `tree` (an ANCESTOR) is skipped on
+    # every PR and tag run, and the implicit `success()` reads the whole
+    # ancestor chain: a skipped grandparent skips this job even though its
+    # direct need succeeded. Same semantics as before, minus that.
+    if: >-
+      ${{ startsWith(github.ref, 'refs/tags/v') && !cancelled()
+          && needs.ios-package.result == 'success' && needs.android-package.result == 'success'
+          && needs.lint.result == 'success' && needs.license-audit.result == 'success' }}
     permissions:
       contents: write
       actions: read
