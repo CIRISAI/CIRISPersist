@@ -12,7 +12,8 @@ test executable). Units are grouped by crate name AND kind — a library unit
 never competes with an executable of the same name, since `libfoo-A.rlib` and
 the test binary `foo-B` are both current outputs of one build — ranked by
 their newest mtime, and all but the newest `--keep` per group are deleted. The same rule
-applies to `target/<profile>/incremental/<crate>-<hash>/` directories.
+applies to `target/<profile>/incremental/<crate>-<disambiguator>/` directories,
+whose disambiguator is base-36 rather than 16 hex (see `INCREMENTAL`).
 
 What is NOT touched: `.fingerprint/` and `build/`. A unit whose outputs are
 gone is rebuilt by cargo on its next use (its fingerprint reports a missing
@@ -41,6 +42,13 @@ from pathlib import Path
 #: prefix that is NOT part of the crate name (`liblibc-….rlib` is crate `libc`);
 #: `.d` files and executables do not.
 UNIT = re.compile(r"^(?P<stem>.+)-(?P<hash>[0-9a-f]{16})(?P<ext>\.[A-Za-z0-9.]+)?$")
+#: `target/<profile>/incremental/<crate>-<disambiguator>/`: cargo's incremental
+#: disambiguator is base-36 of varying length (`build_script_build-05vyqsvijk35y`),
+#: not 16 hex, so `UNIT` matched almost none of them (Codex on PR #1039). Its
+#: units are directories with no extension; the empty `ext` group keeps one shape.
+INCREMENTAL = re.compile(r"^(?P<stem>.+)-(?P<hash>[0-9a-z]+)(?P<ext>)$")
+#: The pattern per subdirectory of a profile.
+PATTERNS = {"deps": UNIT, "incremental": INCREMENTAL}
 LIB_EXTS = {".rlib", ".rmeta", ".so", ".a", ".dylib", ".dll", ".lib"}
 
 
@@ -73,17 +81,17 @@ def mtime_of(p: Path) -> float:
         return 0.0
 
 
-def plan(dirpath: Path, keep: int) -> list[Path]:
+def plan(dirpath: Path, keep: int, pattern: re.Pattern = UNIT) -> list[Path]:
     """Every path in `dirpath` belonging to a superseded unit."""
     units: dict[tuple[str, str], list[Path]] = defaultdict(list)
     for entry in dirpath.iterdir():
-        m = UNIT.match(entry.name)
+        m = pattern.match(entry.name)
         if not m:
             continue
         units[(crate_name(m["stem"], m["ext"]), m["hash"])].append(entry)
     by_group: dict[tuple[str, bool], list[tuple[float, str]]] = defaultdict(list)
     for (name, h), paths in units.items():
-        is_lib = any(UNIT.match(p.name)["ext"] in LIB_EXTS for p in paths)
+        is_lib = any(pattern.match(p.name)["ext"] in LIB_EXTS for p in paths)
         by_group[(name, is_lib)].append((max(mtime_of(p) for p in paths), h))
     doomed: list[Path] = []
     for (name, _is_lib), gens in by_group.items():
@@ -116,7 +124,7 @@ def main() -> int:
             d = target / prof / sub
             if not d.is_dir():
                 continue
-            for p in plan(d, args.keep):
+            for p in plan(d, args.keep, PATTERNS[sub]):
                 n = size_of(p)
                 if args.dry_run:
                     print(f"would remove {p} ({n / 2**20:.1f} MiB)")

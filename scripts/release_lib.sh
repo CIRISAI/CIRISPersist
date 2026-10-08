@@ -11,19 +11,28 @@
 # an early-exiting reader SIGPIPEs its writer and fails the pipeline.
 rl_prev_version() {
     grep -oE '^## \[[0-9]+\.[0-9]+\.[0-9]+\]' "$1" | sed 's/^## \[//; s/\]//' \
-        | awk -v v="$2" '$0==v {f=1; next} f && !p {print; p=1}'
+        | RL_V="$2" awk '$0==ENVIRON["RL_V"] {f=1; next} f && !p {print; p=1}'
 }
 
 # rl_changelog_section <changelog> <version> — the section for <version>,
 # from its `## [<version>]` heading up to (not including) the next numbered
 # section's heading. Returns 1 if the section is missing or empty.
+#
+# Headings are matched as FIXED-STRING prefixes (`index(...) == 1`), passed
+# through ENVIRON, never as regex text through `awk -v`: gawk and busybox awk
+# process backslash escapes in `-v` values, so `\[` arrived as a bare `[`, the
+# pattern became a character class, nothing matched, and the cut came back
+# EMPTY with exit 0 (mawk keeps the backslash, so it was green here; Codex on
+# PR #1039). The output-is-empty check makes any such regression a refusal.
 rl_changelog_section() {
-    local file="$1" ver="$2" prev esc_v esc_p
+    local file="$1" ver="$2" prev
     prev="$(rl_prev_version "$file" "$ver")"
     [ -n "$prev" ] || return 1
-    esc_v="$(printf '%s' "$ver" | sed 's/\./\\./g')"
-    esc_p="$(printf '%s' "$prev" | sed 's/\./\\./g')"
-    awk -v s="^## \\[${esc_v}\\]" -v e="^## \\[${esc_p}\\]" '$0 ~ s {f=1} f && $0 ~ e {exit} f' "$file"
+    RL_S="## [$ver]" RL_E="## [$prev]" awk '
+        !f && index($0, ENVIRON["RL_S"]) == 1 {f=1}
+        f && index($0, ENVIRON["RL_E"]) == 1 {exit}
+        f {print; n++}
+        END {exit (n > 0 ? 0 : 1)}' "$file"
 }
 
 # rl_section_headings <changelog> <version> — the `### ` heading lines of the
@@ -115,4 +124,60 @@ rl_stage() {
     "$fn"; rc=$?
     [ "$rc" -eq 0 ] && rl_mark "$dir" "$name"
     return "$rc"
+}
+
+# ── Codex review gate ───────────────────────────────────────────────────
+# rl_codex_review <repo> <pr> <head-sha> — wait for chatgpt-codex-connector's
+# review of <head-sha> and refuse to ship over its findings. Returns:
+#   0  Codex reviewed <head-sha> and left no inline finding on it
+#   30 Codex left findings on <head-sha> (each printed as path:line + first line)
+#   31 no review of <head-sha> arrived within CODEX_TIMEOUT_SECS (default 1800);
+#      the CALLER fails open, loudly — Codex is an external service
+#
+# v53.2.0: the chain would have merged and tagged ~10 min after Codex posted
+# six findings on PR #1039; it was stopped by hand.
+#
+# "Reviewed <head>" is either a review by the bot whose commit_id is <head>
+# (its body reads "**Reviewed commit:** `<sha prefix>`"), or the bot's summary
+# issue comment (`<!-- codex-pull-request-review-summary -->`) showing a
+# Completed row for `<head7>`: a clean pass posts no review, only a 👍 and that
+# row. A review of an OLDER head does not count: Codex re-reviews each push.
+#
+# A finding is a bot inline comment whose ORIGINAL commit is <head>, or that
+# belongs to a bot review of <head>. Not `commit_id == head`: GitHub moves a
+# comment's commit_id forward to the newest head while its line is unchanged,
+# so already-fixed findings from an older head would block forever.
+RL_CODEX_BOT="chatgpt-codex-connector[bot]"
+rl_codex_review() {
+    local repo="$1" pr="$2" head="$3" h7="${3:0:7}" waited=0 limit="${CODEX_TIMEOUT_SECS:-1800}"
+    local poll="${CODEX_POLL_SECS:-60}" reviews summary ids found
+    while :; do
+        reviews="$(gh api --paginate "repos/$repo/pulls/$pr/reviews" 2>/dev/null | jq -s 'add // []' 2>/dev/null)" || reviews="[]"
+        ids="$(jq -c --arg b "$RL_CODEX_BOT" --arg h "$head" \
+            '[.[] | select(.user.login == $b and .commit_id == $h) | .id]' <<<"${reviews:-[]}" 2>/dev/null)" || ids="[]"
+        summary="$(gh api --paginate "repos/$repo/issues/$pr/comments" 2>/dev/null | jq -s 'add // []' 2>/dev/null \
+            | jq -r --arg b "$RL_CODEX_BOT" --arg h7 "\`$h7\`" \
+                '[.[] | select(.user.login == $b and (.body | contains("<!-- codex-pull-request-review-summary -->")))
+                  | .body | split("\n")[] | select(contains($h7) and contains("Completed"))] | length' 2>/dev/null)" || summary=0
+        if [ "${ids:-[]}" != "[]" ] || [ "${summary:-0}" -gt 0 ]; then
+            found="$(gh api --paginate "repos/$repo/pulls/$pr/comments" 2>/dev/null | jq -s 'add // []' \
+                | jq -r --arg b "$RL_CODEX_BOT" --arg h "$head" --argjson ids "${ids:-[]}" \
+                    '.[] | select(.user.login == $b and (.original_commit_id == $h or (.pull_request_review_id as $r | $ids | index($r))))
+                     | "\(.path):\(.line // .original_line // "?")  \(.body | split("\n") | map(select(test("[A-Za-z]"))) | .[0] // "" | gsub("<[^>]*>|!\\[[^]]*\\]\\([^)]*\\)|\\*\\*"; "") | sub("^\\s+"; "") | .[0:160])"')" \
+                || { echo "codex: review of ${h7} found, but its inline comments could not be read — retrying"; found="?"; }
+            if [ "$found" != "?" ]; then
+                if [ -n "$found" ]; then
+                    echo "CODEX FINDINGS on ${h7} ($(wc -l <<<"$found")):"
+                    printf '%s\n' "$found" | sed 's/^/  /'
+                    echo "fix, commit, re-run the same command"
+                    return 30
+                fi
+                echo "codex: reviewed ${h7}, no findings"
+                return 0
+            fi
+        fi
+        [ "$waited" -lt "$limit" ] || return 31
+        echo "codex: no review of ${h7} yet ($(( waited / 60 )) of $(( limit / 60 )) min)"
+        sleep "$poll"; waited=$(( waited + poll ))
+    done
 }
