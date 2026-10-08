@@ -200,7 +200,7 @@ done
 # The leg is skippable ONLY by CERTIFY_SKIP_PYTHON=1, and never silently — the
 # verdict table carries a SKIPPED line and the run stops claiming full
 # certification.
-ALL_KEYS="$LEGS default python fmt clippy pyi featmatrix wheelfeat docver pyo3sqlite dirdouble floortoken$AXIS_KEYS"
+ALL_KEYS="$LEGS default python fmt clippy pyi featmatrix wheelfeat docver pyo3sqlite dirdouble astgates weaver floortoken$AXIS_KEYS"
 
 FOCUS_LEG=""; FOCUS_FILTER=""
 if [ "$MODE" = "focus" ]; then
@@ -545,6 +545,12 @@ run_bg docver     python3 scripts/doc_version_refs.py
 # exist and never execute — a check that cannot fail is a report.
 run_bg floortoken bash -c 'set -o pipefail; cargo test --quiet --doc --features sqlite -- StorageFloor 2>&1 | tee /dev/stderr | grep -q "test result: ok. 1 passed"'
 run_bg dirdouble  python3 scripts/gen_directory_double.py --check
+# v53.2.0 (CIRISPersist#1026/#1027) — the ast-grep gate counts and the Weaver
+# telemetry registry. Each fetches its pinned tool on first use (cached under
+# ~/.cache); offline with no cached copy it exits 3, which reads RED here: a
+# gate that could not look has not passed.
+run_bg astgates   scripts/ast_gates.sh
+run_bg weaver     scripts/weaver_check.sh
 # v35.0.0 (CIRISPersist#710) — tested-wheel ⊇ shipped-wheel, and nobody
 # hand-spells a `maturin develop --features` list (here or in ci.yml).
 run_bg wheelfeat  python3 scripts/wheel_features.py check
@@ -585,7 +591,7 @@ wait
 # before the expensive legs dispatch, is the point of the fast stage: a compile
 # break under `--features cirisnode` alone should cost seconds, not the full
 # test matrix first.
-FAST_GATES="fmt pyi featmatrix wheelfeat docver pyo3sqlite dirdouble floortoken$AXIS_KEYS"
+FAST_GATES="fmt pyi featmatrix wheelfeat docver pyo3sqlite dirdouble astgates weaver floortoken$AXIS_KEYS"
 
 # Every `.rc` this run produced must be claimed by a key someone reads. The log
 # directory is wiped at startup, so anything here was written by this run.

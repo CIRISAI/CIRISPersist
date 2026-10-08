@@ -205,6 +205,33 @@ path is untested until the v53.2.0 tag run.
   same names, labels and values in-process. Generating `catalog.rs` itself from the registry
   is also deferred; I552 holds the two equal instead.
 
+### Added — from-disk gate counts as ast-grep rules, first increment (#1026)
+
+`docs/FROM_DISK_GATES.md` lists every from-disk gate: about 90 tests in 45 files. Each is
+classed AST-COUNT, AST-STRUCT, TEXTUAL (SQL, migrations, prose, digests) or not-a-gate. Six
+counts from five gates are ported: I110's `check_consent_scope_tokens`, I119's
+`check_media_source`, I448's `check_prev_head_names_held` inside `supersede_group_row`,
+`log_scores_read` inside `list_scores`/`resolve_scores`, and I26's cached and uncached
+content-master resolvers. The ports are `sgconfig.yml`, `rules/*.yml` and exact per-file counts
+in `rules/expected.json`. The AST counts are exact where I110 and I119 asserted only minimums.
+
+`scripts/ast_gates.sh` (ast-grep 0.45.3, pinned, sha256-checked download) compares the counts in
+both directions. A rule with no expectation, an expectation with no rule, a glob, a missing file
+or any differing count is red. It scans `CARGO_MANIFEST_DIR`, else this checkout, and never
+another worktree. It is a certify fast gate (`astgates`, alongside `weaver`) and a CI lint step.
+`src/ast_gate_parity.rs` holds the Rust text counts, with comments and strings blanked, equal to
+the same `expected.json`. The AST count and the text count therefore agree through one file. The
+original Rust witnesses stay for one release.
+
+Mutations, 15 of 15 as expected. For each rule, a commented-out copy of the call (line and block
+comment) leaves both checks green. Deleting the call makes both red. Moving I26's cached call to
+the uncached one makes both I26 rules red. A dropped expectation, a glob in `files:`, and a
+`CARGO_MANIFEST_DIR` pointing at another checkout are each red.
+
+Deferred, listed in the doc: the remaining AST-COUNT gates (I14, the `== 0` guards, I551's path
+set, I98, I103, I8), every AST-STRUCT gate (relational rules), and deleting the six Rust text
+scans after this release.
+
 ### Found, not changed — no Linux CIRISCache blob has been published since at least v53.1.3 (#1022)
 
 Every core-1 `CIRISCache/save@v1` on the v53.1.3–v53.1.8 tag runs and on main run

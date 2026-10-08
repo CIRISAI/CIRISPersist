@@ -1489,6 +1489,11 @@ jobs:
       # downloads its pinned weaver and checks the tarball's sha256.
       - name: telemetry registry (OTel Weaver check + rendering current)
         run: scripts/weaver_check.sh
+      # v53.2.0 (#1026) — the from-disk gate counts ported to ast-grep: a call
+      # in a comment or a string is not a call, by construction. Exact per-file
+      # counts in rules/expected.json; inventory in docs/FROM_DISK_GATES.md.
+      - name: ast-grep gate counts (rules/ vs rules/expected.json)
+        run: scripts/ast_gates.sh
       # v43.0.0 (BLOB_ENCRYPTION_AT_REST.md I22) — the storage floor token is
       # unconstructible outside the crate. The witness is a `compile_fail`
       # doctest, and nextest never runs doctests, so it gets its own step.
