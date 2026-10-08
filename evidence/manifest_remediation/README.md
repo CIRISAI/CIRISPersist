@@ -31,9 +31,9 @@ the record; one taken after a re-post would record the corrected row as the old 
 
 `.github/workflows/reregister-manifests.yml` with `mode: check` compares every row with the
 release's own bytes and writes nothing. With `mode: repost`, it re-posts only the MISMATCH rows. It
-refuses one unless `<version>/<target>.function.json` is committed at the ref it runs from, and
-unless the live row still carries the snapshot's `binary_hash`. Commit the snapshot first, then
-dispatch. The runbook is in docs/RELEASE.md, "Remediating a registered manifest".
+refuses a version unless all five targets' snapshots are committed at the ref it runs from, and
+unless every live row, compared whole as canonical JSON, still equals its snapshot. `register`
+rewrites all five targets, so all five are guarded. Commit the snapshots first, then dispatch. The runbook is in docs/RELEASE.md, "Remediating a registered manifest".
 
 All 11 pairs above are snapshotted here, read from the us registry on 2026-10-08.
 

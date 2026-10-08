@@ -28,9 +28,11 @@
 #     EXPIRED (90 days) or no run holds it, the
 #     `rebuild` job builds the wheel from the tag in pyo3-wheel's shape and the
 #     registration is labelled a same-version REBUILD (CC 3.1.2.1: supersedes);
-#   * PersistExtras + the unchanged manifests: the tag run's
-#     `ciris-persist-build-manifest-<v>` artifact, else the registry's own
-#     verbatim bodies (GET /v1/verify/build-manifest serves the posted bytes).
+#   * PersistExtras + the unchanged manifests: the registry's own verbatim
+#     bodies (GET /v1/verify/build-manifest serves the posted bytes), never the
+#     tag run's build-manifest artifact, which can be older than the live row;
+#     each must equal its committed snapshot, and all five targets are guarded
+#     because `register` rewrites all five.
 #
 # Check first, always: a dispatch with the defaults (mode check, dry_run
 # true, all five targets) writes nothing. Even mode: repost posts only with
@@ -182,7 +184,6 @@ jobs:
     env:
       V: ${{ matrix.entry.version }}
       RUN: ${{ matrix.entry.run }}
-      BM: ${{ matrix.entry.bm }}
       TARGETS: ${{ inputs.targets }}
       MODE: ${{ inputs.mode }}
       REGISTRY_URL: ${{ vars.REGISTRY_URL }}
@@ -242,7 +243,12 @@ jobs:
           RESIGN: ${{ steps.resign.outputs.targets }}
         run: |
           REG="${REGISTRY_URL:-https://api.registry.ciris-services-1.ai}"
-          for t in $RESIGN; do
+          # register rewrites EVERY target's rows, not only the re-signed ones:
+          # each of the five must be committed and still be the live row
+          # (Codex round 2 on PR #1039). RESIGN only says which are re-signed.
+          ALL5="python-source-tree x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu aarch64-apple-darwin x86_64-pc-windows-msvc"
+          echo "re-signed: [$RESIGN]; rewritten by register: [$ALL5]"
+          for t in $ALL5; do
             for kind in function build builds; do
               snap="evidence/manifest_remediation/$V/$t.$kind.json"
               [ -s "$snap" ] || { echo "::error::$snap is not committed at ${GITHUB_SHA:-HEAD}: run scripts/snapshot_manifests.sh $V $t and commit it first"; exit 1; }
@@ -252,24 +258,28 @@ jobs:
           # must equal its committed snapshot: a row re-signed, re-keyed, or
           # with new extras under the same binary_hash is a row the evidence
           # never recorded, and a repost would erase it (Codex on PR #1039).
-          # shellcheck disable=SC2086  # RESIGN is a space-separated target list
-          SNAPSHOT_REGISTRY_BASE="$REG" scripts/snapshot_manifests.sh verify "$V" $RESIGN \
+          # shellcheck disable=SC2086  # ALL5 is a space-separated target list
+          SNAPSHOT_REGISTRY_BASE="$REG" scripts/snapshot_manifests.sh verify "$V" $ALL5 \
             || { echo "::error::v$V: a live row is not its committed snapshot (above); refusing to overwrite it"; exit 1; }
-          # register rewrites every target's `builds` row, not only the
-          # re-signed ones: keep this run's own copy of all five before posting.
-          SNAPSHOT_REGISTRY_BASE="$REG" SNAPSHOT_ROOT=dist/pre-post scripts/snapshot_manifests.sh "$V" \
-            python-source-tree x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu aarch64-apple-darwin x86_64-pc-windows-msvc
+          # and this run's own copy of all five, as read just before posting.
+          # shellcheck disable=SC2086
+          SNAPSHOT_REGISTRY_BASE="$REG" SNAPSHOT_ROOT=dist/pre-post scripts/snapshot_manifests.sh "$V" $ALL5
 
       - name: repost — PersistExtras and the unchanged manifests
         if: ${{ inputs.mode == 'repost' && steps.resign.outputs.targets != '' }}
         run: |
-          if [ "$BM" = true ] && gh run download "$RUN" -R "$GITHUB_REPOSITORY" -n "ciris-persist-build-manifest-$V" -D dist/orig; then
-            echo "reuse source: tag run $RUN's ciris-persist-build-manifest-$V artifact"
-          else
-            echo "reuse source: the registry's verbatim manifests (the build-manifest artifact expired)"
-            scripts/build_manifest.sh fetch-reuse --version "$V" --out dist/orig
-          fi
+          # The unchanged manifests are the LIVE rows, verbatim: register
+          # re-posts them, and the tag run's build-manifest artifact may be
+          # older than the live row (a later re-sign or re-key), so re-posting
+          # it would overwrite the newer row (Codex round 2 on PR #1039).
+          echo "reuse source: the registry's verbatim build-manifest reads (never the tag run's artifact)"
+          scripts/build_manifest.sh fetch-reuse --version "$V" --out dist/orig
           ls -la dist/orig
+          # ... and each must still be its committed snapshot, now: a row that
+          # moved after the guard step above is refused, not re-posted.
+          SNAPSHOT_RETRIES=0 scripts/snapshot_manifests.sh verify-reuse "$V" dist/orig \
+            python-source-tree x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu aarch64-apple-darwin x86_64-pc-windows-msvc \
+            || { echo "::error::v$V: a fetched manifest is not its committed snapshot (above); refusing to re-post it"; exit 1; }
 
       - name: repost — re-sign the MISMATCH targets (bits_changed.sh 1-4 first); reuse the rest
         if: ${{ inputs.mode == 'repost' && steps.resign.outputs.targets != '' }}

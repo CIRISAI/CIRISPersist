@@ -13,6 +13,7 @@
 #
 #   scripts/snapshot_manifests.sh <version> <target> [<target>...]
 #   scripts/snapshot_manifests.sh verify <version> <target> [<target>...]
+#   scripts/snapshot_manifests.sh verify-reuse <version> <dir> <target> [<target>...]
 #
 # A pair is written only when all three reads return 200, and never over an
 # existing snapshot: the first snapshot of a row is the record, so a second
@@ -37,10 +38,22 @@
 # for that pair). Every pair is attempted; the exit is the first failure's.
 # verify: 0 every live read equals its snapshot · 2 usage · 5 a registry read
 # failed · 6 a live read differs from its snapshot · 7 a snapshot is missing.
+#
+# `verify-reuse` reads no registry: it compares <dir>/manifest-<t>.json (what
+# `build_manifest.sh fetch-reuse` just fetched, verbatim, and register will
+# re-post) with the committed <t>.build.json, the same canonical comparison
+# and the same exit codes (7 also when the fetched file is missing). It closes
+# the window between `verify` and the fetch: a row that moved in between is
+# refused rather than re-posted (Codex round 2 on PR #1039).
 set -uo pipefail
 mode=snapshot
-if [ "${1:-}" = verify ]; then mode=verify; shift; fi
+case "${1:-}" in verify|verify-reuse) mode="$1"; shift;; esac
 ver="${1:-}"; shift || true
+reuse_dir=""
+if [ "$mode" = verify-reuse ]; then
+  reuse_dir="${1:-}"; shift || true
+  [ -n "$reuse_dir" ] || { echo "usage: snapshot_manifests.sh verify-reuse <version> <dir> <target>..." >&2; exit 2; }
+fi
 ver="${ver#v}"
 case "$ver" in ""|*[!0-9.]*) echo "usage: snapshot_manifests.sh <version> <target>..." >&2; exit 2;; esac
 [ $# -ge 1 ] || { echo "usage: snapshot_manifests.sh <version> <target>..." >&2; exit 2; }
@@ -103,6 +116,21 @@ PYEOF
 }
 
 rc=0
+if [ "$mode" = verify-reuse ]; then
+  for t in "$@"; do
+    case "$t" in ""|*[!a-z0-9_-]*) echo "usage: target '$t' is not a target triple" >&2; exit 2;; esac
+    snap="$root/$ver/$t.build.json"; got="$reuse_dir/manifest-$t.json"
+    if [ ! -s "$snap" ]; then echo "MISSING  $ver/$t.build: no snapshot at $snap"; [ "$rc" -ne 0 ] || rc=7; continue; fi
+    if [ ! -s "$got" ]; then echo "MISSING  $ver/$t: no fetched $got"; [ "$rc" -ne 0 ] || rc=7; continue; fi
+    if d="$(canon_diff "$snap" "$got")"; then
+      echo "same     $ver/$t.build: the fetched manifest is the snapshot"
+    else
+      echo "DIFFERS  $ver/$t.build: the fetched manifest is not the committed snapshot"; printf '%s\n' "$d"
+      [ "$rc" -ne 0 ] || rc=6
+    fi
+  done
+  exit "$rc"
+fi
 if [ "$mode" = verify ]; then
   for t in "$@"; do
     case "$t" in ""|*[!a-z0-9_-]*) echo "usage: target '$t' is not a target triple" >&2; exit 2;; esac

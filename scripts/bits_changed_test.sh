@@ -382,10 +382,13 @@ guard_fixture() {  # the committed snapshot of $GT, and the registry serving it 
       >"$WORK/reg/v1/verify/build-manifest/ciris-persist/$GV/$t"
   done
   printf '{"version":"%s","source_commit":"abc","status":"active"}' "$GV" >"$WORK/reg/v1/builds/$GV"
-  # the snapshot is the registry's bytes, pretty-printed: canonical, not byte, equality
-  python3 -I -c 'import json,sys; json.dump(json.load(open(sys.argv[1])), open(sys.argv[2],"w"), indent=2)' "$WORK/reg/v1/verify/function-manifest/$GV/$GT" "$snap/$GT.function.json"
-  python3 -I -c 'import json,sys; json.dump(json.load(open(sys.argv[1])), open(sys.argv[2],"w"), indent=2)' "$WORK/reg/v1/verify/build-manifest/ciris-persist/$GV/$GT" "$snap/$GT.build.json"
-  cp "$WORK/reg/v1/builds/$GV" "$snap/$GT.builds.json"
+  # the snapshot is the registry's bytes, pretty-printed: canonical, not byte,
+  # equality. All five: register rewrites every target, not only $GT.
+  for t in $ALL5; do
+    python3 -I -c 'import json,sys; json.dump(json.load(open(sys.argv[1])), open(sys.argv[2],"w"), indent=2)' "$WORK/reg/v1/verify/function-manifest/$GV/$t" "$snap/$t.function.json"
+    python3 -I -c 'import json,sys; json.dump(json.load(open(sys.argv[1])), open(sys.argv[2],"w"), indent=2)' "$WORK/reg/v1/verify/build-manifest/ciris-persist/$GV/$t" "$snap/$t.build.json"
+    cp "$WORK/reg/v1/builds/$GV" "$snap/$t.builds.json"
+  done
   rm -rf "$GR/dist"
 }
 # shellcheck disable=SC2317  # invoked through `expect`
@@ -404,13 +407,61 @@ expect "guard: builds row changed refused"  1 'status' -- guard
 guard_fixture
 rm "$GR/evidence/manifest_remediation/$GV/$GT.function.json"
 expect "guard: no committed snapshot refused" 1 "$GT" -- guard
+# A target NOT being re-signed is still rewritten by register: its live row
+# must be its snapshot too (Codex round 2 on PR #1039, reregister-manifests.yml:257).
+GO=aarch64-apple-darwin
+guard_fixture
+sed -i 's/SIG-A/SIG-B/' "$WORK/reg/v1/verify/function-manifest/$GV/$GO"
+expect "guard: a reused target re-signed refused" 1 "DIFFERS  $GV/$GO.function" -- guard
+guard_fixture
+rm "$GR/evidence/manifest_remediation/$GV/$GO.build.json"
+expect "guard: a reused target unsnapshotted" 1 "$GO.build.json is not committed" -- guard
+
+# The reuse step: the unchanged manifests come from the LIVE registry, never
+# from the tag run's build-manifest artifact (possibly older than the live
+# row), and each must still be its committed snapshot when fetched.
+python3 -I - "$PWD/.github/workflows/reregister-manifests.yml" "$GR/reuse.sh" <<'PYEOF' || { echo "  FAIL  could not extract the reuse step"; fails=$((fails + 1)); }
+import sys, yaml
+wf = yaml.safe_load(open(sys.argv[1]))
+steps = [s for s in wf["jobs"]["manifests"]["steps"] if s.get("name", "").startswith("repost — PersistExtras and the unchanged manifests")]
+assert len(steps) == 1, f"{len(steps)} reuse steps"
+run = steps[0]["run"]
+assert "${{" not in run, "the reuse step interpolates an expression; it must read env only"
+open(sys.argv[2], "w").write("set -eo pipefail\n" + run)
+PYEOF
+# a stub `gh run download` that hands back a STALE build-manifest artifact
+mkdir -p "$GR/bin"
+cat >"$GR/bin/gh" <<'GHEOF'
+#!/usr/bin/env bash
+[ "$1 $2" = "run download" ] || exit 1
+while [ $# -gt 0 ]; do [ "$1" = -D ] && d="$2"; shift; done
+mkdir -p "$d"
+for t in python-source-tree x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu aarch64-apple-darwin x86_64-pc-windows-msvc; do
+  printf '{"target":"%s","binary_hash":"sha256:STALE-ARTIFACT","extras":{"dep_tree_sha256":"DEP-ARTIFACT"}}' "$t" >"$d/manifest-$t.json"
+done
+echo '{"dep_tree_sha256":"DEP-ARTIFACT"}' >"$d/persist-extras-53.1.8.json"
+GHEOF
+chmod +x "$GR/bin/gh"
+# shellcheck disable=SC2317  # invoked through `expect`
+reuse() { (cd "$GR" && env PATH="$GR/bin:$PATH" V="$GV" RUN=7 BM=true GITHUB_REPOSITORY=o/r REGISTRY_URL="$BITS_CHANGED_REGISTRY_BASE" SNAPSHOT_RETRIES=0 bash reuse.sh); }
+guard_fixture
+expect "reuse: live bodies, not the artifact" 0 'reuse source: the registry' -- reuse
+n=$((n + 1))
+if cmp -s "$GR/dist/orig/manifest-$GO.json" "$WORK/reg/v1/verify/build-manifest/ciris-persist/$GV/$GO" && ! grep -rq STALE-ARTIFACT "$GR/dist/orig"; then
+  echo "  ok    reuse: dist/orig holds the live bytes; no artifact byte"
+else echo "  FAIL  reuse: dist/orig is not the live registry's bytes"; fails=$((fails + 1)); fi
+guard_fixture
+sed -i 's/DEP-OLD/DEP-RACED/' "$WORK/reg/v1/verify/build-manifest/ciris-persist/$GV/$GO"
+expect "reuse: live row moved since the guard" 1 "DIFFERS  $GV/$GO" -- reuse
 guard_fixture
 SM="$PWD/scripts/snapshot_manifests.sh"
 export SNAPSHOT_REGISTRY_BASE="$BITS_CHANGED_REGISTRY_BASE" SNAPSHOT_ROOT="$GR/evidence/manifest_remediation" SNAPSHOT_RETRIES=0
 expect "verify: equal is exit 0"           0 '^same .*builds' -- "$SM" verify "$GV" "$GT"
 sed -i 's/"key_id":"ciris-persist-build-v1"/"key_id":"other"/' "$WORK/reg/v1/verify/function-manifest/$GV/$GT"
 expect "verify: re-keyed is exit 6"        6 'signature.key_id: snapshot "ciris-persist-build-v1" live "other"' -- "$SM" verify "$GV" "$GT"
+rm "$GR/evidence/manifest_remediation/$GV/aarch64-apple-darwin.builds.json"
 expect "verify: no snapshot is exit 7"     7 '^MISSING' -- "$SM" verify "$GV" aarch64-apple-darwin
+expect "verify-reuse: no such file is 7"   7 '^MISSING .*manifest-x86_64-pc-windows-msvc.json' -- "$SM" verify-reuse "$GV" "$WORK/nope" "$GT"
 rm "$WORK/reg/v1/builds/$GV"
 guard_fixture; rm "$WORK/reg/v1/builds/$GV"
 expect "verify: a 404 read is exit 5"      5 'HTTP 404' -- "$SM" verify "$GV" "$GT"
