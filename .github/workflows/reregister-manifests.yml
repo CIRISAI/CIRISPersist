@@ -29,8 +29,10 @@
 #     `ciris-persist-build-manifest-<v>` artifact, else the registry's own
 #     verbatim bodies (GET /v1/verify/build-manifest serves the posted bytes).
 #
-# Secrets: the tag job's, used by repost only. None is added. `dry_run: true`
-# stops a repost at `ciris-build-sign register --dry-run`.
+# Check first, always: a dispatch with the defaults (mode check, dry_run
+# true, all five targets) writes nothing. Even mode: repost posts only with
+# dry_run: false; otherwise it stops at `ciris-build-sign register --dry-run`.
+# Secrets: the tag job's, used by repost only. None is added.
 name: Re-register manifests
 
 on:
@@ -52,9 +54,9 @@ on:
         type: choice
         options: [check, repost]
       dry_run:
-        description: "repost only: stop at register --dry-run (nothing posted)"
+        description: "repost only: stop at register --dry-run (nothing posted). Set false to post"
         required: false
-        default: false
+        default: true
         type: boolean
 
 permissions:
