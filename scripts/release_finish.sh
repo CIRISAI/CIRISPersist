@@ -12,7 +12,9 @@
 #    tag/main ordering release_ship.sh sets up (v50 lesson, CIRISPersist#1008);
 # 3. waits for the release to EXIST (tag CI creates it a moment after its last
 #    job; an edit before that fails silently);
-# 4. sets the release body from the tag's annotation and asserts its BYTES;
+# 4. sets the release body from the annotation of ORIGIN's tag (fetched into
+#    refs/release-finish/v<version>; a different local tag is refused) and
+#    asserts its BYTES;
 # 5. runs scripts/verify_release.sh: every attestation tag CI's `attest` job
 #    signed (wheels, release tarballs, evidence/cc_impl.tsv) verifies with
 #    `gh attestation verify` (CIRISPersist#1028), and each desktop wheel's
@@ -26,7 +28,8 @@
 # green · 12 tag CI timeout · 13 release never appeared · 14 release edit
 # failed · 15 release body too short · 17 an attestation did not verify, a
 # wheel's bits check failed, or either could not be checked (gh too old, a
-# download failed).
+# download failed) · 18 a local tag v<version> is not origin's tag object
+# (stale; delete it and re-run) · 19 origin's tag could not be fetched.
 set -uo pipefail
 ver="${1:?version}"; rid="${2:?tag CI run id}"
 cd "$(git rev-parse --show-toplevel)" || exit 2
@@ -34,10 +37,20 @@ case "$rid" in *[!0-9]*|"") echo "tag run id must be numeric: $rid"; exit 2;; es
 info=$(gh run view "$rid" --json headBranch,event,workflowName --jq '"\(.headBranch) \(.event) \(.workflowName)"' 2>/dev/null) \
     || { echo "cannot read run $rid"; exit 2; }
 [ "$info" = "v$ver push CI" ] || { echo "run $rid is '$info', not the CI push run for v$ver"; exit 2; }
-git fetch -q origin "refs/tags/v$ver:refs/tags/v$ver" 2>/dev/null || true
-git rev-parse -q --verify "refs/tags/v$ver" >/dev/null || { echo "tag v$ver not found locally or on origin"; exit 2; }
+# The annotation is read from ORIGIN's tag, fetched into a ref of our own: the
+# CI run belongs to the remote tag. A fetch into refs/tags/ refuses to clobber
+# a stale local tag (an abandoned tagging attempt), and with `|| true` the
+# script then published the STALE annotation (Codex on PR #1039).
+tref="refs/release-finish/v$ver"
+git fetch -q origin "+refs/tags/v$ver:$tref" \
+    || { echo "cannot fetch tag v$ver from origin — refusing to read a local copy"; exit 19; }
+remote_obj=$(git rev-parse -q --verify "$tref") || { echo "fetched $tref but cannot resolve it"; exit 19; }
+local_obj=$(git rev-parse -q --verify "refs/tags/v$ver") || local_obj=""
+[ -z "$local_obj" ] || [ "$local_obj" = "$remote_obj" ] \
+    || { echo "local tag v$ver ($local_obj) is not origin's ($remote_obj) — stale; delete it with 'git tag -d v$ver' and re-run"; exit 18; }
+[ "$(git cat-file -t "$remote_obj")" = tag ] || { echo "origin's v$ver is not an annotated tag"; exit 2; }
 tmp=$(mktemp -d)
-git tag -l --format='%(contents)' "v$ver" > "$tmp/tagbody.md"
+git for-each-ref --format='%(contents)' "$tref" > "$tmp/tagbody.md"
 in_bytes=$(wc -c < "$tmp/tagbody.md")
 [ "$in_bytes" -gt 64 ] || { echo "tag v$ver annotation is $in_bytes bytes — not a CHANGELOG section"; exit 2; }
 
@@ -68,4 +81,4 @@ body_bytes=$(gh release view "v$ver" --json body --jq '.body' | wc -c)
 echo "release body bytes=$body_bytes (tag body $in_bytes)"
 [ "$body_bytes" -ge $(( in_bytes - 64 )) ] || { echo "release body too short — not the CHANGELOG section"; exit 15; }
 scripts/verify_release.sh "$ver" "$rid" || { echo "attestations of v$ver not verified (verify_release.sh exit $?)"; exit 17; }
-echo "=== RELEASE_SHIP_DONE v$ver at $(git rev-list -n1 "v$ver") ==="
+echo "=== RELEASE_SHIP_DONE v$ver at $(git rev-list -n1 "$tref") ==="

@@ -163,6 +163,60 @@ scripts/release.sh --dry-run 1.2 >/dev/null 2>&1; expect_eq "a two-part version 
 scripts/release.sh >/dev/null 2>&1; expect_eq "no version is refused" "$?" "2"
 scripts/release.sh 9.9.9 --bogus >/dev/null 2>&1; expect_eq "an unknown flag is refused" "$?" "2"
 
+echo "release_finish.sh tag source"
+# A bare origin with an annotated v9.9.0, and clones with a stale, absent,
+# equal or unfetchable local tag. A stub `gh` reports run 7 as v9.9.0's green
+# push CI, accepts the release edit and keeps the notes file it was handed, so
+# the case reads WHICH annotation the script would publish. The fixture has no
+# scripts/verify_release.sh, so a script that got that far stops at exit 17.
+RF="$PWD/scripts/release_finish.sh"
+mkdir -p "$t/rf/bin"
+cat > "$t/rf/bin/gh" <<'GHEOF'
+#!/usr/bin/env bash
+case "$*" in
+  "run view"*headBranch*) echo "v9.9.0 push CI";;
+  "run view"*status*) echo "completed/success";;
+  "release edit"*) while [ $# -gt 0 ]; do [ "$1" = --notes-file ] && cp "$2" "$RF_NOTES"; shift; done;;
+  "release view"*body*) cat "$RF_NOTES";;
+  "release view"*) echo "assets: none";;
+  *) exit 1;;
+esac
+GHEOF
+chmod +x "$t/rf/bin/gh"
+(
+    set -e
+    export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t
+    git init -q --bare -b main "$t/rf/origin.git"
+    git init -q -b main "$t/rf/seed"; cd "$t/rf/seed"
+    git commit -q --allow-empty -m one; git commit -q --allow-empty -m two
+    git tag -a v9.9.0 -m "v9.9.0: the REMOTE annotation, long enough to be a CHANGELOG section body." HEAD
+    git push -q "$t/rf/origin.git" HEAD:refs/heads/main refs/tags/v9.9.0
+    git clone -q "$t/rf/origin.git" "$t/rf/stale" 2>/dev/null; cd "$t/rf/stale"
+    git tag -d v9.9.0 >/dev/null
+    git tag -a v9.9.0 -m "v9.9.0: a STALE local annotation from an abandoned tagging attempt, long enough." HEAD~1
+    git clone -q "$t/rf/origin.git" "$t/rf/fresh" 2>/dev/null; git -C "$t/rf/fresh" tag -d v9.9.0 >/dev/null
+    git clone -q "$t/rf/origin.git" "$t/rf/same" 2>/dev/null
+    git clone -q "$t/rf/origin.git" "$t/rf/notag" 2>/dev/null
+    git -C "$t/rf/notag" tag -d v9.9.0 >/dev/null; git -C "$t/rf/notag" remote set-url origin "$t/rf/nonexistent.git"
+) || bad "release_finish fixture repos"
+rf() {
+    : > "$t/rf/notes-$1"
+    out="$(cd "$t/rf/$1" && PATH="$t/rf/bin:$PATH" RF_NOTES="$t/rf/notes-$1" FINISH_TIMEOUT_MIN=1 bash "$RF" 9.9.0 7 2>&1)"; rc=$?
+    [ -n "${RS_DEBUG:-}" ] && printf '[%s rc=%s]\n%s\n' "$1" "$rc" "$out"
+    notes="$(cat "$t/rf/notes-$1")"
+}
+rf stale
+expect_eq "a stale local tag is refused (exit 18)" "$rc" "18"
+case "$notes" in *STALE*) bad "the stale local annotation was published";; *) ok "the stale local annotation was not published";; esac
+rf fresh
+expect_eq "no local tag: the run gets past the release edit" "$rc" "17"
+case "$notes" in *REMOTE*) ok "no local tag: origin's annotation is published";; *) bad "no local tag: published [$notes]";; esac
+rf same
+expect_eq "a local tag equal to origin's is accepted" "$rc" "17"
+case "$notes" in *REMOTE*) ok "equal local tag: origin's annotation is published";; *) bad "equal local tag: published [$notes]";; esac
+rf notag
+expect_eq "an unfetchable tag is refused (exit 19), not hidden" "$rc" "19"
+
 echo "syntax"
 for f in scripts/release.sh scripts/release_ship.sh scripts/release_finish.sh scripts/release_lib.sh scripts/release_selftest.sh; do
     if bash -n "$f"; then ok "bash -n $f"; else bad "bash -n $f"; fi
