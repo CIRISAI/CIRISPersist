@@ -1,0 +1,15 @@
+# I110 (consent_scope_invariants.rs::i110_one_matcher_every_door): every door runs the scope-token gate.
+id: i110-check-consent-scope-tokens
+language: rust
+severity: hint
+message: "check_consent_scope_tokens call site"
+rule:
+  kind: call_expression
+  has:
+    field: function
+    regex: '(^|::|\.)check_consent_scope_tokens$'
+files:
+  - src/store/sqlite.rs
+  - src/store/postgres.rs
+  - src/store/memory.rs
+  - src/federation/admission.rs

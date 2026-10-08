@@ -1,0 +1,20 @@
+# I448 (lineage_head_invariants.rs): supersede_group_row runs the prev check on both arms.
+id: i448-prev-head-check
+language: rust
+severity: hint
+message: "check_prev_head_names_held call site"
+rule:
+  kind: call_expression
+  has:
+    field: function
+    regex: '(^|::|\.)check_prev_head_names_held$'
+  inside:
+    kind: function_item
+    stopBy: end
+    has:
+      field: name
+      regex: '^(supersede_group_row)$'
+files:
+  - src/store/memory.rs
+  - src/store/sqlite.rs
+  - src/store/postgres.rs

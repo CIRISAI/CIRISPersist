@@ -1,0 +1,20 @@
+# scores_read_audit.rs::all_six_scores_read_sites_log: list_scores and resolve_scores log once each.
+id: scores-read-log
+language: rust
+severity: hint
+message: "log_scores_read call site"
+rule:
+  kind: call_expression
+  has:
+    field: function
+    regex: '(^|::|\.)log_scores_read$'
+  inside:
+    kind: function_item
+    stopBy: end
+    has:
+      field: name
+      regex: '^(list_scores|resolve_scores)$'
+files:
+  - src/store/memory.rs
+  - src/store/sqlite.rs
+  - src/store/postgres.rs
