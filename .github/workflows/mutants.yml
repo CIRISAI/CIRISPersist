@@ -1,0 +1,111 @@
+name: mutants and powerset
+
+on:
+  schedule:
+    - cron: '17 6 * * *'      # nightly: mutants on scope-consent
+    - cron: '43 6 * * 0'      # Sunday: also scope-observe-sites and the powerset
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: '10'
+  CARGO_HTTP_MULTIPLEXING: 'false'
+  CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+  # No RUSTFLAGS: -D warnings here would make most mutants unviable.
+
+jobs:
+  mutants:
+    name: mutants (${{ matrix.scope }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        scope: [scope-consent, scope-observe-sites]
+    services:
+      postgres:
+        image: ghcr.io/cirisai/postgres:16
+        credentials:
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+        env:
+          POSTGRES_USER: ciris
+          POSTGRES_PASSWORD: ciris
+          POSTGRES_DB: ciris_persist_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ciris"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - name: skip observe-sites except on the weekly run
+        id: gate
+        run: |
+          if [ "${{ matrix.scope }}" = scope-observe-sites ] && [ "${{ github.event.schedule }}" = '17 6 * * *' ]; then
+            echo run=false >> "$GITHUB_OUTPUT"; else echo run=true >> "$GITHUB_OUTPUT"; fi
+      - uses: actions/checkout@v6
+        if: steps.gate.outputs.run == 'true'
+      - uses: dtolnay/rust-toolchain@1.97.0
+        if: steps.gate.outputs.run == 'true'
+      - uses: ./.github/actions/ciriscache
+        if: steps.gate.outputs.run == 'true'
+        with:
+          plat: linux-x86_64
+      - uses: taiki-e/install-action@v2
+        if: steps.gate.outputs.run == 'true'
+        with:
+          tool: cargo-nextest,cargo-mutants@27.1.0
+      - name: psql client for pg_test_db.sh
+        if: steps.gate.outputs.run == 'true'
+        run: command -v psql || (sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-client)
+      - name: mutation matrix (report-only)
+        if: steps.gate.outputs.run == 'true'
+        env:
+          CIRIS_PERSIST_PG_ADMIN_URL: postgres://ciris:ciris@localhost:5432/ciris_persist_test
+          MUTANTS_BUDGET_SECS: ${{ matrix.scope == 'scope-consent' && '7200' || '14400' }}
+          MUTANTS_JOBS: '1'
+        run: scripts/mutants.sh cargo-mutants scripts/mutants/${{ matrix.scope }}.txt
+      - uses: actions/upload-artifact@v7
+        if: always() && steps.gate.outputs.run == 'true'
+        with:
+          name: mutants-${{ matrix.scope }}
+          path: target/certify-logs/mutants/${{ matrix.scope }}/
+          retention-days: 30
+
+  powerset:
+    name: powerset ${{ matrix.part }}/8
+    if: github.event_name == 'workflow_dispatch' || github.event.schedule == '43 6 * * 0'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    # Known red: `tls` without `postgres` and `pyo3-sqlite` without `pyo3` do not
+    # compile (CIRISPersist#1030, v54.0.0). Report-only until #1030 closes; then
+    # delete this line and the job is blocking.
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [1, 2, 3, 4, 5, 6, 7, 8]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.97.0
+      - uses: ./.github/actions/ciriscache
+        with:
+          plat: linux-x86_64
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-hack
+      - name: delta (no compile)
+        run: python3 scripts/powerset_delta.py
+      - name: cargo check, partition ${{ matrix.part }} of 8
+        run: scripts/powerset.sh check ${{ matrix.part }}/8
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: powerset-${{ matrix.part }}
+          path: target/certify-logs/powerset/
+          retention-days: 30

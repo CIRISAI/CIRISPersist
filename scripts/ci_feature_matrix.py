@@ -37,6 +37,9 @@ Two coverage axes, and they are NOT the same claim:
            ever dropped silently.
 
 Usage:
+    scripts/ci_feature_matrix.py powerset [--verbose]
+                                                 # depth-2 powerset vs certify's hand
+                                                 # sets; exit 1 if a hand set is uncovered
     scripts/ci_feature_matrix.py list            # declared features, one per line
     scripts/ci_feature_matrix.py legs            # matrix-leg names, one per line
     scripts/ci_feature_matrix.py set <name>      # space-separated cargo feature string
@@ -405,6 +408,13 @@ def main(argv: list[str]) -> int:
         return report()
     if cmd == "check":
         return check()
+    if cmd == "powerset":
+        # CIRISPersist#1025 — the derived sets against the hand legs.
+        import subprocess
+        return subprocess.call(
+            [sys.executable, str(Path(__file__).with_name("powerset_delta.py")), *argv[2:]],
+            stdin=subprocess.DEVNULL,
+        )
     raise SystemExit(f"unknown command {cmd!r}")
 
 

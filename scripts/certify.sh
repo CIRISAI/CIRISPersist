@@ -11,6 +11,8 @@
 #                               print the leg's RUSTFLAGS and cargo command; build
 #                               nothing. Read by scripts/fingerprint_check.sh.
 #   certify.sh verdict          re-print the verdict table of the run in
+#   certify.sh mutants <scope>  mutation matrix over a scope (REPORT-ONLY; docs/MUTATION_TESTING.md)
+#   certify.sh powerset [M/N]   cargo check every depth-2 feature set (docs/FEATURE_MATRIX.md)
 #                               $CERTIFY_LOG_DIR; run nothing.
 #
 # EXIT CODE IS THE ONLY VERDICT — captured on its own line immediately after
@@ -156,10 +158,10 @@ cd "$(dirname "$0")/.." || exit 1
 
 MODE="${1:-full}"; shift 2>/dev/null || true
 case "$MODE" in
-    quick|focus|full|prebuild|fingerprint|verdict|keys) ;;
+    quick|focus|full|prebuild|fingerprint|verdict|keys|mutants|powerset) ;;
     -h|--help|help)
-        sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
-    *) echo "unknown mode '$MODE'; expected quick|focus|full|prebuild|fingerprint|verdict" >&2; exit 2 ;;
+        sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "unknown mode '$MODE'; expected quick|focus|full|prebuild|fingerprint|verdict|mutants|powerset" >&2; exit 2 ;;
 esac
 
 # shellcheck source=scripts/ci_env.sh
@@ -449,6 +451,24 @@ if [ -n "$STRAY" ]; then
     echo "  CERTIFY_IGNORE_STRAY=1 — proceeding anyway." >&2
 fi
 
+# v53.2.0 (#1024/#1025) — two tiers that never print a certification verdict.
+# They come AFTER the lock and the stray guard (one postgres cluster, one
+# target dir, and powerset rewrites Cargo.toml) and BEFORE the RUSTFLAGS
+# export: under `-D warnings` most mutants would build as unviable, and every
+# depth-2 set's dead_code would be a red about nothing. They do not wipe
+# $LOG_DIR, so the last full run's logs survive. `exec` keeps fd 8, so the
+# lock is held for the whole run. The RUSTFLAGS export above (ci_env.sh) is
+# undone here: these tiers build without `-D warnings` on purpose.
+case "$MODE" in
+    mutants|powerset) unset RUSTFLAGS ;;
+esac
+case "$MODE" in
+    mutants)
+        [ -n "${1:-}" ] || { echo "usage: certify.sh mutants <scripts/mutants/scope-*.txt>" >&2; exit 2; }
+        CERTIFY_LOG_DIR="$LOG_DIR" exec scripts/mutants.sh "${MUTANTS_TOOL:-cargo-mutants}" "$1" ;;
+    powerset)
+        CERTIFY_LOG_DIR="$LOG_DIR" exec scripts/powerset.sh check ${1:+"$1"} ;;
+esac
 rm -rf "$LOG_DIR"; mkdir -p "$LOG_DIR"
 
 # ── disk and memory guards ───────────────────────────────────────────────
