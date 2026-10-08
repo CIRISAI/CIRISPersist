@@ -1,9 +1,8 @@
 name: Bench
 
 # v0.1.7 — performance trend tracking. Mirrors CIRISAgent's
-# memory-benchmark.yml trigger shape (weekly cron + manual + path-
-# touched PR runs) plus push-to-main so the gh-pages trend chart
-# captures every release point.
+# memory-benchmark.yml trigger shape (weekly cron + manual). Push-to-main
+# and PR runs were both removed later; see the `on:` block for why.
 #
 # The five bench harnesses (`benches/{ingest_pipeline,canonicalize,
 # sign,dedup_key,queue}.rs`) are criterion-based; criterion writes
@@ -20,15 +19,20 @@ on:
     # so a single coffee surveys both PoB primitives' health.
     - cron: '0 7 * * 1'
   workflow_dispatch:
-  push:
-    branches: [main]
   # v30.12.0 (CIRISPersist#639) — the `pull_request` trigger is GONE.
   # This job books a runner for the better part of an hour, and the org's
   # slot pool is shared with every sibling repo; a persist PR that touched
   # `Cargo.toml` took a slot away from the CI matrix that actually gates
-  # the merge. Trend data is a per-release-point concern, so push-to-main
-  # plus the weekly cron is the right cadence. `workflow_dispatch` covers
-  # the "I want to see this PR's numbers" case on demand.
+  # the merge. `workflow_dispatch` covers the "I want to see this PR's
+  # numbers" case on demand.
+  #
+  # v53.2.0 — the `push: main` trigger is GONE too, for the same reason one
+  # step further along. Every merge booked 34–47 min of a 16–20-slot pool
+  # while the merge's own CI matrix and the release tag run were queueing for
+  # those slots. The trend chart does not need a point per merge: the weekly
+  # cron keeps the series continuous, and a release that wants its own point
+  # dispatches this workflow on main (`gh workflow run bench.yml --ref main`),
+  # which publishes exactly as a push did — see the publish step's gate.
 
 permissions:
   # benchmark-action needs `contents: write` to push to the
@@ -372,14 +376,18 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Publish to gh-pages trend chart
-        # Only on push to main (no PR pushes — the action's perm
-        # check handles this but skipping early avoids noise).
+        # Only for runs ON main — the cron (which always runs on the
+        # default branch) and a dispatch with `--ref main`. A dispatch on a
+        # PR branch measures and uploads the artifact but publishes no
+        # point. (Was `event_name == 'push'`; with the push trigger gone
+        # that gate could never fire again and the chart would have
+        # silently stopped.)
         # benchmark-action writes per-bench history to gh-pages
         # branch under dev/bench/; the resulting site at
         # https://cirisai.github.io/CIRISPersist/dev/bench/ shows
         # trend charts per bench function. (The gh-pages root has no
         # index.html — the bare Pages URL 404s by design.)
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        if: github.ref == 'refs/heads/main' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
         uses: benchmark-action/github-action-benchmark@v1
         with:
           name: ciris-persist criterion benchmarks
