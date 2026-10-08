@@ -131,6 +131,11 @@ pub mod wa_cert;
 pub mod wire_vocabulary;
 pub mod witness;
 
+// v53.2.0 (CIRISPersist#1026) — the Rust text counts of the gates ported to
+// ast-grep equal rules/expected.json, the counts scripts/ast_gates.sh asserts.
+#[cfg(test)]
+mod ast_gate_parity;
+
 /// v4.12.1 (CIRISPersist#189) — verify-style embedded version literal for
 /// the agent Trust-page / bundle-refresh integrity check.
 ///

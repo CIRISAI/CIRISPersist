@@ -1,0 +1,13 @@
+# I26 (blob_surface_gates.rs): no backend calls the uncached content-master resolver.
+id: i26-uncached-content-master
+language: rust
+severity: hint
+message: "resolve_persisted_content_master call site"
+rule:
+  kind: call_expression
+  has:
+    field: function
+    regex: '(^|::|\.)resolve_persisted_content_master$'
+files:
+  - src/store/sqlite.rs
+  - src/store/postgres.rs

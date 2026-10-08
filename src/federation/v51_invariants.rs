@@ -656,12 +656,15 @@ pub(crate) mod owner_withdraw {
                 .await
                 .expect("stored")
         };
-        let mut lapsing = ts::owner_binding_attestation(&format!("ob1-{s}"), &owner, &node2);
-        lapsing.expires_at = Some(chrono::Utc::now() + chrono::Duration::milliseconds(300));
-        ts::reseal(&mut lapsing);
-        put(lapsing).await;
-        assert_eq!(owner_of(d, &node2).await.unwrap(), Some(owner.clone()));
-        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        let lapses_at = put_lapsing_owner_binding(
+            d,
+            &format!("ob1-{s}"),
+            &owner,
+            &node2,
+            std::time::Duration::ZERO,
+        )
+        .await;
+        sleep_past(lapses_at).await;
         assert_eq!(
             owner_of(d, &node2).await.unwrap(),
             None,
@@ -747,6 +750,99 @@ pub(crate) mod owner_withdraw {
         // the fixture stamps every owner binding 2026-05-01 — i.e. A's ob3 is
         // already BACKDATED into B's era; the refusal above is the backdating
         // witness too (B's binding was in force at the row's instant)
+    }
+
+    /// The first window a lapsing binding is given, and how many times it is
+    /// doubled before the helper gives up (300 ms → 9.6 s).
+    const LAPSE_WINDOW_MS: i64 = 300;
+    const LAPSE_ATTEMPTS: u32 = 6;
+
+    /// CIRISPersist#1011 — store `owner → node`, expiring a short window after
+    /// it is stamped, and return that expiry once `owner_of` has been SEEN to
+    /// name `owner`.
+    ///
+    /// The window starts at the stamp, before the reseal, the put and the
+    /// read. I126 gave it a fixed 300 ms and asserted the binding live
+    /// straight after the put; on a 4-vCPU hosted runner the postgres put
+    /// took longer than that, the binding had legitimately lapsed when
+    /// `owner_of` read it, and the precondition failed with `left: None`. The
+    /// door was right; the test's clock budget was not. Reproduced locally by
+    /// pinning the test to 2 CPUs under 12 busy loops: stamp-to-read
+    /// 325–869 ms, 5/5 red.
+    ///
+    /// So: a `None` read that FINISHED after the expiry is a lapse, not a
+    /// verdict — retry with a fresh binding and twice the window. A `None`
+    /// read that finished before the expiry is still a failure, so the helper
+    /// keeps witnessing that a live binding is read as live.
+    ///
+    /// `stall_first` delays the first attempt's read, standing in for a slow
+    /// put (the witness below).
+    async fn put_lapsing_owner_binding(
+        d: &dyn FederationDirectory,
+        id: &str,
+        owner: &str,
+        node: &str,
+        stall_first: std::time::Duration,
+    ) -> chrono::DateTime<chrono::Utc> {
+        let mut window = chrono::Duration::milliseconds(LAPSE_WINDOW_MS);
+        for attempt in 0..LAPSE_ATTEMPTS {
+            let mut lapsing =
+                ts::owner_binding_attestation(&format!("{id}-{attempt}"), owner, node);
+            let expires = chrono::Utc::now() + window;
+            lapsing.expires_at = Some(expires);
+            ts::reseal(&mut lapsing);
+            d.put_attestation(SignedAttestation {
+                attestation: lapsing,
+            })
+            .await
+            .expect("stored");
+            if attempt == 0 {
+                tokio::time::sleep(stall_first).await;
+            }
+            let read = owner_of(d, node).await.unwrap();
+            let read_done = chrono::Utc::now();
+            if read.as_deref() == Some(owner) {
+                return expires;
+            }
+            assert!(
+                read.is_none() && read_done >= expires,
+                "owner_of read {read:?} by {read_done}, while {owner}'s binding was live until {expires}"
+            );
+            window = window * 2;
+        }
+        panic!("{owner}'s binding lapsed before every read ({LAPSE_ATTEMPTS} attempts)");
+    }
+
+    /// Sleep until 100 ms past `instant` (the fixed 400 ms this replaced was a
+    /// 300 ms window plus that margin).
+    async fn sleep_past(instant: chrono::DateTime<chrono::Utc>) {
+        let left = instant + chrono::Duration::milliseconds(100) - chrono::Utc::now();
+        if let Ok(left) = left.to_std() {
+            tokio::time::sleep(left).await;
+        }
+    }
+
+    /// CIRISPersist#1011 witness — the interleaving that failed I126 on the
+    /// hosted runner, forced: the first binding lapses between the put and
+    /// the read. The helper must still return a binding it saw live, and
+    /// that binding must then lapse.
+    #[tokio::test]
+    async fn i126_lapsing_binding_survives_a_put_slower_than_its_window() {
+        let d = crate::store::memory::MemoryBackend::new();
+        let d = &d as &dyn FederationDirectory;
+        let s = suffix();
+        let (owner, node) = (format!("ow-owner-{s}"), format!("ow-node-{s}"));
+        register(d, &owner, &[it::USER]).await;
+        register(d, &node, &[it::NODE]).await;
+        let stall = std::time::Duration::from_millis(LAPSE_WINDOW_MS as u64 + 100);
+        let lapses_at =
+            put_lapsing_owner_binding(d, &format!("ob-{s}"), &owner, &node, stall).await;
+        assert!(
+            lapses_at - chrono::Utc::now() < chrono::Duration::milliseconds(2 * LAPSE_WINDOW_MS),
+            "the binding returned is the retry's, not one with an unbounded window"
+        );
+        sleep_past(lapses_at).await;
+        assert_eq!(owner_of(d, &node).await.unwrap(), None, "and it lapses");
     }
 
     macro_rules! runners {

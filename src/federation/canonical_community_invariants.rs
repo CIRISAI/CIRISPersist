@@ -3516,24 +3516,46 @@ mod run {
     #[test]
     fn i190_f_ci_preflight_gates_the_bundle_quorum() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        // v53.2.0 (#1029): the tag job's sign/preflight/register steps moved
+        // into scripts/build_manifest.sh (shared with reregister-manifests.yml).
+        // The property is unchanged — the self-test runs first, the snapshot
+        // gate runs before registration — so the witness follows the
+        // indirection: ci.yml must call `build_manifest.sh preflight` BEFORE
+        // `build_manifest.sh register`, and the script must run both commands.
         let ci = std::fs::read_to_string(root.join(".github/workflows/ci.yml")).unwrap();
         let code: Vec<&str> = ci
             .lines()
             .filter(|l| !l.trim_start().starts_with('#'))
             .collect();
+        let pos = |needle: &str| code.iter().position(|l| l.contains(needle));
+        let preflight =
+            pos("build_manifest.sh preflight").expect("ci.yml runs `build_manifest.sh preflight`");
+        let register =
+            pos("build_manifest.sh register").expect("ci.yml runs `build_manifest.sh register`");
+        assert!(
+            preflight < register,
+            "the pre-flight gate runs BEFORE registration in ci.yml"
+        );
+        let script_src = std::fs::read_to_string(root.join("scripts/build_manifest.sh")).unwrap();
+        let script_code: Vec<&str> = script_src
+            .lines()
+            .filter(|l| !l.trim_start().starts_with('#'))
+            .collect();
         for needle in [
             "python3 scripts/preflight_trust_root.py --self-test",
-            "python3 scripts/preflight_trust_root.py dist/steward-key.json",
+            "python3 scripts/preflight_trust_root.py \"$OUT/steward-key.json\"",
         ] {
             assert!(
-                code.iter().any(|l| l.contains(needle)),
-                "the pre-flight step runs {needle:?}"
+                script_code.iter().any(|l| l.contains(needle)),
+                "build_manifest.sh preflight runs {needle:?}"
             );
         }
-        assert!(
-            !code.iter().any(|l| l.contains("quorum NOT asserted")),
-            "no step reports the quorum instead of gating it (#809)"
-        );
+        for (name, lines) in [("ci.yml", &code), ("build_manifest.sh", &script_code)] {
+            assert!(
+                !lines.iter().any(|l| l.contains("quorum NOT asserted")),
+                "no step in {name} reports the quorum instead of gating it (#809)"
+            );
+        }
         let script = root.join("scripts/preflight_trust_root.py");
         let self_test = std::process::Command::new("python3")
             .arg(&script)

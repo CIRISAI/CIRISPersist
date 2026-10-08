@@ -1,6 +1,6 @@
 [package]
 name = "ciris-persist"
-version = "53.1.8"
+version = "53.2.0"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 description = "Unified Rust persistence for the CIRIS federation — signed events, time-series, runtime state."
@@ -759,6 +759,13 @@ redb = "4"
 # Async runtime — phase 1+
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "signal", "time"] }
 
+# v53.2.0 (CIRISPersist#1027, CIRISServer#746 §5 "metrics facade in
+# libraries") — `observe::emit_metrics` writes the read-telemetry counters
+# through the facade at the host's scrape. No default features (no exporter,
+# no recorder): without a recorder installed every call is a no-op. The host
+# that installs a recorder must resolve the same 0.24 major, or it sees nothing.
+metrics = { version = "0.24", default-features = false }
+
 # v2.13.0 (CIRISPersist#113) — change-feed substrate for
 # `Engine::subscribe_detection_events`. `futures-core` is the canonical
 # `Stream` trait surface (the workspace already pulls it transitively
@@ -898,6 +905,10 @@ tempfile = "3"
 # the generation-custody witnesses (inert against the baked Google anchors).
 # The version verify-core's test-support already resolves; no new crate.
 rcgen = "0.13"
+# v53.2.0 (CIRISPersist#1027) — the `live-check` equivalent: a debugging
+# recorder captures what `observe::emit_metrics` writes and I553 compares the
+# names, label keys and label values with the catalogue.
+metrics-util = { version = "0.19", default-features = false, features = ["debugging"] }
 # Postgres integration tests share a single test database; parallel
 # test execution races on schema setup. serial_test forces the
 # postgres-tagged tests to run one at a time without slowing the

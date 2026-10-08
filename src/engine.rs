@@ -1317,6 +1317,13 @@ impl Engine {
         crate::observe::snapshot()
     }
 
+    /// v53.2.0 (CIRISPersist#1027) — write the read-telemetry counters to the
+    /// `metrics` facade ([`crate::observe::emit_metrics`]); call it at scrape
+    /// time. A no-op when the host has installed no `metrics` 0.24 recorder.
+    pub fn emit_telemetry_metrics(&self) {
+        crate::observe::emit_metrics();
+    }
+
     /// v53.1.8 (CIRISPersist#1014) — the substrate caches' counters (FSD V4.0
     /// §7.2): the per-backend repository-statistics and scoring-factor caches.
     #[cfg(any(feature = "postgres", feature = "sqlite"))]

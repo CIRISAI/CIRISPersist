@@ -12,6 +12,12 @@
 //! - **I551** (from disk, comments stripped): every door, fold and backend
 //!   label code emits is catalogued, every catalogued one is emitted, and the
 //!   snapshot's samples carry exactly the catalogued names and label values.
+//! - **I552** (v53.2.0, CIRISPersist#1027, from disk): the Weaver registry's
+//!   rendering (`telemetry/catalog.json`) and `TELEMETRY_CATALOG` declare the
+//!   same metrics, instruments, units, label keys and label values.
+//! - **I553** (v53.2.0, CIRISPersist#1027): what `emit_metrics` writes to a
+//!   `metrics` recorder carries exactly the catalogued names, label keys and
+//!   label values, at the counters' values — the `live-check` equivalent.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -274,6 +280,216 @@ fn i551_samples_carry_exactly_the_catalogued_names_and_labels() {
             }
         }
     }
+}
+
+// ── I552 ─────────────────────────────────────────────────────────────────
+
+/// One metric as `(instrument, unit, {label key → values})`.
+type MetricShape = (String, String, BTreeMap<String, BTreeSet<String>>);
+
+/// v53.2.0 (CIRISPersist#1027) — `telemetry/catalog.json`, which
+/// `scripts/weaver_check.sh` renders from the Weaver registry
+/// (`telemetry/registry/*.yaml`) and fails on when the committed copy differs.
+/// Read from this crate's own manifest dir, never another checkout.
+fn weaver_catalog() -> BTreeMap<String, MetricShape> {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("telemetry/catalog.json");
+    let json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).expect("read telemetry/catalog.json"))
+            .expect("telemetry/catalog.json is JSON");
+    let mut out = BTreeMap::new();
+    for m in json["metrics"].as_array().expect("metrics array") {
+        let s = |v: &serde_json::Value| v.as_str().expect("string").to_owned();
+        let labels = m["labels"]
+            .as_array()
+            .expect("labels array")
+            .iter()
+            .map(|l| {
+                let values = l["values"]
+                    .as_array()
+                    .expect("values")
+                    .iter()
+                    .map(s)
+                    .collect();
+                (s(&l["key"]), values)
+            })
+            .collect();
+        let prior = out.insert(s(&m["name"]), (s(&m["instrument"]), s(&m["unit"]), labels));
+        assert!(
+            prior.is_none(),
+            "I552 the registry lists {} twice",
+            m["name"]
+        );
+    }
+    out
+}
+
+/// The registry and `TELEMETRY_CATALOG` declare the same metrics, units,
+/// instruments, label keys and label values — compared as whole maps, so a
+/// name, key or value on either side only is red.
+#[test]
+fn i552_the_weaver_registry_and_the_catalogue_agree() {
+    let registry = weaver_catalog();
+    let catalogue: BTreeMap<String, MetricShape> = TELEMETRY_CATALOG
+        .iter()
+        .map(|e| {
+            let instrument = match e.kind {
+                catalog::MetricKind::Counter => "counter",
+            };
+            let labels = e
+                .labels
+                .iter()
+                .map(|l| {
+                    let values = l.values.iter().map(|v| (*v).to_owned()).collect();
+                    (l.key.to_owned(), values)
+                })
+                .collect();
+            (
+                e.name.to_owned(),
+                (instrument.to_owned(), e.unit.to_owned(), labels),
+            )
+        })
+        .collect();
+    assert_eq!(registry.len(), 7, "I552 the registry's metric count");
+    assert_eq!(
+        registry, catalogue,
+        "I552 telemetry/registry (via catalog.json) vs TELEMETRY_CATALOG"
+    );
+}
+
+// ── I553 ─────────────────────────────────────────────────────────────────
+
+/// Every `(backend, door)` read once (no rows, 1 byte), every fold entered
+/// once around one memory `get_attestation` read: then `emit_metrics` into a
+/// debugging recorder must write every catalogued name with every catalogued
+/// label value and nothing else, each series at exactly the value the
+/// snapshot reads for it.
+#[tokio::test(flavor = "current_thread")]
+async fn i553_emit_metrics_writes_exactly_the_catalogue() {
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+    let local = LocalCounters::install();
+    for backend in StoreBackend::ALL {
+        for door in Door::ALL {
+            super::record_read::<crate::federation::Attestation>(*backend, *door, "i553", &[], 1);
+        }
+    }
+    for f in Fold::ALL {
+        super::fold(*f, async {
+            super::record_read::<crate::federation::Attestation>(
+                StoreBackend::Memory,
+                Door::GetAttestation,
+                "i553",
+                &[],
+                1,
+            );
+        })
+        .await;
+    }
+    // Every catalogued unit maps to a metrics::Unit: a `None` would describe
+    // that counter with no unit, silently.
+    for entry in TELEMETRY_CATALOG {
+        let want = match entry.unit {
+            "By" => metrics::Unit::Bytes,
+            "{read}" | "{row}" | "{call}" => metrics::Unit::Count,
+            other => panic!("I553 {}: unit {other:?} has no mapping here", entry.name),
+        };
+        assert_eq!(
+            entry.metrics_unit(),
+            Some(want),
+            "I553 {}: unit {:?}",
+            entry.name,
+            entry.unit
+        );
+    }
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    metrics::with_local_recorder(&recorder, super::emit_metrics);
+
+    // (name, sorted labels) → value, on both sides.
+    type Series = BTreeMap<(String, Vec<(String, String)>), u64>;
+    let mut emitted = Series::new();
+    for (key, unit, description, value) in snapshotter.snapshot().into_vec() {
+        let key = key.key();
+        let name = key.name().to_owned();
+        let entry = TELEMETRY_CATALOG
+            .iter()
+            .find(|e| e.name == name)
+            .unwrap_or_else(|| panic!("I553 emitted {name}, which is not catalogued"));
+        assert_eq!(
+            description.as_ref().map(|d| d.to_string()).as_deref(),
+            Some(entry.description),
+            "I553 {name}: description"
+        );
+        // The recorder sees the catalogued unit, mapped: `By` as bytes, a
+        // `{...}` annotation as a count (Codex round 2 on PR #1039).
+        assert_eq!(
+            unit,
+            entry.metrics_unit(),
+            "I553 {name}: unit (catalogue {:?})",
+            entry.unit
+        );
+        let DebugValue::Counter(v) = value else {
+            panic!("I553 {name}: not a counter: {value:?}")
+        };
+        let mut labels: Vec<(String, String)> = key
+            .labels()
+            .map(|l| (l.key().to_owned(), l.value().to_owned()))
+            .collect();
+        labels.sort();
+        emitted.insert((name, labels), v);
+    }
+    let read: Series = local
+        .snapshot()
+        .samples()
+        .into_iter()
+        .map(|s| {
+            let mut labels: Vec<(String, String)> = s
+                .labels
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect();
+            labels.sort();
+            ((s.name.to_owned(), labels), s.value)
+        })
+        .collect();
+    assert_eq!(emitted, read, "I553 emitted series vs the snapshot");
+
+    // Every catalogued (name, key, value) was emitted, and nothing else.
+    let mut seen: BTreeMap<String, BTreeMap<String, BTreeSet<String>>> = BTreeMap::new();
+    for (name, labels) in emitted.keys() {
+        let keys = seen.entry(name.clone()).or_default();
+        for (k, v) in labels {
+            keys.entry(k.clone()).or_default().insert(v.clone());
+        }
+    }
+    let catalogue: BTreeMap<String, BTreeMap<String, BTreeSet<String>>> = TELEMETRY_CATALOG
+        .iter()
+        .map(|e| {
+            let labels = e
+                .labels
+                .iter()
+                .map(|l| {
+                    let values = l.values.iter().map(|v| (*v).to_owned()).collect();
+                    (l.key.to_owned(), values)
+                })
+                .collect();
+            (e.name.to_owned(), labels)
+        })
+        .collect();
+    assert_eq!(
+        seen, catalogue,
+        "I553 emitted names/labels vs the catalogue"
+    );
+    assert_eq!(
+        emitted[&(
+            catalog::FOLD_CALLS.to_owned(),
+            vec![(
+                catalog::LABEL_FOLD.to_owned(),
+                Fold::TrustRootValid.label().to_owned()
+            )]
+        )],
+        1,
+        "I553 fold.calls{{fold=trust_root_valid}} is the one seeded entry"
+    );
 }
 
 // ── I549 ─────────────────────────────────────────────────────────────────

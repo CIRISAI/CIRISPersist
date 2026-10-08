@@ -19,3 +19,6 @@ __pycache__/
 # cargo-mutants scratch + reports (CIRISPersist#607 gatecraft)
 mutants.out/
 mutants.out.old/
+
+# scripts/release.sh stage state (one marker per completed stage)
+/.release/

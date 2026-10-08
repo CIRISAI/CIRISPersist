@@ -1,0 +1,13 @@
+# I26 (blob_surface_gates.rs): the backends resolve the content master through the cache.
+id: i26-cached-content-master
+language: rust
+severity: hint
+message: "resolve_persisted_content_master_cached call site"
+rule:
+  kind: call_expression
+  has:
+    field: function
+    regex: '(^|::|\.)resolve_persisted_content_master_cached$'
+files:
+  - src/store/sqlite.rs
+  - src/store/postgres.rs

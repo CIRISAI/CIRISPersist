@@ -1,0 +1,9 @@
+# Wheel hashes the registry once carried under the WRONG version (CIRISPersist#1029).
+# scripts/bits_changed.sh check 4 refuses to sign or accept any of these as a
+# release's wheel, unless the line's second column names that release: the
+# 29.0.0 wheel is still the right bytes for v29.0.0 itself.
+#
+# Format: <sha256 hex>  <the version these bytes really are>  <target>  <where it was found>
+# Append only. Read from the live registry on 2026-10-08 (GET /v1/verify/function-manifest).
+51193a5afd0789337ca75b2704d413be720307134486242775540050f5cc4a0a  29.0.0  aarch64-unknown-linux-gnu  registered as 53.1.8 (tag run 37692136047)
+8a1e5a8f53e102cb2604a36b7faf7266ad94fa920a8b9e808443a8b1cf60eb12  29.0.0  x86_64-pc-windows-msvc  registered as 53.0.1 and 53.1.0-53.1.8 (ten versions; 53.1.8 tag run 37692136047)

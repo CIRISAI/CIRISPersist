@@ -1,0 +1,8 @@
+# CIRISPersist's telemetry registry manifest (OTel Weaver). CIRISServer merges
+# the four repos' registries and gates on collisions (CIRISServer#746 §3.3).
+file_format: definition_manifest/2.0
+name: ciris_persist
+description: CIRISPersist read telemetry (door reads and folds), CIRISPersist#1014/#1027.
+# The schema's own version, not the crate's: bump it when a name, unit or
+# label set changes.
+schema_url: https://ciris.ai/schemas/persist/telemetry/1.0.0

@@ -66,6 +66,162 @@ jobs:
   # the merge commit's TREE equals the PR head's, the PR run already certified
   # those bytes and the main-CI wait is skipped. That is where tree equality
   # belongs, and it is measured (−35 min on v46.4.0's ship).
+  #
+  # v53.2.0 (CIRISPersist#1021) — tree equality DOES now gate one run, and it is not the run #895
+  # removed: the `tree` job below skips MAIN's run of a merge commit whose
+  # tree equals its PR head's tree, when that PR head has a successful CI run.
+  # It never skips a tag run, so the tag still publishes the versioned
+  # CIRISCache blob (the #896 finding stands). Measured before this cut: 5 of
+  # the last 10 main runs were cancelled — by the tag push on the same SHA
+  # (#397's group) or by the next merge — after holding up to 2.5 h of
+  # runners for bytes the PR run had already certified.
+  tree:
+    name: tree equality (main merges only)
+    # Runs ONLY for a push to main. Everywhere else it is skipped, and the
+    # dependents' `!cancelled() && needs.tree.outputs.skip != 'true'` reads an
+    # empty output as "run" — so PR and tag runs do not wait for a runner for
+    # this job.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read   # list the PR head's CI runs
+    outputs:
+      skip: ${{ steps.cmp.outputs.skip }}
+      skip_ios: ${{ steps.cmp.outputs.skip_ios }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 2   # HEAD and BOTH parents of a merge commit
+      - id: cmp
+        # Fails OPEN: any error leaves skip=false and the full run proceeds.
+        # Skips only when all three hold —
+        #   1. HEAD is a merge (has a second parent; a squash or direct push
+        #      to main always runs),
+        #   2. tree(HEAD) == tree(HEAD^2): the merge changed no bytes the PR
+        #      head did not already have,
+        #   3. a `pull_request` run of THIS workflow on HEAD^2 concluded
+        #      success — the PR run did certify those bytes; tree equality
+        #      alone would trust a run that may have been red or bypassed.
+        #
+        # `skip_ios` (CIRISPersist#1019) is stricter. The PR run builds iOS only
+        # when the diff touches an iOS-relevant path (`ios-paths` below), so a
+        # passing PR run need not have built iOS at all. iOS is skipped here
+        # only if that PR run's `ios PyO3 abi3` jobs ran AND all succeeded —
+        # otherwise main is where an iOS break is caught, at merge, not at the
+        # tag.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          WORKFLOW: ${{ github.workflow }}
+        run: |
+          skip=false; skip_ios=false
+          if head2="$(git rev-parse -q --verify 'HEAD^2' 2>/dev/null)"; then
+            t_head="$(git rev-parse 'HEAD^{tree}')"
+            t_pr="$(git rev-parse 'HEAD^2^{tree}' 2>/dev/null || echo none)"
+            echo "HEAD tree $t_head; PR head $head2 tree $t_pr"
+            if [ "$t_head" = "$t_pr" ]; then
+              run_id="$(gh api "repos/$REPO/actions/runs?head_sha=$head2&event=pull_request&status=success" \
+                     --jq "[.workflow_runs[] | select(.name == \"$WORKFLOW\") | .id] | first // empty" 2>/dev/null || true)"
+              case "$run_id" in ''|*[!0-9]*) echo "no successful '$WORKFLOW' pull_request run on $head2 (API: ${run_id:-none}) — running everything"; run_id="" ;; esac
+              if [ -n "$run_id" ]; then
+                echo "PR head $head2 passed '$WORKFLOW' in run $run_id"
+                skip=true
+                ios="$(gh api "repos/$REPO/actions/runs/$run_id/jobs?per_page=100" --paginate \
+                       --jq '.jobs[] | select(.name | startswith("ios PyO3 abi3")) | .conclusion' 2>/dev/null || true)"
+                echo "that run's iOS build jobs: $(echo "$ios" | tr '\n' ' ')"
+                if [ -n "$ios" ] && ! grep -qv '^success$' <<<"$ios"; then skip_ios=true; fi
+              fi
+            fi
+          else
+            echo "HEAD has no second parent — not a merge commit; running everything."
+          fi
+          echo "skip=$skip skip_ios=$skip_ios"
+          { echo "skip=$skip"; echo "skip_ios=$skip_ios"; } >> "$GITHUB_OUTPUT"
+          if [ "$skip" = true ]; then
+            echo "::notice title=main run skipped::merge tree equals PR head $head2, whose CI run passed. Nothing new to test."
+          fi
+          if [ "$skip" = true ] && [ "$skip_ios" != true ]; then
+            echo "::notice title=iOS runs on main::the PR run did not build iOS (paths filter), so main builds it."
+          fi
+
+  # v53.2.0 (CIRISPersist#1019) — the iOS build runs on a PR only when the diff
+  # can break it. `ios-build` was ungated: 48 and 52 min per PR (run
+  # 37662321512) on the macOS pool, which is the tag run's critical path. It
+  # still runs on every push to main (minus the tree-skip above, which keeps
+  # iOS unless the PR run built it green) and on every tag — so an iOS break is
+  # caught at merge, never first at the tag.
+  #
+  # iOS-relevant, by path: the FFI surface (`src/ffi/`), the manifest and lock
+  # (features, deps, the crate-type — but NOT a change that is only the
+  # package `version =` bump in either file, which every release PR carries),
+  # `pyproject.toml` (the PyO3/abi3 shape),
+  # `.cargo/` (the iOS target config), this workflow (the build itself lives
+  # inline here — there are no separate iOS scripts or xcconfig files), and the
+  # cache composite it restores through. By content: any changed `.rs` whose
+  # patch touches a `target_os`/`target_vendor`/`target_family`/`target_arch`/
+  # `target_env` cfg, or that already carries one — platform-gated code is the
+  # one thing a Linux leg cannot see. Fails OPEN: any error builds iOS.
+  ios-paths:
+    name: iOS-relevant paths (PRs only)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      ios: ${{ steps.diff.outputs.ios }}
+    steps:
+      - uses: actions/checkout@v6
+      - id: diff
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          NFILES: ${{ github.event.pull_request.changed_files }}
+        run: |
+          ios=true
+          why="fail-open default"
+          # The files API lists at most 3000; past that, do not guess.
+          if [ "${NFILES:-0}" -lt 3000 ] \
+             && gh api "repos/$REPO/pulls/$PR/files?per_page=100" --paginate > "$RUNNER_TEMP/files.json" 2>/dev/null \
+             && files="$(jq -r '.[] | .filename, (.previous_filename // empty)' "$RUNNER_TEMP/files.json")"; then
+            ios=false; why="no iOS-relevant path or platform cfg in the diff"
+            # A Cargo.toml / Cargo.lock change that is EXACTLY one
+            # `-version = "…"` and one `+version = "…"` line is the release
+            # bump. It cannot break the iOS build, and without this exception
+            # every release PR (both files, every time) would build iOS. A dep
+            # upgrade in the lock also moves `checksum`/`source` lines, so it
+            # never matches.
+            bump_only() {
+              jq -r --arg f "$1" '[.[] | select(.filename == $f) | .patch // "x"
+                 | split("\n")[] | select(test("^[-+]") and (test("^(\\+\\+\\+|---) ") | not))]
+                 | (length == 2) and all(test("^[-+]version = \"[^\"]+\"$"))' "$RUNNER_TEMP/files.json"
+            }
+            while IFS= read -r f; do
+              case "$f" in
+                Cargo.toml|Cargo.lock)
+                  [ "$(bump_only "$f")" = true ] && continue
+                  ios=true; why="path $f"; break ;;
+                src/ffi/*|pyproject.toml|.cargo/*|.github/workflows/ci.yml|.github/actions/ciriscache/*)
+                  ios=true; why="path $f"; break ;;
+              esac
+            done <<<"$files"
+            if [ "$ios" = false ]; then
+              cfg='target_(os|vendor|family|arch|env)[[:space:]]*='
+              hit="$(jq -r '.[] | select(.filename | endswith(".rs")) | select((.patch // "") | test("target_(os|vendor|family|arch|env)\\s*=")) | .filename' "$RUNNER_TEMP/files.json" | head -1)"
+              if [ -n "$hit" ]; then ios=true; why="platform cfg in the patch of $hit"; fi
+              if [ "$ios" = false ]; then
+                while IFS= read -r f; do
+                  case "$f" in *.rs) [ -f "$f" ] && grep -qE "$cfg" "$f" && { ios=true; why="$f carries a platform cfg"; break; } ;; esac
+                done <<<"$files"
+              fi
+            fi
+          fi
+          echo "ios=$ios ($why)"
+          echo "ios=$ios" >> "$GITHUB_OUTPUT"
+          [ "$ios" = true ] || echo "::notice title=iOS build skipped on this PR::$why. main and tag runs still build iOS."
+
   # Mission category §4 (PLATFORM_ARCHITECTURE.md §4):
   # the linux-x86_64 path that runs the full feature set with a
   # real Postgres backing the integration tests.
@@ -83,6 +239,8 @@ jobs:
     # exercises the full-features compile so a "all-substrates"
     # backstop entry isn't necessary here.
     name: linux-x86_64 (${{ matrix.substrate.name }})
+    needs: tree
+    if: ${{ !cancelled() && needs.tree.outputs.skip != 'true' }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -178,6 +336,30 @@ jobs:
           - { name: cirisnode,  leg: cirisnode,  gauntlet: false }
           - { name: cirisgraph, leg: cirisgraph, gauntlet: false }
           - { name: telemetry,  leg: telemetry,  gauntlet: false }
+          # v53.2.0 (CIRISPersist#1009) — the `test-anchor` CONFIGURATION gets
+          # its own row. It was a rider step on `cirisaudit`, chosen as "~2 min,
+          # rides the shortest leg"; it grew to 3,440 tests, ~900 s of test time
+          # plus a 2m29s rebuild, and made `cirisaudit` the longest job of every
+          # run (60–71 min against 47–55 for the other Linux legs). As a row it
+          # pays the ~8 min fixed cost (disk free + CIRISCache restore) on a
+          # runner of its own, in parallel, and the critical path drops by the
+          # rider's 15–17.5 min.
+          #
+          # Not moved to `darwin-aarch64 (no postgres)`, the cheaper-looking
+          # host: macOS runners are the SCARCE pool. On the v53.1.8 tag run
+          # (37692136047) the darwin wheel waited 40 min and the iOS simulator
+          # build 48 min for a macOS runner; adding ~20 min to a mac job would
+          # have lengthened exactly the queue the tag run's manifest waits on.
+          #
+          # Why it is an invocation of its own and not a flag on another leg
+          # (the env-switched genesis relaxation; nextest's per-test process
+          # isolation): RIDERS in scripts/ci_feature_matrix.py.
+          #
+          # `gauntlet: true` keeps the rider's exact selection: it ran with no
+          # `substrate_machine` exclusion (sqlite-only, so the sqlite arms). The
+          # row's postgres service starts and goes unused — `set test-anchor`
+          # carries no `postgres`.
+          - { name: test-anchor, leg: test-anchor, gauntlet: true }
     services:
       postgres:
         # CIRISPersist#222 — PLAIN postgres:16, NOT timescaledb. The
@@ -385,30 +567,6 @@ jobs:
         # this is a cache hit plus nine tests. A breach is a hang, not a slow box.
         timeout-minutes: 5
         run: cargo nextest run --test wire_format_fixtures
-      # v25.x (CIRISPersist#585) — the `test-anchor` CONFIGURATION, which CI
-      # had never run at all. It is not a flag that can ride another leg's
-      # feature list: the feature compiles the genesis relaxation in and
-      # `ciris_verify_core::test_anchor::test_anchor_active()` (reading
-      # `CIRIS_TEST_TRUST_ROOT`) switches it on, so with the env unset it is
-      # inert and a 30-feature leg carrying it would certify nothing. It needs
-      # its own invocation — and nextest specifically, because the genesis
-      # fixtures use `std::env::set_var` and per-test process isolation is what
-      # keeps that from leaking into the rest of the suite.
-      #
-      # A RIDER, not a matrix row: sqlite-only, ~1650 tests, ~2 min of test
-      # time. A whole runner for it would be the local-optimization /
-      # global-pessimization trade #543 already rejected, so it rides
-      # `cirisaudit` (the shortest leg) as an extra step.
-      # `scripts/ci_feature_matrix.py check` fails if this step is dropped or
-      # if its host leg changes.
-      - name: cargo nextest (test-anchor configuration — sqlite only)
-        if: matrix.substrate.leg == 'cirisaudit'
-        timeout-minutes: 25
-        run: |
-          set -euo pipefail
-          FEATURES="$(python3 scripts/ci_feature_matrix.py set test-anchor)"
-          echo "rider 'test-anchor' → --features \"${FEATURES}\""
-          cargo nextest run --no-fail-fast --features "${FEATURES}"
       # v0.5.4 (CIRISPersist#29) — Python regression test for the FFI
       # catch_panic layer. Builds the wheel with the `test-panic`
       # feature gate enabled (release wheels don't), then pytest
@@ -504,17 +662,41 @@ jobs:
       # registry alias for cross-version incremental restore (see the ciriscache
       # composite). Was two full saves back-to-back (~18.5 min on the v17.5.0 tag
       # run); now push-once + ~1s retag.
-      - uses: CIRISAI/CIRISCache/save@v1
+      - name: target/ size before the CIRISCache save (#1022 budget measurement)
+        if: (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) && matrix.substrate.name == 'core-1'
+        shell: bash
+        run: du -sh target/release target/debug/{deps,build,incremental,.fingerprint} 2>/dev/null || true
+      - uses: CIRISAI/CIRISCache/save@v1.1
+        id: cache_save
+        # v53.2.0 (#1022) — CIRISCache v1.1: the TAG run's save is strict (a failed
+        # publish fails the release: Edge/Server exact-pin this blob); main stays
+        # fail-open and the next step warns.
+        continue-on-error: ${{ !startsWith(github.ref, 'refs/tags/v') }}
         if: (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) && matrix.substrate.name == 'core-1'   # always warm: save on main AND release tags — a released version's blob MUST exist or edge/server/next-build cold-compile persist from source (far more than the ~9min save)
-        continue-on-error: true
         with:
           key: ${{ env.CIRISCACHE_KEY }}
           alias-keys: ${{ env.CIRISCACHE_KEY_HEAD }}
           token: ${{ secrets.GITHUB_TOKEN }}
-          # v1/ff52ca3 — LRU-prune target/ to 4GB before tar: breaks the
-          # fat-blob ratchet (240–400s ciriscache steps; superseded dep
-          # generations re-saved forever after every re-pin).
-          max-size-mb: "4096"
+          strict: ${{ startsWith(github.ref, 'refs/tags/v') && 'true' || 'false' }}
+          # v53.2.0 (#1022) — 12 GB, BELIEVED until measured: the customers are
+          # Edge/Server exact-pin restores that need persist's RELEASE units, and
+          # 4096 is likely under one release target. The size step above logs
+          # target/release and target/debug per run; set budget = size(target/release)
+          # + headroom from the SECOND run after adoption (the first prunes a stale
+          # generation). The prune is least recently BUILT (CIRISCache#3 notes).
+          max-size-mb: "12288"
+      - name: CIRISCache save result
+        if: ${{ !cancelled() && ((github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) && matrix.substrate.name == 'core-1') }}
+        shell: bash
+        env:
+          PUBLISHED: ${{ steps.cache_save.outputs.published }}
+          REASON: ${{ steps.cache_save.outputs.reason }}
+          KEY: ${{ steps.cache_save.outputs.key }}
+        run: |
+          echo "published=${PUBLISHED:-} key=${KEY:-} reason=${REASON:-}"
+          if [ "${PUBLISHED:-}" != "true" ]; then
+            echo "::warning::CIRISCache save not published (key ${KEY:-?}): ${REASON:-no reason given}"
+          fi
 
   # NOTE: the prior `linux-aarch64-build` cross-compile job was removed
   # in v0.1.15. Its purpose ("prove the crate cross-compiles to arm64
@@ -529,6 +711,8 @@ jobs:
   # Mission alignment: macOS dev path (PLATFORM_ARCHITECTURE.md §1).
   darwin-aarch64-test:
     name: darwin-aarch64 (no postgres)
+    needs: tree
+    if: ${{ !cancelled() && needs.tree.outputs.skip != 'true' }}
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v6
@@ -589,8 +773,11 @@ jobs:
       # never completed — so restore-only loses no cache that exists, while
       # un-redding every tag run. Re-enable via #762 when CIRISCache can save
       # under the mac VM resource ceiling.
-      - uses: CIRISAI/CIRISCache/save@v1
+      - uses: CIRISAI/CIRISCache/save@v1.1
+        id: cache_save
         if: false   # CIRISPersist#762 — see above; was: main + tags/v*
+        # v53.2.0 (#1022) — pinned to v1.1 with the rest; the size and result
+        # steps the other saves carry are left off while this save is disabled.
         continue-on-error: true
         with:
           key: ${{ env.CIRISCACHE_KEY }}
@@ -682,7 +869,12 @@ jobs:
         run: cargo build --release --features server
       # Save under the macos-x86_64 key + alias the rolling phead (push-once +
       # retag, #458). continue-on-error: a flaky/queued Intel runner is non-fatal.
-      - uses: CIRISAI/CIRISCache/save@v1
+      - name: target/ size before the CIRISCache save (#1022 budget measurement)
+        if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: du -sh target/release target/debug/{deps,build,incremental,.fingerprint} 2>/dev/null || true
+      - uses: CIRISAI/CIRISCache/save@v1.1
+        id: cache_save
         if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
         continue-on-error: true
         with:
@@ -693,6 +885,18 @@ jobs:
           # fat-blob ratchet (240–400s ciriscache steps; superseded dep
           # generations re-saved forever after every re-pin).
           max-size-mb: "4096"
+      - name: CIRISCache save result
+        if: ${{ !cancelled() && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) }}
+        shell: bash
+        env:
+          PUBLISHED: ${{ steps.cache_save.outputs.published }}
+          REASON: ${{ steps.cache_save.outputs.reason }}
+          KEY: ${{ steps.cache_save.outputs.key }}
+        run: |
+          echo "published=${PUBLISHED:-} key=${KEY:-} reason=${REASON:-}"
+          if [ "${PUBLISHED:-}" != "true" ]; then
+            echo "::warning::CIRISCache save not published (key ${KEY:-?}): ${REASON:-no reason given}"
+          fi
 
   # Mission category §4 + PLATFORM_ARCHITECTURE.md §3.1: iOS device +
   # simulator build path. Runs on macOS with the iOS targets.
@@ -705,6 +909,11 @@ jobs:
   # (PyO3 PR #5605 requires libpython linking on iOS).
   ios-build:
     name: ios PyO3 abi3 (${{ matrix.dir }})
+    # #1019: `ios-paths` runs on PRs only; its empty output on push/tag reads
+    # as "build". `skip_ios`, not `skip`: main keeps iOS unless the PR run
+    # actually built it green.
+    needs: [tree, ios-paths]
+    if: ${{ !cancelled() && needs.tree.outputs.skip_ios != 'true' && needs.ios-paths.outputs.ios != 'false' }}
     runs-on: macos-14
     # ci-perf — split the two iOS targets into a 2-entry matrix so they
     # build in PARALLEL (was one ~20m job building device then simulator
@@ -851,7 +1060,12 @@ jobs:
       # second ~9-min tar+push of byte-identical content). `phead` lets the NEXT
       # version's build restore this warm target/ and recompile only changed
       # files instead of rebuilding persist's deps from the verify baseline.
-      - uses: CIRISAI/CIRISCache/save@v1
+      - name: target/ size before the CIRISCache save (#1022 budget measurement)
+        if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: du -sh target/release target/debug/{deps,build,incremental,.fingerprint} 2>/dev/null || true
+      - uses: CIRISAI/CIRISCache/save@v1.1
+        id: cache_save
         if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')   # always warm: save on main AND release tags (else the released version cold-compiles downstream)
         continue-on-error: true
         with:
@@ -862,6 +1076,18 @@ jobs:
           # fat-blob ratchet (240–400s ciriscache steps; superseded dep
           # generations re-saved forever after every re-pin).
           max-size-mb: "4096"
+      - name: CIRISCache save result
+        if: ${{ !cancelled() && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) }}
+        shell: bash
+        env:
+          PUBLISHED: ${{ steps.cache_save.outputs.published }}
+          REASON: ${{ steps.cache_save.outputs.reason }}
+          KEY: ${{ steps.cache_save.outputs.key }}
+        run: |
+          echo "published=${PUBLISHED:-} key=${KEY:-} reason=${REASON:-}"
+          if [ "${PUBLISHED:-}" != "true" ]; then
+            echo "::warning::CIRISCache save not published (key ${KEY:-?}): ${REASON:-no reason given}"
+          fi
 
   # ci-perf — recombine the two parallel iOS target builds into the single
   # `ciris-persist-ios` tar that mobile-release uploads. Mirrors
@@ -872,6 +1098,11 @@ jobs:
     name: package ios artifacts
     runs-on: ubuntu-latest
     needs: [ios-build]
+    # v53.2.0 — explicit result check, because `tree` (an ANCESTOR) is skipped on
+    # every PR and tag run, and the implicit `success()` reads the whole
+    # ancestor chain: a skipped grandparent skips this job even though its
+    # direct need succeeded. Same semantics as before, minus that.
+    if: ${{ !cancelled() && needs.ios-build.result == 'success' }}
     steps:
       - uses: actions/checkout@v6
       - name: extract version from Cargo.toml
@@ -905,6 +1136,8 @@ jobs:
   # Downstream android-package job collects artifacts into tarballs.
   android-ndk:
     name: android ${{ matrix.abi }}
+    needs: tree
+    if: ${{ !cancelled() && needs.tree.outputs.skip != 'true' }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -1092,7 +1325,12 @@ jobs:
       # second ~9-min tar+push of byte-identical content). `phead` lets the NEXT
       # version's build restore this warm target/ and recompile only changed
       # files instead of rebuilding persist's deps from the verify baseline.
-      - uses: CIRISAI/CIRISCache/save@v1
+      - name: target/ size before the CIRISCache save (#1022 budget measurement)
+        if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: du -sh target/release target/debug/{deps,build,incremental,.fingerprint} 2>/dev/null || true
+      - uses: CIRISAI/CIRISCache/save@v1.1
+        id: cache_save
         if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')   # always warm: save on main AND release tags (else the released version cold-compiles downstream)
         continue-on-error: true
         with:
@@ -1103,12 +1341,29 @@ jobs:
           # fat-blob ratchet (240–400s ciriscache steps; superseded dep
           # generations re-saved forever after every re-pin).
           max-size-mb: "4096"
+      - name: CIRISCache save result
+        if: ${{ !cancelled() && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) }}
+        shell: bash
+        env:
+          PUBLISHED: ${{ steps.cache_save.outputs.published }}
+          REASON: ${{ steps.cache_save.outputs.reason }}
+          KEY: ${{ steps.cache_save.outputs.key }}
+        run: |
+          echo "published=${PUBLISHED:-} key=${KEY:-} reason=${REASON:-}"
+          if [ "${PUBLISHED:-}" != "true" ]; then
+            echo "::warning::CIRISCache save not published (key ${KEY:-?}): ${REASON:-no reason given}"
+          fi
 
   # Downstream job: collect per-ABI artifacts into tarballs + wheels.
   android-package:
     name: package android artifacts
     runs-on: ubuntu-latest
     needs: [android-ndk]
+    # v53.2.0 — explicit result check, because `tree` (an ANCESTOR) is skipped on
+    # every PR and tag run, and the implicit `success()` reads the whole
+    # ancestor chain: a skipped grandparent skips this job even though its
+    # direct need succeeded. Same semantics as before, minus that.
+    if: ${{ !cancelled() && needs.android-ndk.result == 'success' }}
     steps:
       - uses: actions/checkout@v6
       - name: extract version from Cargo.toml
@@ -1213,6 +1468,8 @@ jobs:
   # Mission category §4 "Mission rejection" + audit/lint.
   lint:
     name: clippy + fmt + audit
+    needs: tree
+    if: ${{ !cancelled() && needs.tree.outputs.skip != 'true' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -1304,6 +1561,22 @@ jobs:
       # thing it measures without anyone being told.
       - name: generated directory double is current
         run: python3 scripts/gen_directory_double.py --check
+      # v53.2.0 (#1027) — the telemetry registry: `weaver registry check` over
+      # telemetry/registry/ and telemetry/catalog.json is its rendering (I552
+      # then holds that rendering equal to TELEMETRY_CATALOG). The script
+      # downloads its pinned weaver and checks the tarball's sha256.
+      - name: telemetry registry (OTel Weaver check + rendering current)
+        run: scripts/weaver_check.sh
+      # v53.2.0 (#1026) — the from-disk gate counts ported to ast-grep: a call
+      # in a comment or a string is not a call, by construction. Exact per-file
+      # counts in rules/expected.json; inventory in docs/FROM_DISK_GATES.md.
+      - name: ast-grep gate counts (rules/ vs rules/expected.json)
+        run: scripts/ast_gates.sh
+      # v53.2.0 (#1029) — the bits-changed gate (scripts/bits_changed.sh) that the
+      # tag job runs before signing a wheel's manifest; offline witnesses with a
+      # stub registry, including the `ls | head -1` mutant.
+      - name: bits-changed gate witnesses
+        run: scripts/bits_changed_test.sh
       # v43.0.0 (BLOB_ENCRYPTION_AT_REST.md I22) — the storage floor token is
       # unconstructible outside the crate. The witness is a `compile_fail`
       # doctest, and nextest never runs doctests, so it gets its own step.
@@ -1367,6 +1640,8 @@ jobs:
   # plus a license-deny pass per CRATE_RECOMMENDATIONS §6.
   license-audit:
     name: cargo deny (license + advisories)
+    needs: tree
+    if: ${{ !cancelled() && needs.tree.outputs.skip != 'true' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -1397,6 +1672,8 @@ jobs:
   # the from-disk gate I57 pins those literals to the crate's.
   sqlite-portability:
     name: sqlite portability (debian bookworm, libsqlite3 3.40.1)
+    needs: tree
+    if: ${{ !cancelled() && needs.tree.outputs.skip != 'true' }}
     runs-on: ubuntu-latest
     container: debian:bookworm-slim
     steps:
@@ -1420,6 +1697,8 @@ jobs:
   # since 2025-01.
   pyo3-wheel:
     name: maturin abi3-py311 wheel (${{ matrix.label }})
+    needs: tree
+    if: ${{ !cancelled() && needs.tree.outputs.skip != 'true' }}
     # v30.9.0 — the CROSS-PLATFORM wheels build on TAGS ONLY.
     #
     # Measured on the last successful PR run (31397353461), which took 38m wall:
@@ -1564,7 +1843,7 @@ jobs:
       # `rustc -V` is the right channel (stable on every platform now) and
       # BEFORE the per-label rust-cache
       # below (which wins on the wheel's own target/). Sets CIRISCACHE_KEY for
-      # the save@v1 at the end of the job (#314, linux-aarch64 + windows-x64).
+      # the save@v1.1 at the end of the job (#314, linux-aarch64 + windows-x64).
       - name: Resolve CIRISCache PLAT from wheel label
         shell: bash
         run: |
@@ -1624,8 +1903,17 @@ jobs:
       # auto-discovers import libs with precompiled std). On Windows
       # `--auditwheel skip` is a no-op (auditwheel is Linux-only); the
       # vcpkg-OpenSSL env for the postgres backend is already exported above.
+      #
+      # v53.2.0 (#1028) — clear target/wheels/ first. The CIRISCache restore
+      # carries the wheels earlier releases built (29.0.0..30.2.0 were found in
+      # v53.1.8's tag artifacts), every later step globs `target/wheels/*.whl`,
+      # and build-manifest's `ls | head -1` picked 29.0.0 — v53.1.8 registered
+      # a 29.0.0 wheel's hash for linux-aarch64 and windows-x86_64.
       - name: maturin build
-        run: maturin build --release --strip --auditwheel skip
+        shell: bash
+        run: |
+          rm -rf target/wheels
+          maturin build --release --strip --auditwheel skip
       # v3.6.2 (CIRISPersist#136) — explicit auditwheel-repair with
       # libsqlite3 excluded from the bundling pass. This is the same
       # pattern `pyarrow` uses (excludes libssl/libcrypto/libz) and
@@ -1811,9 +2099,14 @@ jobs:
       # `alias-keys` retags the rolling `phead` blob onto the same manifest
       # server-side (no second tar+push). Windows was the worst offender here:
       # the wheel target/ is large and a second full push serialized ~9 min.
+      - name: target/ size before the CIRISCache save (#1022 budget measurement)
+        if: (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) && (matrix.label == 'linux-aarch64' || matrix.label == 'windows-x86_64')
+        shell: bash
+        run: du -sh target/release target/debug/{deps,build,incremental,.fingerprint} 2>/dev/null || true
       - name: Save CIRISCache (linux-aarch64 + windows-x64 — #314, push-once+alias)
+        id: cache_save
         if: (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) && (matrix.label == 'linux-aarch64' || matrix.label == 'windows-x86_64')   # always warm: save on main AND release tags
-        uses: CIRISAI/CIRISCache/save@v1
+        uses: CIRISAI/CIRISCache/save@v1.1
         continue-on-error: true
         with:
           key: ${{ env.CIRISCACHE_KEY }}
@@ -1823,6 +2116,18 @@ jobs:
           # fat-blob ratchet (240–400s ciriscache steps; superseded dep
           # generations re-saved forever after every re-pin).
           max-size-mb: "4096"
+      - name: CIRISCache save result
+        if: ${{ !cancelled() && ((github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) && (matrix.label == 'linux-aarch64' || matrix.label == 'windows-x86_64')) }}
+        shell: bash
+        env:
+          PUBLISHED: ${{ steps.cache_save.outputs.published }}
+          REASON: ${{ steps.cache_save.outputs.reason }}
+          KEY: ${{ steps.cache_save.outputs.key }}
+        run: |
+          echo "published=${PUBLISHED:-} key=${KEY:-} reason=${REASON:-}"
+          if [ "${PUBLISHED:-}" != "true" ]; then
+            echo "::warning::CIRISCache save not published (key ${KEY:-?}): ${REASON:-no reason given}"
+          fi
 
   # ── PyPI publishing REMOVED (CIRISPersist#615) ──────────────────────────
   #
@@ -1869,6 +2174,11 @@ jobs:
     name: Sign + register multi-target build manifests (CanonicalBuild v2)
     runs-on: ubuntu-latest
     needs: pyo3-wheel
+    # v53.2.0 — explicit result check, because `tree` (an ANCESTOR) is skipped on
+    # every PR and tag run, and the implicit `success()` reads the whole
+    # ancestor chain: a skipped grandparent skips this job even though its
+    # direct need succeeded. Same semantics as before, minus that.
+    if: ${{ !cancelled() && needs.pyo3-wheel.result == 'success' }}
     # v3.6.6 — hard-fail restored. The hybrid-signing secrets
     # (CIRIS_BUILD_ED25519_SECRET / CIRIS_BUILD_MLDSA_SECRET) are now
     # configured; a manifest failure means either the secrets rotated
@@ -1886,6 +2196,11 @@ jobs:
       actions: read
     steps:
       - uses: actions/checkout@v6
+        with:
+          # v53.2.0 (#1029) — the v-tags: bits_changed.sh finds the previous
+          # release, and lets python-source-tree's hash equal it only when
+          # `git diff v<prev> v<this> -- python/ciris_persist` is empty.
+          fetch-depth: 0
       # v10.7.0 (CIRISVerify v8.0.0, #141) — no libtss2-dev; this step
       # compiles the crate but ciris-keyring no longer link-binds tss-esapi.
       - uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -1899,47 +2214,14 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "ciris-persist version: $VERSION"
       - name: install ciris-build-sign v2.1.5 (prebuilt from CIRISVerify release)
-        # v1.1.2 — bumped from v2.0.5 to v2.1.5. The v2.1.x series is
-        # the CI-hardening arc (continue-on-error on cache, retry on
-        # network installs, macOS x86_64 shadow defang via cache-bin:
-        # false + bash shell on guards). v2.1.5 also includes everything
-        # the v2.0.x line shipped:
-        # - CanonicalBuild v2 with per-target rows (v2.0.3)
-        # - iOS hardware-marker self-heal (v2.0.4)
-        # - Mach-O __TEXT hash sign/runtime parity (v2.0.5)
-        # - the `register` subcommand (replaces the prior custom
-        #   curl POST to /v1/verify/binary-manifest).
-        #
-        # Prebuilt tarball is GitHub-hosted, served over TLS against
-        # CIRISAI/CIRISVerify. Cosign verification of the release
-        # asset is tracked separately (was task #81 under v1.8.0).
+        # v53.2.0 (#1029) — the sign/register logic lives once, in
+        # scripts/build_manifest.sh, shared with reregister-manifests.yml.
+        # History of these steps (v0.9.2 #42 multi-target, v1.1.2 tool v2.1.5,
+        # v1.6.0 retries, #809/#926 preflight gate) is in that script's header
+        # and in git log.
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          cd "$RUNNER_TEMP"
-          # v1.1.2 (CIRISVerify v2.1.1 CI hardening pattern): retry the
-          # `gh release download` to absorb GitHub API transient 5xx /
-          # network blip. Three attempts with backoff, then fail loud.
-          for attempt in 1 2 3; do
-            if gh release download v2.1.5 --repo CIRISAI/CIRISVerify \
-                --pattern 'ciris-verify-v2.1.5-build-tool-linux-x86_64.tar.gz'; then
-              break
-            fi
-            echo "::warning::gh release download attempt $attempt failed; retrying in $((attempt * 5))s"
-            sleep $((attempt * 5))
-            if [ "$attempt" = "3" ]; then
-              echo "::error::gh release download failed 3 times — investigate"
-              exit 1
-            fi
-          done
-          tar -xzf ciris-verify-v2.1.5-build-tool-linux-x86_64.tar.gz
-          # Tarball layout: build-tool/{ciris-build-sign,ciris-build-verify}
-          sudo install -m755 build-tool/ciris-build-sign /usr/local/bin/ciris-build-sign
-          sudo install -m755 build-tool/ciris-build-verify /usr/local/bin/ciris-build-verify
-          ciris-build-sign --version
-          # Self-contained Rust binary; only deps should be libc +
-          # libdl + libpthread.
-          ldd "$(command -v ciris-build-sign)" || true
+        run: scripts/build_manifest.sh install
       # v16.0.0 (CIRISPersist#400) — warm the compile before the emit step:
       # this job previously COLD-compiled persist + the whole verify crypto
       # graph in release, for a JSON blob whose content (migration-set hash +
@@ -1997,303 +2279,60 @@ jobs:
           done
           ls -la dist/wheels/
       - name: sign multi-target manifests (CanonicalBuild v2)
-        # v0.9.2 — replaces the single-target sign of v0.9.1. Four
-        # manifests get produced:
-        #
-        # 1. `python-source-tree` — file-tree hash of `python/ciris_persist/`
-        #    (the Python wrappers + .pyi stubs that travel to every
-        #    consumer regardless of platform). This is what an agent
-        #    running on iOS / Android verifies against — they don't
-        #    pip-install (no wheels exist for those platforms); they
-        #    embed the Python sources via PyOxidizer / Buildozer /
-        #    similar and rebuild persist's Rust from source. The
-        #    source-tree hash covers the Python half; the rebuilt
-        #    Rust half is covered by the agent's own build chain.
-        # 2-4. Three binary manifests (one per published wheel arch):
-        #    `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`,
-        #    `aarch64-apple-darwin`. Each carries `binary_hash =
-        #    sha256(wheel.whl)` so a pip-installed deployment can
-        #    verify the on-disk wheel against the registered manifest.
-        #
-        # All four are signed with the SAME hybrid Ed25519 + ML-DSA-65
-        # keypair; `ciris-build-sign register` (next step) packs all
-        # four into a single `builds` row with per-target
-        # `binary_manifests` rows hanging off it.
+        # Five manifests, one hybrid Ed25519 + ML-DSA-65 key: `python-source-tree`
+        # (FileTreeExtras over python/ciris_persist, what iOS / Android agent
+        # rebuilds verify against) and one binary manifest per published wheel
+        # (`binary_hash = sha256(wheel)`). v53.2.0 (#1028/#1029): exactly ONE
+        # `ciris_persist-<v>-*.whl` per target, and scripts/bits_changed.sh
+        # checks 1-4 pass before each sign — v53.1.8 signed a v29.0.0 wheel.
         env:
           CIRIS_BUILD_ED25519_SECRET: ${{ secrets.CIRIS_BUILD_ED25519_SECRET }}
           CIRIS_BUILD_MLDSA_SECRET: ${{ secrets.CIRIS_BUILD_MLDSA_SECRET }}
-        run: |
-          if [ -z "${CIRIS_BUILD_ED25519_SECRET}" ] || [ -z "${CIRIS_BUILD_MLDSA_SECRET}" ]; then
-            echo "::error::Hybrid signing secrets not configured."
-            echo "::error::Set CIRIS_BUILD_ED25519_SECRET and CIRIS_BUILD_MLDSA_SECRET."
-            echo "::error::See docs/BUILD_SIGNING.md for ciris-build-sign generate-keys + secret upload."
-            exit 1
-          fi
-          umask 077
-          ED_KEY_PATH=$(mktemp)
-          MLDSA_KEY_PATH=$(mktemp)
-          printf '%s' "${CIRIS_BUILD_ED25519_SECRET}" | base64 -d > "$ED_KEY_PATH"
-          printf '%s' "${CIRIS_BUILD_MLDSA_SECRET}" | base64 -d > "$MLDSA_KEY_PATH"
-
-          VERSION="${{ steps.version.outputs.version }}"
-          EXTRAS="dist/persist-extras-${VERSION}.json"
-          KEY_ID="ciris-persist-build-v1"
-
-          # Target 1: python-source-tree. Walks `python/ciris_persist/`,
-          # hashes every .py + .pyi file. Excludes __pycache__,
-          # .pyc/.pyo (bytecode), .so/.dylib/.dll (compiled native
-          # libs — those are covered by the per-arch binary
-          # manifests below, not the source tree). `--tree` mode
-          # produces FileTreeExtras automatically, so we don't pass
-          # `--extras` (mutually exclusive with `--tree`).
-          ciris-build-sign sign \
-            --primitive persist \
-            --build-id "$VERSION" \
-            --target python-source-tree \
-            --tree python/ \
-            --tree-include ciris_persist \
-            --tree-exempt-dir __pycache__ \
-            --tree-exempt-ext pyc pyo so dylib dll \
-            --binary-version "$VERSION" \
-            --ed25519-seed "$ED_KEY_PATH" \
-            --mldsa-secret "$MLDSA_KEY_PATH" \
-            --key-id "$KEY_ID" \
-            --output "dist/manifest-python-source-tree.json"
-
-          # Targets 2-4: per-wheel binary manifests. Loop over the
-          # download-artifact subdirs the matrix produced; sign each
-          # wheel's sha256 as `target: TRIPLE`. Missing wheels (e.g.
-          # one matrix entry failed) get a warning rather than a
-          # hard error — the register step below will still ship
-          # the targets that DID sign.
-          declare -A WHEEL_TARGET=(
-            ["ciris_persist-wheel-linux-x86_64"]="x86_64-unknown-linux-gnu"
-            ["ciris_persist-wheel-linux-aarch64"]="aarch64-unknown-linux-gnu"
-            ["ciris_persist-wheel-darwin-aarch64"]="aarch64-apple-darwin"
-            # windows-x86_64 wheel signs under the standard windows triple
-            # (win7 support dropped).
-            ["ciris_persist-wheel-windows-x86_64"]="x86_64-pc-windows-msvc"
-          )
-          SIGNED_BINARY_TARGETS=()
-          for ARTDIR in "${!WHEEL_TARGET[@]}"; do
-            TARGET="${WHEEL_TARGET[$ARTDIR]}"
-            WHEEL="$(ls dist/wheels/${ARTDIR}/*.whl 2>/dev/null | head -1)"
-            if [ -z "${WHEEL}" ]; then
-              echo "::warning::No wheel found for ${TARGET} (artifact ${ARTDIR}); skipping"
-              continue
-            fi
-            ciris-build-sign sign \
-              --primitive persist \
-              --build-id "$VERSION" \
-              --target "$TARGET" \
-              --binary "$WHEEL" \
-              --binary-version "$VERSION" \
-              --extras "$EXTRAS" \
-              --ed25519-seed "$ED_KEY_PATH" \
-              --mldsa-secret "$MLDSA_KEY_PATH" \
-              --key-id "$KEY_ID" \
-              --output "dist/manifest-${TARGET}.json"
-            SIGNED_BINARY_TARGETS+=("${TARGET}")
-            echo "✓ signed ${TARGET}: $(basename "${WHEEL}")"
-          done
-          # Wipe key files immediately after signing.
-          shred -uz "$ED_KEY_PATH" "$MLDSA_KEY_PATH" 2>/dev/null || rm -f "$ED_KEY_PATH" "$MLDSA_KEY_PATH"
-
-          echo "Multi-target manifests produced:"
-          ls -la dist/manifest-*.json
-          # Stash the list for the register step.
-          printf '%s\n' "${SIGNED_BINARY_TARGETS[@]}" > dist/signed-binary-targets.txt
-      - name: pre-flight registry trust-root check
-        # CIRISPersist#809 — restored as a GATE in v50.0.0 (operator ruling
-        # on CIRISPersist#926, 2026-09-27). The logic lives in
-        # scripts/preflight_trust_root.py so it can be fault-injected: the
-        # self-test runs FIRST, every time, so a guard that has quietly
-        # stopped refusing reds this step instead of passing it
-        # (`authorizations: []` against `quorum:2/3` must exit 1 — the
-        # fixture #809 named as the one to re-run when restoring the gate).
-        #
-        # WHAT THIS GATES
-        # * NEW `bundle` shape -> GATED: `consensus_protocol` parses as
-        #   quorum:M/N (unparseable is refused, never guessed) and the
-        #   DISTINCT authorizing holders named in the bundle's own `holders`
-        #   reach M. It counts; it does not verify signatures (an
-        #   unauthenticated CI read) — `verify_bundle_quorum` is the
-        #   cryptographic gate every consumer runs.
-        # * OLD `stewards` shape -> gated on a deployed steward, unchanged.
-        # * UNRECOGNISED shape / unreachable / not JSON -> FAILS CLOSED.
-        #
-        # Reported, not gated: `served_by.accepts_this_root` (informational —
-        # the outer envelope is unsigned by design) and the #926
-        # `ciris-canonical` community row beside the bundle (the registry
-        # route does not serve it yet).
-        env:
           REGISTRY_URL: ${{ vars.REGISTRY_URL }}
         run: |
-          python3 scripts/preflight_trust_root.py --self-test
-          if [ -z "${REGISTRY_URL}" ]; then
-            REGISTRY_URL="https://api.registry.ciris-services-1.ai"
-            echo "::warning::REGISTRY_URL repo variable unset; defaulting to ${REGISTRY_URL}"
-          fi
-          echo "Registry trust-root snapshot for ${REGISTRY_URL}:"
-          curl -sf "${REGISTRY_URL}/v1/steward-key" | tee dist/steward-key.json | python3 -m json.tool
-          python3 scripts/preflight_trust_root.py dist/steward-key.json >> "$GITHUB_STEP_SUMMARY"
+          VERSION="${{ steps.version.outputs.version }}"
+          scripts/build_manifest.sh sign --version "$VERSION" --wheels dist/wheels --out dist \
+            --extras "dist/persist-extras-${VERSION}.json" --source-tree
+      - name: pre-flight registry trust-root check
+        # CIRISPersist#809 — a GATE since v50.0.0 (ruling on #926). The self-test
+        # runs first, so a guard that stopped refusing reds instead of passing.
+        # Gated: the bundle's consensus_protocol quorum (or a deployed steward on
+        # the old shape); unrecognised / unreachable / not JSON fails closed.
+        env:
+          REGISTRY_URL: ${{ vars.REGISTRY_URL }}
+        run: scripts/build_manifest.sh preflight --out dist
       - name: register multi-target build with CIRISRegistry
-        # v0.9.2 (CIRISPersist#42) — replaces the prior custom
-        # curl POST to /v1/verify/binary-manifest with the
-        # `ciris-build-sign register` subcommand from CIRISVerify
-        # v2.1.5. The subcommand:
-        # - Reads each per-target manifest produced above.
-        # - Signs a CanonicalBuild v2 `builds` parent row over all
-        #   the per-target manifest hashes.
-        # - POSTs the `builds` row plus, per target, the
-        #   `binary_manifests` (binary mode) or `function_manifests`
-        #   (file-tree mode) rows.
-        # - Writes to /v1/builds (the new endpoint), making
-        #   `GET /v1/builds/<v>?project=ciris-persist` return the
-        #   row for downstream `verify_tree(project="ciris-persist")`.
-        #
-        # The Authorization header is read from the
-        # REGISTRY_ADMIN_TOKEN env var directly by the binary.
+        # v53.2.0 — tag runs only. PR and main runs sign and gate (the
+        # artifacts and bits_changed.sh checks 1-4) but never write the live
+        # registry: through v53.2.0's PR runs this step upserted the release's
+        # rows from an unmerged head (PR run 37662321512 and earlier).
+        if: startsWith(github.ref, 'refs/tags/v')
+        # `ciris-build-sign register`: per target a `builds` row (POST /v1/builds)
+        # and a build-manifest row (POST /v1/verify/build-manifest), plus the one
+        # binary_manifests map. REGISTRY_ADMIN_TOKEN is read by the binary.
         env:
           REGISTRY_URL: ${{ vars.REGISTRY_URL }}
           REGISTRY_ADMIN_TOKEN: ${{ secrets.REGISTRY_ADMIN_TOKEN }}
           CIRIS_BUILD_ED25519_SECRET: ${{ secrets.CIRIS_BUILD_ED25519_SECRET }}
           CIRIS_BUILD_MLDSA_SECRET: ${{ secrets.CIRIS_BUILD_MLDSA_SECRET }}
         run: |
-          if [ -z "${REGISTRY_URL}" ]; then
-            REGISTRY_URL="https://api.registry.ciris-services-1.ai"
-          fi
-          if [ -z "${REGISTRY_ADMIN_TOKEN}" ]; then
-            echo "::error::REGISTRY_ADMIN_TOKEN repo secret not configured."
-            echo "::error::Ask the bridge / registry team to issue + upload the persist build identity's admin token."
-            exit 1
-          fi
-          if [ -z "${CIRIS_BUILD_ED25519_SECRET}" ] || [ -z "${CIRIS_BUILD_MLDSA_SECRET}" ]; then
-            echo "::error::Hybrid signing secrets not configured for register step."
-            exit 1
-          fi
-
-          # Re-materialize the key files (sign step wiped them).
-          # register signs the `builds` row's CanonicalBuild over
-          # the aggregated per-target manifest hashes.
-          umask 077
-          ED_KEY_PATH=$(mktemp)
-          MLDSA_KEY_PATH=$(mktemp)
-          printf '%s' "${CIRIS_BUILD_ED25519_SECRET}" | base64 -d > "$ED_KEY_PATH"
-          printf '%s' "${CIRIS_BUILD_MLDSA_SECRET}" | base64 -d > "$MLDSA_KEY_PATH"
-
-          VERSION="${{ steps.version.outputs.version }}"
-
-          # Build the --target flag list. Source-tree is always
-          # present (we just signed it above); binary targets come
-          # from the SIGNED_BINARY_TARGETS list the sign step
-          # produced.
-          TARGET_ARGS=(
-            "--target" "python-source-tree:dist/manifest-python-source-tree.json"
-          )
-          while IFS= read -r TARGET; do
-            [ -z "$TARGET" ] && continue
-            TARGET_ARGS+=("--target" "${TARGET}:dist/manifest-${TARGET}.json")
-          done < dist/signed-binary-targets.txt
-
-          echo "Registering ${#TARGET_ARGS[@]} target args (count includes --target prefix)"
-          echo "Targets to register:"
-          printf '  %s\n' "${TARGET_ARGS[@]}"
-
-          ciris-build-sign register \
-            --registry-url "${REGISTRY_URL}" \
-            --project ciris-persist \
-            --binary-version "$VERSION" \
-            --build-id "${{ github.sha }}" \
-            --source-repo "https://github.com/CIRISAI/CIRISPersist" \
-            --source-commit "${{ github.sha }}" \
-            --notes "CIRIS federation persist substrate; CanonicalBuild v2 multi-target via ciris-build-sign v2.1.5 (CIRISPersist#42). Targets: python-source-tree + per-wheel binary manifests." \
-            --ed25519-seed "$ED_KEY_PATH" \
-            --mldsa-secret "$MLDSA_KEY_PATH" \
-            --key-id ciris-persist-build-v1 \
-            "${TARGET_ARGS[@]}"
-
-          # Wipe key files immediately after register.
-          shred -uz "$ED_KEY_PATH" "$MLDSA_KEY_PATH" 2>/dev/null || rm -f "$ED_KEY_PATH" "$MLDSA_KEY_PATH"
-          echo "✓ Multi-target build registered with CIRISRegistry"
+          scripts/build_manifest.sh register --version "${{ steps.version.outputs.version }}" \
+            --commit "${{ github.sha }}" --out dist
       - name: round-trip verify GET /v1/builds/{version}
-        # v0.9.2 — endpoint moved from /v1/verify/binary-manifest
-        # to /v1/builds/<v>?project=ciris-persist per CanonicalBuild
-        # v2 (CIRISVerify v2.0.3+). Confirms:
-        # 1. The `builds` parent row exists.
-        # 2. Per-target manifests are queryable via
-        #    `?target=<name>`.
-        # 3. Each target's manifest_hash matches the local sha256
-        #    of the manifest file we signed.
+        if: startsWith(github.ref, 'refs/tags/v')   # reads back what the tag run registered
+        env:
+          REGISTRY_URL: ${{ vars.REGISTRY_URL }}
+        run: scripts/build_manifest.sh roundtrip --version "${{ steps.version.outputs.version }}" --out dist
+      - name: bits-changed check 5 — each registered row carries this run's wheel
+        if: startsWith(github.ref, 'refs/tags/v')   # reads back what the tag run registered
+        # v53.2.0 (#1029) — the registry upserts in place, so read back what it
+        # now serves for (version, target) and compare with what we signed:
+        # each wheel's sha256 and python-source-tree's tree hash.
         env:
           REGISTRY_URL: ${{ vars.REGISTRY_URL }}
         run: |
-          if [ -z "${REGISTRY_URL}" ]; then
-            REGISTRY_URL="https://api.registry.ciris-services-1.ai"
-          fi
-          VERSION="${{ steps.version.outputs.version }}"
-
-          # Step 1: parent row exists.
-          echo "GET ${REGISTRY_URL}/v1/builds/${VERSION}?project=ciris-persist"
-          HTTP_CODE=$(curl -sS -o dist/round-trip-build.json -w "%{http_code}" \
-            "${REGISTRY_URL}/v1/builds/${VERSION}?project=ciris-persist")
-          echo "HTTP ${HTTP_CODE}"
-          if [ "${HTTP_CODE}" != "200" ]; then
-            echo "::error::GET /v1/builds returned ${HTTP_CODE} — registration didn't land or the public endpoint is rejecting project=ciris-persist"
-            cat dist/round-trip-build.json
-            exit 1
-          fi
-          cat dist/round-trip-build.json | python3 -m json.tool
-
-          # Step 2: each per-target manifest is queryable. Build
-          # the target list from the manifests we just signed.
-          TARGETS=("python-source-tree")
-          while IFS= read -r T; do
-            [ -z "$T" ] && continue
-            TARGETS+=("$T")
-          done < dist/signed-binary-targets.txt
-
-          ALL_OK=1
-          for TARGET in "${TARGETS[@]}"; do
-            echo ""
-            echo "GET ${REGISTRY_URL}/v1/builds/${VERSION}?project=ciris-persist&target=${TARGET}"
-            HTTP_CODE=$(curl -sS -o "dist/round-trip-${TARGET}.json" -w "%{http_code}" \
-              "${REGISTRY_URL}/v1/builds/${VERSION}?project=ciris-persist&target=${TARGET}")
-            echo "  HTTP ${HTTP_CODE}"
-            if [ "${HTTP_CODE}" != "200" ]; then
-              echo "::error::Per-target GET for ${TARGET} returned ${HTTP_CODE}"
-              ALL_OK=0
-              continue
-            fi
-            # Local manifest sha256 — should match what the
-            # registry stored as `manifest_hash`.
-            LOCAL_SHA="$(sha256sum "dist/manifest-${TARGET}.json" | cut -d' ' -f1)"
-            echo "  local manifest sha256: ${LOCAL_SHA}"
-            echo "  registry response (truncated):"
-            python3 -c "
-          import json
-          d = json.load(open('dist/round-trip-${TARGET}.json'))
-          # Surface the manifest_hash if the registry returns it
-          # in a known location. Shape may vary by endpoint version;
-          # log whatever's there for diagnostic visibility.
-          h = d.get('manifest_hash') or d.get('manifest', {}).get('manifest_hash')
-          print(f'  registry manifest_hash: {h}')" || true
-          done
-
-          if [ "${ALL_OK}" != "1" ]; then
-            echo "::error::One or more per-target round-trip GETs failed"
-            exit 1
-          fi
-
-          {
-            echo "## Registry round-trip"
-            echo ""
-            echo "- registry: \`${REGISTRY_URL}\`"
-            echo "- version: \`${VERSION}\`"
-            echo "- endpoint: \`GET /v1/builds/<v>?project=ciris-persist\`"
-            echo "- targets verified:"
-            for T in "${TARGETS[@]}"; do echo "  - \`${T}\`"; done
-          } >> "$GITHUB_STEP_SUMMARY"
+          scripts/build_manifest.sh after-publish --version "${{ steps.version.outputs.version }}" \
+            --wheels dist/wheels --out dist
       - uses: actions/upload-artifact@v7
         with:
           name: ciris-persist-build-manifest-${{ steps.version.outputs.version }}
@@ -2326,7 +2365,14 @@ jobs:
       - android-package
       - lint
       - license-audit
-    if: startsWith(github.ref, 'refs/tags/v')
+    # v53.2.0 — explicit result check, because `tree` (an ANCESTOR) is skipped on
+    # every PR and tag run, and the implicit `success()` reads the whole
+    # ancestor chain: a skipped grandparent skips this job even though its
+    # direct need succeeded. Same semantics as before, minus that.
+    if: >-
+      ${{ startsWith(github.ref, 'refs/tags/v') && !cancelled()
+          && needs.ios-package.result == 'success' && needs.android-package.result == 'success'
+          && needs.lint.result == 'success' && needs.license-audit.result == 'success' }}
     permissions:
       contents: write
       actions: read
@@ -2450,4 +2496,132 @@ jobs:
             echo "- \`ciris-persist-v${VERSION}-android.tar.gz\`"
             echo "- \`ciris-persist-v${VERSION}-android-wheels.tar.gz\` (Chaquopy abi3 wheels: arm64, x86_64, armeabi-v7a)"
             echo "- \`SHA256SUMS\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # v53.2.0 (CIRISPersist#1028) — attest the release and the conformance
+  # evidence, so an adopter can verify them without trusting this repo's
+  # history. Two GitHub artifact attestations (an in-toto Statement in a DSSE
+  # envelope, signed through Sigstore's public-good instance, since the repo is
+  # public; stored by subject digest, read back with `gh attestation verify`):
+  #
+  #   * SLSA build provenance (`https://slsa.dev/provenance/v1`) over the four
+  #     abi3 desktop wheels (this run's `ciris_persist-wheel-*` artifacts) and
+  #     the three release tarballs, as DOWNLOADED FROM THE RELEASE, so the
+  #     subject digests are the bytes a consumer fetches. There is no sdist:
+  #     consumers build from the git tag, and nothing builds one.
+  #   * `https://ciris.ai/attestation/cc-conformance/v1` over
+  #     `evidence/cc_impl.tsv` at the tag, predicate
+  #     `{cc_tag, registry_sha256, crate_version, merge_sha}`.
+  #
+  # Its own job so the two elevated permissions (`id-token`, `attestations`)
+  # are granted here and nowhere else. `scripts/verify_release.sh v<ver>`
+  # checks all eight, and `release_finish.sh` refuses RELEASE_SHIP_DONE until
+  # it passes. Release procedure: docs/RELEASE.md "Verifying a release".
+  attest:
+    name: Attest wheels, release assets and cc_impl.tsv (tag-gated)
+    runs-on: ubuntu-latest
+    needs:
+      - pyo3-wheel
+      - mobile-release
+    # Explicit result checks, for the same skipped-ancestor reason as
+    # mobile-release (`tree` is skipped on every tag run).
+    if: >-
+      ${{ startsWith(github.ref, 'refs/tags/v') && !cancelled()
+          && needs.pyo3-wheel.result == 'success' && needs.mobile-release.result == 'success' }}
+    permissions:
+      contents: read
+      actions: read        # gh run download of this run's wheel artifacts
+      id-token: write      # the Sigstore signing certificate (OIDC)
+      attestations: write  # store the attestations against this repo
+    steps:
+      - uses: actions/checkout@v6
+      - name: conformance predicate (cc_tag, registry_sha256, crate_version, merge_sha)
+        id: predicate
+        run: |
+          set -euo pipefail
+          VERSION=$(grep '^version = ' Cargo.toml | head -1 | cut -d'"' -f2)
+          if [ "${GITHUB_REF_NAME}" != "v${VERSION}" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not name Cargo.toml's version ${VERSION}"
+            exit 1
+          fi
+          # The evidence must already be re-stamped to this version (release.sh
+          # stage 3); attesting a file that still names the previous release
+          # would sign a stale claim.
+          if ! grep -q "ciris-persist@${VERSION}" evidence/cc_impl.tsv; then
+            echo "::error::evidence/cc_impl.tsv carries no ciris-persist@${VERSION} pointer — not re-stamped"
+            exit 1
+          fi
+          mkdir -p dist
+          python3 - "$VERSION" "$GITHUB_SHA" > dist/cc-conformance.json <<'PY'
+          import json, re, sys
+          src = open("src/federation/namespace/registry.rs").read()
+          def const(name):
+              m = re.search(r'pub const %s: &str =\s*"([^"]*)";' % name, src)
+              if not m:
+                  sys.exit("registry.rs: %s not found" % name)
+              return m.group(1)
+          sha = const("VENDORED_REGISTRY_SHA256")
+          if not re.fullmatch(r"[0-9a-f]{64}", sha):
+              sys.exit("VENDORED_REGISTRY_SHA256 is not 64 hex: %r" % sha)
+          print(json.dumps({
+              "cc_tag": "v" + const("VENDORED_CC_VERSION"),
+              "registry_sha256": sha,
+              "crate_version": sys.argv[1],
+              "merge_sha": sys.argv[2],
+          }, sort_keys=True))
+          PY
+          cat dist/cc-conformance.json
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+      - name: download the desktop wheels (this run) and the release tarballs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.predicate.outputs.version }}
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3 4 5; do
+            rm -rf dist/wheels
+            if gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" \
+                --pattern 'ciris_persist-wheel-*' --dir dist/wheels; then break; fi
+            [ "$attempt" = 5 ] && { echo "::error::wheel artifact download failed 5 times"; exit 1; }
+            sleep $((attempt * 10))
+          done
+          # Only THIS version's wheels: the artifacts carried stale ones from
+          # the cache through v53.1.8 (see pyo3-wheel's maturin build step).
+          n=$(find dist/wheels -name "ciris_persist-${VERSION}-*.whl" | wc -l)
+          [ "$n" -eq 4 ] || { echo "::error::expected 4 ${VERSION} desktop wheels, found $n"; find dist/wheels; exit 1; }
+          for attempt in 1 2 3 4 5; do
+            rm -rf dist/release
+            if gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+                --pattern "ciris-persist-v${VERSION}-*.tar.gz" --dir dist/release; then break; fi
+            [ "$attempt" = 5 ] && { echo "::error::release asset download failed 5 times"; exit 1; }
+            sleep $((attempt * 10))
+          done
+          n=$(find dist/release -name '*.tar.gz' | wc -l)
+          [ "$n" -eq 3 ] || { echo "::error::expected 3 release tarballs, found $n"; ls -la dist/release; exit 1; }
+          sha256sum dist/wheels/*/ciris_persist-"${VERSION}"-*.whl dist/release/*.tar.gz
+      - name: attest build provenance (wheels + release tarballs)
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: |
+            dist/wheels/*/ciris_persist-${{ steps.predicate.outputs.version }}-*.whl
+            dist/release/*.tar.gz
+      - name: attest CC conformance evidence (evidence/cc_impl.tsv)
+        uses: actions/attest@v4
+        with:
+          subject-path: evidence/cc_impl.tsv
+          predicate-type: https://ciris.ai/attestation/cc-conformance/v1
+          predicate-path: dist/cc-conformance.json
+      - name: summary
+        run: |
+          {
+            echo "## Attestations"
+            echo ""
+            echo "- SLSA provenance: 4 wheels + 3 release tarballs"
+            echo "- \`https://ciris.ai/attestation/cc-conformance/v1\` over \`evidence/cc_impl.tsv\` ($(sha256sum evidence/cc_impl.tsv | cut -d' ' -f1))"
+            echo ""
+            echo '```json'
+            cat dist/cc-conformance.json
+            echo '```'
+            echo ""
+            echo "Verify: \`scripts/verify_release.sh ${GITHUB_REF_NAME}\`"
           } >> "$GITHUB_STEP_SUMMARY"

@@ -6,7 +6,7 @@ description: >
   ciris-verify (the start of the centipede), so it's a 2-layer restore: verify's
   leaf blob first (its crypto/keyring registry deps), then persist's own blob
   last (wins on overlap). Sets `CIRISCACHE_KEY` in the job env so a later
-  `save@v1` (where present) reuses it.
+  `save@v1.1` (where present) reuses it.
 
 inputs:
   plat:

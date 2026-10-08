@@ -1,0 +1,33 @@
+{
+  "_comment": "Exact per-file match counts of each rule in rules/ (CIRISPersist#1026). scripts/ast_gates.sh compares ast-grep's counts with these; src/ast_gate_parity.rs compares the Rust text counts with these. A 0 is a claim too: the file must hold no match.",
+  "i110-check-consent-scope-tokens": {
+    "src/federation/admission.rs": 1,
+    "src/store/memory.rs": 2,
+    "src/store/postgres.rs": 2,
+    "src/store/sqlite.rs": 2
+  },
+  "i119-check-media-source": {
+    "src/federation/admission.rs": 1,
+    "src/store/memory.rs": 2,
+    "src/store/postgres.rs": 2,
+    "src/store/sqlite.rs": 2
+  },
+  "i26-cached-content-master": {
+    "src/store/postgres.rs": 1,
+    "src/store/sqlite.rs": 1
+  },
+  "i26-uncached-content-master": {
+    "src/store/postgres.rs": 0,
+    "src/store/sqlite.rs": 0
+  },
+  "i448-prev-head-check": {
+    "src/store/memory.rs": 2,
+    "src/store/postgres.rs": 2,
+    "src/store/sqlite.rs": 2
+  },
+  "scores-read-log": {
+    "src/store/memory.rs": 2,
+    "src/store/postgres.rs": 2,
+    "src/store/sqlite.rs": 2
+  }
+}

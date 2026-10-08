@@ -5,9 +5,49 @@
 #   certify.sh focus <leg> [-E filter]
 #                               quick, then ONE leg's WHOLE suite. NOT a certification.
 #   certify.sh full             every leg CI runs. The only tier that certifies.
+#   certify.sh prebuild         compile every leg (`nextest --no-run`) + the static
+#                               gates + clippy; run nothing. NOT a certification.
+#   certify.sh fingerprint <full|prebuild> <leg>
+#                               print the leg's RUSTFLAGS and cargo command; build
+#                               nothing. Read by scripts/fingerprint_check.sh.
+#   certify.sh verdict          re-print the verdict table of the run in
+#   certify.sh mutants <scope>  mutation matrix over a scope (REPORT-ONLY; docs/MUTATION_TESTING.md)
+#   certify.sh powerset [M/N]   cargo check every depth-2 feature set (docs/FEATURE_MATRIX.md)
+#                               $CERTIFY_LOG_DIR; run nothing.
 #
 # EXIT CODE IS THE ONLY VERDICT — captured on its own line immediately after
-# each command, before any pipe or echo can overwrite it.
+# each command, before any pipe or echo can overwrite it. 0 = green, 1 = a leg
+# is RED, 3 = no leg is red but at least one was lost to the MACHINE (disk
+# floor, killed by a signal, no exit code) — re-run, the tree is unjudged.
+#
+# ── `prebuild` REPLACES PRE-CERTIFY TEST LANES (CIRISPersist#1010) ───────
+# Run `certify.sh prebuild` before the bump commit, then `full`. It compiles
+# exactly the units `full` will run, under the same derived RUSTFLAGS. Running
+# test lanes first (the old pre-certify step) ran certify's tests twice under a
+# different fingerprint — 44–48 min per release for no added assurance, since
+# certify is the gate. The pre-push hook builds the `core` leg's fingerprint
+# too (scripts/ci_env.sh), so a pushed branch has already warmed the first leg.
+#
+# WHAT STAYS WARM, MEASURED (v53.2.0): every dependency of every leg, the
+# clippy units and the dev wheel. NOT the persist library itself: Cargo.toml's
+# `crate-type = ["cdylib", "rlib"]` makes cargo name it WITHOUT a hash
+# (`deps/libciris_persist.{rlib,so}` — a cdylib needs a stable name), so all
+# feature sets share one output and one fingerprint. Whichever leg built last
+# owns it; every other leg sees `FeaturesChanged` and rebuilds the lib and
+# each integration-test binary linking it — 1m04s–1m22s per leg on this box
+# after a complete prebuild (deps: 0 recompiled). The lib-test binaries the
+# hook builds (`--lib`) are hashed and are unaffected.
+#
+# ── DISK IS RE-CHECKED BEFORE EVERY LEG (CIRISPersist#1012) ──────────────
+# The launch-time guard alone let a co-tenant build fill the disk 33–37 min
+# into a run (2 of 4 cycles), and the ENOSPC leg printed as `green exit= s`.
+# Now, before each leg is dispatched, free space on the target filesystem is
+# compared with CERTIFY_MIN_FREE_GB (default 25). Below it, in-flight legs are
+# drained (pruning under a running nextest deletes binaries it re-execs per
+# test), `scripts/prune_target.py` drops superseded artifacts, and the check is
+# repeated. Still below: the leg is recorded DISK — not red, not green — the
+# run continues, and the verdict exits 3 with `INFRA: n legs skipped for disk`.
+# A leg that went red WITH `No space left on device` in its log is DISK too.
 #
 # ── WHY THIS LIVES IN THE REPO ───────────────────────────────────────────
 # It lived in a scratch directory, which was cleaned, taking with it the
@@ -118,11 +158,14 @@ cd "$(dirname "$0")/.." || exit 1
 
 MODE="${1:-full}"; shift 2>/dev/null || true
 case "$MODE" in
-    quick|focus|full) ;;
+    quick|focus|full|prebuild|fingerprint|verdict|keys|mutants|powerset) ;;
     -h|--help|help)
-        sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
-    *) echo "unknown mode '$MODE'; expected quick|focus|full" >&2; exit 2 ;;
+        sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "unknown mode '$MODE'; expected quick|focus|full|prebuild|fingerprint|verdict|mutants|powerset" >&2; exit 2 ;;
 esac
+
+# shellcheck source=scripts/ci_env.sh
+. scripts/ci_env.sh
 
 LOG_DIR="${CERTIFY_LOG_DIR:-target/certify-logs}"
 CORES="$(nproc)"
@@ -159,7 +202,7 @@ done
 # The leg is skippable ONLY by CERTIFY_SKIP_PYTHON=1, and never silently — the
 # verdict table carries a SKIPPED line and the run stops claiming full
 # certification.
-ALL_KEYS="$LEGS default python fmt clippy pyi featmatrix wheelfeat docver pyo3sqlite dirdouble floortoken$AXIS_KEYS"
+ALL_KEYS="$LEGS default python fmt clippy pyi featmatrix wheelfeat docver pyo3sqlite dirdouble astgates weaver bitschanged floortoken$AXIS_KEYS"
 
 FOCUS_LEG=""; FOCUS_FILTER=""
 if [ "$MODE" = "focus" ]; then
@@ -168,6 +211,183 @@ if [ "$MODE" = "focus" ]; then
     echo " $LEGS " | grep -q " $FOCUS_LEG " || {
         echo "unknown leg '$FOCUS_LEG'; expected one of: $LEGS" >&2; exit 2; }
     [ "${1:-}" = "-E" ] && { FOCUS_FILTER="${2:-}"; }
+fi
+
+# ── RUSTFLAGS, DERIVED FROM ci.yml ───────────────────────────────────────
+# Derived (scripts/ci_env.sh) before any guard, because `fingerprint` must
+# report the same value the run would use without taking the run's lock.
+CI_RUSTFLAGS="$(ci_rustflags)" || {
+    echo "REFUSING: could not derive a non-empty RUSTFLAGS from ci.yml — it may have moved or been removed." >&2
+    echo "  Certifying with weaker flags than CI is how a green verdict lies." >&2
+    exit 2; }
+export RUSTFLAGS="$CI_RUSTFLAGS"
+
+feature_csv() { ci_feature_csv "$1"; }
+needs_pg() { python3 scripts/ci_feature_matrix.py set "$1" | grep -qw postgres; }
+
+# The ONE place a leg's cargo invocation is spelled. `full` runs it,
+# `prebuild` runs it with `--no-run`, `fingerprint` prints it — so the units
+# prebuild compiles are the units full runs, by construction.
+#
+# 2026-09-22 (CIRISPersist#880) — the substrate_machine property harness
+# (170 s + 109 s) tests BACKEND parity and varies by no feature axis; it runs
+# in the `rest` leg only (every backend, every feature — the gauntlet), exactly
+# as CI's matrix does. Full case count where it runs; the other legs skip it by
+# filter. (A filter is not part of the build fingerprint.)
+leg_cmd() {
+    local name="$1" csv
+    LEG_CMD=()
+    case "$name" in
+        default) LEG_CMD=(cargo nextest run) ;;
+        *)
+            csv="$(feature_csv "$name")" || return 1
+            LEG_CMD=(cargo nextest run --features "$csv")
+            [ "$name" = "rest" ] || LEG_CMD+=(-E 'not test(/substrate_machine/)')
+            ;;
+    esac
+}
+
+# `keys`: every verdict key, one line — for scripts/certify_selfcheck.sh,
+# which builds synthetic log directories and must cover each key.
+if [ "$MODE" = "keys" ]; then printf '%s\n' $ALL_KEYS; exit 0; fi
+
+# ── fingerprint: print, build nothing, take no lock ──────────────────────
+if [ "$MODE" = "fingerprint" ]; then
+    FP_MODE="${1:-}"; FP_LEG="${2:-}"
+    case "$FP_MODE" in full|prebuild) ;; *)
+        echo "usage: certify.sh fingerprint <full|prebuild> <leg>" >&2; exit 2 ;; esac
+    leg_cmd "$FP_LEG" || { echo "REFUSING: empty or underivable feature set for '$FP_LEG'" >&2; exit 2; }
+    [ "$FP_MODE" = "prebuild" ] && LEG_CMD+=(--no-run)
+    printf 'RUSTFLAGS=%s\n' "$RUSTFLAGS"
+    printf 'CMD='; printf '%q ' "${LEG_CMD[@]}"; echo
+    exit 0
+fi
+
+# One classifier for every verdict this script prints. Sets CLS to one of
+#   green   exit 0
+#   RED     a non-zero exit from the command itself — the only class about the tree
+#   KILLED  exit > 128: the leg was killed by signal (CLS_SIG); 137 is almost always OOM
+#   DISK    skipped by the per-leg disk floor (`.disk`), OR red with ENOSPC in its log
+#   UNKNOWN an `.rc` that exists but holds no integer — ENOSPC on the write itself
+#   NOTRUN  no `.rc` at all
+#   SKIP    an explicit `.skip` marker (CERTIFY_SKIP_PYTHON=1)
+# #1012: an empty `.rc` used to fall through every `-eq`/`-ne` test (each one an
+# `integer expression expected` error, i.e. false) into the GREEN branch, and an
+# ENOSPC leg printed `green rest exit= s`. Green is now reachable from exactly
+# one input: an `.rc` holding `0`.
+classify() {
+    local k="$1" raw
+    CLS_RC="-"; CLS_SIG=""
+    if [ -f "$LOG_DIR/$k.skip" ]; then CLS=SKIP; return; fi
+    if [ -f "$LOG_DIR/$k.disk" ]; then CLS=DISK; return; fi
+    if [ ! -f "$LOG_DIR/$k.rc" ]; then CLS=NOTRUN; return; fi
+    raw="$(cat "$LOG_DIR/$k.rc" 2>/dev/null)"
+    if ! [[ "$raw" =~ ^[0-9]+$ ]]; then
+        CLS=UNKNOWN
+        grep -qs 'No space left on device' "$LOG_DIR/$k.log" && CLS=DISK
+        return
+    fi
+    CLS_RC="$raw"
+    if [ "$raw" -eq 0 ]; then CLS=green
+    elif grep -qs 'No space left on device' "$LOG_DIR/$k.log"; then CLS=DISK
+    elif [ "$raw" -gt 128 ]; then CLS=KILLED; CLS_SIG="$(kill -l $(( raw - 128 )) 2>/dev/null || echo $(( raw - 128 )))"
+    else CLS=RED
+    fi
+}
+
+# ── verdict ──────────────────────────────────────────────────────────────
+# A function so `certify.sh verdict` can re-read an existing log directory —
+# which is also how scripts/certify_verdict_check.sh witnesses the table.
+print_verdict() {
+
+    # Every row comes from `classify`. Exit 1 iff a leg is RED; otherwise exit 3 if
+    # any leg was lost to the machine (DISK / KILLED / UNKNOWN / NOTRUN); 0 only if
+    # every key is green (or explicitly SKIPPED, which prints its own refusal).
+    echo
+    echo "================ FULL CERTIFICATION VERDICT ================"
+    n_red=0; n_disk=0; n_killed=0; n_unknown=0; n_notrun=0; oom=0; skipped=0
+    for k in $ALL_KEYS; do
+        classify "$k"
+        secs="$(tr -dc '0-9' < "$LOG_DIR/$k.secs" 2>/dev/null)"; [ -n "$secs" ] || secs="-"
+        cnt="$(grep -oE '[0-9]+ tests run: [0-9]+ passed|[0-9]+ passed in [0-9.]+s' "$LOG_DIR/$k.log" 2>/dev/null | tail -1)"
+        case "$CLS" in
+            SKIP)
+                # Only CERTIFY_SKIP_PYTHON writes a .skip marker. Loud on purpose:
+                # a skipped leg must cost the reader a sentence, not vanish.
+                printf '  SKIP    %-22s SKIPPED (CERTIFY_SKIP_PYTHON=1) — the Python surface was NOT certified\n' "$k"
+                skipped=1 ;;
+            NOTRUN)
+                # No `.rc` — the leg never ran. Calling that RED would claim a
+                # failure nobody observed.
+                printf '  NOTRUN  %-22s (not run)\n' "$k"; n_notrun=$(( n_notrun + 1 )) ;;
+            DISK)
+                if [ -f "$LOG_DIR/$k.disk" ]; then
+                    printf '  DISK    %-22s skipped: %sG free after prune, floor %sG\n' "$k" "$(cat "$LOG_DIR/$k.disk")" "${MIN_FREE_GB:-?}"
+                else
+                    printf '  DISK    %-22s exit=%-3s %4ss  ENOSPC in the log — the disk, not the tree\n' "$k" "$CLS_RC" "$secs"
+                fi
+                n_disk=$(( n_disk + 1 )) ;;
+            UNKNOWN)
+                printf '  UNKNOWN %-22s exit=?   %4ss  .rc holds no exit code (infra)\n' "$k" "$secs"
+                n_unknown=$(( n_unknown + 1 )) ;;
+            KILLED)
+                # A signal, not an exit. 137 is SIGKILL, overwhelmingly the OOM
+                # killer at these lane counts. Reporting it as RED would attribute
+                # a machine failure to the change under test.
+                printf '  KILLED(%s) %-18s exit=%-3s %4ss\n' "$CLS_SIG" "$k" "$CLS_RC" "$secs"
+                [ "$CLS_RC" = 137 ] && oom=1
+                n_killed=$(( n_killed + 1 )) ;;
+            RED)
+                printf '  RED     %-22s exit=%-3s %4ss  %s\n' "$k" "$CLS_RC" "$secs" "$cnt"; n_red=$(( n_red + 1 )) ;;
+            green)
+                printf '  green   %-22s exit=%-3s %4ss  %s\n' "$k" "$CLS_RC" "$secs" "$cnt" ;;
+        esac
+    done
+    n_infra=$(( n_disk + n_killed + n_unknown + n_notrun ))
+    echo "------------------------------------------------------------"
+    if [ -n "${T_END:-}" ]; then
+        SUM=0
+        for k in $LEGS default clippy python; do
+            s="$(tr -dc '0-9' < "$LOG_DIR/$k.secs" 2>/dev/null)"; SUM=$(( SUM + ${s:-0} ))
+        done
+        # SUM is the sum of leg times AS RUN — under contention, not in isolation. It
+        # GROWS with the lane count, because wider lanes make every leg individually
+        # slower. So SUM/wall is NOT a speedup: at 8x4 it printed "6.57x" for a run that
+        # was only modestly faster than 3x10, purely because contention had inflated the
+        # numerator. A metric that improves when you make things worse is worse than no
+        # metric. WALL CLOCK on a comparably warm tree is the only comparable number.
+        echo "  wall clock, ${LANES} lanes x ${PER_LANE} threads:  $(( T_END - T_START ))s   <-- the only comparable number"
+        echo "  sum of leg times AS RUN (contended, grows with lanes — NOT a baseline): ${SUM}s"
+        [ "$PAUSES" -gt 0 ] && echo "  dispatch paused ${PAUSES}x on the ${RAM_FLOOR_G}G memory floor — consider fewer lanes"
+    fi
+    echo "============================================================"
+    if [ "$oom" -ne 0 ]; then
+        echo "AT LEAST ONE LEG WAS KILLED BY THE KERNEL. That is a verdict about this"
+        echo "machine, not about the tree. Re-run with fewer lanes:  LANES=4 $0 full"
+    fi
+    if [ "$n_red" -ne 0 ]; then
+        echo "NOT CERTIFIED — $n_red leg(s) RED. Logs in $LOG_DIR"; echo "SCRIPT_EXIT=1"; exit 1
+    fi
+    if [ "$n_infra" -ne 0 ]; then
+        echo "NOT CERTIFIED — no leg is red, but the machine lost $n_infra. The tree is UNJUDGED; re-run."
+        echo "INFRA: $n_disk legs skipped for disk, $n_killed killed by a signal, $n_unknown with no exit code, $n_notrun not run."
+        echo "Logs in $LOG_DIR"; echo "SCRIPT_EXIT=3"; exit 3
+    fi
+    if [ "$skipped" -ne 0 ]; then
+        # Explicitly requested, explicitly not certified. The one thing this
+        # branch must never print is the unqualified verdict below.
+        echo "EVERY LEG THAT RAN IS GREEN BY EXIT CODE — but 'python' was SKIPPED (CERTIFY_SKIP_PYTHON=1)."
+        echo "The artifact users install was not run. NOT a full certification; do not tag on this run."
+        echo "SCRIPT_EXIT=0"; exit 0
+    fi
+    echo "EVERY CI LEG GREEN BY EXIT CODE. Logs in $LOG_DIR"
+    echo "SCRIPT_EXIT=0"; exit 0
+}
+
+# ── verdict: re-print the verdict of an existing run, build nothing ─────
+if [ "$MODE" = "verdict" ]; then
+    [ -d "$LOG_DIR" ] || { echo "no log directory at $LOG_DIR" >&2; exit 2; }
+    print_verdict
 fi
 
 # ── the concurrency guard ────────────────────────────────────────────────
@@ -231,29 +451,65 @@ if [ -n "$STRAY" ]; then
     echo "  CERTIFY_IGNORE_STRAY=1 — proceeding anyway." >&2
 fi
 
+# v53.2.0 (#1024/#1025) — two tiers that never print a certification verdict.
+# They come AFTER the lock and the stray guard (one postgres cluster, one
+# target dir, and powerset rewrites Cargo.toml) and BEFORE the RUSTFLAGS
+# export: under `-D warnings` most mutants would build as unviable, and every
+# depth-2 set's dead_code would be a red about nothing. They do not wipe
+# $LOG_DIR, so the last full run's logs survive. `exec` keeps fd 8, so the
+# lock is held for the whole run. The RUSTFLAGS export above (ci_env.sh) is
+# undone here: these tiers build without `-D warnings` on purpose.
+case "$MODE" in
+    mutants|powerset) unset RUSTFLAGS ;;
+esac
+case "$MODE" in
+    mutants)
+        [ -n "${1:-}" ] || { echo "usage: certify.sh mutants <scripts/mutants/scope-*.txt>" >&2; exit 2; }
+        CERTIFY_LOG_DIR="$LOG_DIR" exec scripts/mutants.sh "${MUTANTS_TOOL:-cargo-mutants}" "$1" ;;
+    powerset)
+        CERTIFY_LOG_DIR="$LOG_DIR" exec scripts/powerset.sh check ${1:+"$1"} ;;
+esac
 rm -rf "$LOG_DIR"; mkdir -p "$LOG_DIR"
 
-# ── RUSTFLAGS, DERIVED FROM ci.yml ───────────────────────────────────────
-CI_RUSTFLAGS="$(python3 - <<'PYEOF'
-import re, pathlib, sys
-text = pathlib.Path('.github/workflows/ci.yml').read_text()
-head = text.split('\njobs:')[0]          # workflow-level env, before any job
-m = re.search(r'^\s*RUSTFLAGS:\s*(.+?)\s*$', head, re.MULTILINE)
-if not m:
-    sys.exit('could not find a workflow-level RUSTFLAGS in ci.yml')
-print(m.group(1).strip().strip('"').strip("'"))
-PYEOF
-)" || { echo "REFUSING: could not derive RUSTFLAGS from ci.yml — it may have moved or been removed." >&2; exit 2; }
-[ -n "$CI_RUSTFLAGS" ] || { echo "REFUSING: derived an EMPTY RUSTFLAGS; certifying with weaker flags than CI is how a green verdict lies." >&2; exit 2; }
-export RUSTFLAGS="$CI_RUSTFLAGS"
-
 # ── disk and memory guards ───────────────────────────────────────────────
-FREE_G="$(df -BG --output=avail . | tail -1 | tr -dc '0-9')"
+# Free space is measured on the filesystem that holds the TARGET directory —
+# that is what a build fills, and with CARGO_TARGET_DIR set it need not be the
+# one holding the checkout.
+TARGET_ROOT="${CARGO_TARGET_DIR:-target}"
+MIN_FREE_GB="${CERTIFY_MIN_FREE_GB:-25}"
+target_free_gb() {
+    local d="$TARGET_ROOT"
+    while [ ! -e "$d" ]; do d="$(dirname "$d")"; done
+    df -BG --output=avail "$d" | tail -1 | tr -dc '0-9'
+}
+FREE_G="$(target_free_gb)"
 if [ "${FREE_G:-0}" -lt 15 ]; then
     echo "REFUSING: only ${FREE_G}G free. A build that dies on ENOSPC produces a red that" >&2
     echo "  belongs to the disk, not the change. Reclaim space first." >&2
     exit 2
 fi
+# Per-leg re-check (see the header, #1012). Returns 0 when the leg may run;
+# otherwise writes `<leg>.disk` and returns 1. The CALLER guarantees nothing of
+# this run is in flight before calling it below the floor: the prune deletes
+# artifacts, and nextest re-execs its test binaries once per test.
+disk_guard() {
+    local name="$1" free
+    free="$(target_free_gb)"
+    [ "${free:-0}" -ge "$MIN_FREE_GB" ] && return 0
+    echo "  .. disk: ${free}G free on the target filesystem, below the ${MIN_FREE_GB}G floor — pruning before '$name'"
+    if ! python3 scripts/prune_target.py --target "$TARGET_ROOT" >>"$LOG_DIR/prune.log" 2>&1; then
+        echo "  .. prune_target.py exited non-zero (see $LOG_DIR/prune.log)"
+    fi
+    echo "  .. $(tail -1 "$LOG_DIR/prune.log" 2>/dev/null)"
+    free="$(target_free_gb)"
+    if [ "${free:-0}" -ge "$MIN_FREE_GB" ]; then
+        echo "  .. disk: ${free}G free after the prune — running '$name'"
+        return 0
+    fi
+    echo "  !! DISK — ${free}G free after the prune, still below ${MIN_FREE_GB}G; '$name' is NOT run"
+    echo "${free:-0}" > "$LOG_DIR/$name.disk"
+    return 1
+}
 avail_g() { awk '/^MemAvailable:/{printf "%d", $2/1048576}' /proc/meminfo; }
 RAM_G="$(avail_g)"
 # Budget per lane. A leg is a test binary plus its postgres backends; the floor
@@ -298,6 +554,7 @@ echo "cores=$CORES  ram=${RAM_G}G  free-disk=${FREE_G}G"
 echo
 echo "=== fast static gates (concurrent) ==="
 run_bg() { local name="$1"; shift; ( "$@" >"$LOG_DIR/$name.log" 2>&1; echo $? >"$LOG_DIR/$name.rc" ) </dev/null & }
+
 run_bg fmt        cargo fmt --all --check
 run_bg pyi        python3 scripts/pyi_surface.py check
 run_bg featmatrix python3 scripts/ci_feature_matrix.py check
@@ -308,6 +565,16 @@ run_bg docver     python3 scripts/doc_version_refs.py
 # exist and never execute — a check that cannot fail is a report.
 run_bg floortoken bash -c 'set -o pipefail; cargo test --quiet --doc --features sqlite -- StorageFloor 2>&1 | tee /dev/stderr | grep -q "test result: ok. 1 passed"'
 run_bg dirdouble  python3 scripts/gen_directory_double.py --check
+# v53.2.0 (CIRISPersist#1026/#1027) — the ast-grep gate counts and the Weaver
+# telemetry registry. Each fetches its pinned tool on first use (cached under
+# ~/.cache); offline with no cached copy it exits 3, which reads RED here: a
+# gate that could not look has not passed.
+run_bg astgates   scripts/ast_gates.sh
+run_bg weaver     scripts/weaver_check.sh
+# v53.2.0 (CIRISPersist#1029) — the bits-changed gate's witnesses: fixture
+# wheels and a local stub registry, offline, including the `ls | head -1`
+# mutant that registered a v29 wheel as v53.1.8.
+run_bg bitschanged scripts/bits_changed_test.sh
 # v35.0.0 (CIRISPersist#710) — tested-wheel ⊇ shipped-wheel, and nobody
 # hand-spells a `maturin develop --features` list (here or in ci.yml).
 run_bg wheelfeat  python3 scripts/wheel_features.py check
@@ -348,7 +615,7 @@ wait
 # before the expensive legs dispatch, is the point of the fast stage: a compile
 # break under `--features cirisnode` alone should cost seconds, not the full
 # test matrix first.
-FAST_GATES="fmt pyi featmatrix wheelfeat docver pyo3sqlite dirdouble floortoken$AXIS_KEYS"
+FAST_GATES="fmt pyi featmatrix wheelfeat docver pyo3sqlite dirdouble astgates weaver bitschanged floortoken$AXIS_KEYS"
 
 # Every `.rc` this run produced must be claimed by a key someone reads. The log
 # directory is wiped at startup, so anything here was written by this run.
@@ -375,28 +642,28 @@ if [ -n "$unclaimed" ]; then
     echo "SCRIPT_EXIT=1"; exit 1
 fi
 
-fast_fail=0
+fast_fail=0; fast_infra=0
 for g in $FAST_GATES; do
-    rc="$(cat "$LOG_DIR/$g.rc" 2>/dev/null || echo 99)"
-    printf '  %-22s exit=%s\n' "$g" "$rc"
-    [ "$rc" -ne 0 ] && fast_fail=1
+    classify "$g"
+    printf '  %-22s exit=%-3s %s\n' "$g" "$CLS_RC" "$( [ "$CLS" = green ] || echo "$CLS")"
+    case "$CLS" in
+        green) ;;
+        RED) fast_fail=1 ;;
+        *) fast_infra=1 ;;
+    esac
 done
-if [ "$fast_fail" -ne 0 ]; then
-    echo; echo "STOPPED — a fast gate is red; nothing expensive was run."
+if [ "$fast_fail" -ne 0 ] || [ "$fast_infra" -ne 0 ]; then
+    echo; echo "STOPPED — a fast gate is not green; nothing expensive was run."
     for g in $FAST_GATES; do
-        [ "$(cat "$LOG_DIR/$g.rc" 2>/dev/null || echo 99)" -ne 0 ] && {
-            echo "--- $g ---"; tail -20 "$LOG_DIR/$g.log"; }
+        classify "$g"
+        [ "$CLS" = green ] || { echo "--- $g ($CLS) ---"; tail -20 "$LOG_DIR/$g.log" 2>/dev/null; }
     done
+    if [ "$fast_fail" -eq 0 ]; then
+        echo "INFRA: no fast gate is red, but at least one was lost to the machine. The tree is unjudged."
+        echo "SCRIPT_EXIT=3"; exit 3
+    fi
     echo "SCRIPT_EXIT=1"; exit 1
 fi
-
-feature_csv() {
-    local leg="$1" feats
-    feats="$(python3 scripts/ci_feature_matrix.py set "$leg")" || return 1
-    [ -n "$feats" ] || return 1
-    echo "$feats" | tr ' ' ','
-}
-needs_pg() { python3 scripts/ci_feature_matrix.py set "$1" | grep -qw postgres; }
 
 # ── warm the postgres template SERIALLY (see note 2) ─────────────────────
 warm_template() {
@@ -413,6 +680,105 @@ warm_template() {
     fi
 }
 
+# Both clippy invocations CI's lint job runs. Every tier calls this one
+# function, so `prebuild` warms exactly what `full` and `quick` check.
+# v53.1.2 — CI's lint job ALSO runs --all-features: it compiles the test-anchor
+# integration tests the lint shape does not (v53.1.1 lost a PR CI round to a
+# redundant_guards lint certify never saw). Until v53.2.0 only `quick` ran it;
+# `full`, the tier that certifies, ran the lint shape alone.
+run_clippy() {
+    local lf
+    lf="$(python3 scripts/ci_feature_matrix.py set lint)" || return 1
+    [ -n "$lf" ] || { echo "EMPTY lint feature set" >&2; return 1; }
+    cargo clippy --features "$lf" --all-targets -- -D warnings || return 1
+    cargo clippy --all-features --all-targets -- -D warnings
+}
+
+# v35.0.0 (#669/#710) — the artifact users install, tested. The feature line is
+# DERIVED (`wheel_features.py line` = pyproject's shipped list − written
+# exclusions + test-only riders); the venv persists in target/ so
+# pip/maturin/pytest install once, and `maturin develop` matches CI's
+# wheel-pytest step: --release, under the same derived RUSTFLAGS as every other
+# leg. pytest runs as `python -m pytest` so it is the VENV's interpreter — the
+# one the wheel was installed into — never a system pytest that would import
+# nothing and report it green. First run needs the network (pip: maturin+pytest;
+# maturin develop: ciris-verify). `build` stops after the wheel (prebuild).
+run_python() {
+    local what="$1"
+    WHAT="$what" bash -c '
+        set -euo pipefail
+        WF="$(python3 scripts/wheel_features.py line)"
+        [ -n "$WF" ] || { echo "EMPTY derived wheel feature line" >&2; exit 1; }
+        echo "tested dev-wheel: --features \"$WF\""
+        VENV="target/certify-pyvenv"
+        [ -x "$VENV/bin/python" ] || python3 -m venv "$VENV"
+        # shellcheck disable=SC1091
+        . "$VENV/bin/activate"
+        python -m pytest --version >/dev/null 2>&1 && command -v maturin >/dev/null 2>&1 \
+            || python -m pip install maturin pytest
+        maturin develop --release --features "$WF"
+        [ "$WHAT" = build ] && exit 0
+        python -m pytest tests/python/ -v
+    '
+}
+
+# ═════════════════════════════════════════════════════════════════════════
+# TIER: prebuild (#1010) — compile what `full` runs; run nothing
+# ═════════════════════════════════════════════════════════════════════════
+# Serial on purpose: cargo's target-dir lock serialises builds anyway, and with
+# nothing in flight between legs the per-leg disk guard may prune safely.
+if [ "$MODE" = "prebuild" ]; then
+    echo
+    echo "=== prebuild: every leg's units, compiled and not run (feature sets DERIVED) ==="
+    PB_KEYS=""
+    pb_red=0
+    pb_one() {  # $1 = key, rest = command
+        local key="$1" t0; shift
+        PB_KEYS="$PB_KEYS $key"
+        disk_guard "$key" || { printf '  %-22s DISK\n' "$key"; return 0; }
+        t0=$(date +%s)
+        "$@" >"$LOG_DIR/$key.log" 2>&1 </dev/null
+        echo $? >"$LOG_DIR/$key.rc"; echo $(( $(date +%s) - t0 )) >"$LOG_DIR/$key.secs"
+        classify "$key"
+        printf '  %-22s %-7s exit=%-3s %4ss\n' "$key" "$CLS" "$CLS_RC" "$(cat "$LOG_DIR/$key.secs")"
+        [ "$CLS" = RED ] && pb_red=1
+        return 0
+    }
+    for leg in $LEGS default; do
+        [ "$pb_red" -eq 0 ] || { echo "  !! STOPPING — a build is red; the rest would compile for a verdict already decided."; break; }
+        leg_cmd "$leg" || { PB_KEYS="$PB_KEYS build-$leg"; echo "EMPTY or underivable feature set" >"$LOG_DIR/build-$leg.log"
+            echo 1 >"$LOG_DIR/build-$leg.rc"; pb_red=1; continue; }
+        pb_one "build-$leg" "${LEG_CMD[@]}" --no-run
+    done
+    [ "$pb_red" -eq 0 ] && pb_one build-clippy run_clippy
+    if [ "$pb_red" -eq 0 ] && [ "${CERTIFY_SKIP_PYTHON:-0}" != "1" ]; then
+        pb_one build-python run_python build
+    fi
+    echo
+    echo "================ PREBUILD — NOT A CERTIFICATION ================"
+    pb_infra=0; pb_disk=0
+    for k in $PB_KEYS; do
+        classify "$k"
+        case "$CLS" in
+            green) ;;
+            RED) printf '  RED     %-22s see %s\n' "$k" "$LOG_DIR/$k.log"; tail -15 "$LOG_DIR/$k.log" ;;
+            DISK) printf '  DISK    %-22s\n' "$k"; pb_infra=$(( pb_infra + 1 )); pb_disk=$(( pb_disk + 1 )) ;;
+            *) printf '  %-7s %-22s exit=%s %s\n' "$CLS" "$k" "$CLS_RC" "$CLS_SIG"; pb_infra=$(( pb_infra + 1 )) ;;
+        esac
+    done
+    if [ "$pb_red" -ne 0 ]; then
+        echo "STOPPED — a leg does not compile. 'full' would be red; fix it first."
+        echo "SCRIPT_EXIT=1"; exit 1
+    fi
+    if [ "$pb_infra" -ne 0 ]; then
+        echo "INFRA: $pb_disk legs skipped for disk, $(( pb_infra - pb_disk )) lost otherwise — those legs are cold."
+        echo "SCRIPT_EXIT=3"; exit 3
+    fi
+    echo "every leg compiled — deps, clippy and the wheel are warm for 'full' (the hashless"
+    echo "persist lib relinks per leg; see the header). Nothing was RUN."
+    echo "SCRIPT_EXIT=0"; exit 0
+fi
+
 # ═════════════════════════════════════════════════════════════════════════
 # TIER: quick / focus
 # ═════════════════════════════════════════════════════════════════════════
@@ -422,16 +788,8 @@ if [ "$MODE" != "full" ]; then
     # gates cannot see.
     echo
     echo "=== default-feature suite + clippy (concurrent) ==="
-    run_bg default env NEXTEST_TEST_THREADS="$(( CORES / 2 ))" cargo nextest run
-    run_bg clippy bash -c '
-        set -uo pipefail
-        LF="$(python3 scripts/ci_feature_matrix.py set lint)" || exit 1
-        [ -n "$LF" ] || { echo "EMPTY lint feature set" >&2; exit 1; }
-        cargo clippy --features "$LF" --all-targets -- -D warnings || exit 1
-        # v53.1.2 - CI'"'"'s lint job ALSO runs --all-features: it compiles the
-        # test-anchor integration tests the lint shape does not (v53.1.1 lost
-        # a PR CI round to a redundant_guards lint certify never saw).
-        cargo clippy --all-features --all-targets -- -D warnings'
+    run_bg default env NEXTEST_TEST_THREADS="$(ci_single_leg_threads)" cargo nextest run
+    run_bg clippy run_clippy
     wait
     qfail=0
     for g in default clippy; do
@@ -485,10 +843,10 @@ if [ "$MODE" != "full" ]; then
     echo "=== $FOCUS_LEG — ENTIRE suite (this is the verdict) ==="
     LLOG="$LOG_DIR/$FOCUS_LEG.log"; T0=$(date +%s)
     if needs_pg "$FOCUS_LEG"; then
-        scripts/pg_test_db.sh -- env NEXTEST_TEST_THREADS="$(( CORES / 2 ))" \
+        scripts/pg_test_db.sh -- env NEXTEST_TEST_THREADS="$(ci_single_leg_threads)" \
             cargo nextest run --features "$CSV" >"$LLOG" 2>&1
     else
-        NEXTEST_TEST_THREADS="$(( CORES / 2 ))" cargo nextest run --features "$CSV" >"$LLOG" 2>&1
+        NEXTEST_TEST_THREADS="$(ci_single_leg_threads)" cargo nextest run --features "$CSV" >"$LLOG" 2>&1
     fi
     lrc=$?; T1=$(date +%s)
     echo "  exit=$lrc  $(( T1 - T0 ))s  $(grep -oE '[0-9]+ tests run: [0-9]+ passed' "$LLOG" | tail -1)"
@@ -531,59 +889,16 @@ run_job() {
     local name="$1" log="$LOG_DIR/$1.log" t0 t1 rc
     t0=$(date +%s)
     case "$name" in
-        clippy)
-            bash -c '
-                set -uo pipefail
-                LF="$(python3 scripts/ci_feature_matrix.py set lint)" || exit 1
-                [ -n "$LF" ] || { echo "EMPTY lint feature set" >&2; exit 1; }
-                cargo clippy --features "$LF" --all-targets -- -D warnings' >"$log" 2>&1
-            ;;
-        default)
-            NEXTEST_TEST_THREADS="$PER_LANE" cargo nextest run >"$log" 2>&1
-            ;;
-        python)
-            # v35.0.0 (#669/#710) — the artifact users install, tested. The
-            # feature line is DERIVED (`wheel_features.py line` = pyproject's
-            # shipped list − written exclusions + test-only riders); the venv
-            # persists in target/ so pip/maturin/pytest install once, and
-            # `maturin develop` matches CI's wheel-pytest step: --release,
-            # under the same derived RUSTFLAGS as every other leg. pytest runs
-            # as `python -m pytest` so it is the VENV's interpreter — the one
-            # the wheel was installed into — never a system pytest that would
-            # import nothing and report it green. First run needs the network
-            # (pip: maturin+pytest; maturin develop: ciris-verify).
-            bash -c '
-                set -euo pipefail
-                WF="$(python3 scripts/wheel_features.py line)"
-                [ -n "$WF" ] || { echo "EMPTY derived wheel feature line" >&2; exit 1; }
-                echo "tested dev-wheel: --features \"$WF\""
-                VENV="target/certify-pyvenv"
-                [ -x "$VENV/bin/python" ] || python3 -m venv "$VENV"
-                # shellcheck disable=SC1091
-                . "$VENV/bin/activate"
-                python -m pytest --version >/dev/null 2>&1 && command -v maturin >/dev/null 2>&1 \
-                    || python -m pip install maturin pytest
-                maturin develop --release --features "$WF"
-                python -m pytest tests/python/ -v
-            ' >"$log" 2>&1
-            ;;
+        clippy) run_clippy >"$log" 2>&1 ;;
+        python) run_python test >"$log" 2>&1 ;;
         *)
-            local csv
-            csv="$(feature_csv "$name")" || {
+            leg_cmd "$name" || {
                 echo "EMPTY or underivable feature set for '$name' — refusing to run a leg that tests nothing" >"$log"
                 echo 1 >"$LOG_DIR/$name.rc"; return; }
-            # 2026-09-22 (CIRISPersist#880) — the substrate_machine property
-            # harness (170 s + 109 s) tests BACKEND parity and varies by no
-            # feature axis; it runs in the `rest` leg only (every backend,
-            # every feature — the gauntlet), exactly as CI's matrix does. Full
-            # case count where it runs; the other legs skip it by filter.
-            local gauntlet=()
-            [ "$name" = "rest" ] || gauntlet=(-E 'not test(/substrate_machine/)')
-            if needs_pg "$name"; then
-                scripts/pg_test_db.sh -- env NEXTEST_TEST_THREADS="$PER_LANE" \
-                    cargo nextest run --features "$csv" "${gauntlet[@]}" >"$log" 2>&1
+            if [ "$name" != default ] && needs_pg "$name"; then
+                scripts/pg_test_db.sh -- env NEXTEST_TEST_THREADS="$PER_LANE" "${LEG_CMD[@]}" >"$log" 2>&1
             else
-                NEXTEST_TEST_THREADS="$PER_LANE" cargo nextest run --features "$csv" "${gauntlet[@]}" >"$log" 2>&1
+                NEXTEST_TEST_THREADS="$PER_LANE" "${LEG_CMD[@]}" >"$log" 2>&1
             fi
             ;;
     esac
@@ -603,7 +918,7 @@ T_START=$(date +%s)
 if [ ! -f "$LOG_DIR/python.skip" ]; then
     echo
     echo "=== python leg (serial — the peak-RAM build runs alone) ==="
-    run_job python
+    disk_guard python && run_job python
 fi
 echo
 echo "=== expensive legs (${LANES} lanes x ${PER_LANE} threads; feature sets DERIVED from ci_feature_matrix.py) ==="
@@ -619,10 +934,16 @@ for _ in $(seq "$LANES"); do printf '.' >&9; done
 # cause) or local to one feature set. Two legs failing identically is a
 # different diagnosis from one, and that distinction was worth having the time
 # this rule was written for.
+#
+# A DISK leg does NOT stop dispatch: the next leg meets the same per-leg floor
+# and is either run or recorded DISK on its own. Anything else that is not
+# green (RED, KILLED, an empty `.rc`) does — a second OOM kill decides nothing.
 any_red() {
+    local f
     for f in "$LOG_DIR"/*.rc; do
         [ -f "$f" ] || continue
-        [ "$(cat "$f")" != "0" ] && return 0
+        classify "$(basename "$f" .rc)"
+        case "$CLS" in green|DISK|SKIP) ;; *) return 0 ;; esac
     done
     return 1
 }
@@ -650,6 +971,19 @@ while read -r job; do
         [ "$PAUSES" -eq 1 ] && echo "  .. memory below ${RAM_FLOOR_G}G floor — holding dispatch rather than overcommitting"
         sleep 10
     done
+    # #1012 — the disk floor, per leg. Below it, DRAIN first: the prune deletes
+    # artifacts, and an in-flight nextest re-execs its test binaries once per
+    # test. Draining costs at most one leg's wall clock; pruning under a live
+    # leg turns a disk problem into a red that names the tree.
+    if [ "$(target_free_gb)" -lt "$MIN_FREE_GB" ] && [ "${#pids[@]}" -gt 0 ]; then
+        echo "  .. disk below ${MIN_FREE_GB}G before '$job' — draining ${#pids[@]} in-flight leg(s) before any prune"
+        for p in "${pids[@]}"; do wait "$p"; done
+        pids=()
+    fi
+    if ! disk_guard "$job"; then
+        printf '.' >&9
+        continue
+    fi
     # `< /dev/null` is LOAD-BEARING. Without it the backgrounded job inherits
     # stdin — which is the job queue — and cargo/nextest read from it, silently
     # swallowing queue lines. Observed: of ten queued jobs, four ran and six
@@ -663,67 +997,11 @@ exec 9>&-
 T_END=$(date +%s)
 
 MISSING=""
-while read -r j; do [ -f "$LOG_DIR/$j.rc" ] || MISSING="$MISSING $j"; done < "$LOG_DIR/queue"
+while read -r j; do
+    [ -f "$LOG_DIR/$j.rc" ] || [ -f "$LOG_DIR/$j.disk" ] || MISSING="$MISSING $j"
+done < "$LOG_DIR/queue"
 if [ -n "$MISSING" ]; then
     echo; echo "!! JOBS THAT NEVER RAN:$MISSING"
-    echo "   (not the same as red — the queue drained short. Counted RED below.)"
+    echo "   (not the same as red — the queue drained short. Counted NOTRUN below.)"
 fi
-
-# ── verdict ──────────────────────────────────────────────────────────────
-echo
-echo "================ FULL CERTIFICATION VERDICT ================"
-fail=0; oom=0; skipped=0
-for k in $ALL_KEYS; do
-    if [ -f "$LOG_DIR/$k.skip" ]; then
-        # Only CERTIFY_SKIP_PYTHON writes a .skip marker. Loud on purpose:
-        # a skipped leg must cost the reader a sentence, not vanish.
-        printf '  SKIP   %-22s SKIPPED (CERTIFY_SKIP_PYTHON=1) — the Python surface was NOT certified\n' "$k"
-        skipped=1; continue
-    fi
-    rc="$(cat "$LOG_DIR/$k.rc" 2>/dev/null || echo 99)"
-    secs="$(cat "$LOG_DIR/$k.secs" 2>/dev/null || echo -)"
-    cnt="$(grep -oE '[0-9]+ tests run: [0-9]+ passed|[0-9]+ passed in [0-9.]+s' "$LOG_DIR/$k.log" 2>/dev/null | tail -1)"
-    if [ "$rc" -eq 99 ]; then
-        # 99 is this script's sentinel for a missing .rc — the leg never ran.
-        # Calling that RED would claim a failure nobody observed.
-        printf '  UNKNOWN %-21s (not run)\n' "$k"; fail=1
-    elif [ "$rc" -eq 137 ]; then
-        # SIGKILL. Overwhelmingly the OOM killer at these lane counts. Reporting
-        # it as RED would attribute a memory failure to the change under test.
-        printf '  INFRA  %-22s exit=137 %4ss  killed (SIGKILL — almost certainly OOM)\n' "$k" "$secs"
-        fail=1; oom=1
-    elif [ "$rc" -ne 0 ]; then
-        printf '  RED    %-22s exit=%-3s %4ss  %s\n' "$k" "$rc" "$secs" "$cnt"; fail=1
-    else
-        printf '  green  %-22s exit=%-3s %4ss  %s\n' "$k" "$rc" "$secs" "$cnt"
-    fi
-done
-echo "------------------------------------------------------------"
-SUM=0
-for k in $LEGS default clippy python; do SUM=$(( SUM + $(cat "$LOG_DIR/$k.secs" 2>/dev/null || echo 0) )); done
-# SUM is the sum of leg times AS RUN — under contention, not in isolation. It
-# GROWS with the lane count, because wider lanes make every leg individually
-# slower. So SUM/wall is NOT a speedup: at 8x4 it printed "6.57x" for a run that
-# was only modestly faster than 3x10, purely because contention had inflated the
-# numerator. A metric that improves when you make things worse is worse than no
-# metric. WALL CLOCK on a comparably warm tree is the only comparable number.
-echo "  wall clock, ${LANES} lanes x ${PER_LANE} threads:  $(( T_END - T_START ))s   <-- the only comparable number"
-echo "  sum of leg times AS RUN (contended, grows with lanes — NOT a baseline): ${SUM}s"
-[ "$PAUSES" -gt 0 ] && echo "  dispatch paused ${PAUSES}x on the ${RAM_FLOOR_G}G memory floor — consider fewer lanes"
-echo "============================================================"
-if [ "$oom" -ne 0 ]; then
-    echo "AT LEAST ONE LEG WAS KILLED BY THE KERNEL. That is a verdict about this"
-    echo "machine, not about the tree. Re-run with fewer lanes:  LANES=4 $0 full"
-fi
-if [ "$fail" -ne 0 ]; then
-    echo "NOT CERTIFIED. Logs in $LOG_DIR"; echo "SCRIPT_EXIT=1"; exit 1
-fi
-if [ "$skipped" -ne 0 ]; then
-    # Explicitly requested, explicitly not certified. The one thing this
-    # branch must never print is the unqualified verdict below.
-    echo "EVERY LEG THAT RAN IS GREEN BY EXIT CODE — but 'python' was SKIPPED (CERTIFY_SKIP_PYTHON=1)."
-    echo "The artifact users install was not run. NOT a full certification; do not tag on this run."
-    echo "SCRIPT_EXIT=0"; exit 0
-fi
-echo "EVERY CI LEG GREEN BY EXIT CODE. Logs in $LOG_DIR"
-echo "SCRIPT_EXIT=0"
+print_verdict

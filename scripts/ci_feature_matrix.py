@@ -37,6 +37,9 @@ Two coverage axes, and they are NOT the same claim:
            ever dropped silently.
 
 Usage:
+    scripts/ci_feature_matrix.py powerset [--verbose]
+                                                 # depth-2 powerset vs certify's hand
+                                                 # sets; exit 1 if a hand set is uncovered
     scripts/ci_feature_matrix.py list            # declared features, one per line
     scripts/ci_feature_matrix.py legs            # matrix-leg names, one per line
     scripts/ci_feature_matrix.py set <name>      # space-separated cargo feature string
@@ -75,10 +78,16 @@ AXIS_LEGS = ("cirisaudit", "secrets", "cirisnode", "cirisgraph", "telemetry")
 #: drift from the test matrix.
 LINT_SHIPPED = BASE + AXIS_LEGS
 
-#: Test invocations that are NOT matrix rows. A configuration too small to
-#: deserve a whole runner rides an existing leg as an extra step instead —
-#: `name -> (host leg, feature set)`. They count toward TEST coverage exactly
-#: as a leg does, and `check` verifies ci.yml still runs each one.
+#: Test invocations that are NOT `BASE + axis` legs. Each is
+#: `name -> (host, feature set)`: the host is either an existing leg it rides
+#: as an extra step, or the rider's OWN NAME, meaning it has a matrix row of
+#: its own (`leg: <name>`) and runs through the generic nextest step. They
+#: count toward TEST coverage exactly as a leg does, and `check` verifies
+#: ci.yml still runs each one where this table says.
+#:
+#: v53.2.0 (CIRISPersist#1009) — `test-anchor` moved from riding `cirisaudit`
+#: to its own row: "~2 min, rides the shortest leg" had become 3,440 tests and
+#: 15–17.5 min, making its host the longest job of every run.
 #:
 #: `test-anchor` is here rather than in a leg because it is a CONFIGURATION,
 #: not a flag: the feature compiles the genesis relaxation in and
@@ -88,7 +97,7 @@ LINT_SHIPPED = BASE + AXIS_LEGS
 #: needs its own invocation, and nextest's process isolation is load-bearing
 #: because the genesis fixtures use `std::env::set_var`.
 RIDERS: dict[str, tuple[str, tuple[str, ...]]] = {
-    "test-anchor": ("cirisaudit", ("sqlite", "test-anchor")),
+    "test-anchor": ("test-anchor", ("sqlite", "test-anchor")),
 }
 
 #: Features deliberately held out of every TEST leg, each with the reason.
@@ -272,8 +281,9 @@ def check() -> int:
         )
     else:
         in_yaml = {leg for _, leg in found}
+        own_rows = {name for name, (host, _fs) in RIDERS.items() if host == name}
         missing = sorted(set(plan) - in_yaml)
-        extra = sorted(in_yaml - set(plan))
+        extra = sorted(in_yaml - set(plan) - own_rows)
         if missing:
             problems.append(
                 f"legs defined here but absent from ci.yml's matrix: {missing}. "
@@ -289,8 +299,22 @@ def check() -> int:
     #     hosts it. A rider silently dropped from ci.yml would be a
     #     configuration that stops being tested while this gate keeps counting
     #     it as covered — the gate lying in the #585 direction.
+    rows = {leg for _, leg in found}
     for name, (host, _fs) in RIDERS.items():
-        if f"ci_feature_matrix.py set {name}" not in ci:
+        if host == name:
+            # Its own matrix row: the generic step asks `set <leg>` for it.
+            if name not in rows:
+                problems.append(
+                    f"rider {name!r} is declared to have its own matrix row, but "
+                    f"ci.yml's matrix has no `leg: {name}`. Restore the row, or "
+                    f"move {name!r} to NOT_TESTED with a reason."
+                )
+            elif "ci_feature_matrix.py set '${{ matrix.substrate.leg }}'" not in ci:
+                problems.append(
+                    f"rider {name!r} relies on the generic matrix step deriving "
+                    f"`set <leg>`, and that step no longer does."
+                )
+        elif f"ci_feature_matrix.py set {name}" not in ci:
             problems.append(
                 f"rider {name!r} is counted as test coverage here but ci.yml never "
                 f"runs `ci_feature_matrix.py set {name}`. Either restore the step or "
@@ -384,6 +408,13 @@ def main(argv: list[str]) -> int:
         return report()
     if cmd == "check":
         return check()
+    if cmd == "powerset":
+        # CIRISPersist#1025 — the derived sets against the hand legs.
+        import subprocess
+        return subprocess.call(
+            [sys.executable, str(Path(__file__).with_name("powerset_delta.py")), *argv[2:]],
+            stdin=subprocess.DEVNULL,
+        )
     raise SystemExit(f"unknown command {cmd!r}")
 
 

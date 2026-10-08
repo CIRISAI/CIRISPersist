@@ -7,6 +7,376 @@ threat-model citations because this crate's audit story is the point.
 
 ## [Unreleased]
 
+## [53.2.0] - 2026-10-08
+
+### Changed — the tag is pushed once main's run EXISTS, not once it completes (#1008)
+
+`scripts/release_ship.sh` waited for main's push run on the merge sha to finish before pushing the tag, which re-paid the full matrix that #881's tree-equality skip had already avoided: 64 min on v53.1.5 and 65 min on v53.1.6. That wait came from v50.0.0, where main's run and the tag run were queued in the same second, main's came second, and the #397 same-SHA concurrency group cancelled the tag run. The v50 failure needed main's run to be queued after the tag's, so waiting until main's run is visible is enough. The tag run is then the newer one and cancels main's, as #397 intended. v53.1.7 and v53.1.8 shipped this way from a scratch copy.
+
+- The script now waits until main's push run is visible (`queued`, `in_progress` or already `completed`), or about 5 min if it never appears, then pushes the tag.
+- The script ENDS after the tag push and prints `TAG_RUN_ID=<id>` and the `scripts/release_finish.sh` command. Waiting for tag CI, re-running a tag run cancelled by the dedup, and setting the release body moved to `scripts/release_finish.sh <version> <tag-run-id>`, so neither half can be killed by a 2-hour background cap (v53.1.8's ship script was).
+- Merging goes through the REST endpoint (`gh pr merge` selects Projects-classic fields over GraphQL, which error on this repo). An already-merged PR and an already-cut or already-pushed tag are accepted, so a killed run can be re-run as is. The merge sha is the PR's `merge_commit_sha`, not `origin/main`'s tip.
+- The comment that explains the ordering keeps the v50 and v51 history and adds the #1008 change.
+
+### Added — `scripts/release.sh`: one command from a written CHANGELOG section to a pushed tag (#1018)
+
+On v53.1.8, certify was green at about 18:40 and PR CI at 19:02, but the merge happened at 21:49 because nothing chained the two greens to the merge. `scripts/release.sh <version> [--pr-body FILE] [--merge-body FILE]` runs the release as eight stages: preflight, cheap legs, bump commit, push + PR, `certify.sh full`, PR CI wait, ship, then stop with the `release_finish.sh` command.
+
+- **Resumable.** Each completed stage writes `.release/<version>/<stage>.done` (git-ignored), and a re-run skips it. The cheap legs, certify and the PR CI wait record the commit they passed on and count as done only while HEAD is still that commit. After a red certify, commit the fix and re-run the same command.
+- **Cheap legs first.** The five no-backend axes (read from `ci_feature_matrix.AXIS_LEGS`), the pyo3 lane, both clippy passes and `pyi_surface.py check` run under ci.yml's RUSTFLAGS, so the reds that usually arrive late arrive in minutes.
+- **Bump commit.** Cargo version, the `evidence/cc_impl.tsv` re-stamp (count asserted, so `@53.1.8` does not match `@53.1.80`), the CHANGELOG date, `cargo check --features sqlite`, and the evidence pin test. The subject is built from the section's `###` headings.
+- **PR CI wait.** A failed first attempt counts as final only once it has been re-run, once an `auto-retry` run that started after it has finished without re-running it, or after 15 min.
+- Every wait loop is bounded and prints its timeout. Each failure has its own exit code (20 to 29; 29 is certify's new INFRA exit 3: re-run, tree unjudged) and a one-line reason. There is no `--no-verify` and no `--amend`. `--dry-run` runs preflight and prints the plan without side effects.
+- `scripts/release_lib.sh` holds the shared functions (section cut, re-stamp, stage markers). `scripts/release_selftest.sh` tests them offline against a fixture CHANGELOG (41 checks). Mutation-checked: each of the following reds the self-test: an unbounded previous-version scan, a section that runs to EOF, a re-stamp without the version boundary, marking a failed stage, ignoring the recorded sha, and a `--no-verify` added to a release script.
+- `docs/RELEASE.md` documents the stages, the resume rule and what to do for each exit code.
+
+Codex review on PR #1039: six findings fixed before merge. The CHANGELOG cut passed regex text through `awk -v`, which gawk and busybox awk un-escape, so it returned an empty section with exit 0; it now matches headings as fixed strings, refuses an empty cut, and the self-test runs under every awk on the host (red under gawk 5.2.1 and busybox, green under mawk). The mutest matrix copied the whole-suite verdict, so a mutant only an out-of-scope test detected read `caught`; outcomes now come from the retained witnesses, with `caught_out_of_scope` and `crashed` for the rest. `scripts/prune_target.py` applied the 16-hex deps pattern to `incremental/`, whose names are base-36, so it reclaimed none of them; each directory now has its own pattern. The re-register plan took the newest tag run holding any wheel; it now takes the run covering the most needed wheels and rebuilds only what that run lacks (`scripts/reregister_plan.sh`). The repost guard compared only `binary_hash`; `scripts/snapshot_manifests.sh verify` now compares the whole canonical JSON of all three live reads to the committed snapshot. `scripts/release_finish.sh` hid a failed tag fetch with `|| true` and could publish a stale local annotation; it now reads origin's tag from its own ref and refuses a different local tag (exit 18) or a failed fetch (exit 19). Codex's second round found four more. `scripts/release_ship.sh` accepted a re-run's local tag at the right commit whatever its annotation said; the tag's message must now equal the CHANGELOG section byte for byte, else exit 11 and nothing is pushed. The repost guard verified only the re-signed targets while `register` rewrites all five, and the unchanged manifests could come from a tag-run artifact older than the live row; all five targets are now guarded, the unchanged manifests always come from the live registry, and `scripts/snapshot_manifests.sh verify-reuse` checks each fetched one against its snapshot. `release.sh` resumed `.release/<ver>` state on any clean branch, and its unkeyed bump marker skipped the version bump; the state now records its branch and release commit, and a resume that does not match them (or finds Cargo.toml or the dated header wrong) exits 32. The PR run's `build-manifest` job also went red: `bits_changed.sh` refused python-source-tree's unchanged hash because tag v53.2.0 does not exist before the tag push, so it now judges "unchanged" at HEAD when the version's tag is absent and names the ref it used. That run's history showed every PR run had been registering live registry rows from an unmerged head; register, the round-trip and check 5 now run on tag runs only. `observe::emit_metrics` described every counter with no unit, because the two-argument `describe_counter!` forwards none; it now passes each catalogued unit (`By` as bytes, `{row}`, `{read}` and `{call}` as a count), and I553 asserts the unit the recorder received.
+
+`release.sh` gained a `codex` stage between the PR CI wait and ship, because the chain would have shipped PR #1039 ten minutes after these findings were posted. It waits up to 30 minutes for Codex's review of HEAD. A review of an older head does not count. Any Codex inline finding made on HEAD stops the release with exit 30 and prints each finding's `path:line` and title. If no review arrives, the stage ships with a loud `::warning::` line. `--skip-codex` is the operator override. The self-test covers it with a stub `gh`, and five mutants of its filters each go red.
+
+### Fixed — `owner_withdraw::postgres::i126` flaked on loaded runners (#1011)
+
+The test stamped an owner binding to expire 300 ms out, then asserted that `owner_of` named the owner right after the put. On a 4-vCPU hosted runner the reseal, the postgres put and the read took longer than 300 ms. The binding had lapsed, and the fold correctly returned `None` (`left: None, right: Some("ow-owner-…")`). This was a test-only race: production is right to treat a lapsed binding as unowned. Reproduced locally by pinning the test to 2 CPUs under 12 busy loops: stamp-to-read took 325–869 ms and the test was red 5 times out of 5 with the CI signature. Unloaded, it takes about 22 ms.
+
+- `put_lapsing_owner_binding` retries with a fresh binding and twice the window when the read FINISHED after the expiry (up to 6 attempts, 300 ms to 9.6 s). A `None` read that finished while the binding was live still fails, so the precondition still checks that a live binding reads as live. The fixed 400 ms sleep becomes "100 ms past the expiry".
+- Witness `i126_lapsing_binding_survives_a_put_slower_than_its_window` forces the interleaving by stalling the first read longer than the first window.
+- Mutation-checked: no retry (`LAPSE_ATTEMPTS = 1`) reds the witness (`binding lapsed before every read`), and flipping the lapse classification reds it (`owner_of read None … while … live until …`). Under the same 2-CPU, 12-loop load, the fixed test passed 5 of 5. Unloaded on postgres it passed 20 of 20 (1.9–2.7 s per run, real database). No nextest retries were added.
+
+### Changed — one build fingerprint locally: the pre-push hook builds certify's `core` leg; `certify.sh prebuild` (#1010)
+
+The pre-push hook ran `cargo test --features postgres,pyo3,server --lib` with no RUSTFLAGS,
+the release pipeline's pre-certify lanes ran two more feature sets, and certify ran nine under
+`-D warnings`. RUSTFLAGS and the feature set are in every unit's fingerprint, so one machine
+compiled the dependency graph three times per release and certify reused none of it.
+
+- `scripts/ci_env.sh` derives RUSTFLAGS from ci.yml, a leg's feature set from
+  `ci_feature_matrix.py`, and the single-leg thread count. certify.sh and the hook source it.
+- The hook now runs `cargo nextest run --features <core> --lib` under the derived RUSTFLAGS.
+  Its units are the ones certify's `core` leg compiles. A tree too old to derive them skips
+  the gate loudly; it never hand-spells a feature list.
+- `certify.sh prebuild` compiles every leg (`nextest --no-run`), both clippy invocations and
+  the dev wheel, and runs no tests. Use it before the bump commit instead of test lanes. On a
+  cold worktree with `CARGO_BUILD_JOBS=3` it took 46 min: 11 min of fast gates, then 2071 s of
+  leg builds, including 549 s for the wheel. After it, `full` finds every dependency, the clippy units and the wheel
+  warm. The persist lib does not stay warm. `crate-type = ["cdylib", "rlib"]` makes cargo name
+  it without a hash (`deps/libciris_persist.{rlib,so}`), so every feature set shares one output.
+  Each leg other than the last one built gets `FeaturesChanged` and rebuilds the lib plus its
+  integration-test binaries (measured 1m04s–1m22s per leg, 0 dependencies recompiled). Making
+  that per-feature would need the cdylib split into its own crate; that is not done here.
+- `certify.sh fingerprint <full|prebuild> <leg>` prints the command `full` would run, built by
+  the same `leg_cmd`. `scripts/fingerprint_check.sh` compares the (RUSTFLAGS, features,
+  profile) triple across the hook, prebuild and full's core leg, and exits 1 on drift.
+  Mutation-checked: removing the hook's RUSTFLAGS, giving the hook the lint feature set, or
+  adding `--release` to prebuild each fails the check.
+- `full`'s clippy leg now also runs `--all-features`, as CI's lint job does. Before this,
+  only `quick` ran it.
+
+### Fixed — certify: a disk floor before every leg, and a verdict table that cannot print an ENOSPC leg as green (#1012)
+
+ENOSPC killed 2 of the last 4 certify runs 33–37 min in. The dead leg printed as
+`green rest exit= s`, because an empty `.rc` failed every integer test and fell through to the
+green branch.
+
+- Before each leg, free space on the target filesystem is checked against
+  `CERTIFY_MIN_FREE_GB` (default 25). Below the floor, certify drains in-flight legs (nextest
+  re-execs its binaries once per test, so pruning under a running leg is unsafe), then runs the
+  new `scripts/prune_target.py`, then checks again. `prune_target.py` keeps the newest unit per
+  crate name and kind in `deps/` and `incremental/`, has `--dry-run`, and refuses any directory
+  without a `CACHEDIR.TAG`. If space is still short, the leg is recorded as `DISK` and the run
+  continues.
+- One `classify` function produces every row in every table. Only an `.rc` containing `0`
+  prints green. Exit codes above 128 print `KILLED(<sig>)` with the elapsed time. A red leg
+  with `No space left on device` in its log prints `DISK`. An empty `.rc` prints `UNKNOWN`.
+- New exit code: 1 means a leg is RED. 3 means no leg is red but the machine lost at least one
+  leg (`INFRA: n legs skipped for disk, …`). Fast gates use the same rules.
+- `certify.sh verdict` re-prints the table for an existing log directory.
+  `scripts/certify_selfcheck.sh` runs 12 synthetic cases (137, 143, empty `.rc`, ENOSPC,
+  disk floor, not-run, red beats infra, …) plus the prune. Mutation-checked: restoring the
+  empty-`.rc`-is-green behavior, removing KILLED, or dropping the ENOSPC classification each
+  fails the selfcheck.
+
+### Changed — CI: `test-anchor` runs as its own matrix row instead of riding `cirisaudit` (#1009)
+
+The rider was described as "~2 min, rides the shortest leg". It had grown to 3,440 tests
+(15–17.5 min) and made `cirisaudit` the longest job of every run (60–71 min). It now has its
+own `linux-x86_64 (test-anchor)` row. It was not moved to the macOS job: on the v53.1.8 tag
+run, macOS jobs waited 40–48 min for a runner, so a longer mac job would lengthen the queue
+the manifest waits on. `ci_feature_matrix.py`'s RIDERS now supports an own-row host, and
+`check` requires the row.
+
+### Changed — CI: bench runs on schedule and dispatch only (#1020)
+
+`bench.yml` no longer runs on every push to main, which cost 34–47 min of the shared pool per
+merge. The gh-pages publish was gated on `event_name == 'push'`; it now publishes for
+schedule and dispatch runs on main, so the trend chart keeps updating.
+
+### Changed — CI: main's run is skipped when the merge tree equals a PR head that passed CI (#1021)
+
+A new `tree` job runs only on push to main. It sets `skip=true` only when all three hold:
+HEAD is a merge, tree(HEAD) == tree(HEAD^2), and a pull_request CI run on HEAD^2 succeeded.
+Any error leaves `skip=false`. Root jobs gate on its output. Tag runs never skip, so the
+versioned cache still publishes.
+
+### Changed — CI: a PR builds iOS only when the diff can break it; main and tags always do (#1019)
+
+`ios-build` had no gate and ran on every PR: 52 min for ios-simulator and 48 min for
+ios-device on PR run 37662321512, on the macOS pool that is the tag run's critical path. A new
+`ios-paths` job runs on pull_request only and lists the PR's files through the API. iOS builds
+when the diff touches `src/ffi/`, `Cargo.toml`/`Cargo.lock`, `pyproject.toml`, `.cargo/`,
+`ci.yml` or the cache composite. It also builds when a changed `.rs` file's patch touches a
+`target_os`/`target_vendor`/`target_family`/`target_arch`/`target_env` cfg, or the file already
+contains one. A Cargo change that is exactly the package `version =` bump does not count, so
+release PRs are not forced into iOS by the bump alone.
+
+Any error, or a diff of 3000 or more files, builds iOS. Push and tag runs skip `ios-paths`, and
+its empty output reads as "build". On main, the #1021 tree skip has a stricter `skip_ios`: iOS
+is skipped only if the PR run's `ios PyO3 abi3` jobs ran and all succeeded. An iOS break is
+therefore caught at merge, never first at the tag.
+
+Simulated against PRs #1016, #1000, #985, #978 and #959. #1000 skips iOS; the others build it,
+via `src/ffi/`, `ci.yml` or a lock change. Eleven synthetic diffs also gave the expected answer:
+a bump-only change skips; a dependency added or upgraded builds; a platform cfg in a patch or
+in the file builds; a rename out of `src/ffi/` builds; an API failure builds; 3000 files builds.
+`skip_ios` was simulated against the PR run's iOS job conclusions: success+success skips;
+skipped, failure and none build.
+
+### Added — the release and `evidence/cc_impl.tsv` are attested; `scripts/verify_release.sh` (#1028)
+
+A new tag-gated `attest` job, the only job granted `id-token: write` and `attestations: write`,
+signs two kinds of GitHub artifact attestation through Sigstore's public-good instance. The first
+is SLSA build provenance over the four abi3 desktop wheels and the three release tarballs, as
+downloaded from the release. The second is `https://ciris.ai/attestation/cc-conformance/v1` over
+`evidence/cc_impl.tsv`, with predicate `{cc_tag, registry_sha256, crate_version, merge_sha}`
+read from `registry.rs`. The job refuses a tag that does not name Cargo's version, and refuses
+an evidence file not re-stamped to it. `scripts/verify_release.sh v<ver>` reads every
+attestation back with `gh attestation verify`, bound to this repo, ci.yml and the tag ref, and
+checks the predicate's version and commit. `release_finish.sh` runs it before
+`RELEASE_SHIP_DONE`; exit 17 is new. It needs gh 2.49+ (`GH=`). The release machine's
+`/usr/bin/gh` is 2.45. docs/RELEASE.md has a "Verifying a release" section.
+
+**Edge, Server:** to verify before pinning, use predicate type
+`https://ciris.ai/attestation/cc-conformance/v1` with
+`--source-ref refs/tags/v<ver>`. **Constitution:** claims.tsv can cite the attestation digest.
+
+**Fixed along the way.** The CIRISCache restore left earlier releases' wheels in
+`target/wheels/`. v53.1.8's tag artifacts held wheels for 29.0.0 through 30.2.0 next to
+53.1.8. `build-manifest`'s `ls *.whl | head -1` therefore signed and registered the **29.0.0**
+wheel's hash for `aarch64-unknown-linux-gnu` (`51193a5a…`) and `x86_64-pc-windows-msvc`
+(`8a1e5a8f…`). The build now clears `target/wheels/`, and `build-manifest` signs exactly one
+`ciris_persist-<v>-*.whl` or fails. The rows already registered for earlier releases on those
+two targets, and windows on 53.0.1 and 53.1.0–53.1.7, are corrected by the #1029 workflow below, not by this change.
+
+Deferred: no sdist is attested, because none is built. Consumers build from the tag. The tag
+job cannot run locally. actionlint 1.7.12 reports nothing new. `verify_release.sh` was run
+against unattested v53.1.8 and failed all 8 subjects with exit 1, as it should. The passing
+path is untested until the v53.2.0 tag run.
+
+### Fixed — the registry vouched for v29 bytes under 11 later (version, target) names; the bits-changed gate and a check/repost workflow (#1029)
+
+The tag job registered the 29.0.0 wheel's hash for `x86_64-pc-windows-msvc` (`8a1e5a8f…`) under
+ten versions, 53.0.1 and 53.1.0 through 53.1.8. It did the same for `aarch64-unknown-linux-gnu`
+(`51193a5a…`) under 53.1.8. All of it was signed with our CI key. Verify found the consequence.
+Before CIRISVerify 20.1.0, `verify_build_manifest` checked signature, primitive and extras and
+never related `binary_hash` to `binary_version`. On those pairs a correct install failed
+integrity, a false tamper alarm. The v29.0.0 wheel passed, **attested as the later version**: a
+rollback door. Verify 20.1.0 refuses that at signing and at verification (CIRISVerify#306/#307).
+Persist's side follows.
+
+- **The fix** is in #1028 above: `target/wheels/` is cleared before the build, and the tag job
+  signs exactly one `ciris_persist-<v>-*.whl` per target or fails.
+- **The gate.** `scripts/bits_changed.sh <version> <target> <wheel-dir-or-file>` asks whether
+  the bits changed. Check 1: exactly one wheel for the target's platform tag. Check 2: the
+  wheel's own `METADATA` `Version:` and `WHEEL` `Tag:` fit. Check 3: its sha256 is not the hash
+  the registry holds for the previous release on that target. Check 4: it is not in
+  `evidence/manifest_remediation/known_stale_hashes.txt`. Check 5, `--after-publish`: the
+  registered row now carries exactly that sha256. Each check has its own exit code and a
+  one-line reason.
+- **The fifth target.** `python-source-tree` is gated too, by its tree hash. Its hash may equal
+  the previous release's only when `git diff v<prev> v<this> -- python/ciris_persist` is empty,
+  and the gate says so when it allows it. A wheel never gets that exemption. The tree is three
+  files, unchanged from v13.0.0 through v17.6.0, so the hash registered identically on 13.0.0,
+  14.1.0 and 17.6.0 (`c0bcaeb4…`) is genuine.
+- **Where it runs.** The tag job runs checks 1–4 before each sign and check 5 on all five rows
+  after the round-trip. Its `build-manifest` checkout now fetches full history for the tags.
+  `verify_release.sh` runs all five checks on each desktop wheel. It takes the tag run id from
+  `release_finish.sh`, and reads the wheels from that run's per-target artifacts, never PyPI.
+- **One copy of the signing logic.** `scripts/build_manifest.sh` holds install, check,
+  fetch-reuse, sign, preflight, register, roundtrip and read-back. ci.yml's `build-manifest`
+  job and the new workflow both call it.
+- **Remediation.** `.github/workflows/reregister-manifests.yml` takes `versions`, `targets`
+  (default all five), `mode` (default `check`) and `dry_run` (default `true`). A dispatch with
+  the defaults writes nothing. Check first, then repost the MISMATCH rows with `dry_run: false`.
+  - `mode: check`, the default, writes nothing. Per row it prints the registered hash beside
+    the release's own: the wheel from the tag run's artifact, selected by version, or the tree
+    recomputed from the tag. Each row is MATCH, MISMATCH or NOROW.
+  - `mode: repost` re-posts only the MISMATCH rows. A row with no committed snapshot, or whose
+    live row no longer matches its snapshot, is refused. The registry upserts with no history
+    (CIRISRegistry#144). `scripts/snapshot_manifests.sh` writes the record and never overwrites
+    one.
+  - A repost re-signs the MISMATCH targets after checks 1–4. It re-posts the others unchanged,
+    after checking each against its wheel or the tag's tree, because `register` writes one
+    `binary_manifests` map per version. It registers through `/v1/builds` and
+    `/v1/verify/build-manifest` only, and reads every row back.
+  - An expired wheel artifact is rebuilt from the tag in `pyo3-wheel`'s shape and labelled a
+    same-version REBUILD (CC 3.1.2.1 `supersedes`). An expired build-manifest artifact is
+    replaced by the registry's verbatim bodies. Re-signing with their `extras` reproduces the
+    registered `manifest_hash`. The workflow prints which path it took and adds no secret.
+- **Snapshots committed** for all 11 pairs, read on 2026-10-08.
+
+Tested:
+- `scripts/bits_changed_test.sh` passes 56 cases offline, against a stub registry and a fake
+  `ciris-build-sign`. It is a certify fast gate (`bitschanged`) and a CI lint step. Restoring
+  `ls | head -1` turns it red, and so does each of 21 other mutants of the two scripts.
+- `verify_release.sh 53.1.8 37692136047` against the live registry fails the aarch64 and
+  windows rows and passes x86_64 and darwin.
+- A local run with the real `ciris-build-sign` 2.1.5 and a throwaway key, reading only:
+  - the check pass reported MATCH for `python-source-tree`, x86_64 and darwin on 53.1.8, and
+    MISMATCH for aarch64 and windows;
+  - `fetch-reuse` returned bodies byte-identical to the tag run's manifests;
+  - the re-sign reproduced the registered `manifest_hash` for both targets;
+  - `register --dry-run` listed the five targets with the 53.1.8 wheels' hashes (`835f213a…`,
+    `25c97b37…`).
+- The workflow's plan step, run locally, found the expected tag runs for 53.0.1 and 53.1.8. For
+  5.0.0, whose artifacts have expired, it scheduled the rebuild.
+
+Untested: the tag job, the dispatched workflow and the rebuild job. They need the signing
+secrets or a runner. Nothing was dispatched and nothing was written to the registry.
+
+Witness I190f (`i190_f_ci_preflight_gates_the_bundle_quorum`) followed the refactor: the tag job's sign/preflight/register steps now live in `scripts/build_manifest.sh`, so the witness asserts that `ci.yml` runs `build_manifest.sh preflight` BEFORE `build_manifest.sh register` and that the script runs the self-test and the steward-key gate. Mutations: preflight line deleted → red; self-test deleted → red; register before preflight → red. The pre-push hook caught the stale witness on the first `release.sh 53.2.0` push.
+
+### Added — the telemetry catalogue as an OpenTelemetry Weaver registry, and emission through the `metrics` facade (#1027)
+
+- **Registry.** `telemetry/registry/` is the #1014 catalogue written as an OTel Weaver
+  semantic-convention registry. `manifest.yaml` has `file_format: definition_manifest/2.0` and
+  `schema_url: https://ciris.ai/schemas/persist/telemetry/1.0.0`. `attributes.yaml` holds the
+  closed `backend`/`door`/`fold` enums. `metrics.yaml` holds the seven counters, with
+  instrument, unit and required attributes. The catalogue now has one source: the registry
+  renders through `telemetry/templates/registry/catalog/` to `telemetry/catalog.json`.
+  `scripts/weaver_check.sh` runs `weaver registry check --future`, and fails when the
+  committed rendering is stale. It uses weaver 0.27.0, pinned, downloaded, sha256-checked.
+  **I552** reads that rendering from this crate's own manifest dir and holds it equal to
+  `TELEMETRY_CATALOG` in both directions: names, instruments, units, label keys and label
+  values. It is a CI lint step. **Server (#746 §3.3):** merge `telemetry/registry/` at the
+  persist tag (Weaver v2 definition manifest). Attribute ids are unprefixed (`backend`,
+  `door`, `fold`), so a merge that collides on them should namespace on import.
+- **Emission (the P1 half #1014 deferred).** `observe::emit_metrics()` writes every counter
+  through the `metrics` 0.24 facade, under its catalogued name and labels, as
+  `Counter::absolute(value)`. `Engine::emit_telemetry_metrics()` is the same call. The host
+  calls it at scrape. Without a recorder it is a no-op. The read path does not touch the
+  facade: the atomics stay the one source. **Hosts:** install a recorder that resolves
+  `metrics` 0.24, or nothing arrives. **I553**, the `live-check` equivalent: seed every
+  `(backend, door)` and every fold, then emit into a `metrics_util` `DebuggingRecorder`. The
+  emitted series must equal the snapshot's samples, value for value, and their names, keys
+  and values must equal the catalogue.
+- **Dependencies.** `metrics = 0.24` (no default features; adds `rapidhash`) is a new normal
+  dependency. `metrics-util 0.19` (`debugging`) is a dev-dependency. The lock re-resolved 12
+  Windows-only crates from `windows-sys` 0.60.2 to 0.61.2, already in the graph. The five
+  no-backend axes and `--no-default-features` check clean under `-D warnings`. No wire or ABI
+  change.
+- Mutations, 6 of 6 killed. A door value removed from the YAML → `weaver_check.sh` stale →
+  re-rendered → I552 red. A unit changed in the YAML → stale → I552 red. A fold value removed
+  from `catalog.rs` → I552 and I553 red. `emit_metrics` dropping the fold samples → I553 red.
+  `emit_metrics` emitting `absolute(0)` → I553 red. A dangling `ref` in the YAML →
+  `weaver registry check` red.
+- Deferred: `weaver registry live-check` against a running process (OTLP). I553 asserts the
+  same names, labels and values in-process. Generating `catalog.rs` itself from the registry
+  is also deferred; I552 holds the two equal instead.
+
+### Added — from-disk gate counts as ast-grep rules, first increment (#1026)
+
+`docs/FROM_DISK_GATES.md` lists every from-disk gate: about 90 tests in 45 files. Each is
+classed AST-COUNT, AST-STRUCT, TEXTUAL (SQL, migrations, prose, digests) or not-a-gate. Six
+counts from five gates are ported: I110's `check_consent_scope_tokens`, I119's
+`check_media_source`, I448's `check_prev_head_names_held` inside `supersede_group_row`,
+`log_scores_read` inside `list_scores`/`resolve_scores`, and I26's cached and uncached
+content-master resolvers. The ports are `sgconfig.yml`, `rules/*.yml` and exact per-file counts
+in `rules/expected.json`. The AST counts are exact where I110 and I119 asserted only minimums.
+
+`scripts/ast_gates.sh` (ast-grep 0.45.3, pinned, sha256-checked download) compares the counts in
+both directions. A rule with no expectation, an expectation with no rule, a glob, a missing file
+or any differing count is red. It scans `CARGO_MANIFEST_DIR`, else this checkout, and never
+another worktree. It is a certify fast gate (`astgates`, alongside `weaver`) and a CI lint step.
+`src/ast_gate_parity.rs` holds the Rust text counts, with comments and strings blanked, equal to
+the same `expected.json`. The AST count and the text count therefore agree through one file. The
+original Rust witnesses stay for one release.
+
+Mutations, 15 of 15 as expected. For each rule, a commented-out copy of the call (line and block
+comment) leaves both checks green. Deleting the call makes both red. Moving I26's cached call to
+the uncached one makes both I26 rules red. A dropped expectation, a glob in `files:`, and a
+`CARGO_MANIFEST_DIR` pointing at another checkout are each red.
+
+Deferred, listed in the doc: the remaining AST-COUNT gates (I14, the `== 0` guards, I551's path
+set, I98, I103, I8), every AST-STRUCT gate (relational rules), and deleting the six Rust text
+scans after this release.
+
+### Found, not changed — no Linux CIRISCache blob has been published since at least v53.1.3 (#1022)
+
+Every core-1 `CIRISCache/save@v1` on the v53.1.3–v53.1.8 tag runs and on main run
+37559458619 fails in the LRU prune, before `tar`/`oras push`. The failing pipeline is
+`find | sort | while … break` under `pipefail`: `sort` gets SIGPIPE and the step exits 2, and
+`continue-on-error` hides the failure. As a result, every Linux leg restores
+`phead-…-v10.6.1` (verify v10), spends 6m53s extracting it, and still compiles 119 crates. The
+fix belongs in CIRISCache. The measurements and a one-leg A/B are in the #1022 comment.
+
+**CI: CIRISCache v1.1; tag-run save strict; budget 12 GB pending measurement.** CIRISCache
+v1.1 (CIRISCache#4) fixes the prune's SIGPIPE and reports every save through `published`,
+`reason` and `key` outputs. All six `save@v1` steps now pin `save@v1.1`; `restore@v2` is
+unchanged because v1.1 changes only `save`. The core-1 save is `strict` on a tag run and no
+longer `continue-on-error` there, so a failed publish fails the release, since Edge and Server
+exact-pin that blob. Its budget goes from 4096 to 12288 MB. That figure is BELIEVED, not
+measured: each live save is now preceded by a `du -sh` of `target/release` and the
+`target/debug` subdirectories, and the budget should be set from the second run after
+adoption. Every other save stays fail-open, followed by a step that prints the three outputs
+and emits a `::warning::` when `published` is not `true`. The darwin-aarch64 save stays
+disabled (#762) and gets the pin only.
+
+### Added — a per-witness mutation matrix, without hand selection (#1024)
+
+Until now every mutation round was hand-picked per PR and lived only here ("the 10-mutant round"). Nothing said, after the merge, which witness was load-bearing for which site. `scripts/mutants.sh <cargo-mutants|mutest> <scope>` drives a mutation tool over a named scope and writes `target/certify-logs/mutants/<scope>/matrix.{json,md}`: every mutant, its outcome, and every witness that went red under it. Report-only: it exits 0 whenever a matrix is written. Format, scope grammar and cadence: `docs/MUTATION_TESTING.md`.
+
+- **`scripts/mutants_matrix.py`** resolves a scope file (`tests:` filterset, `witnesses:` files, `<path> [<fn> ...]` entries; a function name must define exactly one `fn`) into each tool's own filter, and turns either tool's output into one schema, `ciris-persist/mutants-matrix/v1`. An interrupted cargo-mutants run is marked INCOMPLETE: the mutants missing from `outcomes.json` are read from the tool's own `mutants.json` as `not_run`. Before that, a matrix built from a run cut off after 17 of 74 mutants said "complete".
+- **`scripts/unvalidated_witnesses.py`** lists each `*_invariants.rs` witness (or `witnesses:` file) that ran and killed nothing: an unvalidated witness in Beyer 2022's sense, never shown red. On an incomplete run a zero prints `ZERO SO FAR`, not `UNVALIDATED`. Report-only this cut.
+- **Three scopes.**
+  - `scripts/mutants/scope-consent.txt` holds the consent gates and `src/observe/`, the sites of 53.1.8's rounds.
+  - `scripts/mutants/scope-consent-gate.txt` holds the two consent files only, against the I548 witnesses, so the gate is measured in 11 minutes without the 61 `observe/` mutants.
+  - `scripts/mutants/scope-observe-sites.txt` holds the backend byte meters and the fold entries, named by function in 3k–28k-line files.
+- **Tool verdict: cargo-mutants 27.1.0**, on the pinned 1.97.0. mutest-rs (git 430efed9, `nightly-2026-07-18`) was measured and rejected:
+  - Its static call graph ran 1 of the 16 in-scope witnesses, the only synchronous one.
+  - It generated no mutant in `consent_by_humans.rs` or `admission.rs`, where cargo-mutants found 13.
+  - With `postgres` on it hits an internal compiler error (`mutest-emit` `analysis/res.rs:758`, `deadpool` path).
+  - Its build peaks at 8.2 GiB, and each run profiles the whole lib suite first (1688 s, 3351 tests).
+  - The ML-DSA tests survived its meta-mutant binary with no stack overflow.
+- **Consent gate (`scope-consent-gate`), complete in 654 s.** 13 mutants: 9 caught, 3 unviable (the `Ok(Default::default())` bodies), 1 missed. Every I548 witness killed at least one, on memory, sqlite and postgres: i548a 5, i548b 4, i548c 9, i548d 4, i548e 1. The hand round's 3 mutants are semantic swaps no operator generates (the subject-only fold, bare `analyze`, the constant in the refusal). The tool's 13 cover the same two functions and show the same witnesses load-bearing.
+- **The gate's survivor is a witness gap, #1038.** It is `consent_by_humans.rs:282:21`, `||` replaced with `&&` in the steward-universe predicate `a.attesting_key_id != *p || is_structural_composer(..) || for_key_id_of(..) == Some(subject)`. The mutant drops the substrate's `consent:state:expired` record, which carries no `for_key_id` by design. A swept steward grant then reads `Unspecified` instead of `Expired`. The admit verdict is unchanged, and no I548 case covers it. This is from reading the code, not reproduced with a test.
+- **Counters (`scope-consent`), INCOMPLETE at 51 of 74.** The harness stopped it for memory after 2954 s. All 51 ran in `src/observe/mod.rs`: 42 caught, 4 unviable, 3 timeouts, 2 missed. Kills: sqlite i549 41, memory i549 38, postgres i549 38, sqlite i550 25, postgres i550 24, every i551 0 so far. 23 were not run: 10 `TelemetrySnapshot::fold` and `samples` mutants, and the 13 gate mutants, which the gate run then covered.
+  - The 3 timeouts are `record_read`'s mask loop at `:316`, which never clears and hangs the witness. They count as detected, but no witness is credited.
+  - The 2 survivors are filed as #1037: `Counters::snapshot` `n > 0` to `>=` (`:247`), and `fold`'s `|` to `^` (`:330`).
+- **Against I549–I551's 10 hand mutants.**
+  - Four have tool equivalents, killed by the same witness as by hand: `Fold::bit -> 0` and `record_read`'s `:313` flip by i549, `record_read` replaced with `()` by i549 and i550, and `note_decoded_bytes` replaced with `()` by sqlite i549.
+  - One, the dropped fold credit, corresponds to the `:316` timeouts.
+  - Three are in `scope-observe-sites.txt`, not yet run.
+  - Two, the `DOOR_VALUES` edits, cannot be generated: neither tool mutates a `const` slice.
+- **mutest's 12 survivors** are all in the `Vec::with_capacity` hint at `src/observe/mod.rs:431`. They are equivalent mutants.
+- **Unvalidated witnesses across all runs.** None among the 13 I548 witnesses. mutest validated `i551_samples_carry_exactly_the_catalogued_names_and_labels`, which killed 2. Three from-disk witnesses have never been shown red by a tool: `i551_each_backend_records_under_its_own_label`, `i551_every_emitted_label_is_catalogued_and_every_catalogued_one_emitted` and `i551_strip_comments_strips_both_shapes`. Neither tool mutates the literals they read. The 53.1.8 hand round showed only the second one red.
+- **Not in this cut.**
+  - The `certify.sh mutants` tier and the scheduled CI job; the exact lines for the merge are in `docs/CI_WIRING_53_2_0.md`.
+  - A complete `scope-consent` run, projected at about 70 min serially, run alone.
+  - Any run of `scope-observe-sites.txt`.
+  - A scope for the remaining `trust_root.rs` walks.
+  - Turning the unvalidated report into a gate.
+
+### Added — the feature powerset against certify's hand legs (#1025)
+
+"Certify per feature set, never a union" was enforced by a hand list. `scripts/powerset.sh list|count|check [M/N]` derives the sets with `cargo hack --feature-powerset --depth 2 --no-dev-deps`. `scripts/powerset_delta.py` compares them with every set certify.sh builds: LEGS, `lint`, AXES × 3 backend shapes, and the literal `run_bg` legs. It exits 1 if a hand set is not covered at least pairwise. Detail: `docs/FEATURE_MATRIX.md`.
+
+- **Enumeration.** 47 declared features, 4 excluded (`scrub-ner`, `scrub-ort`, `default-pipeline-ml`, `_pyffi`, all still compiled by the `--all-features` clippy pass). That leaves 43 features and **929 sets**: the empty set, 43 singles, and 885 pairs. Another 18 pairs are skipped as implied.
+- **Delta.** certify.sh builds 27 hand sets. 18 are built exactly by the powerset, 9 only pairwise (`core`, the five axis legs, `lint`, `pyo3sqlite`, `rest`: 4 to 34 features, beyond depth 2), and 0 are uncovered. 911 derived sets are built by nothing today, including 37 single features never compiled alone.
+- **Two configurations that do not compile**, found by the two partial `check` runs on disk (34 of 929 sets in 598 s; partition 41/80, 12 sets in 274 s at 3.0 GiB). Filed as #1030 (v54.0.0); not fixed here, because each is a feature-contract decision:
+  - `tls` without `postgres` (`Cargo.toml:525`). `tokio-postgres-rustls` fails on `tokio_postgres::tls::MakeTlsConnect`.
+  - `pyo3-sqlite` without `pyo3` (`Cargo.toml:43` enables only `_pyffi`). It fails with 184 × E0004 from `src/ffi/pyo3.rs:120`.
+- **No hand leg dropped.** The test legs stay hand-derived.
+- **Not in this cut.** Two parts of #1025 are deferred. First, the cheap-tier leg it asked for: at the measured 17.6–22.8 s per set, 929 sets is about 4.5–6 h, so the proposal is a weekly 8-partition CI job plus an opt-in `certify.sh powerset [M/N]`. Second, the `ci_feature_matrix.py powerset` mode. Both are written out in `docs/CI_WIRING_53_2_0.md`. A full `check` over all 929 sets has not run.
+
 ## [53.1.8] - 2026-10-07
 
 ### Fixed — the score emit gate refused what its consent precheck granted (#1013)

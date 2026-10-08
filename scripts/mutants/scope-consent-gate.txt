@@ -1,0 +1,4 @@
+# Mutation scope: the consent gate only (the 13 in-scope mutants the first scope-consent run did not reach before it was stopped; 2 more cargo-mutants lists in admission.rs are test support, outside the scope; observe/ is measured in scope-consent). CIRISPersist#1024.
+tests: test(/i548/)
+src/federation/consent_by_humans.rs capacity_consent_stance resolve_scoped_stance_by_principals resolve_scoped_stance_by_principals_body
+src/federation/admission.rs check_capacity_consent_admission

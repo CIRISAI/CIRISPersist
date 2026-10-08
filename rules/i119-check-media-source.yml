@@ -1,0 +1,15 @@
+# I119 (media_source_invariants.rs::i119_every_door_and_the_vocabulary): every door runs the media gate.
+id: i119-check-media-source
+language: rust
+severity: hint
+message: "check_media_source call site"
+rule:
+  kind: call_expression
+  has:
+    field: function
+    regex: '(^|::|\.)check_media_source$'
+files:
+  - src/store/sqlite.rs
+  - src/store/postgres.rs
+  - src/store/memory.rs
+  - src/federation/admission.rs

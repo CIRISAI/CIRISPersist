@@ -1,0 +1,17 @@
+{%- set metrics = ctx.groups | selectattr("type", "equalto", "metric") | sort(attribute="metric_name") -%}
+{
+  "metrics": [
+{%- for m in metrics %}
+    {
+      "name": "{{ m.metric_name }}",
+      "instrument": "{{ m.instrument }}",
+      "unit": "{{ m.unit }}",
+      "labels": [
+{%- for a in m.attributes | sort(attribute="name") %}
+        {"key": "{{ a.name }}", "values": [{% for v in a.type.members | map(attribute="value") | sort %}"{{ v }}"{% if not loop.last %}, {% endif %}{% endfor %}]}{% if not loop.last %},{% endif %}
+{%- endfor %}
+      ]
+    }{% if not loop.last %},{% endif %}
+{%- endfor %}
+  ]
+}
