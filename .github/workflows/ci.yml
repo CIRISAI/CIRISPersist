@@ -1483,6 +1483,12 @@ jobs:
       # thing it measures without anyone being told.
       - name: generated directory double is current
         run: python3 scripts/gen_directory_double.py --check
+      # v53.2.0 (#1027) — the telemetry registry: `weaver registry check` over
+      # telemetry/registry/ and telemetry/catalog.json is its rendering (I552
+      # then holds that rendering equal to TELEMETRY_CATALOG). The script
+      # downloads its pinned weaver and checks the tarball's sha256.
+      - name: telemetry registry (OTel Weaver check + rendering current)
+        run: scripts/weaver_check.sh
       # v43.0.0 (BLOB_ENCRYPTION_AT_REST.md I22) — the storage floor token is
       # unconstructible outside the crate. The witness is a `compile_fail`
       # doctest, and nextest never runs doctests, so it gets its own step.

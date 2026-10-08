@@ -167,6 +167,44 @@ job cannot run locally. actionlint 1.7.12 reports nothing new. `verify_release.s
 against unattested v53.1.8 and failed all 8 subjects with exit 1, as it should. The passing
 path is untested until the v53.2.0 tag run.
 
+### Added — the telemetry catalogue as an OpenTelemetry Weaver registry, and emission through the `metrics` facade (#1027)
+
+- **Registry.** `telemetry/registry/` is the #1014 catalogue written as an OTel Weaver
+  semantic-convention registry. `manifest.yaml` has `file_format: definition_manifest/2.0` and
+  `schema_url: https://ciris.ai/schemas/persist/telemetry/1.0.0`. `attributes.yaml` holds the
+  closed `backend`/`door`/`fold` enums. `metrics.yaml` holds the seven counters, with
+  instrument, unit and required attributes. The catalogue now has one source: the registry
+  renders through `telemetry/templates/registry/catalog/` to `telemetry/catalog.json`.
+  `scripts/weaver_check.sh` runs `weaver registry check --future`, and fails when the
+  committed rendering is stale. It uses weaver 0.27.0, pinned, downloaded, sha256-checked.
+  **I552** reads that rendering from this crate's own manifest dir and holds it equal to
+  `TELEMETRY_CATALOG` in both directions: names, instruments, units, label keys and label
+  values. It is a CI lint step. **Server (#746 §3.3):** merge `telemetry/registry/` at the
+  persist tag (Weaver v2 definition manifest). Attribute ids are unprefixed (`backend`,
+  `door`, `fold`), so a merge that collides on them should namespace on import.
+- **Emission (the P1 half #1014 deferred).** `observe::emit_metrics()` writes every counter
+  through the `metrics` 0.24 facade, under its catalogued name and labels, as
+  `Counter::absolute(value)`. `Engine::emit_telemetry_metrics()` is the same call. The host
+  calls it at scrape. Without a recorder it is a no-op. The read path does not touch the
+  facade: the atomics stay the one source. **Hosts:** install a recorder that resolves
+  `metrics` 0.24, or nothing arrives. **I553**, the `live-check` equivalent: seed every
+  `(backend, door)` and every fold, then emit into a `metrics_util` `DebuggingRecorder`. The
+  emitted series must equal the snapshot's samples, value for value, and their names, keys
+  and values must equal the catalogue.
+- **Dependencies.** `metrics = 0.24` (no default features; adds `rapidhash`) is a new normal
+  dependency. `metrics-util 0.19` (`debugging`) is a dev-dependency. The lock re-resolved 12
+  Windows-only crates from `windows-sys` 0.60.2 to 0.61.2, already in the graph. The five
+  no-backend axes and `--no-default-features` check clean under `-D warnings`. No wire or ABI
+  change.
+- Mutations, 6 of 6 killed. A door value removed from the YAML → `weaver_check.sh` stale →
+  re-rendered → I552 red. A unit changed in the YAML → stale → I552 red. A fold value removed
+  from `catalog.rs` → I552 and I553 red. `emit_metrics` dropping the fold samples → I553 red.
+  `emit_metrics` emitting `absolute(0)` → I553 red. A dangling `ref` in the YAML →
+  `weaver registry check` red.
+- Deferred: `weaver registry live-check` against a running process (OTLP). I553 asserts the
+  same names, labels and values in-process. Generating `catalog.rs` itself from the registry
+  is also deferred; I552 holds the two equal instead.
+
 ### Found, not changed — no Linux CIRISCache blob has been published since at least v53.1.3 (#1022)
 
 Every core-1 `CIRISCache/save@v1` on the v53.1.3–v53.1.8 tag runs and on main run
