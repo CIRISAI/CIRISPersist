@@ -166,6 +166,10 @@ jobs:
     if: github.event_name == 'workflow_dispatch' || github.event.schedule == '43 6 * * 0'
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    # Known red: `tls` without `postgres` and `pyo3-sqlite` without `pyo3` do not
+    # compile (CIRISPersist#1030, v54.0.0). Report-only until #1030 closes; then
+    # delete this line and the job is blocking.
+    continue-on-error: true
     strategy:
       fail-fast: false
       matrix:
@@ -196,10 +200,10 @@ Notes for whoever wires it:
 - The mutants job is green whenever a matrix is written. It goes red only when
   no matrix could be produced. Read the uploaded `matrix.md` and
   `unvalidated.txt`.
-- The powerset job goes red today. Two sets are known not to compile: `tls`
-  without `postgres`, and `pyo3-sqlite` without `pyo3`. See
-  `docs/FEATURE_MATRIX.md`. Either fix the feature closures first or mark the
-  job `continue-on-error: true` until they are fixed.
+- The powerset job is `continue-on-error: true` because two sets are known not
+  to compile: `tls` without `postgres`, and `pyo3-sqlite` without `pyo3`
+  (CIRISPersist#1030, v54.0.0; see `docs/FEATURE_MATRIX.md`). When #1030
+  closes, remove that line and the job becomes blocking.
 - The `ciriscache` composite may only restore. Check whether a scheduled run
   saves under the main key before relying on it for warm builds.
 - If the lead prefers `ci.yml` regardless, add the two `schedule:` entries to

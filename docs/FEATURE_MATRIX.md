@@ -94,7 +94,11 @@ Two partial `check` runs are on disk. Neither covered all 929 sets.
 | `check` (all) | 34 of 929 | 598 s | not recorded | 1 red; the log ends after set 34 finished, cause not recorded |
 | `check 41/80` | 12 | 274 s | 3.0 GiB | 1 red |
 
-Both reds are real configurations that do not compile:
+### Known red (#1030)
+
+Both reds are real configurations that do not compile. They are filed as
+CIRISPersist#1030 (v54.0.0), and until it closes they are the powerset's
+known-red sets:
 
 - **`tls` without `postgres`** (the set `test-panic,tls`; `test-panic` is an
   empty feature). `tokio-postgres-rustls` fails with
@@ -108,7 +112,7 @@ Both reds are real configurations that do not compile:
   the shared gate but not `pyo3`. The hand leg `pyo3sqlite` always adds
   `sqlite` and nine more, so it never saw this.
 
-Neither is fixed in this cut. Each wants a one-line feature-closure decision
+Neither is fixed in this cut; #1030 tracks both. Each wants a one-line feature-closure decision
 (make `tls` imply `postgres`; make `pyo3-sqlite` imply `pyo3` and `sqlite`, or
 gate the module on both), and that is a public feature contract change.
 

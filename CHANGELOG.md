@@ -29,7 +29,7 @@ Until now every mutation round was hand-picked per PR and lived only here ("the 
 
 - **Enumeration.** 47 declared features, 4 excluded (`scrub-ner`, `scrub-ort`, `default-pipeline-ml`, `_pyffi`, all still compiled by the `--all-features` clippy pass). That leaves 43 features and **929 sets**: the empty set, 43 singles, and 885 pairs. Another 18 pairs are skipped as implied.
 - **Delta.** certify.sh builds 27 hand sets. 18 are built exactly by the powerset, 9 only pairwise (`core`, the five axis legs, `lint`, `pyo3sqlite`, `rest`: 4 to 34 features, beyond depth 2), and 0 are uncovered. 911 derived sets are built by nothing today, including 37 single features never compiled alone.
-- **Two configurations that do not compile**, found by the two partial `check` runs on disk (34 of 929 sets in 598 s; partition 41/80, 12 sets in 274 s at 3.0 GiB). Not fixed here, because each is a feature-contract decision:
+- **Two configurations that do not compile**, found by the two partial `check` runs on disk (34 of 929 sets in 598 s; partition 41/80, 12 sets in 274 s at 3.0 GiB). Filed as #1030 (v54.0.0); not fixed here, because each is a feature-contract decision:
   - `tls` without `postgres` (`Cargo.toml:525`). `tokio-postgres-rustls` fails on `tokio_postgres::tls::MakeTlsConnect`.
   - `pyo3-sqlite` without `pyo3` (`Cargo.toml:43` enables only `_pyffi`). It fails with 184 × E0004 from `src/ffi/pyo3.rs:120`.
 - **No hand leg dropped.** The test legs stay hand-derived.
