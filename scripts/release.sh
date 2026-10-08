@@ -2,7 +2,7 @@
 # release.sh — one command from a finished CHANGELOG section to a pushed tag,
 # with no agent in the loop between stages.
 #
-#   scripts/release.sh <version> [--pr-body FILE] [--merge-body FILE]
+#   scripts/release.sh <version> [--pr-body FILE] [--merge-body FILE] [--subject TEXT]
 #   scripts/release.sh --dry-run <version>
 #
 # Run from the release worktree, on the release branch, with the section
@@ -36,11 +36,13 @@ set -uo pipefail
 
 usage() { sed -n '5,6p' "$0" | sed 's/^# *//'; exit 2; }
 dry=0; ver=""; pr_body=""; merge_body=""
+subject_override=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --dry-run) dry=1;;
         --pr-body) pr_body="${2:?--pr-body FILE}"; shift;;
         --merge-body) merge_body="${2:?--merge-body FILE}"; shift;;
+        --subject) subject_override="${2:?--subject TEXT}"; shift;;
         -h|--help) usage;;
         -*) echo "unknown flag $1"; usage;;
         *) [ -z "$ver" ] || usage; ver="$1";;
@@ -102,7 +104,7 @@ if [ "$dry" -eq 1 ]; then
         if rl_done "$S" "$st"; then echo "  $st: done ($(head -1 "$S/$st.done"))"; else echo "  $st: pending"; fi
     done
     echo "cheap legs (RUSTFLAGS from ci.yml):"; cheap_legs | sed 's/^/    /'
-    echo "commit/merge subject: v$ver — $(rl_section_headings CHANGELOG.md "$ver")"
+    echo "commit/merge subject: ${subject_override:-$(rl_subject CHANGELOG.md "$ver")}"
     echo "certify: LANES=${LANES:-1} scripts/certify.sh full"
     exit "$rc"
 fi
@@ -153,7 +155,9 @@ bump() {
     cargo test --features sqlite --lib evidence_cc_impl < /dev/null > "$S/bump-evidence.log" 2>&1 \
         || { echo "BUMP: the evidence pin test is red — $S/bump-evidence.log"; return 22; }
     {
-        echo "release(v$ver): version, evidence re-stamp — $(rl_section_headings CHANGELOG.md "$ver")"
+        echo "release(v$ver): version, evidence re-stamp — ${subject_override:-$(rl_subject CHANGELOG.md "$ver" 140)}" | sed 's/ — v[0-9.]* — / — /'
+        echo
+        echo "$(rl_section_headings CHANGELOG.md "$ver")"
         echo
         echo "Co-Authored-By: $CO_AUTHOR"
         echo "Claude-Session: $SESSION_URL"
@@ -170,7 +174,7 @@ fi
 
 # ── 4. push + PR ────────────────────────────────────────────────────────
 repo="$(gh repo view --json nameWithOwner --jq .nameWithOwner)" || { echo "cannot resolve the GitHub repo"; exit 23; }
-subject="v$ver — $(rl_section_headings CHANGELOG.md "$ver")"
+subject="${subject_override:-$(rl_subject CHANGELOG.md "$ver")}"
 pr_stage() {
     local pr remote
     remote="$(git ls-remote origin "refs/heads/$branch" | cut -f1)"

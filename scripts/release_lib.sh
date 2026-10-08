@@ -34,6 +34,25 @@ rl_section_headings() {
         | sed -E 's/^### +//; s/^[A-Za-z]+ — //' | paste -sd ';' - | sed 's/;/; /g'
 }
 
+# rl_subject <changelog> <version> [max] — "v<ver> — <headings>" capped for a
+# commit/PR subject. Headings are joined until the cap (default 180 chars)
+# would be crossed; the rest become "; +N more". The full list lives in the
+# PR and merge bodies (the CHANGELOG section), never only in the subject.
+# v53.2.0: 16 headings made a 1,200-char subject on the first dry-run.
+rl_subject() {
+    local cl="$1" ver="$2" max="${3:-180}" out="v$2 — " n=0 kept=0 h
+    local -a hs=()
+    while IFS= read -r h; do hs+=("$h"); done < <(rl_changelog_section "$cl" "$ver" | grep -E '^### ' | sed -E 's/^### +//; s/^[A-Za-z]+ — //')
+    n=${#hs[@]}
+    for h in "${hs[@]}"; do
+        if [ "$kept" -gt 0 ] && [ $(( ${#out} + ${#h} + 2 )) -gt "$max" ]; then break; fi
+        [ "$kept" -gt 0 ] && out="$out; "
+        out="$out$h"; kept=$((kept+1))
+    done
+    [ "$kept" -lt "$n" ] && out="$out; +$((n-kept)) more"
+    printf '%s\n' "$out"
+}
+
 # rl_restamp_evidence <tsv> <prev> <version> — rewrite every
 # `ciris-persist@<prev>` pointer to `@<version>` (a version bump re-stamps the
 # evidence pin; supersets.rs::evidence_cc_impl_rows_pin_the_current_crate_version

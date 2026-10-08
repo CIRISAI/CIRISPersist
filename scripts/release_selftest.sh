@@ -66,6 +66,12 @@ if rl_changelog_section "$t/CHANGELOG.md" 9.8.0 >/dev/null; then bad "the oldest
 expect_eq "headings joined" "$(rl_section_headings "$t/CHANGELOG.md" 9.9.0)" \
     "the door refused what its precheck granted (#11); counters always on (#12)"
 
+# rl_subject: short lists pass through; long lists are capped with "+N more".
+expect_eq "subject short" "$(rl_subject "$t/CHANGELOG.md" 9.9.0 180)" "v9.9.0 — $(rl_section_headings "$t/CHANGELOG.md" 9.9.0)"
+_sub="$(rl_subject "$t/CHANGELOG.md" 9.9.0 20)"
+case "$_sub" in "v9.9.0 — "*"; +"*" more") ok "subject capped: $_sub";; *) bad "subject not capped: $_sub";; esac
+[ "${#_sub}" -le 60 ] && ok "subject cap length" || bad "subject cap length ${#_sub}"
+
 echo "evidence re-stamp"
 printf 'a\tciris-persist@9.8.10\nb\tciris-persist@9.8.10:src/x.rs\nc\tciris-persist@9.8.100\nd\tciris-persist@31.0.0\n' > "$t/cc.tsv"
 n="$(rl_restamp_evidence "$t/cc.tsv" 9.8.10 9.9.0)"; rc=$?
