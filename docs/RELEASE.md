@@ -30,7 +30,7 @@ scripts/release_finish.sh <version> <tag-run-id>                    # tag CI →
 | 7 | ship | `release_ship.sh <pr> <version> <head7> "<subject>" <merge-body>`: merge, tag at the merge commit, push the tag once main's run is visible, and print `TAG_RUN_ID`. | `ship.done` + `tag_run` |
 | 8 | stop | Prints `scripts/release_finish.sh <version> <tag-run-id>`. | — |
 
-Then run `release_finish.sh`. It checks that the run id is this tag's CI push run, waits for it (`FINISH_TIMEOUT_MIN`, default 180) and re-runs it if the same-SHA dedup cancelled it. It then waits for the release to exist, sets the body from the tag's annotation, asserts the body is at least the tag body's bytes minus 64, and prints `RELEASE_SHIP_DONE`.
+Then run `release_finish.sh`. It checks that the run id is this tag's CI push run, waits for it (`FINISH_TIMEOUT_MIN`, default 180) and re-runs it if the same-SHA dedup cancelled it. It then waits for the release to exist, sets the body from the tag's annotation, asserts the body is at least the tag body's bytes minus 64, runs `scripts/verify_release.sh` (below), and prints `RELEASE_SHIP_DONE`.
 
 ### Why the tag is pushed once main's run EXISTS (#1008)
 
@@ -84,3 +84,32 @@ PR CI after a failure: `auto-retry.yml` re-runs a first-attempt failure that has
 | 11 | release_finish.sh | tag CI red, other than a cancellation | read the run. Fix forward with a patch release |
 | 12 | release_finish.sh | tag CI did not finish within `FINISH_TIMEOUT_MIN` | re-run the same command |
 | 13, 14, 15 | release_finish.sh | the release never appeared, the edit failed, or the body is too short | re-run. If it repeats, `gh release edit v<version> --notes-file` with the tag annotation by hand |
+| 17 | release_finish.sh | `verify_release.sh` failed: an attestation did not verify, a download failed, or `gh` has no `attestation` command | read its per-subject lines. `gh` older than 2.49: `GH=/path/to/newer/gh` and re-run. A FAIL on a subject means the tag run's `attest` job did not sign those bytes: read that job before anything else |
+
+## Verifying a release
+
+Tag CI's `attest` job (CIRISPersist#1028) signs two kinds of GitHub artifact attestation: an in-toto Statement in a DSSE envelope, signed through Sigstore's public-good instance (the repo is public) and stored against the subject's sha256.
+
+| predicate type | subjects | predicate |
+|---|---|---|
+| `https://slsa.dev/provenance/v1` (SLSA Build L2) | the four abi3 desktop wheels `ciris_persist-<v>-cp310-abi3-*.whl` (tag-run artifacts, not release assets) and the three release tarballs `ciris-persist-v<v>-{ios,android,android-wheels}.tar.gz`, as downloaded from the release | GitHub's build provenance: repo, workflow, ref, commit, run |
+| `https://ciris.ai/attestation/cc-conformance/v1` | `evidence/cc_impl.tsv` at the tag | `{"cc_tag", "registry_sha256", "crate_version", "merge_sha"}`: the vendored CC tag (`"v" + VENDORED_CC_VERSION`), `VENDORED_REGISTRY_SHA256` (CC's grammar hash), the Cargo version, and the tagged commit |
+
+There is no sdist: consumers build from the git tag and nothing builds one.
+
+```
+scripts/verify_release.sh v<version>        # GH=/path/to/gh if the default gh is older than 2.49
+```
+
+It downloads each subject, runs `gh attestation verify` bound to `CIRISAI/CIRISPersist`, to `.github/workflows/ci.yml` as the signer workflow and to `refs/tags/v<version>` as the source ref (an attestation from a branch or PR run does not count), prints the conformance predicate, and checks its `crate_version` and `merge_sha` against the tag. Exit 0 means every subject verified; 1 lists each failure; 2 is usage or a `gh` without `attestation`; 3 is a failed download (nothing judged). Wheel artifacts expire after 90 days; for an older release `VERIFY_SKIP_WHEELS=1` skips them and says so.
+
+An adopter verifies one file without the script:
+
+```
+gh attestation verify evidence/cc_impl.tsv -R CIRISAI/CIRISPersist \
+  --predicate-type https://ciris.ai/attestation/cc-conformance/v1 \
+  --source-ref refs/tags/v<version> --format json \
+  --jq '.[0].verificationResult.statement.predicate'
+```
+
+Releases before v53.2.0 carry no attestations. Through v53.1.8 the wheel artifacts also held stale wheels restored from the build cache, and build-manifest registered a v29.0.0 wheel's hash for linux-aarch64 and windows-x86_64. v53.2.0 clears `target/wheels/` before the build and selects only `ciris_persist-<v>-*.whl`.

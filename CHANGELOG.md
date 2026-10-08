@@ -136,6 +136,37 @@ in the file builds; a rename out of `src/ffi/` builds; an API failure builds; 30
 `skip_ios` was simulated against the PR run's iOS job conclusions: success+success skips;
 skipped, failure and none build.
 
+### Added — the release and `evidence/cc_impl.tsv` are attested; `scripts/verify_release.sh` (#1028)
+
+A new tag-gated `attest` job, the only job granted `id-token: write` and `attestations: write`,
+signs two kinds of GitHub artifact attestation through Sigstore's public-good instance. The first
+is SLSA build provenance over the four abi3 desktop wheels and the three release tarballs, as
+downloaded from the release. The second is `https://ciris.ai/attestation/cc-conformance/v1` over
+`evidence/cc_impl.tsv`, with predicate `{cc_tag, registry_sha256, crate_version, merge_sha}`
+read from `registry.rs`. The job refuses a tag that does not name Cargo's version, and refuses
+an evidence file not re-stamped to it. `scripts/verify_release.sh v<ver>` reads every
+attestation back with `gh attestation verify`, bound to this repo, ci.yml and the tag ref, and
+checks the predicate's version and commit. `release_finish.sh` runs it before
+`RELEASE_SHIP_DONE`; exit 17 is new. It needs gh 2.49+ (`GH=`). The release machine's
+`/usr/bin/gh` is 2.45. docs/RELEASE.md has a "Verifying a release" section.
+
+**Edge, Server:** to verify before pinning, use predicate type
+`https://ciris.ai/attestation/cc-conformance/v1` with
+`--source-ref refs/tags/v<ver>`. **Constitution:** claims.tsv can cite the attestation digest.
+
+**Fixed along the way.** The CIRISCache restore left earlier releases' wheels in
+`target/wheels/`. v53.1.8's tag artifacts held wheels for 29.0.0 through 30.2.0 next to
+53.1.8. `build-manifest`'s `ls *.whl | head -1` therefore signed and registered the **29.0.0**
+wheel's hash for `aarch64-unknown-linux-gnu` (`51193a5a…`) and `x86_64-pc-windows-msvc`
+(`8a1e5a8f…`). The build now clears `target/wheels/`, and `build-manifest` signs exactly one
+`ciris_persist-<v>-*.whl` or fails. The rows already registered for earlier releases on those
+two targets are not corrected here.
+
+Deferred: no sdist is attested, because none is built. Consumers build from the tag. The tag
+job cannot run locally. actionlint 1.7.12 reports nothing new. `verify_release.sh` was run
+against unattested v53.1.8 and failed all 8 subjects with exit 1, as it should. The passing
+path is untested until the v53.2.0 tag run.
+
 ### Found, not changed — no Linux CIRISCache blob has been published since at least v53.1.3 (#1022)
 
 Every core-1 `CIRISCache/save@v1` on the v53.1.3–v53.1.8 tag runs and on main run

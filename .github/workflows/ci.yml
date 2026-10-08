@@ -1809,8 +1809,17 @@ jobs:
       # auto-discovers import libs with precompiled std). On Windows
       # `--auditwheel skip` is a no-op (auditwheel is Linux-only); the
       # vcpkg-OpenSSL env for the postgres backend is already exported above.
+      #
+      # v53.2.0 (#1028) — clear target/wheels/ first. The CIRISCache restore
+      # carries the wheels earlier releases built (29.0.0..30.2.0 were found in
+      # v53.1.8's tag artifacts), every later step globs `target/wheels/*.whl`,
+      # and build-manifest's `ls | head -1` picked 29.0.0 — v53.1.8 registered
+      # a 29.0.0 wheel's hash for linux-aarch64 and windows-x86_64.
       - name: maturin build
-        run: maturin build --release --strip --auditwheel skip
+        shell: bash
+        run: |
+          rm -rf target/wheels
+          maturin build --release --strip --auditwheel skip
       # v3.6.2 (CIRISPersist#136) — explicit auditwheel-repair with
       # libsqlite3 excluded from the bundling pass. This is the same
       # pattern `pyarrow` uses (excludes libssl/libcrypto/libz) and
@@ -2267,11 +2276,20 @@ jobs:
           SIGNED_BINARY_TARGETS=()
           for ARTDIR in "${!WHEEL_TARGET[@]}"; do
             TARGET="${WHEEL_TARGET[$ARTDIR]}"
-            WHEEL="$(ls dist/wheels/${ARTDIR}/*.whl 2>/dev/null | head -1)"
-            if [ -z "${WHEEL}" ]; then
-              echo "::warning::No wheel found for ${TARGET} (artifact ${ARTDIR}); skipping"
+            # v53.2.0 (#1028) — THIS version's wheel, exactly one. `*.whl | head
+            # -1` signed a stale 29.0.0 wheel for v53.1.8 (see maturin build).
+            shopt -s nullglob
+            CANDIDATES=(dist/wheels/${ARTDIR}/ciris_persist-${VERSION}-*.whl)
+            shopt -u nullglob
+            if [ "${#CANDIDATES[@]}" -eq 0 ]; then
+              echo "::warning::No ${VERSION} wheel found for ${TARGET} (artifact ${ARTDIR}); skipping"
               continue
             fi
+            if [ "${#CANDIDATES[@]}" -ne 1 ]; then
+              echo "::error::${#CANDIDATES[@]} ${VERSION} wheels in ${ARTDIR}: ${CANDIDATES[*]}"
+              exit 1
+            fi
+            WHEEL="${CANDIDATES[0]}"
             ciris-build-sign sign \
               --primitive persist \
               --build-id "$VERSION" \
@@ -2647,4 +2665,132 @@ jobs:
             echo "- \`ciris-persist-v${VERSION}-android.tar.gz\`"
             echo "- \`ciris-persist-v${VERSION}-android-wheels.tar.gz\` (Chaquopy abi3 wheels: arm64, x86_64, armeabi-v7a)"
             echo "- \`SHA256SUMS\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # v53.2.0 (CIRISPersist#1028) — attest the release and the conformance
+  # evidence, so an adopter can verify them without trusting this repo's
+  # history. Two GitHub artifact attestations (an in-toto Statement in a DSSE
+  # envelope, signed through Sigstore's public-good instance, since the repo is
+  # public; stored by subject digest, read back with `gh attestation verify`):
+  #
+  #   * SLSA build provenance (`https://slsa.dev/provenance/v1`) over the four
+  #     abi3 desktop wheels (this run's `ciris_persist-wheel-*` artifacts) and
+  #     the three release tarballs, as DOWNLOADED FROM THE RELEASE, so the
+  #     subject digests are the bytes a consumer fetches. There is no sdist:
+  #     consumers build from the git tag, and nothing builds one.
+  #   * `https://ciris.ai/attestation/cc-conformance/v1` over
+  #     `evidence/cc_impl.tsv` at the tag, predicate
+  #     `{cc_tag, registry_sha256, crate_version, merge_sha}`.
+  #
+  # Its own job so the two elevated permissions (`id-token`, `attestations`)
+  # are granted here and nowhere else. `scripts/verify_release.sh v<ver>`
+  # checks all eight, and `release_finish.sh` refuses RELEASE_SHIP_DONE until
+  # it passes. Release procedure: docs/RELEASE.md "Verifying a release".
+  attest:
+    name: Attest wheels, release assets and cc_impl.tsv (tag-gated)
+    runs-on: ubuntu-latest
+    needs:
+      - pyo3-wheel
+      - mobile-release
+    # Explicit result checks, for the same skipped-ancestor reason as
+    # mobile-release (`tree` is skipped on every tag run).
+    if: >-
+      ${{ startsWith(github.ref, 'refs/tags/v') && !cancelled()
+          && needs.pyo3-wheel.result == 'success' && needs.mobile-release.result == 'success' }}
+    permissions:
+      contents: read
+      actions: read        # gh run download of this run's wheel artifacts
+      id-token: write      # the Sigstore signing certificate (OIDC)
+      attestations: write  # store the attestations against this repo
+    steps:
+      - uses: actions/checkout@v6
+      - name: conformance predicate (cc_tag, registry_sha256, crate_version, merge_sha)
+        id: predicate
+        run: |
+          set -euo pipefail
+          VERSION=$(grep '^version = ' Cargo.toml | head -1 | cut -d'"' -f2)
+          if [ "${GITHUB_REF_NAME}" != "v${VERSION}" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not name Cargo.toml's version ${VERSION}"
+            exit 1
+          fi
+          # The evidence must already be re-stamped to this version (release.sh
+          # stage 3); attesting a file that still names the previous release
+          # would sign a stale claim.
+          if ! grep -q "ciris-persist@${VERSION}" evidence/cc_impl.tsv; then
+            echo "::error::evidence/cc_impl.tsv carries no ciris-persist@${VERSION} pointer — not re-stamped"
+            exit 1
+          fi
+          mkdir -p dist
+          python3 - "$VERSION" "$GITHUB_SHA" > dist/cc-conformance.json <<'PY'
+          import json, re, sys
+          src = open("src/federation/namespace/registry.rs").read()
+          def const(name):
+              m = re.search(r'pub const %s: &str =\s*"([^"]*)";' % name, src)
+              if not m:
+                  sys.exit("registry.rs: %s not found" % name)
+              return m.group(1)
+          sha = const("VENDORED_REGISTRY_SHA256")
+          if not re.fullmatch(r"[0-9a-f]{64}", sha):
+              sys.exit("VENDORED_REGISTRY_SHA256 is not 64 hex: %r" % sha)
+          print(json.dumps({
+              "cc_tag": "v" + const("VENDORED_CC_VERSION"),
+              "registry_sha256": sha,
+              "crate_version": sys.argv[1],
+              "merge_sha": sys.argv[2],
+          }, sort_keys=True))
+          PY
+          cat dist/cc-conformance.json
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+      - name: download the desktop wheels (this run) and the release tarballs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.predicate.outputs.version }}
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3 4 5; do
+            rm -rf dist/wheels
+            if gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" \
+                --pattern 'ciris_persist-wheel-*' --dir dist/wheels; then break; fi
+            [ "$attempt" = 5 ] && { echo "::error::wheel artifact download failed 5 times"; exit 1; }
+            sleep $((attempt * 10))
+          done
+          # Only THIS version's wheels: the artifacts carried stale ones from
+          # the cache through v53.1.8 (see pyo3-wheel's maturin build step).
+          n=$(find dist/wheels -name "ciris_persist-${VERSION}-*.whl" | wc -l)
+          [ "$n" -eq 4 ] || { echo "::error::expected 4 ${VERSION} desktop wheels, found $n"; find dist/wheels; exit 1; }
+          for attempt in 1 2 3 4 5; do
+            rm -rf dist/release
+            if gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+                --pattern "ciris-persist-v${VERSION}-*.tar.gz" --dir dist/release; then break; fi
+            [ "$attempt" = 5 ] && { echo "::error::release asset download failed 5 times"; exit 1; }
+            sleep $((attempt * 10))
+          done
+          n=$(find dist/release -name '*.tar.gz' | wc -l)
+          [ "$n" -eq 3 ] || { echo "::error::expected 3 release tarballs, found $n"; ls -la dist/release; exit 1; }
+          sha256sum dist/wheels/*/ciris_persist-"${VERSION}"-*.whl dist/release/*.tar.gz
+      - name: attest build provenance (wheels + release tarballs)
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: |
+            dist/wheels/*/ciris_persist-${{ steps.predicate.outputs.version }}-*.whl
+            dist/release/*.tar.gz
+      - name: attest CC conformance evidence (evidence/cc_impl.tsv)
+        uses: actions/attest@v4
+        with:
+          subject-path: evidence/cc_impl.tsv
+          predicate-type: https://ciris.ai/attestation/cc-conformance/v1
+          predicate-path: dist/cc-conformance.json
+      - name: summary
+        run: |
+          {
+            echo "## Attestations"
+            echo ""
+            echo "- SLSA provenance: 4 wheels + 3 release tarballs"
+            echo "- \`https://ciris.ai/attestation/cc-conformance/v1\` over \`evidence/cc_impl.tsv\` ($(sha256sum evidence/cc_impl.tsv | cut -d' ' -f1))"
+            echo ""
+            echo '```json'
+            cat dist/cc-conformance.json
+            echo '```'
+            echo ""
+            echo "Verify: \`scripts/verify_release.sh ${GITHUB_REF_NAME}\`"
           } >> "$GITHUB_STEP_SUMMARY"

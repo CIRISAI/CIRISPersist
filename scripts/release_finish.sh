@@ -12,14 +12,18 @@
 #    tag/main ordering release_ship.sh sets up (v50 lesson, CIRISPersist#1008);
 # 3. waits for the release to EXIST (tag CI creates it a moment after its last
 #    job; an edit before that fails silently);
-# 4. sets the release body from the tag's annotation and asserts its BYTES.
+# 4. sets the release body from the tag's annotation and asserts its BYTES;
+# 5. runs scripts/verify_release.sh: every attestation tag CI's `attest` job
+#    signed (wheels, release tarballs, evidence/cc_impl.tsv) verifies with
+#    `gh attestation verify` (CIRISPersist#1028). Needs gh 2.49+ (GH=...).
 #
 # Idempotent: re-run the same command after a kill or a timeout; it picks the
 # run up wherever it is. FINISH_TIMEOUT_MIN (default 180) bounds the tag-CI wait.
 #
 # Exit codes: 2 bad arguments / run is not this tag's CI run · 11 tag CI not
 # green · 12 tag CI timeout · 13 release never appeared · 14 release edit
-# failed · 15 release body too short.
+# failed · 15 release body too short · 17 an attestation did not verify (or
+# could not be checked: gh too old, a download failed).
 set -uo pipefail
 ver="${1:?version}"; rid="${2:?tag CI run id}"
 cd "$(git rev-parse --show-toplevel)" || exit 2
@@ -60,4 +64,5 @@ gh release edit "v$ver" --notes-file "$tmp/tagbody.md" >/dev/null || { echo "rel
 body_bytes=$(gh release view "v$ver" --json body --jq '.body' | wc -c)
 echo "release body bytes=$body_bytes (tag body $in_bytes)"
 [ "$body_bytes" -ge $(( in_bytes - 64 )) ] || { echo "release body too short — not the CHANGELOG section"; exit 15; }
+scripts/verify_release.sh "$ver" || { echo "attestations of v$ver not verified (verify_release.sh exit $?)"; exit 17; }
 echo "=== RELEASE_SHIP_DONE v$ver at $(git rev-list -n1 "v$ver") ==="
