@@ -337,6 +337,73 @@ rm -f "$WORK/reg/v1/verify/build-manifest/ciris-persist/$V/x86_64-pc-windows-msv
 expect "fetch-reuse: a missing body is red" 1 'GET build-manifest 53.1.8/x86_64-pc-windows-msvc returned HTTP 404' -- env REGISTRY_URL="$BITS_CHANGED_REGISTRY_BASE" "$BM" fetch-reuse --version "$V" --out "$WORK/fr2"
 reg_clear
 
+# ── reregister-manifests.yml: the snapshot guard before a repost ───────────
+# The workflow step itself, extracted from the YAML and run against the stub
+# registry, in a fixture root whose evidence/ holds the committed snapshots.
+# The guard compared binary_hash only, so a live row re-signed (or re-keyed,
+# or with new extras) under the SAME wheel hash passed it, and the repost
+# erased a row the evidence never recorded (Codex on PR #1039).
+echo
+echo "reregister-manifests.yml snapshot guard"
+GV=53.1.8; GT=x86_64-pc-windows-msvc
+GR="$WORK/guard"; mkdir -p "$GR/evidence/manifest_remediation/$GV"
+ln -s "$PWD/scripts" "$GR/scripts"
+python3 -I - "$PWD/.github/workflows/reregister-manifests.yml" "$GR/guard.sh" <<'PYEOF' || { echo "  FAIL  could not extract the guard step"; fails=$((fails + 1)); }
+import sys, yaml
+wf = yaml.safe_load(open(sys.argv[1]))
+steps = [s for s in wf["jobs"]["manifests"]["steps"] if s.get("name", "").startswith("repost — snapshot before overwrite")]
+assert len(steps) == 1, f"{len(steps)} guard steps"
+run = steps[0]["run"]
+assert "${{" not in run, "the guard step interpolates an expression; it must read env only"
+open(sys.argv[2], "w").write("set -eo pipefail\n" + run)
+PYEOF
+ALL5="python-source-tree x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu aarch64-apple-darwin x86_64-pc-windows-msvc"
+guard_fixture() {  # the committed snapshot of $GT, and the registry serving it for all five targets
+  reg_clear
+  local snap="$GR/evidence/manifest_remediation/$GV" t
+  for t in $ALL5; do
+    mkdir -p "$WORK/reg/v1/verify/function-manifest/$GV" "$WORK/reg/v1/verify/build-manifest/ciris-persist/$GV" "$WORK/reg/v1/builds"
+    printf '{"version":"1.0","target":"%s","binary_hash":"sha256:%s","signature":{"classical":"SIG-A","key_id":"ciris-persist-build-v1"}}' "$t" "$TH" \
+      >"$WORK/reg/v1/verify/function-manifest/$GV/$t"
+    printf '{"build_id":"%s","target":"%s","binary_hash":"sha256:%s","extras":{"dep_tree_sha256":"DEP-OLD"}}' "$GV" "$t" "$TH" \
+      >"$WORK/reg/v1/verify/build-manifest/ciris-persist/$GV/$t"
+  done
+  printf '{"version":"%s","source_commit":"abc","status":"active"}' "$GV" >"$WORK/reg/v1/builds/$GV"
+  # the snapshot is the registry's bytes, pretty-printed: canonical, not byte, equality
+  python3 -I -c 'import json,sys; json.dump(json.load(open(sys.argv[1])), open(sys.argv[2],"w"), indent=2)' "$WORK/reg/v1/verify/function-manifest/$GV/$GT" "$snap/$GT.function.json"
+  python3 -I -c 'import json,sys; json.dump(json.load(open(sys.argv[1])), open(sys.argv[2],"w"), indent=2)' "$WORK/reg/v1/verify/build-manifest/ciris-persist/$GV/$GT" "$snap/$GT.build.json"
+  cp "$WORK/reg/v1/builds/$GV" "$snap/$GT.builds.json"
+  rm -rf "$GR/dist"
+}
+# shellcheck disable=SC2317  # invoked through `expect`
+guard() { (cd "$GR" && env V="$GV" RESIGN="$GT" REGISTRY_URL="$BITS_CHANGED_REGISTRY_BASE" SNAPSHOT_RETRIES=0 bash guard.sh); }
+guard_fixture
+expect "guard: live == snapshot passes"     0 "$GT" -- guard
+guard_fixture
+sed -i 's/SIG-A/SIG-B/' "$WORK/reg/v1/verify/function-manifest/$GV/$GT"
+expect "guard: re-signed, same hash refused" 1 'signature' -- guard
+guard_fixture
+sed -i 's/DEP-OLD/DEP-NEW/' "$WORK/reg/v1/verify/build-manifest/ciris-persist/$GV/$GT"
+expect "guard: new extras, same hash refused" 1 'extras' -- guard
+guard_fixture
+sed -i 's/"active"/"revoked"/' "$WORK/reg/v1/builds/$GV"
+expect "guard: builds row changed refused"  1 'status' -- guard
+guard_fixture
+rm "$GR/evidence/manifest_remediation/$GV/$GT.function.json"
+expect "guard: no committed snapshot refused" 1 "$GT" -- guard
+guard_fixture
+SM="$PWD/scripts/snapshot_manifests.sh"
+export SNAPSHOT_REGISTRY_BASE="$BITS_CHANGED_REGISTRY_BASE" SNAPSHOT_ROOT="$GR/evidence/manifest_remediation" SNAPSHOT_RETRIES=0
+expect "verify: equal is exit 0"           0 '^same .*builds' -- "$SM" verify "$GV" "$GT"
+sed -i 's/"key_id":"ciris-persist-build-v1"/"key_id":"other"/' "$WORK/reg/v1/verify/function-manifest/$GV/$GT"
+expect "verify: re-keyed is exit 6"        6 'signature.key_id: snapshot "ciris-persist-build-v1" live "other"' -- "$SM" verify "$GV" "$GT"
+expect "verify: no snapshot is exit 7"     7 '^MISSING' -- "$SM" verify "$GV" aarch64-apple-darwin
+rm "$WORK/reg/v1/builds/$GV"
+guard_fixture; rm "$WORK/reg/v1/builds/$GV"
+expect "verify: a 404 read is exit 5"      5 'HTTP 404' -- "$SM" verify "$GV" "$GT"
+unset SNAPSHOT_REGISTRY_BASE SNAPSHOT_ROOT SNAPSHOT_RETRIES
+reg_clear
+
 echo
 if [ "$fails" -eq 0 ]; then echo "bits_changed_test: $n/$n as expected"; exit 0; fi
 echo "bits_changed_test: $fails of $n FAILED"; exit 1

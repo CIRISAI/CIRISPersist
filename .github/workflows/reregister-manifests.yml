@@ -12,8 +12,9 @@
 #     python/ciris_persist exactly as the tag job's sign computes it.
 # mode: repost re-posts ONLY the MISMATCH rows of each version, and refuses a
 # MISMATCH row with no committed snapshot (evidence/manifest_remediation/<v>/
-# <t>.function.json, scripts/snapshot_manifests.sh) or whose live row no
-# longer matches its snapshot. It runs scripts/build_manifest.sh, the same
+# <t>.{function,build,builds}.json, scripts/snapshot_manifests.sh) or whose
+# live reads are not, as whole canonical JSON, its snapshot
+# (`snapshot_manifests.sh verify`). It runs scripts/build_manifest.sh, the same
 # sign / preflight / register / roundtrip / read-back the tag job runs: the
 # MISMATCH targets are re-signed after scripts/bits_changed.sh checks 1-4; every
 # other target is re-posted unchanged after its manifest is checked against its
@@ -274,17 +275,18 @@ jobs:
         run: |
           REG="${REGISTRY_URL:-https://api.registry.ciris-services-1.ai}"
           for t in $RESIGN; do
-            snap="evidence/manifest_remediation/$V/$t.function.json"
-            [ -s "$snap" ] || { echo "::error::$snap is not committed at ${GITHUB_SHA}: run scripts/snapshot_manifests.sh $V $t and commit it first"; exit 1; }
-            want=$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["binary_hash"])' "$snap")
-            code=$(curl -sS -o live.json -w '%{http_code}' --retry 4 --retry-delay 60 \
-              "$REG/v1/verify/function-manifest/$V/$t?project=ciris-persist")
-            [ "$code" = 200 ] || { echo "::error::live row $V/$t: HTTP $code"; exit 1; }
-            have=$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["binary_hash"])' live.json)
-            [ "$have" = "$want" ] || { echo "::error::live row $V/$t carries $have, the snapshot $want: the snapshot is not the row being overwritten"; exit 1; }
-            echo "✓ $V/$t: snapshot committed and live ($want)"
+            for kind in function build builds; do
+              snap="evidence/manifest_remediation/$V/$t.$kind.json"
+              [ -s "$snap" ] || { echo "::error::$snap is not committed at ${GITHUB_SHA:-HEAD}: run scripts/snapshot_manifests.sh $V $t and commit it first"; exit 1; }
+            done
           done
-          rm -f live.json
+          # The WHOLE live body of each of the three reads, as canonical JSON,
+          # must equal its committed snapshot: a row re-signed, re-keyed, or
+          # with new extras under the same binary_hash is a row the evidence
+          # never recorded, and a repost would erase it (Codex on PR #1039).
+          # shellcheck disable=SC2086  # RESIGN is a space-separated target list
+          SNAPSHOT_REGISTRY_BASE="$REG" scripts/snapshot_manifests.sh verify "$V" $RESIGN \
+            || { echo "::error::v$V: a live row is not its committed snapshot (above); refusing to overwrite it"; exit 1; }
           # register rewrites every target's `builds` row, not only the
           # re-signed ones: keep this run's own copy of all five before posting.
           SNAPSHOT_REGISTRY_BASE="$REG" SNAPSHOT_ROOT=dist/pre-post scripts/snapshot_manifests.sh "$V" \
