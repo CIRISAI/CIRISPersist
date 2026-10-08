@@ -11,19 +11,28 @@
 # an early-exiting reader SIGPIPEs its writer and fails the pipeline.
 rl_prev_version() {
     grep -oE '^## \[[0-9]+\.[0-9]+\.[0-9]+\]' "$1" | sed 's/^## \[//; s/\]//' \
-        | awk -v v="$2" '$0==v {f=1; next} f && !p {print; p=1}'
+        | RL_V="$2" awk '$0==ENVIRON["RL_V"] {f=1; next} f && !p {print; p=1}'
 }
 
 # rl_changelog_section <changelog> <version> — the section for <version>,
 # from its `## [<version>]` heading up to (not including) the next numbered
 # section's heading. Returns 1 if the section is missing or empty.
+#
+# Headings are matched as FIXED-STRING prefixes (`index(...) == 1`), passed
+# through ENVIRON, never as regex text through `awk -v`: gawk and busybox awk
+# process backslash escapes in `-v` values, so `\[` arrived as a bare `[`, the
+# pattern became a character class, nothing matched, and the cut came back
+# EMPTY with exit 0 (mawk keeps the backslash, so it was green here; Codex on
+# PR #1039). The output-is-empty check makes any such regression a refusal.
 rl_changelog_section() {
-    local file="$1" ver="$2" prev esc_v esc_p
+    local file="$1" ver="$2" prev
     prev="$(rl_prev_version "$file" "$ver")"
     [ -n "$prev" ] || return 1
-    esc_v="$(printf '%s' "$ver" | sed 's/\./\\./g')"
-    esc_p="$(printf '%s' "$prev" | sed 's/\./\\./g')"
-    awk -v s="^## \\[${esc_v}\\]" -v e="^## \\[${esc_p}\\]" '$0 ~ s {f=1} f && $0 ~ e {exit} f' "$file"
+    RL_S="## [$ver]" RL_E="## [$prev]" awk '
+        !f && index($0, ENVIRON["RL_S"]) == 1 {f=1}
+        f && index($0, ENVIRON["RL_E"]) == 1 {exit}
+        f {print; n++}
+        END {exit (n > 0 ? 0 : 1)}' "$file"
 }
 
 # rl_section_headings <changelog> <version> — the `### ` heading lines of the

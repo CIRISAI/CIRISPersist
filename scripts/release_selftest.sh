@@ -48,29 +48,86 @@ Body line with an em dash — and an arrow →.
 ### Added — the first
 EOF
 
-echo "CHANGELOG section extraction"
-expect_eq "prev of 9.9.0" "$(rl_prev_version "$t/CHANGELOG.md" 9.9.0)" "9.8.10"
-expect_eq "prev of 9.8.10" "$(rl_prev_version "$t/CHANGELOG.md" 9.8.10)" "9.8.1"
-expect_eq "prev of 9.8.1" "$(rl_prev_version "$t/CHANGELOG.md" 9.8.1)" "9.8.0"
-expect_eq "prev of the oldest is empty" "$(rl_prev_version "$t/CHANGELOG.md" 9.8.0)" ""
-sec="$(rl_changelog_section "$t/CHANGELOG.md" 9.9.0)"
-expect_eq "section starts at its heading" "$(printf '%s\n' "$sec" | head -1)" "## [9.9.0] - UNRELEASED"
-expect_eq "section ends before the next numbered heading" "$(printf '%s\n' "$sec" | grep -c '^## ')" "1"
-expect_eq "section keeps its last body line" "$(printf '%s\n' "$sec" | grep -c '^- a bullet$')" "1"
-expect_eq "section keeps multibyte text" "$(printf '%s\n' "$sec" | grep -c 'em dash — and an arrow →')" "1"
-sec1="$(rl_changelog_section "$t/CHANGELOG.md" 9.8.1)"
-expect_eq "9.8.1 is not 9.8.10" "$(printf '%s\n' "$sec1" | head -1)" "## [9.8.1] - 2026-01-02"
-expect_eq "9.8.1 section is two headings long" "$(printf '%s\n' "$sec1" | grep -c '^#')" "2"
-if rl_changelog_section "$t/CHANGELOG.md" 9.7.0 >/dev/null; then bad "a missing version fails"; else ok "a missing version fails"; fi
-if rl_changelog_section "$t/CHANGELOG.md" 9.8.0 >/dev/null; then bad "the oldest section (no end) fails"; else ok "the oldest section (no end) fails"; fi
-expect_eq "headings joined" "$(rl_section_headings "$t/CHANGELOG.md" 9.9.0)" \
-    "the door refused what its precheck granted (#11); counters always on (#12)"
+# A second fixture whose headings a bracket-as-character-class pattern would
+# mis-match: `^## [53.2.0]` read as a class matches `## 5` and `## 3`, and
+# `## [5]` is a bracketed heading that is not a numbered section.
+cat > "$t/CHANGELOG2.md" <<'EOF'
+# Changelog
 
-# rl_subject: short lists pass through; long lists are capped with "+N more".
-expect_eq "subject short" "$(rl_subject "$t/CHANGELOG.md" 9.9.0 180)" "v9.9.0 — $(rl_section_headings "$t/CHANGELOG.md" 9.9.0)"
-_sub="$(rl_subject "$t/CHANGELOG.md" 9.9.0 20)"
-case "$_sub" in "v9.9.0 — "*"; +"*" more") ok "subject capped: $_sub";; *) bad "subject not capped: $_sub";; esac
-[ "${#_sub}" -le 80 ] && ok "subject cap length" || bad "subject cap length ${#_sub}"
+## 5 things to know
+
+## 3 more
+
+## [53.2.0] - 2026-10-08
+
+### Added — the release chain (#1018)
+
+## [5]
+
+a non-numbered bracket heading inside 53.2.0's section
+
+## [53.1.8] - 2026-10-07
+
+### Fixed — the score gate (#1013)
+
+## [53.1.7] - 2026-10-06
+EOF
+
+# extraction_cases — every case that runs the CHANGELOG cut. Run once per awk
+# below: gawk and busybox awk process backslash escapes in `-v` values and
+# mawk does not, so a cut that passed regex text through `-v` was green here
+# under mawk and empty under gawk (Codex on PR #1039).
+extraction_cases() {
+    expect_eq "[$1] prev of 9.9.0" "$(rl_prev_version "$t/CHANGELOG.md" 9.9.0)" "9.8.10"
+    expect_eq "[$1] prev of 9.8.10" "$(rl_prev_version "$t/CHANGELOG.md" 9.8.10)" "9.8.1"
+    expect_eq "[$1] prev of 9.8.1" "$(rl_prev_version "$t/CHANGELOG.md" 9.8.1)" "9.8.0"
+    expect_eq "[$1] prev of the oldest is empty" "$(rl_prev_version "$t/CHANGELOG.md" 9.8.0)" ""
+    sec="$(rl_changelog_section "$t/CHANGELOG.md" 9.9.0)"
+    expect_eq "[$1] section starts at its heading" "$(printf '%s\n' "$sec" | head -1)" "## [9.9.0] - UNRELEASED"
+    expect_eq "[$1] section ends before the next numbered heading" "$(printf '%s\n' "$sec" | grep -c '^## ')" "1"
+    expect_eq "[$1] section keeps its last body line" "$(printf '%s\n' "$sec" | grep -c '^- a bullet$')" "1"
+    expect_eq "[$1] section keeps multibyte text" "$(printf '%s\n' "$sec" | grep -c 'em dash — and an arrow →')" "1"
+    sec1="$(rl_changelog_section "$t/CHANGELOG.md" 9.8.1)"
+    expect_eq "[$1] 9.8.1 is not 9.8.10" "$(printf '%s\n' "$sec1" | head -1)" "## [9.8.1] - 2026-01-02"
+    expect_eq "[$1] 9.8.1 section is two headings long" "$(printf '%s\n' "$sec1" | grep -c '^#')" "2"
+    _o="$(rl_changelog_section "$t/CHANGELOG.md" 9.9.0)"; _rc=$?
+    if [ "$_rc" -eq 0 ] && [ -n "$_o" ]; then ok "[$1] a found section is non-empty with exit 0"; else bad "[$1] a found section is non-empty with exit 0 (rc=$_rc, ${#_o} bytes)"; fi
+    if rl_changelog_section "$t/CHANGELOG.md" 9.7.0 >/dev/null; then bad "[$1] a missing version fails"; else ok "[$1] a missing version fails"; fi
+    if rl_changelog_section "$t/CHANGELOG.md" 9.8.0 >/dev/null; then bad "[$1] the oldest section (no end) fails"; else ok "[$1] the oldest section (no end) fails"; fi
+    expect_eq "[$1] headings joined" "$(rl_section_headings "$t/CHANGELOG.md" 9.9.0)" \
+        "the door refused what its precheck granted (#11); counters always on (#12)"
+
+    # rl_subject: short lists pass through; long lists are capped with "+N more".
+    expect_eq "[$1] subject short" "$(rl_subject "$t/CHANGELOG.md" 9.9.0 180)" "v9.9.0 — $(rl_section_headings "$t/CHANGELOG.md" 9.9.0)"
+    _sub="$(rl_subject "$t/CHANGELOG.md" 9.9.0 20)"
+    case "$_sub" in "v9.9.0 — "*"; +"*" more") ok "[$1] subject capped: $_sub";; *) bad "[$1] subject not capped: $_sub";; esac
+    [ "${#_sub}" -le 80 ] && ok "[$1] subject cap length" || bad "[$1] subject cap length ${#_sub}"
+
+    sec2="$(rl_changelog_section "$t/CHANGELOG2.md" 53.2.0)"
+    expect_eq "[$1] 53.2.0 starts at its own heading, not at '## 5'" "$(printf '%s\n' "$sec2" | head -1)" "## [53.2.0] - 2026-10-08"
+    expect_eq "[$1] 53.2.0 keeps the '## [5]' line and stops at 53.1.8" "$(printf '%s\n' "$sec2" | grep -c '^## ')" "2"
+    expect_eq "[$1] 53.2.0 keeps its last body line" "$(printf '%s\n' "$sec2" | grep -c '^a non-numbered bracket heading')" "1"
+    expect_eq "[$1] 53.1.8 headings" "$(rl_section_headings "$t/CHANGELOG2.md" 53.1.8)" "the score gate (#1013)"
+}
+
+# Every awk on this host, each behind a PATH shim named `awk`: gawk, mawk,
+# busybox's awk, the default `awk`, and any extra binaries named in
+# RELEASE_SELFTEST_AWKS (space-separated paths).
+echo "CHANGELOG section extraction"
+awks=()
+for a in gawk mawk; do p="$(command -v "$a" 2>/dev/null)" && awks+=("$a=$p"); done
+p="$(command -v busybox 2>/dev/null)" && busybox awk 'BEGIN{}' </dev/null 2>/dev/null && awks+=("busybox=$p")
+for p in ${RELEASE_SELFTEST_AWKS:-}; do [ -x "$p" ] && awks+=("$(basename "$p")@$p"); done
+[ "${#awks[@]}" -gt 0 ] || awks+=("awk=$(command -v awk)")
+orig_path="$PATH"
+for spec in "${awks[@]}"; do
+    name="${spec%%[=@]*}"; bin="${spec#*[=@]}"
+    shim="$t/awk-$name"; mkdir -p "$shim"; ln -sf "$bin" "$shim/awk"
+    PATH="$shim:$orig_path"; hash -r
+    echo " under $name ($bin)"
+    extraction_cases "$name"
+done
+PATH="$orig_path"; hash -r
 
 echo "evidence re-stamp"
 printf 'a\tciris-persist@9.8.10\nb\tciris-persist@9.8.10:src/x.rs\nc\tciris-persist@9.8.100\nd\tciris-persist@31.0.0\n' > "$t/cc.tsv"
