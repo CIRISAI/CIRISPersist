@@ -22,8 +22,14 @@ compiled the dependency graph three times per release and certify reused none of
   Its units are the ones certify's `core` leg compiles. A tree too old to derive them skips
   the gate loudly; it never hand-spells a feature list.
 - `certify.sh prebuild` compiles every leg (`nextest --no-run`), both clippy invocations and
-  the dev wheel, and runs no tests. Use it before the bump commit instead of test lanes; `full`
-  then finds every leg warm.
+  the dev wheel, and runs no tests. Use it before the bump commit instead of test lanes. On a
+  cold worktree with `CARGO_BUILD_JOBS=3` it took 46 min: 11 min of fast gates, then 2071 s of
+  leg builds, including 549 s for the wheel. After it, `full` finds every dependency, the clippy units and the wheel
+  warm. The persist lib does not stay warm. `crate-type = ["cdylib", "rlib"]` makes cargo name
+  it without a hash (`deps/libciris_persist.{rlib,so}`), so every feature set shares one output.
+  Each leg other than the last one built gets `FeaturesChanged` and rebuilds the lib plus its
+  integration-test binaries (measured 1m04s–1m22s per leg, 0 dependencies recompiled). Making
+  that per-feature would need the cdylib split into its own crate; that is not done here.
 - `certify.sh fingerprint <full|prebuild> <leg>` prints the command `full` would run, built by
   the same `leg_cmd`. `scripts/fingerprint_check.sh` compares the (RUSTFLAGS, features,
   profile) triple across the hook, prebuild and full's core leg, and exits 1 on drift.

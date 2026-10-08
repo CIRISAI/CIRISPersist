@@ -20,12 +20,21 @@
 #
 # ── `prebuild` REPLACES PRE-CERTIFY TEST LANES (CIRISPersist#1010) ───────
 # Run `certify.sh prebuild` before the bump commit, then `full`. It compiles
-# exactly the units `full` will run, under the same derived RUSTFLAGS, so
-# `full` finds every leg warm and spends its wall clock running tests. Running
+# exactly the units `full` will run, under the same derived RUSTFLAGS. Running
 # test lanes first (the old pre-certify step) ran certify's tests twice under a
 # different fingerprint — 44–48 min per release for no added assurance, since
 # certify is the gate. The pre-push hook builds the `core` leg's fingerprint
 # too (scripts/ci_env.sh), so a pushed branch has already warmed the first leg.
+#
+# WHAT STAYS WARM, MEASURED (v53.2.0): every dependency of every leg, the
+# clippy units and the dev wheel. NOT the persist library itself: Cargo.toml's
+# `crate-type = ["cdylib", "rlib"]` makes cargo name it WITHOUT a hash
+# (`deps/libciris_persist.{rlib,so}` — a cdylib needs a stable name), so all
+# feature sets share one output and one fingerprint. Whichever leg built last
+# owns it; every other leg sees `FeaturesChanged` and rebuilds the lib and
+# each integration-test binary linking it — 1m04s–1m22s per leg on this box
+# after a complete prebuild (deps: 0 recompiled). The lib-test binaries the
+# hook builds (`--lib`) are hashed and are unaffected.
 #
 # ── DISK IS RE-CHECKED BEFORE EVERY LEG (CIRISPersist#1012) ──────────────
 # The launch-time guard alone let a co-tenant build fill the disk 33–37 min
@@ -735,7 +744,8 @@ if [ "$MODE" = "prebuild" ]; then
         echo "INFRA: $pb_disk legs skipped for disk, $(( pb_infra - pb_disk )) lost otherwise — those legs are cold."
         echo "SCRIPT_EXIT=3"; exit 3
     fi
-    echo "every leg compiled; 'certify.sh full' will find them warm. Nothing was RUN."
+    echo "every leg compiled — deps, clippy and the wheel are warm for 'full' (the hashless"
+    echo "persist lib relinks per leg; see the header). Nothing was RUN."
     echo "SCRIPT_EXIT=0"; exit 0
 fi
 
