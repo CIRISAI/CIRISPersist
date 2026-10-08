@@ -178,6 +178,30 @@ jobs:
           - { name: cirisnode,  leg: cirisnode,  gauntlet: false }
           - { name: cirisgraph, leg: cirisgraph, gauntlet: false }
           - { name: telemetry,  leg: telemetry,  gauntlet: false }
+          # v53.2.0 (CIRISPersist#1009) — the `test-anchor` CONFIGURATION gets
+          # its own row. It was a rider step on `cirisaudit`, chosen as "~2 min,
+          # rides the shortest leg"; it grew to 3,440 tests, ~900 s of test time
+          # plus a 2m29s rebuild, and made `cirisaudit` the longest job of every
+          # run (60–71 min against 47–55 for the other Linux legs). As a row it
+          # pays the ~8 min fixed cost (disk free + CIRISCache restore) on a
+          # runner of its own, in parallel, and the critical path drops by the
+          # rider's 15–17.5 min.
+          #
+          # Not moved to `darwin-aarch64 (no postgres)`, the cheaper-looking
+          # host: macOS runners are the SCARCE pool. On the v53.1.8 tag run
+          # (37692136047) the darwin wheel waited 40 min and the iOS simulator
+          # build 48 min for a macOS runner; adding ~20 min to a mac job would
+          # have lengthened exactly the queue the tag run's manifest waits on.
+          #
+          # Why it is an invocation of its own and not a flag on another leg
+          # (the env-switched genesis relaxation; nextest's per-test process
+          # isolation): RIDERS in scripts/ci_feature_matrix.py.
+          #
+          # `gauntlet: true` keeps the rider's exact selection: it ran with no
+          # `substrate_machine` exclusion (sqlite-only, so the sqlite arms). The
+          # row's postgres service starts and goes unused — `set test-anchor`
+          # carries no `postgres`.
+          - { name: test-anchor, leg: test-anchor, gauntlet: true }
     services:
       postgres:
         # CIRISPersist#222 — PLAIN postgres:16, NOT timescaledb. The
@@ -385,30 +409,6 @@ jobs:
         # this is a cache hit plus nine tests. A breach is a hang, not a slow box.
         timeout-minutes: 5
         run: cargo nextest run --test wire_format_fixtures
-      # v25.x (CIRISPersist#585) — the `test-anchor` CONFIGURATION, which CI
-      # had never run at all. It is not a flag that can ride another leg's
-      # feature list: the feature compiles the genesis relaxation in and
-      # `ciris_verify_core::test_anchor::test_anchor_active()` (reading
-      # `CIRIS_TEST_TRUST_ROOT`) switches it on, so with the env unset it is
-      # inert and a 30-feature leg carrying it would certify nothing. It needs
-      # its own invocation — and nextest specifically, because the genesis
-      # fixtures use `std::env::set_var` and per-test process isolation is what
-      # keeps that from leaking into the rest of the suite.
-      #
-      # A RIDER, not a matrix row: sqlite-only, ~1650 tests, ~2 min of test
-      # time. A whole runner for it would be the local-optimization /
-      # global-pessimization trade #543 already rejected, so it rides
-      # `cirisaudit` (the shortest leg) as an extra step.
-      # `scripts/ci_feature_matrix.py check` fails if this step is dropped or
-      # if its host leg changes.
-      - name: cargo nextest (test-anchor configuration — sqlite only)
-        if: matrix.substrate.leg == 'cirisaudit'
-        timeout-minutes: 25
-        run: |
-          set -euo pipefail
-          FEATURES="$(python3 scripts/ci_feature_matrix.py set test-anchor)"
-          echo "rider 'test-anchor' → --features \"${FEATURES}\""
-          cargo nextest run --no-fail-fast --features "${FEATURES}"
       # v0.5.4 (CIRISPersist#29) — Python regression test for the FFI
       # catch_panic layer. Builds the wheel with the `test-panic`
       # feature gate enabled (release wheels don't), then pytest
