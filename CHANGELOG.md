@@ -330,13 +330,34 @@ Until now every mutation round was hand-picked per PR and lived only here ("the 
 
 - **`scripts/mutants_matrix.py`** resolves a scope file (`tests:` filterset, `witnesses:` files, `<path> [<fn> ...]` entries; a function name must define exactly one `fn`) into each tool's own filter, and turns either tool's output into one schema, `ciris-persist/mutants-matrix/v1`. An interrupted cargo-mutants run is marked INCOMPLETE: the mutants missing from `outcomes.json` are read from the tool's own `mutants.json` as `not_run`. Before that, a matrix built from a run cut off after 17 of 74 mutants said "complete".
 - **`scripts/unvalidated_witnesses.py`** lists each `*_invariants.rs` witness (or `witnesses:` file) that ran and killed nothing: an unvalidated witness in Beyer 2022's sense, never shown red. On an incomplete run a zero prints `ZERO SO FAR`, not `UNVALIDATED`. Report-only this cut.
-- **Two scopes.** `scripts/mutants/scope-consent.txt` holds the consent gates and `src/observe/`, which are the sites of 53.1.8's rounds. `scripts/mutants/scope-observe-sites.txt` holds the backend byte meters and the fold entries, named by function in 3k–28k-line files.
-- **Tool verdict: cargo-mutants 27.1.0**, on the pinned 1.97.0. mutest-rs (git 430efed9, `nightly-2026-07-18`) was measured and rejected. Its static call graph ran 1 of the 16 in-scope witnesses, the only synchronous one. It generated no mutant in `consent_by_humans.rs` or `admission.rs`. With `postgres` on it hits an internal compiler error (`mutest-emit` `analysis/res.rs:758`, `deadpool` path). Its build peaks at 8.2 GiB, and each run profiles the whole lib suite first (1688 s, 3351 tests). The ML-DSA tests survived its meta-mutant binary with no stack overflow.
-- **Measured on `scope-consent`.** cargo-mutants listed 74 in-scope mutants. Baseline: 267 s build, 9.8 s for the 22 witnesses. It ran 17 in 1162 s (15 caught, 2 unviable, 0 missed) before the session crashed. 57 were not run, including all 13 in the consent gate and fold.
-- **Against the hand rounds: the acceptance is NOT met yet.** Of I549–I551's 10 hand mutants, one has a tool analogue that ran: `Fold::bit -> 0` (`src/observe/mod.rs:175`), the hand round's "fold scope that omits its own bit". It was killed by `i549` on memory, sqlite and postgres, as by hand. Five more have analogues listed but not run (`record_read`, its fold credit, `note_decoded_bytes`). Three sit in `scope-observe-sites.txt`, which has not run. The two `DOOR_VALUES` edits cannot be generated: neither tool mutates a `const` slice, and neither generated a mutant in `catalog.rs`. I548's 3 hand mutants are semantic swaps no operator produces. The tool's 13 coarser mutants at that site did not run.
-- **Beyond the hand rounds**, 14 more mutants were caught: `Fold::bit` ×2, `Tally::add`, eight `Tally::load` constants, `Counters::snapshot` and its two `>` flips. All were killed by `i549` on all three backends, and 12 also by `i550`.
-- **Survivors.** None among cargo-mutants' 17. mutest's 12 survivors are all at `src/observe/mod.rs:431`, inside the `Vec::with_capacity` hint of `TelemetrySnapshot::samples`. They are equivalent mutants, not a witness gap.
-- **Not in this cut.** The `certify.sh mutants` tier and the scheduled CI job: `docs/CI_WIRING_53_2_0.md` has the exact lines for the merge. Also deferred: a complete `scope-consent` run (projected about 63 min serial, not measured); any run of `scope-observe-sites.txt`; a scope for the remaining `trust_root.rs` walks; and turning the unvalidated report into a gate.
+- **Three scopes.**
+  - `scripts/mutants/scope-consent.txt` holds the consent gates and `src/observe/`, the sites of 53.1.8's rounds.
+  - `scripts/mutants/scope-consent-gate.txt` holds the two consent files only, against the I548 witnesses, so the gate is measured in 11 minutes without the 61 `observe/` mutants.
+  - `scripts/mutants/scope-observe-sites.txt` holds the backend byte meters and the fold entries, named by function in 3k–28k-line files.
+- **Tool verdict: cargo-mutants 27.1.0**, on the pinned 1.97.0. mutest-rs (git 430efed9, `nightly-2026-07-18`) was measured and rejected:
+  - Its static call graph ran 1 of the 16 in-scope witnesses, the only synchronous one.
+  - It generated no mutant in `consent_by_humans.rs` or `admission.rs`, where cargo-mutants found 13.
+  - With `postgres` on it hits an internal compiler error (`mutest-emit` `analysis/res.rs:758`, `deadpool` path).
+  - Its build peaks at 8.2 GiB, and each run profiles the whole lib suite first (1688 s, 3351 tests).
+  - The ML-DSA tests survived its meta-mutant binary with no stack overflow.
+- **Consent gate (`scope-consent-gate`), complete in 654 s.** 13 mutants: 9 caught, 3 unviable (the `Ok(Default::default())` bodies), 1 missed. Every I548 witness killed at least one, on memory, sqlite and postgres: i548a 5, i548b 4, i548c 9, i548d 4, i548e 1. The hand round's 3 mutants are semantic swaps no operator generates (the subject-only fold, bare `analyze`, the constant in the refusal). The tool's 13 cover the same two functions and show the same witnesses load-bearing.
+- **The gate's survivor is a witness gap, #1038.** It is `consent_by_humans.rs:282:21`, `||` replaced with `&&` in the steward-universe predicate `a.attesting_key_id != *p || is_structural_composer(..) || for_key_id_of(..) == Some(subject)`. The mutant drops the substrate's `consent:state:expired` record, which carries no `for_key_id` by design. A swept steward grant then reads `Unspecified` instead of `Expired`. The admit verdict is unchanged, and no I548 case covers it. This is from reading the code, not reproduced with a test.
+- **Counters (`scope-consent`), INCOMPLETE at 51 of 74.** The harness stopped it for memory after 2954 s. All 51 ran in `src/observe/mod.rs`: 42 caught, 4 unviable, 3 timeouts, 2 missed. Kills: sqlite i549 41, memory i549 38, postgres i549 38, sqlite i550 25, postgres i550 24, every i551 0 so far. 23 were not run: 10 `TelemetrySnapshot::fold` and `samples` mutants, and the 13 gate mutants, which the gate run then covered.
+  - The 3 timeouts are `record_read`'s mask loop at `:316`, which never clears and hangs the witness. They count as detected, but no witness is credited.
+  - The 2 survivors are filed as #1037: `Counters::snapshot` `n > 0` to `>=` (`:247`), and `fold`'s `|` to `^` (`:330`).
+- **Against I549–I551's 10 hand mutants.**
+  - Four have tool equivalents, killed by the same witness as by hand: `Fold::bit -> 0` and `record_read`'s `:313` flip by i549, `record_read` replaced with `()` by i549 and i550, and `note_decoded_bytes` replaced with `()` by sqlite i549.
+  - One, the dropped fold credit, corresponds to the `:316` timeouts.
+  - Three are in `scope-observe-sites.txt`, not yet run.
+  - Two, the `DOOR_VALUES` edits, cannot be generated: neither tool mutates a `const` slice.
+- **mutest's 12 survivors** are all in the `Vec::with_capacity` hint at `src/observe/mod.rs:431`. They are equivalent mutants.
+- **Unvalidated witnesses across all runs.** None among the 13 I548 witnesses. mutest validated `i551_samples_carry_exactly_the_catalogued_names_and_labels`, which killed 2. Three from-disk witnesses have never been shown red by a tool: `i551_each_backend_records_under_its_own_label`, `i551_every_emitted_label_is_catalogued_and_every_catalogued_one_emitted` and `i551_strip_comments_strips_both_shapes`. Neither tool mutates the literals they read. The 53.1.8 hand round showed only the second one red.
+- **Not in this cut.**
+  - The `certify.sh mutants` tier and the scheduled CI job; the exact lines for the merge are in `docs/CI_WIRING_53_2_0.md`.
+  - A complete `scope-consent` run, projected at about 70 min serially, run alone.
+  - Any run of `scope-observe-sites.txt`.
+  - A scope for the remaining `trust_root.rs` walks.
+  - Turning the unvalidated report into a gate.
 
 ### Added — the feature powerset against certify's hand legs (#1025)
 
