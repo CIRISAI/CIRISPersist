@@ -23,7 +23,9 @@
 # /v1/verify/build-manifest, never the legacy function-manifest path.
 #
 # Sources, and which path was taken, are printed per version:
-#   * wheels: the tag run's artifact; when it has EXPIRED (90 days) the
+#   * wheels: the artifact of the tag run covering the most needed wheels
+#     (scripts/reregister_plan.sh prints each run's coverage); when one has
+#     EXPIRED (90 days) or no run holds it, the
 #     `rebuild` job builds the wheel from the tag in pyo3-wheel's shape and the
 #     registration is labelled a same-version REBUILD (CC 3.1.2.1: supersedes);
 #   * PersistExtras + the unchanged manifests: the tag run's
@@ -79,54 +81,20 @@ jobs:
       rebuild: ${{ steps.p.outputs.rebuild }}
       rebuild_versions: ${{ steps.p.outputs.rebuild_versions }}
     steps:
+      - uses: actions/checkout@v6
+      # The selection logic is scripts/reregister_plan.sh: among the version's
+      # tag runs, the one covering the MOST needed wheels (a tie goes to the
+      # newer), never merely the newest with any wheel (Codex on PR #1039).
       - id: p
         env:
           GH_TOKEN: ${{ github.token }}
           VERSIONS: ${{ inputs.versions }}
           TARGETS: ${{ inputs.targets }}
           MODE: ${{ inputs.mode }}
+          DRY_RUN: ${{ inputs.dry_run }}
         run: |
           if [ -z "$VERSIONS" ] || [ -z "$TARGETS" ]; then echo "::error::versions and targets are required"; exit 1; fi
-          declare -A LABEL=([x86_64-unknown-linux-gnu]=linux-x86_64 [aarch64-unknown-linux-gnu]=linux-aarch64
-                            [aarch64-apple-darwin]=darwin-aarch64 [x86_64-pc-windows-msvc]=windows-x86_64)
-          declare -A OS=([linux-x86_64]=ubuntu-latest [linux-aarch64]=ubuntu-24.04-arm
-                         [darwin-aarch64]=macos-14 [windows-x86_64]=windows-latest)
-          for t in $TARGETS; do
-            [ "$t" = python-source-tree ] || [ -n "${LABEL[$t]:-}" ] || { echo "::error::not a target: $t"; exit 1; }
-          done
-          # repost verifies every reused wheel manifest against its wheel, so it needs all four
-          need_labels=""
-          for t in $TARGETS; do [ -n "${LABEL[$t]:-}" ] && need_labels="$need_labels ${LABEL[$t]}"; done
-          [ "$MODE" = repost ] && need_labels="linux-x86_64 linux-aarch64 darwin-aarch64 windows-x86_64"
-          read -ra vs <<<"$VERSIONS"
-          versions="[]"; rebuild="[]"; rebuild_versions="[]"
-          for v in "${vs[@]}"; do
-            v="${v#v}"
-            [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::not a version: $v"; exit 1; }
-            run=""; arts="[]"
-            for id in $(gh run list -R "$GITHUB_REPOSITORY" --branch "v$v" --event push --workflow ci.yml \
-                          --json databaseId,createdAt --limit 20 --jq 'sort_by(.createdAt) | reverse | .[].databaseId'); do
-              a=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$id/artifacts?per_page=100" \
-                    --jq '[.artifacts[] | select(.expired == false) | .name]')
-              if jq -e 'any(.[]; startswith("ciris_persist-wheel-"))' <<<"$a" >/dev/null; then run=$id; arts=$a; break; fi
-            done
-            bm=$(jq -r --arg n "ciris-persist-build-manifest-$v" 'if index($n) then "true" else "false" end' <<<"$arts")
-            echo "v$v: tag run ${run:-NONE with unexpired wheel artifacts}; build-manifest artifact: $bm"
-            for l in $need_labels; do
-              if jq -e --arg n "ciris_persist-wheel-$l" 'index($n)' <<<"$arts" >/dev/null; then
-                echo "  $l: tag run $run artifact"
-              else
-                echo "::warning::v$v $l: wheel artifact EXPIRED or missing — the wheel will be REBUILT from the tag (CC 3.1.2.1 supersedes)"
-                rebuild=$(jq -c --arg v "$v" --arg l "$l" --arg os "${OS[$l]}" '. + [{version:$v, label:$l, os:$os}]' <<<"$rebuild")
-                rebuild_versions=$(jq -c --arg v "$v" 'if index($v) then . else . + [$v] end' <<<"$rebuild_versions")
-              fi
-            done
-            versions=$(jq -c --arg v "$v" --arg r "$run" --arg bm "$bm" '. + [{version:$v, run:$r, bm:$bm}]' <<<"$versions")
-          done
-          {
-            echo "versions=$versions"; echo "rebuild=$rebuild"; echo "rebuild_versions=$rebuild_versions"
-          } >> "$GITHUB_OUTPUT"
-          echo "mode=$MODE targets=[$TARGETS] dry_run=${{ inputs.dry_run }}"
+          scripts/reregister_plan.sh
 
   # The fallback when a tag run's wheel artifact has expired: build that wheel
   # from the tag, in pyo3-wheel's shape (maturin --release --strip, auditwheel

@@ -404,6 +404,82 @@ expect "verify: a 404 read is exit 5"      5 'HTTP 404' -- "$SM" verify "$GV" "$
 unset SNAPSHOT_REGISTRY_BASE SNAPSHOT_ROOT SNAPSHOT_RETRIES
 reg_clear
 
+# ── reregister-manifests.yml: which tag run supplies the wheels ────────────
+# The plan step, extracted from the YAML, with a stub `gh` serving a run list
+# (newest first) and each run's unexpired artifacts. It stopped at the newest
+# run holding ANY wheel artifact, so a later partial re-run (one wheel) beat
+# the original run holding all four and three wheels were needlessly REBUILT
+# with non-reproducible bytes (Codex on PR #1039). The run that covers the
+# most needed labels wins; a tie goes to the newer run.
+echo
+echo "reregister-manifests.yml plan: tag-run selection"
+PL="$WORK/plan"; mkdir -p "$PL/bin" "$PL/fix"
+ln -s "$PWD/scripts" "$PL/scripts"
+python3 -I - "$PWD/.github/workflows/reregister-manifests.yml" "$PL/plan.sh" <<'PYEOF' || { echo "  FAIL  could not extract the plan step"; fails=$((fails + 1)); }
+import sys, yaml
+wf = yaml.safe_load(open(sys.argv[1]))
+steps = [s for s in wf["jobs"]["plan"]["steps"] if s.get("id") == "p"]
+assert len(steps) == 1, f"{len(steps)} plan steps"
+# The original step interpolated inputs.dry_run into its last echo; nothing else.
+run = steps[0]["run"].replace("${{ inputs.dry_run }}", "true")
+assert "${{" not in run, "the plan step interpolates an expression; it must read env only"
+open(sys.argv[2], "w").write("set -eo pipefail\n" + run)
+PYEOF
+cat >"$PL/bin/gh" <<'GHEOF'
+#!/usr/bin/env bash
+# stub: `gh run list` prints $PLAN_FIX/runs (newest first); `gh api .../runs/<id>/artifacts`
+# prints $PLAN_FIX/arts-<id>.json (the unexpired artifact names, already filtered).
+case "$1 $2" in
+  "run list") cat "$PLAN_FIX/runs";;
+  api\ *) id="$(sed -n 's|.*/runs/\([0-9]*\)/artifacts.*|\1|p' <<<"$2")"; cat "$PLAN_FIX/arts-$id.json" 2>/dev/null || echo '[]';;
+  *) echo "stub gh: $*" >&2; exit 1;;
+esac
+GHEOF
+chmod +x "$PL/bin/gh"
+ALL4='"ciris_persist-wheel-linux-x86_64","ciris_persist-wheel-linux-aarch64","ciris_persist-wheel-darwin-aarch64","ciris_persist-wheel-windows-x86_64"'
+# plan <mode> <targets>: run the extracted step; the outputs land in $PL/out
+plan() {
+  : >"$PL/out"
+  (cd "$PL" && env PATH="$PL/bin:$PATH" PLAN_FIX="$PL/fix" GITHUB_REPOSITORY=CIRISAI/CIRISPersist GITHUB_OUTPUT="$PL/out" \
+     VERSIONS=53.1.8 TARGETS="$2" MODE="$1" DRY_RUN=true bash plan.sh)
+}
+out_of() { sed -n "s/^$1=//p" "$PL/out"; }
+# (1) the Codex case: a partial re-run (newest) and the full original run
+printf '300\n200\n' >"$PL/fix/runs"
+echo '["ciris_persist-wheel-linux-x86_64"]' >"$PL/fix/arts-300.json"
+echo "[$ALL4,\"ciris-persist-build-manifest-53.1.8\"]" >"$PL/fix/arts-200.json"
+expect "plan: full older run beats partial newer" 0 'tag run 200' -- plan repost "x86_64-pc-windows-msvc"
+n=$((n + 1))
+if [ "$(out_of rebuild)" = "[]" ] && [ "$(out_of versions)" = '[{"version":"53.1.8","run":"200","bm":"true"}]' ]; then
+  echo "  ok    plan: run 200 chosen, nothing rebuilt"
+else echo "  FAIL  plan: versions=$(out_of versions) rebuild=$(out_of rebuild)"; fails=$((fails + 1)); fi
+expect "plan: prints the coverage table" 0 '300 +1/4' -- plan repost "x86_64-pc-windows-msvc"
+# (2) no run covers all four: the greater coverage wins, only the rest is rebuilt
+echo '["ciris_persist-wheel-linux-x86_64","ciris_persist-wheel-linux-aarch64"]' >"$PL/fix/arts-300.json"
+echo '["ciris_persist-wheel-darwin-aarch64"]' >"$PL/fix/arts-200.json"
+plan repost "x86_64-pc-windows-msvc" >/dev/null 2>&1
+n=$((n + 1))
+if [ "$(out_of versions)" = '[{"version":"53.1.8","run":"300","bm":"false"}]' ] \
+   && [ "$(out_of rebuild | python3 -I -c 'import json,sys; print(" ".join(sorted(r["label"] for r in json.load(sys.stdin))))')" = "darwin-aarch64 windows-x86_64" ]; then
+  echo "  ok    plan: best partial (2/4) chosen, the 2 missing rebuilt"
+else echo "  FAIL  plan: partial: versions=$(out_of versions) rebuild=$(out_of rebuild)"; fails=$((fails + 1)); fi
+# (3) check mode needs only the requested targets' labels: a tie goes to the newer run
+echo '["ciris_persist-wheel-windows-x86_64"]' >"$PL/fix/arts-300.json"
+echo "[$ALL4]" >"$PL/fix/arts-200.json"
+plan check "x86_64-pc-windows-msvc" >/dev/null 2>&1
+n=$((n + 1))
+if [ "$(out_of versions)" = '[{"version":"53.1.8","run":"300","bm":"false"}]' ] && [ "$(out_of rebuild)" = "[]" ]; then
+  echo "  ok    plan: check mode, tie on 1/1 goes to the newer run"
+else echo "  FAIL  plan: tie: versions=$(out_of versions) rebuild=$(out_of rebuild)"; fails=$((fails + 1)); fi
+# (4) no run has any needed wheel: no run, everything rebuilt
+echo '[]' >"$PL/fix/arts-300.json"; echo '["ciris-persist-build-manifest-53.1.8"]' >"$PL/fix/arts-200.json"
+plan repost "python-source-tree" >/dev/null 2>&1
+n=$((n + 1))
+if [ "$(out_of versions)" = '[{"version":"53.1.8","run":"","bm":"false"}]' ] \
+   && [ "$(out_of rebuild | python3 -I -c 'import json,sys; print(len(json.load(sys.stdin)))')" = 4 ]; then
+  echo "  ok    plan: no wheel anywhere, no run, all 4 rebuilt"
+else echo "  FAIL  plan: none: versions=$(out_of versions) rebuild=$(out_of rebuild)"; fails=$((fails + 1)); fi
+
 echo
 if [ "$fails" -eq 0 ]; then echo "bits_changed_test: $n/$n as expected"; exit 0; fi
 echo "bits_changed_test: $fails of $n FAILED"; exit 1
