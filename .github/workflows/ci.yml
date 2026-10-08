@@ -662,17 +662,41 @@ jobs:
       # registry alias for cross-version incremental restore (see the ciriscache
       # composite). Was two full saves back-to-back (~18.5 min on the v17.5.0 tag
       # run); now push-once + ~1s retag.
-      - uses: CIRISAI/CIRISCache/save@v1
+      - name: target/ size before the CIRISCache save (#1022 budget measurement)
+        if: (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) && matrix.substrate.name == 'core-1'
+        shell: bash
+        run: du -sh target/release target/debug/{deps,build,incremental,.fingerprint} 2>/dev/null || true
+      - uses: CIRISAI/CIRISCache/save@v1.1
+        id: cache_save
+        # v53.2.0 (#1022) — CIRISCache v1.1: the TAG run's save is strict (a failed
+        # publish fails the release: Edge/Server exact-pin this blob); main stays
+        # fail-open and the next step warns.
+        continue-on-error: ${{ !startsWith(github.ref, 'refs/tags/v') }}
         if: (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) && matrix.substrate.name == 'core-1'   # always warm: save on main AND release tags — a released version's blob MUST exist or edge/server/next-build cold-compile persist from source (far more than the ~9min save)
-        continue-on-error: true
         with:
           key: ${{ env.CIRISCACHE_KEY }}
           alias-keys: ${{ env.CIRISCACHE_KEY_HEAD }}
           token: ${{ secrets.GITHUB_TOKEN }}
-          # v1/ff52ca3 — LRU-prune target/ to 4GB before tar: breaks the
-          # fat-blob ratchet (240–400s ciriscache steps; superseded dep
-          # generations re-saved forever after every re-pin).
-          max-size-mb: "4096"
+          strict: ${{ startsWith(github.ref, 'refs/tags/v') && 'true' || 'false' }}
+          # v53.2.0 (#1022) — 12 GB, BELIEVED until measured: the customers are
+          # Edge/Server exact-pin restores that need persist's RELEASE units, and
+          # 4096 is likely under one release target. The size step above logs
+          # target/release and target/debug per run; set budget = size(target/release)
+          # + headroom from the SECOND run after adoption (the first prunes a stale
+          # generation). The prune is least recently BUILT (CIRISCache#3 notes).
+          max-size-mb: "12288"
+      - name: CIRISCache save result
+        if: ${{ !cancelled() && ((github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) && matrix.substrate.name == 'core-1') }}
+        shell: bash
+        env:
+          PUBLISHED: ${{ steps.cache_save.outputs.published }}
+          REASON: ${{ steps.cache_save.outputs.reason }}
+          KEY: ${{ steps.cache_save.outputs.key }}
+        run: |
+          echo "published=${PUBLISHED:-} key=${KEY:-} reason=${REASON:-}"
+          if [ "${PUBLISHED:-}" != "true" ]; then
+            echo "::warning::CIRISCache save not published (key ${KEY:-?}): ${REASON:-no reason given}"
+          fi
 
   # NOTE: the prior `linux-aarch64-build` cross-compile job was removed
   # in v0.1.15. Its purpose ("prove the crate cross-compiles to arm64
@@ -749,8 +773,11 @@ jobs:
       # never completed — so restore-only loses no cache that exists, while
       # un-redding every tag run. Re-enable via #762 when CIRISCache can save
       # under the mac VM resource ceiling.
-      - uses: CIRISAI/CIRISCache/save@v1
+      - uses: CIRISAI/CIRISCache/save@v1.1
+        id: cache_save
         if: false   # CIRISPersist#762 — see above; was: main + tags/v*
+        # v53.2.0 (#1022) — pinned to v1.1 with the rest; the size and result
+        # steps the other saves carry are left off while this save is disabled.
         continue-on-error: true
         with:
           key: ${{ env.CIRISCACHE_KEY }}
@@ -842,7 +869,12 @@ jobs:
         run: cargo build --release --features server
       # Save under the macos-x86_64 key + alias the rolling phead (push-once +
       # retag, #458). continue-on-error: a flaky/queued Intel runner is non-fatal.
-      - uses: CIRISAI/CIRISCache/save@v1
+      - name: target/ size before the CIRISCache save (#1022 budget measurement)
+        if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: du -sh target/release target/debug/{deps,build,incremental,.fingerprint} 2>/dev/null || true
+      - uses: CIRISAI/CIRISCache/save@v1.1
+        id: cache_save
         if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
         continue-on-error: true
         with:
@@ -853,6 +885,18 @@ jobs:
           # fat-blob ratchet (240–400s ciriscache steps; superseded dep
           # generations re-saved forever after every re-pin).
           max-size-mb: "4096"
+      - name: CIRISCache save result
+        if: ${{ !cancelled() && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) }}
+        shell: bash
+        env:
+          PUBLISHED: ${{ steps.cache_save.outputs.published }}
+          REASON: ${{ steps.cache_save.outputs.reason }}
+          KEY: ${{ steps.cache_save.outputs.key }}
+        run: |
+          echo "published=${PUBLISHED:-} key=${KEY:-} reason=${REASON:-}"
+          if [ "${PUBLISHED:-}" != "true" ]; then
+            echo "::warning::CIRISCache save not published (key ${KEY:-?}): ${REASON:-no reason given}"
+          fi
 
   # Mission category §4 + PLATFORM_ARCHITECTURE.md §3.1: iOS device +
   # simulator build path. Runs on macOS with the iOS targets.
@@ -1016,7 +1060,12 @@ jobs:
       # second ~9-min tar+push of byte-identical content). `phead` lets the NEXT
       # version's build restore this warm target/ and recompile only changed
       # files instead of rebuilding persist's deps from the verify baseline.
-      - uses: CIRISAI/CIRISCache/save@v1
+      - name: target/ size before the CIRISCache save (#1022 budget measurement)
+        if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: du -sh target/release target/debug/{deps,build,incremental,.fingerprint} 2>/dev/null || true
+      - uses: CIRISAI/CIRISCache/save@v1.1
+        id: cache_save
         if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')   # always warm: save on main AND release tags (else the released version cold-compiles downstream)
         continue-on-error: true
         with:
@@ -1027,6 +1076,18 @@ jobs:
           # fat-blob ratchet (240–400s ciriscache steps; superseded dep
           # generations re-saved forever after every re-pin).
           max-size-mb: "4096"
+      - name: CIRISCache save result
+        if: ${{ !cancelled() && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) }}
+        shell: bash
+        env:
+          PUBLISHED: ${{ steps.cache_save.outputs.published }}
+          REASON: ${{ steps.cache_save.outputs.reason }}
+          KEY: ${{ steps.cache_save.outputs.key }}
+        run: |
+          echo "published=${PUBLISHED:-} key=${KEY:-} reason=${REASON:-}"
+          if [ "${PUBLISHED:-}" != "true" ]; then
+            echo "::warning::CIRISCache save not published (key ${KEY:-?}): ${REASON:-no reason given}"
+          fi
 
   # ci-perf — recombine the two parallel iOS target builds into the single
   # `ciris-persist-ios` tar that mobile-release uploads. Mirrors
@@ -1264,7 +1325,12 @@ jobs:
       # second ~9-min tar+push of byte-identical content). `phead` lets the NEXT
       # version's build restore this warm target/ and recompile only changed
       # files instead of rebuilding persist's deps from the verify baseline.
-      - uses: CIRISAI/CIRISCache/save@v1
+      - name: target/ size before the CIRISCache save (#1022 budget measurement)
+        if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: du -sh target/release target/debug/{deps,build,incremental,.fingerprint} 2>/dev/null || true
+      - uses: CIRISAI/CIRISCache/save@v1.1
+        id: cache_save
         if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')   # always warm: save on main AND release tags (else the released version cold-compiles downstream)
         continue-on-error: true
         with:
@@ -1275,6 +1341,18 @@ jobs:
           # fat-blob ratchet (240–400s ciriscache steps; superseded dep
           # generations re-saved forever after every re-pin).
           max-size-mb: "4096"
+      - name: CIRISCache save result
+        if: ${{ !cancelled() && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) }}
+        shell: bash
+        env:
+          PUBLISHED: ${{ steps.cache_save.outputs.published }}
+          REASON: ${{ steps.cache_save.outputs.reason }}
+          KEY: ${{ steps.cache_save.outputs.key }}
+        run: |
+          echo "published=${PUBLISHED:-} key=${KEY:-} reason=${REASON:-}"
+          if [ "${PUBLISHED:-}" != "true" ]; then
+            echo "::warning::CIRISCache save not published (key ${KEY:-?}): ${REASON:-no reason given}"
+          fi
 
   # Downstream job: collect per-ABI artifacts into tarballs + wheels.
   android-package:
@@ -1765,7 +1843,7 @@ jobs:
       # `rustc -V` is the right channel (stable on every platform now) and
       # BEFORE the per-label rust-cache
       # below (which wins on the wheel's own target/). Sets CIRISCACHE_KEY for
-      # the save@v1 at the end of the job (#314, linux-aarch64 + windows-x64).
+      # the save@v1.1 at the end of the job (#314, linux-aarch64 + windows-x64).
       - name: Resolve CIRISCache PLAT from wheel label
         shell: bash
         run: |
@@ -2021,9 +2099,14 @@ jobs:
       # `alias-keys` retags the rolling `phead` blob onto the same manifest
       # server-side (no second tar+push). Windows was the worst offender here:
       # the wheel target/ is large and a second full push serialized ~9 min.
+      - name: target/ size before the CIRISCache save (#1022 budget measurement)
+        if: (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) && (matrix.label == 'linux-aarch64' || matrix.label == 'windows-x86_64')
+        shell: bash
+        run: du -sh target/release target/debug/{deps,build,incremental,.fingerprint} 2>/dev/null || true
       - name: Save CIRISCache (linux-aarch64 + windows-x64 — #314, push-once+alias)
+        id: cache_save
         if: (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) && (matrix.label == 'linux-aarch64' || matrix.label == 'windows-x86_64')   # always warm: save on main AND release tags
-        uses: CIRISAI/CIRISCache/save@v1
+        uses: CIRISAI/CIRISCache/save@v1.1
         continue-on-error: true
         with:
           key: ${{ env.CIRISCACHE_KEY }}
@@ -2033,6 +2116,18 @@ jobs:
           # fat-blob ratchet (240–400s ciriscache steps; superseded dep
           # generations re-saved forever after every re-pin).
           max-size-mb: "4096"
+      - name: CIRISCache save result
+        if: ${{ !cancelled() && ((github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) && (matrix.label == 'linux-aarch64' || matrix.label == 'windows-x86_64')) }}
+        shell: bash
+        env:
+          PUBLISHED: ${{ steps.cache_save.outputs.published }}
+          REASON: ${{ steps.cache_save.outputs.reason }}
+          KEY: ${{ steps.cache_save.outputs.key }}
+        run: |
+          echo "published=${PUBLISHED:-} key=${KEY:-} reason=${REASON:-}"
+          if [ "${PUBLISHED:-}" != "true" ]; then
+            echo "::warning::CIRISCache save not published (key ${KEY:-?}): ${REASON:-no reason given}"
+          fi
 
   # ── PyPI publishing REMOVED (CIRISPersist#615) ──────────────────────────
   #

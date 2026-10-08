@@ -241,6 +241,18 @@ Every core-1 `CIRISCache/save@v1` on the v53.1.3–v53.1.8 tag runs and on main 
 `phead-…-v10.6.1` (verify v10), spends 6m53s extracting it, and still compiles 119 crates. The
 fix belongs in CIRISCache. The measurements and a one-leg A/B are in the #1022 comment.
 
+**CI: CIRISCache v1.1; tag-run save strict; budget 12 GB pending measurement.** CIRISCache
+v1.1 (CIRISCache#4) fixes the prune's SIGPIPE and reports every save through `published`,
+`reason` and `key` outputs. All six `save@v1` steps now pin `save@v1.1`; `restore@v2` is
+unchanged because v1.1 changes only `save`. The core-1 save is `strict` on a tag run and no
+longer `continue-on-error` there, so a failed publish fails the release, since Edge and Server
+exact-pin that blob. Its budget goes from 4096 to 12288 MB. That figure is BELIEVED, not
+measured: each live save is now preceded by a `du -sh` of `target/release` and the
+`target/debug` subdirectories, and the budget should be set from the second run after
+adoption. Every other save stays fail-open, followed by a step that prints the three outputs
+and emits a `::warning::` when `published` is not `true`. The darwin-aarch64 save stays
+disabled (#762) and gets the pin only.
+
 ## [53.1.8] - 2026-10-07
 
 ### Fixed — the score emit gate refused what its consent precheck granted (#1013)
