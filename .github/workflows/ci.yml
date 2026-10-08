@@ -2196,6 +2196,11 @@ jobs:
       actions: read
     steps:
       - uses: actions/checkout@v6
+        with:
+          # v53.2.0 (#1029) — the v-tags: bits_changed.sh finds the previous
+          # release, and lets python-source-tree's hash equal it only when
+          # `git diff v<prev> v<this> -- python/ciris_persist` is empty.
+          fetch-depth: 0
       # v10.7.0 (CIRISVerify v8.0.0, #141) — no libtss2-dev; this step
       # compiles the crate but ciris-keyring no longer link-binds tss-esapi.
       - uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -2314,7 +2319,8 @@ jobs:
         run: scripts/build_manifest.sh roundtrip --version "${{ steps.version.outputs.version }}" --out dist
       - name: bits-changed check 5 — each registered row carries this run's wheel
         # v53.2.0 (#1029) — the registry upserts in place, so read back what it
-        # now serves for (version, target) and compare with the wheel we signed.
+        # now serves for (version, target) and compare with what we signed:
+        # each wheel's sha256 and python-source-tree's tree hash.
         env:
           REGISTRY_URL: ${{ vars.REGISTRY_URL }}
         run: |
