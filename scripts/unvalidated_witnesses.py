@@ -59,8 +59,14 @@ def main(argv: list[str]) -> int:
           f"{matrix['summary']['mutants']} mutants, "
           f"{'complete' if matrix['complete'] else 'INCOMPLETE run'})")
     print(f"  {len(rows) - len(unrun)} witnesses ran; {len(zero)} killed no mutant")
+    # On an incomplete run a zero is not yet a verdict: a mutant still
+    # not_run may be the one this witness kills.
+    label = "UNVALIDATED " if matrix["complete"] else "ZERO SO FAR "
+    if zero and not matrix["complete"]:
+        print(f"  (incomplete: {matrix['summary'].get('not_run', 0)} mutants not run;"
+              " a zero below is provisional)")
     for f, test, _ in sorted(zero):
-        print(f"  UNVALIDATED  {test}  ({f})")
+        print(f"  {label} {test}  ({f})")
     if unrun:
         print(f"  {len(unrun)} more were never run by the tool (no verdict either way):")
         for f, test, _ in sorted(unrun):

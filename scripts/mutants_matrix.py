@@ -268,6 +268,29 @@ def collect_cargo_mutants(out_dir: Path, scope: dict) -> tuple[list, list, list]
             "outcome": summary_map.get(o.get("summary", ""), "not_run"),
             "killed_by": killers,
         })
+    # outcomes.json lists only the mutants that FINISHED. An interrupted run
+    # (budget, OOM, a crashed session) leaves the rest out, and a matrix of
+    # only the finished ones would read "complete". mutants.json is the
+    # tool's full list: every in-scope mutant missing from outcomes is
+    # not_run, which marks the matrix INCOMPLETE.
+    listed = mo / "mutants.json"
+    if listed.is_file():
+        seen = {m["description"] for m in mutants} | set(dropped)
+        for mut in json.loads(listed.read_text()):
+            file = mut.get("file", "")
+            span = mut.get("span", {}).get("start", {})
+            line, col = span.get("line", 0), span.get("column", 0)
+            name = mut.get("name") or ""
+            desc = name if name.startswith(file) else f"{file}:{line}:{col}: {name}"
+            if desc in seen:
+                continue
+            if not in_scope(ranges, file, line):
+                dropped.append(desc)
+                continue
+            mutants.append({
+                "id": len(mutants) + 1, "file": file, "line": line, "col": col,
+                "description": desc, "outcome": "not_run", "killed_by": [],
+            })
     # nextest runs every filtered witness under every mutant: none is unreached.
     return sorted(tests), mutants, dropped, []
 
