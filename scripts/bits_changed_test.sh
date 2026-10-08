@@ -189,6 +189,26 @@ expect "prev: 2.0.0's prev is 1.10.0"     13 'registered for 1.10.0'         -- 
 reg_clear
 expect "prev: none below 1.0.0"           18 'no v-tag below 1.0.0'          -- "$G/scripts/bits_changed.sh" 1.0.0 "$T" "$W1"
 
+# python-source-tree: an unchanged hash passes check 3 only when git shows
+# python/ciris_persist unchanged between the tags; a wheel never does.
+G2="$WORK/git2"; mkdir -p "$G2/scripts" "$G2/python/ciris_persist"; cp "$GATE" "$G2/scripts/"
+gc() { git -C "$G2" -c user.name=t -c user.email=t@t "$@"; }
+git -C "$G2" init -q || exit 2
+echo a >"$G2/python/ciris_persist/__init__.py"; gc add -A; gc commit -q -m 1; gc tag v1.0.0
+echo x >"$G2/README"; gc add -A; gc commit -q -m 2; gc tag v1.1.0           # tree untouched
+echo b >"$G2/python/ciris_persist/__init__.py"; gc add -A; gc commit -q -m 3; gc tag v1.2.0   # tree changed
+TH="$(printf 'a%.0s' $(seq 64))"; TT=python-source-tree
+reg_row 1.0.0 "$TT" "$TH"; reg_row 1.1.0 "$TT" "$TH"
+expect "tree: same hash, tree unchanged"  0  'ALLOWED: python/ciris_persist is unchanged between v1.0.0 and v1.1.0' -- "$G2/scripts/bits_changed.sh" 1.1.0 "$TT" --sha256 "$TH"
+expect "tree: same hash, tree changed"    13 'python/ciris_persist changed between v1.1.0 and v1.2.0' -- "$G2/scripts/bits_changed.sh" 1.2.0 "$TT" --sha256 "$TH"
+expect "tree: hash differs"               0  'differs from 1.1.0'            -- "$G2/scripts/bits_changed.sh" 1.2.0 "$TT" --sha256 "$(printf 'b%.0s' $(seq 64))"
+expect "tree: prev tag missing locally"   13 'tag v9.9.9 is not in this checkout' -- env BITS_CHANGED_PREV=1.0.0 "$G2/scripts/bits_changed.sh" 9.9.9 "$TT" --sha256 "$TH"
+expect "tree: a wheel path is refused"    2  'python-source-tree is not a wheel' -- "$G2/scripts/bits_changed.sh" 1.1.0 "$TT" "$WORK/a"
+W11="$WORK/p/ciris_persist-1.1.0-cp310-abi3-$PLAT.whl"; mkwheel "$W11" 1.1.0 "$PLAT"
+reg_row 1.0.0 "$T" "$(sha "$W11")"
+expect "tree: a wheel gets no exemption"  13 'the bits did not change'       -- "$G2/scripts/bits_changed.sh" 1.1.0 "$T" "$W11"
+reg_clear
+
 # ── scripts/build_manifest.sh: the sign logic both workflows call ───────────
 # A fake ciris-build-sign writes {target, binary_version, binary_hash} and logs
 # its argv, so the selection, the gate before signing and the reuse rule are
@@ -200,11 +220,15 @@ cat >"$WORK/bin/ciris-build-sign" <<'SH'
 #!/usr/bin/env bash
 echo "$*" >>"$FAKE_SIGN_LOG"
 sub="$1"; shift
+if [ "$sub" = generate-keys ]; then mkdir -p "$2" && touch "$2/ed25519.seed" "$2/mldsa65.secret"; exit 0; fi
 [ "$sub" = sign ] || exit 0
 while [ $# -gt 0 ]; do
-  case "$1" in --binary) b="$2";; --target) t="$2";; --binary-version) v="$2";; --output) o="$2";; esac; shift
+  case "$1" in --binary) b="$2";; --tree) tr="$2";; --target) t="$2";; --binary-version) v="$2";; --output) o="$2";; esac; shift
 done
-h=""; [ -n "${b:-}" ] && h="sha256:$(sha256sum "$b" | cut -d' ' -f1)"
+h=""
+[ -n "${b:-}" ] && h="sha256:$(sha256sum "$b" | cut -d' ' -f1)"
+# a stand-in tree hash: every file under <tree>/ciris_persist, path + bytes
+[ -n "${tr:-}" ] && h="sha256:$(cd "$tr" && find ciris_persist -type f ! -path '*__pycache__*' | sort | xargs sha256sum | sha256sum | cut -d' ' -f1)"
 printf '{"target":"%s","binary_version":"%s","binary_hash":"%s"}\n' "$t" "$v" "$h" >"$o"
 SH
 chmod +x "$WORK/bin/ciris-build-sign"
@@ -227,6 +251,10 @@ else echo "  FAIL  bm: aarch64 manifest hash $(hash_in "$WORK/o1/manifest-aarch6
 # the gate runs before signing: a denylisted wheel is never signed
 printf '%s  29.0.0  x  t\n' "${AARCH_SHA#sha256:}" >"$WORK/deny-aarch.txt"
 expect "bm: denylisted wheel is not signed"  1 'bits_changed.sh refused aarch64-unknown-linux-gnu' -- env BITS_CHANGED_DENYLIST="$WORK/deny-aarch.txt" "$BM" sign --version "$V" --wheels "$WH" --out "$WORK/o2" --extras "$WORK/extras.json" --source-tree
+
+# ... and the tree's gate runs before it is registered
+printf '%s  1.0.0  python-source-tree  t\n' "$(hash_in "$WORK/o1/manifest-python-source-tree.json" | sed 's/^sha256://')" >"$WORK/deny-tree.txt"
+expect "bm: a denylisted tree is refused"  1 'bits_changed.sh refused python-source-tree' -- env BITS_CHANGED_DENYLIST="$WORK/deny-tree.txt" "$BM" sign --version "$V" --wheels "$WH" --out "$WORK/o2t" --extras "$WORK/extras.json" --source-tree
 
 # remediation: re-sign two targets, reuse the other two + the source tree unchanged
 mkdir -p "$WORK/orig"; cp "$WORK/o1"/manifest-*.json "$WORK/extras.json" "$WORK/orig/"; mv "$WORK/orig/extras.json" "$WORK/orig/persist-extras-$V.json"
@@ -251,7 +279,7 @@ if grep -q '^register --dry-run ' "$FAKE_SIGN_LOG" && [ "$(grep -o -- '--target 
 else echo "  FAIL  bm: register argv: $(cat "$FAKE_SIGN_LOG")"; fails=$((fails + 1)); fi
 
 # after-publish reads every registered row back
-for t in aarch64-unknown-linux-gnu x86_64-unknown-linux-gnu aarch64-apple-darwin; do
+for t in python-source-tree aarch64-unknown-linux-gnu x86_64-unknown-linux-gnu aarch64-apple-darwin; do
   reg_row "$V" "$t" "$(hash_in "$WORK/o1/manifest-$t.json" | sed 's/^sha256://')"
 done
 mkdir -p "$WH/ciris_persist-wheel-windows-x86_64"; mkwheel "$WH/ciris_persist-wheel-windows-x86_64/ciris_persist-$V-cp310-abi3-win_amd64.whl" "$V" win_amd64
@@ -259,6 +287,54 @@ reg_row "$V" x86_64-pc-windows-msvc 8a1e5a8f53e102cb2604a36b7faf7266ad94fa920a8b
 expect "bm: after-publish finds a stale row" 1 'x86_64-pc-windows-msvc does not carry its wheel' -- "$BM" after-publish --version "$V" --wheels "$WH" --out "$WORK/o1"
 reg_row "$V" x86_64-pc-windows-msvc "$(sha "$WH/ciris_persist-wheel-windows-x86_64/ciris_persist-$V-cp310-abi3-win_amd64.whl")"
 expect "bm: after-publish all rows match"    0 'BITS CHANGED ok 53.1.8 x86_64-pc-windows-msvc' -- "$BM" after-publish --version "$V" --wheels "$WH" --out "$WORK/o1"
+reg_row "$V" python-source-tree "$(printf 'c%.0s' $(seq 64))"
+expect "bm: after-publish reads the tree row" 1 'python-source-tree does not carry the signed tree hash' -- "$BM" after-publish --version "$V" --wheels "$WH" --out "$WORK/o1"
+reg_clear
+
+# python-source-tree with --tree-root (the tag's tree): reuse is checked
+# against the recomputed hash; naming the tree re-signs it alone.
+# the windows wheel was rebuilt above (new bytes): the reuse dir follows it
+printf '{"target":"x86_64-pc-windows-msvc","binary_version":"%s","binary_hash":"sha256:%s"}\n' "$V" \
+  "$(sha "$WH/ciris_persist-wheel-windows-x86_64/ciris_persist-$V-cp310-abi3-win_amd64.whl")" >"$WORK/orig/manifest-x86_64-pc-windows-msvc.json"
+TREE_FX="$WORK/tagtree/python"; mkdir -p "$TREE_FX/ciris_persist"; echo "tag" >"$TREE_FX/ciris_persist/__init__.py"
+expect "bm: reused tree row is checked"   1 'reused manifest for python-source-tree signs' -- "$BM" sign --version "$V" --wheels "$WH" --out "$WORK/o6" --reuse "$WORK/orig" --tree-root "$TREE_FX" --targets "aarch64-unknown-linux-gnu"
+: >"$FAKE_SIGN_LOG"
+expect "bm: --targets python-source-tree" 0 'signed python-source-tree from' -- "$BM" sign --version "$V" --wheels "$WH" --out "$WORK/o7" --reuse "$WORK/orig" --tree-root "$TREE_FX" --targets "python-source-tree"
+n=$((n + 1))
+if [ "$(grep -c '^sign .*--tree ' "$FAKE_SIGN_LOG")" -eq 1 ] && [ "$(grep -c '^sign .*--binary ' "$FAKE_SIGN_LOG")" -eq 0 ] && [ "$(wc -l <"$WORK/o7/signed-binary-targets.txt")" -eq 4 ]; then
+  echo "  ok    bm: the tree re-signed, the 4 wheels reused"
+else echo "  FAIL  bm: tree-only re-sign: $(cat "$FAKE_SIGN_LOG")"; fails=$((fails + 1)); fi
+TREE_SHA="$(hash_in "$WORK/o7/manifest-python-source-tree.json" | sed 's/^sha256://')"
+
+# check: MATCH / MISMATCH / NOROW per target, writes nothing, lists MISMATCH
+reg_row "$V" python-source-tree "$TREE_SHA"
+reg_row "$V" aarch64-unknown-linux-gnu "${AARCH_SHA#sha256:}"
+reg_row "$V" x86_64-unknown-linux-gnu 51193a5afd0789337ca75b2704d413be720307134486242775540050f5cc4a0a
+reg_row "$V" x86_64-pc-windows-msvc "$(sha "$WH/ciris_persist-wheel-windows-x86_64/ciris_persist-$V-cp310-abi3-win_amd64.whl")"
+echo "tag run 1 artifact" >"$WH/ciris_persist-wheel-windows-x86_64/SOURCE"
+expect "check: the darwin row is NOROW"   0 'NOROW +53.1.8 aarch64-apple-darwin' -- "$BM" check --version "$V" --wheels "$WH" --out "$WORK/chk" --tree-root "$TREE_FX"
+n=$((n + 1))
+if [ "$(cat "$WORK/chk/mismatch.txt")" = x86_64-unknown-linux-gnu ] && grep -q $'^MATCH\t53.1.8\tpython-source-tree' "$WORK/chk/check.tsv" \
+   && grep -q $'^MATCH\t53.1.8\tx86_64-pc-windows-msvc\t.*\ttag run 1 artifact$' "$WORK/chk/check.tsv"; then
+  echo "  ok    check: mismatch.txt lists x86_64 only; tree and windows MATCH, source printed"
+else echo "  FAIL  check: mismatch=[$(cat "$WORK/chk/mismatch.txt")] tsv: $(cat "$WORK/chk/check.tsv")"; fails=$((fails + 1)); fi
+expect "check: unreachable registry is ERROR" 1 'could not be checked' -- env BITS_CHANGED_REGISTRY_BASE=http://127.0.0.1:9 "$BM" check --version "$V" --wheels "$WH" --out "$WORK/chk2" --tree-root "$TREE_FX"
+reg_clear
+
+# fetch-reuse: the registry's verbatim bodies + PersistExtras out of `extras`
+for t in python-source-tree x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu aarch64-apple-darwin x86_64-pc-windows-msvc; do
+  mkdir -p "$WORK/reg/v1/verify/build-manifest/ciris-persist/$V"
+  printf '{"target":"%s","binary_version":"%s","binary_hash":"sha256:%s","extras":{"dep_tree":"x"}}' "$t" "$V" "$TH" \
+    >"$WORK/reg/v1/verify/build-manifest/ciris-persist/$V/$t"
+done
+expect "fetch-reuse: 5 bodies + extras"   0 'PersistExtras taken from' -- env REGISTRY_URL="$BITS_CHANGED_REGISTRY_BASE" "$BM" fetch-reuse --version "$V" --out "$WORK/fr"
+n=$((n + 1))
+if cmp -s "$WORK/fr/manifest-aarch64-apple-darwin.json" "$WORK/reg/v1/verify/build-manifest/ciris-persist/$V/aarch64-apple-darwin" \
+   && [ "$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1])))' "$WORK/fr/persist-extras-$V.json")" = "{'dep_tree': 'x'}" ]; then
+  echo "  ok    fetch-reuse: bodies byte-identical, extras extracted"
+else echo "  FAIL  fetch-reuse output"; fails=$((fails + 1)); fi
+rm -f "$WORK/reg/v1/verify/build-manifest/ciris-persist/$V/x86_64-pc-windows-msvc"
+expect "fetch-reuse: a missing body is red" 1 'GET build-manifest 53.1.8/x86_64-pc-windows-msvc returned HTTP 404' -- env REGISTRY_URL="$BITS_CHANGED_REGISTRY_BASE" "$BM" fetch-reuse --version "$V" --out "$WORK/fr2"
 reg_clear
 
 echo
