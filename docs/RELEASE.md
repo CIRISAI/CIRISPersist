@@ -84,7 +84,7 @@ PR CI after a failure: `auto-retry.yml` re-runs a first-attempt failure that has
 | 11 | release_finish.sh | tag CI red, other than a cancellation | read the run. Fix forward with a patch release |
 | 12 | release_finish.sh | tag CI did not finish within `FINISH_TIMEOUT_MIN` | re-run the same command |
 | 13, 14, 15 | release_finish.sh | the release never appeared, the edit failed, or the body is too short | re-run. If it repeats, `gh release edit v<version> --notes-file` with the tag annotation by hand |
-| 17 | release_finish.sh | `verify_release.sh` failed: an attestation did not verify, a download failed, or `gh` has no `attestation` command | read its per-subject lines. `gh` older than 2.49: `GH=/path/to/newer/gh` and re-run. A FAIL on a subject means the tag run's `attest` job did not sign those bytes: read that job before anything else |
+| 17 | release_finish.sh | `verify_release.sh` failed: an attestation did not verify, a wheel's bits check failed, a download failed, or `gh` has no `attestation` command | read its per-subject lines. `gh` older than 2.49: `GH=/path/to/newer/gh` and re-run. A FAIL on a provenance subject means the tag run's `attest` job did not sign those bytes: read that job before anything else. A FAIL on `bits (registered)` means the registry's row for that target is not this release's wheel: see "Remediating a registered manifest" |
 
 ## Verifying a release
 
@@ -112,4 +112,47 @@ gh attestation verify evidence/cc_impl.tsv -R CIRISAI/CIRISPersist \
   --jq '.[0].verificationResult.statement.predicate'
 ```
 
+`verify_release.sh` also runs `scripts/bits_changed.sh` on each desktop wheel (below), against the registry. Its `ok    bits` and `ok    bits (registered)` lines are per target.
+
 Releases before v53.2.0 carry no attestations. Through v53.1.8 the wheel artifacts also held stale wheels restored from the build cache, and build-manifest registered a v29.0.0 wheel's hash for linux-aarch64 and windows-x86_64. v53.2.0 clears `target/wheels/` before the build and selects only `ciris_persist-<v>-*.whl`.
+
+## The bits-changed gate
+
+`scripts/bits_changed.sh <version> <target> <wheel-dir-or-file>` (CIRISPersist#1029) asks whether the bits changed, before a wheel's manifest is signed and after it is registered.
+
+| check | refuses when | exit |
+|---|---|---|
+| 1 | the directory holds zero, or two or more, `ciris_persist-<version>-*.whl` for the target's platform tag | 10 |
+| 2 | the wheel's own `*.dist-info/METADATA` `Version:` is not `<version>` | 11 |
+| 2 | a `WHEEL` `Tag:` does not fit the target | 12 |
+| 3 | its sha256 is the hash the registry holds for the PREVIOUS release on this target. A 404 there means the first release on the target, and it passes | 13 |
+| 4 | its sha256 is in `evidence/manifest_remediation/known_stale_hashes.txt`, unless that line names `<version>` as the hash's true version | 14 |
+| 5 | `--after-publish`: the registered row for (`<version>`, target) does not carry exactly its sha256, or there is no row | 15 |
+| — | `--attestation-digest <hex>` differs from its sha256 | 16 |
+| — | a registry read failed: not 200, and not a 404 where one is allowed | 17 |
+| — | no previous version could be found | 18 |
+
+The target map is `aarch64-unknown-linux-gnu` to `manylinux*_aarch64`, `x86_64-unknown-linux-gnu` to `manylinux*_x86_64`, `x86_64-pc-windows-msvc` to `win_amd64`, and `aarch64-apple-darwin` to `macosx*_arm64`. The previous version is the newest `v` tag below `<version>`, from `git tag`, or `git ls-remote` in a shallow checkout. `--prev` or `BITS_CHANGED_PREV` overrides it. The registry is `BITS_CHANGED_REGISTRY_BASE`; the tag job points it at the registry it writes to. A 429 or 5xx is retried, honouring `Retry-After`.
+
+Where it runs: the tag job runs checks 1 to 4 before each sign and check 5 after the round-trip, both through `scripts/build_manifest.sh`. `verify_release.sh` runs all five on each published wheel. `scripts/bits_changed_test.sh` is its offline witness set, a certify fast gate (`bitschanged`) and a CI lint step.
+
+## Remediating a registered manifest
+
+CIRISRegistry keys manifest rows by (project, version, target) and upserts them in place. It keeps no history until CIRISRegistry#144 lands. To replace a wrong row:
+
+1. Snapshot the row and commit it. The snapshot is the only record of what is overwritten.
+   ```
+   scripts/snapshot_manifests.sh <version> <target>...
+   git add evidence/manifest_remediation/<version>/ && git commit
+   ```
+   The script refuses to overwrite an existing snapshot (exit 4) and writes nothing for a pair whose reads are not all 200 (exit 5).
+2. Merge that commit, then dispatch `Re-register manifests` from the ref that has it, with `versions`, `targets` and `dry_run: true` first:
+   ```
+   gh workflow run reregister-manifests.yml -f versions="<v> ..." -f targets="aarch64-unknown-linux-gnu x86_64-pc-windows-msvc" -f dry_run=true
+   ```
+   The dry run stops at `ciris-build-sign register --dry-run` and posts nothing. Read its log, then dispatch again with `dry_run=false`.
+3. Per version, the workflow refuses unless every named target's `.function.json` snapshot is committed and the live row still carries the snapshot's `binary_hash`. It finds the tag run by its `ciris-persist-build-manifest-<v>` artifact and downloads that artifact, which holds the PersistExtras and the other targets' signed manifests, plus the run's wheels. Run artifacts expire after 90 days, and an expired run is refused, not rebuilt. It re-signs the named targets after `bits_changed.sh` checks 1 to 4, with the previous version being the `v` tag below. It re-posts every other target unchanged, after checking each manifest's `binary_hash` against its wheel. A partial re-post would drop the others, because `register` writes one `binary_manifests` map per version. Then it registers through `POST /v1/builds` and `POST /v1/verify/build-manifest`, never the legacy function-manifest path, runs the round-trip, and runs `bits_changed.sh --after-publish` on every target.
+4. Run `scripts/verify_release.sh <v>` (or `VERIFY_SKIP_WHEELS=1` past 90 days, which skips the bits). Every `bits (registered)` line should read `ok`.
+
+The workflow uses the tag job's secrets and adds none. Each version's re-signed manifests and its snapshots are uploaded as the run's `reregistered-manifests-<v>` artifact.
+

@@ -15,15 +15,18 @@
 # 4. sets the release body from the tag's annotation and asserts its BYTES;
 # 5. runs scripts/verify_release.sh: every attestation tag CI's `attest` job
 #    signed (wheels, release tarballs, evidence/cc_impl.tsv) verifies with
-#    `gh attestation verify` (CIRISPersist#1028). Needs gh 2.49+ (GH=...).
+#    `gh attestation verify` (CIRISPersist#1028), and each desktop wheel's
+#    registered row carries that wheel (scripts/bits_changed.sh, #1029).
+#    Needs gh 2.49+ (GH=...).
 #
 # Idempotent: re-run the same command after a kill or a timeout; it picks the
 # run up wherever it is. FINISH_TIMEOUT_MIN (default 180) bounds the tag-CI wait.
 #
 # Exit codes: 2 bad arguments / run is not this tag's CI run · 11 tag CI not
 # green · 12 tag CI timeout · 13 release never appeared · 14 release edit
-# failed · 15 release body too short · 17 an attestation did not verify (or
-# could not be checked: gh too old, a download failed).
+# failed · 15 release body too short · 17 an attestation did not verify, a
+# wheel's bits check failed, or either could not be checked (gh too old, a
+# download failed).
 set -uo pipefail
 ver="${1:?version}"; rid="${2:?tag CI run id}"
 cd "$(git rev-parse --show-toplevel)" || exit 2

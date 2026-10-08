@@ -160,12 +160,59 @@ checks the predicate's version and commit. `release_finish.sh` runs it before
 wheel's hash for `aarch64-unknown-linux-gnu` (`51193a5a…`) and `x86_64-pc-windows-msvc`
 (`8a1e5a8f…`). The build now clears `target/wheels/`, and `build-manifest` signs exactly one
 `ciris_persist-<v>-*.whl` or fails. The rows already registered for earlier releases on those
-two targets are not corrected here.
+two targets are corrected by the #1029 workflow below, not by this change.
 
 Deferred: no sdist is attested, because none is built. Consumers build from the tag. The tag
 job cannot run locally. actionlint 1.7.12 reports nothing new. `verify_release.sh` was run
 against unattested v53.1.8 and failed all 8 subjects with exit 1, as it should. The passing
 path is untested until the v53.2.0 tag run.
+
+### Fixed — the registry vouched for v29 bytes as v53.1.8 on two targets; the bits-changed gate and a re-register workflow (#1029)
+
+v53.1.8's tag job registered the 29.0.0 wheel's hash for `aarch64-unknown-linux-gnu`
+(`51193a5a…`) and `x86_64-pc-windows-msvc` (`8a1e5a8f…`), signed with our CI key. Verify
+found the consequence. Before CIRISVerify 20.1.0, `verify_build_manifest` checked signature,
+primitive and extras and never related `binary_hash` to `binary_version`. On those targets a
+correct v53.1.8 install failed integrity, a false tamper alarm. The v29.0.0 wheel passed,
+**attested as v53.1.8**: a rollback door. Verify 20.1.0 refuses that at signing and at
+verification (CIRISVerify#306/#307). Persist's side follows.
+
+- **The fix** is in #1028 above: `target/wheels/` is cleared before the build, and the tag job
+  signs exactly one `ciris_persist-<v>-*.whl` per target or fails.
+- **The gate.** `scripts/bits_changed.sh <version> <target> <wheel-dir-or-file>` asks whether
+  the bits changed. Check 1: exactly one wheel for the target's platform tag. Check 2: the
+  wheel's own `METADATA` `Version:` and `WHEEL` `Tag:` fit. Check 3: its sha256 is not the hash
+  the registry holds for the previous release on that target. Check 4: it is not in
+  `evidence/manifest_remediation/known_stale_hashes.txt`. Check 5, `--after-publish`: the
+  registered row now carries exactly that sha256. Each check has its own exit code and a
+  one-line reason. The tag job runs checks 1–4 before each sign and check 5 after the
+  round-trip. `verify_release.sh` runs all five on each desktop wheel.
+- **One copy of the signing logic.** `scripts/build_manifest.sh` holds install, sign,
+  preflight, register, roundtrip and read-back. ci.yml's `build-manifest` job and the new
+  workflow both call it.
+- **Remediation.** `.github/workflows/reregister-manifests.yml` is dispatched with `versions`,
+  `targets` and `dry_run`. It refuses a (version, target) pair with no committed snapshot in
+  `evidence/manifest_remediation/<v>/`, or whose live row no longer matches its snapshot. The
+  registry upserts with no history (CIRISRegistry#144), so the snapshot is the record.
+  `scripts/snapshot_manifests.sh` writes it and never overwrites one. The workflow takes the
+  PersistExtras and the wheels from the tag run's artifacts, since PyPI stopped at 22.0.1
+  (#615). It re-signs the named targets after checks 1–4. It re-posts the other targets
+  unchanged, after checking each manifest against its wheel, because `register` writes one
+  `binary_manifests` map per version. It registers through `/v1/builds` and
+  `/v1/verify/build-manifest`, never the legacy function-manifest path, then reads every row
+  back. It adds no secret.
+- **Snapshots committed:** 53.1.8 for both targets, read on 2026-10-08.
+
+Tested: `scripts/bits_changed_test.sh` passes 39 cases, run offline against a stub registry
+and a fake `ciris-build-sign`. It is a certify fast gate (`bitschanged`) and a CI lint step.
+Restoring `ls | head -1` turns it red, and so does each of 15 other mutants of the two
+scripts. `verify_release.sh 53.1.8` against the live registry fails the aarch64 and windows
+rows and passes x86_64 and darwin. The remediation sign step was run on v53.1.8's real
+artifacts with a fake signer. It re-signed aarch64 and windows from the 53.1.8 wheels
+(`835f213a…`, `25c97b37…`) and reused x86_64 and darwin. That run also showed that
+**53.1.7's windows row carries the same 29.0.0 hash** (`8a1e5a8f…`). Untested: the tag job and
+the dispatch workflow, which need the signing secrets. Nothing was dispatched and nothing was
+written to the registry.
 
 ### Added — the telemetry catalogue as an OpenTelemetry Weaver registry, and emission through the `metrics` facade (#1027)
 

@@ -23,7 +23,8 @@ done
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/bits-changed-test.XXXXXX")"
 SRV_PID=""
-cleanup() { [ -n "$SRV_PID" ] && kill "$SRV_PID" 2>/dev/null; rm -rf "$WORK"; }
+# shellcheck disable=SC2317  # invoked by the EXIT trap
+cleanup() { if [ -n "$SRV_PID" ]; then kill "$SRV_PID" 2>/dev/null; fi; rm -rf "$WORK"; }
 trap cleanup EXIT
 fails=0; n=0
 
@@ -71,7 +72,8 @@ python3 -I "$WORK/bin/stub.py" "$WORK/reg" "$WORK/port" </dev/null >/dev/null 2>
 SRV_PID=$!
 for _ in $(seq 1 50); do [ -s "$WORK/port" ] && break; sleep 0.1; done
 [ -s "$WORK/port" ] || { echo "✗ stub registry did not start" >&2; exit 2; }
-export BITS_CHANGED_REGISTRY_BASE="http://127.0.0.1:$(cat "$WORK/port")"
+PORT="$(cat "$WORK/port")"
+export BITS_CHANGED_REGISTRY_BASE="http://127.0.0.1:$PORT"
 export BITS_CHANGED_RETRIES=0
 EMPTY_DENY="$WORK/deny-empty.txt"; echo "# none" >"$EMPTY_DENY"
 export BITS_CHANGED_DENYLIST="$EMPTY_DENY"
@@ -93,7 +95,7 @@ expect() {
     printf '  ok    %-34s exit=%-2s %s\n' "$name" "$rc" "$(grep -E "$must" <<<"$out" | head -1 | sed 's/^ *//' | cut -c1-90)"
   else
     printf '  FAIL  %-34s exit=%s (want %s, /%s/)\n' "$name" "$rc" "$want" "$must"
-    sed 's/^/        | /' <<<"$out"; fails=$((fails + 1))
+    while IFS= read -r l; do echo "        | $l"; done <<<"$out"; fails=$((fails + 1))
   fi
 }
 
@@ -123,6 +125,7 @@ expect "a: windows wheel, windows target" 0 "win_amd64"                    -- "$
 # (b) old + new in one dir: selects new; the `ls | head -1` mutant goes RED
 expect "b: 29.0.0 + 53.1.8 selects 53.1.8" 0 "^ok    1  $W"                -- "$GATE" --prev "$PREV" "$V" "$T" "$WORK/b"
 mkdir -p "$WORK/mut/scripts"
+# shellcheck disable=SC2016  # the replacement is shell text, written literally
 sed 's|^\( *\)mapfile -t all < <(find .*# bits:select$|\1mapfile -t all < <(ls "$src"/*.whl \| head -1)  # mutant|' \
   "$GATE" >"$WORK/mut/scripts/bits_changed.sh"
 chmod +x "$WORK/mut/scripts/bits_changed.sh"
@@ -175,9 +178,10 @@ expect "sha mode: denylisted"             14 'known stale hash'              -- 
 
 # PREVIOUS_VERSION from git tags: newest v-tag below the version
 G="$WORK/git"; mkdir -p "$G/scripts"; cp "$GATE" "$G/scripts/"
-git -C "$G" init -q && git -C "$G" -c user.name=t -c user.email=t@t commit -q --allow-empty -m t \
-  && for tg in v1.0.0 v1.2.0 v1.10.0 v2.0.0 v2.0.0-rc1 v3.0.0; do git -C "$G" tag "$tg"; done \
-  || { echo "✗ fixture git repo" >&2; exit 2; }
+if ! git -C "$G" init -q || ! git -C "$G" -c user.name=t -c user.email=t@t commit -q --allow-empty -m t; then
+  echo "✗ fixture git repo" >&2; exit 2
+fi
+for tg in v1.0.0 v1.2.0 v1.10.0 v2.0.0 v2.0.0-rc1 v3.0.0; do git -C "$G" tag "$tg" || exit 2; done
 W2="$WORK/p/ciris_persist-2.0.0-cp310-abi3-$PLAT.whl"; W1="$WORK/p/ciris_persist-1.0.0-cp310-abi3-$PLAT.whl"
 mkdir -p "$WORK/p"; mkwheel "$W2" 2.0.0 "$PLAT"; mkwheel "$W1" 1.0.0 "$PLAT"
 reg_row 1.10.0 "$T" "$(sha "$W2")"
