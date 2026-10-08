@@ -2,8 +2,20 @@
 # pre-push hook for CIRISPersist.
 #
 # Runs the SLOWER test gate before push. Pre-commit handles fmt +
-# clippy; pre-push runs `cargo test --lib` so we don't push code
-# that's broken at the unit level.
+# clippy; pre-push runs the lib tests so we don't push code that's
+# broken at the unit level.
+#
+# v53.2.0 (CIRISPersist#1010) — ONE FINGERPRINT. This hook used to run
+# `cargo test --features postgres,pyo3,server --lib` with no RUSTFLAGS: a
+# feature set matching no certify leg, under flags weaker than CI's, so
+# nothing it compiled was ever reused. It now builds certify's `core` leg
+# exactly — RUSTFLAGS derived from ci.yml, the feature set derived by
+# `ci_feature_matrix.py set core`, the default profile, nextest — via
+# `scripts/ci_env.sh`, the file certify.sh sources. The dependency graph and
+# the lib-test unit compiled here are the ones certify's first leg finds
+# warm. `scripts/fingerprint_check.sh` runs this hook with
+# CIRIS_HOOK_FINGERPRINT_ONLY=1 and fails if its triple differs from
+# certify's.
 #
 # Postgres + maturin integration tests still run only in CI (they
 # need TimescaleDB containers + cross-platform builds).
@@ -14,6 +26,35 @@ set -euo pipefail
 
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 cd "$REPO_ROOT"
+
+# ── the build fingerprint, shared with certify.sh (#1010) ──────────────
+# `.git/hooks` is common to every worktree and links into the shared
+# checkout, so this BODY can be newer than the branch being pushed. Prefer
+# the pushed tree's own ci_env.sh (it reads that tree's ci.yml); fall back to
+# the one beside this hook. A branch too old to derive a feature set at all
+# SKIPS the test gate loudly rather than aborting a valid push (the
+# pre-commit hook's rule: an abort teaches `--no-verify`) — and never
+# hand-spells a feature list, which is the #585 defect.
+CI_ENV="$REPO_ROOT/scripts/ci_env.sh"
+[ -f "$CI_ENV" ] || CI_ENV="$(dirname "$(readlink -f "$0")")/../ci_env.sh"
+HOOK_CMD=()
+if [ -f "$CI_ENV" ] && [ -f scripts/ci_feature_matrix.py ]; then
+    # shellcheck source=scripts/ci_env.sh
+    . "$CI_ENV"
+    # Computed on their own lines, NOT inline — `set -e` is suppressed inside
+    # an `if`, and an empty value would test with weaker flags than certify.
+    HOOK_RUSTFLAGS="$(ci_rustflags)"
+    HOOK_FEATURES="$(ci_feature_csv core)"
+    export RUSTFLAGS="$HOOK_RUSTFLAGS"
+    HOOK_CMD=(cargo nextest run --features "$HOOK_FEATURES" --lib)
+fi
+
+if [ "${CIRIS_HOOK_FINGERPRINT_ONLY:-0}" = "1" ]; then
+    [ ${#HOOK_CMD[@]} -gt 0 ] || { echo "pre-push: no derivable fingerprint in this tree" >&2; exit 2; }
+    printf 'RUSTFLAGS=%s\n' "$RUSTFLAGS"
+    printf 'CMD='; printf '%q ' "${HOOK_CMD[@]}"; echo
+    exit 0
+fi
 
 # Skip if we're pushing to a branch that hasn't changed any Rust
 # files since main — pre-push gets called even for tag pushes that
@@ -66,8 +107,15 @@ if [ $RUST_TOUCHED -eq 0 ]; then
     exit 0
 fi
 
-echo "─── pre-push: cargo test --lib (server + pyo3 features) ───"
-if ! cargo test --features postgres,pyo3,server --lib --quiet 2>&1 | tail -10; then
+if [ ${#HOOK_CMD[@]} -eq 0 ]; then
+    echo "─── pre-push: SKIPPED — lib tests ───" >&2
+    echo "    reason: scripts/ci_env.sh or scripts/ci_feature_matrix.py is absent from this tree," >&2
+    echo "    so the core leg's fingerprint cannot be derived. NOT run, NOT passed; CI enforces it." >&2
+    exit 0
+fi
+
+echo "─── pre-push: nextest --lib (certify's core leg: RUSTFLAGS='$RUSTFLAGS', --features $HOOK_FEATURES) ───"
+if ! NEXTEST_TEST_THREADS="$(ci_single_leg_threads)" "${HOOK_CMD[@]}" 2>&1 | tail -15; then
     echo
     echo "✗ tests failing. Fix them locally before pushing." >&2
     echo "  Bypass (NOT for routine use): git push --no-verify" >&2
@@ -122,7 +170,7 @@ else
 fi
 
 if [ -n "${CIRIS_PERSIST_TEST_PG_URL:-}" ]; then
-    if ! cargo test --features postgres,pyo3,server --lib read_section -- --quiet 2>&1 | tail -10; then
+    if ! NEXTEST_TEST_THREADS="$(ci_single_leg_threads)" "${HOOK_CMD[@]}" -E 'test(/read_section/)' 2>&1 | tail -10; then
         echo
         echo "✗ PG integration tests failing against live Postgres." >&2
         echo "  These would have failed CI; fix before pushing." >&2
