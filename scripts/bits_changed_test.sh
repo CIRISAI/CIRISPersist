@@ -8,6 +8,11 @@
 # replaced by `ls *.whl | head -1` in a copy, and the copy must go RED on a
 # directory holding a 29.0.0 and a 53.1.8 wheel — the v53.1.8 tag run's shape.
 #
+# The second half drives scripts/build_manifest.sh (the sign + register logic
+# ci.yml's tag job and reregister-manifests.yml share) with a fake
+# ciris-build-sign: selection beside a stale wheel, the gate before signing,
+# the remediation reuse rule, the register argv and the read-back.
+#
 # Exit 0 every case as expected, 1 a case failed, 2 the harness could not run.
 set -uo pipefail
 cd "$(dirname "$0")/.." || exit 2
@@ -179,6 +184,78 @@ reg_row 1.10.0 "$T" "$(sha "$W2")"
 expect "prev: 2.0.0's prev is 1.10.0"     13 'registered for 1.10.0'         -- "$G/scripts/bits_changed.sh" 2.0.0 "$T" "$W2"
 reg_clear
 expect "prev: none below 1.0.0"           18 'no v-tag below 1.0.0'          -- "$G/scripts/bits_changed.sh" 1.0.0 "$T" "$W1"
+
+# ── scripts/build_manifest.sh: the sign logic both workflows call ───────────
+# A fake ciris-build-sign writes {target, binary_version, binary_hash} and logs
+# its argv, so the selection, the gate before signing and the reuse rule are
+# exercised without keys or a registry write.
+echo
+echo "build_manifest.sh witnesses (fake ciris-build-sign)"
+BM="$PWD/scripts/build_manifest.sh"
+cat >"$WORK/bin/ciris-build-sign" <<'SH'
+#!/usr/bin/env bash
+echo "$*" >>"$FAKE_SIGN_LOG"
+sub="$1"; shift
+[ "$sub" = sign ] || exit 0
+while [ $# -gt 0 ]; do
+  case "$1" in --binary) b="$2";; --target) t="$2";; --binary-version) v="$2";; --output) o="$2";; esac; shift
+done
+h=""; [ -n "${b:-}" ] && h="sha256:$(sha256sum "$b" | cut -d' ' -f1)"
+printf '{"target":"%s","binary_version":"%s","binary_hash":"%s"}\n' "$t" "$v" "$h" >"$o"
+SH
+chmod +x "$WORK/bin/ciris-build-sign"
+export PATH="$WORK/bin:$PATH" FAKE_SIGN_LOG="$WORK/sign.log"
+export CIRIS_BUILD_ED25519_SECRET=eA== CIRIS_BUILD_MLDSA_SECRET=eA== BITS_CHANGED_PREV="$PREV"
+WH="$WORK/wheels"
+declare -A LP=([linux-x86_64]=manylinux_2_34_x86_64 [linux-aarch64]=manylinux_2_34_aarch64 [darwin-aarch64]=macosx_11_0_arm64 [windows-x86_64]=win_amd64)
+for l in "${!LP[@]}"; do mkdir -p "$WH/ciris_persist-wheel-$l"; mkwheel "$WH/ciris_persist-wheel-$l/ciris_persist-$V-cp310-abi3-${LP[$l]}.whl" "$V" "${LP[$l]}"; done
+mkwheel "$WH/ciris_persist-wheel-linux-aarch64/$OLD" 29.0.0 "$PLAT"      # v53.1.8's stale neighbour
+echo '{}' >"$WORK/extras.json"
+hash_in() { python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["binary_hash"])' "$1"; }
+AARCH_SHA="sha256:$(sha "$WH/ciris_persist-wheel-linux-aarch64/$W")"
+
+expect "bm: tag mode signs 4 + source tree" 0 'signed aarch64-unknown-linux-gnu: '"$W" -- "$BM" sign --version "$V" --wheels "$WH" --out "$WORK/o1" --extras "$WORK/extras.json" --source-tree
+n=$((n + 1))
+if [ "$(hash_in "$WORK/o1/manifest-aarch64-unknown-linux-gnu.json")" = "$AARCH_SHA" ] && [ "$(wc -l <"$WORK/o1/signed-binary-targets.txt")" -eq 4 ] && [ -s "$WORK/o1/manifest-python-source-tree.json" ]; then
+  echo "  ok    bm: aarch64 manifest signs the $V wheel, 4 targets listed"
+else echo "  FAIL  bm: aarch64 manifest hash $(hash_in "$WORK/o1/manifest-aarch64-unknown-linux-gnu.json") != $AARCH_SHA, or targets/source tree missing"; fails=$((fails + 1)); fi
+
+# the gate runs before signing: a denylisted wheel is never signed
+printf '%s  29.0.0  x  t\n' "${AARCH_SHA#sha256:}" >"$WORK/deny-aarch.txt"
+expect "bm: denylisted wheel is not signed"  1 'bits_changed.sh refused aarch64-unknown-linux-gnu' -- env BITS_CHANGED_DENYLIST="$WORK/deny-aarch.txt" "$BM" sign --version "$V" --wheels "$WH" --out "$WORK/o2" --extras "$WORK/extras.json" --source-tree
+
+# remediation: re-sign two targets, reuse the other two + the source tree unchanged
+mkdir -p "$WORK/orig"; cp "$WORK/o1"/manifest-*.json "$WORK/extras.json" "$WORK/orig/"; mv "$WORK/orig/extras.json" "$WORK/orig/persist-extras-$V.json"
+: >"$FAKE_SIGN_LOG"
+expect "bm: remediation re-signs 2, reuses 2" 0 'reused x86_64-unknown-linux-gnu' -- "$BM" sign --version "$V" --wheels "$WH" --out "$WORK/o3" --reuse "$WORK/orig" --targets "aarch64-unknown-linux-gnu x86_64-pc-windows-msvc"
+n=$((n + 1))
+if [ "$(grep -c '^sign ' "$FAKE_SIGN_LOG")" -eq 2 ] && [ "$(wc -l <"$WORK/o3/signed-binary-targets.txt")" -eq 4 ] && cmp -s "$WORK/orig/manifest-python-source-tree.json" "$WORK/o3/manifest-python-source-tree.json"; then
+  echo "  ok    bm: exactly 2 signs; 4 binary targets + the source tree registered"
+else echo "  FAIL  bm: $(grep -c '^sign ' "$FAKE_SIGN_LOG") signs, $(wc -l <"$WORK/o3/signed-binary-targets.txt") targets"; fails=$((fails + 1)); fi
+printf '{"target":"x86_64-unknown-linux-gnu","binary_version":"%s","binary_hash":"sha256:%s"}\n' "$V" 51193a5afd0789337ca75b2704d413be720307134486242775540050f5cc4a0a >"$WORK/orig/manifest-x86_64-unknown-linux-gnu.json"
+expect "bm: a wrong reused row is refused"  1 'that row is wrong too' -- "$BM" sign --version "$V" --wheels "$WH" --out "$WORK/o4" --reuse "$WORK/orig" --targets "aarch64-unknown-linux-gnu x86_64-pc-windows-msvc"
+cp "$WORK/o1/manifest-x86_64-unknown-linux-gnu.json" "$WORK/orig/"
+rm -rf "$WH/ciris_persist-wheel-windows-x86_64"
+expect "bm: a named target with no wheel"   1 'no 53.1.8 wheel for named target x86_64-pc-windows-msvc' -- "$BM" sign --version "$V" --wheels "$WH" --out "$WORK/o5" --reuse "$WORK/orig" --targets "x86_64-pc-windows-msvc"
+
+# register posts every target in the out dir; --dry-run reaches the tool
+: >"$FAKE_SIGN_LOG"
+expect "bm: register --dry-run"             0 'nothing posted' -- "$BM" register --version "$V" --commit abc --out "$WORK/o3" --dry-run
+n=$((n + 1))
+if grep -q '^register --dry-run ' "$FAKE_SIGN_LOG" && [ "$(grep -o -- '--target ' "$FAKE_SIGN_LOG" | wc -l)" -eq 5 ]; then
+  echo "  ok    bm: register got --dry-run and 5 --target"
+else echo "  FAIL  bm: register argv: $(cat "$FAKE_SIGN_LOG")"; fails=$((fails + 1)); fi
+
+# after-publish reads every registered row back
+for t in aarch64-unknown-linux-gnu x86_64-unknown-linux-gnu aarch64-apple-darwin; do
+  reg_row "$V" "$t" "$(hash_in "$WORK/o1/manifest-$t.json" | sed 's/^sha256://')"
+done
+mkdir -p "$WH/ciris_persist-wheel-windows-x86_64"; mkwheel "$WH/ciris_persist-wheel-windows-x86_64/ciris_persist-$V-cp310-abi3-win_amd64.whl" "$V" win_amd64
+reg_row "$V" x86_64-pc-windows-msvc 8a1e5a8f53e102cb2604a36b7faf7266ad94fa920a8b9e808443a8b1cf60eb12
+expect "bm: after-publish finds a stale row" 1 'x86_64-pc-windows-msvc does not carry its wheel' -- "$BM" after-publish --version "$V" --wheels "$WH" --out "$WORK/o1"
+reg_row "$V" x86_64-pc-windows-msvc "$(sha "$WH/ciris_persist-wheel-windows-x86_64/ciris_persist-$V-cp310-abi3-win_amd64.whl")"
+expect "bm: after-publish all rows match"    0 'BITS CHANGED ok 53.1.8 x86_64-pc-windows-msvc' -- "$BM" after-publish --version "$V" --wheels "$WH" --out "$WORK/o1"
+reg_clear
 
 echo
 if [ "$fails" -eq 0 ]; then echo "bits_changed_test: $n/$n as expected"; exit 0; fi

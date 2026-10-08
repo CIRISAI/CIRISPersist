@@ -2114,47 +2114,14 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "ciris-persist version: $VERSION"
       - name: install ciris-build-sign v2.1.5 (prebuilt from CIRISVerify release)
-        # v1.1.2 — bumped from v2.0.5 to v2.1.5. The v2.1.x series is
-        # the CI-hardening arc (continue-on-error on cache, retry on
-        # network installs, macOS x86_64 shadow defang via cache-bin:
-        # false + bash shell on guards). v2.1.5 also includes everything
-        # the v2.0.x line shipped:
-        # - CanonicalBuild v2 with per-target rows (v2.0.3)
-        # - iOS hardware-marker self-heal (v2.0.4)
-        # - Mach-O __TEXT hash sign/runtime parity (v2.0.5)
-        # - the `register` subcommand (replaces the prior custom
-        #   curl POST to /v1/verify/binary-manifest).
-        #
-        # Prebuilt tarball is GitHub-hosted, served over TLS against
-        # CIRISAI/CIRISVerify. Cosign verification of the release
-        # asset is tracked separately (was task #81 under v1.8.0).
+        # v53.2.0 (#1029) — the sign/register logic lives once, in
+        # scripts/build_manifest.sh, shared with reregister-manifests.yml.
+        # History of these steps (v0.9.2 #42 multi-target, v1.1.2 tool v2.1.5,
+        # v1.6.0 retries, #809/#926 preflight gate) is in that script's header
+        # and in git log.
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          cd "$RUNNER_TEMP"
-          # v1.1.2 (CIRISVerify v2.1.1 CI hardening pattern): retry the
-          # `gh release download` to absorb GitHub API transient 5xx /
-          # network blip. Three attempts with backoff, then fail loud.
-          for attempt in 1 2 3; do
-            if gh release download v2.1.5 --repo CIRISAI/CIRISVerify \
-                --pattern 'ciris-verify-v2.1.5-build-tool-linux-x86_64.tar.gz'; then
-              break
-            fi
-            echo "::warning::gh release download attempt $attempt failed; retrying in $((attempt * 5))s"
-            sleep $((attempt * 5))
-            if [ "$attempt" = "3" ]; then
-              echo "::error::gh release download failed 3 times — investigate"
-              exit 1
-            fi
-          done
-          tar -xzf ciris-verify-v2.1.5-build-tool-linux-x86_64.tar.gz
-          # Tarball layout: build-tool/{ciris-build-sign,ciris-build-verify}
-          sudo install -m755 build-tool/ciris-build-sign /usr/local/bin/ciris-build-sign
-          sudo install -m755 build-tool/ciris-build-verify /usr/local/bin/ciris-build-verify
-          ciris-build-sign --version
-          # Self-contained Rust binary; only deps should be libc +
-          # libdl + libpthread.
-          ldd "$(command -v ciris-build-sign)" || true
+        run: scripts/build_manifest.sh install
       # v16.0.0 (CIRISPersist#400) — warm the compile before the emit step:
       # this job previously COLD-compiled persist + the whole verify crypto
       # graph in release, for a JSON blob whose content (migration-set hash +
@@ -2212,338 +2179,52 @@ jobs:
           done
           ls -la dist/wheels/
       - name: sign multi-target manifests (CanonicalBuild v2)
-        # v0.9.2 — replaces the single-target sign of v0.9.1. Four
-        # manifests get produced:
-        #
-        # 1. `python-source-tree` — file-tree hash of `python/ciris_persist/`
-        #    (the Python wrappers + .pyi stubs that travel to every
-        #    consumer regardless of platform). This is what an agent
-        #    running on iOS / Android verifies against — they don't
-        #    pip-install (no wheels exist for those platforms); they
-        #    embed the Python sources via PyOxidizer / Buildozer /
-        #    similar and rebuild persist's Rust from source. The
-        #    source-tree hash covers the Python half; the rebuilt
-        #    Rust half is covered by the agent's own build chain.
-        # 2-4. Three binary manifests (one per published wheel arch):
-        #    `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`,
-        #    `aarch64-apple-darwin`. Each carries `binary_hash =
-        #    sha256(wheel.whl)` so a pip-installed deployment can
-        #    verify the on-disk wheel against the registered manifest.
-        #
-        # All four are signed with the SAME hybrid Ed25519 + ML-DSA-65
-        # keypair; `ciris-build-sign register` (next step) packs all
-        # four into a single `builds` row with per-target
-        # `binary_manifests` rows hanging off it.
+        # Five manifests, one hybrid Ed25519 + ML-DSA-65 key: `python-source-tree`
+        # (FileTreeExtras over python/ciris_persist, what iOS / Android agent
+        # rebuilds verify against) and one binary manifest per published wheel
+        # (`binary_hash = sha256(wheel)`). v53.2.0 (#1028/#1029): exactly ONE
+        # `ciris_persist-<v>-*.whl` per target, and scripts/bits_changed.sh
+        # checks 1-4 pass before each sign — v53.1.8 signed a v29.0.0 wheel.
         env:
           CIRIS_BUILD_ED25519_SECRET: ${{ secrets.CIRIS_BUILD_ED25519_SECRET }}
           CIRIS_BUILD_MLDSA_SECRET: ${{ secrets.CIRIS_BUILD_MLDSA_SECRET }}
-          # bits_changed.sh reads the registry this job writes to.
-          BITS_CHANGED_REGISTRY_BASE: ${{ vars.REGISTRY_URL || 'https://api.registry.ciris-services-1.ai' }}
-        run: |
-          if [ -z "${CIRIS_BUILD_ED25519_SECRET}" ] || [ -z "${CIRIS_BUILD_MLDSA_SECRET}" ]; then
-            echo "::error::Hybrid signing secrets not configured."
-            echo "::error::Set CIRIS_BUILD_ED25519_SECRET and CIRIS_BUILD_MLDSA_SECRET."
-            echo "::error::See docs/BUILD_SIGNING.md for ciris-build-sign generate-keys + secret upload."
-            exit 1
-          fi
-          umask 077
-          ED_KEY_PATH=$(mktemp)
-          MLDSA_KEY_PATH=$(mktemp)
-          printf '%s' "${CIRIS_BUILD_ED25519_SECRET}" | base64 -d > "$ED_KEY_PATH"
-          printf '%s' "${CIRIS_BUILD_MLDSA_SECRET}" | base64 -d > "$MLDSA_KEY_PATH"
-
-          VERSION="${{ steps.version.outputs.version }}"
-          EXTRAS="dist/persist-extras-${VERSION}.json"
-          KEY_ID="ciris-persist-build-v1"
-
-          # Target 1: python-source-tree. Walks `python/ciris_persist/`,
-          # hashes every .py + .pyi file. Excludes __pycache__,
-          # .pyc/.pyo (bytecode), .so/.dylib/.dll (compiled native
-          # libs — those are covered by the per-arch binary
-          # manifests below, not the source tree). `--tree` mode
-          # produces FileTreeExtras automatically, so we don't pass
-          # `--extras` (mutually exclusive with `--tree`).
-          ciris-build-sign sign \
-            --primitive persist \
-            --build-id "$VERSION" \
-            --target python-source-tree \
-            --tree python/ \
-            --tree-include ciris_persist \
-            --tree-exempt-dir __pycache__ \
-            --tree-exempt-ext pyc pyo so dylib dll \
-            --binary-version "$VERSION" \
-            --ed25519-seed "$ED_KEY_PATH" \
-            --mldsa-secret "$MLDSA_KEY_PATH" \
-            --key-id "$KEY_ID" \
-            --output "dist/manifest-python-source-tree.json"
-
-          # Targets 2-4: per-wheel binary manifests. Loop over the
-          # download-artifact subdirs the matrix produced; sign each
-          # wheel's sha256 as `target: TRIPLE`. Missing wheels (e.g.
-          # one matrix entry failed) get a warning rather than a
-          # hard error — the register step below will still ship
-          # the targets that DID sign.
-          declare -A WHEEL_TARGET=(
-            ["ciris_persist-wheel-linux-x86_64"]="x86_64-unknown-linux-gnu"
-            ["ciris_persist-wheel-linux-aarch64"]="aarch64-unknown-linux-gnu"
-            ["ciris_persist-wheel-darwin-aarch64"]="aarch64-apple-darwin"
-            # windows-x86_64 wheel signs under the standard windows triple
-            # (win7 support dropped).
-            ["ciris_persist-wheel-windows-x86_64"]="x86_64-pc-windows-msvc"
-          )
-          SIGNED_BINARY_TARGETS=()
-          for ARTDIR in "${!WHEEL_TARGET[@]}"; do
-            TARGET="${WHEEL_TARGET[$ARTDIR]}"
-            # v53.2.0 (#1028) — THIS version's wheel, exactly one. `*.whl | head
-            # -1` signed a stale 29.0.0 wheel for v53.1.8 (see maturin build).
-            shopt -s nullglob
-            CANDIDATES=(dist/wheels/${ARTDIR}/ciris_persist-${VERSION}-*.whl)
-            shopt -u nullglob
-            if [ "${#CANDIDATES[@]}" -eq 0 ]; then
-              echo "::warning::No ${VERSION} wheel found for ${TARGET} (artifact ${ARTDIR}); skipping"
-              continue
-            fi
-            if [ "${#CANDIDATES[@]}" -ne 1 ]; then
-              echo "::error::${#CANDIDATES[@]} ${VERSION} wheels in ${ARTDIR}: ${CANDIDATES[*]}"
-              exit 1
-            fi
-            WHEEL="${CANDIDATES[0]}"
-            # v53.2.0 (#1029) — did the bits change? One wheel for the target,
-            # its own METADATA Version and WHEEL Tag, not the previous
-            # release's registered hash, not a known stale hash. Refuse to sign
-            # otherwise: the v53.1.8 rows signed v29 bytes under 53.1.8.
-            scripts/bits_changed.sh "$VERSION" "$TARGET" "dist/wheels/${ARTDIR}" \
-              || { echo "::error::bits_changed.sh refused ${TARGET} (exit $?); not signing"; exit 1; }
-            ciris-build-sign sign \
-              --primitive persist \
-              --build-id "$VERSION" \
-              --target "$TARGET" \
-              --binary "$WHEEL" \
-              --binary-version "$VERSION" \
-              --extras "$EXTRAS" \
-              --ed25519-seed "$ED_KEY_PATH" \
-              --mldsa-secret "$MLDSA_KEY_PATH" \
-              --key-id "$KEY_ID" \
-              --output "dist/manifest-${TARGET}.json"
-            SIGNED_BINARY_TARGETS+=("${TARGET}")
-            echo "✓ signed ${TARGET}: $(basename "${WHEEL}")"
-          done
-          # Wipe key files immediately after signing.
-          shred -uz "$ED_KEY_PATH" "$MLDSA_KEY_PATH" 2>/dev/null || rm -f "$ED_KEY_PATH" "$MLDSA_KEY_PATH"
-
-          echo "Multi-target manifests produced:"
-          ls -la dist/manifest-*.json
-          # Stash the list for the register step.
-          printf '%s\n' "${SIGNED_BINARY_TARGETS[@]}" > dist/signed-binary-targets.txt
-      - name: pre-flight registry trust-root check
-        # CIRISPersist#809 — restored as a GATE in v50.0.0 (operator ruling
-        # on CIRISPersist#926, 2026-09-27). The logic lives in
-        # scripts/preflight_trust_root.py so it can be fault-injected: the
-        # self-test runs FIRST, every time, so a guard that has quietly
-        # stopped refusing reds this step instead of passing it
-        # (`authorizations: []` against `quorum:2/3` must exit 1 — the
-        # fixture #809 named as the one to re-run when restoring the gate).
-        #
-        # WHAT THIS GATES
-        # * NEW `bundle` shape -> GATED: `consensus_protocol` parses as
-        #   quorum:M/N (unparseable is refused, never guessed) and the
-        #   DISTINCT authorizing holders named in the bundle's own `holders`
-        #   reach M. It counts; it does not verify signatures (an
-        #   unauthenticated CI read) — `verify_bundle_quorum` is the
-        #   cryptographic gate every consumer runs.
-        # * OLD `stewards` shape -> gated on a deployed steward, unchanged.
-        # * UNRECOGNISED shape / unreachable / not JSON -> FAILS CLOSED.
-        #
-        # Reported, not gated: `served_by.accepts_this_root` (informational —
-        # the outer envelope is unsigned by design) and the #926
-        # `ciris-canonical` community row beside the bundle (the registry
-        # route does not serve it yet).
-        env:
           REGISTRY_URL: ${{ vars.REGISTRY_URL }}
         run: |
-          python3 scripts/preflight_trust_root.py --self-test
-          if [ -z "${REGISTRY_URL}" ]; then
-            REGISTRY_URL="https://api.registry.ciris-services-1.ai"
-            echo "::warning::REGISTRY_URL repo variable unset; defaulting to ${REGISTRY_URL}"
-          fi
-          echo "Registry trust-root snapshot for ${REGISTRY_URL}:"
-          curl -sf "${REGISTRY_URL}/v1/steward-key" | tee dist/steward-key.json | python3 -m json.tool
-          python3 scripts/preflight_trust_root.py dist/steward-key.json >> "$GITHUB_STEP_SUMMARY"
+          VERSION="${{ steps.version.outputs.version }}"
+          scripts/build_manifest.sh sign --version "$VERSION" --wheels dist/wheels --out dist \
+            --extras "dist/persist-extras-${VERSION}.json" --source-tree
+      - name: pre-flight registry trust-root check
+        # CIRISPersist#809 — a GATE since v50.0.0 (ruling on #926). The self-test
+        # runs first, so a guard that stopped refusing reds instead of passing.
+        # Gated: the bundle's consensus_protocol quorum (or a deployed steward on
+        # the old shape); unrecognised / unreachable / not JSON fails closed.
+        env:
+          REGISTRY_URL: ${{ vars.REGISTRY_URL }}
+        run: scripts/build_manifest.sh preflight --out dist
       - name: register multi-target build with CIRISRegistry
-        # v0.9.2 (CIRISPersist#42) — replaces the prior custom
-        # curl POST to /v1/verify/binary-manifest with the
-        # `ciris-build-sign register` subcommand from CIRISVerify
-        # v2.1.5. The subcommand:
-        # - Reads each per-target manifest produced above.
-        # - Signs a CanonicalBuild v2 `builds` parent row over all
-        #   the per-target manifest hashes.
-        # - POSTs the `builds` row plus, per target, the
-        #   `binary_manifests` (binary mode) or `function_manifests`
-        #   (file-tree mode) rows.
-        # - Writes to /v1/builds (the new endpoint), making
-        #   `GET /v1/builds/<v>?project=ciris-persist` return the
-        #   row for downstream `verify_tree(project="ciris-persist")`.
-        #
-        # The Authorization header is read from the
-        # REGISTRY_ADMIN_TOKEN env var directly by the binary.
+        # `ciris-build-sign register`: per target a `builds` row (POST /v1/builds)
+        # and a build-manifest row (POST /v1/verify/build-manifest), plus the one
+        # binary_manifests map. REGISTRY_ADMIN_TOKEN is read by the binary.
         env:
           REGISTRY_URL: ${{ vars.REGISTRY_URL }}
           REGISTRY_ADMIN_TOKEN: ${{ secrets.REGISTRY_ADMIN_TOKEN }}
           CIRIS_BUILD_ED25519_SECRET: ${{ secrets.CIRIS_BUILD_ED25519_SECRET }}
           CIRIS_BUILD_MLDSA_SECRET: ${{ secrets.CIRIS_BUILD_MLDSA_SECRET }}
         run: |
-          if [ -z "${REGISTRY_URL}" ]; then
-            REGISTRY_URL="https://api.registry.ciris-services-1.ai"
-          fi
-          if [ -z "${REGISTRY_ADMIN_TOKEN}" ]; then
-            echo "::error::REGISTRY_ADMIN_TOKEN repo secret not configured."
-            echo "::error::Ask the bridge / registry team to issue + upload the persist build identity's admin token."
-            exit 1
-          fi
-          if [ -z "${CIRIS_BUILD_ED25519_SECRET}" ] || [ -z "${CIRIS_BUILD_MLDSA_SECRET}" ]; then
-            echo "::error::Hybrid signing secrets not configured for register step."
-            exit 1
-          fi
-
-          # Re-materialize the key files (sign step wiped them).
-          # register signs the `builds` row's CanonicalBuild over
-          # the aggregated per-target manifest hashes.
-          umask 077
-          ED_KEY_PATH=$(mktemp)
-          MLDSA_KEY_PATH=$(mktemp)
-          printf '%s' "${CIRIS_BUILD_ED25519_SECRET}" | base64 -d > "$ED_KEY_PATH"
-          printf '%s' "${CIRIS_BUILD_MLDSA_SECRET}" | base64 -d > "$MLDSA_KEY_PATH"
-
-          VERSION="${{ steps.version.outputs.version }}"
-
-          # Build the --target flag list. Source-tree is always
-          # present (we just signed it above); binary targets come
-          # from the SIGNED_BINARY_TARGETS list the sign step
-          # produced.
-          TARGET_ARGS=(
-            "--target" "python-source-tree:dist/manifest-python-source-tree.json"
-          )
-          while IFS= read -r TARGET; do
-            [ -z "$TARGET" ] && continue
-            TARGET_ARGS+=("--target" "${TARGET}:dist/manifest-${TARGET}.json")
-          done < dist/signed-binary-targets.txt
-
-          echo "Registering ${#TARGET_ARGS[@]} target args (count includes --target prefix)"
-          echo "Targets to register:"
-          printf '  %s\n' "${TARGET_ARGS[@]}"
-
-          ciris-build-sign register \
-            --registry-url "${REGISTRY_URL}" \
-            --project ciris-persist \
-            --binary-version "$VERSION" \
-            --build-id "${{ github.sha }}" \
-            --source-repo "https://github.com/CIRISAI/CIRISPersist" \
-            --source-commit "${{ github.sha }}" \
-            --notes "CIRIS federation persist substrate; CanonicalBuild v2 multi-target via ciris-build-sign v2.1.5 (CIRISPersist#42). Targets: python-source-tree + per-wheel binary manifests." \
-            --ed25519-seed "$ED_KEY_PATH" \
-            --mldsa-secret "$MLDSA_KEY_PATH" \
-            --key-id ciris-persist-build-v1 \
-            "${TARGET_ARGS[@]}"
-
-          # Wipe key files immediately after register.
-          shred -uz "$ED_KEY_PATH" "$MLDSA_KEY_PATH" 2>/dev/null || rm -f "$ED_KEY_PATH" "$MLDSA_KEY_PATH"
-          echo "✓ Multi-target build registered with CIRISRegistry"
+          scripts/build_manifest.sh register --version "${{ steps.version.outputs.version }}" \
+            --commit "${{ github.sha }}" --out dist
       - name: round-trip verify GET /v1/builds/{version}
-        # v0.9.2 — endpoint moved from /v1/verify/binary-manifest
-        # to /v1/builds/<v>?project=ciris-persist per CanonicalBuild
-        # v2 (CIRISVerify v2.0.3+). Confirms:
-        # 1. The `builds` parent row exists.
-        # 2. Per-target manifests are queryable via
-        #    `?target=<name>`.
-        # 3. Each target's manifest_hash matches the local sha256
-        #    of the manifest file we signed.
         env:
           REGISTRY_URL: ${{ vars.REGISTRY_URL }}
-        run: |
-          if [ -z "${REGISTRY_URL}" ]; then
-            REGISTRY_URL="https://api.registry.ciris-services-1.ai"
-          fi
-          VERSION="${{ steps.version.outputs.version }}"
-
-          # Step 1: parent row exists.
-          echo "GET ${REGISTRY_URL}/v1/builds/${VERSION}?project=ciris-persist"
-          HTTP_CODE=$(curl -sS -o dist/round-trip-build.json -w "%{http_code}" \
-            "${REGISTRY_URL}/v1/builds/${VERSION}?project=ciris-persist")
-          echo "HTTP ${HTTP_CODE}"
-          if [ "${HTTP_CODE}" != "200" ]; then
-            echo "::error::GET /v1/builds returned ${HTTP_CODE} — registration didn't land or the public endpoint is rejecting project=ciris-persist"
-            cat dist/round-trip-build.json
-            exit 1
-          fi
-          cat dist/round-trip-build.json | python3 -m json.tool
-
-          # Step 2: each per-target manifest is queryable. Build
-          # the target list from the manifests we just signed.
-          TARGETS=("python-source-tree")
-          while IFS= read -r T; do
-            [ -z "$T" ] && continue
-            TARGETS+=("$T")
-          done < dist/signed-binary-targets.txt
-
-          ALL_OK=1
-          for TARGET in "${TARGETS[@]}"; do
-            echo ""
-            echo "GET ${REGISTRY_URL}/v1/builds/${VERSION}?project=ciris-persist&target=${TARGET}"
-            HTTP_CODE=$(curl -sS -o "dist/round-trip-${TARGET}.json" -w "%{http_code}" \
-              "${REGISTRY_URL}/v1/builds/${VERSION}?project=ciris-persist&target=${TARGET}")
-            echo "  HTTP ${HTTP_CODE}"
-            if [ "${HTTP_CODE}" != "200" ]; then
-              echo "::error::Per-target GET for ${TARGET} returned ${HTTP_CODE}"
-              ALL_OK=0
-              continue
-            fi
-            # Local manifest sha256 — should match what the
-            # registry stored as `manifest_hash`.
-            LOCAL_SHA="$(sha256sum "dist/manifest-${TARGET}.json" | cut -d' ' -f1)"
-            echo "  local manifest sha256: ${LOCAL_SHA}"
-            echo "  registry response (truncated):"
-            python3 -c "
-          import json
-          d = json.load(open('dist/round-trip-${TARGET}.json'))
-          # Surface the manifest_hash if the registry returns it
-          # in a known location. Shape may vary by endpoint version;
-          # log whatever's there for diagnostic visibility.
-          h = d.get('manifest_hash') or d.get('manifest', {}).get('manifest_hash')
-          print(f'  registry manifest_hash: {h}')" || true
-          done
-
-          if [ "${ALL_OK}" != "1" ]; then
-            echo "::error::One or more per-target round-trip GETs failed"
-            exit 1
-          fi
-
-          {
-            echo "## Registry round-trip"
-            echo ""
-            echo "- registry: \`${REGISTRY_URL}\`"
-            echo "- version: \`${VERSION}\`"
-            echo "- endpoint: \`GET /v1/builds/<v>?project=ciris-persist\`"
-            echo "- targets verified:"
-            for T in "${TARGETS[@]}"; do echo "  - \`${T}\`"; done
-          } >> "$GITHUB_STEP_SUMMARY"
+        run: scripts/build_manifest.sh roundtrip --version "${{ steps.version.outputs.version }}" --out dist
       - name: bits-changed check 5 — each registered row carries this run's wheel
         # v53.2.0 (#1029) — the registry upserts in place, so read back what it
         # now serves for (version, target) and compare with the wheel we signed.
         env:
-          BITS_CHANGED_REGISTRY_BASE: ${{ vars.REGISTRY_URL || 'https://api.registry.ciris-services-1.ai' }}
+          REGISTRY_URL: ${{ vars.REGISTRY_URL }}
         run: |
-          VERSION="${{ steps.version.outputs.version }}"
-          declare -A ARTDIR_OF=(
-            ["x86_64-unknown-linux-gnu"]="ciris_persist-wheel-linux-x86_64"
-            ["aarch64-unknown-linux-gnu"]="ciris_persist-wheel-linux-aarch64"
-            ["aarch64-apple-darwin"]="ciris_persist-wheel-darwin-aarch64"
-            ["x86_64-pc-windows-msvc"]="ciris_persist-wheel-windows-x86_64"
-          )
-          while IFS= read -r TARGET; do
-            [ -z "$TARGET" ] && continue
-            scripts/bits_changed.sh --after-publish "$VERSION" "$TARGET" "dist/wheels/${ARTDIR_OF[$TARGET]}" \
-              || { echo "::error::registered row for ${VERSION}/${TARGET} does not carry this run's wheel"; exit 1; }
-          done < dist/signed-binary-targets.txt
+          scripts/build_manifest.sh after-publish --version "${{ steps.version.outputs.version }}" \
+            --wheels dist/wheels --out dist
       - uses: actions/upload-artifact@v7
         with:
           name: ciris-persist-build-manifest-${{ steps.version.outputs.version }}

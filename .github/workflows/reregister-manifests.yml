@@ -1,0 +1,180 @@
+# Re-register CanonicalBuild manifests for released (version, target) pairs
+# whose registered row is wrong (CIRISPersist#1029: through v53.1.8 the tag job
+# signed a cache-restored v29.0.0 wheel for aarch64-unknown-linux-gnu and
+# x86_64-pc-windows-msvc).
+#
+# Per version, this:
+#   1. refuses unless evidence/manifest_remediation/<v>/<t>.function.json is
+#      committed at this ref for every target (scripts/snapshot_manifests.sh;
+#      the registry upserts with no history, CIRISRegistry#144), and unless the
+#      live row still carries that snapshot's binary_hash;
+#   2. finds the tag run by its `ciris-persist-build-manifest-<v>` artifact and
+#      downloads that artifact (the PersistExtras the release signed with, and
+#      the manifests of the targets that were right) plus the run's wheels.
+#      The wheels are tag-run artifacts: PyPI publishing stopped at 22.0.1
+#      (#615) and no release asset carries them. GitHub keeps run artifacts
+#      90 days; an expired run is refused, never rebuilt;
+#   3. runs scripts/build_manifest.sh — the same sign / preflight / register /
+#      roundtrip / read-back steps ci.yml's tag job runs. The named targets are
+#      re-signed after scripts/bits_changed.sh checks 1-4 (PREVIOUS_VERSION =
+#      the v-tag below <v>); every other target is re-posted unchanged after
+#      its manifest's binary_hash is checked against its wheel, because
+#      `register` writes one binary_manifests map per version and a partial
+#      re-post would drop the rest. Rows go through POST /v1/verify/build-manifest
+#      and POST /v1/builds, never the legacy function-manifest path;
+#   4. reads every registered row back (bits_changed.sh --after-publish).
+#
+# Secrets: the tag job's (CIRIS_BUILD_ED25519_SECRET, CIRIS_BUILD_MLDSA_SECRET,
+# REGISTRY_ADMIN_TOKEN). None is added. `dry_run: true` stops at
+# `ciris-build-sign register --dry-run` and posts nothing.
+name: Re-register manifests
+
+on:
+  workflow_dispatch:
+    inputs:
+      versions:
+        description: "Space-separated release versions to re-register (e.g. '53.1.8 53.1.7')"
+        required: true
+        type: string
+      targets:
+        description: "Space-separated targets whose manifest is wrong (re-signed); others are re-posted unchanged"
+        required: true
+        default: "aarch64-unknown-linux-gnu x86_64-pc-windows-msvc"
+        type: string
+      dry_run:
+        description: "Stop at register --dry-run (nothing posted)"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: reregister-manifests
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    name: plan (validate inputs)
+    runs-on: ubuntu-latest
+    outputs:
+      versions: ${{ steps.p.outputs.versions }}
+    steps:
+      - id: p
+        env:
+          VERSIONS: ${{ inputs.versions }}
+          TARGETS: ${{ inputs.targets }}
+        run: |
+          for v in $VERSIONS; do
+            [[ "$v" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::not a version: $v"; exit 1; }
+          done
+          for t in $TARGETS; do
+            case "$t" in
+              x86_64-unknown-linux-gnu|aarch64-unknown-linux-gnu|aarch64-apple-darwin|x86_64-pc-windows-msvc) ;;
+              *) echo "::error::not a wheel target: $t"; exit 1;;
+            esac
+          done
+          if [ -z "$VERSIONS" ] || [ -z "$TARGETS" ]; then echo "::error::versions and targets are required"; exit 1; fi
+          read -ra vs <<<"$VERSIONS"
+          json=$(printf '%s\n' "${vs[@]}" | sed 's/^v//' | python3 -c 'import json,sys; print(json.dumps([l.strip() for l in sys.stdin if l.strip()]))')
+          echo "versions=$json" >> "$GITHUB_OUTPUT"
+          echo "versions: $json; targets: $TARGETS; dry_run: ${{ inputs.dry_run }}"
+
+  reregister:
+    name: re-register ${{ matrix.version }}
+    needs: plan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read   # find + download the tag run's artifacts
+    strategy:
+      # One version at a time: the registry rate-limits (429, Retry-After 60).
+      max-parallel: 1
+      fail-fast: false
+      matrix:
+        version: ${{ fromJSON(needs.plan.outputs.versions) }}
+    env:
+      V: ${{ matrix.version }}
+      TARGETS: ${{ inputs.targets }}
+      REGISTRY_URL: ${{ vars.REGISTRY_URL }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0   # the v-tags: bits_changed.sh's PREVIOUS_VERSION and the tag commit
+
+      - name: snapshot before overwrite (committed, and still the live row)
+        run: |
+          REG="${REGISTRY_URL:-https://api.registry.ciris-services-1.ai}"
+          git rev-parse -q --verify "refs/tags/v$V" >/dev/null || { echo "::error::no tag v$V"; exit 1; }
+          for t in $TARGETS; do
+            snap="evidence/manifest_remediation/$V/$t.function.json"
+            [ -s "$snap" ] || { echo "::error::$snap is not committed at ${GITHUB_SHA}: run scripts/snapshot_manifests.sh $V $t and commit it first"; exit 1; }
+            want=$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["binary_hash"])' "$snap")
+            code=$(curl -sS -o live.json -w '%{http_code}' --retry 4 --retry-delay 60 \
+              "$REG/v1/verify/function-manifest/$V/$t?project=ciris-persist")
+            [ "$code" = 200 ] || { echo "::error::live row $V/$t: HTTP $code"; exit 1; }
+            have=$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["binary_hash"])' live.json)
+            [ "$have" = "$want" ] || { echo "::error::live row $V/$t carries $have, the snapshot $want: the snapshot is not the row being overwritten"; exit 1; }
+            echo "✓ $V/$t: snapshot committed and live ($want)"
+          done
+          rm -f live.json
+
+      - name: find the tag run and download its manifests and wheels
+        run: |
+          art=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?name=ciris-persist-build-manifest-$V&per_page=100" \
+            --jq "[.artifacts[] | select(.expired == false and .workflow_run.head_branch == \"v$V\")] | sort_by(.created_at) | last // empty")
+          [ -n "$art" ] || { echo "::error::no unexpired ciris-persist-build-manifest-$V artifact from a v$V run (expired after 90 days, or the tag run never signed)"; exit 1; }
+          RUN_ID=$(jq -r '.workflow_run.id' <<<"$art")
+          echo "tag run: $RUN_ID"
+          for attempt in 1 2 3 4 5; do
+            rm -rf dist; mkdir -p dist/orig dist/wheels
+            gh run download "$RUN_ID" -R "$GITHUB_REPOSITORY" -n "ciris-persist-build-manifest-$V" -D dist/orig \
+              && gh run download "$RUN_ID" -R "$GITHUB_REPOSITORY" -p 'ciris_persist-wheel-*' -D dist/wheels && break
+            [ "$attempt" = 5 ] && { echo "::error::artifact download failed 5 times"; exit 1; }
+            sleep $((attempt * 10))
+          done
+          ls -laR dist/orig dist/wheels
+          sha256sum dist/wheels/*/*.whl
+          [ -s "dist/orig/persist-extras-$V.json" ] || { echo "::error::the tag run's PersistExtras is missing"; exit 1; }
+
+      - name: install ciris-build-sign v2.1.5
+        run: scripts/build_manifest.sh install
+
+      - name: re-sign the named targets (bits_changed.sh 1-4 first); reuse the rest
+        env:
+          CIRIS_BUILD_ED25519_SECRET: ${{ secrets.CIRIS_BUILD_ED25519_SECRET }}
+          CIRIS_BUILD_MLDSA_SECRET: ${{ secrets.CIRIS_BUILD_MLDSA_SECRET }}
+        run: scripts/build_manifest.sh sign --version "$V" --wheels dist/wheels --out dist/out --reuse dist/orig --targets "$TARGETS"
+
+      - name: pre-flight registry trust-root check
+        run: scripts/build_manifest.sh preflight --out dist/out
+
+      - name: register (POST /v1/builds + /v1/verify/build-manifest)
+        env:
+          REGISTRY_ADMIN_TOKEN: ${{ secrets.REGISTRY_ADMIN_TOKEN }}
+          CIRIS_BUILD_ED25519_SECRET: ${{ secrets.CIRIS_BUILD_ED25519_SECRET }}
+          CIRIS_BUILD_MLDSA_SECRET: ${{ secrets.CIRIS_BUILD_MLDSA_SECRET }}
+          DRY: ${{ inputs.dry_run }}
+        run: |
+          COMMIT=$(git rev-list -n1 "v$V")
+          args=(); [ "$DRY" = true ] && args=(--dry-run)
+          scripts/build_manifest.sh register "${args[@]}" --version "$V" --commit "$COMMIT" --out dist/out \
+            --notes "CIRIS federation persist substrate; CanonicalBuild v2 via ciris-build-sign v2.1.5. Re-registered by reregister-manifests.yml run ${GITHUB_RUN_ID} (CIRISPersist#1029): re-signed [$TARGETS] from the v$V tag run's wheels; superseded rows are in evidence/manifest_remediation/$V/."
+
+      - name: round-trip GET /v1/builds/{version}
+        if: ${{ !inputs.dry_run }}
+        run: scripts/build_manifest.sh roundtrip --version "$V" --out dist/out
+
+      - name: bits-changed check 5 — every registered row carries its wheel
+        if: ${{ !inputs.dry_run }}
+        run: scripts/build_manifest.sh after-publish --version "$V" --wheels dist/wheels --out dist/out
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: reregistered-manifests-${{ matrix.version }}
+          path: |
+            dist/out/
+            evidence/manifest_remediation/${{ matrix.version }}/

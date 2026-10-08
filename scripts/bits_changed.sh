@@ -23,8 +23,9 @@
 #
 #   --after-publish             run 1, 2, 5 instead of 1-4
 #   --attestation-digest <hex>  also assert sha256(wheel) == <hex>
-#   --prev <version>            previous release (default: newest v-tag below
-#                               <version>, from `git tag`, else `git ls-remote`)
+#   --prev <version>            previous release (default: $BITS_CHANGED_PREV, else
+#                               the newest v-tag below <version>, from `git tag`,
+#                               else `git ls-remote`)
 #   --sha256 <hex> --filename <name>
 #                               judge a published file by its digest (PyPI
 #                               lists one per file) without the bytes: check 1
@@ -51,7 +52,7 @@ set -uo pipefail
 usage() { sed -n '2,/^set -uo/p' "$0" | sed 's/^# \{0,1\}//; /^set -uo/d' >&2; exit 2; }
 die() { local code="$1"; shift; echo "FAIL  $*"; exit "$code"; }
 
-after_publish=0; att=""; prev=""; given_sha=""; given_name=""; pos=()
+after_publish=0; att=""; prev="${BITS_CHANGED_PREV:-}"; given_sha=""; given_name=""; pos=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --after-publish) after_publish=1; shift;;
