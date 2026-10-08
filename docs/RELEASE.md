@@ -36,6 +36,12 @@ Then run `release_finish.sh`. It checks that the run id is this tag's CI push ru
 
 The tag run and main's push run on the merge commit share one concurrency group (#397, keyed on the SHA, `cancel-in-progress`), so whichever run is queued later cancels the other. In v50.0.0 the two were queued in the same second, main's came second, and it cancelled the tag run, which is the one that publishes. v51 then waited for main's run to complete, which cost 64–65 min per release. Waiting only until main's run is visible makes the tag run the newer one, so it cancels main's run. `release_finish.sh` re-runs a cancelled tag run as a backstop.
 
+### Main's run after a tree-equal merge
+
+On a push to main, CI's `tree equality (main merges only)` job skips the whole run when the merge tree equals a PR head whose CI passed. Tag runs are never skipped. `release_ship.sh` treats any visible main run as the signal to push the tag, including one that already completed with most jobs skipped. When the trees differ, the full main run happens and ship waits for it to succeed.
+
+`scripts/certify.sh prebuild` compiles every certify leg (`nextest --no-run`), both clippy invocations and the dev wheel, under the same RUSTFLAGS, and runs no tests. It exits 0, 1 or 3 like `full`. It can be run by hand before `release.sh` to warm the cache. `release.sh` does not call it.
+
 ### Why there are two commands
 
 v53.1.8's ship script was killed at the harness's 2-hour background cap while tag CI queued on macOS. `release.sh` ends at the tag push. `release_finish.sh` is a separate, re-runnable command, so each half fits under the cap. If either one is killed, run the same command again.
@@ -64,11 +70,12 @@ PR CI after a failure: `auto-retry.yml` re-runs a first-attempt failure that has
 | 21 | release.sh | a cheap leg is red; the log is `.release/<v>/cheap-<leg>.log` | fix, commit, re-run |
 | 22 | release.sh | bump: version not rewritten, re-stamp count mismatch, `cargo check` or the evidence test red, or a hook refused the commit | read the log. If the tree is left dirty, `git checkout -- Cargo.toml Cargo.lock CHANGELOG.md evidence/cc_impl.tsv` and re-run |
 | 23 | release.sh | the push (pre-push hook) or PR creation failed | read the hook output, fix, commit, re-run |
-| 24 | release.sh | certify not green; the log is `.release/<v>/certify.log` | an `INFRA` (SIGKILL) leg is the machine, not the tree: re-run with fewer lanes. A `RED` leg: fix, commit, re-run |
+| 24 | release.sh | certify has a RED leg (exit 1); the log is `.release/<v>/certify.log` | fix, commit, re-run |
 | 25 | release.sh | PR CI red after any auto-retry | read the run. For a real red, fix, commit and re-run. For a flake, root-cause it (no nextest retries) |
 | 26 | release.sh | PR CI did not finish within `PRCI_TIMEOUT_MIN` | re-run to keep waiting |
 | 27 | release.sh | `release_ship.sh` failed; its own code is printed and logged in `.release/<v>/ship.log` | see the ship codes below, then re-run `release.sh`. Ship accepts an already-merged PR and an already-cut or pushed tag |
 | 28 | release.sh | the tree is dirty mid-release | commit or stash, re-run |
+| 29 | release.sh | certify exited 3 (INFRA): no leg is RED, but a leg was lost to the machine (disk floor `CERTIFY_MIN_FREE_GB`, a signal, an empty `.rc`, or a leg that never ran). The tree is unjudged | free disk or RAM (or lower `LANES`) and re-run. `scripts/certify.sh verdict` re-prints the table from the existing logs |
 | 3 | release_ship.sh | the PR head moved, or PR CI is not green | the head moved: let `release.sh` re-certify it |
 | 4 | release_ship.sh | the merge failed after 5 attempts | check the PR's mergeability |
 | 5, 6 | release_ship.sh | main CI red, or it timed out (only when the merge tree differs from the PR head tree) | something landed on main in between. Investigate before tagging |

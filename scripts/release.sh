@@ -28,7 +28,8 @@
 #
 # Exit codes: 2 usage · 20 preflight · 21 cheap leg red · 22 bump · 23 push/PR ·
 # 24 certify red · 25 PR CI red · 26 PR CI timeout · 27 ship (its own code is
-# printed) · 28 tree dirty mid-release. Each prints one line saying why.
+# printed) · 28 tree dirty mid-release · 29 certify INFRA (no leg red, a leg
+# lost to the machine — re-run). Each prints one line saying why.
 #
 # No `--no-verify` and no `--amend` anywhere: the hooks are the gate.
 set -uo pipefail
@@ -199,12 +200,15 @@ certify() {
     echo "LANES=${LANES:-1} scripts/certify.sh full → $S/certify.log"
     LANES="${LANES:-1}" scripts/certify.sh full < /dev/null > "$S/certify.log" 2>&1; rc=$?
     tail -45 "$S/certify.log"
+    # Exit 3 (ci-local-gates): no leg RED, but a leg was lost to the machine
+    # (disk floor, a signal, an empty .rc, never ran). The tree is unjudged.
+    [ "$rc" -eq 3 ] && { echo "CERTIFY INFRA (exit 3): a leg was lost to the machine, the tree is unjudged — free disk/RAM (or lower LANES) and re-run"; return 29; }
     # Exit code AND the verdict line: a skipped python leg exits 0 without it.
     [ "$rc" -eq 0 ] && grep -qx "EVERY CI LEG GREEN BY EXIT CODE. Logs in .*" "$S/certify.log" \
         || { echo "CERTIFY NOT GREEN (exit $rc) — $S/certify.log"; return 24; }
 }
 if ! rl_done_at "$S" certify "$(head_sha)"; then
-    echo "--- stage certify"; certify || exit 24; rl_mark_at "$S" certify "$(head_sha)"
+    echo "--- stage certify"; certify; rc=$?; [ "$rc" -eq 0 ] || exit "$rc"; rl_mark_at "$S" certify "$(head_sha)"
 fi
 
 # ── 6. PR CI ────────────────────────────────────────────────────────────
