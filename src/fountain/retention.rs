@@ -105,6 +105,43 @@ pub fn retention_action_with_retain_window(
     resolve_retention_action(consent, is_rare)
 }
 
+/// v54.0.0 (CIRISPersist#1015) — **the consent-driven retention verdict**
+/// for content `holder` keeps about `subject`, over any directory: the
+/// subject's all-scope stance (unchanged) and the `retain` bound BY
+/// PRINCIPALS
+/// ([`retain_bound_by_principals`](crate::federation::consent_by_humans::retain_bound_by_principals)),
+/// so a steward's shorter `retain:<window>` naming the subject deletes at the
+/// steward's window. Returns the action and the bound (whose
+/// `governed_by` names the principal whose window decided). The ONE body
+/// `Engine::evict_fountain_content_by_consent` runs, generic so every backend
+/// is witnessed.
+pub async fn consent_retention_verdict(
+    directory: &dyn crate::federation::FederationDirectory,
+    holder_key_id: &str,
+    subject_key_id: &str,
+    is_rare: bool,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<
+    (
+        RetentionAction,
+        crate::federation::consent_by_humans::RetainBound,
+    ),
+    crate::federation::Error,
+> {
+    let consent = directory
+        .resolve_consent_state(holder_key_id, subject_key_id, now)
+        .await?;
+    let bound = crate::federation::consent_by_humans::retain_bound_by_principals(
+        directory,
+        holder_key_id,
+        subject_key_id,
+        now,
+    )
+    .await?;
+    let action = retention_action_with_retain_window(consent, &bound.stance, now, is_rare);
+    Ok((action, bound))
+}
+
 /// N6: may an inbound `FountainHoldingClaim` count toward another peer's
 /// rarity calculation? Only if its possession is PROVEN (it answered a
 /// symbol challenge / carries a proof-of-possession). An unverified claim

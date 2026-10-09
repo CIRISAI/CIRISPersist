@@ -105,6 +105,23 @@ Mutation-checked, each mutant red on memory and sqlite:
 | a community id resolved as a bare key | community |
 | every protocol treated as `founder_only` | community |
 
+### Fixed — a steward's shorter `retain` window naming the machine bounds both retention sweeps (#1015)
+
+Ruled on #1015 (2026-10-09): a steward's `retain:<window>` on a row naming the machine in `for_key_id` is binding, and the data is deleted at the shorter window. Through v53 both sweeps folded the subject's own rows alone. Content was kept past a human's window, and the watch recorded no breach.
+
+- **The fold.** `consent_by_humans::retain_bound_by_principals(directory, holder, subject, now)` returns a `RetainBound`. Its stance is the `retain` stance by principals: the subject's own rows and each steward's rows naming the subject. Its `retain_until` is the minimum live window. Its `governed_by` names the principal whose window that is. It shares one per-principal walk with `resolve_scoped_stance_by_principals`, so the consent door and the sweeps cannot disagree on whose rows count. A steward row whose signed `expires_at` has passed, or that names another machine or none, bounds nothing.
+- **The eviction door.** `Engine::evict_fountain_content_by_consent` now runs `fountain::retention::consent_retention_verdict`, a generic body over any directory. The all-scope stance is unchanged and still the subject's own. A hard delete logs the governing principal.
+- **The deletion-window watch.** `run_deletion_window_watch` asks the same bound. Its `retain_window_breach` row gains the detail member `retain_governed_by`. `retain_window_breach_event` takes the governor as a new argument, which breaks Rust callers.
+- **For adopters.** The first sweep after upgrading may evict content, or record a breach, for rows already past a steward's window.
+
+Witnesses run on memory, sqlite and postgres:
+
+- **I570a** covers five cases through the eviction verdict, with the content kept the day before the window ends and hard-deleted the day after. A shorter steward window governs. A shorter machine window governs. An expired steward row leaves the machine's window. A steward row naming a sibling, or no machine, is ignored.
+- **I570b** checks that the watch records the breach on day 31 under a steward's 30-day window against the machine's 90. The audit row names the steward.
+- **I570c** is a from-disk check that both sweeps reach the principal bound and neither calls the subject-only fold.
+
+Mutation-checked, 6 of 6 killed. Folding no steward rows reds I570a and I570b. Taking the maximum window does the same. The watch on the subject-only fold reds I570b and I570c. The verdict on the subject-only fold reds I570a and I570c. Dropping the `for_key_id` filter reds I570a. A breach row without the governor reds I570b.
+
 ## [53.2.0] - 2026-10-08
 
 ### Changed — the tag is pushed once main's run EXISTS, not once it completes (#1008)

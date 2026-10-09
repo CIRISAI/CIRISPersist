@@ -2544,42 +2544,30 @@ impl Engine {
         is_rare: bool,
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<u64, crate::store::Error> {
-        use crate::federation::FederationDirectory;
-        let consent = {
-            let r = match &self.backend {
-                #[cfg(feature = "postgres")]
-                BackendDispatch::Postgres(b) => {
-                    b.resolve_consent_state(target_key_id, subject_key_id, now)
-                        .await
-                }
-                #[cfg(feature = "sqlite")]
-                BackendDispatch::Sqlite(b) => {
-                    b.resolve_consent_state(target_key_id, subject_key_id, now)
-                        .await
-                }
-            };
-            r.map_err(|e| crate::store::Error::Backend(format!("resolve_consent_state: {e}")))?
-        };
-        // v44.8.0 (CIRISPersist#866 C1b) — and the subject's `retain` stance
-        // WITH its bound: a `retain:<window>` that has passed is a withdrawal
-        // the subject signed in advance, and evicts like one.
-        let retain = {
-            self.federation_directory()
-                .resolve_scoped_stance(
-                    target_key_id,
-                    subject_key_id,
-                    crate::federation::types::transmission_principle::RETAIN,
-                    None,
-                    now,
-                )
-                .await
-                .map_err(|e| crate::store::Error::Backend(format!("resolve_scoped_stance: {e}")))?
-        };
-        // N5: the FROZEN verify-core verdict decides. Withdrawn/revoked →
-        // HardDelete regardless of rarity (revocation overrides rarity).
-        let action =
-            crate::fountain::retention_action_with_retain_window(consent, &retain, now, is_rare);
+        // v54.0.0 (CIRISPersist#1015) — the subject's all-scope stance and
+        // the `retain` bound BY PRINCIPALS: a steward's shorter window naming
+        // the subject is binding. A lapsed window is a withdrawal signed in
+        // advance and evicts like one; N5 (the FROZEN verify-core verdict)
+        // decides, revocation overriding rarity.
+        let (action, bound) = crate::fountain::retention::consent_retention_verdict(
+            self.federation_directory().as_ref(),
+            target_key_id,
+            subject_key_id,
+            is_rare,
+            now,
+        )
+        .await
+        .map_err(|e| crate::store::Error::Backend(format!("consent_retention_verdict: {e}")))?;
         if action.is_hard_delete() {
+            tracing::info!(
+                content_id,
+                corpus_kind,
+                holder = target_key_id,
+                subject = subject_key_id,
+                retain_until = ?bound.stance.retain_until,
+                retain_governed_by = ?bound.governed_by,
+                "evict_fountain_content_by_consent: hard delete"
+            );
             self.evict_fountain_content_hard_delete(content_id, corpus_kind)
                 .await
         } else {

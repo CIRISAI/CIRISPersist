@@ -96,7 +96,11 @@ pub mod consent_by_humans_invariants;
 // v53.1.8 (#1013) — I548: the capacity gate and a scorer's precheck ask one fold.
 #[cfg(test)]
 mod capacity_consent_invariants;
+// v54.0.0 (#1015) — I570: a steward's shorter `retain` window naming the machine bounds both
+// retention sweeps.
 pub mod consent_expiry;
+#[cfg(test)]
+mod retain_by_principals_invariants;
 // CIRISPersist#866/#867 (`FSD/CONTEXTUAL_INTEGRITY_ENVELOPE.md`) — I104–I111: the scope
 // token grammar, the retain bound, the transfer principle, the expiry record.
 #[cfg(any(test, feature = "test-anchor"))]
