@@ -431,6 +431,10 @@ impl PostgresBackend {
         .await?;
         let row = community.community;
         crate::federation::check_consensus_protocol_form(&row.consensus_protocol)?;
+        // v54.0.0 (CIRISPersist#1034, CC 4.4.3.2.8) — the declared cohort parses,
+        // a config rides only on an affiliation, and an affiliation's config
+        // validates against its roster. Backend-symmetric.
+        crate::federation::affiliation_config::check_community_record(&row)?;
         // v4.11.0 (#154 Ask 4) — geographic cohort_subkind admission.
         crate::federation::location::check_geographic_community_admission(
             self,

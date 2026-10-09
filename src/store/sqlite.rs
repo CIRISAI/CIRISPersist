@@ -28839,6 +28839,10 @@ impl SqliteBackend {
         .await?;
         let row = community.community;
         crate::federation::check_consensus_protocol_form(&row.consensus_protocol)?;
+        // v54.0.0 (CIRISPersist#1034, CC 4.4.3.2.8) — the declared cohort parses,
+        // a config rides only on an affiliation, and an affiliation's config
+        // validates against its roster. Backend-symmetric.
+        crate::federation::affiliation_config::check_community_record(&row)?;
         // v4.11.0 (#154 Ask 4) — geographic cohort_subkind admission: every
         // member must hold an in-force contained location_proof. Reads run
         // before the write lock below. No-op for non-geographic communities.
@@ -36697,7 +36701,12 @@ mod tests {
     async fn affiliations_cohort_membership_lifecycle_sqlite() {
         use crate::federation::cohort::{Cohort, RosterMember};
         use crate::federation::{BlobStorage, FederationDirectory};
-        let backend = community_fixture(&[("alice", "alice-occ", true)], None).await;
+        // v54.0.0 (#1034) — the record declares itself an affiliation.
+        let backend = community_fixture(
+            &[("alice", "alice-occ", true)],
+            Some(serde_json::json!({ "cohort_scope": "affiliations" })),
+        )
+        .await;
         // Register a fresh PRIMITIVE key to admit via the affiliations cohort.
         backend
             .put_public_key(SignedKeyRecord {

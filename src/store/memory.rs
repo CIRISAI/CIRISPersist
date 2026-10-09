@@ -12318,6 +12318,10 @@ impl MemoryBackend {
         // v4.0 — value-validation admission (consensus_protocol
         // canonical form). Mirrors put_family.
         crate::federation::check_consensus_protocol_form(&row.consensus_protocol)?;
+        // v54.0.0 (CIRISPersist#1034, CC 4.4.3.2.8) — the declared cohort parses,
+        // a config rides only on an affiliation, and an affiliation's config
+        // validates against its roster. Backend-symmetric.
+        crate::federation::affiliation_config::check_community_record(&row)?;
         // v4.11.0 (#154 Ask 4) — geographic cohort_subkind admission. Runs
         // BEFORE the state lock below: it reads via list_location_proofs_for
         // (which locks state itself), so calling it under the lock would
@@ -19671,6 +19675,20 @@ mod tests {
         cohort_subkind: Option<&str>,
         comm_authorized: bool,
     ) -> Result<(), crate::federation::Error> {
+        let policy_blob = cohort_subkind.map(|sk| serde_json::json!({ "cohort_subkind": sk }));
+        put_community_with_policy(backend, community_id, members, policy_blob, comm_authorized)
+            .await
+    }
+
+    /// [`put_community_with_authority`] with the whole `policy_blob` (v54.0.0,
+    /// #1034 — an affiliation declares `"cohort_scope": "affiliations"` there).
+    async fn put_community_with_policy(
+        backend: &MemoryBackend,
+        community_id: &str,
+        members: Vec<crate::federation::types::CommunityMember>,
+        policy_blob: Option<serde_json::Value>,
+        comm_authorized: bool,
+    ) -> Result<(), crate::federation::Error> {
         let mut comm_key = fix_key(community_id, "primitive", community_id);
         if comm_authorized {
             comm_key.identity_type =
@@ -19684,7 +19702,6 @@ mod tests {
             backend,
         )
         .await;
-        let policy_blob = cohort_subkind.map(|sk| serde_json::json!({ "cohort_subkind": sk }));
         backend
             .put_community(
                 crate::federation::tier_ingest::test_support::sign_community(
@@ -20166,9 +20183,17 @@ mod tests {
         // the founder_only protocol.
         let mut founder = member("ob-owner");
         founder.role = Some("founder".into());
-        put_community_with(&backend, group, vec![founder], None)
-            .await
-            .expect("affiliations group (community row) created");
+        // v54.0.0 (#1034) — the record DECLARES itself an affiliation; a
+        // plain community addressed as one is refused.
+        put_community_with_policy(
+            &backend,
+            group,
+            vec![founder],
+            Some(serde_json::json!({ "cohort_scope": "affiliations" })),
+            false,
+        )
+        .await
+        .expect("affiliations group (community row) created");
 
         // ── add via the affiliations cohort ────────────────────────────────
         // v31.0.0 (CIRISPersist#654) — signed over the GROWN community envelope.

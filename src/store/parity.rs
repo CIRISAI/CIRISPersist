@@ -360,6 +360,9 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // v54.0.0 (CIRISPersist#1031, CC 4.1.1) — refuses the cycle-closing
     // `delegates_to` (`federation_delegation_cycle`).
     ("check_delegation_cycle_admission", Class::Gate),
+    // v54.0.0 (CIRISPersist#1034, CC 4.4.3.2.8) — refuses a community record
+    // whose declared cohort or affiliation config is malformed or invalid.
+    ("check_community_record", Class::Gate),
     ("check_skew_and_payment", Class::Gate),
     ("check_trace_dimension_admission", Class::Gate),
     ("check_trust_charter_admission", Class::Gate),

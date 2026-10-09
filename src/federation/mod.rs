@@ -40,6 +40,9 @@ pub mod accord_recovery;
 pub mod accord_roster;
 pub mod admission;
 pub mod adopt_cascade;
+/// v54.0.0 (CIRISPersist#1034, CC 4.4.3.2.8) — the declared affiliation
+/// cohort and its typed config record.
+pub mod affiliation_config;
 pub mod age;
 pub mod at_rest_cascade;
 /// v36.0.0 (CIRISPersist#624) — the typed, pre-write replicated
@@ -190,6 +193,10 @@ pub(crate) mod nested_manifest_invariants;
 #[cfg(test)]
 mod retraction_invariants;
 // v53.0.0 (CIRISPersist#969) — I310–I319: one DEK per (stream, epoch).
+/// v54.0.0 (CIRISPersist#1034, CC 4.4.3.2.8) — affiliations: the declared
+/// cohort and the typed config record (I562–I564).
+#[cfg(test)]
+pub mod affiliation_invariants;
 /// v54.0.0 (CIRISPersist#1031, CC 4.1.1) — the cycle-closing `delegates_to`
 /// is refused at admission (I560).
 #[cfg(test)]
@@ -6525,6 +6532,8 @@ pub trait FederationDirectory: Send + Sync {
         member: cohort::RosterMember,
         spec: &cohort::AdmitSpec,
     ) -> Result<bool, Error> {
+        // v54.0.0 (CIRISPersist#1034) — the held record is this cohort.
+        affiliation_config::check_group_cohort(self, cohort, group_key_id).await?;
         let member_key_id = member.key_id.clone();
         let (added, change_kind) = match cohort {
             cohort::Cohort::Family => (
@@ -6598,6 +6607,8 @@ pub trait FederationDirectory: Send + Sync {
         removed_key_id: &str,
         spec: cohort::RevokeSpec,
     ) -> Result<(), Error> {
+        // v54.0.0 (CIRISPersist#1034) — the held record is this cohort.
+        affiliation_config::check_group_cohort(self, cohort, group_key_id).await?;
         let now = chrono::Utc::now();
         let cohort::RevokeSpec {
             effective_at,
@@ -7603,7 +7614,20 @@ pub trait FederationDirectory: Send + Sync {
                         }
                         None => false,
                     },
-                    TargetPlane::Room => self.lookup_community(target).await?.is_some(),
+                    // v54.0.0 (CIRISPersist#1034, CC 4.4.3.2.8) — a row placed
+                    // at `affiliations` names an affiliation, a row placed at
+                    // `community` names a community: the record's declared
+                    // cohort, never the caller's spelling.
+                    TargetPlane::Room => match self.lookup_community(target).await? {
+                        Some(held) => {
+                            if let Ok(addressed) = cohort::Cohort::from_token(claimed_cohort_scope)
+                            {
+                                affiliation_config::check_record_is(&held, addressed)?;
+                            }
+                            true
+                        }
+                        None => false,
+                    },
                 };
                 if !held {
                     let reason = crate::scope::ScopeRefusalReason::MembershipUnresolved;
@@ -10684,6 +10708,39 @@ pub enum Error {
         offending_scopes: Vec<String>,
     },
 
+    /// v54.0.0 (CIRISPersist#1034, CC 4.4.3.2.8) — a door addressed a held
+    /// community-plane record under a cohort other than the one the record
+    /// declares (`policy_blob.cohort_scope`; absent = `community`), or a
+    /// supersession would change the declared cohort. Stable `kind()` token
+    /// `federation_affiliation_cohort_mismatch`. See
+    /// [`affiliation_config::check_group_cohort`].
+    #[error(
+        "group {group_key_id:?} is declared {declared:?} and was addressed as {addressed:?}: \
+         an affiliation and a community are different records (CC 4.4.3.2.8)"
+    )]
+    AffiliationCohortMismatch {
+        /// The record.
+        group_key_id: String,
+        /// The cohort the record declares.
+        declared: &'static str,
+        /// The cohort the door addressed it under.
+        addressed: &'static str,
+    },
+
+    /// v54.0.0 (CIRISPersist#1034, CC 4.4.3.2.8) — a community-plane record's
+    /// declared cohort or its affiliation config record is malformed or
+    /// invalid. `rule` is one of [`affiliation_config::rule`]. Stable `kind()`
+    /// token `federation_affiliation_config_invalid`.
+    #[error("group {group_key_id:?}: affiliation record refused ({rule}): {detail}")]
+    AffiliationConfigInvalid {
+        /// The record.
+        group_key_id: String,
+        /// The [`affiliation_config::rule`] that failed.
+        rule: &'static str,
+        /// What failed.
+        detail: String,
+    },
+
     /// v54.0.0 (CIRISPersist#1031, CC 4.1.1 — the anti-pattern table's
     /// "Cycles (A → B → A)" row: "Substrate MUST detect cycles on the
     /// `delegates_to` graph and reject the cycle-closing emission"). A
@@ -11575,6 +11632,8 @@ impl Error {
             Error::NodeAgencyForbidden { .. } => "federation_node_agency_forbidden",
             Error::NodeAlreadyOwned { .. } => "federation_node_already_owned",
             Error::DelegationCycle { .. } => "federation_delegation_cycle",
+            Error::AffiliationCohortMismatch { .. } => "federation_affiliation_cohort_mismatch",
+            Error::AffiliationConfigInvalid { .. } => "federation_affiliation_config_invalid",
             Error::AmbiguousNodeOwner { .. } => "federation_ambiguous_node_owner",
             Error::OwnershipReclaimRefused { .. } => "federation_ownership_reclaim_refused",
             Error::CanonicalRoleNotAccordConferred { .. } => "canonical_role_not_accord_conferred",

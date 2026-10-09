@@ -275,8 +275,14 @@ where
             Some(_) => Ok(OccupiedRoute::Settled(CommunityWrite::Superseded)),
         };
     }
+    // v54.0.0 (CIRISPersist#1034) — the version names the cohort the held
+    // record declares, and its history row is recorded under it (an
+    // affiliation's prior versions are `affiliations`, as the local supersede
+    // door records them).
+    let cohort = super::affiliation_config::declared_cohort(c)?;
+    super::affiliation_config::check_record_is(&stored, cohort)?;
     let offer = Offer {
-        cohort: Cohort::Community,
+        cohort,
         kind: "community",
         group_key_id: &c.community_key_id,
         offered_hash: offered_hash.clone(),
@@ -297,7 +303,7 @@ where
     let snapshot = serde_json::to_value(community)
         .map_err(|e| Error::Backend(format!("community amendment snapshot serialize: {e}")))?;
     let written = dir
-        .supersede_group_row(Cohort::Community, snapshot, Some(authorization(&offer)))
+        .supersede_group_row(cohort, snapshot, Some(authorization(&offer)))
         .await
         .map(|_| Some(1));
     Ok(
@@ -678,6 +684,13 @@ where
     F: FederationDirectory + ?Sized,
 {
     super::check_consensus_protocol_form(&new.community.consensus_protocol)?;
+    // v54.0.0 (CIRISPersist#1034, CC 4.4.3.2.8) — the held record is the
+    // cohort this door addresses, the new version declares the same cohort,
+    // and an affiliation's config validates against the new roster.
+    super::affiliation_config::check_group_cohort(dir, cohort, &new.community.community_key_id)
+        .await?;
+    super::affiliation_config::check_record_is(&new.community, cohort)?;
+    super::affiliation_config::check_community_record(&new.community)?;
     super::verify_community_admission(dir, &new).await?;
     // v52.0.0 (#955, Q2) — an amendment never adds a member. The one
     // exception is a trust-root founders' amendment (#926 HIGH-3: its founder

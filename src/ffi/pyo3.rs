@@ -34392,6 +34392,14 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         // `delegates_to` joins the node-agency arm it sits beside on the
         // put door: a caller-side delegation refusal, ValueError (4xx).
         crate::federation::Error::DelegationCycle { .. } => PyValueError::new_err(kind),
+        // v54.0.0 (CIRISPersist#1034, CC 4.4.3.2.8) — an affiliation addressed
+        // as a community (or the reverse), and a malformed or invalid
+        // affiliation record: caller-side refusals of a group write, the
+        // `ConsensusProtocolMalformed` family's type. ValueError (4xx).
+        crate::federation::Error::AffiliationCohortMismatch { .. } => PyValueError::new_err(kind),
+        crate::federation::Error::AffiliationConfigInvalid { rule, .. } => {
+            PyValueError::new_err(format!("{kind}: {rule}"))
+        }
         // v12.6.0 (CIRISConstitution#23, CC 1.13.3.3 / CC 3.2) — a rejected
         // second-owner binding (single-owner gate) is a caller-side conflict,
         // and an ambiguous-owner read is a fail-closed state rejection; both are

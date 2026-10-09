@@ -9,6 +9,26 @@ threat-model citations because this crate's audit story is the point.
 
 ## [54.0.0] - UNRELEASED
 
+### Fixed — affiliations: the supersede the V089 CHECK refused, the declared cohort, the typed config record (CC 4.4.3.2.8, #1034)
+
+Three findings on affiliations, read for the org-as-affiliation fold.
+
+**1. Superseding an affiliation failed on both SQL backends.** `federation_group_versions.cohort` carried V089's `CHECK (cohort IN ('family', 'community'))`, and `supersede_affiliations` records the prior version under `affiliations`. Only the memory backend, which has no CHECK, had ever run it. **V182** (both dialects) widens the CHECK to admit `affiliations`. V089 is not edited (a shipped migration is immutable as bytes), and `evidence/migration_checksums.tsv` gains the two V182 rows. Postgres drops the cohort CHECK by its looked-up name and adds `federation_group_versions_cohort_check`. SQLite rebuilds the table the V136 way: stage, drop, re-create under the final name, restore. Nothing references the table, so the drop fires no cascade.
+
+**2. Nothing said a record IS an affiliation.** The cohort is now read from the signed record's `policy_blob.cohort_scope`, the membership label the `Community` doc already names (CIRISEdge#48-A) and that adopters' records already carry. Absent means `community`, so existing records keep their bytes and meaning. Being signed, the label replicates with the record; a database column set by a door argument would not. `affiliation_config::declared_cohort` is the one reading, and a value other than `community` or `affiliations` is refused rather than read as absent. New refusal `Error::AffiliationCohortMismatch { group_key_id, declared, addressed }`, `kind()` token `federation_affiliation_cohort_mismatch`, Python `ValueError`. It fires at:
+- both supersede doors, in both directions, and on a supersession that changes the declared cohort;
+- the replicated community amendment path, which now records the history row under the declared cohort (it always wrote `community`);
+- `add_member` and `revoke_member`;
+- the attestation write-scope gate's room lookup: a row placed at `affiliations` must name an affiliation, and one placed at `community` must name a community.
+
+**3. The CC 4.4.3.2.8 config record had no typing or admission.** `AffiliationConfig` at `policy_blob.affiliation_config` types `affiliation_archetype`, `membership_basis`, `classification_scheme`, `retention_policy`, `hierarchy`, `designated_officials`, `compartments` and `role_term` (CIRISConstitution#163, at most 365 days). Every other declared limb is carried verbatim. `resolve()` implements "a value MUST resolve": the explicit field, else the archetype's preset, else the canonical no-op default (one `internal` class, retention `rotate-forward`). Presets fill only what CC's text pins: `informal_adhoc` (role-assigned) and `igo` (its three-class lattice and basis). The other four archetypes resolve to the default until CC publishes a preset table. `check_community_record` runs at every backend's community door (parity-registered) and on supersession. New refusal `Error::AffiliationConfigInvalid { group_key_id, rule, detail }`, `kind()` token `federation_affiliation_config_invalid`, Python `ValueError` carrying the rule. Its rules are `cohort_unknown`, `config_on_community`, `config_malformed`, `classification_invalid`, `retention_unknown_class`, `retention_floor_above_ceiling`, `compartment_invalid` (including a compartment member who is not on the roster), `role_term_out_of_range`, `hierarchy_depth_out_of_range` and `designated_official_invalid`.
+
+- Witnesses:
+  - I562 (sqlite, postgres, with the body also on memory): at V181 the supersession is refused at the history insert (postgres SQLSTATE 23514 on a direct `affiliations` insert). V182 then applies over a populated history, and a community's prior version survives byte-identical. The same supersession then writes, and the CHECK still refuses an unknown cohort.
+  - I563 (memory, sqlite, postgres): every mismatch site above, in both directions, plus the founding refusals.
+  - I564: resolution and one refusal per rule (pure), and the door at founding and on supersession (memory, sqlite, postgres).
+- Test support: `add_member_consented` places an affiliation's proposal at `affiliations`. The proposal and acceptance fixtures now use the production `group_kind` mapping (`community` for the room plane); they wrote the raw scope, which the door refuses at `affiliations`. The three backends' affiliations lifecycle tests now found a declared affiliation.
+
 ### Fixed — a `grant`-scoped delegate may issue a grant (CC 2.4.1.2.1, CC 4.4.3.4.3, #1033)
 
 CC 2.4.1.2.1 says an onward grant is issued by the asset's owner or steward, or by a holder of a `grant`-scoped delegation from them, and a substrate MUST refuse any other issuer. Persist had the refusal and not the positive arm. `DELEGATION_SCOPE_GRANT` was declared and no gate read it, so a legitimate delegate was refused.
