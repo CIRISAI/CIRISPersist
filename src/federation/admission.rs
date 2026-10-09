@@ -15096,6 +15096,25 @@ pub async fn holds_grant_delegation(
 /// `delegates_to` edges ([`delegation_path_hops`]), and if so refuses with
 /// [`Error::DelegationCycle`] (`federation_delegation_cycle`).
 ///
+/// # Acceptance edges are not in the cycle graph
+///
+/// A `delegates_to` labelled `trust:accepts:v1` ([`is_trust_acceptance_edge`])
+/// is the node's SUBSCRIPTION to a root (CC 4.2.1: "the trust edge is the
+/// subscription"), not a delegation of capability, and no capability walk
+/// follows it: `capability_roots_to_trusted_root` reads it as the user's
+/// separate leg, then walks root → … → subject. So it is excluded on both
+/// sides, which covers both arrival orders: the gate admits an acceptance
+/// edge without a search, and [`delegation_path_hops`] never traverses one.
+/// The production shape this keeps working is a KEY root's grantee
+/// subscribing to the root that granted it: the root signs
+/// `delegates_to(root → node, [infra:serve])` itself, and the node's own boot
+/// writes `delegates_to(node → root, trust:accepts:v1)` (CIRISServer
+/// `mesh_genesis.rs` `accept_trust_root`; the portable root's canonical).
+/// Under CC 4.1.1 read over every `delegates_to`, that pair is "A → B → A"
+/// and one of the two would be refused at boot. A CAPABILITY edge closing
+/// the same pair is still a cycle and is still refused (CC 4.1.1, 4.2.1;
+/// ruled on the v54.0.0 integration, test 603).
+///
 /// A self-edge (`A == B`) is admitted without a read: it is the root charter,
 /// the constitutional `delegates_to(root → root)` self-declaration
 /// (`trust_root`), not the "A → B → A" anti-pattern, and the walks' visited
@@ -15137,6 +15156,11 @@ pub async fn check_delegation_cycle_admission(
     if row.attestation_type != attestation_type::DELEGATES_TO {
         return Ok(());
     }
+    // An ACCEPTANCE edge is the subscription plane, not a delegation of
+    // capability: it is not in the cycle graph (see the doc above).
+    if is_trust_acceptance_edge(row) {
+        return Ok(());
+    }
     let refuse = |hops| {
         Err(Error::DelegationCycle {
             attesting_key_id: row.attesting_key_id.clone(),
@@ -15162,6 +15186,17 @@ pub async fn check_delegation_cycle_admission(
         Some(hops) => refuse(hops),
         None => Ok(()),
     }
+}
+
+/// v54.0.0 (CIRISPersist#1031) — is `row` a trust ACCEPTANCE edge, a
+/// `delegates_to` whose envelope `dimension` is
+/// [`TRUST_ACCEPTS_DIMENSION`](crate::federation::trust_root::TRUST_ACCEPTS_DIMENSION)?
+/// The subscription plane: never part of the cycle graph
+/// ([`check_delegation_cycle_admission`]).
+fn is_trust_acceptance_edge(row: &super::Attestation) -> bool {
+    row.attestation_type == attestation_type::DELEGATES_TO
+        && envelope_dimension(&row.attestation_envelope)
+            == Some(crate::federation::trust_root::TRUST_ACCEPTS_DIMENSION)
 }
 
 /// v54.0.0 (CIRISPersist#1031) — the shortest live `delegates_to` path from
@@ -15195,6 +15230,7 @@ pub(crate) async fn delegation_path_hops(
             .collect();
         for r in &rows {
             if r.attestation_type != attestation_type::DELEGATES_TO
+                || is_trust_acceptance_edge(r)
                 || r.expires_at.is_some_and(|x| x <= now)
                 || !delegation_term_live_at_or_after(&r.attestation_envelope, now)
                 || granter_retracted.contains(r.attested_key_id.as_str())

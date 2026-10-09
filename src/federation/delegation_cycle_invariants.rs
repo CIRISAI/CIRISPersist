@@ -26,7 +26,12 @@
 //!   edge whose `delegation_valid_until` (or older `valid_until`) has passed
 //!   connects nothing, while an edge whose `delegation_valid_from` is still
 //!   ahead DOES connect (it will be walked when its term opens), so the edge
-//!   closing a cycle through it is refused now.
+//!   closing a cycle through it is refused now;
+//! - (9) an ACCEPTANCE edge (`trust:accepts:v1`) is the subscription plane,
+//!   not in the cycle graph (CC 4.2.1): a key root's grant `R → N` and the
+//!   grantee's acceptance `N → R` admit in EITHER order, a CAPABILITY edge
+//!   closing the same pair is still refused, and a chain that reaches the
+//!   root only THROUGH an acceptance edge is not a cycle.
 
 /// The backend-agnostic witness body; `run` instantiates it per backend.
 #[cfg(test)]
@@ -115,7 +120,8 @@ pub mod bodies {
     pub async fn i590_the_cycle_closing_edge_is_refused(d: &dyn FederationDirectory, tag: &str) {
         let k = |n: &str| format!("{tag}-{n}");
         for n in [
-            "a", "b", "c", "d", "e", "f", "g", "h", "x", "y", "m", "n", "o", "p", "q", "r",
+            "a", "b", "c", "d", "e", "f", "g", "h", "x", "y", "m", "n", "o", "p", "q", "r", "r1",
+            "n1", "r2", "n2", "r3", "x3", "y3",
         ] {
             agent(d, &k(n)).await;
         }
@@ -242,6 +248,84 @@ pub mod bodies {
             1,
             "(8) o → p opens in an hour; p → o closes a cycle that goes live then",
         );
+
+        // (9) acceptance edges are the subscription plane. Kills: the search
+        // following acceptance edges (m1: 9a, 9b and 9d refuse); exempting
+        // every edge into a self-chartered root instead (m2, option (c): 9c
+        // admits the capability cycle).
+        let accept = |r: &mut crate::federation::Attestation| {
+            let env = r
+                .attestation_envelope
+                .as_object_mut()
+                .expect("an object envelope");
+            env.insert(
+                "dimension".to_owned(),
+                serde_json::json!(crate::federation::trust_root::TRUST_ACCEPTS_DIMENSION),
+            );
+            env.insert(
+                "scope".to_owned(),
+                serde_json::json!([
+                    crate::federation::trust_root::INFRA_ATTEST_SCOPE,
+                    crate::federation::trust_root::INFRA_SERVE_SCOPE
+                ]),
+            );
+        };
+        let grant = |r: &mut crate::federation::Attestation| {
+            r.attestation_envelope
+                .as_object_mut()
+                .expect("an object envelope")
+                .insert(
+                    "scope".to_owned(),
+                    serde_json::json!([crate::federation::trust_root::INFRA_SERVE_SCOPE]),
+                );
+        };
+        // (9a) grant first: the key root charters itself and grants its node;
+        // the node's boot then accepts the root.
+        let (r1, n1) = (k("r1"), k("n1"));
+        ts::put_delegates_to(d, &r1, &r1, None)
+            .await
+            .expect("(9a) the key root's self-charter");
+        put_edge(d, &r1, &n1, grant)
+            .await
+            .expect("(9a) the root grants its node infra:serve");
+        put_edge(d, &n1, &r1, accept).await.expect(
+            "(9a) the grantee's acceptance of the root that granted it is a subscription, \
+             not a cycle",
+        );
+        // (9b) acceptance first: the node subscribes, then the root grants it.
+        let (r2, n2) = (k("r2"), k("n2"));
+        ts::put_delegates_to(d, &r2, &r2, None)
+            .await
+            .expect("(9b) the key root's self-charter");
+        put_edge(d, &n2, &r2, accept)
+            .await
+            .expect("(9b) the node accepts the root");
+        put_edge(d, &r2, &n2, grant)
+            .await
+            .expect("(9b) the root's grant to a subscriber closes no cycle");
+        // (9c) a CAPABILITY edge closing the same pair is still a cycle.
+        expect_cycle(
+            put_edge(d, &n1, &r1, |_| {}).await,
+            &n1,
+            &r1,
+            1,
+            "(9c) a capability delegates_to(node → root) beside the root's grant",
+        );
+        // (9d) a chain that reaches the root only THROUGH an acceptance edge:
+        // x3 accepts r3, y3 delegates to x3, and r3 → y3 closes nothing.
+        let (r3, x3, y3) = (k("r3"), k("x3"), k("y3"));
+        ts::put_delegates_to(d, &r3, &r3, None)
+            .await
+            .expect("(9d) the key root's self-charter");
+        put_edge(d, &x3, &r3, accept)
+            .await
+            .expect("(9d) x3 accepts r3");
+        ts::put_delegates_to(d, &y3, &x3, None)
+            .await
+            .expect("(9d) y3 → x3");
+        put_edge(d, &r3, &y3, grant)
+            .await
+            .expect("(9d) r3 → y3 reaches r3 again only through x3's acceptance: not a cycle");
 
         // (6) the ceiling: a 17-hop chain.
         let chain: Vec<String> = (0..=17).map(|i| k(&format!("k{i}"))).collect();
