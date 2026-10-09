@@ -43,6 +43,11 @@
 //! cycle gate must too. Gate (a) (the granter's bare retraction) and gate (b)
 //! (a retraction naming the edge) are both read at `now`.
 //!
+//! I609 (Codex round 3 on PR #1050) — an edge whose row `expires_at` falls
+//! before its signed term opens is never live under the lens (when the term
+//! opens the row has expired), so it connects nothing; an edge whose expiry
+//! falls after its term opens still connects.
+//!
 //! I597 — the check and the insert are ONE step (Codex on PR #1050). Two
 //! writers of `A → B` and `B → A` that both finish the graph read before
 //! either inserts would both be admitted. The witness forces exactly that
@@ -343,6 +348,68 @@ pub mod bodies {
              cycle",
         );
         assert_no_edge(d, &f, &e, "I608 (b)").await;
+    }
+
+    /// I609 — see the module doc.
+    pub async fn i609_an_edge_expiring_before_its_term_connects_nothing(
+        d: &dyn FederationDirectory,
+        tag: &str,
+    ) {
+        let k = |n: &str| format!("{tag}-{n}");
+        for n in ["o", "p", "o2", "p2"] {
+            agent(d, &k(n)).await;
+        }
+        let now = chrono::Utc::now();
+        let term = |opens: chrono::DateTime<chrono::Utc>,
+                    expires: chrono::DateTime<chrono::Utc>| {
+            move |r: &mut crate::federation::Attestation| {
+                r.expires_at = Some(expires);
+                r.attestation_envelope
+                    .as_object_mut()
+                    .expect("an object envelope")
+                    .insert(
+                        "delegation_valid_from".to_owned(),
+                        serde_json::json!(opens.to_rfc3339()),
+                    );
+            }
+        };
+        // o → p: the term opens in two hours, the row expires in one.
+        let (o, p) = (k("o"), k("p"));
+        put_edge(
+            d,
+            &o,
+            &p,
+            term(
+                now + chrono::Duration::hours(2),
+                now + chrono::Duration::hours(1),
+            ),
+        )
+        .await
+        .expect("I609 an edge expiring before its term opens is a stored row");
+        ts::put_delegates_to(d, &p, &o, None).await.expect(
+            "I609 o → p expires before its term opens, so no walk ever traverses it; p → o \
+             closes nothing",
+        );
+        // Control: the row expires AFTER its term opens, so it is live then.
+        let (o2, p2) = (k("o2"), k("p2"));
+        put_edge(
+            d,
+            &o2,
+            &p2,
+            term(
+                now + chrono::Duration::hours(2),
+                now + chrono::Duration::hours(3),
+            ),
+        )
+        .await
+        .expect("I609 control edge");
+        expect_cycle(
+            ts::put_delegates_to(d, &p2, &o2, None).await,
+            &p2,
+            &o2,
+            1,
+            "I609 control: o2 → p2 is live from its term's opening until its expiry",
+        );
     }
 
     /// I590 — see the module doc.
@@ -683,6 +750,15 @@ mod run {
                     super::super::bodies::i608_a_future_retraction_hides_no_edge(
                         &d as &dyn FederationDirectory,
                         &format!("i608-{}", super::suffix()),
+                    )
+                    .await
+                }
+                #[tokio::test(flavor = "multi_thread")]
+                async fn i609() {
+                    let Some(d) = $fresh.await else { return };
+                    super::super::bodies::i609_an_edge_expiring_before_its_term_connects_nothing(
+                        &d as &dyn FederationDirectory,
+                        &format!("i609-{}", super::suffix()),
                     )
                     .await
                 }

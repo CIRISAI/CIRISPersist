@@ -7728,7 +7728,8 @@ fn delegation_term_live_at(envelope: &serde_json::Value, t: chrono::DateTime<chr
 }
 
 /// v54.0.0 (CIRISPersist#1031 meeting #1032) — will a `delegates_to`
-/// envelope's signed TERM be open at some instant at or after `now`?
+/// edge's signed TERM be open, and the row unexpired, at some instant at or
+/// after `now`?
 ///
 /// The cycle gate's reading of the term, built on
 /// [`delegation_term_live_at`] so it cannot drift from the lens the licence
@@ -7738,10 +7739,17 @@ fn delegation_term_live_at(envelope: &serde_json::Value, t: chrono::DateTime<chr
 /// live on its own), while an edge whose term has closed, or whose term
 /// nobody can read, is skipped, because the lens refuses it at every later
 /// instant and no walk will ever traverse it.
-fn delegation_term_live_at_or_after(
-    envelope: &serde_json::Value,
+///
+/// v54.0.0 (Codex round 3 on PR #1050) — the ROW's `expires_at` is read at
+/// the same probe instant. Tested only at `now`, an edge expiring after `now`
+/// but before its term opens was counted, though the lens (which reads both
+/// at one instant, `DelegationWalkLens::admits_edge`) refuses it at every
+/// instant: when its term opens it has already expired.
+fn delegation_edge_live_at_or_after(
+    edge: &super::Attestation,
     now: chrono::DateTime<chrono::Utc>,
 ) -> bool {
+    let envelope = &edge.attestation_envelope;
     let from = match envelope.get(DELEGATION_VALID_FROM_FIELD) {
         None | Some(serde_json::Value::Null) => None,
         Some(v) => match v
@@ -7752,7 +7760,8 @@ fn delegation_term_live_at_or_after(
             None => return false,
         },
     };
-    delegation_term_live_at(envelope, from.map_or(now, |f| f.max(now)))
+    let probe = from.map_or(now, |f| f.max(now));
+    edge.expires_at.is_none_or(|x| x > probe) && delegation_term_live_at(envelope, probe)
 }
 
 impl DelegationWalkLens<'_> {
@@ -15198,10 +15207,10 @@ pub async fn holds_grant_delegation(
 /// (gate (a) of [`scoped_delegation_reach_at`]: a `withdraws`/`recants` by the
 /// granter naming the recipient), retracted by name (gate (b), the #593
 /// clause, via [`retracted_edge_ids`]) by a retraction asserted by `now`,
-/// expired at `now`, or carrying a signed
+/// expired by the first instant its term can open, or carrying a signed
 /// term (`delegation_valid_from` / `delegation_valid_until` / `valid_until`,
 /// #1032) that the walks' lens will refuse at every instant from `now` on
-/// ([`delegation_term_live_at_or_after`], the lens's own term reading). Scope does NOT
+/// ([`delegation_edge_live_at_or_after`], the lens's own term reading). Scope does NOT
 /// matter: CC names the `delegates_to` graph, not one scope's subgraph, and a
 /// cycle on any scope is still a cycle. A future-dated edge counts — it
 /// exists, and skipping it would let the closing edge in now and the cycle go
@@ -15409,8 +15418,7 @@ where
         for r in &rows {
             if r.attestation_type != attestation_type::DELEGATES_TO
                 || is_trust_plane_edge(r)
-                || r.expires_at.is_some_and(|x| x <= now)
-                || !delegation_term_live_at_or_after(&r.attestation_envelope, now)
+                || !delegation_edge_live_at_or_after(r, now)
                 || granter_retracted.contains(r.attested_key_id.as_str())
             {
                 continue;
