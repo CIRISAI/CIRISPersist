@@ -46,6 +46,11 @@
 //!   today is still served until it is purged; `RefusedToday` selects it and
 //!   every score derived from it (nothing else), the dry run counts per table
 //!   and writes nothing, and once executed the purged rows stop being served.
+//! - **I663** — #1043 class 2 is a list of by-actor selections: the harness
+//!   prefixes name exactly the registered keys that start with them (never a
+//!   production-looking `ciris-server-*` key, never a near-miss), an empty
+//!   prefix is `purge_selection_malformed`, and each selection's dry run counts
+//!   that actor's key, rows and traces without writing anything.
 
 #[cfg(test)]
 pub(crate) mod bodies {
@@ -403,9 +408,7 @@ pub(crate) mod bodies {
     }
 
     fn mock_selection() -> PurgeSelection {
-        PurgeSelection::MockModelTraces {
-            model: sp::MOCK_LLM_MODEL.to_owned(),
-        }
+        PurgeSelection::mock_llm_traces()
     }
 
     // ── I650 ──────────────────────────────────────────────────────────────
@@ -680,6 +683,11 @@ pub(crate) mod bodies {
         let dir = d.as_dyn_directory();
         let t = now();
         let sel = mock_selection();
+        // The wire shape the operator passes to `purge_dry_run_json`.
+        assert_eq!(
+            serde_json::to_value(&sel).unwrap(),
+            serde_json::json!({"kind": "mock_model_traces", "model": "mock-model"})
+        );
         let served_before = served_ids(d).await;
         assert!(served_before.contains(&derived) && served_before.contains(&unrelated));
         let dry = sp::purge_dry_run(dir, &sel).await.unwrap();
@@ -999,6 +1007,17 @@ pub(crate) mod bodies {
                 "the seam makes a #598 legacy row"
             );
         }
+        // A local-tier row the apply door would also refuse is this node's
+        // own business: never served, never in the class.
+        let local = seed_trace(d, "trace-local-i662", AGENT, "gpt-real").await;
+        let local_row = dir.get_attestation(&local).await.unwrap().unwrap();
+        d.shift_asserted_at(&local, local_row.asserted_at + chrono::Duration::seconds(1))
+            .await;
+        let local_row = dir.get_attestation(&local).await.unwrap().unwrap();
+        assert!(
+            sp::refused_today(&local_row).is_some(),
+            "precondition: the class's tier clause is what keeps it out"
+        );
         // Ruled (#1043, 2026-10-09): not a serve filter. Until purged, the
         // rows are served like any other.
         let served_before = served_ids(d).await;
@@ -1037,6 +1056,74 @@ pub(crate) mod bodies {
             assert!(!served.contains(id), "I662: purged {id} is not served");
         }
         assert!(served.contains(&good), "I662: an unselected row still is");
+    }
+
+    // ── I663 ──────────────────────────────────────────────────────────────
+    pub(crate) async fn i663_harness_identities_are_by_actor_selections<D: Seams>(d: &D) {
+        root(d).await;
+        let dir = d.as_dyn_directory();
+        const LEG: &str = "gate-leg-3";
+        for k in [LEG, "ciris-server-prod-1", "qa-nodex-1"] {
+            ts::register_hybrid_key(dir, k).await;
+        }
+        for bad in [vec![], vec!["qa-node-".to_owned(), String::new()]] {
+            let e = sp::harness_actor_selections(dir, &bad)
+                .await
+                .expect_err("an empty prefix matches every key");
+            assert_eq!(refusal(&e).0, token::SELECTION_MALFORMED, "I663");
+        }
+        let sels = sp::harness_actor_selections(dir, sp::HARNESS_KEY_ID_PREFIXES)
+            .await
+            .unwrap();
+        assert_eq!(
+            sels,
+            vec![
+                PurgeSelection::ByActor {
+                    key_id: LEG.to_owned()
+                },
+                PurgeSelection::ByActor {
+                    key_id: HARNESS.to_owned()
+                },
+            ],
+            "I663: exactly the harness keys, in key-id order"
+        );
+        // The harness's rows and traces; a bystander's row about nobody else.
+        put_score(d, HARNESS, BYSTANDER, &[]).await;
+        put_score(d, BYSTANDER, LEG, &[]).await;
+        seed_trace(d, "trace-harness-i663", HARNESS, "gpt-real").await;
+        let other = put_score(d, SCORER, BYSTANDER, &[]).await.attestation_id;
+        let served_before = served_ids(d).await;
+        let mut counts = Vec::new();
+        for sel in &sels {
+            let dry = sp::purge_dry_run(dir, sel).await.unwrap();
+            assert!(dry.withheld.is_empty(), "I663: {:?}", dry.withheld);
+            assert!(!dry.sample.contains(&format!("attestation:{other}")));
+            counts.push(dry.counts);
+        }
+        let map = |kv: &[(&str, u64)]| {
+            kv.iter()
+                .map(|(k, v)| ((*k).to_owned(), *v))
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        assert_eq!(
+            counts,
+            vec![
+                map(&[("federation_attestations", 1), ("federation_keys", 1)]),
+                map(&[
+                    ("federation_attestations", 2),
+                    ("federation_keys", 1),
+                    ("trace_events", 1),
+                ]),
+            ],
+            "I663: per-actor dry-run counts"
+        );
+        // Dry runs write nothing: no header, nothing withheld from serving.
+        assert!(dir
+            .list_purge_executions_since(None, 10)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(served_ids(d).await, served_before, "I663: read-only");
     }
 
     // ── I658 ──────────────────────────────────────────────────────────────
@@ -1390,6 +1477,11 @@ mod run {
                 async fn i662() {
                     let Some(d) = $fresh.await else { return };
                     b::i662_refused_today_is_a_selection_not_a_filter(&d).await
+                }
+                #[tokio::test]
+                async fn i663() {
+                    let Some(d) = $fresh.await else { return };
+                    b::i663_harness_identities_are_by_actor_selections(&d).await
                 }
             }
         };

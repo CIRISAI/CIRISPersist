@@ -36,12 +36,15 @@
 //!
 //! The selection kinds are [`PurgeSelection`]: by actor/key, by explicit id
 //! list, and the two classes the operator ruled on (#1040's mock-LLM traces,
-//! #1043's rows the substrate would refuse to admit today). A class is a
-//! variant plus a resolver over [`scan_attestations`] and the trace reads; a
-//! class like "rows of family F from issuer K in window W" (CIRISServer#757's
-//! zero-scored `capacity:sustained_coherence:v1` rows) is one more variant
-//! whose resolver filters the same scan by dimension prefix, attester and
-//! `asserted_at` window. It is NOT added here.
+//! #1043's rows the substrate would refuse to admit today). #1043's second
+//! class (the QA / harness identities) is a list of by-actor selections
+//! ([`harness_actor_selections`]). A class is a pure row predicate
+//! ([`PurgeSelection::selects_row`]) over ONE [`scan_attestations`] pass, plus
+//! its seeds (an actor's key and traces, a model's traces); the derivation is
+//! shared. A class like "rows of family F from issuer K in window W"
+//! (CIRISServer#757's zero-scored `capacity:sustained_coherence:v1` rows) is
+//! one more variant and one more predicate arm (dimension prefix, attester,
+//! `asserted_at` window). It is NOT added here.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -294,6 +297,107 @@ pub enum PurgeSelection {
     /// column diverging from the signed envelope (#643)), and everything
     /// derived from them.
     RefusedToday,
+}
+
+impl PurgeSelection {
+    /// CIRISPersist#1040 — the mock-LLM class: every trace whose LLM calls
+    /// report [`MOCK_LLM_MODEL`].
+    #[must_use]
+    pub fn mock_llm_traces() -> Self {
+        Self::MockModelTraces {
+            model: MOCK_LLM_MODEL.to_owned(),
+        }
+    }
+
+    /// Does this selection pick `row` on the attestation scan, on its own
+    /// facts? Pure. A class is this predicate plus its seeds (the actor's key
+    /// and traces, the model's traces) and the derivation every class shares
+    /// (a trace's own attestation, scores over purged evidence, a holder
+    /// claim's bytes). A class like "rows of family F from issuer K in window
+    /// W" is one more arm here — `attestation_type`/dimension, attester,
+    /// `asserted_at` — with no new resolver.
+    #[must_use]
+    pub fn selects_row(&self, row: &Attestation) -> bool {
+        match self {
+            Self::ByActor { key_id } => {
+                row.attesting_key_id == *key_id
+                    || row.attested_key_id == *key_id
+                    || row.scrub_key_id == *key_id
+                    || row.subject_key_ids.contains(key_id)
+            }
+            Self::RefusedToday => {
+                row.tier == super::types::attestation_tier::FEDERATION
+                    && refused_today(row).is_some()
+            }
+            Self::ByIds { .. } | Self::MockModelTraces { .. } => false,
+        }
+    }
+}
+
+/// CIRISPersist#1043 class 2 — the key-id prefixes of the QA / harness
+/// identities found registered on the production canonical (2026-10-08).
+/// `ciris-server-` is NOT here: the report names "`ciris-server-*` harness
+/// nodes", and a bare prefix would also match a production server's key, so
+/// those go by explicit key id ([`PurgeSelection::ByActor`]) on the
+/// operator's list.
+pub const HARNESS_KEY_ID_PREFIXES: &[&str] = &[
+    "qa-node-",
+    "gate-leg-",
+    "leg-node-",
+    "gate-gate-identity-",
+    "cessex16-",
+];
+
+/// CIRISPersist#1043 class 2 — **one [`PurgeSelection::ByActor`] per key
+/// registered here whose `key_id` starts with one of `prefixes`**, in key-id
+/// order. Read-only: it names the selections; each is dry-run, cosigned and
+/// executed on its own notice (the operator's ruling: "class 2 as by-actor
+/// selections").
+///
+/// # Errors
+///
+/// [`token::SELECTION_MALFORMED`] for no prefix or an empty one (it would
+/// match every key); the key read's.
+pub async fn harness_actor_selections<F, S>(
+    directory: &F,
+    prefixes: &[S],
+) -> Result<Vec<PurgeSelection>, Error>
+where
+    F: FederationDirectory + ?Sized,
+    S: AsRef<str>,
+{
+    if prefixes.is_empty() || prefixes.iter().any(|p| p.as_ref().is_empty()) {
+        return Err(refused(
+            token::SELECTION_MALFORMED,
+            serde_json::json!({
+                "reason": "a harness prefix list must be non-empty and name no empty prefix \
+                           (an empty prefix matches every key)",
+            }),
+        ));
+    }
+    let mut key_ids: BTreeSet<String> = BTreeSet::new();
+    let mut since: Option<(chrono::DateTime<chrono::Utc>, String)> = None;
+    loop {
+        let page = directory
+            .list_signed_key_records_since(since.clone(), SCAN_PAGE)
+            .await?;
+        let n = page.len();
+        if let Some(last) = page.last() {
+            since = Some((last.admitted_at, last.record.key_id.clone()));
+        }
+        key_ids.extend(
+            page.into_iter()
+                .map(|k| k.record.key_id)
+                .filter(|k| prefixes.iter().any(|p| k.starts_with(p.as_ref()))),
+        );
+        if n < SCAN_PAGE as usize {
+            break;
+        }
+    }
+    Ok(key_ids
+        .into_iter()
+        .map(|key_id| PurgeSelection::ByActor { key_id })
+        .collect())
 }
 
 /// A record a selection class found but did not select, and why. A class
@@ -588,27 +692,6 @@ where
                     },
                 );
             }
-            let actor = key_id.clone();
-            scan_attestations(directory, |row| {
-                let f = RowFacts::of(&row);
-                let about = row.attesting_key_id == actor
-                    || row.attested_key_id == actor
-                    || row.scrub_key_id == actor
-                    || row.subject_key_ids.contains(&actor);
-                if about {
-                    records
-                        .entry(format!("attestation:{}", f.id))
-                        .or_insert(PurgeRecord {
-                            plane: PurgePlane::Attestation,
-                            id: f.id.clone(),
-                            derived_from: None,
-                        });
-                    facts.insert(f.id.clone(), f);
-                } else if f.is_scores && !f.refs.is_empty() {
-                    scores_with_refs.push(f);
-                }
-            })
-            .await?;
         }
         PurgeSelection::MockModelTraces { model } => {
             for trace_id in directory.purge_trace_ids_for_llm_model(model).await? {
@@ -621,41 +704,29 @@ where
                     },
                 );
             }
-            scan_attestations(directory, |row| {
-                let f = RowFacts::of(&row);
-                if f.is_scores && !f.refs.is_empty() {
-                    scores_with_refs.push(f.clone());
-                }
-                facts.insert(f.id.clone(), f);
-            })
-            .await?;
-            // Facts are only needed for rows that can end up selected; the
-            // scan above kept every row's compact facts so the trace
-            // attestations below are judged without a second read.
         }
-        PurgeSelection::RefusedToday => {
-            scan_attestations(directory, |row| {
-                let f = RowFacts::of(&row);
-                if row.tier == super::types::attestation_tier::FEDERATION
-                    && refused_today(&row).is_some()
-                {
-                    records
-                        .entry(format!("attestation:{}", f.id))
-                        .or_insert(PurgeRecord {
-                            plane: PurgePlane::Attestation,
-                            id: f.id.clone(),
-                            derived_from: None,
-                        });
-                    facts.insert(f.id.clone(), f);
-                } else if f.is_scores && !f.refs.is_empty() {
-                    scores_with_refs.push(f);
-                }
-            })
-            .await?;
-        }
+        PurgeSelection::RefusedToday => {}
     }
 
     if derive {
+        // The class's own rows, and every score that may derive from the
+        // selection, in ONE scan.
+        scan_attestations(directory, |row| {
+            let f = RowFacts::of(&row);
+            if selection.selects_row(&row) {
+                records
+                    .entry(format!("attestation:{}", f.id))
+                    .or_insert(PurgeRecord {
+                        plane: PurgePlane::Attestation,
+                        id: f.id.clone(),
+                        derived_from: None,
+                    });
+                facts.insert(f.id.clone(), f);
+            } else if f.is_scores && !f.refs.is_empty() {
+                scores_with_refs.push(f);
+            }
+        })
+        .await?;
         // A trace's own attestation follows the trace.
         let traces: Vec<String> = records
             .values()
