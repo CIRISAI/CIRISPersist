@@ -15210,7 +15210,7 @@ pub async fn check_delegation_cycle_admission(
 /// therefore holds a write lock from a check that sees the committed graph
 /// through its own insert's commit: an in-process mutex on every backend
 /// (memory, sqlite: one process owns the store), and on postgres also a
-/// transaction-scoped advisory lock, [`DELEGATION_CYCLE_LOCK_KEY`], taken in
+/// transaction-scoped advisory lock, `DELEGATION_CYCLE_LOCK_KEY`, taken in
 /// the insert's own transaction with the check re-run under it, because two
 /// processes share one database.
 ///
@@ -15230,6 +15230,7 @@ pub(crate) fn delegation_cycle_gated(row: &super::Attestation) -> bool {
 /// the insert it admits are one step across every process sharing the
 /// database. A fixed 64-bit constant (the ASCII bytes of `"dlgcycle"`),
 /// distinct from every other key this crate takes.
+#[cfg(feature = "postgres")]
 pub(crate) const DELEGATION_CYCLE_LOCK_KEY: i64 = 0x646c_6763_7963_6c65;
 
 /// v54.0.0 (CIRISPersist#1031) — is `row` a TRUST-PLANE edge, a
