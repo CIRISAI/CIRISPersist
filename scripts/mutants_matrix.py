@@ -323,8 +323,15 @@ def scope_diff(ranges) -> str:
     return "\n".join(out) + "\n"
 
 
-def in_scope(ranges, file: str, line: int) -> bool:
-    return any(f == file and a <= line <= b for f, a, b in ranges)
+def in_scope(ranges, file: str, line: int, end: int | None = None) -> bool:
+    """Whether lines `line..=end` (one line when `end` is absent) touch the
+    scope. cargo-mutants' `--in-diff` keeps a mutant whose SPAN touches an
+    added line, so a whole-body replacement whose first statement is a
+    `#[cfg(test)]` one (`counters()` in src/observe/mod.rs) is generated and
+    tested; judged by its first line alone it was filed out of scope, and a
+    survivor there would never have reached the verdict."""
+    end = line if end is None else max(end, line)
+    return any(f == file and a <= end and line <= b for f, a, b in ranges)
 
 
 def resolve(tool: str, scope_path: str, diff_out: str | None = None) -> None:
@@ -402,11 +409,12 @@ def collect_cargo_mutants(out_dir: Path, scope: dict) -> tuple[list, list, list]
         file = mut.get("file", "")
         span = mut.get("span", {}).get("start", {})
         line, col = span.get("line", 0), span.get("column", 0)
+        end = mut.get("span", {}).get("end", {}).get("line")
         desc = f"{file}:{line}:{col}: {mut.get('name') or mut.get('replacement', '')}"
         name = mut.get("name")
         if name:
             desc = name if name.startswith(file) else f"{file}:{line}:{col}: {name}"
-        if not in_scope(ranges, file, line):
+        if not in_scope(ranges, file, line, end):
             dropped.append(desc)
             continue
         tests |= set(results)
@@ -429,11 +437,12 @@ def collect_cargo_mutants(out_dir: Path, scope: dict) -> tuple[list, list, list]
             file = mut.get("file", "")
             span = mut.get("span", {}).get("start", {})
             line, col = span.get("line", 0), span.get("column", 0)
+            end = mut.get("span", {}).get("end", {}).get("line")
             name = mut.get("name") or ""
             desc = name if name.startswith(file) else f"{file}:{line}:{col}: {name}"
             if desc in seen:
                 continue
-            if not in_scope(ranges, file, line):
+            if not in_scope(ranges, file, line, end):
                 dropped.append(desc)
                 continue
             mutants.append({
@@ -612,7 +621,8 @@ def verdict(matrix: dict, allow: list[dict], repo_url: str = "") -> tuple[int, l
     4: INCOMPLETE (budget hit, or a mutant the tool never ran): the job must
        not read green while mutants went untested (CIRISPersist#1051, run 1:
        rc 124, 8 of 85 untested, job green).
-    5: a surviving mutant that no allow-list entry names. Wins over 4."""
+    5: a surviving mutant that no allow-list entry names, or (cargo-mutants)
+       a mutant the tool ran that the matrix filed out of scope. Wins over 4."""
     s = matrix["summary"]
     label = matrix["scope"] + (f" (shard {matrix['shard']})" if matrix.get("shard") else "")
     ann, md = [], [f"## Mutants — `{label}`", ""]
@@ -629,6 +639,17 @@ def verdict(matrix: dict, allow: list[dict], repo_url: str = "") -> tuple[int, l
         msg = (f"INCOMPLETE: {s['not_run']} of {s['mutants']} mutants never tested; {why}. "
                "Shard the scope or raise the budget (docs/MUTATION_TESTING.md).")
         ann.append(f"::error title=mutants {label} INCOMPLETE::{_escape(msg)}")
+        md += [f"**{msg}**", ""]
+    # cargo-mutants runs only what `--in-diff` (the scope, by line) admits, so
+    # a mutant it generated that the matrix files out of scope is one the two
+    # disagree about: it was tested and is judged nowhere. mutest has no such
+    # filter and generates outside the scope by design.
+    strays = matrix.get("out_of_scope", []) if matrix["tool"] == "cargo-mutants" else []
+    if strays:
+        rc = 5
+        msg = (f"{len(strays)} mutants the tool generated inside the scope's diff were filed "
+               "out of scope by the matrix, so no verdict judged them: " + "; ".join(strays))
+        ann.append(f"::error title=mutants {label} scope disagreement::{_escape(msg)}")
         md += [f"**{msg}**", ""]
     unlisted, listed = [], []
     for m in matrix["mutants"]:
@@ -654,7 +675,8 @@ def verdict(matrix: dict, allow: list[dict], repo_url: str = "") -> tuple[int, l
                                  "scripts/mutants/allowed_survivors.txt with its tracking issue"))
     if not unlisted and not listed:
         md.append("No surviving mutant.")
-    verdict_word = {0: "PASS", 4: "FAIL (incomplete)", 5: "FAIL (unlisted survivors)"}[rc]
+    verdict_word = {0: "PASS", 4: "FAIL (incomplete)",
+                    5: "FAIL (unlisted survivors)" if unlisted else "FAIL (scope disagreement)"}[rc]
     md += ["", f"Verdict: **{verdict_word}** ({len(unlisted)} unlisted, {len(listed)} allow-listed survivors)."]
     return rc, ann, md
 

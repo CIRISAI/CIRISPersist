@@ -26,7 +26,7 @@ the matrix reader matched none of them. Now:
 | 2 | usage, an unresolvable scope, or a malformed allow-list |
 | 3 | refused before building: the scope does not fit the budget at `MUTANTS_BASELINE_SECS + N × MUTANTS_SECS_PER_MUTANT` (600 + 120 s; measured on that run: baseline 305 s, p90 105 s per mutant) |
 | 4 | INCOMPLETE: the budget expired or a mutant was never tested |
-| 5 | a surviving mutant (`missed`, `timeout`, `caught_out_of_scope`) not in `scripts/mutants/allowed_survivors.txt` |
+| 5 | a surviving mutant (`missed`, `timeout`, `caught_out_of_scope`) not in `scripts/mutants/allowed_survivors.txt`; or a mutant cargo-mutants ran that the matrix filed out of scope ("scope disagreement": it was tested and judged nowhere) |
 
 `scripts/mutants_matrix.py verdict` writes the same verdict to
 `$GITHUB_STEP_SUMMARY` and as annotations (`::error` for an unlisted survivor
@@ -40,7 +40,10 @@ let `delete field as_of` in four functions outside the scope, and two field
 deletions in `#[cfg(all(test, ..))] mod r2_test_support`, into every run.
 `resolve` now writes the scope as a diff that adds exactly its lines, minus
 every test-only item (`#[cfg(test)]`, `#[cfg(all(test, ..))]`, a `mod
-*test_support*`), and passes `--in-diff`.
+*test_support*`), and passes `--in-diff`. The matrix keeps a mutant whose
+span touches a scope line, as `--in-diff` does; by first line alone,
+`counters()`'s whole-body replacement (it starts on a `#[cfg(test)]`
+statement) was tested and then dropped unjudged.
 
 **A hung witness fails in 60 s.** The run uses nextest's `mutants` profile
 (`.config/nextest.toml`): a witness that hangs under a mutant is killed after

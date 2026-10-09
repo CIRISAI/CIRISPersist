@@ -37,7 +37,11 @@ and its job was **green**. Each defect, and what now makes it red:
   the scope and two deletions in `#[cfg(all(test, ..))] mod r2_test_support`. Selection is
   now by line through `--in-diff`: the scope is written as a diff that adds exactly its lines,
   minus every test-only item (`#[cfg(test)]`, `#[cfg(all(test, ..))]`, `mod *test_support*`).
-  On the old scope this removes exactly those six.
+  On the old scope this removes exactly those six. The matrix judges a mutant in scope when
+  its SPAN touches a scope line, as `--in-diff` does: judged by its first line, `counters()`'s
+  whole-body replacement (which starts on a `#[cfg(test)]` statement) was run by the tool and
+  then filed out of scope, where a survivor reaches no verdict. A cargo-mutants mutant the
+  matrix still files out of scope is now itself a red verdict (exit 5, "scope disagreement").
 - **v54.0.0 had moved the gate out of its scope.** #1015 split
   `resolve_scoped_stance_by_principals_body` into `per_principal_stances` and
   `combine_per_principal`; the scope named only the old body, which kept one mutant.
@@ -45,7 +49,7 @@ and its job was **green**. Each defect, and what now makes it red:
 - **Hangs cost the budget.** A nextest `mutants` profile kills a witness after 60 s, so a
   mutant that hangs one is that witness's FAIL, not a 300 s tool timeout credited to no one.
 
-`scripts/mutants_matrix_test.py` (20 checks, fixtures, no cargo) now runs per-PR in `ci.yml`,
+`scripts/mutants_matrix_test.py` (22 checks, fixtures, no cargo) now runs per-PR in `ci.yml`,
 in certify's fast tier (`mutmatrix`), and before each nightly leg (#1045 item 4). Each new
 failure path is shown red on a crafted input, and each fix was hand-reverted to show its
 witness red. **mutest-rs stays out of the nightly job:** it needs the pinned nightly and a

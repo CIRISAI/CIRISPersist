@@ -224,6 +224,38 @@
   }
  },
  {
+  "diff": "--- src/observe/mod.rs\n+++ replace counters -> &'static Counters with Box::leak(Box::new(Default::default()))\n@@ -281,21 +281,17 @@\n     static LOCAL: std::cell::Cell<Option<&'static Counters>> = const { std::cell::Cell::new(None) };\n }\n \n /// The counters this read feeds: the process-wide set, or under `cfg(test)`\n /// the current thread's [`LocalCounters`] when one is installed (the\n /// `metrics::with_local_recorder` pattern), so a witness sees only its own\n /// reads while the harness runs other tests in parallel.\n fn counters() -> &'static Counters {\n-    #[cfg(test)]\n-    if let Some(local) = LOCAL.with(std::cell::Cell::get) {\n-        return local;\n-    }\n-    &GLOBAL\n+    Box::leak(Box::new(Default::default())) /* ~ changed by cargo-mutants ~ */\n }\n \n tokio::task_local! {\n     /// The folds the current task is inside, one bit per [`Fold`].\n     static ACTIVE_FOLDS: u32;\n }\n \n /// Record one door read: `rows` returned, `bytes` of envelope decoded (see\n",
+  "file": "src/observe/mod.rs",
+  "function": {
+   "function_name": "counters",
+   "return_type": "-> &'static Counters",
+   "span": {
+    "end": {
+     "column": 2,
+     "line": 294
+    },
+    "start": {
+     "column": 1,
+     "line": 284
+    }
+   }
+  },
+  "genre": "FnValue",
+  "name": "src/observe/mod.rs:289:5: replace counters -> &'static Counters with Box::leak(Box::new(Default::default()))",
+  "package": "ciris-persist",
+  "replacement": "Box::leak(Box::new(Default::default()))",
+  "span": {
+   "end": {
+    "column": 12,
+    "line": 293
+   },
+   "start": {
+    "column": 5,
+    "line": 289
+   }
+  }
+ },
+ {
   "diff": "--- src/observe/catalog.rs\n+++ replace CatalogEntry::metrics_unit -> Option<metrics::Unit> with None\n@@ -45,23 +45,17 @@\n \n impl CatalogEntry {\n     /// The [`metrics::Unit`] [`super::emit_metrics`] describes this entry with:\n     /// `By` is [`metrics::Unit::Bytes`], and a UCUM annotation (`{row}`,\n     /// `{read}`, `{call}`) is a dimensionless count, [`metrics::Unit::Count`].\n     /// `None` for a unit this map does not know; I553 fails on any catalogued\n     /// entry that maps to `None`, so a new unit is mapped before it ships.\n     pub(crate) fn metrics_unit(&self) -> Option<metrics::Unit> {\n-        match self.unit {\n-            \"By\" => Some(metrics::Unit::Bytes),\n-            u if u.len() > 2 && u.starts_with('{') && u.ends_with('}') => {\n-                Some(metrics::Unit::Count)\n-            }\n-            _ => None,\n-        }\n+        None /* ~ changed by cargo-mutants ~ */\n     }\n }\n \n /// The `backend` label key.\n pub const LABEL_BACKEND: &str = \"backend\";\n /// The `door` label key.\n pub const LABEL_DOOR: &str = \"door\";\n /// The `fold` label key.\n",
   "file": "src/observe/catalog.rs",
   "function": {

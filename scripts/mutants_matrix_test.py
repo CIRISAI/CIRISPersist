@@ -155,8 +155,25 @@ class CargoMutantsRealArtifact(unittest.TestCase):
             "src/observe/mod.rs:189:9": "unviable",
             "src/observe/mod.rs:249:22": "missed",
             "src/observe/mod.rs:318:18": "timeout",
+            "src/observe/mod.rs:289:5": "not_run",
             "src/observe/catalog.rs:53:9": "not_run",
         })
+
+    def test_a_mutant_whose_span_enters_the_scope_is_judged(self):
+        # `counters()`'s whole-body replacement starts on its `#[cfg(test)]`
+        # statement (lines 289-292, a test-only hole) and ends on `&GLOBAL`
+        # (293). `--in-diff` keeps it, so the tool tests it; judged by its
+        # first line alone the matrix filed it out of scope, where a
+        # survivor never reaches the verdict.
+        holed = [("src/observe/mod.rs", 1, 288), ("src/observe/mod.rs", 293, 10**9),
+                 ("src/observe/catalog.rs", 1, 10**9)]
+        with mock.patch.object(mm, "scope_ranges", return_value=holed):
+            _, mutants, dropped, _ = mm.collect_cargo_mutants(FIXTURE, OBSERVE_SCOPE)
+        sites = {m["description"].split(": ", 1)[0] for m in mutants}
+        self.assertIn("src/observe/mod.rs:289:5", sites)
+        self.assertFalse([d for d in dropped if "replace counters" in d], dropped)
+        # A span wholly inside the hole stays out.
+        self.assertFalse(mm.in_scope(holed, "src/observe/mod.rs", 289, 292))
 
     def test_the_unvalidated_report_counts_the_witnesses_that_ran(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -298,6 +315,16 @@ class Verdict(unittest.TestCase):
         self.assertEqual(rc, 4)
         self.assertIn("INCOMPLETE", ann[0])
         self.assertIn("budget hit (tool exit 124)", "\n".join(md))
+
+    def test_a_tested_mutant_filed_out_of_scope_fails(self):
+        mx = _matrix({CAUGHT: "caught"})
+        mx["out_of_scope"] = ["src/observe/mod.rs:289:5: replace counters -> &'static Counters with x"]
+        rc, ann, md = mm.verdict(mx, [])
+        self.assertEqual(rc, 5)
+        self.assertIn("scope disagreement", ann[0])
+        self.assertIn("FAIL (scope disagreement)", "\n".join(md))
+        mx["tool"] = "mutest"
+        self.assertEqual(mm.verdict(mx, [])[0], 0)
 
     def test_an_allow_entry_without_an_issue_is_refused(self):
         for bad in ("src/observe/mod.rs:249 replace > with >= in Counters::snapshot\n",
