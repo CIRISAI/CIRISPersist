@@ -16383,7 +16383,8 @@ mod tests {
         // group than an unmoderated one"), and a USER key is steward-bound.
         let human = "human-39f";
         ts::register_identity_key(&*sq, human, crate::federation::types::identity_type::USER).await;
-        crate::ceg::list::drive_query_invariants::bodies::seed_room_signed(
+        // v54.0.0 (#1034) — the room is a declared affiliation.
+        crate::ceg::list::drive_query_invariants::bodies::seed_affiliation_signed(
             &*sq,
             room,
             &[(&node, "node-39f"), (human, human)],

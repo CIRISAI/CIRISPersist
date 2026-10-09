@@ -20,6 +20,10 @@
 //!   record: resolution (explicit, else preset, else the no-op default) and
 //!   one refusal per validation rule; an invalid record is refused at founding
 //!   and on supersession.
+//! - **I565** (memory, sqlite, postgres) — the replicated amendment path: an
+//!   affiliation amended by quorum on A and applied on B records its prior
+//!   version under `affiliations` on B, and a replicated version relabelling
+//!   the held affiliation is refused.
 
 /// Backend-agnostic bodies.
 #[cfg(test)]
@@ -241,6 +245,17 @@ pub mod bodies {
         d.supersede_affiliations(signed(&a2), None)
             .await
             .expect("I563: supersede_affiliations on an affiliation admits");
+        // The held record decides, not the new version's label: a version
+        // declaring `community` offered at the community door over a held
+        // affiliation.
+        let mut relabel = next_version(d, &aff, "relabel").await;
+        relabel.policy_blob = None;
+        expect_mismatch(
+            d.supersede_community(signed(&relabel), None).await,
+            "affiliations",
+            "community",
+            "I563: the community door over a held affiliation, relabelled",
+        );
 
         // The membership write doors refuse before any signature is read.
         let spec = crate::federation::cohort::AdmitSpec {
@@ -329,6 +344,95 @@ pub mod bodies {
             .await,
             rule::CONFIG_ON_COMMUNITY,
             "I563: a config on a plain community is refused",
+        );
+    }
+
+    /// **I565** — the replicated amendment path. A amends an affiliation by
+    /// quorum; B applies A's served record and records the prior version under
+    /// `affiliations` (it always wrote `community`). A version that relabels
+    /// the held affiliation as a community is refused on the replicated door.
+    pub async fn i565_a_replicated_affiliation_amendment(
+        a: &dyn FederationDirectory,
+        b: &dyn FederationDirectory,
+        tag: &str,
+    ) {
+        // The distinguishing part of a key id LEADS: the test signer seeds
+        // from its first 32 bytes.
+        let keys: Vec<String> = ["alice", "bob", "carol"]
+            .iter()
+            .map(|n| format!("{n}-{tag}"))
+            .collect();
+        let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+        let id = format!("{tag}-aff");
+        let mut founding = record(&id, &refs, Some(affiliation_blob(None)));
+        founding.consensus_protocol = consensus_protocol::MAJORITY.to_owned();
+        for d in [a, b] {
+            users(d, &refs).await;
+            found(d, founding.clone())
+                .await
+                .unwrap_or_else(|e| panic!("{tag} I565: founding: {e}"));
+        }
+        let change = a
+            .build_membership_change_envelope(
+                Cohort::Affiliations,
+                &id,
+                &keys,
+                false,
+                Some(consensus_protocol::UNANIMOUS),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{tag} I565: build change: {e}"));
+        let bytes = ciris_verify_core::jcs::canonicalize(&change).unwrap();
+        let sigs = [&keys[0], &keys[1]]
+            .iter()
+            .map(|k| ts::threshold_sign(k, &bytes))
+            .collect();
+        let mut v2 = next_version(a, &id, "renamed").await;
+        v2.consensus_protocol = consensus_protocol::UNANIMOUS.to_owned();
+        a.supersede_affiliations_with_quorum(signed(&v2), change, sigs)
+            .await
+            .unwrap_or_else(|e| panic!("{tag} I565: A's quorum amendment: {e}"));
+        let served = a
+            .list_signed_communities_since(None, u32::MAX)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.community.community.community_key_id == id)
+            .expect("served")
+            .community;
+
+        // A relabelled copy of the same amendment: B holds an affiliation.
+        let mut relabelled = served.clone();
+        relabelled.community.policy_blob = None;
+        let relabelled = crate::federation::SignedCommunity {
+            supersede_proof: served.supersede_proof.clone(),
+            ..ts::sign_community(&keys[0], relabelled.community)
+        };
+        expect_mismatch(
+            b.put_community(relabelled).await,
+            "affiliations",
+            "community",
+            "I565: a replicated version relabelling the affiliation",
+        );
+
+        b.put_community(served)
+            .await
+            .unwrap_or_else(|e| panic!("{tag} I565: B applies A's amendment: {e}"));
+        let aff = b
+            .list_group_versions(Cohort::Affiliations, &id)
+            .await
+            .unwrap();
+        assert!(
+            aff.iter().any(|v| v.version == 1 && !v.is_current),
+            "{tag} I565: B recorded the prior version under `affiliations`: {aff:?}"
+        );
+        assert!(
+            b.list_group_versions(Cohort::Community, &id)
+                .await
+                .unwrap()
+                .iter()
+                .all(|v| v.is_current),
+            "{tag} I565: and not under `community`"
         );
     }
 
@@ -551,6 +655,18 @@ mod run {
                     super::super::bodies::i563_the_cohort_is_declared(
                         &d as &dyn FederationDirectory,
                         &format!("i563-{}", super::suffix()),
+                    )
+                    .await
+                }
+                #[tokio::test(flavor = "multi_thread")]
+                async fn i565() {
+                    let (Some(a), Some(b)) = ($fresh.await, $fresh.await) else {
+                        return;
+                    };
+                    super::super::bodies::i565_a_replicated_affiliation_amendment(
+                        &a as &dyn FederationDirectory,
+                        &b as &dyn FederationDirectory,
+                        &format!("i565-{}", super::suffix()),
                     )
                     .await
                 }
