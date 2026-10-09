@@ -1434,6 +1434,7 @@ mod runners {
     sqlite_engine_case!(i526_sqlite, i526_a_plaintext_room_write_carries_the_group);
     #[cfg(feature = "sqlite")]
     sqlite_engine_case!(i579_sqlite, i579_shared_plaintext_keeps_every_room);
+    #[cfg(feature = "sqlite")]
     sqlite_engine_case!(i605_sqlite, i605_durability_reaches_every_plaintext_room);
     #[cfg(feature = "sqlite")]
     #[tokio::test]
@@ -1484,6 +1485,7 @@ mod runners {
     postgres_engine_case!(i526_postgres, i526_a_plaintext_room_write_carries_the_group);
     #[cfg(feature = "postgres")]
     postgres_engine_case!(i579_postgres, i579_shared_plaintext_keeps_every_room);
+    #[cfg(feature = "postgres")]
     postgres_engine_case!(i605_postgres, i605_durability_reaches_every_plaintext_room);
     #[cfg(feature = "postgres")]
     #[tokio::test]
