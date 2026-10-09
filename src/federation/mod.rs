@@ -546,6 +546,9 @@ pub mod reverse_quorum;
 pub mod schema_resolver;
 pub mod scores;
 pub mod scores_read_audit;
+pub mod steward_purge;
+#[cfg(test)]
+mod steward_purge_invariants;
 pub mod trust_root;
 // CIRISPersist#210 — cross-process leader election (RNS shared-instance
 // owner; CIRISEdge#100). Backend-agnostic types + staleness helper; the
@@ -5676,6 +5679,180 @@ pub trait FederationDirectory: Send + Sync {
         since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         limit: u32,
     ) -> Result<Vec<ServedAttestation>, Error>;
+
+    // ── v54.1.0 (CIRISPersist#1046) — the steward purge plane ──────────────
+    //
+    // The store half of [`steward_purge`]: the scan and trace reads the
+    // selection classes resolve over, the ledger header + tombstone tables
+    // (V187), and the delete doors `purge_finalize` drives. Defaulted
+    // `Unsupported`; memory, sqlite and postgres override every one.
+
+    /// Every attestation row, EVERY tier, whose `attestation_id` sorts after
+    /// `after_id`, ordered by `attestation_id`, at most `limit`. The selection
+    /// classes' scan ([`steward_purge::scan_attestations`]); never a serve
+    /// surface.
+    async fn purge_scan_attestations(
+        &self,
+        after_id: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<Attestation>, Error> {
+        let _ = (after_id, limit);
+        Err(Error::Unsupported {
+            method: "purge_scan_attestations",
+        })
+    }
+
+    /// The distinct `trace_id`s with a `trace_llm_calls` row whose `model` is
+    /// `model`, sorted (CIRISPersist#1040).
+    async fn purge_trace_ids_for_llm_model(&self, model: &str) -> Result<Vec<String>, Error> {
+        let _ = model;
+        Err(Error::Unsupported {
+            method: "purge_trace_ids_for_llm_model",
+        })
+    }
+
+    /// The distinct `trace_id`s of `trace_events` rows signed by `key_id`
+    /// (`signing_key_id`), sorted.
+    async fn purge_trace_ids_signed_by(&self, key_id: &str) -> Result<Vec<String>, Error> {
+        let _ = key_id;
+        Err(Error::Unsupported {
+            method: "purge_trace_ids_signed_by",
+        })
+    }
+
+    /// `(trace_events rows, trace_llm_calls rows)` held for `trace_ids`.
+    async fn purge_trace_row_counts(&self, trace_ids: &[String]) -> Result<(u64, u64), Error> {
+        let _ = trace_ids;
+        Err(Error::Unsupported {
+            method: "purge_trace_row_counts",
+        })
+    }
+
+    /// The `key_id`s whose Ed25519 key digests to `digest`
+    /// (`Sha256Ed25519Raw`, 64 lowercase hex).
+    async fn purge_key_ids_for_digest(&self, digest: &str) -> Result<Vec<String>, Error> {
+        let _ = digest;
+        Err(Error::Unsupported {
+            method: "purge_key_ids_for_digest",
+        })
+    }
+
+    /// Record an execution header. `Ok(true)` when inserted, `Ok(false)` when
+    /// a header for the notice id is already held (the notice id is the hash
+    /// of the notice bytes, so a second one is the same notice; the first is
+    /// kept). The store stamps `admitted_at`.
+    async fn purge_put_execution(
+        &self,
+        execution: &steward_purge::PurgeExecution,
+    ) -> Result<bool, Error> {
+        let _ = execution;
+        Err(Error::Unsupported {
+            method: "purge_put_execution",
+        })
+    }
+
+    /// Record one tombstone. `Ok(true)` when inserted, `Ok(false)` when the
+    /// notice already holds it (`(notice_id, plane, record_ref)`).
+    async fn purge_put_tombstone(
+        &self,
+        tombstone: &steward_purge::PurgeTombstone,
+    ) -> Result<bool, Error> {
+        let _ = tombstone;
+        Err(Error::Unsupported {
+            method: "purge_put_tombstone",
+        })
+    }
+
+    /// The execution header for `notice_id`, if held.
+    async fn purge_execution(
+        &self,
+        notice_id: &str,
+    ) -> Result<Option<steward_purge::PurgeExecution>, Error> {
+        let _ = notice_id;
+        Err(Error::Unsupported {
+            method: "purge_execution",
+        })
+    }
+
+    /// Every tombstone of `notice_id`, ordered by ordinal.
+    async fn purge_tombstones_of(
+        &self,
+        notice_id: &str,
+    ) -> Result<Vec<steward_purge::PurgeTombstone>, Error> {
+        let _ = notice_id;
+        Err(Error::Unsupported {
+            method: "purge_tombstones_of",
+        })
+    }
+
+    /// The (lexically first) notice id that tombstoned `(plane, record_ref)`,
+    /// if any — the admission gates' read.
+    async fn purge_tombstoned(
+        &self,
+        plane: &str,
+        record_ref: &str,
+    ) -> Result<Option<String>, Error> {
+        let _ = (plane, record_ref);
+        Err(Error::Unsupported {
+            method: "purge_tombstoned",
+        })
+    }
+
+    /// Execution headers since a `(admitted_at, notice_id)` cursor, ordered
+    /// by it — the tombstone plane's serve read.
+    async fn list_purge_executions_since(
+        &self,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
+        limit: u32,
+    ) -> Result<Vec<steward_purge::PurgeExecution>, Error> {
+        let _ = (since, limit);
+        Err(Error::Unsupported {
+            method: "list_purge_executions_since",
+        })
+    }
+
+    /// Hard-delete ONE attestation row — only if a purge tombstone names it
+    /// (the door's own gate, in the same statement). `Ok(true)` if removed.
+    async fn purge_delete_tombstoned_attestation(
+        &self,
+        attestation_id: &str,
+    ) -> Result<bool, Error> {
+        let _ = attestation_id;
+        Err(Error::Unsupported {
+            method: "purge_delete_tombstoned_attestation",
+        })
+    }
+
+    /// Hard-delete a trace's `trace_events` and `trace_llm_calls` rows — only
+    /// if a purge tombstone names the trace. `(events, llm_calls)` deleted.
+    async fn purge_delete_tombstoned_trace(&self, trace_id: &str) -> Result<(u64, u64), Error> {
+        let _ = trace_id;
+        Err(Error::Unsupported {
+            method: "purge_delete_tombstoned_trace",
+        })
+    }
+
+    /// Hard-delete the key rows whose Ed25519 digest is `digest` — only if a
+    /// purge tombstone names it — with the revocation rows naming them.
+    /// `Ok(true)` if a key row was removed.
+    async fn purge_delete_tombstoned_key(&self, digest: &str) -> Result<bool, Error> {
+        let _ = digest;
+        Err(Error::Unsupported {
+            method: "purge_delete_tombstoned_key",
+        })
+    }
+
+    /// Stamp `finalized_at` on the header. `Ok(true)` if it was unset.
+    async fn purge_mark_finalized(
+        &self,
+        notice_id: &str,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, Error> {
+        let _ = (notice_id, at);
+        Err(Error::Unsupported {
+            method: "purge_mark_finalized",
+        })
+    }
 
     /// v53.0.0 (CIRISPersist#975, CC 2.4 ask 4) — every stored
     /// `attestation_type` with its row count and `asserted_at` span, every
@@ -11582,6 +11759,22 @@ pub enum Error {
         /// What the identity was needed for, so the message is actionable.
         needed_for: &'static str,
     },
+
+    /// v54.1.0 (CIRISPersist#1046, CIRISConstitution#165) — **the steward
+    /// purge door refused.** `token` is one of the closed set in
+    /// [`steward_purge::token`] (`purge_unauthorised`,
+    /// `purge_selection_digest_mismatch`, `purge_selection_count_mismatch`,
+    /// `purge_retraction_inadmissible`, …) and is what [`Error::kind`]
+    /// returns, so a host maps it to a stable reason id without parsing prose.
+    /// `body` carries the typed detail the CSD-108 operator flow renders
+    /// (`{table, expected, found}`, `{record_id, plane, index, total}`, …).
+    #[error("{token}: {body}")]
+    PurgeRefused {
+        /// The stable refusal token.
+        token: &'static str,
+        /// The typed detail, a JSON object.
+        body: serde_json::Value,
+    },
 }
 
 impl Error {
@@ -11718,6 +11911,7 @@ impl Error {
             Error::WitnessAdmit(e) => e.kind(),
             Error::Backend(_) => "federation_backend",
             Error::Unsupported { .. } => "federation_ops_proxy_unsupported",
+            Error::PurgeRefused { token, .. } => token,
         }
     }
 

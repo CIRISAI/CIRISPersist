@@ -612,6 +612,26 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("blob_associations", ConnClass::Read),
     // v54.0.0 (#996) — the outbound queue's status-grouped COUNT.
     ("outbound_counts", ConnClass::Read),
+    // v54.1.0 (CIRISPersist#1046) — the steward purge plane (V187): the
+    // selection reads, the ledger header + tombstone writes, the delete doors
+    // `purge_finalize` drives, and the #1043 legacy-row test seam.
+    ("purge_scan_attestations", ConnClass::Read),
+    ("purge_trace_ids_for_llm_model", ConnClass::Read),
+    ("purge_trace_ids_signed_by", ConnClass::Read),
+    ("purge_trace_row_counts", ConnClass::Read),
+    ("purge_key_ids_for_digest", ConnClass::Read),
+    ("purge_put_execution", ConnClass::Write),
+    ("purge_put_tombstone", ConnClass::Write),
+    ("purge_execution", ConnClass::Read),
+    ("purge_tombstones_of", ConnClass::Read),
+    ("purge_tombstoned", ConnClass::Read),
+    ("list_purge_executions_since", ConnClass::Read),
+    ("purge_delete_tombstoned_attestation", ConnClass::Write),
+    ("purge_delete_tombstoned_trace", ConnClass::Write),
+    ("purge_delete_tombstoned_key", ConnClass::Write),
+    ("purge_mark_finalized", ConnClass::Write),
+    ("test_seam_set_attestation_asserted_at", ConnClass::Write),
+    ("test_seam_set_key_identity_type", ConnClass::Write),
     ("put_blob_chunks", ConnClass::Write),
     ("put_blob_with_scope", ConnClass::Write),
     ("put_calibration_bundle", ConnClass::Write),

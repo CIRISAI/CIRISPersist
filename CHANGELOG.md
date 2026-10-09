@@ -7,6 +7,12 @@ threat-model citations because this crate's audit story is the point.
 
 ## [Unreleased]
 
+## [54.1.0] - unreleased
+
+### Added — the generic steward purge door (#1046, CIRISConstitution#165, CSD-108)
+
+(Checkpoint entry; completed below as the slice lands.)
+
 ## [54.0.0] - 2026-10-09
 
 ### Changed — Verify 20.1.0 adopted: the three verify crates and the wheel floor move together (#992)

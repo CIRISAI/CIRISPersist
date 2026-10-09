@@ -3159,6 +3159,9 @@ class Engine:
     def nodes_stewarded_by_json(self, steward_user_key_id: str) -> str:
         """(derived) empirical — CIRISPersist#299 — the OUTBOUND steward-binding reader: the nodes steward_user_key_id owns (exact inverse of steward_bindings_of_json — n ∈ nodes_s..."""
 
+    def outbound_counts(self) -> dict[str, Any]:
+        """(derived) empirical — v54.0.0 (CIRISPersist#996, CIRISEdge#814 item 2) — how many outbound rows sit in each status, as {status_wire_str: count} (statuses with no row omi..."""
+
     def outbound_status(self, queue_id: str) -> dict[str, Any] | None:
         """(derived) empirical — v0.4.0 — Look up a row by queue_id. Returns the row dict or None. Used by DurableHandle::status()."""
 
@@ -4126,8 +4129,29 @@ class Engine:
     # Varying one of these out of scope by construction — see `report` for why this is empty.
     # ==============================================================
 
-    def outbound_counts(self) -> dict[str, Any]:
-        """(derived) contingent — v54.0.0 (CIRISPersist#996, CIRISEdge#814 item 2) — how many outbound rows sit in each status, as {status_wire_str: count} (statuses with no row omi..."""
+    def apply_replicated_purge_json(self, bundle_json: str, now_iso: str) -> str:
+        """(derived) contingent — v54.1.0 (CIRISPersist#1046) — apply a peer's purge bundle: the notice is re-verified against THIS node's trust root and the digest re-derived from..."""
+
+    def list_purge_bundles_since_json(self, limit: int, since_iso: str | None = None, since_notice_id: str | None = None) -> str:
+        """(derived) contingent — v54.1.0 (CIRISPersist#1046, CIRISConstitution#165 §3) — serve the purge tombstone plane: a JSON array of PurgeBundle (notice, whole cosignature set..."""
+
+    def purge_dry_run_json(self, selection_json: str) -> str:
+        """(derived) contingent — v54.1.0 (CIRISPersist#1046, CSD-108) — dry run a steward purge. selection_json is a tagged selection: {"kind": "by_actor", "key_id": …}, {"kind": "..."""
+
+    def purge_finalize_json(self, notice_id: str, now_iso: str) -> str:
+        """(derived) contingent — v54.1.0 (CIRISPersist#1046, CSD-108 §6 Q4) — finalize: hard-delete an executed purge's records after the retraction round settled. ValueError(purge..."""
+
+    def purge_ledger_tsv(self, notice_id: str) -> str:
+        """(derived) contingent — v54.1.0 (CIRISPersist#1046) — the executed purge's ledger as TSV (for evidence/purges/<date>-<selection-digest>.tsv): a header carrying the digest,..."""
+
+    def purge_notice_signing_payload_json(self, envelope_json: str) -> str:
+        """(derived) contingent — v54.1.0 (CIRISPersist#1046) — the bytes a founder cosigns for a purge notice and the notice id they hash to: {"signing_bytes_b64": …, "notice_id":..."""
+
+    def purge_rows_json(self, selection_json: str, notice_json: str, now_iso: str) -> str:
+        """(derived) contingent — v54.1.0 (CIRISPersist#1046, CIRISConstitution#165) — execute a steward purge. notice_json is {"envelope": {…takedown_notice…}, "cosignatures": [Thr..."""
+
+    def purge_status_json(self, notice_id: str, now_iso: str) -> str:
+        """(derived) contingent — v54.1.0 (CIRISPersist#1046) — a purge's state at now_iso (executed / settled / finalized), its settle instant and its tombstone counts. ValueError(..."""
 
 
 class ScoringFactorStream:
