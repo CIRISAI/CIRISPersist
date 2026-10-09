@@ -684,6 +684,9 @@ class Engine:
     def capacity_consent_stance(self, attester_key_id: str, subject_key_id: str, family: str, now_iso: str | None = None) -> str:
         """(derived) deontic — v53.1.8 (CIRISPersist#1013) — the consent-before-scoring stance the emit gate asks: by principals, scope analyze:<family>. A scorer's precheck call..."""
 
+    def capacity_consent_stance_with_basis(self, attester_key_id: str, subject_key_id: str, family: str, now_iso: str | None = None) -> str:
+        """(derived) deontic — v54.1.0 (CIRISPersist#1041) — [Self::capacity_consent_stance] WITH the consent basis: the rows the stance rests on, so a scorer can record them in..."""
+
     def check_no_moderator_federate_json(self, community_id: str) -> str:
         """v13.0.0 (CIRISPersist#369, CC 4.5.4 / §11.11) — the directly drivable
         **no-moderator-no-federate admission verdict** for one community: exactly
@@ -3173,6 +3176,9 @@ class Engine:
     def nodes_stewarded_by_json(self, steward_user_key_id: str) -> str:
         """(derived) empirical — CIRISPersist#299 — the OUTBOUND steward-binding reader: the nodes steward_user_key_id owns (exact inverse of steward_bindings_of_json — n ∈ nodes_s..."""
 
+    def outbound_counts(self) -> dict[str, Any]:
+        """(derived) empirical — v54.0.0 (CIRISPersist#996, CIRISEdge#814 item 2) — how many outbound rows sit in each status, as {status_wire_str: count} (statuses with no row omi..."""
+
     def outbound_status(self, queue_id: str) -> dict[str, Any] | None:
         """(derived) empirical — v0.4.0 — Look up a row by queue_id. Returns the row dict or None. Used by DurableHandle::status()."""
 
@@ -4133,15 +4139,6 @@ class Engine:
 
     def wholeness_witness_root_hex(self, leaf_bytes_b64_json: str) -> str:
         """(derived) pragmatic — v16 (CIRISPersist#431) — pure §19.1 root builder: the WW-scheme Merkle root (lexicographic leaf order, odd-duplication, WW-v1-empty empty sentinel)..."""
-
-
-    # ==============================================================
-    # CONTINGENT  (descriptive)
-    # Varying one of these out of scope by construction — see `report` for why this is empty.
-    # ==============================================================
-
-    def outbound_counts(self) -> dict[str, Any]:
-        """(derived) contingent — v54.0.0 (CIRISPersist#996, CIRISEdge#814 item 2) — how many outbound rows sit in each status, as {status_wire_str: count} (statuses with no row omi..."""
 
 
 class ScoringFactorStream:

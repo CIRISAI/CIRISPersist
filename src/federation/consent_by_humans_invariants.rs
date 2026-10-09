@@ -740,9 +740,22 @@ mod run {
         const ADM: &str = include_str!("admission.rs");
         const MODULE: &str = include_str!("consent_by_humans.rs");
         const PYO3: &str = include_str!("../ffi/pyo3.rs");
+        // v54.1.0 (#1041) — `steward_bindings_of` is the key set of
+        // `steward_binding_paths_of`, which carries the walk's body.
+        {
+            let body = ADM
+                .split("pub async fn steward_bindings_of(")
+                .nth(1)
+                .expect("steward_bindings_of");
+            let body = &body[..body.find("\n}\n").expect("fn end")];
+            assert!(
+                body.contains("steward_binding_paths_of("),
+                "I94 (b): steward_bindings_of is the labelled walk's key set"
+            );
+        }
         for f in [
             "pub async fn is_steward_bound(",
-            "pub async fn steward_bindings_of(",
+            "pub async fn steward_binding_paths_of(",
             "pub async fn steward_binding_chain(",
         ] {
             let body = ADM.split(f).nth(1).expect(f);

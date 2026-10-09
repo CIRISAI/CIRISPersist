@@ -4954,7 +4954,12 @@ pub async fn check_capacity_consent_admission(
     // v53.1.8 (CIRISPersist#1013) — by principals (#857): a steward's grant
     // naming the subject in `for_key_id` counts, as it does in a scorer's
     // precheck, because both now ask the one fold.
-    let stance = super::consent_by_humans::capacity_consent_stance(
+    //
+    // v54.1.0 (CIRISPersist#1041) — the basis-carrying fold, the one a
+    // scorer's precheck asks before it records the basis in its envelope.
+    // `ConsentGateRefused` does not carry the basis: it is an exhaustive
+    // public struct, and a new field would break a pin-compatible minor.
+    let (stance, _basis) = super::consent_by_humans::capacity_consent_stance_with_basis(
         directory,
         &row.attesting_key_id,
         &row.attested_key_id,
@@ -9998,7 +10003,53 @@ pub async fn steward_bindings_of(
     directory: &dyn super::FederationDirectory,
     k: &str,
 ) -> Result<Vec<String>, Error> {
-    let mut out: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // v54.1.0 (CIRISPersist#1041) — the keys of the labelled walk: one body,
+    // so a consent basis's path labels cannot disagree with membership.
+    Ok(steward_binding_paths_of(directory, k)
+        .await?
+        .into_keys()
+        .collect())
+}
+
+/// v54.1.0 (CIRISPersist#1041) — WHICH clause of [`steward_bindings_of`] put
+/// each steward in `k`'s set. Labels only: a key may be reached by more than
+/// one clause, and membership is the map's key set, which IS
+/// [`steward_bindings_of`]`(k)` (that function returns these keys).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StewardPath {
+    /// Clause (1): `k`'s own key is `user`-role, so `k` stewards itself.
+    SelfUser,
+    /// Clause (2): `k` is an ACTIVE occurrence of this `user`-role identity
+    /// (`user_identity_anchors_of`).
+    OccurrenceOf,
+    /// Clause (3): this `user`-role key granted a LIVE `delegates_to` to `k`
+    /// of the shape `k`'s agency admits (an owner-binding to a person; any
+    /// delegation to a node).
+    DelegatesTo,
+}
+
+impl StewardPath {
+    /// The stable token (the serde spelling).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SelfUser => "self_user",
+            Self::OccurrenceOf => "occurrence_of",
+            Self::DelegatesTo => "delegates_to",
+        }
+    }
+}
+
+/// v54.1.0 (CIRISPersist#1041) — [`steward_bindings_of`] with each steward's
+/// clause label(s), sorted by key. THE body of the steward walk: the three
+/// clauses below are the ones [`is_steward_bound`] tests.
+pub async fn steward_binding_paths_of(
+    directory: &dyn super::FederationDirectory,
+    k: &str,
+) -> Result<std::collections::BTreeMap<String, Vec<StewardPath>>, Error> {
+    let mut out: std::collections::BTreeMap<String, Vec<StewardPath>> =
+        std::collections::BTreeMap::new();
     // v11.5.0 (CIRISPersist#306) — mirror `is_steward_bound`'s minor gate so
     // the invariant `is_steward_bound(k) ⟺ !steward_bindings_of(k).is_empty()`
     // holds: a PROVEN minor user does NOT self-anchor (clauses 1/2 are
@@ -10008,12 +10059,16 @@ pub async fn steward_bindings_of(
         // (1) k's own key is user-role.
         if let Some(rec) = directory.lookup_public_key(k).await? {
             if identity_type::set_contains(&rec.identity_type, identity_type::USER) {
-                out.insert(k.to_owned());
+                out.entry(k.to_owned())
+                    .or_default()
+                    .push(StewardPath::SelfUser);
             }
         }
         // (2) k is an occurrence of a user-role identity.
         // v44.6.0 (#857) — every row for the key, ACTIVE only, spelled once.
-        out.extend(user_identity_anchors_of(directory, k).await?);
+        for u in user_identity_anchors_of(directory, k).await? {
+            out.entry(u).or_default().push(StewardPath::OccurrenceOf);
+        }
     }
     // (3) each user-role granter U of a LIVE delegates_to(U → k) — with the
     // filter chosen by **whether `k` has agency**.
@@ -10046,9 +10101,12 @@ pub async fn steward_bindings_of(
     // ANY delegation naming it; one that can is stewarded only where the envelope
     // declares custody.
     let filter = steward_edge_filter(directory, k).await?;
-    out.extend(live_delegation_granters(directory, k, filter).await?);
-    let mut out: Vec<String> = out.into_iter().collect();
-    out.sort();
+    for u in live_delegation_granters(directory, k, filter).await? {
+        out.entry(u).or_default().push(StewardPath::DelegatesTo);
+    }
+    for paths in out.values_mut() {
+        paths.dedup();
+    }
     Ok(out)
 }
 

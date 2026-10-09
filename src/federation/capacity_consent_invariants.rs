@@ -473,8 +473,8 @@ mod run {
             .expect("gate");
         let gate = strip(&gate[..gate.find("\n}\n").expect("gate end")]);
         assert!(
-            gate.contains("consent_by_humans::capacity_consent_stance("),
-            "I548e: the gate asks the one fold"
+            gate.contains("consent_by_humans::capacity_consent_stance_with_basis("),
+            "I548e: the gate asks the one fold (v54.1.0 #1041: the basis-carrying one)"
         );
         assert!(
             !gate.contains("resolve_scoped_consent("),
@@ -488,6 +488,25 @@ mod run {
         assert!(
             e.contains("consent_by_humans::capacity_consent_stance("),
             "I548e: the Engine door delegates to the module"
+        );
+        // v54.1.0 (#1041) — the basis door delegates the same way.
+        let eb = ENGINE
+            .split("pub async fn capacity_consent_stance_with_basis(")
+            .nth(1)
+            .expect("Engine basis door");
+        let eb = strip(&eb[..eb.find("\n    }\n").expect("end")]);
+        assert!(
+            eb.contains("consent_by_humans::capacity_consent_stance_with_basis("),
+            "I548e: the Engine basis door delegates to the module"
+        );
+        let pyb = PYO3
+            .split("    fn capacity_consent_stance_with_basis(")
+            .nth(1)
+            .expect("PyO3 basis door");
+        let pyb = strip(&pyb[..pyb.find("\n    }\n").expect("end")]);
+        assert!(
+            pyb.contains("engine.capacity_consent_stance_with_basis("),
+            "I548e: the PyO3 basis mirror delegates to the Engine"
         );
         let py = PYO3
             .split("    fn capacity_consent_stance(")

@@ -9213,6 +9213,36 @@ impl Engine {
         .await
     }
 
+    /// v54.1.0 (CIRISPersist#1041) — [`Self::capacity_consent_stance`] WITH
+    /// the [`ConsentBasis`](crate::federation::consent_by_humans::ConsentBasis):
+    /// the consent rows the stance rests on, each with its principal and path.
+    /// The fold the emit gate asks, so a scorer that records the basis records
+    /// what the gate decides on. See
+    /// [`consent_by_humans::capacity_consent_stance_with_basis`](crate::federation::consent_by_humans::capacity_consent_stance_with_basis).
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn capacity_consent_stance_with_basis(
+        &self,
+        attester_key_id: &str,
+        subject_key_id: &str,
+        family: crate::federation::admission::ConsentGatedFamily,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<
+        (
+            crate::federation::hard_case::ConsentState,
+            crate::federation::consent_by_humans::ConsentBasis,
+        ),
+        crate::federation::Error,
+    > {
+        crate::federation::consent_by_humans::capacity_consent_stance_with_basis(
+            self.federation_directory().as_ref(),
+            attester_key_id,
+            subject_key_id,
+            family,
+            now,
+        )
+        .await
+    }
+
     /// v44.8.0 (CIRISPersist#866 C1b) — [`Self::resolve_scoped_consent_by_principals`]
     /// WITH its bound: `retain_until` is the tightest `retain:<window>` any
     /// principal signed for this machine. The door a sweep asks before it

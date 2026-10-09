@@ -99,6 +99,9 @@ pub mod consent_by_humans_invariants;
 // v53.1.8 (#1013) — I548: the capacity gate and a scorer's precheck ask one fold.
 #[cfg(test)]
 mod capacity_consent_invariants;
+// v54.1.0 (#1041) — I622–I624: the consent basis names the rows a stance rests on.
+#[cfg(test)]
+mod consent_basis_invariants;
 // v54.0.0 (#1015) — I570: a steward's shorter `retain` window naming the machine bounds both
 // retention sweeps.
 pub mod consent_expiry;

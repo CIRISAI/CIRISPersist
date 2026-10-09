@@ -25929,6 +25929,55 @@ impl PyEngine {
         })
     }
 
+    /// v54.1.0 (CIRISPersist#1041) — [`Self::capacity_consent_stance`] WITH
+    /// the consent basis: the rows the stance rests on, so a scorer can record
+    /// them in its capacity envelope's `evidence_refs`. Returns JSON
+    /// `{"state": "granted"|"revoked"|"expired"|"unspecified", "basis":
+    /// {"rows": [{"principal": str, "paths": ["subject"|"occurrence_of"|
+    /// "delegates_to", ...], "attestation_id": str}, ...]}}`. `rows` is empty
+    /// exactly when the state is `unspecified`. Same arguments and errors as
+    /// `capacity_consent_stance`. FFI mirror of
+    /// [`Engine::capacity_consent_stance_with_basis`](crate::Engine::capacity_consent_stance_with_basis).
+    #[pyo3(signature = (attester_key_id, subject_key_id, family, now_iso = None))]
+    fn capacity_consent_stance_with_basis(
+        &self,
+        py: Python<'_>,
+        attester_key_id: &str,
+        subject_key_id: &str,
+        family: &str,
+        now_iso: Option<&str>,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let now = match now_iso {
+                Some(v) => chrono::DateTime::parse_from_rfc3339(v)
+                    .map(|t| t.with_timezone(&chrono::Utc))
+                    .map_err(|e| PyValueError::new_err(format!("now_iso parse: {e}")))?,
+                None => chrono::Utc::now(),
+            };
+            let family = crate::federation::admission::ConsentGatedFamily::from_token(family)
+                .ok_or_else(|| {
+                    PyValueError::new_err(format!(
+                        "unknown consent-gated family {family:?}; known: {:?}",
+                        crate::federation::admission::ConsentGatedFamily::ALL
+                            .iter()
+                            .map(|f| f.as_str())
+                            .collect::<Vec<_>>()
+                    ))
+                })?;
+            let (a, sub) = (attester_key_id.to_owned(), subject_key_id.to_owned());
+            let engine = self.hold_engine_view();
+            py.detach(move || {
+                let (state, basis) = self
+                    .runtime
+                    .block_on(engine.capacity_consent_stance_with_basis(&a, &sub, family, now))
+                    .map_err(federation_err_to_py)?;
+                serde_json::to_string(&serde_json::json!({ "state": state, "basis": basis }))
+                    .map_err(|e| PyRuntimeError::new_err(format!("serialize: {e}")))
+            })
+        })
+    }
+
     /// v44.8.0 (CIRISPersist#866 C1b) — `resolve_scoped_consent_by_principals`
     /// WITH its bound. Returns JSON `{"state": "granted"|"revoked"|"expired"|
     /// "unspecified", "retain_until": <RFC-3339>|null}`: `retain_until` is the
