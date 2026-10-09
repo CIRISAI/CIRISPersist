@@ -66,7 +66,10 @@ fail-fast = false
 # against a cluster with `max_connections = 400`; sixteen concurrent PG test
 # processes stay well inside it. The `#[serial_test::serial(postgres)]`
 # markers in the tree are inert under nextest (an in-process lock, one
-# process per test) and are left as documentation of the era they came from.
+# process per test). v54.1.0 (#1003): they still hold under `cargo test`, where
+# `test_pg::dsn()` gives every test of the one process the same database; the
+# 49 on tests that own their database or touch none are gone, and
+# rules/serial-keys.yml lists every remaining key with its reason.
 [test-groups.postgres]
 max-threads = 16
 

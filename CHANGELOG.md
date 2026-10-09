@@ -154,6 +154,29 @@ Each spelled its own attribute test and most knew only `#[cfg(test)]`. They now 
 - Reverting the predicate to `#[cfg(test)]` alone turns I693 red and the supersets gate back to
   green.
 
+### Changed — 49 `#[serial]` markers off tests that own their database or touch none; every remaining key has a stated reason (#1003)
+
+The issue's runtime premise had already moved: under nextest every test is its own process, and
+`serial_test`'s lock is process-local, so the markers were inert there (#879 lifted the postgres
+test group to 16 for the cost the issue measured). They do hold under `cargo test`, where
+`test_pg::dsn()` hands every test in the one process the SAME database, so a marker can only come
+off a test that does not use that database.
+
+- **Removed (49):** 10 postgres tests that provision their own database (`isolated_dsn` /
+  `empty_dsn`), 29 memory-backend parity legs and 10 pure-function tests (blobs.rs chunk rows,
+  scope_bind placeholder rebasing, legacy-schema validation) that reach no database. Classified
+  by resolving each marked test's calls, transitively within its file, to `dsn()`,
+  `isolated_dsn()`, `empty_dsn()` or none; 637 markers reach `dsn()` and stay.
+- **Kept, by key, each with one line of reason** in `rules/serial-keys.yml`: `postgres` (the
+  per-process database under `cargo test`), `test_anchor_env`, `engine_singleton`,
+  `gil_teardown`, `runtime_teardown_gauge`, `env_ciris_data_dir`. The rule (src/ and tests/)
+  refuses a bare `#[serial]` or an unlisted key; its rule tests show both red.
+- **Measured.** The postgres lane under nextest (833 tests, the five postgres filters plus the 49):
+  168.7 s before; 167.1 / 169.1 / 166.2 s after, 833/833 passed each time, so no flake in three
+  runs and, as expected, no time change. The same 47 compiled tests under `cargo test
+  --test-threads=16`, interleaved A/A/B/B/B: 23.5 / 23.5 s with the markers, 4.9 / 4.5 / 5.0 s
+  without.
+
 ### Changed — Verify 20.1.0 adopted: the three verify crates and the wheel floor move together (#992)
 
 `ciris-verify-core`, `ciris-keyring` and `ciris-crypto` move from tag v19.0.0 to v20.1.0 at all seven pin sites in one cut, since a split re-pin forks `ciris_crypto`. The wheel's `Requires-Dist` moves to `ciris-verify>=20.1.0,<21`. The floor is 20.1.0 because that minor ships the wheel-identity refusals the tag job's signer now relies on. The lockfile gains one transitive crate, `zlib-rs`, which verify-core's wheel reader pulls in. The test-anchor witness I162 had typed the expected verify tag as `v19.0.0` and went red on the flip, so it now reads every CIRISVerify pin from `Cargo.toml` and requires them to name one tag.

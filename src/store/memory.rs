@@ -22976,7 +22976,6 @@ mod tests {
     /// backend where an untested divergence hides (v21.11–17.1, seven times).
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     #[tokio::test]
-    #[serial_test::serial(postgres)]
     async fn load_bearing_predicate_parity_memory_564() {
         let backend = MemoryBackend::new();
         crate::federation::load_bearing::test_support::exercise_load_bearing_predicate(
@@ -23008,7 +23007,6 @@ mod tests {
     /// hides, seven times over v21.11–17.1.
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     #[tokio::test]
-    #[serial_test::serial(postgres)]
     async fn reverse_quorum_parity_memory_574() {
         let backend = MemoryBackend::new();
         crate::federation::reverse_quorum::test_support::exercise_reverse_quorum(
@@ -23023,7 +23021,6 @@ mod tests {
     /// attestation carries (the roster-row shape).
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     #[tokio::test]
-    #[serial_test::serial(postgres)]
     async fn reverse_quorum_action_ref_parity_memory() {
         let backend = MemoryBackend::new();
         crate::federation::reverse_quorum::test_support::exercise_reverse_quorum_action_ref(
@@ -23036,7 +23033,6 @@ mod tests {
     /// v49.0.0 — I181 on memory: a reverse-quorum roster removal.
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     #[tokio::test]
-    #[serial_test::serial(postgres)]
     async fn reverse_quorum_roster_removal_memory() {
         let backend = MemoryBackend::new();
         crate::federation::reverse_quorum::test_support::exercise_reverse_quorum_roster_removal(
@@ -23053,7 +23049,6 @@ mod tests {
     /// which is exactly why it runs the SAME body as the other two.
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     #[tokio::test]
-    #[serial_test::serial(postgres)]
     async fn escalation_on_silence_parity_memory_591() {
         let backend = MemoryBackend::new();
         crate::federation::reverse_quorum::test_support::exercise_escalation_on_silence(
@@ -23070,7 +23065,6 @@ mod tests {
     /// — it is the only one holding a lock across the read the filter re-enters.
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     #[tokio::test]
-    #[serial_test::serial(postgres)]
     async fn admin_ops_parity_memory_570() {
         let backend = MemoryBackend::new();
         crate::federation::quarantine::test_support::exercise_admin_ops(&backend, "memory-qa")
@@ -23093,7 +23087,6 @@ mod tests {
     /// `any(...)` forms would blunt it against the real case it was built for.
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     #[tokio::test]
-    #[serial_test::serial(postgres)]
     async fn rescope_keeps_row_servable_memory_610() {
         let backend = MemoryBackend::new();
         crate::federation::admission::r2_test_support::exercise_rescope_keeps_row_servable(
@@ -23107,7 +23100,6 @@ mod tests {
     /// subject read returns must resolve through the content-hash fetch path.
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     #[tokio::test]
-    #[serial_test::serial(postgres)]
     async fn wire_refs_for_subject_resolve_memory_634() {
         let backend = MemoryBackend::new();
         crate::federation::admission::r2_test_support::exercise_wire_refs_for_subject_resolve(
@@ -23123,7 +23115,6 @@ mod tests {
     /// broke, not that the skew was caught).
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     #[tokio::test]
-    #[serial_test::serial(postgres)]
     async fn nanosecond_key_wire_ref_resolves_memory_640() {
         let backend = MemoryBackend::new();
         crate::federation::admission::r2_test_support::exercise_nanosecond_key_wire_ref_resolves(
@@ -23139,7 +23130,6 @@ mod tests {
     /// the skew was caught.
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     #[tokio::test]
-    #[serial_test::serial(postgres)]
     async fn nanosecond_wire_refs_resolve_every_kind_memory_646() {
         let backend = MemoryBackend::new();
         crate::federation::admission::r2_test_support::exercise_nanosecond_wire_refs_resolve_every_kind(
@@ -23157,7 +23147,6 @@ mod tests {
     /// and be silently absent on this one.
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     #[tokio::test]
-    #[serial_test::serial(postgres)]
     async fn namespace_family_unregistered_parity_memory_590() {
         let backend = MemoryBackend::new();
         crate::federation::admission::r2_test_support::exercise_r2b_refusal(&backend, "memory-r2")
@@ -23171,7 +23160,6 @@ mod tests {
     /// stewardship after the others stop.
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     #[tokio::test]
-    #[serial_test::serial(postgres)]
     async fn steward_binding_liveness_parity_memory_584() {
         let backend = MemoryBackend::new();
         crate::federation::admission::steward_liveness_test_support::exercise_steward_binding_liveness(
@@ -23185,7 +23173,6 @@ mod tests {
     /// the `moderate`/`takedown`/`review` plane).
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     #[tokio::test]
-    #[serial_test::serial(postgres)]
     async fn moderation_walk_liveness_parity_memory_593() {
         let backend = MemoryBackend::new();
         crate::federation::admission::moderation_walk_liveness_test_support::exercise_moderation_walk_liveness(
@@ -23199,7 +23186,6 @@ mod tests {
     /// the proof that the predicate walk still stops at the first hit.
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     #[tokio::test]
-    #[serial_test::serial(postgres)]
     async fn moderation_walk_read_cost_memory_593() {
         let backend = MemoryBackend::new();
         crate::federation::admission::moderation_walk_liveness_test_support::exercise_moderation_walk_read_cost(
@@ -23213,7 +23199,6 @@ mod tests {
     /// node-rostered commons whose members' bindings are subject-revoked.
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     #[tokio::test]
-    #[serial_test::serial(postgres)]
     async fn objection_plane_blast_radius_memory_584() {
         let backend = MemoryBackend::new();
         crate::federation::admission::steward_liveness_test_support::exercise_objection_plane_blast_radius(
@@ -23229,7 +23214,6 @@ mod tests {
     /// lesson).
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     #[tokio::test]
-    #[serial_test::serial(postgres)]
     async fn revocation_bound_parity_memory_570() {
         let backend = MemoryBackend::new();
         backend.set_node_key_id("rb-node-memory");
@@ -23650,7 +23634,6 @@ mod tests {
     /// duty-holder witness.
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     #[tokio::test]
-    #[serial_test::serial(postgres)]
     async fn federation_duty_holders_memory_632() {
         let backend = MemoryBackend::new();
         backend
@@ -23669,7 +23652,6 @@ mod tests {
     /// conferral-is-not-stewardship witness.
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     #[tokio::test]
-    #[serial_test::serial(postgres)]
     async fn conferral_is_not_stewardship_memory_87() {
         let backend = MemoryBackend::new();
         crate::federation::admission::moderation_walk_liveness_test_support::exercise_conferral_is_not_stewardship(
@@ -23682,7 +23664,6 @@ mod tests {
     /// re-genesis charter shape works before the ceremony mints it.
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     #[tokio::test]
-    #[serial_test::serial(postgres)]
     async fn moderation_charter_rehearsal_memory() {
         let backend = MemoryBackend::new();
         crate::federation::admission::moderation_walk_liveness_test_support::exercise_moderation_charter_rehearsal(
@@ -23695,7 +23676,6 @@ mod tests {
     /// witness. All three backends drive the SAME body.
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     #[tokio::test]
-    #[serial_test::serial(postgres)]
     async fn sub_delegation_budget_parity_memory_628() {
         let backend = MemoryBackend::new();
         crate::federation::admission::moderation_walk_liveness_test_support::exercise_sub_delegation_budget(
@@ -23710,7 +23690,6 @@ mod tests {
     /// directory; the Postgres leg is the one that was failing in production.
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     #[tokio::test]
-    #[serial_test::serial(postgres)]
     async fn genesis_seed_installs_parity_memory_622() {
         let backend = MemoryBackend::new();
         backend
@@ -24232,7 +24211,6 @@ mod tests {
     /// `admission::r2_test_support::exercise_publisher_vouch_conferral` body.
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     #[tokio::test]
-    #[serial_test::serial(postgres)]
     async fn publisher_vouch_conferral_parity_memory_611() {
         let backend = MemoryBackend::new();
         backend.set_node_key_id("tp-node-memory");
@@ -24286,7 +24264,6 @@ mod tests {
     /// absent here.
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     #[tokio::test]
-    #[serial_test::serial(postgres)]
     async fn hard_case_third_party_conferral_parity_memory_607() {
         let backend = MemoryBackend::new();
         backend.set_node_key_id("hc-node-memory");
@@ -26113,7 +26090,6 @@ mod tests {
     /// entitlement+precedence fold).
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     #[tokio::test]
-    #[serial_test::serial(postgres)]
     async fn foreign_retraction_cannot_sever_conferral_memory_686() {
         let backend = MemoryBackend::new();
         crate::federation::admission::ungated_doors_test_support::exercise_foreign_retraction_cannot_sever_conferral(
@@ -26138,7 +26114,6 @@ mod tests {
     /// stamp. See the shared body for the attack it closes.
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     #[tokio::test]
-    #[serial_test::serial(postgres)]
     async fn transit_mirror_binding_parity_memory_656() {
         let backend = MemoryBackend::new();
         crate::federation::admission::ungated_doors_test_support::exercise_transit_mirror_binding(
@@ -26151,7 +26126,6 @@ mod tests {
     /// the seal it writes and refuses to move the consent fold's ordering key.
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     #[tokio::test]
-    #[serial_test::serial(postgres)]
     async fn reseal_seal_gate_parity_memory_656() {
         let backend = MemoryBackend::new();
         crate::federation::admission::ungated_doors_test_support::exercise_reseal_seal_gate(
@@ -26164,7 +26138,6 @@ mod tests {
     /// self-claim a conferred role.
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     #[tokio::test]
-    #[serial_test::serial(postgres)]
     async fn peer_record_role_gate_parity_memory_656() {
         let backend = MemoryBackend::new();
         crate::federation::admission::ungated_doors_test_support::exercise_peer_record_role_gate(
@@ -26178,7 +26151,6 @@ mod tests {
     /// delegation edge, whatever order it arrives in.
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     #[tokio::test]
-    #[serial_test::serial(postgres)]
     async fn foreign_retraction_cannot_sever_parity_memory_656() {
         let backend = MemoryBackend::new();
         crate::federation::admission::ungated_doors_test_support::exercise_foreign_retraction_cannot_sever(
@@ -26199,7 +26171,6 @@ mod tests {
     /// mistaken the first for the second.
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     #[tokio::test]
-    #[serial_test::serial(postgres)]
     async fn canonical_supersede_role_gate_parity_memory_656() {
         use crate::federation::FederationDirectory;
         let backend = MemoryBackend::new();

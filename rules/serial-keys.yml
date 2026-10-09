@@ -1,0 +1,29 @@
+# CIRISPersist#1003 — every `#[serial_test::serial(…)]` names the shared
+# resource it guards, from this closed list, one line of reason each:
+#
+#   postgres               under `cargo test` (one process) `test_pg::dsn()` hands
+#                          every test that process's ONE database; this lock is
+#                          what isolates them there. Inert under nextest (a process,
+#                          so a database, per test). A test that owns its database
+#                          (`isolated_dsn`/`empty_dsn`) or touches none carries none.
+#   test_anchor_env        mutates the anchor environment variables (process-global;
+#                          integration binaries only, #738).
+#   engine_singleton       installs the process-global PyO3 `ENGINE_SINGLETON`.
+#   gil_teardown           drops a runtime while holding/handing back the GIL (#572).
+#   runtime_teardown_gauge reads the process-wide runtime-teardown gauge.
+#   env_ciris_data_dir     sets CIRIS_DATA_DIR (process environment).
+#
+# A bare `#[serial]`, or a key not listed here, is refused: new tests name what
+# they share, and a new key comes with its reason above. Expected 0.
+id: serial-keys
+language: rust
+severity: hint
+message: "a serial_test lock with no key, or a key with no stated reason"
+rule:
+  kind: attribute_item
+  regex: '^#\[\s*(serial_test::)?(serial|parallel|file_serial)\b'
+  not:
+    regex: '^#\[\s*serial_test::serial\s*\(\s*(postgres|test_anchor_env|engine_singleton|gil_teardown|runtime_teardown_gauge|env_ciris_data_dir)(\s*,\s*(postgres|test_anchor_env|engine_singleton|gil_teardown|runtime_teardown_gauge|env_ciris_data_dir))*\s*\)\s*\]$'
+files:
+  - src/**/*.rs
+  - tests/**/*.rs

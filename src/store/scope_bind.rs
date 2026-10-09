@@ -269,7 +269,6 @@ mod tests {
 
     #[cfg(feature = "postgres")]
     #[test]
-    #[serial_test::serial(postgres)]
     fn pg_rebases_offset_onto_every_placeholder() {
         // 3 filter params already bound → scope params start at $4.
         let (frag, params) =
@@ -286,7 +285,6 @@ mod tests {
 
     #[cfg(feature = "postgres")]
     #[test]
-    #[serial_test::serial(postgres)]
     fn pg_zero_offset_is_identity() {
         let (frag, _) = scope_predicate_pg(
             &CallerScope::Unauthenticated,

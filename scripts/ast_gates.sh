@@ -72,9 +72,9 @@ import collections, glob, json, os, sys
 import yaml
 
 # A whole-tree rule (an absence guard: "nothing under src/ calls X") names
-# exactly this glob and expects one TOTAL under it; every other rule lists its
-# files and expects a count per file.
-TREE = "src/**/*.rs"
+# one or both of these globs and expects one TOTAL under each; every other rule
+# lists its files and expects a count per file.
+TREES = {"src/**/*.rs": ("src/", 100), "tests/**/*.rs": ("tests/", 10)}
 matches = json.load(open(sys.argv[1]))
 expected = {k: v for k, v in json.load(open("rules/expected.json")).items() if not k.startswith("_")}
 rules, ignores = {}, {}
@@ -96,21 +96,24 @@ for rid in sorted(rules):
         if not os.path.isfile(f):
             print(f"RED   {rid}: ignores {f}, which does not exist"); red += 1
 
-tree_files = sorted(glob.glob(TREE, recursive=True))
-tree_rules = {rid for rid, files in rules.items() if files == [TREE]}
+tree_rules = {rid for rid, files in rules.items() if files and set(files) <= set(TREES)}
 for rid in sorted(tree_rules):
-    if set(expected.get(rid, {})) != {TREE}:
-        print(f"RED   {rid}: a whole-tree rule expects one total, {{\"{TREE}\": N}}"); red += 1; continue
-    if len(tree_files) < 100:
-        print(f"RED   {rid}: {TREE} holds {len(tree_files)} files; the walk collapsed"); red += 1; continue
-    want = expected[rid][TREE]
-    hits = [m for m in matches if m["ruleId"] == rid]
-    if len(hits) != want:
-        print(f"RED   {rid}: {len(hits)} match(es) under {TREE} ({len(tree_files)} files), expected {want}"); red += 1
-        for m in hits:
-            print(f"        {m['file']}:{m['range']['start']['line'] + 1}: {m['lines'].strip()[:120]}")
-    else:
-        print(f"ok    {rid}: {TREE} ({len(tree_files)} files) {len(hits)}")
+    globs = sorted(rules[rid])
+    if set(expected.get(rid, {})) != set(globs):
+        print(f"RED   {rid}: a whole-tree rule expects one total per glob, {{{', '.join(repr(g) + ': N' for g in globs)}}}"); red += 1; continue
+    for g in globs:
+        prefix, floor = TREES[g]
+        n = len(glob.glob(g, recursive=True))
+        if n < floor:
+            print(f"RED   {rid}: {g} holds {n} files; the walk collapsed"); red += 1; continue
+        want = expected[rid][g]
+        hits = [m for m in matches if m["ruleId"] == rid and m["file"].startswith(prefix)]
+        if len(hits) != want:
+            print(f"RED   {rid}: {len(hits)} match(es) under {g} ({n} files), expected {want}"); red += 1
+            for m in hits:
+                print(f"        {m['file']}:{m['range']['start']['line'] + 1}: {m['lines'].strip()[:120]}")
+        else:
+            print(f"ok    {rid}: {g} ({n} files) {len(hits)}")
 for rid in tree_rules:
     del rules[rid]
     expected.pop(rid, None)

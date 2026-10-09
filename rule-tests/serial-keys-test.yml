@@ -1,0 +1,35 @@
+id: serial-keys
+valid:
+  - |
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn t() {}
+  - |
+    #[test]
+    #[serial_test::serial(engine_singleton, gil_teardown)]
+    fn t() {}
+  - |
+    /// `#[serial]` in a doc comment is not an attribute
+    #[test]
+    fn t() {}
+invalid:
+  - |
+    #[test]
+    #[serial]
+    fn t() {}
+  - |
+    #[test]
+    #[serial_test::serial]
+    fn t() {}
+  - |
+    #[test]
+    #[serial_test::serial(my_new_thing)]
+    fn t() {}
+  - |
+    #[test]
+    #[serial(postgres)]
+    fn t() {}
+  - |
+    #[test]
+    #[serial_test::file_serial]
+    fn t() {}

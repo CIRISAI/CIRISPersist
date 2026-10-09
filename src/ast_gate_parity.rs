@@ -52,8 +52,8 @@ const PORTED: &[(&str, &str, &[&str])] = &[
 /// zero, that gate's fn name). The text twin and the rule are each red on the
 /// same planted violation (CHANGELOG 54.1.0); this binds the pair so that
 /// deleting the twin, or adding a rule with no twin, is a decision someone
-/// makes here. `cfg-test-forms` has no text twin: it guards the rules' own
-/// test-gated vocabulary.
+/// makes here. `cfg-test-forms` (the rules' own test-gated vocabulary) and
+/// `serial-keys` (#1003) have no text twin.
 const GUARDS: &[(&str, &str, &str)] = &[
     (
         "i14-storage-floor",
@@ -91,6 +91,8 @@ const GUARDS: &[(&str, &str, &str)] = &[
         "every_postgres_test_goes_through_the_provisioner",
     ),
     ("cfg-test-forms", "", ""),
+    // CIRISPersist#1003 — the serial_test key registry; new with its rule.
+    ("serial-keys", "", ""),
 ];
 
 fn root() -> &'static std::path::Path {
