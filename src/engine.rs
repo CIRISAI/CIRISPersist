@@ -6694,6 +6694,7 @@ impl Engine {
         /// Manifests opened per boot. A node with more legacy DAGs finishes
         /// over later boots or an operator call; each skipped manifest is
         /// re-examined at the next boot.
+        #[cfg(any(feature = "postgres", feature = "sqlite"))]
         const BOOT_CAP: u32 = 10_000;
         #[cfg(any(feature = "postgres", feature = "sqlite"))]
         match self.backfill_dag_chunk_links(BOOT_CAP).await {

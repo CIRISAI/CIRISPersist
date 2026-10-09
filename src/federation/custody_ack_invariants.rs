@@ -1330,6 +1330,7 @@ mod runners {
     sqlite_engine_case!(i525_sqlite, i525_the_target_arm_reads_every_room_shape);
     #[cfg(feature = "sqlite")]
     sqlite_engine_case!(i526_sqlite, i526_a_plaintext_room_write_carries_the_group);
+    #[cfg(feature = "sqlite")]
     sqlite_engine_case!(i579_sqlite, i579_shared_plaintext_keeps_every_room);
     #[cfg(feature = "sqlite")]
     #[tokio::test]
