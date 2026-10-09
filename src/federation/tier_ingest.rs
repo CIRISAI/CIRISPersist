@@ -4941,14 +4941,13 @@ mod tests {
             .put_attestation(SignedAttestation { attestation: d })
             .await
             .expect_err("(d) unregistered attester must be REJECTED");
-        // The ingest gate's own rejection token (when it fires) or the
-        // FK InvalidArgument (when the backend's FK check fires first) —
-        // both are fail-secure non-stores.
-        assert!(
-            err.kind() == "federation_federation_tier_unverified"
-                || err.kind() == "federation_invalid_argument",
-            "(d) unexpected rejection kind: {}",
-            err.kind()
+        // v54.1.0 (#1042) — whichever check meets the unknown signer first
+        // (the ingest gate or the backend's attester lookup), the refusal is
+        // the typed, retryable ordering gap, never a verdict on the bytes.
+        assert_eq!(
+            err.kind(),
+            "federation_attester_key_unknown",
+            "(d) unexpected rejection kind: {err}"
         );
         assert!(dir.get_attestation(&d_id).await.expect("get").is_none());
 

@@ -30940,18 +30940,27 @@ mod tests {
         );
         forged.scrub_signature_classical = "AAAA".into();
         forged.scrub_signature_pqc = Some("AAAA".into());
-        let err = backend
+        // v54.1.0 (#1042) — the Insert arm returns a refusal OUTCOME, never a
+        // bare `Err`: a scrubber this node holds whose signature does not
+        // verify is the terminal `unverifiable_signature`.
+        let outcome = backend
             .apply_replicated_key_record(crate::federation::SignedKeyRecord { record: forged })
             .await
-            .expect_err("(E2) invalid-PoP fresh key must be rejected");
+            .expect("(E2) a refusal is an outcome, never a bare Err");
+        assert_eq!(
+            outcome,
+            crate::federation::register::ReplicatedKeyOutcome::Refused {
+                reason: crate::federation::register::KeyRefusalReason::UnverifiableSignature,
+            },
+            "(E2) invalid-PoP fresh key must be refused unverifiable_signature"
+        );
         // Nothing was written.
         assert!(
             crate::federation::FederationDirectory::lookup_public_key(&backend, "e2-forged")
                 .await
                 .unwrap()
                 .is_none(),
-            "forged key left no trace, got err {}",
-            err.kind()
+            "forged key left no trace"
         );
     }
 
@@ -34612,14 +34621,19 @@ mod tests {
     async fn federation_attestation_fk_enforcement() {
         let backend = SqliteBackend::open_in_memory().await.unwrap();
         backend.run_migrations().await.unwrap();
-        // Insert an attestation referencing a non-existent key — FK
-        // violation surfaces as InvalidArgument (matches memory shape).
+        // Insert an attestation referencing a non-existent key. v54.1.0
+        // (#1042) — the attester lookup runs first and types the unknown
+        // signer as the retryable ordering gap (matches memory shape).
         let att = fed_attestation("att-1", "ghost-steward", "ghost-key", "ghost-steward");
         let err = backend
             .put_attestation(SignedAttestation { attestation: att })
             .await
             .unwrap_err();
-        assert!(matches!(err, crate::federation::Error::InvalidArgument(_)));
+        assert!(
+            matches!(&err, crate::federation::Error::AttesterKeyUnknown { attesting_key_id, plane: "attestation" }
+                if attesting_key_id == "ghost-steward"),
+            "expected the attester-lookup refusal, got {err:?}"
+        );
     }
 
     #[tokio::test]
