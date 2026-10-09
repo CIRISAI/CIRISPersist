@@ -172,6 +172,10 @@ bump() {
     [ "$(grep -m1 '^version = "' Cargo.toml)" = "version = \"$ver\"" ] || { echo "BUMP: Cargo.toml version not rewritten"; return 22; }
     n="$(rl_restamp_evidence evidence/cc_impl.tsv "$prev" "$ver")" || { echo "BUMP: $n"; return 22; }
     echo "evidence/cc_impl.tsv: $n pointers ciris-persist@$prev → @$ver"
+    # v54.1.0 (#1052) — the tsv is generated from the manifest: the re-stamped
+    # file must be exactly what the bumped Cargo.toml generates.
+    python3 scripts/evidence_tsv.py check > "$S/bump-evidence-gen.log" 2>&1 \
+        || { echo "BUMP: evidence/cc_impl.tsv is not what the manifest generates after the re-stamp — $S/bump-evidence-gen.log"; return 22; }
     sed -i "s/^## \[$ver\] - UNRELEASED\$/## [$ver] - $today/" CHANGELOG.md
     grep -qxF "## [$ver] - $today" CHANGELOG.md || { echo "BUMP: CHANGELOG header not dated"; return 22; }
     cargo check --features sqlite < /dev/null > "$S/bump-check.log" 2>&1 || { echo "BUMP: cargo check --features sqlite red — $S/bump-check.log"; return 22; }

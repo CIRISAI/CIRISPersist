@@ -91,7 +91,7 @@ sqlite, postgres).
   `CERTIFY_IGNORE_STRAY=1`, certify's own override, skips the wait. The self-test runs
   release.sh's own `certify()` against stubs: a wait that gives up returns 24 before
   certify.sh starts.
-- The 53.2.0 entry's self-test count said 41; it was 112. Now 124.
+- The 53.2.0 entry's self-test count said 41; it was 112. Now 129.
 - Not done here: item 6 (whether Codex caps reviews per PR) and item 7 (observing #1021's
   tree-equality skip on a non-release merge) need observation on GitHub, not code.
 
@@ -211,6 +211,27 @@ no dependency's, prefix-named crates included; three mutations of its matchers w
 Still to see on GitHub: the first main or tag save after this lands, then a PR restoring it.
 pyo3-ffi reruns because its build script tracks `PATH`, which holds the runner's per-job temp
 directory; setting `PYO3_PYTHON` stops that (shown in the container) and is left for a later cut.
+
+### Changed — `evidence/cc_impl.tsv` is generated from the manifest's evidence export (#1052)
+
+The cc-conformance attestation signs `evidence/cc_impl.tsv`, and it was edited by hand: 131 of
+its 174 rows (4.1.1 `CLM-delegation-depth-default` among them) had no entry in
+`namespace_supersets.json`'s `evidence_export.CIRISPersist`, and nothing compared the two.
+
+- **A materialiser, not a cross-check** (#1052 option a): `scripts/evidence_tsv.py
+  write|check`. The version column is derived (src/ rows pin the Cargo.toml version; cross-repo
+  rows keep their entry's `crate`), and the one section note rides on the entry it precedes, so
+  the regenerated body is byte-identical to the hand-made one.
+- **The export now holds every row**, in tsv order: 131 back-filled (`manifest_round:
+  backfill-1052`), two post-cut renames recorded (`post_cut_rename_from`), four entries excluded
+  with a stated `tsv_excluded` reason (three cite a `src/safety/watchlist.rs` persist does not
+  have; one is a design note, not a pointer).
+- **Gates:** `scripts/evidence_tsv_test.py` (CI lint, certify fast gate `evidencetsv`) checks the
+  committed file against the generated one. It is red on a row only the tsv has, an entry only the
+  manifest has, a stale stamp, an exclusion without a reason, and a cross-repo row without a stamp.
+  Each direction was also shown red on the real tree. release.sh's bump re-stamps, then requires
+  `evidence_tsv.py check` before it commits; the release self-test runs that path on a fixture
+  (red before the re-stamp, green after) and is red if the check leaves the bump stage.
 
 ### Changed — Verify 20.1.0 adopted: the three verify crates and the wheel floor move together (#992)
 

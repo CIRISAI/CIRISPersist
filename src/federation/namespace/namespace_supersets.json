@@ -14096,34 +14096,54 @@
   ],
   "CIRISPersist": [
    {
-    "decimal_id": "3.1.9.2",
-    "claim_id": "CLM-nsproc-community-id-moderation-allegation-type",
+    "decimal_id": "3.1.1",
+    "claim_id": "CLM-nsproc-family-roster-membership-change-via-entr-accord",
     "repo": "CIRISPersist",
-    "crate": "ciris-persist@21.4.0",
-    "path#symbol": "CIRISPersist/src/federation/admission.rs#check_delegated_duty_scores_admission",
+    "crate": "ciris-persist@31.0.0",
+    "path#symbol": "ciris-verify-core/src/accord_genesis.rs#build_accord_family_envelope",
     "tsv_target": "evidence/cc_impl.tsv",
-    "field": "community_id",
-    "prefix": "moderation:{allegation_type}"
+    "field": "family roster membership-change via entrenchment-preserving ",
+    "prefix": "accord:*"
    },
    {
-    "decimal_id": "3.1.9.2",
-    "claim_id": "CLM-nsproc-community-id-reconsideration-grounds",
+    "decimal_id": "3.1.1",
+    "claim_id": "CLM-nsproc-holds-bytes-agent-files-kind-platform-or-target",
     "repo": "CIRISPersist",
     "crate": "ciris-persist@21.4.0",
-    "path#symbol": "src/federation/admission.rs#named_moderator_holders",
+    "path#symbol": "src/federation/blobs.rs#holds_bytes_attestation_envelope",
     "tsv_target": "evidence/cc_impl.tsv",
-    "field": "community_id",
-    "prefix": "reconsideration:{grounds}"
+    "field": "holds_bytes",
+    "prefix": "agent_files:{kind}:{platform_or_target}"
    },
    {
-    "decimal_id": "3.1.9.4",
-    "claim_id": "CLM-nsproc-class-dual-scope-gate-watchlist-id",
+    "decimal_id": "3.1.1",
+    "claim_id": "CLM-nsproc-kind-open-vocab-registration-collision-g-agent-files-kind-platform-or-target",
     "repo": "CIRISPersist",
     "crate": "ciris-persist@21.4.0",
-    "path#symbol": "src/safety/watchlist.rs#authority_admits_enable",
+    "path#symbol": "src/federation/schema_resolver.rs#BlobBackedSchemaResolver",
     "tsv_target": "evidence/cc_impl.tsv",
-    "field": "class (dual-scope gate)",
-    "prefix": "watchlist:{id}"
+    "field": "{kind} open-vocab registration/collision guard",
+    "prefix": "agent_files:{kind}:{platform_or_target}"
+   },
+   {
+    "decimal_id": "3.1.2",
+    "claim_id": "CLM-nsproc-witness-key-id-transparency-log-cosigned-tree-size",
+    "repo": "CIRISPersist",
+    "crate": "ciris-persist@21.4.0",
+    "path#symbol": "src/federation/admission.rs#default_reserved_prefix_rules",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "field": "witness_key_id",
+    "prefix": "transparency_log:cosigned:{tree_size}"
+   },
+   {
+    "decimal_id": "3.1.2",
+    "claim_id": "CLM-nsproc-restrictions-attestation-license-validity",
+    "repo": "CIRISPersist",
+    "crate": "ciris-persist@21.4.0",
+    "path#symbol": "src/federation/consent_grammar.rs#RestrictionOp::StripField",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "field": "restrictions",
+    "prefix": "attestation:license_validity"
    },
    {
     "decimal_id": "3.1.2",
@@ -14144,276 +14164,6 @@
     "tsv_target": "evidence/cc_impl.tsv",
     "field": "cosignature",
     "prefix": "transparency_log:cosigned:{tree_size}"
-   },
-   {
-    "decimal_id": "3.1.8.5",
-    "claim_id": "CLM-nsproc-cross-attestation-prefix-distinctness-detection-distributive-access-resource-t",
-    "repo": "CIRISPersist",
-    "crate": "ciris-persist@21.4.0",
-    "path#symbol": "src/federation/admission.rs#default_reserved_prefix_rules",
-    "tsv_target": "evidence/cc_impl.tsv",
-    "field": "cross-attestation prefix distinctness",
-    "prefix": "detection:distributive:access:{resource_type}"
-   },
-   {
-    "decimal_id": "3.1.9.5",
-    "claim_id": "CLM-nsproc-decision-pointer-locality-decision-scale",
-    "repo": "CIRISPersist",
-    "crate": "ciris-persist@21.4.0",
-    "path#symbol": "reuse typed references_attestation_id (drop bespoke decision_ref)",
-    "tsv_target": "evidence/cc_impl.tsv",
-    "field": "decision pointer",
-    "prefix": "locality:decision:{scale}"
-   },
-   {
-    "decimal_id": "3.1.9.4",
-    "claim_id": "CLM-nsproc-enabled-watchlist-id",
-    "repo": "CIRISPersist",
-    "crate": "ciris-persist@21.4.0",
-    "path#symbol": "src/safety/watchlist.rs#enable_watchlist",
-    "tsv_target": "evidence/cc_impl.tsv",
-    "field": "enabled",
-    "prefix": "watchlist:{id}"
-   },
-   {
-    "decimal_id": "3.1.1",
-    "claim_id": "CLM-nsproc-family-roster-membership-change-via-entr-accord",
-    "repo": "CIRISPersist",
-    "crate": "ciris-persist@21.4.0",
-    "path#symbol": "ciris-verify-core/src/accord_genesis.rs#build_accord_family_envelope",
-    "tsv_target": "evidence/cc_impl.tsv",
-    "field": "family roster membership-change via entrenchment-preserving ",
-    "prefix": "accord:*"
-   },
-   {
-    "decimal_id": "3.1.9.7",
-    "claim_id": "CLM-nsproc-goal-scope-goal-scale",
-    "repo": "CIRISPersist",
-    "crate": "ciris-persist@21.4.0",
-    "path#symbol": "src/federation/goal.rs#GoalScope",
-    "tsv_target": "evidence/cc_impl.tsv",
-    "field": "goal.scope",
-    "prefix": "goal:{scale}"
-   },
-   {
-    "decimal_id": "3.1.9.4",
-    "claim_id": "CLM-nsproc-group-key-id-watchlist-id",
-    "repo": "CIRISPersist",
-    "crate": "ciris-persist@21.4.0",
-    "path#symbol": "src/safety/watchlist.rs#authority_admits_enable",
-    "tsv_target": "evidence/cc_impl.tsv",
-    "field": "group_key_id",
-    "prefix": "watchlist:{id}"
-   },
-   {
-    "decimal_id": "3.1.1",
-    "claim_id": "CLM-nsproc-holds-bytes-agent-files-kind-platform-or-target",
-    "repo": "CIRISPersist",
-    "crate": "ciris-persist@21.4.0",
-    "path#symbol": "src/federation/blobs.rs#holds_bytes_attestation_envelope",
-    "tsv_target": "evidence/cc_impl.tsv",
-    "field": "holds_bytes",
-    "prefix": "agent_files:{kind}:{platform_or_target}"
-   },
-   {
-    "decimal_id": "3.1.9.4",
-    "claim_id": "CLM-nsproc-kind-kind-discriminator-hard-case-kind",
-    "repo": "CIRISPersist",
-    "crate": "ciris-persist@21.4.0",
-    "path#symbol": "src/federation/admission.rs#check_reserved_prefix_admission",
-    "tsv_target": "evidence/cc_impl.tsv",
-    "field": "kind ({kind} discriminator)",
-    "prefix": "hard_case:{kind}"
-   },
-   {
-    "decimal_id": "3.1.8.2",
-    "claim_id": "CLM-nsproc-lens-core-version-detection-intra-agent-consistency",
-    "repo": "CIRISPersist",
-    "crate": "ciris-persist@21.4.0",
-    "path#symbol": "src/derived/types.rs#DetectionEvent",
-    "tsv_target": "evidence/cc_impl.tsv",
-    "field": "lens_core_version",
-    "prefix": "detection:intra_agent_consistency"
-   },
-   {
-    "decimal_id": "3.1.9.7",
-    "claim_id": "CLM-nsproc-meta-goal-alignment-goal-scale",
-    "repo": "CIRISPersist",
-    "crate": "ciris-persist@21.4.0",
-    "path#symbol": "src/federation/goal.rs#Goal::new",
-    "tsv_target": "evidence/cc_impl.tsv",
-    "field": "meta_goal_alignment",
-    "prefix": "goal:{scale}"
-   },
-   {
-    "decimal_id": "3.1.5.1",
-    "claim_id": "CLM-nsproc-raw-chain-of-thought-dma-csdma",
-    "repo": "CIRISPersist",
-    "crate": "ciris-persist@21.4.0",
-    "path#symbol": "src/federation/schema_resolver.rs#BlobBackedSchemaResolver",
-    "tsv_target": "evidence/cc_impl.tsv",
-    "field": "raw_chain_of_thought",
-    "prefix": "dma:csdma:*"
-   },
-   {
-    "decimal_id": "3.1.2",
-    "claim_id": "CLM-nsproc-restrictions-attestation-license-validity",
-    "repo": "CIRISPersist",
-    "crate": "ciris-persist@21.4.0",
-    "path#symbol": "src/federation/consent_grammar.rs#RestrictionOp::StripField",
-    "tsv_target": "evidence/cc_impl.tsv",
-    "field": "restrictions",
-    "prefix": "attestation:license_validity"
-   },
-   {
-    "decimal_id": "3.1.2",
-    "claim_id": "CLM-nsproc-witness-key-id-transparency-log-cosigned-tree-size",
-    "repo": "CIRISPersist",
-    "crate": "ciris-persist@21.4.0",
-    "path#symbol": "src/federation/admission.rs#default_reserved_prefix_rules",
-    "tsv_target": "evidence/cc_impl.tsv",
-    "field": "witness_key_id",
-    "prefix": "transparency_log:cosigned:{tree_size}"
-   },
-   {
-    "decimal_id": "3.1.8",
-    "claim_id": "CLM-nsproc-cohort-operational-definition-calibratio-manifold-conformity-cohort",
-    "repo": "CIRISPersist",
-    "crate": "ciris-persist@21.4.0",
-    "path#symbol": "signing/event.rs#CohortDelineation",
-    "tsv_target": "evidence/cc_impl.tsv",
-    "field": "{cohort} operational definition / calibration",
-    "prefix": "manifold_conformity:{cohort}"
-   },
-   {
-    "decimal_id": "3.1.1",
-    "claim_id": "CLM-nsproc-kind-open-vocab-registration-collision-g-agent-files-kind-platform-or-target",
-    "repo": "CIRISPersist",
-    "crate": "ciris-persist@21.4.0",
-    "path#symbol": "src/federation/schema_resolver.rs#BlobBackedSchemaResolver",
-    "tsv_target": "evidence/cc_impl.tsv",
-    "field": "{kind} open-vocab registration/collision guard",
-    "prefix": "agent_files:{kind}:{platform_or_target}"
-   },
-   {
-    "decimal_id": "3.3.1",
-    "decimal_id_status": "PROPOSED - family is UNREGISTERED; the anchor is the governing CC section, not an owned CC 3.1.N row",
-    "claim_id": "CLM-nsproc-subject-key-ids-consent",
-    "repo": "CIRISPersist",
-    "crate": "ciris-persist@21.4.0",
-    "path#symbol": "src/federation/admission.rs#resolve_withdraws_admission_rule_at",
-    "tsv_target": "evidence/cc_impl.tsv",
-    "field": "subject_key_ids",
-    "prefix": "consent:*",
-    "manifest_round": "0.3.0-unregistered-addendum"
-   },
-   {
-    "decimal_id": "3.3.1",
-    "decimal_id_status": "PROPOSED - family is UNREGISTERED; the anchor is the governing CC section, not an owned CC 3.1.N row",
-    "claim_id": "CLM-nsproc-dimension-consent",
-    "repo": "CIRISPersist",
-    "crate": "ciris-persist@21.4.0",
-    "path#symbol": "src/federation/consent.rs#consent_state_of",
-    "tsv_target": "evidence/cc_impl.tsv",
-    "field": "dimension",
-    "prefix": "consent:*",
-    "manifest_round": "0.3.0-unregistered-addendum"
-   },
-   {
-    "decimal_id": "3.3.1",
-    "decimal_id_status": "PROPOSED - family is UNREGISTERED; the anchor is the governing CC section, not an owned CC 3.1.N row",
-    "claim_id": "CLM-nsproc-deletion-sla-consent",
-    "repo": "CIRISPersist",
-    "crate": "ciris-persist@21.4.0",
-    "path#symbol": "src/federation/mod.rs#run_consent_sla_watch",
-    "tsv_target": "evidence/cc_impl.tsv",
-    "field": "deletion_sla",
-    "prefix": "consent:*",
-    "manifest_round": "0.3.0-unregistered-addendum"
-   },
-   {
-    "decimal_id": "3.3.1",
-    "decimal_id_status": "PROPOSED - family is UNREGISTERED; the anchor is the governing CC section, not an owned CC 3.1.N row",
-    "claim_id": "CLM-nsproc-tier-consent",
-    "repo": "CIRISPersist",
-    "crate": "ciris-persist@21.4.0",
-    "path#symbol": "src/federation/mod.rs#list_consent_revocation_promotion_overdue",
-    "tsv_target": "evidence/cc_impl.tsv",
-    "field": "tier",
-    "prefix": "consent:*",
-    "manifest_round": "0.3.0-unregistered-addendum"
-   },
-   {
-    "decimal_id": "3.3.1",
-    "decimal_id_status": "PROPOSED - family is UNREGISTERED; the anchor is the governing CC section, not an owned CC 3.1.N row",
-    "claim_id": "CLM-nsproc-attestation-prefixes-consent",
-    "repo": "CIRISPersist",
-    "crate": "ciris-persist@21.4.0",
-    "path#symbol": "src/federation/consent_grammar.rs#parse_grant_payload",
-    "tsv_target": "evidence/cc_impl.tsv",
-    "field": "attestation_prefixes",
-    "prefix": "consent:*",
-    "manifest_round": "0.3.0-unregistered-addendum"
-   },
-   {
-    "decimal_id": "3.3.1",
-    "decimal_id_status": "PROPOSED - family is UNREGISTERED; the anchor is the governing CC section, not an owned CC 3.1.N row",
-    "claim_id": "CLM-nsproc-restrictions-op-strip-field-consent",
-    "repo": "CIRISPersist",
-    "crate": "ciris-persist@21.4.0",
-    "path#symbol": "src/federation/consent_grammar.rs#strip_field",
-    "tsv_target": "evidence/cc_impl.tsv",
-    "field": "restrictions[].op=strip_field",
-    "prefix": "consent:*",
-    "manifest_round": "0.3.0-unregistered-addendum"
-   },
-   {
-    "decimal_id": "5.3.2.4",
-    "decimal_id_status": "PROPOSED - family is UNREGISTERED; the anchor is the governing CC section, not an owned CC 3.1.N row",
-    "claim_id": "CLM-nsproc-dimension-trace",
-    "repo": "CIRISPersist",
-    "crate": "ciris-persist@21.4.0",
-    "path#symbol": "src/federation/admission.rs#check_trace_dimension_admission",
-    "tsv_target": "evidence/cc_impl.tsv",
-    "field": "dimension",
-    "prefix": "trace:*",
-    "manifest_round": "0.3.0-unregistered-addendum"
-   },
-   {
-    "decimal_id": "5.3.2.4",
-    "decimal_id_status": "PROPOSED - family is UNREGISTERED; the anchor is the governing CC section, not an owned CC 3.1.N row",
-    "claim_id": "CLM-nsproc-subject-key-ids-trace",
-    "repo": "CIRISPersist",
-    "crate": "ciris-persist@21.4.0",
-    "path#symbol": "src/federation/admission.rs#check_trace_dimension_admission",
-    "tsv_target": "evidence/cc_impl.tsv",
-    "field": "subject_key_ids",
-    "prefix": "trace:*",
-    "manifest_round": "0.3.0-unregistered-addendum"
-   },
-   {
-    "decimal_id": "5.3.2.4",
-    "decimal_id_status": "PROPOSED - family is UNREGISTERED; the anchor is the governing CC section, not an owned CC 3.1.N row",
-    "claim_id": "CLM-nsproc-cohort-scope-trace",
-    "repo": "CIRISPersist",
-    "crate": "ciris-persist@21.4.0",
-    "path#symbol": "src/engine.rs#Engine::promote_consented_backlog",
-    "tsv_target": "evidence/cc_impl.tsv",
-    "field": "cohort_scope",
-    "prefix": "trace:*",
-    "manifest_round": "0.3.0-unregistered-addendum"
-   },
-   {
-    "decimal_id": "5.3.2.4",
-    "decimal_id_status": "PROPOSED - family is UNREGISTERED; the anchor is the governing CC section, not an owned CC 3.1.N row",
-    "claim_id": "CLM-nsproc-restrictions-op-strip-field-trace",
-    "repo": "CIRISPersist",
-    "crate": "ciris-persist@21.4.0",
-    "path#symbol": "src/engine.rs#Engine::promote_attestation_with_strips",
-    "tsv_target": "evidence/cc_impl.tsv",
-    "field": "restrictions[].op=strip_field",
-    "prefix": "trace:*",
-    "manifest_round": "0.3.0-unregistered-addendum"
    },
    {
     "decimal_id": "3.1.5",
@@ -14452,39 +14202,142 @@
     "manifest_round": "0.3.0-unregistered-addendum"
    },
    {
-    "decimal_id": "4.5.8.3",
-    "decimal_id_status": "PROPOSED - family is UNREGISTERED; the anchor is the governing CC section, not an owned CC 3.1.N row",
-    "claim_id": "CLM-nsproc-agent-key-id-trace-summary",
+    "decimal_id": "3.1.5.1",
+    "claim_id": "CLM-nsproc-raw-chain-of-thought-dma-csdma",
     "repo": "CIRISPersist",
     "crate": "ciris-persist@21.4.0",
-    "path#symbol": "src/store/sqlite.rs#list_trace_summaries",
+    "path#symbol": "src/federation/schema_resolver.rs#BlobBackedSchemaResolver",
     "tsv_target": "evidence/cc_impl.tsv",
-    "field": "agent_key_id",
-    "prefix": "trace_summary:*",
+    "field": "raw_chain_of_thought",
+    "prefix": "dma:csdma:*"
+   },
+   {
+    "decimal_id": "3.1.8",
+    "claim_id": "CLM-nsproc-cohort-operational-definition-calibratio-manifold-conformity-cohort",
+    "repo": "CIRISPersist",
+    "crate": "ciris-persist@31.0.0",
+    "path#symbol": "signing/event.rs#CohortDelineation",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "field": "{cohort} operational definition / calibration",
+    "prefix": "manifold_conformity:{cohort}"
+   },
+   {
+    "decimal_id": "3.1.8.2",
+    "claim_id": "CLM-nsproc-lens-core-version-detection-intra-agent-consistency",
+    "repo": "CIRISPersist",
+    "crate": "ciris-persist@21.4.0",
+    "path#symbol": "src/derived/types.rs#DetectionEvent",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "field": "lens_core_version",
+    "prefix": "detection:intra_agent_consistency"
+   },
+   {
+    "decimal_id": "3.1.8.5",
+    "claim_id": "CLM-nsproc-cross-attestation-prefix-distinctness-detection-distributive-access-resource-t",
+    "repo": "CIRISPersist",
+    "crate": "ciris-persist@21.4.0",
+    "path#symbol": "src/federation/admission.rs#default_reserved_prefix_rules",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "field": "cross-attestation prefix distinctness",
+    "prefix": "detection:distributive:access:{resource_type}"
+   },
+   {
+    "decimal_id": "3.1.9.2",
+    "claim_id": "CLM-nsproc-community-id-moderation-allegation-type",
+    "repo": "CIRISPersist",
+    "crate": "ciris-persist@21.4.0",
+    "path#symbol": "src/federation/admission.rs#check_delegated_duty_scores_admission",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "field": "community_id",
+    "prefix": "moderation:{allegation_type}",
+    "post_cut_rename_from": "CIRISPersist/src/federation/admission.rs#check_delegated_duty_scores_admission"
+   },
+   {
+    "decimal_id": "3.1.9.2",
+    "claim_id": "CLM-nsproc-community-id-reconsideration-grounds",
+    "repo": "CIRISPersist",
+    "crate": "ciris-persist@21.4.0",
+    "path#symbol": "src/federation/admission.rs#named_moderator_holders",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "field": "community_id",
+    "prefix": "reconsideration:{grounds}"
+   },
+   {
+    "decimal_id": "3.1.9.4",
+    "claim_id": "CLM-nsproc-kind-kind-discriminator-hard-case-kind",
+    "repo": "CIRISPersist",
+    "crate": "ciris-persist@21.4.0",
+    "path#symbol": "src/federation/admission.rs#check_reserved_prefix_admission",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "field": "kind ({kind} discriminator)",
+    "prefix": "hard_case:{kind}"
+   },
+   {
+    "decimal_id": "3.1.9.7",
+    "claim_id": "CLM-nsproc-meta-goal-alignment-goal-scale",
+    "repo": "CIRISPersist",
+    "crate": "ciris-persist@21.4.0",
+    "path#symbol": "src/federation/goal.rs#Goal::new",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "field": "meta_goal_alignment",
+    "prefix": "goal:{scale}"
+   },
+   {
+    "decimal_id": "3.1.9.7",
+    "claim_id": "CLM-nsproc-goal-scope-goal-scale",
+    "repo": "CIRISPersist",
+    "crate": "ciris-persist@21.4.0",
+    "path#symbol": "src/federation/goal.rs#GoalScope",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "field": "goal.scope",
+    "prefix": "goal:{scale}"
+   },
+   {
+    "decimal_id": "3.2",
+    "decimal_id_status": "PROPOSED - family is UNREGISTERED; the anchor is the governing CC section, not an owned CC 3.1.N row",
+    "claim_id": "CLM-nsproc-delegated-scope-ownership",
+    "repo": "CIRISPersist",
+    "crate": "ciris-persist@21.4.0",
+    "path#symbol": "src/federation/admission.rs#check_node_agency_admission",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "field": "delegated_scope",
+    "prefix": "ownership:*",
     "manifest_round": "0.3.0-unregistered-addendum"
    },
    {
-    "decimal_id": "4.5.8.3",
+    "decimal_id": "3.2",
     "decimal_id_status": "PROPOSED - family is UNREGISTERED; the anchor is the governing CC section, not an owned CC 3.1.N row",
-    "claim_id": "CLM-nsproc-attestation-prefixes-trace-summary",
+    "claim_id": "CLM-nsproc-attested-key-id-ownership",
     "repo": "CIRISPersist",
     "crate": "ciris-persist@21.4.0",
-    "path#symbol": "src/federation/consent_grammar.rs#covers",
+    "path#symbol": "src/federation/admission.rs#check_single_node_owner_admission",
     "tsv_target": "evidence/cc_impl.tsv",
-    "field": "attestation_prefixes",
-    "prefix": "trace_summary:*",
+    "field": "attested_key_id",
+    "prefix": "ownership:*",
     "manifest_round": "0.3.0-unregistered-addendum"
    },
    {
-    "decimal_id": "4.5.8.3",
+    "decimal_id": "3.2",
     "decimal_id_status": "PROPOSED - family is UNREGISTERED; the anchor is the governing CC section, not an owned CC 3.1.N row",
-    "claim_id": "CLM-nsproc-extraction-manifest-hash-trace-summary",
+    "claim_id": "CLM-nsproc-delegation-valid-until-ownership",
     "repo": "CIRISPersist",
     "crate": "ciris-persist@21.4.0",
-    "path#symbol": "src/trace_summary_contract.rs#extraction_manifest_sha256",
+    "path#symbol": "src/federation/admission.rs#delegation_valid_until_lapsed",
     "tsv_target": "evidence/cc_impl.tsv",
-    "field": "extraction_manifest_hash",
-    "prefix": "trace_summary:*",
+    "field": "delegation_valid_until",
+    "prefix": "ownership:*",
+    "manifest_round": "0.3.0-unregistered-addendum"
+   },
+   {
+    "decimal_id": "3.2",
+    "decimal_id_status": "PROPOSED - family is UNREGISTERED; the anchor is the governing CC section, not an owned CC 3.1.N row",
+    "claim_id": "CLM-nsproc-delegation-purpose-ownership",
+    "repo": "CIRISPersist",
+    "crate": "ciris-persist@21.4.0",
+    "path#symbol": "src/federation/admission.rs#is_owner_binding_envelope",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "field": "delegation_purpose",
+    "prefix": "ownership:*",
     "manifest_round": "0.3.0-unregistered-addendum"
    },
    {
@@ -14513,62 +14366,134 @@
    },
    {
     "decimal_id": "3.2",
-    "decimal_id_status": "PROPOSED - family is UNREGISTERED; the anchor is the governing CC section, not an owned CC 3.1.N row",
-    "claim_id": "CLM-nsproc-delegation-purpose-ownership",
+    "claim_id": "CLM-trust-not-membership",
     "repo": "CIRISPersist",
-    "crate": "ciris-persist@21.4.0",
-    "path#symbol": "src/federation/admission.rs#is_owner_binding_envelope",
+    "path#symbol": "src/federation/admission.rs#check_user_target_steward_binding_admission",
     "tsv_target": "evidence/cc_impl.tsv",
-    "field": "delegation_purpose",
-    "prefix": "ownership:*",
-    "manifest_round": "0.3.0-unregistered-addendum"
+    "manifest_round": "backfill-1052"
    },
    {
     "decimal_id": "3.2",
-    "decimal_id_status": "PROPOSED - family is UNREGISTERED; the anchor is the governing CC section, not an owned CC 3.1.N row",
-    "claim_id": "CLM-nsproc-attested-key-id-ownership",
+    "claim_id": "CLM-nsproc-steward-bound-predicate-trust",
     "repo": "CIRISPersist",
-    "crate": "ciris-persist@21.4.0",
-    "path#symbol": "src/federation/admission.rs#check_single_node_owner_admission",
+    "path#symbol": "src/federation/admission.rs#is_steward_bound",
     "tsv_target": "evidence/cc_impl.tsv",
-    "field": "attested_key_id",
-    "prefix": "ownership:*",
-    "manifest_round": "0.3.0-unregistered-addendum"
+    "manifest_round": "backfill-1052"
    },
    {
     "decimal_id": "3.2",
-    "decimal_id_status": "PROPOSED - family is UNREGISTERED; the anchor is the governing CC section, not an owned CC 3.1.N row",
-    "claim_id": "CLM-nsproc-delegated-scope-ownership",
+    "claim_id": "CLM-nsproc-steward-bindings-read-fold-trust",
     "repo": "CIRISPersist",
-    "crate": "ciris-persist@21.4.0",
-    "path#symbol": "src/federation/admission.rs#check_node_agency_admission",
+    "path#symbol": "src/engine.rs#steward_bindings_of",
     "tsv_target": "evidence/cc_impl.tsv",
-    "field": "delegated_scope",
-    "prefix": "ownership:*",
-    "manifest_round": "0.3.0-unregistered-addendum"
+    "manifest_round": "backfill-1052"
    },
    {
     "decimal_id": "3.2",
+    "claim_id": "CLM-infrastructure-trust-root-admitted-under-accord-quorum",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/canonical_community.rs#check_trust_root_community_admission",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "3.2",
+    "claim_id": "CLM-infrastructure-does-not-vote",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/canonical_community.rs#check_founders_eligible",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "3.2",
+    "claim_id": "CLM-infrastructure-entrenched-supersede",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/canonical_community.rs#prepare_trust_root_supersede",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "3.3.1",
     "decimal_id_status": "PROPOSED - family is UNREGISTERED; the anchor is the governing CC section, not an owned CC 3.1.N row",
-    "claim_id": "CLM-nsproc-delegation-valid-until-ownership",
+    "claim_id": "CLM-nsproc-subject-key-ids-consent",
     "repo": "CIRISPersist",
     "crate": "ciris-persist@21.4.0",
-    "path#symbol": "src/federation/admission.rs#delegation_valid_until_lapsed",
+    "path#symbol": "src/federation/admission.rs#resolve_withdraws_admission_rule_at",
     "tsv_target": "evidence/cc_impl.tsv",
-    "field": "delegation_valid_until",
-    "prefix": "ownership:*",
+    "field": "subject_key_ids",
+    "prefix": "consent:*",
     "manifest_round": "0.3.0-unregistered-addendum"
    },
    {
-    "decimal_id": "3.4.12",
+    "decimal_id": "3.3.1",
     "decimal_id_status": "PROPOSED - family is UNREGISTERED; the anchor is the governing CC section, not an owned CC 3.1.N row",
-    "claim_id": "CLM-nsproc-attestation-type-capacity-assurance",
+    "claim_id": "CLM-nsproc-dimension-consent",
     "repo": "CIRISPersist",
     "crate": "ciris-persist@21.4.0",
-    "path#symbol": "src/federation/admission.rs#default_reserved_prefix_rules",
+    "path#symbol": "src/federation/consent.rs#consent_state_of",
     "tsv_target": "evidence/cc_impl.tsv",
-    "field": "attestation_type",
-    "prefix": "capacity_assurance:*",
+    "field": "dimension",
+    "prefix": "consent:*",
+    "manifest_round": "0.3.0-unregistered-addendum"
+   },
+   {
+    "decimal_id": "3.3.1",
+    "decimal_id_status": "PROPOSED - family is UNREGISTERED; the anchor is the governing CC section, not an owned CC 3.1.N row",
+    "claim_id": "CLM-nsproc-attestation-prefixes-consent",
+    "repo": "CIRISPersist",
+    "crate": "ciris-persist@21.4.0",
+    "path#symbol": "src/federation/consent_grammar.rs#parse_grant_payload",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "field": "attestation_prefixes",
+    "prefix": "consent:*",
+    "manifest_round": "0.3.0-unregistered-addendum"
+   },
+   {
+    "decimal_id": "3.3.1",
+    "decimal_id_status": "PROPOSED - family is UNREGISTERED; the anchor is the governing CC section, not an owned CC 3.1.N row",
+    "claim_id": "CLM-nsproc-restrictions-op-strip-field-consent",
+    "repo": "CIRISPersist",
+    "crate": "ciris-persist@21.4.0",
+    "path#symbol": "src/federation/consent_grammar.rs#strip_field",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "field": "restrictions[].op=strip_field",
+    "prefix": "consent:*",
+    "manifest_round": "0.3.0-unregistered-addendum"
+   },
+   {
+    "decimal_id": "3.3.1",
+    "decimal_id_status": "PROPOSED - family is UNREGISTERED; the anchor is the governing CC section, not an owned CC 3.1.N row",
+    "claim_id": "CLM-nsproc-tier-consent",
+    "repo": "CIRISPersist",
+    "crate": "ciris-persist@21.4.0",
+    "path#symbol": "src/federation/mod.rs#list_consent_revocation_promotion_overdue",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "field": "tier",
+    "prefix": "consent:*",
+    "manifest_round": "0.3.0-unregistered-addendum"
+   },
+   {
+    "decimal_id": "3.3.1",
+    "decimal_id_status": "PROPOSED - family is UNREGISTERED; the anchor is the governing CC section, not an owned CC 3.1.N row",
+    "claim_id": "CLM-nsproc-deletion-sla-consent",
+    "repo": "CIRISPersist",
+    "crate": "ciris-persist@21.4.0",
+    "path#symbol": "src/federation/mod.rs#run_consent_sla_watch",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "field": "deletion_sla",
+    "prefix": "consent:*",
+    "manifest_round": "0.3.0-unregistered-addendum"
+   },
+   {
+    "decimal_id": "3.3.7",
+    "decimal_id_status": "PROPOSED - family is UNREGISTERED; the anchor is the governing CC section, not an owned CC 3.1.N row",
+    "claim_id": "CLM-nsproc-attestation-prefixes-scores",
+    "repo": "CIRISPersist",
+    "crate": "ciris-persist@21.4.0",
+    "path#symbol": "src/federation/consent_grammar.rs#covers",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "field": "attestation_prefixes",
+    "prefix": "scores:*",
     "manifest_round": "0.3.0-unregistered-addendum"
    },
    {
@@ -14598,6 +14523,18 @@
    {
     "decimal_id": "3.4.12",
     "decimal_id_status": "PROPOSED - family is UNREGISTERED; the anchor is the governing CC section, not an owned CC 3.1.N row",
+    "claim_id": "CLM-nsproc-attestation-type-capacity-assurance",
+    "repo": "CIRISPersist",
+    "crate": "ciris-persist@21.4.0",
+    "path#symbol": "src/federation/admission.rs#default_reserved_prefix_rules",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "field": "attestation_type",
+    "prefix": "capacity_assurance:*",
+    "manifest_round": "0.3.0-unregistered-addendum"
+   },
+   {
+    "decimal_id": "3.4.12",
+    "decimal_id_status": "PROPOSED - family is UNREGISTERED; the anchor is the governing CC section, not an owned CC 3.1.N row",
     "claim_id": "CLM-nsproc-scope-domain-subset-capacity-assurance",
     "repo": "CIRISPersist",
     "crate": "ciris-persist@21.4.0",
@@ -14608,16 +14545,1157 @@
     "manifest_round": "0.3.0-unregistered-addendum"
    },
    {
-    "decimal_id": "3.3.7",
+    "decimal_id": "3.4.11",
+    "claim_id": "CLM-nsproc-age-band-resolution-child-protection",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/engine.rs#age_band",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "3.4.13",
+    "claim_id": "CLM-child-protection",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/age.rs#is_minor",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "3.4.13",
+    "claim_id": "CLM-nsproc-age-band-one-way-coarsening-child-protection",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/age.rs#coarsen",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "4.4",
+    "claim_id": "CLM-pinned-trust-resolves",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/canonical_community.rs#resolve_community",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "4.4",
+    "claim_id": "CLM-pinned-trust-one-fetch",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/canonical_community.rs#pin_trust_from_bundle_response",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "4.5.8.3",
     "decimal_id_status": "PROPOSED - family is UNREGISTERED; the anchor is the governing CC section, not an owned CC 3.1.N row",
-    "claim_id": "CLM-nsproc-attestation-prefixes-scores",
+    "claim_id": "CLM-nsproc-attestation-prefixes-trace-summary",
     "repo": "CIRISPersist",
     "crate": "ciris-persist@21.4.0",
     "path#symbol": "src/federation/consent_grammar.rs#covers",
     "tsv_target": "evidence/cc_impl.tsv",
     "field": "attestation_prefixes",
-    "prefix": "scores:*",
+    "prefix": "trace_summary:*",
     "manifest_round": "0.3.0-unregistered-addendum"
+   },
+   {
+    "decimal_id": "4.5.8.3",
+    "decimal_id_status": "PROPOSED - family is UNREGISTERED; the anchor is the governing CC section, not an owned CC 3.1.N row",
+    "claim_id": "CLM-nsproc-agent-key-id-trace-summary",
+    "repo": "CIRISPersist",
+    "crate": "ciris-persist@21.4.0",
+    "path#symbol": "src/store/sqlite.rs#list_trace_summaries",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "field": "agent_key_id",
+    "prefix": "trace_summary:*",
+    "manifest_round": "0.3.0-unregistered-addendum"
+   },
+   {
+    "decimal_id": "4.5.8.3",
+    "decimal_id_status": "PROPOSED - family is UNREGISTERED; the anchor is the governing CC section, not an owned CC 3.1.N row",
+    "claim_id": "CLM-nsproc-extraction-manifest-hash-trace-summary",
+    "repo": "CIRISPersist",
+    "crate": "ciris-persist@21.4.0",
+    "path#symbol": "src/trace_summary_contract.rs#extraction_manifest_sha256",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "field": "extraction_manifest_hash",
+    "prefix": "trace_summary:*",
+    "manifest_round": "0.3.0-unregistered-addendum"
+   },
+   {
+    "decimal_id": "5.3.2.4",
+    "decimal_id_status": "PROPOSED - family is UNREGISTERED; the anchor is the governing CC section, not an owned CC 3.1.N row",
+    "claim_id": "CLM-nsproc-restrictions-op-strip-field-trace",
+    "repo": "CIRISPersist",
+    "crate": "ciris-persist@21.4.0",
+    "path#symbol": "src/federation/consent_grammar.rs#strip_field",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "field": "restrictions[].op=strip_field",
+    "prefix": "trace:*",
+    "manifest_round": "0.3.0-unregistered-addendum",
+    "post_cut_rename_from": "src/engine.rs#Engine::promote_attestation_with_strips"
+   },
+   {
+    "decimal_id": "5.3.2.4",
+    "decimal_id_status": "PROPOSED - family is UNREGISTERED; the anchor is the governing CC section, not an owned CC 3.1.N row",
+    "claim_id": "CLM-nsproc-cohort-scope-trace",
+    "repo": "CIRISPersist",
+    "crate": "ciris-persist@21.4.0",
+    "path#symbol": "src/engine.rs#Engine::promote_consented_backlog",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "field": "cohort_scope",
+    "prefix": "trace:*",
+    "manifest_round": "0.3.0-unregistered-addendum"
+   },
+   {
+    "decimal_id": "5.3.2.4",
+    "decimal_id_status": "PROPOSED - family is UNREGISTERED; the anchor is the governing CC section, not an owned CC 3.1.N row",
+    "claim_id": "CLM-nsproc-dimension-trace",
+    "repo": "CIRISPersist",
+    "crate": "ciris-persist@21.4.0",
+    "path#symbol": "src/federation/admission.rs#check_trace_dimension_admission",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "field": "dimension",
+    "prefix": "trace:*",
+    "manifest_round": "0.3.0-unregistered-addendum"
+   },
+   {
+    "decimal_id": "5.3.2.4",
+    "decimal_id_status": "PROPOSED - family is UNREGISTERED; the anchor is the governing CC section, not an owned CC 3.1.N row",
+    "claim_id": "CLM-nsproc-subject-key-ids-trace",
+    "repo": "CIRISPersist",
+    "crate": "ciris-persist@21.4.0",
+    "path#symbol": "src/federation/admission.rs#check_trace_dimension_admission",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "field": "subject_key_ids",
+    "prefix": "trace:*",
+    "manifest_round": "0.3.0-unregistered-addendum"
+   },
+   {
+    "decimal_id": "5.3.4",
+    "claim_id": "CLM-trust-root-bundle-serves-community-beside",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/canonical_community.rs#trust_root_bundle_response",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "3.2",
+    "claim_id": "CLM-conferral-plane-named",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/trust_root.rs#ConferralPlane",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052",
+    "tsv_comment_before": [
+     "",
+     "# ── UNASSIGNED — awaiting a CC decimal ───────────────────────────────────────",
+     "# v25.1.0 (CIRISPersist#577 follow-up) — adopted from CIRISVerify's registry",
+     "# (CIRISVerify#233), which shipped this section first and was right to.",
+     "#",
+     "# Shipped, tested persist surface with NO CC identifier yet. Listed here so the",
+     "# Constitution can issue decimals against real implementations rather than",
+     "# against a proposal — the direction that matches how every one of these was",
+     "# actually built (persist implements, CC ratifies, and the RC3 batch #46/#47/",
+     "# #48/#49/#67 is that loop running).",
+     "#",
+     "# The decimal column carries `—`, which is CC check_claims.py's documented skip",
+     "# sentinel (`if not dec or dec == \"—\": continue`). The literal string",
+     "# \"UNASSIGNED\" there would be neither empty nor `—`, so the checker would add",
+     "# it to the backed-DECIMAL set — registering a fake identifier. The",
+     "# awaiting-assignment marker therefore rides the CLM name instead, where it",
+     "# cannot be mistaken for a CC decimal.",
+     "#",
+     "# These cannot rot while they wait: persist's OWN resolver",
+     "# (`evidence_cc_impl_pointers_resolve`) requires a definition for every src/",
+     "# row regardless of decimal, so a rename fails our build even before CC sees",
+     "# it. Proposed CLM names are suggestions, not claims."
+    ]
+   },
+   {
+    "decimal_id": "3.2",
+    "claim_id": "CLM-drill-freshness-signal-not-gate",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/trust_root.rs#DrillFreshness",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "3.2",
+    "claim_id": "CLM-transit-eligibility-shared-root",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/trust_root.rs#resolve_transit_eligibility",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "3.4.7",
+    "claim_id": "CLM-key-refusal-names-its-branch",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/register.rs#KeyRefusalReason",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "6.1.5.2",
+    "claim_id": "CLM-quota-refusal-names-its-budget",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/replication/admission.rs#PeerQuotaRefusal",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "6.1.5",
+    "claim_id": "CLM-load-bearing-reachability",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/load_bearing.rs#is_load_bearing",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "3.3.1",
+    "claim_id": "CLM-deletion-window",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/deletion_window.rs#run_deletion_window_watch",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "3.1.9.2",
+    "claim_id": "CLM-reverse-quorum-objection",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/reverse_quorum.rs#record_objection",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "3.1.9.2",
+    "claim_id": "CLM-reverse-quorum-dismissal",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/reverse_quorum.rs#record_objection_dismissal",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "3.4.5",
+    "claim_id": "CLM-capacity-consent-gate",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/admission.rs#check_capacity_consent_admission",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "2.6.1.3",
+    "claim_id": "CLM-envelope-size",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/admission.rs#check_envelope_size_admission",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "3.4.7",
+    "claim_id": "CLM-peer-deadmission-revocable",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/admission.rs#check_peer_deadmission",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "3.1.9.4",
+    "claim_id": "CLM-wa-adjudication-family",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/ownership_reclaim.rs#build_reclaim_petition_envelope",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "4.2.6",
+    "claim_id": "CLM-wa-quorum-re-derived",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/ownership_reclaim.rs#wa_quorum_over_body",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "3.2",
+    "claim_id": "CLM-reclaim-authority-fails-closed",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/ownership_reclaim.rs#ReclaimPolicy::from_deployment_pin",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "3.1.9.2",
+    "claim_id": "CLM-quarantine-marker-not-command",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/quarantine.rs#fold_quarantine",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "3.1.9.2",
+    "claim_id": "CLM-quarantine-serve-consult",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/quarantine.rs#filter_withheld_rows",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "4.5.5",
+    "claim_id": "CLM-slash-duty-scope",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/admission.rs#check_delegated_duty_scores_admission",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "3.1.9.4",
+    "claim_id": "CLM-admin-action-attributed",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/hard_case.rs#check_admin_action_attribution",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "2.4.1.1",
+    "claim_id": "CLM-revoked-after",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/register.rs#check_revocation_bound",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "3.1.7",
+    "claim_id": "CLM-private-use-never-federates",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/admission.rs#check_private_use_not_federatable",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "4.5.4",
+    "claim_id": "CLM-promotion-cohort-standing",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/admission.rs#check_promotion_cohort_standing",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "3.1.7",
+    "claim_id": "CLM-persist-ruled-family-inventory",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/family_rules.rs#persist_ruled_prefixes",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "3.1.7",
+    "claim_id": "CLM-rule-not-on-the-row",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/family_rules.rs#rule_not_on_the_row_for",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "3.1.7",
+    "claim_id": "CLM-absence-claims-still-hold",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/namespace/supersets.rs#manifest_absence_claims",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "3.3.10.1",
+    "claim_id": "CLM-ledger-standard",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/ledgers/standard.rs#derive_ledger_id",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "3.3.10.1",
+    "claim_id": "CLM-ledger-standard",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/admission.rs#check_ledger_binding_admission",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "3.3.10.1",
+    "claim_id": "CLM-ledger-standard",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/ledgers/standard.rs#verify_chain_from_checkpoint",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "3.3.10.1",
+    "claim_id": "CLM-ledger-standard",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/ledgers/standard.rs#detect_double_head",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "3.3.10.1",
+    "claim_id": "CLM-ledger-standard",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/admission.rs#STAGED_GOVERNED_FAMILIES",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "3.3.10.1",
+    "claim_id": "CLM-ledger-fold",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/ledgers/standard.rs#conservation_fold",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "3.3.10.1",
+    "claim_id": "CLM-ledger-fold",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/ledgers/standard.rs#fold_canonical_bytes",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "4.5.1.1",
+    "claim_id": "CLM-ci-axis",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/namespace/supersets.rs#fusion_classification",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "3.2",
+    "claim_id": "CLM-infrastructure-does-not-vote",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/admission.rs#check_infrastructure_founders_not_node",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "3.2",
+    "claim_id": "CLM-infrastructure-does-not-vote",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/consensus.rs#eligible",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "3.2",
+    "claim_id": "CLM-infrastructure-does-not-vote",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/mod.rs#community_node_bearing_seats",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "3.2",
+    "claim_id": "CLM-infrastructure-quorum-m-of-n",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/admission.rs#check_infrastructure_consensus_protocol",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "3.4.7.3",
+    "claim_id": "CLM-node-exclusive-at-mint",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/register.rs#check_node_identity_exclusive",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "3.2",
+    "claim_id": "CLM-family-root-charter",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/trust_root.rs#ConferralPlane",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "3.2",
+    "claim_id": "CLM-family-root-charter",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/trust_root.rs#family_quorum_over",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "3.4.7",
+    "claim_id": "CLM-family-root-charter",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/trust_root.rs#check_family_charter_admission",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "4.1.1",
+    "claim_id": "CLM-delegation-depth-default",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/topology.rs#DEFAULT_DELEGATION_DEPTH",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "4.1.1",
+    "claim_id": "CLM-delegation-depth-default",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/topology.rs#build_delegation_graph",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "4.1.1",
+    "claim_id": "CLM-delegation-depth-default",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/admission.rs#resolve_withdraws_admission_rule_at",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "3.1.7",
+    "claim_id": "CLM-version-segment-suffix",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/namespace/matcher.rs#match_family",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "3.1.7",
+    "claim_id": "CLM-version-segment-suffix",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/namespace/matcher.rs#trailing_version",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "3.1.7",
+    "claim_id": "CLM-version-segment-suffix",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/namespace/matcher.rs#is_version_exempt",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "3.1.7",
+    "claim_id": "CLM-version-segment-suffix",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/admission.rs#check_dimension_case_rule",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "3.4.1",
+    "claim_id": "CLM-reserved-leaves-closed",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/namespace/matcher.rs#match_family",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "3.4.1",
+    "claim_id": "CLM-reserved-leaves-closed",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/admission.rs#check_namespace_family_registered",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "4.2.1.1",
+    "claim_id": "CLM-accord-invoke-lowercase",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/trust_root.rs#ACCORD_HEARTBEAT_DIMENSION",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "3.1.2",
+    "claim_id": "CLM-hardware-custody-vocabulary",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/hardware_attestation.rs#HardwareTypePlatform",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "3.1.2",
+    "claim_id": "CLM-hardware-custody-vocabulary",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/hardware_attestation.rs#hardware_class_multiplier",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "5.4.6",
+    "claim_id": "CLM-minor-no-federation-binding",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/admission.rs#check_minor_owner_binding_not_announced",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "3.4.12",
+    "claim_id": "CLM-capacity-companion-rows",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/capacity.rs#parse_companion",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "3.4.12",
+    "claim_id": "CLM-capacity-companion-rows",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/admission.rs#check_namespace_family_registered",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "3.1.7",
+    "claim_id": "CLM-match-full-semantics",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/namespace/matcher.rs#compile",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "3.1.7",
+    "claim_id": "CLM-match-full-semantics",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/namespace/matcher.rs#match_family",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "2.4.1.2.1",
+    "claim_id": "CLM-authority-triad",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/admission.rs#emitter_resolves_to_authority",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "2.4.1.2.1",
+    "claim_id": "CLM-authority-triad",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/admission.rs#row_was_issued_under_authority",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "2.4.1.2.1",
+    "claim_id": "CLM-authority-triad",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/topology.rs#build_delegation_graph",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "2.4.1.2.1",
+    "claim_id": "CLM-authority-triad",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/key_grant.rs#admit_replicated_key_grant",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "2.4.1.2.1",
+    "claim_id": "CLM-licence-authority-object",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/admission.rs#emitter_resolves_to_authority",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "2.4.1.2.1",
+    "claim_id": "CLM-licence-authority-object",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/admission.rs#row_was_issued_under_authority",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "2.4.1.2.1",
+    "claim_id": "CLM-licence-authority-object",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/licensure.rs#status_set_for",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "2.4.1.2.1",
+    "claim_id": "CLM-licence-authority-object",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/admission.rs#check_licensure_delegator_is_authority",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "3.1.1",
+    "claim_id": "CLM-licensure-status",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/licensure.rs#LicensureStatus",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "3.1.1",
+    "claim_id": "CLM-licensure-status",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/licensure.rs#fold_status_set",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "3.1.1",
+    "claim_id": "CLM-licensure-status",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/licensure.rs#status_set_for",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "3.1.7",
+    "claim_id": "CLM-dimension-case-rule",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/admission.rs#check_dimension_case_rule",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "3.1.7",
+    "claim_id": "CLM-match-full-semantics",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/namespace/matcher.rs#detect_malformed",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "3.2",
+    "claim_id": "CLM-canonical-community-row",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/canonical_community.rs#check_trust_root_at_door",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "3.2",
+    "claim_id": "CLM-canonical-community-row",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/canonical_community.rs#StoredStanding",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "3.3.1",
+    "claim_id": "CLM-consent-scope-is-envelope-member",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/consent.rs#named_scopes",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "3.3.1",
+    "claim_id": "CLM-consent-scope-is-envelope-member",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/consent_scope.rs#check_consent_scope_tokens",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "3.3.1",
+    "claim_id": "CLM-consent-scope-is-envelope-member",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/admission.rs#check_capacity_consent_admission",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "3.4.5",
+    "claim_id": "CLM-config-self-or-owner-gate",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/admission.rs#check_config_self_or_owner_admission",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "3.4.5.1",
+    "claim_id": "CLM-self-report-route",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/admission.rs#check_config_sensitive_leaf_floor",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "3.4.5.1",
+    "claim_id": "CLM-self-report-route",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/admission.rs#check_config_renewal_supersedes",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "3.4.7.3",
+    "claim_id": "CLM-actor-substrate",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/admission.rs#check_node_agency_admission",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "3.4.7.3",
+    "claim_id": "CLM-actor-substrate",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/register.rs#check_node_identity_exclusive",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "3.4.7.3",
+    "claim_id": "CLM-common-human",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/admission.rs#may_act_through",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "3.4.7.3",
+    "claim_id": "CLM-common-human",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/admission.rs#owner_of",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "3.4.7.3",
+    "claim_id": "CLM-common-human",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/admission.rs#steward_bindings_of",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "4.2.2.1",
+    "claim_id": "CLM-nsproc-attestation-evidence",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/hardware_attestation.rs#HardwareAttestationPolicy::admit_key_record",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "4.2.2.1",
+    "claim_id": "CLM-nsproc-attestation-evidence",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/hardware_attestation.rs#HardwareAttestationPolicy::check_structure",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "4.4.3.4.3",
+    "claim_id": "CLM-issuance-scope",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/admission.rs#check_licensure_delegator_is_authority",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "4.4.3.4.3",
+    "claim_id": "CLM-issuance-scope",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/key_grant.rs#admit_replicated_key_grant",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "4.4.3.8",
+    "claim_id": "CLM-trust-root",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/trust_root.rs#check_trust_charter_admission",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "4.4.3.8",
+    "claim_id": "CLM-trust-root",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/trust_root.rs#trust_root_valid",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "4.4.3.8",
+    "claim_id": "CLM-trust-root",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/trust_root.rs#ConferralPlane",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "4.4.3.8",
+    "claim_id": "CLM-trust-root",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/trust_root.rs#resolve_transit_eligibility",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "4.5.5",
+    "claim_id": "CLM-scope-attenuation",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/admission.rs#scope_covers",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "4.5.5",
+    "claim_id": "CLM-scope-attenuation",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/admission.rs#delegation_scope_grants",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "3.2",
+    "claim_id": "CLM-attach-freshness",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/canonical_community.rs#check_attach_freshness",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "3.2",
+    "claim_id": "CLM-attach-freshness",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/envelope.rs#ATTACH_WINDOW_SECS",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "3.2",
+    "claim_id": "CLM-witnessed-lineage",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/lineage_witness.rs#admit_lineage_head_cosign",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "3.2",
+    "claim_id": "CLM-witnessed-lineage",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/lineage_witness.rs#witnessed",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "3.2",
+    "claim_id": "CLM-witnessed-lineage",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/canonical_community.rs#witnessed_head",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "3.2",
+    "claim_id": "CLM-liveness-margin",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/admission.rs#INFRA_RULE_LIVENESS_MARGIN_AT_FOUNDING",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "3.2",
+    "claim_id": "CLM-liveness-margin",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/canonical_community.rs#emit_liveness_transition",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "3.3.13",
+    "claim_id": "CLM-sealed-descriptor",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/media_source.rs#check_sealed_descriptor_shape",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "3.1.3.1",
+    "claim_id": "CLM-session-claim",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/admission.rs#check_session_lease_bound",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "3.1.3.1",
+    "claim_id": "CLM-session-claim",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/session_claim.rs#resolve_claim",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "3.1.1",
+    "claim_id": "CLM-duty",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/admission.rs#check_duty_admission",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "3.3.1",
+    "claim_id": "CLM-consent-community-trust",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/community_trust_consent.rs#check_community_trust_grant_admission",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "3.3.1",
+    "claim_id": "CLM-consent-community-trust",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/community_trust_consent.rs#fold_community_trust",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "3.1.3.2",
+    "claim_id": "CLM-membership-consent",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/membership_acceptance.rs#check_growth_accepted",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "3.1.3.2",
+    "claim_id": "CLM-membership-consent",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/membership_acceptance.rs#check_founding_signers",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "3.1.3.2",
+    "claim_id": "CLM-membership-consent",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/membership_acceptance.rs#check_community_founding_signers",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "3.1.3.2",
+    "claim_id": "CLM-membership-consent",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/membership_acceptance.rs#check_supersede_adds_no_member",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "6.1.5.3",
+    "claim_id": "CLM-durability-every-tier",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/durability.rs#durability_mode",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "6.1.5.3",
+    "claim_id": "CLM-durability-every-tier",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/durability.rs#content_audience",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "6.1.5.3",
+    "claim_id": "CLM-audience-claimed-nodes",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/replication_audience.rs#audience_nodes",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "6.1.5.3",
+    "claim_id": "CLM-audience-claimed-nodes",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/replication_audience.rs#occurrence_may_hold_key",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "3.2",
+    "claim_id": "CLM-canonical-founders-accord",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/canonical_community.rs#founder_arm_at",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "3.2",
+    "claim_id": "CLM-canonical-founders-accord",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/membership_acceptance.rs#node_seated_without_acceptance",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "3.2",
+    "claim_id": "CLM-attach-unlabelled",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/trust_root.rs#direction_denied_ids",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "3.2",
+    "claim_id": "CLM-attach-unlabelled",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/trust_root.rs#names_no_trust_job",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "backfill-1052"
+   },
+   {
+    "decimal_id": "3.1.9.4",
+    "claim_id": "CLM-nsproc-class-dual-scope-gate-watchlist-id",
+    "repo": "CIRISPersist",
+    "crate": "ciris-persist@21.4.0",
+    "path#symbol": "src/safety/watchlist.rs#authority_admits_enable",
+    "tsv_target": "n/a",
+    "field": "class (dual-scope gate)",
+    "prefix": "watchlist:{id}",
+    "tsv_excluded": "src/safety/watchlist.rs does not exist in persist (misattributed; dropped at the post-cut materialisation)"
+   },
+   {
+    "decimal_id": "3.1.9.5",
+    "claim_id": "CLM-nsproc-decision-pointer-locality-decision-scale",
+    "repo": "CIRISPersist",
+    "crate": "ciris-persist@21.4.0",
+    "path#symbol": "reuse typed references_attestation_id (drop bespoke decision_ref)",
+    "tsv_target": "n/a",
+    "field": "decision pointer",
+    "prefix": "locality:decision:{scale}",
+    "tsv_excluded": "not a path#symbol: a design note, no processor to cite"
+   },
+   {
+    "decimal_id": "3.1.9.4",
+    "claim_id": "CLM-nsproc-enabled-watchlist-id",
+    "repo": "CIRISPersist",
+    "crate": "ciris-persist@21.4.0",
+    "path#symbol": "src/safety/watchlist.rs#enable_watchlist",
+    "tsv_target": "n/a",
+    "field": "enabled",
+    "prefix": "watchlist:{id}",
+    "tsv_excluded": "src/safety/watchlist.rs does not exist in persist (misattributed; dropped at the post-cut materialisation)"
+   },
+   {
+    "decimal_id": "3.1.9.4",
+    "claim_id": "CLM-nsproc-group-key-id-watchlist-id",
+    "repo": "CIRISPersist",
+    "crate": "ciris-persist@21.4.0",
+    "path#symbol": "src/safety/watchlist.rs#authority_admits_enable",
+    "tsv_target": "n/a",
+    "field": "group_key_id",
+    "prefix": "watchlist:{id}",
+    "tsv_excluded": "src/safety/watchlist.rs does not exist in persist (misattributed; dropped at the post-cut materialisation)"
    }
   ],
   "CIRISServer": [
