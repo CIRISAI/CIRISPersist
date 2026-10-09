@@ -166,6 +166,11 @@ pub struct SqliteBackend {
     scoring_factors_cache: std::sync::Arc<crate::ceg::aggregates::scoring::ScoringFactorsCache>,
     /// v50.0.0 (CIRISPersist#926) — this directory's trust-root standing cache.
     trust_root_standing_cache: crate::federation::canonical_community::StandingCache,
+    /// v54.0.0 (Codex on PR #1050) — the in-process half of the
+    /// `delegates_to` cycle-gate serialization
+    /// ([`crate::federation::admission::delegation_cycle_gated`]): held from
+    /// the cycle check through the insert of every gated write.
+    delegation_write_lock: tokio::sync::Mutex<()>,
     /// v50.0.0 (PR #921 review) — test-only hooks inside this backend's doors.
     #[cfg(test)]
     test_hooks: crate::store::test_hooks::TestHooks,
@@ -787,6 +792,7 @@ impl SqliteBackend {
             repo_stats_cache: std::sync::Arc::new(crate::cache::Cache::new()),
             scoring_factors_cache: std::sync::Arc::new(crate::cache::Cache::new()),
             trust_root_standing_cache: Default::default(),
+            delegation_write_lock: tokio::sync::Mutex::new(()),
             #[cfg(test)]
             test_hooks: Default::default(),
         }
@@ -5574,6 +5580,23 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             // the offered one: identical is `AlreadyHeld`, differing is a typed
             // Conflict. `DO NOTHING` alone would silently accept a DIFFERENT row
             // under an occupied id, which is the opposite defect.
+            // v54.0.0 (Codex on PR #1050) — THE CYCLE CHECK AND THE INSERT ARE ONE
+            // STEP. The tier-4 check above read the graph unlocked; a concurrent
+            // writer of the reverse edge could have passed the same read since. Hold
+            // the delegation write lock from a re-check through the write, so every
+            // gated writer is serialized against it. One process owns this store, so
+            // the in-process lock is the whole serialization.
+            let _cycle_guard = if crate::federation::admission::delegation_cycle_gated(&row) {
+                let guard = self.delegation_write_lock.lock().await;
+                crate::federation::admission::check_delegation_cycle_admission(self, &row).await?;
+                #[cfg(test)]
+                self.test_hooks()
+                    .pause_if_armed("delegation_cycle_before_insert")
+                    .await;
+                Some(guard)
+            } else {
+                None
+            };
             let offered_hash_for_compare = row.persist_row_hash.clone();
             let id_for_compare = row.attestation_id.clone();
             let inserted = self.write(move |conn| -> Result<bool, rusqlite::Error> {
@@ -12994,6 +13017,14 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                 "federation_attestations row {attestation_id} does not exist"
             ))
         })?;
+        // v54.0.0 (Codex on PR #1050) — a crossing `delegates_to` adds an edge to
+        // the federation-tier graph the cycle gate reads: the plan's cycle check
+        // and the write below are one step under the delegation write lock.
+        let _cycle_guard = if crate::federation::admission::delegation_cycle_gated(&current) {
+            Some(self.delegation_write_lock.lock().await)
+        } else {
+            None
+        };
         let Some(crossing::EnterPlan { row, crossing }) =
             crossing::plan_enter_mesh(self, &current, ci, custody, self.self_key_id().as_deref())
                 .await?
@@ -13002,6 +13033,12 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                 attestation_id: attestation_id.to_owned(),
             });
         };
+        #[cfg(test)]
+        if _cycle_guard.is_some() {
+            self.test_hooks()
+                .pause_if_armed("delegation_cycle_before_crossing")
+                .await;
+        }
         let envelope_text = serde_json::to_string(&row.attestation_envelope)
             .map_err(|e| Error::Backend(format!("envelope serialize: {e}")))?;
         let och = hex::decode(&row.original_content_hash)

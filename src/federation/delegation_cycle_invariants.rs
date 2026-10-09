@@ -36,6 +36,18 @@
 //!   family-shaped charter holder → root admits beside the root's capability
 //!   edge back to the holder, in either order, and a capability edge closing
 //!   the same pair is still refused.
+//!
+//! I597 — the check and the insert are ONE step (Codex on PR #1050). Two
+//! writers of `A → B` and `B → A` that both finish the graph read before
+//! either inserts would both be admitted. The witness forces exactly that
+//! interleaving: the first writer is paused (a `store::test_hooks` pause) at
+//! the last point before its write, the second writer then runs to completion
+//! or blocks, and the first is resumed. Exactly one edge may be admitted, and
+//! the refused one is `federation_delegation_cycle`. Run as (i) put vs put and
+//! (ii) a local `B → A` crossing (`enter_mesh`) vs a put of `A → B`. On memory
+//! and sqlite both writers share the one backend (its in-process lock is the
+//! serialization); on postgres they are TWO backends with two pools on one
+//! database, so only the advisory lock can serialize them.
 
 /// The backend-agnostic witness body; `run` instantiates it per backend.
 #[cfg(test)]
@@ -118,6 +130,150 @@ pub mod bodies {
         d.put_attestation(crate::federation::SignedAttestation { attestation: row })
             .await?;
         Ok(id)
+    }
+
+    /// Stage a LOCAL `delegates_to(from → to)` and describe its crossing.
+    async fn stage_local_edge(
+        d: &dyn FederationDirectory,
+        from: &str,
+        to: &str,
+    ) -> (
+        String,
+        crate::federation::ContextualIntegrity,
+        crate::federation::TierPromotionCustody,
+    ) {
+        let staged_id = d
+            .attestation_insert_local(crate::federation::types::LocalAttestationInput {
+                attestation_id: None,
+                attesting_key_id: from.to_owned(),
+                attested_key_id: Some(to.to_owned()),
+                attestation_type: attestation_type::DELEGATES_TO.to_owned(),
+                weight: Some(1.0),
+                expires_at: None,
+                attestation_envelope: crate::federation::envelope::EnvelopeCore::from_value(
+                    serde_json::json!({
+                        "dimension": crate::federation::self_at_login::DIMENSION_DELEGATES_TO,
+                        "scope": ["act_on_behalf"],
+                    }),
+                )
+                .unwrap(),
+                subject_key_ids: Vec::new(),
+                cohort_scope: cohort_scope::SELF.to_owned(),
+                scrub_signature_classical: None,
+                scrub_signature_pqc: None,
+            })
+            .await
+            .expect("the local door stages producer-authority rows");
+        let staged = d.get_attestation(&staged_id).await.unwrap().unwrap();
+        let ci = ts::describe_own(&staged, crate::federation::CrossingBasis::ProducerAuthority);
+        let custody = ts::actor_reseal(&staged);
+        (staged_id, ci, custody)
+    }
+
+    /// Is a federation-tier `delegates_to(from → to)` stored?
+    async fn has_fed_edge(d: &dyn FederationDirectory, from: &str, to: &str) -> bool {
+        d.list_attestations_by(from).await.unwrap().iter().any(|r| {
+            r.attestation_type == attestation_type::DELEGATES_TO
+                && r.attested_key_id == to
+                && r.tier == attestation_tier::FEDERATION
+        })
+    }
+
+    /// Run `rival` while the first writer is held at its armed pause, then
+    /// resume the first. Returns the rival's result and whether it FINISHED
+    /// while the first writer was held (true = the two were not serialized).
+    async fn rival_while_paused<T>(
+        pause: &crate::store::test_hooks::Pause,
+        rival: impl std::future::Future<Output = T>,
+    ) -> (T, bool) {
+        pause.reached().await;
+        tokio::pin!(rival);
+        match tokio::time::timeout(std::time::Duration::from_secs(3), &mut rival).await {
+            Ok(out) => {
+                pause.resume();
+                (out, true)
+            }
+            Err(_) => {
+                pause.resume();
+                (rival.await, false)
+            }
+        }
+    }
+
+    /// I597 (i) — put vs put. `first` carries the armed
+    /// `delegation_cycle_before_insert` pause; `second` may be the same
+    /// backend or another one on the same database.
+    pub(crate) async fn i597_put_vs_put_admits_one(
+        first: &dyn FederationDirectory,
+        second: &dyn FederationDirectory,
+        pause: std::sync::Arc<crate::store::test_hooks::Pause>,
+        tag: &str,
+    ) {
+        let (a, b) = (format!("{tag}-a"), format!("{tag}-b"));
+        agent(first, &a).await;
+        agent(first, &b).await;
+        let (ra, (rb, b_ran_free)) = tokio::join!(
+            ts::put_delegates_to(first, &a, &b, None),
+            rival_while_paused(&pause, ts::put_delegates_to(second, &b, &a, None)),
+        );
+        let ab = has_fed_edge(first, &a, &b).await;
+        let ba = has_fed_edge(first, &b, &a).await;
+        assert!(
+            !(ab && ba),
+            "I597 (i): BOTH a → b and b → a were stored — the race admitted the cycle \
+             (b finished while a was held: {b_ran_free}; a: {ra:?}; b: {rb:?})"
+        );
+        assert!(
+            ra.is_ok(),
+            "I597 (i): the first writer holds the lock and admits: {ra:?}"
+        );
+        expect_cycle(
+            rb,
+            &b,
+            &a,
+            1,
+            "I597 (i): the second writer, serialized behind the first",
+        );
+        assert!(ab && !ba, "I597 (i): exactly the first edge is stored");
+        assert!(
+            !b_ran_free,
+            "I597 (i): the second writer must wait for the first"
+        );
+    }
+
+    /// I597 (ii) — a crossing vs a put. `first` carries the armed
+    /// `delegation_cycle_before_crossing` pause.
+    pub(crate) async fn i597_crossing_vs_put_admits_one(
+        first: &dyn FederationDirectory,
+        second: &dyn FederationDirectory,
+        pause: std::sync::Arc<crate::store::test_hooks::Pause>,
+        tag: &str,
+    ) {
+        let (x, y) = (format!("{tag}-x"), format!("{tag}-y"));
+        agent(first, &x).await;
+        agent(first, &y).await;
+        let (staged_id, ci, custody) = stage_local_edge(first, &y, &x).await;
+        let (rc, (rp, p_ran_free)) = tokio::join!(
+            first.enter_mesh(&staged_id, &ci, &custody),
+            rival_while_paused(&pause, ts::put_delegates_to(second, &x, &y, None)),
+        );
+        let yx = has_fed_edge(first, &y, &x).await;
+        let xy = has_fed_edge(first, &x, &y).await;
+        assert!(
+            !(yx && xy),
+            "I597 (ii): the crossing y → x AND the put x → y both landed — the race \
+             admitted the cycle (put finished while the crossing was held: {p_ran_free}; \
+             crossing: {rc:?}; put: {rp:?})"
+        );
+        assert!(rc.is_ok(), "I597 (ii): the held crossing admits: {rc:?}");
+        expect_cycle(
+            rp,
+            &x,
+            &y,
+            1,
+            "I597 (ii): the put, serialized behind the crossing",
+        );
+        assert!(!p_ran_free, "I597 (ii): the put must wait for the crossing");
     }
 
     /// I590 — see the module doc.
@@ -454,6 +610,81 @@ mod run {
                 }
             }
         };
+    }
+
+    /// I597 on one backend `$b` (memory, sqlite): both writers share it.
+    macro_rules! i597_single {
+        ($b:expr) => {{
+            let b = $b;
+            let d = &b as &dyn crate::federation::FederationDirectory;
+            let pause = b.test_hooks().arm_pause("delegation_cycle_before_insert");
+            super::bodies::i597_put_vs_put_admits_one(d, d, pause, &format!("i597p-{}", suffix()))
+                .await;
+            let pause = b.test_hooks().arm_pause("delegation_cycle_before_crossing");
+            super::bodies::i597_crossing_vs_put_admits_one(
+                d,
+                d,
+                pause,
+                &format!("i597c-{}", suffix()),
+            )
+            .await;
+        }};
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn i597_memory() {
+        i597_single!(crate::store::memory::MemoryBackend::new());
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn i597_sqlite() {
+        use crate::store::Backend as _;
+        let b = crate::store::sqlite::SqliteBackend::open_in_memory()
+            .await
+            .unwrap();
+        b.run_migrations().await.unwrap();
+        i597_single!(b);
+    }
+
+    /// I597 on postgres: TWO backends, two pools, one database — two
+    /// processes' worth of writers. Neither backend's in-process lock sees the
+    /// other's writer, so only the advisory lock can serialize them.
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn i597_postgres() {
+        use crate::federation::FederationDirectory;
+        use crate::store::Backend as _;
+        let Some(dsn) = crate::test_pg::isolated_dsn() else {
+            eprintln!("i597_postgres: no CIRIS_PERSIST_TEST_PG base DSN — SKIPPED");
+            return;
+        };
+        let b1 = crate::store::postgres::PostgresBackend::connect(&dsn)
+            .await
+            .unwrap();
+        b1.run_migrations().await.unwrap();
+        let b2 = crate::store::postgres::PostgresBackend::connect(&dsn)
+            .await
+            .unwrap();
+        let pause = b1.test_hooks().arm_pause("delegation_cycle_before_insert");
+        super::bodies::i597_put_vs_put_admits_one(
+            &b1 as &dyn FederationDirectory,
+            &b2 as &dyn FederationDirectory,
+            pause,
+            &format!("i597p-{}", suffix()),
+        )
+        .await;
+        let pause = b1
+            .test_hooks()
+            .arm_pause("delegation_cycle_before_crossing");
+        super::bodies::i597_crossing_vs_put_admits_one(
+            &b1 as &dyn FederationDirectory,
+            &b2 as &dyn FederationDirectory,
+            pause,
+            &format!("i597c-{}", suffix()),
+        )
+        .await;
+        eprintln!("i597_postgres: RAN on {dsn}");
     }
 
     dyn_runners!(memory_dyn, async {

@@ -74,6 +74,11 @@ pub struct MemoryBackend {
     admission_gate: std::sync::RwLock<Option<crate::federation::AdmissionGate>>,
     /// v50.0.0 (CIRISPersist#926) — this directory's trust-root standing cache.
     trust_root_standing_cache: crate::federation::canonical_community::StandingCache,
+    /// v54.0.0 (Codex on PR #1050) — the in-process half of the
+    /// `delegates_to` cycle-gate serialization
+    /// ([`crate::federation::admission::delegation_cycle_gated`]): held from
+    /// the cycle check through the insert of every gated write.
+    delegation_write_lock: tokio::sync::Mutex<()>,
     /// v50.0.0 (PR #921 review) — test-only hooks inside this backend's doors.
     #[cfg(test)]
     test_hooks: crate::store::test_hooks::TestHooks,
@@ -1016,6 +1021,7 @@ impl Default for MemoryBackend {
             ),
             admission_gate: std::sync::RwLock::new(None),
             trust_root_standing_cache: Default::default(),
+            delegation_write_lock: tokio::sync::Mutex::new(()),
             #[cfg(test)]
             test_hooks: Default::default(),
             schema_resolver: std::sync::RwLock::new(std::sync::Arc::new(
@@ -4092,6 +4098,23 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // is still owned (before the push consumes it).
         let projected_trace =
             crate::ingest::project_trace_events_from_attestation(&row.attestation_envelope);
+        // v54.0.0 (Codex on PR #1050) — THE CYCLE CHECK AND THE INSERT ARE ONE
+        // STEP. The tier-4 check above read the graph unlocked; a concurrent
+        // writer of the reverse edge could have passed the same read since. Hold
+        // the delegation write lock from a re-check through the write, so every
+        // gated writer is serialized against it. One process owns this store, so
+        // the in-process lock is the whole serialization.
+        let _cycle_guard = if crate::federation::admission::delegation_cycle_gated(&row) {
+            let guard = self.delegation_write_lock.lock().await;
+            crate::federation::admission::check_delegation_cycle_admission(self, &row).await?;
+            #[cfg(test)]
+            self.test_hooks()
+                .pause_if_armed("delegation_cycle_before_insert")
+                .await;
+            Some(guard)
+        } else {
+            None
+        };
         // v31.0.0 (CIRISPersist#646) — carried OUT of the guard scope: the
         // reload the index derivation needs takes the same lock.
         let wire_index_key: Option<String>;
@@ -10478,6 +10501,14 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                 "federation_attestations row {attestation_id} does not exist"
             ))
         })?;
+        // v54.0.0 (Codex on PR #1050) — a crossing `delegates_to` adds an edge to
+        // the federation-tier graph the cycle gate reads: the plan's cycle check
+        // and the write below are one step under the delegation write lock.
+        let _cycle_guard = if crate::federation::admission::delegation_cycle_gated(&current) {
+            Some(self.delegation_write_lock.lock().await)
+        } else {
+            None
+        };
         let Some(crossing::EnterPlan { row, crossing }) =
             crossing::plan_enter_mesh(self, &current, ci, custody, self.self_key_id().as_deref())
                 .await?
@@ -10486,6 +10517,12 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                 attestation_id: attestation_id.to_owned(),
             });
         };
+        #[cfg(test)]
+        if _cycle_guard.is_some() {
+            self.test_hooks()
+                .pause_if_armed("delegation_cycle_before_crossing")
+                .await;
+        }
         let wire_index_key = {
             let mut state = self.state.lock().expect("memory backend lock");
             let admitted_at = next_plane_position(

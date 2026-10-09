@@ -1019,6 +1019,11 @@ pub struct PostgresBackend {
     scoring_factors_cache: std::sync::Arc<crate::ceg::aggregates::scoring::ScoringFactorsCache>,
     /// v50.0.0 (CIRISPersist#926) — this directory's trust-root standing cache.
     trust_root_standing_cache: crate::federation::canonical_community::StandingCache,
+    /// v54.0.0 (Codex on PR #1050) — the in-process half of the
+    /// `delegates_to` cycle-gate serialization
+    /// ([`crate::federation::admission::delegation_cycle_gated`]): held from
+    /// the cycle check through the insert of every gated write.
+    delegation_write_lock: tokio::sync::Mutex<()>,
     /// v50.0.0 (PR #921 review) — test-only hooks inside this backend's doors.
     #[cfg(test)]
     test_hooks: crate::store::test_hooks::TestHooks,
@@ -1667,6 +1672,7 @@ impl PostgresBackend {
             repo_stats_cache: std::sync::Arc::new(crate::cache::Cache::new()),
             scoring_factors_cache: std::sync::Arc::new(crate::cache::Cache::new()),
             trust_root_standing_cache: Default::default(),
+            delegation_write_lock: tokio::sync::Mutex::new(()),
             #[cfg(test)]
             test_hooks: Default::default(),
         })
@@ -1724,6 +1730,7 @@ impl PostgresBackend {
             repo_stats_cache: std::sync::Arc::new(crate::cache::Cache::new()),
             scoring_factors_cache: std::sync::Arc::new(crate::cache::Cache::new()),
             trust_root_standing_cache: Default::default(),
+            delegation_write_lock: tokio::sync::Mutex::new(()),
             #[cfg(test)]
             test_hooks: Default::default(),
         }
@@ -6851,6 +6858,17 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             // INSERT and every projection below share THIS client, exactly as
             // before; the only change is that a row rejected by tiers 3-4 no
             // longer holds one while it is refused.
+            //
+            // v54.0.0 (Codex on PR #1050) — a cycle-gated `delegates_to` holds the
+            // in-process delegation write lock from here through its commit, taken
+            // BEFORE the pooled client so a queue of such writers holds no clients
+            // (the holder's re-check below needs one of its own).
+            let cycle_gated = crate::federation::admission::delegation_cycle_gated(&row);
+            let cycle_guard = if cycle_gated {
+                Some(self.delegation_write_lock.lock().await)
+            } else {
+                None
+            };
             let mut client = self
                 .get_client()
                 .await
@@ -6928,6 +6946,28 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             let tx = client.transaction().await.map_err(|e| {
                 crate::federation::Error::Backend(format!("attestation transaction: {e}"))
             })?;
+            // v54.0.0 (Codex on PR #1050) — THE CYCLE CHECK AND THE INSERT ARE ONE
+            // STEP. The tier-4 check above read the graph with no lock; a writer of
+            // the reverse edge could have passed the same read since. Take the
+            // delegation advisory lock in THIS transaction (released at its commit
+            // or rollback) and re-run the check under it: every gated writer that
+            // committed before we got the lock is visible to the re-check (READ
+            // COMMITTED, fresh statements), and none can commit until we do.
+            if cycle_gated {
+                tx.execute(
+                    "SELECT pg_advisory_xact_lock($1)",
+                    &[&crate::federation::admission::DELEGATION_CYCLE_LOCK_KEY],
+                )
+                .await
+                .map_err(|e| {
+                    crate::federation::Error::Backend(format!("delegation cycle lock: {e}"))
+                })?;
+                crate::federation::admission::check_delegation_cycle_admission(self, &row).await?;
+                #[cfg(test)]
+                self.test_hooks()
+                    .pause_if_armed("delegation_cycle_before_insert")
+                    .await;
+            }
             let inserted_rows = tx
                 .execute(
                     "INSERT INTO cirislens.federation_attestations (\
@@ -7028,6 +7068,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             tx.commit()
                 .await
                 .map_err(|e| crate::federation::Error::Backend(format!("attestation commit: {e}")))?;
+            drop(cycle_guard);
 
             if inserted_rows == 0 {
                 // The id was occupied. RE-READ decides which case this is.
@@ -14518,6 +14559,17 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 "federation_attestations row {attestation_id} does not exist"
             ))
         })?;
+        // v54.0.0 (Codex on PR #1050) — a crossing `delegates_to` adds an edge to
+        // the federation-tier graph the cycle gate reads, exactly as a put does:
+        // the plan's cycle check and the UPDATE are serialized the same way (the
+        // in-process lock here, the advisory lock + re-check in the UPDATE's
+        // transaction below).
+        let cycle_gated = crate::federation::admission::delegation_cycle_gated(&current);
+        let cycle_guard = if cycle_gated {
+            Some(self.delegation_write_lock.lock().await)
+        } else {
+            None
+        };
         let Some(crossing::EnterPlan { row, crossing }) =
             crossing::plan_enter_mesh(self, &current, ci, custody, self.self_key_id().as_deref())
                 .await?
@@ -14533,14 +14585,31 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             pg_envelope_text(&row.attestation_envelope, "attestation_envelope")?;
         let additional_scrubs_json = serde_json::to_string(&row.additional_scrubs)
             .map_err(|e| Error::Backend(format!("additional_scrubs serialize: {e}")))?;
-        let client = self
+        let mut client = self
             .get_client()
             .await
             .map_err(|e| Error::Backend(e.to_string()))?;
         let admitted_at = self
             .next_plane_position(&client, "federation_attestations")
             .await?;
-        let n = client
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| Error::Backend(format!("enter_mesh transaction: {e}")))?;
+        if cycle_gated {
+            tx.execute(
+                "SELECT pg_advisory_xact_lock($1)",
+                &[&crate::federation::admission::DELEGATION_CYCLE_LOCK_KEY],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("delegation cycle lock: {e}")))?;
+            crate::federation::admission::check_delegation_cycle_admission(self, &row).await?;
+            #[cfg(test)]
+            self.test_hooks()
+                .pause_if_armed("delegation_cycle_before_crossing")
+                .await;
+        }
+        let n = tx
             .execute(
                 "UPDATE cirislens.federation_attestations \
                  SET attestation_envelope = $1, original_content_hash = $2, \
@@ -14571,14 +14640,17 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 "federation_attestations row {attestation_id} was concurrently promoted"
             )));
         }
-        client
-            .execute(
-                "UPDATE cirislens.attestation_subjects SET tier = 'federation' \
-                 WHERE attestation_id = $1",
-                &[&attestation_id],
-            )
+        tx.execute(
+            "UPDATE cirislens.attestation_subjects SET tier = 'federation' \
+             WHERE attestation_id = $1",
+            &[&attestation_id],
+        )
+        .await
+        .map_err(|e| Error::Backend(format!("enter_mesh projection: {e}")))?;
+        tx.commit()
             .await
-            .map_err(|e| Error::Backend(format!("enter_mesh projection: {e}")))?;
+            .map_err(|e| Error::Backend(format!("enter_mesh commit: {e}")))?;
+        drop(cycle_guard);
         let wire_index_key =
             crate::federation::wire_index::record_key(&[("attestation_id", &row.attestation_id)]);
         drop(client);

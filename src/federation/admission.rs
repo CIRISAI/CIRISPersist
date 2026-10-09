@@ -15196,6 +15196,42 @@ pub async fn check_delegation_cycle_admission(
     }
 }
 
+/// v54.0.0 (Codex on PR #1050) — does [`check_delegation_cycle_admission`]
+/// examine `row`: a capability `delegates_to` between two distinct keys (not a
+/// trust-plane edge, not a self-edge)? Exactly these rows can close a cycle
+/// AND exactly these rows are the edges a cycle search walks, so they are the
+/// writes every backend serializes with the check.
+///
+/// # Why the check must be serialized with the write
+///
+/// The gate reads the graph, then the door inserts. Two writers submitting
+/// `A → B` and `B → A` can both finish the read before either inserts, and
+/// both are admitted: the cycle the gate exists to refuse. Every backend
+/// therefore holds a write lock from a check that sees the committed graph
+/// through its own insert's commit: an in-process mutex on every backend
+/// (memory, sqlite: one process owns the store), and on postgres also a
+/// transaction-scoped advisory lock, [`DELEGATION_CYCLE_LOCK_KEY`], taken in
+/// the insert's own transaction with the check re-run under it, because two
+/// processes share one database.
+///
+/// The lock is ONE key for every gated write, not one per pair: a cycle
+/// `A → B → C → A` is closed by a write whose pair `{C, A}` shares no key with
+/// the concurrent `B → C`, so a pair key would not serialize them. Delegation
+/// writes are rare, so one key costs nothing.
+pub(crate) fn delegation_cycle_gated(row: &super::Attestation) -> bool {
+    row.attestation_type == attestation_type::DELEGATES_TO
+        && !is_trust_plane_edge(row)
+        && row.attesting_key_id != row.attested_key_id
+}
+
+/// v54.0.0 (Codex on PR #1050) — the postgres advisory-lock key every
+/// [`delegation_cycle_gated`] write takes in its insert transaction
+/// (`pg_advisory_xact_lock(DELEGATION_CYCLE_LOCK_KEY)`), so a cycle check and
+/// the insert it admits are one step across every process sharing the
+/// database. A fixed 64-bit constant (the ASCII bytes of `"dlgcycle"`),
+/// distinct from every other key this crate takes.
+pub(crate) const DELEGATION_CYCLE_LOCK_KEY: i64 = 0x646c_6763_7963_6c65;
+
 /// v54.0.0 (CIRISPersist#1031) — is `row` a TRUST-PLANE edge, a
 /// `delegates_to` whose envelope `dimension` is
 /// [`TRUST_ACCEPTS_DIMENSION`](crate::federation::trust_root::TRUST_ACCEPTS_DIMENSION)
