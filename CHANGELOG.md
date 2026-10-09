@@ -7,6 +7,51 @@ threat-model citations because this crate's audit story is the point.
 
 ## [Unreleased]
 
+## [54.1.0] - unreleased
+
+### Fixed — the nightly mutants job was green while incomplete, its witness report said 0, and its survivors surfaced nowhere (#1051)
+
+The first scheduled run of `.github/workflows/mutants.yml` (650024b1, 2026-10-09) hit its
+2-hour budget (tool exit 124, 8 of 85 mutants never tested), had 6 survivors and 3 timeouts,
+and its job was **green**. Each defect, and what now makes it red:
+
+- **Incomplete was green.** `scripts/mutants.sh` exits **4** on an INCOMPLETE matrix, and
+  refuses up front with **3** a scope that does not fit its budget at the measured cost
+  (600 s + 120 s per mutant; that run: baseline 305 s, per mutant mean 78 s, p90 105 s).
+  `scope-consent` is split into `scope-consent-gate` (19 mutants, 2880 s) and `scope-observe`
+  (71 mutants, run as two `--shard`s of 36 and 35); each is its own job with a 150-minute
+  timeout. `MUTANTS_SHARD=k/n` is the new knob.
+- **"0 witnesses ran".** The defect was in the matrix reader, not `unvalidated_witnesses.py`:
+  the job sets `CARGO_TERM_COLOR=always`, so nextest's status lines in cargo-mutants' logs
+  carried colour escapes, and no line matched. The matrix listed 0 witnesses and credited no
+  kill. Escapes are stripped now, and a green baseline that yields no status line is a refusal
+  (exit 1), not an empty matrix. Witnessed against a trimmed copy of that run's own output
+  (`scripts/mutants/testdata/cargo-mutants-27.1/`): 22 witnesses, kills attributed per
+  witness, each outcome read.
+- **Survivors went nowhere.** `mutants_matrix.py verdict` writes the outcome table and every
+  survivor to `$GITHUB_STEP_SUMMARY`, annotates each (`::error` unlisted, `::warning`
+  allowed), and exits **5** on any `missed`, `timeout` or `caught_out_of_scope` mutant that
+  `scripts/mutants/allowed_survivors.txt` does not name with a `#<issue>`. The list is empty.
+- **Test support was in scope.** cargo-mutants 27.1 applies neither `-F` nor `-E` to struct
+  field deletions, so a function regex let in `delete field as_of` in four functions outside
+  the scope and two deletions in `#[cfg(all(test, ..))] mod r2_test_support`. Selection is
+  now by line through `--in-diff`: the scope is written as a diff that adds exactly its lines,
+  minus every test-only item (`#[cfg(test)]`, `#[cfg(all(test, ..))]`, `mod *test_support*`).
+  On the old scope this removes exactly those six.
+- **v54.0.0 had moved the gate out of its scope.** #1015 split
+  `resolve_scoped_stance_by_principals_body` into `per_principal_stances` and
+  `combine_per_principal`; the scope named only the old body, which kept one mutant.
+  `scope-consent-gate` names both and measures I570 beside I548.
+- **Hangs cost the budget.** A nextest `mutants` profile kills a witness after 60 s, so a
+  mutant that hangs one is that witness's FAIL, not a 300 s tool timeout credited to no one.
+
+`scripts/mutants_matrix_test.py` (20 checks, fixtures, no cargo) now runs per-PR in `ci.yml`,
+in certify's fast tier (`mutmatrix`), and before each nightly leg (#1045 item 4). Each new
+failure path is shown red on a crafted input, and each fix was hand-reverted to show its
+witness red. **mutest-rs stays out of the nightly job:** it needs the pinned nightly and a
+from-git build, cannot build with `postgres`, profiles the whole lib suite for 28 minutes per
+run and reaches one of the scope's async witnesses (docs/MUTATION_TESTING.md).
+
 ## [54.0.0] - 2026-10-09
 
 ### Changed — Verify 20.1.0 adopted: the three verify crates and the wheel floor move together (#992)

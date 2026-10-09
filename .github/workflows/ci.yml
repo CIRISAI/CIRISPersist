@@ -1577,6 +1577,12 @@ jobs:
       # stub registry, including the `ls | head -1` mutant.
       - name: bits-changed gate witnesses
         run: scripts/bits_changed_test.sh
+      # v54.1.0 (#1045 item 4, #1051) — the mutation matrix's reader and
+      # verdict, against the first nightly run's own (trimmed) output. Fixtures
+      # only, no cargo: the nightly job's gate must not first be tested by the
+      # nightly job.
+      - name: mutation matrix witnesses
+        run: python3 scripts/mutants_matrix_test.py
       # v43.0.0 (BLOB_ENCRYPTION_AT_REST.md I22) — the storage floor token is
       # unconstructible outside the crate. The witness is a `compile_fail`
       # doctest, and nextest never runs doctests, so it gets its own step.

@@ -7,10 +7,14 @@ arguments, and it turns the tool's raw output into ONE matrix format,
 whichever tool produced it.
 
     mutants_matrix.py tests <scope>                     the scope's nextest filterset
-    mutants_matrix.py resolve cargo-mutants <scope>     cargo-mutants args, one per line
+    mutants_matrix.py resolve cargo-mutants <scope> <diff-out>
+                                                        cargo-mutants args, one per line;
+                                                        writes the scope as a diff to <diff-out>
     mutants_matrix.py resolve mutest <scope>            mutest's --filter-mutations value
     mutants_matrix.py collect cargo-mutants <mutants.out> <scope> <out-dir> [k=v ...]
     mutants_matrix.py collect mutest <json-dir> <scope> <out-dir> [k=v ...]
+    mutants_matrix.py verdict <matrix.json> <allow-list>   the gate (exit 0 / 4 / 5)
+    mutants_matrix.py check-allow <allow-list>             parse it, or exit non-zero
 
 `collect` writes <out-dir>/matrix.json and <out-dir>/matrix.md. Trailing k=v
 pairs (wall_secs, budget_secs, features, tool_version, budget_hit) are copied
@@ -174,45 +178,169 @@ def fn_range(file: str, name: str) -> tuple[int, int]:
     return hits[0]
 
 
+def _item_end(src: str, j: int) -> int:
+    """Offset of the last character of the item that starts at or after `j`:
+    the first `;` at paren/bracket depth 0, or the `}` closing the first `{`
+    at that depth. `src` is already literal-blanked."""
+    depth, n = 0, len(src)
+    while j < n:
+        ch = src[j]
+        if ch in "([":
+            depth += 1
+        elif ch in ")]":
+            depth -= 1
+        elif depth == 0 and ch == ";":
+            return j
+        elif depth == 0 and ch == "{":
+            braces = 0
+            while j < n:
+                if src[j] == "{":
+                    braces += 1
+                elif src[j] == "}":
+                    braces -= 1
+                    if braces == 0:
+                        return j
+                j += 1
+            return n - 1
+        j += 1
+    return n - 1
+
+
+def _top_level_args(pred: str) -> list[str]:
+    out, depth, cur = [], 0, ""
+    for ch in pred:
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        if ch == "," and depth == 0:
+            out.append(cur.strip())
+            cur = ""
+        else:
+            cur += ch
+    if cur.strip():
+        out.append(cur.strip())
+    return out
+
+
+def _test_only(pred: str) -> bool:
+    """A `cfg` predicate that can hold only in a test build: `test`, or
+    `all(..)` with `test` among its terms. `any(test, ..)` and `not(test)`
+    can hold in a production build."""
+    pred = re.sub(r"\s+", "", pred)
+    if pred == "test":
+        return True
+    m = re.fullmatch(r"all\((.*)\)", pred)
+    return bool(m) and any(_test_only(a) for a in _top_level_args(m.group(1)))
+
+
+def test_gated_ranges(file: str) -> list[tuple[int, int]]:
+    """1-based inclusive line ranges of the items in `file` that exist only
+    in a test build: a `#[cfg(test)]` / `#[cfg(all(test, ..))]` item or
+    statement, and any `mod` whose name contains `test_support`. Mutating
+    them measures the tests, not the code under test (CIRISPersist#1051:
+    two of the first nightly run's six survivors were field deletions inside
+    `#[cfg(all(test, ..))] mod r2_test_support`, which cargo-mutants 27.1
+    does not skip; it skips only a bare `#[cfg(test)]`)."""
+    src = _blank_literals((REPO / file).read_text())
+    if re.search(r"#!\[\s*cfg\s*\(\s*test\s*\)\s*\]", src):
+        return [(1, src.count("\n") + 1)]
+    out = []
+    starts = []
+    for m in re.finditer(r"#\[\s*cfg\s*\(", src):
+        depth, j = 1, m.end()
+        while j < len(src) and depth:
+            depth += {"(": 1, ")": -1}.get(src[j], 0)
+            j += 1
+        if _test_only(src[m.end():j - 1]):
+            starts.append((m.start(), src.index("]", j) + 1))
+    for m in re.finditer(r"\bmod\s+\w*test_support\w*\b", src):
+        starts.append((m.start(), m.start()))
+    for a, j in starts:
+        end = _item_end(src, j)
+        out.append((src.count("\n", 0, a) + 1, src.count("\n", 0, end) + 1))
+    merged: list[tuple[int, int]] = []
+    for a, b in sorted(out):
+        if merged and a <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(b, merged[-1][1]))
+        else:
+            merged.append((a, b))
+    return merged
+
+
+def _subtract(a: int, b: int, holes: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    segs = [(a, b)]
+    for ha, hb in holes:
+        nxt = []
+        for x, y in segs:
+            if hb < x or ha > y:
+                nxt.append((x, y))
+                continue
+            if x < ha:
+                nxt.append((x, ha - 1))
+            if hb < y:
+                nxt.append((hb + 1, y))
+        segs = nxt
+    return segs
+
+
 def scope_ranges(scope: dict) -> list[tuple[str, int, int]]:
-    """(file, first line, last line); a whole file is (file, 1, huge)."""
+    """(file, first line, last line), with every test-only item removed
+    (`test_gated_ranges`). A whole file runs to its last line."""
     out = []
     for e in scope["entries"]:
+        file = e["file"]
+        spans = [fn_range(file, fn) for fn in e["fns"]]
         if not e["fns"]:
-            out.append((e["file"], 1, 10**9))
-        for fn in e["fns"]:
-            out.append((e["file"], *fn_range(e["file"], fn)))
+            spans = [(1, (REPO / file).read_text().count("\n") + 1)]
+        holes = test_gated_ranges(file)
+        for a, b in spans:
+            out += [(file, x, y) for x, y in _subtract(a, b, holes)]
     return out
+
+
+def scope_diff(ranges) -> str:
+    """The scope as a unified diff that ADDS exactly its lines, for
+    cargo-mutants' `--in-diff`: one hunk per file, every in-scope line `+`,
+    every other line context. cargo-mutants 27.1 applies neither `-F` nor
+    `-E` to its struct-field deletions (CIRISPersist#1051: an `-F` of
+    `check_capacity_consent_admission` still lists `delete field as_of` in
+    four other functions and two in `r2_test_support`), so a name regex
+    cannot bound the run; a diff does, by line."""
+    out = []
+    for file in sorted({f for f, _, _ in ranges}):
+        lines = (REPO / file).read_text().split("\n")
+        if lines and lines[-1] == "":
+            lines.pop()
+        added = set()
+        for f, a, b in ranges:
+            if f == file:
+                added.update(range(a, b + 1))
+        ctx = sum(1 for k in range(1, len(lines) + 1) if k not in added)
+        out.append(f"diff --git a/{file} b/{file}\n--- a/{file}\n+++ b/{file}")
+        out.append(f"@@ -{1 if ctx else 0},{ctx} +1,{len(lines)} @@")
+        out += [("+" if k in added else " ") + t for k, t in enumerate(lines, 1)]
+    return "\n".join(out) + "\n"
 
 
 def in_scope(ranges, file: str, line: int) -> bool:
     return any(f == file and a <= line <= b for f, a, b in ranges)
 
 
-def resolve(tool: str, scope_path: str) -> None:
+def resolve(tool: str, scope_path: str, diff_out: str | None = None) -> None:
     scope = parse_scope(scope_path)
     ranges = scope_ranges(scope)
     if tool == "cargo-mutants":
-        files = sorted({f for f, _, _ in ranges})
-        for f in files:
+        if diff_out is None:
+            raise SystemExit("resolve cargo-mutants needs a <diff-out> path")
+        Path(diff_out).write_text(scope_diff(ranges))
+        for f in sorted({f for f, _, _ in ranges}):
             print("-f")
             print(f)
-        # Mutant names start `path:line:col:`; a range becomes an alternation
-        # of its line numbers. cargo-mutants 27.1 does not apply -F to its
-        # struct-field deletions, so `collect` re-checks every mutant.
-        alts = []
-        for f, a, b in ranges:
-            if b == 10**9:
-                alts.append(rf"^{re.escape(f)}:")
-            else:
-                alts.append(rf"^{re.escape(f)}:({'|'.join(str(x) for x in range(a, b + 1))}):")
-        print("-F")
-        print("|".join(alts))
+        print("--in-diff")
+        print(diff_out)
     elif tool == "mutest":
-        parts = []
-        for f, a, b in ranges:
-            parts.append(f"file:{f}" if b == 10**9 else f"file:{f}:{a}..{b}")
-        print(",".join(parts))
+        print(",".join(f"file:{f}:{a}..{b}" for f, a, b in ranges))
     else:
         raise SystemExit(f"unknown tool {tool!r}")
 
@@ -227,9 +355,16 @@ NEXTEST_LINE = re.compile(
 )
 
 
+#: An SGR colour escape. The nightly job sets `CARGO_TERM_COLOR=always`, which
+#: nextest honours inside cargo-mutants' logs: `\x1b[32;1m        PASS\x1b[0m
+#: [ ...` matched NEXTEST_LINE nowhere, so the first scheduled run's matrix
+#: listed 0 witnesses and credited no kill to any (CIRISPersist#1051).
+ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
 def _nextest_results(log: str) -> dict[str, str]:
     res = {}
-    for line in log.splitlines():
+    for line in ANSI.sub("", log).splitlines():
         m = NEXTEST_LINE.match(line)
         if m:
             res[m.group(3)] = m.group(1)
@@ -256,6 +391,11 @@ def collect_cargo_mutants(out_dir: Path, scope: dict) -> tuple[list, list, list]
             # matrix from it would read as "nothing to report".
             if o.get("summary") != "Success":
                 raise SystemExit(f"baseline did not pass ({o.get('summary')}); see {log_path}")
+            # A green baseline ran the scope's witnesses. Reading none of
+            # them is the parser failing, not an empty scope: every count
+            # after this would be a zero that cannot be anything else.
+            if not results:
+                raise SystemExit(f"no nextest result line read from the green baseline {log_path}")
             tests |= set(results)
             continue
         mut = (scen or {}).get("Mutant", {})
@@ -417,12 +557,114 @@ def write_matrix(tool, scope_path, scope, tests, mutants, dropped, unreached, ou
     return matrix
 
 
+# ── the verdict ─────────────────────────────────────────────────────────────
+
+#: Outcomes that are a surviving mutant for the gate: no witness in the scope
+#: went red (`missed`), only a test outside it did (`caught_out_of_scope`),
+#: or the run hung until the tool's own timeout (`timeout`: detected, but a
+#: bound is missing and no witness is credited, and each one costs minutes of
+#: the budget).
+SURVIVING = ("missed", "caught_out_of_scope", "timeout")
+
+ALLOW_LINE = re.compile(r"^(?P<file>[^\s:]+\.rs)(?::(?P<line>\d+))?\s+(?P<desc>.+?)\s+#(?P<issue>\d+)\b(?P<why>.*)$")
+SITE = re.compile(r"^(?P<file>[^:]+):(?P<line>\d+):(?P<col>\d+):\s*(?P<desc>.*)$")
+
+
+def parse_allow_list(path: str) -> list[dict]:
+    """`<file>[:<line>] <the tool's mutation text> #<issue> [why]`, one per
+    line, `#` at the start of a line a comment. The mutation text is the
+    tool's own (`replace > with >= in Counters::snapshot`), compared exactly;
+    with a line number the line must match too. A line that does not parse,
+    or names no tracking issue, is a refusal: an allow-list entry nobody can
+    trace is a survivor nobody owns."""
+    out = []
+    for n, raw in enumerate(Path(path).read_text().splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        m = ALLOW_LINE.match(line)
+        if not m:
+            raise SystemExit(f"{path}:{n}: not `<file>[:<line>] <mutation> #<issue>`: {raw!r}")
+        out.append({"file": m["file"], "line": int(m["line"]) if m["line"] else None,
+                    "desc": m["desc"], "issue": int(m["issue"]), "why": m["why"].strip(" —-"),
+                    "at": f"{path}:{n}"})
+    return out
+
+
+def _allowed(mutant: dict, allow: list[dict]) -> dict | None:
+    m = SITE.match(mutant["description"])
+    desc = m["desc"] if m else mutant["description"]
+    for a in allow:
+        if a["file"] == mutant["file"] and a["desc"] == desc and a["line"] in (None, mutant["line"]):
+            return a
+    return None
+
+
+def _escape(text: str) -> str:
+    """A workflow-command message: `%`, CR and LF must be escaped."""
+    return text.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+
+
+def verdict(matrix: dict, allow: list[dict], repo_url: str = "") -> tuple[int, list[str], list[str]]:
+    """(exit code, workflow-command annotations, step-summary markdown).
+
+    0: complete, and every surviving mutant is allow-listed with an issue.
+    4: INCOMPLETE (budget hit, or a mutant the tool never ran): the job must
+       not read green while mutants went untested (CIRISPersist#1051, run 1:
+       rc 124, 8 of 85 untested, job green).
+    5: a surviving mutant that no allow-list entry names. Wins over 4."""
+    s = matrix["summary"]
+    label = matrix["scope"] + (f" (shard {matrix['shard']})" if matrix.get("shard") else "")
+    ann, md = [], [f"## Mutants — `{label}`", ""]
+    md.append(f"`{matrix['tool']}` {matrix.get('tool_version', '')}: {s['mutants']} mutants, "
+              f"wall {matrix.get('wall_secs', '?')} s of a {matrix.get('budget_secs', '?')} s budget, "
+              f"tool exit {matrix.get('tool_rc', '?')}.")
+    md += ["", "| " + " | ".join(k.replace("_", " ") for k in OUTCOMES) + " |",
+           "|---:" * len(OUTCOMES) + "|", "| " + " | ".join(str(s[k]) for k in OUTCOMES) + " |", ""]
+    rc = 0
+    if not matrix["complete"]:
+        rc = 4
+        why = (f"budget hit (tool exit {matrix.get('tool_rc')})" if str(matrix.get("tool_rc")) == "124"
+               else "the tool stopped early")
+        msg = (f"INCOMPLETE: {s['not_run']} of {s['mutants']} mutants never tested; {why}. "
+               "Shard the scope or raise the budget (docs/MUTATION_TESTING.md).")
+        ann.append(f"::error title=mutants {label} INCOMPLETE::{_escape(msg)}")
+        md += [f"**{msg}**", ""]
+    unlisted, listed = [], []
+    for m in matrix["mutants"]:
+        if m["outcome"] not in SURVIVING:
+            continue
+        a = _allowed(m, allow)
+        (listed if a else unlisted).append((m, a))
+    if unlisted:
+        rc = 5
+    if unlisted or listed:
+        md += ["| site | outcome | allowed by |", "|---|---|---|"]
+    for m, a in unlisted + listed:
+        site = m["description"].replace("|", "\\|").replace("`", "'")
+        if a:
+            ref = f"[#{a['issue']}]({repo_url}/issues/{a['issue']})" if repo_url else f"#{a['issue']}"
+            md.append(f"| `{site}` | {m['outcome']} | {ref} |")
+            ann.append(f"::warning file={m['file']},line={m['line']},title=Allowed surviving mutant (#{a['issue']})::"
+                       + _escape(m["description"]))
+        else:
+            md.append(f"| `{site}` | **{m['outcome'].upper()}** | **not allow-listed** |")
+            ann.append(f"::error file={m['file']},line={m['line']},title=Surviving mutant ({m['outcome']}), not allow-listed::"
+                       + _escape(m["description"] + " — kill it with a witness, or list it in "
+                                 "scripts/mutants/allowed_survivors.txt with its tracking issue"))
+    if not unlisted and not listed:
+        md.append("No surviving mutant.")
+    verdict_word = {0: "PASS", 4: "FAIL (incomplete)", 5: "FAIL (unlisted survivors)"}[rc]
+    md += ["", f"Verdict: **{verdict_word}** ({len(unlisted)} unlisted, {len(listed)} allow-listed survivors)."]
+    return rc, ann, md
+
+
 def main(argv: list[str]) -> int:
     if len(argv) >= 3 and argv[1] == "tests":
         print(parse_scope(argv[2])["tests"])
         return 0
-    if len(argv) == 4 and argv[1] == "resolve":
-        resolve(argv[2], argv[3])
+    if len(argv) in (4, 5) and argv[1] == "resolve":
+        resolve(argv[2], argv[3], argv[4] if len(argv) == 5 else None)
         return 0
     if len(argv) >= 6 and argv[1] == "collect":
         tool, raw, scope_path, out = argv[2], Path(argv[3]), argv[4], Path(argv[5])
@@ -443,6 +685,22 @@ def main(argv: list[str]) -> int:
               f"{len(unreached)} never run "
               f"-> {out}/matrix.json")
         return 0
+    if len(argv) == 3 and argv[1] == "check-allow":
+        parse_allow_list(argv[2])
+        return 0
+    if len(argv) == 4 and argv[1] == "verdict":
+        import os
+        matrix = json.loads(Path(argv[2]).read_text())
+        url = f"{os.environ.get('GITHUB_SERVER_URL', '')}/{os.environ['GITHUB_REPOSITORY']}" \
+            if os.environ.get("GITHUB_REPOSITORY") else ""
+        rc, ann, md = verdict(matrix, parse_allow_list(argv[3]), url)
+        for a in ann:
+            print(a)
+        print("\n".join(md))
+        if os.environ.get("GITHUB_STEP_SUMMARY"):
+            with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+                f.write("\n".join(md) + "\n\n")
+        return rc
     print(__doc__, file=sys.stderr)
     return 2
 

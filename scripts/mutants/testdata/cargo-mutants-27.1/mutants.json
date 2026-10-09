@@ -1,0 +1,258 @@
+[
+ {
+  "diff": "--- src/observe/mod.rs\n+++ replace Fold::bit -> u32 with 0\n@@ -169,17 +169,17 @@\n         AttestationAdmission => \"attestation_admission\",\n     }\n }\n \n const _: () = assert!(Fold::COUNT <= 32, \"the active-fold mask is a u32\");\n \n impl Fold {\n     const fn bit(self) -> u32 {\n-        1 << (self as u32)\n+        0 /* ~ changed by cargo-mutants ~ */\n     }\n }\n \n /// A row a door returns: the attestation it carries.\n pub trait ReadRow {\n     /// The attestation row.\n     fn attestation(&self) -> &crate::federation::Attestation;\n }\n",
+  "file": "src/observe/mod.rs",
+  "function": {
+   "function_name": "Fold::bit",
+   "return_type": "-> u32",
+   "span": {
+    "end": {
+     "column": 6,
+     "line": 178
+    },
+    "start": {
+     "column": 5,
+     "line": 176
+    }
+   }
+  },
+  "genre": "FnValue",
+  "name": "src/observe/mod.rs:177:9: replace Fold::bit -> u32 with 0",
+  "package": "ciris-persist",
+  "replacement": "0",
+  "span": {
+   "end": {
+    "column": 27,
+    "line": 177
+   },
+   "start": {
+    "column": 9,
+    "line": 177
+   }
+  }
+ },
+ {
+  "diff": "--- src/observe/mod.rs\n+++ replace Fold::bit -> u32 with 1\n@@ -169,17 +169,17 @@\n         AttestationAdmission => \"attestation_admission\",\n     }\n }\n \n const _: () = assert!(Fold::COUNT <= 32, \"the active-fold mask is a u32\");\n \n impl Fold {\n     const fn bit(self) -> u32 {\n-        1 << (self as u32)\n+        1 /* ~ changed by cargo-mutants ~ */\n     }\n }\n \n /// A row a door returns: the attestation it carries.\n pub trait ReadRow {\n     /// The attestation row.\n     fn attestation(&self) -> &crate::federation::Attestation;\n }\n",
+  "file": "src/observe/mod.rs",
+  "function": {
+   "function_name": "Fold::bit",
+   "return_type": "-> u32",
+   "span": {
+    "end": {
+     "column": 6,
+     "line": 178
+    },
+    "start": {
+     "column": 5,
+     "line": 176
+    }
+   }
+  },
+  "genre": "FnValue",
+  "name": "src/observe/mod.rs:177:9: replace Fold::bit -> u32 with 1",
+  "package": "ciris-persist",
+  "replacement": "1",
+  "span": {
+   "end": {
+    "column": 27,
+    "line": 177
+   },
+   "start": {
+    "column": 9,
+    "line": 177
+   }
+  }
+ },
+ {
+  "diff": "--- src/observe/mod.rs\n+++ replace <impl ReadRow for crate::federation::Attestation>::attestation -> &crate::federation::Attestation with Box::leak(Box::new(Default::default()))\n@@ -181,17 +181,17 @@\n /// A row a door returns: the attestation it carries.\n pub trait ReadRow {\n     /// The attestation row.\n     fn attestation(&self) -> &crate::federation::Attestation;\n }\n \n impl ReadRow for crate::federation::Attestation {\n     fn attestation(&self) -> &crate::federation::Attestation {\n-        self\n+        Box::leak(Box::new(Default::default())) /* ~ changed by cargo-mutants ~ */\n     }\n }\n \n impl ReadRow for crate::federation::types::ServedAttestation {\n     fn attestation(&self) -> &crate::federation::Attestation {\n         &self.attestation\n     }\n }\n",
+  "file": "src/observe/mod.rs",
+  "function": {
+   "function_name": "<impl ReadRow for crate::federation::Attestation>::attestation",
+   "return_type": "-> &crate::federation::Attestation",
+   "span": {
+    "end": {
+     "column": 6,
+     "line": 190
+    },
+    "start": {
+     "column": 5,
+     "line": 188
+    }
+   }
+  },
+  "genre": "FnValue",
+  "name": "src/observe/mod.rs:189:9: replace <impl ReadRow for crate::federation::Attestation>::attestation -> &crate::federation::Attestation with Box::leak(Box::new(Default::default()))",
+  "package": "ciris-persist",
+  "replacement": "Box::leak(Box::new(Default::default()))",
+  "span": {
+   "end": {
+    "column": 13,
+    "line": 189
+   },
+   "start": {
+    "column": 9,
+    "line": 189
+   }
+  }
+ },
+ {
+  "diff": "--- src/observe/mod.rs\n+++ replace > with == in Counters::snapshot\n@@ -241,17 +241,17 @@\n         }\n     }\n \n     fn snapshot(&self) -> TelemetrySnapshot {\n         let mut reads = Vec::new();\n         for backend in StoreBackend::ALL {\n             for door in Door::ALL {\n                 let (n, rows, bytes) = self.doors[*backend as usize][*door as usize].load();\n-                if n > 0 {\n+                if n == /* ~ changed by cargo-mutants ~ */ 0 {\n                     reads.push(DoorReads {\n                         backend: backend.label(),\n                         door: door.label(),\n                         reads: n,\n                         rows,\n                         bytes,\n                     });\n                 }\n",
+  "file": "src/observe/mod.rs",
+  "function": {
+   "function_name": "Counters::snapshot",
+   "return_type": "-> TelemetrySnapshot",
+   "span": {
+    "end": {
+     "column": 6,
+     "line": 274
+    },
+    "start": {
+     "column": 5,
+     "line": 244
+    }
+   }
+  },
+  "genre": "BinaryOperator",
+  "name": "src/observe/mod.rs:249:22: replace > with == in Counters::snapshot",
+  "package": "ciris-persist",
+  "replacement": "==",
+  "span": {
+   "end": {
+    "column": 23,
+    "line": 249
+   },
+   "start": {
+    "column": 22,
+    "line": 249
+   }
+  }
+ },
+ {
+  "diff": "--- src/observe/mod.rs\n+++ replace > with < in Counters::snapshot\n@@ -241,17 +241,17 @@\n         }\n     }\n \n     fn snapshot(&self) -> TelemetrySnapshot {\n         let mut reads = Vec::new();\n         for backend in StoreBackend::ALL {\n             for door in Door::ALL {\n                 let (n, rows, bytes) = self.doors[*backend as usize][*door as usize].load();\n-                if n > 0 {\n+                if n < /* ~ changed by cargo-mutants ~ */ 0 {\n                     reads.push(DoorReads {\n                         backend: backend.label(),\n                         door: door.label(),\n                         reads: n,\n                         rows,\n                         bytes,\n                     });\n                 }\n",
+  "file": "src/observe/mod.rs",
+  "function": {
+   "function_name": "Counters::snapshot",
+   "return_type": "-> TelemetrySnapshot",
+   "span": {
+    "end": {
+     "column": 6,
+     "line": 274
+    },
+    "start": {
+     "column": 5,
+     "line": 244
+    }
+   }
+  },
+  "genre": "BinaryOperator",
+  "name": "src/observe/mod.rs:249:22: replace > with < in Counters::snapshot",
+  "package": "ciris-persist",
+  "replacement": "<",
+  "span": {
+   "end": {
+    "column": 23,
+    "line": 249
+   },
+   "start": {
+    "column": 22,
+    "line": 249
+   }
+  }
+ },
+ {
+  "diff": "--- src/observe/mod.rs\n+++ replace > with >= in Counters::snapshot\n@@ -241,17 +241,17 @@\n         }\n     }\n \n     fn snapshot(&self) -> TelemetrySnapshot {\n         let mut reads = Vec::new();\n         for backend in StoreBackend::ALL {\n             for door in Door::ALL {\n                 let (n, rows, bytes) = self.doors[*backend as usize][*door as usize].load();\n-                if n > 0 {\n+                if n >= /* ~ changed by cargo-mutants ~ */ 0 {\n                     reads.push(DoorReads {\n                         backend: backend.label(),\n                         door: door.label(),\n                         reads: n,\n                         rows,\n                         bytes,\n                     });\n                 }\n",
+  "file": "src/observe/mod.rs",
+  "function": {
+   "function_name": "Counters::snapshot",
+   "return_type": "-> TelemetrySnapshot",
+   "span": {
+    "end": {
+     "column": 6,
+     "line": 274
+    },
+    "start": {
+     "column": 5,
+     "line": 244
+    }
+   }
+  },
+  "genre": "BinaryOperator",
+  "name": "src/observe/mod.rs:249:22: replace > with >= in Counters::snapshot",
+  "package": "ciris-persist",
+  "replacement": ">=",
+  "span": {
+   "end": {
+    "column": 23,
+    "line": 249
+   },
+   "start": {
+    "column": 22,
+    "line": 249
+   }
+  }
+ },
+ {
+  "diff": "--- src/observe/mod.rs\n+++ replace &= with |= in record_read\n@@ -310,17 +310,17 @@\n ) {\n     let n = rows.len() as u64;\n     let c = counters();\n     c.doors[backend as usize][door as usize].add(n, bytes);\n     if let Ok(mut mask) = ACTIVE_FOLDS.try_with(|m| *m) {\n         while mask != 0 {\n             let i = mask.trailing_zeros() as usize;\n             c.fold_reads[i].add(n, bytes);\n-            mask &= mask - 1;\n+            mask |= /* ~ changed by cargo-mutants ~ */ mask - 1;\n         }\n     }\n     #[cfg(test)]\n     crate::federation::read_probe::record(door.label(), key, rows);\n     #[cfg(not(test))]\n     let _ = key;\n }\n \n",
+  "file": "src/observe/mod.rs",
+  "function": {
+   "function_name": "record_read",
+   "return_type": "",
+   "span": {
+    "end": {
+     "column": 2,
+     "line": 325
+    },
+    "start": {
+     "column": 1,
+     "line": 301
+    }
+   }
+  },
+  "genre": "BinaryOperator",
+  "name": "src/observe/mod.rs:318:18: replace &= with |= in record_read",
+  "package": "ciris-persist",
+  "replacement": "|=",
+  "span": {
+   "end": {
+    "column": 20,
+    "line": 318
+   },
+   "start": {
+    "column": 18,
+    "line": 318
+   }
+  }
+ },
+ {
+  "diff": "--- src/observe/catalog.rs\n+++ replace CatalogEntry::metrics_unit -> Option<metrics::Unit> with None\n@@ -45,23 +45,17 @@\n \n impl CatalogEntry {\n     /// The [`metrics::Unit`] [`super::emit_metrics`] describes this entry with:\n     /// `By` is [`metrics::Unit::Bytes`], and a UCUM annotation (`{row}`,\n     /// `{read}`, `{call}`) is a dimensionless count, [`metrics::Unit::Count`].\n     /// `None` for a unit this map does not know; I553 fails on any catalogued\n     /// entry that maps to `None`, so a new unit is mapped before it ships.\n     pub(crate) fn metrics_unit(&self) -> Option<metrics::Unit> {\n-        match self.unit {\n-            \"By\" => Some(metrics::Unit::Bytes),\n-            u if u.len() > 2 && u.starts_with('{') && u.ends_with('}') => {\n-                Some(metrics::Unit::Count)\n-            }\n-            _ => None,\n-        }\n+        None /* ~ changed by cargo-mutants ~ */\n     }\n }\n \n /// The `backend` label key.\n pub const LABEL_BACKEND: &str = \"backend\";\n /// The `door` label key.\n pub const LABEL_DOOR: &str = \"door\";\n /// The `fold` label key.\n",
+  "file": "src/observe/catalog.rs",
+  "function": {
+   "function_name": "CatalogEntry::metrics_unit",
+   "return_type": "-> Option<metrics::Unit>",
+   "span": {
+    "end": {
+     "column": 6,
+     "line": 60
+    },
+    "start": {
+     "column": 5,
+     "line": 47
+    }
+   }
+  },
+  "genre": "FnValue",
+  "name": "src/observe/catalog.rs:53:9: replace CatalogEntry::metrics_unit -> Option<metrics::Unit> with None",
+  "package": "ciris-persist",
+  "replacement": "None",
+  "span": {
+   "end": {
+    "column": 10,
+    "line": 59
+   },
+   "start": {
+    "column": 9,
+    "line": 53
+   }
+  }
+ }
+]
