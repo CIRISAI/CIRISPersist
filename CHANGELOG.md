@@ -52,6 +52,18 @@ witness red. **mutest-rs stays out of the nightly job:** it needs the pinned nig
 from-git build, cannot build with `postgres`, profiles the whole lib suite for 28 minutes per
 run and reaches one of the scope's async witnesses (docs/MUTATION_TESTING.md).
 
+### Added — witnesses for the counters' three survivors and the mask loop (#1037, #1051)
+
+- **I690**: the snapshot lists a `(backend, door)` only once it served a read; a fresh set
+  lists none. Kills `Counters::snapshot`'s `n > 0` → `n >= 0`.
+- **I691**: `fold(X, fold(X, read))` keeps X active and credits every read once. Kills
+  `fold`'s `|` → `^`.
+- **I692**: a read inside two folds returns within 5 s. Kills `record_read`'s three mask-loop
+  mutants (`&=` → `|=`, `-` → `+`, `-` → `/`) in seconds, where they used to hang every
+  witness to the tool's 300 s timeout.
+- `emit_metrics` → `()` survived because I553, which kills it, was outside the scope's test
+  filter. The filter now includes I552/I553.
+
 ## [54.0.0] - 2026-10-09
 
 ### Changed — Verify 20.1.0 adopted: the three verify crates and the wheel floor move together (#992)
