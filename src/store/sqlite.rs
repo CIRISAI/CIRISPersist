@@ -8780,16 +8780,6 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         authority_signature: Option<serde_json::Value>,
     ) -> Result<(), crate::federation::Error> {
         use crate::federation::Error;
-        // M4 fail-closed: the nonce must already be issued for this family.
-        if !self
-            .accord_nonce_issued(&proposal.family_key_id, &proposal.nonce)
-            .await?
-        {
-            return Err(Error::InvalidArgument(format!(
-                "accord proposal nonce {:?} not issued for family {:?} (M4 fail-closed)",
-                proposal.nonce, proposal.family_key_id
-            )));
-        }
         // v31.1.0 (CIRISPersist#662, PR #667 round-5) — `created_at` is half the
         // evidence cursor (`max(created_at, max(server_arrival_at))`), so it is
         // an allocated position, not a wall-clock read.
@@ -8833,36 +8823,55 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             ),
             None => None,
         };
-        self.write(move |conn| -> Result<(), rusqlite::Error> {
-            // ON CONFLICT DO NOTHING — the digest is content-derived, so a
-            // re-PUT of the same proposal is idempotent and a different
-            // proposal cannot collide.
-            conn.execute(
-                "INSERT INTO accord_proposal (\
+        let reused = self
+            .write(move |conn| -> Result<Option<String>, rusqlite::Error> {
+                // v54.1.0 (#1047) — single use, in the insert's own write: a
+                // proposer-minted nonce names one proposal per family.
+                let other: Option<String> = conn
+                    .query_row(
+                        "SELECT proposal_digest FROM accord_proposal \
+                     WHERE family_key_id = ?1 AND nonce = ?2 AND proposal_digest <> ?3 LIMIT 1",
+                        rusqlite::params![prep.family_key_id, prep.nonce, prep.proposal_digest],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                if other.is_some() {
+                    return Ok(other);
+                }
+                // ON CONFLICT DO NOTHING — the digest is content-derived, so a
+                // re-PUT of the same proposal is idempotent and a different
+                // proposal cannot collide.
+                conn.execute(
+                    "INSERT INTO accord_proposal (\
                     proposal_digest, family_key_id, action, nonce, window_until, \
                     prior_family_digest, payload_sha256, proposal_json, \
                     authority_signature, persist_row_hash, created_at\
                  ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11) \
                  ON CONFLICT(proposal_digest) DO NOTHING",
-                rusqlite::params![
-                    prep.proposal_digest,
-                    prep.family_key_id,
-                    prep.action,
-                    prep.nonce,
-                    prep.window_until.to_rfc3339(),
-                    prep.prior_family_digest,
-                    prep.payload_sha256,
-                    proposal_json,
-                    auth_sig,
-                    prep.persist_row_hash,
-                    prep.created_at.to_rfc3339(),
-                ],
-            )?;
-            Ok(())
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("insert accord_proposal: {e}")))?;
-        Ok(())
+                    rusqlite::params![
+                        prep.proposal_digest,
+                        prep.family_key_id,
+                        prep.action,
+                        prep.nonce,
+                        prep.window_until.to_rfc3339(),
+                        prep.prior_family_digest,
+                        prep.payload_sha256,
+                        proposal_json,
+                        auth_sig,
+                        prep.persist_row_hash,
+                        prep.created_at.to_rfc3339(),
+                    ],
+                )?;
+                Ok(None)
+            })
+            .await
+            .map_err(|e| Error::Backend(format!("insert accord_proposal: {e}")))?;
+        match reused {
+            Some(other) => Err(crate::federation::accord_quorum::nonce_reused(
+                &proposal, &other,
+            )),
+            None => Ok(()),
+        }
     }
 
     async fn get_accord_proposal(
@@ -9218,48 +9227,6 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         .await
         .map_err(|e| crate::federation::Error::Backend(format!("clear_active_halt: {e}")))?;
         Ok(())
-    }
-
-    async fn issue_accord_nonce(
-        &self,
-        family_key_id: &str,
-        nonce: &str,
-    ) -> Result<(), crate::federation::Error> {
-        let fam = family_key_id.to_owned();
-        let n = nonce.to_owned();
-        let now = chrono::Utc::now().to_rfc3339();
-        self.write(move |conn| -> Result<(), rusqlite::Error> {
-            conn.execute(
-                "INSERT INTO accord_issued_nonce (family_key_id, nonce, issued_at) \
-                 VALUES (?1, ?2, ?3) ON CONFLICT(family_key_id, nonce) DO NOTHING",
-                rusqlite::params![fam, n, now],
-            )?;
-            Ok(())
-        })
-        .await
-        .map_err(|e| crate::federation::Error::Backend(format!("issue_accord_nonce: {e}")))?;
-        Ok(())
-    }
-
-    async fn accord_nonce_issued(
-        &self,
-        family_key_id: &str,
-        nonce: &str,
-    ) -> Result<bool, crate::federation::Error> {
-        let fam = family_key_id.to_owned();
-        let n = nonce.to_owned();
-        self.read(move |conn| -> Result<bool, rusqlite::Error> {
-            let found: Option<i64> = conn
-                .query_row(
-                    "SELECT 1 FROM accord_issued_nonce WHERE family_key_id = ?1 AND nonce = ?2",
-                    rusqlite::params![fam, n],
-                    |r| r.get(0),
-                )
-                .optional()?;
-            Ok(found.is_some())
-        })
-        .await
-        .map_err(|e| crate::federation::Error::Backend(format!("accord_nonce_issued: {e}")))
     }
 
     // ─── v4.8.0 (CIRISPersist#161, CEG §11.7.1) — membership revocations.

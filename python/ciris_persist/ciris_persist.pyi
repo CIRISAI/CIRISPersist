@@ -559,9 +559,6 @@ class Engine:
     def abandon_stream_json(self, stream_id: str) -> str:
         """(derived) deontic — v52.0.0 (CIRISPersist#954) — abandon an unsealed stream this node owns (a streaming publish refused midway): the stream is tombstoned (stream_aband..."""
 
-    def accord_nonce_issued(self, family_key_id: str, nonce: str) -> bool:
-        """(derived) deontic — #302 (M4) — has (family_key_id, nonce) been issued?"""
-
     def add_community_member(self, community_key_id: str, member_json: str, admit_spec_json: str) -> bool:
         """(derived) deontic — #249 Cut B — incrementally add one member to a community roster (mirror of add_family_member). member_json is a [crate::federation::types::Communit..."""
 
@@ -908,9 +905,6 @@ class Engine:
         cannot be walked answers ``false``.
         """
 
-    def issue_accord_nonce(self, family_key_id: str, nonce: str) -> None:
-        """(derived) deontic — #302 (M4) — record a server-issued proposal nonce."""
-
     def ledger_advance_head(self, ledger_id: str, seq: int, head_hash: str, witness_anchor_ref: str | None = None, source_envelope_ref: str | None = None) -> str:
         """(derived) deontic — CC 3.3.10.1 L4 — move the stored head forward. Returns the outcome ("advanced" / "unchanged" / "stale"); a DIFFERENT hash at the stored seq raises... [build-conditional: #[cfg(feature = "ledgers")]]"""
 
@@ -976,7 +970,7 @@ class Engine:
         """(derived) deontic — #302 — admit an accord_participation. payload_json = { "participation": <AccordParticipation>, "standing_roster": [<ThresholdMember>...] }. Verify-..."""
 
     def put_accord_proposal_json(self, payload_json: str) -> None:
-        """(derived) deontic — #302 — admit an accord_proposal. payload_json = { "proposal": <AccordProposal>, "authority_signature": <obj|null> }. M4 fail-closed on an unissued..."""
+        """(derived) deontic — #302 — admit an accord_proposal. payload_json = { "proposal": <AccordProposal>, "authority_signature": <obj|null> }. v54.1.0 (CIRISPersist#1047) —..."""
 
     def put_attestation(self, signed_attestation_json: str) -> None:
         """Admit a ``SignedAttestation`` into ``federation_attestations``.

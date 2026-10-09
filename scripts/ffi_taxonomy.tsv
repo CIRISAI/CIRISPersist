@@ -142,7 +142,6 @@
 # DERIVED (see `pyi_surface.py report`), never pinned. 158 methods are
 # build-conditional and a `.pyi` structurally cannot express that.
 Engine	__init__	structural	
-Engine	accord_nonce_issued	deontic	
 Engine	active_community_members_json	empirical	
 Engine	active_family_members_json	empirical	
 Engine	add_community_member	deontic	
@@ -378,7 +377,6 @@ Engine	is_closed	structural
 Engine	is_load_bearing_json	deontic	
 Engine	is_named_moderator_json	deontic	
 Engine	is_steward_bound_json	deontic	
-Engine	issue_accord_nonce	deontic	
 Engine	keyring_path	ontological	
 Engine	keyring_signer_capsule	structural	
 Engine	keyring_storage_kind	ontological	

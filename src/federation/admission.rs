@@ -22897,9 +22897,6 @@ mod canonical_withdrawal_tests {
             prior_family_digest: "prior-family-digest".to_owned(),
             payload_sha256,
         };
-        dir.issue_accord_nonce(HUMANITY_ACCORD_FAMILY_KEY_ID, nonce)
-            .await
-            .expect("issue nonce");
         dir.put_accord_proposal(proposal.clone(), None)
             .await
             .expect("put proposal");

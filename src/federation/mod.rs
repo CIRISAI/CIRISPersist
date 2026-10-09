@@ -5855,7 +5855,7 @@ pub trait FederationDirectory: Send + Sync {
     /// # Why this is on the trait and not only a free function
     ///
     /// The free function composes five directory calls
-    /// (`issue_accord_nonce`, `put_accord_proposal`, `put_accord_participation`,
+    /// (`put_accord_proposal`, `put_accord_participation`,
     /// `list_accord_participations`, plus the projection's reads), which is
     /// fine against a real backend and useless across the FFI directory
     /// capsule, where those primitives are `Unsupported`. A capsule-backed
@@ -9325,11 +9325,18 @@ pub trait FederationDirectory: Send + Sync {
     // state; the SERVER runs the tally. Recovery (H7) is absent (CIRISAccord#4
     // gate). See [`crate::federation::accord_quorum`].
 
-    /// #302 — admit an `accord_proposal` (server-issued). M4 fail-closed: the
-    /// proposal's `nonce` MUST already be issued for its family
-    /// ([`Self::issue_accord_nonce`]) or the write is rejected. The digest is
+    /// #302 — admit an `accord_proposal`. The digest is
     /// derived via verify-core ([`AccordProposal::digest`](ciris_verify_core::accord_live_quorum::AccordProposal::digest));
     /// the object is stored verbatim. Idempotent on a byte-identical re-PUT.
+    ///
+    /// v54.1.0 (CIRISPersist#1047, CIRISConstitution#146, verify 20) — the
+    /// `nonce` is minted by the PROPOSER, never issued by a server ("a server
+    /// is part of what a halt may need to stop, and no accord act depends on
+    /// one", CC 4.2.6). Verify checks its form; single use is this store's
+    /// dedup: a nonce names ONE proposal per family, so a different proposal
+    /// carrying a nonce already used in its family is [`Error::Conflict`]
+    /// and is not stored. The pre-v54.1 issued-nonce gate (M4) and its
+    /// `issue_accord_nonce` / `accord_nonce_issued` pair are gone.
     async fn put_accord_proposal(
         &self,
         proposal: ciris_verify_core::accord_live_quorum::AccordProposal,
@@ -9450,13 +9457,6 @@ pub trait FederationDirectory: Send + Sync {
         family_key_id: &str,
         active_halt_id: &str,
     ) -> Result<(), Error>;
-
-    /// #302 (M4) — record a server-issued proposal nonce (idempotent).
-    async fn issue_accord_nonce(&self, family_key_id: &str, nonce: &str) -> Result<(), Error>;
-
-    /// #302 (M4) — has this `(family_key_id, nonce)` been issued? The
-    /// fail-closed gate `put_accord_proposal` consults.
-    async fn accord_nonce_issued(&self, family_key_id: &str, nonce: &str) -> Result<bool, Error>;
 }
 
 /// Federation directory errors. Distinct from

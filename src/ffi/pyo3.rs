@@ -11887,7 +11887,9 @@ impl PyEngine {
 
     /// #302 — admit an `accord_proposal`. `payload_json` =
     /// `{ "proposal": <AccordProposal>, "authority_signature": <obj|null> }`.
-    /// M4 fail-closed on an unissued nonce.
+    /// v54.1.0 (CIRISPersist#1047) — the nonce is the proposer's; a different
+    /// proposal reusing a nonce already used in its family is refused
+    /// (`federation_conflict`, ValueError).
     fn put_accord_proposal_json(&self, py: Python<'_>, payload_json: &str) -> PyResult<()> {
         self.ensure_usable()?;
         catch_panic(|| {
@@ -12155,51 +12157,6 @@ impl PyEngine {
                     runtime,
                     b,
                     b.clear_active_halt(&fam, &halt)
-                        .await
-                        .map_err(federation_err_to_py)
-                )
-            })
-        })
-    }
-
-    /// #302 (M4) — record a server-issued proposal nonce.
-    fn issue_accord_nonce(&self, py: Python<'_>, family_key_id: &str, nonce: &str) -> PyResult<()> {
-        self.ensure_usable()?;
-        catch_panic(|| {
-            let runtime = self.runtime.clone();
-            let fam = family_key_id.to_owned();
-            let n = nonce.to_owned();
-            py.detach(move || {
-                accord_dispatch!(
-                    self,
-                    runtime,
-                    b,
-                    b.issue_accord_nonce(&fam, &n)
-                        .await
-                        .map_err(federation_err_to_py)
-                )
-            })
-        })
-    }
-
-    /// #302 (M4) — has `(family_key_id, nonce)` been issued?
-    fn accord_nonce_issued(
-        &self,
-        py: Python<'_>,
-        family_key_id: &str,
-        nonce: &str,
-    ) -> PyResult<bool> {
-        self.ensure_usable()?;
-        catch_panic(|| {
-            let runtime = self.runtime.clone();
-            let fam = family_key_id.to_owned();
-            let n = nonce.to_owned();
-            py.detach(move || {
-                accord_dispatch!(
-                    self,
-                    runtime,
-                    b,
-                    b.accord_nonce_issued(&fam, &n)
                         .await
                         .map_err(federation_err_to_py)
                 )

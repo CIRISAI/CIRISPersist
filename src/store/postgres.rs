@@ -10194,15 +10194,6 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         authority_signature: Option<serde_json::Value>,
     ) -> Result<(), crate::federation::Error> {
         use crate::federation::Error;
-        if !self
-            .accord_nonce_issued(&proposal.family_key_id, &proposal.nonce)
-            .await?
-        {
-            return Err(Error::InvalidArgument(format!(
-                "accord proposal nonce {:?} not issued for family {:?} (M4 fail-closed)",
-                proposal.nonce, proposal.family_key_id
-            )));
-        }
         // v31.1.0 (CIRISPersist#662, PR #667 round-4) — `created_at` is half the
         // evidence cursor, so it is an allocated position rather than a
         // wall-clock read; see `monotonic_admission_instant`.
@@ -10223,34 +10214,66 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             authority_signature,
             created_at,
         )?;
-        let client = self
+        let mut client = self
             .get_client()
             .await
             .map_err(|e| Error::Backend(e.to_string()))?;
-        client
-            .execute(
-                "INSERT INTO cirislens.accord_proposal (\
+        // v54.1.0 (#1047) — single use: a proposer-minted nonce names one
+        // proposal per family. The check and the insert are one transaction
+        // under an advisory lock, so two processes sharing the database
+        // cannot both admit a different proposal under one nonce.
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| Error::Backend(format!("accord_proposal transaction: {e}")))?;
+        tx.execute(
+            "SELECT pg_advisory_xact_lock($1)",
+            &[&crate::federation::accord_quorum::ACCORD_PROPOSAL_NONCE_LOCK_KEY],
+        )
+        .await
+        .map_err(|e| Error::Backend(format!("accord_proposal nonce lock: {e}")))?;
+        let other = tx
+            .query_opt(
+                "SELECT proposal_digest FROM cirislens.accord_proposal \
+                 WHERE family_key_id = $1 AND nonce = $2 AND proposal_digest <> $3 LIMIT 1",
+                &[&prep.family_key_id, &prep.nonce, &prep.proposal_digest],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("accord_proposal nonce read: {e}")))?;
+        if let Some(row) = other {
+            let other: String = row
+                .try_get(0)
+                .map_err(|e| Error::Backend(format!("accord_proposal nonce read: {e}")))?;
+            return Err(crate::federation::accord_quorum::nonce_reused(
+                &proposal, &other,
+            ));
+        }
+        tx.execute(
+            "INSERT INTO cirislens.accord_proposal (\
                     proposal_digest, family_key_id, action, nonce, window_until, \
                     prior_family_digest, payload_sha256, proposal_json, \
                     authority_signature, persist_row_hash, created_at\
                  ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) \
                  ON CONFLICT (proposal_digest) DO NOTHING",
-                &[
-                    &prep.proposal_digest,
-                    &prep.family_key_id,
-                    &prep.action,
-                    &prep.nonce,
-                    &prep.window_until,
-                    &prep.prior_family_digest,
-                    &prep.payload_sha256,
-                    &prep.proposal_json,
-                    &prep.authority_signature,
-                    &prep.persist_row_hash,
-                    &prep.created_at,
-                ],
-            )
+            &[
+                &prep.proposal_digest,
+                &prep.family_key_id,
+                &prep.action,
+                &prep.nonce,
+                &prep.window_until,
+                &prep.prior_family_digest,
+                &prep.payload_sha256,
+                &prep.proposal_json,
+                &prep.authority_signature,
+                &prep.persist_row_hash,
+                &prep.created_at,
+            ],
+        )
+        .await
+        .map_err(|e| Error::Backend(format!("insert accord_proposal: {e}")))?;
+        tx.commit()
             .await
-            .map_err(|e| Error::Backend(format!("insert accord_proposal: {e}")))?;
+            .map_err(|e| Error::Backend(format!("accord_proposal commit: {e}")))?;
         Ok(())
     }
 
@@ -10618,46 +10641,6 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .await
             .map_err(|e| crate::federation::Error::Backend(format!("clear_active_halt: {e}")))?;
         Ok(())
-    }
-
-    async fn issue_accord_nonce(
-        &self,
-        family_key_id: &str,
-        nonce: &str,
-    ) -> Result<(), crate::federation::Error> {
-        let client = self
-            .get_client()
-            .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
-        client
-            .execute(
-                "INSERT INTO cirislens.accord_issued_nonce (family_key_id, nonce, issued_at) \
-                 VALUES ($1, $2, $3) ON CONFLICT (family_key_id, nonce) DO NOTHING",
-                &[&family_key_id, &nonce, &chrono::Utc::now()],
-            )
-            .await
-            .map_err(|e| crate::federation::Error::Backend(format!("issue_accord_nonce: {e}")))?;
-        Ok(())
-    }
-
-    async fn accord_nonce_issued(
-        &self,
-        family_key_id: &str,
-        nonce: &str,
-    ) -> Result<bool, crate::federation::Error> {
-        let client = self
-            .get_client()
-            .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
-        let row_opt = client
-            .query_opt(
-                "SELECT 1 FROM cirislens.accord_issued_nonce \
-                 WHERE family_key_id = $1 AND nonce = $2",
-                &[&family_key_id, &nonce],
-            )
-            .await
-            .map_err(|e| crate::federation::Error::Backend(format!("accord_nonce_issued: {e}")))?;
-        Ok(row_opt.is_some())
     }
 
     // ─── v4.8.0 (CIRISPersist#161, CEG §11.7.1) — membership revocations.

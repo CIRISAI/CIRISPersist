@@ -423,13 +423,11 @@ struct State {
     /// pg/sqlite V091 tables. Proposals keyed by `proposal_digest`;
     /// participations a flat vec (deduped by `(proposal_digest,
     /// pinned_pubkey)` at write time, M6); decisions keyed by
-    /// `proposal_digest` (immutable, M2); active halts keyed by family (H2);
-    /// issued nonces a `(family_key_id, nonce)` set (M4).
+    /// `proposal_digest` (immutable, M2); active halts keyed by family (H2).
     accord_proposals: HashMap<String, crate::federation::accord_quorum::StoredProposal>,
     accord_participations: Vec<crate::federation::accord_quorum::StoredParticipation>,
     accord_decisions: HashMap<String, crate::federation::accord_quorum::StoredDecision>,
     accord_active_halts: HashMap<String, crate::federation::accord_quorum::ActiveHalt>,
-    accord_issued_nonces: std::collections::HashSet<(String, String)>,
     /// #377 — canonical-role WITHDRAW/SUPERSEDE tombstones (V095), keyed by the
     /// withdrawn `key_id`. The in-memory mirror of `canonical_role_withdrawal`.
     canonical_withdrawals: HashMap<String, crate::federation::CanonicalWithdrawal>,
@@ -991,7 +989,6 @@ impl Default for MemoryBackend {
                 accord_participations: Vec::new(),
                 accord_decisions: HashMap::new(),
                 accord_active_halts: HashMap::new(),
-                accord_issued_nonces: std::collections::HashSet::new(),
                 canonical_withdrawals: HashMap::new(),
                 role_withdrawals: HashMap::new(),
                 consent_peer_set: Vec::new(),
@@ -7178,17 +7175,6 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         proposal: ciris_verify_core::accord_live_quorum::AccordProposal,
         authority_signature: Option<serde_json::Value>,
     ) -> Result<(), crate::federation::Error> {
-        use crate::federation::Error;
-        // M4 fail-closed (self.accord_nonce_issued locks state — run before).
-        if !self
-            .accord_nonce_issued(&proposal.family_key_id, &proposal.nonce)
-            .await?
-        {
-            return Err(Error::InvalidArgument(format!(
-                "accord proposal nonce {:?} not issued for family {:?} (M4 fail-closed)",
-                proposal.nonce, proposal.family_key_id
-            )));
-        }
         // v31.1.0 (CIRISPersist#662, PR #667 round-4) — `created_at` is half the
         // evidence cursor, so it is an allocated position, not a wall-clock read.
         let created_at = {
@@ -7215,6 +7201,19 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             created_at,
         };
         let mut state = self.state.lock().expect("memory backend lock");
+        // v54.1.0 (#1047) — single use, under the same lock as the insert: a
+        // proposer-minted nonce names one proposal per family.
+        if let Some(other) = state.accord_proposals.iter().find_map(|(d, p)| {
+            (*d != proposal_digest
+                && p.proposal.family_key_id == stored.proposal.family_key_id
+                && p.proposal.nonce == stored.proposal.nonce)
+                .then(|| d.clone())
+        }) {
+            return Err(crate::federation::accord_quorum::nonce_reused(
+                &stored.proposal,
+                &other,
+            ));
+        }
         // Content-derived digest ⇒ insert-if-absent is idempotent.
         state
             .accord_proposals
@@ -7448,29 +7447,6 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             state.accord_active_halts.remove(family_key_id);
         }
         Ok(())
-    }
-
-    async fn issue_accord_nonce(
-        &self,
-        family_key_id: &str,
-        nonce: &str,
-    ) -> Result<(), crate::federation::Error> {
-        let mut state = self.state.lock().expect("memory backend lock");
-        state
-            .accord_issued_nonces
-            .insert((family_key_id.to_owned(), nonce.to_owned()));
-        Ok(())
-    }
-
-    async fn accord_nonce_issued(
-        &self,
-        family_key_id: &str,
-        nonce: &str,
-    ) -> Result<bool, crate::federation::Error> {
-        let state = self.state.lock().expect("memory backend lock");
-        Ok(state
-            .accord_issued_nonces
-            .contains(&(family_key_id.to_owned(), nonce.to_owned())))
     }
 
     // ─── v4.8.0 (CIRISPersist#161, CEG §11.7.1) — membership revocations.

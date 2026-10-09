@@ -121,7 +121,6 @@ pub(crate) enum Class {
 ///   anything is stored. Classified by what they do, not what they are called.
 #[cfg(test)]
 pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
-    ("accord_nonce_issued", Class::Delegates),
     // v46.3.0 (#884) — `minter_of_blob`'s community arm IS the #876 read
     // (`community_dek_blob_epoch`, another door): its answer is the binding's
     // minter, no refusal of the caller's input here.

@@ -349,3 +349,5 @@ sqlite	185	dag_link_backfill_cursor	11302997608030026060
 postgres	185	dag_link_backfill_cursor	16500093909395014281
 sqlite	186	key_registration_history_replacement	5256358308654834801
 postgres	186	key_registration_history_replacement	6374064702944045244
+sqlite	188	drop_accord_issued_nonce	3171246046045814975
+postgres	188	drop_accord_issued_nonce	408421209126426489

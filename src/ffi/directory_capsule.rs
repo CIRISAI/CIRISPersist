@@ -4578,16 +4578,6 @@ impl FederationDirectory for OpsDirectory {
             method: "clear_active_halt",
         })
     }
-    async fn issue_accord_nonce(&self, family_key_id: &str, nonce: &str) -> Result<(), Error> {
-        Err(Error::Unsupported {
-            method: "issue_accord_nonce",
-        })
-    }
-    async fn accord_nonce_issued(&self, family_key_id: &str, nonce: &str) -> Result<bool, Error> {
-        Err(Error::Unsupported {
-            method: "accord_nonce_issued",
-        })
-    }
 }
 
 #[cfg(test)]
