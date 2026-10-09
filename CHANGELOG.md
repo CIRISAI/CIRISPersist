@@ -7,6 +7,44 @@ threat-model citations because this crate's audit story is the point.
 
 ## [Unreleased]
 
+## [54.0.0] - UNRELEASED
+
+### Changed — Verify 20.1.0 adopted: the three verify crates and the wheel floor move together (#992)
+
+`ciris-verify-core`, `ciris-keyring` and `ciris-crypto` move from tag v19.0.0 to v20.1.0 at all seven pin sites in one cut, since a split re-pin forks `ciris_crypto`. The wheel's `Requires-Dist` moves to `ciris-verify>=20.1.0,<21`. The floor is 20.1.0 because that minor ships the wheel-identity refusals the tag job's signer now relies on. The lockfile gains one transitive crate, `zlib-rs`, which verify-core's wheel reader pulls in.
+
+Verify 20 is a MAJOR of verify, and nothing in persist's surface broke at compile time. Its breaking changes are the kill switch as ruled on CIRISConstitution#146. A `constitutional` halt now verifies on ONE holder's signature, resumption and the new `lifecycle:confirmed` row need a strict majority of the standing roster, and `InvocationKind` and `Invocation` gained the confirmation kind and its `confirms_halt_id` field. `accord_live_quorum::verify_fire_by_live_quorum` and `verify_resume_by_live_quorum` are deprecated, and `AccordAction::Fire`/`Resume` remain only so stored rows parse. Persist calls neither `verify_invocation` nor the deprecated tallies. Its only use of `AccordAction::Fire` is a test fixture for the proposal-row parity tests, which still parses. Verify 20 also says an accord proposal's nonce is minted by the proposer, not issued by a server. Persist's accord proposal store still keeps an issued-nonce set. This cut does not change that set, and it is noted here for the accord owners.
+
+### Changed — the STREAM nonce is verify's; the public stream-chunk pair is the stored construction (#992)
+
+- **Delegation.** `stream_seal::stream_nonce` is now `ciris_crypto::stream_seal::stream_nonce` (CIRISVerify#303/#304), the one implementation persist, edge and verify call. It is also the A/V inner seal (CIRISConstitution#140), so live and stored chunks share one nonce. It is infallible, so it returns `[u8; 12]` instead of a `Result`, and `StreamSealError::Kdf` is gone. `BadDekLength`, which nothing raised, is gone too. `parse_nonce` delegates to verify's `parse_stream_nonce`. Stored nonces are unchanged byte for byte.
+- **New public pair** (the CIRISEdge ask on this issue). `seal_stream_chunk(dek, stream_id, epoch, counter, last, caller_aad, storage_seq, plaintext) -> AtRestEnvelope` and `open_stream_chunk(dek, stream_id, epoch, caller_aad, storage_seq, &AtRestEnvelope) -> (Vec<u8>, StreamKeySlot)` build `chunk_aad(caller_aad, stream_id, storage_seq)` inside. The store's append door, for data chunks and terminators, and its read door call these two functions. The read door now derives the position-bound AAD from the chunk's position, which carries the caller's AAD, instead of taking a pre-built AAD beside the position. So the AAD has one construction.
+- **Removed, clean break:** the public `seal_chunk`/`open_chunk`. They sealed with no associated data, which is a different construction from any stored chunk, so a chunk sealed through them never opened as a stored chunk. Nothing outside the module called them.
+- **Breaking for Rust callers:** `stream_nonce` no longer returns a `Result`, `StreamSealError` lost its `Kdf`, `BadDekLength` and `Crypto` arms and gained `NotAStreamNonce`, `NotThisStreamsNonce`, `Seal` and `DidNotOpen`, and `seal_chunk`/`open_chunk` are gone.
+
+Witnesses:
+
+- **I311** is unchanged. It derives the prefix with an independent HKDF call over the info encoding and now witnesses that verify's derivation is the one persist v53 stored under.
+- **I560** pins verify's five golden vectors as bytes, both through `stream_nonce` and through persist's v53 HKDF framing. A later verify that changed the derivation goes red at the re-pin.
+- **I561** (unit) checks that the DEK, stream and epoch are bound by the nonce recompute, which refuses before the open. It also checks that `caller_aad` and `storage_seq` are bound by the tag.
+- **I562** (sqlite, postgres) checks both directions. A chunk the store appended opens through `open_stream_chunk`. A chunk sealed through `seal_stream_chunk` and put at the floor reads through the store's door. A wrong `storage_seq` or `caller_aad` is refused on both sides, and at the door as the typed `SealDidNotOpen`.
+
+### Changed — the tag job signs with ciris-build-sign v20.1.0, whose own refusal backs the bits-changed gate (#992)
+
+The tag job's `build-manifest` job and `reregister-manifests.yml` now install `ciris-build-sign` v20.1.0 instead of v2.1.5. From v20.1.0 the signer reads a wheel's own `*.dist-info` before it signs (CIRISVerify#306/#307). It refuses, writing nothing, when the wheel's `Version:` is not `--binary-version` or no platform tag fits `--target`. That is the v53.1.8 failure of #1029, a v29 wheel signed as v53.1.8, caught by the signer itself.
+
+- `TOOL_VERSION` in `scripts/build_manifest.sh` is the one place the version lives. The re-register workflow's registry notes read it.
+- `install` and `sign` refuse unless the `ciris-build-sign` on PATH reports exactly that version, because an older binary signs any wheel it is given.
+- `bits_changed.sh` checks 1 to 4 still run first. The signer cannot know check 3, the previous release's registered hash, or check 4, the known-stale list.
+- The signer's check engages only when it is given the `.whl` with `--binary`, which is how the script signs every wheel. A comment at the call says never to pass `--binary-hash` there.
+- `docs/RELEASE.md` gains "The signer's own refusal" under the bits-changed gate.
+
+Checked by hand before the switch, on the v53.2.0 tag run's four wheels and `python/`. The CLI flags are the same; v20.1.0 adds `--emit-contribution`. The `python-source-tree` hash, the manifest fields and the `register --dry-run` preview are identical. So re-registering an old version under the new tool recomputes the same rows. On all four wheels v20.1.0 refused a claimed version of 54.0.0 and each of the three wrong targets, and v2.1.5 signed the wrong version.
+
+Witnesses in `scripts/bits_changed_test.sh`, now 83 of 83. The fake signer answers `--version` with the pinned version. Every wheel reaches the signer as `--binary <.whl>` and none as `--binary-hash`. An older signer, or none, is refused and signs nothing. Mutation-checked: dropping the guard from `sign` reds 3 witnesses, a version compare that accepts any version reds 2, and signing wheels by `--binary-hash` reds 10.
+
+The STREAM-nonce change above is mutation-checked as well. The read door ignoring `storage_seq` reds I561, I562 and I310. Dropping the nonce recompute reds I561 and I319. The seal dropping `caller_aad` reds I561, I562 and `round_trips`.
+
 ## [53.2.0] - 2026-10-08
 
 ### Changed — the tag is pushed once main's run EXISTS, not once it completes (#1008)

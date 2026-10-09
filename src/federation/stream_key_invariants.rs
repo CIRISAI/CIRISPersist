@@ -49,6 +49,10 @@
 //! - **I507** (sqlite, postgres; #984 row 4) — a family blob's row records
 //!   the family it was sealed for, so its durability deficit names the
 //!   family's nodes instead of an unresolvable (empty) audience.
+//! - **I562** (sqlite, postgres; v54.0.0, #992) — the public
+//!   `stream_seal::seal_stream_chunk` / `open_stream_chunk` pair is the
+//!   store's construction both ways; a wrong `storage_seq` or `caller_aad`
+//!   is refused on both sides.
 //! - **I508** (sqlite, postgres; #984 row 2) — a stream-keyed append naming
 //!   another cohort/group than the stream's is refused before the epoch
 //!   door wraps, terminates or mints anything.
@@ -208,8 +212,7 @@ pub(crate) mod bodies {
                 0,
                 u32::try_from(i).unwrap(),
                 false,
-            )
-            .unwrap();
+            );
             assert_eq!(env.nonce, want, "I311: chunk seq {} nonce", c.seq);
         }
         // The live read by position: per epoch, not per chunk.
@@ -271,7 +274,7 @@ pub(crate) mod bodies {
         .unwrap();
         assert_eq!(
             env.nonce,
-            crate::federation::stream_seal::stream_nonce(&dek, &stream, 0, 5, true).unwrap(),
+            crate::federation::stream_seal::stream_nonce(&dek, &stream, 0, 5, true),
             "I312: the terminator carries last_flag at the epoch's final counter"
         );
         let rec = p.sa.stream_dek_list(&stream).await.unwrap().remove(0);
@@ -287,7 +290,7 @@ pub(crate) mod bodies {
             let slot = StreamKeySlot { counter: 6, last };
             let envelope = crate::federation::at_rest_cascade::seal_aad_at_nonce(
                 &dek,
-                crate::federation::stream_seal::stream_nonce(&dek, &stream, 0, 6, last).unwrap(),
+                crate::federation::stream_seal::stream_nonce(&dek, &stream, 0, 6, last),
                 &crate::federation::chunk_dag_cascade::chunk_aad(None, &stream, 9),
                 b"late",
             )
@@ -1257,7 +1260,7 @@ pub(crate) mod bodies {
         let dek1 = epoch_dek(p.sa.as_ref(), &stream, 1).await;
         assert_eq!(
             env.nonce,
-            crate::federation::stream_seal::stream_nonce(&dek1, &stream, 1, 0, false).unwrap(),
+            crate::federation::stream_seal::stream_nonce(&dek1, &stream, 1, 0, false),
             "I314: the counter resets at E+1"
         );
         // The producer naming the old epoch is carried to the open one.
@@ -1306,8 +1309,7 @@ pub(crate) mod bodies {
                 0,
                 u32::try_from(max - 1).unwrap(),
                 true
-            )
-            .unwrap(),
+            ),
             "I314: E's terminator takes the slot the roll reserved"
         );
 
@@ -1765,7 +1767,7 @@ pub(crate) mod bodies {
         let dek = epoch_dek(p.sa.as_ref(), &stream, 0).await;
         let envelope = crate::federation::at_rest_cascade::seal_aad_at_nonce(
             &dek,
-            crate::federation::stream_seal::stream_nonce(&dek, &stream, 0, 1, false).unwrap(),
+            crate::federation::stream_seal::stream_nonce(&dek, &stream, 0, 1, false),
             &crate::federation::chunk_dag_cascade::chunk_aad(None, &stream, 7),
             b"reuse",
         )
@@ -1805,8 +1807,7 @@ pub(crate) mod bodies {
         // A chunk at the right slot sealed under the right DEK, with the
         // right counter and flag, whose nonce PREFIX is not the stream's: the
         // DEK opens it, so only the reader's recompute refuses it.
-        let mut nonce =
-            crate::federation::stream_seal::stream_nonce(&dek, &stream, 0, 2, false).unwrap();
+        let mut nonce = crate::federation::stream_seal::stream_nonce(&dek, &stream, 0, 2, false);
         nonce[0] ^= 0xff;
         let random = crate::federation::at_rest_cascade::seal_aad_at_nonce(
             &dek,
@@ -1918,6 +1919,144 @@ pub(crate) mod bodies {
                 .await
                 .unwrap(),
             segment(0)
+        );
+    }
+
+    /// I562 (v54.0.0, CIRISPersist#992) — the PUBLIC stream-chunk pair is
+    /// the store's construction, both ways: a chunk the store appended
+    /// opens through `stream_seal::open_stream_chunk`; a chunk sealed through
+    /// `stream_seal::seal_stream_chunk` and put at the floor reads through
+    /// the store's read door; a wrong `storage_seq` or `caller_aad` is
+    /// refused on both sides.
+    pub(crate) async fn i562_the_public_pair_is_the_stored_construction<B>(
+        dsn_a: &str,
+        dsn_b: &str,
+        run: &str,
+        pick: Pick<B>,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync + 'static,
+    {
+        use crate::federation::stream_seal::{
+            open_stream_chunk, seal_stream_chunk, StreamSealError,
+        };
+        let p = pair(dsn_a, dsn_b, run, pick, "i562").await;
+        let stream = format!("i562-{run}");
+        let aad: &[u8] = b"i562-row";
+        for i in 0..2u64 {
+            p.a.put_blob_chunk_scoped(
+                cohort_scope::SELF,
+                Some(&p.owner),
+                &stream,
+                i,
+                &segment(i as usize),
+                0,
+                Some(aad),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("chunk {i}: {e}"));
+        }
+        let dek = epoch_dek(p.sa.as_ref(), &stream, 0).await;
+        // Store → public: every appended chunk opens through the public fn.
+        let listing = p.sa.stream_chunks(&stream).await.unwrap();
+        assert_eq!(listing.chunks.len(), 2);
+        for (i, c) in listing.chunks.iter().enumerate() {
+            let env = crate::federation::at_rest_cascade::AtRestEnvelope::from_bytes(
+                &inline(p.sa.as_ref(), &c.chunk_sha).await,
+            )
+            .unwrap();
+            assert_eq!(
+                open_stream_chunk(&dek, &stream, 0, Some(aad), c.seq, &env).unwrap(),
+                (
+                    segment(i),
+                    StreamKeySlot {
+                        counter: u32::try_from(i).unwrap(),
+                        last: false
+                    }
+                ),
+                "I562: stored chunk seq {} opens through the public fn",
+                c.seq
+            );
+            for (bad_aad, bad_seq) in [
+                (Some(aad), c.seq + 1),
+                (Some(&b"other"[..]), c.seq),
+                (None, c.seq),
+            ] {
+                assert!(
+                    matches!(
+                        open_stream_chunk(&dek, &stream, 0, bad_aad, bad_seq, &env),
+                        Err(StreamSealError::DidNotOpen(_))
+                    ),
+                    "I562: seq {} under aad {bad_aad:?} at {bad_seq} is refused",
+                    c.seq
+                );
+            }
+        }
+        // Public → store: a chunk sealed through the public fn at the next
+        // counter and position, put at the floor, reads through the door.
+        let floor_put = |seq: u64,
+                         env: crate::federation::at_rest_cascade::AtRestEnvelope,
+                         counter: u32,
+                         size: u64| {
+            let (sa, owner, key_a, stream) = (
+                p.sa.clone(),
+                p.owner.clone(),
+                p.key_a.clone(),
+                stream.clone(),
+            );
+            async move {
+                sa.put_blob_chunk_with_scope(
+                    &stream,
+                    seq,
+                    BlobBody::Inline(env.to_bytes()),
+                    0,
+                    size,
+                    cohort_scope::SELF,
+                    crate::federation::StorageFloor::resolved(CryptoTier::InvisibleEncrypted),
+                    None,
+                    crate::federation::StreamClaim {
+                        community_key_id: Some(owner),
+                        owner_key_id: Some(key_a),
+                        stream_key: Some(StreamKeySlot {
+                            counter,
+                            last: false,
+                        }),
+                    },
+                )
+                .await
+                .unwrap_or_else(|e| panic!("floor put at {seq}: {e}"));
+            }
+        };
+        let public =
+            seal_stream_chunk(&dek, &stream, 0, 2, false, Some(aad), 2, b"public").unwrap();
+        floor_put(2, public, 2, 6).await;
+        assert_eq!(
+            p.a.read_stream_chunk_as(&stream, 2, &p.key_a, Some(aad))
+                .await
+                .unwrap(),
+            b"public",
+            "I562: a publicly sealed chunk reads through the store's door"
+        );
+        for bad in [Some(&b"other"[..]), None] {
+            let e =
+                p.a.read_stream_chunk_as(&stream, 2, &p.key_a, bad)
+                    .await
+                    .expect_err("I562: the door refuses a wrong caller_aad");
+            assert!(
+                matches!(e, BlobError::SealDidNotOpen { .. }),
+                "I562: aad {bad:?}: {e:?}"
+            );
+        }
+        // Sealed for position 99, stored at 3: the door refuses it.
+        let misplaced =
+            seal_stream_chunk(&dek, &stream, 0, 3, false, Some(aad), 99, b"moved").unwrap();
+        floor_put(3, misplaced, 3, 5).await;
+        let e =
+            p.a.read_stream_chunk_as(&stream, 3, &p.key_a, Some(aad))
+                .await
+                .expect_err("I562: the door refuses a wrong storage_seq");
+        assert!(
+            matches!(e, BlobError::SealDidNotOpen { .. }),
+            "I562: wrong storage_seq: {e:?}"
         );
     }
 
@@ -2135,6 +2274,17 @@ mod runners {
                 async fn i319b() {
                     let Some((a, b)) = $dsns else { return };
                     bodies::i319b_a_stream_chunk_by_sha_authorizes_by_its_epoch(
+                        &a,
+                        &b,
+                        &super::suffix(),
+                        $pick,
+                    )
+                    .await
+                }
+                #[tokio::test]
+                async fn i562() {
+                    let Some((a, b)) = $dsns else { return };
+                    bodies::i562_the_public_pair_is_the_stored_construction(
                         &a,
                         &b,
                         &super::suffix(),
