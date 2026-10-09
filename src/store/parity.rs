@@ -357,6 +357,9 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // v50.0.0 (CIRISPersist#924, CC 5.4.6) — a minor's owner-binding is
     // refused at `cohort_scope: federation`.
     ("check_minor_owner_binding_not_announced", Class::Gate),
+    // v54.0.0 (CIRISPersist#1031, CC 4.1.1) — refuses the cycle-closing
+    // `delegates_to` (`federation_delegation_cycle`).
+    ("check_delegation_cycle_admission", Class::Gate),
     ("check_skew_and_payment", Class::Gate),
     ("check_trace_dimension_admission", Class::Gate),
     ("check_trust_charter_admission", Class::Gate),

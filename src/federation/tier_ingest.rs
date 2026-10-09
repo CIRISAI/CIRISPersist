@@ -3786,7 +3786,7 @@ pub mod test_support {
 
     /// v37.0.0 (CIRISPersist#734) — retract `target_id` with a `withdraws` /
     /// `recants` composer authored by `granter` (the §6.1 / CEG §3.2.3 act).
-    async fn put_retraction<D: crate::federation::FederationDirectory + ?Sized>(
+    pub(crate) async fn put_retraction<D: crate::federation::FederationDirectory + ?Sized>(
         dir: &D,
         granter: &str,
         grantee: &str,

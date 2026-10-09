@@ -3902,6 +3902,11 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // federation`. Backend-symmetric; verify-before-mutation.
         crate::federation::admission::check_minor_owner_binding_not_announced(self, &row).await?;
 
+        // v54.0.0 (CIRISPersist#1031, CC 4.1.1) — the cycle-closing `delegates_to`
+        // is refused: the recipient must not already reach the granter through live
+        // `delegates_to` edges. Backend-symmetric with SQLite + Postgres; verify-before-mutation.
+        crate::federation::admission::check_delegation_cycle_admission(self, &row).await?;
+
         // v12.6.0 (CIRISConstitution#23, CC 1.13.3.3 / CC 3.2) — the single-owner
         // gate: a node has AT MOST ONE responsible steward, so a second,
         // distinct-owner owner-binding `delegates_to(U → node)` is rejected. This

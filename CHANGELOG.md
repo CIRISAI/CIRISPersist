@@ -7,6 +7,18 @@ threat-model citations because this crate's audit story is the point.
 
 ## [Unreleased]
 
+## [54.0.0] - UNRELEASED
+
+### Fixed — the cycle-closing `delegates_to` is refused at admission (CC 4.1.1, #1031)
+
+CC 4.1.1's anti-pattern row "Cycles (A → B → A)" says the substrate MUST detect cycles on the `delegates_to` graph and reject the cycle-closing emission. The walks were visited-guarded, so a cycle was tolerated at read time, but no gate refused the closing edge and it was stored.
+
+- `check_delegation_cycle_admission` refuses `delegates_to(A → B)` when B already reaches A through live `delegates_to` edges within the absolute ceiling of 16 hops (`MAX_WITHDRAWS_DELEGATION_DEPTH`). A self-edge is the one-hop cycle and is refused the same way.
+- New refusal `Error::DelegationCycle { attesting_key_id, attested_key_id, hops }`, `kind()` token `federation_delegation_cycle`, Python `ValueError` (the node-agency arm it sits beside).
+- "Live" is the walks' own reading: a granter's retraction of the recipient, a retraction naming the edge (the #593 clause), and expiry at the admitting node's clock. Scope does not matter. A future-dated edge counts, so the gate fails toward refusal.
+- Wired at every backend's `put_attestation` after the minor-owner gate (parity-registered), and in `check_promotion_admission`. The walks read the federation tier only, so a local edge closes a cycle at the moment it crosses.
+- Witness I560, one body on memory, sqlite and postgres: a two-hop chain closure is refused and not stored; the self-edge; each retraction gate alone; an expired edge; the ceiling (on a 17-hop chain, the 16-hop closure is refused and the 17-hop closure admits); and a local cycle-closing edge refused at `enter_mesh`, left local.
+
 ## [53.2.0] - 2026-10-08
 
 ### Changed — the tag is pushed once main's run EXISTS, not once it completes (#1008)

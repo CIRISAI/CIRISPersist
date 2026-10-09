@@ -190,6 +190,10 @@ pub(crate) mod nested_manifest_invariants;
 #[cfg(test)]
 mod retraction_invariants;
 // v53.0.0 (CIRISPersist#969) — I310–I319: one DEK per (stream, epoch).
+/// v54.0.0 (CIRISPersist#1031, CC 4.1.1) — the cycle-closing `delegates_to`
+/// is refused at admission (I560).
+#[cfg(test)]
+pub mod delegation_cycle_invariants;
 /// CIRISPersist#972 — I335–I339, a node is seated without an acceptance.
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod node_seat_invariants;
@@ -10676,6 +10680,31 @@ pub enum Error {
         offending_scopes: Vec<String>,
     },
 
+    /// v54.0.0 (CIRISPersist#1031, CC 4.1.1 — the anti-pattern table's
+    /// "Cycles (A → B → A)" row: "Substrate MUST detect cycles on the
+    /// `delegates_to` graph and reject the cycle-closing emission"). A
+    /// `delegates_to(attesting → attested)` was REFUSED because `attested`
+    /// already reaches `attesting` through live `delegates_to` edges within the
+    /// absolute depth ceiling, so storing it would close a cycle. A self-edge
+    /// (`attesting == attested`) is the one-hop cycle and is refused the same
+    /// way. The row is not stored (verify-before-mutation, AV-9). Stable
+    /// `kind()` token `federation_delegation_cycle`. See
+    /// [`admission::check_delegation_cycle_admission`].
+    #[error(
+        "delegates_to {attesting_key_id:?} -> {attested_key_id:?} closes a delegation cycle: \
+         {attested_key_id:?} already reaches {attesting_key_id:?} through {hops} live \
+         delegates_to hop(s) (CC 4.1.1 — the cycle-closing emission is refused)"
+    )]
+    DelegationCycle {
+        /// The refused edge's granter (`attesting_key_id`).
+        attesting_key_id: String,
+        /// The refused edge's recipient (`attested_key_id`).
+        attested_key_id: String,
+        /// Length of the existing path `attested → … → attesting` that this
+        /// edge would close (0 for a self-edge).
+        hops: usize,
+    },
+
     /// v12.6.0 (CIRISConstitution#23, CC 1.13.3.3 / CC 3.2) — a **second,
     /// distinct-owner** node owner-binding was REJECTED: the node already
     /// carries a LIVE owner-binding from `incumbent_owner`, and a node has at
@@ -11541,6 +11570,7 @@ impl Error {
             Error::DelegatedScopeUnauthorized { .. } => "federation_delegated_scope_unauthorized",
             Error::NodeAgencyForbidden { .. } => "federation_node_agency_forbidden",
             Error::NodeAlreadyOwned { .. } => "federation_node_already_owned",
+            Error::DelegationCycle { .. } => "federation_delegation_cycle",
             Error::AmbiguousNodeOwner { .. } => "federation_ambiguous_node_owner",
             Error::OwnershipReclaimRefused { .. } => "federation_ownership_reclaim_refused",
             Error::CanonicalRoleNotAccordConferred { .. } => "canonical_role_not_accord_conferred",

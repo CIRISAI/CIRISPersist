@@ -34388,6 +34388,10 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         // node-role key is caller-side authorization failure; ValueError
         // (4xx). "Infrastructure must not have agency."
         crate::federation::Error::NodeAgencyForbidden { .. } => PyValueError::new_err(kind),
+        // v54.0.0 (CIRISPersist#1031, CC 4.1.1) — a cycle-closing
+        // `delegates_to` joins the node-agency arm it sits beside on the
+        // put door: a caller-side delegation refusal, ValueError (4xx).
+        crate::federation::Error::DelegationCycle { .. } => PyValueError::new_err(kind),
         // v12.6.0 (CIRISConstitution#23, CC 1.13.3.3 / CC 3.2) — a rejected
         // second-owner binding (single-owner gate) is a caller-side conflict,
         // and an ambiguous-owner read is a fail-closed state rejection; both are

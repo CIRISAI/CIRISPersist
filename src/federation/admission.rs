@@ -2745,6 +2745,11 @@ pub async fn check_promotion_admission(
     // only as minor-guardianship.
     check_user_target_steward_binding_admission(directory, row).await?;
 
+    // CC 4.1.1 — the cycle-closing `delegates_to` is refused (v54.0.0,
+    // CIRISPersist#1031). Re-run at promotion: the walks read the federation
+    // tier only, so a local edge closes a cycle at the moment it is promoted.
+    check_delegation_cycle_admission(directory, row).await?;
+
     // CC 5.4.6 / CC 3.4.13 Q5 — a minor's owner-binding is never announced
     // (v50.0.0, CIRISPersist#924). Re-run here because "admission MUST refuse
     // the PROMOTION": the owner's age band is directory state that can have
@@ -14444,6 +14449,132 @@ pub async fn check_node_agency_admission(
         attested_key_id: row.attested_key_id.clone(),
         offending_scopes,
     })
+}
+
+/// v54.0.0 (CIRISPersist#1031, CC 4.1.1) — **the cycle-closing `delegates_to`
+/// is refused at admission.**
+///
+/// CC 4.1.1's anti-pattern table, row "Cycles (A → B → A)": *"Substrate MUST
+/// detect cycles on the `delegates_to` graph and reject the cycle-closing
+/// emission."* Until this gate every walk was visited-guarded
+/// ([`scoped_delegation_reach_at`], `topology::build_delegation_graph`), so a
+/// cycle was TOLERATED at read time, but nothing refused the closing edge and
+/// it was stored.
+///
+/// A no-op for any row that is not a [`attestation_type::DELEGATES_TO`]. For
+/// `delegates_to(A → B)` it asks whether `B` already reaches `A` through live
+/// `delegates_to` edges ([`delegation_path_hops`]), and if so refuses with
+/// [`Error::DelegationCycle`] (`federation_delegation_cycle`). `A == B` is the
+/// one-hop cycle and is refused without a read.
+///
+/// # What "live" means here — the walks' own reading
+///
+/// An edge counts unless the walks would skip it: retracted by its granter
+/// (gate (a) of [`scoped_delegation_reach_at`]: a `withdraws`/`recants` by the
+/// granter naming the recipient), retracted by name (gate (b), the #593
+/// clause, via [`retracted_edge_ids`]), or expired at `now`. Scope does NOT
+/// matter: CC names the `delegates_to` graph, not one scope's subgraph, and a
+/// cycle on any scope is still a cycle. A future-dated edge counts — it
+/// exists, and skipping it would let the closing edge in now and the cycle go
+/// live the moment the clock reaches it (fail toward refusal).
+///
+/// # The ceiling
+///
+/// The search follows at most [`MAX_WITHDRAWS_DELEGATION_DEPTH`] hops from
+/// `B`, the absolute ceiling every delegation walk clamps to (the issue's ask
+/// verbatim). A longer path is invisible to every walk this substrate runs,
+/// so a cycle through it cannot change any verdict a walk returns.
+///
+/// # Where it runs
+///
+/// Every backend's `put_attestation` (all tiers), beside the other
+/// `delegates_to` gates, AND [`check_promotion_admission`]: the walks read
+/// the federation tier only, so a local-tier edge closes nothing until it is
+/// promoted, and the graph may have grown since its local write.
+pub async fn check_delegation_cycle_admission(
+    directory: &dyn super::FederationDirectory,
+    row: &super::Attestation,
+) -> Result<(), Error> {
+    if row.attestation_type != attestation_type::DELEGATES_TO {
+        return Ok(());
+    }
+    let refuse = |hops| {
+        Err(Error::DelegationCycle {
+            attesting_key_id: row.attesting_key_id.clone(),
+            attested_key_id: row.attested_key_id.clone(),
+            hops,
+        })
+    };
+    if row.attesting_key_id == row.attested_key_id {
+        return refuse(0);
+    }
+    match delegation_path_hops(
+        directory,
+        &row.attested_key_id,
+        &row.attesting_key_id,
+        chrono::Utc::now(),
+    )
+    .await?
+    {
+        Some(hops) => refuse(hops),
+        None => Ok(()),
+    }
+}
+
+/// v54.0.0 (CIRISPersist#1031) — the shortest live `delegates_to` path from
+/// `from` to `to`, in hops, within [`MAX_WITHDRAWS_DELEGATION_DEPTH`]; `None`
+/// when there is none. Unscoped, unattenuated: it asks whether the graph
+/// CONNECTS the two keys, not whether a duty flows. Edge liveness is the
+/// reading [`check_delegation_cycle_admission`] documents.
+pub(crate) async fn delegation_path_hops(
+    directory: &dyn super::FederationDirectory,
+    from: &str,
+    to: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Option<usize>, Error> {
+    use std::collections::{HashMap, HashSet, VecDeque};
+    let mut visited: HashSet<String> = HashSet::from([from.to_owned()]);
+    let mut queue: VecDeque<(String, usize)> = VecDeque::from([(from.to_owned(), 0)]);
+    let mut incoming_retracted: HashMap<String, HashSet<String>> = HashMap::new();
+    while let Some((key, depth)) = queue.pop_front() {
+        if depth >= MAX_WITHDRAWS_DELEGATION_DEPTH {
+            continue;
+        }
+        let rows = directory.list_attestations_by(&key).await?;
+        // Gate (a): the granter retracted its own edge to this recipient.
+        let granter_retracted: HashSet<&str> = rows
+            .iter()
+            .filter(|r| {
+                r.attestation_type == attestation_type::WITHDRAWS
+                    || r.attestation_type == attestation_type::RECANTS
+            })
+            .map(|r| r.attested_key_id.as_str())
+            .collect();
+        for r in &rows {
+            if r.attestation_type != attestation_type::DELEGATES_TO
+                || r.expires_at.is_some_and(|x| x <= now)
+                || granter_retracted.contains(r.attested_key_id.as_str())
+            {
+                continue;
+            }
+            // Gate (b), the #593 clause: a retraction among the recipient's
+            // incoming rows naming THIS edge kills it, whoever issued it.
+            if !incoming_retracted.contains_key(&r.attested_key_id) {
+                let incoming = directory.list_attestations_for(&r.attested_key_id).await?;
+                incoming_retracted.insert(r.attested_key_id.clone(), retracted_edge_ids(&incoming));
+            }
+            if incoming_retracted[&r.attested_key_id].contains(&r.attestation_id) {
+                continue;
+            }
+            if r.attested_key_id == to {
+                return Ok(Some(depth + 1));
+            }
+            if visited.insert(r.attested_key_id.clone()) {
+                queue.push_back((r.attested_key_id.clone(), depth + 1));
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// v11.5.0 (CIRISPersist#306, CC 3.2 / CC 1.15.6) — the **user-target
