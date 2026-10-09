@@ -50219,11 +50219,36 @@ mod tests {
             })
             .await
             .unwrap();
-        backend
+        // v54.0.0 (CIRISPersist#1031, CC 4.1.1) — the cycle-closing edge is
+        // refused at the door, so a two-key cycle can no longer be stored.
+        let closing = backend
             .put_attestation(SignedAttestation {
                 attestation: topo_attestation(
                     "cyc-b",
                     "cyc-a",
+                    attestation_type::DELEGATES_TO,
+                    None,
+                    Some("*"),
+                    &[],
+                    None,
+                    when,
+                ),
+            })
+            .await;
+        assert!(
+            matches!(
+                closing,
+                Err(crate::federation::Error::DelegationCycle { .. })
+            ),
+            "the cycle-closing edge is refused: {closing:?}"
+        );
+        // The walk's visited guard still meets a cycle: a self-edge (the root
+        // charter shape, admitted) re-enters cyc-b.
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: topo_attestation(
+                    "cyc-b",
+                    "cyc-b",
                     attestation_type::DELEGATES_TO,
                     None,
                     Some("*"),

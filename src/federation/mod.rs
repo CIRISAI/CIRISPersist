@@ -10746,9 +10746,9 @@ pub enum Error {
     /// `delegates_to` graph and reject the cycle-closing emission"). A
     /// `delegates_to(attesting → attested)` was REFUSED because `attested`
     /// already reaches `attesting` through live `delegates_to` edges within the
-    /// absolute depth ceiling, so storing it would close a cycle. A self-edge
-    /// (`attesting == attested`) is the one-hop cycle and is refused the same
-    /// way. The row is not stored (verify-before-mutation, AV-9). Stable
+    /// absolute depth ceiling, so storing it would close a cycle between
+    /// distinct keys. A self-edge is the root charter's self-declaration and is
+    /// not refused. The row is not stored (verify-before-mutation, AV-9). Stable
     /// `kind()` token `federation_delegation_cycle`. See
     /// [`admission::check_delegation_cycle_admission`].
     #[error(
@@ -10762,7 +10762,7 @@ pub enum Error {
         /// The refused edge's recipient (`attested_key_id`).
         attested_key_id: String,
         /// Length of the existing path `attested → … → attesting` that this
-        /// edge would close (0 for a self-edge).
+        /// edge would close (at least 1).
         hops: usize,
     },
 

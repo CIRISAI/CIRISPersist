@@ -14546,8 +14546,12 @@ pub async fn holds_grant_delegation(
 /// A no-op for any row that is not a [`attestation_type::DELEGATES_TO`]. For
 /// `delegates_to(A → B)` it asks whether `B` already reaches `A` through live
 /// `delegates_to` edges ([`delegation_path_hops`]), and if so refuses with
-/// [`Error::DelegationCycle`] (`federation_delegation_cycle`). `A == B` is the
-/// one-hop cycle and is refused without a read.
+/// [`Error::DelegationCycle`] (`federation_delegation_cycle`).
+///
+/// A self-edge (`A == B`) is admitted without a read: it is the root charter,
+/// the constitutional `delegates_to(root → root)` self-declaration
+/// (`trust_root`), not the "A → B → A" anti-pattern, and the walks' visited
+/// guard reads it as a root.
 ///
 /// # What "live" means here — the walks' own reading
 ///
@@ -14587,8 +14591,12 @@ pub async fn check_delegation_cycle_admission(
             hops,
         })
     };
+    // A self-edge is not the anti-pattern: it is the root charter, the
+    // constitutional `delegates_to(root → root)` self-declaration (CC 3.2 —
+    // `trust_root`), and every walk's visited guard already treats it as a
+    // root. CC 4.1.1's row is "A → B → A", a cycle between distinct keys.
     if row.attesting_key_id == row.attested_key_id {
-        return refuse(0);
+        return Ok(());
     }
     match delegation_path_hops(
         directory,

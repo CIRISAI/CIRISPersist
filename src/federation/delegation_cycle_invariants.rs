@@ -10,7 +10,8 @@
 //!
 //! - (1) a chain `a → b → c` admits; `c → a` is refused
 //!   `federation_delegation_cycle` (hops 2) and is not stored;
-//! - (2) a self-edge `a → a` is the one-hop cycle (hops 0);
+//! - (2) a self-edge `a → a` ADMITS: it is the root charter's
+//!   self-declaration (`trust_root`), not the "A → B → A" anti-pattern;
 //! - (3) gate (a): after the granter's bare retraction of `b → c`, the same
 //!   `c → a` admits — a retracted edge connects nothing;
 //! - (4) gate (b): a retraction NAMING an edge kills it the same way;
@@ -133,14 +134,10 @@ pub mod bodies {
             .await
             .expect("(1) a → c is a second path, not a cycle");
 
-        // (2) the self-edge.
-        expect_cycle(
-            ts::put_delegates_to(d, &a, &a, None).await,
-            &a,
-            &a,
-            0,
-            "(2) a → a",
-        );
+        // (2) the self-edge is the root charter's shape, not a cycle.
+        ts::put_delegates_to(d, &a, &a, None)
+            .await
+            .expect("(2) a → a is a root self-declaration, admitted");
 
         // (3) gate (a): the granter's bare retraction against the recipient.
         // `a → c` (admitted above) still reaches c; withdraw it too, so the
