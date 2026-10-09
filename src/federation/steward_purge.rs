@@ -48,7 +48,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 use sha2::Digest as _;
 
-use super::types::{attestation_type, Attestation, ServedAttestation};
+use super::types::{attestation_type, Attestation};
 use super::{Error, FederationDirectory};
 
 /// The closed set of refusal tokens this door raises, each the
@@ -353,9 +353,10 @@ impl ResolvedSelection {
 /// instant, so the clock-relative skew dual can never classify a row) and the
 /// typed-column binding (`admission::check_row_column_binding`, #643). Pure:
 /// no directory read, no clock, so the classification is stable — "downgrade
-/// only a STRUCTURALLY detected refusal". The serve filter
-/// ([`servable`]) and the [`PurgeSelection::RefusedToday`] class ask this ONE
-/// predicate.
+/// only a STRUCTURALLY detected refusal". The [`PurgeSelection::RefusedToday`]
+/// class asks this ONE predicate. It is NOT a serve filter: the operator
+/// ruled (#1043, 2026-10-09) that these rows are PURGED through this door,
+/// never withheld in place.
 #[must_use]
 pub fn refused_today(row: &Attestation) -> Option<String> {
     if let Err(e) = super::admission::check_instant_binding(
@@ -369,53 +370,6 @@ pub fn refused_today(row: &Attestation) -> Option<String> {
         return Some(e.to_string());
     }
     None
-}
-
-/// CIRISPersist#1043 — **refuse to serve what we would refuse to admit.** A
-/// held row the apply door would refuse today ([`refused_today`]) is
-/// withheld from every peer: every peer refuses it every round, and serving
-/// it only spends both sides' budget. It stays readable locally and in audit;
-/// this is withholding, never rewriting. Tombstoned rows are withheld by the
-/// SQL of each backend's serve read (they are excluded before the page is
-/// cut).
-#[must_use]
-pub fn servable(row: &Attestation) -> bool {
-    refused_today(row).is_none()
-}
-
-/// The serve page with [`servable`] applied, refilled so that a page of
-/// unservable rows never reads as the end of the stream (an empty page is not
-/// a settled state): raw pages are fetched from the last RAW position until
-/// `limit` servable rows are gathered or the raw stream ends.
-///
-/// # Errors
-///
-/// The underlying read's.
-pub async fn fill_served_page<F, Fut>(
-    since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-    limit: u32,
-    mut fetch: F,
-) -> Result<Vec<ServedAttestation>, Error>
-where
-    F: FnMut(Option<(chrono::DateTime<chrono::Utc>, String)>, u32) -> Fut,
-    Fut: std::future::Future<Output = Result<Vec<ServedAttestation>, Error>>,
-{
-    let want = limit as usize;
-    let mut out: Vec<ServedAttestation> = Vec::new();
-    let mut cursor = since;
-    loop {
-        let page = fetch(cursor.clone(), limit).await?;
-        let full = limit > 0 && page.len() == want;
-        if let Some(last) = page.last() {
-            cursor = Some((last.admitted_at, last.attestation.attestation_id.clone()));
-        }
-        out.extend(page.into_iter().filter(|s| servable(&s.attestation)));
-        if out.len() >= want || !full {
-            break;
-        }
-    }
-    out.truncate(want);
-    Ok(out)
 }
 
 /// Every attestation row, every tier, paged by `attestation_id`, handed to

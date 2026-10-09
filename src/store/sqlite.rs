@@ -13086,6 +13086,8 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         limit: u32,
     ) -> Result<Vec<crate::federation::ServedAttestation>, crate::federation::Error> {
+        let since_at = since.as_ref().map(|(t, _)| t.to_rfc3339());
+        let since_id = since.as_ref().map(|(_, id)| id.clone());
         // v53.0.0 (#975, CC 2.4) — under enforcement a held row of an
         // unregistered type is neither served nor replicated. Read on the
         // calling task, before the closure moves to the pool.
@@ -13095,63 +13097,49 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         )
         .map(|p| format!(" AND {p}"))
         .unwrap_or_default();
-        // v54.1.0 (CIRISPersist#1046 / #1043) — a tombstoned row is excluded in
-        // the SQL (before the page is cut); a row the apply door would refuse
-        // today is withheld by `steward_purge::servable`, and the page is
-        // REFILLED from the last raw position so a run of withheld rows never
-        // reads as the end of the stream.
-        crate::federation::steward_purge::fill_served_page(since, limit, |since, limit| {
-            let row_type_filter = row_type_filter.clone();
-            async move {
-                let since_at = since.as_ref().map(|(t, _)| t.to_rfc3339());
-                let since_id = since.as_ref().map(|(_, id)| id.clone());
-                let (read, bytes) = self
-                    .read_measured(move |conn| -> Result<Vec<_>, rusqlite::Error> {
-                        // E5 invariant: `tier = 'federation'` only — a local-tier
-                        // row must never reach the advertise/serve wire surface.
-                        let mut stmt = conn.prepare(&format!(
-                            "SELECT attestation_id, attesting_key_id, attested_key_id, \
-                            attestation_type, weight, asserted_at, expires_at, \
-                            attestation_envelope, original_content_hash, \
-                            scrub_signature_classical, scrub_signature_pqc, scrub_key_id, \
-                            scrub_timestamp, pqc_completed_at, persist_row_hash, \
-                            subject_key_ids, withdraws_admission_rule, cohort_scope, tier, \
-                            promoted_at, additional_scrubs, {pos} AS _pos \
-                         FROM federation_attestations \
-                         WHERE (?1 IS NULL OR {pos} > ?1 OR ({pos} = ?1 AND attestation_id > ?2)) \
-                           AND tier = 'federation'{row_type_filter} \
-                           AND NOT EXISTS (SELECT 1 FROM purge_tombstones pt \
-                                           WHERE pt.plane = 'attestation' \
-                                             AND pt.record_ref = federation_attestations.attestation_id) \
-                         ORDER BY {pos} ASC, attestation_id ASC LIMIT ?3",
-                            pos = POS_ATTESTATION,
-                        ))?;
-                        let rows =
-                            stmt.query_map(rusqlite::params![since_at, since_id, limit], |row| {
-                                let pos: String = row.get("_pos")?;
-                                Ok(crate::federation::ServedAttestation {
-                                    attestation: sqlite_row_to_attestation(row)?,
-                                    admitted_at: parse_rfc3339(&pos),
-                                })
-                            })?;
-                        rows.collect()
+        let (read, bytes) = self
+            .read_measured(move |conn| -> Result<Vec<_>, rusqlite::Error> {
+                // E5 invariant: `tier = 'federation'` only — a local-tier row
+                // must never reach the advertise/serve wire surface.
+                //
+                // v54.1.0 (CIRISPersist#1046) — a tombstoned row is never
+                // served; excluded in the SQL, before the page is cut.
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT attestation_id, attesting_key_id, attested_key_id, attestation_type, \
+                    weight, asserted_at, expires_at, attestation_envelope, \
+                    original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
+                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, \
+                    subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at, \
+                    additional_scrubs, {pos} AS _pos \
+                 FROM federation_attestations \
+                 WHERE (?1 IS NULL OR {pos} > ?1 OR ({pos} = ?1 AND attestation_id > ?2)) \
+                   AND tier = 'federation'{row_type_filter} \
+                   AND NOT EXISTS (SELECT 1 FROM purge_tombstones pt \
+                                   WHERE pt.plane = 'attestation' \
+                                     AND pt.record_ref = federation_attestations.attestation_id) \
+                 ORDER BY {pos} ASC, attestation_id ASC LIMIT ?3",
+                    pos = POS_ATTESTATION,
+                ))?;
+                let rows = stmt.query_map(rusqlite::params![since_at, since_id, limit], |row| {
+                    let pos: String = row.get("_pos")?;
+                    Ok(crate::federation::ServedAttestation {
+                        attestation: sqlite_row_to_attestation(row)?,
+                        admitted_at: parse_rfc3339(&pos),
                     })
-                    .await;
-                read.map_err(|e| {
-                    crate::federation::Error::Backend(format!("list_attestations_since: {e}"))
-                })
-                .inspect(|rows| {
-                    crate::observe::record_read(
-                        crate::observe::StoreBackend::Sqlite,
-                        crate::observe::Door::ListAttestationsSince,
-                        "*",
-                        rows,
-                        bytes,
-                    )
-                })
-            }
-        })
-        .await
+                })?;
+                rows.collect()
+            })
+            .await;
+        read.map_err(|e| crate::federation::Error::Backend(format!("list_attestations_since: {e}")))
+            .inspect(|rows| {
+                crate::observe::record_read(
+                    crate::observe::StoreBackend::Sqlite,
+                    crate::observe::Door::ListAttestationsSince,
+                    "*",
+                    rows,
+                    bytes,
+                )
+            })
     }
 
     async fn list_signed_identity_occurrence_revocations_since(

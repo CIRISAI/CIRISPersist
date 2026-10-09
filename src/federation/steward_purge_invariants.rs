@@ -28,9 +28,9 @@
 //! - **I656** — the tombstone replicates: a second node applies the served
 //!   bundle after re-verifying it against its OWN root; a bundle with an id
 //!   dropped, a forged cosignature, or unsorted ids is refused.
-//! - **I657** — #1043 class 1: a row the apply door refuses today is selected
-//!   by `refused_today`, and the serve read withholds it without ever handing
-//!   a peer an empty page while servable rows remain.
+//! - **I657** — RETIRED, not reused: it witnessed a #1043 serve filter the
+//!   operator ruled out (2026-10-09: both classes are PURGED through this
+//!   door, never withheld in place). Its selection half is I662.
 //! - **I658** — #1043 class 2 (by actor): the harness identity's key, rows and
 //!   traces are one selection; after finalize its key cannot be re-registered.
 //! - **I659** — #1040's admission refusal `trace_runtime_mock`: a
@@ -40,7 +40,12 @@
 //! - **I660** — the delete doors re-ask the tombstone: an untombstoned row is
 //!   never deleted through them.
 //! - **I661** — from disk: every backend's attestation put, both key doors,
-//!   the serve read and the promotion door carry the purge gates.
+//!   the serve read and the promotion door carry the purge gates, and no
+//!   serve read classifies a row by `refused_today` (#1043's ruling).
+//! - **I662** — #1043 class 1 is a SELECTION: a row the apply door refuses
+//!   today is still served until it is purged; `RefusedToday` selects it and
+//!   every score derived from it (nothing else), the dry run counts per table
+//!   and writes nothing, and once executed the purged rows stop being served.
 
 #[cfg(test)]
 pub(crate) mod bodies {
@@ -893,25 +898,11 @@ pub(crate) mod bodies {
         assert_eq!((again.tombstoned, again.already_tombstoned), (0, 5));
     }
 
-    // ── I657 ──────────────────────────────────────────────────────────────
-    pub(crate) async fn i657_refused_today_is_selected_and_withheld<D: Seams>(d: &D) {
+    // ── I662 ──────────────────────────────────────────────────────────────
+    pub(crate) async fn i662_refused_today_is_a_selection_not_a_filter<D: Seams>(d: &D) {
         root(d).await;
         let dir = d.as_dyn_directory();
-        // The serve position after everything the fixture wrote: the legacy
-        // rows below are the first thing after it.
-        let mut cursor = None;
-        loop {
-            let page = dir
-                .list_attestations_since(cursor.clone(), 50)
-                .await
-                .unwrap();
-            match page.last() {
-                Some(last) => {
-                    cursor = Some((last.admitted_at, last.attestation.attestation_id.clone()))
-                }
-                None => break,
-            }
-        }
+        let t = now();
         let mut legacy = Vec::new();
         for _ in 0..4 {
             let row = put_score(d, BYSTANDER, AGENT, &[]).await;
@@ -933,36 +924,44 @@ pub(crate) mod bodies {
                 "the seam makes a #598 legacy row"
             );
         }
-        // The serve read withholds them, and a page of withheld rows is never
-        // the end of the stream (page size 3 < 4 legacy rows ahead of `good`).
-        let served = served_ids(d).await;
-        for id in &legacy {
+        // Ruled (#1043, 2026-10-09): not a serve filter. Until purged, the
+        // rows are served like any other.
+        let served_before = served_ids(d).await;
+        for id in legacy.iter().chain([&good, &derived]) {
             assert!(
-                !served.contains(id),
-                "I657: a row refused today is not served"
+                served_before.contains(id),
+                "I662: {id} is served until it is purged"
             );
         }
-        assert!(
-            served.contains(&good),
-            "I657: the servable row behind them is reached"
-        );
-        let next = dir.list_attestations_since(cursor, 3).await.unwrap();
-        assert_eq!(
-            next.iter()
-                .map(|s| s.attestation.attestation_id.clone())
-                .collect::<Vec<_>>(),
-            vec![good.clone(), derived.clone()],
-            "I657: the page after four withheld rows is refilled, never empty"
-        );
         // The class selects them, and the score derived from one follows.
-        let dry = sp::purge_dry_run(dir, &PurgeSelection::RefusedToday)
-            .await
-            .unwrap();
+        let sel = PurgeSelection::RefusedToday;
+        let dry = sp::purge_dry_run(dir, &sel).await.unwrap();
         let mut expect: Vec<String> = legacy.iter().map(|l| format!("attestation:{l}")).collect();
         expect.push(format!("attestation:{derived}"));
         expect.sort();
-        assert_eq!(dry.sample, expect, "I657");
-        assert!(!dry.sample.contains(&format!("attestation:{good}")));
+        assert_eq!(dry.sample, expect, "I662: withheld {:?}", dry.withheld);
+        assert_eq!(dry.record_count, 5);
+        assert_eq!(dry.counts.get("federation_attestations"), Some(&5));
+        assert_eq!(dry.counts.len(), 1, "I662: {:?}", dry.counts);
+        assert!(dry.withheld.is_empty(), "{:?}", dry.withheld);
+        assert_eq!(dry.selection_digest, sp::selection_digest(&expect));
+        assert_eq!(
+            served_ids(d).await,
+            served_before,
+            "I662: the dry run writes nothing"
+        );
+        // Executed on the quorum's notice, they stop being served; the row
+        // the class did not select still is.
+        let notice = notice_for(&dry.notice_template, &[cc::FOUNDERS[1], cc::FOUNDERS[2]], t);
+        let report = sp::purge_rows(dir, &sel, &notice, NODE, t)
+            .await
+            .expect("executes");
+        assert_eq!(report.tombstoned.get("attestation"), Some(&5));
+        let served = served_ids(d).await;
+        for id in legacy.iter().chain([&derived]) {
+            assert!(!served.contains(id), "I662: purged {id} is not served");
+        }
+        assert!(served.contains(&good), "I662: an unselected row still is");
     }
 
     // ── I658 ──────────────────────────────────────────────────────────────
@@ -1290,11 +1289,6 @@ mod run {
                     b::i656_the_tombstone_replicates_re_verified(&a, &c).await
                 }
                 #[tokio::test]
-                async fn i657() {
-                    let Some(d) = $fresh.await else { return };
-                    b::i657_refused_today_is_selected_and_withheld(&d).await
-                }
-                #[tokio::test]
                 async fn i658() {
                     let Some(d) = $fresh.await else { return };
                     b::i658_by_actor_and_the_key_cannot_return(&d).await
@@ -1310,6 +1304,11 @@ mod run {
                 async fn i660() {
                     let Some(d) = $fresh.await else { return };
                     b::i660_the_delete_doors_re_ask_the_tombstone(&d).await
+                }
+                #[tokio::test]
+                async fn i662() {
+                    let Some(d) = $fresh.await else { return };
+                    b::i662_refused_today_is_a_selection_not_a_filter(&d).await
                 }
             }
         };
@@ -1389,15 +1388,15 @@ mod run {
                 assert!(gated, "I661 {backend}: {door} refuses a tombstoned key");
             }
             let serve = body(&src, "async fn list_attestations_since(");
-            let withheld = if backend == "memory" {
-                serve.contains("purge_tombstones") && serve.contains("steward_purge::servable(a)")
-            } else {
-                serve.contains("purge_tombstones")
-                    && serve.contains("steward_purge::fill_served_page")
-            };
             assert!(
-                withheld,
-                "I661 {backend}: the serve read withholds tombstoned and unservable rows"
+                serve.contains("purge_tombstones"),
+                "I661 {backend}: the serve read withholds tombstoned rows"
+            );
+            // #1043 ruled: a row refused today is purged, never filtered at
+            // the serve read.
+            assert!(
+                !serve.contains("refused_today") && !serve.contains("steward_purge::"),
+                "I661 {backend}: the serve read classifies no row by refused_today"
             );
         }
         let adm = strip(include_str!("admission.rs"));

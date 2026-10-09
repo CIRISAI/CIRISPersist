@@ -14788,81 +14788,72 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         limit: u32,
     ) -> Result<Vec<crate::federation::ServedAttestation>, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let limit = i64::from(limit);
+        let since_at = since.as_ref().map(|(t, _)| *t);
+        let since_id = since.as_ref().map(|(_, id)| id.clone());
         // E5 invariant: `tier = 'federation'` only — a local-tier row must
         // never reach the advertise/serve wire surface.
         //
         // v53.0.0 (#975, CC 2.4) — under enforcement a held row of an
         // unregistered type is neither served nor replicated.
+        //
+        // v54.1.0 (CIRISPersist#1046) — a tombstoned row is never served;
+        // excluded in the SQL, before the page is cut.
         let row_type_filter = crate::federation::row_type::serve_filter_sql(
             "attestation_type",
             crate::federation::row_type::SqlDialect::Postgres,
         )
         .map(|p| format!(" AND {p}"))
         .unwrap_or_default();
-        // v54.1.0 (CIRISPersist#1046 / #1043) — a tombstoned row is excluded in
-        // the SQL (before the page is cut); a row the apply door would refuse
-        // today is withheld by `steward_purge::servable`, and the page is
-        // REFILLED from the last raw position so a run of withheld rows never
-        // reads as the end of the stream.
-        crate::federation::steward_purge::fill_served_page(since, limit, |since, limit| {
-            let row_type_filter = row_type_filter.clone();
-            async move {
-                let client = self
-                    .get_client()
-                    .await
-                    .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
-                let limit = i64::from(limit);
-                let since_at = since.as_ref().map(|(t, _)| *t);
-                let since_id = since.as_ref().map(|(_, id)| id.clone());
-                let rows = client
-                    .query(
-                        &format!(
-                            "SELECT attestation_id::text, attesting_key_id, attested_key_id, \
-                                attestation_type, \
-                                weight::float8 AS weight, asserted_at, expires_at, \
-                                attestation_envelope, original_content_hash, \
-                                scrub_signature_classical, scrub_signature_pqc, \
-                                scrub_key_id, scrub_timestamp, pqc_completed_at, \
-                                persist_row_hash, subject_key_ids, withdraws_admission_rule, \
-                                cohort_scope, tier, promoted_at, additional_scrubs, admitted_at \
-                             FROM cirislens.federation_attestations fa \
-                             WHERE ($1::timestamptz IS NULL OR \
-                                    (admitted_at, attestation_id::text) > ($1, $2)) \
-                               AND tier = 'federation'{row_type_filter} \
-                               AND NOT EXISTS (SELECT 1 FROM cirislens.purge_tombstones pt \
-                                               WHERE pt.plane = 'attestation' \
-                                                 AND pt.record_ref = fa.attestation_id::text) \
-                             ORDER BY admitted_at ASC, attestation_id ASC LIMIT $3"
-                        ),
-                        &[&since_at, &since_id, &limit],
-                    )
-                    .await
-                    .map_err(|e| {
-                        crate::federation::Error::Backend(format!("list_attestations_since: {e}"))
-                    })?;
-                let bytes = pg_envelope_bytes(&rows);
-                rows.into_iter()
-                    .map(|row| {
-                        let admitted_at =
-                            row.safe_get_with("admitted_at", crate::federation::Error::Backend)?;
-                        Ok(crate::federation::ServedAttestation {
-                            attestation: pg_row_to_attestation(row)?,
-                            admitted_at,
-                        })
-                    })
-                    .collect::<Result<Vec<_>, _>>()
-                    .inspect(|rows| {
-                        crate::observe::record_read(
-                            crate::observe::StoreBackend::Postgres,
-                            crate::observe::Door::ListAttestationsSince,
-                            "*",
-                            rows,
-                            bytes,
-                        )
-                    })
-            }
-        })
-        .await
+        let rows = client
+            .query(
+                &format!(
+                    "SELECT attestation_id::text, attesting_key_id, attested_key_id, \
+                        attestation_type, \
+                        weight::float8 AS weight, asserted_at, expires_at, attestation_envelope, \
+                        original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
+                        scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, \
+                        subject_key_ids, withdraws_admission_rule, cohort_scope, tier, \
+                        promoted_at, additional_scrubs, admitted_at \
+                     FROM cirislens.federation_attestations fa \
+                     WHERE ($1::timestamptz IS NULL OR \
+                            (admitted_at, attestation_id::text) > ($1, $2)) \
+                       AND tier = 'federation'{row_type_filter} \
+                       AND NOT EXISTS (SELECT 1 FROM cirislens.purge_tombstones pt \
+                                       WHERE pt.plane = 'attestation' \
+                                         AND pt.record_ref = fa.attestation_id::text) \
+                     ORDER BY admitted_at ASC, attestation_id ASC LIMIT $3"
+                ),
+                &[&since_at, &since_id, &limit],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("list_attestations_since: {e}"))
+            })?;
+        let bytes = pg_envelope_bytes(&rows);
+        rows.into_iter()
+            .map(|row| {
+                let admitted_at =
+                    row.safe_get_with("admitted_at", crate::federation::Error::Backend)?;
+                Ok(crate::federation::ServedAttestation {
+                    attestation: pg_row_to_attestation(row)?,
+                    admitted_at,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .inspect(|rows| {
+                crate::observe::record_read(
+                    crate::observe::StoreBackend::Postgres,
+                    crate::observe::Door::ListAttestationsSince,
+                    "*",
+                    rows,
+                    bytes,
+                )
+            })
     }
 
     async fn list_signed_identity_occurrence_revocations_since(

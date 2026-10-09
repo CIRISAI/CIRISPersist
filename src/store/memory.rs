@@ -10574,13 +10574,10 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                     // an unregistered type is neither served nor replicated.
                     && crate::federation::row_type::served_under_enforcement(a)
                     // v54.1.0 (CIRISPersist#1046) — a tombstoned row is never
-                    // served; (#1043) nor is one the apply door would refuse
-                    // today. Filtered BEFORE the page is cut, so a page of
-                    // withheld rows never reads as the end of the stream.
+                    // served; filtered BEFORE the page is cut.
                     && !state.purge_tombstones.keys().any(|(_, p, r)| {
                         p == "attestation" && *r == a.attestation_id
                     })
-                    && crate::federation::steward_purge::servable(a)
                     && since.as_ref().is_none_or(|(s_at, s_id)| {
                         (position(a), a.attestation_id.as_str()) > (*s_at, s_id.as_str())
                     })
