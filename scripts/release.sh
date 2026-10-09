@@ -9,13 +9,15 @@
 # `## [<version>] - UNRELEASED` written. Stages (docs/RELEASE.md has the why):
 #
 #   1 preflight   clean tree, branch is not `v<version>`, Cargo.toml at the
-#                 previous section's version, the UNRELEASED header present
+#                 previous section's version, the UNRELEASED header present,
+#                 a gh with `gh attestation` (2.49+; GH=/path/to/gh) for stage 9
 #   2 cheap       the five no-backend axes, the pyo3 lane, both clippy passes,
 #                 pyi_surface — the legs certify most often goes red on late
 #   3 bump        Cargo version, evidence/cc_impl.tsv re-stamp (count
 #                 asserted), CHANGELOG date, `cargo check`, the release commit
 #   4 pr          push the branch, open (or reuse) the PR
-#   5 certify     `LANES=${LANES:-1} scripts/certify.sh full`
+#   5 certify     `LANES=${LANES:-1} scripts/certify.sh full`, once no foreign
+#                 cargo has run for 60 s (waits up to RELEASE_STRAY_WAIT_SECS)
 #   6 prci        wait for the PR's CI run green (auto-retry reruns respected)
 #   7 codex       wait (CODEX_TIMEOUT_SECS, default 30 min) for Codex's review of
 #                 HEAD; stop on any finding on HEAD; fail OPEN, loudly, if no
@@ -100,6 +102,8 @@ preflight() {
     grep -qxF "## [$ver] - UNRELEASED" CHANGELOG.md || why="CHANGELOG lacks the header '## [$ver] - UNRELEASED'"
     [ "$cargo_ver" = "$prev" ] || why="Cargo.toml is at $cargo_ver, expected the previous release $prev"
     git ls-remote --exit-code origin "refs/tags/v$ver" >/dev/null 2>&1 && why="tag v$ver already exists on origin"
+    rl_gh_has_attestation "${GH:-gh}" \
+        || why="gh at '$(command -v "${GH:-gh}" || echo "${GH:-gh}")' ($("${GH:-gh}" --version 2>/dev/null | head -1)) has no 'gh attestation'; release_finish.sh needs gh 2.49+ — set GH=/path/to/newer/gh (#1045)"
     [ -z "$why" ] || { echo "PREFLIGHT: $why"; return 20; }
     echo "preflight: $prev → $ver on $branch"
 }
@@ -138,6 +142,9 @@ fi
 
 rustflags="$(rl_ci_rustflags)" || { echo "cannot derive RUSTFLAGS from ci.yml"; exit 21; }
 export RUSTFLAGS="$rustflags"
+# 32 cores and 31 GB here: cargo at -j32 was reaped for memory three times
+# during v53.2.0 (#1045 item 2). An environment value wins.
+export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-6}"
 
 # ── 2. cheap legs ───────────────────────────────────────────────────────
 head_sha() { git rev-parse HEAD; }
@@ -218,6 +225,10 @@ pr="$(rl_get "$S" pr)"
 # ── 5. certify ──────────────────────────────────────────────────────────
 certify() {
     local rc
+    # Wait out a foreign cargo instead of letting certify's stray guard
+    # refuse (#1045 item 3); bounded, then 24 as before.
+    rl_wait_quiet_cargo "${RELEASE_QUIET_SECS:-60}" "${RELEASE_STRAY_WAIT_SECS:-7200}" "${RELEASE_STRAY_POLL_SECS:-15}" \
+        || { echo "CERTIFY NOT STARTED: foreign cargo still running after $(( ${RELEASE_STRAY_WAIT_SECS:-7200} / 60 )) min"; return 24; }
     echo "LANES=${LANES:-1} scripts/certify.sh full → $S/certify.log"
     LANES="${LANES:-1}" scripts/certify.sh full < /dev/null > "$S/certify.log" 2>&1; rc=$?
     tail -45 "$S/certify.log"
@@ -300,4 +311,4 @@ fi
 
 # ── 9. stop ─────────────────────────────────────────────────────────────
 echo "=== RELEASE_TAGGED v$ver — tag CI run $(rl_get "$S" tag_run) ==="
-echo "finish with:  scripts/release_finish.sh $ver $(rl_get "$S" tag_run)"
+echo "finish with:  ${GH:+GH=$GH }scripts/release_finish.sh $ver $(rl_get "$S" tag_run)"

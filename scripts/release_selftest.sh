@@ -394,6 +394,36 @@ grep -q 'rl_put "$S" branch "$branch"' scripts/release.sh && ok "release.sh reco
 # shellcheck disable=SC2016  # literal: grep text, not an expansion
 grep -q 'rl_put "$S" bump_sha "$(head_sha)"' scripts/release.sh && ok "release.sh records the release commit at bump" || bad "release.sh does not record the release commit"
 
+echo "gh attestation at preflight (#1045 item 1)"
+mkdir -p "$t/gh-old" "$t/gh-new"
+printf '#!/bin/sh\ncase "$1" in --version) echo "gh version 2.45.0";; *) echo "unknown command \\"$1\\" for \\"gh\\"" >&2; exit 1;; esac\n' > "$t/gh-old/gh"
+printf '#!/bin/sh\n[ "$1 $2 $3" = "attestation verify --help" ] && exit 0; exit 1\n' > "$t/gh-new/gh"
+chmod +x "$t/gh-old/gh" "$t/gh-new/gh"
+if rl_gh_has_attestation "$t/gh-old/gh"; then bad "gh 2.45 (no attestation) passes the probe"; else ok "gh 2.45 (no attestation) fails the probe"; fi
+if rl_gh_has_attestation "$t/gh-new/gh"; then ok "a gh with 'attestation verify' passes the probe"; else bad "a gh with 'attestation verify' fails the probe"; fi
+if rl_gh_has_attestation "$t/no-such-gh"; then bad "a missing gh passes the probe"; else ok "a missing gh fails the probe"; fi
+# shellcheck disable=SC2016  # literal: grep text, not an expansion
+sed -n '/^preflight() {/,/^}/p' scripts/release.sh | grep -q 'rl_gh_has_attestation "${GH:-gh}"' \
+    && ok "release.sh preflight asks the gh probe, GH= honoured" || bad "release.sh preflight does not ask the gh probe"
+
+echo "certify waits for foreign cargo (#1045 item 3)"
+# A pgrep shim that reports a cargo for the first N calls, then none.
+cat > "$t/pgrep-n" <<'PGEOF'
+#!/bin/sh
+n=$(cat "$PG_COUNT" 2>/dev/null || echo 0); echo $((n + 1)) > "$PG_COUNT"
+[ "$n" -lt "$PG_BUSY" ] && echo "4242 cargo build --release"
+exit 0
+PGEOF
+chmod +x "$t/pgrep-n"
+wq() { rm -f "$t/pg-count"; out="$(PG_COUNT="$t/pg-count" PG_BUSY="$1" RL_PGREP="$t/pgrep-n" rl_wait_quiet_cargo "$2" "$3" 1 2>&1)"; rc=$?; calls=$(cat "$t/pg-count"); }
+wq 0 3 10; expect_eq "no foreign cargo: start at once" "$rc/$calls" "0/1"
+wq 2 3 10; expect_eq "a cargo for 2 polls: wait, then 3 quiet polls" "$rc" "0"
+case "$out" in *"waiting for foreign cargo"*"4242 cargo build"*) ok "the wait names the process";; *) bad "wait text: $out";; esac
+wq 1000 3 5; expect_eq "a cargo that never stops: give up at the bound (1)" "$rc" "1"
+# shellcheck disable=SC2016  # literal: grep text, not an expansion
+sed -n '/^certify() {/,/^}/p' scripts/release.sh | grep -q 'rl_wait_quiet_cargo' \
+    && ok "release.sh certify stage waits before certify.sh" || bad "release.sh certify stage does not wait"
+
 echo "syntax"
 for f in scripts/release.sh scripts/release_ship.sh scripts/release_finish.sh scripts/release_lib.sh scripts/release_selftest.sh; do
     if bash -n "$f"; then ok "bash -n $f"; else bad "bash -n $f"; fi

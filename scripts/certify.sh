@@ -221,6 +221,9 @@ CI_RUSTFLAGS="$(ci_rustflags)" || {
     echo "  Certifying with weaker flags than CI is how a green verdict lies." >&2
     exit 2; }
 export RUSTFLAGS="$CI_RUSTFLAGS"
+# v54.1.0 (CIRISPersist#1045 item 2) — 32 cores and 31 GB here: cargo at -j32
+# was reaped for memory three times during v53.2.0. An environment value wins.
+export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-6}"
 
 feature_csv() { ci_feature_csv "$1"; }
 needs_pg() { python3 scripts/ci_feature_matrix.py set "$1" | grep -qw postgres; }
