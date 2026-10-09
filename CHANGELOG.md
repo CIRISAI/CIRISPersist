@@ -45,6 +45,33 @@ Witnesses in `scripts/bits_changed_test.sh`, now 83 of 83. The fake signer answe
 
 The STREAM-nonce change above is mutation-checked as well. The read door ignoring `storage_seq` reds I561, I562 and I310. Dropping the nonce recompute reds I561 and I319. The seal dropping `caller_aad` reds I561, I562 and `round_trips`.
 
+### Fixed — the licence and grant walks honour a term, and a licence is judged at its signed `asserted_at` (#1032)
+
+Ruled at #1036 item 2: authority is judged at the row's signed `asserted_at`, never at receipt, and the `license` and `grant` walks honour `delegation_valid_from` and `delegation_valid_until` at that instant (CC 2.1, CC 4.4.3.2.8 C, CC 4.5.5).
+
+- **The lens reads the edge's signed term.** The `as_of` lens from #908 now also reads `delegation_valid_from`, `delegation_valid_until` and the older `valid_until` spelling from the `delegates_to` envelope, at the same instant as `expires_at`. A term that is present but is not an RFC 3339 instant makes the edge not live, so expiry fails toward less authority. This also applies to the moderation walk read at an instant (`moderation_reach_of_at`), where a lapsed `moderate` term is a moderator lapse (FSD-005 §4).
+- **The instant-less `license` and `grant` reads judge now.** `reachable_under_scope`, its `_with_reasons` twin and the enumeration no longer walk the timeless graph for these two scopes. Before, a term-bound officer never lapsed for licence or grant authority. The other duty scopes keep the pre-v49 default lens.
+- **The licensure door and fold judge at the row's `asserted_at`.** The door judged the chain at receipt, and the fold checked the named edge's instant and then resolved the emitter on the current graph. Now both walk the `license` chain under the lens at the licence's signed instant. A licence signed while its officer's term was open is admitted even after the term has closed, and a later withdrawal of a link stops future issuance without reclassifying licences already issued.
+
+Witnesses in `src/federation/licensure_chain_invariants.rs`, each on memory, sqlite and postgres:
+
+- **Term-bound officer** (`term_bound_officer_lapses_for_licence_1032_*`). Six arms run through the real put door. An in-term licence received after the term admits and folds. A licence after the term, one dated before the appointment, one under a term not yet begun, one under a lapsed `valid_until`, and one under an unreadable term are all refused and not stored.
+- **Withdrawal** (`withdrawal_does_not_reclassify_issued_licence_1032_*`). The officer's licence stays in the board's fold after the board withdraws the officer, and the officer's next issuance is refused.
+- **Grant** (`grant_walk_honours_the_term_1032_*`). An open term confers `grant`, while a lapsed term and a term not yet begun confer nothing.
+
+Mutation-checked, each mutant red on memory and sqlite:
+
+| Mutant | Witnesses red |
+|---|---|
+| the lens drops the envelope term | term-bound officer, grant |
+| the door judges at receipt | term-bound officer, in-term arm |
+| the fold resolves the current graph | term-bound officer, withdrawal |
+| the `grant` read walks the timeless graph | grant |
+| `delegation_valid_from` ignored | term-bound officer, grant |
+| only `delegation_valid_until` read | term-bound officer, `valid_until` arm |
+| an unreadable term read as absent | term-bound officer, unreadable arm |
+| the instant lens dropped from the shared chain walk | term-bound officer, withdrawal |
+
 ## [53.2.0] - 2026-10-08
 
 ### Changed — the tag is pushed once main's run EXISTS, not once it completes (#1008)

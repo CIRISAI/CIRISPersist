@@ -3635,7 +3635,47 @@ pub async fn row_was_issued_under_authority(
     {
         return Ok(false);
     }
-    emitter_resolves_to_authority(directory, &row.attesting_key_id, authority_id).await
+    // v54.0.0 (CIRISPersist#1032, #1036 ruling item 2) — the chain is judged
+    // at the row's SIGNED `asserted_at`, never at receipt and never on the
+    // current graph: a withdrawal (or a lapsed term) after issuance stops
+    // FUTURE issuance and does not reclassify a licence already issued.
+    emitter_resolves_to_authority_at(
+        directory,
+        &row.attesting_key_id,
+        authority_id,
+        row.asserted_at,
+    )
+    .await
+}
+
+/// v54.0.0 (CIRISPersist#1032) — [`emitter_resolves_to_authority`] judged AT
+/// `as_of`: every link of the `license` chain must be live at that instant
+/// (asserted by it, unexpired at it, its signed term open at it, and not
+/// retracted by it).
+async fn emitter_resolves_to_authority_at(
+    directory: &dyn super::FederationDirectory,
+    attester: &str,
+    authority_id: &str,
+    as_of: chrono::DateTime<chrono::Utc>,
+) -> Result<bool, Error> {
+    if attester == authority_id {
+        return Ok(true);
+    }
+    let targets: std::collections::HashSet<String> = std::iter::once(attester.to_owned()).collect();
+    Ok(scoped_delegation_reach_at(
+        directory,
+        authority_id,
+        &targets,
+        DELEGATION_SCOPE_LICENSE,
+        MAX_MODERATION_DELEGATION_DEPTH,
+        DelegationWalkPolicy::MODERATION_DUTY,
+        DelegationWalkLens {
+            as_of: Some(as_of),
+            ..DelegationWalkLens::default()
+        },
+    )
+    .await?
+    .hit_target)
 }
 
 /// v42.0.0 (CIRISPersist#814, CC 2.4.1.2.1 / CC 3.3.9) — **does `attester`
@@ -3739,15 +3779,15 @@ pub async fn check_licensure_delegator_is_authority(
         return Ok(());
     };
     let _ = delegation_id;
-    let targets: std::collections::HashSet<String> =
-        std::iter::once(row.attesting_key_id.clone()).collect();
-    let reaches = issuer_reaches_target_via_scoped_delegation(
+    // v54.0.0 (CIRISPersist#1032) — judged at the row's signed `asserted_at`
+    // (a stamped instant belongs to the SIGNER), not at receipt: a chain live
+    // when the licence was signed admits it even if a link has lapsed since,
+    // and a chain whose link had lapsed (or not yet begun) by then does not.
+    let reaches = emitter_resolves_to_authority_at(
         directory,
+        &row.attesting_key_id,
         authority_id,
-        &targets,
-        DELEGATION_SCOPE_LICENSE,
-        MAX_MODERATION_DELEGATION_DEPTH,
-        DelegationWalkPolicy::MODERATION_DUTY,
+        row.asserted_at,
     )
     .await?;
     if reaches {
@@ -7124,6 +7164,21 @@ async fn scoped_delegation_reach(
     max_depth: usize,
     policy: DelegationWalkPolicy,
 ) -> Result<ScopedReach, Error> {
+    // v54.0.0 (CIRISPersist#1032, CC 2.1 / CC 4.5.5) — the ISSUANCE scopes
+    // never walk the timeless default lens. A `license` / `grant` chain is
+    // live only if every link is live at the instant asked about, and a walk
+    // that names no instant is asking about NOW (the reader's own clock: there
+    // is no signed instant on a bare reachability question). A caller judging
+    // a SIGNED row passes that row's `asserted_at` through
+    // [`scoped_delegation_reach_at`] instead — never this wrapper.
+    let lens = if is_issuance_scope(scope_token) {
+        DelegationWalkLens {
+            as_of: Some(chrono::Utc::now()),
+            ..DelegationWalkLens::default()
+        }
+    } else {
+        DelegationWalkLens::default()
+    };
     scoped_delegation_reach_at(
         directory,
         issuer,
@@ -7131,9 +7186,17 @@ async fn scoped_delegation_reach(
         scope_token,
         max_depth,
         policy,
-        DelegationWalkLens::default(),
+        lens,
     )
     .await
+}
+
+/// v54.0.0 (CIRISPersist#1032) — the two scopes that confer ISSUANCE
+/// ([`DELEGATION_SCOPE_LICENSE`], [`DELEGATION_SCOPE_GRANT`]): their walks
+/// are always read at an instant, so a term-bound officer lapses (CC 2.1,
+/// CC 4.4.3.2.8 C). The other duty scopes keep the pre-v49 timeless default.
+fn is_issuance_scope(scope_token: &str) -> bool {
+    scope_token == DELEGATION_SCOPE_LICENSE || scope_token == DELEGATION_SCOPE_GRANT
 }
 
 /// The scoped walk's cap probe (CIRISPersist#928; PR #921 review F4): does
@@ -7212,6 +7275,59 @@ struct DelegationWalkLens<'a> {
     root_authority: Option<&'a [AuthorityInterval]>,
 }
 
+/// v54.0.0 (CIRISPersist#1032, CC 4.4.3.2.8 C) — the `delegates_to`
+/// envelope member that opens an edge's term: the edge confers nothing
+/// before this instant.
+pub const DELEGATION_VALID_FROM_FIELD: &str = "delegation_valid_from";
+
+/// v54.0.0 (CIRISPersist#1032, CC 4.4.3.2.8 C) — the `delegates_to`
+/// envelope member that closes an edge's term (a term-bound officer). The
+/// older spelling [`crate::federation::capacity::binding_field::VALID_UNTIL`]
+/// (`valid_until`, CC 2.1) is read beside it: both name the same upper bound
+/// (`namespace_supersets.json` lists `delegation_valid_until` as an alias of
+/// the canonical `valid_until`).
+pub const DELEGATION_VALID_UNTIL_FIELD: &str = "delegation_valid_until";
+
+/// v54.0.0 (CIRISPersist#1032, #1036 ruling item 2) — is a `delegates_to`
+/// envelope's signed TERM open at `t`?
+///
+/// * `delegation_valid_from` (when present) must be `<= t`;
+/// * `delegation_valid_until` and `valid_until` (when present) must be `> t`
+///   (half-open, the same boundary as `expires_at`).
+///
+/// A member that is present but is not an RFC 3339 instant makes the edge
+/// NOT live: a term nobody can read cannot be judged open, and expiry must
+/// fail toward LESS authority (`namespace_supersets.json`, `valid_until`
+/// asymmetry note). An absent member bounds nothing.
+fn delegation_term_live_at(envelope: &serde_json::Value, t: chrono::DateTime<chrono::Utc>) -> bool {
+    let instant = |field: &str| -> Option<Option<chrono::DateTime<chrono::Utc>>> {
+        match envelope.get(field) {
+            None | Some(serde_json::Value::Null) => Some(None),
+            Some(v) => v
+                .as_str()
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map(|d| Some(d.with_timezone(&chrono::Utc))),
+        }
+    };
+    let Some(from) = instant(DELEGATION_VALID_FROM_FIELD) else {
+        return false;
+    };
+    if from.is_some_and(|f| f > t) {
+        return false;
+    }
+    for field in [
+        DELEGATION_VALID_UNTIL_FIELD,
+        crate::federation::capacity::binding_field::VALID_UNTIL,
+    ] {
+        match instant(field) {
+            None => return false,
+            Some(Some(until)) if until <= t => return false,
+            Some(_) => {}
+        }
+    }
+    true
+}
+
 impl DelegationWalkLens<'_> {
     /// Was a row asserted at or before the lens instant? Always true unset.
     fn asserted_by(&self, row: &super::Attestation) -> bool {
@@ -7234,6 +7350,13 @@ impl DelegationWalkLens<'_> {
                 return false;
             }
             if edge.expires_at.is_some_and(|x| x <= t) {
+                return false;
+            }
+            // v54.0.0 (CIRISPersist#1032, CC 2.1 / CC 4.4.3.2.8 C) — the
+            // edge's own signed TERM, read at the same instant. Before this a
+            // term-bound officer never lapsed under any lens that read only
+            // the row's `expires_at` column.
+            if !delegation_term_live_at(&edge.attestation_envelope, t) {
                 return false;
             }
         }
