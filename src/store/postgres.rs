@@ -37832,15 +37832,16 @@ mod tests {
             .map(|m| m.key_id)
             .collect();
         assert!(active.contains(&carol));
-        // Shared roster: identical via the `community` cohort.
-        let via_community: Vec<String> = backend
-            .active_members(Cohort::Community, &coop)
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|m| m.key_id)
-            .collect();
-        assert_eq!(active, via_community);
+        // v54.0.0 (Codex round 2 on PR #1050) — the roster is shared storage,
+        // but the record declares `affiliations`: read under `community` it is
+        // refused, never answered with the same roster (I606).
+        assert!(
+            matches!(
+                backend.active_members(Cohort::Community, &coop).await,
+                Err(crate::federation::Error::AffiliationCohortMismatch { .. })
+            ),
+            "an affiliation read under the community cohort is a cohort mismatch"
+        );
 
         assert_eq!(
             backend

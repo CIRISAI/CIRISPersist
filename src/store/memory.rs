@@ -20331,17 +20331,15 @@ mod tests {
             active.contains(&"ob-joiner".to_string()),
             "added member visible via the affiliations cohort"
         );
-        // Identical to reading via the `community` cohort (shared machinery).
-        let active_via_community: Vec<String> = backend
-            .active_members(Cohort::Community, group)
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|m| m.key_id)
-            .collect();
-        assert_eq!(
-            active, active_via_community,
-            "affiliations and community read the SAME roster"
+        // v54.0.0 (Codex round 2 on PR #1050) — the roster is shared storage,
+        // but the record declares `affiliations`: read under `community` it is
+        // refused, never answered with the same roster (I606).
+        assert!(
+            matches!(
+                backend.active_members(Cohort::Community, group).await,
+                Err(crate::federation::Error::AffiliationCohortMismatch { .. })
+            ),
+            "an affiliation read under the community cohort is a cohort mismatch"
         );
 
         // ── revoke via the affiliations cohort → epoch bump (forward secrecy) ─

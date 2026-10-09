@@ -20,6 +20,15 @@
 //!   record: resolution (explicit, else preset, else the no-op default) and
 //!   one refusal per validation rule; an invalid record is refused at founding
 //!   and on supersession.
+//! - **I606** (memory, sqlite, postgres; Codex round 2 on PR #1050) — the
+//!   discriminator on the uniform READS. `lookup_group`, `active_members`,
+//!   `active_member_keys` and `groups_of` merged both variants, so an
+//!   objection labelled as an affiliation's was evaluated against a community
+//!   of the same id, and the FFI lookup and list reported `community` for an
+//!   affiliation. Each read now refuses a held record of the other cohort
+//!   `federation_affiliation_cohort_mismatch`, a reverse lookup lists each
+//!   record under its own cohort only, and a looked-up record reports the
+//!   cohort it declares.
 //! - **I595** (memory, sqlite, postgres) — the replicated amendment path: an
 //!   affiliation amended by quorum on A and applied on B records its prior
 //!   version under `affiliations` on B, and a replicated version relabelling
@@ -203,6 +212,102 @@ pub mod bodies {
             "{tag} I592: the prior version is recorded under `affiliations`: {history:?}"
         );
         Ok(())
+    }
+
+    /// **I606** — see the module doc.
+    pub async fn i606_the_uniform_reads_are_cohort_checked(d: &dyn FederationDirectory, tag: &str) {
+        let (plain, aff) = (format!("{tag}-plain"), format!("{tag}-aff"));
+        let (f, m) = (format!("{tag}-founder"), format!("{tag}-member"));
+        users(d, &[&f, &m]).await;
+        found(d, record(&plain, &[&f, &m], None))
+            .await
+            .expect("I606: a plain community founds");
+        found(d, record(&aff, &[&f, &m], Some(affiliation_blob(None))))
+            .await
+            .expect("I606: an affiliation founds");
+
+        // The point reads refuse the other cohort, both directions.
+        for (id, declared, addressed, cohort) in [
+            (&plain, "community", "affiliations", Cohort::Affiliations),
+            (&aff, "affiliations", "community", Cohort::Community),
+        ] {
+            expect_mismatch(
+                d.lookup_group(cohort, id).await,
+                declared,
+                addressed,
+                &format!("I606: lookup_group({addressed}) on a held {declared}"),
+            );
+            expect_mismatch(
+                d.active_members(cohort, id).await,
+                declared,
+                addressed,
+                &format!("I606: active_members({addressed}) on a held {declared}"),
+            );
+            expect_mismatch(
+                d.active_member_keys(cohort, id).await,
+                declared,
+                addressed,
+                &format!("I606: active_member_keys({addressed}) on a held {declared}"),
+            );
+        }
+        // The right cohort reads, and reports the cohort the record declares
+        // (what the FFI lookup serializes).
+        for (id, cohort) in [(&plain, Cohort::Community), (&aff, Cohort::Affiliations)] {
+            let g = d
+                .lookup_group(cohort, id)
+                .await
+                .expect("I606: the right cohort reads")
+                .expect("I606: held");
+            assert_eq!(
+                g.cohort, cohort,
+                "I606: lookup_group reports the declared cohort"
+            );
+            assert_eq!(
+                d.active_members(cohort, id).await.expect("roster").len(),
+                2,
+                "I606: active_members under the declared cohort"
+            );
+        }
+        // The reverse lookup lists each record under its own cohort only.
+        for (cohort, mine, other) in [
+            (Cohort::Community, &plain, &aff),
+            (Cohort::Affiliations, &aff, &plain),
+        ] {
+            let gs = d.groups_of(cohort, &f).await.expect("groups_of");
+            let ids: Vec<&str> = gs.iter().map(|g| g.group_key_id.as_str()).collect();
+            assert!(
+                ids.contains(&mine.as_str()) && !ids.contains(&other.as_str()),
+                "I606: groups_of({}) lists {mine} and not {other}: {ids:?}",
+                cohort.as_str()
+            );
+            assert!(
+                gs.iter().all(|g| g.cohort == cohort),
+                "I606: every group groups_of({}) lists reports that cohort: {gs:?}",
+                cohort.as_str()
+            );
+        }
+        // reverse_quorum's cohort_state: an objection labelled as an
+        // affiliation's, naming the plain community, is refused.
+        let id = uuid::Uuid::new_v4().to_string();
+        let mut objection = ts::bare_attestation(
+            &id,
+            &m,
+            &f,
+            &crate::federation::reverse_quorum::objection_envelope(
+                Cohort::Affiliations,
+                &plain,
+                "i606-some-action",
+                "i606 grounds",
+            ),
+        );
+        objection.attestation_type = attestation_type::SCORES.to_owned();
+        ts::seal_row_in_place(&m, &mut objection);
+        expect_mismatch(
+            crate::federation::reverse_quorum::record_objection(d, &objection).await,
+            "community",
+            "affiliations",
+            "I606: an objection labelled as an affiliation's, naming a community",
+        );
     }
 
     /// **I593** — see the module doc.
@@ -655,6 +760,15 @@ mod run {
                     super::super::bodies::i593_the_cohort_is_declared(
                         &d as &dyn FederationDirectory,
                         &format!("i593-{}", super::suffix()),
+                    )
+                    .await
+                }
+                #[tokio::test(flavor = "multi_thread")]
+                async fn i606() {
+                    let Some(d) = $fresh.await else { return };
+                    super::super::bodies::i606_the_uniform_reads_are_cohort_checked(
+                        &d as &dyn FederationDirectory,
+                        &format!("i606-{}", super::suffix()),
                     )
                     .await
                 }

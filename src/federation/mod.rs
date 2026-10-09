@@ -6339,12 +6339,18 @@ pub trait FederationDirectory: Send + Sync {
                 .map(cohort::RosterMember::from)
                 .collect(),
             // CC 4.4.3.2.8 / #308: `affiliations` shares the community roster.
-            cohort::Cohort::Community | cohort::Cohort::Affiliations => self
-                .active_community_members(group_key_id)
-                .await?
-                .into_iter()
-                .map(cohort::RosterMember::from)
-                .collect(),
+            // v54.0.0 (Codex round 2 on PR #1050) — but a held record is ONE of
+            // the two (CIRISPersist#1034): read under the other cohort, it is
+            // refused `federation_affiliation_cohort_mismatch`, never answered
+            // with the other variant's roster.
+            cohort::Cohort::Community | cohort::Cohort::Affiliations => {
+                affiliation_config::check_group_cohort(self, cohort, group_key_id).await?;
+                self.active_community_members(group_key_id)
+                    .await?
+                    .into_iter()
+                    .map(cohort::RosterMember::from)
+                    .collect()
+            }
             cohort::Cohort::SelfId => self
                 .list_identity_occurrences_active(group_key_id)
                 .await?
@@ -6467,10 +6473,20 @@ pub trait FederationDirectory: Send + Sync {
                 .await?
                 .map(cohort::GroupRef::from),
             // CC 4.4.3.2.8 / #308: `affiliations` resolves via the community row.
-            cohort::Cohort::Community | cohort::Cohort::Affiliations => self
-                .lookup_community(group_key_id)
-                .await?
-                .map(cohort::GroupRef::from),
+            // v54.0.0 (Codex round 2 on PR #1050) — the held record must declare
+            // `cohort`, and the reference reports the cohort it declares.
+            cohort::Cohort::Community | cohort::Cohort::Affiliations => {
+                match self.lookup_community(group_key_id).await? {
+                    Some(c) => {
+                        affiliation_config::check_record_is(&c, cohort)?;
+                        Some(cohort::GroupRef {
+                            cohort,
+                            ..cohort::GroupRef::from(c)
+                        })
+                    }
+                    None => None,
+                }
+            }
             cohort::Cohort::SelfId => {
                 self.lookup_public_key(group_key_id)
                     .await?
@@ -6503,12 +6519,24 @@ pub trait FederationDirectory: Send + Sync {
                 .map(cohort::GroupRef::from)
                 .collect(),
             // CC 4.4.3.2.8 / #308: `affiliations` shares the community reverse lookup.
-            cohort::Cohort::Community | cohort::Cohort::Affiliations => self
-                .list_communities_for_member_active(member_key_id)
-                .await?
-                .into_iter()
-                .map(cohort::GroupRef::from)
-                .collect(),
+            // v54.0.0 (Codex round 2 on PR #1050) — filtered to the records that
+            // DECLARE `cohort`, each reported under it. A record whose declared
+            // cohort does not parse is a refusal, not a silent omission.
+            cohort::Cohort::Community | cohort::Cohort::Affiliations => {
+                let mut out = Vec::new();
+                for c in self
+                    .list_communities_for_member_active(member_key_id)
+                    .await?
+                {
+                    if affiliation_config::declared_cohort(&c)? == cohort {
+                        out.push(cohort::GroupRef {
+                            cohort,
+                            ..cohort::GroupRef::from(c)
+                        });
+                    }
+                }
+                out
+            }
             cohort::Cohort::SelfId => self
                 .lookup_identity_for_occurrence(member_key_id)
                 .await?
