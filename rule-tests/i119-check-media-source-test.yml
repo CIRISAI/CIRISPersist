@@ -1,0 +1,12 @@
+id: i119-check-media-source
+valid:
+  - |
+    fn a() { // check_media_source(x);
+    }
+  - |
+    fn a() { check_media_source_v2(x); }
+invalid:
+  - |
+    fn a() { check_media_source(&env)?; }
+  - |
+    fn a() { self.check_media_source(x); }

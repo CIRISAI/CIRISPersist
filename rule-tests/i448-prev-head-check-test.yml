@@ -1,0 +1,10 @@
+id: i448-prev-head-check
+valid:
+  - |
+    fn other() { check_prev_head_names_held(x); }
+  - |
+    fn supersede_group_row() { // check_prev_head_names_held(x);
+    }
+invalid:
+  - |
+    async fn supersede_group_row(&self) { if a { check_prev_head_names_held(x)?; } }

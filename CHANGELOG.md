@@ -97,6 +97,43 @@ sqlite, postgres).
 
 ## [54.0.0] - 2026-10-09
 
+### Changed — seven from-disk absence guards ported to ast-grep; test-only code is a node, not a brace count (#1026)
+
+v54.0.0's I14 false red came from a text stripper that knew `#[cfg(test)]` and read a
+`#[cfg(all(test, …))]` module as production. The ported rules select test-only code
+structurally: `utils/test-gated.yml` matches a node that follows (past other attributes and
+comments) `#[cfg(test)]`, `#[cfg(all(test, …))]`, `#[test]` or `#[tokio::test…]`, so a call at
+any depth inside such an item, or a `#[cfg(test)]` statement, is not production. Nothing is cut
+by counting braces, and comments and strings are not code by construction.
+
+- **Ported** (each keeps its Rust text gate for one release, bound to the rule in
+  `src/ast_gate_parity.rs`'s `GUARDS`): I14 the storage floor has no door
+  (`i14-storage-floor`, `i14-storage-floor-blobs`), #738 no src code mutates the anchor env,
+  #564 nothing names `AntiEntropy::Satisfied` outside `matches!`, #748 the retired depth knob,
+  #620 no sync signing verb, and the postgres provisioner's no-direct-env-read. Each rule also
+  matches inside a macro's token tree (`tokio::join!(b.store_blob_local(…))`), which a
+  `call_expression` rule cannot see.
+- **`cfg-test-forms`**: a cfg naming `test` in a form the util does not recognise (say
+  `#[cfg(all(feature = "x", test))]`), or a recognised one written over several lines (the
+  text strippers that remain read a line at a time), is refused, so the I14 class cannot come
+  back through a new spelling.
+- **`scripts/ast_gates.sh`**: a whole-tree rule (`files: [src/**/*.rs]`) expects one total and
+  refuses a collapsed walk; every `ignores:` entry must exist; and every rule must carry
+  `rule-tests/<id>-test.yml` with crafted code it must match and near-misses it must not (a
+  comment, a string, a test-gated item), run by `ast-grep test`. 14 rules, 79 cases.
+- **Shown red, before and after.** One planted file (never compiled) plus a `#[cfg(any())]`
+  item in blobs.rs: all eight new rules red, and every Rust twin red (the #620 one in the pyo3
+  lane). The I14 text gate missed the plant while it sat on one line: it skips every line that
+  starts with `fn ` as a declaration, so `fn a(b: B) { b.store_blob_local(x); }` is invisible to
+  it; the rule caught it, and the text gate caught the same call written over three lines.
+- **Hit sets diffed over the tree.** With their exclusions dropped, each rule's raw matches
+  were compared with a grep of the text gate's needle. Every grep-only hit is a comment, a doc
+  line, or a string literal inside the gate itself; the rules find no call the grep missed and
+  the grep finds no call the rules missed (I14: 57 call sites both ways).
+- Six mutations of the new checks were each red: a rule without its test file, a stale
+  `ignores:`, a per-file expectation on a whole-tree rule, a `valid:` case that fires, the
+  test-gated exclusion dropped from I14, and the util forgetting `all(test, …)`.
+
 ### Changed — Verify 20.1.0 adopted: the three verify crates and the wheel floor move together (#992)
 
 `ciris-verify-core`, `ciris-keyring` and `ciris-crypto` move from tag v19.0.0 to v20.1.0 at all seven pin sites in one cut, since a split re-pin forks `ciris_crypto`. The wheel's `Requires-Dist` moves to `ciris-verify>=20.1.0,<21`. The floor is 20.1.0 because that minor ships the wheel-identity refusals the tag job's signer now relies on. The lockfile gains one transitive crate, `zlib-rs`, which verify-core's wheel reader pulls in. The test-anchor witness I162 had typed the expected verify tag as `v19.0.0` and went red on the flip, so it now reads every CIRISVerify pin from `Cargo.toml` and requires them to name one tag.

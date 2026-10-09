@@ -1,5 +1,5 @@
 {
-  "_comment": "Exact per-file match counts of each rule in rules/ (CIRISPersist#1026). scripts/ast_gates.sh compares ast-grep's counts with these; src/ast_gate_parity.rs compares the Rust text counts with these. A 0 is a claim too: the file must hold no match.",
+  "_comment": "Exact per-file match counts of each rule in rules/ (CIRISPersist#1026). scripts/ast_gates.sh compares ast-grep's counts with these; src/ast_gate_parity.rs compares the Rust text counts with these. A 0 is a claim too: the file must hold no match. A whole-tree rule (files: [\"src/**/*.rs\"]) expects one TOTAL under that key.",
   "i110-check-consent-scope-tokens": {
     "src/federation/admission.rs": 1,
     "src/store/memory.rs": 2,
@@ -29,5 +29,29 @@
     "src/store/memory.rs": 2,
     "src/store/postgres.rs": 2,
     "src/store/sqlite.rs": 2
+  },
+  "i14-storage-floor-blobs": {
+    "src/federation/blobs.rs": 0
+  },
+  "i14-storage-floor": {
+    "src/**/*.rs": 0
+  },
+  "738-anchor-env-mutation": {
+    "src/**/*.rs": 0
+  },
+  "564-anti-entropy-satisfied": {
+    "src/**/*.rs": 0
+  },
+  "748-recursion-depth": {
+    "src/**/*.rs": 0
+  },
+  "620-sync-signing-verb": {
+    "src/**/*.rs": 0
+  },
+  "pg-provisioner-env-read": {
+    "src/**/*.rs": 0
+  },
+  "cfg-test-forms": {
+    "src/**/*.rs": 0
   }
 }

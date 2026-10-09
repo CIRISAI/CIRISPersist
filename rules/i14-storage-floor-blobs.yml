@@ -1,0 +1,20 @@
+# I14, blobs.rs: the trait's thin wrappers and the default
+# `put_blob_signing_at` → `put_blob_with_scope` hop forward a scope a door
+# already validated; only a `store_blob_local` call is a door here. Expected 0.
+id: i14-storage-floor-blobs
+language: rust
+severity: hint
+message: "a production store_blob_local call in blobs.rs"
+rule:
+  any:
+    - kind: call_expression
+      has: {field: function, regex: '(\.|::)\s*store_blob_local$'}
+      not:
+        has: {field: arguments, stopBy: end, regex: '(^|::)cohort_scope::(FEDERATION|SPECIES|BIOSPHERE)$'}
+    - kind: identifier
+      regex: '^store_blob_local$'
+      inside: {kind: token_tree, stopBy: end}
+      follows: {regex: '^(\.|::)$'}
+  not: {inside: {stopBy: end, matches: test-gated}}
+files:
+  - src/federation/blobs.rs

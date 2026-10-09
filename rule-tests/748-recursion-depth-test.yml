@@ -1,0 +1,17 @@
+id: 748-recursion-depth
+valid:
+  - |
+    fn a() { // recursion_depth
+    }
+  - |
+    /// `recursion_depth` is retired
+    fn a() {}
+invalid:
+  - |
+    fn a(recursion_depth: u8) {}
+  - |
+    fn a() { cfg.recursion_depth = 2; }
+  - |
+    fn a() { let k = "recursion_depth"; }
+  - |
+    struct RecursionDepth(u8);

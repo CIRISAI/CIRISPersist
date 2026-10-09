@@ -1,0 +1,9 @@
+id: i26-uncached-content-master
+valid:
+  - |
+    fn a() { resolve_persisted_content_master_cached(x); }
+  - |
+    fn a() { let s = "resolve_persisted_content_master(x)"; }
+invalid:
+  - |
+    async fn a() { resolve_persisted_content_master(self, k).await?; }

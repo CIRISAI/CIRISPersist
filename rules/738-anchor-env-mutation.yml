@@ -1,0 +1,27 @@
+# #738 (genesis/mod.rs::no_src_code_mutates_the_anchor_environment_738): no
+# code under src/, TEST CODE INCLUDED, sets or removes the anchor environment
+# variables; env-mutating tests live in tests/test_anchor_env.rs, their own
+# process. Expected 0.
+id: 738-anchor-env-mutation
+language: rust
+severity: hint
+message: "src/ code mutates an anchor environment variable"
+rule:
+  any:
+    - kind: call_expression
+      all:
+        - has: {field: function, regex: '(^|::|\.)\s*(set_var|remove_var)$'}
+        - has:
+            field: arguments
+            stopBy: end
+            regex: '(CIRIS_TESTING_MODE|CIRIS_TEST_TRUST_ROOT|ENVIRONMENT|CIRIS_ENV)'
+            any: [{kind: string_content}, {kind: identifier}]
+    - kind: token_tree
+      all:
+        - has: {kind: identifier, regex: '^(set_var|remove_var)$', stopBy: end}
+        - has:
+            stopBy: end
+            regex: '(CIRIS_TESTING_MODE|CIRIS_TEST_TRUST_ROOT|ENVIRONMENT|CIRIS_ENV)'
+            any: [{kind: string_content}, {kind: identifier}]
+files:
+  - src/**/*.rs

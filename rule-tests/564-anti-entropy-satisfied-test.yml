@@ -1,0 +1,18 @@
+id: 564-anti-entropy-satisfied
+valid:
+  - |
+    fn is_satisfied(&self) -> bool { matches!(self, Self::Satisfied { .. }) }
+  - |
+    fn a() { assert!(matches!(x, AntiEntropy::Satisfied { .. })); }
+  - |
+    fn a() { // AntiEntropy::Satisfied
+     let u = AntiEntropy::Unverifiable { reason }; }
+invalid:
+  - |
+    fn a() -> AntiEntropy { AntiEntropy::Satisfied { peers: 1 } }
+  - |
+    fn a() { let v = vec![AntiEntropy::Satisfied]; }
+  - |
+    impl AntiEntropy { fn y() -> Self { Self::Satisfied } }
+  - |
+    fn a(x: AntiEntropy) { match x { crate::load_bearing::AntiEntropy::Satisfied => {} _ => {} } }

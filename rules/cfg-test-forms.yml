@@ -1,0 +1,26 @@
+# The test-gated util (utils/test-gated.yml) recognises `#[cfg(test)]` and
+# `#[cfg(all(test, …))]`. Any other cfg whose predicate names `test` (say
+# `#[cfg(all(feature = "x", test))]`) would be read as PRODUCTION by every rule
+# that excludes test code: the I14 class of miss (v54.0.0). Such a form is
+# refused here until the util learns it. `any(test, …)`, `not(test)` and
+# `all(any(test, …), …)` hold in production builds (`test-anchor`) and are
+# production on purpose. A recognised form written over several lines is
+# refused too: the text strippers still in Rust read a line at a time.
+# Expected 0.
+id: cfg-test-forms
+language: rust
+severity: hint
+message: "a cfg naming `test` in a form utils/test-gated.yml does not recognise"
+rule:
+  kind: attribute_item
+  regex: '^#\[\s*cfg\s*\([\s\S]*[(,\s]test\s*[,)]'
+  not:
+    regex: '^#\[\s*cfg\s*\(\s*((any|not)\s*\(|all\s*\(\s*any\s*\()\s*test\s*[,)]'
+  any:
+    - not:
+        regex: '^#\[\s*cfg\s*\(\s*(test|all\s*\(\s*test\s*,[\s\S]*)\s*\)\s*\]$'
+    # A recognised form split over lines: the Rust text strippers that remain
+    # (docs/FROM_DISK_GATES.md) read attributes a line at a time.
+    - regex: '\n'
+files:
+  - src/**/*.rs
