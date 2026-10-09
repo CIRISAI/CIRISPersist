@@ -5153,10 +5153,12 @@ pub async fn verify_signed_identity_occurrence(
         .lookup_public_key(&signed.attesting_key_id)
         .await?
     else {
-        return Err(Error::SignatureInvalid(format!(
-            "signed identity_occurrence: attesting_key_id {} is not a registered federation key",
-            signed.attesting_key_id
-        )));
+        // v54.1.0 (CIRISPersist#1042) — an ordering gap, typed apart from a
+        // bad signature: retryable once the signer's Key row lands.
+        return Err(Error::AttesterKeyUnknown {
+            attesting_key_id: signed.attesting_key_id.clone(),
+            plane: "identity_occurrence",
+        });
     };
     let key_directory = vec![ThresholdMember {
         member_id: signer_key.key_id.clone(),
@@ -5329,10 +5331,12 @@ async fn verify_content_only_identity_occurrence(
         .lookup_public_key(&signed.attesting_key_id)
         .await?
     else {
-        return Err(Error::SignatureInvalid(format!(
-            "signed identity_occurrence: attesting_key_id {} is not a registered federation key",
-            signed.attesting_key_id
-        )));
+        // v54.1.0 (CIRISPersist#1042) — an ordering gap, typed apart from a
+        // bad signature: retryable once the signer's Key row lands.
+        return Err(Error::AttesterKeyUnknown {
+            attesting_key_id: signed.attesting_key_id.clone(),
+            plane: "identity_occurrence",
+        });
     };
     let bytes = crate::verify::canonical::ceg_produce_canonicalize(env).map_err(|e| {
         Error::InvalidArgument(format!("signed identity_occurrence canonicalize: {e}"))
@@ -5504,11 +5508,12 @@ pub async fn verify_signed_identity_occurrence_revocation(
         .lookup_public_key(&signed.attesting_key_id)
         .await?
     else {
-        return Err(Error::SignatureInvalid(format!(
-            "signed identity_occurrence_revocation: attesting_key_id {} is not a registered \
-             federation key",
-            signed.attesting_key_id
-        )));
+        // v54.1.0 (CIRISPersist#1042) — an ordering gap, typed apart from a
+        // bad signature: retryable once the signer's Key row lands.
+        return Err(Error::AttesterKeyUnknown {
+            attesting_key_id: signed.attesting_key_id.clone(),
+            plane: "identity_occurrence_revocation",
+        });
     };
     let bytes = crate::verify::canonical::ceg_produce_canonicalize(env).map_err(|e| {
         Error::InvalidArgument(format!(
@@ -5678,10 +5683,12 @@ pub async fn verify_signed_transport_destination(
         .lookup_public_key(&signed.attesting_key_id)
         .await?
     else {
-        return Err(Error::SignatureInvalid(format!(
-            "signed transport_destination: attesting_key_id {} is not a registered federation key",
-            signed.attesting_key_id
-        )));
+        // v54.1.0 (CIRISPersist#1042) — an ordering gap, typed apart from a
+        // bad signature: retryable once the signer's Key row lands.
+        return Err(Error::AttesterKeyUnknown {
+            attesting_key_id: signed.attesting_key_id.clone(),
+            plane: "transport_destination",
+        });
     };
     let bytes = crate::verify::canonical::ceg_produce_canonicalize(env).map_err(|e| {
         Error::InvalidArgument(format!("signed transport_destination canonicalize: {e}"))
@@ -6519,10 +6526,12 @@ pub async fn verify_signed_touch_claim(
     // (3) Hybrid signature over JCS(signed_envelope) against the PINNED
     // federation pubkeys of the claimed signer, threshold 1-of-1.
     let Some(signer_key) = directory.lookup_public_key(&claim.attesting_key_id).await? else {
-        return Err(Error::SignatureInvalid(format!(
-            "signed touch_claim: attesting_key_id {} is not a registered federation key",
-            claim.attesting_key_id
-        )));
+        // v54.1.0 (CIRISPersist#1042) — an ordering gap, typed apart from a
+        // bad signature: retryable once the signer's Key row lands.
+        return Err(Error::AttesterKeyUnknown {
+            attesting_key_id: claim.attesting_key_id.clone(),
+            plane: "touch_claim",
+        });
     };
     // v21.10.0 (#519 b2) — the signature bytes are over the envelope WITHOUT
     // the `touch_cosignatures` set: co-signatures cannot be inside the bytes
@@ -6619,10 +6628,12 @@ pub async fn verify_signed_touch_claim(
                 continue;
             }
             let Some(cs_key) = directory.lookup_public_key(&cs.member_id).await? else {
-                return Err(Error::SignatureInvalid(format!(
-                    "signed touch_claim: NOfMCosigner {} is not a registered federation key",
-                    cs.member_id
-                )));
+                // v54.1.0 (CIRISPersist#1042) — an ordering gap, typed apart from a
+                // bad signature: retryable once the signer's Key row lands.
+                return Err(Error::AttesterKeyUnknown {
+                    attesting_key_id: cs.member_id.clone(),
+                    plane: "touch_claim_cosigner",
+                });
             };
             let cs_member = [ThresholdMember {
                 member_id: cs_key.key_id.clone(),

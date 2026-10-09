@@ -113,8 +113,10 @@ use crate::verify::{verify_hybrid, HybridPolicy};
 ///    REQUIRED.
 ///
 /// On success returns `Ok(())`; the caller then stores the row. On ANY
-/// failure returns [`Error::FederationTierUnverified`] and the caller
-/// MUST NOT store the row.
+/// failure the caller MUST NOT store the row: a signature that does not
+/// verify is [`Error::FederationTierUnverified`] (terminal); an attester
+/// this node holds no Key row for is [`Error::AttesterKeyUnknown`]
+/// (v54.1.0, CIRISPersist#1042 — retryable after the key plane).
 pub async fn verify_federation_tier_ingest<F>(directory: &F, row: &Attestation) -> Result<(), Error>
 where
     F: FederationDirectory + ?Sized,
@@ -277,9 +279,11 @@ where
 /// the directory (unknown attester ⇒ reject, fail-secure), and runs
 /// [`verify_hybrid`] under [`HybridPolicy::Strict`] (both halves REQUIRED,
 /// PQC-mandatory per CC 5.3.2.4.3.1). On success returns the hex-encoded
-/// `SHA-256(canonical)` (the row's `original_content_hash`); on ANY failure
-/// returns [`Error::FederationTierUnverified`] with an empty `attestation_id`
-/// (the caller re-stamps its own where one exists).
+/// `SHA-256(canonical)` (the row's `original_content_hash`); on a signature
+/// failure returns [`Error::FederationTierUnverified`] with an empty
+/// `attestation_id` (the caller re-stamps its own where one exists). An
+/// attester this node holds no Key row for is [`Error::AttesterKeyUnknown`]
+/// instead (v54.1.0, CIRISPersist#1042): an ordering gap, retryable.
 pub async fn verify_envelope_hybrid_signature<F>(
     directory: &F,
     attesting_key_id: &str,
@@ -304,15 +308,16 @@ where
 
     // (2) Resolve the attester's REGISTERED pubkeys — never pubkeys carried
     // on the row alone. Unknown/unregistered attester ⇒ reject (fail-secure).
+    // v54.1.0 (CIRISPersist#1042) — typed as the ORDERING gap it is
+    // (`Error::AttesterKeyUnknown`, retryable once the Key row lands), not as
+    // the terminal `FederationTierUnverified` a bad signature is.
     let attester = directory
         .lookup_public_key(attesting_key_id)
         .await
         .map_err(|e| reject(format!("attester lookup_public_key: {e} ({})", e.kind())))?
-        .ok_or_else(|| {
-            reject(format!(
-                "attesting_key_id {attesting_key_id} is not registered — no pubkeys to \
-                 verify the bound-hybrid signature against"
-            ))
+        .ok_or_else(|| Error::AttesterKeyUnknown {
+            attesting_key_id: attesting_key_id.to_owned(),
+            plane: "signed_envelope",
         })?;
 
     // (3) Strict hybrid verify: Ed25519 (over canonical) AND ML-DSA-65 (over

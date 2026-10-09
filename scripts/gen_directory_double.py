@@ -78,6 +78,8 @@ DELEGATED_DEFAULTS = (
     # v44.7.0 (#864) — defaulted `Unsupported`, overridden by every backend.
     "store_rebound_key_record",
     "list_key_registration_history",
+    # v54.1.0 (#1044) — defaulted `Unsupported`, overridden by every backend.
+    "store_invalid_replaced_key_record",
     # v45.0.0 (#871) — defaulted `Unsupported`, overridden by every backend.
     "list_holders_sized",
     "list_derived_hex",

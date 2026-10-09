@@ -6379,6 +6379,12 @@ impl PyEngine {
     /// / downgrade / re-scrub / conflicting version / unverifiable scrub /
     /// unowned or ambiguous owner — fail-closed, row untouched). Refusals
     /// are outcomes, not exceptions, so an apply loop stays total.
+    /// v54.1.0: `{"refused":{"reason":"attester_key_unknown"}}` is the
+    /// RETRYABLE ordering gap (the scrubber's Key row has not landed here;
+    /// re-offer after the key plane, CIRISPersist#1042) — the Insert arm used
+    /// to raise it as a bare ValueError; `unverifiable_signature` is terminal;
+    /// `"invalid_replaced"` means a stored record that failed verification was
+    /// replaced by this one (same pubkeys, same claim, CIRISPersist#1044).
     fn apply_replicated_key_record(
         &self,
         py: Python<'_>,
@@ -6431,6 +6437,8 @@ impl PyEngine {
     /// `Engine::rebind_key_record`. `signed_key_record_json` is the holder's
     /// self-signed re-signing of a registration this node already holds.
     /// Returns the canonical JSON of `RebindOutcome`: `{"outcome":"rebound"}`,
+    /// `{"outcome":"invalid_replaced"}` (v54.1.0, CIRISPersist#1044: the
+    /// stored record failed verification and was replaced by this one),
     /// `{"outcome":"unchanged"}`, or `{"outcome":"refused","reason":…}` with
     /// the plan's typed reason (`not_self_signed`, `record_absent`,
     /// `rebind_changes_record`, `pubkey_swap`, `unverifiable_signature`,
@@ -34321,6 +34329,11 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         // Caller-fault → ValueError (4xx).
         crate::federation::Error::InvalidArgument(_)
         | crate::federation::Error::SignatureInvalid(_) => PyValueError::new_err(kind),
+        // v54.1.0 (CIRISPersist#1042) — the ordering gap keeps the Python
+        // type of the arm it was split from (`SignatureInvalid` /
+        // `FederationTierUnverified`, both ValueError); the KIND tells a
+        // retryable `federation_attester_key_unknown` apart.
+        crate::federation::Error::AttesterKeyUnknown { .. } => PyValueError::new_err(kind),
         // Conflict → ValueError too; lens-side maps to 409.
         crate::federation::Error::Conflict(_) => PyValueError::new_err(kind),
         // v2.4.0 (CIRISPersist#102 Ask 3) — admission-gate rejections

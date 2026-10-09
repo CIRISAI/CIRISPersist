@@ -181,7 +181,10 @@ pub enum KeyRefusalReason {
     AlreadyAnchoredIdentical,
     /// The incoming record's scrub-signature did not clear the Strict
     /// [`verify_key_registration`] gate (malformed record, canonicalizer
-    /// disagreement, unregistered signer, or a bad hybrid signature).
+    /// disagreement, or a bad hybrid signature). **Terminal**: re-offering
+    /// the same bytes cannot succeed. v54.1.0 (CIRISPersist#1042): an
+    /// UNREGISTERED signer is no longer this reason but
+    /// [`Self::AttesterKeyUnknown`] (retryable).
     UnverifiableSignature,
     /// v44.7.0 (CIRISPersist#864) — a **rebind** that would change the
     /// claim, not just its binding: `identity_type`, `identity_ref`,
@@ -223,6 +226,13 @@ pub enum KeyRefusalReason {
     /// v50.0.0 (review H3) — a replicated `Upgrade` or `Supersede` would add or
     /// remove `node` from the stored `identity_type`; `node` is fixed at mint.
     NodeIdentityChanged,
+    /// v54.1.0 (CIRISPersist#1042) — the record is scrubbed by a key this node
+    /// holds no Key row for YET ([`Error::AttesterKeyUnknown`]): an ordering
+    /// gap, not a bad signature. **Retryable** — re-offer after the scrubber's
+    /// Key row lands; nothing was stored or marked. Its terminal sibling is
+    /// [`Self::UnverifiableSignature`] (the signer IS known and the record
+    /// does not verify against it), which before v54.1.0 also covered this case.
+    AttesterKeyUnknown,
 }
 
 impl KeyRefusalReason {
@@ -255,6 +265,7 @@ impl KeyRefusalReason {
             Self::StoreConflict => "store_conflict",
             Self::NodeIdentityFused => "node_identity_fused",
             Self::NodeIdentityChanged => "node_identity_changed",
+            Self::AttesterKeyUnknown => "attester_key_unknown",
         }
     }
 
@@ -275,6 +286,7 @@ impl KeyRefusalReason {
         Self::StoreConflict,
         Self::NodeIdentityFused,
         Self::NodeIdentityChanged,
+        Self::AttesterKeyUnknown,
     ];
 }
 
@@ -337,6 +349,15 @@ pub enum ReplicatedKeyOutcome {
     /// but #1. The record's scrubs were written back; nothing else moved.
     /// APPEND-ONLY.
     ScrubsRehydrated,
+    /// v54.1.0 (CIRISPersist#1044, CIRISEdge#858) — the stored record FAILED
+    /// [`verify_key_registration`] (structurally: a signature or envelope that
+    /// does not verify against a signer this node holds) and the incoming
+    /// record with the SAME pubkeys and the SAME claim PASSES it. The row was
+    /// replaced in place, `mutated_at` moved so peers re-serve it, and the
+    /// replaced bytes are in `federation_key_registration_history` with
+    /// `replacement = invalid_replaced` and `replaced_row_hash` = the replaced
+    /// row's `persist_row_hash`. APPEND-ONLY.
+    InvalidReplaced,
 }
 
 /// The classification half of the #371 replicated-key apply — which action
@@ -367,6 +388,11 @@ pub(crate) enum ReplicatedKeyPlan {
     /// `additional_scrubs`: write them back. Run the backend's
     /// `rehydrate_dropped_key_scrubs`.
     RehydrateScrubs,
+    /// v54.1.0 (CIRISPersist#1044) — the stored record fails
+    /// [`verify_key_registration`] (structurally detected), the incoming one
+    /// passes it, same pubkeys, same claim: run the backend's
+    /// `store_invalid_replaced_key_record`.
+    ReplaceInvalid,
     /// Byte-identical re-apply — no-op.
     Unchanged,
     /// Not admitted; leave the row untouched (fail-closed).
@@ -449,10 +475,7 @@ pub(crate) async fn plan_replicated_key_apply(
         if existing.additional_scrubs.is_empty() && !record.additional_scrubs.is_empty() {
             return match verify_key_registration(directory, record).await {
                 Ok(_) => Ok(ReplicatedKeyPlan::RehydrateScrubs),
-                Err(Error::SignatureInvalid(_)) | Err(Error::InvalidArgument(_)) => {
-                    Ok(refused(KeyRefusalReason::UnverifiableSignature))
-                }
-                Err(other) => Err(other),
+                Err(e) => key_refusal_of_verify_error(e).map(refused),
             };
         }
         return Ok(ReplicatedKeyPlan::Unchanged);
@@ -466,6 +489,90 @@ pub(crate) async fn plan_replicated_key_apply(
         return Ok(refused(KeyRefusalReason::PubkeySwap));
     }
 
+    let plan = plan_same_pubkey_transition(directory, &existing, record).await?;
+    // v54.1.0 (CIRISPersist#1044) — a first-seen-wins / monotonic refusal
+    // presumes the STORED row is a valid record. When it is not (it fails
+    // `verify_key_registration`, structurally) and the incoming record with
+    // the same pubkeys and claim passes, the stored row is replaced: it was
+    // never an admissible registration, so first-seen guarded nothing. Asked
+    // only on these refusals, so the stored row's verify is paid only where
+    // the answer can change.
+    if let ReplicatedKeyPlan::Refused {
+        reason:
+            KeyRefusalReason::ConflictingVersion
+            | KeyRefusalReason::Downgrade
+            | KeyRefusalReason::ReScrub
+            | KeyRefusalReason::AlreadyAnchoredIdentical,
+    } = plan
+    {
+        if let Some(p) = plan_invalid_replace(directory, &existing, record).await? {
+            return Ok(p);
+        }
+    }
+    Ok(plan)
+}
+
+/// v54.1.0 (CIRISPersist#1044) — the stored row fails
+/// [`verify_key_registration`] STRUCTURALLY: the verifier returned a verdict
+/// about the record ([`Error::SignatureInvalid`] / [`Error::InvalidArgument`]).
+/// A signer this node does not hold ([`Error::AttesterKeyUnknown`]) is not a
+/// verdict — the row may be valid once the key lands — so it is `false`, and
+/// a backend failure propagates.
+///
+/// A row whose envelope does not bind its subject (the pre-#659 UNBOUND
+/// shape) is also `false`: that class has its own ruled doors — a self-signed
+/// one is REBOUND by its holder (#864), an anchor-scrubbed one re-mints
+/// through genesis and is never shed by its holder (#659, I99's `downgrade`).
+/// This arm is for a record that binds its subject and still does not verify
+/// (CIRISServer's legacy fallback: steps 1–4 pass, the hybrid verify fails).
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub(crate) async fn stored_record_fails_verification<D: FederationDirectory + ?Sized>(
+    directory: &D,
+    stored: &KeyRecord,
+) -> Result<bool, Error> {
+    if super::admission::verify_envelope_binds_subject(stored).is_err() {
+        return Ok(false);
+    }
+    match verify_key_registration(directory, stored).await {
+        Ok(_) | Err(Error::AttesterKeyUnknown { .. }) => Ok(false),
+        Err(Error::SignatureInvalid(_) | Error::InvalidArgument(_)) => Ok(true),
+        Err(e) => Err(e),
+    }
+}
+
+/// v54.1.0 (CIRISPersist#1044) — the `InvalidReplaced` rule. `None` when it
+/// does not apply (the caller's refusal stands): the claim differs, or the
+/// stored row verifies (I616: a valid stored row is NEVER replaced here — the
+/// load-bearing clause). When the stored row fails and the incoming record
+/// also fails, the incoming record's own verdict is the refusal
+/// (`unverifiable_signature`, or the retryable `attester_key_unknown`); the
+/// row is untouched either way.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+async fn plan_invalid_replace(
+    directory: &dyn FederationDirectory,
+    existing: &KeyRecord,
+    record: &KeyRecord,
+) -> Result<Option<ReplicatedKeyPlan>, Error> {
+    if rebind_claim_unchanged(existing, record).is_err() {
+        return Ok(None);
+    }
+    if !stored_record_fails_verification(directory, existing).await? {
+        return Ok(None);
+    }
+    match verify_key_registration(directory, record).await {
+        Ok(_) => Ok(Some(ReplicatedKeyPlan::ReplaceInvalid)),
+        Err(e) => key_refusal_of_verify_error(e).map(|r| Some(refused(r))),
+    }
+}
+
+/// [`plan_replicated_key_apply`] past the existence, identity and pubkey
+/// checks: the transition rules for a same-pubkey record over a held row.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+async fn plan_same_pubkey_transition(
+    directory: &dyn FederationDirectory,
+    existing: &KeyRecord,
+    record: &KeyRecord,
+) -> Result<ReplicatedKeyPlan, Error> {
     let existing_self_signed = existing.scrub_key_id == existing.key_id;
     let incoming_anchor_scrubbed = record.scrub_key_id != record.key_id;
     if !incoming_anchor_scrubbed {
@@ -480,21 +587,17 @@ pub(crate) async fn plan_replicated_key_apply(
         // never rebound by its holder: that would shed the accord's scrub,
         // and #659 ruled those records re-mint through genesis (Downgrade,
         // below). Every refusal carries its reason.
-        if existing_self_signed && rebind_claim_unchanged(&existing, record) == Ok(()) {
-            let stored_unbound =
-                super::admission::verify_envelope_binds_subject(&existing).is_err();
+        if existing_self_signed && rebind_claim_unchanged(existing, record) == Ok(()) {
+            let stored_unbound = super::admission::verify_envelope_binds_subject(existing).is_err();
             let incoming_bound = super::admission::verify_envelope_binds_subject(record).is_ok();
             if stored_unbound && incoming_bound {
                 return match verify_key_registration(directory, record).await {
                     Ok(_) => Ok(ReplicatedKeyPlan::Rebind),
-                    Err(Error::SignatureInvalid(_)) | Err(Error::InvalidArgument(_)) => {
-                        Ok(refused(KeyRefusalReason::UnverifiableSignature))
-                    }
-                    Err(other) => Err(other),
+                    Err(e) => key_refusal_of_verify_error(e).map(refused),
                 };
             }
         } else if existing_self_signed
-            && super::admission::verify_envelope_binds_subject(&existing).is_err()
+            && super::admission::verify_envelope_binds_subject(existing).is_err()
             && super::admission::verify_envelope_binds_subject(record).is_ok()
         {
             // The rebind shape, but the claim moved: name it, so the holder
@@ -521,19 +624,14 @@ pub(crate) async fn plan_replicated_key_apply(
         // ONLY through the same non-forgeable m-of-n quorum re-verify the add
         // path uses, and ONLY monotonically forward. Anything else stays the
         // fail-closed re-scrub refuse.
-        return plan_canonical_supersede(directory, &existing, record).await;
+        return plan_canonical_supersede(directory, existing, record).await;
     }
 
     // Gate 1 — the incoming scrub must verify (Strict hybrid, scrubber
     // pubkeys resolved from the directory ⇒ chains to the seeded accord
     // anchor). An unverifiable or malformed record is not admitted.
     if let Err(e) = verify_key_registration(directory, record).await {
-        return match e {
-            Error::SignatureInvalid(_) | Error::InvalidArgument(_) => {
-                Ok(refused(KeyRefusalReason::UnverifiableSignature))
-            }
-            other => Err(other),
-        };
+        return key_refusal_of_verify_error(e).map(refused);
     }
 
     // Gate 2 — the row must sit inside a single owner's node set
@@ -593,6 +691,10 @@ pub(crate) fn rebind_claim_unchanged(
 pub enum RebindOutcome {
     /// The stored unbound registration was replaced by the bound one.
     Rebound,
+    /// v54.1.0 (CIRISPersist#1044) — the stored record FAILED
+    /// [`verify_key_registration`]; it was replaced by this one (same pubkeys,
+    /// same claim), which passes. Wire token `invalid_replaced`. APPEND-ONLY.
+    InvalidReplaced,
     /// The row already carries exactly this record.
     Unchanged,
     /// Not a rebind; the row is untouched. See [`KeyRefusalReason`].
@@ -691,6 +793,114 @@ pub(crate) async fn prepare_rebind<D: FederationDirectory + ?Sized>(
         new: Box::new(new),
         existing_hash,
     })
+}
+
+/// v54.1.0 (CIRISPersist#1044) — what every backend's
+/// `store_invalid_replaced_key_record` establishes BEFORE its atomic write:
+/// the rule the plan applied, RE-ASSERTED rather than trusted (the store step
+/// is a public trait method), and the row to write.
+///
+/// * a stored row exists, with the same pubkeys (both halves) and the same
+///   claim ([`rebind_claim_unchanged`]);
+/// * the stored row FAILS [`verify_key_registration`] structurally
+///   ([`stored_record_fails_verification`]) — a valid row is `Conflict`;
+/// * the row to write — the STORED claim with the incoming record's envelope,
+///   its hash, `scrub_key_id`, every scrub (base and `additional_scrubs`) and
+///   instants — PASSES [`verify_key_registration`] itself. The verified bytes
+///   are the stored bytes; nothing the signature does not cover moves.
+///
+/// `Replace { existing_hash }` is the hash the backend's `WHERE` re-asserts.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub(crate) async fn prepare_invalid_replace<D: FederationDirectory + ?Sized>(
+    directory: &D,
+    record: super::SignedKeyRecord,
+) -> Result<RebindPrepared, Error> {
+    let mut incoming = record.record;
+    super::canonical_at_rest::canonicalize_in_place(&mut incoming.registration_envelope)?;
+    validate_registration_pubkey(&incoming)?;
+    check_node_identity_exclusive(&incoming)?;
+    if incoming.algorithm != super::types::algorithm::HYBRID {
+        return Err(Error::InvalidArgument(format!(
+            "store_invalid_replaced_key_record algorithm must be 'hybrid' (got '{}')",
+            incoming.algorithm
+        )));
+    }
+    let existing = directory
+        .lookup_public_key(&incoming.key_id)
+        .await?
+        .ok_or_else(|| {
+            Error::InvalidArgument(format!(
+                "store_invalid_replaced_key_record: no existing row for {} — use put_public_key",
+                incoming.key_id
+            ))
+        })?;
+    if existing.pubkey_ed25519_base64 != incoming.pubkey_ed25519_base64
+        || existing.pubkey_ml_dsa_65_base64 != incoming.pubkey_ml_dsa_65_base64
+    {
+        return Err(Error::Conflict(format!(
+            "store_invalid_replaced_key_record {}: pubkey change refused (different identity)",
+            incoming.key_id
+        )));
+    }
+    if let Err(what) = rebind_claim_unchanged(&existing, &incoming) {
+        return Err(Error::Conflict(format!(
+            "store_invalid_replaced_key_record {}: {what} differs from the stored claim",
+            incoming.key_id
+        )));
+    }
+    if !stored_record_fails_verification(directory, &existing).await? {
+        return Err(Error::Conflict(format!(
+            "store_invalid_replaced_key_record {}: the stored record verifies; only a record \
+             that fails verify_key_registration is replaced",
+            incoming.key_id
+        )));
+    }
+    let existing_hash = existing.persist_row_hash.clone();
+    let mut new = existing;
+    new.registration_envelope = incoming.registration_envelope;
+    new.original_content_hash = incoming.original_content_hash;
+    new.scrub_signature_classical = incoming.scrub_signature_classical;
+    new.scrub_signature_pqc = incoming.scrub_signature_pqc;
+    new.scrub_key_id = incoming.scrub_key_id;
+    new.scrub_timestamp = incoming.scrub_timestamp;
+    new.pqc_completed_at = incoming.pqc_completed_at;
+    new.additional_scrubs = incoming.additional_scrubs;
+    verify_key_registration(directory, &new).await?;
+    new.persist_row_hash = super::types::compute_persist_row_hash(&new)?;
+    if new.persist_row_hash == existing_hash {
+        return Ok(RebindPrepared::Unchanged);
+    }
+    Ok(RebindPrepared::Replace {
+        new: Box::new(new),
+        existing_hash,
+    })
+}
+
+/// v54.1.0 (CIRISPersist#1042) — **the one reading of a
+/// [`verify_key_registration`] failure on the replicated Key plane**: which
+/// [`KeyRefusalReason`] it is, or the `Err` itself when it is not a verdict
+/// about the record (a backend failure propagates).
+///
+/// * [`Error::AttesterKeyUnknown`] → [`KeyRefusalReason::AttesterKeyUnknown`]
+///   — the scrubber's Key row has not landed here yet: RETRYABLE.
+/// * [`Error::SignatureInvalid`] / [`Error::InvalidArgument`] →
+///   [`KeyRefusalReason::UnverifiableSignature`] — the record does not verify
+///   (or does not parse) against a signer this node does hold: TERMINAL.
+///
+/// I613: every plan arm that verifies a record AND every backend's `Insert`
+/// arm reads the failure through this function, so the retryable/terminal
+/// split is spelled once. Before v54.1.0 the plan collapsed the two, and the
+/// `Insert` arms propagated a bare `Err` with no token at all (CIRISEdge#858:
+/// the sender booked nothing and parked the row).
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub(crate) fn key_refusal_of_verify_error(e: Error) -> Result<KeyRefusalReason, Error> {
+    match e {
+        Error::AttesterKeyUnknown { .. } => Ok(KeyRefusalReason::AttesterKeyUnknown),
+        Error::SignatureInvalid(_) | Error::InvalidArgument(_) => {
+            Ok(KeyRefusalReason::UnverifiableSignature)
+        }
+        other => Err(other),
+    }
 }
 
 /// v24.2.0 (CIRISPersist#565) — the one constructor for a refused plan, so a
@@ -1235,14 +1445,15 @@ where
             record.pubkey_ml_dsa_65_base64.clone(),
         )
     } else {
+        // v54.1.0 (CIRISPersist#1042) — an unregistered signer is an
+        // ORDERING gap (its Key row has not landed here yet), typed apart
+        // from a signature that does not verify: retryable, not terminal.
         let signer = directory
             .lookup_public_key(&record.scrub_key_id)
             .await?
-            .ok_or_else(|| {
-                Error::SignatureInvalid(format!(
-                    "registration signer (scrub_key_id={}) is not registered",
-                    record.scrub_key_id
-                ))
+            .ok_or_else(|| Error::AttesterKeyUnknown {
+                attesting_key_id: record.scrub_key_id.clone(),
+                plane: "key_registration",
             })?;
         (signer.pubkey_ed25519_base64, signer.pubkey_ml_dsa_65_base64)
     };

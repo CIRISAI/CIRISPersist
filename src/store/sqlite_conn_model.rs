@@ -243,7 +243,7 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("add_peer_record", ConnClass::Write),
     ("adopt_genesis_reanchor", ConnClass::Write),
     ("adopt_scrub_upgrade", ConnClass::Write),
-    ("store_rebound_key_record", ConnClass::Write),
+    ("write_replaced_key_registration", ConnClass::Write),
     // #846 (§6.1) — the adopt floor: row + declared binding + holder claim in
     // one transaction.
     ("adopt_sealed_blob_at", ConnClass::Write),

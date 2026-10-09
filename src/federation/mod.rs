@@ -324,6 +324,18 @@ pub mod claim_signing_invariants;
     any(feature = "postgres", feature = "sqlite")
 ))]
 pub mod key_rebind_invariants;
+// v54.1.0 (#1042) — the ordering-gap witnesses drive the key plan too.
+#[cfg(all(
+    any(test, feature = "test-anchor"),
+    any(feature = "postgres", feature = "sqlite")
+))]
+pub mod attester_key_unknown_invariants;
+// v54.1.0 (#1044) — the invalid-replace witnesses drive the key plan.
+#[cfg(all(
+    any(test, feature = "test-anchor"),
+    any(feature = "postgres", feature = "sqlite")
+))]
+pub mod invalid_replace_invariants;
 // (CIRISPersist#519 item 3) — the invariant-registry admission enforcement
 // + consistency witness: the admission-enforceable subset of the vendored
 // `invariant_registry` (571 invariants / 104 families) and the executed
@@ -2839,6 +2851,30 @@ pub trait FederationDirectory: Send + Sync {
         let _ = record;
         Err(Error::Unsupported {
             method: "store_rebound_key_record",
+        })
+    }
+
+    /// v54.1.0 (CIRISPersist#1044) — **the invalid-replace store step.**
+    /// Reached through the plan's `ReplaceInvalid` arm (the replicated apply
+    /// and `Engine::rebind_key_record`); the shared pre-check
+    /// (`register::prepare_invalid_replace`) RE-ASSERTS the rule — same
+    /// pubkeys, same claim, the stored record fails `verify_key_registration`
+    /// structurally, the row to write passes it — then one atomic write:
+    /// the stored claim with the incoming envelope, scrubber and scrubs,
+    /// `persist_row_hash` recomputed, `mutated_at` moved so peers re-serve
+    /// it, and the replaced bytes appended to
+    /// `federation_key_registration_history` with `replacement_kind =
+    /// invalid_replaced` and `replaced_row_hash` = the replaced row's hash.
+    /// `Conflict` if the stored row verifies or changed under the plan.
+    /// Returns [`register::ReplicatedKeyOutcome::InvalidReplaced`]. Default
+    /// `Unsupported`; every real backend overrides.
+    async fn store_invalid_replaced_key_record(
+        &self,
+        record: SignedKeyRecord,
+    ) -> Result<register::ReplicatedKeyOutcome, Error> {
+        let _ = record;
+        Err(Error::Unsupported {
+            method: "store_invalid_replaced_key_record",
         })
     }
 
@@ -9437,6 +9473,37 @@ pub enum Error {
     #[error("scrub-signature verification failed: {0}")]
     SignatureInvalid(String),
 
+    /// v54.1.0 (CIRISPersist#1042) — **an ordering gap, not a bad
+    /// signature.** The row names a signer (`attesting_key_id`, a key
+    /// record's `scrub_key_id`, a co-signer) whose Key row this node does not
+    /// hold YET, so its signature cannot be checked here. Nothing was stored
+    /// and nothing is marked: the SAME row is admitted when it is re-offered
+    /// after the signer's Key row lands (the sender's round sends the key
+    /// plane before its dependents).
+    ///
+    /// **Retryable**, and that is the whole point of the variant: before
+    /// v54.1.0 it read as [`Error::SignatureInvalid`] (and on the attestation
+    /// plane as [`Error::FederationTierUnverified`]), the TERMINAL verdicts,
+    /// so a sender could not tell a row that will verify tomorrow from a row
+    /// that never will. Consumers key on [`Error::kind`]
+    /// (`federation_attester_key_unknown`), never on this text. On the key
+    /// plane's apply outcome the same fact is
+    /// [`register::KeyRefusalReason::AttesterKeyUnknown`]
+    /// (`attester_key_unknown`).
+    #[error(
+        "{plane}: signer {attesting_key_id} is not a registered federation key on this node yet \
+         — an ordering gap, not a bad signature; re-offer the row after its Key row lands"
+    )]
+    AttesterKeyUnknown {
+        /// The signer this node holds no Key row for.
+        attesting_key_id: String,
+        /// The door that needed it: `key_registration`, `identity_occurrence`,
+        /// `identity_occurrence_revocation`, `transport_destination`,
+        /// `touch_claim`, `touch_claim_cosigner` or `signed_envelope`
+        /// (attestations, revocations and every other envelope-signed row).
+        plane: &'static str,
+    },
+
     /// A write quota refused this row. `reason` names WHICH budget —
     /// per-peer, per-node, reserved-family, or the untracked tail — and in
     /// which regime (burst vs sustained); see [`PeerQuotaRefusal`].
@@ -11591,6 +11658,7 @@ impl Error {
             Error::NodeIdentityUnset { .. } => "federation_node_identity_unset",
             Error::InvalidArgument(_) => "federation_invalid_argument",
             Error::SignatureInvalid(_) => "federation_signature_invalid",
+            Error::AttesterKeyUnknown { .. } => "federation_attester_key_unknown",
             Error::RateLimited { .. } => "federation_rate_limited",
             Error::ConsentGateRefused(_) => "federation_consent_gate_refused",
             Error::ConsentScopeTokenInvalid { .. } => "federation_consent_scope_token_invalid",

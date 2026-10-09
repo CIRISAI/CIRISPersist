@@ -134,7 +134,7 @@ impl FaultInjectingDirectory {
     }
 }
 
-// 114 delegations, generated. Every one: fault first, then delegate.
+// 115 delegations, generated. Every one: fault first, then delegate.
 #[async_trait::async_trait]
 impl FederationDirectory for FaultInjectingDirectory {
     async fn accord_nonce_issued(&self, family_key_id: &str, nonce: &str) -> Result<bool, Error> {
@@ -1183,6 +1183,15 @@ impl FederationDirectory for FaultInjectingDirectory {
             return Err(e);
         }
         self.inner.set_consent_role(key_id, consent_role).await
+    }
+    async fn store_invalid_replaced_key_record(
+        &self,
+        record: SignedKeyRecord,
+    ) -> Result<register::ReplicatedKeyOutcome, Error> {
+        if let Some(e) = self.faulted("store_invalid_replaced_key_record") {
+            return Err(e);
+        }
+        self.inner.store_invalid_replaced_key_record(record).await
     }
     async fn store_lineage_head_cosign(
         &self,

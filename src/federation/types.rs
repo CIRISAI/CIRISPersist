@@ -3776,7 +3776,10 @@ pub struct KeyRegistrationHistoryRow {
     pub scrub_signature_classical: String,
     /// The replaced record's ML-DSA-65 scrub signature (base64), if any.
     pub scrub_signature_pqc: Option<String>,
-    /// Who scrubbed the replaced record (== `key_id`: rebinds are self-signed).
+    /// Who scrubbed the replaced record. `== key_id` for a
+    /// [`KeyReplacementKind::Rebind`]; for an
+    /// [`KeyReplacementKind::InvalidReplaced`] it is whoever the stored (and
+    /// failing) record named.
     pub scrub_key_id: String,
     /// The replaced record's own scrub instant.
     pub scrub_timestamp: DateTime<Utc>,
@@ -3784,6 +3787,51 @@ pub struct KeyRegistrationHistoryRow {
     pub replaced_at: DateTime<Utc>,
     /// The `persist_row_hash` of the record that replaced it.
     pub replaced_by_hash: String,
+    /// v54.1.0 (CIRISPersist#1044, V186) — the `persist_row_hash` of the
+    /// REPLACED row itself: the id of the row this one audits. `None` for a
+    /// row written before V186 (the column did not exist).
+    #[serde(default)]
+    pub replaced_row_hash: Option<String>,
+    /// v54.1.0 (CIRISPersist#1044, V186) — which door replaced it. Rows
+    /// written before V186 were all rebinds (the only door) and read so.
+    #[serde(default)]
+    pub replacement: KeyReplacementKind,
+}
+
+/// v54.1.0 (CIRISPersist#1044) — why a key row's registration was replaced in
+/// place. Stable tokens (`rebind` / `invalid_replaced`, the V186
+/// `replacement_kind` column's values); append-only.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KeyReplacementKind {
+    /// v44.7.0 (#864) — the holder re-signed its own unbound (pre-#659)
+    /// registration over the same pubkeys and claim.
+    #[default]
+    Rebind,
+    /// v54.1.0 (#1044) — the stored record FAILED `verify_key_registration`
+    /// and an incoming record with the same pubkeys and claim PASSES it.
+    InvalidReplaced,
+}
+
+impl KeyReplacementKind {
+    /// The stable token (the serde spelling and the V186 column value).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Rebind => "rebind",
+            Self::InvalidReplaced => "invalid_replaced",
+        }
+    }
+
+    /// Parse a stored V186 `replacement_kind` value.
+    #[must_use]
+    pub fn from_token(s: &str) -> Option<Self> {
+        match s {
+            "rebind" => Some(Self::Rebind),
+            "invalid_replaced" => Some(Self::InvalidReplaced),
+            _ => None,
+        }
+    }
 }
 
 /// Wraps a [`KeyRecord`] payload that the caller has signed but

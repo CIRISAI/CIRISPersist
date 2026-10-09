@@ -1094,7 +1094,18 @@ impl MemoryBackend {
             ReplicatedKeyPlan::Refused { reason } => Ok(ReplicatedKeyOutcome::Refused { reason }),
             ReplicatedKeyPlan::Insert => {
                 if !crate::federation::register::record_is_role_gated(&record.record) {
-                    crate::federation::verify_key_registration(self, &record.record).await?;
+                    // v54.1.0 (CIRISPersist#1042, CIRISEdge#858) — a verify
+                    // failure is a TYPED refusal, never a bare `Err`: the
+                    // sender books `attester_key_unknown` (retryable: the
+                    // scrubber's Key row has not landed here yet) apart from
+                    // `unverifiable_signature` (terminal). Nothing is written.
+                    if let Err(e) =
+                        crate::federation::verify_key_registration(self, &record.record).await
+                    {
+                        return Ok(ReplicatedKeyOutcome::Refused {
+                            reason: crate::federation::register::key_refusal_of_verify_error(e)?,
+                        });
+                    }
                 }
                 match self
                     .put_public_key_at_door(
@@ -1111,6 +1122,21 @@ impl MemoryBackend {
             ReplicatedKeyPlan::Rebind => {
                 match crate::federation::FederationDirectory::store_rebound_key_record(self, record)
                     .await
+                {
+                    Ok(outcome) => Ok(outcome),
+                    Err(Error::Conflict(_)) => Ok(RACED),
+                    Err(e) => Err(e),
+                }
+            }
+            // v54.1.0 (#1044) — the stored record fails verification and the
+            // incoming one (same pubkeys, same claim) passes: replace it. A
+            // lost race, or a stored row that verifies after all, is
+            // fail-closed + re-offerable.
+            ReplicatedKeyPlan::ReplaceInvalid => {
+                match crate::federation::FederationDirectory::store_invalid_replaced_key_record(
+                    self, record,
+                )
+                .await
                 {
                     Ok(outcome) => Ok(outcome),
                     Err(Error::Conflict(_)) => Ok(RACED),
@@ -1142,6 +1168,67 @@ impl MemoryBackend {
                 Ok(ReplicatedKeyOutcome::ScrubsRehydrated)
             }
         }
+    }
+
+    /// v54.1.0 (CIRISPersist#1044) — the in-place registration rewrite both
+    /// replacement doors share (the sqlite/postgres shape): the history row
+    /// (with the replaced row's own hash and the kind), then the row, both
+    /// re-asserting the planned-against hash under one lock.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    async fn write_replaced_key_registration(
+        &self,
+        new: crate::federation::KeyRecord,
+        existing_hash: &str,
+        kind: crate::federation::types::KeyReplacementKind,
+    ) -> Result<(), crate::federation::Error> {
+        use crate::federation::Error;
+        let key_id = {
+            let mut state = self.state.lock().expect("memory backend lock");
+            let key_id = new.key_id.clone();
+            let raced = || {
+                Error::Conflict(format!(
+                    "{} key registration {key_id}: row changed concurrently",
+                    kind.as_str()
+                ))
+            };
+            let existing = state
+                .federation_keys
+                .get(&key_id)
+                .cloned()
+                .ok_or_else(raced)?;
+            // The atomic re-assertion: the row is the one the plan saw.
+            if existing.persist_row_hash != existing_hash
+                || (kind == crate::federation::types::KeyReplacementKind::Rebind
+                    && existing.scrub_key_id != existing.key_id)
+                || existing.pubkey_ed25519_base64 != new.pubkey_ed25519_base64
+            {
+                return Err(raced());
+            }
+            let mutated_at = next_key_admission_position(&state);
+            state
+                .key_registration_history
+                .entry(key_id.clone())
+                .or_default()
+                .push(crate::federation::types::KeyRegistrationHistoryRow {
+                    key_id: key_id.clone(),
+                    registration_envelope: existing.registration_envelope,
+                    original_content_hash: existing.original_content_hash,
+                    scrub_signature_classical: existing.scrub_signature_classical,
+                    scrub_signature_pqc: existing.scrub_signature_pqc,
+                    scrub_key_id: existing.scrub_key_id,
+                    scrub_timestamp: existing.scrub_timestamp,
+                    replaced_at: mutated_at,
+                    replaced_by_hash: new.persist_row_hash.clone(),
+                    replaced_row_hash: Some(existing.persist_row_hash),
+                    replacement: kind,
+                });
+            state
+                .key_record_mutated_at
+                .insert(key_id.clone(), mutated_at);
+            state.federation_keys.insert(key_id.clone(), new);
+            key_id
+        };
+        self.index_stored_key_row(&key_id).await
     }
 
     /// v54.0.0 (CIRISPersist#995 row 2) — TEST SEAM: reproduce what a
@@ -3044,53 +3131,40 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         record: crate::federation::SignedKeyRecord,
     ) -> Result<crate::federation::register::ReplicatedKeyOutcome, crate::federation::Error> {
         use crate::federation::register::{RebindPrepared, ReplicatedKeyOutcome};
-        use crate::federation::Error;
         let (new, existing_hash) =
             match crate::federation::register::prepare_rebind(self, record).await? {
                 RebindPrepared::Unchanged => return Ok(ReplicatedKeyOutcome::Unchanged),
                 RebindPrepared::Replace { new, existing_hash } => (*new, existing_hash),
             };
-        let key_id = {
-            let mut state = self.state.lock().expect("memory backend lock");
-            let key_id = new.key_id.clone();
-            let existing = state.federation_keys.get(&key_id).cloned().ok_or_else(|| {
-                Error::Conflict(format!(
-                    "store_rebound_key_record {key_id}: row changed concurrently"
-                ))
-            })?;
-            // The atomic re-assertion: the row is the one the plan saw.
-            if existing.persist_row_hash != existing_hash
-                || existing.scrub_key_id != existing.key_id
-                || existing.pubkey_ed25519_base64 != new.pubkey_ed25519_base64
-            {
-                return Err(Error::Conflict(format!(
-                    "store_rebound_key_record {key_id}: row changed concurrently"
-                )));
-            }
-            let mutated_at = next_key_admission_position(&state);
-            state
-                .key_registration_history
-                .entry(key_id.clone())
-                .or_default()
-                .push(crate::federation::types::KeyRegistrationHistoryRow {
-                    key_id: key_id.clone(),
-                    registration_envelope: existing.registration_envelope,
-                    original_content_hash: existing.original_content_hash,
-                    scrub_signature_classical: existing.scrub_signature_classical,
-                    scrub_signature_pqc: existing.scrub_signature_pqc,
-                    scrub_key_id: existing.scrub_key_id,
-                    scrub_timestamp: existing.scrub_timestamp,
-                    replaced_at: mutated_at,
-                    replaced_by_hash: new.persist_row_hash.clone(),
-                });
-            state
-                .key_record_mutated_at
-                .insert(key_id.clone(), mutated_at);
-            state.federation_keys.insert(key_id.clone(), new);
-            key_id
-        };
-        self.index_stored_key_row(&key_id).await?;
+        self.write_replaced_key_registration(
+            new,
+            &existing_hash,
+            crate::federation::types::KeyReplacementKind::Rebind,
+        )
+        .await?;
         Ok(ReplicatedKeyOutcome::Rebound)
+    }
+
+    /// v54.1.0 (CIRISPersist#1044) — the invalid-replace store step (the
+    /// sqlite/postgres shape).
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    async fn store_invalid_replaced_key_record(
+        &self,
+        record: crate::federation::SignedKeyRecord,
+    ) -> Result<crate::federation::register::ReplicatedKeyOutcome, crate::federation::Error> {
+        use crate::federation::register::{RebindPrepared, ReplicatedKeyOutcome};
+        let (new, existing_hash) =
+            match crate::federation::register::prepare_invalid_replace(self, record).await? {
+                RebindPrepared::Unchanged => return Ok(ReplicatedKeyOutcome::Unchanged),
+                RebindPrepared::Replace { new, existing_hash } => (*new, existing_hash),
+            };
+        self.write_replaced_key_registration(
+            new,
+            &existing_hash,
+            crate::federation::types::KeyReplacementKind::InvalidReplaced,
+        )
+        .await?;
+        Ok(ReplicatedKeyOutcome::InvalidReplaced)
     }
 
     async fn list_key_registration_history(
@@ -3718,11 +3792,13 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             let state = self.state.lock().expect("memory backend lock");
             match state.federation_keys.get(&row.attesting_key_id) {
                 Some(rec) => rec.identity_type.clone(),
+                // v54.1.0 (CIRISPersist#1042) — the ORDERING gap, typed apart
+                // from a bad signature (retryable once the Key row lands).
                 None => {
-                    return Err(crate::federation::Error::InvalidArgument(format!(
-                        "attesting_key_id {} does not exist in federation_keys",
-                        row.attesting_key_id
-                    )));
+                    return Err(crate::federation::Error::AttesterKeyUnknown {
+                        attesting_key_id: row.attesting_key_id.clone(),
+                        plane: "attestation",
+                    });
                 }
             }
         };
@@ -15708,9 +15784,10 @@ mod tests {
             .put_attestation(SignedAttestation { attestation: att })
             .await
             .unwrap_err();
+        // v54.1.0 (#1042) — typed as the retryable ordering gap now.
         assert!(
-            matches!(&err, crate::federation::Error::InvalidArgument(m)
-                if m.contains("attesting_key_id") && m.contains("does not exist")),
+            matches!(&err, crate::federation::Error::AttesterKeyUnknown { attesting_key_id, plane: "attestation" }
+                if attesting_key_id == "registry-steward"),
             "expected the tier-2 attester-lookup refusal, got {err:?}"
         );
 

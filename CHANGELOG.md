@@ -7,6 +7,16 @@ threat-model citations because this crate's audit story is the point.
 
 ## [Unreleased]
 
+## [54.1.0] - unreleased
+
+### Added — an unknown signer is a typed, RETRYABLE refusal, apart from a bad signature (#1042)
+
+(entry in progress)
+
+### Added — a stored Key row that fails verification is replaced by a passing one (`InvalidReplaced`) (#1044)
+
+(entry in progress)
+
 ## [54.0.0] - 2026-10-09
 
 ### Changed — Verify 20.1.0 adopted: the three verify crates and the wheel floor move together (#992)
