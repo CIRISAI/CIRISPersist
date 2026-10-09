@@ -765,6 +765,26 @@ pub(crate) mod bodies {
                 "I654: the ledger carries {header:?}:\n{ledger}"
             );
         }
+        // The notice id re-derives from the ledger's own `notice_jcs`, and the
+        // ledger carries the whole cosignature set.
+        let header = |k: &str| {
+            ledger
+                .lines()
+                .find_map(|l| l.strip_prefix(&format!("# {k}\t")))
+                .unwrap_or_else(|| panic!("I654: the ledger has no {k}"))
+                .to_owned()
+        };
+        {
+            use sha2::Digest as _;
+            assert_eq!(
+                hex::encode(sha2::Sha256::digest(header("notice_jcs").as_bytes())),
+                report.notice_id,
+                "I654: the notice id re-derives from the ledger"
+            );
+        }
+        let cosigs: Vec<serde_json::Value> =
+            serde_json::from_str(&header("cosignatures_json")).unwrap();
+        assert_eq!(cosigs.len(), 2, "I654: the whole cosignature set");
         let ids: Vec<String> = ledger
             .lines()
             .filter(|l| !l.starts_with('#') && !l.starts_with("selection_digest\t"))

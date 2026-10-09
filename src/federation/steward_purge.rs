@@ -1517,6 +1517,11 @@ where
                 "finalized_at",
                 e.finalized_at.map(|t| t.to_rfc3339()).unwrap_or_default(),
             ),
+            // The notice id's preimage and the WHOLE cosignature set, so the
+            // ledger alone re-derives the id and re-verifies the quorum (JCS
+            // and compact JSON are single-line).
+            ("notice_jcs", e.notice_jcs.clone()),
+            ("cosignatures_json", e.cosignatures_json.clone()),
         ],
         &e.notice_id,
         &records,
