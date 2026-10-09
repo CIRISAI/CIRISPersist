@@ -3745,7 +3745,7 @@
     "proposed:src/federation/admission.rs#check_credits_dimension_subject_match",
     "proposed: admission ignore/reject populated subject_key_ids on detection:* rows (no consent-withdraws for the measured agent)",
     "proposed: no CC 2.3.1 subject-bearing admission check exists for any family - per-dimension required-subject rule beside DimensionAdmissionPolicy::check",
-    "src/federation/admission.rs#resolve_withdraws_admission_rule",
+    "src/federation/admission.rs#resolve_withdraws_admission_rule_at",
     "src/federation/hard_case.rs#HardCaseEvent (written by at_rest_cascade.rs#emit_membership_hard_cases + community_dek.rs#emit_excluded_hard_cases)",
     "proposed:src/federation/admission.rs#check_reserved_prefix_admission extension per 4.5.2.1",
     "CIRISPersist admission.rs#resolve_withdraws_admission_rule (generic rule 2 currently grants the ACCUSED self-revoke - no moderation carve-out; see flag)",
@@ -3754,7 +3754,7 @@
     "proposed: KindPolicy(ratchet:flag:coordinated_voting_cluster).subject_authority=None - admission MUST reject/ignore non-empty subject_key_ids so the accused never acquires rule-2 withdraws standing",
     "proposed:src/admission/subject_authority.rs#deny_self_revoke_on_detector_dimensions - default-empty enforcement so the flagged attested_key_id cannot appear in its own subject_key_ids",
     "proposed: admission reject rows whose subject_key_ids contains attested_key_id (anti-self-revocation guard; absent today)",
-    "CIRISPersist/src/federation/admission.rs#resolve_withdraws_admission_rule (anti-self-revocation: accused must not be in subject_key_ids)",
+    "CIRISPersist/src/federation/admission.rs#resolve_withdraws_admission_rule_at (anti-self-revocation: accused must not be in subject_key_ids)",
     "proposed: CIRISPersist admission gate rejecting attested_key_id in subject_key_ids for adversarial-evidence dimensions (ratchet:flag:*) - no dimension-aware validation exists in either write-path or the CCC re-check",
     "src/federation/admission.rs#duty_holders_from_signed_subjects (the drift site)",
     "proposed:cirispersist/src/federation/admission.rs#reject_revocation_self_subject_key (family-specific guard beside resolve_withdraws_admission_rule, which today admits ANY key in subject_key_ids with no revocation carve-out)",
@@ -14301,7 +14301,7 @@
     "claim_id": "CLM-nsproc-subject-key-ids-consent",
     "repo": "CIRISPersist",
     "crate": "ciris-persist@21.4.0",
-    "path#symbol": "src/federation/admission.rs#resolve_withdraws_admission_rule",
+    "path#symbol": "src/federation/admission.rs#resolve_withdraws_admission_rule_at",
     "tsv_target": "evidence/cc_impl.tsv",
     "field": "subject_key_ids",
     "prefix": "consent:*",
@@ -24509,7 +24509,7 @@
      {
       "field": "subject_key_ids",
       "owner_component": "persist",
-      "processor": "src/federation/admission.rs#resolve_withdraws_admission_rule",
+      "processor": "src/federation/admission.rs#resolve_withdraws_admission_rule_at",
       "enforcement_point": "admission"
      },
      {
@@ -34161,7 +34161,7 @@
      {
       "field": "subject_key_ids",
       "owner_component": "persist",
-      "processor": "CIRISPersist/src/federation/admission.rs#resolve_withdraws_admission_rule (anti-self-revocation: accused must not be in subject_key_ids)",
+      "processor": "CIRISPersist/src/federation/admission.rs#resolve_withdraws_admission_rule_at (anti-self-revocation: accused must not be in subject_key_ids)",
       "enforcement_point": "admission"
      }
     ],
@@ -38661,7 +38661,7 @@
      {
       "field": "subject_key_ids",
       "owner_component": "persist",
-      "processor": "src/federation/admission.rs#resolve_withdraws_admission_rule",
+      "processor": "src/federation/admission.rs#resolve_withdraws_admission_rule_at",
       "enforcement_point": "admission"
      },
      {

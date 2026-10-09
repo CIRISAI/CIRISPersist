@@ -38,7 +38,7 @@ decimal_id	claim_id	repo	path#symbol	crate@version
 3.2	CLM-infrastructure-trust-root-admitted-under-accord-quorum	CIRISPersist	src/federation/canonical_community.rs#check_trust_root_community_admission	ciris-persist@54.0.0
 3.2	CLM-infrastructure-does-not-vote	CIRISPersist	src/federation/canonical_community.rs#check_founders_eligible	ciris-persist@54.0.0
 3.2	CLM-infrastructure-entrenched-supersede	CIRISPersist	src/federation/canonical_community.rs#prepare_trust_root_supersede	ciris-persist@54.0.0
-3.3.1	CLM-nsproc-subject-key-ids-consent	CIRISPersist	src/federation/admission.rs#resolve_withdraws_admission_rule	ciris-persist@54.0.0
+3.3.1	CLM-nsproc-subject-key-ids-consent	CIRISPersist	src/federation/admission.rs#resolve_withdraws_admission_rule_at	ciris-persist@54.0.0
 3.3.1	CLM-nsproc-dimension-consent	CIRISPersist	src/federation/consent.rs#consent_state_of	ciris-persist@54.0.0
 3.3.1	CLM-nsproc-attestation-prefixes-consent	CIRISPersist	src/federation/consent_grammar.rs#parse_grant_payload	ciris-persist@54.0.0
 3.3.1	CLM-nsproc-restrictions-op-strip-field-consent	CIRISPersist	src/federation/consent_grammar.rs#strip_field	ciris-persist@54.0.0
@@ -127,7 +127,7 @@ decimal_id	claim_id	repo	path#symbol	crate@version
 3.4.7	CLM-family-root-charter	CIRISPersist	src/federation/trust_root.rs#check_family_charter_admission	ciris-persist@54.0.0
 4.1.1	CLM-delegation-depth-default	CIRISPersist	src/federation/topology.rs#DEFAULT_DELEGATION_DEPTH	ciris-persist@54.0.0
 4.1.1	CLM-delegation-depth-default	CIRISPersist	src/federation/topology.rs#build_delegation_graph	ciris-persist@54.0.0
-4.1.1	CLM-delegation-depth-default	CIRISPersist	src/federation/admission.rs#resolve_withdraws_admission_rule	ciris-persist@54.0.0
+4.1.1	CLM-delegation-depth-default	CIRISPersist	src/federation/admission.rs#resolve_withdraws_admission_rule_at	ciris-persist@54.0.0
 3.1.7	CLM-version-segment-suffix	CIRISPersist	src/federation/namespace/matcher.rs#match_family	ciris-persist@54.0.0
 3.1.7	CLM-version-segment-suffix	CIRISPersist	src/federation/namespace/matcher.rs#trailing_version	ciris-persist@54.0.0
 3.1.7	CLM-version-segment-suffix	CIRISPersist	src/federation/namespace/matcher.rs#is_version_exempt	ciris-persist@54.0.0

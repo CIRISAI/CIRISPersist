@@ -146,8 +146,14 @@ Each spelled its own attribute test and most knew only `#[cfg(test)]`. They now 
   `#[cfg(all(test, …))]` modules as production, so a call from one counted as a live caller: a
   FALSE GREEN. Fixed, it names `admission.rs#resolve_withdraws_admission_rule`, cited by two
   evidence rows (3.3.1, 4.1.1) and called only from test modules; production runs
-  `resolve_withdraws_admission_rule_at`. **Open: the citation needs a ruling** (re-point the rows,
-  or exempt with a reason); the gate is red until then.
+  `resolve_withdraws_admission_rule_at`. Ruled: evidence cites the function that runs. Both rows
+  (3.3.1 `CLM-nsproc-subject-key-ids-consent`, 4.1.1 `CLM-delegation-depth-default`) and the six
+  manifest citations of that path (`namespace_supersets.json`: the evidence export, the
+  field-processor matrix, three family placement rows) now name `_at`, which every production
+  door reaches: `put_attestation` on memory, sqlite and postgres through
+  `check_withdraws_admission` → `check_withdraws_admission_at`, and the bytes-plane tombstone
+  through `check_withdraws_admission_as_admitted`. The wrapper stays: CIRISServer imports it.
+  The gate is green.
 - `blob_surface_gates.rs`, `key_grant_invariants.rs`, `family_rules.rs`,
   `sqlite_conn_model.rs` and pyo3.rs's GIL gate (which knew only the literal
   `#[cfg(test)]\nmod `) found nothing new.
