@@ -540,10 +540,42 @@ pub(crate) async fn stored_record_fails_verification<D: FederationDirectory + ?S
     }
 }
 
+/// v54.1.0 (CIRISPersist#1044) — **who may sign the replacement, and which
+/// rows the arm may touch.** `Err(what)` names the clause that fails.
+///
+/// * **The signer (I620).** `verify_key_registration` resolves an
+///   anchor-scrubbed record's signer from the directory and accepts ANY
+///   registered key there, so "the incoming record passes" says nothing about
+///   who vouched for it. The replacement is signed by the key ITSELF
+///   (`scrub_key_id == key_id`: the holder's proof of possession, the repair
+///   CIRISEdge#858 names) or by the SAME scrubber the stored row names (its
+///   granting authority re-signing). A third key cannot install itself as a
+///   row's scrubber through this arm.
+/// * **Not a role-gated row (I621).** A canonical / accord-holder /
+///   infra:attest / co-steward registration is admitted by its m-of-n
+///   co-scrub gate, not by `verify_key_registration` (which checks scrub #1
+///   only), so failing the latter does not make it invalid, and a one-scrub
+///   replacement would shed its quorum. Those rows move only through their
+///   own doors (#405 supersede, genesis re-anchor).
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub(crate) fn invalid_replace_admissible(
+    existing: &KeyRecord,
+    incoming: &KeyRecord,
+) -> Result<(), &'static str> {
+    if record_is_role_gated(existing) || record_is_role_gated(incoming) {
+        return Err("a role-gated registration");
+    }
+    if incoming.scrub_key_id != incoming.key_id && incoming.scrub_key_id != existing.scrub_key_id {
+        return Err("the replacement's signer (neither the key itself nor the stored scrubber)");
+    }
+    Ok(())
+}
+
 /// v54.1.0 (CIRISPersist#1044) — the `InvalidReplaced` rule. `None` when it
-/// does not apply (the caller's refusal stands): the claim differs, or the
-/// stored row verifies (I616: a valid stored row is NEVER replaced here — the
-/// load-bearing clause). When the stored row fails and the incoming record
+/// does not apply (the caller's refusal stands): the claim differs, the
+/// signer or the row is not admissible ([`invalid_replace_admissible`]), or
+/// the stored row verifies (I616: a valid stored row is NEVER replaced here —
+/// the load-bearing clause). When the stored row fails and the incoming record
 /// also fails, the incoming record's own verdict is the refusal
 /// (`unverifiable_signature`, or the retryable `attester_key_unknown`); the
 /// row is untouched either way.
@@ -554,6 +586,9 @@ async fn plan_invalid_replace(
     record: &KeyRecord,
 ) -> Result<Option<ReplicatedKeyPlan>, Error> {
     if rebind_claim_unchanged(existing, record).is_err() {
+        return Ok(None);
+    }
+    if invalid_replace_admissible(existing, record).is_err() {
         return Ok(None);
     }
     if !stored_record_fails_verification(directory, existing).await? {
@@ -802,6 +837,8 @@ pub(crate) async fn prepare_rebind<D: FederationDirectory + ?Sized>(
 ///
 /// * a stored row exists, with the same pubkeys (both halves) and the same
 ///   claim ([`rebind_claim_unchanged`]);
+/// * the incoming record is signed by the key itself or by the stored row's
+///   scrubber, and neither is role-gated ([`invalid_replace_admissible`]);
 /// * the stored row FAILS [`verify_key_registration`] structurally
 ///   ([`stored_record_fails_verification`]) — a valid row is `Conflict`;
 /// * the row to write — the STORED claim with the incoming record's envelope,
@@ -845,6 +882,12 @@ pub(crate) async fn prepare_invalid_replace<D: FederationDirectory + ?Sized>(
     if let Err(what) = rebind_claim_unchanged(&existing, &incoming) {
         return Err(Error::Conflict(format!(
             "store_invalid_replaced_key_record {}: {what} differs from the stored claim",
+            incoming.key_id
+        )));
+    }
+    if let Err(what) = invalid_replace_admissible(&existing, &incoming) {
+        return Err(Error::Conflict(format!(
+            "store_invalid_replaced_key_record {}: {what} is not replaced through this door",
             incoming.key_id
         )));
     }

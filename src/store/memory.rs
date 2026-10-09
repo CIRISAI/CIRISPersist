@@ -1049,6 +1049,22 @@ impl MemoryBackend {
         &self.test_hooks
     }
 
+    /// v54.1.0 (CIRISPersist#1044, I621) — hold a key row past every
+    /// `put_public_key` gate, as a node that admitted it under an older rule
+    /// does. Test-only: the role-gated rows a witness needs cannot clear the
+    /// production-roster gate.
+    #[cfg(test)]
+    #[allow(dead_code)] // the witness that calls it needs postgres or sqlite
+    pub(crate) fn seed_key_row_unchecked_for_test(&self, mut row: crate::federation::KeyRecord) {
+        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)
+            .expect("seeded key row hashes");
+        self.state
+            .lock()
+            .expect("memory backend lock")
+            .federation_keys
+            .insert(row.key_id.clone(), row);
+    }
+
     /// v50.0.0 (PR #921 review) — the test-only rival write armed for `at`
     /// (see [`crate::store::test_hooks`]), applied through this backend's own
     /// replicated door. Never armed outside a test.

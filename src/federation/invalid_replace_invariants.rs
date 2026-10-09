@@ -13,7 +13,7 @@ pub(crate) mod bodies {
     use crate::federation::types::KeyReplacementKind;
     use crate::federation::{Error, FederationDirectory, KeyRecord, SignedKeyRecord};
 
-    fn signed(r: KeyRecord) -> SignedKeyRecord {
+    pub fn signed(r: KeyRecord) -> SignedKeyRecord {
         SignedKeyRecord { record: r }
     }
 
@@ -270,6 +270,75 @@ pub(crate) mod bodies {
             Some(held.persist_row_hash.as_str())
         );
     }
+
+    /// **I620 — the replacement's SIGNER.** A failing row scrubbed by anchor
+    /// `A`, offered a record with the same pubkeys and claim that a STRANGER
+    /// `B` scrubbed (registered, so `verify_key_registration` passes): not
+    /// replaced, at the plan and at the store step, and the row is untouched.
+    /// The same record re-signed by `A` (the stored scrubber) is replaced.
+    pub async fn i620_the_replacement_is_signed_by_the_key_or_its_scrubber(
+        d: &dyn FederationDirectory,
+        s: &str,
+    ) {
+        let a = format!("i620-a-{s}");
+        let b = format!("i620-b-{s}");
+        ts::register_identity_key(d, &a, NODE).await;
+        ts::register_identity_key(d, &b, NODE).await;
+        let k = format!("i620-k-{s}");
+        let mut stored = ts::replicated_key_record(&k, USER, &a, &a, "a");
+        let other = ts::sign_envelope(&a, &serde_json::json!({ "owner_binding": k }));
+        stored.scrub_signature_classical = other.1;
+        stored.scrub_signature_pqc = other.2;
+        let held = seed_failing(d, stored).await;
+
+        let by_stranger = ts::replicated_key_record(&k, USER, &b, &b, "b");
+        register::verify_key_registration(d, &by_stranger)
+            .await
+            .expect("precondition: the stranger's record verifies on its own");
+        let out = d
+            .apply_replicated_key_record(signed(by_stranger.clone()))
+            .await
+            .unwrap();
+        assert!(
+            matches!(out, ReplicatedKeyOutcome::Refused { .. }),
+            "I620: a stranger's signature does not replace the row: {out:?}"
+        );
+        let r = d
+            .store_invalid_replaced_key_record(signed(by_stranger))
+            .await;
+        assert!(
+            matches!(r, Err(Error::Conflict(_))),
+            "I620: the store step refuses the stranger's signature: {r:?}"
+        );
+        let now = d.lookup_public_key(&k).await.unwrap().unwrap();
+        assert_eq!(
+            now.persist_row_hash, held.persist_row_hash,
+            "I620: row untouched"
+        );
+        assert_eq!(
+            now.scrub_key_id, a,
+            "I620: the stranger is not the scrubber"
+        );
+        assert!(d
+            .list_key_registration_history(&k)
+            .await
+            .unwrap()
+            .is_empty());
+
+        // The stored scrubber re-signs: replaced.
+        let by_scrubber = ts::replicated_key_record(&k, USER, &a, &a, "c");
+        assert_eq!(
+            d.apply_replicated_key_record(signed(by_scrubber))
+                .await
+                .unwrap(),
+            ReplicatedKeyOutcome::InvalidReplaced,
+            "I620: the stored scrubber's re-signing replaces the row"
+        );
+        assert_eq!(
+            d.lookup_public_key(&k).await.unwrap().unwrap().scrub_key_id,
+            a
+        );
+    }
 }
 
 #[cfg(test)]
@@ -295,6 +364,15 @@ mod run {
                 async fn i618() {
                     let Some(b) = $fresh.await else { return };
                     bodies::i618_rebind_history_names_its_kind(&b, &super::suffix()).await
+                }
+                #[tokio::test]
+                async fn i620() {
+                    let Some(b) = $fresh.await else { return };
+                    bodies::i620_the_replacement_is_signed_by_the_key_or_its_scrubber(
+                        &b,
+                        &super::suffix(),
+                    )
+                    .await
                 }
             }
         };
@@ -351,6 +429,87 @@ mod run {
         assert_eq!(
             serde_json::to_value(out).unwrap(),
             serde_json::json!({ "outcome": "invalid_replaced" })
+        );
+    }
+
+    /// **I621 — a role-gated row is not this door's.** The predicate refuses a
+    /// canonical / infra:attest claim on either side, and a third-party
+    /// signer; it admits the key's own signature and the stored scrubber's.
+    #[test]
+    fn i621_admissibility_predicate() {
+        use crate::federation::register::invalid_replace_admissible;
+        use crate::federation::tier_ingest::test_support as ts;
+        use crate::federation::types::identity_type::{CANONICAL, USER};
+        let k = "i621-k";
+        let stored = ts::replicated_key_record(k, USER, "anchor", "anchor", "a");
+        let self_signed = ts::replicated_key_record(k, USER, k, k, "b");
+        let by_scrubber = ts::replicated_key_record(k, USER, "anchor", "anchor", "c");
+        let by_stranger = ts::replicated_key_record(k, USER, "stranger", "stranger", "d");
+        assert_eq!(invalid_replace_admissible(&stored, &self_signed), Ok(()));
+        assert_eq!(invalid_replace_admissible(&stored, &by_scrubber), Ok(()));
+        assert!(invalid_replace_admissible(&stored, &by_stranger).is_err());
+        let canonical = ts::replicated_key_record(k, CANONICAL, "anchor", "anchor", "a");
+        let canonical_self = ts::replicated_key_record(k, CANONICAL, k, k, "b");
+        assert!(invalid_replace_admissible(&canonical, &canonical_self).is_err());
+        let mut attest = stored.clone();
+        attest.capability_roles = vec!["infra:attest".to_owned()];
+        let mut attest_self = self_signed.clone();
+        attest_self.capability_roles = vec!["infra:attest".to_owned()];
+        assert!(invalid_replace_admissible(&attest, &attest_self).is_err());
+    }
+
+    /// **I621 — through the plan and the store step.** A role-gated row that
+    /// fails `verify_key_registration` (seeded past `put_public_key`'s
+    /// production-roster gate, which is the only way a test can hold one) is
+    /// NOT replaced by the holder's self-signed passing record: the plan's own
+    /// refusal stands and the store step is `Conflict`. Memory only — the
+    /// clause lives in `register`, which every backend calls (sqlite/postgres
+    /// cannot hold the row without the production roster).
+    #[tokio::test]
+    async fn i621_a_role_gated_row_is_not_replaced_memory() {
+        use super::bodies::signed;
+        use crate::federation::register::ReplicatedKeyOutcome;
+        use crate::federation::tier_ingest::test_support as ts;
+        use crate::federation::types::identity_type::{CANONICAL, NODE};
+        use crate::federation::FederationDirectory as _;
+        let d = crate::store::memory::MemoryBackend::new();
+        let s = suffix();
+        let a = format!("i621-a-{s}");
+        ts::register_identity_key(&d, &a, NODE).await;
+        let k = format!("i621-k-{s}");
+        let mut stored = ts::replicated_key_record(&k, CANONICAL, &a, &a, "a");
+        let other = ts::sign_envelope(&a, &serde_json::json!({ "owner_binding": k }));
+        stored.scrub_signature_classical = other.1;
+        stored.scrub_signature_pqc = other.2;
+        d.seed_key_row_unchecked_for_test(stored.clone());
+        let held = d.lookup_public_key(&k).await.unwrap().unwrap();
+        assert!(
+            crate::federation::register::stored_record_fails_verification(&d, &held)
+                .await
+                .unwrap(),
+            "precondition: the stored canonical row fails verify_key_registration"
+        );
+        let incoming = ts::replicated_key_record(&k, CANONICAL, &k, &k, "b");
+        let out = d
+            .apply_replicated_key_record(signed(incoming.clone()))
+            .await
+            .unwrap();
+        assert!(
+            matches!(out, ReplicatedKeyOutcome::Refused { .. }),
+            "I621: a role-gated row is not replaced: {out:?}"
+        );
+        let r = d.store_invalid_replaced_key_record(signed(incoming)).await;
+        assert!(
+            matches!(r, Err(crate::federation::Error::Conflict(_))),
+            "I621: the store step refuses a role-gated row: {r:?}"
+        );
+        assert_eq!(
+            d.lookup_public_key(&k)
+                .await
+                .unwrap()
+                .unwrap()
+                .persist_row_hash,
+            held.persist_row_hash
         );
     }
 }
