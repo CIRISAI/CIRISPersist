@@ -3636,6 +3636,57 @@ pub async fn resolve_licensure_authority(
     })
 }
 
+/// v54.0.0 (Codex round 2 on PR #1050) — every version of `current`'s record
+/// this node holds, oldest first, each with the instant it was superseded
+/// (`None` for the live one). Read from the record's DECLARED cohort's chain
+/// (an affiliation's prior versions are recorded under `affiliations`, V182).
+/// A held version that does not decode as a community is a refusal, never a
+/// skipped version: dropping it would hand its instants to a neighbour.
+async fn community_versions(
+    directory: &dyn super::FederationDirectory,
+    current: &super::Community,
+) -> Result<Vec<(super::Community, Option<chrono::DateTime<chrono::Utc>>)>, Error> {
+    let cohort = super::affiliation_config::declared_cohort(current)?;
+    let mut out = Vec::new();
+    for v in directory
+        .list_group_versions(cohort, &current.community_key_id)
+        .await?
+    {
+        if v.is_current {
+            continue;
+        }
+        let snapshot = v.snapshot.get("community").unwrap_or(&v.snapshot);
+        let c: super::Community = serde_json::from_value(snapshot.clone()).map_err(|e| {
+            Error::Backend(format!(
+                "community {} version {}: the held snapshot is not a community: {e}",
+                current.community_key_id, v.version
+            ))
+        })?;
+        out.push((c, v.superseded_at));
+    }
+    out.push((current.clone(), None));
+    Ok(out)
+}
+
+/// v54.0.0 (Codex round 2 on PR #1050) — **the version of `current`'s record
+/// in force at `t`**: the oldest held version not yet superseded at `t`, else
+/// the live record. `superseded_at` is when THIS node applied the
+/// supersession, so a replica that learned of it later holds the prior
+/// version in force a little longer; the door's receipt check (judged against
+/// the live record) is what keeps a removed founder from issuing into that
+/// window after the fact.
+pub(crate) async fn community_in_force_at(
+    directory: &dyn super::FederationDirectory,
+    current: &super::Community,
+    t: chrono::DateTime<chrono::Utc>,
+) -> Result<super::Community, Error> {
+    Ok(community_versions(directory, current)
+        .await?
+        .into_iter()
+        .find(|(_, superseded_at)| superseded_at.is_none_or(|at| at > t))
+        .map_or_else(|| current.clone(), |(c, _)| c))
+}
+
 /// The authority set at `t`, or why there is none a single signer can stand
 /// for. `Err(protocol)`: the community's `consensus_protocol` admits only a
 /// collective act (a quorum), which a single-signed row or edge is not.
@@ -3646,7 +3697,14 @@ async fn licensure_roots_at(
 ) -> Result<Result<std::collections::BTreeSet<String>, String>, Error> {
     match authority {
         LicensureAuthority::Key(k) => Ok(Ok(std::iter::once(k.clone()).collect())),
-        LicensureAuthority::Community(c) => {
+        LicensureAuthority::Community(current) => {
+            // v54.0.0 (Codex round 2 on PR #1050) — the RECORD in force at `t`,
+            // not the one held now. A supersession replaces the roster the fold
+            // seeds from (and may change the protocol); judged against the
+            // current record, a founder the supersession removed vanished from
+            // the roots at every instant, and the folds dropped licences the
+            // door had admitted while that founder stood.
+            let c = &community_in_force_at(directory, current, t).await?;
             // #1036 ruling item 1: "one founder suffices only where the
             // protocol says so" — and only `founder_only` says so. Any other
             // protocol makes a licence an act of the affiliation's quorum, a
@@ -3969,7 +4027,12 @@ pub async fn licences_issued_under(
             roots.insert(k.clone());
         }
         LicensureAuthority::Community(c) => {
-            roots.extend(c.members.iter().map(|m| m.key_id.clone()));
+            // v54.0.0 (Codex round 2 on PR #1050) — every VERSION's members: a
+            // founder a supersession removed issued under an earlier record,
+            // and the verdict judges each row against the record in force then.
+            for (version, _) in community_versions(directory, c).await? {
+                roots.extend(version.members.iter().map(|m| m.key_id.clone()));
+            }
             roots.extend(
                 directory
                     .list_community_membership_widenings_for(&c.community_key_id)

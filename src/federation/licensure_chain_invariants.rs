@@ -1081,6 +1081,112 @@ pub mod bodies {
         )
         .await;
     }
+
+    /// **I604** (v54.0.0, Codex round 2 on PR #1050) — **a founder's licence is
+    /// judged against the record in force when it was signed.** Founders F and
+    /// G found a `founder_only` community; F issues a licence directly at
+    /// `t1`; G then supersedes the record with a roster that omits F. The
+    /// roots were seeded from the CURRENT record, so F was a root at no
+    /// instant and both folds dropped the licence the door had admitted. Now:
+    /// the fold and the list-by-authority still carry F's `t1` licence, and a
+    /// `revoked` F signs after the supersession is testimony that binds nobody.
+    pub async fn exercise_superseded_founder_keeps_issued_licence(
+        dir: &dyn FederationDirectory,
+        tag: &str,
+    ) {
+        use crate::federation::room_roster_authority_invariants::bodies::make_group;
+        use crate::federation::types::consensus_protocol;
+        let now = base();
+        let holder = format!("{tag}-holder");
+        register(dir, &holder, &[identity_type::USER]).await;
+        let (room, keys) = make_group(
+            dir,
+            &format!("{tag}-fo"),
+            consensus_protocol::FOUNDER_ONLY,
+            &["g", "f"],
+            2,
+            None,
+            None,
+        )
+        .await;
+        let (g, f) = (keys[0].clone(), keys[1].clone());
+        let issued = must_put(
+            dir,
+            &licence(&f, &holder, &room, "issued", None, now - Duration::hours(1)),
+            &format!("[{tag}] I604: founder F issues while a founder"),
+        )
+        .await;
+        // G supersedes the record without F.
+        let held = dir.lookup_community(&room).await.unwrap().expect("held");
+        let mut next = held.clone();
+        next.members.retain(|m| m.key_id != f);
+        next.prev_head_digest = held.persist_row_hash.clone();
+        next.persist_row_hash = String::new();
+        dir.supersede_community(
+            crate::federation::tier_ingest::test_support::sign_community(&g, next),
+            None,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("[{tag}] I604: G supersedes the record without F: {e}"));
+        assert!(
+            !dir.lookup_community(&room)
+                .await
+                .unwrap()
+                .expect("held")
+                .members
+                .iter()
+                .any(|m| m.key_id == f),
+            "[{tag}] I604 precondition: the live record no longer names F"
+        );
+        assert_eq!(
+            status_set_for(dir, &holder, &room, Utc::now())
+                .await
+                .expect("fold"),
+            BTreeSet::from([LicensureStatus::Issued]),
+            "[{tag}] I604: F's licence, signed while F was a founder, still binds"
+        );
+        assert!(
+            ids(&licences_issued_under(dir, &room).await.expect("list"))
+                .contains(&issued.attestation_id),
+            "[{tag}] I604: the list-by-authority still finds F's licence"
+        );
+        // After the supersession F is no founder. F's new row, an absorbing
+        // `revoked`, is testimony (the door admits a non-authority row as
+        // testimony, #1036.1) and binds nobody. The pause puts its signed
+        // instant strictly after the supersession this node applied.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let late = must_put(
+            dir,
+            &licence(
+                &f,
+                &holder,
+                &room,
+                "revoked",
+                None,
+                Utc::now().trunc_subsecs(3),
+            ),
+            &format!("[{tag}] I604: F's row after the supersession is admitted as testimony"),
+        )
+        .await;
+        assert!(
+            !crate::federation::admission::row_was_issued_under_authority(dir, &late, &room)
+                .await
+                .expect("verdict"),
+            "[{tag}] I604: F's row after the supersession is not the authority's"
+        );
+        assert_eq!(
+            status_set_for(dir, &holder, &room, Utc::now())
+                .await
+                .expect("fold"),
+            BTreeSet::from([LicensureStatus::Issued]),
+            "[{tag}] I604: F's later `revoked` binds nobody; the `t1` licence stands"
+        );
+        assert!(
+            !ids(&licences_issued_under(dir, &room).await.expect("list"))
+                .contains(&late.attestation_id),
+            "[{tag}] I604: the list-by-authority does not carry F's later row"
+        );
+    }
 }
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
@@ -1166,5 +1272,12 @@ mod run {
         community_authority_roots_the_chain_1035_sqlite,
         community_authority_roots_the_chain_1035_postgres,
         "lic-aff"
+    );
+    on_every_backend!(
+        exercise_superseded_founder_keeps_issued_licence,
+        i604_superseded_founder_keeps_issued_licence_memory,
+        i604_superseded_founder_keeps_issued_licence_sqlite,
+        i604_superseded_founder_keeps_issued_licence_postgres,
+        "i604"
     );
 }
