@@ -28,8 +28,12 @@ mod tests {
         let mut lines = text.lines().peekable();
         while let Some(line) = lines.next() {
             let t = line.trim_start();
+            // v54.0.0 (Codex round 3 on PR #1050, I14 false red) — a
+            // `#[cfg(all(test, …))]` item is test-only code too; the stripper
+            // missed it and I14 read a test body's floor call as a door.
             let is_test_attr = t.starts_with("#[cfg(test)]")
                 || t.starts_with("#[cfg(any(test")
+                || t.starts_with("#[cfg(all(test")
                 || t.starts_with("#[tokio::test")
                 || t.starts_with("#[test]");
             if is_test_attr {
@@ -54,6 +58,31 @@ mod tests {
             out.push('\n');
         }
         out
+    }
+
+    /// **I612** (v54.0.0) — `production_only` strips every test-only
+    /// gating, including `#[cfg(all(test, …))]`. A module gated that way held
+    /// a witness's `store_blob_local` call and I14 reported it as a door.
+    #[test]
+    fn i612_production_only_strips_cfg_all_test_items() {
+        let text = "fn keep() {}\n\
+            #[cfg(all(test, any(feature = \"sqlite\", feature = \"postgres\")))]\n\
+            mod bodies {\n    fn f() {\n        b.store_blob_local(\n    }\n}\n\
+            #[cfg(any(test, feature = \"x\"))]\nfn g() { .put_blob_with_scope( }\n\
+            #[cfg(test)]\nmod t { fn h() { .seal_stream_with_scope( } }\n\
+            fn keep_too() {}\n";
+        let out = production_only(text);
+        assert!(out.contains("fn keep()") && out.contains("fn keep_too()"));
+        for gated in [
+            ".store_blob_local(",
+            ".put_blob_with_scope(",
+            ".seal_stream_with_scope(",
+        ] {
+            assert!(
+                !out.contains(gated),
+                "I612 a test-only item survived the stripper: {gated}\n{out}"
+            );
+        }
     }
 
     // ── I8 ───────────────────────────────────────────────────────────────
