@@ -595,6 +595,21 @@ impl SqliteBackend {
         .expect("test_dag_link");
     }
 
+    /// v54.0.0 (#994) — TEST SEAM: drop one stream chunk row (a stream that
+    /// no longer holds exactly its manifest's chunks).
+    #[cfg(test)]
+    pub(crate) async fn test_drop_stream_chunk_row(&self, stream_id: &str, seq: u64) {
+        let stream = stream_id.to_owned();
+        self.write(move |conn| {
+            conn.execute(
+                "DELETE FROM federation_stream_chunks WHERE stream_id = ?1 AND seq = ?2",
+                rusqlite::params![stream, seq as i64],
+            )
+        })
+        .await
+        .expect("drop stream row");
+    }
+
     /// CIRISPersist#829 — the read pool, the way [`Self::conn_handle`] is the
     /// writer. A sibling view that should read through the pool is built
     /// with [`Self::from_handles`]; readers are shared, never re-opened per
@@ -3470,6 +3485,68 @@ impl SqliteBackend {
         Ok(AdoptScrubOutcome::Upgraded)
     }
 
+    /// v54.0.0 (CIRISPersist#995 row 2) — TEST SEAM: reproduce what a
+    /// pre-v53.1.4 UPDATE door left behind: `additional_scrubs` emptied while
+    /// `persist_row_hash` still binds the full record. Nothing else moves.
+    #[cfg(any(test, feature = "test-anchor"))]
+    pub async fn test_seam_drop_key_additional_scrubs(
+        &self,
+        key_id: &str,
+    ) -> Result<(), crate::federation::Error> {
+        let k = key_id.to_owned();
+        self.write(move |conn| {
+            conn.execute(
+                "UPDATE federation_keys SET additional_scrubs = '[]' WHERE key_id = ?1",
+                rusqlite::params![k],
+            )
+        })
+        .await
+        .map(|_| ())
+        .map_err(|e| crate::federation::Error::Backend(e.to_string()))
+    }
+
+    /// v54.0.0 (CIRISPersist#995 row 2) — write back the `additional_scrubs`
+    /// a pre-v53.1.4 UPDATE door dropped. The plan
+    /// (`ReplicatedKeyPlan::RehydrateScrubs`) has established that the held
+    /// row's `persist_row_hash` binds `record` exactly and that its column is
+    /// empty; the WHERE re-asserts both atomically, so nothing but the scrub
+    /// set moves (the hash already covers it). Moves the serve position and
+    /// re-indexes, like every door that rewrites consumer-visible bytes.
+    /// `Conflict` when the row changed between plan and act.
+    pub(crate) async fn rehydrate_dropped_key_scrubs(
+        &self,
+        record: &crate::federation::KeyRecord,
+    ) -> Result<(), crate::federation::Error> {
+        let kid = record.key_id.clone();
+        let hash = record.persist_row_hash.clone();
+        let text = serde_json::to_string(&record.additional_scrubs).map_err(|e| {
+            crate::federation::Error::Backend(format!("additional_scrubs serialize: {e}"))
+        })?;
+        let k = kid.clone();
+        let n = self
+            .write(move |conn| -> Result<usize, rusqlite::Error> {
+                let mutated_at = sqlite_next_key_serve_position(conn)?;
+                conn.execute(
+                    "UPDATE federation_keys SET additional_scrubs = ?3, mutated_at = ?4 \
+                     WHERE key_id = ?1 AND persist_row_hash = ?2 AND additional_scrubs = '[]'",
+                    rusqlite::params![k, hash, text, mutated_at.to_rfc3339()],
+                )
+            })
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!(
+                    "rehydrate_dropped_key_scrubs {kid}: {e}"
+                ))
+            })?;
+        if n == 0 {
+            return Err(crate::federation::Error::Conflict(format!(
+                "rehydrate_dropped_key_scrubs {kid}: row changed concurrently"
+            )));
+        }
+        self.index_stored_key_row(&kid).await?;
+        Ok(())
+    }
+
     /// v13.7.0 (CIRISPersist#405) — the CANONICAL SUPERSEDE store: replace an
     /// existing **anchor-scrubbed canonical** row IN PLACE with a strictly-newer,
     /// same-pubkey, m-of-n-re-verified re-scrubbed record (the CEG-native runtime
@@ -3694,6 +3771,16 @@ impl SqliteBackend {
         };
         match plan_replicated_key_apply(self, &record.record).await? {
             ReplicatedKeyPlan::Unchanged => Ok(ReplicatedKeyOutcome::Unchanged),
+            // v54.0.0 (#995 row 2) — write back the scrubs a pre-v53.1.4 door dropped.
+            ReplicatedKeyPlan::RehydrateScrubs => {
+                let mut r = record.record;
+                r.persist_row_hash = crate::federation::types::compute_persist_row_hash(&r)?;
+                match self.rehydrate_dropped_key_scrubs(&r).await {
+                    Ok(()) => Ok(ReplicatedKeyOutcome::ScrubsRehydrated),
+                    Err(crate::federation::Error::Conflict(_)) => Ok(RACED),
+                    Err(e) => Err(e),
+                }
+            }
             // The plan produced the reason at the branch that fired; carry it
             // through rather than re-deriving it here (#565).
             ReplicatedKeyPlan::Refused { reason } => Ok(ReplicatedKeyOutcome::Refused { reason }),
@@ -15160,6 +15247,13 @@ impl crate::federation::BlobStorage for SqliteBackend {
                         group,
                     ],
                 )?;
+                // v54.0.0 (#995 row 4, V184) — THIS write's room, whether or
+                // not the row above was new: shared plaintext keeps every room.
+                tx.execute(
+                    "INSERT INTO federation_blob_associations (sha256, cohort_scope, group_key_id) \
+                     VALUES (?1, ?2, COALESCE(?3, '')) ON CONFLICT DO NOTHING",
+                    rusqlite::params![sha_vec, scope, group],
+                )?;
             }
             // v36.0.0 (#668) — serve position (V130), inside the same
             // transaction as the write.
@@ -15369,6 +15463,14 @@ impl crate::federation::BlobStorage for SqliteBackend {
                     group,
                 ],
             )?;
+            // v54.0.0 (#995 row 4, V184) — a plaintext row keeps every room.
+            if tier == crate::federation::types::cohort_scope::CryptoTier::Plaintext.as_str() {
+                conn.execute(
+                    "INSERT INTO federation_blob_associations (sha256, cohort_scope, group_key_id) \
+                     VALUES (?1, ?2, COALESCE(?3, '')) ON CONFLICT DO NOTHING",
+                    rusqlite::params![sha_vec, scope, group],
+                )?;
+            }
             Ok(())
         })
         .await
@@ -18362,6 +18464,77 @@ impl crate::federation::BlobStorage for SqliteBackend {
             .collect()
     }
 
+    async fn list_unlinked_chunk_dags(
+        &self,
+        after: Option<[u8; 32]>,
+        limit: u32,
+    ) -> Result<Vec<[u8; 32]>, crate::federation::BlobError> {
+        let after = after.map(|a| a.to_vec()).unwrap_or_default();
+        let lim = i64::from(limit);
+        let rows: Vec<Vec<u8>> = self
+            .read(move |conn| -> Result<Vec<Vec<u8>>, rusqlite::Error> {
+                let mut stmt = conn.prepare(
+                    "SELECT b.sha256 FROM federation_blobs b \
+                      WHERE b.storage_kind = 'chunk_dag' AND b.sha256 > ?1 \
+                        AND NOT EXISTS (SELECT 1 FROM federation_dag_chunks d \
+                                         WHERE d.manifest_sha256 = b.sha256) \
+                      ORDER BY b.sha256 LIMIT ?2",
+                )?;
+                let it = stmt.query_map(rusqlite::params![after, lim], |r| r.get(0))?;
+                it.collect()
+            })
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!("list_unlinked_chunk_dags: {e}"))
+            })?;
+        rows.into_iter()
+            .map(|v| {
+                <[u8; 32]>::try_from(v.as_slice()).map_err(|_| {
+                    crate::federation::BlobError::Backend(
+                        "list_unlinked_chunk_dags: a 32-byte sha".into(),
+                    )
+                })
+            })
+            .collect()
+    }
+
+    async fn link_dag_chunks_if_exact(
+        &self,
+        manifest_sha: &[u8; 32],
+        stream_id: &str,
+        chunks: &[(u64, [u8; 32])],
+    ) -> Result<bool, crate::federation::BlobError> {
+        let manifest = manifest_sha.to_vec();
+        let stream = stream_id.to_owned();
+        let mut want: Vec<(i64, Vec<u8>)> = chunks
+            .iter()
+            .map(|(seq, sha)| (i64::try_from(*seq).unwrap_or(i64::MAX), sha.to_vec()))
+            .collect();
+        want.sort();
+        self.write(move |conn| -> Result<bool, rusqlite::Error> {
+            let tx = conn.transaction()?;
+            let held: Vec<(i64, Vec<u8>)> = {
+                let mut stmt = tx.prepare(
+                    "SELECT seq, chunk_sha FROM federation_stream_chunks \
+                      WHERE stream_id = ?1 ORDER BY seq",
+                )?;
+                let it =
+                    stmt.query_map(rusqlite::params![stream], |r| Ok((r.get(0)?, r.get(1)?)))?;
+                it.collect::<Result<_, _>>()?
+            };
+            if held.is_empty() || held != want {
+                return Ok(false);
+            }
+            sqlite_link_dag_chunks(&tx, &manifest, &stream)?;
+            tx.commit()?;
+            Ok(true)
+        })
+        .await
+        .map_err(|e| {
+            crate::federation::BlobError::Backend(format!("link_dag_chunks_if_exact: {e}"))
+        })
+    }
+
     async fn stream_positions_of_chunk(
         &self,
         chunk_sha: &[u8; 32],
@@ -18664,6 +18837,33 @@ impl crate::federation::BlobStorage for SqliteBackend {
             self.index_holder_claim(id, tier).await?;
         }
         Ok(sha256)
+    }
+
+    async fn blob_associations(
+        &self,
+        sha256: &[u8; 32],
+    ) -> Result<Vec<(String, Option<String>)>, crate::federation::BlobError> {
+        let sha = sha256.to_vec();
+        let rows: Vec<(String, String)> = self
+            .read(
+                move |conn| -> Result<Vec<(String, String)>, rusqlite::Error> {
+                    let mut stmt = conn.prepare(
+                        "SELECT cohort_scope, group_key_id FROM federation_blob_associations \
+                      WHERE sha256 = ?1 ORDER BY cohort_scope, group_key_id",
+                    )?;
+                    let it =
+                        stmt.query_map(rusqlite::params![sha], |r| Ok((r.get(0)?, r.get(1)?)))?;
+                    it.collect()
+                },
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!("blob_associations: {e}"))
+            })?;
+        Ok(rows
+            .into_iter()
+            .map(|(s, g)| (s, (!g.is_empty()).then_some(g)))
+            .collect())
     }
 
     async fn blob_provenance(
@@ -20852,6 +21052,11 @@ impl SqliteBackend {
                 "DELETE FROM federation_manifest_children WHERE root_sha256 = ?1",
                 rusqlite::params![sha_vec],
             )?;
+            // v54.0.0 (#995 row 4) — the rooms die with the row.
+            tx.execute(
+                "DELETE FROM federation_blob_associations WHERE sha256 = ?1",
+                rusqlite::params![sha_vec],
+            )?;
             let n = tx.execute(
                 "DELETE FROM federation_blobs WHERE sha256 = ?1",
                 rusqlite::params![sha_vec],
@@ -21673,6 +21878,24 @@ impl crate::outbound::OutboundQueue for SqliteBackend {
         .map_err(|e| crate::outbound::Error::Backend(format!("list_outbound: {e}")))
     }
 
+    async fn outbound_counts(
+        &self,
+    ) -> Result<
+        std::collections::HashMap<crate::outbound::OutboundStatus, u64>,
+        crate::outbound::Error,
+    > {
+        let rows: Vec<(String, i64)> = self
+            .read(move |conn| -> rusqlite::Result<Vec<(String, i64)>> {
+                let mut stmt = conn
+                    .prepare("SELECT status, COUNT(*) FROM edge_outbound_queue GROUP BY status")?;
+                let it = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+                it.collect()
+            })
+            .await
+            .map_err(|e| crate::outbound::Error::Backend(format!("outbound_counts: {e}")))?;
+        crate::outbound::counts_from_rows(rows)
+    }
+
     async fn cancel_outbound(
         &self,
         queue_id: &crate::outbound::QueueId,
@@ -22071,6 +22294,13 @@ fn sqlite_upsert_wire_index(
     content_hash: &str,
     record_key: &str,
 ) -> rusqlite::Result<()> {
+    // v54.0.0 (CIRISPersist#995 row 5) — a record has ONE current content
+    // hash: drop the mappings its earlier bytes left (V183 makes this a seek).
+    conn.execute(
+        "DELETE FROM signed_wire_index \
+         WHERE kind = ?1 AND record_key = ?3 AND content_hash <> ?2",
+        rusqlite::params![kind, content_hash, record_key],
+    )?;
     conn.execute(
         "INSERT INTO signed_wire_index (kind, content_hash, record_key) \
          VALUES (?1, ?2, ?3) \

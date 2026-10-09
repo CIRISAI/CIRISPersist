@@ -156,6 +156,121 @@ CC 4.1.1's anti-pattern row "Cycles (A → B → A)" says the substrate MUST det
 - Witness I590, one body on memory, sqlite and postgres. It covers: a two-hop chain closure is refused and not stored; the self-edge admits; each retraction gate alone; an expired edge; a closed term under either spelling and a term not yet open; the ceiling (on a 17-hop chain, the 16-hop closure is refused and the 17-hop closure admits); and a local cycle-closing edge refused at `enter_mesh` and left local. `delegates_to_graph_cycles_and_depth_sqlite` stored a two-key cycle to test the walk's visited guard. It now asserts that edge is refused and reaches the guard through a self-edge.
 - Mutation-checked: 8 mutants, all killed on all three backends. Gate body off reds (1). Promotion-stack call removed reds (7). Self-edge refused reds (2). Gate (a) removed reds (3). Gate (b) removed reds (4). Expiry check removed reds (5). Depth `>=` to `>` reds (6). (A first-cut mutant, self-edge exemption removed, was killed by the earlier (2) and is superseded by the refusing one.)
 
+### Fixed — a steward's shorter `retain` window naming the machine bounds both retention sweeps (#1015)
+
+Ruled on #1015 (2026-10-09): a steward's `retain:<window>` on a row naming the machine in `for_key_id` is binding, and the data is deleted at the shorter window. Through v53 both sweeps folded the subject's own rows alone. Content was kept past a human's window, and the watch recorded no breach.
+
+- **The fold.** `consent_by_humans::retain_bound_by_principals(directory, holder, subject, now)` returns a `RetainBound`. Its stance is the `retain` stance by principals: the subject's own rows and each steward's rows naming the subject. Its `retain_until` is the minimum live window. Its `governed_by` names the principal whose window that is. It shares one per-principal walk with `resolve_scoped_stance_by_principals`, so the consent door and the sweeps cannot disagree on whose rows count. A steward row whose signed `expires_at` has passed, or that names another machine or none, bounds nothing.
+- **The eviction door.** `Engine::evict_fountain_content_by_consent` now runs `fountain::retention::consent_retention_verdict`, a generic body over any directory. The all-scope stance is unchanged and still the subject's own. A hard delete logs the governing principal.
+- **The deletion-window watch.** `run_deletion_window_watch` asks the same bound. Its `retain_window_breach` row gains the detail member `retain_governed_by`. `retain_window_breach_event` takes the governor as a new argument, which breaks Rust callers.
+- **For adopters.** The first sweep after upgrading may evict content, or record a breach, for rows already past a steward's window.
+
+Witnesses run on memory, sqlite and postgres:
+
+- **I570a** covers five cases through the eviction verdict, with the content kept the day before the window ends and hard-deleted the day after. A shorter steward window governs. A shorter machine window governs. An expired steward row leaves the machine's window. A steward row naming a sibling, or no machine, is ignored.
+- **I570b** checks that the watch records the breach on day 31 under a steward's 30-day window against the machine's 90. The audit row names the steward.
+- **I570c** is a from-disk check that both sweeps reach the principal bound and neither calls the subject-only fold.
+
+Mutation-checked, 6 of 6 killed. Folding no steward rows reds I570a and I570b. Taking the maximum window does the same. The watch on the subject-only fold reds I570b and I570c. The verdict on the subject-only fold reds I570a and I570c. Dropping the `for_key_id` filter reds I570a. A breach row without the governor reds I570b.
+
+### Fixed — Codex on #993 and #987: the equal-instant repair fails closed, stranded rows re-hydrate, one record per instant, one hash per record, shared plaintext keeps every room (#995)
+
+Codex reviewed v53.1.4 and v53.1.3. All five findings are fixed here.
+
+- **Row 1. A lookup failure no longer licenses the repair.** `admission::record_carries_accord_scrub_over_roster` turned any failure of the held row's founder lookup into `false`. The equal-instant arm reads `false` as "the held row lacks the quorum" and replaces it, so the repair failed open on an infrastructure error. The co-scrub check now has a typed failure, `CoscrubFailure`, that separates a refusal from a lookup error. The error propagates. The community leg's `key_record_carries_accord_scrub` asks the same function, so a lookup failure there is now an error instead of "not seated".
+- **Row 2. A row a pre-v53.1.4 door stranded is re-hydrated.** Those doors hashed the full record into `persist_row_hash` and dropped `additional_scrubs` from the column. A re-offer of that record hashed equal and was read as `Unchanged`, so the row stayed a one-holder record for good. The replicated key plan now sees the drop: the stored hash binds the incoming record, the column is empty, and the record carries scrubs. It verifies the record, then writes the scrubs back through a new `rehydrate_dropped_key_scrubs` door on sqlite and postgres, and memory gets the same arm. The door is a compare-and-set on the hash and the empty column, and it moves the serve position and re-indexes. `ReplicatedKeyOutcome` gains `ScrubsRehydrated`, serialized `"scrubs_rehydrated"`, appended. The boot's canonical seed accepts it, so a node seeded from the bundle heals at boot.
+- **Row 3. The equal-instant arm admits only the same record.** As settled on the issue, the two envelopes must match with `roles` compared as a set and every other member byte-equal. The live canonical differs from the bundle only in role order and is still repaired. A record with different `transport_hints`, or a different role set, at the same instant is refused, so two ceremony retries cannot split the address. Two spellings of one nanosecond are now two different records and are refused, which changes the v53.1.4 precheck test that pinned them as equal.
+- **Row 5. The wire index keeps one hash per record.** `signed_wire_index` is keyed by kind and content hash. A re-index after a record's hash moved left the old mapping behind, so `list_wire_hashes_since` kept advertising a hash whose point read answers `None`. Every upsert on all three backends now deletes the record key's other mappings first, and `rebuild_signed_wire_index` uses the same upsert. This covers a withdrawn location proof, an anchor-scrub upgrade and a PQC completion. New migration **V183** indexes `(kind, record_key)` on both dialects so the delete is a seek. Its checksums are appended to `evidence/migration_checksums.tsv`.
+- **Row 4. Shared plaintext keeps every room.** A plaintext blob is content-addressed, so the same bytes written into rooms A and B are one row. Its insert is `ON CONFLICT (sha256) DO NOTHING`, so the row kept A's `cohort_scope` and `group_key_id`. B's write succeeded and announced, but a custody report naming B was refused `custody_ack_malformed`. New migration **V184**, `federation_blob_associations`, records one row per `(sha256, cohort_scope, group)` that a plaintext write named. It is backfilled from every plaintext row's own provenance. A blob shared before the migration keeps only its first writer's room until its other rooms write it again. `put_blob_with_scope` and `store_blob_local` record the association in the same write on both backends, and `delete_blob` removes it. A new `BlobStorage::blob_associations` reads the set. `custody_ack_input_for` accepts a named cohort or target that is one of the blob's associations, and refuses any other as before. With no target named and one room at the cohort, it uses that room. Durability is unchanged: a plaintext room is always an infrastructure community, whose audience is already everyone, so a union over the rooms would change nothing.
+
+Witnesses:
+
+- **I571** (unit) covers role order repaired, different hints refused, a different role set refused and a duplicated role refused. Newer is unchanged.
+- **I571b** (memory, sqlite, postgres) checks the same two cases at the supersede decision over a real directory.
+- **I573** (memory, sqlite, postgres) makes the held row's founder lookup fail through the fault-injecting directory. The quorum question returns an error, and the supersede decision returns an error instead of repairing.
+- **I572** (memory, sqlite, postgres, in `tests/reanchor_5314.rs`) inserts the final record whole and drops its scrubs through a new test seam. It then checks that the re-offer answers `ScrubsRehydrated`, that the row carries the quorum again, and that a second re-offer is `Unchanged`.
+- **I574** (memory, sqlite, postgres, inside I523) checks that after a withdrawal the old hash is no longer listed, and that a rebuild leaves the one current mapping.
+- **I579** (sqlite, postgres; memory has no blob storage) writes the same bytes into two infrastructure rooms. Both rooms are listed as associations. A custody report naming the second room is accepted and its envelope names that room. A room that never wrote the bytes is still refused `custody_ack_malformed`. The durability audience covers the second room.
+
+Mutation-checked, 7 of 7 killed. A lookup error read as `false` reds I573 on memory and sqlite. Roles compared byte-equal reds I571 and I571b. Envelopes always matching does the same. Disabling the rehydrate arm reds I572 on memory and sqlite. Removing the prune reds I574 on sqlite, on postgres and, through the memory upsert, on memory.
+
+Row 4 is mutation-checked as well, 3 of 3 killed. Dropping the association write reds I579 on sqlite and on postgres. Custody ignoring the associations reds I579. A union of the durability audience over the rooms was written and then removed, because its mutant survived: every plaintext room already reaches everyone. Dropping the association delete on `delete_blob` has no witness.
+
+### Fixed — the family plane's exact unsigned re-add is the idempotent no-op (#990)
+
+#936 (v51.2.0) made the exact roster re-add a no-op, whatever the spec, on the community plane. The family plane, which v49 moved onto the widening plane, still sent the retry to the put door, which verified the empty spec first and refused it `federation_tier_unverified`. CIRISConformance found it on v53.1.2. The default `add_family_member` now answers `false` with no row and no verify when a widening for the same member at the same instant is already on the plane, exactly as the community arm does.
+
+**I575** (memory, sqlite, postgres, inside I177): an unsigned exact retry of a widened family member is a no-op. Checked against the exact pre-fix function: red on memory and sqlite with the bulk-ingest refusal Conformance reported. A narrower mutant that only disables the new early return survives, because the active-roster check after it also answers `false` for an authorized widening. The early return is kept to match the community arm.
+
+### Added — the V176 chunk-relation backfill for DAGs sealed or promoted before v53.1.0 (#994)
+
+CIRISEdge asked for this for #771. V176 (v53.1.0) writes a DAG's chunk-to-manifest relation only at the seal or the promote. Every DAG sealed or promoted earlier has none, even on its author's node, and Edge kept a counted stream-walk fallback for those. This backfill lets Edge retire that fallback for every DAG a node can open.
+
+- **The sweep.** `chunk_dag_cascade::orchestrate::backfill_dag_chunk_links(backend, node_key_id, max_manifests)` walks the `chunk_dag` manifests with no relation, in sha order. It opens each one as this node: a plaintext manifest in clear, a sealed one with the node's own grant and no caller data, including each child of a v3 root. It then writes the relation only if the stream the manifest names still holds exactly the manifest's chunks, at their seqs and with their shas. That check and the write happen in one transaction on both backends, through the new `BlobStorage::link_dag_chunks_if_exact`. The candidate list comes from the new `BlobStorage::list_unlinked_chunk_dags`. A directory or store failure is an error, never a skip.
+- **The report.** `DagLinkBackfillReport` counts `scanned`, `linked`, `skipped_no_key`, `skipped_stream_mismatch` and `truncated`. `skipped_no_key` covers a manifest not granted to this node and one sealed under a viewer's associated data, such as an Edge file pointer's `content_aad`, which only a viewer holds. Those stay link-less, and Edge's fallback covers them until a viewer promotes them again.
+- **Where it runs.** `Engine::backfill_dag_chunk_links(max_manifests)` is the operator door. Every Engine constructor runs it once at boot with a cap of 10,000 manifests, best effort and logged, next to the KeyGrant boot sweep. A skipped manifest is examined again at the next boot.
+- **No migration.** The backfill must open sealed manifests with a key, which SQL cannot do, so it is code, not a new migration. V176 is unchanged.
+
+Witnesses run on sqlite and postgres. The memory backend has no blob storage.
+
+- **I576** uses two nodes. A seals three DAGs and B adopts and promotes the first. Every relation is then dropped, one stream loses a row, and one DAG was sealed under associated data. A's sweep links exactly the first DAG's four chunks, terminator included, and skips the moved stream and the unopenable DAG. A second pass links nothing new. The cap truncates. B's sweep links the DAG it adopted, opened with its own grant.
+- **I576b** is a from-disk check that every constructor running the KeyGrant boot sweep also runs the backfill.
+
+Mutation-checked, 4 of 5 killed. Dropping the exactness check reds I576 on sqlite and on postgres. Dropping the boot hook from one constructor reds I576b. Propagating a no-key failure as an error reds I576. A cursor that stops after the first page survives, because the fixture never fills a 256-manifest page.
+
+### Added — `outbound_counts()`: the outbound queue's rows by status (#996); Fixed — the postgres outbound queue's `queue_id` doors never ran
+
+CIRISEdge#814 item 2: Edge's `durable_queue_depth` counted only enqueues, so a queue that drained read as one that never did. Edge wants the resident depth (`Pending + Sending + AwaitingAck`) in its metrics snapshot without listing rows to count them.
+
+- **New.** `OutboundQueue::outbound_counts() -> HashMap<OutboundStatus, u64>` is one `SELECT status, COUNT(*) … GROUP BY status` on sqlite and postgres, and a fold on memory. Statuses with no row are absent. An unknown status in the table is an error, not a dropped row. It crosses the outbound ops capsule as an appended op, `OutboundCounts {}`, answering the appended result `Counts(..)`, with no vtable change. PyO3 exposes `Engine.outbound_counts()` as `{status: count}`, classified `empirical` and stubbed in the `.pyi`.
+- **Found by the witness, fixed.** No test had ever run the outbound queue on postgres. Every door that names a row bound the `String` queue id against `$n::uuid`, so Postgres inferred the parameter as `uuid` and the driver refused to serialize it. That is `mark_transport_delivered`, `mark_transport_failed`, `mark_replay_resolved`, `mark_ack_received`, `outbound_status`, `cancel_outbound` and `replay_abandoned`, nine binds in all. `mark_transport_delivered` also failed earlier, with `inconsistent types deduced for parameter $1`, because its timestamp was used both bare and inside a `CASE`. On postgres no row could leave `sending`. The binds are now `$n::text::uuid` and the timestamp is cast.
+
+Witnesses:
+
+- **I577** (memory, sqlite, postgres) runs four rows through enqueue, claim, deliver with and without ACK, a failure at the last attempt, the ACK, then a status read, a cancel and a replay. At every step the counts equal `list_outbound`'s per-status lengths, equal the expected map, and sum to the four rows.
+- **I577b** (capsule) checks that the appended op answers `Counts` with only the status that has rows.
+
+Mutation-checked, 6 of 7 killed. Memory skipping `sending` reds I577 on memory. Sqlite filtering one status reds I577 on sqlite. The capsule answering `Count` reds I577b. Postgres reverted to `$3::uuid` on delivery reds I577 on postgres, and so does `$2::uuid` on replay and removing both timestamp casts. Removing only the second timestamp cast survives, because the first cast already fixes the parameter's type.
+
+### Fixed — `tls` and `pyo3-sqlite` compile on their own (#1030)
+
+The #1025 powerset found two declared features that did not compile alone. Each now declares the feature its code needs. Both decisions change the public feature contract.
+
+- **`tls` now implies `postgres`.** Every line of TLS code is the Postgres pool's transport, in `src/store/postgres.rs`, so there is no backend-agnostic TLS to make. Alone, `tls` built `tokio-postgres-rustls` against a `tokio-postgres` the `postgres` feature never configured. A consumer that enables `tls` now gets the Postgres backend with it, which it needed anyway.
+- **`pyo3-sqlite` now implies `sqlite`, and is not retired.** It is the postgres-free Python surface for mobile and Windows wheels. Persist's own Android job builds with `pyo3` plus the mobile set, but CIRISEdge points its mobile and Windows wheels at `pyo3-sqlite`, and certify's `pyo3sqlite` leg builds it. Alone, it enabled the FFI module with no backend at all, which gave 184 `E0004` on an uninhabited `BackendDispatch`. Implying `pyo3` would pull postgres and openssl, the one thing this shape exists to drop. With `sqlite`, the Python module needs no other change: it already gates its postgres paths.
+- **The gate.** `scripts/ci_feature_matrix.py` gains an `ALONE_COMPILE` table mapping each feature to the prerequisite it implies, and an `alone` command. `check` fails if Cargo.toml drops an implication, or if ci.yml stops compiling each feature alone. The lint job gains that step, a `cargo check --no-default-features --features <f>` loop. The weekly powerset job in `mutants.yml` is no longer `continue-on-error`, as planned when #1030 was filed. `docs/FEATURE_MATRIX.md` records both decisions.
+
+Checked by compiling `tls`, `tls,test-panic` and `pyo3-sqlite` alone, each with no errors and no warnings. Mutation-checked, 3 of 3 killed, each by `ci_feature_matrix.py check` exiting 1: dropping `postgres` from `tls`, dropping `sqlite` from `pyo3-sqlite`, and removing the CI loop. The last one first survived, because the step's name also named the command, so the check is now anchored to the command substitution.
+
+### Changed — the public async doors stay under `clippy::large_futures` (#1017)
+
+Edge, gating v53.1.8 with `clippy::large_futures` at its 16 KiB default, found `trust_root::resolve_serve_tier` at about 29 KB and its own inbound dispatch at about 19 KB. It boxed both at its call sites, and every caller would otherwise have to do the same. The cause was the fold wrapper from #1014, `observe::fold`. Each fold kept its whole inner future inline, so serve tier, then `trust_root_valid`, then `owner_granted_scope` stacked up.
+
+- **The fix is at the door.** `observe::fold` now boxes the future it wraps, eagerly, when the wrapper is built. An un-polled `async fn` keeps its arguments inline, so a box taken inside the body still left the inner future in the caller's state. Measured with that variant: `resolve_serve_tier` went from 28,904 to 8,200 bytes, and boxing eagerly brings it to 176. The cost is one allocation per fold entry. `fold` is now a plain `fn` returning `impl Future`. Its counting and task-local scope are unchanged.
+- **The lint.** `#![warn(clippy::large_futures)]` is set crate-wide, so every `-D warnings` clippy pass refuses a new large future awaited inside persist. That covers both the shipped shape and `--all-features --all-targets`. One test future, about 18 KB across four postgres matrices in `accord_carriage`, is boxed. The lib had four sites before the fix and has none after.
+
+Measured with `std::mem::size_of_val` on the un-polled future, in bytes:
+
+| door | before | after |
+|---|---:|---:|
+| `trust_root::resolve_serve_tier` (memory / dyn) | 28,904 / 29,544 | 176 / 192 |
+| `Engine::hold_breadth` | 28,952 | 224 |
+| `consent_by_humans::capacity_consent_stance` | 3,832 | 320 |
+| `admission::check_capacity_consent_admission` | 3,888 | 376 |
+| `consent_by_humans::resolve_scoped_stance_by_principals` | 3,648 | 136 |
+| `Engine::capacity_consent_stance` | 3,904 | 392 |
+| `FederationDirectory::put_attestation` | 16 | 16 |
+
+The trait methods are already boxed by `async_trait`, so `put_attestation` was never large. Edge's 19 KB dispatch future is Edge's own state around a consent gate that measured about 3.9 KB.
+
+**I578** (`src/future_size_gate.rs`) builds each door's future without polling it, on memory and on a sqlite Engine, and asserts every one is under 16 KiB. It covers the futures persist hands out, which the lint inside persist cannot see.
+
+Mutation-checked:
+
+- **Killed.** An unboxed `fold` reds both I578 tests. Removing the test future's box reds `clippy --all-features --all-targets -D warnings`.
+- **Survived.** A `fold` that boxes lazily, inside its body, survives I578 at 8,200 bytes, which is under the threshold. Only the eager box's extra margin goes unpinned.
+- **Removed as redundant.** A box on the postgres put door's 16.5 KB admission block was added and then removed. The lint no longer fires there once the folds box themselves.
+
 ## [53.2.0] - 2026-10-08
 
 ### Changed — the tag is pushed once main's run EXISTS, not once it completes (#1008)

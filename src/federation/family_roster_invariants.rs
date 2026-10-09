@@ -286,10 +286,27 @@ pub mod bodies {
             "{tag} I177: a genuine add"
         );
         assert!(
-            !a.add_family_member_consented(&fam, carol_row, &spec)
+            !a.add_family_member_consented(&fam, carol_row.clone(), &spec)
                 .await
                 .unwrap(),
             "{tag} I177: the same row again is the idempotent no-op"
+        );
+        // v54.0.0 (CIRISPersist#990) — **I575**, the family twin of #936: the
+        // exact retry is the no-op WHATEVER the spec. An unsigned retry was
+        // refused `tier_unverified` on the family plane through v53.
+        let empty = crate::federation::cohort::AdmitSpec {
+            authority_key_id: String::new(),
+            scrub_signature_classical: String::new(),
+            scrub_signature_pqc: None,
+            cosignatures: Vec::new(),
+        };
+        assert!(
+            !a.add_family_member_consented(&fam, carol_row.clone(), &empty)
+                .await
+                .unwrap_or_else(|e| panic!(
+                    "{tag} I575: an unsigned exact retry must be the idempotent no-op, got {e}"
+                )),
+            "{tag} I575: the unsigned exact retry is a no-op"
         );
         assert_eq!(
             record_hash(a, &fam).await,

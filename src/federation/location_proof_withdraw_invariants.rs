@@ -238,6 +238,29 @@ pub(crate) mod reindex_bodies {
                 .is_none(),
             "I523 the pre-withdrawal hash resolves to nothing"
         );
+        // **I574** (v54.0.0, #995 row 5) — and the listing no longer
+        // ADVERTISES it: the re-index upserted the new hash and left the
+        // `(kind, old_hash)` row behind, so anti-entropy kept offering a hash
+        // whose point read answers `None`.
+        let listed = d
+            .list_wire_hashes_since("LocationProof", None, 10_000)
+            .await
+            .unwrap();
+        assert!(
+            listed.contains(&hash1),
+            "I574 the withdrawn row's hash is listed"
+        );
+        assert!(
+            !listed.contains(&hash0),
+            "I574 the pre-withdrawal hash is no longer advertised: {listed:?}"
+        );
+        // A rebuild leaves the one current mapping.
+        d.rebuild_signed_wire_index().await.unwrap();
+        let listed = d
+            .list_wire_hashes_since("LocationProof", None, 10_000)
+            .await
+            .unwrap();
+        assert!(listed.contains(&hash1) && !listed.contains(&hash0));
     }
 
     /// **I524** (v53.1.3, Codex on #985 P2, #986) — **the withdrawal write is

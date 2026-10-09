@@ -47,6 +47,8 @@
 #[cfg(feature = "sqlite")]
 pub mod sqlite_open;
 pub mod types;
+// v54.0.0 (#996) — I577: the status counts equal the rows, on every backend.
+mod counts_invariants;
 
 #[cfg(feature = "sqlite")]
 pub use sqlite_open::EdgeOutboundQueueSqlite;
@@ -214,6 +216,16 @@ pub trait OutboundQueue: Send + Sync {
         limit: i64,
     ) -> impl Future<Output = Result<Vec<OutboundRow>, Error>> + Send;
 
+    /// v54.0.0 (CIRISPersist#996, CIRISEdge#814 item 2) — **how many rows
+    /// sit in each status**: one `status`-grouped `COUNT(*)`, statuses with no
+    /// row omitted. The resident queue depth is the caller's sum over the
+    /// three working statuses (`Pending + Sending + AwaitingAck`); listing
+    /// rows to count them is the wrong cost for a metrics snapshot. A row is
+    /// counted once, in the status it holds when the count is read.
+    fn outbound_counts(
+        &self,
+    ) -> impl Future<Output = Result<std::collections::HashMap<OutboundStatus, u64>, Error>> + Send;
+
     /// Operator-driven cancellation. Transitions a non-terminal row
     /// to `abandoned` with `abandoned_reason = 'operator_cancel'`.
     /// Idempotent: cancelling an already-terminal row is a no-op.
@@ -274,4 +286,24 @@ impl Error {
             Self::Backend(_) => "outbound_backend",
         }
     }
+}
+
+/// v54.0.0 (CIRISPersist#996) — fold `(status, count)` rows from a
+/// `GROUP BY status` into the typed map. An unknown status is an error, never
+/// dropped: a count that silently loses a status under-reports the depth.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub(crate) fn counts_from_rows(
+    rows: Vec<(String, i64)>,
+) -> Result<std::collections::HashMap<OutboundStatus, u64>, Error> {
+    let mut out = std::collections::HashMap::new();
+    for (status, n) in rows {
+        let s = OutboundStatus::from_wire_str(&status)
+            .ok_or_else(|| Error::Backend(format!("outbound_counts: unknown status {status:?}")))?;
+        let n = u64::try_from(n)
+            .map_err(|_| Error::Backend(format!("outbound_counts: negative count {n}")))?;
+        if n > 0 {
+            out.insert(s, n);
+        }
+    }
+    Ok(out)
 }

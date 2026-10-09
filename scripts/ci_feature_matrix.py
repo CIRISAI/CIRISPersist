@@ -45,6 +45,8 @@ Usage:
     scripts/ci_feature_matrix.py set <name>      # space-separated cargo feature string
                                                  # (a leg, a rider, or `lint`)
     scripts/ci_feature_matrix.py report          # human-readable coverage table
+    scripts/ci_feature_matrix.py alone           # features that must compile ALONE
+                                                 # (CIRISPersist#1030), one per line
     scripts/ci_feature_matrix.py check           # the gate; exit 1 + names on any gap
 """
 
@@ -115,6 +117,25 @@ NOT_TESTED: dict[str, str] = {
     "default-pipeline-ml": "a bundle whose only content is `scrub-ner` + `extract`; held out for the same reason as `scrub-ner`.",
     "_pyffi": "internal shared gate, not meant to be enabled directly (it would give a PyEngine with no backend). Every leg gets it transitively via `pyo3`.",
 }
+
+
+#: v54.0.0 (CIRISPersist#1030) — features a consumer enables ON THEIR OWN,
+#: each with the sibling feature its code cannot compile without. The
+#: #1025 powerset found both failing alone: `tls` is the Postgres pool's
+#: transport and built `tokio-postgres-rustls` against an unconfigured
+#: `tokio-postgres`; `pyo3-sqlite` (the mobile, postgres-free Python surface)
+#: had no backend at all. Each now IMPLIES its prerequisite in Cargo.toml.
+#: `check` fails if an implication is dropped, and ci.yml's lint job compiles
+#: each one alone (`ci_feature_matrix.py alone`).
+ALONE_COMPILE: dict[str, str] = {
+    "tls": "postgres",
+    "pyo3-sqlite": "sqlite",
+}
+
+#: The ci.yml loop that compiles every ALONE_COMPILE feature on its own,
+#: anchored to the command substitution itself: a step NAME or comment that
+#: merely mentions the command must not satisfy the gate.
+ALONE_STEP = "$(python3 scripts/ci_feature_matrix.py alone)"
 
 
 def declared_features() -> list[str]:
@@ -326,6 +347,26 @@ def check() -> int:
                 f"no step gated on that leg. Its host moved; update RIDERS."
             )
 
+    # 4c. v54.0.0 (#1030) — a feature consumers enable alone carries its
+    #     prerequisite, and CI still compiles it alone.
+    for name, needs in ALONE_COMPILE.items():
+        if name not in declared:
+            problems.append(
+                f"ALONE_COMPILE names {name!r}, which is not a feature in Cargo.toml — "
+                f"stale entry; delete it."
+            )
+        elif needs not in closure([name]):
+            problems.append(
+                f"feature {name!r} no longer implies {needs!r} in Cargo.toml, so "
+                f"`--features {name}` alone does not compile (CIRISPersist#1030). "
+                f"Restore the implication."
+            )
+    if ALONE_STEP not in ci:
+        problems.append(
+            f"ci.yml no longer runs `{ALONE_STEP}`: the features consumers enable on "
+            f"their own are compiled alone by nothing (CIRISPersist#1030)."
+        )
+
     # 5. Deployment shapes may only name features that exist.
     shapes = _deployment_shapes()
     for var in ("IOS_PYO3_FEATURES", "MOBILE_FEATURES"):
@@ -403,6 +444,9 @@ def main(argv: list[str]) -> int:
         if len(argv) != 3:
             raise SystemExit("usage: ci_feature_matrix.py set <leg>")
         print(feature_set(argv[2]))
+        return 0
+    if cmd == "alone":
+        print("\n".join(ALONE_COMPILE))
         return 0
     if cmd == "report":
         return report()

@@ -642,9 +642,23 @@ where
 {
     let blob_err = |e: BlobError| Error::Backend(format!("custody report: {e}"));
     let head = backend.blob_head(blob_sha256).await.map_err(blob_err)?;
+    // v54.0.0 (CIRISPersist#995 row 4, V184) — a PLAINTEXT row is shared by
+    // content address: its provenance columns name the first writer's room,
+    // and every room that wrote the same bytes is an association. A cohort
+    // and target the caller names are valid iff they are one of them.
+    let associations: Vec<(String, Option<String>)> = match &head {
+        Some(h) if h.crypto_tier == super::types::cohort_scope::CryptoTier::Plaintext => backend
+            .blob_associations(blob_sha256)
+            .await
+            .map_err(blob_err)?,
+        _ => Vec::new(),
+    };
     let (scope, size) = match (&head, state) {
         (Some(h), _) => {
-            if let Some(named) = cohort_scope.filter(|c| *c != h.cohort_scope) {
+            let named_is_associated = |named: &str| associations.iter().any(|(s, _)| s == named);
+            if let Some(named) =
+                cohort_scope.filter(|c| *c != h.cohort_scope && !named_is_associated(c))
+            {
                 return Err(malformed(format!(
                     "the blob is held at cohort {:?}, not {named:?}",
                     h.cohort_scope
@@ -705,7 +719,12 @@ where
                 CustodyState::Here => Some(h.size_bytes),
                 CustodyState::None => None,
             };
-            (h.cohort_scope.clone(), size)
+            // The named cohort when it is one of the row's (checked above),
+            // else the row's own.
+            (
+                cohort_scope.map_or_else(|| h.cohort_scope.clone(), str::to_owned),
+                size,
+            )
         }
         (None, CustodyState::Here) => {
             return Err(Error::InvalidArgument(
@@ -757,14 +776,35 @@ where
             .and_then(|p| p.group_key_id),
         _ => None,
     };
-    let target = match (cohort_target, row_target) {
-        (Some(named), Some(rows)) if named != rows => {
-            return Err(malformed(format!(
-                "the blob is held for {scope} {rows:?}, not {named:?}"
-            )));
+    // v54.0.0 (#995 row 4) — a shared plaintext row: the target is one of
+    // the rooms that wrote it at this cohort, or it is malformed; with none
+    // named, the one room at this cohort, else the row's own.
+    let rooms_at_scope: Vec<&str> = associations
+        .iter()
+        .filter(|(s, _)| *s == scope)
+        .filter_map(|(_, g)| g.as_deref())
+        .collect();
+    let target = if associations.is_empty() {
+        match (cohort_target, row_target) {
+            (Some(named), Some(rows)) if named != rows => {
+                return Err(malformed(format!(
+                    "the blob is held for {scope} {rows:?}, not {named:?}"
+                )));
+            }
+            (Some(named), _) => Some(named.to_owned()),
+            (None, rows) => rows,
         }
-        (Some(named), _) => Some(named.to_owned()),
-        (None, rows) => rows,
+    } else {
+        match cohort_target {
+            Some(named) if rooms_at_scope.contains(&named) => Some(named.to_owned()),
+            Some(named) => {
+                return Err(malformed(format!(
+                    "the blob is held for {scope} {rooms_at_scope:?}, not {named:?}"
+                )));
+            }
+            None if rooms_at_scope.len() == 1 => Some(rooms_at_scope[0].to_owned()),
+            None => row_target,
+        }
     };
     let env = custody_ack_envelope(blob_sha256, state, size, &scope, target.as_deref())?;
     let core: super::envelope::EnvelopeCore = serde_json::from_value(env)

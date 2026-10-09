@@ -389,6 +389,20 @@ impl PostgresBackend {
             }
         }
     }
+
+    /// v54.0.0 (#994) — TEST SEAM: drop one stream chunk row (a stream that
+    /// no longer holds exactly its manifest's chunks).
+    #[cfg(test)]
+    pub(crate) async fn test_drop_stream_chunk_row(&self, stream_id: &str, seq: u64) {
+        let client = self.pool.get().await.expect("pool");
+        client
+            .execute(
+                "DELETE FROM cirislens.federation_stream_chunks WHERE stream_id = $1 AND seq = $2",
+                &[&stream_id, &(seq as i64)],
+            )
+            .await
+            .expect("drop stream row");
+    }
 }
 
 impl PostgresBackend {
@@ -4506,6 +4520,73 @@ impl PostgresBackend {
         Ok(())
     }
 
+    /// v54.0.0 (CIRISPersist#995 row 2) — TEST SEAM: reproduce what a
+    /// pre-v53.1.4 UPDATE door left behind: `additional_scrubs` emptied while
+    /// `persist_row_hash` still binds the full record. Nothing else moves.
+    #[cfg(any(test, feature = "test-anchor"))]
+    pub async fn test_seam_drop_key_additional_scrubs(
+        &self,
+        key_id: &str,
+    ) -> Result<(), crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        client
+            .execute(
+                "UPDATE cirislens.federation_keys SET additional_scrubs = '[]' WHERE key_id = $1",
+                &[&key_id],
+            )
+            .await
+            .map(|_| ())
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))
+    }
+
+    /// v54.0.0 (CIRISPersist#995 row 2) — write back the `additional_scrubs`
+    /// a pre-v53.1.4 UPDATE door dropped. The plan
+    /// (`ReplicatedKeyPlan::RehydrateScrubs`) has established that the held
+    /// row's `persist_row_hash` binds `record` exactly and that its column is
+    /// empty; the WHERE re-asserts both atomically, so nothing but the scrub
+    /// set moves (the hash already covers it). Moves the serve position and
+    /// re-indexes, like every door that rewrites consumer-visible bytes.
+    /// `Conflict` when the row changed between plan and act.
+    pub(crate) async fn rehydrate_dropped_key_scrubs(
+        &self,
+        record: &crate::federation::KeyRecord,
+    ) -> Result<(), crate::federation::Error> {
+        let text = serde_json::to_string(&record.additional_scrubs).map_err(|e| {
+            crate::federation::Error::Backend(format!("additional_scrubs serialize: {e}"))
+        })?;
+        let n = {
+            let client = self
+                .get_client()
+                .await
+                .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            let mutated_at = self.next_key_serve_position(&client).await?;
+            client
+                .execute(
+                    "UPDATE cirislens.federation_keys SET additional_scrubs = $3, mutated_at = $4 \
+                     WHERE key_id = $1 AND persist_row_hash = $2 AND additional_scrubs = '[]'",
+                    &[&record.key_id, &record.persist_row_hash, &text, &mutated_at],
+                )
+                .await
+                .map_err(|e| {
+                    crate::federation::Error::Backend(format!(
+                        "rehydrate_dropped_key_scrubs {}: {e}",
+                        record.key_id
+                    ))
+                })?
+        };
+        if n == 0 {
+            return Err(crate::federation::Error::Conflict(format!(
+                "rehydrate_dropped_key_scrubs {}: row changed concurrently",
+                record.key_id
+            )));
+        }
+        self.index_stored_key_row(&record.key_id).await?;
+        Ok(())
+    }
+
     /// Gated self-signed → anchor-scrubbed **upgrade** of an own-key row —
     /// Postgres twin of [`SqliteBackend::adopt_scrub_upgrade`]
     /// (CIRISPersist#351). Same monotonic + identity-preserving guards; the
@@ -4914,6 +4995,16 @@ impl PostgresBackend {
         };
         match plan_replicated_key_apply(self, &record.record).await? {
             ReplicatedKeyPlan::Unchanged => Ok(ReplicatedKeyOutcome::Unchanged),
+            // v54.0.0 (#995 row 2) — write back the scrubs a pre-v53.1.4 door dropped.
+            ReplicatedKeyPlan::RehydrateScrubs => {
+                let mut r = record.record;
+                r.persist_row_hash = crate::federation::types::compute_persist_row_hash(&r)?;
+                match self.rehydrate_dropped_key_scrubs(&r).await {
+                    Ok(()) => Ok(ReplicatedKeyOutcome::ScrubsRehydrated),
+                    Err(crate::federation::Error::Conflict(_)) => Ok(RACED),
+                    Err(e) => Err(e),
+                }
+            }
             // The plan produced the reason at the branch that fired; carry it
             // through rather than re-deriving it here (#565).
             ReplicatedKeyPlan::Refused { reason } => Ok(ReplicatedKeyOutcome::Refused { reason }),
@@ -16469,6 +16560,18 @@ impl crate::federation::BlobStorage for PostgresBackend {
             .map_err(|e| {
                 crate::federation::BlobError::Backend(format!("insert federation_blobs: {e}"))
             })?;
+            // v54.0.0 (#995 row 4, V184) — THIS write's room, whether or not
+            // the row above was new: shared plaintext keeps every room.
+            tx.execute(
+                "INSERT INTO cirislens.federation_blob_associations \
+                    (sha256, cohort_scope, group_key_id) VALUES ($1, $2, COALESCE($3, '')) \
+                 ON CONFLICT DO NOTHING",
+                &[&sha_vec, &scope, &group],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!("insert blob association: {e}"))
+            })?;
         } else {
             // §11.5 / I28 — AN ANNOUNCEMENT NEVER STORES. A sealed-tier token
             // means a cascade already stored and bound these bytes; this
@@ -16775,6 +16878,22 @@ impl crate::federation::BlobStorage for PostgresBackend {
             .map_err(|e| {
                 crate::federation::BlobError::Backend(format!("store_blob_local insert: {e}"))
             })?;
+        // v54.0.0 (#995 row 4, V184) — a plaintext row keeps every room.
+        if tier == crate::federation::types::cohort_scope::CryptoTier::Plaintext.as_str() {
+            client
+                .execute(
+                    "INSERT INTO cirislens.federation_blob_associations \
+                        (sha256, cohort_scope, group_key_id) VALUES ($1, $2, COALESCE($3, '')) \
+                     ON CONFLICT DO NOTHING",
+                    &[&sha_vec, &scope, &group],
+                )
+                .await
+                .map_err(|e| {
+                    crate::federation::BlobError::Backend(format!(
+                        "store_blob_local association: {e}"
+                    ))
+                })?;
+        }
         Ok(())
     }
 
@@ -19974,6 +20093,96 @@ impl crate::federation::BlobStorage for PostgresBackend {
             .collect()
     }
 
+    async fn list_unlinked_chunk_dags(
+        &self,
+        after: Option<[u8; 32]>,
+        limit: u32,
+    ) -> Result<Vec<[u8; 32]>, crate::federation::BlobError> {
+        use crate::federation::BlobError;
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| BlobError::Backend(format!("list_unlinked_chunk_dags pool: {e}")))?;
+        let after = after.map(|a| a.to_vec()).unwrap_or_default();
+        let lim = i64::from(limit);
+        let rows = client
+            .query(
+                "SELECT b.sha256 FROM cirislens.federation_blobs b \
+                  WHERE b.storage_kind = 'chunk_dag' AND b.sha256 > $1 \
+                    AND NOT EXISTS (SELECT 1 FROM cirislens.federation_dag_chunks d \
+                                     WHERE d.manifest_sha256 = b.sha256) \
+                  ORDER BY b.sha256 LIMIT $2",
+                &[&after, &lim],
+            )
+            .await
+            .map_err(|e| BlobError::Backend(format!("list_unlinked_chunk_dags: {e}")))?;
+        rows.iter()
+            .map(|r| {
+                let v: Vec<u8> = r.safe_get_with("sha256", BlobError::Backend)?;
+                <[u8; 32]>::try_from(v.as_slice()).map_err(|_| {
+                    BlobError::Backend("list_unlinked_chunk_dags: a 32-byte sha".into())
+                })
+            })
+            .collect()
+    }
+
+    async fn link_dag_chunks_if_exact(
+        &self,
+        manifest_sha: &[u8; 32],
+        stream_id: &str,
+        chunks: &[(u64, [u8; 32])],
+    ) -> Result<bool, crate::federation::BlobError> {
+        use crate::federation::BlobError;
+        let mut client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| BlobError::Backend(format!("link_dag_chunks_if_exact pool: {e}")))?;
+        let mut want: Vec<(i64, Vec<u8>)> = chunks
+            .iter()
+            .map(|(seq, sha)| (i64::try_from(*seq).unwrap_or(i64::MAX), sha.to_vec()))
+            .collect();
+        want.sort();
+        let manifest = manifest_sha.to_vec();
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| BlobError::Backend(format!("link_dag_chunks_if_exact: begin: {e}")))?;
+        // FOR SHARE: the stream's rows cannot move between the check and the link.
+        let rows = tx
+            .query(
+                "SELECT seq, chunk_sha FROM cirislens.federation_stream_chunks \
+                  WHERE stream_id = $1 ORDER BY seq FOR SHARE",
+                &[&stream_id],
+            )
+            .await
+            .map_err(|e| BlobError::Backend(format!("link_dag_chunks_if_exact: read: {e}")))?;
+        let mut held: Vec<(i64, Vec<u8>)> = Vec::with_capacity(rows.len());
+        for r in &rows {
+            held.push((
+                r.safe_get_with("seq", BlobError::Backend)?,
+                r.safe_get_with("chunk_sha", BlobError::Backend)?,
+            ));
+        }
+        if held.is_empty() || held != want {
+            return Ok(false);
+        }
+        tx.execute(
+            "INSERT INTO cirislens.federation_dag_chunks (manifest_sha256, seq, chunk_sha256, stream_id) \
+             SELECT $1, seq, chunk_sha, stream_id FROM cirislens.federation_stream_chunks \
+              WHERE stream_id = $2 \
+             ON CONFLICT (manifest_sha256, seq) DO NOTHING",
+            &[&manifest, &stream_id],
+        )
+        .await
+        .map_err(|e| BlobError::Backend(format!("link_dag_chunks_if_exact: link: {e}")))?;
+        tx.commit()
+            .await
+            .map_err(|e| BlobError::Backend(format!("link_dag_chunks_if_exact: commit: {e}")))?;
+        Ok(true)
+    }
+
     async fn stream_positions_of_chunk(
         &self,
         chunk_sha: &[u8; 32],
@@ -20308,6 +20517,33 @@ impl crate::federation::BlobStorage for PostgresBackend {
                 .await?;
         }
         Ok(sha256)
+    }
+
+    async fn blob_associations(
+        &self,
+        sha256: &[u8; 32],
+    ) -> Result<Vec<(String, Option<String>)>, crate::federation::BlobError> {
+        use crate::federation::BlobError;
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| BlobError::Backend(format!("blob_associations pool: {e}")))?;
+        let rows = client
+            .query(
+                "SELECT cohort_scope, group_key_id FROM cirislens.federation_blob_associations \
+                  WHERE sha256 = $1 ORDER BY cohort_scope, group_key_id",
+                &[&sha256.to_vec()],
+            )
+            .await
+            .map_err(|e| BlobError::Backend(format!("blob_associations: {e}")))?;
+        let mut out = Vec::with_capacity(rows.len());
+        for r in &rows {
+            let scope: String = r.safe_get_with("cohort_scope", BlobError::Backend)?;
+            let group: String = r.safe_get_with("group_key_id", BlobError::Backend)?;
+            out.push((scope, (!group.is_empty()).then_some(group)));
+        }
+        Ok(out)
     }
 
     async fn blob_provenance(
@@ -22064,6 +22300,15 @@ impl PostgresBackend {
         )
         .await
         .map_err(|e| crate::federation::BlobError::Backend(format!("delete_blob relation: {e}")))?;
+        // v54.0.0 (#995 row 4) — the rooms die with the row.
+        tx.execute(
+            "DELETE FROM cirislens.federation_blob_associations WHERE sha256 = $1",
+            &[&sha_vec],
+        )
+        .await
+        .map_err(|e| {
+            crate::federation::BlobError::Backend(format!("delete_blob associations: {e}"))
+        })?;
         let n = tx
             .execute(
                 "DELETE FROM cirislens.federation_blobs WHERE sha256 = $1",
@@ -22440,15 +22685,19 @@ impl crate::outbound::OutboundQueue for PostgresBackend {
         // Branch on requires_ack within the SQL: 'delivered' immediately
         // when no ACK required; 'awaiting_ack' otherwise. CHECK
         // constraints enforce delivered_at correctness on terminal.
+        // v54.0.0 (#996, found by I577) — `$1` is CAST: inside the CASE
+        // Postgres deduced it as text against the timestamptz column above
+        // ("inconsistent types deduced for parameter $1"), so this door
+        // failed on every call on postgres and no row ever left `sending`.
         let n = client
             .execute(
                 "UPDATE cirislens.edge_outbound_queue \
                  SET status = CASE WHEN requires_ack THEN 'awaiting_ack' ELSE 'delivered' END, \
-                     transport_delivered_at = $1, \
-                     delivered_at = CASE WHEN requires_ack THEN NULL ELSE $1 END, \
+                     transport_delivered_at = $1::timestamptz, \
+                     delivered_at = CASE WHEN requires_ack THEN NULL ELSE $1::timestamptz END, \
                      last_transport = $2, \
                      claimed_until = NULL, claimed_by = NULL \
-                 WHERE queue_id = $3::uuid AND status = 'sending'",
+                 WHERE queue_id = $3::text::uuid AND status = 'sending'",
                 &[&now, &transport, &queue_id],
             )
             .await
@@ -22487,7 +22736,7 @@ impl crate::outbound::OutboundQueue for PostgresBackend {
             .query_opt(
                 "SELECT attempt_count, max_attempts, enqueued_at, ttl_seconds \
                  FROM cirislens.edge_outbound_queue \
-                 WHERE queue_id = $1::uuid AND status = 'sending' \
+                 WHERE queue_id = $1::text::uuid AND status = 'sending' \
                  FOR UPDATE",
                 &[&queue_id],
             )
@@ -22524,7 +22773,7 @@ impl crate::outbound::OutboundQueue for PostgresBackend {
                      last_error_class = $3, last_error_detail = $4, \
                      last_transport = $5, \
                      claimed_until = NULL, claimed_by = NULL \
-                 WHERE queue_id = $6::uuid",
+                 WHERE queue_id = $6::text::uuid",
                 &[
                     &now,
                     &reason,
@@ -22545,7 +22794,7 @@ impl crate::outbound::OutboundQueue for PostgresBackend {
                      last_error_class = $2, last_error_detail = $3, \
                      last_transport = $4, \
                      claimed_until = NULL, claimed_by = NULL \
-                 WHERE queue_id = $5::uuid",
+                 WHERE queue_id = $5::text::uuid",
                 &[
                     &next_attempt_after,
                     &error_class,
@@ -22585,7 +22834,7 @@ impl crate::outbound::OutboundQueue for PostgresBackend {
                 "UPDATE cirislens.edge_outbound_queue \
                  SET status = 'delivered', delivered_at = $1, \
                      claimed_until = NULL, claimed_by = NULL \
-                 WHERE queue_id = $2::uuid AND status NOT IN ('delivered', 'abandoned')",
+                 WHERE queue_id = $2::text::uuid AND status NOT IN ('delivered', 'abandoned')",
                 &[&now, &queue_id],
             )
             .await
@@ -22643,7 +22892,7 @@ impl crate::outbound::OutboundQueue for PostgresBackend {
                  SET status = 'delivered', \
                      ack_envelope_bytes = $1, ack_received_at = $2, \
                      delivered_at = $2 \
-                 WHERE queue_id = $3::uuid AND status = 'awaiting_ack'",
+                 WHERE queue_id = $3::text::uuid AND status = 'awaiting_ack'",
                 &[&ack_envelope_bytes, &now, &queue_id],
             )
             .await
@@ -22774,7 +23023,7 @@ impl crate::outbound::OutboundQueue for PostgresBackend {
                         last_transport, requires_ack, ack_timeout_seconds, \
                         ack_envelope_bytes, ack_received_at, claimed_until, claimed_by \
                  FROM cirislens.edge_outbound_queue \
-                 WHERE queue_id = $1::uuid",
+                 WHERE queue_id = $1::text::uuid",
                 &[&queue_id],
             )
             .await
@@ -22851,6 +23100,33 @@ impl crate::outbound::OutboundQueue for PostgresBackend {
         rows.into_iter().map(pg_row_to_outbound_row).collect()
     }
 
+    async fn outbound_counts(
+        &self,
+    ) -> Result<
+        std::collections::HashMap<crate::outbound::OutboundStatus, u64>,
+        crate::outbound::Error,
+    > {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| crate::outbound::Error::Backend(format!("pool: {e}")))?;
+        let rows = client
+            .query(
+                "SELECT status, COUNT(*) AS n FROM cirislens.edge_outbound_queue GROUP BY status",
+                &[],
+            )
+            .await
+            .map_err(|e| crate::outbound::Error::Backend(format!("outbound_counts: {e}")))?;
+        let mut out = Vec::with_capacity(rows.len());
+        for r in &rows {
+            let status: String = r.safe_get_with("status", crate::outbound::Error::Backend)?;
+            let n: i64 = r.safe_get_with("n", crate::outbound::Error::Backend)?;
+            out.push((status, n));
+        }
+        crate::outbound::counts_from_rows(out)
+    }
+
     async fn cancel_outbound(
         &self,
         queue_id: &crate::outbound::QueueId,
@@ -22867,7 +23143,7 @@ impl crate::outbound::OutboundQueue for PostgresBackend {
                  SET status = 'abandoned', \
                      abandoned_at = $1, abandoned_reason = 'operator_cancel', \
                      claimed_until = NULL, claimed_by = NULL \
-                 WHERE queue_id = $2::uuid AND status NOT IN ('delivered', 'abandoned')",
+                 WHERE queue_id = $2::text::uuid AND status NOT IN ('delivered', 'abandoned')",
                 &[&now, &queue_id],
             )
             .await
@@ -22893,7 +23169,7 @@ impl crate::outbound::OutboundQueue for PostgresBackend {
                      next_attempt_after = $1, \
                      abandoned_at = NULL, abandoned_reason = NULL, \
                      last_error_class = NULL, last_error_detail = NULL \
-                 WHERE queue_id = $2::uuid AND status = 'abandoned'",
+                 WHERE queue_id = $2::text::uuid AND status = 'abandoned'",
                 &[&now, &queue_id],
             )
             .await
@@ -23006,6 +23282,16 @@ async fn pg_upsert_wire_index<C>(
 where
     C: tokio_postgres::GenericClient + Sync,
 {
+    // v54.0.0 (CIRISPersist#995 row 5) — a record has ONE current content
+    // hash: drop the mappings its earlier bytes left (V183 makes this a seek).
+    client
+        .execute(
+            "DELETE FROM cirislens.signed_wire_index \
+             WHERE kind = $1 AND record_key = $3 AND content_hash <> $2",
+            &[&kind, &content_hash, &record_key],
+        )
+        .await
+        .map_err(|e| crate::federation::Error::Backend(format!("signed_wire_index prune: {e}")))?;
     client
         .execute(
             "INSERT INTO cirislens.signed_wire_index (kind, content_hash, record_key) \

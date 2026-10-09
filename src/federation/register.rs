@@ -288,7 +288,7 @@ impl std::fmt::Display for KeyRefusalReason {
 /// [`apply_replicated_key_record`](crate::engine::Engine::apply_replicated_key_record),
 /// the **upgrade-aware replicated Key-plane apply**. Serde tokens are
 /// snake_case strings (`"inserted"` / `"upgraded"` / `"unchanged"` /
-/// `"superseded"`), mirroring [`AdoptScrubOutcome`]'s wire shape;
+/// `"superseded"` / `"scrubs_rehydrated"`), mirroring [`AdoptScrubOutcome`]'s wire shape;
 /// `Refused` carries its reason as `{"refused":{"reason":"<token>"}}`, the
 /// same shape the sibling route plane's
 /// [`TransportDestinationApplyOutcome`](crate::federation::self_at_login::TransportDestinationApplyOutcome)
@@ -331,6 +331,12 @@ pub enum ReplicatedKeyOutcome {
     /// APPEND-ONLY (crosses the directory capsule ABI). Distinct from
     /// `Upgraded` (self→scrubbed): `Superseded` is scrubbed→newer-scrubbed.
     Superseded,
+    /// v54.0.0 (CIRISPersist#995 row 2) — the held row's `persist_row_hash`
+    /// binds this exact record, but its `additional_scrubs` column is empty: a
+    /// pre-v53.1.4 UPDATE door hashed the full record and dropped every scrub
+    /// but #1. The record's scrubs were written back; nothing else moved.
+    /// APPEND-ONLY.
+    ScrubsRehydrated,
 }
 
 /// The classification half of the #371 replicated-key apply — which action
@@ -356,6 +362,11 @@ pub(crate) enum ReplicatedKeyPlan {
     /// holder is re-signing its own registration. Run the backend's
     /// `store_rebound_key_record`.
     Rebind,
+    /// v54.0.0 (CIRISPersist#995 row 2) — the held row's hash binds this
+    /// exact record but a pre-v53.1.4 UPDATE door dropped its
+    /// `additional_scrubs`: write them back. Run the backend's
+    /// `rehydrate_dropped_key_scrubs`.
+    RehydrateScrubs,
     /// Byte-identical re-apply — no-op.
     Unchanged,
     /// Not admitted; leave the row untouched (fail-closed).
@@ -428,6 +439,22 @@ pub(crate) async fn plan_replicated_key_apply(
     // carrying the origin row's hash still compares stably.
     let incoming_hash = super::types::compute_persist_row_hash(record)?;
     if existing.persist_row_hash == incoming_hash {
+        // v54.0.0 (CIRISPersist#995 row 2) — the stored hash binds THIS
+        // record, so every column was written from it; `additional_scrubs`
+        // is serialized into the hash, so a held row with none while the
+        // record carries some is the pre-v53.1.4 UPDATE doors' drop, not a
+        // different record. Reading it as `Unchanged` stranded the row as a
+        // one-holder record for good. Verify before mutating, then write the
+        // scrubs back.
+        if existing.additional_scrubs.is_empty() && !record.additional_scrubs.is_empty() {
+            return match verify_key_registration(directory, record).await {
+                Ok(_) => Ok(ReplicatedKeyPlan::RehydrateScrubs),
+                Err(Error::SignatureInvalid(_)) | Err(Error::InvalidArgument(_)) => {
+                    Ok(refused(KeyRefusalReason::UnverifiableSignature))
+                }
+                Err(other) => Err(other),
+            };
+        }
         return Ok(ReplicatedKeyPlan::Unchanged);
     }
 
@@ -814,7 +841,7 @@ pub(crate) async fn verify_canonical_supersede(
 /// on the equal-instant arm only — the held row's own quorum, which must be
 /// ABSENT for the replacement to be a repair rather than a re-scrub.
 #[cfg(any(feature = "postgres", feature = "sqlite"))]
-async fn decide_canonical_supersede<Admit, Held>(
+pub(crate) async fn decide_canonical_supersede<Admit, Held>(
     existing: &KeyRecord,
     record: &KeyRecord,
     admit_incoming: Admit,
@@ -920,11 +947,63 @@ pub(crate) fn supersede_precheck(existing: &KeyRecord, record: &KeyRecord) -> Su
         (Some(incoming_vf), Some(existing_vf)) if incoming_vf > existing_vf => {
             SupersedePrecheck::Newer
         }
-        (Some(incoming_vf), Some(existing_vf)) if incoming_vf == existing_vf => {
+        // v54.0.0 (CIRISPersist#995 row 3) — an equal instant is a repair
+        // only of the SAME record: two different quorum-signed records at one
+        // instant (a ceremony retry with other `transport_hints`) would each
+        // win on whichever node saw it first and split the address.
+        (Some(incoming_vf), Some(existing_vf))
+            if incoming_vf == existing_vf
+                && envelopes_match_modulo_role_order(
+                    &existing.registration_envelope,
+                    &record.registration_envelope,
+                ) =>
+        {
             SupersedePrecheck::EqualInstant
         }
         _ => SupersedePrecheck::Refuse,
     }
+}
+
+/// v54.0.0 (CIRISPersist#995 row 3, settled on the issue 2026-10-06) — are
+/// two signed registration envelopes the same record? Every member byte-equal
+/// (as JSON values) except `roles`, which is compared as a SET: the live
+/// canonical-1 row differs from the baked bundle's in exactly the ORDER of
+/// `roles` (a ceremony plan rewrote it), and the literal identical-envelope
+/// rule would refuse the very repair v53.1.4 exists for. A different role
+/// SET, `transport_hints`, pubkey or purpose is a different record.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub(crate) fn envelopes_match_modulo_role_order(
+    a: &serde_json::Value,
+    b: &serde_json::Value,
+) -> bool {
+    let (Some(a), Some(b)) = (a.as_object(), b.as_object()) else {
+        return a == b;
+    };
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().all(|(k, va)| {
+        let Some(vb) = b.get(k) else {
+            return false;
+        };
+        if k == "roles" {
+            let as_set = |v: &serde_json::Value| -> Option<std::collections::BTreeSet<String>> {
+                let arr = v.as_array()?;
+                let set: std::collections::BTreeSet<String> = arr
+                    .iter()
+                    .map(|r| r.as_str().map(str::to_owned))
+                    .collect::<Option<_>>()?;
+                // A duplicated role is not the same list in another order.
+                (set.len() == arr.len()).then_some(set)
+            };
+            match (as_set(va), as_set(vb)) {
+                (Some(x), Some(y)) => x == y,
+                _ => va == vb,
+            }
+        } else {
+            va == vb
+        }
+    })
 }
 
 /// v10.1.0 (CIRISPersist#275 hardening) — the **write-path admission
@@ -3867,6 +3946,11 @@ mod tests {
             serde_json::to_string(&ReplicatedKeyOutcome::Superseded).expect("superseded"),
             "\"superseded\""
         );
+        // v54.0.0 (#995 row 2) — appended.
+        assert_eq!(
+            serde_json::to_string(&ReplicatedKeyOutcome::ScrubsRehydrated).expect("rehydrated"),
+            "\"scrubs_rehydrated\""
+        );
         for reason in KeyRefusalReason::ALL {
             let outcome = ReplicatedKeyOutcome::Refused { reason: *reason };
             let json = serde_json::to_string(&outcome).expect("serialize outcome");
@@ -4087,6 +4171,92 @@ mod supersede_precheck_tests {
         );
     }
 
+    /// **I571** (#995 row 3, settled on the issue) — the equal-instant arm
+    /// admits only the SAME record: the canonical's live shape (role ORDER
+    /// differs) is the repair arm; a different `transport_hints` or a
+    /// different role SET at the same instant is refused.
+    #[test]
+    fn i571_equal_instant_admits_only_the_same_record() {
+        let with = |roles: serde_json::Value, hints: &str| {
+            let mut r = canonical(T0);
+            r.registration_envelope = serde_json::json!({
+                "valid_from": T0, "roles": roles, "transport_hints": [hints],
+            });
+            r
+        };
+        let live = with(
+            serde_json::json!([
+                "infra:serve",
+                "infra:attest",
+                "infra:store",
+                "infra:transport"
+            ]),
+            "tcp://a",
+        );
+        let bundle = with(
+            serde_json::json!([
+                "infra:attest",
+                "infra:serve",
+                "infra:store",
+                "infra:transport"
+            ]),
+            "tcp://a",
+        );
+        assert_eq!(
+            supersede_precheck(&live, &bundle),
+            P::EqualInstant,
+            "I571: the live canonical's shape (role order differs) is repaired"
+        );
+        assert_eq!(
+            supersede_precheck(
+                &live,
+                &with(
+                    serde_json::json!([
+                        "infra:attest",
+                        "infra:serve",
+                        "infra:store",
+                        "infra:transport"
+                    ]),
+                    "tcp://b",
+                )
+            ),
+            P::Refuse,
+            "I571: a different transport_hints at the same instant is refused"
+        );
+        assert_eq!(
+            supersede_precheck(
+                &live,
+                &with(
+                    serde_json::json!(["infra:attest", "infra:serve", "infra:store"]),
+                    "tcp://a",
+                )
+            ),
+            P::Refuse,
+            "I571: a different role SET at the same instant is refused"
+        );
+        assert_eq!(
+            supersede_precheck(
+                &live,
+                &with(
+                    serde_json::json!([
+                        "infra:attest",
+                        "infra:serve",
+                        "infra:store",
+                        "infra:store"
+                    ]),
+                    "tcp://a",
+                )
+            ),
+            P::Refuse,
+            "I571: a duplicated role is not the same set"
+        );
+        // Newer is not narrowed: a different record at a later instant is
+        // still the address move.
+        let mut newer = with(serde_json::json!(["infra:serve"]), "tcp://c");
+        newer.registration_envelope["valid_from"] = serde_json::json!(T1);
+        assert_eq!(supersede_precheck(&live, &newer), P::Newer);
+    }
+
     #[test]
     fn older_envelope_valid_from_refused() {
         // incoming T0 is OLDER than existing T1 — downgrade refused.
@@ -4148,10 +4318,14 @@ mod supersede_precheck_tests {
             supersede_precheck(&canonical(T_NS), &canonical(T_NS)),
             P::EqualInstant
         );
+        // v54.0.0 (#995 row 3) — two spellings of one nanosecond are one
+        // INSTANT, but two different signed envelopes: the repair arm admits
+        // only the same record (roles compared as a set, every other member
+        // byte-equal), so this is refused.
         assert_eq!(
             supersede_precheck(&canonical(T_NS), &canonical(T_NS_Z)),
-            P::EqualInstant,
-            "two spellings of one nanosecond are equal"
+            P::Refuse,
+            "two spellings of one nanosecond are equal instants but different records"
         );
         assert_eq!(
             supersede_precheck(&canonical(T_NS), &canonical(T_US)),

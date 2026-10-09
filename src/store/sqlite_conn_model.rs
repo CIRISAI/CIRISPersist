@@ -597,6 +597,18 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("dag_chunks_of_manifest", ConnClass::Read),
     ("sqlite_link_dag_chunks", ConnClass::HelperWrite),
     ("test_dag_link", ConnClass::Write),
+    // v54.0.0 (#994) — the V176 backfill: the candidate list, the exact
+    // check-and-link in one transaction, and the stream-row test seam.
+    ("list_unlinked_chunk_dags", ConnClass::Read),
+    ("link_dag_chunks_if_exact", ConnClass::Write),
+    ("test_drop_stream_chunk_row", ConnClass::Write),
+    // v54.0.0 (#995 row 2) — the scrub re-hydration CAS and its test seam.
+    ("rehydrate_dropped_key_scrubs", ConnClass::Write),
+    ("test_seam_drop_key_additional_scrubs", ConnClass::Write),
+    // v54.0.0 (#995 row 4, V184) — the rooms of a shared plaintext blob.
+    ("blob_associations", ConnClass::Read),
+    // v54.0.0 (#996) — the outbound queue's status-grouped COUNT.
+    ("outbound_counts", ConnClass::Read),
     ("put_blob_chunks", ConnClass::Write),
     ("put_blob_with_scope", ConnClass::Write),
     ("put_calibration_bundle", ConnClass::Write),

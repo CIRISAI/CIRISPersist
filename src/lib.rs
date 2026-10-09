@@ -19,6 +19,12 @@
 // substrate's contract; "what does this column mean" should never
 // require digging through the migration SQL alongside the source.
 #![deny(missing_docs)]
+// v54.0.0 (CIRISPersist#1017) — a future over 16 KiB is boxed at the door, not
+// by every caller. Warned crate-wide so every `-D warnings` clippy pass (the
+// shipped shape and `--all-features --all-targets`) refuses a new one; I578
+// (`future_size_gate`) measures the futures persist hands OUT, which this
+// lint cannot see.
+#![warn(clippy::large_futures)]
 
 //! ciris-persist — unified Rust persistence for the CIRIS federation.
 //!
@@ -135,6 +141,9 @@ pub mod witness;
 // ast-grep equal rules/expected.json, the counts scripts/ast_gates.sh asserts.
 #[cfg(test)]
 mod ast_gate_parity;
+// v54.0.0 (CIRISPersist#1017) — I578: the public async doors stay under
+// clippy::large_futures' 16 KiB threshold.
+mod future_size_gate;
 
 /// v4.12.1 (CIRISPersist#189) — verify-style embedded version literal for
 /// the agent Trust-page / bundle-refresh integrity check.
