@@ -141,6 +141,12 @@ Witnesses:
 
 Mutation-checked, 8 of 8 killed. A lookup error read as `false` reds I573 on memory and sqlite. Roles compared byte-equal reds I571 and I571b. Envelopes always matching does the same. Disabling the rehydrate arm reds I572 on memory and sqlite. Removing the prune reds I574 on sqlite, on postgres and, through the memory upsert, on memory.
 
+### Fixed — the family plane's exact unsigned re-add is the idempotent no-op (#990)
+
+#936 (v51.2.0) made the exact roster re-add a no-op, whatever the spec, on the community plane. The family plane, which v49 moved onto the widening plane, still sent the retry to the put door, which verified the empty spec first and refused it `federation_tier_unverified`. CIRISConformance found it on v53.1.2. The default `add_family_member` now answers `false` with no row and no verify when a widening for the same member at the same instant is already on the plane, exactly as the community arm does.
+
+**I575** (memory, sqlite, postgres, inside I177): an unsigned exact retry of a widened family member is a no-op. Checked against the exact pre-fix function: red on memory and sqlite with the bulk-ingest refusal Conformance reported. A narrower mutant that only disables the new early return survives, because the active-roster check after it also answers `false` for an authorized widening. The early return is kept to match the community arm.
+
 ## [53.2.0] - 2026-10-08
 
 ### Changed — the tag is pushed once main's run EXISTS, not once it completes (#1008)

@@ -4902,16 +4902,23 @@ pub trait FederationDirectory: Send + Sync {
             .any(|w| {
                 w.member_key_id == widening.member_key_id && w.effective_at == widening.effective_at
             });
-        if !already {
-            // Already active at that instant with the same role: the row
-            // would not move the fold.
-            let active = authorized_family_roster_at(self, &record, widening.effective_at).await?;
-            if active
-                .iter()
-                .any(|m| m.key_id == widening.member_key_id && m.role == widening.role)
-            {
-                return Ok(false);
-            }
+        // v54.0.0 (CIRISPersist#990) — the family twin of #936: an IDENTICAL
+        // widening already on the plane IS the idempotent no-op, answered
+        // `false` without a row and without verifying the caller's spec. v49
+        // moved the family onto the widening plane and routed the exact retry
+        // through the put door, which refused an unsigned retry
+        // `tier_unverified` while the community arm (#936) answered `false`.
+        if already {
+            return Ok(false);
+        }
+        // Already active at that instant with the same role: the row would
+        // not move the fold.
+        let active = authorized_family_roster_at(self, &record, widening.effective_at).await?;
+        if active
+            .iter()
+            .any(|m| m.key_id == widening.member_key_id && m.role == widening.role)
+        {
+            return Ok(false);
         }
         self.put_family_membership_widening(SignedFamilyMembershipWidening {
             family_membership_widening: widening,
@@ -4921,7 +4928,7 @@ pub trait FederationDirectory: Send + Sync {
             cosignatures: spec.cosignatures.clone(),
         })
         .await?;
-        Ok(!already)
+        Ok(true)
     }
 
     /// v3.12.0 — fetch a single family by `family_key_id`. Returns
