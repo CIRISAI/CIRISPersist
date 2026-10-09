@@ -1018,6 +1018,17 @@ pub(crate) mod bodies {
             sp::refused_today(&local_row).is_some(),
             "precondition: the class's tier clause is what keeps it out"
         );
+        // The class scan reads every row, every tier, to the end.
+        let mut by_one = Vec::new();
+        sp::scan_attestations_paged(dir, 1, |r| by_one.push(r.attestation_id))
+            .await
+            .unwrap();
+        let mut whole = Vec::new();
+        sp::scan_attestations(dir, |r| whole.push(r.attestation_id))
+            .await
+            .unwrap();
+        assert_eq!(by_one, whole, "I662: the scan pages to the end");
+        assert!(legacy.iter().chain([&local]).all(|id| whole.contains(id)));
         // Ruled (#1043, 2026-10-09): not a serve filter. Until purged, the
         // rows are served like any other.
         let served_before = served_ids(d).await;
@@ -1086,6 +1097,13 @@ pub(crate) mod bodies {
                 },
             ],
             "I663: exactly the harness keys, in key-id order"
+        );
+        assert_eq!(
+            sp::harness_actor_selections_paged(dir, sp::HARNESS_KEY_ID_PREFIXES, 1)
+                .await
+                .unwrap(),
+            sels,
+            "I663: the key read pages to the end"
         );
         // The harness's rows and traces; a bystander's row about nobody else.
         put_score(d, HARNESS, BYSTANDER, &[]).await;

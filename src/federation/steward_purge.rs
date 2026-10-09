@@ -366,6 +366,20 @@ where
     F: FederationDirectory + ?Sized,
     S: AsRef<str>,
 {
+    harness_actor_selections_paged(directory, prefixes, SCAN_PAGE).await
+}
+
+/// [`harness_actor_selections`] at an explicit key-read page size (the
+/// witness pages by one, so a paging defect cannot hide below a full page).
+pub(crate) async fn harness_actor_selections_paged<F, S>(
+    directory: &F,
+    prefixes: &[S],
+    page_size: u32,
+) -> Result<Vec<PurgeSelection>, Error>
+where
+    F: FederationDirectory + ?Sized,
+    S: AsRef<str>,
+{
     if prefixes.is_empty() || prefixes.iter().any(|p| p.as_ref().is_empty()) {
         return Err(refused(
             token::SELECTION_MALFORMED,
@@ -379,7 +393,7 @@ where
     let mut since: Option<(chrono::DateTime<chrono::Utc>, String)> = None;
     loop {
         let page = directory
-            .list_signed_key_records_since(since.clone(), SCAN_PAGE)
+            .list_signed_key_records_since(since.clone(), page_size)
             .await?;
         let n = page.len();
         if let Some(last) = page.last() {
@@ -390,7 +404,7 @@ where
                 .map(|k| k.record.key_id)
                 .filter(|k| prefixes.iter().any(|p| k.starts_with(p.as_ref()))),
         );
-        if n < SCAN_PAGE as usize {
+        if n < page_size as usize {
             break;
         }
     }
@@ -482,7 +496,21 @@ pub fn refused_today(row: &Attestation) -> Option<String> {
 /// # Errors
 ///
 /// The scan read's.
-pub async fn scan_attestations<F, V>(directory: &F, mut visit: V) -> Result<(), Error>
+pub async fn scan_attestations<F, V>(directory: &F, visit: V) -> Result<(), Error>
+where
+    F: FederationDirectory + ?Sized,
+    V: FnMut(Attestation),
+{
+    scan_attestations_paged(directory, SCAN_PAGE, visit).await
+}
+
+/// [`scan_attestations`] at an explicit page size (the witness pages by one,
+/// so a paging defect cannot hide below a full page).
+pub(crate) async fn scan_attestations_paged<F, V>(
+    directory: &F,
+    page_size: u32,
+    mut visit: V,
+) -> Result<(), Error>
 where
     F: FederationDirectory + ?Sized,
     V: FnMut(Attestation),
@@ -490,7 +518,7 @@ where
     let mut after: Option<String> = None;
     loop {
         let page = directory
-            .purge_scan_attestations(after.as_deref(), SCAN_PAGE)
+            .purge_scan_attestations(after.as_deref(), page_size)
             .await?;
         let n = page.len();
         if let Some(last) = page.last() {
@@ -499,7 +527,7 @@ where
         for row in page {
             visit(row);
         }
-        if n < SCAN_PAGE as usize {
+        if n < page_size as usize {
             return Ok(());
         }
     }
