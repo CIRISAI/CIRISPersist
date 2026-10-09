@@ -6692,8 +6692,9 @@ impl Engine {
     /// abort, capped per boot.
     async fn sweep_dag_chunk_links_at_boot(&self) {
         /// Manifests opened per boot. A node with more legacy DAGs finishes
-        /// over later boots or an operator call; each skipped manifest is
-        /// re-examined at the next boot.
+        /// over later boots or an operator call: each pass resumes where the
+        /// last capped one stopped (V185) and wraps, so a skipped manifest is
+        /// re-examined in its turn and never holds the rest back.
         #[cfg(any(feature = "postgres", feature = "sqlite"))]
         const BOOT_CAP: u32 = 10_000;
         #[cfg(any(feature = "postgres", feature = "sqlite"))]

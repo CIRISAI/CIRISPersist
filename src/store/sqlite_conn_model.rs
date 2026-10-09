@@ -602,6 +602,9 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("list_unlinked_chunk_dags", ConnClass::Read),
     ("link_dag_chunks_if_exact", ConnClass::Write),
     ("test_drop_stream_chunk_row", ConnClass::Write),
+    // v54.0.0 (#994, Codex on PR #1050) — the V185 resume cursor.
+    ("dag_link_backfill_cursor", ConnClass::Read),
+    ("set_dag_link_backfill_cursor", ConnClass::Write),
     // v54.0.0 (#995 row 2) — the scrub re-hydration CAS and its test seam.
     ("rehydrate_dropped_key_scrubs", ConnClass::Write),
     ("test_seam_drop_key_additional_scrubs", ConnClass::Write),

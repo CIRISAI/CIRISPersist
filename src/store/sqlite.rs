@@ -18588,6 +18588,55 @@ impl crate::federation::BlobStorage for SqliteBackend {
         })
     }
 
+    async fn dag_link_backfill_cursor(
+        &self,
+    ) -> Result<Option<[u8; 32]>, crate::federation::BlobError> {
+        let v: Option<Option<Vec<u8>>> = self
+            .read(|conn| -> Result<Option<Option<Vec<u8>>>, rusqlite::Error> {
+                use rusqlite::OptionalExtension as _;
+                conn.query_row(
+                    "SELECT after_sha256 FROM dag_link_backfill_cursor WHERE singleton = 1",
+                    [],
+                    |r| r.get(0),
+                )
+                .optional()
+            })
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!("dag_link_backfill_cursor: {e}"))
+            })?;
+        v.flatten()
+            .map(|v| {
+                <[u8; 32]>::try_from(v.as_slice()).map_err(|_| {
+                    crate::federation::BlobError::Backend(
+                        "dag_link_backfill_cursor: a 32-byte sha".into(),
+                    )
+                })
+            })
+            .transpose()
+    }
+
+    async fn set_dag_link_backfill_cursor(
+        &self,
+        after: Option<[u8; 32]>,
+    ) -> Result<(), crate::federation::BlobError> {
+        let after = after.map(|a| a.to_vec());
+        self.write(move |conn| -> Result<(), rusqlite::Error> {
+            conn.execute(
+                "INSERT INTO dag_link_backfill_cursor (singleton, after_sha256, updated_at) \
+                 VALUES (1, ?1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')) \
+                 ON CONFLICT (singleton) DO UPDATE \
+                   SET after_sha256 = excluded.after_sha256, updated_at = excluded.updated_at",
+                rusqlite::params![after],
+            )?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| {
+            crate::federation::BlobError::Backend(format!("set_dag_link_backfill_cursor: {e}"))
+        })
+    }
+
     async fn stream_positions_of_chunk(
         &self,
         chunk_sha: &[u8; 32],

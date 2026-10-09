@@ -20325,6 +20325,54 @@ impl crate::federation::BlobStorage for PostgresBackend {
         Ok(true)
     }
 
+    async fn dag_link_backfill_cursor(
+        &self,
+    ) -> Result<Option<[u8; 32]>, crate::federation::BlobError> {
+        use crate::federation::BlobError;
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| BlobError::Backend(format!("dag_link_backfill_cursor pool: {e}")))?;
+        let row = client
+            .query_opt(
+                "SELECT after_sha256 FROM cirislens.dag_link_backfill_cursor WHERE singleton",
+                &[],
+            )
+            .await
+            .map_err(|e| BlobError::Backend(format!("dag_link_backfill_cursor: {e}")))?;
+        let Some(row) = row else { return Ok(None) };
+        let v: Option<Vec<u8>> = row.safe_get_with("after_sha256", BlobError::Backend)?;
+        v.map(|v| {
+            <[u8; 32]>::try_from(v.as_slice())
+                .map_err(|_| BlobError::Backend("dag_link_backfill_cursor: a 32-byte sha".into()))
+        })
+        .transpose()
+    }
+
+    async fn set_dag_link_backfill_cursor(
+        &self,
+        after: Option<[u8; 32]>,
+    ) -> Result<(), crate::federation::BlobError> {
+        use crate::federation::BlobError;
+        let client =
+            self.pool.get().await.map_err(|e| {
+                BlobError::Backend(format!("set_dag_link_backfill_cursor pool: {e}"))
+            })?;
+        let after = after.map(|a| a.to_vec());
+        client
+            .execute(
+                "INSERT INTO cirislens.dag_link_backfill_cursor (singleton, after_sha256, updated_at) \
+                 VALUES (TRUE, $1, NOW()) \
+                 ON CONFLICT (singleton) DO UPDATE \
+                   SET after_sha256 = EXCLUDED.after_sha256, updated_at = EXCLUDED.updated_at",
+                &[&after],
+            )
+            .await
+            .map_err(|e| BlobError::Backend(format!("set_dag_link_backfill_cursor: {e}")))?;
+        Ok(())
+    }
+
     async fn stream_positions_of_chunk(
         &self,
         chunk_sha: &[u8; 32],

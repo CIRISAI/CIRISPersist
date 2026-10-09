@@ -1991,7 +1991,9 @@ pub mod orchestrate {
     /// seqs and with their shas
     /// ([`BlobStorage::link_dag_chunks_if_exact`]). A plaintext manifest is
     /// read in clear; a sealed one is opened with this node's own grant and
-    /// no caller data. Idempotent; at most `max_manifests` per pass.
+    /// no caller data. Idempotent; at most `max_manifests` per pass. A capped
+    /// pass records where it stopped (V185) and the next pass resumes there,
+    /// wrapping around, so skipped manifests cannot hold the rest back.
     ///
     /// A manifest this node is not granted, or one sealed under a caller's
     /// associated data, is `skipped_no_key`; a stream that moved is
@@ -2007,20 +2009,37 @@ pub mod orchestrate {
     {
         const PAGE: u32 = 256;
         let mut report = DagLinkBackfillReport::default();
-        let mut after: Option<[u8; 32]> = None;
-        // Skipped manifests stay unlinked, so the cursor (not the absence of
-        // a relation) is what moves the pass forward.
+        // v54.0.0 (Codex on PR #1050) — RESUME, then wrap once. Skipped
+        // manifests stay unlinked, so a pass that always started from the
+        // lowest sha re-examined the same capped prefix forever once
+        // `max_manifests` unlinkable manifests sorted first, and never reached
+        // a linkable DAG after them. The pass starts after the sha the last
+        // capped pass stopped at (V185), runs to the end of the sha order, then
+        // wraps to the start and stops once it passes where it began: every
+        // unlinked manifest is examined in turn, across passes. A capped pass
+        // records where it stopped; a pass that completes the cycle clears it.
+        let start = backend.dag_link_backfill_cursor().await?;
+        let mut after = start;
+        let mut wrapped = false;
+        let mut last_scanned: Option<[u8; 32]> = None;
         loop {
             let page = backend.list_unlinked_chunk_dags(after, PAGE).await?;
-            let Some(last) = page.last().copied() else {
-                break;
-            };
+            let mut cycle_done = false;
             for sha in &page {
+                // After the wrap, everything past `start` was examined before it.
+                if wrapped && start.is_some_and(|s| *sha > s) {
+                    cycle_done = true;
+                    break;
+                }
                 if report.scanned >= u64::from(max_manifests) {
                     report.truncated = true;
+                    backend
+                        .set_dag_link_backfill_cursor(last_scanned.or(start))
+                        .await?;
                     return Ok(report);
                 }
                 report.scanned += 1;
+                last_scanned = Some(*sha);
                 match manifest_chunks_as_node(backend, sha, node_key_id).await? {
                     ManifestChunks::NoKey => report.skipped_no_key += 1,
                     ManifestChunks::NotPositioned => report.skipped_stream_mismatch += 1,
@@ -2036,11 +2055,21 @@ pub mod orchestrate {
                     }
                 }
             }
-            if (page.len() as u32) < PAGE {
+            if cycle_done {
                 break;
             }
-            after = Some(last);
+            match page.last().copied() {
+                Some(last) if page.len() as u32 >= PAGE => after = Some(last),
+                // The end of the sha order: wrap once to cover what sorts
+                // before `start`, unless the pass began at the start.
+                _ if start.is_some() && !wrapped => {
+                    wrapped = true;
+                    after = None;
+                }
+                _ => break,
+            }
         }
+        backend.set_dag_link_backfill_cursor(None).await?;
         Ok(report)
     }
 

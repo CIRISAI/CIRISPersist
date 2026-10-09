@@ -2290,6 +2290,21 @@ pub trait BlobStorage: Send + Sync {
         chunks: &[(u64, [u8; 32])],
     ) -> impl Future<Output = Result<bool, BlobError>> + Send;
 
+    /// v54.0.0 (CIRISPersist#994, Codex on PR #1050) — the sha the last
+    /// capped backfill pass stopped after (V185), or `None` to start from
+    /// the lowest sha. The pass resumes here and wraps around, so a capped
+    /// prefix of unlinkable manifests cannot hold the rest back.
+    fn dag_link_backfill_cursor(
+        &self,
+    ) -> impl Future<Output = Result<Option<[u8; 32]>, BlobError>> + Send;
+
+    /// v54.0.0 (CIRISPersist#994, Codex on PR #1050) — record where the next
+    /// backfill pass resumes (`None`: from the lowest sha).
+    fn set_dag_link_backfill_cursor(
+        &self,
+        after: Option<[u8; 32]>,
+    ) -> impl Future<Output = Result<(), BlobError>> + Send;
+
     // ── v53.0.0 (CIRISPersist#969) — the stream-epoch DEK (V168) ─────────
 
     /// The stream's key state in one snapshot — see [`StreamKeyState`].

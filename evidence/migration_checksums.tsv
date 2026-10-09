@@ -345,3 +345,5 @@ sqlite	183	signed_wire_index_record_key	1388055841113232330
 postgres	183	signed_wire_index_record_key	333034005800934726
 sqlite	184	blob_cohort_associations	5515631984490399332
 postgres	184	blob_cohort_associations	6727743211086106808
+sqlite	185	dag_link_backfill_cursor	11302997608030026060
+postgres	185	dag_link_backfill_cursor	16500093909395014281

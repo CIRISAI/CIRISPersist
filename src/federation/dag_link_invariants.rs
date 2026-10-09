@@ -31,6 +31,11 @@
 //!   pre-V176 DAG this node can open, exactly its chunks; a DAG whose stream
 //!   moved is skipped, never mis-linked; a DAG sealed under a viewer's
 //!   associated data is skipped as unopenable; the pass is idempotent.
+//! - **I600** (v54.0.0, Codex on PR #1050) — the sweep RESUMES: with a cap
+//!   of three and three unopenable manifests sorting first, a linkable DAG
+//!   after them is linked within two passes (each pass starts after where the
+//!   last capped one stopped, V185, and wraps); a later full pass examines
+//!   the skipped ones again.
 //! - **I598** (v54.0.0, Codex on PR #1050; postgres) — an append that commits
 //!   between the backfill's comparison and its link is NOT linked: the link
 //!   writes exactly the rows it compared, never a re-read of the stream. A
@@ -675,6 +680,96 @@ pub(crate) mod bodies {
             "I576 B: the adopted DAG gains exactly its chunks"
         );
     }
+
+    /// **I600** — see the module doc.
+    pub(crate) async fn i600_the_sweep_resumes_past_skipped_manifests<B>(
+        dsn_a: &str,
+        dsn_b: &str,
+        run: &str,
+        pick: Pick<B>,
+    ) where
+        B: BlobStorage + FederationDirectory + LinkSeam + Sync + 'static,
+    {
+        let p = pair(dsn_a, dsn_b, run, pick, "i600").await;
+        // Three manifests A cannot open (sealed under a viewer's associated
+        // data), unlinked as a pre-V176 DAG would be.
+        let mut unopenable = Vec::new();
+        for n in 0..3 {
+            let stream = format!("i600-u{n}-{run}");
+            for i in 0..2u64 {
+                p.a.put_blob_chunk_scoped(
+                    cohort_scope::SELF,
+                    Some(&p.owner),
+                    &stream,
+                    i,
+                    &segment(n * 2 + i as usize),
+                    0,
+                    None,
+                )
+                .await
+                .unwrap_or_else(|e| panic!("chunk {i}: {e}"));
+            }
+            let m =
+                p.a.seal_stream_scoped(
+                    cohort_scope::SELF,
+                    Some(&p.owner),
+                    &stream,
+                    None,
+                    Some(b"i600-viewer-context".as_slice()),
+                )
+                .await
+                .unwrap_or_else(|e| panic!("seal {stream}: {e}"))
+                .manifest_sha256;
+            p.sa.dag_link(&m, None).await;
+            unopenable.push(m);
+        }
+        let ceiling = *unopenable.iter().max().unwrap();
+        // A linkable DAG that sorts AFTER all three. A candidate that sorts
+        // below keeps its relation, so the sweep never sees it.
+        let mut good = None;
+        for t in 0..64 {
+            let m = write_and_seal(&p, &format!("i600-g{t}-{run}"), 2).await;
+            if m > ceiling {
+                good = Some(m);
+                break;
+            }
+        }
+        let good = good.expect("I600 precondition: a DAG sorting after the three");
+        let want = p.a.chunks_of_manifest(&good).await.unwrap();
+        p.sa.dag_link(&good, None).await;
+
+        let first = p.a.backfill_dag_chunk_links(3).await.expect("pass 1");
+        assert_eq!(
+            (
+                first.scanned,
+                first.linked,
+                first.skipped_no_key,
+                first.truncated
+            ),
+            (3, 0, 3, true),
+            "I600 pass 1 spends its cap on the three unopenable manifests: {first:?}"
+        );
+        let second = p.a.backfill_dag_chunk_links(3).await.expect("pass 2");
+        assert_eq!(
+            p.a.chunks_of_manifest(&good).await.unwrap(),
+            want,
+            "I600 pass 2 resumes past the skipped prefix and links the DAG after it: {second:?}"
+        );
+        assert_eq!(second.linked, 1, "I600 pass 2: {second:?}");
+        // A full pass after the cycle completed starts over: the skipped
+        // manifests are examined again (they could become openable).
+        let third = p.a.backfill_dag_chunk_links(1_000).await.expect("pass 3");
+        assert_eq!(
+            (
+                third.scanned,
+                third.linked,
+                third.skipped_no_key,
+                third.truncated
+            ),
+            (3, 0, 3, false),
+            "I600 the skipped manifests are examined again: {third:?}"
+        );
+    }
 }
 
 /// I598 — see the module doc. Postgres only: it needs the backend's pause.
@@ -816,6 +911,7 @@ mod runners {
     pair_case!(i485, i485_a_forged_pointer_revives_nothing);
     pair_case!(i486_487, i486_487_an_unrelated_dag_and_the_backfill);
     pair_case!(i576, i576_the_backfill_sweep);
+    pair_case!(i600, i600_the_sweep_resumes_past_skipped_manifests);
 
     /// **I576b** — from disk: every Engine constructor that runs the boot
     /// KeyGrant sweep also runs the V176 backfill (comments stripped).
