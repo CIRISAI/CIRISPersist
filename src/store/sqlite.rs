@@ -21826,6 +21826,24 @@ impl crate::outbound::OutboundQueue for SqliteBackend {
         .map_err(|e| crate::outbound::Error::Backend(format!("list_outbound: {e}")))
     }
 
+    async fn outbound_counts(
+        &self,
+    ) -> Result<
+        std::collections::HashMap<crate::outbound::OutboundStatus, u64>,
+        crate::outbound::Error,
+    > {
+        let rows: Vec<(String, i64)> = self
+            .read(move |conn| -> rusqlite::Result<Vec<(String, i64)>> {
+                let mut stmt = conn
+                    .prepare("SELECT status, COUNT(*) FROM edge_outbound_queue GROUP BY status")?;
+                let it = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+                it.collect()
+            })
+            .await
+            .map_err(|e| crate::outbound::Error::Backend(format!("outbound_counts: {e}")))?;
+        crate::outbound::counts_from_rows(rows)
+    }
+
     async fn cancel_outbound(
         &self,
         queue_id: &crate::outbound::QueueId,

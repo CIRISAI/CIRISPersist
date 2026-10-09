@@ -11769,6 +11769,20 @@ impl crate::outbound::OutboundQueue for MemoryBackend {
         Ok(rows)
     }
 
+    async fn outbound_counts(
+        &self,
+    ) -> Result<
+        std::collections::HashMap<crate::outbound::OutboundStatus, u64>,
+        crate::outbound::Error,
+    > {
+        let state = self.state.lock().expect("memory backend lock");
+        let mut out = std::collections::HashMap::new();
+        for r in state.outbound_queue.values() {
+            *out.entry(r.status).or_insert(0u64) += 1;
+        }
+        Ok(out)
+    }
+
     async fn cancel_outbound(
         &self,
         queue_id: &crate::outbound::QueueId,

@@ -163,6 +163,20 @@ Witnesses run on sqlite and postgres. The memory backend has no blob storage.
 
 Mutation-checked, 4 of 5 killed. Dropping the exactness check reds I576 on sqlite and on postgres. Dropping the boot hook from one constructor reds I576b. Propagating a no-key failure as an error reds I576. A cursor that stops after the first page survives, because the fixture never fills a 256-manifest page.
 
+### Added — `outbound_counts()`: the outbound queue's rows by status (#996); Fixed — the postgres outbound queue's `queue_id` doors never ran
+
+CIRISEdge#814 item 2: Edge's `durable_queue_depth` counted only enqueues, so a queue that drained read as one that never did. Edge wants the resident depth (`Pending + Sending + AwaitingAck`) in its metrics snapshot without listing rows to count them.
+
+- **New.** `OutboundQueue::outbound_counts() -> HashMap<OutboundStatus, u64>` is one `SELECT status, COUNT(*) … GROUP BY status` on sqlite and postgres, and a fold on memory. Statuses with no row are absent. An unknown status in the table is an error, not a dropped row. It crosses the outbound ops capsule as an appended op, `OutboundCounts {}`, answering the appended result `Counts(..)`, with no vtable change. PyO3 exposes `Engine.outbound_counts()` as `{status: count}`, classified `empirical` and stubbed in the `.pyi`.
+- **Found by the witness, fixed.** No test had ever run the outbound queue on postgres. Every door that names a row bound the `String` queue id against `$n::uuid`, so Postgres inferred the parameter as `uuid` and the driver refused to serialize it. That is `mark_transport_delivered`, `mark_transport_failed`, `mark_replay_resolved`, `mark_ack_received`, `outbound_status`, `cancel_outbound` and `replay_abandoned`, nine binds in all. `mark_transport_delivered` also failed earlier, with `inconsistent types deduced for parameter $1`, because its timestamp was used both bare and inside a `CASE`. On postgres no row could leave `sending`. The binds are now `$n::text::uuid` and the timestamp is cast.
+
+Witnesses:
+
+- **I577** (memory, sqlite, postgres) runs four rows through enqueue, claim, deliver with and without ACK, a failure at the last attempt, the ACK, then a status read, a cancel and a replay. At every step the counts equal `list_outbound`'s per-status lengths, equal the expected map, and sum to the four rows.
+- **I577b** (capsule) checks that the appended op answers `Counts` with only the status that has rows.
+
+Mutation-checked, 6 of 7 killed. Memory skipping `sending` reds I577 on memory. Sqlite filtering one status reds I577 on sqlite. The capsule answering `Count` reds I577b. Postgres reverted to `$3::uuid` on delivery reds I577 on postgres, and so does `$2::uuid` on replay and removing both timestamp casts. Removing only the second timestamp cast survives, because the first cast already fixes the parameter's type.
+
 ## [53.2.0] - 2026-10-08
 
 ### Changed — the tag is pushed once main's run EXISTS, not once it completes (#1008)

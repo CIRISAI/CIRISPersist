@@ -18550,6 +18550,45 @@ impl PyEngine {
         })
     }
 
+    /// v54.0.0 (CIRISPersist#996, CIRISEdge#814 item 2) — how many outbound
+    /// rows sit in each status, as `{status_wire_str: count}` (statuses with
+    /// no row omitted). The resident depth is the sum over `pending`,
+    /// `sending` and `awaiting_ack`.
+    fn outbound_counts<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<pyo3::Bound<'py, pyo3::types::PyDict>> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let counts = py
+                .detach(move || match &self.backend {
+                    #[cfg(feature = "postgres")]
+                    BackendDispatch::Postgres(pg) => {
+                        let backend = pg.clone();
+                        runtime.block_on(async move {
+                            use crate::outbound::OutboundQueue;
+                            backend.outbound_counts().await
+                        })
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => {
+                        let backend = sq.clone();
+                        runtime.block_on(async move {
+                            use crate::outbound::OutboundQueue;
+                            backend.outbound_counts().await
+                        })
+                    }
+                })
+                .map_err(outbound_err_to_py)?;
+            let d = pyo3::types::PyDict::new(py);
+            for (status, n) in counts {
+                d.set_item(status.as_str(), n)?;
+            }
+            Ok(d)
+        })
+    }
+
     /// v0.4.0 — List outbound rows with optional filters. Returns
     /// a list of dicts. All filter parameters are optional;
     /// combine with AND.

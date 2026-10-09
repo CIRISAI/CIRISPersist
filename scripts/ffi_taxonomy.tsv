@@ -769,3 +769,5 @@ Engine	community_trust_consent_json	deontic
 Engine	sealed_dag_readiness_json	empirical	
 Engine	chunks_of_manifest_json	epistemic	
 Engine	dag_contains_chunk	epistemic	
+# v54.0.0 (#996) — a count of rows by status: a read, like list_outbound.
+Engine	outbound_counts	empirical

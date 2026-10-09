@@ -22612,15 +22612,19 @@ impl crate::outbound::OutboundQueue for PostgresBackend {
         // Branch on requires_ack within the SQL: 'delivered' immediately
         // when no ACK required; 'awaiting_ack' otherwise. CHECK
         // constraints enforce delivered_at correctness on terminal.
+        // v54.0.0 (#996, found by I577) — `$1` is CAST: inside the CASE
+        // Postgres deduced it as text against the timestamptz column above
+        // ("inconsistent types deduced for parameter $1"), so this door
+        // failed on every call on postgres and no row ever left `sending`.
         let n = client
             .execute(
                 "UPDATE cirislens.edge_outbound_queue \
                  SET status = CASE WHEN requires_ack THEN 'awaiting_ack' ELSE 'delivered' END, \
-                     transport_delivered_at = $1, \
-                     delivered_at = CASE WHEN requires_ack THEN NULL ELSE $1 END, \
+                     transport_delivered_at = $1::timestamptz, \
+                     delivered_at = CASE WHEN requires_ack THEN NULL ELSE $1::timestamptz END, \
                      last_transport = $2, \
                      claimed_until = NULL, claimed_by = NULL \
-                 WHERE queue_id = $3::uuid AND status = 'sending'",
+                 WHERE queue_id = $3::text::uuid AND status = 'sending'",
                 &[&now, &transport, &queue_id],
             )
             .await
@@ -22659,7 +22663,7 @@ impl crate::outbound::OutboundQueue for PostgresBackend {
             .query_opt(
                 "SELECT attempt_count, max_attempts, enqueued_at, ttl_seconds \
                  FROM cirislens.edge_outbound_queue \
-                 WHERE queue_id = $1::uuid AND status = 'sending' \
+                 WHERE queue_id = $1::text::uuid AND status = 'sending' \
                  FOR UPDATE",
                 &[&queue_id],
             )
@@ -22696,7 +22700,7 @@ impl crate::outbound::OutboundQueue for PostgresBackend {
                      last_error_class = $3, last_error_detail = $4, \
                      last_transport = $5, \
                      claimed_until = NULL, claimed_by = NULL \
-                 WHERE queue_id = $6::uuid",
+                 WHERE queue_id = $6::text::uuid",
                 &[
                     &now,
                     &reason,
@@ -22717,7 +22721,7 @@ impl crate::outbound::OutboundQueue for PostgresBackend {
                      last_error_class = $2, last_error_detail = $3, \
                      last_transport = $4, \
                      claimed_until = NULL, claimed_by = NULL \
-                 WHERE queue_id = $5::uuid",
+                 WHERE queue_id = $5::text::uuid",
                 &[
                     &next_attempt_after,
                     &error_class,
@@ -22757,7 +22761,7 @@ impl crate::outbound::OutboundQueue for PostgresBackend {
                 "UPDATE cirislens.edge_outbound_queue \
                  SET status = 'delivered', delivered_at = $1, \
                      claimed_until = NULL, claimed_by = NULL \
-                 WHERE queue_id = $2::uuid AND status NOT IN ('delivered', 'abandoned')",
+                 WHERE queue_id = $2::text::uuid AND status NOT IN ('delivered', 'abandoned')",
                 &[&now, &queue_id],
             )
             .await
@@ -22815,7 +22819,7 @@ impl crate::outbound::OutboundQueue for PostgresBackend {
                  SET status = 'delivered', \
                      ack_envelope_bytes = $1, ack_received_at = $2, \
                      delivered_at = $2 \
-                 WHERE queue_id = $3::uuid AND status = 'awaiting_ack'",
+                 WHERE queue_id = $3::text::uuid AND status = 'awaiting_ack'",
                 &[&ack_envelope_bytes, &now, &queue_id],
             )
             .await
@@ -22946,7 +22950,7 @@ impl crate::outbound::OutboundQueue for PostgresBackend {
                         last_transport, requires_ack, ack_timeout_seconds, \
                         ack_envelope_bytes, ack_received_at, claimed_until, claimed_by \
                  FROM cirislens.edge_outbound_queue \
-                 WHERE queue_id = $1::uuid",
+                 WHERE queue_id = $1::text::uuid",
                 &[&queue_id],
             )
             .await
@@ -23023,6 +23027,33 @@ impl crate::outbound::OutboundQueue for PostgresBackend {
         rows.into_iter().map(pg_row_to_outbound_row).collect()
     }
 
+    async fn outbound_counts(
+        &self,
+    ) -> Result<
+        std::collections::HashMap<crate::outbound::OutboundStatus, u64>,
+        crate::outbound::Error,
+    > {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| crate::outbound::Error::Backend(format!("pool: {e}")))?;
+        let rows = client
+            .query(
+                "SELECT status, COUNT(*) AS n FROM cirislens.edge_outbound_queue GROUP BY status",
+                &[],
+            )
+            .await
+            .map_err(|e| crate::outbound::Error::Backend(format!("outbound_counts: {e}")))?;
+        let mut out = Vec::with_capacity(rows.len());
+        for r in &rows {
+            let status: String = r.safe_get_with("status", crate::outbound::Error::Backend)?;
+            let n: i64 = r.safe_get_with("n", crate::outbound::Error::Backend)?;
+            out.push((status, n));
+        }
+        crate::outbound::counts_from_rows(out)
+    }
+
     async fn cancel_outbound(
         &self,
         queue_id: &crate::outbound::QueueId,
@@ -23039,7 +23070,7 @@ impl crate::outbound::OutboundQueue for PostgresBackend {
                  SET status = 'abandoned', \
                      abandoned_at = $1, abandoned_reason = 'operator_cancel', \
                      claimed_until = NULL, claimed_by = NULL \
-                 WHERE queue_id = $2::uuid AND status NOT IN ('delivered', 'abandoned')",
+                 WHERE queue_id = $2::text::uuid AND status NOT IN ('delivered', 'abandoned')",
                 &[&now, &queue_id],
             )
             .await
@@ -23065,7 +23096,7 @@ impl crate::outbound::OutboundQueue for PostgresBackend {
                      next_attempt_after = $1, \
                      abandoned_at = NULL, abandoned_reason = NULL, \
                      last_error_class = NULL, last_error_detail = NULL \
-                 WHERE queue_id = $2::uuid AND status = 'abandoned'",
+                 WHERE queue_id = $2::text::uuid AND status = 'abandoned'",
                 &[&now, &queue_id],
             )
             .await

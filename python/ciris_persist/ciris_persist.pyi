@@ -4121,6 +4121,15 @@ class Engine:
         """(derived) pragmatic — v16 (CIRISPersist#431) — pure §19.1 root builder: the WW-scheme Merkle root (lexicographic leaf order, odd-duplication, WW-v1-empty empty sentinel)..."""
 
 
+    # ==============================================================
+    # CONTINGENT  (descriptive)
+    # Varying one of these out of scope by construction — see `report` for why this is empty.
+    # ==============================================================
+
+    def outbound_counts(self) -> dict[str, Any]:
+        """(derived) contingent — v54.0.0 (CIRISPersist#996, CIRISEdge#814 item 2) — how many outbound rows sit in each status, as {status_wire_str: count} (statuses with no row omi..."""
+
+
 class ScoringFactorStream:
 
     # ==============================================================
