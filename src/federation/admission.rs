@@ -11433,6 +11433,54 @@ async fn verify_accord_family_coscrub_with<F>(
 where
     F: super::FederationDirectory + ?Sized,
 {
+    verify_accord_family_coscrub_typed(
+        directory,
+        row,
+        roster_key_ids,
+        min_quorum,
+        require_fips_custody,
+        custody_root,
+    )
+    .await
+    .map_err(|f| f.to_string())
+}
+
+/// v54.0.0 (CIRISPersist#995 row 1) — why a co-scrub check did not pass:
+/// the row does not carry the quorum (a policy answer), or the check could
+/// not be completed (a directory failure while resolving the roster). The
+/// String-returning callers fold both into a refusal, which is fail-closed
+/// for an admission. A caller for whom "does not carry the quorum" ADMITS
+/// something (the equal-instant repair) must tell them apart.
+#[derive(Debug)]
+pub(crate) enum CoscrubFailure {
+    /// The row does not carry the accord's m-of-n co-scrub.
+    Refused(String),
+    /// The roster could not be resolved: the answer is unknown.
+    Lookup(Error),
+}
+
+impl std::fmt::Display for CoscrubFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CoscrubFailure::Refused(why) => f.write_str(why),
+            CoscrubFailure::Lookup(e) => write!(f, "roster resolve failed: {e}"),
+        }
+    }
+}
+
+/// [`verify_accord_family_coscrub_with`] with its failure typed
+/// ([`CoscrubFailure`]).
+async fn verify_accord_family_coscrub_typed<F>(
+    directory: &F,
+    row: &super::KeyRecord,
+    roster_key_ids: &[String],
+    min_quorum: usize,
+    require_fips_custody: bool,
+    custody_root: &[u8],
+) -> Result<(), CoscrubFailure>
+where
+    F: super::FederationDirectory + ?Sized,
+{
     use ciris_verify_core::threshold::{
         verify_quorum_policy, QuorumPolicy, Role, ThresholdMember, ThresholdSignature,
     };
@@ -11444,7 +11492,7 @@ where
     // refusal deterministic — a subject-blind envelope is refused identically
     // whether the roster resolves, whether the custody floor is met, and
     // whether the signatures are real. See `verify_envelope_binds_subject`.
-    verify_envelope_binds_subject(row)?;
+    verify_envelope_binds_subject(row).map_err(CoscrubFailure::Refused)?;
 
     // (3) Standing founder roster = the accord family resolved to their PINNED
     // directory pubkeys (never caller-supplied keys). Skip any that don't
@@ -11457,7 +11505,7 @@ where
         if let Some(rec) = directory
             .lookup_public_key(kid)
             .await
-            .map_err(|e| format!("roster resolve failed for {kid}: {e}"))?
+            .map_err(CoscrubFailure::Lookup)?
         {
             if require_fips_custody {
                 if let Err(why) = verify_member_fips_custody_against(&rec, custody_root) {
@@ -11482,7 +11530,7 @@ where
     // so this is NOT a frozen constant.
     let m = std::cmp::max(n / 2 + 1, min_quorum);
     if m > n {
-        return Err(format!(
+        return Err(CoscrubFailure::Refused(format!(
             "accord quorum unreachable: floor {m} exceeds the {n} qualifying roster \
              member(s){}",
             if custody_rejected.is_empty() {
@@ -11493,7 +11541,7 @@ where
                     custody_rejected.join("; ")
                 )
             }
-        ));
+        )));
     }
     let policy = QuorumPolicy::new(m, n);
 
@@ -11501,7 +11549,9 @@ where
     // — the IDENTICAL function the single-scrub verify uses, so a base-field
     // scrub and an `additional_scrubs` entry are over byte-identical content.
     let bytes = crate::verify::canonical::ceg_produce_canonicalize(&row.registration_envelope)
-        .map_err(|e| format!("registration_envelope canonicalize failed: {e}"))?;
+        .map_err(|e| {
+            CoscrubFailure::Refused(format!("registration_envelope canonicalize failed: {e}"))
+        })?;
 
     // (5) The record's full scrub set → threshold signatures (member_id =
     // scrub_key_id; a self-scrub's member_id is not in the founder roster, so it
@@ -11520,11 +11570,11 @@ where
     // cryptographically verifies each hybrid sig and counts ONLY distinct
     // founders — a claimed-but-unsigned / garbage scrub does not count.
     verify_quorum_policy(&bytes, &roster, &sigs, policy).map_err(|e| {
-        format!(
+        CoscrubFailure::Refused(format!(
             "accord family m-of-n not met ({m}-of-{n}): {e}",
             m = policy.m,
             n = policy.n
-        )
+        ))
     })?;
 
     Ok(())
@@ -12195,9 +12245,24 @@ pub(crate) async fn record_carries_accord_scrub_over_roster<F>(
 where
     F: super::FederationDirectory + ?Sized,
 {
-    Ok(verify_accord_family_coscrub(directory, row, roster_key_ids)
-        .await
-        .is_ok())
+    // v54.0.0 (CIRISPersist#995 row 1) — a directory failure while resolving
+    // the roster is an ERROR, never "the row lacks the quorum": the
+    // equal-instant repair reads `false` as licence to replace the held row,
+    // so folding a lookup failure into `false` failed OPEN.
+    match verify_accord_family_coscrub_typed(
+        directory,
+        row,
+        roster_key_ids,
+        0,
+        false,
+        YUBICO_ATTESTATION_ROOT_1_DER,
+    )
+    .await
+    {
+        Ok(()) => Ok(true),
+        Err(CoscrubFailure::Refused(_)) => Ok(false),
+        Err(CoscrubFailure::Lookup(e)) => Err(e),
+    }
 }
 
 /// [`has_accord_conferred_role`] with an explicit accord-holder roster (tests inject
@@ -21225,6 +21290,139 @@ mod canonical_gate_tests {
         use crate::store::memory::MemoryBackend;
         let backend = MemoryBackend::new();
         run_equal_instant_repair_matrix(&backend, "mem").await;
+    }
+
+    /// **I573** (#995 row 1) — **a lookup failure on the HELD row's quorum
+    /// question is an error, never "the held row lacks the quorum".** The
+    /// equal-instant repair reads `false` as licence to replace the held row;
+    /// through v53 `record_carries_accord_scrub_over_roster` folded a
+    /// directory failure while resolving the founders into `false`, so the
+    /// repair ran on an infrastructure error. The incoming record's own
+    /// admission is held `Ok` so the held-row question alone decides.
+    /// Also **I571b** (#995 row 3, at the door): the live canonical's role
+    /// ORDER differs from the bundle's and is still repaired; a record with
+    /// different `transport_hints` at the same instant is not.
+    async fn run_held_row_lookup_failure(dir: std::sync::Arc<dyn FederationDirectory>, tag: &str) {
+        use super::super::register::{
+            decide_canonical_supersede, verify_canonical_supersede_over_roster,
+        };
+        let founders = [
+            Identity::new(&format!("i573h0-{tag}")),
+            Identity::new(&format!("i573h1-{tag}")),
+            Identity::new(&format!("i573h2-{tag}")),
+        ];
+        for f in &founders {
+            register_founder(dir.as_ref(), f).await;
+        }
+        let roster: Vec<String> = founders.iter().map(|f| f.key_id.clone()).collect();
+        let kid = format!("i573-canon-{tag}");
+        let t0 = "2026-07-31T13:58:22+00:00";
+        let rec = |roles: serde_json::Value, hints: &str, scrubbers: &[&Identity]| {
+            signed_canonical_record(
+                &kid,
+                "canonical,node",
+                PLACEHOLDER_SUBJECT_ED25519_BASE64,
+                None,
+                serde_json::json!({ "key_id": kid, "valid_from": t0, "roles": roles,
+                    "transport_hints": [hints] }),
+                scrubbers,
+            )
+        };
+        let live_roles = serde_json::json!(["infra:serve", "infra:attest"]);
+        let bundle_roles = serde_json::json!(["infra:attest", "infra:serve"]);
+        let one = [&founders[0]];
+        let two = [&founders[0], &founders[1]];
+        let held = rec(live_roles.clone(), "tcp://a", &one);
+        let incoming = rec(bundle_roles.clone(), "tcp://a", &two);
+
+        // I571b — at the door, over the real directory.
+        assert!(
+            verify_canonical_supersede_over_roster(dir.as_ref(), &held, &incoming, &roster)
+                .await
+                .expect("no infra error"),
+            "I571b {tag}: role ORDER differs, same set: the repair runs"
+        );
+        assert!(
+            !verify_canonical_supersede_over_roster(
+                dir.as_ref(),
+                &held,
+                &rec(bundle_roles.clone(), "tcp://b", &two),
+                &roster
+            )
+            .await
+            .expect("no infra error"),
+            "I571b {tag}: different transport_hints at the same instant: refused"
+        );
+
+        // I573 — the held-row lookup fails.
+        let failing =
+            crate::federation::directory_double::FaultInjectingDirectory::new(dir.clone())
+                .erroring("lookup_public_key");
+        assert!(failing.error_faults().contains("lookup_public_key"));
+        let carried = crate::federation::admission::record_carries_accord_scrub_over_roster(
+            &failing, &held, &roster,
+        )
+        .await;
+        assert!(
+            carried.is_err(),
+            "I573 {tag}: a lookup failure is an error, not `false`: {carried:?}"
+        );
+        let decided = decide_canonical_supersede(
+            &held,
+            &incoming,
+            async { Ok(()) },
+            crate::federation::admission::record_carries_accord_scrub_over_roster(
+                &failing, &held, &roster,
+            ),
+        )
+        .await;
+        assert!(
+            decided.is_err(),
+            "I573 {tag}: the repair does not run on an infrastructure error: {decided:?}"
+        );
+        // The real directory still answers `false` for the one-holder row, so
+        // the error above is the fault, not the row.
+        assert!(
+            !crate::federation::admission::record_carries_accord_scrub_over_roster(
+                dir.as_ref(),
+                &held,
+                &roster
+            )
+            .await
+            .unwrap(),
+            "I573 {tag} control: the one-holder row lacks the quorum"
+        );
+    }
+
+    #[tokio::test]
+    async fn i573_held_row_lookup_failure_memory() {
+        let d = std::sync::Arc::new(crate::store::memory::MemoryBackend::new());
+        run_held_row_lookup_failure(d, "mem").await;
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn i573_held_row_lookup_failure_sqlite() {
+        use crate::store::backend::Backend as _;
+        let b = crate::store::sqlite::SqliteBackend::open_in_memory()
+            .await
+            .unwrap();
+        b.run_migrations().await.unwrap();
+        run_held_row_lookup_failure(std::sync::Arc::new(b), "sq").await;
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn i573_held_row_lookup_failure_postgres() {
+        let Some(dsn) = crate::test_pg::dsn() else {
+            eprintln!("skipping i573_held_row_lookup_failure_postgres: DSN unset");
+            return;
+        };
+        super::run_in_isolated_pg_db(&dsn, |backend| async move {
+            run_held_row_lookup_failure(std::sync::Arc::new(backend), "pg").await;
+        })
+        .await;
     }
 
     /// End-to-end via the PRODUCTION `check_canonical_role_admission` on the

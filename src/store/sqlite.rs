@@ -3470,6 +3470,68 @@ impl SqliteBackend {
         Ok(AdoptScrubOutcome::Upgraded)
     }
 
+    /// v54.0.0 (CIRISPersist#995 row 2) — TEST SEAM: reproduce what a
+    /// pre-v53.1.4 UPDATE door left behind: `additional_scrubs` emptied while
+    /// `persist_row_hash` still binds the full record. Nothing else moves.
+    #[cfg(any(test, feature = "test-anchor"))]
+    pub async fn test_seam_drop_key_additional_scrubs(
+        &self,
+        key_id: &str,
+    ) -> Result<(), crate::federation::Error> {
+        let k = key_id.to_owned();
+        self.write(move |conn| {
+            conn.execute(
+                "UPDATE federation_keys SET additional_scrubs = '[]' WHERE key_id = ?1",
+                rusqlite::params![k],
+            )
+        })
+        .await
+        .map(|_| ())
+        .map_err(|e| crate::federation::Error::Backend(e.to_string()))
+    }
+
+    /// v54.0.0 (CIRISPersist#995 row 2) — write back the `additional_scrubs`
+    /// a pre-v53.1.4 UPDATE door dropped. The plan
+    /// (`ReplicatedKeyPlan::RehydrateScrubs`) has established that the held
+    /// row's `persist_row_hash` binds `record` exactly and that its column is
+    /// empty; the WHERE re-asserts both atomically, so nothing but the scrub
+    /// set moves (the hash already covers it). Moves the serve position and
+    /// re-indexes, like every door that rewrites consumer-visible bytes.
+    /// `Conflict` when the row changed between plan and act.
+    pub(crate) async fn rehydrate_dropped_key_scrubs(
+        &self,
+        record: &crate::federation::KeyRecord,
+    ) -> Result<(), crate::federation::Error> {
+        let kid = record.key_id.clone();
+        let hash = record.persist_row_hash.clone();
+        let text = serde_json::to_string(&record.additional_scrubs).map_err(|e| {
+            crate::federation::Error::Backend(format!("additional_scrubs serialize: {e}"))
+        })?;
+        let k = kid.clone();
+        let n = self
+            .write(move |conn| -> Result<usize, rusqlite::Error> {
+                let mutated_at = sqlite_next_key_serve_position(conn)?;
+                conn.execute(
+                    "UPDATE federation_keys SET additional_scrubs = ?3, mutated_at = ?4 \
+                     WHERE key_id = ?1 AND persist_row_hash = ?2 AND additional_scrubs = '[]'",
+                    rusqlite::params![k, hash, text, mutated_at.to_rfc3339()],
+                )
+            })
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!(
+                    "rehydrate_dropped_key_scrubs {kid}: {e}"
+                ))
+            })?;
+        if n == 0 {
+            return Err(crate::federation::Error::Conflict(format!(
+                "rehydrate_dropped_key_scrubs {kid}: row changed concurrently"
+            )));
+        }
+        self.index_stored_key_row(&kid).await?;
+        Ok(())
+    }
+
     /// v13.7.0 (CIRISPersist#405) — the CANONICAL SUPERSEDE store: replace an
     /// existing **anchor-scrubbed canonical** row IN PLACE with a strictly-newer,
     /// same-pubkey, m-of-n-re-verified re-scrubbed record (the CEG-native runtime
@@ -3694,6 +3756,16 @@ impl SqliteBackend {
         };
         match plan_replicated_key_apply(self, &record.record).await? {
             ReplicatedKeyPlan::Unchanged => Ok(ReplicatedKeyOutcome::Unchanged),
+            // v54.0.0 (#995 row 2) — write back the scrubs a pre-v53.1.4 door dropped.
+            ReplicatedKeyPlan::RehydrateScrubs => {
+                let mut r = record.record;
+                r.persist_row_hash = crate::federation::types::compute_persist_row_hash(&r)?;
+                match self.rehydrate_dropped_key_scrubs(&r).await {
+                    Ok(()) => Ok(ReplicatedKeyOutcome::ScrubsRehydrated),
+                    Err(crate::federation::Error::Conflict(_)) => Ok(RACED),
+                    Err(e) => Err(e),
+                }
+            }
             // The plan produced the reason at the branch that fired; carry it
             // through rather than re-deriving it here (#565).
             ReplicatedKeyPlan::Refused { reason } => Ok(ReplicatedKeyOutcome::Refused { reason }),
@@ -22066,6 +22138,13 @@ fn sqlite_upsert_wire_index(
     content_hash: &str,
     record_key: &str,
 ) -> rusqlite::Result<()> {
+    // v54.0.0 (CIRISPersist#995 row 5) — a record has ONE current content
+    // hash: drop the mappings its earlier bytes left (V183 makes this a seek).
+    conn.execute(
+        "DELETE FROM signed_wire_index \
+         WHERE kind = ?1 AND record_key = ?3 AND content_hash <> ?2",
+        rusqlite::params![kind, content_hash, record_key],
+    )?;
     conn.execute(
         "INSERT INTO signed_wire_index (kind, content_hash, record_key) \
          VALUES (?1, ?2, ?3) \

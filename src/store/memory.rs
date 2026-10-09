@@ -1107,7 +1107,45 @@ impl MemoryBackend {
                 }
             }
             ReplicatedKeyPlan::Upgrade | ReplicatedKeyPlan::Supersede => Ok(RACED),
+            // v54.0.0 (#995 row 2) — the memory store keeps the whole struct,
+            // so it never dropped a scrub; a seeded drop is repaired the same
+            // way the SQL backends repair it.
+            ReplicatedKeyPlan::RehydrateScrubs => {
+                let r = record.record;
+                let hash = crate::federation::types::compute_persist_row_hash(&r)?;
+                {
+                    let mut state = self.state.lock().expect("memory backend lock");
+                    let mutated_at = next_key_admission_position(&state);
+                    let Some(held) = state.federation_keys.get_mut(&r.key_id) else {
+                        return Ok(RACED);
+                    };
+                    if held.persist_row_hash != hash || !held.additional_scrubs.is_empty() {
+                        return Ok(RACED);
+                    }
+                    held.additional_scrubs = r.additional_scrubs.clone();
+                    state
+                        .key_record_mutated_at
+                        .insert(r.key_id.clone(), mutated_at);
+                }
+                self.index_stored_key_row(&r.key_id).await?;
+                Ok(ReplicatedKeyOutcome::ScrubsRehydrated)
+            }
         }
+    }
+
+    /// v54.0.0 (CIRISPersist#995 row 2) — TEST SEAM: reproduce what a
+    /// pre-v53.1.4 UPDATE door left behind: `additional_scrubs` emptied while
+    /// `persist_row_hash` still binds the full record. Nothing else moves.
+    #[cfg(any(test, feature = "test-anchor"))]
+    pub async fn test_seam_drop_key_additional_scrubs(
+        &self,
+        key_id: &str,
+    ) -> Result<(), crate::federation::Error> {
+        let mut state = self.state.lock().expect("memory backend lock");
+        if let Some(r) = state.federation_keys.get_mut(key_id) {
+            r.additional_scrubs.clear();
+        }
+        Ok(())
     }
 
     /// Create an empty memory backend.
@@ -1157,11 +1195,13 @@ impl MemoryBackend {
     ) -> Result<(), crate::federation::Error> {
         match crate::federation::wire_index::entry_as_stored(self, kind, record_key_json).await {
             Ok(Some(content_hash)) => {
-                self.state
-                    .lock()
-                    .expect("memory backend lock")
-                    .signed_wire_index
-                    .insert((kind.to_owned(), content_hash), record_key_json.to_owned());
+                let mut state = self.state.lock().expect("memory backend lock");
+                memory_upsert_wire_index(
+                    &mut state.signed_wire_index,
+                    kind,
+                    content_hash,
+                    record_key_json,
+                );
             }
             Ok(None) => {}
             Err(e) => {
@@ -10271,9 +10311,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         let count = triples.len() as u64;
         let mut state = self.state.lock().expect("memory backend lock");
         for (kind, hash, record_key) in triples {
-            state
-                .signed_wire_index
-                .insert((kind.to_owned(), hash), record_key);
+            memory_upsert_wire_index(&mut state.signed_wire_index, kind, hash, &record_key);
         }
         Ok(count)
     }
@@ -26130,4 +26168,17 @@ mod tests {
         .await
         .expect("657 attestation wire-index exercise");
     }
+}
+
+/// v54.0.0 (CIRISPersist#995 row 5) — the memory twin of the SQL upserts: a
+/// record has ONE current content hash, so its earlier mappings are dropped
+/// before the new one is written.
+fn memory_upsert_wire_index(
+    index: &mut HashMap<(String, String), String>,
+    kind: &str,
+    content_hash: String,
+    record_key: &str,
+) {
+    index.retain(|(k, h), rk| !(k == kind && rk == record_key && *h != content_hash));
+    index.insert((kind.to_owned(), content_hash), record_key.to_owned());
 }

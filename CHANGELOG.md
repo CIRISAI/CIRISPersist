@@ -122,6 +122,25 @@ Witnesses run on memory, sqlite and postgres:
 
 Mutation-checked, 6 of 6 killed. Folding no steward rows reds I570a and I570b. Taking the maximum window does the same. The watch on the subject-only fold reds I570b and I570c. The verdict on the subject-only fold reds I570a and I570c. Dropping the `for_key_id` filter reds I570a. A breach row without the governor reds I570b.
 
+### Fixed — Codex on #993 and #987: the equal-instant repair fails closed, stranded rows re-hydrate, one record per instant, one hash per record (#995)
+
+Codex reviewed v53.1.4 and v53.1.3. Four of its five findings are fixed here. Row 4, the plaintext blob provenance across rooms, has its own entry below.
+
+- **Row 1. A lookup failure no longer licenses the repair.** `admission::record_carries_accord_scrub_over_roster` turned any failure of the held row's founder lookup into `false`. The equal-instant arm reads `false` as "the held row lacks the quorum" and replaces it, so the repair failed open on an infrastructure error. The co-scrub check now has a typed failure, `CoscrubFailure`, that separates a refusal from a lookup error. The error propagates. The community leg's `key_record_carries_accord_scrub` asks the same function, so a lookup failure there is now an error instead of "not seated".
+- **Row 2. A row a pre-v53.1.4 door stranded is re-hydrated.** Those doors hashed the full record into `persist_row_hash` and dropped `additional_scrubs` from the column. A re-offer of that record hashed equal and was read as `Unchanged`, so the row stayed a one-holder record for good. The replicated key plan now sees the drop: the stored hash binds the incoming record, the column is empty, and the record carries scrubs. It verifies the record, then writes the scrubs back through a new `rehydrate_dropped_key_scrubs` door on sqlite and postgres, and memory gets the same arm. The door is a compare-and-set on the hash and the empty column, and it moves the serve position and re-indexes. `ReplicatedKeyOutcome` gains `ScrubsRehydrated`, serialized `"scrubs_rehydrated"`, appended. The boot's canonical seed accepts it, so a node seeded from the bundle heals at boot.
+- **Row 3. The equal-instant arm admits only the same record.** As settled on the issue, the two envelopes must match with `roles` compared as a set and every other member byte-equal. The live canonical differs from the bundle only in role order and is still repaired. A record with different `transport_hints`, or a different role set, at the same instant is refused, so two ceremony retries cannot split the address. Two spellings of one nanosecond are now two different records and are refused, which changes the v53.1.4 precheck test that pinned them as equal.
+- **Row 5. The wire index keeps one hash per record.** `signed_wire_index` is keyed by kind and content hash. A re-index after a record's hash moved left the old mapping behind, so `list_wire_hashes_since` kept advertising a hash whose point read answers `None`. Every upsert on all three backends now deletes the record key's other mappings first, and `rebuild_signed_wire_index` uses the same upsert. This covers a withdrawn location proof, an anchor-scrub upgrade and a PQC completion. New migration **V183** indexes `(kind, record_key)` on both dialects so the delete is a seek. Its checksums are appended to `evidence/migration_checksums.tsv`.
+
+Witnesses:
+
+- **I571** (unit) covers role order repaired, different hints refused, a different role set refused and a duplicated role refused. Newer is unchanged.
+- **I571b** (memory, sqlite, postgres) checks the same two cases at the supersede decision over a real directory.
+- **I573** (memory, sqlite, postgres) erases the held row's founder lookup through the fault-injecting directory. The quorum question returns an error, and the supersede decision returns an error instead of repairing.
+- **I572** (memory, sqlite, postgres, in `tests/reanchor_5314.rs`) inserts the final record whole and drops its scrubs through a new test seam. It then checks that the re-offer answers `ScrubsRehydrated`, that the row carries the quorum again, and that a second re-offer is `Unchanged`.
+- **I574** (memory, sqlite, postgres, inside I523) checks that after a withdrawal the old hash is no longer listed, and that a rebuild leaves the one current mapping.
+
+Mutation-checked, 8 of 8 killed. A lookup error read as `false` reds I573 on memory and sqlite. Roles compared byte-equal reds I571 and I571b. Envelopes always matching does the same. Disabling the rehydrate arm reds I572 on memory and sqlite. Removing the prune reds I574 on sqlite, on postgres and, through the memory upsert, on memory.
+
 ## [53.2.0] - 2026-10-08
 
 ### Changed — the tag is pushed once main's run EXISTS, not once it completes (#1008)

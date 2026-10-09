@@ -3399,12 +3399,11 @@ impl Engine {
                 reason: KeyRefusalReason::RecordAbsent,
             }),
             ReplicatedKeyPlan::Refused { reason } => Ok(RebindOutcome::Refused { reason }),
-            ReplicatedKeyPlan::Upgrade | ReplicatedKeyPlan::Supersede => {
-                Err(crate::federation::Error::InvalidArgument(
-                    "rebind_key_record: a self-signed record planned an anchor-scrub transition"
-                        .into(),
-                ))
-            }
+            ReplicatedKeyPlan::Upgrade
+            | ReplicatedKeyPlan::Supersede
+            | ReplicatedKeyPlan::RehydrateScrubs => Err(crate::federation::Error::InvalidArgument(
+                "rebind_key_record: a self-signed record planned an anchor-scrub transition".into(),
+            )),
         }
     }
 

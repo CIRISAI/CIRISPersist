@@ -4502,6 +4502,73 @@ impl PostgresBackend {
         Ok(())
     }
 
+    /// v54.0.0 (CIRISPersist#995 row 2) — TEST SEAM: reproduce what a
+    /// pre-v53.1.4 UPDATE door left behind: `additional_scrubs` emptied while
+    /// `persist_row_hash` still binds the full record. Nothing else moves.
+    #[cfg(any(test, feature = "test-anchor"))]
+    pub async fn test_seam_drop_key_additional_scrubs(
+        &self,
+        key_id: &str,
+    ) -> Result<(), crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        client
+            .execute(
+                "UPDATE cirislens.federation_keys SET additional_scrubs = '[]' WHERE key_id = $1",
+                &[&key_id],
+            )
+            .await
+            .map(|_| ())
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))
+    }
+
+    /// v54.0.0 (CIRISPersist#995 row 2) — write back the `additional_scrubs`
+    /// a pre-v53.1.4 UPDATE door dropped. The plan
+    /// (`ReplicatedKeyPlan::RehydrateScrubs`) has established that the held
+    /// row's `persist_row_hash` binds `record` exactly and that its column is
+    /// empty; the WHERE re-asserts both atomically, so nothing but the scrub
+    /// set moves (the hash already covers it). Moves the serve position and
+    /// re-indexes, like every door that rewrites consumer-visible bytes.
+    /// `Conflict` when the row changed between plan and act.
+    pub(crate) async fn rehydrate_dropped_key_scrubs(
+        &self,
+        record: &crate::federation::KeyRecord,
+    ) -> Result<(), crate::federation::Error> {
+        let text = serde_json::to_string(&record.additional_scrubs).map_err(|e| {
+            crate::federation::Error::Backend(format!("additional_scrubs serialize: {e}"))
+        })?;
+        let n = {
+            let client = self
+                .get_client()
+                .await
+                .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            let mutated_at = self.next_key_serve_position(&client).await?;
+            client
+                .execute(
+                    "UPDATE cirislens.federation_keys SET additional_scrubs = $3, mutated_at = $4 \
+                     WHERE key_id = $1 AND persist_row_hash = $2 AND additional_scrubs = '[]'",
+                    &[&record.key_id, &record.persist_row_hash, &text, &mutated_at],
+                )
+                .await
+                .map_err(|e| {
+                    crate::federation::Error::Backend(format!(
+                        "rehydrate_dropped_key_scrubs {}: {e}",
+                        record.key_id
+                    ))
+                })?
+        };
+        if n == 0 {
+            return Err(crate::federation::Error::Conflict(format!(
+                "rehydrate_dropped_key_scrubs {}: row changed concurrently",
+                record.key_id
+            )));
+        }
+        self.index_stored_key_row(&record.key_id).await?;
+        Ok(())
+    }
+
     /// Gated self-signed → anchor-scrubbed **upgrade** of an own-key row —
     /// Postgres twin of [`SqliteBackend::adopt_scrub_upgrade`]
     /// (CIRISPersist#351). Same monotonic + identity-preserving guards; the
@@ -4910,6 +4977,16 @@ impl PostgresBackend {
         };
         match plan_replicated_key_apply(self, &record.record).await? {
             ReplicatedKeyPlan::Unchanged => Ok(ReplicatedKeyOutcome::Unchanged),
+            // v54.0.0 (#995 row 2) — write back the scrubs a pre-v53.1.4 door dropped.
+            ReplicatedKeyPlan::RehydrateScrubs => {
+                let mut r = record.record;
+                r.persist_row_hash = crate::federation::types::compute_persist_row_hash(&r)?;
+                match self.rehydrate_dropped_key_scrubs(&r).await {
+                    Ok(()) => Ok(ReplicatedKeyOutcome::ScrubsRehydrated),
+                    Err(crate::federation::Error::Conflict(_)) => Ok(RACED),
+                    Err(e) => Err(e),
+                }
+            }
             // The plan produced the reason at the branch that fired; carry it
             // through rather than re-deriving it here (#565).
             ReplicatedKeyPlan::Refused { reason } => Ok(ReplicatedKeyOutcome::Refused { reason }),
@@ -22997,6 +23074,16 @@ async fn pg_upsert_wire_index<C>(
 where
     C: tokio_postgres::GenericClient + Sync,
 {
+    // v54.0.0 (CIRISPersist#995 row 5) — a record has ONE current content
+    // hash: drop the mappings its earlier bytes left (V183 makes this a seek).
+    client
+        .execute(
+            "DELETE FROM cirislens.signed_wire_index \
+             WHERE kind = $1 AND record_key = $3 AND content_hash <> $2",
+            &[&kind, &content_hash, &record_key],
+        )
+        .await
+        .map_err(|e| crate::federation::Error::Backend(format!("signed_wire_index prune: {e}")))?;
     client
         .execute(
             "INSERT INTO cirislens.signed_wire_index (kind, content_hash, record_key) \
