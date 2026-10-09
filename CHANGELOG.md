@@ -187,6 +187,35 @@ The #1025 powerset found two declared features that did not compile alone. Each 
 
 Checked by compiling `tls`, `tls,test-panic` and `pyo3-sqlite` alone, each with no errors and no warnings. Mutation-checked, 3 of 3 killed, each by `ci_feature_matrix.py check` exiting 1: dropping `postgres` from `tls`, dropping `sqlite` from `pyo3-sqlite`, and removing the CI loop. The last one first survived, because the step's name also named the command, so the check is now anchored to the command substitution.
 
+### Changed — the public async doors stay under `clippy::large_futures` (#1017)
+
+Edge, gating v53.1.8 with `clippy::large_futures` at its 16 KiB default, found `trust_root::resolve_serve_tier` at about 29 KB and its own inbound dispatch at about 19 KB. It boxed both at its call sites, and every caller would otherwise have to do the same. The cause was the fold wrapper from #1014, `observe::fold`. Each fold kept its whole inner future inline, so serve tier, then `trust_root_valid`, then `owner_granted_scope` stacked up.
+
+- **The fix is at the door.** `observe::fold` now boxes the future it wraps, eagerly, when the wrapper is built. An un-polled `async fn` keeps its arguments inline, so a box taken inside the body still left the inner future in the caller's state. Measured with that variant: `resolve_serve_tier` went from 28,904 to 8,200 bytes, and boxing eagerly brings it to 176. The cost is one allocation per fold entry. `fold` is now a plain `fn` returning `impl Future`. Its counting and task-local scope are unchanged.
+- **The lint.** `#![warn(clippy::large_futures)]` is set crate-wide, so every `-D warnings` clippy pass refuses a new large future awaited inside persist. That covers both the shipped shape and `--all-features --all-targets`. One test future, about 18 KB across four postgres matrices in `accord_carriage`, is boxed. The lib had four sites before the fix and has none after.
+
+Measured with `std::mem::size_of_val` on the un-polled future, in bytes:
+
+| door | before | after |
+|---|---:|---:|
+| `trust_root::resolve_serve_tier` (memory / dyn) | 28,904 / 29,544 | 176 / 192 |
+| `Engine::hold_breadth` | 28,952 | 224 |
+| `consent_by_humans::capacity_consent_stance` | 3,832 | 320 |
+| `admission::check_capacity_consent_admission` | 3,888 | 376 |
+| `consent_by_humans::resolve_scoped_stance_by_principals` | 3,648 | 136 |
+| `Engine::capacity_consent_stance` | 3,904 | 392 |
+| `FederationDirectory::put_attestation` | 16 | 16 |
+
+The trait methods are already boxed by `async_trait`, so `put_attestation` was never large. Edge's 19 KB dispatch future is Edge's own state around a consent gate that measured about 3.9 KB.
+
+**I578** (`src/future_size_gate.rs`) builds each door's future without polling it, on memory and on a sqlite Engine, and asserts every one is under 16 KiB. It covers the futures persist hands out, which the lint inside persist cannot see.
+
+Mutation-checked:
+
+- **Killed.** An unboxed `fold` reds both I578 tests. Removing the test future's box reds `clippy --all-features --all-targets -D warnings`.
+- **Survived.** A `fold` that boxes lazily, inside its body, survives I578 at 8,200 bytes, which is under the threshold. Only the eager box's extra margin goes unpinned.
+- **Removed as redundant.** A box on the postgres put door's 16.5 KB admission block was added and then removed. The lint no longer fires there once the folds box themselves.
+
 ## [53.2.0] - 2026-10-08
 
 ### Changed — the tag is pushed once main's run EXISTS, not once it completes (#1008)
