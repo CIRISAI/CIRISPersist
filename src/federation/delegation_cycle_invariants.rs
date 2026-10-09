@@ -37,6 +37,12 @@
 //!   edge back to the holder, in either order, and a capability edge closing
 //!   the same pair is still refused.
 //!
+//! I608 (Codex round 3 on PR #1050) — a retraction asserted AFTER `now` (a
+//! signer's clock inside the admitted future skew) has not happened yet: the
+//! grant and licence walks at `now` still traverse the edge it names, so the
+//! cycle gate must too. Gate (a) (the granter's bare retraction) and gate (b)
+//! (a retraction naming the edge) are both read at `now`.
+//!
 //! I597 — the check and the insert are ONE step (Codex on PR #1050). Two
 //! writers of `A → B` and `B → A` that both finish the graph read before
 //! either inserts would both be admitted. The witness forces exactly that
@@ -274,6 +280,69 @@ pub mod bodies {
             "I597 (ii): the put, serialized behind the crossing",
         );
         assert!(!p_ran_free, "I597 (ii): the put must wait for the crossing");
+    }
+
+    /// A retraction by `granter` against `grantee` (naming `target` when
+    /// given), signed `ahead` in the future: inside the admitted skew, so the
+    /// door stores it, and not yet in force at `now`.
+    async fn future_retraction(
+        d: &dyn FederationDirectory,
+        granter: &str,
+        grantee: &str,
+        target: Option<&str>,
+        ahead: chrono::Duration,
+    ) {
+        let id = uuid::Uuid::new_v4().to_string();
+        let mut envelope = serde_json::json!({ "id": id });
+        if let Some(t) = target {
+            envelope["references_attestation_id"] = serde_json::json!(t);
+        }
+        let mut row = ts::bare_attestation(&id, granter, grantee, &envelope);
+        row.attestation_type = attestation_type::WITHDRAWS.to_owned();
+        row.asserted_at += ahead;
+        row.scrub_timestamp = row.asserted_at;
+        ts::seal_row_in_place(granter, &mut row);
+        d.put_attestation(crate::federation::SignedAttestation { attestation: row })
+            .await
+            .expect("a retraction inside the future skew is admitted");
+    }
+
+    /// I608 — see the module doc.
+    pub async fn i608_a_future_retraction_hides_no_edge(d: &dyn FederationDirectory, tag: &str) {
+        let k = |n: &str| format!("{tag}-{n}");
+        for n in ["a", "b", "e", "f"] {
+            agent(d, &k(n)).await;
+        }
+        let ahead = crate::federation::operational::CLOCK_SKEW_TOLERANCE / 2;
+        // Gate (a): b → a, and b's bare retraction against a signed ahead.
+        let (a, b) = (k("a"), k("b"));
+        ts::put_delegates_to(d, &b, &a, None)
+            .await
+            .expect("I608 (a) b → a");
+        future_retraction(d, &b, &a, None, ahead).await;
+        expect_cycle(
+            ts::put_delegates_to(d, &a, &b, None).await,
+            &a,
+            &b,
+            1,
+            "I608 (a): b's retraction of b → a is not in force yet, so a → b closes a live cycle",
+        );
+        assert_no_edge(d, &a, &b, "I608 (a)").await;
+        // Gate (b): e → f with f a subject; f withdraws it by name, ahead.
+        let (e, f) = (k("e"), k("f"));
+        let ef = put_edge(d, &e, &f, |r| r.subject_key_ids = vec![f.clone()])
+            .await
+            .expect("I608 (b) e → f, f a subject");
+        future_retraction(d, &f, &f, Some(&ef), ahead).await;
+        expect_cycle(
+            ts::put_delegates_to(d, &f, &e, None).await,
+            &f,
+            &e,
+            1,
+            "I608 (b): f's retraction naming e → f is not in force yet, so f → e closes a live \
+             cycle",
+        );
+        assert_no_edge(d, &f, &e, "I608 (b)").await;
     }
 
     /// I590 — see the module doc.
@@ -605,6 +674,15 @@ mod run {
                     super::super::bodies::i590_the_cycle_closing_edge_is_refused(
                         &d as &dyn FederationDirectory,
                         &format!("i590-{}", super::suffix()),
+                    )
+                    .await
+                }
+                #[tokio::test(flavor = "multi_thread")]
+                async fn i608() {
+                    let Some(d) = $fresh.await else { return };
+                    super::super::bodies::i608_a_future_retraction_hides_no_edge(
+                        &d as &dyn FederationDirectory,
+                        &format!("i608-{}", super::suffix()),
                     )
                     .await
                 }

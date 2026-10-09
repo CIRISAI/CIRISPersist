@@ -15197,7 +15197,8 @@ pub async fn holds_grant_delegation(
 /// An edge counts unless the walks would skip it: retracted by its granter
 /// (gate (a) of [`scoped_delegation_reach_at`]: a `withdraws`/`recants` by the
 /// granter naming the recipient), retracted by name (gate (b), the #593
-/// clause, via [`retracted_edge_ids`]), expired at `now`, or carrying a signed
+/// clause, via [`retracted_edge_ids`]) by a retraction asserted by `now`,
+/// expired at `now`, or carrying a signed
 /// term (`delegation_valid_from` / `delegation_valid_until` / `valid_until`,
 /// #1032) that the walks' lens will refuse at every instant from `now` on
 /// ([`delegation_term_live_at_or_after`], the lens's own term reading). Scope does NOT
@@ -15379,6 +15380,17 @@ where
     let mut visited: HashSet<String> = HashSet::from([from.to_owned()]);
     let mut queue: VecDeque<(String, usize)> = VecDeque::from([(from.to_owned(), 0)]);
     let mut incoming_retracted: HashMap<String, HashSet<String>> = HashMap::new();
+    // v54.0.0 (Codex round 3 on PR #1050) — a retraction is read through the
+    // walks' own lens at `now`: one asserted after `now` (a signer's clock
+    // inside the admitted future skew) has not happened yet, and the grant
+    // and licence walks at `now` still traverse the edge it names. Counted
+    // here, it hid a live `B → A` and admitted the `A → B` closing a cycle
+    // those walks follow. Edges themselves are NOT lensed: a future-dated
+    // edge still counts (see `check_delegation_cycle_admission`).
+    let lens = DelegationWalkLens {
+        as_of: Some(now),
+        ..DelegationWalkLens::default()
+    };
     while let Some((key, depth)) = queue.pop_front() {
         if depth >= MAX_WITHDRAWS_DELEGATION_DEPTH {
             continue;
@@ -15388,8 +15400,9 @@ where
         let granter_retracted: HashSet<&str> = rows
             .iter()
             .filter(|r| {
-                r.attestation_type == attestation_type::WITHDRAWS
-                    || r.attestation_type == attestation_type::RECANTS
+                (r.attestation_type == attestation_type::WITHDRAWS
+                    || r.attestation_type == attestation_type::RECANTS)
+                    && lens.asserted_by(r)
             })
             .map(|r| r.attested_key_id.as_str())
             .collect();
@@ -15404,8 +15417,11 @@ where
             }
             // Gate (b), the #593 clause: a retraction among the recipient's
             // incoming rows naming THIS edge kills it, whoever issued it.
+            // Filtered as the lensed walk filters it (`scoped_delegation_
+            // reach_at`): only rows asserted by `now` reach the fold.
             if !incoming_retracted.contains_key(&r.attested_key_id) {
-                let incoming = directory.list_attestations_for(&r.attested_key_id).await?;
+                let mut incoming = directory.list_attestations_for(&r.attested_key_id).await?;
+                incoming.retain(|row| lens.asserted_by(row));
                 incoming_retracted.insert(r.attested_key_id.clone(), retracted_edge_ids(&incoming));
             }
             if incoming_retracted[&r.attested_key_id].contains(&r.attestation_id) {
