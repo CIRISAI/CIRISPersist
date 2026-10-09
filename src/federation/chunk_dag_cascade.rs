@@ -1960,6 +1960,177 @@ pub mod orchestrate {
         })
     }
 
+    /// v54.0.0 (CIRISPersist#994) — what one
+    /// [`backfill_dag_chunk_links`] pass did. Counts are manifests.
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct DagLinkBackfillReport {
+        /// `chunk_dag` manifests with no V176 relation that the pass examined.
+        pub scanned: u64,
+        /// Manifests that gained exactly their chunks.
+        pub linked: u64,
+        /// Manifests this node cannot open: not granted to it, or sealed under
+        /// associated data only a viewer holds (an edge file pointer's
+        /// `content_aad`). They stay link-less (Edge keeps its fallback) until
+        /// a viewer promotes them again.
+        pub skipped_no_key: u64,
+        /// Manifests whose stream no longer holds exactly their chunks (an
+        /// evicted or re-used stream), or that are not a positioned manifest:
+        /// never mis-linked.
+        pub skipped_stream_mismatch: u64,
+        /// The pass stopped at its manifest cap with more to scan.
+        pub truncated: bool,
+    }
+
+    /// v54.0.0 (CIRISPersist#994, for CIRISEdge#771) — **the V176 backfill.**
+    /// V176 (v53.1.0) writes a DAG's chunk relation only at the seal or the
+    /// promote, so every DAG sealed or promoted earlier has none, even on its
+    /// author's node. This pass walks the `chunk_dag` manifests with no
+    /// relation and, for each one this node can open AS `node_key_id`, writes
+    /// the relation under the re-promote's predicate made exact: the stream
+    /// the manifest names still holds exactly the manifest's chunks, at their
+    /// seqs and with their shas
+    /// ([`BlobStorage::link_dag_chunks_if_exact`]). A plaintext manifest is
+    /// read in clear; a sealed one is opened with this node's own grant and
+    /// no caller data. Idempotent; at most `max_manifests` per pass.
+    ///
+    /// A manifest this node is not granted, or one sealed under a caller's
+    /// associated data, is `skipped_no_key`; a stream that moved is
+    /// `skipped_stream_mismatch`. A directory or store failure is an error,
+    /// never a skip.
+    pub async fn backfill_dag_chunk_links<B>(
+        backend: &B,
+        node_key_id: &str,
+        max_manifests: u32,
+    ) -> Result<DagLinkBackfillReport, BlobError>
+    where
+        B: BlobStorage + crate::federation::FederationDirectory + Sync,
+    {
+        const PAGE: u32 = 256;
+        let mut report = DagLinkBackfillReport::default();
+        let mut after: Option<[u8; 32]> = None;
+        // Skipped manifests stay unlinked, so the cursor (not the absence of
+        // a relation) is what moves the pass forward.
+        loop {
+            let page = backend.list_unlinked_chunk_dags(after, PAGE).await?;
+            let Some(last) = page.last().copied() else {
+                break;
+            };
+            for sha in &page {
+                if report.scanned >= u64::from(max_manifests) {
+                    report.truncated = true;
+                    return Ok(report);
+                }
+                report.scanned += 1;
+                match manifest_chunks_as_node(backend, sha, node_key_id).await? {
+                    ManifestChunks::NoKey => report.skipped_no_key += 1,
+                    ManifestChunks::NotPositioned => report.skipped_stream_mismatch += 1,
+                    ManifestChunks::Chunks { stream_id, chunks } => {
+                        if backend
+                            .link_dag_chunks_if_exact(sha, &stream_id, &chunks)
+                            .await?
+                        {
+                            report.linked += 1;
+                        } else {
+                            report.skipped_stream_mismatch += 1;
+                        }
+                    }
+                }
+            }
+            if (page.len() as u32) < PAGE {
+                break;
+            }
+            after = Some(last);
+        }
+        Ok(report)
+    }
+
+    /// What [`backfill_dag_chunk_links`] could read of one manifest.
+    enum ManifestChunks {
+        NoKey,
+        NotPositioned,
+        Chunks {
+            stream_id: String,
+            chunks: Vec<(u64, [u8; 32])>,
+        },
+    }
+
+    /// Is `e` "this node cannot open it" (a skip), rather than a failure?
+    fn is_no_key(e: &BlobError) -> bool {
+        matches!(
+            e,
+            BlobError::NotGranted { .. }
+                | BlobError::SealDidNotOpen { .. }
+                | BlobError::ChunkKeyNotYetGranted { .. }
+                | BlobError::NotPartyTo { .. }
+                | BlobError::Withdrawn { .. }
+                | BlobError::Evicted { .. }
+                | BlobError::NotHeld { .. }
+        )
+    }
+
+    async fn manifest_chunks_as_node<B>(
+        backend: &B,
+        sha256: &[u8; 32],
+        node_key_id: &str,
+    ) -> Result<ManifestChunks, BlobError>
+    where
+        B: BlobStorage + crate::federation::FederationDirectory + Sync,
+    {
+        let Some(head) = backend.blob_head(sha256).await? else {
+            return Ok(ManifestChunks::NoKey);
+        };
+        let manifest = if head.crypto_tier == CryptoTier::Plaintext {
+            let Some(BlobBody::Inline(bytes)) = backend.get_blob(sha256).await? else {
+                return Ok(ManifestChunks::NotPositioned);
+            };
+            match ParsedManifest::parse(&bytes) {
+                Ok(m) => m,
+                Err(_) => return Ok(ManifestChunks::NotPositioned),
+            }
+        } else {
+            match opened_sealed_manifest(backend, sha256, node_key_id, None).await {
+                Ok((_, m)) => m,
+                Err(e) if is_no_key(&e) => return Ok(ManifestChunks::NoKey),
+                Err(BlobError::InvalidArgument(_)) => return Ok(ManifestChunks::NotPositioned),
+                Err(e) => return Err(e),
+            }
+        };
+        let Some(stream_id) = manifest.stream_id().map(str::to_owned) else {
+            return Ok(ManifestChunks::NotPositioned);
+        };
+        let runs: Vec<ChunkManifest> = match &manifest {
+            ParsedManifest::Flat(f) => vec![f.clone()],
+            ParsedManifest::Nested(root) => {
+                if head.crypto_tier == CryptoTier::Plaintext {
+                    return Ok(ManifestChunks::NotPositioned);
+                }
+                let mut out = Vec::with_capacity(root.children.len());
+                for i in 0..root.children.len() {
+                    match open_manifest_child(backend, root, i, node_key_id, None).await {
+                        Ok(c) => out.push(c),
+                        Err(e) if is_no_key(&e) => return Ok(ManifestChunks::NoKey),
+                        Err(BlobError::InvalidArgument(_)) => {
+                            return Ok(ManifestChunks::NotPositioned)
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+                out
+            }
+        };
+        let mut chunks = Vec::new();
+        for c in runs.iter().flat_map(|r| r.chunks.iter()) {
+            let Some(seq) = c.seq else {
+                return Ok(ManifestChunks::NotPositioned);
+            };
+            chunks.push((seq, c.sha));
+        }
+        if chunks.is_empty() {
+            return Ok(ManifestChunks::NotPositioned);
+        }
+        Ok(ManifestChunks::Chunks { stream_id, chunks })
+    }
+
     /// `Engine::promote_adopted_manifest_to_dag` (#947 ask 1) — **the adopt
     /// door's DAG half.** Opens the held manifest as `viewer_key_id` (the
     /// same authorization as the bytes read), requires every chunk it names

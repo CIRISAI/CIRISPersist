@@ -147,6 +147,22 @@ Mutation-checked, 8 of 8 killed. A lookup error read as `false` reds I573 on mem
 
 **I575** (memory, sqlite, postgres, inside I177): an unsigned exact retry of a widened family member is a no-op. Checked against the exact pre-fix function: red on memory and sqlite with the bulk-ingest refusal Conformance reported. A narrower mutant that only disables the new early return survives, because the active-roster check after it also answers `false` for an authorized widening. The early return is kept to match the community arm.
 
+### Added — the V176 chunk-relation backfill for DAGs sealed or promoted before v53.1.0 (#994)
+
+CIRISEdge asked for this for #771. V176 (v53.1.0) writes a DAG's chunk-to-manifest relation only at the seal or the promote. Every DAG sealed or promoted earlier has none, even on its author's node, and Edge kept a counted stream-walk fallback for those. This backfill lets Edge retire that fallback for every DAG a node can open.
+
+- **The sweep.** `chunk_dag_cascade::orchestrate::backfill_dag_chunk_links(backend, node_key_id, max_manifests)` walks the `chunk_dag` manifests with no relation, in sha order. It opens each one as this node: a plaintext manifest in clear, a sealed one with the node's own grant and no caller data, including each child of a v3 root. It then writes the relation only if the stream the manifest names still holds exactly the manifest's chunks, at their seqs and with their shas. That check and the write happen in one transaction on both backends, through the new `BlobStorage::link_dag_chunks_if_exact`. The candidate list comes from the new `BlobStorage::list_unlinked_chunk_dags`. A directory or store failure is an error, never a skip.
+- **The report.** `DagLinkBackfillReport` counts `scanned`, `linked`, `skipped_no_key`, `skipped_stream_mismatch` and `truncated`. `skipped_no_key` covers a manifest not granted to this node and one sealed under a viewer's associated data, such as an Edge file pointer's `content_aad`, which only a viewer holds. Those stay link-less, and Edge's fallback covers them until a viewer promotes them again.
+- **Where it runs.** `Engine::backfill_dag_chunk_links(max_manifests)` is the operator door. Every Engine constructor runs it once at boot with a cap of 10,000 manifests, best effort and logged, next to the KeyGrant boot sweep. A skipped manifest is examined again at the next boot.
+- **No migration.** The backfill must open sealed manifests with a key, which SQL cannot do, so it is code, not a new migration. V176 is unchanged.
+
+Witnesses run on sqlite and postgres. The memory backend has no blob storage.
+
+- **I576** uses two nodes. A seals three DAGs and B adopts and promotes the first. Every relation is then dropped, one stream loses a row, and one DAG was sealed under associated data. A's sweep links exactly the first DAG's four chunks, terminator included, and skips the moved stream and the unopenable DAG. A second pass links nothing new. The cap truncates. B's sweep links the DAG it adopted, opened with its own grant.
+- **I576b** is a from-disk check that every constructor running the KeyGrant boot sweep also runs the backfill.
+
+Mutation-checked, 4 of 5 killed. Dropping the exactness check reds I576 on sqlite and on postgres. Dropping the boot hook from one constructor reds I576b. Propagating a no-key failure as an error reds I576. A cursor that stops after the first page survives, because the fixture never fills a 256-manifest page.
+
 ## [53.2.0] - 2026-10-08
 
 ### Changed — the tag is pushed once main's run EXISTS, not once it completes (#1008)

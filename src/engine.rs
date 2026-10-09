@@ -1068,6 +1068,7 @@ impl Engine {
         // to this node's key HERE, before any read; a survivor is boot-fatal.
         engine.resolve_minter_sentinels_at_boot().await?;
         engine.sweep_pending_key_grants_at_boot().await;
+        engine.sweep_dag_chunk_links_at_boot().await;
         // v31.0.0 (CIRISPersist#650) — the in-place v31 migration. Here rather
         // than in `Backend::run_migrations` because a re-stamp is a re-SIGN and
         // `Backend` has no signer; this is the first point at which the backend
@@ -1153,6 +1154,7 @@ impl Engine {
         // node with V145 sentinels would have served a minter of nobody.
         engine.resolve_minter_sentinels_at_boot().await?;
         engine.sweep_pending_key_grants_at_boot().await;
+        engine.sweep_dag_chunk_links_at_boot().await;
         // v31.0.0 (CIRISPersist#650) — same hook as `with_signer`. A
         // pre-genesis node usually has nothing to migrate (no identity ⇒ no
         // authorship), and the routine returns early in that case; but a node
@@ -1222,6 +1224,7 @@ impl Engine {
         }
         engine.resolve_minter_sentinels_at_boot().await?;
         engine.sweep_pending_key_grants_at_boot().await;
+        engine.sweep_dag_chunk_links_at_boot().await;
         Ok(engine)
     }
 
@@ -1294,6 +1297,7 @@ impl Engine {
         }
         engine.resolve_minter_sentinels_at_boot().await?;
         engine.sweep_pending_key_grants_at_boot().await;
+        engine.sweep_dag_chunk_links_at_boot().await;
         Ok(engine)
     }
 
@@ -5850,6 +5854,38 @@ impl Engine {
         }
     }
 
+    /// v54.0.0 (CIRISPersist#994, for CIRISEdge#771) — **backfill the V176
+    /// chunk relation** of the `chunk_dag` manifests sealed or promoted before
+    /// v53.1.0, opened as THIS node (its derived key) — see
+    /// [`backfill_dag_chunk_links`](crate::federation::chunk_dag_cascade::orchestrate::backfill_dag_chunk_links).
+    /// Runs once at boot; callable again by an operator. A manifest this node
+    /// cannot open, or whose stream moved, stays link-less and is counted.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn backfill_dag_chunk_links(
+        &self,
+        max_manifests: u32,
+    ) -> Result<
+        crate::federation::chunk_dag_cascade::orchestrate::DagLinkBackfillReport,
+        crate::federation::BlobError,
+    > {
+        use crate::federation::chunk_dag_cascade::orchestrate::backfill_dag_chunk_links;
+        let me = self.local_derived_key_id().await.map_err(|e| {
+            crate::federation::BlobError::Backend(format!(
+                "backfill_dag_chunk_links: this node's key: {e}"
+            ))
+        })?;
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(arc) => {
+                backfill_dag_chunk_links(arc.as_ref(), &me, max_manifests).await
+            }
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(arc) => {
+                backfill_dag_chunk_links(arc.as_ref(), &me, max_manifests).await
+            }
+        }
+    }
+
     /// v51.3.0 (CIRISPersist#947, `BLOB_REPLICATION.md` §6.5) — **the sealed
     /// DAG adopt's second half.** [`adopt_sealed_blob`](Self::adopt_sealed_blob)
     /// stores a received sealed manifest as an inline envelope (it never opens
@@ -6651,6 +6687,32 @@ impl Engine {
     /// (Self::emit_pending_key_grants): best effort, logged, never an abort —
     /// a node that cannot emit right now must still boot, and every write
     /// door retries the dirty axis on its own path.
+    /// v54.0.0 (CIRISPersist#994) — the boot leg of
+    /// [`Self::backfill_dag_chunk_links`]: best effort, logged, never an
+    /// abort, capped per boot.
+    async fn sweep_dag_chunk_links_at_boot(&self) {
+        /// Manifests opened per boot. A node with more legacy DAGs finishes
+        /// over later boots or an operator call; each skipped manifest is
+        /// re-examined at the next boot.
+        const BOOT_CAP: u32 = 10_000;
+        #[cfg(any(feature = "postgres", feature = "sqlite"))]
+        match self.backfill_dag_chunk_links(BOOT_CAP).await {
+            Ok(r) if r.scanned == 0 => {}
+            Ok(r) => tracing::info!(
+                scanned = r.scanned,
+                linked = r.linked,
+                skipped_no_key = r.skipped_no_key,
+                skipped_stream_mismatch = r.skipped_stream_mismatch,
+                truncated = r.truncated,
+                "V176 chunk relation backfilled at boot (#994)"
+            ),
+            Err(e) => tracing::warn!(
+                error = %e,
+                "V176 chunk relation backfill could not run at boot; it retries next boot (#994)"
+            ),
+        }
+    }
+
     async fn sweep_pending_key_grants_at_boot(&self) {
         #[cfg(any(feature = "postgres", feature = "sqlite"))]
         match self.emit_pending_key_grants().await {

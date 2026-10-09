@@ -389,6 +389,20 @@ impl PostgresBackend {
             }
         }
     }
+
+    /// v54.0.0 (#994) — TEST SEAM: drop one stream chunk row (a stream that
+    /// no longer holds exactly its manifest's chunks).
+    #[cfg(test)]
+    pub(crate) async fn test_drop_stream_chunk_row(&self, stream_id: &str, seq: u64) {
+        let client = self.pool.get().await.expect("pool");
+        client
+            .execute(
+                "DELETE FROM cirislens.federation_stream_chunks WHERE stream_id = $1 AND seq = $2",
+                &[&stream_id, &(seq as i64)],
+            )
+            .await
+            .expect("drop stream row");
+    }
 }
 
 impl PostgresBackend {
@@ -20040,6 +20054,96 @@ impl crate::federation::BlobStorage for PostgresBackend {
                 Ok((u64::try_from(seq).unwrap_or(0), sha))
             })
             .collect()
+    }
+
+    async fn list_unlinked_chunk_dags(
+        &self,
+        after: Option<[u8; 32]>,
+        limit: u32,
+    ) -> Result<Vec<[u8; 32]>, crate::federation::BlobError> {
+        use crate::federation::BlobError;
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| BlobError::Backend(format!("list_unlinked_chunk_dags pool: {e}")))?;
+        let after = after.map(|a| a.to_vec()).unwrap_or_default();
+        let lim = i64::from(limit);
+        let rows = client
+            .query(
+                "SELECT b.sha256 FROM cirislens.federation_blobs b \
+                  WHERE b.storage_kind = 'chunk_dag' AND b.sha256 > $1 \
+                    AND NOT EXISTS (SELECT 1 FROM cirislens.federation_dag_chunks d \
+                                     WHERE d.manifest_sha256 = b.sha256) \
+                  ORDER BY b.sha256 LIMIT $2",
+                &[&after, &lim],
+            )
+            .await
+            .map_err(|e| BlobError::Backend(format!("list_unlinked_chunk_dags: {e}")))?;
+        rows.iter()
+            .map(|r| {
+                let v: Vec<u8> = r.safe_get_with("sha256", BlobError::Backend)?;
+                <[u8; 32]>::try_from(v.as_slice()).map_err(|_| {
+                    BlobError::Backend("list_unlinked_chunk_dags: a 32-byte sha".into())
+                })
+            })
+            .collect()
+    }
+
+    async fn link_dag_chunks_if_exact(
+        &self,
+        manifest_sha: &[u8; 32],
+        stream_id: &str,
+        chunks: &[(u64, [u8; 32])],
+    ) -> Result<bool, crate::federation::BlobError> {
+        use crate::federation::BlobError;
+        let mut client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| BlobError::Backend(format!("link_dag_chunks_if_exact pool: {e}")))?;
+        let mut want: Vec<(i64, Vec<u8>)> = chunks
+            .iter()
+            .map(|(seq, sha)| (i64::try_from(*seq).unwrap_or(i64::MAX), sha.to_vec()))
+            .collect();
+        want.sort();
+        let manifest = manifest_sha.to_vec();
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| BlobError::Backend(format!("link_dag_chunks_if_exact: begin: {e}")))?;
+        // FOR SHARE: the stream's rows cannot move between the check and the link.
+        let rows = tx
+            .query(
+                "SELECT seq, chunk_sha FROM cirislens.federation_stream_chunks \
+                  WHERE stream_id = $1 ORDER BY seq FOR SHARE",
+                &[&stream_id],
+            )
+            .await
+            .map_err(|e| BlobError::Backend(format!("link_dag_chunks_if_exact: read: {e}")))?;
+        let mut held: Vec<(i64, Vec<u8>)> = Vec::with_capacity(rows.len());
+        for r in &rows {
+            held.push((
+                r.safe_get_with("seq", BlobError::Backend)?,
+                r.safe_get_with("chunk_sha", BlobError::Backend)?,
+            ));
+        }
+        if held.is_empty() || held != want {
+            return Ok(false);
+        }
+        tx.execute(
+            "INSERT INTO cirislens.federation_dag_chunks (manifest_sha256, seq, chunk_sha256, stream_id) \
+             SELECT $1, seq, chunk_sha, stream_id FROM cirislens.federation_stream_chunks \
+              WHERE stream_id = $2 \
+             ON CONFLICT (manifest_sha256, seq) DO NOTHING",
+            &[&manifest, &stream_id],
+        )
+        .await
+        .map_err(|e| BlobError::Backend(format!("link_dag_chunks_if_exact: link: {e}")))?;
+        tx.commit()
+            .await
+            .map_err(|e| BlobError::Backend(format!("link_dag_chunks_if_exact: commit: {e}")))?;
+        Ok(true)
     }
 
     async fn stream_positions_of_chunk(

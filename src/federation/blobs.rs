@@ -2256,6 +2256,29 @@ pub trait BlobStorage: Send + Sync {
         manifest_sha: &[u8; 32],
     ) -> impl Future<Output = Result<Vec<(u64, [u8; 32])>, BlobError>> + Send;
 
+    /// v54.0.0 (CIRISPersist#994) — up to `limit` `chunk_dag` manifests with
+    /// NO V176 relation, in sha order after `after`: the DAGs sealed or
+    /// promoted before v53.1.0 that the backfill sweep
+    /// ([`backfill_dag_chunk_links`](crate::federation::chunk_dag_cascade::orchestrate::backfill_dag_chunk_links))
+    /// works through.
+    fn list_unlinked_chunk_dags(
+        &self,
+        after: Option<[u8; 32]>,
+        limit: u32,
+    ) -> impl Future<Output = Result<Vec<[u8; 32]>, BlobError>> + Send;
+
+    /// v54.0.0 (CIRISPersist#994) — write the V176 relation of `manifest_sha`
+    /// IFF the stream `stream_id` holds EXACTLY `chunks` (the manifest's own
+    /// `(seq, sha)` list): the same rows, at the same seqs, with the same shas,
+    /// and nothing else. Checked and written in one transaction. `Ok(false)`,
+    /// nothing written, when the stream no longer matches. Idempotent.
+    fn link_dag_chunks_if_exact(
+        &self,
+        manifest_sha: &[u8; 32],
+        stream_id: &str,
+        chunks: &[(u64, [u8; 32])],
+    ) -> impl Future<Output = Result<bool, BlobError>> + Send;
+
     // ── v53.0.0 (CIRISPersist#969) — the stream-epoch DEK (V168) ─────────
 
     /// The stream's key state in one snapshot — see [`StreamKeyState`].
