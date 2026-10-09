@@ -31,7 +31,11 @@
 //!   not in the cycle graph (CC 4.2.1): a key root's grant `R → N` and the
 //!   grantee's acceptance `N → R` admit in EITHER order, a CAPABILITY edge
 //!   closing the same pair is still refused, and a chain that reaches the
-//!   root only THROUGH an acceptance edge is not a cycle.
+//!   root only THROUGH an acceptance edge is not a cycle;
+//! - (10) a CHARTER edge (`trust:charter:v1`) is the trust plane too: a
+//!   family-shaped charter holder → root admits beside the root's capability
+//!   edge back to the holder, in either order, and a capability edge closing
+//!   the same pair is still refused.
 
 /// The backend-agnostic witness body; `run` instantiates it per backend.
 #[cfg(test)]
@@ -121,7 +125,7 @@ pub mod bodies {
         let k = |n: &str| format!("{tag}-{n}");
         for n in [
             "a", "b", "c", "d", "e", "f", "g", "h", "x", "y", "m", "n", "o", "p", "q", "r", "r1",
-            "n1", "r2", "n2", "r3", "x3", "y3",
+            "n1", "r2", "n2", "r3", "x3", "y3", "h4", "f4", "h5", "f5",
         ] {
             agent(d, &k(n)).await;
         }
@@ -326,6 +330,42 @@ pub mod bodies {
         put_edge(d, &r3, &y3, grant)
             .await
             .expect("(9d) r3 → y3 reaches r3 again only through x3's acceptance: not a cycle");
+
+        // (10) the charter is the trust plane as well. Kills: the search or the
+        // gate reading only the acceptance label (10a or 10b refuses).
+        let charter = |r: &mut crate::federation::Attestation| {
+            r.attestation_envelope
+                .as_object_mut()
+                .expect("an object envelope")
+                .insert(
+                    "dimension".to_owned(),
+                    serde_json::json!(crate::federation::trust_root::TRUST_CHARTER_DIMENSION),
+                );
+        };
+        // (10a) the capability edge first, then the charter closing the pair.
+        let (h4, f4) = (k("h4"), k("f4"));
+        ts::put_delegates_to(d, &f4, &h4, None)
+            .await
+            .expect("(10a) f4 → h4, a capability edge");
+        put_edge(d, &h4, &f4, charter)
+            .await
+            .expect("(10a) the charter h4 → f4 is the trust plane, not a cycle");
+        // (10b) the charter first, then a capability edge the other way.
+        let (h5, f5) = (k("h5"), k("f5"));
+        put_edge(d, &h5, &f5, charter)
+            .await
+            .expect("(10b) the charter h5 → f5");
+        ts::put_delegates_to(d, &f5, &h5, None)
+            .await
+            .expect("(10b) f5 → h5 reaches f5 again only through the charter: not a cycle");
+        // (10c) a capability edge closing the same pair is still refused.
+        expect_cycle(
+            ts::put_delegates_to(d, &h4, &f4, None).await,
+            &h4,
+            &f4,
+            1,
+            "(10c) a capability delegates_to(h4 → f4) beside f4 → h4",
+        );
 
         // (6) the ceiling: a 17-hop chain.
         let chain: Vec<String> = (0..=17).map(|i| k(&format!("k{i}"))).collect();

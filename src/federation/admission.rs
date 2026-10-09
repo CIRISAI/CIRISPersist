@@ -15096,15 +15096,23 @@ pub async fn holds_grant_delegation(
 /// `delegates_to` edges ([`delegation_path_hops`]), and if so refuses with
 /// [`Error::DelegationCycle`] (`federation_delegation_cycle`).
 ///
-/// # Acceptance edges are not in the cycle graph
+/// # Trust-plane edges are not in the cycle graph
 ///
-/// A `delegates_to` labelled `trust:accepts:v1` ([`is_trust_acceptance_edge`])
-/// is the node's SUBSCRIPTION to a root (CC 4.2.1: "the trust edge is the
-/// subscription"), not a delegation of capability, and no capability walk
-/// follows it: `capability_roots_to_trusted_root` reads it as the user's
-/// separate leg, then walks root → … → subject. So it is excluded on both
-/// sides, which covers both arrival orders: the gate admits an acceptance
-/// edge without a search, and [`delegation_path_hops`] never traverses one.
+/// The cycle graph is the CAPABILITY graph (CC 4.1.1, as CC confirmed on the
+/// v54.0.0 integration). Two `delegates_to` labels are the trust plane, not a
+/// delegation of capability ([`is_trust_plane_edge`]):
+///
+/// - `trust:accepts:v1`, the node's SUBSCRIPTION to a root (CC 4.2.1: "the
+///   trust edge is the subscription"). It is the user's own leg, and CC 3.2
+///   T3 says no conferral may substitute for it, so it is never a link a
+///   capability flows along: `capability_roots_to_trusted_root` reads it as
+///   the separate user leg, then walks root → … → subject;
+/// - `trust:charter:v1`, the root's charter, self-referential by definition
+///   (CC 3.4.7; a family's is holder → family).
+///
+/// Both are excluded on both sides, which covers both arrival orders: the
+/// gate admits one without a search, and [`delegation_path_hops`] never
+/// traverses one.
 /// The production shape this keeps working is a KEY root's grantee
 /// subscribing to the root that granted it: the root signs
 /// `delegates_to(root → node, [infra:serve])` itself, and the node's own boot
@@ -15156,9 +15164,9 @@ pub async fn check_delegation_cycle_admission(
     if row.attestation_type != attestation_type::DELEGATES_TO {
         return Ok(());
     }
-    // An ACCEPTANCE edge is the subscription plane, not a delegation of
+    // A TRUST-PLANE edge (an acceptance or a charter) is not a delegation of
     // capability: it is not in the cycle graph (see the doc above).
-    if is_trust_acceptance_edge(row) {
+    if is_trust_plane_edge(row) {
         return Ok(());
     }
     let refuse = |hops| {
@@ -15188,15 +15196,20 @@ pub async fn check_delegation_cycle_admission(
     }
 }
 
-/// v54.0.0 (CIRISPersist#1031) — is `row` a trust ACCEPTANCE edge, a
+/// v54.0.0 (CIRISPersist#1031) — is `row` a TRUST-PLANE edge, a
 /// `delegates_to` whose envelope `dimension` is
-/// [`TRUST_ACCEPTS_DIMENSION`](crate::federation::trust_root::TRUST_ACCEPTS_DIMENSION)?
-/// The subscription plane: never part of the cycle graph
-/// ([`check_delegation_cycle_admission`]).
-fn is_trust_acceptance_edge(row: &super::Attestation) -> bool {
+/// [`TRUST_ACCEPTS_DIMENSION`](crate::federation::trust_root::TRUST_ACCEPTS_DIMENSION)
+/// (the subscription) or
+/// [`TRUST_CHARTER_DIMENSION`](crate::federation::trust_root::TRUST_CHARTER_DIMENSION)
+/// (the charter)? Never part of the cycle graph, which is the capability
+/// graph ([`check_delegation_cycle_admission`]).
+fn is_trust_plane_edge(row: &super::Attestation) -> bool {
+    use crate::federation::trust_root::{TRUST_ACCEPTS_DIMENSION, TRUST_CHARTER_DIMENSION};
     row.attestation_type == attestation_type::DELEGATES_TO
-        && envelope_dimension(&row.attestation_envelope)
-            == Some(crate::federation::trust_root::TRUST_ACCEPTS_DIMENSION)
+        && matches!(
+            envelope_dimension(&row.attestation_envelope),
+            Some(TRUST_ACCEPTS_DIMENSION | TRUST_CHARTER_DIMENSION)
+        )
 }
 
 /// v54.0.0 (CIRISPersist#1031) — the shortest live `delegates_to` path from
@@ -15230,7 +15243,7 @@ pub(crate) async fn delegation_path_hops(
             .collect();
         for r in &rows {
             if r.attestation_type != attestation_type::DELEGATES_TO
-                || is_trust_acceptance_edge(r)
+                || is_trust_plane_edge(r)
                 || r.expires_at.is_some_and(|x| x <= now)
                 || !delegation_term_live_at_or_after(&r.attestation_envelope, now)
                 || granter_retracted.contains(r.attested_key_id.as_str())
