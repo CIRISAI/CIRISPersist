@@ -1612,6 +1612,10 @@ jobs:
       # dependency's (fixture target/, no cargo).
       - name: cache trim witnesses
         run: python3 scripts/ci_cache_trim_test.py
+      # v54.1.0 (#1052) — evidence/cc_impl.tsv is generated from the manifest's
+      # evidence export; the committed file must be exactly the generated one.
+      - name: evidence tsv is generated from the manifest
+        run: python3 scripts/evidence_tsv_test.py
       # v43.0.0 (BLOB_ENCRYPTION_AT_REST.md I22) — the storage floor token is
       # unconstructible outside the crate. The witness is a `compile_fail`
       # doctest, and nextest never runs doctests, so it gets its own step.

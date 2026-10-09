@@ -139,6 +139,23 @@ expect_eq "other pins left alone" "$(grep -c 'ciris-persist@31.0.0$' "$t/cc.tsv"
 expect_eq "nothing left at prev" "$(grep -cE 'ciris-persist@9\.8\.10([^0-9]|$)' "$t/cc.tsv")" "0"
 if rl_restamp_evidence "$t/cc.tsv" 9.8.10 9.9.0 >/dev/null; then bad "a second re-stamp (nothing to do) fails"; else ok "a second re-stamp (nothing to do) fails"; fi
 
+echo "evidence re-stamp agrees with the generator (#1052)"
+# The bump path on a fixture tree: a tsv generated at 9.8.10, then the
+# bump's own Cargo.toml rewrite and re-stamp; the generator must agree, and
+# must not before the re-stamp.
+g="$t/gen"; mkdir -p "$g/evidence" "$g/src/federation/namespace"
+printf '[package]\nname = "ciris-persist"\nversion = "9.8.10"\n' > "$g/Cargo.toml"
+printf '{"evidence_export": {"CIRISPersist": [{"decimal_id": "1.1", "claim_id": "CLM-a", "repo": "CIRISPersist", "path#symbol": "src/a.rs#f", "tsv_target": "evidence/cc_impl.tsv"}, {"decimal_id": "1.2", "claim_id": "CLM-x", "repo": "CIRISPersist", "path#symbol": "ciris-verify-core/src/x.rs#g", "tsv_target": "evidence/cc_impl.tsv", "crate": "ciris-persist@31.0.0"}]}}' > "$g/src/federation/namespace/namespace_supersets.json"
+gen() { EVIDENCE_TSV_ROOT="$g" python3 scripts/evidence_tsv.py "$1" >/dev/null 2>&1; }
+gen write; expect_eq "generated at 9.8.10 checks clean" "$(gen check; echo $?)" "0"
+sed -i -E '0,/^version = "9\.8\.10"/s//version = "9.9.0"/' "$g/Cargo.toml"
+expect_eq "bumped Cargo.toml, not yet re-stamped: the generator disagrees" "$(gen check; echo $?)" "1"
+expect_eq "the re-stamp moves the src/ row only" "$(rl_restamp_evidence "$g/evidence/cc_impl.tsv" 9.8.10 9.9.0)" "1"
+expect_eq "re-stamped: the generator agrees" "$(gen check; echo $?)" "0"
+# shellcheck disable=SC2016  # literal: grep text, not an expansion
+sed -n '/^bump() {/,/^}/p' scripts/release.sh | awk '/rl_restamp_evidence/{r=NR} /python3 scripts\/evidence_tsv.py check/{c=NR} /return 22; }$/{if (c && NR>=c && !g) g=NR} /git add /{a=NR} END{exit !(r && c && r<c && g && a && g<a)}' \
+    && ok "bump checks the generator after the re-stamp, before the commit" || bad "bump does not check the generator between re-stamp and commit"
+
 echo "stage state and resume"
 S="$t/state"; mkdir -p "$S"
 runs=0; count() { runs=$((runs + 1)); }
