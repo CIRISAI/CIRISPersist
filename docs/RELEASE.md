@@ -146,6 +146,17 @@ The target map is `aarch64-unknown-linux-gnu` to `manylinux*_aarch64`, `x86_64-u
 
 Where it runs: the tag job runs checks 1 to 4 before each sign and check 5 after the round-trip, both through `scripts/build_manifest.sh`. `verify_release.sh` runs all five on each published wheel. `scripts/bits_changed_test.sh` is its offline witness set, a certify fast gate (`bitschanged`) and a CI lint step.
 
+### The signer's own refusal (CIRISPersist#992)
+
+The tag job and `reregister-manifests.yml` sign with `ciris-build-sign` v20.1.0. The version lives in one place, `TOOL_VERSION` in `scripts/build_manifest.sh`. From v20.1.0 the signer reads a wheel's own `*.dist-info` before it signs, through the same check the verifier runs (CIRISVerify#306/#307). It refuses, exits 1 and writes nothing when either of these is true:
+
+- the wheel's `Version:` is not `--binary-version`;
+- no `Tag:` platform fits `--target`, using the same four-target map as above.
+
+This is the second line behind `bits_changed.sh` checks 1 and 2, and it does not replace the gate. The signer cannot know check 3, the previous release's registered hash, or check 4, the known-stale list, and the gate still runs first. The signer's check engages only when `sign` is given the `.whl` itself with `--binary`. A `--binary-hash` sign skips it, and the script never uses one for a wheel. `scripts/build_manifest.sh sign` refuses to run unless the `ciris-build-sign` on PATH reports exactly `TOOL_VERSION`, because an older binary signs any wheel it is given. `install` makes the same check.
+
+The switch from v2.1.5 changes nothing else the registry sees. The CLI flags, the `python-source-tree` hash, the manifest fields and the `register --dry-run` payload preview were identical between the two tools on the v53.2.0 tree and wheels. On those four wheels, v20.1.0 refused a claimed version of 54.0.0 and every wrong target, and v2.1.5 signed the wrong version.
+
 ## Remediating a registered manifest
 
 CIRISRegistry keys manifest rows by (project, version, target) and upserts them in place. It keeps no history until CIRISRegistry#144 lands. Each version has five targets: `python-source-tree`, a hash over `python/ciris_persist`, and one row per wheel.

@@ -222,7 +222,10 @@ jobs:
             sha256sum "$d"/*.whl
           done
 
-      - name: install ciris-build-sign v2.1.5
+      - name: install ciris-build-sign (the version pinned in scripts/build_manifest.sh)
+        # v54.0.0 (#992) — v20.1.0: it refuses to sign a wheel whose own
+        # Version or platform tag is not the one claimed (CIRISVerify#307), the
+        # second line behind bits_changed.sh checks 1-4.
         run: scripts/build_manifest.sh install
 
       - name: check — registered vs local, per target (writes nothing)
@@ -312,8 +315,9 @@ jobs:
           fi
           echo "registration: $kind"
           args=(); [ "$DRY" = true ] && args=(--dry-run)
+          tool="$(sed -n 's/^TOOL_VERSION=//p' scripts/build_manifest.sh)"
           scripts/build_manifest.sh register "${args[@]}" --version "$V" --commit "$COMMIT" --out dist/out \
-            --notes "CIRIS federation persist substrate; CanonicalBuild v2 via ciris-build-sign v2.1.5. Re-registered by reregister-manifests.yml run ${GITHUB_RUN_ID} (CIRISPersist#1029): $kind; superseded rows are in evidence/manifest_remediation/$V/."
+            --notes "CIRIS federation persist substrate; CanonicalBuild v2 via ciris-build-sign ${tool}. Re-registered by reregister-manifests.yml run ${GITHUB_RUN_ID} (CIRISPersist#1029): $kind; superseded rows are in evidence/manifest_remediation/$V/."
 
       - name: repost — round-trip GET /v1/builds/{version}
         if: ${{ inputs.mode == 'repost' && steps.resign.outputs.targets != '' && !inputs.dry_run }}

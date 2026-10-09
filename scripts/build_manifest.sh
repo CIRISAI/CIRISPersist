@@ -9,7 +9,8 @@
 # directories named like ci.yml's artifacts, `<wheels>/ciris_persist-wheel-<label>/`.
 #
 #   build_manifest.sh install
-#       ciris-build-sign v2.1.5 (prebuilt, CIRISVerify release) into /usr/local/bin.
+#       ciris-build-sign v20.1.0 (prebuilt, CIRISVerify release) into /usr/local/bin,
+#       and refuses unless the installed binary reports that version.
 #   build_manifest.sh check --version V --wheels DIR --out DIR [--targets "T..."] [--tree-root DIR]
 #       Writes nothing to the registry. Per target, prints the registered
 #       binary_hash beside the local one and MATCH / MISMATCH / NOROW / ERROR:
@@ -37,7 +38,12 @@
 #                      --tree-root when given. Needed because `register`
 #                      writes ONE binary_manifests map per (project, version):
 #                      re-registering some targets alone would drop the rest.
-#       Everything signed passes scripts/bits_changed.sh checks 1-4 first.
+#       Two lines of defence before a wheel is signed (v54.0.0, CIRISPersist#992):
+#       scripts/bits_changed.sh checks 1-4 first, then ciris-build-sign itself
+#       (v20.1.0+, CIRISVerify#306/#307) refuses a wheel whose dist-info
+#       Version is not --binary-version or whose platform tag does not fit
+#       --target. `sign` refuses to run unless the tool on PATH is
+#       the pinned version, so that refusal cannot be lost to an old binary.
 #   build_manifest.sh preflight --out DIR
 #       the registry trust-root gate (scripts/preflight_trust_root.py).
 #   build_manifest.sh register --version V --commit SHA --out DIR [--notes TEXT] [--dry-run]
@@ -57,7 +63,13 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-TOOL_VERSION=v2.1.5
+# v54.0.0 (CIRISPersist#992) — v2.1.5 → v20.1.0: the first ciris-build-sign
+# that reads a wheel's own identity before signing it (CIRISVerify#307, the
+# fix for #1029's v29 wheel signed as v53.1.8). CLI, tree hash, manifest
+# fields and the register payload are unchanged from v2.1.5 (checked on the
+# v53.2.0 wheels and python/ tree before the switch). The workflows read
+# this line; it is the one place the version lives.
+TOOL_VERSION=v20.1.0
 KEY_ID=ciris-persist-build-v1
 REGISTRY_URL="${REGISTRY_URL:-https://api.registry.ciris-services-1.ai}"
 REGISTRY_URL="${REGISTRY_URL%/}"
@@ -118,6 +130,15 @@ keys_in() {  # materialise the hybrid keypair; key_wipe removes it
 }
 key_wipe() { shred -uz "${ED_KEY_PATH:-}" "${MLDSA_KEY_PATH:-}" 2>/dev/null || rm -f "${ED_KEY_PATH:-}" "${MLDSA_KEY_PATH:-}"; }
 named() { [ -z "$TARGETS" ] || [[ " $TARGETS " == *" $1 "* ]]; }
+# The tool on PATH must be the pinned one: its wheel-identity refusal is part
+# of the signing gate, and an older binary signs any wheel it is given.
+require_pinned_tool() {
+  local have
+  have="$(ciris-build-sign --version 2>/dev/null || true)"
+  have="${have##* }"
+  [ "v${have}" = "$TOOL_VERSION" ] \
+    || err "ciris-build-sign on PATH reports '${have:-nothing}', this script signs with $TOOL_VERSION (its wheel-identity refusal, CIRISVerify#307, is part of the gate); run scripts/build_manifest.sh install"
+}
 manifest_hash_of() { python3 -I -c 'import json,sys; h=json.load(open(sys.argv[1])).get("binary_hash",""); print(h[7:] if h.startswith("sha256:") else h)' "$1"; }
 artdir_of() { local a; for a in "${ARTDIRS[@]}"; do [ "${WHEEL_TARGET[$a]}" = "$1" ] && { echo "$a"; return; }; done; }
 
@@ -164,6 +185,7 @@ install)
   sudo install -m755 build-tool/ciris-build-sign /usr/local/bin/ciris-build-sign
   sudo install -m755 build-tool/ciris-build-verify /usr/local/bin/ciris-build-verify
   ciris-build-sign --version
+  require_pinned_tool
   ldd "$(command -v ciris-build-sign)" || true
   ;;
 
@@ -238,6 +260,7 @@ sign)
   [[ " $TARGETS " == *" $TREE "* ]] && resign_tree=1
   if [ -z "$EXTRAS" ]; then EXTRAS="$REUSE/persist-extras-$VERSION.json"; fi
   [ -s "$EXTRAS" ] || err "PersistExtras $EXTRAS missing or empty"
+  require_pinned_tool
   mkdir -p "$OUT"
   keys_in
   if [ "$resign_tree" = 1 ]; then
@@ -297,6 +320,10 @@ sign)
     # known stale hash. Refuse to sign otherwise.
     scripts/bits_changed.sh "$VERSION" "$TARGET" "$WHEELS/$ARTDIR" \
       || err "bits_changed.sh refused $TARGET (exit $?); not signing"
+    # #992 — the second line: ciris-build-sign (v20.1.0+) reads the wheel's
+    # dist-info and refuses unless its Version is $VERSION and a platform tag
+    # fits $TARGET (CIRISVerify#307); it writes nothing when it refuses.
+    # `--binary <the .whl>` is what engages it — never pass `--binary-hash`.
     ciris-build-sign sign \
       --primitive persist --build-id "$VERSION" --target "$TARGET" \
       --binary "$WHEEL" --binary-version "$VERSION" --extras "$EXTRAS" \
