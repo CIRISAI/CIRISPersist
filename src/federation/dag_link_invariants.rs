@@ -31,6 +31,13 @@
 //!   pre-V176 DAG this node can open, exactly its chunks; a DAG whose stream
 //!   moved is skipped, never mis-linked; a DAG sealed under a viewer's
 //!   associated data is skipped as unopenable; the pass is idempotent.
+//! - **I598** (v54.0.0, Codex on PR #1050; postgres) — an append that commits
+//!   between the backfill's comparison and its link is NOT linked: the link
+//!   writes exactly the rows it compared, never a re-read of the stream. A
+//!   test pause holds the backfill after the comparison while a second row
+//!   commits to the stream; the manifest then relates exactly its own chunks.
+//!   SQLite reads and links inside one writer closure, so nothing can commit
+//!   between the two there.
 
 #[cfg(test)]
 pub(crate) mod bodies {
@@ -667,6 +674,92 @@ pub(crate) mod bodies {
             on_b,
             "I576 B: the adopted DAG gains exactly its chunks"
         );
+    }
+}
+
+/// I598 — see the module doc. Postgres only: it needs the backend's pause.
+#[cfg(all(test, feature = "postgres"))]
+pub(crate) mod i598 {
+    use crate::federation::epoch_minter_invariants::bodies::Pick;
+    use crate::federation::nested_manifest_invariants::bodies::pair;
+    use crate::federation::types::cohort_scope;
+    use crate::store::postgres::PostgresBackend;
+
+    pub(crate) async fn i598_an_append_after_the_comparison_is_not_linked(
+        dsn_a: &str,
+        dsn_b: &str,
+        run: &str,
+        pick: Pick<PostgresBackend>,
+    ) {
+        let p = pair(dsn_a, dsn_b, run, pick, "i598").await;
+        let stream = format!("i598-{run}");
+        for i in 0..3u64 {
+            p.a.put_blob_chunk_scoped(
+                cohort_scope::SELF,
+                Some(&p.owner),
+                &stream,
+                i,
+                &(0..48u8)
+                    .map(|j| j.wrapping_mul(i as u8 + 3))
+                    .collect::<Vec<_>>(),
+                0,
+                None,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("chunk {i}: {e}"));
+        }
+        let root =
+            p.a.seal_stream_scoped(cohort_scope::SELF, Some(&p.owner), &stream, None, None)
+                .await
+                .unwrap_or_else(|e| panic!("seal {stream}: {e}"))
+                .manifest_sha256;
+        let want = p.a.chunks_of_manifest(&root).await.unwrap();
+        assert_eq!(
+            want.len(),
+            4,
+            "I598 precondition: three chunks and a terminator"
+        );
+        let next_seq = want.last().map(|(s, _)| s + 1).unwrap();
+        p.sa.test_dag_link(&root, None).await;
+        assert!(p.a.chunks_of_manifest(&root).await.unwrap().is_empty());
+
+        let pause = p.sa.test_hooks().arm_pause("dag_link_before_insert");
+        let (report, ()) = tokio::join!(p.a.backfill_dag_chunk_links(1_000), async {
+            pause.reached().await;
+            // The backfill has compared the stream and holds its rows FOR
+            // SHARE; a NEW row is not one of them and commits now.
+            p.sa.test_append_stream_chunk_row(&stream, 0, next_seq)
+                .await;
+            pause.resume();
+        });
+        let report = report.expect("the sweep");
+        assert_eq!(
+            (report.scanned, report.linked),
+            (1, 1),
+            "I598 the manifest was compared before the append and is linked: {report:?}"
+        );
+        let linked = p.a.chunks_of_manifest(&root).await.unwrap();
+        assert!(
+            !linked.iter().any(|(s, _)| *s == next_seq),
+            "I598 the row appended after the comparison was LINKED to the manifest: {linked:?}"
+        );
+        assert_eq!(linked, want, "I598 exactly the manifest's own chunks");
+    }
+
+    #[tokio::test]
+    async fn postgres() {
+        let (Some(a), Some(b)) = (crate::test_pg::empty_dsn(), crate::test_pg::empty_dsn()) else {
+            eprintln!("i598 postgres: no base DSN — SKIPPED");
+            return;
+        };
+        i598_an_append_after_the_comparison_is_not_linked(
+            &a,
+            &b,
+            &uuid::Uuid::new_v4().simple().to_string()[..12],
+            (|e: &crate::Engine| e.postgres_backend().expect("postgres").clone()) as Pick<_>,
+        )
+        .await;
+        eprintln!("i598 postgres: RAN");
     }
 }
 

@@ -403,6 +403,30 @@ impl PostgresBackend {
             .await
             .expect("drop stream row");
     }
+
+    /// v54.0.0 (Codex on PR #1050) — TEST SEAM: a committed APPEND to a
+    /// stream: a new row at `new_seq` repeating row `from_seq`'s chunk (any
+    /// committed `(stream_id, seq)` insert, whichever door wrote it).
+    #[cfg(test)]
+    pub(crate) async fn test_append_stream_chunk_row(
+        &self,
+        stream_id: &str,
+        from_seq: u64,
+        new_seq: u64,
+    ) {
+        let client = self.pool.get().await.expect("pool");
+        let n = client
+            .execute(
+                "INSERT INTO cirislens.federation_stream_chunks \
+                 (stream_id, seq, chunk_sha, epoch, size_bytes, plaintext_size_bytes) \
+                 SELECT stream_id, $3, chunk_sha, epoch, size_bytes, plaintext_size_bytes \
+                   FROM cirislens.federation_stream_chunks WHERE stream_id = $1 AND seq = $2",
+                &[&stream_id, &(from_seq as i64), &(new_seq as i64)],
+            )
+            .await
+            .expect("append stream row");
+        assert_eq!(n, 1, "the appended row landed");
+    }
 }
 
 impl PostgresBackend {
@@ -20240,12 +20264,24 @@ impl crate::federation::BlobStorage for PostgresBackend {
         if held.is_empty() || held != want {
             return Ok(false);
         }
+        #[cfg(test)]
+        self.test_hooks()
+            .pause_if_armed("dag_link_before_insert")
+            .await;
+        // v54.0.0 (Codex on PR #1050) — link EXACTLY the validated rows. `FOR
+        // SHARE` above locks only the rows it returned; it cannot stop a new
+        // `(stream_id, seq)` from committing after the comparison, and an
+        // `INSERT … SELECT` re-reading the stream here would link that row too,
+        // tying an unrelated chunk to this manifest's withdrawal and eviction.
+        // `want` equals what was held, so the links are the manifest's own
+        // chunks and nothing else; a later append is simply not linked.
+        let (seqs, shas): (Vec<i64>, Vec<Vec<u8>>) = want.into_iter().unzip();
         tx.execute(
             "INSERT INTO cirislens.federation_dag_chunks (manifest_sha256, seq, chunk_sha256, stream_id) \
-             SELECT $1, seq, chunk_sha, stream_id FROM cirislens.federation_stream_chunks \
-              WHERE stream_id = $2 \
+             SELECT $1, w.seq, w.chunk_sha, $2 \
+               FROM UNNEST($3::BIGINT[], $4::BYTEA[]) AS w(seq, chunk_sha) \
              ON CONFLICT (manifest_sha256, seq) DO NOTHING",
-            &[&manifest, &stream_id],
+            &[&manifest, &stream_id, &seqs, &shas],
         )
         .await
         .map_err(|e| BlobError::Backend(format!("link_dag_chunks_if_exact: link: {e}")))?;

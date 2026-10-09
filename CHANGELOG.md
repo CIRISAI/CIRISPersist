@@ -276,6 +276,8 @@ Mutation-checked:
 
 The cycle gate (#1031) read the `delegates_to` graph and the door inserted later with no lock spanning the two, so two writers of `A → B` and `B → A` could both pass the read and both be stored. Every capability `delegates_to` write, through `put_attestation` or the `enter_mesh` crossing, now holds an in-process lock from a re-check through its commit, and on postgres also a transaction-scoped advisory lock (one key for all such writes, since a pair key cannot cover a three-key cycle) in the insert's own transaction; I597 pauses the first writer before its insert and runs the reverse edge, on memory and sqlite in one backend and on postgres from a second pool, and admits exactly one (red with the advisory lock or the in-process lock removed).
 
+The postgres V176 backfill (#994) compared the stream's rows `FOR SHARE` and then linked with an `INSERT … SELECT` over the stream, so an append committing between the two was linked to a manifest that does not contain it; the link now inserts exactly the compared rows, and a later append is not linked. I598 pauses the backfill after the comparison and commits an append to the stream; the manifest then relates exactly its own chunks (red with the `INSERT … SELECT` restored). SQLite compares and links inside one writer closure, so nothing can commit between the two there.
+
 ## [53.2.0] - 2026-10-08
 
 ### Changed — the tag is pushed once main's run EXISTS, not once it completes (#1008)
