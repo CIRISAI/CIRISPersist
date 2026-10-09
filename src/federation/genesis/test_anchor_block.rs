@@ -280,12 +280,32 @@ mod tests {
     }
 
     /// **I162 (pure half) — the minted-by pair is derived, not typed.**
+    ///
+    /// v54.0.0 — the expected verify half is read from `Cargo.toml` HERE too,
+    /// independently of the minter's parse: every `CIRISVerify` git pin, all
+    /// of which must name one tag. It was a typed `v19.0.0`, so the #992 pin
+    /// flip to v20.1.0 left this witness red while the minter was right.
     #[test]
     fn i162_minted_by_is_the_compiled_pair() {
         let pair = test_anchor_minted_by();
+        let manifest = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"))
+            .expect("I162: read Cargo.toml");
+        let tags: std::collections::BTreeSet<&str> = manifest
+            .lines()
+            .filter(|l| !l.trim_start().starts_with('#'))
+            .filter(|l| l.contains("github.com/CIRISAI/CIRISVerify"))
+            .filter_map(|l| l.split("tag = \"").nth(1))
+            .filter_map(|rest| rest.split('"').next())
+            .collect();
+        assert_eq!(
+            tags.len(),
+            1,
+            "I162: every CIRISVerify pin in Cargo.toml names ONE tag: {tags:?}"
+        );
+        let tag = tags.into_iter().next().expect("one tag");
         assert_eq!(
             pair,
-            format!("persist v{} / verify v19.0.0", env!("CARGO_PKG_VERSION")),
+            format!("persist v{} / verify {tag}", env!("CARGO_PKG_VERSION")),
             "I162: the verify half is the Cargo.toml tag; bump it there, never here"
         );
         let seed = decode_seed_b64(TEST_ANCHOR_SHARED_SEED_B64).unwrap();
