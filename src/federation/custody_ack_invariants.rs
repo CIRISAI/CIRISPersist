@@ -1336,6 +1336,58 @@ mod engine_bodies {
         }
     }
 
+    /// **I611** (v54.0.0, Codex round 3 on PR #1050) — **a plaintext row and
+    /// its V184 association are one write.** `store_blob_local` inserted the
+    /// row and then, as a second autocommitted statement, its association.
+    /// A failure between the two (here an injected fault at exactly that
+    /// point, `store_blob_local_association`) left a durable row whose room
+    /// was never recorded. Now both statements are one transaction: the
+    /// failed write leaves neither, and the retried write stores both.
+    pub(crate) async fn i611_a_local_plaintext_store_is_one_write<B>(
+        b: &B,
+        arm: impl FnOnce(),
+        run: &str,
+    ) where
+        B: BlobStorage,
+    {
+        use crate::federation::types::cohort_scope::{CryptoTier, FEDERATION};
+        use sha2::Digest as _;
+        let bytes = format!("i611 local plaintext {run}").into_bytes();
+        let sha: [u8; 32] = sha2::Sha256::digest(&bytes).into();
+        let store = || {
+            b.store_blob_local(
+                &sha,
+                crate::federation::BlobBody::Inline(bytes.clone()),
+                None,
+                FEDERATION,
+                crate::federation::StorageFloor::resolved(CryptoTier::Plaintext),
+                None,
+                None,
+            )
+        };
+        arm();
+        let r = store().await;
+        assert!(
+            matches!(&r, Err(BlobError::Backend(m)) if m.contains("injected fault")),
+            "I611 the association statement fails: {r:?}"
+        );
+        assert!(
+            !b.has_blob(&sha).await.unwrap(),
+            "I611 a write whose association failed leaves no row behind"
+        );
+        assert!(
+            b.blob_associations(&sha).await.unwrap().is_empty(),
+            "I611 and no association"
+        );
+        store().await.expect("I611 the retried write");
+        assert!(b.has_blob(&sha).await.unwrap(), "I611 the row is stored");
+        assert_eq!(
+            b.blob_associations(&sha).await.unwrap(),
+            vec![(FEDERATION.to_owned(), None)],
+            "I611 with its association"
+        );
+    }
+
     /// A shared `BackendDispatch` over a backend handle, and a way to make the
     /// handle forget its node key — a handle the constructor could not tell
     /// (a hardware signer that answers asynchronously).
@@ -1510,6 +1562,21 @@ mod runners {
     );
     #[cfg(feature = "sqlite")]
     #[tokio::test]
+    async fn i611_sqlite() {
+        use crate::store::Backend as _;
+        let b = crate::store::sqlite::SqliteBackend::open_in_memory()
+            .await
+            .unwrap();
+        b.run_migrations().await.unwrap();
+        super::engine_bodies::i611_a_local_plaintext_store_is_one_write(
+            &b,
+            || b.test_hooks().fail_next("store_blob_local_association", 1),
+            &suffix(),
+        )
+        .await;
+    }
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
     async fn i514_sqlite() {
         super::engine_bodies::i514_the_custody_door_knows_its_node(
             "sqlite::memory:",
@@ -1564,6 +1631,24 @@ mod runners {
         i607_postgres,
         i607_each_association_resolves_its_own_principal
     );
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn i611_postgres() {
+        use crate::store::Backend as _;
+        let Some(dsn) = crate::test_pg::empty_dsn() else {
+            return;
+        };
+        let b = crate::store::postgres::PostgresBackend::connect(&dsn)
+            .await
+            .unwrap();
+        b.run_migrations().await.unwrap();
+        super::engine_bodies::i611_a_local_plaintext_store_is_one_write(
+            &b,
+            || b.test_hooks().fail_next("store_blob_local_association", 1),
+            &suffix(),
+        )
+        .await;
+    }
     #[cfg(feature = "postgres")]
     #[tokio::test]
     async fn i514_postgres() {

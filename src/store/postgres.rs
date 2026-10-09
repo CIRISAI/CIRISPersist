@@ -16997,52 +16997,71 @@ impl crate::federation::BlobStorage for PostgresBackend {
                 ))
             }
         };
-        let client = self
+        // v54.0.0 (Codex round 3 on PR #1050) — the row and its V184
+        // association are ONE transaction. Run on the bare client, the row
+        // insert autocommitted first, and a process loss or a failed
+        // association statement left a durable plaintext row whose room was
+        // never recorded (I611).
+        #[cfg(test)]
+        let inject_association_fault = self
+            .test_hooks()
+            .fail_if_armed("store_blob_local_association")
+            .is_err();
+        let mut client = self
             .get_client()
             .await
             .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(format!("begin tx: {e}")))?;
         let sha_vec = sha256.to_vec();
-        client
-            .execute(
-                // #984 (V177) — the group the write named, on the row.
-                "INSERT INTO cirislens.federation_blobs (\
+        tx.execute(
+            // #984 (V177) — the group the write named, on the row.
+            "INSERT INTO cirislens.federation_blobs (\
                     sha256, storage_kind, bytes_inline, external_ref, size_bytes, media_type, \
                     cohort_scope, crypto_tier, author_key_id, group_key_id\
                  ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
                  ON CONFLICT (sha256) DO NOTHING",
-                &[
-                    &sha_vec,
-                    &storage_kind,
-                    &bytes_inline_opt,
-                    &external_ref_opt,
-                    &size_bytes_i64,
-                    &media_type,
-                    &scope,
-                    &tier,
-                    &author,
-                    &group,
-                ],
+            &[
+                &sha_vec,
+                &storage_kind,
+                &bytes_inline_opt,
+                &external_ref_opt,
+                &size_bytes_i64,
+                &media_type,
+                &scope,
+                &tier,
+                &author,
+                &group,
+            ],
+        )
+        .await
+        .map_err(|e| {
+            crate::federation::BlobError::Backend(format!("store_blob_local insert: {e}"))
+        })?;
+        // v54.0.0 (#995 row 4, V184) — a plaintext row keeps every room.
+        if tier == crate::federation::types::cohort_scope::CryptoTier::Plaintext.as_str() {
+            #[cfg(test)]
+            if inject_association_fault {
+                return Err(crate::federation::BlobError::Backend(
+                    "store_blob_local association: injected fault".into(),
+                ));
+            }
+            tx.execute(
+                "INSERT INTO cirislens.federation_blob_associations \
+                    (sha256, cohort_scope, group_key_id) VALUES ($1, $2, COALESCE($3, '')) \
+                 ON CONFLICT DO NOTHING",
+                &[&sha_vec, &scope, &group],
             )
             .await
             .map_err(|e| {
-                crate::federation::BlobError::Backend(format!("store_blob_local insert: {e}"))
+                crate::federation::BlobError::Backend(format!("store_blob_local association: {e}"))
             })?;
-        // v54.0.0 (#995 row 4, V184) — a plaintext row keeps every room.
-        if tier == crate::federation::types::cohort_scope::CryptoTier::Plaintext.as_str() {
-            client
-                .execute(
-                    "INSERT INTO cirislens.federation_blob_associations \
-                        (sha256, cohort_scope, group_key_id) VALUES ($1, $2, COALESCE($3, '')) \
-                     ON CONFLICT DO NOTHING",
-                    &[&sha_vec, &scope, &group],
-                )
-                .await
-                .map_err(|e| {
-                    crate::federation::BlobError::Backend(format!(
-                        "store_blob_local association: {e}"
-                    ))
-                })?;
         }
+        tx.commit().await.map_err(|e| {
+            crate::federation::BlobError::Backend(format!("store_blob_local commit: {e}"))
+        })?;
         Ok(())
     }
 

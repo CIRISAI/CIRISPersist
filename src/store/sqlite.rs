@@ -15493,8 +15493,21 @@ impl crate::federation::BlobStorage for SqliteBackend {
         // real wall-clock so a fresh blob matches its first_seen_at.
         let now_iso = chrono::Utc::now().to_rfc3339();
 
+        // v54.0.0 (Codex round 3 on PR #1050) — the row and its V184
+        // association are ONE transaction. `write` holds the connection lock,
+        // which serializes but does not make the two statements atomic: each
+        // autocommitted, and a failed association statement left the row with
+        // its room unrecorded (I611).
+        #[cfg(test)]
+        let inject_association_fault = self
+            .test_hooks()
+            .fail_if_armed("store_blob_local_association")
+            .is_err();
+        #[cfg(not(test))]
+        let inject_association_fault = false;
         self.write(move |conn| -> Result<(), rusqlite::Error> {
-            conn.execute(
+            let tx = conn.transaction()?;
+            tx.execute(
                 // #984 (V177) — the group the write named, on the row.
                 "INSERT INTO federation_blobs (\
                     sha256, storage_kind, bytes_inline, external_ref, size_bytes, media_type, \
@@ -15518,13 +15531,18 @@ impl crate::federation::BlobStorage for SqliteBackend {
             )?;
             // v54.0.0 (#995 row 4, V184) — a plaintext row keeps every room.
             if tier == crate::federation::types::cohort_scope::CryptoTier::Plaintext.as_str() {
-                conn.execute(
+                if inject_association_fault {
+                    return Err(rusqlite::Error::InvalidParameterName(
+                        "store_blob_local association: injected fault".into(),
+                    ));
+                }
+                tx.execute(
                     "INSERT INTO federation_blob_associations (sha256, cohort_scope, group_key_id) \
                      VALUES (?1, ?2, COALESCE(?3, '')) ON CONFLICT DO NOTHING",
                     rusqlite::params![sha_vec, scope, group],
                 )?;
             }
-            Ok(())
+            tx.commit()
         })
         .await
         .map_err(|e| crate::federation::BlobError::Backend(format!("store_blob_local: {e}")))?;
