@@ -431,8 +431,13 @@ pub mod bodies {
     /// - (b) a founder who has LEFT a `founder_only` affiliation dates a direct
     ///   issuance inside their tenure (refused `not_authority_at_receipt`).
     ///
-    /// Kills: the door judging at the signed `asserted_at` alone (both arms
-    /// admit), and dropping the authority-at-receipt clause (arm (b) admits).
+    /// - (c) the door still judges at the signed instant too: a licence dated
+    ///   before an open-ended appointment existed is refused, so the door
+    ///   never admits a row the fold would exclude.
+    ///
+    /// Kills: the door judging at the signed `asserted_at` alone (arms (a)
+    /// and (b) admit), dropping the authority-at-receipt clause (arm (b)
+    /// admits), and dropping the signed-instant verdict (arm (c) admits).
     pub async fn exercise_backdated_licence_is_refused_at_receipt(
         dir: &dyn FederationDirectory,
         tag: &str,
@@ -477,6 +482,37 @@ pub mod bodies {
                 "[{tag}] #1049: a withdrawn officer dating a licence inside the old \
                  appointment"
             ),
+        )
+        .await;
+
+        // (c) The door ALSO judges at the signed instant, so it never admits
+        // a row the fold would exclude: a licence dated before an open-ended
+        // appointment existed is live at receipt and refused.
+        // Kills: the door dropping its signed-instant verdict.
+        let registrar = officer(dir, tag, "registrar").await;
+        let open_ended = must_put(
+            dir,
+            &edge(
+                &board,
+                &registrar,
+                &[DELEGATION_SCOPE_LICENSE],
+                now - Duration::hours(1),
+                &[],
+            ),
+            "the board appoints an open-ended officer",
+        )
+        .await;
+        must_refuse(
+            dir,
+            &licence(
+                &registrar,
+                &holder,
+                &board,
+                "issued",
+                Some(&open_ended.attestation_id),
+                now - Duration::hours(2),
+            ),
+            &format!("[{tag}] #1049: a licence dated before the appointment existed"),
         )
         .await;
 
