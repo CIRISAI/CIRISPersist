@@ -978,6 +978,19 @@ pub(crate) const DECLARED_DIVERGENCES: &[DeclaredDivergence] = &[
                  door that refuses an unknown ENVELOPE token is shared by all three backends \
                  (I279).",
     },
+    DeclaredDivergence {
+        trait_name: "FederationDirectory",
+        method: "enter_mesh",
+        backend: "postgres",
+        expected: &["check_delegation_cycle_admission"],
+        reason: "v54.0.0 (Codex on PR #1050) — the crossing's cycle check runs inside \
+                 `plan_enter_mesh` on every backend. Memory and sqlite take their in-process \
+                 delegation write lock BEFORE the plan, so the plan's check and the write are one \
+                 step: one process owns the store. Postgres shares its database with other \
+                 processes, so it also takes the delegation advisory lock in the UPDATE's \
+                 transaction and asks the cycle gate AGAIN under it: a writer in another process \
+                 may have committed the reverse edge between the plan and the lock (I597).",
+    },
 ];
 
 #[cfg(test)]
