@@ -2701,15 +2701,20 @@ pub(crate) mod carriage_tests {
             return;
         };
         let dsn2 = dsn.clone();
-        crate::federation::admission::run_in_isolated_pg_db(&dsn, |a| async move {
-            crate::federation::admission::run_in_isolated_pg_db(&dsn2, |b| async move {
-                run_carriage_matrix(&a, &b, "pg").await;
-                run_revocation_cursor_matrix(&a, "pg").await;
-                run_cursor_advance_matrix(&b, "pg").await;
-                run_injected_roster_matrix(&b, "pg").await;
-            })
-            .await;
-        })
+        // v54.0.0 (#1017) — boxed: the four matrices are ~18 KB of state
+        // (`clippy::large_futures` is warned crate-wide).
+        Box::pin(crate::federation::admission::run_in_isolated_pg_db(
+            &dsn,
+            |a| async move {
+                crate::federation::admission::run_in_isolated_pg_db(&dsn2, |b| async move {
+                    run_carriage_matrix(&a, &b, "pg").await;
+                    run_revocation_cursor_matrix(&a, "pg").await;
+                    run_cursor_advance_matrix(&b, "pg").await;
+                    run_injected_roster_matrix(&b, "pg").await;
+                })
+                .await;
+            },
+        ))
         .await;
     }
 }

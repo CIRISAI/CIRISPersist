@@ -138,6 +138,28 @@ async fn held<D: FederationDirectory + ?Sized>(
 trait Node: FederationDirectory {
     async fn seed_holders(&self);
     fn be_the_node(&self);
+    /// v54.0.0 (#995 row 2) — the pre-v53.1.4 UPDATE doors' drop.
+    async fn drop_scrubs(&self, key_id: &str);
+    async fn apply_key(&self, r: SignedKeyRecord) -> ReplicatedKeyOutcome;
+}
+
+impl Node for ciris_persist::store::memory::MemoryBackend {
+    async fn seed_holders(&self) {
+        self.seed_genesis_accord_holders(&effective_accord_holder_records())
+            .await
+            .expect("seed holders");
+    }
+    fn be_the_node(&self) {
+        self.set_node_key_id(TEST_CEREMONY_NODE_KEY_ID);
+    }
+    async fn drop_scrubs(&self, key_id: &str) {
+        self.test_seam_drop_key_additional_scrubs(key_id)
+            .await
+            .unwrap();
+    }
+    async fn apply_key(&self, r: SignedKeyRecord) -> ReplicatedKeyOutcome {
+        self.apply_replicated_key_record(r).await.unwrap()
+    }
 }
 
 impl Node for SqliteBackend {
@@ -148,6 +170,14 @@ impl Node for SqliteBackend {
     }
     fn be_the_node(&self) {
         self.set_node_key_id(TEST_CEREMONY_NODE_KEY_ID);
+    }
+    async fn drop_scrubs(&self, key_id: &str) {
+        self.test_seam_drop_key_additional_scrubs(key_id)
+            .await
+            .unwrap();
+    }
+    async fn apply_key(&self, r: SignedKeyRecord) -> ReplicatedKeyOutcome {
+        self.apply_replicated_key_record(r).await.unwrap()
     }
 }
 
@@ -160,6 +190,14 @@ impl Node for ciris_persist::store::postgres::PostgresBackend {
     }
     fn be_the_node(&self) {
         self.set_node_key_id(TEST_CEREMONY_NODE_KEY_ID);
+    }
+    async fn drop_scrubs(&self, key_id: &str) {
+        self.test_seam_drop_key_additional_scrubs(key_id)
+            .await
+            .unwrap();
+    }
+    async fn apply_key(&self, r: SignedKeyRecord) -> ReplicatedKeyOutcome {
+        self.apply_replicated_key_record(r).await.unwrap()
     }
 }
 
@@ -477,6 +515,54 @@ async fn i530_the_adopt_door_keeps_the_quorum<D: Node + ?Sized>(
     assert_entrenched_and_seated(d, 2, &format!("{tag} I530")).await;
 }
 
+/// **I572 (#995 row 2) — a row a pre-v53.1.4 UPDATE door stranded is
+/// re-hydrated, not read as `Unchanged`.** The node holds the final record,
+/// inserted whole; the seam then reproduces the old doors' drop (the
+/// `additional_scrubs` column emptied, `persist_row_hash` still over the full
+/// record). The re-offered record hashes EQUAL to the stored hash, so through
+/// v53 the plan answered `Unchanged` and the row stayed a one-holder record.
+/// It is now `ScrubsRehydrated`, the row carries the quorum again, and a second
+/// re-offer is the no-op.
+async fn i572_a_stranded_row_is_rehydrated<D: Node + ?Sized>(
+    d: &D,
+    block: &TestAnchorBlock,
+    bundle: &GenesisBundle,
+    tag: &str,
+) {
+    arm(block);
+    d.seed_holders().await;
+    let full = bundle.serve_nodes[0].clone();
+    d.put_public_key(full.clone())
+        .await
+        .unwrap_or_else(|e| panic!("{tag} I572: the final record inserts whole: {e}"));
+    assert_eq!(held(d).await.additional_scrubs.len(), 2);
+    assert!(
+        carries_quorum(d).await,
+        "{tag} I572 precondition: inserted whole"
+    );
+    d.drop_scrubs(TEST_CEREMONY_NODE_KEY_ID).await;
+    assert!(
+        !carries_quorum(d).await,
+        "{tag} I572 precondition: the stranded row carries one holder"
+    );
+    let o = d.apply_key(full.clone()).await;
+    assert_eq!(
+        o,
+        ReplicatedKeyOutcome::ScrubsRehydrated,
+        "{tag} I572 EXPECT the stranded row is re-hydrated — OBSERVED {o:?}"
+    );
+    assert_eq!(held(d).await.additional_scrubs.len(), 2);
+    assert!(
+        carries_quorum(d).await,
+        "{tag} I572: the re-hydrated row carries the accord co-scrub"
+    );
+    assert_eq!(
+        d.apply_key(full).await,
+        ReplicatedKeyOutcome::Unchanged,
+        "{tag} I572: a second re-offer is the no-op"
+    );
+}
+
 async fn sqlite() -> SqliteBackend {
     let b = SqliteBackend::open_in_memory().await.unwrap();
     b.run_migrations().await.unwrap();
@@ -543,6 +629,19 @@ sqlite_case!(
     i529c_the_import_door_reanchors
 );
 sqlite_case!(i528e_the_door_repairs_sqlite, i528e_the_door_repairs);
+sqlite_case!(
+    i572_a_stranded_row_is_rehydrated_sqlite,
+    i572_a_stranded_row_is_rehydrated
+);
+
+#[serial_test::serial(test_anchor_env)]
+#[tokio::test]
+async fn i572_a_stranded_row_is_rehydrated_memory() {
+    let (block, bundle) = mint_final();
+    let _armed = Armed;
+    let b = ciris_persist::store::memory::MemoryBackend::new();
+    i572_a_stranded_row_is_rehydrated(&b, &block, &bundle, "memory").await;
+}
 sqlite_case!(
     i530_the_adopt_door_keeps_the_quorum_sqlite,
     i530_the_adopt_door_keeps_the_quorum
@@ -663,6 +762,11 @@ postgres_case!(
 );
 #[cfg(feature = "postgres")]
 postgres_case!(i528e_the_door_repairs_postgres, i528e_the_door_repairs);
+#[cfg(feature = "postgres")]
+postgres_case!(
+    i572_a_stranded_row_is_rehydrated_postgres,
+    i572_a_stranded_row_is_rehydrated
+);
 #[cfg(feature = "postgres")]
 postgres_case!(
     i530_the_adopt_door_keeps_the_quorum_postgres,

@@ -94,27 +94,34 @@ Two partial `check` runs are on disk. Neither covered all 929 sets.
 | `check` (all) | 34 of 929 | 598 s | not recorded | 1 red; the log ends after set 34 finished, cause not recorded |
 | `check 41/80` | 12 | 274 s | 3.0 GiB | 1 red |
 
-### Known red (#1030)
+### Known red (#1030), fixed in v54.0.0
 
-Both reds are real configurations that do not compile. They are filed as
-CIRISPersist#1030 (v54.0.0), and until it closes they are the powerset's
-known-red sets:
+Both reds were real configurations that did not compile:
 
 - **`tls` without `postgres`** (the set `test-panic,tls`; `test-panic` is an
-  empty feature). `tokio-postgres-rustls` fails with
-  `unresolved import tokio_postgres::tls::MakeTlsConnect` and two `E0223`.
-  `tls` (`Cargo.toml:525`) enables `dep:tokio-postgres-rustls` but not
-  `postgres`, so `tokio-postgres` is built without the runtime that crate
-  needs.
+  empty feature). `tokio-postgres-rustls` failed with
+  `unresolved import tokio_postgres::tls::MakeTlsConnect` and two `E0223`,
+  because `tls` enabled `dep:tokio-postgres-rustls` but not `postgres`.
 - **`pyo3-sqlite` without `pyo3`.** 184 × `E0004` "non-exhaustive patterns:
-  `&pyo3::BackendDispatch`" from `src/ffi/pyo3.rs:120`, plus never-type and
-  missing-module errors. `pyo3-sqlite = ["_pyffi"]` (`Cargo.toml:43`) enables
-  the shared gate but not `pyo3`. The hand leg `pyo3sqlite` always adds
-  `sqlite` and nine more, so it never saw this.
+  `&pyo3::BackendDispatch`" from `src/ffi/pyo3.rs:120`: `pyo3-sqlite =
+  ["_pyffi"]` enabled the FFI module with no backend at all, so the dispatch
+  enum was uninhabited. The hand leg `pyo3sqlite` always added `sqlite` and
+  nine more, so it never saw this.
 
-Neither is fixed in this cut; #1030 tracks both. Each wants a one-line feature-closure decision
-(make `tls` imply `postgres`; make `pyo3-sqlite` imply `pyo3` and `sqlite`, or
-gate the module on both), and that is a public feature contract change.
+The decisions (v54.0.0):
+
+- **`tls = ["postgres", …]`.** Every line of TLS code is the Postgres pool's
+  transport (`src/store/postgres.rs`). There is no backend-agnostic TLS to
+  build, so the feature declares the backend it secures.
+- **`pyo3-sqlite = ["_pyffi", "sqlite"]`.** The feature is the mobile and
+  Windows Python shape and stays postgres-free. Implying `pyo3` would pull
+  `postgres` and openssl, the one thing it exists to drop, so it implies the
+  backend its name says.
+- **The gate.** `ci_feature_matrix.py` keeps an `ALONE_COMPILE` table
+  (feature → prerequisite). `check` fails if Cargo.toml drops an implication
+  or if ci.yml stops compiling each one alone (`ci_feature_matrix.py alone`,
+  a `cargo check --no-default-features --features <f>` loop in the lint job).
+  The weekly powerset job is no longer `continue-on-error`.
 
 ## Runtime and placement
 

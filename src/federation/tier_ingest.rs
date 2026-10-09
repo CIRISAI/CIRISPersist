@@ -3382,6 +3382,37 @@ pub mod test_support {
         member_a: &str,
         member_b: &str,
     ) {
+        seed_two_member_group(dir, community_key_id, member_a, member_b, None).await;
+    }
+
+    /// v54.0.0 (CIRISPersist#1034) — [`seed_two_member_community`] declaring
+    /// itself an affiliation (`policy_blob.cohort_scope`), so rows placed at
+    /// `affiliations` may name it.
+    pub(crate) async fn seed_two_member_affiliation(
+        dir: &dyn crate::federation::FederationDirectory,
+        community_key_id: &str,
+        member_a: &str,
+        member_b: &str,
+    ) {
+        seed_two_member_group(
+            dir,
+            community_key_id,
+            member_a,
+            member_b,
+            Some(serde_json::json!({
+                crate::federation::affiliation_config::POLICY_COHORT_FIELD: "affiliations"
+            })),
+        )
+        .await;
+    }
+
+    async fn seed_two_member_group(
+        dir: &dyn crate::federation::FederationDirectory,
+        community_key_id: &str,
+        member_a: &str,
+        member_b: &str,
+        policy_blob: Option<serde_json::Value>,
+    ) {
         let member = |k: &str| crate::federation::types::CommunityMember {
             key_id: k.to_owned(),
             joined_at: "2026-05-01T00:00:00Z".parse().unwrap(),
@@ -3401,7 +3432,7 @@ pub mod test_support {
                 members,
                 founded_at: "2026-05-01T00:00:00Z".parse().unwrap(),
                 consensus_protocol: crate::federation::types::consensus_protocol::UNANIMOUS.into(),
-                policy_blob: None,
+                policy_blob,
                 persist_row_hash: String::new(),
             },
         ))
@@ -3786,7 +3817,7 @@ pub mod test_support {
 
     /// v37.0.0 (CIRISPersist#734) — retract `target_id` with a `withdraws` /
     /// `recants` composer authored by `granter` (the §6.1 / CEG §3.2.3 act).
-    async fn put_retraction<D: crate::federation::FederationDirectory + ?Sized>(
+    pub(crate) async fn put_retraction<D: crate::federation::FederationDirectory + ?Sized>(
         dir: &D,
         granter: &str,
         grantee: &str,

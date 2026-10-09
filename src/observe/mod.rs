@@ -327,10 +327,23 @@ pub fn record_read<R: ReadRow>(
 /// Run `fut` as one entry into `fold`: count the call, and credit every door
 /// read `fut` makes (on this task) to `fold` and to every fold already
 /// active on it.
-pub async fn fold<F: Future>(fold: Fold, fut: F) -> F::Output {
-    counters().fold_calls[fold as usize].fetch_add(1, Relaxed);
-    let mask = ACTIVE_FOLDS.try_with(|m| *m).unwrap_or(0) | fold.bit();
-    ACTIVE_FOLDS.scope(mask, fut).await
+///
+/// v54.0.0 (CIRISPersist#1017) — `fut` is BOXED. Each fold wrapped its whole
+/// inner future inline, so nested folds (serve tier → trust_root_valid →
+/// owner_granted_scope) stacked into a 29 KB public future that every caller
+/// had to box for `clippy::large_futures`. One allocation per fold entry, at
+/// the door, instead of one per caller; I578 pins the doors under 16 KiB.
+///
+/// Boxed EAGERLY, when the wrapper is built: an un-polled `async fn` keeps
+/// its arguments inline, so a box taken inside the body would still leave
+/// the whole inner future in the caller's state until the first poll.
+pub fn fold<F: Future>(fold: Fold, fut: F) -> impl Future<Output = F::Output> {
+    let fut = Box::pin(fut);
+    async move {
+        counters().fold_calls[fold as usize].fetch_add(1, Relaxed);
+        let mask = ACTIVE_FOLDS.try_with(|m| *m).unwrap_or(0) | fold.bit();
+        ACTIVE_FOLDS.scope(mask, fut).await
+    }
 }
 
 thread_local! {

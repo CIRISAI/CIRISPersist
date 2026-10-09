@@ -357,6 +357,12 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // v50.0.0 (CIRISPersist#924, CC 5.4.6) — a minor's owner-binding is
     // refused at `cohort_scope: federation`.
     ("check_minor_owner_binding_not_announced", Class::Gate),
+    // v54.0.0 (CIRISPersist#1031, CC 4.1.1) — refuses the cycle-closing
+    // `delegates_to` (`federation_delegation_cycle`).
+    ("check_delegation_cycle_admission", Class::Gate),
+    // v54.0.0 (CIRISPersist#1034, CC 4.4.3.2.8) — refuses a community record
+    // whose declared cohort or affiliation config is malformed or invalid.
+    ("check_community_record", Class::Gate),
     ("check_skew_and_payment", Class::Gate),
     ("check_trace_dimension_admission", Class::Gate),
     ("check_trust_charter_admission", Class::Gate),
@@ -971,6 +977,19 @@ pub(crate) const DECLARED_DIVERGENCES: &[DeclaredDivergence] = &[
                  there is nothing to decode and nothing that can be malformed. The admission \
                  door that refuses an unknown ENVELOPE token is shared by all three backends \
                  (I279).",
+    },
+    DeclaredDivergence {
+        trait_name: "FederationDirectory",
+        method: "enter_mesh",
+        backend: "postgres",
+        expected: &["check_delegation_cycle_admission"],
+        reason: "v54.0.0 (Codex on PR #1050) — the crossing's cycle check runs inside \
+                 `plan_enter_mesh` on every backend. Memory and sqlite take their in-process \
+                 delegation write lock BEFORE the plan, so the plan's check and the write are one \
+                 step: one process owns the store. Postgres shares its database with other \
+                 processes, so it also takes the delegation advisory lock in the UPDATE's \
+                 transaction and asks the cycle gate AGAIN under it: a writer in another process \
+                 may have committed the reverse edge between the plan and the lock (I597).",
     },
 ];
 

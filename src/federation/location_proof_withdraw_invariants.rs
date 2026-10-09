@@ -238,6 +238,145 @@ pub(crate) mod reindex_bodies {
                 .is_none(),
             "I523 the pre-withdrawal hash resolves to nothing"
         );
+        // **I574** (v54.0.0, #995 row 5) — and the listing no longer
+        // ADVERTISES it: the re-index upserted the new hash and left the
+        // `(kind, old_hash)` row behind, so anti-entropy kept offering a hash
+        // whose point read answers `None`.
+        let listed = d
+            .list_wire_hashes_since("LocationProof", None, 10_000)
+            .await
+            .unwrap();
+        assert!(
+            listed.contains(&hash1),
+            "I574 the withdrawn row's hash is listed"
+        );
+        assert!(
+            !listed.contains(&hash0),
+            "I574 the pre-withdrawal hash is no longer advertised: {listed:?}"
+        );
+        // A rebuild leaves the one current mapping.
+        d.rebuild_signed_wire_index().await.unwrap();
+        let listed = d
+            .list_wire_hashes_since("LocationProof", None, 10_000)
+            .await
+            .unwrap();
+        assert!(listed.contains(&hash1) && !listed.contains(&hash0));
+    }
+
+    /// **I599** (v54.0.0, Codex on PR #1050) — **a re-index is one step per
+    /// record.** `first` re-indexes the proof and is paused after reading the
+    /// stored bytes, before replacing the mapping; meanwhile `second` (the
+    /// same backend, or another pool on the same postgres database) withdraws
+    /// the proof, which re-indexes it under the new bytes; then `first`
+    /// resumes. Before the fix the paused re-index pruned the newer hash and
+    /// wrote its stale one, so the listing advertised a hash the point read
+    /// rejects. After: exactly one mapping, the withdrawn row's, and every
+    /// listed hash resolves.
+    ///
+    /// **I603** (v54.0.0, Codex round 2 on PR #1050) runs the same body with
+    /// the postgres re-index paused EARLIER: after its read, before it takes
+    /// the record's advisory lock (`second_waits = false`). The reload holds
+    /// no pooled client (I601), so the lock cannot cover it; `second`'s whole
+    /// withdrawal and re-index commit while `first` holds a stale read, and
+    /// `first` then commits LAST. Its post-commit re-read must see the newer
+    /// bytes and replace its stale hash.
+    pub(crate) async fn i599_a_concurrent_reindex_leaves_one_mapping<Fut>(
+        first: &dyn FederationDirectory,
+        second: &dyn FederationDirectory,
+        arm: impl FnOnce() -> std::sync::Arc<crate::store::test_hooks::Pause>,
+        reindex_first: impl FnOnce(String) -> Fut,
+        tag: &str,
+        second_waits: bool,
+    ) where
+        Fut: std::future::Future<Output = Result<(), crate::federation::Error>>,
+    {
+        let subject = format!("i599-s-{tag}");
+        ts::register_hybrid_key(first, &subject).await;
+        let (cell, at) = (
+            cell(),
+            "2026-10-03T00:00:00Z".parse::<DateTime<Utc>>().unwrap(),
+        );
+        first
+            .put_location_proof(ts::sign_location_proof(
+                &subject,
+                proof(&subject, &cell, at, None),
+            ))
+            .await
+            .expect("the proof");
+        let (_, hash0) = served(first, &subject).await;
+        let key = crate::federation::wire_index::record_key(&[
+            ("subject_key_id", &subject),
+            (
+                "asserted_at",
+                &crate::federation::wire_index::locator_instant(&at),
+            ),
+        ]);
+        // Armed only now: the put above re-indexed too and must not take it.
+        let pause = arm();
+        let withdrawal = ts::sign_location_proof(
+            &subject,
+            proof(&subject, &cell, at, Some(at + Duration::hours(1))),
+        );
+        let (r_first, (r_second, second_ran_free)) = tokio::join!(reindex_first(key), async {
+            pause.reached().await;
+            let w = second.withdraw_location_proof(withdrawal);
+            tokio::pin!(w);
+            match tokio::time::timeout(std::time::Duration::from_secs(3), &mut w).await {
+                Ok(r) => {
+                    pause.resume();
+                    (r, true)
+                }
+                Err(_) => {
+                    pause.resume();
+                    (w.await, false)
+                }
+            }
+        });
+        r_first.expect("the first re-index");
+        r_second.expect("the withdrawal");
+        let (_, hash1) = served(first, &subject).await;
+        assert_ne!(
+            hash0, hash1,
+            "I599 precondition: the withdrawal changed the bytes"
+        );
+        let listed = first
+            .list_wire_hashes_since("LocationProof", None, 10_000)
+            .await
+            .unwrap();
+        let mine: Vec<&String> = listed
+            .iter()
+            .filter(|h| **h == hash0 || **h == hash1)
+            .collect();
+        for h in &listed {
+            assert!(
+                first
+                    .lookup_signed_record_by_content_hash("LocationProof", h)
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "I599 a listed hash the point read rejects: {h} (stale = {}; the withdrawal \
+                 finished while the re-index was held: {second_ran_free})",
+                *h == hash0
+            );
+        }
+        assert_eq!(
+            mine,
+            vec![&hash1],
+            "I599 exactly one mapping for the record, the withdrawn row's (withdrawal ran \
+             while the re-index was held: {second_ran_free})"
+        );
+        if second_waits {
+            assert!(
+                !second_ran_free,
+                "I599 the withdrawal's re-index must wait for the held one"
+            );
+        } else {
+            assert!(
+                second_ran_free,
+                "I603 premise: the withdrawal and its re-index commit while the first \
+                 re-index holds its stale read, so the first commits last"
+            );
+        }
     }
 
     /// **I524** (v53.1.3, Codex on #985 P2, #986) — **the withdrawal write is
@@ -484,6 +623,101 @@ mod runners {
         b.run_migrations().await.unwrap();
         Some(b)
     });
+
+    /// I599 on one backend (memory, sqlite): both writers share it.
+    macro_rules! i599_single {
+        ($b:expr) => {{
+            let b = $b;
+            let br = &b;
+            super::reindex_bodies::i599_a_concurrent_reindex_leaves_one_mapping(
+                &b as &dyn crate::federation::FederationDirectory,
+                &b as &dyn crate::federation::FederationDirectory,
+                || br.test_hooks().arm_pause("wire_index_before_write"),
+                |key| async move { br.index_stored_record("LocationProof", &key).await },
+                &suffix(),
+                true,
+            )
+            .await;
+        }};
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn i599_memory() {
+        i599_single!(crate::store::memory::MemoryBackend::new());
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn i599_sqlite() {
+        use crate::store::Backend as _;
+        let b = crate::store::sqlite::SqliteBackend::open_in_memory()
+            .await
+            .unwrap();
+        b.run_migrations().await.unwrap();
+        i599_single!(b);
+    }
+
+    /// I599 on postgres: TWO backends, two pools, one database.
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn i599_postgres() {
+        use crate::federation::FederationDirectory;
+        use crate::store::Backend as _;
+        let Some(dsn) = crate::test_pg::isolated_dsn() else {
+            eprintln!("i599_postgres: no base DSN — SKIPPED");
+            return;
+        };
+        let b1 = crate::store::postgres::PostgresBackend::connect(&dsn)
+            .await
+            .unwrap();
+        b1.run_migrations().await.unwrap();
+        let b2 = crate::store::postgres::PostgresBackend::connect(&dsn)
+            .await
+            .unwrap();
+        let b1r = &b1;
+        super::reindex_bodies::i599_a_concurrent_reindex_leaves_one_mapping(
+            &b1 as &dyn FederationDirectory,
+            &b2 as &dyn FederationDirectory,
+            || b1r.test_hooks().arm_pause("wire_index_before_write"),
+            |key| async move { b1r.index_stored_record("LocationProof", &key).await },
+            &suffix(),
+            true,
+        )
+        .await;
+        eprintln!("i599_postgres: RAN on {dsn}");
+    }
+
+    /// I603 on postgres: the I599 body with the first re-index paused after
+    /// its read and before the advisory lock, so the second pool's withdrawal
+    /// commits in full first and the stale re-index commits last.
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn i603_postgres() {
+        use crate::federation::FederationDirectory;
+        use crate::store::Backend as _;
+        let Some(dsn) = crate::test_pg::isolated_dsn() else {
+            eprintln!("i603_postgres: no base DSN — SKIPPED");
+            return;
+        };
+        let b1 = crate::store::postgres::PostgresBackend::connect(&dsn)
+            .await
+            .unwrap();
+        b1.run_migrations().await.unwrap();
+        let b2 = crate::store::postgres::PostgresBackend::connect(&dsn)
+            .await
+            .unwrap();
+        let b1r = &b1;
+        super::reindex_bodies::i599_a_concurrent_reindex_leaves_one_mapping(
+            &b1 as &dyn FederationDirectory,
+            &b2 as &dyn FederationDirectory,
+            || b1r.test_hooks().arm_pause("wire_index_after_read"),
+            |key| async move { b1r.index_stored_record("LocationProof", &key).await },
+            &suffix(),
+            false,
+        )
+        .await;
+        eprintln!("i603_postgres: RAN on {dsn}");
+    }
 
     /// I524 needs the backend's own rival seam (memory writes under one lock
     /// and has no race to witness).

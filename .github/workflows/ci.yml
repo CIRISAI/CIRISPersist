@@ -1632,6 +1632,18 @@ jobs:
           cargo check --no-default-features --features \
             "pyo3-sqlite sqlite secrets cirisnode cirisgraph cirisaudit telemetry cirisincident classify scrub extract"
 
+      # v54.0.0 (CIRISPersist#1030) — the features a consumer enables ON THEIR
+      # OWN, each compiled with nothing beside it. The #1025 powerset found
+      # `tls` and `pyo3-sqlite` failing alone; each now implies its
+      # prerequisite, and `ci_feature_matrix.py check` fails if that drops.
+      - name: cargo check (features alone — `ci_feature_matrix.py alone`)
+        run: |
+          for f in $(python3 scripts/ci_feature_matrix.py alone); do
+            echo "::group::--features $f (alone)"
+            cargo check --no-default-features --features "$f" --lib
+            echo "::endgroup::"
+          done
+
       # No save here — the linux-x86_64-test `core` leg is the single saver for
       # the shared linux-x86_64 key (#311), so this restore-only job can't race
       # it on GHCR.
@@ -2213,12 +2225,15 @@ jobs:
           VERSION=$(grep '^version = ' Cargo.toml | head -1 | cut -d'"' -f2)
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "ciris-persist version: $VERSION"
-      - name: install ciris-build-sign v2.1.5 (prebuilt from CIRISVerify release)
+      - name: install ciris-build-sign v20.1.0 (prebuilt from CIRISVerify release)
         # v53.2.0 (#1029) — the sign/register logic lives once, in
         # scripts/build_manifest.sh, shared with reregister-manifests.yml.
         # History of these steps (v0.9.2 #42 multi-target, v1.1.2 tool v2.1.5,
         # v1.6.0 retries, #809/#926 preflight gate) is in that script's header
-        # and in git log.
+        # and in git log. v54.0.0 (#992): tool v20.1.0 (TOOL_VERSION in the
+        # script), which refuses to sign a wheel whose own Version or platform
+        # tag is not the one claimed (CIRISVerify#307); `sign` refuses any
+        # other binary on PATH.
         env:
           GH_TOKEN: ${{ github.token }}
         run: scripts/build_manifest.sh install
@@ -2285,6 +2300,8 @@ jobs:
         # (`binary_hash = sha256(wheel)`). v53.2.0 (#1028/#1029): exactly ONE
         # `ciris_persist-<v>-*.whl` per target, and scripts/bits_changed.sh
         # checks 1-4 pass before each sign — v53.1.8 signed a v29.0.0 wheel.
+        # v54.0.0 (#992): then ciris-build-sign v20.1.0 itself refuses a wheel
+        # whose dist-info Version / platform tag disagrees (CIRISVerify#307).
         env:
           CIRIS_BUILD_ED25519_SECRET: ${{ secrets.CIRIS_BUILD_ED25519_SECRET }}
           CIRIS_BUILD_MLDSA_SECRET: ${{ secrets.CIRIS_BUILD_MLDSA_SECRET }}

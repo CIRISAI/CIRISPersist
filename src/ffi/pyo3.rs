@@ -18550,6 +18550,45 @@ impl PyEngine {
         })
     }
 
+    /// v54.0.0 (CIRISPersist#996, CIRISEdge#814 item 2) — how many outbound
+    /// rows sit in each status, as `{status_wire_str: count}` (statuses with
+    /// no row omitted). The resident depth is the sum over `pending`,
+    /// `sending` and `awaiting_ack`.
+    fn outbound_counts<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<pyo3::Bound<'py, pyo3::types::PyDict>> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let counts = py
+                .detach(move || match &self.backend {
+                    #[cfg(feature = "postgres")]
+                    BackendDispatch::Postgres(pg) => {
+                        let backend = pg.clone();
+                        runtime.block_on(async move {
+                            use crate::outbound::OutboundQueue;
+                            backend.outbound_counts().await
+                        })
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => {
+                        let backend = sq.clone();
+                        runtime.block_on(async move {
+                            use crate::outbound::OutboundQueue;
+                            backend.outbound_counts().await
+                        })
+                    }
+                })
+                .map_err(outbound_err_to_py)?;
+            let d = pyo3::types::PyDict::new(py);
+            for (status, n) in counts {
+                d.set_item(status.as_str(), n)?;
+            }
+            Ok(d)
+        })
+    }
+
     /// v0.4.0 — List outbound rows with optional filters. Returns
     /// a list of dicts. All filter parameters are optional;
     /// combine with AND.
@@ -26218,6 +26257,104 @@ impl PyEngine {
                 crate::federation::ReachabilityVerdict::BeyondDepthCap => "beyond_depth_cap",
             };
             Ok(token.to_owned())
+        })
+    }
+
+    /// v54.0.0 (CIRISPersist#1035 item 3) — the live licensure status SET for
+    /// `(subject_key_id, authority_id)` now, as wire tokens (`"issued"`,
+    /// `"probation"`, …, sorted). A licence issued by a `license`-scoped
+    /// delegate counts when its chain was live at the row's signed
+    /// `asserted_at`; `revoked` absorbs; an empty list means no live statement
+    /// from that authority, never `lapsed`.
+    fn licensure_status_set(
+        &self,
+        py: Python<'_>,
+        subject_key_id: &str,
+        authority_id: &str,
+    ) -> PyResult<Vec<String>> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let subject_key_id = subject_key_id.to_owned();
+            let authority_id = authority_id.to_owned();
+            py.detach(move || {
+                let now = chrono::Utc::now();
+                let set = match &self.backend {
+                    #[cfg(feature = "postgres")]
+                    BackendDispatch::Postgres(pg) => {
+                        let backend = pg.clone();
+                        runtime.block_on(async move {
+                            crate::federation::licensure::status_set_for(
+                                &*backend,
+                                &subject_key_id,
+                                &authority_id,
+                                now,
+                            )
+                            .await
+                            .map_err(federation_err_to_py)
+                        })?
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => {
+                        let backend = sq.clone();
+                        runtime.block_on(async move {
+                            crate::federation::licensure::status_set_for(
+                                &*backend,
+                                &subject_key_id,
+                                &authority_id,
+                                now,
+                            )
+                            .await
+                            .map_err(federation_err_to_py)
+                        })?
+                    }
+                };
+                Ok(set.into_iter().map(|s| s.as_str().to_owned()).collect())
+            })
+        })
+    }
+
+    /// v54.0.0 (CIRISPersist#1035 item 3) — every licence issued under
+    /// `authority_id` (the `licensure:{authority_id}` rows the fold's own
+    /// verdict accepts: the authority's, or a `license`-scoped delegate's
+    /// judged at the row's signed `asserted_at`), newest first. Returns a JSON
+    /// array of [`crate::federation::Attestation`]; testimony is not listed.
+    fn licences_issued_under_json(&self, py: Python<'_>, authority_id: &str) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let authority_id = authority_id.to_owned();
+            py.detach(move || {
+                let rows: Vec<crate::federation::Attestation> = match &self.backend {
+                    #[cfg(feature = "postgres")]
+                    BackendDispatch::Postgres(pg) => {
+                        let backend = pg.clone();
+                        runtime.block_on(async move {
+                            crate::federation::admission::licences_issued_under(
+                                &*backend,
+                                &authority_id,
+                            )
+                            .await
+                            .map_err(federation_err_to_py)
+                        })?
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => {
+                        let backend = sq.clone();
+                        runtime.block_on(async move {
+                            crate::federation::admission::licences_issued_under(
+                                &*backend,
+                                &authority_id,
+                            )
+                            .await
+                            .map_err(federation_err_to_py)
+                        })?
+                    }
+                };
+                serde_json::to_string(&rows).map_err(|e| {
+                    PyValueError::new_err(format!("licences_issued_under serialize: {e}"))
+                })
+            })
         })
     }
 
@@ -34388,6 +34525,18 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         // node-role key is caller-side authorization failure; ValueError
         // (4xx). "Infrastructure must not have agency."
         crate::federation::Error::NodeAgencyForbidden { .. } => PyValueError::new_err(kind),
+        // v54.0.0 (CIRISPersist#1031, CC 4.1.1) — a cycle-closing
+        // `delegates_to` joins the node-agency arm it sits beside on the
+        // put door: a caller-side delegation refusal, ValueError (4xx).
+        crate::federation::Error::DelegationCycle { .. } => PyValueError::new_err(kind),
+        // v54.0.0 (CIRISPersist#1034, CC 4.4.3.2.8) — an affiliation addressed
+        // as a community (or the reverse), and a malformed or invalid
+        // affiliation record: caller-side refusals of a group write, the
+        // `ConsensusProtocolMalformed` family's type. ValueError (4xx).
+        crate::federation::Error::AffiliationCohortMismatch { .. } => PyValueError::new_err(kind),
+        crate::federation::Error::AffiliationConfigInvalid { rule, .. } => {
+            PyValueError::new_err(format!("{kind}: {rule}"))
+        }
         // v12.6.0 (CIRISConstitution#23, CC 1.13.3.3 / CC 3.2) — a rejected
         // second-owner binding (single-owner gate) is a caller-side conflict,
         // and an ambiguous-owner read is a fail-closed state rejection; both are

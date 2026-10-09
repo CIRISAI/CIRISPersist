@@ -891,6 +891,14 @@ mod engine_bodies {
     where
         B: BlobStorage + FederationDirectory + Sync,
     {
+        infra_room_of(l, run, tag, &l.alice).await
+    }
+
+    /// [`infra_room`] founded by `founder` (its only member).
+    async fn infra_room_of<B>(l: &Ladder<B>, run: &str, tag: &str, founder: &str) -> String
+    where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
         use crate::federation::tier_ingest::test_support as ts;
         use crate::federation::types::{identity_type, Community, CommunityMember};
         let room = format!("em-infra-{tag}-{run}");
@@ -903,7 +911,7 @@ mod engine_bodies {
             community_key_id: room.clone(),
             community_name: "infra".into(),
             members: vec![CommunityMember {
-                key_id: l.alice.clone(),
+                key_id: founder.to_owned(),
                 joined_at: joined,
                 role: Some("founder".into()),
             }],
@@ -912,7 +920,7 @@ mod engine_bodies {
             policy_blob: Some(serde_json::json!({ "cohort_subkind": "infrastructure" })),
             persist_row_hash: String::new(),
         };
-        ba.put_community(ts::sign_community(&l.alice, c))
+        ba.put_community(ts::sign_community(founder, c))
             .await
             .unwrap_or_else(|e| panic!("the infrastructure room {room}: {e}"));
         room
@@ -1056,6 +1064,327 @@ mod engine_bodies {
         assert!(
             !matches!(d.audience, DeficitAudience::Unresolvable),
             "I526 the audience resolves from the row's group: {d:?}"
+        );
+    }
+
+    /// **I579** (v54.0.0, #995 row 4, Codex on #987) — **shared plaintext
+    /// keeps every room.** The same bytes written into infrastructure rooms A
+    /// and B are one content-addressed row whose provenance columns name A
+    /// (`ON CONFLICT DO NOTHING`). Through v53 a custody report naming B was
+    /// refused `custody_ack_malformed`. Now both rooms are associations: a
+    /// report naming B is accepted and names B, a room that never wrote the
+    /// bytes is still malformed, and the durability audience covers B.
+    pub(crate) async fn i579_shared_plaintext_keeps_every_room<B>(
+        dsn_a: &str,
+        dsn_b: &str,
+        run: &str,
+        pick: Pick<B>,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync + 'static,
+    {
+        use crate::federation::durability::{content_audience, ContentAudience, DeficitAudience};
+        use crate::federation::replication_audience_invariants::bodies as ra;
+        let l = ladder(dsn_a, dsn_b, run, pick).await;
+        let e = &l.engine_a;
+        let ba = l.ba.as_ref();
+        let room_a = infra_room(&l, run, "i579a").await;
+        let room_b = infra_room(&l, run, "i579b").await;
+        let stranger = format!("em-comm-s-{run}");
+        ra::room(ba as &dyn FederationDirectory, &stranger, &[&l.alice]).await;
+        let bytes = format!("i579 shared plaintext {run}").into_bytes();
+        let pa = e
+            .put_blob_scoped(COMMUNITY, Some(&room_a), &bytes, None, None)
+            .await
+            .unwrap();
+        let pb = e
+            .put_blob_scoped(COMMUNITY, Some(&room_b), &bytes, None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            pa.at_rest_sha256, pb.at_rest_sha256,
+            "I579 one content address"
+        );
+        let sha = pa.at_rest_sha256;
+        assert_eq!(
+            ba.blob_provenance(&sha)
+                .await
+                .unwrap()
+                .unwrap()
+                .group_key_id
+                .as_deref(),
+            Some(room_a.as_str()),
+            "I579 precondition: the row's columns name the first writer"
+        );
+        let mut want = vec![
+            (COMMUNITY.to_owned(), Some(room_a.clone())),
+            (COMMUNITY.to_owned(), Some(room_b.clone())),
+        ];
+        want.sort();
+        assert_eq!(
+            ba.blob_associations(&sha).await.unwrap(),
+            want,
+            "I579 both rooms are associations"
+        );
+        let id = e
+            .put_custody_ack(&sha, CustodyState::Here, None, Some(&room_b), None)
+            .await
+            .unwrap_or_else(|e| panic!("I579 a report naming room B is accepted: {e}"));
+        assert_eq!(
+            stored(ba, &id)
+                .await
+                .attestation_envelope
+                .get("community_id")
+                .and_then(|v| v.as_str()),
+            Some(room_b.as_str()),
+            "I579 the envelope names room B"
+        );
+        let r = e
+            .put_custody_ack(&sha, CustodyState::Here, None, Some(&stranger), None)
+            .await;
+        assert!(
+            r.as_ref()
+                .is_err_and(|e| e.to_string().contains("custody_ack_malformed")),
+            "I579 a room that never wrote the bytes is malformed: {r:?}"
+        );
+        let d = e.durability_deficit(&sha, &l.node_a, None).await.unwrap();
+        // Room B's own audience is contained in the blob's.
+        match content_audience(
+            ba as &dyn FederationDirectory,
+            COMMUNITY,
+            None,
+            Some(&room_b),
+        )
+        .await
+        .unwrap()
+        {
+            ContentAudience::Everyone => assert_eq!(
+                d.audience,
+                DeficitAudience::Everyone,
+                "I579 room B reaches everyone, so the blob does"
+            ),
+            ContentAudience::Nodes(b_nodes) => {
+                let DeficitAudience::Nodes(nodes) = &d.audience else {
+                    panic!("I579 the audience resolves to nodes: {d:?}");
+                };
+                assert!(
+                    b_nodes.iter().all(|n| nodes.contains(n)),
+                    "I579 the durability audience covers room B: {nodes:?} vs {b_nodes:?}"
+                );
+            }
+            ContentAudience::Unresolvable => panic!("I579 room B's audience resolves"),
+        }
+    }
+
+    /// **I605** (v54.0.0, Codex round 2 on PR #1050) — **durability reaches
+    /// every room shared plaintext was written into.** Plaintext is written
+    /// only into the commons or an authorized infrastructure room, and both
+    /// reach everyone; but a room's infrastructure standing is a property of
+    /// its record, and a supersession can drop it. Its plaintext rows stay,
+    /// and from then on the room reaches its members' nodes. Here room A's
+    /// only member occurs through node A and room B's through node B; the
+    /// same bytes are written into both while both are infrastructure, then
+    /// both records are superseded without the label. The row's provenance
+    /// names room A, and the audience was resolved from it alone, so node B
+    /// (only in room B) was never a target and never missing while room B
+    /// held no copy. Now the audience is the union over the associations.
+    pub(crate) async fn i605_durability_reaches_every_plaintext_room<B>(
+        dsn_a: &str,
+        dsn_b: &str,
+        run: &str,
+        pick: Pick<B>,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync + 'static,
+    {
+        use crate::federation::durability::{content_audience, ContentAudience, DeficitAudience};
+        use crate::federation::tier_ingest::test_support as ts;
+        let l = ladder(dsn_a, dsn_b, run, pick).await;
+        let e = &l.engine_a;
+        let ba = l.ba.as_ref();
+        let bob = format!("em-bob-{run}");
+        let room_a = infra_room_of(&l, run, "i605a", &l.alice).await;
+        let room_b = infra_room_of(&l, run, "i605b", &bob).await;
+        let bytes = format!("i605 shared plaintext {run}").into_bytes();
+        let pa = e
+            .put_blob_scoped(COMMUNITY, Some(&room_a), &bytes, None, None)
+            .await
+            .unwrap();
+        let pb = e
+            .put_blob_scoped(COMMUNITY, Some(&room_b), &bytes, None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            pa.at_rest_sha256, pb.at_rest_sha256,
+            "I605 one content address"
+        );
+        let sha = pa.at_rest_sha256;
+        assert_eq!(
+            ba.blob_provenance(&sha)
+                .await
+                .unwrap()
+                .unwrap()
+                .group_key_id
+                .as_deref(),
+            Some(room_a.as_str()),
+            "I605 precondition: the row's columns name room A only"
+        );
+        // Both rooms lose their infrastructure standing: each founder
+        // supersedes its record without the label.
+        for (room, founder) in [(&room_a, &l.alice), (&room_b, &bob)] {
+            let held = ba.lookup_community(room).await.unwrap().expect("held");
+            let mut next = held.clone();
+            next.policy_blob = None;
+            next.prev_head_digest = held.persist_row_hash.clone();
+            next.persist_row_hash = String::new();
+            ba.supersede_community(ts::sign_community(founder, next), None)
+                .await
+                .unwrap_or_else(|e| panic!("I605 {founder} supersedes {room}: {e}"));
+        }
+        // The premise: the two rooms now reach DIFFERENT nodes.
+        for (room, has, lacks) in [
+            (&room_a, &l.node_a, &l.node_b),
+            (&room_b, &l.node_b, &l.node_a),
+        ] {
+            match content_audience(ba as &dyn FederationDirectory, COMMUNITY, None, Some(room))
+                .await
+                .unwrap()
+            {
+                ContentAudience::Nodes(n) => assert!(
+                    n.contains(has) && !n.contains(lacks),
+                    "I605 premise: room {room} reaches {has} and not {lacks}: {n:?}"
+                ),
+                other => panic!("I605 premise: room {room} resolves to nodes: {other:?}"),
+            }
+        }
+        let d = e.durability_deficit(&sha, &l.node_a, None).await.unwrap();
+        let DeficitAudience::Nodes(nodes) = &d.audience else {
+            panic!("I605 the audience resolves to nodes: {d:?}");
+        };
+        assert!(
+            nodes.contains(&l.node_a) && nodes.contains(&l.node_b),
+            "I605 the audience is both rooms' nodes: {nodes:?}"
+        );
+        assert!(
+            d.missing.contains(&l.node_b),
+            "I605 node B (room B only) holds no copy and is missing: {d:?}"
+        );
+    }
+
+    /// **I607** (v54.0.0, Codex round 3 on PR #1050) — **each association is
+    /// resolved with its own principal.** A `self` association records the
+    /// owner its write named (V177: the group of a `self` write is the owner
+    /// identity). The fold resolved EVERY association with the row's
+    /// `author_key_id`, the first content-addressed writer's, so a second
+    /// owner's `self` room resolved to the first owner's nodes: the second
+    /// owner's node was never a target and never missing. Alice occurs
+    /// through node A and bob through node B; the association set names a
+    /// `self` room for each, and the row's author is node A.
+    ///
+    /// The storage floor refuses plaintext at `self`, so no door writes this
+    /// association set today: the witness drives the fold over the shape the
+    /// V184 table can hold, not a door.
+    pub(crate) async fn i607_each_association_resolves_its_own_principal<B>(
+        dsn_a: &str,
+        dsn_b: &str,
+        run: &str,
+        pick: Pick<B>,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync + 'static,
+    {
+        use crate::federation::durability::{
+            associations_audience, content_audience, ContentAudience,
+        };
+        let l = ladder(dsn_a, dsn_b, run, pick).await;
+        let ba = l.ba.as_ref() as &dyn FederationDirectory;
+        let bob = format!("em-bob-{run}");
+        // The premise: each owner's own `self` room reaches its own node.
+        for (owner, has, lacks) in [
+            (&l.alice, &l.node_a, &l.node_b),
+            (&bob, &l.node_b, &l.node_a),
+        ] {
+            match content_audience(ba, SELF, Some(owner), None).await.unwrap() {
+                ContentAudience::Nodes(n) => assert!(
+                    n.contains(has) && !n.contains(lacks),
+                    "I607 premise: {owner}'s self room reaches {has} and not {lacks}: {n:?}"
+                ),
+                other => panic!("I607 premise: {owner}'s self room resolves to nodes: {other:?}"),
+            }
+        }
+        let associations = vec![
+            (SELF.to_owned(), Some(l.alice.clone())),
+            (SELF.to_owned(), Some(bob.clone())),
+        ];
+        match associations_audience(ba, &associations, Some(&l.node_a))
+            .await
+            .unwrap()
+        {
+            ContentAudience::Nodes(n) => assert!(
+                n.contains(&l.node_a) && n.contains(&l.node_b),
+                "I607 the audience is both owners' nodes, not the first writer's alone: {n:?}"
+            ),
+            other => panic!("I607 the audience resolves to nodes: {other:?}"),
+        }
+        // An association that names no owner falls back to the row's author.
+        match associations_audience(ba, &[(SELF.to_owned(), None)], Some(&l.node_a))
+            .await
+            .unwrap()
+        {
+            ContentAudience::Nodes(n) => assert!(
+                n.contains(&l.node_a) && !n.contains(&l.node_b),
+                "I607 an association naming no owner resolves through the author: {n:?}"
+            ),
+            other => panic!("I607 the author's self room resolves to nodes: {other:?}"),
+        }
+    }
+
+    /// **I611** (v54.0.0, Codex round 3 on PR #1050) — **a plaintext row and
+    /// its V184 association are one write.** `store_blob_local` inserted the
+    /// row and then, as a second autocommitted statement, its association.
+    /// A failure between the two (here an injected fault at exactly that
+    /// point, `store_blob_local_association`) left a durable row whose room
+    /// was never recorded. Now both statements are one transaction: the
+    /// failed write leaves neither, and the retried write stores both.
+    pub(crate) async fn i611_a_local_plaintext_store_is_one_write<B>(
+        b: &B,
+        arm: impl FnOnce(),
+        run: &str,
+    ) where
+        B: BlobStorage,
+    {
+        use crate::federation::types::cohort_scope::{CryptoTier, FEDERATION};
+        use sha2::Digest as _;
+        let bytes = format!("i611 local plaintext {run}").into_bytes();
+        let sha: [u8; 32] = sha2::Sha256::digest(&bytes).into();
+        let store = || {
+            b.store_blob_local(
+                &sha,
+                crate::federation::BlobBody::Inline(bytes.clone()),
+                None,
+                FEDERATION,
+                crate::federation::StorageFloor::resolved(CryptoTier::Plaintext),
+                None,
+                None,
+            )
+        };
+        arm();
+        let r = store().await;
+        assert!(
+            matches!(&r, Err(BlobError::Backend(m)) if m.contains("injected fault")),
+            "I611 the association statement fails: {r:?}"
+        );
+        assert!(
+            !b.has_blob(&sha).await.unwrap(),
+            "I611 a write whose association failed leaves no row behind"
+        );
+        assert!(
+            b.blob_associations(&sha).await.unwrap().is_empty(),
+            "I611 and no association"
+        );
+        store().await.expect("I611 the retried write");
+        assert!(b.has_blob(&sha).await.unwrap(), "I611 the row is stored");
+        assert_eq!(
+            b.blob_associations(&sha).await.unwrap(),
+            vec![(FEDERATION.to_owned(), None)],
+            "I611 with its association"
         );
     }
 
@@ -1223,6 +1552,30 @@ mod runners {
     #[cfg(feature = "sqlite")]
     sqlite_engine_case!(i526_sqlite, i526_a_plaintext_room_write_carries_the_group);
     #[cfg(feature = "sqlite")]
+    sqlite_engine_case!(i579_sqlite, i579_shared_plaintext_keeps_every_room);
+    #[cfg(feature = "sqlite")]
+    sqlite_engine_case!(i605_sqlite, i605_durability_reaches_every_plaintext_room);
+    #[cfg(feature = "sqlite")]
+    sqlite_engine_case!(
+        i607_sqlite,
+        i607_each_association_resolves_its_own_principal
+    );
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn i611_sqlite() {
+        use crate::store::Backend as _;
+        let b = crate::store::sqlite::SqliteBackend::open_in_memory()
+            .await
+            .unwrap();
+        b.run_migrations().await.unwrap();
+        super::engine_bodies::i611_a_local_plaintext_store_is_one_write(
+            &b,
+            || b.test_hooks().fail_next("store_blob_local_association", 1),
+            &suffix(),
+        )
+        .await;
+    }
+    #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn i514_sqlite() {
         super::engine_bodies::i514_the_custody_door_knows_its_node(
@@ -1269,6 +1622,33 @@ mod runners {
     postgres_engine_case!(i525_postgres, i525_the_target_arm_reads_every_room_shape);
     #[cfg(feature = "postgres")]
     postgres_engine_case!(i526_postgres, i526_a_plaintext_room_write_carries_the_group);
+    #[cfg(feature = "postgres")]
+    postgres_engine_case!(i579_postgres, i579_shared_plaintext_keeps_every_room);
+    #[cfg(feature = "postgres")]
+    postgres_engine_case!(i605_postgres, i605_durability_reaches_every_plaintext_room);
+    #[cfg(feature = "postgres")]
+    postgres_engine_case!(
+        i607_postgres,
+        i607_each_association_resolves_its_own_principal
+    );
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn i611_postgres() {
+        use crate::store::Backend as _;
+        let Some(dsn) = crate::test_pg::empty_dsn() else {
+            return;
+        };
+        let b = crate::store::postgres::PostgresBackend::connect(&dsn)
+            .await
+            .unwrap();
+        b.run_migrations().await.unwrap();
+        super::engine_bodies::i611_a_local_plaintext_store_is_one_write(
+            &b,
+            || b.test_hooks().fail_next("store_blob_local_association", 1),
+            &suffix(),
+        )
+        .await;
+    }
     #[cfg(feature = "postgres")]
     #[tokio::test]
     async fn i514_postgres() {

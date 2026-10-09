@@ -267,6 +267,9 @@ pub enum OutboundQueueOp {
         /// The abandoned row to reset to `pending`.
         queue_id: QueueId,
     },
+    /// v54.0.0 (CIRISPersist#996) — [`OutboundQueue::outbound_counts`].
+    /// APPENDED.
+    OutboundCounts {},
 }
 
 /// The mirror of each [`OutboundQueueOp`]'s return, plus the flattened
@@ -299,6 +302,8 @@ pub enum OutboundQueueOpResult {
     MaybeRow(Option<OutboundRow>),
     /// `sweep_ack_timeouts`, `sweep_ttl_expired`, `sweep_expired_claims`.
     Count(i64),
+    /// v54.0.0 (CIRISPersist#996) — `outbound_counts`. APPENDED.
+    Counts(std::collections::HashMap<crate::outbound::OutboundStatus, u64>),
 }
 
 /// Run one [`OutboundQueueOp`] against a concrete backend `q` and wrap
@@ -436,6 +441,10 @@ async fn run_outbound_op<Q: OutboundQueue>(q: &Q, op: OutboundQueueOp) -> Outbou
                 Err(e) => OutboundQueueOpResult::Err(e.to_string()),
             }
         }
+        OutboundQueueOp::OutboundCounts {} => match q.outbound_counts().await {
+            Ok(m) => OutboundQueueOpResult::Counts(m),
+            Err(e) => OutboundQueueOpResult::Err(e.to_string()),
+        },
     }
 }
 
@@ -855,6 +864,43 @@ mod tests {
         let base = v as *const _ as usize;
         let version_field = &v.abi_version as *const _ as usize;
         assert_eq!(version_field, base, "abi_version must be at offset 0");
+    }
+
+    /// v54.0.0 (#996) — I577b: the appended `OutboundCounts` op crosses the
+    /// capsule and answers what the backend answers.
+    #[test]
+    fn i577b_outbound_counts_crosses_the_capsule() {
+        let rt = test_runtime();
+        let dispatch = rt.block_on(sqlite_dispatch());
+        let handle = build_persist_outbound_queue(dispatch.clone());
+        let now = chrono::Utc::now();
+        for i in 0..2u8 {
+            let op = OutboundQueueOp::EnqueueOutbound {
+                sender_key_id: "sender-1".into(),
+                destination_key_id: "dest-1".into(),
+                message_type: "AttestationGossip".into(),
+                edge_schema_version: "1.0.0".into(),
+                envelope_bytes: vec![i; 4],
+                body_sha256: [i + 1; 32],
+                body_size_bytes: 4,
+                requires_ack: false,
+                ack_timeout_seconds: None,
+                max_attempts: 3,
+                ttl_seconds: 3600,
+                initial_next_attempt_after: now,
+            };
+            assert!(matches!(
+                run_op(&rt, &handle, &op),
+                OutboundQueueOpResult::Enqueued(_)
+            ));
+        }
+        match run_op(&rt, &handle, &OutboundQueueOp::OutboundCounts {}) {
+            OutboundQueueOpResult::Counts(m) => {
+                assert_eq!(m.len(), 1, "I577b: only the status that has rows: {m:?}");
+                assert_eq!(m.get(&crate::outbound::OutboundStatus::Pending), Some(&2));
+            }
+            other => panic!("I577b: expected Counts, got {other:?}"),
+        }
     }
 
     #[test]

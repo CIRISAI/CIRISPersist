@@ -968,7 +968,9 @@ pub mod test_support {
             serde_json::json!({
                 "id": uuid::Uuid::new_v4().to_string(),
                 "dimension": PROPOSAL_DIMENSION,
-                "group_kind": scope,
+                // v54.0.0 (#1034) — the production mapping (`affiliations`
+                // is a room: `community`), not the raw scope.
+                "group_kind": super::group_kind_for_scope(scope).unwrap_or("community"),
                 target_key(scope): group,
                 "role": role,
             }),
@@ -989,7 +991,9 @@ pub mod test_support {
             serde_json::json!({
                 "id": uuid::Uuid::new_v4().to_string(),
                 "dimension": ACCEPTANCE_DIMENSION,
-                "group_kind": scope,
+                // v54.0.0 (#1034) — the production mapping (`affiliations`
+                // is a room: `community`), not the raw scope.
+                "group_kind": super::group_kind_for_scope(&scope).unwrap_or("community"),
                 target_key(&scope): p.attestation_envelope.get(target_key(&scope)).cloned(),
                 "references_attestation_id": p.attestation_id,
                 "proposal_hash": p.original_content_hash,
@@ -1158,10 +1162,13 @@ pub mod test_support {
             member: crate::federation::RosterMember,
             spec: &crate::federation::cohort::AdmitSpec,
         ) -> Result<bool, Error> {
-            let scope = if cohort == crate::federation::Cohort::Family {
-                cohort_scope::FAMILY
-            } else {
-                cohort_scope::COMMUNITY
+            // v54.0.0 (#1034) — an affiliation's proposal is placed at
+            // `affiliations`: the write-scope gate reads the record's
+            // declared cohort.
+            let scope = match cohort {
+                crate::federation::Cohort::Family => cohort_scope::FAMILY,
+                crate::federation::Cohort::Affiliations => cohort_scope::AFFILIATIONS,
+                _ => cohort_scope::COMMUNITY,
             };
             report(
                 consent(

@@ -27,6 +27,22 @@
 //! - **I486** — a DAG with no relation (from before V176) behaves as before:
 //!   its chunks read Unbound and serve.
 //! - **I487** — a re-promote by a viewer relates such a DAG (the backfill).
+//! - **I576** (v54.0.0, #994) — the boot/operator sweep relates every
+//!   pre-V176 DAG this node can open, exactly its chunks; a DAG whose stream
+//!   moved is skipped, never mis-linked; a DAG sealed under a viewer's
+//!   associated data is skipped as unopenable; the pass is idempotent.
+//! - **I600** (v54.0.0, Codex on PR #1050) — the sweep RESUMES: with a cap
+//!   of three and three unopenable manifests sorting first, a linkable DAG
+//!   after them is linked within two passes (each pass starts after where the
+//!   last capped one stopped, V185, and wraps); a later full pass examines
+//!   the skipped ones again.
+//! - **I598** (v54.0.0, Codex on PR #1050; postgres) — an append that commits
+//!   between the backfill's comparison and its link is NOT linked: the link
+//!   writes exactly the rows it compared, never a re-read of the stream. A
+//!   test pause holds the backfill after the comparison while a second row
+//!   commits to the stream; the manifest then relates exactly its own chunks.
+//!   SQLite reads and links inside one writer closure, so nothing can commit
+//!   between the two there.
 
 #[cfg(test)]
 pub(crate) mod bodies {
@@ -46,17 +62,24 @@ pub(crate) mod bodies {
     /// `test_dag_link`).
     pub(crate) trait LinkSeam {
         async fn dag_link(&self, manifest: &[u8; 32], add: Option<(u64, [u8; 32], &str)>);
+        async fn drop_stream_row(&self, stream_id: &str, seq: u64);
     }
     #[cfg(feature = "sqlite")]
     impl LinkSeam for crate::store::sqlite::SqliteBackend {
         async fn dag_link(&self, manifest: &[u8; 32], add: Option<(u64, [u8; 32], &str)>) {
             self.test_dag_link(manifest, add).await
         }
+        async fn drop_stream_row(&self, stream_id: &str, seq: u64) {
+            self.test_drop_stream_chunk_row(stream_id, seq).await
+        }
     }
     #[cfg(feature = "postgres")]
     impl LinkSeam for crate::store::postgres::PostgresBackend {
         async fn dag_link(&self, manifest: &[u8; 32], add: Option<(u64, [u8; 32], &str)>) {
             self.test_dag_link(manifest, add).await
+        }
+        async fn drop_stream_row(&self, stream_id: &str, seq: u64) {
+            self.test_drop_stream_chunk_row(stream_id, seq).await
         }
     }
 
@@ -543,6 +566,310 @@ pub(crate) mod bodies {
             );
         }
     }
+
+    /// **I576** (v54.0.0, #994, for CIRISEdge#771) — **the V176 backfill
+    /// sweep.** A seals three DAGs and B adopts and promotes the first; every
+    /// relation is then dropped (the pre-V176 shape). On A one stream loses a
+    /// row (it no longer holds exactly its manifest's chunks) and one DAG was
+    /// sealed under a viewer's associated data. A's sweep relates exactly the
+    /// first DAG's chunks, skips the moved stream and the unopenable one, and
+    /// a second pass relates nothing new. B's sweep relates the DAG it adopted,
+    /// opened with its own grant.
+    pub(crate) async fn i576_the_backfill_sweep<B>(
+        dsn_a: &str,
+        dsn_b: &str,
+        run: &str,
+        pick: Pick<B>,
+    ) where
+        B: BlobStorage + FederationDirectory + LinkSeam + Sync + 'static,
+    {
+        let p = pair(dsn_a, dsn_b, run, pick, "i576").await;
+        let (s1, s2, s3) = (
+            format!("i576-1-{run}"),
+            format!("i576-2-{run}"),
+            format!("i576-3-{run}"),
+        );
+        let good = write_and_seal(&p, &s1, 3).await;
+        let moved = write_and_seal(&p, &s2, 2).await;
+        for i in 0..2 {
+            p.a.put_blob_chunk_scoped(
+                cohort_scope::SELF,
+                Some(&p.owner),
+                &s3,
+                i,
+                &segment(i as usize),
+                0,
+                None,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("chunk {i}: {e}"));
+        }
+        let aad: &[u8] = b"i576-viewer-context";
+        let sealed_with_aad =
+            p.a.seal_stream_scoped(cohort_scope::SELF, Some(&p.owner), &s3, None, Some(aad))
+                .await
+                .unwrap_or_else(|e| panic!("seal {s3}: {e}"))
+                .manifest_sha256;
+        let want_a = p.a.chunks_of_manifest(&good).await.unwrap();
+        assert_eq!(
+            want_a.len(),
+            4,
+            "I576 precondition: three chunks and a terminator"
+        );
+        let on_b = deliver(&p, &s1, &good).await;
+        for m in [&good, &moved, &sealed_with_aad] {
+            p.sa.dag_link(m, None).await;
+        }
+        p.sb.dag_link(&good, None).await;
+        p.sa.drop_stream_row(&s2, 0).await;
+        assert!(p.a.chunks_of_manifest(&good).await.unwrap().is_empty());
+
+        let r =
+            p.a.backfill_dag_chunk_links(1_000)
+                .await
+                .expect("A's sweep");
+        assert_eq!(
+            (
+                r.scanned,
+                r.linked,
+                r.skipped_stream_mismatch,
+                r.skipped_no_key,
+                r.truncated
+            ),
+            (3, 1, 1, 1, false),
+            "I576 A: one linked, the moved stream skipped, the AAD-sealed DAG unopenable: {r:?}"
+        );
+        assert_eq!(
+            p.a.chunks_of_manifest(&good).await.unwrap(),
+            want_a,
+            "I576 A: exactly the manifest's chunks, terminator included"
+        );
+        assert!(
+            p.a.chunks_of_manifest(&moved).await.unwrap().is_empty(),
+            "I576 A: a moved stream is never mis-linked"
+        );
+        assert!(p
+            .a
+            .chunks_of_manifest(&sealed_with_aad)
+            .await
+            .unwrap()
+            .is_empty());
+        for (_, c) in &want_a {
+            assert!(p.a.dag_contains_chunk(&good, c).await.unwrap());
+        }
+        let again = p.a.backfill_dag_chunk_links(1_000).await.unwrap();
+        assert_eq!(
+            (again.scanned, again.linked),
+            (2, 0),
+            "I576 A: idempotent; the skipped two are examined again, nothing new linked"
+        );
+        let capped = p.a.backfill_dag_chunk_links(1).await.unwrap();
+        assert!(
+            capped.truncated && capped.scanned == 1,
+            "I576 the cap: {capped:?}"
+        );
+
+        let rb =
+            p.b.backfill_dag_chunk_links(1_000)
+                .await
+                .expect("B's sweep");
+        assert_eq!((rb.scanned, rb.linked), (1, 1), "I576 B: {rb:?}");
+        assert_eq!(
+            p.b.chunks_of_manifest(&good).await.unwrap(),
+            on_b,
+            "I576 B: the adopted DAG gains exactly its chunks"
+        );
+    }
+
+    /// **I600** — see the module doc.
+    pub(crate) async fn i600_the_sweep_resumes_past_skipped_manifests<B>(
+        dsn_a: &str,
+        dsn_b: &str,
+        run: &str,
+        pick: Pick<B>,
+    ) where
+        B: BlobStorage + FederationDirectory + LinkSeam + Sync + 'static,
+    {
+        let p = pair(dsn_a, dsn_b, run, pick, "i600").await;
+        // Shas are uniform, so the order is arranged by selection. Every seal
+        // writes its relation; only the manifests this witness UNLINKS are
+        // visible to the sweep. First a linkable DAG in the upper half of the
+        // sha order (each candidate: 1/2); the others stay linked.
+        let mut good = None;
+        for t in 0..64 {
+            let m = write_and_seal(&p, &format!("i600-g{t}-{run}"), 2).await;
+            if m[0] >= 0x80 {
+                good = Some(m);
+                break;
+            }
+        }
+        let good = good.expect("I600 precondition: a DAG in the upper half of the sha order");
+        let want = p.a.chunks_of_manifest(&good).await.unwrap();
+        // Then three manifests A cannot open (sealed under a viewer's
+        // associated data) that sort BEFORE it (each: at least 1/2); one that
+        // sorts after keeps its relation.
+        let mut unopenable = Vec::new();
+        for n in 0..128usize {
+            if unopenable.len() == 3 {
+                break;
+            }
+            let stream = format!("i600-u{n}-{run}");
+            for i in 0..2u64 {
+                p.a.put_blob_chunk_scoped(
+                    cohort_scope::SELF,
+                    Some(&p.owner),
+                    &stream,
+                    i,
+                    &segment(n * 2 + i as usize),
+                    0,
+                    None,
+                )
+                .await
+                .unwrap_or_else(|e| panic!("chunk {i}: {e}"));
+            }
+            let m =
+                p.a.seal_stream_scoped(
+                    cohort_scope::SELF,
+                    Some(&p.owner),
+                    &stream,
+                    None,
+                    Some(b"i600-viewer-context".as_slice()),
+                )
+                .await
+                .unwrap_or_else(|e| panic!("seal {stream}: {e}"))
+                .manifest_sha256;
+            if m < good {
+                unopenable.push(m);
+            }
+        }
+        assert_eq!(
+            unopenable.len(),
+            3,
+            "I600 precondition: three sorting first"
+        );
+        // The pre-V176 shape: exactly these four have no relation.
+        for m in unopenable.iter().chain([&good]) {
+            p.sa.dag_link(m, None).await;
+        }
+
+        let first = p.a.backfill_dag_chunk_links(3).await.expect("pass 1");
+        assert_eq!(
+            (
+                first.scanned,
+                first.linked,
+                first.skipped_no_key,
+                first.truncated
+            ),
+            (3, 0, 3, true),
+            "I600 pass 1 spends its cap on the three unopenable manifests: {first:?}"
+        );
+        let second = p.a.backfill_dag_chunk_links(3).await.expect("pass 2");
+        assert_eq!(
+            p.a.chunks_of_manifest(&good).await.unwrap(),
+            want,
+            "I600 pass 2 resumes past the skipped prefix and links the DAG after it: {second:?}"
+        );
+        assert_eq!(second.linked, 1, "I600 pass 2: {second:?}");
+        // A full pass after the cycle completed starts over: the skipped
+        // manifests are examined again (they could become openable).
+        let third = p.a.backfill_dag_chunk_links(1_000).await.expect("pass 3");
+        assert_eq!(
+            (
+                third.scanned,
+                third.linked,
+                third.skipped_no_key,
+                third.truncated
+            ),
+            (3, 0, 3, false),
+            "I600 the skipped manifests are examined again: {third:?}"
+        );
+    }
+}
+
+/// I598 — see the module doc. Postgres only: it needs the backend's pause.
+#[cfg(all(test, feature = "postgres"))]
+pub(crate) mod i598 {
+    use crate::federation::epoch_minter_invariants::bodies::Pick;
+    use crate::federation::nested_manifest_invariants::bodies::pair;
+    use crate::federation::types::cohort_scope;
+    use crate::store::postgres::PostgresBackend;
+
+    pub(crate) async fn i598_an_append_after_the_comparison_is_not_linked(
+        dsn_a: &str,
+        dsn_b: &str,
+        run: &str,
+        pick: Pick<PostgresBackend>,
+    ) {
+        let p = pair(dsn_a, dsn_b, run, pick, "i598").await;
+        let stream = format!("i598-{run}");
+        for i in 0..3u64 {
+            p.a.put_blob_chunk_scoped(
+                cohort_scope::SELF,
+                Some(&p.owner),
+                &stream,
+                i,
+                &(0..48u8)
+                    .map(|j| j.wrapping_mul(i as u8 + 3))
+                    .collect::<Vec<_>>(),
+                0,
+                None,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("chunk {i}: {e}"));
+        }
+        let root =
+            p.a.seal_stream_scoped(cohort_scope::SELF, Some(&p.owner), &stream, None, None)
+                .await
+                .unwrap_or_else(|e| panic!("seal {stream}: {e}"))
+                .manifest_sha256;
+        let want = p.a.chunks_of_manifest(&root).await.unwrap();
+        assert_eq!(
+            want.len(),
+            4,
+            "I598 precondition: three chunks and a terminator"
+        );
+        let next_seq = want.last().map(|(s, _)| s + 1).unwrap();
+        p.sa.test_dag_link(&root, None).await;
+        assert!(p.a.chunks_of_manifest(&root).await.unwrap().is_empty());
+
+        let pause = p.sa.test_hooks().arm_pause("dag_link_before_insert");
+        let (report, ()) = tokio::join!(p.a.backfill_dag_chunk_links(1_000), async {
+            pause.reached().await;
+            // The backfill has compared the stream and holds its rows FOR
+            // SHARE; a NEW row is not one of them and commits now.
+            p.sa.test_append_stream_chunk_row(&stream, 0, next_seq)
+                .await;
+            pause.resume();
+        });
+        let report = report.expect("the sweep");
+        assert_eq!(
+            (report.scanned, report.linked),
+            (1, 1),
+            "I598 the manifest was compared before the append and is linked: {report:?}"
+        );
+        let linked = p.a.chunks_of_manifest(&root).await.unwrap();
+        assert!(
+            !linked.iter().any(|(s, _)| *s == next_seq),
+            "I598 the row appended after the comparison was LINKED to the manifest: {linked:?}"
+        );
+        assert_eq!(linked, want, "I598 exactly the manifest's own chunks");
+    }
+
+    #[tokio::test]
+    async fn postgres() {
+        let (Some(a), Some(b)) = (crate::test_pg::empty_dsn(), crate::test_pg::empty_dsn()) else {
+            eprintln!("i598 postgres: no base DSN — SKIPPED");
+            return;
+        };
+        i598_an_append_after_the_comparison_is_not_linked(
+            &a,
+            &b,
+            &uuid::Uuid::new_v4().simple().to_string()[..12],
+            (|e: &crate::Engine| e.postgres_backend().expect("postgres").clone()) as Pick<_>,
+        )
+        .await;
+        eprintln!("i598 postgres: RAN");
+    }
 }
 
 #[cfg(test)]
@@ -597,4 +924,25 @@ mod runners {
     pair_case!(i484, i484_a_shared_chunk_needs_both_withdrawn);
     pair_case!(i485, i485_a_forged_pointer_revives_nothing);
     pair_case!(i486_487, i486_487_an_unrelated_dag_and_the_backfill);
+    pair_case!(i576, i576_the_backfill_sweep);
+    pair_case!(i600, i600_the_sweep_resumes_past_skipped_manifests);
+
+    /// **I576b** — from disk: every Engine constructor that runs the boot
+    /// KeyGrant sweep also runs the V176 backfill (comments stripped).
+    #[test]
+    fn i576b_every_constructor_runs_the_backfill_at_boot() {
+        let src: String = include_str!("../engine.rs")
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let grants = src
+            .matches("engine.sweep_pending_key_grants_at_boot().await;")
+            .count();
+        let links = src
+            .matches("engine.sweep_dag_chunk_links_at_boot().await;")
+            .count();
+        assert!(grants >= 4, "I576b: the constructors were found ({grants})");
+        assert_eq!(links, grants, "I576b: a constructor skips the backfill");
+    }
 }

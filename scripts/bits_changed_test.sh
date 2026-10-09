@@ -229,8 +229,13 @@ reg_clear
 echo
 echo "build_manifest.sh witnesses (fake ciris-build-sign)"
 BM="$PWD/scripts/build_manifest.sh"
+# #992 — the fake answers `--version` with FAKE_SIGN_VERSION, which defaults to
+# the version build_manifest.sh pins: `sign` refuses any other binary on PATH.
+PINNED_SIGNER="$(sed -n 's/^TOOL_VERSION=v//p' scripts/build_manifest.sh)"
+[ -n "$PINNED_SIGNER" ] || { echo "no TOOL_VERSION in scripts/build_manifest.sh" >&2; exit 1; }
 cat >"$WORK/bin/ciris-build-sign" <<'SH'
 #!/usr/bin/env bash
+if [ "${1:-}" = --version ]; then echo "ciris-build-sign $FAKE_SIGN_VERSION"; exit 0; fi
 echo "$*" >>"$FAKE_SIGN_LOG"
 sub="$1"; shift
 if [ "$sub" = generate-keys ]; then mkdir -p "$2" && touch "$2/ed25519.seed" "$2/mldsa65.secret"; exit 0; fi
@@ -245,7 +250,7 @@ h=""
 printf '{"target":"%s","binary_version":"%s","binary_hash":"%s"}\n' "$t" "$v" "$h" >"$o"
 SH
 chmod +x "$WORK/bin/ciris-build-sign"
-export PATH="$WORK/bin:$PATH" FAKE_SIGN_LOG="$WORK/sign.log"
+export PATH="$WORK/bin:$PATH" FAKE_SIGN_LOG="$WORK/sign.log" FAKE_SIGN_VERSION="$PINNED_SIGNER"
 export CIRIS_BUILD_ED25519_SECRET=eA== CIRIS_BUILD_MLDSA_SECRET=eA== BITS_CHANGED_PREV="$PREV"
 WH="$WORK/wheels"
 declare -A LP=([linux-x86_64]=manylinux_2_34_x86_64 [linux-aarch64]=manylinux_2_34_aarch64 [darwin-aarch64]=macosx_11_0_arm64 [windows-x86_64]=win_amd64)
@@ -260,6 +265,24 @@ n=$((n + 1))
 if [ "$(hash_in "$WORK/o1/manifest-aarch64-unknown-linux-gnu.json")" = "$AARCH_SHA" ] && [ "$(wc -l <"$WORK/o1/signed-binary-targets.txt")" -eq 4 ] && [ -s "$WORK/o1/manifest-python-source-tree.json" ]; then
   echo "  ok    bm: aarch64 manifest signs the $V wheel, 4 targets listed"
 else echo "  FAIL  bm: aarch64 manifest hash $(hash_in "$WORK/o1/manifest-aarch64-unknown-linux-gnu.json") != $AARCH_SHA, or targets/source tree missing"; fails=$((fails + 1)); fi
+
+# #992 — every wheel reaches the signer as the .whl itself (`--binary <wheel>`),
+# which is what engages ciris-build-sign's own Version / platform-tag refusal
+# (CIRISVerify#307); a `--binary-hash` sign would skip it.
+n=$((n + 1))
+wheel_signs="$(grep -c -- '--binary [^ ]*\.whl ' "$FAKE_SIGN_LOG" || true)"
+if [ "$wheel_signs" -eq 4 ] && ! grep -q -- '--binary-hash' "$FAKE_SIGN_LOG"; then
+  echo "  ok    bm: 4 wheels signed as --binary <.whl>, no --binary-hash"
+else echo "  FAIL  bm: $wheel_signs wheel signs by --binary <.whl> (want 4), or a --binary-hash sign"; fails=$((fails + 1)); fi
+
+# #992 — an older signer on PATH (no wheel-identity refusal) is refused before
+# anything is signed; so is no signer at all.
+: >"$FAKE_SIGN_LOG"
+expect "bm: an older signer is refused"    1 "reports '2.1.5', this script signs with v$PINNED_SIGNER" -- env FAKE_SIGN_VERSION=2.1.5 "$BM" sign --version "$V" --wheels "$WH" --out "$WORK/o0" --extras "$WORK/extras.json" --source-tree
+expect "bm: no signer output is refused"   1 "reports 'nothing'" -- env FAKE_SIGN_VERSION= "$BM" sign --version "$V" --wheels "$WH" --out "$WORK/o0b" --extras "$WORK/extras.json" --source-tree
+n=$((n + 1))
+if [ ! -s "$FAKE_SIGN_LOG" ]; then echo "  ok    bm: the refused runs signed nothing"
+else echo "  FAIL  bm: the refused runs reached the signer: $(head -1 "$FAKE_SIGN_LOG")"; fails=$((fails + 1)); fi
 
 # the gate runs before signing: a denylisted wheel is never signed
 printf '%s  29.0.0  x  t\n' "${AARCH_SHA#sha256:}" >"$WORK/deny-aarch.txt"

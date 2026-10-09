@@ -269,14 +269,19 @@ pub fn retain_window_breach_event_id(
     )
 }
 
-/// The retain-window breach observation (v44.8.0, #866 C1b): the subject's
-/// `retain:<window>` to this producer ended at `deadline` and the row is
-/// still held. Evidence, never a verdict — see [`breach_event`].
+/// The retain-window breach observation (v44.8.0, #866 C1b): the tightest
+/// `retain:<window>` to this producer for the subject ended at `deadline` and
+/// the row is still held. Evidence, never a verdict — see [`breach_event`].
+///
+/// v54.0.0 (#1015) — `governed_by` is the principal whose window it was: the
+/// subject itself, or a steward on a row naming the subject in `for_key_id`
+/// (detail member `retain_governed_by`).
 #[must_use]
 pub fn retain_window_breach_event(
     row: &Attestation,
     subject_key_id: &str,
     deadline: DateTime<Utc>,
+    governed_by: Option<&str>,
     now: DateTime<Utc>,
 ) -> HardCaseEvent {
     HardCaseEvent {
@@ -293,6 +298,7 @@ pub fn retain_window_breach_event(
             "dimension": super::admission::envelope_dimension(&row.attestation_envelope),
             "published_at": row.asserted_at.to_rfc3339(),
             "retain_until": deadline.to_rfc3339(),
+            "retain_governed_by": governed_by,
             "observed_at": now.to_rfc3339(),
         }),
         emitted_at: now,
@@ -376,9 +382,11 @@ pub async fn run_deletion_window_watch(
     /// windowed rows costs ONE `list_attestations_by`, not one per row.
     type RetractionCache = HashMap<String, HashSet<String>>;
     let mut retracted: RetractionCache = HashMap::new();
-    // v44.8.0 (#866 C1b) — (producer, subject) → the end of the subject's
-    // `retain:<window>` to that producer, if any. One fold per pair per pass.
-    let mut retain_until: HashMap<(String, String), Option<DateTime<Utc>>> = HashMap::new();
+    // v44.8.0 (#866 C1b) — (producer, subject) → the end of the tightest
+    // `retain:<window>` to that producer and whose window it is (v54.0.0,
+    // #1015: by principals). One fold per pair per pass.
+    type Bound = (Option<DateTime<Utc>>, Option<String>);
+    let mut retain_until: HashMap<(String, String), Bound> = HashMap::new();
     let mut seen: HashSet<String> = HashSet::new();
     // v36.0.0 (CIRISPersist#668) — the cursor is the `(position, id)` PAIR,
     // so a page boundary landing inside a group of rows sharing one instant
@@ -420,18 +428,16 @@ pub async fn run_deletion_window_watch(
                 }
                 let key = (producer.clone(), subject.clone());
                 if !retain_until.contains_key(&key) {
-                    let stance = dir
-                        .resolve_scoped_stance(
-                            producer,
-                            subject,
-                            super::types::transmission_principle::RETAIN,
-                            None,
-                            now,
-                        )
-                        .await?;
-                    retain_until.insert(key.clone(), stance.retain_until);
+                    // v54.0.0 (#1015) — by principals: a steward's tighter
+                    // window naming the subject bounds the subject's own.
+                    let bound = super::consent_by_humans::retain_bound_by_principals(
+                        dir, producer, subject, now,
+                    )
+                    .await?;
+                    retain_until
+                        .insert(key.clone(), (bound.stance.retain_until, bound.governed_by));
                 }
-                let Some(Some(deadline)) = retain_until.get(&key).copied() else {
+                let Some((Some(deadline), governed_by)) = retain_until.get(&key).cloned() else {
                     continue;
                 };
                 if deadline > now {
@@ -445,8 +451,14 @@ pub async fn run_deletion_window_watch(
                     .get(producer)
                     .is_some_and(|ids| ids.contains(&row.attestation_id));
                 if still_present {
-                    dir.record_hard_case(retain_window_breach_event(row, subject, deadline, now))
-                        .await?;
+                    dir.record_hard_case(retain_window_breach_event(
+                        row,
+                        subject,
+                        deadline,
+                        governed_by.as_deref(),
+                        now,
+                    ))
+                    .await?;
                     report.retain_window_breaches += 1;
                 }
             }

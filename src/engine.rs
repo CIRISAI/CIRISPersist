@@ -1068,6 +1068,7 @@ impl Engine {
         // to this node's key HERE, before any read; a survivor is boot-fatal.
         engine.resolve_minter_sentinels_at_boot().await?;
         engine.sweep_pending_key_grants_at_boot().await;
+        engine.sweep_dag_chunk_links_at_boot().await;
         // v31.0.0 (CIRISPersist#650) — the in-place v31 migration. Here rather
         // than in `Backend::run_migrations` because a re-stamp is a re-SIGN and
         // `Backend` has no signer; this is the first point at which the backend
@@ -1153,6 +1154,7 @@ impl Engine {
         // node with V145 sentinels would have served a minter of nobody.
         engine.resolve_minter_sentinels_at_boot().await?;
         engine.sweep_pending_key_grants_at_boot().await;
+        engine.sweep_dag_chunk_links_at_boot().await;
         // v31.0.0 (CIRISPersist#650) — same hook as `with_signer`. A
         // pre-genesis node usually has nothing to migrate (no identity ⇒ no
         // authorship), and the routine returns early in that case; but a node
@@ -1222,6 +1224,7 @@ impl Engine {
         }
         engine.resolve_minter_sentinels_at_boot().await?;
         engine.sweep_pending_key_grants_at_boot().await;
+        engine.sweep_dag_chunk_links_at_boot().await;
         Ok(engine)
     }
 
@@ -1294,6 +1297,7 @@ impl Engine {
         }
         engine.resolve_minter_sentinels_at_boot().await?;
         engine.sweep_pending_key_grants_at_boot().await;
+        engine.sweep_dag_chunk_links_at_boot().await;
         Ok(engine)
     }
 
@@ -2544,42 +2548,30 @@ impl Engine {
         is_rare: bool,
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<u64, crate::store::Error> {
-        use crate::federation::FederationDirectory;
-        let consent = {
-            let r = match &self.backend {
-                #[cfg(feature = "postgres")]
-                BackendDispatch::Postgres(b) => {
-                    b.resolve_consent_state(target_key_id, subject_key_id, now)
-                        .await
-                }
-                #[cfg(feature = "sqlite")]
-                BackendDispatch::Sqlite(b) => {
-                    b.resolve_consent_state(target_key_id, subject_key_id, now)
-                        .await
-                }
-            };
-            r.map_err(|e| crate::store::Error::Backend(format!("resolve_consent_state: {e}")))?
-        };
-        // v44.8.0 (CIRISPersist#866 C1b) — and the subject's `retain` stance
-        // WITH its bound: a `retain:<window>` that has passed is a withdrawal
-        // the subject signed in advance, and evicts like one.
-        let retain = {
-            self.federation_directory()
-                .resolve_scoped_stance(
-                    target_key_id,
-                    subject_key_id,
-                    crate::federation::types::transmission_principle::RETAIN,
-                    None,
-                    now,
-                )
-                .await
-                .map_err(|e| crate::store::Error::Backend(format!("resolve_scoped_stance: {e}")))?
-        };
-        // N5: the FROZEN verify-core verdict decides. Withdrawn/revoked →
-        // HardDelete regardless of rarity (revocation overrides rarity).
-        let action =
-            crate::fountain::retention_action_with_retain_window(consent, &retain, now, is_rare);
+        // v54.0.0 (CIRISPersist#1015) — the subject's all-scope stance and
+        // the `retain` bound BY PRINCIPALS: a steward's shorter window naming
+        // the subject is binding. A lapsed window is a withdrawal signed in
+        // advance and evicts like one; N5 (the FROZEN verify-core verdict)
+        // decides, revocation overriding rarity.
+        let (action, bound) = crate::fountain::retention::consent_retention_verdict(
+            self.federation_directory().as_ref(),
+            target_key_id,
+            subject_key_id,
+            is_rare,
+            now,
+        )
+        .await
+        .map_err(|e| crate::store::Error::Backend(format!("consent_retention_verdict: {e}")))?;
         if action.is_hard_delete() {
+            tracing::info!(
+                content_id,
+                corpus_kind,
+                holder = target_key_id,
+                subject = subject_key_id,
+                retain_until = ?bound.stance.retain_until,
+                retain_governed_by = ?bound.governed_by,
+                "evict_fountain_content_by_consent: hard delete"
+            );
             self.evict_fountain_content_hard_delete(content_id, corpus_kind)
                 .await
         } else {
@@ -3411,12 +3403,11 @@ impl Engine {
                 reason: KeyRefusalReason::RecordAbsent,
             }),
             ReplicatedKeyPlan::Refused { reason } => Ok(RebindOutcome::Refused { reason }),
-            ReplicatedKeyPlan::Upgrade | ReplicatedKeyPlan::Supersede => {
-                Err(crate::federation::Error::InvalidArgument(
-                    "rebind_key_record: a self-signed record planned an anchor-scrub transition"
-                        .into(),
-                ))
-            }
+            ReplicatedKeyPlan::Upgrade
+            | ReplicatedKeyPlan::Supersede
+            | ReplicatedKeyPlan::RehydrateScrubs => Err(crate::federation::Error::InvalidArgument(
+                "rebind_key_record: a self-signed record planned an anchor-scrub transition".into(),
+            )),
         }
     }
 
@@ -5863,6 +5854,38 @@ impl Engine {
         }
     }
 
+    /// v54.0.0 (CIRISPersist#994, for CIRISEdge#771) — **backfill the V176
+    /// chunk relation** of the `chunk_dag` manifests sealed or promoted before
+    /// v53.1.0, opened as THIS node (its derived key) — see
+    /// [`backfill_dag_chunk_links`](crate::federation::chunk_dag_cascade::orchestrate::backfill_dag_chunk_links).
+    /// Runs once at boot; callable again by an operator. A manifest this node
+    /// cannot open, or whose stream moved, stays link-less and is counted.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn backfill_dag_chunk_links(
+        &self,
+        max_manifests: u32,
+    ) -> Result<
+        crate::federation::chunk_dag_cascade::orchestrate::DagLinkBackfillReport,
+        crate::federation::BlobError,
+    > {
+        use crate::federation::chunk_dag_cascade::orchestrate::backfill_dag_chunk_links;
+        let me = self.local_derived_key_id().await.map_err(|e| {
+            crate::federation::BlobError::Backend(format!(
+                "backfill_dag_chunk_links: this node's key: {e}"
+            ))
+        })?;
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(arc) => {
+                backfill_dag_chunk_links(arc.as_ref(), &me, max_manifests).await
+            }
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(arc) => {
+                backfill_dag_chunk_links(arc.as_ref(), &me, max_manifests).await
+            }
+        }
+    }
+
     /// v51.3.0 (CIRISPersist#947, `BLOB_REPLICATION.md` §6.5) — **the sealed
     /// DAG adopt's second half.** [`adopt_sealed_blob`](Self::adopt_sealed_blob)
     /// stores a received sealed manifest as an inline envelope (it never opens
@@ -6664,6 +6687,34 @@ impl Engine {
     /// (Self::emit_pending_key_grants): best effort, logged, never an abort —
     /// a node that cannot emit right now must still boot, and every write
     /// door retries the dirty axis on its own path.
+    /// v54.0.0 (CIRISPersist#994) — the boot leg of
+    /// [`Self::backfill_dag_chunk_links`]: best effort, logged, never an
+    /// abort, capped per boot.
+    async fn sweep_dag_chunk_links_at_boot(&self) {
+        /// Manifests opened per boot. A node with more legacy DAGs finishes
+        /// over later boots or an operator call: each pass resumes where the
+        /// last capped one stopped (V185) and wraps, so a skipped manifest is
+        /// re-examined in its turn and never holds the rest back.
+        #[cfg(any(feature = "postgres", feature = "sqlite"))]
+        const BOOT_CAP: u32 = 10_000;
+        #[cfg(any(feature = "postgres", feature = "sqlite"))]
+        match self.backfill_dag_chunk_links(BOOT_CAP).await {
+            Ok(r) if r.scanned == 0 => {}
+            Ok(r) => tracing::info!(
+                scanned = r.scanned,
+                linked = r.linked,
+                skipped_no_key = r.skipped_no_key,
+                skipped_stream_mismatch = r.skipped_stream_mismatch,
+                truncated = r.truncated,
+                "V176 chunk relation backfilled at boot (#994)"
+            ),
+            Err(e) => tracing::warn!(
+                error = %e,
+                "V176 chunk relation backfill could not run at boot; it retries next boot (#994)"
+            ),
+        }
+    }
+
     async fn sweep_pending_key_grants_at_boot(&self) {
         #[cfg(any(feature = "postgres", feature = "sqlite"))]
         match self.emit_pending_key_grants().await {
@@ -9194,6 +9245,48 @@ impl Engine {
             target_key_id,
             scope,
             max_depth,
+        )
+        .await
+    }
+
+    /// v54.0.0 (CIRISPersist#1035 item 3) — the live licensure status SET
+    /// for `(subject_key_id, authority_id)` at `now`: the fold of every
+    /// `licensure:{authority_id}` row the authority (or a `license`-scoped
+    /// delegate, judged at the row's signed `asserted_at`) issued about the
+    /// subject. `revoked` absorbs; the empty set means "no live statement",
+    /// never `lapsed`. See
+    /// [`licensure::status_set_for`](crate::federation::licensure::status_set_for).
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn licensure_status_set(
+        &self,
+        subject_key_id: &str,
+        authority_id: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<
+        std::collections::BTreeSet<crate::federation::licensure::LicensureStatus>,
+        crate::federation::Error,
+    > {
+        crate::federation::licensure::status_set_for(
+            self.federation_directory().as_ref(),
+            subject_key_id,
+            authority_id,
+            now,
+        )
+        .await
+    }
+
+    /// v54.0.0 (CIRISPersist#1035 item 3) — every licence issued under
+    /// `authority_id`, newest first: the rows the fold's own verdict accepts.
+    /// See
+    /// [`admission::licences_issued_under`](crate::federation::admission::licences_issued_under).
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn licences_issued_under(
+        &self,
+        authority_id: &str,
+    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
+        crate::federation::admission::licences_issued_under(
+            self.federation_directory().as_ref(),
+            authority_id,
         )
         .await
     }
@@ -16383,7 +16476,8 @@ mod tests {
         // group than an unmoderated one"), and a USER key is steward-bound.
         let human = "human-39f";
         ts::register_identity_key(&*sq, human, crate::federation::types::identity_type::USER).await;
-        crate::ceg::list::drive_query_invariants::bodies::seed_room_signed(
+        // v54.0.0 (#1034) — the room is a declared affiliation.
+        crate::ceg::list::drive_query_invariants::bodies::seed_affiliation_signed(
             &*sq,
             room,
             &[(&node, "node-39f"), (human, human)],

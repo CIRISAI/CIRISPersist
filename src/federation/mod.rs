@@ -40,6 +40,9 @@ pub mod accord_recovery;
 pub mod accord_roster;
 pub mod admission;
 pub mod adopt_cascade;
+/// v54.0.0 (CIRISPersist#1034, CC 4.4.3.2.8) — the declared affiliation
+/// cohort and its typed config record.
+pub mod affiliation_config;
 pub mod age;
 pub mod at_rest_cascade;
 /// v36.0.0 (CIRISPersist#624) — the typed, pre-write replicated
@@ -96,7 +99,11 @@ pub mod consent_by_humans_invariants;
 // v53.1.8 (#1013) — I548: the capacity gate and a scorer's precheck ask one fold.
 #[cfg(test)]
 mod capacity_consent_invariants;
+// v54.0.0 (#1015) — I570: a steward's shorter `retain` window naming the machine bounds both
+// retention sweeps.
 pub mod consent_expiry;
+#[cfg(test)]
+mod retain_by_principals_invariants;
 // CIRISPersist#866/#867 (`FSD/CONTEXTUAL_INTEGRITY_ENVELOPE.md`) — I104–I111: the scope
 // token grammar, the retain bound, the transfer principle, the expiry record.
 #[cfg(any(test, feature = "test-anchor"))]
@@ -168,6 +175,10 @@ pub mod group_amendment_invariants;
 /// v52.0.0 (CIRISPersist#672) — I230–I235: the held-record settle.
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod held_settle_invariants;
+/// v54.0.0 (CIRISPersist#1032, #1035) — the licensure chain, judged at the
+/// licence's signed instant by ONE function the gate and the fold share.
+#[cfg(test)]
+pub mod licensure_chain_invariants;
 /// v49.0.0 (CIRISPersist#912) — I183: the membership listing plane.
 #[cfg(test)]
 pub mod listing_invariants;
@@ -190,6 +201,18 @@ pub(crate) mod nested_manifest_invariants;
 #[cfg(test)]
 mod retraction_invariants;
 // v53.0.0 (CIRISPersist#969) — I310–I319: one DEK per (stream, epoch).
+/// v54.0.0 (CIRISPersist#1034, CC 4.4.3.2.8) — affiliations: the declared
+/// cohort and the typed config record (I592–I594).
+#[cfg(test)]
+pub mod affiliation_invariants;
+/// v54.0.0 (CIRISPersist#1031, CC 4.1.1) — the cycle-closing `delegates_to`
+/// is refused at admission (I590).
+#[cfg(test)]
+pub mod delegation_cycle_invariants;
+/// v54.0.0 (CIRISPersist#1033, CC 2.4.1.2.1) — the `grant` scope admits its
+/// holder (I591).
+#[cfg(test)]
+pub mod grant_scope_invariants;
 /// CIRISPersist#972 — I335–I339, a node is seated without an acceptance.
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod node_seat_invariants;
@@ -4894,16 +4917,23 @@ pub trait FederationDirectory: Send + Sync {
             .any(|w| {
                 w.member_key_id == widening.member_key_id && w.effective_at == widening.effective_at
             });
-        if !already {
-            // Already active at that instant with the same role: the row
-            // would not move the fold.
-            let active = authorized_family_roster_at(self, &record, widening.effective_at).await?;
-            if active
-                .iter()
-                .any(|m| m.key_id == widening.member_key_id && m.role == widening.role)
-            {
-                return Ok(false);
-            }
+        // v54.0.0 (CIRISPersist#990) — the family twin of #936: an IDENTICAL
+        // widening already on the plane IS the idempotent no-op, answered
+        // `false` without a row and without verifying the caller's spec. v49
+        // moved the family onto the widening plane and routed the exact retry
+        // through the put door, which refused an unsigned retry
+        // `tier_unverified` while the community arm (#936) answered `false`.
+        if already {
+            return Ok(false);
+        }
+        // Already active at that instant with the same role: the row would
+        // not move the fold.
+        let active = authorized_family_roster_at(self, &record, widening.effective_at).await?;
+        if active
+            .iter()
+            .any(|m| m.key_id == widening.member_key_id && m.role == widening.role)
+        {
+            return Ok(false);
         }
         self.put_family_membership_widening(SignedFamilyMembershipWidening {
             family_membership_widening: widening,
@@ -4913,7 +4943,7 @@ pub trait FederationDirectory: Send + Sync {
             cosignatures: spec.cosignatures.clone(),
         })
         .await?;
-        Ok(!already)
+        Ok(true)
     }
 
     /// v3.12.0 — fetch a single family by `family_key_id`. Returns
@@ -6309,12 +6339,18 @@ pub trait FederationDirectory: Send + Sync {
                 .map(cohort::RosterMember::from)
                 .collect(),
             // CC 4.4.3.2.8 / #308: `affiliations` shares the community roster.
-            cohort::Cohort::Community | cohort::Cohort::Affiliations => self
-                .active_community_members(group_key_id)
-                .await?
-                .into_iter()
-                .map(cohort::RosterMember::from)
-                .collect(),
+            // v54.0.0 (Codex round 2 on PR #1050) — but a held record is ONE of
+            // the two (CIRISPersist#1034): read under the other cohort, it is
+            // refused `federation_affiliation_cohort_mismatch`, never answered
+            // with the other variant's roster.
+            cohort::Cohort::Community | cohort::Cohort::Affiliations => {
+                affiliation_config::check_group_cohort(self, cohort, group_key_id).await?;
+                self.active_community_members(group_key_id)
+                    .await?
+                    .into_iter()
+                    .map(cohort::RosterMember::from)
+                    .collect()
+            }
             cohort::Cohort::SelfId => self
                 .list_identity_occurrences_active(group_key_id)
                 .await?
@@ -6437,10 +6473,20 @@ pub trait FederationDirectory: Send + Sync {
                 .await?
                 .map(cohort::GroupRef::from),
             // CC 4.4.3.2.8 / #308: `affiliations` resolves via the community row.
-            cohort::Cohort::Community | cohort::Cohort::Affiliations => self
-                .lookup_community(group_key_id)
-                .await?
-                .map(cohort::GroupRef::from),
+            // v54.0.0 (Codex round 2 on PR #1050) — the held record must declare
+            // `cohort`, and the reference reports the cohort it declares.
+            cohort::Cohort::Community | cohort::Cohort::Affiliations => {
+                match self.lookup_community(group_key_id).await? {
+                    Some(c) => {
+                        affiliation_config::check_record_is(&c, cohort)?;
+                        Some(cohort::GroupRef {
+                            cohort,
+                            ..cohort::GroupRef::from(c)
+                        })
+                    }
+                    None => None,
+                }
+            }
             cohort::Cohort::SelfId => {
                 self.lookup_public_key(group_key_id)
                     .await?
@@ -6473,12 +6519,24 @@ pub trait FederationDirectory: Send + Sync {
                 .map(cohort::GroupRef::from)
                 .collect(),
             // CC 4.4.3.2.8 / #308: `affiliations` shares the community reverse lookup.
-            cohort::Cohort::Community | cohort::Cohort::Affiliations => self
-                .list_communities_for_member_active(member_key_id)
-                .await?
-                .into_iter()
-                .map(cohort::GroupRef::from)
-                .collect(),
+            // v54.0.0 (Codex round 2 on PR #1050) — filtered to the records that
+            // DECLARE `cohort`, each reported under it. A record whose declared
+            // cohort does not parse is a refusal, not a silent omission.
+            cohort::Cohort::Community | cohort::Cohort::Affiliations => {
+                let mut out = Vec::new();
+                for c in self
+                    .list_communities_for_member_active(member_key_id)
+                    .await?
+                {
+                    if affiliation_config::declared_cohort(&c)? == cohort {
+                        out.push(cohort::GroupRef {
+                            cohort,
+                            ..cohort::GroupRef::from(c)
+                        });
+                    }
+                }
+                out
+            }
             cohort::Cohort::SelfId => self
                 .lookup_identity_for_occurrence(member_key_id)
                 .await?
@@ -6517,6 +6575,8 @@ pub trait FederationDirectory: Send + Sync {
         member: cohort::RosterMember,
         spec: &cohort::AdmitSpec,
     ) -> Result<bool, Error> {
+        // v54.0.0 (CIRISPersist#1034) — the held record is this cohort.
+        affiliation_config::check_group_cohort(self, cohort, group_key_id).await?;
         let member_key_id = member.key_id.clone();
         let (added, change_kind) = match cohort {
             cohort::Cohort::Family => (
@@ -6590,6 +6650,8 @@ pub trait FederationDirectory: Send + Sync {
         removed_key_id: &str,
         spec: cohort::RevokeSpec,
     ) -> Result<(), Error> {
+        // v54.0.0 (CIRISPersist#1034) — the held record is this cohort.
+        affiliation_config::check_group_cohort(self, cohort, group_key_id).await?;
         let now = chrono::Utc::now();
         let cohort::RevokeSpec {
             effective_at,
@@ -7595,7 +7657,20 @@ pub trait FederationDirectory: Send + Sync {
                         }
                         None => false,
                     },
-                    TargetPlane::Room => self.lookup_community(target).await?.is_some(),
+                    // v54.0.0 (CIRISPersist#1034, CC 4.4.3.2.8) — a row placed
+                    // at `affiliations` names an affiliation, a row placed at
+                    // `community` names a community: the record's declared
+                    // cohort, never the caller's spelling.
+                    TargetPlane::Room => match self.lookup_community(target).await? {
+                        Some(held) => {
+                            if let Ok(addressed) = cohort::Cohort::from_token(claimed_cohort_scope)
+                            {
+                                affiliation_config::check_record_is(&held, addressed)?;
+                            }
+                            true
+                        }
+                        None => false,
+                    },
                 };
                 if !held {
                     let reason = crate::scope::ScopeRefusalReason::MembershipUnresolved;
@@ -10676,6 +10751,64 @@ pub enum Error {
         offending_scopes: Vec<String>,
     },
 
+    /// v54.0.0 (CIRISPersist#1034, CC 4.4.3.2.8) — a door addressed a held
+    /// community-plane record under a cohort other than the one the record
+    /// declares (`policy_blob.cohort_scope`; absent = `community`), or a
+    /// supersession would change the declared cohort. Stable `kind()` token
+    /// `federation_affiliation_cohort_mismatch`. See
+    /// [`affiliation_config::check_group_cohort`].
+    #[error(
+        "group {group_key_id:?} is declared {declared:?} and was addressed as {addressed:?}: \
+         an affiliation and a community are different records (CC 4.4.3.2.8)"
+    )]
+    AffiliationCohortMismatch {
+        /// The record.
+        group_key_id: String,
+        /// The cohort the record declares.
+        declared: &'static str,
+        /// The cohort the door addressed it under.
+        addressed: &'static str,
+    },
+
+    /// v54.0.0 (CIRISPersist#1034, CC 4.4.3.2.8) — a community-plane record's
+    /// declared cohort or its affiliation config record is malformed or
+    /// invalid. `rule` is one of [`affiliation_config::rule`]. Stable `kind()`
+    /// token `federation_affiliation_config_invalid`.
+    #[error("group {group_key_id:?}: affiliation record refused ({rule}): {detail}")]
+    AffiliationConfigInvalid {
+        /// The record.
+        group_key_id: String,
+        /// The [`affiliation_config::rule`] that failed.
+        rule: &'static str,
+        /// What failed.
+        detail: String,
+    },
+
+    /// v54.0.0 (CIRISPersist#1031, CC 4.1.1 — the anti-pattern table's
+    /// "Cycles (A → B → A)" row: "Substrate MUST detect cycles on the
+    /// `delegates_to` graph and reject the cycle-closing emission"). A
+    /// `delegates_to(attesting → attested)` was REFUSED because `attested`
+    /// already reaches `attesting` through live `delegates_to` edges within the
+    /// absolute depth ceiling, so storing it would close a cycle between
+    /// distinct keys. A self-edge is the root charter's self-declaration and is
+    /// not refused. The row is not stored (verify-before-mutation, AV-9). Stable
+    /// `kind()` token `federation_delegation_cycle`. See
+    /// [`admission::check_delegation_cycle_admission`].
+    #[error(
+        "delegates_to {attesting_key_id:?} -> {attested_key_id:?} closes a delegation cycle: \
+         {attested_key_id:?} already reaches {attesting_key_id:?} through {hops} live \
+         delegates_to hop(s) (CC 4.1.1 — the cycle-closing emission is refused)"
+    )]
+    DelegationCycle {
+        /// The refused edge's granter (`attesting_key_id`).
+        attesting_key_id: String,
+        /// The refused edge's recipient (`attested_key_id`).
+        attested_key_id: String,
+        /// Length of the existing path `attested → … → attesting` that this
+        /// edge would close (at least 1).
+        hops: usize,
+    },
+
     /// v12.6.0 (CIRISConstitution#23, CC 1.13.3.3 / CC 3.2) — a **second,
     /// distinct-owner** node owner-binding was REJECTED: the node already
     /// carries a LIVE owner-binding from `incumbent_owner`, and a node has at
@@ -11541,6 +11674,9 @@ impl Error {
             Error::DelegatedScopeUnauthorized { .. } => "federation_delegated_scope_unauthorized",
             Error::NodeAgencyForbidden { .. } => "federation_node_agency_forbidden",
             Error::NodeAlreadyOwned { .. } => "federation_node_already_owned",
+            Error::DelegationCycle { .. } => "federation_delegation_cycle",
+            Error::AffiliationCohortMismatch { .. } => "federation_affiliation_cohort_mismatch",
+            Error::AffiliationConfigInvalid { .. } => "federation_affiliation_config_invalid",
             Error::AmbiguousNodeOwner { .. } => "federation_ambiguous_node_owner",
             Error::OwnershipReclaimRefused { .. } => "federation_ownership_reclaim_refused",
             Error::CanonicalRoleNotAccordConferred { .. } => "canonical_role_not_accord_conferred",

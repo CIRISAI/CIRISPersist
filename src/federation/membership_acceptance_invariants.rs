@@ -58,6 +58,32 @@ pub(crate) mod bodies {
         founders: &[&str],
         unsigned: &[&str],
     ) -> Result<(), Error> {
+        found_room(d, cid, protocol, founders, unsigned, None).await
+    }
+
+    /// v54.0.0 (CIRISPersist#1034) — [`found_community`] declaring itself an
+    /// affiliation (`policy_blob.cohort_scope`).
+    pub(crate) async fn found_affiliation<D: FederationDirectory + ?Sized>(
+        d: &D,
+        cid: &str,
+        protocol: &str,
+        founders: &[&str],
+        unsigned: &[&str],
+    ) -> Result<(), Error> {
+        let blob = serde_json::json!({
+            crate::federation::affiliation_config::POLICY_COHORT_FIELD: "affiliations"
+        });
+        found_room(d, cid, protocol, founders, unsigned, Some(blob)).await
+    }
+
+    async fn found_room<D: FederationDirectory + ?Sized>(
+        d: &D,
+        cid: &str,
+        protocol: &str,
+        founders: &[&str],
+        unsigned: &[&str],
+        policy_blob: Option<serde_json::Value>,
+    ) -> Result<(), Error> {
         let members = founders
             .iter()
             .map(|k| ((*k).to_owned(), Some("founder".to_owned())))
@@ -76,7 +102,7 @@ pub(crate) mod bodies {
             members,
             founded_at: ms(Utc::now() - Duration::days(1)),
             consensus_protocol: protocol.to_owned(),
-            policy_blob: None,
+            policy_blob,
             persist_row_hash: String::new(),
         };
         let env = c.signing_envelope();

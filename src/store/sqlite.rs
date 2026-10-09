@@ -166,6 +166,15 @@ pub struct SqliteBackend {
     scoring_factors_cache: std::sync::Arc<crate::ceg::aggregates::scoring::ScoringFactorsCache>,
     /// v50.0.0 (CIRISPersist#926) — this directory's trust-root standing cache.
     trust_root_standing_cache: crate::federation::canonical_community::StandingCache,
+    /// v54.0.0 (Codex on PR #1050) — the in-process half of the
+    /// `delegates_to` cycle-gate serialization
+    /// ([`crate::federation::admission::delegation_cycle_gated`]): held from
+    /// the cycle check through the insert of every gated write.
+    delegation_write_lock: tokio::sync::Mutex<()>,
+    /// v54.0.0 (Codex on PR #1050) — the per-record stripe a
+    /// `signed_wire_index` re-index holds from its read of the stored bytes
+    /// through the replacement ([`crate::store::record_locks`]).
+    wire_index_locks: crate::store::record_locks::RecordLocks,
     /// v50.0.0 (PR #921 review) — test-only hooks inside this backend's doors.
     #[cfg(test)]
     test_hooks: crate::store::test_hooks::TestHooks,
@@ -595,6 +604,21 @@ impl SqliteBackend {
         .expect("test_dag_link");
     }
 
+    /// v54.0.0 (#994) — TEST SEAM: drop one stream chunk row (a stream that
+    /// no longer holds exactly its manifest's chunks).
+    #[cfg(test)]
+    pub(crate) async fn test_drop_stream_chunk_row(&self, stream_id: &str, seq: u64) {
+        let stream = stream_id.to_owned();
+        self.write(move |conn| {
+            conn.execute(
+                "DELETE FROM federation_stream_chunks WHERE stream_id = ?1 AND seq = ?2",
+                rusqlite::params![stream, seq as i64],
+            )
+        })
+        .await
+        .expect("drop stream row");
+    }
+
     /// CIRISPersist#829 — the read pool, the way [`Self::conn_handle`] is the
     /// writer. A sibling view that should read through the pool is built
     /// with [`Self::from_handles`]; readers are shared, never re-opened per
@@ -772,6 +796,8 @@ impl SqliteBackend {
             repo_stats_cache: std::sync::Arc::new(crate::cache::Cache::new()),
             scoring_factors_cache: std::sync::Arc::new(crate::cache::Cache::new()),
             trust_root_standing_cache: Default::default(),
+            delegation_write_lock: tokio::sync::Mutex::new(()),
+            wire_index_locks: Default::default(),
             #[cfg(test)]
             test_hooks: Default::default(),
         }
@@ -3080,15 +3106,26 @@ impl SqliteBackend {
             })
     }
 
-    async fn index_stored_record(
+    pub(crate) async fn index_stored_record(
         &self,
         kind: &str,
         record_key_json: &str,
     ) -> Result<(), crate::federation::Error> {
         let indexed: Result<(), crate::federation::Error> = async {
+            // v54.0.0 (Codex on PR #1050) — the read of the stored bytes and the
+            // replacement are ONE step per record: a re-index whose read predates
+            // a newer write would otherwise prune the newer hash and write its
+            // stale one. The read runs on the read pool, outside the writer, so
+            // the single writer does not serialize the two; the record's stripe
+            // does. One process owns this store, so the stripe is the whole lock.
+            let _stripe = self.wire_index_locks.lock(kind, record_key_json).await;
             if let Some(content_hash) =
                 crate::federation::wire_index::entry_as_stored(self, kind, record_key_json).await?
             {
+                #[cfg(test)]
+                self.test_hooks()
+                    .pause_if_armed("wire_index_before_write")
+                    .await;
                 let kind = kind.to_owned();
                 let record_key_json = record_key_json.to_owned();
                 self.write(move |conn| {
@@ -3470,6 +3507,68 @@ impl SqliteBackend {
         Ok(AdoptScrubOutcome::Upgraded)
     }
 
+    /// v54.0.0 (CIRISPersist#995 row 2) — TEST SEAM: reproduce what a
+    /// pre-v53.1.4 UPDATE door left behind: `additional_scrubs` emptied while
+    /// `persist_row_hash` still binds the full record. Nothing else moves.
+    #[cfg(any(test, feature = "test-anchor"))]
+    pub async fn test_seam_drop_key_additional_scrubs(
+        &self,
+        key_id: &str,
+    ) -> Result<(), crate::federation::Error> {
+        let k = key_id.to_owned();
+        self.write(move |conn| {
+            conn.execute(
+                "UPDATE federation_keys SET additional_scrubs = '[]' WHERE key_id = ?1",
+                rusqlite::params![k],
+            )
+        })
+        .await
+        .map(|_| ())
+        .map_err(|e| crate::federation::Error::Backend(e.to_string()))
+    }
+
+    /// v54.0.0 (CIRISPersist#995 row 2) — write back the `additional_scrubs`
+    /// a pre-v53.1.4 UPDATE door dropped. The plan
+    /// (`ReplicatedKeyPlan::RehydrateScrubs`) has established that the held
+    /// row's `persist_row_hash` binds `record` exactly and that its column is
+    /// empty; the WHERE re-asserts both atomically, so nothing but the scrub
+    /// set moves (the hash already covers it). Moves the serve position and
+    /// re-indexes, like every door that rewrites consumer-visible bytes.
+    /// `Conflict` when the row changed between plan and act.
+    pub(crate) async fn rehydrate_dropped_key_scrubs(
+        &self,
+        record: &crate::federation::KeyRecord,
+    ) -> Result<(), crate::federation::Error> {
+        let kid = record.key_id.clone();
+        let hash = record.persist_row_hash.clone();
+        let text = serde_json::to_string(&record.additional_scrubs).map_err(|e| {
+            crate::federation::Error::Backend(format!("additional_scrubs serialize: {e}"))
+        })?;
+        let k = kid.clone();
+        let n = self
+            .write(move |conn| -> Result<usize, rusqlite::Error> {
+                let mutated_at = sqlite_next_key_serve_position(conn)?;
+                conn.execute(
+                    "UPDATE federation_keys SET additional_scrubs = ?3, mutated_at = ?4 \
+                     WHERE key_id = ?1 AND persist_row_hash = ?2 AND additional_scrubs = '[]'",
+                    rusqlite::params![k, hash, text, mutated_at.to_rfc3339()],
+                )
+            })
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!(
+                    "rehydrate_dropped_key_scrubs {kid}: {e}"
+                ))
+            })?;
+        if n == 0 {
+            return Err(crate::federation::Error::Conflict(format!(
+                "rehydrate_dropped_key_scrubs {kid}: row changed concurrently"
+            )));
+        }
+        self.index_stored_key_row(&kid).await?;
+        Ok(())
+    }
+
     /// v13.7.0 (CIRISPersist#405) — the CANONICAL SUPERSEDE store: replace an
     /// existing **anchor-scrubbed canonical** row IN PLACE with a strictly-newer,
     /// same-pubkey, m-of-n-re-verified re-scrubbed record (the CEG-native runtime
@@ -3694,6 +3793,16 @@ impl SqliteBackend {
         };
         match plan_replicated_key_apply(self, &record.record).await? {
             ReplicatedKeyPlan::Unchanged => Ok(ReplicatedKeyOutcome::Unchanged),
+            // v54.0.0 (#995 row 2) — write back the scrubs a pre-v53.1.4 door dropped.
+            ReplicatedKeyPlan::RehydrateScrubs => {
+                let mut r = record.record;
+                r.persist_row_hash = crate::federation::types::compute_persist_row_hash(&r)?;
+                match self.rehydrate_dropped_key_scrubs(&r).await {
+                    Ok(()) => Ok(ReplicatedKeyOutcome::ScrubsRehydrated),
+                    Err(crate::federation::Error::Conflict(_)) => Ok(RACED),
+                    Err(e) => Err(e),
+                }
+            }
             // The plan produced the reason at the branch that fired; carry it
             // through rather than re-deriving it here (#565).
             ReplicatedKeyPlan::Refused { reason } => Ok(ReplicatedKeyOutcome::Refused { reason }),
@@ -5293,6 +5402,11 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             // federation`. Backend-symmetric; verify-before-mutation.
             crate::federation::admission::check_minor_owner_binding_not_announced(self, &row).await?;
 
+            // v54.0.0 (CIRISPersist#1031, CC 4.1.1) — the cycle-closing `delegates_to`
+            // is refused: the recipient must not already reach the granter through live
+            // `delegates_to` edges. Backend-symmetric with memory + Postgres; verify-before-mutation.
+            crate::federation::admission::check_delegation_cycle_admission(self, &row).await?;
+
             // v12.6.0 (CIRISConstitution#23, CC 1.13.3.3 / CC 3.2) — the single-owner
             // gate: a node has AT MOST ONE responsible steward, so a second,
             // distinct-owner owner-binding `delegates_to(U → node)` is rejected. Runs
@@ -5482,6 +5596,23 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             // the offered one: identical is `AlreadyHeld`, differing is a typed
             // Conflict. `DO NOTHING` alone would silently accept a DIFFERENT row
             // under an occupied id, which is the opposite defect.
+            // v54.0.0 (Codex on PR #1050) — THE CYCLE CHECK AND THE INSERT ARE ONE
+            // STEP. The tier-4 check above read the graph unlocked; a concurrent
+            // writer of the reverse edge could have passed the same read since. Hold
+            // the delegation write lock from a re-check through the write, so every
+            // gated writer is serialized against it. One process owns this store, so
+            // the in-process lock is the whole serialization.
+            let _cycle_guard = if crate::federation::admission::delegation_cycle_gated(&row) {
+                let guard = self.delegation_write_lock.lock().await;
+                crate::federation::admission::check_delegation_cycle_admission(self, &row).await?;
+                #[cfg(test)]
+                self.test_hooks()
+                    .pause_if_armed("delegation_cycle_before_insert")
+                    .await;
+                Some(guard)
+            } else {
+                None
+            };
             let offered_hash_for_compare = row.persist_row_hash.clone();
             let id_for_compare = row.attestation_id.clone();
             let inserted = self.write(move |conn| -> Result<bool, rusqlite::Error> {
@@ -12902,6 +13033,14 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                 "federation_attestations row {attestation_id} does not exist"
             ))
         })?;
+        // v54.0.0 (Codex on PR #1050) — a crossing `delegates_to` adds an edge to
+        // the federation-tier graph the cycle gate reads: the plan's cycle check
+        // and the write below are one step under the delegation write lock.
+        let _cycle_guard = if crate::federation::admission::delegation_cycle_gated(&current) {
+            Some(self.delegation_write_lock.lock().await)
+        } else {
+            None
+        };
         let Some(crossing::EnterPlan { row, crossing }) =
             crossing::plan_enter_mesh(self, &current, ci, custody, self.self_key_id().as_deref())
                 .await?
@@ -12910,6 +13049,12 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                 attestation_id: attestation_id.to_owned(),
             });
         };
+        #[cfg(test)]
+        if _cycle_guard.is_some() {
+            self.test_hooks()
+                .pause_if_armed("delegation_cycle_before_crossing")
+                .await;
+        }
         let envelope_text = serde_json::to_string(&row.attestation_envelope)
             .map_err(|e| Error::Backend(format!("envelope serialize: {e}")))?;
         let och = hex::decode(&row.original_content_hash)
@@ -15155,6 +15300,13 @@ impl crate::federation::BlobStorage for SqliteBackend {
                         group,
                     ],
                 )?;
+                // v54.0.0 (#995 row 4, V184) — THIS write's room, whether or
+                // not the row above was new: shared plaintext keeps every room.
+                tx.execute(
+                    "INSERT INTO federation_blob_associations (sha256, cohort_scope, group_key_id) \
+                     VALUES (?1, ?2, COALESCE(?3, '')) ON CONFLICT DO NOTHING",
+                    rusqlite::params![sha_vec, scope, group],
+                )?;
             }
             // v36.0.0 (#668) — serve position (V130), inside the same
             // transaction as the write.
@@ -15341,8 +15493,21 @@ impl crate::federation::BlobStorage for SqliteBackend {
         // real wall-clock so a fresh blob matches its first_seen_at.
         let now_iso = chrono::Utc::now().to_rfc3339();
 
+        // v54.0.0 (Codex round 3 on PR #1050) — the row and its V184
+        // association are ONE transaction. `write` holds the connection lock,
+        // which serializes but does not make the two statements atomic: each
+        // autocommitted, and a failed association statement left the row with
+        // its room unrecorded (I611).
+        #[cfg(test)]
+        let inject_association_fault = self
+            .test_hooks()
+            .fail_if_armed("store_blob_local_association")
+            .is_err();
+        #[cfg(not(test))]
+        let inject_association_fault = false;
         self.write(move |conn| -> Result<(), rusqlite::Error> {
-            conn.execute(
+            let tx = conn.transaction()?;
+            tx.execute(
                 // #984 (V177) — the group the write named, on the row.
                 "INSERT INTO federation_blobs (\
                     sha256, storage_kind, bytes_inline, external_ref, size_bytes, media_type, \
@@ -15364,7 +15529,20 @@ impl crate::federation::BlobStorage for SqliteBackend {
                     group,
                 ],
             )?;
-            Ok(())
+            // v54.0.0 (#995 row 4, V184) — a plaintext row keeps every room.
+            if tier == crate::federation::types::cohort_scope::CryptoTier::Plaintext.as_str() {
+                if inject_association_fault {
+                    return Err(rusqlite::Error::InvalidParameterName(
+                        "store_blob_local association: injected fault".into(),
+                    ));
+                }
+                tx.execute(
+                    "INSERT INTO federation_blob_associations (sha256, cohort_scope, group_key_id) \
+                     VALUES (?1, ?2, COALESCE(?3, '')) ON CONFLICT DO NOTHING",
+                    rusqlite::params![sha_vec, scope, group],
+                )?;
+            }
+            tx.commit()
         })
         .await
         .map_err(|e| crate::federation::BlobError::Backend(format!("store_blob_local: {e}")))?;
@@ -18357,6 +18535,126 @@ impl crate::federation::BlobStorage for SqliteBackend {
             .collect()
     }
 
+    async fn list_unlinked_chunk_dags(
+        &self,
+        after: Option<[u8; 32]>,
+        limit: u32,
+    ) -> Result<Vec<[u8; 32]>, crate::federation::BlobError> {
+        let after = after.map(|a| a.to_vec()).unwrap_or_default();
+        let lim = i64::from(limit);
+        let rows: Vec<Vec<u8>> = self
+            .read(move |conn| -> Result<Vec<Vec<u8>>, rusqlite::Error> {
+                let mut stmt = conn.prepare(
+                    "SELECT b.sha256 FROM federation_blobs b \
+                      WHERE b.storage_kind = 'chunk_dag' AND b.sha256 > ?1 \
+                        AND NOT EXISTS (SELECT 1 FROM federation_dag_chunks d \
+                                         WHERE d.manifest_sha256 = b.sha256) \
+                      ORDER BY b.sha256 LIMIT ?2",
+                )?;
+                let it = stmt.query_map(rusqlite::params![after, lim], |r| r.get(0))?;
+                it.collect()
+            })
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!("list_unlinked_chunk_dags: {e}"))
+            })?;
+        rows.into_iter()
+            .map(|v| {
+                <[u8; 32]>::try_from(v.as_slice()).map_err(|_| {
+                    crate::federation::BlobError::Backend(
+                        "list_unlinked_chunk_dags: a 32-byte sha".into(),
+                    )
+                })
+            })
+            .collect()
+    }
+
+    async fn link_dag_chunks_if_exact(
+        &self,
+        manifest_sha: &[u8; 32],
+        stream_id: &str,
+        chunks: &[(u64, [u8; 32])],
+    ) -> Result<bool, crate::federation::BlobError> {
+        let manifest = manifest_sha.to_vec();
+        let stream = stream_id.to_owned();
+        let mut want: Vec<(i64, Vec<u8>)> = chunks
+            .iter()
+            .map(|(seq, sha)| (i64::try_from(*seq).unwrap_or(i64::MAX), sha.to_vec()))
+            .collect();
+        want.sort();
+        self.write(move |conn| -> Result<bool, rusqlite::Error> {
+            let tx = conn.transaction()?;
+            let held: Vec<(i64, Vec<u8>)> = {
+                let mut stmt = tx.prepare(
+                    "SELECT seq, chunk_sha FROM federation_stream_chunks \
+                      WHERE stream_id = ?1 ORDER BY seq",
+                )?;
+                let it =
+                    stmt.query_map(rusqlite::params![stream], |r| Ok((r.get(0)?, r.get(1)?)))?;
+                it.collect::<Result<_, _>>()?
+            };
+            if held.is_empty() || held != want {
+                return Ok(false);
+            }
+            sqlite_link_dag_chunks(&tx, &manifest, &stream)?;
+            tx.commit()?;
+            Ok(true)
+        })
+        .await
+        .map_err(|e| {
+            crate::federation::BlobError::Backend(format!("link_dag_chunks_if_exact: {e}"))
+        })
+    }
+
+    async fn dag_link_backfill_cursor(
+        &self,
+    ) -> Result<Option<[u8; 32]>, crate::federation::BlobError> {
+        let v: Option<Option<Vec<u8>>> = self
+            .read(|conn| -> Result<Option<Option<Vec<u8>>>, rusqlite::Error> {
+                use rusqlite::OptionalExtension as _;
+                conn.query_row(
+                    "SELECT after_sha256 FROM dag_link_backfill_cursor WHERE singleton = 1",
+                    [],
+                    |r| r.get(0),
+                )
+                .optional()
+            })
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!("dag_link_backfill_cursor: {e}"))
+            })?;
+        v.flatten()
+            .map(|v| {
+                <[u8; 32]>::try_from(v.as_slice()).map_err(|_| {
+                    crate::federation::BlobError::Backend(
+                        "dag_link_backfill_cursor: a 32-byte sha".into(),
+                    )
+                })
+            })
+            .transpose()
+    }
+
+    async fn set_dag_link_backfill_cursor(
+        &self,
+        after: Option<[u8; 32]>,
+    ) -> Result<(), crate::federation::BlobError> {
+        let after = after.map(|a| a.to_vec());
+        self.write(move |conn| -> Result<(), rusqlite::Error> {
+            conn.execute(
+                "INSERT INTO dag_link_backfill_cursor (singleton, after_sha256, updated_at) \
+                 VALUES (1, ?1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')) \
+                 ON CONFLICT (singleton) DO UPDATE \
+                   SET after_sha256 = excluded.after_sha256, updated_at = excluded.updated_at",
+                rusqlite::params![after],
+            )?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| {
+            crate::federation::BlobError::Backend(format!("set_dag_link_backfill_cursor: {e}"))
+        })
+    }
+
     async fn stream_positions_of_chunk(
         &self,
         chunk_sha: &[u8; 32],
@@ -18659,6 +18957,33 @@ impl crate::federation::BlobStorage for SqliteBackend {
             self.index_holder_claim(id, tier).await?;
         }
         Ok(sha256)
+    }
+
+    async fn blob_associations(
+        &self,
+        sha256: &[u8; 32],
+    ) -> Result<Vec<(String, Option<String>)>, crate::federation::BlobError> {
+        let sha = sha256.to_vec();
+        let rows: Vec<(String, String)> = self
+            .read(
+                move |conn| -> Result<Vec<(String, String)>, rusqlite::Error> {
+                    let mut stmt = conn.prepare(
+                        "SELECT cohort_scope, group_key_id FROM federation_blob_associations \
+                      WHERE sha256 = ?1 ORDER BY cohort_scope, group_key_id",
+                    )?;
+                    let it =
+                        stmt.query_map(rusqlite::params![sha], |r| Ok((r.get(0)?, r.get(1)?)))?;
+                    it.collect()
+                },
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!("blob_associations: {e}"))
+            })?;
+        Ok(rows
+            .into_iter()
+            .map(|(s, g)| (s, (!g.is_empty()).then_some(g)))
+            .collect())
     }
 
     async fn blob_provenance(
@@ -20847,6 +21172,11 @@ impl SqliteBackend {
                 "DELETE FROM federation_manifest_children WHERE root_sha256 = ?1",
                 rusqlite::params![sha_vec],
             )?;
+            // v54.0.0 (#995 row 4) — the rooms die with the row.
+            tx.execute(
+                "DELETE FROM federation_blob_associations WHERE sha256 = ?1",
+                rusqlite::params![sha_vec],
+            )?;
             let n = tx.execute(
                 "DELETE FROM federation_blobs WHERE sha256 = ?1",
                 rusqlite::params![sha_vec],
@@ -21668,6 +21998,24 @@ impl crate::outbound::OutboundQueue for SqliteBackend {
         .map_err(|e| crate::outbound::Error::Backend(format!("list_outbound: {e}")))
     }
 
+    async fn outbound_counts(
+        &self,
+    ) -> Result<
+        std::collections::HashMap<crate::outbound::OutboundStatus, u64>,
+        crate::outbound::Error,
+    > {
+        let rows: Vec<(String, i64)> = self
+            .read(move |conn| -> rusqlite::Result<Vec<(String, i64)>> {
+                let mut stmt = conn
+                    .prepare("SELECT status, COUNT(*) FROM edge_outbound_queue GROUP BY status")?;
+                let it = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+                it.collect()
+            })
+            .await
+            .map_err(|e| crate::outbound::Error::Backend(format!("outbound_counts: {e}")))?;
+        crate::outbound::counts_from_rows(rows)
+    }
+
     async fn cancel_outbound(
         &self,
         queue_id: &crate::outbound::QueueId,
@@ -22066,6 +22414,13 @@ fn sqlite_upsert_wire_index(
     content_hash: &str,
     record_key: &str,
 ) -> rusqlite::Result<()> {
+    // v54.0.0 (CIRISPersist#995 row 5) — a record has ONE current content
+    // hash: drop the mappings its earlier bytes left (V183 makes this a seek).
+    conn.execute(
+        "DELETE FROM signed_wire_index \
+         WHERE kind = ?1 AND record_key = ?3 AND content_hash <> ?2",
+        rusqlite::params![kind, content_hash, record_key],
+    )?;
     conn.execute(
         "INSERT INTO signed_wire_index (kind, content_hash, record_key) \
          VALUES (?1, ?2, ?3) \
@@ -28834,6 +29189,10 @@ impl SqliteBackend {
         .await?;
         let row = community.community;
         crate::federation::check_consensus_protocol_form(&row.consensus_protocol)?;
+        // v54.0.0 (CIRISPersist#1034, CC 4.4.3.2.8) — the declared cohort parses,
+        // a config rides only on an affiliation, and an affiliation's config
+        // validates against its roster. Backend-symmetric.
+        crate::federation::affiliation_config::check_community_record(&row)?;
         // v4.11.0 (#154 Ask 4) — geographic cohort_subkind admission: every
         // member must hold an in-force contained location_proof. Reads run
         // before the write lock below. No-op for non-geographic communities.
@@ -36692,7 +37051,12 @@ mod tests {
     async fn affiliations_cohort_membership_lifecycle_sqlite() {
         use crate::federation::cohort::{Cohort, RosterMember};
         use crate::federation::{BlobStorage, FederationDirectory};
-        let backend = community_fixture(&[("alice", "alice-occ", true)], None).await;
+        // v54.0.0 (#1034) — the record declares itself an affiliation.
+        let backend = community_fixture(
+            &[("alice", "alice-occ", true)],
+            Some(serde_json::json!({ "cohort_scope": "affiliations" })),
+        )
+        .await;
         // Register a fresh PRIMITIVE key to admit via the affiliations cohort.
         backend
             .put_public_key(SignedKeyRecord {
@@ -36730,15 +37094,16 @@ mod tests {
             .map(|m| m.key_id)
             .collect();
         assert!(active.contains(&"carol".to_string()));
-        // Shared roster: reading via `community` is identical.
-        let via_community: Vec<String> = backend
-            .active_members(Cohort::Community, "comm")
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|m| m.key_id)
-            .collect();
-        assert_eq!(active, via_community);
+        // v54.0.0 (Codex round 2 on PR #1050) — the roster is shared storage,
+        // but the record declares `affiliations`: read under `community` it is
+        // refused, never answered with the same roster (I606).
+        assert!(
+            matches!(
+                backend.active_members(Cohort::Community, "comm").await,
+                Err(crate::federation::Error::AffiliationCohortMismatch { .. })
+            ),
+            "an affiliation read under the community cohort is a cohort mismatch"
+        );
 
         assert_eq!(
             backend
@@ -50205,11 +50570,36 @@ mod tests {
             })
             .await
             .unwrap();
-        backend
+        // v54.0.0 (CIRISPersist#1031, CC 4.1.1) — the cycle-closing edge is
+        // refused at the door, so a two-key cycle can no longer be stored.
+        let closing = backend
             .put_attestation(SignedAttestation {
                 attestation: topo_attestation(
                     "cyc-b",
                     "cyc-a",
+                    attestation_type::DELEGATES_TO,
+                    None,
+                    Some("*"),
+                    &[],
+                    None,
+                    when,
+                ),
+            })
+            .await;
+        assert!(
+            matches!(
+                closing,
+                Err(crate::federation::Error::DelegationCycle { .. })
+            ),
+            "the cycle-closing edge is refused: {closing:?}"
+        );
+        // The walk's visited guard still meets a cycle: a self-edge (the root
+        // charter shape, admitted) re-enters cyc-b.
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: topo_attestation(
+                    "cyc-b",
+                    "cyc-b",
                     attestation_type::DELEGATES_TO,
                     None,
                     Some("*"),

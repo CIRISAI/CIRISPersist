@@ -74,6 +74,15 @@ pub struct MemoryBackend {
     admission_gate: std::sync::RwLock<Option<crate::federation::AdmissionGate>>,
     /// v50.0.0 (CIRISPersist#926) — this directory's trust-root standing cache.
     trust_root_standing_cache: crate::federation::canonical_community::StandingCache,
+    /// v54.0.0 (Codex on PR #1050) — the in-process half of the
+    /// `delegates_to` cycle-gate serialization
+    /// ([`crate::federation::admission::delegation_cycle_gated`]): held from
+    /// the cycle check through the insert of every gated write.
+    delegation_write_lock: tokio::sync::Mutex<()>,
+    /// v54.0.0 (Codex on PR #1050) — the per-record stripe a
+    /// `signed_wire_index` re-index holds from its read of the stored bytes
+    /// through the replacement ([`crate::store::record_locks`]).
+    wire_index_locks: crate::store::record_locks::RecordLocks,
     /// v50.0.0 (PR #921 review) — test-only hooks inside this backend's doors.
     #[cfg(test)]
     test_hooks: crate::store::test_hooks::TestHooks,
@@ -1016,6 +1025,8 @@ impl Default for MemoryBackend {
             ),
             admission_gate: std::sync::RwLock::new(None),
             trust_root_standing_cache: Default::default(),
+            delegation_write_lock: tokio::sync::Mutex::new(()),
+            wire_index_locks: Default::default(),
             #[cfg(test)]
             test_hooks: Default::default(),
             schema_resolver: std::sync::RwLock::new(std::sync::Arc::new(
@@ -1107,7 +1118,45 @@ impl MemoryBackend {
                 }
             }
             ReplicatedKeyPlan::Upgrade | ReplicatedKeyPlan::Supersede => Ok(RACED),
+            // v54.0.0 (#995 row 2) — the memory store keeps the whole struct,
+            // so it never dropped a scrub; a seeded drop is repaired the same
+            // way the SQL backends repair it.
+            ReplicatedKeyPlan::RehydrateScrubs => {
+                let r = record.record;
+                let hash = crate::federation::types::compute_persist_row_hash(&r)?;
+                {
+                    let mut state = self.state.lock().expect("memory backend lock");
+                    let mutated_at = next_key_admission_position(&state);
+                    let Some(held) = state.federation_keys.get_mut(&r.key_id) else {
+                        return Ok(RACED);
+                    };
+                    if held.persist_row_hash != hash || !held.additional_scrubs.is_empty() {
+                        return Ok(RACED);
+                    }
+                    held.additional_scrubs = r.additional_scrubs.clone();
+                    state
+                        .key_record_mutated_at
+                        .insert(r.key_id.clone(), mutated_at);
+                }
+                self.index_stored_key_row(&r.key_id).await?;
+                Ok(ReplicatedKeyOutcome::ScrubsRehydrated)
+            }
         }
+    }
+
+    /// v54.0.0 (CIRISPersist#995 row 2) — TEST SEAM: reproduce what a
+    /// pre-v53.1.4 UPDATE door left behind: `additional_scrubs` emptied while
+    /// `persist_row_hash` still binds the full record. Nothing else moves.
+    #[cfg(any(test, feature = "test-anchor"))]
+    pub async fn test_seam_drop_key_additional_scrubs(
+        &self,
+        key_id: &str,
+    ) -> Result<(), crate::federation::Error> {
+        let mut state = self.state.lock().expect("memory backend lock");
+        if let Some(r) = state.federation_keys.get_mut(key_id) {
+            r.additional_scrubs.clear();
+        }
+        Ok(())
     }
 
     /// Create an empty memory backend.
@@ -1150,18 +1199,28 @@ impl MemoryBackend {
     /// own upsert is infallible; the reload through the read path is the only
     /// thing that can error, and it is logged rather than propagated so the
     /// contract is uniform across all three backends.
-    async fn index_stored_record(
+    pub(crate) async fn index_stored_record(
         &self,
         kind: &str,
         record_key_json: &str,
     ) -> Result<(), crate::federation::Error> {
+        // v54.0.0 (Codex on PR #1050) — the read and the replacement are ONE step
+        // per record (the SQL twins' reason): the state lock is released between
+        // the reload and the upsert, so the record's stripe spans both.
+        let _stripe = self.wire_index_locks.lock(kind, record_key_json).await;
         match crate::federation::wire_index::entry_as_stored(self, kind, record_key_json).await {
             Ok(Some(content_hash)) => {
-                self.state
-                    .lock()
-                    .expect("memory backend lock")
-                    .signed_wire_index
-                    .insert((kind.to_owned(), content_hash), record_key_json.to_owned());
+                #[cfg(test)]
+                self.test_hooks()
+                    .pause_if_armed("wire_index_before_write")
+                    .await;
+                let mut state = self.state.lock().expect("memory backend lock");
+                memory_upsert_wire_index(
+                    &mut state.signed_wire_index,
+                    kind,
+                    content_hash,
+                    record_key_json,
+                );
             }
             Ok(None) => {}
             Err(e) => {
@@ -3902,6 +3961,11 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // federation`. Backend-symmetric; verify-before-mutation.
         crate::federation::admission::check_minor_owner_binding_not_announced(self, &row).await?;
 
+        // v54.0.0 (CIRISPersist#1031, CC 4.1.1) — the cycle-closing `delegates_to`
+        // is refused: the recipient must not already reach the granter through live
+        // `delegates_to` edges. Backend-symmetric with SQLite + Postgres; verify-before-mutation.
+        crate::federation::admission::check_delegation_cycle_admission(self, &row).await?;
+
         // v12.6.0 (CIRISConstitution#23, CC 1.13.3.3 / CC 3.2) — the single-owner
         // gate: a node has AT MOST ONE responsible steward, so a second,
         // distinct-owner owner-binding `delegates_to(U → node)` is rejected. This
@@ -4047,6 +4111,23 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // is still owned (before the push consumes it).
         let projected_trace =
             crate::ingest::project_trace_events_from_attestation(&row.attestation_envelope);
+        // v54.0.0 (Codex on PR #1050) — THE CYCLE CHECK AND THE INSERT ARE ONE
+        // STEP. The tier-4 check above read the graph unlocked; a concurrent
+        // writer of the reverse edge could have passed the same read since. Hold
+        // the delegation write lock from a re-check through the write, so every
+        // gated writer is serialized against it. One process owns this store, so
+        // the in-process lock is the whole serialization.
+        let _cycle_guard = if crate::federation::admission::delegation_cycle_gated(&row) {
+            let guard = self.delegation_write_lock.lock().await;
+            crate::federation::admission::check_delegation_cycle_admission(self, &row).await?;
+            #[cfg(test)]
+            self.test_hooks()
+                .pause_if_armed("delegation_cycle_before_insert")
+                .await;
+            Some(guard)
+        } else {
+            None
+        };
         // v31.0.0 (CIRISPersist#646) — carried OUT of the guard scope: the
         // reload the index derivation needs takes the same lock.
         let wire_index_key: Option<String>;
@@ -10271,9 +10352,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         let count = triples.len() as u64;
         let mut state = self.state.lock().expect("memory backend lock");
         for (kind, hash, record_key) in triples {
-            state
-                .signed_wire_index
-                .insert((kind.to_owned(), hash), record_key);
+            memory_upsert_wire_index(&mut state.signed_wire_index, kind, hash, &record_key);
         }
         Ok(count)
     }
@@ -10435,6 +10514,14 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                 "federation_attestations row {attestation_id} does not exist"
             ))
         })?;
+        // v54.0.0 (Codex on PR #1050) — a crossing `delegates_to` adds an edge to
+        // the federation-tier graph the cycle gate reads: the plan's cycle check
+        // and the write below are one step under the delegation write lock.
+        let _cycle_guard = if crate::federation::admission::delegation_cycle_gated(&current) {
+            Some(self.delegation_write_lock.lock().await)
+        } else {
+            None
+        };
         let Some(crossing::EnterPlan { row, crossing }) =
             crossing::plan_enter_mesh(self, &current, ci, custody, self.self_key_id().as_deref())
                 .await?
@@ -10443,6 +10530,12 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                 attestation_id: attestation_id.to_owned(),
             });
         };
+        #[cfg(test)]
+        if _cycle_guard.is_some() {
+            self.test_hooks()
+                .pause_if_armed("delegation_cycle_before_crossing")
+                .await;
+        }
         let wire_index_key = {
             let mut state = self.state.lock().expect("memory backend lock");
             let admitted_at = next_plane_position(
@@ -11731,6 +11824,20 @@ impl crate::outbound::OutboundQueue for MemoryBackend {
         Ok(rows)
     }
 
+    async fn outbound_counts(
+        &self,
+    ) -> Result<
+        std::collections::HashMap<crate::outbound::OutboundStatus, u64>,
+        crate::outbound::Error,
+    > {
+        let state = self.state.lock().expect("memory backend lock");
+        let mut out = std::collections::HashMap::new();
+        for r in state.outbound_queue.values() {
+            *out.entry(r.status).or_insert(0u64) += 1;
+        }
+        Ok(out)
+    }
+
     async fn cancel_outbound(
         &self,
         queue_id: &crate::outbound::QueueId,
@@ -12313,6 +12420,10 @@ impl MemoryBackend {
         // v4.0 — value-validation admission (consensus_protocol
         // canonical form). Mirrors put_family.
         crate::federation::check_consensus_protocol_form(&row.consensus_protocol)?;
+        // v54.0.0 (CIRISPersist#1034, CC 4.4.3.2.8) — the declared cohort parses,
+        // a config rides only on an affiliation, and an affiliation's config
+        // validates against its roster. Backend-symmetric.
+        crate::federation::affiliation_config::check_community_record(&row)?;
         // v4.11.0 (#154 Ask 4) — geographic cohort_subkind admission. Runs
         // BEFORE the state lock below: it reads via list_location_proofs_for
         // (which locks state itself), so calling it under the lock would
@@ -19666,6 +19777,20 @@ mod tests {
         cohort_subkind: Option<&str>,
         comm_authorized: bool,
     ) -> Result<(), crate::federation::Error> {
+        let policy_blob = cohort_subkind.map(|sk| serde_json::json!({ "cohort_subkind": sk }));
+        put_community_with_policy(backend, community_id, members, policy_blob, comm_authorized)
+            .await
+    }
+
+    /// [`put_community_with_authority`] with the whole `policy_blob` (v54.0.0,
+    /// #1034 — an affiliation declares `"cohort_scope": "affiliations"` there).
+    async fn put_community_with_policy(
+        backend: &MemoryBackend,
+        community_id: &str,
+        members: Vec<crate::federation::types::CommunityMember>,
+        policy_blob: Option<serde_json::Value>,
+        comm_authorized: bool,
+    ) -> Result<(), crate::federation::Error> {
         let mut comm_key = fix_key(community_id, "primitive", community_id);
         if comm_authorized {
             comm_key.identity_type =
@@ -19679,7 +19804,6 @@ mod tests {
             backend,
         )
         .await;
-        let policy_blob = cohort_subkind.map(|sk| serde_json::json!({ "cohort_subkind": sk }));
         backend
             .put_community(
                 crate::federation::tier_ingest::test_support::sign_community(
@@ -20161,9 +20285,17 @@ mod tests {
         // the founder_only protocol.
         let mut founder = member("ob-owner");
         founder.role = Some("founder".into());
-        put_community_with(&backend, group, vec![founder], None)
-            .await
-            .expect("affiliations group (community row) created");
+        // v54.0.0 (#1034) — the record DECLARES itself an affiliation; a
+        // plain community addressed as one is refused.
+        put_community_with_policy(
+            &backend,
+            group,
+            vec![founder],
+            Some(serde_json::json!({ "cohort_scope": "affiliations" })),
+            false,
+        )
+        .await
+        .expect("affiliations group (community row) created");
 
         // ── add via the affiliations cohort ────────────────────────────────
         // v31.0.0 (CIRISPersist#654) — signed over the GROWN community envelope.
@@ -20199,17 +20331,15 @@ mod tests {
             active.contains(&"ob-joiner".to_string()),
             "added member visible via the affiliations cohort"
         );
-        // Identical to reading via the `community` cohort (shared machinery).
-        let active_via_community: Vec<String> = backend
-            .active_members(Cohort::Community, group)
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|m| m.key_id)
-            .collect();
-        assert_eq!(
-            active, active_via_community,
-            "affiliations and community read the SAME roster"
+        // v54.0.0 (Codex round 2 on PR #1050) — the roster is shared storage,
+        // but the record declares `affiliations`: read under `community` it is
+        // refused, never answered with the same roster (I606).
+        assert!(
+            matches!(
+                backend.active_members(Cohort::Community, group).await,
+                Err(crate::federation::Error::AffiliationCohortMismatch { .. })
+            ),
+            "an affiliation read under the community cohort is a cohort mismatch"
         );
 
         // ── revoke via the affiliations cohort → epoch bump (forward secrecy) ─
@@ -26130,4 +26260,17 @@ mod tests {
         .await
         .expect("657 attestation wire-index exercise");
     }
+}
+
+/// v54.0.0 (CIRISPersist#995 row 5) — the memory twin of the SQL upserts: a
+/// record has ONE current content hash, so its earlier mappings are dropped
+/// before the new one is written.
+fn memory_upsert_wire_index(
+    index: &mut HashMap<(String, String), String>,
+    kind: &str,
+    content_hash: String,
+    record_key: &str,
+) {
+    index.retain(|(k, h), rk| !(k == kind && rk == record_key && *h != content_hash));
+    index.insert((kind.to_owned(), content_hash), record_key.to_owned());
 }

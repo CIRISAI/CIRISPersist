@@ -48,6 +48,37 @@ pub(crate) struct TestHooks {
     /// won the race at exactly that point. One point, so it carries no
     /// `RivalPoint`.
     rival_location_proof_withdrawal: Mutex<Option<crate::federation::SignedLocationProof>>,
+    /// v54.0.0 (Codex on PR #1050) — a named point a backend door PAUSES at:
+    /// the witness learns the door reached it, runs a rival writer, then
+    /// resumes the door. One-shot per arm.
+    pauses: Mutex<BTreeMap<&'static str, std::sync::Arc<Pause>>>,
+}
+
+/// v54.0.0 (Codex on PR #1050) — one armed pause: the door signals
+/// [`Pause::reached`] and waits for [`Pause::resume`]. The wait is bounded so a
+/// witness whose rival is (correctly) blocked behind the paused door cannot
+/// hang the suite: the door resumes on its own after [`PAUSE_CEILING`].
+#[derive(Default)]
+pub(crate) struct Pause {
+    reached: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
+}
+
+/// The longest a paused door waits for its witness.
+pub(crate) const PAUSE_CEILING: std::time::Duration = std::time::Duration::from_secs(30);
+
+#[allow(dead_code)]
+impl Pause {
+    /// Resolves once the door has reached the armed point.
+    pub(crate) async fn reached(&self) {
+        self.reached.notified().await;
+    }
+
+    /// Lets the paused door continue (a permit is stored if it has not
+    /// reached the point yet).
+    pub(crate) fn resume(&self) {
+        self.resume.notify_one();
+    }
 }
 
 // The witnesses that arm these are cfg'd on a database feature; under the
@@ -107,6 +138,27 @@ impl TestHooks {
             .lock()
             .expect("test hooks")
             .take()
+    }
+
+    /// v54.0.0 (Codex on PR #1050) — arm a pause at `point`; the returned
+    /// handle observes the door arriving and releases it.
+    pub(crate) fn arm_pause(&self, point: &'static str) -> std::sync::Arc<Pause> {
+        let p = std::sync::Arc::new(Pause::default());
+        self.pauses
+            .lock()
+            .expect("test hooks")
+            .insert(point, std::sync::Arc::clone(&p));
+        p
+    }
+
+    /// Called by the backend at `point`: when armed (once), signal the
+    /// witness and wait for it to resume the door, at most [`PAUSE_CEILING`].
+    pub(crate) async fn pause_if_armed(&self, point: &'static str) {
+        let armed = self.pauses.lock().expect("test hooks").remove(point);
+        if let Some(p) = armed {
+            p.reached.notify_one();
+            let _ = tokio::time::timeout(PAUSE_CEILING, p.resume.notified()).await;
+        }
     }
 
     /// Taken (once) by the backend at `at`: the rival armed for that point.

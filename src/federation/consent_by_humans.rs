@@ -243,6 +243,30 @@ async fn resolve_scoped_stance_by_principals_body(
     qualifier: Option<&str>,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<super::consent::ScopedStance, Error> {
+    let folded = per_principal_stances(
+        directory,
+        target_key_id,
+        subject_key_id,
+        scope,
+        qualifier,
+        now,
+    )
+    .await?;
+    Ok(combine_per_principal(&folded).0)
+}
+
+/// The stance each principal folds to, the subject first: `(principal,
+/// stance)`. The ONE walk [`resolve_scoped_stance_by_principals`] and
+/// [`retain_bound_by_principals`] both combine, so "whose rows count for
+/// this machine" cannot drift between the consent door and the sweeps.
+async fn per_principal_stances(
+    directory: &dyn FederationDirectory,
+    target_key_id: &str,
+    subject_key_id: &str,
+    scope: &str,
+    qualifier: Option<&str>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Vec<(String, super::consent::ScopedStance)>, Error> {
     // v53.1.5 — ONE bounded read for every principal (the subject and each
     // steward), shared by the subject's own fold and the per-steward folds;
     // before this cut the target's whole slice was read twice per call (the
@@ -259,12 +283,9 @@ async fn resolve_scoped_stance_by_principals_body(
     );
     let rows = super::consent::scoped_fold_rows(directory, target_key_id, &principals).await?;
     let refs: Vec<&super::Attestation> = rows.iter().collect();
-    let mut folded = vec![super::consent::fold_scoped_stance_refs(
-        &refs,
-        subject_key_id,
-        now,
-        scope,
-        qualifier,
+    let mut folded = vec![(
+        subject_key_id.to_owned(),
+        super::consent::fold_scoped_stance_refs(&refs, subject_key_id, now, scope, qualifier),
     )];
     // The steward's universe for `k`: only the rows that name `k`. Rows
     // that do not are removed from the universe, not merely out-sorted,
@@ -283,15 +304,85 @@ async fn resolve_scoped_stance_by_principals_body(
                     || for_key_id_of(&a.attestation_envelope) == Some(subject_key_id)
             })
             .collect();
-        folded.push(super::consent::fold_scoped_stance_refs(
-            &universe, p, now, scope, qualifier,
+        folded.push((
+            p.clone(),
+            super::consent::fold_scoped_stance_refs(&universe, p, now, scope, qualifier),
         ));
     }
-    let stances: Vec<ConsentState> = folded.iter().map(|s| s.state).collect();
-    Ok(super::consent::ScopedStance {
-        state: combine_principal_stances(&stances),
-        retain_until: folded.iter().filter_map(|s| s.retain_until).min(),
-    })
+    Ok(folded)
+}
+
+/// Combine per-principal stances: the state by [`combine_principal_stances`],
+/// `retain_until` the TIGHTEST window any principal signed, and the principal
+/// whose window that is (the subject wins a tie: it is folded first and
+/// `min_by_key` keeps the first minimum).
+fn combine_per_principal(
+    folded: &[(String, super::consent::ScopedStance)],
+) -> (super::consent::ScopedStance, Option<String>) {
+    let stances: Vec<ConsentState> = folded.iter().map(|(_, s)| s.state).collect();
+    let governing = folded
+        .iter()
+        .filter_map(|(p, s)| s.retain_until.map(|u| (p, u)))
+        .min_by_key(|(_, u)| *u);
+    (
+        super::consent::ScopedStance {
+            state: combine_principal_stances(&stances),
+            retain_until: governing.map(|(_, u)| u),
+        },
+        governing.map(|(p, _)| p.clone()),
+    )
+}
+
+/// v54.0.0 (CIRISPersist#1015) — what bounds how long `holder` may retain
+/// what it holds about `subject`: the `retain` stance by principals and the
+/// principal whose window governs.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RetainBound {
+    /// The `retain` stance by principals; `retain_until` is the tightest live
+    /// window any principal signed for this machine.
+    pub stance: super::consent::ScopedStance,
+    /// The principal whose `retain:<window>` is `stance.retain_until`: the
+    /// subject itself, or a steward on a row naming the subject in
+    /// [`FOR_KEY_ID`]. `None` when no window bounds the retention.
+    pub governed_by: Option<String>,
+}
+
+/// v54.0.0 (CIRISPersist#1015, ruled 2026-10-09) — **the bound a retention
+/// sweep asks before it keeps or evicts**: the subject's own `retain` rows and
+/// each steward's `retain` rows naming the subject (`for_key_id`), folded per
+/// principal by the same walk the consent door runs, with the MINIMUM live
+/// window. A steward's `retain:30d` for this machine bounds the machine's own
+/// `retain:90d`: the data is deleted at the shorter window. A steward row that
+/// has expired (its signed `expires_at` passed), or that names another
+/// machine, bounds nothing. Through v53 both sweeps (the fountain eviction
+/// door and the deletion-window watch) folded the subject's rows alone and
+/// kept content past a human's window.
+pub async fn retain_bound_by_principals(
+    directory: &dyn FederationDirectory,
+    holder_key_id: &str,
+    subject_key_id: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<RetainBound, Error> {
+    crate::observe::fold(
+        crate::observe::Fold::ResolveScopedStanceByPrincipals,
+        async {
+            let folded = per_principal_stances(
+                directory,
+                holder_key_id,
+                subject_key_id,
+                super::types::transmission_principle::RETAIN,
+                None,
+                now,
+            )
+            .await?;
+            let (stance, governed_by) = combine_per_principal(&folded);
+            Ok(RetainBound {
+                stance,
+                governed_by,
+            })
+        },
+    )
+    .await
 }
 
 #[cfg(test)]
