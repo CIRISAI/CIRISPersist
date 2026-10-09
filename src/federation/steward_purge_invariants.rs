@@ -643,6 +643,34 @@ pub(crate) mod bodies {
             .await
             .expect("admissible");
         assert_eq!(r.tombstoned.get("attestation"), Some(&2));
+        // A delegates_to between two keys neither of which is purged is a
+        // third party's standing grant: inadmissible.
+        let grant = ts::put_delegates_to(dir, SCORER, BYSTANDER, None)
+            .await
+            .unwrap();
+        let gid = format!("attestation:{grant}");
+        let gsel = PurgeSelection::ByIds {
+            ids: vec![gid.clone()],
+        };
+        let gdry = sp::purge_dry_run(dir, &gsel).await.unwrap();
+        assert_eq!(
+            gdry.inadmissible
+                .iter()
+                .map(|w| w.record_id.clone())
+                .collect::<Vec<_>>(),
+            vec![gid.clone()],
+            "I653: a third party's delegates_to is not the purge's to remove"
+        );
+        assert!(gdry.inadmissible[0].reason.contains("delegates_to"));
+        let gn = notice_for(
+            &gdry.notice_template,
+            &[cc::FOUNDERS[0], cc::FOUNDERS[2]],
+            t,
+        );
+        let e = sp::purge_rows(dir, &gsel, &gn, NODE, t)
+            .await
+            .expect_err("a third party's grant");
+        assert_eq!(refusal(&e).0, token::RETRACTION_INADMISSIBLE, "I653");
     }
 
     // ── I654 ──────────────────────────────────────────────────────────────
@@ -694,7 +722,17 @@ pub(crate) mod bodies {
         assert_eq!(report.tombstoned.get("attestation"), Some(&3));
         assert_eq!(report.selection_digest, dry.selection_digest);
         // Nothing deleted yet; the purged score is no longer served.
-        assert!(dir.get_attestation(&derived).await.unwrap().is_some());
+        let held = dir.get_attestation(&derived).await.unwrap();
+        assert!(held.is_some());
+        // Nor can a held copy be re-published through the tier crossing.
+        let e = crate::federation::admission::check_promotion_admission(
+            dir,
+            held.as_ref().unwrap(),
+            None,
+        )
+        .await
+        .expect_err("a tombstoned row cannot cross");
+        assert_eq!(refusal(&e).0, token::TOMBSTONED, "I654: the promotion door");
         let served = served_ids(d).await;
         assert!(
             !served.contains(&derived),
@@ -1154,6 +1192,12 @@ pub(crate) mod bodies {
             .expect_err("a federation-tier mock trace is refused");
         assert_eq!(e.kind(), sp::TRACE_RUNTIME_MOCK, "I659(a): {e}");
         assert!(sp::refuse_mock_trace_attestation(&row).is_err());
+        // The tier crossing mints a federation-tier row: a local QA trace
+        // cannot cross either.
+        let e = crate::federation::admission::check_promotion_admission(dir, &row, None)
+            .await
+            .expect_err("a mock trace cannot cross");
+        assert_eq!(e.kind(), sp::TRACE_RUNTIME_MOCK, "I659(a) promotion: {e}");
         let mut local = row.clone();
         local.tier = crate::federation::types::attestation_tier::LOCAL.to_owned();
         assert!(
