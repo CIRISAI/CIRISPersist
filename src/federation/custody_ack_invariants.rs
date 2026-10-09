@@ -1269,6 +1269,73 @@ mod engine_bodies {
         );
     }
 
+    /// **I607** (v54.0.0, Codex round 3 on PR #1050) — **each association is
+    /// resolved with its own principal.** A `self` association records the
+    /// owner its write named (V177: the group of a `self` write is the owner
+    /// identity). The fold resolved EVERY association with the row's
+    /// `author_key_id`, the first content-addressed writer's, so a second
+    /// owner's `self` room resolved to the first owner's nodes: the second
+    /// owner's node was never a target and never missing. Alice occurs
+    /// through node A and bob through node B; the association set names a
+    /// `self` room for each, and the row's author is node A.
+    ///
+    /// The storage floor refuses plaintext at `self`, so no door writes this
+    /// association set today: the witness drives the fold over the shape the
+    /// V184 table can hold, not a door.
+    pub(crate) async fn i607_each_association_resolves_its_own_principal<B>(
+        dsn_a: &str,
+        dsn_b: &str,
+        run: &str,
+        pick: Pick<B>,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync + 'static,
+    {
+        use crate::federation::durability::{
+            associations_audience, content_audience, ContentAudience,
+        };
+        let l = ladder(dsn_a, dsn_b, run, pick).await;
+        let ba = l.ba.as_ref() as &dyn FederationDirectory;
+        let bob = format!("em-bob-{run}");
+        // The premise: each owner's own `self` room reaches its own node.
+        for (owner, has, lacks) in [
+            (&l.alice, &l.node_a, &l.node_b),
+            (&bob, &l.node_b, &l.node_a),
+        ] {
+            match content_audience(ba, SELF, Some(owner), None).await.unwrap() {
+                ContentAudience::Nodes(n) => assert!(
+                    n.contains(has) && !n.contains(lacks),
+                    "I607 premise: {owner}'s self room reaches {has} and not {lacks}: {n:?}"
+                ),
+                other => panic!("I607 premise: {owner}'s self room resolves to nodes: {other:?}"),
+            }
+        }
+        let associations = vec![
+            (SELF.to_owned(), Some(l.alice.clone())),
+            (SELF.to_owned(), Some(bob.clone())),
+        ];
+        match associations_audience(ba, &associations, Some(&l.node_a))
+            .await
+            .unwrap()
+        {
+            ContentAudience::Nodes(n) => assert!(
+                n.contains(&l.node_a) && n.contains(&l.node_b),
+                "I607 the audience is both owners' nodes, not the first writer's alone: {n:?}"
+            ),
+            other => panic!("I607 the audience resolves to nodes: {other:?}"),
+        }
+        // An association that names no owner falls back to the row's author.
+        match associations_audience(ba, &[(SELF.to_owned(), None)], Some(&l.node_a))
+            .await
+            .unwrap()
+        {
+            ContentAudience::Nodes(n) => assert!(
+                n.contains(&l.node_a) && !n.contains(&l.node_b),
+                "I607 an association naming no owner resolves through the author: {n:?}"
+            ),
+            other => panic!("I607 the author's self room resolves to nodes: {other:?}"),
+        }
+    }
+
     /// A shared `BackendDispatch` over a backend handle, and a way to make the
     /// handle forget its node key — a handle the constructor could not tell
     /// (a hardware signer that answers asynchronously).
@@ -1437,6 +1504,11 @@ mod runners {
     #[cfg(feature = "sqlite")]
     sqlite_engine_case!(i605_sqlite, i605_durability_reaches_every_plaintext_room);
     #[cfg(feature = "sqlite")]
+    sqlite_engine_case!(
+        i607_sqlite,
+        i607_each_association_resolves_its_own_principal
+    );
+    #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn i514_sqlite() {
         super::engine_bodies::i514_the_custody_door_knows_its_node(
@@ -1487,6 +1559,11 @@ mod runners {
     postgres_engine_case!(i579_postgres, i579_shared_plaintext_keeps_every_room);
     #[cfg(feature = "postgres")]
     postgres_engine_case!(i605_postgres, i605_durability_reaches_every_plaintext_room);
+    #[cfg(feature = "postgres")]
+    postgres_engine_case!(
+        i607_postgres,
+        i607_each_association_resolves_its_own_principal
+    );
     #[cfg(feature = "postgres")]
     #[tokio::test]
     async fn i514_postgres() {

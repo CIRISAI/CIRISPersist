@@ -223,27 +223,20 @@ where
     // while that room held no copy. The audience is the union over the
     // associations; a sealed row has none, and its room is its binding.
     let associations = backend.blob_associations(at_rest_sha256).await?;
-    let rooms: Vec<(String, Option<String>)> = if associations.is_empty() {
-        vec![(
-            prov.cohort_scope.clone(),
-            prov.community_key_id.clone().or(prov.group_key_id.clone()),
-        )]
-    } else {
-        associations
-    };
-    let mut audience: Option<ContentAudience> = None;
-    for (scope, group) in &rooms {
-        let room = content_audience(
+    let audience = if associations.is_empty() {
+        content_audience(
             backend,
-            scope,
+            &prov.cohort_scope,
             prov.author_key_id.as_deref(),
-            group.as_deref(),
+            prov.community_key_id
+                .as_deref()
+                .or(prov.group_key_id.as_deref()),
         )
         .await
-        .map_err(|e| BlobError::Backend(format!("durability deficit: audience: {e}")))?;
-        audience = Some(union_audience(audience, room));
+    } else {
+        associations_audience(backend, &associations, prov.author_key_id.as_deref()).await
     }
-    let audience = audience.unwrap_or(ContentAudience::Unresolvable);
+    .map_err(|e| BlobError::Backend(format!("durability deficit: audience: {e}")))?;
     let known: std::collections::BTreeMap<String, CustodyVerdict> = view
         .devices
         .iter()
@@ -252,6 +245,43 @@ where
     deficit_over(backend, &view.sha256_hex, audience, &known, n_plus_k, now)
         .await
         .map_err(|e| BlobError::Backend(format!("durability deficit: {e}")))
+}
+
+/// v54.0.0 (Codex round 2 on PR #1050) — **the audience of a plaintext row
+/// over every room it was written into** (its V184 associations): the union
+/// of each room's [`content_audience`].
+///
+/// v54.0.0 (Codex round 3 on PR #1050) — each association is resolved with
+/// ITS OWN principal. A `self` room's principal is the group that write named
+/// (V177: the owner identity, for `self`), and the row's author only when the
+/// association names none. `author_key_id` is the FIRST content-addressed
+/// writer's, so resolving every association with it put a later owner's nodes
+/// in no audience: never a target, never missing. The storage floor refuses
+/// plaintext at `self` today (`StorageFloor::check_scope`), so no door writes
+/// such an association; this keeps the fold right for the shape the table
+/// can hold, rather than leaning on a refusal two layers away.
+pub(crate) async fn associations_audience<D>(
+    dir: &D,
+    associations: &[(String, Option<String>)],
+    author_key_id: Option<&str>,
+) -> Result<ContentAudience, Error>
+where
+    D: FederationDirectory + ?Sized,
+{
+    let mut audience: Option<ContentAudience> = None;
+    for (scope, group) in associations {
+        let group = group.as_deref().filter(|g| !g.is_empty());
+        let self_room =
+            cs::Scope::parse(scope).is_some_and(|s| s.placement() == cs::Placement::SelfCollective);
+        let principal = if self_room {
+            group.or(author_key_id)
+        } else {
+            author_key_id
+        };
+        let room = content_audience(dir, scope, principal, group).await?;
+        audience = Some(union_audience(audience, room));
+    }
+    Ok(audience.unwrap_or(ContentAudience::Unresolvable))
 }
 
 /// v54.0.0 (Codex round 2 on PR #1050) — two rooms' audiences as one: any
