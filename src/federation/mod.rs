@@ -9499,7 +9499,8 @@ pub enum Error {
         attesting_key_id: String,
         /// The door that needed it: `key_registration`, `identity_occurrence`,
         /// `identity_occurrence_revocation`, `transport_destination`,
-        /// `touch_claim`, `touch_claim_cosigner` or `signed_envelope`
+        /// `touch_claim`, `touch_claim_cosigner`, `attestation` (the store's
+        /// attester lookup on `put_attestation`) or `signed_envelope`
         /// (attestations, revocations and every other envelope-signed row).
         plane: &'static str,
     },

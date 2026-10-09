@@ -11,11 +11,80 @@ threat-model citations because this crate's audit story is the point.
 
 ### Added — an unknown signer is a typed, RETRYABLE refusal, apart from a bad signature (#1042)
 
-(entry in progress)
+A fresh node refused the canonical's `identity_occurrence` rows every round with `scrub-signature verification failed: … is not a registered federation key`, because the signer's Key row had not landed yet. That is an ordering gap, and it read the same as a forged signature, so a sender could not tell a row that will admit tomorrow from one that never will. Persist's stance is unchanged: the refusal is per attempt, nothing is stored, marked or parked, and the same row admits when it is re-offered after the key plane. What changes is the type.
+
+Edge's three questions (CIRISEdge#858):
+
+1. **The variant and its token.** `federation::Error::AttesterKeyUnknown { attesting_key_id, plane }`, kind `federation_attester_key_unknown`. On the replicated key plane's outcome it is `register::KeyRefusalReason::AttesterKeyUnknown`, token `attester_key_unknown`. The terminal siblings are unchanged: `Error::SignatureInvalid` (`federation_signature_invalid`), `Error::FederationTierUnverified` (`federation_tier_unverified`) and, on the key plane, `KeyRefusalReason::UnverifiableSignature` (`unverifiable_signature`). That last one is the key plane's "signature_invalid" token the issue names; it keeps its existing spelling.
+2. **Which doors return it.** Every door that resolves a signer's Key row and finds none. `plane` names the door: `key_registration` (`verify_key_registration`, so `Engine::register_federation_key`, the replicated key apply, the rebind and invalid-replace doors), `identity_occurrence` (`put_identity_occurrence`, signed and content-only), `identity_occurrence_revocation`, `transport_destination`, `touch_claim` and `touch_claim_cosigner` (an `NOfMCosigner` co-signer), `attestation` (the store's attester lookup in `put_attestation`, all three backends) and `signed_envelope` (`tier_ingest::verify_envelope_hybrid_signature`, which carries attestations, revocations, families, communities, memberships, location proofs and every other envelope-signed row that does not re-type its error). Before, these were `SignatureInvalid`, `FederationTierUnverified` or, at the store's attester lookup, `InvalidArgument`.
+3. **The replicated Key Insert arm.** Yes. `apply_replicated_key_record`'s `Insert` arm on memory, sqlite and postgres (the postgres arm was re-read and mirrors sqlite) no longer propagates `verify_key_registration(..)?` as a bare `Err`. It returns `ReplicatedKeyOutcome::Refused { reason }`, with `attester_key_unknown` for an unknown scrubber and `unverifiable_signature` for a scrubber this node holds whose signature does not verify. Every other plan arm that verifies a record (upgrade, rebind, scrub rehydrate, invalid replace) reads the failure through the same function, `register::key_refusal_of_verify_error`, so the split is spelled once. A backend failure still propagates as `Err`.
+
+Python keeps the arm's type. `federation_err_to_py` raises `AttesterKeyUnknown` as `ValueError`, as it did `SignatureInvalid` and `FederationTierUnverified`, with the kind string as the message. `apply_replicated_key_record` returns `{"refused":{"reason":"attester_key_unknown"}}` where it used to raise.
+
+New variants on `pub` exhaustive enums, and how an adopter maps them:
+
+| Variant | Mapping |
+|---|---|
+| `federation::Error::AttesterKeyUnknown` | **retryable**: re-offer the same row after the signer's Key row lands |
+| `register::KeyRefusalReason::AttesterKeyUnknown` | **retryable**, same rule, on the key plane |
+
+Breaking for Rust callers that match `Error` or `KeyRefusalReason` exhaustively. `canonical_community::is_row_verdict` counts the new variant as a verdict on the row, as it counted `FederationTierUnverified`.
+
+Witnesses in `src/federation/attester_key_unknown_invariants.rs`, each on memory, sqlite and postgres. Each has the three steps the issue names: an unknown signer is the gap, a known signer with a signature over other bytes is the terminal verdict, and the same row admits after the Key row lands.
+
+- **I613**, the key plane: `verify_key_registration` directly, then `apply_replicated_key_record`'s Insert arm, which must return an outcome and never an `Err`.
+- **I614**, the `identity_occurrence` plane, the 2026-10-08 defect.
+- **I615**, the attestation plane through `put_attestation`.
+
+RED before the fix, with every fix site reverted: all nine fail. I613 reads `registration signer (scrub_key_id=…) is not registered`, I614 reads `signed identity_occurrence: attesting_key_id … is not a registered federation key` and I615 reads `invalid argument: attesting_key_id … does not exist in federation_keys`. With only the Insert arms reverted, I613 fails on all three backends with `a refusal is an outcome, never a bare Err: AttesterKeyUnknown { … }`. Mutation: collapsing `AttesterKeyUnknown` into `UnverifiableSignature` in `key_refusal_of_verify_error` turns I613 red on all three backends.
 
 ### Added — a stored Key row that fails verification is replaced by a passing one (`InvalidReplaced`) (#1044)
 
-(entry in progress)
+CIRISServer's legacy `register_user_key` fallback stored user Keys whose scrub signatures cover the owner-binding bytes rather than the registration envelope. Such a row passes `verify_key_registration` steps 1 to 4 and fails step 5, the hybrid verify. It is served to every peer and refused by every stranger's Insert. When the holder re-signed, the incoming record was refused `conflicting_version`, `downgrade`, `re_scrub` or `already_anchored_identical`, because first-seen-wins presumes the stored row is a valid record. Server measured 0 such rows on the canonical, so no production row waits on this door; it is the class fix.
+
+Edge's three questions (CIRISEdge#858):
+
+1. **The door.** There is no new entry point. The arm is `ReplicatedKeyPlan::ReplaceInvalid` inside the existing key plan, reached through two doors: the replicated apply, `FederationDirectory::apply_replicated_key_record` (`Engine::apply_replicated_key_record`, Python `apply_replicated_key_record`, outcome `"invalid_replaced"`), and the local door, `Engine::rebind_key_record` (Python `rebind_key_record`, `{"outcome":"invalid_replaced"}`). Both write through one new store step, `FederationDirectory::store_invalid_replaced_key_record`, overridden by memory, sqlite and postgres. The store step re-asserts the whole rule itself rather than trusting the plan, since it is a public trait method.
+2. **Inputs.** One `SignedKeyRecord`, the re-signed registration. It replaces the stored row only when all of these hold:
+   - the stored row fails `verify_key_registration` structurally (`SignatureInvalid` or `InvalidArgument`) and binds its subject. An unknown signer is not a verdict, and the unbound pre-#659 shape has its own doors (#864 rebind, genesis re-mint).
+   - the incoming record passes `verify_key_registration`.
+   - both pubkeys are the same.
+   - the claim is the same (`identity_type`, `identity_ref`, `valid_from`, `valid_until`, roles, attestation evidence; the #864 predicate).
+   - the incoming record is signed by the key itself (`scrub_key_id == key_id`, the holder's proof of possession) or by the stored row's scrubber. `verify_key_registration` accepts any registered key as an anchor scrubber, so without this a third key could install itself as a failing row's scrubber.
+   - neither side is role-gated (canonical, accord_holder, infra:attest, co-steward). Those rows are admitted by their m-of-n co-scrub, not by `verify_key_registration`'s scrub #1, and a one-scrub replacement would shed the quorum.
+
+   The arm is consulted only when the plan would otherwise refuse with one of the four first-seen reasons, so the stored row's verify is paid only where the answer can change. A valid stored row is never replaced, and the original refusal stands. If the incoming record also fails, its own verdict is the refusal (`unverifiable_signature`, or `attester_key_unknown`). A different pubkey stays `pubkey_swap`. A lost race at the store step is `store_conflict`, re-offerable.
+3. **The audit row.** One `KeyRegistrationHistoryRow` in `federation_key_registration_history` (V148, widened by **V186** on both dialects), written in the same transaction as the replacement and guarded on the planned-against row hash. It carries the replaced row's `registration_envelope`, `original_content_hash`, `scrub_signature_classical`, `scrub_signature_pqc`, `scrub_key_id` (the old scrubber) and `scrub_timestamp`, plus `replaced_at`, `replaced_by_hash` (the new row's `persist_row_hash`) and two new fields. `replaced_row_hash` is the replaced row's own `persist_row_hash`, its id. `replacement` is a `KeyReplacementKind`: `invalid_replaced` here, `rebind` for the #864 door. V186 adds `replaced_row_hash TEXT` (NULL on rows written before V186) and `replacement_kind TEXT NOT NULL DEFAULT 'rebind'` with a CHECK for the two tokens. Rows from before V186 were all rebinds and read so. The key row is rewritten in place: the incoming envelope, every scrub (`additional_scrubs` included), `scrub_key_id`, a recomputed `persist_row_hash`, and `mutated_at` moved so peers whose cursor passed the row are served it again. Python reads the history through `list_key_registration_history`.
+
+The rebind door and the invalid-replace door now share one guarded write per backend (sqlite and postgres `write_replaced_key_registration`). The rebind additionally requires the stored row to be self-signed in its `WHERE`, as before.
+
+New variants on `pub` exhaustive enums, and how an adopter maps them:
+
+| Variant | Mapping |
+|---|---|
+| `register::ReplicatedKeyOutcome::InvalidReplaced` | **admitted**: the row now carries this record |
+| `register::RebindOutcome::InvalidReplaced` | **admitted**, same, at the local door |
+| `types::KeyReplacementKind::Rebind` / `::InvalidReplaced` (new enum) | audit only: which door replaced a history row's record |
+
+`KeyRegistrationHistoryRow` gains two `pub` fields, `replaced_row_hash` and `replacement`, both `#[serde(default)]`. That breaks Rust struct literals; JSON readers are unaffected. Genesis' baked-record apply treats `InvalidReplaced` as success, like `Upgraded` and `Rebound`.
+
+Witnesses in `src/federation/invalid_replace_invariants.rs`:
+
+- **I616** (memory, sqlite, postgres) covers the arm and every refusal around it. A valid stored row is refused `conflicting_version` and untouched. A pubkey swap, a changed claim and a failing incoming record are each refused with the row untouched. The holder's re-signed record gives `InvalidReplaced`: the row verifies, it is served again past a cursor that had passed it, the history row names the replaced row's hash and `invalid_replaced`, and a second apply is idempotent.
+- **I617** (memory, sqlite, postgres): the store step called directly refuses a stored row that verifies (`Conflict`). A failing anchor-scrubbed row is replaced by the holder's self-signed record instead of being refused `downgrade`, and the audit row keeps the old scrubber.
+- **I618** (memory, sqlite, postgres): a #864 rebind writes `replacement = rebind` and the replaced row's hash.
+- **I619** (sqlite, through `Engine`): `rebind_key_record` returns `{"outcome":"invalid_replaced"}`.
+- **I620** (memory, sqlite, postgres): a record a registered stranger signed does not replace the row, at the plan or at the store step, and the stored scrubber's re-signing does.
+- **I621**: the admissibility predicate, plus a memory witness through the plan and the store step. A role-gated row cannot clear `put_public_key`'s production-roster gate in a test, so the row is seeded past it. The clause lives in `register`, which every backend calls.
+
+RED before the fix (the arm made unreachable): I616, I617 and I620 fail on all three backends and I619 fails (`I617: a failing anchor-scrubbed row is replaced, not a downgrade refusal`). Mutants, each restored:
+
+| Mutant | Witnesses red |
+|---|---|
+| the plan drops "the stored row fails verification" | I616 on all three backends (`a stored row that VERIFIES is never replaced`) |
+| the store step drops the same precondition | I617 on all three backends (`the store step refuses to replace a row that verifies: Ok(InvalidReplaced)`) |
+| the signer clause dropped | I620 on all three backends, I621 predicate |
+| the role-gated clause dropped | I621 predicate and memory witness (`a role-gated row is not replaced: InvalidReplaced`) |
 
 ## [54.0.0] - 2026-10-09
 

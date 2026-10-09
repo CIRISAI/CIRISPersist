@@ -644,6 +644,16 @@ class Engine:
             Refusals are outcomes, not exceptions, so an apply loop stays
             total over unsolicited records.
 
+            v54.1.0: a refusal reading ``attester_key_unknown`` is the
+            RETRYABLE ordering gap (the scrubber's Key row has not landed
+            on this node; re-offer after the key plane, CIRISPersist#1042);
+            ``unverifiable_signature`` is terminal. Before v54.1.0 the
+            insert arm raised both as a bare ValueError.
+            ``"invalid_replaced"`` — the stored record failed
+            verification and this one (same pubkeys, same claim, signed by
+            the key itself or the stored scrubber) replaced it
+            (CIRISPersist#1044).
+
         Raises:
             ValueError: SignedKeyRecord JSON decode failure or a
                 malformed record no policy can classify.
@@ -1000,6 +1010,8 @@ class Engine:
 
         Raises:
             ValueError: ``federation_signature_invalid`` /
+                ``federation_attester_key_unknown`` (v54.1.0, #1042: the
+                attester's Key row has not landed here yet — RETRYABLE) /
                 ``federation_conflict`` / ``federation_reserved_prefix_emitter_mismatch``
                 / ``federation_trust_below_threshold`` (#123) /
                 ``federation_invalid_argument``.
@@ -1157,7 +1169,9 @@ class Engine:
         Raises:
             ValueError: SignedKeyRecord JSON decode failure, or a
                 federation verification/admission error (bad/missing
-                signature, hash mismatch, unknown signer, non-hybrid).
+                signature, hash mismatch, non-hybrid; an unknown signer is
+                ``federation_attester_key_unknown`` from v54.1.0, #1042 —
+                retryable once its Key row lands).
             RuntimeError: backend / IO error.
         """
 
