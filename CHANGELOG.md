@@ -72,6 +72,39 @@ Mutation-checked, each mutant red on memory and sqlite:
 | an unreadable term read as absent | term-bound officer, unreadable arm |
 | the instant lens dropped from the shared chain walk | term-bound officer, withdrawal |
 
+### Fixed — the licensure gate and fold share one chain function; a public read and list-by-authority (#1035)
+
+The door and the fold disagreed about which licences are an authority's. The door admitted a multi-hop `license` chain and then discarded the `delegation_id` it required. The fold required the named edge to be signed by the authority itself, so a two-hop delegate's admitted licence never entered the fold.
+
+- **One chain function.** `admission::licensure_issuance_at` is the verdict on one licensure row, judged at its signed `asserted_at`. The emitter in the authority set is `Authority`. No `delegation_id` is `Testimony`. A named edge that resolves is `Delegated`, and one that does not is `Unresolved` with a reason. `check_licensure_delegator_is_authority` and `row_was_issued_under_authority` are both projections of it.
+- **The named edge is verified.** It must exist, be a `delegates_to` carrying `license`, delegate to the emitter, and be an edge the `license` walk from the authority set traverses under the lens at `asserted_at`. The walk records the edges it traverses, so "lies on a live chain" is read from the walk itself. Each failure is its own token after `licensure_delegator_not_authority:`. The tokens are `named_edge_absent`, `named_edge_not_license_delegation`, `named_edge_not_onto_emitter`, `not_on_live_chain_at_asserted_at` and `authority_acts_by_quorum`. The error type is unchanged, so Python still sees the same exception class.
+- **`delegation_id` stays on the stored row.** It is signed in the envelope and the verdict names it.
+- **A community authority (#1036 ruling item 1).** When `authority_id` names a community this node holds, the walk roots at its authority set at `asserted_at`. Under `founder_only` that is the founders active at that instant, and a founder's own row is the affiliation's. Any other protocol makes a licence a quorum act, which a single-signed row or edge is not. Such a chain is refused as `authority_acts_by_quorum` until the cosigned licensure row of #1036 lands.
+- **Public reads.** `Engine::licensure_status_set` and `Engine::licences_issued_under` are new, as are the pyo3 `licensure_status_set` and `licences_issued_under_json`. Both are pinned `deontic` in `scripts/ffi_taxonomy.tsv`. `admission::licences_issued_under` lists every `licensure:{A}` row whose verdict is the authority's, newest first. No index keys a dimension alone, so it gathers candidate issuers first. These are the authority set plus every key a structural `license` walk reaches, at any instant and to the same depth cap. It then seeks each issuer's rows on `(attesting_key_id, dimension)`. The verdict, not the candidate walk, decides. The authority segment is matched exactly, so `licensure:acmecorp` is not acme's.
+- **`emitter_resolves_to_authority`** answers for a key now, with the same community roots.
+
+Not in this cut: item 4 of the issue, the typed licence payload. It waits on CIRISConstitution#161, and its field set ports with the #1036 plane move.
+
+Witnesses in `src/federation/licensure_chain_invariants.rs`, each on memory, sqlite and postgres:
+
+- **One chain** (`gate_and_fold_share_one_chain_1035_*`). A two-hop clerk's licence admits, is in the board's fold, and the verdict names its `delegation_id`. Four rows are refused with their exact tokens: one naming the manager's edge, one naming a licence row, one naming a missing edge, and one naming a stranger's edge onto the clerk while the clerk holds a live chain. The list is exactly the board's direct licence and the two-hop licence, newest first. A candidate's testimony and a `licensure:{board}corp` row are not listed. Withdrawing the manager later does not unlist the clerk's licence.
+- **Community authority** (`community_authority_roots_the_chain_1035_*`). In a `founder_only` affiliation a founder-rooted officer's licence and the founder's own row fold and list, and a non-founder member's absorbing `revoked` is testimony. In a `majority` affiliation a single founder's chain is refused as `authority_acts_by_quorum`.
+
+Mutation-checked, each mutant red on memory and sqlite:
+
+| Mutant | Witnesses red |
+|---|---|
+| the fold requires the named edge to be the authority's own (the pre-v54 fold) | one chain, community |
+| the door ignores `delegation_id` when any chain reaches the emitter (the pre-v54 door) | one chain, stranger-edge arm |
+| the onto-emitter check dropped | one chain, manager-edge arm |
+| the type and scope check dropped | one chain, the reason token changes |
+| "on the chain" read as "emitter reached" instead of "edge traversed" | one chain, stranger-edge arm |
+| the list drops the verdict | one chain, community |
+| the list matches the byte prefix only | one chain |
+| the list's candidate walk stops at depth 1 | one chain |
+| a community id resolved as a bare key | community |
+| every protocol treated as `founder_only` | community |
+
 ## [53.2.0] - 2026-10-08
 
 ### Changed — the tag is pushed once main's run EXISTS, not once it completes (#1008)

@@ -32,8 +32,10 @@ pub mod bodies {
         bare_edge_retraction, register, signed_row, store,
     };
     use crate::federation::admission::{
-        reachable_under_scope, DELEGATION_SCOPE_GRANT, DELEGATION_SCOPE_LICENSE,
-        DELEGATION_VALID_FROM_FIELD, DELEGATION_VALID_UNTIL_FIELD, MAX_MODERATION_DELEGATION_DEPTH,
+        licences_issued_under, licensure_issuance_at, reachable_under_scope,
+        resolve_licensure_authority, LicensureChainBreak, LicensureIssuance,
+        DELEGATION_SCOPE_GRANT, DELEGATION_SCOPE_LICENSE, DELEGATION_VALID_FROM_FIELD,
+        DELEGATION_VALID_UNTIL_FIELD, MAX_MODERATION_DELEGATION_DEPTH,
     };
     use crate::federation::licensure::{status_set_for, LicensureStatus};
     use crate::federation::tier_ingest::test_support::reseal;
@@ -495,6 +497,417 @@ pub mod bodies {
             "[{tag}] #1032: a term that has not begun confers nothing"
         );
     }
+
+    /// `row` is refused by the licensure gate with `reason`'s token.
+    pub(crate) async fn must_refuse_as(
+        dir: &dyn FederationDirectory,
+        row: &Attestation,
+        reason: LicensureChainBreak,
+        what: &str,
+    ) {
+        let err = put(dir, row)
+            .await
+            .expect_err(&format!("{what}: must be refused at the door"));
+        let text = format!("{err}");
+        assert!(
+            text.contains(REFUSAL) && text.contains(reason.as_str()),
+            "{what}: expected `{REFUSAL}: {}`, got {err}",
+            reason.as_str()
+        );
+        assert!(
+            dir.get_attestation(&row.attestation_id)
+                .await
+                .expect("read")
+                .is_none(),
+            "{what}: a refused row must not be stored"
+        );
+    }
+
+    fn ids(rows: &[Attestation]) -> BTreeSet<String> {
+        rows.iter().map(|r| r.attestation_id.clone()).collect()
+    }
+
+    /// #1035 — **the gate and the fold agree on chain depth, and the named
+    /// edge is verified.** A two-hop delegate's admitted issuance is FOUND by
+    /// the fold and by the list-by-authority read; a row naming an edge that is
+    /// not its own live `license` edge is refused, with the reason.
+    #[allow(clippy::too_many_lines)]
+    pub async fn exercise_gate_and_fold_share_one_chain(dir: &dyn FederationDirectory, tag: &str) {
+        let (board, holder) = keys(dir, tag).await;
+        let now = base();
+        let manager = officer(dir, tag, "manager").await;
+        let clerk = officer(dir, tag, "clerk").await;
+
+        // board → manager (may sub-delegate) → clerk: a two-hop `license` chain.
+        let hop1 = must_put(
+            dir,
+            &edge(
+                &board,
+                &manager,
+                &[DELEGATION_SCOPE_LICENSE],
+                now - Duration::hours(3),
+                &[("sub_delegation", serde_json::json!(true))],
+            ),
+            "the board appoints a licensing manager who may sub-delegate",
+        )
+        .await;
+        let hop2 = must_put(
+            dir,
+            &edge(
+                &manager,
+                &clerk,
+                &[DELEGATION_SCOPE_LICENSE],
+                now - Duration::minutes(170),
+                &[],
+            ),
+            "the manager appoints a clerk",
+        )
+        .await;
+
+        // The two-hop clerk's issuance: admitted AND found.
+        // Kills: the fold requiring the named edge to be the authority's own.
+        let two_hop = must_put(
+            dir,
+            &licence(
+                &clerk,
+                &holder,
+                &board,
+                "issued",
+                Some(&hop2.attestation_id),
+                now - Duration::hours(2),
+            ),
+            &format!("[{tag}] #1035: the two-hop clerk's licence admits"),
+        )
+        .await;
+        assert_eq!(
+            status_set_for(dir, &holder, &board, Utc::now())
+                .await
+                .expect("fold"),
+            BTreeSet::from([LicensureStatus::Issued]),
+            "[{tag}] #1035: a licence the door ADMITTED under a two-hop chain must be in the \
+             board's fold — the gate and the fold judge ONE chain"
+        );
+        assert_eq!(
+            licensure_issuance_at(
+                dir,
+                &resolve_licensure_authority(dir, &board)
+                    .await
+                    .expect("resolve"),
+                &two_hop,
+            )
+            .await
+            .expect("verdict"),
+            LicensureIssuance::Delegated {
+                delegation_id: hop2.attestation_id.clone()
+            },
+            "[{tag}] #1035: the stored row keeps the `delegation_id` it was signed with, \
+             and the verdict names it"
+        );
+        assert_eq!(
+            two_hop.attestation_envelope["delegation_id"],
+            serde_json::json!(hop2.attestation_id),
+            "[{tag}] #1035: `delegation_id` is kept on the stored row"
+        );
+
+        // The named edge must be onto the EMITTER. `hop1` is live and on the
+        // chain, but it delegates to the manager, not the clerk.
+        // Kills: dropping the onto-emitter check.
+        must_refuse_as(
+            dir,
+            &licence(
+                &clerk,
+                &holder,
+                &board,
+                "probation",
+                Some(&hop1.attestation_id),
+                now,
+            ),
+            LicensureChainBreak::NamedEdgeNotOntoEmitter,
+            &format!("[{tag}] #1035: a row naming someone else's edge"),
+        )
+        .await;
+
+        // The named row must be a `license` delegation.
+        // Kills: dropping the type/scope check (the reason token changes).
+        must_refuse_as(
+            dir,
+            &licence(
+                &clerk,
+                &holder,
+                &board,
+                "probation",
+                Some(&two_hop.attestation_id),
+                now,
+            ),
+            LicensureChainBreak::NamedEdgeNotLicense,
+            &format!("[{tag}] #1035: a row naming a licence instead of an edge"),
+        )
+        .await;
+
+        // The named row must exist.
+        must_refuse_as(
+            dir,
+            &licence(
+                &clerk,
+                &holder,
+                &board,
+                "probation",
+                Some(&uuid::Uuid::new_v4().to_string()),
+                now,
+            ),
+            LicensureChainBreak::NamedEdgeAbsent,
+            &format!("[{tag}] #1035: a row naming an edge nobody holds"),
+        )
+        .await;
+
+        // THE `let _ = delegation_id;` CASE. The clerk holds a live chain, but
+        // the row names a DIFFERENT edge onto the clerk — one a stranger signed,
+        // on no chain from the board. The old gate admitted it (any chain to
+        // the emitter passed, whatever the row named).
+        // Kills: the gate ignoring `delegation_id`.
+        let stranger = officer(dir, tag, "stranger").await;
+        let side = must_put(
+            dir,
+            &edge(
+                &stranger,
+                &clerk,
+                &[DELEGATION_SCOPE_LICENSE],
+                now - Duration::hours(3),
+                &[],
+            ),
+            "a stranger 'appoints' the clerk",
+        )
+        .await;
+        must_refuse_as(
+            dir,
+            &licence(
+                &clerk,
+                &holder,
+                &board,
+                "probation",
+                Some(&side.attestation_id),
+                now,
+            ),
+            LicensureChainBreak::NotOnLiveChain,
+            &format!("[{tag}] #1035: a row naming an edge that is not on the board's chain"),
+        )
+        .await;
+
+        // ── list-by-authority: exactly the fold's verdict, per row ──
+        let holder2 = format!("{tag}-holder2");
+        register(dir, &holder2, &[identity_type::USER]).await;
+        let direct = must_put(
+            dir,
+            &licence(
+                &board,
+                &holder2,
+                &board,
+                "issued",
+                None,
+                now - Duration::hours(1),
+            ),
+            "the board licenses a second holder itself",
+        )
+        .await;
+        // A candidate issuer's TESTIMONY (no delegation claimed) is not listed.
+        // Kills: dropping the verdict filter from the list.
+        let testimony = must_put(
+            dir,
+            &licence(
+                &clerk,
+                &holder2,
+                &board,
+                "suspended",
+                None,
+                now - Duration::minutes(30),
+            ),
+            "the clerk writes testimony about the board's licence",
+        )
+        .await;
+        // A neighbouring authority sharing the byte prefix is not listed.
+        // Kills: dropping the exact authority-segment check.
+        let neighbour = must_put(
+            dir,
+            &licence(
+                &board,
+                &holder2,
+                &format!("{board}corp"),
+                "issued",
+                None,
+                now - Duration::minutes(20),
+            ),
+            "the board writes under a different authority id",
+        )
+        .await;
+        let listed = licences_issued_under(dir, &board)
+            .await
+            .expect("licences_issued_under");
+        assert_eq!(
+            ids(&listed),
+            BTreeSet::from([
+                two_hop.attestation_id.clone(),
+                direct.attestation_id.clone()
+            ]),
+            "[{tag}] #1035: the board's licences are its own and the two-hop clerk's — not \
+             the clerk's testimony ({}), not `licensure:{board}corp` ({})",
+            testimony.attestation_id,
+            neighbour.attestation_id
+        );
+        assert_eq!(
+            listed[0].attestation_id, direct.attestation_id,
+            "[{tag}] #1035: newest first"
+        );
+
+        // Withdrawing the manager later does not unlist (or un-fold) what the
+        // clerk issued while the chain was live.
+        must_put(
+            dir,
+            &bare_edge_retraction(&board, &manager),
+            "the board withdraws the manager",
+        )
+        .await;
+        assert!(
+            ids(&licences_issued_under(dir, &board).await.expect("list"))
+                .contains(&two_hop.attestation_id),
+            "[{tag}] #1035/#1032: the list reads the same signed-instant verdict as the fold"
+        );
+    }
+
+    /// #1035 / #1036 ruling item 1 — **a `licensure:{community_key_id}` row's
+    /// authority set is the community's**: a chain rooted at a founder of a
+    /// `founder_only` affiliation admits and folds; under a protocol that
+    /// needs a quorum, no single-signed chain stands for the affiliation.
+    pub async fn exercise_community_authority_roots_the_chain(
+        dir: &dyn FederationDirectory,
+        tag: &str,
+    ) {
+        use crate::federation::room_roster_authority_invariants::bodies::make_group;
+        use crate::federation::types::consensus_protocol;
+        let now = base();
+        let holder = format!("{tag}-holder");
+        register(dir, &holder, &[identity_type::USER]).await;
+
+        // A founder_only affiliation: alice founds it.
+        let (aff, keys) = make_group(
+            dir,
+            &format!("{tag}-fo"),
+            consensus_protocol::FOUNDER_ONLY,
+            &["alice", "bob"],
+            1,
+            None,
+            None,
+        )
+        .await;
+        let (alice, bob) = (keys[0].clone(), keys[1].clone());
+        let officer_k = officer(dir, tag, "officer").await;
+        let appointment = must_put(
+            dir,
+            &edge(
+                &alice,
+                &officer_k,
+                &[DELEGATION_SCOPE_LICENSE],
+                now - Duration::hours(2),
+                &[],
+            ),
+            "the founder appoints a licensing officer for the affiliation",
+        )
+        .await;
+        // Kills: resolving the community id as a bare key.
+        let by_officer = must_put(
+            dir,
+            &licence(
+                &officer_k,
+                &holder,
+                &aff,
+                "issued",
+                Some(&appointment.attestation_id),
+                now - Duration::hours(1),
+            ),
+            &format!("[{tag}] #1036.1: a chain rooted at the affiliation's founder admits"),
+        )
+        .await;
+        // The founder's own direct row is the affiliation's (founder_only says
+        // one founder suffices); a non-founder member's is testimony.
+        let by_founder = must_put(
+            dir,
+            &licence(
+                &alice,
+                &holder,
+                &aff,
+                "probation",
+                None,
+                now - Duration::minutes(50),
+            ),
+            "the founder issues directly",
+        )
+        .await;
+        must_put(
+            dir,
+            &licence(
+                &bob,
+                &holder,
+                &aff,
+                "revoked",
+                None,
+                now - Duration::minutes(40),
+            ),
+            "a non-founder member writes testimony",
+        )
+        .await;
+        assert_eq!(
+            status_set_for(dir, &holder, &aff, Utc::now())
+                .await
+                .expect("fold"),
+            BTreeSet::from([LicensureStatus::Issued, LicensureStatus::Probation]),
+            "[{tag}] #1036.1: the officer's and the founder's rows are the affiliation's; a \
+             non-founder's absorbing `revoked` is testimony and binds nobody"
+        );
+        assert_eq!(
+            ids(&licences_issued_under(dir, &aff).await.expect("list")),
+            BTreeSet::from([by_officer.attestation_id, by_founder.attestation_id]),
+            "[{tag}] #1036.1: the list-by-authority roots at the affiliation's founders"
+        );
+
+        // A majority affiliation: no single founder's chain stands for it.
+        // Kills: treating every protocol as founder_only.
+        let (maj, mkeys) = make_group(
+            dir,
+            &format!("{tag}-mj"),
+            consensus_protocol::MAJORITY,
+            &["carol", "dave"],
+            1,
+            None,
+            None,
+        )
+        .await;
+        let officer2 = officer(dir, tag, "officer2").await;
+        let lone = must_put(
+            dir,
+            &edge(
+                &mkeys[0],
+                &officer2,
+                &[DELEGATION_SCOPE_LICENSE],
+                now - Duration::hours(2),
+                &[],
+            ),
+            "one founder of a majority affiliation appoints an officer alone",
+        )
+        .await;
+        must_refuse_as(
+            dir,
+            &licence(
+                &officer2,
+                &holder,
+                &maj,
+                "issued",
+                Some(&lone.attestation_id),
+                now - Duration::hours(1),
+            ),
+            LicensureChainBreak::AuthorityActsByQuorum,
+            &format!("[{tag}] #1036.1: a single founder's chain under `majority`"),
+        )
+        .await;
+    }
 }
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
@@ -559,5 +972,19 @@ mod run {
         grant_walk_honours_the_term_1032_sqlite,
         grant_walk_honours_the_term_1032_postgres,
         "grant-term"
+    );
+    on_every_backend!(
+        exercise_gate_and_fold_share_one_chain,
+        gate_and_fold_share_one_chain_1035_memory,
+        gate_and_fold_share_one_chain_1035_sqlite,
+        gate_and_fold_share_one_chain_1035_postgres,
+        "lic-one"
+    );
+    on_every_backend!(
+        exercise_community_authority_roots_the_chain,
+        community_authority_roots_the_chain_1035_memory,
+        community_authority_roots_the_chain_1035_sqlite,
+        community_authority_roots_the_chain_1035_postgres,
+        "lic-aff"
     );
 }

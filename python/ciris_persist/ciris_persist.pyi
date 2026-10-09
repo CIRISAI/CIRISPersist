@@ -904,6 +904,12 @@ class Engine:
     def ledger_register(self, owner_key_id: str, unit: str, standard_version: str) -> str:
         """(derived) deontic — CC 3.3.10.1 L1 — register (or idempotently re-register) the ledger for (owner_key_id, unit, standard_version). Returns JSON {"ledger_id": .., "outc... [build-conditional: #[cfg(feature = "ledgers")]]"""
 
+    def licences_issued_under_json(self, authority_id: str) -> str:
+        """(derived) deontic — v54.0.0 (CIRISPersist#1035 item 3) — every licence issued under authority_id (the licensure:{authority_id} rows the fold's own verdict accepts: the..."""
+
+    def licensure_status_set(self, subject_key_id: str, authority_id: str) -> list[str]:
+        """(derived) deontic — v54.0.0 (CIRISPersist#1035 item 3) — the live licensure status SET for (subject_key_id, authority_id) now, as wire tokens ("issued", "probation", …..."""
+
     def may_release_copy_json(
         self, object_kind: str, object_id: str, object_id2: str | None = None
     ) -> str:
