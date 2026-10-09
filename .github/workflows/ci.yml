@@ -662,6 +662,16 @@ jobs:
       # registry alias for cross-version incremental restore (see the ciriscache
       # composite). Was two full saves back-to-back (~18.5 min on the v17.5.0 tag
       # run); now push-once + ~1s retag.
+      # v54.1.0 (#1022) — this crate's own lib/test/bench outputs go before the
+      # save: every run rebuilds them on a new commit and no downstream build
+      # can reuse them, yet they were most of target/ (21.9 GB on the v54.0.0
+      # tag run's core-1, 12 GB budget), so the save's oldest-mtime prune
+      # deleted DEPENDENCY fingerprints instead and the next restore recompiled
+      # their dependents. Trimmed, target/ fits and nothing is pruned.
+      - name: drop this crate's own build outputs before the CIRISCache save (#1022)
+        if: (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) && matrix.substrate.name == 'core-1'
+        shell: bash
+        run: for py in python3 python; do "$py" -c 'import sys' 2>/dev/null && exec "$py" scripts/ci_cache_trim.py target; done; echo '::warning::no python for the cache trim'
       - name: target/ size before the CIRISCache save (#1022 budget measurement)
         if: (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) && matrix.substrate.name == 'core-1'
         shell: bash
@@ -869,6 +879,11 @@ jobs:
         run: cargo build --release --features server
       # Save under the macos-x86_64 key + alias the rolling phead (push-once +
       # retag, #458). continue-on-error: a flaky/queued Intel runner is non-fatal.
+      # v54.1.0 (#1022) — this crate's own outputs go first; see the core-1 save.
+      - name: drop this crate's own build outputs before the CIRISCache save (#1022)
+        if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: for py in python3 python; do "$py" -c 'import sys' 2>/dev/null && exec "$py" scripts/ci_cache_trim.py target; done; echo '::warning::no python for the cache trim'
       - name: target/ size before the CIRISCache save (#1022 budget measurement)
         if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
         shell: bash
@@ -1060,6 +1075,11 @@ jobs:
       # second ~9-min tar+push of byte-identical content). `phead` lets the NEXT
       # version's build restore this warm target/ and recompile only changed
       # files instead of rebuilding persist's deps from the verify baseline.
+      # v54.1.0 (#1022) — this crate's own outputs go first; see the core-1 save.
+      - name: drop this crate's own build outputs before the CIRISCache save (#1022)
+        if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: for py in python3 python; do "$py" -c 'import sys' 2>/dev/null && exec "$py" scripts/ci_cache_trim.py target; done; echo '::warning::no python for the cache trim'
       - name: target/ size before the CIRISCache save (#1022 budget measurement)
         if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
         shell: bash
@@ -1325,6 +1345,11 @@ jobs:
       # second ~9-min tar+push of byte-identical content). `phead` lets the NEXT
       # version's build restore this warm target/ and recompile only changed
       # files instead of rebuilding persist's deps from the verify baseline.
+      # v54.1.0 (#1022) — this crate's own outputs go first; see the core-1 save.
+      - name: drop this crate's own build outputs before the CIRISCache save (#1022)
+        if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: for py in python3 python; do "$py" -c 'import sys' 2>/dev/null && exec "$py" scripts/ci_cache_trim.py target; done; echo '::warning::no python for the cache trim'
       - name: target/ size before the CIRISCache save (#1022 budget measurement)
         if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
         shell: bash
@@ -1583,6 +1608,10 @@ jobs:
       # nightly job.
       - name: mutation matrix witnesses
         run: python3 scripts/mutants_matrix_test.py
+      # v54.1.0 (#1022) — the pre-save trim removes this crate's outputs and no
+      # dependency's (fixture target/, no cargo).
+      - name: cache trim witnesses
+        run: python3 scripts/ci_cache_trim_test.py
       # v43.0.0 (BLOB_ENCRYPTION_AT_REST.md I22) — the storage floor token is
       # unconstructible outside the crate. The witness is a `compile_fail`
       # doctest, and nextest never runs doctests, so it gets its own step.
@@ -2117,6 +2146,11 @@ jobs:
       # `alias-keys` retags the rolling `phead` blob onto the same manifest
       # server-side (no second tar+push). Windows was the worst offender here:
       # the wheel target/ is large and a second full push serialized ~9 min.
+      # v54.1.0 (#1022) — this crate's own outputs go first; see the core-1 save.
+      - name: drop this crate's own build outputs before the CIRISCache save (#1022)
+        if: (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) && (matrix.label == 'linux-aarch64' || matrix.label == 'windows-x86_64')
+        shell: bash
+        run: for py in python3 python; do "$py" -c 'import sys' 2>/dev/null && exec "$py" scripts/ci_cache_trim.py target; done; echo '::warning::no python for the cache trim'
       - name: target/ size before the CIRISCache save (#1022 budget measurement)
         if: (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) && (matrix.label == 'linux-aarch64' || matrix.label == 'windows-x86_64')
         shell: bash

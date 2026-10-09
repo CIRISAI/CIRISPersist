@@ -177,6 +177,35 @@ off a test that does not use that database.
   --test-threads=16`, interleaved A/A/B/B/B: 23.5 / 23.5 s with the markers, 4.9 / 4.5 / 5.0 s
   without.
 
+### Fixed — the CIRISCache save pruned dependency fingerprints, so the test legs recompiled everything they restored (#1022)
+
+Measured, not inferred. The v54.0.0 PR run's telemetry leg spent 99 s restoring
+`…-phead-enone-v19.0.0` (the v20.1.0 key did not exist yet) and then compiled **436** crates,
+`proc-macro2` first; the tag run's core-1, the very leg that saves the blob, did the same. The
+blob is not release-only (the key's `-release-` is a cross-repo name token): the v20.1.0 blob
+that tag run published holds 10.5 GB of `target/debug/deps` beside 1 GB of `target/release`.
+
+The cause is the save's budget prune. core-1's target/ was 21.9 GB against `max-size-mb: 12288`,
+and `cc_prune_lru` deletes the OLDEST-mtime files. Cargo never touches a fresh unit, so the
+oldest files are the dependencies the run reused, and the newest are ciris-persist's own lib,
+test and bench binaries, which every commit rebuilds and no downstream build can use. The
+published blob kept 7.7 GB of those and lost dependency fingerprints.
+
+Reproduced in a container (ubuntu 24.04, rustc 1.97.0, the CI paths), restoring the published
+v20.1.0 blob over the v54.0.0 tree: a core-1 build compiled 27 crates, of which 8 had no
+fingerprint left, 17 sat behind those, plus pyo3 and persist. **Fix:** `scripts/ci_cache_trim.py`
+removes this crate's own outputs (target names from `cargo metadata`; deps, examples,
+uplifted copies, fingerprint, build and incremental dirs, cross-target dirs too) before each of
+the five saves. On that restored tree it removed 9.19 GiB and left 4.39 GiB, under every budget.
+A rebuild over the trimmed tree compiled 3 crates (pyo3-ffi, pyo3, persist) for core-1, and the
+same 3 for the telemetry leg's feature set. `scripts/ci_cache_trim_test.py` (fixture target/,
+runs in CI lint and certify's fast tier `cachetrim`) holds that it removes every own output and
+no dependency's, prefix-named crates included; three mutations of its matchers were each red.
+
+Still to see on GitHub: the first main or tag save after this lands, then a PR restoring it.
+pyo3-ffi reruns because its build script tracks `PATH`, which holds the runner's per-job temp
+directory; setting `PYO3_PYTHON` stops that (shown in the container) and is left for a later cut.
+
 ### Changed — Verify 20.1.0 adopted: the three verify crates and the wheel floor move together (#992)
 
 `ciris-verify-core`, `ciris-keyring` and `ciris-crypto` move from tag v19.0.0 to v20.1.0 at all seven pin sites in one cut, since a split re-pin forks `ciris_crypto`. The wheel's `Requires-Dist` moves to `ciris-verify>=20.1.0,<21`. The floor is 20.1.0 because that minor ships the wheel-identity refusals the tag job's signer now relies on. The lockfile gains one transitive crate, `zlib-rs`, which verify-core's wheel reader pulls in. The test-anchor witness I162 had typed the expected verify tag as `v19.0.0` and went red on the flip, so it now reads every CIRISVerify pin from `Cargo.toml` and requires them to name one tag.
