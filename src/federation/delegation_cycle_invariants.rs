@@ -58,7 +58,7 @@ pub mod bodies {
     };
     use crate::federation::{Error, FederationDirectory};
 
-    async fn agent(d: &dyn FederationDirectory, k: &str) {
+    pub(crate) async fn agent(d: &dyn FederationDirectory, k: &str) {
         ts::register_hybrid_key_as(d, k, k, identity_type::AGENT).await;
     }
 
@@ -133,7 +133,7 @@ pub mod bodies {
     }
 
     /// Stage a LOCAL `delegates_to(from → to)` and describe its crossing.
-    async fn stage_local_edge(
+    pub(crate) async fn stage_local_edge(
         d: &dyn FederationDirectory,
         from: &str,
         to: &str,
@@ -171,7 +171,7 @@ pub mod bodies {
     }
 
     /// Is a federation-tier `delegates_to(from → to)` stored?
-    async fn has_fed_edge(d: &dyn FederationDirectory, from: &str, to: &str) -> bool {
+    pub(crate) async fn has_fed_edge(d: &dyn FederationDirectory, from: &str, to: &str) -> bool {
         d.list_attestations_by(from).await.unwrap().iter().any(|r| {
             r.attestation_type == attestation_type::DELEGATES_TO
                 && r.attested_key_id == to

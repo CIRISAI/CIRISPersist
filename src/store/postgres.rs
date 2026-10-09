@@ -7085,7 +7085,13 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 .map_err(|e| {
                     crate::federation::Error::Backend(format!("delegation cycle lock: {e}"))
                 })?;
-                crate::federation::admission::check_delegation_cycle_admission(self, &row).await?;
+                // v54.0.0 (Codex round 2 on PR #1050) — on THIS transaction's
+                // client: a directory read here would check out a second one.
+                crate::federation::admission::check_delegation_cycle_admission(
+                    &PgTxDelegationGraph(&*tx),
+                    &row,
+                )
+                .await?;
                 #[cfg(test)]
                 self.test_hooks()
                     .pause_if_armed("delegation_cycle_before_insert")
@@ -7368,39 +7374,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .get_client()
             .await
             .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
-        let rows = client
-            .query(
-                // weight::float8 AS weight — tokio-postgres has no
-                // built-in NUMERIC<->f64 deserializer, so the read
-                // path mirrors the write-path `$5::float8::numeric`
-                // cast. NUMERIC→FLOAT8 is the inverse hop;
-                // pg_row_to_attestation reads weight as Option<f64>.
-                "SELECT attestation_id::text, attesting_key_id, attested_key_id, attestation_type, \
-                    weight::float8 AS weight, asserted_at, expires_at, attestation_envelope, \
-                    original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
-                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at, additional_scrubs \
-                 FROM cirislens.federation_attestations \
-                 WHERE attested_key_id = $1 AND tier = 'federation' \
-                 ORDER BY asserted_at DESC",
-                &[&attested_key_id],
-            )
-            .await
-            .map_err(|e| {
-                crate::federation::Error::Backend(format!("list_attestations_for: {e}"))
-            })?;
-        let bytes = pg_envelope_bytes(&rows);
-        rows.into_iter()
-            .map(pg_row_to_attestation)
-            .collect::<Result<Vec<_>, _>>()
-            .inspect(|rows| {
-                crate::observe::record_read(
-                    crate::observe::StoreBackend::Postgres,
-                    crate::observe::Door::ListAttestationsFor,
-                    attested_key_id,
-                    rows,
-                    bytes,
-                )
-            })
+        pg_list_attestations_for(&**client, attested_key_id).await
     }
 
     async fn list_attestations_by(
@@ -7411,33 +7385,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .get_client()
             .await
             .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
-        let rows = client
-            .query(
-                // weight::float8 AS weight — see list_attestations_for.
-                "SELECT attestation_id::text, attesting_key_id, attested_key_id, attestation_type, \
-                    weight::float8 AS weight, asserted_at, expires_at, attestation_envelope, \
-                    original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
-                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at, additional_scrubs \
-                 FROM cirislens.federation_attestations \
-                 WHERE attesting_key_id = $1 AND tier = 'federation' \
-                 ORDER BY asserted_at DESC",
-                &[&attesting_key_id],
-            )
-            .await
-            .map_err(|e| crate::federation::Error::Backend(format!("list_attestations_by: {e}")))?;
-        let bytes = pg_envelope_bytes(&rows);
-        rows.into_iter()
-            .map(pg_row_to_attestation)
-            .collect::<Result<Vec<_>, _>>()
-            .inspect(|rows| {
-                crate::observe::record_read(
-                    crate::observe::StoreBackend::Postgres,
-                    crate::observe::Door::ListAttestationsBy,
-                    attesting_key_id,
-                    rows,
-                    bytes,
-                )
-            })
+        pg_list_attestations_by(&**client, attesting_key_id).await
     }
 
     /// v53.1.5 — V137's `(attesting_key_id, dimension COLLATE "C")` seek;
@@ -14726,7 +14674,13 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             )
             .await
             .map_err(|e| Error::Backend(format!("delegation cycle lock: {e}")))?;
-            crate::federation::admission::check_delegation_cycle_admission(self, &row).await?;
+            // v54.0.0 (Codex round 2 on PR #1050) — on THIS transaction's
+            // client (see `put_attestation`).
+            crate::federation::admission::check_delegation_cycle_admission(
+                &PgTxDelegationGraph(&*tx),
+                &row,
+            )
+            .await?;
             #[cfg(test)]
             self.test_hooks()
                 .pause_if_armed("delegation_cycle_before_crossing")
@@ -23520,6 +23474,114 @@ fn decode_ed25519_b64(b64: &str) -> Result<VerifyingKey, Error> {
     }
     let arr: [u8; 32] = bytes.as_slice().try_into().expect("length-checked");
     VerifyingKey::from_bytes(&arr).map_err(|e| Error::Backend(format!("public_key parse: {e}")))
+}
+
+/// v54.0.0 (Codex round 2 on PR #1050) — `list_attestations_for` on any
+/// client: the directory method's own statement, so a caller holding a
+/// transaction reads through it instead of checking out another client.
+async fn pg_list_attestations_for<C>(
+    client: &C,
+    attested_key_id: &str,
+) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error>
+where
+    C: tokio_postgres::GenericClient + Sync,
+{
+    let rows = client
+        .query(
+            // weight::float8 AS weight — tokio-postgres has no
+            // built-in NUMERIC<->f64 deserializer, so the read
+            // path mirrors the write-path `$5::float8::numeric`
+            // cast. NUMERIC→FLOAT8 is the inverse hop;
+            // pg_row_to_attestation reads weight as Option<f64>.
+            "SELECT attestation_id::text, attesting_key_id, attested_key_id, attestation_type, \
+                weight::float8 AS weight, asserted_at, expires_at, attestation_envelope, \
+                original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
+                scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at, additional_scrubs \
+             FROM cirislens.federation_attestations \
+             WHERE attested_key_id = $1 AND tier = 'federation' \
+             ORDER BY asserted_at DESC",
+            &[&attested_key_id],
+        )
+        .await
+        .map_err(|e| crate::federation::Error::Backend(format!("list_attestations_for: {e}")))?;
+    let bytes = pg_envelope_bytes(&rows);
+    rows.into_iter()
+        .map(pg_row_to_attestation)
+        .collect::<Result<Vec<_>, _>>()
+        .inspect(|rows| {
+            crate::observe::record_read(
+                crate::observe::StoreBackend::Postgres,
+                crate::observe::Door::ListAttestationsFor,
+                attested_key_id,
+                rows,
+                bytes,
+            )
+        })
+}
+
+/// v54.0.0 (Codex round 2 on PR #1050) — `list_attestations_by` on any
+/// client (see [`pg_list_attestations_for`]).
+async fn pg_list_attestations_by<C>(
+    client: &C,
+    attesting_key_id: &str,
+) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error>
+where
+    C: tokio_postgres::GenericClient + Sync,
+{
+    let rows = client
+        .query(
+            // weight::float8 AS weight — see pg_list_attestations_for.
+            "SELECT attestation_id::text, attesting_key_id, attested_key_id, attestation_type, \
+                weight::float8 AS weight, asserted_at, expires_at, attestation_envelope, \
+                original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
+                scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at, additional_scrubs \
+             FROM cirislens.federation_attestations \
+             WHERE attesting_key_id = $1 AND tier = 'federation' \
+             ORDER BY asserted_at DESC",
+            &[&attesting_key_id],
+        )
+        .await
+        .map_err(|e| crate::federation::Error::Backend(format!("list_attestations_by: {e}")))?;
+    let bytes = pg_envelope_bytes(&rows);
+    rows.into_iter()
+        .map(pg_row_to_attestation)
+        .collect::<Result<Vec<_>, _>>()
+        .inspect(|rows| {
+            crate::observe::record_read(
+                crate::observe::StoreBackend::Postgres,
+                crate::observe::Door::ListAttestationsBy,
+                attesting_key_id,
+                rows,
+                bytes,
+            )
+        })
+}
+
+/// v54.0.0 (Codex round 2 on PR #1050) — the cycle gate's two walk reads
+/// ([`DelegationGraphReads`](crate::federation::admission::DelegationGraphReads))
+/// answered on the transaction that holds the delegation advisory lock. The
+/// re-check under the lock reads through this, never through the backend, so
+/// it takes no second pooled client while the lock's transaction holds one
+/// (I602), and it reads exactly what that transaction sees.
+struct PgTxDelegationGraph<'a, C>(&'a C);
+
+#[async_trait::async_trait]
+impl<C> crate::federation::admission::DelegationGraphReads for PgTxDelegationGraph<'_, C>
+where
+    C: tokio_postgres::GenericClient + Sync,
+{
+    async fn list_attestations_by(
+        &self,
+        attesting_key_id: &str,
+    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
+        pg_list_attestations_by(self.0, attesting_key_id).await
+    }
+    async fn list_attestations_for(
+        &self,
+        attested_key_id: &str,
+    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
+        pg_list_attestations_for(self.0, attested_key_id).await
+    }
 }
 
 /// v54.0.0 (Codex on PR #1050) — the seed that namespaces the

@@ -15157,10 +15157,13 @@ pub async fn holds_grant_delegation(
 /// `delegates_to` gates, AND [`check_promotion_admission`]: the walks read
 /// the federation tier only, so a local-tier edge closes nothing until it is
 /// promoted, and the graph may have grown since its local write.
-pub async fn check_delegation_cycle_admission(
-    directory: &dyn super::FederationDirectory,
+pub async fn check_delegation_cycle_admission<G>(
+    directory: &G,
     row: &super::Attestation,
-) -> Result<(), Error> {
+) -> Result<(), Error>
+where
+    G: DelegationGraphReads + ?Sized,
+{
     if row.attestation_type != attestation_type::DELEGATES_TO {
         return Ok(());
     }
@@ -15224,6 +15227,52 @@ pub(crate) fn delegation_cycle_gated(row: &super::Attestation) -> bool {
         && row.attesting_key_id != row.attested_key_id
 }
 
+/// v54.0.0 (Codex round 2 on PR #1050) — **the two reads the cycle gate's
+/// walk makes**, and nothing else: every `delegates_to` (and the retractions
+/// beside it) a key issued, and every row naming a key. Every
+/// [`FederationDirectory`](super::FederationDirectory) answers them through
+/// its own `list_attestations_by` / `list_attestations_for`.
+///
+/// The postgres backend re-runs the gate inside the transaction that holds
+/// the delegation advisory lock, and that transaction owns its pooled client.
+/// Asked through the directory, each walk read checked out ANOTHER client: on
+/// a one-connection pool, or a pool whose every connection was held that way,
+/// the write waited forever for a connection only it could release (I602).
+/// So postgres answers these two reads on the lock's own transaction, through
+/// the SAME statements its directory methods run.
+#[async_trait::async_trait]
+pub trait DelegationGraphReads: Send + Sync {
+    /// The federation-tier rows `attesting_key_id` issued, newest first.
+    async fn list_attestations_by(
+        &self,
+        attesting_key_id: &str,
+    ) -> Result<Vec<super::Attestation>, Error>;
+    /// The federation-tier rows naming `attested_key_id`, newest first.
+    async fn list_attestations_for(
+        &self,
+        attested_key_id: &str,
+    ) -> Result<Vec<super::Attestation>, Error>;
+}
+
+#[async_trait::async_trait]
+impl<D> DelegationGraphReads for D
+where
+    D: super::FederationDirectory + ?Sized,
+{
+    async fn list_attestations_by(
+        &self,
+        attesting_key_id: &str,
+    ) -> Result<Vec<super::Attestation>, Error> {
+        super::FederationDirectory::list_attestations_by(self, attesting_key_id).await
+    }
+    async fn list_attestations_for(
+        &self,
+        attested_key_id: &str,
+    ) -> Result<Vec<super::Attestation>, Error> {
+        super::FederationDirectory::list_attestations_for(self, attested_key_id).await
+    }
+}
+
 /// v54.0.0 (Codex on PR #1050) — the postgres advisory-lock key every
 /// [`delegation_cycle_gated`] write takes in its insert transaction
 /// (`pg_advisory_xact_lock(DELEGATION_CYCLE_LOCK_KEY)`), so a cycle check and
@@ -15254,12 +15303,15 @@ fn is_trust_plane_edge(row: &super::Attestation) -> bool {
 /// when there is none. Unscoped, unattenuated: it asks whether the graph
 /// CONNECTS the two keys, not whether a duty flows. Edge liveness is the
 /// reading [`check_delegation_cycle_admission`] documents.
-pub(crate) async fn delegation_path_hops(
-    directory: &dyn super::FederationDirectory,
+pub(crate) async fn delegation_path_hops<G>(
+    directory: &G,
     from: &str,
     to: &str,
     now: chrono::DateTime<chrono::Utc>,
-) -> Result<Option<usize>, Error> {
+) -> Result<Option<usize>, Error>
+where
+    G: DelegationGraphReads + ?Sized,
+{
     use std::collections::{HashMap, HashSet, VecDeque};
     let mut visited: HashSet<String> = HashSet::from([from.to_owned()]);
     let mut queue: VecDeque<(String, usize)> = VecDeque::from([(from.to_owned(), 0)]);
