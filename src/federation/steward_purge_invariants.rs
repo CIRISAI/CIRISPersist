@@ -470,12 +470,30 @@ pub(crate) mod bodies {
             "a claimant that is not a rooted trust root",
             sign(not_root, &[cc::FOUNDERS[0], cc::FOUNDERS[1]]),
         ));
+        // Each case is refused BY its own clause: the reason names it, so a
+        // case that an earlier clause happens to refuse cannot stand in.
+        let clause = |what: &str| match what {
+            "no cosignature" => "carries no cosignature",
+            "one of quorum:2/3" => "consensus_protocol",
+            "a founder quorum with one founder signing twice" => "signed twice",
+            "a forged cosignature" => "does not verify",
+            "another basis" => "does not authorise a steward purge",
+            "an expired notice" => "expired",
+            "a claimant that is not a rooted trust root" => "no community row",
+            _ => "is not a founder",
+        };
         for (what, notice) in cases {
             let e = sp::purge_rows(dir, &sel, &notice, NODE, t)
                 .await
                 .expect_err(what);
             let (tok, body) = refusal(&e);
             assert_eq!(tok, token::UNAUTHORISED, "I650 {what}: {body}");
+            assert!(
+                body["reason"]
+                    .as_str()
+                    .is_some_and(|r| r.contains(clause(what))),
+                "I650 {what}: refused by another clause: {body}"
+            );
             assert_eq!(e.kind(), "purge_unauthorised", "I650 the kind IS the token");
             assert_nothing_written(d, &notice).await;
         }
