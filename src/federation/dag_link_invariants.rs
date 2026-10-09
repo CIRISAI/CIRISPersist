@@ -691,10 +691,28 @@ pub(crate) mod bodies {
         B: BlobStorage + FederationDirectory + LinkSeam + Sync + 'static,
     {
         let p = pair(dsn_a, dsn_b, run, pick, "i600").await;
-        // Three manifests A cannot open (sealed under a viewer's associated
-        // data), unlinked as a pre-V176 DAG would be.
+        // Shas are uniform, so the order is arranged by selection. Every seal
+        // writes its relation; only the manifests this witness UNLINKS are
+        // visible to the sweep. First a linkable DAG in the upper half of the
+        // sha order (each candidate: 1/2); the others stay linked.
+        let mut good = None;
+        for t in 0..64 {
+            let m = write_and_seal(&p, &format!("i600-g{t}-{run}"), 2).await;
+            if m[0] >= 0x80 {
+                good = Some(m);
+                break;
+            }
+        }
+        let good = good.expect("I600 precondition: a DAG in the upper half of the sha order");
+        let want = p.a.chunks_of_manifest(&good).await.unwrap();
+        // Then three manifests A cannot open (sealed under a viewer's
+        // associated data) that sort BEFORE it (each: at least 1/2); one that
+        // sorts after keeps its relation.
         let mut unopenable = Vec::new();
-        for n in 0..3 {
+        for n in 0..128usize {
+            if unopenable.len() == 3 {
+                break;
+            }
             let stream = format!("i600-u{n}-{run}");
             for i in 0..2u64 {
                 p.a.put_blob_chunk_scoped(
@@ -720,23 +738,19 @@ pub(crate) mod bodies {
                 .await
                 .unwrap_or_else(|e| panic!("seal {stream}: {e}"))
                 .manifest_sha256;
-            p.sa.dag_link(&m, None).await;
-            unopenable.push(m);
-        }
-        let ceiling = *unopenable.iter().max().unwrap();
-        // A linkable DAG that sorts AFTER all three. A candidate that sorts
-        // below keeps its relation, so the sweep never sees it.
-        let mut good = None;
-        for t in 0..64 {
-            let m = write_and_seal(&p, &format!("i600-g{t}-{run}"), 2).await;
-            if m > ceiling {
-                good = Some(m);
-                break;
+            if m < good {
+                unopenable.push(m);
             }
         }
-        let good = good.expect("I600 precondition: a DAG sorting after the three");
-        let want = p.a.chunks_of_manifest(&good).await.unwrap();
-        p.sa.dag_link(&good, None).await;
+        assert_eq!(
+            unopenable.len(),
+            3,
+            "I600 precondition: three sorting first"
+        );
+        // The pre-V176 shape: exactly these four have no relation.
+        for m in unopenable.iter().chain([&good]) {
+            p.sa.dag_link(m, None).await;
+        }
 
         let first = p.a.backfill_dag_chunk_links(3).await.expect("pass 1");
         assert_eq!(
