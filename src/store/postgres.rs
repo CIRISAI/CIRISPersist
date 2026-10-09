@@ -16551,6 +16551,18 @@ impl crate::federation::BlobStorage for PostgresBackend {
             .map_err(|e| {
                 crate::federation::BlobError::Backend(format!("insert federation_blobs: {e}"))
             })?;
+            // v54.0.0 (#995 row 4, V184) — THIS write's room, whether or not
+            // the row above was new: shared plaintext keeps every room.
+            tx.execute(
+                "INSERT INTO cirislens.federation_blob_associations \
+                    (sha256, cohort_scope, group_key_id) VALUES ($1, $2, COALESCE($3, '')) \
+                 ON CONFLICT DO NOTHING",
+                &[&sha_vec, &scope, &group],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!("insert blob association: {e}"))
+            })?;
         } else {
             // §11.5 / I28 — AN ANNOUNCEMENT NEVER STORES. A sealed-tier token
             // means a cascade already stored and bound these bytes; this
@@ -16857,6 +16869,22 @@ impl crate::federation::BlobStorage for PostgresBackend {
             .map_err(|e| {
                 crate::federation::BlobError::Backend(format!("store_blob_local insert: {e}"))
             })?;
+        // v54.0.0 (#995 row 4, V184) — a plaintext row keeps every room.
+        if tier == crate::federation::types::cohort_scope::CryptoTier::Plaintext.as_str() {
+            client
+                .execute(
+                    "INSERT INTO cirislens.federation_blob_associations \
+                        (sha256, cohort_scope, group_key_id) VALUES ($1, $2, COALESCE($3, '')) \
+                     ON CONFLICT DO NOTHING",
+                    &[&sha_vec, &scope, &group],
+                )
+                .await
+                .map_err(|e| {
+                    crate::federation::BlobError::Backend(format!(
+                        "store_blob_local association: {e}"
+                    ))
+                })?;
+        }
         Ok(())
     }
 
@@ -20482,6 +20510,33 @@ impl crate::federation::BlobStorage for PostgresBackend {
         Ok(sha256)
     }
 
+    async fn blob_associations(
+        &self,
+        sha256: &[u8; 32],
+    ) -> Result<Vec<(String, Option<String>)>, crate::federation::BlobError> {
+        use crate::federation::BlobError;
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| BlobError::Backend(format!("blob_associations pool: {e}")))?;
+        let rows = client
+            .query(
+                "SELECT cohort_scope, group_key_id FROM cirislens.federation_blob_associations \
+                  WHERE sha256 = $1 ORDER BY cohort_scope, group_key_id",
+                &[&sha256.to_vec()],
+            )
+            .await
+            .map_err(|e| BlobError::Backend(format!("blob_associations: {e}")))?;
+        let mut out = Vec::with_capacity(rows.len());
+        for r in &rows {
+            let scope: String = r.safe_get_with("cohort_scope", BlobError::Backend)?;
+            let group: String = r.safe_get_with("group_key_id", BlobError::Backend)?;
+            out.push((scope, (!group.is_empty()).then_some(group)));
+        }
+        Ok(out)
+    }
+
     async fn blob_provenance(
         &self,
         sha256: &[u8; 32],
@@ -22236,6 +22291,15 @@ impl PostgresBackend {
         )
         .await
         .map_err(|e| crate::federation::BlobError::Backend(format!("delete_blob relation: {e}")))?;
+        // v54.0.0 (#995 row 4) — the rooms die with the row.
+        tx.execute(
+            "DELETE FROM cirislens.federation_blob_associations WHERE sha256 = $1",
+            &[&sha_vec],
+        )
+        .await
+        .map_err(|e| {
+            crate::federation::BlobError::Backend(format!("delete_blob associations: {e}"))
+        })?;
         let n = tx
             .execute(
                 "DELETE FROM cirislens.federation_blobs WHERE sha256 = $1",

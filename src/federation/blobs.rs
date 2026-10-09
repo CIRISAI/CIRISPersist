@@ -1968,6 +1968,17 @@ pub trait BlobStorage: Send + Sync {
         sha256: &[u8; 32],
     ) -> impl Future<Output = Result<Option<BlobProvenanceRow>, BlobError>> + Send;
 
+    /// v54.0.0 (CIRISPersist#995 row 4, V184) — **every room a PLAINTEXT
+    /// blob was written into**: `(cohort_scope, group)` per write, sorted;
+    /// `group` is `None` for a write that named none (the commons). Shared
+    /// plaintext is one row whose provenance columns name its FIRST writer;
+    /// this is the set custody and durability resolve against. Empty for a
+    /// sealed row (its room is its DEK binding) and for an absent one.
+    fn blob_associations(
+        &self,
+        sha256: &[u8; 32],
+    ) -> impl Future<Output = Result<Vec<(String, Option<String>)>, BlobError>> + Send;
+
     /// v43.0.0 (`BLOB_ENCRYPTION_AT_REST.md` §11.1) — [`put_blob`](Self::put_blob)
     /// with the row's `cohort_scope` and resolved `crypto_tier` recorded.
     /// `put_blob` itself is the commons form (`federation`, plaintext).

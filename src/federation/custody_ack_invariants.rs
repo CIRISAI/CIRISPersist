@@ -1059,6 +1059,114 @@ mod engine_bodies {
         );
     }
 
+    /// **I579** (v54.0.0, #995 row 4, Codex on #987) — **shared plaintext
+    /// keeps every room.** The same bytes written into infrastructure rooms A
+    /// and B are one content-addressed row whose provenance columns name A
+    /// (`ON CONFLICT DO NOTHING`). Through v53 a custody report naming B was
+    /// refused `custody_ack_malformed`. Now both rooms are associations: a
+    /// report naming B is accepted and names B, a room that never wrote the
+    /// bytes is still malformed, and the durability audience covers B.
+    pub(crate) async fn i579_shared_plaintext_keeps_every_room<B>(
+        dsn_a: &str,
+        dsn_b: &str,
+        run: &str,
+        pick: Pick<B>,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync + 'static,
+    {
+        use crate::federation::durability::{content_audience, ContentAudience, DeficitAudience};
+        use crate::federation::replication_audience_invariants::bodies as ra;
+        let l = ladder(dsn_a, dsn_b, run, pick).await;
+        let e = &l.engine_a;
+        let ba = l.ba.as_ref();
+        let room_a = infra_room(&l, run, "i579a").await;
+        let room_b = infra_room(&l, run, "i579b").await;
+        let stranger = format!("em-comm-s-{run}");
+        ra::room(ba as &dyn FederationDirectory, &stranger, &[&l.alice]).await;
+        let bytes = format!("i579 shared plaintext {run}").into_bytes();
+        let pa = e
+            .put_blob_scoped(COMMUNITY, Some(&room_a), &bytes, None, None)
+            .await
+            .unwrap();
+        let pb = e
+            .put_blob_scoped(COMMUNITY, Some(&room_b), &bytes, None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            pa.at_rest_sha256, pb.at_rest_sha256,
+            "I579 one content address"
+        );
+        let sha = pa.at_rest_sha256;
+        assert_eq!(
+            ba.blob_provenance(&sha)
+                .await
+                .unwrap()
+                .unwrap()
+                .group_key_id
+                .as_deref(),
+            Some(room_a.as_str()),
+            "I579 precondition: the row's columns name the first writer"
+        );
+        let mut want = vec![
+            (COMMUNITY.to_owned(), Some(room_a.clone())),
+            (COMMUNITY.to_owned(), Some(room_b.clone())),
+        ];
+        want.sort();
+        assert_eq!(
+            ba.blob_associations(&sha).await.unwrap(),
+            want,
+            "I579 both rooms are associations"
+        );
+        let id = e
+            .put_custody_ack(&sha, CustodyState::Here, None, Some(&room_b), None)
+            .await
+            .unwrap_or_else(|e| panic!("I579 a report naming room B is accepted: {e}"));
+        assert_eq!(
+            stored(ba, &id)
+                .await
+                .attestation_envelope
+                .get("community_id")
+                .and_then(|v| v.as_str()),
+            Some(room_b.as_str()),
+            "I579 the envelope names room B"
+        );
+        let r = e
+            .put_custody_ack(&sha, CustodyState::Here, None, Some(&stranger), None)
+            .await;
+        assert!(
+            r.as_ref()
+                .is_err_and(|e| e.to_string().contains("custody_ack_malformed")),
+            "I579 a room that never wrote the bytes is malformed: {r:?}"
+        );
+        let d = e.durability_deficit(&sha, &l.node_a, None).await.unwrap();
+        // Room B's own audience is contained in the blob's.
+        match content_audience(
+            ba as &dyn FederationDirectory,
+            COMMUNITY,
+            None,
+            Some(&room_b),
+        )
+        .await
+        .unwrap()
+        {
+            ContentAudience::Everyone => assert_eq!(
+                d.audience,
+                DeficitAudience::Everyone,
+                "I579 room B reaches everyone, so the blob does"
+            ),
+            ContentAudience::Nodes(b_nodes) => {
+                let DeficitAudience::Nodes(nodes) = &d.audience else {
+                    panic!("I579 the audience resolves to nodes: {d:?}");
+                };
+                assert!(
+                    b_nodes.iter().all(|n| nodes.contains(n)),
+                    "I579 the durability audience covers room B: {nodes:?} vs {b_nodes:?}"
+                );
+            }
+            ContentAudience::Unresolvable => panic!("I579 room B's audience resolves"),
+        }
+    }
+
     /// A shared `BackendDispatch` over a backend handle, and a way to make the
     /// handle forget its node key — a handle the constructor could not tell
     /// (a hardware signer that answers asynchronously).
@@ -1222,6 +1330,7 @@ mod runners {
     sqlite_engine_case!(i525_sqlite, i525_the_target_arm_reads_every_room_shape);
     #[cfg(feature = "sqlite")]
     sqlite_engine_case!(i526_sqlite, i526_a_plaintext_room_write_carries_the_group);
+    sqlite_engine_case!(i579_sqlite, i579_shared_plaintext_keeps_every_room);
     #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn i514_sqlite() {
@@ -1269,6 +1378,8 @@ mod runners {
     postgres_engine_case!(i525_postgres, i525_the_target_arm_reads_every_room_shape);
     #[cfg(feature = "postgres")]
     postgres_engine_case!(i526_postgres, i526_a_plaintext_room_write_carries_the_group);
+    #[cfg(feature = "postgres")]
+    postgres_engine_case!(i579_postgres, i579_shared_plaintext_keeps_every_room);
     #[cfg(feature = "postgres")]
     #[tokio::test]
     async fn i514_postgres() {

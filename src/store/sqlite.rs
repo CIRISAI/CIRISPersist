@@ -15242,6 +15242,13 @@ impl crate::federation::BlobStorage for SqliteBackend {
                         group,
                     ],
                 )?;
+                // v54.0.0 (#995 row 4, V184) — THIS write's room, whether or
+                // not the row above was new: shared plaintext keeps every room.
+                tx.execute(
+                    "INSERT INTO federation_blob_associations (sha256, cohort_scope, group_key_id) \
+                     VALUES (?1, ?2, COALESCE(?3, '')) ON CONFLICT DO NOTHING",
+                    rusqlite::params![sha_vec, scope, group],
+                )?;
             }
             // v36.0.0 (#668) — serve position (V130), inside the same
             // transaction as the write.
@@ -15451,6 +15458,14 @@ impl crate::federation::BlobStorage for SqliteBackend {
                     group,
                 ],
             )?;
+            // v54.0.0 (#995 row 4, V184) — a plaintext row keeps every room.
+            if tier == crate::federation::types::cohort_scope::CryptoTier::Plaintext.as_str() {
+                conn.execute(
+                    "INSERT INTO federation_blob_associations (sha256, cohort_scope, group_key_id) \
+                     VALUES (?1, ?2, COALESCE(?3, '')) ON CONFLICT DO NOTHING",
+                    rusqlite::params![sha_vec, scope, group],
+                )?;
+            }
             Ok(())
         })
         .await
@@ -18819,6 +18834,33 @@ impl crate::federation::BlobStorage for SqliteBackend {
         Ok(sha256)
     }
 
+    async fn blob_associations(
+        &self,
+        sha256: &[u8; 32],
+    ) -> Result<Vec<(String, Option<String>)>, crate::federation::BlobError> {
+        let sha = sha256.to_vec();
+        let rows: Vec<(String, String)> = self
+            .read(
+                move |conn| -> Result<Vec<(String, String)>, rusqlite::Error> {
+                    let mut stmt = conn.prepare(
+                        "SELECT cohort_scope, group_key_id FROM federation_blob_associations \
+                      WHERE sha256 = ?1 ORDER BY cohort_scope, group_key_id",
+                    )?;
+                    let it =
+                        stmt.query_map(rusqlite::params![sha], |r| Ok((r.get(0)?, r.get(1)?)))?;
+                    it.collect()
+                },
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!("blob_associations: {e}"))
+            })?;
+        Ok(rows
+            .into_iter()
+            .map(|(s, g)| (s, (!g.is_empty()).then_some(g)))
+            .collect())
+    }
+
     async fn blob_provenance(
         &self,
         sha256: &[u8; 32],
@@ -21003,6 +21045,11 @@ impl SqliteBackend {
             }
             tx.execute(
                 "DELETE FROM federation_manifest_children WHERE root_sha256 = ?1",
+                rusqlite::params![sha_vec],
+            )?;
+            // v54.0.0 (#995 row 4) — the rooms die with the row.
+            tx.execute(
+                "DELETE FROM federation_blob_associations WHERE sha256 = ?1",
                 rusqlite::params![sha_vec],
             )?;
             let n = tx.execute(
