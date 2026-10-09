@@ -40,7 +40,12 @@ pyo3     = ["_pyffi", "postgres"]
 # error cleanly at runtime (a `postgresql://` dsn is rejected; postgres-only
 # methods raise a `PyRuntimeError`). Downstream (CIRISEdge) points its
 # Windows/mobile wheels here to drop the vcpkg + vendored-openssl builds.
-pyo3-sqlite = ["_pyffi"]
+# v54.0.0 (CIRISPersist#1030) — `pyo3-sqlite` IMPLIES `sqlite`: the
+# sqlite-only Python surface has no backend without it (184 x E0004 on an
+# uninhabited `BackendDispatch` when built alone). It stays postgres-free;
+# implying `pyo3` instead would pull postgres → openssl, the one thing this
+# shape exists to drop.
+pyo3-sqlite = ["_pyffi", "sqlite"]
 # Internal shared feature: the ~13 FFI module-compilation gates fire for
 # BOTH public pyo3 shapes via `feature = "_pyffi"`. Not meant to be enabled
 # directly (it would give a PyEngine with no backend). Enabling `dep:pyo3`
@@ -522,7 +527,12 @@ registry_key_escrows = []
 # remote — sovereign-mode deployments with Postgres-over-WAN, or
 # any deployment where TLS at the lens-API edge doesn't also
 # cover the lens→DB hop. THREAT_MODEL.md AV-18.
-tls = ["dep:tokio-postgres-rustls", "dep:rustls", "dep:rustls-native-certs"]
+#
+# v54.0.0 (CIRISPersist#1030) — `tls` IMPLIES `postgres`. Every line of TLS
+# code is the Postgres pool's transport (`src/store/postgres.rs`); there is no
+# backend-agnostic TLS to make, and `tokio-postgres-rustls` does not build
+# against a `tokio-postgres` the `postgres` feature did not configure.
+tls = ["postgres", "dep:tokio-postgres-rustls", "dep:rustls", "dep:rustls-native-certs"]
 
 # Always-on (no_std-cleanness for schema/verify is enforced separately
 # by `cargo build --no-default-features --features no_std` per

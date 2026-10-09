@@ -177,6 +177,16 @@ Witnesses:
 
 Mutation-checked, 6 of 7 killed. Memory skipping `sending` reds I577 on memory. Sqlite filtering one status reds I577 on sqlite. The capsule answering `Count` reds I577b. Postgres reverted to `$3::uuid` on delivery reds I577 on postgres, and so does `$2::uuid` on replay and removing both timestamp casts. Removing only the second timestamp cast survives, because the first cast already fixes the parameter's type.
 
+### Fixed — `tls` and `pyo3-sqlite` compile on their own (#1030)
+
+The #1025 powerset found two declared features that did not compile alone. Each now declares the feature its code needs. Both decisions change the public feature contract.
+
+- **`tls` now implies `postgres`.** Every line of TLS code is the Postgres pool's transport, in `src/store/postgres.rs`, so there is no backend-agnostic TLS to make. Alone, `tls` built `tokio-postgres-rustls` against a `tokio-postgres` the `postgres` feature never configured. A consumer that enables `tls` now gets the Postgres backend with it, which it needed anyway.
+- **`pyo3-sqlite` now implies `sqlite`, and is not retired.** It is the postgres-free Python surface for mobile and Windows wheels. Persist's own Android job builds with `pyo3` plus the mobile set, but CIRISEdge points its mobile and Windows wheels at `pyo3-sqlite`, and certify's `pyo3sqlite` leg builds it. Alone, it enabled the FFI module with no backend at all, which gave 184 `E0004` on an uninhabited `BackendDispatch`. Implying `pyo3` would pull postgres and openssl, the one thing this shape exists to drop. With `sqlite`, the Python module needs no other change: it already gates its postgres paths.
+- **The gate.** `scripts/ci_feature_matrix.py` gains an `ALONE_COMPILE` table mapping each feature to the prerequisite it implies, and an `alone` command. `check` fails if Cargo.toml drops an implication, or if ci.yml stops compiling each feature alone. The lint job gains that step, a `cargo check --no-default-features --features <f>` loop. The weekly powerset job in `mutants.yml` is no longer `continue-on-error`, as planned when #1030 was filed. `docs/FEATURE_MATRIX.md` records both decisions.
+
+Checked by compiling `tls`, `tls,test-panic` and `pyo3-sqlite` alone, each with no errors and no warnings. Mutation-checked, 3 of 3 killed, each by `ci_feature_matrix.py check` exiting 1: dropping `postgres` from `tls`, dropping `sqlite` from `pyo3-sqlite`, and removing the CI loop. The last one first survived, because the step's name also named the command, so the check is now anchored to the command substitution.
+
 ## [53.2.0] - 2026-10-08
 
 ### Changed — the tag is pushed once main's run EXISTS, not once it completes (#1008)

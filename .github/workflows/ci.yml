@@ -1632,6 +1632,18 @@ jobs:
           cargo check --no-default-features --features \
             "pyo3-sqlite sqlite secrets cirisnode cirisgraph cirisaudit telemetry cirisincident classify scrub extract"
 
+      # v54.0.0 (CIRISPersist#1030) — the features a consumer enables ON THEIR
+      # OWN, each compiled with nothing beside it. The #1025 powerset found
+      # `tls` and `pyo3-sqlite` failing alone; each now implies its
+      # prerequisite, and `ci_feature_matrix.py check` fails if that drops.
+      - name: cargo check (features alone — `ci_feature_matrix.py alone`)
+        run: |
+          for f in $(python3 scripts/ci_feature_matrix.py alone); do
+            echo "::group::--features $f (alone)"
+            cargo check --no-default-features --features "$f" --lib
+            echo "::endgroup::"
+          done
+
       # No save here — the linux-x86_64-test `core` leg is the single saver for
       # the shared linux-x86_64 key (#311), so this restore-only job can't race
       # it on GHCR.

@@ -82,10 +82,9 @@ jobs:
     if: github.event_name == 'workflow_dispatch' || github.event.schedule == '43 6 * * 0'
     runs-on: ubuntu-latest
     timeout-minutes: 90
-    # Known red: `tls` without `postgres` and `pyo3-sqlite` without `pyo3` do not
-    # compile (CIRISPersist#1030, v54.0.0). Report-only until #1030 closes; then
-    # delete this line and the job is blocking.
-    continue-on-error: true
+    # v54.0.0 (CIRISPersist#1030) — the two known-red sets (`tls` without
+    # `postgres`, `pyo3-sqlite` without `pyo3`) compile: each feature now implies
+    # its prerequisite. The job is blocking, as planned when #1030 was filed.
     strategy:
       fail-fast: false
       matrix:
