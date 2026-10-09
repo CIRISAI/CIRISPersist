@@ -29,6 +29,22 @@ Witnesses:
 - **I561** (unit) checks that the DEK, stream and epoch are bound by the nonce recompute, which refuses before the open. It also checks that `caller_aad` and `storage_seq` are bound by the tag.
 - **I562** (sqlite, postgres) checks both directions. A chunk the store appended opens through `open_stream_chunk`. A chunk sealed through `seal_stream_chunk` and put at the floor reads through the store's door. A wrong `storage_seq` or `caller_aad` is refused on both sides, and at the door as the typed `SealDidNotOpen`.
 
+### Changed — the tag job signs with ciris-build-sign v20.1.0, whose own refusal backs the bits-changed gate (#992)
+
+The tag job's `build-manifest` job and `reregister-manifests.yml` now install `ciris-build-sign` v20.1.0 instead of v2.1.5. From v20.1.0 the signer reads a wheel's own `*.dist-info` before it signs (CIRISVerify#306/#307). It refuses, writing nothing, when the wheel's `Version:` is not `--binary-version` or no platform tag fits `--target`. That is the v53.1.8 failure of #1029, a v29 wheel signed as v53.1.8, caught by the signer itself.
+
+- `TOOL_VERSION` in `scripts/build_manifest.sh` is the one place the version lives. The re-register workflow's registry notes read it.
+- `install` and `sign` refuse unless the `ciris-build-sign` on PATH reports exactly that version, because an older binary signs any wheel it is given.
+- `bits_changed.sh` checks 1 to 4 still run first. The signer cannot know check 3, the previous release's registered hash, or check 4, the known-stale list.
+- The signer's check engages only when it is given the `.whl` with `--binary`, which is how the script signs every wheel. A comment at the call says never to pass `--binary-hash` there.
+- `docs/RELEASE.md` gains "The signer's own refusal" under the bits-changed gate.
+
+Checked by hand before the switch, on the v53.2.0 tag run's four wheels and `python/`. The CLI flags are the same; v20.1.0 adds `--emit-contribution`. The `python-source-tree` hash, the manifest fields and the `register --dry-run` preview are identical. So re-registering an old version under the new tool recomputes the same rows. On all four wheels v20.1.0 refused a claimed version of 54.0.0 and each of the three wrong targets, and v2.1.5 signed the wrong version.
+
+Witnesses in `scripts/bits_changed_test.sh`, now 83 of 83. The fake signer answers `--version` with the pinned version. Every wheel reaches the signer as `--binary <.whl>` and none as `--binary-hash`. An older signer, or none, is refused and signs nothing. Mutation-checked: dropping the guard from `sign` reds 3 witnesses, a version compare that accepts any version reds 2, and signing wheels by `--binary-hash` reds 10.
+
+The STREAM-nonce change above is mutation-checked as well. The read door ignoring `storage_seq` reds I561, I562 and I310. Dropping the nonce recompute reds I561 and I319. The seal dropping `caller_aad` reds I561, I562 and `round_trips`.
+
 ## [53.2.0] - 2026-10-08
 
 ### Changed — the tag is pushed once main's run EXISTS, not once it completes (#1008)
