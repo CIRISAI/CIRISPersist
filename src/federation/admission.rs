@@ -3591,78 +3591,288 @@ pub async fn distinct_self_reporting_subjects<F: super::FederationDirectory + ?S
     Ok(out)
 }
 
+/// v54.0.0 (CIRISPersist#1035; #1036 ruling item 1) — **who `authority_id`
+/// names**: a key, or a community (an affiliation) whose authority set is
+/// whatever its `consensus_protocol` admits.
+///
+/// Resolved ONCE per question — the gate resolves it per row, the fold per
+/// `(subject, authority)` — and handed to [`licensure_issuance_at`], so the
+/// two never resolve it differently.
+#[derive(Debug, Clone)]
+pub enum LicensureAuthority {
+    /// A key: the authority set is the key itself, at every instant.
+    Key(String),
+    /// A community this node holds the record of. A `community_key_id` is
+    /// keyless — it never signs and emits no edges — so its licences are
+    /// issued by its authority set and the `license` walk roots there.
+    Community(Box<super::Community>),
+}
+
+impl LicensureAuthority {
+    /// The `authority_id` this names.
+    #[must_use]
+    pub fn id(&self) -> &str {
+        match self {
+            LicensureAuthority::Key(k) => k,
+            LicensureAuthority::Community(c) => &c.community_key_id,
+        }
+    }
+}
+
+/// v54.0.0 (CIRISPersist#1035) — resolve `authority_id`: a community when
+/// this node holds its record, a key otherwise. One indexed read.
+pub async fn resolve_licensure_authority(
+    directory: &dyn super::FederationDirectory,
+    authority_id: &str,
+) -> Result<LicensureAuthority, Error> {
+    Ok(match directory.lookup_community(authority_id).await? {
+        Some(c) => LicensureAuthority::Community(Box::new(c)),
+        None => LicensureAuthority::Key(authority_id.to_owned()),
+    })
+}
+
+/// The authority set at `t`, or why there is none a single signer can stand
+/// for. `Err(protocol)`: the community's `consensus_protocol` admits only a
+/// collective act (a quorum), which a single-signed row or edge is not.
+async fn licensure_roots_at(
+    directory: &dyn super::FederationDirectory,
+    authority: &LicensureAuthority,
+    t: chrono::DateTime<chrono::Utc>,
+) -> Result<Result<std::collections::BTreeSet<String>, String>, Error> {
+    match authority {
+        LicensureAuthority::Key(k) => Ok(Ok(std::iter::once(k.clone()).collect())),
+        LicensureAuthority::Community(c) => {
+            // #1036 ruling item 1: "one founder suffices only where the
+            // protocol says so" — and only `founder_only` says so. Any other
+            // protocol makes a licence an act of the affiliation's quorum, a
+            // cosigned row this plane does not carry yet (the #1036 plane
+            // move); until then no single key stands for it.
+            if c.consensus_protocol != crate::federation::types::consensus_protocol::FOUNDER_ONLY {
+                return Ok(Err(c.consensus_protocol.clone()));
+            }
+            // The founders ACTIVE at `t` — the authorized roster fold, read at
+            // the signed instant (a founder who left before `t` roots nothing
+            // at `t`; one who joined after `t` had not yet).
+            let roster = Box::pin(crate::federation::authorized_community_roster_at(
+                directory, c, t,
+            ))
+            .await?;
+            Ok(Ok(roster
+                .into_iter()
+                .filter(|m| m.role.as_deref() == Some(MEMBER_ROLE_FOUNDER))
+                .map(|m| m.key_id)
+                .collect()))
+        }
+    }
+}
+
+/// v54.0.0 (CIRISPersist#1035) — why a CLAIMED licensing delegation does not
+/// resolve. Each is a distinct refusal token under
+/// `licensure_delegator_not_authority`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LicensureChainBreak {
+    /// `delegation_id` names no row this node holds.
+    NamedEdgeAbsent,
+    /// The named row is not a `delegates_to` carrying the `license` scope.
+    NamedEdgeNotLicense,
+    /// The named edge delegates to some key other than the row's emitter.
+    NamedEdgeNotOntoEmitter,
+    /// The named edge is not on a `license` chain from the authority set
+    /// that was live at the row's signed `asserted_at` (not yet asserted,
+    /// expired, outside its term, retracted, unreachable, or past the cap).
+    NotOnLiveChain,
+    /// The authority is a community whose `consensus_protocol` admits only a
+    /// quorum act; no single-signed chain stands for it (#1036 item 1).
+    AuthorityActsByQuorum,
+}
+
+impl LicensureChainBreak {
+    /// The stable token.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LicensureChainBreak::NamedEdgeAbsent => "named_edge_absent",
+            LicensureChainBreak::NamedEdgeNotLicense => "named_edge_not_license_delegation",
+            LicensureChainBreak::NamedEdgeNotOntoEmitter => "named_edge_not_onto_emitter",
+            LicensureChainBreak::NotOnLiveChain => "not_on_live_chain_at_asserted_at",
+            LicensureChainBreak::AuthorityActsByQuorum => "authority_acts_by_quorum",
+        }
+    }
+}
+
+/// v54.0.0 (CIRISPersist#1035) — the verdict on ONE licensure row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LicensureIssuance {
+    /// The emitter IS the authority at the row's instant: the authority key,
+    /// or (for a `founder_only` community) a founder active at that instant.
+    Authority,
+    /// No delegation claimed and not the authority — TESTIMONY about the
+    /// authority. Admitted, never folded, and no later grant promotes it.
+    Testimony,
+    /// Issued under the named edge, which lies on a `license` chain from the
+    /// authority set that was live at the row's signed `asserted_at`.
+    Delegated {
+        /// The edge the row names (kept on the stored row, as signed).
+        delegation_id: String,
+    },
+    /// A delegation was claimed and does not resolve.
+    Unresolved {
+        /// The edge the row names.
+        delegation_id: String,
+        /// Why it does not resolve.
+        reason: LicensureChainBreak,
+    },
+}
+
+impl LicensureIssuance {
+    /// Is the row the authority's own licensure (in the fold)?
+    #[must_use]
+    pub fn is_the_authoritys(&self) -> bool {
+        matches!(
+            self,
+            LicensureIssuance::Authority | LicensureIssuance::Delegated { .. }
+        )
+    }
+}
+
+/// v54.0.0 (CIRISPersist#1035, #1032; #1036 rulings items 1-2) — **THE
+/// licensure chain function.** The door ([`check_licensure_delegator_is_authority`])
+/// and the fold ([`row_was_issued_under_authority`]) are projections of this
+/// one verdict, so the door refuses exactly what the fold would exclude among
+/// rows that claim a delegation, and the fold finds every delegated issuance
+/// the door admitted — at any depth the walk follows.
+///
+/// Judged at the row's SIGNED `asserted_at` (a stamped instant belongs to the
+/// signer), never at receipt and never on the current graph:
+///
+/// 1. the emitter is in the authority set at `asserted_at` ⇒ [`Authority`];
+/// 2. no `delegation_id` ⇒ [`Testimony`];
+/// 3. the named row must exist, be a `delegates_to` carrying `license`, and
+///    delegate to the EMITTER;
+/// 4. it must be an edge the `license` walk from the authority set TRAVERSES
+///    under the lens at `asserted_at` — every link asserted by then, unexpired,
+///    in its signed term, unretracted by then, attenuated, `sub_delegation`
+///    granted past the first hop, within the depth cap. That is "lies on a
+///    live chain", read from the walk itself.
+///
+/// [`Authority`]: LicensureIssuance::Authority
+/// [`Testimony`]: LicensureIssuance::Testimony
+pub async fn licensure_issuance_at(
+    directory: &dyn super::FederationDirectory,
+    authority: &LicensureAuthority,
+    row: &super::Attestation,
+) -> Result<LicensureIssuance, Error> {
+    let t = row.asserted_at;
+    // The authority key itself — the bootstrap case, and the common one. No
+    // read: a key is always its own authority.
+    if matches!(authority, LicensureAuthority::Key(k) if *k == row.attesting_key_id) {
+        return Ok(LicensureIssuance::Authority);
+    }
+    let delegation_id = row
+        .attestation_envelope
+        .get(crate::federation::hard_case::admin_field::DELEGATION_ID)
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
+    // A community's founder issuing directly (where the protocol lets one).
+    // Only a community needs the roster read for this; a key authority was
+    // settled above.
+    let roots = if matches!(authority, LicensureAuthority::Community(_)) {
+        let roots = licensure_roots_at(directory, authority, t).await?;
+        if roots
+            .as_ref()
+            .is_ok_and(|r| r.contains(&row.attesting_key_id))
+        {
+            return Ok(LicensureIssuance::Authority);
+        }
+        Some(roots)
+    } else {
+        None
+    };
+    let Some(delegation_id) = delegation_id else {
+        return Ok(LicensureIssuance::Testimony);
+    };
+    let unresolved = |reason| LicensureIssuance::Unresolved {
+        delegation_id: delegation_id.clone(),
+        reason,
+    };
+    let Some(edge) = directory.get_attestation(&delegation_id).await? else {
+        return Ok(unresolved(LicensureChainBreak::NamedEdgeAbsent));
+    };
+    if edge.attestation_type != attestation_type::DELEGATES_TO
+        || !delegation_scope_grants(&edge.attestation_envelope, DELEGATION_SCOPE_LICENSE)
+    {
+        return Ok(unresolved(LicensureChainBreak::NamedEdgeNotLicense));
+    }
+    if edge.attested_key_id != row.attesting_key_id {
+        return Ok(unresolved(LicensureChainBreak::NamedEdgeNotOntoEmitter));
+    }
+    let roots = match roots {
+        Some(r) => r,
+        None => licensure_roots_at(directory, authority, t).await?,
+    };
+    let Ok(roots) = roots else {
+        return Ok(unresolved(LicensureChainBreak::AuthorityActsByQuorum));
+    };
+    let lens = DelegationWalkLens {
+        as_of: Some(t),
+        ..DelegationWalkLens::default()
+    };
+    for root in &roots {
+        let reach = scoped_delegation_reach_at(
+            directory,
+            root,
+            &std::collections::HashSet::new(),
+            DELEGATION_SCOPE_LICENSE,
+            MAX_MODERATION_DELEGATION_DEPTH,
+            DelegationWalkPolicy::MODERATION_DUTY,
+            lens,
+        )
+        .await?;
+        if reach.traversed.contains(&edge.attestation_id) {
+            return Ok(LicensureIssuance::Delegated { delegation_id });
+        }
+    }
+    Ok(unresolved(LicensureChainBreak::NotOnLiveChain))
+}
+
 /// v42.0.0 (review, P1) — **was this ROW issued under `authority_id`'s
-/// authority, as of its own `asserted_at`?**
+/// authority, as of its own `asserted_at`?** The fold key.
 ///
-/// The fold key. Distinct from [`emitter_resolves_to_authority`], which asks
-/// only about a key *now*: this asks about a row *then*, and the difference is
-/// the whole point. Resolving stored rows against the current graph
-/// reclassifies history — a stranger's pre-published `revoked` would enter the
-/// fold the moment the authority granted that key a delegation for any reason,
-/// and an absorbing revocation would bar the holder retroactively.
+/// v54.0.0 (CIRISPersist#1035) — a projection of [`licensure_issuance_at`],
+/// the SAME function the door runs. Before v54 this re-derived the chain by
+/// itself and required the named edge to be signed by the authority directly,
+/// so a two-hop delegate's issuance the door admitted never entered the fold
+/// (the #1013 class: gate and fold disagreeing on one relation).
 ///
-/// A row qualifies iff its attester IS the authority, or it NAMES the
-/// delegation it was issued under (`delegation_id`) and that delegation was a
-/// live `license` chain to the authority at the row's `asserted_at`. A row that
-/// claims no delegation is testimony permanently; no later grant promotes it.
+/// Resolving stored rows against the current graph reclassifies history — a
+/// stranger's pre-published `revoked` would enter the fold the moment the
+/// authority granted that key a delegation for any reason — so a row that
+/// claims no delegation is testimony permanently, and a claimed one is judged
+/// at the row's own signed instant.
 pub async fn row_was_issued_under_authority(
     directory: &dyn super::FederationDirectory,
     row: &super::Attestation,
     authority_id: &str,
 ) -> Result<bool, Error> {
-    if row.attesting_key_id == authority_id {
-        return Ok(true);
-    }
-    let Some(delegation_id) = row
-        .attestation_envelope
-        .get(crate::federation::hard_case::admin_field::DELEGATION_ID)
-        .and_then(serde_json::Value::as_str)
-        .filter(|s| !s.is_empty())
-    else {
-        // No delegation claimed — testimony, and it stays testimony.
-        return Ok(false);
-    };
-    let Some(delegation) = directory.get_attestation(delegation_id).await? else {
-        return Ok(false);
-    };
-    // The named edge must be the authority's own `license` grant, and it must
-    // have been live when the row was asserted — an edge issued afterwards
-    // cannot have authorised it.
-    if delegation.attesting_key_id != authority_id
-        || delegation.attestation_type != attestation_type::DELEGATES_TO
-        || !delegation_scope_grants(&delegation.attestation_envelope, DELEGATION_SCOPE_LICENSE)
-        || delegation.asserted_at > row.asserted_at
-    {
-        return Ok(false);
-    }
-    emitter_resolves_to_authority(directory, &row.attesting_key_id, authority_id).await
+    let authority = resolve_licensure_authority(directory, authority_id).await?;
+    Ok(licensure_issuance_at(directory, &authority, row)
+        .await?
+        .is_the_authoritys())
 }
 
 /// v42.0.0 (CIRISPersist#814, CC 2.4.1.2.1 / CC 3.3.9) — **does `attester`
-/// resolve to licence authority `authority_id`?**
+/// resolve to licence authority `authority_id` NOW?**
 ///
-/// CC ruled there is no authority object and no roster: *anyone may be a
-/// licensing authority.* `authority_id` names a KEY — a
-/// `federation_keys.key_id`, or an organisation whose keys resolve through
-/// `org_membership`. So "X holds licence authority for A" means exactly:
+/// `authority_id` names a key, or (v54.0.0, #1036 ruling item 1) a community
+/// whose authority set is whatever its `consensus_protocol` admits. "X holds
+/// licence authority for A" means exactly: X is in A's authority set, or X
+/// holds a [`DELEGATION_SCOPE_LICENSE`]-scoped delegation chain from it
+/// (CC 4.4.3.4.3) — every link live NOW (v54.0.0, #1032).
 ///
-///  * X's key **is** `A`; or
-///  * X holds a [`DELEGATION_SCOPE_LICENSE`]-scoped delegation chain from `A`
-///    (CC 4.4.3.4.3).
-///
-/// That is the whole predicate. There is no quorum for persist to check — "by
-/// quorum" in CC 2.4.1.2.1 describes an authority's OWN governance where it is
-/// a collective, never an admission gate a substrate applies to somebody else's
-/// authority.
-///
-/// # This is a FOLD key, not an admission gate
-///
-/// A `licensure:{A}` row from a key that does not resolve to `A` is perfectly
-/// admissible — it is *testimony about* `A`'s licensure, and it reaches a reader
-/// only along a flow that reader's trust or consent already admits (CC 4.4.3.8).
-/// It simply is not `A`'s licensure, so it stays out of the `(subject, A)` fold
-/// and composes at consumer confidence instead. **That is how a stranger's
-/// absorbing `revoked` binds nobody — not by refusing the row.**
+/// This asks about a KEY at the reader's instant. A stored ROW is judged by
+/// [`row_was_issued_under_authority`] at its own signed instant instead; that
+/// difference is the whole point (#1032).
 pub async fn emitter_resolves_to_authority(
     directory: &dyn super::FederationDirectory,
     attester: &str,
@@ -3671,38 +3881,151 @@ pub async fn emitter_resolves_to_authority(
     if attester == authority_id {
         return Ok(true);
     }
+    let authority = resolve_licensure_authority(directory, authority_id).await?;
+    let now = chrono::Utc::now();
+    let Ok(roots) = licensure_roots_at(directory, &authority, now).await? else {
+        return Ok(false);
+    };
+    if roots.contains(attester) {
+        return Ok(true);
+    }
     let targets: std::collections::HashSet<String> = std::iter::once(attester.to_owned()).collect();
-    issuer_reaches_target_via_scoped_delegation(
-        directory,
-        authority_id,
-        &targets,
-        DELEGATION_SCOPE_LICENSE,
-        MAX_MODERATION_DELEGATION_DEPTH,
-        DelegationWalkPolicy::MODERATION_DUTY,
-    )
-    .await
+    for root in &roots {
+        if scoped_delegation_reach_at(
+            directory,
+            root,
+            &targets,
+            DELEGATION_SCOPE_LICENSE,
+            MAX_MODERATION_DELEGATION_DEPTH,
+            DelegationWalkPolicy::MODERATION_DUTY,
+            DelegationWalkLens {
+                as_of: Some(now),
+                ..DelegationWalkLens::default()
+            },
+        )
+        .await?
+        .hit_target
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// v54.0.0 (CIRISPersist#1035 item 3) — **every licence issued under
+/// `authority_id`**: the `licensure:{authority_id}` rows (any `:v{n}`) whose
+/// verdict under [`licensure_issuance_at`] is the authority's own — the SAME
+/// verdict the fold applies, so a row is listed here iff it is a candidate of
+/// some subject's [`crate::federation::licensure::status_set_for`]. Newest
+/// first by `asserted_at`. Testimony about the authority is not listed.
+///
+/// # How it seeks without a dimension-only index
+///
+/// The stored indexes key a dimension on its ATTESTER or its SUBJECT, never
+/// on the dimension alone. A licence under `A` is signed by `A`'s authority
+/// set or by a key some `license` chain from it reaches, so the read gathers
+/// those candidate ISSUERS first and seeks each one's
+/// `licensure:{A}` rows on `(attesting_key_id, dimension)`. The candidate walk
+/// is STRUCTURAL — every `license`-scoped edge, at every instant, retracted
+/// or not, to the same depth cap — a superset of every chain the verdict can
+/// accept at any instant, because a link withdrawn today may have been live
+/// when a licence it authorised was signed. The verdict, not the candidate
+/// walk, decides.
+pub async fn licences_issued_under(
+    directory: &dyn super::FederationDirectory,
+    authority_id: &str,
+) -> Result<Vec<super::Attestation>, Error> {
+    use std::collections::{BTreeSet, VecDeque};
+    let authority = resolve_licensure_authority(directory, authority_id).await?;
+    // Every key that is EVER a root: the authority key, or every member the
+    // community's record or a widening ever named (the verdict re-checks
+    // standing at each row's instant).
+    let mut roots: BTreeSet<String> = BTreeSet::new();
+    match &authority {
+        LicensureAuthority::Key(k) => {
+            roots.insert(k.clone());
+        }
+        LicensureAuthority::Community(c) => {
+            roots.extend(c.members.iter().map(|m| m.key_id.clone()));
+            roots.extend(
+                directory
+                    .list_community_membership_widenings_for(&c.community_key_id)
+                    .await?
+                    .into_iter()
+                    .map(|w| w.member_key_id),
+            );
+        }
+    }
+    let cap = MAX_MODERATION_DELEGATION_DEPTH.min(MAX_WITHDRAWS_DELEGATION_DEPTH);
+    let mut issuers: BTreeSet<String> = roots.clone();
+    let mut queue: VecDeque<(String, usize)> = roots.iter().map(|r| (r.clone(), 0)).collect();
+    while let Some((key, depth)) = queue.pop_front() {
+        if depth >= cap {
+            continue;
+        }
+        for e in directory.list_attestations_by(&key).await? {
+            if e.attestation_type == attestation_type::DELEGATES_TO
+                && delegation_scope_grants(&e.attestation_envelope, DELEGATION_SCOPE_LICENSE)
+                && issuers.insert(e.attested_key_id.clone())
+            {
+                queue.push_back((e.attested_key_id, depth + 1));
+            }
+        }
+    }
+    let prefix = format!(
+        "{}{authority_id}",
+        crate::federation::licensure::LICENSURE_DIMENSION_PREFIX
+    );
+    let mut out: Vec<super::Attestation> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for issuer in &issuers {
+        for row in directory
+            .list_attestations_by_dimension_prefix(issuer, &prefix)
+            .await?
+        {
+            // The byte prefix `licensure:acme` also matches `licensure:acmecorp`;
+            // the authority is the dimension's own segment, read exactly.
+            let names_authority = envelope_dimension(&row.attestation_envelope)
+                .and_then(crate::federation::licensure::authority_of)
+                == Some(authority_id);
+            if names_authority
+                && seen.insert(row.attestation_id.clone())
+                && licensure_issuance_at(directory, &authority, &row)
+                    .await?
+                    .is_the_authoritys()
+            {
+                out.push(row);
+            }
+        }
+    }
+    out.sort_by(|a, b| {
+        b.asserted_at
+            .cmp(&a.asserted_at)
+            .then_with(|| a.attestation_id.cmp(&b.attestation_id))
+    });
+    Ok(out)
 }
 
 /// v42.0.0 (CIRISPersist#814, CC 3.3.9 / CC 4.4.3.4.3) — **the one refusal on
 /// the `license` scope**: an issuance whose delegator chain does not resolve to
 /// the authority it names.
 ///
-/// A key emitting `licensure:{A}` under a delegated
-/// [`DELEGATION_SCOPE_LICENSE`] must have that delegation chain resolve to `A`
-/// itself. Emitting `licensure:{A}` under a `license` scope delegated by `B` is
-/// `B` lending authority it does not hold, and it is refused
-/// (`licensure_delegator_not_authority`).
-///
-/// # What this is NOT
-///
 /// It is **not** a check that `A` is a known or trusted authority. CC ruled
-/// there is no roster: an unknown authority is simply an authority nobody
-/// trusts yet, and there is no `licensure_authority_unknown`. A key signing
-/// `licensure:{itself}` is always its own authority and passes trivially — the
-/// bootstrap has no circle because there is no prior row to gate on.
+/// there is no roster of authorities: an unknown authority is simply one
+/// nobody trusts yet. A key signing `licensure:{itself}` is always its own
+/// authority, and a row that claims NO delegation is testimony about `A`
+/// (CC ruled it must admit; it binds nobody because the fold excludes it).
 ///
-/// So this fires only on the delegated path: someone claiming to speak FOR an
-/// authority, whose chain does not reach it.
+/// So this fires only where the row carries the authorizing `delegates_to`
+/// id — the `delegation_id` convention ([`crate::federation::hard_case`]'s
+/// field, whose entire job is to name the edge an act was taken under). A row
+/// that claims delegated authority must make that claim resolve.
+///
+/// v54.0.0 (CIRISPersist#1035, #1032) — the verdict is [`licensure_issuance_at`],
+/// the SAME function the fold runs, judged at the row's signed `asserted_at`.
+/// Before v54 the door discarded the `delegation_id` it required (any chain
+/// to the emitter passed, whichever edge the row named) and judged the graph
+/// at receipt.
 pub async fn check_licensure_delegator_is_authority(
     directory: &dyn super::FederationDirectory,
     row: &super::Attestation,
@@ -3713,56 +4036,32 @@ pub async fn check_licensure_delegator_is_authority(
     let Some(authority_id) = crate::federation::licensure::authority_of(dimension) else {
         return Ok(());
     };
-    // Its own authority — the bootstrap case, and the overwhelmingly common one.
+    // Its own authority — no read at all.
     if row.attesting_key_id == authority_id {
         return Ok(());
     }
-    // v42.0.0 — the trigger is an EXPLICIT delegated-issuance claim, and getting
-    // this wrong once is why it is spelled out. CC's refusal is on "the `license`
-    // scope itself: an issuance whose delegator chain does not resolve to A" —
-    // NOT on any row whose attester differs from the authority. A stranger
-    // writing `licensure:{A}` with no delegation claim is TESTIMONY about A, and
-    // CC ruled it must admit; it binds nobody because the fold excludes it, not
-    // because the door refuses it.
-    //
-    // So the gate fires only where the row carries the authorizing
-    // `delegates_to` id — the `delegation_id` convention
-    // ([`crate::federation::hard_case`]'s field, whose entire job is to name the
-    // edge an act was taken under). A row that claims delegated authority must
-    // make that claim resolve; a row that claims none is not lying about one.
-    let Some(delegation_id) = row
-        .attestation_envelope
-        .get(crate::federation::hard_case::admin_field::DELEGATION_ID)
-        .and_then(serde_json::Value::as_str)
-        .filter(|s| !s.is_empty())
-    else {
-        return Ok(());
-    };
-    let _ = delegation_id;
-    let targets: std::collections::HashSet<String> =
-        std::iter::once(row.attesting_key_id.clone()).collect();
-    let reaches = issuer_reaches_target_via_scoped_delegation(
-        directory,
-        authority_id,
-        &targets,
-        DELEGATION_SCOPE_LICENSE,
-        MAX_MODERATION_DELEGATION_DEPTH,
-        DelegationWalkPolicy::MODERATION_DUTY,
-    )
-    .await?;
-    if reaches {
-        return Ok(());
+    let authority = resolve_licensure_authority(directory, authority_id).await?;
+    match licensure_issuance_at(directory, &authority, row).await? {
+        LicensureIssuance::Authority
+        | LicensureIssuance::Testimony
+        | LicensureIssuance::Delegated { .. } => Ok(()),
+        LicensureIssuance::Unresolved {
+            delegation_id,
+            reason,
+        } => Err(Error::InvalidArgument(format!(
+            "licensure_delegator_not_authority: {reason}: {:?} emitted {dimension:?} under \
+             delegation {delegation_id:?} at {asserted_at}, and that edge is not a live \
+             `license`-scoped delegation onto the emitter on a chain from {authority_id:?} \
+             at that instant (CC 3.3.9 / CC 4.4.3.4.3; judged at the signed asserted_at, \
+             CIRISPersist#1032). A `license` scope authorises emitting on behalf of a \
+             delegator that itself holds authority for THAT authority_id; lending authority \
+             one does not hold is the refusal. This says nothing about whether \
+             {authority_id:?} is known or trusted.",
+            row.attesting_key_id,
+            reason = reason.as_str(),
+            asserted_at = row.asserted_at,
+        ))),
     }
-    Err(Error::InvalidArgument(format!(
-        "licensure_delegator_not_authority: {:?} emitted {dimension:?} but no \
-         `license`-scoped delegation chain from {authority_id:?} reaches it (CC 3.3.9 / \
-         CC 4.4.3.4.3). A `license` scope authorises emitting on behalf of a delegator that \
-         itself holds authority for THAT authority_id; lending authority one does not hold is \
-         the refusal. Note this says nothing about whether {authority_id:?} is known or \
-         trusted — an unknown authority is simply one nobody trusts yet, and a key signing \
-         `licensure:` for ITSELF is always its own authority.",
-        row.attesting_key_id
-    )))
 }
 
 /// v42.0.0 (CIRISPersist#814 part 3, CC 3.4.5.1) — the **sensitive-leaf
@@ -6999,6 +7298,12 @@ struct ScopedReach {
     /// the effective depth cap at a recipient that delegates `scope_token`
     /// onward? "Too deep" — self_verify only — not "nothing there".
     beyond_cap: bool,
+    /// v54.0.0 (CIRISPersist#1035) — the `attestation_id` of every edge the
+    /// walk TRAVERSED: the edge-level twin of `reached`, recorded at the same
+    /// point, so "this named edge lies on a live chain" is read from the walk
+    /// itself rather than re-derived by a second one. Truncated on
+    /// `hit_target` exactly as `reached` is.
+    traversed: std::collections::HashSet<String>,
 }
 
 /// **THE §11.10 scoped-`delegates_to` walk — one BFS, three callers**
@@ -7124,6 +7429,21 @@ async fn scoped_delegation_reach(
     max_depth: usize,
     policy: DelegationWalkPolicy,
 ) -> Result<ScopedReach, Error> {
+    // v54.0.0 (CIRISPersist#1032, CC 2.1 / CC 4.5.5) — the ISSUANCE scopes
+    // never walk the timeless default lens. A `license` / `grant` chain is
+    // live only if every link is live at the instant asked about, and a walk
+    // that names no instant is asking about NOW (the reader's own clock: there
+    // is no signed instant on a bare reachability question). A caller judging
+    // a SIGNED row passes that row's `asserted_at` through
+    // [`scoped_delegation_reach_at`] instead — never this wrapper.
+    let lens = if is_issuance_scope(scope_token) {
+        DelegationWalkLens {
+            as_of: Some(chrono::Utc::now()),
+            ..DelegationWalkLens::default()
+        }
+    } else {
+        DelegationWalkLens::default()
+    };
     scoped_delegation_reach_at(
         directory,
         issuer,
@@ -7131,9 +7451,17 @@ async fn scoped_delegation_reach(
         scope_token,
         max_depth,
         policy,
-        DelegationWalkLens::default(),
+        lens,
     )
     .await
+}
+
+/// v54.0.0 (CIRISPersist#1032) — the two scopes that confer ISSUANCE
+/// ([`DELEGATION_SCOPE_LICENSE`], [`DELEGATION_SCOPE_GRANT`]): their walks
+/// are always read at an instant, so a term-bound officer lapses (CC 2.1,
+/// CC 4.4.3.2.8 C). The other duty scopes keep the pre-v49 timeless default.
+fn is_issuance_scope(scope_token: &str) -> bool {
+    scope_token == DELEGATION_SCOPE_LICENSE || scope_token == DELEGATION_SCOPE_GRANT
 }
 
 /// The scoped walk's cap probe (CIRISPersist#928; PR #921 review F4): does
@@ -7212,6 +7540,59 @@ struct DelegationWalkLens<'a> {
     root_authority: Option<&'a [AuthorityInterval]>,
 }
 
+/// v54.0.0 (CIRISPersist#1032, CC 4.4.3.2.8 C) — the `delegates_to`
+/// envelope member that opens an edge's term: the edge confers nothing
+/// before this instant.
+pub const DELEGATION_VALID_FROM_FIELD: &str = "delegation_valid_from";
+
+/// v54.0.0 (CIRISPersist#1032, CC 4.4.3.2.8 C) — the `delegates_to`
+/// envelope member that closes an edge's term (a term-bound officer). The
+/// older spelling [`crate::federation::capacity::binding_field::VALID_UNTIL`]
+/// (`valid_until`, CC 2.1) is read beside it: both name the same upper bound
+/// (`namespace_supersets.json` lists `delegation_valid_until` as an alias of
+/// the canonical `valid_until`).
+pub const DELEGATION_VALID_UNTIL_FIELD: &str = "delegation_valid_until";
+
+/// v54.0.0 (CIRISPersist#1032, #1036 ruling item 2) — is a `delegates_to`
+/// envelope's signed TERM open at `t`?
+///
+/// * `delegation_valid_from` (when present) must be `<= t`;
+/// * `delegation_valid_until` and `valid_until` (when present) must be `> t`
+///   (half-open, the same boundary as `expires_at`).
+///
+/// A member that is present but is not an RFC 3339 instant makes the edge
+/// NOT live: a term nobody can read cannot be judged open, and expiry must
+/// fail toward LESS authority (`namespace_supersets.json`, `valid_until`
+/// asymmetry note). An absent member bounds nothing.
+fn delegation_term_live_at(envelope: &serde_json::Value, t: chrono::DateTime<chrono::Utc>) -> bool {
+    let instant = |field: &str| -> Option<Option<chrono::DateTime<chrono::Utc>>> {
+        match envelope.get(field) {
+            None | Some(serde_json::Value::Null) => Some(None),
+            Some(v) => v
+                .as_str()
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map(|d| Some(d.with_timezone(&chrono::Utc))),
+        }
+    };
+    let Some(from) = instant(DELEGATION_VALID_FROM_FIELD) else {
+        return false;
+    };
+    if from.is_some_and(|f| f > t) {
+        return false;
+    }
+    for field in [
+        DELEGATION_VALID_UNTIL_FIELD,
+        crate::federation::capacity::binding_field::VALID_UNTIL,
+    ] {
+        match instant(field) {
+            None => return false,
+            Some(Some(until)) if until <= t => return false,
+            Some(_) => {}
+        }
+    }
+    true
+}
+
 impl DelegationWalkLens<'_> {
     /// Was a row asserted at or before the lens instant? Always true unset.
     fn asserted_by(&self, row: &super::Attestation) -> bool {
@@ -7234,6 +7615,13 @@ impl DelegationWalkLens<'_> {
                 return false;
             }
             if edge.expires_at.is_some_and(|x| x <= t) {
+                return false;
+            }
+            // v54.0.0 (CIRISPersist#1032, CC 2.1 / CC 4.4.3.2.8 C) — the
+            // edge's own signed TERM, read at the same instant. Before this a
+            // term-bound officer never lapsed under any lens that read only
+            // the row's `expires_at` column.
+            if !delegation_term_live_at(&edge.attestation_envelope, t) {
                 return false;
             }
         }
@@ -7426,6 +7814,7 @@ async fn scoped_delegation_reach_at(
             // projection) BEFORE the short-circuit, so the two never disagree
             // about what a reached key is.
             out.reached.insert(r.attested_key_id.clone());
+            out.traversed.insert(r.attestation_id.clone());
             // A scope-bearing delegation edge to a target key is sufficient —
             // delegated duty established along the path.
             if to_target {

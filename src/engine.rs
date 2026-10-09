@@ -9198,6 +9198,48 @@ impl Engine {
         .await
     }
 
+    /// v54.0.0 (CIRISPersist#1035 item 3) — the live licensure status SET
+    /// for `(subject_key_id, authority_id)` at `now`: the fold of every
+    /// `licensure:{authority_id}` row the authority (or a `license`-scoped
+    /// delegate, judged at the row's signed `asserted_at`) issued about the
+    /// subject. `revoked` absorbs; the empty set means "no live statement",
+    /// never `lapsed`. See
+    /// [`licensure::status_set_for`](crate::federation::licensure::status_set_for).
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn licensure_status_set(
+        &self,
+        subject_key_id: &str,
+        authority_id: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<
+        std::collections::BTreeSet<crate::federation::licensure::LicensureStatus>,
+        crate::federation::Error,
+    > {
+        crate::federation::licensure::status_set_for(
+            self.federation_directory().as_ref(),
+            subject_key_id,
+            authority_id,
+            now,
+        )
+        .await
+    }
+
+    /// v54.0.0 (CIRISPersist#1035 item 3) — every licence issued under
+    /// `authority_id`, newest first: the rows the fold's own verdict accepts.
+    /// See
+    /// [`admission::licences_issued_under`](crate::federation::admission::licences_issued_under).
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn licences_issued_under(
+        &self,
+        authority_id: &str,
+    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
+        crate::federation::admission::licences_issued_under(
+            self.federation_directory().as_ref(),
+            authority_id,
+        )
+        .await
+    }
+
     /// v10.0.0 (CIRISPersist#272) — the refusal-reason companion of
     /// [`reachable_under_scope`](Self::reachable_under_scope): the same
     /// scope-bearing `delegates_to` walk, returning a typed

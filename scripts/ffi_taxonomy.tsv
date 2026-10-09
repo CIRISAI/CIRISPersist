@@ -308,6 +308,8 @@ Engine	emit_attestation	deontic
 Engine	emit_attestation_self	deontic	
 Engine	emit_key_grant	deontic
 Engine	emit_pending_key_grants	deontic
+Engine	licences_issued_under_json	deontic	
+Engine	licensure_status_set	deontic	
 Engine	list_key_registration_history	empirical	
 Engine	publish_self_occurrence	deontic
 Engine	engine_handle	structural	

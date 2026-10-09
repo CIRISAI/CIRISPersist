@@ -168,6 +168,10 @@ pub mod group_amendment_invariants;
 /// v52.0.0 (CIRISPersist#672) — I230–I235: the held-record settle.
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod held_settle_invariants;
+/// v54.0.0 (CIRISPersist#1032, #1035) — the licensure chain, judged at the
+/// licence's signed instant by ONE function the gate and the fold share.
+#[cfg(test)]
+pub mod licensure_chain_invariants;
 /// v49.0.0 (CIRISPersist#912) — I183: the membership listing plane.
 #[cfg(test)]
 pub mod listing_invariants;
