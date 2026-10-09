@@ -134,6 +134,26 @@ by counting braces, and comments and strings are not code by construction.
   `ignores:`, a per-file expectation on a whole-tree rule, a `valid:` case that fires, the
   test-gated exclusion dropped from I14, and the util forgetting `all(test, …)`.
 
+### Fixed — the six text strippers that remain share one test-only-cfg predicate; one of them hid a test-only citation (#1026)
+
+Six from-disk gates still cut test code out by text before scanning (SQL anchors, manifest-driven
+symbol lists, relational body checks; docs/FROM_DISK_GATES.md lists them and why each stays text).
+Each spelled its own attribute test and most knew only `#[cfg(test)]`. They now share
+`crate::test_cfg::is_test_only_cfg` (I693), whose vocabulary is `utils/test-gated.yml`'s, and
+`rules/cfg-test-forms.yml` keeps every test-only cfg in the tree inside it.
+
+- `namespace/supersets.rs::every_cited_processor_has_a_non_test_caller` read the
+  `#[cfg(all(test, …))]` modules as production, so a call from one counted as a live caller: a
+  FALSE GREEN. Fixed, it names `admission.rs#resolve_withdraws_admission_rule`, cited by two
+  evidence rows (3.3.1, 4.1.1) and called only from test modules; production runs
+  `resolve_withdraws_admission_rule_at`. **Open: the citation needs a ruling** (re-point the rows,
+  or exempt with a reason); the gate is red until then.
+- `blob_surface_gates.rs`, `key_grant_invariants.rs`, `family_rules.rs`,
+  `sqlite_conn_model.rs` and pyo3.rs's GIL gate (which knew only the literal
+  `#[cfg(test)]\nmod `) found nothing new.
+- Reverting the predicate to `#[cfg(test)]` alone turns I693 red and the supersets gate back to
+  green.
+
 ### Changed — Verify 20.1.0 adopted: the three verify crates and the wheel floor move together (#992)
 
 `ciris-verify-core`, `ciris-keyring` and `ciris-crypto` move from tag v19.0.0 to v20.1.0 at all seven pin sites in one cut, since a split re-pin forks `ciris_crypto`. The wheel's `Requires-Dist` moves to `ciris-verify>=20.1.0,<21`. The floor is 20.1.0 because that minor ships the wheel-identity refusals the tag job's signer now relies on. The lockfile gains one transitive crate, `zlib-rs`, which verify-core's wheel reader pulls in. The test-anchor witness I162 had typed the expected verify tag as `v19.0.0` and went red on the flip, so it now reads every CIRISVerify pin from `Cargo.toml` and requires them to name one tag.

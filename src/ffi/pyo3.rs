@@ -38302,7 +38302,28 @@ mod tests {
         let stripped = strip_rust_noise(raw);
         let s: Vec<char> = stripped.chars().collect();
 
-        let test_mods = spans_of(&s, &stripped, "#[cfg(test)]\nmod ");
+        // v54.1.0 (#1026): a test module is one whose attribute line is
+        // test-only by `crate::test_cfg` (`#[cfg(all(test, …))]` too), not
+        // only the literal `#[cfg(test)]\nmod `.
+        let test_mods: Vec<(usize, usize)> = {
+            let mut v = Vec::new();
+            let lines: Vec<&str> = stripped.split('\n').collect();
+            let mut line_start = 0usize;
+            for (k, line) in lines.iter().enumerate() {
+                let next = lines.get(k + 1).map_or("", |l| l.trim_start());
+                let is_mod = ["mod ", "pub mod ", "pub(crate) mod ", "pub(super) mod "]
+                    .iter()
+                    .any(|m| next.starts_with(m));
+                if is_mod && crate::test_cfg::is_test_only_cfg(line) {
+                    let at = stripped[..line_start].chars().count();
+                    if let Some(off) = s[at..].iter().position(|c| *c == '{') {
+                        v.push((at, match_brace(&s, at + off)));
+                    }
+                }
+                line_start += line.len() + 1;
+            }
+            v
+        };
         // A detach span runs to the matching CLOSE PAREN of `.detach(`, not to
         // some following brace: `py.detach(|| runtime.block_on(x))` has no
         // block at all, and brace-matching there would swallow an unrelated

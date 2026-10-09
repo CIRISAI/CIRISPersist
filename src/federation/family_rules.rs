@@ -1179,7 +1179,8 @@ mod tests {
         let mut i = 0usize;
         while i < lines.len() {
             let s = lines[i].trim_start();
-            if s.starts_with("#[cfg(test)]") || s.starts_with("#[cfg(any(test") {
+            // v54.1.0 (#1026): `#[cfg(all(test, …))]` is test-only too.
+            if crate::test_cfg::is_test_only_cfg(s) || s.starts_with("#[cfg(any(test") {
                 let mut j = i;
                 while j < lines.len() && !lines[j].contains('{') {
                     j += 1;

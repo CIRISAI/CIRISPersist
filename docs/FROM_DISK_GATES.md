@@ -14,6 +14,9 @@ Two lessons drive the port:
 | `sgconfig.yml`, `rules/*.yml` | One rule per ported count. Each rule names its files explicitly (no globs). Its file name is its id. |
 | `rules/expected.json` | The exact per-file match count of every rule. A `0` is a claim too: the file must hold no match. |
 | `scripts/ast_gates.sh` | Runs `ast-grep scan --json` (ast-grep 0.45.3, pinned, sha256-checked download into `~/.cache/ciris-ast-grep`, or `AST_GREP=`). It compares counts with `expected.json` in both directions: a rule without expectations, expectations without a rule, a rule file list that differs from its expected files, a missing file, or any differing count is red. Exit 0 green, 1 red, 2 usage or bad root, 3 tool unavailable. A certify fast gate (`astgates`) and a CI `lint` step. |
+| `utils/test-gated.yml` | (v54.1.0) A node that follows `#[cfg(test)]`, `#[cfg(all(test, …))]`, `#[test]` or `#[tokio::test…]`, past other attributes and comments. A rule that excludes test code says `not: {inside: {stopBy: end, matches: test-gated}}`. `rules/cfg-test-forms.yml` refuses any other spelling of a test-only cfg, and a recognised one split over lines. |
+| `rule-tests/<id>-test.yml` | (v54.1.0) Crafted code each rule must match (`invalid`) and near-misses it must not (`valid`). `ast_gates.sh` runs `ast-grep test` and refuses a rule without one. |
+| whole-tree rules | (v54.1.0) `files: [src/**/*.rs]` with `expected.json` `{"src/**/*.rs": N}`: one total, for absence guards. `ignores:` lists exact paths that must exist. |
 | `src/ast_gate_parity.rs` | Counts the same call sites by text, with comments and string contents blanked, and holds them equal to the same `expected.json`. The AST count and the text count therefore agree through one committed file. A call ast-grep cannot see, such as one inside a macro's token tree, shows up as a disagreement instead of a silently lower count. |
 
 Each ported gate keeps its original Rust witness for one release (issue step 3). The Rust text scan is deleted once the AST rule has carried a release.
@@ -32,6 +35,38 @@ Each ported gate keeps its original Rust witness for one release (issue step 3).
 The AST rules count exactly where several Rust gates assert a minimum (`>=`), so they are the stricter of the two. The Rust gates' other legs stay in Rust: I448's field checks, `scores-read-log`'s per-site variant name and its log-before-gate order, and I110's vocabulary-literal checks.
 
 Mutation results (v53.2.0, 12 + 3): for each rule, a commented-out copy of the call (line and block comment) placed in the counted scope left both counts unchanged and green. Deleting the call (renaming it on disk) made both `ast_gates.sh` and the parity test red. For I26, turning the cached call into the uncached one made both rules red. Three more mutants were also red: an expected entry removed, a glob in a rule's `files:`, and `CARGO_MANIFEST_DIR` pointed at another checkout (refused, exit 2).
+
+### Ported (v54.1.0): the absence guards
+
+Each expects 0 under `src/**/*.rs` (or in the one file named) and is bound to its Rust text gate in `src/ast_gate_parity.rs`'s `GUARDS`. Each also matches inside a macro's token tree.
+
+| rule | original gate | what it refuses | test code |
+|---|---|---|---|
+| `i14-storage-floor` | `blob_surface_gates.rs::i14_the_storage_floor_has_no_door` | a call of the five floor methods (method or path call) outside the three cascades and blobs.rs, unless the call names a commons `cohort_scope::` literally | excluded (test-gated) |
+| `i14-storage-floor-blobs` | the same | a `store_blob_local` call in blobs.rs | excluded |
+| `738-anchor-env-mutation` | `genesis/mod.rs::no_src_code_mutates_the_anchor_environment_738` | `set_var`/`remove_var` naming one of the four anchor variables | **included**: the gate is about tests |
+| `564-anti-entropy-satisfied` | `load_bearing.rs::nothing_yields_anti_entropy_satisfied_today` | the path `AntiEntropy::Satisfied` / `Self::Satisfied` outside `matches!` | included |
+| `748-recursion-depth` | `replication/mod.rs::the_retired_depth_knob_stays_retired` | an identifier, field, type or string literal naming the knob, outside replication/mod.rs | included |
+| `620-sync-signing-verb` | `ffi/pyo3.rs::no_sync_signing_verb_is_called_from_persists_own_tree` | `call_method*("local_sign" / "local_pqc_sign")` outside pyo3.rs | included |
+| `pg-provisioner-env-read` | `store/postgres.rs::every_postgres_test_goes_through_the_provisioner` | `env::var*("CIRIS_PERSIST_TEST_PG_URL")` outside test_pg.rs | included |
+| `cfg-test-forms` | none (guards the util) | a test-only cfg the util cannot read | n/a |
+
+Differences from the text gates, all in the direction of fewer false reds and no fewer true ones: the I14 text gate skips any line starting with `fn ` (so a one-line fn calling the floor is invisible to it) and only sees `.method(` calls; the rule sees both shapes and a path call. The text gates for #564, #748 and the provisioner skip comment lines by a `//` prefix test and exempt their own needles with markers; the rules need neither. CC 3.4.5's redaction-token gate is not ported: it bans the token in ANY text of other files, comments included, which is a textual property.
+
+## Hand-written test-code strippers (v54.1.0 inventory)
+
+The gates below still cut test code out of a file by text before they scan. Each read an attribute line at a time and knew only some test-only forms; v54.1.0 points each at one predicate, `crate::test_cfg::is_test_only_cfg`, whose vocabulary is the util's (`cfg-test-forms` keeps the tree inside it). None of them is a count ast-grep can take today: they are SQL anchors, data-driven symbol lists, or relational ("every door calls X before Y").
+
+| stripper | gates | why it stays text |
+|---|---|---|
+| `blob_surface_gates.rs::production_only` | I8, I13, I36, I45, I46, I48, I49, I90b, I14's twin | I8 is a 17-symbol data list, the rest are AST-STRUCT (bodies that must not call, or must call first) |
+| `key_grant_invariants.rs::production_only` | I66e/I68, I67, I69, I72 | I67 counts a SQL `DELETE` literal; the others are per-door body checks (AST-STRUCT) |
+| `family_rules.rs::test_regions` | `every_admission_shaped_prefix_literal_is_classified` | classifies string literals (TEXTUAL) |
+| `namespace/supersets.rs::test_regions` | `every_cited_processor_has_a_non_test_caller` | the symbol set is read from the evidence manifest at test time (data-driven); a rule file is static |
+| `sqlite_conn_model.rs::production_text` | the four connection-class gates and the direct-lock gate | per-fn classification from a table in the test (AST-STRUCT, data-driven) |
+| `ffi/pyo3.rs` (`#[cfg(test)]\nmod` spans) | `no_block_on_reaches_the_pyo3_boundary_holding_the_gil` | span containment of `block_on` inside `py.detach(…)` (AST-STRUCT) |
+
+Comment-only strippers (`observe/tests.rs::strip_comments`, `durability_invariants.rs::strip_comments`, `store/parity.rs::strip_file`, the line-prefix `//` skips in the I-number invariants) cut no test code; their gates are in the inventory below.
 
 ## Inventory (v53.2.0)
 
@@ -124,7 +159,7 @@ Classes:
 
 ## Follow-up (not in v53.2.0)
 
-- **Next AST-COUNT ports:** I14, the `== 0` guards (#738, #564, #748, CC 3.4.5, #620, #622, the PG provisioner gate), I551's path-mention set, I98's single definition, I103's single arm, I8's 17 symbols, `no_backend_file_hand_rolls_the_seal`, `no_production_line_in_sqlite_rs_locks_a_connection_directly`. Each needs a rule, an `expected.json` entry and a `PORTED` row in `src/ast_gate_parity.rs`.
+- **Next AST-COUNT ports** (I14, #738, #564, #748, #620 and the PG provisioner gate were ported in v54.1.0): #622 (a heuristic about which variable holds an attestation id), I551's path-mention set, I98's single definition, I103's single arm, I8's 17 symbols, `no_backend_file_hand_rolls_the_seal`, `no_production_line_in_sqlite_rs_locks_a_connection_directly`. CC 3.4.5 stays textual (it bans the token in comments too).
 - **AST-STRUCT gates** (I13, I36, I45, I46, I48, I49, I90b, I548e, I89b, I235, I458, I378, I66e, I69, I72, #580, the parity and sqlite_conn_model families) need relational rules (`inside`, `has`, `precedes`) and a way to express "every fn in this list". Port them after the counts.
 - **Delete the Rust text scans** of the six ported gates in the release after v53.2.0, once the AST rules have carried a release (issue step 3). Keep `src/ast_gate_parity.rs` until then.
 - **TEXTUAL gates stay textual.** SQL strings (supersets' pointer guard, I114, I288, I67, I78, I125, the schema-parity and migration families), doc prose (#583, #602, I53, I59), byte digests (#682) and lockfile checks (I295) are about text, not syntax.
