@@ -120,9 +120,14 @@ case "$tool" in
         # binaries would be built for every mutant and never run.
         # --profile mutants (.config/nextest.toml): a witness that hangs
         # under a mutant is killed at 60 s and reads as a FAIL of that
-        # witness, not a 300 s tool timeout credited to no one.
+        # witness, not a 300 s tool timeout credited to no one. That holds
+        # only while the tool's own test timeout is longer than the leash:
+        # cargo-mutants auto-sets it from the baseline (300 s on the first
+        # nightly run's 16 s baseline), so its floor is pinned here, not left
+        # to the tool's default.
         CARGO_INCREMENTAL=1 timeout --signal=INT --kill-after=120 "$BUDGET" \
             "${pg[@]}" cargo mutants --test-tool nextest --features "$FEATURES" \
+            --minimum-test-timeout 300 \
             --jobs "$JOBS" --no-shuffle --output "$ABS_OUT" "${sel[@]}" "${shard_args[@]}" \
             -- --lib --no-fail-fast --profile mutants -E "$filter" \
             </dev/null >"$OUT/tool.log" 2>&1

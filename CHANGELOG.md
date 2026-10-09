@@ -48,6 +48,10 @@ and its job was **green**. Each defect, and what now makes it red:
   `scope-consent-gate` names both and measures I570 beside I548.
 - **Hangs cost the budget.** A nextest `mutants` profile kills a witness after 60 s, so a
   mutant that hangs one is that witness's FAIL, not a 300 s tool timeout credited to no one.
+  `mutants.sh` pins cargo-mutants' `--minimum-test-timeout 300` so the tool's own timeout
+  cannot fall under that leash on a fast baseline. Run locally with cargo-mutants 27.1 on
+  `record_read` at `-j 1`: all five of its mutants `caught`, the three mask-loop ones in
+  61-63 s of test each (300 s and `timeout` on the nightly run).
 
 `scripts/mutants_matrix_test.py` (22 checks, fixtures, no cargo) now runs per-PR in `ci.yml`,
 in certify's fast tier (`mutmatrix`), and before each nightly leg (#1045 item 4). Each new
@@ -84,7 +88,10 @@ sqlite, postgres).
 - **`CARGO_BUILD_JOBS` defaults to 6** in `release.sh` and `certify.sh`; the environment wins.
 - **The certify stage waits for a foreign cargo** (until none has run for 60 s, at most 2 h,
   then exit 24 as before) instead of exiting 24 on certify's stray guard.
-- The 53.2.0 entry's self-test count said 41; it was 112. Now 122.
+  `CERTIFY_IGNORE_STRAY=1`, certify's own override, skips the wait. The self-test runs
+  release.sh's own `certify()` against stubs: a wait that gives up returns 24 before
+  certify.sh starts.
+- The 53.2.0 entry's self-test count said 41; it was 112. Now 124.
 - Not done here: item 6 (whether Codex caps reviews per PR) and item 7 (observing #1021's
   tree-equality skip on a non-release merge) need observation on GitHub, not code.
 

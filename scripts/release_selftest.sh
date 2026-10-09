@@ -415,14 +415,28 @@ n=$(cat "$PG_COUNT" 2>/dev/null || echo 0); echo $((n + 1)) > "$PG_COUNT"
 exit 0
 PGEOF
 chmod +x "$t/pgrep-n"
-wq() { rm -f "$t/pg-count"; out="$(PG_COUNT="$t/pg-count" PG_BUSY="$1" RL_PGREP="$t/pgrep-n" rl_wait_quiet_cargo "$2" "$3" 1 2>&1)"; rc=$?; calls=$(cat "$t/pg-count"); }
+wq() { rm -f "$t/pg-count"; out="$(PG_COUNT="$t/pg-count" PG_BUSY="$1" RL_PGREP="$t/pgrep-n" rl_wait_quiet_cargo "$2" "$3" 1 2>&1)"; rc=$?; calls=$(cat "$t/pg-count" 2>/dev/null || echo 0); }
 wq 0 3 10; expect_eq "no foreign cargo: start at once" "$rc/$calls" "0/1"
 wq 2 3 10; expect_eq "a cargo for 2 polls: wait, then 3 quiet polls" "$rc" "0"
 case "$out" in *"waiting for foreign cargo"*"4242 cargo build"*) ok "the wait names the process";; *) bad "wait text: $out";; esac
 wq 1000 3 5; expect_eq "a cargo that never stops: give up at the bound (1)" "$rc" "1"
-# shellcheck disable=SC2016  # literal: grep text, not an expansion
-sed -n '/^certify() {/,/^}/p' scripts/release.sh | grep -q 'rl_wait_quiet_cargo' \
-    && ok "release.sh certify stage waits before certify.sh" || bad "release.sh certify stage does not wait"
+CERTIFY_IGNORE_STRAY=1 wq 1000 3 5; expect_eq "CERTIFY_IGNORE_STRAY=1: no wait, no poll" "$rc/${calls:-0}" "0/0"
+# release.sh's own certify() run against stubs (a mention, a `: ` no-op or a
+# call after certify.sh would each pass a grep): a wait that gives up must
+# return 24 before certify.sh starts, and a quiet box must start it.
+mkdir -p "$t/cert/scripts" "$t/cert/S"
+printf '#!/bin/sh\necho ran > "%s/cert/ran"; echo "EVERY CI LEG GREEN BY EXIT CODE. Logs in x"\n' "$t" > "$t/cert/scripts/certify.sh"
+chmod +x "$t/cert/scripts/certify.sh"
+cert_rc() {
+    rm -f "$t/cert/ran"
+    local src; src="$(pwd)/scripts/release.sh"
+    ( cd "$t/cert" && S="$t/cert/S"
+      eval "$(sed -n '/^certify() {/,/^}/p' "$src")"
+      eval "rl_wait_quiet_cargo() { return $1; }"
+      certify >/dev/null 2>&1 ); echo "$?/$([ -f "$t/cert/ran" ] && echo ran || echo not-run)"
+}
+expect_eq "certify stage: the wait gives up -> 24, certify.sh never started" "$(cert_rc 1)" "24/not-run"
+expect_eq "certify stage: a quiet box -> certify.sh runs" "$(cert_rc 0)" "0/ran"
 
 echo "syntax"
 for f in scripts/release.sh scripts/release_ship.sh scripts/release_finish.sh scripts/release_lib.sh scripts/release_selftest.sh; do

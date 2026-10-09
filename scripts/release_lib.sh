@@ -229,9 +229,12 @@ rl_gh_has_attestation() { "$1" attestation verify --help >/dev/null 2>&1; }
 # red; on v53.2.0 a hand-written waiter did this instead. Returns 0 at once
 # when no cargo runs; once one has been seen, only after <quiet-secs> with
 # none (agents start their cargos back to back); 1 when <limit-secs> pass
-# first. RL_PGREP replaces pgrep for the self-test.
+# first. CERTIFY_IGNORE_STRAY=1, certify's own override of that guard, skips
+# the wait too: an operator who waved the guard through must not then wait two
+# hours for it here. RL_PGREP replaces pgrep for the self-test.
 rl_wait_quiet_cargo() {
     local quiet="$1" limit="$2" poll="$3" waited=0 calm=0 seen=0 procs
+    [ "${CERTIFY_IGNORE_STRAY:-0}" = "1" ] && { echo "certify: CERTIFY_IGNORE_STRAY=1 — not waiting for foreign cargo"; return 0; }
     while :; do
         procs="$(${RL_PGREP:-pgrep} -x -a 'cargo|cargo-nextest' 2>/dev/null || true)"
         if [ -z "$procs" ]; then
