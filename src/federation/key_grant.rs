@@ -271,6 +271,51 @@ fn refuse(reason: KeyGrantRefusalReason, detail: impl Into<String>) -> Error {
     }
 }
 
+/// v54.0.0 (CIRISPersist#1033, CC 2.4.1.2.1 / CC 4.4.3.4.3) — **may `signer`
+/// issue a `key_grant` over an asset `owner` holds?**
+///
+/// CC 2.4.1.2.1: an onward grant is *"a new grant issued by the asset's owner
+/// or steward, or by a holder of a `grant`-scoped delegation from them"*, and a
+/// substrate MUST refuse one whose issuer is neither. The first arm is
+/// [`speaks_for`] (the owner, or one of the owner's active occurrences —
+/// #884); the second is a live `grant`-scoped chain to `signer` rooted at
+/// `owner` or at one of its principals, via
+/// [`holds_grant_delegation`](crate::federation::admission::holds_grant_delegation).
+///
+/// The ONE predicate every signer check on the content and stream axes asks —
+/// at admission, at the pending re-check, at the pending projection, and on
+/// the stream read path's sealer filter — so a set admitted under the
+/// delegate arm is never then refused by a sibling that asks only the first.
+pub async fn may_issue_grant_for<D>(dir: &D, signer: &str, owner: &str) -> Result<bool, Error>
+where
+    D: FederationDirectory + ?Sized,
+{
+    if speaks_for(dir, signer, owner).await? {
+        return Ok(true);
+    }
+    // The chain may be rooted at the owner key or at one of its principals —
+    // the same reading `speaks_for` gives the first arm: what a node seals is
+    // its human's (#884), so the human's `grant` delegate speaks for it too.
+    let now = chrono::Utc::now();
+    let mut roots = crate::federation::self_collective::principals_of(dir, owner).await?;
+    if !roots.iter().any(|r| r == owner) {
+        roots.insert(0, owner.to_owned());
+    }
+    for root in &roots {
+        if crate::federation::admission::holds_grant_delegation(
+            dir.as_dyn_directory(),
+            root,
+            signer,
+            now,
+        )
+        .await?
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 impl KeyGrantSet {
     /// The set's identity as the envelope carries it, beside the CEG
     /// envelope members `stamp_and_canonicalize` adds. `wraps[]` entries are
@@ -1232,12 +1277,23 @@ where
             minter_key_id,
             ..
         } => {
-            if signer != minter_key_id {
+            // v54.0.0 (#1033, CC 2.4.1.2.1) — the minter, or a holder of a
+            // live `grant`-scoped chain from the minter.
+            if signer != minter_key_id
+                && !crate::federation::admission::holds_grant_delegation(
+                    backend.as_dyn_directory(),
+                    minter_key_id,
+                    signer,
+                    chrono::Utc::now(),
+                )
+                .await?
+            {
                 return Err(refuse(
                     KeyGrantRefusalReason::SignerNotMinter,
                     format!(
-                        "signer {signer:?} is not the set's minter {minter_key_id:?}; only M signs \
-                         M's counter (BLOB_REPLICATION.md §11)"
+                        "signer {signer:?} is not the set's minter {minter_key_id:?} and holds no \
+                         live `grant`-scoped delegation from it; only M, or M's `grant` delegate, \
+                         issues a grant over M's counter (BLOB_REPLICATION.md §11; CC 2.4.1.2.1)"
                     ),
                 ));
             }
@@ -1270,7 +1326,7 @@ where
                 // author's ACTIVE occurrences (CC 3.3.6) — never a revoked
                 // one, never a family member's device (I65).
                 Some(author) => {
-                    if !speaks_for(backend, signer, &author).await? {
+                    if !may_issue_grant_for(backend, signer, &author).await? {
                         return Err(refuse(
                             KeyGrantRefusalReason::SignerNotAuthor,
                             format!(
@@ -1305,7 +1361,7 @@ where
                 .map_err(map_blob_err)?
                 .owner_key_id
             {
-                if !speaks_for(backend, signer, &owner).await? {
+                if !may_issue_grant_for(backend, signer, &owner).await? {
                     return Err(refuse(
                         KeyGrantRefusalReason::SignerNotStreamOwner,
                         format!(
@@ -1374,7 +1430,7 @@ where
             .map_err(map_blob_err)?
             .and_then(|p| p.author_key_id);
         let speaks = match &author {
-            Some(a) => speaks_for(backend, signer, a).await?,
+            Some(a) => may_issue_grant_for(backend, signer, a).await?,
             None => false,
         };
         match author {
@@ -1523,7 +1579,7 @@ where
         // adopt (PR #850 review, round three). v46.3.0 (#884, §4.1): the
         // author's own active occurrence — the node that sealed the bytes —
         // speaks for the author.
-        if !speaks_for(backend, &signer, author_key_id).await? {
+        if !may_issue_grant_for(backend, &signer, author_key_id).await? {
             backend
                 .key_grant_pending_delete(sha256, cohort_scope, &attestation_id)
                 .await

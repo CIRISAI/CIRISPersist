@@ -9,6 +9,16 @@ threat-model citations because this crate's audit story is the point.
 
 ## [54.0.0] - UNRELEASED
 
+### Fixed — a `grant`-scoped delegate may issue a grant (CC 2.4.1.2.1, CC 4.4.3.4.3, #1033)
+
+CC 2.4.1.2.1 says an onward grant is issued by the asset's owner or steward, or by a holder of a `grant`-scoped delegation from them, and a substrate MUST refuse any other issuer. Persist had the refusal and not the positive arm. `DELEGATION_SCOPE_GRANT` was declared and no gate read it, so a legitimate delegate was refused.
+
+- `admission::holds_grant_delegation(owner, issuer, now)` is the licence scope's walk (`MODERATION_DUTY` policy: attenuation, deputization, both retraction gates, depth 5) read as of the admitting node's clock, so an expired or future-dated edge confers nothing.
+- `key_grant::may_issue_grant_for(signer, owner)` is `speaks_for` OR a live `grant` chain to the signer rooted at the owner or one of the owner's principals. It is the one predicate at all four content and stream signer checks (admission, the pending re-check, the pending projection) and on the stream read path's sealer filter, so a set admitted under the delegate arm is not refused by a sibling. On the epoch axis the signer is the minter OR holds a live `grant` chain from the minter, and must still be an active member.
+- `check_consent_for_key_admission`: a machine naming another key in `for_key_id` is admitted when that key is a `user` and holds a live `grant` chain to the machine. A chain rooted at a machine does not count (consent stays by humans). The refusal keeps its type (`InvalidArgument`, Python `ValueError`) and now leads with the token `consent_for_key_not_delegated`.
+- The `key_grant` refusal tokens are unchanged (`signer_not_minter`, `signer_not_author`, `signer_not_stream_owner`); their messages now name the delegate arm.
+- Witnesses: I561 (memory, sqlite, postgres) covers consent: refused with no delegation and under `moderate`; admitted under `grant` (a `consent:replication` grant and a `consent:state` row); refused once the edge is withdrawn, under an expired edge, and when the root is a node. I561b (sqlite, postgres) covers the content axis: refused, still refused under `moderate`, admitted and projected under `grant`, refused once withdrawn. I561c (sqlite, postgres) covers the epoch axis on a two-node pair, with the same four arms. Memory has no blob store, so it cannot host the `key_grant` door.
+
 ### Fixed — the cycle-closing `delegates_to` is refused at admission (CC 4.1.1, #1031)
 
 CC 4.1.1's anti-pattern row "Cycles (A → B → A)" says the substrate MUST detect cycles on the `delegates_to` graph and reject the cycle-closing emission. The walks were visited-guarded, so a cycle was tolerated at read time, but no gate refused the closing edge and it was stored.

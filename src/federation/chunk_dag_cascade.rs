@@ -3026,7 +3026,10 @@ pub mod orchestrate {
             .await?
         {
             if sealer == owner
-                || crate::federation::self_collective::speaks_for(backend, &sealer, &owner)
+                // v54.0.0 (#1033) — the admission predicate, so a set
+                // admitted under the `grant`-delegate arm is not then refused
+                // here.
+                || crate::federation::key_grant::may_issue_grant_for(backend, &sealer, &owner)
                     .await
                     .map_err(|e| BlobError::Backend(format!("stream grant sealer: {e}")))?
             {

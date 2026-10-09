@@ -14198,12 +14198,49 @@ pub async fn check_consent_for_key_admission(
     if identity_type::set_contains(&rec.identity_type, identity_type::USER) {
         return Ok(());
     }
+    // v54.0.0 (CIRISPersist#1033, CC 2.4.1.2.1 / CC 4.4.3.4.3) — the positive
+    // arm. A machine may issue a consent grant over a PERSON's data when that
+    // person delegated it the `grant` scope: the onward grant is "issued by a
+    // holder of a `grant`-scoped delegation from them". The root must be a
+    // human (`user`) — consent stays by humans; a chain rooted at another
+    // machine is still one machine consenting for another.
+    if consent_root_is_human(directory, for_key).await?
+        && holds_grant_delegation(
+            directory,
+            for_key,
+            &row.attesting_key_id,
+            chrono::Utc::now(),
+        )
+        .await?
+    {
+        return Ok(());
+    }
     Err(Error::InvalidArgument(format!(
-        "consent row by {} names for_key_id {for_key}: a machine author may name only itself — \
-         consent is by humans, and infrastructure cannot consent on another machine's behalf \
-         (CIRISPersist#857, FSD/CONSENT_BY_HUMANS.md §4)",
+        "{CONSENT_FOR_KEY_NOT_DELEGATED}: consent row by {} names for_key_id {for_key}: a \
+         machine author may name only itself, or a person who delegated it the `grant` scope \
+         through a live chain — consent is by humans, and infrastructure cannot consent on \
+         another machine's behalf (CIRISPersist#857, FSD/CONSENT_BY_HUMANS.md §4; \
+         CIRISPersist#1033, CC 2.4.1.2.1)",
         row.attesting_key_id
     )))
+}
+
+/// v54.0.0 (CIRISPersist#1033) — the refusal token of
+/// [`check_consent_for_key_admission`]: a machine author named another key in
+/// `for_key_id` and holds no live `grant`-scoped chain from a human there.
+/// `Error::InvalidArgument` (Python `ValueError`), the type this refusal has
+/// always had; the token is its stable prefix.
+pub const CONSENT_FOR_KEY_NOT_DELEGATED: &str = "consent_for_key_not_delegated";
+
+/// Is `key` a `user`-role identity on this node? Unknown keys are not.
+async fn consent_root_is_human(
+    directory: &dyn super::FederationDirectory,
+    key: &str,
+) -> Result<bool, Error> {
+    Ok(directory
+        .lookup_public_key(key)
+        .await?
+        .is_some_and(|r| identity_type::set_contains(&r.identity_type, identity_type::USER)))
 }
 
 /// v52.0.0 (CIRISPersist#784, decision D2) — the envelope member a
@@ -14449,6 +14486,51 @@ pub async fn check_node_agency_admission(
         attested_key_id: row.attested_key_id.clone(),
         offending_scopes,
     })
+}
+
+/// v54.0.0 (CIRISPersist#1033, CC 2.4.1.2.1 / CC 4.4.3.4.3) — **does `issuer`
+/// hold a live [`DELEGATION_SCOPE_GRANT`]-scoped delegation from `owner`?**
+///
+/// CC 2.4.1.2.1: *"An onward grant is a new grant issued by the asset's owner
+/// or steward, or by a holder of a `grant`-scoped delegation from them."* This
+/// is the second half of that sentence; the owner/steward half is the
+/// caller's own predicate (`speaks_for`, the minter, the human author).
+///
+/// The walk is the one the `license` scope uses
+/// ([`emitter_resolves_to_authority`]): [`scoped_delegation_reach_at`] under
+/// [`DelegationWalkPolicy::MODERATION_DUTY`] (`⊆`-parent attenuation,
+/// `sub_delegation`-gated deputization, both retraction gates) to
+/// [`MAX_MODERATION_DELEGATION_DEPTH`] — read AS OF `now`, so an edge that has
+/// expired, or that is dated after the act, confers nothing. "Live" is the
+/// admitting node's clock, never the row's signer-chosen `asserted_at`.
+///
+/// `owner == issuer` is NOT a reach (no edge carries a scope to the self); the
+/// owner's own issuance is the caller's other arm.
+pub async fn holds_grant_delegation(
+    directory: &dyn super::FederationDirectory,
+    owner: &str,
+    issuer: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<bool, Error> {
+    if owner == issuer {
+        return Ok(false);
+    }
+    let targets: std::collections::HashSet<String> = std::iter::once(issuer.to_owned()).collect();
+    Ok(scoped_delegation_reach_at(
+        directory,
+        owner,
+        &targets,
+        DELEGATION_SCOPE_GRANT,
+        MAX_MODERATION_DELEGATION_DEPTH,
+        DelegationWalkPolicy::MODERATION_DUTY,
+        DelegationWalkLens {
+            as_of: Some(now),
+            community_id: None,
+            root_authority: None,
+        },
+    )
+    .await?
+    .hit_target)
 }
 
 /// v54.0.0 (CIRISPersist#1031, CC 4.1.1) — **the cycle-closing `delegates_to`
