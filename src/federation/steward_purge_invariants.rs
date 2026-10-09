@@ -418,16 +418,35 @@ pub(crate) mod bodies {
         let sel = mock_selection();
         let ok = notice_for(&dry.notice_template, &[cc::FOUNDERS[0], cc::FOUNDERS[1]], t);
 
-        let mut cases: Vec<(&str, StewardPurgeNotice)> = Vec::new();
-        cases.push(("no cosignature", notice_for(&dry.notice_template, &[], t)));
-        cases.push((
-            "one of quorum:2/3",
-            notice_for(&dry.notice_template, &[cc::FOUNDERS[0]], t),
-        ));
-        cases.push((
-            "an accord holder who is not a founder",
-            notice_for(&dry.notice_template, &[cc::FOUNDERS[0], "A1"], t),
-        ));
+        let mut cases: Vec<(&str, StewardPurgeNotice)> = vec![
+            ("no cosignature", notice_for(&dry.notice_template, &[], t)),
+            (
+                "one of quorum:2/3",
+                notice_for(&dry.notice_template, &[cc::FOUNDERS[0]], t),
+            ),
+            (
+                "an accord holder who is not a founder",
+                notice_for(&dry.notice_template, &[cc::FOUNDERS[0], "A1"], t),
+            ),
+            // A quorum of founders does not launder a stranger's cosignature
+            // into the set the bundle carries, nor does a founder count twice.
+            (
+                "a founder quorum carrying a non-founder's cosignature",
+                notice_for(
+                    &dry.notice_template,
+                    &[cc::FOUNDERS[0], cc::FOUNDERS[1], "A1"],
+                    t,
+                ),
+            ),
+            (
+                "a founder quorum with one founder signing twice",
+                notice_for(
+                    &dry.notice_template,
+                    &[cc::FOUNDERS[0], cc::FOUNDERS[1], cc::FOUNDERS[1]],
+                    t,
+                ),
+            ),
+        ];
         let mut forged = ok.clone();
         forged.cosignatures[1] = ts::threshold_sign(cc::FOUNDERS[1], b"other bytes");
         cases.push(("a forged cosignature", forged));

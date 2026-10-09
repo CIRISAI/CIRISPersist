@@ -3759,7 +3759,9 @@ where
 /// whose seat the protocol counted.
 ///
 /// - The row at `community_key_id` must be TRUST-ROOT GRADE and **ROOTED** now
-///   ([`stored_standing_at`]). A stalled root is valid but non-admitting (CC
+///   ([`stored_standing_at`], which answers `NotRooted` for a row that is not
+///   trust-root grade — the ONE grade check; only the trust root's takedown
+///   duty authorises a steward purge, CC 4.5.5). A stalled root is valid but non-admitting (CC
 ///   3.2 T7): it confers nothing new, and an authorisation is something new.
 ///   An unrooted squat authorises nothing.
 /// - Every offered signature must be a distinct RECORDED FOUNDER of the held
@@ -3786,18 +3788,6 @@ where
     F: FederationDirectory + ?Sized,
 {
     use ciris_verify_core::threshold::ThresholdMember;
-    let Some(stored) = directory.lookup_community(community_key_id).await? else {
-        return Ok(Err(format!(
-            "no community row at {community_key_id:?}: the claimant is not a trust root this \
-             node holds"
-        )));
-    };
-    if !is_trust_root_grade(&stored) {
-        return Ok(Err(format!(
-            "{community_key_id:?} is not trust-root grade: only the trust root's takedown duty \
-             authorises a steward purge (CC 4.5.5)"
-        )));
-    }
     let head = match stored_standing_at(directory, community_key_id, now).await? {
         StoredStanding::Rooted(head) => head,
         StoredStanding::Stalled { reason, .. } => {
@@ -3812,7 +3802,10 @@ where
             )))
         }
         StoredStanding::Absent => {
-            return Ok(Err(format!("no rooted trust root at {community_key_id:?}")))
+            return Ok(Err(format!(
+                "no community row at {community_key_id:?}: the claimant is not a trust root this \
+                 node holds"
+            )))
         }
     };
     if signatures.is_empty() {
