@@ -7569,6 +7569,14 @@ pub const DELEGATION_VALID_UNTIL_FIELD: &str = "delegation_valid_until";
 /// NOT live: a term nobody can read cannot be judged open, and expiry must
 /// fail toward LESS authority (`namespace_supersets.json`, `valid_until`
 /// asymmetry note). An absent member bounds nothing.
+///
+/// The one-year ceiling (CC 4.4.3.2.8 C): when the term names both ends, an
+/// upper bound more than
+/// [`ROLE_TERM_CEILING_SECONDS`](crate::federation::affiliation_config::ROLE_TERM_CEILING_SECONDS)
+/// (`365 × 86400` s) after `delegation_valid_from` makes the edge NOT live at
+/// any instant: a term past the ceiling is not a term the constitution
+/// recognises, and it fails toward less authority like an unreadable one. A
+/// term that names only one end has no span to measure.
 fn delegation_term_live_at(envelope: &serde_json::Value, t: chrono::DateTime<chrono::Utc>) -> bool {
     let instant = |field: &str| -> Option<Option<chrono::DateTime<chrono::Utc>>> {
         match envelope.get(field) {
@@ -7592,6 +7600,16 @@ fn delegation_term_live_at(envelope: &serde_json::Value, t: chrono::DateTime<chr
         match instant(field) {
             None => return false,
             Some(Some(until)) if until <= t => return false,
+            Some(Some(until))
+                if from.is_some_and(|f| {
+                    until - f
+                        > chrono::Duration::seconds(
+                            crate::federation::affiliation_config::ROLE_TERM_CEILING_SECONDS,
+                        )
+                }) =>
+            {
+                return false
+            }
             Some(_) => {}
         }
     }
@@ -14968,7 +14986,8 @@ pub async fn holds_grant_delegation(
 /// A self-edge (`A == B`) is admitted without a read: it is the root charter,
 /// the constitutional `delegates_to(root → root)` self-declaration
 /// (`trust_root`), not the "A → B → A" anti-pattern, and the walks' visited
-/// guard reads it as a root.
+/// guard reads it as a root. CC confirms the reading: a cycle needs at least
+/// two distinct keys (CC 4.1.1; CC 3.2 T1/T3, the root's self-declaration).
 ///
 /// # What "live" means here — the walks' own reading
 ///

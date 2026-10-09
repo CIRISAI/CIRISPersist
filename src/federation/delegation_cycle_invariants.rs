@@ -6,7 +6,7 @@
 //! emission."* The walks were visited-guarded, so a cycle was tolerated at
 //! read time; nothing refused the closing edge.
 //!
-//! I566 — one body, run on memory, sqlite and postgres:
+//! I590 — one body, run on memory, sqlite and postgres:
 //!
 //! - (1) a chain `a → b → c` admits; `c → a` is refused
 //!   `federation_delegation_cycle` (hops 2) and is not stored;
@@ -111,8 +111,8 @@ pub mod bodies {
         Ok(id)
     }
 
-    /// I566 — see the module doc.
-    pub async fn i566_the_cycle_closing_edge_is_refused(d: &dyn FederationDirectory, tag: &str) {
+    /// I590 — see the module doc.
+    pub async fn i590_the_cycle_closing_edge_is_refused(d: &dyn FederationDirectory, tag: &str) {
         let k = |n: &str| format!("{tag}-{n}");
         for n in [
             "a", "b", "c", "d", "e", "f", "g", "h", "x", "y", "m", "n", "o", "p", "q", "r",
@@ -320,11 +320,11 @@ mod run {
             mod $modname {
                 use crate::federation::FederationDirectory;
                 #[tokio::test(flavor = "multi_thread")]
-                async fn i566() {
+                async fn i590() {
                     let Some(d) = $fresh.await else { return };
-                    super::super::bodies::i566_the_cycle_closing_edge_is_refused(
+                    super::super::bodies::i590_the_cycle_closing_edge_is_refused(
                         &d as &dyn FederationDirectory,
-                        &format!("i566-{}", super::suffix()),
+                        &format!("i590-{}", super::suffix()),
                     )
                     .await
                 }

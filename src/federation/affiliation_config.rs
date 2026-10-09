@@ -67,6 +67,14 @@ pub const DEFAULT_CLASS: &str = "internal";
 /// The constitutional ceiling on a role term, in days: "at most one year
 /// after `delegation_valid_from`" (CC 4.4.3.2.8 C, CIRISConstitution#163).
 pub const ROLE_TERM_CEILING_DAYS: u32 = 365;
+/// [`ROLE_TERM_CEILING_DAYS`] in seconds: CC pins the ceiling as exactly
+/// `365 × 86400` s from `delegation_valid_from`. The ONE spelling of the
+/// ceiling: the config check above (`role_term ≤ 365`, in days) and the
+/// delegation walks' term lens
+/// (`delegation_valid_until − delegation_valid_from ≤ 365 × 86400` s,
+/// `admission::delegation_term_live_at`) both derive from
+/// [`ROLE_TERM_CEILING_DAYS`] (CC 4.4.3.2.8 C; CIRISPersist#1032, #1034).
+pub const ROLE_TERM_CEILING_SECONDS: i64 = ROLE_TERM_CEILING_DAYS as i64 * 86_400;
 
 /// The refusal rules of [`Error::AffiliationConfigInvalid`]. Stable tokens;
 /// append-only.
@@ -468,7 +476,9 @@ impl AffiliationConfig {
             }
         }
         if let Some(t) = self.role_term {
-            if t == 0 || t > ROLE_TERM_CEILING_DAYS {
+            // The same ceiling the term lens enforces on an edge, in the same
+            // unit: `role_term × 86400 ≤ 365 × 86400` (CC 4.4.3.2.8 C).
+            if t == 0 || i64::from(t) * 86_400 > ROLE_TERM_CEILING_SECONDS {
                 return Err(invalid(
                     group,
                     rule::ROLE_TERM_OUT_OF_RANGE,

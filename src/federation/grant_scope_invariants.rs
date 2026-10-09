@@ -7,21 +7,35 @@
 //! refusal and not the positive arm: `DELEGATION_SCOPE_GRANT` was declared and
 //! no gate read it, so a legitimate `grant` delegate was refused.
 //!
-//! - **I567** (memory, sqlite, postgres) — consent. A machine naming a person
+//! - **I591** (memory, sqlite, postgres) — consent. A machine naming a person
 //!   in `for_key_id` is refused `consent_for_key_not_delegated`, still refused
 //!   under a non-`grant` delegation, ADMITTED under a live `grant` chain from
 //!   that person (a `consent:replication` grant and a `consent:state` row),
 //!   refused again once the edge is withdrawn, refused under an expired edge,
 //!   and refused when the chain is rooted at a machine.
-//! - **I567b** (sqlite, postgres) — `key_grant`, content axis: a key that is
+//! - **I591b** (sqlite, postgres) — `key_grant`, content axis: a key that is
 //!   neither the author nor an occurrence of them is `signer_not_author`;
 //!   still so under a `moderate` delegation; admitted and PROJECTED under the
 //!   author's `grant` delegation; refused again once it is withdrawn.
-//! - **I567c** (sqlite, postgres) — `key_grant`, epoch axis on a two-node
+//! - **I591c** (sqlite, postgres) — `key_grant`, epoch axis on a two-node
 //!   pair: a member signing the minter's counter is `signer_not_minter`;
 //!   admitted and projected under the minter's `grant` delegation; refused
 //!   again once it is withdrawn. Memory has no blob store, so it cannot host
 //!   the `key_grant` door.
+//!
+//! **I596** — the `grant` walk honours the edge's signed TERM at the door
+//! (CIRISPersist#1032 meeting #1033; written on the merged tree, since #1033's
+//! positive arm and #1032's term lens shipped on separate branches). A
+//! `grant`-scoped `delegates_to` whose `delegation_valid_until` has passed
+//! confers nothing, one whose term is open confers the grant, and a term
+//! longer than the one-year ceiling
+//! ([`ROLE_TERM_CEILING_SECONDS`](crate::federation::affiliation_config::ROLE_TERM_CEILING_SECONDS),
+//! `365 × 86400` s from `delegation_valid_from`, CC 4.4.3.2.8 C) confers
+//! nothing while exactly 365 days does:
+//!
+//! - **I596** (memory, sqlite, postgres) — through the consent door;
+//! - **I596b** (sqlite, postgres) — through the `key_grant` door, content
+//!   axis (memory has no blob store).
 
 /// The consent body, generic over the directory.
 #[cfg(test)]
@@ -105,6 +119,41 @@ pub mod bodies {
         id
     }
 
+    /// v54.0.0 (I596) — a `grant`-scoped `delegates_to(granter → grantee)`
+    /// asserted at `at`, whose envelope carries the signed TERM
+    /// `[from, until)` as `delegation_valid_from` / `delegation_valid_until`.
+    pub async fn put_grant_with_term(
+        d: &dyn FederationDirectory,
+        granter: &str,
+        grantee: &str,
+        at: chrono::DateTime<chrono::Utc>,
+        from: chrono::DateTime<chrono::Utc>,
+        until: chrono::DateTime<chrono::Utc>,
+    ) -> String {
+        let id = uuid::Uuid::new_v4().to_string();
+        let r = row(
+            &id,
+            granter,
+            granter,
+            grantee,
+            attestation_type::DELEGATES_TO,
+            serde_json::json!({
+                "id": id,
+                "kind": "delegates_to",
+                "scope": [admission::DELEGATION_SCOPE_GRANT],
+                "sub_delegation": false,
+                admission::DELEGATION_VALID_FROM_FIELD: from.to_rfc3339(),
+                admission::DELEGATION_VALID_UNTIL_FIELD: until.to_rfc3339(),
+            }),
+            Vec::new(),
+            admission::truncate_to_substrate_resolution(at),
+        );
+        d.put_attestation(SignedAttestation { attestation: r })
+            .await
+            .unwrap_or_else(|e| panic!("delegates_to({granter} → {grantee}, grant, term): {e}"));
+        id
+    }
+
     /// The granter withdraws the edge `target` by name.
     pub async fn withdraw(
         d: &dyn FederationDirectory,
@@ -134,7 +183,7 @@ pub mod bodies {
     fn replication_grant(id: &str, author: &str, for_key: &str) -> Attestation {
         let payload = serde_json::json!({
             "grants": "replication",
-            "attestation_prefixes": ["i567-fixture:"],
+            "attestation_prefixes": ["i591-fixture:"],
             cbh::FOR_KEY_ID: for_key,
         });
         row(
@@ -144,7 +193,7 @@ pub mod bodies {
             author,
             attestation_type::SCORES,
             serde_json::json!({ "dimension": crate::federation::consent_peer_set::DIMENSION, "payload": payload }),
-            vec!["i567-peer".to_owned()],
+            vec!["i591-peer".to_owned()],
             chrono::Utc::now(),
         )
     }
@@ -188,9 +237,9 @@ pub mod bodies {
         }
     }
 
-    /// **I567** — see the module doc.
-    pub async fn i567_consent_grant_scope(d: &dyn FederationDirectory, s: &str) {
-        let k = |n: &str| format!("i567-{n}-{s}");
+    /// **I591** — see the module doc.
+    pub async fn i591_consent_grant_scope(d: &dyn FederationDirectory, s: &str) {
+        let k = |n: &str| format!("i591-{n}-{s}");
         let (alice, m, o, n) = (k("alice"), k("m"), k("o"), k("n"));
         ts::register_identity_key(d, &alice, USER).await;
         ts::register_identity_key(d, &m, AGENT).await;
@@ -263,6 +312,61 @@ pub mod bodies {
             "(6) a `grant` chain from a node is one machine consenting for another",
         );
     }
+    /// **I596** — see the module doc. Kills: the lens dropping the envelope
+    /// term (arm 1 admits), and the lens dropping the one-year ceiling
+    /// (arm 3 admits).
+    pub async fn i596_grant_term_at_the_consent_door(d: &dyn FederationDirectory, s: &str) {
+        let k = |n: &str| format!("i596-{n}-{s}");
+        let alice = k("alice");
+        ts::register_identity_key(d, &alice, USER).await;
+        let now = chrono::Utc::now();
+        let at = now - chrono::Duration::hours(3);
+        let day = chrono::Duration::days(1);
+        let arms: [(
+            &str,
+            chrono::DateTime<chrono::Utc>,
+            chrono::DateTime<chrono::Utc>,
+            bool,
+        ); 4] = [
+            (
+                "(1) the term closed an hour ago",
+                at,
+                now - chrono::Duration::hours(1),
+                false,
+            ),
+            (
+                "(2) the term is open",
+                at,
+                now + chrono::Duration::hours(1),
+                true,
+            ),
+            (
+                "(3) a 366-day term is past the ceiling",
+                at,
+                at + day * 366,
+                false,
+            ),
+            (
+                "(4) a 365-day term is at the ceiling",
+                at,
+                at + day * 365,
+                true,
+            ),
+        ];
+        for (i, (what, from, until, admits)) in arms.into_iter().enumerate() {
+            let m = k(&format!("m{i}"));
+            ts::register_identity_key(d, &m, AGENT).await;
+            put_grant_with_term(d, &alice, &m, at, from, until).await;
+            let r = put(d, replication_grant(&k(&format!("g{i}")), &m, &alice)).await;
+            if admits {
+                r.unwrap_or_else(|e| {
+                    panic!("I596 {what}: the `grant` delegate must be admitted: {e}")
+                });
+            } else {
+                assert_not_delegated(r, &format!("I596 {what}"));
+            }
+        }
+    }
 }
 
 /// The `key_grant` exercises, generic over a blob-capable backend.
@@ -297,8 +401,8 @@ pub mod key_grant_arms {
         }
     }
 
-    /// **I567b** — the content axis, one node.
-    pub async fn exercise_i567b_content_axis<B>(a: &Node<'_, B>, tag: &str)
+    /// **I591b** — the content axis, one node.
+    pub async fn exercise_i591b_content_axis<B>(a: &Node<'_, B>, tag: &str)
     where
         B: BlobStorage + FederationDirectory + Sync,
     {
@@ -330,7 +434,7 @@ pub mod key_grant_arms {
             Some(&a.key),
         )
         .await
-        .unwrap_or_else(|e| panic!("{tag} I567b: A seals self: {e}"));
+        .unwrap_or_else(|e| panic!("{tag} I591b: A seals self: {e}"));
         let sha = sealed.at_rest_sha256;
         // The delegate: a registered key that is neither the author nor one
         // of the author's occurrences.
@@ -354,7 +458,7 @@ pub mod key_grant_arms {
         assert_eq!(
             reason(&r),
             "signer_not_author",
-            "{tag} I567b (1): no delegation"
+            "{tag} I591b (1): no delegation"
         );
 
         let dir = a.backend.as_dyn_directory();
@@ -377,7 +481,7 @@ pub mod key_grant_arms {
         assert_eq!(
             reason(&r),
             "signer_not_author",
-            "{tag} I567b (2): `moderate` is not `grant`"
+            "{tag} I591b (2): `moderate` is not `grant`"
         );
 
         let edge = put_delegation(
@@ -395,10 +499,10 @@ pub mod key_grant_arms {
             sign_set_unstored(&delegate, &set_for(&r1)).await,
         )
         .await
-        .unwrap_or_else(|e| panic!("{tag} I567b (3): the author's `grant` delegate: {e}"));
+        .unwrap_or_else(|e| panic!("{tag} I591b (3): the author's `grant` delegate: {e}"));
         assert!(
             !admitted.pending && admitted.wraps_written == 1,
-            "{tag} I567b (3): admitted AND projected: {admitted:?}"
+            "{tag} I591b (3): admitted AND projected: {admitted:?}"
         );
         assert!(
             a.backend
@@ -406,7 +510,7 @@ pub mod key_grant_arms {
                 .await
                 .unwrap()
                 .is_some(),
-            "{tag} I567b (3): the onward recipient holds a grant row"
+            "{tag} I591b (3): the onward recipient holds a grant row"
         );
 
         withdraw(dir, &owner, &owner, &d_key, &edge).await;
@@ -419,7 +523,7 @@ pub mod key_grant_arms {
         assert_eq!(
             reason(&r),
             "signer_not_author",
-            "{tag} I567b (4): withdrawn"
+            "{tag} I591b (4): withdrawn"
         );
         assert!(
             a.backend
@@ -427,12 +531,126 @@ pub mod key_grant_arms {
                 .await
                 .unwrap()
                 .is_none(),
-            "{tag} I567b (4): a refused set projects nothing"
+            "{tag} I591b (4): a refused set projects nothing"
         );
     }
 
-    /// **I567c** — the epoch axis, two nodes: B admits sets for A's counter.
-    pub async fn exercise_i567c_epoch_axis<B>(
+    /// **I596b** — the `grant` term at the `key_grant` door, content axis.
+    /// Kills: the lens dropping the envelope term (arm 1 admits) or the
+    /// one-year ceiling (arm 3 admits).
+    pub async fn exercise_i596b_content_axis_term<B>(a: &Node<'_, B>, tag: &str)
+    where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        use super::bodies::put_grant_with_term;
+        use crate::federation::at_rest_cascade::orchestrate::encrypt_and_cascade;
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let owner = format!("{tag}-i596-owner-{run}");
+        ts::register_hybrid_key_as(a.backend, &owner, &owner, USER).await;
+        a.backend
+            .put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
+                identity_key_id: owner.clone(),
+                occurrence_key_id: a.key.clone(),
+                device_class: crate::federation::types::device_class::LAPTOP.into(),
+                hardware_attestation: None,
+                asserted_at: chrono::Utc::now(),
+                valid_until: None,
+                encryption_pubkeys: Some(a.kem.clone()),
+                transport_binding: None,
+                persist_row_hash: String::new(),
+            })
+            .await
+            .unwrap();
+        let sealed = encrypt_and_cascade(
+            a.backend,
+            SELF,
+            &owner,
+            b"the ledger",
+            None,
+            None,
+            Some(&a.key),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{tag} I596b: A seals self: {e}"));
+        let sha = sealed.at_rest_sha256;
+        let set_for = |recipient: &str| KeyGrantSet {
+            axis: KeyGrantAxis::Content {
+                at_rest_sha256: hex::encode(sha),
+                cohort_scope: SELF.into(),
+                owner_key_id: owner.clone(),
+            },
+            wraps: vec![wrap(recipient)],
+        };
+        let dir = a.backend.as_dyn_directory();
+        let now = chrono::Utc::now();
+        let at = now - chrono::Duration::hours(3);
+        let day = chrono::Duration::days(1);
+        let arms: [(
+            &str,
+            chrono::DateTime<chrono::Utc>,
+            chrono::DateTime<chrono::Utc>,
+            bool,
+        ); 4] = [
+            (
+                "(1) the term closed an hour ago",
+                at,
+                now - chrono::Duration::hours(1),
+                false,
+            ),
+            (
+                "(2) the term is open",
+                at,
+                now + chrono::Duration::hours(1),
+                true,
+            ),
+            (
+                "(3) a 366-day term is past the ceiling",
+                at,
+                at + day * 366,
+                false,
+            ),
+            (
+                "(4) a 365-day term is at the ceiling",
+                at,
+                at + day * 365,
+                true,
+            ),
+        ];
+        for (i, (what, from, until, admits)) in arms.into_iter().enumerate() {
+            let delegate = node_signer(a.backend, &format!("{tag}-i596-d{i}-{run}")).await;
+            let d_key = delegate.derived_key_id();
+            put_grant_with_term(dir, &owner, &d_key, at, from, until).await;
+            let recipient = format!("{tag}-i596-r{i}-{run}");
+            let r = admit_replicated_key_grant(
+                a.backend,
+                sign_set_unstored(&delegate, &set_for(&recipient)).await,
+            )
+            .await;
+            let projected = a
+                .backend
+                .get_at_rest_grant(&sha, &recipient)
+                .await
+                .unwrap()
+                .is_some();
+            if admits {
+                let admitted =
+                    r.unwrap_or_else(|e| panic!("{tag} I596b {what}: must be admitted: {e}"));
+                assert!(
+                    !admitted.pending && admitted.wraps_written == 1 && projected,
+                    "{tag} I596b {what}: admitted AND projected: {admitted:?}"
+                );
+            } else {
+                assert_eq!(reason(&r), "signer_not_author", "{tag} I596b {what}");
+                assert!(
+                    !projected,
+                    "{tag} I596b {what}: a refused set projects nothing"
+                );
+            }
+        }
+    }
+
+    /// **I591c** — the epoch axis, two nodes: B admits sets for A's counter.
+    pub async fn exercise_i591c_epoch_axis<B>(
         a: &Node<'_, B>,
         a_alias: &str,
         b: &Node<'_, B>,
@@ -447,7 +665,7 @@ pub mod key_grant_arms {
         seed_community_everywhere(&[a, b], &comm, &[(&alice, Some(a)), (&bob, Some(b))]).await;
         encrypt_and_cascade_community(a.backend, &comm, b"minutes", None, Some(&a.key))
             .await
-            .unwrap_or_else(|e| panic!("{tag} I567c: A seals: {e}"));
+            .unwrap_or_else(|e| panic!("{tag} I591c: A seals: {e}"));
         let honest = crate::federation::key_grant::build_epoch_set(a.backend, &comm, &a.key, 0)
             .await
             .unwrap()
@@ -466,7 +684,7 @@ pub mod key_grant_arms {
         assert_eq!(
             reason(&r),
             "signer_not_minter",
-            "{tag} I567c (1): no delegation"
+            "{tag} I591c (1): no delegation"
         );
 
         let dir = b.backend.as_dyn_directory();
@@ -489,7 +707,7 @@ pub mod key_grant_arms {
         assert_eq!(
             reason(&r),
             "signer_not_minter",
-            "{tag} I567c (2): `moderate` is not `grant`"
+            "{tag} I591c (2): `moderate` is not `grant`"
         );
 
         let edge = put_delegation(
@@ -504,13 +722,13 @@ pub mod key_grant_arms {
         .await;
         admit_replicated_key_grant(b.backend, sign_set_unstored(&b.signer, &set_for(&r1)).await)
             .await
-            .unwrap_or_else(|e| panic!("{tag} I567c (3): the minter's `grant` delegate: {e}"));
+            .unwrap_or_else(|e| panic!("{tag} I591c (3): the minter's `grant` delegate: {e}"));
         assert!(
             b.backend
                 .community_dek_has_member_grant(&comm, &a.key, 0, &r1)
                 .await
                 .unwrap(),
-            "{tag} I567c (3): the onward recipient holds a grant on (C, A, 0)"
+            "{tag} I591c (3): the onward recipient holds a grant on (C, A, 0)"
         );
 
         withdraw(dir, &a.key, a_alias, &b.key, &edge).await;
@@ -523,7 +741,7 @@ pub mod key_grant_arms {
         assert_eq!(
             reason(&r),
             "signer_not_minter",
-            "{tag} I567c (4): withdrawn"
+            "{tag} I591c (4): withdrawn"
         );
     }
 }
@@ -539,9 +757,19 @@ mod run {
             mod $modname {
                 use crate::federation::FederationDirectory;
                 #[tokio::test(flavor = "multi_thread")]
-                async fn i567() {
+                async fn i591() {
                     let Some(d) = $fresh.await else { return };
-                    super::super::bodies::i567_consent_grant_scope(
+                    super::super::bodies::i591_consent_grant_scope(
+                        &d as &dyn FederationDirectory,
+                        &super::suffix(),
+                    )
+                    .await
+                }
+
+                #[tokio::test(flavor = "multi_thread")]
+                async fn i596() {
+                    let Some(d) = $fresh.await else { return };
+                    super::super::bodies::i596_grant_term_at_the_consent_door(
                         &d as &dyn FederationDirectory,
                         &super::suffix(),
                     )
@@ -590,19 +818,26 @@ mod run {
         }
 
         #[tokio::test(flavor = "multi_thread")]
-        async fn i567b() {
+        async fn i591b() {
             let ba = fresh().await;
-            let a = node(&ba, "i567b-a").await;
-            exercise_i567b_content_axis(&a, "sqlite").await;
+            let a = node(&ba, "i591b-a").await;
+            exercise_i591b_content_axis(&a, "sqlite").await;
         }
 
         #[tokio::test(flavor = "multi_thread")]
-        async fn i567c() {
+        async fn i596b() {
+            let ba = fresh().await;
+            let a = node(&ba, "i596b-a").await;
+            exercise_i596b_content_axis_term(&a, "sqlite").await;
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn i591c() {
             let (ba, bb) = (fresh().await, fresh().await);
-            let a = node(&ba, "i567c-a").await;
-            let b = node(&bb, "i567c-b").await;
-            introduce(&[&a, &b], &["i567c-a", "i567c-b"]).await;
-            exercise_i567c_epoch_axis(&a, "i567c-a", &b, "sqlite").await;
+            let a = node(&ba, "i591c-a").await;
+            let b = node(&bb, "i591c-b").await;
+            introduce(&[&a, &b], &["i591c-a", "i591c-b"]).await;
+            exercise_i591c_epoch_axis(&a, "i591c-a", &b, "sqlite").await;
         }
     }
 
@@ -621,21 +856,28 @@ mod run {
         }
 
         #[tokio::test(flavor = "multi_thread")]
-        async fn i567b() {
+        async fn i591b() {
             let Some(ba) = fresh().await else { return };
-            let a = node(&ba, "i567b-a").await;
-            exercise_i567b_content_axis(&a, "postgres").await;
+            let a = node(&ba, "i591b-a").await;
+            exercise_i591b_content_axis(&a, "postgres").await;
         }
 
         #[tokio::test(flavor = "multi_thread")]
-        async fn i567c() {
+        async fn i596b() {
+            let Some(ba) = fresh().await else { return };
+            let a = node(&ba, "i596b-a").await;
+            exercise_i596b_content_axis_term(&a, "postgres").await;
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn i591c() {
             let (Some(ba), Some(bb)) = (fresh().await, fresh().await) else {
                 return;
             };
-            let a = node(&ba, "i567c-a").await;
-            let b = node(&bb, "i567c-b").await;
-            introduce(&[&a, &b], &["i567c-a", "i567c-b"]).await;
-            exercise_i567c_epoch_axis(&a, "i567c-a", &b, "postgres").await;
+            let a = node(&ba, "i591c-a").await;
+            let b = node(&bb, "i591c-b").await;
+            introduce(&[&a, &b], &["i591c-a", "i591c-b"]).await;
+            exercise_i591c_epoch_axis(&a, "i591c-a", &b, "postgres").await;
         }
     }
 }

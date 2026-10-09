@@ -2,13 +2,13 @@
 //! that could not be written, the cohort nothing declared, and the config
 //! record nothing typed.**
 //!
-//! - **I568** (sqlite, postgres) — the V089 CHECK. At V181 a supersession of an
+//! - **I592** (sqlite, postgres) — the V089 CHECK. At V181 a supersession of an
 //!   affiliation is refused by `federation_group_versions`' cohort CHECK (the
 //!   bug, pinned); V182 applies over a populated history (a community's prior
 //!   version, recorded at V181, survives byte-identical), the same supersession
 //!   then writes its prior version under `affiliations`, and the CHECK still
 //!   refuses a value outside the vocabulary (the rebuild kept it).
-//! - **I569** (memory, sqlite, postgres) — the discriminator. A record declares
+//! - **I593** (memory, sqlite, postgres) — the discriminator. A record declares
 //!   its cohort at founding (`policy_blob.cohort_scope`); every door that addresses a
 //!   held record under the other cohort is refused
 //!   `federation_affiliation_cohort_mismatch`: both supersede doors (both
@@ -16,11 +16,11 @@
 //!   write doors, and an attestation placed at the wrong `cohort_scope`. An
 //!   unknown cohort value and a config on a plain community are refused at
 //!   founding.
-//! - **I570** (pure, and at the door on all three backends) — the typed config
+//! - **I594** (pure, and at the door on all three backends) — the typed config
 //!   record: resolution (explicit, else preset, else the no-op default) and
 //!   one refusal per validation rule; an invalid record is refused at founding
 //!   and on supersession.
-//! - **I571** (memory, sqlite, postgres) — the replicated amendment path: an
+//! - **I595** (memory, sqlite, postgres) — the replicated amendment path: an
 //!   affiliation amended by quorum on A and applied on B records its prior
 //!   version under `affiliations` on B, and a replicated version relabelling
 //!   the held affiliation is refused.
@@ -186,9 +186,9 @@ pub mod bodies {
         c
     }
 
-    /// **I568 (after V182)** — a supersession of an affiliation writes, and
+    /// **I592 (after V182)** — a supersession of an affiliation writes, and
     /// its prior version is recorded under `affiliations`.
-    pub async fn i568_affiliation_supersedes(
+    pub async fn i592_affiliation_supersedes(
         d: &dyn FederationDirectory,
         tag: &str,
     ) -> Result<(), Error> {
@@ -200,22 +200,22 @@ pub mod bodies {
         let history = d.list_group_versions(Cohort::Affiliations, &aff).await?;
         assert!(
             history.iter().any(|v| v.version == 1),
-            "{tag} I568: the prior version is recorded under `affiliations`: {history:?}"
+            "{tag} I592: the prior version is recorded under `affiliations`: {history:?}"
         );
         Ok(())
     }
 
-    /// **I569** — see the module doc.
-    pub async fn i569_the_cohort_is_declared(d: &dyn FederationDirectory, tag: &str) {
+    /// **I593** — see the module doc.
+    pub async fn i593_the_cohort_is_declared(d: &dyn FederationDirectory, tag: &str) {
         let (plain, aff) = (format!("{tag}-plain"), format!("{tag}-aff"));
         let (f, m) = (format!("{tag}-founder"), format!("{tag}-member"));
         users(d, &[&f, &m]).await;
         found(d, record(&plain, &[&f, &m], None))
             .await
-            .expect("I569: a plain community founds");
+            .expect("I593: a plain community founds");
         found(d, record(&aff, &[&f, &m], Some(affiliation_blob(None))))
             .await
-            .expect("I569: an affiliation founds");
+            .expect("I593: an affiliation founds");
 
         // Both supersede doors, both directions.
         let p2 = next_version(d, &plain, "p2").await;
@@ -223,14 +223,14 @@ pub mod bodies {
             d.supersede_affiliations(signed(&p2), None).await,
             "community",
             "affiliations",
-            "I569: supersede_affiliations on a plain community",
+            "I593: supersede_affiliations on a plain community",
         );
         let a2 = next_version(d, &aff, "a2").await;
         expect_mismatch(
             d.supersede_community(signed(&a2), None).await,
             "affiliations",
             "community",
-            "I569: supersede_community on an affiliation",
+            "I593: supersede_community on an affiliation",
         );
         // A supersession that flips the declared cohort.
         let mut flipped = next_version(d, &aff, "flipped").await;
@@ -239,12 +239,12 @@ pub mod bodies {
             d.supersede_affiliations(signed(&flipped), None).await,
             "community",
             "affiliations",
-            "I569: an affiliation cannot supersede itself into a community",
+            "I593: an affiliation cannot supersede itself into a community",
         );
         // Control: the right door admits.
         d.supersede_affiliations(signed(&a2), None)
             .await
-            .expect("I569: supersede_affiliations on an affiliation admits");
+            .expect("I593: supersede_affiliations on an affiliation admits");
         // The held record decides, not the new version's label: a version
         // declaring `community` offered at the community door over a held
         // affiliation.
@@ -254,7 +254,7 @@ pub mod bodies {
             d.supersede_community(signed(&relabel), None).await,
             "affiliations",
             "community",
-            "I569: the community door over a held affiliation, relabelled",
+            "I593: the community door over a held affiliation, relabelled",
         );
 
         // The membership write doors refuse before any signature is read.
@@ -274,13 +274,13 @@ pub mod bodies {
                 .await,
             "community",
             "affiliations",
-            "I569: add_member(affiliations) on a plain community",
+            "I593: add_member(affiliations) on a plain community",
         );
         expect_mismatch(
             d.add_member(Cohort::Community, &aff, member, &spec).await,
             "affiliations",
             "community",
-            "I569: add_member(community) on an affiliation",
+            "I593: add_member(community) on an affiliation",
         );
         let revoke = ts::sign_revoke_spec(
             Cohort::Community,
@@ -295,7 +295,7 @@ pub mod bodies {
             d.revoke_member(Cohort::Community, &aff, &m, revoke).await,
             "affiliations",
             "community",
-            "I569: revoke_member(community) on an affiliation",
+            "I593: revoke_member(community) on an affiliation",
         );
 
         // An attestation placed at the wrong cohort_scope.
@@ -303,20 +303,20 @@ pub mod bodies {
             place(d, placed_row(&m, cohort_scope::AFFILIATIONS, &plain)).await,
             "community",
             "affiliations",
-            "I569: an affiliations-scoped row naming a plain community",
+            "I593: an affiliations-scoped row naming a plain community",
         );
         expect_mismatch(
             place(d, placed_row(&m, cohort_scope::COMMUNITY, &aff)).await,
             "affiliations",
             "community",
-            "I569: a community-scoped row naming an affiliation",
+            "I593: a community-scoped row naming an affiliation",
         );
         place(d, placed_row(&m, cohort_scope::AFFILIATIONS, &aff))
             .await
-            .expect("I569: a member's affiliations-scoped row naming the affiliation admits");
+            .expect("I593: a member's affiliations-scoped row naming the affiliation admits");
         place(d, placed_row(&m, cohort_scope::COMMUNITY, &plain))
             .await
-            .expect("I569: a member's community-scoped row naming the community admits");
+            .expect("I593: a member's community-scoped row naming the community admits");
 
         // Founding: an unknown cohort, and a config on a plain community.
         expect_rule(
@@ -330,7 +330,7 @@ pub mod bodies {
             )
             .await,
             rule::COHORT_UNKNOWN,
-            "I569: an unknown declared cohort is refused, never read as community",
+            "I593: an unknown declared cohort is refused, never read as community",
         );
         expect_rule(
             found(
@@ -343,15 +343,15 @@ pub mod bodies {
             )
             .await,
             rule::CONFIG_ON_COMMUNITY,
-            "I569: a config on a plain community is refused",
+            "I593: a config on a plain community is refused",
         );
     }
 
-    /// **I571** — the replicated amendment path. A amends an affiliation by
+    /// **I595** — the replicated amendment path. A amends an affiliation by
     /// quorum; B applies A's served record and records the prior version under
     /// `affiliations` (it always wrote `community`). A version that relabels
     /// the held affiliation as a community is refused on the replicated door.
-    pub async fn i571_a_replicated_affiliation_amendment(
+    pub async fn i595_a_replicated_affiliation_amendment(
         a: &dyn FederationDirectory,
         b: &dyn FederationDirectory,
         tag: &str,
@@ -370,7 +370,7 @@ pub mod bodies {
             users(d, &refs).await;
             found(d, founding.clone())
                 .await
-                .unwrap_or_else(|e| panic!("{tag} I571: founding: {e}"));
+                .unwrap_or_else(|e| panic!("{tag} I595: founding: {e}"));
         }
         let change = a
             .build_membership_change_envelope(
@@ -381,7 +381,7 @@ pub mod bodies {
                 Some(consensus_protocol::UNANIMOUS),
             )
             .await
-            .unwrap_or_else(|e| panic!("{tag} I571: build change: {e}"));
+            .unwrap_or_else(|e| panic!("{tag} I595: build change: {e}"));
         let bytes = ciris_verify_core::jcs::canonicalize(&change).unwrap();
         let sigs = [&keys[0], &keys[1]]
             .iter()
@@ -391,7 +391,7 @@ pub mod bodies {
         v2.consensus_protocol = consensus_protocol::UNANIMOUS.to_owned();
         a.supersede_affiliations_with_quorum(signed(&v2), change, sigs)
             .await
-            .unwrap_or_else(|e| panic!("{tag} I571: A's quorum amendment: {e}"));
+            .unwrap_or_else(|e| panic!("{tag} I595: A's quorum amendment: {e}"));
         let served = a
             .list_signed_communities_since(None, u32::MAX)
             .await
@@ -412,19 +412,19 @@ pub mod bodies {
             b.put_community(relabelled).await,
             "affiliations",
             "community",
-            "I571: a replicated version relabelling the affiliation",
+            "I595: a replicated version relabelling the affiliation",
         );
 
         b.put_community(served)
             .await
-            .unwrap_or_else(|e| panic!("{tag} I571: B applies A's amendment: {e}"));
+            .unwrap_or_else(|e| panic!("{tag} I595: B applies A's amendment: {e}"));
         let aff = b
             .list_group_versions(Cohort::Affiliations, &id)
             .await
             .unwrap();
         assert!(
             aff.iter().any(|v| v.version == 1 && !v.is_current),
-            "{tag} I571: B recorded the prior version under `affiliations`: {aff:?}"
+            "{tag} I595: B recorded the prior version under `affiliations`: {aff:?}"
         );
         assert!(
             b.list_group_versions(Cohort::Community, &id)
@@ -432,13 +432,13 @@ pub mod bodies {
                 .unwrap()
                 .iter()
                 .all(|v| v.is_current),
-            "{tag} I571: and not under `community`"
+            "{tag} I595: and not under `community`"
         );
     }
 
-    /// **I570 (door)** — an invalid config is refused at founding and on
+    /// **I594 (door)** — an invalid config is refused at founding and on
     /// supersession; a valid one founds and resolves.
-    pub async fn i570_the_config_is_checked_at_the_door(d: &dyn FederationDirectory, tag: &str) {
+    pub async fn i594_the_config_is_checked_at_the_door(d: &dyn FederationDirectory, tag: &str) {
         let (aff, f, m) = (
             format!("{tag}-aff"),
             format!("{tag}-founder"),
@@ -458,7 +458,7 @@ pub mod bodies {
             )
             .await,
             rule::ROLE_TERM_OUT_OF_RANGE,
-            "I570: founding with a role term past the one-year ceiling",
+            "I594: founding with a role term past the one-year ceiling",
         );
         found(
             d,
@@ -473,7 +473,7 @@ pub mod bodies {
             ),
         )
         .await
-        .expect("I570: a valid affiliation founds");
+        .expect("I594: a valid affiliation founds");
         let held = d.lookup_community(&aff).await.unwrap().unwrap();
         let resolved = ac::resolved_affiliation_config(&held)
             .unwrap()
@@ -489,12 +489,12 @@ pub mod bodies {
         expect_rule(
             d.supersede_affiliations(signed(&bad), None).await,
             rule::COMPARTMENT_INVALID,
-            "I570: a supersession naming a compartment member off the roster",
+            "I594: a supersession naming a compartment member off the roster",
         );
     }
 
-    /// **I570 (pure)** — resolution and every validation rule.
-    pub fn i570_resolution_and_rules() {
+    /// **I594 (pure)** — resolution and every validation rule.
+    pub fn i594_resolution_and_rules() {
         let roster: std::collections::BTreeSet<&str> = ["f", "m"].into_iter().collect();
         let cfg = |v: serde_json::Value| -> ac::AffiliationConfig {
             serde_json::from_value(v).expect("parses")
@@ -631,8 +631,8 @@ mod run {
     }
 
     #[test]
-    fn i570_pure() {
-        super::bodies::i570_resolution_and_rules();
+    fn i594_pure() {
+        super::bodies::i594_resolution_and_rules();
     }
 
     macro_rules! dyn_runners {
@@ -640,42 +640,42 @@ mod run {
             mod $modname {
                 use crate::federation::FederationDirectory;
                 #[tokio::test(flavor = "multi_thread")]
-                async fn i568() {
+                async fn i592() {
                     let Some(d) = $fresh.await else { return };
-                    super::super::bodies::i568_affiliation_supersedes(
+                    super::super::bodies::i592_affiliation_supersedes(
                         &d as &dyn FederationDirectory,
-                        &format!("i568-{}", super::suffix()),
+                        &format!("i592-{}", super::suffix()),
                     )
                     .await
-                    .expect("I568: an affiliation supersedes");
+                    .expect("I592: an affiliation supersedes");
                 }
                 #[tokio::test(flavor = "multi_thread")]
-                async fn i569() {
+                async fn i593() {
                     let Some(d) = $fresh.await else { return };
-                    super::super::bodies::i569_the_cohort_is_declared(
+                    super::super::bodies::i593_the_cohort_is_declared(
                         &d as &dyn FederationDirectory,
-                        &format!("i569-{}", super::suffix()),
+                        &format!("i593-{}", super::suffix()),
                     )
                     .await
                 }
                 #[tokio::test(flavor = "multi_thread")]
-                async fn i571() {
+                async fn i595() {
                     let (Some(a), Some(b)) = ($fresh.await, $fresh.await) else {
                         return;
                     };
-                    super::super::bodies::i571_a_replicated_affiliation_amendment(
+                    super::super::bodies::i595_a_replicated_affiliation_amendment(
                         &a as &dyn FederationDirectory,
                         &b as &dyn FederationDirectory,
-                        &format!("i571-{}", super::suffix()),
+                        &format!("i595-{}", super::suffix()),
                     )
                     .await
                 }
                 #[tokio::test(flavor = "multi_thread")]
-                async fn i570() {
+                async fn i594() {
                     let Some(d) = $fresh.await else { return };
-                    super::super::bodies::i570_the_config_is_checked_at_the_door(
+                    super::super::bodies::i594_the_config_is_checked_at_the_door(
                         &d as &dyn FederationDirectory,
-                        &format!("i570-{}", super::suffix()),
+                        &format!("i594-{}", super::suffix()),
                     )
                     .await
                 }
@@ -708,25 +708,25 @@ mod run {
         Some(b)
     });
 
-    /// I568 at V181 then V182, sqlite: red before, green after, the
+    /// I592 at V181 then V182, sqlite: red before, green after, the
     /// populated history preserved, the CHECK kept.
     #[cfg(feature = "sqlite")]
     #[tokio::test(flavor = "multi_thread")]
-    async fn i568_v089_check_then_v182_sqlite() {
+    async fn i592_v089_check_then_v182_sqlite() {
         use crate::federation::FederationDirectory;
         use crate::store::Backend as _;
         let b = crate::store::sqlite::SqliteBackend::open_in_memory()
             .await
             .unwrap();
         b.run_migrations_through(181).await.unwrap();
-        let tag = format!("i568s-{}", suffix());
+        let tag = format!("i592s-{}", suffix());
         let community = super::bodies::seed_community_history(&b, &tag).await;
-        let err = super::bodies::i568_affiliation_supersedes(&b, &format!("{tag}-pre"))
+        let err = super::bodies::i592_affiliation_supersedes(&b, &format!("{tag}-pre"))
             .await
-            .expect_err("I568: at V181 the V089 CHECK refuses an affiliations history row");
+            .expect_err("I592: at V181 the V089 CHECK refuses an affiliations history row");
         assert!(
             err.to_string().contains("CHECK"),
-            "I568: refused by the cohort CHECK, not by a neighbour: {err}"
+            "I592: refused by the cohort CHECK, not by a neighbour: {err}"
         );
         let before: (String, String) = b
             .read(move |c| {
@@ -752,14 +752,14 @@ mod run {
             .unwrap();
         assert_eq!(
             before, after,
-            "I568: V182 preserves the populated history byte-identical"
+            "I592: V182 preserves the populated history byte-identical"
         );
-        super::bodies::i568_affiliation_supersedes(
+        super::bodies::i592_affiliation_supersedes(
             &b as &dyn FederationDirectory,
             &format!("{tag}-post"),
         )
         .await
-        .expect("I568: after V182 an affiliation supersedes");
+        .expect("I592: after V182 an affiliation supersedes");
         let bogus = b
             .write(|c| {
                 c.execute(
@@ -771,14 +771,14 @@ mod run {
             .await;
         assert!(
             bogus.is_err(),
-            "I568: the rebuilt table keeps the cohort CHECK"
+            "I592: the rebuilt table keeps the cohort CHECK"
         );
     }
 
-    /// I568 at V181 then V182, postgres.
+    /// I592 at V181 then V182, postgres.
     #[cfg(feature = "postgres")]
     #[tokio::test(flavor = "multi_thread")]
-    async fn i568_v089_check_then_v182_postgres() {
+    async fn i592_v089_check_then_v182_postgres() {
         use crate::federation::FederationDirectory;
         use crate::store::Backend as _;
         let Some(dsn) = crate::test_pg::empty_dsn() else {
@@ -788,17 +788,17 @@ mod run {
             .await
             .unwrap();
         b.run_migrations_through(181).await.unwrap();
-        let tag = format!("i568p-{}", suffix());
+        let tag = format!("i592p-{}", suffix());
         let community = super::bodies::seed_community_history(&b, &tag).await;
-        let err = super::bodies::i568_affiliation_supersedes(&b, &format!("{tag}-pre"))
+        let err = super::bodies::i592_affiliation_supersedes(&b, &format!("{tag}-pre"))
             .await
-            .expect_err("I568: at V181 the V089 CHECK refuses an affiliations history row");
+            .expect_err("I592: at V181 the V089 CHECK refuses an affiliations history row");
         // The backend reports the driver error as `db error`; the history
         // insert is what refused, and the table itself says why: an
         // `affiliations` row is a CHECK violation (SQLSTATE 23514) at V181.
         assert!(
             err.to_string().contains("insert group version"),
-            "I568: refused at the history insert, not by a neighbour: {err}"
+            "I592: refused at the history insert, not by a neighbour: {err}"
         );
         let direct = b
             .get_client()
@@ -810,11 +810,11 @@ mod run {
                 &[],
             )
             .await
-            .expect_err("I568: V089's CHECK refuses `affiliations`");
+            .expect_err("I592: V089's CHECK refuses `affiliations`");
         assert_eq!(
             direct.code(),
             Some(&tokio_postgres::error::SqlState::CHECK_VIOLATION),
-            "I568: the refusal is the cohort CHECK: {direct:?}"
+            "I592: the refusal is the cohort CHECK: {direct:?}"
         );
         let read = |id: String| {
             let b = &b;
@@ -838,14 +838,14 @@ mod run {
         assert_eq!(
             before,
             read(community).await,
-            "I568: V182 preserves the populated history"
+            "I592: V182 preserves the populated history"
         );
-        super::bodies::i568_affiliation_supersedes(
+        super::bodies::i592_affiliation_supersedes(
             &b as &dyn FederationDirectory,
             &format!("{tag}-post"),
         )
         .await
-        .expect("I568: after V182 an affiliation supersedes");
+        .expect("I592: after V182 an affiliation supersedes");
         let bogus = b
             .get_client()
             .await
@@ -858,7 +858,7 @@ mod run {
             .await;
         assert!(
             bogus.is_err(),
-            "I568: the rebuilt CHECK still refuses an unknown cohort"
+            "I592: the rebuilt CHECK still refuses an unknown cohort"
         );
     }
 }

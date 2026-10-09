@@ -198,15 +198,15 @@ pub(crate) mod nested_manifest_invariants;
 mod retraction_invariants;
 // v53.0.0 (CIRISPersist#969) — I310–I319: one DEK per (stream, epoch).
 /// v54.0.0 (CIRISPersist#1034, CC 4.4.3.2.8) — affiliations: the declared
-/// cohort and the typed config record (I568–I570).
+/// cohort and the typed config record (I592–I594).
 #[cfg(test)]
 pub mod affiliation_invariants;
 /// v54.0.0 (CIRISPersist#1031, CC 4.1.1) — the cycle-closing `delegates_to`
-/// is refused at admission (I566).
+/// is refused at admission (I590).
 #[cfg(test)]
 pub mod delegation_cycle_invariants;
 /// v54.0.0 (CIRISPersist#1033, CC 2.4.1.2.1) — the `grant` scope admits its
-/// holder (I567).
+/// holder (I591).
 #[cfg(test)]
 pub mod grant_scope_invariants;
 /// CIRISPersist#972 — I335–I339, a node is seated without an acceptance.
