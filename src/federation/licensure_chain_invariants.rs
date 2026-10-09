@@ -8,10 +8,17 @@
 //!    link must be live at that instant: asserted by it, not expired at it,
 //!    its signed term (`delegation_valid_from` / `delegation_valid_until` /
 //!    `valid_until`) open at it, and not retracted by it. So a term-bound
-//!    officer lapses, an edge valid at issuance but expired at receipt still
-//!    admits, and a later withdrawal never reclassifies a licence already
-//!    issued. The instant-less `license` / `grant` reachability read judges
-//!    NOW, never the timeless graph.
+//!    officer lapses, and a later withdrawal never reclassifies a licence
+//!    already issued. The instant-less `license` / `grant` reachability read
+//!    judges NOW, never the timeless graph.
+//!
+//!    **#1049 — in this cut the DOOR also judges at receipt.** With no
+//!    past-freshness window on `asserted_at`, the signed instant alone lets
+//!    a withdrawn officer date a licence inside their old term. So the door
+//!    requires the chain at receipt AND at the signed instant: a licence
+//!    signed in term but received after it is REFUSED here, and a backdated
+//!    licence from a withdrawn officer or a departed founder is refused. The
+//!    FOLD keeps the signed instant: it reads only rows the door admitted.
 //! 2. **#1035 — the gate and the fold use ONE chain function.** The door
 //!    refuses what the fold would exclude and the fold finds what the door
 //!    admitted: a two-hop delegate's issuance is FOUND, and the named edge
@@ -189,8 +196,11 @@ pub mod bodies {
         )
         .await;
 
-        // (a) Issued INSIDE the term, received now (after the term): ADMITS.
-        // Kills: judging at receipt (`as_of = now`).
+        // (a) Issued INSIDE the term, received now (after the term). The
+        // CC-ruled signed-instant rule admits it, but in this cut the door
+        // also judges at receipt (#1049: no past-freshness window yet), so it
+        // is REFUSED, and the fold has nothing to count.
+        // Kills: the door judging at the signed instant alone.
         let in_term = licence(
             &clerk,
             &holder,
@@ -199,12 +209,12 @@ pub mod bodies {
             Some(&term.attestation_id),
             now - Duration::hours(2),
         );
-        must_put(
+        must_refuse(
             dir,
             &in_term,
             &format!(
-                "[{tag}] #1032: a licence signed while the officer's term was open is the \
-                 board's licence even though the term has closed by receipt"
+                "[{tag}] #1049: a licence signed while the officer's term was open but \
+                 received after it closed is refused at receipt in this cut"
             ),
         )
         .await;
@@ -212,9 +222,8 @@ pub mod bodies {
             status_set_for(dir, &holder, &board, Utc::now())
                 .await
                 .expect("fold"),
-            BTreeSet::from([LicensureStatus::Issued]),
-            "[{tag}] #1032: the fold judges the same instant the door did — the in-term \
-             issuance is in the board's licensure"
+            BTreeSet::new(),
+            "[{tag}] #1049: a refused licence is not in the board's licensure"
         );
 
         // (b) Issued AFTER the term closed: REFUSED.
@@ -413,6 +422,133 @@ pub mod bodies {
         .await;
     }
 
+    /// #1049 — **a backdated licence is refused at receipt.** Without a
+    /// past-freshness window, the signed `asserted_at` is the signer's to
+    /// choose. Both bypasses are closed by the door's receipt check:
+    ///
+    /// - (a) an officer the board has WITHDRAWN dates a licence inside the
+    ///   appointment's old live window;
+    /// - (b) a founder who has LEFT a `founder_only` affiliation dates a direct
+    ///   issuance inside their tenure (refused `not_authority_at_receipt`).
+    ///
+    /// Kills: the door judging at the signed `asserted_at` alone (both arms
+    /// admit), and dropping the authority-at-receipt clause (arm (b) admits).
+    pub async fn exercise_backdated_licence_is_refused_at_receipt(
+        dir: &dyn FederationDirectory,
+        tag: &str,
+    ) {
+        use crate::federation::room_roster_authority_invariants::bodies::make_group;
+        use crate::federation::tier_ingest::test_support as ts;
+        use crate::federation::types::{consensus_protocol, CommunityMembershipRevocation};
+        let (board, holder) = keys(dir, tag).await;
+        let now = base();
+
+        // (a) The withdrawn officer.
+        let clerk = officer(dir, tag, "clerk").await;
+        let appointment = must_put(
+            dir,
+            &edge(
+                &board,
+                &clerk,
+                &[DELEGATION_SCOPE_LICENSE],
+                now - Duration::hours(3),
+                &[],
+            ),
+            "the board appoints a licensing officer",
+        )
+        .await;
+        must_put(
+            dir,
+            &bare_edge_retraction(&board, &clerk),
+            "the board withdraws the officer",
+        )
+        .await;
+        must_refuse(
+            dir,
+            &licence(
+                &clerk,
+                &holder,
+                &board,
+                "issued",
+                Some(&appointment.attestation_id),
+                now - Duration::hours(2),
+            ),
+            &format!(
+                "[{tag}] #1049: a withdrawn officer dating a licence inside the old \
+                 appointment"
+            ),
+        )
+        .await;
+
+        // (b) The departed founder. alice and carol found a founder_only
+        // affiliation; alice leaves an hour ago, then dates a direct issuance
+        // two hours ago, when she was still a founder.
+        let (aff, k) = make_group(
+            dir,
+            &format!("{tag}-fo"),
+            consensus_protocol::FOUNDER_ONLY,
+            &["alice", "carol", "bob"],
+            2,
+            None,
+            None,
+        )
+        .await;
+        let alice = k[0].clone();
+        let at_leave = now - Duration::hours(1);
+        dir.put_community_membership_revocation(ts::sign_community_membership_revocation(
+            &alice,
+            CommunityMembershipRevocation {
+                community_key_id: aff.clone(),
+                removed_identity_key_id: alice.clone(),
+                removed_at: at_leave,
+                effective_at: at_leave,
+                reason: None,
+                witness_set: vec![],
+                persist_row_hash: String::new(),
+            },
+        ))
+        .await
+        .unwrap_or_else(|e| panic!("[{tag}] alice leaves (carol remains a founder): {e}"));
+        let backdated = licence(
+            &alice,
+            &holder,
+            &aff,
+            "issued",
+            None,
+            now - Duration::hours(2),
+        );
+        let err = put(dir, &backdated)
+            .await
+            .expect_err("a departed founder's backdated issuance must be refused");
+        assert!(
+            format!("{err}").contains(REFUSAL)
+                && format!("{err}")
+                    .contains(crate::federation::admission::LICENSURE_NOT_AUTHORITY_AT_RECEIPT),
+            "[{tag}] #1049: refused as not the authority at receipt: {err}"
+        );
+        assert!(
+            dir.get_attestation(&backdated.attestation_id)
+                .await
+                .expect("read")
+                .is_none(),
+            "[{tag}] #1049: the refused row is not stored"
+        );
+        // Over-refusal control: a current founder's direct issuance admits.
+        must_put(
+            dir,
+            &licence(
+                &k[1],
+                &holder,
+                &aff,
+                "issued",
+                None,
+                now - Duration::minutes(30),
+            ),
+            "a current founder issues directly",
+        )
+        .await;
+    }
+
     /// #1032 — **the `grant` walk honours the term too.** The instant-less
     /// read judges NOW: a lapsed term, or one not yet begun, confers nothing.
     pub async fn exercise_grant_walk_honours_the_term(dir: &dyn FederationDirectory, tag: &str) {
@@ -594,6 +730,7 @@ pub mod bodies {
                     .await
                     .expect("resolve"),
                 &two_hop,
+                two_hop.asserted_at,
             )
             .await
             .expect("verdict"),
@@ -965,6 +1102,13 @@ mod run {
         withdrawal_does_not_reclassify_issued_licence_1032_sqlite,
         withdrawal_does_not_reclassify_issued_licence_1032_postgres,
         "lic-wd"
+    );
+    on_every_backend!(
+        exercise_backdated_licence_is_refused_at_receipt,
+        backdated_licence_is_refused_at_receipt_1049_memory,
+        backdated_licence_is_refused_at_receipt_1049_sqlite,
+        backdated_licence_is_refused_at_receipt_1049_postgres,
+        "lic-backdate"
     );
     on_every_backend!(
         exercise_grant_walk_honours_the_term,

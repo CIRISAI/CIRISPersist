@@ -3705,6 +3705,13 @@ impl LicensureChainBreak {
     }
 }
 
+/// v54.0.0 (CIRISPersist#1049) — the door's refusal reason when a row is the
+/// authority's own at its signed `asserted_at` but not at receipt: the
+/// emitter was a founder of a `founder_only` authority when the row was
+/// dated, and is not one now. Without a past-freshness window a signed
+/// instant cannot grant standing the emitter no longer has.
+pub const LICENSURE_NOT_AUTHORITY_AT_RECEIPT: &str = "not_authority_at_receipt";
+
 /// v54.0.0 (CIRISPersist#1035) — the verdict on ONE licensure row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LicensureIssuance {
@@ -3747,15 +3754,17 @@ impl LicensureIssuance {
 /// rows that claim a delegation, and the fold finds every delegated issuance
 /// the door admitted — at any depth the walk follows.
 ///
-/// Judged at the row's SIGNED `asserted_at` (a stamped instant belongs to the
-/// signer), never at receipt and never on the current graph:
+/// Judged at the instant `t` the caller names, never on the timeless graph.
+/// The fold passes the row's SIGNED `asserted_at` (a stamped instant belongs
+/// to the signer). The door passes BOTH receipt and the signed instant
+/// (v54.0.0, CIRISPersist#1049): see [`check_licensure_delegator_is_authority`].
 ///
-/// 1. the emitter is in the authority set at `asserted_at` ⇒ [`Authority`];
+/// 1. the emitter is in the authority set at `t` ⇒ [`Authority`];
 /// 2. no `delegation_id` ⇒ [`Testimony`];
 /// 3. the named row must exist, be a `delegates_to` carrying `license`, and
 ///    delegate to the EMITTER;
 /// 4. it must be an edge the `license` walk from the authority set TRAVERSES
-///    under the lens at `asserted_at` — every link asserted by then, unexpired,
+///    under the lens at `t` — every link asserted by then, unexpired,
 ///    in its signed term, unretracted by then, attenuated, `sub_delegation`
 ///    granted past the first hop, within the depth cap. That is "lies on a
 ///    live chain", read from the walk itself.
@@ -3766,8 +3775,8 @@ pub async fn licensure_issuance_at(
     directory: &dyn super::FederationDirectory,
     authority: &LicensureAuthority,
     row: &super::Attestation,
+    t: chrono::DateTime<chrono::Utc>,
 ) -> Result<LicensureIssuance, Error> {
-    let t = row.asserted_at;
     // The authority key itself — the bootstrap case, and the common one. No
     // read: a key is always its own authority.
     if matches!(authority, LicensureAuthority::Key(k) if *k == row.attesting_key_id) {
@@ -3855,15 +3864,24 @@ pub async fn licensure_issuance_at(
 /// authority granted that key a delegation for any reason — so a row that
 /// claims no delegation is testimony permanently, and a claimed one is judged
 /// at the row's own signed instant.
+///
+/// v54.0.0 (CIRISPersist#1049) — the fold keeps the signed instant while the
+/// door also judges at receipt. That is sound because the fold reads only
+/// STORED rows, and a stored row passed the door once: CC, "a grant admitted
+/// once is not re-admitted". The door's receipt check is what stops a
+/// withdrawn officer backdating a licence into an old term; the fold need not
+/// repeat it, and must not, or a later withdrawal would reclassify history.
 pub async fn row_was_issued_under_authority(
     directory: &dyn super::FederationDirectory,
     row: &super::Attestation,
     authority_id: &str,
 ) -> Result<bool, Error> {
     let authority = resolve_licensure_authority(directory, authority_id).await?;
-    Ok(licensure_issuance_at(directory, &authority, row)
-        .await?
-        .is_the_authoritys())
+    Ok(
+        licensure_issuance_at(directory, &authority, row, row.asserted_at)
+            .await?
+            .is_the_authoritys(),
+    )
 }
 
 /// v42.0.0 (CIRISPersist#814, CC 2.4.1.2.1 / CC 3.3.9) — **does `attester`
@@ -3995,7 +4013,7 @@ pub async fn licences_issued_under(
                 == Some(authority_id);
             if names_authority
                 && seen.insert(row.attestation_id.clone())
-                && licensure_issuance_at(directory, &authority, &row)
+                && licensure_issuance_at(directory, &authority, &row, row.asserted_at)
                     .await?
                     .is_the_authoritys()
             {
@@ -4027,10 +4045,23 @@ pub async fn licences_issued_under(
 /// that claims delegated authority must make that claim resolve.
 ///
 /// v54.0.0 (CIRISPersist#1035, #1032) — the verdict is [`licensure_issuance_at`],
-/// the SAME function the fold runs, judged at the row's signed `asserted_at`.
-/// Before v54 the door discarded the `delegation_id` it required (any chain
-/// to the emitter passed, whichever edge the row named) and judged the graph
-/// at receipt.
+/// the SAME function the fold runs. Before v54 the door discarded the
+/// `delegation_id` it required (any chain to the emitter passed, whichever
+/// edge the row named).
+///
+/// v54.0.0 (CIRISPersist#1049) — **judged at receipt, and at the signed
+/// instant.** CC ruled a licence is judged at its signed `asserted_at`
+/// (#1036 item 2), but that rule is safe only with a past-freshness window on
+/// `asserted_at`, and none exists yet: judged at the signed instant alone, a
+/// withdrawn officer could date a licence inside their old term and the door
+/// would admit it. So in this cut the chain, its terms and the authority set
+/// must hold at RECEIPT (now). They must ALSO hold at the signed instant, so
+/// the door never admits a row the fold (which reads the signed instant)
+/// would exclude, and a row that is the authority's own at its signed instant
+/// must be the authority's own at receipt too
+/// ([`LICENSURE_NOT_AUTHORITY_AT_RECEIPT`]: a founder who has left cannot
+/// backdate a direct issuance). The signed-instant rule alone lands with the
+/// window (#1049).
 pub async fn check_licensure_delegator_is_authority(
     directory: &dyn super::FederationDirectory,
     row: &super::Attestation,
@@ -4046,27 +4077,44 @@ pub async fn check_licensure_delegator_is_authority(
         return Ok(());
     }
     let authority = resolve_licensure_authority(directory, authority_id).await?;
-    match licensure_issuance_at(directory, &authority, row).await? {
-        LicensureIssuance::Authority
-        | LicensureIssuance::Testimony
-        | LicensureIssuance::Delegated { .. } => Ok(()),
-        LicensureIssuance::Unresolved {
-            delegation_id,
-            reason,
-        } => Err(Error::InvalidArgument(format!(
+    let refuse = |reason: &str, delegation_id: Option<&str>, judged: &str| {
+        Err(Error::InvalidArgument(format!(
             "licensure_delegator_not_authority: {reason}: {:?} emitted {dimension:?} under \
-             delegation {delegation_id:?} at {asserted_at}, and that edge is not a live \
-             `license`-scoped delegation onto the emitter on a chain from {authority_id:?} \
-             at that instant (CC 3.3.9 / CC 4.4.3.4.3; judged at the signed asserted_at, \
-             CIRISPersist#1032). A `license` scope authorises emitting on behalf of a \
-             delegator that itself holds authority for THAT authority_id; lending authority \
-             one does not hold is the refusal. This says nothing about whether \
-             {authority_id:?} is known or trusted.",
+             delegation {delegation_id:?} signed at {asserted_at}, and it is not the \
+             authority's own issuance on a live `license` chain from {authority_id:?} at \
+             {judged} (CC 3.3.9 / CC 4.4.3.4.3; judged at receipt and at the signed \
+             asserted_at in this cut, CIRISPersist#1032, #1049). A `license` scope authorises \
+             emitting on behalf of a delegator that itself holds authority for THAT \
+             authority_id; lending authority one does not hold is the refusal. This says \
+             nothing about whether {authority_id:?} is known or trusted.",
             row.attesting_key_id,
-            reason = reason.as_str(),
             asserted_at = row.asserted_at,
-        ))),
+        )))
+    };
+    let at_receipt = licensure_issuance_at(directory, &authority, row, chrono::Utc::now()).await?;
+    if let LicensureIssuance::Unresolved {
+        delegation_id,
+        reason,
+    } = &at_receipt
+    {
+        return refuse(reason.as_str(), Some(delegation_id), "receipt");
     }
+    let at_signed = licensure_issuance_at(directory, &authority, row, row.asserted_at).await?;
+    if let LicensureIssuance::Unresolved {
+        delegation_id,
+        reason,
+    } = &at_signed
+    {
+        return refuse(
+            reason.as_str(),
+            Some(delegation_id),
+            "the signed asserted_at",
+        );
+    }
+    if at_signed.is_the_authoritys() && !at_receipt.is_the_authoritys() {
+        return refuse(LICENSURE_NOT_AUTHORITY_AT_RECEIPT, None, "receipt");
+    }
+    Ok(())
 }
 
 /// v42.0.0 (CIRISPersist#814 part 3, CC 3.4.5.1) — the **sensitive-leaf
