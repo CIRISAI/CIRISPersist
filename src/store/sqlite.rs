@@ -171,6 +171,10 @@ pub struct SqliteBackend {
     /// ([`crate::federation::admission::delegation_cycle_gated`]): held from
     /// the cycle check through the insert of every gated write.
     delegation_write_lock: tokio::sync::Mutex<()>,
+    /// v54.0.0 (Codex on PR #1050) — the per-record stripe a
+    /// `signed_wire_index` re-index holds from its read of the stored bytes
+    /// through the replacement ([`crate::store::record_locks`]).
+    wire_index_locks: crate::store::record_locks::RecordLocks,
     /// v50.0.0 (PR #921 review) — test-only hooks inside this backend's doors.
     #[cfg(test)]
     test_hooks: crate::store::test_hooks::TestHooks,
@@ -793,6 +797,7 @@ impl SqliteBackend {
             scoring_factors_cache: std::sync::Arc::new(crate::cache::Cache::new()),
             trust_root_standing_cache: Default::default(),
             delegation_write_lock: tokio::sync::Mutex::new(()),
+            wire_index_locks: Default::default(),
             #[cfg(test)]
             test_hooks: Default::default(),
         }
@@ -3101,15 +3106,26 @@ impl SqliteBackend {
             })
     }
 
-    async fn index_stored_record(
+    pub(crate) async fn index_stored_record(
         &self,
         kind: &str,
         record_key_json: &str,
     ) -> Result<(), crate::federation::Error> {
         let indexed: Result<(), crate::federation::Error> = async {
+            // v54.0.0 (Codex on PR #1050) — the read of the stored bytes and the
+            // replacement are ONE step per record: a re-index whose read predates
+            // a newer write would otherwise prune the newer hash and write its
+            // stale one. The read runs on the read pool, outside the writer, so
+            // the single writer does not serialize the two; the record's stripe
+            // does. One process owns this store, so the stripe is the whole lock.
+            let _stripe = self.wire_index_locks.lock(kind, record_key_json).await;
             if let Some(content_hash) =
                 crate::federation::wire_index::entry_as_stored(self, kind, record_key_json).await?
             {
+                #[cfg(test)]
+                self.test_hooks()
+                    .pause_if_armed("wire_index_before_write")
+                    .await;
                 let kind = kind.to_owned();
                 let record_key_json = record_key_json.to_owned();
                 self.write(move |conn| {

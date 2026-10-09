@@ -42,6 +42,9 @@ pub mod postgres;
 /// none of persist's (a foreign tokio copy's thread).
 #[cfg(feature = "postgres")]
 pub(crate) mod postgres_runtime_connect;
+/// v54.0.0 (Codex on PR #1050) — the striped per-record lock a wire-index
+/// re-index holds from its read through its replacement.
+pub(crate) mod record_locks;
 mod schema_parity;
 #[cfg(any(feature = "postgres", feature = "sqlite"))]
 pub(crate) mod scope_bind;

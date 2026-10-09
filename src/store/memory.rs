@@ -79,6 +79,10 @@ pub struct MemoryBackend {
     /// ([`crate::federation::admission::delegation_cycle_gated`]): held from
     /// the cycle check through the insert of every gated write.
     delegation_write_lock: tokio::sync::Mutex<()>,
+    /// v54.0.0 (Codex on PR #1050) — the per-record stripe a
+    /// `signed_wire_index` re-index holds from its read of the stored bytes
+    /// through the replacement ([`crate::store::record_locks`]).
+    wire_index_locks: crate::store::record_locks::RecordLocks,
     /// v50.0.0 (PR #921 review) — test-only hooks inside this backend's doors.
     #[cfg(test)]
     test_hooks: crate::store::test_hooks::TestHooks,
@@ -1022,6 +1026,7 @@ impl Default for MemoryBackend {
             admission_gate: std::sync::RwLock::new(None),
             trust_root_standing_cache: Default::default(),
             delegation_write_lock: tokio::sync::Mutex::new(()),
+            wire_index_locks: Default::default(),
             #[cfg(test)]
             test_hooks: Default::default(),
             schema_resolver: std::sync::RwLock::new(std::sync::Arc::new(
@@ -1194,13 +1199,21 @@ impl MemoryBackend {
     /// own upsert is infallible; the reload through the read path is the only
     /// thing that can error, and it is logged rather than propagated so the
     /// contract is uniform across all three backends.
-    async fn index_stored_record(
+    pub(crate) async fn index_stored_record(
         &self,
         kind: &str,
         record_key_json: &str,
     ) -> Result<(), crate::federation::Error> {
+        // v54.0.0 (Codex on PR #1050) — the read and the replacement are ONE step
+        // per record (the SQL twins' reason): the state lock is released between
+        // the reload and the upsert, so the record's stripe spans both.
+        let _stripe = self.wire_index_locks.lock(kind, record_key_json).await;
         match crate::federation::wire_index::entry_as_stored(self, kind, record_key_json).await {
             Ok(Some(content_hash)) => {
+                #[cfg(test)]
+                self.test_hooks()
+                    .pause_if_armed("wire_index_before_write")
+                    .await;
                 let mut state = self.state.lock().expect("memory backend lock");
                 memory_upsert_wire_index(
                     &mut state.signed_wire_index,

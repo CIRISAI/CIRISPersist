@@ -278,6 +278,8 @@ The cycle gate (#1031) read the `delegates_to` graph and the door inserted later
 
 The postgres V176 backfill (#994) compared the stream's rows `FOR SHARE` and then linked with an `INSERT … SELECT` over the stream, so an append committing between the two was linked to a manifest that does not contain it; the link now inserts exactly the compared rows, and a later append is not linked. I598 pauses the backfill after the comparison and commits an append to the stream; the manifest then relates exactly its own chunks (red with the `INSERT … SELECT` restored). SQLite compares and links inside one writer closure, so nothing can commit between the two there.
 
+The `signed_wire_index` replacement (#995 row 5) pruned a record's other hashes and then inserted its current one as two autocommit statements on postgres, after reading the stored bytes with no lock; two re-indexes of one record could leave both hashes, or the later one could write the hash it read before a newer write, and either way `list_wire_hashes_since` advertised a hash the point read rejects. One transaction alone does not close it under READ COMMITTED, so every backend now holds a per-record lock from the read of the stored bytes through the replacement: an in-process striped lock on all three, and on postgres also a transaction-scoped advisory lock on the record's identity with the prune and upsert in that transaction. I599 pauses one re-index after its read while the record is withdrawn and re-indexed (from a second pool on postgres); exactly the withdrawn row's hash remains and every listed hash resolves (red with the advisory lock or the stripe removed).
+
 ## [53.2.0] - 2026-10-08
 
 ### Changed — the tag is pushed once main's run EXISTS, not once it completes (#1008)
