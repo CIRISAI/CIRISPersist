@@ -114,6 +114,32 @@ RED before the fix (the arm made unreachable): I616, I617 and I620 fail on all t
 | the signer clause dropped | I620 on all three backends, I621 predicate |
 | the role-gated clause dropped | I621 predicate and memory witness (`a role-gated row is not replaced: InvalidReplaced`) |
 
+### Changed — an accord proposal's nonce is the proposer's; the server-issued nonce set is gone (#1047)
+
+Verify 20 (CIRISConstitution#146, CC 4.2.6) has the proposer mint an `AccordProposal`'s nonce, never a server: "a server is part of what a halt may need to stop, and no accord act depends on one". Verify checks the nonce's form, and single use is the substrate's dedup. Persist still kept the pre-20 model (M4). `put_accord_proposal` refused a proposal unless `issue_accord_nonce` had first recorded its `(family_key_id, nonce)`. The replicated-evidence path issued the nonce itself, just before storing, because a receiving node had issued nothing. Server and Edge never called the issue door (checked on both `main`s), and Server has no accord proposal producer.
+
+- **`put_accord_proposal`** (memory, sqlite, postgres) admits a proposal without a prior issuance. A nonce names one proposal per family. A different proposal (another digest) carrying a nonce already used in its family is refused `Error::Conflict`, with a message starting `accord_proposal_nonce_reused`, and is not stored. That is the same type as a second vote by one holder (M6), and Python raises `ValueError` (`federation_conflict`). A byte-identical re-put stays idempotent, and the same nonce in another family is unaffected. The check and the insert are one step: under the memory lock, inside sqlite's write, and in postgres inside one transaction under `pg_advisory_xact_lock(ACCORD_PROPOSAL_NONCE_LOCK_KEY)`.
+- **`admit_replicated_accord_evidence_over_roster`** no longer records a nonce before storing the proposal, and a bundle whose proposal reuses a nonce is refused at the same check.
+- **Removed (breaking):** `FederationDirectory::issue_accord_nonce` and `FederationDirectory::accord_nonce_issued`, the three backend implementations, the directory double and capsule arms, and the Python `Engine.issue_accord_nonce` / `Engine.accord_nonce_issued`. **V188** (both dialects) drops the `accord_issued_nonce` table.
+- **Wire:** unchanged. `AccordProposal` is verify's struct, and no accord row (CC 3.4.1) changes shape.
+
+Witness **I629**, in the shared accord storage body (`accord_quorum::test_fixtures::exercise_accord_storage`) on memory, sqlite and postgres, plus the Python `test_accord_live_quorum_ffi_302`. A proposal admits with nothing issued, and a re-put is idempotent. A proposal that differs only in `window_until` and reuses the nonce is refused `accord_proposal_nonce_reused` naming the first digest, and is not stored. The same nonce in another family admits.
+
+RED before, with the I629 body run against the pre-#1047 backends: all three fail with `I629: a proposer-minted nonce admits: invalid argument: accord proposal nonce "…" not issued for family "…" (M4 fail-closed)`. Mutants, each restored:
+
+| Mutant | Witnesses red |
+|---|---|
+| memory's single-use check off | I629 memory (`a reused nonce must be refused Conflict, got Ok(())`) |
+| sqlite's single-use check off | I629 sqlite (same) |
+| postgres's single-use check off | I629 postgres (same) |
+| memory's check read across families | I629 memory (`one nonce in another family admits: … accord_proposal_nonce_reused`) |
+| sqlite's, the same | I629 sqlite |
+| postgres's, the same | I629 postgres |
+
+Python witness `test_accord_live_quorum_ffi_302` covers the new door: a proposer-minted nonce admits, and a reuse raises `ValueError` matching `federation_conflict`. It passed in the wheel lane (`maturin develop --release` with the derived feature line, 55 passed).
+
+Not in this cut, from the same verify 20 notes in the issue: a `constitutional` halt that verifies on one holder's signature, and `Invocation`'s `lifecycle:confirmed` / `confirms_halt_id`. Persist calls neither `verify_invocation` nor the deprecated live-quorum tallies, and its only `AccordAction::Fire` use is a test fixture.
+
 ## [54.0.0] - 2026-10-09
 
 ### Changed — Verify 20.1.0 adopted: the three verify crates and the wheel floor move together (#992)
