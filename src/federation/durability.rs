@@ -18,7 +18,8 @@
 //!   same set). There is no second holding-claim predicate.
 //! - **the audience of a stored blob**, [`content_audience`]: the S1 resolver
 //!   ([`audience_nodes`](super::replication_audience::audience_nodes)) over
-//!   the row's own provenance — never a sender's assertion.
+//!   the row's own provenance — never a sender's assertion — and, for shared
+//!   plaintext, over every room the bytes were written into (V184).
 //! - **the target**, [`durability_mode`]: below the §R-policy feasibility
 //!   floor `C₁ = N + K` every audience node holds the full blob; at or above
 //!   it the fountain tuple applies.
@@ -177,7 +178,9 @@ pub struct DurabilityDeficit {
 /// **The durability deficit of `at_rest_sha256`** for `viewer_key_id`,
 /// authorized exactly as the custody view (a stranger is `NotGranted` and
 /// learns nothing). The audience is [`content_audience`] over the row's own
-/// provenance; each audience node's verdict is S2's per-device fold
+/// provenance, or for a plaintext row the union over every room the bytes
+/// were written into ([`blob_associations`](super::BlobStorage::blob_associations));
+/// each audience node's verdict is S2's per-device fold
 /// ([`custody_view`](super::custody_ack::custody_view) for the devices it
 /// names, [`device_custody_of`](super::custody_ack::device_custody_of) for an
 /// audience node it does not), at `now`. `stream_id` adds that stream's
@@ -212,16 +215,35 @@ where
     // v53.1.2 (#984 row 4) — the group is the epoch binding's community for
     // a community row, else the group the row itself records (V177): a
     // family row has no binding, and resolved to nothing before.
-    let audience = content_audience(
-        backend,
-        &prov.cohort_scope,
-        prov.author_key_id.as_deref(),
-        prov.community_key_id
-            .as_deref()
-            .or(prov.group_key_id.as_deref()),
-    )
-    .await
-    .map_err(|e| BlobError::Backend(format!("durability deficit: audience: {e}")))?;
+    //
+    // v54.0.0 (Codex round 2 on PR #1050) — a PLAINTEXT row is every room it
+    // was written into (V184 `blob_associations`), and its provenance columns
+    // name only the first. Resolved from the provenance alone, a node that is
+    // only in a later room was in no audience: never a target, never missing,
+    // while that room held no copy. The audience is the union over the
+    // associations; a sealed row has none, and its room is its binding.
+    let associations = backend.blob_associations(at_rest_sha256).await?;
+    let rooms: Vec<(String, Option<String>)> = if associations.is_empty() {
+        vec![(
+            prov.cohort_scope.clone(),
+            prov.community_key_id.clone().or(prov.group_key_id.clone()),
+        )]
+    } else {
+        associations
+    };
+    let mut audience: Option<ContentAudience> = None;
+    for (scope, group) in &rooms {
+        let room = content_audience(
+            backend,
+            scope,
+            prov.author_key_id.as_deref(),
+            group.as_deref(),
+        )
+        .await
+        .map_err(|e| BlobError::Backend(format!("durability deficit: audience: {e}")))?;
+        audience = Some(union_audience(audience, room));
+    }
+    let audience = audience.unwrap_or(ContentAudience::Unresolvable);
     let known: std::collections::BTreeMap<String, CustodyVerdict> = view
         .devices
         .iter()
@@ -230,6 +252,30 @@ where
     deficit_over(backend, &view.sha256_hex, audience, &known, n_plus_k, now)
         .await
         .map_err(|e| BlobError::Backend(format!("durability deficit: {e}")))
+}
+
+/// v54.0.0 (Codex round 2 on PR #1050) — two rooms' audiences as one: any
+/// room that reaches everyone makes the content reach everyone; node sets
+/// union; a room whose audience cannot be resolved adds no node, and the
+/// union is unresolvable only when no room resolves.
+fn union_audience(acc: Option<ContentAudience>, room: ContentAudience) -> ContentAudience {
+    match (acc, room) {
+        (None, r) => r,
+        (Some(ContentAudience::Everyone), _) | (Some(_), ContentAudience::Everyone) => {
+            ContentAudience::Everyone
+        }
+        (Some(ContentAudience::Nodes(mut a)), ContentAudience::Nodes(b)) => {
+            a.extend(b);
+            ContentAudience::Nodes(a)
+        }
+        (Some(ContentAudience::Nodes(a)), ContentAudience::Unresolvable)
+        | (Some(ContentAudience::Unresolvable), ContentAudience::Nodes(a)) => {
+            ContentAudience::Nodes(a)
+        }
+        (Some(ContentAudience::Unresolvable), ContentAudience::Unresolvable) => {
+            ContentAudience::Unresolvable
+        }
+    }
 }
 
 /// **The deficit over a resolved audience** — the directory-only core of

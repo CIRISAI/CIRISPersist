@@ -891,6 +891,14 @@ mod engine_bodies {
     where
         B: BlobStorage + FederationDirectory + Sync,
     {
+        infra_room_of(l, run, tag, &l.alice).await
+    }
+
+    /// [`infra_room`] founded by `founder` (its only member).
+    async fn infra_room_of<B>(l: &Ladder<B>, run: &str, tag: &str, founder: &str) -> String
+    where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
         use crate::federation::tier_ingest::test_support as ts;
         use crate::federation::types::{identity_type, Community, CommunityMember};
         let room = format!("em-infra-{tag}-{run}");
@@ -903,7 +911,7 @@ mod engine_bodies {
             community_key_id: room.clone(),
             community_name: "infra".into(),
             members: vec![CommunityMember {
-                key_id: l.alice.clone(),
+                key_id: founder.to_owned(),
                 joined_at: joined,
                 role: Some("founder".into()),
             }],
@@ -912,7 +920,7 @@ mod engine_bodies {
             policy_blob: Some(serde_json::json!({ "cohort_subkind": "infrastructure" })),
             persist_row_hash: String::new(),
         };
-        ba.put_community(ts::sign_community(&l.alice, c))
+        ba.put_community(ts::sign_community(founder, c))
             .await
             .unwrap_or_else(|e| panic!("the infrastructure room {room}: {e}"));
         room
@@ -1167,6 +1175,100 @@ mod engine_bodies {
         }
     }
 
+    /// **I605** (v54.0.0, Codex round 2 on PR #1050) — **durability reaches
+    /// every room shared plaintext was written into.** Plaintext is written
+    /// only into the commons or an authorized infrastructure room, and both
+    /// reach everyone; but a room's infrastructure standing is a property of
+    /// its record, and a supersession can drop it. Its plaintext rows stay,
+    /// and from then on the room reaches its members' nodes. Here room A's
+    /// only member occurs through node A and room B's through node B; the
+    /// same bytes are written into both while both are infrastructure, then
+    /// both records are superseded without the label. The row's provenance
+    /// names room A, and the audience was resolved from it alone, so node B
+    /// (only in room B) was never a target and never missing while room B
+    /// held no copy. Now the audience is the union over the associations.
+    pub(crate) async fn i605_durability_reaches_every_plaintext_room<B>(
+        dsn_a: &str,
+        dsn_b: &str,
+        run: &str,
+        pick: Pick<B>,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync + 'static,
+    {
+        use crate::federation::durability::{content_audience, ContentAudience, DeficitAudience};
+        use crate::federation::tier_ingest::test_support as ts;
+        let l = ladder(dsn_a, dsn_b, run, pick).await;
+        let e = &l.engine_a;
+        let ba = l.ba.as_ref();
+        let bob = format!("em-bob-{run}");
+        let room_a = infra_room_of(&l, run, "i605a", &l.alice).await;
+        let room_b = infra_room_of(&l, run, "i605b", &bob).await;
+        let bytes = format!("i605 shared plaintext {run}").into_bytes();
+        let pa = e
+            .put_blob_scoped(COMMUNITY, Some(&room_a), &bytes, None, None)
+            .await
+            .unwrap();
+        let pb = e
+            .put_blob_scoped(COMMUNITY, Some(&room_b), &bytes, None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            pa.at_rest_sha256, pb.at_rest_sha256,
+            "I605 one content address"
+        );
+        let sha = pa.at_rest_sha256;
+        assert_eq!(
+            ba.blob_provenance(&sha)
+                .await
+                .unwrap()
+                .unwrap()
+                .group_key_id
+                .as_deref(),
+            Some(room_a.as_str()),
+            "I605 precondition: the row's columns name room A only"
+        );
+        // Both rooms lose their infrastructure standing: each founder
+        // supersedes its record without the label.
+        for (room, founder) in [(&room_a, &l.alice), (&room_b, &bob)] {
+            let held = ba.lookup_community(room).await.unwrap().expect("held");
+            let mut next = held.clone();
+            next.policy_blob = None;
+            next.prev_head_digest = held.persist_row_hash.clone();
+            next.persist_row_hash = String::new();
+            ba.supersede_community(ts::sign_community(founder, next), None)
+                .await
+                .unwrap_or_else(|e| panic!("I605 {founder} supersedes {room}: {e}"));
+        }
+        // The premise: the two rooms now reach DIFFERENT nodes.
+        for (room, has, lacks) in [
+            (&room_a, &l.node_a, &l.node_b),
+            (&room_b, &l.node_b, &l.node_a),
+        ] {
+            match content_audience(ba as &dyn FederationDirectory, COMMUNITY, None, Some(room))
+                .await
+                .unwrap()
+            {
+                ContentAudience::Nodes(n) => assert!(
+                    n.contains(has) && !n.contains(lacks),
+                    "I605 premise: room {room} reaches {has} and not {lacks}: {n:?}"
+                ),
+                other => panic!("I605 premise: room {room} resolves to nodes: {other:?}"),
+            }
+        }
+        let d = e.durability_deficit(&sha, &l.node_a, None).await.unwrap();
+        let DeficitAudience::Nodes(nodes) = &d.audience else {
+            panic!("I605 the audience resolves to nodes: {d:?}");
+        };
+        assert!(
+            nodes.contains(&l.node_a) && nodes.contains(&l.node_b),
+            "I605 the audience is both rooms' nodes: {nodes:?}"
+        );
+        assert!(
+            d.missing.contains(&l.node_b),
+            "I605 node B (room B only) holds no copy and is missing: {d:?}"
+        );
+    }
+
     /// A shared `BackendDispatch` over a backend handle, and a way to make the
     /// handle forget its node key — a handle the constructor could not tell
     /// (a hardware signer that answers asynchronously).
@@ -1332,6 +1434,7 @@ mod runners {
     sqlite_engine_case!(i526_sqlite, i526_a_plaintext_room_write_carries_the_group);
     #[cfg(feature = "sqlite")]
     sqlite_engine_case!(i579_sqlite, i579_shared_plaintext_keeps_every_room);
+    sqlite_engine_case!(i605_sqlite, i605_durability_reaches_every_plaintext_room);
     #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn i514_sqlite() {
@@ -1381,6 +1484,7 @@ mod runners {
     postgres_engine_case!(i526_postgres, i526_a_plaintext_room_write_carries_the_group);
     #[cfg(feature = "postgres")]
     postgres_engine_case!(i579_postgres, i579_shared_plaintext_keeps_every_room);
+    postgres_engine_case!(i605_postgres, i605_durability_reaches_every_plaintext_room);
     #[cfg(feature = "postgres")]
     #[tokio::test]
     async fn i514_postgres() {
