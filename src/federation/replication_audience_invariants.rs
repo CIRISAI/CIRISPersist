@@ -858,7 +858,8 @@ pub(crate) mod bodies {
         ma::reg(d, &[&cid, &founder, &k]).await;
         nodes(d, &[&knode]).await;
         claim(d, &k, &knode, device_class::PHONE).await;
-        ma::found_community(d, &cid, "founder_only", &[&founder], &[])
+        // v54.0.0 (#1034) — an affiliations proposal names an affiliation.
+        ma::found_affiliation(d, &cid, "founder_only", &[&founder], &[])
             .await
             .unwrap();
         let now = Utc::now();

@@ -339,3 +339,5 @@ sqlite	180	custody_ack_citation_index	10189599177617824388
 postgres	180	custody_ack_citation_index	14445688681878171875
 sqlite	181	composer_reference_seek_index	11241924307906540648
 postgres	181	composer_reference_seek_index	8486926848432789536
+sqlite	182	group_versions_affiliations	13669801334306756260
+postgres	182	group_versions_affiliations	1144206470936720170

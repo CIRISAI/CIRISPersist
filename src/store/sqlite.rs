@@ -5293,6 +5293,11 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             // federation`. Backend-symmetric; verify-before-mutation.
             crate::federation::admission::check_minor_owner_binding_not_announced(self, &row).await?;
 
+            // v54.0.0 (CIRISPersist#1031, CC 4.1.1) — the cycle-closing `delegates_to`
+            // is refused: the recipient must not already reach the granter through live
+            // `delegates_to` edges. Backend-symmetric with memory + Postgres; verify-before-mutation.
+            crate::federation::admission::check_delegation_cycle_admission(self, &row).await?;
+
             // v12.6.0 (CIRISConstitution#23, CC 1.13.3.3 / CC 3.2) — the single-owner
             // gate: a node has AT MOST ONE responsible steward, so a second,
             // distinct-owner owner-binding `delegates_to(U → node)` is rejected. Runs
@@ -28834,6 +28839,10 @@ impl SqliteBackend {
         .await?;
         let row = community.community;
         crate::federation::check_consensus_protocol_form(&row.consensus_protocol)?;
+        // v54.0.0 (CIRISPersist#1034, CC 4.4.3.2.8) — the declared cohort parses,
+        // a config rides only on an affiliation, and an affiliation's config
+        // validates against its roster. Backend-symmetric.
+        crate::federation::affiliation_config::check_community_record(&row)?;
         // v4.11.0 (#154 Ask 4) — geographic cohort_subkind admission: every
         // member must hold an in-force contained location_proof. Reads run
         // before the write lock below. No-op for non-geographic communities.
@@ -36692,7 +36701,12 @@ mod tests {
     async fn affiliations_cohort_membership_lifecycle_sqlite() {
         use crate::federation::cohort::{Cohort, RosterMember};
         use crate::federation::{BlobStorage, FederationDirectory};
-        let backend = community_fixture(&[("alice", "alice-occ", true)], None).await;
+        // v54.0.0 (#1034) — the record declares itself an affiliation.
+        let backend = community_fixture(
+            &[("alice", "alice-occ", true)],
+            Some(serde_json::json!({ "cohort_scope": "affiliations" })),
+        )
+        .await;
         // Register a fresh PRIMITIVE key to admit via the affiliations cohort.
         backend
             .put_public_key(SignedKeyRecord {
@@ -50205,11 +50219,36 @@ mod tests {
             })
             .await
             .unwrap();
-        backend
+        // v54.0.0 (CIRISPersist#1031, CC 4.1.1) — the cycle-closing edge is
+        // refused at the door, so a two-key cycle can no longer be stored.
+        let closing = backend
             .put_attestation(SignedAttestation {
                 attestation: topo_attestation(
                     "cyc-b",
                     "cyc-a",
+                    attestation_type::DELEGATES_TO,
+                    None,
+                    Some("*"),
+                    &[],
+                    None,
+                    when,
+                ),
+            })
+            .await;
+        assert!(
+            matches!(
+                closing,
+                Err(crate::federation::Error::DelegationCycle { .. })
+            ),
+            "the cycle-closing edge is refused: {closing:?}"
+        );
+        // The walk's visited guard still meets a cycle: a self-edge (the root
+        // charter shape, admitted) re-enters cyc-b.
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: topo_attestation(
+                    "cyc-b",
+                    "cyc-b",
                     attestation_type::DELEGATES_TO,
                     None,
                     Some("*"),

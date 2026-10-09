@@ -2745,6 +2745,11 @@ pub async fn check_promotion_admission(
     // only as minor-guardianship.
     check_user_target_steward_binding_admission(directory, row).await?;
 
+    // CC 4.1.1 — the cycle-closing `delegates_to` is refused (v54.0.0,
+    // CIRISPersist#1031). Re-run at promotion: the walks read the federation
+    // tier only, so a local edge closes a cycle at the moment it is promoted.
+    check_delegation_cycle_admission(directory, row).await?;
+
     // CC 5.4.6 / CC 3.4.13 Q5 — a minor's owner-binding is never announced
     // (v50.0.0, CIRISPersist#924). Re-run here because "admission MUST refuse
     // the PROMOTION": the owner's age band is directory state that can have
@@ -7591,6 +7596,34 @@ fn delegation_term_live_at(envelope: &serde_json::Value, t: chrono::DateTime<chr
         }
     }
     true
+}
+
+/// v54.0.0 (CIRISPersist#1031 meeting #1032) — will a `delegates_to`
+/// envelope's signed TERM be open at some instant at or after `now`?
+///
+/// The cycle gate's reading of the term, built on
+/// [`delegation_term_live_at`] so it cannot drift from the lens the licence
+/// and grant walks judge with. It asks the lens at the first instant the term
+/// can be open (`max(now, delegation_valid_from)`): an edge whose term has
+/// not opened yet still counts (it WILL be walked, so a cycle through it goes
+/// live on its own), while an edge whose term has closed, or whose term
+/// nobody can read, is skipped, because the lens refuses it at every later
+/// instant and no walk will ever traverse it.
+fn delegation_term_live_at_or_after(
+    envelope: &serde_json::Value,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    let from = match envelope.get(DELEGATION_VALID_FROM_FIELD) {
+        None | Some(serde_json::Value::Null) => None,
+        Some(v) => match v
+            .as_str()
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        {
+            Some(d) => Some(d.with_timezone(&chrono::Utc)),
+            None => return false,
+        },
+    };
+    delegation_term_live_at(envelope, from.map_or(now, |f| f.max(now)))
 }
 
 impl DelegationWalkLens<'_> {
@@ -14582,12 +14615,49 @@ pub async fn check_consent_for_key_admission(
     if identity_type::set_contains(&rec.identity_type, identity_type::USER) {
         return Ok(());
     }
+    // v54.0.0 (CIRISPersist#1033, CC 2.4.1.2.1 / CC 4.4.3.4.3) — the positive
+    // arm. A machine may issue a consent grant over a PERSON's data when that
+    // person delegated it the `grant` scope: the onward grant is "issued by a
+    // holder of a `grant`-scoped delegation from them". The root must be a
+    // human (`user`) — consent stays by humans; a chain rooted at another
+    // machine is still one machine consenting for another.
+    if consent_root_is_human(directory, for_key).await?
+        && holds_grant_delegation(
+            directory,
+            for_key,
+            &row.attesting_key_id,
+            chrono::Utc::now(),
+        )
+        .await?
+    {
+        return Ok(());
+    }
     Err(Error::InvalidArgument(format!(
-        "consent row by {} names for_key_id {for_key}: a machine author may name only itself — \
-         consent is by humans, and infrastructure cannot consent on another machine's behalf \
-         (CIRISPersist#857, FSD/CONSENT_BY_HUMANS.md §4)",
+        "{CONSENT_FOR_KEY_NOT_DELEGATED}: consent row by {} names for_key_id {for_key}: a \
+         machine author may name only itself, or a person who delegated it the `grant` scope \
+         through a live chain — consent is by humans, and infrastructure cannot consent on \
+         another machine's behalf (CIRISPersist#857, FSD/CONSENT_BY_HUMANS.md §4; \
+         CIRISPersist#1033, CC 2.4.1.2.1)",
         row.attesting_key_id
     )))
+}
+
+/// v54.0.0 (CIRISPersist#1033) — the refusal token of
+/// [`check_consent_for_key_admission`]: a machine author named another key in
+/// `for_key_id` and holds no live `grant`-scoped chain from a human there.
+/// `Error::InvalidArgument` (Python `ValueError`), the type this refusal has
+/// always had; the token is its stable prefix.
+pub const CONSENT_FOR_KEY_NOT_DELEGATED: &str = "consent_for_key_not_delegated";
+
+/// Is `key` a `user`-role identity on this node? Unknown keys are not.
+async fn consent_root_is_human(
+    directory: &dyn super::FederationDirectory,
+    key: &str,
+) -> Result<bool, Error> {
+    Ok(directory
+        .lookup_public_key(key)
+        .await?
+        .is_some_and(|r| identity_type::set_contains(&r.identity_type, identity_type::USER)))
 }
 
 /// v52.0.0 (CIRISPersist#784, decision D2) — the envelope member a
@@ -14833,6 +14903,190 @@ pub async fn check_node_agency_admission(
         attested_key_id: row.attested_key_id.clone(),
         offending_scopes,
     })
+}
+
+/// v54.0.0 (CIRISPersist#1033, CC 2.4.1.2.1 / CC 4.4.3.4.3) — **does `issuer`
+/// hold a live [`DELEGATION_SCOPE_GRANT`]-scoped delegation from `owner`?**
+///
+/// CC 2.4.1.2.1: *"An onward grant is a new grant issued by the asset's owner
+/// or steward, or by a holder of a `grant`-scoped delegation from them."* This
+/// is the second half of that sentence; the owner/steward half is the
+/// caller's own predicate (`speaks_for`, the minter, the human author).
+///
+/// The walk is the one the `license` scope uses
+/// ([`emitter_resolves_to_authority`]): [`scoped_delegation_reach_at`] under
+/// [`DelegationWalkPolicy::MODERATION_DUTY`] (`⊆`-parent attenuation,
+/// `sub_delegation`-gated deputization, both retraction gates) to
+/// [`MAX_MODERATION_DELEGATION_DEPTH`] — read AS OF `now`, so an edge that has
+/// expired, or that is dated after the act, confers nothing. "Live" is the
+/// admitting node's clock, never the row's signer-chosen `asserted_at`.
+///
+/// `owner == issuer` is NOT a reach (no edge carries a scope to the self); the
+/// owner's own issuance is the caller's other arm.
+pub async fn holds_grant_delegation(
+    directory: &dyn super::FederationDirectory,
+    owner: &str,
+    issuer: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<bool, Error> {
+    if owner == issuer {
+        return Ok(false);
+    }
+    let targets: std::collections::HashSet<String> = std::iter::once(issuer.to_owned()).collect();
+    Ok(scoped_delegation_reach_at(
+        directory,
+        owner,
+        &targets,
+        DELEGATION_SCOPE_GRANT,
+        MAX_MODERATION_DELEGATION_DEPTH,
+        DelegationWalkPolicy::MODERATION_DUTY,
+        DelegationWalkLens {
+            as_of: Some(now),
+            community_id: None,
+            root_authority: None,
+        },
+    )
+    .await?
+    .hit_target)
+}
+
+/// v54.0.0 (CIRISPersist#1031, CC 4.1.1) — **the cycle-closing `delegates_to`
+/// is refused at admission.**
+///
+/// CC 4.1.1's anti-pattern table, row "Cycles (A → B → A)": *"Substrate MUST
+/// detect cycles on the `delegates_to` graph and reject the cycle-closing
+/// emission."* Until this gate every walk was visited-guarded
+/// ([`scoped_delegation_reach_at`], `topology::build_delegation_graph`), so a
+/// cycle was TOLERATED at read time, but nothing refused the closing edge and
+/// it was stored.
+///
+/// A no-op for any row that is not a [`attestation_type::DELEGATES_TO`]. For
+/// `delegates_to(A → B)` it asks whether `B` already reaches `A` through live
+/// `delegates_to` edges ([`delegation_path_hops`]), and if so refuses with
+/// [`Error::DelegationCycle`] (`federation_delegation_cycle`).
+///
+/// A self-edge (`A == B`) is admitted without a read: it is the root charter,
+/// the constitutional `delegates_to(root → root)` self-declaration
+/// (`trust_root`), not the "A → B → A" anti-pattern, and the walks' visited
+/// guard reads it as a root.
+///
+/// # What "live" means here — the walks' own reading
+///
+/// An edge counts unless the walks would skip it: retracted by its granter
+/// (gate (a) of [`scoped_delegation_reach_at`]: a `withdraws`/`recants` by the
+/// granter naming the recipient), retracted by name (gate (b), the #593
+/// clause, via [`retracted_edge_ids`]), expired at `now`, or carrying a signed
+/// term (`delegation_valid_from` / `delegation_valid_until` / `valid_until`,
+/// #1032) that the walks' lens will refuse at every instant from `now` on
+/// ([`delegation_term_live_at_or_after`], the lens's own term reading). Scope does NOT
+/// matter: CC names the `delegates_to` graph, not one scope's subgraph, and a
+/// cycle on any scope is still a cycle. A future-dated edge counts — it
+/// exists, and skipping it would let the closing edge in now and the cycle go
+/// live the moment the clock reaches it (fail toward refusal). The same holds
+/// for a term that opens later: its `delegation_valid_from` does not hide it.
+///
+/// # The ceiling
+///
+/// The search follows at most [`MAX_WITHDRAWS_DELEGATION_DEPTH`] hops from
+/// `B`, the absolute ceiling every delegation walk clamps to (the issue's ask
+/// verbatim). A longer path is invisible to every walk this substrate runs,
+/// so a cycle through it cannot change any verdict a walk returns.
+///
+/// # Where it runs
+///
+/// Every backend's `put_attestation` (all tiers), beside the other
+/// `delegates_to` gates, AND [`check_promotion_admission`]: the walks read
+/// the federation tier only, so a local-tier edge closes nothing until it is
+/// promoted, and the graph may have grown since its local write.
+pub async fn check_delegation_cycle_admission(
+    directory: &dyn super::FederationDirectory,
+    row: &super::Attestation,
+) -> Result<(), Error> {
+    if row.attestation_type != attestation_type::DELEGATES_TO {
+        return Ok(());
+    }
+    let refuse = |hops| {
+        Err(Error::DelegationCycle {
+            attesting_key_id: row.attesting_key_id.clone(),
+            attested_key_id: row.attested_key_id.clone(),
+            hops,
+        })
+    };
+    // A self-edge is not the anti-pattern: it is the root charter, the
+    // constitutional `delegates_to(root → root)` self-declaration (CC 3.2 —
+    // `trust_root`), and every walk's visited guard already treats it as a
+    // root. CC 4.1.1's row is "A → B → A", a cycle between distinct keys.
+    if row.attesting_key_id == row.attested_key_id {
+        return Ok(());
+    }
+    match delegation_path_hops(
+        directory,
+        &row.attested_key_id,
+        &row.attesting_key_id,
+        chrono::Utc::now(),
+    )
+    .await?
+    {
+        Some(hops) => refuse(hops),
+        None => Ok(()),
+    }
+}
+
+/// v54.0.0 (CIRISPersist#1031) — the shortest live `delegates_to` path from
+/// `from` to `to`, in hops, within [`MAX_WITHDRAWS_DELEGATION_DEPTH`]; `None`
+/// when there is none. Unscoped, unattenuated: it asks whether the graph
+/// CONNECTS the two keys, not whether a duty flows. Edge liveness is the
+/// reading [`check_delegation_cycle_admission`] documents.
+pub(crate) async fn delegation_path_hops(
+    directory: &dyn super::FederationDirectory,
+    from: &str,
+    to: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Option<usize>, Error> {
+    use std::collections::{HashMap, HashSet, VecDeque};
+    let mut visited: HashSet<String> = HashSet::from([from.to_owned()]);
+    let mut queue: VecDeque<(String, usize)> = VecDeque::from([(from.to_owned(), 0)]);
+    let mut incoming_retracted: HashMap<String, HashSet<String>> = HashMap::new();
+    while let Some((key, depth)) = queue.pop_front() {
+        if depth >= MAX_WITHDRAWS_DELEGATION_DEPTH {
+            continue;
+        }
+        let rows = directory.list_attestations_by(&key).await?;
+        // Gate (a): the granter retracted its own edge to this recipient.
+        let granter_retracted: HashSet<&str> = rows
+            .iter()
+            .filter(|r| {
+                r.attestation_type == attestation_type::WITHDRAWS
+                    || r.attestation_type == attestation_type::RECANTS
+            })
+            .map(|r| r.attested_key_id.as_str())
+            .collect();
+        for r in &rows {
+            if r.attestation_type != attestation_type::DELEGATES_TO
+                || r.expires_at.is_some_and(|x| x <= now)
+                || !delegation_term_live_at_or_after(&r.attestation_envelope, now)
+                || granter_retracted.contains(r.attested_key_id.as_str())
+            {
+                continue;
+            }
+            // Gate (b), the #593 clause: a retraction among the recipient's
+            // incoming rows naming THIS edge kills it, whoever issued it.
+            if !incoming_retracted.contains_key(&r.attested_key_id) {
+                let incoming = directory.list_attestations_for(&r.attested_key_id).await?;
+                incoming_retracted.insert(r.attested_key_id.clone(), retracted_edge_ids(&incoming));
+            }
+            if incoming_retracted[&r.attested_key_id].contains(&r.attestation_id) {
+                continue;
+            }
+            if r.attested_key_id == to {
+                return Ok(Some(depth + 1));
+            }
+            if visited.insert(r.attested_key_id.clone()) {
+                queue.push_back((r.attested_key_id.clone(), depth + 1));
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// v11.5.0 (CIRISPersist#306, CC 3.2 / CC 1.15.6) — the **user-target

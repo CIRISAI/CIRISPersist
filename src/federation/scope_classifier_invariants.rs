@@ -12,7 +12,9 @@
 /// The I145 / I147 bodies, one per backend runner.
 #[cfg(any(test, feature = "test-anchor"))]
 pub mod bodies {
-    use crate::ceg::list::drive_query_invariants::bodies::{seed_room, seed_row};
+    use crate::ceg::list::drive_query_invariants::bodies::{
+        seed_affiliation, seed_room_for, seed_row,
+    };
     use crate::federation::tier_ingest::test_support as ts;
     use crate::read::AttestationFilter;
     use crate::scope::{caller_scope_from_directory, CallerScope};
@@ -41,8 +43,8 @@ pub mod bodies {
         for k in [&producer, &member, &only_b] {
             ts::register_identity_key(b, k, crate::federation::types::identity_type::USER).await;
         }
-        seed_room(b, &room_a, &[&producer, &member]).await;
-        seed_room(b, &room_b, &[&producer, &only_b]).await;
+        seed_affiliation(b, &room_a, &[&producer, &member]).await;
+        seed_affiliation(b, &room_b, &[&producer, &only_b]).await;
         let callers = [&member, &only_b];
         let expected = set(&[&member]);
 
@@ -247,7 +249,7 @@ pub mod bodies {
                  not 'not a member' (terminal)"
             );
             let theirs = format!("i147-theirs-{scope}-{s}");
-            seed_room(b, &theirs, &[&other]).await;
+            seed_room_for(b, scope, &theirs, &[&other]).await;
             assert_eq!(
                 kind(
                     seed_row(
@@ -264,7 +266,7 @@ pub mod bodies {
                 "I147/{scope}: a KNOWN room the writer is not in is terminal"
             );
             let ours = format!("i147-ours-{scope}-{s}");
-            seed_room(b, &ours, &[&writer]).await;
+            seed_room_for(b, scope, &ours, &[&writer]).await;
             assert_eq!(
                 kind(
                     seed_row(

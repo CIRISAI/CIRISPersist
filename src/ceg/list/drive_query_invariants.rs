@@ -38,6 +38,57 @@ pub mod bodies {
     where
         B: crate::federation::FederationDirectory + Sync,
     {
+        seed_group_signed(b, comm, members_signed, None).await;
+    }
+
+    /// v54.0.0 (CIRISPersist#1034) — [`seed_room`] declaring itself an
+    /// affiliation (`policy_blob.cohort_scope`), so rows placed at
+    /// `affiliations` may name it.
+    pub async fn seed_affiliation<B>(b: &B, comm: &str, members: &[&str])
+    where
+        B: crate::federation::FederationDirectory + Sync,
+    {
+        let signed: Vec<(&str, &str)> = members.iter().map(|m| (*m, *m)).collect();
+        seed_affiliation_signed(b, comm, &signed).await;
+    }
+
+    /// [`seed_affiliation`] with aliased signers (see [`seed_room_signed`]).
+    pub async fn seed_affiliation_signed<B>(b: &B, comm: &str, members_signed: &[(&str, &str)])
+    where
+        B: crate::federation::FederationDirectory + Sync,
+    {
+        seed_group_signed(
+            b,
+            comm,
+            members_signed,
+            Some(serde_json::json!({
+                crate::federation::affiliation_config::POLICY_COHORT_FIELD: "affiliations"
+            })),
+        )
+        .await;
+    }
+
+    /// [`seed_room`] if `scope` is `community`, [`seed_affiliation`] if it is
+    /// `affiliations`.
+    pub async fn seed_room_for<B>(b: &B, scope: &str, comm: &str, members: &[&str])
+    where
+        B: crate::federation::FederationDirectory + Sync,
+    {
+        if scope == crate::federation::types::cohort_scope::AFFILIATIONS {
+            seed_affiliation(b, comm, members).await;
+        } else {
+            seed_room(b, comm, members).await;
+        }
+    }
+
+    async fn seed_group_signed<B>(
+        b: &B,
+        comm: &str,
+        members_signed: &[(&str, &str)],
+        policy_blob: Option<serde_json::Value>,
+    ) where
+        B: crate::federation::FederationDirectory + Sync,
+    {
         use crate::federation::{Community, CommunityMember};
         let members: Vec<&str> = members_signed.iter().map(|(m, _)| *m).collect();
         let at = |s: &str| s.parse::<chrono::DateTime<chrono::Utc>>().unwrap();
@@ -57,7 +108,7 @@ pub mod bodies {
                 .collect(),
             founded_at: at("2026-06-01T00:00:00Z"),
             consensus_protocol: crate::federation::types::consensus_protocol::MAJORITY.to_owned(),
-            policy_blob: None,
+            policy_blob,
             persist_row_hash: String::new(),
         };
         let envelope = community.signing_envelope();

@@ -431,6 +431,10 @@ impl PostgresBackend {
         .await?;
         let row = community.community;
         crate::federation::check_consensus_protocol_form(&row.consensus_protocol)?;
+        // v54.0.0 (CIRISPersist#1034, CC 4.4.3.2.8) — the declared cohort parses,
+        // a config rides only on an affiliation, and an affiliation's config
+        // validates against its roster. Backend-symmetric.
+        crate::federation::affiliation_config::check_community_record(&row)?;
         // v4.11.0 (#154 Ask 4) — geographic cohort_subkind admission.
         crate::federation::location::check_geographic_community_admission(
             self,
@@ -6617,6 +6621,11 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             // owner-binding is never ANNOUNCED: refused at `cohort_scope:
             // federation`. Backend-symmetric; verify-before-mutation.
             crate::federation::admission::check_minor_owner_binding_not_announced(self, &row).await?;
+
+            // v54.0.0 (CIRISPersist#1031, CC 4.1.1) — the cycle-closing `delegates_to`
+            // is refused: the recipient must not already reach the granter through live
+            // `delegates_to` edges. Backend-symmetric with memory + SQLite; verify-before-mutation.
+            crate::federation::admission::check_delegation_cycle_admission(self, &row).await?;
 
             // v12.6.0 (CIRISConstitution#23, CC 1.13.3.3 / CC 3.2) — the single-owner
             // gate: a node has AT MOST ONE responsible steward, so a second,

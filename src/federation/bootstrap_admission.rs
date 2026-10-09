@@ -1571,8 +1571,13 @@ pub mod test_support {
         };
         // v47.0.0 (CIRISPersist#897) — an affiliation is a room (CC
         // 4.4.3.2.8), so it stands in the targeted arm with the other two.
+        // v54.0.0 (#1034) — the affiliation is its own declared record, with
+        // P in it, so only AV-84 can refuse a third-party row placed there.
+        let aff = format!("{tag}-a592-{run}");
+        ts::register_hybrid_key(dir, &aff).await;
+        ts::seed_two_member_affiliation(dir, &aff, &producer, &producer).await;
         let affiliations = crate::federation::Audience::Affiliations {
-            community_key_id: comm.clone(),
+            community_key_id: aff.clone(),
         };
         let stage = |attested: String| {
             let producer = producer.clone();
@@ -1682,7 +1687,9 @@ pub mod test_support {
                 "trust:demo:v1",
             );
             narrower.cohort_scope = cohort_scope::AFFILIATIONS.to_owned();
-            narrower.attestation_envelope["community_key_id"] = serde_json::json!(comm);
+            // v54.0.0 (#1034) — a row placed at `affiliations` names an
+            // affiliation (seeded above, P in it).
+            narrower.attestation_envelope["community_key_id"] = serde_json::json!(aff);
             ts::reseal(&mut narrower);
             let nid = narrower.attestation_id.clone();
             let err = dir
@@ -2248,7 +2255,8 @@ pub mod test_support {
         // v47 this row named no affiliation and AV-45 admitted it anyway.
         let aff = format!("aff-814-{tag}-{}", uuid::Uuid::new_v4().simple());
         ts::register_hybrid_key(dir, &aff).await;
-        ts::seed_two_member_community(dir, &aff, &licensor, &licensor).await;
+        // v54.0.0 (#1034) — a row placed at `affiliations` names an affiliation.
+        ts::seed_two_member_affiliation(dir, &aff, &licensor, &licensor).await;
         let mut mid = scores_row(&mid_id, &licensor, &licensor, "consent:scope:share:v1");
         mid.cohort_scope = cohort_scope::AFFILIATIONS.to_owned();
         mid.attestation_envelope["community_key_id"] = serde_json::json!(aff);
