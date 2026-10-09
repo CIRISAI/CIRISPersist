@@ -577,66 +577,82 @@ pub mod orchestrate {
         Ok(wraps.len())
     }
 
-    /// v53.0.0 (#969) — seal one chunk under the stream epoch's DEK with the
-    /// STREAM nonce `(counter, last)` and the position-bound AAD.
-    fn seal_stream_chunk(
+    /// v54.0.0 (#992) — the append door's seal: the PUBLIC
+    /// [`seal_stream_chunk`](crate::federation::stream_seal::seal_stream_chunk),
+    /// so a stored chunk and a producer-sealed one are one construction (the
+    /// STREAM nonce at `slot`, the AAD `chunk_aad(caller_aad, stream_id,
+    /// storage_seq)` built inside it).
+    fn seal_stored_stream_chunk(
         dek: &[u8; 32],
         stream_id: &str,
         epoch: u64,
         slot: crate::federation::StreamKeySlot,
+        caller_aad: Option<&[u8]>,
+        storage_seq: u64,
         plaintext: &[u8],
-        bound_aad: &[u8],
     ) -> Result<AtRestEnvelope, BlobError> {
-        let nonce = crate::federation::stream_seal::stream_nonce(
+        crate::federation::stream_seal::seal_stream_chunk(
             dek,
             stream_id,
             epoch,
             slot.counter,
             slot.last,
+            caller_aad,
+            storage_seq,
+            plaintext,
         )
-        .map_err(|e| BlobError::Backend(format!("stream nonce: {e}")))?;
-        crate::federation::at_rest_cascade::seal_aad_at_nonce(dek, nonce, bound_aad, plaintext)
-            .map_err(map_at_rest_err)
+        .map_err(|e| BlobError::Backend(e.to_string()))
     }
 
-    /// v53.0.0 (#969, CC 5.3.3.1) — open a stream-keyed chunk: read
-    /// `(counter, last)` from the stored nonce, require the stored nonce to
-    /// BE `stream_nonce(dek, stream_id, epoch, counter, last)` (a prefix that
-    /// does not belong to this DEK, stream and epoch fails closed before the
-    /// open), then open under the position-bound AAD. Returns the plaintext
-    /// and the slot, for the caller's per-epoch structure check.
+    /// v53.0.0 (#969, CC 5.3.3.1), v54.0.0 (#992) — the read door's open of a
+    /// stream-keyed chunk: the PUBLIC
+    /// [`open_stream_chunk`](crate::federation::stream_seal::open_stream_chunk)
+    /// (the stored nonce must BE the stream epoch's STREAM nonce — a prefix
+    /// that does not belong to this DEK, stream and epoch fails closed before
+    /// the open — then the open under the position-bound AAD), with its
+    /// refusals named by the chunk. Returns the plaintext and the slot, for
+    /// the caller's per-epoch structure check.
     pub(crate) fn open_stream_keyed_chunk(
         dek: &[u8; 32],
         stream_id: &str,
         epoch: u64,
         chunk_sha: &[u8; 32],
         envelope: &AtRestEnvelope,
-        bound_aad: &[u8],
+        caller_aad: Option<&[u8]>,
+        storage_seq: u64,
     ) -> Result<(Vec<u8>, crate::federation::StreamKeySlot), BlobError> {
+        use crate::federation::stream_seal::StreamSealError;
         let refuse = |why: &str| {
             BlobError::Backend(format!(
                 "stream chunk {} {why} (CC 5.3.3.1; CIRISPersist#969)",
                 hex::encode(chunk_sha)
             ))
         };
-        let (counter, last) = crate::federation::stream_seal::parse_nonce(&envelope.nonce)
-            .ok_or_else(|| refuse("carries a nonce whose flag byte is not a STREAM flag"))?;
-        let expect =
-            crate::federation::stream_seal::stream_nonce(dek, stream_id, epoch, counter, last)
-                .map_err(|e| BlobError::Backend(format!("stream nonce: {e}")))?;
-        if expect != envelope.nonce {
-            return Err(refuse(
-                "carries a nonce that is not the STREAM nonce of its stream, epoch and DEK",
-            ));
-        }
-        // #842 — the authorized viewer's open failing under the data presented
-        // is the typed crypto-class refusal, as on every other sealed row.
-        let plain = crate::federation::at_rest_cascade::open_aad(dek, Some(bound_aad), envelope)
-            .map_err(crate::federation::at_rest_cascade::open_err(
-                chunk_sha,
-                |e| BlobError::Backend(format!("stream chunk did not open ({e})")),
-            ))?;
-        Ok((plain, crate::federation::StreamKeySlot { counter, last }))
+        crate::federation::stream_seal::open_stream_chunk(
+            dek,
+            stream_id,
+            epoch,
+            caller_aad,
+            storage_seq,
+            envelope,
+        )
+        .map_err(|e| match e {
+            StreamSealError::NotAStreamNonce => {
+                refuse("carries a nonce whose flag byte is not a STREAM flag")
+            }
+            StreamSealError::NotThisStreamsNonce => {
+                refuse("carries a nonce that is not the STREAM nonce of its stream, epoch and DEK")
+            }
+            // #842 — the authorized viewer's open failing under the data
+            // presented is the typed crypto-class refusal, as on every other
+            // sealed row.
+            StreamSealError::DidNotOpen(e) => {
+                crate::federation::at_rest_cascade::open_err(chunk_sha, |e| {
+                    BlobError::Backend(format!("stream chunk did not open ({e})"))
+                })(e)
+            }
+            StreamSealError::Seal(e) => BlobError::Backend(e.to_string()),
+        })
     }
 
     /// v53.0.0 (#969) — the chunk door's stream-keyed arm. Per pass: the
@@ -669,8 +685,6 @@ pub mod orchestrate {
                  (CIRISPersist#969)"
             )));
         }
-        let bound_aad = chunk_aad(aad, w.stream_id, seq);
-        let bound_aad = bound_aad.as_slice();
         let plaintext_size = plaintext.len() as u64;
         let mut state = Some(first_state);
         for _ in 0..STREAM_SEAL_ATTEMPTS {
@@ -720,7 +734,7 @@ pub mod orchestrate {
                 last: false,
             };
             let envelope =
-                seal_stream_chunk(&dek, w.stream_id, rec.epoch, slot, plaintext, bound_aad)?;
+                seal_stored_stream_chunk(&dek, w.stream_id, rec.epoch, slot, aad, seq, plaintext)?;
             match backend
                 .put_blob_chunk_with_scope(
                     w.stream_id,
@@ -842,8 +856,8 @@ pub mod orchestrate {
                 counter,
                 last: true,
             };
-            let bound = chunk_aad(aad, w.stream_id, seq);
-            let envelope = seal_stream_chunk(&dek, w.stream_id, rec.epoch, slot, &[], &bound)?;
+            let envelope =
+                seal_stored_stream_chunk(&dek, w.stream_id, rec.epoch, slot, aad, seq, &[])?;
             match backend
                 .put_blob_chunk_with_scope(
                     w.stream_id,
@@ -2819,10 +2833,10 @@ pub mod orchestrate {
                 &c.sha,
                 tier,
                 viewer_key_id,
-                &chunk_aad(aad, sid, seq),
                 ChunkPos {
                     stream_id: sid,
                     seq,
+                    caller_aad: aad,
                     keys: ChunkKeys::StreamEpoch(epoch),
                     dag_authorized: true,
                 },
@@ -2879,7 +2893,6 @@ pub mod orchestrate {
                     hex::encode(cref.sha)
                 ))
             })?;
-            let bound_aad = chunk_aad(aad, stream_id, seq);
             // #969 — a v4 manifest names the epoch whose DEK sealed the chunk.
             let keys = match (manifest.is_stream_keyed(), cref.epoch) {
                 (false, _) => ChunkKeys::PerChunk,
@@ -2898,10 +2911,10 @@ pub mod orchestrate {
                 &cref.sha,
                 tier,
                 viewer_key_id,
-                &bound_aad,
                 ChunkPos {
                     stream_id,
                     seq,
+                    caller_aad: aad,
                     keys,
                     dag_authorized: true,
                 },
@@ -2947,6 +2960,10 @@ pub mod orchestrate {
         pub stream_id: &'a str,
         /// Its position.
         pub seq: u64,
+        /// v54.0.0 (#992) — the caller's associated data. The chunk's
+        /// position-bound AAD is `chunk_aad(caller_aad, stream_id, seq)`,
+        /// built from this position in ONE place, never passed beside it.
+        pub caller_aad: Option<&'a [u8]>,
         /// Which keys sealed it.
         pub keys: ChunkKeys,
         /// The viewer was authorized on the DAG's manifest: a missing chunk
@@ -3055,13 +3072,14 @@ pub mod orchestrate {
         chunk_sha: &[u8; 32],
         tier: CryptoTier,
         viewer_key_id: &str,
-        bound_aad: &[u8],
         pos: ChunkPos<'_>,
         memo: &mut ChunkReadMemo,
     ) -> Result<Vec<u8>, BlobError>
     where
         B: BlobStorage + crate::federation::FederationDirectory + Sync,
     {
+        let bound_aad = chunk_aad(pos.caller_aad, pos.stream_id, pos.seq);
+        let bound_aad = bound_aad.as_slice();
         // A chunk with no row: the same fact as a missing blob — swept (I31)
         // or never ours — told the same way (I4b).
         let Some(chunk_head) = backend.blob_head(chunk_sha).await? else {
@@ -3239,7 +3257,8 @@ pub mod orchestrate {
                     epoch,
                     chunk_sha,
                     &envelope,
-                    bound_aad,
+                    pos.caller_aad,
+                    pos.seq,
                 )?;
                 memo.stream_slots.push((pos.seq, epoch, slot));
                 Ok(plain)
@@ -3323,17 +3342,16 @@ pub mod orchestrate {
                 bytes
             }
             tier => {
-                let bound_aad = chunk_aad(aad, stream_id, seq);
                 open_stream_chunk_row_for_viewer(
                     backend,
                     &c.chunk_sha,
                     &c.chunk_sha,
                     tier,
                     viewer_key_id,
-                    &bound_aad,
                     ChunkPos {
                         stream_id,
                         seq,
+                        caller_aad: aad,
                         keys: ChunkKeys::Live(c.epoch),
                         dag_authorized: false,
                     },

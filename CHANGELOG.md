@@ -7,6 +7,28 @@ threat-model citations because this crate's audit story is the point.
 
 ## [Unreleased]
 
+## [54.0.0] - UNRELEASED
+
+### Changed — Verify 20.1.0 adopted: the three verify crates and the wheel floor move together (#992)
+
+`ciris-verify-core`, `ciris-keyring` and `ciris-crypto` move from tag v19.0.0 to v20.1.0 at all seven pin sites in one cut, since a split re-pin forks `ciris_crypto`. The wheel's `Requires-Dist` moves to `ciris-verify>=20.1.0,<21`. The floor is 20.1.0 because that minor ships the wheel-identity refusals the tag job's signer now relies on. The lockfile gains one transitive crate, `zlib-rs`, which verify-core's wheel reader pulls in.
+
+Verify 20 is a MAJOR of verify, and nothing in persist's surface broke at compile time. Its breaking changes are the kill switch as ruled on CIRISConstitution#146. A `constitutional` halt now verifies on ONE holder's signature, resumption and the new `lifecycle:confirmed` row need a strict majority of the standing roster, and `InvocationKind` and `Invocation` gained the confirmation kind and its `confirms_halt_id` field. `accord_live_quorum::verify_fire_by_live_quorum` and `verify_resume_by_live_quorum` are deprecated, and `AccordAction::Fire`/`Resume` remain only so stored rows parse. Persist calls neither `verify_invocation` nor the deprecated tallies. Its only use of `AccordAction::Fire` is a test fixture for the proposal-row parity tests, which still parses. Verify 20 also says an accord proposal's nonce is minted by the proposer, not issued by a server. Persist's accord proposal store still keeps an issued-nonce set. This cut does not change that set, and it is noted here for the accord owners.
+
+### Changed — the STREAM nonce is verify's; the public stream-chunk pair is the stored construction (#992)
+
+- **Delegation.** `stream_seal::stream_nonce` is now `ciris_crypto::stream_seal::stream_nonce` (CIRISVerify#303/#304), the one implementation persist, edge and verify call. It is also the A/V inner seal (CIRISConstitution#140), so live and stored chunks share one nonce. It is infallible, so it returns `[u8; 12]` instead of a `Result`, and `StreamSealError::Kdf` is gone. `BadDekLength`, which nothing raised, is gone too. `parse_nonce` delegates to verify's `parse_stream_nonce`. Stored nonces are unchanged byte for byte.
+- **New public pair** (the CIRISEdge ask on this issue). `seal_stream_chunk(dek, stream_id, epoch, counter, last, caller_aad, storage_seq, plaintext) -> AtRestEnvelope` and `open_stream_chunk(dek, stream_id, epoch, caller_aad, storage_seq, &AtRestEnvelope) -> (Vec<u8>, StreamKeySlot)` build `chunk_aad(caller_aad, stream_id, storage_seq)` inside. The store's append door, for data chunks and terminators, and its read door call these two functions. The read door now derives the position-bound AAD from the chunk's position, which carries the caller's AAD, instead of taking a pre-built AAD beside the position. So the AAD has one construction.
+- **Removed, clean break:** the public `seal_chunk`/`open_chunk`. They sealed with no associated data, which is a different construction from any stored chunk, so a chunk sealed through them never opened as a stored chunk. Nothing outside the module called them.
+- **Breaking for Rust callers:** `stream_nonce` no longer returns a `Result`, `StreamSealError` lost its `Kdf`, `BadDekLength` and `Crypto` arms and gained `NotAStreamNonce`, `NotThisStreamsNonce`, `Seal` and `DidNotOpen`, and `seal_chunk`/`open_chunk` are gone.
+
+Witnesses:
+
+- **I311** is unchanged. It derives the prefix with an independent HKDF call over the info encoding and now witnesses that verify's derivation is the one persist v53 stored under.
+- **I560** pins verify's five golden vectors as bytes, both through `stream_nonce` and through persist's v53 HKDF framing. A later verify that changed the derivation goes red at the re-pin.
+- **I561** (unit) checks that the DEK, stream and epoch are bound by the nonce recompute, which refuses before the open. It also checks that `caller_aad` and `storage_seq` are bound by the tag.
+- **I562** (sqlite, postgres) checks both directions. A chunk the store appended opens through `open_stream_chunk`. A chunk sealed through `seal_stream_chunk` and put at the floor reads through the store's door. A wrong `storage_seq` or `caller_aad` is refused on both sides, and at the door as the typed `SealDidNotOpen`.
+
 ## [53.2.0] - 2026-10-08
 
 ### Changed — the tag is pushed once main's run EXISTS, not once it completes (#1008)
