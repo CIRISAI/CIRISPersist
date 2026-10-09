@@ -67,6 +67,28 @@ impl PostgresBackend {
         &self.test_hooks
     }
 
+    /// v54.0.0 (Codex round 2 on PR #1050) — [`Self::connect`] with a pool of
+    /// `max_size` connections. The one-connection witnesses
+    /// (`store::one_connection_pool_invariants`) run every door on a pool where
+    /// a second checkout while one is held can never be served: a nested
+    /// checkout hangs there instead of passing by luck on a roomy pool.
+    /// (`deadpool`'s `Pool::resize` cannot stand in: shrinking a pool that has
+    /// not yet opened its connections leaves every semaphore permit in place.)
+    #[cfg(test)]
+    pub(crate) async fn connect_with_max_size_for_test(
+        dsn: &str,
+        max_size: usize,
+    ) -> Result<Self, Error> {
+        Self::connect_sized(dsn, Some(max_size)).await
+    }
+
+    /// The pool's configured `max_size` (the one-connection witnesses assert
+    /// their own premise with it).
+    #[cfg(test)]
+    pub(crate) fn pool_max_size_for_test(&self) -> usize {
+        self.pool.status().max_size
+    }
+
     /// v50.0.0 (PR #921 review) — the test-only rival write armed for `at`
     /// (see [`crate::store::test_hooks`]), applied through this backend's own
     /// replicated door. Never armed outside a test.
@@ -1612,6 +1634,12 @@ impl PostgresBackend {
     /// - `postgres://user:pass@host:5432/dbname`
     /// - `host=db user=lens password=… dbname=cirislens`
     pub async fn connect(dsn: &str) -> Result<Self, Error> {
+        Self::connect_sized(dsn, None).await
+    }
+
+    /// [`Self::connect`], with the pool's `max_size` set when `Some` (else
+    /// deadpool's default).
+    async fn connect_sized(dsn: &str, max_size: Option<usize>) -> Result<Self, Error> {
         #[cfg(feature = "tls")]
         ensure_rustls_provider();
         let pg_config: tokio_postgres::Config = dsn
@@ -1638,6 +1666,9 @@ impl PostgresBackend {
             .map(|b| String::from_utf8_lossy(b).into_owned());
         cfg.dbname = pg_config.get_dbname().map(str::to_owned);
         cfg.manager = Some(mgr_config);
+        if let Some(n) = max_size {
+            cfg.pool = Some(deadpool_postgres::PoolConfig::new(n));
+        }
 
         // THREAT_MODEL.md AV-18: TLS for the Postgres connection
         // pool, gated on the `tls` feature. Sovereign-mode
@@ -2014,9 +2045,9 @@ impl PostgresBackend {
     ///
     /// Callers must RELEASE any pooled client they hold before calling — the
     /// reload takes its own, and nesting two checkouts can exhaust a small
-    /// pool. That is also why the primary write must be COMMITTED first: the
-    /// reload runs on a different connection and would not see an open
-    /// transaction's rows. Every wire-indexed write chokepoint here is
+    /// pool (this method itself holds none while it reloads: I601). That is
+    /// also why the primary write must be COMMITTED first: the reload runs on
+    /// a different connection and would not see an open transaction's rows. Every wire-indexed write chokepoint here is
     /// autocommit (none opens a `tokio_postgres::Transaction`), so "after the
     /// statement returns" is already "after commit".
     /// v36.0.0 (CIRISPersist#668) — **a failure here is LOUD, never fatal.**
@@ -2055,44 +2086,78 @@ impl PostgresBackend {
         record_key_json: &str,
     ) -> Result<(), crate::federation::Error> {
         let indexed: Result<(), crate::federation::Error> = async {
-            // v54.0.0 (Codex on PR #1050) — the read of the stored bytes and the
-            // replacement of the mapping are ONE step per record. One transaction
-            // is not enough under READ COMMITTED: two re-indexes each prune before
-            // the other inserts and both hashes stay, and a re-index whose read
-            // predates a newer write replaces the newer hash with its stale one.
-            // The record's in-process stripe (taken before the pooled client, so a
-            // queue holds no clients) and a transaction-scoped advisory lock on the
-            // same identity (other processes) are held from the read through the
-            // commit, so the last re-index reads the last committed bytes.
+            // v54.0.0 (Codex on PR #1050) — two re-indexes of one record must not
+            // leave both hashes, and a re-index whose read predates a newer write
+            // must not leave the older hash. The record's in-process stripe (taken
+            // before any pooled client, so a queue holds none) orders this
+            // process's re-indexes; a transaction-scoped advisory lock on the same
+            // identity (other processes) makes each prune-and-upsert one step.
+            //
+            // v54.0.0 (Codex round 2 on PR #1050) — **the reload holds NO pooled
+            // client.** `entry_as_stored` reloads through the directory's own
+            // reads, each of which checks out a client; run while this re-index
+            // held its client and transaction, it waited for a connection only it
+            // could release, and on a one-connection pool (or a pool every
+            // connection of which was held the same way) the write hung (I601).
+            // A transaction-backed reload would duplicate the dispatcher's
+            // seventeen per-kind reads against a raw client, the very second
+            // derivation #640/#646 removed. So the read runs first, with no
+            // client held, and the lock orders the WRITES; a read that went
+            // stale while waiting for the lock is caught by re-reading after
+            // the commit: if the stored bytes moved, the loop writes the newer
+            // hash. The last re-index to commit therefore re-reads bytes no
+            // older than its own commit, and either confirms them or replaces
+            // them, so the mapping settles on the last committed bytes (I599).
             let _stripe = self.wire_index_locks.lock(kind, record_key_json).await;
-            let mut client = self
-                .get_client()
-                .await
-                .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
-            let tx = client.transaction().await.map_err(|e| {
-                crate::federation::Error::Backend(format!("signed_wire_index transaction: {e}"))
-            })?;
-            tx.execute(
-                "SELECT pg_advisory_xact_lock(hashtextextended($1 || chr(31) || $2, $3))",
-                &[&kind, &record_key_json, &WIRE_INDEX_LOCK_SEED],
-            )
-            .await
-            .map_err(|e| {
-                crate::federation::Error::Backend(format!("signed_wire_index lock: {e}"))
-            })?;
-            if let Some(content_hash) =
-                crate::federation::wire_index::entry_as_stored(self, kind, record_key_json).await?
-            {
-                #[cfg(test)]
-                self.test_hooks()
-                    .pause_if_armed("wire_index_before_write")
-                    .await;
-                pg_upsert_wire_index(&*tx, kind, &content_hash, record_key_json).await?;
+            let mut current =
+                crate::federation::wire_index::entry_as_stored(self, kind, record_key_json).await?;
+            #[cfg(test)]
+            self.test_hooks()
+                .pause_if_armed("wire_index_after_read")
+                .await;
+            for _ in 0..WIRE_INDEX_SETTLE_ATTEMPTS {
+                let Some(content_hash) = current else {
+                    return Ok(());
+                };
+                {
+                    let mut client = self
+                        .get_client()
+                        .await
+                        .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+                    let tx = client.transaction().await.map_err(|e| {
+                        crate::federation::Error::Backend(format!(
+                            "signed_wire_index transaction: {e}"
+                        ))
+                    })?;
+                    tx.execute(
+                        "SELECT pg_advisory_xact_lock(hashtextextended($1 || chr(31) || $2, $3))",
+                        &[&kind, &record_key_json, &WIRE_INDEX_LOCK_SEED],
+                    )
+                    .await
+                    .map_err(|e| {
+                        crate::federation::Error::Backend(format!("signed_wire_index lock: {e}"))
+                    })?;
+                    #[cfg(test)]
+                    self.test_hooks()
+                        .pause_if_armed("wire_index_before_write")
+                        .await;
+                    pg_upsert_wire_index(&*tx, kind, &content_hash, record_key_json).await?;
+                    tx.commit().await.map_err(|e| {
+                        crate::federation::Error::Backend(format!("signed_wire_index commit: {e}"))
+                    })?;
+                }
+                let after =
+                    crate::federation::wire_index::entry_as_stored(self, kind, record_key_json)
+                        .await?;
+                if after.as_deref() == Some(content_hash.as_str()) {
+                    return Ok(());
+                }
+                current = after;
             }
-            tx.commit().await.map_err(|e| {
-                crate::federation::Error::Backend(format!("signed_wire_index commit: {e}"))
-            })?;
-            Ok(())
+            Err(crate::federation::Error::Backend(format!(
+                "signed_wire_index: the stored bytes changed under each of \
+                 {WIRE_INDEX_SETTLE_ATTEMPTS} re-index attempts"
+            )))
         }
         .await;
         if let Err(e) = indexed {
@@ -23457,18 +23522,24 @@ fn decode_ed25519_b64(b64: &str) -> Result<VerifyingKey, Error> {
     VerifyingKey::from_bytes(&arr).map_err(|e| Error::Backend(format!("public_key parse: {e}")))
 }
 
-/// v21.1.0 (CIRISPersist#507b) — upsert one `(kind, content_hash) ->
-/// record_key` row into `signed_wire_index`. Shared by every signed-record
-/// write chokepoint's post-write hook and by `rebuild_signed_wire_index`.
-/// Generic over `GenericClient` (matches `pg_project_attestation_subjects` /
-/// `pg_project_consent_peer_set`) so a caller mid-transaction can pass its
-/// `&Transaction` and get the upsert in the SAME commit as the primary write.
 /// v54.0.0 (Codex on PR #1050) — the seed that namespaces the
 /// `signed_wire_index` per-record advisory lock
 /// (`hashtextextended(kind || chr(31) || record_key, seed)`) away from every
 /// other advisory key this crate takes. The ASCII bytes of `"wireidx"`.
 const WIRE_INDEX_LOCK_SEED: i64 = 0x0077_6972_6569_6478;
 
+/// v54.0.0 (Codex round 2 on PR #1050) — how many times one re-index writes
+/// and re-reads before it reports the record as still changing. Each extra
+/// pass is caused by a write that committed during the previous one, and that
+/// write's own re-index follows it, so the bound is never the only repair.
+const WIRE_INDEX_SETTLE_ATTEMPTS: usize = 8;
+
+/// v21.1.0 (CIRISPersist#507b) — upsert one `(kind, content_hash) ->
+/// record_key` row into `signed_wire_index`. Shared by every signed-record
+/// write chokepoint's post-write hook and by `rebuild_signed_wire_index`.
+/// Generic over `GenericClient` (matches `pg_project_attestation_subjects` /
+/// `pg_project_consent_peer_set`) so a caller mid-transaction can pass its
+/// `&Transaction` and get the upsert in the SAME commit as the primary write.
 async fn pg_upsert_wire_index<C>(
     client: &C,
     kind: &str,

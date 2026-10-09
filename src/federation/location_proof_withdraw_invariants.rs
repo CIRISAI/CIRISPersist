@@ -272,12 +272,21 @@ pub(crate) mod reindex_bodies {
     /// wrote its stale one, so the listing advertised a hash the point read
     /// rejects. After: exactly one mapping, the withdrawn row's, and every
     /// listed hash resolves.
+    ///
+    /// **I603** (v54.0.0, Codex round 2 on PR #1050) runs the same body with
+    /// the postgres re-index paused EARLIER: after its read, before it takes
+    /// the record's advisory lock (`second_waits = false`). The reload holds
+    /// no pooled client (I601), so the lock cannot cover it; `second`'s whole
+    /// withdrawal and re-index commit while `first` holds a stale read, and
+    /// `first` then commits LAST. Its post-commit re-read must see the newer
+    /// bytes and replace its stale hash.
     pub(crate) async fn i599_a_concurrent_reindex_leaves_one_mapping<Fut>(
         first: &dyn FederationDirectory,
         second: &dyn FederationDirectory,
         arm: impl FnOnce() -> std::sync::Arc<crate::store::test_hooks::Pause>,
         reindex_first: impl FnOnce(String) -> Fut,
         tag: &str,
+        second_waits: bool,
     ) where
         Fut: std::future::Future<Output = Result<(), crate::federation::Error>>,
     {
@@ -356,10 +365,18 @@ pub(crate) mod reindex_bodies {
             "I599 exactly one mapping for the record, the withdrawn row's (withdrawal ran \
              while the re-index was held: {second_ran_free})"
         );
-        assert!(
-            !second_ran_free,
-            "I599 the withdrawal's re-index must wait for the held one"
-        );
+        if second_waits {
+            assert!(
+                !second_ran_free,
+                "I599 the withdrawal's re-index must wait for the held one"
+            );
+        } else {
+            assert!(
+                second_ran_free,
+                "I603 premise: the withdrawal and its re-index commit while the first \
+                 re-index holds its stale read, so the first commits last"
+            );
+        }
     }
 
     /// **I524** (v53.1.3, Codex on #985 P2, #986) — **the withdrawal write is
@@ -618,6 +635,7 @@ mod runners {
                 || br.test_hooks().arm_pause("wire_index_before_write"),
                 |key| async move { br.index_stored_record("LocationProof", &key).await },
                 &suffix(),
+                true,
             )
             .await;
         }};
@@ -663,9 +681,42 @@ mod runners {
             || b1r.test_hooks().arm_pause("wire_index_before_write"),
             |key| async move { b1r.index_stored_record("LocationProof", &key).await },
             &suffix(),
+            true,
         )
         .await;
         eprintln!("i599_postgres: RAN on {dsn}");
+    }
+
+    /// I603 on postgres: the I599 body with the first re-index paused after
+    /// its read and before the advisory lock, so the second pool's withdrawal
+    /// commits in full first and the stale re-index commits last.
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn i603_postgres() {
+        use crate::federation::FederationDirectory;
+        use crate::store::Backend as _;
+        let Some(dsn) = crate::test_pg::isolated_dsn() else {
+            eprintln!("i603_postgres: no base DSN — SKIPPED");
+            return;
+        };
+        let b1 = crate::store::postgres::PostgresBackend::connect(&dsn)
+            .await
+            .unwrap();
+        b1.run_migrations().await.unwrap();
+        let b2 = crate::store::postgres::PostgresBackend::connect(&dsn)
+            .await
+            .unwrap();
+        let b1r = &b1;
+        super::reindex_bodies::i599_a_concurrent_reindex_leaves_one_mapping(
+            &b1 as &dyn FederationDirectory,
+            &b2 as &dyn FederationDirectory,
+            || b1r.test_hooks().arm_pause("wire_index_after_read"),
+            |key| async move { b1r.index_stored_record("LocationProof", &key).await },
+            &suffix(),
+            false,
+        )
+        .await;
+        eprintln!("i603_postgres: RAN on {dsn}");
     }
 
     /// I524 needs the backend's own rival seam (memory writes under one lock
