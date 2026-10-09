@@ -71,8 +71,12 @@ classifiers = [
 # required `roles` field; CIRISVerify #185, the accord-co-scrub "same ceremony"
 # milestone that CIRISPersist#422's infra:attest adopt-gate pairs with). Floor
 # moves to v9.0.0 (`<10`) in lockstep with the six Rust pins.
+# v54.0.0 (CIRISPersist#992, CIRISVerify v20.1.0 re-pin) — verify MAJOR 19→20.
+# Floor moves to v20.1.0 (`<21`) in lockstep with the seven Rust pins; the
+# floor is the minor that ships the wheel-identity refusals (CIRISVerify#307)
+# the tag job's signer relies on.
 dependencies = [
-    "ciris-verify>=19.0.0,<20",
+    "ciris-verify>=20.1.0,<21",
 ]
 dynamic = ["version"]
 
