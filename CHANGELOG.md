@@ -64,6 +64,14 @@ run and reaches one of the scope's async witnesses (docs/MUTATION_TESTING.md).
 - `emit_metrics` → `()` survived because I553, which kills it, was outside the scope's test
   filter. The filter now includes I552/I553.
 
+### Added — I548f: a steward's grant lapsed and swept reads `Expired` (#1038)
+
+The consent gate's one survivor (`||` → `&&` in the steward-universe predicate, now in
+`per_principal_stances`) dropped the substrate's `consent:state:expired` record from every
+steward's universe. I548f grants for the machine by its steward, lets it lapse, runs
+`run_consent_expiry_sweep`, and requires `Expired` from `capacity_consent_stance` (memory,
+sqlite, postgres).
+
 ## [54.0.0] - 2026-10-09
 
 ### Changed — Verify 20.1.0 adopted: the three verify crates and the wheel floor move together (#992)
