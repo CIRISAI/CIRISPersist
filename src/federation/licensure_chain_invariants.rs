@@ -1187,6 +1187,101 @@ pub mod bodies {
             "[{tag}] I604: the list-by-authority does not carry F's later row"
         );
     }
+
+    /// **I610** (v54.0.0, Codex round 3 on PR #1050) — **a community's id is
+    /// not its own issuer.** An infrastructure community's id is ALSO its
+    /// substrate key (`is_authorized_infrastructure_community` reads that
+    /// key), so a row that key signs has `attesting_key_id == authority_id`.
+    /// The door short-circuited on that equality and admitted a row claiming
+    /// a delegation (`delegation_id`) that names no edge, without reading the
+    /// community's authority set; the fold, which resolves the authority
+    /// first, classified the stored row unresolved. Now the door resolves
+    /// first and only a KEY authority is its own issuer: the row is refused,
+    /// and the door and the chain function agree on it. The same key's row
+    /// that claims no delegation is testimony, admitted, binding nobody.
+    pub async fn exercise_community_id_is_not_its_own_issuer(
+        dir: &dyn FederationDirectory,
+        tag: &str,
+    ) {
+        use crate::federation::admission::emitter_resolves_to_authority;
+        use crate::federation::room_roster_authority_invariants::bodies::make_group;
+        use crate::federation::types::consensus_protocol;
+        let now = base();
+        let holder = format!("{tag}-holder");
+        register(dir, &holder, &[identity_type::USER]).await;
+        let (room, _founders) = make_group(
+            dir,
+            &format!("{tag}-infra"),
+            consensus_protocol::FOUNDER_ONLY,
+            &["alice"],
+            1,
+            None,
+            None,
+        )
+        .await;
+        // The community's id resolves to a key as well.
+        register(dir, &room, &[identity_type::SUBSTRATE_PERSIST]).await;
+        assert!(
+            matches!(
+                resolve_licensure_authority(dir, &room)
+                    .await
+                    .expect("resolve"),
+                crate::federation::admission::LicensureAuthority::Community(_)
+            ),
+            "[{tag}] I610 premise: the authority id resolves to the community"
+        );
+        let claimed = licence(
+            &room,
+            &holder,
+            &room,
+            "issued",
+            Some(&uuid::Uuid::new_v4().to_string()),
+            now - Duration::minutes(30),
+        );
+        let authority = resolve_licensure_authority(dir, &room)
+            .await
+            .expect("resolve");
+        assert!(
+            matches!(
+                licensure_issuance_at(dir, &authority, &claimed, claimed.asserted_at)
+                    .await
+                    .expect("chain"),
+                LicensureIssuance::Unresolved { .. }
+            ),
+            "[{tag}] I610 premise: the chain function classifies the row unresolved"
+        );
+        must_refuse(
+            dir,
+            &claimed,
+            &format!("[{tag}] I610: the community's key signs a delegated issuance naming no edge"),
+        )
+        .await;
+        assert!(
+            !emitter_resolves_to_authority(dir, &room, &room)
+                .await
+                .expect("reader"),
+            "[{tag}] I610: the community's key is not in its founder_only authority set"
+        );
+        let testimony = must_put(
+            dir,
+            &licence(
+                &room,
+                &holder,
+                &room,
+                "revoked",
+                None,
+                now - Duration::minutes(20),
+            ),
+            &format!("[{tag}] I610 control: the same key's row claiming no delegation"),
+        )
+        .await;
+        assert!(
+            !crate::federation::admission::row_was_issued_under_authority(dir, &testimony, &room)
+                .await
+                .expect("verdict"),
+            "[{tag}] I610 control: that row is testimony, not the community's"
+        );
+    }
 }
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
@@ -1279,5 +1374,12 @@ mod run {
         i604_superseded_founder_keeps_issued_licence_sqlite,
         i604_superseded_founder_keeps_issued_licence_postgres,
         "i604"
+    );
+    on_every_backend!(
+        exercise_community_id_is_not_its_own_issuer,
+        i610_community_id_is_not_its_own_issuer_memory,
+        i610_community_id_is_not_its_own_issuer_sqlite,
+        i610_community_id_is_not_its_own_issuer_postgres,
+        "i610"
     );
 }

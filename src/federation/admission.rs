@@ -3959,10 +3959,13 @@ pub async fn emitter_resolves_to_authority(
     attester: &str,
     authority_id: &str,
 ) -> Result<bool, Error> {
-    if attester == authority_id {
+    // v54.0.0 (Codex round 3 on PR #1050) — resolved first, as the door does:
+    // a community's id equal to the attester's is not the community's
+    // authority set.
+    let authority = resolve_licensure_authority(directory, authority_id).await?;
+    if matches!(&authority, LicensureAuthority::Key(k) if k == attester) {
         return Ok(true);
     }
-    let authority = resolve_licensure_authority(directory, authority_id).await?;
     let now = chrono::Utc::now();
     let Ok(roots) = licensure_roots_at(directory, &authority, now).await? else {
         return Ok(false);
@@ -4135,11 +4138,18 @@ pub async fn check_licensure_delegator_is_authority(
     let Some(authority_id) = crate::federation::licensure::authority_of(dimension) else {
         return Ok(());
     };
-    // Its own authority — no read at all.
-    if row.attesting_key_id == authority_id {
+    // v54.0.0 (Codex round 3 on PR #1050) — resolved BEFORE any shortcut. A
+    // community's id can also resolve to a key (an infrastructure community's
+    // id IS its substrate key, `is_authorized_infrastructure_community`), and
+    // that key is not the community's authority set. Equality of the ids
+    // short-circuited here, so a delegated-issuance row that key signed was
+    // admitted without the founder / consensus set ever being read, and the
+    // fold then classified the stored row unresolved. Only a KEY authority is
+    // its own issuer, and `licensure_issuance_at` says so with no read.
+    let authority = resolve_licensure_authority(directory, authority_id).await?;
+    if matches!(&authority, LicensureAuthority::Key(k) if *k == row.attesting_key_id) {
         return Ok(());
     }
-    let authority = resolve_licensure_authority(directory, authority_id).await?;
     let refuse = |reason: &str, delegation_id: Option<&str>, judged: &str| {
         Err(Error::InvalidArgument(format!(
             "licensure_delegator_not_authority: {reason}: {:?} emitted {dimension:?} under \
