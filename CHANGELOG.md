@@ -9,6 +9,34 @@ threat-model citations because this crate's audit story is the point.
 
 ## [54.1.0] - unreleased
 
+### Added — the capacity consent stance names the rows it rests on (#1041)
+
+CIRISServer and RATCHET asked for it after 2026-10-08, when 11 scored subjects showed no visible `analyze` grant. Two hours of read-only work ended at the identity-anchor path: each subject's human had granted with `for_key_id` naming the occurrence. The fold was right and the scan's classification was wrong, and the score said nothing about which grant admitted it.
+
+- **`consent_by_humans::capacity_consent_stance_with_basis(directory, attester, subject, family, now) -> (ConsentState, ConsentBasis)`**, with `Engine::capacity_consent_stance_with_basis` and the Python `capacity_consent_stance_with_basis(attester_key_id, subject_key_id, family, now_iso=None)`. The Python door returns JSON `{"state": …, "basis": {"rows": [{"principal", "paths", "attestation_id"}]}}`.
+- **What the basis names.** Under the combine rule, the combined state is decided by every principal whose own fold reached it, so `ConsentBasis.rows` names each of those principals' deciding row. For `granted`, that is every granting principal's grant. For `revoked`, every revoker's row, and not a grant beside it. For `expired`, every lapsed grant. The subject comes first, then stewards by key. `unspecified` has an empty basis, which is how a gate gap reads apart from an expired grant. `ConsentBasis::attestation_ids()` gives the ids in order, for the capacity envelope's `evidence_refs` (Server's envelope, Server's field).
+- **Paths.** `ConsentPrincipalPath`: `subject` is the subject's own rows. `occurrence_of` is an identity the subject is an active occurrence of. `delegates_to` is a live `delegates_to` steward: an owner-binding to a person, any delegation to a node. Steward rows count only when they name the subject in `for_key_id`, as before.
+- **One fold.** `check_capacity_consent_admission`, the emit gate, asks `capacity_consent_stance_with_basis`, so a basis a scorer records is the one the gate decides on. `ConsentGateRefused` does not carry the basis, because a new field on that exhaustive public struct would break a pin-compatible minor. A scorer reads the basis from its precheck.
+- **The old door.** `capacity_consent_stance` stays for one release as a thin wrapper that returns the state alone.
+- **One steward walk.** `admission::steward_bindings_of` is now the key set of the new `admission::steward_binding_paths_of`, which returns each steward with its clause labels (`StewardPath`: `self_user`, `occurrence_of`, `delegates_to`). The labels cannot disagree with membership because there is one body. Reused from the `probe-consent-stance` branch: `StewardPath`, and `consent::fold_scoped_stance_refs_with_winner`, the stance fold that also returns its deciding row, which `fold_scoped_stance_refs` now wraps. The probe's debug fold, read-only backends and `examples/consent_stance` are not in this cut.
+
+New `pub` enums and how an adopter maps them (none is an admission outcome):
+
+| Variant | Mapping |
+|---|---|
+| `consent_by_humans::ConsentPrincipalPath::{Subject, OccurrenceOf, DelegatesTo}` | audit label on a basis row |
+| `admission::StewardPath::{SelfUser, OccurrenceOf, DelegatesTo}` | audit label on a steward |
+
+Witnesses in `src/federation/consent_basis_invariants.rs`, each on memory, sqlite and postgres:
+
+- **I622**: the subject's own grant is the basis under `subject`, and with no consent the basis is empty.
+- **I623**: a node owner's grant naming the node is the basis under `delegates_to`, and the same owner's blanket grant is neither a grant nor a basis. An identity anchor's grant naming the agent is the basis under `occurrence_of`.
+- **I624**: an agent's own grant beside its anchor's revocation is `revoked`, and the basis is the revocation only. A subject whose own grant has expired (`expires_at` past) and whose anchor grants is `granted`, and the basis is the anchor's live grant only. Every `granted` basis row is checked to be held, a grant, and not past its `expires_at`.
+
+The wrapper and the basis door are asserted equal in every body. I548e, the from-disk check, now requires the gate, the Engine basis door and the Python basis door to reach `capacity_consent_stance_with_basis`. I578, the large-futures gate, measures both new doors.
+
+Mutants, each restored. An empty basis turns I622, I623 and I624 red on all three backends; this is the before state, when the stance named no rows. A basis that ignores the combined state turns I624 red on all three. Labelling `occurrence_of` as `delegates_to` turns I623 and I624 red on all three.
+
 ### Added — an unknown signer is a typed, RETRYABLE refusal, apart from a bad signature (#1042)
 
 A fresh node refused the canonical's `identity_occurrence` rows every round with `scrub-signature verification failed: … is not a registered federation key`, because the signer's Key row had not landed yet. That is an ordering gap, and it read the same as a forged signature, so a sender could not tell a row that will admit tomorrow from one that never will. Persist's stance is unchanged: the refusal is per attempt, nothing is stored, marked or parked, and the same row admits when it is re-offered after the key plane. What changes is the type.
