@@ -5728,15 +5728,6 @@ pub trait FederationDirectory: Send + Sync {
         })
     }
 
-    /// The `key_id`s whose Ed25519 key digests to `digest`
-    /// (`Sha256Ed25519Raw`, 64 lowercase hex).
-    async fn purge_key_ids_for_digest(&self, digest: &str) -> Result<Vec<String>, Error> {
-        let _ = digest;
-        Err(Error::Unsupported {
-            method: "purge_key_ids_for_digest",
-        })
-    }
-
     /// Record an execution header. `Ok(true)` when inserted, `Ok(false)` when
     /// a header for the notice id is already held (the notice id is the hash
     /// of the notice bytes, so a second one is the same notice; the first is
@@ -5829,16 +5820,6 @@ pub trait FederationDirectory: Send + Sync {
         let _ = trace_id;
         Err(Error::Unsupported {
             method: "purge_delete_tombstoned_trace",
-        })
-    }
-
-    /// Hard-delete the key rows whose Ed25519 digest is `digest` — only if a
-    /// purge tombstone names it — with the revocation rows naming them.
-    /// `Ok(true)` if a key row was removed.
-    async fn purge_delete_tombstoned_key(&self, digest: &str) -> Result<bool, Error> {
-        let _ = digest;
-        Err(Error::Unsupported {
-            method: "purge_delete_tombstoned_key",
         })
     }
 

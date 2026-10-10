@@ -34,13 +34,13 @@
 //! resolve to a purged record (a trace id, a trace attestation id, an
 //! attestation id) is in the SAME selection and ledger, transitively.
 //!
-//! The selection kinds are [`PurgeSelection`]: by actor/key, by explicit id
+//! The selection kinds are [`PurgeSelection`]: by actor, by explicit id
 //! list, and the two classes the operator ruled on (#1040's mock-LLM traces,
 //! #1043's rows the substrate would refuse to admit today). #1043's second
 //! class (the QA / harness identities) is a list of by-actor selections
 //! ([`harness_actor_selections`]). A class is a pure row predicate
 //! ([`PurgeSelection::selects_row`]) over ONE [`scan_attestations`] pass, plus
-//! its seeds (an actor's key and traces, a model's traces); the derivation is
+//! its seeds (an actor's traces, a model's traces); the derivation is
 //! shared. A class like "rows of family F from issuer K in window W"
 //! (CIRISServer#757's zero-scored `capacity:sustained_coherence:v1` rows) is
 //! one more variant and one more predicate arm (dimension prefix, attester,
@@ -128,6 +128,12 @@ fn refused(token: &'static str, body: serde_json::Value) -> Error {
 /// The plane a purged record lives on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+///
+/// There is NO key plane (operator ruling 2026-10-09: "We should not delete
+/// any keys"; CC 2.4.1.1 at CIRISConstitution rc8@af6b436 — the root has no
+/// path over a stranger's key). Deleting a key leaves every row it signed
+/// unverifiable wherever it replicated; key retirement is `key:revocation`,
+/// a separate act by the key's own authority.
 pub enum PurgePlane {
     /// A `federation_attestations` row (the claims plane): traces' own
     /// `trace:complete:v1` attestations, scores, any claim. Id: the
@@ -136,10 +142,6 @@ pub enum PurgePlane {
     /// A trace's node-local projection rows (`trace_events`,
     /// `trace_llm_calls`). Id: the `trace_id`.
     Trace,
-    /// A `federation_keys` row. Id: the key's label-free digest
-    /// (`Sha256Ed25519Raw`, FSD `REVOCATION_BY_DIGEST.md`) — a replicated
-    /// tombstone never publishes a keystore label.
-    Key,
     /// A `federation_blobs` row (the bytes plane). Id: the blob's sha256 hex.
     /// Hard-deleted through the bytes plane's own retract-then-delete
     /// (`Engine::evict_blob`, #1007's shape).
@@ -147,9 +149,8 @@ pub enum PurgePlane {
 }
 
 impl PurgePlane {
-    /// Every plane, in finalize order (projections and claims before the keys
-    /// they reference).
-    pub const ALL: [Self; 4] = [Self::Trace, Self::Attestation, Self::Blob, Self::Key];
+    /// Every plane, in finalize order.
+    pub const ALL: [Self; 3] = [Self::Trace, Self::Attestation, Self::Blob];
 
     /// The wire spelling (the record id's prefix).
     #[must_use]
@@ -157,7 +158,6 @@ impl PurgePlane {
         match self {
             Self::Attestation => "attestation",
             Self::Trace => "trace",
-            Self::Key => "key",
             Self::Blob => "blob",
         }
     }
@@ -171,7 +171,6 @@ impl PurgePlane {
         match self {
             Self::Attestation => "federation_attestations",
             Self::Trace => "trace_events",
-            Self::Key => "federation_keys",
             Self::Blob => "federation_blobs",
         }
     }
@@ -180,7 +179,6 @@ impl PurgePlane {
         Some(match s {
             "attestation" => Self::Attestation,
             "trace" => Self::Trace,
-            "key" => Self::Key,
             "blob" => Self::Blob,
             _ => return None,
         })
@@ -214,8 +212,9 @@ impl PurgeRecord {
 ///
 /// # Errors
 ///
-/// [`token::SELECTION_MALFORMED`] for an unknown plane, an empty id, or a
-/// malformed key / blob digest.
+/// [`token::SELECTION_MALFORMED`] for an unknown plane (a key, by either
+/// spelling, is refused by name: a purge never removes a key), an empty id,
+/// or a malformed blob digest.
 pub fn parse_record_id(record_id: &str) -> Result<PurgeRecord, Error> {
     let malformed = |why: &str| {
         refused(
@@ -226,16 +225,21 @@ pub fn parse_record_id(record_id: &str) -> Result<PurgeRecord, Error> {
     let (plane, id) = record_id
         .split_once(':')
         .ok_or_else(|| malformed("a record id is \"{plane}:{id}\""))?;
+    if matches!(plane, "key" | "federation_keys") {
+        return Err(malformed(
+            "a steward purge never deletes or tombstones a key (a deleted key leaves every row it \
+             signed unverifiable); key retirement is key:revocation, a separate act by the key's \
+             own authority",
+        ));
+    }
     let plane = PurgePlane::parse(plane).ok_or_else(|| malformed("unknown plane"))?;
     if id.is_empty() {
         return Err(malformed("empty id"));
     }
-    if matches!(plane, PurgePlane::Key | PurgePlane::Blob)
+    if plane == PurgePlane::Blob
         && !(id.len() == 64 && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
     {
-        return Err(malformed(
-            "a key or blob id is 64 lowercase hex (the label-free digest)",
-        ));
+        return Err(malformed("a blob id is 64 lowercase hex (its sha256)"));
     }
     Ok(PurgeRecord {
         plane,
@@ -268,10 +272,10 @@ pub fn selection_digest<S: AsRef<str>>(record_ids: &[S]) -> String {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PurgeSelection {
-    /// Every row attested BY or ABOUT `key_id` (attester, subject, scrub
-    /// signer, a `subject_key_ids` member), every trace it signed, the bytes
-    /// its `holds_bytes` claims name, the key itself, and everything derived.
-    /// CSD-065 Descend moves onto this (#1043 class 2: harness identities).
+    /// Every row `key_id` AUTHORED (`attesting_key_id`), every trace it
+    /// signed, the bytes its `holds_bytes` claims name, and everything
+    /// derived. NEVER its key, and never a row another key signed about it
+    /// (operator ruling 2026-10-09). CSD-065 Descend moves onto this.
     ByActor {
         /// The actor's `key_id`.
         key_id: String,
@@ -318,17 +322,23 @@ impl PurgeSelection {
     #[must_use]
     pub fn selects_row(&self, row: &Attestation) -> bool {
         match self {
-            Self::ByActor { key_id } => {
-                row.attesting_key_id == *key_id
-                    || row.attested_key_id == *key_id
-                    || row.scrub_key_id == *key_id
-                    || row.subject_key_ids.contains(key_id)
-            }
+            Self::ByActor { key_id } => row.attesting_key_id == *key_id,
             Self::RefusedToday => {
                 row.tier == super::types::attestation_tier::FEDERATION
                     && refused_today(row).is_some()
             }
             Self::ByIds { .. } | Self::MockModelTraces { .. } => false,
+        }
+    }
+
+    /// The parties this selection removes: the actor of a
+    /// [`Self::ByActor`], nobody otherwise. A `delegates_to` is purgeable only
+    /// with one of its parties ([`retraction_admissible`]).
+    #[must_use]
+    pub fn parties(&self) -> BTreeSet<String> {
+        match self {
+            Self::ByActor { key_id } => BTreeSet::from([key_id.clone()]),
+            _ => BTreeSet::new(),
         }
     }
 }
@@ -532,13 +542,6 @@ where
     }
 }
 
-/// The label-free digest of a key record's Ed25519 key.
-fn key_digest_of(record: &super::KeyRecord) -> Option<String> {
-    super::key_digest::Sha256Ed25519Raw::from_pubkey_base64(&record.pubkey_ed25519_base64)
-        .ok()
-        .map(|d| d.to_hex())
-}
-
 fn evidence_refs(envelope: &serde_json::Value) -> Vec<String> {
     envelope
         .get("evidence_refs")
@@ -604,14 +607,15 @@ impl RowFacts {
 /// - a structural composer (`withdraws` / `recants` / `supersedes`) →
 ///   admissible only when the row it retracts is in the selection too
 ///   (deleting a tombstone alone resurrects its target);
-/// - a `delegates_to` → admissible only when its granter or grantee key is in
-///   the selection (the purge removes the party, not a third party's grant);
+/// - a `delegates_to` → admissible only when its granter or grantee is a
+///   party the selection removes ([`PurgeSelection::parties`]) — the purge
+///   removes the party's rows, not a third party's grant;
 /// - any other exclusion-bearing row (`revocation:*`, `moderation:*`,
 ///   `slashing:*`, an unreadable dimension, …) → NOT admissible.
 fn retraction_admissible(
     facts: &RowFacts,
     selected_attestations: &BTreeSet<String>,
-    selected_key_ids: &BTreeSet<String>,
+    parties: &BTreeSet<String>,
 ) -> Result<(), String> {
     use super::migration::ExclusionClass;
     match facts.exclusion {
@@ -625,36 +629,18 @@ fn retraction_admissible(
             None => Err("a structural composer naming no target".to_owned()),
         },
         Some(ExclusionClass::Delegation) => {
-            if selected_key_ids.contains(&facts.attesting)
-                || selected_key_ids.contains(&facts.attested)
-            {
+            if parties.contains(&facts.attesting) || parties.contains(&facts.attested) {
                 Ok(())
             } else {
                 Err(
-                    "a delegates_to grant between keys neither of which is in the selection: a \
-                     purge removes a party, not a third party's standing grant"
+                    "a delegates_to grant between keys neither of which is a party the selection \
+                     removes: a purge removes a party's rows, not a third party's standing grant"
                         .to_owned(),
                 )
             }
         }
         Some(class) => Err(class.why().to_owned()),
     }
-}
-
-/// The key ids (labels) of the selected key records, resolved by digest from
-/// this node's directory.
-async fn selected_key_ids<F>(
-    directory: &F,
-    records: &BTreeMap<String, PurgeRecord>,
-) -> Result<BTreeSet<String>, Error>
-where
-    F: FederationDirectory + ?Sized,
-{
-    let mut out = BTreeSet::new();
-    for r in records.values().filter(|r| r.plane == PurgePlane::Key) {
-        out.extend(directory.purge_key_ids_for_digest(&r.id).await?);
-    }
-    Ok(out)
 }
 
 /// Resolve a selection against this node's live state.
@@ -697,18 +683,6 @@ where
             }
         }
         PurgeSelection::ByActor { key_id } => {
-            if let Some(rec) = directory.lookup_public_key(key_id).await? {
-                if let Some(d) = key_digest_of(&rec) {
-                    add(
-                        &mut records,
-                        PurgeRecord {
-                            plane: PurgePlane::Key,
-                            id: d,
-                            derived_from: None,
-                        },
-                    );
-                }
-            }
             for trace_id in directory.purge_trace_ids_signed_by(key_id).await? {
                 add(
                     &mut records,
@@ -791,7 +765,7 @@ where
                     PurgePlane::Trace | PurgePlane::Attestation => {
                         evidence.insert(r.id.clone(), r.record_id());
                     }
-                    PurgePlane::Key | PurgePlane::Blob => {}
+                    PurgePlane::Blob => {}
                 }
             }
             let mut grew = false;
@@ -836,7 +810,7 @@ where
     }
 
     // Admissibility: a fixpoint for the classes, a warning list for ByIds.
-    let key_ids = selected_key_ids(directory, &records).await?;
+    let key_ids = selection.parties();
     let mut withheld = Vec::new();
     let mut inadmissible = Vec::new();
     loop {
@@ -1275,7 +1249,7 @@ async fn record_inadmissible<F>(
     directory: &F,
     record: &PurgeRecord,
     selected_attestations: &BTreeSet<String>,
-    selected_key_ids: &BTreeSet<String>,
+    parties: &BTreeSet<String>,
 ) -> Result<Option<String>, Error>
 where
     F: FederationDirectory + ?Sized,
@@ -1286,7 +1260,7 @@ where
     let Some(row) = directory.get_attestation(&record.id).await? else {
         return Ok(None);
     };
-    Ok(retraction_admissible(&RowFacts::of(&row), selected_attestations, selected_key_ids).err())
+    Ok(retraction_admissible(&RowFacts::of(&row), selected_attestations, parties).err())
 }
 
 /// **`purge_rows(selection, notice, now)`** — the door.
@@ -1377,9 +1351,7 @@ where
         .filter(|r| r.plane == PurgePlane::Attestation)
         .map(|r| r.id.clone())
         .collect();
-    let by_id: BTreeMap<String, PurgeRecord> =
-        records.iter().map(|r| (r.record_id(), r.clone())).collect();
-    let key_ids = selected_key_ids(directory, &by_id).await?;
+    let key_ids = selection.parties();
     let mut tombstoned: BTreeMap<String, u64> = BTreeMap::new();
     let mut already = 0u64;
     for (index, record) in records.iter().enumerate() {
@@ -1590,8 +1562,6 @@ pub struct FinalizeReport {
     pub trace_events_deleted: u64,
     /// `trace_llm_calls` rows deleted.
     pub trace_llm_calls_deleted: u64,
-    /// Key rows deleted.
-    pub keys_deleted: u64,
     /// Blobs evicted.
     pub blobs_evicted: u64,
 }
@@ -1677,11 +1647,6 @@ where
                                 }),
                             ))
                         }
-                    }
-                }
-                PurgePlane::Key => {
-                    if directory.purge_delete_tombstoned_key(&r.id).await? {
-                        report.keys_deleted += 1;
                     }
                 }
             }
@@ -1919,24 +1884,6 @@ where
     F: FederationDirectory + ?Sized,
 {
     refuse_if_tombstoned(directory, PurgePlane::Attestation, &row.attestation_id).await
-}
-
-/// The key doors' gate: the record's label-free digest on the key plane.
-///
-/// # Errors
-///
-/// See [`refuse_if_tombstoned`].
-pub async fn refuse_if_tombstoned_key<F>(
-    directory: &F,
-    record: &super::KeyRecord,
-) -> Result<(), Error>
-where
-    F: FederationDirectory + ?Sized,
-{
-    match key_digest_of(record) {
-        Some(d) => refuse_if_tombstoned(directory, PurgePlane::Key, &d).await,
-        None => Ok(()),
-    }
 }
 
 // ── #1040: the mock-run trace refusal (CC 3.1.5, CIRISConstitution#166) ──

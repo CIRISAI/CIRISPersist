@@ -4078,23 +4078,6 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         .map_err(|e| crate::federation::Error::Backend(format!("purge_trace_row_counts: {e}")))
     }
 
-    async fn purge_key_ids_for_digest(
-        &self,
-        digest: &str,
-    ) -> Result<Vec<String>, crate::federation::Error> {
-        let digest = digest.to_owned();
-        self.read(move |conn| -> Result<Vec<String>, rusqlite::Error> {
-            let mut stmt = conn.prepare(
-                "SELECT key_id FROM federation_keys \
-                 WHERE ciris_sha256_ed25519_raw(pubkey_ed25519_base64) = ?1 ORDER BY key_id",
-            )?;
-            let rows = stmt.query_map([&digest], |r| r.get::<_, String>(0))?;
-            rows.collect()
-        })
-        .await
-        .map_err(|e| crate::federation::Error::Backend(format!("purge_key_ids_for_digest: {e}")))
-    }
-
     async fn purge_put_execution(
         &self,
         execution: &crate::federation::steward_purge::PurgeExecution,
@@ -4300,52 +4283,6 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         .map_err(|e| {
             crate::federation::Error::Backend(format!("purge_delete_tombstoned_trace: {e}"))
         })
-    }
-
-    async fn purge_delete_tombstoned_key(
-        &self,
-        digest: &str,
-    ) -> Result<bool, crate::federation::Error> {
-        let digest = digest.to_owned();
-        self.write(move |conn| -> Result<bool, rusqlite::Error> {
-            let tx = conn.transaction()?;
-            let tombstoned: bool = tx
-                .query_row(
-                    "SELECT 1 FROM purge_tombstones WHERE plane = 'key' AND record_ref = ?1 LIMIT 1",
-                    [&digest],
-                    |_| Ok(true),
-                )
-                .optional()?
-                .unwrap_or(false);
-            if !tombstoned {
-                return Ok(false);
-            }
-            tx.execute(
-                "DELETE FROM federation_revocations WHERE revoked_key_sha256_ed25519_raw = ?1",
-                [&digest],
-            )?;
-            // A key still referenced by a row outside the purge (a foreign
-            // key) is RETAINED: its tombstone keeps refusing it, and the
-            // caller reports it as retained rather than failing the finalize.
-            match tx.execute(
-                "DELETE FROM federation_keys \
-                 WHERE ciris_sha256_ed25519_raw(pubkey_ed25519_base64) = ?1",
-                [&digest],
-            ) {
-                Ok(n) => {
-                    tx.commit()?;
-                    Ok(n > 0)
-                }
-                Err(rusqlite::Error::SqliteFailure(f, _))
-                    if f.code == rusqlite::ErrorCode::ConstraintViolation =>
-                {
-                    Ok(false)
-                }
-                Err(e) => Err(e),
-            }
-        })
-        .await
-        .map_err(|e| crate::federation::Error::Backend(format!("purge_delete_tombstoned_key: {e}")))
     }
 
     async fn purge_mark_finalized(
@@ -4863,7 +4800,6 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         {
             return Ok(crate::federation::register::ReplicatedKeyOutcome::Unchanged);
         }
-        crate::federation::steward_purge::refuse_if_tombstoned_key(self, &record.record).await?;
         SqliteBackend::apply_replicated_key_record(self, record).await
     }
 
@@ -4871,9 +4807,6 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         &self,
         record: crate::federation::SignedKeyRecord,
     ) -> Result<(), crate::federation::Error> {
-        // v54.1.0 (CIRISPersist#1046) — a key a steward purge tombstoned (by
-        // its label-free digest) is refused here and at the replicated door.
-        crate::federation::steward_purge::refuse_if_tombstoned_key(self, &record.record).await?;
         self.put_public_key_at_door(record, crate::federation::register::KeyDoor::LocalMint)
             .await?;
         Ok(())

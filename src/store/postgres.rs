@@ -5492,31 +5492,6 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         ))
     }
 
-    async fn purge_key_ids_for_digest(
-        &self,
-        digest: &str,
-    ) -> Result<Vec<String>, crate::federation::Error> {
-        let client = self
-            .get_client()
-            .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
-        client
-            .query(
-                &format!(
-                    "SELECT key_id FROM cirislens.federation_keys WHERE {} = $1 ORDER BY key_id",
-                    crate::federation::key_digest::postgres_sql_expr("pubkey_ed25519_base64")
-                ),
-                &[&digest],
-            )
-            .await
-            .map_err(|e| {
-                crate::federation::Error::Backend(format!("purge_key_ids_for_digest: {e}"))
-            })?
-            .into_iter()
-            .map(|r| r.safe_get_with::<String, _, _, _>(0, crate::federation::Error::Backend))
-            .collect()
-    }
-
     async fn purge_put_execution(
         &self,
         execution: &crate::federation::steward_purge::PurgeExecution,
@@ -5754,66 +5729,6 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         Ok((events, calls))
     }
 
-    async fn purge_delete_tombstoned_key(
-        &self,
-        digest: &str,
-    ) -> Result<bool, crate::federation::Error> {
-        let mut client = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| crate::federation::Error::Backend(format!("pool: {e}")))?;
-        let tx = client
-            .transaction()
-            .await
-            .map_err(|e| crate::federation::Error::Backend(format!("begin tx: {e}")))?;
-        let tombstoned = tx
-            .query_opt(
-                "SELECT 1 FROM cirislens.purge_tombstones \
-                 WHERE plane = 'key' AND record_ref = $1 LIMIT 1",
-                &[&digest],
-            )
-            .await
-            .map_err(|e| crate::federation::Error::Backend(format!("purge key gate: {e}")))?
-            .is_some();
-        if !tombstoned {
-            return Ok(false);
-        }
-        tx.execute(
-            "DELETE FROM cirislens.federation_revocations \
-             WHERE revoked_key_sha256_ed25519_raw = $1",
-            &[&digest],
-        )
-        .await
-        .map_err(|e| crate::federation::Error::Backend(format!("purge key revocations: {e}")))?;
-        // A key still referenced by a row outside the purge (a foreign key) is
-        // RETAINED: its tombstone keeps refusing it, and the caller reports it
-        // as retained rather than failing the finalize.
-        let deleted = tx
-            .execute(
-                &format!(
-                    "DELETE FROM cirislens.federation_keys WHERE {} = $1",
-                    crate::federation::key_digest::postgres_sql_expr("pubkey_ed25519_base64")
-                ),
-                &[&digest],
-            )
-            .await;
-        match deleted {
-            Ok(n) => {
-                tx.commit()
-                    .await
-                    .map_err(|e| crate::federation::Error::Backend(format!("commit: {e}")))?;
-                Ok(n > 0)
-            }
-            Err(e) if e.code() == Some(&tokio_postgres::error::SqlState::FOREIGN_KEY_VIOLATION) => {
-                Ok(false)
-            }
-            Err(e) => Err(crate::federation::Error::Backend(format!(
-                "purge key delete: {e}"
-            ))),
-        }
-    }
-
     async fn purge_mark_finalized(
         &self,
         notice_id: &str,
@@ -5930,7 +5845,6 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         {
             return Ok(crate::federation::register::ReplicatedKeyOutcome::Unchanged);
         }
-        crate::federation::steward_purge::refuse_if_tombstoned_key(self, &record.record).await?;
         PostgresBackend::apply_replicated_key_record(self, record).await
     }
 
@@ -6352,9 +6266,6 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         &self,
         record: crate::federation::SignedKeyRecord,
     ) -> Result<(), crate::federation::Error> {
-        // v54.1.0 (CIRISPersist#1046) — a key a steward purge tombstoned (by
-        // its label-free digest) is refused here and at the replicated door.
-        crate::federation::steward_purge::refuse_if_tombstoned_key(self, &record.record).await?;
         self.put_public_key_at_door(record, crate::federation::register::KeyDoor::LocalMint)
             .await?;
         Ok(())

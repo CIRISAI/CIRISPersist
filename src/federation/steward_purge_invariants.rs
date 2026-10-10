@@ -31,8 +31,9 @@
 //! - **I657** — RETIRED, not reused: it witnessed a #1043 serve filter the
 //!   operator ruled out (2026-10-09: both classes are PURGED through this
 //!   door, never withheld in place). Its selection half is I662.
-//! - **I658** — #1043 class 2 (by actor): the harness identity's key, rows and
-//!   traces are one selection; after finalize its key cannot be re-registered.
+//! - **I658** — RETIRED, not reused: it witnessed a purged key that could
+//!   not return. The operator ruled (2026-10-09) that a purge never deletes
+//!   or tombstones a key; see I665, I666.
 //! - **I659** — #1040's admission refusal `trace_run_kind_mock` (CC 3.1.5,
 //!   CIRISConstitution#166), keyed on the signed `run_kind`: a federation-tier
 //!   `run_kind: mock` trace attestation is refused at the put and the
@@ -43,7 +44,8 @@
 //! - **I660** — the delete doors re-ask the tombstone: an untombstoned row is
 //!   never deleted through them.
 //! - **I661** — from disk: every backend's attestation put, both key doors,
-//!   the serve read and the promotion door carry the purge gates, and no
+//!   the serve read and the promotion door carry the purge gates, no key door
+//!   consults the purge plane, and no
 //!   serve read classifies a row by `refused_today` (#1043's ruling).
 //! - **I662** — #1043 class 1 is a SELECTION: a row the apply door refuses
 //!   today is still served until it is purged; `RefusedToday` selects it and
@@ -54,6 +56,15 @@
 //!   duty-holder `ncmec_csam` takedown, the v55 #1007 door's row) and its
 //!   bytes-plane tombstone round-trip through the store with their basis
 //!   intact, and the ledger names the basis.
+//! - **I665** — a purge never touches a key (operator ruling 2026-10-09):
+//!   `ByActor` selects only what the actor AUTHORED, never its key and never a
+//!   row another key signed about it; after a by-ids and a by-actor purge are
+//!   executed and finalized the key is still registered, its door still admits
+//!   it, its unselected row still verifies, and a row it signs afterwards
+//!   verifies.
+//! - **I666** — a `key:` (or `federation_keys:`) id is not a purge record:
+//!   `purge_selection_malformed`, naming `key:revocation` as key retirement's
+//!   own act.
 //! - **I663** — #1043 class 2 is a list of by-actor selections: the harness
 //!   prefixes name exactly the registered keys that start with them (never a
 //!   production-looking `ciris-server-*` key, never a near-miss), an empty
@@ -1164,12 +1175,8 @@ pub(crate) mod bodies {
         assert_eq!(
             counts,
             vec![
-                map(&[("federation_attestations", 1), ("federation_keys", 1)]),
-                map(&[
-                    ("federation_attestations", 2),
-                    ("federation_keys", 1),
-                    ("trace_events", 1),
-                ]),
+                map(&[]),
+                map(&[("federation_attestations", 2), ("trace_events", 1)]),
             ],
             "I663: per-actor dry-run counts"
         );
@@ -1234,62 +1241,119 @@ pub(crate) mod bodies {
         );
     }
 
-    // ── I658 ──────────────────────────────────────────────────────────────
-    pub(crate) async fn i658_by_actor_and_the_key_cannot_return<D: Seams>(d: &D) {
+    // ── I665 ──────────────────────────────────────────────────────────────
+    pub(crate) async fn i665_a_purge_never_touches_a_key<D: Seams>(d: &D) {
         root(d).await;
         let dir = d.as_dyn_directory();
         let t = now();
+        let key = dir.lookup_public_key(HARNESS).await.unwrap().unwrap();
+        let by = put_score(d, HARNESS, BYSTANDER, &[]).await.attestation_id;
+        let kept = put_score(d, HARNESS, SCORER, &[]).await;
+        let about = put_score(d, BYSTANDER, HARNESS, &[]).await.attestation_id;
+        let grant = ts::put_delegates_to(dir, HARNESS, BYSTANDER, None)
+            .await
+            .unwrap();
+        let incoming = ts::put_delegates_to(dir, SCORER, HARNESS, None)
+            .await
+            .unwrap();
+        let tid = "trace-harness-i665";
+        let tatt = seed_trace(d, tid, HARNESS, "gpt-real").await;
+        let later = t + chrono::Duration::seconds(sp::PURGE_SETTLE_DWELL_SECS + 1);
+
+        // (a) ByIds: one of the actor's rows goes; its key and its OTHER row
+        // stay, and that row still verifies against the key.
+        let one = PurgeSelection::ByIds {
+            ids: vec![format!("attestation:{by}")],
+        };
+        let dry = sp::purge_dry_run(dir, &one).await.unwrap();
+        let n = notice_for(&dry.notice_template, &[cc::FOUNDERS[0], cc::FOUNDERS[1]], t);
+        let r = sp::purge_rows(dir, &one, &n, NODE, t).await.unwrap();
+        sp::purge_finalize(dir, &r.notice_id, later, None)
+            .await
+            .unwrap();
+        assert!(dir.get_attestation(&by).await.unwrap().is_none());
+        crate::federation::verify_row_hybrid_signature(dir, &kept)
+            .await
+            .expect("I665: the actor's unselected row still verifies");
+
+        // (b) ByActor: exactly what the actor AUTHORED — never its key, never
+        // a row another key signed about it.
+        let sel = PurgeSelection::ByActor {
+            key_id: HARNESS.to_owned(),
+        };
+        let dry = sp::purge_dry_run(dir, &sel).await.unwrap();
+        let mut expect = vec![
+            format!("attestation:{}", kept.attestation_id),
+            format!("attestation:{grant}"),
+            format!("attestation:{tatt}"),
+            format!("trace:{tid}"),
+        ];
+        expect.sort();
+        assert_eq!(dry.sample, expect, "I665: withheld {:?}", dry.withheld);
+        assert!(
+            !dry.counts.contains_key("federation_keys"),
+            "I665: {:?}",
+            dry.counts
+        );
+        let notice = notice_for(&dry.notice_template, &[cc::FOUNDERS[0], cc::FOUNDERS[2]], t);
+        let report = sp::purge_rows(dir, &sel, &notice, NODE, t)
+            .await
+            .expect("executes");
+        sp::purge_finalize(dir, &report.notice_id, later, None)
+            .await
+            .expect("finalizes");
+        // The key is untouched: still registered, byte-identical, and still
+        // the key the rows others signed about the actor resolve against.
+        let after = dir.lookup_public_key(HARNESS).await.unwrap();
+        assert_eq!(
+            after.as_ref().map(|k| &k.pubkey_ed25519_base64),
+            Some(&key.pubkey_ed25519_base64),
+            "I665: the actor's key stays registered"
+        );
+        for id in [&about, &incoming] {
+            assert!(
+                dir.get_attestation(id).await.unwrap().is_some(),
+                "I665: {id}"
+            );
+        }
+        dir.put_public_key(crate::federation::SignedKeyRecord {
+            record: key.clone(),
+        })
+        .await
+        .expect("I665: the key's door never refuses it on a purge's account");
+        let fresh = put_score(d, HARNESS, BYSTANDER, &[]).await;
+        crate::federation::verify_row_hybrid_signature(dir, &fresh)
+            .await
+            .expect("I665: a row the actor signs afterwards still verifies");
+    }
+
+    // ── I666 ──────────────────────────────────────────────────────────────
+    pub(crate) async fn i666_a_key_id_is_not_a_purge_record<D: Seams>(d: &D) {
+        root(d).await;
+        let dir = d.as_dyn_directory();
         let key = dir.lookup_public_key(HARNESS).await.unwrap().unwrap();
         let digest = crate::federation::key_digest::Sha256Ed25519Raw::from_pubkey_base64(
             &key.pubkey_ed25519_base64,
         )
         .unwrap()
         .to_hex();
-        let by = put_score(d, HARNESS, BYSTANDER, &[]).await.attestation_id;
-        let about = put_score(d, BYSTANDER, HARNESS, &[]).await.attestation_id;
-        let grant = ts::put_delegates_to(dir, HARNESS, BYSTANDER, None)
-            .await
-            .unwrap();
-        let tid = "trace-harness-i658";
-        let tatt = seed_trace(d, tid, HARNESS, "gpt-real").await;
-        let other = put_score(d, SCORER, BYSTANDER, &[]).await.attestation_id;
-        let sel = PurgeSelection::ByActor {
-            key_id: HARNESS.to_owned(),
+        let sel = PurgeSelection::ByIds {
+            ids: vec![format!("key:{digest}")],
         };
-        let dry = sp::purge_dry_run(dir, &sel).await.unwrap();
-        let mut expect = vec![
-            format!("key:{digest}"),
-            format!("attestation:{by}"),
-            format!("attestation:{about}"),
-            format!("attestation:{grant}"),
-            format!("attestation:{tatt}"),
-            format!("trace:{tid}"),
-        ];
-        expect.sort();
-        assert_eq!(dry.sample, expect, "I658: withheld {:?}", dry.withheld);
-        assert!(!dry.sample.contains(&format!("attestation:{other}")));
-        assert!(
-            dry.sample.iter().all(|i| !i.contains(HARNESS)),
-            "I658: the key travels by its label-free digest, never its label"
-        );
-        let notice = notice_for(&dry.notice_template, &[cc::FOUNDERS[0], cc::FOUNDERS[1]], t);
-        let report = sp::purge_rows(dir, &sel, &notice, NODE, t)
+        let e = sp::purge_dry_run(dir, &sel)
             .await
-            .expect("executes");
-        let later = t + chrono::Duration::seconds(sp::PURGE_SETTLE_DWELL_SECS + 1);
-        let fin = sp::purge_finalize(dir, &report.notice_id, later, None)
-            .await
-            .expect("finalizes");
-        assert_eq!(fin.attestations_deleted, 4, "{fin:?}");
-        // The key: deleted where nothing else references it; either way it
-        // can never be registered again.
-        let e = dir
-            .put_public_key(crate::federation::SignedKeyRecord { record: key })
-            .await
-            .expect_err("the purged key cannot return");
+            .expect_err("a key is never a purge record");
         let (tok, body) = refusal(&e);
-        assert_eq!(tok, token::TOMBSTONED, "I658: {body}");
-        assert_eq!(body["record_id"], format!("key:{digest}"));
+        assert_eq!(tok, token::SELECTION_MALFORMED, "I666: {body}");
+        assert!(
+            body["reason"]
+                .as_str()
+                .is_some_and(|r| r.contains("key:revocation")),
+            "I666: the refusal names key retirement's own act: {body}"
+        );
+        let e = sp::parse_record_id(&format!("federation_keys:{digest}"))
+            .expect_err("nor by its table name");
+        assert_eq!(refusal(&e).0, token::SELECTION_MALFORMED);
     }
 
     // ── I659 ──────────────────────────────────────────────────────────────
@@ -1524,12 +1588,6 @@ pub(crate) mod bodies {
         let dir = d.as_dyn_directory();
         let row = put_score(d, SCORER, AGENT, &[]).await;
         let tatt = seed_trace(d, "trace-i660", AGENT, "gpt-real").await;
-        let key = dir.lookup_public_key(BYSTANDER).await.unwrap().unwrap();
-        let digest = crate::federation::key_digest::Sha256Ed25519Raw::from_pubkey_base64(
-            &key.pubkey_ed25519_base64,
-        )
-        .unwrap()
-        .to_hex();
         assert!(!dir
             .purge_delete_tombstoned_attestation(&row.attestation_id)
             .await
@@ -1544,7 +1602,6 @@ pub(crate) mod bodies {
                 .unwrap(),
             (0, 0)
         );
-        assert!(!dir.purge_delete_tombstoned_key(&digest).await.unwrap());
         assert!(dir
             .get_attestation(&row.attestation_id)
             .await
@@ -1610,9 +1667,14 @@ mod run {
                     b::i656_the_tombstone_replicates_re_verified(&a, &c).await
                 }
                 #[tokio::test]
-                async fn i658() {
+                async fn i665() {
                     let Some(d) = $fresh.await else { return };
-                    b::i658_by_actor_and_the_key_cannot_return(&d).await
+                    b::i665_a_purge_never_touches_a_key(&d).await
+                }
+                #[tokio::test]
+                async fn i666() {
+                    let Some(d) = $fresh.await else { return };
+                    b::i666_a_key_id_is_not_a_purge_record(&d).await
                 }
                 #[tokio::test]
                 async fn i659() {
@@ -1707,16 +1769,13 @@ mod run {
                 "async fn put_public_key(",
                 "async fn apply_replicated_key_record(",
             ] {
-                // The TRAIT door: the occurrence that settles under the Key
-                // kind (memory and sqlite also have an inherent namesake).
+                // A purge never touches a key (operator ruling 2026-10-09): no
+                // key door consults the purge plane.
                 let gated = src
                     .match_indices(door)
                     .map(|(i, _)| body(&src[i..], door))
-                    .filter(|b| door.contains("put_public_key") || b.contains("EnvelopeKind::Key"))
-                    .any(|b| {
-                        b.contains("steward_purge::refuse_if_tombstoned_key(self, &record.record)")
-                    });
-                assert!(gated, "I661 {backend}: {door} refuses a tombstoned key");
+                    .any(|b| b.contains("steward_purge::refuse_if_tombstoned"));
+                assert!(!gated, "I661 {backend}: {door} consults no purge gate");
             }
             let serve = body(&src, "async fn list_attestations_since(");
             assert!(

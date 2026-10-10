@@ -24,7 +24,7 @@ CREATE INDEX IF NOT EXISTS purge_executions_serve
 
 CREATE TABLE IF NOT EXISTS cirislens.purge_tombstones (
     notice_id     TEXT NOT NULL REFERENCES cirislens.purge_executions (notice_id),
-    plane         TEXT NOT NULL CHECK (plane IN ('attestation', 'trace', 'key', 'blob')),
+    plane         TEXT NOT NULL CHECK (plane IN ('attestation', 'trace', 'blob')),
     record_ref    TEXT NOT NULL CHECK (record_ref <> ''),
     ordinal       BIGINT NOT NULL CHECK (ordinal >= 0),
     derived_from  TEXT NULL,

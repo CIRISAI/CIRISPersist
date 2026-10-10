@@ -46,7 +46,7 @@ CREATE INDEX IF NOT EXISTS purge_executions_serve
 
 CREATE TABLE IF NOT EXISTS purge_tombstones (
     notice_id     TEXT NOT NULL REFERENCES purge_executions (notice_id),
-    plane         TEXT NOT NULL CHECK (plane IN ('attestation', 'trace', 'key', 'blob')),
+    plane         TEXT NOT NULL CHECK (plane IN ('attestation', 'trace', 'blob')),
     record_ref    TEXT NOT NULL CHECK (record_ref <> ''),
     ordinal       INTEGER NOT NULL CHECK (ordinal >= 0),
     derived_from  TEXT NULL,

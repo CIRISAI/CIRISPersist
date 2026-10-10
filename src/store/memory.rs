@@ -3081,26 +3081,6 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         Ok((events, calls))
     }
 
-    async fn purge_key_ids_for_digest(
-        &self,
-        digest: &str,
-    ) -> Result<Vec<String>, crate::federation::Error> {
-        let state = self.state.lock().expect("memory backend lock");
-        let mut ids: Vec<String> = state
-            .federation_keys
-            .values()
-            .filter(|k| {
-                crate::federation::key_digest::Sha256Ed25519Raw::from_pubkey_base64(
-                    &k.pubkey_ed25519_base64,
-                )
-                .is_ok_and(|d| d.to_hex() == digest)
-            })
-            .map(|k| k.key_id.clone())
-            .collect();
-        ids.sort();
-        Ok(ids)
-    }
-
     async fn purge_put_execution(
         &self,
         execution: &crate::federation::steward_purge::PurgeExecution,
@@ -3255,46 +3235,6 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         ))
     }
 
-    async fn purge_delete_tombstoned_key(
-        &self,
-        digest: &str,
-    ) -> Result<bool, crate::federation::Error> {
-        let mut state = self.state.lock().expect("memory backend lock");
-        let tombstoned = state
-            .purge_tombstones
-            .keys()
-            .any(|(_, p, r)| p == "key" && r == digest);
-        if !tombstoned {
-            return Ok(false);
-        }
-        let doomed: Vec<String> = state
-            .federation_keys
-            .values()
-            .filter(|k| {
-                crate::federation::key_digest::Sha256Ed25519Raw::from_pubkey_base64(
-                    &k.pubkey_ed25519_base64,
-                )
-                .is_ok_and(|d| d.to_hex() == digest)
-            })
-            .map(|k| k.key_id.clone())
-            .collect();
-        if doomed.is_empty() {
-            return Ok(false);
-        }
-        state.federation_revocations.retain(|r| {
-            r.revoked_key_sha256_ed25519_raw != digest
-                && !r
-                    .revoked_key_id
-                    .as_ref()
-                    .is_some_and(|k| doomed.contains(k))
-        });
-        for k in &doomed {
-            state.federation_keys.remove(k);
-            state.federation_trust.remove(k);
-        }
-        Ok(true)
-    }
-
     async fn purge_mark_finalized(
         &self,
         notice_id: &str,
@@ -3358,9 +3298,6 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         &self,
         record: crate::federation::SignedKeyRecord,
     ) -> Result<(), crate::federation::Error> {
-        // v54.1.0 (CIRISPersist#1046) — a key a steward purge tombstoned (by
-        // its label-free digest) is refused here and at the replicated door.
-        crate::federation::steward_purge::refuse_if_tombstoned_key(self, &record.record).await?;
         self.put_public_key_at_door(record, crate::federation::register::KeyDoor::LocalMint)
             .await?;
         Ok(())
@@ -3384,7 +3321,6 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         {
             return Ok(crate::federation::register::ReplicatedKeyOutcome::Unchanged);
         }
-        crate::federation::steward_purge::refuse_if_tombstoned_key(self, &record.record).await?;
         MemoryBackend::apply_replicated_key_record(self, record).await
     }
 
