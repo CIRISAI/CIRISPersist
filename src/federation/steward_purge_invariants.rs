@@ -1410,7 +1410,11 @@ pub(crate) mod bodies {
             .await
             .expect_err("the accountability record is unpurgeable");
         assert_eq!(refusal(&e).0, token::RETRACTION_INADMISSIBLE, "I667");
-        // By actor: the class withholds them all.
+        // By actor: the class withholds them all, and the dry run surfaces
+        // them. Whole or not at all (CC 4.5.3) holds for what the notice
+        // NAMES: the digest is over the admissible rows only, so executing it
+        // tombstones exactly those, and the withheld rows stay untouched.
+        let plain = put_score(d, HARNESS, BYSTANDER, &[]).await.attestation_id;
         let by = PurgeSelection::ByActor {
             key_id: HARNESS.to_owned(),
         };
@@ -1421,6 +1425,27 @@ pub(crate) mod bodies {
                 "I667: by-actor did not withhold the {dimension} row"
             );
             assert!(!dry.sample.contains(id));
+        }
+        assert_eq!(dry.sample, vec![format!("attestation:{plain}")], "I667");
+        let n = notice_for(&dry.notice_template, &[cc::FOUNDERS[1], cc::FOUNDERS[2]], t);
+        let r = sp::purge_rows(dir, &by, &n, NODE, t)
+            .await
+            .expect("executes");
+        let held: Vec<String> = dir
+            .purge_tombstones_of(&r.notice_id)
+            .await
+            .unwrap()
+            .iter()
+            .map(sp::PurgeTombstone::record_id)
+            .collect();
+        assert_eq!(held, dry.sample, "I667: exactly what the notice names");
+        for (_, id) in &ids {
+            let raw = id.trim_start_matches("attestation:");
+            assert!(dir.get_attestation(raw).await.unwrap().is_some());
+            assert_eq!(
+                dir.purge_tombstoned("attestation", raw).await.unwrap(),
+                None
+            );
         }
     }
 

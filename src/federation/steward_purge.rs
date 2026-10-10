@@ -624,6 +624,16 @@ fn retraction_admissible(
 /// what they withheld; [`PurgeSelection::ByIds`] selects exactly its list and
 /// reports inadmissible members as warnings — the door refuses at them.
 ///
+/// **Whole or not at all** (CC 4.5.3, CIRISConstitution rc8@c69129c: "A
+/// retraction the door cannot admit aborts the purge … a purge is whole or
+/// not at all, never a half-emptied selection"). The selection IS the id list
+/// the notice's digest names. A class's withheld rows are not in that list:
+/// the dry run surfaces them ([`PurgeDryRun::withheld`]) BEFORE the quorum
+/// cosigns, so the quorum authorises exactly the admissible rows, and the
+/// purge is whole for what it names. Nothing the digest names is ever
+/// skipped: an id list holding an inadmissible record (an explicit list, or
+/// a selection that drifted) aborts with nothing written.
+///
 /// # Errors
 ///
 /// Directory reads; [`token::SELECTION_MALFORMED`] for a malformed id.
