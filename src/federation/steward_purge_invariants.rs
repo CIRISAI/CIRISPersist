@@ -475,6 +475,15 @@ pub(crate) mod bodies {
                 t - chrono::Duration::days(3),
             ),
         ));
+        let mut no_holders = ok.envelope.clone();
+        no_holders
+            .as_object_mut()
+            .unwrap()
+            .remove("content_holder_key_ids");
+        cases.push((
+            "a notice without the CC 3.3.2 holder list",
+            sign(no_holders, &[cc::FOUNDERS[0], cc::FOUNDERS[1]]),
+        ));
         let mut not_root = ok.envelope.clone();
         not_root["claimant_key_id"] = serde_json::json!("some-room");
         cases.push((
@@ -491,6 +500,7 @@ pub(crate) mod bodies {
             "another basis" => "does not authorise a steward purge",
             "an expired notice" => "expired",
             "a claimant that is not a rooted trust root" => "no community row",
+            "a notice without the CC 3.3.2 holder list" => "content_holder_key_ids",
             _ => "is not a founder",
         };
         for (what, notice) in cases {
