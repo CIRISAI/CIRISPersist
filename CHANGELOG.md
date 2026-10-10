@@ -90,6 +90,8 @@ Witnesses in `src/federation/attester_key_unknown_invariants.rs`, each on memory
 - **I630**: on each of the four doors, a registered signer whose signature verifies but who is not yet an active occurrence of the identity is refused `federation_signer_not_acting_for`, naming the signer, the identity and the door. Once the occurrence lands, the same row admits.
 - **I631**: `verify_envelope_hybrid_signature` over the `FaultInjectingDirectory` with `lookup_public_key` erroring returns `Error::Backend("injected backend failure: …")`. Over the same directory without the fault, the row verifies.
 
+RED before, each fix reverted alone: I630 fails on all three backends with `I630 occurrence: scrub-signature verification failed: signed identity_occurrence: signer … is neither identity … nor an active occurrence of it` (kind `federation_signature_invalid`). I631 fails on all three with `I631: a backend failure propagates as itself, never a verdict: federation_federation_tier_unverified`. Mutant, restored: the refusal's `plane` pinned to `identity_occurrence` turns I630 red on all three at the revocation door.
+
 Existing assertions moved with the arm: the signed route matrix's "unrelated registered signer" step on all three backends, sqlite's signed-occurrence `signer_acts_for` arm, and the three I76 arms in `key_grant_invariants`. All now assert `federation_signer_not_acting_for`.
 
 ### Added — a stored Key row that fails verification is replaced by a passing one (`InvalidReplaced`) (#1044)
