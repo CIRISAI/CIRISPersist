@@ -518,7 +518,7 @@ its 174 rows (4.1.1 `CLM-delegation-depth-default` among them) had no entry in
   `verify_purge_authorisation`), 2.4.1.1 `CLM-purge-never-reaches-key` (`parse_record_id`,
   `resolve_selection`), 2.4.1.1 `CLM-accountability-record-unpurgeable`
   (`migration::accountability_record_family`, #1054's shared list; `steward_purge::retraction_admissible`),
-  3.1.5 `CLM-trace-run-kind` (`refuse_mock_trace_attestation`; `schema::trace::RUN_KINDS`), 4.5.3
+  3.1.5 `CLM-trace-run-kind-refusal` (the admitter's half; the producer's half is CLM-trace-run-kind-carried, CIRISAgent#1249) (`refuse_mock_trace_attestation`; `schema::trace::RUN_KINDS`), 4.5.3
   `CLM-purge-whole-or-not` (`purge_rows`, `purge_finalize`, `refuse_if_tombstoned_attestation`).
   Not added, because v54.1.0 does less than the text: `CLM-steward-purge-authorisation` and
   `CLM-purge-digest-preimage` (the notice is not yet an admitted row, so there is no
