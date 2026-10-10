@@ -785,7 +785,6 @@ Engine	purge_rows_json	deontic
 Engine	purge_finalize_json	deontic
 Engine	apply_replicated_purge_json	deontic
 Engine	purge_dry_run_json	empirical
-Engine	purge_harness_actor_selections_json	empirical
 Engine	purge_status_json	empirical
 Engine	purge_ledger_tsv	empirical
 Engine	list_purge_bundles_since_json	epistemic

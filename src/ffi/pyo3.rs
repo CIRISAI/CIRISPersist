@@ -13923,34 +13923,6 @@ impl PyEngine {
         })
     }
 
-    /// v54.1.0 (CIRISPersist#1043 class 2) — the by-actor selections of the
-    /// QA / harness identities registered on this node: a JSON array of
-    /// `{"kind": "by_actor", "key_id": …}`, one per key whose `key_id` starts
-    /// with a prefix of `prefixes_json` (a JSON array of strings; `None` →
-    /// `qa-node-`, `gate-leg-`, `leg-node-`, `gate-gate-identity-`,
-    /// `cessex16-`). Each is dry-run with `purge_dry_run_json`. Writes
-    /// nothing. `ValueError(purge_selection_malformed, …)` for an empty
-    /// prefix.
-    #[pyo3(signature = (prefixes_json=None))]
-    fn purge_harness_actor_selections_json(
-        &self,
-        py: Python<'_>,
-        prefixes_json: Option<&str>,
-    ) -> PyResult<String> {
-        self.ensure_usable()?;
-        let prefixes: Vec<String> = match prefixes_json {
-            Some(j) => serde_json::from_str(j)
-                .map_err(|e| PyValueError::new_err(format!("purge prefixes_json: {e}")))?,
-            None => crate::federation::steward_purge::HARNESS_KEY_ID_PREFIXES
-                .iter()
-                .map(|p| (*p).to_owned())
-                .collect(),
-        };
-        self.purge_engine_call(py, move |engine| async move {
-            engine.purge_harness_actor_selections(&prefixes).await
-        })
-    }
-
     /// v54.1.0 (CIRISPersist#1046, CIRISConstitution#165) — **execute** a
     /// steward purge. `notice_json` is `{"envelope": {…takedown_notice…},
     /// "cosignatures": [ThresholdSignature, …]}`, every cosignature over the

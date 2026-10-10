@@ -3189,9 +3189,6 @@ class Engine:
     def purge_dry_run_json(self, selection_json: str) -> str:
         """(derived) empirical — v54.1.0 (CIRISPersist#1046, CSD-108) — dry run a steward purge. selection_json is a tagged selection: {"kind": "by_actor", "key_id": …}, {"kind": "..."""
 
-    def purge_harness_actor_selections_json(self, prefixes_json: str | None = None) -> str:
-        """(derived) empirical — v54.1.0 (CIRISPersist#1043 class 2) — the by-actor selections of the QA / harness identities registered on this node: a JSON array of {"kind": "by_..."""
-
     def purge_ledger_tsv(self, notice_id: str) -> str:
         """(derived) empirical — v54.1.0 (CIRISPersist#1046) — the executed purge's ledger as TSV (for evidence/purges/<date>-<selection-digest>.tsv): a header carrying the digest,..."""
 

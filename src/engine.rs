@@ -8802,21 +8802,6 @@ impl Engine {
         crate::federation::steward_purge::purge_dry_run(directory.as_ref(), selection).await
     }
 
-    /// v54.1.0 (CIRISPersist#1043 class 2) — the by-actor selections of the
-    /// QA / harness identities registered here: one per key whose `key_id`
-    /// starts with one of `prefixes`, in key-id order. Writes nothing; each
-    /// is dry-run with [`Self::purge_dry_run`].
-    #[cfg(any(feature = "postgres", feature = "sqlite"))]
-    pub async fn purge_harness_actor_selections(
-        &self,
-        prefixes: &[String],
-    ) -> Result<Vec<crate::federation::steward_purge::PurgeSelection>, crate::federation::Error>
-    {
-        let directory = self.federation_directory();
-        crate::federation::steward_purge::harness_actor_selections(directory.as_ref(), prefixes)
-            .await
-    }
-
     /// v54.1.0 (CIRISPersist#1046) — **execute** a steward purge under a
     /// cosigned `takedown_notice` (basis `steward_purge`): authorise, re-count,
     /// re-digest, then tombstone every record in JCS order. Typed refusals:
