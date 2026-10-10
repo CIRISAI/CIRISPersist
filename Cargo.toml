@@ -919,10 +919,10 @@ rcgen = "0.13"
 # recorder captures what `observe::emit_metrics` writes and I553 compares the
 # names, label keys and label values with the catalogue.
 metrics-util = { version = "0.19", default-features = false, features = ["debugging"] }
-# Postgres integration tests share a single test database; parallel
-# test execution races on schema setup. serial_test forces the
-# postgres-tagged tests to run one at a time without slowing the
-# rest of the suite.
+# In-process locks for tests that share process-global state. Every key and
+# its reason is listed in rules/serial-keys.yml (CIRISPersist#1003), which
+# refuses a bare `#[serial]` or an unlisted key. Under nextest (a process per
+# test) the locks are inert; they hold under `cargo test`.
 serial_test = "3"
 # v0.1.7 — bench harness. criterion writes JSON to target/criterion/
 # which github-action-benchmark consumes for the gh-pages trend

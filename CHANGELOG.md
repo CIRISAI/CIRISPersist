@@ -7,7 +7,247 @@ threat-model citations because this crate's audit story is the point.
 
 ## [Unreleased]
 
+## [54.1.0] - unreleased
+
+### Fixed — the nightly mutants job was green while incomplete, its witness report said 0, and its survivors surfaced nowhere (#1051)
+
+The first scheduled run of `.github/workflows/mutants.yml` (650024b1, 2026-10-09) hit its
+2-hour budget (tool exit 124, 8 of 85 mutants never tested), had 6 survivors and 3 timeouts,
+and its job was **green**. Each defect, and what now makes it red:
+
+- **Incomplete was green.** `scripts/mutants.sh` exits **4** on an INCOMPLETE matrix, and
+  refuses up front with **3** a scope that does not fit its budget at the measured cost
+  (600 s + 120 s per mutant; that run: baseline 305 s, per mutant mean 78 s, p90 105 s).
+  `scope-consent` is split into `scope-consent-gate` (19 mutants, 2880 s) and `scope-observe`
+  (71 mutants, run as two `--shard`s of 36 and 35); each is its own job with a 150-minute
+  timeout. `MUTANTS_SHARD=k/n` is the new knob.
+- **"0 witnesses ran".** The defect was in the matrix reader, not `unvalidated_witnesses.py`:
+  the job sets `CARGO_TERM_COLOR=always`, so nextest's status lines in cargo-mutants' logs
+  carried colour escapes, and no line matched. The matrix listed 0 witnesses and credited no
+  kill. Escapes are stripped now, and a green baseline that yields no status line is a refusal
+  (exit 1), not an empty matrix. Witnessed against a trimmed copy of that run's own output
+  (`scripts/mutants/testdata/cargo-mutants-27.1/`): 22 witnesses, kills attributed per
+  witness, each outcome read.
+- **Survivors went nowhere.** `mutants_matrix.py verdict` writes the outcome table and every
+  survivor to `$GITHUB_STEP_SUMMARY`, annotates each (`::error` unlisted, `::warning`
+  allowed), and exits **5** on any `missed`, `timeout` or `caught_out_of_scope` mutant that
+  `scripts/mutants/allowed_survivors.txt` does not name with a `#<issue>`. The list is empty.
+- **Test support was in scope.** cargo-mutants 27.1 applies neither `-F` nor `-E` to struct
+  field deletions, so a function regex let in `delete field as_of` in four functions outside
+  the scope and two deletions in `#[cfg(all(test, ..))] mod r2_test_support`. Selection is
+  now by line through `--in-diff`: the scope is written as a diff that adds exactly its lines,
+  minus every test-only item (`#[cfg(test)]`, `#[cfg(all(test, ..))]`, `mod *test_support*`).
+  On the old scope this removes exactly those six. The matrix judges a mutant in scope when
+  its SPAN touches a scope line, as `--in-diff` does: judged by its first line, `counters()`'s
+  whole-body replacement (which starts on a `#[cfg(test)]` statement) was run by the tool and
+  then filed out of scope, where a survivor reaches no verdict. A cargo-mutants mutant the
+  matrix still files out of scope is now itself a red verdict (exit 5, "scope disagreement").
+- **v54.0.0 had moved the gate out of its scope.** #1015 split
+  `resolve_scoped_stance_by_principals_body` into `per_principal_stances` and
+  `combine_per_principal`; the scope named only the old body, which kept one mutant.
+  `scope-consent-gate` names both and measures I570 beside I548.
+- **Hangs cost the budget.** A nextest `mutants` profile kills a witness after 60 s, so a
+  mutant that hangs one is that witness's FAIL, not a 300 s tool timeout credited to no one.
+  `mutants.sh` pins cargo-mutants' `--minimum-test-timeout 300` so the tool's own timeout
+  cannot fall under that leash on a fast baseline. Run locally with cargo-mutants 27.1 on
+  `record_read` at `-j 1`: all five of its mutants `caught`, the three mask-loop ones in
+  61-63 s of test each (300 s and `timeout` on the nightly run).
+
+`scripts/mutants_matrix_test.py` (22 checks, fixtures, no cargo) now runs per-PR in `ci.yml`,
+in certify's fast tier (`mutmatrix`), and before each nightly leg (#1045 item 4). Each new
+failure path is shown red on a crafted input, and each fix was hand-reverted to show its
+witness red. **mutest-rs stays out of the nightly job:** it needs the pinned nightly and a
+from-git build, cannot build with `postgres`, profiles the whole lib suite for 28 minutes per
+run and reaches one of the scope's async witnesses (docs/MUTATION_TESTING.md).
+
+### Added — witnesses for the counters' three survivors and the mask loop (#1037, #1051)
+
+- **I690**: the snapshot lists a `(backend, door)` only once it served a read; a fresh set
+  lists none. Kills `Counters::snapshot`'s `n > 0` → `n >= 0`.
+- **I691**: `fold(X, fold(X, read))` keeps X active and credits every read once. Kills
+  `fold`'s `|` → `^`.
+- **I692**: a read inside two folds returns within 5 s. Kills `record_read`'s three mask-loop
+  mutants (`&=` → `|=`, `-` → `+`, `-` → `/`) in seconds, where they used to hang every
+  witness to the tool's 300 s timeout.
+- `emit_metrics` → `()` survived because I553, which kills it, was outside the scope's test
+  filter. The filter now includes I552/I553.
+
+### Added — I548f: a steward's grant lapsed and swept reads `Expired` (#1038)
+
+The consent gate's one survivor (`||` → `&&` in the steward-universe predicate, now in
+`per_principal_stances`) dropped the substrate's `consent:state:expired` record from every
+steward's universe. I548f grants for the machine by its steward, lets it lapse, runs
+`run_consent_expiry_sweep`, and requires `Expired` from `capacity_consent_stance` (memory,
+sqlite, postgres).
+
+### Changed — release chain follow-ups from v53.2.0 (#1045)
+
+- **gh ≥ 2.49 at preflight.** `release.sh` stage 1 asks `${GH:-gh}` for `gh attestation`
+  before anything is tagged; the printed finish command carries `GH=`. v53.2.0's finish
+  failed on gh 2.45 after the release was public.
+- **`CARGO_BUILD_JOBS` defaults to 6** in `release.sh` and `certify.sh`; the environment wins.
+- **The certify stage waits for a foreign cargo** (until none has run for 60 s, at most 2 h,
+  then exit 24 as before) instead of exiting 24 on certify's stray guard.
+  `CERTIFY_IGNORE_STRAY=1`, certify's own override, skips the wait. The self-test runs
+  release.sh's own `certify()` against stubs: a wait that gives up returns 24 before
+  certify.sh starts.
+- The 53.2.0 entry's self-test count said 41; it was 112. Now 129.
+- Not done here: item 6 (whether Codex caps reviews per PR) and item 7 (observing #1021's
+  tree-equality skip on a non-release merge) need observation on GitHub, not code.
+
 ## [54.0.0] - 2026-10-09
+
+### Changed — seven from-disk absence guards ported to ast-grep; test-only code is a node, not a brace count (#1026)
+
+v54.0.0's I14 false red came from a text stripper that knew `#[cfg(test)]` and read a
+`#[cfg(all(test, …))]` module as production. The ported rules select test-only code
+structurally: `utils/test-gated.yml` matches a node that follows (past other attributes and
+comments) `#[cfg(test)]`, `#[cfg(all(test, …))]`, `#[test]` or `#[tokio::test…]`, so a call at
+any depth inside such an item, or a `#[cfg(test)]` statement, is not production. Nothing is cut
+by counting braces, and comments and strings are not code by construction.
+
+- **Ported** (each keeps its Rust text gate for one release, bound to the rule in
+  `src/ast_gate_parity.rs`'s `GUARDS`): I14 the storage floor has no door
+  (`i14-storage-floor`, `i14-storage-floor-blobs`), #738 no src code mutates the anchor env,
+  #564 nothing names `AntiEntropy::Satisfied` outside `matches!`, #748 the retired depth knob,
+  #620 no sync signing verb, and the postgres provisioner's no-direct-env-read. Each rule also
+  matches inside a macro's token tree (`tokio::join!(b.store_blob_local(…))`), which a
+  `call_expression` rule cannot see.
+- **`cfg-test-forms`**: a cfg naming `test` in a form the util does not recognise (say
+  `#[cfg(all(feature = "x", test))]`), or a recognised one written over several lines (the
+  text strippers that remain read a line at a time), is refused, so the I14 class cannot come
+  back through a new spelling.
+- **`scripts/ast_gates.sh`**: a whole-tree rule (`files: [src/**/*.rs]`) expects one total and
+  refuses a collapsed walk; every `ignores:` entry must exist; and every rule must carry
+  `rule-tests/<id>-test.yml` with crafted code it must match and near-misses it must not (a
+  comment, a string, a test-gated item), run by `ast-grep test`. 14 rules, 79 cases.
+- **Shown red, before and after.** One planted file (never compiled) plus a `#[cfg(any())]`
+  item in blobs.rs: all eight new rules red, and every Rust twin red (the #620 one in the pyo3
+  lane). The I14 text gate missed the plant while it sat on one line: it skips every line that
+  starts with `fn ` as a declaration, so `fn a(b: B) { b.store_blob_local(x); }` is invisible to
+  it; the rule caught it, and the text gate caught the same call written over three lines.
+- **Hit sets diffed over the tree.** With their exclusions dropped, each rule's raw matches
+  were compared with a grep of the text gate's needle. Every grep-only hit is a comment, a doc
+  line, or a string literal inside the gate itself; the rules find no call the grep missed and
+  the grep finds no call the rules missed (I14: 57 call sites both ways).
+- Six mutations of the new checks were each red: a rule without its test file, a stale
+  `ignores:`, a per-file expectation on a whole-tree rule, a `valid:` case that fires, the
+  test-gated exclusion dropped from I14, and the util forgetting `all(test, …)`.
+
+### Fixed — the six text strippers that remain share one test-only-cfg predicate; one of them hid a test-only citation (#1026)
+
+Six from-disk gates still cut test code out by text before scanning (SQL anchors, manifest-driven
+symbol lists, relational body checks; docs/FROM_DISK_GATES.md lists them and why each stays text).
+Each spelled its own attribute test and most knew only `#[cfg(test)]`. They now share
+`crate::test_cfg::is_test_only_cfg` (I693), whose vocabulary is `utils/test-gated.yml`'s, and
+`rules/cfg-test-forms.yml` keeps every test-only cfg in the tree inside it.
+
+- `namespace/supersets.rs::every_cited_processor_has_a_non_test_caller` read the
+  `#[cfg(all(test, …))]` modules as production, so a call from one counted as a live caller: a
+  FALSE GREEN. Fixed, it names `admission.rs#resolve_withdraws_admission_rule`, cited by two
+  evidence rows (3.3.1, 4.1.1) and called only from test modules; production runs
+  `resolve_withdraws_admission_rule_at`. Ruled: evidence cites the function that runs. Both rows
+  (3.3.1 `CLM-nsproc-subject-key-ids-consent`, 4.1.1 `CLM-delegation-depth-default`) and the six
+  manifest citations of that path (`namespace_supersets.json`: the evidence export, the
+  field-processor matrix, three family placement rows) now name `_at`, which every production
+  door reaches: `put_attestation` on memory, sqlite and postgres through
+  `check_withdraws_admission` → `check_withdraws_admission_at`, and the bytes-plane tombstone
+  through `check_withdraws_admission_as_admitted`. The wrapper stays: CIRISServer imports it.
+  The gate is green.
+- `blob_surface_gates.rs`, `key_grant_invariants.rs`, `family_rules.rs`,
+  `sqlite_conn_model.rs` and pyo3.rs's GIL gate (which knew only the literal
+  `#[cfg(test)]\nmod `) found nothing new.
+- Reverting the predicate to `#[cfg(test)]` alone turns I693 red and the supersets gate back to
+  green.
+
+### Changed — 49 `#[serial]` markers off tests that own their database or touch none; every remaining key has a stated reason (#1003)
+
+The issue's runtime premise had already moved: under nextest every test is its own process, and
+`serial_test`'s lock is process-local, so the markers were inert there (#879 lifted the postgres
+test group to 16 for the cost the issue measured). They do hold under `cargo test`, where
+`test_pg::dsn()` hands every test in the one process the SAME database, so a marker can only come
+off a test that does not use that database.
+
+- **Removed (49):** 10 postgres tests that provision their own database (`isolated_dsn` /
+  `empty_dsn`), 29 memory-backend parity legs and 10 pure-function tests (blobs.rs chunk rows,
+  scope_bind placeholder rebasing, legacy-schema validation) that reach no database. Classified
+  by resolving each marked test's calls, transitively within its file, to `dsn()`,
+  `isolated_dsn()`, `empty_dsn()` or none; 637 markers reach `dsn()` and stay.
+- **Kept, by key, each with one line of reason** in `rules/serial-keys.yml`: `postgres` (the
+  per-process database under `cargo test`), `test_anchor_env`, `engine_singleton`,
+  `gil_teardown`, `runtime_teardown_gauge`, `env_ciris_data_dir`. The rule (src/ and tests/)
+  refuses a bare `#[serial]` or an unlisted key; its rule tests show both red.
+- **Measured.** The postgres lane under nextest (833 tests, the five postgres filters plus the 49):
+  168.7 s before; 167.1 / 169.1 / 166.2 s after, 833/833 passed each time, so no flake in three
+  runs and, as expected, no time change. The same 47 compiled tests under `cargo test
+  --test-threads=16`, interleaved A/A/B/B/B: 23.5 / 23.5 s with the markers, 4.9 / 4.5 / 5.0 s
+  without.
+
+### Fixed — the CIRISCache save pruned dependency fingerprints, so the test legs recompiled everything they restored (#1022)
+
+Measured, not inferred. The v54.0.0 PR run's telemetry leg spent 99 s restoring
+`…-phead-enone-v19.0.0` (the v20.1.0 key did not exist yet) and then compiled **436** crates,
+`proc-macro2` first; the tag run's core-1, the very leg that saves the blob, did the same. The
+blob is not release-only (the key's `-release-` is a cross-repo name token): the v20.1.0 blob
+that tag run published holds 10.5 GB of `target/debug/deps` beside 1 GB of `target/release`.
+
+The cause is the save's budget prune. core-1's target/ was 21.9 GB against `max-size-mb: 12288`,
+and `cc_prune_lru` deletes the OLDEST-mtime files. Cargo never touches a fresh unit, so the
+oldest files are the dependencies the run reused, and the newest are ciris-persist's own lib,
+test and bench binaries, which every commit rebuilds and no downstream build can use. The
+published blob kept 7.7 GB of those and lost dependency fingerprints.
+
+Reproduced in a container (ubuntu 24.04, rustc 1.97.0, the CI paths), restoring the published
+v20.1.0 blob over the v54.0.0 tree: a core-1 build compiled 27 crates, of which 8 had no
+fingerprint left, 17 sat behind those, plus pyo3 and persist. **Fix:** `scripts/ci_cache_trim.py`
+removes this crate's own outputs (target names from `cargo metadata`; deps, examples,
+uplifted copies, fingerprint, build and incremental dirs, cross-target dirs too) before each of
+the five saves. On that restored tree it removed 9.19 GiB and left 4.39 GiB, under every budget.
+A rebuild over the trimmed tree compiled 3 crates (pyo3-ffi, pyo3, persist) for core-1, and the
+same 3 for the telemetry leg's feature set. `scripts/ci_cache_trim_test.py` (fixture target/,
+runs in CI lint and certify's fast tier `cachetrim`) holds that it removes every own output and
+no dependency's, prefix-named crates included; three mutations of its matchers were each red.
+
+Still to see on GitHub: the first main or tag save after this lands, then a PR restoring it.
+pyo3-ffi reruns because its build script tracks `PATH`, which holds the runner's per-job temp
+directory; setting `PYO3_PYTHON` stops that (shown in the container) and is left for a later cut.
+
+### Changed — `evidence/cc_impl.tsv` is generated from the manifest's evidence export (#1052)
+
+The cc-conformance attestation signs `evidence/cc_impl.tsv`, and it was edited by hand: 131 of
+its 174 rows (4.1.1 `CLM-delegation-depth-default` among them) had no entry in
+`namespace_supersets.json`'s `evidence_export.CIRISPersist`, and nothing compared the two.
+
+- **A materialiser, not a cross-check** (#1052 option a): `scripts/evidence_tsv.py
+  write|check`. The version column is derived (src/ rows pin the Cargo.toml version; cross-repo
+  rows keep their entry's `crate`), and the one section note rides on the entry it precedes, so
+  the regenerated body is byte-identical to the hand-made one.
+- **The export now holds every row**, in tsv order: 131 back-filled (`manifest_round:
+  backfill-1052`), two post-cut renames recorded (`post_cut_rename_from`), four entries excluded
+  with a stated `tsv_excluded` reason (three cite a `src/safety/watchlist.rs` persist does not
+  have; one is a design note, not a pointer).
+- **Gates:** `scripts/evidence_tsv_test.py` (CI lint, certify fast gate `evidencetsv`) checks the
+  committed file against the generated one. It is red on a row only the tsv has, an entry only the
+  manifest has, a stale stamp, an exclusion without a reason, and a cross-repo row without a stamp.
+  Each direction was also shown red on the real tree. release.sh's bump re-stamps, then requires
+  `evidence_tsv.py check` before it commits; the release self-test runs that path on a fixture
+  (red before the re-stamp, green after) and is red if the check leaves the bump stage.
+- **Rows for three claims v54.0.0 shipped and published nothing under** (CC re-pin 15), added
+  through the export and the generator, each at its claim's own section and at the function
+  production runs:
+  - 4.1.1 `CLM-anti-pattern-delegation` and `CLM-self-edge-not-cycle`:
+    `admission.rs#check_delegation_cycle_admission`. Every backend's `put_attestation_with_origin`
+    and `check_promotion_admission` call it. The self-edge exemption and the trust-plane exclusion
+    are its first two clauses, so the self-edge claim also cites `admission.rs#is_trust_plane_edge`.
+    `delegation_cycle_invariants.rs` is the witness, not the gate.
+  - 4.4.3.2.8 `CLM-affiliation-config-record`: `affiliation_config.rs#check_community_record` (every
+    backend's `put_community_at_door`, and supersession through `group_amendment`) and
+    `#declared_cohort`.
+  - Not added: `CLM-licence-judged-at-issuance` and `CLM-licence-authority-quorum`. v54.0.0
+    judges a licence at receipt as well as at the signed `asserted_at` (the CC says never at
+    receipt; the signed-instant rule alone lands with #1049's window). It also roots a community
+    authority only under `founder_only`; any other protocol is refused (`authority_acts_by_quorum`)
+    because cosigned licensure rows are #1036's plane move.
 
 ### Changed — Verify 20.1.0 adopted: the three verify crates and the wheel floor move together (#992)
 
@@ -319,7 +559,7 @@ On v53.1.8, certify was green at about 18:40 and PR CI at 19:02, but the merge h
 - **Bump commit.** Cargo version, the `evidence/cc_impl.tsv` re-stamp (count asserted, so `@53.1.8` does not match `@53.1.80`), the CHANGELOG date, `cargo check --features sqlite`, and the evidence pin test. The subject is built from the section's `###` headings.
 - **PR CI wait.** A failed first attempt counts as final only once it has been re-run, once an `auto-retry` run that started after it has finished without re-running it, or after 15 min.
 - Every wait loop is bounded and prints its timeout. Each failure has its own exit code (20 to 29; 29 is certify's new INFRA exit 3: re-run, tree unjudged) and a one-line reason. There is no `--no-verify` and no `--amend`. `--dry-run` runs preflight and prints the plan without side effects.
-- `scripts/release_lib.sh` holds the shared functions (section cut, re-stamp, stage markers). `scripts/release_selftest.sh` tests them offline against a fixture CHANGELOG (41 checks). Mutation-checked: each of the following reds the self-test: an unbounded previous-version scan, a section that runs to EOF, a re-stamp without the version boundary, marking a failed stage, ignoring the recorded sha, and a `--no-verify` added to a release script.
+- `scripts/release_lib.sh` holds the shared functions (section cut, re-stamp, stage markers). `scripts/release_selftest.sh` tests them offline against a fixture CHANGELOG (112 checks at 53.2.0; 41 was the first draft's count). Mutation-checked: each of the following reds the self-test: an unbounded previous-version scan, a section that runs to EOF, a re-stamp without the version boundary, marking a failed stage, ignoring the recorded sha, and a `--no-verify` added to a release script.
 - `docs/RELEASE.md` documents the stages, the resume rule and what to do for each exit code.
 
 Codex review on PR #1039: six findings fixed before merge. The CHANGELOG cut passed regex text through `awk -v`, which gawk and busybox awk un-escape, so it returned an empty section with exit 0; it now matches headings as fixed strings, refuses an empty cut, and the self-test runs under every awk on the host (red under gawk 5.2.1 and busybox, green under mawk). The mutest matrix copied the whole-suite verdict, so a mutant only an out-of-scope test detected read `caught`; outcomes now come from the retained witnesses, with `caught_out_of_scope` and `crashed` for the rest. `scripts/prune_target.py` applied the 16-hex deps pattern to `incremental/`, whose names are base-36, so it reclaimed none of them; each directory now has its own pattern. The re-register plan took the newest tag run holding any wheel; it now takes the run covering the most needed wheels and rebuilds only what that run lacks (`scripts/reregister_plan.sh`). The repost guard compared only `binary_hash`; `scripts/snapshot_manifests.sh verify` now compares the whole canonical JSON of all three live reads to the committed snapshot. `scripts/release_finish.sh` hid a failed tag fetch with `|| true` and could publish a stale local annotation; it now reads origin's tag from its own ref and refuses a different local tag (exit 18) or a failed fetch (exit 19). Codex's second round found four more. `scripts/release_ship.sh` accepted a re-run's local tag at the right commit whatever its annotation said; the tag's message must now equal the CHANGELOG section byte for byte, else exit 11 and nothing is pushed. The repost guard verified only the re-signed targets while `register` rewrites all five, and the unchanged manifests could come from a tag-run artifact older than the live row; all five targets are now guarded, the unchanged manifests always come from the live registry, and `scripts/snapshot_manifests.sh verify-reuse` checks each fetched one against its snapshot. `release.sh` resumed `.release/<ver>` state on any clean branch, and its unkeyed bump marker skipped the version bump; the state now records its branch and release commit, and a resume that does not match them (or finds Cargo.toml or the dated header wrong) exits 32. The PR run's `build-manifest` job also went red: `bits_changed.sh` refused python-source-tree's unchanged hash because tag v53.2.0 does not exist before the tag push, so it now judges "unchanged" at HEAD when the version's tag is absent and names the ref it used. That run's history showed every PR run had been registering live registry rows from an unmerged head; register, the round-trip and check 5 now run on tag runs only. `observe::emit_metrics` described every counter with no unit, because the two-argument `describe_counter!` forwards none; it now passes each catalogued unit (`By` as bytes, `{row}`, `{read}` and `{call}` as a count), and I553 asserts the unit the recorder received.

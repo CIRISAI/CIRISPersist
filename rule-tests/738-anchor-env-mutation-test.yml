@@ -1,0 +1,19 @@
+id: 738-anchor-env-mutation
+valid:
+  - |
+    fn a() { std::env::set_var("OTHER_VAR", "1"); }
+  - |
+    fn a() { let _ = std::env::var("CIRIS_ENV"); }
+  - |
+    fn a() { // std::env::set_var("CIRIS_ENV", "x");
+    }
+invalid:
+  - |
+    fn a() { unsafe { std::env::set_var("CIRIS_TESTING_MODE", "true") }; }
+  - |
+    #[test]
+    fn t() { std::env::remove_var("CIRIS_TEST_TRUST_ROOT"); }
+  - |
+    fn a() { env::set_var(ENVIRONMENT, "production"); }
+  - |
+    fn a() { with_env!(std::env::set_var("CIRIS_ENV", "dev")); }

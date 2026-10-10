@@ -18,6 +18,14 @@
 //! - **I553** (v53.2.0, CIRISPersist#1027): what `emit_metrics` writes to a
 //!   `metrics` recorder carries exactly the catalogued names, label keys and
 //!   label values, at the counters' values — the `live-check` equivalent.
+//! - **I690** (v54.1.0, CIRISPersist#1037): the snapshot lists a `(backend,
+//!   door)` only once it has served a read; a fresh set lists none.
+//! - **I691** (v54.1.0, CIRISPersist#1037): re-entering a fold that is
+//!   already active keeps it active — every read inside the inner entry and
+//!   after it is credited to the fold exactly once.
+//! - **I692** (v54.1.0, CIRISPersist#1051): a read inside a fold returns
+//!   within a deadline, so a mutant that never clears the fold mask fails
+//!   this witness in seconds instead of hanging the run to a tool timeout.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -490,6 +498,114 @@ async fn i553_emit_metrics_writes_exactly_the_catalogue() {
         1,
         "I553 fold.calls{{fold=trust_root_valid}} is the one seeded entry"
     );
+}
+
+// ── I690–I692 ────────────────────────────────────────────────────────────
+
+/// One memory read at `door` with no rows: one read, 0 rows, 1 byte.
+fn one_read(door: Door) {
+    super::record_read::<crate::federation::Attestation>(
+        StoreBackend::Memory,
+        door,
+        "i69x",
+        &[],
+        1,
+    );
+}
+
+/// **I690** (#1037) — the snapshot's `reads` is exactly the doors that served
+/// a read. Every other witness checked the rows present; none checked that a
+/// never-read door is ABSENT, so `if n > 0` → `if n >= 0` (every pair listed,
+/// at zeros) survived the first matrix.
+#[test]
+fn i690_the_snapshot_lists_only_doors_that_were_read() {
+    let local = LocalCounters::install();
+    assert_eq!(
+        local.snapshot().reads,
+        Vec::<DoorReads>::new(),
+        "I690 a fresh counter set lists no door"
+    );
+    one_read(Door::GetAttestation);
+    assert_eq!(
+        local.snapshot().reads,
+        vec![DoorReads {
+            backend: StoreBackend::Memory.label(),
+            door: Door::GetAttestation.label(),
+            reads: 1,
+            rows: 0,
+            bytes: 1,
+        }],
+        "I690 one read lists exactly its (backend, door)"
+    );
+}
+
+/// **I691** (#1037) — `fold(X, fold(X, read))`: the inner entry must keep X
+/// active (its mask is the outer mask OR X's bit), and leaving it must leave
+/// X active for the rest of the outer entry. With `|` → `^` the inner entry
+/// TOGGLED X off and its read was credited to nothing.
+#[tokio::test(flavor = "current_thread")]
+async fn i691_reentering_an_active_fold_keeps_it_active() {
+    let local = LocalCounters::install();
+    let x = Fold::TrustRootValid;
+    let other = Fold::OwnerGrantedScope;
+    super::fold(x, async {
+        one_read(Door::GetAttestation);
+        super::fold(x, async {
+            one_read(Door::GetAttestation);
+            super::fold(other, async { one_read(Door::GetAttestation) }).await;
+        })
+        .await;
+        one_read(Door::GetAttestation);
+    })
+    .await;
+    let snap = local.snapshot();
+    assert_eq!(
+        snap.fold(x),
+        (2, 4, 0, 4),
+        "I691 {}: two entries, and all four reads credited once each (calls, reads, rows, bytes)",
+        x.label()
+    );
+    assert_eq!(
+        snap.fold(other),
+        (1, 1, 0, 1),
+        "I691 {}: only the read made inside it",
+        other.label()
+    );
+}
+
+/// **I692** (#1051) — `record_read` inside nested folds returns within 5 s.
+/// Its credit loop clears one mask bit per pass; the first matrix's three
+/// `record_read` mutants (`&=` → `|=`, `-` → `+`, `-` → `/`) never clear it,
+/// and every witness hung until cargo-mutants' 300 s timeout, credited to no
+/// witness. The read runs on its own thread (the counters are thread-local,
+/// so it installs its own set) and this thread waits with a deadline: a hang
+/// is this witness's red. A spinning thread is left behind on that red; the
+/// test process exits with it.
+#[test]
+fn i692_a_read_inside_folds_returns_within_a_deadline() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let local = LocalCounters::install();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        rt.block_on(super::fold(
+            Fold::ResolveServeTier,
+            super::fold(Fold::IsPublicGroup, async {
+                one_read(Door::ListAttestationsFor);
+            }),
+        ));
+        let snap = local.snapshot();
+        let _ = tx.send((
+            snap.fold(Fold::ResolveServeTier),
+            snap.fold(Fold::IsPublicGroup),
+        ));
+    });
+    let (outer, inner) = rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("I692 a read inside two folds did not return within 5 s");
+    assert_eq!(outer, (1, 1, 0, 1), "I692 the outer fold's credit");
+    assert_eq!(inner, (1, 1, 0, 1), "I692 the inner fold's credit");
 }
 
 // ── I549 ─────────────────────────────────────────────────────────────────

@@ -380,6 +380,76 @@ pub(crate) mod bodies {
         }
     }
 
+    /// **I548f (v54.1.0, CIRISPersist#1038) — a steward's grant that lapsed,
+    /// once the expiry sweep has recorded it, reads `Expired`.** The record
+    /// is the substrate's own `consent:state:expired` row: authored by a node,
+    /// not the steward, and naming no `for_key_id` (`consent_expiry.rs`). A
+    /// steward's universe keeps every row another author wrote; the first
+    /// matrix's one survivor in the gate (`||` → `&&` in that predicate, now
+    /// in `per_principal_stances`) kept another author's row only if it was a
+    /// composer or named the subject, which drops exactly this record, and
+    /// the stance read `Unspecified`. No I548 case had swept a steward's
+    /// grant. The gate refuses either way (neither stance is `Granted`): the
+    /// stance a scorer is told is what this pins.
+    pub async fn i548f_a_swept_stewards_grant_reads_expired(d: &dyn FederationDirectory, s: &str) {
+        use crate::federation::attestation_emit::emit_with_local_signer;
+        use crate::federation::consent_expiry::run_consent_expiry_sweep;
+        let p = parties(d, &format!("f-{s}")).await;
+        put(
+            d,
+            consent(
+                &format!("i548f-g-{s}"),
+                &p.steward,
+                &p.canonical,
+                "granted",
+                "analyze",
+                Some(&p.agent),
+                "2026-01-01T00:00:00Z",
+                Some("2026-01-02T00:00:00Z"),
+            ),
+        )
+        .await
+        .expect("I548f: the steward's (since lapsed) grant admits");
+        let alias = format!("i548f-node-{s}");
+        let node = ts::local_signer(&alias);
+        ts::register_hybrid_key_as(d, &node.derived_key_id(), &alias, NODE).await;
+        let report = run_consent_expiry_sweep(d, chrono::Utc::now(), |input| {
+            let node = node.clone();
+            async move {
+                emit_with_local_signer(d, &node, input)
+                    .await
+                    .map(|e| e.attestation_id)
+            }
+        })
+        .await
+        .expect("I548f: the sweep runs");
+        assert_eq!(
+            (report.lapsed, report.emitted),
+            (1, 1),
+            "I548f precondition: the sweep records the one lapsed grant: {report:?}"
+        );
+        let expired: Vec<Attestation> = d
+            .list_attestations_for(&p.canonical)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|a| a.attesting_key_id == node.derived_key_id())
+            .collect();
+        assert_eq!(expired.len(), 1, "I548f precondition: one substrate record");
+        assert_eq!(
+            cbh::for_key_id_of(&expired[0].attestation_envelope),
+            None,
+            "I548f precondition: the record names no for_key_id (the case the predicate keeps by author)"
+        );
+        let (gate, stance) = verdicts(d, &p, &format!("i548f-score-{s}")).await;
+        assert_eq!(
+            stance,
+            ConsentState::Expired,
+            "I548f: the steward's swept grant reads Expired (#1038)"
+        );
+        assert!(!gate, "I548f: an expired consent admits no score");
+    }
+
     /// **I548d — the refusal names the scope it asked.**
     pub async fn i548d_the_refusal_names_the_asked_scope(d: &dyn FederationDirectory, s: &str) {
         let p = parties(d, &format!("d-{s}")).await;
@@ -426,6 +496,11 @@ mod run {
                 async fn i548d() {
                     let Some(b) = $fresh.await else { return };
                     bodies::i548d_the_refusal_names_the_asked_scope(&b, &super::suffix()).await
+                }
+                #[tokio::test]
+                async fn i548f() {
+                    let Some(b) = $fresh.await else { return };
+                    bodies::i548f_a_swept_stewards_grant_reads_expired(&b, &super::suffix()).await
                 }
             }
         };

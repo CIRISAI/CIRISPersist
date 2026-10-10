@@ -782,7 +782,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial_test::serial(postgres)]
     async fn validate_legacy_schema_accepts_default() {
         assert_eq!(validate_legacy_schema("public").unwrap(), "public");
         assert_eq!(
@@ -793,7 +792,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial_test::serial(postgres)]
     async fn validate_legacy_schema_rejects_unsafe_input() {
         assert!(validate_legacy_schema("").is_err());
         assert!(validate_legacy_schema("Public").is_err()); // uppercase

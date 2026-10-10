@@ -1,0 +1,14 @@
+id: 620-sync-signing-verb
+valid:
+  - |
+    fn a() { obj.call_method1("local_sign_hybrid", (x,)); }
+  - |
+    fn a() { let s = "call_method(\"local_sign\")"; }
+invalid:
+  - |
+    fn a() { obj.call_method1("local_sign", (x,))?; }
+  - |
+    fn a() { obj
+        .call_method("local_pqc_sign", (x,), None)?; }
+  - |
+    fn a() { dbg!(obj.call_method0("local_sign")); }

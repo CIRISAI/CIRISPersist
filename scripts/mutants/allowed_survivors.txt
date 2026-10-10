@@ -1,0 +1,19 @@
+# Surviving mutants the nightly mutation job (.github/workflows/mutants.yml)
+# accepts, each with the issue that tracks killing it (CIRISPersist#1051).
+#
+# One per line:
+#
+#   <file>[:<line>] <the tool's mutation text> #<issue> [why]
+#
+# The mutation text is cargo-mutants' own, after `file:line:col: `, compared
+# exactly, e.g.
+#
+#   src/observe/mod.rs:249 replace > with >= in Counters::snapshot #1037
+#
+# With a line number the line must match too (an edit above it turns the run
+# red until the entry is moved: the safe direction). A survivor is `missed`,
+# `timeout` or `caught_out_of_scope`; any survivor not named here fails the
+# job, and so does a line here without a `#<issue>`.
+#
+# Empty since v54.1.0: the six survivors and three timeouts of the first
+# nightly run (#1037, #1038, #1051) are killed by witnesses or left the scope.

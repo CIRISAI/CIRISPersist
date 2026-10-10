@@ -8467,6 +8467,11 @@ async fn enumerate_scoped_delegation_reach(
 ///
 /// `target_id` is the `withdraws` envelope's `references_attestation_id`
 /// (the attestation `T` being withdrawn).
+///
+/// v54.1.0 (CIRISPersist#1026) — no production path in persist calls this
+/// wrapper: every door reaches [`resolve_withdraws_admission_rule_at`] through
+/// [`check_withdraws_admission_at`], and the evidence rows cite that. It stays
+/// as public API (CIRISServer's `capacity_self_revocation_pin` test imports it).
 pub async fn resolve_withdraws_admission_rule(
     directory: &dyn super::FederationDirectory,
     issuer: &str,

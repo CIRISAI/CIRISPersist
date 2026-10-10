@@ -736,7 +736,9 @@ mod gate {
     fn production_text(text: &str) -> String {
         let mut out = String::with_capacity(text.len());
         for line in text.lines() {
-            if line.starts_with("#[cfg(test)]") {
+            // v54.1.0 (#1026): `#[cfg(all(test, …))]` at column 0 starts
+            // the test half as well.
+            if !line.starts_with(char::is_whitespace) && crate::test_cfg::is_test_only_cfg(line) {
                 break;
             }
             out.push_str(line);

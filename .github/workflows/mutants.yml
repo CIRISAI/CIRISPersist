@@ -2,7 +2,7 @@ name: mutants and powerset
 
 on:
   schedule:
-    - cron: '17 6 * * *'      # nightly: mutants on scope-consent
+    - cron: '17 6 * * *'      # nightly: the consent gate and the counters
     - cron: '43 6 * * 0'      # Sunday: also scope-observe-sites and the powerset
   workflow_dispatch:
 
@@ -17,14 +17,28 @@ env:
   # No RUSTFLAGS: -D warnings here would make most mutants unviable.
 
 jobs:
+  # v54.1.0 (CIRISPersist#1051) — the first scheduled run (650024b1) was GREEN
+  # with the budget hit (rc 124, 8 of 85 mutants untested) and 6 survivors no
+  # one saw. Now every leg is a gate: scripts/mutants.sh refuses a scope that
+  # does not fit its budget before building (exit 3), fails an INCOMPLETE run
+  # (4) and any surviving mutant not in scripts/mutants/allowed_survivors.txt
+  # (5), and writes the verdict to the step summary with annotations.
+  #
+  # Sizing: 600 s + 120 s per mutant (measured on that run: baseline 305 s,
+  # p90 105 s per mutant). scope-observe's 71 mutants need 9120 s, so it runs
+  # as two shards; scope-consent-gate's 19 need 2880 s.
   mutants:
-    name: mutants (${{ matrix.scope }})
+    name: mutants (${{ matrix.scope }}${{ matrix.shard && format(' {0}', matrix.shard) || '' }})
     runs-on: ubuntu-latest
-    timeout-minutes: 300
+    timeout-minutes: 150
     strategy:
       fail-fast: false
       matrix:
-        scope: [scope-consent, scope-observe-sites]
+        include:
+          - {scope: scope-consent-gate, shard: '', id: consent-gate, weekly: false}
+          - {scope: scope-observe, shard: '0/2', id: observe-0-of-2, weekly: false}
+          - {scope: scope-observe, shard: '1/2', id: observe-1-of-2, weekly: false}
+          - {scope: scope-observe-sites, shard: '', id: observe-sites, weekly: true}
     services:
       postgres:
         image: ghcr.io/cirisai/postgres:16
@@ -43,10 +57,13 @@ jobs:
           --health-timeout 5s
           --health-retries 10
     steps:
-      - name: skip observe-sites except on the weekly run
+      - name: skip the weekly scopes except on the weekly run
         id: gate
+        env:
+          WEEKLY: ${{ matrix.weekly }}
+          SCHEDULE: ${{ github.event.schedule }}
         run: |
-          if [ "${{ matrix.scope }}" = scope-observe-sites ] && [ "${{ github.event.schedule }}" = '17 6 * * *' ]; then
+          if [ "$WEEKLY" = true ] && [ "$SCHEDULE" = '17 6 * * *' ]; then
             echo run=false >> "$GITHUB_OUTPUT"; else echo run=true >> "$GITHUB_OUTPUT"; fi
       - uses: actions/checkout@v6
         if: steps.gate.outputs.run == 'true'
@@ -63,18 +80,25 @@ jobs:
       - name: psql client for pg_test_db.sh
         if: steps.gate.outputs.run == 'true'
         run: command -v psql || (sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-client)
-      - name: mutation matrix (report-only)
+      # The matrix scripts' own witnesses (fixture outputs, no cargo), before
+      # two hours of mutants are read by them (CIRISPersist#1045 item 4).
+      - name: mutants_matrix self-test
+        if: steps.gate.outputs.run == 'true'
+        run: python3 scripts/mutants_matrix_test.py
+      - name: mutation matrix and verdict
         if: steps.gate.outputs.run == 'true'
         env:
           CIRIS_PERSIST_PG_ADMIN_URL: postgres://ciris:ciris@localhost:5432/ciris_persist_test
-          MUTANTS_BUDGET_SECS: ${{ matrix.scope == 'scope-consent' && '7200' || '14400' }}
+          MUTANTS_BUDGET_SECS: '7200'
           MUTANTS_JOBS: '1'
-        run: scripts/mutants.sh cargo-mutants scripts/mutants/${{ matrix.scope }}.txt
+          MUTANTS_SHARD: ${{ matrix.shard }}
+          SCOPE: scripts/mutants/${{ matrix.scope }}.txt
+        run: scripts/mutants.sh cargo-mutants "$SCOPE"
       - uses: actions/upload-artifact@v7
         if: always() && steps.gate.outputs.run == 'true'
         with:
-          name: mutants-${{ matrix.scope }}
-          path: target/certify-logs/mutants/${{ matrix.scope }}/
+          name: mutants-${{ matrix.id }}
+          path: target/certify-logs/mutants/
           retention-days: 30
 
   powerset:

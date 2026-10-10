@@ -8,10 +8,48 @@ hand selection.
 
     scripts/mutants.sh <cargo-mutants|mutest> <scope-file>
 
-writes `target/certify-logs/mutants/<scope>/matrix.{json,md}` and
-`unvalidated.txt`. It is **report-only**: exit 0 whenever a matrix is written,
-however many mutants survive. Non-zero only when no matrix can be produced
-(tool missing, red baseline, broken build, unresolvable scope).
+writes `target/certify-logs/mutants/<scope>/matrix.{json,md}`,
+`unvalidated.txt` and `verdict.txt`.
+
+## The gate (v54.1.0, CIRISPersist#1051)
+
+Until v54.1.0 the run was report-only. The first scheduled run (650024b1,
+2026-10-09) hit its 2-hour budget with 8 of 85 mutants untested, had 6
+survivors, and its job was **green**. Its `unvalidated.txt` said "0 witnesses
+ran", because `CARGO_TERM_COLOR=always` coloured nextest's status lines and
+the matrix reader matched none of them. Now:
+
+| exit | meaning |
+|---:|---|
+| 0 | complete, and every surviving mutant is allow-listed with an issue |
+| 1 | no matrix (tool missing, red baseline, broken build, or a green baseline whose log yields no status line) |
+| 2 | usage, an unresolvable scope, or a malformed allow-list |
+| 3 | refused before building: the scope does not fit the budget at `MUTANTS_BASELINE_SECS + N × MUTANTS_SECS_PER_MUTANT` (600 + 120 s; measured on that run: baseline 305 s, p90 105 s per mutant) |
+| 4 | INCOMPLETE: the budget expired or a mutant was never tested |
+| 5 | a surviving mutant (`missed`, `timeout`, `caught_out_of_scope`) not in `scripts/mutants/allowed_survivors.txt`; or a mutant cargo-mutants ran that the matrix filed out of scope ("scope disagreement": it was tested and judged nowhere) |
+
+`scripts/mutants_matrix.py verdict` writes the same verdict to
+`$GITHUB_STEP_SUMMARY` and as annotations (`::error` for an unlisted survivor
+or an incomplete run, `::warning` for an allowed one). An allow-list entry is
+`<file>[:<line>] <cargo-mutants' mutation text> #<issue>`: the text is the
+tool's own, compared exactly, and a line without an issue number is refused.
+
+**Selection is by line, through `--in-diff`.** cargo-mutants 27.1 applies
+neither `-F` nor `-E` to its struct-field deletions, so a function-name regex
+let `delete field as_of` in four functions outside the scope, and two field
+deletions in `#[cfg(all(test, ..))] mod r2_test_support`, into every run.
+`resolve` now writes the scope as a diff that adds exactly its lines, minus
+every test-only item (`#[cfg(test)]`, `#[cfg(all(test, ..))]`, a `mod
+*test_support*`), and passes `--in-diff`. The matrix keeps a mutant whose
+span touches a scope line, as `--in-diff` does; by first line alone,
+`counters()`'s whole-body replacement (it starts on a `#[cfg(test)]`
+statement) was tested and then dropped unjudged.
+
+**A hung witness fails in 60 s.** The run uses nextest's `mutants` profile
+(`.config/nextest.toml`): a witness that hangs under a mutant is killed after
+three 20 s periods and reads as its FAIL, instead of a 300 s tool timeout
+credited to no witness (`record_read`'s three loop mutants cost 1049 s of the
+first run). I692 additionally bounds the fold-mask loop in a 5 s deadline.
 
 ## Verdict: cargo-mutants
 
@@ -242,15 +280,19 @@ To add one:
 2. Write the `tests:` filter as the witnesses that guard those sites. The
    whole-crate suite is not a sensible default: every mutant runs it.
 3. Check it resolves without running anything:
-   `python3 scripts/mutants_matrix.py resolve cargo-mutants <scope>`.
+   `python3 scripts/mutants_matrix.py resolve cargo-mutants <scope> /tmp/scope.diff`,
+   then `cargo mutants --list` with the printed arguments.
 4. Run it: `MUTANTS_BUDGET_SECS=7200 scripts/mutants.sh cargo-mutants <scope>`.
+   If it exits 3, shard it.
 
-Three scopes exist:
+Three scopes exist (v54.1.0; `scope-consent.txt` held the first two
+together and did not fit its budget):
 
-- `scope-consent.txt`: the consent gates and the counters.
-- `scope-consent-gate.txt`: the two consent files only, against the I548
-  witnesses. It exists so the gate can be measured in about 11 minutes
-  without the 61 `observe/` mutants.
+- `scope-consent-gate.txt`: the consent gate, against the I548 and I570
+  witnesses. 19 mutants. v54.0.0 had moved the gate's universe predicate into
+  `per_principal_stances`, which the scope did not name: it is named now.
+- `scope-observe.txt`: `src/observe/`, against I549–I553 and I690–I692.
+  71 mutants, run as two shards (`MUTANTS_SHARD=0/2`, `1/2`).
 - `scope-observe-sites.txt`: the call sites in the 3k–28k-line backend and
   federation files that feed the counters. The issue's other starting modules
 (the `trust_root.rs` walks beyond `trust_root_valid`) are not yet scoped.
@@ -293,13 +335,13 @@ Across the runs above:
 
 ## Cadence
 
-- **Never per-PR.** `scope-consent` is about 70 minutes serially;
-  `scope-consent-gate` 11.
-- **Nightly**: `scope-consent` with cargo-mutants, `MUTANTS_JOBS=1`, a 2-hour
-  budget, alone on the runner. The artefact is the matrix; a diff in `kills_per_test` from the last
-  night is what someone reads.
-- **Weekly**: `scope-observe-sites`, whose mutant count is not yet measured,
-  with a 4-hour budget.
+- **Never per-PR.** The matrix scripts' own witnesses
+  (`scripts/mutants_matrix_test.py`, fixtures, no cargo) run per-PR in
+  `ci.yml` and in certify's fast tier (`mutmatrix`).
+- **Nightly** (v54.1.0): `scope-consent-gate`, and `scope-observe` as two
+  shards, each its own job with `MUTANTS_JOBS=1` and a 2-hour budget. Each is
+  a gate (exit codes above).
+- **Weekly**: `scope-observe-sites` (12 mutants), also a gate.
 - Locally: `certify.sh mutants <scope>` once wired (see
   `docs/CI_WIRING_53_2_0.md`), never alongside another cargo in the same tree,
   and never next to `scripts/powerset.sh check`: that rewrites `Cargo.toml`
@@ -314,6 +356,16 @@ Across the runs above:
 | `MUTANTS_FEATURES` | `postgres,sqlite,server` | for mutest set `sqlite,server` (postgres ICE) |
 | `MUTANTS_JOBS` | 1 | cargo-mutants `-j`; each job is a full crate build |
 | `CARGO_BUILD_JOBS` | 3 | per-build parallelism |
+| `MUTANTS_SHARD` | none | `k/n`, 0-based: cargo-mutants' `--shard`; output `<scope>-shard-<k>-of-<n>` |
+| `MUTANTS_ALLOW` | `scripts/mutants/allowed_survivors.txt` | the allow-list |
+| `MUTANTS_BASELINE_SECS`, `MUTANTS_SECS_PER_MUTANT` | 600, 120 | the sizing model for exit 3 |
+
+**mutest-rs is not wired into the nightly job** (#1051 asked). The verdict
+above still stands: on CI it would need the pinned nightly toolchain and a
+from-git build of mutest (no release binary), it cannot build with `postgres`
+(the `mutest-emit` ICE), it profiles the whole 3351-test lib suite (28 min)
+per run, and it reaches 1 of the scope's async witnesses. A nightly job
+would run about 30 minutes to measure one synchronous test.
 
 With `postgres` on, the run goes through `scripts/pg_test_db.sh`, so a
 postgres witness gets a fresh database. Without one it returns before its

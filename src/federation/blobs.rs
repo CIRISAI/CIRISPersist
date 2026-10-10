@@ -6285,7 +6285,6 @@ mod tests {
 
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     #[test]
-    #[serial_test::serial(postgres)]
     fn chunk_manifest_round_trips_through_bytes() {
         let c0 = sha_of(b"a");
         let c1 = sha_of(b"bb");
@@ -6348,7 +6347,6 @@ mod tests {
 
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     #[test]
-    #[serial_test::serial(postgres)]
     fn prepare_chunk_rows_rejects_sha_mismatch() {
         // Manifest claims a chunk sha that the inline bytes don't hash to.
         let real = sha_of(b"real");
@@ -6375,7 +6373,6 @@ mod tests {
 
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     #[test]
-    #[serial_test::serial(postgres)]
     fn prepare_chunk_rows_rejects_total_size_mismatch() {
         let c = sha_of(b"abcd");
         let manifest = ChunkManifest {
@@ -6397,7 +6394,6 @@ mod tests {
 
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     #[test]
-    #[serial_test::serial(postgres)]
     fn prepare_chunk_rows_manifest_row_is_last_and_chunk_dag() {
         let c = sha_of(b"xyz");
         let manifest = ChunkManifest {
@@ -6426,7 +6422,6 @@ mod tests {
 
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     #[test]
-    #[serial_test::serial(postgres)]
     fn body_storage_kind_strings() {
         assert_eq!(BlobBody::Inline(vec![1, 2, 3]).storage_kind(), "inline");
         assert_eq!(
@@ -6468,7 +6463,6 @@ mod tests {
 
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     #[test]
-    #[serial_test::serial(postgres)]
     fn verify_inline_hash_round_trip() {
         use sha2::Digest;
         let bytes = b"hello world";

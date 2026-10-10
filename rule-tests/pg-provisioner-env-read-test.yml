@@ -1,0 +1,15 @@
+id: pg-provisioner-env-read
+valid:
+  - |
+    fn a() { let d = crate::test_pg::dsn(); }
+  - |
+    fn a() { let s = "std::env::var(\"CIRIS_PERSIST_TEST_PG_URL\")"; }
+  - |
+    fn a() { line.contains("CIRIS_PERSIST_TEST_PG_URL") && line.contains("env::var") }
+invalid:
+  - |
+    fn a() { let d = std::env::var("CIRIS_PERSIST_TEST_PG_URL").unwrap(); }
+  - |
+    fn a() { let d = env::var_os("CIRIS_PERSIST_TEST_PG_URL"); }
+  - |
+    fn a() { println!("{:?}", std::env::var("CIRIS_PERSIST_TEST_PG_URL")); }

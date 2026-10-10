@@ -1,0 +1,33 @@
+# I14 (blob_surface_gates.rs::i14_the_storage_floor_has_no_door): no production
+# caller of the storage floor outside the three cascades. A commons door may
+# reach it only by naming a commons cohort scope literally in the call. blobs.rs
+# (the trait's own wrappers) is rule i14-storage-floor-blobs. Expected 0.
+id: i14-storage-floor
+language: rust
+severity: hint
+message: "a production call of the storage floor outside the cascades"
+rule:
+  any:
+    - kind: call_expression
+      has:
+        field: function
+        regex: '(\.|::)\s*(store_blob_local|put_blob_with_scope|put_blob_signing_at|put_blob_chunk_with_scope|seal_stream_with_scope)$'
+      not:
+        has:
+          field: arguments
+          stopBy: end
+          regex: '(^|::)cohort_scope::(FEDERATION|SPECIES|BIOSPHERE)$'
+    # A call inside a macro's token tree (`tokio::join!(b.store_blob_local(…))`)
+    # is tokens, not a call_expression.
+    - kind: identifier
+      regex: '^(store_blob_local|put_blob_with_scope|put_blob_signing_at|put_blob_chunk_with_scope|seal_stream_with_scope)$'
+      inside: {kind: token_tree, stopBy: end}
+      follows: {regex: '^(\.|::)$'}
+  not: {inside: {stopBy: end, matches: test-gated}}
+files:
+  - src/**/*.rs
+ignores:
+  - src/federation/at_rest_cascade.rs
+  - src/federation/community_dek.rs
+  - src/federation/chunk_dag_cascade.rs
+  - src/federation/blobs.rs

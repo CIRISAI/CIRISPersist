@@ -1,0 +1,23 @@
+# #564 (load_bearing.rs::nothing_yields_anti_entropy_satisfied_today): nothing
+# under src/, test code included, names `AntiEntropy::Satisfied` (or
+# `Self::Satisfied`) except to READ it in `matches!`. Over-reporting is the safe
+# direction: a match arm on the variant is a hit too, as in the text gate.
+# Expected 0.
+id: 564-anti-entropy-satisfied
+language: rust
+severity: hint
+message: "AntiEntropy::Satisfied is named outside matches!"
+rule:
+  any:
+    - any: [{kind: scoped_identifier}, {kind: scoped_type_identifier}]
+      regex: '^(AntiEntropy|Self|(\w+::)*AntiEntropy)::Satisfied$'
+    - kind: identifier
+      regex: '^Satisfied$'
+      inside: {kind: token_tree, stopBy: end}
+      follows: {regex: '^::$', follows: {regex: '^(AntiEntropy|Self)$'}}
+  not:
+    any:
+      - inside: {stopBy: end, kind: macro_invocation, has: {field: macro, regex: '^matches$'}}
+      - inside: {stopBy: end, kind: token_tree, follows: {regex: '^!$', follows: {regex: '^matches$'}}}
+files:
+  - src/**/*.rs

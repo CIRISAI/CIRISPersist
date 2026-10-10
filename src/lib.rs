@@ -141,6 +141,10 @@ pub mod witness;
 // ast-grep equal rules/expected.json, the counts scripts/ast_gates.sh asserts.
 #[cfg(test)]
 mod ast_gate_parity;
+// v54.1.0 (CIRISPersist#1026) — the one test-only-cfg predicate the remaining
+// text strippers share (I693).
+#[cfg(test)]
+mod test_cfg;
 // v54.0.0 (CIRISPersist#1017) — I578: the public async doors stay under
 // clippy::large_futures' 16 KiB threshold.
 mod future_size_gate;

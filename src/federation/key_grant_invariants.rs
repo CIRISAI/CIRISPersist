@@ -2748,7 +2748,8 @@ mod tests {
         let mut depth = 0i32;
         let mut in_tests = false;
         for line in text.lines() {
-            if !in_tests && line.trim_start().starts_with("#[cfg(test)]") {
+            // v54.1.0 (#1026): `#[cfg(all(test, …))]` is test-only too.
+            if !in_tests && crate::test_cfg::is_test_only_cfg(line) {
                 in_tests = true;
                 depth = 0;
                 continue;

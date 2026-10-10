@@ -1,0 +1,21 @@
+# store/postgres.rs::every_postgres_test_goes_through_the_provisioner: nothing
+# under src/ but src/test_pg.rs reads CIRIS_PERSIST_TEST_PG_URL from the
+# environment; a direct read gets the SHARED database. Expected 0.
+id: pg-provisioner-env-read
+language: rust
+severity: hint
+message: "a direct read of CIRIS_PERSIST_TEST_PG_URL"
+rule:
+  any:
+    - kind: call_expression
+      all:
+        - has: {field: function, regex: '(^|::)env::var\w*$'}
+        - has: {field: arguments, stopBy: end, kind: string_content, regex: '^CIRIS_PERSIST_TEST_PG_URL$'}
+    - kind: token_tree
+      all:
+        - has: {kind: identifier, regex: '^var\w*$', stopBy: end}
+        - has: {kind: string_content, regex: '^CIRIS_PERSIST_TEST_PG_URL$', stopBy: end}
+files:
+  - src/**/*.rs
+ignores:
+  - src/test_pg.rs

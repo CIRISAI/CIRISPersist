@@ -1,0 +1,29 @@
+[32;1m    Starting[0m [1m22[0m tests across [1m1[0m binary ([1m4229[0m tests [33;1mskipped[0m)
+[32;1m        PASS[0m [   0.018s] ( 1/22) [35;1mciris-persist[0m [36mfederation::capacity_consent_invariants::run[0m[36m::[0m[34;1mi548e_one_fold_every_door[0m
+[32;1m        PASS[0m [   0.522s] ( 2/22) [35;1mciris-persist[0m [36mfederation::capacity_consent_invariants::run::memory[0m[36m::[0m[34;1mi548d[0m
+[32;1m        PASS[0m [   0.647s] ( 3/22) [35;1mciris-persist[0m [36mfederation::capacity_consent_invariants::run::memory[0m[36m::[0m[34;1mi548a[0m
+[32;1m        PASS[0m [   1.132s] ( 4/22) [35;1mciris-persist[0m [36mfederation::capacity_consent_invariants::run::memory[0m[36m::[0m[34;1mi548b[0m
+[32;1m        PASS[0m [   3.692s] ( 5/22) [35;1mciris-persist[0m [36mfederation::capacity_consent_invariants::run::memory[0m[36m::[0m[34;1mi548c[0m
+[32;1m        PASS[0m [   3.417s] ( 6/22) [35;1mciris-persist[0m [36mfederation::capacity_consent_invariants::run::postgres[0m[36m::[0m[34;1mi548a[0m
+[32;1m        PASS[0m [   4.163s] ( 7/22) [35;1mciris-persist[0m [36mfederation::capacity_consent_invariants::run::postgres[0m[36m::[0m[34;1mi548b[0m
+[32;1m        PASS[0m [   1.119s] ( 8/22) [35;1mciris-persist[0m [36mfederation::capacity_consent_invariants::run::sqlite[0m[36m::[0m[34;1mi548a[0m
+[32;1m        PASS[0m [   1.614s] ( 9/22) [35;1mciris-persist[0m [36mfederation::capacity_consent_invariants::run::sqlite[0m[36m::[0m[34;1mi548b[0m
+[32;1m        PASS[0m [   3.432s] (10/22) [35;1mciris-persist[0m [36mfederation::capacity_consent_invariants::run::postgres[0m[36m::[0m[34;1mi548d[0m
+[32;1m        PASS[0m [   1.403s] (11/22) [35;1mciris-persist[0m [36mfederation::capacity_consent_invariants::run::sqlite[0m[36m::[0m[34;1mi548d[0m
+[32;1m        PASS[0m [   0.953s] (12/22) [35;1mciris-persist[0m [36mobserve::tests[0m[36m::[0m[34;1mi551_each_backend_records_under_its_own_label[0m
+[32;1m        PASS[0m [   0.011s] (13/22) [35;1mciris-persist[0m [36mobserve::tests[0m[36m::[0m[34;1mi551_samples_carry_exactly_the_catalogued_names_and_labels[0m
+[32;1m        PASS[0m [   0.010s] (14/22) [35;1mciris-persist[0m [36mobserve::tests[0m[36m::[0m[34;1mi551_strip_comments_strips_both_shapes[0m
+[32;1m        PASS[0m [   0.916s] (15/22) [35;1mciris-persist[0m [36mobserve::tests[0m[36m::[0m[34;1mi551_every_emitted_label_is_catalogued_and_every_catalogued_one_emitted[0m
+[32;1m        PASS[0m [   8.143s] (16/22) [35;1mciris-persist[0m [36mfederation::capacity_consent_invariants::run::postgres[0m[36m::[0m[34;1mi548c[0m
+[32;1m        PASS[0m [   4.756s] (17/22) [35;1mciris-persist[0m [36mfederation::capacity_consent_invariants::run::sqlite[0m[36m::[0m[34;1mi548c[0m
+[31;1m        FAIL[0m [   1.833s] (18/22) [35;1mciris-persist[0m [36mobserve::tests::memory[0m[36m::[0m[34;1mi549[0m
+[31;1m        FAIL[0m [   0.592s] (19/22) [35;1mciris-persist[0m [36mobserve::tests::sqlite[0m[36m::[0m[34;1mi550[0m
+[31;1m        FAIL[0m [   2.404s] (20/22) [35;1mciris-persist[0m [36mobserve::tests::postgres[0m[36m::[0m[34;1mi550[0m
+[31;1m        FAIL[0m [   2.334s] (21/22) [35;1mciris-persist[0m [36mobserve::tests::sqlite[0m[36m::[0m[34;1mi549[0m
+[31;1m        FAIL[0m [   4.723s] (22/22) [35;1mciris-persist[0m [36mobserve::tests::postgres[0m[36m::[0m[34;1mi549[0m
+[31;1m     Summary[0m [  13.474s] [1m22[0m tests run: [1m17[0m [32;1mpassed[0m, [1m5[0m [31;1mfailed[0m, [1m4229[0m [33;1mskipped[0m
+[31;1m        FAIL[0m [   1.833s] (18/22) [35;1mciris-persist[0m [36mobserve::tests::memory[0m[36m::[0m[34;1mi549[0m
+[31;1m        FAIL[0m [   0.592s] (19/22) [35;1mciris-persist[0m [36mobserve::tests::sqlite[0m[36m::[0m[34;1mi550[0m
+[31;1m        FAIL[0m [   2.404s] (20/22) [35;1mciris-persist[0m [36mobserve::tests::postgres[0m[36m::[0m[34;1mi550[0m
+[31;1m        FAIL[0m [   2.334s] (21/22) [35;1mciris-persist[0m [36mobserve::tests::sqlite[0m[36m::[0m[34;1mi549[0m
+[31;1m        FAIL[0m [   4.723s] (22/22) [35;1mciris-persist[0m [36mobserve::tests::postgres[0m[36m::[0m[34;1mi549[0m

@@ -1,0 +1,20 @@
+# A node that exists only in a test build (CIRISPersist#1026): it follows,
+# past any other attributes and comments, `#[cfg(test)]`, `#[cfg(all(test, …))]`,
+# `#[test]` or `#[tokio::test…]`. Used as `not: {inside: {stopBy: end, matches:
+# test-gated}}`, so a call inside such an item, at any depth, is not production.
+# The I14 lesson (v54.0.0): a text stripper that knew `#[cfg(test)]` read a
+# `#[cfg(all(test, …))]` module as production. Here the attribute is a node,
+# and the item it gates is its next sibling; nothing is cut by brace counting.
+# `any(test, …)` and `not(test)` hold in production builds: not test-gated.
+# A file declared `#[cfg(test)] mod x;` elsewhere carries no attribute of its
+# own and is NOT excluded: a hit there is a false red, the safe direction, as
+# in the text gates this replaces.
+id: test-gated
+language: rust
+rule:
+  follows:
+    stopBy:
+      not:
+        any: [{kind: attribute_item}, {kind: line_comment}, {kind: block_comment}]
+    kind: attribute_item
+    regex: '^#\[\s*(cfg\s*\(\s*(test|all\s*\(\s*test\s*,[\s\S]*)\s*\)|test|tokio::test[\s\S]*)\s*\]$'

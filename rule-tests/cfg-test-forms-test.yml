@@ -1,0 +1,39 @@
+id: cfg-test-forms
+valid:
+  - |
+    #[cfg(test)]
+    mod t {}
+  - |
+    #[cfg(all(test, feature = "sqlite"))]
+    mod t {}
+  - |
+    #[cfg(any(test, feature = "test-anchor"))]
+    mod t {}
+  - |
+    #[cfg(not(test))]
+    fn a() {}
+  - |
+    #[cfg(feature = "test-anchor")]
+    fn a() {}
+  - |
+    #[cfg(all(
+        any(test, feature = "test-anchor"),
+        any(feature = "postgres", feature = "sqlite")
+    ))]
+    mod t {}
+invalid:
+  - |
+    #[cfg(all(
+        test,
+        feature = "sqlite"
+    ))]
+    mod t {}
+  - |
+    #[cfg(all(feature = "x", test))]
+    mod t {}
+  - |
+    #[cfg(all(any(feature = "a", feature = "b"), test))]
+    fn a() {}
+  - |
+    #[cfg(any(feature = "x", test))]
+    fn a() {}

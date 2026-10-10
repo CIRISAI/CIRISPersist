@@ -31024,7 +31024,6 @@ mod tests {
     /// v31.0.0 (CIRISPersist#659) — a licence grant takes a strict majority,
     /// and the M is signed. On postgres.
     #[tokio::test]
-    #[serial_test::serial(postgres)]
     async fn partner_threshold_floor_postgres_659() {
         let Some(dsn) = pg_isolated_dsn() else {
             eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
@@ -31042,7 +31041,6 @@ mod tests {
     /// v31.0.0 (CIRISPersist#659) — the co-scrub binds its SUBJECT, at the
     /// real `put_public_key` chokepoint, on postgres.
     #[tokio::test]
-    #[serial_test::serial(postgres)]
     async fn coscrub_subject_binding_postgres_659() {
         let Some(dsn) = pg_isolated_dsn() else {
             eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
@@ -31215,7 +31213,6 @@ mod tests {
     /// #644-c — an inflated `PartnerRecord::revision` is REFUSED and a
     /// legitimate later revision still admits, on postgres.
     #[tokio::test]
-    #[serial_test::serial(postgres)]
     async fn revision_inflation_refused_postgres_644() {
         let Some(dsn) = pg_isolated_dsn() else {
             eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
@@ -31233,7 +31230,6 @@ mod tests {
     /// #658 — one signed operational envelope may not be installed at a
     /// second primary key, on postgres.
     #[tokio::test]
-    #[serial_test::serial(postgres)]
     async fn operational_id_replay_refused_postgres_658() {
         let Some(dsn) = pg_isolated_dsn() else {
             eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
@@ -50149,7 +50145,6 @@ mod tests {
     /// (revoked > active), revision-decrease rejected at admission,
     /// insufficient quorum + unsorted set-semantics rejected, bulk since.
     #[tokio::test]
-    #[serial_test::serial(postgres)]
     async fn pg_operational_partner_record_quorum_and_monotonic() {
         use crate::federation::operational::test_support as op;
         use crate::federation::FederationDirectory;
@@ -50290,7 +50285,6 @@ mod tests {
     /// M-of-N steward signatures + threshold survive and the federated-parts
     /// hash converges sender↔receiver (vs the empty-sig reconstruction).
     #[tokio::test]
-    #[serial_test::serial(postgres)]
     async fn pg_operational_list_signed_partner_records_converges() {
         use crate::federation::operational::test_support as op;
         use crate::federation::FederationDirectory;
@@ -52600,7 +52594,6 @@ mod tests {
     /// `verify_canonical_supersede`'s own canonical check — proving control
     /// reached the supersede policy and the role gates never ran here.
     #[tokio::test]
-    #[serial_test::serial(postgres)]
     async fn canonical_supersede_role_gate_parity_postgres_656() {
         let Some(dsn) = pg_isolated_dsn() else {
             eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
@@ -52635,7 +52628,6 @@ mod tests {
     /// rewrites a history row between them, which no shared template can
     /// serve.
     #[tokio::test]
-    #[serial_test::serial(postgres)]
     async fn i44_a_node_that_recorded_the_bricked_v070_checksum_boots_postgres() {
         use crate::store::migration_immutability as mi;
         let Some(dsn) = crate::test_pg::empty_dsn() else {
@@ -52684,7 +52676,6 @@ mod tests {
     /// #840 — on postgres too, a divergence that is not #840's still refuses
     /// to boot. The repair is not a general escape hatch.
     #[tokio::test]
-    #[serial_test::serial(postgres)]
     async fn a_divergence_that_is_not_840_still_refuses_to_boot_postgres() {
         let Some(dsn) = crate::test_pg::empty_dsn() else {
             eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
@@ -52965,7 +52956,6 @@ mod tests {
     /// default-filter pages and the walk's count are the corpus and nothing
     /// else.
     #[tokio::test]
-    #[serial_test::serial(postgres)]
     async fn i531_two_phase_listing_matches_the_v53_1_4_statement_pg() {
         let Some(dsn) = pg_isolated_dsn() else {
             eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");

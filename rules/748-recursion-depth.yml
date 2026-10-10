@@ -1,0 +1,18 @@
+# #748 (replication/mod.rs::the_retired_depth_knob_stays_retired): the retired
+# depth knob is named nowhere under src/ but replication/mod.rs: no identifier,
+# field, type or string literal (a config key is a reintroduction too).
+# Comments may mention it. Expected 0.
+id: 748-recursion-depth
+language: rust
+severity: hint
+message: "the retired recursion depth knob reappeared"
+rule:
+  any:
+    - {kind: identifier, regex: 'recursion_depth'}
+    - {kind: field_identifier, regex: 'recursion_depth'}
+    - {kind: type_identifier, regex: '(?i)recursion_?depth'}
+    - {kind: string_content, regex: 'recursion_depth'}
+files:
+  - src/**/*.rs
+ignores:
+  - src/federation/replication/mod.rs

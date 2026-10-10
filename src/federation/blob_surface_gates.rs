@@ -31,9 +31,11 @@ mod tests {
             // v54.0.0 (Codex round 3 on PR #1050, I14 false red) — a
             // `#[cfg(all(test, …))]` item is test-only code too; the stripper
             // missed it and I14 read a test body's floor call as a door.
-            let is_test_attr = t.starts_with("#[cfg(test)]")
+            // v54.1.0 (#1026): the test-only cfg forms are
+            // `crate::test_cfg`'s, shared with the other text strippers; this
+            // one also drops `any(test, …)` seams and test fns.
+            let is_test_attr = crate::test_cfg::is_test_only_cfg(t)
                 || t.starts_with("#[cfg(any(test")
-                || t.starts_with("#[cfg(all(test")
                 || t.starts_with("#[tokio::test")
                 || t.starts_with("#[test]");
             if is_test_attr {
