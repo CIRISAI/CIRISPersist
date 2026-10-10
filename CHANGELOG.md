@@ -92,7 +92,7 @@ Witnesses in `src/federation/attester_key_unknown_invariants.rs`, each on memory
 
 RED before, each fix reverted alone: I630 fails on all three backends with `I630 occurrence: scrub-signature verification failed: signed identity_occurrence: signer … is neither identity … nor an active occurrence of it` (kind `federation_signature_invalid`). I631 fails on all three with `I631: a backend failure propagates as itself, never a verdict: federation_federation_tier_unverified`. Mutant, restored: the refusal's `plane` pinned to `identity_occurrence` turns I630 red on all three at the revocation door.
 
-Existing assertions moved with the arm: the signed route matrix's "unrelated registered signer" step on all three backends, sqlite's signed-occurrence `signer_acts_for` arm, and the three I76 arms in `key_grant_invariants`. All now assert `federation_signer_not_acting_for`.
+Existing assertions moved with the arm: the signed route matrix's "unrelated registered signer" step on all three backends, sqlite's signed-occurrence `signer_acts_for` arm and its signed-revocation (3b) arm, and the three I76 arms in `key_grant_invariants`. All now assert `federation_signer_not_acting_for`.
 
 ### Added — a stored Key row that fails verification is replaced by a passing one (`InvalidReplaced`) (#1044)
 

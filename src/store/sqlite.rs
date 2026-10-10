@@ -37985,7 +37985,9 @@ mod tests {
             )
             .await
             .expect_err("(3b) a peer's revocation of a victim must be REJECTED");
-        assert_eq!(err.kind(), "federation_signature_invalid");
+        // v54.1.0 (#1042 follow-up) — the signature verifies; the signer does
+        // not act for alice: the typed signer-acts-for refusal.
+        assert_eq!(err.kind(), "federation_signer_not_acting_for");
         assert!(backend
             .resolve_encryption_keys("alice-phone")
             .await
