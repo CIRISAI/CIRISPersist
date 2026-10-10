@@ -1027,6 +1027,13 @@ pub struct PostgresBackend {
     /// (`from_shared*`) resolves lazily at its first DEK-plane door when
     /// this is still false (CIRISPersist#850 review).
     minter_sentinel_resolved: std::sync::atomic::AtomicBool,
+    /// v54.1.0 (CIRISPersist#1046) — `true` only between a test-only
+    /// `run_migrations_through(v)` with `v` below V187 and the next full
+    /// `run_migrations`: the schema predates the purge plane, so it holds no
+    /// tombstone and the admission gates' read answers `Unsupported` (which
+    /// they pass) instead of "no such table". Never set on a production path;
+    /// the default is the plane PRESENT, so a gate fails closed.
+    pre_purge_schema: std::sync::atomic::AtomicBool,
     /// v3.4.0 (CIRISPersist#123) — trust-weighted admission gate.
     /// `None` = no trust gate is installed (bootstrap-permissive — the
     /// historical pre-#123 behavior). Set via
@@ -1539,6 +1546,8 @@ impl PostgresBackend {
     /// sqlite twin). No advisory lock — a test database has one writer.
     #[cfg(any(test, feature = "test-anchor"))]
     pub async fn run_migrations_through(&self, version: u32) -> Result<(), Error> {
+        self.pre_purge_schema
+            .store(version < 187, std::sync::atomic::Ordering::Release);
         let mut client = self.dedicated_connect().await?;
         Self::repair_v070_checksum(&client)
             .await
@@ -1724,6 +1733,7 @@ impl PostgresBackend {
                 crate::federation::topology::DEFAULT_DELEGATION_DEPTH,
             ),
             minter_sentinel_resolved: std::sync::atomic::AtomicBool::new(false),
+            pre_purge_schema: std::sync::atomic::AtomicBool::new(false),
             admission_gate: std::sync::RwLock::new(None),
             self_key_id: std::sync::RwLock::new(None),
             peer_write_quota: crate::federation::replication::admission::PeerWriteQuota::new(),
@@ -1783,6 +1793,7 @@ impl PostgresBackend {
                 crate::federation::topology::DEFAULT_DELEGATION_DEPTH,
             ),
             minter_sentinel_resolved: std::sync::atomic::AtomicBool::new(false),
+            pre_purge_schema: std::sync::atomic::AtomicBool::new(false),
             admission_gate: std::sync::RwLock::new(None),
             self_key_id: std::sync::RwLock::new(None),
             peer_write_quota: crate::federation::replication::admission::PeerWriteQuota::new(),
@@ -2995,6 +3006,8 @@ impl Backend for PostgresBackend {
     }
 
     async fn run_migrations(&self) -> Result<(), Error> {
+        self.pre_purge_schema
+            .store(false, std::sync::atomic::Ordering::Release);
         // v24.1.0 (CIRISPersist#559) — THE DDL RUNS ONCE PER PROCESS, PER
         // DATABASE. `Engine(...)` re-enters this on every construction, and
         // even a steady-state boot took the global advisory lock and re-ran
@@ -4650,6 +4663,55 @@ impl PostgresBackend {
         Ok(())
     }
 
+    /// v54.1.0 (CIRISPersist#1040) — TEST SEAM: store `identity_type` on a
+    /// held key row as if the role had been conferred at its door (the
+    /// conferral itself is the canonical gate's, witnessed by I190 and the
+    /// #372 tests). Nothing else moves.
+    #[cfg(any(test, feature = "test-anchor"))]
+    pub async fn test_seam_set_key_identity_type(
+        &self,
+        key_id: &str,
+        identity_type: &str,
+    ) -> Result<(), crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        client
+            .execute(
+                "UPDATE cirislens.federation_keys SET identity_type = $2 WHERE key_id = $1",
+                &[&key_id, &identity_type],
+            )
+            .await
+            .map(|_| ())
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))
+    }
+
+    /// v54.1.0 (CIRISPersist#1043) — TEST SEAM: reproduce a legacy row the
+    /// apply door refuses today (#598 "typed asserted_at diverges from the
+    /// signed envelope"): move the typed `asserted_at` column off the signed
+    /// instant. Nothing else moves.
+    #[cfg(any(test, feature = "test-anchor"))]
+    pub async fn test_seam_set_attestation_asserted_at(
+        &self,
+        attestation_id: &str,
+        asserted_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        client
+            .execute(
+                "UPDATE cirislens.federation_attestations SET asserted_at = $2 \
+                 WHERE attestation_id::text = $1",
+                &[&attestation_id, &asserted_at],
+            )
+            .await
+            .map(|_| ())
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))
+    }
+
     /// v54.0.0 (CIRISPersist#995 row 2) — TEST SEAM: reproduce what a
     /// pre-v53.1.4 UPDATE door left behind: `additional_scrubs` emptied while
     /// `persist_row_hash` still binds the full record. Nothing else moves.
@@ -5415,10 +5477,422 @@ impl PostgresBackend {
     }
 }
 
+/// v54.1.0 (CIRISPersist#1046) — the V187 header columns, spelled once.
+const PG_PURGE_EXECUTION_SELECT: &str = "SELECT notice_id, selection_digest, claimant_key_id, \
+     record_count, notice_jcs, cosignatures_json, executed_by, origin, executed_at, \
+     admitted_at, finalized_at, legal_basis FROM cirislens.purge_executions";
+
+fn pg_row_to_purge_execution(
+    r: &tokio_postgres::Row,
+) -> Result<crate::federation::steward_purge::PurgeExecution, crate::federation::Error> {
+    use crate::federation::Error as E;
+    let record_count: i64 = r.safe_get_with(3, E::Backend)?;
+    Ok(crate::federation::steward_purge::PurgeExecution {
+        notice_id: r.safe_get_with(0, E::Backend)?,
+        selection_digest: r.safe_get_with(1, E::Backend)?,
+        claimant_key_id: r.safe_get_with(2, E::Backend)?,
+        legal_basis: r.safe_get_with(11, E::Backend)?,
+        record_count: u64::try_from(record_count).unwrap_or_default(),
+        notice_jcs: r.safe_get_with(4, E::Backend)?,
+        cosignatures_json: r.safe_get_with(5, E::Backend)?,
+        executed_by: r.safe_get_with(6, E::Backend)?,
+        origin: r.safe_get_with(7, E::Backend)?,
+        executed_at: r.safe_get_with(8, E::Backend)?,
+        admitted_at: r.safe_get_with(9, E::Backend)?,
+        finalized_at: r.safe_get_with(10, E::Backend)?,
+    })
+}
+
+fn pg_row_to_purge_tombstone(
+    r: &tokio_postgres::Row,
+) -> Result<crate::federation::steward_purge::PurgeTombstone, crate::federation::Error> {
+    use crate::federation::Error as E;
+    let plane: String = r.safe_get_with(1, E::Backend)?;
+    let ordinal: i64 = r.safe_get_with(3, E::Backend)?;
+    Ok(crate::federation::steward_purge::PurgeTombstone {
+        notice_id: r.safe_get_with(0, E::Backend)?,
+        plane: serde_json::from_value(serde_json::Value::String(plane.clone()))
+            .map_err(|_| E::Backend(format!("purge_tombstones plane {plane:?}")))?,
+        record_ref: r.safe_get_with(2, E::Backend)?,
+        ordinal: u64::try_from(ordinal).unwrap_or_default(),
+        derived_from: r.safe_get_with(4, E::Backend)?,
+    })
+}
+
 #[async_trait::async_trait]
 impl crate::federation::FederationDirectory for PostgresBackend {
     fn as_dyn_directory(&self) -> &dyn crate::federation::FederationDirectory {
         self
+    }
+
+    // ── v54.1.0 (CIRISPersist#1046) — the steward purge plane (V187) ──────
+
+    async fn purge_scan_attestations(
+        &self,
+        after_id: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let limit = i64::from(limit);
+        // V121: `attestation_id` is TEXT (genesis rows carry symbolic ids), so
+        // the scan pages on the PK in its own order.
+        let rows = client
+            .query(
+                "SELECT attestation_id::text, attesting_key_id, attested_key_id, \
+                    attestation_type, \
+                    weight::float8 AS weight, asserted_at, expires_at, attestation_envelope, \
+                    original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
+                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, \
+                    subject_key_ids, withdraws_admission_rule, cohort_scope, tier, \
+                    promoted_at, additional_scrubs \
+                 FROM cirislens.federation_attestations \
+                 WHERE ($1::text IS NULL OR attestation_id > $1) \
+                 ORDER BY attestation_id ASC LIMIT $2",
+                &[&after_id, &limit],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("purge_scan_attestations: {e}"))
+            })?;
+        rows.into_iter().map(pg_row_to_attestation).collect()
+    }
+
+    async fn purge_trace_ids_for_llm_model(
+        &self,
+        model: &str,
+    ) -> Result<Vec<String>, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        client
+            .query(
+                "SELECT DISTINCT trace_id FROM cirislens.trace_llm_calls WHERE model = $1 \
+                 ORDER BY trace_id",
+                &[&model],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("purge_trace_ids_for_llm_model: {e}"))
+            })?
+            .into_iter()
+            .map(|r| r.safe_get_with::<String, _, _, _>(0, crate::federation::Error::Backend))
+            .collect()
+    }
+
+    async fn purge_trace_ids_signed_by(
+        &self,
+        key_id: &str,
+    ) -> Result<Vec<String>, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        client
+            .query(
+                "SELECT DISTINCT trace_id FROM cirislens.trace_events WHERE signing_key_id = $1 \
+                 ORDER BY trace_id",
+                &[&key_id],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("purge_trace_ids_signed_by: {e}"))
+            })?
+            .into_iter()
+            .map(|r| r.safe_get_with::<String, _, _, _>(0, crate::federation::Error::Backend))
+            .collect()
+    }
+
+    async fn purge_trace_row_counts(
+        &self,
+        trace_ids: &[String],
+    ) -> Result<(u64, u64), crate::federation::Error> {
+        if trace_ids.is_empty() {
+            return Ok((0, 0));
+        }
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let ids: Vec<&str> = trace_ids.iter().map(String::as_str).collect();
+        let row = client
+            .query_one(
+                "SELECT (SELECT COUNT(*) FROM cirislens.trace_events \
+                          WHERE trace_id = ANY($1::text[])), \
+                        (SELECT COUNT(*) FROM cirislens.trace_llm_calls \
+                          WHERE trace_id = ANY($1::text[]))",
+                &[&ids],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("purge_trace_row_counts: {e}"))
+            })?;
+        let events: i64 = row.safe_get_with(0, crate::federation::Error::Backend)?;
+        let calls: i64 = row.safe_get_with(1, crate::federation::Error::Backend)?;
+        Ok((
+            u64::try_from(events).unwrap_or_default(),
+            u64::try_from(calls).unwrap_or_default(),
+        ))
+    }
+
+    async fn purge_put_execution(
+        &self,
+        execution: &crate::federation::steward_purge::PurgeExecution,
+    ) -> Result<bool, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let e = execution;
+        let record_count = i64::try_from(e.record_count).unwrap_or(i64::MAX);
+        let n = client
+            .execute(
+                "INSERT INTO cirislens.purge_executions (notice_id, selection_digest, \
+                    claimant_key_id, record_count, notice_jcs, cosignatures_json, executed_by, \
+                    origin, executed_at, admitted_at, finalized_at, legal_basis) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, clock_timestamp(), NULL, $10) \
+                 ON CONFLICT (notice_id) DO NOTHING",
+                &[
+                    &e.notice_id,
+                    &e.selection_digest,
+                    &e.claimant_key_id,
+                    &record_count,
+                    &e.notice_jcs,
+                    &e.cosignatures_json,
+                    &e.executed_by,
+                    &e.origin,
+                    &e.executed_at,
+                    &e.legal_basis,
+                ],
+            )
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("purge_put_execution: {e}")))?;
+        Ok(n > 0)
+    }
+
+    async fn purge_put_tombstone(
+        &self,
+        tombstone: &crate::federation::steward_purge::PurgeTombstone,
+    ) -> Result<bool, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let t = tombstone;
+        let ordinal = i64::try_from(t.ordinal).unwrap_or(i64::MAX);
+        let n = client
+            .execute(
+                "INSERT INTO cirislens.purge_tombstones \
+                    (notice_id, plane, record_ref, ordinal, derived_from) \
+                 VALUES ($1, $2, $3, $4, $5) \
+                 ON CONFLICT (notice_id, plane, record_ref) DO NOTHING",
+                &[
+                    &t.notice_id,
+                    &t.plane.as_str(),
+                    &t.record_ref,
+                    &ordinal,
+                    &t.derived_from,
+                ],
+            )
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("purge_put_tombstone: {e}")))?;
+        Ok(n > 0)
+    }
+
+    async fn purge_execution(
+        &self,
+        notice_id: &str,
+    ) -> Result<Option<crate::federation::steward_purge::PurgeExecution>, crate::federation::Error>
+    {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        client
+            .query_opt(
+                &format!("{PG_PURGE_EXECUTION_SELECT} WHERE notice_id = $1"),
+                &[&notice_id],
+            )
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("purge_execution: {e}")))?
+            .map(|r| pg_row_to_purge_execution(&r))
+            .transpose()
+    }
+
+    async fn purge_tombstones_of(
+        &self,
+        notice_id: &str,
+    ) -> Result<Vec<crate::federation::steward_purge::PurgeTombstone>, crate::federation::Error>
+    {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        client
+            .query(
+                "SELECT notice_id, plane, record_ref, ordinal, derived_from \
+                 FROM cirislens.purge_tombstones WHERE notice_id = $1 ORDER BY ordinal ASC",
+                &[&notice_id],
+            )
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("purge_tombstones_of: {e}")))?
+            .iter()
+            .map(pg_row_to_purge_tombstone)
+            .collect()
+    }
+
+    async fn purge_tombstoned(
+        &self,
+        plane: &str,
+        record_ref: &str,
+    ) -> Result<Option<String>, crate::federation::Error> {
+        if self
+            .pre_purge_schema
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(crate::federation::Error::Unsupported {
+                method: "purge_tombstoned",
+            });
+        }
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let row = client
+            .query_one(
+                "SELECT MIN(notice_id) FROM cirislens.purge_tombstones \
+                 WHERE plane = $1 AND record_ref = $2",
+                &[&plane, &record_ref],
+            )
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("purge_tombstoned: {e}")))?;
+        row.safe_get_with::<Option<String>, _, _, _>(0, crate::federation::Error::Backend)
+    }
+
+    async fn list_purge_executions_since(
+        &self,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
+        limit: u32,
+    ) -> Result<Vec<crate::federation::steward_purge::PurgeExecution>, crate::federation::Error>
+    {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let since_at = since.as_ref().map(|(t, _)| *t);
+        let since_id = since.as_ref().map(|(_, id)| id.clone());
+        let limit = i64::from(limit);
+        client
+            .query(
+                &format!(
+                    "{PG_PURGE_EXECUTION_SELECT} \
+                     WHERE ($1::timestamptz IS NULL OR (admitted_at, notice_id) > ($1, $2)) \
+                     ORDER BY admitted_at ASC, notice_id ASC LIMIT $3"
+                ),
+                &[&since_at, &since_id, &limit],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("list_purge_executions_since: {e}"))
+            })?
+            .iter()
+            .map(pg_row_to_purge_execution)
+            .collect()
+    }
+
+    async fn purge_delete_tombstoned_attestation(
+        &self,
+        attestation_id: &str,
+    ) -> Result<bool, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        // The door's own gate, in the statement: only a row a purge tombstone
+        // names. The V106 / V121 cascades follow as on the purge path.
+        let n = client
+            .execute(
+                "DELETE FROM cirislens.federation_attestations \
+                 WHERE attestation_id = $1 \
+                   AND EXISTS (SELECT 1 FROM cirislens.purge_tombstones \
+                               WHERE plane = 'attestation' AND record_ref = $1)",
+                &[&attestation_id],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!(
+                    "purge_delete_tombstoned_attestation: {e}"
+                ))
+            })?;
+        Ok(n > 0)
+    }
+
+    async fn purge_delete_tombstoned_trace(
+        &self,
+        trace_id: &str,
+    ) -> Result<(u64, u64), crate::federation::Error> {
+        let mut client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("pool: {e}")))?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("begin tx: {e}")))?;
+        let tombstoned = tx
+            .query_opt(
+                "SELECT 1 FROM cirislens.purge_tombstones \
+                 WHERE plane = 'trace' AND record_ref = $1 LIMIT 1",
+                &[&trace_id],
+            )
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("purge trace gate: {e}")))?
+            .is_some();
+        if !tombstoned {
+            return Ok((0, 0));
+        }
+        let calls = tx
+            .execute(
+                "DELETE FROM cirislens.trace_llm_calls WHERE trace_id = $1",
+                &[&trace_id],
+            )
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("purge trace calls: {e}")))?;
+        let events = tx
+            .execute(
+                "DELETE FROM cirislens.trace_events WHERE trace_id = $1",
+                &[&trace_id],
+            )
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("purge trace events: {e}")))?;
+        tx.commit()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("commit: {e}")))?;
+        Ok((events, calls))
+    }
+
+    async fn purge_mark_finalized(
+        &self,
+        notice_id: &str,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let n = client
+            .execute(
+                "UPDATE cirislens.purge_executions SET finalized_at = $2 \
+                 WHERE notice_id = $1 AND finalized_at IS NULL",
+                &[&notice_id, &at],
+            )
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("purge_mark_finalized: {e}")))?;
+        Ok(n > 0)
     }
 
     fn withdraws_delegation_depth(&self) -> usize {
@@ -6378,6 +6852,11 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             {
                 return Ok(crate::federation::AttestationOutcome::AlreadyHeld);
             }
+            // v54.1.0 (CIRISPersist#1046) — a row a steward purge tombstoned is
+            // refused; (CIRISPersist#1040) a federation-tier mock-LLM trace is
+            // refused. Backend-symmetric across memory / sqlite / postgres.
+            crate::federation::steward_purge::refuse_if_tombstoned_attestation(self, &row).await?;
+            crate::federation::steward_purge::refuse_mock_trace_attestation(&row)?;
             if !row.attesting_key_id.is_empty() {
                 // v22.0.0 (CIRISPersist#543 finding 4, AV-76) — per-peer write
                 // quota. It LEADS the state-consulting checks because it is the
@@ -14300,6 +14779,9 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         //
         // v53.0.0 (#975, CC 2.4) — under enforcement a held row of an
         // unregistered type is neither served nor replicated.
+        //
+        // v54.1.0 (CIRISPersist#1046) — a tombstoned row is never served;
+        // excluded in the SQL, before the page is cut.
         let row_type_filter = crate::federation::row_type::serve_filter_sql(
             "attestation_type",
             crate::federation::row_type::SqlDialect::Postgres,
@@ -14316,10 +14798,13 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                         scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, \
                         subject_key_ids, withdraws_admission_rule, cohort_scope, tier, \
                         promoted_at, additional_scrubs, admitted_at \
-                     FROM cirislens.federation_attestations \
+                     FROM cirislens.federation_attestations fa \
                      WHERE ($1::timestamptz IS NULL OR \
                             (admitted_at, attestation_id::text) > ($1, $2)) \
                        AND tier = 'federation'{row_type_filter} \
+                       AND NOT EXISTS (SELECT 1 FROM cirislens.purge_tombstones pt \
+                                       WHERE pt.plane = 'attestation' \
+                                         AND pt.record_ref = fa.attestation_id::text) \
                      ORDER BY admitted_at ASC, attestation_id ASC LIMIT $3"
                 ),
                 &[&since_at, &since_id, &limit],

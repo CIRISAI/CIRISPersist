@@ -106,6 +106,7 @@ async fn build_signed_batch(
         signature_ml_dsa_65: None,
         pubkey_ml_dsa_65: None,
         pqc_key_id: None,
+        run_kind: None,
     };
     let payload = canonical_payload_value(&trace);
     let bytes = PythonJsonDumpsCanonicalizer
@@ -558,6 +559,7 @@ async fn av17_attempt_index_out_of_range() {
         signature_ml_dsa_65: None,
         pubkey_ml_dsa_65: None,
         pqc_key_id: None,
+        run_kind: None,
     };
     let payload = canonical_payload_value(&trace);
     let canon = PythonJsonDumpsCanonicalizer

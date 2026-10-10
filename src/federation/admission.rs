@@ -2653,6 +2653,12 @@ pub async fn check_promotion_admission(
     // v53.0.0 (CIRISPersist#975, CC 2.4) — the closed row-type slot, beside the
     // binding. Uncounted: the local door counted this row when it was written.
     crate::federation::row_type::check_row_type(row)?;
+    // v54.1.0 (CIRISPersist#1040) — the tier crossing mints a FEDERATION-tier
+    // row, so a local mock-LLM trace (kept for QA) cannot cross; and
+    // (CIRISPersist#1046) a row a steward purge tombstoned cannot be
+    // re-published by promoting a local copy.
+    crate::federation::steward_purge::refuse_mock_trace_attestation(row)?;
+    crate::federation::steward_purge::refuse_if_tombstoned_attestation(directory, row).await?;
 
     // AV-84 — a TARGETED cohort placement (`family` / `community`) is a
     // producer self-declaration or it is refused. Pure and free, so it leads

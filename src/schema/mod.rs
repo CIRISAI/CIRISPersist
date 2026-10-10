@@ -60,6 +60,11 @@ pub enum Error {
     #[error("unknown trace_level: {0:?}")]
     UnknownTraceLevel(String),
 
+    /// v54.1.0 (CC 3.1.5, CIRISConstitution#166) — a trace's `run_kind` is
+    /// not one of the closed vocabulary `production | qa | battery | mock`.
+    #[error("unknown run_kind: {0:?}")]
+    UnknownRunKind(String),
+
     /// Required field missing per the wire-format spec.
     #[error("missing required field: {0}")]
     MissingField(&'static str),
@@ -126,6 +131,7 @@ impl Error {
             Error::Json(_) => "schema_malformed_json",
             Error::UnsupportedSchemaVersion { .. } => "schema_unsupported_version",
             Error::UnknownTraceLevel(_) => "schema_unknown_trace_level",
+            Error::UnknownRunKind(_) => "schema_unknown_run_kind",
             Error::MissingField(_) => "schema_missing_field",
             Error::FieldTypeMismatch { .. } => "schema_field_type_mismatch",
             Error::NegativeAttemptIndex(_) => "schema_negative_attempt_index",
@@ -167,7 +173,7 @@ impl Error {
             // instead of None.
             Error::Json(e) => Some(e.to_string()),
             Error::UnsupportedSchemaVersion { got, .. } => Some(got.clone()),
-            Error::UnknownTraceLevel(s) => Some(s.clone()),
+            Error::UnknownTraceLevel(s) | Error::UnknownRunKind(s) => Some(s.clone()),
             Error::MissingField(name) => Some((*name).to_string()),
             Error::FieldTypeMismatch {
                 field,

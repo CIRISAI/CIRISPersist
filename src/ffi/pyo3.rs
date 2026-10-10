@@ -6042,7 +6042,8 @@ impl PyEngine {
                         | IngestError::Scrub(_)
                         | IngestError::ScrubTreatmentMismatch { .. }
                         | IngestError::ScopeRefused(_)
-                        | IngestError::PipelineInvariant { .. } => Err(match detail {
+                        | IngestError::PipelineInvariant { .. }
+                        | IngestError::TraceRefused { .. } => Err(match detail {
                             Some(d) => PyValueError::new_err((kind, d)),
                             None => PyValueError::new_err(kind),
                         }),
@@ -13866,6 +13867,164 @@ impl PyEngine {
                     })
                 }
             })
+        })
+    }
+
+    /// v54.1.0 (CIRISPersist#1046, CSD-108) — **dry run** a steward purge.
+    /// `selection_json` is a tagged selection: `{"kind": "by_actor",
+    /// "key_id": …}`, `{"kind": "by_ids", "ids": ["attestation:…", …]}`,
+    /// `{"kind": "mock_model_traces", "model": "mock-model"}` (#1040) or
+    /// `{"kind": "refused_today"}` (#1043). Returns the JSON `PurgeDryRun`:
+    /// per-table counts, the selection digest the notice must name, the first
+    /// 20 record ids in JCS order, what a class withheld, the ledger TSV and
+    /// the notice template to cosign. Writes nothing.
+    fn purge_dry_run_json(&self, py: Python<'_>, selection_json: &str) -> PyResult<String> {
+        self.ensure_usable()?;
+        let selection: crate::federation::steward_purge::PurgeSelection =
+            serde_json::from_str(selection_json)
+                .map_err(|e| PyValueError::new_err(format!("purge selection_json: {e}")))?;
+        self.purge_engine_call(py, move |engine| async move {
+            engine.purge_dry_run(&selection).await
+        })
+    }
+
+    /// v54.1.0 (CIRISPersist#1046, CIRISConstitution#165) — **execute** a
+    /// steward purge. `notice_json` is `{"envelope": {…takedown_notice…},
+    /// "cosignatures": [ThresholdSignature, …]}`, every cosignature over the
+    /// envelope's JCS bytes (`purge_notice_signing_payload_json`). Refuses
+    /// with a `ValueError(token, body_json)`: `purge_unauthorised`,
+    /// `purge_selection_count_mismatch` `{table, expected, found}`,
+    /// `purge_selection_digest_mismatch`, `purge_retraction_inadmissible`
+    /// `{record_id, plane, index, total}`. There is no override. Tombstones
+    /// only; returns the JSON `PurgeReport`.
+    fn purge_rows_json(
+        &self,
+        py: Python<'_>,
+        selection_json: &str,
+        notice_json: &str,
+        now_iso: &str,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        let selection: crate::federation::steward_purge::PurgeSelection =
+            serde_json::from_str(selection_json)
+                .map_err(|e| PyValueError::new_err(format!("purge selection_json: {e}")))?;
+        let notice: crate::federation::steward_purge::StewardPurgeNotice =
+            serde_json::from_str(notice_json)
+                .map_err(|e| PyValueError::new_err(format!("purge notice_json: {e}")))?;
+        let now = purge_now(now_iso)?;
+        self.purge_engine_call(py, move |engine| async move {
+            engine.purge_rows(&selection, &notice, now).await
+        })
+    }
+
+    /// v54.1.0 (CIRISPersist#1046) — the bytes a founder cosigns for a purge
+    /// notice and the notice id they hash to: `{"signing_bytes_b64": …,
+    /// "notice_id": …}`. The notice id is `sha256(JCS(envelope))`.
+    fn purge_notice_signing_payload_json(&self, envelope_json: &str) -> PyResult<String> {
+        let envelope: serde_json::Value = serde_json::from_str(envelope_json)
+            .map_err(|e| PyValueError::new_err(format!("purge envelope_json: {e}")))?;
+        let bytes = crate::federation::steward_purge::notice_signing_bytes(&envelope)
+            .map_err(federation_err_to_py)?;
+        use base64::Engine as _;
+        use sha2::Digest as _;
+        Ok(serde_json::json!({
+            "signing_bytes_b64": base64::engine::general_purpose::STANDARD.encode(&bytes),
+            "notice_id": hex::encode(sha2::Sha256::digest(&bytes)),
+        })
+        .to_string())
+    }
+
+    /// v54.1.0 (CIRISPersist#1046) — a purge's state at `now_iso`
+    /// (`executed` / `settled` / `finalized`), its settle instant and its
+    /// tombstone counts. `ValueError(purge_notice_unknown, …)` for a notice
+    /// this node never executed or applied.
+    fn purge_status_json(
+        &self,
+        py: Python<'_>,
+        notice_id: &str,
+        now_iso: &str,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        let notice_id = notice_id.to_owned();
+        let now = purge_now(now_iso)?;
+        self.purge_engine_call(py, move |engine| async move {
+            engine.purge_status(&notice_id, now).await
+        })
+    }
+
+    /// v54.1.0 (CIRISPersist#1046, CSD-108 §6 Q4) — **finalize**: hard-delete
+    /// an executed purge's records after the retraction round settled.
+    /// `ValueError(purge_not_settled, …)` before it. Idempotent. Returns the
+    /// JSON `FinalizeReport`.
+    fn purge_finalize_json(
+        &self,
+        py: Python<'_>,
+        notice_id: &str,
+        now_iso: &str,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        let notice_id = notice_id.to_owned();
+        let now = purge_now(now_iso)?;
+        self.purge_engine_call(py, move |engine| async move {
+            engine.purge_finalize(&notice_id, now).await
+        })
+    }
+
+    /// v54.1.0 (CIRISPersist#1046) — the executed purge's ledger as TSV (for
+    /// `evidence/purges/<date>-<selection-digest>.tsv`): a header carrying the
+    /// digest, notice id, claimant, count, actor and instant, then one row per
+    /// record in JCS order. Returned as a JSON string.
+    fn purge_ledger_tsv(&self, py: Python<'_>, notice_id: &str) -> PyResult<String> {
+        self.ensure_usable()?;
+        let notice_id = notice_id.to_owned();
+        self.purge_engine_call(py, move |engine| async move {
+            engine.purge_ledger_tsv(&notice_id).await
+        })
+    }
+
+    /// v54.1.0 (CIRISPersist#1046, CIRISConstitution#165 §3) — **serve** the
+    /// purge tombstone plane: a JSON array of `PurgeBundle` (notice, whole
+    /// cosignature set, record ids — never content) since the
+    /// `(since_iso, since_notice_id)` cursor.
+    #[pyo3(signature = (limit, since_iso=None, since_notice_id=None))]
+    fn list_purge_bundles_since_json(
+        &self,
+        py: Python<'_>,
+        limit: u32,
+        since_iso: Option<&str>,
+        since_notice_id: Option<&str>,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        let since = match (since_iso, since_notice_id) {
+            (Some(t), Some(id)) => Some((purge_now(t)?, id.to_owned())),
+            (None, None) => None,
+            _ => {
+                return Err(PyValueError::new_err(
+                    "list_purge_bundles_since_json: since_iso and since_notice_id go together",
+                ))
+            }
+        };
+        self.purge_engine_call(py, move |engine| async move {
+            engine.list_purge_bundles_since(since, limit).await
+        })
+    }
+
+    /// v54.1.0 (CIRISPersist#1046) — **apply** a peer's purge bundle: the
+    /// notice is re-verified against THIS node's trust root and the digest
+    /// re-derived from the ids before any tombstone lands. Deletes nothing.
+    fn apply_replicated_purge_json(
+        &self,
+        py: Python<'_>,
+        bundle_json: &str,
+        now_iso: &str,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        let bundle: crate::federation::steward_purge::PurgeBundle =
+            serde_json::from_str(bundle_json)
+                .map_err(|e| PyValueError::new_err(format!("purge bundle_json: {e}")))?;
+        let now = purge_now(now_iso)?;
+        self.purge_engine_call(py, move |engine| async move {
+            engine.apply_replicated_purge(&bundle, now).await
         })
     }
 
@@ -34328,6 +34487,45 @@ fn outcome_to_py<'py>(
         .map_err(|e| PyRuntimeError::new_err(format!("outcome is not an object: {e}")))
 }
 
+/// v54.1.0 (CIRISPersist#1046) — parse a purge door's caller-supplied instant.
+fn purge_now(now_iso: &str) -> PyResult<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::parse_from_rfc3339(now_iso)
+        .map(|t| t.with_timezone(&chrono::Utc))
+        .map_err(|e| PyValueError::new_err(format!("purge now_iso parse: {e}")))
+}
+
+impl PyEngine {
+    /// v54.1.0 (CIRISPersist#1046) — run one steward-purge door on an
+    /// `Engine` composed over this handle's backend and signers (the
+    /// cohabitation pattern), and JSON-encode its result.
+    fn purge_engine_call<T, F, Fut>(&self, py: Python<'_>, call: F) -> PyResult<String>
+    where
+        T: serde::Serialize,
+        F: FnOnce(crate::Engine) -> Fut + Send,
+        Fut: std::future::Future<Output = Result<T, crate::federation::Error>> + Send,
+    {
+        catch_panic(|| {
+            let backend = match &self.backend {
+                #[cfg(feature = "postgres")]
+                BackendDispatch::Postgres(b) => crate::engine::BackendDispatch::Postgres(b.clone()),
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(b) => crate::engine::BackendDispatch::Sqlite(b.clone()),
+            };
+            let signer = self.signer.clone();
+            let local_signer = self.local_signer.clone();
+            let runtime = self.runtime.clone();
+            py.detach(move || {
+                let engine = crate::Engine::from_shared_with_local(backend, signer, local_signer);
+                runtime.block_on(async move {
+                    let out = call(engine).await.map_err(federation_err_to_py)?;
+                    serde_json::to_string(&out)
+                        .map_err(|e| PyRuntimeError::new_err(format!("purge JSON encode: {e}")))
+                })
+            })
+        })
+    }
+}
+
 fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
     let kind = e.kind();
     tracing::warn!(error = %e, kind = kind, "federation error");
@@ -34679,6 +34877,12 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         // cannot be admitted-to / continue federating. A caller/state admission
         // refusal (fail-secure), like the other admission gates → ValueError (4xx).
         crate::federation::Error::CommunityHasNoModerator { .. } => PyValueError::new_err(kind),
+        // v54.1.0 (CIRISPersist#1046) — a steward purge refusal: the token is
+        // the stable reason id (`e.args[0]`), the typed body its JSON detail
+        // (`e.args[1]`) — CIRISServer#756 renders both. Caller/state → 4xx.
+        crate::federation::Error::PurgeRefused { token, body } => {
+            PyValueError::new_err((token, body.to_string()))
+        }
         // Server-fault → RuntimeError (5xx).
         crate::federation::Error::Backend(_) => PyRuntimeError::new_err(kind),
         // v11.8.1 (CIRISPersist#329) — the directory-ops proxy was asked
@@ -39789,6 +39993,7 @@ mod verify_trace_canon_parity_class {
             signature_ml_dsa_65: None,
             pubkey_ml_dsa_65: None,
             pqc_key_id: None,
+            run_kind: None,
         }
     }
 

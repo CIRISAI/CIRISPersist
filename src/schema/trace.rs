@@ -227,6 +227,9 @@ pub struct DeploymentProfile {
     pub deployment_trust_mode: String,
 }
 
+/// CC 3.1.5 (CIRISConstitution#166) — the closed `run_kind` vocabulary.
+pub const RUN_KINDS: &[&str] = &["production", "qa", "battery", "mock"];
+
 /// `CompleteTrace` envelope (TRACE_WIRE_FORMAT.md §3).
 ///
 /// Mission alignment (MISSION.md §2 — `verify/`): the signature is
@@ -321,6 +324,17 @@ pub struct CompleteTrace {
     /// JSON byte-identical.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cohort_target_id: Option<String>,
+
+    /// v54.1.0 (CC 3.1.5, CIRISConstitution#166 at rc8@8c8f536;
+    /// CIRISAgent#1249) — the run that produced this trace, closed vocabulary
+    /// `production | qa | battery | mock` ([`RUN_KINDS`]). A SIGNED member:
+    /// when present it is part of the canonical bytes every schema version's
+    /// reconstruction signs over (`verify::ed25519::canonical_bytes_for_trace`),
+    /// so it cannot be added, removed or changed after signing. Absent on
+    /// every pre-#1249 trace, whose canonical bytes are therefore unchanged.
+    /// `mock` is refused at federation-tier admission (`trace_run_kind_mock`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_kind: Option<String>,
 
     /// Base64-encoded Ed25519 signature over the canonical bytes
     /// (TRACE_WIRE_FORMAT.md §8).
@@ -822,6 +836,7 @@ mod tests {
             signature_ml_dsa_65: None,
             pubkey_ml_dsa_65: None,
             pqc_key_id: None,
+            run_kind: None,
         };
         let canon_default = crate::verify::ed25519::canonical_payload_value(&base);
 

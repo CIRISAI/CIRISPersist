@@ -3752,6 +3752,151 @@ where
     Ok(())
 }
 
+/// v54.1.0 (CIRISPersist#1046, CIRISConstitution#165 §1) — **the trust
+/// root's own `consensus_protocol` over a cosigned envelope that is NOT one of
+/// its own versions**: the steward purge's `takedown_notice`.
+///
+/// The question is asked about the SIGNERS, never the subject: the envelope is
+/// judged only as bytes (`accord_family_signing_bytes`, JCS), and the answer is
+/// the set of seats whose hybrid signature over those bytes verified, judged
+/// by the protocol (CC 2.4 rule 0, CC 3.2 T2; CIRISConstitution rc8@8c8f536).
+///
+/// - The row at `community_key_id` must be TRUST-ROOT GRADE and **ROOTED** now
+///   ([`stored_standing_at`], which answers `NotRooted` for a row that is not
+///   trust-root grade — the ONE grade check; only the trust root's takedown
+///   duty authorises a steward purge, CC 4.5.5). A stalled root is valid but non-admitting (CC
+///   3.2 T7): it confers nothing new, and an authorisation is something new.
+///   An unrooted squat authorises nothing.
+/// - Every offered signature must be a distinct SEAT of the held head (any
+///   member, whatever its role) whose hybrid signature verifies against that
+///   seat's stored key. One that does not is a refusal, not a discount:
+///   evidence that does not verify is never carried as decoration (the
+///   roster-row rule, I190 (b)).
+/// - WHICH seats count is the protocol's, never a hard-coded founders rule:
+///   the head's members under its own `cohort_subkind` (`infrastructure`
+///   makes only non-`node`-bearing founders eligible, CC 3.2 "infrastructure
+///   does not vote"), evaluated by [`super::consensus::evaluate`] with
+///   [`super::consensus::Direction::Add`] — a purge is not a protective
+///   removal, so no reverse-quorum single-signer arm applies.
+///
+/// # Errors
+///
+/// `Ok(Err(reason))` names why the signers do not authorise (the caller maps
+/// it to its own typed refusal); `Err` is a directory read failure.
+pub async fn trust_root_cosigners_over<F>(
+    directory: &F,
+    community_key_id: &str,
+    envelope: &serde_json::Value,
+    signatures: &[ciris_verify_core::threshold::ThresholdSignature],
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Result<std::collections::BTreeSet<String>, String>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    use ciris_verify_core::threshold::ThresholdMember;
+    let head = match stored_standing_at(directory, community_key_id, now).await? {
+        StoredStanding::Rooted(head) => head,
+        StoredStanding::Stalled { reason, .. } => {
+            return Ok(Err(format!(
+                "the trust root {community_key_id:?} is stalled ({reason}): valid but \
+                 non-admitting (CC 3.2 T7), so it authorises nothing new"
+            )))
+        }
+        StoredStanding::NotRooted { reason } => {
+            return Ok(Err(format!(
+                "the row at {community_key_id:?} is not rooted ({reason})"
+            )))
+        }
+        StoredStanding::Absent => {
+            return Ok(Err(format!(
+                "no community row at {community_key_id:?}: the claimant is not a trust root this \
+                 node holds"
+            )))
+        }
+    };
+    if signatures.is_empty() {
+        return Ok(Err("the notice carries no cosignature".to_owned()));
+    }
+    let bytes = match ciris_verify_core::accord_genesis::accord_family_signing_bytes(envelope) {
+        Ok(b) => b,
+        Err(e) => {
+            return Ok(Err(format!(
+                "the notice envelope does not canonicalize: {e}"
+            )))
+        }
+    };
+    let mut memo = Memo::at(now);
+    let mut signers = std::collections::BTreeSet::new();
+    for sig in signatures {
+        if !head
+            .community
+            .members
+            .iter()
+            .any(|m| m.key_id == sig.member_id)
+        {
+            return Ok(Err(format!(
+                "cosigner {:?} holds no seat on the trust root {community_key_id:?}",
+                sig.member_id
+            )));
+        }
+        if !signers.insert(sig.member_id.clone()) {
+            return Ok(Err(format!("cosigner {:?} signed twice", sig.member_id)));
+        }
+        let Some(rec) = memo.record(directory, &sig.member_id).await? else {
+            return Ok(Err(format!(
+                "cosigner {:?} has no key record on this node",
+                sig.member_id
+            )));
+        };
+        let member = ThresholdMember {
+            member_id: rec.key_id,
+            ed25519_public_key_base64: rec.pubkey_ed25519_base64,
+            mldsa65_public_key_base64: rec.pubkey_ml_dsa_65_base64,
+            role: None,
+        };
+        if ciris_verify_core::threshold::verify_threshold_signatures(
+            &bytes,
+            std::slice::from_ref(&member),
+            std::slice::from_ref(sig),
+            1,
+        )
+        .is_err()
+        {
+            return Ok(Err(format!(
+                "cosigner {:?}'s signature does not verify over the notice",
+                sig.member_id
+            )));
+        }
+    }
+    let mut seats: Vec<super::consensus::Seat> = Vec::with_capacity(head.community.members.len());
+    for m in &head.community.members {
+        seats.push(super::consensus::Seat {
+            key_id: m.key_id.clone(),
+            role: m.role.clone(),
+            node_bearing: super::is_node_bearing_key_at(directory, &m.key_id, now).await?,
+        });
+    }
+    let verdict = super::consensus::evaluate(&super::consensus::Ballot {
+        protocol: &head.community.consensus_protocol,
+        subkind: super::community_subkind(&head.community),
+        policy_blob: head.community.policy_blob.as_ref(),
+        roster: &seats,
+        signers: &signers,
+        direction: super::consensus::Direction::Add,
+    });
+    match verdict {
+        super::consensus::Verdict::Admit => Ok(Ok(signers)),
+        super::consensus::Verdict::Insufficient { detail } => Ok(Err(format!(
+            "the trust root's consensus_protocol {:?} is not met: {detail}",
+            head.community.consensus_protocol
+        ))),
+        super::consensus::Verdict::Unevaluable { reason } => Ok(Err(format!(
+            "the trust root's consensus_protocol {:?} cannot be evaluated: {reason}",
+            head.community.consensus_protocol
+        ))),
+    }
+}
+
 /// v53.1.7 — I547's oracle: [`live_charter_rows`] as v53.1.6 shipped it,
 /// VERBATIM (the family's whole about-slice), `super::` spelled from the crate
 /// root.

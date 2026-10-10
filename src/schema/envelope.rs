@@ -255,6 +255,13 @@ impl BatchEnvelope {
                     {
                         return Err(super::Error::MissingField("deployment_profile"));
                     }
+                    // v54.1.0 (CC 3.1.5, CIRISConstitution#166) — `run_kind`
+                    // is a closed vocabulary.
+                    if let Some(kind) = &trace.run_kind {
+                        if !super::trace::RUN_KINDS.contains(&kind.as_str()) {
+                            return Err(super::Error::UnknownRunKind(kind.clone()));
+                        }
+                    }
                 }
             }
         }

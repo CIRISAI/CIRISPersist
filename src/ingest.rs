@@ -216,6 +216,21 @@ pub enum IngestError {
     #[error("scope: {0}")]
     ScopeRefused(#[from] crate::scope::ScopeRefusalReason),
 
+    /// v54.1.0 — a trace the substrate refuses to admit on a NAMED ground,
+    /// before anything is written (zero rows for the whole batch):
+    /// `trace_run_kind_mock` (CIRISPersist#1040, CIRISConstitution#166 — a
+    /// trace whose signed `run_kind` is `mock`, offered to
+    /// a node holding the `canonical` role, the federation corpus) or
+    /// `purge_tombstoned` (CIRISPersist#1046 — a trace a steward purge
+    /// tombstoned). Lens → HTTP 422.
+    #[error("trace refused {kind}: {detail}")]
+    TraceRefused {
+        /// The stable refusal token.
+        kind: &'static str,
+        /// The trace id and the ground (closed-set; never payload bytes).
+        detail: String,
+    },
+
     /// v1.1.0 (CIRISPersist#33 part 3) — `PipelineEnvelope` failed one
     /// of the FSD §4.3 wire-shape / consistency invariants. Lens →
     /// HTTP 422. Each invariant carries a stable kind token so
@@ -252,6 +267,7 @@ impl IngestError {
             // failed) is available via the inner `ScopeRefusalReason::kind`.
             IngestError::ScopeRefused(_) => "write_scope_refused",
             IngestError::PipelineInvariant { kind, .. } => kind,
+            IngestError::TraceRefused { kind, .. } => kind,
             // v32.0.0 (#690) — its own token, not folded into `scrub`. A
             // scrubber BUG and a batch whose treatment does not match its label
             // are different conditions with different remedies: the first is
@@ -284,6 +300,7 @@ impl IngestError {
         match self {
             IngestError::Schema(e) => e.detail(),
             IngestError::PipelineInvariant { detail, .. } => Some(detail.clone()),
+            IngestError::TraceRefused { detail, .. } => Some(detail.clone()),
             // The per-reason machine token (e.g. `scope_no_community_membership`)
             // is the actionable detail for a write-scope refusal.
             IngestError::ScopeRefused(r) => Some(r.kind().to_string()),
@@ -501,6 +518,66 @@ where
     C: Canonicalizer + ?Sized,
     S: Scrubber + ?Sized,
 {
+    /// v54.1.0 (CIRISPersist#1040, #1046) — step 2b of
+    /// [`receive_and_persist_with`](Self::receive_and_persist_with): refuse a
+    /// tombstoned trace on every node, and a trace whose signed `run_kind` is
+    /// `mock` (CC 3.1.5, CIRISConstitution#166) on a node holding the
+    /// `canonical` role (its OWN verified role, re-derived from its own
+    /// directory; a node with no identity set is not the canonical).
+    /// `run_kind` is the trace's SIGNED member (verified in step 2 when it is
+    /// present).
+    async fn refuse_named_traces(&self, env: &BatchEnvelope) -> Result<(), IngestError> {
+        let refused =
+            |kind: &'static str, detail: String| IngestError::TraceRefused { kind, detail };
+        let mut canonical: Option<bool> = None;
+        for event in &env.events {
+            let BatchEvent::CompleteTrace { trace, .. } = event;
+            match self
+                .backend
+                .purge_tombstoned(
+                    crate::federation::steward_purge::PurgePlane::Trace.as_str(),
+                    &trace.trace_id,
+                )
+                .await
+            {
+                Ok(Some(notice_id)) => {
+                    return Err(refused(
+                        crate::federation::steward_purge::token::TOMBSTONED,
+                        format!("trace_id={} notice_id={notice_id}", trace.trace_id),
+                    ))
+                }
+                Ok(None) | Err(crate::federation::Error::Unsupported { .. }) => {}
+                Err(e) => return Err(IngestError::Store(StoreError::Backend(e.to_string()))),
+            }
+            if trace.run_kind.as_deref() != Some(crate::federation::steward_purge::RUN_KIND_MOCK) {
+                continue;
+            }
+            let is_canonical = match canonical {
+                Some(c) => c,
+                None => {
+                    let c = match self.backend.node_key_id() {
+                        Some(node) => crate::federation::is_canonical_effective(
+                            self.backend.as_dyn_directory(),
+                            &node,
+                        )
+                        .await
+                        .map_err(|e| IngestError::Store(StoreError::Backend(e.to_string())))?,
+                        None => false,
+                    };
+                    canonical = Some(c);
+                    c
+                }
+            };
+            if is_canonical {
+                return Err(refused(
+                    crate::federation::steward_purge::TRACE_RUN_KIND_MOCK,
+                    format!("trace_id={} run_kind=mock", trace.trace_id),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Run the FSD §3.3 pipeline over a raw HTTP body.
     ///
     /// Step ordering is load-bearing — schema first (fail fast on
@@ -594,6 +671,15 @@ where
             }
             VerifyMode::TrustPreVerified => {}
         }
+
+        // 2b. v54.1.0 — refusals on a NAMED ground, before any write.
+        //     (CIRISPersist#1046) a trace a steward purge tombstoned is never
+        //     re-admitted — the tombstone outlives the rows it removed.
+        //     (CIRISPersist#1040, CIRISConstitution#166) a node holding the
+        //     `canonical` role is the federation corpus: a trace whose signed
+        //     `run_kind` is `mock` attests nothing and is refused there. Every
+        //     other node (an agent's own store, a QA node) keeps it.
+        self.refuse_named_traces(&env).await?;
 
         // 3. Capture pre-scrub canonical bytes for every component.
         //    FSD §3.3 step 3.5: original_content_hash is sha256 of
@@ -1607,6 +1693,7 @@ mod tests {
             signature_ml_dsa_65: None,
             pubkey_ml_dsa_65: None,
             pqc_key_id: None,
+            run_kind: None,
         };
         // v7.2.0 (#225) — hybrid-sign so the Full-mode hard cut admits.
         hybrid_sign_trace(&mut trace, &sk).await;
@@ -1671,6 +1758,7 @@ mod tests {
             signature_ml_dsa_65: None,
             pubkey_ml_dsa_65: None,
             pqc_key_id: None,
+            run_kind: None,
         };
         // Sign over the canonical allowlist — cohort fields excluded.
         // v7.2.0 (#225) — hybrid-sign so the Full-mode hard cut admits;
@@ -2757,6 +2845,7 @@ mod tests {
             signature_ml_dsa_65: None,
             pubkey_ml_dsa_65: None,
             pqc_key_id: None,
+            run_kind: None,
         };
         // Hybrid-sign the 2.7.9 canonical (per-component agent_id_hash
         // included; deployment_profile in the envelope alpha-position).
@@ -2883,6 +2972,7 @@ mod tests {
             signature_ml_dsa_65: None,
             pubkey_ml_dsa_65: None,
             pqc_key_id: None,
+            run_kind: None,
         };
         let d1 = decompose(&trace).unwrap();
         let d2 = decompose(&trace).unwrap();
@@ -2977,6 +3067,7 @@ mod tests {
             signature_ml_dsa_65: None,
             pubkey_ml_dsa_65: None,
             pqc_key_id: None,
+            run_kind: None,
         };
         let canonical = crate::verify::ed25519::canonical_bytes_for_trace(
             &trace,
@@ -3065,6 +3156,7 @@ mod tests {
             signature_ml_dsa_65: None,
             pubkey_ml_dsa_65: None,
             pqc_key_id: None,
+            run_kind: None,
         };
         let canonical = crate::verify::ed25519::canonical_bytes_for_trace(
             &trace,
