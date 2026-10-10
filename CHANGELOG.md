@@ -106,7 +106,9 @@ Existing assertions moved with the arm: the signed route matrix's "unrelated reg
 | Variant / refusal | Mapping |
 |---|---|
 | empty or blank signer id → `Error::InvalidArgument` | **refused** (terminal): malformed |
-| `federation::Error::LicensureDelegatorNotAuthority` (`authority_acts_by_quorum` and the other reasons) | **refused** (terminal) |
+| `federation::Error::LicensureDelegatorNotAuthority`, reason `named_edge_absent` | **retryable**: the named `delegates_to` row is not held here YET (a lookup miss, the same ordering gap as `AttesterKeyUnknown`); re-offer after it lands, with a cap |
+| `federation::Error::LicensureDelegatorNotAuthority`, reason `not_on_live_chain_at_asserted_at` | **retryable, capped**: an upstream `license` edge may still be replicating (the door cannot tell a missing edge from a dead one), but a retraction can also land later, so a later re-offer is not guaranteed to admit |
+| `federation::Error::LicensureDelegatorNotAuthority`, reasons `named_edge_not_license_delegation`, `named_edge_not_onto_emitter`, `authority_acts_by_quorum`, `not_authority_at_receipt` | **refused** (terminal): a property of the signed named edge, of the authority's protocol (until #1036), or of the emitter's standing at receipt, none of which a later row repairs |
 | `federation::Error::AccordProposalNonceReused` (`accord_proposal_nonce_reused`) | **refused** (terminal) |
 
 Witnesses, each on memory, sqlite and postgres:
