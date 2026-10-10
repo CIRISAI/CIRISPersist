@@ -29,7 +29,8 @@
 //!   then hard-deletes exactly the tombstoned rows; afterwards the tombstone
 //!   refuses the row's return (`purge_tombstoned`); a second finalize is a no-op.
 //! - **I656** — the tombstone replicates: a second node applies the served
-//!   bundle after re-verifying it against its OWN root; a bundle with an id
+//!   bundle after re-verifying it against its OWN root; a node rooted at no
+//!   trust root refuses it and records nothing; a bundle with an id
 //!   dropped, a forged cosignature, or unsorted ids is refused.
 //! - **I657** — RETIRED, not reused: it witnessed a #1043 serve filter the
 //!   operator ruled out (2026-10-09: both classes are PURGED through this
@@ -959,7 +960,7 @@ pub(crate) mod bodies {
     }
 
     // ── I656 ──────────────────────────────────────────────────────────────
-    pub(crate) async fn i656_the_tombstone_replicates_re_verified<D: Seams>(a: &D, b: &D) {
+    pub(crate) async fn i656_the_tombstone_replicates_re_verified<D: Seams>(a: &D, b: &D, c: &D) {
         root(a).await;
         root(b).await;
         let (_, derived, _) = mock_world(a, "i656").await;
@@ -993,6 +994,20 @@ pub(crate) mod bodies {
             sp::selection_digest(&bundle.record_ids),
             dry.selection_digest
         );
+        // A node not rooted at the same trust root (here: none) refuses the
+        // bundle and records nothing: a purge is not global erasure (CC 3.2
+        // T3, 4.2.1).
+        let e = sp::apply_replicated_purge(c.as_dyn_directory(), &bundle, "node-c", t)
+            .await
+            .unwrap_err();
+        let (tok, body) = refusal(&e);
+        assert_eq!(tok, token::UNAUTHORISED, "I656 rootless: {body}");
+        assert!(c
+            .as_dyn_directory()
+            .purge_execution(&report.notice_id)
+            .await
+            .unwrap()
+            .is_none());
         // Tampered bundles.
         let mut dropped = bundle.clone();
         dropped.record_ids.pop();
@@ -1612,10 +1627,11 @@ mod run {
                 }
                 #[tokio::test]
                 async fn i656() {
-                    let (Some(a), Some(c)) = ($fresh.await, $fresh.await) else {
+                    let (Some(a), Some(c), Some(e)) = ($fresh.await, $fresh.await, $fresh.await)
+                    else {
                         return;
                     };
-                    b::i656_the_tombstone_replicates_re_verified(&a, &c).await
+                    b::i656_the_tombstone_replicates_re_verified(&a, &c, &e).await
                 }
                 #[tokio::test]
                 async fn i665() {
