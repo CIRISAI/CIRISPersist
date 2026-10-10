@@ -513,6 +513,19 @@ its 174 rows (4.1.1 `CLM-delegation-depth-default` among them) had no entry in
     receipt; the signed-instant rule alone lands with #1049's window). It also roots a community
     authority only under `founder_only`; any other protocol is refused (`authority_acts_by_quorum`)
     because cosigned licensure rows are #1036's plane move.
+- **CC rc8 (CIRISConstitution 8c8f536) purge and run-kind rows**, at the functions production
+  runs: 2.4.1.1 `CLM-purge-tombstone-not-withdraws` (`steward_purge::purge_rows`,
+  `verify_purge_authorisation`), 2.4.1.1 `CLM-purge-never-reaches-key` (`parse_record_id`,
+  `resolve_selection`), 2.4.1.1 `CLM-accountability-record-unpurgeable`
+  (`migration::accountability_record_family`, #1054's shared list; `steward_purge::retraction_admissible`),
+  3.1.5 `CLM-trace-run-kind` (`refuse_mock_trace_attestation`; `schema::trace::RUN_KINDS`), 4.5.3
+  `CLM-purge-whole-or-not` (`purge_rows`, `purge_finalize`, `refuse_if_tombstoned_attestation`).
+  Not added, because v54.1.0 does less than the text: `CLM-steward-purge-authorisation` and
+  `CLM-purge-digest-preimage` (the notice is not yet an admitted row, so there is no
+  `reconsideration` to contest it and no Contribution for the tombstones to cite; the interim
+  human-subject gate stands in), and `CLM-derived-rows-follow-reason` (its legal-basis half is
+  #1007's takedown door, v55). Also withheld: `CLM-one-tombstone-row`,
+  `CLM-trace-schema-pinned`, `CLM-takedown-notice-row`.
 
 ### Changed — Verify 20.1.0 adopted: the three verify crates and the wheel floor move together (#992)
 

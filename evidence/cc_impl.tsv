@@ -209,3 +209,14 @@ decimal_id	claim_id	repo	path#symbol	crate@version
 4.1.1	CLM-self-edge-not-cycle	CIRISPersist	src/federation/admission.rs#is_trust_plane_edge	ciris-persist@54.0.0
 4.4.3.2.8	CLM-affiliation-config-record	CIRISPersist	src/federation/affiliation_config.rs#check_community_record	ciris-persist@54.0.0
 4.4.3.2.8	CLM-affiliation-config-record	CIRISPersist	src/federation/affiliation_config.rs#declared_cohort	ciris-persist@54.0.0
+2.4.1.1	CLM-purge-tombstone-not-withdraws	CIRISPersist	src/federation/steward_purge.rs#purge_rows	ciris-persist@54.0.0
+2.4.1.1	CLM-purge-tombstone-not-withdraws	CIRISPersist	src/federation/steward_purge.rs#verify_purge_authorisation	ciris-persist@54.0.0
+2.4.1.1	CLM-purge-never-reaches-key	CIRISPersist	src/federation/steward_purge.rs#parse_record_id	ciris-persist@54.0.0
+2.4.1.1	CLM-purge-never-reaches-key	CIRISPersist	src/federation/steward_purge.rs#resolve_selection	ciris-persist@54.0.0
+2.4.1.1	CLM-accountability-record-unpurgeable	CIRISPersist	src/federation/migration.rs#accountability_record_family	ciris-persist@54.0.0
+2.4.1.1	CLM-accountability-record-unpurgeable	CIRISPersist	src/federation/steward_purge.rs#retraction_admissible	ciris-persist@54.0.0
+3.1.5	CLM-trace-run-kind	CIRISPersist	src/federation/steward_purge.rs#refuse_mock_trace_attestation	ciris-persist@54.0.0
+3.1.5	CLM-trace-run-kind	CIRISPersist	src/schema/trace.rs#RUN_KINDS	ciris-persist@54.0.0
+4.5.3	CLM-purge-whole-or-not	CIRISPersist	src/federation/steward_purge.rs#purge_rows	ciris-persist@54.0.0
+4.5.3	CLM-purge-whole-or-not	CIRISPersist	src/federation/steward_purge.rs#purge_finalize	ciris-persist@54.0.0
+4.5.3	CLM-purge-whole-or-not	CIRISPersist	src/federation/steward_purge.rs#refuse_if_tombstoned_attestation	ciris-persist@54.0.0

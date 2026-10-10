@@ -15694,6 +15694,94 @@
     "manifest_round": "cc-repin-15-1052"
    },
    {
+    "decimal_id": "2.4.1.1",
+    "claim_id": "CLM-purge-tombstone-not-withdraws",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/steward_purge.rs#purge_rows",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc8-8c8f536-1052"
+   },
+   {
+    "decimal_id": "2.4.1.1",
+    "claim_id": "CLM-purge-tombstone-not-withdraws",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/steward_purge.rs#verify_purge_authorisation",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc8-8c8f536-1052"
+   },
+   {
+    "decimal_id": "2.4.1.1",
+    "claim_id": "CLM-purge-never-reaches-key",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/steward_purge.rs#parse_record_id",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc8-8c8f536-1052"
+   },
+   {
+    "decimal_id": "2.4.1.1",
+    "claim_id": "CLM-purge-never-reaches-key",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/steward_purge.rs#resolve_selection",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc8-8c8f536-1052"
+   },
+   {
+    "decimal_id": "2.4.1.1",
+    "claim_id": "CLM-accountability-record-unpurgeable",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/migration.rs#accountability_record_family",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc8-8c8f536-1052"
+   },
+   {
+    "decimal_id": "2.4.1.1",
+    "claim_id": "CLM-accountability-record-unpurgeable",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/steward_purge.rs#retraction_admissible",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc8-8c8f536-1052"
+   },
+   {
+    "decimal_id": "3.1.5",
+    "claim_id": "CLM-trace-run-kind",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/steward_purge.rs#refuse_mock_trace_attestation",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc8-8c8f536-1052"
+   },
+   {
+    "decimal_id": "3.1.5",
+    "claim_id": "CLM-trace-run-kind",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/schema/trace.rs#RUN_KINDS",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc8-8c8f536-1052"
+   },
+   {
+    "decimal_id": "4.5.3",
+    "claim_id": "CLM-purge-whole-or-not",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/steward_purge.rs#purge_rows",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc8-8c8f536-1052"
+   },
+   {
+    "decimal_id": "4.5.3",
+    "claim_id": "CLM-purge-whole-or-not",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/steward_purge.rs#purge_finalize",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc8-8c8f536-1052"
+   },
+   {
+    "decimal_id": "4.5.3",
+    "claim_id": "CLM-purge-whole-or-not",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/steward_purge.rs#refuse_if_tombstoned_attestation",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc8-8c8f536-1052"
+   },
+   {
     "decimal_id": "3.1.9.4",
     "claim_id": "CLM-nsproc-class-dual-scope-gate-watchlist-id",
     "repo": "CIRISPersist",
