@@ -38550,7 +38550,11 @@ mod tests {
             .await
             .expect_err("an unsigned family roster grow must be refused");
         assert!(
-            err.to_string().contains("not registered") || err.to_string().contains("signature"),
+            // v54.1.0 (#1042 follow-up B) — an empty authority is a row naming
+            // no signer: the terminal malformed refusal.
+            err.to_string().contains("not registered")
+                || err.to_string().contains("signature")
+                || err.to_string().contains("names no signer"),
             "the refusal is about AUTHORSHIP: {err:?}"
         );
         // v49.0.0 (#910): alice — the whole of this `unanimous` family — signs;
