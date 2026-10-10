@@ -347,5 +347,5 @@ sqlite	184	blob_cohort_associations	5515631984490399332
 postgres	184	blob_cohort_associations	6727743211086106808
 sqlite	185	dag_link_backfill_cursor	11302997608030026060
 postgres	185	dag_link_backfill_cursor	16500093909395014281
-sqlite	187	steward_purge	7547657216172557312
-postgres	187	steward_purge	11379433437359114983
+sqlite	187	steward_purge	5502289150037550418
+postgres	187	steward_purge	16303362266317701919

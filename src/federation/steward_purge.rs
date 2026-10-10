@@ -97,12 +97,9 @@ pub mod token {
     ];
 }
 
-/// The `takedown_notice` basis that authorises a steward purge
-/// (CIRISConstitution#165 §1, proposed CC 3.3.2 `LegalBasis::StewardPurge`).
+/// The `takedown_notice` basis that authorises a steward purge (CC 3.3.2
+/// `LegalBasis::StewardPurge`, CIRISConstitution rc8@9ce73e6).
 pub const STEWARD_PURGE_BASIS: &str = "steward_purge";
-
-/// The notice's `kind` (CC 3.3.2).
-pub const TAKEDOWN_NOTICE_KIND: &str = "takedown_notice";
 
 /// The sample a dry run shows: the first N record ids in JCS order (CSD-108
 /// §6 Q6). A VIEW of the ledger, which holds every id.
@@ -114,7 +111,9 @@ pub const SAMPLE_LEN: usize = 20;
 pub const PURGE_SETTLE_DWELL_SECS: i64 = 24 * 3600;
 
 /// The model id the agent's mock LLM reports (CIRISPersist#1040:
-/// `ciris_adapters/mock_llm`). A trace carrying it is test-harness input.
+/// `ciris_adapters/mock_llm`). It is what identifies the mock traces already
+/// held (they predate `run_kind`, CIRISAgent#1249), so the purge class keys
+/// on it; ADMISSION keys on the signed `run_kind` ([`TRACE_RUN_KIND_MOCK`]).
 pub const MOCK_LLM_MODEL: &str = "mock-model";
 
 /// The page size of the attestation scan the selection classes resolve over.
@@ -906,11 +905,12 @@ pub struct PurgeDryRun {
     /// The ledger, to be written to `evidence/purges/<date>-<digest>.tsv`
     /// BEFORE the notice is cosigned (its `evidence_refs` point at it).
     pub ledger_tsv: String,
-    /// The notice envelope to complete and cosign: `kind`, `legal_basis`,
-    /// `selection_digest`, `selection_counts` and `selection` are filled;
-    /// the proposer fills `claimant_key_id`, `claim_text`,
-    /// `good_faith_statement`, `jurisdiction`, `evidence_refs`, `asserted_at`
-    /// and `expires_at`.
+    /// The `takedown_notice` payload (CC 3.3.2) to complete and cosign:
+    /// `legal_basis`, `content_sha256` (the selection digest),
+    /// `content_holder_key_ids` (empty: a purge names no holder) and
+    /// `selection_counts` are filled; the proposer fills `claimant_key_id`,
+    /// `claim_text`, `good_faith_statement`, `jurisdiction`, `evidence_refs`
+    /// (the dry-run ledger), `asserted_at` and `expires_at`.
     pub notice_template: serde_json::Value,
 }
 
@@ -972,17 +972,20 @@ where
         &[
             ("selection_digest", digest.clone()),
             ("record_count", ids.len().to_string()),
+            (
+                "selection",
+                serde_json::to_string(selection).expect("a selection serializes"),
+            ),
             ("notice_id", "(dry run: no notice yet)".to_owned()),
         ],
         "",
         &resolved.records,
     );
     let notice_template = serde_json::json!({
-        "kind": TAKEDOWN_NOTICE_KIND,
         "legal_basis": STEWARD_PURGE_BASIS,
-        "selection_digest": digest,
+        "content_sha256": digest,
+        "content_holder_key_ids": [],
         "selection_counts": counts,
-        "selection": selection,
     });
     Ok(PurgeDryRun {
         selection: selection.clone(),
@@ -1063,11 +1066,6 @@ pub fn notice_terms(envelope: &serde_json::Value) -> Result<NoticeTerms, Error> 
             _ => Err(unauth(format!("the notice carries no non-empty `{k}`"))),
         }
     };
-    if s("kind")? != TAKEDOWN_NOTICE_KIND {
-        return Err(unauth(format!(
-            "the notice's kind is not `{TAKEDOWN_NOTICE_KIND}`"
-        )));
-    }
     let basis = s("legal_basis")?;
     if basis != STEWARD_PURGE_BASIS {
         return Err(unauth(format!(
@@ -1076,10 +1074,20 @@ pub fn notice_terms(envelope: &serde_json::Value) -> Result<NoticeTerms, Error> 
         )));
     }
     let claimant_key_id = s("claimant_key_id")?;
-    let selection_digest = s("selection_digest")?;
+    // CC 3.3.2: for `steward_purge`, `content_sha256` IS the selection digest.
+    let selection_digest = s("content_sha256")?;
     if !is_hex64(&selection_digest) {
         return Err(unauth(
-            "selection_digest is not 64 lowercase hex".to_owned(),
+            "content_sha256 (the selection digest) is not 64 lowercase hex".to_owned(),
+        ));
+    }
+    if !envelope
+        .get("content_holder_key_ids")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|a| a.iter().all(serde_json::Value::is_string))
+    {
+        return Err(unauth(
+            "content_holder_key_ids must be a string array (CC 3.3.2)".to_owned(),
         ));
     }
     s("claim_text")?;
@@ -1189,8 +1197,16 @@ pub struct PurgeExecution {
     pub notice_id: String,
     /// The digest the notice names and the tombstones re-derive.
     pub selection_digest: String,
-    /// The trust root that authorised it.
+    /// The notice's claimant: for `steward_purge`, the trust root that
+    /// authorised it.
     pub claimant_key_id: String,
+    /// The notice's `legal_basis` (CC 3.3.2). One tombstone row serves
+    /// takedown and purge (CIRISConstitution rc8@9ce73e6, CC 4.5.3): the
+    /// basis is what tells a `steward_purge` (cosigned, any plane, hard
+    /// delete after settle) from a duty-holder takedown (bytes plane only;
+    /// an immediate-removal basis destroys on receipt — the v55 door,
+    /// CIRISPersist#1007).
+    pub legal_basis: String,
     /// How many records the selection holds.
     pub record_count: u64,
     /// The notice envelope's JCS text, verbatim.
@@ -1345,6 +1361,7 @@ where
             notice_id: terms.notice_id.clone(),
             selection_digest: digest.clone(),
             claimant_key_id: terms.claimant_key_id.clone(),
+            legal_basis: STEWARD_PURGE_BASIS.to_owned(),
             record_count: total,
             notice_jcs,
             cosignatures_json,
@@ -1509,6 +1526,7 @@ where
             ("selection_digest", e.selection_digest.clone()),
             ("notice_id", e.notice_id.clone()),
             ("claimant_key_id", e.claimant_key_id.clone()),
+            ("legal_basis", e.legal_basis.clone()),
             ("record_count", e.record_count.to_string()),
             ("executed_by", e.executed_by.clone()),
             ("origin", e.origin.clone()),
@@ -1822,6 +1840,7 @@ where
             notice_id: terms.notice_id.clone(),
             selection_digest: digest,
             claimant_key_id: terms.claimant_key_id,
+            legal_basis: STEWARD_PURGE_BASIS.to_owned(),
             record_count: records.len() as u64,
             notice_jcs,
             cosignatures_json,
@@ -1920,50 +1939,55 @@ where
     }
 }
 
-// ── #1040: the mock-LLM trace refusal ──────────────────────────────────────
+// ── #1040: the mock-run trace refusal (CC 3.1.5, CIRISConstitution#166) ──
 
-/// CIRISPersist#1040 — the refusal token for a trace whose LLM calls report
-/// the mock model.
-pub const TRACE_RUNTIME_MOCK: &str = "trace_runtime_mock";
+/// CIRISConstitution#166 (rc8@9ce73e6) — the refusal token for a trace whose
+/// signed `run_kind` is `mock`.
+pub const TRACE_RUN_KIND_MOCK: &str = "trace_run_kind_mock";
 
-/// CIRISPersist#1040 — the mock model a decomposed trace's LLM calls report,
-/// if any. Pure.
+/// The `run_kind` value a mock-LLM run declares (closed vocabulary
+/// `production | qa | battery | mock`, CC 3.1.5).
+pub const RUN_KIND_MOCK: &str = "mock";
+
+/// A trace JSON's `run_kind` member, if it carries one. Pure. Traces carry it
+/// from CIRISAgent#1249's schema bump; until then it is absent and nothing is
+/// refused on this ground.
 #[must_use]
-pub fn mock_model_of(llm_calls: &[crate::store::TraceLlmCallRow]) -> Option<String> {
-    llm_calls
-        .iter()
-        .filter_map(|c| c.model.as_deref())
-        .find(|m| *m == MOCK_LLM_MODEL)
-        .map(str::to_owned)
+pub fn trace_run_kind(trace: &serde_json::Value) -> Option<&str> {
+    trace.get("run_kind").and_then(serde_json::Value::as_str)
 }
 
-/// CIRISPersist#1040 — the FEDERATION-tier attestation gate: a replicated
-/// `trace:complete:v1` attestation whose embedded trace reports the mock LLM
-/// is refused ([`TRACE_RUNTIME_MOCK`]). A local-tier row is untouched (a node
-/// may keep its own QA traces). Pure.
+/// CIRISConstitution#166 — the FEDERATION-tier attestation gate: a
+/// `trace:complete:v1` attestation whose embedded trace declares `run_kind`
+/// `mock` is refused ([`TRACE_RUN_KIND_MOCK`]). A local-tier row is untouched
+/// (a node may keep its own QA traces). Pure.
 ///
 /// # Errors
 ///
-/// [`Error::PurgeRefused`] with [`TRACE_RUNTIME_MOCK`].
+/// [`Error::PurgeRefused`] with [`TRACE_RUN_KIND_MOCK`].
 pub fn refuse_mock_trace_attestation(row: &Attestation) -> Result<(), Error> {
     if row.tier != super::types::attestation_tier::FEDERATION {
         return Ok(());
     }
-    let Some(decomposed) =
-        crate::ingest::project_trace_events_from_attestation(&row.attestation_envelope)
-    else {
+    if super::admission::envelope_dimension(&row.attestation_envelope)
+        != Some(crate::ingest::TRACE_ATTESTATION_DIMENSION)
+    {
         return Ok(());
-    };
-    match mock_model_of(&decomposed.llm_calls) {
-        Some(model) => Err(refused(
-            TRACE_RUNTIME_MOCK,
+    }
+    match row
+        .attestation_envelope
+        .get("trace")
+        .and_then(trace_run_kind)
+    {
+        Some(RUN_KIND_MOCK) => Err(refused(
+            TRACE_RUN_KIND_MOCK,
             serde_json::json!({
                 "attestation_id": row.attestation_id,
-                "model": model,
-                "reason": "a mock-LLM trace is test-harness input; the federation tier refuses it \
-                           (CIRISPersist#1040)",
+                "run_kind": RUN_KIND_MOCK,
+                "reason": "a mock run attests nothing about any agent; the federation tier \
+                           refuses it (CC 3.1.5, CIRISConstitution#166)",
             }),
         )),
-        None => Ok(()),
+        _ => Ok(()),
     }
 }

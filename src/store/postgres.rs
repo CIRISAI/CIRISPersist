@@ -5334,7 +5334,7 @@ impl PostgresBackend {
 /// v54.1.0 (CIRISPersist#1046) — the V187 header columns, spelled once.
 const PG_PURGE_EXECUTION_SELECT: &str = "SELECT notice_id, selection_digest, claimant_key_id, \
      record_count, notice_jcs, cosignatures_json, executed_by, origin, executed_at, \
-     admitted_at, finalized_at FROM cirislens.purge_executions";
+     admitted_at, finalized_at, legal_basis FROM cirislens.purge_executions";
 
 fn pg_row_to_purge_execution(
     r: &tokio_postgres::Row,
@@ -5345,6 +5345,7 @@ fn pg_row_to_purge_execution(
         notice_id: r.safe_get_with(0, E::Backend)?,
         selection_digest: r.safe_get_with(1, E::Backend)?,
         claimant_key_id: r.safe_get_with(2, E::Backend)?,
+        legal_basis: r.safe_get_with(11, E::Backend)?,
         record_count: u64::try_from(record_count).unwrap_or_default(),
         notice_jcs: r.safe_get_with(4, E::Backend)?,
         cosignatures_json: r.safe_get_with(5, E::Backend)?,
@@ -5530,8 +5531,8 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .execute(
                 "INSERT INTO cirislens.purge_executions (notice_id, selection_digest, \
                     claimant_key_id, record_count, notice_jcs, cosignatures_json, executed_by, \
-                    origin, executed_at, admitted_at, finalized_at) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, clock_timestamp(), NULL) \
+                    origin, executed_at, admitted_at, finalized_at, legal_basis) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, clock_timestamp(), NULL, $10) \
                  ON CONFLICT (notice_id) DO NOTHING",
                 &[
                     &e.notice_id,
@@ -5543,6 +5544,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     &e.executed_by,
                     &e.origin,
                     &e.executed_at,
+                    &e.legal_basis,
                 ],
             )
             .await

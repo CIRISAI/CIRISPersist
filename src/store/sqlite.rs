@@ -4117,8 +4117,8 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             tx.execute(
                 "INSERT INTO purge_executions (notice_id, selection_digest, claimant_key_id, \
                     record_count, notice_jcs, cosignatures_json, executed_by, origin, \
-                    executed_at, admitted_at, finalized_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL)",
+                    executed_at, admitted_at, finalized_at, legal_basis) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL, ?11)",
                 rusqlite::params![
                     e.notice_id,
                     e.selection_digest,
@@ -4130,6 +4130,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     e.origin,
                     purge_instant_text(e.executed_at),
                     purge_instant_text(position),
+                    e.legal_basis,
                 ],
             )?;
             tx.commit()?;
@@ -22631,7 +22632,7 @@ fn purge_instant_text(t: chrono::DateTime<chrono::Utc>) -> String {
 /// v54.1.0 (CIRISPersist#1046) — the V187 header columns, spelled once.
 const PURGE_EXECUTION_SELECT: &str = "SELECT notice_id, selection_digest, claimant_key_id, \
      record_count, notice_jcs, cosignatures_json, executed_by, origin, executed_at, \
-     admitted_at, finalized_at FROM purge_executions";
+     admitted_at, finalized_at, legal_basis FROM purge_executions";
 
 fn sqlite_row_to_purge_execution(
     r: &rusqlite::Row<'_>,
@@ -22651,6 +22652,7 @@ fn sqlite_row_to_purge_execution(
         notice_id: r.get(0)?,
         selection_digest: r.get(1)?,
         claimant_key_id: r.get(2)?,
+        legal_basis: r.get(11)?,
         record_count: u64::try_from(r.get::<_, i64>(3)?).unwrap_or_default(),
         notice_jcs: r.get(4)?,
         cosignatures_json: r.get(5)?,

@@ -15,7 +15,8 @@ CREATE TABLE IF NOT EXISTS cirislens.purge_executions (
     origin             TEXT NOT NULL CHECK (origin IN ('local', 'replicated')),
     executed_at        TIMESTAMPTZ NOT NULL,
     admitted_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    finalized_at       TIMESTAMPTZ NULL
+    finalized_at       TIMESTAMPTZ NULL,
+    legal_basis        TEXT NOT NULL CHECK (legal_basis <> '')
 );
 
 CREATE INDEX IF NOT EXISTS purge_executions_serve

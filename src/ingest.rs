@@ -218,7 +218,8 @@ pub enum IngestError {
 
     /// v54.1.0 — a trace the substrate refuses to admit on a NAMED ground,
     /// before anything is written (zero rows for the whole batch):
-    /// `trace_runtime_mock` (CIRISPersist#1040 — a mock-LLM trace offered to
+    /// `trace_run_kind_mock` (CIRISPersist#1040, CIRISConstitution#166 — a
+    /// trace whose signed `run_kind` is `mock`, offered to
     /// a node holding the `canonical` role, the federation corpus) or
     /// `purge_tombstoned` (CIRISPersist#1046 — a trace a steward purge
     /// tombstoned). Lens → HTTP 422.
@@ -519,14 +520,26 @@ where
 {
     /// v54.1.0 (CIRISPersist#1040, #1046) — step 2b of
     /// [`receive_and_persist_with`](Self::receive_and_persist_with): refuse a
-    /// tombstoned trace on every node, and a mock-LLM trace on a node holding
-    /// the `canonical` role (its OWN verified role, re-derived from its own
+    /// tombstoned trace on every node, and a trace whose signed `run_kind` is
+    /// `mock` (CC 3.1.5, CIRISConstitution#166) on a node holding the
+    /// `canonical` role (its OWN verified role, re-derived from its own
     /// directory; a node with no identity set is not the canonical).
-    async fn refuse_named_traces(&self, env: &BatchEnvelope) -> Result<(), IngestError> {
+    /// `run_kind` is read from the wire body: the typed trace does not carry
+    /// it until CIRISAgent#1249's schema bump.
+    async fn refuse_named_traces(
+        &self,
+        env: &BatchEnvelope,
+        bytes: &[u8],
+    ) -> Result<(), IngestError> {
         let refused =
             |kind: &'static str, detail: String| IngestError::TraceRefused { kind, detail };
+        let raw: Option<serde_json::Value> = serde_json::from_slice(bytes).ok();
+        let raw_events = raw
+            .as_ref()
+            .and_then(|v| v.get("events"))
+            .and_then(serde_json::Value::as_array);
         let mut canonical: Option<bool> = None;
-        for event in &env.events {
+        for (i, event) in env.events.iter().enumerate() {
             let BatchEvent::CompleteTrace { trace, .. } = event;
             match self
                 .backend
@@ -545,14 +558,13 @@ where
                 Ok(None) | Err(crate::federation::Error::Unsupported { .. }) => {}
                 Err(e) => return Err(IngestError::Store(StoreError::Backend(e.to_string()))),
             }
-            let Ok(decomposed) = crate::store::decompose::decompose(trace) else {
+            let run_kind = raw_events
+                .and_then(|events| events.get(i))
+                .and_then(|e| e.get("trace"))
+                .and_then(crate::federation::steward_purge::trace_run_kind);
+            if run_kind != Some(crate::federation::steward_purge::RUN_KIND_MOCK) {
                 continue;
-            };
-            let Some(model) =
-                crate::federation::steward_purge::mock_model_of(&decomposed.llm_calls)
-            else {
-                continue;
-            };
+            }
             let is_canonical = match canonical {
                 Some(c) => c,
                 None => {
@@ -571,8 +583,8 @@ where
             };
             if is_canonical {
                 return Err(refused(
-                    crate::federation::steward_purge::TRACE_RUNTIME_MOCK,
-                    format!("trace_id={} model={model}", trace.trace_id),
+                    crate::federation::steward_purge::TRACE_RUN_KIND_MOCK,
+                    format!("trace_id={} run_kind=mock", trace.trace_id),
                 ));
             }
         }
@@ -676,11 +688,11 @@ where
         // 2b. v54.1.0 — refusals on a NAMED ground, before any write.
         //     (CIRISPersist#1046) a trace a steward purge tombstoned is never
         //     re-admitted — the tombstone outlives the rows it removed.
-        //     (CIRISPersist#1040) a node holding the `canonical` role is the
-        //     federation corpus: a trace whose LLM calls report the mock model
-        //     is test-harness input and is refused there. Every other node
-        //     (an agent's own store, a QA node) keeps it.
-        self.refuse_named_traces(&env).await?;
+        //     (CIRISPersist#1040, CIRISConstitution#166) a node holding the
+        //     `canonical` role is the federation corpus: a trace whose signed
+        //     `run_kind` is `mock` attests nothing and is refused there. Every
+        //     other node (an agent's own store, a QA node) keeps it.
+        self.refuse_named_traces(&env, bytes).await?;
 
         // 3. Capture pre-scrub canonical bytes for every component.
         //    FSD §3.3 step 3.5: original_content_hash is sha256 of

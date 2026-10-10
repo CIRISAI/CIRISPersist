@@ -18,6 +18,13 @@
 -- serve position. `purge_tombstones` is keyed per notice, so every notice's
 -- id list is complete and its digest re-derives from its own rows; the
 -- `(plane, record_ref)` index is the admission gates' lookup.
+--
+-- ONE tombstone row for takedown and purge (CC 4.5.3, CIRISConstitution
+-- rc8@9ce73e6): `legal_basis` is the authorising notice's basis, so the same
+-- tables hold a duty-holder takedown (bytes plane only; an immediate-removal
+-- basis destroys on receipt, so `finalized_at` is simply set at once) beside
+-- a `steward_purge` (any plane; hard delete after the round settles). No
+-- column assumes `steward_purge`; v54.1.0 writes only that basis.
 
 CREATE TABLE IF NOT EXISTS purge_executions (
     notice_id          TEXT PRIMARY KEY CHECK (length(notice_id) = 64 AND notice_id NOT GLOB '*[^0-9a-f]*'),
@@ -30,7 +37,8 @@ CREATE TABLE IF NOT EXISTS purge_executions (
     origin             TEXT NOT NULL CHECK (origin IN ('local', 'replicated')),
     executed_at        TEXT NOT NULL,
     admitted_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    finalized_at       TEXT NULL
+    finalized_at       TEXT NULL,
+    legal_basis        TEXT NOT NULL CHECK (legal_basis <> '')
 );
 
 CREATE INDEX IF NOT EXISTS purge_executions_serve

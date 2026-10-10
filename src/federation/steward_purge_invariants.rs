@@ -33,10 +33,13 @@
 //!   door, never withheld in place). Its selection half is I662.
 //! - **I658** — #1043 class 2 (by actor): the harness identity's key, rows and
 //!   traces are one selection; after finalize its key cannot be re-registered.
-//! - **I659** — #1040's admission refusal `trace_runtime_mock`: a
-//!   federation-tier mock trace attestation is refused (a local one is kept);
-//!   ingest on a node holding `canonical` refuses a mock trace, a node without
-//!   it keeps it; a tombstoned trace is refused at ingest everywhere.
+//! - **I659** — #1040's admission refusal `trace_run_kind_mock` (CC 3.1.5,
+//!   CIRISConstitution#166), keyed on the signed `run_kind`: a federation-tier
+//!   `run_kind: mock` trace attestation is refused at the put and the
+//!   promotion door (a local one is kept; a production run on the mock model's
+//!   id, or a trace with no `run_kind`, passes); ingest on a node holding
+//!   `canonical` refuses a mock run, a node without it keeps it; a tombstoned
+//!   trace is refused at ingest everywhere.
 //! - **I660** — the delete doors re-ask the tombstone: an untombstoned row is
 //!   never deleted through them.
 //! - **I661** — from disk: every backend's attestation put, both key doors,
@@ -46,6 +49,11 @@
 //!   today is still served until it is purged; `RefusedToday` selects it and
 //!   every score derived from it (nothing else), the dry run counts per table
 //!   and writes nothing, and once executed the purged rows stop being served.
+//! - **I664** — one tombstone row for takedown and purge (CC 4.5.3,
+//!   CIRISConstitution rc8@9ce73e6): a header with ANOTHER basis (a
+//!   duty-holder `ncmec_csam` takedown, the v55 #1007 door's row) and its
+//!   bytes-plane tombstone round-trip through the store with their basis
+//!   intact, and the ledger names the basis.
 //! - **I663** — #1043 class 2 is a list of by-actor selections: the harness
 //!   prefixes name exactly the registered keys that start with them (never a
 //!   production-looking `ciris-server-*` key, never a near-miss), an empty
@@ -161,7 +169,7 @@ pub(crate) mod bodies {
         now: chrono::DateTime<chrono::Utc>,
     ) -> StewardPurgeNotice {
         let mut env = template.clone();
-        let digest = env["selection_digest"]
+        let digest = env["content_sha256"]
             .as_str()
             .unwrap_or_default()
             .to_owned();
@@ -530,14 +538,14 @@ pub(crate) mod bodies {
         let (plane, _) = last.split_once(':').unwrap();
         ids.push(format!("{plane}:00000000-0000-4000-8000-000000000000"));
         let mut tpl = dry.notice_template.clone();
-        tpl["selection_digest"] = serde_json::json!(sp::selection_digest(&ids));
+        tpl["content_sha256"] = serde_json::json!(sp::selection_digest(&ids));
         let notice = notice_for(&tpl, &[cc::FOUNDERS[0], cc::FOUNDERS[2]], t);
         let e = sp::purge_rows(dir, &mock_selection(), &notice, NODE, t)
             .await
             .expect_err("digest mismatch");
         let (tok, body) = refusal(&e);
         assert_eq!(tok, token::SELECTION_DIGEST_MISMATCH, "I651: {body}");
-        assert_eq!(body["expected"], tpl["selection_digest"]);
+        assert_eq!(body["expected"], tpl["content_sha256"]);
         assert_eq!(body["found"], serde_json::json!(dry.selection_digest));
         assert_nothing_written(d, &notice).await;
     }
@@ -1164,6 +1172,58 @@ pub(crate) mod bodies {
         assert_eq!(served_ids(d).await, served_before, "I663: read-only");
     }
 
+    // ── I664 ──────────────────────────────────────────────────────────────
+    pub(crate) async fn i664_the_tombstone_row_holds_another_basis<D: Seams>(d: &D) {
+        let dir = d.as_dyn_directory();
+        let t = now();
+        let sha = "ab".repeat(32);
+        let exec = sp::PurgeExecution {
+            notice_id: "cd".repeat(32),
+            selection_digest: sha.clone(),
+            claimant_key_id: "moderator-1".to_owned(),
+            legal_basis: "ncmec_csam".to_owned(),
+            record_count: 1,
+            notice_jcs: "{}".to_owned(),
+            cosignatures_json: "[]".to_owned(),
+            executed_by: NODE.to_owned(),
+            origin: sp::origin::LOCAL.to_owned(),
+            executed_at: t,
+            admitted_at: t,
+            finalized_at: None,
+        };
+        assert!(dir.purge_put_execution(&exec).await.unwrap());
+        assert!(dir
+            .purge_put_tombstone(&sp::PurgeTombstone {
+                notice_id: exec.notice_id.clone(),
+                ordinal: 0,
+                plane: PurgePlane::Blob,
+                record_ref: sha.clone(),
+                derived_from: None,
+            })
+            .await
+            .unwrap());
+        let got = dir
+            .purge_execution(&exec.notice_id)
+            .await
+            .unwrap()
+            .expect("held");
+        assert_eq!(got.legal_basis, "ncmec_csam", "I664: the basis round-trips");
+        assert_eq!(
+            (got.claimant_key_id.as_str(), got.selection_digest.as_str()),
+            (exec.claimant_key_id.as_str(), sha.as_str())
+        );
+        assert_eq!(
+            dir.purge_tombstoned("blob", &sha).await.unwrap(),
+            Some(exec.notice_id.clone()),
+            "I664: the bytes-plane tombstone names its notice"
+        );
+        let ledger = sp::purge_ledger_tsv(dir, &exec.notice_id).await.unwrap();
+        assert!(
+            ledger.contains("# legal_basis\tncmec_csam\n"),
+            "I664: the ledger names the basis:\n{ledger}"
+        );
+    }
+
     // ── I658 ──────────────────────────────────────────────────────────────
     pub(crate) async fn i658_by_actor_and_the_key_cannot_return<D: Seams>(d: &D) {
         root(d).await;
@@ -1223,8 +1283,15 @@ pub(crate) mod bodies {
     }
 
     // ── I659 ──────────────────────────────────────────────────────────────
-    fn trace_json(trace_id: &str, signer: &str, model: &str) -> serde_json::Value {
-        serde_json::json!({
+    /// A trace whose LLM call reports `model` and which declares `run_kind`
+    /// (absent when `None`, as every pre-CIRISAgent#1249 trace is).
+    fn trace_json(
+        trace_id: &str,
+        signer: &str,
+        model: &str,
+        run_kind: Option<&str>,
+    ) -> serde_json::Value {
+        let mut t = serde_json::json!({
             "trace_id": trace_id,
             "thought_id": "th-1",
             "task_id": "task-1",
@@ -1256,7 +1323,11 @@ pub(crate) mod bodies {
             ],
             "signature": "",
             "signature_key_id": signer,
-        })
+        });
+        if let Some(k) = run_kind {
+            t["run_kind"] = serde_json::json!(k);
+        }
+        t
     }
 
     fn batch(trace: &serde_json::Value) -> Vec<u8> {
@@ -1304,7 +1375,7 @@ pub(crate) mod bodies {
             &serde_json::json!({
                 "dimension": crate::ingest::TRACE_ATTESTATION_DIMENSION,
                 "trace_id": "trace-i659-att",
-                "trace": trace_json("trace-i659-att", AGENT, sp::MOCK_LLM_MODEL),
+                "trace": trace_json("trace-i659-att", AGENT, "gpt-real", Some(sp::RUN_KIND_MOCK)),
             }),
         );
         row.attestation_type = attestation_type::SCORES.to_owned();
@@ -1315,26 +1386,45 @@ pub(crate) mod bodies {
             })
             .await
             .expect_err("a federation-tier mock trace is refused");
-        assert_eq!(e.kind(), sp::TRACE_RUNTIME_MOCK, "I659(a): {e}");
+        assert_eq!(e.kind(), sp::TRACE_RUN_KIND_MOCK, "I659(a): {e}");
         assert!(sp::refuse_mock_trace_attestation(&row).is_err());
         // The tier crossing mints a federation-tier row: a local QA trace
         // cannot cross either.
         let e = crate::federation::admission::check_promotion_admission(dir, &row, None)
             .await
             .expect_err("a mock trace cannot cross");
-        assert_eq!(e.kind(), sp::TRACE_RUNTIME_MOCK, "I659(a) promotion: {e}");
+        assert_eq!(e.kind(), sp::TRACE_RUN_KIND_MOCK, "I659(a) promotion: {e}");
         let mut local = row.clone();
         local.tier = crate::federation::types::attestation_tier::LOCAL.to_owned();
         assert!(
             sp::refuse_mock_trace_attestation(&local).is_ok(),
             "the local tier keeps QA traces"
         );
-        let mut real = row.clone();
-        real.attestation_envelope["trace"] = trace_json("trace-i659-att", AGENT, "gpt-real");
-        assert!(
-            sp::refuse_mock_trace_attestation(&real).is_ok(),
-            "a real model passes"
-        );
+        // Keyed on the signed `run_kind`, never on a model-name heuristic: a
+        // production run on the mock model's id, and a trace that predates
+        // `run_kind`, pass.
+        for (what, trace) in [
+            (
+                "run_kind production",
+                trace_json(
+                    "trace-i659-att",
+                    AGENT,
+                    sp::MOCK_LLM_MODEL,
+                    Some("production"),
+                ),
+            ),
+            (
+                "no run_kind",
+                trace_json("trace-i659-att", AGENT, sp::MOCK_LLM_MODEL, None),
+            ),
+        ] {
+            let mut other = row.clone();
+            other.attestation_envelope["trace"] = trace;
+            assert!(
+                sp::refuse_mock_trace_attestation(&other).is_ok(),
+                "I659(a): {what} passes"
+            );
+        }
 
         // (b) ingest: a node holding `canonical` refuses, a plain node keeps.
         ts::register_hybrid_key(dir, NODE).await;
@@ -1344,7 +1434,12 @@ pub(crate) mod bodies {
         canonical.set_node(NODE);
         // Before the role: this node is not the federation corpus, so it keeps
         // a mock trace like any other node would.
-        let early = batch(&trace_json("trace-i659-early", AGENT, sp::MOCK_LLM_MODEL));
+        let early = batch(&trace_json(
+            "trace-i659-early",
+            AGENT,
+            "gpt-real",
+            Some(sp::RUN_KIND_MOCK),
+        ));
         ingest(canonical, &early)
             .await
             .expect("a node without `canonical` keeps it");
@@ -1352,11 +1447,16 @@ pub(crate) mod bodies {
         assert!(crate::federation::is_canonical_effective(dir, NODE)
             .await
             .unwrap());
-        let mock = batch(&trace_json("trace-i659-ingest", AGENT, sp::MOCK_LLM_MODEL));
+        let mock = batch(&trace_json(
+            "trace-i659-ingest",
+            AGENT,
+            "gpt-real",
+            Some(sp::RUN_KIND_MOCK),
+        ));
         let e = ingest(canonical, &mock)
             .await
             .expect_err("refused on the canonical");
-        assert_eq!(e.kind(), sp::TRACE_RUNTIME_MOCK, "I659(b): {e}");
+        assert_eq!(e.kind(), sp::TRACE_RUN_KIND_MOCK, "I659(b): {e}");
         assert_eq!(
             dir.purge_trace_row_counts(&["trace-i659-ingest".to_owned()])
                 .await
@@ -1364,7 +1464,12 @@ pub(crate) mod bodies {
             (0, 0),
             "I659(b): zero rows for the refused batch"
         );
-        let real = batch(&trace_json("trace-i659-real", AGENT, "gpt-real"));
+        let real = batch(&trace_json(
+            "trace-i659-real",
+            AGENT,
+            sp::MOCK_LLM_MODEL,
+            Some("production"),
+        ));
         ingest(canonical, &real)
             .await
             .expect("a real trace is admitted on the canonical");
@@ -1517,6 +1622,11 @@ mod run {
                     b::i662_refused_today_is_a_selection_not_a_filter(&d).await
                 }
                 #[tokio::test]
+                async fn i664() {
+                    let Some(d) = $fresh.await else { return };
+                    b::i664_the_tombstone_row_holds_another_basis(&d).await
+                }
+                #[tokio::test]
                 async fn i663() {
                     let Some(d) = $fresh.await else { return };
                     b::i663_harness_identities_are_by_actor_selections(&d).await
@@ -1615,7 +1725,7 @@ mod run {
         assert!(promo.contains("steward_purge::refuse_mock_trace_attestation(row)?"));
         assert!(promo.contains("steward_purge::refuse_if_tombstoned_attestation(directory, row)"));
         let ingest = strip(include_str!("../ingest.rs"));
-        assert!(ingest.contains("self.refuse_named_traces(&env).await?;"));
+        assert!(ingest.contains("self.refuse_named_traces(&env, bytes).await?;"));
     }
 
     /// The refusal tokens are a closed set of stable strings (CIRISServer#756
@@ -1637,8 +1747,8 @@ mod run {
             ]
         );
         assert_eq!(
-            crate::federation::steward_purge::TRACE_RUNTIME_MOCK,
-            "trace_runtime_mock"
+            crate::federation::steward_purge::TRACE_RUN_KIND_MOCK,
+            "trace_run_kind_mock"
         );
         assert_eq!(
             crate::federation::steward_purge::STEWARD_PURGE_BASIS,
