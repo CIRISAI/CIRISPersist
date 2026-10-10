@@ -524,22 +524,13 @@ where
     /// `mock` (CC 3.1.5, CIRISConstitution#166) on a node holding the
     /// `canonical` role (its OWN verified role, re-derived from its own
     /// directory; a node with no identity set is not the canonical).
-    /// `run_kind` is read from the wire body: the typed trace does not carry
-    /// it until CIRISAgent#1249's schema bump.
-    async fn refuse_named_traces(
-        &self,
-        env: &BatchEnvelope,
-        bytes: &[u8],
-    ) -> Result<(), IngestError> {
+    /// `run_kind` is the trace's SIGNED member (verified in step 2 when it is
+    /// present).
+    async fn refuse_named_traces(&self, env: &BatchEnvelope) -> Result<(), IngestError> {
         let refused =
             |kind: &'static str, detail: String| IngestError::TraceRefused { kind, detail };
-        let raw: Option<serde_json::Value> = serde_json::from_slice(bytes).ok();
-        let raw_events = raw
-            .as_ref()
-            .and_then(|v| v.get("events"))
-            .and_then(serde_json::Value::as_array);
         let mut canonical: Option<bool> = None;
-        for (i, event) in env.events.iter().enumerate() {
+        for event in &env.events {
             let BatchEvent::CompleteTrace { trace, .. } = event;
             match self
                 .backend
@@ -558,11 +549,7 @@ where
                 Ok(None) | Err(crate::federation::Error::Unsupported { .. }) => {}
                 Err(e) => return Err(IngestError::Store(StoreError::Backend(e.to_string()))),
             }
-            let run_kind = raw_events
-                .and_then(|events| events.get(i))
-                .and_then(|e| e.get("trace"))
-                .and_then(crate::federation::steward_purge::trace_run_kind);
-            if run_kind != Some(crate::federation::steward_purge::RUN_KIND_MOCK) {
+            if trace.run_kind.as_deref() != Some(crate::federation::steward_purge::RUN_KIND_MOCK) {
                 continue;
             }
             let is_canonical = match canonical {
@@ -692,7 +679,7 @@ where
         //     `canonical` role is the federation corpus: a trace whose signed
         //     `run_kind` is `mock` attests nothing and is refused there. Every
         //     other node (an agent's own store, a QA node) keeps it.
-        self.refuse_named_traces(&env, bytes).await?;
+        self.refuse_named_traces(&env).await?;
 
         // 3. Capture pre-scrub canonical bytes for every component.
         //    FSD §3.3 step 3.5: original_content_hash is sha256 of
@@ -1706,6 +1693,7 @@ mod tests {
             signature_ml_dsa_65: None,
             pubkey_ml_dsa_65: None,
             pqc_key_id: None,
+            run_kind: None,
         };
         // v7.2.0 (#225) — hybrid-sign so the Full-mode hard cut admits.
         hybrid_sign_trace(&mut trace, &sk).await;
@@ -1770,6 +1758,7 @@ mod tests {
             signature_ml_dsa_65: None,
             pubkey_ml_dsa_65: None,
             pqc_key_id: None,
+            run_kind: None,
         };
         // Sign over the canonical allowlist — cohort fields excluded.
         // v7.2.0 (#225) — hybrid-sign so the Full-mode hard cut admits;
@@ -2856,6 +2845,7 @@ mod tests {
             signature_ml_dsa_65: None,
             pubkey_ml_dsa_65: None,
             pqc_key_id: None,
+            run_kind: None,
         };
         // Hybrid-sign the 2.7.9 canonical (per-component agent_id_hash
         // included; deployment_profile in the envelope alpha-position).
@@ -2982,6 +2972,7 @@ mod tests {
             signature_ml_dsa_65: None,
             pubkey_ml_dsa_65: None,
             pqc_key_id: None,
+            run_kind: None,
         };
         let d1 = decompose(&trace).unwrap();
         let d2 = decompose(&trace).unwrap();
@@ -3076,6 +3067,7 @@ mod tests {
             signature_ml_dsa_65: None,
             pubkey_ml_dsa_65: None,
             pqc_key_id: None,
+            run_kind: None,
         };
         let canonical = crate::verify::ed25519::canonical_bytes_for_trace(
             &trace,
@@ -3164,6 +3156,7 @@ mod tests {
             signature_ml_dsa_65: None,
             pubkey_ml_dsa_65: None,
             pqc_key_id: None,
+            run_kind: None,
         };
         let canonical = crate::verify::ed25519::canonical_bytes_for_trace(
             &trace,

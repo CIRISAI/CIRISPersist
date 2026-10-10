@@ -78,10 +78,16 @@
 //!   notice can lift (the accountability record; a composer without its
 //!   target): a quorum-cosigned bundle naming a held `moderation_track_record`
 //!   row is `purge_retraction_inadmissible` with nothing written.
-//! - **I669** — a v54.1 node REFUSES a CIRISAgent#1249 trace
-//!   (`trace_schema_version` 2.8.0, `run_kind` signed) whole at the
-//!   schema-version gate, `schema_unsupported_version`, nothing written —
-//!   never stripped, never admitted unverifiable.
+//! - **I669** — a trace at an UNSUPPORTED `trace_schema_version` (2.8.0,
+//!   should CIRISAgent#1249 bump the wire version) carrying `run_kind` is
+//!   refused whole at the schema-version gate, `schema_unsupported_version`,
+//!   nothing written — never stripped, never admitted unverifiable.
+//! - **I670** — `run_kind` is a SIGNED trace member (CC 3.1.5): a 2.7.0
+//!   trace signed with `production`, `qa` or `battery` admits under full
+//!   verification and keeps the value on its stored attestation; one whose
+//!   `run_kind` was edited after signing is refused by the signature check;
+//!   a value outside the vocabulary is `schema_unknown_run_kind`; a signed
+//!   `mock` run is `trace_run_kind_mock` on the canonical.
 //! - **I666** — a `key:` (or `federation_keys:`) id is not a purge record:
 //!   `purge_selection_malformed`, naming `key:revocation` as key retirement's
 //!   own act.
@@ -1449,6 +1455,105 @@ pub(crate) mod bodies {
         }
     }
 
+    // ── I670 ──────────────────────────────────────────────────────────────
+    /// A 2.7.0 trace by `signer` carrying `wire_kind`, hybrid-signed over the
+    /// canonical bytes with `signed_kind` as the top-level `"run_kind"` key —
+    /// built INDEPENDENTLY of persist's reconstruction (the pre-run_kind
+    /// payload plus the key), so the witness is not persist checking itself.
+    fn signed_run_kind_trace(
+        trace_id: &str,
+        signer: &str,
+        signed_kind: &str,
+        wire_kind: &str,
+    ) -> serde_json::Value {
+        use crate::verify::canonical::Canonicalizer as _;
+        let mut json = trace_json(trace_id, signer, "gpt-real", None);
+        let typed: crate::schema::CompleteTrace = serde_json::from_value(json.clone()).unwrap();
+        let mut canonical = crate::verify::ed25519::canonical_payload_value(&typed);
+        canonical["run_kind"] = serde_json::json!(signed_kind);
+        let bytes = crate::verify::PythonJsonDumpsCanonicalizer
+            .canonicalize_value(&canonical)
+            .unwrap();
+        let sig = ts::threshold_sign(signer, &bytes);
+        json["run_kind"] = serde_json::json!(wire_kind);
+        json["signature"] = serde_json::json!(sig.ed25519_signature_base64);
+        json["signature_ml_dsa_65"] = serde_json::json!(sig.mldsa65_signature_base64);
+        json["pubkey_ml_dsa_65"] = serde_json::json!(ts::hybrid_pubkeys(signer).1);
+        json["pqc_key_id"] = serde_json::json!(signer);
+        json
+    }
+
+    async fn ingest_full<D: Seams>(
+        d: &D,
+        bytes: &[u8],
+    ) -> Result<crate::ingest::BatchSummary, crate::ingest::IngestError> {
+        use ciris_keyring::Ed25519SoftwareSigner;
+        let mut signer = Ed25519SoftwareSigner::new("scrub-key-i670");
+        signer.import_key(&[0xA6u8; 32]).expect("seed");
+        let pipeline = crate::ingest::IngestPipeline {
+            backend: d,
+            canonicalizer: &crate::verify::PythonJsonDumpsCanonicalizer,
+            scrubber: &crate::scrub::NullScrubber,
+            signer: &signer,
+            signer_key_id: "scrub-key-i670",
+        };
+        pipeline
+            .receive_and_persist_with(bytes, crate::ingest::VerifyMode::Full)
+            .await
+    }
+
+    pub(crate) async fn i670_run_kind_is_a_signed_member<D: Seams>(d: &D) {
+        root(d).await;
+        let dir = d.as_dyn_directory();
+        // (a) production / qa / battery: admitted and verified, and the
+        // stored trace attestation carries the signed run_kind.
+        for kind in ["production", "qa", "battery"] {
+            let tid = format!("trace-i670-{kind}");
+            let trace = signed_run_kind_trace(&tid, AGENT, kind, kind);
+            let summary = ingest_full(d, &batch(&trace))
+                .await
+                .unwrap_or_else(|e| panic!("I670: a signed run_kind {kind} trace admits: {e}"));
+            assert_eq!(summary.signatures_verified, 1, "I670 {kind}");
+            let att = dir
+                .get_attestation(&crate::ingest::trace_attestation_id(&tid))
+                .await
+                .unwrap()
+                .expect("the trace attestation");
+            assert_eq!(
+                att.attestation_envelope["trace"]["run_kind"], kind,
+                "I670: the stored trace keeps its signed run_kind"
+            );
+        }
+        // (b) signed one way, sent another: the signature check refuses it.
+        let tampered = signed_run_kind_trace("trace-i670-tampered", AGENT, "mock", "production");
+        let e = ingest_full(d, &batch(&tampered))
+            .await
+            .expect_err("a run_kind edited after signing");
+        assert!(
+            !matches!(e, crate::ingest::IngestError::TraceRefused { .. }),
+            "I670: refused by the signature, not a gate: {e}"
+        );
+        assert_eq!(
+            dir.purge_trace_row_counts(&["trace-i670-tampered".to_owned()])
+                .await
+                .unwrap(),
+            (0, 0)
+        );
+        // (c) outside the closed vocabulary: a schema refusal.
+        let odd = signed_run_kind_trace("trace-i670-odd", AGENT, "staging", "staging");
+        let e = ingest_full(d, &batch(&odd))
+            .await
+            .expect_err("closed vocabulary");
+        assert_eq!(e.kind(), "schema_unknown_run_kind", "I670: {e}");
+        // (d) a signed mock run on the canonical: `trace_run_kind_mock`.
+        ts::register_hybrid_key(dir, NODE).await;
+        d.set_node(NODE);
+        d.set_identity_type(NODE, "node,canonical").await;
+        let mock = signed_run_kind_trace("trace-i670-mock", AGENT, "mock", "mock");
+        let e = ingest_full(d, &batch(&mock)).await.expect_err("a mock run");
+        assert_eq!(e.kind(), sp::TRACE_RUN_KIND_MOCK, "I670: {e}");
+    }
+
     // ── I669 ──────────────────────────────────────────────────────────────
     /// What a v54.1 node does with the first CIRISAgent#1249 trace
     /// (`trace_format` v2.8.0, `run_kind` in the signed envelope): it REFUSES
@@ -1828,6 +1933,11 @@ mod run {
                     b::i656_the_tombstone_replicates_re_verified(&a, &c, &e).await
                 }
                 #[tokio::test]
+                async fn i670() {
+                    let Some(d) = $fresh.await else { return };
+                    b::i670_run_kind_is_a_signed_member(&d).await
+                }
+                #[tokio::test]
                 async fn i669() {
                     let Some(d) = $fresh.await else { return };
                     b::i669_a_run_kind_trace_format_is_refused_whole(&d).await
@@ -1965,7 +2075,7 @@ mod run {
         assert!(promo.contains("steward_purge::refuse_mock_trace_attestation(row)?"));
         assert!(promo.contains("steward_purge::refuse_if_tombstoned_attestation(directory, row)"));
         let ingest = strip(include_str!("../ingest.rs"));
-        assert!(ingest.contains("self.refuse_named_traces(&env, bytes).await?;"));
+        assert!(ingest.contains("self.refuse_named_traces(&env).await?;"));
     }
 
     /// The refusal tokens are a closed set of stable strings (CIRISServer#756

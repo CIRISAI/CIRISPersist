@@ -467,7 +467,7 @@ where
     // counter is a follow-up; tracing matches the rest of persist's
     // observability discipline today.)
     let wire = trace.trace_schema_version.as_str();
-    let canonical = match wire {
+    let mut canonical = match wire {
         "2.7.0" => canonical_payload_value(trace),
         "2.7.9" => canonical_payload_value_v279(trace),
         // v4.15.0 (#871) — the JCS-cutover schema. The canonical FIELD
@@ -489,6 +489,7 @@ where
             return Err(Error::UnsupportedSchemaVersion(other.to_owned()));
         }
     };
+    with_signed_run_kind(&mut canonical, trace);
     tracing::info!(
         target: "federation_canonical_match",
         wire = wire,
@@ -528,14 +529,31 @@ where
     C: Canonicalizer + ?Sized,
 {
     let wire = trace.trace_schema_version.as_str();
-    let canonical = match wire {
+    let mut canonical = match wire {
         "2.7.0" => canonical_payload_value(trace),
         "2.7.9" => canonical_payload_value_v279(trace),
         "3.0.0" => canonical_payload_value_v279(trace),
         "2.7.legacy" => canonical_payload_value_legacy(trace),
         other => return Err(Error::UnsupportedSchemaVersion(other.to_owned())),
     };
+    with_signed_run_kind(&mut canonical, trace);
     canonicalizer.canonicalize_value(&canonical)
+}
+
+/// v54.1.0 (CC 3.1.5, CIRISConstitution#166 at rc8@c69129c) — `run_kind`
+/// is a SIGNED envelope member: when the trace carries it, it joins the
+/// canonical payload as a top-level `"run_kind"` key (sorted with its
+/// siblings by the canonicalizer), at every schema version. A trace without
+/// it reconstructs exactly the bytes it did before, so no signature over a
+/// pre-#1249 trace changes; a trace WITH it verifies only if the producer
+/// signed it, so it cannot be added, dropped or edited after signing.
+fn with_signed_run_kind(canonical: &mut serde_json::Value, trace: &CompleteTrace) {
+    if let (Some(kind), Some(obj)) = (&trace.run_kind, canonical.as_object_mut()) {
+        obj.insert(
+            "run_kind".to_owned(),
+            serde_json::Value::String(kind.clone()),
+        );
+    }
 }
 
 /// v7.2.0 (CIRISPersist#225) — the trace-tier hybrid hard-cut verify.
@@ -725,6 +743,7 @@ mod tests {
             signature_ml_dsa_65: None,
             pubkey_ml_dsa_65: None,
             pqc_key_id: None,
+            run_kind: None,
         };
         // Sign the canonical bytes of the unsigned trace.
         let payload = canonical_payload_value(&trace_unsigned);
@@ -813,6 +832,7 @@ mod tests {
             signature_ml_dsa_65: None,
             pubkey_ml_dsa_65: None,
             pqc_key_id: None,
+            run_kind: None,
         };
         let payload = canonical_payload_value(&trace_unsigned);
         let bytes = PythonJsonDumpsCanonicalizer
@@ -884,6 +904,7 @@ mod tests {
             signature_ml_dsa_65: None,
             pubkey_ml_dsa_65: None,
             pqc_key_id: None,
+            run_kind: None,
         };
 
         // Sign the LEGACY 2-field form:
@@ -957,6 +978,7 @@ mod tests {
             signature_ml_dsa_65: None,
             pubkey_ml_dsa_65: None,
             pqc_key_id: None,
+            run_kind: None,
         };
 
         // Sign the LEGACY 2-field canonical form (which doesn't
@@ -1043,6 +1065,7 @@ mod tests {
             signature_ml_dsa_65: None,
             pubkey_ml_dsa_65: None,
             pqc_key_id: None,
+            run_kind: None,
         };
 
         // Sign legacy form, then mutate trace_level (which IS in
@@ -1107,6 +1130,7 @@ mod tests {
             signature_ml_dsa_65: None,
             pubkey_ml_dsa_65: None,
             pqc_key_id: None,
+            run_kind: None,
         };
 
         let payload = canonical_payload_value_v279(&trace_unsigned);
@@ -1175,6 +1199,7 @@ mod tests {
             signature_ml_dsa_65: None,
             pubkey_ml_dsa_65: None,
             pqc_key_id: None,
+            run_kind: None,
         };
 
         // The gate MUST route 3.0.0 to JCS.
@@ -1261,6 +1286,7 @@ mod tests {
                 signature_ml_dsa_65: None,
                 pubkey_ml_dsa_65: None,
                 pqc_key_id: None,
+                run_kind: None,
             }
         }
         let no_inject = build(None);
@@ -1440,6 +1466,7 @@ mod tests {
             signature_ml_dsa_65: None,
             pubkey_ml_dsa_65: None,
             pqc_key_id: None,
+            run_kind: None,
         };
         let payload = canonical_payload_value_v279(&trace);
         let bytes = PythonJsonDumpsCanonicalizer
@@ -1500,6 +1527,7 @@ mod tests {
                 signature_ml_dsa_65: None,
                 pubkey_ml_dsa_65: None,
                 pqc_key_id: None,
+                run_kind: None,
             }
         }
         let no_profile = build(None);

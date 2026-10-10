@@ -1927,9 +1927,9 @@ pub const TRACE_RUN_KIND_MOCK: &str = "trace_run_kind_mock";
 /// `production | qa | battery | mock`, CC 3.1.5).
 pub const RUN_KIND_MOCK: &str = "mock";
 
-/// A trace JSON's `run_kind` member, if it carries one. Pure. Traces carry it
-/// from CIRISAgent#1249's schema bump; until then it is absent and nothing is
-/// refused on this ground.
+/// A trace JSON's `run_kind` member, if it carries one. Pure. A SIGNED member
+/// of the trace (`CompleteTrace::run_kind`); producers emit it from
+/// CIRISAgent#1249.
 #[must_use]
 pub fn trace_run_kind(trace: &serde_json::Value) -> Option<&str> {
     trace.get("run_kind").and_then(serde_json::Value::as_str)

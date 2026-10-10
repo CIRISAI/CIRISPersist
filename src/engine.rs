@@ -12077,6 +12077,7 @@ mod tests {
             signature_ml_dsa_65: None,
             pubkey_ml_dsa_65: None,
             pqc_key_id: None,
+            run_kind: None,
         };
         // v7.2.0 (#225) — hybrid-sign so the Full-mode trace-tier hard
         // cut admits: Ed25519 over canonical + ML-DSA-65 over the bound
@@ -12313,6 +12314,7 @@ mod tests {
             signature_ml_dsa_65: None,
             pubkey_ml_dsa_65: None,
             pqc_key_id: None,
+            run_kind: None,
         };
         let payload = canonical_payload_value(&trace);
         let canonical = PythonJsonDumpsCanonicalizer
@@ -12685,6 +12687,7 @@ mod tests {
             signature_ml_dsa_65: None,
             pubkey_ml_dsa_65: None,
             pqc_key_id: None,
+            run_kind: None,
         };
         let payload = canonical_payload_value(&trace);
         let canonical = PythonJsonDumpsCanonicalizer
