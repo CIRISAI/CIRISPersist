@@ -540,7 +540,7 @@ where
     canonicalizer.canonicalize_value(&canonical)
 }
 
-/// v54.1.0 (CC 3.1.5, CIRISConstitution#166 at rc8@c69129c) — `run_kind`
+/// v54.1.0 (CC 3.1.5, CIRISConstitution#166 at rc8@8c8f536) — `run_kind`
 /// is a SIGNED envelope member: when the trace carries it, it joins the
 /// canonical payload as a top-level `"run_kind"` key (sorted with its
 /// siblings by the canonicalizer), at every schema version. A trace without

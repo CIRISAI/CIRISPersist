@@ -5,7 +5,7 @@
 //! for one actor or one sha. This door extends that shape to any row
 //! selection, authorised under GLOBAL TRUST-ROOT MODERATION, with an evidence
 //! ledger. The constitutional reading is CIRISConstitution#165 as landed at
-//! **rc8@c69129c** (CC 2.4.1.1, CC 3.3.2, CC 4.5.3):
+//! **rc8@8c8f536** (CC 2.4.1.1, CC 3.3.2, CC 4.5.3):
 //!
 //! 1. **Authorisation** is a cosigned `takedown_notice` (CC 3.3.2 shape) with
 //!    the closed-set basis [`STEWARD_PURGE_BASIS`], `claimant_key_id` = the
@@ -41,6 +41,15 @@
 //!    `key:revocation`, a separate act) and never the accountability record
 //!    ([`ACCOUNTABILITY_RECORD_PREFIXES`]). A purge binds only nodes rooted at
 //!    the same trust root: it is not global erasure (CC 3.2 T3, 4.2.1).
+//! 6. **INTERIM — no human subject** until the notice is an admitted row a
+//!    `reconsideration:{grounds}` can target (CC 4.5.5; the
+//!    `takedown_notice:{basis}:v1` row arrives with the rc8 vendor): every
+//!    selection is checked per record by [`human_subject_records`], fail
+//!    closed ([`token::HUMAN_SUBJECT_PENDING_NOTICE_ROW`]). Retired when the
+//!    row lands.
+//!
+//! The door is inert without the operator's go: nothing runs until a purge
+//! is explicitly requested on a notice the trust root's quorum cosigned.
 //!
 //! Derived rows follow the reason: a `scores` row whose `evidence_refs`
 //! resolve to a purged record (a trace id, a trace attestation id, an
@@ -101,6 +110,14 @@ pub mod token {
     /// The selection or bundle itself is malformed (an unparseable record id,
     /// an unsorted or duplicated bundle id list). Body: `{reason}`.
     pub const SELECTION_MALFORMED: &str = "purge_selection_malformed";
+    /// INTERIM (CIRISConstitution rc8@8c8f536, CC session 2026-10-10): until
+    /// the notice is an admitted row a `reconsideration:{grounds}` can target
+    /// (CC 4.5.5, the `takedown_notice:{basis}:v1` family, which arrives with
+    /// the rc8 vendor), a purge refuses a selection holding any record whose
+    /// subject is a person, or cannot be shown not to be
+    /// ([`human_subject_records`]). Persist-local. Body: `{records: [{record_id,
+    /// subject, reason}]}`. Retired when the notice row lands.
+    pub const HUMAN_SUBJECT_PENDING_NOTICE_ROW: &str = "purge_human_subject_pending_notice_row";
 
     /// Every token, for the registry and the from-disk witnesses.
     pub const ALL: &[&str] = &[
@@ -112,11 +129,12 @@ pub mod token {
         NOTICE_UNKNOWN,
         TOMBSTONED,
         SELECTION_MALFORMED,
+        HUMAN_SUBJECT_PENDING_NOTICE_ROW,
     ];
 }
 
 /// The `takedown_notice` basis that authorises a steward purge (CC 3.3.2
-/// `LegalBasis::StewardPurge`, CIRISConstitution rc8@c69129c).
+/// `LegalBasis::StewardPurge`, CIRISConstitution rc8@8c8f536).
 pub const STEWARD_PURGE_BASIS: &str = "steward_purge";
 
 /// The sample a dry run shows: the first N record ids in JCS order (CSD-108
@@ -125,7 +143,7 @@ pub const SAMPLE_LEN: usize = 20;
 
 /// How long after the tombstone the retraction round is taken as settled:
 /// `W` = 72 h (259 200 s), the CC 2.6.7 / 4.2.6 "until everyone has heard"
-/// constant (CIRISConstitution rc8@c69129c; operator-confirmed 2026-10-09).
+/// constant (CIRISConstitution rc8@8c8f536; operator-confirmed 2026-10-09).
 /// NOT the 24 h lone-holder halt fuse, which is a different thing. There is
 /// no peer-acknowledgement plane: settle is this stated dwell.
 /// `purge_finalize` refuses before it ([`token::NOT_SETTLED`]). ONE named
@@ -152,7 +170,7 @@ fn refused(token: &'static str, body: serde_json::Value) -> Error {
 #[serde(rename_all = "snake_case")]
 ///
 /// There is NO key plane (operator ruling 2026-10-09: "We should not delete
-/// any keys"; CC 2.4.1.1 at CIRISConstitution rc8@c69129c — the root has no
+/// any keys"; CC 2.4.1.1 at CIRISConstitution rc8@8c8f536 — the root has no
 /// path over a stranger's key). Deleting a key leaves every row it signed
 /// unverifiable wherever it replicated; key retirement is `key:revocation`,
 /// a separate act by the key's own authority.
@@ -543,7 +561,7 @@ impl RowFacts {
     }
 }
 
-/// CLM-accountability-record-unpurgeable (CIRISConstitution rc8@c69129c) —
+/// CLM-accountability-record-unpurgeable (CIRISConstitution rc8@8c8f536) —
 /// the dimension families the text names EXACTLY as the unpurgeable
 /// accountability record. Matched by the purge's own check, not by widening
 /// `migration::ExclusionClass`: its `moderation:` prefix does not reach
@@ -624,7 +642,7 @@ fn retraction_admissible(
 /// what they withheld; [`PurgeSelection::ByIds`] selects exactly its list and
 /// reports inadmissible members as warnings — the door refuses at them.
 ///
-/// **Whole or not at all** (CC 4.5.3, CIRISConstitution rc8@c69129c: "A
+/// **Whole or not at all** (CC 4.5.3, CIRISConstitution rc8@8c8f536: "A
 /// retraction the door cannot admit aborts the purge … a purge is whole or
 /// not at all, never a half-emptied selection"). The selection IS the id list
 /// the notice's digest names. A class's withheld rows are not in that list:
@@ -899,6 +917,158 @@ fn render_ledger(header: &[(&str, String)], notice_id: &str, records: &[PurgeRec
     out
 }
 
+// ── the interim no-human-subject gate ──────────────────────────────────────
+
+/// One record the interim gate refuses, and why.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HumanSubject {
+    /// The record id.
+    pub record_id: String,
+    /// The subject key that is a person, or that could not be resolved (empty
+    /// when the record's subjects themselves could not be read).
+    pub subject: String,
+    /// Why.
+    pub reason: String,
+}
+
+/// The subjects of an attestation: its `subject_key_ids` and its
+/// `attested_key_id` (the key the row is ABOUT). Not its author: an
+/// attestation's subject is who it is about.
+fn attestation_subjects(row: &Attestation) -> BTreeSet<String> {
+    row.subject_key_ids
+        .iter()
+        .chain(std::iter::once(&row.attested_key_id))
+        .filter(|k| !k.is_empty())
+        .cloned()
+        .collect()
+}
+
+/// **INTERIM — which records of `records` have a human subject?** CC session
+/// 2026-10-10 (CIRISConstitution rc8@8c8f536): until the notice is an
+/// admitted row that a `reconsideration:{grounds}` can target (CC 4.5.5), a
+/// purge may touch only records with NO HUMAN SUBJECT, so the redress path
+/// exists before the act. Per record:
+///
+/// - an **attestation**: its `subject_key_ids` and `attested_key_id`;
+/// - a **trace**: the author and subjects of its own `trace:complete:v1`
+///   attestation (every held trace has one, #473/#478) — the signing agent;
+/// - a **blob**: the subjects of the holding claim it was derived through.
+///
+/// - and, for a [`PurgeSelection::ByActor`], the ACTOR is a subject of every
+///   record the selection holds (`parties`): a by-actor purge is about them.
+///   A bundle does not carry its selection, so the receiver reads the
+///   per-record subjects only.
+///
+/// A subject is a person when its key record's `identity_type` names
+/// `user`. **Fail closed**: a subject key this node cannot resolve, a trace
+/// with no own attestation, a blob named without its holding claim, or an
+/// attestation not held are NOT proven non-human, and are refused.
+/// `skip_unheld` is the receiver's reading: it judges only what it holds.
+///
+/// # Errors
+///
+/// Directory reads.
+pub async fn human_subject_records<F>(
+    directory: &F,
+    records: &[PurgeRecord],
+    parties: &BTreeSet<String>,
+    skip_unheld: bool,
+) -> Result<Vec<HumanSubject>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let mut out = Vec::new();
+    let mut kinds: BTreeMap<String, Option<bool>> = BTreeMap::new();
+    for record in records {
+        let unresolved = |reason: &str| HumanSubject {
+            record_id: record.record_id(),
+            subject: String::new(),
+            reason: reason.to_owned(),
+        };
+        let row_id = match record.plane {
+            PurgePlane::Attestation => Some(record.id.clone()),
+            PurgePlane::Trace => Some(crate::ingest::trace_attestation_id(&record.id)),
+            PurgePlane::Blob => record
+                .derived_from
+                .as_deref()
+                .and_then(|d| d.strip_prefix("attestation:"))
+                .map(str::to_owned),
+        };
+        let Some(row_id) = row_id else {
+            out.push(unresolved(
+                "a blob named without its holding claim: its subject cannot be read",
+            ));
+            continue;
+        };
+        let Some(row) = directory.get_attestation(&row_id).await? else {
+            if !skip_unheld {
+                out.push(unresolved(
+                    "the record's subject row is not held here: not proven non-human",
+                ));
+            }
+            continue;
+        };
+        let mut subjects = attestation_subjects(&row);
+        subjects.extend(parties.iter().cloned());
+        if record.plane == PurgePlane::Trace {
+            subjects.insert(row.attesting_key_id.clone());
+        }
+        for subject in subjects {
+            let human = match kinds.get(&subject) {
+                Some(v) => *v,
+                None => {
+                    let v = directory.lookup_public_key(&subject).await?.map(|k| {
+                        k.identity_type
+                            .split(',')
+                            .any(|t| t.trim() == super::types::identity_type::USER)
+                    });
+                    kinds.insert(subject.clone(), v);
+                    v
+                }
+            };
+            let reason = match human {
+                Some(false) => continue,
+                Some(true) => "the subject is a person (identity_type user)",
+                None => "the subject key does not resolve here: not proven non-human",
+            };
+            out.push(HumanSubject {
+                record_id: record.record_id(),
+                subject,
+                reason: reason.to_owned(),
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// The interim gate as a refusal: [`token::HUMAN_SUBJECT_PENDING_NOTICE_ROW`]
+/// naming EVERY offending record, or `Ok`.
+async fn refuse_human_subjects<F>(
+    directory: &F,
+    records: &[PurgeRecord],
+    parties: &BTreeSet<String>,
+    skip_unheld: bool,
+    notice_id: Option<&str>,
+) -> Result<(), Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let found = human_subject_records(directory, records, parties, skip_unheld).await?;
+    if found.is_empty() {
+        return Ok(());
+    }
+    Err(refused(
+        token::HUMAN_SUBJECT_PENDING_NOTICE_ROW,
+        serde_json::json!({
+            "notice_id": notice_id,
+            "records": found,
+            "reason": "until the notice is an admitted row a reconsideration can target (CC \
+                       4.5.5; the takedown_notice row arrives with the rc8 vendor), a purge \
+                       touches no record with a human subject",
+        }),
+    ))
+}
+
 /// **Dry run**: resolve the selection, count it per table, digest it, sample
 /// it, and render the ledger and the notice template. Read-only.
 ///
@@ -913,7 +1083,21 @@ where
     F: FederationDirectory + ?Sized,
 {
     let resolved = resolve_selection(directory, selection).await?;
-    let ids = resolved.record_ids();
+    // INTERIM: the operator sees every human-subject record before anyone
+    // cosigns.
+    refuse_human_subjects(
+        directory,
+        &resolved.records,
+        &selection.parties(),
+        false,
+        None,
+    )
+    .await?;
+    let ids = resolved
+        .records
+        .iter()
+        .map(PurgeRecord::record_id)
+        .collect::<Vec<_>>();
     let digest = selection_digest(&ids);
     let counts = resolved.counts();
     let traces: Vec<String> = resolved
@@ -982,7 +1166,7 @@ pub struct NoticeTerms {
     /// The digest the notice authorises.
     pub selection_digest: String,
     /// Per-table counts the notice authorises, when it carries the OPTIONAL
-    /// `selection_counts` member (CC 3.3.2, CIRISConstitution rc8@c69129c).
+    /// `selection_counts` member (CC 3.3.2, CIRISConstitution rc8@8c8f536).
     /// Absent, the digest alone binds the selection.
     pub selection_counts: Option<BTreeMap<String, u64>>,
     /// The notice's own instant.
@@ -1162,7 +1346,7 @@ pub struct PurgeExecution {
     /// authorised it.
     pub claimant_key_id: String,
     /// The notice's `legal_basis` (CC 3.3.2). One tombstone row serves
-    /// takedown and purge (CIRISConstitution rc8@c69129c, CC 4.5.3): the
+    /// takedown and purge (CIRISConstitution rc8@8c8f536, CC 4.5.3): the
     /// basis is what tells a `steward_purge` (cosigned, any plane, hard
     /// delete after settle) from a duty-holder takedown (bytes plane only;
     /// an immediate-removal basis destroys on receipt — the v55 door,
@@ -1289,7 +1473,7 @@ fn check_counts(terms: &NoticeTerms, live: &BTreeMap<String, u64>) -> Result<(),
 ///    inadmissible one ABORTS the purge —
 ///    [`token::RETRACTION_INADMISSIBLE`] `{record_id, plane, index, total}` —
 ///    with nothing written (whole or not at all, CC 4.5.3, CIRISConstitution
-///    rc8@c69129c);
+///    rc8@8c8f536);
 /// 5. the header is recorded (idempotent on the notice id), then each
 ///    tombstone in JCS order. A retry after a crash resumes; a tombstone is
 ///    never written twice.
@@ -1326,7 +1510,7 @@ where
     }
     let records = resolved.records;
     let total = records.len() as u64;
-    // Whole or not at all (CC 4.5.3, CIRISConstitution rc8@c69129c): every
+    // Whole or not at all (CC 4.5.3, CIRISConstitution rc8@8c8f536): every
     // retraction is judged BEFORE anything is written, so an inadmissible one
     // aborts the purge with nothing tombstoned.
     let selected_attestations: BTreeSet<String> = records
@@ -1352,6 +1536,8 @@ where
             ));
         }
     }
+    // INTERIM: no human subject until the notice is a row (nothing written).
+    refuse_human_subjects(directory, &records, &parties, false, Some(&terms.notice_id)).await?;
     let notice_jcs = String::from_utf8(notice_signing_bytes(&notice.envelope)?)
         .map_err(|e| Error::Backend(format!("notice JCS is not UTF-8: {e}")))?;
     let cosignatures_json = serde_json::to_string(&notice.cosignatures)
@@ -1827,6 +2013,15 @@ where
             ));
         }
     }
+    // INTERIM: the receiver applies the same gate to what it holds.
+    refuse_human_subjects(
+        directory,
+        &records,
+        &BTreeSet::new(),
+        true,
+        Some(&terms.notice_id),
+    )
+    .await?;
     let notice_jcs = String::from_utf8(notice_signing_bytes(&bundle.notice.envelope)?)
         .map_err(|e| Error::Backend(format!("notice JCS is not UTF-8: {e}")))?;
     let cosignatures_json = serde_json::to_string(&bundle.notice.cosignatures)
@@ -1919,7 +2114,7 @@ where
 
 // ── #1040: the mock-run trace refusal (CC 3.1.5, CIRISConstitution#166) ──
 
-/// CIRISConstitution#166 (rc8@c69129c) — the refusal token for a trace whose
+/// CIRISConstitution#166 (rc8@8c8f536) — the refusal token for a trace whose
 /// signed `run_kind` is `mock`.
 pub const TRACE_RUN_KIND_MOCK: &str = "trace_run_kind_mock";
 

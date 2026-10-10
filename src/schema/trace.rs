@@ -325,7 +325,7 @@ pub struct CompleteTrace {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cohort_target_id: Option<String>,
 
-    /// v54.1.0 (CC 3.1.5, CIRISConstitution#166 at rc8@c69129c;
+    /// v54.1.0 (CC 3.1.5, CIRISConstitution#166 at rc8@8c8f536;
     /// CIRISAgent#1249) — the run that produced this trace, closed vocabulary
     /// `production | qa | battery | mock` ([`RUN_KINDS`]). A SIGNED member:
     /// when present it is part of the canonical bytes every schema version's

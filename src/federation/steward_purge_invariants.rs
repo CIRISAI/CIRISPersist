@@ -20,7 +20,7 @@
 //! - **I653** — an inadmissible retraction (a `withdraws` whose target is not
 //!   purged with it) ABORTS the purge: `purge_retraction_inadmissible
 //!   {record_id, plane, index, total}`, with nothing written, on every attempt
-//!   — whole or not at all (CC 4.5.3, CIRISConstitution rc8@c69129c).
+//!   — whole or not at all (CC 4.5.3, CIRISConstitution rc8@8c8f536).
 //! - **I654** — #1040's class end to end: the mock-model traces, their own
 //!   trace attestations and the score derived from them are ONE selection; the
 //!   dry run is read-only, its sample is the first ids in JCS order, the
@@ -60,7 +60,7 @@
 //!   harness-prefix builder the operator dropped (harness rows on production
 //!   stay; Server selects by actor or by ids when it needs a purge).
 //! - **I664** — one tombstone row for takedown and purge (CC 4.5.3,
-//!   CIRISConstitution rc8@c69129c): a header with ANOTHER basis (a
+//!   CIRISConstitution rc8@8c8f536): a header with ANOTHER basis (a
 //!   duty-holder `ncmec_csam` takedown, the v55 #1007 door's row) and its
 //!   bytes-plane tombstone round-trip through the store with their basis
 //!   intact, and the ledger names the basis.
@@ -71,7 +71,7 @@
 //!   it, its unselected row still verifies, and a row it signs afterwards
 //!   verifies.
 //! - **I667** — CLM-accountability-record-unpurgeable (CIRISConstitution
-//!   rc8@c69129c): a row of each of `revocation:*`, `key:revocation`,
+//!   rc8@8c8f536): a row of each of `revocation:*`, `key:revocation`,
 //!   `moderation:*`, `moderation_track_record:*` and `slashing:*` is
 //!   inadmissible by that clause — refused by id, withheld by a class.
 //! - **I668** — the receiver of a replicated bundle re-asks the rules no
@@ -88,6 +88,13 @@
 //!   `run_kind` was edited after signing is refused by the signature check;
 //!   a value outside the vocabulary is `schema_unknown_run_kind`; a signed
 //!   `mock` run is `trace_run_kind_mock` on the canonical.
+//! - **I672** — INTERIM (CIRISConstitution rc8@8c8f536): until the notice
+//!   is an admitted row, a purge touches no record with a human subject. The
+//!   mock-trace class passes; a by-ids selection holding one row about a
+//!   `user` key is `purge_human_subject_pending_notice_row` at the dry run
+//!   (naming exactly that record and subject), at execution and at the
+//!   replicated apply, with nothing written; a person's by-actor purge is
+//!   refused; a subject key that does not resolve fails closed.
 //! - **I666** — a `key:` (or `federation_keys:`) id is not a purge record:
 //!   `purge_selection_malformed`, naming `key:revocation` as key retirement's
 //!   own act.
@@ -614,7 +621,7 @@ pub(crate) mod bodies {
         let dry = sp::purge_dry_run(dir, &mock_selection()).await.unwrap();
         let notice = notice_for(&dry.notice_template, &[cc::FOUNDERS[0], cc::FOUNDERS[1]], t);
         // `selection_counts` is OPTIONAL (CC 3.3.2, CIRISConstitution
-        // rc8@c69129c): without it the digest alone binds.
+        // rc8@8c8f536): without it the digest alone binds.
         let mut bare = notice.envelope.clone();
         bare.as_object_mut().unwrap().remove("selection_counts");
         let bare = sign(bare, &[cc::FOUNDERS[0], cc::FOUNDERS[1]]);
@@ -663,11 +670,13 @@ pub(crate) mod bodies {
             .into_iter()
             .next()
             .expect("the withdraws");
-        // Two records sort before the withdraws, one after it.
+        // Two more held records beside the withdraws (held, so the interim
+        // no-human-subject gate can read their subjects).
         let before = format!(
             "attestation:{}",
-            "0".repeat(8) + "-0000-4000-8000-000000000001"
+            put_score(d, SCORER, AGENT, &[]).await.attestation_id
         );
+        seed_trace(d, "zzz-i653", AGENT, "gpt-real").await;
         let trace = "trace:zzz-i653".to_owned();
         let wid = format!("attestation:{}", withdraws.attestation_id);
         let ids = vec![before.clone(), wid.clone(), trace.clone()];
@@ -918,7 +927,7 @@ pub(crate) mod bodies {
             .await
             .unwrap();
         // Settle is W = 72 h after the tombstone (CC 2.6.7, CIRISConstitution
-        // rc8@c69129c): still unsettled after an hour, and after the 24 h
+        // rc8@8c8f536): still unsettled after an hour, and after the 24 h
         // lone-holder fuse (a different constant).
         for early in [
             chrono::Duration::hours(1),
@@ -1621,6 +1630,131 @@ pub(crate) mod bodies {
             .is_empty());
     }
 
+    // ── I672 ──────────────────────────────────────────────────────────────
+    pub(crate) async fn i672_no_human_subject_until_the_notice_is_a_row<D: Seams>(d: &D) {
+        root(d).await;
+        let dir = d.as_dyn_directory();
+        let t = now();
+        const ALICE: &str = "alice-human-i672";
+        ts::register_hybrid_key_as(
+            dir,
+            ALICE,
+            ALICE,
+            crate::federation::types::identity_type::USER,
+        )
+        .await;
+        // (a) The mock-trace class has no human subject: it passes.
+        mock_world(d, "i672").await;
+        sp::purge_dry_run(dir, &mock_selection())
+            .await
+            .expect("I672: the mock traces pass the interim gate");
+        // (b) One row about a person, beside one that is not: refused, at the
+        // dry run (naming the record and the subject) and at execution.
+        let about_alice = put_score(d, SCORER, ALICE, &[]).await.attestation_id;
+        let plain = put_score(d, SCORER, AGENT, &[]).await.attestation_id;
+        let mut ids = vec![
+            format!("attestation:{about_alice}"),
+            format!("attestation:{plain}"),
+        ];
+        ids.sort();
+        let sel = PurgeSelection::ByIds { ids: ids.clone() };
+        let e = sp::purge_dry_run(dir, &sel)
+            .await
+            .expect_err("a human subject is refused at the dry run");
+        let (tok, body) = refusal(&e);
+        assert_eq!(tok, token::HUMAN_SUBJECT_PENDING_NOTICE_ROW, "I672: {body}");
+        let records = body["records"].as_array().unwrap();
+        assert_eq!(records.len(), 1, "I672: only the human-subject row: {body}");
+        assert_eq!(
+            records[0]["record_id"],
+            format!("attestation:{about_alice}")
+        );
+        assert_eq!(records[0]["subject"], ALICE);
+        let template = serde_json::json!({
+            "legal_basis": sp::STEWARD_PURGE_BASIS,
+            "content_sha256": sp::selection_digest(&ids),
+            "content_holder_key_ids": [],
+        });
+        let notice = notice_for(&template, &[cc::FOUNDERS[0], cc::FOUNDERS[1]], t);
+        let e = sp::purge_rows(dir, &sel, &notice, NODE, t)
+            .await
+            .expect_err("and at execution");
+        assert_eq!(
+            refusal(&e).0,
+            token::HUMAN_SUBJECT_PENDING_NOTICE_ROW,
+            "I672"
+        );
+        assert_nothing_written(d, &notice).await;
+        // ... and at the replicated apply, on what the receiver holds.
+        let bundle = sp::PurgeBundle {
+            notice: notice.clone(),
+            record_ids: ids.clone(),
+            derived_from: vec![String::new(); ids.len()],
+            admitted_at: t,
+        };
+        let e = sp::apply_replicated_purge(dir, &bundle, "node-b", t)
+            .await
+            .expect_err("and at the receiver");
+        assert_eq!(
+            refusal(&e).0,
+            token::HUMAN_SUBJECT_PENDING_NOTICE_ROW,
+            "I672"
+        );
+        assert_nothing_written(d, &notice).await;
+        // (c) A by-actor purge of a person is refused: the actor is the
+        // subject of every record it selects.
+        put_score(d, ALICE, AGENT, &[]).await;
+        let e = sp::purge_dry_run(
+            dir,
+            &PurgeSelection::ByActor {
+                key_id: ALICE.to_owned(),
+            },
+        )
+        .await
+        .expect_err("a person's by-actor purge");
+        assert_eq!(
+            refusal(&e).0,
+            token::HUMAN_SUBJECT_PENDING_NOTICE_ROW,
+            "I672"
+        );
+        // (d) Fail closed: a subject key this node cannot resolve.
+        // (A held local row whose subject list names a key this node has no
+        // record of; the federation door would not admit such an attested key.)
+        let ghost = d
+            .attestation_insert_local(crate::federation::types::LocalAttestationInput {
+                attestation_id: None,
+                attesting_key_id: SCORER.to_owned(),
+                attested_key_id: Some(AGENT.to_owned()),
+                attestation_type: attestation_type::SCORES.to_owned(),
+                weight: None,
+                expires_at: None,
+                attestation_envelope: crate::federation::envelope::EnvelopeCore::from_value(
+                    serde_json::json!({"dimension": "chat:message:v1", "score": 1.0}),
+                )
+                .unwrap(),
+                subject_key_ids: vec!["ghost-unregistered-i672".to_owned()],
+                cohort_scope: crate::federation::types::cohort_scope::SELF.to_owned(),
+                scrub_signature_classical: None,
+                scrub_signature_pqc: None,
+            })
+            .await
+            .expect("local row");
+        let e = sp::purge_dry_run(
+            dir,
+            &PurgeSelection::ByIds {
+                ids: vec![format!("attestation:{ghost}")],
+            },
+        )
+        .await
+        .expect_err("an unresolvable subject is not proven non-human");
+        let (tok, body) = refusal(&e);
+        assert_eq!(tok, token::HUMAN_SUBJECT_PENDING_NOTICE_ROW, "I672");
+        assert!(body["records"][0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("does not resolve"));
+    }
+
     // ── I659 ──────────────────────────────────────────────────────────────
     /// A trace whose LLM call reports `model` and which declares `run_kind`
     /// (absent when `None`, as every pre-CIRISAgent#1249 trace is).
@@ -1938,6 +2072,11 @@ mod run {
                     b::i670_run_kind_is_a_signed_member(&d).await
                 }
                 #[tokio::test]
+                async fn i672() {
+                    let Some(d) = $fresh.await else { return };
+                    b::i672_no_human_subject_until_the_notice_is_a_row(&d).await
+                }
+                #[tokio::test]
                 async fn i669() {
                     let Some(d) = $fresh.await else { return };
                     b::i669_a_run_kind_trace_format_is_refused_whole(&d).await
@@ -2094,6 +2233,7 @@ mod run {
                 "purge_notice_unknown",
                 "purge_tombstoned",
                 "purge_selection_malformed",
+                "purge_human_subject_pending_notice_row",
             ]
         );
         assert_eq!(

@@ -3756,7 +3756,7 @@ where
 /// The question is asked about the SIGNERS, never the subject: the envelope is
 /// judged only as bytes (`accord_family_signing_bytes`, JCS), and the answer is
 /// the set of seats whose hybrid signature over those bytes verified, judged
-/// by the protocol (CC 2.4 rule 0, CC 3.2 T2; CIRISConstitution rc8@c69129c).
+/// by the protocol (CC 2.4 rule 0, CC 3.2 T2; CIRISConstitution rc8@8c8f536).
 ///
 /// - The row at `community_key_id` must be TRUST-ROOT GRADE and **ROOTED** now
 ///   ([`stored_standing_at`], which answers `NotRooted` for a row that is not
