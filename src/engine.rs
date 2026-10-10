@@ -3367,7 +3367,10 @@ impl Engine {
     /// every other arm is returned as the typed refusal it is, never coerced.
     /// Not self-signed ⇒ `NotSelfSigned`; no row ⇒ `RecordAbsent`; the plan's
     /// own refusals pass through. The store step's lost race is
-    /// `StoreConflict`, re-offerable.
+    /// `StoreConflict`, re-offerable. v54.1.0 (CIRISPersist#1044): also
+    /// proceeds on the plan's `ReplaceInvalid` arm — the stored record FAILS
+    /// `verify_key_registration` and this one (same pubkeys, same claim)
+    /// passes — returning `InvalidReplaced`.
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     pub async fn rebind_key_record(
         &self,
@@ -3398,6 +3401,25 @@ impl Engine {
                 }),
                 Err(e) => Err(e),
             },
+            // v54.1.0 (CIRISPersist#1044) — the holder's re-signed record
+            // over a stored record that fails verification (same pubkeys, same
+            // claim): the invalid row is replaced in place.
+            ReplicatedKeyPlan::ReplaceInvalid => {
+                match directory.store_invalid_replaced_key_record(record).await {
+                    Ok(ReplicatedKeyOutcome::InvalidReplaced) => Ok(RebindOutcome::InvalidReplaced),
+                    Ok(ReplicatedKeyOutcome::Unchanged) => Ok(RebindOutcome::Unchanged),
+                    Ok(ReplicatedKeyOutcome::Refused { reason }) => {
+                        Ok(RebindOutcome::Refused { reason })
+                    }
+                    Ok(other) => Err(crate::federation::Error::Backend(format!(
+                        "rebind_key_record: invalid-replace store step returned {other:?}"
+                    ))),
+                    Err(crate::federation::Error::Conflict(_)) => Ok(RebindOutcome::Refused {
+                        reason: KeyRefusalReason::StoreConflict,
+                    }),
+                    Err(e) => Err(e),
+                }
+            }
             ReplicatedKeyPlan::Unchanged => Ok(RebindOutcome::Unchanged),
             ReplicatedKeyPlan::Insert => Ok(RebindOutcome::Refused {
                 reason: KeyRefusalReason::RecordAbsent,
@@ -9182,6 +9204,36 @@ impl Engine {
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<crate::federation::hard_case::ConsentState, crate::federation::Error> {
         crate::federation::consent_by_humans::capacity_consent_stance(
+            self.federation_directory().as_ref(),
+            attester_key_id,
+            subject_key_id,
+            family,
+            now,
+        )
+        .await
+    }
+
+    /// v54.1.0 (CIRISPersist#1041) — [`Self::capacity_consent_stance`] WITH
+    /// the [`ConsentBasis`](crate::federation::consent_by_humans::ConsentBasis):
+    /// the consent rows the stance rests on, each with its principal and path.
+    /// The fold the emit gate asks, so a scorer that records the basis records
+    /// what the gate decides on. See
+    /// [`consent_by_humans::capacity_consent_stance_with_basis`](crate::federation::consent_by_humans::capacity_consent_stance_with_basis).
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn capacity_consent_stance_with_basis(
+        &self,
+        attester_key_id: &str,
+        subject_key_id: &str,
+        family: crate::federation::admission::ConsentGatedFamily,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<
+        (
+            crate::federation::hard_case::ConsentState,
+            crate::federation::consent_by_humans::ConsentBasis,
+        ),
+        crate::federation::Error,
+    > {
+        crate::federation::consent_by_humans::capacity_consent_stance_with_basis(
             self.federation_directory().as_ref(),
             attester_key_id,
             subject_key_id,

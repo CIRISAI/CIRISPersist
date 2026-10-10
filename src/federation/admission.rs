@@ -3749,16 +3749,38 @@ pub enum LicensureChainBreak {
     AuthorityActsByQuorum,
 }
 
+/// v54.1.0 (CIRISPersist#1042 follow-up C) — the stable `reason` tokens of
+/// [`Error::LicensureDelegatorNotAuthority`]: one per
+/// [`LicensureChainBreak`], plus [`NOT_AUTHORITY_AT_RECEIPT`]. Append-only.
+pub mod licensure_refusal {
+    /// [`super::LicensureChainBreak::NamedEdgeAbsent`].
+    pub const NAMED_EDGE_ABSENT: &str = "named_edge_absent";
+    /// [`super::LicensureChainBreak::NamedEdgeNotLicense`].
+    pub const NAMED_EDGE_NOT_LICENSE: &str = "named_edge_not_license_delegation";
+    /// [`super::LicensureChainBreak::NamedEdgeNotOntoEmitter`].
+    pub const NAMED_EDGE_NOT_ONTO_EMITTER: &str = "named_edge_not_onto_emitter";
+    /// [`super::LicensureChainBreak::NotOnLiveChain`].
+    pub const NOT_ON_LIVE_CHAIN: &str = "not_on_live_chain_at_asserted_at";
+    /// [`super::LicensureChainBreak::AuthorityActsByQuorum`].
+    pub const AUTHORITY_ACTS_BY_QUORUM: &str = "authority_acts_by_quorum";
+    /// [`super::LICENSURE_NOT_AUTHORITY_AT_RECEIPT`].
+    pub const NOT_AUTHORITY_AT_RECEIPT: &str = "not_authority_at_receipt";
+}
+
 impl LicensureChainBreak {
-    /// The stable token.
+    /// The stable token (a [`licensure_refusal`] constant).
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
-            LicensureChainBreak::NamedEdgeAbsent => "named_edge_absent",
-            LicensureChainBreak::NamedEdgeNotLicense => "named_edge_not_license_delegation",
-            LicensureChainBreak::NamedEdgeNotOntoEmitter => "named_edge_not_onto_emitter",
-            LicensureChainBreak::NotOnLiveChain => "not_on_live_chain_at_asserted_at",
-            LicensureChainBreak::AuthorityActsByQuorum => "authority_acts_by_quorum",
+            LicensureChainBreak::NamedEdgeAbsent => licensure_refusal::NAMED_EDGE_ABSENT,
+            LicensureChainBreak::NamedEdgeNotLicense => licensure_refusal::NAMED_EDGE_NOT_LICENSE,
+            LicensureChainBreak::NamedEdgeNotOntoEmitter => {
+                licensure_refusal::NAMED_EDGE_NOT_ONTO_EMITTER
+            }
+            LicensureChainBreak::NotOnLiveChain => licensure_refusal::NOT_ON_LIVE_CHAIN,
+            LicensureChainBreak::AuthorityActsByQuorum => {
+                licensure_refusal::AUTHORITY_ACTS_BY_QUORUM
+            }
         }
     }
 }
@@ -3768,7 +3790,7 @@ impl LicensureChainBreak {
 /// emitter was a founder of a `founder_only` authority when the row was
 /// dated, and is not one now. Without a past-freshness window a signed
 /// instant cannot grant standing the emitter no longer has.
-pub const LICENSURE_NOT_AUTHORITY_AT_RECEIPT: &str = "not_authority_at_receipt";
+pub const LICENSURE_NOT_AUTHORITY_AT_RECEIPT: &str = licensure_refusal::NOT_AUTHORITY_AT_RECEIPT;
 
 /// v54.0.0 (CIRISPersist#1035) — the verdict on ONE licensure row.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4150,8 +4172,10 @@ pub async fn check_licensure_delegator_is_authority(
     if matches!(&authority, LicensureAuthority::Key(k) if *k == row.attesting_key_id) {
         return Ok(());
     }
-    let refuse = |reason: &str, delegation_id: Option<&str>, judged: &str| {
-        Err(Error::InvalidArgument(format!(
+    // v54.1.0 (CIRISPersist#1042 follow-up C) — typed, with `reason` as the
+    // stable token; the Display is the pre-v54.1 text.
+    let refuse = |reason: &'static str, delegation_id: Option<&str>, judged: &str| {
+        let message = format!(
             "licensure_delegator_not_authority: {reason}: {:?} emitted {dimension:?} under \
              delegation {delegation_id:?} signed at {asserted_at}, and it is not the \
              authority's own issuance on a live `license` chain from {authority_id:?} at \
@@ -4162,7 +4186,13 @@ pub async fn check_licensure_delegator_is_authority(
              nothing about whether {authority_id:?} is known or trusted.",
             row.attesting_key_id,
             asserted_at = row.asserted_at,
-        )))
+        );
+        Err(Error::LicensureDelegatorNotAuthority {
+            attesting_key_id: row.attesting_key_id.clone(),
+            authority_id: authority_id.to_owned(),
+            reason,
+            message,
+        })
     };
     let at_receipt = licensure_issuance_at(directory, &authority, row, chrono::Utc::now()).await?;
     if let LicensureIssuance::Unresolved {
@@ -4954,7 +4984,12 @@ pub async fn check_capacity_consent_admission(
     // v53.1.8 (CIRISPersist#1013) — by principals (#857): a steward's grant
     // naming the subject in `for_key_id` counts, as it does in a scorer's
     // precheck, because both now ask the one fold.
-    let stance = super::consent_by_humans::capacity_consent_stance(
+    //
+    // v54.1.0 (CIRISPersist#1041) — the basis-carrying fold, the one a
+    // scorer's precheck asks before it records the basis in its envelope.
+    // `ConsentGateRefused` does not carry the basis: it is an exhaustive
+    // public struct, and a new field would break a pin-compatible minor.
+    let (stance, _basis) = super::consent_by_humans::capacity_consent_stance_with_basis(
         directory,
         &row.attesting_key_id,
         &row.attested_key_id,
@@ -5153,10 +5188,12 @@ pub async fn verify_signed_identity_occurrence(
         .lookup_public_key(&signed.attesting_key_id)
         .await?
     else {
-        return Err(Error::SignatureInvalid(format!(
-            "signed identity_occurrence: attesting_key_id {} is not a registered federation key",
-            signed.attesting_key_id
-        )));
+        // v54.1.0 (CIRISPersist#1042) — an ordering gap, typed apart from a
+        // bad signature: retryable once the signer's Key row lands.
+        return Err(Error::unknown_signer(
+            &signed.attesting_key_id,
+            "identity_occurrence",
+        ));
     };
     let key_directory = vec![ThresholdMember {
         member_id: signer_key.key_id.clone(),
@@ -5329,10 +5366,12 @@ async fn verify_content_only_identity_occurrence(
         .lookup_public_key(&signed.attesting_key_id)
         .await?
     else {
-        return Err(Error::SignatureInvalid(format!(
-            "signed identity_occurrence: attesting_key_id {} is not a registered federation key",
-            signed.attesting_key_id
-        )));
+        // v54.1.0 (CIRISPersist#1042) — an ordering gap, typed apart from a
+        // bad signature: retryable once the signer's Key row lands.
+        return Err(Error::unknown_signer(
+            &signed.attesting_key_id,
+            "identity_occurrence",
+        ));
     };
     let bytes = crate::verify::canonical::ceg_produce_canonicalize(env).map_err(|e| {
         Error::InvalidArgument(format!("signed identity_occurrence canonicalize: {e}"))
@@ -5376,7 +5415,7 @@ async fn check_signer_acts_for(
     directory: &dyn super::FederationDirectory,
     attesting_key_id: &str,
     identity_key_id: &str,
-    what: &str,
+    plane: &'static str,
 ) -> Result<(), Error> {
     if attesting_key_id == identity_key_id {
         return Ok(());
@@ -5406,10 +5445,15 @@ async fn check_signer_acts_for(
             .any(|o| o.occurrence_key_id == attesting_key_id)
     };
     if !acts_for {
-        return Err(Error::SignatureInvalid(format!(
-            "signed {what}: signer {attesting_key_id} is neither identity {identity_key_id} \
-             nor an active occurrence of it, nor a node it owns"
-        )));
+        // v54.1.0 (CIRISPersist#1042 follow-up, CIRISEdge#858) — the signature
+        // VERIFIED; what is missing is the binding or occurrence that lets this
+        // signer vouch, which on a fresh node may simply not have landed yet
+        // (#776). Typed apart from `SignatureInvalid`, which stays terminal.
+        return Err(Error::SignerDoesNotActFor {
+            attesting_key_id: attesting_key_id.to_owned(),
+            identity_key_id: identity_key_id.to_owned(),
+            plane,
+        });
     }
     Ok(())
 }
@@ -5504,11 +5548,12 @@ pub async fn verify_signed_identity_occurrence_revocation(
         .lookup_public_key(&signed.attesting_key_id)
         .await?
     else {
-        return Err(Error::SignatureInvalid(format!(
-            "signed identity_occurrence_revocation: attesting_key_id {} is not a registered \
-             federation key",
-            signed.attesting_key_id
-        )));
+        // v54.1.0 (CIRISPersist#1042) — an ordering gap, typed apart from a
+        // bad signature: retryable once the signer's Key row lands.
+        return Err(Error::unknown_signer(
+            &signed.attesting_key_id,
+            "identity_occurrence_revocation",
+        ));
     };
     let bytes = crate::verify::canonical::ceg_produce_canonicalize(env).map_err(|e| {
         Error::InvalidArgument(format!(
@@ -5678,10 +5723,12 @@ pub async fn verify_signed_transport_destination(
         .lookup_public_key(&signed.attesting_key_id)
         .await?
     else {
-        return Err(Error::SignatureInvalid(format!(
-            "signed transport_destination: attesting_key_id {} is not a registered federation key",
-            signed.attesting_key_id
-        )));
+        // v54.1.0 (CIRISPersist#1042) — an ordering gap, typed apart from a
+        // bad signature: retryable once the signer's Key row lands.
+        return Err(Error::unknown_signer(
+            &signed.attesting_key_id,
+            "transport_destination",
+        ));
     };
     let bytes = crate::verify::canonical::ceg_produce_canonicalize(env).map_err(|e| {
         Error::InvalidArgument(format!("signed transport_destination canonicalize: {e}"))
@@ -6519,10 +6566,12 @@ pub async fn verify_signed_touch_claim(
     // (3) Hybrid signature over JCS(signed_envelope) against the PINNED
     // federation pubkeys of the claimed signer, threshold 1-of-1.
     let Some(signer_key) = directory.lookup_public_key(&claim.attesting_key_id).await? else {
-        return Err(Error::SignatureInvalid(format!(
-            "signed touch_claim: attesting_key_id {} is not a registered federation key",
-            claim.attesting_key_id
-        )));
+        // v54.1.0 (CIRISPersist#1042) — an ordering gap, typed apart from a
+        // bad signature: retryable once the signer's Key row lands.
+        return Err(Error::unknown_signer(
+            &claim.attesting_key_id,
+            "touch_claim",
+        ));
     };
     // v21.10.0 (#519 b2) — the signature bytes are over the envelope WITHOUT
     // the `touch_cosignatures` set: co-signatures cannot be inside the bytes
@@ -6619,10 +6668,9 @@ pub async fn verify_signed_touch_claim(
                 continue;
             }
             let Some(cs_key) = directory.lookup_public_key(&cs.member_id).await? else {
-                return Err(Error::SignatureInvalid(format!(
-                    "signed touch_claim: NOfMCosigner {} is not a registered federation key",
-                    cs.member_id
-                )));
+                // v54.1.0 (CIRISPersist#1042) — an ordering gap, typed apart from a
+                // bad signature: retryable once the signer's Key row lands.
+                return Err(Error::unknown_signer(&cs.member_id, "touch_claim_cosigner"));
             };
             let cs_member = [ThresholdMember {
                 member_id: cs_key.key_id.clone(),
@@ -9992,7 +10040,53 @@ pub async fn steward_bindings_of(
     directory: &dyn super::FederationDirectory,
     k: &str,
 ) -> Result<Vec<String>, Error> {
-    let mut out: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // v54.1.0 (CIRISPersist#1041) — the keys of the labelled walk: one body,
+    // so a consent basis's path labels cannot disagree with membership.
+    Ok(steward_binding_paths_of(directory, k)
+        .await?
+        .into_keys()
+        .collect())
+}
+
+/// v54.1.0 (CIRISPersist#1041) — WHICH clause of [`steward_bindings_of`] put
+/// each steward in `k`'s set. Labels only: a key may be reached by more than
+/// one clause, and membership is the map's key set, which IS
+/// [`steward_bindings_of`]`(k)` (that function returns these keys).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StewardPath {
+    /// Clause (1): `k`'s own key is `user`-role, so `k` stewards itself.
+    SelfUser,
+    /// Clause (2): `k` is an ACTIVE occurrence of this `user`-role identity
+    /// (`user_identity_anchors_of`).
+    OccurrenceOf,
+    /// Clause (3): this `user`-role key granted a LIVE `delegates_to` to `k`
+    /// of the shape `k`'s agency admits (an owner-binding to a person; any
+    /// delegation to a node).
+    DelegatesTo,
+}
+
+impl StewardPath {
+    /// The stable token (the serde spelling).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SelfUser => "self_user",
+            Self::OccurrenceOf => "occurrence_of",
+            Self::DelegatesTo => "delegates_to",
+        }
+    }
+}
+
+/// v54.1.0 (CIRISPersist#1041) — [`steward_bindings_of`] with each steward's
+/// clause label(s), sorted by key. THE body of the steward walk: the three
+/// clauses below are the ones [`is_steward_bound`] tests.
+pub async fn steward_binding_paths_of(
+    directory: &dyn super::FederationDirectory,
+    k: &str,
+) -> Result<std::collections::BTreeMap<String, Vec<StewardPath>>, Error> {
+    let mut out: std::collections::BTreeMap<String, Vec<StewardPath>> =
+        std::collections::BTreeMap::new();
     // v11.5.0 (CIRISPersist#306) — mirror `is_steward_bound`'s minor gate so
     // the invariant `is_steward_bound(k) ⟺ !steward_bindings_of(k).is_empty()`
     // holds: a PROVEN minor user does NOT self-anchor (clauses 1/2 are
@@ -10002,12 +10096,16 @@ pub async fn steward_bindings_of(
         // (1) k's own key is user-role.
         if let Some(rec) = directory.lookup_public_key(k).await? {
             if identity_type::set_contains(&rec.identity_type, identity_type::USER) {
-                out.insert(k.to_owned());
+                out.entry(k.to_owned())
+                    .or_default()
+                    .push(StewardPath::SelfUser);
             }
         }
         // (2) k is an occurrence of a user-role identity.
         // v44.6.0 (#857) — every row for the key, ACTIVE only, spelled once.
-        out.extend(user_identity_anchors_of(directory, k).await?);
+        for u in user_identity_anchors_of(directory, k).await? {
+            out.entry(u).or_default().push(StewardPath::OccurrenceOf);
+        }
     }
     // (3) each user-role granter U of a LIVE delegates_to(U → k) — with the
     // filter chosen by **whether `k` has agency**.
@@ -10040,9 +10138,12 @@ pub async fn steward_bindings_of(
     // ANY delegation naming it; one that can is stewarded only where the envelope
     // declares custody.
     let filter = steward_edge_filter(directory, k).await?;
-    out.extend(live_delegation_granters(directory, k, filter).await?);
-    let mut out: Vec<String> = out.into_iter().collect();
-    out.sort();
+    for u in live_delegation_granters(directory, k, filter).await? {
+        out.entry(u).or_default().push(StewardPath::DelegatesTo);
+    }
+    for paths in out.values_mut() {
+        paths.dedup();
+    }
     Ok(out)
 }
 
@@ -22833,9 +22934,6 @@ mod canonical_withdrawal_tests {
             prior_family_digest: "prior-family-digest".to_owned(),
             payload_sha256,
         };
-        dir.issue_accord_nonce(HUMANITY_ACCORD_FAMILY_KEY_ID, nonce)
-            .await
-            .expect("issue nonce");
         dir.put_accord_proposal(proposal.clone(), None)
             .await
             .expect("put proposal");

@@ -142,7 +142,6 @@
 # DERIVED (see `pyi_surface.py report`), never pinned. 158 methods are
 # build-conditional and a `.pyi` structurally cannot express that.
 Engine	__init__	structural	
-Engine	accord_nonce_issued	deontic	
 Engine	active_community_members_json	empirical	
 Engine	active_family_members_json	empirical	
 Engine	add_community_member	deontic	
@@ -378,7 +377,6 @@ Engine	is_closed	structural
 Engine	is_load_bearing_json	deontic	
 Engine	is_named_moderator_json	deontic	
 Engine	is_steward_bound_json	deontic	
-Engine	issue_accord_nonce	deontic	
 Engine	keyring_path	ontological	
 Engine	keyring_signer_capsule	structural	
 Engine	keyring_storage_kind	ontological	
@@ -750,6 +748,9 @@ Engine	resolve_scoped_consent_by_principals	deontic
 # v53.1.8 (CIRISPersist#1013) — `capacity_consent_stance` is DEONTIC: it is the
 # consent-before-scoring gate's own fold; a wrong answer admits or refuses a score.
 Engine	capacity_consent_stance	deontic	
+# v54.1.0 (CIRISPersist#1041) — the same fold WITH the rows it rests on: deontic
+# for the same reason; the basis a scorer records is what the gate decides on.
+Engine	capacity_consent_stance_with_basis	deontic	
 # v50.0.0 (CIRISPersist#926) — `resolve_community_json` and
 # `pin_trust_from_bundle_response_json` are DEONTIC: a wrong entry names the
 # founders a consumer trusts (or admits a row its accord did not found), which

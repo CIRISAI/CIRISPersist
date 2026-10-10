@@ -3816,7 +3816,18 @@ impl SqliteBackend {
                 // runs, and the upgrade branch already runs) now guards the
                 // insert too. Fail-closed before any write.
                 if !crate::federation::register::record_is_role_gated(&record.record) {
-                    crate::federation::verify_key_registration(self, &record.record).await?;
+                    // v54.1.0 (CIRISPersist#1042, CIRISEdge#858) — a verify
+                    // failure is a TYPED refusal, never a bare `Err`: the
+                    // sender books `attester_key_unknown` (retryable: the
+                    // scrubber's Key row has not landed here yet) apart from
+                    // `unverifiable_signature` (terminal). Nothing is written.
+                    if let Err(e) =
+                        crate::federation::verify_key_registration(self, &record.record).await
+                    {
+                        return Ok(ReplicatedKeyOutcome::Refused {
+                            reason: crate::federation::register::key_refusal_of_verify_error(e)?,
+                        });
+                    }
                 }
                 match self
                     .put_public_key_at_door(
@@ -3865,6 +3876,21 @@ impl SqliteBackend {
                     Err(e) => Err(e),
                 }
             }
+            // v54.1.0 (#1044) — the stored record fails verification and the
+            // incoming one (same pubkeys, same claim) passes: replace it. A
+            // lost race, or a stored row that verifies after all, is
+            // fail-closed + re-offerable.
+            ReplicatedKeyPlan::ReplaceInvalid => {
+                match crate::federation::FederationDirectory::store_invalid_replaced_key_record(
+                    self, record,
+                )
+                .await
+                {
+                    Ok(outcome) => Ok(outcome),
+                    Err(crate::federation::Error::Conflict(_)) => Ok(RACED),
+                    Err(e) => Err(e),
+                }
+            }
             // #405 — existing canonical → strictly-newer, m-of-n-re-verified
             // re-scrub (runtime address move). A lost race / policy-no-longer-
             // holds Conflict is fail-closed + re-offerable.
@@ -3887,6 +3913,111 @@ impl SqliteBackend {
                 Err(e) => Err(e),
             },
         }
+    }
+
+    /// v54.1.0 (CIRISPersist#1044) — the ONE in-place registration rewrite
+    /// both replacement doors share (the #864 rebind, the #1044 invalid
+    /// replace). One transaction: append the stored row's registration bytes
+    /// to `federation_key_registration_history` (V148) with the replaced
+    /// row's own `persist_row_hash` and `kind` (V186), then rewrite the
+    /// envelope, every scrub (V096 `additional_scrubs` included, v53.1.4),
+    /// `scrub_key_id`, `persist_row_hash` and `mutated_at` (#707: a cursor
+    /// that passed the row is served the new bytes). Both statements are
+    /// guarded on the planned-against hash and the Ed25519 pubkey; a rebind
+    /// additionally requires the stored row to be self-signed. 0 rows ⇒
+    /// `Conflict` (a concurrent mutation) and nothing is written.
+    async fn write_replaced_key_registration(
+        &self,
+        row: crate::federation::KeyRecord,
+        existing_hash: String,
+        kind: crate::federation::types::KeyReplacementKind,
+    ) -> Result<(), crate::federation::Error> {
+        let envelope_text = serde_json::to_string(&row.registration_envelope)
+            .map_err(|e| crate::federation::Error::Backend(format!("envelope: {e}")))?;
+        let original_content_hash = hex::decode(&row.original_content_hash).map_err(|e| {
+            crate::federation::Error::InvalidArgument(format!("original_content_hash hex: {e}"))
+        })?;
+        let additional_scrubs_text =
+            serde_json::to_string(&row.additional_scrubs).map_err(|e| {
+                crate::federation::Error::Backend(format!("additional_scrubs serialize: {e}"))
+            })?;
+        let require_self_signed = kind == crate::federation::types::KeyReplacementKind::Rebind;
+        let kind_token = kind.as_str();
+        let kid = row.key_id.clone();
+        let n = self
+            .write(move |conn| -> Result<usize, rusqlite::Error> {
+                let tx = conn.transaction()?;
+                let mutated_at = sqlite_next_key_serve_position(&tx)?;
+                // History first, FROM the row as stored and only if it is still
+                // the row the plan saw; the UPDATE below is guarded the same
+                // way, so a lost race leaves neither.
+                let replaced = tx.execute(
+                    "INSERT INTO federation_key_registration_history \
+                        (key_id, registration_envelope, original_content_hash, \
+                         scrub_signature_classical, scrub_signature_pqc, scrub_key_id, \
+                         scrub_timestamp, replaced_at, replaced_by_hash, \
+                         replaced_row_hash, replacement_kind) \
+                     SELECT key_id, registration_envelope, original_content_hash, \
+                         scrub_signature_classical, scrub_signature_pqc, scrub_key_id, \
+                         scrub_timestamp, ?3, ?4, persist_row_hash, ?5 \
+                     FROM federation_keys WHERE key_id = ?1 AND persist_row_hash = ?2 \
+                       AND (?6 = 0 OR scrub_key_id = key_id)",
+                    rusqlite::params![
+                        row.key_id,
+                        existing_hash,
+                        mutated_at.to_rfc3339(),
+                        row.persist_row_hash,
+                        kind_token,
+                        i64::from(require_self_signed),
+                    ],
+                )?;
+                if replaced == 0 {
+                    return Ok(0);
+                }
+                let n = tx.execute(
+                    "UPDATE federation_keys SET \
+                        registration_envelope = ?2, original_content_hash = ?3, \
+                        scrub_signature_classical = ?4, scrub_signature_pqc = ?5, \
+                        scrub_timestamp = ?6, pqc_completed_at = ?7, \
+                        persist_row_hash = ?8, mutated_at = ?9, additional_scrubs = ?12, \
+                        scrub_key_id = ?13 \
+                     WHERE key_id = ?1 AND (?14 = 0 OR scrub_key_id = key_id) \
+                       AND pubkey_ed25519_base64 = ?10 AND persist_row_hash = ?11",
+                    rusqlite::params![
+                        row.key_id,
+                        envelope_text,
+                        original_content_hash,
+                        row.scrub_signature_classical,
+                        row.scrub_signature_pqc,
+                        row.scrub_timestamp.to_rfc3339(),
+                        row.pqc_completed_at.map(|t| t.to_rfc3339()),
+                        row.persist_row_hash,
+                        mutated_at.to_rfc3339(),
+                        row.pubkey_ed25519_base64,
+                        existing_hash,
+                        additional_scrubs_text,
+                        row.scrub_key_id,
+                        i64::from(require_self_signed),
+                    ],
+                )?;
+                if n == 0 {
+                    return Ok(0);
+                }
+                tx.commit()?;
+                Ok(n)
+            })
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!(
+                    "{kind_token} key registration {kid}: {e}"
+                ))
+            })?;
+        if n == 0 {
+            return Err(crate::federation::Error::Conflict(format!(
+                "{kind_token} key registration {kid}: row changed concurrently"
+            )));
+        }
+        self.index_stored_key_row(&kid).await
     }
 
     /// v13.0.0 (CIRISPersist#372, CC 3.4.7.1) — enumerate the **canonical /
@@ -4036,85 +4167,36 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                 RebindPrepared::Unchanged => return Ok(ReplicatedKeyOutcome::Unchanged),
                 RebindPrepared::Replace { new, existing_hash } => (*new, existing_hash),
             };
-        let envelope_text = serde_json::to_string(&row.registration_envelope)
-            .map_err(|e| crate::federation::Error::Backend(format!("envelope: {e}")))?;
-        let original_content_hash = hex::decode(&row.original_content_hash).map_err(|e| {
-            crate::federation::Error::InvalidArgument(format!("original_content_hash hex: {e}"))
-        })?;
-        // v53.1.4 — the whole scrub set rides every rewrite of the scrub columns:
-        // a door that wrote scrub #1 alone stored a quorum-signed record as a
-        // one-holder row (the V096 JSON-array TEXT column; empty → "[]").
-        let additional_scrubs_text =
-            serde_json::to_string(&row.additional_scrubs).map_err(|e| {
-                crate::federation::Error::Backend(format!("additional_scrubs serialize: {e}"))
-            })?;
-        let kid = row.key_id.clone();
-        let n = self
-            .write(move |conn| -> Result<usize, rusqlite::Error> {
-                let tx = conn.transaction()?;
-                let mutated_at = sqlite_next_key_serve_position(&tx)?;
-                // History first, FROM the row as stored and only if it is still
-                // the row the plan saw; the UPDATE below is guarded the same
-                // way, so a lost race leaves neither.
-                let replaced = tx.execute(
-                    "INSERT INTO federation_key_registration_history \
-                        (key_id, registration_envelope, original_content_hash, \
-                         scrub_signature_classical, scrub_signature_pqc, scrub_key_id, \
-                         scrub_timestamp, replaced_at, replaced_by_hash) \
-                     SELECT key_id, registration_envelope, original_content_hash, \
-                         scrub_signature_classical, scrub_signature_pqc, scrub_key_id, \
-                         scrub_timestamp, ?3, ?4 \
-                     FROM federation_keys WHERE key_id = ?1 AND persist_row_hash = ?2",
-                    rusqlite::params![
-                        row.key_id,
-                        existing_hash,
-                        mutated_at.to_rfc3339(),
-                        row.persist_row_hash,
-                    ],
-                )?;
-                if replaced == 0 {
-                    return Ok(0);
-                }
-                let n = tx.execute(
-                    "UPDATE federation_keys SET \
-                        registration_envelope = ?2, original_content_hash = ?3, \
-                        scrub_signature_classical = ?4, scrub_signature_pqc = ?5, \
-                        scrub_timestamp = ?6, pqc_completed_at = ?7, \
-                        persist_row_hash = ?8, mutated_at = ?9, additional_scrubs = ?12 \
-                     WHERE key_id = ?1 AND scrub_key_id = key_id \
-                       AND pubkey_ed25519_base64 = ?10 AND persist_row_hash = ?11",
-                    rusqlite::params![
-                        row.key_id,
-                        envelope_text,
-                        original_content_hash,
-                        row.scrub_signature_classical,
-                        row.scrub_signature_pqc,
-                        row.scrub_timestamp.to_rfc3339(),
-                        row.pqc_completed_at.map(|t| t.to_rfc3339()),
-                        row.persist_row_hash,
-                        mutated_at.to_rfc3339(),
-                        row.pubkey_ed25519_base64,
-                        existing_hash,
-                        additional_scrubs_text,
-                    ],
-                )?;
-                if n == 0 {
-                    return Ok(0);
-                }
-                tx.commit()?;
-                Ok(n)
-            })
-            .await
-            .map_err(|e| {
-                crate::federation::Error::Backend(format!("store_rebound_key_record {kid}: {e}"))
-            })?;
-        if n == 0 {
-            return Err(crate::federation::Error::Conflict(format!(
-                "store_rebound_key_record {kid}: row changed concurrently"
-            )));
-        }
-        self.index_stored_key_row(&kid).await?;
+        self.write_replaced_key_registration(
+            row,
+            existing_hash,
+            crate::federation::types::KeyReplacementKind::Rebind,
+        )
+        .await?;
         Ok(ReplicatedKeyOutcome::Rebound)
+    }
+
+    /// v54.1.0 (CIRISPersist#1044) — the invalid-replace store step (see the
+    /// trait doc): the shared pre-check (`register::prepare_invalid_replace`,
+    /// which re-asserts that the stored record FAILS verification), then the
+    /// same guarded history + UPDATE transaction the rebind writes.
+    async fn store_invalid_replaced_key_record(
+        &self,
+        record: crate::federation::SignedKeyRecord,
+    ) -> Result<crate::federation::register::ReplicatedKeyOutcome, crate::federation::Error> {
+        use crate::federation::register::{RebindPrepared, ReplicatedKeyOutcome};
+        let (row, existing_hash) =
+            match crate::federation::register::prepare_invalid_replace(self, record).await? {
+                RebindPrepared::Unchanged => return Ok(ReplicatedKeyOutcome::Unchanged),
+                RebindPrepared::Replace { new, existing_hash } => (*new, existing_hash),
+            };
+        self.write_replaced_key_registration(
+            row,
+            existing_hash,
+            crate::federation::types::KeyReplacementKind::InvalidReplaced,
+        )
+        .await?;
+        Ok(ReplicatedKeyOutcome::InvalidReplaced)
     }
 
     async fn list_key_registration_history(
@@ -4132,6 +4214,8 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             String,
             String,
             String,
+            Option<String>,
+            String,
         );
         let kid = key_id.to_owned();
         let raw = self
@@ -4139,7 +4223,8 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                 let mut stmt = conn.prepare(
                     "SELECT key_id, registration_envelope, original_content_hash, \
                             scrub_signature_classical, scrub_signature_pqc, scrub_key_id, \
-                            scrub_timestamp, replaced_at, replaced_by_hash \
+                            scrub_timestamp, replaced_at, replaced_by_hash, \
+                            replaced_row_hash, replacement_kind \
                      FROM federation_key_registration_history \
                      WHERE key_id = ?1 ORDER BY history_id ASC",
                 )?;
@@ -4154,6 +4239,8 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                         r.get(6)?,
                         r.get(7)?,
                         r.get(8)?,
+                        r.get(9)?,
+                        r.get(10)?,
                     ))
                 })?;
                 rows.collect()
@@ -4164,7 +4251,19 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             })?;
         raw.into_iter()
             .map(
-                |(key_id, envelope, hash, classical, pqc, scrub_key_id, scrub_ts, replaced, by)| {
+                |(
+                    key_id,
+                    envelope,
+                    hash,
+                    classical,
+                    pqc,
+                    scrub_key_id,
+                    scrub_ts,
+                    replaced,
+                    by,
+                    replaced_row_hash,
+                    kind,
+                )| {
                     Ok(crate::federation::types::KeyRegistrationHistoryRow {
                         key_id,
                         registration_envelope: serde_json::from_str(&envelope).map_err(|e| {
@@ -4177,6 +4276,15 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                         scrub_timestamp: parse_rfc3339(&scrub_ts),
                         replaced_at: parse_rfc3339(&replaced),
                         replaced_by_hash: by,
+                        replaced_row_hash,
+                        replacement: crate::federation::types::KeyReplacementKind::from_token(
+                            &kind,
+                        )
+                        .ok_or_else(|| {
+                            crate::federation::Error::Backend(format!(
+                                "history replacement_kind {kind:?}"
+                            ))
+                        })?,
                     })
                 },
             )
@@ -5105,11 +5213,11 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     crate::federation::Error::Backend(format!("lookup attesting identity_type: {e}"))
                 })?
             };
+            // v54.1.0 (CIRISPersist#1042) — an attester this node does not
+            // hold is the ORDERING gap (retryable once its Key row lands),
+            // typed apart from a bad signature; it read as `InvalidArgument`.
             let attesting_identity_type = attesting_identity_type.ok_or_else(|| {
-                crate::federation::Error::InvalidArgument(format!(
-                    "attesting_key_id {} does not exist in federation_keys",
-                    row.attesting_key_id
-                ))
+                crate::federation::Error::unknown_signer(&row.attesting_key_id, "attestation")
             })?;
             // AV-76 D2 — the lookup above is a hard DATA dependency of the
             // dimension policy here (`attesting_identity_type`); the pair
@@ -8669,16 +8777,6 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         authority_signature: Option<serde_json::Value>,
     ) -> Result<(), crate::federation::Error> {
         use crate::federation::Error;
-        // M4 fail-closed: the nonce must already be issued for this family.
-        if !self
-            .accord_nonce_issued(&proposal.family_key_id, &proposal.nonce)
-            .await?
-        {
-            return Err(Error::InvalidArgument(format!(
-                "accord proposal nonce {:?} not issued for family {:?} (M4 fail-closed)",
-                proposal.nonce, proposal.family_key_id
-            )));
-        }
         // v31.1.0 (CIRISPersist#662, PR #667 round-5) — `created_at` is half the
         // evidence cursor (`max(created_at, max(server_arrival_at))`), so it is
         // an allocated position, not a wall-clock read.
@@ -8722,36 +8820,55 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             ),
             None => None,
         };
-        self.write(move |conn| -> Result<(), rusqlite::Error> {
-            // ON CONFLICT DO NOTHING — the digest is content-derived, so a
-            // re-PUT of the same proposal is idempotent and a different
-            // proposal cannot collide.
-            conn.execute(
-                "INSERT INTO accord_proposal (\
+        let reused = self
+            .write(move |conn| -> Result<Option<String>, rusqlite::Error> {
+                // v54.1.0 (#1047) — single use, in the insert's own write: a
+                // proposer-minted nonce names one proposal per family.
+                let other: Option<String> = conn
+                    .query_row(
+                        "SELECT proposal_digest FROM accord_proposal \
+                     WHERE family_key_id = ?1 AND nonce = ?2 AND proposal_digest <> ?3 LIMIT 1",
+                        rusqlite::params![prep.family_key_id, prep.nonce, prep.proposal_digest],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                if other.is_some() {
+                    return Ok(other);
+                }
+                // ON CONFLICT DO NOTHING — the digest is content-derived, so a
+                // re-PUT of the same proposal is idempotent and a different
+                // proposal cannot collide.
+                conn.execute(
+                    "INSERT INTO accord_proposal (\
                     proposal_digest, family_key_id, action, nonce, window_until, \
                     prior_family_digest, payload_sha256, proposal_json, \
                     authority_signature, persist_row_hash, created_at\
                  ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11) \
                  ON CONFLICT(proposal_digest) DO NOTHING",
-                rusqlite::params![
-                    prep.proposal_digest,
-                    prep.family_key_id,
-                    prep.action,
-                    prep.nonce,
-                    prep.window_until.to_rfc3339(),
-                    prep.prior_family_digest,
-                    prep.payload_sha256,
-                    proposal_json,
-                    auth_sig,
-                    prep.persist_row_hash,
-                    prep.created_at.to_rfc3339(),
-                ],
-            )?;
-            Ok(())
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("insert accord_proposal: {e}")))?;
-        Ok(())
+                    rusqlite::params![
+                        prep.proposal_digest,
+                        prep.family_key_id,
+                        prep.action,
+                        prep.nonce,
+                        prep.window_until.to_rfc3339(),
+                        prep.prior_family_digest,
+                        prep.payload_sha256,
+                        proposal_json,
+                        auth_sig,
+                        prep.persist_row_hash,
+                        prep.created_at.to_rfc3339(),
+                    ],
+                )?;
+                Ok(None)
+            })
+            .await
+            .map_err(|e| Error::Backend(format!("insert accord_proposal: {e}")))?;
+        match reused {
+            Some(other) => Err(crate::federation::accord_quorum::nonce_reused(
+                &proposal, &other,
+            )),
+            None => Ok(()),
+        }
     }
 
     async fn get_accord_proposal(
@@ -9107,48 +9224,6 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         .await
         .map_err(|e| crate::federation::Error::Backend(format!("clear_active_halt: {e}")))?;
         Ok(())
-    }
-
-    async fn issue_accord_nonce(
-        &self,
-        family_key_id: &str,
-        nonce: &str,
-    ) -> Result<(), crate::federation::Error> {
-        let fam = family_key_id.to_owned();
-        let n = nonce.to_owned();
-        let now = chrono::Utc::now().to_rfc3339();
-        self.write(move |conn| -> Result<(), rusqlite::Error> {
-            conn.execute(
-                "INSERT INTO accord_issued_nonce (family_key_id, nonce, issued_at) \
-                 VALUES (?1, ?2, ?3) ON CONFLICT(family_key_id, nonce) DO NOTHING",
-                rusqlite::params![fam, n, now],
-            )?;
-            Ok(())
-        })
-        .await
-        .map_err(|e| crate::federation::Error::Backend(format!("issue_accord_nonce: {e}")))?;
-        Ok(())
-    }
-
-    async fn accord_nonce_issued(
-        &self,
-        family_key_id: &str,
-        nonce: &str,
-    ) -> Result<bool, crate::federation::Error> {
-        let fam = family_key_id.to_owned();
-        let n = nonce.to_owned();
-        self.read(move |conn| -> Result<bool, rusqlite::Error> {
-            let found: Option<i64> = conn
-                .query_row(
-                    "SELECT 1 FROM accord_issued_nonce WHERE family_key_id = ?1 AND nonce = ?2",
-                    rusqlite::params![fam, n],
-                    |r| r.get(0),
-                )
-                .optional()?;
-            Ok(found.is_some())
-        })
-        .await
-        .map_err(|e| crate::federation::Error::Backend(format!("accord_nonce_issued: {e}")))
     }
 
     // ─── v4.8.0 (CIRISPersist#161, CEG §11.7.1) — membership revocations.
@@ -30829,18 +30904,27 @@ mod tests {
         );
         forged.scrub_signature_classical = "AAAA".into();
         forged.scrub_signature_pqc = Some("AAAA".into());
-        let err = backend
+        // v54.1.0 (#1042) — the Insert arm returns a refusal OUTCOME, never a
+        // bare `Err`: a scrubber this node holds whose signature does not
+        // verify is the terminal `unverifiable_signature`.
+        let outcome = backend
             .apply_replicated_key_record(crate::federation::SignedKeyRecord { record: forged })
             .await
-            .expect_err("(E2) invalid-PoP fresh key must be rejected");
+            .expect("(E2) a refusal is an outcome, never a bare Err");
+        assert_eq!(
+            outcome,
+            crate::federation::register::ReplicatedKeyOutcome::Refused {
+                reason: crate::federation::register::KeyRefusalReason::UnverifiableSignature,
+            },
+            "(E2) invalid-PoP fresh key must be refused unverifiable_signature"
+        );
         // Nothing was written.
         assert!(
             crate::federation::FederationDirectory::lookup_public_key(&backend, "e2-forged")
                 .await
                 .unwrap()
                 .is_none(),
-            "forged key left no trace, got err {}",
-            err.kind()
+            "forged key left no trace"
         );
     }
 
@@ -34501,14 +34585,19 @@ mod tests {
     async fn federation_attestation_fk_enforcement() {
         let backend = SqliteBackend::open_in_memory().await.unwrap();
         backend.run_migrations().await.unwrap();
-        // Insert an attestation referencing a non-existent key — FK
-        // violation surfaces as InvalidArgument (matches memory shape).
+        // Insert an attestation referencing a non-existent key. v54.1.0
+        // (#1042) — the attester lookup runs first and types the unknown
+        // signer as the retryable ordering gap (matches memory shape).
         let att = fed_attestation("att-1", "ghost-steward", "ghost-key", "ghost-steward");
         let err = backend
             .put_attestation(SignedAttestation { attestation: att })
             .await
             .unwrap_err();
-        assert!(matches!(err, crate::federation::Error::InvalidArgument(_)));
+        assert!(
+            matches!(&err, crate::federation::Error::AttesterKeyUnknown { attesting_key_id, plane: "attestation" }
+                if attesting_key_id == "ghost-steward"),
+            "expected the attester-lookup refusal, got {err:?}"
+        );
     }
 
     #[tokio::test]
@@ -37658,9 +37747,11 @@ mod tests {
         let err = backend.put_identity_occurrence(wrong).await.expect_err(
             "a signer who is neither the identity nor its active occurrence must be rejected",
         );
-        assert_eq!(err.kind(), "federation_signature_invalid");
-        assert!(
-            format!("{err}").contains("neither identity"),
+        // v54.1.0 (#1042 follow-up) — `signer_acts_for`'s refusal is typed apart
+        // from a bad signature: the retryable `federation_signer_not_acting_for`.
+        assert_eq!(
+            err.kind(),
+            "federation_signer_not_acting_for",
             "(4) the refusal must be `signer_acts_for`'s, not a subject-binding or signature \
              failure standing in for it: {err}"
         );
@@ -37891,7 +37982,9 @@ mod tests {
             )
             .await
             .expect_err("(3b) a peer's revocation of a victim must be REJECTED");
-        assert_eq!(err.kind(), "federation_signature_invalid");
+        // v54.1.0 (#1042 follow-up) — the signature verifies; the signer does
+        // not act for alice: the typed signer-acts-for refusal.
+        assert_eq!(err.kind(), "federation_signer_not_acting_for");
         assert!(backend
             .resolve_encryption_keys("alice-phone")
             .await
@@ -38457,7 +38550,11 @@ mod tests {
             .await
             .expect_err("an unsigned family roster grow must be refused");
         assert!(
-            err.to_string().contains("not registered") || err.to_string().contains("signature"),
+            // v54.1.0 (#1042 follow-up B) — an empty authority is a row naming
+            // no signer: the terminal malformed refusal.
+            err.to_string().contains("not registered")
+                || err.to_string().contains("signature")
+                || err.to_string().contains("names no signer"),
             "the refusal is about AUTHORSHIP: {err:?}"
         );
         // v49.0.0 (#910): alice — the whole of this `unanimous` family — signs;

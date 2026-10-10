@@ -65,6 +65,30 @@ pub(crate) struct PreparedProposal {
     pub created_at: DateTime<Utc>,
 }
 
+/// v54.1.0 (CIRISPersist#1042 follow-up C) — the stable refusal token of
+/// [`Error::AccordProposalNonceReused`].
+pub const ACCORD_PROPOSAL_NONCE_REUSED: &str = "accord_proposal_nonce_reused";
+
+/// v54.1.0 (CIRISPersist#1047) — the refusal of a proposal whose
+/// proposer-minted nonce already names `other` (a different proposal) in its
+/// family. Single use is the substrate's dedup (verify checks the nonce's
+/// form). Typed (#1042 follow-up C): [`Error::AccordProposalNonceReused`].
+pub(crate) fn nonce_reused(proposal: &AccordProposal, other: &str) -> Error {
+    Error::AccordProposalNonceReused {
+        family_key_id: proposal.family_key_id.clone(),
+        nonce: proposal.nonce.clone(),
+        existing_proposal_digest: other.to_owned(),
+    }
+}
+
+/// v54.1.0 (CIRISPersist#1047) — the postgres advisory-lock key a
+/// `put_accord_proposal` takes in its transaction, so the single-use read
+/// and the insert are one step across every process sharing the database.
+/// A fixed 64-bit constant (the ASCII bytes of `"acnonce1"`), distinct from
+/// every other key this crate takes.
+#[cfg(feature = "postgres")]
+pub(crate) const ACCORD_PROPOSAL_NONCE_LOCK_KEY: i64 = 0x6163_6e6f_6e63_6531;
+
 /// Derive the `accord_proposal` columns from the verify-core object. The
 /// digest is `AccordProposal::digest()` (never caller-supplied); the action
 /// is the canonical token. Stores the object verbatim.
@@ -320,8 +344,8 @@ pub(crate) mod test_fixtures {
 
     /// #302 — the full accord live-quorum storage flow, run against ANY
     /// backend so the three impls assert identical behaviour from ONE source
-    /// (no pg/sqlite/memory asymmetry): M4 nonce fail-closed,
-    /// verify-before-mutation (C3 roster + verify-core verify), M6 dedup by
+    /// (no pg/sqlite/memory asymmetry): the proposer-minted nonce and its
+    /// single use (I629, v54.1.0 #1047), verify-before-mutation (C3 roster + verify-core verify), M6 dedup by
     /// pinned pubkey, decision immutability (M2), active-halt clear-on-resume
     /// (H2).
     pub async fn exercise_accord_storage<B>(backend: &B, suffix: &str)
@@ -343,22 +367,55 @@ pub(crate) mod test_fixtures {
         let anchor = prop.prior_family_digest.clone();
         let digest = prop.digest();
 
-        // M4 fail-closed: proposal before its nonce is issued → rejected.
-        let err = backend
-            .put_accord_proposal(prop.clone(), None)
-            .await
-            .unwrap_err();
-        assert!(matches!(err, Error::InvalidArgument(_)), "M4: {err:?}");
-        // Issue the nonce → admitted (+ idempotent re-PUT).
-        backend.issue_accord_nonce(&family, &nonce).await.unwrap();
+        // I629 (v54.1.0, #1047; CIRISConstitution#146, verify 20) — the nonce
+        // is the PROPOSER's: the proposal admits with nothing issued first
+        // (+ idempotent re-PUT). Kills: the pre-v54.1 issued-nonce gate (M4).
         backend
             .put_accord_proposal(prop.clone(), None)
             .await
-            .unwrap();
+            .unwrap_or_else(|e| panic!("I629: a proposer-minted nonce admits: {e}"));
         backend
             .put_accord_proposal(prop.clone(), None)
             .await
-            .unwrap();
+            .unwrap_or_else(|e| panic!("I629: a byte-identical re-PUT is idempotent: {e}"));
+        // Single use: a DIFFERENT proposal reusing the nonce in this family
+        // is refused and not stored. Kills: the single-use check.
+        let mut reuse = prop.clone();
+        reuse.window_until = "2030-01-01T00:00:00Z".to_owned();
+        assert_ne!(reuse.digest(), digest);
+        match backend.put_accord_proposal(reuse.clone(), None).await {
+            Err(e @ Error::AccordProposalNonceReused { .. }) => {
+                assert_eq!(e.kind(), "federation_accord_proposal_nonce_reused");
+                assert!(
+                    matches!(&e, Error::AccordProposalNonceReused { family_key_id, nonce: n, existing_proposal_digest }
+                        if *family_key_id == family && *n == nonce && *existing_proposal_digest == digest),
+                    "I629: the refusal names the family, the nonce and the proposal it names: {e:?}"
+                );
+                // The Display is the pre-typing text, unchanged (adopters pinned it).
+                assert!(
+                    e.to_string().starts_with(&format!(
+                        "conflicts with existing row: {}: nonce",
+                        crate::federation::accord_quorum::ACCORD_PROPOSAL_NONCE_REUSED
+                    )),
+                    "I629: {e}"
+                );
+            }
+            other => panic!("I629: a reused nonce must be refused typed, got {other:?}"),
+        }
+        assert!(
+            backend
+                .get_accord_proposal(&reuse.digest())
+                .await
+                .unwrap()
+                .is_none(),
+            "I629: the refused proposal is not stored"
+        );
+        // The same nonce in ANOTHER family names nothing there yet. Kills:
+        // single use read across families.
+        backend
+            .put_accord_proposal(proposal(&format!("{family}-b"), &nonce), None)
+            .await
+            .unwrap_or_else(|e| panic!("I629: one nonce in another family admits: {e}"));
         assert!(backend
             .get_accord_proposal(&digest)
             .await

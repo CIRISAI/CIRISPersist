@@ -245,7 +245,11 @@ pub mod test_support {
             .await
             .expect_err("(1) an unsigned family roster grow must be refused");
         assert!(
-            err.to_string().contains("not registered") || err.to_string().contains("signature"),
+            // v54.1.0 (#1042 follow-up B) — an empty authority is a row naming
+            // no signer: the terminal malformed refusal.
+            err.to_string().contains("not registered")
+                || err.to_string().contains("signature")
+                || err.to_string().contains("names no signer"),
             "({tag}) the refusal is about AUTHORSHIP: {err:?}"
         );
         let wrong = admit_family_via(

@@ -1324,7 +1324,6 @@ async fn recovers(d: &dyn FederationDirectory, c: &TestCeremonyOutputs, tag: &st
     use ciris_verify_core::accord_live_quorum::{AccordAction, AccordDecision, AccordProposal};
     let far = chrono::Utc::now() + chrono::Duration::days(3650);
     let nonce = format!("i429-roster-change-{tag}");
-    d.issue_accord_nonce(accord, &nonce).await.unwrap();
     let proposal = AccordProposal {
         family_key_id: accord.to_owned(),
         action: AccordAction::RosterChange,

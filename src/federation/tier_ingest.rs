@@ -113,8 +113,10 @@ use crate::verify::{verify_hybrid, HybridPolicy};
 ///    REQUIRED.
 ///
 /// On success returns `Ok(())`; the caller then stores the row. On ANY
-/// failure returns [`Error::FederationTierUnverified`] and the caller
-/// MUST NOT store the row.
+/// failure the caller MUST NOT store the row: a signature that does not
+/// verify is [`Error::FederationTierUnverified`] (terminal); an attester
+/// this node holds no Key row for is [`Error::AttesterKeyUnknown`]
+/// (v54.1.0, CIRISPersist#1042 — retryable after the key plane).
 pub async fn verify_federation_tier_ingest<F>(directory: &F, row: &Attestation) -> Result<(), Error>
 where
     F: FederationDirectory + ?Sized,
@@ -277,9 +279,12 @@ where
 /// the directory (unknown attester ⇒ reject, fail-secure), and runs
 /// [`verify_hybrid`] under [`HybridPolicy::Strict`] (both halves REQUIRED,
 /// PQC-mandatory per CC 5.3.2.4.3.1). On success returns the hex-encoded
-/// `SHA-256(canonical)` (the row's `original_content_hash`); on ANY failure
-/// returns [`Error::FederationTierUnverified`] with an empty `attestation_id`
-/// (the caller re-stamps its own where one exists).
+/// `SHA-256(canonical)` (the row's `original_content_hash`); on a signature
+/// failure returns [`Error::FederationTierUnverified`] with an empty
+/// `attestation_id` (the caller re-stamps its own where one exists). An
+/// attester this node holds no Key row for is [`Error::AttesterKeyUnknown`]
+/// instead (v54.1.0, CIRISPersist#1042): an ordering gap, retryable. A
+/// backend failure of the attester lookup propagates as that backend error.
 pub async fn verify_envelope_hybrid_signature<F>(
     directory: &F,
     attesting_key_id: &str,
@@ -304,16 +309,18 @@ where
 
     // (2) Resolve the attester's REGISTERED pubkeys — never pubkeys carried
     // on the row alone. Unknown/unregistered attester ⇒ reject (fail-secure).
+    // v54.1.0 (CIRISPersist#1042) — typed as the ORDERING gap it is
+    // (`Error::AttesterKeyUnknown`, retryable once the Key row lands), not as
+    // the terminal `FederationTierUnverified` a bad signature is.
+    //
+    // v54.1.0 (CIRISPersist#1042 follow-up, CIRISEdge#858) — a BACKEND failure
+    // of the lookup propagates as itself, as `register::verify_key_registration`'s
+    // twin does: a transient storage error is not a verdict on the row, and
+    // folding it into `FederationTierUnverified` made it read as terminal.
     let attester = directory
         .lookup_public_key(attesting_key_id)
-        .await
-        .map_err(|e| reject(format!("attester lookup_public_key: {e} ({})", e.kind())))?
-        .ok_or_else(|| {
-            reject(format!(
-                "attesting_key_id {attesting_key_id} is not registered — no pubkeys to \
-                 verify the bound-hybrid signature against"
-            ))
-        })?;
+        .await?
+        .ok_or_else(|| Error::unknown_signer(attesting_key_id, "signed_envelope"))?;
 
     // (3) Strict hybrid verify: Ed25519 (over canonical) AND ML-DSA-65 (over
     // the bound canonical || classical_sig) both REQUIRED. A classical-only /
@@ -1089,6 +1096,22 @@ pub mod test_support {
     /// single async test frame otherwise overflow the worker stack).
     fn mldsa_signer(key_id: &str) -> Box<MlDsa65Signer> {
         Box::new(MlDsa65Signer::from_seed(&seed_for(key_id)).expect("mldsa seed"))
+    }
+
+    /// v54.1.0 (CIRISPersist#1042 follow-up) — `key_id`'s deterministic hybrid
+    /// signing identity, boxed (the ML-DSA secret is multi-KiB): the signer
+    /// whose pubkeys [`hybrid_pubkeys`] registers, for fixtures that sign
+    /// through verify's `produce_signed_identity_occurrence`.
+    pub fn hybrid_identity(
+        key_id: &str,
+    ) -> Box<ciris_verify_core::self_at_login::HybridSigningIdentity> {
+        Box::new(
+            ciris_verify_core::self_at_login::HybridSigningIdentity::new(
+                key_id,
+                ed_signer(key_id),
+                *mldsa_signer(key_id),
+            ),
+        )
     }
 
     /// `key_id`'s registered hybrid pubkeys, base64. Use these to fill a
@@ -4936,14 +4959,13 @@ mod tests {
             .put_attestation(SignedAttestation { attestation: d })
             .await
             .expect_err("(d) unregistered attester must be REJECTED");
-        // The ingest gate's own rejection token (when it fires) or the
-        // FK InvalidArgument (when the backend's FK check fires first) —
-        // both are fail-secure non-stores.
-        assert!(
-            err.kind() == "federation_federation_tier_unverified"
-                || err.kind() == "federation_invalid_argument",
-            "(d) unexpected rejection kind: {}",
-            err.kind()
+        // v54.1.0 (#1042) — whichever check meets the unknown signer first
+        // (the ingest gate or the backend's attester lookup), the refusal is
+        // the typed, retryable ordering gap, never a verdict on the bytes.
+        assert_eq!(
+            err.kind(),
+            "federation_attester_key_unknown",
+            "(d) unexpected rejection kind: {err}"
         );
         assert!(dir.get_attestation(&d_id).await.expect("get").is_none());
 

@@ -563,6 +563,11 @@ pub mod bodies {
             "[{tag}] #1049: refused as not the authority at receipt: {err}"
         );
         assert!(
+            matches!(&err, Error::LicensureDelegatorNotAuthority { reason, .. }
+                if *reason == crate::federation::admission::licensure_refusal::NOT_AUTHORITY_AT_RECEIPT),
+            "[{tag}] #1042 C: typed `not_authority_at_receipt`: {err:?}"
+        );
+        assert!(
             dir.get_attestation(&backdated.attestation_id)
                 .await
                 .expect("read")
@@ -685,6 +690,26 @@ pub mod bodies {
             text.contains(REFUSAL) && text.contains(reason.as_str()),
             "{what}: expected `{REFUSAL}: {}`, got {err}",
             reason.as_str()
+        );
+        // v54.1.0 (#1042 follow-up C) — typed: the kind and the reason token,
+        // never prose; the Display above is the pre-typing text, unchanged.
+        assert_eq!(
+            err.kind(),
+            "federation_licensure_delegator_not_authority",
+            "{what}: {err}"
+        );
+        assert!(
+            matches!(&err, Error::LicensureDelegatorNotAuthority { reason: r, attesting_key_id, .. }
+                if *r == reason.as_str() && *attesting_key_id == row.attesting_key_id),
+            "{what}: the typed reason is `{}`: {err:?}",
+            reason.as_str()
+        );
+        assert!(
+            text.starts_with(&format!(
+                "invalid argument: {REFUSAL}: {}: ",
+                reason.as_str()
+            )),
+            "{what}: the Display keeps its pre-typing prefix: {text}"
         );
         assert!(
             dir.get_attestation(&row.attestation_id)

@@ -1232,6 +1232,9 @@ fn is_row_verdict(e: &Error) -> bool {
             | Error::RosterAuthorityUnauthorized { .. }
             | Error::RoleNotAccordConferred { .. }
             | Error::FederationTierUnverified { .. }
+            // v54.1.0 (#1042) — was `FederationTierUnverified` before the
+            // ordering gap got its own variant; still a verdict on the row.
+            | Error::AttesterKeyUnknown { .. }
             | Error::CommunityConsensusProtocolViolation { .. }
     )
 }

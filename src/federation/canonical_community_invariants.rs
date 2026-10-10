@@ -1197,14 +1197,11 @@ pub(crate) mod bodies {
         }
     }
 
-    /// Store `proposal` on `d` (its nonce issued first).
+    /// Store `proposal` on `d` (its nonce is the proposer's, #1047).
     async fn store_proposal(
         d: &dyn FederationDirectory,
         proposal: &ciris_verify_core::accord_live_quorum::AccordProposal,
     ) {
-        d.issue_accord_nonce(cc::accord_family_key_id(), &proposal.nonce)
-            .await
-            .unwrap();
         d.put_accord_proposal(proposal.clone(), None).await.unwrap();
     }
 

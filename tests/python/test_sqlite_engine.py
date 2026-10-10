@@ -635,8 +635,8 @@ def test_nodes_stewarded_by_json_pyo3_299():
 
 def test_accord_live_quorum_ffi_302():
     """#302 — the accord live-quorum write-through FFI is bound and routes
-    JSON through the backend: M4 nonce gate (issue + fail-closed reject +
-    admit), proposal round-trip via the anchor index, and active-halt H2
+    JSON through the backend: a proposer-minted nonce admits and its reuse by
+    a different proposal is refused (v54.1.0, #1047), proposal round-trip via the anchor index, and active-halt H2
     set/clear semantics. The verify-before-mutation participation path needs
     real hybrid signatures and is covered exhaustively by the Rust tests."""
     import json
@@ -660,8 +660,6 @@ def test_accord_live_quorum_ffi_302():
             pytest.skip("wheel built without the sqlite feature")
         raise
     try:
-        # M4: nonce gate.
-        assert eng.accord_nonce_issued("fam", "n1") is False
         proposal = {
             "family_key_id": "fam",
             "action": "fire",
@@ -670,17 +668,18 @@ def test_accord_live_quorum_ffi_302():
             "prior_family_digest": "pfd-abc",
             "payload_sha256": "psh-def",
         }
-        # Proposal before the nonce is issued → ValueError (M4 fail-closed).
-        with pytest.raises(ValueError):
-            eng.put_accord_proposal_json(
-                json.dumps({"proposal": proposal, "authority_signature": None})
-            )
-        eng.issue_accord_nonce("fam", "n1")
-        assert eng.accord_nonce_issued("fam", "n1") is True
-        # Now admitted; the anchor index returns it (verbatim round-trip).
+        # v54.1.0 (#1047): the nonce is the proposer's; nothing is issued
+        # first. Admitted; the anchor index returns it (verbatim round-trip).
         eng.put_accord_proposal_json(
             json.dumps({"proposal": proposal, "authority_signature": None})
         )
+        # Single use: a different proposal reusing the nonce in this family
+        # is refused (typed, ValueError).
+        reuse = dict(proposal, window_until="2030-01-01T00:00:00Z")
+        with pytest.raises(ValueError, match="federation_accord_proposal_nonce_reused"):
+            eng.put_accord_proposal_json(
+                json.dumps({"proposal": reuse, "authority_signature": None})
+            )
         rows = json.loads(eng.list_accord_proposals_by_anchor_json("fire", "pfd-abc"))
         assert len(rows) == 1
         assert rows[0]["proposal"]["nonce"] == "n1"

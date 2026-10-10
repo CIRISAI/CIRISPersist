@@ -187,6 +187,10 @@ pub async fn resolve_scoped_consent_by_principals(
 /// cut the gate folded only the subject's own rows and a precheck asked bare
 /// `analyze`; a steward's grant for the machine passed the precheck and was
 /// refused at emit.
+///
+/// v54.1.0 (CIRISPersist#1041) — kept for one release as a thin wrapper over
+/// [`capacity_consent_stance_with_basis`], which the gate asks and which also
+/// names the rows the stance rests on.
 pub async fn capacity_consent_stance(
     directory: &dyn FederationDirectory,
     attester_key_id: &str,
@@ -194,15 +198,134 @@ pub async fn capacity_consent_stance(
     family: super::admission::ConsentGatedFamily,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<ConsentState, Error> {
-    resolve_scoped_consent_by_principals(
-        directory,
-        attester_key_id, // the consent edge points AT the attester
-        subject_key_id,  // and is authored by the subject or a steward naming it
-        &family.analyze_scope(),
-        None,
-        now,
+    Ok(
+        capacity_consent_stance_with_basis(directory, attester_key_id, subject_key_id, family, now)
+            .await?
+            .0,
+    )
+}
+
+/// v54.1.0 (CIRISPersist#1041) — [`capacity_consent_stance`] WITH its
+/// [`ConsentBasis`]: the consent rows the stance rests on at `now`, each with
+/// the principal that authored it and the path that principal stands behind
+/// the subject by. The one fold the consent-before-scoring gate asks; a
+/// scorer that records the basis in its capacity envelope records what the
+/// gate will decide on, because the gate runs this same function.
+pub async fn capacity_consent_stance_with_basis(
+    directory: &dyn FederationDirectory,
+    attester_key_id: &str,
+    subject_key_id: &str,
+    family: super::admission::ConsentGatedFamily,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<(ConsentState, ConsentBasis), Error> {
+    let scope = family.analyze_scope();
+    crate::observe::fold(
+        crate::observe::Fold::ResolveScopedStanceByPrincipals,
+        async {
+            let folded = per_principal_stances(
+                directory,
+                attester_key_id, // the consent edge points AT the attester
+                subject_key_id,  // and is authored by the subject or a steward naming it
+                &scope,
+                None,
+                now,
+            )
+            .await?;
+            let state = combine_per_principal(&folded).0.state;
+            Ok((state, ConsentBasis::of(state, &folded)))
+        },
     )
     .await
+}
+
+/// v54.1.0 (CIRISPersist#1041) — how a consent row's author stands behind the
+/// subject. Stable tokens (serde snake_case); append-only.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ConsentPrincipalPath {
+    /// The subject's own rows (an agent consents for itself; a node's legacy
+    /// machine-authored grants; a `user`-role subject is its own human).
+    Subject,
+    /// A steward the subject is an ACTIVE occurrence of (clause 2 of
+    /// [`steward_bindings_of`](super::admission::steward_bindings_of)), on a
+    /// row naming the subject in [`FOR_KEY_ID`].
+    OccurrenceOf,
+    /// A steward with a LIVE `delegates_to` to the subject (clause 3: an
+    /// owner-binding to a person, any delegation to a node), on a row naming
+    /// the subject in [`FOR_KEY_ID`].
+    DelegatesTo,
+}
+
+impl ConsentPrincipalPath {
+    /// The stable token.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Subject => "subject",
+            Self::OccurrenceOf => "occurrence_of",
+            Self::DelegatesTo => "delegates_to",
+        }
+    }
+}
+
+/// v54.1.0 (CIRISPersist#1041) — one row a combined stance rests on.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ConsentBasisRow {
+    /// The principal whose fold this row decided: the subject, or a steward.
+    pub principal: String,
+    /// How `principal` stands behind the subject (more than one when two
+    /// steward clauses both hold).
+    pub paths: Vec<ConsentPrincipalPath>,
+    /// The deciding row's `attestation_id`: the grant that granted, the row
+    /// that revoked, the grant whose window lapsed.
+    pub attestation_id: String,
+}
+
+/// v54.1.0 (CIRISPersist#1041) — **which consent rows a stance rests on.**
+///
+/// Under the combine rule ([`combine_principal_stances`]) the combined state
+/// is decided by every principal whose own fold reached it: for `Granted`,
+/// each principal whose fold granted (any one suffices, so all are named); for
+/// `Revoked`, each principal that revoked; for `Expired`, each principal whose
+/// grant lapsed. `rows` names exactly those principals' deciding rows, the
+/// subject first, then stewards by key. `Unspecified` has no basis and `rows`
+/// is empty, which is how a gate gap reads apart from an expired grant.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ConsentBasis {
+    /// The deciding rows, see the type doc.
+    pub rows: Vec<ConsentBasisRow>,
+}
+
+impl ConsentBasis {
+    /// The basis of `state` over per-principal folds: each fold that reached
+    /// `state` and kept a deciding row.
+    fn of(state: ConsentState, folded: &[PrincipalFold]) -> Self {
+        Self {
+            rows: folded
+                .iter()
+                .filter(|f| f.stance.state == state)
+                .filter_map(|f| {
+                    Some(ConsentBasisRow {
+                        principal: f.principal.clone(),
+                        paths: f.paths.clone(),
+                        attestation_id: f.governing.clone()?,
+                    })
+                })
+                .collect(),
+        }
+    }
+
+    /// The deciding rows' ids, in [`Self::rows`] order (the `evidence_refs` a
+    /// scorer writes).
+    #[must_use]
+    pub fn attestation_ids(&self) -> Vec<&str> {
+        self.rows
+            .iter()
+            .map(|r| r.attestation_id.as_str())
+            .collect()
+    }
 }
 
 /// v44.8.0 (CIRISPersist#866 C1b) — [`resolve_scoped_consent_by_principals`]
@@ -255,8 +378,17 @@ async fn resolve_scoped_stance_by_principals_body(
     Ok(combine_per_principal(&folded).0)
 }
 
-/// The stance each principal folds to, the subject first: `(principal,
-/// stance)`. The ONE walk [`resolve_scoped_stance_by_principals`] and
+/// One principal's fold for the subject: its stance, the row that decided
+/// it, and how the principal stands behind the subject.
+struct PrincipalFold {
+    principal: String,
+    paths: Vec<ConsentPrincipalPath>,
+    stance: super::consent::ScopedStance,
+    governing: Option<String>,
+}
+
+/// The stance each principal folds to, the subject first, with the row that
+/// decided it and the principal's path (v54.1.0, #1041). The ONE walk [`resolve_scoped_stance_by_principals`] and
 /// [`retain_bound_by_principals`] both combine, so "whose rows count for
 /// this machine" cannot drift between the consent door and the sweeps.
 async fn per_principal_stances(
@@ -266,33 +398,48 @@ async fn per_principal_stances(
     scope: &str,
     qualifier: Option<&str>,
     now: chrono::DateTime<chrono::Utc>,
-) -> Result<Vec<(String, super::consent::ScopedStance)>, Error> {
+) -> Result<Vec<PrincipalFold>, Error> {
     // v53.1.5 — ONE bounded read for every principal (the subject and each
     // steward), shared by the subject's own fold and the per-steward folds;
     // before this cut the target's whole slice was read twice per call (the
     // default `resolve_scoped_stance`, then again here) and cloned once per
     // steward. The subject's stance is the same body the default
     // `resolve_scoped_stance` runs, over the same rows.
-    let stewards = super::admission::steward_bindings_of(directory, subject_key_id).await?;
+    let stewards = super::admission::steward_binding_paths_of(directory, subject_key_id).await?;
     let mut principals: Vec<&str> = vec![subject_key_id];
     principals.extend(
         stewards
-            .iter()
+            .keys()
             .map(String::as_str)
             .filter(|p| *p != subject_key_id),
     );
     let rows = super::consent::scoped_fold_rows(directory, target_key_id, &principals).await?;
     let refs: Vec<&super::Attestation> = rows.iter().collect();
-    let mut folded = vec![(
-        subject_key_id.to_owned(),
-        super::consent::fold_scoped_stance_refs(&refs, subject_key_id, now, scope, qualifier),
+    let fold_of = |principal: &str,
+                   paths: Vec<ConsentPrincipalPath>,
+                   universe: &[&super::Attestation]|
+     -> PrincipalFold {
+        let (stance, winner) = super::consent::fold_scoped_stance_refs_with_winner(
+            universe, principal, now, scope, qualifier,
+        );
+        PrincipalFold {
+            principal: principal.to_owned(),
+            paths,
+            stance,
+            governing: winner.map(|w| w.attestation_id.clone()),
+        }
+    };
+    let mut folded = vec![fold_of(
+        subject_key_id,
+        vec![ConsentPrincipalPath::Subject],
+        &refs,
     )];
     // The steward's universe for `k`: only the rows that name `k`. Rows
     // that do not are removed from the universe, not merely out-sorted,
     // so a human's blanket-looking row never governs a machine it did not
     // name. Composers (withdraws/recants/supersedes) are kept: they carry
     // no `for_key_id` and the fold reads them for retraction only.
-    for p in &stewards {
+    for (p, steward_paths) in &stewards {
         if p == subject_key_id {
             continue;
         }
@@ -304,10 +451,20 @@ async fn per_principal_stances(
                     || for_key_id_of(&a.attestation_envelope) == Some(subject_key_id)
             })
             .collect();
-        folded.push((
-            p.clone(),
-            super::consent::fold_scoped_stance_refs(&universe, p, now, scope, qualifier),
-        ));
+        let paths = steward_paths
+            .iter()
+            .filter_map(|sp| match sp {
+                super::admission::StewardPath::OccurrenceOf => {
+                    Some(ConsentPrincipalPath::OccurrenceOf)
+                }
+                super::admission::StewardPath::DelegatesTo => {
+                    Some(ConsentPrincipalPath::DelegatesTo)
+                }
+                // Clause (1) names `k` itself, which is the subject's own fold.
+                super::admission::StewardPath::SelfUser => None,
+            })
+            .collect();
+        folded.push(fold_of(p, paths, &universe));
     }
     Ok(folded)
 }
@@ -317,12 +474,12 @@ async fn per_principal_stances(
 /// whose window that is (the subject wins a tie: it is folded first and
 /// `min_by_key` keeps the first minimum).
 fn combine_per_principal(
-    folded: &[(String, super::consent::ScopedStance)],
+    folded: &[PrincipalFold],
 ) -> (super::consent::ScopedStance, Option<String>) {
-    let stances: Vec<ConsentState> = folded.iter().map(|(_, s)| s.state).collect();
+    let stances: Vec<ConsentState> = folded.iter().map(|f| f.stance.state).collect();
     let governing = folded
         .iter()
-        .filter_map(|(p, s)| s.retain_until.map(|u| (p, u)))
+        .filter_map(|f| f.stance.retain_until.map(|u| (&f.principal, u)))
         .min_by_key(|(_, u)| *u);
     (
         super::consent::ScopedStance {

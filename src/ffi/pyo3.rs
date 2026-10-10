@@ -6379,6 +6379,12 @@ impl PyEngine {
     /// / downgrade / re-scrub / conflicting version / unverifiable scrub /
     /// unowned or ambiguous owner — fail-closed, row untouched). Refusals
     /// are outcomes, not exceptions, so an apply loop stays total.
+    /// v54.1.0: `{"refused":{"reason":"attester_key_unknown"}}` is the
+    /// RETRYABLE ordering gap (the scrubber's Key row has not landed here;
+    /// re-offer after the key plane, CIRISPersist#1042) — the Insert arm used
+    /// to raise it as a bare ValueError; `unverifiable_signature` is terminal;
+    /// `"invalid_replaced"` means a stored record that failed verification was
+    /// replaced by this one (same pubkeys, same claim, CIRISPersist#1044).
     fn apply_replicated_key_record(
         &self,
         py: Python<'_>,
@@ -6431,6 +6437,8 @@ impl PyEngine {
     /// `Engine::rebind_key_record`. `signed_key_record_json` is the holder's
     /// self-signed re-signing of a registration this node already holds.
     /// Returns the canonical JSON of `RebindOutcome`: `{"outcome":"rebound"}`,
+    /// `{"outcome":"invalid_replaced"}` (v54.1.0, CIRISPersist#1044: the
+    /// stored record failed verification and was replaced by this one),
     /// `{"outcome":"unchanged"}`, or `{"outcome":"refused","reason":…}` with
     /// the plan's typed reason (`not_self_signed`, `record_absent`,
     /// `rebind_changes_record`, `pubkey_swap`, `unverifiable_signature`,
@@ -11879,7 +11887,9 @@ impl PyEngine {
 
     /// #302 — admit an `accord_proposal`. `payload_json` =
     /// `{ "proposal": <AccordProposal>, "authority_signature": <obj|null> }`.
-    /// M4 fail-closed on an unissued nonce.
+    /// v54.1.0 (CIRISPersist#1047) — the nonce is the proposer's; a different
+    /// proposal reusing a nonce already used in its family is refused
+    /// (`federation_conflict`, ValueError).
     fn put_accord_proposal_json(&self, py: Python<'_>, payload_json: &str) -> PyResult<()> {
         self.ensure_usable()?;
         catch_panic(|| {
@@ -12147,51 +12157,6 @@ impl PyEngine {
                     runtime,
                     b,
                     b.clear_active_halt(&fam, &halt)
-                        .await
-                        .map_err(federation_err_to_py)
-                )
-            })
-        })
-    }
-
-    /// #302 (M4) — record a server-issued proposal nonce.
-    fn issue_accord_nonce(&self, py: Python<'_>, family_key_id: &str, nonce: &str) -> PyResult<()> {
-        self.ensure_usable()?;
-        catch_panic(|| {
-            let runtime = self.runtime.clone();
-            let fam = family_key_id.to_owned();
-            let n = nonce.to_owned();
-            py.detach(move || {
-                accord_dispatch!(
-                    self,
-                    runtime,
-                    b,
-                    b.issue_accord_nonce(&fam, &n)
-                        .await
-                        .map_err(federation_err_to_py)
-                )
-            })
-        })
-    }
-
-    /// #302 (M4) — has `(family_key_id, nonce)` been issued?
-    fn accord_nonce_issued(
-        &self,
-        py: Python<'_>,
-        family_key_id: &str,
-        nonce: &str,
-    ) -> PyResult<bool> {
-        self.ensure_usable()?;
-        catch_panic(|| {
-            let runtime = self.runtime.clone();
-            let fam = family_key_id.to_owned();
-            let n = nonce.to_owned();
-            py.detach(move || {
-                accord_dispatch!(
-                    self,
-                    runtime,
-                    b,
-                    b.accord_nonce_issued(&fam, &n)
                         .await
                         .map_err(federation_err_to_py)
                 )
@@ -25921,6 +25886,55 @@ impl PyEngine {
         })
     }
 
+    /// v54.1.0 (CIRISPersist#1041) — [`Self::capacity_consent_stance`] WITH
+    /// the consent basis: the rows the stance rests on, so a scorer can record
+    /// them in its capacity envelope's `evidence_refs`. Returns JSON
+    /// `{"state": "granted"|"revoked"|"expired"|"unspecified", "basis":
+    /// {"rows": [{"principal": str, "paths": ["subject"|"occurrence_of"|
+    /// "delegates_to", ...], "attestation_id": str}, ...]}}`. `rows` is empty
+    /// exactly when the state is `unspecified`. Same arguments and errors as
+    /// `capacity_consent_stance`. FFI mirror of
+    /// [`Engine::capacity_consent_stance_with_basis`](crate::Engine::capacity_consent_stance_with_basis).
+    #[pyo3(signature = (attester_key_id, subject_key_id, family, now_iso = None))]
+    fn capacity_consent_stance_with_basis(
+        &self,
+        py: Python<'_>,
+        attester_key_id: &str,
+        subject_key_id: &str,
+        family: &str,
+        now_iso: Option<&str>,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let now = match now_iso {
+                Some(v) => chrono::DateTime::parse_from_rfc3339(v)
+                    .map(|t| t.with_timezone(&chrono::Utc))
+                    .map_err(|e| PyValueError::new_err(format!("now_iso parse: {e}")))?,
+                None => chrono::Utc::now(),
+            };
+            let family = crate::federation::admission::ConsentGatedFamily::from_token(family)
+                .ok_or_else(|| {
+                    PyValueError::new_err(format!(
+                        "unknown consent-gated family {family:?}; known: {:?}",
+                        crate::federation::admission::ConsentGatedFamily::ALL
+                            .iter()
+                            .map(|f| f.as_str())
+                            .collect::<Vec<_>>()
+                    ))
+                })?;
+            let (a, sub) = (attester_key_id.to_owned(), subject_key_id.to_owned());
+            let engine = self.hold_engine_view();
+            py.detach(move || {
+                let (state, basis) = self
+                    .runtime
+                    .block_on(engine.capacity_consent_stance_with_basis(&a, &sub, family, now))
+                    .map_err(federation_err_to_py)?;
+                serde_json::to_string(&serde_json::json!({ "state": state, "basis": basis }))
+                    .map_err(|e| PyRuntimeError::new_err(format!("serialize: {e}")))
+            })
+        })
+    }
+
     /// v44.8.0 (CIRISPersist#866 C1b) — `resolve_scoped_consent_by_principals`
     /// WITH its bound. Returns JSON `{"state": "granted"|"revoked"|"expired"|
     /// "unspecified", "retain_until": <RFC-3339>|null}`: `retain_until` is the
@@ -34321,6 +34335,22 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         // Caller-fault → ValueError (4xx).
         crate::federation::Error::InvalidArgument(_)
         | crate::federation::Error::SignatureInvalid(_) => PyValueError::new_err(kind),
+        // v54.1.0 (CIRISPersist#1042) — the ordering gap keeps the Python
+        // type of the arm it was split from (`SignatureInvalid` /
+        // `FederationTierUnverified`, both ValueError); the KIND tells a
+        // retryable `federation_attester_key_unknown` apart.
+        crate::federation::Error::AttesterKeyUnknown { .. } => PyValueError::new_err(kind),
+        // v54.1.0 (CIRISPersist#1042 follow-up) — split from `SignatureInvalid`
+        // (ValueError), so it keeps that type; the KIND
+        // (`federation_signer_not_acting_for`) marks it retryable.
+        crate::federation::Error::SignerDoesNotActFor { .. } => PyValueError::new_err(kind),
+        // v54.1.0 (CIRISPersist#1042 follow-up C) — typed out of
+        // `InvalidArgument` / `Conflict` (both ValueError); same type, and the
+        // licensure reason token rides with the kind.
+        crate::federation::Error::LicensureDelegatorNotAuthority { reason, .. } => {
+            PyValueError::new_err(format!("{kind}: {reason}"))
+        }
+        crate::federation::Error::AccordProposalNonceReused { .. } => PyValueError::new_err(kind),
         // Conflict → ValueError too; lens-side maps to 409.
         crate::federation::Error::Conflict(_) => PyValueError::new_err(kind),
         // v2.4.0 (CIRISPersist#102 Ask 3) — admission-gate rejections

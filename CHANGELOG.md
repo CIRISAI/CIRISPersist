@@ -9,6 +9,188 @@ threat-model citations because this crate's audit story is the point.
 
 ## [54.1.0] - unreleased
 
+### Added — the capacity consent stance names the rows it rests on (#1041)
+
+CIRISServer and RATCHET asked for it after 2026-10-08, when 11 scored subjects showed no visible `analyze` grant. Two hours of read-only work ended at the identity-anchor path: each subject's human had granted with `for_key_id` naming the occurrence. The fold was right and the scan's classification was wrong, and the score said nothing about which grant admitted it.
+
+- **`consent_by_humans::capacity_consent_stance_with_basis(directory, attester, subject, family, now) -> (ConsentState, ConsentBasis)`**, with `Engine::capacity_consent_stance_with_basis` and the Python `capacity_consent_stance_with_basis(attester_key_id, subject_key_id, family, now_iso=None)`. The Python door returns JSON `{"state": …, "basis": {"rows": [{"principal", "paths", "attestation_id"}]}}`.
+- **What the basis names.** Under the combine rule, the combined state is decided by every principal whose own fold reached it, so `ConsentBasis.rows` names each of those principals' deciding row. For `granted`, that is every granting principal's grant. For `revoked`, every revoker's row, and not a grant beside it. For `expired`, every lapsed grant. The subject comes first, then stewards by key. `unspecified` has an empty basis, which is how a gate gap reads apart from an expired grant. `ConsentBasis::attestation_ids()` gives the ids in order, for the capacity envelope's `evidence_refs` (Server's envelope, Server's field).
+- **Paths.** `ConsentPrincipalPath`: `subject` is the subject's own rows. `occurrence_of` is an identity the subject is an active occurrence of. `delegates_to` is a live `delegates_to` steward: an owner-binding to a person, any delegation to a node. Steward rows count only when they name the subject in `for_key_id`, as before.
+- **One fold.** `check_capacity_consent_admission`, the emit gate, asks `capacity_consent_stance_with_basis`, so a basis a scorer records is the one the gate decides on. `ConsentGateRefused` does not carry the basis, because a new field on that exhaustive public struct would break a pin-compatible minor. A scorer reads the basis from its precheck.
+- **The old door.** `capacity_consent_stance` stays for one release as a thin wrapper that returns the state alone.
+- **One steward walk.** `admission::steward_bindings_of` is now the key set of the new `admission::steward_binding_paths_of`, which returns each steward with its clause labels (`StewardPath`: `self_user`, `occurrence_of`, `delegates_to`). The labels cannot disagree with membership because there is one body. Reused from the `probe-consent-stance` branch: `StewardPath`, and `consent::fold_scoped_stance_refs_with_winner`, the stance fold that also returns its deciding row, which `fold_scoped_stance_refs` now wraps. The probe's debug fold, read-only backends and `examples/consent_stance` are not in this cut.
+
+New `pub` enums and how an adopter maps them (none is an admission outcome):
+
+| Variant | Mapping |
+|---|---|
+| `consent_by_humans::ConsentPrincipalPath::{Subject, OccurrenceOf, DelegatesTo}` | audit label on a basis row |
+| `admission::StewardPath::{SelfUser, OccurrenceOf, DelegatesTo}` | audit label on a steward |
+
+Witnesses in `src/federation/consent_basis_invariants.rs`, each on memory, sqlite and postgres:
+
+- **I622**: the subject's own grant is the basis under `subject`, and with no consent the basis is empty.
+- **I623**: a node owner's grant naming the node is the basis under `delegates_to`, and the same owner's blanket grant is neither a grant nor a basis. An identity anchor's grant naming the agent is the basis under `occurrence_of`.
+- **I624**: an agent's own grant beside its anchor's revocation is `revoked`, and the basis is the revocation only. A subject whose own grant has expired (`expires_at` past) and whose anchor grants is `granted`, and the basis is the anchor's live grant only. Every `granted` basis row is checked to be held, a grant, and not past its `expires_at`.
+
+The wrapper and the basis door are asserted equal in every body. I548e, the from-disk check, now requires the gate, the Engine basis door and the Python basis door to reach `capacity_consent_stance_with_basis`. I578, the large-futures gate, measures both new doors.
+
+Mutants, each restored. An empty basis turns I622, I623 and I624 red on all three backends; this is the before state, when the stance named no rows. A basis that ignores the combined state turns I624 red on all three. Labelling `occurrence_of` as `delegates_to` turns I623 and I624 red on all three.
+
+### Added — an unknown signer is a typed, RETRYABLE refusal, apart from a bad signature (#1042)
+
+A fresh node refused the canonical's `identity_occurrence` rows every round with `scrub-signature verification failed: … is not a registered federation key`, because the signer's Key row had not landed yet. That is an ordering gap, and it read the same as a forged signature, so a sender could not tell a row that will admit tomorrow from one that never will. Persist's stance is unchanged: the refusal is per attempt, nothing is stored, marked or parked, and the same row admits when it is re-offered after the key plane. What changes is the type.
+
+Edge's three questions (CIRISEdge#858):
+
+1. **The variant and its token.** `federation::Error::AttesterKeyUnknown { attesting_key_id, plane }`, kind `federation_attester_key_unknown`. On the replicated key plane's outcome it is `register::KeyRefusalReason::AttesterKeyUnknown`, token `attester_key_unknown`. The terminal siblings are unchanged: `Error::SignatureInvalid` (`federation_signature_invalid`), `Error::FederationTierUnverified` (`federation_tier_unverified`) and, on the key plane, `KeyRefusalReason::UnverifiableSignature` (`unverifiable_signature`). That last one is the key plane's "signature_invalid" token the issue names; it keeps its existing spelling.
+2. **Which doors return it.** Every door that resolves a signer's Key row and finds none. `plane` names the door: `key_registration` (`verify_key_registration`, so `Engine::register_federation_key`, the replicated key apply, the rebind and invalid-replace doors), `identity_occurrence` (`put_identity_occurrence`, signed and content-only), `identity_occurrence_revocation`, `transport_destination`, `touch_claim` and `touch_claim_cosigner` (an `NOfMCosigner` co-signer), `attestation` (the store's attester lookup in `put_attestation`, all three backends) and `signed_envelope` (`tier_ingest::verify_envelope_hybrid_signature`, which carries attestations, revocations, families, communities, memberships, location proofs and every other envelope-signed row that does not re-type its error). Before, these were `SignatureInvalid`, `FederationTierUnverified` or, at the store's attester lookup, `InvalidArgument`.
+3. **The replicated Key Insert arm.** Yes. `apply_replicated_key_record`'s `Insert` arm on memory, sqlite and postgres (the postgres arm was re-read and mirrors sqlite) no longer propagates `verify_key_registration(..)?` as a bare `Err`. It returns `ReplicatedKeyOutcome::Refused { reason }`, with `attester_key_unknown` for an unknown scrubber and `unverifiable_signature` for a scrubber this node holds whose signature does not verify. Every other plan arm that verifies a record (upgrade, rebind, scrub rehydrate, invalid replace) reads the failure through the same function, `register::key_refusal_of_verify_error`, so the split is spelled once. A backend failure still propagates as `Err`.
+
+Python keeps the arm's type. `federation_err_to_py` raises `AttesterKeyUnknown` as `ValueError`, as it did `SignatureInvalid` and `FederationTierUnverified`, with the kind string as the message. `apply_replicated_key_record` returns `{"refused":{"reason":"attester_key_unknown"}}` where it used to raise.
+
+New variants on `pub` exhaustive enums, and how an adopter maps them:
+
+| Variant | Mapping |
+|---|---|
+| `federation::Error::AttesterKeyUnknown` | **retryable**: re-offer the same row after the signer's Key row lands |
+| `register::KeyRefusalReason::AttesterKeyUnknown` | **retryable**, same rule, on the key plane |
+
+Breaking for Rust callers that match `Error` or `KeyRefusalReason` exhaustively. `canonical_community::is_row_verdict` counts the new variant as a verdict on the row, as it counted `FederationTierUnverified`.
+
+Witnesses in `src/federation/attester_key_unknown_invariants.rs`, each on memory, sqlite and postgres. Each has the three steps the issue names: an unknown signer is the gap, a known signer with a signature over other bytes is the terminal verdict, and the same row admits after the Key row lands.
+
+- **I613**, the key plane: `verify_key_registration` directly, then `apply_replicated_key_record`'s Insert arm, which must return an outcome and never an `Err`.
+- **I614**, the `identity_occurrence` plane, the 2026-10-08 defect.
+- **I615**, the attestation plane through `put_attestation`.
+
+RED before the fix, with every fix site reverted: all nine fail. I613 reads `registration signer (scrub_key_id=…) is not registered`, I614 reads `signed identity_occurrence: attesting_key_id … is not a registered federation key` and I615 reads `invalid argument: attesting_key_id … does not exist in federation_keys`. With only the Insert arms reverted, I613 fails on all three backends with `a refusal is an outcome, never a bare Err: AttesterKeyUnknown { … }`. Mutation: collapsing `AttesterKeyUnknown` into `UnverifiableSignature` in `key_refusal_of_verify_error` turns I613 red on all three backends.
+
+#### #1042 follow-ups from Edge's adopt (CIRISEdge#858)
+
+**The signer-acts-for arm is its own retryable variant.** `check_signer_acts_for` is the check that the signer is the identity itself, an ACTIVE occurrence of it, or a node it owns through a live owner binding. It returned `Error::SignatureInvalid` when none held. The signature had verified at that point, and on a fresh node the usual cause is ordering: the binding or occurrence that lets this signer vouch has not landed yet (the #776 standup race, which Edge's `occurrence_before_binding_776` relies on staying re-askable). It now returns `federation::Error::SignerDoesNotActFor { attesting_key_id, identity_key_id, plane }`, kind `federation_signer_not_acting_for`. Python raises `ValueError`, the type of the `SignatureInvalid` arm it was split from. The doors that ask it, by `plane`:
+
+- `identity_occurrence`: `put_identity_occurrence`, signed and content-only.
+- `identity_occurrence_revocation`: `put_identity_occurrence_revocation`.
+- `transport_destination`: `put_signed_transport_destination`. `identity_key_id` is the route's `occurrence_key_id`.
+- `touch_claim`: `put_touch_claim` with `SignerForm::SelfTouch`. `identity_key_id` is the touched target.
+
+A registered key that will never be bound, a peer asserting a victim's route for example, gets the same token, because at admission it is indistinguishable from a binding that has not arrived yet. The re-offer is the sender's to bound.
+
+| Variant | Mapping |
+|---|---|
+| `federation::Error::SignerDoesNotActFor` | **retryable**: re-offer the same row after the signer's owner binding or occurrence lands |
+
+**`SignatureInvalid` is now terminal on every door.** It means the signature does not verify, or the signed bytes are malformed or unbound: a hash mismatch, a missing ML-DSA half, an envelope that does not bind its subject, a `touch_claim` signer form whose shape is wrong (attester equals target, no co-signature set, too few distinct valid co-signers). Nothing that can still land can change any of those. How I checked: `grep -rn 'SignatureInvalid(' src --include=*.rs`, excluding comments, `SignatureInvalid(_)` match arms and the `_invariants.rs` witnesses, leaves the variant definition and 16 construction sites. Those are `register.rs` 3 (subject binding, content-hash mismatch, hybrid verify) and `admission.rs` 13: occurrence verdict and hybrid verify, missing ML-DSA, revocation and route hybrid verify, the six touch-claim signature and shape sites, and the two PQC-attach sites. Each was read. The unknown-signer and unknown-co-signer lookups next to them already return `AttesterKeyUnknown` (#1042 above), and the signer-acts-for arm was the only one that depended on directory state that can still arrive.
+
+**The shared envelope verifier propagates a backend failure.** In `tier_ingest::verify_envelope_hybrid_signature`, a FAILED `lookup_public_key` (the backend erred, not "no row") went through the verdict path and became `FederationTierUnverified`, the terminal token. It now propagates as the backend's own error, as `register::verify_key_registration`'s twin does. A transient storage failure is not a verdict on the row. This verifier serves attestations, revocations, families, communities, memberships, location proofs and every other envelope-signed row.
+
+Witnesses in `src/federation/attester_key_unknown_invariants.rs`, each on memory, sqlite and postgres:
+
+- **I630**: on each of the four doors, a registered signer whose signature verifies but who is not yet an active occurrence of the identity is refused `federation_signer_not_acting_for`, naming the signer, the identity and the door. Once the occurrence lands, the same row admits.
+- **I631**: `verify_envelope_hybrid_signature` over the `FaultInjectingDirectory` with `lookup_public_key` erroring returns `Error::Backend("injected backend failure: …")`. Over the same directory without the fault, the row verifies.
+
+RED before, each fix reverted alone: I630 fails on all three backends with `I630 occurrence: scrub-signature verification failed: signed identity_occurrence: signer … is neither identity … nor an active occurrence of it` (kind `federation_signature_invalid`). I631 fails on all three with `I631: a backend failure propagates as itself, never a verdict: federation_federation_tier_unverified`. Mutant, restored: the refusal's `plane` pinned to `identity_occurrence` turns I630 red on all three at the revocation door.
+
+Existing assertions moved with the arm: the signed route matrix's "unrelated registered signer" step on all three backends, sqlite's signed-occurrence `signer_acts_for` arm and its signed-revocation (3b) arm, and the three I76 arms in `key_grant_invariants`. All now assert `federation_signer_not_acting_for`.
+
+#### #1042 follow-ups B and C (Edge's adopt of 84e6f502, CIRISEdge#858)
+
+**B. A row that names no signer is malformed, not the gap.** A row with an empty `attesting_key_id` reached the signer lookup and was refused `AttesterKeyUnknown { attesting_key_id: "" }`, labelled retryable, though no Key row can ever land for `""`. Every `AttesterKeyUnknown` is now built by one constructor, `Error::unknown_signer(id, plane)`. For an empty or blank id it returns a terminal `Error::InvalidArgument` ("`{plane}: the row names no signer …`"). All 11 construction sites go through it: the attestation door on memory, sqlite and postgres; the shared envelope verifier; the key plane; `identity_occurrence` (2); `identity_occurrence_revocation`; `transport_destination`; `touch_claim`; and `touch_claim_cosigner`. The key plane already refused an empty `scrub_key_id` before its lookup (`scrub_key_id must be non-empty for registration`). On the replicated apply that refusal stays the terminal `unverifiable_signature` outcome. One more door reaches the guard through the shared envelope verifier: an unsigned roster grow, where `add_family_member_consented` gets an `AdmitSpec` with an empty `authority_key_id`. It is now `InvalidArgument`, `signed_envelope: the row names no signer …`, where it was `AttesterKeyUnknown { "" }`. The full suite found it (`roster_growth_is_authorized_*_654` on all three backends and sqlite `rekey_family_member_add_grows_roster_and_serves_future_writes`), and their authorship assertions accept the new text.
+
+**C. Two refusals Edge matched as prose are typed.** In both, the Display is the previous text, unchanged, so a pinned string still matches, and Python keeps `ValueError`:
+
+- `Error::LicensureDelegatorNotAuthority { attesting_key_id, authority_id, reason, message }`, kind `federation_licensure_delegator_not_authority`, replaces the `InvalidArgument` the licensure door (`check_licensure_delegator_is_authority`) returned. `reason` is a stable token from the new public `admission::licensure_refusal`: `AUTHORITY_ACTS_BY_QUORUM` (`authority_acts_by_quorum`), `NAMED_EDGE_ABSENT`, `NAMED_EDGE_NOT_LICENSE`, `NAMED_EDGE_NOT_ONTO_EMITTER`, `NOT_ON_LIVE_CHAIN` and `NOT_AUTHORITY_AT_RECEIPT`. `LicensureChainBreak::as_str` and `LICENSURE_NOT_AUTHORITY_AT_RECEIPT` now return these constants. Python's message is `federation_licensure_delegator_not_authority: {reason}`.
+- `Error::AccordProposalNonceReused { family_key_id, nonce, existing_proposal_digest }`, kind `federation_accord_proposal_nonce_reused`, token `accord_quorum::ACCORD_PROPOSAL_NONCE_REUSED`, replaces the `Conflict` from #1047's single-use check (all three backends). Python's message is the kind, so it no longer reads `federation_conflict`.
+
+| Variant / refusal | Mapping |
+|---|---|
+| empty or blank signer id → `Error::InvalidArgument` | **refused** (terminal): malformed |
+| `federation::Error::LicensureDelegatorNotAuthority` (`authority_acts_by_quorum` and the other reasons) | **refused** (terminal) |
+| `federation::Error::AccordProposalNonceReused` (`accord_proposal_nonce_reused`) | **refused** (terminal) |
+
+Witnesses, each on memory, sqlite and postgres:
+
+- **I632** (`attester_key_unknown_invariants.rs`): an empty signer is `InvalidArgument` from the lookup's own guard at the attestation door, the shared envelope verifier and the signed occurrence door. The key plane refuses it with its pre-existing guard, and the replicated apply returns `unverifiable_signature`.
+- The licensure witnesses (`licensure_chain_invariants.rs`, through `must_refuse_as`, including `authority_acts_by_quorum` under a `majority` affiliation, and the #1049 `not_authority_at_receipt` arm) now also assert the kind, the typed `reason` and the unchanged Display prefix.
+- I629 asserts the typed nonce refusal (family, nonce, existing digest, kind) and its unchanged Display. The Python witness matches `federation_accord_proposal_nonce_reused`.
+
+Mutants, each restored: B's guard off turns I632 red on all three backends (`got federation_attester_key_unknown (AttesterKeyUnknown { attesting_key_id: "" … })`). That is also the RED-before state. The licensure door returning the old `InvalidArgument`, and the `reason` pinned to `not_on_live_chain_at_asserted_at`, each turn 9 licensure witnesses red across the backends. The nonce refusal back to `Conflict` turns I629 red on all three.
+
+### Added — a stored Key row that fails verification is replaced by a passing one (`InvalidReplaced`) (#1044)
+
+CIRISServer's legacy `register_user_key` fallback stored user Keys whose scrub signatures cover the owner-binding bytes rather than the registration envelope. Such a row passes `verify_key_registration` steps 1 to 4 and fails step 5, the hybrid verify. It is served to every peer and refused by every stranger's Insert. When the holder re-signed, the incoming record was refused `conflicting_version`, `downgrade`, `re_scrub` or `already_anchored_identical`, because first-seen-wins presumes the stored row is a valid record. Server measured 0 such rows on the canonical, so no production row waits on this door; it is the class fix.
+
+Edge's three questions (CIRISEdge#858):
+
+1. **The door.** There is no new entry point. The arm is `ReplicatedKeyPlan::ReplaceInvalid` inside the existing key plan, reached through two doors: the replicated apply, `FederationDirectory::apply_replicated_key_record` (`Engine::apply_replicated_key_record`, Python `apply_replicated_key_record`, outcome `"invalid_replaced"`), and the local door, `Engine::rebind_key_record` (Python `rebind_key_record`, `{"outcome":"invalid_replaced"}`). Both write through one new store step, `FederationDirectory::store_invalid_replaced_key_record`, overridden by memory, sqlite and postgres. The store step re-asserts the whole rule itself rather than trusting the plan, since it is a public trait method.
+2. **Inputs.** One `SignedKeyRecord`, the re-signed registration. It replaces the stored row only when all of these hold:
+   - the stored row fails `verify_key_registration` structurally (`SignatureInvalid` or `InvalidArgument`) and binds its subject. An unknown signer is not a verdict, and the unbound pre-#659 shape has its own doors (#864 rebind, genesis re-mint).
+   - the incoming record passes `verify_key_registration`.
+   - both pubkeys are the same.
+   - the claim is the same (`identity_type`, `identity_ref`, `valid_from`, `valid_until`, roles, attestation evidence; the #864 predicate).
+   - the incoming record is signed by the key itself (`scrub_key_id == key_id`, the holder's proof of possession) or by the stored row's scrubber. `verify_key_registration` accepts any registered key as an anchor scrubber, so without this a third key could install itself as a failing row's scrubber.
+   - neither side is role-gated (canonical, accord_holder, infra:attest, co-steward). Those rows are admitted by their m-of-n co-scrub, not by `verify_key_registration`'s scrub #1, and a one-scrub replacement would shed the quorum.
+
+   The arm is consulted only when the plan would otherwise refuse with one of the four first-seen reasons, so the stored row's verify is paid only where the answer can change. A valid stored row is never replaced, and the original refusal stands. If the incoming record also fails, its own verdict is the refusal (`unverifiable_signature`, or `attester_key_unknown`). A different pubkey stays `pubkey_swap`. A lost race at the store step is `store_conflict`, re-offerable.
+3. **The audit row.** One `KeyRegistrationHistoryRow` in `federation_key_registration_history` (V148, widened by **V186** on both dialects), written in the same transaction as the replacement and guarded on the planned-against row hash. It carries the replaced row's `registration_envelope`, `original_content_hash`, `scrub_signature_classical`, `scrub_signature_pqc`, `scrub_key_id` (the old scrubber) and `scrub_timestamp`, plus `replaced_at`, `replaced_by_hash` (the new row's `persist_row_hash`) and two new fields. `replaced_row_hash` is the replaced row's own `persist_row_hash`, its id. `replacement` is a `KeyReplacementKind`: `invalid_replaced` here, `rebind` for the #864 door. V186 adds `replaced_row_hash TEXT` (NULL on rows written before V186) and `replacement_kind TEXT NOT NULL DEFAULT 'rebind'` with a CHECK for the two tokens. Rows from before V186 were all rebinds and read so. The key row is rewritten in place: the incoming envelope, every scrub (`additional_scrubs` included), `scrub_key_id`, a recomputed `persist_row_hash`, and `mutated_at` moved so peers whose cursor passed the row are served it again. Python reads the history through `list_key_registration_history`.
+
+The rebind door and the invalid-replace door now share one guarded write per backend (sqlite and postgres `write_replaced_key_registration`). The rebind additionally requires the stored row to be self-signed in its `WHERE`, as before.
+
+New variants on `pub` exhaustive enums, and how an adopter maps them:
+
+| Variant | Mapping |
+|---|---|
+| `register::ReplicatedKeyOutcome::InvalidReplaced` | **admitted**: the row now carries this record |
+| `register::RebindOutcome::InvalidReplaced` | **admitted**, same, at the local door |
+| `types::KeyReplacementKind::Rebind` / `::InvalidReplaced` (new enum) | audit only: which door replaced a history row's record |
+
+`KeyRegistrationHistoryRow` gains two `pub` fields, `replaced_row_hash` and `replacement`, both `#[serde(default)]`. That breaks Rust struct literals; JSON readers are unaffected. Genesis' baked-record apply treats `InvalidReplaced` as success, like `Upgraded` and `Rebound`.
+
+Witnesses in `src/federation/invalid_replace_invariants.rs`:
+
+- **I616** (memory, sqlite, postgres) covers the arm and every refusal around it. A valid stored row is refused `conflicting_version` and untouched. A pubkey swap, a changed claim and a failing incoming record are each refused with the row untouched. The holder's re-signed record gives `InvalidReplaced`: the row verifies, it is served again past a cursor that had passed it, the history row names the replaced row's hash and `invalid_replaced`, and a second apply is idempotent.
+- **I617** (memory, sqlite, postgres): the store step called directly refuses a stored row that verifies (`Conflict`). A failing anchor-scrubbed row is replaced by the holder's self-signed record instead of being refused `downgrade`, and the audit row keeps the old scrubber.
+- **I618** (memory, sqlite, postgres): a #864 rebind writes `replacement = rebind` and the replaced row's hash.
+- **I619** (sqlite, through `Engine`): `rebind_key_record` returns `{"outcome":"invalid_replaced"}`.
+- **I620** (memory, sqlite, postgres): a record a registered stranger signed does not replace the row, at the plan or at the store step, and the stored scrubber's re-signing does.
+- **I621**: the admissibility predicate, plus a memory witness through the plan and the store step. A role-gated row cannot clear `put_public_key`'s production-roster gate in a test, so the row is seeded past it. The clause lives in `register`, which every backend calls.
+
+RED before the fix (the arm made unreachable): I616, I617 and I620 fail on all three backends and I619 fails (`I617: a failing anchor-scrubbed row is replaced, not a downgrade refusal`). Mutants, each restored:
+
+| Mutant | Witnesses red |
+|---|---|
+| the plan drops "the stored row fails verification" | I616 on all three backends (`a stored row that VERIFIES is never replaced`) |
+| the store step drops the same precondition | I617 on all three backends (`the store step refuses to replace a row that verifies: Ok(InvalidReplaced)`) |
+| the signer clause dropped | I620 on all three backends, I621 predicate |
+| the role-gated clause dropped | I621 predicate and memory witness (`a role-gated row is not replaced: InvalidReplaced`) |
+
+### Changed — an accord proposal's nonce is the proposer's; the server-issued nonce set is gone (#1047)
+
+Verify 20 (CIRISConstitution#146, CC 4.2.6) has the proposer mint an `AccordProposal`'s nonce, never a server: "a server is part of what a halt may need to stop, and no accord act depends on one". Verify checks the nonce's form, and single use is the substrate's dedup. Persist still kept the pre-20 model (M4). `put_accord_proposal` refused a proposal unless `issue_accord_nonce` had first recorded its `(family_key_id, nonce)`. The replicated-evidence path issued the nonce itself, just before storing, because a receiving node had issued nothing. Server and Edge never called the issue door (checked on both `main`s), and Server has no accord proposal producer.
+
+- **`put_accord_proposal`** (memory, sqlite, postgres) admits a proposal without a prior issuance. A nonce names one proposal per family. A different proposal (another digest) carrying a nonce already used in its family is refused `Error::Conflict`, with a message starting `accord_proposal_nonce_reused`, and is not stored. That is the same type as a second vote by one holder (M6), and Python raises `ValueError` (`federation_conflict`). A byte-identical re-put stays idempotent, and the same nonce in another family is unaffected. The check and the insert are one step: under the memory lock, inside sqlite's write, and in postgres inside one transaction under `pg_advisory_xact_lock(ACCORD_PROPOSAL_NONCE_LOCK_KEY)`.
+- **`admit_replicated_accord_evidence_over_roster`** no longer records a nonce before storing the proposal, and a bundle whose proposal reuses a nonce is refused at the same check.
+- **Removed (breaking):** `FederationDirectory::issue_accord_nonce` and `FederationDirectory::accord_nonce_issued`, the three backend implementations, the directory double and capsule arms, and the Python `Engine.issue_accord_nonce` / `Engine.accord_nonce_issued`. **V188** (both dialects) drops the `accord_issued_nonce` table.
+- **Wire:** unchanged. `AccordProposal` is verify's struct, and no accord row (CC 3.4.1) changes shape.
+
+Witness **I629**, in the shared accord storage body (`accord_quorum::test_fixtures::exercise_accord_storage`) on memory, sqlite and postgres, plus the Python `test_accord_live_quorum_ffi_302`. A proposal admits with nothing issued, and a re-put is idempotent. A proposal that differs only in `window_until` and reuses the nonce is refused `accord_proposal_nonce_reused` naming the first digest, and is not stored. The same nonce in another family admits.
+
+RED before, with the I629 body run against the pre-#1047 backends: all three fail with `I629: a proposer-minted nonce admits: invalid argument: accord proposal nonce "…" not issued for family "…" (M4 fail-closed)`. Mutants, each restored:
+
+| Mutant | Witnesses red |
+|---|---|
+| memory's single-use check off | I629 memory (`a reused nonce must be refused Conflict, got Ok(())`) |
+| sqlite's single-use check off | I629 sqlite (same) |
+| postgres's single-use check off | I629 postgres (same) |
+| memory's check read across families | I629 memory (`one nonce in another family admits: … accord_proposal_nonce_reused`) |
+| sqlite's, the same | I629 sqlite |
+| postgres's, the same | I629 postgres |
+
+Python witness `test_accord_live_quorum_ffi_302` covers the new door: a proposer-minted nonce admits, and a reuse raises `ValueError` matching `federation_conflict`. It passed in the wheel lane (`maturin develop --release` with the derived feature line, 55 passed).
+
+Not in this cut, from the same verify 20 notes in the issue: a `constitutional` halt that verifies on one holder's signature, and `Invocation`'s `lifecycle:confirmed` / `confirms_halt_id`. Persist calls neither `verify_invocation` nor the deprecated live-quorum tallies, and its only `AccordAction::Fire` use is a test fixture.
+
 ### Fixed — the nightly mutants job was green while incomplete, its witness report said 0, and its survivors surfaced nowhere (#1051)
 
 The first scheduled run of `.github/workflows/mutants.yml` (650024b1, 2026-10-09) hit its

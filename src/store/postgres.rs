@@ -5148,7 +5148,18 @@ impl PostgresBackend {
                 // runs, and the upgrade branch already runs) now guards the
                 // insert too. Fail-closed before any write.
                 if !crate::federation::register::record_is_role_gated(&record.record) {
-                    crate::federation::verify_key_registration(self, &record.record).await?;
+                    // v54.1.0 (CIRISPersist#1042, CIRISEdge#858) — a verify
+                    // failure is a TYPED refusal, never a bare `Err`: the
+                    // sender books `attester_key_unknown` (retryable: the
+                    // scrubber's Key row has not landed here yet) apart from
+                    // `unverifiable_signature` (terminal). Nothing is written.
+                    if let Err(e) =
+                        crate::federation::verify_key_registration(self, &record.record).await
+                    {
+                        return Ok(ReplicatedKeyOutcome::Refused {
+                            reason: crate::federation::register::key_refusal_of_verify_error(e)?,
+                        });
+                    }
                 }
                 match self
                     .put_public_key_at_door(
@@ -5197,6 +5208,21 @@ impl PostgresBackend {
                     Err(e) => Err(e),
                 }
             }
+            // v54.1.0 (#1044) — the stored record fails verification and the
+            // incoming one (same pubkeys, same claim) passes: replace it. A
+            // lost race, or a stored row that verifies after all, is
+            // fail-closed + re-offerable.
+            ReplicatedKeyPlan::ReplaceInvalid => {
+                match crate::federation::FederationDirectory::store_invalid_replaced_key_record(
+                    self, record,
+                )
+                .await
+                {
+                    Ok(outcome) => Ok(outcome),
+                    Err(crate::federation::Error::Conflict(_)) => Ok(RACED),
+                    Err(e) => Err(e),
+                }
+            }
             // #405 — existing canonical → strictly-newer, m-of-n-re-verified
             // re-scrub (runtime address move). Backend-symmetric with SQLite.
             ReplicatedKeyPlan::Supersede => match self.supersede_canonical_record(record).await {
@@ -5218,6 +5244,126 @@ impl PostgresBackend {
                 Err(e) => Err(e),
             },
         }
+    }
+
+    /// v54.1.0 (CIRISPersist#1044) — the ONE in-place registration rewrite
+    /// both replacement doors share (see the sqlite twin): one transaction
+    /// appending the stored row's registration bytes to the V148 history with
+    /// the replaced row's own hash and the V186 kind, then rewriting the
+    /// envelope, every scrub, `scrub_key_id`, `persist_row_hash` and
+    /// `mutated_at`, both guarded on the planned-against hash (a rebind also
+    /// on a self-signed stored row). 0 rows ⇒ `Conflict`.
+    async fn write_replaced_key_registration(
+        &self,
+        row: crate::federation::KeyRecord,
+        existing_hash: String,
+        kind: crate::federation::types::KeyReplacementKind,
+    ) -> Result<(), crate::federation::Error> {
+        let kind_token = kind.as_str();
+        let require_self_signed = kind == crate::federation::types::KeyReplacementKind::Rebind;
+        let original_content_hash = hex::decode(&row.original_content_hash).map_err(|e| {
+            crate::federation::Error::InvalidArgument(format!("original_content_hash hex: {e}"))
+        })?;
+        // v53.1.4 — the whole scrub set rides every rewrite of the scrub columns.
+        let additional_scrubs_text =
+            serde_json::to_string(&row.additional_scrubs).map_err(|e| {
+                crate::federation::Error::Backend(format!("additional_scrubs serialize: {e}"))
+            })?;
+        let registration_envelope_text =
+            pg_envelope_text(&row.registration_envelope, "registration_envelope")?;
+        let mut client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let mutated_at = self.next_key_serve_position(&client).await?;
+        let tx = client.transaction().await.map_err(|e| {
+            crate::federation::Error::Backend(format!(
+                "{kind_token} key registration {}: begin: {e}",
+                row.key_id
+            ))
+        })?;
+        let replaced = tx
+            .execute(
+                "INSERT INTO cirislens.federation_key_registration_history \
+                    (key_id, registration_envelope, original_content_hash, \
+                     scrub_signature_classical, scrub_signature_pqc, scrub_key_id, \
+                     scrub_timestamp, replaced_at, replaced_by_hash, \
+                     replaced_row_hash, replacement_kind) \
+                 SELECT key_id, registration_envelope, original_content_hash, \
+                     scrub_signature_classical, scrub_signature_pqc, scrub_key_id, \
+                     scrub_timestamp, $3::timestamptz, $4::text, persist_row_hash, $5::text \
+                 FROM cirislens.federation_keys WHERE key_id = $1 AND persist_row_hash = $2 \
+                   AND (NOT $6::bool OR scrub_key_id = key_id)",
+                &[
+                    &row.key_id,
+                    &existing_hash,
+                    &mutated_at,
+                    &row.persist_row_hash,
+                    &kind_token,
+                    &require_self_signed,
+                ],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!(
+                    "{kind_token} key registration {}: history: {e}",
+                    row.key_id
+                ))
+            })?;
+        let n = if replaced == 0 {
+            0
+        } else {
+            tx.execute(
+                "UPDATE cirislens.federation_keys SET \
+                    registration_envelope = $2, original_content_hash = $3, \
+                    scrub_signature_classical = $4, scrub_signature_pqc = $5, \
+                    scrub_timestamp = $6, pqc_completed_at = $7, \
+                    persist_row_hash = $8, mutated_at = $9, additional_scrubs = $12, \
+                    scrub_key_id = $13 \
+                 WHERE key_id = $1 AND (NOT $14::bool OR scrub_key_id = key_id) \
+                   AND pubkey_ed25519_base64 = $10 AND persist_row_hash = $11",
+                &[
+                    &row.key_id,
+                    &registration_envelope_text,
+                    &original_content_hash,
+                    &row.scrub_signature_classical,
+                    &row.scrub_signature_pqc,
+                    &row.scrub_timestamp,
+                    &row.pqc_completed_at,
+                    &row.persist_row_hash,
+                    &mutated_at,
+                    &row.pubkey_ed25519_base64,
+                    &existing_hash,
+                    &additional_scrubs_text,
+                    &row.scrub_key_id,
+                    &require_self_signed,
+                ],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!(
+                    "{kind_token} key registration {}: {e}",
+                    row.key_id
+                ))
+            })?
+        };
+        if n == 0 {
+            // Dropping the transaction rolls the history insert back.
+            drop(tx);
+            return Err(crate::federation::Error::Conflict(format!(
+                "{kind_token} key registration {}: row changed concurrently",
+                row.key_id
+            )));
+        }
+        tx.commit().await.map_err(|e| {
+            crate::federation::Error::Backend(format!(
+                "{kind_token} key registration {}: commit: {e}",
+                row.key_id
+            ))
+        })?;
+        // Release the pooled client before the reload (see adopt_scrub_upgrade).
+        drop(client);
+        self.index_stored_key_row(&row.key_id).await
     }
 
     /// v13.0.0 (CIRISPersist#372, CC 3.4.7.1) — enumerate the **canonical /
@@ -5400,105 +5546,34 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 RebindPrepared::Unchanged => return Ok(ReplicatedKeyOutcome::Unchanged),
                 RebindPrepared::Replace { new, existing_hash } => (*new, existing_hash),
             };
-        let original_content_hash = hex::decode(&row.original_content_hash).map_err(|e| {
-            crate::federation::Error::InvalidArgument(format!("original_content_hash hex: {e}"))
-        })?;
-        // v53.1.4 — the whole scrub set rides every rewrite of the scrub columns:
-        // a door that wrote scrub #1 alone stored a quorum-signed record as a
-        // one-holder row (the V096 JSON-array TEXT column; empty → "[]").
-        let additional_scrubs_text =
-            serde_json::to_string(&row.additional_scrubs).map_err(|e| {
-                crate::federation::Error::Backend(format!("additional_scrubs serialize: {e}"))
-            })?;
-        let registration_envelope_text =
-            pg_envelope_text(&row.registration_envelope, "registration_envelope")?;
-        let mut client = self
-            .get_client()
-            .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
-        let mutated_at = self.next_key_serve_position(&client).await?;
-        let tx = client.transaction().await.map_err(|e| {
-            crate::federation::Error::Backend(format!(
-                "store_rebound_key_record {}: begin: {e}",
-                row.key_id
-            ))
-        })?;
-        let replaced = tx
-            .execute(
-                "INSERT INTO cirislens.federation_key_registration_history \
-                    (key_id, registration_envelope, original_content_hash, \
-                     scrub_signature_classical, scrub_signature_pqc, scrub_key_id, \
-                     scrub_timestamp, replaced_at, replaced_by_hash) \
-                 SELECT key_id, registration_envelope, original_content_hash, \
-                     scrub_signature_classical, scrub_signature_pqc, scrub_key_id, \
-                     scrub_timestamp, $3::timestamptz, $4::text \
-                 FROM cirislens.federation_keys WHERE key_id = $1 AND persist_row_hash = $2",
-                &[
-                    &row.key_id,
-                    &existing_hash,
-                    &mutated_at,
-                    &row.persist_row_hash,
-                ],
-            )
-            .await
-            .map_err(|e| {
-                crate::federation::Error::Backend(format!(
-                    "store_rebound_key_record {}: history: {e}",
-                    row.key_id
-                ))
-            })?;
-        let n = if replaced == 0 {
-            0
-        } else {
-            tx.execute(
-                "UPDATE cirislens.federation_keys SET \
-                    registration_envelope = $2, original_content_hash = $3, \
-                    scrub_signature_classical = $4, scrub_signature_pqc = $5, \
-                    scrub_timestamp = $6, pqc_completed_at = $7, \
-                    persist_row_hash = $8, mutated_at = $9, additional_scrubs = $12 \
-                 WHERE key_id = $1 AND scrub_key_id = key_id \
-                   AND pubkey_ed25519_base64 = $10 AND persist_row_hash = $11",
-                &[
-                    &row.key_id,
-                    &registration_envelope_text,
-                    &original_content_hash,
-                    &row.scrub_signature_classical,
-                    &row.scrub_signature_pqc,
-                    &row.scrub_timestamp,
-                    &row.pqc_completed_at,
-                    &row.persist_row_hash,
-                    &mutated_at,
-                    &row.pubkey_ed25519_base64,
-                    &existing_hash,
-                    &additional_scrubs_text,
-                ],
-            )
-            .await
-            .map_err(|e| {
-                crate::federation::Error::Backend(format!(
-                    "store_rebound_key_record {}: {e}",
-                    row.key_id
-                ))
-            })?
-        };
-        if n == 0 {
-            // Dropping the transaction rolls the history insert back.
-            drop(tx);
-            return Err(crate::federation::Error::Conflict(format!(
-                "store_rebound_key_record {}: row changed concurrently",
-                row.key_id
-            )));
-        }
-        tx.commit().await.map_err(|e| {
-            crate::federation::Error::Backend(format!(
-                "store_rebound_key_record {}: commit: {e}",
-                row.key_id
-            ))
-        })?;
-        // Release the pooled client before the reload (see adopt_scrub_upgrade).
-        drop(client);
-        self.index_stored_key_row(&row.key_id).await?;
+        self.write_replaced_key_registration(
+            row,
+            existing_hash,
+            crate::federation::types::KeyReplacementKind::Rebind,
+        )
+        .await?;
         Ok(ReplicatedKeyOutcome::Rebound)
+    }
+
+    /// v54.1.0 (CIRISPersist#1044) — the invalid-replace store step (see the
+    /// sqlite twin and the trait doc).
+    async fn store_invalid_replaced_key_record(
+        &self,
+        record: crate::federation::SignedKeyRecord,
+    ) -> Result<crate::federation::register::ReplicatedKeyOutcome, crate::federation::Error> {
+        use crate::federation::register::{RebindPrepared, ReplicatedKeyOutcome};
+        let (row, existing_hash) =
+            match crate::federation::register::prepare_invalid_replace(self, record).await? {
+                RebindPrepared::Unchanged => return Ok(ReplicatedKeyOutcome::Unchanged),
+                RebindPrepared::Replace { new, existing_hash } => (*new, existing_hash),
+            };
+        self.write_replaced_key_registration(
+            row,
+            existing_hash,
+            crate::federation::types::KeyReplacementKind::InvalidReplaced,
+        )
+        .await?;
+        Ok(ReplicatedKeyOutcome::InvalidReplaced)
     }
 
     async fn list_key_registration_history(
@@ -5514,7 +5589,8 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .query(
                 "SELECT key_id, registration_envelope, original_content_hash, \
                         scrub_signature_classical, scrub_signature_pqc, scrub_key_id, \
-                        scrub_timestamp, replaced_at, replaced_by_hash \
+                        scrub_timestamp, replaced_at, replaced_by_hash, \
+                        replaced_row_hash, replacement_kind \
                  FROM cirislens.federation_key_registration_history \
                  WHERE key_id = $1 ORDER BY history_id ASC",
                 &[&key_id],
@@ -5530,6 +5606,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .map(|r| {
                 let envelope: String = r.try_get("registration_envelope").map_err(col)?;
                 let hash: Vec<u8> = r.try_get("original_content_hash").map_err(col)?;
+                let kind: String = r.try_get("replacement_kind").map_err(col)?;
                 Ok(crate::federation::types::KeyRegistrationHistoryRow {
                     key_id: r.try_get("key_id").map_err(col)?,
                     registration_envelope: serde_json::from_str(&envelope).map_err(|e| {
@@ -5544,6 +5621,13 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     scrub_timestamp: r.try_get("scrub_timestamp").map_err(col)?,
                     replaced_at: r.try_get("replaced_at").map_err(col)?,
                     replaced_by_hash: r.try_get("replaced_by_hash").map_err(col)?,
+                    replaced_row_hash: r.try_get("replaced_row_hash").map_err(col)?,
+                    replacement: crate::federation::types::KeyReplacementKind::from_token(&kind)
+                        .ok_or_else(|| {
+                            crate::federation::Error::Backend(format!(
+                                "history replacement_kind {kind:?}"
+                            ))
+                        })?,
                 })
             })
             .collect()
@@ -6542,11 +6626,10 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 })?;
             let attesting_identity_type: String = match attesting_row {
                 Some(r) => r.safe_get_with("identity_type", crate::federation::Error::Backend)?,
+                // v54.1.0 (CIRISPersist#1042) — the ORDERING gap, typed apart
+                // from a bad signature (retryable once the Key row lands).
                 None => {
-                    return Err(crate::federation::Error::InvalidArgument(format!(
-                        "attesting_key_id {} does not exist in federation_keys",
-                        row.attesting_key_id
-                    )));
+                    return Err(crate::federation::Error::unknown_signer(&row.attesting_key_id, "attestation"));
                 }
             };
             // AV-76 D2 — the lookup above is a hard DATA dependency of the
@@ -10108,15 +10191,6 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         authority_signature: Option<serde_json::Value>,
     ) -> Result<(), crate::federation::Error> {
         use crate::federation::Error;
-        if !self
-            .accord_nonce_issued(&proposal.family_key_id, &proposal.nonce)
-            .await?
-        {
-            return Err(Error::InvalidArgument(format!(
-                "accord proposal nonce {:?} not issued for family {:?} (M4 fail-closed)",
-                proposal.nonce, proposal.family_key_id
-            )));
-        }
         // v31.1.0 (CIRISPersist#662, PR #667 round-4) — `created_at` is half the
         // evidence cursor, so it is an allocated position rather than a
         // wall-clock read; see `monotonic_admission_instant`.
@@ -10137,34 +10211,66 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             authority_signature,
             created_at,
         )?;
-        let client = self
+        let mut client = self
             .get_client()
             .await
             .map_err(|e| Error::Backend(e.to_string()))?;
-        client
-            .execute(
-                "INSERT INTO cirislens.accord_proposal (\
+        // v54.1.0 (#1047) — single use: a proposer-minted nonce names one
+        // proposal per family. The check and the insert are one transaction
+        // under an advisory lock, so two processes sharing the database
+        // cannot both admit a different proposal under one nonce.
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| Error::Backend(format!("accord_proposal transaction: {e}")))?;
+        tx.execute(
+            "SELECT pg_advisory_xact_lock($1)",
+            &[&crate::federation::accord_quorum::ACCORD_PROPOSAL_NONCE_LOCK_KEY],
+        )
+        .await
+        .map_err(|e| Error::Backend(format!("accord_proposal nonce lock: {e}")))?;
+        let other = tx
+            .query_opt(
+                "SELECT proposal_digest FROM cirislens.accord_proposal \
+                 WHERE family_key_id = $1 AND nonce = $2 AND proposal_digest <> $3 LIMIT 1",
+                &[&prep.family_key_id, &prep.nonce, &prep.proposal_digest],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("accord_proposal nonce read: {e}")))?;
+        if let Some(row) = other {
+            let other: String = row
+                .try_get(0)
+                .map_err(|e| Error::Backend(format!("accord_proposal nonce read: {e}")))?;
+            return Err(crate::federation::accord_quorum::nonce_reused(
+                &proposal, &other,
+            ));
+        }
+        tx.execute(
+            "INSERT INTO cirislens.accord_proposal (\
                     proposal_digest, family_key_id, action, nonce, window_until, \
                     prior_family_digest, payload_sha256, proposal_json, \
                     authority_signature, persist_row_hash, created_at\
                  ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) \
                  ON CONFLICT (proposal_digest) DO NOTHING",
-                &[
-                    &prep.proposal_digest,
-                    &prep.family_key_id,
-                    &prep.action,
-                    &prep.nonce,
-                    &prep.window_until,
-                    &prep.prior_family_digest,
-                    &prep.payload_sha256,
-                    &prep.proposal_json,
-                    &prep.authority_signature,
-                    &prep.persist_row_hash,
-                    &prep.created_at,
-                ],
-            )
+            &[
+                &prep.proposal_digest,
+                &prep.family_key_id,
+                &prep.action,
+                &prep.nonce,
+                &prep.window_until,
+                &prep.prior_family_digest,
+                &prep.payload_sha256,
+                &prep.proposal_json,
+                &prep.authority_signature,
+                &prep.persist_row_hash,
+                &prep.created_at,
+            ],
+        )
+        .await
+        .map_err(|e| Error::Backend(format!("insert accord_proposal: {e}")))?;
+        tx.commit()
             .await
-            .map_err(|e| Error::Backend(format!("insert accord_proposal: {e}")))?;
+            .map_err(|e| Error::Backend(format!("accord_proposal commit: {e}")))?;
         Ok(())
     }
 
@@ -10532,46 +10638,6 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .await
             .map_err(|e| crate::federation::Error::Backend(format!("clear_active_halt: {e}")))?;
         Ok(())
-    }
-
-    async fn issue_accord_nonce(
-        &self,
-        family_key_id: &str,
-        nonce: &str,
-    ) -> Result<(), crate::federation::Error> {
-        let client = self
-            .get_client()
-            .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
-        client
-            .execute(
-                "INSERT INTO cirislens.accord_issued_nonce (family_key_id, nonce, issued_at) \
-                 VALUES ($1, $2, $3) ON CONFLICT (family_key_id, nonce) DO NOTHING",
-                &[&family_key_id, &nonce, &chrono::Utc::now()],
-            )
-            .await
-            .map_err(|e| crate::federation::Error::Backend(format!("issue_accord_nonce: {e}")))?;
-        Ok(())
-    }
-
-    async fn accord_nonce_issued(
-        &self,
-        family_key_id: &str,
-        nonce: &str,
-    ) -> Result<bool, crate::federation::Error> {
-        let client = self
-            .get_client()
-            .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
-        let row_opt = client
-            .query_opt(
-                "SELECT 1 FROM cirislens.accord_issued_nonce \
-                 WHERE family_key_id = $1 AND nonce = $2",
-                &[&family_key_id, &nonce],
-            )
-            .await
-            .map_err(|e| crate::federation::Error::Backend(format!("accord_nonce_issued: {e}")))?;
-        Ok(row_opt.is_some())
     }
 
     // ─── v4.8.0 (CIRISPersist#161, CEG §11.7.1) — membership revocations.

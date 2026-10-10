@@ -626,7 +626,6 @@ pub(crate) mod bodies {
             let nonce = format!("{n}-{tag}");
             let anchor = anchor.to_owned();
             async move {
-                d.issue_accord_nonce(accord, &nonce).await.unwrap();
                 let proposal = AccordProposal {
                     family_key_id: accord.to_owned(),
                     action: AccordAction::RosterChange,

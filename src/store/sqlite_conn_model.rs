@@ -239,11 +239,10 @@ pub(crate) enum ConnClass {
 /// and are `Write`.
 #[cfg(test)]
 pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
-    ("accord_nonce_issued", ConnClass::Read),
     ("add_peer_record", ConnClass::Write),
     ("adopt_genesis_reanchor", ConnClass::Write),
     ("adopt_scrub_upgrade", ConnClass::Write),
-    ("store_rebound_key_record", ConnClass::Write),
+    ("write_replaced_key_registration", ConnClass::Write),
     // #846 (§6.1) — the adopt floor: row + declared binding + holder claim in
     // one transaction.
     ("adopt_sealed_blob_at", ConnClass::Write),
@@ -346,7 +345,6 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("insert_known_wire_hash", ConnClass::Write),
     ("insert_trace_events_batch", ConnClass::Write),
     ("insert_trace_llm_calls_batch", ConnClass::Write),
-    ("issue_accord_nonce", ConnClass::Write),
     ("known_wire_hash_contains", ConnClass::Read),
     ("last_witness_epoch_for_peer", ConnClass::Read),
     ("latest_stream_sth", ConnClass::Read),
