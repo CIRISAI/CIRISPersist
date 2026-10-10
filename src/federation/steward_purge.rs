@@ -4,15 +4,21 @@
 //! `evict_actor` / `evict_blob` (v3.5.0, v47.2.0) purge ONE plane — the bytes —
 //! for one actor or one sha. This door extends that shape to any row
 //! selection, authorised under GLOBAL TRUST-ROOT MODERATION, with an evidence
-//! ledger. The constitutional reading is CIRISConstitution#165:
+//! ledger. The constitutional reading is CIRISConstitution#165 as landed at
+//! **rc8@c69129c** (CC 2.4.1.1, CC 3.3.2, CC 4.5.3):
 //!
 //! 1. **Authorisation** is a cosigned `takedown_notice` (CC 3.3.2 shape) with
 //!    the closed-set basis [`STEWARD_PURGE_BASIS`], `claimant_key_id` = the
-//!    trust root's `community_key_id`, cosigned under that root's own
-//!    `consensus_protocol`
+//!    trust root's `community_key_id`, cosigned by distinct SEATS of the held
+//!    root and counted under that root's own `consensus_protocol`
 //!    ([`trust_root_cosigners_over`](super::canonical_community::trust_root_cosigners_over)),
-//!    naming the **selection digest**: SHA-256 over the JCS array of every
-//!    purged record id, derived ids included, sorted ([`selection_digest`]).
+//!    with `content_sha256` = the **selection digest**: SHA-256 over the JCS
+//!    array of sorted, unique `"plane:id"` strings naming every purged
+//!    record, derived included — a record is named by its plane identifier
+//!    (`attestation_id`, `trace_id`, bytes by their sha256), never by content
+//!    ([`selection_digest`]). An OPTIONAL `selection_counts` `{table: count}`
+//!    lets the door refuse a drifted selection
+//!    ([`token::SELECTION_COUNT_MISMATCH`]).
 //!    The door asks about the SIGNERS (their standing under the root's
 //!    protocol) and binds the subject through the digest — never through a
 //!    caller-supplied verdict. There is NO override path: a changed selection
@@ -28,11 +34,22 @@
 //!    receiver re-verifies it against its OWN trust root and re-derives the
 //!    digest ([`apply_replicated_purge`]).
 //! 4. **Hard delete** happens only on the explicit second call
-//!    [`purge_finalize`], after the settle dwell ([`PURGE_SETTLE_DWELL_SECS`]).
+//!    [`purge_finalize`], after the settle: a stated dwell of `W` = 72 h
+//!    after the tombstone ([`PURGE_SETTLE_DWELL_SECS`]), never a peer
+//!    acknowledgement ([`token::NOT_SETTLED`]).
+//! 5. **Reach**: never a key (no key plane; key retirement is
+//!    `key:revocation`, a separate act) and never the accountability record
+//!    ([`ACCOUNTABILITY_RECORD_PREFIXES`]). A purge binds only nodes rooted at
+//!    the same trust root: it is not global erasure (CC 3.2 T3, 4.2.1).
 //!
 //! Derived rows follow the reason: a `scores` row whose `evidence_refs`
 //! resolve to a purged record (a trace id, a trace attestation id, an
-//! attestation id) is in the SAME selection and ledger, transitively.
+//! attestation id), a trace's own `trace:complete:v1` attestation, and the
+//! bytes a purged holding claim holds are in the SAME selection, digest and
+//! ledger, transitively. The dry run's sample is the first 20 ids in JCS
+//! order, a view of the ledger. `purge_notice_unknown` and
+//! `purge_selection_malformed` are persist-local tokens; the other six are in
+//! the CC registry.
 //!
 //! The selection kinds are [`PurgeSelection`]: by actor, by explicit id
 //! list, and the two classes the operator ruled on (#1040's mock-LLM traces,
@@ -99,7 +116,7 @@ pub mod token {
 }
 
 /// The `takedown_notice` basis that authorises a steward purge (CC 3.3.2
-/// `LegalBasis::StewardPurge`, CIRISConstitution rc8@af6b436).
+/// `LegalBasis::StewardPurge`, CIRISConstitution rc8@c69129c).
 pub const STEWARD_PURGE_BASIS: &str = "steward_purge";
 
 /// The sample a dry run shows: the first N record ids in JCS order (CSD-108
@@ -108,7 +125,7 @@ pub const SAMPLE_LEN: usize = 20;
 
 /// How long after the tombstone the retraction round is taken as settled:
 /// `W` = 72 h (259 200 s), the CC 2.6.7 / 4.2.6 "until everyone has heard"
-/// constant (CIRISConstitution rc8@af6b436; operator-confirmed 2026-10-09).
+/// constant (CIRISConstitution rc8@c69129c; operator-confirmed 2026-10-09).
 /// NOT the 24 h lone-holder halt fuse, which is a different thing. There is
 /// no peer-acknowledgement plane: settle is this stated dwell.
 /// `purge_finalize` refuses before it ([`token::NOT_SETTLED`]). ONE named
@@ -135,7 +152,7 @@ fn refused(token: &'static str, body: serde_json::Value) -> Error {
 #[serde(rename_all = "snake_case")]
 ///
 /// There is NO key plane (operator ruling 2026-10-09: "We should not delete
-/// any keys"; CC 2.4.1.1 at CIRISConstitution rc8@af6b436 — the root has no
+/// any keys"; CC 2.4.1.1 at CIRISConstitution rc8@c69129c — the root has no
 /// path over a stranger's key). Deleting a key leaves every row it signed
 /// unverifiable wherever it replicated; key retirement is `key:revocation`,
 /// a separate act by the key's own authority.
@@ -526,7 +543,7 @@ impl RowFacts {
     }
 }
 
-/// CLM-accountability-record-unpurgeable (CIRISConstitution rc8@af6b436) —
+/// CLM-accountability-record-unpurgeable (CIRISConstitution rc8@c69129c) —
 /// the dimension families the text names EXACTLY as the unpurgeable
 /// accountability record. Matched by the purge's own check, not by widening
 /// `migration::ExclusionClass`: its `moderation:` prefix does not reach
@@ -1135,7 +1152,7 @@ pub struct PurgeExecution {
     /// authorised it.
     pub claimant_key_id: String,
     /// The notice's `legal_basis` (CC 3.3.2). One tombstone row serves
-    /// takedown and purge (CIRISConstitution rc8@af6b436, CC 4.5.3): the
+    /// takedown and purge (CIRISConstitution rc8@c69129c, CC 4.5.3): the
     /// basis is what tells a `steward_purge` (cosigned, any plane, hard
     /// delete after settle) from a duty-holder takedown (bytes plane only;
     /// an immediate-removal basis destroys on receipt — the v55 door,
@@ -1892,7 +1909,7 @@ where
 
 // ── #1040: the mock-run trace refusal (CC 3.1.5, CIRISConstitution#166) ──
 
-/// CIRISConstitution#166 (rc8@af6b436) — the refusal token for a trace whose
+/// CIRISConstitution#166 (rc8@c69129c) — the refusal token for a trace whose
 /// signed `run_kind` is `mock`.
 pub const TRACE_RUN_KIND_MOCK: &str = "trace_run_kind_mock";
 

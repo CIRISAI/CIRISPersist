@@ -20,7 +20,7 @@
 -- `(plane, record_ref)` index is the admission gates' lookup.
 --
 -- ONE tombstone row for takedown and purge (CC 4.5.3, CIRISConstitution
--- rc8@af6b436): `legal_basis` is the authorising notice's basis, so the same
+-- rc8@c69129c): `legal_basis` is the authorising notice's basis, so the same
 -- tables hold a duty-holder takedown (bytes plane only; an immediate-removal
 -- basis destroys on receipt, so `finalized_at` is simply set at once) beside
 -- a `steward_purge` (any plane; hard delete after the round settles). No

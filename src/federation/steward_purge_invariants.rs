@@ -60,7 +60,7 @@
 //!   harness-prefix builder the operator dropped (harness rows on production
 //!   stay; Server selects by actor or by ids when it needs a purge).
 //! - **I664** — one tombstone row for takedown and purge (CC 4.5.3,
-//!   CIRISConstitution rc8@af6b436): a header with ANOTHER basis (a
+//!   CIRISConstitution rc8@c69129c): a header with ANOTHER basis (a
 //!   duty-holder `ncmec_csam` takedown, the v55 #1007 door's row) and its
 //!   bytes-plane tombstone round-trip through the store with their basis
 //!   intact, and the ledger names the basis.
@@ -71,7 +71,7 @@
 //!   it, its unselected row still verifies, and a row it signs afterwards
 //!   verifies.
 //! - **I667** — CLM-accountability-record-unpurgeable (CIRISConstitution
-//!   rc8@af6b436): a row of each of `revocation:*`, `key:revocation`,
+//!   rc8@c69129c): a row of each of `revocation:*`, `key:revocation`,
 //!   `moderation:*`, `moderation_track_record:*` and `slashing:*` is
 //!   inadmissible by that clause — refused by id, withheld by a class.
 //! - **I668** — the receiver of a replicated bundle re-asks the rules no
@@ -908,7 +908,7 @@ pub(crate) mod bodies {
             .await
             .unwrap();
         // Settle is W = 72 h after the tombstone (CC 2.6.7, CIRISConstitution
-        // rc8@af6b436): still unsettled after an hour, and after the 24 h
+        // rc8@c69129c): still unsettled after an hour, and after the 24 h
         // lone-holder fuse (a different constant).
         for early in [
             chrono::Duration::hours(1),
