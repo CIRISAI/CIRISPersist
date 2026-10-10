@@ -11,7 +11,48 @@ threat-model citations because this crate's audit story is the point.
 
 ### Added — the generic steward purge door (#1046, CIRISConstitution#165, CSD-108)
 
-(Checkpoint entry; completed below as the slice lands.)
+`federation::steward_purge` extends `evict_actor`'s bytes-plane purge to any row selection, authorised under global trust-root moderation, with an evidence ledger. Nothing runs on its own: every purge is an explicit call on a notice the trust root's quorum cosigned, and production execution is the operator's go only.
+
+- **Authorisation.** A cosigned `takedown_notice` (CC 3.3.2 shape) with the closed-set basis `steward_purge`, `claimant_key_id` = the trust root's `community_key_id`, naming the **selection digest**: SHA-256 over the JCS array of every purged record id (`"{plane}:{id}"`, derived ids included, sorted, unique). The cosigners are judged by `canonical_community::trust_root_cosigners_over`: each a distinct recorded founder of the rooted, trust-root-grade head, each hybrid signature verified, the set counted by the head's own `consensus_protocol`. A non-founder's cosignature, a founder signing twice, a stalled or unrooted root, an expired or future notice are refusals. There is no override path: a changed selection has another digest.
+- **Execution.** A tombstone by digest per record, citing the notice (never a `withdraws`), written in JCS order; derived rows (a trace's own `trace:complete:v1` attestation, scores whose `evidence_refs` resolve to purged ids, transitively; a holder claim's bytes) are in the same selection. An inadmissible retraction (a structural composer whose target is not purged with it; a `delegates_to` between keys neither of which is purged; any other exclusion-bearing row) stops the door at its index; everything before it stays tombstoned, a retry writes nothing twice. A tombstoned row is not served and is refused at every door that could bring it back: the attestation put (local and replicated), the tier-crossing promotion door, both key doors, trace ingest. Hard delete only on the explicit `purge_finalize` after the settle dwell (`PURGE_SETTLE_DWELL_SECS`, 24 h), through delete doors that re-ask the tombstone in the same statement.
+- **Replication.** `list_purge_bundles_since` serves `PurgeBundle`s (the notice, its whole cosignature set, the record ids, never content); `apply_replicated_purge` re-verifies the notice against the RECEIVER's own trust root and re-derives the digest before any tombstone lands. Deletes nothing.
+- **Ledger.** `purge_dry_run` returns the would-purge ledger TSV (written before the notice is cosigned, so the notice's `evidence_refs` can point at it). `purge_ledger_tsv` renders the executed one: a header with `selection_digest`, `notice_id`, `claimant_key_id`, `record_count`, `executed_by`, `origin`, `executed_at`, `finalized_at`, `notice_jcs` (the notice id's preimage) and `cosignatures_json` (the whole set), then one row per record, `selection_digest notice_id ordinal plane record_id derived_from`. The ledger alone re-derives both the notice id and the digest.
+- **Storage (V187, sqlite and postgres; memory mirrors it).** `purge_executions` (header, one row per notice, `origin` `local`/`replicated`) and `purge_tombstones` (`(notice_id, plane, record_ref)` key, `ordinal`, `derived_from`). Checksums in `evidence/migration_checksums.tsv`.
+
+**Selections** (`PurgeSelection`, serialized with a `kind` tag). A class is a pure row predicate, `PurgeSelection::selects_row`, over one attestation scan, plus its seeds; "rows of family F from issuer K in window W" (CIRISServer#757) is one more variant and predicate arm, not added here.
+
+| `kind` | Selects |
+|---|---|
+| `by_actor {key_id}` | every row attested by or about the key, every trace it signed, the key (by its label-free digest) and everything derived. CSD-065 Descend moves onto this. |
+| `by_ids {ids}` | exactly the list; inadmissible members are reported as warnings, and the door refuses at them. |
+| `mock_model_traces {model}` | #1040: every trace with an LLM call on `model`, built by `PurgeSelection::mock_llm_traces()` (`mock-model`). |
+| `refused_today` | #1043 class 1: every federation-tier row the apply door would refuse today on a structural ground (`refused_today(row)`: #598 no signed `asserted_at`, #643 a typed column diverging from the envelope). |
+
+#1043 class 2 (the QA / harness identities registered on production) is a list of `by_actor` selections: `harness_actor_selections(directory, prefixes)` names one per registered key matching `HARNESS_KEY_ID_PREFIXES` (`qa-node-`, `gate-leg-`, `leg-node-`, `gate-gate-identity-`, `cessex16-`). `ciris-server-` is deliberately absent; those go by explicit key id.
+
+**Refusal tokens** (`Error::kind()` returns the token; Python `ValueError((token, body_json))`): `purge_unauthorised`, `purge_selection_digest_mismatch`, `purge_selection_count_mismatch` `{table, expected, found}`, `purge_retraction_inadmissible` `{record_id, plane, index, total}`, `purge_not_settled`, `purge_notice_unknown`, `purge_tombstoned`, `purge_selection_malformed`.
+
+**Surface.** `Engine::{purge_dry_run, purge_harness_actor_selections, purge_rows, purge_status, purge_finalize, purge_ledger_tsv, list_purge_bundles_since, apply_replicated_purge}`. pyo3: `purge_dry_run_json`, `purge_harness_actor_selections_json`, `purge_rows_json`, `purge_notice_signing_payload_json`, `purge_status_json`, `purge_finalize_json`, `purge_ledger_tsv`, `list_purge_bundles_since_json`, `apply_replicated_purge_json` (classified in `scripts/ffi_taxonomy.tsv`; the three that remove rows are deontic).
+
+**New variants on exhaustive public enums** (adopters with an exhaustive `match` must add an arm):
+
+- `federation::Error::PurgeRefused { token, body }`: map by `token` (CIRISServer#756 gives each a stable reason id); the HTTP status is Server's to assign.
+- `ingest::IngestError::TraceRefused { kind, detail }`: `kind` is `trace_runtime_mock` or `purge_tombstoned`; Lens → HTTP 422, Python `ValueError((kind, detail))`.
+- New enums: `steward_purge::PurgeSelection` (`ByActor`, `ByIds`, `MockModelTraces`, `RefusedToday`), `steward_purge::PurgePlane` (`Trace`, `Attestation`, `Blob`, `Key`), `steward_purge::PurgeState` (`Executed`, `Settled`, `Finalized`).
+
+### Added — the federation tier refuses mock-LLM traces (#1040)
+
+`trace_runtime_mock`: a federation-tier `trace:complete:v1` attestation whose embedded trace reports `model = "mock-model"` is refused at the attestation put (local and replicated) and at the tier-crossing promotion door, on memory, sqlite and postgres; a local-tier row is kept (QA). Trace ingest refuses a mock trace on a node holding the `canonical` role (its own verified role), zero rows written for the batch; a node without it keeps the trace. Keyed on the model today; the agent's envelope marker joins it when Agent settles the name (CC 3.1.5).
+
+### Changed — #1043 is a purge, not a serve filter
+
+The operator ruled (#1043, 2026-10-09): both classes are purged through the door above, never withheld in place. The draft serve filter (`servable`, `fill_served_page` and the serve-read changes) was removed before release; the serve reads withhold only tombstoned rows. **I657 is retired and not reused.**
+
+### Witnesses (`src/federation/steward_purge_invariants.rs`, memory, sqlite and postgres)
+
+I650 authorisation (each refusal asserts the clause that refused it), I651 digest mismatch, I652 count mismatch, I653 inadmissible retraction stops the door (composer and third-party `delegates_to`), I654 the mock class end to end (dry run read-only, sample, ledger preimages, tombstone stops serving and blocks promotion), I655 finalize after settle, I656 the tombstone replicates re-verified, I658 by-actor and the key cannot return, I659 `trace_runtime_mock` at the put, promotion and ingest doors, I660 the delete doors re-ask the tombstone, I661 from disk (every backend's doors carry the gates; no serve read classifies by `refused_today`), I662 class 1 is a selection (served until purged; the class scan pages to the end), I663 class 2 by-actor selections and their dry-run counts.
+
+Mutation-checked: 41 mutants on the door's load-bearing clauses (authorisation, founder set, distinct signers, quorum, basis, expiry, count, digest, inadmissible stop, composer target, delegation, derived scores, finalize settle, replicated re-verify / digest / order, every backend's put gate, serve exclusion and delete gate, the promotion gates, the ingest gates, the mock matcher, the class predicates and both scans' paging): all KILLED. M08 (the trust-root-grade pre-check) survived because `stored_standing_at` already answers it; the duplicate check was removed.
 
 ## [54.0.0] - 2026-10-09
 
