@@ -561,26 +561,11 @@ impl RowFacts {
     }
 }
 
-/// CLM-accountability-record-unpurgeable (CIRISConstitution rc8@8c8f536) —
-/// the dimension families the text names EXACTLY as the unpurgeable
-/// accountability record. Matched by the purge's own check, not by widening
-/// `migration::ExclusionClass`: its `moderation:` prefix does not reach
-/// `moderation_track_record:*`, and it has no `key:revocation` arm.
-pub const ACCOUNTABILITY_RECORD_PREFIXES: &[&str] = &[
-    "revocation:",
-    "key:revocation",
-    "moderation:",
-    "moderation_track_record:",
-    "slashing:",
-];
-
-/// The accountability family `dimension` belongs to, if any.
-fn accountability_family(dimension: &str) -> Option<&'static str> {
-    ACCOUNTABILITY_RECORD_PREFIXES
-        .iter()
-        .copied()
-        .find(|p| dimension.starts_with(p))
-}
+use super::migration::accountability_record_family as accountability_family;
+/// CLM-accountability-record-unpurgeable — the five families, now ONE list
+/// both purge doors read (CIRISPersist#1054):
+/// [`migration::ACCOUNTABILITY_RECORD_PREFIXES`](super::migration::ACCOUNTABILITY_RECORD_PREFIXES).
+pub use super::migration::ACCOUNTABILITY_RECORD_PREFIXES;
 
 /// **Is this attestation's retraction admissible inside this selection?**
 /// `Err(reason)` when not. The door's own gate (AV-9): the purge deletes what

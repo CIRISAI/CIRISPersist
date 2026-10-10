@@ -56,6 +56,24 @@ CC basis: **CIRISConstitution rc8@8c8f536** (#165: CC 2.4.1.1 "a purge is a tomb
 - `ingest::IngestError::TraceRefused { kind, detail }`: `kind` is `trace_run_kind_mock` or `purge_tombstoned`; Lens → HTTP 422, Python `ValueError((kind, detail))`.
 - New enums: `steward_purge::PurgeSelection` (`ByActor`, `ByIds`, `MockModelTraces`, `RefusedToday`), `steward_purge::PurgePlane` (`Trace`, `Attestation`, `Blob`; there is no key plane), `steward_purge::PurgeState` (`Executed`, `Settled`, `Finalized`).
 
+### Fixed — the reset purge door deleted `key:revocation` and `moderation_track_record:*` rows; both purge doors now read one list (#1054)
+
+CC rc8 names five families no purge may reach "by the root or anyone": `revocation:*`,
+`key:revocation`, `moderation:*`, `moderation_track_record:*`, `slashing:*`. The steward purge
+refused all five through its own list. The reset door (`migration::check_purge_admission`, every
+backend's `purge_attestation_v31`) matched `ExclusionClass` prefixes only, and none of those
+reaches `key:revocation` or `moderation_track_record:*`. **I694** (memory, sqlite, postgres)
+admitted a row of each family and asked the reset door. Before the fix it planned and
+`purge_attestation_v31` DELETED the `key:revocation` and `moderation_track_record` rows on every
+backend. Now the list lives once, as `migration::ACCOUNTABILITY_RECORD_PREFIXES` /
+`accountability_record_family`. The reset door reads it through a new
+`ExclusionClass::AccountabilityRecord` (after the narrower prefix classes, so their labels are
+unchanged), and the steward purge reads the same function. Mutations, each red: dropping the
+reset arm (I694, the exhaustiveness test); removing `key:revocation` from the list (I667 and
+I694, both doors, all three backends); removing `moderation_track_record:` (I667, I668, I694,
+the exhaustiveness test). I694 hardcodes its five families. Built from the list, it followed
+the list and stayed green when a family was dropped.
+
 ### Added — the federation tier refuses mock runs (#1040)
 
 CC basis: **CIRISConstitution rc8@8c8f536** (#166, CC 3.1.5: every trace carries `run_kind`, closed vocabulary `production | qa | battery | mock`; `mock` is refused at federation-tier admission).

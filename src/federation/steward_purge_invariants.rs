@@ -74,6 +74,10 @@
 //!   rc8@8c8f536): a row of each of `revocation:*`, `key:revocation`,
 //!   `moderation:*`, `moderation_track_record:*` and `slashing:*` is
 //!   inadmissible by that clause — refused by id, withheld by a class.
+//! - **I694** (CIRISPersist#1054) — the RESET purge door refuses the same
+//!   five families, through the one list both doors read
+//!   (`migration::ACCOUNTABILITY_RECORD_PREFIXES`), and the reset's planning
+//!   (`is_exclusion_bearing`) keeps them.
 //! - **I668** — the receiver of a replicated bundle re-asks the rules no
 //!   notice can lift (the accountability record; a composer without its
 //!   target): a quorum-cosigned bundle naming a held `moderation_track_record`
@@ -1386,6 +1390,69 @@ pub(crate) mod bodies {
         d.attestation_insert_local(local).await.expect("local row")
     }
 
+    /// **I694** (CIRISPersist#1054) — the RESET purge door
+    /// (`migration::check_purge_admission`, every backend's
+    /// `purge_attestation_v31`) refuses the accountability record too, and the
+    /// reset's planning keeps it: `is_exclusion_bearing` names each of the five
+    /// families. Before #1054 the door knew `revocation:`, `moderation:` and
+    /// `slashing:` by prefix and deleted a `key:revocation` or a
+    /// `moderation_track_record:*` row.
+    pub(crate) async fn i694_the_reset_door_refuses_the_accountability_record<D: Seams>(d: &D) {
+        root(d).await;
+        let dir = d.as_dyn_directory();
+        let mut problems = Vec::new();
+        // The CC's five families, hardcoded: built from the shared list, the
+        // witness followed the list wherever it moved (dropping a family from
+        // it left I694 green).
+        for dimension in [
+            "revocation:i694:v1",
+            "key:revocation:i694:v1",
+            "moderation:i694:v1",
+            "moderation_track_record:i694:v1",
+            "slashing:i694:v1",
+        ] {
+            let id = uuid::Uuid::new_v4().to_string();
+            let env = serde_json::json!({"dimension": dimension, "score": 0.0});
+            let mut row = ts::bare_attestation(&id, HARNESS, BYSTANDER, &env);
+            row.attestation_type = attestation_type::SCORES.to_owned();
+            ts::reseal(&mut row);
+            if let Err(e) = dir
+                .put_attestation(SignedAttestation {
+                    attestation: row.clone(),
+                })
+                .await
+            {
+                // A family the write doors refuse cannot reach the reset door
+                // that way; the door's own gate is still asked below.
+                problems.push(format!(
+                    "{dimension}: not admitted ({e}); door asked on the row"
+                ));
+            }
+            if crate::federation::migration::is_exclusion_bearing(&row).is_none() {
+                problems.push(format!("{dimension}: the reset would PLAN its purge"));
+            }
+            if crate::federation::migration::check_purge_admission(&row).is_ok() {
+                problems.push(format!("{dimension}: the reset door ADMITS its purge"));
+            }
+            if dir.get_attestation(&id).await.unwrap().is_some() {
+                match dir.purge_attestation_v31(&id).await {
+                    Ok(gone) => problems.push(format!(
+                        "{dimension}: purge_attestation_v31 DELETED it (returned {gone})"
+                    )),
+                    Err(_) => assert!(
+                        dir.get_attestation(&id).await.unwrap().is_some(),
+                        "I694 {dimension}: refused, and the row is still held"
+                    ),
+                }
+            }
+        }
+        let deleted: Vec<&String> = problems
+            .iter()
+            .filter(|p| !p.contains("not admitted"))
+            .collect();
+        assert!(deleted.is_empty(), "I694:\n{}", problems.join("\n"));
+    }
+
     pub(crate) async fn i667_the_accountability_record_is_unpurgeable<D: Seams>(d: &D) {
         root(d).await;
         let dir = d.as_dyn_directory();
@@ -2090,6 +2157,11 @@ mod run {
                 async fn i667() {
                     let Some(d) = $fresh.await else { return };
                     b::i667_the_accountability_record_is_unpurgeable(&d).await
+                }
+                #[tokio::test]
+                async fn i694() {
+                    let Some(d) = $fresh.await else { return };
+                    b::i694_the_reset_door_refuses_the_accountability_record(&d).await
                 }
                 #[tokio::test]
                 async fn i665() {
