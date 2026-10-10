@@ -3749,16 +3749,38 @@ pub enum LicensureChainBreak {
     AuthorityActsByQuorum,
 }
 
+/// v54.1.0 (CIRISPersist#1042 follow-up C) — the stable `reason` tokens of
+/// [`Error::LicensureDelegatorNotAuthority`]: one per
+/// [`LicensureChainBreak`], plus [`NOT_AUTHORITY_AT_RECEIPT`]. Append-only.
+pub mod licensure_refusal {
+    /// [`super::LicensureChainBreak::NamedEdgeAbsent`].
+    pub const NAMED_EDGE_ABSENT: &str = "named_edge_absent";
+    /// [`super::LicensureChainBreak::NamedEdgeNotLicense`].
+    pub const NAMED_EDGE_NOT_LICENSE: &str = "named_edge_not_license_delegation";
+    /// [`super::LicensureChainBreak::NamedEdgeNotOntoEmitter`].
+    pub const NAMED_EDGE_NOT_ONTO_EMITTER: &str = "named_edge_not_onto_emitter";
+    /// [`super::LicensureChainBreak::NotOnLiveChain`].
+    pub const NOT_ON_LIVE_CHAIN: &str = "not_on_live_chain_at_asserted_at";
+    /// [`super::LicensureChainBreak::AuthorityActsByQuorum`].
+    pub const AUTHORITY_ACTS_BY_QUORUM: &str = "authority_acts_by_quorum";
+    /// [`super::LICENSURE_NOT_AUTHORITY_AT_RECEIPT`].
+    pub const NOT_AUTHORITY_AT_RECEIPT: &str = "not_authority_at_receipt";
+}
+
 impl LicensureChainBreak {
-    /// The stable token.
+    /// The stable token (a [`licensure_refusal`] constant).
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
-            LicensureChainBreak::NamedEdgeAbsent => "named_edge_absent",
-            LicensureChainBreak::NamedEdgeNotLicense => "named_edge_not_license_delegation",
-            LicensureChainBreak::NamedEdgeNotOntoEmitter => "named_edge_not_onto_emitter",
-            LicensureChainBreak::NotOnLiveChain => "not_on_live_chain_at_asserted_at",
-            LicensureChainBreak::AuthorityActsByQuorum => "authority_acts_by_quorum",
+            LicensureChainBreak::NamedEdgeAbsent => licensure_refusal::NAMED_EDGE_ABSENT,
+            LicensureChainBreak::NamedEdgeNotLicense => licensure_refusal::NAMED_EDGE_NOT_LICENSE,
+            LicensureChainBreak::NamedEdgeNotOntoEmitter => {
+                licensure_refusal::NAMED_EDGE_NOT_ONTO_EMITTER
+            }
+            LicensureChainBreak::NotOnLiveChain => licensure_refusal::NOT_ON_LIVE_CHAIN,
+            LicensureChainBreak::AuthorityActsByQuorum => {
+                licensure_refusal::AUTHORITY_ACTS_BY_QUORUM
+            }
         }
     }
 }
@@ -3768,7 +3790,7 @@ impl LicensureChainBreak {
 /// emitter was a founder of a `founder_only` authority when the row was
 /// dated, and is not one now. Without a past-freshness window a signed
 /// instant cannot grant standing the emitter no longer has.
-pub const LICENSURE_NOT_AUTHORITY_AT_RECEIPT: &str = "not_authority_at_receipt";
+pub const LICENSURE_NOT_AUTHORITY_AT_RECEIPT: &str = licensure_refusal::NOT_AUTHORITY_AT_RECEIPT;
 
 /// v54.0.0 (CIRISPersist#1035) — the verdict on ONE licensure row.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4150,8 +4172,10 @@ pub async fn check_licensure_delegator_is_authority(
     if matches!(&authority, LicensureAuthority::Key(k) if *k == row.attesting_key_id) {
         return Ok(());
     }
-    let refuse = |reason: &str, delegation_id: Option<&str>, judged: &str| {
-        Err(Error::InvalidArgument(format!(
+    // v54.1.0 (CIRISPersist#1042 follow-up C) — typed, with `reason` as the
+    // stable token; the Display is the pre-v54.1 text.
+    let refuse = |reason: &'static str, delegation_id: Option<&str>, judged: &str| {
+        let message = format!(
             "licensure_delegator_not_authority: {reason}: {:?} emitted {dimension:?} under \
              delegation {delegation_id:?} signed at {asserted_at}, and it is not the \
              authority's own issuance on a live `license` chain from {authority_id:?} at \
@@ -4162,7 +4186,13 @@ pub async fn check_licensure_delegator_is_authority(
              nothing about whether {authority_id:?} is known or trusted.",
             row.attesting_key_id,
             asserted_at = row.asserted_at,
-        )))
+        );
+        Err(Error::LicensureDelegatorNotAuthority {
+            attesting_key_id: row.attesting_key_id.clone(),
+            authority_id: authority_id.to_owned(),
+            reason,
+            message,
+        })
     };
     let at_receipt = licensure_issuance_at(directory, &authority, row, chrono::Utc::now()).await?;
     if let LicensureIssuance::Unresolved {
@@ -5160,10 +5190,10 @@ pub async fn verify_signed_identity_occurrence(
     else {
         // v54.1.0 (CIRISPersist#1042) — an ordering gap, typed apart from a
         // bad signature: retryable once the signer's Key row lands.
-        return Err(Error::AttesterKeyUnknown {
-            attesting_key_id: signed.attesting_key_id.clone(),
-            plane: "identity_occurrence",
-        });
+        return Err(Error::unknown_signer(
+            &signed.attesting_key_id,
+            "identity_occurrence",
+        ));
     };
     let key_directory = vec![ThresholdMember {
         member_id: signer_key.key_id.clone(),
@@ -5338,10 +5368,10 @@ async fn verify_content_only_identity_occurrence(
     else {
         // v54.1.0 (CIRISPersist#1042) — an ordering gap, typed apart from a
         // bad signature: retryable once the signer's Key row lands.
-        return Err(Error::AttesterKeyUnknown {
-            attesting_key_id: signed.attesting_key_id.clone(),
-            plane: "identity_occurrence",
-        });
+        return Err(Error::unknown_signer(
+            &signed.attesting_key_id,
+            "identity_occurrence",
+        ));
     };
     let bytes = crate::verify::canonical::ceg_produce_canonicalize(env).map_err(|e| {
         Error::InvalidArgument(format!("signed identity_occurrence canonicalize: {e}"))
@@ -5520,10 +5550,10 @@ pub async fn verify_signed_identity_occurrence_revocation(
     else {
         // v54.1.0 (CIRISPersist#1042) — an ordering gap, typed apart from a
         // bad signature: retryable once the signer's Key row lands.
-        return Err(Error::AttesterKeyUnknown {
-            attesting_key_id: signed.attesting_key_id.clone(),
-            plane: "identity_occurrence_revocation",
-        });
+        return Err(Error::unknown_signer(
+            &signed.attesting_key_id,
+            "identity_occurrence_revocation",
+        ));
     };
     let bytes = crate::verify::canonical::ceg_produce_canonicalize(env).map_err(|e| {
         Error::InvalidArgument(format!(
@@ -5695,10 +5725,10 @@ pub async fn verify_signed_transport_destination(
     else {
         // v54.1.0 (CIRISPersist#1042) — an ordering gap, typed apart from a
         // bad signature: retryable once the signer's Key row lands.
-        return Err(Error::AttesterKeyUnknown {
-            attesting_key_id: signed.attesting_key_id.clone(),
-            plane: "transport_destination",
-        });
+        return Err(Error::unknown_signer(
+            &signed.attesting_key_id,
+            "transport_destination",
+        ));
     };
     let bytes = crate::verify::canonical::ceg_produce_canonicalize(env).map_err(|e| {
         Error::InvalidArgument(format!("signed transport_destination canonicalize: {e}"))
@@ -6538,10 +6568,10 @@ pub async fn verify_signed_touch_claim(
     let Some(signer_key) = directory.lookup_public_key(&claim.attesting_key_id).await? else {
         // v54.1.0 (CIRISPersist#1042) — an ordering gap, typed apart from a
         // bad signature: retryable once the signer's Key row lands.
-        return Err(Error::AttesterKeyUnknown {
-            attesting_key_id: claim.attesting_key_id.clone(),
-            plane: "touch_claim",
-        });
+        return Err(Error::unknown_signer(
+            &claim.attesting_key_id,
+            "touch_claim",
+        ));
     };
     // v21.10.0 (#519 b2) — the signature bytes are over the envelope WITHOUT
     // the `touch_cosignatures` set: co-signatures cannot be inside the bytes
@@ -6640,10 +6670,7 @@ pub async fn verify_signed_touch_claim(
             let Some(cs_key) = directory.lookup_public_key(&cs.member_id).await? else {
                 // v54.1.0 (CIRISPersist#1042) — an ordering gap, typed apart from a
                 // bad signature: retryable once the signer's Key row lands.
-                return Err(Error::AttesterKeyUnknown {
-                    attesting_key_id: cs.member_id.clone(),
-                    plane: "touch_claim_cosigner",
-                });
+                return Err(Error::unknown_signer(&cs.member_id, "touch_claim_cosigner"));
             };
             let cs_member = [ThresholdMember {
                 member_id: cs_key.key_id.clone(),

@@ -94,6 +94,29 @@ RED before, each fix reverted alone: I630 fails on all three backends with `I630
 
 Existing assertions moved with the arm: the signed route matrix's "unrelated registered signer" step on all three backends, sqlite's signed-occurrence `signer_acts_for` arm and its signed-revocation (3b) arm, and the three I76 arms in `key_grant_invariants`. All now assert `federation_signer_not_acting_for`.
 
+#### #1042 follow-ups B and C (Edge's adopt of 84e6f502, CIRISEdge#858)
+
+**B. A row that names no signer is malformed, not the gap.** A row with an empty `attesting_key_id` reached the signer lookup and was refused `AttesterKeyUnknown { attesting_key_id: "" }`, labelled retryable, though no Key row can ever land for `""`. Every `AttesterKeyUnknown` is now built by one constructor, `Error::unknown_signer(id, plane)`. For an empty or blank id it returns a terminal `Error::InvalidArgument` ("`{plane}: the row names no signer …`"). All 11 construction sites go through it: the attestation door on memory, sqlite and postgres; the shared envelope verifier; the key plane; `identity_occurrence` (2); `identity_occurrence_revocation`; `transport_destination`; `touch_claim`; and `touch_claim_cosigner`. The key plane already refused an empty `scrub_key_id` before its lookup (`scrub_key_id must be non-empty for registration`). On the replicated apply that refusal stays the terminal `unverifiable_signature` outcome.
+
+**C. Two refusals Edge matched as prose are typed.** In both, the Display is the previous text, unchanged, so a pinned string still matches, and Python keeps `ValueError`:
+
+- `Error::LicensureDelegatorNotAuthority { attesting_key_id, authority_id, reason, message }`, kind `federation_licensure_delegator_not_authority`, replaces the `InvalidArgument` the licensure door (`check_licensure_delegator_is_authority`) returned. `reason` is a stable token from the new public `admission::licensure_refusal`: `AUTHORITY_ACTS_BY_QUORUM` (`authority_acts_by_quorum`), `NAMED_EDGE_ABSENT`, `NAMED_EDGE_NOT_LICENSE`, `NAMED_EDGE_NOT_ONTO_EMITTER`, `NOT_ON_LIVE_CHAIN` and `NOT_AUTHORITY_AT_RECEIPT`. `LicensureChainBreak::as_str` and `LICENSURE_NOT_AUTHORITY_AT_RECEIPT` now return these constants. Python's message is `federation_licensure_delegator_not_authority: {reason}`.
+- `Error::AccordProposalNonceReused { family_key_id, nonce, existing_proposal_digest }`, kind `federation_accord_proposal_nonce_reused`, token `accord_quorum::ACCORD_PROPOSAL_NONCE_REUSED`, replaces the `Conflict` from #1047's single-use check (all three backends). Python's message is the kind, so it no longer reads `federation_conflict`.
+
+| Variant / refusal | Mapping |
+|---|---|
+| empty or blank signer id → `Error::InvalidArgument` | **refused** (terminal): malformed |
+| `federation::Error::LicensureDelegatorNotAuthority` (`authority_acts_by_quorum` and the other reasons) | **refused** (terminal) |
+| `federation::Error::AccordProposalNonceReused` (`accord_proposal_nonce_reused`) | **refused** (terminal) |
+
+Witnesses, each on memory, sqlite and postgres:
+
+- **I632** (`attester_key_unknown_invariants.rs`): an empty signer is `InvalidArgument` from the lookup's own guard at the attestation door, the shared envelope verifier and the signed occurrence door. The key plane refuses it with its pre-existing guard, and the replicated apply returns `unverifiable_signature`.
+- The licensure witnesses (`licensure_chain_invariants.rs`, through `must_refuse_as`, including `authority_acts_by_quorum` under a `majority` affiliation, and the #1049 `not_authority_at_receipt` arm) now also assert the kind, the typed `reason` and the unchanged Display prefix.
+- I629 asserts the typed nonce refusal (family, nonce, existing digest, kind) and its unchanged Display. The Python witness matches `federation_accord_proposal_nonce_reused`.
+
+Mutants, each restored: B's guard off turns I632 red on all three backends (`got federation_attester_key_unknown (AttesterKeyUnknown { attesting_key_id: "" … })`). That is also the RED-before state. The licensure door returning the old `InvalidArgument`, and the `reason` pinned to `not_on_live_chain_at_asserted_at`, each turn 9 licensure witnesses red across the backends. The nonce refusal back to `Conflict` turns I629 red on all three.
+
 ### Added — a stored Key row that fails verification is replaced by a passing one (`InvalidReplaced`) (#1044)
 
 CIRISServer's legacy `register_user_key` fallback stored user Keys whose scrub signatures cover the owner-binding bytes rather than the registration envelope. Such a row passes `verify_key_registration` steps 1 to 4 and fails step 5, the hybrid verify. It is served to every peer and refused by every stranger's Insert. When the holder re-signed, the incoming record was refused `conflicting_version`, `downgrade`, `re_scrub` or `already_anchored_identical`, because first-seen-wins presumes the stored row is a valid record. Server measured 0 such rows on the canonical, so no production row waits on this door; it is the class fix.

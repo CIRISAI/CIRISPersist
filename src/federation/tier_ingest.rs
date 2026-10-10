@@ -320,10 +320,7 @@ where
     let attester = directory
         .lookup_public_key(attesting_key_id)
         .await?
-        .ok_or_else(|| Error::AttesterKeyUnknown {
-            attesting_key_id: attesting_key_id.to_owned(),
-            plane: "signed_envelope",
-        })?;
+        .ok_or_else(|| Error::unknown_signer(attesting_key_id, "signed_envelope"))?;
 
     // (3) Strict hybrid verify: Ed25519 (over canonical) AND ML-DSA-65 (over
     // the bound canonical || classical_sig) both REQUIRED. A classical-only /

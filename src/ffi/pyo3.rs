@@ -34344,6 +34344,13 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         // (ValueError), so it keeps that type; the KIND
         // (`federation_signer_not_acting_for`) marks it retryable.
         crate::federation::Error::SignerDoesNotActFor { .. } => PyValueError::new_err(kind),
+        // v54.1.0 (CIRISPersist#1042 follow-up C) — typed out of
+        // `InvalidArgument` / `Conflict` (both ValueError); same type, and the
+        // licensure reason token rides with the kind.
+        crate::federation::Error::LicensureDelegatorNotAuthority { reason, .. } => {
+            PyValueError::new_err(format!("{kind}: {reason}"))
+        }
+        crate::federation::Error::AccordProposalNonceReused { .. } => PyValueError::new_err(kind),
         // Conflict → ValueError too; lens-side maps to 409.
         crate::federation::Error::Conflict(_) => PyValueError::new_err(kind),
         // v2.4.0 (CIRISPersist#102 Ask 3) — admission-gate rejections

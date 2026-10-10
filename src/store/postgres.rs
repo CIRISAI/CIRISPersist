@@ -6629,10 +6629,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 // v54.1.0 (CIRISPersist#1042) — the ORDERING gap, typed apart
                 // from a bad signature (retryable once the Key row lands).
                 None => {
-                    return Err(crate::federation::Error::AttesterKeyUnknown {
-                        attesting_key_id: row.attesting_key_id.clone(),
-                        plane: "attestation",
-                    });
+                    return Err(crate::federation::Error::unknown_signer(&row.attesting_key_id, "attestation"));
                 }
             };
             // AV-76 D2 — the lookup above is a hard DATA dependency of the

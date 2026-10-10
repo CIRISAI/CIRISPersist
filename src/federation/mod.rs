@@ -9538,6 +9538,52 @@ pub enum Error {
         plane: &'static str,
     },
 
+    /// v54.1.0 (CIRISPersist#1042 follow-up C, CIRISEdge#858) — a
+    /// `licensure:{A}` row that claims a delegation (`delegation_id`) is not
+    /// the authority's own issuance on a live `license` chain from `A` (CC
+    /// 3.3.9 / CC 4.4.3.4.3). **Refused, terminal for these bytes.** Before
+    /// v54.1.0 this was an [`Error::InvalidArgument`] whose prose an adopter had
+    /// to prefix-match; `reason` is now the stable token, one of
+    /// [`admission::licensure_refusal`]'s constants (the
+    /// [`admission::LicensureChainBreak`] tokens and
+    /// `not_authority_at_receipt`). The Display is the pre-v54.1 text,
+    /// unchanged. Stable `kind()` token
+    /// `federation_licensure_delegator_not_authority`; Python `ValueError`, the
+    /// type of the `InvalidArgument` arm it replaces.
+    #[error("invalid argument: {message}")]
+    LicensureDelegatorNotAuthority {
+        /// The row's emitter.
+        attesting_key_id: String,
+        /// The `authority_id` the row's `licensure:{A}` dimension names.
+        authority_id: String,
+        /// Why: an [`admission::licensure_refusal`] token.
+        reason: &'static str,
+        /// The full refusal text (the Display).
+        message: String,
+    },
+
+    /// v54.1.0 (CIRISPersist#1042 follow-up C, CIRISEdge#858;
+    /// CIRISPersist#1047) — an `accord_proposal` whose proposer-minted nonce
+    /// already names a DIFFERENT proposal in its family. **Refused, terminal
+    /// for these bytes**: single use is the substrate's dedup. Before it was an
+    /// [`Error::Conflict`] whose prose an adopter had to prefix-match; the
+    /// stable token is [`accord_quorum::ACCORD_PROPOSAL_NONCE_REUSED`] and the
+    /// Display is the previous text, unchanged. Stable `kind()` token
+    /// `federation_accord_proposal_nonce_reused`; Python `ValueError`, the type
+    /// of the `Conflict` arm it replaces.
+    #[error(
+        "conflicts with existing row: accord_proposal_nonce_reused: nonce {nonce:?} in family \
+         {family_key_id:?} already names proposal {existing_proposal_digest}"
+    )]
+    AccordProposalNonceReused {
+        /// The proposal's family.
+        family_key_id: String,
+        /// The reused nonce.
+        nonce: String,
+        /// The digest of the proposal the nonce already names.
+        existing_proposal_digest: String,
+    },
+
     /// A write quota refused this row. `reason` names WHICH budget —
     /// per-peer, per-node, reserved-family, or the untracked tail — and in
     /// which regime (burst vs sustained); see [`PeerQuotaRefusal`].
@@ -11686,6 +11732,24 @@ pub enum Error {
 }
 
 impl Error {
+    /// v54.1.0 (CIRISPersist#1042 follow-up B, CIRISEdge#858) — the refusal
+    /// for a signer this node holds no Key row for. THE one constructor of
+    /// [`Error::AttesterKeyUnknown`]: a row that names NO signer (an empty or
+    /// blank id) is malformed, a terminal [`Error::InvalidArgument`], never the
+    /// retryable ordering gap — no Key row can ever land for `""`.
+    pub(crate) fn unknown_signer(attesting_key_id: &str, plane: &'static str) -> Self {
+        if attesting_key_id.trim().is_empty() {
+            return Error::InvalidArgument(format!(
+                "{plane}: the row names no signer (empty attesting key id) — malformed, not an \
+                 ordering gap"
+            ));
+        }
+        Error::AttesterKeyUnknown {
+            attesting_key_id: attesting_key_id.to_owned(),
+            plane,
+        }
+    }
+
     /// Stable string-token for telemetry / structured logging.
     pub fn kind(&self) -> &'static str {
         match self {
@@ -11694,6 +11758,10 @@ impl Error {
             Error::SignatureInvalid(_) => "federation_signature_invalid",
             Error::AttesterKeyUnknown { .. } => "federation_attester_key_unknown",
             Error::SignerDoesNotActFor { .. } => "federation_signer_not_acting_for",
+            Error::LicensureDelegatorNotAuthority { .. } => {
+                "federation_licensure_delegator_not_authority"
+            }
+            Error::AccordProposalNonceReused { .. } => "federation_accord_proposal_nonce_reused",
             Error::RateLimited { .. } => "federation_rate_limited",
             Error::ConsentGateRefused(_) => "federation_consent_gate_refused",
             Error::ConsentScopeTokenInvalid { .. } => "federation_consent_scope_token_invalid",

@@ -674,9 +674,9 @@ def test_accord_live_quorum_ffi_302():
             json.dumps({"proposal": proposal, "authority_signature": None})
         )
         # Single use: a different proposal reusing the nonce in this family
-        # is refused (Conflict -> ValueError).
+        # is refused (typed, ValueError).
         reuse = dict(proposal, window_until="2030-01-01T00:00:00Z")
-        with pytest.raises(ValueError, match="federation_conflict"):
+        with pytest.raises(ValueError, match="federation_accord_proposal_nonce_reused"):
             eng.put_accord_proposal_json(
                 json.dumps({"proposal": reuse, "authority_signature": None})
             )

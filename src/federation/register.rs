@@ -1494,10 +1494,7 @@ where
         let signer = directory
             .lookup_public_key(&record.scrub_key_id)
             .await?
-            .ok_or_else(|| Error::AttesterKeyUnknown {
-                attesting_key_id: record.scrub_key_id.clone(),
-                plane: "key_registration",
-            })?;
+            .ok_or_else(|| Error::unknown_signer(&record.scrub_key_id, "key_registration"))?;
         (signer.pubkey_ed25519_base64, signer.pubkey_ml_dsa_65_base64)
     };
 

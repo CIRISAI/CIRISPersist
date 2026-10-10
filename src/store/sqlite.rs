@@ -5217,10 +5217,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             // hold is the ORDERING gap (retryable once its Key row lands),
             // typed apart from a bad signature; it read as `InvalidArgument`.
             let attesting_identity_type = attesting_identity_type.ok_or_else(|| {
-                crate::federation::Error::AttesterKeyUnknown {
-                    attesting_key_id: row.attesting_key_id.clone(),
-                    plane: "attestation",
-                }
+                crate::federation::Error::unknown_signer(&row.attesting_key_id, "attestation")
             })?;
             // AV-76 D2 — the lookup above is a hard DATA dependency of the
             // dimension policy here (`attesting_identity_type`); the pair

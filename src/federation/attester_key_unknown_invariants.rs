@@ -421,6 +421,82 @@ pub(crate) mod bodies {
             .await
             .expect("I631: without the fault the same row verifies");
     }
+
+    /// `e` is a terminal `InvalidArgument`, never the retryable gap.
+    fn expect_malformed(e: &Error, what: &str) {
+        // The key plane refuses an empty `scrub_key_id` before its lookup (its
+        // own pre-existing guard); every other door reaches the lookup's.
+        assert!(
+            matches!(e, Error::InvalidArgument(m)
+                if m.contains("names no signer") || m.contains("scrub_key_id must be non-empty")),
+            "{what}: a row naming no signer is malformed (InvalidArgument, from the signer \
+             lookup's own guard), got {} ({e:?})",
+            e.kind()
+        );
+    }
+
+    /// **I632 (#1042 follow-up B, CIRISEdge#858) — a row that names NO signer
+    /// is malformed, never the retryable gap.** No Key row can ever land for
+    /// `""`, so an empty signer id reaching a door's signer lookup is a
+    /// terminal `InvalidArgument` (before: `AttesterKeyUnknown { "" }`). Run
+    /// through the key plane (direct and replicated, where it is the terminal
+    /// `unverifiable_signature` outcome), the attestation door, the signed
+    /// occurrence door, and the shared envelope verifier.
+    pub async fn i632_empty_signer_is_malformed(d: &dyn FederationDirectory, s: &str) {
+        // Key plane: a record scrubbed by "".
+        let k = format!("i632-k-{s}");
+        let record = ts::replicated_key_record(&k, AGENT, "", "", "n1");
+        let direct = register::verify_key_registration(d, &record)
+            .await
+            .expect_err("I632: a record scrubbed by nobody");
+        expect_malformed(&direct, "I632 key plane (direct)");
+        let out = d
+            .apply_replicated_key_record(SignedKeyRecord { record })
+            .await
+            .expect("I632: a refusal is an outcome");
+        assert_eq!(
+            out,
+            ReplicatedKeyOutcome::Refused {
+                reason: KeyRefusalReason::UnverifiableSignature
+            },
+            "I632 key plane (replicated): terminal, not attester_key_unknown"
+        );
+
+        // Attestation door: a row whose attesting_key_id is "".
+        let row = scored_row("", &format!("i632-a-{s}"));
+        let e = d
+            .put_attestation(SignedAttestation {
+                attestation: row.clone(),
+            })
+            .await
+            .expect_err("I632: a row naming no attester");
+        expect_malformed(&e, "I632 attestation door");
+
+        // The shared envelope verifier, directly.
+        let e = crate::federation::tier_ingest::verify_envelope_hybrid_signature(
+            d,
+            "",
+            &row.attestation_envelope,
+            &row.scrub_signature_classical,
+            row.scrub_signature_pqc.as_deref(),
+        )
+        .await
+        .expect_err("I632: the verifier with no signer");
+        expect_malformed(&e, "I632 signed_envelope");
+
+        // Signed occurrence door: signed by "".
+        let identity = format!("i632-id-{s}");
+        let occ = format!("i632-occ-{s}");
+        ts::register_identity_key(d, &identity, USER).await;
+        ts::register_identity_key(d, &occ, AGENT).await;
+        let signed =
+            ts::signed_content_only_occurrence("", &identity, &occ, chrono::Utc::now()).await;
+        let e = d
+            .put_identity_occurrence(signed)
+            .await
+            .expect_err("I632: an occurrence signed by nobody");
+        expect_malformed(&e, "I632 identity_occurrence");
+    }
 }
 
 #[cfg(test)]
@@ -451,6 +527,11 @@ mod run {
                 async fn i630_signer_not_acting_for_is_retryable() {
                     let Some(b) = $fresh.await else { return };
                     bodies::i630_signer_not_acting_for_is_retryable(&b, &super::suffix()).await
+                }
+                #[tokio::test]
+                async fn i632_empty_signer_is_malformed() {
+                    let Some(b) = $fresh.await else { return };
+                    bodies::i632_empty_signer_is_malformed(&b, &super::suffix()).await
                 }
                 #[tokio::test]
                 async fn i631_lookup_failure_is_not_a_verdict() {

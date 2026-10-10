@@ -65,15 +65,20 @@ pub(crate) struct PreparedProposal {
     pub created_at: DateTime<Utc>,
 }
 
+/// v54.1.0 (CIRISPersist#1042 follow-up C) — the stable refusal token of
+/// [`Error::AccordProposalNonceReused`].
+pub const ACCORD_PROPOSAL_NONCE_REUSED: &str = "accord_proposal_nonce_reused";
+
 /// v54.1.0 (CIRISPersist#1047) — the refusal of a proposal whose
 /// proposer-minted nonce already names `other` (a different proposal) in its
 /// family. Single use is the substrate's dedup (verify checks the nonce's
-/// form); `Conflict`, the same type as a second vote by one holder (M6).
+/// form). Typed (#1042 follow-up C): [`Error::AccordProposalNonceReused`].
 pub(crate) fn nonce_reused(proposal: &AccordProposal, other: &str) -> Error {
-    Error::Conflict(format!(
-        "accord_proposal_nonce_reused: nonce {:?} in family {:?} already names proposal {other}",
-        proposal.nonce, proposal.family_key_id
-    ))
+    Error::AccordProposalNonceReused {
+        family_key_id: proposal.family_key_id.clone(),
+        nonce: proposal.nonce.clone(),
+        existing_proposal_digest: other.to_owned(),
+    }
 }
 
 /// v54.1.0 (CIRISPersist#1047) — the postgres advisory-lock key a
@@ -379,11 +384,23 @@ pub(crate) mod test_fixtures {
         reuse.window_until = "2030-01-01T00:00:00Z".to_owned();
         assert_ne!(reuse.digest(), digest);
         match backend.put_accord_proposal(reuse.clone(), None).await {
-            Err(Error::Conflict(m)) => assert!(
-                m.starts_with("accord_proposal_nonce_reused") && m.contains(&digest),
-                "I629: the refusal names the reuse and the proposal the nonce names: {m}"
-            ),
-            other => panic!("I629: a reused nonce must be refused Conflict, got {other:?}"),
+            Err(e @ Error::AccordProposalNonceReused { .. }) => {
+                assert_eq!(e.kind(), "federation_accord_proposal_nonce_reused");
+                assert!(
+                    matches!(&e, Error::AccordProposalNonceReused { family_key_id, nonce: n, existing_proposal_digest }
+                        if *family_key_id == family && *n == nonce && *existing_proposal_digest == digest),
+                    "I629: the refusal names the family, the nonce and the proposal it names: {e:?}"
+                );
+                // The Display is the pre-typing text, unchanged (adopters pinned it).
+                assert!(
+                    e.to_string().starts_with(&format!(
+                        "conflicts with existing row: {}: nonce",
+                        crate::federation::accord_quorum::ACCORD_PROPOSAL_NONCE_REUSED
+                    )),
+                    "I629: {e}"
+                );
+            }
+            other => panic!("I629: a reused nonce must be refused typed, got {other:?}"),
         }
         assert!(
             backend
