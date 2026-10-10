@@ -204,3 +204,8 @@ decimal_id	claim_id	repo	path#symbol	crate@version
 3.2	CLM-canonical-founders-accord	CIRISPersist	src/federation/membership_acceptance.rs#node_seated_without_acceptance	ciris-persist@54.0.0
 3.2	CLM-attach-unlabelled	CIRISPersist	src/federation/trust_root.rs#direction_denied_ids	ciris-persist@54.0.0
 3.2	CLM-attach-unlabelled	CIRISPersist	src/federation/trust_root.rs#names_no_trust_job	ciris-persist@54.0.0
+4.1.1	CLM-anti-pattern-delegation	CIRISPersist	src/federation/admission.rs#check_delegation_cycle_admission	ciris-persist@54.0.0
+4.1.1	CLM-self-edge-not-cycle	CIRISPersist	src/federation/admission.rs#check_delegation_cycle_admission	ciris-persist@54.0.0
+4.1.1	CLM-self-edge-not-cycle	CIRISPersist	src/federation/admission.rs#is_trust_plane_edge	ciris-persist@54.0.0
+4.4.3.2.8	CLM-affiliation-config-record	CIRISPersist	src/federation/affiliation_config.rs#check_community_record	ciris-persist@54.0.0
+4.4.3.2.8	CLM-affiliation-config-record	CIRISPersist	src/federation/affiliation_config.rs#declared_cohort	ciris-persist@54.0.0

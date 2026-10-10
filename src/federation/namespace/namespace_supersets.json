@@ -15654,6 +15654,46 @@
     "manifest_round": "backfill-1052"
    },
    {
+    "decimal_id": "4.1.1",
+    "claim_id": "CLM-anti-pattern-delegation",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/admission.rs#check_delegation_cycle_admission",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-repin-15-1052"
+   },
+   {
+    "decimal_id": "4.1.1",
+    "claim_id": "CLM-self-edge-not-cycle",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/admission.rs#check_delegation_cycle_admission",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-repin-15-1052"
+   },
+   {
+    "decimal_id": "4.1.1",
+    "claim_id": "CLM-self-edge-not-cycle",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/admission.rs#is_trust_plane_edge",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-repin-15-1052"
+   },
+   {
+    "decimal_id": "4.4.3.2.8",
+    "claim_id": "CLM-affiliation-config-record",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/affiliation_config.rs#check_community_record",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-repin-15-1052"
+   },
+   {
+    "decimal_id": "4.4.3.2.8",
+    "claim_id": "CLM-affiliation-config-record",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/affiliation_config.rs#declared_cohort",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-repin-15-1052"
+   },
+   {
     "decimal_id": "3.1.9.4",
     "claim_id": "CLM-nsproc-class-dual-scope-gate-watchlist-id",
     "repo": "CIRISPersist",

@@ -232,6 +232,22 @@ its 174 rows (4.1.1 `CLM-delegation-depth-default` among them) had no entry in
   Each direction was also shown red on the real tree. release.sh's bump re-stamps, then requires
   `evidence_tsv.py check` before it commits; the release self-test runs that path on a fixture
   (red before the re-stamp, green after) and is red if the check leaves the bump stage.
+- **Rows for three claims v54.0.0 shipped and published nothing under** (CC re-pin 15), added
+  through the export and the generator, each at its claim's own section and at the function
+  production runs:
+  - 4.1.1 `CLM-anti-pattern-delegation` and `CLM-self-edge-not-cycle`:
+    `admission.rs#check_delegation_cycle_admission`. Every backend's `put_attestation_with_origin`
+    and `check_promotion_admission` call it. The self-edge exemption and the trust-plane exclusion
+    are its first two clauses, so the self-edge claim also cites `admission.rs#is_trust_plane_edge`.
+    `delegation_cycle_invariants.rs` is the witness, not the gate.
+  - 4.4.3.2.8 `CLM-affiliation-config-record`: `affiliation_config.rs#check_community_record` (every
+    backend's `put_community_at_door`, and supersession through `group_amendment`) and
+    `#declared_cohort`.
+  - Not added: `CLM-licence-judged-at-issuance` and `CLM-licence-authority-quorum`. v54.0.0
+    judges a licence at receipt as well as at the signed `asserted_at` (the CC says never at
+    receipt; the signed-instant rule alone lands with #1049's window). It also roots a community
+    authority only under `founder_only`; any other protocol is refused (`authority_acts_by_quorum`)
+    because cosigned licensure rows are #1036's plane move.
 
 ### Changed — Verify 20.1.0 adopted: the three verify crates and the wheel floor move together (#992)
 
