@@ -34340,6 +34340,10 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         // `FederationTierUnverified`, both ValueError); the KIND tells a
         // retryable `federation_attester_key_unknown` apart.
         crate::federation::Error::AttesterKeyUnknown { .. } => PyValueError::new_err(kind),
+        // v54.1.0 (CIRISPersist#1042 follow-up) — split from `SignatureInvalid`
+        // (ValueError), so it keeps that type; the KIND
+        // (`federation_signer_not_acting_for`) marks it retryable.
+        crate::federation::Error::SignerDoesNotActFor { .. } => PyValueError::new_err(kind),
         // Conflict → ValueError too; lens-side maps to 409.
         crate::federation::Error::Conflict(_) => PyValueError::new_err(kind),
         // v2.4.0 (CIRISPersist#102 Ask 3) — admission-gate rejections

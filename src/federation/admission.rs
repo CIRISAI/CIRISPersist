@@ -5385,7 +5385,7 @@ async fn check_signer_acts_for(
     directory: &dyn super::FederationDirectory,
     attesting_key_id: &str,
     identity_key_id: &str,
-    what: &str,
+    plane: &'static str,
 ) -> Result<(), Error> {
     if attesting_key_id == identity_key_id {
         return Ok(());
@@ -5415,10 +5415,15 @@ async fn check_signer_acts_for(
             .any(|o| o.occurrence_key_id == attesting_key_id)
     };
     if !acts_for {
-        return Err(Error::SignatureInvalid(format!(
-            "signed {what}: signer {attesting_key_id} is neither identity {identity_key_id} \
-             nor an active occurrence of it, nor a node it owns"
-        )));
+        // v54.1.0 (CIRISPersist#1042 follow-up, CIRISEdge#858) — the signature
+        // VERIFIED; what is missing is the binding or occurrence that lets this
+        // signer vouch, which on a fresh node may simply not have landed yet
+        // (#776). Typed apart from `SignatureInvalid`, which stays terminal.
+        return Err(Error::SignerDoesNotActFor {
+            attesting_key_id: attesting_key_id.to_owned(),
+            identity_key_id: identity_key_id.to_owned(),
+            plane,
+        });
     }
     Ok(())
 }

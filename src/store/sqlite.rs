@@ -37750,9 +37750,11 @@ mod tests {
         let err = backend.put_identity_occurrence(wrong).await.expect_err(
             "a signer who is neither the identity nor its active occurrence must be rejected",
         );
-        assert_eq!(err.kind(), "federation_signature_invalid");
-        assert!(
-            format!("{err}").contains("neither identity"),
+        // v54.1.0 (#1042 follow-up) — `signer_acts_for`'s refusal is typed apart
+        // from a bad signature: the retryable `federation_signer_not_acting_for`.
+        assert_eq!(
+            err.kind(),
+            "federation_signer_not_acting_for",
             "(4) the refusal must be `signer_acts_for`'s, not a subject-binding or signature \
              failure standing in for it: {err}"
         );

@@ -9508,6 +9508,36 @@ pub enum Error {
         plane: &'static str,
     },
 
+    /// v54.1.0 (CIRISPersist#1042 follow-up, CIRISEdge#858) — **the signer
+    /// does not act for the identity the row is about YET.** The signature
+    /// verified, but `attesting_key_id` is neither `identity_key_id` itself,
+    /// nor an ACTIVE occurrence of it, nor a node it owns through a live
+    /// owner binding. On a fresh node that is an ordering gap: the owner
+    /// binding or the occurrence that lets this signer vouch has not landed
+    /// (the #776 standup race). Nothing is stored or marked; the SAME row is
+    /// admitted when it is re-offered after that binding or occurrence lands.
+    ///
+    /// **Retryable.** Before v54.1.0 this read as [`Error::SignatureInvalid`],
+    /// which is now terminal on every door: it means only that a signature
+    /// does not verify (or the signed bytes are malformed). Stable `kind()`
+    /// token `federation_signer_not_acting_for`; Python `ValueError`, the type
+    /// of the arm it was split from. Raised by `admission::check_signer_acts_for`.
+    #[error(
+        "{plane}: signer {attesting_key_id} does not act for {identity_key_id} on this node yet \
+         (not that identity, an active occurrence of it, nor a node it owns) — re-offer the row \
+         after the binding or occurrence lands"
+    )]
+    SignerDoesNotActFor {
+        /// The row's signer.
+        attesting_key_id: String,
+        /// The identity the row is about (for `transport_destination`, the
+        /// route's `occurrence_key_id`; for `touch_claim`, the touched target).
+        identity_key_id: String,
+        /// The door: `identity_occurrence`, `identity_occurrence_revocation`,
+        /// `transport_destination` or `touch_claim`.
+        plane: &'static str,
+    },
+
     /// A write quota refused this row. `reason` names WHICH budget —
     /// per-peer, per-node, reserved-family, or the untracked tail — and in
     /// which regime (burst vs sustained); see [`PeerQuotaRefusal`].
@@ -11663,6 +11693,7 @@ impl Error {
             Error::InvalidArgument(_) => "federation_invalid_argument",
             Error::SignatureInvalid(_) => "federation_signature_invalid",
             Error::AttesterKeyUnknown { .. } => "federation_attester_key_unknown",
+            Error::SignerDoesNotActFor { .. } => "federation_signer_not_acting_for",
             Error::RateLimited { .. } => "federation_rate_limited",
             Error::ConsentGateRefused(_) => "federation_consent_gate_refused",
             Error::ConsentScopeTokenInvalid { .. } => "federation_consent_scope_token_invalid",

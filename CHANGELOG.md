@@ -66,6 +66,32 @@ Witnesses in `src/federation/attester_key_unknown_invariants.rs`, each on memory
 
 RED before the fix, with every fix site reverted: all nine fail. I613 reads `registration signer (scrub_key_id=…) is not registered`, I614 reads `signed identity_occurrence: attesting_key_id … is not a registered federation key` and I615 reads `invalid argument: attesting_key_id … does not exist in federation_keys`. With only the Insert arms reverted, I613 fails on all three backends with `a refusal is an outcome, never a bare Err: AttesterKeyUnknown { … }`. Mutation: collapsing `AttesterKeyUnknown` into `UnverifiableSignature` in `key_refusal_of_verify_error` turns I613 red on all three backends.
 
+#### #1042 follow-ups from Edge's adopt (CIRISEdge#858)
+
+**The signer-acts-for arm is its own retryable variant.** `check_signer_acts_for` is the check that the signer is the identity itself, an ACTIVE occurrence of it, or a node it owns through a live owner binding. It returned `Error::SignatureInvalid` when none held. The signature had verified at that point, and on a fresh node the usual cause is ordering: the binding or occurrence that lets this signer vouch has not landed yet (the #776 standup race, which Edge's `occurrence_before_binding_776` relies on staying re-askable). It now returns `federation::Error::SignerDoesNotActFor { attesting_key_id, identity_key_id, plane }`, kind `federation_signer_not_acting_for`. Python raises `ValueError`, the type of the `SignatureInvalid` arm it was split from. The doors that ask it, by `plane`:
+
+- `identity_occurrence`: `put_identity_occurrence`, signed and content-only.
+- `identity_occurrence_revocation`: `put_identity_occurrence_revocation`.
+- `transport_destination`: `put_signed_transport_destination`. `identity_key_id` is the route's `occurrence_key_id`.
+- `touch_claim`: `put_touch_claim` with `SignerForm::SelfTouch`. `identity_key_id` is the touched target.
+
+A registered key that will never be bound, a peer asserting a victim's route for example, gets the same token, because at admission it is indistinguishable from a binding that has not arrived yet. The re-offer is the sender's to bound.
+
+| Variant | Mapping |
+|---|---|
+| `federation::Error::SignerDoesNotActFor` | **retryable**: re-offer the same row after the signer's owner binding or occurrence lands |
+
+**`SignatureInvalid` is now terminal on every door.** It means the signature does not verify, or the signed bytes are malformed or unbound: a hash mismatch, a missing ML-DSA half, an envelope that does not bind its subject, a `touch_claim` signer form whose shape is wrong (attester equals target, no co-signature set, too few distinct valid co-signers). Nothing that can still land can change any of those. How I checked: `grep -rn 'SignatureInvalid(' src --include=*.rs`, excluding comments, `SignatureInvalid(_)` match arms and the `_invariants.rs` witnesses, leaves the variant definition and 16 construction sites. Those are `register.rs` 3 (subject binding, content-hash mismatch, hybrid verify) and `admission.rs` 13: occurrence verdict and hybrid verify, missing ML-DSA, revocation and route hybrid verify, the six touch-claim signature and shape sites, and the two PQC-attach sites. Each was read. The unknown-signer and unknown-co-signer lookups next to them already return `AttesterKeyUnknown` (#1042 above), and the signer-acts-for arm was the only one that depended on directory state that can still arrive.
+
+**The shared envelope verifier propagates a backend failure.** In `tier_ingest::verify_envelope_hybrid_signature`, a FAILED `lookup_public_key` (the backend erred, not "no row") went through the verdict path and became `FederationTierUnverified`, the terminal token. It now propagates as the backend's own error, as `register::verify_key_registration`'s twin does. A transient storage failure is not a verdict on the row. This verifier serves attestations, revocations, families, communities, memberships, location proofs and every other envelope-signed row.
+
+Witnesses in `src/federation/attester_key_unknown_invariants.rs`, each on memory, sqlite and postgres:
+
+- **I630**: on each of the four doors, a registered signer whose signature verifies but who is not yet an active occurrence of the identity is refused `federation_signer_not_acting_for`, naming the signer, the identity and the door. Once the occurrence lands, the same row admits.
+- **I631**: `verify_envelope_hybrid_signature` over the `FaultInjectingDirectory` with `lookup_public_key` erroring returns `Error::Backend("injected backend failure: …")`. Over the same directory without the fault, the row verifies.
+
+Existing assertions moved with the arm: the signed route matrix's "unrelated registered signer" step on all three backends, sqlite's signed-occurrence `signer_acts_for` arm, and the three I76 arms in `key_grant_invariants`. All now assert `federation_signer_not_acting_for`.
+
 ### Added — a stored Key row that fails verification is replaced by a passing one (`InvalidReplaced`) (#1044)
 
 CIRISServer's legacy `register_user_key` fallback stored user Keys whose scrub signatures cover the owner-binding bytes rather than the registration envelope. Such a row passes `verify_key_registration` steps 1 to 4 and fails step 5, the hybrid verify. It is served to every peer and refused by every stranger's Insert. When the holder re-signed, the incoming record was refused `conflicting_version`, `downgrade`, `re_scrub` or `already_anchored_identical`, because first-seen-wins presumes the stored row is a valid record. Server measured 0 such rows on the canonical, so no production row waits on this door; it is the class fix.

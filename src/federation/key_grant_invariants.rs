@@ -2088,10 +2088,9 @@ pub mod two_node {
             .put_identity_occurrence(sign(i, e, at).await)
             .await
             .expect_err("{tag} I76: an unbound node cannot vouch for itself");
-        assert!(
-            err.to_string().contains("neither identity")
-                || err.to_string().contains("acts for")
-                || err.to_string().contains("nor a node it owns"),
+        assert_eq!(
+            err.kind(),
+            "federation_signer_not_acting_for",
             "{tag} I76: the refusal is signer_acts_for: {err}"
         );
         // (2) alice's live owner binding lifts the node: admitted, advertised.
@@ -2161,10 +2160,9 @@ pub mod two_node {
             .put_identity_occurrence(sign(i, e, at).await)
             .await
             .expect_err("{tag} I76: a node bound to alice cannot claim carol");
-        assert!(
-            err.to_string().contains("neither identity")
-                || err.to_string().contains("acts for")
-                || err.to_string().contains("nor a node it owns"),
+        assert_eq!(
+            err.kind(),
+            "federation_signer_not_acting_for",
             "{tag} I76: {err}"
         );
         // (10) Hybrid-only (operator directive) — a content-only occurrence
@@ -2370,9 +2368,9 @@ pub mod two_node {
                 .expect_err(
                 "{tag} I76: the row a prior admission left never vouches without the live binding",
             );
-            assert!(
-                err.to_string().contains("neither identity")
-                    || err.to_string().contains("acts for"),
+            assert_eq!(
+                err.kind(),
+                "federation_signer_not_acting_for",
                 "{tag} I76: {err}"
             );
         }
