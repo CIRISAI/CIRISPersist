@@ -7,7 +7,7 @@ threat-model citations because this crate's audit story is the point.
 
 ## [Unreleased]
 
-## [54.1.0] - unreleased
+## [54.1.0] - UNRELEASED
 
 ### Added — the generic steward purge door (#1046, CIRISConstitution#165, CSD-108)
 
