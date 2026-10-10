@@ -78,6 +78,10 @@
 //!   notice can lift (the accountability record; a composer without its
 //!   target): a quorum-cosigned bundle naming a held `moderation_track_record`
 //!   row is `purge_retraction_inadmissible` with nothing written.
+//! - **I669** — a v54.1 node REFUSES a CIRISAgent#1249 trace
+//!   (`trace_schema_version` 2.8.0, `run_kind` signed) whole at the
+//!   schema-version gate, `schema_unsupported_version`, nothing written —
+//!   never stripped, never admitted unverifiable.
 //! - **I666** — a `key:` (or `federation_keys:`) id is not a purge record:
 //!   `purge_selection_malformed`, naming `key:revocation` as key retirement's
 //!   own act.
@@ -1420,6 +1424,31 @@ pub(crate) mod bodies {
         }
     }
 
+    // ── I669 ──────────────────────────────────────────────────────────────
+    /// What a v54.1 node does with the first CIRISAgent#1249 trace
+    /// (`trace_format` v2.8.0, `run_kind` in the signed envelope): it REFUSES
+    /// the whole batch at the schema-version gate, `schema_unsupported_version`,
+    /// before any write — it never strips the field and never admits a trace
+    /// whose signed bytes it cannot reconstruct.
+    pub(crate) async fn i669_a_run_kind_trace_format_is_refused_whole<D: Seams>(d: &D) {
+        let mut trace = trace_json("trace-i669", AGENT, "gpt-real", Some("production"));
+        trace["trace_schema_version"] = serde_json::json!("2.8.0");
+        let mut body: serde_json::Value = serde_json::from_slice(&batch(&trace)).unwrap();
+        body["trace_schema_version"] = serde_json::json!("2.8.0");
+        let e = ingest(d, body.to_string().as_bytes())
+            .await
+            .expect_err("a v2.8.0 trace is refused, not stripped");
+        assert_eq!(e.kind(), "schema_unsupported_version", "I669: {e}");
+        assert_eq!(
+            d.as_dyn_directory()
+                .purge_trace_row_counts(&["trace-i669".to_owned()])
+                .await
+                .unwrap(),
+            (0, 0),
+            "I669: nothing written"
+        );
+    }
+
     // ── I668 ──────────────────────────────────────────────────────────────
     pub(crate) async fn i668_the_receiver_re_asks_admissibility<D: Seams>(d: &D) {
         root(d).await;
@@ -1772,6 +1801,11 @@ mod run {
                         return;
                     };
                     b::i656_the_tombstone_replicates_re_verified(&a, &c, &e).await
+                }
+                #[tokio::test]
+                async fn i669() {
+                    let Some(d) = $fresh.await else { return };
+                    b::i669_a_run_kind_trace_format_is_refused_whole(&d).await
                 }
                 #[tokio::test]
                 async fn i668() {
