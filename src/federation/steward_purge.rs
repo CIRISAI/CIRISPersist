@@ -99,7 +99,7 @@ pub mod token {
 }
 
 /// The `takedown_notice` basis that authorises a steward purge (CC 3.3.2
-/// `LegalBasis::StewardPurge`, CIRISConstitution rc8@9ce73e6).
+/// `LegalBasis::StewardPurge`, CIRISConstitution rc8@af6b436).
 pub const STEWARD_PURGE_BASIS: &str = "steward_purge";
 
 /// The sample a dry run shows: the first N record ids in JCS order (CSD-108
@@ -1132,7 +1132,7 @@ pub struct PurgeExecution {
     /// authorised it.
     pub claimant_key_id: String,
     /// The notice's `legal_basis` (CC 3.3.2). One tombstone row serves
-    /// takedown and purge (CIRISConstitution rc8@9ce73e6, CC 4.5.3): the
+    /// takedown and purge (CIRISConstitution rc8@af6b436, CC 4.5.3): the
     /// basis is what tells a `steward_purge` (cosigned, any plane, hard
     /// delete after settle) from a duty-holder takedown (bytes plane only;
     /// an immediate-removal basis destroys on receipt — the v55 door,
@@ -1845,7 +1845,7 @@ where
 
 // ── #1040: the mock-run trace refusal (CC 3.1.5, CIRISConstitution#166) ──
 
-/// CIRISConstitution#166 (rc8@9ce73e6) — the refusal token for a trace whose
+/// CIRISConstitution#166 (rc8@af6b436) — the refusal token for a trace whose
 /// signed `run_kind` is `mock`.
 pub const TRACE_RUN_KIND_MOCK: &str = "trace_run_kind_mock";
 

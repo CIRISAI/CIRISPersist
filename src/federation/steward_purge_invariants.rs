@@ -59,7 +59,7 @@
 //!   harness-prefix builder the operator dropped (harness rows on production
 //!   stay; Server selects by actor or by ids when it needs a purge).
 //! - **I664** — one tombstone row for takedown and purge (CC 4.5.3,
-//!   CIRISConstitution rc8@9ce73e6): a header with ANOTHER basis (a
+//!   CIRISConstitution rc8@af6b436): a header with ANOTHER basis (a
 //!   duty-holder `ncmec_csam` takedown, the v55 #1007 door's row) and its
 //!   bytes-plane tombstone round-trip through the store with their basis
 //!   intact, and the ledger names the basis.

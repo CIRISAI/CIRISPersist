@@ -11,7 +11,7 @@ threat-model citations because this crate's audit story is the point.
 
 ### Added — the generic steward purge door (#1046, CIRISConstitution#165, CSD-108)
 
-CC basis: **CIRISConstitution rc8@9ce73e6** (#165: CC 2.4.1.1 "a purge is a tombstone, not a `withdraws`", CC 3.3.2 `LegalBasis::StewardPurge`, CC 4.5.3 "one tombstone row for takedown and purge").
+CC basis: **CIRISConstitution rc8@af6b436** (#165: CC 2.4.1.1 "a purge is a tombstone, not a `withdraws`", CC 3.3.2 `LegalBasis::StewardPurge`, CC 4.5.3 "one tombstone row for takedown and purge").
 
 `federation::steward_purge` extends `evict_actor`'s bytes-plane purge to any row selection, authorised under global trust-root moderation, with an evidence ledger. Nothing runs on its own: every purge is an explicit call on a notice the trust root's quorum cosigned, and production execution is the operator's go only.
 
@@ -46,7 +46,7 @@ CC basis: **CIRISConstitution rc8@9ce73e6** (#165: CC 2.4.1.1 "a purge is a tomb
 
 ### Added — the federation tier refuses mock runs (#1040)
 
-CC basis: **CIRISConstitution rc8@9ce73e6** (#166, CC 3.1.5: every trace carries `run_kind`, closed vocabulary `production | qa | battery | mock`; `mock` is refused at federation-tier admission).
+CC basis: **CIRISConstitution rc8@af6b436** (#166, CC 3.1.5: every trace carries `run_kind`, closed vocabulary `production | qa | battery | mock`; `mock` is refused at federation-tier admission).
 
 `trace_run_kind_mock`: a federation-tier `trace:complete:v1` attestation whose embedded trace declares `run_kind: "mock"` is refused at the attestation put (local and replicated) and at the tier-crossing promotion door, on memory, sqlite and postgres; a local-tier row is kept (QA). Trace ingest refuses a mock run on a node holding the `canonical` role (its own verified role), zero rows written for the batch; a node without it keeps the trace. Keyed on the signed `run_kind`, never on the model name. **No trace carries `run_kind` yet** (it arrives with CIRISAgent#1249's schema bump, which also adds it to the signed canonical bytes), so until then this gate refuses nothing; ingest reads the member from the wire body because the typed `CompleteTrace` does not carry it. The purge class for the traces already held (`mock_model_traces`) keys on `model = 'mock-model'`, which is what identifies them today.
 
