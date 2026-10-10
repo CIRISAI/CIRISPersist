@@ -1759,6 +1759,47 @@ where
     };
     let live = resolved.counts();
     check_counts(&terms, &live)?;
+    // The receiver re-asks what no notice can lift, whole or not at all: the
+    // accountability record and a composer without its target. A
+    // `delegates_to` is the exception: the bundle does not carry the
+    // selection's parties, and the quorum's digest binds the list.
+    let selected_attestations: BTreeSet<String> = records
+        .iter()
+        .filter(|r| r.plane == PurgePlane::Attestation)
+        .map(|r| r.id.clone())
+        .collect();
+    for (index, record) in records.iter().enumerate() {
+        if record.plane != PurgePlane::Attestation {
+            continue;
+        }
+        let Some(row) = directory.get_attestation(&record.id).await? else {
+            continue;
+        };
+        let facts = RowFacts::of(&row);
+        let verdict = match retraction_admissible(&facts, &selected_attestations, &BTreeSet::new())
+        {
+            Err(_)
+                if facts.accountability.is_none()
+                    && facts.exclusion == Some(super::migration::ExclusionClass::Delegation) =>
+            {
+                Ok(())
+            }
+            v => v,
+        };
+        if let Err(reason) = verdict {
+            return Err(refused(
+                token::RETRACTION_INADMISSIBLE,
+                serde_json::json!({
+                    "notice_id": terms.notice_id,
+                    "record_id": record.record_id(),
+                    "plane": record.plane.as_str(),
+                    "index": index,
+                    "total": records.len(),
+                    "reason": reason,
+                }),
+            ));
+        }
+    }
     let notice_jcs = String::from_utf8(notice_signing_bytes(&bundle.notice.envelope)?)
         .map_err(|e| Error::Backend(format!("notice JCS is not UTF-8: {e}")))?;
     let cosignatures_json = serde_json::to_string(&bundle.notice.cosignatures)

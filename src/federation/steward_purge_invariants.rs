@@ -74,6 +74,10 @@
 //!   rc8@af6b436): a row of each of `revocation:*`, `key:revocation`,
 //!   `moderation:*`, `moderation_track_record:*` and `slashing:*` is
 //!   inadmissible by that clause — refused by id, withheld by a class.
+//! - **I668** — the receiver of a replicated bundle re-asks the rules no
+//!   notice can lift (the accountability record; a composer without its
+//!   target): a quorum-cosigned bundle naming a held `moderation_track_record`
+//!   row is `purge_retraction_inadmissible` with nothing written.
 //! - **I666** — a `key:` (or `federation_keys:`) id is not a purge record:
 //!   `purge_selection_malformed`, naming `key:revocation` as key retirement's
 //!   own act.
@@ -1416,6 +1420,48 @@ pub(crate) mod bodies {
         }
     }
 
+    // ── I668 ──────────────────────────────────────────────────────────────
+    pub(crate) async fn i668_the_receiver_re_asks_admissibility<D: Seams>(d: &D) {
+        root(d).await;
+        let dir = d.as_dyn_directory();
+        let t = now();
+        // A quorum-cosigned bundle that no origin door would have produced:
+        // it names an accountability record this receiver holds.
+        let held =
+            put_local_dimension(d, HARNESS, "moderation_track_record:ciris-canonical:v1").await;
+        let plain = put_score(d, SCORER, AGENT, &[]).await.attestation_id;
+        let mut ids = vec![
+            format!("attestation:{held}"),
+            format!("attestation:{plain}"),
+        ];
+        ids.sort();
+        let template = serde_json::json!({
+            "legal_basis": sp::STEWARD_PURGE_BASIS,
+            "content_sha256": sp::selection_digest(&ids),
+            "content_holder_key_ids": [],
+        });
+        let bundle = sp::PurgeBundle {
+            notice: notice_for(&template, &[cc::FOUNDERS[0], cc::FOUNDERS[1]], t),
+            record_ids: ids.clone(),
+            derived_from: vec![String::new(); ids.len()],
+            admitted_at: t,
+        };
+        let e = sp::apply_replicated_purge(dir, &bundle, "node-b", t)
+            .await
+            .expect_err("the receiver re-asks the unconditional rules");
+        let (tok, body) = refusal(&e);
+        assert_eq!(tok, token::RETRACTION_INADMISSIBLE, "I668: {body}");
+        assert_eq!(body["record_id"], format!("attestation:{held}"));
+        // Whole or not at all: the plain row is not tombstoned either.
+        let notice_id = sp::notice_terms(&bundle.notice.envelope).unwrap().notice_id;
+        assert!(dir.purge_execution(&notice_id).await.unwrap().is_none());
+        assert!(dir
+            .purge_tombstones_of(&notice_id)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
     // ── I659 ──────────────────────────────────────────────────────────────
     /// A trace whose LLM call reports `model` and which declares `run_kind`
     /// (absent when `None`, as every pre-CIRISAgent#1249 trace is).
@@ -1726,6 +1772,11 @@ mod run {
                         return;
                     };
                     b::i656_the_tombstone_replicates_re_verified(&a, &c, &e).await
+                }
+                #[tokio::test]
+                async fn i668() {
+                    let Some(d) = $fresh.await else { return };
+                    b::i668_the_receiver_re_asks_admissibility(&d).await
                 }
                 #[tokio::test]
                 async fn i667() {
