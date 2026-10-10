@@ -69,6 +69,10 @@
 //!   executed and finalized the key is still registered, its door still admits
 //!   it, its unselected row still verifies, and a row it signs afterwards
 //!   verifies.
+//! - **I667** — CLM-accountability-record-unpurgeable (CIRISConstitution
+//!   rc8@af6b436): a row of each of `revocation:*`, `key:revocation`,
+//!   `moderation:*`, `moderation_track_record:*` and `slashing:*` is
+//!   inadmissible by that clause — refused by id, withheld by a class.
 //! - **I666** — a `key:` (or `federation_keys:`) id is not a purge record:
 //!   `purge_selection_malformed`, naming `key:revocation` as key retirement's
 //!   own act.
@@ -1322,6 +1326,81 @@ pub(crate) mod bodies {
         assert_eq!(refusal(&e).0, token::SELECTION_MALFORMED);
     }
 
+    // ── I667 ──────────────────────────────────────────────────────────────
+    /// A local-tier row by `attester` whose dimension is `dimension`.
+    async fn put_local_dimension<D: Seams>(d: &D, attester: &str, dimension: &str) -> String {
+        let local = crate::federation::types::LocalAttestationInput {
+            attestation_id: None,
+            attesting_key_id: attester.to_owned(),
+            attested_key_id: Some(BYSTANDER.to_owned()),
+            attestation_type: attestation_type::SCORES.to_owned(),
+            weight: None,
+            expires_at: None,
+            attestation_envelope: crate::federation::envelope::EnvelopeCore::from_value(
+                serde_json::json!({"dimension": dimension, "score": 0.0}),
+            )
+            .expect("object"),
+            subject_key_ids: vec![BYSTANDER.to_owned()],
+            cohort_scope: crate::federation::types::cohort_scope::SELF.to_owned(),
+            scrub_signature_classical: None,
+            scrub_signature_pqc: None,
+        };
+        d.attestation_insert_local(local).await.expect("local row")
+    }
+
+    pub(crate) async fn i667_the_accountability_record_is_unpurgeable<D: Seams>(d: &D) {
+        root(d).await;
+        let dir = d.as_dyn_directory();
+        let t = now();
+        let mut ids = Vec::new();
+        for dimension in [
+            "revocation:peer:fraud:v1",
+            "key:revocation:v1",
+            "moderation:spam:v1",
+            "moderation_track_record:ciris-canonical:v1",
+            "slashing:upheld:v1",
+        ] {
+            let id = put_local_dimension(d, HARNESS, dimension).await;
+            ids.push((dimension, format!("attestation:{id}")));
+        }
+        // By ids: every one is inadmissible, by the accountability clause.
+        let sel = PurgeSelection::ByIds {
+            ids: ids.iter().map(|(_, id)| id.clone()).collect(),
+        };
+        let dry = sp::purge_dry_run(dir, &sel).await.unwrap();
+        let mut problems = Vec::new();
+        for (dimension, id) in &ids {
+            match dry.inadmissible.iter().find(|w| w.record_id == *id) {
+                None => problems.push(format!("{dimension}: SLIPPED THROUGH")),
+                Some(w) if !w.reason.contains("CLM-accountability-record-unpurgeable") => {
+                    problems.push(format!(
+                        "{dimension}: refused by another clause ({})",
+                        w.reason
+                    ));
+                }
+                Some(_) => {}
+            }
+        }
+        assert!(problems.is_empty(), "I667:\n{}", problems.join("\n"));
+        let n = notice_for(&dry.notice_template, &[cc::FOUNDERS[0], cc::FOUNDERS[1]], t);
+        let e = sp::purge_rows(dir, &sel, &n, NODE, t)
+            .await
+            .expect_err("the accountability record is unpurgeable");
+        assert_eq!(refusal(&e).0, token::RETRACTION_INADMISSIBLE, "I667");
+        // By actor: the class withholds them all.
+        let by = PurgeSelection::ByActor {
+            key_id: HARNESS.to_owned(),
+        };
+        let dry = sp::purge_dry_run(dir, &by).await.unwrap();
+        for (dimension, id) in &ids {
+            assert!(
+                dry.withheld.iter().any(|w| w.record_id == *id),
+                "I667: by-actor did not withhold the {dimension} row"
+            );
+            assert!(!dry.sample.contains(id));
+        }
+    }
+
     // ── I659 ──────────────────────────────────────────────────────────────
     /// A trace whose LLM call reports `model` and which declares `run_kind`
     /// (absent when `None`, as every pre-CIRISAgent#1249 trace is).
@@ -1632,6 +1711,11 @@ mod run {
                         return;
                     };
                     b::i656_the_tombstone_replicates_re_verified(&a, &c, &e).await
+                }
+                #[tokio::test]
+                async fn i667() {
+                    let Some(d) = $fresh.await else { return };
+                    b::i667_the_accountability_record_is_unpurgeable(&d).await
                 }
                 #[tokio::test]
                 async fn i665() {

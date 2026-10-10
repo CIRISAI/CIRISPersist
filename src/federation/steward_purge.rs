@@ -489,6 +489,7 @@ fn is_hex64(s: &str) -> bool {
 #[derive(Debug, Clone)]
 struct RowFacts {
     id: String,
+    accountability: Option<&'static str>,
     attesting: String,
     attested: String,
     exclusion: Option<super::migration::ExclusionClass>,
@@ -509,6 +510,8 @@ impl RowFacts {
             .map(str::to_owned);
         Self {
             id: row.attestation_id.clone(),
+            accountability: super::admission::envelope_dimension(&row.attestation_envelope)
+                .and_then(accountability_family),
             attesting: row.attesting_key_id.clone(),
             attested: row.attested_key_id.clone(),
             exclusion: super::migration::is_exclusion_bearing(row),
@@ -523,11 +526,34 @@ impl RowFacts {
     }
 }
 
+/// CLM-accountability-record-unpurgeable (CIRISConstitution rc8@af6b436) —
+/// the dimension families the text names EXACTLY as the unpurgeable
+/// accountability record. Matched by the purge's own check, not by widening
+/// `migration::ExclusionClass`: its `moderation:` prefix does not reach
+/// `moderation_track_record:*`, and it has no `key:revocation` arm.
+pub const ACCOUNTABILITY_RECORD_PREFIXES: &[&str] = &[
+    "revocation:",
+    "key:revocation",
+    "moderation:",
+    "moderation_track_record:",
+    "slashing:",
+];
+
+/// The accountability family `dimension` belongs to, if any.
+fn accountability_family(dimension: &str) -> Option<&'static str> {
+    ACCOUNTABILITY_RECORD_PREFIXES
+        .iter()
+        .copied()
+        .find(|p| dimension.starts_with(p))
+}
+
 /// **Is this attestation's retraction admissible inside this selection?**
 /// `Err(reason)` when not. The door's own gate (AV-9): the purge deletes what
 /// the migration purge door (`migration::check_purge_admission`) protects, so
 /// it re-asks the protecting question with the selection in view:
 ///
+/// - an accountability record ([`ACCOUNTABILITY_RECORD_PREFIXES`]) → NEVER
+///   admissible, whatever the selection;
 /// - not exclusion-bearing → admissible;
 /// - a structural composer (`withdraws` / `recants` / `supersedes`) →
 ///   admissible only when the row it retracts is in the selection too
@@ -543,6 +569,12 @@ fn retraction_admissible(
     parties: &BTreeSet<String>,
 ) -> Result<(), String> {
     use super::migration::ExclusionClass;
+    if let Some(family) = facts.accountability {
+        return Err(format!(
+            "a `{family}` row is the accountability record, unpurgeable by any selection \
+             (CLM-accountability-record-unpurgeable)"
+        ));
+    }
     match facts.exclusion {
         None => Ok(()),
         Some(ExclusionClass::StructuralComposer) => match &facts.references {
