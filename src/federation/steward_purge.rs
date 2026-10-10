@@ -106,10 +106,14 @@ pub const STEWARD_PURGE_BASIS: &str = "steward_purge";
 /// §6 Q6). A VIEW of the ledger, which holds every id.
 pub const SAMPLE_LEN: usize = 20;
 
-/// How long after execution the retraction round is taken as settled
-/// (FSD `HELD_RECORD_SETTLE.md`; CSD-108 §6 Q4). `purge_finalize` refuses
-/// before it ([`token::NOT_SETTLED`]).
-pub const PURGE_SETTLE_DWELL_SECS: i64 = 24 * 3600;
+/// How long after the tombstone the retraction round is taken as settled:
+/// `W` = 72 h (259 200 s), the CC 2.6.7 / 4.2.6 "until everyone has heard"
+/// constant (CIRISConstitution rc8@af6b436; operator-confirmed 2026-10-09).
+/// NOT the 24 h lone-holder halt fuse, which is a different thing. There is
+/// no peer-acknowledgement plane: settle is this stated dwell.
+/// `purge_finalize` refuses before it ([`token::NOT_SETTLED`]). ONE named
+/// constant, so a different ruling is a one-line change.
+pub const PURGE_SETTLE_DWELL_SECS: i64 = 259_200;
 
 /// The model id the agent's mock LLM reports (CIRISPersist#1040:
 /// `ciris_adapters/mock_llm`). It is what identifies the mock traces already

@@ -883,11 +883,19 @@ pub(crate) mod bodies {
         let report = sp::purge_rows(dir, &mock_selection(), &notice, NODE, t)
             .await
             .unwrap();
-        let e = sp::purge_finalize(dir, &report.notice_id, t + chrono::Duration::hours(1), None)
-            .await
-            .expect_err("not settled");
-        let (tok, body) = refusal(&e);
-        assert_eq!(tok, token::NOT_SETTLED, "I655: {body}");
+        // Settle is W = 72 h after the tombstone (CC 2.6.7, CIRISConstitution
+        // rc8@af6b436): still unsettled after an hour, and after the 24 h
+        // lone-holder fuse (a different constant).
+        for early in [
+            chrono::Duration::hours(1),
+            chrono::Duration::hours(24) + chrono::Duration::seconds(1),
+        ] {
+            let e = sp::purge_finalize(dir, &report.notice_id, t + early, None)
+                .await
+                .expect_err("not settled");
+            let (tok, body) = refusal(&e);
+            assert_eq!(tok, token::NOT_SETTLED, "I655 at +{early}: {body}");
+        }
         assert!(
             dir.get_attestation(&derived).await.unwrap().is_some(),
             "nothing deleted"
