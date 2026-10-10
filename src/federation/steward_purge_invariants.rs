@@ -4,10 +4,13 @@
 //!
 //! - **I650** — authorisation is the trust root's own `consensus_protocol`
 //!   over a cosigned `takedown_notice` of basis `steward_purge`: no
-//!   cosignature, one founder of a `quorum:2/3`, an accord holder who is not a
-//!   founder, a forged signature, another basis, an expired notice and a
-//!   claimant that is not a rooted trust root are each `purge_unauthorised`,
-//!   and nothing is written.
+//!   cosignature, one founder of a `quorum:2/3`, one founder plus a seat the
+//!   protocol does not count, an accord holder who holds no seat, a forged
+//!   signature, another basis, an expired notice and a claimant that is not a
+//!   rooted trust root are each `purge_unauthorised`, and nothing is written;
+//!   a founder quorum plus a non-founder SEAT executes, the seat among the
+//!   cosigners (CC 2.4 rule 0: the signer set is the roster's, the count the
+//!   protocol's).
 //! - **I651** — a notice whose counts match but whose digest names another
 //!   id list is `purge_selection_digest_mismatch`.
 //! - **I652** — a live selection that grew after the dry run is
@@ -445,13 +448,19 @@ pub(crate) mod bodies {
                 notice_for(&dry.notice_template, &[cc::FOUNDERS[0]], t),
             ),
             (
-                "an accord holder who is not a founder",
+                "an accord holder who holds no seat",
                 notice_for(&dry.notice_template, &[cc::FOUNDERS[0], "A1"], t),
             ),
-            // A quorum of founders does not launder a stranger's cosignature
-            // into the set the bundle carries, nor does a founder count twice.
+            // A seat the protocol does not count is no refusal, but it is no
+            // vote either: under `infrastructure` only founders are eligible.
             (
-                "a founder quorum carrying a non-founder's cosignature",
+                "one founder and a non-founder seat",
+                notice_for(&dry.notice_template, &[cc::FOUNDERS[0], cc::SERVE_NODE], t),
+            ),
+            // A quorum does not launder a stranger's cosignature into the set
+            // the bundle carries, nor does a seat count twice.
+            (
+                "a founder quorum carrying a non-seat's cosignature",
                 notice_for(
                     &dry.notice_template,
                     &[cc::FOUNDERS[0], cc::FOUNDERS[1], "A1"],
@@ -503,14 +512,14 @@ pub(crate) mod bodies {
         // case that an earlier clause happens to refuse cannot stand in.
         let clause = |what: &str| match what {
             "no cosignature" => "carries no cosignature",
-            "one of quorum:2/3" => "consensus_protocol",
+            "one of quorum:2/3" | "one founder and a non-founder seat" => "consensus_protocol",
             "a founder quorum with one founder signing twice" => "signed twice",
             "a forged cosignature" => "does not verify",
             "another basis" => "does not authorise a steward purge",
             "an expired notice" => "expired",
             "a claimant that is not a rooted trust root" => "no community row",
             "a notice without the CC 3.3.2 holder list" => "content_holder_key_ids",
-            _ => "is not a founder",
+            _ => "holds no seat",
         };
         for (what, notice) in cases {
             let e = sp::purge_rows(dir, &sel, &notice, NODE, t)
@@ -527,18 +536,25 @@ pub(crate) mod bodies {
             assert_eq!(e.kind(), "purge_unauthorised", "I650 the kind IS the token");
             assert_nothing_written(d, &notice).await;
         }
-        // The quorum, and only the quorum, executes.
-        let report = sp::purge_rows(dir, &sel, &ok, NODE, t)
-            .await
-            .expect("2-of-3 founders");
-        assert_eq!(
-            report.cosigners,
-            vec![cc::FOUNDERS[1].to_owned(), cc::FOUNDERS[0].to_owned()]
-                .into_iter()
-                .collect::<std::collections::BTreeSet<_>>()
-                .into_iter()
-                .collect::<Vec<_>>()
+        // The quorum executes, and a non-founder SEAT's verifying cosignature
+        // rides along (CC 2.4 rule 0: the signer set is the roster's, the
+        // count is the protocol's).
+        let with_seat = notice_for(
+            &dry.notice_template,
+            &[cc::FOUNDERS[0], cc::FOUNDERS[1], cc::SERVE_NODE],
+            t,
         );
+        let report = sp::purge_rows(dir, &sel, &with_seat, NODE, t)
+            .await
+            .expect("2-of-3 founders, plus a seat");
+        let mut expect = vec![
+            cc::FOUNDERS[0].to_owned(),
+            cc::FOUNDERS[1].to_owned(),
+            cc::SERVE_NODE.to_owned(),
+        ];
+        expect.sort();
+        assert_eq!(report.cosigners, expect, "I650");
+        let _ = ok;
     }
 
     // ── I651 ──────────────────────────────────────────────────────────────

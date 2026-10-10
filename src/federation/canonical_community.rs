@@ -3755,8 +3755,8 @@ where
 ///
 /// The question is asked about the SIGNERS, never the subject: the envelope is
 /// judged only as bytes (`accord_family_signing_bytes`, JCS), and the answer is
-/// the set of founders whose hybrid signature over those bytes verified and
-/// whose seat the protocol counted.
+/// the set of seats whose hybrid signature over those bytes verified, judged
+/// by the protocol (CC 2.4 rule 0, CC 3.2 T2; CIRISConstitution rc8@af6b436).
 ///
 /// - The row at `community_key_id` must be TRUST-ROOT GRADE and **ROOTED** now
 ///   ([`stored_standing_at`], which answers `NotRooted` for a row that is not
@@ -3764,12 +3764,15 @@ where
 ///   duty authorises a steward purge, CC 4.5.5). A stalled root is valid but non-admitting (CC
 ///   3.2 T7): it confers nothing new, and an authorisation is something new.
 ///   An unrooted squat authorises nothing.
-/// - Every offered signature must be a distinct RECORDED FOUNDER of the held
-///   head whose hybrid signature verifies against that founder's stored key.
-///   One that does not is a refusal, not a discount: evidence that does not
-///   verify is never carried as decoration (the roster-row rule, I190 (b)).
-/// - The seats are the head's members (`node`-bearing seats dropped under
-///   `infrastructure`), evaluated by [`super::consensus::evaluate`] with
+/// - Every offered signature must be a distinct SEAT of the held head (any
+///   member, whatever its role) whose hybrid signature verifies against that
+///   seat's stored key. One that does not is a refusal, not a discount:
+///   evidence that does not verify is never carried as decoration (the
+///   roster-row rule, I190 (b)).
+/// - WHICH seats count is the protocol's, never a hard-coded founders rule:
+///   the head's members under its own `cohort_subkind` (`infrastructure`
+///   makes only non-`node`-bearing founders eligible, CC 3.2 "infrastructure
+///   does not vote"), evaluated by [`super::consensus::evaluate`] with
 ///   [`super::consensus::Direction::Add`] — a purge is not a protective
 ///   removal, so no reverse-quorum single-signer arm applies.
 ///
@@ -3819,13 +3822,17 @@ where
             )))
         }
     };
-    let head_founders = founders(&head.community);
     let mut memo = Memo::at(now);
     let mut signers = std::collections::BTreeSet::new();
     for sig in signatures {
-        if !head_founders.contains(&sig.member_id.as_str()) {
+        if !head
+            .community
+            .members
+            .iter()
+            .any(|m| m.key_id == sig.member_id)
+        {
             return Ok(Err(format!(
-                "cosigner {:?} is not a founder of the trust root {community_key_id:?}",
+                "cosigner {:?} holds no seat on the trust root {community_key_id:?}",
                 sig.member_id
             )));
         }
@@ -3868,7 +3875,7 @@ where
     }
     let verdict = super::consensus::evaluate(&super::consensus::Ballot {
         protocol: &head.community.consensus_protocol,
-        subkind: Some(COHORT_SUBKIND_INFRASTRUCTURE),
+        subkind: super::community_subkind(&head.community),
         policy_blob: head.community.policy_blob.as_ref(),
         roster: &seats,
         signers: &signers,
