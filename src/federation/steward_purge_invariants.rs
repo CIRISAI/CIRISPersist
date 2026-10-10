@@ -15,11 +15,12 @@
 //!   id list is `purge_selection_digest_mismatch`.
 //! - **I652** — a live selection that grew after the dry run is
 //!   `purge_selection_count_mismatch {table, expected, found}`; there is no
-//!   override.
+//!   override. A notice without the OPTIONAL `selection_counts` is
+//!   well-formed, and the same drift is then the digest's to refuse.
 //! - **I653** — an inadmissible retraction (a `withdraws` whose target is not
-//!   purged with it) STOPS the door at its index: `purge_retraction_inadmissible
-//!   {record_id, plane, index, total}`; everything before it stays retracted
-//!   and a retry writes no tombstone twice.
+//!   purged with it) ABORTS the purge: `purge_retraction_inadmissible
+//!   {record_id, plane, index, total}`, with nothing written, on every attempt
+//!   — whole or not at all (CC 4.5.3, CIRISConstitution rc8@c69129c).
 //! - **I654** — #1040's class end to end: the mock-model traces, their own
 //!   trace attestations and the score derived from them are ONE selection; the
 //!   dry run is read-only, its sample is the first ids in JCS order, the
@@ -598,6 +599,15 @@ pub(crate) mod bodies {
         let t = now();
         let dry = sp::purge_dry_run(dir, &mock_selection()).await.unwrap();
         let notice = notice_for(&dry.notice_template, &[cc::FOUNDERS[0], cc::FOUNDERS[1]], t);
+        // `selection_counts` is OPTIONAL (CC 3.3.2, CIRISConstitution
+        // rc8@c69129c): without it the digest alone binds.
+        let mut bare = notice.envelope.clone();
+        bare.as_object_mut().unwrap().remove("selection_counts");
+        let bare = sign(bare, &[cc::FOUNDERS[0], cc::FOUNDERS[1]]);
+        assert!(sp::notice_terms(&bare.envelope)
+            .expect("a notice without selection_counts is well-formed")
+            .selection_counts
+            .is_none());
         // A third mock trace lands after the dry run.
         seed_trace(d, "trace-mock-3-i652", AGENT, sp::MOCK_LLM_MODEL).await;
         let e = sp::purge_rows(dir, &mock_selection(), &notice, NODE, t)
@@ -609,6 +619,12 @@ pub(crate) mod bodies {
         assert_eq!(body["expected"], 3, "I652: {body}");
         assert_eq!(body["found"], 4, "I652: {body}");
         assert_nothing_written(d, &notice).await;
+        // The count-less notice: the same drift is the digest's to refuse.
+        let e = sp::purge_rows(dir, &mock_selection(), &bare, NODE, t)
+            .await
+            .expect_err("digest mismatch");
+        assert_eq!(refusal(&e).0, token::SELECTION_DIGEST_MISMATCH, "I652");
+        assert_nothing_written(d, &bare).await;
     }
 
     // ── I653 ──────────────────────────────────────────────────────────────
@@ -666,15 +682,14 @@ pub(crate) mod bodies {
             assert_eq!(body["plane"], "attestation");
             assert_eq!(body["index"], index);
             assert_eq!(body["total"], 3);
-            let held = dir.purge_tombstones_of(&notice_id).await.unwrap();
-            assert_eq!(
-                held.iter()
-                    .map(sp::PurgeTombstone::record_id)
-                    .collect::<Vec<_>>(),
-                sorted[..index].to_vec(),
-                "I653 attempt {attempt}: everything before the refusal stays retracted, \
-                 nothing after it is touched, nothing twice"
+            assert!(
+                dir.purge_tombstones_of(&notice_id)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "I653 attempt {attempt}: whole or not at all — nothing is tombstoned"
             );
+            assert_nothing_written(d, &notice).await;
         }
         // Purging the target WITH its retraction is admissible.
         let with_target = PurgeSelection::ByIds {

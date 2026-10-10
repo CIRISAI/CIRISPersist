@@ -68,9 +68,9 @@ pub mod token {
     /// The live selection's count for a table is not the notice's
     /// (CIRISPersist#1046, CSD-108 §6 Q2). Body: `{table, expected, found}`.
     pub const SELECTION_COUNT_MISMATCH: &str = "purge_selection_count_mismatch";
-    /// One record's retraction is not admissible; the door stopped there.
-    /// Body: `{record_id, plane, index, total, reason}`. Everything before it
-    /// stays retracted; a retry is idempotent.
+    /// One record's retraction is not admissible: the purge ABORTS with
+    /// nothing written — whole or not at all (CC 4.5.3). Body:
+    /// `{record_id, plane, index, total, reason}`.
     pub const RETRACTION_INADMISSIBLE: &str = "purge_retraction_inadmissible";
     /// `purge_finalize` before the retraction round settled. Body:
     /// `{notice_id, executed_at, settles_at}`.
@@ -954,8 +954,10 @@ pub struct NoticeTerms {
     pub claimant_key_id: String,
     /// The digest the notice authorises.
     pub selection_digest: String,
-    /// Per-table counts the notice authorises.
-    pub selection_counts: BTreeMap<String, u64>,
+    /// Per-table counts the notice authorises, when it carries the OPTIONAL
+    /// `selection_counts` member (CC 3.3.2, CIRISConstitution rc8@c69129c).
+    /// Absent, the digest alone binds the selection.
+    pub selection_counts: Option<BTreeMap<String, u64>>,
     /// The notice's own instant.
     pub asserted_at: chrono::DateTime<chrono::Utc>,
     /// When it stops authorising.
@@ -1032,11 +1034,12 @@ pub fn notice_terms(envelope: &serde_json::Value) -> Result<NoticeTerms, Error> 
             unauth("evidence_refs must name the dry-run ledger (a non-empty string array)".into())
         })?;
     let _ = refs;
-    let selection_counts: BTreeMap<String, u64> = envelope
-        .get("selection_counts")
-        .cloned()
-        .and_then(|v| serde_json::from_value(v).ok())
-        .ok_or_else(|| unauth("selection_counts must be an object of table -> count".into()))?;
+    let selection_counts: Option<BTreeMap<String, u64>> = match envelope.get("selection_counts") {
+        None => None,
+        Some(v) => Some(serde_json::from_value(v.clone()).map_err(|_| {
+            unauth("selection_counts, when present, must be an object of table -> count".into())
+        })?),
+    };
     let instant = |k: &str| -> Result<chrono::DateTime<chrono::Utc>, Error> {
         let raw = s(k)?;
         chrono::DateTime::parse_from_rfc3339(&raw)
@@ -1220,6 +1223,32 @@ where
     Ok(retraction_admissible(&RowFacts::of(&row), selected_attestations, parties).err())
 }
 
+/// The OPTIONAL count check: when the notice carries `selection_counts`, the
+/// live per-table counts must equal them exactly
+/// ([`token::SELECTION_COUNT_MISMATCH`] `{table, expected, found}`).
+fn check_counts(terms: &NoticeTerms, live: &BTreeMap<String, u64>) -> Result<(), Error> {
+    let Some(authorised) = &terms.selection_counts else {
+        return Ok(());
+    };
+    let tables: BTreeSet<&String> = live.keys().chain(authorised.keys()).collect();
+    for table in tables {
+        let expected = authorised.get(table).copied().unwrap_or(0);
+        let found = live.get(table).copied().unwrap_or(0);
+        if expected != found {
+            return Err(refused(
+                token::SELECTION_COUNT_MISMATCH,
+                serde_json::json!({
+                    "notice_id": terms.notice_id,
+                    "table": table,
+                    "expected": expected,
+                    "found": found,
+                }),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// **`purge_rows(selection, notice, now)`** — the door.
 ///
 /// In order, each a typed refusal and none an override:
@@ -1229,12 +1258,14 @@ where
 ///    [`token::SELECTION_COUNT_MISMATCH`] `{table, expected, found}`;
 /// 3. the live selection's digest is the notice's —
 ///    [`token::SELECTION_DIGEST_MISMATCH`];
-/// 4. the header is recorded (idempotent on the notice id), then per record
-///    in JCS order its retraction is re-checked and its tombstone written; an
-///    inadmissible record STOPS the door —
+/// 4. every record's retraction is judged BEFORE anything is written; an
+///    inadmissible one ABORTS the purge —
 ///    [`token::RETRACTION_INADMISSIBLE`] `{record_id, plane, index, total}` —
-///    with everything before it retracted and nothing after it touched. A
-///    retry resumes; a tombstone is never written twice.
+///    with nothing written (whole or not at all, CC 4.5.3, CIRISConstitution
+///    rc8@c69129c);
+/// 5. the header is recorded (idempotent on the notice id), then each
+///    tombstone in JCS order. A retry after a crash resumes; a tombstone is
+///    never written twice.
 ///
 /// Nothing is deleted here: [`purge_finalize`] hard-deletes after the settle.
 ///
@@ -1254,22 +1285,7 @@ where
     let (terms, signers) = verify_purge_authorisation(directory, notice, now).await?;
     let resolved = resolve_selection(directory, selection).await?;
     let live = resolved.counts();
-    let tables: BTreeSet<&String> = live.keys().chain(terms.selection_counts.keys()).collect();
-    for table in tables {
-        let expected = terms.selection_counts.get(table).copied().unwrap_or(0);
-        let found = live.get(table).copied().unwrap_or(0);
-        if expected != found {
-            return Err(refused(
-                token::SELECTION_COUNT_MISMATCH,
-                serde_json::json!({
-                    "notice_id": terms.notice_id,
-                    "table": table,
-                    "expected": expected,
-                    "found": found,
-                }),
-            ));
-        }
-    }
+    check_counts(&terms, &live)?;
     let digest = resolved.digest();
     if digest != terms.selection_digest {
         return Err(refused(
@@ -1283,6 +1299,32 @@ where
     }
     let records = resolved.records;
     let total = records.len() as u64;
+    // Whole or not at all (CC 4.5.3, CIRISConstitution rc8@c69129c): every
+    // retraction is judged BEFORE anything is written, so an inadmissible one
+    // aborts the purge with nothing tombstoned.
+    let selected_attestations: BTreeSet<String> = records
+        .iter()
+        .filter(|r| r.plane == PurgePlane::Attestation)
+        .map(|r| r.id.clone())
+        .collect();
+    let parties = selection.parties();
+    for (index, record) in records.iter().enumerate() {
+        if let Some(reason) =
+            record_inadmissible(directory, record, &selected_attestations, &parties).await?
+        {
+            return Err(refused(
+                token::RETRACTION_INADMISSIBLE,
+                serde_json::json!({
+                    "notice_id": terms.notice_id,
+                    "record_id": record.record_id(),
+                    "plane": record.plane.as_str(),
+                    "index": index,
+                    "total": total,
+                    "reason": reason,
+                }),
+            ));
+        }
+    }
     let notice_jcs = String::from_utf8(notice_signing_bytes(&notice.envelope)?)
         .map_err(|e| Error::Backend(format!("notice JCS is not UTF-8: {e}")))?;
     let cosignatures_json = serde_json::to_string(&notice.cosignatures)
@@ -1303,30 +1345,9 @@ where
             finalized_at: None,
         })
         .await?;
-    let selected_attestations: BTreeSet<String> = records
-        .iter()
-        .filter(|r| r.plane == PurgePlane::Attestation)
-        .map(|r| r.id.clone())
-        .collect();
-    let key_ids = selection.parties();
     let mut tombstoned: BTreeMap<String, u64> = BTreeMap::new();
     let mut already = 0u64;
     for (index, record) in records.iter().enumerate() {
-        if let Some(reason) =
-            record_inadmissible(directory, record, &selected_attestations, &key_ids).await?
-        {
-            return Err(refused(
-                token::RETRACTION_INADMISSIBLE,
-                serde_json::json!({
-                    "notice_id": terms.notice_id,
-                    "record_id": record.record_id(),
-                    "plane": record.plane.as_str(),
-                    "index": index,
-                    "total": total,
-                    "reason": reason,
-                }),
-            ));
-        }
         let inserted = directory
             .purge_put_tombstone(&PurgeTombstone {
                 notice_id: terms.notice_id.clone(),
@@ -1737,22 +1758,7 @@ where
         ..ResolvedSelection::default()
     };
     let live = resolved.counts();
-    let tables: BTreeSet<&String> = live.keys().chain(terms.selection_counts.keys()).collect();
-    for table in tables {
-        let expected = terms.selection_counts.get(table).copied().unwrap_or(0);
-        let found = live.get(table).copied().unwrap_or(0);
-        if expected != found {
-            return Err(refused(
-                token::SELECTION_COUNT_MISMATCH,
-                serde_json::json!({
-                    "notice_id": terms.notice_id,
-                    "table": table,
-                    "expected": expected,
-                    "found": found,
-                }),
-            ));
-        }
-    }
+    check_counts(&terms, &live)?;
     let notice_jcs = String::from_utf8(notice_signing_bytes(&bundle.notice.envelope)?)
         .map_err(|e| Error::Backend(format!("notice JCS is not UTF-8: {e}")))?;
     let cosignatures_json = serde_json::to_string(&bundle.notice.cosignatures)
