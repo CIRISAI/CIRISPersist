@@ -781,6 +781,139 @@ const MIGRATION_LOCK_ID: i64 = 0x6369_7269_7370_7372_i64;
 /// `MIGRATION_LOCK_ID`; the low bytes spell `"rllup"` for greppability.
 const ROLLUP_REFRESH_LOCK_ID: i64 = 0x7263_6972_736c_7570_i64;
 
+/// CIRISPersist#222 — the rollup's whole-bucket recompute: an idempotent
+/// UPSERT re-aggregating the `cirislens.trace_events` rows `source_where`
+/// selects (a full `WHERE …` clause, which must carry the §10.1.4
+/// `cohort_scope NOT IN ('self','family')` filter). `refresh_factor_rollup`
+/// passes its re-fold floor; v54.1.0 (Codex on PR #1057) a steward purge
+/// passes ONE bucket group, after deleting that group's row, so a group the
+/// purge emptied stays gone.
+fn pg_factor_rollup_upsert_sql(source_where: &str) -> String {
+    format!(
+        "INSERT INTO cirislens.trace_events_factor_rollup_1h ( \
+            bucket_start, agent_id_hash, deployment_domain, cohort_scope, \
+            cohort_target_id, trace_count, \
+            csdma_sum, csdma_n, k_eff_sum, k_eff_n, \
+            correlation_risk_sum, correlation_risk_n, \
+            override_trace_count, fragility_trace_count, \
+            conscience_fail_trace_count, entropy_fail_trace_count, \
+            coherence_fail_trace_count, optimization_veto_fail_trace_count, \
+            epistemic_humility_fail_trace_count, \
+            audit_seq_trace_count, audit_sig_trace_count) \
+         WITH bucket_agg AS ( \
+            SELECT \
+               date_trunc('hour', te.ts) AS bucket_start, \
+               te.agent_id_hash AS agent_id_hash, \
+               te.deployment_domain AS deployment_domain, \
+               te.cohort_scope AS cohort_scope, \
+               te.cohort_target_id AS cohort_target_id, \
+               COUNT(DISTINCT te.trace_id)::bigint AS trace_count, \
+               COUNT(DISTINCT te.trace_id) FILTER ( \
+                   WHERE te.event_type = 'CONSCIENCE_RESULT' \
+                     AND (te.payload->>'action_was_overridden')::bool)::bigint \
+                   AS override_trace_count, \
+               COUNT(DISTINCT te.trace_id) FILTER ( \
+                   WHERE (te.payload->>'idma_fragility_flag')::bool)::bigint \
+                   AS fragility_trace_count, \
+               COUNT(DISTINCT te.trace_id) FILTER ( \
+                   WHERE te.event_type = 'CONSCIENCE_RESULT' \
+                     AND (te.payload->>'conscience_passed')::bool = false)::bigint \
+                   AS conscience_fail_trace_count, \
+               COUNT(DISTINCT te.trace_id) FILTER ( \
+                   WHERE te.event_type = 'CONSCIENCE_RESULT' \
+                     AND (te.payload->>'entropy_passed')::bool = false)::bigint \
+                   AS entropy_fail_trace_count, \
+               COUNT(DISTINCT te.trace_id) FILTER ( \
+                   WHERE te.event_type = 'CONSCIENCE_RESULT' \
+                     AND (te.payload->>'coherence_passed')::bool = false)::bigint \
+                   AS coherence_fail_trace_count, \
+               COUNT(DISTINCT te.trace_id) FILTER ( \
+                   WHERE te.event_type = 'CONSCIENCE_RESULT' \
+                     AND (te.payload->>'optimization_veto_passed')::bool = false)::bigint \
+                   AS optimization_veto_fail_trace_count, \
+               COUNT(DISTINCT te.trace_id) FILTER ( \
+                   WHERE te.event_type = 'CONSCIENCE_RESULT' \
+                     AND (te.payload->>'epistemic_humility_passed')::bool = false)::bigint \
+                   AS epistemic_humility_fail_trace_count, \
+               COUNT(DISTINCT te.trace_id) FILTER ( \
+                   WHERE te.audit_sequence_number IS NOT NULL)::bigint \
+                   AS audit_seq_trace_count, \
+               COUNT(DISTINCT te.trace_id) FILTER ( \
+                   WHERE te.audit_signature IS NOT NULL)::bigint \
+                   AS audit_sig_trace_count \
+            FROM cirislens.trace_events te \
+            {source_where} \
+            GROUP BY date_trunc('hour', te.ts), te.agent_id_hash, \
+                     te.deployment_domain, te.cohort_scope, te.cohort_target_id \
+         ), \
+         per_trace_metric AS ( \
+            SELECT \
+               date_trunc('hour', te.ts) AS bucket_start, \
+               te.agent_id_hash AS agent_id_hash, \
+               te.deployment_domain AS deployment_domain, \
+               te.cohort_scope AS cohort_scope, \
+               te.cohort_target_id AS cohort_target_id, \
+               AVG((te.payload->>'csdma_plausibility_score')::float8) AS csdma_val, \
+               AVG((te.payload->>'idma_k_eff')::float8) AS k_eff_val, \
+               AVG((te.payload->>'idma_correlation_risk')::float8) AS corr_val \
+            FROM cirislens.trace_events te \
+            {source_where} \
+            GROUP BY date_trunc('hour', te.ts), te.agent_id_hash, \
+                     te.deployment_domain, te.cohort_scope, te.cohort_target_id, \
+                     te.trace_id \
+         ), \
+         metric_agg AS ( \
+            SELECT bucket_start, agent_id_hash, deployment_domain, cohort_scope, \
+                   cohort_target_id, \
+                   COALESCE(SUM(csdma_val), 0)::float8 AS csdma_sum, \
+                   COUNT(csdma_val)::bigint AS csdma_n, \
+                   COALESCE(SUM(k_eff_val), 0)::float8 AS k_eff_sum, \
+                   COUNT(k_eff_val)::bigint AS k_eff_n, \
+                   COALESCE(SUM(corr_val), 0)::float8 AS correlation_risk_sum, \
+                   COUNT(corr_val)::bigint AS correlation_risk_n \
+            FROM per_trace_metric \
+            GROUP BY bucket_start, agent_id_hash, deployment_domain, cohort_scope, \
+                     cohort_target_id \
+         ) \
+         SELECT \
+            b.bucket_start, b.agent_id_hash, b.deployment_domain, b.cohort_scope, \
+            b.cohort_target_id, b.trace_count, \
+            COALESCE(m.csdma_sum, 0), COALESCE(m.csdma_n, 0), \
+            COALESCE(m.k_eff_sum, 0), COALESCE(m.k_eff_n, 0), \
+            COALESCE(m.correlation_risk_sum, 0), COALESCE(m.correlation_risk_n, 0), \
+            b.override_trace_count, b.fragility_trace_count, \
+            b.conscience_fail_trace_count, b.entropy_fail_trace_count, \
+            b.coherence_fail_trace_count, b.optimization_veto_fail_trace_count, \
+            b.epistemic_humility_fail_trace_count, \
+            b.audit_seq_trace_count, b.audit_sig_trace_count \
+         FROM bucket_agg b \
+         LEFT JOIN metric_agg m ON \
+            b.bucket_start = m.bucket_start \
+            AND b.agent_id_hash IS NOT DISTINCT FROM m.agent_id_hash \
+            AND b.deployment_domain IS NOT DISTINCT FROM m.deployment_domain \
+            AND b.cohort_scope IS NOT DISTINCT FROM m.cohort_scope \
+            AND b.cohort_target_id IS NOT DISTINCT FROM m.cohort_target_id \
+         ON CONFLICT (bucket_start, COALESCE(agent_id_hash,''), \
+                      COALESCE(deployment_domain,''), COALESCE(cohort_scope,''), \
+                      COALESCE(cohort_target_id,'')) \
+         DO UPDATE SET \
+            trace_count = EXCLUDED.trace_count, \
+            csdma_sum = EXCLUDED.csdma_sum, csdma_n = EXCLUDED.csdma_n, \
+            k_eff_sum = EXCLUDED.k_eff_sum, k_eff_n = EXCLUDED.k_eff_n, \
+            correlation_risk_sum = EXCLUDED.correlation_risk_sum, \
+            correlation_risk_n = EXCLUDED.correlation_risk_n, \
+            override_trace_count = EXCLUDED.override_trace_count, \
+            fragility_trace_count = EXCLUDED.fragility_trace_count, \
+            conscience_fail_trace_count = EXCLUDED.conscience_fail_trace_count, \
+            entropy_fail_trace_count = EXCLUDED.entropy_fail_trace_count, \
+            coherence_fail_trace_count = EXCLUDED.coherence_fail_trace_count, \
+            optimization_veto_fail_trace_count = EXCLUDED.optimization_veto_fail_trace_count, \
+            epistemic_humility_fail_trace_count = EXCLUDED.epistemic_humility_fail_trace_count, \
+            audit_seq_trace_count = EXCLUDED.audit_seq_trace_count, \
+            audit_sig_trace_count = EXCLUDED.audit_sig_trace_count"
+    )
+}
+
 /// v24.1.0 (CIRISPersist#559) — **the migration phase runs once per process,
 /// per database, and every wait in it is bounded.**
 ///
@@ -4687,6 +4820,37 @@ impl PostgresBackend {
             .map_err(|e| crate::federation::Error::Backend(e.to_string()))
     }
 
+    /// v54.1.0 (Codex on PR #1057) — TEST SEAM: run the lazy rollup refresh
+    /// from the stored watermark, as a fleet read would.
+    #[cfg(test)]
+    pub async fn test_seam_refresh_factor_rollup(&self) -> Result<(), crate::read::Error> {
+        self.refresh_factor_rollup(None).await
+    }
+
+    /// v54.1.0 (Codex on PR #1057) — TEST SEAM: `trace_count` of every
+    /// `trace_events_factor_rollup_1h` row of `agent_id_hash`, by bucket.
+    #[cfg(test)]
+    pub async fn test_seam_factor_rollup_trace_counts(
+        &self,
+        agent_id_hash: &str,
+    ) -> Result<Vec<i64>, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        client
+            .query(
+                "SELECT trace_count FROM cirislens.trace_events_factor_rollup_1h \
+                 WHERE agent_id_hash = $1 ORDER BY bucket_start",
+                &[&agent_id_hash],
+            )
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?
+            .iter()
+            .map(|r| r.safe_get_with::<i64, _, _, _>(0, crate::federation::Error::Backend))
+            .collect()
+    }
+
     /// v54.1.0 (Codex on PR #1057) — TEST SEAM: drop one stored tombstone of
     /// a notice, reproducing a header whose set is partial (the state the
     /// pre-fix, non-atomic write could leave). Nothing else moves.
@@ -5906,6 +6070,28 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         if !tombstoned {
             return Ok((0, 0));
         }
+        // Codex on PR #1057 — the rollup groups this trace was folded into,
+        // read BEFORE its rows go, and recomputed in this transaction: the
+        // lazy refresh revisits only the watermark tail and only upserts
+        // groups that still have source rows. The refreshers' advisory lock,
+        // taken blocking, so no refresh computed over the pre-purge rows
+        // commits after this one.
+        tx.execute(
+            "SELECT pg_advisory_xact_lock($1)",
+            &[&ROLLUP_REFRESH_LOCK_ID],
+        )
+        .await
+        .map_err(|e| crate::federation::Error::Backend(format!("purge rollup lock: {e}")))?;
+        let groups = tx
+            .query(
+                "SELECT DISTINCT date_trunc('hour', ts) AS bucket_start, agent_id_hash, \
+                    deployment_domain, cohort_scope, cohort_target_id \
+                 FROM cirislens.trace_events \
+                 WHERE trace_id = $1 AND cohort_scope NOT IN ('self','family')",
+                &[&trace_id],
+            )
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("purge rollup groups: {e}")))?;
         let calls = tx
             .execute(
                 "DELETE FROM cirislens.trace_llm_calls WHERE trace_id = $1",
@@ -5920,9 +6106,50 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             )
             .await
             .map_err(|e| crate::federation::Error::Backend(format!("purge trace events: {e}")))?;
+        let recompute = pg_factor_rollup_upsert_sql(
+            "WHERE te.cohort_scope NOT IN ('self','family') \
+               AND date_trunc('hour', te.ts) = $1 \
+               AND te.agent_id_hash IS NOT DISTINCT FROM $2 \
+               AND te.deployment_domain IS NOT DISTINCT FROM $3 \
+               AND te.cohort_scope IS NOT DISTINCT FROM $4 \
+               AND te.cohort_target_id IS NOT DISTINCT FROM $5",
+        );
+        let mut buckets = Vec::with_capacity(groups.len());
+        for g in &groups {
+            let bucket: chrono::DateTime<chrono::Utc> =
+                g.safe_get_with(0, crate::federation::Error::Backend)?;
+            let agent: Option<String> = g.safe_get_with(1, crate::federation::Error::Backend)?;
+            let domain: Option<String> = g.safe_get_with(2, crate::federation::Error::Backend)?;
+            let scope: Option<String> = g.safe_get_with(3, crate::federation::Error::Backend)?;
+            let target: Option<String> = g.safe_get_with(4, crate::federation::Error::Backend)?;
+            let key: [&(dyn tokio_postgres::types::ToSql + Sync); 5] =
+                [&bucket, &agent, &domain, &scope, &target];
+            tx.execute(
+                "DELETE FROM cirislens.trace_events_factor_rollup_1h \
+                 WHERE bucket_start = $1 AND agent_id_hash IS NOT DISTINCT FROM $2 \
+                   AND deployment_domain IS NOT DISTINCT FROM $3 \
+                   AND cohort_scope IS NOT DISTINCT FROM $4 \
+                   AND cohort_target_id IS NOT DISTINCT FROM $5",
+                &key,
+            )
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("purge rollup delete: {e}")))?;
+            tx.execute(recompute.as_str(), &key).await.map_err(|e| {
+                crate::federation::Error::Backend(format!("purge rollup recompute: {e}"))
+            })?;
+            buckets.push(bucket);
+        }
         tx.commit()
             .await
             .map_err(|e| crate::federation::Error::Backend(format!("commit: {e}")))?;
+        // The aggregate caches hold the purged trace until their TTL; evict
+        // every window holding one of its buckets.
+        for bucket in buckets {
+            self.scoring_factors_cache
+                .invalidate_write(bucket.timestamp_millis());
+            self.repo_stats_cache
+                .invalidate_write(bucket.timestamp_millis());
+        }
         Ok((events, calls))
     }
 
@@ -29588,10 +29815,12 @@ impl PostgresBackend {
         // The lo bound is applied to the SOURCE rows; we delete + rewrite
         // whole buckets in range so a partial trailing bucket is fully
         // recomputed (idempotent: re-running yields the same bucket rows).
-        let lo_pred = if lo.is_some() {
-            "WHERE te.ts >= $1"
+        // §10.1.4 — never materialize self/family; the re-fold floor, when
+        // there is one, bounds the source rows.
+        let source_where = if lo.is_some() {
+            "WHERE te.ts >= $1 AND te.cohort_scope NOT IN ('self','family')"
         } else {
-            ""
+            "WHERE te.cohort_scope NOT IN ('self','family')"
         };
         // CIRISPersist#518 — the three value-mean metrics (csdma/k_eff/
         // correlation_risk) are computed via a per-trace CTE
@@ -29616,139 +29845,7 @@ impl PostgresBackend {
         // `metric_agg` share the identical grouping-key row set (same
         // source rows, same leading GROUP BY columns), so the join below
         // is exact; the LEFT JOIN + COALESCE is defensive only.
-        let sql = format!(
-            "INSERT INTO cirislens.trace_events_factor_rollup_1h ( \
-                bucket_start, agent_id_hash, deployment_domain, cohort_scope, \
-                cohort_target_id, trace_count, \
-                csdma_sum, csdma_n, k_eff_sum, k_eff_n, \
-                correlation_risk_sum, correlation_risk_n, \
-                override_trace_count, fragility_trace_count, \
-                conscience_fail_trace_count, entropy_fail_trace_count, \
-                coherence_fail_trace_count, optimization_veto_fail_trace_count, \
-                epistemic_humility_fail_trace_count, \
-                audit_seq_trace_count, audit_sig_trace_count) \
-             WITH bucket_agg AS ( \
-                SELECT \
-                   date_trunc('hour', te.ts) AS bucket_start, \
-                   te.agent_id_hash AS agent_id_hash, \
-                   te.deployment_domain AS deployment_domain, \
-                   te.cohort_scope AS cohort_scope, \
-                   te.cohort_target_id AS cohort_target_id, \
-                   COUNT(DISTINCT te.trace_id)::bigint AS trace_count, \
-                   COUNT(DISTINCT te.trace_id) FILTER ( \
-                       WHERE te.event_type = 'CONSCIENCE_RESULT' \
-                         AND (te.payload->>'action_was_overridden')::bool)::bigint \
-                       AS override_trace_count, \
-                   COUNT(DISTINCT te.trace_id) FILTER ( \
-                       WHERE (te.payload->>'idma_fragility_flag')::bool)::bigint \
-                       AS fragility_trace_count, \
-                   COUNT(DISTINCT te.trace_id) FILTER ( \
-                       WHERE te.event_type = 'CONSCIENCE_RESULT' \
-                         AND (te.payload->>'conscience_passed')::bool = false)::bigint \
-                       AS conscience_fail_trace_count, \
-                   COUNT(DISTINCT te.trace_id) FILTER ( \
-                       WHERE te.event_type = 'CONSCIENCE_RESULT' \
-                         AND (te.payload->>'entropy_passed')::bool = false)::bigint \
-                       AS entropy_fail_trace_count, \
-                   COUNT(DISTINCT te.trace_id) FILTER ( \
-                       WHERE te.event_type = 'CONSCIENCE_RESULT' \
-                         AND (te.payload->>'coherence_passed')::bool = false)::bigint \
-                       AS coherence_fail_trace_count, \
-                   COUNT(DISTINCT te.trace_id) FILTER ( \
-                       WHERE te.event_type = 'CONSCIENCE_RESULT' \
-                         AND (te.payload->>'optimization_veto_passed')::bool = false)::bigint \
-                       AS optimization_veto_fail_trace_count, \
-                   COUNT(DISTINCT te.trace_id) FILTER ( \
-                       WHERE te.event_type = 'CONSCIENCE_RESULT' \
-                         AND (te.payload->>'epistemic_humility_passed')::bool = false)::bigint \
-                       AS epistemic_humility_fail_trace_count, \
-                   COUNT(DISTINCT te.trace_id) FILTER ( \
-                       WHERE te.audit_sequence_number IS NOT NULL)::bigint \
-                       AS audit_seq_trace_count, \
-                   COUNT(DISTINCT te.trace_id) FILTER ( \
-                       WHERE te.audit_signature IS NOT NULL)::bigint \
-                       AS audit_sig_trace_count \
-                FROM cirislens.trace_events te \
-                {lo_pred} \
-                {self_family_gate} \
-                GROUP BY date_trunc('hour', te.ts), te.agent_id_hash, \
-                         te.deployment_domain, te.cohort_scope, te.cohort_target_id \
-             ), \
-             per_trace_metric AS ( \
-                SELECT \
-                   date_trunc('hour', te.ts) AS bucket_start, \
-                   te.agent_id_hash AS agent_id_hash, \
-                   te.deployment_domain AS deployment_domain, \
-                   te.cohort_scope AS cohort_scope, \
-                   te.cohort_target_id AS cohort_target_id, \
-                   AVG((te.payload->>'csdma_plausibility_score')::float8) AS csdma_val, \
-                   AVG((te.payload->>'idma_k_eff')::float8) AS k_eff_val, \
-                   AVG((te.payload->>'idma_correlation_risk')::float8) AS corr_val \
-                FROM cirislens.trace_events te \
-                {lo_pred} \
-                {self_family_gate} \
-                GROUP BY date_trunc('hour', te.ts), te.agent_id_hash, \
-                         te.deployment_domain, te.cohort_scope, te.cohort_target_id, \
-                         te.trace_id \
-             ), \
-             metric_agg AS ( \
-                SELECT bucket_start, agent_id_hash, deployment_domain, cohort_scope, \
-                       cohort_target_id, \
-                       COALESCE(SUM(csdma_val), 0)::float8 AS csdma_sum, \
-                       COUNT(csdma_val)::bigint AS csdma_n, \
-                       COALESCE(SUM(k_eff_val), 0)::float8 AS k_eff_sum, \
-                       COUNT(k_eff_val)::bigint AS k_eff_n, \
-                       COALESCE(SUM(corr_val), 0)::float8 AS correlation_risk_sum, \
-                       COUNT(corr_val)::bigint AS correlation_risk_n \
-                FROM per_trace_metric \
-                GROUP BY bucket_start, agent_id_hash, deployment_domain, cohort_scope, \
-                         cohort_target_id \
-             ) \
-             SELECT \
-                b.bucket_start, b.agent_id_hash, b.deployment_domain, b.cohort_scope, \
-                b.cohort_target_id, b.trace_count, \
-                COALESCE(m.csdma_sum, 0), COALESCE(m.csdma_n, 0), \
-                COALESCE(m.k_eff_sum, 0), COALESCE(m.k_eff_n, 0), \
-                COALESCE(m.correlation_risk_sum, 0), COALESCE(m.correlation_risk_n, 0), \
-                b.override_trace_count, b.fragility_trace_count, \
-                b.conscience_fail_trace_count, b.entropy_fail_trace_count, \
-                b.coherence_fail_trace_count, b.optimization_veto_fail_trace_count, \
-                b.epistemic_humility_fail_trace_count, \
-                b.audit_seq_trace_count, b.audit_sig_trace_count \
-             FROM bucket_agg b \
-             LEFT JOIN metric_agg m ON \
-                b.bucket_start = m.bucket_start \
-                AND b.agent_id_hash IS NOT DISTINCT FROM m.agent_id_hash \
-                AND b.deployment_domain IS NOT DISTINCT FROM m.deployment_domain \
-                AND b.cohort_scope IS NOT DISTINCT FROM m.cohort_scope \
-                AND b.cohort_target_id IS NOT DISTINCT FROM m.cohort_target_id \
-             ON CONFLICT (bucket_start, COALESCE(agent_id_hash,''), \
-                          COALESCE(deployment_domain,''), COALESCE(cohort_scope,''), \
-                          COALESCE(cohort_target_id,'')) \
-             DO UPDATE SET \
-                trace_count = EXCLUDED.trace_count, \
-                csdma_sum = EXCLUDED.csdma_sum, csdma_n = EXCLUDED.csdma_n, \
-                k_eff_sum = EXCLUDED.k_eff_sum, k_eff_n = EXCLUDED.k_eff_n, \
-                correlation_risk_sum = EXCLUDED.correlation_risk_sum, \
-                correlation_risk_n = EXCLUDED.correlation_risk_n, \
-                override_trace_count = EXCLUDED.override_trace_count, \
-                fragility_trace_count = EXCLUDED.fragility_trace_count, \
-                conscience_fail_trace_count = EXCLUDED.conscience_fail_trace_count, \
-                entropy_fail_trace_count = EXCLUDED.entropy_fail_trace_count, \
-                coherence_fail_trace_count = EXCLUDED.coherence_fail_trace_count, \
-                optimization_veto_fail_trace_count = EXCLUDED.optimization_veto_fail_trace_count, \
-                epistemic_humility_fail_trace_count = EXCLUDED.epistemic_humility_fail_trace_count, \
-                audit_seq_trace_count = EXCLUDED.audit_seq_trace_count, \
-                audit_sig_trace_count = EXCLUDED.audit_sig_trace_count",
-            lo_pred = lo_pred,
-            // §10.1.4 — never materialize self/family. AND-joined when a lo
-            // bound exists, else it is the leading WHERE.
-            self_family_gate = if lo.is_some() {
-                "AND te.cohort_scope NOT IN ('self','family')"
-            } else {
-                "WHERE te.cohort_scope NOT IN ('self','family')"
-            },
-        );
+        let sql = pg_factor_rollup_upsert_sql(source_where);
 
         if let Some(lo_ts) = lo {
             tx.execute(sql.as_str(), &[&lo_ts])

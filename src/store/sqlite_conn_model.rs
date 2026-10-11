@@ -628,6 +628,7 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("test_seam_set_attestation_asserted_at", ConnClass::Write),
     ("test_seam_set_key_identity_type", ConnClass::Write),
     ("test_seam_drop_purge_tombstone", ConnClass::Write),
+    ("test_seam_factor_rollup_trace_counts", ConnClass::Read),
     ("put_blob_chunks", ConnClass::Write),
     ("put_blob_with_scope", ConnClass::Write),
     ("put_calibration_bundle", ConnClass::Write),

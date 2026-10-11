@@ -3541,6 +3541,33 @@ impl SqliteBackend {
         .map_err(|e| crate::federation::Error::Backend(e.to_string()))
     }
 
+    /// v54.1.0 (Codex on PR #1057) — TEST SEAM: run the lazy rollup refresh
+    /// from the stored watermark, as a fleet read would.
+    #[cfg(test)]
+    pub async fn test_seam_refresh_factor_rollup(&self) -> Result<(), crate::read::Error> {
+        self.refresh_factor_rollup(None).await
+    }
+
+    /// v54.1.0 (Codex on PR #1057) — TEST SEAM: `trace_count` of every
+    /// `trace_events_factor_rollup_1h` row of `agent_id_hash`, by bucket.
+    #[cfg(test)]
+    pub async fn test_seam_factor_rollup_trace_counts(
+        &self,
+        agent_id_hash: &str,
+    ) -> Result<Vec<i64>, crate::federation::Error> {
+        let agent = agent_id_hash.to_owned();
+        self.read(move |conn| -> Result<Vec<i64>, rusqlite::Error> {
+            let mut stmt = conn.prepare(
+                "SELECT trace_count FROM trace_events_factor_rollup_1h \
+                 WHERE agent_id_hash = ?1 ORDER BY bucket_start",
+            )?;
+            let rows = stmt.query_map([&agent], |r| r.get::<_, i64>(0))?;
+            rows.collect()
+        })
+        .await
+        .map_err(|e| crate::federation::Error::Backend(e.to_string()))
+    }
+
     /// v54.1.0 (Codex on PR #1057) — TEST SEAM: drop one stored tombstone of
     /// a notice, reproducing a header whose set is partial (the state the
     /// pre-fix, non-atomic write could leave). Nothing else moves.
@@ -4441,30 +4468,77 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         trace_id: &str,
     ) -> Result<(u64, u64), crate::federation::Error> {
         let id = trace_id.to_owned();
-        self.write(move |conn| -> Result<(u64, u64), rusqlite::Error> {
-            let tx = conn.transaction()?;
-            let tombstoned: bool = tx
-                .query_row(
-                    "SELECT 1 FROM purge_tombstones WHERE plane = 'trace' AND record_ref = ?1 \
-                     LIMIT 1",
-                    [&id],
-                    |_| Ok(true),
-                )
-                .optional()?
-                .unwrap_or(false);
-            if !tombstoned {
-                return Ok((0, 0));
-            }
-            let calls =
-                tx.execute("DELETE FROM trace_llm_calls WHERE trace_id = ?1", [&id])? as u64;
-            let events = tx.execute("DELETE FROM trace_events WHERE trace_id = ?1", [&id])? as u64;
-            tx.commit()?;
-            Ok((events, calls))
-        })
-        .await
-        .map_err(|e| {
-            crate::federation::Error::Backend(format!("purge_delete_tombstoned_trace: {e}"))
-        })
+        let (deleted, buckets) = self
+            .write(
+                move |conn| -> Result<((u64, u64), Vec<String>), rusqlite::Error> {
+                    let tx = conn.transaction()?;
+                    let tombstoned: bool = tx
+                        .query_row(
+                            "SELECT 1 FROM purge_tombstones WHERE plane = 'trace' \
+                             AND record_ref = ?1 LIMIT 1",
+                            [&id],
+                            |_| Ok(true),
+                        )
+                        .optional()?
+                        .unwrap_or(false);
+                    if !tombstoned {
+                        return Ok(((0, 0), Vec::new()));
+                    }
+                    // Codex on PR #1057 — the rollup groups this trace was
+                    // folded into, read BEFORE its rows go. The lazy refresh
+                    // revisits only the watermark tail and only upserts groups
+                    // that still have source rows, so the purge itself
+                    // recomputes exactly these groups, in this transaction.
+                    let groups: Vec<RollupGroup> = {
+                        let mut stmt = tx.prepare(
+                            "SELECT DISTINCT strftime('%Y-%m-%dT%H:00:00Z', ts), \
+                                agent_id_hash, deployment_domain, cohort_scope, \
+                                cohort_target_id \
+                             FROM trace_events \
+                             WHERE trace_id = ?1 AND cohort_scope NOT IN ('self','family')",
+                        )?;
+                        let rows = stmt.query_map([&id], |r| {
+                            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+                        })?;
+                        rows.collect::<Result<_, _>>()?
+                    };
+                    let calls = tx
+                        .execute("DELETE FROM trace_llm_calls WHERE trace_id = ?1", [&id])?
+                        as u64;
+                    let events =
+                        tx.execute("DELETE FROM trace_events WHERE trace_id = ?1", [&id])? as u64;
+                    let recompute = sqlite_factor_rollup_upsert_sql(
+                        "AND strftime('%Y-%m-%dT%H:00:00Z', te.ts) = ?1 \
+                         AND te.agent_id_hash IS ?2 AND te.deployment_domain IS ?3 \
+                         AND te.cohort_scope IS ?4 AND te.cohort_target_id IS ?5",
+                    );
+                    for (bucket, agent, domain, scope, target) in &groups {
+                        let key = rusqlite::params![bucket, agent, domain, scope, target];
+                        tx.execute(
+                            "DELETE FROM trace_events_factor_rollup_1h \
+                             WHERE bucket_start = ?1 AND agent_id_hash IS ?2 \
+                               AND deployment_domain IS ?3 AND cohort_scope IS ?4 \
+                               AND cohort_target_id IS ?5",
+                            key,
+                        )?;
+                        tx.execute(&recompute, key)?;
+                    }
+                    tx.commit()?;
+                    Ok(((events, calls), groups.into_iter().map(|g| g.0).collect()))
+                },
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("purge_delete_tombstoned_trace: {e}"))
+            })?;
+        // The aggregate caches hold the purged trace until their TTL; evict
+        // every window holding one of its buckets.
+        for bucket in buckets {
+            let ms = parse_rfc3339(&bucket).timestamp_millis();
+            self.scoring_factors_cache.invalidate_write(ms);
+            self.repo_stats_cache.invalidate_write(ms);
+        }
+        Ok(deleted)
     }
 
     async fn purge_mark_finalized(
@@ -22682,6 +22756,120 @@ fn sqlite_row_to_outbound_row(
     })
 }
 
+/// One `trace_events_factor_rollup_1h` group key: `(bucket_start,
+/// agent_id_hash, deployment_domain, cohort_scope, cohort_target_id)`.
+type RollupGroup = (
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
+/// CIRISPersist#222 — the rollup's whole-bucket recompute: an idempotent
+/// UPSERT re-aggregating the `trace_events` rows that pass
+/// `te.cohort_scope NOT IN ('self','family') {source_filter}` (the §10.1.4
+/// filter is always applied). `refresh_factor_rollup` passes its re-fold floor;
+/// v54.1.0 (Codex on PR #1057) a steward purge passes ONE bucket group, after
+/// deleting that group's row, so a group the purge emptied stays gone.
+fn sqlite_factor_rollup_upsert_sql(source_filter: &str) -> String {
+    format!(
+        "INSERT INTO trace_events_factor_rollup_1h ( \
+            bucket_start, agent_id_hash, deployment_domain, cohort_scope, \
+            cohort_target_id, trace_count, \
+            csdma_sum, csdma_n, k_eff_sum, k_eff_n, \
+            correlation_risk_sum, correlation_risk_n, \
+            override_trace_count, fragility_trace_count, \
+            conscience_fail_trace_count, entropy_fail_trace_count, \
+            coherence_fail_trace_count, optimization_veto_fail_trace_count, \
+            epistemic_humility_fail_trace_count, \
+            audit_seq_trace_count, audit_sig_trace_count) \
+         WITH per_trace AS ( \
+            SELECT \
+               strftime('%Y-%m-%dT%H:00:00Z', te.ts) AS bucket_start, \
+               te.agent_id_hash AS agent_id_hash, \
+               te.deployment_domain AS deployment_domain, \
+               te.cohort_scope AS cohort_scope, \
+               te.cohort_target_id AS cohort_target_id, \
+               te.trace_id AS trace_id, \
+               AVG(CASE WHEN json_extract(te.payload,'$.csdma_plausibility_score') \
+                   IS NOT NULL THEN json_extract(te.payload,'$.csdma_plausibility_score') END) \
+                   AS csdma_val, \
+               AVG(CASE WHEN json_extract(te.payload,'$.idma_k_eff') \
+                   IS NOT NULL THEN json_extract(te.payload,'$.idma_k_eff') END) \
+                   AS k_eff_val, \
+               AVG(CASE WHEN json_extract(te.payload,'$.idma_correlation_risk') \
+                   IS NOT NULL THEN json_extract(te.payload,'$.idma_correlation_risk') END) \
+                   AS corr_val, \
+               MAX(CASE WHEN te.event_type='CONSCIENCE_RESULT' \
+                   AND json_extract(te.payload,'$.action_was_overridden')=1 THEN 1 ELSE 0 END) \
+                   AS overridden, \
+               MAX(CASE WHEN json_extract(te.payload,'$.idma_fragility_flag')=1 THEN 1 ELSE 0 END) \
+                   AS fragile, \
+               MAX(CASE WHEN te.event_type='CONSCIENCE_RESULT' \
+                   AND json_extract(te.payload,'$.conscience_passed')=0 THEN 1 ELSE 0 END) \
+                   AS conscience_fail, \
+               MAX(CASE WHEN te.event_type='CONSCIENCE_RESULT' \
+                   AND json_extract(te.payload,'$.entropy_passed')=0 THEN 1 ELSE 0 END) \
+                   AS entropy_fail, \
+               MAX(CASE WHEN te.event_type='CONSCIENCE_RESULT' \
+                   AND json_extract(te.payload,'$.coherence_passed')=0 THEN 1 ELSE 0 END) \
+                   AS coherence_fail, \
+               MAX(CASE WHEN te.event_type='CONSCIENCE_RESULT' \
+                   AND json_extract(te.payload,'$.optimization_veto_passed')=0 THEN 1 ELSE 0 END) \
+                   AS optimization_veto_fail, \
+               MAX(CASE WHEN te.event_type='CONSCIENCE_RESULT' \
+                   AND json_extract(te.payload,'$.epistemic_humility_passed')=0 THEN 1 ELSE 0 END) \
+                   AS epistemic_humility_fail, \
+               MAX(CASE WHEN te.audit_sequence_number IS NOT NULL THEN 1 ELSE 0 END) \
+                   AS has_audit_seq, \
+               MAX(CASE WHEN te.audit_signature IS NOT NULL THEN 1 ELSE 0 END) \
+                   AS has_audit_sig, \
+               MAX(CASE WHEN json_extract(te.payload,'$.csdma_plausibility_score') \
+                   IS NOT NULL THEN 1 ELSE 0 END) AS has_csdma, \
+               MAX(CASE WHEN json_extract(te.payload,'$.idma_k_eff') \
+                   IS NOT NULL THEN 1 ELSE 0 END) AS has_k_eff, \
+               MAX(CASE WHEN json_extract(te.payload,'$.idma_correlation_risk') \
+                   IS NOT NULL THEN 1 ELSE 0 END) AS has_corr \
+            FROM trace_events te \
+            WHERE te.cohort_scope NOT IN ('self','family') {source_filter} \
+            GROUP BY bucket_start, te.agent_id_hash, te.deployment_domain, \
+                     te.cohort_scope, te.cohort_target_id, te.trace_id \
+         ) \
+         SELECT bucket_start, agent_id_hash, deployment_domain, cohort_scope, \
+                cohort_target_id, \
+                COUNT(*) AS trace_count, \
+                COALESCE(SUM(csdma_val),0), SUM(has_csdma), \
+                COALESCE(SUM(k_eff_val),0), SUM(has_k_eff), \
+                COALESCE(SUM(corr_val),0), SUM(has_corr), \
+                SUM(overridden), SUM(fragile), \
+                SUM(conscience_fail), SUM(entropy_fail), SUM(coherence_fail), \
+                SUM(optimization_veto_fail), SUM(epistemic_humility_fail), \
+                SUM(has_audit_seq), SUM(has_audit_sig) \
+         FROM per_trace \
+         GROUP BY bucket_start, agent_id_hash, deployment_domain, \
+                  cohort_scope, cohort_target_id \
+         ON CONFLICT (bucket_start, COALESCE(agent_id_hash,''), \
+                      COALESCE(deployment_domain,''), COALESCE(cohort_scope,''), \
+                      COALESCE(cohort_target_id,'')) \
+         DO UPDATE SET \
+            trace_count = excluded.trace_count, \
+            csdma_sum = excluded.csdma_sum, csdma_n = excluded.csdma_n, \
+            k_eff_sum = excluded.k_eff_sum, k_eff_n = excluded.k_eff_n, \
+            correlation_risk_sum = excluded.correlation_risk_sum, \
+            correlation_risk_n = excluded.correlation_risk_n, \
+            override_trace_count = excluded.override_trace_count, \
+            fragility_trace_count = excluded.fragility_trace_count, \
+            conscience_fail_trace_count = excluded.conscience_fail_trace_count, \
+            entropy_fail_trace_count = excluded.entropy_fail_trace_count, \
+            coherence_fail_trace_count = excluded.coherence_fail_trace_count, \
+            optimization_veto_fail_trace_count = excluded.optimization_veto_fail_trace_count, \
+            epistemic_humility_fail_trace_count = excluded.epistemic_humility_fail_trace_count, \
+            audit_seq_trace_count = excluded.audit_seq_trace_count, \
+            audit_sig_trace_count = excluded.audit_sig_trace_count"
+    )
+}
+
 /// v54.1.0 (CIRISPersist#1046) — the V187 instant spelling: fixed-width
 /// RFC 3339 at microseconds, so the TEXT serve cursor orders as time does.
 fn purge_instant_text(t: chrono::DateTime<chrono::Utc>) -> String {
@@ -28795,101 +28983,7 @@ impl SqliteBackend {
             // bucket grain. ON CONFLICT REPLACES the bucket aggregate
             // (idempotent — never additive).
             let lo_pred = if lo.is_some() { "AND te.ts >= ?1" } else { "" };
-            let sql = format!(
-                "INSERT INTO trace_events_factor_rollup_1h ( \
-                    bucket_start, agent_id_hash, deployment_domain, cohort_scope, \
-                    cohort_target_id, trace_count, \
-                    csdma_sum, csdma_n, k_eff_sum, k_eff_n, \
-                    correlation_risk_sum, correlation_risk_n, \
-                    override_trace_count, fragility_trace_count, \
-                    conscience_fail_trace_count, entropy_fail_trace_count, \
-                    coherence_fail_trace_count, optimization_veto_fail_trace_count, \
-                    epistemic_humility_fail_trace_count, \
-                    audit_seq_trace_count, audit_sig_trace_count) \
-                 WITH per_trace AS ( \
-                    SELECT \
-                       strftime('%Y-%m-%dT%H:00:00Z', te.ts) AS bucket_start, \
-                       te.agent_id_hash AS agent_id_hash, \
-                       te.deployment_domain AS deployment_domain, \
-                       te.cohort_scope AS cohort_scope, \
-                       te.cohort_target_id AS cohort_target_id, \
-                       te.trace_id AS trace_id, \
-                       AVG(CASE WHEN json_extract(te.payload,'$.csdma_plausibility_score') \
-                           IS NOT NULL THEN json_extract(te.payload,'$.csdma_plausibility_score') END) \
-                           AS csdma_val, \
-                       AVG(CASE WHEN json_extract(te.payload,'$.idma_k_eff') \
-                           IS NOT NULL THEN json_extract(te.payload,'$.idma_k_eff') END) \
-                           AS k_eff_val, \
-                       AVG(CASE WHEN json_extract(te.payload,'$.idma_correlation_risk') \
-                           IS NOT NULL THEN json_extract(te.payload,'$.idma_correlation_risk') END) \
-                           AS corr_val, \
-                       MAX(CASE WHEN te.event_type='CONSCIENCE_RESULT' \
-                           AND json_extract(te.payload,'$.action_was_overridden')=1 THEN 1 ELSE 0 END) \
-                           AS overridden, \
-                       MAX(CASE WHEN json_extract(te.payload,'$.idma_fragility_flag')=1 THEN 1 ELSE 0 END) \
-                           AS fragile, \
-                       MAX(CASE WHEN te.event_type='CONSCIENCE_RESULT' \
-                           AND json_extract(te.payload,'$.conscience_passed')=0 THEN 1 ELSE 0 END) \
-                           AS conscience_fail, \
-                       MAX(CASE WHEN te.event_type='CONSCIENCE_RESULT' \
-                           AND json_extract(te.payload,'$.entropy_passed')=0 THEN 1 ELSE 0 END) \
-                           AS entropy_fail, \
-                       MAX(CASE WHEN te.event_type='CONSCIENCE_RESULT' \
-                           AND json_extract(te.payload,'$.coherence_passed')=0 THEN 1 ELSE 0 END) \
-                           AS coherence_fail, \
-                       MAX(CASE WHEN te.event_type='CONSCIENCE_RESULT' \
-                           AND json_extract(te.payload,'$.optimization_veto_passed')=0 THEN 1 ELSE 0 END) \
-                           AS optimization_veto_fail, \
-                       MAX(CASE WHEN te.event_type='CONSCIENCE_RESULT' \
-                           AND json_extract(te.payload,'$.epistemic_humility_passed')=0 THEN 1 ELSE 0 END) \
-                           AS epistemic_humility_fail, \
-                       MAX(CASE WHEN te.audit_sequence_number IS NOT NULL THEN 1 ELSE 0 END) \
-                           AS has_audit_seq, \
-                       MAX(CASE WHEN te.audit_signature IS NOT NULL THEN 1 ELSE 0 END) \
-                           AS has_audit_sig, \
-                       MAX(CASE WHEN json_extract(te.payload,'$.csdma_plausibility_score') \
-                           IS NOT NULL THEN 1 ELSE 0 END) AS has_csdma, \
-                       MAX(CASE WHEN json_extract(te.payload,'$.idma_k_eff') \
-                           IS NOT NULL THEN 1 ELSE 0 END) AS has_k_eff, \
-                       MAX(CASE WHEN json_extract(te.payload,'$.idma_correlation_risk') \
-                           IS NOT NULL THEN 1 ELSE 0 END) AS has_corr \
-                    FROM trace_events te \
-                    WHERE te.cohort_scope NOT IN ('self','family') {lo_pred} \
-                    GROUP BY bucket_start, te.agent_id_hash, te.deployment_domain, \
-                             te.cohort_scope, te.cohort_target_id, te.trace_id \
-                 ) \
-                 SELECT bucket_start, agent_id_hash, deployment_domain, cohort_scope, \
-                        cohort_target_id, \
-                        COUNT(*) AS trace_count, \
-                        COALESCE(SUM(csdma_val),0), SUM(has_csdma), \
-                        COALESCE(SUM(k_eff_val),0), SUM(has_k_eff), \
-                        COALESCE(SUM(corr_val),0), SUM(has_corr), \
-                        SUM(overridden), SUM(fragile), \
-                        SUM(conscience_fail), SUM(entropy_fail), SUM(coherence_fail), \
-                        SUM(optimization_veto_fail), SUM(epistemic_humility_fail), \
-                        SUM(has_audit_seq), SUM(has_audit_sig) \
-                 FROM per_trace \
-                 GROUP BY bucket_start, agent_id_hash, deployment_domain, \
-                          cohort_scope, cohort_target_id \
-                 ON CONFLICT (bucket_start, COALESCE(agent_id_hash,''), \
-                              COALESCE(deployment_domain,''), COALESCE(cohort_scope,''), \
-                              COALESCE(cohort_target_id,'')) \
-                 DO UPDATE SET \
-                    trace_count = excluded.trace_count, \
-                    csdma_sum = excluded.csdma_sum, csdma_n = excluded.csdma_n, \
-                    k_eff_sum = excluded.k_eff_sum, k_eff_n = excluded.k_eff_n, \
-                    correlation_risk_sum = excluded.correlation_risk_sum, \
-                    correlation_risk_n = excluded.correlation_risk_n, \
-                    override_trace_count = excluded.override_trace_count, \
-                    fragility_trace_count = excluded.fragility_trace_count, \
-                    conscience_fail_trace_count = excluded.conscience_fail_trace_count, \
-                    entropy_fail_trace_count = excluded.entropy_fail_trace_count, \
-                    coherence_fail_trace_count = excluded.coherence_fail_trace_count, \
-                    optimization_veto_fail_trace_count = excluded.optimization_veto_fail_trace_count, \
-                    epistemic_humility_fail_trace_count = excluded.epistemic_humility_fail_trace_count, \
-                    audit_seq_trace_count = excluded.audit_seq_trace_count, \
-                    audit_sig_trace_count = excluded.audit_sig_trace_count"
-            );
+            let sql = sqlite_factor_rollup_upsert_sql(lo_pred);
 
             if let Some(ref lo_ts) = lo {
                 tx.execute(&sql, rusqlite::params![lo_ts])

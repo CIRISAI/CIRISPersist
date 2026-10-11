@@ -107,6 +107,12 @@
 //!   refuse it `purge_execution_incomplete` with nothing deleted, until a
 //!   re-run of the same notice completes it. The store door refuses a set that
 //!   is not exactly `record_count` rows of its notice.
+//! - **I696** (Codex on PR #1057) — purging a trace invalidates the rollup
+//!   it was folded into (sqlite, postgres; memory has no rollup and
+//!   aggregates directly): after finalize, a bucket the trace shared keeps
+//!   only the survivor, a bucket it alone filled is GONE (not left at its old
+//!   count), and the fleet read no longer counts it — including a bucket older
+//!   than the lazy refresh's watermark tail, which no refresh revisits.
 //! - **I666** — a `key:` (or `federation_keys:`) id is not a purge record:
 //!   `purge_selection_malformed`, naming `key:revocation` as key retirement's
 //!   own act.
@@ -197,6 +203,51 @@ pub(crate) mod bodies {
             }
         };
     }
+    /// The rollup witness's seams (the plain `trace_events_factor_rollup_1h`
+    /// rollup exists on sqlite and postgres; memory aggregates directly).
+    pub(crate) trait RollupSeams: Seams + crate::read::ReadEngine {
+        /// Run the lazy refresh from the stored watermark.
+        fn refresh_rollup(
+            &self,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>>;
+        /// `trace_count` per rollup bucket of `agent`.
+        fn rollup_trace_counts<'a>(
+            &'a self,
+            agent: &'a str,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<i64>> + Send + 'a>>;
+    }
+
+    macro_rules! rollup_seams_for {
+        ($t:ty) => {
+            impl RollupSeams for $t {
+                fn refresh_rollup(
+                    &self,
+                ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+                    Box::pin(async move {
+                        self.test_seam_refresh_factor_rollup()
+                            .await
+                            .expect("refresh");
+                    })
+                }
+                fn rollup_trace_counts<'a>(
+                    &'a self,
+                    agent: &'a str,
+                ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<i64>> + Send + 'a>>
+                {
+                    Box::pin(async move {
+                        self.test_seam_factor_rollup_trace_counts(agent)
+                            .await
+                            .expect("seam")
+                    })
+                }
+            }
+        };
+    }
+    #[cfg(feature = "sqlite")]
+    rollup_seams_for!(crate::store::sqlite::SqliteBackend);
+    #[cfg(feature = "postgres")]
+    rollup_seams_for!(crate::store::postgres::PostgresBackend);
+
     seams_for!(crate::store::memory::MemoryBackend);
     #[cfg(feature = "sqlite")]
     seams_for!(crate::store::sqlite::SqliteBackend);
@@ -2203,6 +2254,120 @@ pub(crate) mod bodies {
         );
     }
 
+    // ── I696 ──────────────────────────────────────────────────────────────
+    /// One trace at `ts` for agent `agent_hash`: two `trace_events` rows signed
+    /// by `signer`, one LLM call, and its own trace attestation.
+    async fn seed_trace_at<D: Seams>(
+        d: &D,
+        trace_id: &str,
+        signer: &str,
+        agent_hash: &str,
+        ts: chrono::DateTime<chrono::Utc>,
+    ) {
+        seed_trace(d, trace_id, signer, "gpt-real").await;
+        // Re-home the projection rows: the rollup groups by hour and agent.
+        let rows: Vec<TraceEventRow> = (0..2)
+            .map(|attempt| {
+                let mut r = event_row(trace_id, signer, attempt);
+                r.ts = ts;
+                r.agent_id_hash = agent_hash.to_owned();
+                r.thought_id = "th-at".to_owned();
+                r
+            })
+            .collect();
+        d.insert_trace_events_batch(&rows)
+            .await
+            .expect("trace rows");
+    }
+
+    /// The fleet read's `trace_count` per agent (the rollup fast path: more
+    /// than one agent, no baseline, an unauthenticated caller).
+    async fn fleet_trace_counts<D: RollupSeams>(
+        d: &D,
+        agents: &[String],
+        window: crate::read::TimeWindow,
+    ) -> Vec<i64> {
+        d.aggregate_scoring_factors_batch(
+            agents,
+            window,
+            None,
+            crate::scope::CallerScope::Unauthenticated,
+        )
+        .await
+        .expect("fleet read")
+        .into_iter()
+        .map(|a| a.trace_count)
+        .collect()
+    }
+
+    pub(crate) async fn i696_a_purged_trace_leaves_no_rollup<D: RollupSeams>(d: &D) {
+        root(d).await;
+        let dir = d.as_dyn_directory();
+        let t = now();
+        // Five hours back: older than the refresh's watermark tail (the
+        // newest event, at `t`, sets the watermark; the tail is 1 h).
+        let old = t - chrono::Duration::hours(5);
+        let (x, y, z) = ("i696-agent-x", "i696-agent-y", "i696-agent-z");
+        seed_trace_at(d, "trace-i696-a", AGENT, x, old).await;
+        seed_trace_at(d, "trace-i696-b", AGENT, x, old).await;
+        seed_trace_at(d, "trace-i696-c", AGENT, y, old).await;
+        seed_trace_at(d, "trace-i696-d", AGENT, z, t).await;
+        d.refresh_rollup().await;
+        assert_eq!(d.rollup_trace_counts(x).await, vec![2], "I696: folded");
+        assert_eq!(d.rollup_trace_counts(y).await, vec![1], "I696: folded");
+        let window = crate::read::TimeWindow {
+            since: t - chrono::Duration::days(1),
+            until: t + chrono::Duration::hours(1),
+        };
+        let agents = [x.to_owned(), y.to_owned()];
+        assert_eq!(
+            fleet_trace_counts(d, &agents, window).await,
+            vec![2, 1],
+            "I696: the fleet read counts them"
+        );
+
+        let sel = PurgeSelection::ByIds {
+            ids: vec![
+                "trace:trace-i696-a".to_owned(),
+                "trace:trace-i696-c".to_owned(),
+            ],
+        };
+        let dry = sp::purge_dry_run(dir, &sel).await.unwrap();
+        let notice = notice_for(&dry.notice_template, &[cc::FOUNDERS[0], cc::FOUNDERS[1]], t);
+        let rep = sp::purge_rows(dir, &sel, &notice, NODE, t).await.unwrap();
+        let fin = sp::purge_finalize(
+            dir,
+            &rep.notice_id,
+            t + chrono::Duration::seconds(sp::PURGE_SETTLE_DWELL_SECS + 1),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(fin.trace_events_deleted, 8, "{fin:?}");
+
+        // The rollup no longer counts the purged traces, with no refresh in
+        // between (the lazy one would not revisit a 5 h old bucket anyway).
+        assert_eq!(
+            d.rollup_trace_counts(x).await,
+            vec![1],
+            "I696: the shared bucket keeps only the survivor"
+        );
+        assert_eq!(
+            d.rollup_trace_counts(y).await,
+            Vec::<i64>::new(),
+            "I696: a bucket the purge emptied is gone"
+        );
+        d.refresh_rollup().await;
+        assert_eq!(d.rollup_trace_counts(x).await, vec![1]);
+        assert_eq!(d.rollup_trace_counts(y).await, Vec::<i64>::new());
+        assert_eq!(
+            fleet_trace_counts(d, &agents, window).await,
+            vec![1, 0],
+            "I696: the fleet read no longer counts a purged trace"
+        );
+        assert_eq!(d.rollup_trace_counts(z).await, vec![1], "I696: untouched");
+    }
+
     // ── I660 ──────────────────────────────────────────────────────────────
     pub(crate) async fn i660_the_delete_doors_re_ask_the_tombstone<D: Seams>(d: &D) {
         root(d).await;
@@ -2358,6 +2523,40 @@ mod run {
             }
         };
     }
+
+    macro_rules! rollup_runners {
+        ($modname:ident, $fresh:expr) => {
+            mod $modname {
+                use super::super::bodies as b;
+                #[tokio::test]
+                async fn i696() {
+                    let Some(d) = $fresh.await else { return };
+                    b::i696_a_purged_trace_leaves_no_rollup(&d).await
+                }
+            }
+        };
+    }
+
+    #[cfg(feature = "sqlite")]
+    rollup_runners!(sqlite_rollup, async {
+        use crate::store::Backend as _;
+        let b = crate::store::sqlite::SqliteBackend::open_in_memory()
+            .await
+            .unwrap();
+        b.run_migrations().await.unwrap();
+        Some(b)
+    });
+
+    #[cfg(feature = "postgres")]
+    rollup_runners!(postgres_rollup, async {
+        use crate::store::Backend as _;
+        let dsn = crate::test_pg::isolated_dsn()?;
+        let b = crate::store::postgres::PostgresBackend::connect(&dsn)
+            .await
+            .unwrap();
+        b.run_migrations().await.unwrap();
+        Some(b)
+    });
 
     runners!(memory, async {
         Some(crate::store::memory::MemoryBackend::new())
