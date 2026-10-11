@@ -2791,6 +2791,43 @@ pub(crate) mod bodies {
         );
         assert_nothing_written(d, &forged.notice).await;
 
+        // A person's device holds bytes: its `holds_bytes` claim (the holder
+        // attests itself) is a local holding row too.
+        const BOB: &str = "bob-human-holder-i821";
+        ts::register_hybrid_key_as(dir, BOB, BOB, crate::federation::types::identity_type::USER)
+            .await;
+        let held = [0xd4u8; 32];
+        let mut claim = ts::bare_attestation(
+            &uuid::Uuid::new_v4().to_string(),
+            BOB,
+            BOB,
+            &serde_json::json!({
+                "kind": "holds_bytes",
+                "evidence_refs": [hex::encode(held)],
+                "size": 12,
+            }),
+        );
+        claim.attestation_type = crate::federation::holds_bytes_attestation_type(&held);
+        claim.weight = None;
+        ts::reseal(&mut claim);
+        dir.put_attestation(SignedAttestation { attestation: claim })
+            .await
+            .expect("the holder claim admits");
+        let device = bundle_over(
+            vec![(
+                format!("blob:{}", hex::encode(held)),
+                format!("attestation:{harmless}"),
+            )],
+            t,
+        );
+        let (tok, body) = refusal(
+            &sp::apply_replicated_purge(dir, &device, NODE, t)
+                .await
+                .expect_err("I821: a person's holding claim is read locally"),
+        );
+        assert_eq!(tok, token::HUMAN_SUBJECT_PENDING_NOTICE_ROW, "I821: {body}");
+        assert!(body.to_string().contains(BOB), "I821 holder: {body}");
+
         // A blob nothing here holds or binds: not proven non-human.
         let blind = bundle_over(vec![(format!("blob:{unbound}"), String::new())], t);
         let (tok, body) = refusal(
