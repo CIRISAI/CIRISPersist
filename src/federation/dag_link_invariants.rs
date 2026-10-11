@@ -501,10 +501,17 @@ pub(crate) mod bodies {
             p.sb.has_blob(&shared).await.unwrap(),
             "I830: a chunk B's unsettled purge also withholds survives A's finalize"
         );
-        assert!(
-            matches!(served(&p, &shared).await, Err(BlobError::Purged { .. })),
-            "I830: and it stays withheld meanwhile"
-        );
+        for r in [
+            served(&p, &shared).await,
+            p.b.serve_blob_range_to_peer(&shared, 0, 3, &p.key_a)
+                .await
+                .map(|_| ()),
+        ] {
+            assert!(
+                matches!(r, Err(BlobError::Purged { .. })),
+                "I830: and it stays withheld (Purged) meanwhile: {r:?}"
+            );
+        }
         sp::test_clock::set(Some(t + dwell));
         p.b.purge_finalize(&eb.notice_id)
             .await
@@ -514,6 +521,19 @@ pub(crate) mod bodies {
             !p.sb.has_blob(&shared).await.unwrap(),
             "I830: it goes at B's finalize"
         );
+        // Edge's terminal disposition holds throughout: the tombstones outlive
+        // the bytes, so the serve door still answers `Purged` (never NotHeld).
+        for r in [
+            served(&p, &shared).await,
+            p.b.serve_blob_range_to_peer(&shared, 0, 3, &p.key_a)
+                .await
+                .map(|_| ()),
+        ] {
+            assert!(
+                matches!(r, Err(BlobError::Purged { .. })),
+                "I830: Purged after both finalize: {r:?}"
+            );
+        }
     }
 
     /// **I824** — a purged blob is withheld from execution, before finalize.
