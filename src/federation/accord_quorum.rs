@@ -305,6 +305,54 @@ pub(crate) mod test_fixtures {
     use ciris_verify_core::accord_live_quorum::{AccordAction, Vote};
     use ciris_verify_core::threshold::ThresholdSignature;
 
+    /// **I827** (v54.1.0, Codex round 3 on PR #1057) — two backends sharing
+    /// one database race two DIFFERENT proposals under one family's nonce,
+    /// `rounds` times: exactly one is admitted and stored, the other is
+    /// `AccordProposalNonceReused` naming the winner. The database's claim
+    /// (V189 PRIMARY KEY) decides, not one process's lock.
+    pub async fn i827_two_backends_race_one_nonce<B>(a: &B, b: &B, suffix: &str, rounds: usize)
+    where
+        B: crate::federation::FederationDirectory + ?Sized,
+    {
+        use crate::federation::Error;
+        let family = format!("fam-i827-{suffix}");
+        for round in 0..rounds {
+            let nonce = format!("nonce-i827-{suffix}-{round}");
+            let first = proposal(&family, &nonce);
+            let mut second = first.clone();
+            second.window_until = "2030-01-01T00:00:00Z".to_owned();
+            assert_ne!(first.digest(), second.digest());
+            let (ra, rb) = tokio::join!(
+                a.put_accord_proposal(first.clone(), None),
+                b.put_accord_proposal(second.clone(), None)
+            );
+            let (winner, loser, refusal) = match (ra, rb) {
+                (Ok(()), Err(e)) => (&first, &second, e),
+                (Err(e), Ok(())) => (&second, &first, e),
+                (ra, rb) => panic!(
+                    "I827 round {round}: exactly one proposal wins a nonce, got {ra:?} / {rb:?}"
+                ),
+            };
+            assert!(
+                matches!(&refusal, Error::AccordProposalNonceReused { existing_proposal_digest, .. }
+                    if *existing_proposal_digest == winner.digest()),
+                "I827 round {round}: the loser is refused naming the winner: {refusal:?}"
+            );
+            assert!(a
+                .get_accord_proposal(&winner.digest())
+                .await
+                .unwrap()
+                .is_some());
+            assert!(
+                a.get_accord_proposal(&loser.digest())
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "I827 round {round}: the loser is not stored"
+            );
+        }
+    }
+
     /// A `fire` proposal over `family` with `nonce` (far-future window).
     pub fn proposal(family: &str, nonce: &str) -> AccordProposal {
         AccordProposal {

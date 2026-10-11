@@ -9342,23 +9342,33 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         };
         let reused = self
             .write(move |conn| -> Result<Option<String>, rusqlite::Error> {
-                // v54.1.0 (#1047) — single use, in the insert's own write: a
-                // proposer-minted nonce names one proposal per family.
-                let other: Option<String> = conn
-                    .query_row(
-                        "SELECT proposal_digest FROM accord_proposal \
-                     WHERE family_key_id = ?1 AND nonce = ?2 AND proposal_digest <> ?3 LIMIT 1",
-                        rusqlite::params![prep.family_key_id, prep.nonce, prep.proposal_digest],
-                        |r| r.get(0),
-                    )
-                    .optional()?;
-                if other.is_some() {
-                    return Ok(other);
+                // v54.1.0 (#1047; Codex round 3 on PR #1057) — single use,
+                // ENFORCED BY THE DATABASE: the V189 claim's PRIMARY KEY
+                // `(family_key_id, nonce)`, inserted in the proposal's own
+                // transaction. A SELECT-then-INSERT is not enough: two
+                // backends on one file hold two connections and both pass the
+                // SELECT. The claim's INSERT takes the write lock first, so a
+                // second writer waits and then reads the first one's claim.
+                let tx = conn.transaction()?;
+                tx.execute(
+                    "INSERT INTO accord_proposal_nonce_claim \
+                        (family_key_id, nonce, proposal_digest) VALUES (?1, ?2, ?3) \
+                     ON CONFLICT (family_key_id, nonce) DO NOTHING",
+                    rusqlite::params![prep.family_key_id, prep.nonce, prep.proposal_digest],
+                )?;
+                let owner: String = tx.query_row(
+                    "SELECT proposal_digest FROM accord_proposal_nonce_claim \
+                     WHERE family_key_id = ?1 AND nonce = ?2",
+                    rusqlite::params![prep.family_key_id, prep.nonce],
+                    |r| r.get(0),
+                )?;
+                if owner != prep.proposal_digest {
+                    return Ok(Some(owner));
                 }
                 // ON CONFLICT DO NOTHING — the digest is content-derived, so a
                 // re-PUT of the same proposal is idempotent and a different
                 // proposal cannot collide.
-                conn.execute(
+                tx.execute(
                     "INSERT INTO accord_proposal (\
                     proposal_digest, family_key_id, action, nonce, window_until, \
                     prior_family_digest, payload_sha256, proposal_json, \
@@ -9379,6 +9389,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                         prep.created_at.to_rfc3339(),
                     ],
                 )?;
+                tx.commit()?;
                 Ok(None)
             })
             .await
@@ -30934,6 +30945,96 @@ mod accord_tests {
 mod tests {
     use super::*;
     use crate::federation::membership_acceptance::test_support::ConsentedWidening as _;
+
+    /// **I827** (v54.1.0, Codex round 3 on PR #1057) — two `SqliteBackend`
+    /// instances on ONE file race one accord nonce: exactly one proposal wins.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn i827_two_backends_on_one_file_race_one_nonce_sqlite() {
+        use crate::store::Backend as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("i827.db").to_string_lossy().to_string();
+        let a = SqliteBackend::open(path.clone()).await.unwrap();
+        a.run_migrations().await.unwrap();
+        let b = SqliteBackend::open(path).await.unwrap();
+        b.run_migrations().await.unwrap();
+        crate::federation::accord_quorum::test_fixtures::i827_two_backends_race_one_nonce(
+            &a, &b, "sqlite", 64,
+        )
+        .await;
+    }
+
+    /// **I827b** — V189's backfill on proposals that already share a pair
+    /// (admitted before #1047): the EARLIEST keeps the claim, every legacy row
+    /// stays, and a new proposal under the pair is refused naming it.
+    #[tokio::test]
+    async fn i827b_the_claim_backfill_keeps_every_legacy_row_sqlite() {
+        use crate::federation::FederationDirectory as _;
+        use crate::store::Backend as _;
+        let b = SqliteBackend::open_in_memory().await.unwrap();
+        b.run_migrations().await.unwrap();
+        let fixtures = crate::federation::accord_quorum::test_fixtures::proposal;
+        let older = fixtures("fam-i827b", "nonce-i827b");
+        let mut newer = older.clone();
+        newer.window_until = "2030-01-01T00:00:00Z".to_owned();
+        b.put_accord_proposal(older.clone(), None).await.unwrap();
+        // Reproduce the pre-#1047 state: a second row under the pair, written
+        // around the door, and no claim table content.
+        let (od, nd) = (older.digest(), newer.digest());
+        b.write(move |conn| -> Result<(), rusqlite::Error> {
+            conn.execute(
+                "INSERT INTO accord_proposal (proposal_digest, family_key_id, action, nonce, \
+                    window_until, prior_family_digest, payload_sha256, proposal_json, \
+                    authority_signature, persist_row_hash, created_at) \
+                 SELECT ?2, family_key_id, action, nonce, window_until, prior_family_digest, \
+                    payload_sha256, proposal_json, authority_signature, persist_row_hash, \
+                    '2999-01-01T00:00:00+00:00' \
+                 FROM accord_proposal WHERE proposal_digest = ?1",
+                rusqlite::params![od, nd],
+            )?;
+            conn.execute("DELETE FROM accord_proposal_nonce_claim", [])?;
+            // V189's backfill, as shipped.
+            let v189 =
+                include_str!("../../migrations/sqlite/lens/V189__accord_proposal_nonce_claim.sql");
+            let backfill = &v189[v189
+                .find("INSERT INTO accord_proposal_nonce_claim")
+                .unwrap()..];
+            conn.execute_batch(backfill)
+        })
+        .await
+        .unwrap();
+        let owner: String = b
+            .read(|conn| {
+                conn.query_row(
+                    "SELECT proposal_digest FROM accord_proposal_nonce_claim \
+                     WHERE family_key_id = 'fam-i827b' AND nonce = 'nonce-i827b'",
+                    [],
+                    |r| r.get(0),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(owner, older.digest(), "I827b: the earliest keeps the claim");
+        assert!(b
+            .get_accord_proposal(&older.digest())
+            .await
+            .unwrap()
+            .is_some());
+        assert!(
+            b.get_accord_proposal(&newer.digest())
+                .await
+                .unwrap()
+                .is_some(),
+            "I827b: no legacy row is deleted"
+        );
+        let mut third = older.clone();
+        third.window_until = "2029-01-01T00:00:00Z".to_owned();
+        let e = b.put_accord_proposal(third, None).await.unwrap_err();
+        assert!(
+            matches!(&e, crate::federation::Error::AccordProposalNonceReused { existing_proposal_digest, .. }
+                if *existing_proposal_digest == older.digest()),
+            "I827b: {e:?}"
+        );
+    }
     use crate::schema::{LlmCallStatus, ReasoningEventType, TraceLevel};
     use chrono::{TimeZone, Utc};
 

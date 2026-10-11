@@ -11034,20 +11034,30 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         )
         .await
         .map_err(|e| Error::Backend(format!("accord_proposal nonce lock: {e}")))?;
-        let other = tx
-            .query_opt(
-                "SELECT proposal_digest FROM cirislens.accord_proposal \
-                 WHERE family_key_id = $1 AND nonce = $2 AND proposal_digest <> $3 LIMIT 1",
-                &[&prep.family_key_id, &prep.nonce, &prep.proposal_digest],
+        // Codex round 3 on PR #1057 — and the V189 claim's PRIMARY KEY makes
+        // the pair the database's invariant on both dialects, not only this
+        // door's lock.
+        tx.execute(
+            "INSERT INTO cirislens.accord_proposal_nonce_claim \
+                (family_key_id, nonce, proposal_digest) VALUES ($1, $2, $3) \
+             ON CONFLICT (family_key_id, nonce) DO NOTHING",
+            &[&prep.family_key_id, &prep.nonce, &prep.proposal_digest],
+        )
+        .await
+        .map_err(|e| Error::Backend(format!("accord_proposal nonce claim: {e}")))?;
+        let owner: String = tx
+            .query_one(
+                "SELECT proposal_digest FROM cirislens.accord_proposal_nonce_claim \
+                 WHERE family_key_id = $1 AND nonce = $2",
+                &[&prep.family_key_id, &prep.nonce],
             )
             .await
+            .map_err(|e| Error::Backend(format!("accord_proposal nonce read: {e}")))?
+            .try_get(0)
             .map_err(|e| Error::Backend(format!("accord_proposal nonce read: {e}")))?;
-        if let Some(row) = other {
-            let other: String = row
-                .try_get(0)
-                .map_err(|e| Error::Backend(format!("accord_proposal nonce read: {e}")))?;
+        if owner != prep.proposal_digest {
             return Err(crate::federation::accord_quorum::nonce_reused(
-                &proposal, &other,
+                &proposal, &owner,
             ));
         }
         tx.execute(
@@ -30997,6 +31007,25 @@ pub(crate) mod postgres_serial_scan {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **I827** (v54.1.0, Codex round 3 on PR #1057) — two
+    /// `PostgresBackend` instances on ONE database race one accord nonce:
+    /// exactly one proposal wins.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn i827_two_backends_on_one_database_race_one_nonce_postgres() {
+        use crate::store::Backend as _;
+        let Some(dsn) = crate::test_pg::isolated_dsn() else {
+            return;
+        };
+        let a = PostgresBackend::connect(&dsn).await.unwrap();
+        a.run_migrations().await.unwrap();
+        let b = PostgresBackend::connect(&dsn).await.unwrap();
+        b.run_migrations().await.unwrap();
+        crate::federation::accord_quorum::test_fixtures::i827_two_backends_race_one_nonce(
+            &a, &b, "postgres", 64,
+        )
+        .await;
+    }
     use crate::federation::membership_acceptance::test_support::ConsentedWidening as _;
     use chrono::TimeZone;
 
