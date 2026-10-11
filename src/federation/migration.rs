@@ -614,6 +614,30 @@ pub fn accountability_record_family(dimension: &str) -> Option<&'static str> {
         .find(|p| dimension.starts_with(p))
 }
 
+/// v54.1.0 (Codex on PR #1057) — [`accountability_record_family`] as a SQL
+/// predicate over the text column `column` (the generated `dimension` column
+/// of `federation_attestations`), rendered FROM
+/// [`ACCOUNTABILITY_RECORD_PREFIXES`] so the serve read and the purge delete
+/// door ask the one list, never a second spelling of it. `substr` is a prefix
+/// test with no pattern syntax to escape (a LIKE would read the `_` in
+/// `moderation_track_record:` as a wildcard), the same in SQLite and Postgres;
+/// a NULL column is not an accountability record (`COALESCE` to false, as the
+/// Rust predicate answers `None` for a row with no dimension).
+#[must_use]
+pub fn accountability_record_sql(column: &str) -> String {
+    let arms: Vec<String> = ACCOUNTABILITY_RECORD_PREFIXES
+        .iter()
+        .map(|p| {
+            format!(
+                "substr({column}, 1, {}) = '{}'",
+                p.chars().count(),
+                p.replace('\'', "''")
+            )
+        })
+        .collect();
+    format!("COALESCE(({}), FALSE)", arms.join(" OR "))
+}
+
 /// **The rows that carry an EXCLUSION — never purged.**
 ///
 /// See the module doc: exclusion of a previously slashed / leaked / de-admitted

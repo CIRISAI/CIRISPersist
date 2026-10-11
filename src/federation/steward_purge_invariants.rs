@@ -113,6 +113,14 @@
 //!   only the survivor, a bucket it alone filled is GONE (not left at its old
 //!   count), and the fleet read no longer counts it — including a bucket older
 //!   than the lazy refresh's watermark tail, which no refresh revisits.
+//! - **I697** (Codex on PR #1057) — replication order cannot purge the
+//!   accountability record: a quorum-cosigned bundle naming ids this node does
+//!   not hold yet applies (a bundle legitimately names unheld rows); when
+//!   those ids then arrive as a `key:revocation` row and a
+//!   `moderation_track_record:*` row they are ADMITTED and served, the
+//!   tombstone is void for them (`purge_status.voided`), and `purge_finalize`
+//!   (and the delete door itself) never deletes them. An ordinary row at a
+//!   tombstoned id is still `purge_tombstoned`.
 //! - **I666** — a `key:` (or `federation_keys:`) id is not a purge record:
 //!   `purge_selection_malformed`, naming `key:revocation` as key retirement's
 //!   own act.
@@ -2368,6 +2376,119 @@ pub(crate) mod bodies {
         assert_eq!(d.rollup_trace_counts(z).await, vec![1], "I696: untouched");
     }
 
+    // ── I697 ──────────────────────────────────────────────────────────────
+    /// A federation-tier `scores` row at `id` on `dimension`, really signed.
+    fn fed_row(id: &str, attester: &str, attested: &str, dimension: &str) -> Attestation {
+        let env = serde_json::json!({
+            "dimension": dimension,
+            "score": 1.0,
+            "confidence": 0.9,
+        });
+        let mut row = ts::bare_attestation(id, attester, attested, &env);
+        row.attestation_type = attestation_type::SCORES.to_owned();
+        ts::reseal(&mut row);
+        row
+    }
+
+    pub(crate) async fn i697_a_tombstone_never_reaches_the_accountability_record<D: Seams>(d: &D) {
+        root(d).await;
+        let dir = d.as_dyn_directory();
+        let t = now();
+        let revocation = uuid::Uuid::new_v4().to_string();
+        let track = uuid::Uuid::new_v4().to_string();
+        let plain = uuid::Uuid::new_v4().to_string();
+        // A bundle naming three ids this node does not hold yet.
+        let mut ids: Vec<String> = [&revocation, &track, &plain]
+            .iter()
+            .map(|id| format!("attestation:{id}"))
+            .collect();
+        ids.sort();
+        let template = serde_json::json!({
+            "legal_basis": sp::STEWARD_PURGE_BASIS,
+            "content_sha256": sp::selection_digest(&ids),
+            "content_holder_key_ids": [],
+        });
+        let bundle = sp::PurgeBundle {
+            notice: notice_for(&template, &[cc::FOUNDERS[0], cc::FOUNDERS[1]], t),
+            record_ids: ids.clone(),
+            derived_from: vec![String::new(); ids.len()],
+            admitted_at: t,
+        };
+        let applied = sp::apply_replicated_purge(dir, &bundle, NODE, t)
+            .await
+            .expect("I697: a bundle may name rows this node does not hold yet");
+        assert_eq!(applied.tombstoned, 3);
+
+        // The named rows ARRIVE: the accountability record is admitted.
+        for (id, attester, attested, dimension) in [
+            (&revocation, AGENT, AGENT, "key:revocation:v1"),
+            (
+                &track,
+                HARNESS,
+                BYSTANDER,
+                "moderation_track_record:ciris-canonical:v1",
+            ),
+        ] {
+            dir.put_attestation(SignedAttestation {
+                attestation: fed_row(id, attester, attested, dimension),
+            })
+            .await
+            .unwrap_or_else(|e| {
+                panic!("I697: a {dimension} row is admitted over a tombstone: {e:?}")
+            });
+        }
+        // An ordinary row at a tombstoned id is still refused.
+        let e = dir
+            .put_attestation(SignedAttestation {
+                attestation: fed_row(&plain, SCORER, AGENT, "chat:message:v1"),
+            })
+            .await
+            .expect_err("I697: an ordinary tombstoned row is refused");
+        let (tok, body) = refusal(&e);
+        assert_eq!(tok, token::TOMBSTONED, "I697: {body}");
+
+        let served = served_ids(d).await;
+        for id in [&revocation, &track] {
+            assert!(served.contains(id), "I697: {id} is served");
+        }
+        assert!(!served.contains(&plain));
+        let notice_id = applied.notice_id;
+        let later = t + chrono::Duration::seconds(sp::PURGE_SETTLE_DWELL_SECS + 1);
+        let mut voided = vec![
+            format!("attestation:{revocation}"),
+            format!("attestation:{track}"),
+        ];
+        voided.sort();
+        let mut st = sp::purge_status(dir, &notice_id, later).await.unwrap();
+        st.voided.sort();
+        assert_eq!(
+            st.voided, voided,
+            "I697: the ledger names the void tombstones"
+        );
+
+        // The delete door itself never deletes them, and neither does finalize.
+        assert!(!dir
+            .purge_delete_tombstoned_attestation(&revocation)
+            .await
+            .unwrap());
+        let mut fin = sp::purge_finalize(dir, &notice_id, later, None)
+            .await
+            .expect("finalizes");
+        fin.voided.sort();
+        assert_eq!(fin.voided, voided, "I697: {fin:?}");
+        assert_eq!(fin.attestations_deleted, 0, "I697: {fin:?}");
+        for id in [&revocation, &track] {
+            assert!(
+                dir.get_attestation(id).await.unwrap().is_some(),
+                "I697: {id} survives finalize"
+            );
+        }
+        let served = served_ids(d).await;
+        for id in [&revocation, &track] {
+            assert!(served.contains(id), "I697: {id} is served after finalize");
+        }
+    }
+
     // ── I660 ──────────────────────────────────────────────────────────────
     pub(crate) async fn i660_the_delete_doors_re_ask_the_tombstone<D: Seams>(d: &D) {
         root(d).await;
@@ -2516,6 +2637,11 @@ mod run {
                     b::i695_the_header_and_its_tombstones_are_one_write(&d).await
                 }
                 #[tokio::test]
+                async fn i697() {
+                    let Some(d) = $fresh.await else { return };
+                    b::i697_a_tombstone_never_reaches_the_accountability_record(&d).await
+                }
+                #[tokio::test]
                 async fn i664() {
                     let Some(d) = $fresh.await else { return };
                     b::i664_the_tombstone_row_holds_another_basis(&d).await
@@ -2632,6 +2758,12 @@ mod run {
             assert!(
                 serve.contains("purge_tombstones"),
                 "I661 {backend}: the serve read withholds tombstoned rows"
+            );
+            // Codex on PR #1057 (I697): except the accountability record, by
+            // the one shared list.
+            assert!(
+                serve.contains("migration::accountability_record_"),
+                "I661 {backend}: the serve read never withholds the accountability record"
             );
             // #1043 ruled: a row refused today is purged, never filtered at
             // the serve read.

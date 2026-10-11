@@ -4447,20 +4447,24 @@ impl crate::federation::FederationDirectory for SqliteBackend {
     ) -> Result<bool, crate::federation::Error> {
         let id = attestation_id.to_owned();
         // The door's own gate, in the statement: only a row a purge tombstone
-        // names is deleted. `attestation_subjects` follows by ON DELETE CASCADE.
-        self.write(move |conn| -> Result<usize, rusqlite::Error> {
-            conn.execute(
-                "DELETE FROM federation_attestations WHERE attestation_id = ?1 \
-                   AND EXISTS (SELECT 1 FROM purge_tombstones \
-                               WHERE plane = 'attestation' AND record_ref = ?1)",
-                [&id],
-            )
-        })
-        .await
-        .map(|n| n > 0)
-        .map_err(|e| {
-            crate::federation::Error::Backend(format!("purge_delete_tombstoned_attestation: {e}"))
-        })
+        // names is deleted, and never the accountability record (Codex on PR
+        // #1057: a tombstone is void for it). `attestation_subjects` follows by
+        // ON DELETE CASCADE.
+        let sql = format!(
+            "DELETE FROM federation_attestations WHERE attestation_id = ?1 \
+               AND EXISTS (SELECT 1 FROM purge_tombstones \
+                           WHERE plane = 'attestation' AND record_ref = ?1) \
+               AND NOT {}",
+            crate::federation::migration::accountability_record_sql("dimension")
+        );
+        self.write(move |conn| -> Result<usize, rusqlite::Error> { conn.execute(&sql, [&id]) })
+            .await
+            .map(|n| n > 0)
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!(
+                    "purge_delete_tombstoned_attestation: {e}"
+                ))
+            })
     }
 
     async fn purge_delete_tombstoned_trace(
@@ -13231,13 +13235,18 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         )
         .map(|p| format!(" AND {p}"))
         .unwrap_or_default();
+        let accountability = crate::federation::migration::accountability_record_sql(
+            "federation_attestations.dimension",
+        );
         let (read, bytes) = self
             .read_measured(move |conn| -> Result<Vec<_>, rusqlite::Error> {
                 // E5 invariant: `tier = 'federation'` only — a local-tier row
                 // must never reach the advertise/serve wire surface.
                 //
                 // v54.1.0 (CIRISPersist#1046) — a tombstoned row is never
-                // served; excluded in the SQL, before the page is cut.
+                // served; excluded in the SQL, before the page is cut. Unless
+                // it is the accountability record (Codex on PR #1057): a
+                // tombstone is void for it.
                 let mut stmt = conn.prepare(&format!(
                     "SELECT attestation_id, attesting_key_id, attested_key_id, attestation_type, \
                     weight, asserted_at, expires_at, attestation_envelope, \
@@ -13248,11 +13257,13 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                  FROM federation_attestations \
                  WHERE (?1 IS NULL OR {pos} > ?1 OR ({pos} = ?1 AND attestation_id > ?2)) \
                    AND tier = 'federation'{row_type_filter} \
-                   AND NOT EXISTS (SELECT 1 FROM purge_tombstones pt \
-                                   WHERE pt.plane = 'attestation' \
-                                     AND pt.record_ref = federation_attestations.attestation_id) \
+                   AND (NOT EXISTS (SELECT 1 FROM purge_tombstones pt \
+                                    WHERE pt.plane = 'attestation' \
+                                      AND pt.record_ref = federation_attestations.attestation_id) \
+                        OR {accountability}) \
                  ORDER BY {pos} ASC, attestation_id ASC LIMIT ?3",
                     pos = POS_ATTESTATION,
+                    accountability = accountability,
                 ))?;
                 let rows = stmt.query_map(rusqlite::params![since_at, since_id, limit], |row| {
                     let pos: String = row.get("_pos")?;

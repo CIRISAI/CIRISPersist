@@ -1674,6 +1674,11 @@ pub struct PurgeStatus {
     pub settles_at: chrono::DateTime<chrono::Utc>,
     /// Tombstones recorded, per plane.
     pub tombstones: BTreeMap<String, u64>,
+    /// Record ids whose tombstone is VOID: the row the id names arrived after
+    /// the tombstone and is the accountability record
+    /// ([`refuse_if_tombstoned_attestation`]), so it is admitted, served and
+    /// never deleted.
+    pub voided: Vec<String>,
 }
 
 async fn execution_or_unknown<F>(directory: &F, notice_id: &str) -> Result<PurgeExecution, Error>
@@ -1709,8 +1714,14 @@ where
     let mut tombstones = BTreeMap::new();
     let held = directory.purge_tombstones_of(notice_id).await?;
     let complete = held.len() as u64 == execution.record_count;
+    let mut voided = Vec::new();
     for t in held {
         *tombstones.entry(t.plane.as_str().to_owned()).or_insert(0) += 1;
+        if t.plane == PurgePlane::Attestation
+            && voided_by_accountability(directory, &t.record_ref).await?
+        {
+            voided.push(t.record_id());
+        }
     }
     let settles = settles_at(&execution);
     let state = if execution.finalized_at.is_some() {
@@ -1727,7 +1738,20 @@ where
         state,
         settles_at: settles,
         tombstones,
+        voided,
     })
+}
+
+/// Is the tombstone on attestation `id` void — is the row it names held here
+/// and the accountability record ([`accountability_record_of`])?
+async fn voided_by_accountability<F>(directory: &F, id: &str) -> Result<bool, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    Ok(directory
+        .get_attestation(id)
+        .await?
+        .is_some_and(|row| accountability_record_of(&row).is_some()))
 }
 
 /// **The ledger** of an executed purge, as TSV for
@@ -1840,6 +1864,11 @@ pub struct FinalizeReport {
     pub trace_llm_calls_deleted: u64,
     /// Blobs evicted.
     pub blobs_evicted: u64,
+    /// Tombstoned record ids NOT deleted because the tombstone is void: the
+    /// row arrived after it and is the accountability record
+    /// ([`refuse_if_tombstoned_attestation`]).
+    #[serde(default)]
+    pub voided: Vec<String>,
 }
 
 /// **`purge_finalize(notice_id)`** — the hard delete, after settle (CSD-108
@@ -1894,6 +1923,12 @@ where
                     report.trace_llm_calls_deleted += calls;
                 }
                 PurgePlane::Attestation => {
+                    // The accountability record is never deleted, whatever
+                    // tombstone names it (the delete door re-asks this too).
+                    if voided_by_accountability(directory, &r.id).await? {
+                        report.voided.push(r.record_id());
+                        continue;
+                    }
                     directory.purge_attestation_projections(&r.id).await?;
                     if directory.purge_delete_tombstoned_attestation(&r.id).await? {
                         report.attestations_deleted += 1;
@@ -2183,7 +2218,24 @@ where
     }
 }
 
+/// The accountability family `row` belongs to, if any
+/// (CLM-accountability-record-unpurgeable, [`ACCOUNTABILITY_RECORD_PREFIXES`]).
+#[must_use]
+pub fn accountability_record_of(row: &Attestation) -> Option<&'static str> {
+    super::admission::envelope_dimension(&row.attestation_envelope).and_then(accountability_family)
+}
+
 /// The attestation door's gate: the row's id on the claims plane.
+///
+/// **A tombstone never reaches the accountability record** (Codex on PR
+/// #1057; CLM-accountability-record-unpurgeable, "by the root or anyone"). A
+/// bundle may name an id this node does not hold yet — that is legitimate,
+/// and the receiver cannot judge a row it has not seen. When the row the id
+/// names ARRIVES and it is a `revocation:*`, `key:revocation`,
+/// `moderation:*`, `moderation_track_record:*` or `slashing:*` row, the
+/// tombstone is VOID for it: the row is admitted, served, and never deleted
+/// by `purge_finalize` ([`PurgeStatus::voided`] names it). Replication order
+/// cannot do what no notice may. Every other row stays refused.
 ///
 /// # Errors
 ///
@@ -2195,6 +2247,9 @@ pub async fn refuse_if_tombstoned_attestation<F>(
 where
     F: FederationDirectory + ?Sized,
 {
+    if accountability_record_of(row).is_some() {
+        return Ok(());
+    }
     refuse_if_tombstoned(directory, PurgePlane::Attestation, &row.attestation_id).await
 }
 

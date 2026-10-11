@@ -6027,15 +6027,19 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .await
             .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
         // The door's own gate, in the statement: only a row a purge tombstone
-        // names. The V106 / V121 cascades follow as on the purge path.
+        // names, and never the accountability record (Codex on PR #1057: a
+        // tombstone is void for it). The V106 / V121 cascades follow as on the
+        // purge path.
+        let sql = format!(
+            "DELETE FROM cirislens.federation_attestations \
+             WHERE attestation_id = $1 \
+               AND EXISTS (SELECT 1 FROM cirislens.purge_tombstones \
+                           WHERE plane = 'attestation' AND record_ref = $1) \
+               AND NOT {}",
+            crate::federation::migration::accountability_record_sql("dimension")
+        );
         let n = client
-            .execute(
-                "DELETE FROM cirislens.federation_attestations \
-                 WHERE attestation_id = $1 \
-                   AND EXISTS (SELECT 1 FROM cirislens.purge_tombstones \
-                               WHERE plane = 'attestation' AND record_ref = $1)",
-                &[&attestation_id],
-            )
+            .execute(sql.as_str(), &[&attestation_id])
             .await
             .map_err(|e| {
                 crate::federation::Error::Backend(format!(
@@ -15080,10 +15084,15 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                      WHERE ($1::timestamptz IS NULL OR \
                             (admitted_at, attestation_id::text) > ($1, $2)) \
                        AND tier = 'federation'{row_type_filter} \
-                       AND NOT EXISTS (SELECT 1 FROM cirislens.purge_tombstones pt \
-                                       WHERE pt.plane = 'attestation' \
-                                         AND pt.record_ref = fa.attestation_id::text) \
-                     ORDER BY admitted_at ASC, attestation_id ASC LIMIT $3"
+                       AND (NOT EXISTS (SELECT 1 FROM cirislens.purge_tombstones pt \
+                                        WHERE pt.plane = 'attestation' \
+                                          AND pt.record_ref = fa.attestation_id::text) \
+                            OR {accountability}) \
+                     ORDER BY admitted_at ASC, attestation_id ASC LIMIT $3",
+                    // Codex on PR #1057 — a tombstone is void for the
+                    // accountability record: it is served.
+                    accountability =
+                        crate::federation::migration::accountability_record_sql("fa.dimension"),
                 ),
                 &[&since_at, &since_id, &limit],
             )

@@ -3318,12 +3318,18 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         attestation_id: &str,
     ) -> Result<bool, crate::federation::Error> {
         let mut state = self.state.lock().expect("memory backend lock");
-        // The door's own gate: only a row a purge tombstone names.
+        // The door's own gate: only a row a purge tombstone names, and never
+        // the accountability record (Codex on PR #1057: a tombstone is void
+        // for it).
         let tombstoned = state
             .purge_tombstones
             .keys()
             .any(|(_, p, r)| p == "attestation" && r == attestation_id);
-        if !tombstoned {
+        let accountability = state.federation_attestations.iter().any(|a| {
+            a.attestation_id == attestation_id
+                && crate::federation::steward_purge::accountability_record_of(a).is_some()
+        });
+        if !tombstoned || accountability {
             return Ok(false);
         }
         let before = state.federation_attestations.len();
@@ -10606,9 +10612,16 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                     && crate::federation::row_type::served_under_enforcement(a)
                     // v54.1.0 (CIRISPersist#1046) — a tombstoned row is never
                     // served; filtered BEFORE the page is cut.
-                    && !state.purge_tombstones.keys().any(|(_, p, r)| {
+                    && (!state.purge_tombstones.keys().any(|(_, p, r)| {
                         p == "attestation" && *r == a.attestation_id
                     })
+                        // Codex on PR #1057 — a tombstone is void for the
+                        // accountability record: it is served.
+                        || crate::federation::admission::envelope_dimension(
+                            &a.attestation_envelope,
+                        )
+                        .and_then(crate::federation::migration::accountability_record_family)
+                        .is_some())
                     && since.as_ref().is_none_or(|(s_at, s_id)| {
                         (position(a), a.attestation_id.as_str()) > (*s_at, s_id.as_str())
                     })
