@@ -2717,6 +2717,34 @@ where
     held_row_voided(directory, &crate::ingest::trace_attestation_id(trace_id)).await
 }
 
+/// v54.1.0 (Codex round 4 sweep on PR #1057) — **a trace-keyed derived row
+/// for a purged trace is refused** ([`token::TOMBSTONED`]), unless the
+/// trace's tombstone is void (its own attestation is held with a
+/// [`tombstone_void_reason`]). The detection-event door asks it: a detection
+/// arriving after the purge would otherwise re-attach the purged trace's
+/// linkage and content the finalize tombstoned.
+///
+/// # Errors
+///
+/// [`token::TOMBSTONED`]; the lookups' read errors.
+pub async fn refuse_if_tombstoned_trace<F>(directory: &F, trace_id: &str) -> Result<(), Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    match directory
+        .purge_tombstoned(PurgePlane::Trace.as_str(), trace_id)
+        .await
+    {
+        Ok(None) | Err(Error::Unsupported { .. }) => return Ok(()),
+        Ok(Some(_)) => {}
+        Err(e) => return Err(e),
+    }
+    if trace_voided(directory, trace_id).await? {
+        return Ok(());
+    }
+    refuse_if_tombstoned(directory, PurgePlane::Trace, trace_id).await
+}
+
 /// The attestation door's gate: the row's id on the claims plane.
 ///
 /// **A tombstone never reaches the accountability record** (Codex on PR

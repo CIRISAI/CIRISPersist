@@ -155,6 +155,8 @@
 //!   detection events (the DSAR door's own function, same transaction): no
 //!   event names the trace or returns its body hash or canonical bytes; an
 //!   unrelated trace's event is untouched.
+//!   (Round-4 sweep) a detection arriving AFTER the purge is refused
+//!   `purge_tombstoned` and not stored.
 //! - **I826** (Codex round 3 on PR #1057; memory, sqlite, postgres) — a
 //!   finalized trace purge removes the thought-signature row no remaining
 //!   event cites: a later trace reusing the thought_id reads ITS OWN
@@ -3019,6 +3021,25 @@ pub(crate) mod bodies {
             .unwrap();
         assert_eq!(kept.len(), 1, "I825: the unrelated event is untouched");
         assert_eq!(kept[0].canonical_bytes, b"kept-body");
+        // The round-4 sweep: a detection ARRIVING after the purge cannot
+        // re-attach the purged trace's linkage and content.
+        let e = d
+            .put_detection_event(detection("trace-i825", b"late-body"))
+            .await
+            .expect_err("I825: a detection naming a purged trace is refused");
+        assert!(
+            matches!(&e, crate::derived::Error::InvalidArgument(m) if m.starts_with(token::TOMBSTONED)),
+            "I825: {e:?}"
+        );
+        assert!(d
+            .get_detection_events(crate::derived::EventFilter {
+                trace_id: Some("trace-i825".to_owned()),
+                detector: None,
+                since: None,
+            })
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     pub(crate) async fn i826_a_reused_thought_reads_its_own_signature<D: Seams>(d: &D) {

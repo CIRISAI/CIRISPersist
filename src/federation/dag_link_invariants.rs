@@ -682,6 +682,20 @@ pub(crate) mod bodies {
                 "I823 chunk {seq} is not served by hash"
             );
         }
+        // The round-4 sweep: the tombstone outlives the bytes, so a manifest
+        // re-delivered after finalize is held but never served again.
+        p.b.adopt_sealed_blob(
+            &inline(p.sa.as_ref(), &root).await,
+            prov(&p),
+            None,
+            AdoptDisposition::LocalOnly,
+        )
+        .await
+        .expect("I823: the bytes may be re-delivered");
+        assert!(
+            matches!(served(&p, &root).await, Err(BlobError::Purged { .. })),
+            "I823: a re-delivered purged manifest stays withheld"
+        );
         assert!(
             p.sb.has_blob(&shared).await.unwrap(),
             "I823 a chunk a live DAG relates stays"

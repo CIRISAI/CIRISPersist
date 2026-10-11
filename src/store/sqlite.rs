@@ -29307,6 +29307,17 @@ impl crate::derived::DerivedSchema for SqliteBackend {
                 event.ml_dsa_65_sig.len()
             )));
         }
+        // v54.1.0 (Codex round 4 sweep on PR #1057) — a detection naming a
+        // trace a steward purge tombstoned is refused: it would re-attach the
+        // linkage and content the purge's finalize tombstoned.
+        crate::federation::steward_purge::refuse_if_tombstoned_trace(self, &event.trace_id)
+            .await
+            .map_err(|e| match e {
+                crate::federation::Error::PurgeRefused { .. } => {
+                    crate::derived::Error::InvalidArgument(format!("{}: {e}", e.kind()))
+                }
+                other => crate::derived::Error::Backend(other.to_string()),
+            })?;
 
         let cohort_cell = serde_json::to_string(&event.cohort_cell)
             .map_err(|e| crate::derived::Error::Backend(format!("cohort_cell encode: {e}")))?;

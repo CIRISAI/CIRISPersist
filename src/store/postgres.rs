@@ -30541,6 +30541,18 @@ impl crate::derived::DerivedSchema for PostgresBackend {
             )));
         }
 
+        // v54.1.0 (Codex round 4 sweep on PR #1057) — a detection naming a
+        // trace a steward purge tombstoned is refused: it would re-attach the
+        // linkage and content the purge's finalize tombstoned.
+        crate::federation::steward_purge::refuse_if_tombstoned_trace(self, &event.trace_id)
+            .await
+            .map_err(|e| match e {
+                crate::federation::Error::PurgeRefused { .. } => {
+                    crate::derived::Error::InvalidArgument(format!("{}: {e}", e.kind()))
+                }
+                other => crate::derived::Error::Backend(other.to_string()),
+            })?;
+
         // Idempotent on detection_id collision; raise Conflict on
         // collision-with-different-canonical_bytes.
         let result = client
