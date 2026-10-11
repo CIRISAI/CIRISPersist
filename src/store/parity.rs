@@ -381,6 +381,10 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // IMMEDIATE transaction (the write lock before the held-digest read).
     ("transaction_with_behavior", Class::Plumbing),
     ("pg_tombstone_detection_events", Class::Plumbing),
+    // v54.1.0 (Codex round 4 sweep) — Plumbing: the orphaned thought-signature
+    // cleanup both trace-removal doors run in their transaction.
+    ("sqlite_drop_orphaned_thought_signatures", Class::Plumbing),
+    ("pg_drop_orphaned_thought_signatures", Class::Plumbing),
     ("check_skew_and_payment", Class::Gate),
     ("check_trace_dimension_admission", Class::Gate),
     ("check_trust_charter_admission", Class::Gate),

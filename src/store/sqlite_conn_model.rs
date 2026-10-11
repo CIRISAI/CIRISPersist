@@ -718,6 +718,10 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     // v54.1.0 (Codex round 3 on PR #1057) — the Art. 17 detection tombstone,
     // shared by the DSAR erasure and the steward purge's trace delete.
     ("sqlite_tombstone_detection_events", ConnClass::HelperWrite),
+    (
+        "sqlite_drop_orphaned_thought_signatures",
+        ConnClass::HelperWrite,
+    ),
     // v45.0.0 (#871) — the V149 `blob_renditions` projection, a free fn over
     // the writer's connection called from the three attestation doors.
     ("sqlite_project_rendition_row", ConnClass::HelperWrite),

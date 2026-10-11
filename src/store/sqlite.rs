@@ -1759,11 +1759,24 @@ impl Backend for SqliteBackend {
                         }
                     }
 
+                    // v54.1.0 (Codex round 4 sweep on PR #1057) — the agent's
+                    // thoughts, read before its rows go: their signature rows
+                    // are removed once no remaining event cites them (the
+                    // steward purge's own rule, one helper).
+                    let thought_ids: Vec<String> = {
+                        let mut stmt = tx.prepare(
+                            "SELECT DISTINCT thought_id FROM trace_events WHERE agent_id_hash = ?1",
+                        )?;
+                        let rows = stmt.query_map([&agent], |r| r.get::<_, String>(0))?;
+                        rows.collect::<Result<Vec<_>, _>>()?
+                    };
+
                     // Step 4: hard-delete the trace_events rows for the agent.
                     let trace_events = tx.execute(
                         "DELETE FROM trace_events WHERE agent_id_hash = ?1",
                         [&agent],
                     )? as u64;
+                    sqlite_drop_orphaned_thought_signatures(&tx, &thought_ids)?;
 
                     // Step 5: emit the `hard_case:trace_erasure` audit row inside
                     // the txn (atomic). Emit only when something was erased.
@@ -4578,16 +4591,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                         as u64;
                     let events =
                         tx.execute("DELETE FROM trace_events WHERE trace_id = ?1", [&id])? as u64;
-                    {
-                        let mut stmt = tx.prepare(
-                            "DELETE FROM trace_thought_signatures WHERE thought_id = ?1 \
-                               AND NOT EXISTS (SELECT 1 FROM trace_events \
-                                               WHERE trace_events.thought_id = ?1)",
-                        )?;
-                        for thought in &thought_ids {
-                            stmt.execute([thought])?;
-                        }
-                    }
+                    sqlite_drop_orphaned_thought_signatures(&tx, &thought_ids)?;
                     let recompute = sqlite_factor_rollup_upsert_sql(
                         "AND strftime('%Y-%m-%dT%H:00:00Z', te.ts) = ?1 \
                          AND te.agent_id_hash IS ?2 AND te.deployment_domain IS ?3 \
@@ -22889,6 +22893,26 @@ fn sqlite_row_to_outbound_row(
         claimed_until: claimed_until_str.as_deref().map(parse_rfc3339),
         claimed_by: row.get("claimed_by")?,
     })
+}
+
+/// v54.1.0 (Codex rounds 3 and 4 on PR #1057) — remove the
+/// `trace_thought_signatures` row of each of `thought_ids` that no remaining
+/// `trace_events` row cites, inside the caller's transaction, AFTER its event
+/// delete. Both trace-removal doors run it (the steward purge's trace delete,
+/// the DSAR erasure): an orphaned row would hand its signature to a later
+/// trace reusing the thought_id (the insert is ON CONFLICT DO NOTHING).
+fn sqlite_drop_orphaned_thought_signatures(
+    tx: &rusqlite::Transaction<'_>,
+    thought_ids: &[String],
+) -> Result<(), rusqlite::Error> {
+    let mut stmt = tx.prepare(
+        "DELETE FROM trace_thought_signatures WHERE thought_id = ?1 \
+           AND NOT EXISTS (SELECT 1 FROM trace_events WHERE trace_events.thought_id = ?1)",
+    )?;
+    for thought in thought_ids {
+        stmt.execute([thought])?;
+    }
+    Ok(())
 }
 
 /// The Art. 17 TOMBSTONE of the derived detection events (V080) for

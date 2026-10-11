@@ -781,6 +781,29 @@ const MIGRATION_LOCK_ID: i64 = 0x6369_7269_7370_7372_i64;
 /// `MIGRATION_LOCK_ID`; the low bytes spell `"rllup"` for greppability.
 const ROLLUP_REFRESH_LOCK_ID: i64 = 0x7263_6972_736c_7570_i64;
 
+/// v54.1.0 (Codex rounds 3 and 4 on PR #1057) — remove the
+/// `trace_thought_signatures` row of each of `thought_ids` that no remaining
+/// `trace_events` row cites, inside the caller's transaction, AFTER its event
+/// delete. Both trace-removal doors run it (the steward purge's trace delete,
+/// the DSAR erasure): an orphaned row would hand its signature to a later
+/// trace reusing the thought_id (the insert is ON CONFLICT DO NOTHING).
+async fn pg_drop_orphaned_thought_signatures(
+    tx: &tokio_postgres::Transaction<'_>,
+    thought_ids: &[String],
+) -> Result<u64, tokio_postgres::Error> {
+    if thought_ids.is_empty() {
+        return Ok(0);
+    }
+    tx.execute(
+        "DELETE FROM cirislens.trace_thought_signatures \
+         WHERE thought_id = ANY($1::text[]) \
+           AND NOT EXISTS (SELECT 1 FROM cirislens.trace_events e \
+                           WHERE e.thought_id = trace_thought_signatures.thought_id)",
+        &[&thought_ids],
+    )
+    .await
+}
+
 /// The Art. 17 TOMBSTONE of the derived detection events (V080) for
 /// `trace_ids`: NULL the PII linkage and content (`trace_id`, `body_sha256`,
 /// `canonical_bytes`) and stamp `erased_at`. NOT a delete. Only un-tombstoned
@@ -3558,6 +3581,21 @@ impl Backend for PostgresBackend {
             .map_err(|e| Error::Backend(format!("delete trace_llm_calls: {e}")))?
         };
 
+        // v54.1.0 (Codex round 4 sweep on PR #1057) — the agent's thoughts,
+        // read before its rows go: their signature rows are removed once no
+        // remaining event cites them (the steward purge's own rule, one
+        // helper).
+        let thought_ids: Vec<String> = tx
+            .query(
+                "SELECT DISTINCT thought_id FROM cirislens.trace_events WHERE agent_id_hash = $1",
+                &[&agent_id_hash],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("collect thought_ids: {e}")))?
+            .into_iter()
+            .map(|row| row.safe_get_with::<String, _, _, _>(0, Error::Backend))
+            .collect::<Result<_, _>>()?;
+
         // Step 4: hard-delete the trace_events rows for the agent.
         let trace_events = tx
             .execute(
@@ -3566,6 +3604,9 @@ impl Backend for PostgresBackend {
             )
             .await
             .map_err(|e| Error::Backend(format!("delete trace_events: {e}")))?;
+        pg_drop_orphaned_thought_signatures(&tx, &thought_ids)
+            .await
+            .map_err(|e| Error::Backend(format!("drop orphaned thought signatures: {e}")))?;
 
         // Step 5: emit the `hard_case:trace_erasure` audit row INSIDE the
         // txn (atomic with the erasure). Emit only when something was
@@ -6207,15 +6248,9 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             )
             .await
             .map_err(|e| crate::federation::Error::Backend(format!("purge trace events: {e}")))?;
-        tx.execute(
-            "DELETE FROM cirislens.trace_thought_signatures \
-             WHERE thought_id = ANY($1::text[]) \
-               AND NOT EXISTS (SELECT 1 FROM cirislens.trace_events e \
-                               WHERE e.thought_id = trace_thought_signatures.thought_id)",
-            &[&thought_ids],
-        )
-        .await
-        .map_err(|e| crate::federation::Error::Backend(format!("purge signatures: {e}")))?;
+        pg_drop_orphaned_thought_signatures(&tx, &thought_ids)
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("purge signatures: {e}")))?;
         let recompute = pg_factor_rollup_upsert_sql(
             "WHERE te.cohort_scope NOT IN ('self','family') \
                AND date_trunc('hour', te.ts) = $1 \

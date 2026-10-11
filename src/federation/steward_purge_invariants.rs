@@ -172,6 +172,9 @@
 //!   subject key does not resolve here (no person PROVEN), at a tombstoned id
 //!   are still `purge_tombstoned`; and the serve-by-hash reload withholds a
 //!   tombstoned row during the dwell.
+//! - **I831** (Codex round 4 sweep on PR #1057; memory, sqlite, postgres) —
+//!   the DSAR erasure drops the orphaned thought signature too (the purge's
+//!   helper): a later trace reusing the thought_id reads its own signature.
 //! - **I666** — a `key:` (or `federation_keys:`) id is not a purge record:
 //!   `purge_selection_malformed`, naming `key:revocation` as key retirement's
 //!   own act.
@@ -3258,6 +3261,43 @@ pub(crate) mod bodies {
         );
     }
 
+    /// **I831** (Codex round 4 sweep on PR #1057) — the DSAR erasure
+    /// (`delete_traces_for_agent_id_hash`) removes the orphaned thought
+    /// signature too (one helper with the purge): a later trace reusing the
+    /// thought_id reads its own signature.
+    pub(crate) async fn i831_dsar_erasure_drops_orphaned_signatures<D: Seams>(d: &D) {
+        let signed = |trace: &str, agent: &str, sig: &str| {
+            let mut r = event_row(trace, AGENT, 0);
+            r.thought_id = "th-i831".to_owned();
+            r.agent_id_hash = agent.to_owned();
+            r.pqc_key_id = Some(AGENT.to_owned());
+            r.signature_ml_dsa_65 = Some(sig.to_owned());
+            r
+        };
+        d.insert_trace_events_batch(&[signed("trace-i831-old", "agent-i831-erased", "sig-old")])
+            .await
+            .unwrap();
+        d.delete_traces_for_agent_id_hash("agent-i831-erased")
+            .await
+            .unwrap();
+        d.insert_trace_events_batch(&[signed("trace-i831-new", "agent-i831-new", "sig-new")])
+            .await
+            .unwrap();
+        let rows = d
+            .fetch_trace_events_page(0, 1_000, Some("agent-i831-new"))
+            .await
+            .unwrap();
+        let sigs: Vec<Option<String>> = rows
+            .iter()
+            .map(|(_, r)| r.signature_ml_dsa_65.clone())
+            .collect();
+        assert_eq!(
+            sigs,
+            vec![Some("sig-new".to_owned())],
+            "I831: after a DSAR erasure the reused thought reads its own signature"
+        );
+    }
+
     // ── I660 ──────────────────────────────────────────────────────────────
     pub(crate) async fn i660_the_delete_doors_re_ask_the_tombstone<D: Seams>(d: &D) {
         root(d).await;
@@ -3444,6 +3484,11 @@ mod run {
                 async fn i828b() {
                     let Some(d) = $fresh.await else { return };
                     b::i828b_serve_by_hash_withholds_during_the_dwell(&d).await
+                }
+                #[tokio::test]
+                async fn i831() {
+                    let Some(d) = $fresh.await else { return };
+                    b::i831_dsar_erasure_drops_orphaned_signatures(&d).await
                 }
                 #[tokio::test]
                 async fn i664() {
