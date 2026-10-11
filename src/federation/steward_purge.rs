@@ -2496,6 +2496,7 @@ pub fn accountability_record_of(row: &Attestation) -> Option<&'static str> {
 /// # Errors
 ///
 /// The lookups' read errors.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
 pub(crate) async fn blob_purge_settled<F>(
     directory: &F,
     sha256: &[u8; 32],
