@@ -781,6 +781,31 @@ const MIGRATION_LOCK_ID: i64 = 0x6369_7269_7370_7372_i64;
 /// `MIGRATION_LOCK_ID`; the low bytes spell `"rllup"` for greppability.
 const ROLLUP_REFRESH_LOCK_ID: i64 = 0x7263_6972_736c_7570_i64;
 
+/// The Art. 17 TOMBSTONE of the derived detection events (V080) for
+/// `trace_ids`: NULL the PII linkage and content (`trace_id`, `body_sha256`,
+/// `canonical_bytes`) and stamp `erased_at`. NOT a delete. Only un-tombstoned
+/// rows are touched, so a re-run is a no-op. ONE spelling, run inside the
+/// caller's transaction by both trace-removal doors: the DSAR erasure
+/// (`delete_traces_for_agent_id_hash`) and the steward purge's trace delete
+/// (Codex round 3 on PR #1057). Returns the rows tombstoned.
+async fn pg_tombstone_detection_events(
+    tx: &tokio_postgres::Transaction<'_>,
+    trace_ids: &[String],
+    erased_at: chrono::DateTime<chrono::Utc>,
+) -> Result<u64, tokio_postgres::Error> {
+    if trace_ids.is_empty() {
+        return Ok(0);
+    }
+    tx.execute(
+        "UPDATE cirislens_derived.detection_events \
+         SET trace_id = NULL, body_sha256 = NULL, \
+             canonical_bytes = NULL, erased_at = $2 \
+         WHERE trace_id = ANY($1::text[]) AND erased_at IS NULL",
+        &[&trace_ids, &erased_at],
+    )
+    .await
+}
+
 /// CIRISPersist#222 — the rollup's whole-bucket recompute: an idempotent
 /// UPSERT re-aggregating the `cirislens.trace_events` rows `source_where`
 /// selects (a full `WHERE …` clause, which must carry the §10.1.4
@@ -3516,19 +3541,9 @@ impl Backend for PostgresBackend {
         // the trace_id set is still resolvable here for symmetry; the
         // tombstone reads its own table by trace_id so ordering is moot,
         // but keeping it inside the txn is what guarantees atomicity.
-        let detection_events_tombstoned = if trace_ids.is_empty() {
-            0u64
-        } else {
-            tx.execute(
-                "UPDATE cirislens_derived.detection_events \
-                 SET trace_id = NULL, body_sha256 = NULL, \
-                     canonical_bytes = NULL, erased_at = $2 \
-                 WHERE trace_id = ANY($1::text[]) AND erased_at IS NULL",
-                &[&trace_ids, &erased_at],
-            )
+        let detection_events_tombstoned = pg_tombstone_detection_events(&tx, &trace_ids, erased_at)
             .await
-            .map_err(|e| Error::Backend(format!("tombstone detection_events: {e}")))?
-        };
+            .map_err(|e| Error::Backend(format!("tombstone detection_events: {e}")))?;
 
         // Step 3: hard-delete the LLM call rows joined by trace_id.
         let trace_llm_calls = if trace_ids.is_empty() {
@@ -6096,6 +6111,26 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             )
             .await
             .map_err(|e| crate::federation::Error::Backend(format!("purge rollup groups: {e}")))?;
+        // Codex round 3 on PR #1057 — the trace's thoughts, read before its
+        // rows go: their signature row is removed below once no remaining
+        // event cites the thought, so a later trace reusing the thought_id
+        // stores its own (the insert is ON CONFLICT DO NOTHING).
+        let thought_ids: Vec<String> = tx
+            .query(
+                "SELECT DISTINCT thought_id FROM cirislens.trace_events WHERE trace_id = $1",
+                &[&trace_id],
+            )
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("purge thoughts: {e}")))?
+            .iter()
+            .map(|r| r.safe_get_with::<String, _, _, _>(0, crate::federation::Error::Backend))
+            .collect::<Result<_, _>>()?;
+        // The derived detection events take the Art. 17 tombstone, in this
+        // transaction (the same function the DSAR door runs).
+        let trace_ids = [trace_id.to_owned()];
+        pg_tombstone_detection_events(&tx, &trace_ids, chrono::Utc::now())
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("purge detections: {e}")))?;
         let calls = tx
             .execute(
                 "DELETE FROM cirislens.trace_llm_calls WHERE trace_id = $1",
@@ -6110,6 +6145,15 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             )
             .await
             .map_err(|e| crate::federation::Error::Backend(format!("purge trace events: {e}")))?;
+        tx.execute(
+            "DELETE FROM cirislens.trace_thought_signatures \
+             WHERE thought_id = ANY($1::text[]) \
+               AND NOT EXISTS (SELECT 1 FROM cirislens.trace_events e \
+                               WHERE e.thought_id = trace_thought_signatures.thought_id)",
+            &[&thought_ids],
+        )
+        .await
+        .map_err(|e| crate::federation::Error::Backend(format!("purge signatures: {e}")))?;
         let recompute = pg_factor_rollup_upsert_sql(
             "WHERE te.cohort_scope NOT IN ('self','family') \
                AND date_trunc('hour', te.ts) = $1 \
@@ -30465,6 +30509,10 @@ impl crate::derived::DerivedSchema for PostgresBackend {
             .await
             .map_err(|e| crate::derived::Error::Backend(e.to_string()))?;
 
+        // v54.1.0 (Codex round 3 on PR #1057) — an Art. 17 tombstoned event
+        // (DSAR erasure, or a steward purge of its trace) has no linkage or
+        // content left and is not a `DetectionEvent`: it is not returned.
+        // Before this, one tombstoned row made the read fail to decode.
         // Build the query with conditional filters. We collect
         // boxed-ToSql-trait-object refs into a Vec and pass as
         // a slice — same pattern other typed-filter paths use.
@@ -30474,7 +30522,7 @@ impl crate::derived::DerivedSchema for PostgresBackend {
                 cohort_cell, conformity_variant, conformity_payload, \
                 lens_core_version, ratchet_calibration_version, \
                 canonical_bytes, ed25519_sig, ml_dsa_65_sig, signing_key_id, ts \
-             FROM cirislens_derived.detection_events WHERE 1 = 1",
+             FROM cirislens_derived.detection_events WHERE erased_at IS NULL",
         );
         let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = Vec::new();
         if let Some(t) = filter.trace_id {

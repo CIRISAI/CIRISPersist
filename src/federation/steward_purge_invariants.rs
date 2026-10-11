@@ -150,6 +150,16 @@
 //!   `apply_replicated_purge`, the pyo3 `purge_*_json` /
 //!   `apply_replicated_purge_json`) takes a `now`, so no caller can advance
 //!   or backdate it.
+//! - **I825** (Codex round 3 on PR #1057; sqlite, postgres) — a finalized
+//!   trace purge takes the Art. 17 tombstone onto the trace's derived
+//!   detection events (the DSAR door's own function, same transaction): no
+//!   event names the trace or returns its body hash or canonical bytes; an
+//!   unrelated trace's event is untouched.
+//! - **I826** (Codex round 3 on PR #1057; memory, sqlite, postgres) — a
+//!   finalized trace purge removes the thought-signature row no remaining
+//!   event cites: a later trace reusing the thought_id reads ITS OWN
+//!   signature, not the purged one's; a thought another live trace shares
+//!   keeps its row.
 //! - **I666** — a `key:` (or `federation_keys:`) id is not a purge record:
 //!   `purge_selection_malformed`, naming `key:revocation` as key retirement's
 //!   own act.
@@ -2915,6 +2925,152 @@ pub(crate) mod bodies {
         );
     }
 
+    // ── I825 / I826 ───────────────────────────────────────────────────────
+    /// Execute and finalize a by-ids purge of one trace.
+    async fn purge_trace<D: Seams>(d: &D, trace_id: &str) {
+        let dir = d.as_dyn_directory();
+        let t = now();
+        let sel = PurgeSelection::ByIds {
+            ids: vec![format!("trace:{trace_id}")],
+        };
+        let dry = sp::purge_dry_run(dir, &sel).await.unwrap();
+        let notice = notice_for(&dry.notice_template, &[cc::FOUNDERS[0], cc::FOUNDERS[1]], t);
+        let rep = rows_at(dir, &sel, &notice, NODE, t).await.unwrap();
+        finalize_at(
+            dir,
+            &rep.notice_id,
+            t + chrono::Duration::seconds(sp::PURGE_SETTLE_DWELL_SECS + 1),
+            None,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    fn detection(trace_id: &str, canonical: &[u8]) -> crate::derived::DetectionEvent {
+        crate::derived::DetectionEvent {
+            detection_id: uuid::Uuid::new_v4(),
+            trace_id: trace_id.to_owned(),
+            body_sha256: vec![7u8; 32],
+            detector: "manifold_conformity_outlier".to_owned(),
+            severity: crate::derived::DetectionSeverity::Warning,
+            cohort_cell: serde_json::json!({"deployment_domain": "legal"}),
+            conformity_variant: crate::derived::ConformityVariant::Numeric,
+            conformity_payload: serde_json::json!({"score": 3.1}),
+            lens_core_version: "lc-1.0.0".to_owned(),
+            ratchet_calibration_version: 4,
+            canonical_bytes: canonical.to_vec(),
+            ed25519_sig: vec![1u8; 64],
+            ml_dsa_65_sig: vec![2u8; 3309],
+            signing_key_id: "key-lens".to_owned(),
+            ts: chrono::Utc::now(),
+        }
+    }
+
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    pub(crate) async fn i825_a_purged_traces_detections_are_tombstoned<
+        D: Seams + crate::derived::DerivedSchema,
+    >(
+        d: &D,
+    ) {
+        root(d).await;
+        seed_trace(d, "trace-i825", AGENT, "gpt-real").await;
+        seed_trace(d, "trace-i825-other", BYSTANDER, "gpt-real").await;
+        d.put_detection_event(detection("trace-i825", b"purged-body"))
+            .await
+            .unwrap();
+        d.put_detection_event(detection("trace-i825-other", b"kept-body"))
+            .await
+            .unwrap();
+        purge_trace(d, "trace-i825").await;
+        let all = d
+            .get_detection_events(crate::derived::EventFilter {
+                trace_id: None,
+                detector: None,
+                since: None,
+            })
+            .await
+            .expect("I825: the detection read still decodes every row");
+        assert!(
+            all.iter()
+                .all(|e| e.trace_id != "trace-i825" && e.canonical_bytes != b"purged-body"),
+            "I825: no event names the purged trace or returns its content: {:?}",
+            all.iter()
+                .map(|e| (&e.trace_id, String::from_utf8_lossy(&e.canonical_bytes)))
+                .collect::<Vec<_>>()
+        );
+        let kept = d
+            .get_detection_events(crate::derived::EventFilter {
+                trace_id: Some("trace-i825-other".to_owned()),
+                detector: None,
+                since: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(kept.len(), 1, "I825: the unrelated event is untouched");
+        assert_eq!(kept[0].canonical_bytes, b"kept-body");
+    }
+
+    pub(crate) async fn i826_a_reused_thought_reads_its_own_signature<D: Seams>(d: &D) {
+        root(d).await;
+        let signed = |trace: &str, attempt: u32, sig: &str| {
+            let mut r = event_row(trace, AGENT, attempt);
+            r.thought_id = "th-i826".to_owned();
+            r.agent_id_hash = "agent-i826".to_owned();
+            r.pqc_key_id = Some(AGENT.to_owned());
+            r.signature_ml_dsa_65 = Some(sig.to_owned());
+            r
+        };
+        let sig_of = |rows: &[(i64, TraceEventRow)], trace: &str| -> Vec<Option<String>> {
+            rows.iter()
+                .filter(|(_, r)| r.trace_id == trace)
+                .map(|(_, r)| r.signature_ml_dsa_65.clone())
+                .collect()
+        };
+        seed_trace(d, "trace-i826-old", AGENT, "gpt-real").await;
+        d.insert_trace_events_batch(&[signed("trace-i826-old", 0, "sig-old")])
+            .await
+            .unwrap();
+        // A thought another live trace shares keeps its row.
+        seed_trace(d, "trace-i826-live", AGENT, "gpt-real").await;
+        let mut shared = event_row("trace-i826-live", AGENT, 5);
+        shared.thought_id = "th-i826-shared".to_owned();
+        shared.agent_id_hash = "agent-i826".to_owned();
+        shared.pqc_key_id = Some(AGENT.to_owned());
+        shared.signature_ml_dsa_65 = Some("sig-shared".to_owned());
+        let mut shared_purged = shared.clone();
+        shared_purged.trace_id = "trace-i826-old".to_owned();
+        shared_purged.attempt_index = 6;
+        d.insert_trace_events_batch(&[shared, shared_purged])
+            .await
+            .unwrap();
+
+        purge_trace(d, "trace-i826-old").await;
+        d.insert_trace_events_batch(&[signed("trace-i826-new", 0, "sig-new")])
+            .await
+            .unwrap();
+        let rows = d
+            .fetch_trace_events_page(0, 1_000, Some("agent-i826"))
+            .await
+            .unwrap();
+        assert_eq!(
+            sig_of(&rows, "trace-i826-new"),
+            vec![Some("sig-new".to_owned())],
+            "I826: the reused thought reads its own signature"
+        );
+        assert!(sig_of(&rows, "trace-i826-old").is_empty(), "I826: purged");
+        let live: Vec<Option<String>> = rows
+            .iter()
+            .filter(|(_, r)| r.thought_id == "th-i826-shared")
+            .map(|(_, r)| r.signature_ml_dsa_65.clone())
+            .collect();
+        assert_eq!(
+            live,
+            vec![Some("sig-shared".to_owned())],
+            "I826: a thought a live trace shares keeps its signature"
+        );
+    }
+
     // ── I660 ──────────────────────────────────────────────────────────────
     pub(crate) async fn i660_the_delete_doors_re_ask_the_tombstone<D: Seams>(d: &D) {
         root(d).await;
@@ -3088,6 +3244,11 @@ mod run {
                     b::i822_the_dwell_is_this_nodes_clock(&d).await
                 }
                 #[tokio::test]
+                async fn i826() {
+                    let Some(d) = $fresh.await else { return };
+                    b::i826_a_reused_thought_reads_its_own_signature(&d).await
+                }
+                #[tokio::test]
                 async fn i664() {
                     let Some(d) = $fresh.await else { return };
                     b::i664_the_tombstone_row_holds_another_basis(&d).await
@@ -3101,6 +3262,11 @@ mod run {
         ($modname:ident, $fresh:expr) => {
             mod $modname {
                 use super::super::bodies as b;
+                #[tokio::test]
+                async fn i825() {
+                    let Some(d) = $fresh.await else { return };
+                    b::i825_a_purged_traces_detections_are_tombstoned(&d).await
+                }
                 #[tokio::test]
                 async fn i696() {
                     let Some(d) = $fresh.await else { return };

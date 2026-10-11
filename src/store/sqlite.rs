@@ -1746,19 +1746,8 @@ impl Backend for SqliteBackend {
                     // the PII linkage, stamp erased_at. NOT a delete. sqlite has
                     // no array params; iterate per trace_id. Only un-tombstoned
                     // rows are touched (idempotent re-run = no-op).
-                    let mut detection_events_tombstoned = 0u64;
-                    if !trace_ids.is_empty() {
-                        let mut stmt = tx.prepare(
-                            "UPDATE cirislens_derived_detection_events \
-                     SET trace_id = NULL, body_sha256 = NULL, \
-                         canonical_bytes = NULL, erased_at = ?2 \
-                     WHERE trace_id = ?1 AND erased_at IS NULL",
-                        )?;
-                        for tid in &trace_ids {
-                            detection_events_tombstoned +=
-                                stmt.execute(rusqlite::params![tid, &erased_s])? as u64;
-                        }
-                    }
+                    let detection_events_tombstoned =
+                        sqlite_tombstone_detection_events(&tx, &trace_ids, &erased_s)?;
 
                     // Step 3: hard-delete LLM call rows joined by trace_id.
                     let mut trace_llm_calls = 0u64;
@@ -4506,11 +4495,40 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                         })?;
                         rows.collect::<Result<_, _>>()?
                     };
+                    // Codex round 3 on PR #1057 — the trace's thoughts, read
+                    // before its rows go: their signature row is removed
+                    // below once no remaining event cites the thought, so a
+                    // later trace reusing the thought_id stores its own (the
+                    // insert is ON CONFLICT DO NOTHING).
+                    let thought_ids: Vec<String> = {
+                        let mut stmt = tx.prepare(
+                            "SELECT DISTINCT thought_id FROM trace_events WHERE trace_id = ?1",
+                        )?;
+                        let rows = stmt.query_map([&id], |r| r.get::<_, String>(0))?;
+                        rows.collect::<Result<_, _>>()?
+                    };
+                    // The derived detection events take the Art. 17 tombstone,
+                    // in this transaction (the same function the DSAR door runs).
+                    sqlite_tombstone_detection_events(
+                        &tx,
+                        std::slice::from_ref(&id),
+                        &chrono::Utc::now().to_rfc3339(),
+                    )?;
                     let calls = tx
                         .execute("DELETE FROM trace_llm_calls WHERE trace_id = ?1", [&id])?
                         as u64;
                     let events =
                         tx.execute("DELETE FROM trace_events WHERE trace_id = ?1", [&id])? as u64;
+                    {
+                        let mut stmt = tx.prepare(
+                            "DELETE FROM trace_thought_signatures WHERE thought_id = ?1 \
+                               AND NOT EXISTS (SELECT 1 FROM trace_events \
+                                               WHERE trace_events.thought_id = ?1)",
+                        )?;
+                        for thought in &thought_ids {
+                            stmt.execute([thought])?;
+                        }
+                    }
                     let recompute = sqlite_factor_rollup_upsert_sql(
                         "AND strftime('%Y-%m-%dT%H:00:00Z', te.ts) = ?1 \
                          AND te.agent_id_hash IS ?2 AND te.deployment_domain IS ?3 \
@@ -22767,6 +22785,34 @@ fn sqlite_row_to_outbound_row(
     })
 }
 
+/// The Art. 17 TOMBSTONE of the derived detection events (V080) for
+/// `trace_ids`: NULL the PII linkage and content (`trace_id`, `body_sha256`,
+/// `canonical_bytes`) and stamp `erased_at`. NOT a delete. Only un-tombstoned
+/// rows are touched, so a re-run is a no-op. ONE spelling, run inside the
+/// caller's transaction by both trace-removal doors: the DSAR erasure
+/// (`delete_traces_for_agent_id_hash`) and the steward purge's trace delete
+/// (Codex round 3 on PR #1057). Returns the rows tombstoned.
+fn sqlite_tombstone_detection_events(
+    tx: &rusqlite::Transaction<'_>,
+    trace_ids: &[String],
+    erased_at: &str,
+) -> Result<u64, rusqlite::Error> {
+    let mut tombstoned = 0u64;
+    if trace_ids.is_empty() {
+        return Ok(0);
+    }
+    let mut stmt = tx.prepare(
+        "UPDATE cirislens_derived_detection_events \
+         SET trace_id = NULL, body_sha256 = NULL, \
+             canonical_bytes = NULL, erased_at = ?2 \
+         WHERE trace_id = ?1 AND erased_at IS NULL",
+    )?;
+    for tid in trace_ids {
+        tombstoned += stmt.execute(rusqlite::params![tid, erased_at])? as u64;
+    }
+    Ok(tombstoned)
+}
+
 /// One `trace_events_factor_rollup_1h` group key: `(bucket_start,
 /// agent_id_hash, deployment_domain, cohort_scope, cohort_target_id)`.
 type RollupGroup = (
@@ -29222,6 +29268,10 @@ impl crate::derived::DerivedSchema for SqliteBackend {
     ) -> Result<Vec<crate::derived::DetectionEvent>, crate::derived::Error> {
         self.read(
             move |conn| -> Result<Vec<crate::derived::DetectionEvent>, crate::derived::Error> {
+                // v54.1.0 (Codex round 3 on PR #1057) — an Art. 17 tombstoned event
+                // (DSAR erasure, or a steward purge of its trace) has no linkage or
+                // content left and is not a `DetectionEvent`: it is not returned.
+                // Before this, one tombstoned row made the read fail to decode.
                 // Conditional filters; ts DESC for newest-first triage,
                 // matching the Postgres path (default LIMIT 1000).
                 let mut sql = String::from(
@@ -29229,7 +29279,7 @@ impl crate::derived::DerivedSchema for SqliteBackend {
                         cohort_cell, conformity_variant, conformity_payload, \
                         lens_core_version, ratchet_calibration_version, \
                         canonical_bytes, ed25519_sig, ml_dsa_65_sig, signing_key_id, ts \
-                     FROM cirislens_derived_detection_events WHERE 1 = 1",
+                     FROM cirislens_derived_detection_events WHERE erased_at IS NULL",
                 );
                 let mut binds: Vec<String> = Vec::new();
                 if let Some(t) = filter.trace_id {
