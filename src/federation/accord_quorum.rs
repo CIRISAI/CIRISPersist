@@ -310,6 +310,7 @@ pub(crate) mod test_fixtures {
     /// `rounds` times: exactly one is admitted and stored, the other is
     /// `AccordProposalNonceReused` naming the winner. The database's claim
     /// (V189 PRIMARY KEY) decides, not one process's lock.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     pub async fn i827_two_backends_race_one_nonce<B>(a: &B, b: &B, suffix: &str, rounds: usize)
     where
         B: crate::federation::FederationDirectory + ?Sized,
