@@ -1191,16 +1191,26 @@ where
         if canonical.len() > MAX_ATTESTATION_ENVELOPE_BYTES {
             let mut mh = Sha256::new();
             mh.update(&canonical);
+            let mut manifest = serde_json::json!({
+                "schema": "trace_manifest:v1",
+                "content_hash": format!("sha256:{}", hex::encode(mh.finalize())),
+                "byte_len": canonical.len(),
+                "component_count": trace.components.len(),
+            });
+            // v54.1.0 (Codex on PR #1057) — the manifest carries the trace's
+            // signed `run_kind` (CC 3.1.5), so the federation-tier mock gate
+            // reads it from either shape: without it an oversize local mock
+            // trace promoted as a manifest crossed the tier unrefused. Absent
+            // when the trace carries none (a pre-CIRISAgent#1249 trace), as in
+            // the inline form; a manifest without it is the legacy shape.
+            if let Some(kind) = &trace.run_kind {
+                manifest["run_kind"] = serde_json::json!(kind);
+            }
             envelope = serde_json::json!({
                 "dimension": TRACE_ATTESTATION_DIMENSION,
                 "trace_id": trace.trace_id,
                 "agent_id_hash": trace.agent_id_hash,
-                "manifest": {
-                    "schema": "trace_manifest:v1",
-                    "content_hash": format!("sha256:{}", hex::encode(mh.finalize())),
-                    "byte_len": canonical.len(),
-                    "component_count": trace.components.len(),
-                },
+                "manifest": manifest,
             });
         }
 

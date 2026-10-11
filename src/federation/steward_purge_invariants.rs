@@ -121,6 +121,14 @@
 //!   tombstone is void for them (`purge_status.voided`), and `purge_finalize`
 //!   (and the delete door itself) never deletes them. An ordinary row at a
 //!   tombstoned id is still `purge_tombstoned`.
+//! - **I698** (Codex on PR #1057) — `run_kind` survives the manifest form:
+//!   an OVERSIZE mock trace kept on a non-canonical node is stored as a
+//!   manifest-form attestation whose manifest carries `run_kind: mock`, and
+//!   that row is `trace_run_kind_mock` at the promotion door and at the
+//!   federation-tier put; manifest rows declaring `production` or `qa` are
+//!   admitted; a LEGACY manifest row with no `run_kind` is admitted and
+//!   stored byte for byte as signed; a `run_kind` outside the vocabulary, in
+//!   either shape, is `federation_trace_dimension_invalid`.
 //! - **I666** — a `key:` (or `federation_keys:`) id is not a purge record:
 //!   `purge_selection_malformed`, naming `key:revocation` as key retirement's
 //!   own act.
@@ -2489,6 +2497,139 @@ pub(crate) mod bodies {
         }
     }
 
+    // ── I698 ──────────────────────────────────────────────────────────────
+    /// A federation-tier `trace:complete:v1` row in the MANIFEST form, by
+    /// AGENT about itself, really signed; `run_kind` in the manifest when given.
+    fn manifest_row(id: &str, trace_id: &str, run_kind: Option<&str>) -> Attestation {
+        let mut manifest = serde_json::json!({
+            "schema": "trace_manifest:v1",
+            "content_hash": format!("sha256:{}", "ab".repeat(32)),
+            "byte_len": 2_000_000,
+            "component_count": 3,
+        });
+        if let Some(k) = run_kind {
+            manifest["run_kind"] = serde_json::json!(k);
+        }
+        let env = serde_json::json!({
+            "dimension": crate::ingest::TRACE_ATTESTATION_DIMENSION,
+            "trace_id": trace_id,
+            "agent_id_hash": "deadbeef",
+            "manifest": manifest,
+        });
+        let mut row = ts::bare_attestation(id, AGENT, AGENT, &env);
+        row.attestation_type = attestation_type::SCORES.to_owned();
+        // A trace is self-emitted: its producer is among its subjects.
+        row.subject_key_ids = vec![AGENT.to_owned()];
+        ts::reseal(&mut row);
+        row
+    }
+
+    pub(crate) async fn i698_run_kind_survives_the_manifest_form<D: Seams>(d: &D) {
+        root(d).await;
+        let dir = d.as_dyn_directory();
+        // An oversize mock trace, kept by a node that is not the canonical.
+        let tid = "trace-i698-big";
+        let mut trace = trace_json(tid, AGENT, "gpt-real", Some(sp::RUN_KIND_MOCK));
+        trace["components"][0]["data"]["padding"] = serde_json::json!(
+            "x".repeat(crate::federation::admission::MAX_ATTESTATION_ENVELOPE_BYTES + 1024)
+        );
+        ingest(d, &batch(&trace))
+            .await
+            .expect("I698: a non-canonical node keeps its QA trace");
+        let local = dir
+            .get_attestation(&crate::ingest::trace_attestation_id(tid))
+            .await
+            .unwrap()
+            .expect("I698: the trace's own attestation");
+        let env = &local.attestation_envelope;
+        assert!(env.get("trace").is_none(), "I698: the oversize form: {env}");
+        assert_eq!(
+            env["manifest"]["run_kind"],
+            sp::RUN_KIND_MOCK,
+            "I698: the manifest carries the signed run_kind: {env}"
+        );
+        // The tier crossing mints a federation-tier row: refused.
+        let mut crossing = local.clone();
+        crossing.tier = crate::federation::types::attestation_tier::FEDERATION.to_owned();
+        let e = crate::federation::admission::check_promotion_admission(dir, &crossing, None)
+            .await
+            .expect_err("I698: a manifest-form mock trace cannot cross");
+        assert_eq!(e.kind(), sp::TRACE_RUN_KIND_MOCK, "I698 promotion: {e}");
+        // A federation-tier put of the manifest form.
+        let e = dir
+            .put_attestation(SignedAttestation {
+                attestation: manifest_row(
+                    &uuid::Uuid::new_v4().to_string(),
+                    "trace-i698-mock",
+                    Some(sp::RUN_KIND_MOCK),
+                ),
+            })
+            .await
+            .expect_err("I698: a manifest-form mock trace is refused at the put");
+        assert_eq!(e.kind(), sp::TRACE_RUN_KIND_MOCK, "I698 put: {e}");
+        for kind in ["production", "qa"] {
+            dir.put_attestation(SignedAttestation {
+                attestation: manifest_row(
+                    &uuid::Uuid::new_v4().to_string(),
+                    &format!("trace-i698-{kind}"),
+                    Some(kind),
+                ),
+            })
+            .await
+            .unwrap_or_else(|e| panic!("I698: a {kind} manifest row is admitted: {e:?}"));
+        }
+        // The legacy manifest (no run_kind) is admitted and stored as signed.
+        let legacy_id = uuid::Uuid::new_v4().to_string();
+        let legacy = manifest_row(&legacy_id, "trace-i698-legacy", None);
+        dir.put_attestation(SignedAttestation {
+            attestation: legacy.clone(),
+        })
+        .await
+        .unwrap_or_else(|e| panic!("I698: a legacy manifest row is admitted: {e:?}"));
+        let stored = dir.get_attestation(&legacy_id).await.unwrap().unwrap();
+        let jcs = |v: &serde_json::Value| ciris_verify_core::jcs::canonicalize(v).expect("jcs");
+        assert_eq!(
+            jcs(&stored.attestation_envelope),
+            jcs(&legacy.attestation_envelope),
+            "I698: the legacy manifest row's signed bytes are stored unchanged"
+        );
+        assert!(stored.attestation_envelope["manifest"]
+            .get("run_kind")
+            .is_none());
+        // Outside the vocabulary, in either shape.
+        let bad = manifest_row(
+            &uuid::Uuid::new_v4().to_string(),
+            "trace-i698-bad",
+            Some("simulation"),
+        );
+        let e = dir
+            .put_attestation(SignedAttestation { attestation: bad })
+            .await
+            .expect_err("I698: an unknown manifest run_kind is refused");
+        assert_eq!(e.kind(), "federation_trace_dimension_invalid", "I698: {e}");
+        let mut inline = ts::bare_attestation(
+            &uuid::Uuid::new_v4().to_string(),
+            AGENT,
+            AGENT,
+            &serde_json::json!({
+                "dimension": crate::ingest::TRACE_ATTESTATION_DIMENSION,
+                "trace_id": "trace-i698-inline",
+                "agent_id_hash": "deadbeef",
+                "trace": {"trace_id": "trace-i698-inline", "run_kind": 7},
+            }),
+        );
+        inline.attestation_type = attestation_type::SCORES.to_owned();
+        inline.subject_key_ids = vec![AGENT.to_owned()];
+        ts::reseal(&mut inline);
+        let e = dir
+            .put_attestation(SignedAttestation {
+                attestation: inline,
+            })
+            .await
+            .expect_err("I698: a non-string inline run_kind is refused");
+        assert_eq!(e.kind(), "federation_trace_dimension_invalid", "I698: {e}");
+    }
+
     // ── I660 ──────────────────────────────────────────────────────────────
     pub(crate) async fn i660_the_delete_doors_re_ask_the_tombstone<D: Seams>(d: &D) {
         root(d).await;
@@ -2640,6 +2781,11 @@ mod run {
                 async fn i697() {
                     let Some(d) = $fresh.await else { return };
                     b::i697_a_tombstone_never_reaches_the_accountability_record(&d).await
+                }
+                #[tokio::test]
+                async fn i698() {
+                    let Some(d) = $fresh.await else { return };
+                    b::i698_run_kind_survives_the_manifest_form(&d).await
                 }
                 #[tokio::test]
                 async fn i664() {

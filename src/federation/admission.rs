@@ -2850,6 +2850,9 @@ fn is_sha256_digest_token(s: &str) -> bool {
 ///      `content_hash` a CC 2.6.3 digest token (`"sha256:"` + 64 lowercase
 ///      hex — [`is_sha256_digest_token`], CIRISPersist#579), positive integer
 ///      `byte_len`, integer `component_count` (the CC#38 oversize form).
+/// 3. **`run_kind`** (v54.1.0, CC 3.1.5): in either form, absent or one of
+///    the closed vocabulary (`crate::schema::trace::RUN_KINDS`) — the inline
+///    trace's own member, or the manifest's copy of it.
 ///
 /// Admission validates SHAPE, machine-checkably — a `trace:*` row that
 /// admits is guaranteed parseable by every consumer. PROVENANCE rides the
@@ -2892,11 +2895,30 @@ pub fn check_trace_dimension_admission(
     // 3. Exactly one of inline `trace` / `manifest`.
     let inline = envelope.get("trace");
     let manifest = envelope.get("manifest");
+    // v54.1.0 (Codex on PR #1057) — `run_kind` (CC 3.1.5), in EITHER shape,
+    // is absent or a member of the closed vocabulary: the federation-tier mock
+    // gate reads it as a string, so a malformed one must not read as "none".
+    let run_kind_ok =
+        |form: &str, obj: &serde_json::Map<String, serde_json::Value>| match obj.get("run_kind") {
+            None => Ok(()),
+            Some(serde_json::Value::String(k))
+                if crate::schema::trace::RUN_KINDS.contains(&k.as_str()) =>
+            {
+                Ok(())
+            }
+            Some(other) => Err(Error::TraceDimensionInvalid {
+                detail: format!(
+                    "trace:* {form} form: \"run_kind\" {other} is not one of {:?} (CC 3.1.5)",
+                    crate::schema::trace::RUN_KINDS
+                ),
+            }),
+        };
     match (inline, manifest) {
         (Some(t), None) => {
-            if !t.is_object() {
+            let Some(t) = t.as_object() else {
                 return refuse("trace:* inline form: \"trace\" must be an object".into());
-            }
+            };
+            run_kind_ok("inline", t)?;
         }
         (None, Some(m)) => {
             let Some(m) = m.as_object() else {
@@ -2930,6 +2952,7 @@ pub fn check_trace_dimension_admission(
                     "trace:* manifest form: \"component_count\" must be an integer".into(),
                 );
             }
+            run_kind_ok("manifest", m)?;
         }
         (Some(_), Some(_)) => {
             return refuse(

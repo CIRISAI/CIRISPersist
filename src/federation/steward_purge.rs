@@ -2271,10 +2271,24 @@ pub fn trace_run_kind(trace: &serde_json::Value) -> Option<&str> {
     trace.get("run_kind").and_then(serde_json::Value::as_str)
 }
 
+/// A `trace:complete:v1` attestation envelope's `run_kind`, from EITHER
+/// shape: the inline trace's own member (`trace.run_kind`) or the oversize
+/// manifest's (`manifest.run_kind`, which the mint copies from the signed
+/// trace; Codex on PR #1057). `None` when the shape carries none (a legacy
+/// row, or a trace that predates `run_kind`). Pure.
+#[must_use]
+pub fn trace_attestation_run_kind(envelope: &serde_json::Value) -> Option<&str> {
+    envelope
+        .get("trace")
+        .and_then(trace_run_kind)
+        .or_else(|| envelope.get("manifest").and_then(trace_run_kind))
+}
+
 /// CIRISConstitution#166 — the FEDERATION-tier attestation gate: a
-/// `trace:complete:v1` attestation whose embedded trace declares `run_kind`
-/// `mock` is refused ([`TRACE_RUN_KIND_MOCK`]). A local-tier row is untouched
-/// (a node may keep its own QA traces). Pure.
+/// `trace:complete:v1` attestation whose `run_kind` is `mock`, in either
+/// shape ([`trace_attestation_run_kind`]: the inline trace or the oversize
+/// manifest), is refused ([`TRACE_RUN_KIND_MOCK`]). A local-tier row is
+/// untouched (a node may keep its own QA traces). Pure.
 ///
 /// # Errors
 ///
@@ -2288,11 +2302,7 @@ pub fn refuse_mock_trace_attestation(row: &Attestation) -> Result<(), Error> {
     {
         return Ok(());
     }
-    match row
-        .attestation_envelope
-        .get("trace")
-        .and_then(trace_run_kind)
-    {
+    match trace_attestation_run_kind(&row.attestation_envelope) {
         Some(RUN_KIND_MOCK) => Err(refused(
             TRACE_RUN_KIND_MOCK,
             serde_json::json!({
