@@ -160,6 +160,16 @@
 //!   event cites: a later trace reusing the thought_id reads ITS OWN
 //!   signature, not the purged one's; a thought another live trace shares
 //!   keeps its row.
+//! - **I828** (Codex round 4 on PR #1057) — replication order cannot purge a
+//!   record a PERSON is the subject of (interim): a bundle naming an unheld
+//!   attestation id and an unheld trace id applies (`skip_unheld`); a row
+//!   about a `user` key then arriving at the attestation id is admitted,
+//!   served, listed void, and survives finalize and the delete door; a trace
+//!   a person signed arriving at the trace id is ingested and survives
+//!   finalize and the trace delete door. An ordinary row, and a row whose
+//!   subject key does not resolve here (no person PROVEN), at a tombstoned id
+//!   are still `purge_tombstoned`; and the serve-by-hash reload withholds a
+//!   tombstoned row during the dwell.
 //! - **I666** — a `key:` (or `federation_keys:`) id is not a purge record:
 //!   `purge_selection_malformed`, naming `key:revocation` as key retirement's
 //!   own act.
@@ -3071,6 +3081,162 @@ pub(crate) mod bodies {
         );
     }
 
+    // ── I828 ──────────────────────────────────────────────────────────────
+    pub(crate) async fn i828_a_person_subject_arrival_voids_the_tombstone<D: Seams>(d: &D) {
+        root(d).await;
+        let dir = d.as_dyn_directory();
+        let t = now();
+        const ALICE: &str = "alice-human-i828";
+        ts::register_hybrid_key_as(
+            dir,
+            ALICE,
+            ALICE,
+            crate::federation::types::identity_type::USER,
+        )
+        .await;
+        let about_alice = uuid::Uuid::new_v4().to_string();
+        let ordinary = uuid::Uuid::new_v4().to_string();
+        let unknown = uuid::Uuid::new_v4().to_string();
+        let trace_id = "trace-i828-alice";
+        let mut ids: Vec<String> = [&about_alice, &ordinary, &unknown]
+            .iter()
+            .map(|id| format!("attestation:{id}"))
+            .collect();
+        ids.push(format!("trace:{trace_id}"));
+        ids.sort();
+        let template = serde_json::json!({
+            "legal_basis": sp::STEWARD_PURGE_BASIS,
+            "content_sha256": sp::selection_digest(&ids),
+            "content_holder_key_ids": [],
+        });
+        let bundle = sp::PurgeBundle {
+            notice: notice_for(&template, &[cc::FOUNDERS[0], cc::FOUNDERS[1]], t),
+            record_ids: ids.clone(),
+            derived_from: vec![String::new(); ids.len()],
+            admitted_at: t,
+        };
+        let applied = apply_at(dir, &bundle, NODE, t)
+            .await
+            .expect("I828: a bundle may name rows this node does not hold yet");
+        assert_eq!(applied.tombstoned, 4);
+
+        // A row about a person arrives at a tombstoned id: admitted.
+        dir.put_attestation(SignedAttestation {
+            attestation: fed_row(&about_alice, SCORER, ALICE, "chat:message:v1"),
+        })
+        .await
+        .unwrap_or_else(|e| panic!("I828: a row about a person is admitted: {e:?}"));
+        // An ordinary row, and one whose subject key does not resolve here
+        // (no person PROVEN), stay refused.
+        for (id, attested) in [(&ordinary, AGENT), (&unknown, "nobody-knows-me-i828")] {
+            let e = dir
+                .put_attestation(SignedAttestation {
+                    attestation: fed_row(id, SCORER, attested, "chat:message:v1"),
+                })
+                .await
+                .expect_err("I828: a non-person row at a tombstoned id is refused");
+            assert_eq!(refusal(&e).0, token::TOMBSTONED, "I828 {attested}: {e:?}");
+        }
+        // A trace a person signed arrives at the tombstoned trace id.
+        ingest(d, &batch(&trace_json(trace_id, ALICE, "gpt-real", None)))
+            .await
+            .expect("I828: a trace a person signed is ingested over the tombstone");
+
+        assert!(
+            served_ids(d).await.contains(&about_alice),
+            "I828: the person's row is served"
+        );
+        let later = t + chrono::Duration::seconds(sp::PURGE_SETTLE_DWELL_SECS + 1);
+        let mut st = status_at(dir, &applied.notice_id, later).await.unwrap();
+        st.voided.sort();
+        let mut want = vec![
+            format!("attestation:{about_alice}"),
+            format!("trace:{trace_id}"),
+        ];
+        want.sort();
+        assert_eq!(
+            st.voided, want,
+            "I828: the ledger names the void tombstones"
+        );
+        assert!(!dir
+            .purge_delete_tombstoned_attestation(&about_alice)
+            .await
+            .unwrap());
+        assert_eq!(
+            dir.purge_delete_tombstoned_trace(trace_id).await.unwrap(),
+            (0, 0),
+            "I828: the trace delete door leaves a person's trace"
+        );
+        let mut fin = finalize_at(dir, &applied.notice_id, later, None)
+            .await
+            .expect("finalizes");
+        fin.voided.sort();
+        assert_eq!(fin.voided, want, "I828: {fin:?}");
+        assert!(dir.get_attestation(&about_alice).await.unwrap().is_some());
+        assert!(
+            dir.purge_trace_row_counts(&[trace_id.to_owned()])
+                .await
+                .unwrap()
+                .0
+                > 0,
+            "I828: the person's trace survives finalize"
+        );
+        assert!(served_ids(d).await.contains(&about_alice));
+    }
+
+    /// **I828b** — the serve-by-hash reload withholds a tombstoned row during
+    /// the dwell, exactly as the cursor serve does (the round-4 sweep).
+    pub(crate) async fn i828b_serve_by_hash_withholds_during_the_dwell<D: Seams>(d: &D) {
+        root(d).await;
+        let dir = d.as_dyn_directory();
+        let row = put_score(d, SCORER, AGENT, &[]).await;
+        let hash = crate::federation::wire_index::content_hash_of(&row).unwrap();
+        let rk =
+            crate::federation::wire_index::record_key(&[("attestation_id", &row.attestation_id)]);
+        assert!(
+            crate::federation::wire_index::reload_record_bytes(dir, "Attestation", &rk)
+                .await
+                .unwrap()
+                .is_some(),
+            "I828b control: reloads while live"
+        );
+        assert!(
+            dir.list_wire_hashes_since("Attestation", None, 10_000)
+                .await
+                .unwrap()
+                .contains(&hash),
+            "I828b control: advertised"
+        );
+        let t = now();
+        let sel = PurgeSelection::ByIds {
+            ids: vec![format!("attestation:{}", row.attestation_id)],
+        };
+        let dry = sp::purge_dry_run(dir, &sel).await.unwrap();
+        let notice = notice_for(&dry.notice_template, &[cc::FOUNDERS[0], cc::FOUNDERS[1]], t);
+        rows_at(dir, &sel, &notice, NODE, t).await.unwrap();
+        assert!(
+            crate::federation::wire_index::reload_record_bytes(dir, "Attestation", &rk)
+                .await
+                .unwrap()
+                .is_none(),
+            "I828b: a tombstoned row is not served by hash during the dwell"
+        );
+        assert!(
+            dir.lookup_signed_record_by_content_hash("Attestation", &hash)
+                .await
+                .unwrap()
+                .is_none(),
+            "I828b: nor through the content-hash door"
+        );
+        assert!(
+            !dir.list_wire_hashes_since("Attestation", None, 10_000)
+                .await
+                .unwrap()
+                .contains(&hash),
+            "I828b: nor advertised"
+        );
+    }
+
     // ── I660 ──────────────────────────────────────────────────────────────
     pub(crate) async fn i660_the_delete_doors_re_ask_the_tombstone<D: Seams>(d: &D) {
         root(d).await;
@@ -3249,6 +3415,16 @@ mod run {
                     b::i826_a_reused_thought_reads_its_own_signature(&d).await
                 }
                 #[tokio::test]
+                async fn i828() {
+                    let Some(d) = $fresh.await else { return };
+                    b::i828_a_person_subject_arrival_voids_the_tombstone(&d).await
+                }
+                #[tokio::test]
+                async fn i828b() {
+                    let Some(d) = $fresh.await else { return };
+                    b::i828b_serve_by_hash_withholds_during_the_dwell(&d).await
+                }
+                #[tokio::test]
                 async fn i664() {
                     let Some(d) = $fresh.await else { return };
                     b::i664_the_tombstone_row_holds_another_basis(&d).await
@@ -3380,8 +3556,11 @@ mod run {
             );
             // #1043 ruled: a row refused today is purged, never filtered at
             // the serve read.
+            // The serve read may render the void predicates (round 4:
+            // `person_subject_sql`), never classify by a purge class.
+            let without_void = serve.replace("steward_purge::person_subject_sql", "");
             assert!(
-                !serve.contains("refused_today") && !serve.contains("steward_purge::"),
+                !serve.contains("refused_today") && !without_void.contains("steward_purge::"),
                 "I661 {backend}: the serve read classifies no row by refused_today"
             );
         }
@@ -3460,6 +3639,112 @@ mod run {
             problems.is_empty(),
             "I822: a purge surface takes a caller's instant:\n{}",
             problems.join("\n")
+        );
+    }
+
+    /// **I829b** (Codex round 4 on PR #1057) — from the MIGRATED schema:
+    /// every table with an `*attestation_id` column is either a classified
+    /// projection (`steward_purge::ATTESTATION_PROJECTIONS`) or a declared
+    /// independent plane, every foreign key to `federation_attestations`
+    /// matches its classified removal, every classified entry exists, and the
+    /// memory backend's projection purge names every helper-removed mirror it
+    /// holds. A new projection is a red here until the purge removes it.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn i829b_every_attestation_keyed_table_is_a_classified_projection() {
+        use crate::federation::steward_purge::{
+            ProjectionRemoval, ATTESTATION_PROJECTIONS, INDEPENDENT_ATTESTATION_ID_TABLES,
+        };
+        use crate::store::Backend as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("i829b.db");
+        let b = crate::store::sqlite::SqliteBackend::open(path.to_string_lossy().to_string())
+            .await
+            .unwrap();
+        b.run_migrations().await.unwrap();
+        drop(b);
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let mut columns: Vec<(String, String)> = conn
+            .prepare(
+                "SELECT m.name, p.name FROM sqlite_master m, pragma_table_info(m.name) p \
+                 WHERE m.type = 'table' AND p.name LIKE '%attestation_id' ORDER BY 1, 2",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        columns.dedup();
+        let mut problems = Vec::new();
+        for (table, column) in &columns {
+            let projection = ATTESTATION_PROJECTIONS
+                .iter()
+                .any(|(t, c, _)| t == table && c == column);
+            let independent = INDEPENDENT_ATTESTATION_ID_TABLES
+                .iter()
+                .any(|(t, _)| t == table);
+            if !projection && !independent {
+                problems.push(format!(
+                    "{table}.{column} is keyed by an attestation id and is neither a classified \
+                     projection nor a declared independent plane"
+                ));
+            }
+        }
+        let fks: Vec<(String, String, String)> = conn
+            .prepare(
+                "SELECT m.name, f.\"from\", f.on_delete FROM sqlite_master m, \
+                    pragma_foreign_key_list(m.name) f \
+                 WHERE m.type = 'table' AND f.\"table\" = 'federation_attestations'",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        for (table, column, on_delete) in &fks {
+            let want = match on_delete.as_str() {
+                "CASCADE" => ProjectionRemoval::ForeignKeyCascade,
+                "SET NULL" => ProjectionRemoval::ForeignKeySetNull,
+                other => {
+                    problems.push(format!(
+                        "{table}.{column}: FK ON DELETE {other} keeps the row"
+                    ));
+                    continue;
+                }
+            };
+            if !ATTESTATION_PROJECTIONS.contains(&(table.as_str(), column.as_str(), want)) {
+                problems.push(format!(
+                    "{table}.{column}: FK {on_delete} is not classified so"
+                ));
+            }
+        }
+        for (table, column, _) in ATTESTATION_PROJECTIONS {
+            if !columns.iter().any(|(t, c)| t == table && c == column) {
+                problems.push(format!(
+                    "stale classification: {table}.{column} is not in the schema"
+                ));
+            }
+        }
+        // The memory backend mirrors the helper-removed tables by hand.
+        let root = env!("CARGO_MANIFEST_DIR");
+        let memory =
+            strip(&std::fs::read_to_string(format!("{root}/src/store/memory.rs")).unwrap());
+        let helper = body(&memory, "async fn purge_attestation_projections(");
+        for (table, _, removal) in ATTESTATION_PROJECTIONS {
+            if *removal != ProjectionRemoval::Helper {
+                continue;
+            }
+            let held = memory.contains(&format!("    {table}:"));
+            if held && !helper.contains(&format!(".{table}")) {
+                problems.push(format!(
+                    "memory holds {table} and its projection purge omits it"
+                ));
+            }
+        }
+        assert!(problems.is_empty(), "I829b:\n{}", problems.join("\n"));
+        assert!(
+            columns.len() >= 10,
+            "I829b: the schema scan ran ({columns:?})"
         );
     }
 

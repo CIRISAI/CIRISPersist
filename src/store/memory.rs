@@ -902,6 +902,22 @@ fn transport_destination_rows(state: &State) -> Vec<(String, chrono::DateTime<ch
         })
         .collect()
 }
+/// v54.1.0 (Codex round 4 on PR #1057) — the memory twin of
+/// `steward_purge::person_subject_sql`: does a held key that is a person
+/// (`identity_type_is_person`) appear among `row`'s subjects
+/// (`subject_key_ids`, `attested_key_id`)?
+fn mem_person_subject(state: &State, row: &crate::federation::Attestation) -> bool {
+    row.subject_key_ids
+        .iter()
+        .chain(std::iter::once(&row.attested_key_id))
+        .filter(|k| !k.is_empty())
+        .any(|k| {
+            state.federation_keys.get(k).is_some_and(|r| {
+                crate::federation::steward_purge::identity_type_is_person(&r.identity_type)
+            })
+        })
+}
+
 /// v45.0.0 (CIRISPersist#871, FSD §5) — maintain the V149 `blob_renditions`
 /// mirror for `row` under the state lock the caller already holds: when
 /// [`crate::federation::renditions::rendition_of_row`] answers `Some`, upsert
@@ -3240,6 +3256,17 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         for ((key, t), inserted) in keys.into_iter().zip(tombstones).zip(&tombstones_inserted) {
             if *inserted {
                 state.purge_tombstones.insert(key, t.clone());
+                // Codex round 4 sweep — a newly tombstoned attestation leaves
+                // the signed-wire index at once (no longer advertised).
+                if t.plane == crate::federation::steward_purge::PurgePlane::Attestation {
+                    let rk = crate::federation::wire_index::record_key(&[(
+                        "attestation_id",
+                        &t.record_ref,
+                    )]);
+                    state
+                        .signed_wire_index
+                        .retain(|(kind, _), v| !(kind == "Attestation" && *v == rk));
+                }
             }
         }
         Ok(crate::federation::steward_purge::PurgePutOutcome {
@@ -3287,6 +3314,23 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             .min())
     }
 
+    async fn purge_tombstone_notices(
+        &self,
+        plane: &str,
+        record_ref: &str,
+    ) -> Result<Vec<String>, crate::federation::Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        let mut out: Vec<String> = state
+            .purge_tombstones
+            .keys()
+            .filter(|(_, p, r)| p == plane && r == record_ref)
+            .map(|(n, _, _)| n.clone())
+            .collect();
+        out.sort();
+        out.dedup();
+        Ok(out)
+    }
+
     async fn list_purge_executions_since(
         &self,
         since: Option<(chrono::DateTime<chrono::Utc>, String)>,
@@ -3327,7 +3371,10 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             .any(|(_, p, r)| p == "attestation" && r == attestation_id);
         let accountability = state.federation_attestations.iter().any(|a| {
             a.attestation_id == attestation_id
-                && crate::federation::steward_purge::accountability_record_of(a).is_some()
+                && (crate::federation::steward_purge::accountability_record_of(a).is_some()
+                    // INTERIM (Codex round 4): nor a row a person is the
+                    // subject of.
+                    || mem_person_subject(&state, a))
         });
         if !tombstoned || accountability {
             return Ok(false);
@@ -3356,6 +3403,19 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             .keys()
             .any(|(_, p, r)| p == "trace" && r == trace_id);
         if !tombstoned {
+            return Ok((0, 0));
+        }
+        // INTERIM (Codex round 4 on PR #1057) — never a trace a person signed.
+        let person_signed = state.events.values().any(|(_, e)| {
+            e.trace_id == trace_id
+                && state
+                    .federation_keys
+                    .get(&e.signing_key_id)
+                    .is_some_and(|k| {
+                        crate::federation::steward_purge::identity_type_is_person(&k.identity_type)
+                    })
+        });
+        if person_signed {
             return Ok((0, 0));
         }
         let events_before = state.events.len();
@@ -5826,6 +5886,19 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         state
             .signed_wire_index
             .retain(|(kind, _), rk| !(kind == "Attestation" && *rk == record_key));
+        // v54.1.0 (Codex round 4 on PR #1057) — every other mirror of a
+        // `steward_purge::ATTESTATION_PROJECTIONS` table: the steward-scoped
+        // `consent_peer_set_for` (a hard-deleted grant kept authorising its
+        // peer through `consent_peers_by_principals`), the withdraws depth and
+        // the trust-direction grandfather. Memory holds no pending-KeyGrant
+        // set and no canonical-binding table.
+        state
+            .consent_peer_set_for
+            .retain(|r| r.source_attestation_id != attestation_id);
+        state
+            .federation_withdraws_admission_depths
+            .remove(attestation_id);
+        state.federation_trust_direction_held.remove(attestation_id);
         Ok(())
     }
 
@@ -7527,6 +7600,11 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             created_at,
         };
         let mut state = self.state.lock().expect("memory backend lock");
+        // Codex round 4 on PR #1057 — a held digest is an idempotent replay,
+        // asked BEFORE single use (the SQL backends' legacy pairs need it).
+        if state.accord_proposals.contains_key(&proposal_digest) {
+            return Ok(());
+        }
         // v54.1.0 (#1047) — single use, under the same lock as the insert: a
         // proposer-minted nonce names one proposal per family.
         if let Some(other) = state.accord_proposals.iter().find_map(|(d, p)| {
@@ -10621,7 +10699,10 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                             &a.attestation_envelope,
                         )
                         .and_then(crate::federation::migration::accountability_record_family)
-                        .is_some())
+                        .is_some()
+                        // Codex round 4 — and (interim) a row a person is the
+                        // subject of.
+                        || mem_person_subject(&state, a))
                     && since.as_ref().is_none_or(|(s_at, s_id)| {
                         (position(a), a.attestation_id.as_str()) > (*s_at, s_id.as_str())
                     })

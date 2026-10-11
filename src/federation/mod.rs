@@ -5824,6 +5824,22 @@ pub trait FederationDirectory: Send + Sync {
         })
     }
 
+    /// v54.1.0 (Codex round 4 on PR #1057) — EVERY notice id that tombstoned
+    /// `(plane, record_ref)`, sorted. [`Self::purge_tombstoned`] answers "is it
+    /// tombstoned"; this answers "by which purges", for a decision that must
+    /// ask each one (a shared DAG chunk is deleted only once every purge that
+    /// withholds it has settled).
+    async fn purge_tombstone_notices(
+        &self,
+        plane: &str,
+        record_ref: &str,
+    ) -> Result<Vec<String>, Error> {
+        let _ = (plane, record_ref);
+        Err(Error::Unsupported {
+            method: "purge_tombstone_notices",
+        })
+    }
+
     /// Execution headers since a `(admitted_at, notice_id)` cursor, ordered
     /// by it — the tombstone plane's serve read.
     async fn list_purge_executions_since(

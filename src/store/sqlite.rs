@@ -4334,6 +4334,27 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                             inserted.push(n > 0);
                         }
                     }
+                    // Codex round 4 sweep on PR #1057 — a newly tombstoned
+                    // attestation leaves the signed-wire index at once, so the
+                    // node stops ADVERTISING a hash it no longer serves (the
+                    // rebuild re-indexes from the tombstone-filtered serve read).
+                    {
+                        let mut stmt = tx.prepare(
+                            "DELETE FROM signed_wire_index \
+                             WHERE kind = 'Attestation' AND record_key = ?1",
+                        )?;
+                        for (t, fresh) in ts.iter().zip(&inserted) {
+                            if *fresh
+                                && t.plane
+                                    == crate::federation::steward_purge::PurgePlane::Attestation
+                            {
+                                stmt.execute([crate::federation::wire_index::record_key(&[(
+                                    "attestation_id",
+                                    &t.record_ref,
+                                )])])?;
+                            }
+                        }
+                    }
                     tx.commit()?;
                     Ok(crate::federation::steward_purge::PurgePutOutcome {
                         header_inserted: !held,
@@ -4406,6 +4427,24 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         .map_err(|e| crate::federation::Error::Backend(format!("purge_tombstoned: {e}")))
     }
 
+    async fn purge_tombstone_notices(
+        &self,
+        plane: &str,
+        record_ref: &str,
+    ) -> Result<Vec<String>, crate::federation::Error> {
+        let (plane, record_ref) = (plane.to_owned(), record_ref.to_owned());
+        self.read(move |conn| -> Result<Vec<String>, rusqlite::Error> {
+            let mut stmt = conn.prepare(
+                "SELECT DISTINCT notice_id FROM purge_tombstones \
+                 WHERE plane = ?1 AND record_ref = ?2 ORDER BY notice_id",
+            )?;
+            let rows = stmt.query_map(rusqlite::params![plane, record_ref], |r| r.get(0))?;
+            rows.collect()
+        })
+        .await
+        .map_err(|e| crate::federation::Error::Backend(format!("purge_tombstone_notices: {e}")))
+    }
+
     async fn list_purge_executions_since(
         &self,
         since: Option<(chrono::DateTime<chrono::Utc>, String)>,
@@ -4437,14 +4476,16 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         let id = attestation_id.to_owned();
         // The door's own gate, in the statement: only a row a purge tombstone
         // names is deleted, and never the accountability record (Codex on PR
-        // #1057: a tombstone is void for it). `attestation_subjects` follows by
+        // #1057: a tombstone is void for it) nor, INTERIM, a row a person is
+        // the subject of (Codex round 4). `attestation_subjects` follows by
         // ON DELETE CASCADE.
         let sql = format!(
             "DELETE FROM federation_attestations WHERE attestation_id = ?1 \
                AND EXISTS (SELECT 1 FROM purge_tombstones \
                            WHERE plane = 'attestation' AND record_ref = ?1) \
-               AND NOT {}",
-            crate::federation::migration::accountability_record_sql("dimension")
+               AND NOT {} AND NOT {}",
+            crate::federation::migration::accountability_record_sql("dimension"),
+            crate::federation::steward_purge::person_subject_sql("federation_attestations", "")
         );
         self.write(move |conn| -> Result<usize, rusqlite::Error> { conn.execute(&sql, [&id]) })
             .await
@@ -4475,6 +4516,24 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                         .optional()?
                         .unwrap_or(false);
                     if !tombstoned {
+                        return Ok(((0, 0), Vec::new()));
+                    }
+                    // INTERIM (Codex round 4 on PR #1057) — a trace a person
+                    // signed arrived after the tombstone: the tombstone is
+                    // void for it, and this door never deletes it.
+                    let person_signed: bool = tx.query_row(
+                        &format!(
+                            "SELECT EXISTS (SELECT 1 FROM trace_events te \
+                               JOIN federation_keys k ON k.key_id = te.signing_key_id \
+                               WHERE te.trace_id = ?1 AND {})",
+                            crate::federation::steward_purge::person_identity_sql(
+                                "k.identity_type"
+                            )
+                        ),
+                        [&id],
+                        |r| r.get(0),
+                    )?;
+                    if person_signed {
                         return Ok(((0, 0), Vec::new()));
                     }
                     // Codex on PR #1057 — the rollup groups this trace was
@@ -7630,20 +7689,28 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             crate::federation::wire_index::record_key(&[("attestation_id", attestation_id)]);
         let id = attestation_id.to_owned();
         self.write(move |guard| -> Result<(), rusqlite::Error> {
-            guard.execute(
+            // One transaction: every projection leaves together.
+            let tx = guard.transaction()?;
+            tx.execute(
                 "DELETE FROM signed_wire_index WHERE kind = 'Attestation' AND record_key = ?1",
                 rusqlite::params![record_key],
             )?;
-            guard.execute(
-                "DELETE FROM consent_peer_set WHERE source_attestation_id = ?1",
-                rusqlite::params![id],
-            )?;
-            // v45.0.0 (#871) — a retired row's rendition leaves the index with it.
-            guard.execute(
-                "DELETE FROM blob_renditions WHERE source_attestation_id = ?1",
-                rusqlite::params![id],
-            )?;
-            Ok(())
+            // v54.1.0 (Codex round 4 on PR #1057) — every helper-removed
+            // projection, FROM THE ONE LIST (`consent_peer_set`, and the
+            // `consent_peer_set_for` this used to miss, `blob_renditions`, the
+            // withdraws depth, the trust-direction grandfather, the pending
+            // KeyGrant set). FK-cascaded tables follow the row's delete.
+            for (table, column, removal) in
+                crate::federation::steward_purge::ATTESTATION_PROJECTIONS
+            {
+                if *removal == crate::federation::steward_purge::ProjectionRemoval::Helper {
+                    tx.execute(
+                        &format!("DELETE FROM {table} WHERE {column} = ?1"),
+                        rusqlite::params![id],
+                    )?;
+                }
+            }
+            tx.commit()
         })
         .await
         .map_err(|e| {
@@ -9349,7 +9416,28 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                 // backends on one file hold two connections and both pass the
                 // SELECT. The claim's INSERT takes the write lock first, so a
                 // second writer waits and then reads the first one's claim.
-                let tx = conn.transaction()?;
+                // IMMEDIATE: the write lock is taken BEFORE the held-digest
+                // read, so a second backend on the file waits on the busy
+                // timeout instead of failing a read-to-write lock upgrade
+                // ("database is locked").
+                let tx =
+                    conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                // Codex round 4 on PR #1057 — a HELD digest is an idempotent
+                // replay, accepted before the claim is asked: a legacy
+                // proposal V189 did not give the claim to (it shared its pair
+                // with an earlier one) is held evidence, and its replay must
+                // not abort the delivery its participations ride on.
+                let held: bool = tx
+                    .query_row(
+                        "SELECT 1 FROM accord_proposal WHERE proposal_digest = ?1",
+                        [&prep.proposal_digest],
+                        |_| Ok(true),
+                    )
+                    .optional()?
+                    .unwrap_or(false);
+                if held {
+                    return Ok(None);
+                }
                 tx.execute(
                     "INSERT INTO accord_proposal_nonce_claim \
                         (family_key_id, nonce, proposal_digest) VALUES (?1, ?2, ?3) \
@@ -13264,8 +13352,15 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         )
         .map(|p| format!(" AND {p}"))
         .unwrap_or_default();
-        let accountability = crate::federation::migration::accountability_record_sql(
-            "federation_attestations.dimension",
+        // Codex rounds 1 and 4 on PR #1057 — a tombstone is void for the
+        // accountability record and (interim) for a row a person is the
+        // subject of: both are served.
+        let accountability = format!(
+            "{} OR {}",
+            crate::federation::migration::accountability_record_sql(
+                "federation_attestations.dimension"
+            ),
+            crate::federation::steward_purge::person_subject_sql("federation_attestations", "")
         );
         let (read, bytes) = self
             .read_measured(move |conn| -> Result<Vec<_>, rusqlite::Error> {
@@ -31026,6 +31121,14 @@ mod tests {
                 .is_some(),
             "I827b: no legacy row is deleted"
         );
+        // Codex round 4 — an exact replay of the legacy non-owner (held
+        // evidence) is idempotent, not refused.
+        b.put_accord_proposal(newer.clone(), None)
+            .await
+            .expect("I827b: a held legacy proposal's replay is idempotent");
+        b.put_accord_proposal(older.clone(), None)
+            .await
+            .expect("I827b: the claim owner's replay too");
         let mut third = older.clone();
         third.window_until = "2029-01-01T00:00:00Z".to_owned();
         let e = b.put_accord_proposal(third, None).await.unwrap_err();

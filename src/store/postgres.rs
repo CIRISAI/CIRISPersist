@@ -5923,6 +5923,23 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 .map_err(|e| crate::federation::Error::Backend(format!("purge tombstone: {e}")))?;
             inserted.push(k > 0);
         }
+        // Codex round 4 sweep on PR #1057 — a newly tombstoned attestation
+        // leaves the signed-wire index at once, so the node stops ADVERTISING a
+        // hash it no longer serves (the rebuild re-indexes from the
+        // tombstone-filtered serve read).
+        for (t, fresh) in tombstones.iter().zip(&inserted) {
+            if *fresh && t.plane == crate::federation::steward_purge::PurgePlane::Attestation {
+                let rk =
+                    crate::federation::wire_index::record_key(&[("attestation_id", &t.record_ref)]);
+                tx.execute(
+                    "DELETE FROM cirislens.signed_wire_index \
+                     WHERE kind = 'Attestation' AND record_key = $1",
+                    &[&rk],
+                )
+                .await
+                .map_err(|e| crate::federation::Error::Backend(format!("purge wire index: {e}")))?;
+            }
+        }
         tx.commit()
             .await
             .map_err(|e| crate::federation::Error::Backend(format!("commit: {e}")))?;
@@ -6002,6 +6019,30 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         row.safe_get_with::<Option<String>, _, _, _>(0, crate::federation::Error::Backend)
     }
 
+    async fn purge_tombstone_notices(
+        &self,
+        plane: &str,
+        record_ref: &str,
+    ) -> Result<Vec<String>, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        client
+            .query(
+                "SELECT DISTINCT notice_id FROM cirislens.purge_tombstones \
+                 WHERE plane = $1 AND record_ref = $2 ORDER BY notice_id",
+                &[&plane, &record_ref],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("purge_tombstone_notices: {e}"))
+            })?
+            .iter()
+            .map(|r| r.safe_get_with::<String, _, _, _>(0, crate::federation::Error::Backend))
+            .collect()
+    }
+
     async fn list_purge_executions_since(
         &self,
         since: Option<(chrono::DateTime<chrono::Utc>, String)>,
@@ -6045,13 +6086,15 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // names, and never the accountability record (Codex on PR #1057: a
         // tombstone is void for it). The V106 / V121 cascades follow as on the
         // purge path.
+        // INTERIM (Codex round 4): nor a row a person is the subject of.
         let sql = format!(
-            "DELETE FROM cirislens.federation_attestations \
-             WHERE attestation_id = $1 \
+            "DELETE FROM cirislens.federation_attestations fa \
+             WHERE fa.attestation_id = $1 \
                AND EXISTS (SELECT 1 FROM cirislens.purge_tombstones \
-                           WHERE plane = 'attestation' AND record_ref = $1) \
-               AND NOT {}",
-            crate::federation::migration::accountability_record_sql("dimension")
+                           WHERE plane = 'attestation' AND record_ref = $1::text) \
+               AND NOT {} AND NOT {}",
+            crate::federation::migration::accountability_record_sql("fa.dimension"),
+            crate::federation::steward_purge::person_subject_sql("fa", "cirislens.")
         );
         let n = client
             .execute(sql.as_str(), &[&attestation_id])
@@ -6087,6 +6130,25 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .map_err(|e| crate::federation::Error::Backend(format!("purge trace gate: {e}")))?
             .is_some();
         if !tombstoned {
+            return Ok((0, 0));
+        }
+        // INTERIM (Codex round 4 on PR #1057) — a trace a person signed
+        // arrived after the tombstone: the tombstone is void for it, and this
+        // door never deletes it.
+        let person_signed: bool = tx
+            .query_one(
+                &format!(
+                    "SELECT EXISTS (SELECT 1 FROM cirislens.trace_events te \
+                       JOIN cirislens.federation_keys k ON k.key_id = te.signing_key_id \
+                       WHERE te.trace_id = $1 AND {})",
+                    crate::federation::steward_purge::person_identity_sql("k.identity_type")
+                ),
+                &[&trace_id],
+            )
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("purge trace signer: {e}")))?
+            .safe_get_with(0, crate::federation::Error::Backend)?;
+        if person_signed {
             return Ok((0, 0));
         }
         // Codex on PR #1057 — the rollup groups this trace was folded into,
@@ -9357,36 +9419,38 @@ impl crate::federation::FederationDirectory for PostgresBackend {
     ) -> Result<(), crate::federation::Error> {
         let record_key =
             crate::federation::wire_index::record_key(&[("attestation_id", attestation_id)]);
-        let client = self.pool().get().await.map_err(|e| {
+        let mut client = self.pool().get().await.map_err(|e| {
             crate::federation::Error::Backend(format!("purge_attestation_projections pool: {e}"))
         })?;
-        client
-            .execute(
-                "DELETE FROM cirislens.signed_wire_index \
-                 WHERE kind = 'Attestation' AND record_key = $1",
-                &[&record_key],
-            )
-            .await
-            .map_err(|e| crate::federation::Error::Backend(format!("purge wire index: {e}")))?;
-        client
-            .execute(
-                "DELETE FROM cirislens.consent_peer_set WHERE source_attestation_id = $1",
-                &[&attestation_id],
-            )
-            .await
-            .map_err(|e| {
-                crate::federation::Error::Backend(format!("purge consent_peer_set: {e}"))
-            })?;
-        // v45.0.0 (#871) — a retired row's rendition leaves the index with it.
-        client
-            .execute(
-                "DELETE FROM cirislens.blob_renditions WHERE source_attestation_id = $1",
-                &[&attestation_id],
-            )
-            .await
-            .map_err(|e| {
-                crate::federation::Error::Backend(format!("purge blob_renditions: {e}"))
-            })?;
+        // One transaction: every projection leaves together.
+        let tx = client.transaction().await.map_err(|e| {
+            crate::federation::Error::Backend(format!("purge_attestation_projections tx: {e}"))
+        })?;
+        tx.execute(
+            "DELETE FROM cirislens.signed_wire_index \
+             WHERE kind = 'Attestation' AND record_key = $1",
+            &[&record_key],
+        )
+        .await
+        .map_err(|e| crate::federation::Error::Backend(format!("purge wire index: {e}")))?;
+        // v54.1.0 (Codex round 4 on PR #1057) — every helper-removed
+        // projection, FROM THE ONE LIST (`consent_peer_set`, and the
+        // `consent_peer_set_for` this used to miss, `blob_renditions`, the
+        // withdraws depth, the trust-direction grandfather, the pending
+        // KeyGrant set). FK-cascaded tables follow the row's delete.
+        for (table, column, removal) in crate::federation::steward_purge::ATTESTATION_PROJECTIONS {
+            if *removal == crate::federation::steward_purge::ProjectionRemoval::Helper {
+                tx.execute(
+                    &format!("DELETE FROM cirislens.{table} WHERE {column}::text = $1"),
+                    &[&attestation_id],
+                )
+                .await
+                .map_err(|e| crate::federation::Error::Backend(format!("purge {table}: {e}")))?;
+            }
+        }
+        tx.commit().await.map_err(|e| {
+            crate::federation::Error::Backend(format!("purge_attestation_projections commit: {e}"))
+        })?;
         Ok(())
     }
 
@@ -11034,6 +11098,24 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         )
         .await
         .map_err(|e| Error::Backend(format!("accord_proposal nonce lock: {e}")))?;
+        // Codex round 4 on PR #1057 — a HELD digest is an idempotent replay,
+        // accepted before the claim is asked: a legacy proposal V189 did not
+        // give the claim to is held evidence, and its replay must not abort
+        // the delivery its participations ride on.
+        let held = tx
+            .query_opt(
+                "SELECT 1 FROM cirislens.accord_proposal WHERE proposal_digest = $1",
+                &[&prep.proposal_digest],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("accord_proposal held read: {e}")))?
+            .is_some();
+        if held {
+            tx.commit()
+                .await
+                .map_err(|e| Error::Backend(format!("accord_proposal commit: {e}")))?;
+            return Ok(());
+        }
         // Codex round 3 on PR #1057 — and the V189 claim's PRIMARY KEY makes
         // the pair the database's invariant on both dialects, not only this
         // door's lock.
@@ -15141,12 +15223,15 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                        AND (NOT EXISTS (SELECT 1 FROM cirislens.purge_tombstones pt \
                                         WHERE pt.plane = 'attestation' \
                                           AND pt.record_ref = fa.attestation_id::text) \
-                            OR {accountability}) \
+                            OR {accountability} OR {person}) \
                      ORDER BY admitted_at ASC, attestation_id ASC LIMIT $3",
-                    // Codex on PR #1057 — a tombstone is void for the
-                    // accountability record: it is served.
+                    // Codex rounds 1 and 4 on PR #1057 — a tombstone is void
+                    // for the accountability record and (interim) for a row a
+                    // person is the subject of: both are served.
                     accountability =
                         crate::federation::migration::accountability_record_sql("fa.dimension"),
+                    person =
+                        crate::federation::steward_purge::person_subject_sql("fa", "cirislens."),
                 ),
                 &[&since_at, &since_id, &limit],
             )
@@ -31007,6 +31092,53 @@ pub(crate) mod postgres_serial_scan {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **I827b** (v54.1.0, Codex round 4 on PR #1057) — a held legacy
+    /// proposal sharing a claimed pair (pre-#1047 evidence) replays
+    /// idempotently; a NEW digest under the pair is still refused.
+    #[tokio::test]
+    async fn i827b_a_held_legacy_proposal_replays_postgres() {
+        use crate::federation::FederationDirectory as _;
+        use crate::store::Backend as _;
+        let Some(dsn) = crate::test_pg::isolated_dsn() else {
+            return;
+        };
+        let b = PostgresBackend::connect(&dsn).await.unwrap();
+        b.run_migrations().await.unwrap();
+        let older = crate::federation::accord_quorum::test_fixtures::proposal(
+            "fam-i827b-pg",
+            "nonce-i827b-pg",
+        );
+        let mut newer = older.clone();
+        newer.window_until = "2030-01-01T00:00:00Z".to_owned();
+        b.put_accord_proposal(older.clone(), None).await.unwrap();
+        // The pre-#1047 state: a second row under the pair, around the door.
+        let client = b.get_client().await.unwrap();
+        client
+            .execute(
+                "INSERT INTO cirislens.accord_proposal (proposal_digest, family_key_id, action, \
+                    nonce, window_until, prior_family_digest, payload_sha256, proposal_json, \
+                    authority_signature, persist_row_hash, created_at) \
+                 SELECT $2, family_key_id, action, nonce, window_until, prior_family_digest, \
+                    payload_sha256, proposal_json, authority_signature, persist_row_hash, \
+                    created_at + interval '1 second' \
+                 FROM cirislens.accord_proposal WHERE proposal_digest = $1",
+                &[&older.digest(), &newer.digest()],
+            )
+            .await
+            .unwrap();
+        b.put_accord_proposal(newer.clone(), None)
+            .await
+            .expect("I827b: a held legacy proposal's replay is idempotent");
+        let mut third = older.clone();
+        third.window_until = "2029-01-01T00:00:00Z".to_owned();
+        let e = b.put_accord_proposal(third, None).await.unwrap_err();
+        assert!(
+            matches!(&e, crate::federation::Error::AccordProposalNonceReused { existing_proposal_digest, .. }
+                if *existing_proposal_digest == older.digest()),
+            "I827b: {e:?}"
+        );
+    }
 
     /// **I827** (v54.1.0, Codex round 3 on PR #1057) — two
     /// `PostgresBackend` instances on ONE database race one accord nonce:

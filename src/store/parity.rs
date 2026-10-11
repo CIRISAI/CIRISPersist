@@ -377,6 +377,9 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // tombstone (NULL the linkage, stamp `erased_at`) both trace-removal doors
     // run inside their transaction. A write; it refuses nothing about input.
     ("sqlite_tombstone_detection_events", Class::Plumbing),
+    // v54.1.0 (Codex round 4 on PR #1057) — Plumbing: the accord proposal's
+    // IMMEDIATE transaction (the write lock before the held-digest read).
+    ("transaction_with_behavior", Class::Plumbing),
     ("pg_tombstone_detection_events", Class::Plumbing),
     ("check_skew_and_payment", Class::Gate),
     ("check_trace_dimension_admission", Class::Gate),

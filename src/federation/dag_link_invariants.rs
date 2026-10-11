@@ -43,6 +43,10 @@
 //!   manifest is `Purged` at the serve-by-hash door, the ranged serve and the
 //!   local read, and so is every chunk no live manifest relates (whole and
 //!   ranged); a chunk a live DAG relates still serves.
+//! - **I830** (v54.1.0, Codex round 4 on PR #1057) — a chunk two purged
+//!   manifests share survives the SETTLED purge's finalize while the other
+//!   purge is still in its dwell (withheld meanwhile), and goes at the other's
+//!   finalize.
 //! - **I600** (v54.0.0, Codex on PR #1050) — the sweep RESUMES: with a cap
 //!   of three and three unopenable manifests sorting first, a linkable DAG
 //!   after them is linked within two passes (each pass starts after where the
@@ -444,6 +448,74 @@ pub(crate) mod bodies {
         exec
     }
 
+    /// **I830** — a chunk two purged manifests share is deleted only once
+    /// EVERY purge withholding it has settled.
+    pub(crate) async fn i830_a_shared_chunk_waits_for_every_settle<B>(
+        dsn_a: &str,
+        dsn_b: &str,
+        run: &str,
+        pick: Pick<B>,
+    ) where
+        B: BlobStorage + FederationDirectory + LinkSeam + Sync + 'static,
+    {
+        use crate::federation::steward_purge::{self as sp, PurgePlane};
+        let p = pair(dsn_a, dsn_b, run, pick, "i830").await;
+        let (sa, sb) = (format!("i830-a-{run}"), format!("i830-b-{run}"));
+        let ma = write_and_seal(&p, &sa, 3).await;
+        let chunks_a = deliver(&p, &sa, &ma).await;
+        let mb = write_and_seal(&p, &sb, 2).await;
+        deliver(&p, &sb, &mb).await;
+        let (seq, shared) = chunks_a[0];
+        p.sb.dag_link(&mb, Some((1_000 + seq, shared, &sb))).await;
+        let t = chrono::Utc::now();
+        let dwell = chrono::Duration::seconds(sp::PURGE_SETTLE_DWELL_SECS + 1);
+        // A's purge settled long ago; B's was executed just now.
+        let ea = execute_purge(
+            p.sb.as_ref(),
+            &p.key_b,
+            &[(PurgePlane::Blob, hex::encode(ma))],
+            t - dwell,
+        )
+        .await;
+        let eb = execute_purge(
+            p.sb.as_ref(),
+            &p.key_b,
+            &[(PurgePlane::Blob, hex::encode(mb))],
+            t,
+        )
+        .await;
+        sp::test_clock::set(Some(t));
+        let fin =
+            p.b.purge_finalize(&ea.notice_id)
+                .await
+                .expect("A finalizes");
+        sp::test_clock::set(None);
+        assert_eq!(fin.blobs_evicted, 1, "{fin:?}");
+        for (seq, c) in &chunks_a[1..] {
+            assert!(
+                !p.sb.has_blob(c).await.unwrap(),
+                "I830 A's own chunk {seq} goes"
+            );
+        }
+        assert!(
+            p.sb.has_blob(&shared).await.unwrap(),
+            "I830: a chunk B's unsettled purge also withholds survives A's finalize"
+        );
+        assert!(
+            matches!(served(&p, &shared).await, Err(BlobError::Purged { .. })),
+            "I830: and it stays withheld meanwhile"
+        );
+        sp::test_clock::set(Some(t + dwell));
+        p.b.purge_finalize(&eb.notice_id)
+            .await
+            .expect("B finalizes");
+        sp::test_clock::set(None);
+        assert!(
+            !p.sb.has_blob(&shared).await.unwrap(),
+            "I830: it goes at B's finalize"
+        );
+    }
+
     /// **I824** — a purged blob is withheld from execution, before finalize.
     pub(crate) async fn i824_a_purged_blob_is_withheld_from_execution<B>(
         dsn_a: &str,
@@ -587,11 +659,15 @@ pub(crate) mod bodies {
                 .await
                 .expect("I823: the purge finalizes");
         sp::test_clock::set(None);
+        // The binding row is the owner's, a person: under the interim
+        // no-human-subject rule (Codex round 4) its tombstone is void and it
+        // is kept; the bytes go.
         assert_eq!(
             (fin.attestations_deleted, fin.blobs_evicted),
-            (1, 1),
+            (0, 1),
             "{fin:?}"
         );
+        assert_eq!(fin.voided, vec![format!("attestation:i823-file-{run}")]);
         assert!(
             !p.sb.has_blob(&root).await.unwrap(),
             "I823 the manifest goes"
@@ -1156,6 +1232,7 @@ mod runners {
     pair_case!(i484, i484_a_shared_chunk_needs_both_withdrawn);
     pair_case!(i823, i823_a_purged_manifest_takes_its_chunks);
     pair_case!(i824, i824_a_purged_blob_is_withheld_from_execution);
+    pair_case!(i830, i830_a_shared_chunk_waits_for_every_settle);
     pair_case!(i485, i485_a_forged_pointer_revives_nothing);
     pair_case!(i486_487, i486_487_an_unrelated_dag_and_the_backfill);
     pair_case!(i576, i576_the_backfill_sweep);

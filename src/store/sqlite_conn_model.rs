@@ -621,6 +621,7 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("purge_execution", ConnClass::Read),
     ("purge_tombstones_of", ConnClass::Read),
     ("purge_tombstoned", ConnClass::Read),
+    ("purge_tombstone_notices", ConnClass::Read),
     ("list_purge_executions_since", ConnClass::Read),
     ("purge_delete_tombstoned_attestation", ConnClass::Write),
     ("purge_delete_tombstoned_trace", ConnClass::Write),

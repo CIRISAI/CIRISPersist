@@ -8895,7 +8895,7 @@ impl Engine {
 
     /// v54.1.0 (Codex round 2 on PR #1057) — the purge's bytes-plane delete:
     /// [`Self::evict_blob`], then every sealed-DAG child of the purged blob
-    /// whose EVERY manifest is purge-tombstoned on the blob plane (or was
+    /// whose EVERY manifest is purge-tombstoned by SETTLED purges only (or was
     /// evicted by this walk), transitively. The purge deletes the blob's
     /// binding row in the same finalize, so the DAG fold reads the manifest
     /// `Unbound`, not `Withdrawn`, and `evict_blob`'s own chunk pass (keyed
@@ -11338,12 +11338,18 @@ where
                 if gone.contains(&parent) {
                     continue;
                 }
-                let tombstoned = backend
-                    .purge_tombstoned("blob", &hex::encode(parent))
-                    .await
-                    .map_err(|e| BlobError::Backend(format!("purge_evict_blob: tombstone: {e}")))?
-                    .is_some();
-                if !tombstoned {
+                // Codex round 4 on PR #1057 — a parent counts as gone only
+                // when every purge that tombstoned it has SETTLED (or
+                // finalized): a parent still inside another notice's dwell
+                // keeps the shared chunk for that notice's own finalize (the
+                // chunk stays withheld meanwhile, I824).
+                let settled =
+                    crate::federation::steward_purge::blob_purge_settled(backend, &parent, now)
+                        .await
+                        .map_err(|e| {
+                            BlobError::Backend(format!("purge_evict_blob: tombstone: {e}"))
+                        })?;
+                if !settled {
                     orphaned = false;
                     break;
                 }

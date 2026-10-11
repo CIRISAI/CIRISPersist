@@ -197,6 +197,100 @@ pub(crate) mod test_clock {
 /// on it; ADMISSION keys on the signed `run_kind` ([`TRACE_RUN_KIND_MOCK`]).
 pub const MOCK_LLM_MODEL: &str = "mock-model";
 
+/// How a projection of a stored attestation leaves with the row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectionRemoval {
+    /// `purge_attestation_projections` deletes its rows (every backend, from
+    /// THIS list: the SQL backends iterate it).
+    Helper,
+    /// A foreign key `ON DELETE CASCADE` to `federation_attestations`.
+    ForeignKeyCascade,
+    /// A foreign key `ON DELETE SET NULL` to `federation_attestations`: the
+    /// projection row is the key's, and only its link to the attestation goes.
+    ForeignKeySetNull,
+}
+
+/// v54.1.0 (Codex round 4 on PR #1057) — **every table a stored attestation
+/// projects into, keyed by the attestation id, and how the hard delete removes
+/// it** (`table`, `column`, removal). `purge_attestation_projections` (run by
+/// `purge_finalize` and by the reset/reaper door) deletes every
+/// [`ProjectionRemoval::Helper`] row FROM THIS LIST, so a table added here is
+/// purged on every SQL backend with no second edit; the memory backend mirrors
+/// each by hand. The from-disk gate
+/// `every_attestation_keyed_table_is_a_classified_projection` reads the
+/// migrated schema and fails on any table with an `*attestation_id` column that
+/// is in neither this list nor [`INDEPENDENT_ATTESTATION_ID_TABLES`].
+///
+/// `signed_wire_index` is keyed by `record_key`, not an id column, and is
+/// deleted by the helper beside this list.
+pub const ATTESTATION_PROJECTIONS: &[(&str, &str, ProjectionRemoval)] = &[
+    (
+        "attestation_subjects",
+        "attestation_id",
+        ProjectionRemoval::ForeignKeyCascade,
+    ),
+    (
+        "consent_peer_set",
+        "source_attestation_id",
+        ProjectionRemoval::Helper,
+    ),
+    // Codex round 4: a steward-scoped grant outlived its hard delete here, and
+    // `consent_peers_by_principals` kept authorising the peer.
+    (
+        "consent_peer_set_for",
+        "source_attestation_id",
+        ProjectionRemoval::Helper,
+    ),
+    (
+        "blob_renditions",
+        "source_attestation_id",
+        ProjectionRemoval::Helper,
+    ),
+    (
+        "federation_withdraws_admission_depths",
+        "attestation_id",
+        ProjectionRemoval::Helper,
+    ),
+    (
+        "federation_trust_direction_held",
+        "attestation_id",
+        ProjectionRemoval::Helper,
+    ),
+    (
+        "federation_key_grant_pending",
+        "attestation_id",
+        ProjectionRemoval::Helper,
+    ),
+    (
+        "identity_canonical_binding",
+        "binding_attestation_id",
+        ProjectionRemoval::ForeignKeySetNull,
+    ),
+];
+
+/// Tables with an `*attestation_id` column that are NOT projections of a
+/// `federation_attestations` row: their own signed records whose identifier
+/// is spelled `attestation_id` (`table`, why).
+pub const INDEPENDENT_ATTESTATION_ID_TABLES: &[(&str, &str)] = &[
+    ("federation_attestations", "the row itself"),
+    (
+        "federation_organizations",
+        "its own signed organization record; the id is that record's",
+    ),
+    (
+        "federation_org_memberships",
+        "its own signed membership record; the id is that record's",
+    ),
+    (
+        "federation_partner_records",
+        "its own signed partner record; the id is that record's",
+    ),
+    (
+        "cirisnode_promotion_attestations",
+        "the cirisnode plane's own promotion records, written by src/cirisnode",
+    ),
+];
+
 /// The page size of the attestation scan the selection classes resolve over.
 const SCAN_PAGE: u32 = 256;
 
@@ -1124,11 +1218,10 @@ where
             let human = match kinds.get(&subject) {
                 Some(v) => *v,
                 None => {
-                    let v = directory.lookup_public_key(&subject).await?.map(|k| {
-                        k.identity_type
-                            .split(',')
-                            .any(|t| t.trim() == super::types::identity_type::USER)
-                    });
+                    let v = directory
+                        .lookup_public_key(&subject)
+                        .await?
+                        .map(|k| identity_type_is_person(&k.identity_type));
                     kinds.insert(subject.clone(), v);
                     v
                 }
@@ -1886,9 +1979,12 @@ where
     let mut voided = Vec::new();
     for t in held {
         *tombstones.entry(t.plane.as_str().to_owned()).or_insert(0) += 1;
-        if t.plane == PurgePlane::Attestation
-            && voided_by_accountability(directory, &t.record_ref).await?
-        {
+        let void = match t.plane {
+            PurgePlane::Attestation => held_row_voided(directory, &t.record_ref).await?,
+            PurgePlane::Trace => trace_voided(directory, &t.record_ref).await?,
+            PurgePlane::Blob => false,
+        };
+        if void {
             voided.push(t.record_id());
         }
     }
@@ -1909,18 +2005,6 @@ where
         tombstones,
         voided,
     })
-}
-
-/// Is the tombstone on attestation `id` void — is the row it names held here
-/// and the accountability record ([`accountability_record_of`])?
-async fn voided_by_accountability<F>(directory: &F, id: &str) -> Result<bool, Error>
-where
-    F: FederationDirectory + ?Sized,
-{
-    Ok(directory
-        .get_attestation(id)
-        .await?
-        .is_some_and(|row| accountability_record_of(&row).is_some()))
 }
 
 /// **The ledger** of an executed purge, as TSV for
@@ -2087,14 +2171,21 @@ where
         for (index, r) in records.iter().enumerate().filter(|(_, r)| r.plane == plane) {
             match plane {
                 PurgePlane::Trace => {
+                    // INTERIM — a trace whose signer is a person arrived after
+                    // the tombstone: never deleted (the door re-asks this too).
+                    if trace_voided(directory, &r.id).await? {
+                        report.voided.push(r.record_id());
+                        continue;
+                    }
                     let (ev, calls) = directory.purge_delete_tombstoned_trace(&r.id).await?;
                     report.trace_events_deleted += ev;
                     report.trace_llm_calls_deleted += calls;
                 }
                 PurgePlane::Attestation => {
-                    // The accountability record is never deleted, whatever
-                    // tombstone names it (the delete door re-asks this too).
-                    if voided_by_accountability(directory, &r.id).await? {
+                    // The accountability record, and (interim) a row a person
+                    // is the subject of, is never deleted, whatever tombstone
+                    // names it (the delete door re-asks both).
+                    if held_row_voided(directory, &r.id).await? {
                         report.voided.push(r.record_id());
                         continue;
                     }
@@ -2394,6 +2485,42 @@ pub fn accountability_record_of(row: &Attestation) -> Option<&'static str> {
     super::admission::envelope_dimension(&row.attestation_envelope).and_then(accountability_family)
 }
 
+/// v54.1.0 (Codex round 4 on PR #1057) — **may a blob another purge's DAG
+/// walk reaches be deleted at `now`?** `true` when at least one purge that
+/// tombstoned `sha256` has FINALIZED or SETTLED (its 72 h dwell passed at
+/// `now`) and every OTHER purge that tombstoned it has too: a shared chunk is
+/// deleted only once no purge withholding it is still inside its retraction
+/// round. An unsettled parent leaves the chunk held (and withheld, I824) for
+/// its own finalize.
+///
+/// # Errors
+///
+/// The lookups' read errors.
+pub(crate) async fn blob_purge_settled<F>(
+    directory: &F,
+    sha256: &[u8; 32],
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<bool, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let notices = directory
+        .purge_tombstone_notices(PurgePlane::Blob.as_str(), &hex::encode(sha256))
+        .await?;
+    if notices.is_empty() {
+        return Ok(false);
+    }
+    for notice_id in notices {
+        let Some(e) = directory.purge_execution(&notice_id).await? else {
+            return Ok(false);
+        };
+        if e.finalized_at.is_none() && now < settles_at(&e) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 /// v54.1.0 (Codex round 3 on PR #1057) — **is this blob withheld by a
 /// purge?** `Some(notice_id)` when a steward purge tombstoned `sha256`, or
 /// when it is a sealed-DAG child and EVERY manifest it belongs to is withheld
@@ -2467,6 +2594,129 @@ where
     }
 }
 
+/// **Is a key with this `identity_type` a person?** Its comma-separated
+/// roles name `user`. THE predicate the interim no-human-subject rule asks,
+/// in Rust ([`human_subject_records`], the arrival gates) and, rendered from
+/// the same constant, in SQL ([`person_identity_sql`]).
+#[must_use]
+pub fn identity_type_is_person(identity_type: &str) -> bool {
+    identity_type
+        .split(',')
+        .any(|t| t.trim() == super::types::identity_type::USER)
+}
+
+/// [`identity_type_is_person`] as a SQL predicate over the text column
+/// `column` (SQLite and Postgres): the comma list with spaces removed, fenced
+/// by commas, contains `,user,`. Rendered from the constant, never retyped.
+#[must_use]
+pub fn person_identity_sql(column: &str) -> String {
+    format!(
+        "((',' || replace(COALESCE({column}, ''), ' ', '') || ',') LIKE '%,{},%')",
+        super::types::identity_type::USER.replace('\'', "''")
+    )
+}
+
+/// v54.1.0 (Codex round 4 on PR #1057) — "the held attestation `fa` has a
+/// subject that is a person" as SQL: its `attested_key_id` or any
+/// `attestation_subjects` row resolves to a key [`person_identity_sql`]
+/// accepts. `prefix` is the schema prefix (`""` for SQLite, `"cirislens."`
+/// for Postgres). The serve read and the delete door ask this so a
+/// person-subject row that arrived after a tombstone stays served and held.
+#[must_use]
+pub fn person_subject_sql(fa: &str, prefix: &str) -> String {
+    format!(
+        "EXISTS (SELECT 1 FROM {prefix}federation_keys pk \
+           WHERE (pk.key_id = {fa}.attested_key_id \
+                  OR pk.key_id IN (SELECT ps.subject_key_id FROM {prefix}attestation_subjects ps \
+                                   WHERE ps.attestation_id = {fa}.attestation_id)) \
+             AND {})",
+        person_identity_sql("pk.identity_type")
+    )
+}
+
+/// The first subject of `row` (its `subject_key_ids` and `attested_key_id`)
+/// that resolves HERE to a person, if any. A key this node cannot resolve is
+/// not a person for this question: the void below is granted only on a
+/// person PROVEN, so an unknown key cannot un-purge a row.
+///
+/// # Errors
+///
+/// Key lookups.
+pub async fn person_subject_of<F>(directory: &F, row: &Attestation) -> Result<Option<String>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    for subject in attestation_subjects(row) {
+        if directory
+            .lookup_public_key(&subject)
+            .await?
+            .is_some_and(|k| identity_type_is_person(&k.identity_type))
+        {
+            return Ok(Some(subject));
+        }
+    }
+    Ok(None)
+}
+
+/// v54.1.0 (Codex rounds 1 and 4 on PR #1057) — **why a tombstone on this
+/// row's id is VOID, if it is.** Two things no purge may reach, whatever
+/// replication order brought the tombstone first:
+///
+/// - the accountability record ([`accountability_record_of`],
+///   CLM-accountability-record-unpurgeable);
+/// - INTERIM, a row a person is the subject of ([`person_subject_of`]): a
+///   receiver applies a bundle naming ids it does not hold (`skip_unheld`),
+///   so the interim no-human-subject rule is re-asked when the row arrives.
+///
+/// A void row is admitted at arrival, served, never deleted, and listed in
+/// [`PurgeStatus::voided`] / [`FinalizeReport::voided`].
+///
+/// # Errors
+///
+/// Key lookups.
+pub async fn tombstone_void_reason<F>(
+    directory: &F,
+    row: &Attestation,
+) -> Result<Option<String>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    if let Some(family) = accountability_record_of(row) {
+        return Ok(Some(format!(
+            "a `{family}` row is the accountability record (CLM-accountability-record-unpurgeable)"
+        )));
+    }
+    if let Some(person) = person_subject_of(directory, row).await? {
+        return Ok(Some(format!(
+            "its subject {person} is a person (interim: no purge reaches a human subject until \
+             the notice is a row)"
+        )));
+    }
+    Ok(None)
+}
+
+/// Is the tombstone on attestation `id` void — is the row it names held here
+/// and [`tombstone_void_reason`] answers?
+async fn held_row_voided<F>(directory: &F, id: &str) -> Result<bool, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    match directory.get_attestation(id).await? {
+        Some(row) => Ok(tombstone_void_reason(directory, &row).await?.is_some()),
+        None => Ok(false),
+    }
+}
+
+/// Is the tombstone on trace `trace_id` void — is the trace's own attestation
+/// held here with a void reason (its signer, a subject of that attestation, is
+/// a person)? The trace delete door re-asks the signer in its statement.
+async fn trace_voided<F>(directory: &F, trace_id: &str) -> Result<bool, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    held_row_voided(directory, &crate::ingest::trace_attestation_id(trace_id)).await
+}
+
 /// The attestation door's gate: the row's id on the claims plane.
 ///
 /// **A tombstone never reaches the accountability record** (Codex on PR
@@ -2479,6 +2729,11 @@ where
 /// by `purge_finalize` ([`PurgeStatus::voided`] names it). Replication order
 /// cannot do what no notice may. Every other row stays refused.
 ///
+/// v54.1.0 (Codex round 4 on PR #1057) — and, INTERIM, a row a PROVEN person
+/// is the subject of ([`tombstone_void_reason`]): the receiver applied the
+/// tombstone without the row (`skip_unheld`), so the no-human-subject rule is
+/// asked here, when the row is in hand.
+///
 /// # Errors
 ///
 /// See [`refuse_if_tombstoned`].
@@ -2489,7 +2744,16 @@ pub async fn refuse_if_tombstoned_attestation<F>(
 where
     F: FederationDirectory + ?Sized,
 {
-    if accountability_record_of(row).is_some() {
+    // Cheap first: an id nothing tombstoned needs no subject lookups.
+    match directory
+        .purge_tombstoned(PurgePlane::Attestation.as_str(), &row.attestation_id)
+        .await
+    {
+        Ok(None) | Err(Error::Unsupported { .. }) => return Ok(()),
+        Ok(Some(_)) => {}
+        Err(e) => return Err(e),
+    }
+    if tombstone_void_reason(directory, row).await?.is_some() {
         return Ok(());
     }
     refuse_if_tombstoned(directory, PurgePlane::Attestation, &row.attestation_id).await

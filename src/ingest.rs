@@ -541,10 +541,28 @@ where
                 .await
             {
                 Ok(Some(notice_id)) => {
-                    return Err(refused(
-                        crate::federation::steward_purge::token::TOMBSTONED,
-                        format!("trace_id={} notice_id={notice_id}", trace.trace_id),
-                    ))
+                    // INTERIM (Codex round 4 on PR #1057) — a trace a PROVEN
+                    // person signed is not purgeable until the notice is a row:
+                    // a receiver applied this tombstone without the trace, so
+                    // the rule is asked here, with the trace in hand. The
+                    // tombstone is void for it.
+                    let person = self
+                        .backend
+                        .as_dyn_directory()
+                        .lookup_public_key(&trace.signature_key_id)
+                        .await
+                        .map_err(|e| IngestError::Store(StoreError::Backend(e.to_string())))?
+                        .is_some_and(|k| {
+                            crate::federation::steward_purge::identity_type_is_person(
+                                &k.identity_type,
+                            )
+                        });
+                    if !person {
+                        return Err(refused(
+                            crate::federation::steward_purge::token::TOMBSTONED,
+                            format!("trace_id={} notice_id={notice_id}", trace.trace_id),
+                        ));
+                    }
                 }
                 Ok(None) | Err(crate::federation::Error::Unsupported { .. }) => {}
                 Err(e) => return Err(IngestError::Store(StoreError::Backend(e.to_string()))),
