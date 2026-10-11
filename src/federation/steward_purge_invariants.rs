@@ -129,6 +129,12 @@
 //!   admitted; a LEGACY manifest row with no `run_kind` is admitted and
 //!   stored byte for byte as signed; a `run_kind` outside the vocabulary, in
 //!   either shape, is `federation_trace_dimension_invalid`.
+//! - **I820** (Codex round 2 on PR #1057) — derivatives leave with a
+//!   withheld parent: under `RefusedToday`, a refused-today
+//!   `moderation_track_record` row is withheld (inadmissible), and so are the
+//!   score citing it and the score citing THAT score; a refused-today plain
+//!   row and the score over it are selected; the dry run's digest is the
+//!   reduced set's, and execution under it succeeds.
 //! - **I666** — a `key:` (or `federation_keys:`) id is not a purge record:
 //!   `purge_selection_malformed`, naming `key:revocation` as key retirement's
 //!   own act.
@@ -2635,6 +2641,75 @@ pub(crate) mod bodies {
         assert_eq!(e.kind(), "federation_trace_dimension_invalid", "I698: {e}");
     }
 
+    // ── I820 ──────────────────────────────────────────────────────────────
+    pub(crate) async fn i820_derivatives_leave_with_a_withheld_parent<D: Seams>(d: &D) {
+        root(d).await;
+        let dir = d.as_dyn_directory();
+        let t = now();
+        // A refused-today accountability row (inadmissible) and a refused-
+        // today plain row (admissible).
+        let parent = uuid::Uuid::new_v4().to_string();
+        dir.put_attestation(SignedAttestation {
+            attestation: fed_row(
+                &parent,
+                HARNESS,
+                BYSTANDER,
+                "moderation_track_record:ciris-canonical:v1",
+            ),
+        })
+        .await
+        .expect("the accountability row admits");
+        let plain = put_score(d, BYSTANDER, AGENT, &[]).await.attestation_id;
+        for id in [&parent, &plain] {
+            let row = dir.get_attestation(id).await.unwrap().unwrap();
+            d.shift_asserted_at(id, row.asserted_at + chrono::Duration::seconds(1))
+                .await;
+            let row = dir.get_attestation(id).await.unwrap().unwrap();
+            assert!(sp::refused_today(&row).is_some(), "precondition: {id}");
+        }
+        // A chain off each: score over the row, score over that score.
+        let s1 = put_score(d, SCORER, AGENT, &[&parent]).await.attestation_id;
+        let s2 = put_score(d, SCORER, AGENT, &[&s1]).await.attestation_id;
+        let p1 = put_score(d, SCORER, AGENT, &[&plain]).await.attestation_id;
+        let p2 = put_score(d, SCORER, AGENT, &[&p1]).await.attestation_id;
+
+        let sel = PurgeSelection::RefusedToday;
+        let dry = sp::purge_dry_run(dir, &sel).await.unwrap();
+        let mut expect: Vec<String> = [&plain, &p1, &p2]
+            .iter()
+            .map(|id| format!("attestation:{id}"))
+            .collect();
+        expect.sort();
+        assert_eq!(
+            dry.sample, expect,
+            "I820: the chain off the withheld row leaves with it; withheld {:?}",
+            dry.withheld
+        );
+        let mut withheld: Vec<String> = dry.withheld.iter().map(|w| w.record_id.clone()).collect();
+        withheld.sort();
+        let mut expect_withheld: Vec<String> = [&parent, &s1, &s2]
+            .iter()
+            .map(|id| format!("attestation:{id}"))
+            .collect();
+        expect_withheld.sort();
+        assert_eq!(withheld, expect_withheld, "I820: {:?}", dry.withheld);
+        assert_eq!(dry.record_count, 3);
+        assert_eq!(
+            dry.selection_digest,
+            sp::selection_digest(&expect),
+            "I820: the digest is the reduced set's"
+        );
+        let notice = notice_for(&dry.notice_template, &[cc::FOUNDERS[0], cc::FOUNDERS[1]], t);
+        let rep = sp::purge_rows(dir, &sel, &notice, NODE, t)
+            .await
+            .expect("I820: the reduced selection executes");
+        assert_eq!(rep.record_count, 3);
+        let served = served_ids(d).await;
+        for id in [&parent, &s1, &s2] {
+            assert!(served.contains(id), "I820: withheld {id} is still served");
+        }
+    }
+
     // ── I660 ──────────────────────────────────────────────────────────────
     pub(crate) async fn i660_the_delete_doors_re_ask_the_tombstone<D: Seams>(d: &D) {
         root(d).await;
@@ -2791,6 +2866,11 @@ mod run {
                 async fn i698() {
                     let Some(d) = $fresh.await else { return };
                     b::i698_run_kind_survives_the_manifest_form(&d).await
+                }
+                #[tokio::test]
+                async fn i820() {
+                    let Some(d) = $fresh.await else { return };
+                    b::i820_derivatives_leave_with_a_withheld_parent(&d).await
                 }
                 #[tokio::test]
                 async fn i664() {

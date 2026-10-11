@@ -841,6 +841,12 @@ where
             records.remove(&record_id);
             withheld.push(Withheld { record_id, reason });
         }
+        // Codex round 2 on PR #1057 — derivatives follow their evidence OUT
+        // as they followed it in: a record selected only because it derives
+        // from a withheld one is withheld too, transitively (a score over a
+        // score over the withheld row). A score that cites another record
+        // still selected stays, re-pointed at it.
+        withhold_orphaned_derivatives(&mut records, &facts, &mut withheld);
     }
     withheld.sort_by(|a, b| a.record_id.cmp(&b.record_id));
     Ok(ResolvedSelection {
@@ -848,6 +854,63 @@ where
         withheld,
         inadmissible,
     })
+}
+
+/// Withhold, to a fixpoint, every DERIVED record whose evidence left the
+/// selection: its `derived_from` record is gone and (for a score) none of its
+/// `evidence_refs` names a record still selected. A score whose
+/// `derived_from` left but which cites another selected record stays, its
+/// `derived_from` re-pointed at that one. A record a class selected on its own
+/// facts (`derived_from` = `None`) is never touched here.
+fn withhold_orphaned_derivatives(
+    records: &mut BTreeMap<String, PurgeRecord>,
+    facts: &BTreeMap<String, RowFacts>,
+    withheld: &mut Vec<Withheld>,
+) {
+    loop {
+        let evidence: BTreeMap<String, String> = records
+            .values()
+            .filter(|r| r.plane != PurgePlane::Blob)
+            .map(|r| (r.id.clone(), r.record_id()))
+            .collect();
+        let mut orphans: Vec<(String, String)> = Vec::new();
+        let mut repoint: Vec<(String, String)> = Vec::new();
+        for (key, r) in records.iter() {
+            let Some(from) = &r.derived_from else {
+                continue;
+            };
+            if records.contains_key(from) {
+                continue;
+            }
+            let other = (r.plane == PurgePlane::Attestation)
+                .then(|| facts.get(&r.id))
+                .flatten()
+                .filter(|f| f.is_scores)
+                .and_then(|f| f.refs.iter().find_map(|e| evidence.get(e)));
+            match other {
+                Some(still) => repoint.push((key.clone(), still.clone())),
+                None => orphans.push((key.clone(), from.clone())),
+            }
+        }
+        for (key, still) in repoint {
+            if let Some(r) = records.get_mut(&key) {
+                r.derived_from = Some(still);
+            }
+        }
+        if orphans.is_empty() {
+            return;
+        }
+        for (record_id, from) in orphans {
+            records.remove(&record_id);
+            withheld.push(Withheld {
+                record_id,
+                reason: format!(
+                    "derived from {from}, which is not in the selection: a derivative leaves with \
+                     its evidence"
+                ),
+            });
+        }
+    }
 }
 
 // ── the dry run ────────────────────────────────────────────────────────────
