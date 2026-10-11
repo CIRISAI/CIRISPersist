@@ -378,9 +378,25 @@ where
     C: super::canonical::Canonicalizer + ?Sized,
 {
     use sha2::{Digest, Sha256};
-    let nine_field = canonical_payload_value(trace);
-    let nine_bytes = canonicalizer.canonicalize_value(&nine_field)?;
-    let two_field = canonical_payload_value_legacy(trace);
+    // v54.1.0 (Codex round 2 on PR #1057) — the primary shape IS the
+    // verifier's preimage: the same builder `verify_trace` and
+    // `verify_trace_hybrid` sign-check against ([`canonical_bytes_for_trace`],
+    // dispatched by the signed `trace_schema_version`, with the signed
+    // `run_kind` joined). Before, it rebuilt the 2.7.0 shape WITHOUT
+    // `run_kind`, so for a trace carrying one the breadcrumb named bytes no
+    // verifier ever checked. A version no arm dispatches falls back to the
+    // 2.7.0 shape (the diagnostic must not fail where the verifier refused).
+    let nine_bytes = match canonical_bytes_for_trace(trace, canonicalizer) {
+        Ok(bytes) => bytes,
+        Err(super::Error::UnsupportedSchemaVersion(_)) => {
+            let mut nine_field = canonical_payload_value(trace);
+            with_signed_run_kind(&mut nine_field, trace);
+            canonicalizer.canonicalize_value(&nine_field)?
+        }
+        Err(e) => return Err(e),
+    };
+    let mut two_field = canonical_payload_value_legacy(trace);
+    with_signed_run_kind(&mut two_field, trace);
     let two_bytes = canonicalizer.canonicalize_value(&two_field)?;
     Ok(CanonicalDiagnostic {
         nine_field_sha256: hex::encode(Sha256::digest(&nine_bytes)),
@@ -393,7 +409,9 @@ where
 /// Diagnostic carrier for v0.1.18 breadcrumbs +
 /// `Engine.debug_canonicalize`. See [`canonical_payload_sha256s`].
 pub(crate) struct CanonicalDiagnostic {
-    /// Hex sha256 of the spec 9-field canonical form.
+    /// Hex sha256 of the verifier's preimage ([`canonical_bytes_for_trace`]:
+    /// the spec canonical form at the trace's signed schema version, signed
+    /// `run_kind` included). The `9field` name is the v0.1.18 wire key.
     pub(crate) nine_field_sha256: String,
     /// Hex sha256 of the legacy 2-field canonical form.
     pub(crate) two_field_sha256: String,
@@ -703,6 +721,36 @@ mod tests {
             ("", V1Python),
         ] {
             assert_eq!(canon_version_for_trace_schema(wire), want, "schema {wire}");
+        }
+    }
+
+    /// **I699** (Codex round 2 on PR #1057) — the `SignatureMismatch`
+    /// breadcrumb and `debug_canonicalize` hash the VERIFIER's preimage: for a
+    /// trace carrying the signed `run_kind`, at each dispatched version, the
+    /// diagnostic's primary hash is SHA-256 of [`canonical_bytes_for_trace`],
+    /// and the legacy shape carries `run_kind` too.
+    #[test]
+    fn i699_the_diagnostic_hashes_the_verifiers_preimage() {
+        use sha2::{Digest, Sha256};
+        let sk = fixed_signing_key();
+        for wire in ["2.7.0", "2.7.9", "3.0.0", "2.7.legacy"] {
+            let mut trace = make_trace(&sk, "agent-i699");
+            trace.trace_schema_version = SchemaVersion::parse(wire).unwrap();
+            trace.run_kind = Some("production".into());
+            let preimage =
+                canonical_bytes_for_trace(&trace, &PythonJsonDumpsCanonicalizer).unwrap();
+            let diag = canonical_payload_sha256s(&trace, &PythonJsonDumpsCanonicalizer).unwrap();
+            assert_eq!(
+                diag.nine_field_sha256,
+                hex::encode(Sha256::digest(&preimage)),
+                "I699 {wire}: the diagnostic names the bytes the verifier checks"
+            );
+            assert_eq!(diag.nine_field_bytes, preimage, "I699 {wire}");
+            let legacy: serde_json::Value = serde_json::from_slice(&diag.two_field_bytes).unwrap();
+            assert_eq!(
+                legacy["run_kind"], "production",
+                "I699 {wire}: the legacy shape carries the signed run_kind"
+            );
         }
     }
 
