@@ -4687,6 +4687,31 @@ impl PostgresBackend {
             .map_err(|e| crate::federation::Error::Backend(e.to_string()))
     }
 
+    /// v54.1.0 (Codex on PR #1057) — TEST SEAM: drop one stored tombstone of
+    /// a notice, reproducing a header whose set is partial (the state the
+    /// pre-fix, non-atomic write could leave). Nothing else moves.
+    #[cfg(test)]
+    pub async fn test_seam_drop_purge_tombstone(
+        &self,
+        notice_id: &str,
+        plane: &str,
+        record_ref: &str,
+    ) -> Result<(), crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        client
+            .execute(
+                "DELETE FROM cirislens.purge_tombstones \
+                 WHERE notice_id = $1 AND plane = $2 AND record_ref = $3",
+                &[&notice_id, &plane, &record_ref],
+            )
+            .await
+            .map(|_| ())
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))
+    }
+
     /// v54.1.0 (CIRISPersist#1043) — TEST SEAM: reproduce a legacy row the
     /// apply door refuses today (#598 "typed asserted_at diverges from the
     /// signed envelope"): move the typed `asserted_at` column off the signed
@@ -5641,14 +5666,31 @@ impl crate::federation::FederationDirectory for PostgresBackend {
     async fn purge_put_execution(
         &self,
         execution: &crate::federation::steward_purge::PurgeExecution,
-    ) -> Result<bool, crate::federation::Error> {
-        let client = self
+        tombstones: &[crate::federation::steward_purge::PurgeTombstone],
+    ) -> Result<crate::federation::steward_purge::PurgePutOutcome, crate::federation::Error> {
+        crate::federation::steward_purge::check_purge_put_set(execution, tombstones)?;
+        // Codex on PR #1057 — the header and every tombstone are ONE
+        // transaction: run on the bare client, each statement autocommitted,
+        // and a failure or a process loss between them left a durable header
+        // holding part of its `record_count`.
+        #[cfg(test)]
+        let inject_tombstone_fault = self
+            .test_hooks()
+            .fail_if_armed("purge_put_execution_tombstones")
+            .is_err();
+        #[cfg(not(test))]
+        let inject_tombstone_fault = false;
+        let mut client = self
             .get_client()
             .await
             .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("begin tx: {e}")))?;
         let e = execution;
         let record_count = i64::try_from(e.record_count).unwrap_or(i64::MAX);
-        let n = client
+        let n = tx
             .execute(
                 "INSERT INTO cirislens.purge_executions (notice_id, selection_digest, \
                     claimant_key_id, record_count, notice_jcs, cosignatures_json, executed_by, \
@@ -5670,36 +5712,45 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             )
             .await
             .map_err(|e| crate::federation::Error::Backend(format!("purge_put_execution: {e}")))?;
-        Ok(n > 0)
-    }
-
-    async fn purge_put_tombstone(
-        &self,
-        tombstone: &crate::federation::steward_purge::PurgeTombstone,
-    ) -> Result<bool, crate::federation::Error> {
-        let client = self
-            .get_client()
-            .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
-        let t = tombstone;
-        let ordinal = i64::try_from(t.ordinal).unwrap_or(i64::MAX);
-        let n = client
-            .execute(
+        if inject_tombstone_fault {
+            return Err(crate::federation::Error::Backend(
+                "purge_put_execution tombstones: injected fault".into(),
+            ));
+        }
+        let stmt = tx
+            .prepare(
                 "INSERT INTO cirislens.purge_tombstones \
                     (notice_id, plane, record_ref, ordinal, derived_from) \
                  VALUES ($1, $2, $3, $4, $5) \
                  ON CONFLICT (notice_id, plane, record_ref) DO NOTHING",
-                &[
-                    &t.notice_id,
-                    &t.plane.as_str(),
-                    &t.record_ref,
-                    &ordinal,
-                    &t.derived_from,
-                ],
             )
             .await
-            .map_err(|e| crate::federation::Error::Backend(format!("purge_put_tombstone: {e}")))?;
-        Ok(n > 0)
+            .map_err(|e| crate::federation::Error::Backend(format!("purge tombstone: {e}")))?;
+        let mut inserted = Vec::with_capacity(tombstones.len());
+        for t in tombstones {
+            let ordinal = i64::try_from(t.ordinal).unwrap_or(i64::MAX);
+            let k = tx
+                .execute(
+                    &stmt,
+                    &[
+                        &t.notice_id,
+                        &t.plane.as_str(),
+                        &t.record_ref,
+                        &ordinal,
+                        &t.derived_from,
+                    ],
+                )
+                .await
+                .map_err(|e| crate::federation::Error::Backend(format!("purge tombstone: {e}")))?;
+            inserted.push(k > 0);
+        }
+        tx.commit()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("commit: {e}")))?;
+        Ok(crate::federation::steward_purge::PurgePutOutcome {
+            header_inserted: n > 0,
+            tombstones_inserted: inserted,
+        })
     }
 
     async fn purge_execution(

@@ -3541,6 +3541,33 @@ impl SqliteBackend {
         .map_err(|e| crate::federation::Error::Backend(e.to_string()))
     }
 
+    /// v54.1.0 (Codex on PR #1057) — TEST SEAM: drop one stored tombstone of
+    /// a notice, reproducing a header whose set is partial (the state the
+    /// pre-fix, non-atomic write could leave). Nothing else moves.
+    #[cfg(test)]
+    pub async fn test_seam_drop_purge_tombstone(
+        &self,
+        notice_id: &str,
+        plane: &str,
+        record_ref: &str,
+    ) -> Result<(), crate::federation::Error> {
+        let (n, p, r) = (
+            notice_id.to_owned(),
+            plane.to_owned(),
+            record_ref.to_owned(),
+        );
+        self.write(move |conn| {
+            conn.execute(
+                "DELETE FROM purge_tombstones \
+                 WHERE notice_id = ?1 AND plane = ?2 AND record_ref = ?3",
+                rusqlite::params![n, p, r],
+            )
+        })
+        .await
+        .map(|_| ())
+        .map_err(|e| crate::federation::Error::Backend(e.to_string()))
+    }
+
     /// v54.1.0 (CIRISPersist#1043) — TEST SEAM: reproduce a legacy row the
     /// apply door refuses today (#598 "typed asserted_at diverges from the
     /// signed envelope"): move the typed `asserted_at` column off the signed
@@ -4212,70 +4239,94 @@ impl crate::federation::FederationDirectory for SqliteBackend {
     async fn purge_put_execution(
         &self,
         execution: &crate::federation::steward_purge::PurgeExecution,
-    ) -> Result<bool, crate::federation::Error> {
+        tombstones: &[crate::federation::steward_purge::PurgeTombstone],
+    ) -> Result<crate::federation::steward_purge::PurgePutOutcome, crate::federation::Error> {
+        crate::federation::steward_purge::check_purge_put_set(execution, tombstones)?;
         let e = execution.clone();
-        self.write(move |conn| -> Result<bool, rusqlite::Error> {
-            let tx = conn.transaction()?;
-            let held: bool = tx
-                .query_row(
-                    "SELECT 1 FROM purge_executions WHERE notice_id = ?1",
-                    [&e.notice_id],
-                    |_| Ok(true),
-                )
-                .optional()?
-                .unwrap_or(false);
-            if held {
-                return Ok(false);
-            }
-            let position = sqlite_next_plane_position(&tx, "purge_executions", "admitted_at")?;
-            tx.execute(
-                "INSERT INTO purge_executions (notice_id, selection_digest, claimant_key_id, \
-                    record_count, notice_jcs, cosignatures_json, executed_by, origin, \
-                    executed_at, admitted_at, finalized_at, legal_basis) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL, ?11)",
-                rusqlite::params![
-                    e.notice_id,
-                    e.selection_digest,
-                    e.claimant_key_id,
-                    i64::try_from(e.record_count).unwrap_or(i64::MAX),
-                    e.notice_jcs,
-                    e.cosignatures_json,
-                    e.executed_by,
-                    e.origin,
-                    purge_instant_text(e.executed_at),
-                    purge_instant_text(position),
-                    e.legal_basis,
-                ],
-            )?;
-            tx.commit()?;
-            Ok(true)
-        })
-        .await
-        .map_err(|e| crate::federation::Error::Backend(format!("purge_put_execution: {e}")))
-    }
-
-    async fn purge_put_tombstone(
-        &self,
-        tombstone: &crate::federation::steward_purge::PurgeTombstone,
-    ) -> Result<bool, crate::federation::Error> {
-        let t = tombstone.clone();
-        self.write(move |conn| -> Result<usize, rusqlite::Error> {
-            conn.execute(
-                "INSERT INTO purge_tombstones (notice_id, plane, record_ref, ordinal, derived_from) \
-                 VALUES (?1, ?2, ?3, ?4, ?5) \
-                 ON CONFLICT (notice_id, plane, record_ref) DO NOTHING",
-                rusqlite::params![
-                    t.notice_id,
-                    t.plane.as_str(),
-                    t.record_ref,
-                    i64::try_from(t.ordinal).unwrap_or(i64::MAX),
-                    t.derived_from,
-                ],
+        let ts = tombstones.to_vec();
+        // Codex on PR #1057 — the header and every tombstone are ONE
+        // transaction: autocommitted separately, a failure or a process loss
+        // between them left a durable header holding part of its
+        // `record_count`.
+        #[cfg(test)]
+        let inject_tombstone_fault = self
+            .test_hooks()
+            .fail_if_armed("purge_put_execution_tombstones")
+            .is_err();
+        #[cfg(not(test))]
+        let inject_tombstone_fault = false;
+        self
+            .write(
+                move |conn| -> Result<
+                    crate::federation::steward_purge::PurgePutOutcome,
+                    rusqlite::Error,
+                > {
+                    let tx = conn.transaction()?;
+                    let held: bool = tx
+                        .query_row(
+                            "SELECT 1 FROM purge_executions WHERE notice_id = ?1",
+                            [&e.notice_id],
+                            |_| Ok(true),
+                        )
+                        .optional()?
+                        .unwrap_or(false);
+                    if !held {
+                        let position =
+                            sqlite_next_plane_position(&tx, "purge_executions", "admitted_at")?;
+                        tx.execute(
+                            "INSERT INTO purge_executions (notice_id, selection_digest, \
+                            claimant_key_id, record_count, notice_jcs, cosignatures_json, \
+                            executed_by, origin, executed_at, admitted_at, finalized_at, \
+                            legal_basis) \
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL, ?11)",
+                            rusqlite::params![
+                                e.notice_id,
+                                e.selection_digest,
+                                e.claimant_key_id,
+                                i64::try_from(e.record_count).unwrap_or(i64::MAX),
+                                e.notice_jcs,
+                                e.cosignatures_json,
+                                e.executed_by,
+                                e.origin,
+                                purge_instant_text(e.executed_at),
+                                purge_instant_text(position),
+                                e.legal_basis,
+                            ],
+                        )?;
+                    }
+                    if inject_tombstone_fault {
+                        return Err(rusqlite::Error::InvalidParameterName(
+                            "purge_put_execution tombstones: injected fault".into(),
+                        ));
+                    }
+                    let mut inserted = Vec::with_capacity(ts.len());
+                    {
+                        let mut stmt = tx.prepare(
+                            "INSERT INTO purge_tombstones \
+                            (notice_id, plane, record_ref, ordinal, derived_from) \
+                         VALUES (?1, ?2, ?3, ?4, ?5) \
+                         ON CONFLICT (notice_id, plane, record_ref) DO NOTHING",
+                        )?;
+                        for t in &ts {
+                            let n = stmt.execute(rusqlite::params![
+                                t.notice_id,
+                                t.plane.as_str(),
+                                t.record_ref,
+                                i64::try_from(t.ordinal).unwrap_or(i64::MAX),
+                                t.derived_from,
+                            ])?;
+                            inserted.push(n > 0);
+                        }
+                    }
+                    tx.commit()?;
+                    Ok(crate::federation::steward_purge::PurgePutOutcome {
+                        header_inserted: !held,
+                        tombstones_inserted: inserted,
+                    })
+                },
             )
-        })
-        .await
-        .map(|n| n > 0)
-        .map_err(|e| crate::federation::Error::Backend(format!("purge_put_tombstone: {e}")))
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("purge_put_execution: {e}")))
     }
 
     async fn purge_execution(

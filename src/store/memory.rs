@@ -1273,6 +1273,25 @@ impl MemoryBackend {
         Ok(())
     }
 
+    /// v54.1.0 (Codex on PR #1057) — TEST SEAM: drop one stored tombstone of
+    /// a notice, reproducing a header whose set is partial (the state the
+    /// pre-fix, non-atomic write could leave). Nothing else moves.
+    #[cfg(test)]
+    pub async fn test_seam_drop_purge_tombstone(
+        &self,
+        notice_id: &str,
+        plane: &str,
+        record_ref: &str,
+    ) -> Result<(), crate::federation::Error> {
+        let mut state = self.state.lock().expect("memory backend lock");
+        state.purge_tombstones.remove(&(
+            notice_id.to_owned(),
+            plane.to_owned(),
+            record_ref.to_owned(),
+        ));
+        Ok(())
+    }
+
     /// v54.1.0 (CIRISPersist#1043) — TEST SEAM: reproduce a legacy row the
     /// apply door refuses today (#598 "typed asserted_at diverges from the
     /// signed envelope"): move the typed `asserted_at` column off the signed
@@ -3184,41 +3203,49 @@ impl crate::federation::FederationDirectory for MemoryBackend {
     async fn purge_put_execution(
         &self,
         execution: &crate::federation::steward_purge::PurgeExecution,
-    ) -> Result<bool, crate::federation::Error> {
+        tombstones: &[crate::federation::steward_purge::PurgeTombstone],
+    ) -> Result<crate::federation::steward_purge::PurgePutOutcome, crate::federation::Error> {
+        crate::federation::steward_purge::check_purge_put_set(execution, tombstones)?;
         let mut state = self.state.lock().expect("memory backend lock");
-        if state.purge_executions.contains_key(&execution.notice_id) {
-            return Ok(false);
+        // Codex on PR #1057 — the header and its tombstones are one write:
+        // everything is decided under the lock BEFORE anything is inserted,
+        // so a failure leaves neither.
+        let header_inserted = !state.purge_executions.contains_key(&execution.notice_id);
+        let keys: Vec<(String, String, String)> = tombstones
+            .iter()
+            .map(|t| {
+                (
+                    t.notice_id.clone(),
+                    t.plane.as_str().to_owned(),
+                    t.record_ref.clone(),
+                )
+            })
+            .collect();
+        let mut fresh = std::collections::BTreeSet::new();
+        let tombstones_inserted: Vec<bool> = keys
+            .iter()
+            .map(|k| !state.purge_tombstones.contains_key(k) && fresh.insert(k.clone()))
+            .collect();
+        #[cfg(test)]
+        self.test_hooks()
+            .fail_if_armed("purge_put_execution_tombstones")?;
+        if header_inserted {
+            let last = state.purge_executions.values().map(|e| e.admitted_at).max();
+            let mut row = execution.clone();
+            row.admitted_at =
+                crate::federation::types::monotonic_admission_instant(chrono::Utc::now(), last);
+            row.finalized_at = None;
+            state.purge_executions.insert(row.notice_id.clone(), row);
         }
-        let last = state.purge_executions.values().map(|e| e.admitted_at).max();
-        let mut row = execution.clone();
-        row.admitted_at =
-            crate::federation::types::monotonic_admission_instant(chrono::Utc::now(), last);
-        row.finalized_at = None;
-        state.purge_executions.insert(row.notice_id.clone(), row);
-        Ok(true)
-    }
-
-    async fn purge_put_tombstone(
-        &self,
-        tombstone: &crate::federation::steward_purge::PurgeTombstone,
-    ) -> Result<bool, crate::federation::Error> {
-        let mut state = self.state.lock().expect("memory backend lock");
-        if !state.purge_executions.contains_key(&tombstone.notice_id) {
-            return Err(crate::federation::Error::Backend(format!(
-                "purge_put_tombstone: no execution header for notice {}",
-                tombstone.notice_id
-            )));
+        for ((key, t), inserted) in keys.into_iter().zip(tombstones).zip(&tombstones_inserted) {
+            if *inserted {
+                state.purge_tombstones.insert(key, t.clone());
+            }
         }
-        let key = (
-            tombstone.notice_id.clone(),
-            tombstone.plane.as_str().to_owned(),
-            tombstone.record_ref.clone(),
-        );
-        if state.purge_tombstones.contains_key(&key) {
-            return Ok(false);
-        }
-        state.purge_tombstones.insert(key, tombstone.clone());
-        Ok(true)
+        Ok(crate::federation::steward_purge::PurgePutOutcome {
+            header_inserted,
+            tombstones_inserted,
+        })
     }
 
     async fn purge_execution(

@@ -99,6 +99,14 @@
 //!   (naming exactly that record and subject), at execution and at the
 //!   replicated apply, with nothing written; a person's by-actor purge is
 //!   refused; a subject key that does not resolve fails closed.
+//! - **I695** (Codex on PR #1057) — the purge header and its tombstones are
+//!   ONE transaction: a fault armed between them leaves neither header nor
+//!   tombstone (and the selection is still served), and a retry executes the
+//!   whole set. A header whose stored set is partial (the pre-fix state) is
+//!   `Incomplete` at `purge_status`, and `purge_finalize` and the bundle serve
+//!   refuse it `purge_execution_incomplete` with nothing deleted, until a
+//!   re-run of the same notice completes it. The store door refuses a set that
+//!   is not exactly `record_count` rows of its notice.
 //! - **I666** — a `key:` (or `federation_keys:`) id is not a purge record:
 //!   `purge_selection_malformed`, naming `key:revocation` as key retirement's
 //!   own act.
@@ -131,6 +139,16 @@ pub(crate) mod bodies {
             key_id: &'a str,
             identity_type: &'a str,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>>;
+        /// The backend's own test hooks (Codex on PR #1057: the fault armed
+        /// between the purge header and its tombstones).
+        fn hooks(&self) -> &crate::store::test_hooks::TestHooks;
+        /// Drop one stored tombstone: a header whose set is partial.
+        fn drop_tombstone<'a>(
+            &'a self,
+            notice_id: &'a str,
+            plane: &'a str,
+            record_ref: &'a str,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>>;
     }
 
     macro_rules! seams_for {
@@ -157,6 +175,21 @@ pub(crate) mod bodies {
                 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
                     Box::pin(async move {
                         self.test_seam_set_key_identity_type(key_id, identity_type)
+                            .await
+                            .expect("seam");
+                    })
+                }
+                fn hooks(&self) -> &crate::store::test_hooks::TestHooks {
+                    self.test_hooks()
+                }
+                fn drop_tombstone<'a>(
+                    &'a self,
+                    notice_id: &'a str,
+                    plane: &'a str,
+                    record_ref: &'a str,
+                ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+                    Box::pin(async move {
+                        self.test_seam_drop_purge_tombstone(notice_id, plane, record_ref)
                             .await
                             .expect("seam");
                     })
@@ -1220,17 +1253,21 @@ pub(crate) mod bodies {
             admitted_at: t,
             finalized_at: None,
         };
-        assert!(dir.purge_put_execution(&exec).await.unwrap());
-        assert!(dir
-            .purge_put_tombstone(&sp::PurgeTombstone {
-                notice_id: exec.notice_id.clone(),
-                ordinal: 0,
-                plane: PurgePlane::Blob,
-                record_ref: sha.clone(),
-                derived_from: None,
-            })
+        let put = dir
+            .purge_put_execution(
+                &exec,
+                &[sp::PurgeTombstone {
+                    notice_id: exec.notice_id.clone(),
+                    ordinal: 0,
+                    plane: PurgePlane::Blob,
+                    record_ref: sha.clone(),
+                    derived_from: None,
+                }],
+            )
             .await
-            .unwrap());
+            .unwrap();
+        assert!(put.header_inserted);
+        assert_eq!(put.tombstones_inserted, vec![true]);
         let got = dir
             .purge_execution(&exec.notice_id)
             .await
@@ -2048,6 +2085,124 @@ pub(crate) mod bodies {
         assert_eq!(e.kind(), token::TOMBSTONED, "I659(c): {e}");
     }
 
+    // ── I695 ──────────────────────────────────────────────────────────────
+    pub(crate) async fn i695_the_header_and_its_tombstones_are_one_write<D: Seams>(d: &D) {
+        root(d).await;
+        let (_, derived, _) = mock_world(d, "i695").await;
+        let dir = d.as_dyn_directory();
+        let t = now();
+        let dry = sp::purge_dry_run(dir, &mock_selection()).await.unwrap();
+        let notice = notice_for(&dry.notice_template, &[cc::FOUNDERS[0], cc::FOUNDERS[1]], t);
+
+        // A failure between the header and the tombstones leaves NEITHER.
+        d.hooks().fail_next("purge_put_execution_tombstones", 1);
+        let e = sp::purge_rows(dir, &mock_selection(), &notice, NODE, t)
+            .await
+            .expect_err("I695: the armed fault fails the write");
+        assert!(
+            e.to_string().contains("injected"),
+            "I695: refused by the armed fault, not a gate: {e}"
+        );
+        assert_nothing_written(d, &notice).await;
+        assert!(
+            served_ids(d).await.contains(&derived),
+            "I695: nothing tombstoned, so the selection is still served"
+        );
+
+        // The retry executes the whole set.
+        let report = sp::purge_rows(dir, &mock_selection(), &notice, NODE, t)
+            .await
+            .expect("I695: the retry executes");
+        assert_eq!(report.record_count, dry.record_count);
+        assert_eq!(
+            report.tombstoned.values().sum::<u64>(),
+            dry.record_count,
+            "I695: every tombstone is written by the retry: {report:?}"
+        );
+        assert_eq!(report.already_tombstoned, 0);
+        let later = t + chrono::Duration::seconds(sp::PURGE_SETTLE_DWELL_SECS + 1);
+        assert_eq!(
+            sp::purge_status(dir, &report.notice_id, later)
+                .await
+                .unwrap()
+                .state,
+            sp::PurgeState::Settled
+        );
+
+        // The store door refuses a set that is not the header's whole count.
+        let header = dir
+            .purge_execution(&report.notice_id)
+            .await
+            .unwrap()
+            .expect("held");
+        let mut short = header.clone();
+        short.notice_id = "ee".repeat(32);
+        let e = dir
+            .purge_put_execution(&short, &[])
+            .await
+            .expect_err("I695: a header without its set is refused");
+        assert!(
+            matches!(e, Error::InvalidArgument(_)),
+            "I695: the store door's own refusal: {e:?}"
+        );
+        assert!(dir
+            .purge_execution(&short.notice_id)
+            .await
+            .unwrap()
+            .is_none());
+
+        // Defence in depth: a partial set (the pre-fix state) is neither
+        // finalized nor served.
+        let tombs = dir.purge_tombstones_of(&report.notice_id).await.unwrap();
+        let dropped = tombs.last().expect("a tombstone").clone();
+        d.drop_tombstone(
+            &report.notice_id,
+            dropped.plane.as_str(),
+            &dropped.record_ref,
+        )
+        .await;
+        assert_eq!(
+            sp::purge_status(dir, &report.notice_id, later)
+                .await
+                .unwrap()
+                .state,
+            sp::PurgeState::Incomplete
+        );
+        let e = sp::purge_finalize(dir, &report.notice_id, later, None)
+            .await
+            .expect_err("I695: a partial execution is not finalized");
+        let (tok, body) = refusal(&e);
+        assert_eq!(tok, token::EXECUTION_INCOMPLETE, "I695 finalize: {body}");
+        assert_eq!(body["record_count"], dry.record_count, "I695: {body}");
+        assert_eq!(body["tombstones"], dry.record_count - 1, "I695: {body}");
+        assert!(
+            dir.get_attestation(&derived).await.unwrap().is_some(),
+            "I695: nothing deleted"
+        );
+        let e = sp::list_purge_bundles_since(dir, None, 10)
+            .await
+            .expect_err("I695: a partial execution is not served");
+        assert_eq!(refusal(&e).0, token::EXECUTION_INCOMPLETE, "I695 serve");
+
+        // A re-run of the same notice completes it.
+        let healed = sp::purge_rows(dir, &mock_selection(), &notice, NODE, t)
+            .await
+            .expect("I695: the re-run completes the set");
+        assert_eq!(healed.tombstoned.values().sum::<u64>(), 1, "{healed:?}");
+        assert_eq!(healed.already_tombstoned, dry.record_count - 1);
+        let fin = sp::purge_finalize(dir, &report.notice_id, later, None)
+            .await
+            .expect("I695: the complete execution finalizes");
+        assert_eq!(fin.attestations_deleted, 3, "{fin:?}");
+        assert_eq!(
+            sp::list_purge_bundles_since(dir, None, 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
     // ── I660 ──────────────────────────────────────────────────────────────
     pub(crate) async fn i660_the_delete_doors_re_ask_the_tombstone<D: Seams>(d: &D) {
         root(d).await;
@@ -2191,6 +2346,11 @@ mod run {
                     b::i662_refused_today_is_a_selection_not_a_filter(&d).await
                 }
                 #[tokio::test]
+                async fn i695() {
+                    let Some(d) = $fresh.await else { return };
+                    b::i695_the_header_and_its_tombstones_are_one_write(&d).await
+                }
+                #[tokio::test]
                 async fn i664() {
                     let Some(d) = $fresh.await else { return };
                     b::i664_the_tombstone_row_holds_another_basis(&d).await
@@ -2306,6 +2466,7 @@ mod run {
                 "purge_tombstoned",
                 "purge_selection_malformed",
                 "purge_human_subject_pending_notice_row",
+                "purge_execution_incomplete",
             ]
         );
         assert_eq!(

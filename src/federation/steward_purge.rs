@@ -56,9 +56,9 @@
 //! attestation id), a trace's own `trace:complete:v1` attestation, and the
 //! bytes a purged holding claim holds are in the SAME selection, digest and
 //! ledger, transitively. The dry run's sample is the first 20 ids in JCS
-//! order, a view of the ledger. `purge_notice_unknown` and
-//! `purge_selection_malformed` are persist-local tokens; the other six are in
-//! the CC registry.
+//! order, a view of the ledger. `purge_notice_unknown`,
+//! `purge_selection_malformed` and `purge_execution_incomplete` are
+//! persist-local tokens; the other six are in the CC registry.
 //!
 //! The selection kinds are [`PurgeSelection`]: by actor, by explicit id
 //! list, and the two classes the operator ruled on (#1040's mock-LLM traces,
@@ -118,6 +118,15 @@ pub mod token {
     /// ([`human_subject_records`]). Persist-local. Body: `{records: [{record_id,
     /// subject, reason}]}`. Retired when the notice row lands.
     pub const HUMAN_SUBJECT_PENDING_NOTICE_ROW: &str = "purge_human_subject_pending_notice_row";
+    /// v54.1.0 (Codex on PR #1057) — `purge_finalize` or the bundle serve
+    /// read found an execution header whose stored tombstones are not its
+    /// whole declared `record_count`. The header and its tombstones are one
+    /// transaction ([`purge_put_execution`](super::FederationDirectory::purge_put_execution)),
+    /// so this is a store that lost rows, never a state the door writes;
+    /// re-running `purge_rows` (or re-applying the bundle) with the same
+    /// notice completes it. Persist-local. Body: `{notice_id, record_count,
+    /// tombstones}`.
+    pub const EXECUTION_INCOMPLETE: &str = "purge_execution_incomplete";
 
     /// Every token, for the registry and the from-disk witnesses.
     pub const ALL: &[&str] = &[
@@ -130,6 +139,7 @@ pub mod token {
         TOMBSTONED,
         SELECTION_MALFORMED,
         HUMAN_SUBJECT_PENDING_NOTICE_ROW,
+        EXECUTION_INCOMPLETE,
     ];
 }
 
@@ -1378,6 +1388,53 @@ impl PurgeTombstone {
     }
 }
 
+/// The store door's own check on a header and its tombstone set: exactly
+/// `record_count` tombstones, every one citing this notice. Every backend's
+/// `purge_put_execution` asks it before writing, so no backend can store a
+/// header with a partial set by being handed one.
+///
+/// # Errors
+///
+/// `Error::InvalidArgument` naming the mismatch.
+pub(crate) fn check_purge_put_set(
+    execution: &PurgeExecution,
+    tombstones: &[PurgeTombstone],
+) -> Result<(), Error> {
+    if tombstones.len() as u64 != execution.record_count {
+        return Err(Error::InvalidArgument(format!(
+            "purge_put_execution: notice {} declares {} records but {} tombstones were given",
+            execution.notice_id,
+            execution.record_count,
+            tombstones.len()
+        )));
+    }
+    if let Some(t) = tombstones
+        .iter()
+        .find(|t| t.notice_id != execution.notice_id)
+    {
+        return Err(Error::InvalidArgument(format!(
+            "purge_put_execution: tombstone {} cites notice {}, not {}",
+            t.record_id(),
+            t.notice_id,
+            execution.notice_id
+        )));
+    }
+    Ok(())
+}
+
+/// What one [`purge_put_execution`](super::FederationDirectory::purge_put_execution)
+/// recorded: the header and its WHOLE tombstone set are one transaction
+/// (Codex on PR #1057), so a header is never durable with part of its
+/// `record_count`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PurgePutOutcome {
+    /// `true` when the header was inserted, `false` when it was already held.
+    pub header_inserted: bool,
+    /// Per tombstone, in the order given: `true` when inserted, `false` when
+    /// the notice already held it.
+    pub tombstones_inserted: Vec<bool>,
+}
+
 // ── execution ──────────────────────────────────────────────────────────────
 
 /// What `purge_rows` did.
@@ -1459,9 +1516,10 @@ fn check_counts(terms: &NoticeTerms, live: &BTreeMap<String, u64>) -> Result<(),
 ///    [`token::RETRACTION_INADMISSIBLE`] `{record_id, plane, index, total}` —
 ///    with nothing written (whole or not at all, CC 4.5.3, CIRISConstitution
 ///    rc8@8c8f536);
-/// 5. the header is recorded (idempotent on the notice id), then each
-///    tombstone in JCS order. A retry after a crash resumes; a tombstone is
-///    never written twice.
+/// 5. the header and every tombstone, in JCS order, are recorded in ONE
+///    transaction (idempotent on the notice id; Codex on PR #1057): a crash
+///    leaves either nothing or the whole set, and a tombstone is never
+///    written twice.
 ///
 /// Nothing is deleted here: [`purge_finalize`] hard-deletes after the settle.
 ///
@@ -1527,35 +1585,44 @@ where
         .map_err(|e| Error::Backend(format!("notice JCS is not UTF-8: {e}")))?;
     let cosignatures_json = serde_json::to_string(&notice.cosignatures)
         .map_err(|e| Error::Backend(format!("cosignatures encode: {e}")))?;
-    directory
-        .purge_put_execution(&PurgeExecution {
+    let tombstones: Vec<PurgeTombstone> = records
+        .iter()
+        .enumerate()
+        .map(|(index, record)| PurgeTombstone {
             notice_id: terms.notice_id.clone(),
-            selection_digest: digest.clone(),
-            claimant_key_id: terms.claimant_key_id.clone(),
-            legal_basis: STEWARD_PURGE_BASIS.to_owned(),
-            record_count: total,
-            notice_jcs,
-            cosignatures_json,
-            executed_by: executed_by.to_owned(),
-            origin: origin::LOCAL.to_owned(),
-            executed_at: now,
-            admitted_at: now,
-            finalized_at: None,
+            ordinal: index as u64,
+            plane: record.plane,
+            record_ref: record.id.clone(),
+            derived_from: record.derived_from.clone(),
         })
+        .collect();
+    // Codex on PR #1057: the header and every tombstone are ONE transaction,
+    // so a crash or a failed write never leaves a durable header holding part
+    // of its declared `record_count`. A retry after an interrupted call that
+    // predates this re-sends the whole set; the store inserts what is missing.
+    let put = directory
+        .purge_put_execution(
+            &PurgeExecution {
+                notice_id: terms.notice_id.clone(),
+                selection_digest: digest.clone(),
+                claimant_key_id: terms.claimant_key_id.clone(),
+                legal_basis: STEWARD_PURGE_BASIS.to_owned(),
+                record_count: total,
+                notice_jcs,
+                cosignatures_json,
+                executed_by: executed_by.to_owned(),
+                origin: origin::LOCAL.to_owned(),
+                executed_at: now,
+                admitted_at: now,
+                finalized_at: None,
+            },
+            &tombstones,
+        )
         .await?;
     let mut tombstoned: BTreeMap<String, u64> = BTreeMap::new();
     let mut already = 0u64;
-    for (index, record) in records.iter().enumerate() {
-        let inserted = directory
-            .purge_put_tombstone(&PurgeTombstone {
-                notice_id: terms.notice_id.clone(),
-                ordinal: index as u64,
-                plane: record.plane,
-                record_ref: record.id.clone(),
-                derived_from: record.derived_from.clone(),
-            })
-            .await?;
-        if inserted {
+    for (record, inserted) in records.iter().zip(&put.tombstones_inserted) {
+        if *inserted {
             *tombstoned
                 .entry(record.plane.as_str().to_owned())
                 .or_insert(0) += 1;
@@ -1584,6 +1651,10 @@ where
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PurgeState {
+    /// The header's stored tombstones are not its whole `record_count`
+    /// ([`token::EXECUTION_INCOMPLETE`]): finalize and serve refuse it until
+    /// a re-run of the same notice completes it.
+    Incomplete,
     /// Tombstones written; the retraction round has not settled.
     Executed,
     /// The settle dwell has passed; `purge_finalize` may hard-delete.
@@ -1636,12 +1707,16 @@ where
 {
     let execution = execution_or_unknown(directory, notice_id).await?;
     let mut tombstones = BTreeMap::new();
-    for t in directory.purge_tombstones_of(notice_id).await? {
+    let held = directory.purge_tombstones_of(notice_id).await?;
+    let complete = held.len() as u64 == execution.record_count;
+    for t in held {
         *tombstones.entry(t.plane.as_str().to_owned()).or_insert(0) += 1;
     }
     let settles = settles_at(&execution);
     let state = if execution.finalized_at.is_some() {
         PurgeState::Finalized
+    } else if !complete {
+        PurgeState::Incomplete
     } else if now >= settles {
         PurgeState::Settled
     } else {
@@ -1692,6 +1767,31 @@ where
         &e.notice_id,
         &records,
     ))
+}
+
+/// The execution's tombstones as records, refusing a header whose stored
+/// tombstones are not its whole `record_count`
+/// ([`token::EXECUTION_INCOMPLETE`]): finalize must not delete, and serve must
+/// not replicate, part of a selection the notice signed whole.
+async fn complete_tombstone_records<F>(
+    directory: &F,
+    execution: &PurgeExecution,
+) -> Result<Vec<PurgeRecord>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let records = tombstone_records(directory, &execution.notice_id).await?;
+    if records.len() as u64 != execution.record_count {
+        return Err(refused(
+            token::EXECUTION_INCOMPLETE,
+            serde_json::json!({
+                "notice_id": execution.notice_id,
+                "record_count": execution.record_count,
+                "tombstones": records.len(),
+            }),
+        ));
+    }
+    Ok(records)
 }
 
 async fn tombstone_records<F>(directory: &F, notice_id: &str) -> Result<Vec<PurgeRecord>, Error>
@@ -1752,7 +1852,7 @@ pub struct FinalizeReport {
 /// # Errors
 ///
 /// [`token::NOTICE_UNKNOWN`], [`token::NOT_SETTLED`],
-/// [`token::RETRACTION_INADMISSIBLE`] for a blob the bytes plane would not
+/// [`token::EXECUTION_INCOMPLETE`], [`token::RETRACTION_INADMISSIBLE`] for a blob the bytes plane would not
 /// retract (or a host with no bytes plane); directory writes.
 pub async fn purge_finalize<F>(
     directory: &F,
@@ -1783,7 +1883,7 @@ where
             }),
         ));
     }
-    let records = tombstone_records(directory, notice_id).await?;
+    let records = complete_tombstone_records(directory, &e).await?;
     let total = records.len();
     for plane in PurgePlane::ALL {
         for (index, r) in records.iter().enumerate().filter(|(_, r)| r.plane == plane) {
@@ -1855,7 +1955,8 @@ pub struct PurgeBundle {
 ///
 /// # Errors
 ///
-/// Directory reads; a stored notice that no longer parses.
+/// Directory reads; a stored notice that no longer parses;
+/// [`token::EXECUTION_INCOMPLETE`] for a header missing part of its tombstones.
 pub async fn list_purge_bundles_since<F>(
     directory: &F,
     since: Option<(chrono::DateTime<chrono::Utc>, String)>,
@@ -1870,7 +1971,7 @@ where
             .map_err(|err| Error::Backend(format!("stored notice {}: {err}", e.notice_id)))?;
         let cosignatures = serde_json::from_str(&e.cosignatures_json)
             .map_err(|err| Error::Backend(format!("stored cosignatures {}: {err}", e.notice_id)))?;
-        let records = tombstone_records(directory, &e.notice_id).await?;
+        let records = complete_tombstone_records(directory, &e).await?;
         out.push(PurgeBundle {
             notice: StewardPurgeNotice {
                 envelope,
@@ -2011,39 +2112,39 @@ where
         .map_err(|e| Error::Backend(format!("notice JCS is not UTF-8: {e}")))?;
     let cosignatures_json = serde_json::to_string(&bundle.notice.cosignatures)
         .map_err(|e| Error::Backend(format!("cosignatures encode: {e}")))?;
-    directory
-        .purge_put_execution(&PurgeExecution {
+    let tombstones: Vec<PurgeTombstone> = records
+        .iter()
+        .enumerate()
+        .map(|(i, r)| PurgeTombstone {
             notice_id: terms.notice_id.clone(),
-            selection_digest: digest,
-            claimant_key_id: terms.claimant_key_id,
-            legal_basis: STEWARD_PURGE_BASIS.to_owned(),
-            record_count: records.len() as u64,
-            notice_jcs,
-            cosignatures_json,
-            executed_by: receiver_key_id.to_owned(),
-            origin: origin::REPLICATED.to_owned(),
-            executed_at: now,
-            admitted_at: now,
-            finalized_at: None,
+            ordinal: i as u64,
+            plane: r.plane,
+            record_ref: r.id.clone(),
+            derived_from: r.derived_from.clone(),
         })
-        .await?;
-    let (mut tombstoned, mut already) = (0u64, 0u64);
-    for (i, r) in records.iter().enumerate() {
-        if directory
-            .purge_put_tombstone(&PurgeTombstone {
+        .collect();
+    // One transaction, as at `purge_rows` (Codex on PR #1057).
+    let put = directory
+        .purge_put_execution(
+            &PurgeExecution {
                 notice_id: terms.notice_id.clone(),
-                ordinal: i as u64,
-                plane: r.plane,
-                record_ref: r.id.clone(),
-                derived_from: r.derived_from.clone(),
-            })
-            .await?
-        {
-            tombstoned += 1;
-        } else {
-            already += 1;
-        }
-    }
+                selection_digest: digest,
+                claimant_key_id: terms.claimant_key_id,
+                legal_basis: STEWARD_PURGE_BASIS.to_owned(),
+                record_count: records.len() as u64,
+                notice_jcs,
+                cosignatures_json,
+                executed_by: receiver_key_id.to_owned(),
+                origin: origin::REPLICATED.to_owned(),
+                executed_at: now,
+                admitted_at: now,
+                finalized_at: None,
+            },
+            &tombstones,
+        )
+        .await?;
+    let tombstoned = put.tombstones_inserted.iter().filter(|b| **b).count() as u64;
+    let already = put.tombstones_inserted.len() as u64 - tombstoned;
     Ok(ApplyPurgeOutcome {
         notice_id: terms.notice_id,
         tombstoned,

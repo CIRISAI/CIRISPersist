@@ -5767,29 +5767,25 @@ pub trait FederationDirectory: Send + Sync {
         })
     }
 
-    /// Record an execution header. `Ok(true)` when inserted, `Ok(false)` when
-    /// a header for the notice id is already held (the notice id is the hash
-    /// of the notice bytes, so a second one is the same notice; the first is
-    /// kept). The store stamps `admitted_at`.
+    /// Record an execution header AND its whole tombstone set, in ONE
+    /// transaction (Codex on PR #1057): a failure or a process loss leaves
+    /// neither, never a durable header holding part of its `record_count`.
+    ///
+    /// The header is inserted unless held (the notice id is the hash of the
+    /// notice bytes, so a second one is the same notice; the first is kept,
+    /// and the store stamps `admitted_at`). Each tombstone
+    /// (`(notice_id, plane, record_ref)`) is inserted unless held, so a re-run
+    /// completes a set an earlier, non-atomic write left partial. Refused
+    /// (`Error::InvalidArgument`) when `tombstones` is not exactly
+    /// `record_count` rows of this notice.
     async fn purge_put_execution(
         &self,
         execution: &steward_purge::PurgeExecution,
-    ) -> Result<bool, Error> {
-        let _ = execution;
+        tombstones: &[steward_purge::PurgeTombstone],
+    ) -> Result<steward_purge::PurgePutOutcome, Error> {
+        let _ = (execution, tombstones);
         Err(Error::Unsupported {
             method: "purge_put_execution",
-        })
-    }
-
-    /// Record one tombstone. `Ok(true)` when inserted, `Ok(false)` when the
-    /// notice already holds it (`(notice_id, plane, record_ref)`).
-    async fn purge_put_tombstone(
-        &self,
-        tombstone: &steward_purge::PurgeTombstone,
-    ) -> Result<bool, Error> {
-        let _ = tombstone;
-        Err(Error::Unsupported {
-            method: "purge_put_tombstone",
         })
     }
 

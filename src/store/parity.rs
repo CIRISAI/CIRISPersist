@@ -369,6 +369,10 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // Both are statements about the caller's row.
     ("refuse_if_tombstoned_attestation", Class::Gate),
     ("refuse_mock_trace_attestation", Class::Gate),
+    // v54.1.0 (Codex on PR #1057) — Gate: the purge header door refuses a
+    // tombstone set that is not exactly the header's `record_count` rows of
+    // its own notice, so no backend stores a header with a partial set.
+    ("check_purge_put_set", Class::Gate),
     ("check_skew_and_payment", Class::Gate),
     ("check_trace_dimension_admission", Class::Gate),
     ("check_trust_charter_admission", Class::Gate),
