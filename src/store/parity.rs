@@ -362,6 +362,13 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // v54.0.0 (CIRISPersist#1034, CC 4.4.3.2.8) — refuses a community record
     // whose declared cohort or affiliation config is malformed or invalid.
     ("check_community_record", Class::Gate),
+    // v54.1.0 (CIRISPersist#1046, #1040) — Gates on the attestation put: a
+    // tombstoned record is refused so a purge cannot be undone by a re-put
+    // (`purge_tombstoned`), and a federation-tier trace attestation whose
+    // signed `run_kind` is `mock` is refused (`trace_run_kind_mock`, CC 3.1.5).
+    // Both are statements about the caller's row.
+    ("refuse_if_tombstoned_attestation", Class::Gate),
+    ("refuse_mock_trace_attestation", Class::Gate),
     ("check_skew_and_payment", Class::Gate),
     ("check_trace_dimension_admission", Class::Gate),
     ("check_trust_charter_admission", Class::Gate),
