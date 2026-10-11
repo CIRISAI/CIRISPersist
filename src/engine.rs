@@ -8875,7 +8875,7 @@ impl Engine {
                 now: chrono::DateTime<chrono::Utc>,
             ) -> Result<bool, String> {
                 self.0
-                    .evict_blob(sha256, now)
+                    .purge_evict_blob(sha256, now)
                     .await
                     .map(|r| r.blob_deleted)
                     .map_err(|e| e.to_string())
@@ -8891,6 +8891,41 @@ impl Engine {
                 .then_some(&bytes as &dyn crate::federation::steward_purge::BytesEvictor),
         )
         .await
+    }
+
+    /// v54.1.0 (Codex round 2 on PR #1057) — the purge's bytes-plane delete:
+    /// [`Self::evict_blob`], then every sealed-DAG child of the purged blob
+    /// whose EVERY manifest is purge-tombstoned on the blob plane (or was
+    /// evicted by this walk), transitively. The purge deletes the blob's
+    /// binding row in the same finalize, so the DAG fold reads the manifest
+    /// `Unbound`, not `Withdrawn`, and `evict_blob`'s own chunk pass (keyed
+    /// on `Withdrawn`) would leave the chunks readable by hash. A chunk
+    /// another live manifest relates stays.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub(crate) async fn purge_evict_blob(
+        &self,
+        sha256: &[u8; 32],
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<crate::federation::EvictBlobReport, crate::federation::BlobError> {
+        let signer = self.local_signer.as_ref().ok_or_else(|| {
+            crate::federation::BlobError::Backend(
+                "purge_evict_blob requires a LocalSigner (evict_blob's retract-then-delete)"
+                    .to_string(),
+            )
+        })?;
+        let node = self.local_derived_key_id().await.map_err(|e| {
+            crate::federation::BlobError::Backend(format!("purge_evict_blob signer: {e}"))
+        })?;
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(arc) => {
+                purge_evict_blob_on(arc.as_ref(), &node, signer, sha256, now).await
+            }
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(arc) => {
+                purge_evict_blob_on(arc.as_ref(), &node, signer, sha256, now).await
+            }
+        }
     }
 
     /// v54.1.0 (CIRISPersist#1046) — the executed purge's ledger as TSV, for
@@ -11263,6 +11298,67 @@ where
             report.withdraws_emitted += r.withdraws_emitted;
             if r.blob_deleted {
                 report.dag_chunks_evicted += 1;
+            }
+        }
+    }
+    Ok(report)
+}
+
+/// v54.1.0 (Codex round 2 on PR #1057) — [`Engine::purge_evict_blob`] on one
+/// backend: [`evict_blob_on`], then the DAG children no live manifest keeps.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+async fn purge_evict_blob_on<B>(
+    backend: &B,
+    node: &str,
+    signer: &crate::signing::LocalSigner,
+    sha256: &[u8; 32],
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<crate::federation::EvictBlobReport, crate::federation::BlobError>
+where
+    B: crate::federation::BlobStorage + crate::federation::FederationDirectory + Sync,
+{
+    use crate::federation::BlobError;
+    let mut report = evict_blob_on(backend, node, signer, sha256, now).await?;
+    // Every manifest this walk has taken; a child is purged only when each of
+    // its manifests is one of these or is itself purge-tombstoned.
+    let mut gone: std::collections::BTreeSet<[u8; 32]> =
+        std::collections::BTreeSet::from([*sha256]);
+    let mut work = vec![*sha256];
+    while let Some(manifest) = work.pop() {
+        for (_, child) in backend.dag_chunks_of_manifest(&manifest).await? {
+            if gone.contains(&child) {
+                continue;
+            }
+            let mut orphaned = true;
+            for parent in backend
+                .dag_manifests_of_chunk(&child)
+                .await
+                .map_err(|e| BlobError::Backend(format!("purge_evict_blob: parents: {e}")))?
+            {
+                if gone.contains(&parent) {
+                    continue;
+                }
+                let tombstoned = backend
+                    .purge_tombstoned("blob", &hex::encode(parent))
+                    .await
+                    .map_err(|e| BlobError::Backend(format!("purge_evict_blob: tombstone: {e}")))?
+                    .is_some();
+                if !tombstoned {
+                    orphaned = false;
+                    break;
+                }
+            }
+            if !orphaned {
+                continue;
+            }
+            gone.insert(child);
+            work.push(child);
+            if backend.has_blob(&child).await? {
+                let r = evict_one_on(backend, node, signer, &child, now).await?;
+                report.withdraws_emitted += r.withdraws_emitted;
+                if r.blob_deleted {
+                    report.dag_chunks_evicted += 1;
+                }
             }
         }
     }
