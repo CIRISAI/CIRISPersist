@@ -546,17 +546,24 @@ where
                     // a receiver applied this tombstone without the trace, so
                     // the rule is asked here, with the trace in hand. The
                     // tombstone is void for it.
-                    let person = self
+                    let signer = self
                         .backend
                         .as_dyn_directory()
                         .lookup_public_key(&trace.signature_key_id)
                         .await
-                        .map_err(|e| IngestError::Store(StoreError::Backend(e.to_string())))?
-                        .is_some_and(|k| {
-                            crate::federation::steward_purge::identity_type_is_person(
-                                &k.identity_type,
-                            )
-                        });
+                        .map_err(|e| IngestError::Store(StoreError::Backend(e.to_string())))?;
+                    // A signer key not held YET cannot be judged: the existing
+                    // RETRYABLE unknown-signer refusal (`verify_unknown_key`),
+                    // never the terminal tombstone, so the trace is re-offered
+                    // once the key lands (Codex round 4 follow-up).
+                    let Some(signer) = signer else {
+                        return Err(IngestError::Verify(VerifyError::UnknownKey(
+                            trace.signature_key_id.clone(),
+                        )));
+                    };
+                    let person = crate::federation::steward_purge::identity_type_is_person(
+                        &signer.identity_type,
+                    );
                     if !person {
                         return Err(refused(
                             crate::federation::steward_purge::token::TOMBSTONED,

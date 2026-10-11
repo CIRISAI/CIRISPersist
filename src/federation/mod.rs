@@ -9674,7 +9674,11 @@ pub enum Error {
         /// `identity_occurrence_revocation`, `transport_destination`,
         /// `touch_claim`, `touch_claim_cosigner`, `attestation` (the store's
         /// attester lookup on `put_attestation`) or `signed_envelope`
-        /// (attestations, revocations and every other envelope-signed row).
+        /// (attestations, revocations and every other envelope-signed row),
+        /// or `purge_tombstone_subject` (v54.1.0: a row arriving at a
+        /// steward-purge-tombstoned id names a SUBJECT whose key is not held
+        /// yet, so the interim person check cannot be asked; the key here is
+        /// that subject's, not a signer's).
         plane: &'static str,
     },
 

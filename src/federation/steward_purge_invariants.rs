@@ -170,8 +170,15 @@
 //!   a person signed arriving at the trace id is ingested and survives
 //!   finalize and the trace delete door. An ordinary row, and a row whose
 //!   subject key does not resolve here (no person PROVEN), at a tombstoned id
-//!   are still `purge_tombstoned`; and the serve-by-hash reload withholds a
-//!   tombstoned row during the dwell.
+//!   are still `purge_tombstoned` (an unresolvable subject: the retryable
+//!   `federation_attester_key_unknown`, I832); and the serve-by-hash reload
+//!   withholds a tombstoned row during the dwell.
+//! - **I832** (Codex round 4 follow-up; memory, sqlite, postgres) — a row (or
+//!   trace) arriving at a tombstoned id BEFORE its subject's (signer's) key
+//!   record is refused RETRYABLY (`federation_attester_key_unknown`, plane
+//!   `purge_tombstone_subject`; for a trace, `verify_unknown_key`), not
+//!   stored; once the key lands as a person the re-offer is admitted and
+//!   voided; once it lands as a non-person the re-offer is `purge_tombstoned`.
 //! - **I831** (Codex round 4 sweep on PR #1057; memory, sqlite, postgres) —
 //!   the DSAR erasure drops the orphaned thought signature too (the purge's
 //!   helper): a later trace reusing the thought_id reads its own signature.
@@ -3150,17 +3157,22 @@ pub(crate) mod bodies {
         })
         .await
         .unwrap_or_else(|e| panic!("I828: a row about a person is admitted: {e:?}"));
-        // An ordinary row, and one whose subject key does not resolve here
-        // (no person PROVEN), stay refused.
-        for (id, attested) in [(&ordinary, AGENT), (&unknown, "nobody-knows-me-i828")] {
-            let e = dir
-                .put_attestation(SignedAttestation {
-                    attestation: fed_row(id, SCORER, attested, "chat:message:v1"),
-                })
-                .await
-                .expect_err("I828: a non-person row at a tombstoned id is refused");
-            assert_eq!(refusal(&e).0, token::TOMBSTONED, "I828 {attested}: {e:?}");
-        }
+        // An ordinary row stays refused; one whose subject key does not
+        // resolve here is refused RETRYABLY (I832 walks the key landing).
+        let e = dir
+            .put_attestation(SignedAttestation {
+                attestation: fed_row(&ordinary, SCORER, AGENT, "chat:message:v1"),
+            })
+            .await
+            .expect_err("I828: a non-person row at a tombstoned id is refused");
+        assert_eq!(refusal(&e).0, token::TOMBSTONED, "I828: {e:?}");
+        let e = dir
+            .put_attestation(SignedAttestation {
+                attestation: fed_row(&unknown, SCORER, "nobody-knows-me-i828", "chat:message:v1"),
+            })
+            .await
+            .expect_err("I828: an unresolved subject is not admitted");
+        assert_eq!(e.kind(), "federation_attester_key_unknown", "I828: {e:?}");
         // A trace a person signed arrives at the tombstoned trace id.
         ingest(d, &batch(&trace_json(trace_id, ALICE, "gpt-real", None)))
             .await
@@ -3206,6 +3218,93 @@ pub(crate) mod bodies {
             "I828: the person's trace survives finalize"
         );
         assert!(served_ids(d).await.contains(&about_alice));
+    }
+
+    /// **I832** — the subject's key arrives AFTER the row.
+    pub(crate) async fn i832_an_unresolved_subject_is_retryable<D: Seams>(d: &D) {
+        root(d).await;
+        let dir = d.as_dyn_directory();
+        let t = now();
+        const BOB: &str = "bob-late-key-i832";
+        const CAROL: &str = "carol-late-agent-i832";
+        let (about_bob, about_carol) = (
+            uuid::Uuid::new_v4().to_string(),
+            uuid::Uuid::new_v4().to_string(),
+        );
+        let trace_id = "trace-i832-bob";
+        let mut ids: Vec<String> = [&about_bob, &about_carol]
+            .iter()
+            .map(|id| format!("attestation:{id}"))
+            .collect();
+        ids.push(format!("trace:{trace_id}"));
+        ids.sort();
+        let template = serde_json::json!({
+            "legal_basis": sp::STEWARD_PURGE_BASIS,
+            "content_sha256": sp::selection_digest(&ids),
+            "content_holder_key_ids": [],
+        });
+        let bundle = sp::PurgeBundle {
+            notice: notice_for(&template, &[cc::FOUNDERS[0], cc::FOUNDERS[1]], t),
+            record_ids: ids.clone(),
+            derived_from: vec![String::new(); ids.len()],
+            admitted_at: t,
+        };
+        let applied = apply_at(dir, &bundle, NODE, t).await.unwrap();
+        let offer = |id: &str, subject: &str| {
+            dir.put_attestation(SignedAttestation {
+                attestation: fed_row(id, SCORER, subject, "chat:message:v1"),
+            })
+        };
+        // Row first, key later: retryable, nothing stored.
+        for (id, subject) in [(&about_bob, BOB), (&about_carol, CAROL)] {
+            let e = offer(id, subject)
+                .await
+                .expect_err("I832: an unresolved subject is not admitted");
+            assert_eq!(
+                e.kind(),
+                "federation_attester_key_unknown",
+                "I832 {subject}: {e:?}"
+            );
+            assert!(
+                matches!(&e, Error::AttesterKeyUnknown { attesting_key_id, plane }
+                    if attesting_key_id == subject && *plane == sp::PURGE_TOMBSTONE_SUBJECT_PLANE),
+                "I832: names the subject and the plane: {e:?}"
+            );
+            assert!(dir.get_attestation(id).await.unwrap().is_none());
+        }
+        let e = ingest(d, &batch(&trace_json(trace_id, BOB, "gpt-real", None)))
+            .await
+            .expect_err("I832: a trace whose signer is not held yet is not admitted");
+        assert_eq!(e.kind(), "verify_unknown_key", "I832 trace: {e}");
+        // The keys land.
+        ts::register_hybrid_key_as(dir, BOB, BOB, crate::federation::types::identity_type::USER)
+            .await;
+        ts::register_hybrid_key_as(
+            dir,
+            CAROL,
+            CAROL,
+            crate::federation::types::identity_type::AGENT,
+        )
+        .await;
+        offer(&about_bob, BOB)
+            .await
+            .expect("I832: once the key lands as a person, the re-offer is admitted");
+        let e = offer(&about_carol, CAROL)
+            .await
+            .expect_err("I832: once the key lands as a non-person, the tombstone stands");
+        assert_eq!(refusal(&e).0, token::TOMBSTONED, "I832: {e:?}");
+        ingest(d, &batch(&trace_json(trace_id, BOB, "gpt-real", None)))
+            .await
+            .expect("I832: the person's trace is admitted once the key lands");
+        let later = t + chrono::Duration::seconds(sp::PURGE_SETTLE_DWELL_SECS + 1);
+        let mut st = status_at(dir, &applied.notice_id, later).await.unwrap();
+        st.voided.sort();
+        let mut want = vec![
+            format!("attestation:{about_bob}"),
+            format!("trace:{trace_id}"),
+        ];
+        want.sort();
+        assert_eq!(st.voided, want, "I832: voided once admitted");
     }
 
     /// **I828b** — the serve-by-hash reload withholds a tombstoned row during
@@ -3479,6 +3578,11 @@ mod run {
                 async fn i828() {
                     let Some(d) = $fresh.await else { return };
                     b::i828_a_person_subject_arrival_voids_the_tombstone(&d).await
+                }
+                #[tokio::test]
+                async fn i832() {
+                    let Some(d) = $fresh.await else { return };
+                    b::i832_an_unresolved_subject_is_retryable(&d).await
                 }
                 #[tokio::test]
                 async fn i828b() {

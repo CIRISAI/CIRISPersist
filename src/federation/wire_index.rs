@@ -272,7 +272,9 @@ pub async fn reload_record_bytes(
                         Ok(()) => {
                             Some(serde_json::to_vec(&a).map_err(|e| to_bytes(e, "Attestation"))?)
                         }
-                        Err(Error::PurgeRefused { .. }) => None,
+                        // Withheld while tombstoned, and while the person
+                        // check cannot be asked (a subject key not held yet).
+                        Err(Error::PurgeRefused { .. } | Error::AttesterKeyUnknown { .. }) => None,
                         Err(e) => return Err(e),
                     }
                 }

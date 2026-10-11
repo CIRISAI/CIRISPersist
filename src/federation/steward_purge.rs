@@ -2782,11 +2782,40 @@ where
         Ok(Some(_)) => {}
         Err(e) => return Err(e),
     }
-    if tombstone_void_reason(directory, row).await?.is_some() {
+    if accountability_record_of(row).is_some() {
         return Ok(());
+    }
+    // INTERIM — a PROVEN person among the subjects voids the tombstone. A
+    // subject whose key this node does not hold YET decides nothing: the
+    // refusal is the RETRYABLE ordering gap (`federation_attester_key_unknown`,
+    // plane `purge_tombstone_subject`), never the terminal `purge_tombstoned`,
+    // so the sender re-offers the row once the key lands and the person check
+    // decides then (Codex round 4 follow-up). An unknown key still never
+    // un-purges a row: it is not admitted while the key is unknown.
+    let mut unresolved: Option<String> = None;
+    for subject in attestation_subjects(row) {
+        match directory.lookup_public_key(&subject).await? {
+            Some(k) if identity_type_is_person(&k.identity_type) => return Ok(()),
+            Some(_) => {}
+            None => {
+                unresolved.get_or_insert(subject);
+            }
+        }
+    }
+    if let Some(subject) = unresolved {
+        return Err(Error::unknown_signer(
+            &subject,
+            PURGE_TOMBSTONE_SUBJECT_PLANE,
+        ));
     }
     refuse_if_tombstoned(directory, PurgePlane::Attestation, &row.attestation_id).await
 }
+
+/// The `plane` of the RETRYABLE [`Error::AttesterKeyUnknown`] the
+/// tombstone gates raise for a row at a tombstoned id whose subject (or, for a
+/// trace, signer) key this node does not hold yet: the interim person check
+/// cannot be asked until it lands.
+pub const PURGE_TOMBSTONE_SUBJECT_PLANE: &str = "purge_tombstone_subject";
 
 // ── #1040: the mock-run trace refusal (CC 3.1.5, CIRISConstitution#166) ──
 
