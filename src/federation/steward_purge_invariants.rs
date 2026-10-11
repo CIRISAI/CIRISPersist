@@ -221,6 +221,7 @@ pub(crate) mod bodies {
     }
     /// The rollup witness's seams (the plain `trace_events_factor_rollup_1h`
     /// rollup exists on sqlite and postgres; memory aggregates directly).
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     pub(crate) trait RollupSeams: Seams + crate::read::ReadEngine {
         /// Run the lazy refresh from the stored watermark.
         fn refresh_rollup(
@@ -233,6 +234,7 @@ pub(crate) mod bodies {
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<i64>> + Send + 'a>>;
     }
 
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     macro_rules! rollup_seams_for {
         ($t:ty) => {
             impl RollupSeams for $t {
@@ -2273,6 +2275,7 @@ pub(crate) mod bodies {
     // ── I696 ──────────────────────────────────────────────────────────────
     /// One trace at `ts` for agent `agent_hash`: two `trace_events` rows signed
     /// by `signer`, one LLM call, and its own trace attestation.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     async fn seed_trace_at<D: Seams>(
         d: &D,
         trace_id: &str,
@@ -2298,6 +2301,7 @@ pub(crate) mod bodies {
 
     /// The fleet read's `trace_count` per agent (the rollup fast path: more
     /// than one agent, no baseline, an unauthenticated caller).
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     async fn fleet_trace_counts<D: RollupSeams>(
         d: &D,
         agents: &[String],
@@ -2316,6 +2320,7 @@ pub(crate) mod bodies {
         .collect()
     }
 
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     pub(crate) async fn i696_a_purged_trace_leaves_no_rollup<D: RollupSeams>(d: &D) {
         root(d).await;
         let dir = d.as_dyn_directory();
@@ -2796,6 +2801,7 @@ mod run {
         };
     }
 
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     macro_rules! rollup_runners {
         ($modname:ident, $fresh:expr) => {
             mod $modname {
