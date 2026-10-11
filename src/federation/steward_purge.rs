@@ -2394,6 +2394,79 @@ pub fn accountability_record_of(row: &Attestation) -> Option<&'static str> {
     super::admission::envelope_dimension(&row.attestation_envelope).and_then(accountability_family)
 }
 
+/// v54.1.0 (Codex round 3 on PR #1057) — **is this blob withheld by a
+/// purge?** `Some(notice_id)` when a steward purge tombstoned `sha256`, or
+/// when it is a sealed-DAG child and EVERY manifest it belongs to is withheld
+/// (transitively: a v3 child of a purged root). The byte doors refuse it from
+/// EXECUTION onward; `purge_finalize`'s hard delete still waits for the settle.
+/// A chunk any un-purged manifest relates is not withheld. The purge plane
+/// absent from a backend (`Unsupported`) withholds nothing.
+///
+/// # Errors
+///
+/// The lookups' read errors.
+pub async fn purge_withheld<F>(directory: &F, sha256: &[u8; 32]) -> Result<Option<String>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    // Memoized per walk: a manifest reached twice (a diamond) answers the
+    // same; one still being judged (a cycle, which a sealed DAG never has)
+    // counts as not withheld.
+    let mut memo: BTreeMap<[u8; 32], Option<String>> = BTreeMap::new();
+    purge_withheld_walk(directory, *sha256, &mut memo).await
+}
+
+fn purge_withheld_walk<'a, F>(
+    directory: &'a F,
+    sha256: [u8; 32],
+    memo: &'a mut BTreeMap<[u8; 32], Option<String>>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<String>, Error>> + Send + 'a>>
+where
+    F: FederationDirectory + ?Sized,
+{
+    Box::pin(async move {
+        if let Some(known) = memo.get(&sha256) {
+            return Ok(known.clone());
+        }
+        memo.insert(sha256, None);
+        let verdict = purge_withheld_judge(directory, sha256, memo).await?;
+        memo.insert(sha256, verdict.clone());
+        Ok(verdict)
+    })
+}
+
+async fn purge_withheld_judge<F>(
+    directory: &F,
+    sha256: [u8; 32],
+    memo: &mut BTreeMap<[u8; 32], Option<String>>,
+) -> Result<Option<String>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    {
+        match directory
+            .purge_tombstoned(PurgePlane::Blob.as_str(), &hex::encode(sha256))
+            .await
+        {
+            Ok(Some(notice_id)) => return Ok(Some(notice_id)),
+            Ok(None) => {}
+            Err(Error::Unsupported { .. }) => return Ok(None),
+            Err(e) => return Err(e),
+        }
+        let manifests = directory.dag_manifests_of_chunk(&sha256).await?;
+        let mut first = None;
+        for m in manifests {
+            match purge_withheld_walk(directory, m, memo).await? {
+                Some(n) => {
+                    first.get_or_insert(n);
+                }
+                None => return Ok(None),
+            }
+        }
+        Ok(first)
+    }
+}
+
 /// The attestation door's gate: the row's id on the claims plane.
 ///
 /// **A tombstone never reaches the accountability record** (Codex on PR

@@ -4497,6 +4497,19 @@ pub enum BlobError {
         /// The `withdraws` (or `recants`) that retired it, re-derived now.
         withdraws_id: String,
     },
+    /// v54.1.0 (Codex round 3 on PR #1057) — a steward purge tombstoned these
+    /// bytes (or EVERY manifest a sealed-DAG chunk belongs to): they are
+    /// withheld from every byte door from EXECUTION onward, while the hard
+    /// delete waits for the 72 h settle. Like [`Self::Withdrawn`], never
+    /// [`Self::NotHeld`]: another holder rooted at the same trust root is
+    /// bound by the same purge, so the fetcher must not walk the mesh.
+    #[error("blob {sha256_hex} is withheld: steward purge {notice_id} tombstoned it")]
+    Purged {
+        /// Hex-encoded at-rest SHA-256 the read targeted.
+        sha256_hex: String,
+        /// The purge notice whose tombstone withholds it.
+        notice_id: String,
+    },
     /// Backend-level error (DB connection, serialization, etc.).
     #[error("backend: {0}")]
     Backend(String),
@@ -4525,6 +4538,7 @@ impl BlobError {
             BlobError::NotPartyTo { .. } => "blob_not_party_to",
             BlobError::SealDidNotOpen { .. } => "blob_seal_did_not_open",
             BlobError::Withdrawn { .. } => "blob_withdrawn",
+            BlobError::Purged { .. } => "blob_purged",
             BlobError::Backend(_) => "blob_backend",
         }
     }

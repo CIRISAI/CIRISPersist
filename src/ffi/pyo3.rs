@@ -35157,6 +35157,11 @@ fn blob_err_to_py(e: crate::federation::BlobError) -> PyErr {
         crate::federation::BlobError::Withdrawn { ref sha256_hex, .. } => {
             PyRuntimeError::new_err(withdrawn_message(kind, sha256_hex))
         }
+        // v54.1.0 (Codex round 3 on PR #1057) — a purge-tombstoned blob: the
+        // `Withdrawn` shape (a refusal after authorization, token + sha).
+        crate::federation::BlobError::Purged { ref sha256_hex, .. } => {
+            PyRuntimeError::new_err(withdrawn_message(kind, sha256_hex))
+        }
         // v43.0.0 (I17) — a rotation landed mid-write; the cascade re-seals,
         // so a caller sees this only if every retry lost the race.
         crate::federation::BlobError::EpochNotCurrent { .. } => PyValueError::new_err(kind),
