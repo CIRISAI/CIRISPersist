@@ -1010,7 +1010,14 @@ fn attestation_subjects(row: &Attestation) -> BTreeSet<String> {
 /// - an **attestation**: its `subject_key_ids` and `attested_key_id`;
 /// - a **trace**: the author and subjects of its own `trace:complete:v1`
 ///   attestation (every held trace has one, #473/#478) — the signing agent;
-/// - a **blob**: the subjects of the holding claim it was derived through.
+/// - a **blob**: the subjects of EVERY row held here that holds or binds it
+///   (each `holds_bytes` claim on its sha, and each `scores` row whose
+///   `evidence_refs` cite it), every tier, resolved LOCALLY
+///   ([`blob_binding_subjects`]). Never the record's `derived_from`: on a
+///   replicated bundle that is the sender's metadata, and a peer could point a
+///   person's blob at a harmless row (Codex round 2 on PR #1057). A blob no
+///   row held here holds or binds is not proven non-human and is refused, at
+///   the receiver too.
 ///
 /// - and, for a [`PurgeSelection::ByActor`], the ACTOR is a subject of every
 ///   record the selection holds (`parties`): a by-actor purge is about them.
@@ -1019,7 +1026,7 @@ fn attestation_subjects(row: &Attestation) -> BTreeSet<String> {
 ///
 /// A subject is a person when its key record's `identity_type` names
 /// `user`. **Fail closed**: a subject key this node cannot resolve, a trace
-/// with no own attestation, a blob named without its holding claim, or an
+/// with no own attestation, a blob nothing held here holds or binds, or an
 /// attestation not held are NOT proven non-human, and are refused.
 /// `skip_unheld` is the receiver's reading: it judges only what it holds.
 ///
@@ -1037,40 +1044,51 @@ where
 {
     let mut out = Vec::new();
     let mut kinds: BTreeMap<String, Option<bool>> = BTreeMap::new();
+    let blob_shas: BTreeSet<String> = records
+        .iter()
+        .filter(|r| r.plane == PurgePlane::Blob)
+        .map(|r| r.id.clone())
+        .collect();
+    let mut blob_subjects = blob_binding_subjects(directory, &blob_shas).await?;
     for record in records {
         let unresolved = |reason: &str| HumanSubject {
             record_id: record.record_id(),
             subject: String::new(),
             reason: reason.to_owned(),
         };
-        let row_id = match record.plane {
-            PurgePlane::Attestation => Some(record.id.clone()),
-            PurgePlane::Trace => Some(crate::ingest::trace_attestation_id(&record.id)),
-            PurgePlane::Blob => record
-                .derived_from
-                .as_deref()
-                .and_then(|d| d.strip_prefix("attestation:"))
-                .map(str::to_owned),
-        };
-        let Some(row_id) = row_id else {
-            out.push(unresolved(
-                "a blob named without its holding claim: its subject cannot be read",
-            ));
-            continue;
-        };
-        let Some(row) = directory.get_attestation(&row_id).await? else {
-            if !skip_unheld {
-                out.push(unresolved(
-                    "the record's subject row is not held here: not proven non-human",
-                ));
+        let mut subjects = match record.plane {
+            PurgePlane::Blob => match blob_subjects.remove(&record.id) {
+                Some(subjects) => subjects,
+                None => {
+                    out.push(unresolved(
+                        "no row held here holds or binds this blob: its subject cannot be read, \
+                         so it is not proven non-human",
+                    ));
+                    continue;
+                }
+            },
+            PurgePlane::Attestation | PurgePlane::Trace => {
+                let row_id = if record.plane == PurgePlane::Trace {
+                    crate::ingest::trace_attestation_id(&record.id)
+                } else {
+                    record.id.clone()
+                };
+                let Some(row) = directory.get_attestation(&row_id).await? else {
+                    if !skip_unheld {
+                        out.push(unresolved(
+                            "the record's subject row is not held here: not proven non-human",
+                        ));
+                    }
+                    continue;
+                };
+                let mut subjects = attestation_subjects(&row);
+                if record.plane == PurgePlane::Trace {
+                    subjects.insert(row.attesting_key_id.clone());
+                }
+                subjects
             }
-            continue;
         };
-        let mut subjects = attestation_subjects(&row);
         subjects.extend(parties.iter().cloned());
-        if record.plane == PurgePlane::Trace {
-            subjects.insert(row.attesting_key_id.clone());
-        }
         for subject in subjects {
             let human = match kinds.get(&subject) {
                 Some(v) => *v,
@@ -1096,6 +1114,53 @@ where
             });
         }
     }
+    Ok(out)
+}
+
+/// The subjects of the rows held HERE that hold or bind each blob in `shas`
+/// (64-hex sha256): every `holds_bytes` claim whose first `evidence_refs`
+/// entry is the sha, and every `scores` row whose `evidence_refs` cite it,
+/// every tier, in one attestation scan. A sha no held row names is absent
+/// from the map. Local state only: never a bundle's `derived_from`.
+///
+/// # Errors
+///
+/// The scan's.
+async fn blob_binding_subjects<F>(
+    directory: &F,
+    shas: &BTreeSet<String>,
+) -> Result<BTreeMap<String, BTreeSet<String>>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let mut out: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    if shas.is_empty() {
+        return Ok(out);
+    }
+    scan_attestations(directory, |row| {
+        let named: Vec<&String> = if row
+            .attestation_type
+            .starts_with(super::HOLDS_BYTES_ATTESTATION_TYPE_PREFIX)
+        {
+            super::first_evidence_ref(&row.attestation_envelope)
+                .and_then(|sha| shas.get(sha))
+                .into_iter()
+                .collect()
+        } else if row.attestation_type == attestation_type::SCORES {
+            evidence_refs(&row.attestation_envelope)
+                .iter()
+                .filter_map(|e| shas.get(e.as_str()))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        for sha in named {
+            out.entry(sha.clone())
+                .or_default()
+                .extend(attestation_subjects(&row));
+        }
+    })
+    .await?;
     Ok(out)
 }
 

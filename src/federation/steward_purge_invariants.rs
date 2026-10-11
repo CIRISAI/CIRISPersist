@@ -135,6 +135,13 @@
 //!   score citing it and the score citing THAT score; a refused-today plain
 //!   row and the score over it are selected; the dry run's digest is the
 //!   reduced set's, and execution under it succeeds.
+//! - **I821** (Codex round 2 on PR #1057) — a blob's subject is resolved
+//!   from what THIS node holds, never from a bundle's `derived_from`: a
+//!   quorum-cosigned bundle that points a person's blob at a harmless row is
+//!   `purge_human_subject_pending_notice_row` naming the blob and the person,
+//!   with nothing written; a blob nothing held here binds is refused (fail
+//!   closed); a blob bound only by rows about non-persons applies; the local
+//!   dry run refuses the person's blob the same way.
 //! - **I666** — a `key:` (or `federation_keys:`) id is not a purge record:
 //!   `purge_selection_malformed`, naming `key:revocation` as key retirement's
 //!   own act.
@@ -2710,6 +2717,109 @@ pub(crate) mod bodies {
         }
     }
 
+    // ── I821 ──────────────────────────────────────────────────────────────
+    /// A quorum-cosigned bundle over `ids` (sorted here), with `derived_from`
+    /// as given per id.
+    fn bundle_over(
+        mut pairs: Vec<(String, String)>,
+        t: chrono::DateTime<chrono::Utc>,
+    ) -> sp::PurgeBundle {
+        pairs.sort();
+        let ids: Vec<String> = pairs.iter().map(|(id, _)| id.clone()).collect();
+        let template = serde_json::json!({
+            "legal_basis": sp::STEWARD_PURGE_BASIS,
+            "content_sha256": sp::selection_digest(&ids),
+            "content_holder_key_ids": [],
+        });
+        sp::PurgeBundle {
+            notice: notice_for(&template, &[cc::FOUNDERS[0], cc::FOUNDERS[1]], t),
+            record_ids: ids,
+            derived_from: pairs.into_iter().map(|(_, d)| d).collect(),
+            admitted_at: t,
+        }
+    }
+
+    pub(crate) async fn i821_a_blobs_subject_is_resolved_locally<D: Seams>(d: &D) {
+        root(d).await;
+        let dir = d.as_dyn_directory();
+        let t = now();
+        const ALICE: &str = "alice-human-i821";
+        ts::register_hybrid_key_as(
+            dir,
+            ALICE,
+            ALICE,
+            crate::federation::types::identity_type::USER,
+        )
+        .await;
+        let (personal, unbound, plain) = ("a1".repeat(32), "b2".repeat(32), "c3".repeat(32));
+        // Alice's blob: a row about her binds it. A harmless row elsewhere.
+        put_score(d, SCORER, ALICE, &[&personal]).await;
+        put_score(d, SCORER, AGENT, &[&plain]).await;
+        let harmless = put_score(d, SCORER, AGENT, &[]).await.attestation_id;
+
+        // The peer points Alice's blob at the harmless row.
+        let forged = bundle_over(
+            vec![
+                (format!("attestation:{harmless}"), String::new()),
+                (
+                    format!("blob:{personal}"),
+                    format!("attestation:{harmless}"),
+                ),
+            ],
+            t,
+        );
+        let e = sp::apply_replicated_purge(dir, &forged, NODE, t)
+            .await
+            .expect_err("I821: the bundle's provenance is not trusted");
+        let (tok, body) = refusal(&e);
+        assert_eq!(tok, token::HUMAN_SUBJECT_PENDING_NOTICE_ROW, "I821: {body}");
+        let named: Vec<(&str, &str)> = body["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| {
+                (
+                    r["record_id"].as_str().unwrap(),
+                    r["subject"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        let blob_id = format!("blob:{personal}");
+        assert!(
+            named.contains(&(blob_id.as_str(), ALICE)),
+            "I821: names Alice's blob and Alice: {body}"
+        );
+        assert_nothing_written(d, &forged.notice).await;
+
+        // A blob nothing here holds or binds: not proven non-human.
+        let blind = bundle_over(vec![(format!("blob:{unbound}"), String::new())], t);
+        let (tok, body) = refusal(
+            &sp::apply_replicated_purge(dir, &blind, NODE, t)
+                .await
+                .expect_err("I821: an unknown holding fails closed"),
+        );
+        assert_eq!(tok, token::HUMAN_SUBJECT_PENDING_NOTICE_ROW, "I821: {body}");
+        assert_nothing_written(d, &blind.notice).await;
+
+        // A blob bound only by a row about a non-person applies.
+        let fine = bundle_over(vec![(format!("blob:{plain}"), String::new())], t);
+        sp::apply_replicated_purge(dir, &fine, NODE, t)
+            .await
+            .expect("I821: a non-person's blob applies");
+
+        // The local door reads the same local state.
+        let sel = PurgeSelection::ByIds {
+            ids: vec![format!("blob:{personal}")],
+        };
+        let (tok, body) = refusal(
+            &sp::purge_dry_run(dir, &sel)
+                .await
+                .expect_err("I821: the local dry run refuses Alice's blob"),
+        );
+        assert_eq!(tok, token::HUMAN_SUBJECT_PENDING_NOTICE_ROW, "I821: {body}");
+        assert!(body.to_string().contains(ALICE), "I821 local: {body}");
+    }
+
     // ── I660 ──────────────────────────────────────────────────────────────
     pub(crate) async fn i660_the_delete_doors_re_ask_the_tombstone<D: Seams>(d: &D) {
         root(d).await;
@@ -2871,6 +2981,11 @@ mod run {
                 async fn i820() {
                     let Some(d) = $fresh.await else { return };
                     b::i820_derivatives_leave_with_a_withheld_parent(&d).await
+                }
+                #[tokio::test]
+                async fn i821() {
+                    let Some(d) = $fresh.await else { return };
+                    b::i821_a_blobs_subject_is_resolved_locally(&d).await
                 }
                 #[tokio::test]
                 async fn i664() {
