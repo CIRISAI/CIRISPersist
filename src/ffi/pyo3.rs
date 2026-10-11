@@ -13902,7 +13902,6 @@ impl PyEngine {
         py: Python<'_>,
         selection_json: &str,
         notice_json: &str,
-        now_iso: &str,
     ) -> PyResult<String> {
         self.ensure_usable()?;
         let selection: crate::federation::steward_purge::PurgeSelection =
@@ -13911,9 +13910,8 @@ impl PyEngine {
         let notice: crate::federation::steward_purge::StewardPurgeNotice =
             serde_json::from_str(notice_json)
                 .map_err(|e| PyValueError::new_err(format!("purge notice_json: {e}")))?;
-        let now = purge_now(now_iso)?;
         self.purge_engine_call(py, move |engine| async move {
-            engine.purge_rows(&selection, &notice, now).await
+            engine.purge_rows(&selection, &notice).await
         })
     }
 
@@ -13934,39 +13932,28 @@ impl PyEngine {
         .to_string())
     }
 
-    /// v54.1.0 (CIRISPersist#1046) — a purge's state at `now_iso`
-    /// (`executed` / `settled` / `finalized`), its settle instant and its
-    /// tombstone counts. `ValueError(purge_notice_unknown, …)` for a notice
+    /// v54.1.0 (CIRISPersist#1046) — a purge's state on this node's clock
+    /// (`incomplete` / `executed` / `settled` / `finalized`), its settle
+    /// instant, its tombstone counts and the `voided` record ids. `ValueError(purge_notice_unknown, …)` for a notice
     /// this node never executed or applied.
-    fn purge_status_json(
-        &self,
-        py: Python<'_>,
-        notice_id: &str,
-        now_iso: &str,
-    ) -> PyResult<String> {
+    fn purge_status_json(&self, py: Python<'_>, notice_id: &str) -> PyResult<String> {
         self.ensure_usable()?;
         let notice_id = notice_id.to_owned();
-        let now = purge_now(now_iso)?;
         self.purge_engine_call(py, move |engine| async move {
-            engine.purge_status(&notice_id, now).await
+            engine.purge_status(&notice_id).await
         })
     }
 
     /// v54.1.0 (CIRISPersist#1046, CSD-108 §6 Q4) — **finalize**: hard-delete
-    /// an executed purge's records after the retraction round settled.
+    /// an executed purge's records after the retraction round settled, judged
+    /// on THIS node's clock (no caller instant: Codex round 2 on PR #1057).
     /// `ValueError(purge_not_settled, …)` before it. Idempotent. Returns the
     /// JSON `FinalizeReport`.
-    fn purge_finalize_json(
-        &self,
-        py: Python<'_>,
-        notice_id: &str,
-        now_iso: &str,
-    ) -> PyResult<String> {
+    fn purge_finalize_json(&self, py: Python<'_>, notice_id: &str) -> PyResult<String> {
         self.ensure_usable()?;
         let notice_id = notice_id.to_owned();
-        let now = purge_now(now_iso)?;
         self.purge_engine_call(py, move |engine| async move {
-            engine.purge_finalize(&notice_id, now).await
+            engine.purge_finalize(&notice_id).await
         })
     }
 
@@ -13996,7 +13983,7 @@ impl PyEngine {
     ) -> PyResult<String> {
         self.ensure_usable()?;
         let since = match (since_iso, since_notice_id) {
-            (Some(t), Some(id)) => Some((purge_now(t)?, id.to_owned())),
+            (Some(t), Some(id)) => Some((purge_cursor_instant(t)?, id.to_owned())),
             (None, None) => None,
             _ => {
                 return Err(PyValueError::new_err(
@@ -14012,19 +13999,13 @@ impl PyEngine {
     /// v54.1.0 (CIRISPersist#1046) — **apply** a peer's purge bundle: the
     /// notice is re-verified against THIS node's trust root and the digest
     /// re-derived from the ids before any tombstone lands. Deletes nothing.
-    fn apply_replicated_purge_json(
-        &self,
-        py: Python<'_>,
-        bundle_json: &str,
-        now_iso: &str,
-    ) -> PyResult<String> {
+    fn apply_replicated_purge_json(&self, py: Python<'_>, bundle_json: &str) -> PyResult<String> {
         self.ensure_usable()?;
         let bundle: crate::federation::steward_purge::PurgeBundle =
             serde_json::from_str(bundle_json)
                 .map_err(|e| PyValueError::new_err(format!("purge bundle_json: {e}")))?;
-        let now = purge_now(now_iso)?;
         self.purge_engine_call(py, move |engine| async move {
-            engine.apply_replicated_purge(&bundle, now).await
+            engine.apply_replicated_purge(&bundle).await
         })
     }
 
@@ -34487,11 +34468,13 @@ fn outcome_to_py<'py>(
         .map_err(|e| PyRuntimeError::new_err(format!("outcome is not an object: {e}")))
 }
 
-/// v54.1.0 (CIRISPersist#1046) — parse a purge door's caller-supplied instant.
-fn purge_now(now_iso: &str) -> PyResult<chrono::DateTime<chrono::Utc>> {
-    chrono::DateTime::parse_from_rfc3339(now_iso)
+/// v54.1.0 (CIRISPersist#1046) — parse the purge bundle serve cursor's
+/// instant. A CURSOR, never a judging instant: no purge door takes a caller's
+/// `now` (Codex round 2 on PR #1057).
+fn purge_cursor_instant(since_iso: &str) -> PyResult<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::parse_from_rfc3339(since_iso)
         .map(|t| t.with_timezone(&chrono::Utc))
-        .map_err(|e| PyValueError::new_err(format!("purge now_iso parse: {e}")))
+        .map_err(|e| PyValueError::new_err(format!("purge since_iso parse: {e}")))
 }
 
 impl PyEngine {

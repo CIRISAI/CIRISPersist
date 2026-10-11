@@ -657,7 +657,7 @@ class Engine:
             RuntimeError: backend / IO error.
         """
 
-    def apply_replicated_purge_json(self, bundle_json: str, now_iso: str) -> str:
+    def apply_replicated_purge_json(self, bundle_json: str) -> str:
         """(derived) deontic — v54.1.0 (CIRISPersist#1046) — apply a peer's purge bundle: the notice is re-verified against THIS node's trust root and the digest re-derived from..."""
 
     def bake_assembled_genesis(self, bundle_json: str) -> str:
@@ -966,10 +966,10 @@ class Engine:
     def publish_self_occurrence(self, identity_key_id: str, device_class: str, valid_until_iso: str | None = None) -> str:
         """(derived) deontic — CIRISPersist#851 (BLOB_REPLICATION.md §20.3) — publish this node's own content-only occurrence under identity_key_id (its owner), signed with the L..."""
 
-    def purge_finalize_json(self, notice_id: str, now_iso: str) -> str:
-        """(derived) deontic — v54.1.0 (CIRISPersist#1046, CSD-108 §6 Q4) — finalize: hard-delete an executed purge's records after the retraction round settled. ValueError(purge..."""
+    def purge_finalize_json(self, notice_id: str) -> str:
+        """(derived) deontic — v54.1.0 (CIRISPersist#1046, CSD-108 §6 Q4) — finalize: hard-delete an executed purge's records after the retraction round settled, judged on THIS n..."""
 
-    def purge_rows_json(self, selection_json: str, notice_json: str, now_iso: str) -> str:
+    def purge_rows_json(self, selection_json: str, notice_json: str) -> str:
         """(derived) deontic — v54.1.0 (CIRISPersist#1046, CIRISConstitution#165) — execute a steward purge. notice_json is {"envelope": {…takedown_notice…}, "cosignatures": [Thr..."""
 
     def put_accord_decision_json(self, payload_json: str) -> None:
@@ -3203,8 +3203,8 @@ class Engine:
     def purge_ledger_tsv(self, notice_id: str) -> str:
         """(derived) empirical — v54.1.0 (CIRISPersist#1046) — the executed purge's ledger as TSV (for evidence/purges/<date>-<selection-digest>.tsv): a header carrying the digest,..."""
 
-    def purge_status_json(self, notice_id: str, now_iso: str) -> str:
-        """(derived) empirical — v54.1.0 (CIRISPersist#1046) — a purge's state at now_iso (executed / settled / finalized), its settle instant and its tombstone counts. ValueError(..."""
+    def purge_status_json(self, notice_id: str) -> str:
+        """(derived) empirical — v54.1.0 (CIRISPersist#1046) — a purge's state on this node's clock (incomplete / executed / settled / finalized), its settle instant, its tombstone..."""
 
     def put_blob_chunk(self, stream_id: str, seq: int, body_b64: str, epoch: int) -> str:
         """(derived) empirical — v4.1 (CIRISPersist#142, Cut C1a) — live-append one chunk to a stream. Inserts the chunk's bytes as a content-addressed federation_blobs row AND the..."""

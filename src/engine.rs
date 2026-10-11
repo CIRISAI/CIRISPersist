@@ -8835,44 +8835,36 @@ impl Engine {
         &self,
         selection: &crate::federation::steward_purge::PurgeSelection,
         notice: &crate::federation::steward_purge::StewardPurgeNotice,
-        now: chrono::DateTime<chrono::Utc>,
     ) -> Result<crate::federation::steward_purge::PurgeReport, crate::federation::Error> {
         let node = self
             .local_derived_key_id()
             .await
             .map_err(|e| crate::federation::Error::Backend(format!("purge_rows signer: {e}")))?;
         let directory = self.federation_directory();
-        crate::federation::steward_purge::purge_rows(
-            directory.as_ref(),
-            selection,
-            notice,
-            &node,
-            now,
-        )
-        .await
+        crate::federation::steward_purge::purge_rows(directory.as_ref(), selection, notice, &node)
+            .await
     }
 
-    /// v54.1.0 (CIRISPersist#1046) — a purge's state at `now`: executed,
-    /// settled or finalized, with its tombstone counts.
+    /// v54.1.0 (CIRISPersist#1046) — a purge's state now (this node's clock):
+    /// executed, settled or finalized, with its tombstone counts.
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     pub async fn purge_status(
         &self,
         notice_id: &str,
-        now: chrono::DateTime<chrono::Utc>,
     ) -> Result<crate::federation::steward_purge::PurgeStatus, crate::federation::Error> {
         let directory = self.federation_directory();
-        crate::federation::steward_purge::purge_status(directory.as_ref(), notice_id, now).await
+        crate::federation::steward_purge::purge_status(directory.as_ref(), notice_id).await
     }
 
     /// v54.1.0 (CIRISPersist#1046) — **finalize** (hard-delete) an executed
-    /// purge after it settled. Blob records go through [`Self::evict_blob`]
+    /// purge after it settled, judged on THIS node's clock (Codex round 2 on
+    /// PR #1057: no purge surface takes a caller's instant). Blob records go through [`Self::evict_blob`]
     /// (the bytes plane's own retract-then-delete), which needs this Engine's
     /// LocalSigner; without one a purge holding blobs refuses at the first.
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     pub async fn purge_finalize(
         &self,
         notice_id: &str,
-        now: chrono::DateTime<chrono::Utc>,
     ) -> Result<crate::federation::steward_purge::FinalizeReport, crate::federation::Error> {
         struct EngineBytes<'a>(&'a Engine);
         #[async_trait::async_trait]
@@ -8894,7 +8886,6 @@ impl Engine {
         crate::federation::steward_purge::purge_finalize(
             directory.as_ref(),
             notice_id,
-            now,
             self.local_signer
                 .is_some()
                 .then_some(&bytes as &dyn crate::federation::steward_purge::BytesEvictor),
@@ -8933,19 +8924,13 @@ impl Engine {
     pub async fn apply_replicated_purge(
         &self,
         bundle: &crate::federation::steward_purge::PurgeBundle,
-        now: chrono::DateTime<chrono::Utc>,
     ) -> Result<crate::federation::steward_purge::ApplyPurgeOutcome, crate::federation::Error> {
         let node = self.local_derived_key_id().await.map_err(|e| {
             crate::federation::Error::Backend(format!("apply_replicated_purge signer: {e}"))
         })?;
         let directory = self.federation_directory();
-        crate::federation::steward_purge::apply_replicated_purge(
-            directory.as_ref(),
-            bundle,
-            &node,
-            now,
-        )
-        .await
+        crate::federation::steward_purge::apply_replicated_purge(directory.as_ref(), bundle, &node)
+            .await
     }
 
     /// v9.1.0 (CC 1.13.3 / FSD §2.4, CIRISPersist#243) — Engine-facade for

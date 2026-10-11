@@ -142,6 +142,14 @@
 //!   with nothing written; a blob nothing held here binds is refused (fail
 //!   closed); a blob bound only by rows about non-persons applies; the local
 //!   dry run refuses the person's blob the same way.
+//! - **I822** (Codex round 2 on PR #1057) — the dwell is this node's clock:
+//!   with the test clock unset, a purge executed now and finalized at once is
+//!   `purge_not_settled`, its `executed_at` is the system clock's and its
+//!   settle 72 h later; and from disk, no public purge surface (the
+//!   `steward_purge` module's `pub fn`s, `Engine::purge_*` /
+//!   `apply_replicated_purge`, the pyo3 `purge_*_json` /
+//!   `apply_replicated_purge_json`) takes a `now`, so no caller can advance
+//!   or backdate it.
 //! - **I666** — a `key:` (or `federation_keys:`) id is not a purge record:
 //!   `purge_selection_malformed`, naming `key:revocation` as key retirement's
 //!   own act.
@@ -285,6 +293,48 @@ pub(crate) mod bodies {
     #[cfg(feature = "postgres")]
     seams_for!(crate::store::postgres::PostgresBackend);
 
+    // The purge doors read this node's clock (Codex round 2 on PR #1057); a
+    // witness pins it through the `cfg(test)` seam, never an argument.
+    /// `sp::purge_rows` with the purge clock pinned at `at`.
+    pub(crate) async fn rows_at<F: FederationDirectory + ?Sized>(
+        dir: &F,
+        selection: &PurgeSelection,
+        notice: &StewardPurgeNotice,
+        by: &str,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<sp::PurgeReport, Error> {
+        sp::test_clock::set(Some(at));
+        sp::purge_rows(dir, selection, notice, by).await
+    }
+    /// `sp::purge_status` with the purge clock pinned at `at`.
+    pub(crate) async fn status_at<F: FederationDirectory + ?Sized>(
+        dir: &F,
+        notice_id: &str,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<sp::PurgeStatus, Error> {
+        sp::test_clock::set(Some(at));
+        sp::purge_status(dir, notice_id).await
+    }
+    /// `sp::purge_finalize` with the purge clock pinned at `at`.
+    pub(crate) async fn finalize_at<F: FederationDirectory + ?Sized>(
+        dir: &F,
+        notice_id: &str,
+        at: chrono::DateTime<chrono::Utc>,
+        bytes: Option<&dyn sp::BytesEvictor>,
+    ) -> Result<sp::FinalizeReport, Error> {
+        sp::test_clock::set(Some(at));
+        sp::purge_finalize(dir, notice_id, bytes).await
+    }
+    /// `sp::apply_replicated_purge` with the purge clock pinned at `at`.
+    pub(crate) async fn apply_at<F: FederationDirectory + ?Sized>(
+        dir: &F,
+        bundle: &sp::PurgeBundle,
+        receiver: &str,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<sp::ApplyPurgeOutcome, Error> {
+        sp::test_clock::set(Some(at));
+        sp::apply_replicated_purge(dir, bundle, receiver).await
+    }
     pub(crate) const AGENT: &str = "mock-agent-a";
     pub(crate) const SCORER: &str = "lens-scorer";
     pub(crate) const BYSTANDER: &str = "bystander-b";
@@ -668,9 +718,7 @@ pub(crate) mod bodies {
             _ => "holds no seat",
         };
         for (what, notice) in cases {
-            let e = sp::purge_rows(dir, &sel, &notice, NODE, t)
-                .await
-                .expect_err(what);
+            let e = rows_at(dir, &sel, &notice, NODE, t).await.expect_err(what);
             let (tok, body) = refusal(&e);
             assert_eq!(tok, token::UNAUTHORISED, "I650 {what}: {body}");
             assert!(
@@ -690,7 +738,7 @@ pub(crate) mod bodies {
             &[cc::FOUNDERS[0], cc::FOUNDERS[1], cc::SERVE_NODE],
             t,
         );
-        let report = sp::purge_rows(dir, &sel, &with_seat, NODE, t)
+        let report = rows_at(dir, &sel, &with_seat, NODE, t)
             .await
             .expect("2-of-3 founders, plus a seat");
         let mut expect = vec![
@@ -721,7 +769,7 @@ pub(crate) mod bodies {
         let mut tpl = dry.notice_template.clone();
         tpl["content_sha256"] = serde_json::json!(sp::selection_digest(&ids));
         let notice = notice_for(&tpl, &[cc::FOUNDERS[0], cc::FOUNDERS[2]], t);
-        let e = sp::purge_rows(dir, &mock_selection(), &notice, NODE, t)
+        let e = rows_at(dir, &mock_selection(), &notice, NODE, t)
             .await
             .expect_err("digest mismatch");
         let (tok, body) = refusal(&e);
@@ -750,7 +798,7 @@ pub(crate) mod bodies {
             .is_none());
         // A third mock trace lands after the dry run.
         seed_trace(d, "trace-mock-3-i652", AGENT, sp::MOCK_LLM_MODEL).await;
-        let e = sp::purge_rows(dir, &mock_selection(), &notice, NODE, t)
+        let e = rows_at(dir, &mock_selection(), &notice, NODE, t)
             .await
             .expect_err("count mismatch");
         let (tok, body) = refusal(&e);
@@ -760,7 +808,7 @@ pub(crate) mod bodies {
         assert_eq!(body["found"], 4, "I652: {body}");
         assert_nothing_written(d, &notice).await;
         // The count-less notice: the same drift is the digest's to refuse.
-        let e = sp::purge_rows(dir, &mock_selection(), &bare, NODE, t)
+        let e = rows_at(dir, &mock_selection(), &bare, NODE, t)
             .await
             .expect_err("digest mismatch");
         assert_eq!(refusal(&e).0, token::SELECTION_DIGEST_MISMATCH, "I652");
@@ -815,7 +863,7 @@ pub(crate) mod bodies {
         sorted.sort();
         let index = sorted.iter().position(|i| *i == wid).unwrap();
         for attempt in 0..2 {
-            let e = sp::purge_rows(dir, &sel, &notice, NODE, t)
+            let e = rows_at(dir, &sel, &notice, NODE, t)
                 .await
                 .expect_err("inadmissible");
             let (tok, body) = refusal(&e);
@@ -847,7 +895,7 @@ pub(crate) mod bodies {
             &[cc::FOUNDERS[1], cc::FOUNDERS[2]],
             t,
         );
-        let r = sp::purge_rows(dir, &with_target, &n2, NODE, t)
+        let r = rows_at(dir, &with_target, &n2, NODE, t)
             .await
             .expect("admissible");
         assert_eq!(r.tombstoned.get("attestation"), Some(&2));
@@ -875,7 +923,7 @@ pub(crate) mod bodies {
             &[cc::FOUNDERS[0], cc::FOUNDERS[2]],
             t,
         );
-        let e = sp::purge_rows(dir, &gsel, &gn, NODE, t)
+        let e = rows_at(dir, &gsel, &gn, NODE, t)
             .await
             .expect_err("a third party's grant");
         assert_eq!(refusal(&e).0, token::RETRACTION_INADMISSIBLE, "I653");
@@ -927,7 +975,7 @@ pub(crate) mod bodies {
         );
 
         let notice = notice_for(&dry.notice_template, &[cc::FOUNDERS[0], cc::FOUNDERS[2]], t);
-        let report = sp::purge_rows(dir, &sel, &notice, NODE, t)
+        let report = rows_at(dir, &sel, &notice, NODE, t)
             .await
             .expect("executes");
         assert_eq!(report.record_count, 5);
@@ -1024,12 +1072,10 @@ pub(crate) mod bodies {
                 .as_slice()
         );
         // Idempotent re-run.
-        let again = sp::purge_rows(dir, &sel, &notice, NODE, t)
-            .await
-            .expect("re-run");
+        let again = rows_at(dir, &sel, &notice, NODE, t).await.expect("re-run");
         assert!(again.tombstoned.is_empty());
         assert_eq!(again.already_tombstoned, 5);
-        let status = sp::purge_status(dir, &report.notice_id, t).await.unwrap();
+        let status = status_at(dir, &report.notice_id, t).await.unwrap();
         assert_eq!(status.state, sp::PurgeState::Executed);
     }
 
@@ -1042,7 +1088,7 @@ pub(crate) mod bodies {
         let derived_row = dir.get_attestation(&derived).await.unwrap().unwrap();
         let dry = sp::purge_dry_run(dir, &mock_selection()).await.unwrap();
         let notice = notice_for(&dry.notice_template, &[cc::FOUNDERS[0], cc::FOUNDERS[1]], t);
-        let report = sp::purge_rows(dir, &mock_selection(), &notice, NODE, t)
+        let report = rows_at(dir, &mock_selection(), &notice, NODE, t)
             .await
             .unwrap();
         // Settle is W = 72 h after the tombstone (CC 2.6.7, CIRISConstitution
@@ -1052,7 +1098,7 @@ pub(crate) mod bodies {
             chrono::Duration::hours(1),
             chrono::Duration::hours(24) + chrono::Duration::seconds(1),
         ] {
-            let e = sp::purge_finalize(dir, &report.notice_id, t + early, None)
+            let e = finalize_at(dir, &report.notice_id, t + early, None)
                 .await
                 .expect_err("not settled");
             let (tok, body) = refusal(&e);
@@ -1064,13 +1110,13 @@ pub(crate) mod bodies {
         );
         let later = t + chrono::Duration::seconds(sp::PURGE_SETTLE_DWELL_SECS + 1);
         assert_eq!(
-            sp::purge_status(dir, &report.notice_id, later)
+            status_at(dir, &report.notice_id, later)
                 .await
                 .unwrap()
                 .state,
             sp::PurgeState::Settled
         );
-        let fin = sp::purge_finalize(dir, &report.notice_id, later, None)
+        let fin = finalize_at(dir, &report.notice_id, later, None)
             .await
             .expect("finalizes");
         assert_eq!(fin.attestations_deleted, 3, "{fin:?}");
@@ -1105,16 +1151,14 @@ pub(crate) mod bodies {
             .expect_err("a purged row does not come back");
         let (tok, body) = refusal(&e);
         assert_eq!(tok, token::TOMBSTONED, "I655: {body}");
-        let st = sp::purge_status(dir, &report.notice_id, later)
-            .await
-            .unwrap();
+        let st = status_at(dir, &report.notice_id, later).await.unwrap();
         assert_eq!(st.state, sp::PurgeState::Finalized);
         assert_eq!(st.tombstones.values().sum::<u64>(), 5, "tombstones remain");
-        let again = sp::purge_finalize(dir, &report.notice_id, later, None)
+        let again = finalize_at(dir, &report.notice_id, later, None)
             .await
             .unwrap();
         assert!(again.already_finalized);
-        let e = sp::purge_finalize(dir, "f".repeat(64).as_str(), later, None)
+        let e = finalize_at(dir, "f".repeat(64).as_str(), later, None)
             .await
             .expect_err("unknown");
         assert_eq!(refusal(&e).0, token::NOTICE_UNKNOWN);
@@ -1141,7 +1185,7 @@ pub(crate) mod bodies {
         let (da, db) = (a.as_dyn_directory(), b.as_dyn_directory());
         let dry = sp::purge_dry_run(da, &mock_selection()).await.unwrap();
         let notice = notice_for(&dry.notice_template, &[cc::FOUNDERS[1], cc::FOUNDERS[2]], t);
-        let report = sp::purge_rows(da, &mock_selection(), &notice, NODE, t)
+        let report = rows_at(da, &mock_selection(), &notice, NODE, t)
             .await
             .unwrap();
         let bundles = sp::list_purge_bundles_since(da, None, 10).await.unwrap();
@@ -1158,7 +1202,7 @@ pub(crate) mod bodies {
         // A node not rooted at the same trust root (here: none) refuses the
         // bundle and records nothing: a purge is not global erasure (CC 3.2
         // T3, 4.2.1).
-        let e = sp::apply_replicated_purge(c.as_dyn_directory(), &bundle, "node-c", t)
+        let e = apply_at(c.as_dyn_directory(), &bundle, "node-c", t)
             .await
             .unwrap_err();
         let (tok, body) = refusal(&e);
@@ -1173,22 +1217,14 @@ pub(crate) mod bodies {
         let mut dropped = bundle.clone();
         dropped.record_ids.pop();
         dropped.derived_from.pop();
-        let (tok, _) = refusal(
-            &sp::apply_replicated_purge(db, &dropped, "node-b", t)
-                .await
-                .unwrap_err(),
-        );
+        let (tok, _) = refusal(&apply_at(db, &dropped, "node-b", t).await.unwrap_err());
         assert!(
             tok == token::SELECTION_DIGEST_MISMATCH,
             "I656: a dropped id re-derives another digest ({tok})"
         );
         let mut forged = bundle.clone();
         forged.notice.cosignatures[0] = ts::threshold_sign(cc::FOUNDERS[1], b"not the notice");
-        let (tok, _) = refusal(
-            &sp::apply_replicated_purge(db, &forged, "node-b", t)
-                .await
-                .unwrap_err(),
-        );
+        let (tok, _) = refusal(&apply_at(db, &forged, "node-b", t).await.unwrap_err());
         assert_eq!(
             tok,
             token::UNAUTHORISED,
@@ -1196,11 +1232,7 @@ pub(crate) mod bodies {
         );
         let mut unsorted = bundle.clone();
         unsorted.record_ids.swap(0, 1);
-        let (tok, _) = refusal(
-            &sp::apply_replicated_purge(db, &unsorted, "node-b", t)
-                .await
-                .unwrap_err(),
-        );
+        let (tok, _) = refusal(&apply_at(db, &unsorted, "node-b", t).await.unwrap_err());
         assert_eq!(tok, token::SELECTION_MALFORMED);
         assert!(db
             .purge_execution(&report.notice_id)
@@ -1208,9 +1240,7 @@ pub(crate) mod bodies {
             .unwrap()
             .is_none());
         // The genuine bundle.
-        let out = sp::apply_replicated_purge(db, &bundle, "node-b", t)
-            .await
-            .expect("applies");
+        let out = apply_at(db, &bundle, "node-b", t).await.expect("applies");
         assert_eq!(out.tombstoned, 5);
         let exec = db
             .purge_execution(&report.notice_id)
@@ -1222,9 +1252,7 @@ pub(crate) mod bodies {
             !served_ids(b).await.contains(&derived),
             "B stops serving its replica"
         );
-        let again = sp::apply_replicated_purge(db, &bundle, "node-b", t)
-            .await
-            .unwrap();
+        let again = apply_at(db, &bundle, "node-b", t).await.unwrap();
         assert_eq!((again.tombstoned, again.already_tombstoned), (0, 5));
     }
 
@@ -1305,7 +1333,7 @@ pub(crate) mod bodies {
         // Executed on the quorum's notice, they stop being served; the row
         // the class did not select still is.
         let notice = notice_for(&dry.notice_template, &[cc::FOUNDERS[1], cc::FOUNDERS[2]], t);
-        let report = sp::purge_rows(dir, &sel, &notice, NODE, t)
+        let report = rows_at(dir, &sel, &notice, NODE, t)
             .await
             .expect("executes");
         assert_eq!(report.tombstoned.get("attestation"), Some(&5));
@@ -1398,10 +1426,8 @@ pub(crate) mod bodies {
         };
         let dry = sp::purge_dry_run(dir, &one).await.unwrap();
         let n = notice_for(&dry.notice_template, &[cc::FOUNDERS[0], cc::FOUNDERS[1]], t);
-        let r = sp::purge_rows(dir, &one, &n, NODE, t).await.unwrap();
-        sp::purge_finalize(dir, &r.notice_id, later, None)
-            .await
-            .unwrap();
+        let r = rows_at(dir, &one, &n, NODE, t).await.unwrap();
+        finalize_at(dir, &r.notice_id, later, None).await.unwrap();
         assert!(dir.get_attestation(&by).await.unwrap().is_none());
         crate::federation::verify_row_hybrid_signature(dir, &kept)
             .await
@@ -1427,10 +1453,10 @@ pub(crate) mod bodies {
             dry.counts
         );
         let notice = notice_for(&dry.notice_template, &[cc::FOUNDERS[0], cc::FOUNDERS[2]], t);
-        let report = sp::purge_rows(dir, &sel, &notice, NODE, t)
+        let report = rows_at(dir, &sel, &notice, NODE, t)
             .await
             .expect("executes");
-        sp::purge_finalize(dir, &report.notice_id, later, None)
+        finalize_at(dir, &report.notice_id, later, None)
             .await
             .expect("finalizes");
         // The key is untouched: still registered, byte-identical, and still
@@ -1607,7 +1633,7 @@ pub(crate) mod bodies {
         }
         assert!(problems.is_empty(), "I667:\n{}", problems.join("\n"));
         let n = notice_for(&dry.notice_template, &[cc::FOUNDERS[0], cc::FOUNDERS[1]], t);
-        let e = sp::purge_rows(dir, &sel, &n, NODE, t)
+        let e = rows_at(dir, &sel, &n, NODE, t)
             .await
             .expect_err("the accountability record is unpurgeable");
         assert_eq!(refusal(&e).0, token::RETRACTION_INADMISSIBLE, "I667");
@@ -1629,9 +1655,7 @@ pub(crate) mod bodies {
         }
         assert_eq!(dry.sample, vec![format!("attestation:{plain}")], "I667");
         let n = notice_for(&dry.notice_template, &[cc::FOUNDERS[1], cc::FOUNDERS[2]], t);
-        let r = sp::purge_rows(dir, &by, &n, NODE, t)
-            .await
-            .expect("executes");
+        let r = rows_at(dir, &by, &n, NODE, t).await.expect("executes");
         let held: Vec<String> = dir
             .purge_tombstones_of(&r.notice_id)
             .await
@@ -1800,7 +1824,7 @@ pub(crate) mod bodies {
             derived_from: vec![String::new(); ids.len()],
             admitted_at: t,
         };
-        let e = sp::apply_replicated_purge(dir, &bundle, "node-b", t)
+        let e = apply_at(dir, &bundle, "node-b", t)
             .await
             .expect_err("the receiver re-asks the unconditional rules");
         let (tok, body) = refusal(&e);
@@ -1862,7 +1886,7 @@ pub(crate) mod bodies {
             "content_holder_key_ids": [],
         });
         let notice = notice_for(&template, &[cc::FOUNDERS[0], cc::FOUNDERS[1]], t);
-        let e = sp::purge_rows(dir, &sel, &notice, NODE, t)
+        let e = rows_at(dir, &sel, &notice, NODE, t)
             .await
             .expect_err("and at execution");
         assert_eq!(
@@ -1878,7 +1902,7 @@ pub(crate) mod bodies {
             derived_from: vec![String::new(); ids.len()],
             admitted_at: t,
         };
-        let e = sp::apply_replicated_purge(dir, &bundle, "node-b", t)
+        let e = apply_at(dir, &bundle, "node-b", t)
             .await
             .expect_err("and at the receiver");
         assert_eq!(
@@ -2152,8 +2176,8 @@ pub(crate) mod bodies {
         };
         let dry = sp::purge_dry_run(dir, &sel).await.unwrap();
         let notice = notice_for(&dry.notice_template, &[cc::FOUNDERS[0], cc::FOUNDERS[1]], t);
-        let rep = sp::purge_rows(dir, &sel, &notice, NODE, t).await.unwrap();
-        sp::purge_finalize(
+        let rep = rows_at(dir, &sel, &notice, NODE, t).await.unwrap();
+        finalize_at(
             dir,
             &rep.notice_id,
             t + chrono::Duration::seconds(sp::PURGE_SETTLE_DWELL_SECS + 1),
@@ -2178,7 +2202,7 @@ pub(crate) mod bodies {
 
         // A failure between the header and the tombstones leaves NEITHER.
         d.hooks().fail_next("purge_put_execution_tombstones", 1);
-        let e = sp::purge_rows(dir, &mock_selection(), &notice, NODE, t)
+        let e = rows_at(dir, &mock_selection(), &notice, NODE, t)
             .await
             .expect_err("I695: the armed fault fails the write");
         assert!(
@@ -2192,7 +2216,7 @@ pub(crate) mod bodies {
         );
 
         // The retry executes the whole set.
-        let report = sp::purge_rows(dir, &mock_selection(), &notice, NODE, t)
+        let report = rows_at(dir, &mock_selection(), &notice, NODE, t)
             .await
             .expect("I695: the retry executes");
         assert_eq!(report.record_count, dry.record_count);
@@ -2204,7 +2228,7 @@ pub(crate) mod bodies {
         assert_eq!(report.already_tombstoned, 0);
         let later = t + chrono::Duration::seconds(sp::PURGE_SETTLE_DWELL_SECS + 1);
         assert_eq!(
-            sp::purge_status(dir, &report.notice_id, later)
+            status_at(dir, &report.notice_id, later)
                 .await
                 .unwrap()
                 .state,
@@ -2244,13 +2268,13 @@ pub(crate) mod bodies {
         )
         .await;
         assert_eq!(
-            sp::purge_status(dir, &report.notice_id, later)
+            status_at(dir, &report.notice_id, later)
                 .await
                 .unwrap()
                 .state,
             sp::PurgeState::Incomplete
         );
-        let e = sp::purge_finalize(dir, &report.notice_id, later, None)
+        let e = finalize_at(dir, &report.notice_id, later, None)
             .await
             .expect_err("I695: a partial execution is not finalized");
         let (tok, body) = refusal(&e);
@@ -2267,12 +2291,12 @@ pub(crate) mod bodies {
         assert_eq!(refusal(&e).0, token::EXECUTION_INCOMPLETE, "I695 serve");
 
         // A re-run of the same notice completes it.
-        let healed = sp::purge_rows(dir, &mock_selection(), &notice, NODE, t)
+        let healed = rows_at(dir, &mock_selection(), &notice, NODE, t)
             .await
             .expect("I695: the re-run completes the set");
         assert_eq!(healed.tombstoned.values().sum::<u64>(), 1, "{healed:?}");
         assert_eq!(healed.already_tombstoned, dry.record_count - 1);
-        let fin = sp::purge_finalize(dir, &report.notice_id, later, None)
+        let fin = finalize_at(dir, &report.notice_id, later, None)
             .await
             .expect("I695: the complete execution finalizes");
         assert_eq!(fin.attestations_deleted, 3, "{fin:?}");
@@ -2368,8 +2392,8 @@ pub(crate) mod bodies {
         };
         let dry = sp::purge_dry_run(dir, &sel).await.unwrap();
         let notice = notice_for(&dry.notice_template, &[cc::FOUNDERS[0], cc::FOUNDERS[1]], t);
-        let rep = sp::purge_rows(dir, &sel, &notice, NODE, t).await.unwrap();
-        let fin = sp::purge_finalize(
+        let rep = rows_at(dir, &sel, &notice, NODE, t).await.unwrap();
+        let fin = finalize_at(
             dir,
             &rep.notice_id,
             t + chrono::Duration::seconds(sp::PURGE_SETTLE_DWELL_SECS + 1),
@@ -2440,7 +2464,7 @@ pub(crate) mod bodies {
             derived_from: vec![String::new(); ids.len()],
             admitted_at: t,
         };
-        let applied = sp::apply_replicated_purge(dir, &bundle, NODE, t)
+        let applied = apply_at(dir, &bundle, NODE, t)
             .await
             .expect("I697: a bundle may name rows this node does not hold yet");
         assert_eq!(applied.tombstoned, 3);
@@ -2485,7 +2509,7 @@ pub(crate) mod bodies {
             format!("attestation:{track}"),
         ];
         voided.sort();
-        let mut st = sp::purge_status(dir, &notice_id, later).await.unwrap();
+        let mut st = status_at(dir, &notice_id, later).await.unwrap();
         st.voided.sort();
         assert_eq!(
             st.voided, voided,
@@ -2497,7 +2521,7 @@ pub(crate) mod bodies {
             .purge_delete_tombstoned_attestation(&revocation)
             .await
             .unwrap());
-        let mut fin = sp::purge_finalize(dir, &notice_id, later, None)
+        let mut fin = finalize_at(dir, &notice_id, later, None)
             .await
             .expect("finalizes");
         fin.voided.sort();
@@ -2707,7 +2731,7 @@ pub(crate) mod bodies {
             "I820: the digest is the reduced set's"
         );
         let notice = notice_for(&dry.notice_template, &[cc::FOUNDERS[0], cc::FOUNDERS[1]], t);
-        let rep = sp::purge_rows(dir, &sel, &notice, NODE, t)
+        let rep = rows_at(dir, &sel, &notice, NODE, t)
             .await
             .expect("I820: the reduced selection executes");
         assert_eq!(rep.record_count, 3);
@@ -2768,7 +2792,7 @@ pub(crate) mod bodies {
             ],
             t,
         );
-        let e = sp::apply_replicated_purge(dir, &forged, NODE, t)
+        let e = apply_at(dir, &forged, NODE, t)
             .await
             .expect_err("I821: the bundle's provenance is not trusted");
         let (tok, body) = refusal(&e);
@@ -2821,7 +2845,7 @@ pub(crate) mod bodies {
             t,
         );
         let (tok, body) = refusal(
-            &sp::apply_replicated_purge(dir, &device, NODE, t)
+            &apply_at(dir, &device, NODE, t)
                 .await
                 .expect_err("I821: a person's holding claim is read locally"),
         );
@@ -2831,7 +2855,7 @@ pub(crate) mod bodies {
         // A blob nothing here holds or binds: not proven non-human.
         let blind = bundle_over(vec![(format!("blob:{unbound}"), String::new())], t);
         let (tok, body) = refusal(
-            &sp::apply_replicated_purge(dir, &blind, NODE, t)
+            &apply_at(dir, &blind, NODE, t)
                 .await
                 .expect_err("I821: an unknown holding fails closed"),
         );
@@ -2840,7 +2864,7 @@ pub(crate) mod bodies {
 
         // A blob bound only by a row about a non-person applies.
         let fine = bundle_over(vec![(format!("blob:{plain}"), String::new())], t);
-        sp::apply_replicated_purge(dir, &fine, NODE, t)
+        apply_at(dir, &fine, NODE, t)
             .await
             .expect("I821: a non-person's blob applies");
 
@@ -2855,6 +2879,40 @@ pub(crate) mod bodies {
         );
         assert_eq!(tok, token::HUMAN_SUBJECT_PENDING_NOTICE_ROW, "I821: {body}");
         assert!(body.to_string().contains(ALICE), "I821 local: {body}");
+    }
+
+    // ── I822 ──────────────────────────────────────────────────────────────
+    pub(crate) async fn i822_the_dwell_is_this_nodes_clock<D: Seams>(d: &D) {
+        root(d).await;
+        mock_world(d, "i822").await;
+        let dir = d.as_dyn_directory();
+        let t = now();
+        let dry = sp::purge_dry_run(dir, &mock_selection()).await.unwrap();
+        let notice = notice_for(&dry.notice_template, &[cc::FOUNDERS[0], cc::FOUNDERS[1]], t);
+        // The system clock: no seam, no argument.
+        sp::test_clock::set(None);
+        let before = chrono::Utc::now();
+        let rep = sp::purge_rows(dir, &mock_selection(), &notice, NODE)
+            .await
+            .expect("executes");
+        let after = chrono::Utc::now();
+        assert!(
+            rep.executed_at >= before && rep.executed_at <= after,
+            "I822: executed_at is this node's clock: {} not in [{before}, {after}]",
+            rep.executed_at
+        );
+        let e = sp::purge_finalize(dir, &rep.notice_id, None)
+            .await
+            .expect_err("I822: finalize right after execute is refused");
+        let (tok, body) = refusal(&e);
+        assert_eq!(tok, token::NOT_SETTLED, "I822: {body}");
+        let st = sp::purge_status(dir, &rep.notice_id).await.unwrap();
+        assert_eq!(st.state, sp::PurgeState::Executed, "I822");
+        assert_eq!(
+            st.settles_at,
+            rep.executed_at + chrono::Duration::seconds(sp::PURGE_SETTLE_DWELL_SECS),
+            "I822: the settle is 72 h after this node's execution"
+        );
     }
 
     // ── I660 ──────────────────────────────────────────────────────────────
@@ -3025,6 +3083,11 @@ mod run {
                     b::i821_a_blobs_subject_is_resolved_locally(&d).await
                 }
                 #[tokio::test]
+                async fn i822() {
+                    let Some(d) = $fresh.await else { return };
+                    b::i822_the_dwell_is_this_nodes_clock(&d).await
+                }
+                #[tokio::test]
                 async fn i664() {
                     let Some(d) = $fresh.await else { return };
                     b::i664_the_tombstone_row_holds_another_basis(&d).await
@@ -3162,6 +3225,76 @@ mod run {
         assert!(promo.contains("steward_purge::refuse_if_tombstoned_attestation(directory, row)"));
         let ingest = strip(include_str!("../ingest.rs"));
         assert!(ingest.contains("self.refuse_named_traces(&env).await?;"));
+    }
+
+    /// The signature text of the `fn` at byte `at` of `src`, up to its body.
+    fn signature_of(src: &str, at: usize) -> &str {
+        let rest = &src[at..];
+        &rest[..rest.find('{').unwrap_or(rest.len())]
+    }
+
+    /// **I822** (Codex round 2 on PR #1057) — from disk: no public purge
+    /// surface takes a caller's instant.
+    #[test]
+    fn i822_no_purge_surface_takes_a_callers_now() {
+        let root = env!("CARGO_MANIFEST_DIR");
+        let read = |f: &str| strip(&std::fs::read_to_string(format!("{root}/{f}")).unwrap());
+        let mut problems = Vec::new();
+        let module = read("src/federation/steward_purge.rs");
+        let mut seen = 0;
+        for open in ["pub fn ", "pub async fn "] {
+            for (i, _) in module.match_indices(open) {
+                let sig = signature_of(&module, i);
+                seen += 1;
+                if sig.contains("now") {
+                    problems.push(format!("steward_purge: {}", sig.trim()));
+                }
+            }
+        }
+        assert!(
+            seen > 15,
+            "I822: the scan read the module's pub fns ({seen})"
+        );
+        let engine = read("src/engine.rs");
+        for name in [
+            "purge_dry_run",
+            "purge_rows",
+            "purge_status",
+            "purge_finalize",
+            "purge_ledger_tsv",
+            "list_purge_bundles_since",
+            "apply_replicated_purge",
+        ] {
+            let open = format!("pub async fn {name}(");
+            let i = engine
+                .find(&open)
+                .unwrap_or_else(|| panic!("I822: Engine::{name} not found"));
+            let sig = signature_of(&engine, i);
+            if sig.contains("now") {
+                problems.push(format!("Engine::{name}: {}", sig.trim()));
+            }
+        }
+        let pyo3 = read("src/ffi/pyo3.rs");
+        for name in [
+            "purge_rows_json",
+            "purge_status_json",
+            "purge_finalize_json",
+            "apply_replicated_purge_json",
+        ] {
+            let open = format!("fn {name}(");
+            let i = pyo3
+                .find(&open)
+                .unwrap_or_else(|| panic!("I822: pyo3 {name} not found"));
+            let sig = signature_of(&pyo3, i);
+            if sig.contains("now") {
+                problems.push(format!("pyo3 {name}: {}", sig.trim()));
+            }
+        }
+        assert!(
+            problems.is_empty(),
+            "I822: a purge surface takes a caller's instant:\n{}",
+            problems.join("\n")
+        );
     }
 
     /// The refusal tokens are a closed set of stable strings (CIRISServer#756

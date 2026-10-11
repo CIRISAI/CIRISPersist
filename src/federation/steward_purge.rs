@@ -160,6 +160,37 @@ pub const SAMPLE_LEN: usize = 20;
 /// constant, so a different ruling is a one-line change.
 pub const PURGE_SETTLE_DWELL_SECS: i64 = 259_200;
 
+/// **The purge's clock** (Codex round 2 on PR #1057): every instant the door
+/// judges by — the notice's window, the execution's `executed_at`, the settle
+/// — is THIS node's system clock, read once per door call. No public surface
+/// takes an instant: a caller-chosen `now` skipped the 72 h dwell (execute,
+/// then finalize at `now + 72 h`) or backdated the execution. A test sets
+/// [`test_clock`] instead; outside `cfg(test)` there is no seam.
+pub(crate) fn purge_clock() -> chrono::DateTime<chrono::Utc> {
+    #[cfg(test)]
+    if let Some(at) = test_clock::get() {
+        return at;
+    }
+    chrono::Utc::now()
+}
+
+/// The `cfg(test)` clock seam: a thread-local instant [`purge_clock`] returns
+/// while set (`#[tokio::test]` runs the door on the test's own thread).
+#[cfg(test)]
+pub(crate) mod test_clock {
+    use std::cell::Cell;
+    thread_local! {
+        static AT: Cell<Option<chrono::DateTime<chrono::Utc>>> = const { Cell::new(None) };
+    }
+    /// Pin the purge clock to `at` (`None`: the system clock).
+    pub(crate) fn set(at: Option<chrono::DateTime<chrono::Utc>>) {
+        AT.with(|c| c.set(at));
+    }
+    pub(super) fn get() -> Option<chrono::DateTime<chrono::Utc>> {
+        AT.with(Cell::get)
+    }
+}
+
 /// The model id the agent's mock LLM reports (CIRISPersist#1040:
 /// `ciris_adapters/mock_llm`). It is what identifies the mock traces already
 /// held (they predate `run_kind`, CIRISAgent#1249), so the purge class keys
@@ -1395,7 +1426,8 @@ pub fn notice_terms(envelope: &serde_json::Value) -> Result<NoticeTerms, Error> 
     })
 }
 
-/// **The authorisation gate.** The notice's shape, its window at `now`, and
+/// **The authorisation gate.** The notice's shape, its window at
+/// [`purge_clock`], and
 /// its cosigners under the claimant trust root's own `consensus_protocol`
 /// ([`trust_root_cosigners_over`](super::canonical_community::trust_root_cosigners_over)).
 /// Returns the terms and the counted cosigners.
@@ -1404,6 +1436,18 @@ pub fn notice_terms(envelope: &serde_json::Value) -> Result<NoticeTerms, Error> 
 ///
 /// [`token::UNAUTHORISED`]; directory reads.
 pub async fn verify_purge_authorisation<F>(
+    directory: &F,
+    notice: &StewardPurgeNotice,
+) -> Result<(NoticeTerms, BTreeSet<String>), Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    authorise_at(directory, notice, purge_clock()).await
+}
+
+/// [`verify_purge_authorisation`] at the instant the calling door read from
+/// [`purge_clock`] (one reading per door call).
+async fn authorise_at<F>(
     directory: &F,
     notice: &StewardPurgeNotice,
     now: chrono::DateTime<chrono::Utc>,
@@ -1630,7 +1674,7 @@ fn check_counts(terms: &NoticeTerms, live: &BTreeMap<String, u64>) -> Result<(),
     Ok(())
 }
 
-/// **`purge_rows(selection, notice, now)`** — the door.
+/// **`purge_rows(selection, notice)`** — the door, at [`purge_clock`].
 ///
 /// In order, each a typed refusal and none an override:
 /// 1. the notice authorises ([`verify_purge_authorisation`]) —
@@ -1659,12 +1703,12 @@ pub async fn purge_rows<F>(
     selection: &PurgeSelection,
     notice: &StewardPurgeNotice,
     executed_by: &str,
-    now: chrono::DateTime<chrono::Utc>,
 ) -> Result<PurgeReport, Error>
 where
     F: FederationDirectory + ?Sized,
 {
-    let (terms, signers) = verify_purge_authorisation(directory, notice, now).await?;
+    let now = purge_clock();
+    let (terms, signers) = authorise_at(directory, notice, now).await?;
     let resolved = resolve_selection(directory, selection).await?;
     let live = resolved.counts();
     check_counts(&terms, &live)?;
@@ -1825,19 +1869,16 @@ fn settles_at(e: &PurgeExecution) -> chrono::DateTime<chrono::Utc> {
     e.executed_at + chrono::Duration::seconds(PURGE_SETTLE_DWELL_SECS)
 }
 
-/// **Status** of an executed purge at `now`.
+/// **Status** of an executed purge, at [`purge_clock`].
 ///
 /// # Errors
 ///
 /// [`token::NOTICE_UNKNOWN`]; directory reads.
-pub async fn purge_status<F>(
-    directory: &F,
-    notice_id: &str,
-    now: chrono::DateTime<chrono::Utc>,
-) -> Result<PurgeStatus, Error>
+pub async fn purge_status<F>(directory: &F, notice_id: &str) -> Result<PurgeStatus, Error>
 where
     F: FederationDirectory + ?Sized,
 {
+    let now = purge_clock();
     let execution = execution_or_unknown(directory, notice_id).await?;
     let mut tombstones = BTreeMap::new();
     let held = directory.purge_tombstones_of(notice_id).await?;
@@ -2014,12 +2055,12 @@ pub struct FinalizeReport {
 pub async fn purge_finalize<F>(
     directory: &F,
     notice_id: &str,
-    now: chrono::DateTime<chrono::Utc>,
     bytes: Option<&dyn BytesEvictor>,
 ) -> Result<FinalizeReport, Error>
 where
     F: FederationDirectory + ?Sized,
 {
+    let now = purge_clock();
     let e = execution_or_unknown(directory, notice_id).await?;
     let mut report = FinalizeReport {
         notice_id: notice_id.to_owned(),
@@ -2179,12 +2220,12 @@ pub async fn apply_replicated_purge<F>(
     directory: &F,
     bundle: &PurgeBundle,
     receiver_key_id: &str,
-    now: chrono::DateTime<chrono::Utc>,
 ) -> Result<ApplyPurgeOutcome, Error>
 where
     F: FederationDirectory + ?Sized,
 {
-    let (terms, _signers) = verify_purge_authorisation(directory, &bundle.notice, now).await?;
+    let now = purge_clock();
+    let (terms, _signers) = authorise_at(directory, &bundle.notice, now).await?;
     let mut records = Vec::with_capacity(bundle.record_ids.len());
     for (i, id) in bundle.record_ids.iter().enumerate() {
         let mut r = parse_record_id(id)?;
