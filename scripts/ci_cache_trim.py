@@ -83,6 +83,11 @@ def victims(target: Path, targets: set[str], packages: set[str]) -> list[Path]:
 
 
 def main(argv: list[str]) -> int:
+    # v54.1.1 — a Windows runner's stdout is cp1252; the summary line's
+    # arrow killed the v54.1.0 tag's windows wheel job AFTER the trim ran.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
     if len(argv) < 2:
         print(__doc__, file=sys.stderr)
         return 2
