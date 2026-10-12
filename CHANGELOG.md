@@ -137,6 +137,22 @@ threat-model citations because this crate's audit story is the point.
   (`custody_ack_withdraws_not_the_holder`), and the retraction fold never
   lets one retire it (CC 3.1.3.3 rule 4); the v6.4.0 carve-out that let a
   moderation key withdraw a `holds_bytes` row is gone.
+- **Who may claim (CC 3.1.3.3 rule 2).** A `family` claim is admitted only for
+  a holder on that family's roster (an active member, or an occurrence of one
+  whose allow list lets the family through); an unknown family has no roster.
+  Through v54 the custody gate asked whether the holder received its OWN row,
+  whose principal arm answered from the holder's owner alone — so a node in
+  no family could report custody at any family (witnessed by I52's family
+  arm, red before). A `self` claim's principal is the reporting device
+  (custody:ack:v1 names no owner): any claimed personal device may claim at
+  `self`, and the claim reaches only its own owner's devices.
+- **Plaintext room content is Commons (CC 3.2 infrastructure: "holding claims
+  at federation scope").** A custody report about an infrastructure room's
+  plaintext blob is at `federation` and names no room; one naming a room —
+  its own or another — is `custody_ack_malformed` (I525, I579 updated).
+- **The advertisement plane survives (I723).** A Commons claim crosses to a
+  node that shares no cohort with the writer and holds no copy; that node
+  lists the writer as a live, sized holder.
 - **Legacy `holds_bytes` rows.** A row a node holds is "reported to the
   operator, … neither served nor replicated, and … not deleted" (CC 2.4):
   `row_type_report` lists it, both serve reads leave it out, no fold reads it.

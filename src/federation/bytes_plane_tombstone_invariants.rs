@@ -376,6 +376,8 @@ pub mod bodies {
 
     /// A federation-tier `custody:ack:v1` `here` by `device` for `sha`: the
     /// row node B holds once a device's report reaches it (CIRISEdge#763).
+    /// v55.0.0 (CIRISPersist#989, CC 3.1.3.3 rule 1) — placed at the
+    /// content's scope: [`seal_blob`] writes Commons content, so `federation`.
     #[cfg(test)]
     async fn custody_here<B>(b: &B, id: &str, device: &str, sha: &[u8; 32])
     where
@@ -385,14 +387,14 @@ pub mod bodies {
             sha,
             crate::federation::custody_ack::CustodyState::Here,
             Some(4096),
-            crate::federation::types::cohort_scope::SELF,
+            crate::federation::types::cohort_scope::FEDERATION,
             None,
         )
         .expect("custody envelope");
         env["id"] = serde_json::json!(id);
         let mut row = ts::bare_attestation(id, device, device, &env);
         row.attestation_type = attestation_type::SCORES.into();
-        row.cohort_scope = crate::federation::types::cohort_scope::SELF.into();
+        row.cohort_scope = crate::federation::types::cohort_scope::FEDERATION.into();
         ts::seal_row_in_place(device, &mut row);
         b.put_attestation(SignedAttestation { attestation: row })
             .await

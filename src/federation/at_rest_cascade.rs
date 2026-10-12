@@ -7124,12 +7124,18 @@ pub mod blob_invariants {
             "{tag} I52: LocalOnly emitted a holder claim"
         );
         // self / family + Announce — v55.0.0 (CIRISPersist#989, CC 3.1.3.3):
-        // the claim is placed at the content's own cohort, so it may announce
-        // there, and only a device IN that cohort may (rule 2). This node is
-        // no one's device and in no family, so the floor refuses the claim
-        // (`custody_ack_outside_cohort`) before anything is written — never a
-        // claim at `federation` for structurally invisible content.
+        // the claim is placed at the content's own cohort, never at
+        // `federation`. A `self` claim's principal is the reporting device
+        // itself (custody:ack:v1 names no owner), so this node's self claim is
+        // admitted AT `self`; a `family` claim names the family, and this node
+        // is in no family, so the floor refuses it (`custody_ack_outside_cohort`,
+        // rule 2) before anything is written.
         for scope in [SELF, FAMILY] {
+            // A fresh envelope per arm: a row another arm stored would make
+            // this adopt a re-adopt of held bytes.
+            let (env2, _, sha_n) =
+                sealed_community_envelope(backend, &comm, scope.as_bytes(), &peer).await;
+            backend.delete_blob(&sha_n).await.unwrap();
             let prov = crate::federation::BlobProvenance {
                 author_key_id: our.clone(),
                 cohort_scope: scope.to_owned(),
@@ -7138,7 +7144,7 @@ pub mod blob_invariants {
                 tier: CryptoTier::InvisibleEncrypted,
                 minter_key_id: None,
             };
-            let err = adopt_sealed_blob(
+            let r = adopt_sealed_blob(
                 backend,
                 Some(&signer),
                 &ctx,
@@ -7147,10 +7153,29 @@ pub mod blob_invariants {
                 None,
                 AdoptDisposition::Announce,
             )
-            .await
-            .expect_err(&format!(
-                "{tag} I52: an announced {scope} blob — structurally invisible content got a \
-                 holder claim"
+            .await;
+            if scope == SELF {
+                let out = r.unwrap_or_else(|e| panic!("{tag} I52: a self Announce: {e:?}"));
+                let claims: Vec<_> = backend
+                    .list_attestations_by(&our)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .filter(|a| {
+                        crate::federation::custody_ack::parse_custody_ack(a)
+                            .ok()
+                            .flatten()
+                            .is_some_and(|c| c.blob_sha256_hex == hex::encode(out.sha256))
+                    })
+                    .collect();
+                assert!(
+                    !claims.is_empty() && claims.iter().all(|c| c.cohort_scope == SELF),
+                    "{tag} I52: a self claim stays at self — never the directory: {claims:?}"
+                );
+                continue;
+            }
+            let err = r.expect_err(&format!(
+                "{tag} I52: an announced {scope} blob outside its cohort got a holder claim"
             ));
             // (a node not party to the family is refused even earlier, by the
             // hold decision)

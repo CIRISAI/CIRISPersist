@@ -4300,10 +4300,14 @@ pub mod invariants {
                 .any(|w| w.recipient_key_id == occ),
             "{tag} I34b: the occurrence holds the stream epoch's wrap"
         );
-        assert_eq!(
-            backend.list_holders(&manifest).await.unwrap(),
-            vec![writer.clone()],
-            "{tag} I34b: a self DAG is claimed at `self` by its writer alone (v55.0.0, CC 3.1.3.3)"
+        // v55.0.0 (CIRISPersist#989, CC 3.1.3.3 rules 1–2) — a self DAG is
+        // claimed at `self`, and only by a device in its cohort: this writer
+        // is a server node, no one's device, so it claims nothing
+        // (`HoldingClaimOutcome::NotInCohort`) and nothing reaches the
+        // directory.
+        assert!(
+            backend.list_holders(&manifest).await.unwrap().is_empty(),
+            "{tag} I34b: a node outside the self cohort claims nothing"
         );
         assert_eq!(
             read_any_for_viewer(backend, &manifest, &occ, None)

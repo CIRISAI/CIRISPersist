@@ -271,6 +271,22 @@ pub(crate) async fn holder_in_cohort<D>(
 where
     D: FederationDirectory + ?Sized,
 {
+    // v55.0.0 (CIRISPersist#989) — a FAMILY claim asks the family's own
+    // roster: the holder is an active member, or an occurrence of one whose
+    // allow list lets the family through to it. The general arm below asks
+    // whether the holder receives its OWN row, and for a family placement its
+    // principal arm answers that from the holder's owner alone — whoever the
+    // family is — so a node in no family could claim at any family.
+    if cohort_scope == super::types::cohort_scope::FAMILY {
+        let Some(family) = target else {
+            return Ok(false);
+        };
+        // A family this node does not know has no roster it is on.
+        if directory.lookup_family(family).await?.is_none() {
+            return Ok(false);
+        }
+        return super::replication::hold::family_audience(directory, holder, family).await;
+    }
     // v53.0.0 (#963) — the ONE audience rule, with no exemption for the
     // reporter: a `self` report is admitted iff the device is in its
     // principal's self audience — a claimed personal occurrence (or one its

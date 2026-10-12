@@ -45358,12 +45358,24 @@ mod tests {
             .evict_actor(&real_signer.derived_key_id(), &failing, chrono::Utc::now())
             .await
             .unwrap();
+        // v55.0.0 (CIRISPersist#989, CC 3.1.3.3 rule 4) — a holding claim is
+        // retracted by its signer alone: an evicting signer that is not the
+        // actor retracts NOTHING of the actor's (no attempt, so no failure),
+        // and its own copy still goes.
         assert_eq!(report.blobs_evicted, 1, "blob still evicted");
         assert_eq!(report.withdraws_emitted, 0, "no withdraws emitted");
-        assert_eq!(report.withdraws_failed, 1, "1 withdraws failed");
+        assert_eq!(
+            report.withdraws_failed, 0,
+            "another signer never tries to retract the actor's claim"
+        );
         assert!(
             !backend.has_blob(&shas[0]).await.unwrap(),
-            "blob row deletion proceeds despite withdraws failure"
+            "the local copy is deleted"
+        );
+        assert_eq!(
+            backend.list_holders(&shas[0]).await.unwrap(),
+            vec![real_signer.derived_key_id()],
+            "the actor's own claim stands"
         );
     }
 
