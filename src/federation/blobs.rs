@@ -4051,6 +4051,31 @@ pub fn check_announcing_signer(
     Ok(())
 }
 
+/// Codex r2 on #1065 — the `(seq, chunk)` relation a plaintext DAG's
+/// manifest names, for `federation_dag_chunks` (V176): written in the
+/// transaction that stores the `chunk_dag` row, as the sealed seal and the
+/// promote write theirs, so a takedown or withdrawal of the DAG reaches its
+/// chunks through `dag_manifests_of_chunk`. A chunk's `seq` is its own when
+/// the manifest names one, else its index; the stream is the manifest's, or
+/// empty for a DAG not sealed from a stream.
+#[must_use]
+pub fn manifest_chunk_links(manifest: &ChunkManifest) -> (Vec<(i64, Vec<u8>)>, String) {
+    (
+        manifest
+            .chunks
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                (
+                    i64::try_from(c.seq.unwrap_or(i as u64)).unwrap_or(i64::MAX),
+                    c.sha.to_vec(),
+                )
+            })
+            .collect(),
+        manifest.stream_id.clone().unwrap_or_default(),
+    )
+}
+
 /// v2.3 (CIRISPersist#103) — typed errors from the [`BlobStorage`] trait.
 #[derive(Debug, thiserror::Error)]
 pub enum BlobError {

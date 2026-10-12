@@ -82,6 +82,11 @@
 //!   binding's subject is admitted); a binding's non-empty `attested_key_id`
 //!   is a subject; an `affiliations` binding's `community_id` is a bound
 //!   community, so that room's moderator is admitted.
+//! - **I773** (sqlite, postgres; Codex r2 on #1065) — a plaintext DAG's
+//!   chunks belong to it: the incremental finalize and the one-shot door each
+//!   write the manifest → chunk relation with the `chunk_dag` row, so after an
+//!   immediate-removal takedown of the DAG every chunk is withheld
+//!   (`purge_withheld` finds it through `dag_manifests_of_chunk`) and evicted.
 //! - **I793** — the settle is the basis's: a steward purge after W = 72 h,
 //!   an immediate-removal takedown at once, a counter-notice takedown after
 //!   its window, the age gate and an unknown basis never earlier than W.
@@ -1218,6 +1223,80 @@ pub(crate) mod engine_bodies {
         sha
     }
 
+    // ── I773 ──────────────────────────────────────────────────────────────
+    pub(crate) async fn i773_a_plaintext_dags_chunks_follow_its_takedown<B>(
+        dsn_a: &str,
+        dsn_b: &str,
+        run: &str,
+        pick: Pick<B>,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync + 'static,
+    {
+        let l = ladder(dsn_a, dsn_b, run, pick).await;
+        let author = format!("i773-author-{run}");
+        ts::register_hybrid_key_as(l.ba.as_ref(), &author, &author, USER).await;
+        let owner = claimant(0x97);
+        let dir = l.ba.as_dyn_directory();
+        for (door, tag) in [(true, "incremental"), (false, "one-shot")] {
+            let segs: Vec<Vec<u8>> = (0..3u8)
+                .map(|i| {
+                    format!("i773 {tag} {run} chunk {i} ")
+                        .repeat(40)
+                        .into_bytes()
+                })
+                .collect();
+            let manifest = plaintext_manifest(&segs);
+            let msha = if door {
+                for (c, s) in manifest.chunks.iter().zip(&segs) {
+                    l.engine_a
+                        .put_plaintext_dag_chunk(c, BlobBody::Inline(s.clone()), &author)
+                        .await
+                        .unwrap();
+                }
+                l.engine_a
+                    .finalize_blob_chunks_signing(manifest.clone(), &author)
+                    .await
+                    .expect("I773: the incremental DAG")
+            } else {
+                let chunks = segs
+                    .iter()
+                    .map(|s| (sha2::Sha256::digest(s).into(), BlobBody::Inline(s.clone())))
+                    .collect();
+                l.engine_a
+                    .put_blob_chunks_signing(manifest.clone(), chunks, &author)
+                    .await
+                    .expect("I773: the one-shot DAG")
+            };
+            for c in &manifest.chunks {
+                assert!(
+                    l.ba.dag_manifests_of_chunk(&c.sha)
+                        .await
+                        .unwrap()
+                        .contains(&msha),
+                    "I773 {tag}: the chunk is related to its manifest"
+                );
+            }
+            establish(dir, &author, &owner.id, &hex::encode(msha)).await;
+            let r = l
+                .engine_a
+                .takedown_tombstone(&notice(&owner, &hex::encode(msha), "ncmec_csam"))
+                .await
+                .expect("I773: an immediate-removal takedown of the DAG");
+            assert!(r.bytes_destroyed, "I773 {tag}: {r:?}");
+            for c in &manifest.chunks {
+                assert_eq!(
+                    sp::purge_withheld(dir, &c.sha).await.unwrap(),
+                    Some(r.notice_id.clone()),
+                    "I773 {tag}: the chunk is withheld with its DAG"
+                );
+                assert!(
+                    l.ba.blob_head(&c.sha).await.unwrap().is_none(),
+                    "I773 {tag}: the chunk is evicted with its DAG"
+                );
+            }
+        }
+    }
+
     // ── I790 ──────────────────────────────────────────────────────────────
     pub(crate) async fn i790_this_node_acts_as_a_holder<B>(
         dsn_a: &str,
@@ -1547,6 +1626,17 @@ mod run {
                     let Some((a, b)) = $dsns else { return };
                     e::i780_i783_the_incremental_plaintext_dag(&a, &b, &super::suffix(), $pick)
                         .await
+                }
+                #[tokio::test]
+                async fn i773() {
+                    let Some((a, b)) = $dsns else { return };
+                    e::i773_a_plaintext_dags_chunks_follow_its_takedown(
+                        &a,
+                        &b,
+                        &super::suffix(),
+                        $pick,
+                    )
+                    .await
                 }
                 #[tokio::test]
                 async fn i790() {

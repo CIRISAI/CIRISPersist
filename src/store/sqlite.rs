@@ -18642,6 +18642,10 @@ impl crate::federation::BlobStorage for SqliteBackend {
         }
 
         let now_iso = chrono::Utc::now().to_rfc3339();
+        // Codex r2 on #1065 — the manifest's chunk relation, in the same
+        // transaction (the manifest row is the last prepared row).
+        let manifest_sha = rows.last().map(|r| r.sha256.to_vec());
+        let (links, link_stream) = crate::federation::blobs::manifest_chunk_links(&manifest);
         self.write(move |conn| -> Result<(), rusqlite::Error> {
             let tx = conn.transaction()?;
             for row in &rows {
@@ -18661,6 +18665,15 @@ impl crate::federation::BlobStorage for SqliteBackend {
                         now_iso,
                     ],
                 )?;
+            }
+            if let Some(m) = &manifest_sha {
+                for (seq, chunk) in &links {
+                    tx.execute(
+                        "INSERT INTO federation_dag_chunks (manifest_sha256, seq, chunk_sha256, stream_id) \
+                         VALUES (?1, ?2, ?3, ?4) ON CONFLICT (manifest_sha256, seq) DO NOTHING",
+                        rusqlite::params![m, seq, chunk, link_stream],
+                    )?;
+                }
             }
             tx.commit()?;
             Ok(())
@@ -18692,6 +18705,8 @@ impl crate::federation::BlobStorage for SqliteBackend {
             .collect();
         let now_iso = chrono::Utc::now().to_rfc3339();
         let sha = row.sha256;
+        // Codex r2 on #1065 — the manifest's chunk relation, with the row.
+        let (links, link_stream) = crate::federation::blobs::manifest_chunk_links(&manifest);
         let outcome = self
             .write(
                 move |conn| -> Result<Result<(), crate::federation::BlobError>, rusqlite::Error> {
@@ -18725,6 +18740,13 @@ impl crate::federation::BlobStorage for SqliteBackend {
                             now_iso,
                         ],
                     )?;
+                    for (seq, chunk) in &links {
+                        tx.execute(
+                            "INSERT INTO federation_dag_chunks (manifest_sha256, seq, chunk_sha256, stream_id) \
+                         VALUES (?1, ?2, ?3, ?4) ON CONFLICT (manifest_sha256, seq) DO NOTHING",
+                            rusqlite::params![row.sha256.to_vec(), seq, chunk, link_stream],
+                        )?;
+                    }
                     tx.commit()?;
                     Ok(Ok(()))
                 },

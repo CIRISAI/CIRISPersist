@@ -20666,6 +20666,23 @@ impl crate::federation::BlobStorage for PostgresBackend {
                 crate::federation::BlobError::Backend(format!("put_blob_chunks insert: {e}"))
             })?;
         }
+        // Codex r2 on #1065 — the manifest's chunk relation, in the same
+        // transaction (the manifest row is the last prepared row).
+        if let Some(m) = rows.last().map(|r| r.sha256.to_vec()) {
+            let (links, link_stream) = crate::federation::blobs::manifest_chunk_links(&manifest);
+            for (seq, chunk) in &links {
+                tx.execute(
+                    "INSERT INTO cirislens.federation_dag_chunks \
+                     (manifest_sha256, seq, chunk_sha256, stream_id) VALUES ($1, $2, $3, $4) \
+                 ON CONFLICT (manifest_sha256, seq) DO NOTHING",
+                    &[&m, seq, chunk, &link_stream],
+                )
+                .await
+                .map_err(|e| {
+                    crate::federation::BlobError::Backend(format!("put_blob_chunks link: {e}"))
+                })?;
+            }
+        }
         tx.commit().await.map_err(|e| {
             crate::federation::BlobError::Backend(format!("put_blob_chunks commit: {e}"))
         })?;
@@ -20734,6 +20751,18 @@ impl crate::federation::BlobStorage for PostgresBackend {
         )
         .await
         .map_err(|e| be("insert", e))?;
+        // Codex r2 on #1065 — the manifest's chunk relation, with the row.
+        let (links, link_stream) = crate::federation::blobs::manifest_chunk_links(&manifest);
+        for (seq, chunk) in &links {
+            tx.execute(
+                "INSERT INTO cirislens.federation_dag_chunks \
+                     (manifest_sha256, seq, chunk_sha256, stream_id) VALUES ($1, $2, $3, $4) \
+                 ON CONFLICT (manifest_sha256, seq) DO NOTHING",
+                &[&row.sha256.to_vec(), seq, chunk, &link_stream],
+            )
+            .await
+            .map_err(|e| be("link", e))?;
+        }
         tx.commit().await.map_err(|e| be("commit", e))?;
         Ok(row.sha256)
     }
