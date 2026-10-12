@@ -15824,6 +15824,186 @@
     "field": "group_key_id",
     "prefix": "watchlist:{id}",
     "tsv_excluded": "src/safety/watchlist.rs does not exist in persist (misattributed; dropped at the post-cut materialisation)"
+   },
+   {
+    "decimal_id": "3.3.2",
+    "claim_id": "CLM-steward-purge-authorisation",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/steward_purge.rs#verify_purge_authorisation",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc8-1059",
+    "witness": "I650, I833, I656 (memory, sqlite, postgres)"
+   },
+   {
+    "decimal_id": "3.3.2",
+    "claim_id": "CLM-steward-purge-authorisation",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/canonical_community.rs#trust_root_cosigners_over",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc8-1059",
+    "witness": "I650, I833, I656 (memory, sqlite, postgres)"
+   },
+   {
+    "decimal_id": "2.4.1.1",
+    "claim_id": "CLM-derived-rows-follow-reason",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/steward_purge.rs#resolve_selection",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc8-1059",
+    "witness": "I654, I662, I820 (memory, sqlite, postgres)"
+   },
+   {
+    "decimal_id": "2.4.1.1",
+    "claim_id": "CLM-derived-rows-follow-reason",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/steward_purge.rs#withhold_orphaned_derivatives",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc8-1059",
+    "witness": "I820 (memory, sqlite, postgres)"
+   },
+   {
+    "decimal_id": "3.3.2",
+    "claim_id": "CLM-purge-digest-preimage",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/steward_purge.rs#selection_digest",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc8-1059",
+    "witness": "I651, I654, I656 (memory, sqlite, postgres)"
+   },
+   {
+    "decimal_id": "3.3.2",
+    "claim_id": "CLM-purge-digest-preimage",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/steward_purge.rs#notice_terms",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc8-1059",
+    "witness": "I650, I651 (memory, sqlite, postgres)"
+   },
+   {
+    "decimal_id": "4.5.3",
+    "claim_id": "CLM-purge-atomic-commit",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/steward_purge.rs#check_purge_put_set",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc8-1059",
+    "witness": "I695 (memory, sqlite, postgres)"
+   },
+   {
+    "decimal_id": "4.5.3",
+    "claim_id": "CLM-purge-atomic-commit",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/store/sqlite.rs#purge_put_execution",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc8-1059",
+    "witness": "I695 (sqlite)"
+   },
+   {
+    "decimal_id": "4.5.3",
+    "claim_id": "CLM-purge-atomic-commit",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/store/postgres.rs#purge_put_execution",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc8-1059",
+    "witness": "I695 (postgres)"
+   },
+   {
+    "decimal_id": "4.5.3",
+    "claim_id": "CLM-purge-dwell-node-clock",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/steward_purge.rs#purge_clock",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc8-1059",
+    "witness": "I822 (behavioural and from disk), I655"
+   },
+   {
+    "decimal_id": "4.5.3",
+    "claim_id": "CLM-purge-dwell-node-clock",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/steward_purge.rs#purge_finalize",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc8-1059",
+    "witness": "I822, I655 (memory, sqlite, postgres)"
+   },
+   {
+    "decimal_id": "4.5.3",
+    "claim_id": "CLM-purge-out-of-order-void",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/steward_purge.rs#tombstone_void_reason",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc8-1059",
+    "witness": "I697, I828 (memory, sqlite, postgres)"
+   },
+   {
+    "decimal_id": "4.5.3",
+    "claim_id": "CLM-purge-out-of-order-void",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/steward_purge.rs#refuse_if_tombstoned_attestation",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc8-1059",
+    "witness": "I697, I828 (memory, sqlite, postgres)"
+   },
+   {
+    "decimal_id": "4.5.3",
+    "claim_id": "CLM-purge-subject-unknown-retryable",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/steward_purge.rs#refuse_if_tombstoned_attestation",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc8-1059",
+    "witness": "I832 (memory, sqlite, postgres)"
+   },
+   {
+    "decimal_id": "4.5.3",
+    "claim_id": "CLM-purge-subject-unknown-retryable",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/steward_purge.rs#refuse_if_tombstoned_trace",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc8-1059",
+    "witness": "I832 (memory, sqlite, postgres)"
+   },
+   {
+    "decimal_id": "4.5.3",
+    "claim_id": "CLM-purge-blob-withheld",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/steward_purge.rs#purge_withheld",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc8-1059",
+    "witness": "I824, I835 (sqlite, postgres)"
+   },
+   {
+    "decimal_id": "4.5.3",
+    "claim_id": "CLM-purge-blob-withheld",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/at_rest_cascade.rs#refuse_if_withdrawn",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc8-1059",
+    "witness": "I824, I835 (sqlite, postgres), I836 (from disk)"
+   },
+   {
+    "decimal_id": "4.5.3",
+    "claim_id": "CLM-purge-projections-removed",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/steward_purge.rs#ATTESTATION_PROJECTIONS",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc8-1059",
+    "witness": "I829b (migrated schema)"
+   },
+   {
+    "decimal_id": "4.5.3",
+    "claim_id": "CLM-purge-projections-removed",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/store/sqlite.rs#purge_attestation_projections",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc8-1059",
+    "witness": "I829 (sqlite), I829b"
+   },
+   {
+    "decimal_id": "4.5.3",
+    "claim_id": "CLM-purge-projections-removed",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/store/postgres.rs#purge_attestation_projections",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc8-1059",
+    "witness": "I829 (postgres)"
    }
   ],
   "CIRISServer": [

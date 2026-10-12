@@ -1743,7 +1743,8 @@ mod tests {
         // visible one-line diff, which is the same discipline the FFI taxonomy
         // and the CC 3.1.9.2 prose-rule count are held to.
         // One number, stated once: the message reads it, so it cannot go stale.
-        const EXPECTED: usize = 188;
+        // v55.0.0 (CIRISPersist#1059): +20, the steward purge door's nine claims.
+        const EXPECTED: usize = 208;
         assert_eq!(
             checked, EXPECTED,
             "checked {checked} version-pinned persist src/ rows, expected {EXPECTED}. \
