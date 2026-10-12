@@ -1043,7 +1043,9 @@ pub const KEY_GRANT_PLANE: &str = "key_grant";
 /// rule**, asked of every federation-tier row by
 /// `check_reserved_prefix_admission` on every backend:
 ///
-/// - a retired key-grant SET is refused `set_retired`;
+/// - (a retired key-grant SET never reaches it: the row-type gate refuses a
+///   retired carrier first, and [`KeyGrantRow::from_attestation`] answers
+///   `set_retired` at the key-grant door);
 /// - a `scores` row on `key_grant:` must parse ([`KeyGrantRow::from_attestation`]),
 ///   carry a v2 wrap, be self-signed (`attesting_key_id == scrub_key_id`),
 ///   meet the sealer rule ([`check_sealer`], at the row's `asserted_at`, its
@@ -1056,17 +1058,6 @@ pub async fn check_key_grant_row_admission(
     dir: &dyn FederationDirectory,
     row: &Attestation,
 ) -> Result<(), Error> {
-    if is_retired_key_grant_set_type(&row.attestation_type) {
-        return Err(refuse(
-            KeyGrantRefusalReason::SetRetired,
-            format!(
-                "attestation_type {:?} is the retired rc6 key-grant SET (CC 2.4 rc7, \
-                 CIRISConstitution#143); a wrap is one `scores` row per recipient on \
-                 `key_grant:{{axis}}:v1`",
-                row.attestation_type
-            ),
-        ));
-    }
     let Some(dimension) =
         crate::federation::admission::envelope_dimension(&row.attestation_envelope)
     else {

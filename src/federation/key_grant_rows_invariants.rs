@@ -5,7 +5,7 @@
 //!   through its envelope on every axis; every departure from the shape is
 //!   `malformed`, a retired set type `set_retired`.
 //! - **I742** (memory, sqlite, postgres) — the admission rule at the attestation
-//!   plane's own door: a SET row is refused `set_retired`; a `key_grant:`
+//!   plane's own door: a SET row is refused (a retired carrier); a `key_grant:`
 //!   dimension on a composer is `malformed`; a non-minter's epoch row is
 //!   `signer_not_minter`; the minter's row to a member's occurrence admits and
 //!   its row to a stranger is `recipient_not_in_audience`; a `withdraws` and a
@@ -172,21 +172,13 @@ pub(crate) mod directory {
             }
         };
 
-        // (1) A SET row — the retired rc6 carrier — is refused `set_retired`.
+        // (1) A SET row — the retired rc6 carrier — is refused.
         let (id, r) =
             put(signed_as(crate::federation::key_grant::KEY_GRANT_EPOCH_DIMENSION).await).await;
-        // The row-type gate (a retired carrier) or the key-grant rule
-        // (`set_retired`), whichever the door asks first.
+        // The plane door's row-type gate: a retired carrier (CC 2.4 rc7).
         let e = r.expect_err("I742 (1)");
         assert!(
-            matches!(&e, Error::AttestationTypeUnregistered { .. })
-                || matches!(
-                    &e,
-                    Error::KeyGrantRefused {
-                        reason: "set_retired",
-                        ..
-                    }
-                ),
+            matches!(&e, Error::AttestationTypeUnregistered { .. }),
             "I742 (1): {e:?}"
         );
         assert!(d.get_attestation(&id).await.unwrap().is_none(), "I742 (1)");
@@ -741,10 +733,11 @@ pub(crate) mod two_nodes {
         );
         // The peer: the set is refused, the row admitted through the generic
         // door, the bytes open.
+        // The plane door: a retired carrier, refused by the row-type gate.
         let e = b
             .backend
             .apply_replicated_attestation(SignedAttestation {
-                attestation: legacy,
+                attestation: legacy.clone(),
             })
             .await
             .expect_err("a set is refused");
@@ -752,9 +745,22 @@ pub(crate) mod two_nodes {
             matches!(
                 &e,
                 crate::federation::Error::AttestationTypeUnregistered { .. }
-            ) || matches!(&e, crate::federation::Error::KeyGrantRefused { reason, .. }
+            ),
+            "{tag} I745 (plane door): {e:?}"
+        );
+        // The key-grant door: `set_retired`, in its own token.
+        let e = crate::federation::key_grant::admit_replicated_key_grant(
+            b.backend,
+            crate::federation::key_grant::SignedKeyGrantRow {
+                attestation: legacy,
+            },
+        )
+        .await
+        .expect_err("a set is refused at the key-grant door");
+        assert!(
+            matches!(&e, crate::federation::Error::KeyGrantRefused { reason, .. }
                 if *reason == "set_retired"),
-            "{tag} I745: {e:?}"
+            "{tag} I745 (key-grant door): {e:?}"
         );
         let to_b = rows
             .iter()
