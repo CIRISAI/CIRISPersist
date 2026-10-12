@@ -159,11 +159,15 @@ threat-model citations because this crate's audit story is the point.
   minter as a per-recipient row, each at a fresh signed instant (so each
   recipient is re-checked against the audience at that instant, CC 4.4.3.2.2).
   The held legacy set rows stay where they are.
-- **The retired SET.** A new set row (`attestation_type` under `key_grant:`)
-  is refused `set_retired` at every door, whatever `ROW_TYPE_ENFORCEMENT` says,
-  and held set rows are never served: `row_type::RETIRED_ROW_TYPE_PREFIXES`
-  joins the serve filter of `list_attestations_since` and
-  `list_attestation_log` on every backend under `Report` as under `Enforce`.
+- **The retired SET.** The three set types join
+  `registry::RETIRED_CARRIER_STEMS` (slice A's list, whole type names). A new
+  set row is refused at every door whatever `ROW_TYPE_ENFORCEMENT` says: the
+  row-type gate answers `attestation_type_unregistered` at the plane doors and
+  the mint, and `apply_replicated_key_grant` answers `set_retired`. Held set
+  rows are never served: `row_type::not_retired_carrier_sql` joins the serve
+  filter of `list_attestations_since` and `list_attestation_log` on sqlite and
+  postgres, and memory's `served_under_enforcement` asks
+  `row_type::retired_carrier`, under `Report` as under `Enforce`.
   The `key_grant` line of A0's `RC6_RETIRED_CARRIERS_ADMITTED_UNTIL_989` is
   deleted (slice A deletes `holds_bytes`'s; whichever merges last deletes the
   const); I700 and I701 follow.
@@ -208,7 +212,7 @@ threat-model citations because this crate's audit story is the point.
 - **New refusal reasons** on `federation_key_grant_refused`
   (`Error::KeyGrantRefused`, Python `ValueError`): `recipient_not_in_audience`
   (retryable: the occurrence, roster or allow list may not have landed) and
-  `set_retired` (terminal). The self-axis owner leg answers
+  `set_retired` (terminal; `apply_replicated_key_grant` only). The self-axis owner leg answers
   `federation_signer_not_acting_for` (`Error::SignerDoesNotActFor`, plane
   `key_grant`, retryable). New exhaustive enum variants:
   `KeyGrantRefusalReason::{RecipientNotInAudience, SetRetired}`.
@@ -219,8 +223,9 @@ threat-model citations because this crate's audit story is the point.
   `is_retired_key_grant_set_type`, `plan_key_grant_emission`,
   `key_grant_row_held`, `emit_key_grant_axis_with`,
   `emit_dirty_with_local_signer`, `project_key_grant_row`,
-  `admission::grant_chain_instant`, `row_type::{RETIRED_ROW_TYPE_PREFIXES,
-  is_retired_row_type, retired_row_type_sql}`;
+  `admission::grant_chain_instant`, and (shared with slice A)
+  `registry::RETIRED_CARRIER_STEMS`, `row_type::{retired_carrier,
+  not_retired_carrier_sql}`;
   `FederationDirectory::{key_grant_held_owner, project_key_grant_row}`
   (defaulted; an out-of-tree directory needs nothing).
 - **Scores readers:** a consumer folding `scores` rows must not apply CC 2's
@@ -228,6 +233,15 @@ threat-model citations because this crate's audit story is the point.
   union key is the row's identity.
 - A v55 node and a v54 node exchange no wraps: the v55 node refuses the v54
   set and the v54 node does not admit the v55 row. The fleet moves together.
+- Witnesses I740–I746: the row shape (pure); the admission rule at the plane
+  door on memory, sqlite and postgres, one step per clause (I742); delivery
+  through the planes (I743); idempotent re-emission (I744); the upgraded node
+  (I745: v54 state, V192 replayed, booted on v55); memory never serves a held
+  set (I746).
+- **A device-add re-wrap on one node no longer reports a peer's epoch as
+  `minted_elsewhere` for a member whose holders the peer's rows never
+  reached:** a row crosses only to its recipient's node, so the node holds no
+  such epoch. The single-node report is unchanged (I188).
 
 #### Changed — a room's stream is stream-keyed (#977, CC 5.3.3.1 / CC 5.1)
 

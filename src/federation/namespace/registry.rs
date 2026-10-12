@@ -451,7 +451,7 @@ pub const RC6_RETIRED_CARRIERS_ADMITTED_UNTIL_989: &[(&str, &str, &str, &str)] =
     // `key_grant:(content|epoch|stream):v1` left with v55 slice B
     // (CIRISPersist#989): a wrap is a per-recipient `scores` row, a held SET
     // is a retired carrier (`RETIRED_CARRIER_STEMS`, never
-    // served) and a new one is refused `set_retired`.
+    // served) and a new one is refused at every door.
 ];
 
 /// v55.0.0 (CIRISPersist#989; slice A carries the same list for #141) —

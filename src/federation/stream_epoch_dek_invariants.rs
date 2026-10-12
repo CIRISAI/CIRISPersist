@@ -464,6 +464,20 @@ pub(crate) mod bodies {
         .unwrap();
         crate::federation::stream_seal::open_stream_chunk(&first, &stream, 0, None, 0, &env)
             .expect("I754: the epoch's key was not replaced");
+        // ...and the refused supply left the epoch as it was: not terminated,
+        // its chunk count unchanged (no terminator written on the way in).
+        let e0 =
+            l.ba.stream_dek_list(&stream)
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|r| r.epoch == 0)
+                .expect("I754: epoch 0 held");
+        assert!(
+            !e0.terminated,
+            "I754: a refused supply terminated the epoch"
+        );
+        assert_eq!(e0.chunk_count, 1, "I754: the epoch's chunks are untouched");
         // B's node, a member, does not author A's stream: it cannot supply
         // the next epoch's key, and its chunk is refused, writing nothing.
         // (B holds the stream once it adopts; here B's own store records

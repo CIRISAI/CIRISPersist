@@ -28,6 +28,39 @@
 
 #![cfg(test)]
 
+/// I746 (memory) — a held retired carrier (a v54 SET row, planted below the
+/// door) is never served by the since-read, under `Report`; a row planted
+/// the same way of a registered type is (the control).
+mod memory_serve {
+    use crate::federation::tier_ingest::test_support as ts;
+    use crate::federation::FederationDirectory;
+
+    #[tokio::test]
+    async fn i746_memory_never_serves_a_held_retired_carrier() {
+        let m = crate::store::memory::MemoryBackend::new();
+        let control = ts::owner_binding_attestation("i746-control", "i746-owner", "i746-node");
+        let mut set = ts::owner_binding_attestation("i746-set", "i746-owner", "i746-node");
+        set.attestation_type = crate::federation::key_grant::KEY_GRANT_EPOCH_DIMENSION.into();
+        m.plant_attestation_below_the_door(control);
+        m.plant_attestation_below_the_door(set);
+        let served: Vec<String> = m
+            .list_attestations_since(None, 100)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|s| s.attestation.attestation_id)
+            .collect();
+        assert!(
+            served.iter().any(|id| id == "i746-control"),
+            "I746 control: {served:?}"
+        );
+        assert!(
+            !served.iter().any(|id| id == "i746-set"),
+            "I746: {served:?}"
+        );
+    }
+}
+
 /// I742 — the admission rule, at the attestation plane's door, on any
 /// directory (no blob plane needed). It signs through the two-node harness,
 /// which is backend-gated.
@@ -771,10 +804,22 @@ pub(crate) mod two_nodes {
             .await
             .unwrap()
             .allowed());
-        b.backend
+        // B already HOLDS the row, unprojected (stored below the door, as a
+        // put interrupted before its projection would leave it): the
+        // re-offer is `Unchanged` and still projects the wrap.
+        seed_held(b.backend, to_b.clone()).await;
+        let outcome = b
+            .backend
             .apply_replicated_attestation(SignedAttestation { attestation: to_b })
             .await
             .unwrap_or_else(|e| panic!("{tag} I745: B admits its re-emitted row: {e}"));
+        assert!(
+            matches!(
+                outcome,
+                crate::federation::attestation_apply::ReplicatedAttestationOutcome::Unchanged
+            ),
+            "{tag} I745: {outcome:?}"
+        );
         carry_bytes(
             a,
             b,

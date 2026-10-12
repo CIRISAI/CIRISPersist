@@ -149,7 +149,9 @@ CIRISConstitution#143), so the `key_grant:{axis}:v1` SET above is retired:
   federation-tier row on every backend): the shape, a v2 wrap, self-signed, the
   sealer rule, and the recipient rule (an occurrence the one audience rule
   lets hold the cohort's key). A `withdraws` / `recants` naming one is refused.
-  A key-grant SET row is refused `set_retired`.
+  A key-grant SET row is a retired carrier: the row-type gate refuses it
+  `attestation_type_unregistered` at the plane doors, and the key-grant door
+  (`apply_replicated_key_grant`) answers `set_retired`.
 - **Projection.** Both typed attestation doors (`apply_replicated_attestation`,
   `put_attestation_synced`) project the row's wrap into the grant tables as a
   union keyed by the row's identity `(dimension, attester, attested, axis
@@ -158,7 +160,7 @@ CIRISConstitution#143), so the `key_grant:{axis}:v1` SET above is retired:
   projection.
 - **Delivery.** A row reaches its recipient's node (refers-to) when the
   cohort's audience contains that node, and no other node.
-- **Held sets** are not served (`row_type::RETIRED_ROW_TYPE_PREFIXES`); each
+- **Held sets** are not served (`registry::RETIRED_CARRIER_STEMS`); each
   node re-emits its own wraps as rows once (V192 marks every axis dirty).
 - The `KeyGrant` kind keeps its place in the hashed, appended vocabulary as the
   plane the rows project into; no pin moved.
