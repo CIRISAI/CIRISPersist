@@ -11629,7 +11629,9 @@ where
         return Ok(report);
     }
     for (_, chunk) in backend.dag_chunks_of_manifest(sha256).await? {
-        if !backend.has_blob(&chunk).await? {
+        // An eviction walk's existence probe is not an access (Codex r2 on
+        // #1065): a chunk it leaves must not look hot to the sweeper.
+        if backend.blob_head(&chunk).await?.is_none() {
             continue;
         }
         if matches!(fold(chunk).await?, BindingState::Withdrawn { .. }) {
@@ -11698,7 +11700,7 @@ where
             }
             gone.insert(child);
             work.push(child);
-            if backend.has_blob(&child).await? {
+            if backend.blob_head(&child).await?.is_some() {
                 let r = evict_one_on(backend, node, signer, &child, now).await?;
                 report.withdraws_emitted += r.withdraws_emitted;
                 if r.blob_deleted {

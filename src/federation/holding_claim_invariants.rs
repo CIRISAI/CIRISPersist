@@ -684,6 +684,12 @@ pub(crate) mod blob_bodies {
             ty: &'a str,
             envelope: Option<&'a serde_json::Value>,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>>;
+        /// The row's access-tracking columns `(access_count,
+        /// last_accessed_at)`, read below every door (Codex r2 on #1065).
+        fn access_stats<'a>(
+            &'a self,
+            sha: &'a [u8; 32],
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = (i64, String)> + Send + 'a>>;
     }
     #[cfg(feature = "sqlite")]
     impl LegacySeam for crate::store::sqlite::SqliteBackend {
@@ -699,6 +705,23 @@ pub(crate) mod blob_bodies {
                     .unwrap()
             })
         }
+        fn access_stats<'a>(
+            &'a self,
+            sha: &'a [u8; 32],
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = (i64, String)> + Send + 'a>>
+        {
+            Box::pin(async move {
+                let conn = self.conn_handle();
+                let conn = conn.lock();
+                conn.query_row(
+                    "SELECT access_count, COALESCE(last_accessed_at, '') FROM federation_blobs \
+                      WHERE sha256 = ?1",
+                    rusqlite::params![sha.to_vec()],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap()
+            })
+        }
     }
     #[cfg(feature = "postgres")]
     impl LegacySeam for crate::store::postgres::PostgresBackend {
@@ -712,6 +735,26 @@ pub(crate) mod blob_bodies {
                 self.test_seam_set_attestation_type(id, ty, envelope)
                     .await
                     .unwrap()
+            })
+        }
+        fn access_stats<'a>(
+            &'a self,
+            sha: &'a [u8; 32],
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = (i64, String)> + Send + 'a>>
+        {
+            Box::pin(async move {
+                let row = self
+                    .get_client()
+                    .await
+                    .unwrap()
+                    .query_one(
+                        "SELECT access_count::BIGINT, COALESCE(last_accessed_at::TEXT, '') \
+                           FROM cirislens.federation_blobs WHERE sha256 = $1",
+                        &[&sha.to_vec()],
+                    )
+                    .await
+                    .unwrap();
+                (row.get(0), row.get(1))
             })
         }
     }
@@ -984,6 +1027,59 @@ pub(crate) mod blob_bodies {
             2,
             "I725 one renewal, not one per pass"
         );
+    }
+
+    /// **I771** (Codex r2 on #1065) — the maintenance reads are not
+    /// accesses: an hourly re-ack pass (renewing one stale claim and finding
+    /// one fresh), the holder directory reads and the local-holder read leave
+    /// every claimed blob's `access_count` and `last_accessed_at` as they were,
+    /// so a cold blob is not kept hot against the storage-budget sweeper.
+    pub(crate) async fn i771_the_reack_scan_is_not_an_access<B>(b: &B, s: &str)
+    where
+        B: BlobStorage + FederationDirectory + Sync + LegacySeam,
+    {
+        use crate::federation::holding_claim::reack_own_claims;
+        let n = node_as(b, &format!("i771-holder-{s}"), NODE).await;
+        let now = chrono::Utc::now();
+        let mut shas = Vec::new();
+        for (i, at) in [now - chrono::Duration::hours(70), now]
+            .into_iter()
+            .enumerate()
+        {
+            let bytes = format!("i771 bytes {i} {s}").into_bytes();
+            let sha = sha256_of(&bytes);
+            b.put_blob_signing_scoped(
+                cs::FEDERATION,
+                None,
+                &sha,
+                BlobBody::Inline(bytes),
+                None,
+                &n.key,
+                &n.signer,
+                at,
+                uuid::Uuid::new_v4(),
+            )
+            .await
+            .expect("I771 a claimed blob");
+            shas.push(sha);
+        }
+        let mut before = Vec::new();
+        for sha in &shas {
+            before.push(b.access_stats(sha).await);
+        }
+        let r = reack_own_claims(b, &n.signer, now).await.unwrap();
+        assert_eq!((r.scanned, r.renewed, r.fresh), (2, 1, 1), "I771 {r:?}");
+        for sha in &shas {
+            let _ = b.list_holders(sha).await.unwrap();
+            let _ = b.list_local_holders(sha).await.unwrap();
+        }
+        for (sha, was) in shas.iter().zip(&before) {
+            assert_eq!(
+                &b.access_stats(sha).await,
+                was,
+                "I771 the re-ack and the holder reads did not touch the access columns"
+            );
+        }
     }
 
     /// **I726** — the upgrade conversion. A blob this node holds whose only
@@ -1495,6 +1591,7 @@ mod runners {
                 one!(i720_a_public_room_is_commons_tier);
                 one!(i725_the_reack_renews_what_is_held);
                 one!(i726_the_reack_converts_its_own_retired_claims);
+                one!(i771_the_reack_scan_is_not_an_access);
                 #[tokio::test]
                 async fn i723_a_commons_claim_is_discovered_across_cohorts() {
                     let Some(a) = $fresh.await else { return };

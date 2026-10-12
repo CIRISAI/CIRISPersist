@@ -685,7 +685,10 @@ where
         .map_err(|e| BlobError::Backend(format!("reack: {e}")))?;
     for sha in shas {
         report.scanned += 1;
-        if !backend.has_blob(&sha).await? {
+        // Codex r2 on #1065 — a maintenance scan reads the row HEAD, never
+        // `has_blob`, which counts as an access (access_count,
+        // last_accessed_at): an hourly re-ack must not keep cold bytes hot.
+        if backend.blob_head(&sha).await?.is_none() {
             report.not_held += 1;
             continue;
         }
@@ -739,7 +742,7 @@ where
     legacy.sort_unstable();
     legacy.dedup();
     for sha in legacy {
-        if !backend.has_blob(&sha).await?
+        if backend.blob_head(&sha).await?.is_none()
             || !super::custody_ack::custody_acks_of(backend, &me, &hex::encode(sha))
                 .await
                 .map_err(|e| BlobError::Backend(format!("reack: {e}")))?
@@ -938,7 +941,8 @@ pub async fn list_holders_of<B>(backend: &B, sha256: &[u8; 32]) -> Result<Vec<St
 where
     B: BlobStorage + FederationDirectory + Sync,
 {
-    let held_here = backend.has_blob(sha256).await?;
+    // A directory read, not an access to the bytes (Codex r2 on #1065).
+    let held_here = backend.blob_head(sha256).await?.is_some();
     let claims = holder_claims(backend, sha256, Utc::now())
         .await
         .map_err(|e| BlobError::Backend(format!("list_holders: {e}")))?;
@@ -963,7 +967,7 @@ pub async fn list_local_holders_of<B>(
 where
     B: BlobStorage + FederationDirectory + Sync,
 {
-    if !backend.has_blob(sha256).await? {
+    if backend.blob_head(sha256).await?.is_none() {
         return Ok(Vec::new());
     }
     Ok(holder_claims(backend, sha256, Utc::now())

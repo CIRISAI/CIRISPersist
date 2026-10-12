@@ -155,7 +155,8 @@ where
         return Err(refuse_missing_row(backend, at_rest_sha256, viewer_key_id).await?);
     };
     authorize_viewer_by_tier(backend, at_rest_sha256, head.crypto_tier, viewer_key_id).await?;
-    let held_here = backend.has_blob(at_rest_sha256).await?;
+    // A custody read, not an access to the bytes (Codex r2 on #1065).
+    let held_here = backend.blob_head(at_rest_sha256).await?.is_some();
     let self_node = backend.node_key_id();
     let (access, observable_elsewhere, why) = match head.crypto_tier {
         CryptoTier::InvisibleEncrypted => {
