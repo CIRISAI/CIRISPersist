@@ -5191,8 +5191,9 @@ pub async fn verify_signed_identity_occurrence(
             "identity_occurrence",
             super::malformed_row::TYPED_DIVERGES_FROM_ENVELOPE,
             format!(
-                "signed identity_occurrence: typed {what} diverges from the signed envelope (rejected)"
-        ),
+                "signed identity_occurrence: typed {what} diverges from the signed envelope \
+                 (rejected)"
+            ),
         )
     };
     if str_field(env, "identity_key_id")? != row.identity_key_id {
@@ -5336,8 +5337,9 @@ async fn verify_content_only_identity_occurrence(
             "identity_occurrence",
             super::malformed_row::TYPED_DIVERGES_FROM_ENVELOPE,
             format!(
-                "signed identity_occurrence: typed {what} diverges from the signed envelope (rejected)"
-        ),
+                "signed identity_occurrence: typed {what} diverges from the signed envelope \
+                 (rejected)"
+            ),
         )
     };
     // (1) The envelope must carry the content-KEM pubkeys — a content-only
@@ -6334,8 +6336,8 @@ pub fn check_row_column_binding(row: &super::Attestation) -> Result<(), Error> {
             "attestation",
             super::malformed_row::ENVELOPE_MEMBER_MISSING,
             format!(
-                "attestation {} carries no signed `{}` object in its envelope. The signature covers \
-                 `attestation_envelope` and NOTHING ELSE, so `attestation_id` (the row's identity), \
+                "attestation {} carries no signed `{}` object in its envelope. The signature \
+                 covers `attestation_envelope` and NOTHING ELSE, so `attestation_id` (the row's identity), \
                  `attesting_key_id` (who made the claim), `attestation_type` (the verb), \
                  `subject_key_ids` (which grants revocation authority), `attested_key_id`, \
                  `cohort_scope` and `weight` were unsigned columns a relay could rewrite while the \
@@ -6346,7 +6348,7 @@ pub fn check_row_column_binding(row: &super::Attestation) -> Result<(), Error> {
                 row.attestation_id,
                 paths::ROW,
                 ROW_MIRROR_MEMBERS,
-        ),
+            ),
         ));
     };
     let mirror: RowMirror = serde_json::from_value(raw.clone()).map_err(|e| {
@@ -6354,12 +6356,12 @@ pub fn check_row_column_binding(row: &super::Attestation) -> Result<(), Error> {
             "attestation",
             super::malformed_row::ENVELOPE_MEMBER_INVALID,
             format!(
-                "attestation {}: signed envelope `{}` is not a well-formed typed-column mirror: {e} \
-                 (members are exactly {:?} — all seven, and no others; CIRISPersist#643)",
+                "attestation {}: signed envelope `{}` is not a well-formed typed-column \
+                 mirror: {e} (members are exactly {:?} — all seven, and no others; CIRISPersist#643)",
                 row.attestation_id,
                 paths::ROW,
                 ROW_MIRROR_MEMBERS,
-        ),
+            ),
         )
     })?;
 
@@ -15167,9 +15169,9 @@ pub fn moderation_subject_digest(
                 "attestation",
                 super::malformed_row::MODERATION_SUBJECT_DIGEST,
                 format!(
-                    "moderation_subject_digest_malformed: `{MODERATION_SUBJECT_DIGEST_ENVELOPE_FIELD}` \
-                     {v}: {e} (CIRISPersist#784)"
-            ),
+                    "moderation_subject_digest_malformed: \
+                     `{MODERATION_SUBJECT_DIGEST_ENVELOPE_FIELD}` {v}: {e} (CIRISPersist#784)"
+                ),
             )
         })
 }
