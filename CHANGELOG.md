@@ -676,6 +676,13 @@ threat-model citations because this crate's audit story is the point.
   removed key, or `cap`); a chunk naming an epoch nobody supplied is the
   retryable `stream_epoch_dek_missing`. No timer forces a rotation: CC 5.1's
   time / bytes hygiene is the caller's schedule.
+- **The stream-name rule first** (Edge on a6c36c7d): a 64-hex stream id is
+  reserved for an inline blob's log (#953). The chunk door refused it, but
+  this door wrote a DEK row for a stream that could never hold a chunk. It now
+  refuses the id first, with the chunk door's own `InvalidArgument` and
+  nothing written. `stream_dek_insert` and `stream_dek_put_grants` refuse it
+  at the floor (sqlite, postgres), and a `key_grant:stream:v1` row naming
+  such an id is `malformed`. Witnesses: I770 (sqlite, postgres) and I741.
 - Refusals at the door, nothing written: `stream_epoch_dek_exists` (an
   epoch's key is never replaced; a racing second supply is caught at the
   insert), `stream_not_authored` (the stream is another writer's; it names
