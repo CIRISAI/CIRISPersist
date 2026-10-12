@@ -91,6 +91,11 @@ DELEGATED_DEFAULTS = (
     # v50.0.0 (#916) — defaulted no-op, overridden by sqlite/postgres (the
     # receive doors' re-wrap); through the double it must reach the override.
     "rewrap_own_epochs_for_device",
+    # v55.0.0 (CIRISPersist#989) — the key-grant hooks: leaf operations the
+    # sqlite / postgres backends override (the held content's author, the
+    # projection into the grant tables); neither composes a trait method.
+    "key_grant_held_owner",
+    "project_key_grant_row",
     # v50.0.0 (#926) — defaulted `Unsupported`, overridden by every backend;
     # the trust-root reads re-derive the accord quorum from it.
     "lookup_signed_community",

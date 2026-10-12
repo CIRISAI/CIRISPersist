@@ -11,7 +11,7 @@
 
 #[cfg(test)]
 pub(crate) mod bodies {
-    use crate::federation::key_grant::SignedKeyGrantSet;
+    use crate::federation::key_grant::SignedKeyGrantRow;
     use crate::federation::key_grant_invariants::two_node::{
         introduce, seed_community_everywhere, Node,
     };
@@ -96,11 +96,12 @@ pub(crate) mod bodies {
         }
     }
 
-    /// A's seal through the production door, and the epoch set it emitted.
+    /// A's seal through the production door, and the epoch-axis row it
+    /// emitted to B's node (v55.0.0, #989: one row per recipient).
     async fn seal_and_set<B>(
         l: &Ladder<B>,
         plaintext: &[u8],
-    ) -> ([u8; 32], Vec<u8>, SignedKeyGrantSet)
+    ) -> ([u8; 32], Vec<u8>, SignedKeyGrantRow)
     where
         B: BlobStorage + FederationDirectory + Sync,
     {
@@ -118,18 +119,23 @@ pub(crate) mod bodies {
             .unwrap()
             .into_iter()
             .filter(|x| {
-                x.attestation_type == crate::federation::key_grant::KEY_GRANT_EPOCH_ATTESTATION_TYPE
+                crate::federation::admission::envelope_dimension(&x.attestation_envelope)
+                    == Some(crate::federation::key_grant::KEY_GRANT_EPOCH_DIMENSION)
+                    && x.attested_key_id == l.node_b
             })
             .collect();
-        assert_eq!(emitted.len(), 1, "one epoch-axis set, signed by the NODE");
+        let to_b = emitted
+            .iter()
+            .max_by_key(|x| x.asserted_at)
+            .expect("an epoch-axis row to B, signed by the NODE");
         let Some(BlobBody::Inline(bytes)) = sa.get_blob(&sha).await.unwrap() else {
             panic!("inline")
         };
         (
             sha,
             bytes,
-            SignedKeyGrantSet {
-                attestation: emitted[0].clone(),
+            SignedKeyGrantRow {
+                attestation: to_b.clone(),
             },
         )
     }
@@ -185,8 +191,8 @@ pub(crate) mod bodies {
             .engine_b
             .apply_replicated_key_grant(set)
             .await
-            .expect("B admits A's set");
-        assert!(admission.wraps_written >= 1);
+            .expect("B admits A's row");
+        assert!(admission.projected, "{admission:?}");
         l.engine_b
             .adopt_sealed_blob(
                 &bytes,

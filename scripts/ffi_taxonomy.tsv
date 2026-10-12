@@ -568,6 +568,7 @@ Engine	register_federation_key	deontic
 Engine	register_occurrence	ontological	
 Engine	register_public_key	deontic	
 Engine	register_self_federation_key	ontological	
+Engine	register_stream_epoch_dek	deontic	
 Engine	rematerialize_role_withdrawals	deontic
 Engine	remove_moderator	deontic	
 Engine	remove_peer_record	deontic	

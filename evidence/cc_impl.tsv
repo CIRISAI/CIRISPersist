@@ -161,6 +161,11 @@ decimal_id	claim_id	repo	path#symbol	crate@version
 3.3.1	CLM-consent-scope-is-envelope-member	CIRISPersist	src/federation/consent.rs#named_scopes	ciris-persist@54.1.0
 3.3.1	CLM-consent-scope-is-envelope-member	CIRISPersist	src/federation/consent_scope.rs#check_consent_scope_tokens	ciris-persist@54.1.0
 3.3.1	CLM-consent-scope-is-envelope-member	CIRISPersist	src/federation/admission.rs#check_capacity_consent_admission	ciris-persist@54.1.0
+3.3.2	CLM-key-grant-rows	CIRISPersist	src/federation/key_grant.rs#check_key_grant_row_admission	ciris-persist@54.1.0
+3.3.2	CLM-key-grant-rows	CIRISPersist	src/federation/key_grant.rs#KeyGrantRow::from_attestation	ciris-persist@54.1.0
+3.3.2	CLM-key-grant-rows	CIRISPersist	src/federation/key_grant.rs#project_key_grant_row	ciris-persist@54.1.0
+5.3.3.2.5	CLM-one-chunk-seal	CIRISPersist	src/federation/chunk_dag_cascade.rs#register_stream_epoch_dek	ciris-persist@54.1.0
+5.3.3.2.5	CLM-one-chunk-seal	CIRISPersist	src/federation/chunk_dag_cascade.rs#stream_epoch_verdict	ciris-persist@54.1.0
 3.4.5	CLM-config-self-or-owner-gate	CIRISPersist	src/federation/admission.rs#check_config_self_or_owner_admission	ciris-persist@54.1.0
 3.4.5.1	CLM-self-report-route	CIRISPersist	src/federation/admission.rs#check_config_sensitive_leaf_floor	ciris-persist@54.1.0
 3.4.5.1	CLM-self-report-route	CIRISPersist	src/federation/admission.rs#check_config_renewal_supersedes	ciris-persist@54.1.0

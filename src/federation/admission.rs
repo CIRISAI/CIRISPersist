@@ -794,12 +794,9 @@ pub const STAGED_GOVERNED_FAMILIES: &[(&str, &str)] = &[
 /// nothing the registry carries, and the cut that builds the door deletes the
 /// line.
 pub const REGISTERED_FAMILIES_HELD_SHUT: &[(&str, &str)] = &[
-    // CC 3.3.2 rc7 (CIRISConstitution#143): `key_grant:{axis}:v1` is one
-    // `scores` row per recipient, "sealer-only". rc6 gated the `key_grant:`
-    // stem ("carrier row type, never a dimension"), so no node admitted it as a
-    // dimension; rc7 drops that gate. The per-recipient row door, with the
-    // sealer rule, is v55 slice B (CIRISPersist#989), which deletes this line.
-    ("key_grant:", "CIRISPersist#989"),
+    // `key_grant:` was held here by the rc7 re-vendor (A0) until v55 slice B
+    // built its door: the per-recipient row with CC 3.3.2's sealer rule,
+    // `key_grant::check_key_grant_row_admission` (CIRISPersist#989).
     // CC 3.1.3.2 rc7: three new `membership:{stage}` leaves — widening and
     // removal "cosigned under the group's consensus_protocol", resignation
     // "the leaving member". rc6's closed vocabulary refused all three;
@@ -2390,6 +2387,19 @@ impl std::fmt::Display for CohortStandingRefusal {
     }
 }
 
+/// v55.0.0 (CIRISPersist#989, CC 3.3.2 rc7) — AV-84's second exception: a
+/// `key_grant:{axis}:v1` row is placed at its content's scope and names its
+/// RECIPIENT occurrence as `attested_key_id` ("`attested_key_id` is the
+/// recipient occurrence … placed at the content's scope"). The recipient is
+/// not a third party the row speaks ABOUT: the key-grant rule
+/// (`key_grant::check_key_grant_row_admission`) requires it to be an
+/// occurrence the cohort's audience rule lets hold the key, and the row
+/// reaches that recipient's node alone. Subjects stay refused: a key-grant row
+/// names none.
+fn names_its_key_grant_recipient(row: &super::Attestation) -> bool {
+    super::key_grant::is_key_grant_row(row) && row.subject_key_ids.is_empty()
+}
+
 /// The ONE standing comparison, parameterised over party resolution: refuse
 /// iff any named party RESOLVES differently from the producer. The string
 /// form ([`check_promotion_cohort_standing`], resolution = identity fn) and
@@ -2409,7 +2419,10 @@ fn cohort_standing_core(
             reason,
         })
     };
-    if row.attested_key_id != producer && resolve(&row.attested_key_id) != producer_identity {
+    if row.attested_key_id != producer
+        && resolve(&row.attested_key_id) != producer_identity
+        && !names_its_key_grant_recipient(row)
+    {
         return refuse(CohortStandingRefusal::AttestedParty, &row.attested_key_id);
     }
     // v52.0.0 (CIRISPersist#955) — AV-84's one exception: a membership
@@ -2476,6 +2489,7 @@ pub async fn check_cohort_standing_resolved(
         })
     };
     if row.attested_key_id != producer
+        && !names_its_key_grant_recipient(row)
         && admission_identity_for_writer(directory, &row.attested_key_id).await?
             != producer_identity
     {
@@ -9062,6 +9076,15 @@ pub async fn check_withdraws_admission_at(
         let Some(target) = directory.get_attestation(target_id).await? else {
             return Ok(None);
         };
+        // v55.0.0 (#989, CC 3.3.2 rc7) — "a `withdraws` or `recants` naming a
+        // `key_grant` row is refused", the sealer's own recants included: once
+        // shared, always shared; forward secrecy is by rotation.
+        if crate::federation::key_grant::is_key_grant_row(&target) {
+            return Err(Error::InvalidArgument(format!(
+                "recants names a key_grant row ({target_id}) — a shared key cannot be \
+                 retroactively un-shared (CC 3.3.2); rotate the epoch instead"
+            )));
+        }
         if !crate::federation::precedence::retraction_entitled(row, &target) {
             return Err(Error::InvalidArgument(format!(
                 "recants_not_admitted: {} is not the attester of {target_id} — only the original \
@@ -9094,9 +9117,7 @@ pub async fn check_withdraws_admission_at(
             .attestation_envelope
             .get("references_attestation_type")
             .and_then(|v| v.as_str())
-            .is_some_and(|t| {
-                t.starts_with(crate::federation::key_grant::KEY_GRANT_ATTESTATION_TYPE_PREFIX)
-            })
+            .is_some_and(crate::federation::key_grant::is_retired_key_grant_set_type)
         {
             return Err(Error::InvalidArgument(
                 "withdraws declares a key_grant target — a shared key cannot be retroactively \
@@ -9114,14 +9135,16 @@ pub async fn check_withdraws_admission_at(
     // and that nothing enforces (the fail-silent class). The honest verdict
     // is at the gate. Forward secrecy on this axis is ROTATION (§15): bump
     // the epoch, and the next seal is unreadable to the removed party.
-    if target
-        .attestation_type
-        .starts_with(crate::federation::key_grant::KEY_GRANT_ATTESTATION_TYPE_PREFIX)
+    // v55.0.0 (#989, CC 3.3.2 rc7) — the per-recipient `scores` row on
+    // `key_grant:{axis}:v1` ("a `withdraws` or `recants` naming a `key_grant`
+    // row is refused"), and a held retired SET alike.
+    if crate::federation::key_grant::is_key_grant_row(&target)
+        || crate::federation::key_grant::is_retired_key_grant_set_type(&target.attestation_type)
     {
         return Err(Error::InvalidArgument(format!(
             "withdraws names a key_grant row ({}) — a shared key cannot be retroactively \
              un-shared (CC 3); rotate the epoch instead (BLOB_REPLICATION.md §15)",
-            target.attestation_type
+            envelope_dimension(&target.attestation_envelope).unwrap_or(&target.attestation_type)
         )));
     }
     // Scope discriminator: a `holds_bytes:sha256:*` target is a
@@ -15127,7 +15150,7 @@ pub async fn check_consent_for_key_admission(
             directory,
             for_key,
             &row.attesting_key_id,
-            chrono::Utc::now(),
+            grant_chain_instant(row),
         )
         .await?
     {
@@ -15424,6 +15447,8 @@ pub async fn check_node_agency_admission(
 ///
 /// `owner == issuer` is NOT a reach (no edge carries a scope to the self); the
 /// owner's own issuance is the caller's other arm.
+///
+/// The `now` every grant-issuing door passes is [`grant_chain_instant`].
 pub async fn holds_grant_delegation(
     directory: &dyn super::FederationDirectory,
     owner: &str,
@@ -15449,6 +15474,25 @@ pub async fn holds_grant_delegation(
     )
     .await?
     .hit_target)
+}
+
+/// v55.0.0 (CIRISPersist#989; the seam for CIRISPersist#1049) — **the instant
+/// a grant row's `grant` delegation chain is judged at**: a `key_grant:{axis}`
+/// row's issuer chain ([`holds_grant_delegation`] under
+/// `key_grant::check_sealer`, and the pending projection) and a consent row's
+/// `for_key_id` chain.
+///
+/// Today it is this node's clock, whatever the row: v54.0.0 kept "now"
+/// because judging at the signed `asserted_at` with no past bound lets a
+/// withdrawn delegate backdate a grant into its old window (#1049). The
+/// bound is W = 72 h, refusal `asserted_at_stale`, on CC rc8 (untagged), so
+/// it ships with the rc8 vendor. That cut changes this one function to the
+/// row's `asserted_at` and puts the freshness refusal in front of every
+/// caller; no caller passes its own instant.
+#[must_use]
+pub fn grant_chain_instant(row: &super::Attestation) -> chrono::DateTime<chrono::Utc> {
+    let _ = row;
+    chrono::Utc::now()
 }
 
 /// v54.0.0 (CIRISPersist#1031, CC 4.1.1) — **the cycle-closing `delegates_to`
@@ -16505,6 +16549,11 @@ pub async fn check_reserved_prefix_admission(
     // CC 3.3.10 (CIRISPersist#753) — a `settlement:*` row links an action to
     // its off-stack settlement and carries no payment-processor identifier.
     check_settlement_admission(row)?;
+
+    // CC 3.3.2 rc7 (CIRISPersist#989) — a `key_grant:{axis}:v1` row is one
+    // wrap to one recipient, sealer-only, at the content's scope; the retired
+    // rc6 SET is refused whatever the row-type switch says.
+    super::key_grant::check_key_grant_row_admission(directory, row).await?;
 
     // v37.0.0 (CIRISPersist#733) — **AN `accord:*` ROW NAMES ITS OWN ACCORD.**
     //
@@ -19436,10 +19485,10 @@ mod tests {
         // the gate is `check_settlement_admission` (no payment-processor
         // identifier).
         "settlement:",
-        // rc7 re-vendor (v55.0.0, CIRISPersist#753) — "sealer-only" (CC 3.3.2).
-        // Held shut: `REGISTERED_FAMILIES_HELD_SHUT` refuses every dimension
-        // under the stem until v55 slice B builds the per-recipient row door
-        // (CIRISPersist#989).
+        // rc7 re-vendor (v55.0.0, CIRISPersist#753) — "sealer-only" (CC 3.3.2):
+        // the minter (epoch) or a key that speaks for the owner (content,
+        // stream), which no identity type expresses. The gate is
+        // `key_grant::check_key_grant_row_admission` (CIRISPersist#989).
         "key_grant:",
     ];
 
@@ -19847,6 +19896,10 @@ mod tests {
             "key:record:v1",
             "custody:ack:v1",
             "key_granted:v1",
+            // v55 slice B (#989) built the key-grant row door.
+            "key_grant:epoch:v1",
+            "key_grant:content:v1",
+            "key_grant:stream:v1",
         ] {
             check_registered_family_not_held(open)
                 .unwrap_or_else(|e| panic!("I702 {open:?} is not held: {e}"));

@@ -64,7 +64,6 @@
 pub(crate) mod bodies {
     use crate::federation::blob_tombstone::{binding_state, BindingState};
     use crate::federation::epoch_minter_invariants::bodies::Pick;
-    use crate::federation::key_grant::SignedKeyGrantSet;
     use crate::federation::nested_manifest_invariants::bodies::{pair, Pair};
     use crate::federation::tier_ingest::test_support as ts;
     use crate::federation::types::attestation_type;
@@ -151,7 +150,7 @@ pub(crate) mod bodies {
             .manifest_sha256
     }
 
-    /// B receives A's DAG the way a host delivers it — A's key_grant sets, the
+    /// B receives A's DAG the way a host delivers it — A's key-grant rows, the
     /// sealed manifest, every chunk at its position, the promote. Returns the
     /// chunk addresses in seq order (terminator last).
     async fn deliver<B>(p: &Pair<B>, stream: &str, root: &[u8; 32]) -> Vec<(u64, [u8; 32])>
@@ -159,18 +158,17 @@ pub(crate) mod bodies {
         B: BlobStorage + FederationDirectory + Sync + 'static,
     {
         p.a.emit_pending_key_grants().await.unwrap();
-        for set in
-            p.sa.list_attestations_by(&p.key_a)
-                .await
-                .unwrap()
-                .into_iter()
-                .filter(|x| x.attestation_type.starts_with("key_grant:"))
+        // v55.0.0 (#989) — the rows A's plane delivers to B.
+        for set in crate::federation::key_grant_invariants::two_node::key_grant_rows_for(
+            p.sa.as_ref(),
+            &p.key_a,
+            &p.key_b,
+        )
+        .await
         {
-            // A set B already applied answers as a duplicate; the delivery is
+            // A row B already applied answers as a duplicate; the delivery is
             // what matters, not the count.
-            let _ =
-                p.b.apply_replicated_key_grant(SignedKeyGrantSet { attestation: set })
-                    .await;
+            let _ = p.b.apply_replicated_key_grant(set).await;
         }
         p.b.adopt_sealed_blob(
             &inline(p.sa.as_ref(), root).await,

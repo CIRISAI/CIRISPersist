@@ -429,9 +429,11 @@ pub fn row_types() -> Option<&'static RowTypes> {
 /// every such row `attestation_type_unregistered`, so the v55 re-vendor
 /// (CIRISPersist#753, slice A0) keeps them admitted here, with the rc6
 /// carrier shape still enforced, until v55 slices A (holding) and B (grants)
-/// move the emitters onto rc7's grammar. Slice B deletes this const.
+/// move the emitters onto rc7's grammar. Slice B (CIRISPersist#989) removed
+/// the `key_grant` line; slice A removes `holds_bytes`'s, and whichever of the
+/// two merges last deletes the const.
 ///
-/// It admits exactly the two rc6 patterns and nothing else: the vendored
+/// It admitted exactly the two rc6 patterns and nothing else: the vendored
 /// carriers are read first, then these, by the same whole-string,
 /// re-anchored match ([`carrier_row_type`], [`carriers`]).
 /// `tests::the_rc6_carrier_exception_admits_only_the_retired_carriers`
@@ -446,12 +448,27 @@ pub const RC6_RETIRED_CARRIERS_ADMITTED_UNTIL_989: &[(&str, &str, &str, &str)] =
         "holds_bytes:sha256:0a1b2c3d",
         "holds_bytes:sha256:{prefix}",
     ),
-    (
-        "key_grant",
-        "^key_grant:(content|epoch|stream):v1$",
-        "key_grant:epoch:v1",
-        "key_grant:{axis}:{version}",
-    ),
+    // `key_grant:(content|epoch|stream):v1` left with v55 slice B
+    // (CIRISPersist#989): a wrap is a per-recipient `scores` row, a held SET
+    // is a retired carrier (`RETIRED_CARRIER_STEMS`, never
+    // served) and a new one is refused `set_retired`.
+];
+
+/// v55.0.0 (CIRISPersist#989; slice A carries the same list for #141) —
+/// **retired carriers** `(type stem, tracking note)`: rc6 carriers CC rc7
+/// retired whose held rows a node keeps and must never serve. A new row of one
+/// is refused `attestation_type_unregistered` and a held one is left out of
+/// every serve read, under `Report` as under `Enforce`
+/// (`row_type::retired_carrier`, `row_type::not_retired_carrier_sql`). A
+/// PREFIX match, so each entry names a whole type: the filter is class-blind
+/// and a bare `key_grant:` stem would also name a future type sharing it.
+pub const RETIRED_CARRIER_STEMS: &[(&str, &str)] = &[
+    // The rc6 key-grant SET, retired by CC 2.4 rc7 (CIRISConstitution#143): a
+    // wrap is a per-recipient `scores` row on `key_grant:{axis}:v1`. Each node
+    // re-emits its own wraps as rows (operator ruling Q3, V192).
+    ("key_grant:content:v1", "CIRISPersist#989"),
+    ("key_grant:epoch:v1", "CIRISPersist#989"),
+    ("key_grant:stream:v1", "CIRISPersist#989"),
 ];
 
 /// Every carrier row type the row-type gate admits: the vendored cut's
@@ -1088,8 +1105,9 @@ mod tests {
         }
         assert_eq!(
             excepted,
-            ["holds_bytes:sha256:0a1b2c3d", "key_grant:epoch:v1"],
-            "the vectors persist departs from are exactly the retired rc6 carriers"
+            ["holds_bytes:sha256:0a1b2c3d"],
+            "the vectors persist departs from are exactly the retired rc6 carriers still \
+             excepted (key_grant left with slice B, #989)"
         );
         assert!(rtv
             .iter()
@@ -1103,22 +1121,24 @@ mod tests {
     #[test]
     fn the_rc6_carrier_exception_admits_only_the_retired_carriers() {
         let kinds: Vec<&str> = carriers().iter().map(|c| c.kind.as_str()).collect();
-        assert_eq!(kinds, ["holds_bytes", "key_grant"], "I700");
+        assert_eq!(
+            kinds,
+            ["holds_bytes"],
+            "I700 (key_grant left with slice B, #989)"
+        );
         for (kind, pattern, sample, _) in RC6_RETIRED_CARRIERS_ADMITTED_UNTIL_989 {
             let c = carrier_row_type(sample).expect("I700: the sample is admitted");
             assert_eq!(c.kind, *kind);
             assert_eq!(c.pattern, *pattern);
         }
-        for t in [
-            "holds_bytes:sha256:0a1b2c3d",
-            "holds_bytes:sha256:ffffffff",
-            "key_grant:content:v1",
-            "key_grant:epoch:v1",
-            "key_grant:stream:v1",
-        ] {
+        for t in ["holds_bytes:sha256:0a1b2c3d", "holds_bytes:sha256:ffffffff"] {
             assert!(is_registered_carrier_row_type(t), "I700 admits {t:?}");
         }
         for t in [
+            // v55 slice B (#989) — the key-grant SET is no carrier any more.
+            "key_grant:content:v1",
+            "key_grant:epoch:v1",
+            "key_grant:stream:v1",
             "holds_bytes:sha256:0a1b2c3",
             "holds_bytes:sha256:0a1b2c3d0",
             "holds_bytes:sha256:0A1B2C3D",

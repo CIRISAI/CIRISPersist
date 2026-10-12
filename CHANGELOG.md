@@ -87,6 +87,242 @@ threat-model citations because this crate's audit story is the point.
 - No new error variant, no new exhaustive enum variant, no FFI or `.pyi`
   surface change, no migration.
 
+### Slice B — key grants as rows (#989, CC 3.3.2 rc7, CIRISConstitution#143)
+
+#### Changed — one `scores` row per recipient replaces the key-grant SET
+
+- **The row.** A wrap of one data-encryption key to one recipient is one
+  `scores` row on `key_grant:content:v1` / `key_grant:epoch:v1` /
+  `key_grant:stream:v1` (`key_grant::KeyGrantRow`): `attesting_key_id` the
+  sealer (the epoch's minter; a key that speaks for the owner on the content
+  and stream axes), `attested_key_id` the RECIPIENT occurrence, `score` and
+  `confidence` 1.0, no subject, no expiry, at the content's own `cohort_scope`
+  (`community` on the epoch axis). Envelope members, each present only on the
+  axis that uses it: `axis`, `at_rest_sha256`, `owner_key_id`,
+  `community_key_id`, `minter_key_id`, `epoch`, `stream_id`, `wrap_algorithm`
+  (v2 only), `wrapped_dek`, plus the CC 2 target (`family_key_id` on a family
+  row, `community_id` on a community row and on every epoch row). The digest
+  is a member and never an `evidence_refs` citation, so the CC 2.3 bytes-plane
+  fold cannot read a wrap as a content binding.
+- **The admission rule opens the dimension.** A0 held `key_grant:` shut
+  (`registered_family_held_shut`); the line is deleted and every
+  federation-tier row now meets `key_grant::check_key_grant_row_admission`
+  (from `check_reserved_prefix_admission`, on memory, sqlite and postgres):
+  the shape (`KeyGrantRow::from_attestation`: any departure is `malformed`, a
+  `key_grant:` dimension on a composer included); a v2 wrap
+  (`wrap_algorithm_not_v2`); self-signed (`signer_not_self`); the SEALER rule
+  (`key_grant::check_sealer`: epoch, the minter or a holder of a live `grant`
+  delegation from it (`signer_not_minter`) and an active member occurrence of
+  the community at `asserted_at` (`signer_not_active_member`); content and
+  stream, where this node holds the blob or stream a key that speaks for its
+  author / owner (`signer_not_author` / `signer_not_stream_owner`), then at
+  `self` a key that speaks for the owner (`federation_signer_not_acting_for`,
+  plane `key_grant`, retryable), at a group scope the write gate's membership
+  check); and the RECIPIENT rule (`key_grant::recipient_may_hold_key`: an
+  active occurrence of the owner / a family member / a member on the room's
+  authorized roster that the one audience rule, #963, lets hold the cohort's
+  key; `recipient_not_in_audience`, retryable).
+- **The #1049 seam.** The `grant` delegation chain of a key-grant row (and of
+  a consent row's `for_key_id`) is judged at
+  `admission::grant_chain_instant(row)`, which is this node's clock today.
+  CIRISPersist#1049 (W = 72 h, `asserted_at_stale`, CC rc8, untagged) changes
+  that one function to the row's signed `asserted_at` and adds the freshness
+  refusal in front of its callers. Not implemented here.
+- **Never withdrawn.** A `withdraws` or a `recants` naming a key-grant row is
+  refused, the sealer's own `recants` included (CC 3.3.2).
+- **Union by identity.** The projection is keyed by the row's identity
+  `(dimension, attester, attested, axis identity)`; CC 2's latest-wins over
+  `(attester, dimension, attested)` does not apply. A later row with the same
+  identity (a re-wrap) admits and changes nothing.
+- **Projection on both typed doors.** `apply_replicated_attestation` and
+  `put_attestation_synced` project a key-grant row's wrap into the grant
+  tables (the backend hook `FederationDirectory::project_key_grant_row`, run
+  on insert and on a re-offer, so a crash between the two transactions is
+  repaired). A content-axis row whose bytes have not arrived waits in the V146
+  pending index and is projected by the adopt, as before.
+  `apply_replicated_key_grant` remains as the door that reports the
+  projection.
+- **Delivery (CC 6.1.5.3).** `replication_audience::may_receive` delivers a
+  key-grant row to its recipient's node (refers-to) when the cohort's audience
+  contains that node, and to no other node. A set used to reach the whole
+  cohort audience with every wrap in it.
+- **Emission.** The local grant tables stay the record (operator ruling Q3).
+  `key_grant::plan_key_grant_emission` emits one row per wrap the node holds
+  for an axis that it has not emitted as a row yet (re-emission is idempotent),
+  withholds a wrap whose recipient the audience rule no longer admits, defers
+  one whose recipient has no key record on this node yet (the axis stays
+  dirty), and emits nothing when the node can no longer sign as the axis's
+  sealer.
+- **The legacy re-emit (V192).** V192 marks every emission axis dirty and
+  drops the pending index entries the retired sets left. On the first boot
+  after it, the pending sweep re-emits every wrap the node holds as sealer or
+  minter as a per-recipient row, each at a fresh signed instant (so each
+  recipient is re-checked against the audience at that instant, CC 4.4.3.2.2).
+  The held legacy set rows stay where they are.
+- **The retired SET.** A new set row (`attestation_type` under `key_grant:`)
+  is refused `set_retired` at every door, whatever `ROW_TYPE_ENFORCEMENT` says,
+  and held set rows are never served: `row_type::RETIRED_ROW_TYPE_PREFIXES`
+  joins the serve filter of `list_attestations_since` and
+  `list_attestation_log` on every backend under `Report` as under `Enforce`.
+  The `key_grant` line of A0's `RC6_RETIRED_CARRIERS_ADMITTED_UNTIL_989` is
+  deleted (slice A deletes `holds_bytes`'s; whichever merges last deletes the
+  const); I700 and I701 follow.
+- **Readers moved to the rows:** the epoch key transport and the community
+  DEK epochs (rows on `key_grant:epoch:v1`, projected per recipient),
+  `minter_of_blob` (the content row's sealer), the stream read path's sealer
+  filter, the withdraws gate, the serve gate, consent's chain instant, and
+  the replication pull path (a key-grant row through
+  `apply_replicated_attestation` needs no routing).
+- `family_rules`: `key_grant:` moves from `NOT_A_FAMILY_RULE` to the
+  persist-ruled families. Evidence: `CLM-key-grant-rows` (CC 3.3.2) cites
+  `check_key_grant_row_admission`, `KeyGrantRow::from_attestation` and
+  `project_key_grant_row`.
+- Migration **V192** (`key_grant_rows_reemit`, data only), sqlite and
+  postgres.
+
+#### Adoption — what Edge and Server must handle (#989)
+
+- **Removed:** `key_grant::SignedKeyGrantSet` (now `SignedKeyGrantRow`, the
+  same `{"attestation": {…}}` JSON shape); `KeyGrantSet::{envelope_extra,
+  from_attestation, emit_input}` (a `KeyGrantSet` is a builder only, with
+  `rows()`); `KEY_GRANT_ATTESTATION_TYPE_PREFIX`,
+  `KEY_GRANT_{EPOCH,CONTENT,STREAM}_ATTESTATION_TYPE` (now
+  `KEY_GRANT_DIMENSION_PREFIX`, `KEY_GRANT_{EPOCH,CONTENT,STREAM}_DIMENSION`);
+  `KEY_GRANT_ENVELOPE_KIND`; `KeyGrantAxis::attestation_type()` (now
+  `dimension()`).
+- **Changed:** `KeyGrantAdmission` is `{axis, recipient_key_id, attestation,
+  projected, pending}` (was `wraps_offered`, `wraps_written`).
+  `Engine::emit_key_grant` returns `Option<KeyGrantEmission>` and PyO3
+  `emit_key_grant(axis_json)` returns the `KeyGrantEmission` JSON
+  (`axis`, `attestation_ids`, `already_emitted`, `withheld`, `deferred`,
+  `sealer_refused`) or `null`, where it returned one attestation id.
+  `emit_*_key_grant_with_local_signer` return `Option<KeyGrantEmission>`.
+  `emit_pending_key_grants` (Engine and PyO3) counts ROWS. `may_issue_grant_for`
+  takes the chain instant.
+- **Routing.** A key-grant row is `attestation_type = "scores"` with a
+  `key_grant:` dimension. A pull path that routed `attestation_type`
+  `key_grant:*` to `apply_replicated_key_grant` now sees `scores` rows and
+  may hand them to `apply_replicated_attestation`, which projects; or route by
+  `dimension` to `apply_replicated_key_grant`, which also reports the
+  projection.
+- **New refusal reasons** on `federation_key_grant_refused`
+  (`Error::KeyGrantRefused`, Python `ValueError`): `recipient_not_in_audience`
+  (retryable: the occurrence, roster or allow list may not have landed) and
+  `set_retired` (terminal). The self-axis owner leg answers
+  `federation_signer_not_acting_for` (`Error::SignerDoesNotActFor`, plane
+  `key_grant`, retryable). New exhaustive enum variants:
+  `KeyGrantRefusalReason::{RecipientNotInAudience, SetRetired}`.
+- **New public items:** `KeyGrantRow`, `SignedKeyGrantRow`,
+  `KeyGrantEmission`, `KeyGrantEmissionPlan`, `KeyGrantProjection`,
+  `check_key_grant_row_admission`, `check_sealer`, `recipient_may_hold_key`,
+  `is_key_grant_row`, `key_grant_dimension_of`,
+  `is_retired_key_grant_set_type`, `plan_key_grant_emission`,
+  `key_grant_row_held`, `emit_key_grant_axis_with`,
+  `emit_dirty_with_local_signer`, `project_key_grant_row`,
+  `admission::grant_chain_instant`, `row_type::{RETIRED_ROW_TYPE_PREFIXES,
+  is_retired_row_type, retired_row_type_sql}`;
+  `FederationDirectory::{key_grant_held_owner, project_key_grant_row}`
+  (defaulted; an out-of-tree directory needs nothing).
+- **Scores readers:** a consumer folding `scores` rows must not apply CC 2's
+  latest-wins over `(attester, dimension, attested)` to `key_grant:*`; the
+  union key is the row's identity.
+- A v55 node and a v54 node exchange no wraps: the v55 node refuses the v54
+  set and the v54 node does not admit the v55 row. The fleet moves together.
+
+#### Changed — a room's stream is stream-keyed (#977, CC 5.3.3.1 / CC 5.1)
+
+- CC rc7 5.3.3.1 binds per-chunk sealing to SFrame with `KID = stream_id` and
+  keys per epoch, and CC 5.1 keys an N>1 stream per `(stream_id, epoch)`,
+  carried by the flat per-epoch key-grant cascade. A community chunk DAG was
+  sealed per chunk under the community epoch DEK with a random nonce. Now a
+  `community` / `affiliations` stream takes the #969 path: one DEK per
+  `(stream_id, epoch)`, the STREAM nonce, a terminator per epoch, the epoch's
+  DEK wrapped to the room's audience (the community cascade's own roster fold
+  and audience rule, `community_dek::orchestrate::room_targets`) and emitted
+  as `key_grant:stream:v1` rows at the room's scope. A removal or the nonce
+  cap rolls the epoch. The chunks are recorded at `CommunityDek` with NO
+  community binding; the manifest is still sealed under the community epoch
+  DEK, with its binding, as before.
+- **Retention (operator ruling).** A room's retention bound covers every
+  byte sealed for the room. A room stream epoch records `room_epoch`, the
+  writer's community epoch at its mint, and the community retention sweep
+  (`sweep_rotated_epochs`) evicts its chunks under the same
+  `retain_past_epochs` rule as that community epoch's own objects
+  (`BlobStorage::stream_dek_evict_room_chunks`; the epoch row stays, stamped
+  `evicted_at`).
+- A stream that already holds per-chunk-bound community chunks (written
+  before v55) keeps sealing them that way to its seal (one DAG never mixes the
+  two), and every legacy community DAG reads as before.
+- Readers: `open_stream_chunk_row_for_viewer` takes the stream epoch's key for
+  a room chunk that a v4 manifest names stream-keyed (or that carries no
+  binding, on a live read); `read_stream_chunk_as` authorizes such a chunk in
+  the opener; the seal door terminates a room stream's epochs and wraps them
+  at the seal; `adopt_sealed_chunks` admits a room chunk whose provenance
+  names its community and no community epoch (no binding written).
+
+#### Added — a stream epoch's DEK may be the caller's (#981, CC 5.3.3.2.5)
+
+- **`register_stream_epoch_dek`** (`chunk_dag_cascade::orchestrate`,
+  `Engine::register_stream_epoch_dek`, PyO3
+  `register_stream_epoch_dek(cohort_scope, group_key_id, stream_id, epoch,
+  dek_b64, keep, aad_b64=None) -> str`): the caller supplies the
+  `(stream_id, epoch)` DEK (the MLS exporter secret of a live call), so the
+  live and the stored stream are one key. The door closes the stream's open
+  epoch with its terminator, self-retains the DEK under the content master
+  (never derivable from persist state alone), marks the epoch `supplied`, and
+  when `keep` (the stream is recorded, or `history_on_join: full`) wraps it to
+  the stream's audience and emits the `key_grant:stream:v1` rows. An unkept
+  stream is wrapped to NOBODY and has no row, so MLS forward secrecy survives.
+  Chunks then go through `put_blob_chunk_scoped` at that epoch and read
+  through the same doors as any stream-keyed chunk. Self, family and room
+  streams alike.
+- **Persist never mints or rolls a supplied stream's epoch.** A removal from
+  the audience of a kept epoch, or the nonce cap, refuses the next chunk with
+  the retryable `stream_epoch_rotation_required` (reason `removal`, naming the
+  removed key, or `cap`); a chunk naming an epoch nobody supplied is the
+  retryable `stream_epoch_dek_missing`. No timer forces a rotation: CC 5.1's
+  time / bytes hygiene is the caller's schedule.
+- Refusals at the door, nothing written: `stream_epoch_dek_exists` (an
+  epoch's key is never replaced; a racing second supply is caught at the
+  insert), `stream_not_authored` (the stream is another writer's; it names
+  the stream and never the writer, the I41 rule a foreign append already
+  follows), `InvalidArgument` (a plaintext tier, an epoch below the newest, a
+  per-chunk-keyed stream, another cohort).
+- Retroactive re-key walks skip an unkept epoch.
+- Migration **V193** (`stream_epoch_dek_supplied_and_rooms`), sqlite and
+  postgres: `federation_stream_deks` gains `supplied`, `keep`, `room_epoch`
+  and `evicted_at`, and both
+  stream-DEK tables admit the room scopes (sqlite rebuilds them in place under
+  their final names; every existing row is a minted, kept epoch).
+- Evidence: `CLM-one-chunk-seal` (CC 5.3.3.2.5) cites
+  `register_stream_epoch_dek` and `stream_epoch_verdict`.
+- Witnesses I750–I757 (sqlite, postgres; I756 pure).
+
+#### Adoption — what Edge must handle (#977, #981)
+
+- **Room chunk DAGs.** A new `community` / `affiliations` stream is
+  stream-keyed: `sealed_dag_readiness` answers `chunk_keys: "stream_epoch"`
+  for it and names missing keys per epoch; its chunks need the
+  `key_grant:stream:v1` row (at the room's scope) as well as the manifest's
+  `key_grant:epoch:v1` row; `PutChunkScopedResult.epoch` is `None` for such a
+  chunk (it was the community epoch). To adopt such a chunk, pass a provenance
+  with `tier = community_dek`, the community, and `epoch = None`; the chunk
+  adopt's own `epoch` argument is the stream epoch.
+- **New door:** `register_stream_epoch_dek` (above).
+- **New exhaustive enum variants:** `BlobError::{StreamEpochRotationRequired
+  {stream_id, epoch, reason, removed_key_id}, StreamEpochDekExists {stream_id,
+  epoch}, StreamNotAuthored {stream_id}, StreamEpochDekMissing
+  {stream_id, epoch}}`; new enum `blobs::StreamRotationReason {Removal, Cap}`
+  (`removal` / `cap`). `StreamDekRecord` gains `supplied`, `keep` and
+  `room_epoch`; `BlobStorage` gains `stream_dek_evict_room_chunks` (a required
+  method: an out-of-tree `BlobStorage` must implement it).
+- **Python:** each is a `ValueError` whose message is the kind token then JSON
+  with `retryable`: `blob_stream_epoch_rotation_required`
+  (`{stream_id, epoch, reason, removed_key_id, retryable: true}`),
+  `blob_stream_epoch_dek_missing` (`retryable: true`),
+  `blob_stream_epoch_dek_exists` and `blob_stream_not_authored`
+  (`retryable: false`).
+
 ## [54.1.0] - 2026-10-10
 
 ### Added — the generic steward purge door (#1046, CIRISConstitution#165, CSD-108)

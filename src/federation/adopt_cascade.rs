@@ -321,7 +321,20 @@ where
     if shaped.is_empty() {
         return Ok(answers.into_iter().map(|a| a.expect("answered")).collect());
     }
-    let (floor, binding) = resolve_provenance(backend, ctx.our_key_id, provenance).await?;
+    // v55.0.0 (#977) — a stream-keyed ROOM chunk carries no community binding:
+    // its key is the stream epoch's (`epoch` below), and its provenance names
+    // the community and no community epoch. Only the chunk door reads it so;
+    // a whole community blob still names its epoch.
+    let (floor, binding) = if provenance.tier == CryptoTier::CommunityDek
+        && provenance.epoch.is_none()
+        && provenance.community_key_id.is_some()
+    {
+        let floor = StorageFloor::resolved(provenance.tier);
+        floor.check_scope(&provenance.cohort_scope)?;
+        (floor, None)
+    } else {
+        resolve_provenance(backend, ctx.our_key_id, provenance).await?
+    };
     would_hold(backend, ctx, provenance).await?;
     let stored = backend
         .adopt_sealed_chunks_at(

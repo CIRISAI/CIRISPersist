@@ -552,6 +552,7 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("stream_dek_list", ConnClass::Read),
     ("stream_dek_insert", ConnClass::Write),
     ("stream_dek_close", ConnClass::Write),
+    ("stream_dek_evict_room_chunks", ConnClass::Write),
     ("stream_dek_put_grants", ConnClass::Write),
     ("stream_dek_grants", ConnClass::Read),
     ("stream_dek_grants_for_recipient", ConnClass::Read),

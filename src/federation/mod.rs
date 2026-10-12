@@ -258,6 +258,10 @@ pub(crate) mod sealed_dag_adopt_invariants;
 pub mod self_collective_invariants;
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod stream_key_invariants;
+// v55.0.0 (CIRISPersist#977, #981) — I750–I756: a room's stream is
+// stream-keyed; a stream epoch's DEK may be the caller's.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod stream_epoch_dek_invariants;
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod stream_sth_producer_invariants;
 /// v50.0.0 (CIRISPersist#919) — I186: the consent sweep never widens a placed row.
@@ -315,6 +319,10 @@ pub mod key_grant;
 // consumers can drive them against their own backends.
 #[cfg(any(test, feature = "test-anchor"))]
 pub mod key_grant_invariants;
+// v55.0.0 (CIRISPersist#989) — I742–I745: the key-grant SET retired, one
+// `scores` row per recipient (the upgraded node included).
+#[cfg(test)]
+mod key_grant_rows_invariants;
 // CIRISPersist#851 §20.5 — I79: the holder claim is hybrid-signed when a
 // LocalSigner exists, so peers admit it at the federation-tier gate.
 #[cfg(any(test, feature = "test-anchor"))]
@@ -3222,6 +3230,40 @@ pub trait FederationDirectory: Send + Sync {
     /// self/family keys this node holds.
     async fn rewrap_own_epochs_for_device(&self, owner: &str, device: &str) -> Result<(), Error> {
         let _ = (owner, device);
+        Ok(())
+    }
+
+    /// v55.0.0 (CIRISPersist#989, CC 3.3.2 rc7) — **whose content does this
+    /// node hold under a key-grant axis?** The author of the blob it holds at
+    /// `at_rest_sha256` (content axis), the owner it recorded for `stream_id`
+    /// (stream axis), `None` on the epoch axis or when nothing is held. The
+    /// sealer rule's held-state leg
+    /// ([`key_grant::check_sealer`](crate::federation::key_grant::check_sealer)):
+    /// where this node holds the content, the row's signer must speak for its
+    /// author.
+    ///
+    /// The default is `None`: a directory with no blob plane holds no content.
+    /// The sqlite and postgres backends answer from their blob and stream
+    /// tables.
+    async fn key_grant_held_owner(
+        &self,
+        axis: &key_grant::KeyGrantAxis,
+    ) -> Result<Option<String>, Error> {
+        let _ = axis;
+        Ok(None)
+    }
+
+    /// v55.0.0 (CIRISPersist#989) — **project an admitted key-grant row into
+    /// this node's grant tables**
+    /// ([`key_grant::project_key_grant_row`](crate::federation::key_grant::project_key_grant_row)).
+    /// The typed attestation doors (wire, sync) call it after the store
+    /// inserted or already held the row, so a row that reaches this node by
+    /// any typed door carries its wrap with it.
+    ///
+    /// The default is a no-op: a directory with no grant tables has nothing to
+    /// project into. The sqlite and postgres backends project.
+    async fn project_key_grant_row(&self, row: &Attestation) -> Result<(), Error> {
+        let _ = row;
         Ok(())
     }
 

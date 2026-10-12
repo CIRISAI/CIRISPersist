@@ -128,6 +128,41 @@ CIRISServer pins the hash). Fifteen kinds shipped through v44.2.1; v44.3.0
 
 `FSD/BLOB_REPLICATION.md` Part II (§11–§19) is the design.
 
+### v55.0.0 — the set is retired; one `scores` row per recipient (#989, CC 3.3.2 rc7)
+
+CC rc7 closes the row-type slot at the five structural types (CC 2.4,
+CIRISConstitution#143), so the `key_grant:{axis}:v1` SET above is retired:
+
+- **Wire shape.** A `SignedKeyGrantRow` (`{"attestation": {…}}`, the
+  `SignedAttestation` shape) is a `scores` row with envelope `dimension`
+  `key_grant:content:v1` / `key_grant:epoch:v1` / `key_grant:stream:v1`,
+  `attesting_key_id` the sealer (the minter on the epoch axis, a key that
+  speaks for the owner on the content and stream axes), `attested_key_id` the
+  RECIPIENT occurrence, `score` 1.0, no subject, no expiry, at the content's
+  own `cohort_scope` (`community` on the epoch axis). Envelope members, each
+  present only on the axis that uses it: `axis`, `at_rest_sha256`,
+  `owner_key_id`, `community_key_id`, `minter_key_id`, `epoch`, `stream_id`,
+  `wrap_algorithm` (v2 only), `wrapped_dek`; plus the CC 2 target
+  (`family_key_id` on a family row, `community_id` on a community row and on
+  every epoch row). The digest is a member, never an `evidence_refs` citation.
+- **Admission** (`key_grant::check_key_grant_row_admission`, asked of every
+  federation-tier row on every backend): the shape, a v2 wrap, self-signed, the
+  sealer rule, and the recipient rule (an occurrence the one audience rule
+  lets hold the cohort's key). A `withdraws` / `recants` naming one is refused.
+  A key-grant SET row is refused `set_retired`.
+- **Projection.** Both typed attestation doors (`apply_replicated_attestation`,
+  `put_attestation_synced`) project the row's wrap into the grant tables as a
+  union keyed by the row's identity `(dimension, attester, attested, axis
+  identity)`; CC 2's latest-wins over `(attester, dimension, attested)` does
+  not apply. `apply_replicated_key_grant` remains as the door that reports the
+  projection.
+- **Delivery.** A row reaches its recipient's node (refers-to) when the
+  cohort's audience contains that node, and no other node.
+- **Held sets** are not served (`row_type::RETIRED_ROW_TYPE_PREFIXES`); each
+  node re-emits its own wraps as rows once (V192 marks every axis dirty).
+- The `KeyGrant` kind keeps its place in the hashed, appended vocabulary as the
+  plane the rows project into; no pin moved.
+
 ## Replicated `EnvelopeKind`s — the seventeenth kind, `CommunityMembershipWidening` (v48.0.0, #860)
 
 Sixteen kinds shipped through v47.4.0; v48.0.0 **appends** the seventeenth

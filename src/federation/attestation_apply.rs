@@ -331,6 +331,10 @@ where
     // v50.0.0 (CIRISPersist#916) — an owner-binding is the moment a minter
     // learns a member has a device; read before the row is moved.
     let binding = super::owner_binding_of(incoming);
+    // v55.0.0 (CIRISPersist#989) — a key-grant row carries its wrap: kept to
+    // project once the store holds the row (inserted now, or held already —
+    // a re-offer repairs a projection a crash cut off).
+    let key_grant = super::key_grant::is_key_grant_row(incoming).then(|| incoming.clone());
     // The §6.1 silent-no-op door only exists for structural composers
     // that actually carry a references target — precompute the predicate
     // while `incoming` is still borrowed.
@@ -360,7 +364,12 @@ where
         Err(e) => return Err(e),
     };
     match planned {
-        Some(Plan::Unchanged) => return Ok(Outcome::Unchanged),
+        Some(Plan::Unchanged) => {
+            if let Some(row) = &key_grant {
+                dir.project_key_grant_row(row).await?;
+            }
+            return Ok(Outcome::Unchanged);
+        }
         Some(Plan::Refused { reason }) => return Ok(Outcome::Refused { reason }),
         Some(Plan::Insert) | None => {}
     }
@@ -385,6 +394,9 @@ where
             // not `Ok(_)`: `AlreadyHeld` means a byte-identical row landed
             // between the plan and the write (a lost race), or the plan-free
             // fallback re-offered one — nothing changed, so not `Inserted`.
+            if let Some(row) = &key_grant {
+                dir.project_key_grant_row(row).await?;
+            }
             match stored {
                 super::AttestationOutcome::Inserted => {
                     // v50.0.0 (CIRISPersist#916, #917) — the ONE re-wrap site

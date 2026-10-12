@@ -1400,7 +1400,8 @@ pub struct StreamKeySlot {
 }
 
 /// v53.0.0 (CIRISPersist#969) — one `federation_stream_deks` row: the DEK of
-/// a self/family stream's epoch, held by the node that seals it.
+/// a stream's epoch (self / family; v55.0.0, #977: a room's too), held by the
+/// node that seals it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamDekRecord {
     /// The stream.
@@ -1409,9 +1410,9 @@ pub struct StreamDekRecord {
     pub epoch: u64,
     /// The stream's owner — the writer, the only sealer (single sender).
     pub owner_key_id: String,
-    /// `self` or `family`.
+    /// `self`, `family`, `community` or `affiliations`.
     pub cohort_scope: String,
-    /// The self identity or the family key the stream is sealed for.
+    /// The self identity, family or community key the stream is sealed for.
     pub group_key_id: String,
     /// The DEK wrapped under this node's content master.
     pub self_retention_wrap: String,
@@ -1422,6 +1423,23 @@ pub struct StreamDekRecord {
     pub closed: bool,
     /// The epoch's terminator is stored; nothing more may be appended.
     pub terminated: bool,
+    /// v55.0.0 (#981, V193) — the caller supplied this epoch's DEK
+    /// (`register_stream_epoch_dek`): persist never mints or rolls the
+    /// stream's epochs; a removal or the nonce cap is refused, retryably, until
+    /// the caller supplies the next one.
+    pub supplied: bool,
+    /// v55.0.0 (#981, V193) — the stream is KEPT (recorded, or
+    /// `history_on_join: full`): the epoch's DEK is wrapped to the audience
+    /// as `key_grant:stream:v1` rows. An unkept epoch is wrapped to nobody
+    /// (CC 5.3.3.2.5: MLS forward secrecy survives). Every persist-minted
+    /// epoch is kept.
+    pub keep: bool,
+    /// v55.0.0 (#977, V193) — a ROOM stream epoch's place in the room's
+    /// retention: the writer's community epoch when this stream epoch was
+    /// minted. The community retention sweep evicts the epoch's chunks under
+    /// the same policy as that community epoch's objects. `None` for self /
+    /// family.
+    pub room_epoch: Option<u64>,
 }
 
 /// v53.0.0 (CIRISPersist#969) — the key set a chunk is sealed under, as a
@@ -2328,6 +2346,20 @@ pub trait BlobStorage: Send + Sync {
         &self,
         record: &StreamDekRecord,
     ) -> impl Future<Output = Result<StreamDekRecord, BlobError>> + Send;
+
+    /// v55.0.0 (CIRISPersist#977) — **the community retention sweep's room
+    /// stream leg**: delete the stored chunks of every ROOM stream epoch
+    /// `minter_key_id` sealed for `community_key_id` whose `room_epoch` is at
+    /// or below `max_room_epoch`, and stamp the epoch rows evicted (they stay,
+    /// a record). Idempotent: an evicted epoch is not counted again. Returns
+    /// the chunk rows deleted.
+    fn stream_dek_evict_room_chunks(
+        &self,
+        community_key_id: &str,
+        minter_key_id: &str,
+        max_room_epoch: u64,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> impl Future<Output = Result<u64, BlobError>> + Send;
 
     /// Close the epoch to further DATA chunks (a forced or removal roll).
     /// Idempotent. The terminator may still be appended.
@@ -4510,9 +4542,98 @@ pub enum BlobError {
         /// The purge notice whose tombstone withholds it.
         notice_id: String,
     },
+    /// v55.0.0 (CIRISPersist#981) — a stream whose epoch DEK the CALLER
+    /// supplies (`register_stream_epoch_dek`: the MLS exporter secret) needs
+    /// its next epoch before this chunk can be stored: a recipient the epoch
+    /// was wrapped to has left the audience (`Removal`, naming it, so the
+    /// caller commits the matching MLS removal), or only the terminator's slot
+    /// of the STREAM counter is left (`Cap`). Persist never mints or rolls a
+    /// supplied stream's epoch. **RETRYABLE**: supply the next epoch's DEK
+    /// (`register_stream_epoch_dek`) and resend the chunk under it. Nothing
+    /// was stored.
+    #[error(
+        "stream {stream_id} epoch {epoch} needs its next epoch ({reason}{}) — supply the next \
+         epoch's DEK and resend (CIRISPersist#981)",
+        removed_key_id.as_deref().map(|k| format!(": {k} left the audience")).unwrap_or_default()
+    )]
+    StreamEpochRotationRequired {
+        /// The stream.
+        stream_id: String,
+        /// The epoch that takes no more chunks.
+        epoch: u64,
+        /// Why.
+        reason: StreamRotationReason,
+        /// `Removal`: the recipient that left the audience.
+        removed_key_id: Option<String>,
+    },
+    /// v55.0.0 (CIRISPersist#981) — a DEK was supplied for a `(stream_id,
+    /// epoch)` that already holds one. An epoch's key is never replaced.
+    /// Terminal for these arguments.
+    #[error(
+        "stream {stream_id} epoch {epoch} already holds a DEK; an epoch's key is never replaced"
+    )]
+    StreamEpochDekExists {
+        /// The stream.
+        stream_id: String,
+        /// The epoch.
+        epoch: u64,
+    },
+    /// v55.0.0 (CIRISPersist#981) — the stream belongs to another writer: its
+    /// keys come from its single sender (CC 5.3.3.1). Terminal. Names the
+    /// stream and never its writer's key (the I41 rule for a foreign append).
+    #[error(
+        "stream {stream_id} is another writer's; its keys come from its single sender (CC 5.3.3.1)"
+    )]
+    StreamNotAuthored {
+        /// The stream.
+        stream_id: String,
+    },
+    /// v55.0.0 (CIRISPersist#981) — a chunk named an epoch of a caller-keyed
+    /// stream whose DEK has not been supplied (persist mints none for such a
+    /// stream). **RETRYABLE**: supply the epoch's DEK, then resend.
+    #[error(
+        "stream {stream_id} is keyed by its caller and epoch {epoch} has no supplied DEK — \
+         register it, then resend (CIRISPersist#981)"
+    )]
+    StreamEpochDekMissing {
+        /// The stream.
+        stream_id: String,
+        /// The epoch the chunk named.
+        epoch: u64,
+    },
     /// Backend-level error (DB connection, serialization, etc.).
     #[error("backend: {0}")]
     Backend(String),
+}
+
+/// v55.0.0 (CIRISPersist#981) — why a caller-keyed stream needs its next
+/// epoch. Wire tokens `removal` / `cap`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StreamRotationReason {
+    /// A recipient the epoch was wrapped to left the stream's audience (CC
+    /// 5.1: removal forces rotation).
+    Removal,
+    /// Only the terminator's slot of the epoch's STREAM counter is left (CC
+    /// 5.3.3.1: the counter never wraps).
+    Cap,
+}
+
+impl StreamRotationReason {
+    /// The wire token.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Removal => "removal",
+            Self::Cap => "cap",
+        }
+    }
+}
+
+impl std::fmt::Display for StreamRotationReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 impl BlobError {
@@ -4539,6 +4660,10 @@ impl BlobError {
             BlobError::SealDidNotOpen { .. } => "blob_seal_did_not_open",
             BlobError::Withdrawn { .. } => "blob_withdrawn",
             BlobError::Purged { .. } => "blob_purged",
+            BlobError::StreamEpochRotationRequired { .. } => "blob_stream_epoch_rotation_required",
+            BlobError::StreamEpochDekExists { .. } => "blob_stream_epoch_dek_exists",
+            BlobError::StreamNotAuthored { .. } => "blob_stream_not_authored",
+            BlobError::StreamEpochDekMissing { .. } => "blob_stream_epoch_dek_missing",
             BlobError::Backend(_) => "blob_backend",
         }
     }

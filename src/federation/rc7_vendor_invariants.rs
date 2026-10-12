@@ -18,8 +18,8 @@
 //!   for the owner is refused `federation_signer_not_acting_for`; the L1
 //!   binding still refuses a foreign `ledger_id`. Nothing refused is stored.
 //! - **I706** the dimensions rc7 registers and persist has no door for —
-//!   `key_grant:{axis}:v1` and `membership:{widening|removal|resignation}:v1`
-//!   — are refused `federation_dimension_rejected` /
+//!   `membership:{widening|removal|resignation}:v1` (`key_grant:{axis}:v1`
+//!   until v55 slice B, #989) — are refused `federation_dimension_rejected` /
 //!   `registered_family_held_shut` on `scores` and on a composer; nothing is
 //!   stored.
 //!
@@ -235,10 +235,9 @@ pub(crate) mod bodies {
     /// **I706** — the dimensions rc7 opens and persist holds shut.
     pub async fn i706_held_dimensions_refused<B: FederationDirectory + Sync>(b: &B, s: &str) {
         let w = who(b, &format!("i706-{s}")).await;
+        // `key_grant:{axis}:v1` left this list with v55 slice B (#989): its
+        // door is the row rule (I742–I745).
         for dim in [
-            "key_grant:content:v1",
-            "key_grant:epoch:v1",
-            "key_grant:stream:v1",
             "membership:widening:v1",
             "membership:removal:v1",
             "membership:resignation:v1",

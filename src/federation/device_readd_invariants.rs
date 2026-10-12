@@ -880,8 +880,8 @@ pub(crate) mod two_node {
     use crate::federation::community_dek::orchestrate::ensure_epoch_dek;
     use crate::federation::epoch_minter_invariants::bodies::{ladder, Pick};
     use crate::federation::key_grant::{
-        publish_signed_content_only_occurrence, KeyGrantAxis, KeyGrantSet, SignedKeyGrantSet,
-        KEY_GRANT_EPOCH_ATTESTATION_TYPE,
+        is_key_grant_row, publish_signed_content_only_occurrence, KeyGrantAxis, KeyGrantRow,
+        SignedKeyGrantRow,
     };
     use crate::federation::tier_ingest::test_support as ts;
     use crate::federation::types::cohort_scope::COMMUNITY;
@@ -892,29 +892,30 @@ pub(crate) mod two_node {
         FederationDirectory, SignedAttestation,
     };
 
-    /// Every epoch-axis set on `backend` for `(comm, minter, epoch)`.
+    /// Every epoch-axis key-grant ROW on `backend` for `(comm, minter,
+    /// epoch)` (v55.0.0, #989: one per recipient).
     async fn sets_on<B: FederationDirectory + Sync>(
         backend: &B,
         comm: &str,
         minter: &str,
         epoch: u64,
-    ) -> Vec<(Attestation, KeyGrantSet)> {
+    ) -> Vec<(Attestation, KeyGrantRow)> {
         backend
             .list_attestations_since(None, 10_000)
             .await
             .unwrap()
             .into_iter()
             .map(|s| s.attestation)
-            .filter(|a| a.attestation_type == KEY_GRANT_EPOCH_ATTESTATION_TYPE)
-            .filter_map(|a| KeyGrantSet::from_attestation(&a).ok().map(|s| (a, s)))
-            .filter(|(_, s)| {
-                matches!(&s.axis, KeyGrantAxis::Epoch { community_key_id, minter_key_id, epoch: e }
+            .filter(is_key_grant_row)
+            .filter_map(|a| KeyGrantRow::from_attestation(&a).ok().map(|r| (a, r)))
+            .filter(|(_, r)| {
+                matches!(&r.axis, KeyGrantAxis::Epoch { community_key_id, minter_key_id, epoch: e }
                     if community_key_id == comm && minter_key_id == minter && *e == epoch)
             })
             .collect()
     }
 
-    /// A set on `backend` for `(comm, minter, epoch)` that carries a wrap to
+    /// The row on `backend` for `(comm, minter, epoch)` whose recipient is
     /// `device`, if any.
     async fn set_carrying<B: FederationDirectory + Sync>(
         backend: &B,
@@ -926,7 +927,7 @@ pub(crate) mod two_node {
         sets_on(backend, comm, minter, epoch)
             .await
             .into_iter()
-            .find(|(_, s)| s.wraps.iter().any(|w| w.recipient_key_id == device))
+            .find(|(_, r)| r.recipient() == device)
             .map(|(a, _)| a)
     }
 
@@ -1019,12 +1020,13 @@ pub(crate) mod two_node {
             .await
             .unwrap()
         {
-            if crate::federation::key_grant::emit_key_grant_axis_with_local_signer(a, signer, &axis)
-                .await
-                .unwrap()
-                .is_some()
+            if let Some(e) = crate::federation::key_grant::emit_key_grant_axis_with_local_signer(
+                a, signer, &axis,
+            )
+            .await
+            .unwrap()
             {
-                n += 1;
+                n += e.attestation_ids.len();
             }
         }
         n
@@ -1112,15 +1114,13 @@ pub(crate) mod two_node {
             .put_blob_scoped(COMMUNITY, Some(&l.comm), b"b's", None, None)
             .await
             .unwrap_or_else(|e| panic!("B seals: {e}"));
-        let (b_set, _) = sets_on(b, &l.comm, &l.node_b, 0)
+        let b_set = set_carrying(b, &l.comm, &l.node_b, 0, &l.node_a)
             .await
-            .into_iter()
-            .next()
-            .expect("B emitted its set");
+            .expect("B emitted its row to A");
         l.engine_a
-            .apply_replicated_key_grant(SignedKeyGrantSet { attestation: b_set })
+            .apply_replicated_key_grant(SignedKeyGrantRow { attestation: b_set })
             .await
-            .unwrap_or_else(|e| panic!("A admits B's set: {e}"));
+            .unwrap_or_else(|e| panic!("A admits B's row: {e}"));
         // And an epoch A holds a self-retention for under a FOREIGN minter's
         // name: the door may re-wrap it locally, never sign a set for it.
         let foreign = format!("fm-{run}");
@@ -1296,10 +1296,11 @@ pub(crate) mod two_node {
             "(T5) the capsule's synced op re-wrapped A's epochs to d7 on A's backend"
         );
 
-        // The sets: A's pending-set loop (the one PyEngine runs) signs and
-        // emits every epoch the doors dirtied; B admits them off A's
-        // `list_attestations_since`; on B each device's wrap opens to the DEK
-        // bob's node already holds.
+        // The rows: A's pending loop (the one PyEngine runs) signs and emits
+        // one row per wrap the doors wrote; each device's row, read off A's
+        // `list_attestations_since`, opens to the DEK bob's node already
+        // holds on B (v55.0.0, #989: a row to a device crosses to that
+        // device's node, never to bob's).
         let signer_a = ts::local_signer(&format!("em-a-{run}"));
         assert_eq!(signer_a.derived_key_id(), l.node_a, "fixture: A's signer");
         assert!(
@@ -1307,24 +1308,25 @@ pub(crate) mod two_node {
             "(T) the doors left A's three epochs dirty"
         );
         let b_priv = b.load_content_kem_private_halves().await.unwrap();
+        // B holds A's epochs through A's rows to bob's node, delivered.
+        for e in &own {
+            let row = set_carrying(a, &l.comm, &l.node_a, *e, &l.node_b)
+                .await
+                .unwrap_or_else(|| panic!("(T) A's row for epoch {e} to bob's node"));
+            l.engine_b
+                .apply_replicated_key_grant(SignedKeyGrantRow { attestation: row })
+                .await
+                .unwrap_or_else(|e| panic!("(T) B admits A's row: {e:?}"));
+        }
         for e in &own {
             for d in [&d1, &d2, &d3, &d6, &d7] {
                 let set = set_carrying(a, &l.comm, &l.node_a, *e, &d.key)
                     .await
-                    .unwrap_or_else(|| {
-                        panic!("(T) A's loop emitted epoch {e}'s set carrying {}", d.key)
-                    });
-                crate::federation::key_grant::admit_replicated_key_grant(
-                    b,
-                    SignedKeyGrantSet { attestation: set },
-                )
-                .await
-                .unwrap_or_else(|err| panic!("(T) B admits A's set for epoch {e}: {err}"));
-                let (_, wrap) = b
-                    .community_dek_member_grant_wrap(&l.comm, &l.node_a, *e, &d.key)
-                    .await
+                    .unwrap_or_else(|| panic!("(T) A's loop emitted epoch {e}'s row to {}", d.key));
+                let wrap = KeyGrantRow::from_attestation(&set)
                     .unwrap()
-                    .unwrap_or_else(|| panic!("(T) {}'s wrap on epoch {e} reached B", d.key));
+                    .wrap
+                    .wrapped_dek;
                 let (_, bob_wrap) = b
                     .community_dek_member_grant_wrap(&l.comm, &l.node_a, *e, &l.node_b)
                     .await
@@ -1428,13 +1430,18 @@ pub(crate) mod two_node {
             vec![(foreign.clone(), 0)],
             "(D) the foreign-named epoch is granted here and reported local-only: {r:?}"
         );
+        // v55.0.0 (#989): B's rows to bob's holders cross to THEIR nodes, never
+        // to A (CC 6.1.5.3 refers-to), so A holds no B epoch for bob and has
+        // none to report; B re-wraps its own on the binding's arrival. The
+        // single-node `MintedElsewhere` witness (a peer epoch known here by a
+        // holder's wrap) is unchanged above.
         assert_eq!(
             r.content_miss
                 .iter()
                 .map(|m| (m.minter_key_id.clone(), m.epoch, m.reason))
                 .collect::<Vec<_>>(),
-            vec![(l.node_b.clone(), 0, EpochMissReason::MintedElsewhere)],
-            "(D) B's epoch is B's to re-wrap: {r:?}"
+            Vec::<(String, u64, EpochMissReason)>::new(),
+            "(D) B's epoch never reached A for bob's holders: {r:?}"
         );
         for e in &own {
             assert!(
@@ -1502,12 +1509,8 @@ pub(crate) mod two_node {
         let set = set_carrying(a, &l.comm, &l.node_a, 0, &d.key)
             .await
             .expect("(k) epoch 0's set carries the late device");
-        let set = KeyGrantSet::from_attestation(&set).unwrap();
-        let wrap = set
-            .wraps
-            .iter()
-            .find(|w| w.recipient_key_id == d.key)
-            .expect("(k) the wrap");
+        let wrap = KeyGrantRow::from_attestation(&set).unwrap().wrap;
+        assert_eq!(wrap.recipient_key_id, d.key, "(k) the wrap");
         let dek = unwrap_dek_v2_json(&d.private, &wrap.wrapped_dek)
             .unwrap_or_else(|e| panic!("(k) the device opens its wrap: {e}"));
         assert_eq!(dek.len(), 32, "(k) a 32-byte DEK");

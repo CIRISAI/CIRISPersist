@@ -133,6 +133,8 @@ mod tests {
             // cannot admit the key is the state #848 was opened on.
             ("apply_replicated_key_grant(", "apply_replicated_key_grant"),
             ("emit_key_grant(", "emit_key_grant"),
+            // v55.0.0 (#981) — the caller-supplied stream epoch DEK.
+            ("register_stream_epoch_dek(", "register_stream_epoch_dek"),
         ];
         let mut missing = Vec::new();
         for (sym, _) in ops {

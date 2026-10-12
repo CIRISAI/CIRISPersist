@@ -234,7 +234,9 @@ pub fn check_row_type(row: &Attestation) -> Result<RowTypeClass, Error> {
             }
         }
         RowTypeClass::Unregistered => {
-            if enforcement() == RowTypeEnforcement::Enforce {
+            if enforcement() == RowTypeEnforcement::Enforce
+                || retired_carrier(&row.attestation_type).is_some()
+            {
                 return Err(unregistered(&row.attestation_type));
             }
         }
@@ -265,7 +267,9 @@ pub fn admit_row_type(row: &Attestation) -> Result<(), Error> {
 /// [`Error::AttestationTypeUnregistered`] under `Enforce`.
 pub fn admit_local_row_type(attestation_type: &str) -> Result<(), Error> {
     if classify(attestation_type) == RowTypeClass::Unregistered {
-        if enforcement() == RowTypeEnforcement::Enforce {
+        if enforcement() == RowTypeEnforcement::Enforce
+            || retired_carrier(attestation_type).is_some()
+        {
             return Err(unregistered(attestation_type));
         }
         record_unregistered_admission(attestation_type, "(local)");
@@ -489,18 +493,54 @@ pub fn registered_row_type_sql(column: &str, dialect: SqlDialect) -> String {
     format!("({})", arms.join(" OR "))
 }
 
-/// The serve-read filter: `Some(predicate)` under `Enforce` (held rows of an
-/// unregistered type are neither served nor replicated), `None` under
-/// `Report`. Read once per query, on the calling task.
+/// v55.0.0 — **a retired carrier** ([`registry::RETIRED_CARRIER_STEMS`]):
+/// the stem `attestation_type` starts with, or `None`. A retired carrier is
+/// refused at every door and never served, under `Report` as under `Enforce`.
+#[must_use]
+pub fn retired_carrier(attestation_type: &str) -> Option<&'static str> {
+    registry::RETIRED_CARRIER_STEMS
+        .iter()
+        .find(|(stem, _)| attestation_type.starts_with(stem))
+        .map(|(stem, _)| *stem)
+}
+
+/// `column` is NOT a retired carrier, as a SQL boolean expression: one
+/// `substr` comparison per stem, which both dialects read byte-exact (a
+/// `LIKE` would read `_` as a wildcard). `None` when nothing is retired.
+#[must_use]
+pub fn not_retired_carrier_sql(column: &str) -> Option<String> {
+    if registry::RETIRED_CARRIER_STEMS.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "({})",
+        registry::RETIRED_CARRIER_STEMS
+            .iter()
+            .map(|(p, _)| format!("substr({column}, 1, {}) <> {}", p.len(), sql_quote(p)))
+            .collect::<Vec<_>>()
+            .join(" AND ")
+    ))
+}
+
+/// The serve-read filter: under `Enforce`, held rows of an unregistered type
+/// are neither served nor replicated; under either mode, held rows of a
+/// retired carrier ([`retired_carrier`]) are not. `None` when neither
+/// applies. Read once per query, on the calling task.
 #[must_use]
 pub fn serve_filter_sql(column: &str, dialect: SqlDialect) -> Option<String> {
-    (enforcement() == RowTypeEnforcement::Enforce).then(|| registered_row_type_sql(column, dialect))
+    let registered = (enforcement() == RowTypeEnforcement::Enforce)
+        .then(|| registered_row_type_sql(column, dialect));
+    match (registered, not_retired_carrier_sql(column)) {
+        (Some(r), Some(t)) => Some(format!("({r} AND {t})")),
+        (r, t) => r.or(t),
+    }
 }
 
 /// The memory backend's serve filter: does `row` survive it?
 #[must_use]
 pub fn served_under_enforcement(row: &Attestation) -> bool {
-    enforcement() == RowTypeEnforcement::Report || is_registered(&row.attestation_type)
+    retired_carrier(&row.attestation_type).is_none()
+        && (enforcement() == RowTypeEnforcement::Report || is_registered(&row.attestation_type))
 }
 
 // ── the report door ──────────────────────────────────────────────────

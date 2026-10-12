@@ -5443,6 +5443,24 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         .map_err(|e| crate::federation::Error::Backend(format!("lookup_role_withdrawal: {e}")))
     }
 
+    /// v55.0.0 (CIRISPersist#989) — the key-grant sealer rule's held-state
+    /// leg: the held blob's author, the recorded owner of the held stream.
+    async fn key_grant_held_owner(
+        &self,
+        axis: &crate::federation::key_grant::KeyGrantAxis,
+    ) -> Result<Option<String>, crate::federation::Error> {
+        crate::federation::key_grant::held_owner(self, axis).await
+    }
+
+    /// v55.0.0 (CIRISPersist#989) — a key-grant row admitted by a typed door
+    /// carries its wrap into this node's grant tables.
+    async fn project_key_grant_row(
+        &self,
+        row: &crate::federation::Attestation,
+    ) -> Result<(), crate::federation::Error> {
+        crate::federation::key_grant::project_if_key_grant_row(self, row).await
+    }
+
     /// v50.0.0 (CIRISPersist#916) — the receive doors' re-wrap: this node's
     /// own epochs (minter = the node key) to a member's device. Grant rows
     /// only; each leaves its epoch dirty for the pending-`KeyGrant` loop.
@@ -15717,7 +15735,7 @@ fn scope_blob_symbol_from_sqlite_row(
 /// every stream-DEK read shares, joined to the epoch's V165 count.
 const SQLITE_STREAM_DEK_SELECT: &str = "SELECT d.stream_id, d.epoch, d.owner_key_id, \
     d.cohort_scope, d.group_key_id, d.self_retention_wrap, COALESCE(c.chunk_count, 0), \
-    d.closed_at IS NOT NULL, d.terminated_at IS NOT NULL \
+    d.closed_at IS NOT NULL, d.terminated_at IS NOT NULL, d.supplied, d.keep, d.room_epoch \
     FROM federation_stream_deks d \
     LEFT JOIN federation_stream_epoch_counts c ON c.stream_id = d.stream_id AND c.epoch = d.epoch";
 
@@ -15734,6 +15752,11 @@ fn sqlite_stream_dek_row(
         chunk_count: u64::try_from(r.get::<_, i64>(6)?).unwrap_or_default(),
         closed: r.get(7)?,
         terminated: r.get(8)?,
+        supplied: r.get(9)?,
+        keep: r.get(10)?,
+        room_epoch: r
+            .get::<_, Option<i64>>(11)?
+            .map(|e| u64::try_from(e).unwrap_or_default()),
     })
 }
 
@@ -17054,8 +17077,9 @@ impl crate::federation::BlobStorage for SqliteBackend {
                 let tx = conn.transaction()?;
                 tx.execute(
                     "INSERT INTO federation_stream_deks \
-                        (stream_id, epoch, owner_key_id, cohort_scope, group_key_id, self_retention_wrap) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+                        (stream_id, epoch, owner_key_id, cohort_scope, group_key_id, \
+                         self_retention_wrap, supplied, keep, room_epoch) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
                      ON CONFLICT (stream_id, epoch) DO NOTHING",
                     rusqlite::params![
                         r.stream_id,
@@ -17063,7 +17087,10 @@ impl crate::federation::BlobStorage for SqliteBackend {
                         r.owner_key_id,
                         r.cohort_scope,
                         r.group_key_id,
-                        r.self_retention_wrap
+                        r.self_retention_wrap,
+                        r.supplied,
+                        r.keep,
+                        r.room_epoch.map(|e| i64::try_from(e).unwrap_or(i64::MAX))
                     ],
                 )?;
                 let stored = tx.query_row(
@@ -17077,6 +17104,51 @@ impl crate::federation::BlobStorage for SqliteBackend {
         )
         .await
         .map_err(|e| crate::federation::BlobError::Backend(format!("stream_dek_insert: {e}")))
+    }
+
+    async fn stream_dek_evict_room_chunks(
+        &self,
+        community_key_id: &str,
+        minter_key_id: &str,
+        max_room_epoch: u64,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<u64, crate::federation::BlobError> {
+        let (comm, minter) = (community_key_id.to_owned(), minter_key_id.to_owned());
+        let bound = i64::try_from(max_room_epoch).unwrap_or(i64::MAX);
+        let stamp = format_ledger_instant(now);
+        self.write(move |conn| -> Result<u64, rusqlite::Error> {
+            // One transaction: the chunk rows go, the epoch rows stay,
+            // stamped. Scoped to epochs not yet evicted, so a re-run deletes
+            // nothing and never re-stamps.
+            const EPOCHS: &str = "FROM federation_stream_deks d \
+                WHERE d.group_key_id = ?1 AND d.owner_key_id = ?2 \
+                  AND d.cohort_scope IN ('community', 'affiliations') \
+                  AND d.room_epoch IS NOT NULL AND d.room_epoch <= ?3 \
+                  AND d.evicted_at IS NULL";
+            let tx = conn.transaction()?;
+            let n = tx.execute(
+                &format!(
+                    "DELETE FROM federation_blobs WHERE sha256 IN ( \
+                        SELECT c.chunk_sha FROM federation_stream_chunks c \
+                         WHERE EXISTS (SELECT 1 {EPOCHS} \
+                                         AND d.stream_id = c.stream_id AND d.epoch = c.epoch))"
+                ),
+                rusqlite::params![comm, minter, bound],
+            )?;
+            tx.execute(
+                &format!(
+                    "UPDATE federation_stream_deks SET evicted_at = ?4 \
+                      WHERE (stream_id, epoch) IN (SELECT d.stream_id, d.epoch {EPOCHS})"
+                ),
+                rusqlite::params![comm, minter, bound, stamp],
+            )?;
+            tx.commit()?;
+            Ok(n as u64)
+        })
+        .await
+        .map_err(|e| {
+            crate::federation::BlobError::Backend(format!("stream_dek_evict_room_chunks: {e}"))
+        })
     }
 
     async fn stream_dek_close(
@@ -17932,7 +18004,8 @@ impl crate::federation::BlobStorage for SqliteBackend {
     }
 
     /// v46.3.0 (#884, FSD/SELF_COLLECTIVE_TRANSFER.md §3 R4) — the minter of
-    /// the bytes: the community binding's, else the content set's attester.
+    /// the bytes: the community binding's, else the content-axis key-grant
+    /// row's attester (v55.0.0, #989).
     async fn minter_of_blob(
         &self,
         at_rest_sha256: &[u8; 32],
@@ -17941,11 +18014,13 @@ impl crate::federation::BlobStorage for SqliteBackend {
             return Ok(Some(minter));
         }
         let hex = hex::encode(at_rest_sha256);
-        let ty = crate::federation::key_grant::KEY_GRANT_CONTENT_ATTESTATION_TYPE.to_owned();
+        // v55.0.0 (#989) — the content-axis key-grant ROW's sealer (a
+        // `scores` row on `key_grant:content:v1`); a retired SET is not read.
+        let ty = crate::federation::key_grant::KEY_GRANT_CONTENT_DIMENSION.to_owned();
         self.read(move |conn| -> Result<Option<String>, rusqlite::Error> {
             conn.query_row(
                 "SELECT attesting_key_id FROM federation_attestations \
-                  WHERE attestation_type = ?1 \
+                  WHERE attestation_type = 'scores' AND dimension = ?1 \
                     AND json_extract(attestation_envelope, '$.at_rest_sha256') = ?2 \
                   ORDER BY asserted_at ASC LIMIT 1",
                 rusqlite::params![ty, hex],

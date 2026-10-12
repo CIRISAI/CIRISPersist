@@ -67,7 +67,10 @@ pub(crate) mod bodies {
     };
     use crate::federation::epoch_minter_invariants::bodies::Pick;
     use crate::federation::key_grant::{
-        SignedKeyGrantSet, KEY_GRANT_CONTENT_ATTESTATION_TYPE, KEY_GRANT_STREAM_ATTESTATION_TYPE,
+        key_grant_dimension_of, KEY_GRANT_CONTENT_DIMENSION, KEY_GRANT_STREAM_DIMENSION,
+    };
+    use crate::federation::key_grant_invariants::two_node::{
+        key_grant_rows_for, sign_row_unstored,
     };
     use crate::federation::nested_manifest_invariants::bodies::{kem_of, pair, Pair, SetCap};
     use crate::federation::self_collective_invariants::bodies::bind;
@@ -183,21 +186,22 @@ pub(crate) mod bodies {
                 .await
                 .unwrap()
                 .into_iter()
-                .filter(|x| x.attestation_type.starts_with("key_grant:"))
+                .filter(crate::federation::key_grant::is_key_grant_row)
                 .collect();
+        // v55.0.0 (#989) — one stream-axis ROW per recipient for the epoch.
         assert_eq!(
             sets.iter()
-                .filter(|x| x.attestation_type == KEY_GRANT_STREAM_ATTESTATION_TYPE)
+                .filter(|x| key_grant_dimension_of(x) == Some(KEY_GRANT_STREAM_DIMENSION))
                 .count(),
-            1,
-            "I310: ONE stream-axis set for the epoch"
+            2,
+            "I310: one stream-axis row per recipient (R = 2) for the epoch"
         );
         assert_eq!(
             sets.iter()
-                .filter(|x| x.attestation_type == KEY_GRANT_CONTENT_ATTESTATION_TYPE)
+                .filter(|x| key_grant_dimension_of(x) == Some(KEY_GRANT_CONTENT_DIMENSION))
                 .count(),
             0,
-            "I310: no per-chunk content set"
+            "I310: no per-chunk content row"
         );
         // I311 — every stored nonce is the STREAM nonce at its counter.
         let dek = epoch_dek(p.sa.as_ref(), &stream, 0).await;
@@ -335,26 +339,22 @@ pub(crate) mod bodies {
         let plain = write_self(&p.a, &p.owner, &stream, 12).await;
         let root = seal(&p, &stream).await;
         p.a.emit_pending_key_grants().await.unwrap();
-        let sets: Vec<_> =
-            p.sa.list_attestations_by(&p.key_a)
-                .await
-                .unwrap()
-                .into_iter()
-                .filter(|x| x.attestation_type.starts_with("key_grant:"))
-                .collect();
-        let (stream_sets, content_sets): (Vec<_>, Vec<_>) = sets
-            .into_iter()
-            .partition(|x| x.attestation_type == KEY_GRANT_STREAM_ATTESTATION_TYPE);
-        assert_eq!(stream_sets.len(), 1, "I313: one stream set per epoch");
+        // v55.0.0 (#989) — the rows A's plane delivers to B: B's own row per
+        // key, never A's.
+        let sets = key_grant_rows_for(p.sa.as_ref(), &p.key_a, &p.key_b).await;
+        let (stream_sets, content_sets): (Vec<_>, Vec<_>) = sets.into_iter().partition(|x| {
+            key_grant_dimension_of(&x.attestation) == Some(KEY_GRANT_STREAM_DIMENSION)
+        });
+        assert_eq!(stream_sets.len(), 1, "I313: one stream row for B per epoch");
         assert_eq!(
             content_sets.len(),
             1,
-            "I313: one content set, the manifest's"
+            "I313: one content row for B, the manifest's"
         );
         for set in content_sets {
-            p.b.apply_replicated_key_grant(SignedKeyGrantSet { attestation: set })
+            p.b.apply_replicated_key_grant(set)
                 .await
-                .expect("B applies the manifest's set");
+                .expect("B applies the manifest's row");
         }
         let prov = BlobProvenance {
             author_key_id: p.owner.clone(),
@@ -442,9 +442,9 @@ pub(crate) mod bodies {
             Err(BlobError::NotGranted { .. })
         ));
         for set in stream_sets {
-            p.b.apply_replicated_key_grant(SignedKeyGrantSet { attestation: set })
+            p.b.apply_replicated_key_grant(set)
                 .await
-                .expect("B applies the stream set");
+                .expect("B applies the stream row");
         }
         let r =
             p.b.sealed_dag_readiness(&root, &p.key_b, None)
@@ -467,38 +467,35 @@ pub(crate) mod bodies {
         // other node and speaks for A (#884); a party that shares no
         // principal with the stream's owner does not, and its set is refused
         // before the attestation plane is asked.
-        let forged = crate::federation::key_grant::KeyGrantSet {
+        let forged = crate::federation::key_grant::KeyGrantRow {
             axis: crate::federation::key_grant::KeyGrantAxis::Stream {
                 stream_id: stream.clone(),
                 epoch: 0,
                 cohort_scope: cohort_scope::SELF.to_owned(),
                 owner_key_id: p.owner.clone(),
             },
-            wraps: p
+            wrap: p
                 .sa
                 .stream_dek_grants(&stream, 0, &p.key_a)
                 .await
                 .unwrap()
                 .into_iter()
-                .take(1)
                 .map(|mut w| {
-                    w.recipient_key_id = format!("i313-evil-{run}");
+                    w.recipient_key_id = p.key_a.clone();
                     w
                 })
-                .collect(),
+                .next()
+                .expect("a wrap"),
         };
-        let id =
-            p.b.emit_attestation_self(forged.emit_input())
-                .await
-                .unwrap();
-        let mut row = p.sb.get_attestation(&id).await.unwrap().expect("B's row");
-        let outsider = format!("i313-outsider-{run}");
-        row.attesting_key_id = outsider.clone();
-        row.scrub_key_id = outsider;
+        // An outsider's own hybrid signature: well-formed, and refused on the
+        // sealer rule before the plane is asked.
+        let outsider = crate::federation::tier_ingest::test_support::local_signer(&format!(
+            "i313-outsider-{run}"
+        ));
         let e =
-            p.a.apply_replicated_key_grant(SignedKeyGrantSet { attestation: row })
+            p.a.apply_replicated_key_grant(sign_row_unstored(&outsider, &forged).await)
                 .await
-                .expect_err("I313: a set signed by a party that does not speak for the owner");
+                .expect_err("I313: a row signed by a party that does not speak for the owner");
         assert!(
             matches!(&e, crate::federation::Error::KeyGrantRefused { reason, .. }
                 if *reason == "signer_not_stream_owner"),
@@ -1691,16 +1688,10 @@ pub(crate) mod bodies {
         let plain = write_self(&p.a, &p.owner, &stream, 9).await;
         let root = seal(&p, &stream).await;
         p.a.emit_pending_key_grants().await.unwrap();
-        for set in
-            p.sa.list_attestations_by(&p.key_a)
+        for set in key_grant_rows_for(p.sa.as_ref(), &p.key_a, &p.key_b).await {
+            p.b.apply_replicated_key_grant(set)
                 .await
-                .unwrap()
-                .into_iter()
-                .filter(|x| x.attestation_type.starts_with("key_grant:"))
-        {
-            p.b.apply_replicated_key_grant(SignedKeyGrantSet { attestation: set })
-                .await
-                .expect("B applies A's sets");
+                .expect("B applies A's rows");
         }
         let prov = BlobProvenance {
             author_key_id: p.owner.clone(),
@@ -2118,6 +2109,9 @@ mod unit {
             chunk_count: 0,
             closed,
             terminated: false,
+            supplied: false,
+            keep: true,
+            room_epoch: None,
         };
         assert_eq!(stream_target_epoch(None, 4), 4);
         assert_eq!(stream_target_epoch(Some(&rec(3, false)), 0), 3);
