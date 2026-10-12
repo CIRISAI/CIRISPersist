@@ -658,8 +658,10 @@ threat-model citations because this crate's audit story is the point.
   `Engine::register_stream_epoch_dek`, PyO3
   `register_stream_epoch_dek(cohort_scope, group_key_id, stream_id, epoch,
   dek_b64, aad_b64=None) -> str`): the caller supplies the
-  `(stream_id, epoch)` DEK (the MLS exporter secret of a live call), so the
-  live and the stored stream are one key. The door closes the stream's open
+  `(stream_id, epoch)` DEK (the stream's per-(stream, epoch) DEK the producer
+  derives from the group's MLS exporter, CC 5.1; CIRISConstitution#169, rc8
+  ruling: persist never derives it and never sees the exporter secret), so
+  the live and the stored stream are one key. The door closes the stream's open
   epoch with its terminator, self-retains the DEK under the content master
   (never derivable from persist state alone), marks the epoch `supplied`,
   wraps it to the stream's audience and emits the `key_grant:stream:v1` rows.
@@ -705,7 +707,7 @@ threat-model citations because this crate's audit story is the point.
   epoch (see "Fixed — provenance epoch on stream-keyed room chunks" below).
 - **New door:** `register_stream_epoch_dek` (above). No `keep`: an unrecorded
   live call seals its frames in memory with `stream_seal::seal_stream_chunk`
-  under the MLS exporter secret and never calls it.
+  under its per-(stream, epoch) DEK and never calls it.
 - **`chunk_dag_cascade::terminator_seq(epoch)` and `TERMINATOR_SEQ_BASE` are
   public** (also under `orchestrate`): an epoch terminator's storage seq, the
   `storage_seq` argument to `seal_stream_chunk` / `open_stream_chunk` for a
@@ -825,6 +827,16 @@ threat-model citations because this crate's audit story is the point.
     `misbuilt_axis_state(signer, axis)` reads the per-axis state, which lives
     in this process only.
   - An axis that later emits normally forgets its state.
+- **Upgraded nodes:** v54 shipped the owner bug, so every v54 node holds
+  self/family content axes marked emitted with no row. No new step is needed:
+  V192 (`key_grant_rows_reemit`, the slice-B SET → rows reset, run once by the
+  migration runner) already sets EVERY emission axis dirty, content axes
+  included. The first boot sweep on v55 then emits them under the fixed owner.
+  I769 (sqlite, postgres) witnesses this: a seeded v54 state (blob, ledger
+  clean, no row) gets no row from the dirty loop before the upgrade, then
+  reaches the owner's second device after V192 and a boot. V192 replayed and a
+  second boot emit nothing more. Removing V192's `federation_blobs` reset, or
+  reverting the owner fix, turns I769 red.
 - **Adoption:** `KeyGrantEmission` and `KeyGrantEmissionPlan` gain the field
   `misbuilt: Option<String>`, so a struct literal must name it. It is
   `#[serde(default)]` on the wire.
@@ -870,7 +882,8 @@ threat-model citations because this crate's audit story is the point.
     retro re-key and seal-time grant walks no longer skip anything.
 - **An unrecorded live call** never comes to persist's DEK door. The adopter
   seals its frames in memory with `stream_seal::seal_stream_chunk` under the
-  MLS exporter secret. If it holds the resulting ciphertext, it may adopt it
+  stream's per-(stream, epoch) DEK, which it derives from the group's MLS
+  exporter (CC 5.1; CIRISConstitution#169, rc8 ruling). If it holds the resulting ciphertext, it may adopt it
   through `adopt_sealed_chunks` with a `for_stream_keyed_chunk` provenance;
   persist stores the ciphertext and no key (I753).
 - **Witnesses:**
