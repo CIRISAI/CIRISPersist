@@ -239,11 +239,10 @@ pub(crate) enum ConnClass {
 /// and are `Write`.
 #[cfg(test)]
 pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
-    ("accord_nonce_issued", ConnClass::Read),
     ("add_peer_record", ConnClass::Write),
     ("adopt_genesis_reanchor", ConnClass::Write),
     ("adopt_scrub_upgrade", ConnClass::Write),
-    ("store_rebound_key_record", ConnClass::Write),
+    ("write_replaced_key_registration", ConnClass::Write),
     // #846 (§6.1) — the adopt floor: row + declared binding + holder claim in
     // one transaction.
     ("adopt_sealed_blob_at", ConnClass::Write),
@@ -346,7 +345,6 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("insert_known_wire_hash", ConnClass::Write),
     ("insert_trace_events_batch", ConnClass::Write),
     ("insert_trace_llm_calls_batch", ConnClass::Write),
-    ("issue_accord_nonce", ConnClass::Write),
     ("known_wire_hash_contains", ConnClass::Read),
     ("last_witness_epoch_for_peer", ConnClass::Read),
     ("latest_stream_sth", ConnClass::Read),
@@ -612,6 +610,26 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("blob_associations", ConnClass::Read),
     // v54.0.0 (#996) — the outbound queue's status-grouped COUNT.
     ("outbound_counts", ConnClass::Read),
+    // v54.1.0 (CIRISPersist#1046) — the steward purge plane (V187): the
+    // selection reads, the ledger header + tombstone writes, the delete doors
+    // `purge_finalize` drives, and the #1043 legacy-row test seam.
+    ("purge_scan_attestations", ConnClass::Read),
+    ("purge_trace_ids_for_llm_model", ConnClass::Read),
+    ("purge_trace_ids_signed_by", ConnClass::Read),
+    ("purge_trace_row_counts", ConnClass::Read),
+    ("purge_put_execution", ConnClass::Write),
+    ("purge_execution", ConnClass::Read),
+    ("purge_tombstones_of", ConnClass::Read),
+    ("purge_tombstoned", ConnClass::Read),
+    ("purge_tombstone_notices", ConnClass::Read),
+    ("list_purge_executions_since", ConnClass::Read),
+    ("purge_delete_tombstoned_attestation", ConnClass::Write),
+    ("purge_delete_tombstoned_trace", ConnClass::Write),
+    ("purge_mark_finalized", ConnClass::Write),
+    ("test_seam_set_attestation_asserted_at", ConnClass::Write),
+    ("test_seam_set_key_identity_type", ConnClass::Write),
+    ("test_seam_drop_purge_tombstone", ConnClass::Write),
+    ("test_seam_factor_rollup_trace_counts", ConnClass::Read),
     ("put_blob_chunks", ConnClass::Write),
     ("put_blob_with_scope", ConnClass::Write),
     ("put_calibration_bundle", ConnClass::Write),
@@ -697,6 +715,13 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
         ConnClass::HelperWrite,
     ),
     ("sqlite_project_consent_peer_set", ConnClass::HelperWrite),
+    // v54.1.0 (Codex round 3 on PR #1057) — the Art. 17 detection tombstone,
+    // shared by the DSAR erasure and the steward purge's trace delete.
+    ("sqlite_tombstone_detection_events", ConnClass::HelperWrite),
+    (
+        "sqlite_drop_orphaned_thought_signatures",
+        ConnClass::HelperWrite,
+    ),
     // v45.0.0 (#871) — the V149 `blob_renditions` projection, a free fn over
     // the writer's connection called from the three attestation doors.
     ("sqlite_project_rendition_row", ConnClass::HelperWrite),
@@ -736,7 +761,9 @@ mod gate {
     fn production_text(text: &str) -> String {
         let mut out = String::with_capacity(text.len());
         for line in text.lines() {
-            if line.starts_with("#[cfg(test)]") {
+            // v54.1.0 (#1026): `#[cfg(all(test, …))]` at column 0 starts
+            // the test half as well.
+            if !line.starts_with(char::is_whitespace) && crate::test_cfg::is_test_only_cfg(line) {
                 break;
             }
             out.push_str(line);

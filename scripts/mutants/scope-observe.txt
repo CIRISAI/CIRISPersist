@@ -1,0 +1,18 @@
+# Mutation scope: the read and fold counters (CIRISPersist#1014, #1024).
+# Nightly, in two shards.
+#
+# v54.1.0 (CIRISPersist#1051) — split from scope-consent.txt, which held these
+# and the consent gate together: 85 mutants did not fit the 2-hour budget
+# (rc 124, 8 never tested). The consent gate is scope-consent-gate.txt. The
+# witnesses are I549-I553 and the counter witnesses added for #1037 (I690-):
+# I552/I553 were outside the old filter, so `emit_metrics -> ()` survived a
+# scope that had a witness for it.
+#
+# Not in this scope: the backend byte meters and the fold entries in the
+# 3k-28k-line files; see scope-observe-sites.txt.
+
+tests: test(/i549|i550|i551|i552|i553|i69[0-9]/)
+witnesses: src/observe/tests.rs
+
+src/observe/mod.rs
+src/observe/catalog.rs

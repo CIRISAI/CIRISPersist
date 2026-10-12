@@ -73,6 +73,16 @@ mod tests {
                 )),
             ),
             (
+                "consent_by_humans::capacity_consent_stance_with_basis",
+                std::mem::size_of_val(&cbh::capacity_consent_stance_with_basis(
+                    d,
+                    "a",
+                    "b",
+                    ConsentGatedFamily::Capacity,
+                    now,
+                )),
+            ),
+            (
                 "consent_by_humans::resolve_scoped_stance_by_principals",
                 std::mem::size_of_val(&cbh::resolve_scoped_stance_by_principals(
                     d, "a", "b", "analyze", None, now,
@@ -119,6 +129,15 @@ mod tests {
             (
                 "Engine::capacity_consent_stance",
                 std::mem::size_of_val(&e.capacity_consent_stance(
+                    "a",
+                    "b",
+                    ConsentGatedFamily::Capacity,
+                    now,
+                )),
+            ),
+            (
+                "Engine::capacity_consent_stance_with_basis",
+                std::mem::size_of_val(&e.capacity_consent_stance_with_basis(
                     "a",
                     "b",
                     ConsentGatedFamily::Capacity,

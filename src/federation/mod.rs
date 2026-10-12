@@ -99,6 +99,9 @@ pub mod consent_by_humans_invariants;
 // v53.1.8 (#1013) — I548: the capacity gate and a scorer's precheck ask one fold.
 #[cfg(test)]
 mod capacity_consent_invariants;
+// v54.1.0 (#1041) — I622–I624: the consent basis names the rows a stance rests on.
+#[cfg(test)]
+mod consent_basis_invariants;
 // v54.0.0 (#1015) — I570: a steward's shorter `retain` window naming the machine bounds both
 // retention sweeps.
 pub mod consent_expiry;
@@ -324,6 +327,18 @@ pub mod claim_signing_invariants;
     any(feature = "postgres", feature = "sqlite")
 ))]
 pub mod key_rebind_invariants;
+// v54.1.0 (#1042) — the ordering-gap witnesses drive the key plan too.
+#[cfg(all(
+    any(test, feature = "test-anchor"),
+    any(feature = "postgres", feature = "sqlite")
+))]
+pub mod attester_key_unknown_invariants;
+// v54.1.0 (#1044) — the invalid-replace witnesses drive the key plan.
+#[cfg(all(
+    any(test, feature = "test-anchor"),
+    any(feature = "postgres", feature = "sqlite")
+))]
+pub mod invalid_replace_invariants;
 // (CIRISPersist#519 item 3) — the invariant-registry admission enforcement
 // + consistency witness: the admission-enforceable subset of the vendored
 // `invariant_registry` (571 invariants / 104 families) and the executed
@@ -546,6 +561,9 @@ pub mod reverse_quorum;
 pub mod schema_resolver;
 pub mod scores;
 pub mod scores_read_audit;
+pub mod steward_purge;
+#[cfg(test)]
+mod steward_purge_invariants;
 pub mod trust_root;
 // CIRISPersist#210 — cross-process leader election (RNS shared-instance
 // owner; CIRISEdge#100). Backend-agnostic types + staleness helper; the
@@ -2839,6 +2857,30 @@ pub trait FederationDirectory: Send + Sync {
         let _ = record;
         Err(Error::Unsupported {
             method: "store_rebound_key_record",
+        })
+    }
+
+    /// v54.1.0 (CIRISPersist#1044) — **the invalid-replace store step.**
+    /// Reached through the plan's `ReplaceInvalid` arm (the replicated apply
+    /// and `Engine::rebind_key_record`); the shared pre-check
+    /// (`register::prepare_invalid_replace`) RE-ASSERTS the rule — same
+    /// pubkeys, same claim, the stored record fails `verify_key_registration`
+    /// structurally, the row to write passes it — then one atomic write:
+    /// the stored claim with the incoming envelope, scrubber and scrubs,
+    /// `persist_row_hash` recomputed, `mutated_at` moved so peers re-serve
+    /// it, and the replaced bytes appended to
+    /// `federation_key_registration_history` with `replacement_kind =
+    /// invalid_replaced` and `replaced_row_hash` = the replaced row's hash.
+    /// `Conflict` if the stored row verifies or changed under the plan.
+    /// Returns [`register::ReplicatedKeyOutcome::InvalidReplaced`]. Default
+    /// `Unsupported`; every real backend overrides.
+    async fn store_invalid_replaced_key_record(
+        &self,
+        record: SignedKeyRecord,
+    ) -> Result<register::ReplicatedKeyOutcome, Error> {
+        let _ = record;
+        Err(Error::Unsupported {
+            method: "store_invalid_replaced_key_record",
         })
     }
 
@@ -5677,6 +5719,173 @@ pub trait FederationDirectory: Send + Sync {
         limit: u32,
     ) -> Result<Vec<ServedAttestation>, Error>;
 
+    // ── v54.1.0 (CIRISPersist#1046) — the steward purge plane ──────────────
+    //
+    // The store half of [`steward_purge`]: the scan and trace reads the
+    // selection classes resolve over, the ledger header + tombstone tables
+    // (V187), and the delete doors `purge_finalize` drives. Defaulted
+    // `Unsupported`; memory, sqlite and postgres override every one.
+
+    /// Every attestation row, EVERY tier, whose `attestation_id` sorts after
+    /// `after_id`, ordered by `attestation_id`, at most `limit`. The selection
+    /// classes' scan ([`steward_purge::scan_attestations`]); never a serve
+    /// surface.
+    async fn purge_scan_attestations(
+        &self,
+        after_id: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<Attestation>, Error> {
+        let _ = (after_id, limit);
+        Err(Error::Unsupported {
+            method: "purge_scan_attestations",
+        })
+    }
+
+    /// The distinct `trace_id`s with a `trace_llm_calls` row whose `model` is
+    /// `model`, sorted (CIRISPersist#1040).
+    async fn purge_trace_ids_for_llm_model(&self, model: &str) -> Result<Vec<String>, Error> {
+        let _ = model;
+        Err(Error::Unsupported {
+            method: "purge_trace_ids_for_llm_model",
+        })
+    }
+
+    /// The distinct `trace_id`s of `trace_events` rows signed by `key_id`
+    /// (`signing_key_id`), sorted.
+    async fn purge_trace_ids_signed_by(&self, key_id: &str) -> Result<Vec<String>, Error> {
+        let _ = key_id;
+        Err(Error::Unsupported {
+            method: "purge_trace_ids_signed_by",
+        })
+    }
+
+    /// `(trace_events rows, trace_llm_calls rows)` held for `trace_ids`.
+    async fn purge_trace_row_counts(&self, trace_ids: &[String]) -> Result<(u64, u64), Error> {
+        let _ = trace_ids;
+        Err(Error::Unsupported {
+            method: "purge_trace_row_counts",
+        })
+    }
+
+    /// Record an execution header AND its whole tombstone set, in ONE
+    /// transaction (Codex on PR #1057): a failure or a process loss leaves
+    /// neither, never a durable header holding part of its `record_count`.
+    ///
+    /// The header is inserted unless held (the notice id is the hash of the
+    /// notice bytes, so a second one is the same notice; the first is kept,
+    /// and the store stamps `admitted_at`). Each tombstone
+    /// (`(notice_id, plane, record_ref)`) is inserted unless held, so a re-run
+    /// completes a set an earlier, non-atomic write left partial. Refused
+    /// (`Error::InvalidArgument`) when `tombstones` is not exactly
+    /// `record_count` rows of this notice.
+    async fn purge_put_execution(
+        &self,
+        execution: &steward_purge::PurgeExecution,
+        tombstones: &[steward_purge::PurgeTombstone],
+    ) -> Result<steward_purge::PurgePutOutcome, Error> {
+        let _ = (execution, tombstones);
+        Err(Error::Unsupported {
+            method: "purge_put_execution",
+        })
+    }
+
+    /// The execution header for `notice_id`, if held.
+    async fn purge_execution(
+        &self,
+        notice_id: &str,
+    ) -> Result<Option<steward_purge::PurgeExecution>, Error> {
+        let _ = notice_id;
+        Err(Error::Unsupported {
+            method: "purge_execution",
+        })
+    }
+
+    /// Every tombstone of `notice_id`, ordered by ordinal.
+    async fn purge_tombstones_of(
+        &self,
+        notice_id: &str,
+    ) -> Result<Vec<steward_purge::PurgeTombstone>, Error> {
+        let _ = notice_id;
+        Err(Error::Unsupported {
+            method: "purge_tombstones_of",
+        })
+    }
+
+    /// The (lexically first) notice id that tombstoned `(plane, record_ref)`,
+    /// if any — the admission gates' read.
+    async fn purge_tombstoned(
+        &self,
+        plane: &str,
+        record_ref: &str,
+    ) -> Result<Option<String>, Error> {
+        let _ = (plane, record_ref);
+        Err(Error::Unsupported {
+            method: "purge_tombstoned",
+        })
+    }
+
+    /// v54.1.0 (Codex round 4 on PR #1057) — EVERY notice id that tombstoned
+    /// `(plane, record_ref)`, sorted. [`Self::purge_tombstoned`] answers "is it
+    /// tombstoned"; this answers "by which purges", for a decision that must
+    /// ask each one (a shared DAG chunk is deleted only once every purge that
+    /// withholds it has settled).
+    async fn purge_tombstone_notices(
+        &self,
+        plane: &str,
+        record_ref: &str,
+    ) -> Result<Vec<String>, Error> {
+        let _ = (plane, record_ref);
+        Err(Error::Unsupported {
+            method: "purge_tombstone_notices",
+        })
+    }
+
+    /// Execution headers since a `(admitted_at, notice_id)` cursor, ordered
+    /// by it — the tombstone plane's serve read.
+    async fn list_purge_executions_since(
+        &self,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
+        limit: u32,
+    ) -> Result<Vec<steward_purge::PurgeExecution>, Error> {
+        let _ = (since, limit);
+        Err(Error::Unsupported {
+            method: "list_purge_executions_since",
+        })
+    }
+
+    /// Hard-delete ONE attestation row — only if a purge tombstone names it
+    /// (the door's own gate, in the same statement). `Ok(true)` if removed.
+    async fn purge_delete_tombstoned_attestation(
+        &self,
+        attestation_id: &str,
+    ) -> Result<bool, Error> {
+        let _ = attestation_id;
+        Err(Error::Unsupported {
+            method: "purge_delete_tombstoned_attestation",
+        })
+    }
+
+    /// Hard-delete a trace's `trace_events` and `trace_llm_calls` rows — only
+    /// if a purge tombstone names the trace. `(events, llm_calls)` deleted.
+    async fn purge_delete_tombstoned_trace(&self, trace_id: &str) -> Result<(u64, u64), Error> {
+        let _ = trace_id;
+        Err(Error::Unsupported {
+            method: "purge_delete_tombstoned_trace",
+        })
+    }
+
+    /// Stamp `finalized_at` on the header. `Ok(true)` if it was unset.
+    async fn purge_mark_finalized(
+        &self,
+        notice_id: &str,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, Error> {
+        let _ = (notice_id, at);
+        Err(Error::Unsupported {
+            method: "purge_mark_finalized",
+        })
+    }
+
     /// v53.0.0 (CIRISPersist#975, CC 2.4 ask 4) — every stored
     /// `attestation_type` with its row count and `asserted_at` span, every
     /// tier. The inventory [`row_type::row_type_report`] filters to the types
@@ -5816,7 +6025,7 @@ pub trait FederationDirectory: Send + Sync {
     /// # Why this is on the trait and not only a free function
     ///
     /// The free function composes five directory calls
-    /// (`issue_accord_nonce`, `put_accord_proposal`, `put_accord_participation`,
+    /// (`put_accord_proposal`, `put_accord_participation`,
     /// `list_accord_participations`, plus the projection's reads), which is
     /// fine against a real backend and useless across the FFI directory
     /// capsule, where those primitives are `Unsupported`. A capsule-backed
@@ -9286,11 +9495,18 @@ pub trait FederationDirectory: Send + Sync {
     // state; the SERVER runs the tally. Recovery (H7) is absent (CIRISAccord#4
     // gate). See [`crate::federation::accord_quorum`].
 
-    /// #302 — admit an `accord_proposal` (server-issued). M4 fail-closed: the
-    /// proposal's `nonce` MUST already be issued for its family
-    /// ([`Self::issue_accord_nonce`]) or the write is rejected. The digest is
+    /// #302 — admit an `accord_proposal`. The digest is
     /// derived via verify-core ([`AccordProposal::digest`](ciris_verify_core::accord_live_quorum::AccordProposal::digest));
     /// the object is stored verbatim. Idempotent on a byte-identical re-PUT.
+    ///
+    /// v54.1.0 (CIRISPersist#1047, CIRISConstitution#146, verify 20) — the
+    /// `nonce` is minted by the PROPOSER, never issued by a server ("a server
+    /// is part of what a halt may need to stop, and no accord act depends on
+    /// one", CC 4.2.6). Verify checks its form; single use is this store's
+    /// dedup: a nonce names ONE proposal per family, so a different proposal
+    /// carrying a nonce already used in its family is [`Error::Conflict`]
+    /// and is not stored. The pre-v54.1 issued-nonce gate (M4) and its
+    /// `issue_accord_nonce` / `accord_nonce_issued` pair are gone.
     async fn put_accord_proposal(
         &self,
         proposal: ciris_verify_core::accord_live_quorum::AccordProposal,
@@ -9411,13 +9627,6 @@ pub trait FederationDirectory: Send + Sync {
         family_key_id: &str,
         active_halt_id: &str,
     ) -> Result<(), Error>;
-
-    /// #302 (M4) — record a server-issued proposal nonce (idempotent).
-    async fn issue_accord_nonce(&self, family_key_id: &str, nonce: &str) -> Result<(), Error>;
-
-    /// #302 (M4) — has this `(family_key_id, nonce)` been issued? The
-    /// fail-closed gate `put_accord_proposal` consults.
-    async fn accord_nonce_issued(&self, family_key_id: &str, nonce: &str) -> Result<bool, Error>;
 }
 
 /// Federation directory errors. Distinct from
@@ -9436,6 +9645,118 @@ pub enum Error {
     /// caller bug. Persist does not store the row.
     #[error("scrub-signature verification failed: {0}")]
     SignatureInvalid(String),
+
+    /// v54.1.0 (CIRISPersist#1042) — **an ordering gap, not a bad
+    /// signature.** The row names a signer (`attesting_key_id`, a key
+    /// record's `scrub_key_id`, a co-signer) whose Key row this node does not
+    /// hold YET, so its signature cannot be checked here. Nothing was stored
+    /// and nothing is marked: the SAME row is admitted when it is re-offered
+    /// after the signer's Key row lands (the sender's round sends the key
+    /// plane before its dependents).
+    ///
+    /// **Retryable**, and that is the whole point of the variant: before
+    /// v54.1.0 it read as [`Error::SignatureInvalid`] (and on the attestation
+    /// plane as [`Error::FederationTierUnverified`]), the TERMINAL verdicts,
+    /// so a sender could not tell a row that will verify tomorrow from a row
+    /// that never will. Consumers key on [`Error::kind`]
+    /// (`federation_attester_key_unknown`), never on this text. On the key
+    /// plane's apply outcome the same fact is
+    /// [`register::KeyRefusalReason::AttesterKeyUnknown`]
+    /// (`attester_key_unknown`).
+    #[error(
+        "{plane}: signer {attesting_key_id} is not a registered federation key on this node yet \
+         — an ordering gap, not a bad signature; re-offer the row after its Key row lands"
+    )]
+    AttesterKeyUnknown {
+        /// The signer this node holds no Key row for.
+        attesting_key_id: String,
+        /// The door that needed it: `key_registration`, `identity_occurrence`,
+        /// `identity_occurrence_revocation`, `transport_destination`,
+        /// `touch_claim`, `touch_claim_cosigner`, `attestation` (the store's
+        /// attester lookup on `put_attestation`) or `signed_envelope`
+        /// (attestations, revocations and every other envelope-signed row),
+        /// or `purge_tombstone_subject` (v54.1.0: a row arriving at a
+        /// steward-purge-tombstoned id names a SUBJECT whose key is not held
+        /// yet, so the interim person check cannot be asked; the key here is
+        /// that subject's, not a signer's).
+        plane: &'static str,
+    },
+
+    /// v54.1.0 (CIRISPersist#1042 follow-up, CIRISEdge#858) — **the signer
+    /// does not act for the identity the row is about YET.** The signature
+    /// verified, but `attesting_key_id` is neither `identity_key_id` itself,
+    /// nor an ACTIVE occurrence of it, nor a node it owns through a live
+    /// owner binding. On a fresh node that is an ordering gap: the owner
+    /// binding or the occurrence that lets this signer vouch has not landed
+    /// (the #776 standup race). Nothing is stored or marked; the SAME row is
+    /// admitted when it is re-offered after that binding or occurrence lands.
+    ///
+    /// **Retryable.** Before v54.1.0 this read as [`Error::SignatureInvalid`],
+    /// which is now terminal on every door: it means only that a signature
+    /// does not verify (or the signed bytes are malformed). Stable `kind()`
+    /// token `federation_signer_not_acting_for`; Python `ValueError`, the type
+    /// of the arm it was split from. Raised by `admission::check_signer_acts_for`.
+    #[error(
+        "{plane}: signer {attesting_key_id} does not act for {identity_key_id} on this node yet \
+         (not that identity, an active occurrence of it, nor a node it owns) — re-offer the row \
+         after the binding or occurrence lands"
+    )]
+    SignerDoesNotActFor {
+        /// The row's signer.
+        attesting_key_id: String,
+        /// The identity the row is about (for `transport_destination`, the
+        /// route's `occurrence_key_id`; for `touch_claim`, the touched target).
+        identity_key_id: String,
+        /// The door: `identity_occurrence`, `identity_occurrence_revocation`,
+        /// `transport_destination` or `touch_claim`.
+        plane: &'static str,
+    },
+
+    /// v54.1.0 (CIRISPersist#1042 follow-up C, CIRISEdge#858) — a
+    /// `licensure:{A}` row that claims a delegation (`delegation_id`) is not
+    /// the authority's own issuance on a live `license` chain from `A` (CC
+    /// 3.3.9 / CC 4.4.3.4.3). **Refused, terminal for these bytes.** Before
+    /// v54.1.0 this was an [`Error::InvalidArgument`] whose prose an adopter had
+    /// to prefix-match; `reason` is now the stable token, one of
+    /// [`admission::licensure_refusal`]'s constants (the
+    /// [`admission::LicensureChainBreak`] tokens and
+    /// `not_authority_at_receipt`). The Display is the pre-v54.1 text,
+    /// unchanged. Stable `kind()` token
+    /// `federation_licensure_delegator_not_authority`; Python `ValueError`, the
+    /// type of the `InvalidArgument` arm it replaces.
+    #[error("invalid argument: {message}")]
+    LicensureDelegatorNotAuthority {
+        /// The row's emitter.
+        attesting_key_id: String,
+        /// The `authority_id` the row's `licensure:{A}` dimension names.
+        authority_id: String,
+        /// Why: an [`admission::licensure_refusal`] token.
+        reason: &'static str,
+        /// The full refusal text (the Display).
+        message: String,
+    },
+
+    /// v54.1.0 (CIRISPersist#1042 follow-up C, CIRISEdge#858;
+    /// CIRISPersist#1047) — an `accord_proposal` whose proposer-minted nonce
+    /// already names a DIFFERENT proposal in its family. **Refused, terminal
+    /// for these bytes**: single use is the substrate's dedup. Before it was an
+    /// [`Error::Conflict`] whose prose an adopter had to prefix-match; the
+    /// stable token is [`accord_quorum::ACCORD_PROPOSAL_NONCE_REUSED`] and the
+    /// Display is the previous text, unchanged. Stable `kind()` token
+    /// `federation_accord_proposal_nonce_reused`; Python `ValueError`, the type
+    /// of the `Conflict` arm it replaces.
+    #[error(
+        "conflicts with existing row: accord_proposal_nonce_reused: nonce {nonce:?} in family \
+         {family_key_id:?} already names proposal {existing_proposal_digest}"
+    )]
+    AccordProposalNonceReused {
+        /// The proposal's family.
+        family_key_id: String,
+        /// The reused nonce.
+        nonce: String,
+        /// The digest of the proposal the nonce already names.
+        existing_proposal_digest: String,
+    },
 
     /// A write quota refused this row. `reason` names WHICH budget —
     /// per-peer, per-node, reserved-family, or the untracked tail — and in
@@ -11582,15 +11903,55 @@ pub enum Error {
         /// What the identity was needed for, so the message is actionable.
         needed_for: &'static str,
     },
+
+    /// v54.1.0 (CIRISPersist#1046, CIRISConstitution#165) — **the steward
+    /// purge door refused.** `token` is one of the closed set in
+    /// [`steward_purge::token`] (`purge_unauthorised`,
+    /// `purge_selection_digest_mismatch`, `purge_selection_count_mismatch`,
+    /// `purge_retraction_inadmissible`, …) and is what [`Error::kind`]
+    /// returns, so a host maps it to a stable reason id without parsing prose.
+    /// `body` carries the typed detail the CSD-108 operator flow renders
+    /// (`{table, expected, found}`, `{record_id, plane, index, total}`, …).
+    #[error("{token}: {body}")]
+    PurgeRefused {
+        /// The stable refusal token.
+        token: &'static str,
+        /// The typed detail, a JSON object.
+        body: serde_json::Value,
+    },
 }
 
 impl Error {
+    /// v54.1.0 (CIRISPersist#1042 follow-up B, CIRISEdge#858) — the refusal
+    /// for a signer this node holds no Key row for. THE one constructor of
+    /// [`Error::AttesterKeyUnknown`]: a row that names NO signer (an empty or
+    /// blank id) is malformed, a terminal [`Error::InvalidArgument`], never the
+    /// retryable ordering gap — no Key row can ever land for `""`.
+    pub(crate) fn unknown_signer(attesting_key_id: &str, plane: &'static str) -> Self {
+        if attesting_key_id.trim().is_empty() {
+            return Error::InvalidArgument(format!(
+                "{plane}: the row names no signer (empty attesting key id) — malformed, not an \
+                 ordering gap"
+            ));
+        }
+        Error::AttesterKeyUnknown {
+            attesting_key_id: attesting_key_id.to_owned(),
+            plane,
+        }
+    }
+
     /// Stable string-token for telemetry / structured logging.
     pub fn kind(&self) -> &'static str {
         match self {
             Error::NodeIdentityUnset { .. } => "federation_node_identity_unset",
             Error::InvalidArgument(_) => "federation_invalid_argument",
             Error::SignatureInvalid(_) => "federation_signature_invalid",
+            Error::AttesterKeyUnknown { .. } => "federation_attester_key_unknown",
+            Error::SignerDoesNotActFor { .. } => "federation_signer_not_acting_for",
+            Error::LicensureDelegatorNotAuthority { .. } => {
+                "federation_licensure_delegator_not_authority"
+            }
+            Error::AccordProposalNonceReused { .. } => "federation_accord_proposal_nonce_reused",
             Error::RateLimited { .. } => "federation_rate_limited",
             Error::ConsentGateRefused(_) => "federation_consent_gate_refused",
             Error::ConsentScopeTokenInvalid { .. } => "federation_consent_scope_token_invalid",
@@ -11718,6 +12079,7 @@ impl Error {
             Error::WitnessAdmit(e) => e.kind(),
             Error::Backend(_) => "federation_backend",
             Error::Unsupported { .. } => "federation_ops_proxy_unsupported",
+            Error::PurgeRefused { token, .. } => token,
         }
     }
 

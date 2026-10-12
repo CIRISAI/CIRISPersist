@@ -139,6 +139,23 @@ expect_eq "other pins left alone" "$(grep -c 'ciris-persist@31.0.0$' "$t/cc.tsv"
 expect_eq "nothing left at prev" "$(grep -cE 'ciris-persist@9\.8\.10([^0-9]|$)' "$t/cc.tsv")" "0"
 if rl_restamp_evidence "$t/cc.tsv" 9.8.10 9.9.0 >/dev/null; then bad "a second re-stamp (nothing to do) fails"; else ok "a second re-stamp (nothing to do) fails"; fi
 
+echo "evidence re-stamp agrees with the generator (#1052)"
+# The bump path on a fixture tree: a tsv generated at 9.8.10, then the
+# bump's own Cargo.toml rewrite and re-stamp; the generator must agree, and
+# must not before the re-stamp.
+g="$t/gen"; mkdir -p "$g/evidence" "$g/src/federation/namespace"
+printf '[package]\nname = "ciris-persist"\nversion = "9.8.10"\n' > "$g/Cargo.toml"
+printf '{"evidence_export": {"CIRISPersist": [{"decimal_id": "1.1", "claim_id": "CLM-a", "repo": "CIRISPersist", "path#symbol": "src/a.rs#f", "tsv_target": "evidence/cc_impl.tsv"}, {"decimal_id": "1.2", "claim_id": "CLM-x", "repo": "CIRISPersist", "path#symbol": "ciris-verify-core/src/x.rs#g", "tsv_target": "evidence/cc_impl.tsv", "crate": "ciris-persist@31.0.0"}]}}' > "$g/src/federation/namespace/namespace_supersets.json"
+gen() { EVIDENCE_TSV_ROOT="$g" python3 scripts/evidence_tsv.py "$1" >/dev/null 2>&1; }
+gen write; expect_eq "generated at 9.8.10 checks clean" "$(gen check; echo $?)" "0"
+sed -i -E '0,/^version = "9\.8\.10"/s//version = "9.9.0"/' "$g/Cargo.toml"
+expect_eq "bumped Cargo.toml, not yet re-stamped: the generator disagrees" "$(gen check; echo $?)" "1"
+expect_eq "the re-stamp moves the src/ row only" "$(rl_restamp_evidence "$g/evidence/cc_impl.tsv" 9.8.10 9.9.0)" "1"
+expect_eq "re-stamped: the generator agrees" "$(gen check; echo $?)" "0"
+# shellcheck disable=SC2016  # literal: grep text, not an expansion
+sed -n '/^bump() {/,/^}/p' scripts/release.sh | awk '/rl_restamp_evidence/{r=NR} /python3 scripts\/evidence_tsv.py check/{c=NR} /return 22; }$/{if (c && NR>=c && !g) g=NR} /git add /{a=NR} END{exit !(r && c && r<c && g && a && g<a)}' \
+    && ok "bump checks the generator after the re-stamp, before the commit" || bad "bump does not check the generator between re-stamp and commit"
+
 echo "stage state and resume"
 S="$t/state"; mkdir -p "$S"
 runs=0; count() { runs=$((runs + 1)); }
@@ -393,6 +410,50 @@ expect_eq "resume: bump done with no release commit recorded is refused (32)" "$
 grep -q 'rl_put "$S" branch "$branch"' scripts/release.sh && ok "release.sh records the branch at preflight" || bad "release.sh does not record the branch"
 # shellcheck disable=SC2016  # literal: grep text, not an expansion
 grep -q 'rl_put "$S" bump_sha "$(head_sha)"' scripts/release.sh && ok "release.sh records the release commit at bump" || bad "release.sh does not record the release commit"
+
+echo "gh attestation at preflight (#1045 item 1)"
+mkdir -p "$t/gh-old" "$t/gh-new"
+printf '#!/bin/sh\ncase "$1" in --version) echo "gh version 2.45.0";; *) echo "unknown command \\"$1\\" for \\"gh\\"" >&2; exit 1;; esac\n' > "$t/gh-old/gh"
+printf '#!/bin/sh\n[ "$1 $2 $3" = "attestation verify --help" ] && exit 0; exit 1\n' > "$t/gh-new/gh"
+chmod +x "$t/gh-old/gh" "$t/gh-new/gh"
+if rl_gh_has_attestation "$t/gh-old/gh"; then bad "gh 2.45 (no attestation) passes the probe"; else ok "gh 2.45 (no attestation) fails the probe"; fi
+if rl_gh_has_attestation "$t/gh-new/gh"; then ok "a gh with 'attestation verify' passes the probe"; else bad "a gh with 'attestation verify' fails the probe"; fi
+if rl_gh_has_attestation "$t/no-such-gh"; then bad "a missing gh passes the probe"; else ok "a missing gh fails the probe"; fi
+# shellcheck disable=SC2016  # literal: grep text, not an expansion
+sed -n '/^preflight() {/,/^}/p' scripts/release.sh | grep -q 'rl_gh_has_attestation "${GH:-gh}"' \
+    && ok "release.sh preflight asks the gh probe, GH= honoured" || bad "release.sh preflight does not ask the gh probe"
+
+echo "certify waits for foreign cargo (#1045 item 3)"
+# A pgrep shim that reports a cargo for the first N calls, then none.
+cat > "$t/pgrep-n" <<'PGEOF'
+#!/bin/sh
+n=$(cat "$PG_COUNT" 2>/dev/null || echo 0); echo $((n + 1)) > "$PG_COUNT"
+[ "$n" -lt "$PG_BUSY" ] && echo "4242 cargo build --release"
+exit 0
+PGEOF
+chmod +x "$t/pgrep-n"
+wq() { rm -f "$t/pg-count"; out="$(PG_COUNT="$t/pg-count" PG_BUSY="$1" RL_PGREP="$t/pgrep-n" rl_wait_quiet_cargo "$2" "$3" 1 2>&1)"; rc=$?; calls=$(cat "$t/pg-count" 2>/dev/null || echo 0); }
+wq 0 3 10; expect_eq "no foreign cargo: start at once" "$rc/$calls" "0/1"
+wq 2 3 10; expect_eq "a cargo for 2 polls: wait, then 3 quiet polls" "$rc" "0"
+case "$out" in *"waiting for foreign cargo"*"4242 cargo build"*) ok "the wait names the process";; *) bad "wait text: $out";; esac
+wq 1000 3 5; expect_eq "a cargo that never stops: give up at the bound (1)" "$rc" "1"
+CERTIFY_IGNORE_STRAY=1 wq 1000 3 5; expect_eq "CERTIFY_IGNORE_STRAY=1: no wait, no poll" "$rc/${calls:-0}" "0/0"
+# release.sh's own certify() run against stubs (a mention, a `: ` no-op or a
+# call after certify.sh would each pass a grep): a wait that gives up must
+# return 24 before certify.sh starts, and a quiet box must start it.
+mkdir -p "$t/cert/scripts" "$t/cert/S"
+printf '#!/bin/sh\necho ran > "%s/cert/ran"; echo "EVERY CI LEG GREEN BY EXIT CODE. Logs in x"\n' "$t" > "$t/cert/scripts/certify.sh"
+chmod +x "$t/cert/scripts/certify.sh"
+cert_rc() {
+    rm -f "$t/cert/ran"
+    local src; src="$(pwd)/scripts/release.sh"
+    ( cd "$t/cert" && S="$t/cert/S"
+      eval "$(sed -n '/^certify() {/,/^}/p' "$src")"
+      eval "rl_wait_quiet_cargo() { return $1; }"
+      certify >/dev/null 2>&1 ); echo "$?/$([ -f "$t/cert/ran" ] && echo ran || echo not-run)"
+}
+expect_eq "certify stage: the wait gives up -> 24, certify.sh never started" "$(cert_rc 1)" "24/not-run"
+expect_eq "certify stage: a quiet box -> certify.sh runs" "$(cert_rc 0)" "0/ran"
 
 echo "syntax"
 for f in scripts/release.sh scripts/release_ship.sh scripts/release_finish.sh scripts/release_lib.sh scripts/release_selftest.sh; do

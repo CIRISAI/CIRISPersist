@@ -388,14 +388,30 @@ mod run {
             .unwrap()
             .record;
         // The insert arm runs `verify_key_registration` fail-closed BEFORE any
-        // write and propagates its error (v21.0.0 #502 E2 shape, unchanged
-        // here): the refusal is the #659 subject-binding error, by name.
+        // write (v21.0.0 #502 E2). v54.1.0 (#1042): the failure is a TYPED
+        // terminal refusal now, not a bare `Err` — the #659 subject-binding
+        // failure is a record that does not verify, by name.
+        let legacy_served_again = legacy_served.clone();
         let refused = sc
             .apply_replicated_key_record(SignedKeyRecord {
                 record: legacy_served,
             })
             .await;
-        assert!(matches!(&refused, Err(crate::federation::Error::SignatureInvalid(m)) if m.contains("does not bind")), "I101 precondition: a fresh peer refuses the unbound record at the insert gate: {refused:?}");
+        assert!(
+            matches!(
+                &refused,
+                Ok(ReplicatedKeyOutcome::Refused {
+                    reason: KeyRefusalReason::UnverifiableSignature
+                })
+            ),
+            "I101 precondition: a fresh peer refuses the unbound record at the insert gate: {refused:?}"
+        );
+        assert!(
+            crate::federation::verify_key_registration(sc.as_ref(), &legacy_served_again)
+                .await
+                .is_err_and(|e| e.to_string().contains("does not bind")),
+            "I101 precondition: the refusal is the #659 subject binding"
+        );
 
         // The local door refuses what is not a rebind by NAME, before the plan
         // could mutate anything: a record scrubbed by someone else, a key A

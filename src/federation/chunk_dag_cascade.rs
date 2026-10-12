@@ -2092,6 +2092,7 @@ pub mod orchestrate {
                 | BlobError::ChunkKeyNotYetGranted { .. }
                 | BlobError::NotPartyTo { .. }
                 | BlobError::Withdrawn { .. }
+                | BlobError::Purged { .. }
                 | BlobError::Evicted { .. }
                 | BlobError::NotHeld { .. }
         )

@@ -1,0 +1,11 @@
+[32;1m    Starting[0m [1m22[0m tests across [1m1[0m binary ([1m4229[0m tests [33;1mskipped[0m)
+[32;1m        PASS[0m [   0.021s] ( 1/22) [35;1mciris-persist[0m [36mfederation::capacity_consent_invariants::run[0m[36m::[0m[34;1mi548e_one_fold_every_door[0m
+[31;1m     SIGTERM[0m [ 298.719s] ( 2/22) [35;1mciris-persist[0m [36mfederation::capacity_consent_invariants::run::memory[0m[36m::[0m[34;1mi548b[0m
+[31;1m     SIGTERM[0m [ 298.720s] ( 3/22) [35;1mciris-persist[0m [36mfederation::capacity_consent_invariants::run::memory[0m[36m::[0m[34;1mi548a[0m
+[31;1m     SIGTERM[0m [ 298.720s] ( 4/22) [35;1mciris-persist[0m [36mfederation::capacity_consent_invariants::run::memory[0m[36m::[0m[34;1mi548c[0m
+[31;1m     SIGTERM[0m [ 298.698s] ( 5/22) [35;1mciris-persist[0m [36mfederation::capacity_consent_invariants::run::memory[0m[36m::[0m[34;1mi548d[0m
+[31;1m     Summary[0m [ 298.731s] [1m5[0m/[1m22[0m tests run: [1m1[0m [32;1mpassed[0m, [1m4[0m [31;1mfailed[0m, [1m4229[0m [33;1mskipped[0m
+[31;1m     SIGTERM[0m [ 298.719s] ( 2/22) [35;1mciris-persist[0m [36mfederation::capacity_consent_invariants::run::memory[0m[36m::[0m[34;1mi548b[0m
+[31;1m     SIGTERM[0m [ 298.720s] ( 3/22) [35;1mciris-persist[0m [36mfederation::capacity_consent_invariants::run::memory[0m[36m::[0m[34;1mi548a[0m
+[31;1m     SIGTERM[0m [ 298.720s] ( 4/22) [35;1mciris-persist[0m [36mfederation::capacity_consent_invariants::run::memory[0m[36m::[0m[34;1mi548c[0m
+[31;1m     SIGTERM[0m [ 298.698s] ( 5/22) [35;1mciris-persist[0m [36mfederation::capacity_consent_invariants::run::memory[0m[36m::[0m[34;1mi548d[0m

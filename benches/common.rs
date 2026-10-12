@@ -76,6 +76,7 @@ fn build_unsigned_trace(
         signature_ml_dsa_65: None,
         pubkey_ml_dsa_65: None,
         pqc_key_id: None,
+        run_kind: None,
     }
 }
 

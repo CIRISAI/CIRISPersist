@@ -1,0 +1,43 @@
+id: i14-storage-floor
+valid:
+  - |
+    fn a() { b.store_blob_local(cohort_scope::FEDERATION, x); }
+  - |
+    fn a() { b.put_blob_with_scope(x, crate::federation::cohort_scope::SPECIES); }
+  - |
+    fn a() { // b.store_blob_local(x);
+     let s = ".store_blob_local(x)"; }
+  - |
+    #[cfg(test)]
+    mod t { fn a() { b.store_blob_local(x); } }
+  - |
+    #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+    pub(crate) mod bodies { fn a() { b.seal_stream_with_scope(x); } }
+  - |
+    #[tokio::test]
+    #[serial]
+    async fn t() { b.put_blob_chunk_with_scope(x).await; }
+  - |
+    fn a() {
+        #[cfg(test)]
+        b.store_blob_local(x);
+    }
+  - |
+    trait T { fn store_blob_local(&self, x: u8); }
+invalid:
+  - |
+    fn a() { b.store_blob_local(x); }
+  - |
+    async fn a() { self.backend
+            .put_blob_signing_at(scope, x)
+            .await?; }
+  - |
+    #[cfg(any(test, feature = "x"))]
+    fn a() { b.put_blob_with_scope(x); }
+  - |
+    #[cfg(all(feature = "x", test))]
+    fn a() { b.put_blob_with_scope(x); }
+  - |
+    fn a() { tokio::join!(b.seal_stream_with_scope(x), c); }
+  - |
+    fn a() { Backend::put_blob_chunk_with_scope(&b, x); }

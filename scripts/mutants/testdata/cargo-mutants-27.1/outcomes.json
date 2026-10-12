@@ -1,0 +1,564 @@
+{
+ "outcomes": [
+  {
+   "scenario": "Baseline",
+   "summary": "Success",
+   "log_path": "log/baseline.log",
+   "phase_results": [
+    {
+     "phase": "Build",
+     "duration": 288.46566927,
+     "process_status": "Success",
+     "argv": [
+      "/home/runner/.rustup/toolchains/1.97.0-x86_64-unknown-linux-gnu/bin/cargo",
+      "nextest",
+      "run",
+      "--no-run",
+      "--verbose",
+      "--package=ciris-persist@53.2.0",
+      "--features=postgres,sqlite,server",
+      "--features",
+      "sqlite"
+     ]
+    },
+    {
+     "phase": "Test",
+     "duration": 16.590494513,
+     "process_status": "Success",
+     "argv": [
+      "/home/runner/.rustup/toolchains/1.97.0-x86_64-unknown-linux-gnu/bin/cargo",
+      "nextest",
+      "run",
+      "--verbose",
+      "--package=ciris-persist@53.2.0",
+      "--features=postgres,sqlite,server",
+      "--features",
+      "sqlite",
+      "--lib",
+      "--no-fail-fast",
+      "-E",
+      "test(/i548|i549|i550|i551/)"
+     ]
+    }
+   ]
+  },
+  {
+   "scenario": {
+    "Mutant": {
+     "name": "src/observe/mod.rs:177:9: replace Fold::bit -> u32 with 0",
+     "package": "ciris-persist",
+     "file": "src/observe/mod.rs",
+     "function": {
+      "function_name": "Fold::bit",
+      "return_type": "-> u32",
+      "span": {
+       "start": {
+        "line": 176,
+        "column": 5
+       },
+       "end": {
+        "line": 178,
+        "column": 6
+       }
+      }
+     },
+     "span": {
+      "start": {
+       "line": 177,
+       "column": 9
+      },
+      "end": {
+       "line": 177,
+       "column": 27
+      }
+     },
+     "replacement": "0",
+     "genre": "FnValue"
+    }
+   },
+   "summary": "CaughtMutant",
+   "log_path": "log/src__observe__mod.rs_line_177_col_9.log",
+   "phase_results": [
+    {
+     "phase": "Build",
+     "duration": 75.456900045,
+     "process_status": "Success",
+     "argv": [
+      "/home/runner/.rustup/toolchains/1.97.0-x86_64-unknown-linux-gnu/bin/cargo",
+      "nextest",
+      "run",
+      "--no-run",
+      "--verbose",
+      "--package=ciris-persist@53.2.0",
+      "--features=postgres,sqlite,server",
+      "--features",
+      "sqlite"
+     ]
+    },
+    {
+     "phase": "Test",
+     "duration": 15.112670145,
+     "process_status": {
+      "Failure": 100
+     },
+     "argv": [
+      "/home/runner/.rustup/toolchains/1.97.0-x86_64-unknown-linux-gnu/bin/cargo",
+      "nextest",
+      "run",
+      "--verbose",
+      "--package=ciris-persist@53.2.0",
+      "--features=postgres,sqlite,server",
+      "--features",
+      "sqlite",
+      "--lib",
+      "--no-fail-fast",
+      "-E",
+      "test(/i548|i549|i550|i551/)"
+     ]
+    }
+   ]
+  },
+  {
+   "scenario": {
+    "Mutant": {
+     "name": "src/observe/mod.rs:177:9: replace Fold::bit -> u32 with 1",
+     "package": "ciris-persist",
+     "file": "src/observe/mod.rs",
+     "function": {
+      "function_name": "Fold::bit",
+      "return_type": "-> u32",
+      "span": {
+       "start": {
+        "line": 176,
+        "column": 5
+       },
+       "end": {
+        "line": 178,
+        "column": 6
+       }
+      }
+     },
+     "span": {
+      "start": {
+       "line": 177,
+       "column": 9
+      },
+      "end": {
+       "line": 177,
+       "column": 27
+      }
+     },
+     "replacement": "1",
+     "genre": "FnValue"
+    }
+   },
+   "summary": "CaughtMutant",
+   "log_path": "log/src__observe__mod.rs_line_177_col_9_001.log",
+   "phase_results": [
+    {
+     "phase": "Build",
+     "duration": 76.11559492,
+     "process_status": "Success",
+     "argv": [
+      "/home/runner/.rustup/toolchains/1.97.0-x86_64-unknown-linux-gnu/bin/cargo",
+      "nextest",
+      "run",
+      "--no-run",
+      "--verbose",
+      "--package=ciris-persist@53.2.0",
+      "--features=postgres,sqlite,server",
+      "--features",
+      "sqlite"
+     ]
+    },
+    {
+     "phase": "Test",
+     "duration": 17.613785179,
+     "process_status": {
+      "Failure": 100
+     },
+     "argv": [
+      "/home/runner/.rustup/toolchains/1.97.0-x86_64-unknown-linux-gnu/bin/cargo",
+      "nextest",
+      "run",
+      "--verbose",
+      "--package=ciris-persist@53.2.0",
+      "--features=postgres,sqlite,server",
+      "--features",
+      "sqlite",
+      "--lib",
+      "--no-fail-fast",
+      "-E",
+      "test(/i548|i549|i550|i551/)"
+     ]
+    }
+   ]
+  },
+  {
+   "scenario": {
+    "Mutant": {
+     "name": "src/observe/mod.rs:189:9: replace <impl ReadRow for crate::federation::Attestation>::attestation -> &crate::federation::Attestation with Box::leak(Box::new(Default::default()))",
+     "package": "ciris-persist",
+     "file": "src/observe/mod.rs",
+     "function": {
+      "function_name": "<impl ReadRow for crate::federation::Attestation>::attestation",
+      "return_type": "-> &crate::federation::Attestation",
+      "span": {
+       "start": {
+        "line": 188,
+        "column": 5
+       },
+       "end": {
+        "line": 190,
+        "column": 6
+       }
+      }
+     },
+     "span": {
+      "start": {
+       "line": 189,
+       "column": 9
+      },
+      "end": {
+       "line": 189,
+       "column": 13
+      }
+     },
+     "replacement": "Box::leak(Box::new(Default::default()))",
+     "genre": "FnValue"
+    }
+   },
+   "summary": "Unviable",
+   "log_path": "log/src__observe__mod.rs_line_189_col_9.log",
+   "phase_results": [
+    {
+     "phase": "Build",
+     "duration": 22.343428691,
+     "process_status": {
+      "Failure": 101
+     },
+     "argv": [
+      "/home/runner/.rustup/toolchains/1.97.0-x86_64-unknown-linux-gnu/bin/cargo",
+      "nextest",
+      "run",
+      "--no-run",
+      "--verbose",
+      "--package=ciris-persist@53.2.0",
+      "--features=postgres,sqlite,server",
+      "--features",
+      "sqlite"
+     ]
+    }
+   ]
+  },
+  {
+   "scenario": {
+    "Mutant": {
+     "name": "src/observe/mod.rs:249:22: replace > with == in Counters::snapshot",
+     "package": "ciris-persist",
+     "file": "src/observe/mod.rs",
+     "function": {
+      "function_name": "Counters::snapshot",
+      "return_type": "-> TelemetrySnapshot",
+      "span": {
+       "start": {
+        "line": 244,
+        "column": 5
+       },
+       "end": {
+        "line": 274,
+        "column": 6
+       }
+      }
+     },
+     "span": {
+      "start": {
+       "line": 249,
+       "column": 22
+      },
+      "end": {
+       "line": 249,
+       "column": 23
+      }
+     },
+     "replacement": "==",
+     "genre": "BinaryOperator"
+    }
+   },
+   "summary": "CaughtMutant",
+   "log_path": "log/src__observe__mod.rs_line_249_col_22.log",
+   "phase_results": [
+    {
+     "phase": "Build",
+     "duration": 111.419486851,
+     "process_status": "Success",
+     "argv": [
+      "/home/runner/.rustup/toolchains/1.97.0-x86_64-unknown-linux-gnu/bin/cargo",
+      "nextest",
+      "run",
+      "--no-run",
+      "--verbose",
+      "--package=ciris-persist@53.2.0",
+      "--features=postgres,sqlite,server",
+      "--features",
+      "sqlite"
+     ]
+    },
+    {
+     "phase": "Test",
+     "duration": 15.752797123,
+     "process_status": {
+      "Failure": 100
+     },
+     "argv": [
+      "/home/runner/.rustup/toolchains/1.97.0-x86_64-unknown-linux-gnu/bin/cargo",
+      "nextest",
+      "run",
+      "--verbose",
+      "--package=ciris-persist@53.2.0",
+      "--features=postgres,sqlite,server",
+      "--features",
+      "sqlite",
+      "--lib",
+      "--no-fail-fast",
+      "-E",
+      "test(/i548|i549|i550|i551/)"
+     ]
+    }
+   ]
+  },
+  {
+   "scenario": {
+    "Mutant": {
+     "name": "src/observe/mod.rs:249:22: replace > with < in Counters::snapshot",
+     "package": "ciris-persist",
+     "file": "src/observe/mod.rs",
+     "function": {
+      "function_name": "Counters::snapshot",
+      "return_type": "-> TelemetrySnapshot",
+      "span": {
+       "start": {
+        "line": 244,
+        "column": 5
+       },
+       "end": {
+        "line": 274,
+        "column": 6
+       }
+      }
+     },
+     "span": {
+      "start": {
+       "line": 249,
+       "column": 22
+      },
+      "end": {
+       "line": 249,
+       "column": 23
+      }
+     },
+     "replacement": "<",
+     "genre": "BinaryOperator"
+    }
+   },
+   "summary": "CaughtMutant",
+   "log_path": "log/src__observe__mod.rs_line_249_col_22_001.log",
+   "phase_results": [
+    {
+     "phase": "Build",
+     "duration": 80.811067436,
+     "process_status": "Success",
+     "argv": [
+      "/home/runner/.rustup/toolchains/1.97.0-x86_64-unknown-linux-gnu/bin/cargo",
+      "nextest",
+      "run",
+      "--no-run",
+      "--verbose",
+      "--package=ciris-persist@53.2.0",
+      "--features=postgres,sqlite,server",
+      "--features",
+      "sqlite"
+     ]
+    },
+    {
+     "phase": "Test",
+     "duration": 15.5961112,
+     "process_status": {
+      "Failure": 100
+     },
+     "argv": [
+      "/home/runner/.rustup/toolchains/1.97.0-x86_64-unknown-linux-gnu/bin/cargo",
+      "nextest",
+      "run",
+      "--verbose",
+      "--package=ciris-persist@53.2.0",
+      "--features=postgres,sqlite,server",
+      "--features",
+      "sqlite",
+      "--lib",
+      "--no-fail-fast",
+      "-E",
+      "test(/i548|i549|i550|i551/)"
+     ]
+    }
+   ]
+  },
+  {
+   "scenario": {
+    "Mutant": {
+     "name": "src/observe/mod.rs:249:22: replace > with >= in Counters::snapshot",
+     "package": "ciris-persist",
+     "file": "src/observe/mod.rs",
+     "function": {
+      "function_name": "Counters::snapshot",
+      "return_type": "-> TelemetrySnapshot",
+      "span": {
+       "start": {
+        "line": 244,
+        "column": 5
+       },
+       "end": {
+        "line": 274,
+        "column": 6
+       }
+      }
+     },
+     "span": {
+      "start": {
+       "line": 249,
+       "column": 22
+      },
+      "end": {
+       "line": 249,
+       "column": 23
+      }
+     },
+     "replacement": ">=",
+     "genre": "BinaryOperator"
+    }
+   },
+   "summary": "MissedMutant",
+   "log_path": "log/src__observe__mod.rs_line_249_col_22_002.log",
+   "phase_results": [
+    {
+     "phase": "Build",
+     "duration": 55.344747214,
+     "process_status": "Success",
+     "argv": [
+      "/home/runner/.rustup/toolchains/1.97.0-x86_64-unknown-linux-gnu/bin/cargo",
+      "nextest",
+      "run",
+      "--no-run",
+      "--verbose",
+      "--package=ciris-persist@53.2.0",
+      "--features=postgres,sqlite,server",
+      "--features",
+      "sqlite"
+     ]
+    },
+    {
+     "phase": "Test",
+     "duration": 17.204283034,
+     "process_status": "Success",
+     "argv": [
+      "/home/runner/.rustup/toolchains/1.97.0-x86_64-unknown-linux-gnu/bin/cargo",
+      "nextest",
+      "run",
+      "--verbose",
+      "--package=ciris-persist@53.2.0",
+      "--features=postgres,sqlite,server",
+      "--features",
+      "sqlite",
+      "--lib",
+      "--no-fail-fast",
+      "-E",
+      "test(/i548|i549|i550|i551/)"
+     ]
+    }
+   ]
+  },
+  {
+   "scenario": {
+    "Mutant": {
+     "name": "src/observe/mod.rs:318:18: replace &= with |= in record_read",
+     "package": "ciris-persist",
+     "file": "src/observe/mod.rs",
+     "function": {
+      "function_name": "record_read",
+      "return_type": "",
+      "span": {
+       "start": {
+        "line": 301,
+        "column": 1
+       },
+       "end": {
+        "line": 325,
+        "column": 2
+       }
+      }
+     },
+     "span": {
+      "start": {
+       "line": 318,
+       "column": 18
+      },
+      "end": {
+       "line": 318,
+       "column": 20
+      }
+     },
+     "replacement": "|=",
+     "genre": "BinaryOperator"
+    }
+   },
+   "summary": "Timeout",
+   "log_path": "log/src__observe__mod.rs_line_318_col_18.log",
+   "phase_results": [
+    {
+     "phase": "Build",
+     "duration": 65.350731304,
+     "process_status": "Success",
+     "argv": [
+      "/home/runner/.rustup/toolchains/1.97.0-x86_64-unknown-linux-gnu/bin/cargo",
+      "nextest",
+      "run",
+      "--no-run",
+      "--verbose",
+      "--package=ciris-persist@53.2.0",
+      "--features=postgres,sqlite,server",
+      "--features",
+      "sqlite"
+     ]
+    },
+    {
+     "phase": "Test",
+     "duration": 300.044509497,
+     "process_status": "Timeout",
+     "argv": [
+      "/home/runner/.rustup/toolchains/1.97.0-x86_64-unknown-linux-gnu/bin/cargo",
+      "nextest",
+      "run",
+      "--verbose",
+      "--package=ciris-persist@53.2.0",
+      "--features=postgres,sqlite,server",
+      "--features",
+      "sqlite",
+      "--lib",
+      "--no-fail-fast",
+      "-E",
+      "test(/i548|i549|i550|i551/)"
+     ]
+    }
+   ]
+  }
+ ],
+ "total_mutants": 77,
+ "missed": 6,
+ "caught": 60,
+ "timeout": 3,
+ "unviable": 8,
+ "success": 0,
+ "start_time": "2026-10-09T13:25:14.046914135Z",
+ "end_time": null,
+ "cargo_mutants_version": "27.1.0"
+}

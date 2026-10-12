@@ -1,4 +1,6 @@
 //! v53.2.0 (CIRISPersist#1026) — **the ported gates' two counts agree.**
+//! v54.1.0 adds the absence guards (`GUARDS`): rules that expect 0, each
+//! bound to the Rust text gate that asserts the same zero.
 //!
 //! Six from-disk gates have an ast-grep port: a rule in `rules/` whose
 //! per-file match counts `scripts/ast_gates.sh` holds equal to
@@ -42,6 +44,55 @@ const PORTED: &[(&str, &str, &[&str])] = &[
         "log_scores_read",
         &["list_scores", "resolve_scores"],
     ),
+];
+
+/// v54.1.0 — the absence guards ported as rules that expect 0 (whole-tree
+/// rules expect one total under `src/**/*.rs`; `i14-storage-floor-blobs` one
+/// file). Rule id → (the file holding the Rust text gate that asserts the same
+/// zero, that gate's fn name). The text twin and the rule are each red on the
+/// same planted violation (CHANGELOG 54.1.0); this binds the pair so that
+/// deleting the twin, or adding a rule with no twin, is a decision someone
+/// makes here. `cfg-test-forms` (the rules' own test-gated vocabulary) and
+/// `serial-keys` (#1003) have no text twin.
+const GUARDS: &[(&str, &str, &str)] = &[
+    (
+        "i14-storage-floor",
+        "src/federation/blob_surface_gates.rs",
+        "i14_the_storage_floor_has_no_door",
+    ),
+    (
+        "i14-storage-floor-blobs",
+        "src/federation/blob_surface_gates.rs",
+        "i14_the_storage_floor_has_no_door",
+    ),
+    (
+        "738-anchor-env-mutation",
+        "src/federation/genesis/mod.rs",
+        "no_src_code_mutates_the_anchor_environment_738",
+    ),
+    (
+        "564-anti-entropy-satisfied",
+        "src/federation/load_bearing.rs",
+        "nothing_yields_anti_entropy_satisfied_today",
+    ),
+    (
+        "748-recursion-depth",
+        "src/federation/replication/mod.rs",
+        "the_retired_depth_knob_stays_retired",
+    ),
+    (
+        "620-sync-signing-verb",
+        "src/ffi/pyo3.rs",
+        "no_sync_signing_verb_is_called_from_persists_own_tree",
+    ),
+    (
+        "pg-provisioner-env-read",
+        "src/store/postgres.rs",
+        "every_postgres_test_goes_through_the_provisioner",
+    ),
+    ("cfg-test-forms", "", ""),
+    // CIRISPersist#1003 — the serial_test key registry; new with its rule.
+    ("serial-keys", "", ""),
 ];
 
 fn root() -> &'static std::path::Path {
@@ -200,7 +251,11 @@ fn expected() -> BTreeMap<String, BTreeMap<String, usize>> {
 #[test]
 fn the_rust_text_counts_equal_the_ast_grep_expectations() {
     let expected = expected();
-    let ported: BTreeSet<&str> = PORTED.iter().map(|(id, ..)| *id).collect();
+    let ported: BTreeSet<&str> = PORTED
+        .iter()
+        .map(|(id, ..)| *id)
+        .chain(GUARDS.iter().map(|(id, ..)| *id))
+        .collect();
     let listed: BTreeSet<&str> = expected.keys().map(String::as_str).collect();
     assert_eq!(
         ported, listed,
@@ -231,6 +286,27 @@ fn the_rust_text_counts_equal_the_ast_grep_expectations() {
         "the text count and the AST expectation disagree:\n{}",
         red.join("\n")
     );
+}
+
+/// Each absence guard expects 0, and its Rust text twin still exists: the
+/// gate fn is defined (by text, comments blanked) in the file named.
+#[test]
+fn every_absence_guard_expects_zero_and_keeps_its_text_twin() {
+    let expected = expected();
+    let mut red = Vec::new();
+    for (id, file, gate) in GUARDS {
+        if expected[*id].values().any(|n| *n != 0) {
+            red.push(format!("{id}: an absence guard must expect 0"));
+        }
+        if gate.is_empty() {
+            continue;
+        }
+        let code = code_only(&std::fs::read_to_string(root().join(file)).expect("read source"));
+        if fn_bodies(&code, gate).len() != 1 {
+            red.push(format!("{id}: its text twin `fn {gate}` is not in {file}"));
+        }
+    }
+    assert!(red.is_empty(), "{}", red.join("\n"));
 }
 
 #[test]

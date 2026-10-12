@@ -441,7 +441,6 @@ pub(crate) mod bodies {
         let family = format!("i436-fam-{tag}");
         let nonce = format!("i436-nonce-{tag}");
         let prop = crate::federation::accord_quorum::test_fixtures::proposal(&family, &nonce);
-        d.issue_accord_nonce(&family, &nonce).await.unwrap();
         d.put_accord_proposal(prop.clone(), None)
             .await
             .expect("I436: the proposal admits");

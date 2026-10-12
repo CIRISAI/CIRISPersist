@@ -7,7 +7,586 @@ threat-model citations because this crate's audit story is the point.
 
 ## [Unreleased]
 
+## [54.1.0] - 2026-10-10
+
+### Added — the generic steward purge door (#1046, CIRISConstitution#165, CSD-108)
+
+CC basis: **CIRISConstitution rc8@8c8f536** (#165: CC 2.4.1.1 "a purge is a tombstone, not a `withdraws`", CC 3.3.2 `LegalBasis::StewardPurge`, CC 4.5.3 "one tombstone row for takedown and purge").
+
+`federation::steward_purge` extends `evict_actor`'s bytes-plane purge to any row selection, authorised under global trust-root moderation, with an evidence ledger. Nothing runs on its own: every purge is an explicit call on a notice the trust root's quorum cosigned, and production execution is the operator's go only.
+
+**Inert without the operator's go.** The door never runs on its own: nothing executes until the operator authorises a specific purge and a trust-root quorum cosigns its notice. Production execution and finalize are the operator's call only.
+
+- **INTERIM — no human subject until the notice is a row** (CC session 2026-10-10, CIRISConstitution rc8@8c8f536). A reconsideration (CC 4.5.5) needs a row to target, and the redress path must exist before the act. So until the notice is admitted as a row, the door refuses any selection holding a record whose subject is a person, at the dry run, at `purge_rows` and at the replicated apply, with nothing written: `purge_human_subject_pending_notice_row` (persist-local; body names every `{record_id, subject, reason}`, so the operator sees them before anyone cosigns). "Subject" per record (`steward_purge::human_subject_records`):
+  - an attestation: its `subject_key_ids` and `attested_key_id`;
+  - a trace: the author and subjects of its own `trace:complete:v1` attestation;
+  - a blob: the subjects of the holding claim it was derived through;
+  - for `by_actor`: also the actor, since the purge is about them.
+
+  A subject is a person when its key's `identity_type` names `user`. **Fail closed:** a subject key that does not resolve, a trace with no own attestation, a blob named without its holding claim, or a record not held is not proven non-human and is refused (the receiver judges only what it holds). The mock-trace class passes; `refused_today` rows are judged per row. Meanwhile the tombstones cite the notice by its digest (the notice id).
+
+  **Retirement, planned with the rc8 vendor:** the notice becomes a `takedown_notice:{basis}:v1` row (one family; `{basis}` the closed LegalBasis wire string; polarity -1 only; `subject_kind: takedown_notice`; envelope = the notice payload). The attester is any seat (the proposer); the other seats go in `cosignatures[]`; the family is derived from the verified signers and must equal the `claimant_key_id` root. The tombstones then cite the row's `attestation_id` plus the digest, and this gate retires. The row is not shipped in v54.1 (operator ruling 2026-10-10): its family exists only on the untagged rc8 branch, and persist vendors tagged CC only. The finished row work is preserved on branch `v54.1-purge-notice-row` for the rc8 release.
+- **Authorisation.** A cosigned `takedown_notice` payload (CC 3.3.2 shape: `content_sha256`, `content_holder_key_ids`, `claimant_key_id`, `legal_basis`, `jurisdiction`, `good_faith_statement`, `claim_text`, `evidence_refs`, `asserted_at`, `expires_at`) with the basis `steward_purge`, `claimant_key_id` = the trust root's `community_key_id`, and `content_sha256` = the **selection digest**: SHA-256 over the JCS array of every purged record id (`"{plane}:{id}"`, derived ids included, sorted, unique). The cosigners are judged by `canonical_community::trust_root_cosigners_over`: each a distinct recorded founder of the rooted, trust-root-grade head, each hybrid signature verified, the set counted by the head's own `consensus_protocol`. A non-founder's cosignature, a founder signing twice, a stalled or unrooted root, an expired or future notice are refusals. There is no override path: a changed selection has another digest. The notice may carry the OPTIONAL `selection_counts` (table → count, CC 3.3.2 at rc8@8c8f536); when present the live counts must match exactly (`purge_selection_count_mismatch`), when absent the digest alone binds. The dry run's template fills it.
+- **Execution.** A tombstone by digest per record, citing the notice (never a `withdraws`), written in JCS order; derived rows (a trace's own `trace:complete:v1` attestation, scores whose `evidence_refs` resolve to purged ids, transitively; a holder claim's bytes) are in the same selection. An inadmissible retraction (a structural composer whose target is not purged with it; a `delegates_to` between keys neither of which is purged; any other exclusion-bearing row) ABORTS the purge with nothing written: every retraction is judged before the first tombstone, so a purge is whole or not at all (CC 4.5.3, CIRISConstitution rc8@8c8f536). A class selection withholds inadmissible rows by fixpoint and the dry run lists them before the quorum cosigns; the notice's digest names only the admissible rows, so the purge is whole for what it names, and nothing the digest names is ever skipped. A tombstoned row is not served and is refused at every door that could bring it back: the attestation put (local and replicated), the tier-crossing promotion door, trace ingest. Hard delete only on the explicit `purge_finalize` after the settle dwell (`PURGE_SETTLE_DWELL_SECS` = 259 200 s, `W` = 72 h after the tombstone, CC 2.6.7 / 4.2.6; there is no peer-acknowledgement plane, so settle is this stated dwell), through delete doors that re-ask the tombstone in the same statement.
+- **The accountability record is unpurgeable** (CLM-accountability-record-unpurgeable, CIRISConstitution rc8@8c8f536): a row whose dimension is `revocation:*`, `key:revocation`, `moderation:*`, `moderation_track_record:*` or `slashing:*` is inadmissible in every selection (`steward_purge::ACCOUNTABILITY_RECORD_PREFIXES`, checked by the purge itself): refused `purge_retraction_inadmissible` by id, withheld by a class. Before this, `key:revocation` and `moderation_track_record:*` rows slipped through (the migration exclusion classes have no arm for either). The migration reset's own purge door (`migration::check_purge_admission`) is unchanged.
+- **A purge never deletes or tombstones a key** (operator ruling 2026-10-09: "We should not delete any keys"). There is no key plane: `ByActor` selects only what the actor authored, never its key; a `key:` or `federation_keys:` record id is refused `purge_selection_malformed`; the key doors consult no purge gate. A deleted key would leave every row it signed unverifiable wherever those rows replicated. Key retirement is `key:revocation`, a separate act by the key's own authority, which this door neither emits nor triggers.
+- **Replication.** `list_purge_bundles_since` serves `PurgeBundle`s (the notice, its whole cosignature set, the record ids, never content); `apply_replicated_purge` re-verifies the notice against the RECEIVER's own trust root, re-derives the digest, and re-asks the rules no notice can lift (the accountability record; a composer without its target) before any tombstone lands, whole or not at all. Deletes nothing. **A purge binds only nodes rooted at the same trust root:** a node under another root, or none, refuses the bundle and writes nothing, so whatever replica it holds stays and a purge is not global erasure (CC 3.2 T3, 4.2.1; I656 witnesses the rootless node).
+- **Ledger.** `purge_dry_run` returns the would-purge ledger TSV (written before the notice is cosigned, so the notice's `evidence_refs` can point at it). `purge_ledger_tsv` renders the executed one: a header with `selection_digest`, `notice_id`, `claimant_key_id`, `legal_basis`, `record_count`, `executed_by`, `origin`, `executed_at`, `finalized_at`, `notice_jcs` (the notice id's preimage) and `cosignatures_json` (the whole set), then one row per record, `selection_digest notice_id ordinal plane record_id derived_from`. The ledger alone re-derives both the notice id and the digest.
+- **Storage (V187, sqlite and postgres; memory mirrors it).** `purge_executions` (header, one row per notice, `origin` `local`/`replicated`, and the notice's `legal_basis`: one tombstone row serves takedown and purge, CC 4.5.3, so no column assumes `steward_purge`; the v55 duty-holder door, #1007, writes its own basis into the same tables) and `purge_tombstones` (`(notice_id, plane, record_ref)` key, `ordinal`, `derived_from`). Checksums in `evidence/migration_checksums.tsv`.
+
+**Selections** (`PurgeSelection`, serialized with a `kind` tag). A class is a pure row predicate, `PurgeSelection::selects_row`, over one attestation scan, plus its seeds; "rows of family F from issuer K in window W" (CIRISServer#757) is one more variant and predicate arm, not added here.
+
+| `kind` | Selects |
+|---|---|
+| `by_actor {key_id}` | every row the key AUTHORED (`attesting_key_id`), every trace it signed, the bytes its holder claims name, and everything derived. Never the key, never a row another key signed about it. CSD-065 Descend moves onto this. |
+| `by_ids {ids}` | exactly the list; inadmissible members are reported as warnings, and the door refuses at them. |
+| `mock_model_traces {model}` | #1040: every trace with an LLM call on `model`, built by `PurgeSelection::mock_llm_traces()` (`mock-model`). |
+| `refused_today` | #1043 class 1: every federation-tier row the apply door would refuse today on a structural ground (`refused_today(row)`: #598 no signed `asserted_at`, #643 a typed column diverging from the envelope). |
+
+#1043 is class 1 only (`refused_today`). Class 2 (the QA / harness identities registered on production) is dropped by the operator's ruling (2026-10-09): harnesses run on the synthetic test root, which cannot reach production, so the harness rows already there are left as they are, and Server uses the generic `by_actor` / `by_ids` selections under authorisation whenever it needs to purge rows.
+
+**Refusal tokens** (`Error::kind()` returns the token; Python `ValueError((token, body_json))`): `purge_unauthorised`, `purge_selection_digest_mismatch`, `purge_selection_count_mismatch` `{table, expected, found}`, `purge_retraction_inadmissible` `{record_id, plane, index, total}`, `purge_not_settled`, `purge_notice_unknown`, `purge_tombstoned`, `purge_selection_malformed`, `purge_human_subject_pending_notice_row` (interim), `purge_execution_incomplete` `{notice_id, record_count, tombstones}` (persist-local; see "Codex review on PR #1057" below), and `trace_run_kind_mock` (raised as `Error::PurgeRefused` by `refuse_mock_trace_attestation` at the federation-tier attestation put; the same token as `ingest::IngestError::TraceRefused`; its constant is `steward_purge::TRACE_RUN_KIND_MOCK`, outside the `token` module).
+
+**Adopter mapping for `Error::PurgeRefused`.** Every token is terminal for that request, with one exception. `purge_unauthorised` returned by `apply_replicated_purge` (a peer's bundle) may be an ORDERING GAP: the receiver re-verifies the bundle against its OWN state, and it refuses when it does not yet hold the claimant trust root's community row ("no community row at …") or a cosigner's key record ("cosigner … has no key record on this node"). Treat `purge_unauthorised` from the replicated apply as retryable with a cap, and as terminal from the local doors (`purge_dry_run`, `purge_rows`, `purge_finalize`). A typed reason that separates "not held yet" from "does not verify" is CIRISPersist#1055's follow-up.
+
+**Surface.** `Engine::{purge_dry_run, purge_rows, purge_status, purge_finalize, purge_ledger_tsv, list_purge_bundles_since, apply_replicated_purge}`. pyo3: `purge_dry_run_json`, `purge_rows_json`, `purge_notice_signing_payload_json`, `purge_status_json`, `purge_finalize_json`, `purge_ledger_tsv`, `list_purge_bundles_since_json`, `apply_replicated_purge_json` (classified in `scripts/ffi_taxonomy.tsv`; the three that remove rows are deontic). **No purge surface takes an instant** (see "Codex review round 2 on PR #1057"): every door judges by this node's clock. `Engine::purge_rows(selection, notice)`, `purge_status(notice_id)`, `purge_finalize(notice_id)` and `apply_replicated_purge(bundle)` take no `now`, and pyo3's `purge_rows_json(selection_json, notice_json)`, `purge_status_json(notice_id)`, `purge_finalize_json(notice_id)` and `apply_replicated_purge_json(bundle_json)` take no `now_iso`. `list_purge_bundles_since_json`'s `since_iso` is a cursor and stays.
+
+**New variants on exhaustive public enums** (adopters with an exhaustive `match` must add an arm):
+
+- `federation::BlobError::Purged { sha256_hex, notice_id }` (kind `blob_purged`): a purge-tombstoned blob, withheld at every byte door from execution; like `Withdrawn`, do not ask another holder.
+- `federation::Error::PurgeRefused { token, body }`: map by `token` (CIRISServer#756 gives each a stable reason id); the HTTP status is Server's to assign.
+- `schema::Error::UnknownRunKind(String)`: a trace `run_kind` outside the closed vocabulary; kind `schema_unknown_run_kind`, a client fault (HTTP 422 at Lens), Python `ValueError` like its sibling `UnknownTraceLevel`.
+- `ingest::IngestError::TraceRefused { kind, detail }`: `kind` is `trace_run_kind_mock` or `purge_tombstoned`; Lens → HTTP 422, Python `ValueError((kind, detail))`.
+- New enums: `steward_purge::PurgeSelection` (`ByActor`, `ByIds`, `MockModelTraces`, `RefusedToday`), `steward_purge::PurgePlane` (`Trace`, `Attestation`, `Blob`; there is no key plane), `steward_purge::PurgeState` (`Incomplete`, `Executed`, `Settled`, `Finalized`).
+
+### Fixed — the reset purge door deleted `key:revocation` and `moderation_track_record:*` rows; both purge doors now read one list (#1054)
+
+CC rc8 names five families no purge may reach "by the root or anyone": `revocation:*`,
+`key:revocation`, `moderation:*`, `moderation_track_record:*`, `slashing:*`. The steward purge
+refused all five through its own list. The reset door (`migration::check_purge_admission`, every
+backend's `purge_attestation_v31`) matched `ExclusionClass` prefixes only, and none of those
+reaches `key:revocation` or `moderation_track_record:*`. **I694** (memory, sqlite, postgres)
+admitted a row of each family and asked the reset door. Before the fix it planned and
+`purge_attestation_v31` DELETED the `key:revocation` and `moderation_track_record` rows on every
+backend. Now the list lives once, as `migration::ACCOUNTABILITY_RECORD_PREFIXES` /
+`accountability_record_family`. The reset door reads it through a new
+`ExclusionClass::AccountabilityRecord` (after the narrower prefix classes, so their labels are
+unchanged), and the steward purge reads the same function. Mutations, each red: dropping the
+reset arm (I694, the exhaustiveness test); removing `key:revocation` from the list (I667 and
+I694, both doors, all three backends); removing `moderation_track_record:` (I667, I668, I694,
+the exhaustiveness test). I694 hardcodes its five families. Built from the list, it followed
+the list and stayed green when a family was dropped.
+
+### Added — the federation tier refuses mock runs (#1040)
+
+CC basis: **CIRISConstitution rc8@8c8f536** (#166, CC 3.1.5: every trace carries `run_kind`, closed vocabulary `production | qa | battery | mock`; `mock` is refused at federation-tier admission).
+
+`trace_run_kind_mock`: a federation-tier `trace:complete:v1` attestation whose embedded trace declares `run_kind: "mock"` is refused at the attestation put (local and replicated) and at the tier-crossing promotion door, on memory, sqlite and postgres; a local-tier row is kept (QA). Trace ingest refuses a mock run on a node holding the `canonical` role (its own verified role), zero rows written for the batch; a node without it keeps the trace. Keyed on the signed `run_kind`, never on the model name. **`run_kind` is a signed trace member** (`CompleteTrace::run_kind`, closed vocabulary `schema::trace::RUN_KINDS`). When present it joins the canonical payload as a top-level `"run_kind"` key at every schema version, so it verifies only if the producer signed it and cannot be added, dropped or edited afterwards; a trace without it reconstructs exactly the bytes it did before, so no existing signature changes. Before this, a v54.1 node REFUSED a run_kind-bearing trace at a supported schema version at the signature check (`verify_hybrid_crypto`: its reconstruction dropped the member the producer had signed). A value outside the vocabulary is `schema_unknown_run_kind` (new `schema::Error::UnknownRunKind`). Ingest's mock gate reads the verified member. **What a v54.1 node does with CIRISAgent#1249's traces:** at a supported `trace_schema_version` they admit and verify; if #1249 also bumps the wire version to an unsupported string (its schema file is `trace_format` v2.8.0), the batch is refused whole at the version gate (`schema_unsupported_version`, nothing written, I669) until that version is added to `SUPPORTED_VERSIONS` with the Agent's pinned schema (CC 3.1.5, vendored by tag). The purge class for the traces already held (`mock_model_traces`) keys on `model = 'mock-model'`, which is what identifies them today.
+
+### Changed — #1043 is a purge, not a serve filter
+
+The operator ruled (#1043, 2026-10-09): both classes are purged through the door above, never withheld in place. The draft serve filter (`servable`, `fill_served_page` and the serve-read changes) was removed before release; the serve reads withhold only tombstoned rows. **I657 is retired and not reused.**
+
+### Witnesses (`src/federation/steward_purge_invariants.rs`, memory, sqlite and postgres)
+
+I650 authorisation (each refusal asserts the clause that refused it), I651 digest mismatch, I652 count mismatch (and a count-less notice, refused by the digest instead), I653 an inadmissible retraction aborts the purge with nothing written (composer and third-party `delegates_to`), I654 the mock class end to end (dry run read-only, sample, ledger preimages, tombstone stops serving and blocks promotion), I655 finalize after settle, I656 the tombstone replicates re-verified, I658 retired (it witnessed a purged key; see I665/I666), I659 `trace_run_kind_mock` at the put, promotion and ingest doors (a production run on the mock model's id, and a trace with no `run_kind`, pass), I660 the delete doors re-ask the tombstone, I661 from disk (every backend's doors carry the gates; no serve read classifies by `refused_today`), I662 class 1 is a selection (served until purged; the class scan pages to the end), I663 retired (it witnessed the dropped class-2 builder), I672 the interim no-human-subject gate (the mock class passes; a row about a `user` key is refused at the dry run, at execution and at the receiver; a person's by-actor purge is refused; an unresolvable subject fails closed), I670 `run_kind` is signed (production / qa / battery admit and verify, an edited value is refused by the signature, an unknown value by the schema, a signed mock by `trace_run_kind_mock`), I669 an unsupported trace version carrying it is refused whole, I664 a header with another basis (`ncmec_csam`) and its bytes-plane tombstone round-trip, I667 one row of each of the five accountability families is refused by id and withheld by a class, I668 a quorum-cosigned bundle naming an accountability row is refused by the receiver with nothing written, I665 a purge never touches a key (by-ids and by-actor purges leave the actor's key registered and its unselected rows verifying), I666 a `key:` id is refused.
+
+Mutation-checked: a final sweep over 50 mutants on the door's load-bearing clauses, each re-run on the final code: authorisation, the seat check and distinct signers, the subkind-driven eligibility, the quorum, basis, expiry, the optional count check, the digest, the whole-or-nothing pre-check, the composer target, the parties rule, the accountability arm and its two families the exclusion classes miss, derived scores, the key-id refusal, by-actor authorship, the settle check, the receiver's re-verify / digest / order / admissibility, every backend's put gate, serve exclusion, delete gate and basis read, the promotion gates, the ingest gates, the `run_kind` matcher at both doors, the notice's holder list, `RefusedToday`'s tier clause and the scan's paging: all 50 KILLED. Along the way M08 (a trust-root-grade pre-check shadowed by `stored_standing_at`) was removed rather than kept.
+
+### Fixed — Codex review on PR #1057
+
+- **A purge header and its tombstones are one transaction.** `purge_put_execution(execution, tombstones)` writes the header and the whole tombstone set in one transaction on every backend (memory decides everything under its lock before inserting); `purge_put_tombstone` is removed, and the store door refuses a set that is not exactly `record_count` rows of its notice (`check_purge_put_set`). Before, sqlite and postgres committed the header and each tombstone separately, so a failure or a process exit left a durable header with part of its declared `record_count`, which `purge_finalize` deleted and the bundle serve read replicated. As defence in depth, `purge_finalize` and `list_purge_bundles_since` refuse a header whose stored tombstones are not its `record_count` (`purge_execution_incomplete`), `purge_status` reports it `Incomplete`, and re-running the same notice completes it. **I695** (memory, sqlite, postgres): a fault armed between the header and the tombstones leaves neither, and the retry executes the whole set; a dropped tombstone makes finalize and serve refuse until a re-run heals it. Mutations, each red on all three backends: committing the header before the fault (before the fix, "a refused notice writes no header"); dropping the completeness check (finalize deleted 2 of 4 trace events with one trace untombstoned).
+- **Purging a trace recomputes the rollup it was folded into.** `purge_delete_tombstoned_trace` (sqlite, postgres) reads the trace's `trace_events_factor_rollup_1h` groups before deleting its rows, then in the same transaction deletes each group's rollup row and recomputes it from the surviving rows (one upsert function per dialect, shared with `refresh_factor_rollup`). A group the purge emptied is gone, and a shared group keeps only the survivors. Postgres takes the refreshers' advisory lock, blocking, so no refresh computed over pre-purge rows can commit after the purge. The scoring-factors and repository-stats caches evict every window that holds a purged bucket. Memory has no rollup. **I696** (sqlite, postgres): with a bucket 5 h old, outside the lazy refresh's 1 h tail, a bucket shared by two traces keeps the survivor, a bucket one purged trace filled alone is gone, and the fleet read stops counting the purged trace. Mutations, each red on both backends: skipping the recompute (shared bucket `[2]`, expected `[1]`); recomputing without deleting the group (emptied bucket `[1]`, expected `[]`); not evicting the scoring cache (fleet read `[2, 1]`, expected `[1, 0]`). The repository-stats cache eviction has no witness of its own.
+- **Replication order cannot purge the accountability record.** A bundle can name an id this node does not hold yet, and it still applies. When the row then arrives and is a `revocation:*`, `key:revocation`, `moderation:*`, `moderation_track_record:*` or `slashing:*` row, the tombstone is void for it. `refuse_if_tombstoned_attestation` admits it. The serve read on every backend does not withhold it: sqlite and postgres use `migration::accountability_record_sql`, rendered from `ACCOUNTABILITY_RECORD_PREFIXES`, and memory uses `accountability_record_family`. `purge_finalize` skips it (`FinalizeReport.voided`), every backend's `purge_delete_tombstoned_attestation` refuses it in the statement, and `purge_status.voided` names it. Every other row is still `purge_tombstoned`. I661 now also requires the serve read's exemption. **I697** (memory, sqlite, postgres): a bundle naming three unheld ids applies. A `key:revocation:v1` row and a `moderation_track_record:*` row at two of those ids are admitted, served, listed as void, and survive both finalize and the delete door. An ordinary row at the third id is `purge_tombstoned`. Mutations, each red on all three backends: no arrival exemption (before the fix, the `key:revocation` row was refused `purge_tombstoned`); no serve exemption; no delete-door guard; no finalize skip.
+- **`run_kind` survives the manifest form.** An oversize trace's attestation replaces the inline trace with a `trace_manifest:v1` manifest, and that manifest did not carry `run_kind`. A mock trace kept on a non-canonical node could therefore cross the tier as a manifest. The mint now copies the trace's signed `run_kind` into the manifest, or leaves it out when the trace has none. The federation-tier gate reads either shape (`steward_purge::trace_attestation_run_kind`), and the `trace:*` shape check refuses a `run_kind` outside the closed vocabulary in either shape (`federation_trace_dimension_invalid`). The manifest member set is open, so a legacy manifest without `run_kind` is admitted unchanged. **I698** (memory, sqlite, postgres): an oversize mock trace on a non-canonical node is stored as a manifest carrying `run_kind: mock`, and it is `trace_run_kind_mock` at the promotion door and at the federation put. Production and qa manifests are admitted. A legacy manifest is admitted with its JCS bytes unchanged. An out-of-vocabulary `run_kind` is refused in both shapes. Mutations, each red on all three backends: the gate reading the inline shape only (before the fix, the manifest-form mock row crossed); the mint dropping `run_kind`; the manifest's vocabulary check off.
+
+### Fixed — Codex review round 4 on PR #1057
+
+- **Replication order cannot purge a record a person is the subject of (interim).** A receiver applies a bundle that names ids it does not hold yet (`skip_unheld`). The no-human-subject rule is therefore asked again when the row arrives, through `steward_purge::tombstone_void_reason`. A tombstone is void for the accountability record, or for a row with a PROVEN person among its subjects (`identity_type_is_person`). A key that does not resolve here proves nothing, so the row stays refused.
+  - A void row is admitted at arrival and served. On sqlite and postgres the serve read uses `person_subject_sql`, rendered from the same predicate; memory applies that predicate directly. The delete door and `purge_finalize` leave the row in place, and `voided` names it.
+  - A trace a person signed is ingested over a trace tombstone, and the trace delete door and finalize leave it.
+  - Blob tombstones are unchanged. A blob tombstone lands only after this node proved its binding rows non-human (I821). Voiding it on a later holder claim would let any user key un-withhold purged bytes.
+  - **I828** (memory, sqlite, postgres) covers this. Before the fix, the person's row was refused `purge_tombstoned`. Mutations, each red on all three backends: no person void; ingest gate off; serve void off; delete-door guard off; trace-door guard off.
+- **A subject key that is not held yet gets a retryable refusal (round-4 follow-up).** A row can arrive at a tombstoned id before its subject's key record does. I828 refused such a row with the terminal `purge_tombstoned`, so the sender never re-offered it, and the node lost a person's row that other nodes admitted. The arrival gate now refuses it with the existing RETRYABLE `Error::AttesterKeyUnknown`, built through `Error::unknown_signer`.
+  - The kind token is `federation_attester_key_unknown`, and the new plane is `purge_tombstone_subject`.
+  - In Python it raises `ValueError("federation_attester_key_unknown")`, which is the variant's existing mapping.
+  - A trace whose signer is not held yet gets the existing `verify_unknown_key` (`ValueError(("verify_unknown_key", …))`).
+  - Once the key lands, the person check decides: a person voids the tombstone, and a non-person gets `purge_tombstoned`. An unknown key still never un-purges a row, because the row is not admitted while its key is unknown.
+  - **I832** (memory, sqlite, postgres) covers this, for both a row and a trace. Before the fix, the row got the terminal tombstone refusal. Mutating either retryable branch turns it red.
+- **Edge surface (round 4).** No new `BlobError`, no new refusal token, no new `Error` variant. The only addition is a new `plane` value, `purge_tombstone_subject`, on the existing `AttesterKeyUnknown`. `serve_blob_to_peer`, the ranged serve and the DAG manifest/chunk reads keep returning `BlobError::Purged` for anything a purge withholds.
+  - A chunk shared with a parent under an unsettled notice returns `Purged` throughout B's dwell, both before and after A finalizes.
+  - It still returns `Purged` after both purges finalize: the tombstones outlive the bytes, and the serve disposition runs before the body read, so the answer is never `NotHeld`.
+  - I830 covers both doors at each point.
+- **Every projection of an attestation leaves with it.** `purge_attestation_projections`, run by `purge_finalize` and by the reaper, removed `consent_peer_set` but not `consent_peer_set_for`. As a result, `consent_peers_by_principals` kept authorising a peer after its grant was hard-deleted.
+  - The new `steward_purge::ATTESTATION_PROJECTIONS` lists every table a stored attestation projects into, and how the delete removes it. The SQL backends now delete every helper-removed table from that list, in one transaction. Besides `consent_peer_set_for`, that adds `federation_withdraws_admission_depths`, `federation_trust_direction_held` and `federation_key_grant_pending`, which were also left behind. Memory mirrors them.
+  - **I829** (memory, sqlite, postgres): after the hard delete, the steward's grant no longer authorises the peer. Before the fix it did.
+  - **I829b** is a schema-driven gate. It fails on any migrated table with an `*attestation_id` column that is not classified, on a foreign key whose removal disagrees with its classification, on a stale entry, and on a memory mirror the helper omits. Mutations: dropping a table from the list is red.
+- **A shared DAG chunk waits for every purge's settle.** The purge's DAG walk counted a parent manifest as gone as soon as it had any blob tombstone. It now counts the parent only once every purge that tombstoned it has settled or finalized (`blob_purge_settled`, via the new `FederationDirectory::purge_tombstone_notices`, which defaults to `Unsupported`). **I830** (sqlite, postgres): a chunk shared with an unsettled purge survives the settled purge's finalize, stays withheld meanwhile, and goes at the other purge's finalize. Before the fix it was deleted early.
+- **A held accord proposal replays idempotently.** V189's legacy non-owner proposals were refused before the digest check. A held digest is now accepted first, and only a new digest under a claimed pair is refused. SQLite's door now uses an IMMEDIATE transaction, so a held-digest read followed by the claim write cannot fail a lock upgrade against a concurrent writer. **I827b** (sqlite, postgres): before the fix, the replay was refused.
+- **Sweep of the four classes Codex keeps finding** (replication order vs arrival, finalize/dwell across notices, derived tables left behind, serve paths). Three further fixes:
+  - **Serve by hash.** A tombstoned attestation is withheld by `wire_index::reload_record_bytes`, which uses the arrival gate's own predicate. It also leaves the signed-wire index at execution, so during the dwell it is neither served by content hash nor advertised. **I828b** (memory, sqlite, postgres): before the fix it was served and advertised.
+  - **Late detection events.** `put_detection_event` refuses a detection naming a purged trace (`derived::Error::InvalidArgument("purge_tombstoned: …")`). This is void-aware. **I825**: before the fix, the late detection was stored.
+  - **DSAR erasure.** The DSAR erasure now drops orphaned thought signatures through the purge's helper. **I831** (sqlite, postgres): before the fix, the old signature was read.
+  - Also witnessed, with no defect found: I823 now re-delivers a purged manifest after finalize and asserts it stays `BlobError::Purged`.
+- **Adopter surface:**
+  - New public items: `steward_purge::{ATTESTATION_PROJECTIONS, INDEPENDENT_ATTESTATION_ID_TABLES, ProjectionRemoval, identity_type_is_person, person_identity_sql, person_subject_sql, person_subject_of, tombstone_void_reason, refuse_if_tombstoned_trace}`.
+  - New trait method: `FederationDirectory::purge_tombstone_notices`, with a default implementation.
+  - `ProjectionRemoval` is a new exhaustive enum, but it is only matched inside persist.
+  - Behaviour change: `purge_status.voided` and `FinalizeReport.voided` can now name person-subject records and person-signed traces.
+  - Behaviour change: `put_detection_event` may refuse.
+  - No new variant on an existing enum.
+
+### Fixed — Codex review round 3 on PR #1057
+
+- **A purged blob is withheld from execution, not only after finalize (adopter surface change).** The serve doors (`serve_blob_to_peer`, `serve_blob_range_to_peer`) and the viewer read doors checked pressure, quarantine and the withdraws fold, but never the purge plane, so a purged blob stayed servable for the whole 72 h dwell. The one place every byte door asks the tombstone fold, `at_rest_cascade::refuse_if_withdrawn`, now first asks the new `steward_purge::purge_withheld`. That covers the serve disposition, the whole-blob and ranged viewer reads, and the sealed-manifest open. A purge-tombstoned blob is refused, and so is a sealed-DAG chunk whose every manifest is withheld (transitively). A chunk that any un-purged manifest relates is not refused. The new variant is **`BlobError::Purged { sha256_hex, notice_id }`**, kind `blob_purged`, raised in Python as `RuntimeError("blob_purged: <sha>")` (the `Withdrawn` shape). Like `Withdrawn`, it tells the fetcher not to ask another holder. Adopters with an exhaustive `match` on `BlobError` must add an arm. **I824** (sqlite, postgres): after execution and before finalize, the manifest is `Purged` at the serve, ranged-serve and local-read doors. So is every unshared chunk, whole and ranged, and a chunk shared with a live DAG still serves. Before the fix, "serve by hash" returned `Ok`. Each of these mutations is red on both backends: no chunk walk, and letting a live parent's chunk be withheld. The raw storage reads (`BlobStorage::get_blob`, `get_blob_range`) still ask no disposition, the same as for withdraws.
+- **A trace purge tombstones the trace's detection events.** Purging a trace now applies the DSAR door's Art. 17 tombstone to its `cirislens_derived` detection events, in the same transaction: the linkage and content are set to NULL and `erased_at` is stamped. That tombstone is now one function per dialect, and both doors call it. The witness surfaced a pre-existing defect: `get_detection_events` could not decode any tombstoned row. On sqlite it returned an error, and on postgres it panicked deserializing the NULL `trace_id`, so a single DSAR erasure broke every unfiltered read. Tombstoned rows are no longer returned. **I825** (sqlite, postgres; memory stores no detection events): after finalize, no event names the purged trace or returns its content, and an unrelated event is untouched. Before the fix, the read returned `("trace-i825", "purged-body")`.
+- **A trace purge removes its orphaned thought signatures.** `trace_thought_signatures` rows outlived their events. Because that insert is `ON CONFLICT DO NOTHING`, a later trace reusing the thought_id read the purged trace's signature. The purge now collects the trace's thought_ids before deleting its events, and removes each signature row that no remaining event cites. **I826** (memory, sqlite, postgres): the new trace reads `sig-new`. Before the fix it read `sig-old`. A thought that a live trace shares keeps its row; mutation: deleting signatures that are still cited is red. The DSAR erasure (`delete_traces_for_agent_id_hash`) has the same orphan shape and is not changed in this release.
+- **An accord nonce's single use is enforced by the database.** On SQLite the single-use check was a SELECT followed by an INSERT, so two backends on one file could both admit a proposal under the same nonce. **V189** (both dialects) adds `accord_proposal_nonce_claim`, with primary key `(family_key_id, nonce)` mapping to `proposal_digest`. The door inserts the claim in the proposal's own transaction, and a pair that another digest already holds is refused `AccordProposalNonceReused`. Postgres keeps its advisory lock and now also checks the claim. I used a claim table rather than a UNIQUE index because rows admitted before #1047 may already share a pair, and those rows are evidence that is never deleted. The backfill gives each existing pair to its earliest proposal (`created_at`, then `proposal_digest`); the other legacy rows stay. Checksum rows are appended. **I827**: two backends on one SQLite file, and two on one Postgres database, race 64 nonces; each time exactly one proposal wins and the loser's refusal names it. With the exact pre-fix SQLite door, both proposals were admitted (`Ok / Ok`) in 3 of 3 runs. Mutation on postgres: with the lock removed and the claim kept, the race stays green; with both removed, it is red. **I827b**: the shipped backfill, run over a legacy shared pair, keeps both rows, gives the claim to the earliest, and refuses a new proposal under it.
+
+### Fixed — Codex review round 2 on PR #1057
+
+- **The purge dwell is this node's clock (adopter surface change).** Every purge door took the caller's `now`, so a caller could execute, then finalize at `now + 72 h`, and skip the dwell; backdating the execution did the same. The doors now read `steward_purge::purge_clock()`, this node's system clock, once per call. The only seam is `cfg(test)`. Clean break, with no alias, because the purge surface has never shipped: `now` is removed from `steward_purge::{verify_purge_authorisation, purge_rows, purge_status, purge_finalize, apply_replicated_purge}` and from `Engine::{purge_rows, purge_status, purge_finalize, apply_replicated_purge}`, and `now_iso` is removed from pyo3's `purge_rows_json`, `purge_status_json`, `purge_finalize_json` and `apply_replicated_purge_json` (the pyi stub is re-emitted). **I822**: with no clock pinned, a purge executed and finalized at once is `purge_not_settled` (memory, sqlite, postgres), its `executed_at` is the system clock's, and its settle is 72 h later. A from-disk gate asserts that no public purge surface takes a `now`. Run against the pre-fix sources, it named all 13 surfaces. Mutation: dropping the settle check is red on all three backends.
+- **A purged sealed manifest takes its unshared DAG chunks.** Finalize deletes the blob's binding row before the bytes plane runs, so the DAG fold read the manifest `Unbound`, not `Withdrawn`. `evict_blob`'s chunk pass is keyed on `Withdrawn`, so it left the chunks readable by hash. The purge's evictor is now `Engine::purge_evict_blob`: it runs `evict_blob`, then evicts every DAG child whose every manifest is purge-tombstoned or evicted by the same walk, transitively. A chunk that a live manifest relates stays. The finalize order is unchanged. **I823** (sqlite, postgres; memory has no bytes plane): after `Engine::purge_finalize`, no unshared chunk is held or served by hash, and a chunk shared with a live DAG stays and serves. Before the fix, "chunk 1 goes with its purged manifest" was red on both backends. Mutation: ignoring the live-parent check deletes the shared chunk, red on both. Not witnessed: a nested (v3) child DAG under the purged manifest, which the walk follows.
+- **A blob's human subject is resolved from local state.** The interim no-human-subject gate used to read a blob's subject from `derived_from`, which on a replicated bundle is the sender's metadata. A peer could point a person's blob at a harmless row. The gate now resolves each blob from the rows this node holds (`holds_bytes` claims on the sha, and `scores` rows citing it, every tier), and refuses a blob nothing here holds or binds, at the receiver too. **I821** (memory, sqlite, postgres): a bundle pointing Alice's blob at a harmless row is refused `purge_human_subject_pending_notice_row` naming Alice; so is a blob a person's device claims to hold, and a blob nothing binds. A non-person's blob applies, and the local dry run refuses Alice's blob. Before the fix, the forged bundle applied (2 tombstones). Mutations: dropping either the `holds_bytes` or the `scores` branch is red on all three backends. **Receiver consequence:** a bundle naming a blob this node holds no row for is now refused, where it used to be applied.
+- **Derivatives leave with a withheld parent.** In a class selection, scores and blobs were derived before the admissibility fixpoint, so a withheld parent left its derivatives selected. Each fixpoint round now withholds, transitively, every derived record whose evidence left the selection. A score that still cites a selected record stays. **I820** (memory, sqlite, postgres): under `RefusedToday`, a refused-today `moderation_track_record` row is withheld, along with the score over it and the score over that score. The plain row's chain is selected, and the digest is the reduced set's. Before the fix, 5 records were selected instead of 3. Mutation: pruning one level only is red on all three backends.
+- **The signature-mismatch diagnostic hashes the verifier's preimage.** `canonical_payload_sha256s`, used by the breadcrumb and by `debug_canonicalize`, canonicalized without the signed `run_kind`. Its primary shape is now `canonical_bytes_for_trace`, the builder the verifiers check against, and the legacy shape carries `run_kind` too. The wire keys (`canonical_9field_*`) are unchanged, but for 2.7.9 and 3.0.0 traces the `9field` hash is now the version's real preimage. **I699**: at 2.7.0, 2.7.9, 3.0.0 and 2.7.legacy, a trace carrying `run_kind` has a diagnostic hash equal to the SHA-256 of the verifier's preimage. Before the fix, it was red at 2.7.0.
+
+### Added — the capacity consent stance names the rows it rests on (#1041)
+
+CIRISServer and RATCHET asked for it after 2026-10-08, when 11 scored subjects showed no visible `analyze` grant. Two hours of read-only work ended at the identity-anchor path: each subject's human had granted with `for_key_id` naming the occurrence. The fold was right and the scan's classification was wrong, and the score said nothing about which grant admitted it.
+
+- **`consent_by_humans::capacity_consent_stance_with_basis(directory, attester, subject, family, now) -> (ConsentState, ConsentBasis)`**, with `Engine::capacity_consent_stance_with_basis` and the Python `capacity_consent_stance_with_basis(attester_key_id, subject_key_id, family, now_iso=None)`. The Python door returns JSON `{"state": …, "basis": {"rows": [{"principal", "paths", "attestation_id"}]}}`.
+- **What the basis names.** Under the combine rule, the combined state is decided by every principal whose own fold reached it, so `ConsentBasis.rows` names each of those principals' deciding row. For `granted`, that is every granting principal's grant. For `revoked`, every revoker's row, and not a grant beside it. For `expired`, every lapsed grant. The subject comes first, then stewards by key. `unspecified` has an empty basis, which is how a gate gap reads apart from an expired grant. `ConsentBasis::attestation_ids()` gives the ids in order, for the capacity envelope's `evidence_refs` (Server's envelope, Server's field).
+- **Paths.** `ConsentPrincipalPath`: `subject` is the subject's own rows. `occurrence_of` is an identity the subject is an active occurrence of. `delegates_to` is a live `delegates_to` steward: an owner-binding to a person, any delegation to a node. Steward rows count only when they name the subject in `for_key_id`, as before.
+- **One fold.** `check_capacity_consent_admission`, the emit gate, asks `capacity_consent_stance_with_basis`, so a basis a scorer records is the one the gate decides on. `ConsentGateRefused` does not carry the basis, because a new field on that exhaustive public struct would break a pin-compatible minor. A scorer reads the basis from its precheck.
+- **The old door.** `capacity_consent_stance` stays for one release as a thin wrapper that returns the state alone.
+- **One steward walk.** `admission::steward_bindings_of` is now the key set of the new `admission::steward_binding_paths_of`, which returns each steward with its clause labels (`StewardPath`: `self_user`, `occurrence_of`, `delegates_to`). The labels cannot disagree with membership because there is one body. Reused from the `probe-consent-stance` branch: `StewardPath`, and `consent::fold_scoped_stance_refs_with_winner`, the stance fold that also returns its deciding row, which `fold_scoped_stance_refs` now wraps. The probe's debug fold, read-only backends and `examples/consent_stance` are not in this cut.
+
+New `pub` enums and how an adopter maps them (none is an admission outcome):
+
+| Variant | Mapping |
+|---|---|
+| `consent_by_humans::ConsentPrincipalPath::{Subject, OccurrenceOf, DelegatesTo}` | audit label on a basis row |
+| `admission::StewardPath::{SelfUser, OccurrenceOf, DelegatesTo}` | audit label on a steward |
+
+Witnesses in `src/federation/consent_basis_invariants.rs`, each on memory, sqlite and postgres:
+
+- **I622**: the subject's own grant is the basis under `subject`, and with no consent the basis is empty.
+- **I623**: a node owner's grant naming the node is the basis under `delegates_to`, and the same owner's blanket grant is neither a grant nor a basis. An identity anchor's grant naming the agent is the basis under `occurrence_of`.
+- **I624**: an agent's own grant beside its anchor's revocation is `revoked`, and the basis is the revocation only. A subject whose own grant has expired (`expires_at` past) and whose anchor grants is `granted`, and the basis is the anchor's live grant only. Every `granted` basis row is checked to be held, a grant, and not past its `expires_at`.
+
+The wrapper and the basis door are asserted equal in every body. I548e, the from-disk check, now requires the gate, the Engine basis door and the Python basis door to reach `capacity_consent_stance_with_basis`. I578, the large-futures gate, measures both new doors.
+
+Mutants, each restored. An empty basis turns I622, I623 and I624 red on all three backends; this is the before state, when the stance named no rows. A basis that ignores the combined state turns I624 red on all three. Labelling `occurrence_of` as `delegates_to` turns I623 and I624 red on all three.
+
+### Added — an unknown signer is a typed, RETRYABLE refusal, apart from a bad signature (#1042)
+
+A fresh node refused the canonical's `identity_occurrence` rows every round with `scrub-signature verification failed: … is not a registered federation key`, because the signer's Key row had not landed yet. That is an ordering gap, and it read the same as a forged signature, so a sender could not tell a row that will admit tomorrow from one that never will. Persist's stance is unchanged: the refusal is per attempt, nothing is stored, marked or parked, and the same row admits when it is re-offered after the key plane. What changes is the type.
+
+Edge's three questions (CIRISEdge#858):
+
+1. **The variant and its token.** `federation::Error::AttesterKeyUnknown { attesting_key_id, plane }`, kind `federation_attester_key_unknown`. On the replicated key plane's outcome it is `register::KeyRefusalReason::AttesterKeyUnknown`, token `attester_key_unknown`. The terminal siblings are unchanged: `Error::SignatureInvalid` (`federation_signature_invalid`), `Error::FederationTierUnverified` (`federation_tier_unverified`) and, on the key plane, `KeyRefusalReason::UnverifiableSignature` (`unverifiable_signature`). That last one is the key plane's "signature_invalid" token the issue names; it keeps its existing spelling.
+2. **Which doors return it.** Every door that resolves a signer's Key row and finds none. `plane` names the door: `key_registration` (`verify_key_registration`, so `Engine::register_federation_key`, the replicated key apply, the rebind and invalid-replace doors), `identity_occurrence` (`put_identity_occurrence`, signed and content-only), `identity_occurrence_revocation`, `transport_destination`, `touch_claim` and `touch_claim_cosigner` (an `NOfMCosigner` co-signer), `attestation` (the store's attester lookup in `put_attestation`, all three backends) and `signed_envelope` (`tier_ingest::verify_envelope_hybrid_signature`, which carries attestations, revocations, families, communities, memberships, location proofs and every other envelope-signed row that does not re-type its error). Before, these were `SignatureInvalid`, `FederationTierUnverified` or, at the store's attester lookup, `InvalidArgument`.
+3. **The replicated Key Insert arm.** Yes. `apply_replicated_key_record`'s `Insert` arm on memory, sqlite and postgres (the postgres arm was re-read and mirrors sqlite) no longer propagates `verify_key_registration(..)?` as a bare `Err`. It returns `ReplicatedKeyOutcome::Refused { reason }`, with `attester_key_unknown` for an unknown scrubber and `unverifiable_signature` for a scrubber this node holds whose signature does not verify. Every other plan arm that verifies a record (upgrade, rebind, scrub rehydrate, invalid replace) reads the failure through the same function, `register::key_refusal_of_verify_error`, so the split is spelled once. A backend failure still propagates as `Err`.
+
+Python keeps the arm's type. `federation_err_to_py` raises `AttesterKeyUnknown` as `ValueError`, as it did `SignatureInvalid` and `FederationTierUnverified`, with the kind string as the message. `apply_replicated_key_record` returns `{"refused":{"reason":"attester_key_unknown"}}` where it used to raise.
+
+New variants on `pub` exhaustive enums, and how an adopter maps them:
+
+| Variant | Mapping |
+|---|---|
+| `federation::Error::AttesterKeyUnknown` | **retryable**: re-offer the same row after the signer's Key row lands |
+| `register::KeyRefusalReason::AttesterKeyUnknown` | **retryable**, same rule, on the key plane |
+
+Breaking for Rust callers that match `Error` or `KeyRefusalReason` exhaustively. `canonical_community::is_row_verdict` counts the new variant as a verdict on the row, as it counted `FederationTierUnverified`.
+
+Witnesses in `src/federation/attester_key_unknown_invariants.rs`, each on memory, sqlite and postgres. Each has the three steps the issue names: an unknown signer is the gap, a known signer with a signature over other bytes is the terminal verdict, and the same row admits after the Key row lands.
+
+- **I613**, the key plane: `verify_key_registration` directly, then `apply_replicated_key_record`'s Insert arm, which must return an outcome and never an `Err`.
+- **I614**, the `identity_occurrence` plane, the 2026-10-08 defect.
+- **I615**, the attestation plane through `put_attestation`.
+
+RED before the fix, with every fix site reverted: all nine fail. I613 reads `registration signer (scrub_key_id=…) is not registered`, I614 reads `signed identity_occurrence: attesting_key_id … is not a registered federation key` and I615 reads `invalid argument: attesting_key_id … does not exist in federation_keys`. With only the Insert arms reverted, I613 fails on all three backends with `a refusal is an outcome, never a bare Err: AttesterKeyUnknown { … }`. Mutation: collapsing `AttesterKeyUnknown` into `UnverifiableSignature` in `key_refusal_of_verify_error` turns I613 red on all three backends.
+
+#### #1042 follow-ups from Edge's adopt (CIRISEdge#858)
+
+**The signer-acts-for arm is its own retryable variant.** `check_signer_acts_for` is the check that the signer is the identity itself, an ACTIVE occurrence of it, or a node it owns through a live owner binding. It returned `Error::SignatureInvalid` when none held. The signature had verified at that point, and on a fresh node the usual cause is ordering: the binding or occurrence that lets this signer vouch has not landed yet (the #776 standup race, which Edge's `occurrence_before_binding_776` relies on staying re-askable). It now returns `federation::Error::SignerDoesNotActFor { attesting_key_id, identity_key_id, plane }`, kind `federation_signer_not_acting_for`. Python raises `ValueError`, the type of the `SignatureInvalid` arm it was split from. The doors that ask it, by `plane`:
+
+- `identity_occurrence`: `put_identity_occurrence`, signed and content-only.
+- `identity_occurrence_revocation`: `put_identity_occurrence_revocation`.
+- `transport_destination`: `put_signed_transport_destination`. `identity_key_id` is the route's `occurrence_key_id`.
+- `touch_claim`: `put_touch_claim` with `SignerForm::SelfTouch`. `identity_key_id` is the touched target.
+
+A registered key that will never be bound, a peer asserting a victim's route for example, gets the same token, because at admission it is indistinguishable from a binding that has not arrived yet. The re-offer is the sender's to bound.
+
+| Variant | Mapping |
+|---|---|
+| `federation::Error::SignerDoesNotActFor` | **retryable**: re-offer the same row after the signer's owner binding or occurrence lands |
+
+**`SignatureInvalid` is now terminal on every door.** It means the signature does not verify, or the signed bytes are malformed or unbound: a hash mismatch, a missing ML-DSA half, an envelope that does not bind its subject, a `touch_claim` signer form whose shape is wrong (attester equals target, no co-signature set, too few distinct valid co-signers). Nothing that can still land can change any of those. How I checked: `grep -rn 'SignatureInvalid(' src --include=*.rs`, excluding comments, `SignatureInvalid(_)` match arms and the `_invariants.rs` witnesses, leaves the variant definition and 16 construction sites. Those are `register.rs` 3 (subject binding, content-hash mismatch, hybrid verify) and `admission.rs` 13: occurrence verdict and hybrid verify, missing ML-DSA, revocation and route hybrid verify, the six touch-claim signature and shape sites, and the two PQC-attach sites. Each was read. The unknown-signer and unknown-co-signer lookups next to them already return `AttesterKeyUnknown` (#1042 above), and the signer-acts-for arm was the only one that depended on directory state that can still arrive.
+
+**The shared envelope verifier propagates a backend failure.** In `tier_ingest::verify_envelope_hybrid_signature`, a FAILED `lookup_public_key` (the backend erred, not "no row") went through the verdict path and became `FederationTierUnverified`, the terminal token. It now propagates as the backend's own error, as `register::verify_key_registration`'s twin does. A transient storage failure is not a verdict on the row. This verifier serves attestations, revocations, families, communities, memberships, location proofs and every other envelope-signed row.
+
+Witnesses in `src/federation/attester_key_unknown_invariants.rs`, each on memory, sqlite and postgres:
+
+- **I630**: on each of the four doors, a registered signer whose signature verifies but who is not yet an active occurrence of the identity is refused `federation_signer_not_acting_for`, naming the signer, the identity and the door. Once the occurrence lands, the same row admits.
+- **I631**: `verify_envelope_hybrid_signature` over the `FaultInjectingDirectory` with `lookup_public_key` erroring returns `Error::Backend("injected backend failure: …")`. Over the same directory without the fault, the row verifies.
+
+RED before, each fix reverted alone: I630 fails on all three backends with `I630 occurrence: scrub-signature verification failed: signed identity_occurrence: signer … is neither identity … nor an active occurrence of it` (kind `federation_signature_invalid`). I631 fails on all three with `I631: a backend failure propagates as itself, never a verdict: federation_federation_tier_unverified`. Mutant, restored: the refusal's `plane` pinned to `identity_occurrence` turns I630 red on all three at the revocation door.
+
+Existing assertions moved with the arm: the signed route matrix's "unrelated registered signer" step on all three backends, sqlite's signed-occurrence `signer_acts_for` arm and its signed-revocation (3b) arm, and the three I76 arms in `key_grant_invariants`. All now assert `federation_signer_not_acting_for`.
+
+#### #1042 follow-ups B and C (Edge's adopt of 84e6f502, CIRISEdge#858)
+
+**B. A row that names no signer is malformed, not the gap.** A row with an empty `attesting_key_id` reached the signer lookup and was refused `AttesterKeyUnknown { attesting_key_id: "" }`, labelled retryable, though no Key row can ever land for `""`. Every `AttesterKeyUnknown` is now built by one constructor, `Error::unknown_signer(id, plane)`. For an empty or blank id it returns a terminal `Error::InvalidArgument` ("`{plane}: the row names no signer …`"). All 11 construction sites go through it: the attestation door on memory, sqlite and postgres; the shared envelope verifier; the key plane; `identity_occurrence` (2); `identity_occurrence_revocation`; `transport_destination`; `touch_claim`; and `touch_claim_cosigner`. The key plane already refused an empty `scrub_key_id` before its lookup (`scrub_key_id must be non-empty for registration`). On the replicated apply that refusal stays the terminal `unverifiable_signature` outcome. One more door reaches the guard through the shared envelope verifier: an unsigned roster grow, where `add_family_member_consented` gets an `AdmitSpec` with an empty `authority_key_id`. It is now `InvalidArgument`, `signed_envelope: the row names no signer …`, where it was `AttesterKeyUnknown { "" }`. The full suite found it (`roster_growth_is_authorized_*_654` on all three backends and sqlite `rekey_family_member_add_grows_roster_and_serves_future_writes`), and their authorship assertions accept the new text.
+
+**C. Two refusals Edge matched as prose are typed.** In both, the Display is the previous text, unchanged, so a pinned string still matches, and Python keeps `ValueError`:
+
+- `Error::LicensureDelegatorNotAuthority { attesting_key_id, authority_id, reason, message }`, kind `federation_licensure_delegator_not_authority`, replaces the `InvalidArgument` the licensure door (`check_licensure_delegator_is_authority`) returned. `reason` is a stable token from the new public `admission::licensure_refusal`: `AUTHORITY_ACTS_BY_QUORUM` (`authority_acts_by_quorum`), `NAMED_EDGE_ABSENT`, `NAMED_EDGE_NOT_LICENSE`, `NAMED_EDGE_NOT_ONTO_EMITTER`, `NOT_ON_LIVE_CHAIN` and `NOT_AUTHORITY_AT_RECEIPT`. `LicensureChainBreak::as_str` and `LICENSURE_NOT_AUTHORITY_AT_RECEIPT` now return these constants. Python's message is `federation_licensure_delegator_not_authority: {reason}`.
+- `Error::AccordProposalNonceReused { family_key_id, nonce, existing_proposal_digest }`, kind `federation_accord_proposal_nonce_reused`, token `accord_quorum::ACCORD_PROPOSAL_NONCE_REUSED`, replaces the `Conflict` from #1047's single-use check (all three backends). Python's message is the kind, so it no longer reads `federation_conflict`.
+
+| Variant / refusal | Mapping |
+|---|---|
+| empty or blank signer id → `Error::InvalidArgument` | **refused** (terminal): malformed |
+| `federation::Error::LicensureDelegatorNotAuthority`, reason `named_edge_absent` | **retryable**: the named `delegates_to` row is not held here YET (a lookup miss, the same ordering gap as `AttesterKeyUnknown`); re-offer after it lands, with a cap |
+| `federation::Error::LicensureDelegatorNotAuthority`, reason `not_on_live_chain_at_asserted_at` | **retryable, capped**: an upstream `license` edge may still be replicating (the door cannot tell a missing edge from a dead one), but a retraction can also land later, so a later re-offer is not guaranteed to admit |
+| `federation::Error::LicensureDelegatorNotAuthority`, reasons `named_edge_not_license_delegation`, `named_edge_not_onto_emitter`, `authority_acts_by_quorum`, `not_authority_at_receipt` | **refused** (terminal): a property of the signed named edge, of the authority's protocol (until #1036), or of the emitter's standing at receipt, none of which a later row repairs |
+| `federation::Error::AccordProposalNonceReused` (`accord_proposal_nonce_reused`) | **refused** (terminal) |
+
+Witnesses, each on memory, sqlite and postgres:
+
+- **I632** (`attester_key_unknown_invariants.rs`): an empty signer is `InvalidArgument` from the lookup's own guard at the attestation door, the shared envelope verifier and the signed occurrence door. The key plane refuses it with its pre-existing guard, and the replicated apply returns `unverifiable_signature`.
+- The licensure witnesses (`licensure_chain_invariants.rs`, through `must_refuse_as`, including `authority_acts_by_quorum` under a `majority` affiliation, and the #1049 `not_authority_at_receipt` arm) now also assert the kind, the typed `reason` and the unchanged Display prefix.
+- I629 asserts the typed nonce refusal (family, nonce, existing digest, kind) and its unchanged Display. The Python witness matches `federation_accord_proposal_nonce_reused`.
+
+Mutants, each restored: B's guard off turns I632 red on all three backends (`got federation_attester_key_unknown (AttesterKeyUnknown { attesting_key_id: "" … })`). That is also the RED-before state. The licensure door returning the old `InvalidArgument`, and the `reason` pinned to `not_on_live_chain_at_asserted_at`, each turn 9 licensure witnesses red across the backends. The nonce refusal back to `Conflict` turns I629 red on all three.
+
+### Added — a stored Key row that fails verification is replaced by a passing one (`InvalidReplaced`) (#1044)
+
+CIRISServer's legacy `register_user_key` fallback stored user Keys whose scrub signatures cover the owner-binding bytes rather than the registration envelope. Such a row passes `verify_key_registration` steps 1 to 4 and fails step 5, the hybrid verify. It is served to every peer and refused by every stranger's Insert. When the holder re-signed, the incoming record was refused `conflicting_version`, `downgrade`, `re_scrub` or `already_anchored_identical`, because first-seen-wins presumes the stored row is a valid record. Server measured 0 such rows on the canonical, so no production row waits on this door; it is the class fix.
+
+Edge's three questions (CIRISEdge#858):
+
+1. **The door.** There is no new entry point. The arm is `ReplicatedKeyPlan::ReplaceInvalid` inside the existing key plan, reached through two doors: the replicated apply, `FederationDirectory::apply_replicated_key_record` (`Engine::apply_replicated_key_record`, Python `apply_replicated_key_record`, outcome `"invalid_replaced"`), and the local door, `Engine::rebind_key_record` (Python `rebind_key_record`, `{"outcome":"invalid_replaced"}`). Both write through one new store step, `FederationDirectory::store_invalid_replaced_key_record`, overridden by memory, sqlite and postgres. The store step re-asserts the whole rule itself rather than trusting the plan, since it is a public trait method.
+2. **Inputs.** One `SignedKeyRecord`, the re-signed registration. It replaces the stored row only when all of these hold:
+   - the stored row fails `verify_key_registration` structurally (`SignatureInvalid` or `InvalidArgument`) and binds its subject. An unknown signer is not a verdict, and the unbound pre-#659 shape has its own doors (#864 rebind, genesis re-mint).
+   - the incoming record passes `verify_key_registration`.
+   - both pubkeys are the same.
+   - the claim is the same (`identity_type`, `identity_ref`, `valid_from`, `valid_until`, roles, attestation evidence; the #864 predicate).
+   - the incoming record is signed by the key itself (`scrub_key_id == key_id`, the holder's proof of possession) or by the stored row's scrubber. `verify_key_registration` accepts any registered key as an anchor scrubber, so without this a third key could install itself as a failing row's scrubber.
+   - neither side is role-gated (canonical, accord_holder, infra:attest, co-steward). Those rows are admitted by their m-of-n co-scrub, not by `verify_key_registration`'s scrub #1, and a one-scrub replacement would shed the quorum.
+
+   The arm is consulted only when the plan would otherwise refuse with one of the four first-seen reasons, so the stored row's verify is paid only where the answer can change. A valid stored row is never replaced, and the original refusal stands. If the incoming record also fails, its own verdict is the refusal (`unverifiable_signature`, or `attester_key_unknown`). A different pubkey stays `pubkey_swap`. A lost race at the store step is `store_conflict`, re-offerable.
+3. **The audit row.** One `KeyRegistrationHistoryRow` in `federation_key_registration_history` (V148, widened by **V186** on both dialects), written in the same transaction as the replacement and guarded on the planned-against row hash. It carries the replaced row's `registration_envelope`, `original_content_hash`, `scrub_signature_classical`, `scrub_signature_pqc`, `scrub_key_id` (the old scrubber) and `scrub_timestamp`, plus `replaced_at`, `replaced_by_hash` (the new row's `persist_row_hash`) and two new fields. `replaced_row_hash` is the replaced row's own `persist_row_hash`, its id. `replacement` is a `KeyReplacementKind`: `invalid_replaced` here, `rebind` for the #864 door. V186 adds `replaced_row_hash TEXT` (NULL on rows written before V186) and `replacement_kind TEXT NOT NULL DEFAULT 'rebind'` with a CHECK for the two tokens. Rows from before V186 were all rebinds and read so. The key row is rewritten in place: the incoming envelope, every scrub (`additional_scrubs` included), `scrub_key_id`, a recomputed `persist_row_hash`, and `mutated_at` moved so peers whose cursor passed the row are served it again. Python reads the history through `list_key_registration_history`.
+
+The rebind door and the invalid-replace door now share one guarded write per backend (sqlite and postgres `write_replaced_key_registration`). The rebind additionally requires the stored row to be self-signed in its `WHERE`, as before.
+
+New variants on `pub` exhaustive enums, and how an adopter maps them:
+
+| Variant | Mapping |
+|---|---|
+| `register::ReplicatedKeyOutcome::InvalidReplaced` | **admitted**: the row now carries this record |
+| `register::RebindOutcome::InvalidReplaced` | **admitted**, same, at the local door |
+| `types::KeyReplacementKind::Rebind` / `::InvalidReplaced` (new enum) | audit only: which door replaced a history row's record |
+
+`KeyRegistrationHistoryRow` gains two `pub` fields, `replaced_row_hash` and `replacement`, both `#[serde(default)]`. That breaks Rust struct literals; JSON readers are unaffected. Genesis' baked-record apply treats `InvalidReplaced` as success, like `Upgraded` and `Rebound`.
+
+Witnesses in `src/federation/invalid_replace_invariants.rs`:
+
+- **I616** (memory, sqlite, postgres) covers the arm and every refusal around it. A valid stored row is refused `conflicting_version` and untouched. A pubkey swap, a changed claim and a failing incoming record are each refused with the row untouched. The holder's re-signed record gives `InvalidReplaced`: the row verifies, it is served again past a cursor that had passed it, the history row names the replaced row's hash and `invalid_replaced`, and a second apply is idempotent.
+- **I617** (memory, sqlite, postgres): the store step called directly refuses a stored row that verifies (`Conflict`). A failing anchor-scrubbed row is replaced by the holder's self-signed record instead of being refused `downgrade`, and the audit row keeps the old scrubber.
+- **I618** (memory, sqlite, postgres): a #864 rebind writes `replacement = rebind` and the replaced row's hash.
+- **I619** (sqlite, through `Engine`): `rebind_key_record` returns `{"outcome":"invalid_replaced"}`.
+- **I620** (memory, sqlite, postgres): a record a registered stranger signed does not replace the row, at the plan or at the store step, and the stored scrubber's re-signing does.
+- **I621**: the admissibility predicate, plus a memory witness through the plan and the store step. A role-gated row cannot clear `put_public_key`'s production-roster gate in a test, so the row is seeded past it. The clause lives in `register`, which every backend calls.
+
+RED before the fix (the arm made unreachable): I616, I617 and I620 fail on all three backends and I619 fails (`I617: a failing anchor-scrubbed row is replaced, not a downgrade refusal`). Mutants, each restored:
+
+| Mutant | Witnesses red |
+|---|---|
+| the plan drops "the stored row fails verification" | I616 on all three backends (`a stored row that VERIFIES is never replaced`) |
+| the store step drops the same precondition | I617 on all three backends (`the store step refuses to replace a row that verifies: Ok(InvalidReplaced)`) |
+| the signer clause dropped | I620 on all three backends, I621 predicate |
+| the role-gated clause dropped | I621 predicate and memory witness (`a role-gated row is not replaced: InvalidReplaced`) |
+
+### Changed — an accord proposal's nonce is the proposer's; the server-issued nonce set is gone (#1047)
+
+Verify 20 (CIRISConstitution#146, CC 4.2.6) has the proposer mint an `AccordProposal`'s nonce, never a server: "a server is part of what a halt may need to stop, and no accord act depends on one". Verify checks the nonce's form, and single use is the substrate's dedup. Persist still kept the pre-20 model (M4). `put_accord_proposal` refused a proposal unless `issue_accord_nonce` had first recorded its `(family_key_id, nonce)`. The replicated-evidence path issued the nonce itself, just before storing, because a receiving node had issued nothing. Server and Edge never called the issue door (checked on both `main`s), and Server has no accord proposal producer.
+
+- **`put_accord_proposal`** (memory, sqlite, postgres) admits a proposal without a prior issuance. A nonce names one proposal per family. A different proposal (another digest) carrying a nonce already used in its family is refused `Error::Conflict`, with a message starting `accord_proposal_nonce_reused`, and is not stored. That is the same type as a second vote by one holder (M6), and Python raises `ValueError` (`federation_conflict`). A byte-identical re-put stays idempotent, and the same nonce in another family is unaffected. The check and the insert are one step: under the memory lock, inside sqlite's write, and in postgres inside one transaction under `pg_advisory_xact_lock(ACCORD_PROPOSAL_NONCE_LOCK_KEY)`.
+- **`admit_replicated_accord_evidence_over_roster`** no longer records a nonce before storing the proposal, and a bundle whose proposal reuses a nonce is refused at the same check.
+- **Removed (breaking):** `FederationDirectory::issue_accord_nonce` and `FederationDirectory::accord_nonce_issued`, the three backend implementations, the directory double and capsule arms, and the Python `Engine.issue_accord_nonce` / `Engine.accord_nonce_issued`. **V188** (both dialects) drops the `accord_issued_nonce` table.
+- **Wire:** unchanged. `AccordProposal` is verify's struct, and no accord row (CC 3.4.1) changes shape.
+
+Witness **I629**, in the shared accord storage body (`accord_quorum::test_fixtures::exercise_accord_storage`) on memory, sqlite and postgres, plus the Python `test_accord_live_quorum_ffi_302`. A proposal admits with nothing issued, and a re-put is idempotent. A proposal that differs only in `window_until` and reuses the nonce is refused `accord_proposal_nonce_reused` naming the first digest, and is not stored. The same nonce in another family admits.
+
+RED before, with the I629 body run against the pre-#1047 backends: all three fail with `I629: a proposer-minted nonce admits: invalid argument: accord proposal nonce "…" not issued for family "…" (M4 fail-closed)`. Mutants, each restored:
+
+| Mutant | Witnesses red |
+|---|---|
+| memory's single-use check off | I629 memory (`a reused nonce must be refused Conflict, got Ok(())`) |
+| sqlite's single-use check off | I629 sqlite (same) |
+| postgres's single-use check off | I629 postgres (same) |
+| memory's check read across families | I629 memory (`one nonce in another family admits: … accord_proposal_nonce_reused`) |
+| sqlite's, the same | I629 sqlite |
+| postgres's, the same | I629 postgres |
+
+Python witness `test_accord_live_quorum_ffi_302` covers the new door: a proposer-minted nonce admits, and a reuse raises `ValueError` matching `federation_conflict`. It passed in the wheel lane (`maturin develop --release` with the derived feature line, 55 passed).
+
+Not in this cut, from the same verify 20 notes in the issue: a `constitutional` halt that verifies on one holder's signature, and `Invocation`'s `lifecycle:confirmed` / `confirms_halt_id`. Persist calls neither `verify_invocation` nor the deprecated live-quorum tallies, and its only `AccordAction::Fire` use is a test fixture.
+
+### Fixed — the nightly mutants job was green while incomplete, its witness report said 0, and its survivors surfaced nowhere (#1051)
+
+The first scheduled run of `.github/workflows/mutants.yml` (650024b1, 2026-10-09) hit its
+2-hour budget (tool exit 124, 8 of 85 mutants never tested), had 6 survivors and 3 timeouts,
+and its job was **green**. Each defect, and what now makes it red:
+
+- **Incomplete was green.** `scripts/mutants.sh` exits **4** on an INCOMPLETE matrix, and
+  refuses up front with **3** a scope that does not fit its budget at the measured cost
+  (600 s + 120 s per mutant; that run: baseline 305 s, per mutant mean 78 s, p90 105 s).
+  `scope-consent` is split into `scope-consent-gate` (19 mutants, 2880 s) and `scope-observe`
+  (71 mutants, run as two `--shard`s of 36 and 35); each is its own job with a 150-minute
+  timeout. `MUTANTS_SHARD=k/n` is the new knob.
+- **"0 witnesses ran".** The defect was in the matrix reader, not `unvalidated_witnesses.py`:
+  the job sets `CARGO_TERM_COLOR=always`, so nextest's status lines in cargo-mutants' logs
+  carried colour escapes, and no line matched. The matrix listed 0 witnesses and credited no
+  kill. Escapes are stripped now, and a green baseline that yields no status line is a refusal
+  (exit 1), not an empty matrix. Witnessed against a trimmed copy of that run's own output
+  (`scripts/mutants/testdata/cargo-mutants-27.1/`): 22 witnesses, kills attributed per
+  witness, each outcome read.
+- **Survivors went nowhere.** `mutants_matrix.py verdict` writes the outcome table and every
+  survivor to `$GITHUB_STEP_SUMMARY`, annotates each (`::error` unlisted, `::warning`
+  allowed), and exits **5** on any `missed`, `timeout` or `caught_out_of_scope` mutant that
+  `scripts/mutants/allowed_survivors.txt` does not name with a `#<issue>`. The list is empty.
+- **Test support was in scope.** cargo-mutants 27.1 applies neither `-F` nor `-E` to struct
+  field deletions, so a function regex let in `delete field as_of` in four functions outside
+  the scope and two deletions in `#[cfg(all(test, ..))] mod r2_test_support`. Selection is
+  now by line through `--in-diff`: the scope is written as a diff that adds exactly its lines,
+  minus every test-only item (`#[cfg(test)]`, `#[cfg(all(test, ..))]`, `mod *test_support*`).
+  On the old scope this removes exactly those six. The matrix judges a mutant in scope when
+  its SPAN touches a scope line, as `--in-diff` does: judged by its first line, `counters()`'s
+  whole-body replacement (which starts on a `#[cfg(test)]` statement) was run by the tool and
+  then filed out of scope, where a survivor reaches no verdict. A cargo-mutants mutant the
+  matrix still files out of scope is now itself a red verdict (exit 5, "scope disagreement").
+- **v54.0.0 had moved the gate out of its scope.** #1015 split
+  `resolve_scoped_stance_by_principals_body` into `per_principal_stances` and
+  `combine_per_principal`; the scope named only the old body, which kept one mutant.
+  `scope-consent-gate` names both and measures I570 beside I548.
+- **Hangs cost the budget.** A nextest `mutants` profile kills a witness after 60 s, so a
+  mutant that hangs one is that witness's FAIL, not a 300 s tool timeout credited to no one.
+  `mutants.sh` pins cargo-mutants' `--minimum-test-timeout 300` so the tool's own timeout
+  cannot fall under that leash on a fast baseline. Run locally with cargo-mutants 27.1 on
+  `record_read` at `-j 1`: all five of its mutants `caught`, the three mask-loop ones in
+  61-63 s of test each (300 s and `timeout` on the nightly run).
+
+`scripts/mutants_matrix_test.py` (22 checks, fixtures, no cargo) now runs per-PR in `ci.yml`,
+in certify's fast tier (`mutmatrix`), and before each nightly leg (#1045 item 4). Each new
+failure path is shown red on a crafted input, and each fix was hand-reverted to show its
+witness red. **mutest-rs stays out of the nightly job:** it needs the pinned nightly and a
+from-git build, cannot build with `postgres`, profiles the whole lib suite for 28 minutes per
+run and reaches one of the scope's async witnesses (docs/MUTATION_TESTING.md).
+
+### Added — witnesses for the counters' three survivors and the mask loop (#1037, #1051)
+
+- **I690**: the snapshot lists a `(backend, door)` only once it served a read; a fresh set
+  lists none. Kills `Counters::snapshot`'s `n > 0` → `n >= 0`.
+- **I691**: `fold(X, fold(X, read))` keeps X active and credits every read once. Kills
+  `fold`'s `|` → `^`.
+- **I692**: a read inside two folds returns within 5 s. Kills `record_read`'s three mask-loop
+  mutants (`&=` → `|=`, `-` → `+`, `-` → `/`) in seconds, where they used to hang every
+  witness to the tool's 300 s timeout.
+- `emit_metrics` → `()` survived because I553, which kills it, was outside the scope's test
+  filter. The filter now includes I552/I553.
+
+### Added — I548f: a steward's grant lapsed and swept reads `Expired` (#1038)
+
+The consent gate's one survivor (`||` → `&&` in the steward-universe predicate, now in
+`per_principal_stances`) dropped the substrate's `consent:state:expired` record from every
+steward's universe. I548f grants for the machine by its steward, lets it lapse, runs
+`run_consent_expiry_sweep`, and requires `Expired` from `capacity_consent_stance` (memory,
+sqlite, postgres).
+
+### Changed — release chain follow-ups from v53.2.0 (#1045)
+
+- **gh ≥ 2.49 at preflight.** `release.sh` stage 1 asks `${GH:-gh}` for `gh attestation`
+  before anything is tagged; the printed finish command carries `GH=`. v53.2.0's finish
+  failed on gh 2.45 after the release was public.
+- **`CARGO_BUILD_JOBS` defaults to 6** in `release.sh` and `certify.sh`; the environment wins.
+- **The certify stage waits for a foreign cargo** (until none has run for 60 s, at most 2 h,
+  then exit 24 as before) instead of exiting 24 on certify's stray guard.
+  `CERTIFY_IGNORE_STRAY=1`, certify's own override, skips the wait. The self-test runs
+  release.sh's own `certify()` against stubs: a wait that gives up returns 24 before
+  certify.sh starts.
+- The 53.2.0 entry's self-test count said 41; it was 112. Now 129.
+- Not done here: item 6 (whether Codex caps reviews per PR) and item 7 (observing #1021's
+  tree-equality skip on a non-release merge) need observation on GitHub, not code.
+
 ## [54.0.0] - 2026-10-09
+
+### Changed — seven from-disk absence guards ported to ast-grep; test-only code is a node, not a brace count (#1026)
+
+v54.0.0's I14 false red came from a text stripper that knew `#[cfg(test)]` and read a
+`#[cfg(all(test, …))]` module as production. The ported rules select test-only code
+structurally: `utils/test-gated.yml` matches a node that follows (past other attributes and
+comments) `#[cfg(test)]`, `#[cfg(all(test, …))]`, `#[test]` or `#[tokio::test…]`, so a call at
+any depth inside such an item, or a `#[cfg(test)]` statement, is not production. Nothing is cut
+by counting braces, and comments and strings are not code by construction.
+
+- **Ported** (each keeps its Rust text gate for one release, bound to the rule in
+  `src/ast_gate_parity.rs`'s `GUARDS`): I14 the storage floor has no door
+  (`i14-storage-floor`, `i14-storage-floor-blobs`), #738 no src code mutates the anchor env,
+  #564 nothing names `AntiEntropy::Satisfied` outside `matches!`, #748 the retired depth knob,
+  #620 no sync signing verb, and the postgres provisioner's no-direct-env-read. Each rule also
+  matches inside a macro's token tree (`tokio::join!(b.store_blob_local(…))`), which a
+  `call_expression` rule cannot see.
+- **`cfg-test-forms`**: a cfg naming `test` in a form the util does not recognise (say
+  `#[cfg(all(feature = "x", test))]`), or a recognised one written over several lines (the
+  text strippers that remain read a line at a time), is refused, so the I14 class cannot come
+  back through a new spelling.
+- **`scripts/ast_gates.sh`**: a whole-tree rule (`files: [src/**/*.rs]`) expects one total and
+  refuses a collapsed walk; every `ignores:` entry must exist; and every rule must carry
+  `rule-tests/<id>-test.yml` with crafted code it must match and near-misses it must not (a
+  comment, a string, a test-gated item), run by `ast-grep test`. 14 rules, 79 cases.
+- **Shown red, before and after.** One planted file (never compiled) plus a `#[cfg(any())]`
+  item in blobs.rs: all eight new rules red, and every Rust twin red (the #620 one in the pyo3
+  lane). The I14 text gate missed the plant while it sat on one line: it skips every line that
+  starts with `fn ` as a declaration, so `fn a(b: B) { b.store_blob_local(x); }` is invisible to
+  it; the rule caught it, and the text gate caught the same call written over three lines.
+- **Hit sets diffed over the tree.** With their exclusions dropped, each rule's raw matches
+  were compared with a grep of the text gate's needle. Every grep-only hit is a comment, a doc
+  line, or a string literal inside the gate itself; the rules find no call the grep missed and
+  the grep finds no call the rules missed (I14: 57 call sites both ways).
+- Six mutations of the new checks were each red: a rule without its test file, a stale
+  `ignores:`, a per-file expectation on a whole-tree rule, a `valid:` case that fires, the
+  test-gated exclusion dropped from I14, and the util forgetting `all(test, …)`.
+
+### Fixed — the six text strippers that remain share one test-only-cfg predicate; one of them hid a test-only citation (#1026)
+
+Six from-disk gates still cut test code out by text before scanning (SQL anchors, manifest-driven
+symbol lists, relational body checks; docs/FROM_DISK_GATES.md lists them and why each stays text).
+Each spelled its own attribute test and most knew only `#[cfg(test)]`. They now share
+`crate::test_cfg::is_test_only_cfg` (I693), whose vocabulary is `utils/test-gated.yml`'s, and
+`rules/cfg-test-forms.yml` keeps every test-only cfg in the tree inside it.
+
+- `namespace/supersets.rs::every_cited_processor_has_a_non_test_caller` read the
+  `#[cfg(all(test, …))]` modules as production, so a call from one counted as a live caller: a
+  FALSE GREEN. Fixed, it names `admission.rs#resolve_withdraws_admission_rule`, cited by two
+  evidence rows (3.3.1, 4.1.1) and called only from test modules; production runs
+  `resolve_withdraws_admission_rule_at`. Ruled: evidence cites the function that runs. Both rows
+  (3.3.1 `CLM-nsproc-subject-key-ids-consent`, 4.1.1 `CLM-delegation-depth-default`) and the six
+  manifest citations of that path (`namespace_supersets.json`: the evidence export, the
+  field-processor matrix, three family placement rows) now name `_at`, which every production
+  door reaches: `put_attestation` on memory, sqlite and postgres through
+  `check_withdraws_admission` → `check_withdraws_admission_at`, and the bytes-plane tombstone
+  through `check_withdraws_admission_as_admitted`. The wrapper stays: CIRISServer imports it.
+  The gate is green.
+- `blob_surface_gates.rs`, `key_grant_invariants.rs`, `family_rules.rs`,
+  `sqlite_conn_model.rs` and pyo3.rs's GIL gate (which knew only the literal
+  `#[cfg(test)]\nmod `) found nothing new.
+- Reverting the predicate to `#[cfg(test)]` alone turns I693 red and the supersets gate back to
+  green.
+
+### Changed — 49 `#[serial]` markers off tests that own their database or touch none; every remaining key has a stated reason (#1003)
+
+The issue's runtime premise had already moved: under nextest every test is its own process, and
+`serial_test`'s lock is process-local, so the markers were inert there (#879 lifted the postgres
+test group to 16 for the cost the issue measured). They do hold under `cargo test`, where
+`test_pg::dsn()` hands every test in the one process the SAME database, so a marker can only come
+off a test that does not use that database.
+
+- **Removed (49):** 10 postgres tests that provision their own database (`isolated_dsn` /
+  `empty_dsn`), 29 memory-backend parity legs and 10 pure-function tests (blobs.rs chunk rows,
+  scope_bind placeholder rebasing, legacy-schema validation) that reach no database. Classified
+  by resolving each marked test's calls, transitively within its file, to `dsn()`,
+  `isolated_dsn()`, `empty_dsn()` or none; 637 markers reach `dsn()` and stay.
+- **Kept, by key, each with one line of reason** in `rules/serial-keys.yml`: `postgres` (the
+  per-process database under `cargo test`), `test_anchor_env`, `engine_singleton`,
+  `gil_teardown`, `runtime_teardown_gauge`, `env_ciris_data_dir`. The rule (src/ and tests/)
+  refuses a bare `#[serial]` or an unlisted key; its rule tests show both red.
+- **Measured.** The postgres lane under nextest (833 tests, the five postgres filters plus the 49):
+  168.7 s before; 167.1 / 169.1 / 166.2 s after, 833/833 passed each time, so no flake in three
+  runs and, as expected, no time change. The same 47 compiled tests under `cargo test
+  --test-threads=16`, interleaved A/A/B/B/B: 23.5 / 23.5 s with the markers, 4.9 / 4.5 / 5.0 s
+  without.
+
+### Fixed — the CIRISCache save pruned dependency fingerprints, so the test legs recompiled everything they restored (#1022)
+
+Measured, not inferred. The v54.0.0 PR run's telemetry leg spent 99 s restoring
+`…-phead-enone-v19.0.0` (the v20.1.0 key did not exist yet) and then compiled **436** crates,
+`proc-macro2` first; the tag run's core-1, the very leg that saves the blob, did the same. The
+blob is not release-only (the key's `-release-` is a cross-repo name token): the v20.1.0 blob
+that tag run published holds 10.5 GB of `target/debug/deps` beside 1 GB of `target/release`.
+
+The cause is the save's budget prune. core-1's target/ was 21.9 GB against `max-size-mb: 12288`,
+and `cc_prune_lru` deletes the OLDEST-mtime files. Cargo never touches a fresh unit, so the
+oldest files are the dependencies the run reused, and the newest are ciris-persist's own lib,
+test and bench binaries, which every commit rebuilds and no downstream build can use. The
+published blob kept 7.7 GB of those and lost dependency fingerprints.
+
+Reproduced in a container (ubuntu 24.04, rustc 1.97.0, the CI paths), restoring the published
+v20.1.0 blob over the v54.0.0 tree: a core-1 build compiled 27 crates, of which 8 had no
+fingerprint left, 17 sat behind those, plus pyo3 and persist. **Fix:** `scripts/ci_cache_trim.py`
+removes this crate's own outputs (target names from `cargo metadata`; deps, examples,
+uplifted copies, fingerprint, build and incremental dirs, cross-target dirs too) before each of
+the five saves. On that restored tree it removed 9.19 GiB and left 4.39 GiB, under every budget.
+A rebuild over the trimmed tree compiled 3 crates (pyo3-ffi, pyo3, persist) for core-1, and the
+same 3 for the telemetry leg's feature set. `scripts/ci_cache_trim_test.py` (fixture target/,
+runs in CI lint and certify's fast tier `cachetrim`) holds that it removes every own output and
+no dependency's, prefix-named crates included; three mutations of its matchers were each red.
+
+Still to see on GitHub: the first main or tag save after this lands, then a PR restoring it.
+pyo3-ffi reruns because its build script tracks `PATH`, which holds the runner's per-job temp
+directory; setting `PYO3_PYTHON` stops that (shown in the container) and is left for a later cut.
+
+### Changed — `evidence/cc_impl.tsv` is generated from the manifest's evidence export (#1052)
+
+The cc-conformance attestation signs `evidence/cc_impl.tsv`, and it was edited by hand: 131 of
+its 174 rows (4.1.1 `CLM-delegation-depth-default` among them) had no entry in
+`namespace_supersets.json`'s `evidence_export.CIRISPersist`, and nothing compared the two.
+
+- **A materialiser, not a cross-check** (#1052 option a): `scripts/evidence_tsv.py
+  write|check`. The version column is derived (src/ rows pin the Cargo.toml version; cross-repo
+  rows keep their entry's `crate`), and the one section note rides on the entry it precedes, so
+  the regenerated body is byte-identical to the hand-made one.
+- **The export now holds every row**, in tsv order: 131 back-filled (`manifest_round:
+  backfill-1052`), two post-cut renames recorded (`post_cut_rename_from`), four entries excluded
+  with a stated `tsv_excluded` reason (three cite a `src/safety/watchlist.rs` persist does not
+  have; one is a design note, not a pointer).
+- **Gates:** `scripts/evidence_tsv_test.py` (CI lint, certify fast gate `evidencetsv`) checks the
+  committed file against the generated one. It is red on a row only the tsv has, an entry only the
+  manifest has, a stale stamp, an exclusion without a reason, and a cross-repo row without a stamp.
+  Each direction was also shown red on the real tree. release.sh's bump re-stamps, then requires
+  `evidence_tsv.py check` before it commits; the release self-test runs that path on a fixture
+  (red before the re-stamp, green after) and is red if the check leaves the bump stage.
+- **Rows for three claims v54.0.0 shipped and published nothing under** (CC re-pin 15), added
+  through the export and the generator, each at its claim's own section and at the function
+  production runs:
+  - 4.1.1 `CLM-anti-pattern-delegation` and `CLM-self-edge-not-cycle`:
+    `admission.rs#check_delegation_cycle_admission`. Every backend's `put_attestation_with_origin`
+    and `check_promotion_admission` call it. The self-edge exemption and the trust-plane exclusion
+    are its first two clauses, so the self-edge claim also cites `admission.rs#is_trust_plane_edge`.
+    `delegation_cycle_invariants.rs` is the witness, not the gate.
+  - 4.4.3.2.8 `CLM-affiliation-config-record`: `affiliation_config.rs#check_community_record` (every
+    backend's `put_community_at_door`, and supersession through `group_amendment`) and
+    `#declared_cohort`.
+  - Not added: `CLM-licence-judged-at-issuance` and `CLM-licence-authority-quorum`. v54.0.0
+    judges a licence at receipt as well as at the signed `asserted_at` (the CC says never at
+    receipt; the signed-instant rule alone lands with #1049's window). It also roots a community
+    authority only under `founder_only`; any other protocol is refused (`authority_acts_by_quorum`)
+    because cosigned licensure rows are #1036's plane move.
+- **CC rc8 (CIRISConstitution 8c8f536) purge and run-kind rows**, at the functions production
+  runs: 2.4.1.1 `CLM-purge-tombstone-not-withdraws` (`steward_purge::purge_rows`,
+  `verify_purge_authorisation`), 2.4.1.1 `CLM-purge-never-reaches-key` (`parse_record_id`,
+  `resolve_selection`), 2.4.1.1 `CLM-accountability-record-unpurgeable`
+  (`migration::accountability_record_family`, #1054's shared list; `steward_purge::retraction_admissible`),
+  3.1.5 `CLM-trace-run-kind-refusal` (the admitter's half; the producer's half is CLM-trace-run-kind-carried, CIRISAgent#1249) (`refuse_mock_trace_attestation`; `schema::trace::RUN_KINDS`), 4.5.3
+  `CLM-purge-whole-or-not` (`purge_rows`, `purge_finalize`, `refuse_if_tombstoned_attestation`).
+  Not added, because v54.1.0 does less than the text: `CLM-steward-purge-authorisation` and
+  `CLM-purge-digest-preimage` (the notice is not yet an admitted row, so there is no
+  `reconsideration` to contest it and no Contribution for the tombstones to cite; the interim
+  human-subject gate stands in), and `CLM-derived-rows-follow-reason` (its legal-basis half is
+  #1007's takedown door, v55). Also withheld: `CLM-one-tombstone-row`,
+  `CLM-trace-schema-pinned`, `CLM-takedown-notice-row`.
 
 ### Changed — Verify 20.1.0 adopted: the three verify crates and the wheel floor move together (#992)
 
@@ -319,7 +898,7 @@ On v53.1.8, certify was green at about 18:40 and PR CI at 19:02, but the merge h
 - **Bump commit.** Cargo version, the `evidence/cc_impl.tsv` re-stamp (count asserted, so `@53.1.8` does not match `@53.1.80`), the CHANGELOG date, `cargo check --features sqlite`, and the evidence pin test. The subject is built from the section's `###` headings.
 - **PR CI wait.** A failed first attempt counts as final only once it has been re-run, once an `auto-retry` run that started after it has finished without re-running it, or after 15 min.
 - Every wait loop is bounded and prints its timeout. Each failure has its own exit code (20 to 29; 29 is certify's new INFRA exit 3: re-run, tree unjudged) and a one-line reason. There is no `--no-verify` and no `--amend`. `--dry-run` runs preflight and prints the plan without side effects.
-- `scripts/release_lib.sh` holds the shared functions (section cut, re-stamp, stage markers). `scripts/release_selftest.sh` tests them offline against a fixture CHANGELOG (41 checks). Mutation-checked: each of the following reds the self-test: an unbounded previous-version scan, a section that runs to EOF, a re-stamp without the version boundary, marking a failed stage, ignoring the recorded sha, and a `--no-verify` added to a release script.
+- `scripts/release_lib.sh` holds the shared functions (section cut, re-stamp, stage markers). `scripts/release_selftest.sh` tests them offline against a fixture CHANGELOG (112 checks at 53.2.0; 41 was the first draft's count). Mutation-checked: each of the following reds the self-test: an unbounded previous-version scan, a section that runs to EOF, a re-stamp without the version boundary, marking a failed stage, ignoring the recorded sha, and a `--no-verify` added to a release script.
 - `docs/RELEASE.md` documents the stages, the resume rule and what to do for each exit code.
 
 Codex review on PR #1039: six findings fixed before merge. The CHANGELOG cut passed regex text through `awk -v`, which gawk and busybox awk un-escape, so it returned an empty section with exit 0; it now matches headings as fixed strings, refuses an empty cut, and the self-test runs under every awk on the host (red under gawk 5.2.1 and busybox, green under mawk). The mutest matrix copied the whole-suite verdict, so a mutant only an out-of-scope test detected read `caught`; outcomes now come from the retained witnesses, with `caught_out_of_scope` and `crashed` for the rest. `scripts/prune_target.py` applied the 16-hex deps pattern to `incremental/`, whose names are base-36, so it reclaimed none of them; each directory now has its own pattern. The re-register plan took the newest tag run holding any wheel; it now takes the run covering the most needed wheels and rebuilds only what that run lacks (`scripts/reregister_plan.sh`). The repost guard compared only `binary_hash`; `scripts/snapshot_manifests.sh verify` now compares the whole canonical JSON of all three live reads to the committed snapshot. `scripts/release_finish.sh` hid a failed tag fetch with `|| true` and could publish a stale local annotation; it now reads origin's tag from its own ref and refuses a different local tag (exit 18) or a failed fetch (exit 19). Codex's second round found four more. `scripts/release_ship.sh` accepted a re-run's local tag at the right commit whatever its annotation said; the tag's message must now equal the CHANGELOG section byte for byte, else exit 11 and nothing is pushed. The repost guard verified only the re-signed targets while `register` rewrites all five, and the unchanged manifests could come from a tag-run artifact older than the live row; all five targets are now guarded, the unchanged manifests always come from the live registry, and `scripts/snapshot_manifests.sh verify-reuse` checks each fetched one against its snapshot. `release.sh` resumed `.release/<ver>` state on any clean branch, and its unkeyed bump marker skipped the version bump; the state now records its branch and release commit, and a resume that does not match them (or finds Cargo.toml or the dated header wrong) exits 32. The PR run's `build-manifest` job also went red: `bits_changed.sh` refused python-source-tree's unchanged hash because tag v53.2.0 does not exist before the tag push, so it now judges "unchanged" at HEAD when the version's tag is absent and names the ref it used. That run's history showed every PR run had been registering live registry rows from an unmerged head; register, the round-trip and check 5 now run on tag runs only. `observe::emit_metrics` described every counter with no unit, because the two-argument `describe_counter!` forwards none; it now passes each catalogued unit (`By` as bytes, `{row}`, `{read}` and `{call}` as a count), and I553 asserts the unit the recorder received.

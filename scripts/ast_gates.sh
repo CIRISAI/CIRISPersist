@@ -59,23 +59,67 @@ python3 -c 'import yaml' 2>/dev/null || { echo "PyYAML unavailable (reads the ru
 tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
 "$SG" scan -c sgconfig.yml --json=compact > "$tmp/scan.json" 2> "$tmp/scan.err" \
   || { cat "$tmp/scan.err"; echo "AST-GREP SCAN FAILED"; exit 1; }
+# v54.1.0 — every rule is shown to FIRE: rule-tests/<id>-test.yml holds crafted
+# code it must match (`invalid`) and near-misses it must not (`valid`): a
+# comment, a string, a test-gated item. A rule whose only evidence is a 0 on
+# the tree is a check nobody has seen fail.
+"$SG" test -c sgconfig.yml --skip-snapshot-tests > "$tmp/test.out" 2>&1 \
+  || { cat "$tmp/test.out"; echo "AST-GREP RULE TESTS RED"; exit 1; }
+grep -E '^(PASS|FAIL) ' "$tmp/test.out" | sed 's/^/rule-test /'
 
 python3 - "$tmp/scan.json" <<'PY'
 import collections, glob, json, os, sys
 import yaml
 
+# A whole-tree rule (an absence guard: "nothing under src/ calls X") names
+# one or both of these globs and expects one TOTAL under each; every other rule
+# lists its files and expects a count per file.
+TREES = {"src/**/*.rs": ("src/", 100), "tests/**/*.rs": ("tests/", 10)}
 matches = json.load(open(sys.argv[1]))
 expected = {k: v for k, v in json.load(open("rules/expected.json")).items() if not k.startswith("_")}
-rules = {}
+rules, ignores = {}, {}
 for path in sorted(glob.glob("rules/*.yml")):
     doc = yaml.safe_load(open(path))
     rid = doc["id"]
     if os.path.basename(path) != rid + ".yml":
         print(f"RED   {path}: id {rid} does not match its file name"); sys.exit(1)
     rules[rid] = doc.get("files") or []
+    ignores[rid] = doc.get("ignores") or []
+
+red = 0
+for rid in sorted(rules):
+    t = f"rule-tests/{rid}-test.yml"
+    doc = yaml.safe_load(open(t)) if os.path.isfile(t) else None
+    if not doc or doc.get("id") != rid or not doc.get("valid") or not doc.get("invalid"):
+        print(f"RED   {rid}: {t} must name the rule and hold at least one valid and one invalid case"); red += 1
+    for f in ignores[rid]:
+        if not os.path.isfile(f):
+            print(f"RED   {rid}: ignores {f}, which does not exist"); red += 1
+
+tree_rules = {rid for rid, files in rules.items() if files and set(files) <= set(TREES)}
+for rid in sorted(tree_rules):
+    globs = sorted(rules[rid])
+    if set(expected.get(rid, {})) != set(globs):
+        print(f"RED   {rid}: a whole-tree rule expects one total per glob, {{{', '.join(repr(g) + ': N' for g in globs)}}}"); red += 1; continue
+    for g in globs:
+        prefix, floor = TREES[g]
+        n = len(glob.glob(g, recursive=True))
+        if n < floor:
+            print(f"RED   {rid}: {g} holds {n} files; the walk collapsed"); red += 1; continue
+        want = expected[rid][g]
+        hits = [m for m in matches if m["ruleId"] == rid and m["file"].startswith(prefix)]
+        if len(hits) != want:
+            print(f"RED   {rid}: {len(hits)} match(es) under {g} ({n} files), expected {want}"); red += 1
+            for m in hits:
+                print(f"        {m['file']}:{m['range']['start']['line'] + 1}: {m['lines'].strip()[:120]}")
+        else:
+            print(f"ok    {rid}: {g} ({n} files) {len(hits)}")
+for rid in tree_rules:
+    del rules[rid]
+    expected.pop(rid, None)
+matches = [m for m in matches if m["ruleId"] not in tree_rules]
 
 got = collections.Counter((m["ruleId"], m["file"]) for m in matches)
-red = 0
 for rid in sorted(set(rules) | set(expected)):
     if rid not in rules:
         print(f"RED   {rid}: expected.json names it, rules/ has no rule"); red += 1; continue
@@ -99,5 +143,5 @@ for rid, f in sorted(stray):
     print(f"RED   {rid}: unexpected matches in {f}"); red += 1
 if red:
     print(f"AST GATES RED: {red}"); sys.exit(1)
-print(f"AST GATES GREEN: {len(rules)} rules")
+print(f"AST GATES GREEN: {len(rules) + len(tree_rules)} rules")
 PY

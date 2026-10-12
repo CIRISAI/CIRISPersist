@@ -4497,6 +4497,19 @@ pub enum BlobError {
         /// The `withdraws` (or `recants`) that retired it, re-derived now.
         withdraws_id: String,
     },
+    /// v54.1.0 (Codex round 3 on PR #1057) — a steward purge tombstoned these
+    /// bytes (or EVERY manifest a sealed-DAG chunk belongs to): they are
+    /// withheld from every byte door from EXECUTION onward, while the hard
+    /// delete waits for the 72 h settle. Like [`Self::Withdrawn`], never
+    /// [`Self::NotHeld`]: another holder rooted at the same trust root is
+    /// bound by the same purge, so the fetcher must not walk the mesh.
+    #[error("blob {sha256_hex} is withheld: steward purge {notice_id} tombstoned it")]
+    Purged {
+        /// Hex-encoded at-rest SHA-256 the read targeted.
+        sha256_hex: String,
+        /// The purge notice whose tombstone withholds it.
+        notice_id: String,
+    },
     /// Backend-level error (DB connection, serialization, etc.).
     #[error("backend: {0}")]
     Backend(String),
@@ -4525,6 +4538,7 @@ impl BlobError {
             BlobError::NotPartyTo { .. } => "blob_not_party_to",
             BlobError::SealDidNotOpen { .. } => "blob_seal_did_not_open",
             BlobError::Withdrawn { .. } => "blob_withdrawn",
+            BlobError::Purged { .. } => "blob_purged",
             BlobError::Backend(_) => "blob_backend",
         }
     }
@@ -6285,7 +6299,6 @@ mod tests {
 
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     #[test]
-    #[serial_test::serial(postgres)]
     fn chunk_manifest_round_trips_through_bytes() {
         let c0 = sha_of(b"a");
         let c1 = sha_of(b"bb");
@@ -6348,7 +6361,6 @@ mod tests {
 
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     #[test]
-    #[serial_test::serial(postgres)]
     fn prepare_chunk_rows_rejects_sha_mismatch() {
         // Manifest claims a chunk sha that the inline bytes don't hash to.
         let real = sha_of(b"real");
@@ -6375,7 +6387,6 @@ mod tests {
 
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     #[test]
-    #[serial_test::serial(postgres)]
     fn prepare_chunk_rows_rejects_total_size_mismatch() {
         let c = sha_of(b"abcd");
         let manifest = ChunkManifest {
@@ -6397,7 +6408,6 @@ mod tests {
 
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     #[test]
-    #[serial_test::serial(postgres)]
     fn prepare_chunk_rows_manifest_row_is_last_and_chunk_dag() {
         let c = sha_of(b"xyz");
         let manifest = ChunkManifest {
@@ -6426,7 +6436,6 @@ mod tests {
 
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     #[test]
-    #[serial_test::serial(postgres)]
     fn body_storage_kind_strings() {
         assert_eq!(BlobBody::Inline(vec![1, 2, 3]).storage_kind(), "inline");
         assert_eq!(
@@ -6468,7 +6477,6 @@ mod tests {
 
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     #[test]
-    #[serial_test::serial(postgres)]
     fn verify_inline_hash_round_trip() {
         use sha2::Digest;
         let bytes = b"hello world";

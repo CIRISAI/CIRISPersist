@@ -3367,7 +3367,10 @@ impl Engine {
     /// every other arm is returned as the typed refusal it is, never coerced.
     /// Not self-signed ⇒ `NotSelfSigned`; no row ⇒ `RecordAbsent`; the plan's
     /// own refusals pass through. The store step's lost race is
-    /// `StoreConflict`, re-offerable.
+    /// `StoreConflict`, re-offerable. v54.1.0 (CIRISPersist#1044): also
+    /// proceeds on the plan's `ReplaceInvalid` arm — the stored record FAILS
+    /// `verify_key_registration` and this one (same pubkeys, same claim)
+    /// passes — returning `InvalidReplaced`.
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     pub async fn rebind_key_record(
         &self,
@@ -3398,6 +3401,25 @@ impl Engine {
                 }),
                 Err(e) => Err(e),
             },
+            // v54.1.0 (CIRISPersist#1044) — the holder's re-signed record
+            // over a stored record that fails verification (same pubkeys, same
+            // claim): the invalid row is replaced in place.
+            ReplicatedKeyPlan::ReplaceInvalid => {
+                match directory.store_invalid_replaced_key_record(record).await {
+                    Ok(ReplicatedKeyOutcome::InvalidReplaced) => Ok(RebindOutcome::InvalidReplaced),
+                    Ok(ReplicatedKeyOutcome::Unchanged) => Ok(RebindOutcome::Unchanged),
+                    Ok(ReplicatedKeyOutcome::Refused { reason }) => {
+                        Ok(RebindOutcome::Refused { reason })
+                    }
+                    Ok(other) => Err(crate::federation::Error::Backend(format!(
+                        "rebind_key_record: invalid-replace store step returned {other:?}"
+                    ))),
+                    Err(crate::federation::Error::Conflict(_)) => Ok(RebindOutcome::Refused {
+                        reason: KeyRefusalReason::StoreConflict,
+                    }),
+                    Err(e) => Err(e),
+                }
+            }
             ReplicatedKeyPlan::Unchanged => Ok(RebindOutcome::Unchanged),
             ReplicatedKeyPlan::Insert => Ok(RebindOutcome::Refused {
                 reason: KeyRefusalReason::RecordAbsent,
@@ -8782,6 +8804,170 @@ impl Engine {
         }
     }
 
+    // ── v54.1.0 (CIRISPersist#1046) — the generic steward purge door ──────
+    //
+    // `crate::federation::steward_purge` holds the door; these are its host
+    // surface (the pyo3 `purge_*` methods and CIRISServer#756's
+    // `/v1/accord/purge/*` routes call them). The Engine supplies what the
+    // generic door cannot: this node's derived key id (the ledger's actor)
+    // and the bytes plane's retract-then-delete (`evict_blob`).
+
+    /// v54.1.0 (CIRISPersist#1046) — **dry run** a steward purge selection:
+    /// per-table counts, the selection digest the notice must name, the first
+    /// 20 record ids, the ledger TSV and the notice template. Writes nothing.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn purge_dry_run(
+        &self,
+        selection: &crate::federation::steward_purge::PurgeSelection,
+    ) -> Result<crate::federation::steward_purge::PurgeDryRun, crate::federation::Error> {
+        let directory = self.federation_directory();
+        crate::federation::steward_purge::purge_dry_run(directory.as_ref(), selection).await
+    }
+
+    /// v54.1.0 (CIRISPersist#1046) — **execute** a steward purge under a
+    /// cosigned `takedown_notice` (basis `steward_purge`): authorise, re-count,
+    /// re-digest, then tombstone every record in JCS order. Typed refusals:
+    /// `purge_unauthorised`, `purge_selection_count_mismatch`,
+    /// `purge_selection_digest_mismatch`, `purge_retraction_inadmissible`.
+    /// Deletes nothing (see [`Self::purge_finalize`]).
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn purge_rows(
+        &self,
+        selection: &crate::federation::steward_purge::PurgeSelection,
+        notice: &crate::federation::steward_purge::StewardPurgeNotice,
+    ) -> Result<crate::federation::steward_purge::PurgeReport, crate::federation::Error> {
+        let node = self
+            .local_derived_key_id()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("purge_rows signer: {e}")))?;
+        let directory = self.federation_directory();
+        crate::federation::steward_purge::purge_rows(directory.as_ref(), selection, notice, &node)
+            .await
+    }
+
+    /// v54.1.0 (CIRISPersist#1046) — a purge's state now (this node's clock):
+    /// executed, settled or finalized, with its tombstone counts.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn purge_status(
+        &self,
+        notice_id: &str,
+    ) -> Result<crate::federation::steward_purge::PurgeStatus, crate::federation::Error> {
+        let directory = self.federation_directory();
+        crate::federation::steward_purge::purge_status(directory.as_ref(), notice_id).await
+    }
+
+    /// v54.1.0 (CIRISPersist#1046) — **finalize** (hard-delete) an executed
+    /// purge after it settled, judged on THIS node's clock (Codex round 2 on
+    /// PR #1057: no purge surface takes a caller's instant). Blob records go through [`Self::evict_blob`]
+    /// (the bytes plane's own retract-then-delete), which needs this Engine's
+    /// LocalSigner; without one a purge holding blobs refuses at the first.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn purge_finalize(
+        &self,
+        notice_id: &str,
+    ) -> Result<crate::federation::steward_purge::FinalizeReport, crate::federation::Error> {
+        struct EngineBytes<'a>(&'a Engine);
+        #[async_trait::async_trait]
+        impl crate::federation::steward_purge::BytesEvictor for EngineBytes<'_> {
+            async fn evict(
+                &self,
+                sha256: &[u8; 32],
+                now: chrono::DateTime<chrono::Utc>,
+            ) -> Result<bool, String> {
+                self.0
+                    .purge_evict_blob(sha256, now)
+                    .await
+                    .map(|r| r.blob_deleted)
+                    .map_err(|e| e.to_string())
+            }
+        }
+        let bytes = EngineBytes(self);
+        let directory = self.federation_directory();
+        crate::federation::steward_purge::purge_finalize(
+            directory.as_ref(),
+            notice_id,
+            self.local_signer
+                .is_some()
+                .then_some(&bytes as &dyn crate::federation::steward_purge::BytesEvictor),
+        )
+        .await
+    }
+
+    /// v54.1.0 (Codex round 2 on PR #1057) — the purge's bytes-plane delete:
+    /// [`Self::evict_blob`], then every sealed-DAG child of the purged blob
+    /// whose EVERY manifest is purge-tombstoned by SETTLED purges only (or was
+    /// evicted by this walk), transitively. The purge deletes the blob's
+    /// binding row in the same finalize, so the DAG fold reads the manifest
+    /// `Unbound`, not `Withdrawn`, and `evict_blob`'s own chunk pass (keyed
+    /// on `Withdrawn`) would leave the chunks readable by hash. A chunk
+    /// another live manifest relates stays.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub(crate) async fn purge_evict_blob(
+        &self,
+        sha256: &[u8; 32],
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<crate::federation::EvictBlobReport, crate::federation::BlobError> {
+        let signer = self.local_signer.as_ref().ok_or_else(|| {
+            crate::federation::BlobError::Backend(
+                "purge_evict_blob requires a LocalSigner (evict_blob's retract-then-delete)"
+                    .to_string(),
+            )
+        })?;
+        let node = self.local_derived_key_id().await.map_err(|e| {
+            crate::federation::BlobError::Backend(format!("purge_evict_blob signer: {e}"))
+        })?;
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(arc) => {
+                purge_evict_blob_on(arc.as_ref(), &node, signer, sha256, now).await
+            }
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(arc) => {
+                purge_evict_blob_on(arc.as_ref(), &node, signer, sha256, now).await
+            }
+        }
+    }
+
+    /// v54.1.0 (CIRISPersist#1046) — the executed purge's ledger as TSV, for
+    /// `evidence/purges/<date>-<selection-digest>.tsv`.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn purge_ledger_tsv(
+        &self,
+        notice_id: &str,
+    ) -> Result<String, crate::federation::Error> {
+        let directory = self.federation_directory();
+        crate::federation::steward_purge::purge_ledger_tsv(directory.as_ref(), notice_id).await
+    }
+
+    /// v54.1.0 (CIRISPersist#1046) — **serve** the purge tombstone plane:
+    /// [`PurgeBundle`](crate::federation::steward_purge::PurgeBundle)s since a
+    /// `(admitted_at, notice_id)` cursor.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn list_purge_bundles_since(
+        &self,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
+        limit: u32,
+    ) -> Result<Vec<crate::federation::steward_purge::PurgeBundle>, crate::federation::Error> {
+        let directory = self.federation_directory();
+        crate::federation::steward_purge::list_purge_bundles_since(directory.as_ref(), since, limit)
+            .await
+    }
+
+    /// v54.1.0 (CIRISPersist#1046) — **apply** a peer's purge bundle,
+    /// re-verified against THIS node's trust root, digest re-derived.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn apply_replicated_purge(
+        &self,
+        bundle: &crate::federation::steward_purge::PurgeBundle,
+    ) -> Result<crate::federation::steward_purge::ApplyPurgeOutcome, crate::federation::Error> {
+        let node = self.local_derived_key_id().await.map_err(|e| {
+            crate::federation::Error::Backend(format!("apply_replicated_purge signer: {e}"))
+        })?;
+        let directory = self.federation_directory();
+        crate::federation::steward_purge::apply_replicated_purge(directory.as_ref(), bundle, &node)
+            .await
+    }
+
     /// v9.1.0 (CC 1.13.3 / FSD §2.4, CIRISPersist#243) — Engine-facade for
     /// [`BlobStorage::put_scope_blob`](crate::federation::BlobStorage::put_scope_blob):
     /// admit one caller-pre-encrypted (XChaCha20-Poly1305) RaptorQ symbol
@@ -9182,6 +9368,36 @@ impl Engine {
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<crate::federation::hard_case::ConsentState, crate::federation::Error> {
         crate::federation::consent_by_humans::capacity_consent_stance(
+            self.federation_directory().as_ref(),
+            attester_key_id,
+            subject_key_id,
+            family,
+            now,
+        )
+        .await
+    }
+
+    /// v54.1.0 (CIRISPersist#1041) — [`Self::capacity_consent_stance`] WITH
+    /// the [`ConsentBasis`](crate::federation::consent_by_humans::ConsentBasis):
+    /// the consent rows the stance rests on, each with its principal and path.
+    /// The fold the emit gate asks, so a scorer that records the basis records
+    /// what the gate decides on. See
+    /// [`consent_by_humans::capacity_consent_stance_with_basis`](crate::federation::consent_by_humans::capacity_consent_stance_with_basis).
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn capacity_consent_stance_with_basis(
+        &self,
+        attester_key_id: &str,
+        subject_key_id: &str,
+        family: crate::federation::admission::ConsentGatedFamily,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<
+        (
+            crate::federation::hard_case::ConsentState,
+            crate::federation::consent_by_humans::ConsentBasis,
+        ),
+        crate::federation::Error,
+    > {
+        crate::federation::consent_by_humans::capacity_consent_stance_with_basis(
             self.federation_directory().as_ref(),
             attester_key_id,
             subject_key_id,
@@ -11088,6 +11304,73 @@ where
     Ok(report)
 }
 
+/// v54.1.0 (Codex round 2 on PR #1057) — [`Engine::purge_evict_blob`] on one
+/// backend: [`evict_blob_on`], then the DAG children no live manifest keeps.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+async fn purge_evict_blob_on<B>(
+    backend: &B,
+    node: &str,
+    signer: &crate::signing::LocalSigner,
+    sha256: &[u8; 32],
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<crate::federation::EvictBlobReport, crate::federation::BlobError>
+where
+    B: crate::federation::BlobStorage + crate::federation::FederationDirectory + Sync,
+{
+    use crate::federation::BlobError;
+    let mut report = evict_blob_on(backend, node, signer, sha256, now).await?;
+    // Every manifest this walk has taken; a child is purged only when each of
+    // its manifests is one of these or is itself purge-tombstoned.
+    let mut gone: std::collections::BTreeSet<[u8; 32]> =
+        std::collections::BTreeSet::from([*sha256]);
+    let mut work = vec![*sha256];
+    while let Some(manifest) = work.pop() {
+        for (_, child) in backend.dag_chunks_of_manifest(&manifest).await? {
+            if gone.contains(&child) {
+                continue;
+            }
+            let mut orphaned = true;
+            for parent in backend
+                .dag_manifests_of_chunk(&child)
+                .await
+                .map_err(|e| BlobError::Backend(format!("purge_evict_blob: parents: {e}")))?
+            {
+                if gone.contains(&parent) {
+                    continue;
+                }
+                // Codex round 4 on PR #1057 — a parent counts as gone only
+                // when every purge that tombstoned it has SETTLED (or
+                // finalized): a parent still inside another notice's dwell
+                // keeps the shared chunk for that notice's own finalize (the
+                // chunk stays withheld meanwhile, I824).
+                let settled =
+                    crate::federation::steward_purge::blob_purge_settled(backend, &parent, now)
+                        .await
+                        .map_err(|e| {
+                            BlobError::Backend(format!("purge_evict_blob: tombstone: {e}"))
+                        })?;
+                if !settled {
+                    orphaned = false;
+                    break;
+                }
+            }
+            if !orphaned {
+                continue;
+            }
+            gone.insert(child);
+            work.push(child);
+            if backend.has_blob(&child).await? {
+                let r = evict_one_on(backend, node, signer, &child, now).await?;
+                report.withdraws_emitted += r.withdraws_emitted;
+                if r.blob_deleted {
+                    report.dag_chunks_evicted += 1;
+                }
+            }
+        }
+    }
+    Ok(report)
+}
+
 /// One sha, retract-then-delete (the pre-#979 [`evict_blob_on`]).
 #[cfg(any(feature = "postgres", feature = "sqlite"))]
 async fn evict_one_on<B>(
@@ -11933,6 +12216,7 @@ mod tests {
             signature_ml_dsa_65: None,
             pubkey_ml_dsa_65: None,
             pqc_key_id: None,
+            run_kind: None,
         };
         // v7.2.0 (#225) — hybrid-sign so the Full-mode trace-tier hard
         // cut admits: Ed25519 over canonical + ML-DSA-65 over the bound
@@ -12169,6 +12453,7 @@ mod tests {
             signature_ml_dsa_65: None,
             pubkey_ml_dsa_65: None,
             pqc_key_id: None,
+            run_kind: None,
         };
         let payload = canonical_payload_value(&trace);
         let canonical = PythonJsonDumpsCanonicalizer
@@ -12541,6 +12826,7 @@ mod tests {
             signature_ml_dsa_65: None,
             pubkey_ml_dsa_65: None,
             pqc_key_id: None,
+            run_kind: None,
         };
         let payload = canonical_payload_value(&trace);
         let canonical = PythonJsonDumpsCanonicalizer

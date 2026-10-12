@@ -378,9 +378,25 @@ where
     C: super::canonical::Canonicalizer + ?Sized,
 {
     use sha2::{Digest, Sha256};
-    let nine_field = canonical_payload_value(trace);
-    let nine_bytes = canonicalizer.canonicalize_value(&nine_field)?;
-    let two_field = canonical_payload_value_legacy(trace);
+    // v54.1.0 (Codex round 2 on PR #1057) — the primary shape IS the
+    // verifier's preimage: the same builder `verify_trace` and
+    // `verify_trace_hybrid` sign-check against ([`canonical_bytes_for_trace`],
+    // dispatched by the signed `trace_schema_version`, with the signed
+    // `run_kind` joined). Before, it rebuilt the 2.7.0 shape WITHOUT
+    // `run_kind`, so for a trace carrying one the breadcrumb named bytes no
+    // verifier ever checked. A version no arm dispatches falls back to the
+    // 2.7.0 shape (the diagnostic must not fail where the verifier refused).
+    let nine_bytes = match canonical_bytes_for_trace(trace, canonicalizer) {
+        Ok(bytes) => bytes,
+        Err(super::Error::UnsupportedSchemaVersion(_)) => {
+            let mut nine_field = canonical_payload_value(trace);
+            with_signed_run_kind(&mut nine_field, trace);
+            canonicalizer.canonicalize_value(&nine_field)?
+        }
+        Err(e) => return Err(e),
+    };
+    let mut two_field = canonical_payload_value_legacy(trace);
+    with_signed_run_kind(&mut two_field, trace);
     let two_bytes = canonicalizer.canonicalize_value(&two_field)?;
     Ok(CanonicalDiagnostic {
         nine_field_sha256: hex::encode(Sha256::digest(&nine_bytes)),
@@ -393,7 +409,9 @@ where
 /// Diagnostic carrier for v0.1.18 breadcrumbs +
 /// `Engine.debug_canonicalize`. See [`canonical_payload_sha256s`].
 pub(crate) struct CanonicalDiagnostic {
-    /// Hex sha256 of the spec 9-field canonical form.
+    /// Hex sha256 of the verifier's preimage ([`canonical_bytes_for_trace`]:
+    /// the spec canonical form at the trace's signed schema version, signed
+    /// `run_kind` included). The `9field` name is the v0.1.18 wire key.
     pub(crate) nine_field_sha256: String,
     /// Hex sha256 of the legacy 2-field canonical form.
     pub(crate) two_field_sha256: String,
@@ -467,7 +485,7 @@ where
     // counter is a follow-up; tracing matches the rest of persist's
     // observability discipline today.)
     let wire = trace.trace_schema_version.as_str();
-    let canonical = match wire {
+    let mut canonical = match wire {
         "2.7.0" => canonical_payload_value(trace),
         "2.7.9" => canonical_payload_value_v279(trace),
         // v4.15.0 (#871) — the JCS-cutover schema. The canonical FIELD
@@ -489,6 +507,7 @@ where
             return Err(Error::UnsupportedSchemaVersion(other.to_owned()));
         }
     };
+    with_signed_run_kind(&mut canonical, trace);
     tracing::info!(
         target: "federation_canonical_match",
         wire = wire,
@@ -528,14 +547,31 @@ where
     C: Canonicalizer + ?Sized,
 {
     let wire = trace.trace_schema_version.as_str();
-    let canonical = match wire {
+    let mut canonical = match wire {
         "2.7.0" => canonical_payload_value(trace),
         "2.7.9" => canonical_payload_value_v279(trace),
         "3.0.0" => canonical_payload_value_v279(trace),
         "2.7.legacy" => canonical_payload_value_legacy(trace),
         other => return Err(Error::UnsupportedSchemaVersion(other.to_owned())),
     };
+    with_signed_run_kind(&mut canonical, trace);
     canonicalizer.canonicalize_value(&canonical)
+}
+
+/// v54.1.0 (CC 3.1.5, CIRISConstitution#166 at rc8@8c8f536) — `run_kind`
+/// is a SIGNED envelope member: when the trace carries it, it joins the
+/// canonical payload as a top-level `"run_kind"` key (sorted with its
+/// siblings by the canonicalizer), at every schema version. A trace without
+/// it reconstructs exactly the bytes it did before, so no signature over a
+/// pre-#1249 trace changes; a trace WITH it verifies only if the producer
+/// signed it, so it cannot be added, dropped or edited after signing.
+fn with_signed_run_kind(canonical: &mut serde_json::Value, trace: &CompleteTrace) {
+    if let (Some(kind), Some(obj)) = (&trace.run_kind, canonical.as_object_mut()) {
+        obj.insert(
+            "run_kind".to_owned(),
+            serde_json::Value::String(kind.clone()),
+        );
+    }
 }
 
 /// v7.2.0 (CIRISPersist#225) — the trace-tier hybrid hard-cut verify.
@@ -688,6 +724,36 @@ mod tests {
         }
     }
 
+    /// **I699** (Codex round 2 on PR #1057) — the `SignatureMismatch`
+    /// breadcrumb and `debug_canonicalize` hash the VERIFIER's preimage: for a
+    /// trace carrying the signed `run_kind`, at each dispatched version, the
+    /// diagnostic's primary hash is SHA-256 of [`canonical_bytes_for_trace`],
+    /// and the legacy shape carries `run_kind` too.
+    #[test]
+    fn i699_the_diagnostic_hashes_the_verifiers_preimage() {
+        use sha2::{Digest, Sha256};
+        let sk = fixed_signing_key();
+        for wire in ["2.7.0", "2.7.9", "3.0.0", "2.7.legacy"] {
+            let mut trace = make_trace(&sk, "agent-i699");
+            trace.trace_schema_version = SchemaVersion::parse(wire).unwrap();
+            trace.run_kind = Some("production".into());
+            let preimage =
+                canonical_bytes_for_trace(&trace, &PythonJsonDumpsCanonicalizer).unwrap();
+            let diag = canonical_payload_sha256s(&trace, &PythonJsonDumpsCanonicalizer).unwrap();
+            assert_eq!(
+                diag.nine_field_sha256,
+                hex::encode(Sha256::digest(&preimage)),
+                "I699 {wire}: the diagnostic names the bytes the verifier checks"
+            );
+            assert_eq!(diag.nine_field_bytes, preimage, "I699 {wire}");
+            let legacy: serde_json::Value = serde_json::from_slice(&diag.two_field_bytes).unwrap();
+            assert_eq!(
+                legacy["run_kind"], "production",
+                "I699 {wire}: the legacy shape carries the signed run_kind"
+            );
+        }
+    }
+
     /// In-memory PublicKeyDirectory for tests.
     struct MemKeys {
         keys: HashMap<String, VerifyingKey>,
@@ -725,6 +791,7 @@ mod tests {
             signature_ml_dsa_65: None,
             pubkey_ml_dsa_65: None,
             pqc_key_id: None,
+            run_kind: None,
         };
         // Sign the canonical bytes of the unsigned trace.
         let payload = canonical_payload_value(&trace_unsigned);
@@ -813,6 +880,7 @@ mod tests {
             signature_ml_dsa_65: None,
             pubkey_ml_dsa_65: None,
             pqc_key_id: None,
+            run_kind: None,
         };
         let payload = canonical_payload_value(&trace_unsigned);
         let bytes = PythonJsonDumpsCanonicalizer
@@ -884,6 +952,7 @@ mod tests {
             signature_ml_dsa_65: None,
             pubkey_ml_dsa_65: None,
             pqc_key_id: None,
+            run_kind: None,
         };
 
         // Sign the LEGACY 2-field form:
@@ -957,6 +1026,7 @@ mod tests {
             signature_ml_dsa_65: None,
             pubkey_ml_dsa_65: None,
             pqc_key_id: None,
+            run_kind: None,
         };
 
         // Sign the LEGACY 2-field canonical form (which doesn't
@@ -1043,6 +1113,7 @@ mod tests {
             signature_ml_dsa_65: None,
             pubkey_ml_dsa_65: None,
             pqc_key_id: None,
+            run_kind: None,
         };
 
         // Sign legacy form, then mutate trace_level (which IS in
@@ -1107,6 +1178,7 @@ mod tests {
             signature_ml_dsa_65: None,
             pubkey_ml_dsa_65: None,
             pqc_key_id: None,
+            run_kind: None,
         };
 
         let payload = canonical_payload_value_v279(&trace_unsigned);
@@ -1175,6 +1247,7 @@ mod tests {
             signature_ml_dsa_65: None,
             pubkey_ml_dsa_65: None,
             pqc_key_id: None,
+            run_kind: None,
         };
 
         // The gate MUST route 3.0.0 to JCS.
@@ -1261,6 +1334,7 @@ mod tests {
                 signature_ml_dsa_65: None,
                 pubkey_ml_dsa_65: None,
                 pqc_key_id: None,
+                run_kind: None,
             }
         }
         let no_inject = build(None);
@@ -1440,6 +1514,7 @@ mod tests {
             signature_ml_dsa_65: None,
             pubkey_ml_dsa_65: None,
             pqc_key_id: None,
+            run_kind: None,
         };
         let payload = canonical_payload_value_v279(&trace);
         let bytes = PythonJsonDumpsCanonicalizer
@@ -1500,6 +1575,7 @@ mod tests {
                 signature_ml_dsa_65: None,
                 pubkey_ml_dsa_65: None,
                 pqc_key_id: None,
+                run_kind: None,
             }
         }
         let no_profile = build(None);

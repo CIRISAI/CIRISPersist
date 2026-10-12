@@ -130,6 +130,13 @@ pub struct SqliteBackend {
     /// (`from_shared*`) resolves lazily at its first DEK-plane door when
     /// this is still false (CIRISPersist#850 review).
     minter_sentinel_resolved: std::sync::atomic::AtomicBool,
+    /// v54.1.0 (CIRISPersist#1046) — `true` only between a test-only
+    /// `run_migrations_through(v)` with `v` below V187 and the next full
+    /// `run_migrations`: the schema predates the purge plane, so it holds no
+    /// tombstone and the admission gates' read answers `Unsupported` (which
+    /// they pass) instead of "no such table". Never set on a production path;
+    /// the default is the plane PRESENT, so a gate fails closed.
+    pre_purge_schema: std::sync::atomic::AtomicBool,
     /// v3.4.0 (CIRISPersist#123) — trust-weighted admission gate.
     /// `None` = no gate (bootstrap-permissive). See
     /// [`SqliteBackend::set_admission_gate`].
@@ -552,6 +559,8 @@ impl SqliteBackend {
     /// can seed rows in the PRE-migration shape and then run the rest.
     #[cfg(any(test, feature = "test-anchor"))]
     pub async fn run_migrations_through(&self, version: u32) -> Result<(), Error> {
+        self.pre_purge_schema
+            .store(version < 187, std::sync::atomic::Ordering::Release);
         self.repair_v070_checksum().await?;
         self.write(move |conn| -> Result<(), refinery::Error> {
             embedded::migrations::runner()
@@ -789,6 +798,7 @@ impl SqliteBackend {
                 crate::federation::topology::DEFAULT_DELEGATION_DEPTH,
             ),
             minter_sentinel_resolved: std::sync::atomic::AtomicBool::new(false),
+            pre_purge_schema: std::sync::atomic::AtomicBool::new(false),
             admission_gate: std::sync::RwLock::new(None),
             self_key_id: std::sync::RwLock::new(None),
             peer_write_quota: crate::federation::replication::admission::PeerWriteQuota::new(),
@@ -1518,6 +1528,8 @@ impl Backend for SqliteBackend {
     }
 
     async fn run_migrations(&self) -> Result<(), Error> {
+        self.pre_purge_schema
+            .store(false, std::sync::atomic::Ordering::Release);
         // #840 (I44) — BEFORE refinery reads the history table: a node that
         // applied V070 under v43.0.0–v44.1.0 carries a checksum the shipped
         // file no longer produces, and refinery would abort the boot here.
@@ -1734,19 +1746,8 @@ impl Backend for SqliteBackend {
                     // the PII linkage, stamp erased_at. NOT a delete. sqlite has
                     // no array params; iterate per trace_id. Only un-tombstoned
                     // rows are touched (idempotent re-run = no-op).
-                    let mut detection_events_tombstoned = 0u64;
-                    if !trace_ids.is_empty() {
-                        let mut stmt = tx.prepare(
-                            "UPDATE cirislens_derived_detection_events \
-                     SET trace_id = NULL, body_sha256 = NULL, \
-                         canonical_bytes = NULL, erased_at = ?2 \
-                     WHERE trace_id = ?1 AND erased_at IS NULL",
-                        )?;
-                        for tid in &trace_ids {
-                            detection_events_tombstoned +=
-                                stmt.execute(rusqlite::params![tid, &erased_s])? as u64;
-                        }
-                    }
+                    let detection_events_tombstoned =
+                        sqlite_tombstone_detection_events(&tx, &trace_ids, &erased_s)?;
 
                     // Step 3: hard-delete LLM call rows joined by trace_id.
                     let mut trace_llm_calls = 0u64;
@@ -1758,11 +1759,24 @@ impl Backend for SqliteBackend {
                         }
                     }
 
+                    // v54.1.0 (Codex round 4 sweep on PR #1057) — the agent's
+                    // thoughts, read before its rows go: their signature rows
+                    // are removed once no remaining event cites them (the
+                    // steward purge's own rule, one helper).
+                    let thought_ids: Vec<String> = {
+                        let mut stmt = tx.prepare(
+                            "SELECT DISTINCT thought_id FROM trace_events WHERE agent_id_hash = ?1",
+                        )?;
+                        let rows = stmt.query_map([&agent], |r| r.get::<_, String>(0))?;
+                        rows.collect::<Result<Vec<_>, _>>()?
+                    };
+
                     // Step 4: hard-delete the trace_events rows for the agent.
                     let trace_events = tx.execute(
                         "DELETE FROM trace_events WHERE agent_id_hash = ?1",
                         [&agent],
                     )? as u64;
+                    sqlite_drop_orphaned_thought_signatures(&tx, &thought_ids)?;
 
                     // Step 5: emit the `hard_case:trace_erasure` audit row inside
                     // the txn (atomic). Emit only when something was erased.
@@ -3507,6 +3521,105 @@ impl SqliteBackend {
         Ok(AdoptScrubOutcome::Upgraded)
     }
 
+    /// v54.1.0 (CIRISPersist#1040) — TEST SEAM: store `identity_type` on a
+    /// held key row as if the role had been conferred at its door (the
+    /// conferral itself is the canonical gate's, witnessed by I190 and the
+    /// #372 tests). Nothing else moves.
+    #[cfg(any(test, feature = "test-anchor"))]
+    pub async fn test_seam_set_key_identity_type(
+        &self,
+        key_id: &str,
+        identity_type: &str,
+    ) -> Result<(), crate::federation::Error> {
+        let (k, it) = (key_id.to_owned(), identity_type.to_owned());
+        self.write(move |conn| {
+            conn.execute(
+                "UPDATE federation_keys SET identity_type = ?2 WHERE key_id = ?1",
+                rusqlite::params![k, it],
+            )
+        })
+        .await
+        .map(|_| ())
+        .map_err(|e| crate::federation::Error::Backend(e.to_string()))
+    }
+
+    /// v54.1.0 (Codex on PR #1057) — TEST SEAM: run the lazy rollup refresh
+    /// from the stored watermark, as a fleet read would.
+    #[cfg(test)]
+    pub async fn test_seam_refresh_factor_rollup(&self) -> Result<(), crate::read::Error> {
+        self.refresh_factor_rollup(None).await
+    }
+
+    /// v54.1.0 (Codex on PR #1057) — TEST SEAM: `trace_count` of every
+    /// `trace_events_factor_rollup_1h` row of `agent_id_hash`, by bucket.
+    #[cfg(test)]
+    pub async fn test_seam_factor_rollup_trace_counts(
+        &self,
+        agent_id_hash: &str,
+    ) -> Result<Vec<i64>, crate::federation::Error> {
+        let agent = agent_id_hash.to_owned();
+        self.read(move |conn| -> Result<Vec<i64>, rusqlite::Error> {
+            let mut stmt = conn.prepare(
+                "SELECT trace_count FROM trace_events_factor_rollup_1h \
+                 WHERE agent_id_hash = ?1 ORDER BY bucket_start",
+            )?;
+            let rows = stmt.query_map([&agent], |r| r.get::<_, i64>(0))?;
+            rows.collect()
+        })
+        .await
+        .map_err(|e| crate::federation::Error::Backend(e.to_string()))
+    }
+
+    /// v54.1.0 (Codex on PR #1057) — TEST SEAM: drop one stored tombstone of
+    /// a notice, reproducing a header whose set is partial (the state the
+    /// pre-fix, non-atomic write could leave). Nothing else moves.
+    #[cfg(test)]
+    pub async fn test_seam_drop_purge_tombstone(
+        &self,
+        notice_id: &str,
+        plane: &str,
+        record_ref: &str,
+    ) -> Result<(), crate::federation::Error> {
+        let (n, p, r) = (
+            notice_id.to_owned(),
+            plane.to_owned(),
+            record_ref.to_owned(),
+        );
+        self.write(move |conn| {
+            conn.execute(
+                "DELETE FROM purge_tombstones \
+                 WHERE notice_id = ?1 AND plane = ?2 AND record_ref = ?3",
+                rusqlite::params![n, p, r],
+            )
+        })
+        .await
+        .map(|_| ())
+        .map_err(|e| crate::federation::Error::Backend(e.to_string()))
+    }
+
+    /// v54.1.0 (CIRISPersist#1043) — TEST SEAM: reproduce a legacy row the
+    /// apply door refuses today (#598 "typed asserted_at diverges from the
+    /// signed envelope"): move the typed `asserted_at` column off the signed
+    /// instant. Nothing else moves.
+    #[cfg(any(test, feature = "test-anchor"))]
+    pub async fn test_seam_set_attestation_asserted_at(
+        &self,
+        attestation_id: &str,
+        asserted_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), crate::federation::Error> {
+        let id = attestation_id.to_owned();
+        let at = asserted_at.to_rfc3339();
+        self.write(move |conn| {
+            conn.execute(
+                "UPDATE federation_attestations SET asserted_at = ?2 WHERE attestation_id = ?1",
+                rusqlite::params![id, at],
+            )
+        })
+        .await
+        .map(|_| ())
+        .map_err(|e| crate::federation::Error::Backend(e.to_string()))
+    }
+
     /// v54.0.0 (CIRISPersist#995 row 2) — TEST SEAM: reproduce what a
     /// pre-v53.1.4 UPDATE door left behind: `additional_scrubs` emptied while
     /// `persist_row_hash` still binds the full record. Nothing else moves.
@@ -3816,7 +3929,18 @@ impl SqliteBackend {
                 // runs, and the upgrade branch already runs) now guards the
                 // insert too. Fail-closed before any write.
                 if !crate::federation::register::record_is_role_gated(&record.record) {
-                    crate::federation::verify_key_registration(self, &record.record).await?;
+                    // v54.1.0 (CIRISPersist#1042, CIRISEdge#858) — a verify
+                    // failure is a TYPED refusal, never a bare `Err`: the
+                    // sender books `attester_key_unknown` (retryable: the
+                    // scrubber's Key row has not landed here yet) apart from
+                    // `unverifiable_signature` (terminal). Nothing is written.
+                    if let Err(e) =
+                        crate::federation::verify_key_registration(self, &record.record).await
+                    {
+                        return Ok(ReplicatedKeyOutcome::Refused {
+                            reason: crate::federation::register::key_refusal_of_verify_error(e)?,
+                        });
+                    }
                 }
                 match self
                     .put_public_key_at_door(
@@ -3865,6 +3989,21 @@ impl SqliteBackend {
                     Err(e) => Err(e),
                 }
             }
+            // v54.1.0 (#1044) — the stored record fails verification and the
+            // incoming one (same pubkeys, same claim) passes: replace it. A
+            // lost race, or a stored row that verifies after all, is
+            // fail-closed + re-offerable.
+            ReplicatedKeyPlan::ReplaceInvalid => {
+                match crate::federation::FederationDirectory::store_invalid_replaced_key_record(
+                    self, record,
+                )
+                .await
+                {
+                    Ok(outcome) => Ok(outcome),
+                    Err(crate::federation::Error::Conflict(_)) => Ok(RACED),
+                    Err(e) => Err(e),
+                }
+            }
             // #405 — existing canonical → strictly-newer, m-of-n-re-verified
             // re-scrub (runtime address move). A lost race / policy-no-longer-
             // holds Conflict is fail-closed + re-offerable.
@@ -3887,6 +4026,111 @@ impl SqliteBackend {
                 Err(e) => Err(e),
             },
         }
+    }
+
+    /// v54.1.0 (CIRISPersist#1044) — the ONE in-place registration rewrite
+    /// both replacement doors share (the #864 rebind, the #1044 invalid
+    /// replace). One transaction: append the stored row's registration bytes
+    /// to `federation_key_registration_history` (V148) with the replaced
+    /// row's own `persist_row_hash` and `kind` (V186), then rewrite the
+    /// envelope, every scrub (V096 `additional_scrubs` included, v53.1.4),
+    /// `scrub_key_id`, `persist_row_hash` and `mutated_at` (#707: a cursor
+    /// that passed the row is served the new bytes). Both statements are
+    /// guarded on the planned-against hash and the Ed25519 pubkey; a rebind
+    /// additionally requires the stored row to be self-signed. 0 rows ⇒
+    /// `Conflict` (a concurrent mutation) and nothing is written.
+    async fn write_replaced_key_registration(
+        &self,
+        row: crate::federation::KeyRecord,
+        existing_hash: String,
+        kind: crate::federation::types::KeyReplacementKind,
+    ) -> Result<(), crate::federation::Error> {
+        let envelope_text = serde_json::to_string(&row.registration_envelope)
+            .map_err(|e| crate::federation::Error::Backend(format!("envelope: {e}")))?;
+        let original_content_hash = hex::decode(&row.original_content_hash).map_err(|e| {
+            crate::federation::Error::InvalidArgument(format!("original_content_hash hex: {e}"))
+        })?;
+        let additional_scrubs_text =
+            serde_json::to_string(&row.additional_scrubs).map_err(|e| {
+                crate::federation::Error::Backend(format!("additional_scrubs serialize: {e}"))
+            })?;
+        let require_self_signed = kind == crate::federation::types::KeyReplacementKind::Rebind;
+        let kind_token = kind.as_str();
+        let kid = row.key_id.clone();
+        let n = self
+            .write(move |conn| -> Result<usize, rusqlite::Error> {
+                let tx = conn.transaction()?;
+                let mutated_at = sqlite_next_key_serve_position(&tx)?;
+                // History first, FROM the row as stored and only if it is still
+                // the row the plan saw; the UPDATE below is guarded the same
+                // way, so a lost race leaves neither.
+                let replaced = tx.execute(
+                    "INSERT INTO federation_key_registration_history \
+                        (key_id, registration_envelope, original_content_hash, \
+                         scrub_signature_classical, scrub_signature_pqc, scrub_key_id, \
+                         scrub_timestamp, replaced_at, replaced_by_hash, \
+                         replaced_row_hash, replacement_kind) \
+                     SELECT key_id, registration_envelope, original_content_hash, \
+                         scrub_signature_classical, scrub_signature_pqc, scrub_key_id, \
+                         scrub_timestamp, ?3, ?4, persist_row_hash, ?5 \
+                     FROM federation_keys WHERE key_id = ?1 AND persist_row_hash = ?2 \
+                       AND (?6 = 0 OR scrub_key_id = key_id)",
+                    rusqlite::params![
+                        row.key_id,
+                        existing_hash,
+                        mutated_at.to_rfc3339(),
+                        row.persist_row_hash,
+                        kind_token,
+                        i64::from(require_self_signed),
+                    ],
+                )?;
+                if replaced == 0 {
+                    return Ok(0);
+                }
+                let n = tx.execute(
+                    "UPDATE federation_keys SET \
+                        registration_envelope = ?2, original_content_hash = ?3, \
+                        scrub_signature_classical = ?4, scrub_signature_pqc = ?5, \
+                        scrub_timestamp = ?6, pqc_completed_at = ?7, \
+                        persist_row_hash = ?8, mutated_at = ?9, additional_scrubs = ?12, \
+                        scrub_key_id = ?13 \
+                     WHERE key_id = ?1 AND (?14 = 0 OR scrub_key_id = key_id) \
+                       AND pubkey_ed25519_base64 = ?10 AND persist_row_hash = ?11",
+                    rusqlite::params![
+                        row.key_id,
+                        envelope_text,
+                        original_content_hash,
+                        row.scrub_signature_classical,
+                        row.scrub_signature_pqc,
+                        row.scrub_timestamp.to_rfc3339(),
+                        row.pqc_completed_at.map(|t| t.to_rfc3339()),
+                        row.persist_row_hash,
+                        mutated_at.to_rfc3339(),
+                        row.pubkey_ed25519_base64,
+                        existing_hash,
+                        additional_scrubs_text,
+                        row.scrub_key_id,
+                        i64::from(require_self_signed),
+                    ],
+                )?;
+                if n == 0 {
+                    return Ok(0);
+                }
+                tx.commit()?;
+                Ok(n)
+            })
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!(
+                    "{kind_token} key registration {kid}: {e}"
+                ))
+            })?;
+        if n == 0 {
+            return Err(crate::federation::Error::Conflict(format!(
+                "{kind_token} key registration {kid}: row changed concurrently"
+            )));
+        }
+        self.index_stored_key_row(&kid).await
     }
 
     /// v13.0.0 (CIRISPersist#372, CC 3.4.7.1) — enumerate the **canonical /
@@ -3934,6 +4178,471 @@ impl SqliteBackend {
 impl crate::federation::FederationDirectory for SqliteBackend {
     fn as_dyn_directory(&self) -> &dyn crate::federation::FederationDirectory {
         self
+    }
+
+    // ── v54.1.0 (CIRISPersist#1046) — the steward purge plane (V187) ──────
+
+    async fn purge_scan_attestations(
+        &self,
+        after_id: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
+        let after = after_id.map(str::to_owned);
+        self.read(
+            move |conn| -> Result<Vec<crate::federation::Attestation>, rusqlite::Error> {
+                let mut stmt = conn.prepare(
+                    "SELECT attestation_id, attesting_key_id, attested_key_id, attestation_type, \
+                    weight, asserted_at, expires_at, attestation_envelope, \
+                    original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
+                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, \
+                    subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at, \
+                    additional_scrubs \
+                 FROM federation_attestations \
+                 WHERE (?1 IS NULL OR attestation_id > ?1) \
+                 ORDER BY attestation_id ASC LIMIT ?2",
+                )?;
+                let rows =
+                    stmt.query_map(rusqlite::params![after, limit], sqlite_row_to_attestation)?;
+                rows.collect()
+            },
+        )
+        .await
+        .map_err(|e| crate::federation::Error::Backend(format!("purge_scan_attestations: {e}")))
+    }
+
+    async fn purge_trace_ids_for_llm_model(
+        &self,
+        model: &str,
+    ) -> Result<Vec<String>, crate::federation::Error> {
+        let model = model.to_owned();
+        self.read(move |conn| -> Result<Vec<String>, rusqlite::Error> {
+            let mut stmt = conn.prepare(
+                "SELECT DISTINCT trace_id FROM trace_llm_calls WHERE model = ?1 ORDER BY trace_id",
+            )?;
+            let rows = stmt.query_map([&model], |r| r.get::<_, String>(0))?;
+            rows.collect()
+        })
+        .await
+        .map_err(|e| {
+            crate::federation::Error::Backend(format!("purge_trace_ids_for_llm_model: {e}"))
+        })
+    }
+
+    async fn purge_trace_ids_signed_by(
+        &self,
+        key_id: &str,
+    ) -> Result<Vec<String>, crate::federation::Error> {
+        let key = key_id.to_owned();
+        self.read(move |conn| -> Result<Vec<String>, rusqlite::Error> {
+            let mut stmt = conn.prepare(
+                "SELECT DISTINCT trace_id FROM trace_events WHERE signing_key_id = ?1 \
+                 ORDER BY trace_id",
+            )?;
+            let rows = stmt.query_map([&key], |r| r.get::<_, String>(0))?;
+            rows.collect()
+        })
+        .await
+        .map_err(|e| crate::federation::Error::Backend(format!("purge_trace_ids_signed_by: {e}")))
+    }
+
+    async fn purge_trace_row_counts(
+        &self,
+        trace_ids: &[String],
+    ) -> Result<(u64, u64), crate::federation::Error> {
+        let ids = trace_ids.to_vec();
+        self.read(move |conn| -> Result<(u64, u64), rusqlite::Error> {
+            let mut ev = conn.prepare("SELECT COUNT(*) FROM trace_events WHERE trace_id = ?1")?;
+            let mut calls =
+                conn.prepare("SELECT COUNT(*) FROM trace_llm_calls WHERE trace_id = ?1")?;
+            let (mut e, mut c) = (0u64, 0u64);
+            for id in &ids {
+                e += ev.query_row([id], |r| r.get::<_, i64>(0))? as u64;
+                c += calls.query_row([id], |r| r.get::<_, i64>(0))? as u64;
+            }
+            Ok((e, c))
+        })
+        .await
+        .map_err(|e| crate::federation::Error::Backend(format!("purge_trace_row_counts: {e}")))
+    }
+
+    async fn purge_put_execution(
+        &self,
+        execution: &crate::federation::steward_purge::PurgeExecution,
+        tombstones: &[crate::federation::steward_purge::PurgeTombstone],
+    ) -> Result<crate::federation::steward_purge::PurgePutOutcome, crate::federation::Error> {
+        crate::federation::steward_purge::check_purge_put_set(execution, tombstones)?;
+        let e = execution.clone();
+        let ts = tombstones.to_vec();
+        // Codex on PR #1057 — the header and every tombstone are ONE
+        // transaction: autocommitted separately, a failure or a process loss
+        // between them left a durable header holding part of its
+        // `record_count`.
+        #[cfg(test)]
+        let inject_tombstone_fault = self
+            .test_hooks()
+            .fail_if_armed("purge_put_execution_tombstones")
+            .is_err();
+        #[cfg(not(test))]
+        let inject_tombstone_fault = false;
+        self
+            .write(
+                move |conn| -> Result<
+                    crate::federation::steward_purge::PurgePutOutcome,
+                    rusqlite::Error,
+                > {
+                    let tx = conn.transaction()?;
+                    let held: bool = tx
+                        .query_row(
+                            "SELECT 1 FROM purge_executions WHERE notice_id = ?1",
+                            [&e.notice_id],
+                            |_| Ok(true),
+                        )
+                        .optional()?
+                        .unwrap_or(false);
+                    if !held {
+                        let position =
+                            sqlite_next_plane_position(&tx, "purge_executions", "admitted_at")?;
+                        tx.execute(
+                            "INSERT INTO purge_executions (notice_id, selection_digest, \
+                            claimant_key_id, record_count, notice_jcs, cosignatures_json, \
+                            executed_by, origin, executed_at, admitted_at, finalized_at, \
+                            legal_basis) \
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL, ?11)",
+                            rusqlite::params![
+                                e.notice_id,
+                                e.selection_digest,
+                                e.claimant_key_id,
+                                i64::try_from(e.record_count).unwrap_or(i64::MAX),
+                                e.notice_jcs,
+                                e.cosignatures_json,
+                                e.executed_by,
+                                e.origin,
+                                purge_instant_text(e.executed_at),
+                                purge_instant_text(position),
+                                e.legal_basis,
+                            ],
+                        )?;
+                    }
+                    if inject_tombstone_fault {
+                        return Err(rusqlite::Error::InvalidParameterName(
+                            "purge_put_execution tombstones: injected fault".into(),
+                        ));
+                    }
+                    let mut inserted = Vec::with_capacity(ts.len());
+                    {
+                        let mut stmt = tx.prepare(
+                            "INSERT INTO purge_tombstones \
+                            (notice_id, plane, record_ref, ordinal, derived_from) \
+                         VALUES (?1, ?2, ?3, ?4, ?5) \
+                         ON CONFLICT (notice_id, plane, record_ref) DO NOTHING",
+                        )?;
+                        for t in &ts {
+                            let n = stmt.execute(rusqlite::params![
+                                t.notice_id,
+                                t.plane.as_str(),
+                                t.record_ref,
+                                i64::try_from(t.ordinal).unwrap_or(i64::MAX),
+                                t.derived_from,
+                            ])?;
+                            inserted.push(n > 0);
+                        }
+                    }
+                    // Codex round 4 sweep on PR #1057 — a newly tombstoned
+                    // attestation leaves the signed-wire index at once, so the
+                    // node stops ADVERTISING a hash it no longer serves (the
+                    // rebuild re-indexes from the tombstone-filtered serve read).
+                    {
+                        let mut stmt = tx.prepare(
+                            "DELETE FROM signed_wire_index \
+                             WHERE kind = 'Attestation' AND record_key = ?1",
+                        )?;
+                        for (t, fresh) in ts.iter().zip(&inserted) {
+                            if *fresh
+                                && t.plane
+                                    == crate::federation::steward_purge::PurgePlane::Attestation
+                            {
+                                stmt.execute([crate::federation::wire_index::record_key(&[(
+                                    "attestation_id",
+                                    &t.record_ref,
+                                )])])?;
+                            }
+                        }
+                    }
+                    tx.commit()?;
+                    Ok(crate::federation::steward_purge::PurgePutOutcome {
+                        header_inserted: !held,
+                        tombstones_inserted: inserted,
+                    })
+                },
+            )
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("purge_put_execution: {e}")))
+    }
+
+    async fn purge_execution(
+        &self,
+        notice_id: &str,
+    ) -> Result<Option<crate::federation::steward_purge::PurgeExecution>, crate::federation::Error>
+    {
+        let id = notice_id.to_owned();
+        self.read(move |conn| {
+            conn.query_row(
+                &format!("{PURGE_EXECUTION_SELECT} WHERE notice_id = ?1"),
+                [&id],
+                sqlite_row_to_purge_execution,
+            )
+            .optional()
+        })
+        .await
+        .map_err(|e| crate::federation::Error::Backend(format!("purge_execution: {e}")))
+    }
+
+    async fn purge_tombstones_of(
+        &self,
+        notice_id: &str,
+    ) -> Result<Vec<crate::federation::steward_purge::PurgeTombstone>, crate::federation::Error>
+    {
+        let id = notice_id.to_owned();
+        self.read(move |conn| -> Result<Vec<_>, rusqlite::Error> {
+            let mut stmt = conn.prepare(
+                "SELECT notice_id, plane, record_ref, ordinal, derived_from \
+                 FROM purge_tombstones WHERE notice_id = ?1 ORDER BY ordinal ASC",
+            )?;
+            let rows = stmt.query_map([&id], sqlite_row_to_purge_tombstone)?;
+            rows.collect()
+        })
+        .await
+        .map_err(|e| crate::federation::Error::Backend(format!("purge_tombstones_of: {e}")))
+    }
+
+    async fn purge_tombstoned(
+        &self,
+        plane: &str,
+        record_ref: &str,
+    ) -> Result<Option<String>, crate::federation::Error> {
+        if self
+            .pre_purge_schema
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(crate::federation::Error::Unsupported {
+                method: "purge_tombstoned",
+            });
+        }
+        let (plane, record_ref) = (plane.to_owned(), record_ref.to_owned());
+        self.read(move |conn| -> Result<Option<String>, rusqlite::Error> {
+            conn.query_row(
+                "SELECT MIN(notice_id) FROM purge_tombstones WHERE plane = ?1 AND record_ref = ?2",
+                rusqlite::params![plane, record_ref],
+                |r| r.get::<_, Option<String>>(0),
+            )
+        })
+        .await
+        .map_err(|e| crate::federation::Error::Backend(format!("purge_tombstoned: {e}")))
+    }
+
+    async fn purge_tombstone_notices(
+        &self,
+        plane: &str,
+        record_ref: &str,
+    ) -> Result<Vec<String>, crate::federation::Error> {
+        let (plane, record_ref) = (plane.to_owned(), record_ref.to_owned());
+        self.read(move |conn| -> Result<Vec<String>, rusqlite::Error> {
+            let mut stmt = conn.prepare(
+                "SELECT DISTINCT notice_id FROM purge_tombstones \
+                 WHERE plane = ?1 AND record_ref = ?2 ORDER BY notice_id",
+            )?;
+            let rows = stmt.query_map(rusqlite::params![plane, record_ref], |r| r.get(0))?;
+            rows.collect()
+        })
+        .await
+        .map_err(|e| crate::federation::Error::Backend(format!("purge_tombstone_notices: {e}")))
+    }
+
+    async fn list_purge_executions_since(
+        &self,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
+        limit: u32,
+    ) -> Result<Vec<crate::federation::steward_purge::PurgeExecution>, crate::federation::Error>
+    {
+        let since_at = since.as_ref().map(|(t, _)| purge_instant_text(*t));
+        let since_id = since.as_ref().map(|(_, id)| id.clone());
+        self.read(move |conn| -> Result<Vec<_>, rusqlite::Error> {
+            let mut stmt = conn.prepare(&format!(
+                "{PURGE_EXECUTION_SELECT} \
+                 WHERE (?1 IS NULL OR admitted_at > ?1 OR (admitted_at = ?1 AND notice_id > ?2)) \
+                 ORDER BY admitted_at ASC, notice_id ASC LIMIT ?3"
+            ))?;
+            let rows = stmt.query_map(
+                rusqlite::params![since_at, since_id, limit],
+                sqlite_row_to_purge_execution,
+            )?;
+            rows.collect()
+        })
+        .await
+        .map_err(|e| crate::federation::Error::Backend(format!("list_purge_executions_since: {e}")))
+    }
+
+    async fn purge_delete_tombstoned_attestation(
+        &self,
+        attestation_id: &str,
+    ) -> Result<bool, crate::federation::Error> {
+        let id = attestation_id.to_owned();
+        // The door's own gate, in the statement: only a row a purge tombstone
+        // names is deleted, and never the accountability record (Codex on PR
+        // #1057: a tombstone is void for it) nor, INTERIM, a row a person is
+        // the subject of (Codex round 4). `attestation_subjects` follows by
+        // ON DELETE CASCADE.
+        let sql = format!(
+            "DELETE FROM federation_attestations WHERE attestation_id = ?1 \
+               AND EXISTS (SELECT 1 FROM purge_tombstones \
+                           WHERE plane = 'attestation' AND record_ref = ?1) \
+               AND NOT {} AND NOT {}",
+            crate::federation::migration::accountability_record_sql("dimension"),
+            crate::federation::steward_purge::person_subject_sql("federation_attestations", "")
+        );
+        self.write(move |conn| -> Result<usize, rusqlite::Error> { conn.execute(&sql, [&id]) })
+            .await
+            .map(|n| n > 0)
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!(
+                    "purge_delete_tombstoned_attestation: {e}"
+                ))
+            })
+    }
+
+    async fn purge_delete_tombstoned_trace(
+        &self,
+        trace_id: &str,
+    ) -> Result<(u64, u64), crate::federation::Error> {
+        let id = trace_id.to_owned();
+        let (deleted, buckets) = self
+            .write(
+                move |conn| -> Result<((u64, u64), Vec<String>), rusqlite::Error> {
+                    let tx = conn.transaction()?;
+                    let tombstoned: bool = tx
+                        .query_row(
+                            "SELECT 1 FROM purge_tombstones WHERE plane = 'trace' \
+                             AND record_ref = ?1 LIMIT 1",
+                            [&id],
+                            |_| Ok(true),
+                        )
+                        .optional()?
+                        .unwrap_or(false);
+                    if !tombstoned {
+                        return Ok(((0, 0), Vec::new()));
+                    }
+                    // INTERIM (Codex round 4 on PR #1057) — a trace a person
+                    // signed arrived after the tombstone: the tombstone is
+                    // void for it, and this door never deletes it.
+                    let person_signed: bool = tx.query_row(
+                        &format!(
+                            "SELECT EXISTS (SELECT 1 FROM trace_events te \
+                               JOIN federation_keys k ON k.key_id = te.signing_key_id \
+                               WHERE te.trace_id = ?1 AND {})",
+                            crate::federation::steward_purge::person_identity_sql(
+                                "k.identity_type"
+                            )
+                        ),
+                        [&id],
+                        |r| r.get(0),
+                    )?;
+                    if person_signed {
+                        return Ok(((0, 0), Vec::new()));
+                    }
+                    // Codex on PR #1057 — the rollup groups this trace was
+                    // folded into, read BEFORE its rows go. The lazy refresh
+                    // revisits only the watermark tail and only upserts groups
+                    // that still have source rows, so the purge itself
+                    // recomputes exactly these groups, in this transaction.
+                    let groups: Vec<RollupGroup> = {
+                        let mut stmt = tx.prepare(
+                            "SELECT DISTINCT strftime('%Y-%m-%dT%H:00:00Z', ts), \
+                                agent_id_hash, deployment_domain, cohort_scope, \
+                                cohort_target_id \
+                             FROM trace_events \
+                             WHERE trace_id = ?1 AND cohort_scope NOT IN ('self','family')",
+                        )?;
+                        let rows = stmt.query_map([&id], |r| {
+                            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+                        })?;
+                        rows.collect::<Result<_, _>>()?
+                    };
+                    // Codex round 3 on PR #1057 — the trace's thoughts, read
+                    // before its rows go: their signature row is removed
+                    // below once no remaining event cites the thought, so a
+                    // later trace reusing the thought_id stores its own (the
+                    // insert is ON CONFLICT DO NOTHING).
+                    let thought_ids: Vec<String> = {
+                        let mut stmt = tx.prepare(
+                            "SELECT DISTINCT thought_id FROM trace_events WHERE trace_id = ?1",
+                        )?;
+                        let rows = stmt.query_map([&id], |r| r.get::<_, String>(0))?;
+                        rows.collect::<Result<_, _>>()?
+                    };
+                    // The derived detection events take the Art. 17 tombstone,
+                    // in this transaction (the same function the DSAR door runs).
+                    sqlite_tombstone_detection_events(
+                        &tx,
+                        std::slice::from_ref(&id),
+                        &chrono::Utc::now().to_rfc3339(),
+                    )?;
+                    let calls = tx
+                        .execute("DELETE FROM trace_llm_calls WHERE trace_id = ?1", [&id])?
+                        as u64;
+                    let events =
+                        tx.execute("DELETE FROM trace_events WHERE trace_id = ?1", [&id])? as u64;
+                    sqlite_drop_orphaned_thought_signatures(&tx, &thought_ids)?;
+                    let recompute = sqlite_factor_rollup_upsert_sql(
+                        "AND strftime('%Y-%m-%dT%H:00:00Z', te.ts) = ?1 \
+                         AND te.agent_id_hash IS ?2 AND te.deployment_domain IS ?3 \
+                         AND te.cohort_scope IS ?4 AND te.cohort_target_id IS ?5",
+                    );
+                    for (bucket, agent, domain, scope, target) in &groups {
+                        let key = rusqlite::params![bucket, agent, domain, scope, target];
+                        tx.execute(
+                            "DELETE FROM trace_events_factor_rollup_1h \
+                             WHERE bucket_start = ?1 AND agent_id_hash IS ?2 \
+                               AND deployment_domain IS ?3 AND cohort_scope IS ?4 \
+                               AND cohort_target_id IS ?5",
+                            key,
+                        )?;
+                        tx.execute(&recompute, key)?;
+                    }
+                    tx.commit()?;
+                    Ok(((events, calls), groups.into_iter().map(|g| g.0).collect()))
+                },
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("purge_delete_tombstoned_trace: {e}"))
+            })?;
+        // The aggregate caches hold the purged trace until their TTL; evict
+        // every window holding one of its buckets.
+        for bucket in buckets {
+            let ms = parse_rfc3339(&bucket).timestamp_millis();
+            self.scoring_factors_cache.invalidate_write(ms);
+            self.repo_stats_cache.invalidate_write(ms);
+        }
+        Ok(deleted)
+    }
+
+    async fn purge_mark_finalized(
+        &self,
+        notice_id: &str,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, crate::federation::Error> {
+        let id = notice_id.to_owned();
+        let at = purge_instant_text(at);
+        self.write(move |conn| -> Result<usize, rusqlite::Error> {
+            conn.execute(
+                "UPDATE purge_executions SET finalized_at = ?2 \
+                 WHERE notice_id = ?1 AND finalized_at IS NULL",
+                rusqlite::params![id, at],
+            )
+        })
+        .await
+        .map(|n| n > 0)
+        .map_err(|e| crate::federation::Error::Backend(format!("purge_mark_finalized: {e}")))
     }
 
     fn withdraws_delegation_depth(&self) -> usize {
@@ -4036,85 +4745,36 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                 RebindPrepared::Unchanged => return Ok(ReplicatedKeyOutcome::Unchanged),
                 RebindPrepared::Replace { new, existing_hash } => (*new, existing_hash),
             };
-        let envelope_text = serde_json::to_string(&row.registration_envelope)
-            .map_err(|e| crate::federation::Error::Backend(format!("envelope: {e}")))?;
-        let original_content_hash = hex::decode(&row.original_content_hash).map_err(|e| {
-            crate::federation::Error::InvalidArgument(format!("original_content_hash hex: {e}"))
-        })?;
-        // v53.1.4 — the whole scrub set rides every rewrite of the scrub columns:
-        // a door that wrote scrub #1 alone stored a quorum-signed record as a
-        // one-holder row (the V096 JSON-array TEXT column; empty → "[]").
-        let additional_scrubs_text =
-            serde_json::to_string(&row.additional_scrubs).map_err(|e| {
-                crate::federation::Error::Backend(format!("additional_scrubs serialize: {e}"))
-            })?;
-        let kid = row.key_id.clone();
-        let n = self
-            .write(move |conn| -> Result<usize, rusqlite::Error> {
-                let tx = conn.transaction()?;
-                let mutated_at = sqlite_next_key_serve_position(&tx)?;
-                // History first, FROM the row as stored and only if it is still
-                // the row the plan saw; the UPDATE below is guarded the same
-                // way, so a lost race leaves neither.
-                let replaced = tx.execute(
-                    "INSERT INTO federation_key_registration_history \
-                        (key_id, registration_envelope, original_content_hash, \
-                         scrub_signature_classical, scrub_signature_pqc, scrub_key_id, \
-                         scrub_timestamp, replaced_at, replaced_by_hash) \
-                     SELECT key_id, registration_envelope, original_content_hash, \
-                         scrub_signature_classical, scrub_signature_pqc, scrub_key_id, \
-                         scrub_timestamp, ?3, ?4 \
-                     FROM federation_keys WHERE key_id = ?1 AND persist_row_hash = ?2",
-                    rusqlite::params![
-                        row.key_id,
-                        existing_hash,
-                        mutated_at.to_rfc3339(),
-                        row.persist_row_hash,
-                    ],
-                )?;
-                if replaced == 0 {
-                    return Ok(0);
-                }
-                let n = tx.execute(
-                    "UPDATE federation_keys SET \
-                        registration_envelope = ?2, original_content_hash = ?3, \
-                        scrub_signature_classical = ?4, scrub_signature_pqc = ?5, \
-                        scrub_timestamp = ?6, pqc_completed_at = ?7, \
-                        persist_row_hash = ?8, mutated_at = ?9, additional_scrubs = ?12 \
-                     WHERE key_id = ?1 AND scrub_key_id = key_id \
-                       AND pubkey_ed25519_base64 = ?10 AND persist_row_hash = ?11",
-                    rusqlite::params![
-                        row.key_id,
-                        envelope_text,
-                        original_content_hash,
-                        row.scrub_signature_classical,
-                        row.scrub_signature_pqc,
-                        row.scrub_timestamp.to_rfc3339(),
-                        row.pqc_completed_at.map(|t| t.to_rfc3339()),
-                        row.persist_row_hash,
-                        mutated_at.to_rfc3339(),
-                        row.pubkey_ed25519_base64,
-                        existing_hash,
-                        additional_scrubs_text,
-                    ],
-                )?;
-                if n == 0 {
-                    return Ok(0);
-                }
-                tx.commit()?;
-                Ok(n)
-            })
-            .await
-            .map_err(|e| {
-                crate::federation::Error::Backend(format!("store_rebound_key_record {kid}: {e}"))
-            })?;
-        if n == 0 {
-            return Err(crate::federation::Error::Conflict(format!(
-                "store_rebound_key_record {kid}: row changed concurrently"
-            )));
-        }
-        self.index_stored_key_row(&kid).await?;
+        self.write_replaced_key_registration(
+            row,
+            existing_hash,
+            crate::federation::types::KeyReplacementKind::Rebind,
+        )
+        .await?;
         Ok(ReplicatedKeyOutcome::Rebound)
+    }
+
+    /// v54.1.0 (CIRISPersist#1044) — the invalid-replace store step (see the
+    /// trait doc): the shared pre-check (`register::prepare_invalid_replace`,
+    /// which re-asserts that the stored record FAILS verification), then the
+    /// same guarded history + UPDATE transaction the rebind writes.
+    async fn store_invalid_replaced_key_record(
+        &self,
+        record: crate::federation::SignedKeyRecord,
+    ) -> Result<crate::federation::register::ReplicatedKeyOutcome, crate::federation::Error> {
+        use crate::federation::register::{RebindPrepared, ReplicatedKeyOutcome};
+        let (row, existing_hash) =
+            match crate::federation::register::prepare_invalid_replace(self, record).await? {
+                RebindPrepared::Unchanged => return Ok(ReplicatedKeyOutcome::Unchanged),
+                RebindPrepared::Replace { new, existing_hash } => (*new, existing_hash),
+            };
+        self.write_replaced_key_registration(
+            row,
+            existing_hash,
+            crate::federation::types::KeyReplacementKind::InvalidReplaced,
+        )
+        .await?;
+        Ok(ReplicatedKeyOutcome::InvalidReplaced)
     }
 
     async fn list_key_registration_history(
@@ -4132,6 +4792,8 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             String,
             String,
             String,
+            Option<String>,
+            String,
         );
         let kid = key_id.to_owned();
         let raw = self
@@ -4139,7 +4801,8 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                 let mut stmt = conn.prepare(
                     "SELECT key_id, registration_envelope, original_content_hash, \
                             scrub_signature_classical, scrub_signature_pqc, scrub_key_id, \
-                            scrub_timestamp, replaced_at, replaced_by_hash \
+                            scrub_timestamp, replaced_at, replaced_by_hash, \
+                            replaced_row_hash, replacement_kind \
                      FROM federation_key_registration_history \
                      WHERE key_id = ?1 ORDER BY history_id ASC",
                 )?;
@@ -4154,6 +4817,8 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                         r.get(6)?,
                         r.get(7)?,
                         r.get(8)?,
+                        r.get(9)?,
+                        r.get(10)?,
                     ))
                 })?;
                 rows.collect()
@@ -4164,7 +4829,19 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             })?;
         raw.into_iter()
             .map(
-                |(key_id, envelope, hash, classical, pqc, scrub_key_id, scrub_ts, replaced, by)| {
+                |(
+                    key_id,
+                    envelope,
+                    hash,
+                    classical,
+                    pqc,
+                    scrub_key_id,
+                    scrub_ts,
+                    replaced,
+                    by,
+                    replaced_row_hash,
+                    kind,
+                )| {
                     Ok(crate::federation::types::KeyRegistrationHistoryRow {
                         key_id,
                         registration_envelope: serde_json::from_str(&envelope).map_err(|e| {
@@ -4177,6 +4854,15 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                         scrub_timestamp: parse_rfc3339(&scrub_ts),
                         replaced_at: parse_rfc3339(&replaced),
                         replaced_by_hash: by,
+                        replaced_row_hash,
+                        replacement: crate::federation::types::KeyReplacementKind::from_token(
+                            &kind,
+                        )
+                        .ok_or_else(|| {
+                            crate::federation::Error::Backend(format!(
+                                "history replacement_kind {kind:?}"
+                            ))
+                        })?,
                     })
                 },
             )
@@ -4852,6 +5538,11 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             {
                 return Ok(crate::federation::AttestationOutcome::AlreadyHeld);
             }
+            // v54.1.0 (CIRISPersist#1046) — a row a steward purge tombstoned is
+            // refused; (CIRISPersist#1040) a federation-tier mock-LLM trace is
+            // refused. Backend-symmetric across memory / sqlite / postgres.
+            crate::federation::steward_purge::refuse_if_tombstoned_attestation(self, &row).await?;
+            crate::federation::steward_purge::refuse_mock_trace_attestation(&row)?;
             if !row.attesting_key_id.is_empty() {
                 // v22.0.0 (CIRISPersist#543 finding 4, AV-76) — per-peer write
                 // quota. It LEADS the state-consulting checks because it is the
@@ -5105,11 +5796,11 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     crate::federation::Error::Backend(format!("lookup attesting identity_type: {e}"))
                 })?
             };
+            // v54.1.0 (CIRISPersist#1042) — an attester this node does not
+            // hold is the ORDERING gap (retryable once its Key row lands),
+            // typed apart from a bad signature; it read as `InvalidArgument`.
             let attesting_identity_type = attesting_identity_type.ok_or_else(|| {
-                crate::federation::Error::InvalidArgument(format!(
-                    "attesting_key_id {} does not exist in federation_keys",
-                    row.attesting_key_id
-                ))
+                crate::federation::Error::unknown_signer(&row.attesting_key_id, "attestation")
             })?;
             // AV-76 D2 — the lookup above is a hard DATA dependency of the
             // dimension policy here (`attesting_identity_type`); the pair
@@ -7002,20 +7693,28 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             crate::federation::wire_index::record_key(&[("attestation_id", attestation_id)]);
         let id = attestation_id.to_owned();
         self.write(move |guard| -> Result<(), rusqlite::Error> {
-            guard.execute(
+            // One transaction: every projection leaves together.
+            let tx = guard.transaction()?;
+            tx.execute(
                 "DELETE FROM signed_wire_index WHERE kind = 'Attestation' AND record_key = ?1",
                 rusqlite::params![record_key],
             )?;
-            guard.execute(
-                "DELETE FROM consent_peer_set WHERE source_attestation_id = ?1",
-                rusqlite::params![id],
-            )?;
-            // v45.0.0 (#871) — a retired row's rendition leaves the index with it.
-            guard.execute(
-                "DELETE FROM blob_renditions WHERE source_attestation_id = ?1",
-                rusqlite::params![id],
-            )?;
-            Ok(())
+            // v54.1.0 (Codex round 4 on PR #1057) — every helper-removed
+            // projection, FROM THE ONE LIST (`consent_peer_set`, and the
+            // `consent_peer_set_for` this used to miss, `blob_renditions`, the
+            // withdraws depth, the trust-direction grandfather, the pending
+            // KeyGrant set). FK-cascaded tables follow the row's delete.
+            for (table, column, removal) in
+                crate::federation::steward_purge::ATTESTATION_PROJECTIONS
+            {
+                if *removal == crate::federation::steward_purge::ProjectionRemoval::Helper {
+                    tx.execute(
+                        &format!("DELETE FROM {table} WHERE {column} = ?1"),
+                        rusqlite::params![id],
+                    )?;
+                }
+            }
+            tx.commit()
         })
         .await
         .map_err(|e| {
@@ -8669,16 +9368,6 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         authority_signature: Option<serde_json::Value>,
     ) -> Result<(), crate::federation::Error> {
         use crate::federation::Error;
-        // M4 fail-closed: the nonce must already be issued for this family.
-        if !self
-            .accord_nonce_issued(&proposal.family_key_id, &proposal.nonce)
-            .await?
-        {
-            return Err(Error::InvalidArgument(format!(
-                "accord proposal nonce {:?} not issued for family {:?} (M4 fail-closed)",
-                proposal.nonce, proposal.family_key_id
-            )));
-        }
         // v31.1.0 (CIRISPersist#662, PR #667 round-5) — `created_at` is half the
         // evidence cursor (`max(created_at, max(server_arrival_at))`), so it is
         // an allocated position, not a wall-clock read.
@@ -8722,36 +9411,87 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             ),
             None => None,
         };
-        self.write(move |conn| -> Result<(), rusqlite::Error> {
-            // ON CONFLICT DO NOTHING — the digest is content-derived, so a
-            // re-PUT of the same proposal is idempotent and a different
-            // proposal cannot collide.
-            conn.execute(
-                "INSERT INTO accord_proposal (\
+        let reused = self
+            .write(move |conn| -> Result<Option<String>, rusqlite::Error> {
+                // v54.1.0 (#1047; Codex round 3 on PR #1057) — single use,
+                // ENFORCED BY THE DATABASE: the V189 claim's PRIMARY KEY
+                // `(family_key_id, nonce)`, inserted in the proposal's own
+                // transaction. A SELECT-then-INSERT is not enough: two
+                // backends on one file hold two connections and both pass the
+                // SELECT. The claim's INSERT takes the write lock first, so a
+                // second writer waits and then reads the first one's claim.
+                // IMMEDIATE: the write lock is taken BEFORE the held-digest
+                // read, so a second backend on the file waits on the busy
+                // timeout instead of failing a read-to-write lock upgrade
+                // ("database is locked").
+                let tx =
+                    conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                // Codex round 4 on PR #1057 — a HELD digest is an idempotent
+                // replay, accepted before the claim is asked: a legacy
+                // proposal V189 did not give the claim to (it shared its pair
+                // with an earlier one) is held evidence, and its replay must
+                // not abort the delivery its participations ride on.
+                let held: bool = tx
+                    .query_row(
+                        "SELECT 1 FROM accord_proposal WHERE proposal_digest = ?1",
+                        [&prep.proposal_digest],
+                        |_| Ok(true),
+                    )
+                    .optional()?
+                    .unwrap_or(false);
+                if held {
+                    return Ok(None);
+                }
+                tx.execute(
+                    "INSERT INTO accord_proposal_nonce_claim \
+                        (family_key_id, nonce, proposal_digest) VALUES (?1, ?2, ?3) \
+                     ON CONFLICT (family_key_id, nonce) DO NOTHING",
+                    rusqlite::params![prep.family_key_id, prep.nonce, prep.proposal_digest],
+                )?;
+                let owner: String = tx.query_row(
+                    "SELECT proposal_digest FROM accord_proposal_nonce_claim \
+                     WHERE family_key_id = ?1 AND nonce = ?2",
+                    rusqlite::params![prep.family_key_id, prep.nonce],
+                    |r| r.get(0),
+                )?;
+                if owner != prep.proposal_digest {
+                    return Ok(Some(owner));
+                }
+                // ON CONFLICT DO NOTHING — the digest is content-derived, so a
+                // re-PUT of the same proposal is idempotent and a different
+                // proposal cannot collide.
+                tx.execute(
+                    "INSERT INTO accord_proposal (\
                     proposal_digest, family_key_id, action, nonce, window_until, \
                     prior_family_digest, payload_sha256, proposal_json, \
                     authority_signature, persist_row_hash, created_at\
                  ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11) \
                  ON CONFLICT(proposal_digest) DO NOTHING",
-                rusqlite::params![
-                    prep.proposal_digest,
-                    prep.family_key_id,
-                    prep.action,
-                    prep.nonce,
-                    prep.window_until.to_rfc3339(),
-                    prep.prior_family_digest,
-                    prep.payload_sha256,
-                    proposal_json,
-                    auth_sig,
-                    prep.persist_row_hash,
-                    prep.created_at.to_rfc3339(),
-                ],
-            )?;
-            Ok(())
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("insert accord_proposal: {e}")))?;
-        Ok(())
+                    rusqlite::params![
+                        prep.proposal_digest,
+                        prep.family_key_id,
+                        prep.action,
+                        prep.nonce,
+                        prep.window_until.to_rfc3339(),
+                        prep.prior_family_digest,
+                        prep.payload_sha256,
+                        proposal_json,
+                        auth_sig,
+                        prep.persist_row_hash,
+                        prep.created_at.to_rfc3339(),
+                    ],
+                )?;
+                tx.commit()?;
+                Ok(None)
+            })
+            .await
+            .map_err(|e| Error::Backend(format!("insert accord_proposal: {e}")))?;
+        match reused {
+            Some(other) => Err(crate::federation::accord_quorum::nonce_reused(
+                &proposal, &other,
+            )),
+            None => Ok(()),
+        }
     }
 
     async fn get_accord_proposal(
@@ -9107,48 +9847,6 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         .await
         .map_err(|e| crate::federation::Error::Backend(format!("clear_active_halt: {e}")))?;
         Ok(())
-    }
-
-    async fn issue_accord_nonce(
-        &self,
-        family_key_id: &str,
-        nonce: &str,
-    ) -> Result<(), crate::federation::Error> {
-        let fam = family_key_id.to_owned();
-        let n = nonce.to_owned();
-        let now = chrono::Utc::now().to_rfc3339();
-        self.write(move |conn| -> Result<(), rusqlite::Error> {
-            conn.execute(
-                "INSERT INTO accord_issued_nonce (family_key_id, nonce, issued_at) \
-                 VALUES (?1, ?2, ?3) ON CONFLICT(family_key_id, nonce) DO NOTHING",
-                rusqlite::params![fam, n, now],
-            )?;
-            Ok(())
-        })
-        .await
-        .map_err(|e| crate::federation::Error::Backend(format!("issue_accord_nonce: {e}")))?;
-        Ok(())
-    }
-
-    async fn accord_nonce_issued(
-        &self,
-        family_key_id: &str,
-        nonce: &str,
-    ) -> Result<bool, crate::federation::Error> {
-        let fam = family_key_id.to_owned();
-        let n = nonce.to_owned();
-        self.read(move |conn| -> Result<bool, rusqlite::Error> {
-            let found: Option<i64> = conn
-                .query_row(
-                    "SELECT 1 FROM accord_issued_nonce WHERE family_key_id = ?1 AND nonce = ?2",
-                    rusqlite::params![fam, n],
-                    |r| r.get(0),
-                )
-                .optional()?;
-            Ok(found.is_some())
-        })
-        .await
-        .map_err(|e| crate::federation::Error::Backend(format!("accord_nonce_issued: {e}")))
     }
 
     // ─── v4.8.0 (CIRISPersist#161, CEG §11.7.1) — membership revocations.
@@ -12658,10 +13356,25 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         )
         .map(|p| format!(" AND {p}"))
         .unwrap_or_default();
+        // Codex rounds 1 and 4 on PR #1057 — a tombstone is void for the
+        // accountability record and (interim) for a row a person is the
+        // subject of: both are served.
+        let accountability = format!(
+            "{} OR {}",
+            crate::federation::migration::accountability_record_sql(
+                "federation_attestations.dimension"
+            ),
+            crate::federation::steward_purge::person_subject_sql("federation_attestations", "")
+        );
         let (read, bytes) = self
             .read_measured(move |conn| -> Result<Vec<_>, rusqlite::Error> {
                 // E5 invariant: `tier = 'federation'` only — a local-tier row
                 // must never reach the advertise/serve wire surface.
+                //
+                // v54.1.0 (CIRISPersist#1046) — a tombstoned row is never
+                // served; excluded in the SQL, before the page is cut. Unless
+                // it is the accountability record (Codex on PR #1057): a
+                // tombstone is void for it.
                 let mut stmt = conn.prepare(&format!(
                     "SELECT attestation_id, attesting_key_id, attested_key_id, attestation_type, \
                     weight, asserted_at, expires_at, attestation_envelope, \
@@ -12672,8 +13385,13 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                  FROM federation_attestations \
                  WHERE (?1 IS NULL OR {pos} > ?1 OR ({pos} = ?1 AND attestation_id > ?2)) \
                    AND tier = 'federation'{row_type_filter} \
+                   AND (NOT EXISTS (SELECT 1 FROM purge_tombstones pt \
+                                    WHERE pt.plane = 'attestation' \
+                                      AND pt.record_ref = federation_attestations.attestation_id) \
+                        OR {accountability}) \
                  ORDER BY {pos} ASC, attestation_id ASC LIMIT ?3",
                     pos = POS_ATTESTATION,
+                    accountability = accountability,
                 ))?;
                 let rows = stmt.query_map(rusqlite::params![since_at, since_id, limit], |row| {
                     let pos: String = row.get("_pos")?;
@@ -22177,6 +22895,229 @@ fn sqlite_row_to_outbound_row(
     })
 }
 
+/// v54.1.0 (Codex rounds 3 and 4 on PR #1057) — remove the
+/// `trace_thought_signatures` row of each of `thought_ids` that no remaining
+/// `trace_events` row cites, inside the caller's transaction, AFTER its event
+/// delete. Both trace-removal doors run it (the steward purge's trace delete,
+/// the DSAR erasure): an orphaned row would hand its signature to a later
+/// trace reusing the thought_id (the insert is ON CONFLICT DO NOTHING).
+fn sqlite_drop_orphaned_thought_signatures(
+    tx: &rusqlite::Transaction<'_>,
+    thought_ids: &[String],
+) -> Result<(), rusqlite::Error> {
+    let mut stmt = tx.prepare(
+        "DELETE FROM trace_thought_signatures WHERE thought_id = ?1 \
+           AND NOT EXISTS (SELECT 1 FROM trace_events WHERE trace_events.thought_id = ?1)",
+    )?;
+    for thought in thought_ids {
+        stmt.execute([thought])?;
+    }
+    Ok(())
+}
+
+/// The Art. 17 TOMBSTONE of the derived detection events (V080) for
+/// `trace_ids`: NULL the PII linkage and content (`trace_id`, `body_sha256`,
+/// `canonical_bytes`) and stamp `erased_at`. NOT a delete. Only un-tombstoned
+/// rows are touched, so a re-run is a no-op. ONE spelling, run inside the
+/// caller's transaction by both trace-removal doors: the DSAR erasure
+/// (`delete_traces_for_agent_id_hash`) and the steward purge's trace delete
+/// (Codex round 3 on PR #1057). Returns the rows tombstoned.
+fn sqlite_tombstone_detection_events(
+    tx: &rusqlite::Transaction<'_>,
+    trace_ids: &[String],
+    erased_at: &str,
+) -> Result<u64, rusqlite::Error> {
+    let mut tombstoned = 0u64;
+    if trace_ids.is_empty() {
+        return Ok(0);
+    }
+    let mut stmt = tx.prepare(
+        "UPDATE cirislens_derived_detection_events \
+         SET trace_id = NULL, body_sha256 = NULL, \
+             canonical_bytes = NULL, erased_at = ?2 \
+         WHERE trace_id = ?1 AND erased_at IS NULL",
+    )?;
+    for tid in trace_ids {
+        tombstoned += stmt.execute(rusqlite::params![tid, erased_at])? as u64;
+    }
+    Ok(tombstoned)
+}
+
+/// One `trace_events_factor_rollup_1h` group key: `(bucket_start,
+/// agent_id_hash, deployment_domain, cohort_scope, cohort_target_id)`.
+type RollupGroup = (
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
+/// CIRISPersist#222 — the rollup's whole-bucket recompute: an idempotent
+/// UPSERT re-aggregating the `trace_events` rows that pass
+/// `te.cohort_scope NOT IN ('self','family') {source_filter}` (the §10.1.4
+/// filter is always applied). `refresh_factor_rollup` passes its re-fold floor;
+/// v54.1.0 (Codex on PR #1057) a steward purge passes ONE bucket group, after
+/// deleting that group's row, so a group the purge emptied stays gone.
+fn sqlite_factor_rollup_upsert_sql(source_filter: &str) -> String {
+    format!(
+        "INSERT INTO trace_events_factor_rollup_1h ( \
+            bucket_start, agent_id_hash, deployment_domain, cohort_scope, \
+            cohort_target_id, trace_count, \
+            csdma_sum, csdma_n, k_eff_sum, k_eff_n, \
+            correlation_risk_sum, correlation_risk_n, \
+            override_trace_count, fragility_trace_count, \
+            conscience_fail_trace_count, entropy_fail_trace_count, \
+            coherence_fail_trace_count, optimization_veto_fail_trace_count, \
+            epistemic_humility_fail_trace_count, \
+            audit_seq_trace_count, audit_sig_trace_count) \
+         WITH per_trace AS ( \
+            SELECT \
+               strftime('%Y-%m-%dT%H:00:00Z', te.ts) AS bucket_start, \
+               te.agent_id_hash AS agent_id_hash, \
+               te.deployment_domain AS deployment_domain, \
+               te.cohort_scope AS cohort_scope, \
+               te.cohort_target_id AS cohort_target_id, \
+               te.trace_id AS trace_id, \
+               AVG(CASE WHEN json_extract(te.payload,'$.csdma_plausibility_score') \
+                   IS NOT NULL THEN json_extract(te.payload,'$.csdma_plausibility_score') END) \
+                   AS csdma_val, \
+               AVG(CASE WHEN json_extract(te.payload,'$.idma_k_eff') \
+                   IS NOT NULL THEN json_extract(te.payload,'$.idma_k_eff') END) \
+                   AS k_eff_val, \
+               AVG(CASE WHEN json_extract(te.payload,'$.idma_correlation_risk') \
+                   IS NOT NULL THEN json_extract(te.payload,'$.idma_correlation_risk') END) \
+                   AS corr_val, \
+               MAX(CASE WHEN te.event_type='CONSCIENCE_RESULT' \
+                   AND json_extract(te.payload,'$.action_was_overridden')=1 THEN 1 ELSE 0 END) \
+                   AS overridden, \
+               MAX(CASE WHEN json_extract(te.payload,'$.idma_fragility_flag')=1 THEN 1 ELSE 0 END) \
+                   AS fragile, \
+               MAX(CASE WHEN te.event_type='CONSCIENCE_RESULT' \
+                   AND json_extract(te.payload,'$.conscience_passed')=0 THEN 1 ELSE 0 END) \
+                   AS conscience_fail, \
+               MAX(CASE WHEN te.event_type='CONSCIENCE_RESULT' \
+                   AND json_extract(te.payload,'$.entropy_passed')=0 THEN 1 ELSE 0 END) \
+                   AS entropy_fail, \
+               MAX(CASE WHEN te.event_type='CONSCIENCE_RESULT' \
+                   AND json_extract(te.payload,'$.coherence_passed')=0 THEN 1 ELSE 0 END) \
+                   AS coherence_fail, \
+               MAX(CASE WHEN te.event_type='CONSCIENCE_RESULT' \
+                   AND json_extract(te.payload,'$.optimization_veto_passed')=0 THEN 1 ELSE 0 END) \
+                   AS optimization_veto_fail, \
+               MAX(CASE WHEN te.event_type='CONSCIENCE_RESULT' \
+                   AND json_extract(te.payload,'$.epistemic_humility_passed')=0 THEN 1 ELSE 0 END) \
+                   AS epistemic_humility_fail, \
+               MAX(CASE WHEN te.audit_sequence_number IS NOT NULL THEN 1 ELSE 0 END) \
+                   AS has_audit_seq, \
+               MAX(CASE WHEN te.audit_signature IS NOT NULL THEN 1 ELSE 0 END) \
+                   AS has_audit_sig, \
+               MAX(CASE WHEN json_extract(te.payload,'$.csdma_plausibility_score') \
+                   IS NOT NULL THEN 1 ELSE 0 END) AS has_csdma, \
+               MAX(CASE WHEN json_extract(te.payload,'$.idma_k_eff') \
+                   IS NOT NULL THEN 1 ELSE 0 END) AS has_k_eff, \
+               MAX(CASE WHEN json_extract(te.payload,'$.idma_correlation_risk') \
+                   IS NOT NULL THEN 1 ELSE 0 END) AS has_corr \
+            FROM trace_events te \
+            WHERE te.cohort_scope NOT IN ('self','family') {source_filter} \
+            GROUP BY bucket_start, te.agent_id_hash, te.deployment_domain, \
+                     te.cohort_scope, te.cohort_target_id, te.trace_id \
+         ) \
+         SELECT bucket_start, agent_id_hash, deployment_domain, cohort_scope, \
+                cohort_target_id, \
+                COUNT(*) AS trace_count, \
+                COALESCE(SUM(csdma_val),0), SUM(has_csdma), \
+                COALESCE(SUM(k_eff_val),0), SUM(has_k_eff), \
+                COALESCE(SUM(corr_val),0), SUM(has_corr), \
+                SUM(overridden), SUM(fragile), \
+                SUM(conscience_fail), SUM(entropy_fail), SUM(coherence_fail), \
+                SUM(optimization_veto_fail), SUM(epistemic_humility_fail), \
+                SUM(has_audit_seq), SUM(has_audit_sig) \
+         FROM per_trace \
+         GROUP BY bucket_start, agent_id_hash, deployment_domain, \
+                  cohort_scope, cohort_target_id \
+         ON CONFLICT (bucket_start, COALESCE(agent_id_hash,''), \
+                      COALESCE(deployment_domain,''), COALESCE(cohort_scope,''), \
+                      COALESCE(cohort_target_id,'')) \
+         DO UPDATE SET \
+            trace_count = excluded.trace_count, \
+            csdma_sum = excluded.csdma_sum, csdma_n = excluded.csdma_n, \
+            k_eff_sum = excluded.k_eff_sum, k_eff_n = excluded.k_eff_n, \
+            correlation_risk_sum = excluded.correlation_risk_sum, \
+            correlation_risk_n = excluded.correlation_risk_n, \
+            override_trace_count = excluded.override_trace_count, \
+            fragility_trace_count = excluded.fragility_trace_count, \
+            conscience_fail_trace_count = excluded.conscience_fail_trace_count, \
+            entropy_fail_trace_count = excluded.entropy_fail_trace_count, \
+            coherence_fail_trace_count = excluded.coherence_fail_trace_count, \
+            optimization_veto_fail_trace_count = excluded.optimization_veto_fail_trace_count, \
+            epistemic_humility_fail_trace_count = excluded.epistemic_humility_fail_trace_count, \
+            audit_seq_trace_count = excluded.audit_seq_trace_count, \
+            audit_sig_trace_count = excluded.audit_sig_trace_count"
+    )
+}
+
+/// v54.1.0 (CIRISPersist#1046) — the V187 instant spelling: fixed-width
+/// RFC 3339 at microseconds, so the TEXT serve cursor orders as time does.
+fn purge_instant_text(t: chrono::DateTime<chrono::Utc>) -> String {
+    t.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string()
+}
+
+/// v54.1.0 (CIRISPersist#1046) — the V187 header columns, spelled once.
+const PURGE_EXECUTION_SELECT: &str = "SELECT notice_id, selection_digest, claimant_key_id, \
+     record_count, notice_jcs, cosignatures_json, executed_by, origin, executed_at, \
+     admitted_at, finalized_at, legal_basis FROM purge_executions";
+
+fn sqlite_row_to_purge_execution(
+    r: &rusqlite::Row<'_>,
+) -> Result<crate::federation::steward_purge::PurgeExecution, rusqlite::Error> {
+    let instant = |i: usize| -> Result<chrono::DateTime<chrono::Utc>, rusqlite::Error> {
+        let s: String = r.get(i)?;
+        parse_sqlite_instant(&s).ok_or_else(|| {
+            rusqlite::Error::FromSqlConversionFailure(
+                i,
+                rusqlite::types::Type::Text,
+                format!("purge_executions instant {s:?}").into(),
+            )
+        })
+    };
+    let finalized: Option<String> = r.get(10)?;
+    Ok(crate::federation::steward_purge::PurgeExecution {
+        notice_id: r.get(0)?,
+        selection_digest: r.get(1)?,
+        claimant_key_id: r.get(2)?,
+        legal_basis: r.get(11)?,
+        record_count: u64::try_from(r.get::<_, i64>(3)?).unwrap_or_default(),
+        notice_jcs: r.get(4)?,
+        cosignatures_json: r.get(5)?,
+        executed_by: r.get(6)?,
+        origin: r.get(7)?,
+        executed_at: instant(8)?,
+        admitted_at: instant(9)?,
+        finalized_at: finalized.as_deref().and_then(parse_sqlite_instant),
+    })
+}
+
+fn sqlite_row_to_purge_tombstone(
+    r: &rusqlite::Row<'_>,
+) -> Result<crate::federation::steward_purge::PurgeTombstone, rusqlite::Error> {
+    let plane: String = r.get(1)?;
+    let plane = serde_json::from_value(serde_json::Value::String(plane.clone())).map_err(|_| {
+        rusqlite::Error::FromSqlConversionFailure(
+            1,
+            rusqlite::types::Type::Text,
+            format!("purge_tombstones plane {plane:?}").into(),
+        )
+    })?;
+    Ok(crate::federation::steward_purge::PurgeTombstone {
+        notice_id: r.get(0)?,
+        plane,
+        record_ref: r.get(2)?,
+        ordinal: u64::try_from(r.get::<_, i64>(3)?).unwrap_or_default(),
+        derived_from: r.get(4)?,
+    })
+}
+
 fn parse_rfc3339(s: &str) -> chrono::DateTime<chrono::Utc> {
     chrono::DateTime::parse_from_rfc3339(s)
         .map(|t| t.with_timezone(&chrono::Utc))
@@ -28229,101 +29170,7 @@ impl SqliteBackend {
             // bucket grain. ON CONFLICT REPLACES the bucket aggregate
             // (idempotent — never additive).
             let lo_pred = if lo.is_some() { "AND te.ts >= ?1" } else { "" };
-            let sql = format!(
-                "INSERT INTO trace_events_factor_rollup_1h ( \
-                    bucket_start, agent_id_hash, deployment_domain, cohort_scope, \
-                    cohort_target_id, trace_count, \
-                    csdma_sum, csdma_n, k_eff_sum, k_eff_n, \
-                    correlation_risk_sum, correlation_risk_n, \
-                    override_trace_count, fragility_trace_count, \
-                    conscience_fail_trace_count, entropy_fail_trace_count, \
-                    coherence_fail_trace_count, optimization_veto_fail_trace_count, \
-                    epistemic_humility_fail_trace_count, \
-                    audit_seq_trace_count, audit_sig_trace_count) \
-                 WITH per_trace AS ( \
-                    SELECT \
-                       strftime('%Y-%m-%dT%H:00:00Z', te.ts) AS bucket_start, \
-                       te.agent_id_hash AS agent_id_hash, \
-                       te.deployment_domain AS deployment_domain, \
-                       te.cohort_scope AS cohort_scope, \
-                       te.cohort_target_id AS cohort_target_id, \
-                       te.trace_id AS trace_id, \
-                       AVG(CASE WHEN json_extract(te.payload,'$.csdma_plausibility_score') \
-                           IS NOT NULL THEN json_extract(te.payload,'$.csdma_plausibility_score') END) \
-                           AS csdma_val, \
-                       AVG(CASE WHEN json_extract(te.payload,'$.idma_k_eff') \
-                           IS NOT NULL THEN json_extract(te.payload,'$.idma_k_eff') END) \
-                           AS k_eff_val, \
-                       AVG(CASE WHEN json_extract(te.payload,'$.idma_correlation_risk') \
-                           IS NOT NULL THEN json_extract(te.payload,'$.idma_correlation_risk') END) \
-                           AS corr_val, \
-                       MAX(CASE WHEN te.event_type='CONSCIENCE_RESULT' \
-                           AND json_extract(te.payload,'$.action_was_overridden')=1 THEN 1 ELSE 0 END) \
-                           AS overridden, \
-                       MAX(CASE WHEN json_extract(te.payload,'$.idma_fragility_flag')=1 THEN 1 ELSE 0 END) \
-                           AS fragile, \
-                       MAX(CASE WHEN te.event_type='CONSCIENCE_RESULT' \
-                           AND json_extract(te.payload,'$.conscience_passed')=0 THEN 1 ELSE 0 END) \
-                           AS conscience_fail, \
-                       MAX(CASE WHEN te.event_type='CONSCIENCE_RESULT' \
-                           AND json_extract(te.payload,'$.entropy_passed')=0 THEN 1 ELSE 0 END) \
-                           AS entropy_fail, \
-                       MAX(CASE WHEN te.event_type='CONSCIENCE_RESULT' \
-                           AND json_extract(te.payload,'$.coherence_passed')=0 THEN 1 ELSE 0 END) \
-                           AS coherence_fail, \
-                       MAX(CASE WHEN te.event_type='CONSCIENCE_RESULT' \
-                           AND json_extract(te.payload,'$.optimization_veto_passed')=0 THEN 1 ELSE 0 END) \
-                           AS optimization_veto_fail, \
-                       MAX(CASE WHEN te.event_type='CONSCIENCE_RESULT' \
-                           AND json_extract(te.payload,'$.epistemic_humility_passed')=0 THEN 1 ELSE 0 END) \
-                           AS epistemic_humility_fail, \
-                       MAX(CASE WHEN te.audit_sequence_number IS NOT NULL THEN 1 ELSE 0 END) \
-                           AS has_audit_seq, \
-                       MAX(CASE WHEN te.audit_signature IS NOT NULL THEN 1 ELSE 0 END) \
-                           AS has_audit_sig, \
-                       MAX(CASE WHEN json_extract(te.payload,'$.csdma_plausibility_score') \
-                           IS NOT NULL THEN 1 ELSE 0 END) AS has_csdma, \
-                       MAX(CASE WHEN json_extract(te.payload,'$.idma_k_eff') \
-                           IS NOT NULL THEN 1 ELSE 0 END) AS has_k_eff, \
-                       MAX(CASE WHEN json_extract(te.payload,'$.idma_correlation_risk') \
-                           IS NOT NULL THEN 1 ELSE 0 END) AS has_corr \
-                    FROM trace_events te \
-                    WHERE te.cohort_scope NOT IN ('self','family') {lo_pred} \
-                    GROUP BY bucket_start, te.agent_id_hash, te.deployment_domain, \
-                             te.cohort_scope, te.cohort_target_id, te.trace_id \
-                 ) \
-                 SELECT bucket_start, agent_id_hash, deployment_domain, cohort_scope, \
-                        cohort_target_id, \
-                        COUNT(*) AS trace_count, \
-                        COALESCE(SUM(csdma_val),0), SUM(has_csdma), \
-                        COALESCE(SUM(k_eff_val),0), SUM(has_k_eff), \
-                        COALESCE(SUM(corr_val),0), SUM(has_corr), \
-                        SUM(overridden), SUM(fragile), \
-                        SUM(conscience_fail), SUM(entropy_fail), SUM(coherence_fail), \
-                        SUM(optimization_veto_fail), SUM(epistemic_humility_fail), \
-                        SUM(has_audit_seq), SUM(has_audit_sig) \
-                 FROM per_trace \
-                 GROUP BY bucket_start, agent_id_hash, deployment_domain, \
-                          cohort_scope, cohort_target_id \
-                 ON CONFLICT (bucket_start, COALESCE(agent_id_hash,''), \
-                              COALESCE(deployment_domain,''), COALESCE(cohort_scope,''), \
-                              COALESCE(cohort_target_id,'')) \
-                 DO UPDATE SET \
-                    trace_count = excluded.trace_count, \
-                    csdma_sum = excluded.csdma_sum, csdma_n = excluded.csdma_n, \
-                    k_eff_sum = excluded.k_eff_sum, k_eff_n = excluded.k_eff_n, \
-                    correlation_risk_sum = excluded.correlation_risk_sum, \
-                    correlation_risk_n = excluded.correlation_risk_n, \
-                    override_trace_count = excluded.override_trace_count, \
-                    fragility_trace_count = excluded.fragility_trace_count, \
-                    conscience_fail_trace_count = excluded.conscience_fail_trace_count, \
-                    entropy_fail_trace_count = excluded.entropy_fail_trace_count, \
-                    coherence_fail_trace_count = excluded.coherence_fail_trace_count, \
-                    optimization_veto_fail_trace_count = excluded.optimization_veto_fail_trace_count, \
-                    epistemic_humility_fail_trace_count = excluded.epistemic_humility_fail_trace_count, \
-                    audit_seq_trace_count = excluded.audit_seq_trace_count, \
-                    audit_sig_trace_count = excluded.audit_sig_trace_count"
-            );
+            let sql = sqlite_factor_rollup_upsert_sql(lo_pred);
 
             if let Some(ref lo_ts) = lo {
                 tx.execute(&sql, rusqlite::params![lo_ts])
@@ -28484,6 +29331,17 @@ impl crate::derived::DerivedSchema for SqliteBackend {
                 event.ml_dsa_65_sig.len()
             )));
         }
+        // v54.1.0 (Codex round 4 sweep on PR #1057) — a detection naming a
+        // trace a steward purge tombstoned is refused: it would re-attach the
+        // linkage and content the purge's finalize tombstoned.
+        crate::federation::steward_purge::refuse_if_tombstoned_trace(self, &event.trace_id)
+            .await
+            .map_err(|e| match e {
+                crate::federation::Error::PurgeRefused { .. } => {
+                    crate::derived::Error::InvalidArgument(format!("{}: {e}", e.kind()))
+                }
+                other => crate::derived::Error::Backend(other.to_string()),
+            })?;
 
         let cohort_cell = serde_json::to_string(&event.cohort_cell)
             .map_err(|e| crate::derived::Error::Backend(format!("cohort_cell encode: {e}")))?;
@@ -28551,6 +29409,10 @@ impl crate::derived::DerivedSchema for SqliteBackend {
     ) -> Result<Vec<crate::derived::DetectionEvent>, crate::derived::Error> {
         self.read(
             move |conn| -> Result<Vec<crate::derived::DetectionEvent>, crate::derived::Error> {
+                // v54.1.0 (Codex round 3 on PR #1057) — an Art. 17 tombstoned event
+                // (DSAR erasure, or a steward purge of its trace) has no linkage or
+                // content left and is not a `DetectionEvent`: it is not returned.
+                // Before this, one tombstoned row made the read fail to decode.
                 // Conditional filters; ts DESC for newest-first triage,
                 // matching the Postgres path (default LIMIT 1000).
                 let mut sql = String::from(
@@ -28558,7 +29420,7 @@ impl crate::derived::DerivedSchema for SqliteBackend {
                         cohort_cell, conformity_variant, conformity_payload, \
                         lens_core_version, ratchet_calibration_version, \
                         canonical_bytes, ed25519_sig, ml_dsa_65_sig, signing_key_id, ts \
-                     FROM cirislens_derived_detection_events WHERE 1 = 1",
+                     FROM cirislens_derived_detection_events WHERE erased_at IS NULL",
                 );
                 let mut binds: Vec<String> = Vec::new();
                 if let Some(t) = filter.trace_id {
@@ -30213,6 +31075,104 @@ mod accord_tests {
 mod tests {
     use super::*;
     use crate::federation::membership_acceptance::test_support::ConsentedWidening as _;
+
+    /// **I827** (v54.1.0, Codex round 3 on PR #1057) — two `SqliteBackend`
+    /// instances on ONE file race one accord nonce: exactly one proposal wins.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn i827_two_backends_on_one_file_race_one_nonce_sqlite() {
+        use crate::store::Backend as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("i827.db").to_string_lossy().to_string();
+        let a = SqliteBackend::open(path.clone()).await.unwrap();
+        a.run_migrations().await.unwrap();
+        let b = SqliteBackend::open(path).await.unwrap();
+        b.run_migrations().await.unwrap();
+        crate::federation::accord_quorum::test_fixtures::i827_two_backends_race_one_nonce(
+            &a, &b, "sqlite", 64,
+        )
+        .await;
+    }
+
+    /// **I827b** — V189's backfill on proposals that already share a pair
+    /// (admitted before #1047): the EARLIEST keeps the claim, every legacy row
+    /// stays, and a new proposal under the pair is refused naming it.
+    #[tokio::test]
+    async fn i827b_the_claim_backfill_keeps_every_legacy_row_sqlite() {
+        use crate::federation::FederationDirectory as _;
+        use crate::store::Backend as _;
+        let b = SqliteBackend::open_in_memory().await.unwrap();
+        b.run_migrations().await.unwrap();
+        let fixtures = crate::federation::accord_quorum::test_fixtures::proposal;
+        let older = fixtures("fam-i827b", "nonce-i827b");
+        let mut newer = older.clone();
+        newer.window_until = "2030-01-01T00:00:00Z".to_owned();
+        b.put_accord_proposal(older.clone(), None).await.unwrap();
+        // Reproduce the pre-#1047 state: a second row under the pair, written
+        // around the door, and no claim table content.
+        let (od, nd) = (older.digest(), newer.digest());
+        b.write(move |conn| -> Result<(), rusqlite::Error> {
+            conn.execute(
+                "INSERT INTO accord_proposal (proposal_digest, family_key_id, action, nonce, \
+                    window_until, prior_family_digest, payload_sha256, proposal_json, \
+                    authority_signature, persist_row_hash, created_at) \
+                 SELECT ?2, family_key_id, action, nonce, window_until, prior_family_digest, \
+                    payload_sha256, proposal_json, authority_signature, persist_row_hash, \
+                    '2999-01-01T00:00:00+00:00' \
+                 FROM accord_proposal WHERE proposal_digest = ?1",
+                rusqlite::params![od, nd],
+            )?;
+            conn.execute("DELETE FROM accord_proposal_nonce_claim", [])?;
+            // V189's backfill, as shipped.
+            let v189 =
+                include_str!("../../migrations/sqlite/lens/V189__accord_proposal_nonce_claim.sql");
+            let backfill = &v189[v189
+                .find("INSERT INTO accord_proposal_nonce_claim")
+                .unwrap()..];
+            conn.execute_batch(backfill)
+        })
+        .await
+        .unwrap();
+        let owner: String = b
+            .read(|conn| {
+                conn.query_row(
+                    "SELECT proposal_digest FROM accord_proposal_nonce_claim \
+                     WHERE family_key_id = 'fam-i827b' AND nonce = 'nonce-i827b'",
+                    [],
+                    |r| r.get(0),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(owner, older.digest(), "I827b: the earliest keeps the claim");
+        assert!(b
+            .get_accord_proposal(&older.digest())
+            .await
+            .unwrap()
+            .is_some());
+        assert!(
+            b.get_accord_proposal(&newer.digest())
+                .await
+                .unwrap()
+                .is_some(),
+            "I827b: no legacy row is deleted"
+        );
+        // Codex round 4 — an exact replay of the legacy non-owner (held
+        // evidence) is idempotent, not refused.
+        b.put_accord_proposal(newer.clone(), None)
+            .await
+            .expect("I827b: a held legacy proposal's replay is idempotent");
+        b.put_accord_proposal(older.clone(), None)
+            .await
+            .expect("I827b: the claim owner's replay too");
+        let mut third = older.clone();
+        third.window_until = "2029-01-01T00:00:00Z".to_owned();
+        let e = b.put_accord_proposal(third, None).await.unwrap_err();
+        assert!(
+            matches!(&e, crate::federation::Error::AccordProposalNonceReused { existing_proposal_digest, .. }
+                if *existing_proposal_digest == older.digest()),
+            "I827b: {e:?}"
+        );
+    }
     use crate::schema::{LlmCallStatus, ReasoningEventType, TraceLevel};
     use chrono::{TimeZone, Utc};
 
@@ -30829,18 +31789,27 @@ mod tests {
         );
         forged.scrub_signature_classical = "AAAA".into();
         forged.scrub_signature_pqc = Some("AAAA".into());
-        let err = backend
+        // v54.1.0 (#1042) — the Insert arm returns a refusal OUTCOME, never a
+        // bare `Err`: a scrubber this node holds whose signature does not
+        // verify is the terminal `unverifiable_signature`.
+        let outcome = backend
             .apply_replicated_key_record(crate::federation::SignedKeyRecord { record: forged })
             .await
-            .expect_err("(E2) invalid-PoP fresh key must be rejected");
+            .expect("(E2) a refusal is an outcome, never a bare Err");
+        assert_eq!(
+            outcome,
+            crate::federation::register::ReplicatedKeyOutcome::Refused {
+                reason: crate::federation::register::KeyRefusalReason::UnverifiableSignature,
+            },
+            "(E2) invalid-PoP fresh key must be refused unverifiable_signature"
+        );
         // Nothing was written.
         assert!(
             crate::federation::FederationDirectory::lookup_public_key(&backend, "e2-forged")
                 .await
                 .unwrap()
                 .is_none(),
-            "forged key left no trace, got err {}",
-            err.kind()
+            "forged key left no trace"
         );
     }
 
@@ -34501,14 +35470,19 @@ mod tests {
     async fn federation_attestation_fk_enforcement() {
         let backend = SqliteBackend::open_in_memory().await.unwrap();
         backend.run_migrations().await.unwrap();
-        // Insert an attestation referencing a non-existent key — FK
-        // violation surfaces as InvalidArgument (matches memory shape).
+        // Insert an attestation referencing a non-existent key. v54.1.0
+        // (#1042) — the attester lookup runs first and types the unknown
+        // signer as the retryable ordering gap (matches memory shape).
         let att = fed_attestation("att-1", "ghost-steward", "ghost-key", "ghost-steward");
         let err = backend
             .put_attestation(SignedAttestation { attestation: att })
             .await
             .unwrap_err();
-        assert!(matches!(err, crate::federation::Error::InvalidArgument(_)));
+        assert!(
+            matches!(&err, crate::federation::Error::AttesterKeyUnknown { attesting_key_id, plane: "attestation" }
+                if attesting_key_id == "ghost-steward"),
+            "expected the attester-lookup refusal, got {err:?}"
+        );
     }
 
     #[tokio::test]
@@ -37658,9 +38632,11 @@ mod tests {
         let err = backend.put_identity_occurrence(wrong).await.expect_err(
             "a signer who is neither the identity nor its active occurrence must be rejected",
         );
-        assert_eq!(err.kind(), "federation_signature_invalid");
-        assert!(
-            format!("{err}").contains("neither identity"),
+        // v54.1.0 (#1042 follow-up) — `signer_acts_for`'s refusal is typed apart
+        // from a bad signature: the retryable `federation_signer_not_acting_for`.
+        assert_eq!(
+            err.kind(),
+            "federation_signer_not_acting_for",
             "(4) the refusal must be `signer_acts_for`'s, not a subject-binding or signature \
              failure standing in for it: {err}"
         );
@@ -37891,7 +38867,9 @@ mod tests {
             )
             .await
             .expect_err("(3b) a peer's revocation of a victim must be REJECTED");
-        assert_eq!(err.kind(), "federation_signature_invalid");
+        // v54.1.0 (#1042 follow-up) — the signature verifies; the signer does
+        // not act for alice: the typed signer-acts-for refusal.
+        assert_eq!(err.kind(), "federation_signer_not_acting_for");
         assert!(backend
             .resolve_encryption_keys("alice-phone")
             .await
@@ -38457,7 +39435,11 @@ mod tests {
             .await
             .expect_err("an unsigned family roster grow must be refused");
         assert!(
-            err.to_string().contains("not registered") || err.to_string().contains("signature"),
+            // v54.1.0 (#1042 follow-up B) — an empty authority is a row naming
+            // no signer: the terminal malformed refusal.
+            err.to_string().contains("not registered")
+                || err.to_string().contains("signature")
+                || err.to_string().contains("names no signer"),
             "the refusal is about AUTHORSHIP: {err:?}"
         );
         // v49.0.0 (#910): alice — the whole of this `unanimous` family — signs;

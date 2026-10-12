@@ -142,6 +142,16 @@ struct State {
     events: HashMap<DedupKey, (i64, TraceEventRow)>,
     /// Inserted `trace_llm_calls` rows.
     llm_calls: Vec<TraceLlmCallRow>,
+    /// v54.1.0 (CIRISPersist#1046, V187 mirror) — steward purge execution
+    /// headers, keyed by notice id.
+    purge_executions:
+        std::collections::BTreeMap<String, crate::federation::steward_purge::PurgeExecution>,
+    /// v54.1.0 (CIRISPersist#1046, V187 mirror) — steward purge tombstones,
+    /// keyed `(notice_id, plane, record_ref)`.
+    purge_tombstones: std::collections::BTreeMap<
+        (String, String, String),
+        crate::federation::steward_purge::PurgeTombstone,
+    >,
     /// Monotonic event_id counter (mimics Postgres BIGSERIAL).
     next_event_id: i64,
     /// Public-key directory (legacy `accord_public_keys` shape; used
@@ -423,13 +433,11 @@ struct State {
     /// pg/sqlite V091 tables. Proposals keyed by `proposal_digest`;
     /// participations a flat vec (deduped by `(proposal_digest,
     /// pinned_pubkey)` at write time, M6); decisions keyed by
-    /// `proposal_digest` (immutable, M2); active halts keyed by family (H2);
-    /// issued nonces a `(family_key_id, nonce)` set (M4).
+    /// `proposal_digest` (immutable, M2); active halts keyed by family (H2).
     accord_proposals: HashMap<String, crate::federation::accord_quorum::StoredProposal>,
     accord_participations: Vec<crate::federation::accord_quorum::StoredParticipation>,
     accord_decisions: HashMap<String, crate::federation::accord_quorum::StoredDecision>,
     accord_active_halts: HashMap<String, crate::federation::accord_quorum::ActiveHalt>,
-    accord_issued_nonces: std::collections::HashSet<(String, String)>,
     /// #377 — canonical-role WITHDRAW/SUPERSEDE tombstones (V095), keyed by the
     /// withdrawn `key_id`. The in-memory mirror of `canonical_role_withdrawal`.
     canonical_withdrawals: HashMap<String, crate::federation::CanonicalWithdrawal>,
@@ -894,6 +902,22 @@ fn transport_destination_rows(state: &State) -> Vec<(String, chrono::DateTime<ch
         })
         .collect()
 }
+/// v54.1.0 (Codex round 4 on PR #1057) — the memory twin of
+/// `steward_purge::person_subject_sql`: does a held key that is a person
+/// (`identity_type_is_person`) appear among `row`'s subjects
+/// (`subject_key_ids`, `attested_key_id`)?
+fn mem_person_subject(state: &State, row: &crate::federation::Attestation) -> bool {
+    row.subject_key_ids
+        .iter()
+        .chain(std::iter::once(&row.attested_key_id))
+        .filter(|k| !k.is_empty())
+        .any(|k| {
+            state.federation_keys.get(k).is_some_and(|r| {
+                crate::federation::steward_purge::identity_type_is_person(&r.identity_type)
+            })
+        })
+}
+
 /// v45.0.0 (CIRISPersist#871, FSD §5) — maintain the V149 `blob_renditions`
 /// mirror for `row` under the state lock the caller already holds: when
 /// [`crate::federation::renditions::rendition_of_row`] answers `Some`, upsert
@@ -937,6 +961,8 @@ impl Default for MemoryBackend {
                 lineage_head_cosigns: Default::default(),
                 events: HashMap::new(),
                 llm_calls: Vec::new(),
+                purge_executions: std::collections::BTreeMap::new(),
+                purge_tombstones: std::collections::BTreeMap::new(),
                 next_event_id: 1,
                 keys: HashMap::new(),
                 federation_keys: HashMap::new(),
@@ -991,7 +1017,6 @@ impl Default for MemoryBackend {
                 accord_participations: Vec::new(),
                 accord_decisions: HashMap::new(),
                 accord_active_halts: HashMap::new(),
-                accord_issued_nonces: std::collections::HashSet::new(),
                 canonical_withdrawals: HashMap::new(),
                 role_withdrawals: HashMap::new(),
                 consent_peer_set: Vec::new(),
@@ -1049,6 +1074,22 @@ impl MemoryBackend {
         &self.test_hooks
     }
 
+    /// v54.1.0 (CIRISPersist#1044, I621) — hold a key row past every
+    /// `put_public_key` gate, as a node that admitted it under an older rule
+    /// does. Test-only: the role-gated rows a witness needs cannot clear the
+    /// production-roster gate.
+    #[cfg(test)]
+    #[allow(dead_code)] // the witness that calls it needs postgres or sqlite
+    pub(crate) fn seed_key_row_unchecked_for_test(&self, mut row: crate::federation::KeyRecord) {
+        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)
+            .expect("seeded key row hashes");
+        self.state
+            .lock()
+            .expect("memory backend lock")
+            .federation_keys
+            .insert(row.key_id.clone(), row);
+    }
+
     /// v50.0.0 (PR #921 review) — the test-only rival write armed for `at`
     /// (see [`crate::store::test_hooks`]), applied through this backend's own
     /// replicated door. Never armed outside a test.
@@ -1094,7 +1135,18 @@ impl MemoryBackend {
             ReplicatedKeyPlan::Refused { reason } => Ok(ReplicatedKeyOutcome::Refused { reason }),
             ReplicatedKeyPlan::Insert => {
                 if !crate::federation::register::record_is_role_gated(&record.record) {
-                    crate::federation::verify_key_registration(self, &record.record).await?;
+                    // v54.1.0 (CIRISPersist#1042, CIRISEdge#858) — a verify
+                    // failure is a TYPED refusal, never a bare `Err`: the
+                    // sender books `attester_key_unknown` (retryable: the
+                    // scrubber's Key row has not landed here yet) apart from
+                    // `unverifiable_signature` (terminal). Nothing is written.
+                    if let Err(e) =
+                        crate::federation::verify_key_registration(self, &record.record).await
+                    {
+                        return Ok(ReplicatedKeyOutcome::Refused {
+                            reason: crate::federation::register::key_refusal_of_verify_error(e)?,
+                        });
+                    }
                 }
                 match self
                     .put_public_key_at_door(
@@ -1111,6 +1163,21 @@ impl MemoryBackend {
             ReplicatedKeyPlan::Rebind => {
                 match crate::federation::FederationDirectory::store_rebound_key_record(self, record)
                     .await
+                {
+                    Ok(outcome) => Ok(outcome),
+                    Err(Error::Conflict(_)) => Ok(RACED),
+                    Err(e) => Err(e),
+                }
+            }
+            // v54.1.0 (#1044) — the stored record fails verification and the
+            // incoming one (same pubkeys, same claim) passes: replace it. A
+            // lost race, or a stored row that verifies after all, is
+            // fail-closed + re-offerable.
+            ReplicatedKeyPlan::ReplaceInvalid => {
+                match crate::federation::FederationDirectory::store_invalid_replaced_key_record(
+                    self, record,
+                )
+                .await
                 {
                     Ok(outcome) => Ok(outcome),
                     Err(Error::Conflict(_)) => Ok(RACED),
@@ -1142,6 +1209,124 @@ impl MemoryBackend {
                 Ok(ReplicatedKeyOutcome::ScrubsRehydrated)
             }
         }
+    }
+
+    /// v54.1.0 (CIRISPersist#1044) — the in-place registration rewrite both
+    /// replacement doors share (the sqlite/postgres shape): the history row
+    /// (with the replaced row's own hash and the kind), then the row, both
+    /// re-asserting the planned-against hash under one lock.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    async fn write_replaced_key_registration(
+        &self,
+        new: crate::federation::KeyRecord,
+        existing_hash: &str,
+        kind: crate::federation::types::KeyReplacementKind,
+    ) -> Result<(), crate::federation::Error> {
+        use crate::federation::Error;
+        let key_id = {
+            let mut state = self.state.lock().expect("memory backend lock");
+            let key_id = new.key_id.clone();
+            let raced = || {
+                Error::Conflict(format!(
+                    "{} key registration {key_id}: row changed concurrently",
+                    kind.as_str()
+                ))
+            };
+            let existing = state
+                .federation_keys
+                .get(&key_id)
+                .cloned()
+                .ok_or_else(raced)?;
+            // The atomic re-assertion: the row is the one the plan saw.
+            if existing.persist_row_hash != existing_hash
+                || (kind == crate::federation::types::KeyReplacementKind::Rebind
+                    && existing.scrub_key_id != existing.key_id)
+                || existing.pubkey_ed25519_base64 != new.pubkey_ed25519_base64
+            {
+                return Err(raced());
+            }
+            let mutated_at = next_key_admission_position(&state);
+            state
+                .key_registration_history
+                .entry(key_id.clone())
+                .or_default()
+                .push(crate::federation::types::KeyRegistrationHistoryRow {
+                    key_id: key_id.clone(),
+                    registration_envelope: existing.registration_envelope,
+                    original_content_hash: existing.original_content_hash,
+                    scrub_signature_classical: existing.scrub_signature_classical,
+                    scrub_signature_pqc: existing.scrub_signature_pqc,
+                    scrub_key_id: existing.scrub_key_id,
+                    scrub_timestamp: existing.scrub_timestamp,
+                    replaced_at: mutated_at,
+                    replaced_by_hash: new.persist_row_hash.clone(),
+                    replaced_row_hash: Some(existing.persist_row_hash),
+                    replacement: kind,
+                });
+            state
+                .key_record_mutated_at
+                .insert(key_id.clone(), mutated_at);
+            state.federation_keys.insert(key_id.clone(), new);
+            key_id
+        };
+        self.index_stored_key_row(&key_id).await
+    }
+
+    /// v54.1.0 (CIRISPersist#1040) — TEST SEAM: store `identity_type` on a
+    /// held key row as if the role had been conferred at its door (the
+    /// conferral itself is the canonical gate's, witnessed by I190 and the
+    /// #372 tests). Nothing else moves.
+    #[cfg(any(test, feature = "test-anchor"))]
+    pub async fn test_seam_set_key_identity_type(
+        &self,
+        key_id: &str,
+        identity_type: &str,
+    ) -> Result<(), crate::federation::Error> {
+        let mut state = self.state.lock().expect("memory backend lock");
+        if let Some(r) = state.federation_keys.get_mut(key_id) {
+            r.identity_type = identity_type.to_owned();
+        }
+        Ok(())
+    }
+
+    /// v54.1.0 (Codex on PR #1057) — TEST SEAM: drop one stored tombstone of
+    /// a notice, reproducing a header whose set is partial (the state the
+    /// pre-fix, non-atomic write could leave). Nothing else moves.
+    #[cfg(test)]
+    pub async fn test_seam_drop_purge_tombstone(
+        &self,
+        notice_id: &str,
+        plane: &str,
+        record_ref: &str,
+    ) -> Result<(), crate::federation::Error> {
+        let mut state = self.state.lock().expect("memory backend lock");
+        state.purge_tombstones.remove(&(
+            notice_id.to_owned(),
+            plane.to_owned(),
+            record_ref.to_owned(),
+        ));
+        Ok(())
+    }
+
+    /// v54.1.0 (CIRISPersist#1043) — TEST SEAM: reproduce a legacy row the
+    /// apply door refuses today (#598 "typed asserted_at diverges from the
+    /// signed envelope"): move the typed `asserted_at` column off the signed
+    /// instant. Nothing else moves.
+    #[cfg(any(test, feature = "test-anchor"))]
+    pub async fn test_seam_set_attestation_asserted_at(
+        &self,
+        attestation_id: &str,
+        asserted_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), crate::federation::Error> {
+        let mut state = self.state.lock().expect("memory backend lock");
+        if let Some(a) = state
+            .federation_attestations
+            .iter_mut()
+            .find(|a| a.attestation_id == attestation_id)
+        {
+            a.asserted_at = asserted_at;
+        }
+        Ok(())
     }
 
     /// v54.0.0 (CIRISPersist#995 row 2) — TEST SEAM: reproduce what a
@@ -2964,6 +3149,300 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         self
     }
 
+    // ── v54.1.0 (CIRISPersist#1046) — the steward purge plane (V187 mirror) ──
+
+    async fn purge_scan_attestations(
+        &self,
+        after_id: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        let mut rows: Vec<_> = state
+            .federation_attestations
+            .iter()
+            .filter(|a| after_id.is_none_or(|after| a.attestation_id.as_str() > after))
+            .cloned()
+            .collect();
+        rows.sort_by(|a, b| a.attestation_id.cmp(&b.attestation_id));
+        rows.truncate(limit as usize);
+        Ok(rows)
+    }
+
+    async fn purge_trace_ids_for_llm_model(
+        &self,
+        model: &str,
+    ) -> Result<Vec<String>, crate::federation::Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        let ids: std::collections::BTreeSet<String> = state
+            .llm_calls
+            .iter()
+            .filter(|c| c.model.as_deref() == Some(model))
+            .map(|c| c.trace_id.clone())
+            .collect();
+        Ok(ids.into_iter().collect())
+    }
+
+    async fn purge_trace_ids_signed_by(
+        &self,
+        key_id: &str,
+    ) -> Result<Vec<String>, crate::federation::Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        let ids: std::collections::BTreeSet<String> = state
+            .events
+            .values()
+            .filter(|(_, e)| e.signing_key_id == key_id)
+            .map(|(_, e)| e.trace_id.clone())
+            .collect();
+        Ok(ids.into_iter().collect())
+    }
+
+    async fn purge_trace_row_counts(
+        &self,
+        trace_ids: &[String],
+    ) -> Result<(u64, u64), crate::federation::Error> {
+        let wanted: std::collections::HashSet<&str> =
+            trace_ids.iter().map(String::as_str).collect();
+        let state = self.state.lock().expect("memory backend lock");
+        let events = state
+            .events
+            .values()
+            .filter(|(_, e)| wanted.contains(e.trace_id.as_str()))
+            .count() as u64;
+        let calls = state
+            .llm_calls
+            .iter()
+            .filter(|c| wanted.contains(c.trace_id.as_str()))
+            .count() as u64;
+        Ok((events, calls))
+    }
+
+    async fn purge_put_execution(
+        &self,
+        execution: &crate::federation::steward_purge::PurgeExecution,
+        tombstones: &[crate::federation::steward_purge::PurgeTombstone],
+    ) -> Result<crate::federation::steward_purge::PurgePutOutcome, crate::federation::Error> {
+        crate::federation::steward_purge::check_purge_put_set(execution, tombstones)?;
+        let mut state = self.state.lock().expect("memory backend lock");
+        // Codex on PR #1057 — the header and its tombstones are one write:
+        // everything is decided under the lock BEFORE anything is inserted,
+        // so a failure leaves neither.
+        let header_inserted = !state.purge_executions.contains_key(&execution.notice_id);
+        let keys: Vec<(String, String, String)> = tombstones
+            .iter()
+            .map(|t| {
+                (
+                    t.notice_id.clone(),
+                    t.plane.as_str().to_owned(),
+                    t.record_ref.clone(),
+                )
+            })
+            .collect();
+        let mut fresh = std::collections::BTreeSet::new();
+        let tombstones_inserted: Vec<bool> = keys
+            .iter()
+            .map(|k| !state.purge_tombstones.contains_key(k) && fresh.insert(k.clone()))
+            .collect();
+        #[cfg(test)]
+        self.test_hooks()
+            .fail_if_armed("purge_put_execution_tombstones")?;
+        if header_inserted {
+            let last = state.purge_executions.values().map(|e| e.admitted_at).max();
+            let mut row = execution.clone();
+            row.admitted_at =
+                crate::federation::types::monotonic_admission_instant(chrono::Utc::now(), last);
+            row.finalized_at = None;
+            state.purge_executions.insert(row.notice_id.clone(), row);
+        }
+        for ((key, t), inserted) in keys.into_iter().zip(tombstones).zip(&tombstones_inserted) {
+            if *inserted {
+                state.purge_tombstones.insert(key, t.clone());
+                // Codex round 4 sweep — a newly tombstoned attestation leaves
+                // the signed-wire index at once (no longer advertised).
+                if t.plane == crate::federation::steward_purge::PurgePlane::Attestation {
+                    let rk = crate::federation::wire_index::record_key(&[(
+                        "attestation_id",
+                        &t.record_ref,
+                    )]);
+                    state
+                        .signed_wire_index
+                        .retain(|(kind, _), v| !(kind == "Attestation" && *v == rk));
+                }
+            }
+        }
+        Ok(crate::federation::steward_purge::PurgePutOutcome {
+            header_inserted,
+            tombstones_inserted,
+        })
+    }
+
+    async fn purge_execution(
+        &self,
+        notice_id: &str,
+    ) -> Result<Option<crate::federation::steward_purge::PurgeExecution>, crate::federation::Error>
+    {
+        let state = self.state.lock().expect("memory backend lock");
+        Ok(state.purge_executions.get(notice_id).cloned())
+    }
+
+    async fn purge_tombstones_of(
+        &self,
+        notice_id: &str,
+    ) -> Result<Vec<crate::federation::steward_purge::PurgeTombstone>, crate::federation::Error>
+    {
+        let state = self.state.lock().expect("memory backend lock");
+        let mut out: Vec<_> = state
+            .purge_tombstones
+            .values()
+            .filter(|t| t.notice_id == notice_id)
+            .cloned()
+            .collect();
+        out.sort_by_key(|t| t.ordinal);
+        Ok(out)
+    }
+
+    async fn purge_tombstoned(
+        &self,
+        plane: &str,
+        record_ref: &str,
+    ) -> Result<Option<String>, crate::federation::Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        Ok(state
+            .purge_tombstones
+            .keys()
+            .filter(|(_, p, r)| p == plane && r == record_ref)
+            .map(|(n, _, _)| n.clone())
+            .min())
+    }
+
+    async fn purge_tombstone_notices(
+        &self,
+        plane: &str,
+        record_ref: &str,
+    ) -> Result<Vec<String>, crate::federation::Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        let mut out: Vec<String> = state
+            .purge_tombstones
+            .keys()
+            .filter(|(_, p, r)| p == plane && r == record_ref)
+            .map(|(n, _, _)| n.clone())
+            .collect();
+        out.sort();
+        out.dedup();
+        Ok(out)
+    }
+
+    async fn list_purge_executions_since(
+        &self,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
+        limit: u32,
+    ) -> Result<Vec<crate::federation::steward_purge::PurgeExecution>, crate::federation::Error>
+    {
+        let state = self.state.lock().expect("memory backend lock");
+        let mut out: Vec<_> = state
+            .purge_executions
+            .values()
+            .filter(|e| {
+                since.as_ref().is_none_or(|(at, id)| {
+                    (e.admitted_at, e.notice_id.as_str()) > (*at, id.as_str())
+                })
+            })
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| {
+            a.admitted_at
+                .cmp(&b.admitted_at)
+                .then_with(|| a.notice_id.cmp(&b.notice_id))
+        });
+        out.truncate(limit as usize);
+        Ok(out)
+    }
+
+    async fn purge_delete_tombstoned_attestation(
+        &self,
+        attestation_id: &str,
+    ) -> Result<bool, crate::federation::Error> {
+        let mut state = self.state.lock().expect("memory backend lock");
+        // The door's own gate: only a row a purge tombstone names, and never
+        // the accountability record (Codex on PR #1057: a tombstone is void
+        // for it).
+        let tombstoned = state
+            .purge_tombstones
+            .keys()
+            .any(|(_, p, r)| p == "attestation" && r == attestation_id);
+        let accountability = state.federation_attestations.iter().any(|a| {
+            a.attestation_id == attestation_id
+                && (crate::federation::steward_purge::accountability_record_of(a).is_some()
+                    // INTERIM (Codex round 4): nor a row a person is the
+                    // subject of.
+                    || mem_person_subject(&state, a))
+        });
+        if !tombstoned || accountability {
+            return Ok(false);
+        }
+        let before = state.federation_attestations.len();
+        state
+            .federation_attestations
+            .retain(|a| a.attestation_id != attestation_id);
+        if state.federation_attestations.len() == before {
+            return Ok(false);
+        }
+        for ids in state.subject_index.values_mut() {
+            ids.retain(|id| id != attestation_id);
+        }
+        state.subject_index.retain(|_, ids| !ids.is_empty());
+        Ok(true)
+    }
+
+    async fn purge_delete_tombstoned_trace(
+        &self,
+        trace_id: &str,
+    ) -> Result<(u64, u64), crate::federation::Error> {
+        let mut state = self.state.lock().expect("memory backend lock");
+        let tombstoned = state
+            .purge_tombstones
+            .keys()
+            .any(|(_, p, r)| p == "trace" && r == trace_id);
+        if !tombstoned {
+            return Ok((0, 0));
+        }
+        // INTERIM (Codex round 4 on PR #1057) — never a trace a person signed.
+        let person_signed = state.events.values().any(|(_, e)| {
+            e.trace_id == trace_id
+                && state
+                    .federation_keys
+                    .get(&e.signing_key_id)
+                    .is_some_and(|k| {
+                        crate::federation::steward_purge::identity_type_is_person(&k.identity_type)
+                    })
+        });
+        if person_signed {
+            return Ok((0, 0));
+        }
+        let events_before = state.events.len();
+        state.events.retain(|_, (_, e)| e.trace_id != trace_id);
+        let calls_before = state.llm_calls.len();
+        state.llm_calls.retain(|c| c.trace_id != trace_id);
+        Ok((
+            (events_before - state.events.len()) as u64,
+            (calls_before - state.llm_calls.len()) as u64,
+        ))
+    }
+
+    async fn purge_mark_finalized(
+        &self,
+        notice_id: &str,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, crate::federation::Error> {
+        let mut state = self.state.lock().expect("memory backend lock");
+        match state.purge_executions.get_mut(notice_id) {
+            Some(e) if e.finalized_at.is_none() => {
+                e.finalized_at = Some(at);
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
     fn withdraws_delegation_depth(&self) -> usize {
         self.withdraws_delegation_depth
             .load(std::sync::atomic::Ordering::Relaxed)
@@ -3044,53 +3523,40 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         record: crate::federation::SignedKeyRecord,
     ) -> Result<crate::federation::register::ReplicatedKeyOutcome, crate::federation::Error> {
         use crate::federation::register::{RebindPrepared, ReplicatedKeyOutcome};
-        use crate::federation::Error;
         let (new, existing_hash) =
             match crate::federation::register::prepare_rebind(self, record).await? {
                 RebindPrepared::Unchanged => return Ok(ReplicatedKeyOutcome::Unchanged),
                 RebindPrepared::Replace { new, existing_hash } => (*new, existing_hash),
             };
-        let key_id = {
-            let mut state = self.state.lock().expect("memory backend lock");
-            let key_id = new.key_id.clone();
-            let existing = state.federation_keys.get(&key_id).cloned().ok_or_else(|| {
-                Error::Conflict(format!(
-                    "store_rebound_key_record {key_id}: row changed concurrently"
-                ))
-            })?;
-            // The atomic re-assertion: the row is the one the plan saw.
-            if existing.persist_row_hash != existing_hash
-                || existing.scrub_key_id != existing.key_id
-                || existing.pubkey_ed25519_base64 != new.pubkey_ed25519_base64
-            {
-                return Err(Error::Conflict(format!(
-                    "store_rebound_key_record {key_id}: row changed concurrently"
-                )));
-            }
-            let mutated_at = next_key_admission_position(&state);
-            state
-                .key_registration_history
-                .entry(key_id.clone())
-                .or_default()
-                .push(crate::federation::types::KeyRegistrationHistoryRow {
-                    key_id: key_id.clone(),
-                    registration_envelope: existing.registration_envelope,
-                    original_content_hash: existing.original_content_hash,
-                    scrub_signature_classical: existing.scrub_signature_classical,
-                    scrub_signature_pqc: existing.scrub_signature_pqc,
-                    scrub_key_id: existing.scrub_key_id,
-                    scrub_timestamp: existing.scrub_timestamp,
-                    replaced_at: mutated_at,
-                    replaced_by_hash: new.persist_row_hash.clone(),
-                });
-            state
-                .key_record_mutated_at
-                .insert(key_id.clone(), mutated_at);
-            state.federation_keys.insert(key_id.clone(), new);
-            key_id
-        };
-        self.index_stored_key_row(&key_id).await?;
+        self.write_replaced_key_registration(
+            new,
+            &existing_hash,
+            crate::federation::types::KeyReplacementKind::Rebind,
+        )
+        .await?;
         Ok(ReplicatedKeyOutcome::Rebound)
+    }
+
+    /// v54.1.0 (CIRISPersist#1044) — the invalid-replace store step (the
+    /// sqlite/postgres shape).
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    async fn store_invalid_replaced_key_record(
+        &self,
+        record: crate::federation::SignedKeyRecord,
+    ) -> Result<crate::federation::register::ReplicatedKeyOutcome, crate::federation::Error> {
+        use crate::federation::register::{RebindPrepared, ReplicatedKeyOutcome};
+        let (new, existing_hash) =
+            match crate::federation::register::prepare_invalid_replace(self, record).await? {
+                RebindPrepared::Unchanged => return Ok(ReplicatedKeyOutcome::Unchanged),
+                RebindPrepared::Replace { new, existing_hash } => (*new, existing_hash),
+            };
+        self.write_replaced_key_registration(
+            new,
+            &existing_hash,
+            crate::federation::types::KeyReplacementKind::InvalidReplaced,
+        )
+        .await?;
+        Ok(ReplicatedKeyOutcome::InvalidReplaced)
     }
 
     async fn list_key_registration_history(
@@ -3482,6 +3948,13 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         {
             return Ok(crate::federation::AttestationOutcome::AlreadyHeld);
         }
+        // v54.1.0 (CIRISPersist#1046) — a row a steward purge tombstoned is
+        // refused (the tombstone outlives the row: it is what keeps a replica
+        // from bringing it back); (CIRISPersist#1040) a federation-tier
+        // mock-LLM trace is refused. Backend-symmetric across memory / sqlite /
+        // postgres, after the settle (a byte-identical held row moves nothing).
+        crate::federation::steward_purge::refuse_if_tombstoned_attestation(self, &row).await?;
+        crate::federation::steward_purge::refuse_mock_trace_attestation(&row)?;
 
         if !row.attesting_key_id.is_empty() {
             // Per-peer write quota. It LEADS the state-consulting checks because
@@ -3718,11 +4191,13 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             let state = self.state.lock().expect("memory backend lock");
             match state.federation_keys.get(&row.attesting_key_id) {
                 Some(rec) => rec.identity_type.clone(),
+                // v54.1.0 (CIRISPersist#1042) — the ORDERING gap, typed apart
+                // from a bad signature (retryable once the Key row lands).
                 None => {
-                    return Err(crate::federation::Error::InvalidArgument(format!(
-                        "attesting_key_id {} does not exist in federation_keys",
-                        row.attesting_key_id
-                    )));
+                    return Err(crate::federation::Error::unknown_signer(
+                        &row.attesting_key_id,
+                        "attestation",
+                    ));
                 }
             }
         };
@@ -5411,6 +5886,19 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         state
             .signed_wire_index
             .retain(|(kind, _), rk| !(kind == "Attestation" && *rk == record_key));
+        // v54.1.0 (Codex round 4 on PR #1057) — every other mirror of a
+        // `steward_purge::ATTESTATION_PROJECTIONS` table: the steward-scoped
+        // `consent_peer_set_for` (a hard-deleted grant kept authorising its
+        // peer through `consent_peers_by_principals`), the withdraws depth and
+        // the trust-direction grandfather. Memory holds no pending-KeyGrant
+        // set and no canonical-binding table.
+        state
+            .consent_peer_set_for
+            .retain(|r| r.source_attestation_id != attestation_id);
+        state
+            .federation_withdraws_admission_depths
+            .remove(attestation_id);
+        state.federation_trust_direction_held.remove(attestation_id);
         Ok(())
     }
 
@@ -7086,17 +7574,6 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         proposal: ciris_verify_core::accord_live_quorum::AccordProposal,
         authority_signature: Option<serde_json::Value>,
     ) -> Result<(), crate::federation::Error> {
-        use crate::federation::Error;
-        // M4 fail-closed (self.accord_nonce_issued locks state — run before).
-        if !self
-            .accord_nonce_issued(&proposal.family_key_id, &proposal.nonce)
-            .await?
-        {
-            return Err(Error::InvalidArgument(format!(
-                "accord proposal nonce {:?} not issued for family {:?} (M4 fail-closed)",
-                proposal.nonce, proposal.family_key_id
-            )));
-        }
         // v31.1.0 (CIRISPersist#662, PR #667 round-4) — `created_at` is half the
         // evidence cursor, so it is an allocated position, not a wall-clock read.
         let created_at = {
@@ -7123,6 +7600,24 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             created_at,
         };
         let mut state = self.state.lock().expect("memory backend lock");
+        // Codex round 4 on PR #1057 — a held digest is an idempotent replay,
+        // asked BEFORE single use (the SQL backends' legacy pairs need it).
+        if state.accord_proposals.contains_key(&proposal_digest) {
+            return Ok(());
+        }
+        // v54.1.0 (#1047) — single use, under the same lock as the insert: a
+        // proposer-minted nonce names one proposal per family.
+        if let Some(other) = state.accord_proposals.iter().find_map(|(d, p)| {
+            (*d != proposal_digest
+                && p.proposal.family_key_id == stored.proposal.family_key_id
+                && p.proposal.nonce == stored.proposal.nonce)
+                .then(|| d.clone())
+        }) {
+            return Err(crate::federation::accord_quorum::nonce_reused(
+                &stored.proposal,
+                &other,
+            ));
+        }
         // Content-derived digest ⇒ insert-if-absent is idempotent.
         state
             .accord_proposals
@@ -7356,29 +7851,6 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             state.accord_active_halts.remove(family_key_id);
         }
         Ok(())
-    }
-
-    async fn issue_accord_nonce(
-        &self,
-        family_key_id: &str,
-        nonce: &str,
-    ) -> Result<(), crate::federation::Error> {
-        let mut state = self.state.lock().expect("memory backend lock");
-        state
-            .accord_issued_nonces
-            .insert((family_key_id.to_owned(), nonce.to_owned()));
-        Ok(())
-    }
-
-    async fn accord_nonce_issued(
-        &self,
-        family_key_id: &str,
-        nonce: &str,
-    ) -> Result<bool, crate::federation::Error> {
-        let state = self.state.lock().expect("memory backend lock");
-        Ok(state
-            .accord_issued_nonces
-            .contains(&(family_key_id.to_owned(), nonce.to_owned())))
     }
 
     // ─── v4.8.0 (CIRISPersist#161, CEG §11.7.1) — membership revocations.
@@ -10216,6 +10688,21 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                     // v53.0.0 (#975, CC 2.4) — under enforcement a held row of
                     // an unregistered type is neither served nor replicated.
                     && crate::federation::row_type::served_under_enforcement(a)
+                    // v54.1.0 (CIRISPersist#1046) — a tombstoned row is never
+                    // served; filtered BEFORE the page is cut.
+                    && (!state.purge_tombstones.keys().any(|(_, p, r)| {
+                        p == "attestation" && *r == a.attestation_id
+                    })
+                        // Codex on PR #1057 — a tombstone is void for the
+                        // accountability record: it is served.
+                        || crate::federation::admission::envelope_dimension(
+                            &a.attestation_envelope,
+                        )
+                        .and_then(crate::federation::migration::accountability_record_family)
+                        .is_some()
+                        // Codex round 4 — and (interim) a row a person is the
+                        // subject of.
+                        || mem_person_subject(&state, a))
                     && since.as_ref().is_none_or(|(s_at, s_id)| {
                         (position(a), a.attestation_id.as_str()) > (*s_at, s_id.as_str())
                     })
@@ -13466,6 +13953,7 @@ mod tests {
             signature_ml_dsa_65: None,
             pubkey_ml_dsa_65: None,
             pqc_key_id: None,
+            run_kind: None,
         };
 
         let d = decompose(&trace).expect("decompose ok");
@@ -15708,9 +16196,10 @@ mod tests {
             .put_attestation(SignedAttestation { attestation: att })
             .await
             .unwrap_err();
+        // v54.1.0 (#1042) — typed as the retryable ordering gap now.
         assert!(
-            matches!(&err, crate::federation::Error::InvalidArgument(m)
-                if m.contains("attesting_key_id") && m.contains("does not exist")),
+            matches!(&err, crate::federation::Error::AttesterKeyUnknown { attesting_key_id, plane: "attestation" }
+                if attesting_key_id == "registry-steward"),
             "expected the tier-2 attester-lookup refusal, got {err:?}"
         );
 
@@ -22976,7 +23465,6 @@ mod tests {
     /// backend where an untested divergence hides (v21.11–17.1, seven times).
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     #[tokio::test]
-    #[serial_test::serial(postgres)]
     async fn load_bearing_predicate_parity_memory_564() {
         let backend = MemoryBackend::new();
         crate::federation::load_bearing::test_support::exercise_load_bearing_predicate(
@@ -23008,7 +23496,6 @@ mod tests {
     /// hides, seven times over v21.11–17.1.
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     #[tokio::test]
-    #[serial_test::serial(postgres)]
     async fn reverse_quorum_parity_memory_574() {
         let backend = MemoryBackend::new();
         crate::federation::reverse_quorum::test_support::exercise_reverse_quorum(
@@ -23023,7 +23510,6 @@ mod tests {
     /// attestation carries (the roster-row shape).
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     #[tokio::test]
-    #[serial_test::serial(postgres)]
     async fn reverse_quorum_action_ref_parity_memory() {
         let backend = MemoryBackend::new();
         crate::federation::reverse_quorum::test_support::exercise_reverse_quorum_action_ref(
@@ -23036,7 +23522,6 @@ mod tests {
     /// v49.0.0 — I181 on memory: a reverse-quorum roster removal.
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     #[tokio::test]
-    #[serial_test::serial(postgres)]
     async fn reverse_quorum_roster_removal_memory() {
         let backend = MemoryBackend::new();
         crate::federation::reverse_quorum::test_support::exercise_reverse_quorum_roster_removal(
@@ -23053,7 +23538,6 @@ mod tests {
     /// which is exactly why it runs the SAME body as the other two.
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     #[tokio::test]
-    #[serial_test::serial(postgres)]
     async fn escalation_on_silence_parity_memory_591() {
         let backend = MemoryBackend::new();
         crate::federation::reverse_quorum::test_support::exercise_escalation_on_silence(
@@ -23070,7 +23554,6 @@ mod tests {
     /// — it is the only one holding a lock across the read the filter re-enters.
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     #[tokio::test]
-    #[serial_test::serial(postgres)]
     async fn admin_ops_parity_memory_570() {
         let backend = MemoryBackend::new();
         crate::federation::quarantine::test_support::exercise_admin_ops(&backend, "memory-qa")
@@ -23093,7 +23576,6 @@ mod tests {
     /// `any(...)` forms would blunt it against the real case it was built for.
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     #[tokio::test]
-    #[serial_test::serial(postgres)]
     async fn rescope_keeps_row_servable_memory_610() {
         let backend = MemoryBackend::new();
         crate::federation::admission::r2_test_support::exercise_rescope_keeps_row_servable(
@@ -23107,7 +23589,6 @@ mod tests {
     /// subject read returns must resolve through the content-hash fetch path.
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     #[tokio::test]
-    #[serial_test::serial(postgres)]
     async fn wire_refs_for_subject_resolve_memory_634() {
         let backend = MemoryBackend::new();
         crate::federation::admission::r2_test_support::exercise_wire_refs_for_subject_resolve(
@@ -23123,7 +23604,6 @@ mod tests {
     /// broke, not that the skew was caught).
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     #[tokio::test]
-    #[serial_test::serial(postgres)]
     async fn nanosecond_key_wire_ref_resolves_memory_640() {
         let backend = MemoryBackend::new();
         crate::federation::admission::r2_test_support::exercise_nanosecond_key_wire_ref_resolves(
@@ -23139,7 +23619,6 @@ mod tests {
     /// the skew was caught.
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     #[tokio::test]
-    #[serial_test::serial(postgres)]
     async fn nanosecond_wire_refs_resolve_every_kind_memory_646() {
         let backend = MemoryBackend::new();
         crate::federation::admission::r2_test_support::exercise_nanosecond_wire_refs_resolve_every_kind(
@@ -23157,7 +23636,6 @@ mod tests {
     /// and be silently absent on this one.
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     #[tokio::test]
-    #[serial_test::serial(postgres)]
     async fn namespace_family_unregistered_parity_memory_590() {
         let backend = MemoryBackend::new();
         crate::federation::admission::r2_test_support::exercise_r2b_refusal(&backend, "memory-r2")
@@ -23171,7 +23649,6 @@ mod tests {
     /// stewardship after the others stop.
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     #[tokio::test]
-    #[serial_test::serial(postgres)]
     async fn steward_binding_liveness_parity_memory_584() {
         let backend = MemoryBackend::new();
         crate::federation::admission::steward_liveness_test_support::exercise_steward_binding_liveness(
@@ -23185,7 +23662,6 @@ mod tests {
     /// the `moderate`/`takedown`/`review` plane).
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     #[tokio::test]
-    #[serial_test::serial(postgres)]
     async fn moderation_walk_liveness_parity_memory_593() {
         let backend = MemoryBackend::new();
         crate::federation::admission::moderation_walk_liveness_test_support::exercise_moderation_walk_liveness(
@@ -23199,7 +23675,6 @@ mod tests {
     /// the proof that the predicate walk still stops at the first hit.
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     #[tokio::test]
-    #[serial_test::serial(postgres)]
     async fn moderation_walk_read_cost_memory_593() {
         let backend = MemoryBackend::new();
         crate::federation::admission::moderation_walk_liveness_test_support::exercise_moderation_walk_read_cost(
@@ -23213,7 +23688,6 @@ mod tests {
     /// node-rostered commons whose members' bindings are subject-revoked.
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     #[tokio::test]
-    #[serial_test::serial(postgres)]
     async fn objection_plane_blast_radius_memory_584() {
         let backend = MemoryBackend::new();
         crate::federation::admission::steward_liveness_test_support::exercise_objection_plane_blast_radius(
@@ -23229,7 +23703,6 @@ mod tests {
     /// lesson).
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     #[tokio::test]
-    #[serial_test::serial(postgres)]
     async fn revocation_bound_parity_memory_570() {
         let backend = MemoryBackend::new();
         backend.set_node_key_id("rb-node-memory");
@@ -23650,7 +24123,6 @@ mod tests {
     /// duty-holder witness.
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     #[tokio::test]
-    #[serial_test::serial(postgres)]
     async fn federation_duty_holders_memory_632() {
         let backend = MemoryBackend::new();
         backend
@@ -23669,7 +24141,6 @@ mod tests {
     /// conferral-is-not-stewardship witness.
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     #[tokio::test]
-    #[serial_test::serial(postgres)]
     async fn conferral_is_not_stewardship_memory_87() {
         let backend = MemoryBackend::new();
         crate::federation::admission::moderation_walk_liveness_test_support::exercise_conferral_is_not_stewardship(
@@ -23682,7 +24153,6 @@ mod tests {
     /// re-genesis charter shape works before the ceremony mints it.
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     #[tokio::test]
-    #[serial_test::serial(postgres)]
     async fn moderation_charter_rehearsal_memory() {
         let backend = MemoryBackend::new();
         crate::federation::admission::moderation_walk_liveness_test_support::exercise_moderation_charter_rehearsal(
@@ -23695,7 +24165,6 @@ mod tests {
     /// witness. All three backends drive the SAME body.
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     #[tokio::test]
-    #[serial_test::serial(postgres)]
     async fn sub_delegation_budget_parity_memory_628() {
         let backend = MemoryBackend::new();
         crate::federation::admission::moderation_walk_liveness_test_support::exercise_sub_delegation_budget(
@@ -23710,7 +24179,6 @@ mod tests {
     /// directory; the Postgres leg is the one that was failing in production.
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     #[tokio::test]
-    #[serial_test::serial(postgres)]
     async fn genesis_seed_installs_parity_memory_622() {
         let backend = MemoryBackend::new();
         backend
@@ -24232,7 +24700,6 @@ mod tests {
     /// `admission::r2_test_support::exercise_publisher_vouch_conferral` body.
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     #[tokio::test]
-    #[serial_test::serial(postgres)]
     async fn publisher_vouch_conferral_parity_memory_611() {
         let backend = MemoryBackend::new();
         backend.set_node_key_id("tp-node-memory");
@@ -24286,7 +24753,6 @@ mod tests {
     /// absent here.
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     #[tokio::test]
-    #[serial_test::serial(postgres)]
     async fn hard_case_third_party_conferral_parity_memory_607() {
         let backend = MemoryBackend::new();
         backend.set_node_key_id("hc-node-memory");
@@ -26113,7 +26579,6 @@ mod tests {
     /// entitlement+precedence fold).
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     #[tokio::test]
-    #[serial_test::serial(postgres)]
     async fn foreign_retraction_cannot_sever_conferral_memory_686() {
         let backend = MemoryBackend::new();
         crate::federation::admission::ungated_doors_test_support::exercise_foreign_retraction_cannot_sever_conferral(
@@ -26138,7 +26603,6 @@ mod tests {
     /// stamp. See the shared body for the attack it closes.
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     #[tokio::test]
-    #[serial_test::serial(postgres)]
     async fn transit_mirror_binding_parity_memory_656() {
         let backend = MemoryBackend::new();
         crate::federation::admission::ungated_doors_test_support::exercise_transit_mirror_binding(
@@ -26151,7 +26615,6 @@ mod tests {
     /// the seal it writes and refuses to move the consent fold's ordering key.
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     #[tokio::test]
-    #[serial_test::serial(postgres)]
     async fn reseal_seal_gate_parity_memory_656() {
         let backend = MemoryBackend::new();
         crate::federation::admission::ungated_doors_test_support::exercise_reseal_seal_gate(
@@ -26164,7 +26627,6 @@ mod tests {
     /// self-claim a conferred role.
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     #[tokio::test]
-    #[serial_test::serial(postgres)]
     async fn peer_record_role_gate_parity_memory_656() {
         let backend = MemoryBackend::new();
         crate::federation::admission::ungated_doors_test_support::exercise_peer_record_role_gate(
@@ -26178,7 +26640,6 @@ mod tests {
     /// delegation edge, whatever order it arrives in.
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     #[tokio::test]
-    #[serial_test::serial(postgres)]
     async fn foreign_retraction_cannot_sever_parity_memory_656() {
         let backend = MemoryBackend::new();
         crate::federation::admission::ungated_doors_test_support::exercise_foreign_retraction_cannot_sever(
@@ -26199,7 +26660,6 @@ mod tests {
     /// mistaken the first for the second.
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     #[tokio::test]
-    #[serial_test::serial(postgres)]
     async fn canonical_supersede_role_gate_parity_memory_656() {
         use crate::federation::FederationDirectory;
         let backend = MemoryBackend::new();

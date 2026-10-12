@@ -1112,7 +1112,10 @@ where
                         | O::Upgraded
                         | O::Inserted
                         | O::Rebound
-                        | O::ScrubsRehydrated,
+                        | O::ScrubsRehydrated
+                        // v54.1.0 (#1044) — the held row failed verification and
+                        // the baked record (same pubkeys, same claim) replaced it.
+                        | O::InvalidReplaced,
                     ) => Ok(()),
                     // Existing is same-or-newer (or not admissible against the
                     // baked record): do NOT downgrade the node, do NOT brick.
@@ -5455,6 +5458,9 @@ mod tests {
             matches!(
                 &err,
                 crate::federation::Error::FederationTierUnverified { attesting_key_id, .. }
+                    // v54.1.0 (#1042) — an unregistered co-signer is the typed
+                    // ordering gap now.
+                    | crate::federation::Error::AttesterKeyUnknown { attesting_key_id, .. }
                     if attesting_key_id == "not-a-registered-key"
             ) || format!("{err:?}").contains("not a registered"),
             "expected the unregistered member refused, got {err:?}"

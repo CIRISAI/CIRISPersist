@@ -1,4 +1,13 @@
-# Mutation scope: the consent gate only (the 13 in-scope mutants the first scope-consent run did not reach before it was stopped; 2 more cargo-mutants lists in admission.rs are test support, outside the scope; observe/ is measured in scope-consent). CIRISPersist#1024.
-tests: test(/i548/)
-src/federation/consent_by_humans.rs capacity_consent_stance resolve_scoped_stance_by_principals resolve_scoped_stance_by_principals_body
+# Mutation scope: the consent gate (CIRISPersist#1024). Nightly.
+#
+# v54.1.0 (CIRISPersist#1051) — v54.0.0 (#1015) split
+# `resolve_scoped_stance_by_principals_body` into `per_principal_stances`
+# (each principal's universe: the predicate #1038's survivor lives in) and
+# `combine_per_principal` (the state and the tightest `retain_until`). The
+# scope named only the old body, which kept one mutant (`-> Ok(Default)`):
+# the gate's operators had silently left the scope. Both are named now, and
+# the #1015 witnesses (I570) that read the combined window are measured too.
+# Grammar: docs/MUTATION_TESTING.md.
+tests: test(/i548|i570/)
+src/federation/consent_by_humans.rs capacity_consent_stance resolve_scoped_stance_by_principals resolve_scoped_stance_by_principals_body per_principal_stances combine_per_principal
 src/federation/admission.rs check_capacity_consent_admission

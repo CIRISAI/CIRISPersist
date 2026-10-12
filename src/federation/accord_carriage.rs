@@ -309,11 +309,9 @@ pub async fn admit_replicated_accord_evidence(
 ///    [`strict_majority_policy`]. The sender's `authority_signature` and any
 ///    `AccordDecision.authorized` bool are NOT consulted — they are not
 ///    inputs to this function at all.
-/// 4. Only now does anything land: the nonce is recorded (so the local M4
-///    gate on `put_accord_proposal` is satisfied by evidence this node
-///    verified, not by a sender's assertion), then the proposal, then each
-///    participation — which `put_accord_participation` re-verifies a SECOND
-///    time against the same roster as it stores it.
+/// 4. Only now does anything land: the proposal, then each participation —
+///    which `put_accord_participation` re-verifies a SECOND time against the
+///    same roster as it stores it.
 /// 5. The V104/V095 projection is re-derived locally
 ///    ([`project_role_withdrawals_for_proposal`]).
 ///
@@ -322,14 +320,12 @@ pub async fn admit_replicated_accord_evidence(
 ///
 /// # On step 4's nonce
 ///
-/// M4 (`accord_nonce_issued`) is an ORIGINATION control — it stops a client
-/// from proposing arbitrary proposals to a server that never issued a nonce.
-/// It is not an authenticity control, and on a receiving node it cannot be
-/// satisfied by construction (that node issued nothing). Recording the nonce
-/// here is not a bypass because it happens strictly AFTER the strict-majority
-/// re-tally: this node is recording that it accepted a bundle carrying real
-/// signed votes from its own roster, which is a stronger fact than the one
-/// M4 exists to establish.
+/// v54.1.0 (CIRISPersist#1047) — the proposal's nonce is minted by its
+/// PROPOSER (CIRISConstitution#146, verify 20); no node issues one, so there
+/// is nothing to record before the proposal lands. `put_accord_proposal`'s
+/// single-use dedup applies here as at the local door: a bundle whose
+/// proposal reuses a nonce that already names a different proposal in its
+/// family is refused `Conflict` and stores nothing past the tally.
 pub async fn admit_replicated_accord_evidence_over_roster(
     directory: &dyn FederationDirectory,
     evidence: &AccordQuorumEvidence,
@@ -481,9 +477,6 @@ pub async fn admit_replicated_accord_evidence_over_roster(
     };
 
     // (4) Now — and only now — store. See the doc note on M4.
-    directory
-        .issue_accord_nonce(&evidence.proposal.family_key_id, &evidence.proposal.nonce)
-        .await?;
     directory
         .put_accord_proposal(
             evidence.proposal.clone(),
@@ -1066,9 +1059,6 @@ pub(crate) mod carriage_tests {
             prior_family_digest: "prior-family-digest".to_owned(),
             payload_sha256,
         };
-        dir.issue_accord_nonce(HUMANITY_ACCORD_FAMILY_KEY_ID, nonce)
-            .await
-            .expect("issue nonce");
         dir.put_accord_proposal(proposal.clone(), None)
             .await
             .expect("put proposal");

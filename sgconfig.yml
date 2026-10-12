@@ -2,5 +2,9 @@
 # AST ports of from-disk gates; scripts/ast_gates.sh runs them and compares
 # the per-file match counts with rules/expected.json. Inventory and the gates
 # still textual: docs/FROM_DISK_GATES.md.
+utilDirs:
+  - utils
 ruleDirs:
   - rules
+testConfigs:
+  - testDir: rule-tests

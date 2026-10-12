@@ -262,8 +262,21 @@ pub async fn reload_record_bytes(
         "Attestation" => {
             let attestation_id = record_key_field(record_key_json, "attestation_id")?;
             match dir.get_attestation(&attestation_id).await? {
+                // v54.1.0 (Codex round 4 sweep on PR #1057) — a row a steward
+                // purge tombstoned is withheld here too, exactly as the arrival
+                // gate would refuse it (void rows stay served): the
+                // serve-by-hash door must not hand out what the cursor serve
+                // withholds during the dwell.
                 Some(a) if a.tier == super::types::attestation_tier::FEDERATION => {
-                    Some(serde_json::to_vec(&a).map_err(|e| to_bytes(e, "Attestation"))?)
+                    match super::steward_purge::refuse_if_tombstoned_attestation(dir, &a).await {
+                        Ok(()) => {
+                            Some(serde_json::to_vec(&a).map_err(|e| to_bytes(e, "Attestation"))?)
+                        }
+                        // Withheld while tombstoned, and while the person
+                        // check cannot be asked (a subject key not held yet).
+                        Err(Error::PurgeRefused { .. } | Error::AttesterKeyUnknown { .. }) => None,
+                        Err(e) => return Err(e),
+                    }
                 }
                 _ => None,
             }

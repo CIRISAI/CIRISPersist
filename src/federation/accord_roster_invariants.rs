@@ -105,7 +105,6 @@ pub(crate) mod bodies {
     ) -> String {
         let accord = accord_family_key_id();
         let head = held(d).await;
-        d.issue_accord_nonce(accord, nonce).await.unwrap();
         let proposal = AccordProposal {
             family_key_id: accord.to_owned(),
             action: AccordAction::RosterChange,

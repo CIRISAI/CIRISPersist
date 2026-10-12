@@ -1743,7 +1743,7 @@ mod tests {
         // visible one-line diff, which is the same discipline the FFI taxonomy
         // and the CC 3.1.9.2 prose-rule count are held to.
         // One number, stated once: the message reads it, so it cannot go stale.
-        const EXPECTED: usize = 172;
+        const EXPECTED: usize = 188;
         assert_eq!(
             checked, EXPECTED,
             "checked {checked} version-pinned persist src/ rows, expected {EXPECTED}. \
@@ -1922,7 +1922,9 @@ mod tests {
             let mut i = 0usize;
             while i < lines.len() {
                 let s = lines[i].trim_start();
-                if s.starts_with("#[cfg(test)]") || s.starts_with("#[cfg(any(test") {
+                // v54.1.0 (#1026): `#[cfg(all(test, …))]` is test-only too;
+                // missing it counted a test module's call as a NON-test caller.
+                if crate::test_cfg::is_test_only_cfg(s) || s.starts_with("#[cfg(any(test") {
                     let mut j = i;
                     while j < lines.len() && !lines[j].contains('{') {
                         j += 1;

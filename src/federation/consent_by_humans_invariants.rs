@@ -458,6 +458,46 @@ pub(crate) mod bodies {
         assert_eq!(by(agent.clone(), t3.clone()).await, Granted, "I95: the SAME steward re-granting newer than its own revoke → Granted (latest-wins within one principal)");
     }
 
+    /// **I829** (v54.1.0, Codex round 4 on PR #1057) — a hard-deleted grant
+    /// stops authorising: the steward's grant FOR the node projects into
+    /// `consent_peer_set_for`; after the attestation's hard delete and
+    /// `purge_attestation_projections` (the sequence `purge_finalize` and the
+    /// reaper run) `consent_peers_by_principals` no longer names the peer.
+    pub async fn i829_a_deleted_grant_stops_authorising(d: &dyn FederationDirectory, s: &str) {
+        let (alice, node, p1) = (
+            format!("i829-alice-{s}"),
+            format!("i829-node-{s}"),
+            format!("i829-p1-{s}"),
+        );
+        ts::register_identity_key(d, &alice, USER).await;
+        ts::register_identity_key(d, &node, NODE).await;
+        put(
+            d,
+            ts::owner_binding_attestation(&format!("i829-ob-{s}"), &alice, &node),
+        )
+        .await
+        .unwrap();
+        let gid = format!("i829-g-{s}");
+        put(d, grant(&gid, &alice, &p1, Some(&node))).await.unwrap();
+        assert_eq!(
+            cbh::consent_peers_by_principals(d, &node).await.unwrap(),
+            vec![p1.clone()],
+            "I829 control: the steward's grant names the node's peer"
+        );
+        assert!(
+            d.purge_attestation_v31(&gid).await.unwrap(),
+            "the grant is hard-deleted"
+        );
+        d.purge_attestation_projections(&gid).await.unwrap();
+        assert!(
+            cbh::consent_peers_by_principals(d, &node)
+                .await
+                .unwrap()
+                .is_empty(),
+            "I829: a hard-deleted grant no longer authorises its peer"
+        );
+    }
+
     /// **I96** — the peer set by principals: own peers ∪ the steward's grants
     /// that NAME the machine; a grant for a sibling contributes nothing.
     pub async fn i96_consent_peers_by_principals(d: &dyn FederationDirectory, s: &str) {
@@ -590,6 +630,11 @@ mod run {
                 async fn i96() {
                     let Some(b) = $fresh.await else { return };
                     bodies::i96_consent_peers_by_principals(&b, &super::suffix()).await
+                }
+                #[tokio::test]
+                async fn i829() {
+                    let Some(b) = $fresh.await else { return };
+                    bodies::i829_a_deleted_grant_stops_authorising(&b, &super::suffix()).await
                 }
                 #[tokio::test]
                 async fn i96b() {
@@ -740,9 +785,22 @@ mod run {
         const ADM: &str = include_str!("admission.rs");
         const MODULE: &str = include_str!("consent_by_humans.rs");
         const PYO3: &str = include_str!("../ffi/pyo3.rs");
+        // v54.1.0 (#1041) — `steward_bindings_of` is the key set of
+        // `steward_binding_paths_of`, which carries the walk's body.
+        {
+            let body = ADM
+                .split("pub async fn steward_bindings_of(")
+                .nth(1)
+                .expect("steward_bindings_of");
+            let body = &body[..body.find("\n}\n").expect("fn end")];
+            assert!(
+                body.contains("steward_binding_paths_of("),
+                "I94 (b): steward_bindings_of is the labelled walk's key set"
+            );
+        }
         for f in [
             "pub async fn is_steward_bound(",
-            "pub async fn steward_bindings_of(",
+            "pub async fn steward_binding_paths_of(",
             "pub async fn steward_binding_chain(",
         ] {
             let body = ADM.split(f).nth(1).expect(f);

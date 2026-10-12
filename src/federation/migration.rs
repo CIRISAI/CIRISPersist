@@ -496,6 +496,13 @@ pub enum ExclusionClass {
     Slashing,
     /// `objection:*` — reverse-quorum objections, dismissals and ballots.
     Objection,
+    /// v54.1.0 (CIRISPersist#1054) — the accountability record
+    /// ([`ACCOUNTABILITY_RECORD_PREFIXES`]) that no prefix class above
+    /// reaches: `key:revocation` and `moderation_track_record:*`. Matched by
+    /// [`accountability_record_family`], the list the steward purge reads too,
+    /// so the two doors cannot drift; its own `revocation:`, `moderation:` and
+    /// `slashing:` entries resolve to the narrower classes above first.
+    AccountabilityRecord,
     /// **The dimension could not be read** — absent, or not a string.
     ///
     /// FAIL-SECURE, and the polarity is the whole point: this predicate asks
@@ -510,7 +517,7 @@ impl ExclusionClass {
     /// Every class, in declaration order. The gate iterates this; its LENGTH is
     /// compiler-checked against the variant set by
     /// [`tests::every_exclusion_class_is_reachable_and_declared`].
-    pub const ALL: [ExclusionClass; 9] = [
+    pub const ALL: [ExclusionClass; 10] = [
         ExclusionClass::StructuralComposer,
         ExclusionClass::Delegation,
         ExclusionClass::Revocation,
@@ -519,6 +526,7 @@ impl ExclusionClass {
         ExclusionClass::Reconsideration,
         ExclusionClass::Slashing,
         ExclusionClass::Objection,
+        ExclusionClass::AccountabilityRecord,
         ExclusionClass::UnreadableDimension,
     ];
 
@@ -528,7 +536,11 @@ impl ExclusionClass {
     #[must_use]
     pub const fn dimension_prefix(self) -> Option<&'static str> {
         match self {
-            Self::StructuralComposer | Self::Delegation | Self::UnreadableDimension => None,
+            // AccountabilityRecord is the shared list's predicate, not one prefix.
+            Self::StructuralComposer
+            | Self::Delegation
+            | Self::UnreadableDimension
+            | Self::AccountabilityRecord => None,
             // The #650 audit's finding: PREFIX, never `==`. A versioned leaf
             // (`:v2`) and a sibling leaf (`revocation:partner:fraud`) are the
             // same class and must inherit the same protection.
@@ -563,6 +575,10 @@ impl ExclusionClass {
             Self::Reconsideration => "a §11.10 reconsideration / review report",
             Self::Slashing => "a slashing outcome",
             Self::Objection => "a reverse-quorum objection, dismissal or ballot",
+            Self::AccountabilityRecord => {
+                "the accountability record (`key:revocation`, `moderation_track_record:*`), \
+                 never purgeable by the root or anyone (CLM-accountability-record-unpurgeable)"
+            }
             Self::UnreadableDimension => {
                 "the row's `dimension` is absent or not a string, so this predicate cannot tell \
                  what it is. It asks whether the row is too dangerous to delete, and an \
@@ -570,6 +586,56 @@ impl ExclusionClass {
             }
         }
     }
+}
+
+/// CLM-accountability-record-unpurgeable (CIRISConstitution rc8@8c8f536) —
+/// the dimension families the text names EXACTLY as the accountability record
+/// no purge may reach, "by the root or anyone". ONE list, read by both purge
+/// doors (CIRISPersist#1054): the reset door through [`is_exclusion_bearing`]
+/// ([`ExclusionClass::AccountabilityRecord`]) and the steward purge
+/// (`steward_purge`'s retraction check). Two lists drifted once: the steward
+/// purge refused `key:revocation` and `moderation_track_record:*` while this
+/// door, matching [`ExclusionClass`] prefixes only, deleted them.
+pub const ACCOUNTABILITY_RECORD_PREFIXES: &[&str] = &[
+    "revocation:",
+    "key:revocation",
+    "moderation:",
+    "moderation_track_record:",
+    "slashing:",
+];
+
+/// The accountability family `dimension` belongs to, if any
+/// ([`ACCOUNTABILITY_RECORD_PREFIXES`]).
+#[must_use]
+pub fn accountability_record_family(dimension: &str) -> Option<&'static str> {
+    ACCOUNTABILITY_RECORD_PREFIXES
+        .iter()
+        .copied()
+        .find(|p| dimension.starts_with(p))
+}
+
+/// v54.1.0 (Codex on PR #1057) — [`accountability_record_family`] as a SQL
+/// predicate over the text column `column` (the generated `dimension` column
+/// of `federation_attestations`), rendered FROM
+/// [`ACCOUNTABILITY_RECORD_PREFIXES`] so the serve read and the purge delete
+/// door ask the one list, never a second spelling of it. `substr` is a prefix
+/// test with no pattern syntax to escape (a LIKE would read the `_` in
+/// `moderation_track_record:` as a wildcard), the same in SQLite and Postgres;
+/// a NULL column is not an accountability record (`COALESCE` to false, as the
+/// Rust predicate answers `None` for a row with no dimension).
+#[must_use]
+pub fn accountability_record_sql(column: &str) -> String {
+    let arms: Vec<String> = ACCOUNTABILITY_RECORD_PREFIXES
+        .iter()
+        .map(|p| {
+            format!(
+                "substr({column}, 1, {}) = '{}'",
+                p.chars().count(),
+                p.replace('\'', "''")
+            )
+        })
+        .collect();
+    format!("COALESCE(({}), FALSE)", arms.join(" OR "))
 }
 
 /// **The rows that carry an EXCLUSION — never purged.**
@@ -600,10 +666,15 @@ pub fn is_exclusion_bearing(row: &Attestation) -> Option<ExclusionClass> {
     let Some(dimension) = super::admission::envelope_dimension(&row.attestation_envelope) else {
         return Some(ExclusionClass::UnreadableDimension);
     };
-    ExclusionClass::ALL.into_iter().find(|c| {
-        c.dimension_prefix()
-            .is_some_and(|p| dimension.starts_with(p))
-    })
+    ExclusionClass::ALL
+        .into_iter()
+        .find(|c| {
+            c.dimension_prefix()
+                .is_some_and(|p| dimension.starts_with(p))
+        })
+        .or_else(|| {
+            accountability_record_family(dimension).map(|_| ExclusionClass::AccountabilityRecord)
+        })
 }
 
 /// v31.0.0 (CIRISPersist#650) — **the purge door's own gate.**
@@ -2100,6 +2171,12 @@ mod tests {
                     "k",
                     attestation_type::SCORES,
                     env("objection:dismissed:v1", None),
+                ),
+                ExclusionClass::AccountabilityRecord => row(
+                    "p",
+                    "k",
+                    attestation_type::SCORES,
+                    env("moderation_track_record:ciris-canonical:v1", None),
                 ),
             };
             let got = is_exclusion_bearing(&probe).unwrap_or_else(|| {

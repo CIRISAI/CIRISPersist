@@ -6042,7 +6042,8 @@ impl PyEngine {
                         | IngestError::Scrub(_)
                         | IngestError::ScrubTreatmentMismatch { .. }
                         | IngestError::ScopeRefused(_)
-                        | IngestError::PipelineInvariant { .. } => Err(match detail {
+                        | IngestError::PipelineInvariant { .. }
+                        | IngestError::TraceRefused { .. } => Err(match detail {
                             Some(d) => PyValueError::new_err((kind, d)),
                             None => PyValueError::new_err(kind),
                         }),
@@ -6379,6 +6380,12 @@ impl PyEngine {
     /// / downgrade / re-scrub / conflicting version / unverifiable scrub /
     /// unowned or ambiguous owner — fail-closed, row untouched). Refusals
     /// are outcomes, not exceptions, so an apply loop stays total.
+    /// v54.1.0: `{"refused":{"reason":"attester_key_unknown"}}` is the
+    /// RETRYABLE ordering gap (the scrubber's Key row has not landed here;
+    /// re-offer after the key plane, CIRISPersist#1042) — the Insert arm used
+    /// to raise it as a bare ValueError; `unverifiable_signature` is terminal;
+    /// `"invalid_replaced"` means a stored record that failed verification was
+    /// replaced by this one (same pubkeys, same claim, CIRISPersist#1044).
     fn apply_replicated_key_record(
         &self,
         py: Python<'_>,
@@ -6431,6 +6438,8 @@ impl PyEngine {
     /// `Engine::rebind_key_record`. `signed_key_record_json` is the holder's
     /// self-signed re-signing of a registration this node already holds.
     /// Returns the canonical JSON of `RebindOutcome`: `{"outcome":"rebound"}`,
+    /// `{"outcome":"invalid_replaced"}` (v54.1.0, CIRISPersist#1044: the
+    /// stored record failed verification and was replaced by this one),
     /// `{"outcome":"unchanged"}`, or `{"outcome":"refused","reason":…}` with
     /// the plan's typed reason (`not_self_signed`, `record_absent`,
     /// `rebind_changes_record`, `pubkey_swap`, `unverifiable_signature`,
@@ -11879,7 +11888,9 @@ impl PyEngine {
 
     /// #302 — admit an `accord_proposal`. `payload_json` =
     /// `{ "proposal": <AccordProposal>, "authority_signature": <obj|null> }`.
-    /// M4 fail-closed on an unissued nonce.
+    /// v54.1.0 (CIRISPersist#1047) — the nonce is the proposer's; a different
+    /// proposal reusing a nonce already used in its family is refused
+    /// (`federation_conflict`, ValueError).
     fn put_accord_proposal_json(&self, py: Python<'_>, payload_json: &str) -> PyResult<()> {
         self.ensure_usable()?;
         catch_panic(|| {
@@ -12147,51 +12158,6 @@ impl PyEngine {
                     runtime,
                     b,
                     b.clear_active_halt(&fam, &halt)
-                        .await
-                        .map_err(federation_err_to_py)
-                )
-            })
-        })
-    }
-
-    /// #302 (M4) — record a server-issued proposal nonce.
-    fn issue_accord_nonce(&self, py: Python<'_>, family_key_id: &str, nonce: &str) -> PyResult<()> {
-        self.ensure_usable()?;
-        catch_panic(|| {
-            let runtime = self.runtime.clone();
-            let fam = family_key_id.to_owned();
-            let n = nonce.to_owned();
-            py.detach(move || {
-                accord_dispatch!(
-                    self,
-                    runtime,
-                    b,
-                    b.issue_accord_nonce(&fam, &n)
-                        .await
-                        .map_err(federation_err_to_py)
-                )
-            })
-        })
-    }
-
-    /// #302 (M4) — has `(family_key_id, nonce)` been issued?
-    fn accord_nonce_issued(
-        &self,
-        py: Python<'_>,
-        family_key_id: &str,
-        nonce: &str,
-    ) -> PyResult<bool> {
-        self.ensure_usable()?;
-        catch_panic(|| {
-            let runtime = self.runtime.clone();
-            let fam = family_key_id.to_owned();
-            let n = nonce.to_owned();
-            py.detach(move || {
-                accord_dispatch!(
-                    self,
-                    runtime,
-                    b,
-                    b.accord_nonce_issued(&fam, &n)
                         .await
                         .map_err(federation_err_to_py)
                 )
@@ -13901,6 +13867,145 @@ impl PyEngine {
                     })
                 }
             })
+        })
+    }
+
+    /// v54.1.0 (CIRISPersist#1046, CSD-108) — **dry run** a steward purge.
+    /// `selection_json` is a tagged selection: `{"kind": "by_actor",
+    /// "key_id": …}`, `{"kind": "by_ids", "ids": ["attestation:…", …]}`,
+    /// `{"kind": "mock_model_traces", "model": "mock-model"}` (#1040) or
+    /// `{"kind": "refused_today"}` (#1043). Returns the JSON `PurgeDryRun`:
+    /// per-table counts, the selection digest the notice must name, the first
+    /// 20 record ids in JCS order, what a class withheld, the ledger TSV and
+    /// the notice template to cosign. Writes nothing.
+    fn purge_dry_run_json(&self, py: Python<'_>, selection_json: &str) -> PyResult<String> {
+        self.ensure_usable()?;
+        let selection: crate::federation::steward_purge::PurgeSelection =
+            serde_json::from_str(selection_json)
+                .map_err(|e| PyValueError::new_err(format!("purge selection_json: {e}")))?;
+        self.purge_engine_call(py, move |engine| async move {
+            engine.purge_dry_run(&selection).await
+        })
+    }
+
+    /// v54.1.0 (CIRISPersist#1046, CIRISConstitution#165) — **execute** a
+    /// steward purge. `notice_json` is `{"envelope": {…takedown_notice…},
+    /// "cosignatures": [ThresholdSignature, …]}`, every cosignature over the
+    /// envelope's JCS bytes (`purge_notice_signing_payload_json`). Refuses
+    /// with a `ValueError(token, body_json)`: `purge_unauthorised`,
+    /// `purge_selection_count_mismatch` `{table, expected, found}`,
+    /// `purge_selection_digest_mismatch`, `purge_retraction_inadmissible`
+    /// `{record_id, plane, index, total}`. There is no override. Tombstones
+    /// only; returns the JSON `PurgeReport`.
+    fn purge_rows_json(
+        &self,
+        py: Python<'_>,
+        selection_json: &str,
+        notice_json: &str,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        let selection: crate::federation::steward_purge::PurgeSelection =
+            serde_json::from_str(selection_json)
+                .map_err(|e| PyValueError::new_err(format!("purge selection_json: {e}")))?;
+        let notice: crate::federation::steward_purge::StewardPurgeNotice =
+            serde_json::from_str(notice_json)
+                .map_err(|e| PyValueError::new_err(format!("purge notice_json: {e}")))?;
+        self.purge_engine_call(py, move |engine| async move {
+            engine.purge_rows(&selection, &notice).await
+        })
+    }
+
+    /// v54.1.0 (CIRISPersist#1046) — the bytes a founder cosigns for a purge
+    /// notice and the notice id they hash to: `{"signing_bytes_b64": …,
+    /// "notice_id": …}`. The notice id is `sha256(JCS(envelope))`.
+    fn purge_notice_signing_payload_json(&self, envelope_json: &str) -> PyResult<String> {
+        let envelope: serde_json::Value = serde_json::from_str(envelope_json)
+            .map_err(|e| PyValueError::new_err(format!("purge envelope_json: {e}")))?;
+        let bytes = crate::federation::steward_purge::notice_signing_bytes(&envelope)
+            .map_err(federation_err_to_py)?;
+        use base64::Engine as _;
+        use sha2::Digest as _;
+        Ok(serde_json::json!({
+            "signing_bytes_b64": base64::engine::general_purpose::STANDARD.encode(&bytes),
+            "notice_id": hex::encode(sha2::Sha256::digest(&bytes)),
+        })
+        .to_string())
+    }
+
+    /// v54.1.0 (CIRISPersist#1046) — a purge's state on this node's clock
+    /// (`incomplete` / `executed` / `settled` / `finalized`), its settle
+    /// instant, its tombstone counts and the `voided` record ids. `ValueError(purge_notice_unknown, …)` for a notice
+    /// this node never executed or applied.
+    fn purge_status_json(&self, py: Python<'_>, notice_id: &str) -> PyResult<String> {
+        self.ensure_usable()?;
+        let notice_id = notice_id.to_owned();
+        self.purge_engine_call(py, move |engine| async move {
+            engine.purge_status(&notice_id).await
+        })
+    }
+
+    /// v54.1.0 (CIRISPersist#1046, CSD-108 §6 Q4) — **finalize**: hard-delete
+    /// an executed purge's records after the retraction round settled, judged
+    /// on THIS node's clock (no caller instant: Codex round 2 on PR #1057).
+    /// `ValueError(purge_not_settled, …)` before it. Idempotent. Returns the
+    /// JSON `FinalizeReport`.
+    fn purge_finalize_json(&self, py: Python<'_>, notice_id: &str) -> PyResult<String> {
+        self.ensure_usable()?;
+        let notice_id = notice_id.to_owned();
+        self.purge_engine_call(py, move |engine| async move {
+            engine.purge_finalize(&notice_id).await
+        })
+    }
+
+    /// v54.1.0 (CIRISPersist#1046) — the executed purge's ledger as TSV (for
+    /// `evidence/purges/<date>-<selection-digest>.tsv`): a header carrying the
+    /// digest, notice id, claimant, count, actor and instant, then one row per
+    /// record in JCS order. Returned as a JSON string.
+    fn purge_ledger_tsv(&self, py: Python<'_>, notice_id: &str) -> PyResult<String> {
+        self.ensure_usable()?;
+        let notice_id = notice_id.to_owned();
+        self.purge_engine_call(py, move |engine| async move {
+            engine.purge_ledger_tsv(&notice_id).await
+        })
+    }
+
+    /// v54.1.0 (CIRISPersist#1046, CIRISConstitution#165 §3) — **serve** the
+    /// purge tombstone plane: a JSON array of `PurgeBundle` (notice, whole
+    /// cosignature set, record ids — never content) since the
+    /// `(since_iso, since_notice_id)` cursor.
+    #[pyo3(signature = (limit, since_iso=None, since_notice_id=None))]
+    fn list_purge_bundles_since_json(
+        &self,
+        py: Python<'_>,
+        limit: u32,
+        since_iso: Option<&str>,
+        since_notice_id: Option<&str>,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        let since = match (since_iso, since_notice_id) {
+            (Some(t), Some(id)) => Some((purge_cursor_instant(t)?, id.to_owned())),
+            (None, None) => None,
+            _ => {
+                return Err(PyValueError::new_err(
+                    "list_purge_bundles_since_json: since_iso and since_notice_id go together",
+                ))
+            }
+        };
+        self.purge_engine_call(py, move |engine| async move {
+            engine.list_purge_bundles_since(since, limit).await
+        })
+    }
+
+    /// v54.1.0 (CIRISPersist#1046) — **apply** a peer's purge bundle: the
+    /// notice is re-verified against THIS node's trust root and the digest
+    /// re-derived from the ids before any tombstone lands. Deletes nothing.
+    fn apply_replicated_purge_json(&self, py: Python<'_>, bundle_json: &str) -> PyResult<String> {
+        self.ensure_usable()?;
+        let bundle: crate::federation::steward_purge::PurgeBundle =
+            serde_json::from_str(bundle_json)
+                .map_err(|e| PyValueError::new_err(format!("purge bundle_json: {e}")))?;
+        self.purge_engine_call(py, move |engine| async move {
+            engine.apply_replicated_purge(&bundle).await
         })
     }
 
@@ -25921,6 +26026,55 @@ impl PyEngine {
         })
     }
 
+    /// v54.1.0 (CIRISPersist#1041) — [`Self::capacity_consent_stance`] WITH
+    /// the consent basis: the rows the stance rests on, so a scorer can record
+    /// them in its capacity envelope's `evidence_refs`. Returns JSON
+    /// `{"state": "granted"|"revoked"|"expired"|"unspecified", "basis":
+    /// {"rows": [{"principal": str, "paths": ["subject"|"occurrence_of"|
+    /// "delegates_to", ...], "attestation_id": str}, ...]}}`. `rows` is empty
+    /// exactly when the state is `unspecified`. Same arguments and errors as
+    /// `capacity_consent_stance`. FFI mirror of
+    /// [`Engine::capacity_consent_stance_with_basis`](crate::Engine::capacity_consent_stance_with_basis).
+    #[pyo3(signature = (attester_key_id, subject_key_id, family, now_iso = None))]
+    fn capacity_consent_stance_with_basis(
+        &self,
+        py: Python<'_>,
+        attester_key_id: &str,
+        subject_key_id: &str,
+        family: &str,
+        now_iso: Option<&str>,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let now = match now_iso {
+                Some(v) => chrono::DateTime::parse_from_rfc3339(v)
+                    .map(|t| t.with_timezone(&chrono::Utc))
+                    .map_err(|e| PyValueError::new_err(format!("now_iso parse: {e}")))?,
+                None => chrono::Utc::now(),
+            };
+            let family = crate::federation::admission::ConsentGatedFamily::from_token(family)
+                .ok_or_else(|| {
+                    PyValueError::new_err(format!(
+                        "unknown consent-gated family {family:?}; known: {:?}",
+                        crate::federation::admission::ConsentGatedFamily::ALL
+                            .iter()
+                            .map(|f| f.as_str())
+                            .collect::<Vec<_>>()
+                    ))
+                })?;
+            let (a, sub) = (attester_key_id.to_owned(), subject_key_id.to_owned());
+            let engine = self.hold_engine_view();
+            py.detach(move || {
+                let (state, basis) = self
+                    .runtime
+                    .block_on(engine.capacity_consent_stance_with_basis(&a, &sub, family, now))
+                    .map_err(federation_err_to_py)?;
+                serde_json::to_string(&serde_json::json!({ "state": state, "basis": basis }))
+                    .map_err(|e| PyRuntimeError::new_err(format!("serialize: {e}")))
+            })
+        })
+    }
+
     /// v44.8.0 (CIRISPersist#866 C1b) — `resolve_scoped_consent_by_principals`
     /// WITH its bound. Returns JSON `{"state": "granted"|"revoked"|"expired"|
     /// "unspecified", "retain_until": <RFC-3339>|null}`: `retain_until` is the
@@ -34314,6 +34468,47 @@ fn outcome_to_py<'py>(
         .map_err(|e| PyRuntimeError::new_err(format!("outcome is not an object: {e}")))
 }
 
+/// v54.1.0 (CIRISPersist#1046) — parse the purge bundle serve cursor's
+/// instant. A CURSOR, never a judging instant: no purge door takes a caller's
+/// `now` (Codex round 2 on PR #1057).
+fn purge_cursor_instant(since_iso: &str) -> PyResult<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::parse_from_rfc3339(since_iso)
+        .map(|t| t.with_timezone(&chrono::Utc))
+        .map_err(|e| PyValueError::new_err(format!("purge since_iso parse: {e}")))
+}
+
+impl PyEngine {
+    /// v54.1.0 (CIRISPersist#1046) — run one steward-purge door on an
+    /// `Engine` composed over this handle's backend and signers (the
+    /// cohabitation pattern), and JSON-encode its result.
+    fn purge_engine_call<T, F, Fut>(&self, py: Python<'_>, call: F) -> PyResult<String>
+    where
+        T: serde::Serialize,
+        F: FnOnce(crate::Engine) -> Fut + Send,
+        Fut: std::future::Future<Output = Result<T, crate::federation::Error>> + Send,
+    {
+        catch_panic(|| {
+            let backend = match &self.backend {
+                #[cfg(feature = "postgres")]
+                BackendDispatch::Postgres(b) => crate::engine::BackendDispatch::Postgres(b.clone()),
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(b) => crate::engine::BackendDispatch::Sqlite(b.clone()),
+            };
+            let signer = self.signer.clone();
+            let local_signer = self.local_signer.clone();
+            let runtime = self.runtime.clone();
+            py.detach(move || {
+                let engine = crate::Engine::from_shared_with_local(backend, signer, local_signer);
+                runtime.block_on(async move {
+                    let out = call(engine).await.map_err(federation_err_to_py)?;
+                    serde_json::to_string(&out)
+                        .map_err(|e| PyRuntimeError::new_err(format!("purge JSON encode: {e}")))
+                })
+            })
+        })
+    }
+}
+
 fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
     let kind = e.kind();
     tracing::warn!(error = %e, kind = kind, "federation error");
@@ -34321,6 +34516,22 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         // Caller-fault → ValueError (4xx).
         crate::federation::Error::InvalidArgument(_)
         | crate::federation::Error::SignatureInvalid(_) => PyValueError::new_err(kind),
+        // v54.1.0 (CIRISPersist#1042) — the ordering gap keeps the Python
+        // type of the arm it was split from (`SignatureInvalid` /
+        // `FederationTierUnverified`, both ValueError); the KIND tells a
+        // retryable `federation_attester_key_unknown` apart.
+        crate::federation::Error::AttesterKeyUnknown { .. } => PyValueError::new_err(kind),
+        // v54.1.0 (CIRISPersist#1042 follow-up) — split from `SignatureInvalid`
+        // (ValueError), so it keeps that type; the KIND
+        // (`federation_signer_not_acting_for`) marks it retryable.
+        crate::federation::Error::SignerDoesNotActFor { .. } => PyValueError::new_err(kind),
+        // v54.1.0 (CIRISPersist#1042 follow-up C) — typed out of
+        // `InvalidArgument` / `Conflict` (both ValueError); same type, and the
+        // licensure reason token rides with the kind.
+        crate::federation::Error::LicensureDelegatorNotAuthority { reason, .. } => {
+            PyValueError::new_err(format!("{kind}: {reason}"))
+        }
+        crate::federation::Error::AccordProposalNonceReused { .. } => PyValueError::new_err(kind),
         // Conflict → ValueError too; lens-side maps to 409.
         crate::federation::Error::Conflict(_) => PyValueError::new_err(kind),
         // v2.4.0 (CIRISPersist#102 Ask 3) — admission-gate rejections
@@ -34649,6 +34860,12 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         // cannot be admitted-to / continue federating. A caller/state admission
         // refusal (fail-secure), like the other admission gates → ValueError (4xx).
         crate::federation::Error::CommunityHasNoModerator { .. } => PyValueError::new_err(kind),
+        // v54.1.0 (CIRISPersist#1046) — a steward purge refusal: the token is
+        // the stable reason id (`e.args[0]`), the typed body its JSON detail
+        // (`e.args[1]`) — CIRISServer#756 renders both. Caller/state → 4xx.
+        crate::federation::Error::PurgeRefused { token, body } => {
+            PyValueError::new_err((token, body.to_string()))
+        }
         // Server-fault → RuntimeError (5xx).
         crate::federation::Error::Backend(_) => PyRuntimeError::new_err(kind),
         // v11.8.1 (CIRISPersist#329) — the directory-ops proxy was asked
@@ -34938,6 +35155,11 @@ fn blob_err_to_py(e: crate::federation::BlobError) -> PyErr {
         // RuntimeError (the SealDidNotOpen precedent); the token is what a host
         // keys on, the sha says which blob.
         crate::federation::BlobError::Withdrawn { ref sha256_hex, .. } => {
+            PyRuntimeError::new_err(withdrawn_message(kind, sha256_hex))
+        }
+        // v54.1.0 (Codex round 3 on PR #1057) — a purge-tombstoned blob: the
+        // `Withdrawn` shape (a refusal after authorization, token + sha).
+        crate::federation::BlobError::Purged { ref sha256_hex, .. } => {
             PyRuntimeError::new_err(withdrawn_message(kind, sha256_hex))
         }
         // v43.0.0 (I17) — a rotation landed mid-write; the cascade re-seals,
@@ -38302,7 +38524,28 @@ mod tests {
         let stripped = strip_rust_noise(raw);
         let s: Vec<char> = stripped.chars().collect();
 
-        let test_mods = spans_of(&s, &stripped, "#[cfg(test)]\nmod ");
+        // v54.1.0 (#1026): a test module is one whose attribute line is
+        // test-only by `crate::test_cfg` (`#[cfg(all(test, …))]` too), not
+        // only the literal `#[cfg(test)]\nmod `.
+        let test_mods: Vec<(usize, usize)> = {
+            let mut v = Vec::new();
+            let lines: Vec<&str> = stripped.split('\n').collect();
+            let mut line_start = 0usize;
+            for (k, line) in lines.iter().enumerate() {
+                let next = lines.get(k + 1).map_or("", |l| l.trim_start());
+                let is_mod = ["mod ", "pub mod ", "pub(crate) mod ", "pub(super) mod "]
+                    .iter()
+                    .any(|m| next.starts_with(m));
+                if is_mod && crate::test_cfg::is_test_only_cfg(line) {
+                    let at = stripped[..line_start].chars().count();
+                    if let Some(off) = s[at..].iter().position(|c| *c == '{') {
+                        v.push((at, match_brace(&s, at + off)));
+                    }
+                }
+                line_start += line.len() + 1;
+            }
+            v
+        };
         // A detach span runs to the matching CLOSE PAREN of `.detach(`, not to
         // some following brace: `py.detach(|| runtime.block_on(x))` has no
         // block at all, and brace-matching there would swallow an unrelated
@@ -39738,6 +39981,7 @@ mod verify_trace_canon_parity_class {
             signature_ml_dsa_65: None,
             pubkey_ml_dsa_65: None,
             pqc_key_id: None,
+            run_kind: None,
         }
     }
 

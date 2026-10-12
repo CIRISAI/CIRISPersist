@@ -780,11 +780,27 @@ pub(crate) fn seal_aad_at_nonce(
 /// place the read doors ask the tombstone fold. Sits AFTER authorization on
 /// every viewer door (whole-blob, range, and the serve door has no viewer),
 /// so the refusal is told only to a viewer who could have read the bytes.
+///
+/// v54.1.0 (Codex round 3 on PR #1057) — and the ONE place they ask the
+/// steward purge plane: a purge-tombstoned blob, or a sealed-DAG chunk whose
+/// every manifest is, is [`BlobError::Purged`](crate::federation::BlobError::Purged)
+/// from EXECUTION onward ([`steward_purge::purge_withheld`](crate::federation::steward_purge::purge_withheld)).
+/// Finalization still waits for the settle; serving does not.
 pub(crate) async fn refuse_if_withdrawn(
     directory: &dyn crate::federation::FederationDirectory,
     at_rest_sha256: &[u8; 32],
 ) -> Result<(), crate::federation::BlobError> {
     use crate::federation::blob_tombstone::{binding_state, BindingState};
+    if let Some(notice_id) =
+        crate::federation::steward_purge::purge_withheld(directory, at_rest_sha256)
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(format!("purge plane: {e}")))?
+    {
+        return Err(crate::federation::BlobError::Purged {
+            sha256_hex: hex::encode(at_rest_sha256),
+            notice_id,
+        });
+    }
     match binding_state(directory, at_rest_sha256)
         .await
         .map_err(|e| crate::federation::BlobError::Backend(format!("tombstone fold: {e}")))?

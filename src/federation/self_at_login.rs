@@ -879,7 +879,9 @@ pub(crate) mod test_support {
             })
             .await
             .expect_err("a peer's route assertion for a victim must be rejected");
-        assert_eq!(err.kind(), "federation_signature_invalid");
+        // v54.1.0 (#1042 follow-up) — the signature verifies; mallory is not
+        // (yet) an occurrence of alice: the signer-acts-for refusal, typed.
+        assert_eq!(err.kind(), "federation_signer_not_acting_for");
 
         // (5) Divergent typed projection (envelope says d1, typed claims
         // attacker-dest) → Err.

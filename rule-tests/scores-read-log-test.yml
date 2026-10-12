@@ -1,0 +1,11 @@
+id: scores-read-log
+valid:
+  - |
+    fn list_scores_v2() { log_scores_read(x); }
+  - |
+    fn list_scores() { /* log_scores_read(x); */ }
+invalid:
+  - |
+    fn list_scores() { log_scores_read(a); }
+  - |
+    fn resolve_scores() { crate::audit::log_scores_read(b); }

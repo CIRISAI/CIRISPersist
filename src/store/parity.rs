@@ -121,7 +121,6 @@ pub(crate) enum Class {
 ///   anything is stored. Classified by what they do, not what they are called.
 #[cfg(test)]
 pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
-    ("accord_nonce_issued", Class::Delegates),
     // v46.3.0 (#884) — `minter_of_blob`'s community arm IS the #876 read
     // (`community_dek_blob_epoch`, another door): its answer is the binding's
     // minter, no refusal of the caller's input here.
@@ -363,6 +362,29 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // v54.0.0 (CIRISPersist#1034, CC 4.4.3.2.8) — refuses a community record
     // whose declared cohort or affiliation config is malformed or invalid.
     ("check_community_record", Class::Gate),
+    // v54.1.0 (CIRISPersist#1046, #1040) — Gates on the attestation put: a
+    // tombstoned record is refused so a purge cannot be undone by a re-put
+    // (`purge_tombstoned`), and a federation-tier trace attestation whose
+    // signed `run_kind` is `mock` is refused (`trace_run_kind_mock`, CC 3.1.5).
+    // Both are statements about the caller's row.
+    ("refuse_if_tombstoned_attestation", Class::Gate),
+    ("refuse_mock_trace_attestation", Class::Gate),
+    // v54.1.0 (Codex on PR #1057) — Gate: the purge header door refuses a
+    // tombstone set that is not exactly the header's `record_count` rows of
+    // its own notice, so no backend stores a header with a partial set.
+    ("check_purge_put_set", Class::Gate),
+    // v54.1.0 (Codex round 3 on PR #1057) — Plumbing: the Art. 17 detection
+    // tombstone (NULL the linkage, stamp `erased_at`) both trace-removal doors
+    // run inside their transaction. A write; it refuses nothing about input.
+    ("sqlite_tombstone_detection_events", Class::Plumbing),
+    // v54.1.0 (Codex round 4 on PR #1057) — Plumbing: the accord proposal's
+    // IMMEDIATE transaction (the write lock before the held-digest read).
+    ("transaction_with_behavior", Class::Plumbing),
+    ("pg_tombstone_detection_events", Class::Plumbing),
+    // v54.1.0 (Codex round 4 sweep) — Plumbing: the orphaned thought-signature
+    // cleanup both trace-removal doors run in their transaction.
+    ("sqlite_drop_orphaned_thought_signatures", Class::Plumbing),
+    ("pg_drop_orphaned_thought_signatures", Class::Plumbing),
     ("check_skew_and_payment", Class::Gate),
     ("check_trace_dimension_admission", Class::Gate),
     ("check_trust_charter_admission", Class::Gate),
@@ -667,6 +689,17 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // v44.7.0 (#864) — the rebind store steps' shared pre-check: same pubkeys,
     // self-signed, claim byte-equal; refuses the write with `Conflict`.
     ("prepare_rebind", Class::Gate),
+    // v54.1.0 (#1044) — the invalid-replace store step's pre-check: the stored
+    // row fails verification, the incoming passes, same pubkeys and claim, a
+    // permitted signer, neither side role-gated; refuses with `Conflict`.
+    ("prepare_invalid_replace", Class::Gate),
+    // v54.1.0 (#1044) — the one guarded write the rebind and invalid-replace
+    // store steps share. Plumbing: every rule about the caller's record ran
+    // in `prepare_rebind` / `prepare_invalid_replace` before it; it fails only
+    // on the substrate's own terms — the stored row changed under the plan (a
+    // lost race, `Conflict`, re-offerable), or an encoding of the record it
+    // was handed.
+    ("write_replaced_key_registration", Class::Plumbing),
     ("prepare_sealed_manifest_row", Class::Plumbing),
     ("project_route", Class::Plumbing),
     // #846 — the chunk floor's one body; the write door and the adopt door
@@ -977,6 +1010,17 @@ pub(crate) const DECLARED_DIVERGENCES: &[DeclaredDivergence] = &[
                  there is nothing to decode and nothing that can be malformed. The admission \
                  door that refuses an unknown ENVELOPE token is shared by all three backends \
                  (I279).",
+    },
+    DeclaredDivergence {
+        trait_name: "FederationDirectory",
+        method: "list_key_registration_history",
+        backend: "memory",
+        expected: &[],
+        reason: "v54.1.0 (#1044) — `from_token` decodes the STORED `replacement_kind` TEXT column \
+                 (V186) on sqlite and postgres and refuses a token that is neither `rebind` nor \
+                 `invalid_replaced`. Memory stores the typed `KeyReplacementKind` enum and never \
+                 holds a token, so there is nothing to decode and nothing that can be malformed. \
+                 The V186 CHECK constrains the column to the two tokens on both dialects.",
     },
     DeclaredDivergence {
         trait_name: "FederationDirectory",

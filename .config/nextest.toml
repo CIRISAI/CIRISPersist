@@ -66,7 +66,10 @@ fail-fast = false
 # against a cluster with `max_connections = 400`; sixteen concurrent PG test
 # processes stay well inside it. The `#[serial_test::serial(postgres)]`
 # markers in the tree are inert under nextest (an in-process lock, one
-# process per test) and are left as documentation of the era they came from.
+# process per test). v54.1.0 (#1003): they still hold under `cargo test`, where
+# `test_pg::dsn()` gives every test of the one process the same database; the
+# 49 on tests that own their database or touch none are gone, and
+# rules/serial-keys.yml lists every remaining key with its reason.
 [test-groups.postgres]
 max-threads = 16
 
@@ -123,3 +126,17 @@ test-group = "postgres-shared"
 [[profile.default.overrides]]
 filter = 'test(/substrate_machine/)'
 slow-timeout = { period = "60s", terminate-after = 20 }
+
+# v54.1.0 (CIRISPersist#1051) — THE MUTATION RUN'S LEASH.
+#
+# `scripts/mutants.sh` runs the scope's witnesses under every mutant with
+# `--profile mutants`. A mutant that turns a loop infinite (record_read's
+# fold-mask loop: `&=` to `|=`, `-` to `+`, `-` to `/`) hung every witness
+# that read inside a fold until cargo-mutants' own 300 s timeout: three such
+# mutants cost 1049 s of the first nightly run's 7200 s budget, and the tool
+# credits a timeout to no witness. The slowest witness in the scopes takes
+# 7 s on a CI runner (postgres::i548c), so 60 s is honest headroom: a hung
+# witness is killed here and reads as that witness's FAIL.
+[profile.mutants]
+slow-timeout = { period = "20s", terminate-after = 3 }
+fail-fast = false

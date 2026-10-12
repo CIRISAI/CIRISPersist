@@ -202,7 +202,7 @@ done
 # The leg is skippable ONLY by CERTIFY_SKIP_PYTHON=1, and never silently — the
 # verdict table carries a SKIPPED line and the run stops claiming full
 # certification.
-ALL_KEYS="$LEGS default python fmt clippy pyi featmatrix wheelfeat docver pyo3sqlite dirdouble astgates weaver bitschanged floortoken$AXIS_KEYS"
+ALL_KEYS="$LEGS default python fmt clippy pyi featmatrix wheelfeat docver pyo3sqlite dirdouble astgates weaver bitschanged mutmatrix cachetrim evidencetsv floortoken$AXIS_KEYS"
 
 FOCUS_LEG=""; FOCUS_FILTER=""
 if [ "$MODE" = "focus" ]; then
@@ -221,6 +221,9 @@ CI_RUSTFLAGS="$(ci_rustflags)" || {
     echo "  Certifying with weaker flags than CI is how a green verdict lies." >&2
     exit 2; }
 export RUSTFLAGS="$CI_RUSTFLAGS"
+# v54.1.0 (CIRISPersist#1045 item 2) — 32 cores and 31 GB here: cargo at -j32
+# was reaped for memory three times during v53.2.0. An environment value wins.
+export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-6}"
 
 feature_csv() { ci_feature_csv "$1"; }
 needs_pg() { python3 scripts/ci_feature_matrix.py set "$1" | grep -qw postgres; }
@@ -575,6 +578,13 @@ run_bg weaver     scripts/weaver_check.sh
 # wheels and a local stub registry, offline, including the `ls | head -1`
 # mutant that registered a v29 wheel as v53.1.8.
 run_bg bitschanged scripts/bits_changed_test.sh
+# v54.1.0 (CIRISPersist#1045 item 4, #1051) — the mutation matrix's reader,
+# verdict and allow-list grammar, against fixture tool outputs (no cargo).
+run_bg mutmatrix  python3 scripts/mutants_matrix_test.py
+# v54.1.0 (CIRISPersist#1022) — the pre-save cache trim (fixture target/).
+run_bg cachetrim  python3 scripts/ci_cache_trim_test.py
+# v54.1.0 (CIRISPersist#1052) — the committed evidence tsv is the generated one.
+run_bg evidencetsv python3 scripts/evidence_tsv_test.py
 # v35.0.0 (CIRISPersist#710) — tested-wheel ⊇ shipped-wheel, and nobody
 # hand-spells a `maturin develop --features` list (here or in ci.yml).
 run_bg wheelfeat  python3 scripts/wheel_features.py check
@@ -615,7 +625,7 @@ wait
 # before the expensive legs dispatch, is the point of the fast stage: a compile
 # break under `--features cirisnode` alone should cost seconds, not the full
 # test matrix first.
-FAST_GATES="fmt pyi featmatrix wheelfeat docver pyo3sqlite dirdouble astgates weaver bitschanged floortoken$AXIS_KEYS"
+FAST_GATES="fmt pyi featmatrix wheelfeat docver pyo3sqlite dirdouble astgates weaver bitschanged mutmatrix cachetrim evidencetsv floortoken$AXIS_KEYS"
 
 # Every `.rc` this run produced must be claimed by a key someone reads. The log
 # directory is wiped at startup, so anything here was written by this run.

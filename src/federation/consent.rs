@@ -738,6 +738,22 @@ pub fn fold_scoped_stance_refs(
     scope: &str,
     qualifier: Option<&str>,
 ) -> ScopedStance {
+    fold_scoped_stance_refs_with_winner(rows, subject_key_id, now, scope, qualifier).0
+}
+
+/// v54.1.0 (CIRISPersist#1041) — [`fold_scoped_stance_refs`] WITH the row
+/// that decided it: the winner the fold kept, or `None` when no candidate
+/// remained (`Unspecified`). The one body the stance runs; the stance-only
+/// form above drops the winner, so a consent basis that names the governing
+/// row cannot disagree with the stance it explains.
+#[must_use]
+pub fn fold_scoped_stance_refs_with_winner<'a>(
+    rows: &[&'a super::Attestation],
+    subject_key_id: &str,
+    now: chrono::DateTime<chrono::Utc>,
+    scope: &str,
+    qualifier: Option<&str>,
+) -> (ScopedStance, Option<&'a super::Attestation>) {
     let (state, winner) = fold_winner(rows, subject_key_id, now, Some((scope, qualifier)));
     let retain_until = winner
         .and_then(|w| covering_token(w, scope, qualifier).map(|t| (w, t)))
@@ -748,10 +764,13 @@ pub fn fold_scoped_stance_refs(
         }
         _ => state,
     };
-    ScopedStance {
-        state,
-        retain_until,
-    }
+    (
+        ScopedStance {
+            state,
+            retain_until,
+        },
+        winner,
+    )
 }
 
 /// The fold proper: the stance, and the row that decided it (`None` when

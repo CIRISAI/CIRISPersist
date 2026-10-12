@@ -559,9 +559,6 @@ class Engine:
     def abandon_stream_json(self, stream_id: str) -> str:
         """(derived) deontic — v52.0.0 (CIRISPersist#954) — abandon an unsealed stream this node owns (a streaming publish refused midway): the stream is tombstoned (stream_aband..."""
 
-    def accord_nonce_issued(self, family_key_id: str, nonce: str) -> bool:
-        """(derived) deontic — #302 (M4) — has (family_key_id, nonce) been issued?"""
-
     def add_community_member(self, community_key_id: str, member_json: str, admit_spec_json: str) -> bool:
         """(derived) deontic — #249 Cut B — incrementally add one member to a community roster (mirror of add_family_member). member_json is a [crate::federation::types::Communit..."""
 
@@ -644,11 +641,24 @@ class Engine:
             Refusals are outcomes, not exceptions, so an apply loop stays
             total over unsolicited records.
 
+            v54.1.0: a refusal reading ``attester_key_unknown`` is the
+            RETRYABLE ordering gap (the scrubber's Key row has not landed
+            on this node; re-offer after the key plane, CIRISPersist#1042);
+            ``unverifiable_signature`` is terminal. Before v54.1.0 the
+            insert arm raised both as a bare ValueError.
+            ``"invalid_replaced"`` — the stored record failed
+            verification and this one (same pubkeys, same claim, signed by
+            the key itself or the stored scrubber) replaced it
+            (CIRISPersist#1044).
+
         Raises:
             ValueError: SignedKeyRecord JSON decode failure or a
                 malformed record no policy can classify.
             RuntimeError: backend / IO error.
         """
+
+    def apply_replicated_purge_json(self, bundle_json: str) -> str:
+        """(derived) deontic — v54.1.0 (CIRISPersist#1046) — apply a peer's purge bundle: the notice is re-verified against THIS node's trust root and the digest re-derived from..."""
 
     def bake_assembled_genesis(self, bundle_json: str) -> str:
         """(derived) deontic — v19.1.0 (CIRISPersist#490) — bake an assembled genesis trust-root bundle (the ceremony artifact JSON, the operator-saved genesis_v2.json). Verifies... [build-conditional: #[cfg(any(feature = "postgres", feature = "sqlite"))]]"""
@@ -673,6 +683,9 @@ class Engine:
 
     def capacity_consent_stance(self, attester_key_id: str, subject_key_id: str, family: str, now_iso: str | None = None) -> str:
         """(derived) deontic — v53.1.8 (CIRISPersist#1013) — the consent-before-scoring stance the emit gate asks: by principals, scope analyze:<family>. A scorer's precheck call..."""
+
+    def capacity_consent_stance_with_basis(self, attester_key_id: str, subject_key_id: str, family: str, now_iso: str | None = None) -> str:
+        """(derived) deontic — v54.1.0 (CIRISPersist#1041) — [Self::capacity_consent_stance] WITH the consent basis: the rows the stance rests on, so a scorer can record them in..."""
 
     def check_no_moderator_federate_json(self, community_id: str) -> str:
         """v13.0.0 (CIRISPersist#369, CC 4.5.4 / §11.11) — the directly drivable
@@ -895,9 +908,6 @@ class Engine:
         cannot be walked answers ``false``.
         """
 
-    def issue_accord_nonce(self, family_key_id: str, nonce: str) -> None:
-        """(derived) deontic — #302 (M4) — record a server-issued proposal nonce."""
-
     def ledger_advance_head(self, ledger_id: str, seq: int, head_hash: str, witness_anchor_ref: str | None = None, source_envelope_ref: str | None = None) -> str:
         """(derived) deontic — CC 3.3.10.1 L4 — move the stored head forward. Returns the outcome ("advanced" / "unchanged" / "stale"); a DIFFERENT hash at the stored seq raises... [build-conditional: #[cfg(feature = "ledgers")]]"""
 
@@ -956,6 +966,12 @@ class Engine:
     def publish_self_occurrence(self, identity_key_id: str, device_class: str, valid_until_iso: str | None = None) -> str:
         """(derived) deontic — CIRISPersist#851 (BLOB_REPLICATION.md §20.3) — publish this node's own content-only occurrence under identity_key_id (its owner), signed with the L..."""
 
+    def purge_finalize_json(self, notice_id: str) -> str:
+        """(derived) deontic — v54.1.0 (CIRISPersist#1046, CSD-108 §6 Q4) — finalize: hard-delete an executed purge's records after the retraction round settled, judged on THIS n..."""
+
+    def purge_rows_json(self, selection_json: str, notice_json: str) -> str:
+        """(derived) deontic — v54.1.0 (CIRISPersist#1046, CIRISConstitution#165) — execute a steward purge. notice_json is {"envelope": {…takedown_notice…}, "cosignatures": [Thr..."""
+
     def put_accord_decision_json(self, payload_json: str) -> None:
         """(derived) deontic — #302 — record the server's frozen-L decision. payload_json = { "decision": <AccordDecision> }. Immutable (M2). v53.0.0 (CC 4.2.6 rc7): a non-null s..."""
 
@@ -963,7 +979,7 @@ class Engine:
         """(derived) deontic — #302 — admit an accord_participation. payload_json = { "participation": <AccordParticipation>, "standing_roster": [<ThresholdMember>...] }. Verify-..."""
 
     def put_accord_proposal_json(self, payload_json: str) -> None:
-        """(derived) deontic — #302 — admit an accord_proposal. payload_json = { "proposal": <AccordProposal>, "authority_signature": <obj|null> }. M4 fail-closed on an unissued..."""
+        """(derived) deontic — #302 — admit an accord_proposal. payload_json = { "proposal": <AccordProposal>, "authority_signature": <obj|null> }. v54.1.0 (CIRISPersist#1047) —..."""
 
     def put_attestation(self, signed_attestation_json: str) -> None:
         """Admit a ``SignedAttestation`` into ``federation_attestations``.
@@ -1000,6 +1016,8 @@ class Engine:
 
         Raises:
             ValueError: ``federation_signature_invalid`` /
+                ``federation_attester_key_unknown`` (v54.1.0, #1042: the
+                attester's Key row has not landed here yet — RETRYABLE) /
                 ``federation_conflict`` / ``federation_reserved_prefix_emitter_mismatch``
                 / ``federation_trust_below_threshold`` (#123) /
                 ``federation_invalid_argument``.
@@ -1157,7 +1175,9 @@ class Engine:
         Raises:
             ValueError: SignedKeyRecord JSON decode failure, or a
                 federation verification/admission error (bad/missing
-                signature, hash mismatch, unknown signer, non-hybrid).
+                signature, hash mismatch, non-hybrid; an unknown signer is
+                ``federation_attester_key_unknown`` from v54.1.0, #1042 —
+                retryable once its Key row lands).
             RuntimeError: backend / IO error.
         """
 
@@ -2181,6 +2201,9 @@ class Engine:
     def maintenance_tighten_vocabulary(self, target_json: str, dry_run: bool = False) -> str:
         """(derived) nomological — v25.1.0 (CIRISPersist#582) — Run one vocabulary tightening: retire every federation-tier attestation carrying a non-conformant wire value at a name..."""
 
+    def purge_notice_signing_payload_json(self, envelope_json: str) -> str:
+        """(derived) nomological — v54.1.0 (CIRISPersist#1046) — the bytes a founder cosigns for a purge notice and the notice id they hash to: {"signing_bytes_b64": …, "notice_id":..."""
+
     def trace_summary_extraction(self) -> dict[str, Any]:
         """(derived) nomological — v19.2.0 (CIRISPersist#494) — the pinned trace-summary EXTRACTION manifest and its sha256, as {"manifest_json", "sha256"}. This names which fields a..."""
 
@@ -2244,6 +2267,9 @@ class Engine:
 
     def lineage_head_json(self, community_key_id: str) -> str:
         """(derived) epistemic — v51.0.0 (CIRISPersist#938) — the witness plane's view of a root this node holds a lineage for (a trust-root community or a conferring family) as JS..."""
+
+    def list_purge_bundles_since_json(self, limit: int, since_iso: str | None = None, since_notice_id: str | None = None) -> str:
+        """(derived) epistemic — v54.1.0 (CIRISPersist#1046, CIRISConstitution#165 §3) — serve the purge tombstone plane: a JSON array of PurgeBundle (notice, whole cosignature set..."""
 
     def list_signed_accord_quorum_evidence_since(self, since_rfc3339: str | None, since_id: str | None, limit: int) -> str:
         """(derived) epistemic — v31.1.0 (CIRISPersist#662) — bulk-list the signed accord EVIDENCE bundles (proposal + its hybrid-signed participations) since a cursor, as a JSON a..."""
@@ -3159,6 +3185,9 @@ class Engine:
     def nodes_stewarded_by_json(self, steward_user_key_id: str) -> str:
         """(derived) empirical — CIRISPersist#299 — the OUTBOUND steward-binding reader: the nodes steward_user_key_id owns (exact inverse of steward_bindings_of_json — n ∈ nodes_s..."""
 
+    def outbound_counts(self) -> dict[str, Any]:
+        """(derived) empirical — v54.0.0 (CIRISPersist#996, CIRISEdge#814 item 2) — how many outbound rows sit in each status, as {status_wire_str: count} (statuses with no row omi..."""
+
     def outbound_status(self, queue_id: str) -> dict[str, Any] | None:
         """(derived) empirical — v0.4.0 — Look up a row by queue_id. Returns the row dict or None. Used by DurableHandle::status()."""
 
@@ -3167,6 +3196,15 @@ class Engine:
 
     def peer_metadata_for_json(self, key_id: str) -> str | None:
         """(derived) empirical — v3.4.1 (CIRISPersist#127) — Federation directory: read peer metadata row. Returns the JSON-encoded PeerMetadataRow (carrying alias, trust, notes, p..."""
+
+    def purge_dry_run_json(self, selection_json: str) -> str:
+        """(derived) empirical — v54.1.0 (CIRISPersist#1046, CSD-108) — dry run a steward purge. selection_json is a tagged selection: {"kind": "by_actor", "key_id": …}, {"kind": "..."""
+
+    def purge_ledger_tsv(self, notice_id: str) -> str:
+        """(derived) empirical — v54.1.0 (CIRISPersist#1046) — the executed purge's ledger as TSV (for evidence/purges/<date>-<selection-digest>.tsv): a header carrying the digest,..."""
+
+    def purge_status_json(self, notice_id: str) -> str:
+        """(derived) empirical — v54.1.0 (CIRISPersist#1046) — a purge's state on this node's clock (incomplete / executed / settled / finalized), its settle instant, its tombstone..."""
 
     def put_blob_chunk(self, stream_id: str, seq: int, body_b64: str, epoch: int) -> str:
         """(derived) empirical — v4.1 (CIRISPersist#142, Cut C1a) — live-append one chunk to a stream. Inserts the chunk's bytes as a content-addressed federation_blobs row AND the..."""
@@ -4119,15 +4157,6 @@ class Engine:
 
     def wholeness_witness_root_hex(self, leaf_bytes_b64_json: str) -> str:
         """(derived) pragmatic — v16 (CIRISPersist#431) — pure §19.1 root builder: the WW-scheme Merkle root (lexicographic leaf order, odd-duplication, WW-v1-empty empty sentinel)..."""
-
-
-    # ==============================================================
-    # CONTINGENT  (descriptive)
-    # Varying one of these out of scope by construction — see `report` for why this is empty.
-    # ==============================================================
-
-    def outbound_counts(self) -> dict[str, Any]:
-        """(derived) contingent — v54.0.0 (CIRISPersist#996, CIRISEdge#814 item 2) — how many outbound rows sit in each status, as {status_wire_str: count} (statuses with no row omi..."""
 
 
 class ScoringFactorStream:

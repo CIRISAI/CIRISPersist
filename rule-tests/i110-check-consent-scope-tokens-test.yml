@@ -1,0 +1,11 @@
+id: i110-check-consent-scope-tokens
+valid:
+  - |
+    fn a() { /* check_consent_scope_tokens(x); */ let s = "check_consent_scope_tokens(x)"; }
+  - |
+    fn a() { my_check_consent_scope_tokens(x); }
+invalid:
+  - |
+    fn a() { check_consent_scope_tokens(x)?; }
+  - |
+    fn a() { crate::federation::consent_scope::check_consent_scope_tokens(&e)?; }
