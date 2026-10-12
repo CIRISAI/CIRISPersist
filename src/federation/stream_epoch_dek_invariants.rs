@@ -51,6 +51,11 @@
 //! - **I760** (sqlite, postgres; #977) — a legacy (pre-v55, per-chunk-bound)
 //!   room chunk still adopts under a community epoch, binds, promotes and
 //!   reads positionally: the refusal is for stream-keyed chunks only.
+//! - **I761** (sqlite, postgres; #977) — the chunk door's stream-keyed
+//!   fact, leg by leg: the stream epoch's DEK row alone, a wrap addressed to
+//!   this node alone, and a wrap sealed by the chunk's author alone each
+//!   refuse a community epoch; none of them admits, as does another epoch,
+//!   a provenance naming no epoch and a self-tier provenance.
 //! - **I756** (pure; #981) — the roll rule: cap and removal roll a minted
 //!   epoch and refuse a supplied one with the reason; nothing else does.
 
@@ -1150,6 +1155,103 @@ pub(crate) mod bodies {
         );
     }
 
+    /// **I761** — see the module doc.
+    pub(crate) async fn i761_each_leg_alone_names_a_stream_keyed_epoch<B>(
+        dsn_a: &str,
+        dsn_b: &str,
+        run: &str,
+        pick: Pick<B>,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync + 'static,
+    {
+        use crate::federation::adopt_cascade::refuse_community_epoch_on_a_stream_keyed_chunk as refuse;
+        let l = ladder(dsn_a, dsn_b, run, pick).await;
+        let b = l.bb.as_ref();
+        let prov = |author: &str| BlobProvenance {
+            author_key_id: author.to_owned(),
+            cohort_scope: COMMUNITY.to_owned(),
+            community_key_id: Some(l.comm.clone()),
+            epoch: Some(3),
+            tier: CryptoTier::CommunityDek,
+            minter_key_id: None,
+        };
+        let wrap = |to: &str| crate::federation::GrantWrap {
+            recipient_key_id: to.to_owned(),
+            wrap_algorithm: crate::federation::at_rest_cascade::WRAP_ALGORITHM_V2.into(),
+            wrapped_dek: "w".into(),
+        };
+        let refused = |r: Result<(), BlobError>| {
+            matches!(r, Err(BlobError::StreamKeyedChunkCommunityEpoch { .. }))
+        };
+        let (me, author, other) = (l.node_b.as_str(), l.node_a.as_str(), "i761-other");
+        // Nothing known: admitted.
+        let s0 = format!("i761-none-{run}");
+        refuse(b, me, &s0, 0, &prov(author))
+            .await
+            .expect("I761: nothing known admits");
+        // A wrap addressed to this node, sealed by someone else.
+        let s1 = format!("i761-to-me-{run}");
+        b.stream_dek_put_grants(&s1, 0, other, COMMUNITY, &[wrap(me)])
+            .await
+            .unwrap();
+        assert!(
+            refused(refuse(b, me, &s1, 0, &prov(author)).await),
+            "I761: a wrap to this node"
+        );
+        refuse(b, me, &s1, 1, &prov(author))
+            .await
+            .expect("I761: another epoch admits");
+        // A wrap sealed by the author, addressed to someone else.
+        let s2 = format!("i761-by-author-{run}");
+        b.stream_dek_put_grants(&s2, 0, author, COMMUNITY, &[wrap(other)])
+            .await
+            .unwrap();
+        assert!(
+            refused(refuse(b, me, &s2, 0, &prov(author)).await),
+            "I761: the author's wrap"
+        );
+        refuse(b, me, &s2, 0, &prov(other))
+            .await
+            .expect("I761: another sealer's wrap to another node admits");
+        // The stream epoch's DEK row, no wrap.
+        let s3 = format!("i761-dek-{run}");
+        b.stream_dek_insert(&crate::federation::StreamDekRecord {
+            stream_id: s3.clone(),
+            epoch: 0,
+            owner_key_id: other.to_owned(),
+            cohort_scope: COMMUNITY.to_owned(),
+            group_key_id: l.comm.clone(),
+            self_retention_wrap: "r".into(),
+            chunk_count: 0,
+            closed: false,
+            terminated: false,
+            supplied: false,
+            keep: true,
+            room_epoch: Some(3),
+        })
+        .await
+        .unwrap();
+        assert!(
+            refused(refuse(b, me, &s3, 0, &prov(author)).await),
+            "I761: the DEK row"
+        );
+        // The legs never fire for a provenance that names no epoch, or a
+        // self-tier one.
+        let unbound = prov(author).for_stream_keyed_chunk().unwrap();
+        refuse(b, me, &s3, 0, &unbound)
+            .await
+            .expect("I761: no epoch named");
+        let mine = BlobProvenance {
+            tier: CryptoTier::InvisibleEncrypted,
+            cohort_scope: "self".into(),
+            community_key_id: None,
+            ..prov(author)
+        };
+        refuse(b, me, &s3, 0, &mine)
+            .await
+            .expect("I761: a self provenance");
+    }
+
     macro_rules! runners {
         ($modname:ident, $dsn:expr, $pick:expr) => {
             mod $modname {
@@ -1189,6 +1291,11 @@ pub(crate) mod bodies {
                         $pick,
                     )
                     .await
+                }
+                #[tokio::test]
+                async fn i761() {
+                    let Some((a, b)) = $dsn else { return };
+                    i761_each_leg_alone_names_a_stream_keyed_epoch(&a, &b, &run(), $pick).await
                 }
                 #[tokio::test]
                 async fn i750() {

@@ -319,7 +319,7 @@ pub struct AdoptChunkItem<'a> {
 /// (`promote_checks`): nothing is promoted or announced under a wrong
 /// binding. Build the chunk's provenance with
 /// [`BlobProvenance::for_stream_keyed_chunk`].
-async fn refuse_community_epoch_on_a_stream_keyed_chunk<B>(
+pub(crate) async fn refuse_community_epoch_on_a_stream_keyed_chunk<B>(
     backend: &B,
     our_key_id: &str,
     stream_id: &str,
