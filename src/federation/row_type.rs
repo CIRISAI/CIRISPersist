@@ -470,7 +470,7 @@ pub fn registered_row_type_sql(column: &str, dialect: SqlDialect) -> String {
             .collect::<Vec<_>>()
             .join(", ")
     )];
-    for c in &rt.carriers {
+    for c in registry::carriers() {
         match dialect {
             SqlDialect::Sqlite => {
                 for g in carrier_globs(&c.pattern) {

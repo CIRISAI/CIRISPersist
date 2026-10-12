@@ -8,10 +8,14 @@
 //!
 //! - **I370** an unregistered type is refused at the local put, the replication
 //!   apply and the emit under `Enforce`; nothing is stored.
-//! - **I371** CC's 39 `row_type_vectors` replay through [`classify`].
+//! - **I371** CC's `row_type_vectors` (25 at rc7) replay through [`classify`];
+//!   the two retired rc6 carriers persist still admits until CIRISPersist#989
+//!   are the only departures.
 //! - **I372** the carrier shape: every violation refused (always enforced);
 //!   today's `holds_bytes` and `key_grant` rows satisfy it.
-//! - **I373** a carrier token is never a `dimension`.
+//! - **I373** a carrier token is never a `dimension` (since rc7, `key_grant:`
+//!   is a registered family held shut until #989 and the `holds_bytes`
+//!   token has no version tail).
 //! - **I374** the dimension gate follows the dimension onto the four composers
 //!   (CC 2.4 ask 3): refused under `Enforce`, counted under `Report`; persist's
 //!   own composer dimensions admit.
@@ -50,7 +54,7 @@ mod pure {
     #[test]
     fn i371_cc_row_type_vectors_replay() {
         let vs = vectors();
-        assert_eq!(vs.len(), 39, "CC rc6 publishes 39 row-type vectors");
+        assert_eq!(vs.len(), 25, "CC rc7 publishes 25 row-type vectors");
         assert_eq!(
             registry::row_types().unwrap().refusal,
             ATTESTATION_TYPE_UNREGISTERED,
@@ -63,6 +67,19 @@ mod pure {
                 RowTypeClass::Carrier(_) => Some("carrier"),
                 RowTypeClass::Unregistered => None,
             };
+            // rc7 retired both carriers; persist still admits them until #989
+            // (`registry::RC6_RETIRED_CARRIERS_ADMITTED_UNTIL_989`). Those two
+            // vectors, and only those, are answered "carrier" against CC's
+            // refusal.
+            if got == Some("carrier") && v["class"].is_null() {
+                assert!(
+                    registry::RC6_RETIRED_CARRIERS_ADMITTED_UNTIL_989
+                        .iter()
+                        .any(|(_, _, sample, _)| *sample == t),
+                    "{t:?}: answered carrier, and no retired rc6 carrier names it"
+                );
+                continue;
+            }
             assert_eq!(got, v["class"].as_str(), "{t:?}: {}", v["why"]);
             assert_eq!(
                 got.is_none(),
@@ -614,10 +631,11 @@ pub(crate) mod bodies {
     }
 
     /// **I373** — a carrier token is never a dimension. On `scores` it is
-    /// refused under the shipped setting (R2(b) gates `key_grant:`; the
-    /// `holds_bytes` token has no version tail). On a composer `key_grant:` is
-    /// refused by R2(b) always, and the `holds_bytes` token by the ask-3
-    /// dimension gate, so under `Enforce`.
+    /// refused under the shipped setting (`key_grant:` is held shut by
+    /// `admission::REGISTERED_FAMILIES_HELD_SHUT` since rc7 registered it —
+    /// rc6 gated the stem; the `holds_bytes` token has no version tail). On a
+    /// composer `key_grant:` is refused by the same hold always, and the
+    /// `holds_bytes` token by the ask-3 dimension gate, so under `Enforce`.
     pub async fn i373_carrier_token_is_not_a_dimension<B: FederationDirectory + Sync>(
         b: &B,
         s: &str,

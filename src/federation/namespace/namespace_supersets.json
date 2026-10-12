@@ -14937,9 +14937,9 @@
     "decimal_id": "3.3.10.1",
     "claim_id": "CLM-ledger-standard",
     "repo": "CIRISPersist",
-    "path#symbol": "src/federation/admission.rs#STAGED_GOVERNED_FAMILIES",
+    "path#symbol": "src/federation/admission.rs#check_ledger_emitter_admission",
     "tsv_target": "evidence/cc_impl.tsv",
-    "manifest_round": "backfill-1052"
+    "manifest_round": "v55-753"
    },
    {
     "decimal_id": "3.3.10.1",

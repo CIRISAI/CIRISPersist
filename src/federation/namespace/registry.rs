@@ -38,14 +38,14 @@ pub(super) const REGISTRY_JSON: &str = include_str!("namespace_registry.json");
 
 /// The CC version [`REGISTRY_JSON`] was generated from. Bump in lockstep when
 /// re-vendoring (the drift gate asserts the file's `_meta.cc_version` matches).
-pub const VENDORED_CC_VERSION: &str = "1.0-rc6";
+pub const VENDORED_CC_VERSION: &str = "1.0-rc7";
 /// SHA-256 of the CC `part_3_the_namespace.md` bytes the manifest was generated
 /// from (the manifest's `_meta.source_sha256`). Pins the exact source cut.
 pub const VENDORED_SOURCE_SHA256: &str =
-    "459d3ef52bc6d021d8bed58af908f75c11fdaf83b5cb841e100040fbe6437ea9";
+    "9032a726082d2db658bac364fd865617b7add3d7ef71dd644010c65297548660";
 /// The number of prefix families in this vendored cut (the enumerated leaf
 /// count; CC 3.1's "83" summary is stale — see CIRISConstitution#30).
-pub const VENDORED_N_FAMILIES: usize = 158;
+pub const VENDORED_N_FAMILIES: usize = 168;
 
 /// v50.0.0 (CIRISPersist#924, CIRISConstitution#112) — the manifest's
 /// `_meta.registry_sha256`: the hash of the GRAMMAR (families + `_meta` minus
@@ -55,33 +55,30 @@ pub const VENDORED_N_FAMILIES: usize = 158;
 /// vendored bytes the way `tools/build_cc_namespace.py` does.
 ///
 /// Vendored byte-for-byte from CIRISConstitution commit [`VENDORED_CC_COMMIT`]
-/// (CC 1.0-rc6, the `v1.0-rc6` tag's commit), together with
+/// (CC 1.0-rc7, the `v1.0-rc7` tag's commit), together with
 /// `namespace_match_vectors.json` from the same commit. JSON carries no
 /// comments, so this doc is the vendored files' header.
 pub const VENDORED_REGISTRY_SHA256: &str =
-    "f666f334db6b5e82dd7f75e6cbe82c926d27dcd9bd81d208784527cbce651c37";
+    "796f609981434b838edab1165462484f1be67889eed7f60c26b210ede5984464";
 
 /// The CIRISConstitution commit both vendored manifests were copied from: the
-/// commit the `v1.0-rc6` tag names (`3c3e63f`, annotated tag `b9d8cba`).
-///
-/// The files were first copied at `1f45ebe` "Cut 1.0-rc6, released as guidance"
-/// on branch `rc6`, before the tag existed; both manifests carry the same blob
-/// ids at `1f45ebe` and at the tag, so the bytes are unchanged and only this
-/// record moved. The files are also pinned by their own SHA-256
+/// commit the `v1.0-rc7` tag names (`536b8cb`, annotated tag `686d274`),
+/// copied from the tag itself, never a branch tip (CIRISPersist#753). The
+/// files are also pinned by their own SHA-256
 /// ([`VENDORED_REGISTRY_FILE_SHA256`], [`VENDORED_VECTORS_FILE_SHA256`]), and
-/// `scripts/check_vendored_cc.sh v1.0-rc6` byte-compares them against the tag
-/// before a persist release that names rc6 is tagged.
-pub const VENDORED_CC_COMMIT: &str = "3c3e63fdef844f2f849e43081a8242e31cfaf30d";
+/// `scripts/check_vendored_cc.sh v1.0-rc7` byte-compares them against the tag
+/// before a persist release that names rc7 is tagged.
+pub const VENDORED_CC_COMMIT: &str = "536b8cbb931da1f4549425284af24cd227587c36";
 
 /// SHA-256 of the vendored `namespace_registry.json` FILE bytes (the whole file,
 /// unlike [`VENDORED_REGISTRY_SHA256`], which is CC's hash of the grammar).
 /// What `scripts/check_vendored_cc.sh` compares against the tag.
 pub const VENDORED_REGISTRY_FILE_SHA256: &str =
-    "5f53f9776604713cb84468811983e67804b9771d61882a6723be61000897056d";
+    "6a14cb027ac65b8515f2004274278e73f4bcc4d3dfe233e9870c27c7d02d3c84";
 
 /// SHA-256 of the vendored `namespace_match_vectors.json` FILE bytes.
 pub const VENDORED_VECTORS_FILE_SHA256: &str =
-    "c4226dfb769c8939b608398e9b6b4364dde62b8ac40b2cd25363af9bb4622810";
+    "8fc35ba167f1ab0d2cb5b4ea742865dff3fd92d1bd751105ddbb7fc191a73331";
 
 /// v42.0.0 (CC 3.1.7 R3, CIRISPersist#815) — the case class of one dimension
 /// SEGMENT, read from the manifest rather than inferred from `{...}` in prose.
@@ -417,12 +414,78 @@ pub fn row_types() -> Option<&'static RowTypes> {
     .as_ref()
 }
 
-/// The registered CARRIER row type (CC 2.4) `attestation_type` is a
+/// **TEMPORARY — the rc6 carriers rc7 retired, still admitted
+/// (CIRISPersist#989).** `(kind, pattern, sample, token)`, copied verbatim
+/// from the rc6 manifest's `_meta.row_types.carriers` (CC 1.0-rc6 @
+/// `3c3e63f`).
+///
+/// CC 1.0-rc7 empties `_meta.row_types.carriers` (CC 2.4: "For one rc6 week
+/// it also admitted a second class, the carrier … Both are gone"):
+/// `holds_bytes` becomes the `custody:ack:v1` holding claim (CC 3.1.3.3,
+/// CIRISConstitution#141) and the key-grant set becomes one `scores` row per
+/// recipient on `key_grant:{axis}:v1` (CC 3.3.2, CIRISConstitution#143).
+/// Persist's blob doors and key-grant sets still WRITE both carriers, and
+/// nodes hold rows of both. Re-vendoring rc7 without this line would make
+/// every such row `attestation_type_unregistered`, so the v55 re-vendor
+/// (CIRISPersist#753, slice A0) keeps them admitted here, with the rc6
+/// carrier shape still enforced, until v55 slices A (holding) and B (grants)
+/// move the emitters onto rc7's grammar. Slice B deletes this const.
+///
+/// It admits exactly the two rc6 patterns and nothing else: the vendored
+/// carriers are read first, then these, by the same whole-string,
+/// re-anchored match ([`carrier_row_type`], [`carriers`]).
+/// `tests::the_rc6_carrier_exception_admits_only_the_retired_carriers`
+/// pins that, and the from-disk gate
+/// `tests::the_rc6_carrier_exception_does_not_outlive_v55` fails the build
+/// once `CHANGELOG.md` dates a 55.0.0 or later release while this const is
+/// still non-empty, so v55.0.0 cannot ship with it.
+pub const RC6_RETIRED_CARRIERS_ADMITTED_UNTIL_989: &[(&str, &str, &str, &str)] = &[
+    (
+        "holds_bytes",
+        "^holds_bytes:sha256:[0-9a-f]{8}$",
+        "holds_bytes:sha256:0a1b2c3d",
+        "holds_bytes:sha256:{prefix}",
+    ),
+    (
+        "key_grant",
+        "^key_grant:(content|epoch|stream):v1$",
+        "key_grant:epoch:v1",
+        "key_grant:{axis}:{version}",
+    ),
+];
+
+/// Every carrier row type the row-type gate admits: the vendored cut's
+/// `_meta.row_types.carriers`, then [`RC6_RETIRED_CARRIERS_ADMITTED_UNTIL_989`].
+/// Built once. The one list [`carrier_row_type`] and the serve filter
+/// ([`crate::federation::row_type::registered_row_type_sql`]) read.
+#[must_use]
+pub fn carriers() -> &'static [CarrierRowType] {
+    static C: OnceLock<Vec<CarrierRowType>> = OnceLock::new();
+    C.get_or_init(|| {
+        let mut out: Vec<CarrierRowType> = row_types()
+            .map(|rt| rt.carriers.clone())
+            .unwrap_or_default();
+        for (kind, pattern, sample, token) in RC6_RETIRED_CARRIERS_ADMITTED_UNTIL_989 {
+            if !out.iter().any(|c| c.kind == *kind) {
+                out.push(CarrierRowType {
+                    kind: (*kind).to_owned(),
+                    pattern: (*pattern).to_owned(),
+                    sample: (*sample).to_owned(),
+                    token: (*token).to_owned(),
+                });
+            }
+        }
+        out
+    })
+}
+
+/// The admitted CARRIER row type (CC 2.4) `attestation_type` is a
 /// whole-string, byte-exact match for, or `None`.
 ///
-/// Each carrier's pattern is compiled once from `_meta.row_types`, re-anchored
-/// `\A(?:…)\z` whatever anchors the row spells, so a trailing newline is never
-/// admitted. The row-type gate (CIRISPersist#975,
+/// Each carrier's pattern ([`carriers`]: the vendored `_meta.row_types`, plus
+/// the temporary [`RC6_RETIRED_CARRIERS_ADMITTED_UNTIL_989`]) is compiled
+/// once, re-anchored `\A(?:…)\z` whatever anchors the row spells, so a
+/// trailing newline is never admitted. The row-type gate (CIRISPersist#975,
 /// [`crate::federation::row_type`]) reads this for the carrier's envelope
 /// `kind`; no type constant in the tree decides admission.
 #[must_use]
@@ -430,19 +493,15 @@ pub fn carrier_row_type(attestation_type: &str) -> Option<&'static CarrierRowTyp
     static PATTERNS: OnceLock<Vec<(regex::Regex, &'static CarrierRowType)>> = OnceLock::new();
     PATTERNS
         .get_or_init(|| {
-            row_types()
-                .map(|rt| {
-                    rt.carriers
-                        .iter()
-                        .map(|c| {
-                            let body = c.pattern.trim_start_matches('^').trim_end_matches('$');
-                            let re = regex::Regex::new(&format!("\\A(?:{body})\\z"))
-                                .expect("a vendored carrier pattern compiles");
-                            (re, c)
-                        })
-                        .collect()
+            carriers()
+                .iter()
+                .map(|c| {
+                    let body = c.pattern.trim_start_matches('^').trim_end_matches('$');
+                    let re = regex::Regex::new(&format!("\\A(?:{body})\\z"))
+                        .expect("a carrier pattern compiles");
+                    (re, c)
                 })
-                .unwrap_or_default()
+                .collect()
         })
         .iter()
         .find(|(re, _)| re.is_match(attestation_type))
@@ -631,6 +690,7 @@ pub const VENDORED_FAMILY_PREFIXES: &[&str] = &[
     "accord:invoke:notify:{notify_id}",
     "accord:lifecycle",
     "accord:lifecycle:active",
+    "accord:lifecycle:confirmed",
     "activity_tier:{period}",
     "age_assurance:{level}:{band}:{version}",
     "age_self_declared:band:{band}:{version}",
@@ -712,7 +772,6 @@ pub const VENDORED_FAMILY_PREFIXES: &[&str] = &[
     "hard_case:{kind}",
     "hardware_custody:{platform}",
     "health:liveness:{version}",
-    "holds_bytes:sha256:{prefix}",
     "identity:canonical_binding:{canonical_hash}",
     "identity_continuity:relational_anchor",
     "image:*",
@@ -782,6 +841,19 @@ pub const VENDORED_FAMILY_PREFIXES: &[&str] = &[
     "observation:reachability",
     "self:delegates_to",
     "self:delegates_to:agent_occurrence",
+    // rc7 (CIRISConstitution v1.0-rc7 @ 536b8cb; CIRISPersist#753) — eleven
+    // families added (with `accord:lifecycle:confirmed` above), one retired
+    // (`holds_bytes:sha256:{prefix}`, in RETIRED_FAMILIES).
+    "community:listing",
+    "group:roster",
+    "identity:occurrence",
+    "key:record",
+    "key:revocation",
+    "key_grant:{axis}",
+    "ledger:checkpoint:{unit}:{version}",
+    "ledger:head:{unit}:{version}",
+    "ledger:promotion:{version}",
+    "settlement:*",
 ];
 
 /// Families CC has **deliberately retired** — present in an earlier vendored cut,
@@ -797,6 +869,12 @@ pub const RETIRED_FAMILIES: &[&str] = &[
     // `age_self_declared:band:{band}:{version}` (CC 3.1.2). CC's own
     // generator lists it in its `RETIRED_FAMILIES`.
     "age_self_declared:{band}:{version}",
+    // rc7 (CIRISConstitution#141, CC 2.4 + CC 3.1.9.1): the `holds_bytes`
+    // carrier is retired; the holder directory is the `custody:ack:v1` holding
+    // claim at the content's scope (CC 3.1.3.3). Persist's emitters still write
+    // the carrier ROW TYPE until v55 slice A, admitted by
+    // `RC6_RETIRED_CARRIERS_ADMITTED_UNTIL_989`; the dimension row is gone.
+    "holds_bytes:sha256:{prefix}",
 ];
 
 #[cfg(test)]
@@ -959,12 +1037,13 @@ mod tests {
         );
     }
 
-    /// CC 2.4 (rc6) — the closed row-type set is vendored and parses: the five
-    /// and the two carriers, each carrier's own sample matching its pattern.
-    /// Vendored only; enforcement is CIRISPersist#975.
+    /// CC 2.4 (rc7) — the closed row-type set is vendored and parses: the five
+    /// and NO carrier (rc7 retired both, CIRISConstitution#141/#143). The rc6
+    /// carriers persist still admits are [`RC6_RETIRED_CARRIERS_ADMITTED_UNTIL_989`],
+    /// pinned by the tests below. Enforcement is CIRISPersist#975.
     #[test]
     fn the_row_type_set_is_vendored_and_parses() {
-        let rt = row_types().expect("rc6 carries _meta.row_types");
+        let rt = row_types().expect("rc7 carries _meta.row_types");
         assert_eq!(
             rt.structural,
             [
@@ -976,47 +1055,183 @@ mod tests {
             ]
         );
         assert_eq!(rt.refusal, "attestation_type_unregistered");
-        let patterns: Vec<&str> = rt.carriers.iter().map(|c| c.pattern.as_str()).collect();
-        assert_eq!(
-            patterns,
-            [
-                "^holds_bytes:sha256:[0-9a-f]{8}$",
-                "^key_grant:(content|epoch|stream):v1$"
-            ]
+        assert!(
+            rt.carriers.is_empty(),
+            "rc7 registers no carrier; a re-vendor that brings one back must re-read \
+             RC6_RETIRED_CARRIERS_ADMITTED_UNTIL_989: {:?}",
+            rt.carriers
         );
-        for c in &rt.carriers {
-            let re = regex::Regex::new(&c.pattern).expect("a carrier pattern compiles");
-            assert!(
-                re.is_match(&c.sample),
-                "{} must match {}",
-                c.sample,
-                c.pattern
-            );
-            assert!(c.sample.starts_with(&format!("{}:", c.kind)), "{c:?}");
-        }
         // The vectors file carries CC's row-type vectors beside the dimension
-        // ones. Present and counted here; REPLAYED by the classifier that
-        // enforces the slot (CIRISPersist#975), which this cut does not add.
+        // ones, replayed in full by `row_type_invariants::pure::i371`. The
+        // carrier half is replayed here against the one reader that answers
+        // "carrier": a vector CC classes `carrier` is one, and the only types
+        // persist answers "carrier" for against CC's refusal are the two the
+        // temporary exception names.
         let vectors: serde_json::Value =
             serde_json::from_str(super::super::matcher::VECTORS_JSON).unwrap();
         let rtv = vectors["row_type_vectors"]
             .as_array()
             .expect("row_type_vectors");
-        assert_eq!(rtv.len(), 39);
-        // The carrier half of those vectors IS replayed, against the one reader
-        // this cut adds: a vector CC classes `carrier` is a registered carrier,
-        // and nothing else is.
+        assert_eq!(rtv.len(), 25);
+        let mut excepted = Vec::new();
         for v in rtv {
             let t = v["attestation_type"].as_str().unwrap();
-            assert_eq!(
-                is_registered_carrier_row_type(t),
-                v["class"] == "carrier",
-                "{t:?}"
-            );
+            if is_registered_carrier_row_type(t) && v["class"] != "carrier" {
+                excepted.push(t);
+            } else {
+                assert_eq!(
+                    is_registered_carrier_row_type(t),
+                    v["class"] == "carrier",
+                    "{t:?}"
+                );
+            }
         }
+        assert_eq!(
+            excepted,
+            ["holds_bytes:sha256:0a1b2c3d", "key_grant:epoch:v1"],
+            "the vectors persist departs from are exactly the retired rc6 carriers"
+        );
         assert!(rtv
             .iter()
             .all(|v| v["refusal"].is_null() || v["refusal"] == rt.refusal));
+    }
+
+    /// I700 (CIRISPersist#753, #989) — the temporary carrier exception admits
+    /// the two retired rc6 carriers, byte-exact and whole-string, and nothing
+    /// else: no other kind, no other axis, no other version, no case variant,
+    /// no trailing newline, and no dimension spelling of the same family.
+    #[test]
+    fn the_rc6_carrier_exception_admits_only_the_retired_carriers() {
+        let kinds: Vec<&str> = carriers().iter().map(|c| c.kind.as_str()).collect();
+        assert_eq!(kinds, ["holds_bytes", "key_grant"], "I700");
+        for (kind, pattern, sample, _) in RC6_RETIRED_CARRIERS_ADMITTED_UNTIL_989 {
+            let c = carrier_row_type(sample).expect("I700: the sample is admitted");
+            assert_eq!(c.kind, *kind);
+            assert_eq!(c.pattern, *pattern);
+        }
+        for t in [
+            "holds_bytes:sha256:0a1b2c3d",
+            "holds_bytes:sha256:ffffffff",
+            "key_grant:content:v1",
+            "key_grant:epoch:v1",
+            "key_grant:stream:v1",
+        ] {
+            assert!(is_registered_carrier_row_type(t), "I700 admits {t:?}");
+        }
+        for t in [
+            "holds_bytes:sha256:0a1b2c3",
+            "holds_bytes:sha256:0a1b2c3d0",
+            "holds_bytes:sha256:0A1B2C3D",
+            "holds_bytes:sha256:0a1b2c3d:v1",
+            "holds_bytes:sha256:0a1b2c3d\n",
+            "Holds_bytes:sha256:0a1b2c3d",
+            "key_grant:epoch:v2",
+            "key_grant:epoch:V1",
+            "key_grant:other:v1",
+            "key_grant:epoch",
+            "key_grant:epoch:v1\n",
+            " key_grant:epoch:v1",
+            "custody:ack:v1",
+            "key_grant",
+            "holds_bytes",
+            "",
+        ] {
+            assert!(
+                !is_registered_carrier_row_type(t),
+                "I700: the exception must not admit {t:?}"
+            );
+        }
+    }
+
+    /// I701 (CIRISPersist#753, #989) — FROM DISK: the temporary carrier
+    /// exception does not outlive v55. `CHANGELOG.md` must carry an
+    /// `## [55.0.0] - UNRELEASED` heading while the const is non-empty; once a
+    /// 55.0.0-or-later heading carries a date (the release is cut) and the
+    /// const still has an entry in production source, this fails, so the
+    /// release that retires the carriers (slice B) must delete it. A missing
+    /// marker fails too: a gate that cannot find its marker is not a pass.
+    ///
+    /// The const is counted in the registry source with comments and every
+    /// test-only item removed (`crate::test_cfg::is_test_only_cfg`), so a
+    /// commented-out or test-gated copy neither keeps it alive nor hides it.
+    #[test]
+    fn the_rc6_carrier_exception_does_not_outlive_v55() {
+        fn production_entries(src: &str) -> usize {
+            let mut out = Vec::new();
+            let mut skip_depth: Option<i32> = None;
+            let mut depth = 0i32;
+            let mut pending_test_item = false;
+            for line in src.lines() {
+                let code = line.split("//").next().unwrap_or("");
+                if skip_depth.is_none() && crate::test_cfg::is_test_only_cfg(line) {
+                    pending_test_item = true;
+                    continue;
+                }
+                let opens = code.matches('{').count() as i32;
+                let closes = code.matches('}').count() as i32;
+                if pending_test_item && opens > 0 {
+                    skip_depth = Some(depth);
+                    pending_test_item = false;
+                }
+                depth += opens - closes;
+                if let Some(d) = skip_depth {
+                    if depth <= d {
+                        skip_depth = None;
+                    }
+                    continue;
+                }
+                out.push(code);
+            }
+            let prod = out.join("\n");
+            let decl = "pub const RC6_RETIRED_CARRIERS_ADMITTED_UNTIL_989";
+            let Some(i) = prod.find(decl) else { return 0 };
+            let body = &prod[i..];
+            let body = &body[..body.find("];").expect("the const closes")];
+            // One `(` per entry tuple after the type annotation's `&[(`.
+            body.matches("    (").count()
+        }
+        let entries = production_entries(include_str!("registry.rs"));
+        assert_eq!(
+            entries,
+            RC6_RETIRED_CARRIERS_ADMITTED_UNTIL_989.len(),
+            "I701: the from-disk count must read the const the build compiled"
+        );
+        let changelog = include_str!("../../../CHANGELOG.md");
+        let mut marker = false;
+        let mut cut = Vec::new();
+        for line in changelog.lines() {
+            let Some(rest) = line.strip_prefix("## [") else {
+                continue;
+            };
+            let Some((ver, tail)) = rest.split_once(']') else {
+                continue;
+            };
+            let Some(major) = ver.split('.').next().and_then(|m| m.parse::<u32>().ok()) else {
+                continue;
+            };
+            if major < 55 {
+                continue;
+            }
+            if ver == "55.0.0" && tail.trim() == "- UNRELEASED" {
+                marker = true;
+            } else {
+                cut.push(line.to_owned());
+            }
+        }
+        if entries == 0 {
+            return;
+        }
+        assert!(
+            cut.is_empty(),
+            "I701: RC6_RETIRED_CARRIERS_ADMITTED_UNTIL_989 outlived v55 — {cut:?} is cut while the \
+             temporary carrier exception still admits {entries} retired rc6 carrier(s). Retire the \
+             emitters onto rc7's grammar (CIRISPersist#989) and delete the const."
+        );
+        assert!(
+            marker,
+            "I701: no `## [55.0.0] - UNRELEASED` heading in CHANGELOG.md — the temporary carrier \
+             exception's marker is missing, so this gate cannot tell whether v55 is cut"
+        );
     }
 
     /// v50.0.0 (CIRISPersist#924, CIRISConstitution#112) — the grammar pin.
