@@ -207,7 +207,7 @@ async fn pull_a_legacy_v2_dag(aad: Option<Vec<u8>>) {
         .await
         .unwrap_or_else(|e| panic!("B adopts chunk {}: {e}", c.seq));
     }
-    b.promote_adopted_manifest_to_dag(&root, &nb.key, aad)
+    b.promote_adopted_manifest_to_dag(&root, &nb.key, aad, AdoptDisposition::LocalOnly)
         .await
         .expect("B promotes the v2 DAG");
     let r = b.sealed_dag_readiness(&root, &nb.key, aad).await.unwrap();

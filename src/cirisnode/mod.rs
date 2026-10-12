@@ -75,17 +75,15 @@ pub use federation_announcement::{
 };
 pub use media_sharing::{
     extract_key_grant_payload, extract_takedown_notice_payload, require_key_grant_envelope,
-    KeyGrantPayload, KeyGrantScope, KeyValidityWindow, LegalBasis, MultimediaConfig,
-    MultimediaConfigWire, TakedownNoticePayload, WrapAlgorithm, IFAC_SIZE_MAX_BITS,
-    IFAC_SIZE_MIN_BITS, KEY_GRANT_SUBJECT_KIND, TAKEDOWN_NOTICE_SUBJECT_KIND,
+    KeyGrantPayload, KeyGrantScope, KeyValidityWindow, LegalBasis, TakedownNoticePayload,
+    WrapAlgorithm, IFAC_SIZE_MAX_BITS, IFAC_SIZE_MIN_BITS, KEY_GRANT_SUBJECT_KIND,
+    TAKEDOWN_NOTICE_SUBJECT_KIND,
 };
 pub use service::{
     NodeCoreService, RetireFailureStage, RetireGrantFailure, RetireKeyGrantsOutcome,
 };
 #[cfg(any(feature = "postgres", feature = "sqlite"))]
-pub use takedown_handler::{
-    process_takedown_admission, process_takedown_admission_with_config, TakedownReport,
-};
+pub use takedown_handler::{process_takedown_admission, takedown_notice_from_contribution};
 // v1.3.0 (CIRISPersist#47): convenience re-export of the
 // FederationDirectory trait so NodeCore consumers can use either
 // `ciris_persist::federation::FederationDirectory` (canonical) or
@@ -293,6 +291,49 @@ pub async fn check_moderation_or_reject(
         Err(crate::federation::Error::Backend(e)) => Err(Error::Backend(e)),
         Err(e) => Err(Error::Internal(format!(
             "moderation gate unexpected federation error: {e}"
+        ))),
+    }
+}
+
+/// v55.0.0 (CIRISPersist#1007) — the `takedown_notice` gate at
+/// `put_contribution`: [`takedown_authority`](crate::federation::takedown_tombstone::takedown_authority),
+/// the ONE decision the tombstone door re-asks at execution. The content's
+/// community is read from the rows THIS node holds that bind the content,
+/// never from the notice's `community_id` (which a signer could point at a
+/// community it moderates). A content with no binding row held here is an
+/// ordering gap: [`Error::NotFound`] naming `takedown_content_unbound`
+/// (retryable once the binding row replicates). No duty is
+/// [`Error::DelegatedScopeUnauthorized`], as before.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub async fn check_takedown_or_reject(
+    directory: &dyn crate::federation::FederationDirectory,
+    signer: &str,
+    payload: &serde_json::Value,
+) -> Result<(), Error> {
+    use crate::federation::takedown_tombstone::{takedown_authority, token};
+    let (content_sha256, _) = payload_target_descriptor(payload);
+    let basis = payload
+        .get("legal_basis")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    match takedown_authority(directory, signer, &content_sha256, basis).await {
+        Ok(()) => Ok(()),
+        Err(crate::federation::Error::PurgeRefused { token: t, body })
+            if t == token::CONTENT_UNBOUND =>
+        {
+            Err(Error::NotFound(format!("{t}: {body}")))
+        }
+        Err(crate::federation::Error::PurgeRefused { token: t, body })
+            if t == token::UNAUTHORISED =>
+        {
+            Err(Error::DelegatedScopeUnauthorized(format!(
+                "signer {signer} holds no takedown duty over {content_sha256} under the \
+                 content's own binding here (CC 4.5.5): {body}"
+            )))
+        }
+        Err(crate::federation::Error::Backend(e)) => Err(Error::Backend(e)),
+        Err(e) => Err(Error::Internal(format!(
+            "takedown gate unexpected federation error: {e}"
         ))),
     }
 }

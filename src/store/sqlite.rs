@@ -15809,6 +15809,8 @@ impl crate::federation::BlobStorage for SqliteBackend {
         group_key_id: Option<&str>,
     ) -> Result<(), crate::federation::BlobError> {
         floor.check_scope(cohort_scope)?;
+        // v55.0.0 (#1007) — taken-down bytes never come back.
+        crate::federation::steward_purge::refuse_tombstoned_bytes(self, sha256).await?;
         let scope = cohort_scope.to_owned();
         let tier = floor.tier().as_str().to_owned();
         let group = group_key_id.map(str::to_owned);
@@ -16168,6 +16170,8 @@ impl crate::federation::BlobStorage for SqliteBackend {
         group_key_id: Option<&str>,
     ) -> Result<(), crate::federation::BlobError> {
         floor.check_scope(cohort_scope)?;
+        // v55.0.0 (#1007) — taken-down bytes never come back.
+        crate::federation::steward_purge::refuse_tombstoned_bytes(self, sha256).await?;
         let scope = cohort_scope.to_owned();
         let tier = floor.tier().as_str().to_owned();
         let author = author_key_id.map(str::to_owned);
@@ -18534,6 +18538,11 @@ impl crate::federation::BlobStorage for SqliteBackend {
         let cap = self.inline_bytes_cap();
         // Validation + row preparation (chunks first, manifest last).
         let rows = crate::federation::blobs::prepare_chunk_rows(&manifest, &chunks, cap)?;
+        // v55.0.0 (#1007) — taken-down bytes never come back: no chunk, and
+        // not the manifest.
+        for row in &rows {
+            crate::federation::steward_purge::refuse_tombstoned_bytes(self, &row.sha256).await?;
+        }
 
         let now_iso = chrono::Utc::now().to_rfc3339();
         self.write(move |conn| -> Result<(), rusqlite::Error> {
@@ -18562,6 +18571,72 @@ impl crate::federation::BlobStorage for SqliteBackend {
         .await
         .map_err(|e| crate::federation::BlobError::Backend(format!("put_blob_chunks tx: {e}")))?;
         Ok(())
+    }
+
+    // v55.0.0 (CIRISPersist#952) — the incremental plaintext DAG's finalize:
+    // every chunk row the manifest names is read in the SAME transaction that
+    // writes the manifest row, so the row lands only over a whole DAG.
+    async fn put_dag_manifest_over_held(
+        &self,
+        manifest: crate::federation::ChunkManifest,
+    ) -> Result<[u8; 32], crate::federation::BlobError> {
+        let row =
+            crate::federation::blobs::prepare_manifest_row(&manifest, self.inline_bytes_cap())?;
+        // v55.0.0 (#1007) — taken-down bytes never come back: neither the
+        // manifest nor a withheld chunk becomes a DAG.
+        crate::federation::steward_purge::refuse_tombstoned_bytes(self, &row.sha256).await?;
+        for c in &manifest.chunks {
+            crate::federation::steward_purge::refuse_tombstoned_bytes(self, &c.sha).await?;
+        }
+        let chunks: Vec<([u8; 32], u64)> = manifest
+            .chunks
+            .iter()
+            .map(|c| (c.sha, u64::from(c.size)))
+            .collect();
+        let now_iso = chrono::Utc::now().to_rfc3339();
+        let sha = row.sha256;
+        let outcome = self
+            .write(
+                move |conn| -> Result<Result<(), crate::federation::BlobError>, rusqlite::Error> {
+                    let tx = conn.transaction()?;
+                    for (idx, (chunk_sha, size)) in chunks.iter().enumerate() {
+                        let held: Option<(String, String, i64)> = tx
+                            .query_row(
+                                "SELECT storage_kind, crypto_tier, size_bytes \
+                                 FROM federation_blobs WHERE sha256 = ?1",
+                                rusqlite::params![chunk_sha.to_vec()],
+                                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                            )
+                            .optional()?;
+                        if let Err(e) = crate::federation::blobs::check_held_dag_chunk(
+                            idx, chunk_sha, *size, held,
+                        ) {
+                            return Ok(Err(e));
+                        }
+                    }
+                    tx.execute(
+                        "INSERT INTO federation_blobs (\
+                            sha256, storage_kind, bytes_inline, external_ref, size_bytes, \
+                            media_type, last_accessed_at, access_count\
+                         ) VALUES (?1, ?2, ?3, NULL, ?4, NULL, ?5, 0) \
+                         ON CONFLICT (sha256) DO NOTHING",
+                        rusqlite::params![
+                            row.sha256.to_vec(),
+                            row.storage_kind,
+                            row.bytes_inline,
+                            row.size_bytes,
+                            now_iso,
+                        ],
+                    )?;
+                    tx.commit()?;
+                    Ok(Ok(()))
+                },
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!("put_dag_manifest_over_held: {e}"))
+            })?;
+        outcome.map(|()| sha)
     }
 
     async fn put_blob_chunk_with_scope(
@@ -19537,6 +19612,8 @@ impl crate::federation::BlobStorage for SqliteBackend {
         // The address is the SHA-256 of the CIPHERTEXT, computed here from
         // the bytes that are stored — never trusted from the sender.
         let sha256: [u8; 32] = sha2::Sha256::digest(&envelope_bytes).into();
+        // v55.0.0 (#1007) — taken-down bytes never come back.
+        crate::federation::steward_purge::refuse_tombstoned_bytes(self, &sha256).await?;
         let size_i64 = i64::try_from(envelope_bytes.len()).map_err(|_| {
             crate::federation::BlobError::InvalidArgument(
                 "adopt_sealed_blob_at: size_bytes exceeds i64".into(),
@@ -20993,15 +21070,24 @@ impl crate::federation::BlobStorage for SqliteBackend {
                 None => continue,
             };
 
-            // Emit the withdraws (fail-honest: still delete the blob).
-            let withdraws_outcome = crate::federation::blobs::emit_withdraws_attestation_helper(
-                &prior,
-                attesting_key_id,
-                signer,
-                self,
-                now,
-            )
-            .await;
+            // v55.0.0 (CIRISPersist#1007) — only the holder retracts its own claim
+            // (CC 3.1.3.3 rule 4): a claim another key signed is its signer's to
+            // retract, and the door refuses this node's `withdraws` of it. The
+            // bytes are deleted either way (fail-honest).
+            let withdraws_outcome = if prior.attesting_key_id == signer.derived_key_id() {
+                Some(
+                    crate::federation::blobs::emit_withdraws_attestation_helper(
+                        &prior,
+                        attesting_key_id,
+                        signer,
+                        self,
+                        now,
+                    )
+                    .await,
+                )
+            } else {
+                None
+            };
 
             // Delete the blob row.
             let deleted = self.delete_blob(&sha).await?;
@@ -21009,8 +21095,9 @@ impl crate::federation::BlobStorage for SqliteBackend {
                 report.blobs_evicted += 1;
             }
             match withdraws_outcome {
-                Ok(()) => report.withdraws_emitted += 1,
-                Err(e) => {
+                None => {}
+                Some(Ok(())) => report.withdraws_emitted += 1,
+                Some(Err(e)) => {
                     report.withdraws_failed += 1;
                     tracing::warn!(
                         error = %e,
@@ -21532,6 +21619,18 @@ impl SqliteBackend {
                 Err(e) => results.push(Some(Err(e))),
             }
         }
+
+        // v55.0.0 (#1007) — taken-down bytes never come back: that item's
+        // answer is the refusal, as for any other per-item refusal.
+        let mut kept: Vec<SqliteChunkRow> = Vec::with_capacity(ready.len());
+        for row in ready {
+            match crate::federation::steward_purge::refuse_tombstoned_bytes(self, &row.sha256).await
+            {
+                Ok(()) => kept.push(row),
+                Err(e) => results[row.slot] = Some(Err(e)),
+            }
+        }
+        let ready = kept;
 
         let meta: Vec<(u64, [u8; 32])> = ready.iter().map(|r| (r.seq, r.sha256)).collect();
         let now_iso = chrono::Utc::now().to_rfc3339();

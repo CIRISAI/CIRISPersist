@@ -351,7 +351,6 @@ Engine	get_edge_detection_events	empirical
 Engine	get_features	empirical	
 Engine	get_fountain_content	empirical	
 Engine	get_installed_storage_budget_json	empirical	
-Engine	get_multimedia_config_json	empirical	
 Engine	get_repository_statistics	epistemic	
 Engine	get_retention	empirical	
 Engine	get_scope_blob	empirical	
@@ -626,7 +625,6 @@ Engine	set_active_halt	deontic
 Engine	set_classifications	empirical	
 Engine	set_consent_role	deontic	
 Engine	set_features	empirical	
-Engine	set_multimedia_config_json	deontic	
 Engine	set_perceptual_hash_matcher	structural	
 Engine	set_retention	deontic	
 Engine	set_self_key_id	ontological	
@@ -790,3 +788,9 @@ Engine	purge_status_json	empirical
 Engine	purge_ledger_tsv	empirical
 Engine	list_purge_bundles_since_json	epistemic
 Engine	purge_notice_signing_payload_json	nomological
+# v55.0.0 (CIRISPersist#952) — the incremental plaintext chunk-DAG write.
+# Both are DEONTIC like `put_blob_chunks_signing_json`: the chunk door decides
+# what this node stores (the WILL decision, the per-chunk hash and size), and
+# the finalize decides when a DAG is whole enough to be held and claimed.
+Engine	put_plaintext_dag_chunk	deontic
+Engine	finalize_blob_chunks_signing_json	deontic

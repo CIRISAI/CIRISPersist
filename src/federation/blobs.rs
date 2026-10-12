@@ -2061,6 +2061,25 @@ pub trait BlobStorage: Send + Sync {
         chunks: Vec<([u8; 32], BlobBody)>,
     ) -> impl Future<Output = Result<(), BlobError>> + Send;
 
+    /// v55.0.0 (CIRISPersist#952) — **the incremental plaintext DAG's
+    /// finalize floor.** The chunks were stored one at a time
+    /// (`Engine::put_plaintext_dag_chunk`); in ONE transaction this reads
+    /// every chunk row the manifest names and writes the `chunk_dag` manifest
+    /// row only if each is held as a plaintext, non-DAG row of exactly the
+    /// entry's size. Returns the manifest's address. Before this commits there
+    /// is no manifest row, so a partial DAG is invisible to every read and
+    /// listing of its address.
+    ///
+    /// The caller checks the manifest's shape first
+    /// (`blobs::check_plaintext_dag_manifest`). Refusals: a chunk not held is
+    /// [`BlobError::NotHeld`] naming it; a chunk row of another size, tier or
+    /// kind is [`BlobError::InvalidArgument`] naming its index. Idempotent on
+    /// the manifest's address.
+    fn put_dag_manifest_over_held(
+        &self,
+        manifest: ChunkManifest,
+    ) -> impl Future<Output = Result<[u8; 32], BlobError>> + Send;
+
     /// v4.1 (CIRISPersist#142, Cut C1a) — **live append** of one chunk
     /// to a stream (CEG §10.5.1).
     ///
@@ -3326,7 +3345,10 @@ pub trait BlobStorage: Send + Sync {
     /// # Mechanics
     ///
     /// 1. Resolve the actor's live holdings via [`list_held_by`].
-    /// 2. For each holding's `holds_bytes` attestation: emit a
+    /// 2. For each holding's `holds_bytes` attestation THIS signer signed
+    ///    (v55.0.0, CIRISPersist#1007: only the holder retracts its own
+    ///    claim, CC 3.1.3.3 rule 4; another key's claim is skipped and the
+    ///    door would refuse it): emit a
     ///    `withdraws` attestation HYBRID-signed by `signer`
     ///    (Ed25519 + ML-DSA-65), canonicalized via the CEG produce gate
     ///    ([`crate::verify::canonical::ceg_produce_canonicalize`]) — the
@@ -5625,8 +5647,6 @@ pub(crate) fn prepare_chunk_rows(
     chunks: &[([u8; 32], BlobBody)],
     inline_bytes_cap: usize,
 ) -> Result<Vec<PreparedBlobRow>, BlobError> {
-    use sha2::{Digest, Sha256};
-
     // 1. total_size == sum(chunk sizes).
     manifest.validate_total_size()?;
 
@@ -5649,59 +5669,91 @@ pub(crate) fn prepare_chunk_rows(
                 hex::encode(mref.sha)
             )));
         }
-        let (storage_kind, bytes_inline, external_ref, size) = match body {
-            BlobBody::Inline(bytes) => {
-                if bytes.len() > inline_bytes_cap {
-                    return Err(BlobError::InlineSizeExceeded {
-                        size: bytes.len(),
-                        cap: inline_bytes_cap,
-                    });
-                }
-                // Verify the chunk bytes hash to the manifest entry SHA.
-                let computed = Sha256::digest(bytes);
-                if computed.as_slice() != mref.sha.as_slice() {
-                    return Err(BlobError::HashMismatch {
-                        expected_hex: hex::encode(mref.sha),
-                        got_hex: hex::encode(computed),
-                    });
-                }
-                // And the chunk length matches the manifest size.
-                if bytes.len() as u64 != u64::from(mref.size) {
-                    return Err(BlobError::InvalidArgument(format!(
-                        "put_blob_chunks: chunk[{idx}] is {} bytes but manifest size is {}",
-                        bytes.len(),
-                        mref.size
-                    )));
-                }
-                ("inline", Some(bytes.clone()), None, u64::from(mref.size))
-            }
-            BlobBody::External(e) => {
-                let kind = body.storage_kind();
-                (kind, None, Some(e.uri.clone()), e.size_bytes)
-            }
-            BlobBody::ChunkDag(_) => {
-                return Err(BlobError::InvalidArgument(format!(
-                    "put_blob_chunks: chunk[{idx}] is itself a ChunkDag — \
-                     one-level DAG only (no nesting)"
-                )));
-            }
-        };
-        let size_bytes = i64::try_from(size).map_err(|_| {
-            BlobError::InvalidArgument("put_blob_chunks: chunk size_bytes exceeds i64".into())
-        })?;
-        rows.push(PreparedBlobRow {
-            sha256: *chunk_sha,
-            storage_kind,
-            bytes_inline,
-            external_ref,
-            size_bytes,
-        });
+        rows.push(prepare_dag_chunk_row(idx, body, mref, inline_bytes_cap)?);
     }
 
     // The manifest row last (so a covering chunk always exists before
     // the manifest references it within the same txn — not strictly
     // required for correctness given the single txn, but it keeps the
     // insert order intuitive).
+    rows.push(prepare_manifest_row(manifest, inline_bytes_cap)?);
+
+    Ok(rows)
+}
+
+/// One chunk of a plaintext DAG, checked against its manifest entry `mref`
+/// (`idx` names it in a refusal): an `Inline` body must hash to the entry's
+/// sha ([`BlobError::HashMismatch`]) and be exactly the entry's size, within
+/// the inline cap; an `External` body is trusted (persist has no bytes to
+/// hash); a nested `ChunkDag` is refused (one-level DAG only). Shared by the
+/// one-shot door ([`prepare_chunk_rows`]) and the incremental one
+/// (`Engine::put_plaintext_dag_chunk`, CIRISPersist#952), so the two admit
+/// exactly the same chunk.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub(crate) fn prepare_dag_chunk_row(
+    idx: usize,
+    body: &BlobBody,
+    mref: &ChunkRef,
+    inline_bytes_cap: usize,
+) -> Result<PreparedBlobRow, BlobError> {
+    use sha2::{Digest, Sha256};
+    let (storage_kind, bytes_inline, external_ref, size) = match body {
+        BlobBody::Inline(bytes) => {
+            if bytes.len() > inline_bytes_cap {
+                return Err(BlobError::InlineSizeExceeded {
+                    size: bytes.len(),
+                    cap: inline_bytes_cap,
+                });
+            }
+            // Verify the chunk bytes hash to the manifest entry SHA.
+            let computed = Sha256::digest(bytes);
+            if computed.as_slice() != mref.sha.as_slice() {
+                return Err(BlobError::HashMismatch {
+                    expected_hex: hex::encode(mref.sha),
+                    got_hex: hex::encode(computed),
+                });
+            }
+            // And the chunk length matches the manifest size.
+            if bytes.len() as u64 != u64::from(mref.size) {
+                return Err(BlobError::InvalidArgument(format!(
+                    "put_blob_chunks: chunk[{idx}] is {} bytes but manifest size is {}",
+                    bytes.len(),
+                    mref.size
+                )));
+            }
+            ("inline", Some(bytes.clone()), None, u64::from(mref.size))
+        }
+        BlobBody::External(e) => {
+            let kind = body.storage_kind();
+            (kind, None, Some(e.uri.clone()), e.size_bytes)
+        }
+        BlobBody::ChunkDag(_) => {
+            return Err(BlobError::InvalidArgument(format!(
+                "put_blob_chunks: chunk[{idx}] is itself a ChunkDag — \
+                 one-level DAG only (no nesting)"
+            )));
+        }
+    };
+    let size_bytes = i64::try_from(size).map_err(|_| {
+        BlobError::InvalidArgument("put_blob_chunks: chunk size_bytes exceeds i64".into())
+    })?;
+    Ok(PreparedBlobRow {
+        sha256: mref.sha,
+        storage_kind,
+        bytes_inline,
+        external_ref,
+        size_bytes,
+    })
+}
+
+/// The `chunk_dag` manifest row of `manifest`: its JCS bytes inline, its
+/// address the SHA-256 of those bytes, `size_bytes` its `total_size`.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub(crate) fn prepare_manifest_row(
+    manifest: &ChunkManifest,
+    inline_bytes_cap: usize,
+) -> Result<PreparedBlobRow, BlobError> {
+    use sha2::{Digest, Sha256};
     let manifest_bytes = manifest.to_jcs_bytes();
     if manifest_bytes.len() > inline_bytes_cap {
         return Err(BlobError::InlineSizeExceeded {
@@ -5713,15 +5765,67 @@ pub(crate) fn prepare_chunk_rows(
     let manifest_size = i64::try_from(manifest.total_size).map_err(|_| {
         BlobError::InvalidArgument("put_blob_chunks: total_size exceeds i64".into())
     })?;
-    rows.push(PreparedBlobRow {
+    Ok(PreparedBlobRow {
         sha256: manifest_sha,
         storage_kind: "chunk_dag",
         bytes_inline: Some(manifest_bytes),
         external_ref: None,
         size_bytes: manifest_size,
-    });
+    })
+}
 
-    Ok(rows)
+/// v55.0.0 (CIRISPersist#952) — **is chunk `idx` held whole?** The finalize
+/// floor's per-chunk question, asked of the row each backend read inside its
+/// transaction as `(storage_kind, crypto_tier, size_bytes)`: present, a
+/// plaintext non-DAG row (a sealed row at the address holds an envelope, not
+/// the chunk's bytes), of exactly the manifest entry's size. ONE predicate
+/// for both backends.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub(crate) fn check_held_dag_chunk(
+    idx: usize,
+    chunk_sha: &[u8; 32],
+    size: u64,
+    held: Option<(String, String, i64)>,
+) -> Result<(), BlobError> {
+    let Some((kind, tier, held_size)) = held else {
+        return Err(BlobError::NotHeld {
+            sha256_hex: hex::encode(chunk_sha),
+        });
+    };
+    let plaintext = crate::federation::types::cohort_scope::CryptoTier::Plaintext.as_str();
+    if kind == "chunk_dag" || tier != plaintext || u64::try_from(held_size).ok() != Some(size) {
+        return Err(BlobError::InvalidArgument(format!(
+            "finalize_blob_chunks_signing: chunk[{idx}] {} is held as a {kind} row at tier \
+             {tier} of {held_size} bytes, not a plaintext chunk of {size} bytes",
+            hex::encode(chunk_sha)
+        )));
+    }
+    Ok(())
+}
+
+/// v55.0.0 (CIRISPersist#952) — the manifest a PLAINTEXT chunk DAG may be
+/// finalized under: version [`CHUNK_MANIFEST_VERSION`], no `chunk_tier`, no
+/// `stream_id` (both are the sealed DAG's), at least one chunk, and
+/// `total_size` the sum of the chunk sizes. The incremental door's finalize
+/// asks this before it reads a single chunk row.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub(crate) fn check_plaintext_dag_manifest(manifest: &ChunkManifest) -> Result<(), BlobError> {
+    if manifest.v != CHUNK_MANIFEST_VERSION
+        || manifest.chunk_tier.is_some()
+        || manifest.stream_id.is_some()
+    {
+        return Err(BlobError::InvalidArgument(format!(
+            "finalize_blob_chunks_signing: a plaintext chunk DAG's manifest is version {} with no \
+             chunk_tier and no stream_id (got version {}); a sealed DAG is adopted and promoted",
+            CHUNK_MANIFEST_VERSION, manifest.v
+        )));
+    }
+    if manifest.chunks.is_empty() {
+        return Err(BlobError::InvalidArgument(
+            "finalize_blob_chunks_signing: the manifest names no chunks".into(),
+        ));
+    }
+    manifest.validate_total_size()
 }
 
 #[cfg(all(test, feature = "sqlite"))]

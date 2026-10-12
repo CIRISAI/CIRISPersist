@@ -15824,6 +15824,87 @@
     "field": "group_key_id",
     "prefix": "watchlist:{id}",
     "tsv_excluded": "src/safety/watchlist.rs does not exist in persist (misattributed; dropped at the post-cut materialisation)"
+   },
+   {
+    "decimal_id": "4.5.3",
+    "claim_id": "CLM-one-tombstone-row",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/takedown_tombstone.rs#takedown_tombstone",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v55-c-1007",
+    "witness": "I786, I787 (memory, sqlite, postgres)"
+   },
+   {
+    "decimal_id": "4.5.3",
+    "claim_id": "CLM-one-tombstone-row",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/takedown_tombstone.rs#apply_replicated_takedown",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v55-c-1007",
+    "witness": "I788, I789 (memory, sqlite, postgres); I795 (sqlite, postgres)"
+   },
+   {
+    "decimal_id": "4.5.3",
+    "claim_id": "CLM-one-tombstone-row",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/takedown_tombstone.rs#settles_at",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v55-c-1007",
+    "witness": "I793; I790 (sqlite, postgres)"
+   },
+   {
+    "decimal_id": "4.5.3",
+    "claim_id": "CLM-one-tombstone-row",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/engine.rs#takedown_holder_action",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v55-c-1007",
+    "witness": "I790, I795 (sqlite, postgres)"
+   },
+   {
+    "decimal_id": "4.5.3",
+    "claim_id": "CLM-one-tombstone-row",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/steward_purge.rs#purge_rows",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v55-c-1007",
+    "witness": "I664, I787 (memory, sqlite, postgres)"
+   },
+   {
+    "decimal_id": "2.4.1.1",
+    "claim_id": "CLM-derived-rows-follow-reason",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/steward_purge.rs#resolve_selection",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v55-c-1007",
+    "witness": "I654, I662, I820 (memory, sqlite, postgres)"
+   },
+   {
+    "decimal_id": "2.4.1.1",
+    "claim_id": "CLM-derived-rows-follow-reason",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/steward_purge.rs#withhold_orphaned_derivatives",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v55-c-1007",
+    "witness": "I820 (memory, sqlite, postgres)"
+   },
+   {
+    "decimal_id": "2.4.1.1",
+    "claim_id": "CLM-derived-rows-follow-reason",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/takedown_tombstone.rs#takedown_tombstone",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v55-c-1007",
+    "witness": "I792, I788 (memory, sqlite, postgres)"
+   },
+   {
+    "decimal_id": "2.4.1.1",
+    "claim_id": "CLM-derived-rows-follow-reason",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/steward_purge.rs#purge_withheld",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v55-c-1007",
+    "witness": "I792 (memory, sqlite, postgres); I790 (sqlite, postgres)"
    }
   ],
   "CIRISServer": [

@@ -702,17 +702,27 @@ class Engine:
     def cirisnode_cast_vote(self, envelope_json: str) -> None:
         """(derived) deontic — v0.7.0 — Verify-and-insert a Vote envelope. [build-conditional: #[cfg(feature = "cirisnode")]]"""
 
-    def cirisnode_process_takedown_admission_json(
-        self, notice_payload_json: str, signer_key_id: str, now_iso: str
-    ) -> str:
-        """v3.6.0 (CIRISPersist#134) — run the takedown-admission orchestration
-        over a JSON ``TakedownNoticePayload``, consulting the installed
-        ``MultimediaConfig`` (or persist's defaults when none is installed) for
-        the immediate-eviction decision and the counter-notice window.
+    def cirisnode_process_takedown_admission_json(self, contribution_json: str) -> str:
+        """v55.0.0 (CIRISPersist#1007; CC 4.5.3 step 2, CC 4.5.5) — execute a
+        takedown on the bytes plane from the SIGNED ``takedown_notice``
+        Contribution (the ``ContributionEnvelope`` JSON). The signature is
+        re-verified and CC 4.5.5 re-asked of this node's state; then ONE
+        tombstone, ``blob:{content_sha256}``, is recorded on the steward
+        purge's tombstone row and replicates as a purge bundle. An
+        immediate-removal basis destroys this node's bytes on receipt; a
+        counter-notice basis retracts this node's own holding claim and the
+        hard delete waits for ``purge_finalize_json`` after the window; the
+        age-gate basis records nothing. No other device's claim is withdrawn.
 
-        Returns the admission outcome as JSON — **a truthy string on the refusal
-        arm too**. This one both DECIDES and ACTS: a caller who mis-reads the
-        verdict may re-drive it and evict content twice.
+        Returns JSON ``{"notice_id", "content_sha256", "legal_basis",
+        "disposition", "signer", "tombstoned", "settles_at",
+        "claims_retracted", "bytes_destroyed"}``. Idempotent on the notice.
+
+        Raises:
+            ValueError: ``(token, body_json)`` with token
+                ``takedown_unauthorised`` (bad signature, basis outside the
+                closed set, outside its window, or a signer holding no
+                ``takedown`` duty over the content here).
         """
 
     def cirisnode_put_key_grant_json(self, envelope_json: str) -> None:
@@ -821,6 +831,9 @@ class Engine:
 
     def file_moderation(self, content_sha256: str, community_id: str, duty: str, allegation_type: str) -> str:
         """(derived) deontic — v9.3.0 (#249, §11.10 EMIT) — file a moderation report: a scores on the moderation:{allegation_type} dimension over content_sha256, naming community..."""
+
+    def finalize_blob_chunks_signing_json(self, payload_json: str) -> str:
+        """(derived) deontic — v55.0.0 (CIRISPersist#952) — finalize an incremental plaintext chunk DAG (Engine::finalize_blob_chunks_signing). Payload: {"manifest": {"v": 1, "to..."""
 
     def get_blob_for_viewer(self, at_rest_sha256_hex: str, viewer_key_id: str) -> str:
         """(derived) deontic — v43.0.0 (§10.1) — read a self/family-encrypted blob as viewer_key_id."""
@@ -960,7 +973,7 @@ class Engine:
     def pin_trust_from_bundle_response_json(self, response_json: str) -> str:
         """(derived) deontic — v50.0.0 (CIRISPersist#926) — the consumer half of CC 4.4 / 5.3.4: pin ciris-canonical from ONE TrustRootBundleResponse JSON (the bundle's quorum ve..."""
 
-    def promote_adopted_manifest_to_dag_json(self, at_rest_sha256_hex: str, viewer_key_id: str, caller_aad_b64: str | None = None) -> str:
+    def promote_adopted_manifest_to_dag_json(self, at_rest_sha256_hex: str, viewer_key_id: str, disposition: str, caller_aad_b64: str | None = None) -> str:
         """(derived) deontic — v51.3.0 (CIRISPersist#947) — finish a sealed DAG adopt. adopt_sealed_blob_json stores a received sealed manifest as an inline envelope; until this..."""
 
     def publish_self_occurrence(self, identity_key_id: str, device_class: str, valid_until_iso: str | None = None) -> str:
@@ -1101,6 +1114,9 @@ class Engine:
 
     def put_partner_record(self, signed_json: str) -> None:
         """(derived) deontic — Federation directory: admit a partner_record envelope (M-of-N steward quorum; CEG 1.0-RC2 §5.6.8.13). signed_json = SignedPartnerRecord (carries th..."""
+
+    def put_plaintext_dag_chunk(self, chunk_sha256_hex: str, size: int, body: bytes, author_key_id: str) -> str:
+        """(derived) deontic — v55.0.0 (CIRISPersist#952, CIRISEdge#734) — store ONE chunk of a plaintext chunk DAG ahead of its manifest (Engine::put_plaintext_dag_chunk). chunk..."""
 
     def put_public_key(self, signed_key_record_json: str) -> None:
         """(derived) deontic — Federation directory: register a public key."""
@@ -1530,9 +1546,6 @@ class Engine:
 
     def set_consent_role(self, key_id: str, consent_role: str | None = None) -> None:
         """(derived) deontic — v13.0.0 (CIRISPersist#365, CC 3.4.7.2 OQ-1) — assign or overwrite the Counter-RII consent_role of key_id. consent_role=None revokes it (resets the..."""
-
-    def set_multimedia_config_json(self, config_json: str | None) -> None:
-        """(derived) deontic — v3.6.0 (CIRISPersist#134) — install / clear the media-sharing operator config ([MultimediaConfig](crate::cirisnode::MultimediaConfig)). Wire shape:... [build-conditional: #[cfg(feature = "cirisnode")]]"""
 
     def set_retention(self, table_name: str, min_keep_secs: int, time_column: str, pressure_trigger_bytes: int | None = None, pressure_target_bytes: int | None = None, interval_secs: int = ...) -> None:
         """(derived) deontic — v6.0.1 (CIRISPersist#218) — Set (upsert) the retention policy for table_name. table_name and time_column are validated as strict SQL identifiers in..."""
@@ -2952,9 +2965,6 @@ class Engine:
 
     def get_installed_storage_budget_json(self, node_id: str) -> str | None:
         """(derived) empirical — #370 — the installed StorageBudgetV1 wire JSON for node_id, VERBATIM as accepted (re-verifiable with verify_storage_budget_v1). None when no budget..."""
-
-    def get_multimedia_config_json(self) -> str | None:
-        """(derived) empirical — v3.6.0 (CIRISPersist#134) — snapshot of the currently-installed media-sharing config as a JSON string. Returns the wire shape (see [MultimediaConfi... [build-conditional: #[cfg(feature = "cirisnode")]]"""
 
     def get_retention(self, table_name: str) -> str | None:
         """(derived) empirical — v6.0.1 (CIRISPersist#218) — Stored retention policy for table_name as a JSON-encoded RetentionPolicy, or None when no policy exists."""

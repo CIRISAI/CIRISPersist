@@ -359,9 +359,14 @@ pub(crate) mod bodies {
             );
             if i == 0 && view.children.len() > 1 {
                 let e =
-                    p.b.promote_adopted_manifest_to_dag(&root, &p.key_b, None)
-                        .await
-                        .expect_err("children missing");
+                    p.b.promote_adopted_manifest_to_dag(
+                        &root,
+                        &p.key_b,
+                        None,
+                        crate::federation::AdoptDisposition::LocalOnly,
+                    )
+                    .await
+                    .expect_err("children missing");
                 assert!(
                     matches!(&e, BlobError::InvalidArgument(m) if m.contains("child 1") && m.contains("not held")),
                     "{e:?}"
@@ -381,9 +386,14 @@ pub(crate) mod bodies {
             .unwrap_or_else(|e| panic!("I204: chunk {}: {e}", c.seq));
         }
         let promoted =
-            p.b.promote_adopted_manifest_to_dag(&root, &p.key_b, None)
-                .await
-                .expect("I204: promoted");
+            p.b.promote_adopted_manifest_to_dag(
+                &root,
+                &p.key_b,
+                None,
+                crate::federation::AdoptDisposition::LocalOnly,
+            )
+            .await
+            .expect("I204: promoted");
         assert!(promoted.promoted);
         assert_eq!(
             promoted.chunk_count, 61,

@@ -605,11 +605,6 @@ struct EngineCell {
     /// installed config's budget is finite. `None` otherwise.
     /// `close()` calls `.stop()` on the handle.
     sweeper: std::sync::Mutex<Option<crate::federation::EvictionSweeper>>,
-    /// v3.6.0 (CIRISPersist#134) — shared media-sharing config slot.
-    /// `Arc<RwLock<...>>` so every PyEngine handle's
-    /// `set_multimedia_config_json` mutates the same cell-level state.
-    #[cfg(feature = "cirisnode")]
-    multimedia_config: Arc<std::sync::RwLock<Option<Arc<crate::cirisnode::MultimediaConfig>>>>,
     /// v6.8.0 (CIRISPersist#149) — disk-pressure monitor, installed at
     /// construction when a `disk_pressure` config resolves (kwarg or
     /// env). `None` ⇒ disk-pressure response not active on this engine.
@@ -815,13 +810,6 @@ pub struct PyEngine {
     /// v1.9.0 (CIRISPersist#84) — shared change-feed subscription
     /// registry. Same `Arc` every handle holds.
     subscriptions: SubscriptionRegistry,
-    /// v3.6.0 (CIRISPersist#134) — media-sharing operator config.
-    /// `None` = persist defaults (14-day counter-notice window;
-    /// child-safety + terrorist content bases evict immediately).
-    /// Wrapped in `Arc<RwLock<...>>` so handles share the cell-level
-    /// state — `set_multimedia_config_json` mutates the shared slot.
-    #[cfg(feature = "cirisnode")]
-    multimedia_config: Arc<std::sync::RwLock<Option<Arc<crate::cirisnode::MultimediaConfig>>>>,
     /// v12.3.0 (CIRISPersist#320) — the directory-ops-proxy capsule, built
     /// once and **cached on the engine**. Consumers (CIRISEdge#245) extract the
     /// raw `Directory { data, vtable }` pointer and rely on the capsule (and
@@ -985,8 +973,6 @@ impl PyEngine {
             construction_pid: cell.construction_pid,
             consumers: cell.consumers.clone(),
             subscriptions: cell.subscriptions.clone(),
-            #[cfg(feature = "cirisnode")]
-            multimedia_config: cell.multimedia_config.clone(),
             directory_ops_capsule_cache: std::sync::OnceLock::new(),
             outbound_queue_ops_capsule_cache: std::sync::OnceLock::new(),
             signer_ops_capsule_cache: std::sync::OnceLock::new(),
@@ -2608,8 +2594,6 @@ impl PyEngine {
             // when budget transitions from infinite to finite.
             replication_config: std::sync::RwLock::new(Arc::new(initial_replication_config)),
             sweeper: std::sync::Mutex::new(None),
-            #[cfg(feature = "cirisnode")]
-            multimedia_config: Arc::new(std::sync::RwLock::new(None)),
             disk_pressure: std::sync::Mutex::new(None),
             disk_pressure_handle: std::sync::Mutex::new(None),
         });
@@ -4260,8 +4244,6 @@ impl PyEngine {
             construction_pid: self.construction_pid,
             consumers: self.consumers.clone(),
             subscriptions: self.subscriptions.clone(),
-            #[cfg(feature = "cirisnode")]
-            multimedia_config: self.multimedia_config.clone(),
             directory_ops_capsule_cache: std::sync::OnceLock::new(),
             outbound_queue_ops_capsule_cache: std::sync::OnceLock::new(),
             signer_ops_capsule_cache: std::sync::OnceLock::new(),
@@ -15452,13 +15434,21 @@ impl PyEngine {
     /// be held at `(stream_id, seq)` with the named sha, size and tier
     /// (`ValueError` naming the first missing `(seq, sha)`), and flips the row
     /// to a `chunk_dag`. Returns JSON `{"sha256_hex", "promoted": true|false,
-    /// "chunk_count", "total_size"}`; `promoted: false` means it already was.
-    #[pyo3(signature = (at_rest_sha256_hex, viewer_key_id, caller_aad_b64=None))]
+    /// "chunk_count", "total_size", "announced"}`; `promoted: false` means it
+    /// already was.
+    ///
+    /// v55.0.0 (CIRISPersist#951) — `disposition` (`"announce"` |
+    /// `"local_only"`, required): a sealed DAG is announced HERE, once every
+    /// chunk is held, never at the manifest adopt (adopt the manifest
+    /// `local_only`). `"announce"` emits this node's holding claim for the
+    /// root and answers `"announced": true`.
+    #[pyo3(signature = (at_rest_sha256_hex, viewer_key_id, disposition, caller_aad_b64=None))]
     fn promote_adopted_manifest_to_dag_json(
         &self,
         py: Python<'_>,
         at_rest_sha256_hex: &str,
         viewer_key_id: &str,
+        disposition: &str,
         caller_aad_b64: Option<&str>,
     ) -> PyResult<String> {
         self.ensure_usable()?;
@@ -15466,13 +15456,28 @@ impl PyEngine {
             let sha = parse_sha256_hex(at_rest_sha256_hex)?;
             let viewer = viewer_key_id.to_owned();
             let aad = decode_aad_b64(caller_aad_b64)?;
+            let disposition = match disposition {
+                "announce" => crate::federation::AdoptDisposition::Announce,
+                "local_only" => crate::federation::AdoptDisposition::LocalOnly,
+                other => {
+                    return Err(PyValueError::new_err(format!(
+                        "promote_adopted_manifest_to_dag_json disposition {other:?}: expected \
+                         \"announce\" or \"local_only\""
+                    )))
+                }
+            };
             let engine = self.hold_engine_view();
             let runtime = self.runtime.clone();
             py.detach(move || {
                 let out = runtime
                     .block_on(async move {
                         engine
-                            .promote_adopted_manifest_to_dag(&sha, &viewer, aad.as_deref())
+                            .promote_adopted_manifest_to_dag(
+                                &sha,
+                                &viewer,
+                                aad.as_deref(),
+                                disposition,
+                            )
                             .await
                     })
                     .map_err(blob_err_to_py)?;
@@ -15510,6 +15515,82 @@ impl PyEngine {
                         engine
                             .put_blob_chunks_signing(manifest, chunks, &author)
                             .await
+                    })
+                    .map_err(blob_err_to_py)?;
+                Ok(
+                    serde_json::json!({ "manifest_sha256": hex::encode(sha), "announced": true })
+                        .to_string(),
+                )
+            })
+        })
+    }
+
+    /// v55.0.0 (CIRISPersist#952, CIRISEdge#734) — **store ONE chunk of a
+    /// plaintext chunk DAG** ahead of its manifest (`Engine::put_plaintext_dag_chunk`).
+    /// `chunk_sha256_hex` and `size` are the chunk's manifest entry; `body`
+    /// must hash to it and be exactly `size` bytes. Writes no manifest row
+    /// and no claim. Returns the chunk's address (hex).
+    fn put_plaintext_dag_chunk(
+        &self,
+        py: Python<'_>,
+        chunk_sha256_hex: &str,
+        size: u32,
+        body: &[u8],
+        author_key_id: &str,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let entry = crate::federation::ChunkRef {
+                sha: parse_sha256_hex(chunk_sha256_hex)?,
+                size,
+                seq: None,
+                epoch: None,
+            };
+            let body = crate::federation::BlobBody::Inline(body.to_vec());
+            let author = author_key_id.to_owned();
+            let engine = self.hold_engine_view();
+            let runtime = self.runtime.clone();
+            py.detach(move || {
+                let sha = runtime
+                    .block_on(
+                        async move { engine.put_plaintext_dag_chunk(&entry, body, &author).await },
+                    )
+                    .map_err(blob_err_to_py)?;
+                Ok(hex::encode(sha))
+            })
+        })
+    }
+
+    /// v55.0.0 (CIRISPersist#952) — **finalize an incremental plaintext chunk
+    /// DAG** (`Engine::finalize_blob_chunks_signing`). Payload:
+    /// `{"manifest": {"v": 1, "total_size": N, "chunks": [{"sha": "<hex>",
+    /// "size": M}, …]}, "author_key_id": "<key>"}`. Every chunk must already
+    /// be held (`put_plaintext_dag_chunk`); a missing one raises the
+    /// `blob_not_held` class naming it, with nothing written. Returns
+    /// `{"manifest_sha256": "<hex>", "announced": true}`.
+    fn finalize_blob_chunks_signing_json(
+        &self,
+        py: Python<'_>,
+        payload_json: &str,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            #[derive(serde::Deserialize)]
+            struct Wire {
+                manifest: ChunkManifestWire,
+                author_key_id: String,
+            }
+            let wire: Wire = serde_json::from_str(payload_json).map_err(|e| {
+                PyValueError::new_err(format!("finalize_blob_chunks_signing_json decode: {e}"))
+            })?;
+            let manifest = plaintext_manifest_from_wire(wire.manifest)?;
+            let author = wire.author_key_id;
+            let engine = self.hold_engine_view();
+            let runtime = self.runtime.clone();
+            py.detach(move || {
+                let sha = runtime
+                    .block_on(async move {
+                        engine.finalize_blob_chunks_signing(manifest, &author).await
                     })
                     .map_err(blob_err_to_py)?;
                 Ok(
@@ -23559,64 +23640,6 @@ impl PyEngine {
         })
     }
 
-    /// v3.6.0 (CIRISPersist#134) — install / clear the media-sharing
-    /// operator config ([`MultimediaConfig`](crate::cirisnode::MultimediaConfig)).
-    /// Wire shape: see [`MultimediaConfigWire`](crate::cirisnode::MultimediaConfigWire).
-    ///
-    /// Pass `None` (Python None / empty string) to clear; persist
-    /// defaults then apply (14-day window; child-safety + terrorist
-    /// content classes evict immediately).
-    #[cfg(feature = "cirisnode")]
-    fn set_multimedia_config_json(&self, config_json: Option<&str>) -> PyResult<()> {
-        self.ensure_usable()?;
-        catch_panic(|| match config_json {
-            None => {
-                *self
-                    .multimedia_config
-                    .write()
-                    .unwrap_or_else(|p| p.into_inner()) = None;
-                Ok(())
-            }
-            Some(json) => {
-                let wire: crate::cirisnode::MultimediaConfigWire = serde_json::from_str(json)
-                    .map_err(|e| PyValueError::new_err(format!("MultimediaConfig decode: {e}")))?;
-                let cfg = wire
-                    .into_config()
-                    .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
-                *self
-                    .multimedia_config
-                    .write()
-                    .unwrap_or_else(|p| p.into_inner()) = Some(Arc::new(cfg));
-                Ok(())
-            }
-        })
-    }
-
-    /// v3.6.0 (CIRISPersist#134) — snapshot of the currently-installed
-    /// media-sharing config as a JSON string. Returns the wire shape
-    /// (see [`MultimediaConfigWire`](crate::cirisnode::MultimediaConfigWire))
-    /// for the configured values, or `None` when no config is installed
-    /// (persist defaults apply).
-    #[cfg(feature = "cirisnode")]
-    fn get_multimedia_config_json(&self) -> PyResult<Option<String>> {
-        self.ensure_usable()?;
-        catch_panic(|| {
-            let guard = self
-                .multimedia_config
-                .read()
-                .unwrap_or_else(|p| p.into_inner());
-            match guard.as_ref() {
-                None => Ok(None),
-                Some(cfg) => {
-                    let wire = crate::cirisnode::MultimediaConfigWire::from_config(cfg);
-                    serde_json::to_string(&wire).map(Some).map_err(|e| {
-                        PyRuntimeError::new_err(format!("MultimediaConfig encode: {e}"))
-                    })
-                }
-            }
-        })
-    }
-
     /// Retire prior key_grants issued by actor_key_id. Returns
     /// outcome-tagged JSON; "partial" = grants in `failed` are STILL LIVE
     /// and does NOT raise — branch on `outcome`, never on the non-raise.
@@ -23693,104 +23716,39 @@ impl PyEngine {
         })
     }
 
-    /// v3.6.0 (CIRISPersist#134) — run the takedown-admission
-    /// orchestration on a JSON-encoded [`TakedownNoticePayload`](crate::cirisnode::TakedownNoticePayload).
-    /// Consults the installed [`MultimediaConfig`] (or persist defaults
-    /// when none is installed) for the immediate-eviction decision +
-    /// counter-notice window.
+    /// v55.0.0 (CIRISPersist#1007; CC 4.5.3 step 2, CC 4.5.5) — **execute a
+    /// takedown on the bytes plane.** `contribution_json` is the signed
+    /// `takedown_notice` Contribution (the `ContributionEnvelope` JSON
+    /// `cirisnode_put_contribution` admitted). Its signature is re-verified and
+    /// CC 4.5.5 re-asked of this node's state, then ONE tombstone,
+    /// `blob:{content_sha256}`, is recorded on the steward purge's tombstone
+    /// row: the bytes are withheld at once and the tombstone replicates as a
+    /// purge bundle. An immediate-removal basis destroys this node's bytes on
+    /// receipt; a counter-notice basis retracts this node's own holding claim
+    /// and the hard delete waits for `purge_finalize_json` after the window;
+    /// the age-gate basis records nothing. No other device's claim is
+    /// withdrawn.
     ///
-    /// Returns a JSON object:
-    /// `{"holders_seen": u, "withdraws_emitted": u, "withdraws_failed": u,
-    ///   "holders_evicted": u, "holders_evict_failed": u,
-    ///   "scheduled_eviction_at": "<rfc3339>" | null,
-    ///   "age_gate_applied": bool}`.
-    ///
-    /// `age_gate_applied` is `true` when the takedown emitted
-    /// withdraws but did NOT trigger eviction because the basis
-    /// composes with the Policy J age-gate per CEG §8.1.10
-    /// (today only [`LegalBasis::AvmsdAgeInappropriate`] qualifies).
-    /// Python callers need this to distinguish age-gated takedowns
-    /// from any other no-eviction outcome.
+    /// Returns JSON `{"notice_id", "content_sha256", "legal_basis",
+    /// "disposition": {"kind": "destroy_on_receipt" | "withhold_then_delete"
+    /// (+ "window_days") | "age_gate"}, "signer", "tombstoned",
+    /// "settles_at" (RFC 3339 or null), "claims_retracted",
+    /// "bytes_destroyed"}`. A refusal raises `ValueError(token, body_json)`
+    /// with token `takedown_unauthorised`.
     #[cfg(feature = "cirisnode")]
     fn cirisnode_process_takedown_admission_json(
         &self,
         py: Python<'_>,
-        notice_payload_json: &str,
-        signer_key_id: &str,
-        now_iso: &str,
+        contribution_json: &str,
     ) -> PyResult<String> {
         self.ensure_usable()?;
-        catch_panic(|| {
-            let runtime = self.runtime.clone();
-            let notice: crate::cirisnode::TakedownNoticePayload =
-                serde_json::from_str(notice_payload_json).map_err(|e| {
-                    PyValueError::new_err(format!("TakedownNoticePayload decode: {e}"))
-                })?;
-            let signer_kid = signer_key_id.to_owned();
-            let now = chrono::DateTime::parse_from_rfc3339(now_iso)
-                .map_err(|e| {
-                    PyValueError::new_err(format!("process_takedown_admission now_iso parse: {e}"))
-                })?
-                .with_timezone(&chrono::Utc);
-            // v9.0.0 (#237, CC 5.3.2.4.3.1) — the takedown handler emits
-            // federation-tier `withdraws` per holder, which the ingest gate
-            // requires be hybrid-signed. Use the PQC-capable LocalSigner;
-            // error clearly when none is configured (no classical-only
-            // fallback / silent skip / local-tier downgrade).
-            let signer = self.local_signer.clone().ok_or_else(|| {
-                PyValueError::new_err(
-                    "process_takedown_admission requires a hybrid (Ed25519 + ML-DSA-65) \
-                     LocalSigner to sign federation-tier withdraws (CC 5.3.2.4.3.1); none is \
-                     configured on this engine",
-                )
-            })?;
-            let cfg_snapshot = self
-                .multimedia_config
-                .read()
-                .unwrap_or_else(|p| p.into_inner())
-                .clone();
-            py.detach(move || match &self.backend {
-                #[cfg(feature = "postgres")]
-                BackendDispatch::Postgres(pg) => {
-                    let backend = pg.clone();
-                    let cfg = cfg_snapshot.clone();
-                    runtime.block_on(async move {
-                        let report =
-                            crate::cirisnode::takedown_handler::process_takedown_admission_with_config(
-                                &*backend,
-                                &*backend,
-                                &signer,
-                                &signer_kid,
-                                &notice,
-                                now,
-                                cfg.as_deref(),
-                            )
-                            .await
-                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
-                        serialize_takedown_report(&report)
-                    })
-                }
-                #[cfg(feature = "sqlite")]
-                BackendDispatch::Sqlite(sq) => {
-                    let backend = sq.clone();
-                    let cfg = cfg_snapshot.clone();
-                    runtime.block_on(async move {
-                        let report =
-                            crate::cirisnode::takedown_handler::process_takedown_admission_with_config(
-                                &*backend,
-                                &*backend,
-                                &signer,
-                                &signer_kid,
-                                &notice,
-                                now,
-                                cfg.as_deref(),
-                            )
-                            .await
-                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
-                        serialize_takedown_report(&report)
-                    })
-                }
-            })
+        let env: crate::cirisnode::ContributionEnvelope =
+            serde_json::from_str(contribution_json)
+                .map_err(|e| PyValueError::new_err(format!("takedown contribution_json: {e}")))?;
+        let notice = crate::cirisnode::takedown_notice_from_contribution(&env)
+            .map_err(federation_err_to_py)?;
+        self.purge_engine_call(py, move |engine| async move {
+            engine.takedown_tombstone(&notice).await
         })
     }
 
@@ -35043,35 +35001,6 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
 /// server-fault → RuntimeError. The `kind()` string travels in the
 /// message for `translate_error_kind`-style retry-policy routing if
 /// the consumer wants it.
-/// v3.6.0 (CIRISPersist#134) — JSON-encode a
-/// [`TakedownReport`](crate::cirisnode::takedown_handler::TakedownReport)
-/// for return across the PyO3 boundary. Field order matches the
-/// rustdoc on `cirisnode_process_takedown_admission_json`.
-#[cfg(feature = "cirisnode")]
-fn serialize_takedown_report(
-    report: &crate::cirisnode::takedown_handler::TakedownReport,
-) -> PyResult<String> {
-    let value = serde_json::json!({
-        "holders_seen": report.holders_seen,
-        "withdraws_emitted": report.withdraws_emitted,
-        "withdraws_failed": report.withdraws_failed,
-        "holders_evicted": report.holders_evicted,
-        "holders_evict_failed": report.holders_evict_failed,
-        "scheduled_eviction_at": report
-            .scheduled_eviction_at
-            .map(|t| t.to_rfc3339()),
-        // v3.6.0 (CIRISPersist#134) — Policy J age-gate observability.
-        // True when the takedown emitted withdraws but did NOT trigger
-        // eviction because the basis composes with the Policy J age
-        // gate per CEG §8.1.10. Python callers need this to
-        // distinguish age-gated takedowns from any other no-eviction
-        // outcome.
-        "age_gate_applied": report.age_gate_applied,
-    });
-    serde_json::to_string(&value)
-        .map_err(|e| PyRuntimeError::new_err(format!("TakedownReport encode: {e}")))
-}
-
 /// #832 / #831 — decode the optional `aad_b64` kwarg every AAD-carrying
 /// binding takes. `None` stays `None`; a malformed string is a `ValueError`
 /// before any backend work.
@@ -35487,24 +35416,7 @@ fn parse_put_blob_chunks_payload(
 )> {
     let wire: PutBlobChunksJsonWire = serde_json::from_str(json)
         .map_err(|e| PyValueError::new_err(format!("put_blob_chunks_json decode: {e}")))?;
-    let mut mrefs = Vec::with_capacity(wire.manifest.chunks.len());
-    for c in wire.manifest.chunks {
-        let sha = parse_sha256_hex(&c.sha)?;
-        // The commons atomic upload builds a v1 (plaintext) manifest: no position.
-        mrefs.push(crate::federation::ChunkRef {
-            sha,
-            size: c.size,
-            seq: None,
-            epoch: None,
-        });
-    }
-    let manifest = crate::federation::ChunkManifest {
-        chunk_tier: None,
-        stream_id: None,
-        v: wire.manifest.v,
-        total_size: wire.manifest.total_size,
-        chunks: mrefs,
-    };
+    let manifest = plaintext_manifest_from_wire(wire.manifest)?;
     let mut chunks = Vec::with_capacity(wire.chunks.len());
     for c in wire.chunks {
         let sha = parse_sha256_hex(&c.sha)?;
@@ -35522,6 +35434,32 @@ fn parse_put_blob_chunks_payload(
         chunks.push((sha, body));
     }
     Ok((manifest, chunks))
+}
+
+/// The commons manifest wire into a v1 (plaintext) [`ChunkManifest`]: no
+/// chunk position, no sealed-DAG members. Shared by the one-shot upload and
+/// the incremental finalize (CIRISPersist#952).
+fn plaintext_manifest_from_wire(
+    wire: ChunkManifestWire,
+) -> PyResult<crate::federation::ChunkManifest> {
+    let mut mrefs = Vec::with_capacity(wire.chunks.len());
+    for c in wire.chunks {
+        let sha = parse_sha256_hex(&c.sha)?;
+        // The commons atomic upload builds a v1 (plaintext) manifest: no position.
+        mrefs.push(crate::federation::ChunkRef {
+            sha,
+            size: c.size,
+            seq: None,
+            epoch: None,
+        });
+    }
+    Ok(crate::federation::ChunkManifest {
+        chunk_tier: None,
+        stream_id: None,
+        v: wire.v,
+        total_size: wire.total_size,
+        chunks: mrefs,
+    })
 }
 
 /// v2.3 (CIRISPersist#103) — parse a 64-char hex string into a
@@ -37224,8 +37162,6 @@ mod tests {
                 crate::federation::ReplicationConfig::default(),
             )),
             sweeper: std::sync::Mutex::new(None),
-            #[cfg(feature = "cirisnode")]
-            multimedia_config: Arc::new(std::sync::RwLock::new(None)),
             disk_pressure: std::sync::Mutex::new(None),
             disk_pressure_handle: std::sync::Mutex::new(None),
         });
@@ -37379,8 +37315,6 @@ mod tests {
                 crate::federation::ReplicationConfig::default(),
             )),
             sweeper: std::sync::Mutex::new(None),
-            #[cfg(feature = "cirisnode")]
-            multimedia_config: Arc::new(std::sync::RwLock::new(None)),
             disk_pressure: std::sync::Mutex::new(None),
             disk_pressure_handle: std::sync::Mutex::new(None),
         });
@@ -37467,8 +37401,6 @@ mod tests {
                 crate::federation::ReplicationConfig::default(),
             )),
             sweeper: std::sync::Mutex::new(None),
-            #[cfg(feature = "cirisnode")]
-            multimedia_config: Arc::new(std::sync::RwLock::new(None)),
             disk_pressure: std::sync::Mutex::new(None),
             disk_pressure_handle: std::sync::Mutex::new(None),
         });

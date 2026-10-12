@@ -243,7 +243,12 @@ pub(crate) mod bodies {
         assert_eq!(view.chunks[1].size, 900);
         // Promotion before the chunks are held is refused, naming the first missing one.
         let e = engine_b
-            .promote_adopted_manifest_to_dag(&manifest, &b.key, None)
+            .promote_adopted_manifest_to_dag(
+                &manifest,
+                &b.key,
+                None,
+                crate::federation::AdoptDisposition::LocalOnly,
+            )
             .await
             .expect_err("no chunk held yet");
         assert!(
@@ -293,7 +298,12 @@ pub(crate) mod bodies {
             .await
             .unwrap();
         let e = engine_b
-            .promote_adopted_manifest_to_dag(&m2, &b.key, None)
+            .promote_adopted_manifest_to_dag(
+                &m2,
+                &b.key,
+                None,
+                crate::federation::AdoptDisposition::LocalOnly,
+            )
             .await
             .expect_err("the wrong chunk at the right position");
         assert!(
@@ -346,7 +356,12 @@ pub(crate) mod bodies {
             .unwrap();
         assert!(
             engine_b
-                .promote_adopted_manifest_to_dag(&m3, &b.key, None)
+                .promote_adopted_manifest_to_dag(
+                    &m3,
+                    &b.key,
+                    None,
+                    crate::federation::AdoptDisposition::LocalOnly
+                )
                 .await
                 .unwrap()
                 .promoted
@@ -387,7 +402,12 @@ pub(crate) mod bodies {
             if c.seq == 0 {
                 // one chunk held, two missing: still refused, naming seq 1
                 let e = engine_b
-                    .promote_adopted_manifest_to_dag(&manifest, &b.key, None)
+                    .promote_adopted_manifest_to_dag(
+                        &manifest,
+                        &b.key,
+                        None,
+                        crate::federation::AdoptDisposition::LocalOnly,
+                    )
                     .await
                     .expect_err("two chunks missing");
                 // Named as MISSING, not as a mismatch of the chunk that IS held
@@ -401,7 +421,12 @@ pub(crate) mod bodies {
             }
         }
         let p = engine_b
-            .promote_adopted_manifest_to_dag(&manifest, &b.key, None)
+            .promote_adopted_manifest_to_dag(
+                &manifest,
+                &b.key,
+                None,
+                crate::federation::AdoptDisposition::LocalOnly,
+            )
             .await
             .expect("every chunk held: promoted");
         assert!(p.promoted);
@@ -433,7 +458,12 @@ pub(crate) mod bodies {
         );
         // Idempotent.
         let again = engine_b
-            .promote_adopted_manifest_to_dag(&manifest, &b.key, None)
+            .promote_adopted_manifest_to_dag(
+                &manifest,
+                &b.key,
+                None,
+                crate::federation::AdoptDisposition::LocalOnly,
+            )
             .await
             .unwrap();
         assert!(!again.promoted);

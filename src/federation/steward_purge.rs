@@ -1958,8 +1958,11 @@ where
     })
 }
 
+/// v55.0.0 (CIRISPersist#1007) — the settle is the header's BASIS's: a
+/// steward purge after `W`, a duty-holder takedown per its basis (one
+/// tombstone row serves both, CC 4.5.3 step 2).
 fn settles_at(e: &PurgeExecution) -> chrono::DateTime<chrono::Utc> {
-    e.executed_at + chrono::Duration::seconds(PURGE_SETTLE_DWELL_SECS)
+    super::takedown_tombstone::settles_at(e)
 }
 
 /// **Status** of an executed purge, at [`purge_clock`].
@@ -2592,6 +2595,40 @@ where
             }
         }
         Ok(first)
+    }
+}
+
+/// v55.0.0 (CIRISPersist#1007; operator ruling, v55 slice C) — **bytes a
+/// tombstone took down never come back.** Every byte write floor asks this
+/// for each address it is about to store (the one-shot and chunk DAG puts,
+/// the plaintext and scoped puts, the local store, the adopt, the chunk
+/// floor, the incremental DAG finalize): an address a steward purge or a
+/// takedown tombstoned, or a DAG child every manifest of which is, is refused
+/// [`BlobError::Purged`](super::BlobError::Purged) naming the notice — the
+/// read doors' own answer ([`purge_withheld`]). A peer re-pushing taken-down
+/// bytes is refused at receipt; retaining them withheld would be knowing
+/// possession (CC 4.5.3 step 2). The from-disk gate I797 holds every floor
+/// to it.
+///
+/// # Errors
+///
+/// [`BlobError::Purged`](super::BlobError::Purged); the lookup's read error.
+pub(crate) async fn refuse_tombstoned_bytes<F>(
+    directory: &F,
+    sha256: &[u8; 32],
+) -> Result<(), super::BlobError>
+where
+    F: FederationDirectory + ?Sized,
+{
+    match purge_withheld(directory, sha256).await {
+        Ok(None) => Ok(()),
+        Ok(Some(notice_id)) => Err(super::BlobError::Purged {
+            sha256_hex: hex::encode(sha256),
+            notice_id,
+        }),
+        Err(e) => Err(super::BlobError::Backend(format!(
+            "tombstone plane at write: {e}"
+        ))),
     }
 }
 

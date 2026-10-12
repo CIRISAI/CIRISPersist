@@ -1739,6 +1739,10 @@ pub mod orchestrate {
         pub chunk_count: u64,
         /// The file's plaintext size.
         pub total_size: u64,
+        /// v55.0.0 (CIRISPersist#951) — `true` when THIS call emitted the
+        /// DAG's holding claim (`AdoptDisposition::Announce`, every chunk
+        /// held). Always `false` under `LocalOnly`.
+        pub announced: bool,
     }
 
     /// The manifest of a SEALED DAG this node holds, opened for `viewer`:
@@ -2189,6 +2193,7 @@ pub mod orchestrate {
             promoted,
             chunk_count,
             total_size,
+            announced: false,
         };
         // v53.1.0 (#979) — a row that is already a DAG is re-checked so the
         // floor can relate it to its chunks (a DAG from before V176). Any

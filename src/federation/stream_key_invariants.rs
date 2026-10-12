@@ -397,9 +397,14 @@ pub(crate) mod bodies {
             .await
             .unwrap_or_else(|e| panic!("I313: chunk {}: {e}", c.seq));
         }
-        p.b.promote_adopted_manifest_to_dag(&root, &p.key_b, None)
-            .await
-            .expect("I313: promoted (the structure check reads nonces only)");
+        p.b.promote_adopted_manifest_to_dag(
+            &root,
+            &p.key_b,
+            None,
+            crate::federation::AdoptDisposition::LocalOnly,
+        )
+        .await
+        .expect("I313: promoted (the structure check reads nonces only)");
         // Held, but the epoch's set has not arrived: ONE missing entry for the
         // epoch, spanning every chunk of it.
         let r =
@@ -1743,9 +1748,14 @@ pub(crate) mod bodies {
                 .await
                 .unwrap();
         assert!(out.iter().all(Result::is_ok), "I318: {out:?}");
-        p.b.promote_adopted_manifest_to_dag(&root, &p.key_b, None)
-            .await
-            .expect("I318: promoted");
+        p.b.promote_adopted_manifest_to_dag(
+            &root,
+            &p.key_b,
+            None,
+            crate::federation::AdoptDisposition::LocalOnly,
+        )
+        .await
+        .expect("I318: promoted");
         assert_eq!(
             p.b.read_blob_as(&root, &p.key_b, None).await.unwrap(),
             plain

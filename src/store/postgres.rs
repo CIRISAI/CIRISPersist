@@ -17558,6 +17558,8 @@ impl crate::federation::BlobStorage for PostgresBackend {
         group_key_id: Option<&str>,
     ) -> Result<(), crate::federation::BlobError> {
         floor.check_scope(cohort_scope)?;
+        // v55.0.0 (#1007) — taken-down bytes never come back.
+        crate::federation::steward_purge::refuse_tombstoned_bytes(self, sha256).await?;
         let scope = cohort_scope.to_owned();
         let tier = floor.tier().as_str().to_owned();
         let group = group_key_id.map(str::to_owned);
@@ -17973,6 +17975,8 @@ impl crate::federation::BlobStorage for PostgresBackend {
         group_key_id: Option<&str>,
     ) -> Result<(), crate::federation::BlobError> {
         floor.check_scope(cohort_scope)?;
+        // v55.0.0 (#1007) — taken-down bytes never come back.
+        crate::federation::steward_purge::refuse_tombstoned_bytes(self, sha256).await?;
         let scope = cohort_scope.to_owned();
         let tier = floor.tier().as_str().to_owned();
         let author = author_key_id.map(str::to_owned);
@@ -20515,6 +20519,11 @@ impl crate::federation::BlobStorage for PostgresBackend {
         let cap = self.inline_bytes_cap();
         // Validation + row preparation (chunks first, manifest last).
         let rows = crate::federation::blobs::prepare_chunk_rows(&manifest, &chunks, cap)?;
+        // v55.0.0 (#1007) — taken-down bytes never come back: no chunk, and
+        // not the manifest.
+        for row in &rows {
+            crate::federation::steward_purge::refuse_tombstoned_bytes(self, &row.sha256).await?;
+        }
 
         let mut client = self
             .get_client()
@@ -20551,6 +20560,72 @@ impl crate::federation::BlobStorage for PostgresBackend {
             crate::federation::BlobError::Backend(format!("put_blob_chunks commit: {e}"))
         })?;
         Ok(())
+    }
+
+    // v55.0.0 (CIRISPersist#952) — the incremental plaintext DAG's finalize:
+    // every chunk row the manifest names is read (FOR SHARE, so a concurrent
+    // delete waits) in the SAME transaction that writes the manifest row.
+    async fn put_dag_manifest_over_held(
+        &self,
+        manifest: crate::federation::ChunkManifest,
+    ) -> Result<[u8; 32], crate::federation::BlobError> {
+        let be = |what: &str, e: tokio_postgres::Error| {
+            crate::federation::BlobError::Backend(format!("put_dag_manifest_over_held {what}: {e}"))
+        };
+        let row =
+            crate::federation::blobs::prepare_manifest_row(&manifest, self.inline_bytes_cap())?;
+        // v55.0.0 (#1007) — taken-down bytes never come back: neither the
+        // manifest nor a withheld chunk becomes a DAG.
+        crate::federation::steward_purge::refuse_tombstoned_bytes(self, &row.sha256).await?;
+        for c in &manifest.chunks {
+            crate::federation::steward_purge::refuse_tombstoned_bytes(self, &c.sha).await?;
+        }
+        let mut client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
+        let tx = client.transaction().await.map_err(|e| be("begin", e))?;
+        for (idx, c) in manifest.chunks.iter().enumerate() {
+            let held = tx
+                .query_opt(
+                    "SELECT storage_kind, crypto_tier, size_bytes \
+                     FROM cirislens.federation_blobs WHERE sha256 = $1 FOR SHARE",
+                    &[&c.sha.to_vec()],
+                )
+                .await
+                .map_err(|e| be("read chunk", e))?
+                .map(
+                    |r| -> Result<(String, String, i64), crate::federation::BlobError> {
+                        use crate::federation::BlobError as B;
+                        Ok((
+                            r.safe_get_with("storage_kind", B::Backend)?,
+                            r.safe_get_with("crypto_tier", B::Backend)?,
+                            r.safe_get_with("size_bytes", B::Backend)?,
+                        ))
+                    },
+                )
+                .transpose()?;
+            // Dropping `tx` uncommitted rolls back; nothing was written.
+            crate::federation::blobs::check_held_dag_chunk(idx, &c.sha, u64::from(c.size), held)?;
+        }
+        let media_type_null: Option<String> = None;
+        tx.execute(
+            "INSERT INTO cirislens.federation_blobs (\
+                sha256, storage_kind, bytes_inline, external_ref, size_bytes, media_type\
+             ) VALUES ($1, $2, $3, NULL, $4, $5) \
+             ON CONFLICT (sha256) DO NOTHING",
+            &[
+                &row.sha256.to_vec(),
+                &row.storage_kind,
+                &row.bytes_inline,
+                &row.size_bytes,
+                &media_type_null,
+            ],
+        )
+        .await
+        .map_err(|e| be("insert", e))?;
+        tx.commit().await.map_err(|e| be("commit", e))?;
+        Ok(row.sha256)
     }
 
     async fn put_blob_chunk_with_scope(
@@ -21601,6 +21676,8 @@ impl crate::federation::BlobStorage for PostgresBackend {
         // The address is the SHA-256 of the CIPHERTEXT, computed here from
         // the bytes that are stored — never trusted from the sender.
         let sha256: [u8; 32] = sha2::Sha256::digest(&envelope_bytes).into();
+        // v55.0.0 (#1007) — taken-down bytes never come back.
+        crate::federation::steward_purge::refuse_tombstoned_bytes(self, &sha256).await?;
         let size_i64 = i64::try_from(envelope_bytes.len()).map_err(|_| {
             crate::federation::BlobError::InvalidArgument(
                 "adopt_sealed_blob_at: size_bytes exceeds i64".into(),
@@ -22976,22 +23053,33 @@ impl crate::federation::BlobStorage for PostgresBackend {
                 None => continue,
             };
 
-            let withdraws_outcome = crate::federation::blobs::emit_withdraws_attestation_helper(
-                &prior,
-                attesting_key_id,
-                signer,
-                self,
-                now,
-            )
-            .await;
+            // v55.0.0 (CIRISPersist#1007) — only the holder retracts its own claim
+            // (CC 3.1.3.3 rule 4): a claim another key signed is its signer's to
+            // retract, and the door refuses this node's `withdraws` of it. The
+            // bytes are deleted either way (fail-honest).
+            let withdraws_outcome = if prior.attesting_key_id == signer.derived_key_id() {
+                Some(
+                    crate::federation::blobs::emit_withdraws_attestation_helper(
+                        &prior,
+                        attesting_key_id,
+                        signer,
+                        self,
+                        now,
+                    )
+                    .await,
+                )
+            } else {
+                None
+            };
 
             let deleted = self.delete_blob(&sha).await?;
             if deleted {
                 report.blobs_evicted += 1;
             }
             match withdraws_outcome {
-                Ok(()) => report.withdraws_emitted += 1,
-                Err(e) => {
+                None => {}
+                Some(Ok(())) => report.withdraws_emitted += 1,
+                Some(Err(e)) => {
                     report.withdraws_failed += 1;
                     tracing::warn!(
                         error = %e,
@@ -23188,6 +23276,17 @@ impl PostgresBackend {
                 Err(e) => results.push(Some(Err(e))),
             }
         }
+        // v55.0.0 (#1007) — taken-down bytes never come back: that item's
+        // answer is the refusal, as for any other per-item refusal.
+        let mut kept: Vec<(usize, PgChunkRow)> = Vec::with_capacity(ready.len());
+        for (slot, row) in ready {
+            match crate::federation::steward_purge::refuse_tombstoned_bytes(self, &row.sha256).await
+            {
+                Ok(()) => kept.push((slot, row)),
+                Err(e) => results[slot] = Some(Err(e)),
+            }
+        }
+        let ready = kept;
         let scope = cohort_scope.to_owned();
         let tier = floor.tier().as_str().to_owned();
 

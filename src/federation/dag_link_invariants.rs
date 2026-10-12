@@ -47,6 +47,10 @@
 //!   manifests share survives the SETTLED purge's finalize while the other
 //!   purge is still in its dwell (withheld meanwhile), and goes at the other's
 //!   finalize.
+//! - **I784 / I791b** (v55.0.0, CIRISPersist#951, #1007) — a sealed DAG is
+//!   announced at promotion under `Announce`, never at the manifest adopt or
+//!   a `LocalOnly` promote, and never while a chunk is missing; B's custody
+//!   report is B's alone to retract.
 //! - **I600** (v54.0.0, Codex on PR #1050) — the sweep RESUMES: with a cap
 //!   of three and three unopenable manifests sorting first, a linkable DAG
 //!   after them is linked within two passes (each pass starts after where the
@@ -194,9 +198,14 @@ pub(crate) mod bodies {
                 .unwrap_or_else(|e| panic!("chunk {}: {e}", c.seq));
             out.push((c.seq, sha));
         }
-        p.b.promote_adopted_manifest_to_dag(root, &p.key_b, None)
-            .await
-            .expect("B promotes");
+        p.b.promote_adopted_manifest_to_dag(
+            root,
+            &p.key_b,
+            None,
+            crate::federation::AdoptDisposition::LocalOnly,
+        )
+        .await
+        .expect("B promotes");
         out.sort_by_key(|(seq, _)| *seq);
         out
     }
@@ -305,6 +314,152 @@ pub(crate) mod bodies {
             "I481 B's promote relates the adopted manifest to every chunk it checked"
         );
         assert_eq!(on_b, on_a, "I481 the same relation on both nodes");
+    }
+
+    /// B's live `custody:ack:v1` `here` reports naming `root`.
+    async fn custody_reports<B>(p: &Pair<B>, root: &[u8; 32]) -> Vec<crate::federation::Attestation>
+    where
+        B: BlobStorage + FederationDirectory + Sync + 'static,
+    {
+        let hex_root = hex::encode(root);
+        let all = p.sb.list_attestations_by(&p.key_b).await.unwrap();
+        let retired = {
+            let refs: Vec<&crate::federation::Attestation> = all.iter().collect();
+            crate::federation::precedence::retired_ids(&refs)
+        };
+        all.into_iter()
+            .filter(|a| !retired.contains(&a.attestation_id))
+            .filter(|a| {
+                crate::federation::admission::envelope_dimension(&a.attestation_envelope)
+                    == Some(crate::federation::custody_ack::CUSTODY_ACK_DIMENSION)
+                    && a.attestation_envelope["evidence_refs"][0].as_str()
+                        == Some(hex_root.as_str())
+            })
+            .collect()
+    }
+
+    /// **I784** (v55.0.0, CIRISPersist#951) — a sealed DAG is announced at
+    /// PROMOTION, never at the manifest adopt: B adopts the manifest
+    /// `LocalOnly` and holds no claim for the root; a promote under
+    /// `LocalOnly` announces nothing; under `Announce` it emits B's holding
+    /// claim (`announced: true`), on a re-run over a DAG already promoted
+    /// too. A DAG with a chunk not held refuses the promote and announces
+    /// nothing.
+    ///
+    /// **I791b** (v55.0.0, CIRISPersist#1007) — B's `custody:ack:v1` report
+    /// is B's alone to retract: A's `withdraws` of it is
+    /// `carrier_withdraws_not_the_holder` at B's door; B's own is admitted.
+    pub(crate) async fn i784_a_sealed_dag_is_announced_at_promotion<B>(
+        dsn_a: &str,
+        dsn_b: &str,
+        run: &str,
+        pick: Pick<B>,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync + 'static,
+    {
+        let p = pair(dsn_a, dsn_b, run, pick, "i784").await;
+        let stream = format!("i784-{run}");
+        let root = write_and_seal(&p, &stream, 2).await;
+        deliver(&p, &stream, &root).await;
+        assert!(
+            custody_reports(&p, &root).await.is_empty(),
+            "I784: a LocalOnly adopt and promote announce nothing"
+        );
+        let out =
+            p.b.promote_adopted_manifest_to_dag(&root, &p.key_b, None, AdoptDisposition::Announce)
+                .await
+                .expect("I784: B announces the whole DAG");
+        assert!(out.announced && !out.promoted, "I784: {out:?}");
+        let reports = custody_reports(&p, &root).await;
+        assert_eq!(reports.len(), 1, "I784: B's holding claim for the root");
+
+        // A DAG B holds part of: refused, nothing announced.
+        let partial = format!("i784-partial-{run}");
+        let root2 = write_and_seal(&p, &partial, 2).await;
+        p.a.emit_pending_key_grants().await.unwrap();
+        for set in
+            p.sa.list_attestations_by(&p.key_a)
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|x| x.attestation_type.starts_with("key_grant:"))
+        {
+            let _ =
+                p.b.apply_replicated_key_grant(SignedKeyGrantSet { attestation: set })
+                    .await;
+        }
+        p.b.adopt_sealed_blob(
+            &inline(p.sa.as_ref(), &root2).await,
+            prov(&p),
+            None,
+            AdoptDisposition::LocalOnly,
+        )
+        .await
+        .expect("B adopts the manifest");
+        assert!(
+            custody_reports(&p, &root2).await.is_empty(),
+            "I784: the manifest adopt announces nothing"
+        );
+        let view =
+            p.b.open_sealed_manifest_as(&root2, &p.key_b, None)
+                .await
+                .unwrap();
+        let c = &view.chunks[0];
+        let sha = hexsha(&c.sha256_hex);
+        p.b.adopt_sealed_chunk(
+            &partial,
+            c.seq,
+            &inline(p.sa.as_ref(), &sha).await,
+            c.epoch.expect("a v4 chunk names its epoch"),
+            u64::from(c.size),
+            prov(&p),
+        )
+        .await
+        .unwrap();
+        let e =
+            p.b.promote_adopted_manifest_to_dag(&root2, &p.key_b, None, AdoptDisposition::Announce)
+                .await
+                .expect_err("I784: a chunk is not held");
+        assert!(matches!(e, BlobError::InvalidArgument(_)), "I784: {e:?}");
+        assert!(
+            custody_reports(&p, &root2).await.is_empty(),
+            "I784: a partial DAG is never announced"
+        );
+
+        // I791b — only B retracts B's report.
+        let report = &reports[0];
+        let a_signer = ts::local_signer(&format!("i784-a-{run}"));
+        let refused = crate::federation::blobs::emit_withdraws_attestation_helper(
+            report,
+            "",
+            &a_signer,
+            p.sb.as_ref(),
+            chrono::Utc::now(),
+        )
+        .await
+        .expect_err("I791b: A withdraws B's custody report");
+        assert!(
+            refused
+                .to_string()
+                .contains("carrier_withdraws_not_the_holder"),
+            "I791b: {refused}"
+        );
+        assert_eq!(
+            custody_reports(&p, &root).await.len(),
+            1,
+            "I791b: it stands"
+        );
+        let b_signer = ts::local_signer(&format!("i784-b-{run}"));
+        crate::federation::blobs::emit_withdraws_attestation_helper(
+            report,
+            "",
+            &b_signer,
+            p.sb.as_ref(),
+            chrono::Utc::now(),
+        )
+        .await
+        .expect("I791b: B retracts its own report");
+        assert!(custody_reports(&p, &root).await.is_empty());
     }
 
     /// **I482 / I483** — Edge's leg: withdraw on B, then serve and evict.
@@ -891,9 +1046,14 @@ pub(crate) mod bodies {
         p.sb.dag_link(&root, None).await;
         assert!(p.b.chunks_of_manifest(&root).await.unwrap().is_empty());
         let again =
-            p.b.promote_adopted_manifest_to_dag(&root, &p.key_b, None)
-                .await
-                .unwrap();
+            p.b.promote_adopted_manifest_to_dag(
+                &root,
+                &p.key_b,
+                None,
+                crate::federation::AdoptDisposition::LocalOnly,
+            )
+            .await
+            .unwrap();
         assert!(!again.promoted, "I487 the row was already a DAG");
         assert_eq!(
             p.b.chunks_of_manifest(&root).await.unwrap(),
@@ -1271,6 +1431,7 @@ mod runners {
     pair_case!(i486_487, i486_487_an_unrelated_dag_and_the_backfill);
     pair_case!(i576, i576_the_backfill_sweep);
     pair_case!(i600, i600_the_sweep_resumes_past_skipped_manifests);
+    pair_case!(i784_i791b, i784_a_sealed_dag_is_announced_at_promotion);
 
     /// **I576b** — from disk: every Engine constructor that runs the boot
     /// KeyGrant sweep also runs the V176 backfill (comments stripped).

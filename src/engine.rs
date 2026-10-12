@@ -751,13 +751,6 @@ pub struct Engine {
     /// substrate refuses nothing).
     disk_pressure_state:
         Option<tokio::sync::watch::Receiver<crate::federation::DiskPressureSnapshot>>,
-    /// v3.6.0 (CIRISPersist#134) — media-sharing operator config
-    /// (counter-notice window + immediate-eviction basis set). `None`
-    /// = persist defaults (14-day window; child-safety + terrorist
-    /// content classes evict immediately). Interior-mutable so the
-    /// runtime PyO3 setter can update without consuming the engine.
-    #[cfg(feature = "cirisnode")]
-    multimedia_config: Arc<std::sync::RwLock<Option<Arc<crate::cirisnode::MultimediaConfig>>>>,
 }
 
 /// v2.12.0 (CIRISPersist#112) — error from [`Engine::sign_hybrid`].
@@ -1052,8 +1045,6 @@ impl Engine {
             replication_config: None,
             disk_pressure_config: None,
             disk_pressure_state: None,
-            #[cfg(feature = "cirisnode")]
-            multimedia_config: Arc::new(std::sync::RwLock::new(None)),
         };
         // v30.2.0 (CIRISPersist#607) — a node knows who it IS at construction,
         // so the backend is told here rather than waiting on
@@ -1137,8 +1128,6 @@ impl Engine {
             replication_config: None,
             disk_pressure_config: None,
             disk_pressure_state: None,
-            #[cfg(feature = "cirisnode")]
-            multimedia_config: Arc::new(std::sync::RwLock::new(None)),
         };
         // v30.2.0 (CIRISPersist#607) — a node knows who it IS at construction,
         // so the backend is told here rather than waiting on
@@ -1215,8 +1204,6 @@ impl Engine {
             replication_config: None,
             disk_pressure_config: None,
             disk_pressure_state: None,
-            #[cfg(feature = "cirisnode")]
-            multimedia_config: Arc::new(std::sync::RwLock::new(None)),
         };
         // CIRISPersist#848 (I66) — see `with_signer`.
         if let Ok(id) = engine.local_derived_key_id().await {
@@ -1288,8 +1275,6 @@ impl Engine {
             replication_config: None,
             disk_pressure_config: None,
             disk_pressure_state: None,
-            #[cfg(feature = "cirisnode")]
-            multimedia_config: Arc::new(std::sync::RwLock::new(None)),
         };
         // CIRISPersist#848 (I66) — see `with_signer`.
         if let Ok(id) = engine.local_derived_key_id().await {
@@ -1390,8 +1375,6 @@ impl Engine {
             replication_config: None,
             disk_pressure_config: None,
             disk_pressure_state: None,
-            #[cfg(feature = "cirisnode")]
-            multimedia_config: Arc::new(std::sync::RwLock::new(None)),
         };
         engine.tell_shared_backend_its_node_key();
         engine
@@ -1418,8 +1401,6 @@ impl Engine {
             replication_config: None,
             disk_pressure_config: None,
             disk_pressure_state: None,
-            #[cfg(feature = "cirisnode")]
-            multimedia_config: Arc::new(std::sync::RwLock::new(None)),
         };
         engine.tell_shared_backend_its_node_key();
         engine
@@ -1568,32 +1549,6 @@ impl Engine {
             Some(rx) => *rx.borrow(),
             None => crate::federation::DiskPressureSnapshot::normal(),
         }
-    }
-
-    /// v3.6.0 (CIRISPersist#134) — install / replace the media-sharing
-    /// operator config. `None` clears it (persist defaults apply).
-    ///
-    /// The
-    /// [`process_takedown_admission_with_config`](crate::cirisnode::takedown_handler::process_takedown_admission_with_config)
-    /// handler consults this when present; the v3.6.0 default keeps
-    /// child-safety / terrorist-content bases as immediate-eviction and
-    /// the counter-notice window at 14 days.
-    #[cfg(feature = "cirisnode")]
-    pub fn set_multimedia_config(&self, cfg: Option<crate::cirisnode::MultimediaConfig>) {
-        *self
-            .multimedia_config
-            .write()
-            .unwrap_or_else(|p| p.into_inner()) = cfg.map(Arc::new);
-    }
-
-    /// v3.6.0 (CIRISPersist#134) — snapshot of the installed
-    /// media-sharing config. `None` = persist defaults apply.
-    #[cfg(feature = "cirisnode")]
-    pub fn multimedia_config(&self) -> Option<Arc<crate::cirisnode::MultimediaConfig>> {
-        self.multimedia_config
-            .read()
-            .unwrap_or_else(|p| p.into_inner())
-            .clone()
     }
 
     /// v22.0.0 (CIRISPersist#543 / AV-77) — declare THIS NODE'S OWN key id on
@@ -5917,8 +5872,54 @@ impl Engine {
     /// the named sha, size and tier, and flips the row to a `chunk_dag`, after
     /// which [`read_blob_as`](Self::read_blob_as) and the range read serve the
     /// file. Idempotent.
+    ///
+    /// v55.0.0 (CIRISPersist#951) — **a sealed DAG is announced here, never at
+    /// the manifest adopt.** `disposition` is the puller's: under
+    /// [`AdoptDisposition::Announce`](crate::federation::AdoptDisposition::Announce)
+    /// this node's holding claim for the DAG root is emitted once the
+    /// promotion's checks pass (every chunk held), the moment the plaintext
+    /// door announces; `LocalOnly` emits nothing. The puller adopts the
+    /// manifest `LocalOnly`. A re-run on a DAG already promoted re-checks
+    /// every chunk and announces again under `Announce` (the resume path).
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     pub async fn promote_adopted_manifest_to_dag(
+        &self,
+        at_rest_sha256: &[u8; 32],
+        viewer_key_id: &str,
+        caller_aad: Option<&[u8]>,
+        disposition: crate::federation::AdoptDisposition,
+    ) -> Result<
+        crate::federation::chunk_dag_cascade::orchestrate::DagPromotion,
+        crate::federation::BlobError,
+    > {
+        let mut out = self
+            .promote_adopted_manifest_to_dag_floor(at_rest_sha256, viewer_key_id, caller_aad)
+            .await?;
+        if disposition == crate::federation::AdoptDisposition::Announce {
+            // SEAM (v55 slice A, #989): the one holding claim, `custody:ack:v1`
+            // `here` at the content's scope; its door asks again that every
+            // chunk is held, as THIS node.
+            self.put_custody_ack(
+                at_rest_sha256,
+                crate::federation::custody_ack::CustodyState::Here,
+                None,
+                None,
+                caller_aad,
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::AttestationEmissionFailed(format!(
+                    "promote_adopted_manifest_to_dag: the DAG is promoted and whole, but its \
+                     holding claim was not emitted: {e}"
+                ))
+            })?;
+            out.announced = true;
+        }
+        Ok(out)
+    }
+
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    async fn promote_adopted_manifest_to_dag_floor(
         &self,
         at_rest_sha256: &[u8; 32],
         viewer_key_id: &str,
@@ -6114,18 +6115,141 @@ impl Engine {
             #[cfg(feature = "sqlite")]
             BackendDispatch::Sqlite(arc) => arc.put_blob_chunks(manifest, chunks).await?,
         }
-        // The row exists; the signing floor's insert is a no-op on conflict and
-        // the attestation is what this adds.
+        self.announce_plaintext_dag(&sha256, jcs, author_key_id)
+            .await?;
+        Ok(sha256)
+    }
+
+    /// v55.0.0 (CIRISPersist#952, CIRISEdge#734) — **store ONE chunk of a
+    /// plaintext chunk DAG**, ahead of its manifest, so a puller holds a few
+    /// chunks in memory rather than the whole file. `entry` is the chunk's
+    /// manifest entry: an `Inline` body must hash to `entry.sha` and be
+    /// exactly `entry.size` bytes (the one-shot door's per-chunk checks, the
+    /// same function); `author_key_id` is whose content this is, asked of the
+    /// WILL decision as the one-shot door asks it. The row is a plain
+    /// commons chunk row: no manifest row and no holding claim exist until
+    /// [`finalize_blob_chunks_signing`](Self::finalize_blob_chunks_signing),
+    /// so the DAG's address reads as absent until then. Idempotent on the
+    /// chunk's address. Returns it.
+    ///
+    /// A chunk stored here and never finalized is an unclaimed commons row:
+    /// the retention sweep may evict it like any other, and a finalize that
+    /// finds it gone names it ([`BlobError::NotHeld`](crate::federation::BlobError::NotHeld)).
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn put_plaintext_dag_chunk(
+        &self,
+        entry: &crate::federation::ChunkRef,
+        body: crate::federation::BlobBody,
+        author_key_id: &str,
+    ) -> Result<[u8; 32], crate::federation::BlobError> {
+        use crate::federation::types::cohort_scope::{CryptoTier, FEDERATION};
+        use crate::federation::BlobStorage;
+        self.would_hold(&crate::federation::BlobProvenance {
+            author_key_id: author_key_id.to_owned(),
+            cohort_scope: FEDERATION.to_owned(),
+            community_key_id: None,
+            epoch: None,
+            tier: CryptoTier::Plaintext,
+            minter_key_id: None,
+        })
+        .await?;
+        let floor = crate::federation::StorageFloor::resolved(CryptoTier::Plaintext);
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(arc) => {
+                crate::federation::blobs::prepare_dag_chunk_row(
+                    0,
+                    &body,
+                    entry,
+                    arc.inline_bytes_cap(),
+                )?;
+                arc.store_blob_local(
+                    &entry.sha,
+                    body,
+                    None,
+                    FEDERATION,
+                    floor,
+                    Some(author_key_id),
+                    None,
+                )
+                .await?;
+            }
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(arc) => {
+                crate::federation::blobs::prepare_dag_chunk_row(
+                    0,
+                    &body,
+                    entry,
+                    arc.inline_bytes_cap(),
+                )?;
+                arc.store_blob_local(
+                    &entry.sha,
+                    body,
+                    None,
+                    FEDERATION,
+                    floor,
+                    Some(author_key_id),
+                    None,
+                )
+                .await?;
+            }
+        }
+        Ok(entry.sha)
+    }
+
+    /// v55.0.0 (CIRISPersist#952) — **finalize an incremental plaintext chunk
+    /// DAG**: the manifest's shape (version 1, no sealed-DAG members, at least
+    /// one chunk, `total_size` the sum), then, in ONE transaction, every chunk
+    /// it names held as a plaintext row of its entry's size and the
+    /// `chunk_dag` manifest row written; then the manifest's holding claim,
+    /// exactly as [`put_blob_chunks_signing`](Self::put_blob_chunks_signing)
+    /// emits it. Before this returns there is no manifest row and no claim.
+    /// A missing chunk is [`BlobError::NotHeld`](crate::federation::BlobError::NotHeld)
+    /// naming it; nothing is written. Idempotent. Returns the manifest's
+    /// address.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn finalize_blob_chunks_signing(
+        &self,
+        manifest: crate::federation::ChunkManifest,
+        author_key_id: &str,
+    ) -> Result<[u8; 32], crate::federation::BlobError> {
+        use crate::federation::BlobStorage;
+        crate::federation::blobs::check_plaintext_dag_manifest(&manifest)?;
+        let jcs = manifest.to_jcs_bytes();
+        let sha256 = match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(arc) => arc.put_dag_manifest_over_held(manifest).await?,
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(arc) => arc.put_dag_manifest_over_held(manifest).await?,
+        };
+        self.announce_plaintext_dag(&sha256, jcs, author_key_id)
+            .await?;
+        Ok(sha256)
+    }
+
+    /// The holding claim of a plaintext chunk DAG this node now holds whole,
+    /// shared by the one-shot door and the incremental finalize so the two
+    /// emit the same claim. The manifest row already exists; the signing
+    /// floor's insert is a no-op on conflict and the claim is what this adds.
+    // SEAM (v55 slice A, #989): the holding claim moves to `custody:ack:v1`
+    // `here` at the content's scope through `emit_holding_claim`; this is the
+    // one call site both plaintext DAG doors route through.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    async fn announce_plaintext_dag(
+        &self,
+        sha256: &[u8; 32],
+        manifest_jcs: Vec<u8>,
+        author_key_id: &str,
+    ) -> Result<(), crate::federation::BlobError> {
         self.put_blob_signing(
-            &sha256,
-            crate::federation::BlobBody::Inline(jcs),
+            sha256,
+            crate::federation::BlobBody::Inline(manifest_jcs),
             None,
             author_key_id,
             chrono::Utc::now(),
             uuid::Uuid::new_v4(),
         )
-        .await?;
-        Ok(sha256)
+        .await
     }
 
     /// #846 (`BLOB_REPLICATION.md` §6.2, I50) — **adopt one sealed chunk** of
@@ -8964,8 +9088,113 @@ impl Engine {
             crate::federation::Error::Backend(format!("apply_replicated_purge signer: {e}"))
         })?;
         let directory = self.federation_directory();
+        // v55.0.0 (CIRISPersist#1007) — one tombstone plane, two bases: a
+        // bundle whose notice is a duty-holder takedown is re-verified under
+        // CC 4.5.5 and reaches the bytes plane only; an immediate-removal
+        // basis destroys the bytes on receipt here too (CC 4.5.3 step 2).
+        if crate::federation::takedown_tombstone::is_takedown_notice_envelope(
+            &bundle.notice.envelope,
+        ) {
+            let notice = crate::federation::takedown_tombstone::TakedownNotice {
+                envelope: bundle.notice.envelope.clone(),
+            };
+            let report = crate::federation::takedown_tombstone::apply_replicated_takedown(
+                directory.as_ref(),
+                &notice,
+                &bundle.record_ids,
+                &node,
+            )
+            .await?;
+            let outcome = crate::federation::steward_purge::ApplyPurgeOutcome {
+                notice_id: report.notice_id.clone(),
+                tombstoned: u64::from(report.tombstoned),
+                already_tombstoned: u64::from(!report.tombstoned),
+            };
+            self.takedown_holder_action(report).await?;
+            return Ok(outcome);
+        }
         crate::federation::steward_purge::apply_replicated_purge(directory.as_ref(), bundle, &node)
             .await
+    }
+
+    /// v55.0.0 (CIRISPersist#1007; CC 4.5.3 step 2, CC 4.5.5, CC 2.3) — **take
+    /// content down on the bytes plane** under a signed `takedown_notice`
+    /// Contribution. The notice's signature is verified and CC 4.5.5 is asked
+    /// of this node's own state (the signer holds the `takedown` duty over the
+    /// content); then ONE tombstone, `blob:{content_sha256}`, is recorded on
+    /// the steward purge's tombstone row, which withholds the bytes from every
+    /// read door at once and replicates as a purge bundle. Then this node acts
+    /// as a holder: an immediate-removal basis destroys the bytes now; a
+    /// counter-notice basis retracts this node's own holding claim now and
+    /// leaves the hard delete to [`purge_finalize`](Self::purge_finalize)
+    /// after its window; the age-gate basis records nothing. No other
+    /// device's claim is touched. Idempotent on the notice. Typed refusals:
+    /// `takedown_unauthorised`.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn takedown_tombstone(
+        &self,
+        notice: &crate::federation::takedown_tombstone::TakedownNotice,
+    ) -> Result<crate::federation::takedown_tombstone::TakedownReport, crate::federation::Error>
+    {
+        let node = self.local_derived_key_id().await.map_err(|e| {
+            crate::federation::Error::Backend(format!("takedown_tombstone signer: {e}"))
+        })?;
+        let directory = self.federation_directory();
+        let report = crate::federation::takedown_tombstone::takedown_tombstone(
+            directory.as_ref(),
+            notice,
+            &node,
+        )
+        .await?;
+        self.takedown_holder_action(report).await
+    }
+
+    /// What THIS node does as a holder once a takedown's tombstone is held:
+    /// destroy the bytes on receipt (immediate-removal), or retract its own
+    /// holding claim (counter-notice). Never another device's claim.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    async fn takedown_holder_action(
+        &self,
+        mut report: crate::federation::takedown_tombstone::TakedownReport,
+    ) -> Result<crate::federation::takedown_tombstone::TakedownReport, crate::federation::Error>
+    {
+        use crate::federation::takedown_tombstone::TakedownDisposition;
+        let mut sha = [0u8; 32];
+        hex::decode_to_slice(&report.content_sha256, &mut sha)
+            .map_err(|e| crate::federation::Error::Backend(format!("takedown sha: {e}")))?;
+        match report.disposition {
+            TakedownDisposition::AgeGate => {}
+            TakedownDisposition::DestroyOnReceipt => {
+                // The header settles at its own execution instant, so the
+                // finalize runs now: retract this node's claim, delete the
+                // bytes and the DAG children no live manifest keeps.
+                let done = self.purge_finalize(&report.notice_id).await?;
+                report.bytes_destroyed = done.blobs_evicted > 0;
+            }
+            TakedownDisposition::WithholdThenDelete { .. } => {
+                let Some(signer) = self.local_signer.as_ref() else {
+                    // No LocalSigner, no claim of this node's to retract.
+                    return Ok(report);
+                };
+                let node = self.local_derived_key_id().await.map_err(|e| {
+                    crate::federation::Error::Backend(format!("takedown signer: {e}"))
+                })?;
+                let now = crate::federation::steward_purge::purge_clock();
+                let retracted = match &self.backend {
+                    #[cfg(feature = "postgres")]
+                    BackendDispatch::Postgres(arc) => {
+                        retract_own_holding_claims_on(arc.as_ref(), &node, signer, &sha, now).await
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(arc) => {
+                        retract_own_holding_claims_on(arc.as_ref(), &node, signer, &sha, now).await
+                    }
+                }
+                .map_err(|e| crate::federation::Error::Backend(format!("takedown: {e}")))?;
+                report.claims_retracted = retracted as u64;
+            }
+        }
+        Ok(report)
     }
 
     /// v9.1.0 (CC 1.13.3 / FSD §2.4, CIRISPersist#243) — Engine-facade for
@@ -11383,7 +11612,35 @@ async fn evict_one_on<B>(
 where
     B: crate::federation::BlobStorage + crate::federation::FederationDirectory + Sync,
 {
-    use crate::federation::{BlobError, EvictBlobReport};
+    let mut report = crate::federation::EvictBlobReport {
+        withdraws_emitted: retract_own_holding_claims_on(backend, node, signer, sha256, now)
+            .await?,
+        ..crate::federation::EvictBlobReport::default()
+    };
+    report.blob_deleted = backend.delete_blob(sha256).await?;
+    Ok(report)
+}
+
+/// v55.0.0 (CIRISPersist#1007) — retract THIS node's own live holding claims
+/// for `sha256` (a hybrid-signed `withdraws` each, signed by the holder), and
+/// nothing else: the eviction's first half, and a takedown's "holders
+/// re-acknowledge `none`" (CC 4.5.3 step 2). Never another device's claim
+/// (CC 3.1.3.3 rule 4). A refused retraction is an error. Returns how many
+/// were retracted; a retry finds the earlier ones already retired.
+// SEAM (v55 slice A, #989): the holding claim becomes `custody:ack:v1`, and
+// retracting it becomes the `none` re-acknowledgement.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+async fn retract_own_holding_claims_on<B>(
+    backend: &B,
+    node: &str,
+    signer: &crate::signing::LocalSigner,
+    sha256: &[u8; 32],
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<usize, crate::federation::BlobError>
+where
+    B: crate::federation::BlobStorage + crate::federation::FederationDirectory + Sync,
+{
+    use crate::federation::BlobError;
     let sha_hex = hex::encode(sha256);
     let prefix = crate::federation::HOLDS_BYTES_ATTESTATION_TYPE_PREFIX;
     let mine = backend
@@ -11410,7 +11667,7 @@ where
                     == Some(sha_hex.as_str())
         })
         .collect();
-    let mut report = EvictBlobReport::default();
+    let mut retracted = 0usize;
     for prior in &claims {
         // RETRACT FIRST. A refused retraction aborts: bytes and binding stay.
         crate::federation::blobs::emit_withdraws_attestation_helper(
@@ -11424,10 +11681,9 @@ where
                 prior.attestation_id
             ))
         })?;
-        report.withdraws_emitted += 1;
+        retracted += 1;
     }
-    report.blob_deleted = backend.delete_blob(sha256).await?;
-    Ok(report)
+    Ok(retracted)
 }
 
 #[cfg(test)]

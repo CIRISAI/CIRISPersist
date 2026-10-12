@@ -155,6 +155,23 @@ pub(crate) mod bodies {
                 .is_err_and(|e| e.to_string().contains("carrier_withdraws_not_the_holder")),
             "I520 a third party's stamped withdraws of a carrier is refused by name: {r:?}"
         );
+        // v55.0.0 (CIRISPersist#1007, I791) — and UNSTAMPED too: only the
+        // holder retracts its claim; a takedown is the CC 2.3 tombstone.
+        let r = put(
+            d,
+            composer(
+                &format!("i520-tu-{tag}"),
+                &third,
+                attestation_type::WITHDRAWS,
+                &claim_id,
+            ),
+        )
+        .await;
+        assert!(
+            r.as_ref()
+                .is_err_and(|e| e.to_string().contains("carrier_withdraws_not_the_holder")),
+            "I791 a third party's unstamped withdraws of a carrier is refused by name: {r:?}"
+        );
         // …and inert in the fold even when offered directly (out of order).
         let stored = d.get_attestation(&claim_id).await.unwrap().expect("claim");
         assert!(

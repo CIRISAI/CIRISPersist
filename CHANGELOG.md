@@ -87,6 +87,164 @@ threat-model citations because this crate's audit story is the point.
 - No new error variant, no new exhaustive enum variant, no FFI or `.pyi`
   surface change, no migration.
 
+### Slice C — doors and takedown (#952, #951, #1007, #1059)
+
+- **#952 — the incremental plaintext chunk-DAG write.** Two doors replace
+  buffering a whole commons file: `Engine::put_plaintext_dag_chunk(entry,
+  body, author_key_id)` stores ONE chunk against its manifest entry (the
+  one-shot door's per-chunk checks, now the shared
+  `blobs::prepare_dag_chunk_row`: an inline body hashes to the entry and is
+  exactly its size; the WILL decision asked as the one-shot door asks it) and
+  writes no manifest row and no claim; `Engine::finalize_blob_chunks_signing(
+  manifest, author_key_id)` checks the manifest is a plaintext v1 DAG, then in
+  ONE transaction (`BlobStorage::put_dag_manifest_over_held`, new trait
+  method, sqlite and postgres) reads every chunk row it names and writes the
+  `chunk_dag` row only over a whole DAG, then emits the manifest's holding
+  claim exactly as `put_blob_chunks_signing` does (one shared call site,
+  `announce_plaintext_dag`). Until finalize the DAG's address is absent to
+  every read and listing. A missing chunk is `blob_not_held` naming it, with
+  nothing written. A chunk stored and never finalized is an unclaimed commons
+  row the retention sweep may evict like any other.
+- **#951 — a sealed DAG is announced at promotion, never at the manifest
+  adopt.** `Engine::promote_adopted_manifest_to_dag` gains a required
+  `disposition: AdoptDisposition`. Under `Announce` this node's holding claim
+  for the root (`custody:ack:v1` `here`, whose door asks again that every
+  chunk is held) is emitted once the promotion's checks pass, on a re-run too;
+  `LocalOnly` emits nothing. `DagPromotion` gains `announced`. The puller
+  adopts the manifest `LocalOnly`.
+- **#1007 — takedown on the CC 2.3 tombstone (CC 4.5.3 step 2, CC 4.5.5).**
+  A takedown is now ONE bytes-plane tombstone, `blob:{content_sha256}`,
+  written on the steward purge's V187 tables in its row shape (one shape for
+  both bases, one row per record keyed by its digest): the header carries the
+  notice's `legal_basis`, `record_count` 1, the digest of `["blob:{sha}"]`,
+  the notice's JCS (whose hash is the notice id) and no cosignatures. New
+  module `federation::takedown_tombstone`:
+  - `takedown_tombstone(directory, notice, executed_by)` verifies the signed
+    `takedown_notice` Contribution (the cirisnode track's own signature rule)
+    and asks CC 4.5.5 of THIS node's state through ONE function,
+    `takedown_authority`, which `put_contribution`'s takedown gate now calls
+    too: a signed subject of a row binding the content, a named moderator of a
+    community the content is BOUND INTO here, or a delegate a steward-bound
+    duty-holder reaches over a live `takedown`-scoped chain. **The content's
+    community is read from the held binding rows, never from the notice's
+    `community_id`** (operator ruling; before v55 `put_contribution` judged a
+    takedown under whatever community the notice named). No binding row held
+    is `takedown_content_unbound` (retryable: an ordering gap). Every basis
+    needs a duty-holder (operator ruling; CC is asked whether "from any
+    claimant" was meant for the immediate-removal bases);
+  - the tombstone withholds the bytes from every read door at once
+    (`blob_purged`, naming the notice) and replicates as a `PurgeBundle`;
+    `apply_replicated_takedown` re-verifies the signature and CC 4.5.5 on the
+    RECEIVER's state and refuses a bundle naming anything but the notice's
+    own content on the bytes plane (`takedown_not_bytes_plane`);
+  - per basis (`basis_disposition`, CC 4.5.3): an immediate-removal basis
+    (`tvec_terrorist`, `ncmec_csam`, `gifct_cip`, `perceptual_hash_csam`,
+    `court_order`) settles at once and the Engine destroys this node's bytes
+    on receipt (locally and on a replica); a counter-notice basis
+    (`dmca_512` 10 d, `dsa_article_16` 14 d, `osa_illegal_content` 14 d,
+    `community_standards` 30 d) withholds at once, retracts this node's own
+    holding claim, and `purge_finalize` deletes after the window; the age-gate
+    basis writes no tombstone. `steward_purge`'s settle reads the header's
+    basis through `takedown_tombstone::settles_at` (W = 72 h for
+    `steward_purge`, unchanged). An immediate-removal takedown records ONE
+    `hard_case:fast_path_takedown` per notice on each node that executes or
+    applies it (CC 4.5.3 step 4; the `hard_case:{kind}` family is registered
+    at rc7, open vocabulary): `target_key_id` the notice id, `detail` the
+    content, basis, signer and origin. The fast path waives the CC 4.5.1
+    quorum and the counter notice, never the duty-holder gate (confirmed by
+    the CC session; "any claimant" is corrected in rc8 CC 4.5.3 step 1).
+  - **A non-holder's `withdraws` of a holding claim is refused at the door**,
+    stamped or not (`carrier_withdraws_not_the_holder`, CC 3.1.3.3 rule 4):
+    a `holds_bytes` claim, and the rc7 `custody:ack:v1` report. Before v55 the
+    unstamped form was admitted inert because the takedown handler and
+    `evict_actor` emitted it.
+  - `cirisnode::process_takedown_admission` now takes the Engine and the
+    signed `ContributionEnvelope` and runs the tombstone door; it no longer
+    lists holders, withdraws their claims, or runs `evict_actor` per holder
+    (which deleted every blob a holder held, not the one taken down).
+    `process_takedown_admission_with_config` and the cirisnode
+    `TakedownReport` are removed. **`MultimediaConfig` is removed** (clean
+    break, operator ruling): its three knobs only steered the old handler,
+    and narrowing CC 4.5.3's immediate set made a node non-conformant.
+  - **Taken-down bytes never come back** (operator ruling): every byte write
+    floor (`put_blob_with_scope`, `store_blob_local`, `put_blob_chunks`, the
+    chunk floor, `adopt_sealed_blob_at`, `put_dag_manifest_over_held`, both
+    backends) asks `steward_purge::refuse_tombstoned_bytes` before it stores
+    an address, for a takedown's tombstone and a steward purge's alike, and
+    refuses `BlobError::Purged` naming the notice (the read doors' answer).
+    A from-disk gate (I797) holds every `federation_blobs` insert to it.
+  - `evict_actor` (sqlite, postgres) retracts only claims the evicting signer
+    signed; the bytes are deleted as before. `retract_own_holding_claims_on`
+    is the eviction's first half, shared with the takedown.
+- **#1059 — evidence.** `CLM-one-tombstone-row` (CC 4.5.3, 5 rows) and
+  `CLM-derived-rows-follow-reason` (CC 2.4.1.1, 4 rows: the purge half's
+  `resolve_selection` and `withhold_orphaned_derivatives`, and the takedown
+  half: a score over content later taken down on a legal basis stands, its
+  evidence ref resolving to the tombstone through `purge_withheld`) are
+  published through `namespace_supersets.json` (`manifest_round:
+  v55-c-1007`, each naming its witnesses) and `scripts/evidence_tsv.py
+  write`. The version-pin witness's exact count rises by 9.
+- Witnesses I780–I799 (`doors_takedown_invariants`; I784/I791b in
+  `dag_link_invariants`; I785/I785b in `cirisnode::takedown_handler`; I791
+  also extends I520 in `retraction_invariants`).
+- No migration.
+
+### Adoption — slice C (what Edge and Server must handle)
+
+- **New doors:** `Engine::put_plaintext_dag_chunk` / Python
+  `put_plaintext_dag_chunk(chunk_sha256_hex, size, body, author_key_id) ->
+  str`; `Engine::finalize_blob_chunks_signing` / Python
+  `finalize_blob_chunks_signing_json(payload_json) -> str` (`{"manifest": {…},
+  "author_key_id": …}` → `{"manifest_sha256", "announced": true}`; a missing
+  chunk raises the `blob_not_held` class). `Engine::takedown_tombstone(&
+  TakedownNotice)`. `BlobStorage::put_dag_manifest_over_held` (trait
+  implementers: a new required method).
+- **Changed signatures:** `Engine::promote_adopted_manifest_to_dag(sha,
+  viewer, aad, disposition)`; Python `promote_adopted_manifest_to_dag_json(
+  at_rest_sha256_hex, viewer_key_id, disposition, caller_aad_b64=None)` with
+  `disposition` `"announce"` | `"local_only"` (required) and an `announced`
+  field in the answer. Edge's sealed-DAG pull adopts the manifest
+  `local_only` and promotes with `announce`.
+  `cirisnode::process_takedown_admission(engine, contribution)`; Python
+  `cirisnode_process_takedown_admission_json(contribution_json)` takes the
+  signed `takedown_notice` `ContributionEnvelope` JSON and returns the
+  tombstone report `{notice_id, content_sha256, legal_basis, disposition:
+  {kind: destroy_on_receipt | withhold_then_delete (+ window_days) |
+  age_gate}, signer, tombstoned, settles_at, claims_retracted,
+  bytes_destroyed}`. Server's takedown report fields
+  `holders_seen` / `withdraws_*` / `holders_evict*` /
+  `scheduled_eviction_at` / `age_gate_applied` are gone.
+- **Removed:** `cirisnode::process_takedown_admission_with_config`, the
+  cirisnode `TakedownReport`.
+- **New refusal tokens** on `Error::PurgeRefused` (Python
+  `ValueError(token, body_json)`): `takedown_unauthorised`,
+  `takedown_not_bytes_plane`, and `takedown_content_unbound` (RETRYABLE,
+  body `retryable: true`: no row binding the content is held yet). A
+  replicated takedown bundle arrives through the existing
+  `apply_replicated_purge(_json)` door; a v54.1 receiver refuses one
+  `purge_unauthorised`.
+- **`put_contribution` of a `takedown_notice`** is judged under the
+  content's HELD binding: a notice for content with no binding row held is
+  now `cirisnode_not_found` (`takedown_content_unbound: …`, retry once the
+  binding replicates), and a moderator of the community the notice names is
+  refused when the content is bound elsewhere.
+- **Byte writes of taken-down or purged content** (`put_blob*`,
+  `store_plaintext_local`, adopts, chunk appends, both DAG doors) now refuse
+  `blob_purged` (`BlobError::Purged`), where they stored the bytes withheld.
+- **New audit row** `hard_case:fast_path_takedown` (listed by
+  `list_hard_case_events`) for every immediate-removal takedown.
+- **Removed (Server sets these):** `cirisnode::MultimediaConfig`,
+  `cirisnode::MultimediaConfigWire`, `Engine::set_multimedia_config`,
+  `Engine::multimedia_config`, Python `set_multimedia_config_json` /
+  `get_multimedia_config_json`, and the fields `counter_notice_window_days`,
+  `immediate_legal_bases`, `age_gate_legal_bases`.
+- **Newly refused:** a `withdraws` of another key's `holds_bytes` claim or
+  `custody:ack:v1` report, unstamped, is `carrier_withdraws_not_the_holder`
+  (`federation_invalid_argument`, `ValueError`), where it was admitted inert.
+- New enum `takedown_tombstone::TakedownDisposition` (`DestroyOnReceipt`,
+  `WithholdThenDelete { window_days }`, `AgeGate`); `DagPromotion` gains
+  `announced`. No exhaustive enum an adopter matches gains a variant.
+
 ## [54.1.0] - 2026-10-10
 
 ### Added — the generic steward purge door (#1046, CIRISConstitution#165, CSD-108)

@@ -140,9 +140,14 @@ pub(crate) mod bodies {
                 .unwrap_or_else(|e| panic!("chunk {}: {e}", c.seq));
             out.push((c.seq, sha, env, epoch, u64::from(c.size)));
         }
-        p.b.promote_adopted_manifest_to_dag(root, &p.key_b, None)
-            .await
-            .expect("B promotes");
+        p.b.promote_adopted_manifest_to_dag(
+            root,
+            &p.key_b,
+            None,
+            crate::federation::AdoptDisposition::LocalOnly,
+        )
+        .await
+        .expect("B promotes");
         out
     }
 
@@ -308,9 +313,14 @@ pub(crate) mod bodies {
                 .await
                 .unwrap_or_else(|e| panic!("I415f re-adopt chunk {seq}: {e}"));
         }
-        p.b.promote_adopted_manifest_to_dag(&root, &p.key_b, None)
-            .await
-            .expect("I415f B promotes the re-fetched manifest");
+        p.b.promote_adopted_manifest_to_dag(
+            &root,
+            &p.key_b,
+            None,
+            crate::federation::AdoptDisposition::LocalOnly,
+        )
+        .await
+        .expect("I415f B promotes the re-fetched manifest");
         assert_eq!(
             p.b.read_blob_as(&root, &p.key_b, None).await.unwrap(),
             plain,

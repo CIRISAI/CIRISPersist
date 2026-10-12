@@ -566,8 +566,13 @@ pub mod schema_resolver;
 pub mod scores;
 pub mod scores_read_audit;
 pub mod steward_purge;
+// v55.0.0 (CIRISPersist#1007) — the duty-holder takedown on the steward
+// purge's tombstone row (CC 4.5.3 step 2, CC 4.5.5).
+#[cfg(test)]
+pub(crate) mod doors_takedown_invariants;
 #[cfg(test)]
 mod steward_purge_invariants;
+pub mod takedown_tombstone;
 pub mod trust_root;
 // CIRISPersist#210 — cross-process leader election (RNS shared-instance
 // owner; CIRISEdge#100). Backend-agnostic types + staleness helper; the

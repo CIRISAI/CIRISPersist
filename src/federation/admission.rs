@@ -8943,6 +8943,31 @@ pub async fn owner_granters_in_force_at(
         .collect())
 }
 
+/// v55.0.0 (CIRISPersist#1007; CC 3.1.3.3 rule 4) — **a holding claim is
+/// retracted by its holder alone.** A `withdraws` whose target is a holding
+/// claim (a `holds_bytes` carrier, or the rc7 `custody:ack:v1` report) and
+/// whose signer is not the claim's signer is REFUSED at the door, stamped or
+/// not: "nobody withdraws another device's report, and a takedown is the CC
+/// 2.3 tombstone path" (`takedown_tombstone`). The fold
+/// (`precedence::retraction_entitled`) already never let such a row retire a
+/// claim; until v55 the door admitted the unstamped form inert, because the
+/// takedown handler and `evict_actor` emitted it and had no tombstone to move
+/// to. Both have moved.
+fn refuse_non_holder_withdraws(
+    row: &super::Attestation,
+    target: &super::Attestation,
+) -> Result<(), Error> {
+    if row.attesting_key_id == target.attesting_key_id {
+        return Ok(());
+    }
+    Err(Error::InvalidArgument(format!(
+        "carrier_withdraws_not_the_holder: {} is not the holder {} whose {} claim this withdraws \
+         names — only the holder retracts its own claim (CC 3.1.3.3 rule 4); a takedown is the \
+         CC 2.3 tombstone path (#1007)",
+        row.attesting_key_id, target.attesting_key_id, target.attestation_type
+    )))
+}
+
 /// v6.4.0 (CIRISPersist#146 Ask 2) — the `put_attestation` entry point
 /// for the broadened gate. A no-op (`Ok(None)`) for any
 /// non-`withdraws` row; for a `withdraws` it loads target `T`
@@ -8979,26 +9004,19 @@ pub async fn owner_granters_in_force_at(
 /// `T` is a `holds_bytes:sha256:*` **content-location directory entry**,
 /// not a consent-bearing Contribution:
 ///
-/// - **takedown** ([`crate::cirisnode::takedown_handler`]) — a
-///   moderation/operator key (already authorized by the takedown path)
-///   withdraws each holder's `holds_bytes` row.
-/// - **Policy-J age-gate** — same handler, age-assurance composition.
-/// - **`evict_actor` / sweeper** ([`crate::federation::blobs`],
+/// - **`evict_blob` / sweeper** ([`crate::federation::blobs`],
 ///   `engine.rs`) — a host self-attests it no longer holds the bytes.
 ///
-/// These are content-location retractions, not consent revocations;
-/// their authority is established upstream of persist (the moderation
-/// path / the host's own self-attestation). The consent gate would
-/// wrongly reject a moderation key withdrawing a third-party holder's
-/// `holds_bytes` row (issuer ≠ holder, no subjects, no delegation), so
-/// the gate is **scoped to NON-`holds_bytes` targets**: a `withdraws`
-/// whose target `T.attestation_type` begins with
-/// [`crate::federation::blobs::HOLDS_BYTES_ATTESTATION_TYPE_PREFIX`]
-/// bypasses the consent rules entirely (`Ok(None)`). Genuine consent
-/// withdraws target a consent-bearing Contribution (a `scores` /
-/// content attestation that may carry `subject_key_ids`), never a
-/// `holds_bytes` directory row — so the 4-rule gate still fully applies
-/// to them.
+/// These are content-location retractions, not consent revocations, so
+/// the gate is **scoped to NON-holding-claim targets**: a `withdraws`
+/// whose target is a holding claim (a `holds_bytes:sha256:*` row, or the
+/// rc7 `custody:ack:v1` report) bypasses the consent rules and is admitted
+/// iff its signer IS the claim's signer (v55.0.0, CIRISPersist#1007; CC
+/// 3.1.3.3 rule 4: nobody withdraws another device's report). A takedown
+/// is not a withdrawal of holders: it is the CC 2.3 tombstone
+/// ([`crate::federation::takedown_tombstone`]). Genuine consent withdraws
+/// target a consent-bearing Contribution, never a holding claim — so the
+/// 4-rule gate still fully applies to them.
 pub async fn check_withdraws_admission(
     directory: &dyn super::FederationDirectory,
     row: &super::Attestation,
@@ -9125,35 +9143,23 @@ pub async fn check_withdraws_admission_at(
         )));
     }
     // Scope discriminator: a `holds_bytes:sha256:*` target is a
-    // content-location directory entry whose `withdraws` is emitted by a
-    // separately-authorized moderation / host self-attestation path
-    // (takedown / age-gate / evict_actor / sweeper). The §3.2.3 consent
-    // gate does NOT apply — admit with rule `None` (the moderation path
-    // owns its own authorization).
+    // content-location directory entry, retracted by its holder alone
+    // (v55.0.0, #1007). The §3.2.3 consent gate does NOT apply.
     if target
         .attestation_type
         .starts_with(crate::federation::blobs::HOLDS_BYTES_ATTESTATION_TYPE_PREFIX)
     {
-        // v53.1.2 (CIRISPersist#984 row 13) — a holder's claim is retired by
-        // the holder alone, and the fold (`precedence::retraction_entitled`)
-        // never lets a resolved rule retire a carrier. So a non-holder's
-        // `withdraws` that ARRIVES with a `withdraws_admission_rule` stamp —
-        // which this door never resolves for a carrier target, so it can only
-        // be a replicated row's forged claim of entitlement — is refused by
-        // name rather than stored with a stamp nothing honours. An unstamped
-        // non-holder `withdraws` (the takedown handler's and `evict_actor`'s
-        // audit rows, whose authority is the moderation path's) is admitted
-        // with no rule, inert in every fold, exactly as before.
-        if row.attesting_key_id != target.attesting_key_id && row.withdraws_admission_rule.is_some()
-        {
-            return Err(Error::InvalidArgument(format!(
-                "carrier_withdraws_not_the_holder: {} is not the holder {} whose {} claim this \
-                 withdraws names, yet it carries a resolved admission rule — only the holder \
-                 retracts its own claim; a takedown is the CC 2.3 tombstone path (#984 row 13)",
-                row.attesting_key_id, target.attesting_key_id, target.attestation_type
-            )));
-        }
+        refuse_non_holder_withdraws(row, &target)?;
         return Ok(None);
+    }
+    // v55.0.0 (CIRISPersist#1007) — the rc7 holding claim, `custody:ack:v1`
+    // (a `scores` row), is retracted by its signer alone too (CC 3.1.3.3
+    // rule 4). The signer's own `withdraws` goes on to the rules below and
+    // resolves as rule 1, as before.
+    if envelope_dimension(&target.attestation_envelope)
+        == Some(super::custody_ack::CUSTODY_ACK_DIMENSION)
+    {
+        refuse_non_holder_withdraws(row, &target)?;
     }
     // v25.x (CIRISPersist#578, CIRISConstitution rc3 CC 3.2) — **the recovery
     // gate, in BOTH directions.**
@@ -15042,6 +15048,17 @@ pub async fn duty_holders_for_federation(
 /// `moderation:*` / `reconsideration:*` over a community): the named
 /// moderators of that community for `duty`.
 pub async fn duty_holders_for_community(
+    directory: &dyn super::FederationDirectory,
+    community_id: &str,
+    duty: &str,
+) -> Result<std::collections::HashSet<String>, Error> {
+    named_moderator_holders(directory, community_id, duty).await
+}
+
+/// v55.0.0 (CIRISPersist#1007) — [`named_moderator_holders`] for a caller
+/// that resolved the community from HELD state (the takedown authority
+/// reads it from the content's binding rows, never from a notice).
+pub(crate) async fn community_duty_roots(
     directory: &dyn super::FederationDirectory,
     community_id: &str,
     duty: &str,

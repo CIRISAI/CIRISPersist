@@ -220,3 +220,12 @@ decimal_id	claim_id	repo	path#symbol	crate@version
 4.5.3	CLM-purge-whole-or-not	CIRISPersist	src/federation/steward_purge.rs#purge_rows	ciris-persist@54.1.0
 4.5.3	CLM-purge-whole-or-not	CIRISPersist	src/federation/steward_purge.rs#purge_finalize	ciris-persist@54.1.0
 4.5.3	CLM-purge-whole-or-not	CIRISPersist	src/federation/steward_purge.rs#refuse_if_tombstoned_attestation	ciris-persist@54.1.0
+4.5.3	CLM-one-tombstone-row	CIRISPersist	src/federation/takedown_tombstone.rs#takedown_tombstone	ciris-persist@54.1.0
+4.5.3	CLM-one-tombstone-row	CIRISPersist	src/federation/takedown_tombstone.rs#apply_replicated_takedown	ciris-persist@54.1.0
+4.5.3	CLM-one-tombstone-row	CIRISPersist	src/federation/takedown_tombstone.rs#settles_at	ciris-persist@54.1.0
+4.5.3	CLM-one-tombstone-row	CIRISPersist	src/engine.rs#takedown_holder_action	ciris-persist@54.1.0
+4.5.3	CLM-one-tombstone-row	CIRISPersist	src/federation/steward_purge.rs#purge_rows	ciris-persist@54.1.0
+2.4.1.1	CLM-derived-rows-follow-reason	CIRISPersist	src/federation/steward_purge.rs#resolve_selection	ciris-persist@54.1.0
+2.4.1.1	CLM-derived-rows-follow-reason	CIRISPersist	src/federation/steward_purge.rs#withhold_orphaned_derivatives	ciris-persist@54.1.0
+2.4.1.1	CLM-derived-rows-follow-reason	CIRISPersist	src/federation/takedown_tombstone.rs#takedown_tombstone	ciris-persist@54.1.0
+2.4.1.1	CLM-derived-rows-follow-reason	CIRISPersist	src/federation/steward_purge.rs#purge_withheld	ciris-persist@54.1.0
