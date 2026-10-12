@@ -1364,3 +1364,59 @@ def test_ciris_canonical_trust_root_surface_926() -> None:
     finally:
         eng.close(force=True)
     ciris_persist.reset_engine()
+
+
+def test_reack_holding_claims_once_is_host_reachable_989() -> None:
+    """v55.0.0 (#989, CC 3.1.3.3 rule 5) — the re-ack pass is reachable from
+    Python and returns its report as JSON. A fresh commons claim is a day
+    younger than the renewal threshold, so one pass renews nothing and finds
+    it fresh; a second pass is the same (idempotent). Skips on a non-sqlite
+    wheel."""
+    import base64
+    import hashlib
+    import json
+    import os
+    import secrets
+    import tempfile
+
+    import pytest
+
+    ciris_persist.reset_engine()
+    d = tempfile.mkdtemp()
+    seed = os.path.join(d, "seed")
+    pqc_seed = os.path.join(d, "pqc.seed")
+    with open(seed, "wb") as fh:
+        fh.write(secrets.token_bytes(32))
+    with open(pqc_seed, "wb") as fh:
+        fh.write(secrets.token_bytes(32))
+    alias = "node-" + secrets.token_hex(8)
+    try:
+        eng = ciris_persist.Engine(
+            "sqlite::memory:",
+            alias,
+            local_key_id=alias,
+            local_key_path=seed,
+            local_pqc_key_id=alias + "-pqc",
+            local_pqc_key_path=pqc_seed,
+        )
+    except ValueError as exc:
+        if "sqlite" in str(exc) and "feature" in str(exc):
+            pytest.skip("wheel built without the sqlite feature")
+        raise
+    try:
+        eng.register_self_federation_key("agent", "ref", None, None, None)
+        body = b"commons bytes " + secrets.token_bytes(8)
+        put = json.loads(
+            eng.put_blob_scoped("federation", base64.b64encode(body).decode(), None, None)
+        )
+        assert put["at_rest_sha256"] == hashlib.sha256(body).hexdigest(), put
+        for _ in range(2):
+            report = json.loads(eng.reack_holding_claims_once())
+            assert set(report) == {
+                "scanned", "renewed", "fresh", "not_held", "not_in_cohort", "failed", "converted",
+            }, report
+            assert report["scanned"] == 1 and report["fresh"] == 1, report
+            assert report["renewed"] == 0 and report["failed"] == 0, report
+    finally:
+        eng.close(force=True)
+    ciris_persist.reset_engine()
