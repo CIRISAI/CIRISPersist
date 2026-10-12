@@ -87,6 +87,11 @@
 //!   write the manifest → chunk relation with the `chunk_dag` row, so after an
 //!   immediate-removal takedown of the DAG every chunk is withheld
 //!   (`purge_withheld` finds it through `dag_manifests_of_chunk`) and evicted.
+//! - **I774** (sqlite, postgres; Codex r2 on #1065) — the plaintext DAG doors
+//!   ask the WILL decision of the author: at the stop tier a non-local proxy
+//!   author's one-shot DAG (`put_blob_chunks_signing`) and finalize are
+//!   `DiskPressureProxyRefused` (`accept`) with nothing stored and nothing
+//!   announced; this node's own DAG is still admitted.
 //! - **I793** — the settle is the basis's: a steward purge after W = 72 h,
 //!   an immediate-removal takedown at once, a counter-notice takedown after
 //!   its window, the age gate and an unknown basis never earlier than W.
@@ -1297,6 +1302,123 @@ pub(crate) mod engine_bodies {
         }
     }
 
+    // ── I774 ──────────────────────────────────────────────────────────────
+    pub(crate) async fn i774_the_plaintext_dag_doors_ask_the_will_decision<B>(
+        dsn_a: &str,
+        _dsn_b: &str,
+        run: &str,
+        pick: Pick<B>,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync + 'static,
+    {
+        use crate::federation::{DiskPressureConfig, DiskPressureMonitor, StubFreeBytes};
+        let alias = format!("i774-node-{run}");
+        let engine = crate::Engine::with_signer_pre_genesis(ts::local_signer(&alias), dsn_a)
+            .await
+            .unwrap();
+        engine
+            .register_self_federation_key(
+                crate::federation::types::identity_type::NODE,
+                &alias,
+                None,
+                serde_json::json!({}),
+                vec![],
+            )
+            .await
+            .unwrap();
+        let b = pick(&engine);
+        let stranger = format!("i774-stranger-{run}");
+        ts::register_hybrid_key_as(b.as_ref(), &stranger, &stranger, USER).await;
+        let cfg = std::sync::Arc::new(DiskPressureConfig {
+            monitor_path: std::path::PathBuf::from("/x"),
+            ..Default::default()
+        });
+        let stub = std::sync::Arc::new(StubFreeBytes::new(2 * 1024 * 1024 * 1024));
+        let monitor = std::sync::Arc::new(DiskPressureMonitor::with_source(
+            (*cfg).clone(),
+            stub.clone(),
+        ));
+        monitor.poll_once();
+        let engine = engine
+            .with_disk_pressure_config_shared(cfg)
+            .with_disk_pressure_state_shared(monitor.subscribe());
+        let segs = |tag: &str| -> Vec<Vec<u8>> {
+            (0..2u8)
+                .map(|i| format!("i774 {tag} {run} {i} ").repeat(30).into_bytes())
+                .collect()
+        };
+        let chunks_of = |segs: &[Vec<u8>]| -> Vec<([u8; 32], BlobBody)> {
+            segs.iter()
+                .map(|s| (sha2::Sha256::digest(s).into(), BlobBody::Inline(s.clone())))
+                .collect()
+        };
+        let absent = |sha: [u8; 32]| {
+            let b = b.clone();
+            async move { b.blob_head(&sha).await.unwrap().is_none() }
+        };
+        // The incremental chunks are stored BELOW stop (admitted then).
+        let late = segs("finalize");
+        let late_m = plaintext_manifest(&late);
+        for (c, s) in late_m.chunks.iter().zip(&late) {
+            engine
+                .put_plaintext_dag_chunk(c, BlobBody::Inline(s.clone()), &stranger)
+                .await
+                .expect("I774: a proxy chunk below stop");
+        }
+        // STOP.
+        stub.set(400 * 1024 * 1024);
+        monitor.poll_once();
+        let refused = |r: Result<[u8; 32], BlobError>| {
+            matches!(
+                r,
+                Err(BlobError::DiskPressureProxyRefused {
+                    operation: "accept",
+                    ..
+                })
+            )
+        };
+        let one = segs("one-shot");
+        let one_m = plaintext_manifest(&one);
+        let one_sha: [u8; 32] = sha2::Sha256::digest(one_m.to_jcs_bytes()).into();
+        assert!(
+            refused(
+                engine
+                    .put_blob_chunks_signing(one_m.clone(), chunks_of(&one), &stranger)
+                    .await
+            ),
+            "I774: the one-shot door refuses a proxy author at stop"
+        );
+        assert!(absent(one_sha).await, "I774: no manifest row");
+        for c in &one_m.chunks {
+            assert!(absent(c.sha).await, "I774: no chunk row");
+        }
+        assert!(
+            b.list_holders(&one_sha).await.unwrap().is_empty(),
+            "I774: no claim"
+        );
+        let late_sha: [u8; 32] = sha2::Sha256::digest(late_m.to_jcs_bytes()).into();
+        assert!(
+            refused(
+                engine
+                    .finalize_blob_chunks_signing(late_m.clone(), &stranger)
+                    .await
+            ),
+            "I774: the finalize refuses a proxy author at stop"
+        );
+        assert!(
+            absent(late_sha).await,
+            "I774: no manifest row at the finalize"
+        );
+        assert!(b.list_holders(&late_sha).await.unwrap().is_empty());
+        // This node's own DAG is not a proxy write.
+        let me = engine.local_derived_key_id().await.unwrap();
+        let own = segs("own");
+        engine
+            .put_blob_chunks_signing(plaintext_manifest(&own), chunks_of(&own), &me)
+            .await
+            .expect("I774: this node's own DAG at stop");
+    }
+
     // ── I790 ──────────────────────────────────────────────────────────────
     pub(crate) async fn i790_this_node_acts_as_a_holder<B>(
         dsn_a: &str,
@@ -1626,6 +1748,17 @@ mod run {
                     let Some((a, b)) = $dsns else { return };
                     e::i780_i783_the_incremental_plaintext_dag(&a, &b, &super::suffix(), $pick)
                         .await
+                }
+                #[tokio::test]
+                async fn i774() {
+                    let Some((a, b)) = $dsns else { return };
+                    e::i774_the_plaintext_dag_doors_ask_the_will_decision(
+                        &a,
+                        &b,
+                        &super::suffix(),
+                        $pick,
+                    )
+                    .await
                 }
                 #[tokio::test]
                 async fn i773() {

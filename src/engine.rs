@@ -6135,9 +6135,11 @@ impl Engine {
     /// holding claim ([`emit_holding_claim`](crate::federation::holding_claim::emit_holding_claim),
     /// v55.0.0) — the shape `seal_stream_scoped` uses for a commons stream at
     /// the origin, so a pulled commons DAG is not a silent holder. The claim
-    /// is this node's. `author_key_id` is whose content this is; the chunk
-    /// floor records no author, so it is not stored (as before: the
-    /// announcement never overwrote the row). Returns the manifest's address.
+    /// is this node's. `author_key_id` is whose content this is: the WILL
+    /// decision ([`would_hold`](Self::would_hold)) is asked of it before
+    /// anything is stored or announced (Codex r2 on #1065: a non-local proxy
+    /// author at the stop tier is refused, as the incremental door refuses
+    /// it); the chunk floor records no author. Returns the manifest's address.
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     pub async fn put_blob_chunks_signing(
         &self,
@@ -6147,6 +6149,8 @@ impl Engine {
     ) -> Result<[u8; 32], crate::federation::BlobError> {
         use crate::federation::BlobStorage;
         use sha2::Digest as _;
+        self.would_hold(&plaintext_dag_provenance(author_key_id))
+            .await?;
         let jcs = manifest.to_jcs_bytes();
         let sha256: [u8; 32] = sha2::Sha256::digest(&jcs).into();
         match &self.backend {
@@ -6155,9 +6159,8 @@ impl Engine {
             #[cfg(feature = "sqlite")]
             BackendDispatch::Sqlite(arc) => arc.put_blob_chunks(manifest, chunks).await?,
         }
-        // The author is the WILL decision's input (the chunk floor's); the
-        // claim is this node's.
-        let _ = (author_key_id, jcs);
+        // The claim is this node's.
+        let _ = jcs;
         self.announce_plaintext_dag(&sha256).await?;
         Ok(sha256)
     }
@@ -6186,15 +6189,8 @@ impl Engine {
     ) -> Result<[u8; 32], crate::federation::BlobError> {
         use crate::federation::types::cohort_scope::CryptoTier;
         use crate::federation::BlobStorage;
-        self.would_hold(&crate::federation::BlobProvenance {
-            author_key_id: author_key_id.to_owned(),
-            cohort_scope: crate::federation::types::cohort_scope::FEDERATION.to_owned(),
-            community_key_id: None,
-            epoch: None,
-            tier: CryptoTier::Plaintext,
-            minter_key_id: None,
-        })
-        .await?;
+        self.would_hold(&plaintext_dag_provenance(author_key_id))
+            .await?;
         let floor = crate::federation::StorageFloor::resolved(CryptoTier::Plaintext);
         match &self.backend {
             #[cfg(feature = "postgres")]
@@ -6257,9 +6253,11 @@ impl Engine {
     ) -> Result<[u8; 32], crate::federation::BlobError> {
         use crate::federation::BlobStorage;
         crate::federation::blobs::check_plaintext_dag_manifest(&manifest)?;
-        // The author was the WILL decision's input at every chunk; the claim
-        // is this node's (as the one-shot door).
-        let _ = author_key_id;
+        // Codex r2 on #1065 — the WILL decision again before the manifest row
+        // and the announcement (pressure may have risen since the chunks);
+        // the claim is this node's (as the one-shot door).
+        self.would_hold(&plaintext_dag_provenance(author_key_id))
+            .await?;
         let sha256 = match &self.backend {
             #[cfg(feature = "postgres")]
             BackendDispatch::Postgres(arc) => arc.put_dag_manifest_over_held(manifest).await?,
@@ -11606,6 +11604,21 @@ pub enum EngineError {
 /// evicted the same way, retract-then-delete. A chunk another live (or
 /// unbound) manifest still holds stays. Bytes only: the relation rows and the
 /// at-rest grants stay, as for any eviction.
+/// The provenance a plaintext chunk DAG's WILL decision is asked of: the
+/// commons (`federation`, plaintext), authored by `author_key_id`. One
+/// spelling for the one-shot door, the chunk door and the finalize.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+fn plaintext_dag_provenance(author_key_id: &str) -> crate::federation::BlobProvenance {
+    crate::federation::BlobProvenance {
+        author_key_id: author_key_id.to_owned(),
+        cohort_scope: crate::federation::types::cohort_scope::FEDERATION.to_owned(),
+        community_key_id: None,
+        epoch: None,
+        tier: crate::federation::types::cohort_scope::CryptoTier::Plaintext,
+        minter_key_id: None,
+    }
+}
+
 #[cfg(any(feature = "postgres", feature = "sqlite"))]
 async fn evict_blob_on<B>(
     backend: &B,
