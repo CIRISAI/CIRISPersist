@@ -508,6 +508,10 @@ mod accord_roster_invariants;
 /// v53.0.0 (CC 3.2 T6) — I440–I449, the head moves with the record.
 #[cfg(test)]
 mod lineage_head_invariants;
+/// v55.0.0 (CIRISPersist#753) — I700–I709, the CC rc7 re-vendor: the held
+/// families, the ledger owner rule, settlement admission.
+#[cfg(test)]
+mod rc7_vendor_invariants;
 pub mod register;
 /// v53.0.0 (CC 3.2 T6, rc7 `36432c6`) — I450–I459, roster rows and the head.
 #[cfg(test)]

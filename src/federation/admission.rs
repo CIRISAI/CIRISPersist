@@ -769,17 +769,78 @@ pub const UNREGISTERED_GATED_FAMILIES: &[&str] = &[
 /// [`tests::staged_families_are_still_unregistered_and_tracked`] fails until
 /// it is deleted — the same self-deleting discipline as the exceptions list.
 pub const STAGED_GOVERNED_FAMILIES: &[(&str, &str)] = &[
-    // CC 3.3.10.1 (1.0-rc4.3) — in-grammar ledgers. Persist's working index
-    // and the pure standard shipped ahead of ratification; `ledger:*` rows
-    // refuse at federation tier until CIRISConstitution#92 graduates the
-    // family. Local-tier rows are the node's own business, as everywhere.
-    ("ledger:", "CIRISConstitution#92"),
+    // EMPTY as of the rc7 re-vendor (v55.0.0, CIRISPersist#753). It carried
+    // `ledger:` (CC 3.3.10.1 in-grammar ledgers, staged on
+    // CIRISConstitution#92) from v38.0.0 until CC rc7 registered
+    // `ledger:head|checkpoint|promotion` (CIRISConstitution#105); the
+    // re-vendor brought the rows in,
+    // `tests::staged_families_are_still_unregistered_and_tracked` failed by
+    // name, and the line was deleted. The family is now gated by
+    // `check_ledger_binding_admission` and `check_ledger_emitter_admission`.
 ];
 
+/// **Registered dimensions held shut** `(prefix, tracking ref)` — CC registers
+/// them, persist has no door for them yet, and a dimension under one is
+/// refused at every federation-tier door until the door lands
+/// ([`check_registered_family_not_held`]). A prefix is a family stem or a leaf
+/// with its trailing `:` (`membership:widening:`), matched on that boundary.
+///
+/// The staged latch's twin for a family that is ALREADY registered, where
+/// [`STAGED_GOVERNED_FAMILIES`] cannot hold it (R2(b) stands aside for a
+/// registered stem). It is for a registration that WIDENS what a node admits:
+/// a dimension the previous cut refused, which the re-vendor would otherwise
+/// open to any signer before persist enforces CC's rule on it.
+/// `tests::held_dimensions_are_registered_and_tracked` fails once a line names
+/// nothing the registry carries, and the cut that builds the door deletes the
+/// line.
+pub const REGISTERED_FAMILIES_HELD_SHUT: &[(&str, &str)] = &[
+    // CC 3.3.2 rc7 (CIRISConstitution#143): `key_grant:{axis}:v1` is one
+    // `scores` row per recipient, "sealer-only". rc6 gated the `key_grant:`
+    // stem ("carrier row type, never a dimension"), so no node admitted it as a
+    // dimension; rc7 drops that gate. The per-recipient row door, with the
+    // sealer rule, is v55 slice B (CIRISPersist#989), which deletes this line.
+    ("key_grant:", "CIRISPersist#989"),
+    // CC 3.1.3.2 rc7: three new `membership:{stage}` leaves — widening and
+    // removal "cosigned under the group's consensus_protocol", resignation
+    // "the leaving member". rc6's closed vocabulary refused all three;
+    // `membership_acceptance` gates only proposal / acceptance / decline, so
+    // the re-vendor would admit these from any signer. The cosigned-row doors
+    // are CIRISPersist#991's.
+    ("membership:widening:", "CIRISPersist#991"),
+    ("membership:removal:", "CIRISPersist#991"),
+    ("membership:resignation:", "CIRISPersist#991"),
+];
+
+/// The reason token a [`REGISTERED_FAMILIES_HELD_SHUT`] refusal carries, on the
+/// existing [`Error::DimensionRejected`] shape (the [`LEDGER_BINDING_REASON`]
+/// precedent: the pyo3 FFI matches the shape, so a token needs no FFI change).
+pub const REGISTERED_FAMILY_HELD_SHUT_REASON: &str = "registered_family_held_shut";
+
+/// v55.0.0 (CIRISPersist#753) — refuse a dimension under a
+/// [`REGISTERED_FAMILIES_HELD_SHUT`] prefix. Pure; asked of the envelope
+/// `dimension` of every federation-tier row, whatever its type, beside R2(b).
+///
+/// # Errors
+///
+/// [`Error::DimensionRejected`] with [`REGISTERED_FAMILY_HELD_SHUT_REASON`].
+pub fn check_registered_family_not_held(dimension: &str) -> Result<(), Error> {
+    if REGISTERED_FAMILIES_HELD_SHUT
+        .iter()
+        .any(|(p, _)| dimension.starts_with(p))
+    {
+        return Err(Error::DimensionRejected {
+            dimension: dimension.to_owned(),
+            reason: REGISTERED_FAMILY_HELD_SHUT_REASON,
+        });
+    }
+    Ok(())
+}
+
 /// v38.0.0 (CIRISPersist#754) — the CC 3.3.10.1 `ledger:*` dimension family
-/// stem. Staged on CIRISConstitution#92 (see [`STAGED_GOVERNED_FAMILIES`]);
-/// the L1 binding arm below is live from day one so graduation opens an
-/// already-gated door, never an open one.
+/// stem. Staged on CIRISConstitution#92 until the rc7 re-vendor (v55.0.0,
+/// CIRISPersist#753) registered it; gated by the L1 binding arm
+/// ([`check_ledger_binding_admission`]) and the owner rule
+/// ([`check_ledger_emitter_admission`]).
 pub const LEDGER_DIMENSION_PREFIX: &str = "ledger:";
 
 /// v38.0.0 (CIRISPersist#721) — the pinned signing bytes for a
@@ -998,6 +1059,98 @@ pub fn check_ledger_binding_admission(
         }
     }
     Ok(())
+}
+
+/// v55.0.0 (CIRISPersist#753) — **the `ledger:*` owner rule.** CC 3.1.3's
+/// table reserves the three ledger rows to "the ledger's single owner (the
+/// steward-bound identity of its `ledger_id` triple) or a delegate under its
+/// declared serialization discipline" (CC 3.3.10.1 clauses 1–3). The owner is
+/// `attested_key_id` ([`check_ledger_binding_admission`] binds the triple to
+/// it), so the signer must act for that identity: its own key, a live
+/// occurrence of it, or a node bound to it (the one `signer_acts_for` rule).
+///
+/// The rc7 registry rows carry `substrate-self-report` instead — the CC 3.1.3
+/// section's default — which would refuse every owner. Persist follows the
+/// table cell, the more specific text, and is stricter than it in one
+/// direction: the `delegates_to` delegate path is refused until a door reads
+/// the ledger's declared serialization discipline (clause 3: "Concurrent
+/// unleased writes at one sequence number ARE a fork").
+///
+/// # Errors
+///
+/// [`Error::SignerDoesNotActFor`] (plane `ledger`) when the signer does not
+/// act for the owner — retryable, since the binding may not have landed yet.
+pub async fn check_ledger_emitter_admission(
+    directory: &dyn super::FederationDirectory,
+    row: &super::Attestation,
+) -> Result<(), Error> {
+    if row.attestation_type != attestation_type::SCORES {
+        return Ok(());
+    }
+    let Some(dimension) = envelope_dimension(&row.attestation_envelope) else {
+        return Ok(());
+    };
+    if !dimension.starts_with(LEDGER_DIMENSION_PREFIX) {
+        return Ok(());
+    }
+    check_signer_acts_for(
+        directory,
+        &row.attesting_key_id,
+        &row.attested_key_id,
+        LEDGER_EMITTER_PLANE,
+    )
+    .await
+}
+
+/// The `plane` a [`check_ledger_emitter_admission`] refusal names.
+pub const LEDGER_EMITTER_PLANE: &str = "ledger";
+
+/// v55.0.0 (CIRISPersist#753) — the CC 3.3.10 `settlement:*` dimension stem.
+pub const SETTLEMENT_DIMENSION_PREFIX: &str = "settlement:";
+
+/// v55.0.0 (CIRISPersist#753) — **`settlement:*` admission, CC 3.3.10.**
+///
+/// A settlement row is "a bare `scores` on a `settlement:*` dimension against
+/// the paid Contribution", signed by the payer (Identity = Wallet: "the same
+/// federation key that signs this attestation controls the Base wallet that
+/// emitted `settlement_ref`"), and the payee MAY counter-attest on
+/// `settlement:received:*`. The leaves are open (`settlement:paid:v1`
+/// canonical) and the `cohort_scope` is the producer's choice — `self` by
+/// default (the private arm), `public` / `federation` opt-in — so no emitter
+/// role and no scope is asked here.
+///
+/// What IS asked: the row carries no payment-processor identifier. CC 3.3.10
+/// keeps billing "entirely Portal+Stripe, off-wire" and cites a settlement the
+/// way `evidence_refs[]` cite a blob (a chain tx hash, an x402 receipt id);
+/// the same recursive scan the operational envelopes get
+/// ([`crate::federation::operational::reject_payment_processor_identifiers`])
+/// runs over the whole signed envelope, so a Stripe id cannot ride an open
+/// field of a settlement either. Linkage references in, processor
+/// identifiers out.
+///
+/// The rc7 registry row carries the CC 3.1.3 section default
+/// `substrate-self-report`; the CC 3.1.3 table marks the row "Reserved? No"
+/// and CC 3.3.10 names the payer as the signer. Persist follows the text:
+/// gating the family to `substrate_persist` would refuse every conformant
+/// settlement (the CC 3.1.7 R2 failure mode).
+///
+/// Pure. Every federation-tier row reaches it through
+/// [`check_reserved_prefix_admission`], on all three backends.
+///
+/// # Errors
+///
+/// [`Error::PaymentProcessorIdentifier`] on the first processor identifier.
+pub fn check_settlement_admission(row: &super::Attestation) -> Result<(), Error> {
+    if row.attestation_type != attestation_type::SCORES {
+        return Ok(());
+    }
+    let Some(dimension) = envelope_dimension(&row.attestation_envelope) else {
+        return Ok(());
+    };
+    if !dimension.starts_with(SETTLEMENT_DIMENSION_PREFIX) {
+        return Ok(());
+    }
+    crate::federation::operational::reject_payment_processor_identifiers(&row.attestation_envelope)
 }
 
 /// **CIRISPersist#571 — the three media-plane families persist STOPPED gating,
@@ -16321,6 +16474,7 @@ pub async fn check_reserved_prefix_admission(
     }
     if let Some(dim) = envelope_dimension(&row.attestation_envelope) {
         check_namespace_family_registered(dim)?;
+        check_registered_family_not_held(dim)?;
     }
 
     // (CIRISPersist#571) — CC 3.1.7 R2's Private Use range: `x_private:*` MUST
@@ -16341,10 +16495,16 @@ pub async fn check_reserved_prefix_admission(
 
     // CC 3.3.10.1 L1 (CIRISPersist#754) — a `ledger:*` row's declared
     // ledger_id must BE the derivation of its (attested identity, unit,
-    // standard_version) triple. Dormant pre-graduation (R2(b) above refuses
-    // the staged family first) and live the moment CIRISConstitution#92
-    // lands the registry row — the door graduation opens is already gated.
+    // standard_version) triple. Live since the rc7 re-vendor (v55.0.0,
+    // CIRISPersist#753) registered the family and the staging latch went.
     check_ledger_binding_admission(at, &row.attestation_envelope, &row.attested_key_id)?;
+    // And the signer must act for the ledger's owner (CC 3.1.3 table:
+    // "the ledger's single owner … or a delegate").
+    check_ledger_emitter_admission(directory, row).await?;
+
+    // CC 3.3.10 (CIRISPersist#753) — a `settlement:*` row links an action to
+    // its off-stack settlement and carries no payment-processor identifier.
+    check_settlement_admission(row)?;
 
     // v37.0.0 (CIRISPersist#733) — **AN `accord:*` ROW NAMES ITS OWN ACCORD.**
     //
@@ -19263,6 +19423,24 @@ mod tests {
         // identity type expresses. The gate is
         // `custody_ack::check_custody_ack_admission`.
         "custody:",
+        // rc7 re-vendor (v55.0.0, CIRISPersist#753) — the rows carry the CC
+        // 3.1.3 section default `substrate-self-report`; the table cell says
+        // "the ledger's single owner … or a delegate" (CC 3.3.10.1), which no
+        // identity type expresses. Gated by `check_ledger_binding_admission`
+        // and `check_ledger_emitter_admission`.
+        "ledger:",
+        // rc7 re-vendor (v55.0.0, CIRISPersist#753) — the row carries the
+        // section default `substrate-self-report`, but the CC 3.1.3 table marks
+        // it "Reserved? No" and CC 3.3.10 names the payer as the signer, with a
+        // payee counter-attestation on `settlement:received:*`. Open emitter;
+        // the gate is `check_settlement_admission` (no payment-processor
+        // identifier).
+        "settlement:",
+        // rc7 re-vendor (v55.0.0, CIRISPersist#753) — "sealer-only" (CC 3.3.2).
+        // Held shut: `REGISTERED_FAMILIES_HELD_SHUT` refuses every dimension
+        // under the stem until v55 slice B builds the per-recipient row door
+        // (CIRISPersist#989).
+        "key_grant:",
     ];
 
     /// Manifest-reserved families persist has **no gate for yet** — a different
@@ -19286,6 +19464,18 @@ mod tests {
         // CC 3.1.1 — owner-signed, self scope only. The server's row
         // (`self:device_label`, renamed); persist has no emitter.
         ("device:label", "CIRISConstitution#137"),
+        // rc7 re-vendor (v55.0.0, CIRISPersist#753). Each was unregistered open
+        // vocabulary in rc6, so nothing admits that did not admit before. The
+        // planes they name are persist's own (the key record, the occurrence,
+        // the revocation, the roster head), held today on their typed tables;
+        // the `scores` rows that carry them, with CC's rule, are #991's.
+        ("key:record", "CIRISPersist#991"),
+        ("key:revocation", "CIRISPersist#991"),
+        ("identity:occurrence", "CIRISPersist#991"),
+        ("group:roster", "CIRISPersist#991"),
+        // CC 3.2 public communities (CIRISConstitution#142): founder- or
+        // moderate-holder-signed, one live row per community. v55 slice A.
+        ("community:listing", "CIRISPersist#1053"),
     ];
 
     /// **CC 3.1.7 R2(a) — the mint gate.** Every family persist declares itself
@@ -19613,6 +19803,53 @@ mod tests {
                 ),
                 "staged family {stem:?} did not refuse at R2(b)"
             );
+        }
+    }
+
+    /// I702 (CIRISPersist#753) — every held-shut prefix ends on a segment
+    /// boundary, names a tracking issue, and covers a dimension the vendored
+    /// registry RESOLVES (a line whose dimension CC no longer registers holds
+    /// nothing shut and must go); the refusal fires on the registry's own
+    /// sample and spares the neighbours the prefix must not reach.
+    #[test]
+    fn held_dimensions_are_registered_and_tracked() {
+        use crate::federation::namespace::matcher::{match_family, sample_dimension};
+        use crate::federation::namespace::registry;
+        assert!(!REGISTERED_FAMILIES_HELD_SHUT.is_empty());
+        for (prefix, tracked) in REGISTERED_FAMILIES_HELD_SHUT {
+            assert!(prefix.ends_with(':'), "I702 {prefix:?} ends on a boundary");
+            assert!(tracked.contains('#'), "I702 {prefix:?} names its door");
+            let probe = format!("{prefix}v1");
+            let probe = if match_family(&probe).refusal.is_none() {
+                probe
+            } else {
+                registry::entries()
+                    .iter()
+                    .filter_map(|e| sample_dimension(&e.prefix))
+                    .find(|d| d.starts_with(prefix) && match_family(d).refusal.is_none())
+                    .unwrap_or_else(|| {
+                        panic!("I702 {prefix:?} holds nothing the registry resolves — delete it")
+                    })
+            };
+            assert!(
+                matches!(
+                    check_registered_family_not_held(&probe),
+                    Err(Error::DimensionRejected { reason, .. })
+                        if reason == REGISTERED_FAMILY_HELD_SHUT_REASON
+                ),
+                "I702 {probe:?} is held shut"
+            );
+        }
+        for open in [
+            "membership:proposal:v1",
+            "membership:acceptance:v1",
+            "membership:decline:v1",
+            "key:record:v1",
+            "custody:ack:v1",
+            "key_granted:v1",
+        ] {
+            check_registered_family_not_held(open)
+                .unwrap_or_else(|e| panic!("I702 {open:?} is not held: {e}"));
         }
     }
 

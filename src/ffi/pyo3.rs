@@ -30430,9 +30430,10 @@ impl PyEngine {
     // checkpoints (immutable — a witnessed fact pins, never flips), L2/L6
     // entry-range pointers, L8 fork-evidence records (detection records,
     // adjudication punishes — a fork NEVER fires slashing from here).
-    // Rows on the ledger:* dimension family stay REFUSED at federation
-    // tier until CIRISConstitution#92 graduates the family; these local
-    // verbs are live for consumers that enable the feature.
+    // Rows on the ledger:* dimension family admit at federation tier since
+    // the rc7 re-vendor (v55.0.0, CIRISPersist#753) under the L1 binding and
+    // the owner rule; these local verbs are live for consumers that enable
+    // the feature.
 
     /// CC 3.3.10.1 L1 — register (or idempotently re-register) the ledger
     /// for `(owner_key_id, unit, standard_version)`. Returns JSON

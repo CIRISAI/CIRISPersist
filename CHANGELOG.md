@@ -7,6 +7,86 @@ threat-model citations because this crate's audit story is the point.
 
 ## [Unreleased]
 
+## [55.0.0] - UNRELEASED
+
+### Changed — CIRISConstitution v1.0-rc7 vendored (#753, slice A0)
+
+- `namespace_registry.json` and `namespace_match_vectors.json` are copied
+  byte-for-byte from the `v1.0-rc7` TAG (`536b8cb`, annotated tag `686d274`):
+  168 families (was 158), `registry_sha256 796f6099…` (was `f666f334…`), 1103
+  dimension vectors and 25 row-type vectors. `scripts/check_vendored_cc.sh
+  v1.0-rc7` passes. `namespace_match_binds.json` is regenerated from the
+  reference matcher at the tag.
+- **Families added (11):** `accord:lifecycle:confirmed`, `community:listing`,
+  `group:roster`, `identity:occurrence`, `key:record`, `key:revocation`,
+  `key_grant:{axis}`, `ledger:head:{unit}:{version}`,
+  `ledger:checkpoint:{unit}:{version}`, `ledger:promotion:{version}`,
+  `settlement:*`. **Retired (1):** `holds_bytes:sha256:{prefix}` (CC 2.4,
+  CIRISConstitution#141). **Changed:** `accord:*` lists the new leaf;
+  `membership:{stage}` gains `widening`, `removal`, `resignation`. The
+  `key_grant:` reserved stem ("carrier row type, never a dimension") is gone
+  and a `community:` stem is gated ("community:listing is the only leaf").
+- **The `ledger:` staging latch is deleted.** CC rc7 registers the CC
+  3.3.10.1 ledger leaves (CIRISConstitution#92/#105), so `ledger:*` rows now
+  admit at federation tier, under the L1 triple binding and a new owner rule
+  (`check_ledger_emitter_admission`): the signer must act for the attested
+  owner (its key, a live occurrence, or its node binding). The rc7 rows carry
+  the CC 3.1.3 section default `substrate-self-report`; persist follows the
+  table cell ("the ledger's single owner … or a delegate") and refuses the
+  `delegates_to` delegate path until a door reads the ledger's declared
+  serialization discipline.
+- **`settlement:*` admits (CC 3.3.10).** A `scores` row on any
+  `settlement:*` leaf admits from the payer, on the private arm
+  (`cohort_scope: self`) and the auditable arm (`federation` / `public`), and
+  the payee's `settlement:received:*` counter-attestation admits too. Its
+  envelope is scanned by `reject_payment_processor_identifiers`, the gate the
+  operational envelopes already run: a Stripe-shaped identifier anywhere in a
+  settlement row is refused. The rc7 row says `substrate-self-report`; the CC
+  3.1.3 table says "Reserved? No" and CC 3.3.10 names the payer, and persist
+  follows the text.
+- **Held shut until their door:** `key_grant:{axis}:v1` as a dimension (v55
+  slice B, #989) and `membership:widening|removal|resignation:v1` (#991).
+  rc6 refused all four; rc7 registers them; persist has no gate that enforces
+  CC's rule on them yet, so `admission::REGISTERED_FAMILIES_HELD_SHUT` refuses
+  them at every federation-tier door.
+- **TEMPORARY carrier exception.** rc7 empties `_meta.row_types.carriers`.
+  Persist's blob doors and key-grant sets still write the two rc6 carriers, so
+  `registry::RC6_RETIRED_CARRIERS_ADMITTED_UNTIL_989` keeps exactly
+  `holds_bytes:sha256:{8 hex}` and `key_grant:(content|epoch|stream):v1`
+  admitted as carrier row types, carrier shape still enforced, until v55
+  slices A and B retire them. A from-disk gate (I701) fails once a 55.0.0 or
+  later release is dated in this file while the const is non-empty.
+- Reserved and not yet gated (admitted as before, when they were unregistered
+  open vocabulary): `key:record`, `key:revocation`, `identity:occurrence`,
+  `group:roster` (#991), `community:listing` (#1053).
+- Evidence: the `CLM-ledger-standard` row that cited the staging latch now
+  cites `check_ledger_emitter_admission`.
+- Witnesses I700–I706 (memory, sqlite, postgres).
+
+### Adoption — what Edge and Server must handle (#753)
+
+- **New refusal reason token** `registered_family_held_shut` on the existing
+  `federation_dimension_rejected` kind (`Error::DimensionRejected`), for a
+  dimension under `key_grant:` or `membership:widening:` /
+  `membership:removal:` / `membership:resignation:`. Terminal for this release.
+- **`ledger:*` rows** now refuse `federation_signer_not_acting_for`
+  (`Error::SignerDoesNotActFor`, plane `"ledger"`, retryable) when the signer
+  does not act for the attested owner, and `federation_dimension_rejected` /
+  `ledger_l1_binding_violation` on a binding mismatch, where they were refused
+  `federation_namespace_family_unregistered` before.
+- **`settlement:*` rows** refuse `federation_payment_processor_identifier`
+  (`Error::PaymentProcessorIdentifier`) on a processor identifier.
+- **Matcher answers that change:** `key_grant:{axis}:v1`,
+  `membership:{widening|removal|resignation}:v1`, the ledger and settlement
+  leaves, `community:listing:v1`, `group:roster:v1`, `key:record:v1`,
+  `key:revocation:v1`, `identity:occurrence:v1` and
+  `accord:lifecycle:confirmed:v1` now resolve; any other `community:*` leaf
+  refuses `namespace_family_unregistered`; `holds_bytes:sha256:*` no longer
+  resolves to a family. `authority_for` gives the ledger rows and
+  `settlement:*` the `SubstrateSelf` class (CC's row data).
+- No new error variant, no new exhaustive enum variant, no FFI or `.pyi`
+  surface change, no migration.
+
 ## [54.1.0] - 2026-10-10
 
 ### Added — the generic steward purge door (#1046, CIRISConstitution#165, CSD-108)
