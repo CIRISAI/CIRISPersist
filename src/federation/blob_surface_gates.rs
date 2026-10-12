@@ -1232,4 +1232,114 @@ mod tests {
         }
         out
     }
+
+    /// Drop `//` comments (line and trailing, doc comments included) so a
+    /// gate reads code, not prose about the code. Crude: a `//` inside a
+    /// string literal would cut the line too; none of the scanned spans has
+    /// one.
+    fn strip_line_comments(text: &str) -> String {
+        text.lines()
+            .map(|l| l.find("//").map_or(l, |i| &l[..i]))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The text of the item that starts at `start` in `text`, up to its body's
+    /// opening brace (the signature), comments stripped.
+    fn signature_at(text: &str, start: &str) -> String {
+        let at = text
+            .find(start)
+            .unwrap_or_else(|| panic!("`{start}` is in the file"));
+        let rest = &text[at..];
+        let end = rest.find('{').expect("a body follows the signature");
+        strip_line_comments(&rest[..end])
+    }
+
+    /// **I767** (v55.0.0, CC rc7 part 5) — **an unrecorded live call never
+    /// reaches persist's DEK door.** The CC sentence is pinned in the vendored
+    /// rc7 paragraph (byte-for-byte from `constitution/part_5_transport_substrate.md`
+    /// line 44 at `VENDORED_CC_COMMIT`, checked by its SHA-256), and the door
+    /// has no `keep`: not in the orchestration, the Engine, the PyO3 binding
+    /// or its signature attribute, the stub, the record, or V193.
+    #[test]
+    fn i767_register_stream_epoch_dek_has_no_keep() {
+        use sha2::Digest as _;
+        let cc = src("src/federation/namespace/cc_rc7_part_5_one_dek_two_distributors.md");
+        assert_eq!(
+            hex::encode(sha2::Sha256::digest(cc.as_bytes())),
+            "a1075162cc481ff25c8c27b03dd4f54f408899920bbc27629fb0e76a156ad9f9",
+            "I767: the vendored CC rc7 paragraph changed; re-vendor it from the tag"
+        );
+        assert!(
+            cc.contains(
+                "An unrecorded live call wraps nothing: its DEK exists only inside the live \
+                 group, so an ordinary call keeps the forward secrecy MLS gives it and leaves \
+                 no durable wrap that could later open it."
+            ),
+            "I767: the CC sentence the door conforms to"
+        );
+        let has_keep = |t: &str| {
+            t.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                .any(|w| w == "keep")
+        };
+        for (file, start) in [
+            (
+                "src/federation/chunk_dag_cascade.rs",
+                "pub async fn register_stream_epoch_dek<",
+            ),
+            ("src/engine.rs", "pub async fn register_stream_epoch_dek("),
+            (
+                "src/ffi/pyo3.rs",
+                "#[pyo3(signature = (cohort_scope, group_key_id, stream_id, epoch, dek_b64",
+            ),
+            (
+                "src/federation/chunk_dag_cascade.rs",
+                "pub struct RegisteredStreamEpoch",
+            ),
+        ] {
+            let text = production_only(&src(file));
+            let sig = if start.starts_with("pub struct") {
+                let at = text.find(start).expect("the struct");
+                let body = &text[at..];
+                strip_line_comments(&body[..body.find("\n}").expect("struct end")])
+            } else {
+                signature_at(&text, start)
+            };
+            assert!(!has_keep(&sig), "I767: {file} `{start}` names keep:\n{sig}");
+        }
+        let blobs = production_only(&src("src/federation/blobs.rs"));
+        let at = blobs
+            .find("pub struct StreamDekRecord")
+            .expect("StreamDekRecord");
+        let rec = strip_line_comments(&blobs[at..at + blobs[at..].find("\n}").unwrap()]);
+        assert!(!has_keep(&rec), "I767: StreamDekRecord has no keep field");
+        let stub = src("python/ciris_persist/ciris_persist.pyi");
+        let line = stub
+            .lines()
+            .find(|l| l.contains("def register_stream_epoch_dek("))
+            .expect("the stub");
+        assert!(!has_keep(line), "I767: the stub names keep: {line}");
+        for m in [
+            "migrations/sqlite/lens/V193__stream_epoch_dek_supplied_and_rooms.sql",
+            "migrations/postgres/lens/V193__stream_epoch_dek_supplied_and_rooms.sql",
+        ] {
+            let ddl: String = src(m)
+                .lines()
+                .map(|l| l.find("--").map_or(l, |i| &l[..i]))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(!has_keep(&ddl), "I767: {m} adds a keep column");
+        }
+    }
+
+    /// **I768** (v55.0.0) — an epoch terminator's storage seq is public and
+    /// pinned: adopters seal and open terminators with it, never a hand copy.
+    #[test]
+    fn i768_the_terminator_seq_is_pinned() {
+        use crate::federation::chunk_dag_cascade::{terminator_seq, TERMINATOR_SEQ_BASE};
+        assert_eq!(TERMINATOR_SEQ_BASE, 4_611_686_018_427_387_904);
+        assert_eq!(terminator_seq(0).unwrap(), 1 << 62);
+        assert_eq!(terminator_seq(7).unwrap(), (1 << 62) + 7);
+        assert!(terminator_seq(u64::MAX - (1 << 62)).is_err());
+    }
 }
