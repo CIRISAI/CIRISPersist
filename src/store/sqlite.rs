@@ -3623,19 +3623,24 @@ impl SqliteBackend {
 
     /// v55.0.0 (CIRISPersist#989) — TEST SEAM: reproduce a row of a type no
     /// door admits today (a retired `holds_bytes` carrier a node still holds):
-    /// rewrite the typed `attestation_type` column. Nothing else moves.
+    /// rewrite the typed `attestation_type` column and, when given, the stored
+    /// envelope (the rc6 shape). Nothing else moves.
     #[cfg(any(test, feature = "test-anchor"))]
     pub async fn test_seam_set_attestation_type(
         &self,
         attestation_id: &str,
         attestation_type: &str,
+        envelope: Option<&serde_json::Value>,
     ) -> Result<(), crate::federation::Error> {
         let id = attestation_id.to_owned();
         let ty = attestation_type.to_owned();
+        let env = envelope.map(serde_json::Value::to_string);
         self.write(move |conn| {
             conn.execute(
-                "UPDATE federation_attestations SET attestation_type = ?2 WHERE attestation_id = ?1",
-                rusqlite::params![id, ty],
+                "UPDATE federation_attestations SET attestation_type = ?2, \
+                 attestation_envelope = COALESCE(?3, attestation_envelope) \
+                 WHERE attestation_id = ?1",
+                rusqlite::params![id, ty, env],
             )
         })
         .await

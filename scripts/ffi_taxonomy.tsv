@@ -649,6 +649,7 @@ Engine	supersede_canonical	deontic
 Engine	sweep_ack_timeouts	procedural	
 Engine	sweep_all_communities	procedural	
 Engine	sweep_community_epochs	procedural	
+Engine	reack_holding_claims_once	procedural	
 Engine	sweep_consent_decay_once	procedural	
 Engine	sweep_evictions_once	procedural	
 Engine	sweep_expired_claims	procedural	

@@ -449,6 +449,12 @@ pub const RC6_RETIRED_CARRIERS_ADMITTED_UNTIL_989: &[(&str, &str, &str, &str)] =
     "key_grant:{axis}:{version}",
 )];
 
+/// The retired rc6 holding-claim carrier's type stem (`holds_bytes:`), named
+/// once: [`RETIRED_CARRIER_STEMS`] refuses it, and the re-ack
+/// (`holding_claim::reack_own_claims`) reads this node's OWN held rows of it
+/// once, to claim those bytes as `custody:ack:v1` after an upgrade.
+pub const RETIRED_HOLDING_CLAIM_STEM: &str = "holds_bytes:";
+
 /// v55.0.0 (CIRISPersist#989, CC 2.4 rc7, CIRISConstitution#141) — **the
 /// carrier families rc7 retired whose rows persist refuses at EVERY door and
 /// leaves out of EVERY serve read, whatever the row-type enforcement mode**:
@@ -460,7 +466,7 @@ pub const RC6_RETIRED_CARRIERS_ADMITTED_UNTIL_989: &[(&str, &str, &str, &str)] =
 /// `holds_bytes` became the `custody:ack:v1` holding claim (CC 3.1.3.3); the
 /// key-grant set joins this list in v55 slice B, when its emitter moves.
 pub const RETIRED_CARRIER_STEMS: &[(&str, &str)] = &[(
-    "holds_bytes:",
+    RETIRED_HOLDING_CLAIM_STEM,
     "CC 2.4 rc7 / CIRISConstitution#141: the holding claim is custody:ack:v1 at the content's \
      scope",
 )];

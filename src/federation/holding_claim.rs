@@ -611,6 +611,158 @@ where
     })
 }
 
+// ── the re-ack (CC 3.1.3.3 rule 5) ───────────────────────────────────
+
+/// **How old this node's own claim may grow before the re-ack renews it**:
+/// a day. The claim lives [`CUSTODY_LIVE_SECS`] (72 h) from its signed
+/// instant and "devices re-acknowledge about daily" (CC 3.1.3.3), so a node
+/// that misses two sweeps is still advertised.
+pub const HOLDING_CLAIM_REACK_AFTER_SECS: i64 = 24 * 60 * 60;
+
+/// How often the background re-ack sweeper ([`Engine::spawn_reack_sweeper`])
+/// wakes. Each wake renews only the claims older than
+/// [`HOLDING_CLAIM_REACK_AFTER_SECS`], so the cadence bounds how late a renewal
+/// can be, not how often one is signed.
+///
+/// [`Engine::spawn_reack_sweeper`]: crate::Engine::spawn_reack_sweeper
+pub const HOLDING_CLAIM_REACK_SWEEP_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(60 * 60);
+
+/// What one [`reack_own_claims`] pass did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+pub struct ReackReport {
+    /// Blobs whose latest claim by this node is `here` (any age).
+    pub scanned: u64,
+    /// Claims renewed: a fresh `here` signed at `now`.
+    pub renewed: u64,
+    /// Claims younger than [`HOLDING_CLAIM_REACK_AFTER_SECS`], left alone.
+    pub fresh: u64,
+    /// Claims about bytes this node no longer holds: never renewed (a claim
+    /// is a holding fact, CC 3.1.3.3 rule 3; the lapse retires it).
+    pub not_held: u64,
+    /// Content whose cohort no longer seats this node: not renewed.
+    pub not_in_cohort: u64,
+    /// Renewals that failed (logged); the next pass retries them.
+    pub failed: u64,
+    /// Blobs this node held under a retired rc6 claim of its OWN and had no
+    /// custody claim about: claimed now, once (the upgrade conversion).
+    pub converted: u64,
+}
+
+/// **Re-acknowledge this node's own holdings** (CC 3.1.3.3 rule 5: "freshness
+/// is the row's"): every blob whose latest claim by this node is `here`, whose
+/// bytes this node still holds, and whose claim is at least
+/// [`HOLDING_CLAIM_REACK_AFTER_SECS`] old gets a fresh claim through
+/// [`emit_holding_claim`] — the same door, the same content-derived scope.
+/// Without it every claim lapses 72 h after it was signed and the holder
+/// directory goes dark.
+///
+/// After an upgrade it also claims, once, each blob this node still holds and
+/// had announced under the retired rc6 carrier with its OWN row, and has made
+/// no custody report about ([`ReackReport::converted`]); a peer's retired row
+/// stays inert (CC 2.4).
+///
+/// Idempotent: a renewed claim is fresh, so a second pass at the same `now`
+/// renews nothing. It never claims a blob this node did not already claim
+/// (a `LocalOnly` copy stays unannounced) and never renews a claim about bytes
+/// that are gone. A failure on one blob is counted and the pass goes on.
+///
+/// # Errors
+///
+/// Directory errors on the scan.
+pub async fn reack_own_claims<B>(
+    backend: &B,
+    local: &crate::signing::LocalSigner,
+    now: DateTime<Utc>,
+) -> Result<ReackReport, BlobError>
+where
+    B: BlobStorage + FederationDirectory + Sync,
+{
+    let me = local.derived_key_id();
+    let mut report = ReackReport::default();
+    let shas = held_by(backend, &me, now, false)
+        .await
+        .map_err(|e| BlobError::Backend(format!("reack: {e}")))?;
+    for sha in shas {
+        report.scanned += 1;
+        if !backend.has_blob(&sha).await? {
+            report.not_held += 1;
+            continue;
+        }
+        let latest = super::custody_ack::custody_acks_of(backend, &me, &hex::encode(sha))
+            .await
+            .map_err(|e| BlobError::Backend(format!("reack: {e}")))?
+            .into_iter()
+            .filter(|a| a.state == CustodyState::Here)
+            .map(|a| a.instant)
+            .max();
+        if latest.is_some_and(|t| (now - t).num_seconds() < HOLDING_CLAIM_REACK_AFTER_SECS) {
+            report.fresh += 1;
+            continue;
+        }
+        match emit_holding_claim(backend, local, &sha, now).await {
+            Ok(HoldingClaimOutcome::Emitted { .. }) => report.renewed += 1,
+            Ok(HoldingClaimOutcome::NotInCohort { .. }) => report.not_in_cohort += 1,
+            Err(e) => {
+                report.failed += 1;
+                tracing::warn!(
+                    error = %e,
+                    sha256_prefix = &hex::encode(sha)[..16],
+                    "holding-claim re-ack failed; the next pass retries"
+                );
+            }
+        }
+    }
+    // The upgrade conversion: a blob this node still holds and announced
+    // under the retired rc6 carrier (its OWN row; a peer's is inert, CC 2.4)
+    // and has made no custody report about — not even `none` — is claimed
+    // now, at the content's scope. Once: the claim it emits is a custody
+    // report, so a later pass finds it above and only renews it.
+    let mut legacy: Vec<[u8; 32]> = backend
+        .list_attestations_by(&me)
+        .await
+        .map_err(|e| BlobError::Backend(format!("reack: {e}")))?
+        .iter()
+        .filter(|r| {
+            r.attestation_type
+                .starts_with(super::namespace::registry::RETIRED_HOLDING_CLAIM_STEM)
+        })
+        .filter_map(|r| {
+            r.attestation_envelope
+                .get("evidence_refs")
+                .and_then(|v| v.get(0))
+                .and_then(serde_json::Value::as_str)
+                .and_then(|h| hex::decode(h).ok())
+                .and_then(|b| <[u8; 32]>::try_from(b).ok())
+        })
+        .collect();
+    legacy.sort_unstable();
+    legacy.dedup();
+    for sha in legacy {
+        if !backend.has_blob(&sha).await?
+            || !super::custody_ack::custody_acks_of(backend, &me, &hex::encode(sha))
+                .await
+                .map_err(|e| BlobError::Backend(format!("reack: {e}")))?
+                .is_empty()
+        {
+            continue;
+        }
+        match emit_holding_claim(backend, local, &sha, now).await {
+            Ok(HoldingClaimOutcome::Emitted { .. }) => report.converted += 1,
+            Ok(HoldingClaimOutcome::NotInCohort { .. }) => report.not_in_cohort += 1,
+            Err(e) => {
+                report.failed += 1;
+                tracing::warn!(
+                    error = %e,
+                    sha256_prefix = &hex::encode(sha)[..16],
+                    "retired-claim conversion failed; the next pass retries"
+                );
+            }
+        }
+    }
+    Ok(report)
+}
+
 // ── the holder directory ─────────────────────────────────────────────
 
 /// One holder's latest admitted claim about one blob, folded.

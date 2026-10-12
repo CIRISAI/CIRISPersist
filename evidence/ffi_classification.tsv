@@ -22,7 +22,7 @@
 # CC asked for this file because 53 testimonial rows living only in a gated TSV
 # is itself a testimonial-class state: the class should not exemplify its own wrong.
 #
-# Counts at this revision: empirical=203 deontic=181 testimonial=42 structural=40 procedural=39 epistemic=37 ontological=34 axiotic=19 nomological=17 pragmatic=6 axiomatic=3
+# Counts at this revision: empirical=203 deontic=181 testimonial=42 procedural=40 structural=40 epistemic=37 ontological=34 axiotic=19 nomological=17 pragmatic=6 axiomatic=3
 #
 class	binding	class_count	owner	symbol	frame
 axiomatic	binding	3	MODULE	namespace_manifest_version	
@@ -525,45 +525,46 @@ pragmatic	descriptive	6	Engine	locale_leaf_hash_hex
 pragmatic	descriptive	6	Engine	locale_merkle_root_hex	
 pragmatic	descriptive	6	Engine	secrets_encrypt	
 pragmatic	descriptive	6	Engine	wholeness_witness_root_hex	
-procedural	descriptive	39	Engine	backfill_trace_attestations	
-procedural	descriptive	39	Engine	backfill_v020_trust_rows	
-procedural	descriptive	39	Engine	cancel_outbound	
-procedural	descriptive	39	Engine	claim_pending_outbound	
-procedural	descriptive	39	Engine	enqueue_outbound	
-procedural	descriptive	39	Engine	evict_aggregated_tier	
-procedural	descriptive	39	Engine	evict_fountain_content_to_tier	
-procedural	descriptive	39	Engine	hold_breadth	
-procedural	descriptive	39	Engine	lock_get	
-procedural	descriptive	39	Engine	lock_release	
-procedural	descriptive	39	Engine	lock_try_acquire	
-procedural	descriptive	39	Engine	maintain	
-procedural	descriptive	39	Engine	maintenance_vacuum	
-procedural	descriptive	39	Engine	mark_ack_received	
-procedural	descriptive	39	Engine	mark_replay_resolved	
-procedural	descriptive	39	Engine	mark_transport_delivered	
-procedural	descriptive	39	Engine	mark_transport_failed	
-procedural	descriptive	39	Engine	match_ack_to_outbound	
-procedural	descriptive	39	Engine	promote_consented_backlog	
-procedural	descriptive	39	Engine	replay_abandoned	
-procedural	descriptive	39	Engine	run_consent_expiry_sweep_json	
-procedural	descriptive	39	Engine	run_deletion_window_watch_json	
-procedural	descriptive	39	Engine	run_legacy_graph_migration	
-procedural	descriptive	39	Engine	run_pqc_sweep	
-procedural	descriptive	39	Engine	scheduled_task_list_due	
-procedural	descriptive	39	Engine	scheduled_task_update_after_trigger	
-procedural	descriptive	39	Engine	scheduled_task_upsert	
-procedural	descriptive	39	Engine	sweep_ack_timeouts	
-procedural	descriptive	39	Engine	sweep_all_communities	
-procedural	descriptive	39	Engine	sweep_community_epochs	
-procedural	descriptive	39	Engine	sweep_consent_decay_once	
-procedural	descriptive	39	Engine	sweep_evictions_once	
-procedural	descriptive	39	Engine	sweep_expired_claims	
-procedural	descriptive	39	Engine	task_try_claim_shared	
-procedural	descriptive	39	Engine	telemetry_consolidate_period	
-procedural	descriptive	39	Engine	tsdb_consolidate_audit	
-procedural	descriptive	39	Engine	tsdb_consolidate_conversations	
-procedural	descriptive	39	Engine	tsdb_consolidate_tasks	
-procedural	descriptive	39	Engine	tsdb_consolidate_traces	
+procedural	descriptive	40	Engine	backfill_trace_attestations	
+procedural	descriptive	40	Engine	backfill_v020_trust_rows	
+procedural	descriptive	40	Engine	cancel_outbound	
+procedural	descriptive	40	Engine	claim_pending_outbound	
+procedural	descriptive	40	Engine	enqueue_outbound	
+procedural	descriptive	40	Engine	evict_aggregated_tier	
+procedural	descriptive	40	Engine	evict_fountain_content_to_tier	
+procedural	descriptive	40	Engine	hold_breadth	
+procedural	descriptive	40	Engine	lock_get	
+procedural	descriptive	40	Engine	lock_release	
+procedural	descriptive	40	Engine	lock_try_acquire	
+procedural	descriptive	40	Engine	maintain	
+procedural	descriptive	40	Engine	maintenance_vacuum	
+procedural	descriptive	40	Engine	mark_ack_received	
+procedural	descriptive	40	Engine	mark_replay_resolved	
+procedural	descriptive	40	Engine	mark_transport_delivered	
+procedural	descriptive	40	Engine	mark_transport_failed	
+procedural	descriptive	40	Engine	match_ack_to_outbound	
+procedural	descriptive	40	Engine	promote_consented_backlog	
+procedural	descriptive	40	Engine	reack_holding_claims_once	
+procedural	descriptive	40	Engine	replay_abandoned	
+procedural	descriptive	40	Engine	run_consent_expiry_sweep_json	
+procedural	descriptive	40	Engine	run_deletion_window_watch_json	
+procedural	descriptive	40	Engine	run_legacy_graph_migration	
+procedural	descriptive	40	Engine	run_pqc_sweep	
+procedural	descriptive	40	Engine	scheduled_task_list_due	
+procedural	descriptive	40	Engine	scheduled_task_update_after_trigger	
+procedural	descriptive	40	Engine	scheduled_task_upsert	
+procedural	descriptive	40	Engine	sweep_ack_timeouts	
+procedural	descriptive	40	Engine	sweep_all_communities	
+procedural	descriptive	40	Engine	sweep_community_epochs	
+procedural	descriptive	40	Engine	sweep_consent_decay_once	
+procedural	descriptive	40	Engine	sweep_evictions_once	
+procedural	descriptive	40	Engine	sweep_expired_claims	
+procedural	descriptive	40	Engine	task_try_claim_shared	
+procedural	descriptive	40	Engine	telemetry_consolidate_period	
+procedural	descriptive	40	Engine	tsdb_consolidate_audit	
+procedural	descriptive	40	Engine	tsdb_consolidate_conversations	
+procedural	descriptive	40	Engine	tsdb_consolidate_tasks	
+procedural	descriptive	40	Engine	tsdb_consolidate_traces	
 structural	binding	40	Engine	__init__	
 structural	binding	40	Engine	blob_storage_capsule	
 structural	binding	40	Engine	close	
