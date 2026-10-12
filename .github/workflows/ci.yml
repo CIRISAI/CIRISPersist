@@ -25,6 +25,9 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # v54.1.1 — Python's stdio is UTF-8 on every runner (Windows defaults to
+  # cp1252; a non-ASCII print failed the v54.1.0 tag's windows wheel job).
+  PYTHONUTF8: "1"
   RUSTFLAGS: -D warnings
   # CIRISPersist#297 — network resilience for recurring crates.io registry
   # flakes during `cargo metadata` (start of nextest/clippy + install-action),
@@ -669,6 +672,8 @@ jobs:
       # deleted DEPENDENCY fingerprints instead and the next restore recompiled
       # their dependents. Trimmed, target/ fits and nothing is pruned.
       - name: drop this crate's own build outputs before the CIRISCache save (#1022)
+        # A cache optimisation never fails the build it follows (v54.1.1).
+        continue-on-error: true
         if: (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) && matrix.substrate.name == 'core-1'
         shell: bash
         run: for py in python3 python; do "$py" -c 'import sys' 2>/dev/null && exec "$py" scripts/ci_cache_trim.py target; done; echo '::warning::no python for the cache trim'
@@ -881,6 +886,8 @@ jobs:
       # retag, #458). continue-on-error: a flaky/queued Intel runner is non-fatal.
       # v54.1.0 (#1022) — this crate's own outputs go first; see the core-1 save.
       - name: drop this crate's own build outputs before the CIRISCache save (#1022)
+        # A cache optimisation never fails the build it follows (v54.1.1).
+        continue-on-error: true
         if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
         shell: bash
         run: for py in python3 python; do "$py" -c 'import sys' 2>/dev/null && exec "$py" scripts/ci_cache_trim.py target; done; echo '::warning::no python for the cache trim'
@@ -1077,6 +1084,8 @@ jobs:
       # files instead of rebuilding persist's deps from the verify baseline.
       # v54.1.0 (#1022) — this crate's own outputs go first; see the core-1 save.
       - name: drop this crate's own build outputs before the CIRISCache save (#1022)
+        # A cache optimisation never fails the build it follows (v54.1.1).
+        continue-on-error: true
         if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
         shell: bash
         run: for py in python3 python; do "$py" -c 'import sys' 2>/dev/null && exec "$py" scripts/ci_cache_trim.py target; done; echo '::warning::no python for the cache trim'
@@ -1347,6 +1356,8 @@ jobs:
       # files instead of rebuilding persist's deps from the verify baseline.
       # v54.1.0 (#1022) — this crate's own outputs go first; see the core-1 save.
       - name: drop this crate's own build outputs before the CIRISCache save (#1022)
+        # A cache optimisation never fails the build it follows (v54.1.1).
+        continue-on-error: true
         if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
         shell: bash
         run: for py in python3 python; do "$py" -c 'import sys' 2>/dev/null && exec "$py" scripts/ci_cache_trim.py target; done; echo '::warning::no python for the cache trim'
@@ -2152,6 +2163,8 @@ jobs:
       # the wheel target/ is large and a second full push serialized ~9 min.
       # v54.1.0 (#1022) — this crate's own outputs go first; see the core-1 save.
       - name: drop this crate's own build outputs before the CIRISCache save (#1022)
+        # A cache optimisation never fails the build it follows (v54.1.1).
+        continue-on-error: true
         if: (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) && (matrix.label == 'linux-aarch64' || matrix.label == 'windows-x86_64')
         shell: bash
         run: for py in python3 python; do "$py" -c 'import sys' 2>/dev/null && exec "$py" scripts/ci_cache_trim.py target; done; echo '::warning::no python for the cache trim'
