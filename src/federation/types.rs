@@ -1248,6 +1248,14 @@ pub mod delegation_scope {
              (Error::MembershipListingRefused.rule = \"envelope_listed_scope_invalid\"), not a \
              delegates_to scope value; `scope` in its name is the cohort scope a listing named",
         ),
+        (
+            "holding_claim::HOLDING_CLAIM_SCOPE_UNRESOLVED",
+            "v55.0.0 (CIRISPersist#989) — a REFUSAL TOKEN (a holding claim whose content names              no cohort to be placed at), not a delegates_to scope value; `scope` in its name is              the claim's cohort scope",
+        ),
+        (
+            "holding_claim::CUSTODY_ACK_SCOPE_MISMATCH",
+            "v55.0.0 (CIRISPersist#989) — a REFUSAL TOKEN (a holding claim placed at another              cohort scope than its content's, CC 3.1.3.3 rule 1), not a delegates_to scope value",
+        ),
     ];
 
     /// CC 3.4.7.3 — the legacy **unprefixed** agency kinds (the pre-split

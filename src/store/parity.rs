@@ -338,7 +338,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // and an unknown tier is signature-exempt.
     ("check_attestation_tier_vocabulary", Class::Gate),
     ("check_purge_admission", Class::Gate),
-    ("check_put_blob_admission", Class::Gate),
     ("check_reseal_admission", Class::Gate),
     ("check_reseal_seal_admission", Class::Gate),
     ("check_reserved_prefix_admission", Class::Gate),
@@ -408,7 +407,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // construction (one fn in `renditions.rs`).
     ("decode_sha256_hex", Class::Gate),
     ("dedicated_connect", Class::Delegates),
-    ("delete_blob", Class::Delegates),
     ("deserialize_signature", Class::Plumbing),
     ("deserialize_witness_signatures", Class::Plumbing),
     ("entry_as_stored", Class::Plumbing),
@@ -437,7 +435,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("insert_trace_events_batch", Class::Delegates),
     ("insert_trace_llm_calls_batch", Class::Delegates),
     ("iter", Class::Plumbing),
-    ("list_attestations_by", Class::Delegates),
     ("list_org_memberships_for", Class::Delegates),
     ("list_partner_records_for", Class::Delegates),
     ("load_or_init_content_master", Class::Delegates),
@@ -507,7 +504,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // its gates are the put-gate's and identical on both backends because
     // there is one helper. Propagated (I18) rather than swallowed, so it now
     // appears in the scanned sequence.
-    ("emit_withdraws_attestation_helper", Class::Plumbing),
     // v43.0.0 third pass (I27) — the per-community advisory lock is LOCKING,
     // the enum's own definition of Plumbing: it can fail only on the driver's
     // terms and decides nothing about the row. sqlite's boundary is the
@@ -951,16 +947,12 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // v55.0.0 (CIRISPersist#989) — the ONE `evict_actor` both blob backends
     // call (`holding_claim.rs`); its retractions go through the shared
     // withdraws helper.
-    ("evict_actor_of", Class::Delegates),
     // v55.0.0 (CIRISPersist#989) — postgres: the holding claim's INSERT inside
     // the caller's transaction (serve position + row). Storage; the claim was
     // admitted by `prepare_holding_claim_row` + the audience gate before.
     ("insert_holding_claim_tx", Class::Plumbing),
     // v55.0.0 (CIRISPersist#989) — the shared holder-directory reads: folds
     // over the held rows, refusing nothing.
-    ("list_held_by_of", Class::Plumbing),
-    ("list_holders_of", Class::Plumbing),
-    ("list_local_holders_of", Class::Plumbing),
     // v55.0.0 (CIRISPersist#989) — Gate: `put_holding_claim`'s pre-check —
     // scope is the stored content's, size is the stored length, the row
     // rebuilds and admits, the holder is in the cohort.

@@ -2811,11 +2811,26 @@ pub trait BlobStorage: Send + Sync {
             // records the AUTHOR, which for a proxy write is the peer —
             // losing it made proxy content look locally authored and slipped
             // the stop-tier proxy-serve refusal.
-            let scope = crate::federation::holding_claim::ClaimScope::of_content(
-                floor.tier(),
-                cohort_scope,
-                group_key_id,
-            )?;
+            //
+            // v55.0.0 (CIRISPersist#989) — a sealed floor with no group named
+            // is the announce of a row already stored: its claim scope is the
+            // stored row's ([`content_claim_scope`]), never guessed; no row is
+            // `NotHeld`.
+            //
+            // [`content_claim_scope`]: crate::federation::holding_claim::content_claim_scope
+            let scope = match (floor.tier(), group_key_id) {
+                (crate::federation::types::cohort_scope::CryptoTier::Plaintext, _)
+                | (_, Some(_)) => crate::federation::holding_claim::ClaimScope::of_content(
+                    floor.tier(),
+                    cohort_scope,
+                    group_key_id,
+                )?,
+                (_, None) => crate::federation::holding_claim::content_claim_scope(self, sha256)
+                    .await?
+                    .ok_or_else(|| BlobError::NotHeld {
+                        sha256_hex: hex::encode(sha256),
+                    })?,
+            };
             let att = crate::federation::holding_claim::sign_holding_claim(
                 local,
                 sha256,

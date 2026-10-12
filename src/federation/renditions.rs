@@ -266,6 +266,9 @@ pub(crate) mod witnesses {
             &scope,
         )
         .unwrap();
+        // The pure row leaves the scrub to its signer (`sign_holding_claim`);
+        // here the holder seals it.
+        r.scrub_key_id = holder.to_owned();
         ts::reseal(&mut r);
         r
     }

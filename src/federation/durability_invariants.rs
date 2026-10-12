@@ -537,15 +537,23 @@ pub(crate) mod engine_bodies {
                 .is_err_and(|e| e.to_string().contains("custody_ack_here_dag_incomplete")),
             "I415b the manifest alone is not a copy: {r:?}"
         );
+        // v55.0.0 (CIRISPersist#989) — the seal claimed the DAG while it was
+        // whole; a chunk lost since then is reported by the node's own `none`
+        // (CC 3.1.3.3 rule 4: the signer retracts), which is always
+        // reportable, and from then on the partial holder is missing.
+        let d = p.a.durability_deficit(&root, &p.key_a, None).await.unwrap();
+        assert!(
+            d.live_here.contains(&p.key_a),
+            "I415b the seal claimed the whole DAG: {d:?}"
+        );
+        p.a.put_custody_ack(&root, CustodyState::None, None, None, None)
+            .await
+            .expect("I415b `none` is always reportable");
         let d = p.a.durability_deficit(&root, &p.key_a, None).await.unwrap();
         assert!(
             !d.live_here.contains(&p.key_a) && d.missing.contains(&p.key_a),
             "I415b the partial holder is listed missing: {d:?}"
         );
-        // it can still say it holds nothing whole
-        p.a.put_custody_ack(&root, CustodyState::None, None, None, None)
-            .await
-            .expect("I415b `none` is always reportable");
         // node B adopts the manifest AS RECEIVED (inline, not promoted: no
         // chunk held). Nothing on the row says DAG; the opened plaintext does.
         p.a.emit_pending_key_grants().await.unwrap();
