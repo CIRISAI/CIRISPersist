@@ -101,7 +101,7 @@ async fn rows_state(
 /// The composer that retires `row` under §6.1 precedence, with every
 /// `withdraws`/`recants` entitlement RE-DERIVED against `row` as this node
 /// holds it now — or `None` if the row is live.
-async fn retiring_composer(
+pub(crate) async fn retiring_composer(
     directory: &dyn FederationDirectory,
     row: &Attestation,
 ) -> Result<Option<String>, Error> {

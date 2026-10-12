@@ -370,6 +370,15 @@ pub async fn verify_takedown_authority(
 /// `community` scope, names its community. `None` when no binding row is
 /// held — whose content it is cannot be told here. Never read from a notice.
 ///
+/// Codex r2 on #1065 — only LIVE bindings confer authority: a row expired at
+/// the read instant, or retired by a `withdraws` / `recants` (the bytes-plane
+/// fold, `blob_tombstone::retiring_composer`, with every entitlement
+/// re-derived now), names no subject and no community. A former subject or a
+/// former room's moderator never authorizes through a retired row. Each live
+/// row's subjects are its `subject_key_ids` AND its non-empty
+/// `attested_key_id` (the purge subject helper's reading), and its room is
+/// the `community_id` of a `community` or `affiliations` row.
+///
 /// # Errors
 ///
 /// Directory reads.
@@ -387,9 +396,23 @@ pub async fn content_binding(
         return Ok(None);
     }
     let mut out = ContentBinding::default();
+    let now = chrono::Utc::now();
     for row in rows {
+        if row.expires_at.is_some_and(|e| e <= now)
+            || super::blob_tombstone::retiring_composer(directory, &row)
+                .await?
+                .is_some()
+        {
+            continue;
+        }
         out.subjects.extend(row.subject_key_ids.iter().cloned());
-        if row.cohort_scope == super::types::cohort_scope::COMMUNITY {
+        if !row.attested_key_id.is_empty() {
+            out.subjects.insert(row.attested_key_id.clone());
+        }
+        if matches!(
+            row.cohort_scope.as_str(),
+            super::types::cohort_scope::COMMUNITY | super::types::cohort_scope::AFFILIATIONS
+        ) {
             if let Some(c) = row
                 .attestation_envelope
                 .get("community_id")

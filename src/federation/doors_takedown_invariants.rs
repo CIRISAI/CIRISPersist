@@ -75,6 +75,13 @@
 //!   records ONE `hard_case:fast_path_takedown` for its notice (CC 4.5.3
 //!   step 4), naming the basis, the content and the origin, and a re-run
 //!   records no second; a counter-notice takedown records none.
+//! - **I772** (memory, sqlite, postgres; Codex r2 on #1065) — only LIVE
+//!   bindings confer takedown authority, read as the purge plane reads a
+//!   row's subjects: a binding withdrawn by its attester, or expired, names
+//!   no subject (its former subject is `takedown_unauthorised` while the live
+//!   binding's subject is admitted); a binding's non-empty `attested_key_id`
+//!   is a subject; an `affiliations` binding's `community_id` is a bound
+//!   community, so that room's moderator is admitted.
 //! - **I793** — the settle is the basis's: a steward purge after W = 72 h,
 //!   an immediate-removal takedown at once, a counter-notice takedown after
 //!   its window, the age gate and an unknown basis never earlier than W.
@@ -174,7 +181,17 @@ pub(crate) mod bodies {
     /// A community whose only member is `member` (a person, so a
     /// steward-bound authority root: a named moderator).
     async fn community_of(dir: &dyn FederationDirectory, comm: &str, member: &str) {
-        for k in [comm, member] {
+        group_of(dir, comm, &[member], None).await
+    }
+
+    /// [`community_of`] with a `policy_blob` (an `affiliations` group).
+    async fn group_of(
+        dir: &dyn FederationDirectory,
+        comm: &str,
+        members: &[&str],
+        policy_blob: Option<serde_json::Value>,
+    ) {
+        for k in std::iter::once(&comm).chain(members) {
             if dir.lookup_public_key(k).await.unwrap().is_none() {
                 ts::register_hybrid_key_as(
                     dir,
@@ -192,15 +209,18 @@ pub(crate) mod bodies {
                 charter_digest: String::new(),
                 community_key_id: comm.to_owned(),
                 community_name: comm.to_owned(),
-                members: vec![crate::federation::types::CommunityMember {
-                    key_id: member.to_owned(),
-                    joined_at: chrono::Utc::now(),
-                    role: None,
-                }],
+                members: members
+                    .iter()
+                    .map(|m| crate::federation::types::CommunityMember {
+                        key_id: (*m).to_owned(),
+                        joined_at: chrono::Utc::now(),
+                        role: None,
+                    })
+                    .collect(),
                 founded_at: chrono::Utc::now(),
                 consensus_protocol: crate::federation::types::consensus_protocol::MAJORITY
                     .to_owned(),
-                policy_blob: None,
+                policy_blob,
                 persist_row_hash: String::new(),
             },
         ))
@@ -323,6 +343,215 @@ pub(crate) mod bodies {
             .await
             .expect("the establishing row");
         id
+    }
+
+    /// A content-binding `scores` row over `sha_hex` by `producer`, attested
+    /// to `attested`, with `subjects`, at `scope` naming `community`.
+    #[allow(clippy::too_many_arguments)]
+    async fn bind_row(
+        dir: &dyn FederationDirectory,
+        producer: &str,
+        attested: &str,
+        subjects: &[&str],
+        sha_hex: &str,
+        scope: &str,
+        community: Option<&str>,
+        expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<String, crate::federation::Error> {
+        for k in [producer, attested].iter().chain(subjects) {
+            if dir.lookup_public_key(k).await.unwrap().is_none() {
+                ts::register_hybrid_key(dir, k).await;
+            }
+        }
+        let now = chrono::Utc::now();
+        let id = uuid::Uuid::new_v4().to_string();
+        let mut env = serde_json::json!({
+            "dimension": "content:established:v1",
+            "evidence_refs": [sha_hex],
+        });
+        if let Some(c) = community {
+            env["community_id"] = serde_json::json!(c);
+        }
+        let row = Attestation {
+            attestation_id: id.clone(),
+            attesting_key_id: producer.into(),
+            attested_key_id: attested.into(),
+            attestation_type: attestation_type::SCORES.into(),
+            weight: None,
+            asserted_at: now,
+            expires_at,
+            attestation_envelope: env,
+            original_content_hash: String::new(),
+            scrub_signature_classical: String::new(),
+            scrub_signature_pqc: None,
+            scrub_key_id: producer.into(),
+            scrub_timestamp: now,
+            pqc_completed_at: Some(now),
+            persist_row_hash: String::new(),
+            subject_key_ids: subjects.iter().map(|s| (*s).to_owned()).collect(),
+            withdraws_admission_rule: None,
+            cohort_scope: scope.to_string(),
+            tier: crate::federation::types::attestation_tier::FEDERATION.to_string(),
+            promoted_at: None,
+            additional_scrubs: Vec::new(),
+        };
+        dir.put_attestation(SignedAttestation {
+            attestation: ts::seal_row(producer, row),
+        })
+        .await
+        .map(|_| id)
+    }
+
+    // ── I772 ──────────────────────────────────────────────────────────────
+    pub(crate) async fn i772_only_live_bindings_confer_takedown_authority<D>(d: &D)
+    where
+        D: FederationDirectory + Sync,
+    {
+        use crate::federation::types::cohort_scope as cs;
+        let dir = d.as_dyn_directory();
+        let producer = "i772-producer";
+        let auth = |signer: String, sha: String| async move {
+            td::takedown_authority(dir, &signer, &sha, "dmca_512").await
+        };
+        let unauthorised = |r: Result<(), crate::federation::Error>| matches!(&r, Err(e) if e.kind() == token::UNAUTHORISED);
+
+        // (1) Retired vs live: two bindings of one digest; the first is
+        // withdrawn by its attester.
+        let (old, new) = (claimant(0x91), claimant(0x92));
+        let sha = sha_of("i772-retired");
+        let r_old = bind_row(
+            dir,
+            producer,
+            producer,
+            &[&old.id],
+            &sha,
+            cs::FEDERATION,
+            None,
+            None,
+        )
+        .await
+        .expect("I772: the first binding");
+        bind_row(
+            dir,
+            producer,
+            producer,
+            &[&new.id],
+            &sha,
+            cs::FEDERATION,
+            None,
+            None,
+        )
+        .await
+        .expect("I772: the live binding");
+        assert!(
+            auth(old.id.clone(), sha.clone()).await.is_ok(),
+            "I772 precondition"
+        );
+        let env = serde_json::json!({
+            "references_attestation_id": r_old,
+            "withdrawal_reason": "I772",
+        });
+        let mut w =
+            ts::bare_attestation(&uuid::Uuid::new_v4().to_string(), producer, producer, &env);
+        w.attestation_type = attestation_type::WITHDRAWS.into();
+        w.cohort_scope = "federation".into();
+        ts::seal_row_in_place(producer, &mut w);
+        dir.put_attestation(SignedAttestation { attestation: w })
+            .await
+            .expect("I772: the attester withdraws its binding");
+        assert!(
+            unauthorised(auth(old.id.clone(), sha.clone()).await),
+            "I772 (1): the withdrawn binding's former subject is refused"
+        );
+        assert!(
+            auth(new.id.clone(), sha.clone()).await.is_ok(),
+            "I772 (1): the live binding's subject is admitted"
+        );
+
+        // (2) An expired binding names no subject.
+        let gone = claimant(0x93);
+        let sha2 = sha_of("i772-expired");
+        bind_row(
+            dir,
+            producer,
+            producer,
+            &[&new.id],
+            &sha2,
+            cs::FEDERATION,
+            None,
+            None,
+        )
+        .await
+        .expect("I772: a live binding");
+        let past = chrono::Utc::now() + chrono::Duration::milliseconds(300);
+        bind_row(
+            dir,
+            producer,
+            producer,
+            &[&gone.id],
+            &sha2,
+            cs::FEDERATION,
+            None,
+            Some(past),
+        )
+        .await
+        .expect("I772: a binding that expires");
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        assert!(
+            unauthorised(auth(gone.id.clone(), sha2.clone()).await),
+            "I772 (2): an expired binding's subject is refused"
+        );
+
+        // (3) The attested key is a subject.
+        let attested = claimant(0x94);
+        let sha3 = sha_of("i772-attested");
+        bind_row(
+            dir,
+            producer,
+            &attested.id,
+            &[],
+            &sha3,
+            cs::FEDERATION,
+            None,
+            None,
+        )
+        .await
+        .expect("I772: a binding attested to its subject");
+        assert!(
+            auth(attested.id.clone(), sha3.clone()).await.is_ok(),
+            "I772 (3): the attested key is a signed subject"
+        );
+
+        // (4) An affiliations binding's room is a bound community.
+        let (moderator, writer) = (claimant(0x95), claimant(0x96));
+        let room = "i772-room";
+        group_of(
+            dir,
+            room,
+            &[&moderator.id, &writer.id],
+            Some(crate::federation::affiliation_invariants::bodies::affiliation_blob(None)),
+        )
+        .await;
+        let sha4 = sha_of("i772-affiliations");
+        // Written by another member, attested to itself: the moderator is
+        // neither a subject nor the attested key, so only the room makes it a
+        // duty-holder.
+        bind_row(
+            dir,
+            &writer.id,
+            &writer.id,
+            &[],
+            &sha4,
+            cs::AFFILIATIONS,
+            Some(room),
+            None,
+        )
+        .await
+        .expect("I772: an affiliations binding");
+        assert!(
+            auth(moderator.id.clone(), sha4.clone()).await.is_ok(),
+            "I772 (4): the affiliations room's moderator is admitted"
+        );
     }
 
     fn sha_of(seed: &str) -> String {
@@ -1257,6 +1486,11 @@ mod run {
                 async fn i796() {
                     let Some(d) = $fresh.await else { return };
                     b::i796_the_contents_own_community_judges(&d).await
+                }
+                #[tokio::test]
+                async fn i772() {
+                    let Some(d) = $fresh.await else { return };
+                    b::i772_only_live_bindings_confer_takedown_authority(&d).await
                 }
                 #[tokio::test]
                 async fn i792() {
