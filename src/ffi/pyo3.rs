@@ -605,6 +605,11 @@ struct EngineCell {
     /// installed config's budget is finite. `None` otherwise.
     /// `close()` calls `.stop()` on the handle.
     sweeper: std::sync::Mutex<Option<crate::federation::EvictionSweeper>>,
+    /// v55.0.0 (CIRISPersist#989, CC 3.1.3.3 rule 5) — the holding-claim
+    /// re-ack loop (`Engine::spawn_reack_sweeper`): spawned at construction
+    /// whenever the engine can sign a claim, so a holder stays advertised
+    /// past the claim's 72 h. `close()` stops it, like `sweeper`.
+    reack_sweeper: std::sync::Mutex<Option<crate::federation::EvictionSweeper>>,
     /// v3.6.0 (CIRISPersist#134) — shared media-sharing config slot.
     /// `Arc<RwLock<...>>` so every PyEngine handle's
     /// `set_multimedia_config_json` mutates the same cell-level state.
@@ -950,6 +955,15 @@ impl PyEngine {
                 // Stop signals + returns the JoinHandle; explicit
                 // drop satisfies clippy::let_underscore_future.
                 std::mem::drop(sweeper.stop());
+            }
+            // v55.0.0 (#989) — and the re-ack loop.
+            if let Some(reack) = cell
+                .reack_sweeper
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .take()
+            {
+                std::mem::drop(reack.stop());
             }
             // v6.8.0 (#149) — stop the disk-pressure poll loop too.
             if let Some(dp) = cell
@@ -2608,6 +2622,7 @@ impl PyEngine {
             // when budget transitions from infinite to finite.
             replication_config: std::sync::RwLock::new(Arc::new(initial_replication_config)),
             sweeper: std::sync::Mutex::new(None),
+            reack_sweeper: std::sync::Mutex::new(None),
             #[cfg(feature = "cirisnode")]
             multimedia_config: Arc::new(std::sync::RwLock::new(None)),
             disk_pressure: std::sync::Mutex::new(None),
@@ -2647,6 +2662,21 @@ impl PyEngine {
                 if let Some(sweeper) = engine.spawn_sweeper() {
                     *cell.sweeper.lock().unwrap_or_else(|p| p.into_inner()) = Some(sweeper);
                 }
+            }
+        }
+
+        // v55.0.0 (CIRISPersist#989, CC 3.1.3.3 rule 5) — the holding-claim
+        // re-ack loop: always on when this engine can sign a claim (no budget
+        // gate — a claim lapses after 72 h whatever the disk says).
+        {
+            let engine = crate::Engine::from_shared_with_local(
+                cell.engine_backend_dispatch(),
+                cell.signer.clone(),
+                cell.local_signer.clone(),
+            );
+            let _enter = cell.runtime.enter();
+            if let Some(reack) = engine.spawn_reack_sweeper() {
+                *cell.reack_sweeper.lock().unwrap_or_else(|p| p.into_inner()) = Some(reack);
             }
         }
 
@@ -4047,6 +4077,37 @@ impl PyEngine {
                 .block_on(async move { engine.sweep_evictions_once().await })
                 .map(|report| report.rows_evicted as i64)
                 .map_err(blob_err_to_py)
+        })
+    }
+
+    /// v55.0.0 (CIRISPersist#989, CC 3.1.3.3 rule 5) — drive one holding-claim
+    /// **re-ack** pass synchronously: renew this node's own claims that are a
+    /// day old, for bytes it still holds. The background loop spawned at
+    /// construction runs the same pass hourly; sovereign hosts may drive it
+    /// on their own schedule. Returns the report as JSON
+    /// (`scanned`, `renewed`, `fresh`, `not_held`, `not_in_cohort`,
+    /// `failed`). Idempotent.
+    fn reack_holding_claims_once(&self, py: Python<'_>) -> PyResult<String> {
+        self.ensure_usable()?;
+        let runtime = self.runtime.clone();
+        let slot = engine_slot();
+        let cell = slot
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("engine cell missing"))?;
+        let engine = crate::Engine::from_shared_with_local(
+            cell.engine_backend_dispatch(),
+            cell.signer.clone(),
+            cell.local_signer.clone(),
+        );
+        drop(slot);
+        py.detach(move || {
+            runtime
+                .block_on(async move { engine.reack_holding_claims_once(chrono::Utc::now()).await })
+                .map_err(blob_err_to_py)
+                .and_then(|r| {
+                    serde_json::to_string(&r)
+                        .map_err(|e| PyRuntimeError::new_err(format!("reack report: {e}")))
+                })
         })
     }
 
@@ -35105,9 +35166,16 @@ fn blob_err_to_py(e: crate::federation::BlobError) -> PyErr {
         crate::federation::BlobError::AttestationEmissionFailed(ref detail) => {
             PyValueError::new_err(format!("{kind}: {detail}"))
         }
+        // v55.0.0 (CIRISPersist#989, operator ruling 2026-10-12) — an
+        // invalid-argument refusal keeps its `kind` prefix and carries its
+        // detail, whose leading `<token>:` (`custody_ack_scope_mismatch`,
+        // `holding_claim_scope_unresolved`, `custody_ack_outside_cohort`, …)
+        // is what a host keys on — the convention of the arm above.
+        crate::federation::BlobError::InvalidArgument(ref detail) => {
+            PyValueError::new_err(format!("{kind}: {detail}"))
+        }
         crate::federation::BlobError::HashMismatch { .. }
-        | crate::federation::BlobError::InlineSizeExceeded { .. }
-        | crate::federation::BlobError::InvalidArgument(_) => PyValueError::new_err(kind),
+        | crate::federation::BlobError::InlineSizeExceeded { .. } => PyValueError::new_err(kind),
         // v3.4.0 (CIRISPersist#123) — trust gate rejection.
         crate::federation::BlobError::TrustBelowThreshold { .. } => PyValueError::new_err(kind),
         // v3.6.0 (CIRISPersist#134) — perceptual-hash matcher hit.
@@ -36620,6 +36688,35 @@ async fn build_audit_chain_proof(
 mod tests {
     use super::*;
 
+    /// v55.0.0 (CIRISPersist#989, operator ruling 2026-10-12) — **a blob
+    /// invalid-argument refusal shows Python its token.** The error is the
+    /// real gate's (`ClaimScope::of_content` for community content naming no
+    /// room); through v54 the Python text was the bare `blob_invalid_argument`
+    /// kind and a host could not tell which refusal it was. The kind stays the
+    /// prefix (`startswith` callers still match) and the type stays ValueError.
+    #[test]
+    fn blob_invalid_argument_carries_its_token_to_python() {
+        use crate::federation::holding_claim::{ClaimScope, HOLDING_CLAIM_SCOPE_UNRESOLVED};
+        use crate::federation::types::cohort_scope::{CryptoTier, COMMUNITY};
+        let e = ClaimScope::of_content(CryptoTier::CommunityDek, COMMUNITY, None).unwrap_err();
+        assert!(matches!(
+            e,
+            crate::federation::BlobError::InvalidArgument(_)
+        ));
+        Python::initialize();
+        let py_err = blob_err_to_py(e);
+        Python::attach(|py| {
+            assert!(py_err.is_instance_of::<PyValueError>(py));
+            let text = py_err.value(py).to_string();
+            assert!(
+                text.starts_with(&format!(
+                    "blob_invalid_argument: {HOLDING_CLAIM_SCOPE_UNRESOLVED}:"
+                )),
+                "the kind prefix, then the token a host keys on: {text}"
+            );
+        });
+    }
+
     /// A `full_traces` envelope with one ASCII trace — the shape the #690 door
     /// judges. Built through `from_json` so it is a real parsed envelope, not a
     /// struct literal that could drift from what the wire actually produces.
@@ -37231,6 +37328,7 @@ mod tests {
                 crate::federation::ReplicationConfig::default(),
             )),
             sweeper: std::sync::Mutex::new(None),
+            reack_sweeper: std::sync::Mutex::new(None),
             #[cfg(feature = "cirisnode")]
             multimedia_config: Arc::new(std::sync::RwLock::new(None)),
             disk_pressure: std::sync::Mutex::new(None),
@@ -37386,6 +37484,7 @@ mod tests {
                 crate::federation::ReplicationConfig::default(),
             )),
             sweeper: std::sync::Mutex::new(None),
+            reack_sweeper: std::sync::Mutex::new(None),
             #[cfg(feature = "cirisnode")]
             multimedia_config: Arc::new(std::sync::RwLock::new(None)),
             disk_pressure: std::sync::Mutex::new(None),
@@ -37474,6 +37573,7 @@ mod tests {
                 crate::federation::ReplicationConfig::default(),
             )),
             sweeper: std::sync::Mutex::new(None),
+            reack_sweeper: std::sync::Mutex::new(None),
             #[cfg(feature = "cirisnode")]
             multimedia_config: Arc::new(std::sync::RwLock::new(None)),
             disk_pressure: std::sync::Mutex::new(None),

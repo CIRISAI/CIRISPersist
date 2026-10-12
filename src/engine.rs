@@ -2168,6 +2168,79 @@ impl Engine {
         Some(crate::federation::EvictionSweeper::new(handle, shutdown))
     }
 
+    /// v55.0.0 (CIRISPersist#989, CC 3.1.3.3 rule 5) — **one re-ack pass**:
+    /// renew this node's own holding claims that are a day old, for bytes it
+    /// still holds ([`reack_own_claims`](crate::federation::holding_claim::reack_own_claims)).
+    /// Idempotent; `now` is threaded for deterministic tests (the background
+    /// loop and the FFI pass wall-clock time).
+    ///
+    /// # Errors
+    ///
+    /// No announcing signer on this Engine; directory errors on the scan.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn reack_holding_claims_once(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<crate::federation::holding_claim::ReackReport, crate::federation::BlobError> {
+        let local = self.announcing_signer().await?;
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(arc) => {
+                crate::federation::holding_claim::reack_own_claims(arc.as_ref(), local, now).await
+            }
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(arc) => {
+                crate::federation::holding_claim::reack_own_claims(arc.as_ref(), local, now).await
+            }
+        }
+    }
+
+    /// v55.0.0 (CIRISPersist#989, CC 3.1.3.3 rule 5) — **spawn the background
+    /// re-ack sweeper**, the eviction sweeper's shape: a loop that wakes every
+    /// [`HOLDING_CLAIM_REACK_SWEEP_INTERVAL`](crate::federation::holding_claim::HOLDING_CLAIM_REACK_SWEEP_INTERVAL)
+    /// and runs [`Engine::reack_holding_claims_once`], until the returned
+    /// handle's `stop()`. Every holding claim lapses 72 h after it was signed;
+    /// this keeps a holder advertised while it holds.
+    ///
+    /// Returns `None` when this Engine has no PQC local signer (it cannot sign
+    /// a claim, so it has none to renew). Disk-independent: no budget gate.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub fn spawn_reack_sweeper(&self) -> Option<crate::federation::EvictionSweeper> {
+        self.local_signer.as_ref()?;
+        let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
+        let shutdown_for_loop = shutdown.clone();
+        let interval = crate::federation::holding_claim::HOLDING_CLAIM_REACK_SWEEP_INTERVAL;
+        let engine = self.clone();
+        let handle = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = shutdown_for_loop.notified() => {
+                        tracing::info!("ciris-persist v55.0.0 re-ack sweeper: shutdown signal received");
+                        return;
+                    }
+                    _ = tokio::time::sleep(interval) => {}
+                }
+                match engine.reack_holding_claims_once(chrono::Utc::now()).await {
+                    Ok(report) if report.renewed > 0 || report.failed > 0 => {
+                        tracing::info!(
+                            scanned = report.scanned,
+                            renewed = report.renewed,
+                            not_held = report.not_held,
+                            not_in_cohort = report.not_in_cohort,
+                            failed = report.failed,
+                            "ciris-persist v55.0.0 re-ack sweeper cycle"
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::warn!(error = %e, "ciris-persist v55.0.0 re-ack sweeper cycle failed");
+                    }
+                }
+            }
+        });
+        Some(crate::federation::EvictionSweeper::new(handle, shutdown))
+    }
+
     /// v3.4.0 (CIRISPersist#123) — backend-dispatched candidate fetch.
     /// Per-backend ranking strategy:
     /// - PG ranks by full decay-weighted score in SQL.

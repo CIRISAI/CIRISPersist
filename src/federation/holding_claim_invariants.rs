@@ -63,6 +63,12 @@
 //! - **I723** — two nodes, the advertisement plane: a Commons write is
 //!   claimed at `federation`; a node sharing no cohort with the writer, and
 //!   holding no copy, discovers the writer as a live, sized holder.
+//! - **I724** — a listing ahead of its room's record is refused retryably
+//!   (`scope_membership_unresolved`) and admitted when re-offered after it.
+//! - **I725** — the re-ack: a day-old claim on held bytes is renewed by one
+//!   pass, a claim on evicted bytes is not, and a second pass renews nothing.
+//! - **I726** — the upgrade conversion: this node's OWN retired rc6 claim on
+//!   bytes it holds is claimed once as custody:ack:v1; a peer's is inert.
 //! - **I721** — from disk: no production source builds a `holds_bytes` row
 //!   type; the stem is named only by the retired list
 //!   (`registry::RETIRED_CARRIER_STEMS`).
@@ -526,6 +532,61 @@ pub(crate) mod dyn_bodies {
             .map(|e| e.attestation_id)
     }
 
+    /// **I724** — a listing whose room record is not held yet waits for it:
+    /// the signer's authority lives in the record, so the row is refused
+    /// RETRYABLY (`scope_membership_unresolved`), and the SAME row, re-offered
+    /// after the record lands, is admitted.
+    pub(crate) async fn i724_a_listing_waits_for_its_room(d: &dyn FederationDirectory, tag: &str) {
+        let (founder, _) = key(d, "i724f", tag).await;
+        let id = format!("i724-pub-{tag}");
+        let env = serde_json::json!({
+            "dimension": LISTING_DIMENSION, "score": 1.0, "confidence": 1.0,
+            "community_key_id": id, "cohort_subkind": COHORT_SUBKIND_PUBLIC,
+            "admission": ADMISSION_OPEN, "moderator": "m", "name": "n", "description": "d",
+            "id": format!("i724-listing-{tag}"),
+        });
+        let mut row =
+            ts::bare_attestation(&format!("i724-listing-{tag}"), &founder, &founder, &env);
+        row.attestation_type = crate::federation::types::attestation_type::SCORES.into();
+        row.cohort_scope = cs::FEDERATION.into();
+        ts::seal_row_in_place(&founder, &mut row);
+        let e = d
+            .put_attestation(SignedAttestation {
+                attestation: row.clone(),
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                e,
+                Error::WriteScopeRefused(crate::scope::ScopeRefusalReason::MembershipUnresolved)
+            ),
+            "I724 a listing ahead of its room is the retryable ordering gap: {e}"
+        );
+        assert!(
+            d.get_attestation(&row.attestation_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "I724 nothing stored"
+        );
+        put_room(d, room(&id, &founder, None, open_policy()))
+            .await
+            .unwrap();
+        d.put_attestation(SignedAttestation {
+            attestation: row.clone(),
+        })
+        .await
+        .expect("I724 the same listing, re-offered after the record, is admitted");
+        assert_eq!(
+            live_listing(d, &id)
+                .await
+                .unwrap()
+                .map(|r| r.attestation_id),
+            Some(row.attestation_id)
+        );
+    }
+
     /// **I714** — the listing door and the one live listing.
     pub(crate) async fn i714_the_listing_door(d: &dyn FederationDirectory, tag: &str) {
         let (founder, founder_alias) = key(d, "i714f", tag).await;
@@ -621,6 +682,7 @@ pub(crate) mod blob_bodies {
             &'a self,
             id: &'a str,
             ty: &'a str,
+            envelope: Option<&'a serde_json::Value>,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>>;
     }
     #[cfg(feature = "sqlite")]
@@ -629,8 +691,13 @@ pub(crate) mod blob_bodies {
             &'a self,
             id: &'a str,
             ty: &'a str,
+            envelope: Option<&'a serde_json::Value>,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
-            Box::pin(async move { self.test_seam_set_attestation_type(id, ty).await.unwrap() })
+            Box::pin(async move {
+                self.test_seam_set_attestation_type(id, ty, envelope)
+                    .await
+                    .unwrap()
+            })
         }
     }
     #[cfg(feature = "postgres")]
@@ -639,8 +706,13 @@ pub(crate) mod blob_bodies {
             &'a self,
             id: &'a str,
             ty: &'a str,
+            envelope: Option<&'a serde_json::Value>,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
-            Box::pin(async move { self.test_seam_set_attestation_type(id, ty).await.unwrap() })
+            Box::pin(async move {
+                self.test_seam_set_attestation_type(id, ty, envelope)
+                    .await
+                    .unwrap()
+            })
         }
     }
 
@@ -846,6 +918,147 @@ pub(crate) mod blob_bodies {
         );
     }
 
+    /// **I725** — the re-ack (CC 3.1.3.3 rule 5). Two claims signed 70 h ago,
+    /// one about bytes since evicted: one pass renews the held one (live again
+    /// for 72 h from now) and not the evicted one, which lapses; a second pass
+    /// renews nothing (idempotent); a claim younger than a day is left alone.
+    pub(crate) async fn i725_the_reack_renews_what_is_held<B>(b: &B, s: &str)
+    where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        use crate::federation::holding_claim::{live_holders, reack_own_claims};
+        let n = node_as(b, &format!("i725-holder-{s}"), NODE).await;
+        let now = chrono::Utc::now();
+        let then = now - chrono::Duration::hours(70);
+        let mut shas = Vec::new();
+        for i in 0..2 {
+            let bytes = format!("i725 bytes {i} {s}").into_bytes();
+            let sha = sha256_of(&bytes);
+            b.put_blob_signing_scoped(
+                cs::FEDERATION,
+                None,
+                &sha,
+                BlobBody::Inline(bytes),
+                None,
+                &n.key,
+                &n.signer,
+                then,
+                uuid::Uuid::new_v4(),
+            )
+            .await
+            .expect("I725 a claim signed 70 h ago");
+            shas.push(sha);
+        }
+        let (kept, evicted) = (shas[0], shas[1]);
+        assert!(b.delete_blob(&evicted).await.unwrap(), "I725 bytes evicted");
+        let later = now + chrono::Duration::hours(10);
+        for sha in [&kept, &evicted] {
+            assert!(
+                live_holders(b, sha, later).await.unwrap().is_empty(),
+                "I725 precondition: unrenewed, the claim lapses at 72 h"
+            );
+        }
+        let r = reack_own_claims(b, &n.signer, now).await.unwrap();
+        assert_eq!(
+            (r.scanned, r.renewed, r.not_held, r.failed),
+            (2, 1, 1, 0),
+            "I725 one pass: {r:?}"
+        );
+        assert_eq!(
+            live_holders(b, &kept, later).await.unwrap(),
+            vec![n.key.clone()],
+            "I725 the held blob's claim is renewed past its old lapse"
+        );
+        assert!(
+            live_holders(b, &evicted, later).await.unwrap().is_empty(),
+            "I725 a claim about evicted bytes is never renewed"
+        );
+        let again = reack_own_claims(b, &n.signer, now).await.unwrap();
+        assert_eq!(
+            (again.renewed, again.fresh),
+            (0, 1),
+            "I725 idempotent: the renewed claim is fresh: {again:?}"
+        );
+        assert_eq!(
+            claims_of(b, &n.key, &kept).await.len(),
+            2,
+            "I725 one renewal, not one per pass"
+        );
+    }
+
+    /// **I726** — the upgrade conversion. A blob this node holds whose only
+    /// claim is its OWN retired rc6 row (the real rc6 envelope: `kind` and the
+    /// full digest in `evidence_refs`) is claimed once by the re-ack, at the
+    /// content's scope; a PEER's retired row about a blob this node holds
+    /// converts nothing (CC 2.4: inert); a second pass converts nothing.
+    pub(crate) async fn i726_the_reack_converts_its_own_retired_claims<B>(b: &B, s: &str)
+    where
+        B: BlobStorage + FederationDirectory + Sync + LegacySeam,
+    {
+        use crate::federation::holding_claim::reack_own_claims;
+        let n = node_as(b, &format!("i726-holder-{s}"), NODE).await;
+        let peer = node_as(b, &format!("i726-peer-{s}"), NODE).await;
+        let mut shas = Vec::new();
+        for (who, i) in [(&n, 0), (&peer, 1)] {
+            let bytes = format!("i726 bytes {i} {s}").into_bytes();
+            let sha = sha256_of(&bytes);
+            b.put_blob_signing_scoped(
+                cs::FEDERATION,
+                None,
+                &sha,
+                BlobBody::Inline(bytes),
+                None,
+                &who.key,
+                &who.signer,
+                chrono::Utc::now(),
+                uuid::Uuid::new_v4(),
+            )
+            .await
+            .unwrap();
+            // What a v54 node left: the same claim, as the rc6 carrier.
+            let claim = claims_of(b, &who.key, &sha).await.remove(0);
+            let rc6 = serde_json::json!({
+                "kind": "holds_bytes", "evidence_refs": [hex::encode(sha)],
+            });
+            b.set_type(
+                &claim.attestation_id,
+                &format!("holds_bytes:sha256:{}", &hex::encode(sha)[..8]),
+                Some(&rc6),
+            )
+            .await;
+            assert!(claims_of(b, &who.key, &sha).await.is_empty());
+            shas.push(sha);
+        }
+        let (own, peers) = (shas[0], shas[1]);
+        assert!(
+            b.list_holders(&own).await.unwrap().is_empty(),
+            "I726 dark after upgrade"
+        );
+        let now = chrono::Utc::now();
+        let r = reack_own_claims(b, &n.signer, now).await.unwrap();
+        assert_eq!(
+            (r.converted, r.failed),
+            (1, 0),
+            "I726 one conversion: {r:?}"
+        );
+        let c = claims_of(b, &n.key, &own).await;
+        assert_eq!(c.len(), 1);
+        assert_eq!(
+            c[0].cohort_scope,
+            cs::FEDERATION,
+            "I726 at the content's scope"
+        );
+        assert_eq!(b.list_holders(&own).await.unwrap(), vec![n.key.clone()]);
+        assert!(
+            claims_of(b, &n.key, &peers).await.is_empty()
+                && b.list_holders(&peers).await.unwrap().is_empty(),
+            "I726 a peer's retired row converts nothing"
+        );
+        let again = reack_own_claims(b, &n.signer, now).await.unwrap();
+        assert_eq!(again.converted, 0, "I726 once: {again:?}");
+        assert_eq!(claims_of(b, &n.key, &own).await.len(), 1);
+    }
+
     /// **I717** — the content's scope, at admission and at the announce door.
     pub(crate) async fn i717_the_claim_scope_is_the_contents<B>(b: &B, s: &str)
     where
@@ -954,7 +1167,7 @@ pub(crate) mod blob_bodies {
         .unwrap();
         let claim = claims_of(b, &n.key, &sha).await.remove(0);
         let legacy_type = format!("holds_bytes:sha256:{}", &hex::encode(sha)[..8]);
-        b.set_type(&claim.attestation_id, &legacy_type).await;
+        b.set_type(&claim.attestation_id, &legacy_type, None).await;
         assert!(
             b.get_attestation(&claim.attestation_id)
                 .await
@@ -1230,6 +1443,7 @@ mod runners {
                 case!(i712_open_admission_only_on_a_public_room);
                 case!(i713_open_admission_rides_a_standing_proposal);
                 case!(i714_the_listing_door);
+                case!(i724_a_listing_waits_for_its_room);
             }
         };
     }
@@ -1279,6 +1493,8 @@ mod runners {
                 one!(i718_a_held_retired_row_is_inert);
                 one!(i719_eviction_retracts_only_its_own_claims);
                 one!(i720_a_public_room_is_commons_tier);
+                one!(i725_the_reack_renews_what_is_held);
+                one!(i726_the_reack_converts_its_own_retired_claims);
                 #[tokio::test]
                 async fn i723_a_commons_claim_is_discovered_across_cohorts() {
                     let Some(a) = $fresh.await else { return };

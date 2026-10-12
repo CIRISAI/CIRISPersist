@@ -209,13 +209,16 @@ pub fn listing_community(row: &Attestation) -> Option<&str> {
 /// member that is not the record's ([`LISTING_MALFORMED`]), and a signer that
 /// is neither a founder on the room's effective roster nor a current named
 /// `moderate`-holder ([`LISTING_SIGNER_NOT_AUTHORIZED`]). Where it does not
-/// hold the record — a canonical "holds the listing row and nothing else"
-/// (CC 3.2) — the signer's standing is judged where the roster lives, as a
-/// membership proposal's is (`membership_acceptance::check_attestation_write_scope`).
+/// hold the record YET, the signer's authority cannot be asked, so the row is
+/// refused RETRYABLY — [`Error::WriteScopeRefused`] with
+/// `ScopeRefusalReason::MembershipUnresolved` (`scope_membership_unresolved`)
+/// — and admitted when re-offered after the record lands (operator ruling
+/// 2026-10-12: a gate asks about the signer).
 ///
 /// # Errors
 ///
-/// The refusal tokens above, as [`Error::InvalidArgument`]; directory errors.
+/// The refusal tokens above, as [`Error::InvalidArgument`]; the retryable
+/// ordering gap; directory errors.
 pub async fn check_community_listing_admission(
     directory: &dyn FederationDirectory,
     row: &Attestation,
@@ -245,8 +248,20 @@ pub async fn check_community_listing_admission(
              `moderate`-holder from creation (CC 4.5.4)",
         ));
     }
+    // A gate asks about the SIGNER's authority, and the room record is where
+    // that authority lives: without it the signer cannot be checked, so the
+    // row waits for the record — refused RETRYABLY as the ordering gap it is
+    // (`scope_membership_unresolved`, the "roster not held here yet" shape,
+    // CIRISPersist#797), and admitted when re-offered after the record lands.
     let Some(room) = directory.lookup_community(community_key_id).await? else {
-        return Ok(());
+        tracing::warn!(
+            community_key_id = %community_key_id,
+            attestation_id = %row.attestation_id,
+            "ciris-persist: community:listing:v1 refused — room record not held yet; retryable"
+        );
+        return Err(Error::WriteScopeRefused(
+            crate::scope::ScopeRefusalReason::MembershipUnresolved,
+        ));
     };
     if !is_public_community(&room) {
         return Err(listing_refusal(

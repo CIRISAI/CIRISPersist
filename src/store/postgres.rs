@@ -5025,22 +5025,26 @@ impl PostgresBackend {
 
     /// v55.0.0 (CIRISPersist#989) — TEST SEAM: reproduce a row of a type no
     /// door admits today (a retired `holds_bytes` carrier a node still holds):
-    /// rewrite the typed `attestation_type` column. Nothing else moves.
+    /// rewrite the typed `attestation_type` column and, when given, the stored
+    /// envelope (the rc6 shape). Nothing else moves.
     #[cfg(any(test, feature = "test-anchor"))]
     pub async fn test_seam_set_attestation_type(
         &self,
         attestation_id: &str,
         attestation_type: &str,
+        envelope: Option<&serde_json::Value>,
     ) -> Result<(), crate::federation::Error> {
         let client = self
             .get_client()
             .await
             .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let env: Option<String> = envelope.map(serde_json::Value::to_string);
         client
             .execute(
-                "UPDATE cirislens.federation_attestations SET attestation_type = $2 \
+                "UPDATE cirislens.federation_attestations SET attestation_type = $2, \
+                 attestation_envelope = COALESCE($3::text, attestation_envelope) \
                  WHERE attestation_id::text = $1",
-                &[&attestation_id, &attestation_type],
+                &[&attestation_id, &attestation_type, &env],
             )
             .await
             .map(|_| ())

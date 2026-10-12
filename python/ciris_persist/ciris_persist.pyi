@@ -3833,6 +3833,9 @@ class Engine:
     def promote_consented_backlog(self) -> dict[str, Any]:
         """(derived) procedural — v21.2.0 (CIRISPersist#509 FLOOR) — run the promote-on-consent sweep ON DEMAND: the same idempotent Engine::promote_consented_backlog primitive the... [build-conditional: #[cfg(any(feature = "postgres", feature = "sqlite"))]]"""
 
+    def reack_holding_claims_once(self) -> str:
+        """(derived) procedural — v55.0.0 (CIRISPersist#989, CC 3.1.3.3 rule 5) — drive one holding-claim re-ack pass synchronously: renew this node's own claims that are a day old,..."""
+
     def replay_abandoned(self, queue_id: str) -> None:
         """(derived) procedural — v0.4.0 — Operator-driven replay. Resets attempt_count=0 and requeues an abandoned row."""
 

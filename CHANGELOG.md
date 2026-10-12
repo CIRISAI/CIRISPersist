@@ -178,9 +178,50 @@ threat-model citations because this crate's audit story is the point.
 - **`community:listing:v1` door** (`check_community_listing_admission`, all
   three backends and the promotion chokepoint): federation-scoped, names the
   room and its moderator, states the room's subkind and admission policy, by
-  a founder or a current `moderate`-holder; a room this node does not hold is
-  judged where the roster lives. `public_room::live_listing` is the "one live
-  row per community" read fold.
+  a founder or a current `moderate`-holder. A listing whose room record this
+  node does not hold YET is refused RETRYABLY — the signer's authority lives
+  in the record — as `federation_write_scope_refused` /
+  `scope_membership_unresolved` (the #797 "roster not held here yet" shape),
+  and the same row is admitted when re-offered after the record lands (I724).
+  `public_room::live_listing` is the "one live row per community" read fold.
+- Delivering a standing proposal to a non-member requester is not built
+  (#1063).
+
+#### Added — the re-ack (CC 3.1.3.3 rule 5)
+
+- **`holding_claim::reack_own_claims(backend, local, now)`** renews this
+  node's own holding claims once they are a day old
+  (`HOLDING_CLAIM_REACK_AFTER_SECS`), through `emit_holding_claim` (the same
+  content-derived scope), for bytes it still holds. A claim about bytes it no
+  longer holds is never renewed and lapses at 72 h; a blob it never claimed (a
+  `LocalOnly` copy) is never claimed by it. Idempotent: a second pass at the
+  same instant renews nothing. Returns `ReackReport { scanned, renewed,
+  fresh, not_held, not_in_cohort, failed }` (I725).
+- **`Engine::reack_holding_claims_once(now)`** and
+  **`Engine::spawn_reack_sweeper()`**, which has the eviction sweeper's task
+  shape (`EvictionSweeper` handle with `stop()`). It wakes hourly
+  (`HOLDING_CLAIM_REACK_SWEEP_INTERVAL`) and is `None` without a PQC local
+  signer. The Python engine spawns it at construction and stops it at
+  `close()`. Python: **`Engine.reack_holding_claims_once()`** returns the
+  report as JSON.
+
+#### Changed — Python sees the blob refusal's token
+
+- `BlobError::InvalidArgument` now reaches Python as `ValueError(
+  "blob_invalid_argument: <detail>")`, so the detail's leading `<token>:`
+  (`custody_ack_scope_mismatch`, `holding_claim_scope_unresolved`,
+  `custody_ack_outside_cohort`, …) is what a host keys on. The kind stays the
+  prefix, so `startswith("blob_invalid_argument")` still matches; through v54
+  the text was the bare kind.
+
+#### Deploy ordering — upgrade the fleet together
+
+- **v55 nodes do not read v54 `holds_bytes` claims** (a held one is inert,
+  CC 2.4), and v54 nodes do not read v55 `custody:ack:v1` claims as holders.
+  During a mixed fleet, discovery of bytes held ONLY by v54 peers waits until
+  those peers upgrade and re-announce. Upgrade the fleet together. A v55 node
+  claims the bytes it holds on its next write, adopt or announce, and the
+  re-ack keeps those claims live.
 
 #### #975 — the row-type slot
 
