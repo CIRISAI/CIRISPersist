@@ -375,6 +375,9 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     // `list_attestations_for_types` / `_by_types` share this body.
     ("sqlite_typed_read", ConnClass::Read),
     ("list_attestations_by_dimension_citing", ConnClass::Read),
+    // v55.0.0 (CIRISPersist#989) — V190's attester-free citation seek (the
+    // holder directory's candidates).
+    ("list_attestations_citing_by_dimension", ConnClass::Read),
     ("list_targeted_by_dimension_prefix", ConnClass::Read),
     ("list_attestations_for_migration", ConnClass::Read),
     ("list_attestations_since", ConnClass::Read),
@@ -403,7 +406,6 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     // SELECT on the reader path (the community half delegates to
     // `community_dek_blob_epoch`, itself Read).
     ("minter_of_blob", ConnClass::Read),
-    ("list_holders_sized", ConnClass::Read),
     ("list_consent_revocations", ConnClass::Read),
     ("list_stored_delivery_receipts_for", ConnClass::Read),
     ("list_expired_attestation_ids", ConnClass::Read),
@@ -414,9 +416,7 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("list_goals", ConnClass::Read),
     ("list_group_versions", ConnClass::Read),
     ("list_hard_case_events", ConnClass::Read),
-    ("list_held_by", ConnClass::Read),
     ("list_held_fountain_content", ConnClass::Read),
-    ("list_holders", ConnClass::Read),
     ("list_hybrid_pending_attestations", ConnClass::Read),
     ("list_hybrid_pending_keys", ConnClass::Read),
     ("list_hybrid_pending_revocations", ConnClass::Read),
@@ -428,7 +428,6 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("list_live_consent_grants_by", ConnClass::Read),
     ("list_live_consent_grants_for", ConnClass::Read),
     ("list_llm_calls", ConnClass::Read),
-    ("list_local_holders", ConnClass::Read),
     ("list_local_tier_attestations", ConnClass::Read),
     ("list_location_proofs_for", ConnClass::Read),
     ("list_org_memberships_for", ConnClass::Read),
@@ -628,10 +627,15 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("purge_mark_finalized", ConnClass::Write),
     ("test_seam_set_attestation_asserted_at", ConnClass::Write),
     ("test_seam_set_key_identity_type", ConnClass::Write),
+    ("test_seam_set_attestation_type", ConnClass::Write),
     ("test_seam_drop_purge_tombstone", ConnClass::Write),
     ("test_seam_factor_rollup_trace_counts", ConnClass::Read),
     ("put_blob_chunks", ConnClass::Write),
+    // v55.0.0 (CIRISPersist#952) — the incremental plaintext DAG finalize.
+    ("put_dag_manifest_over_held", ConnClass::Write),
     ("put_blob_with_scope", ConnClass::Write),
+    // v55.0.0 (CIRISPersist#989) — announce a holding claim for a held row.
+    ("put_holding_claim", ConnClass::Write),
     ("put_calibration_bundle", ConnClass::Write),
     // v50.0.0 (#931) — `put_community` / `apply_replicated_community` delegate here.
     ("put_community_at_door", ConnClass::Write),
@@ -727,6 +731,8 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("sqlite_project_rendition_row", ConnClass::HelperWrite),
     ("sqlite_update_peer_field", ConnClass::Write),
     ("sqlite_upsert_wire_index", ConnClass::HelperWrite),
+    // v55.0.0 (CIRISPersist#989) — the three claim doors' shared INSERT.
+    ("sqlite_insert_holding_claim", ConnClass::HelperWrite),
     ("sqlite_write_local_attestation", ConnClass::Write),
     ("store_blob_local", ConnClass::Write),
     ("stream_consistency_proof", ConnClass::Read),

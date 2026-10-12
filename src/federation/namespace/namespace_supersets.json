@@ -14110,7 +14110,7 @@
     "claim_id": "CLM-nsproc-holds-bytes-agent-files-kind-platform-or-target",
     "repo": "CIRISPersist",
     "crate": "ciris-persist@21.4.0",
-    "path#symbol": "src/federation/blobs.rs#holds_bytes_attestation_envelope",
+    "path#symbol": "src/federation/holding_claim.rs#holding_claim_row",
     "tsv_target": "evidence/cc_impl.tsv",
     "field": "holds_bytes",
     "prefix": "agent_files:{kind}:{platform_or_target}"
@@ -15780,6 +15780,46 @@
     "path#symbol": "src/federation/steward_purge.rs#refuse_if_tombstoned_attestation",
     "tsv_target": "evidence/cc_impl.tsv",
     "manifest_round": "cc-rc8-8c8f536-1052"
+   },
+   {
+    "decimal_id": "3.1.3.3",
+    "claim_id": "CLM-custody-receipt",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/holding_claim.rs#emit_holding_claim",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc7-536b8cb-989"
+   },
+   {
+    "decimal_id": "3.1.3.3",
+    "claim_id": "CLM-custody-receipt",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/holding_claim.rs#check_holding_claim_scope",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc7-536b8cb-989"
+   },
+   {
+    "decimal_id": "3.1.3.3",
+    "claim_id": "CLM-custody-receipt",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/custody_ack.rs#check_custody_withdraws_signer",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc7-536b8cb-989"
+   },
+   {
+    "decimal_id": "3.2",
+    "claim_id": "CLM-public-community",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/public_room.rs#check_public_room_conformance",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc7-536b8cb-1053"
+   },
+   {
+    "decimal_id": "3.2",
+    "claim_id": "CLM-public-community",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/public_room.rs#check_community_listing_admission",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc7-536b8cb-1053"
    },
    {
     "decimal_id": "3.1.9.4",

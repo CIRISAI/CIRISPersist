@@ -983,9 +983,10 @@ pub mod orchestrate {
     /// plaintext sizes for a sealed tier, v1 for `Plaintext` — seals it under
     /// the DAG's DEK, stores the row through the manifest floor (binding
     /// in-transaction for a community; self-retention + occurrence grants
-    /// for `self` / `family`), and announces `holds_bytes` for the manifest
-    /// under `signer`'s derived key at `Plaintext` and `CommunityDek`, as
-    /// `put_blob_scoped` does. `InvisibleEncrypted` announces nothing.
+    /// for `self` / `family`), and announces this node's holding claim for the
+    /// manifest at every tier, placed at the content's scope (v55.0.0,
+    /// CIRISPersist#989: `federation` at `Plaintext`, the cohort otherwise),
+    /// as `put_blob_scoped` does.
     ///
     /// `aad` is the #831 hook for the manifest's seal.
     ///
@@ -1097,7 +1098,7 @@ pub mod orchestrate {
                         stream_id,
                         ManifestRowSpec {
                             sha256: sha,
-                            body: jcs.clone(),
+                            body: jcs,
                             size_bytes: total_size,
                             expected_chunk_count: chunk_count,
                             children: Vec::new(),
@@ -1109,23 +1110,13 @@ pub mod orchestrate {
                         None,
                     )
                     .await?;
-                // Announce the manifest under the signer's derived key. The
-                // row already exists; the signing floor's insert is a no-op
-                // on conflict and the attestation is what this adds.
-                backend
-                    .put_blob_signing_at(
-                        cohort_scope,
-                        StorageFloor::resolved(CryptoTier::Plaintext),
-                        &sha,
-                        BlobBody::Inline(jcs),
-                        media_type,
-                        &signer_key_id,
-                        local,
-                        now,
-                        uuid::Uuid::new_v4(),
-                        community_key_id,
-                    )
-                    .await?;
+                // v55.0.0 (CIRISPersist#989, CC 3.1.3.3) — announce the stored
+                // manifest with this node's holding claim, at the content's
+                // scope (`federation` at this tier), sized as the row is.
+                crate::federation::at_rest_cascade::orchestrate::announce_stored(
+                    backend, local, &sha, now,
+                )
+                .await?;
                 Ok(SealStreamScopedResult {
                     manifest_sha256: sha,
                     tier,
@@ -1255,6 +1246,13 @@ pub mod orchestrate {
                         );
                     }
                 }
+                // v55.0.0 (CIRISPersist#989, CC 3.1.3.3) — the manifest is
+                // claimed at the content's own scope (`self` / the family),
+                // reaching only the cohort; the chunks are claimed by it.
+                crate::federation::at_rest_cascade::orchestrate::announce_stored(
+                    backend, local, &sha, now,
+                )
+                .await?;
                 let axis = |s: &[u8; 32]| crate::federation::key_grant::KeyGrantAxis::Content {
                     at_rest_sha256: hex::encode(s),
                     cohort_scope: cohort_scope.to_owned(),
@@ -1311,7 +1309,7 @@ pub mod orchestrate {
                             ManifestRowSpec {
                                 sha256: sha,
                                 size_bytes: body.len() as u64,
-                                body: body.clone(),
+                                body,
                                 expected_chunk_count: chunk_count,
                                 children: child_rows,
                                 group_key_id: Some(comm.to_owned()),
@@ -1328,24 +1326,14 @@ pub mod orchestrate {
                         .await
                     {
                         Ok(()) => {
-                            // Announce the SEALED manifest: community content
-                            // federates with cleartext provenance (§11.2 (3)).
-                            // The sealed-tier token announces a row the floor
-                            // already stored and bound (I28).
-                            backend
-                                .put_blob_signing_at(
-                                    cohort_scope,
-                                    StorageFloor::resolved(CryptoTier::CommunityDek),
-                                    &sha,
-                                    BlobBody::Inline(body),
-                                    media_type,
-                                    &signer_key_id,
-                                    local,
-                                    now,
-                                    uuid::Uuid::new_v4(),
-                                    Some(comm),
-                                )
-                                .await?;
+                            // v55.0.0 (CIRISPersist#989, CIRISConstitution
+                            // #141) — announce the SEALED manifest the floor
+                            // already stored and bound (I28) with a claim at
+                            // the ROOM's scope: it reaches the roster only.
+                            crate::federation::at_rest_cascade::orchestrate::announce_stored(
+                                backend, local, &sha, now,
+                            )
+                            .await?;
                             return Ok(SealStreamScopedResult {
                                 manifest_sha256: sha,
                                 tier,
@@ -4317,9 +4305,10 @@ pub mod invariants {
                 .any(|w| w.recipient_key_id == occ),
             "{tag} I34b: the occurrence holds the stream epoch's wrap"
         );
-        assert!(
-            backend.list_holders(&manifest).await.unwrap().is_empty(),
-            "{tag} I34b: a self DAG is structurally invisible — no holds_bytes"
+        assert_eq!(
+            backend.list_holders(&manifest).await.unwrap(),
+            vec![writer.clone()],
+            "{tag} I34b: a self DAG is claimed at `self` by its writer alone (v55.0.0, CC 3.1.3.3)"
         );
         assert_eq!(
             read_any_for_viewer(backend, &manifest, &occ, None)

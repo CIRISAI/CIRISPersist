@@ -90,8 +90,10 @@ pub(crate) mod bodies {
         retired_ids(&refs).contains(target)
     }
 
-    /// **I520** (v53.1.2, CIRISPersist#984 row 13) — **only the holder
-    /// retracts its own carrier row.** A `holds_bytes` row is the holder's
+    /// **I520** (v53.1.2, CIRISPersist#984 row 13; v55.0.0 CIRISPersist#989)
+    /// — **only the holder retracts its own holding claim.** The claim
+    /// (`custody:ack:v1` since v55; the `holds_bytes` carrier before) is the
+    /// holder's
     /// self-attestation. The fold's resolved-rule arm honoured a
     /// `withdraws_admission_rule` stamp on ANY `withdraws`, and the door's
     /// `holds_bytes` bypass left a replicated row's stamp in place, so a
@@ -120,11 +122,14 @@ pub(crate) mod bodies {
                 &claim_id,
                 &holder,
                 &holder,
-                &crate::federation::holds_bytes_attestation_type(&sha),
+                attestation_type::SCORES,
                 serde_json::json!({
-                    "kind": "holds_bytes",
+                    "dimension": crate::federation::custody_ack::CUSTODY_ACK_DIMENSION,
+                    "custody_state": "here",
                     "evidence_refs": [hex::encode(sha)],
                     "size": 4096,
+                    "score": 1.0,
+                    "confidence": 1.0,
                 }),
                 Vec::new(),
             ),
@@ -151,9 +156,10 @@ pub(crate) mod bodies {
         ts::reseal(&mut forged);
         let r = put(d, forged.clone()).await;
         assert!(
-            r.as_ref()
-                .is_err_and(|e| e.to_string().contains("carrier_withdraws_not_the_holder")),
-            "I520 a third party's stamped withdraws of a carrier is refused by name: {r:?}"
+            r.as_ref().is_err_and(|e| e
+                .to_string()
+                .contains("custody_ack_withdraws_not_the_holder")),
+            "I520 a third party's withdraws of a holding claim is refused by name: {r:?}"
         );
         // v55.0.0 (CIRISPersist#1007, I791) — and UNSTAMPED too: only the
         // holder retracts its claim; a takedown is the CC 2.3 tombstone.
@@ -168,15 +174,16 @@ pub(crate) mod bodies {
         )
         .await;
         assert!(
-            r.as_ref()
-                .is_err_and(|e| e.to_string().contains("carrier_withdraws_not_the_holder")),
+            r.as_ref().is_err_and(|e| e
+                .to_string()
+                .contains("custody_ack_withdraws_not_the_holder")),
             "I791 a third party's unstamped withdraws of a carrier is refused by name: {r:?}"
         );
         // …and inert in the fold even when offered directly (out of order).
         let stored = d.get_attestation(&claim_id).await.unwrap().expect("claim");
         assert!(
             !retired(&[stored, forged], &claim_id),
-            "I520 the fold never lets a resolved rule retire a carrier"
+            "I520 the fold never lets a resolved rule retire a holding claim"
         );
         assert!(listed().await, "I520 the holder is still listed");
         // The holder's own withdraws retires it in the fold and the listing.

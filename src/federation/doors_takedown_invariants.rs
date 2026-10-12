@@ -45,8 +45,8 @@
 //!   them at once (`blob_purged`), retracts this node's own claim, and
 //!   `purge_finalize` refuses until the window has passed, then deletes.
 //! - **I791** (sqlite, postgres) — only the holder retracts a holding claim:
-//!   another key's unstamped `withdraws` of this node's `holds_bytes` claim
-//!   is `carrier_withdraws_not_the_holder` at the door and the claim stands;
+//!   another key's unstamped `withdraws` of this node's holding claim
+//!   (`custody:ack:v1` `here`) is `custody_ack_withdraws_not_the_holder` at the door and the claim stands;
 //!   the holder's own is admitted. (I791b, the `custody:ack:v1` report, runs
 //!   in `dag_link_invariants` where a node holds a custody-scoped blob.)
 //! - **I792** (memory, sqlite, postgres) — CLM-derived-rows-follow-reason's
@@ -79,8 +79,9 @@
 //!   an immediate-removal takedown at once, a counter-notice takedown after
 //!   its window, the age gate and an unknown basis never earlier than W.
 //! - **I794** — from disk: the takedown handler emits no `withdraws` and runs
-//!   no `evict_actor`, and both backends' `evict_actor` retract only claims
-//!   the evicting signer signed.
+//!   no `evict_actor`; both backends' `evict_actor` delegate to
+//!   `holding_claim::evict_actor_of` (which retracts only the evicting
+//!   signer's claims); the withdraws door asks `check_custody_withdraws_signer`.
 //! - **I795** (two nodes, sqlite and postgres) — the takedown delivered
 //!   through the planes: A takes content down, serves the tombstone as a
 //!   purge bundle over JSON, and B applies it, re-verified on B's state, and
@@ -1087,8 +1088,13 @@ pub(crate) mod engine_bodies {
             .await
             .unwrap()
             .into_iter()
-            .find(|a| a.attestation_type == crate::federation::holds_bytes_attestation_type(&sha))
-            .expect("this node's holds_bytes claim");
+            .find(|a| {
+                crate::federation::admission::envelope_dimension(&a.attestation_envelope)
+                    == Some(crate::federation::custody_ack::CUSTODY_ACK_DIMENSION)
+                    && a.attestation_envelope["evidence_refs"][0].as_str()
+                        == Some(hex::encode(sha).as_str())
+            })
+            .expect("this node's holding claim (custody:ack:v1 here)");
         let refused = crate::federation::blobs::emit_withdraws_attestation_helper(
             &claim,
             "",
@@ -1101,7 +1107,7 @@ pub(crate) mod engine_bodies {
         assert!(
             refused
                 .to_string()
-                .contains("carrier_withdraws_not_the_holder"),
+                .contains("custody_ack_withdraws_not_the_holder"),
             "I791: {refused}"
         );
         assert!(
@@ -1508,17 +1514,15 @@ mod run {
                 .expect("evict_actor is implemented");
             let body = &src[i..i + src[i..].find("\n    }\n").expect("its end")];
             assert!(
-                body.contains("prior.attesting_key_id == signer.derived_key_id()"),
-                "I794 {backend}: evict_actor retracts only the evicting signer's claims"
+                body.contains("holding_claim::evict_actor_of(self,"),
+                "I794 {backend}: evict_actor delegates to the one body that retracts only the \
+                 evicting signer's claims"
             );
         }
         let admission = read("src/federation/admission.rs");
-        assert_eq!(
-            admission
-                .matches("refuse_non_holder_withdraws(row, &target)?")
-                .count(),
-            2,
-            "I794: both holding-claim shapes ask the holder rule at the door"
+        assert!(
+            admission.contains("custody_ack::check_custody_withdraws_signer(row, &target)?"),
+            "I794: the withdraws door asks the holder rule (CC 3.1.3.3 rule 4)"
         );
     }
 }

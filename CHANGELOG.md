@@ -154,7 +154,7 @@ threat-model citations because this crate's audit story is the point.
     quorum and the counter notice, never the duty-holder gate (confirmed by
     the CC session; "any claimant" is corrected in rc8 CC 4.5.3 step 1).
   - **A non-holder's `withdraws` of a holding claim is refused at the door**,
-    stamped or not (`carrier_withdraws_not_the_holder`, CC 3.1.3.3 rule 4):
+    stamped or not (`custody_ack_withdraws_not_the_holder`, CC 3.1.3.3 rule 4):
     a `holds_bytes` claim, and the rc7 `custody:ack:v1` report. Before v55 the
     unstamped form was admitted inert because the takedown handler and
     `evict_actor` emitted it.
@@ -239,11 +239,121 @@ threat-model citations because this crate's audit story is the point.
   `get_multimedia_config_json`, and the fields `counter_notice_window_days`,
   `immediate_legal_bases`, `age_gate_legal_bases`.
 - **Newly refused:** a `withdraws` of another key's `holds_bytes` claim or
-  `custody:ack:v1` report, unstamped, is `carrier_withdraws_not_the_holder`
+  `custody:ack:v1` report, unstamped, is `custody_ack_withdraws_not_the_holder`
   (`federation_invalid_argument`, `ValueError`), where it was admitted inert.
 - New enum `takedown_tombstone::TakedownDisposition` (`DestroyOnReceipt`,
   `WithholdThenDelete { window_days }`, `AgeGate`); `DagPromotion` gains
   `announced`. No exhaustive enum an adopter matches gains a variant.
+
+### Slice A — one holding claim (#989 / CIRISConstitution#141), public rooms (#1053 / #142), the row-type slot (#975)
+
+#### Changed — the holding claim is `custody:ack:v1` at the content's scope
+
+- **`holds_bytes` is retired; `custody:ack:v1` `here` is the one holding
+  claim at every tier (CC 3.1.3.3, 2.4, 5.3.2.1).** `holding_claim.rs` is its
+  one home: `ClaimScope::of_content` (the scope is the CONTENT's — Commons
+  tier, which includes `public` and `infrastructure` rooms, at `federation`
+  with no target; sealed content at its own `self` / `family` / `community` /
+  `affiliations` cohort and group), `holding_claim_row` (the one row: a
+  `scores` row on `custody:ack:v1`, `here`, attested by and about the holder,
+  the full digest in `evidence_refs`, the size, `expires_at` = signed instant
+  + 72 h), `sign_holding_claim`, and `emit_holding_claim(backend, local, sha,
+  now)` for a row this node already stores.
+- **Every door emits it.** `put_blob*` (the commons doors, in the write's
+  transaction, as before), `put_blob_scoped` at every tier (the sealed
+  cascades announce through `emit_holding_claim` — a room's claim is at the
+  ROOM's scope, never `federation`, which was the rc6 defect; a self/family
+  write is claimed at `self` / the family), `adopt_sealed_blob*` with
+  `Announce` (now admitted for `self` / `family` too: the claim stays in the
+  cohort), `seal_stream_scoped` (every tier) and `put_blob_chunks_signing`. A
+  node that is not in the content's cohort (an unclaimed node, a server-class
+  occurrence holding its owner's `self` content) stores the bytes and claims
+  nothing (`HoldingClaimOutcome::NotInCohort`, decided before signing).
+- **New BlobStorage door `put_holding_claim(sha, claim, scope)`** — announce a
+  claim for a held row (the floor `emit_holding_claim` ends at); refuses a
+  scope that is not the stored content's, a size that is not the stored
+  length, and a row no longer held.
+- **Every reader moved.** `list_holders` / `list_local_holders` /
+  `list_held_by` / `evict_actor` and `FederationDirectory::list_holders_sized`
+  have ONE implementation each (`holding_claim::*_of`, a provided default for
+  the sized read) over the custody fold: a holder's latest non-retired claim,
+  `here`, live for 72 h (any age when this node holds the bytes). The new
+  `list_attestations_citing_by_dimension` seek (V190) finds the candidates.
+  The steward purge's blob provenance (`blob_binding_subjects`, I821) and its
+  `ByActor` "bytes follow the claim" read the custody claim; the eviction
+  sweeper, `Engine::evict_blob` / `purge_evict_blob`, the epoch eviction and
+  `evict_actor` retract this node's OWN claims (a `withdraws` each, placed at
+  the claim's scope); the takedown handler retracts this node's own claim and
+  deletes its local copy (other holders are the CC 2.3 tombstone path's,
+  #1007). `MeshCrossing.replicates.discoverable` is true only for a Commons
+  placement.
+- **Admission.** The custody report admits `federation` and `affiliations`
+  placements; its `expires_at`, when present, must be the 72 h window
+  (`custody_ack_malformed`). A claim about a blob this node holds must sit at
+  that blob's scope (`custody_ack_scope_mismatch`, all three backends). A
+  `withdraws` of another device's claim is refused
+  (`custody_ack_withdraws_not_the_holder`), and the retraction fold never
+  lets one retire it (CC 3.1.3.3 rule 4); the v6.4.0 carve-out that let a
+  moderation key withdraw a `holds_bytes` row is gone.
+- **Legacy `holds_bytes` rows.** A row a node holds is "reported to the
+  operator, … neither served nor replicated, and … not deleted" (CC 2.4):
+  `row_type_report` lists it, both serve reads leave it out, no fold reads it.
+  A new one is refused `attestation_type_unregistered` at every door under
+  either row-type mode (`registry::RETIRED_CARRIER_STEMS`). The temporary
+  rc6 exception (`RC6_RETIRED_CARRIERS_ADMITTED_UNTIL_989`) keeps only the
+  key-grant pattern; slice B removes it and the const.
+
+#### Added — the `public` room (#1053, CC 3.2)
+
+- `public_room.rs`: a `cohort_subkind: public` room is Commons tier
+  (`resolve_write_tier` → plaintext; the community DEK cascade refuses it),
+  its holding claims at `federation`. `admission: open` is admissible only on
+  a `public` room; an `admission` value other than `open` is malformed; no
+  version crosses the `public` boundary (all
+  `federation_community_consensus_protocol_violation`, rules
+  `open_admission_not_public`, `admission_malformed`, `public_subkind_changed`).
+- **Open admission:** a founder's STANDING `membership:proposal:v1` (no
+  invitee) of an open public room is admitted; any requester's own
+  `membership:acceptance:v1` naming it is their consent and satisfies the
+  growth gate while the room is open (`membership_open_proposal_not_open`
+  otherwise). `membership_acceptance::standing_proposal_input` builds one.
+- **`community:listing:v1` door** (`check_community_listing_admission`, all
+  three backends and the promotion chokepoint): federation-scoped, names the
+  room and its moderator, states the room's subkind and admission policy, by
+  a founder or a current `moderate`-holder; a room this node does not hold is
+  judged where the roster lives. `public_room::live_listing` is the "one live
+  row per community" read fold.
+
+#### #975 — the row-type slot
+
+- Report-only as shipped in v53 (`ROW_TYPE_ENFORCEMENT = Report`): with rc7
+  vendored the allowlist is the five plus the one rc6 carrier still excepted;
+  any other type is admitted, counted per stem and logged, except a RETIRED
+  carrier, which is refused in either mode. The flip to `Enforce` waits on
+  the Server census (0 of 606 legacy `consent` authors re-authored at
+  2026-10-05).
+
+#### Removed (clean break, no aliases)
+
+- `sign_holds_bytes_claim`, `holds_bytes_attestation_envelope`,
+  `holds_bytes_attestation_type`, `holds_bytes_attestation_row`,
+  `PreparedHoldsBytes`, `prepare_holds_bytes_row`, `DEFAULT_HOLDS_BYTES_TTL`
+  (the 24 h TTL), `HOLDS_BYTES_ATTESTATION_TYPE_PREFIX`,
+  `HOLDS_BYTES_PREFIX_HEX_LEN`, `media_source::holds_bytes_claim_size`,
+  `media_source::check_holder_claim_size`, `renditions::holder_claim_size`,
+  `renditions::sized_holder_claims`.
+- Renamed: `cohort_scope::suppresses_holds_bytes` →
+  `cohort_scope::is_structurally_invisible`;
+  `replication::withdraws_attestation_envelope`'s second parameter is the
+  target's `attestation_type`.
+- `BlobStorage::adopt_sealed_blob_at` gains `group_key_id: Option<&str>`
+  (recorded on the row, V177; the claim's target).
+
+#### Migrations
+
+- **V190** `federation_attestations_dimension_citation` — `(dimension,
+  evidence_refs[0])`, both dialects: the holder directory's attester-free
+  citation seek.
 
 ## [54.1.0] - 2026-10-10
 
@@ -1704,7 +1814,7 @@ The retroactive key-grant ADD walk (`rekey_for_newcomers`) took its cohort-visib
 
 ### Fixed — an imported root lost to an older bake, a forged rule retiring a holder's claim, a withdrawal a peer dropped (#984 rows 11, 13, 19)
 - **Row 11.** A node that IMPORTED a later ceremony and booted a binary with an older one compiled in lost the imported root: the accord head, the `ciris-canonical` birth, `genesis-charter` and `genesis-lifecycle` all moved to the older bake. The mechanism was in the import door, not the boot: `install_genesis_bundle_roster` baked the delegation rows BEFORE the accord head existed, and the bake admits the charter through the family it names, so on a fresh node the charter and lifecycle were skipped ("no constitutional trust root yet"); the head and birth landed naming a charter no row held, and the next boot's compiled rows — of any vintage — filled the holes and `charter_superseded` took the head and birth with them. The import now installs the accord head first, as the boot seed does; with the rows held, the existing #665 rule (signed-instant `candidate_is_strictly_newer`) leaves a newer ceremony's rows at boot, the head's charter stays live, the birth stays, and the posture is `Entrenched` (a root ahead of its binary is allowed). No new vintage comparison was added. **I521** (memory, sqlite, postgres): import v3, boot v2 — every plane stays v3's; boot v3 — unchanged.
-- **Row 13.** `precedence::retraction_entitled`'s resolved-rule arm honoured a `withdraws_admission_rule` stamp on any `withdraws`, and the door's `holds_bytes` bypass left a replicated row's stamp in place, so a third party's `withdraws` carrying a forged rule retired a holder's `holds_bytes` claim in the fold while `list_holders` (which folds the holder's own retractions only) still listed it. A registered carrier row is retired by its attester alone: the subject and rule arms never apply to a carrier (`row_type::classify`), and a non-holder's stamped `withdraws` of a carrier is refused at the door as `carrier_withdraws_not_the_holder`. An unstamped non-holder `withdraws` of a `holds_bytes` row — what `takedown_handler` and `evict_actor` emit as audit rows — is admitted with no rule and inert in every fold, exactly as before; moving those paths onto a CC 2.3 tombstone door is a separate row (no such door exists yet). **I520** (memory, sqlite, postgres): the stamped third-party `withdraws` refused and inert; the holder's own retires it in the fold and the listing.
+- **Row 13.** `precedence::retraction_entitled`'s resolved-rule arm honoured a `withdraws_admission_rule` stamp on any `withdraws`, and the door's `holds_bytes` bypass left a replicated row's stamp in place, so a third party's `withdraws` carrying a forged rule retired a holder's `holds_bytes` claim in the fold while `list_holders` (which folds the holder's own retractions only) still listed it. A registered carrier row is retired by its attester alone: the subject and rule arms never apply to a carrier (`row_type::classify`), and a non-holder's stamped `withdraws` of a carrier is refused at the door as `custody_ack_withdraws_not_the_holder`. An unstamped non-holder `withdraws` of a `holds_bytes` row — what `takedown_handler` and `evict_actor` emit as audit rows — is admitted with no rule and inert in every fold, exactly as before; moving those paths onto a CC 2.3 tombstone door is a separate row (no such door exists yet). **I520** (memory, sqlite, postgres): the stamped third-party `withdraws` refused and inert; the holder's own retires it in the fold and the listing.
 - **Row 19.** A peer offered a withdrawn location proof (the attester's re-signed row, v53.1.2 row 16) through `put_location_proof` refused it on the primary key (sqlite, postgres) or overwrote the held row unchecked (memory). A held `(subject, asserted_at)` re-offered with `withdrawn_at` set is now handed to `withdraw_location_proof` — one predicate for the local and the replicated path — and any other re-offer keeps its path. **I522** (memory, sqlite, postgres): B applies A's served withdrawal and its in-force fold excludes the proof; a live delegate who did not attest it is refused by name; a stranger by standing.
 - Mutation-checked: baking before the head reds I521; dropping the carrier exclusion from the fold, or the stamped-rule refusal at the door, reds I520; dropping the held-PK routing on all three backends reds I522.
 

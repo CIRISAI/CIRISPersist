@@ -1907,9 +1907,9 @@ pub fn envelope_binds_content(envelope: &serde_json::Value, content_sha256: &str
 /// hook produces the machine-readable typed rejection consumers
 /// pattern-match on (`kind() == "federation_cohort_scope_rejected"`).
 ///
-/// `self`-tier locality enforcement (a `cohort_scope: self`
-/// attestation MUST NOT emit `holds_bytes` to peers — the
-/// FEDERATION_SCALING_MODEL §9.5 locality dividend) is a separate,
+/// `self`-tier locality enforcement (a `cohort_scope: self` row is never
+/// advertised beyond the owner — the FEDERATION_SCALING_MODEL §9.5 locality
+/// dividend; v55.0.0 its holding claims stay at `self`) is a separate,
 /// emission-side concern tracked by #153 Ask 5 and is not part of this
 /// value-validation layer.
 pub fn check_cohort_scope(cohort_scope: &str) -> Result<(), Error> {
@@ -2780,7 +2780,7 @@ pub async fn check_promotion_admission(
     // crossing is over the same bytes (CC 5.3.2.4.2) and `cohort_scope` is
     // one of those bytes, so a `(local, self)` row crosses to
     // `(federation, self)`: the CC 5.2 shape — replicated to the owner's own
-    // nodes by consent fan-out, never advertised via `holds_bytes`. #315
+    // nodes by consent fan-out, its holding claims kept at `self`. #315
     // called this a dead plane because nothing consumed it; edge's own-device
     // fan-out (`CohortScope::SelfOnly`) now does. Widening is a separate
     // `supersedes` row (`FederationDirectory::widen_audience`), and THAT door
@@ -2852,10 +2852,8 @@ pub async fn check_promotion_admission(
     super::consent_scope::check_consent_scope_tokens(&row.attestation_envelope)?;
     // v45.0.0 (CIRISPersist#871) — the media Source struct gate at the promotion
     // chokepoint: a local row admitted before this cut does not cross with a
-    // malformed struct; a promoted holder claim (there is none) would need its
-    // size.
+    // malformed struct. (A holding claim's size is the custody parse's, v55.)
     super::media_source::check_media_source(&row.attestation_envelope)?;
-    super::media_source::check_holder_claim_size(&row.attestation_envelope, &row.attestation_type)?;
     check_capacity_consent_admission(directory, row).await?;
 
     // v38.7.0 (CIRISPersist#778) — CC 3.4.5's OTHER emitter rule: `config:*`
@@ -2885,6 +2883,10 @@ pub async fn check_promotion_admission(
     // CC 3.1.3.3 — a custody report is a holder self-report within the blob's
     // own cohort (v53.0.0, CIRISPersist#942 part 2).
     super::custody_ack::check_custody_ack_admission(directory, row).await?;
+    // CC 3.2 — a `community:listing:v1` row is federation-scoped and signed by
+    // the room's founder or a current moderate-holder (v55.0.0,
+    // CIRISPersist#1053).
+    super::public_room::check_community_listing_admission(directory, row).await?;
 
     // CC 3.1 — a dimension's family stem is lowercase, or it evades every
     // family gate in this file (v42.0.0, CIRISPersist#814, found by review).
@@ -7606,7 +7608,7 @@ impl DelegationWalkPolicy {
 /// the siblings model §6.1 self-retraction only, and narrowing this fold to
 /// that would drop the subject and proxy revocations it exists to see.
 /// `withdraws_admission_rule` is `None` for several distinct reasons (deferred,
-/// malformed, non-`withdraws`, `holds_bytes` target), so it is used only as an
+/// malformed, non-`withdraws`, a retired carrier target), so it is used only as an
 /// admitting arm and never as the sole test.
 /// v36.0.0 (CIRISPersist#686) — delegates to the CONSOLIDATED fold
 /// [`crate::federation::precedence::retired_ids`]. This fold contributed the
@@ -8943,31 +8945,6 @@ pub async fn owner_granters_in_force_at(
         .collect())
 }
 
-/// v55.0.0 (CIRISPersist#1007; CC 3.1.3.3 rule 4) — **a holding claim is
-/// retracted by its holder alone.** A `withdraws` whose target is a holding
-/// claim (a `holds_bytes` carrier, or the rc7 `custody:ack:v1` report) and
-/// whose signer is not the claim's signer is REFUSED at the door, stamped or
-/// not: "nobody withdraws another device's report, and a takedown is the CC
-/// 2.3 tombstone path" (`takedown_tombstone`). The fold
-/// (`precedence::retraction_entitled`) already never let such a row retire a
-/// claim; until v55 the door admitted the unstamped form inert, because the
-/// takedown handler and `evict_actor` emitted it and had no tombstone to move
-/// to. Both have moved.
-fn refuse_non_holder_withdraws(
-    row: &super::Attestation,
-    target: &super::Attestation,
-) -> Result<(), Error> {
-    if row.attesting_key_id == target.attesting_key_id {
-        return Ok(());
-    }
-    Err(Error::InvalidArgument(format!(
-        "carrier_withdraws_not_the_holder: {} is not the holder {} whose {} claim this withdraws \
-         names — only the holder retracts its own claim (CC 3.1.3.3 rule 4); a takedown is the \
-         CC 2.3 tombstone path (#1007)",
-        row.attesting_key_id, target.attesting_key_id, target.attestation_type
-    )))
-}
-
 /// v6.4.0 (CIRISPersist#146 Ask 2) — the `put_attestation` entry point
 /// for the broadened gate. A no-op (`Ok(None)`) for any
 /// non-`withdraws` row; for a `withdraws` it loads target `T`
@@ -8998,25 +8975,18 @@ fn refuse_non_holder_withdraws(
 ///
 /// # Scope — CONSENT-revocation withdraws ONLY (v6.4.0 regression fix)
 ///
-/// CEG §3.2.3 broadens the authority basis for **consent**-revocation.
-/// It is NOT the only authority basis for a `withdraws`. The substrate
-/// emits `withdraws` on several SEPARATELY-authorized paths whose target
-/// `T` is a `holds_bytes:sha256:*` **content-location directory entry**,
-/// not a consent-bearing Contribution:
+/// CEG §3.2.3 broadens the authority basis for **consent**-revocation. It is
+/// not the only authority basis for a `withdraws`: a host retracting its OWN
+/// holding claim (`evict_actor`, the sweeper, an epoch eviction) is rule 1,
+/// the producer's own retraction.
 ///
-/// - **`evict_blob` / sweeper** ([`crate::federation::blobs`],
-///   `engine.rs`) — a host self-attests it no longer holds the bytes.
-///
-/// These are content-location retractions, not consent revocations, so
-/// the gate is **scoped to NON-holding-claim targets**: a `withdraws`
-/// whose target is a holding claim (a `holds_bytes:sha256:*` row, or the
-/// rc7 `custody:ack:v1` report) bypasses the consent rules and is admitted
-/// iff its signer IS the claim's signer (v55.0.0, CIRISPersist#1007; CC
-/// 3.1.3.3 rule 4: nobody withdraws another device's report). A takedown
-/// is not a withdrawal of holders: it is the CC 2.3 tombstone
-/// ([`crate::federation::takedown_tombstone`]). Genuine consent withdraws
-/// target a consent-bearing Contribution, never a holding claim — so the
-/// 4-rule gate still fully applies to them.
+/// v55.0.0 (CIRISPersist#989, CC 3.1.3.3 rule 4) — the v6.4.0 carve-out that
+/// let a `withdraws` against a `holds_bytes:sha256:*` row bypass the consent
+/// rules (so a moderation key could withdraw a third party's claim on the
+/// takedown path) is gone with the carrier. A holding claim is
+/// `custody:ack:v1` and is retracted by its signer alone
+/// ([`custody_ack::check_custody_withdraws_signer`](super::custody_ack::check_custody_withdraws_signer));
+/// a takedown is the CC 2.3 tombstone path.
 pub async fn check_withdraws_admission(
     directory: &dyn super::FederationDirectory,
     row: &super::Attestation,
@@ -9142,25 +9112,13 @@ pub async fn check_withdraws_admission_at(
             target.attestation_type
         )));
     }
-    // Scope discriminator: a `holds_bytes:sha256:*` target is a
-    // content-location directory entry, retracted by its holder alone
-    // (v55.0.0, #1007). The §3.2.3 consent gate does NOT apply.
-    if target
-        .attestation_type
-        .starts_with(crate::federation::blobs::HOLDS_BYTES_ATTESTATION_TYPE_PREFIX)
-    {
-        refuse_non_holder_withdraws(row, &target)?;
-        return Ok(None);
-    }
-    // v55.0.0 (CIRISPersist#1007) — the rc7 holding claim, `custody:ack:v1`
-    // (a `scores` row), is retracted by its signer alone too (CC 3.1.3.3
-    // rule 4). The signer's own `withdraws` goes on to the rules below and
-    // resolves as rule 1, as before.
-    if envelope_dimension(&target.attestation_envelope)
-        == Some(super::custody_ack::CUSTODY_ACK_DIMENSION)
-    {
-        refuse_non_holder_withdraws(row, &target)?;
-    }
+    // v55.0.0 (CIRISPersist#989, CC 3.1.3.3 rule 4) — a holding claim
+    // (`custody:ack:v1`) is retracted by its signer alone: "nobody withdraws
+    // another device's report, and a takedown is the CC 2.3 tombstone path,
+    // not a withdrawal of holders". The retired `holds_bytes` carve-out that
+    // let a moderation key withdraw a third party's claim is gone with the
+    // carrier; a holder's own retraction falls through to rule 1 below.
+    super::custody_ack::check_custody_withdraws_signer(row, &target)?;
     // v25.x (CIRISPersist#578, CIRISConstitution rc3 CC 3.2) — **the recovery
     // gate, in BOTH directions.**
     //
@@ -13778,6 +13736,8 @@ pub async fn check_infrastructure_founder_count_unchanged(
 /// conformance checks over a whole community record, for the record doors
 /// (`put_community`, the supersede door): a founder exists, then the protocol
 /// and its `N` (they read nothing), then the founders' node-bearing.
+/// v55.0.0 (CIRISPersist#1053) — then the `public` room's conformance
+/// ([`public_room::check_public_room_conformance`](super::public_room::check_public_room_conformance)).
 pub async fn check_infrastructure_community_conformance(
     directory: &dyn super::FederationDirectory,
     community: &super::Community,
@@ -13797,7 +13757,10 @@ pub async fn check_infrastructure_community_conformance(
         });
     }
     check_infrastructure_consensus_protocol(community)?;
-    check_infrastructure_founders_not_node(directory, community, chrono::Utc::now()).await
+    check_infrastructure_founders_not_node(directory, community, chrono::Utc::now()).await?;
+    // v55.0.0 (CIRISPersist#1053, CC 3.2 `public`) — `admission: open` only on
+    // a public room, and no version crosses the `public` boundary.
+    super::public_room::check_public_room_conformance(directory, community).await
 }
 
 /// v50.0.0 (CIRISPersist#925/#927, final check) — **a conformant room never
@@ -13825,9 +13788,16 @@ pub async fn check_replicated_supersede_does_not_degrade(
     else {
         return Ok(());
     };
-    if stored.persist_row_hash == super::types::compute_persist_row_hash(offered)?
-        || !is_infrastructure_labeled(&stored)
-    {
+    if stored.persist_row_hash == super::types::compute_persist_row_hash(offered)? {
+        return Ok(());
+    }
+    if !is_infrastructure_labeled(&stored) {
+        // v55.0.0 (CIRISPersist#1053) — a stored public room never degrades
+        // through the replicated door either: the offered version stays on the
+        // public side with a well-formed admission.
+        if super::public_room::is_public_community(&stored) {
+            return super::public_room::check_public_room_conformance(directory, offered).await;
+        }
         return Ok(());
     }
     match check_infrastructure_community_conformance(directory, &stored).await {
@@ -13853,9 +13823,6 @@ pub async fn check_infrastructure_record_admission(
     directory: &dyn super::FederationDirectory,
     community: &super::Community,
 ) -> Result<(), Error> {
-    if !is_infrastructure_labeled(community) {
-        return Ok(());
-    }
     if let Some(stored) = directory
         .lookup_community(&community.community_key_id)
         .await?
@@ -13863,6 +13830,12 @@ pub async fn check_infrastructure_record_admission(
         if stored.persist_row_hash == super::types::compute_persist_row_hash(community)? {
             return Ok(());
         }
+    }
+    if !is_infrastructure_labeled(community) {
+        // v55.0.0 (CIRISPersist#1053, CC 3.2 `public`) — every NEW or CHANGED
+        // room record, infrastructure or not, keeps `admission: open` on the
+        // public side and does not cross the `public` boundary.
+        return super::public_room::check_public_room_conformance(directory, community).await;
     }
     check_infrastructure_community_conformance(directory, community).await
 }
@@ -19453,6 +19426,13 @@ mod tests {
         // the gate is `check_settlement_admission` (no payment-processor
         // identifier).
         "settlement:",
+        // v55.0.0 (CIRISPersist#1053, CC 3.2 public rooms) — "founder- or
+        // moderate-holder-signed for the community it names; one live row per
+        // community; federation scope": the rule asks who the room's founders
+        // and moderators ARE, which no identity type expresses. The gate is
+        // `public_room::check_community_listing_admission`; "one live row" is
+        // the read fold `public_room::live_listing`.
+        "community:listing",
         // rc7 re-vendor (v55.0.0, CIRISPersist#753) — "sealer-only" (CC 3.3.2).
         // Held shut: `REGISTERED_FAMILIES_HELD_SHUT` refuses every dimension
         // under the stem until v55 slice B builds the per-recipient row door
@@ -19490,9 +19470,6 @@ mod tests {
         ("key:revocation", "CIRISPersist#991"),
         ("identity:occurrence", "CIRISPersist#991"),
         ("group:roster", "CIRISPersist#991"),
-        // CC 3.2 public communities (CIRISConstitution#142): founder- or
-        // moderate-holder-signed, one live row per community. v55 slice A.
-        ("community:listing", "CIRISPersist#1053"),
     ];
 
     /// **CC 3.1.7 R2(a) — the mint gate.** Every family persist declares itself
@@ -20391,12 +20368,12 @@ mod tests {
     // ── #153 Ask 5: structural-invisibility classification ─────────
 
     #[test]
-    fn cohort_scope_suppresses_holds_bytes_only_for_self_and_family() {
+    fn cohort_scope_is_structurally_invisible_only_for_self_and_family() {
         use crate::federation::types::cohort_scope as cs;
-        // self + family are structurally invisible — no holds_bytes.
-        assert!(cs::suppresses_holds_bytes(cs::SELF));
-        assert!(cs::suppresses_holds_bytes(cs::FAMILY));
-        // everything else federates and emits holds_bytes per status quo
+        // self + family are structurally invisible — never discoverable.
+        assert!(cs::is_structurally_invisible(cs::SELF));
+        assert!(cs::is_structurally_invisible(cs::FAMILY));
+        // everything else is not structurally invisible
         // (CEG 0.8 §8.1.13.3 is explicit that community is NOT suppressed).
         for scope in [
             cs::COMMUNITY,
@@ -20406,13 +20383,13 @@ mod tests {
             cs::FEDERATION,
         ] {
             assert!(
-                !cs::suppresses_holds_bytes(scope),
-                "{scope:?} must federate (emit holds_bytes)"
+                !cs::is_structurally_invisible(scope),
+                "{scope:?} must not be structurally invisible"
             );
         }
         // unknown values are not suppressors (they're rejected upstream
         // by is_valid / the admission gate).
-        assert!(!cs::suppresses_holds_bytes("global"));
+        assert!(!cs::is_structurally_invisible("global"));
     }
 
     // ── AV-45 (FSD §4.6): write-path cohort_scope admission gate ────

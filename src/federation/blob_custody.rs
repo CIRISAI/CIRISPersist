@@ -170,9 +170,9 @@ where
                 group_by_person(backend, devices, "at_rest_grant").await?,
                 false,
                 Some(
-                    "self/family bytes are never announced (CC 5.2 structural invisibility): \
-                     copies on other devices are counted from their custody reports (CC \
-                     3.1.3.3); a device with no live report is unknown, not none"
+                    "self/family holding claims stay within the cohort (CC 5.2, 3.1.3.3): \
+                     copies on other devices are counted from their custody reports; a device \
+                     with no live report is unknown, not none"
                         .to_owned(),
                 ),
             )

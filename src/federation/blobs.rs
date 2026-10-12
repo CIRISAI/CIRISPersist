@@ -20,19 +20,18 @@
 //! # The four operations (per CIRISPersist#103)
 //!
 //! 1. [`put_blob`](BlobStorage::put_blob) — hash-on-write, SHA-keyed
-//!    idempotency, auto-emits a `holds_bytes:sha256:<prefix>`
-//!    attestation to the existing `federation_attestations` table.
+//!    idempotency, auto-emits this node's holding claim (`custody:ack:v1`
+//!    `here` at the content's scope — v55.0.0, CIRISPersist#989; the retired
+//!    `holds_bytes` carrier before it) to the `federation_attestations`
+//!    table.
 //! 2. [`get_blob`](BlobStorage::get_blob) — returns the [`BlobBody`]
 //!    variant matching the row's `storage_kind`. Persist NEVER fetches
 //!    from S3 / external URLs; the caller streams the External case.
 //! 3. [`has_blob`](BlobStorage::has_blob) — existence check.
-//! 4. [`list_holders`](BlobStorage::list_holders) — queries the
-//!    `holds_bytes:sha256:<prefix>` attestation index for keys that
-//!    have written this blob. Prefix-not-full-hash for index size; the
-//!    full SHA hides in the attestation envelope's `evidence_refs`
-//!    array to discriminate prefix collisions (8-hex prefix gives 32
-//!    bits → birthday collision around 65k distinct blobs, well below
-//!    federation scale; the full SHA hides any structural collisions).
+//! 4. [`list_holders`](BlobStorage::list_holders) — the holder directory:
+//!    every device whose latest `custody:ack:v1` claim about this blob is a
+//!    live `here` ([`holding_claim::live_holders`](crate::federation::holding_claim::live_holders)),
+//!    keyed by the full digest in the claim's `evidence_refs` (V190).
 //!
 //! # Why no GC in v0.1
 //!
@@ -72,54 +71,15 @@
 //! per-host hint about how the bytes are *stored locally*, not a wire
 //! property of the blob. Two hosts having different opinions is the
 //! expected federation shape, not an error. (`list_holders` returns
-//! BOTH key_ids regardless — the `holds_bytes` attestation is per
-//! attester.)
+//! BOTH key_ids regardless — the holding claim is per attester.)
 
 use std::future::Future;
-use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
 /// v2.3 (CIRISPersist#103) — default maximum byte length for an
 /// `Inline` payload. 1 MiB (1,048,576 bytes).
 pub const DEFAULT_INLINE_BYTES_CAP: usize = 1024 * 1024;
-
-/// v3.0.0 (CIRISPersist#116, CEG 0.2 §10.1.2) — default TTL for a
-/// `holds_bytes:sha256:{prefix}` directory entry. Measured from the
-/// attestation's `asserted_at` (the `signed_at` in CEG §10.1.2 wire
-/// terms). After this window passes the holder is considered stale
-/// and [`BlobStorage::list_holders`] filters the row out.
-///
-/// **24 hours per CEG §10.1.2.** The constant is the operator-tunable
-/// default; sovereign deployments override per their freshness
-/// policy (e.g., LAN-only edges that always-on may tighten the TTL;
-/// cold-archive nodes may extend it). Persist exposes the constant
-/// rather than a runtime field so the default is the same shape across
-/// every deployment that hasn't overridden — operators tune by
-/// providing their own freshness window when consuming `list_holders`
-/// (the trait surface returns the unfiltered + filtered shapes
-/// depending on the implementation; see [`BlobStorage::list_holders`]
-/// for the contract).
-pub const DEFAULT_HOLDS_BYTES_TTL: Duration = Duration::from_secs(24 * 3600);
-
-/// v2.3 (CIRISPersist#103) — hex-prefix length for the
-/// `holds_bytes:sha256:<prefix>` attestation index.
-///
-/// 8 hex chars = 4 bytes = 32 bits of prefix entropy. Birthday
-/// collision at ~sqrt(2^32) = 65k distinct blobs — well below
-/// federation scale. The full SHA-256 lives in the attestation
-/// envelope's `evidence_refs` array to discriminate any prefix
-/// collisions.
-pub const HOLDS_BYTES_PREFIX_HEX_LEN: usize = 8;
-
-/// v2.3 (CIRISPersist#103) — the `attestation_type` prefix prepended
-/// to the SHA prefix for `holds_bytes` attestations.
-///
-/// Full string shape: `"holds_bytes:sha256:<8-hex-prefix>"`. The
-/// `attestation_type` column on `federation_attestations` is free-form
-/// TEXT (no enum CHECK in V004), so the new prefix rides existing
-/// storage without a schema break.
-pub const HOLDS_BYTES_ATTESTATION_TYPE_PREFIX: &str = "holds_bytes:sha256:";
 
 /// Reference to a blob stored externally (S3 or arbitrary URL).
 ///
@@ -1732,7 +1692,11 @@ pub trait BlobStorage: Send + Sync {
     fn inline_bytes_cap(&self) -> usize;
 
     /// Write a blob, with hash-on-write validation and auto-emission
-    /// of the holder attestation.
+    /// of the holding claim — the commons form: `federation` / plaintext, so
+    /// the claim is the holder-directory row (`custody:ack:v1` `here` at
+    /// `federation`, v55.0.0 CIRISPersist#989). The caller signed
+    /// [`holding_claim_row`](crate::federation::holding_claim::holding_claim_row)
+    /// over the same inputs; persist rebuilds and checks it.
     ///
     /// # Validation
     ///
@@ -1760,19 +1724,17 @@ pub trait BlobStorage: Send + Sync {
     ) -> impl Future<Output = Result<(), BlobError>> + Send;
 
     /// v3.9.2 (CIRISPersist#153 Ask 5, CEG 0.7 §10.1.4) — store blob
-    /// bytes **without** emitting a `holds_bytes:sha256:*` directory
-    /// attestation.
+    /// bytes **without** emitting a holding claim.
     ///
-    /// The structural-invisibility primitive for
-    /// [`cohort_scope`](crate::federation::types::cohort_scope)
-    /// `self` / `family` content: the bytes are persisted locally
-    /// (and readable via [`get_blob`](BlobStorage::get_blob) /
-    /// streamable as the operator's own data) but the substrate
-    /// announces nothing — no `holds_bytes` row is created, so a
-    /// non-member peer walking the federation directory cannot
-    /// discover the bytes exist. This is the difference between
-    /// [`put_blob`](BlobStorage::put_blob) (federation-tier: bytes +
-    /// holds_bytes announcement) and local-only storage.
+    /// The storage floor the sealing cascades write through: the bytes are
+    /// persisted locally (and readable via [`get_blob`](BlobStorage::get_blob) /
+    /// streamable as the operator's own data) and the floor announces
+    /// nothing. v55.0.0 (CIRISPersist#989, CC 3.1.3.3) — a cascade that
+    /// stores here then announces through
+    /// [`emit_holding_claim`](crate::federation::holding_claim::emit_holding_claim),
+    /// which places the claim at the content's own scope (`self` / `family` /
+    /// the room), so a non-member peer still learns nothing; the LocalOnly
+    /// doors stop here.
     ///
     /// Validation is identical to [`put_blob`] for the bytes
     /// themselves — inline-size cap + hash-on-write — but there is no
@@ -1784,11 +1746,7 @@ pub trait BlobStorage: Send + Sync {
     ///
     /// Idempotent on SHA collision (first-write-wins on
     /// `storage_kind` / `external_ref`), exactly as [`put_blob`].
-    /// Callers normally reach this via
-    /// [`put_blob_signing_scoped`](BlobStorage::put_blob_signing_scoped),
-    /// which dispatches here when
-    /// [`suppresses_holds_bytes`](crate::federation::types::cohort_scope::suppresses_holds_bytes)
-    /// is true.
+    /// The sealing cascades reach this for every encrypted tier.
     ///
     /// #846 (`BLOB_REPLICATION.md` §5) — `author_key_id` is recorded on the
     /// row: the writer's DERIVED federation key id for a local write (I23).
@@ -1831,7 +1789,7 @@ pub trait BlobStorage: Send + Sync {
     /// a node that pulled a commons blob from a holder, checked its size
     /// (CC 5.3.2.5) and its digest, keeps the bytes for its own consumers
     /// without becoming a holder the mesh can be pointed at. No
-    /// `holds_bytes` claim is emitted, no signer is involved, and nothing
+    /// holding claim is emitted, no signer is involved, and nothing
     /// here decides a render tier (CC 5.3.2.6: the node's, from sniffed
     /// bytes).
     ///
@@ -1875,7 +1833,19 @@ pub trait BlobStorage: Send + Sync {
     /// current-epoch check** (the I17 rule governs a *write*; an adopt records
     /// the epoch the author sealed under, which may be past and may be one
     /// this node holds no key state for) — and, when `announce` is `Some`,
-    /// the `holds_bytes` row, all in ONE transaction. Returns the address.
+    /// this node's holding claim, all in ONE transaction. Returns the
+    /// address.
+    ///
+    /// v55.0.0 (CIRISPersist#989, CC 3.1.3.3 rule 1) — the claim is placed at
+    /// the CONTENT's scope ([`ClaimScope::of_content`](crate::federation::holding_claim::ClaimScope::of_content)
+    /// over the floor's tier, `cohort_scope`, and the group), so an adopted
+    /// self, family or room blob is claimed within its own cohort and never
+    /// at `federation`. `group_key_id` is the group the provenance names
+    /// (the owner for `self`, the family, the room); it is recorded on the
+    /// row as the cascades record it (V177), and the floor refuses a
+    /// `CommunityDek` binding whose community is not it. The claim's
+    /// audience (the holder is in the cohort) is checked before the
+    /// transaction.
     ///
     /// Idempotent on the address (first-write-wins on the row and the
     /// binding); the holder claim is inserted on every announcing call.
@@ -1892,6 +1862,7 @@ pub trait BlobStorage: Send + Sync {
         author_key_id: &str,
         floor: StorageFloor,
         binding: Option<EpochBinding>,
+        group_key_id: Option<&str>,
         announce: Option<PutBlobAttestation>,
     ) -> impl Future<Output = Result<[u8; 32], BlobError>> + Send;
 
@@ -1995,6 +1966,26 @@ pub trait BlobStorage: Send + Sync {
         group_key_id: Option<&str>,
     ) -> impl Future<Output = Result<(), BlobError>> + Send;
 
+    /// v55.0.0 (CIRISPersist#989, CC 3.1.3.3) — **announce this node's
+    /// holding claim for a row it ALREADY stores**: the floor
+    /// [`emit_holding_claim`](crate::federation::holding_claim::emit_holding_claim)
+    /// ends at. Rebuilds the claim from `claim` and `scope`
+    /// ([`prepare_holding_claim_row`](crate::federation::holding_claim::prepare_holding_claim_row)
+    /// — the caller's hash must cover the rebuilt bytes), refuses a `scope`
+    /// that is not the stored content's
+    /// ([`content_claim_scope`](crate::federation::holding_claim::content_claim_scope),
+    /// `custody_ack_scope_mismatch`), a `size` that is not the stored length,
+    /// and a holder outside the cohort; then, in ONE transaction, checks the
+    /// row is still held ([`BlobError::NotHeld`] otherwise — an announcement
+    /// never stores) and inserts the claim. Indexed for the wire like every
+    /// federation-plane row.
+    fn put_holding_claim(
+        &self,
+        sha256: &[u8; 32],
+        claim: PutBlobAttestation,
+        scope: &crate::federation::holding_claim::ClaimScope,
+    ) -> impl Future<Output = Result<(), BlobError>> + Send;
+
     /// v43.0.0 (§11.1) — the `cohort_scope` recorded when the blob was
     /// stored (provenance: the cohort the write NAMED), or `None` if the blob
     /// is absent.
@@ -2039,7 +2030,7 @@ pub trait BlobStorage: Send + Sync {
     ///   `content_sha256` = SHA-256 over those bytes, `size_bytes` =
     ///   `manifest.total_size`).
     ///
-    /// No `holds_bytes` attestation is emitted (this is the local-store
+    /// No holding claim is emitted (this is the local-store
     /// shape; Cut C / a later surface can wrap a signing variant).
     ///
     /// # Validation (all-or-nothing — any failure rolls back the txn)
@@ -2607,7 +2598,8 @@ pub trait BlobStorage: Send + Sync {
     fn has_blob(&self, sha256: &[u8; 32]) -> impl Future<Output = Result<bool, BlobError>> + Send;
 
     /// v3.3.0 (CIRISPersist#121) — one-call ingest convenience. Persist
-    /// computes the `holds_bytes` envelope, canonicalizes it via the
+    /// computes the holding-claim envelope (v55.0.0: `custody:ack:v1` `here`
+    /// at `federation`, CIRISPersist#989), canonicalizes it via the
     /// production [`PythonJsonDumpsCanonicalizer`](crate::verify::canonical::PythonJsonDumpsCanonicalizer)
     /// (NOT RFC 8785 / JCS — the parity reference canonicalizer is
     /// `#[cfg(test)]`-only), signs the canonical bytes via the
@@ -2632,7 +2624,7 @@ pub trait BlobStorage: Send + Sync {
     /// `serde_json_canonicalizer` crate produces signatures that fail
     /// downstream verification — silently wrong rows in
     /// `federation_attestations`. This method closes that error class
-    /// by making persist the canonical owner of holds_bytes-envelope
+    /// by making persist the canonical owner of holding-claim envelope
     /// canonicalization.
     ///
     /// # Default impl
@@ -2771,12 +2763,17 @@ pub trait BlobStorage: Send + Sync {
     /// [`put_blob_signing_scoped`](Self::put_blob_signing_scoped); there is no
     /// path through here for an encrypted tier.
     ///
-    /// `local` — CIRISPersist#851 §20.5, HYBRID/PQC ONLY: the holder claim is
-    /// federation-tier, so it is signed by this node's PQC `LocalSigner` and
-    /// by nothing else. No LocalSigner, no ML-DSA-65 half, or a LocalSigner
-    /// that is not `attesting_key_id` ⇒ the write REFUSES
-    /// ([`BlobError::AttestationEmissionFailed`]) rather than storing bytes
-    /// under a claim no peer will admit.
+    /// `local` — CIRISPersist#851 §20.5, HYBRID/PQC ONLY: the holding claim
+    /// rides the federation plane, so it is signed by this node's PQC
+    /// `LocalSigner` and by nothing else. No ML-DSA-65 half ⇒ the write
+    /// REFUSES ([`BlobError::AttestationEmissionFailed`]) rather than storing
+    /// bytes under a claim no peer will admit.
+    ///
+    /// v55.0.0 (CIRISPersist#989, CC 3.1.3.3 rule 1) — the claim is placed at
+    /// the content's scope, derived from THIS write's tier, cohort and group
+    /// ([`ClaimScope::of_content`](crate::federation::holding_claim::ClaimScope::of_content)):
+    /// `federation` for a plaintext write, the room for a sealed community
+    /// manifest this door announces. The floor re-derives the same scope.
     #[allow(clippy::too_many_arguments)]
     fn put_blob_signing_at<'s>(
         &'s self,
@@ -2814,13 +2811,18 @@ pub trait BlobStorage: Send + Sync {
             // records the AUTHOR, which for a proxy write is the peer —
             // losing it made proxy content look locally authored and slipped
             // the stop-tier proxy-serve refusal.
-            let att = sign_holds_bytes_claim(
+            let scope = crate::federation::holding_claim::ClaimScope::of_content(
+                floor.tier(),
+                cohort_scope,
+                group_key_id,
+            )?;
+            let att = crate::federation::holding_claim::sign_holding_claim(
                 local,
                 sha256,
-                &local.derived_key_id(),
                 attestation_id,
                 now,
                 body.size_bytes(),
+                &scope,
             )
             .await?;
             self.put_blob_with_scope(
@@ -2838,20 +2840,13 @@ pub trait BlobStorage: Send + Sync {
     }
 
     /// v3.9.2 (CIRISPersist#153 Ask 5, CEG 0.7 §10.1.4) — cohort-scope-
-    /// aware blob write. The substrate-side enforcement of the
-    /// structural-invisibility privacy claim.
+    /// aware blob write.
     ///
-    /// Dispatches on
-    /// [`cohort_scope::suppresses_holds_bytes`](crate::federation::types::cohort_scope::suppresses_holds_bytes):
-    ///
-    /// - `self` / `family` → [`store_blob_local`](BlobStorage::store_blob_local):
-    ///   bytes are persisted, **no** `holds_bytes` attestation is
-    ///   emitted, the signer is never invoked (there is no attestation
-    ///   to sign). The content is structurally invisible to the
-    ///   federation.
-    /// - every other (validated) scope → [`put_blob_signing`](BlobStorage::put_blob_signing):
-    ///   the federation-tier path that signs + emits the `holds_bytes`
-    ///   announcement exactly as today.
+    /// Dispatches on the tier resolved from the directory: a Commons-tier
+    /// (plaintext) write is [`put_blob_signing_at`](BlobStorage::put_blob_signing_at),
+    /// which stores and claims at `federation`; an encrypted tier is
+    /// refused — persist seals those through `Engine::put_blob_scoped`, whose
+    /// claim is placed at the content's own scope (CIRISPersist#989).
     ///
     /// `cohort_scope` MUST be one of the closed-set values
     /// ([`cohort_scope::is_valid`](crate::federation::types::cohort_scope::is_valid));
@@ -3223,154 +3218,81 @@ pub trait BlobStorage: Send + Sync {
         Output = Result<crate::federation::identity_aggregate::ContentKemPrivate, BlobError>,
     > + Send;
 
-    /// List the `key_id`s of every **currently-live** attester that
-    /// has emitted a `holds_bytes:sha256:<prefix>` attestation for
-    /// this blob.
+    /// **The holder directory** (CC 5.3.2.1; v55.0.0 CIRISPersist#989, CC
+    /// 3.1.3.3): the `key_id` of every holder whose latest admitted
+    /// `custody:ack:v1` claim about this blob is `here` and LIVE — within
+    /// its 72-hour window (CC 3.1.3.3 rule 5). A holder's later `none`, or
+    /// its own `withdraws` / `recants` of the claim, folds it out (rule 4).
+    /// At `federation` these are the directory rows every node receives; a
+    /// bounded cohort's claims reach only its members, so a member's node
+    /// sees its cohort's holders and nobody else does.
     ///
-    /// Queries the `federation_attestations` table:
+    /// When this node holds the bytes itself, freshness is not asked
+    /// (v3.6.4, CIRISPersist#130): the window is a backstop for peers that
+    /// go silent.
     ///
-    /// 1. WHERE attestation_type = `holds_bytes:sha256:<8-hex-prefix>`
-    /// 2. AND evidence_refs (from the JSONB envelope) contains the
-    ///    full hex SHA (discriminates prefix collisions)
-    /// 3. AND `asserted_at + DEFAULT_HOLDS_BYTES_TTL > now` (the
-    ///    CEG §10.1.2 24-hour freshness window; expired holders are
-    ///    treated as stale per the spec)
-    /// 4. AND the attester has NOT emitted a `withdraws` structural
-    ///    composer against the holds_bytes attestation (CEG §10.1.2
-    ///    ContentMiss feedback loop — when a consumer fetches from a
-    ///    holder via the directory and the holder no longer has the
-    ///    blob, the consumer emits a `withdraws` against the stale
-    ///    `holds_bytes` row; the directory filters the row out
-    ///    before serving the next consumer)
-    ///
-    /// Returns an empty `Vec` when no live holders exist. The
-    /// substrate stores every holds_bytes row honestly (the audit
-    /// chain is complete); the freshness filter applies at read.
-    ///
-    /// # Default TTL
-    ///
-    /// [`DEFAULT_HOLDS_BYTES_TTL`] is the CEG §10.1.2 24-hour
-    /// default. Sovereign deployments override via their own
-    /// implementation if they need a different freshness window;
-    /// the trait's default behavior matches the spec.
+    /// One implementation for every backend:
+    /// [`list_holders_of`](crate::federation::holding_claim::list_holders_of).
+    /// The retired `holds_bytes` rows a node still holds are read by no fold.
     fn list_holders(
         &self,
         sha256: &[u8; 32],
     ) -> impl Future<Output = Result<Vec<String>, BlobError>> + Send;
 
-    /// v3.5.2 (CIRISPersist#130) — **local-truth** holder query.
+    /// v3.5.2 (CIRISPersist#130) — **local-truth** holder query: empty when
+    /// this node does not hold the bytes; otherwise every holder whose latest
+    /// claim about them is `here`, **whatever its age**. Retractions and a
+    /// later `none` still fold a holder out.
     ///
-    /// Returns the `key_id`s of every attester this engine has a
-    /// `holds_bytes:sha256:<prefix>` attestation for, **regardless of
-    /// the CEG §10.1.2 24-hour TTL window**. The bytes are locally
-    /// held (verified by checking `federation_blobs`); the attestations
-    /// are read directly from the substrate; `withdraws` is still the
-    /// active eviction signal.
-    ///
-    /// # Why this exists alongside `list_holders`
-    ///
-    /// [`list_holders`](BlobStorage::list_holders) answers the
-    /// **federation-discovery** question: "which peers _claim_ to hold
-    /// this blob right now, per CEG §10.1.2 freshness?" Stale claims
-    /// are dropped because peers may have gone silently offline.
-    ///
-    /// `list_local_holders` answers the **local-truth** question:
-    /// "I have the bytes in `federation_blobs`; which attestations
-    /// from this substrate's audit chain claim holdings of them?"
-    /// The bytes' presence is definitive proof — TTL is a backstop
-    /// for peers, not for our own ground truth.
-    ///
-    /// Both APIs honor `withdraws`: an explicit eviction signal is
-    /// honored regardless of TTL.
-    ///
-    /// # Filter discipline
-    ///
-    /// 1. If the blob is NOT in `federation_blobs`, returns `Vec::new()`
-    ///    immediately. The local-truth premise doesn't apply — for
-    ///    federation-discovery, use [`list_holders`].
-    /// 2. WHERE `attestation_type` matches the full
-    ///    `holds_bytes:sha256:<8-hex-prefix>` for this SHA.
-    /// 3. AND `evidence_refs` (from the envelope) contains the full
-    ///    hex SHA (discriminates prefix collisions).
-    /// 4. **No TTL filter.** Stale local attestations are admitted.
-    /// 5. AND the attester has NOT emitted a `withdraws` against the
-    ///    holds_bytes row's `attestation_id`.
-    ///
-    /// # Use case
-    ///
-    /// FEDERATION_SCALING_MODEL §9.1 "whose bytes do I hold?" — the
-    /// substrate-truth side of the identity-aware-storage property.
-    /// CIRISConformance fabric-tier consumes this for the §9 audit.
+    /// [`list_holders`](BlobStorage::list_holders) answers "which devices
+    /// claim to hold this right now"; this answers "I have the bytes — whose
+    /// claims name them". FEDERATION_SCALING_MODEL §9.1; CIRISConformance
+    /// fabric-tier consumes it. v55.0.0 — over `custody:ack:v1`
+    /// ([`list_local_holders_of`](crate::federation::holding_claim::list_local_holders_of)).
     fn list_local_holders(
         &self,
         sha256: &[u8; 32],
     ) -> impl Future<Output = Result<Vec<String>, BlobError>> + Send;
 
     /// v3.5.0 (CIRISPersist#125) — the **inverse** of
-    /// [`list_holders`](BlobStorage::list_holders): "whose bytes do I
-    /// hold for actor X?". Returns the full SHA-256 of every blob this
-    /// Engine has a currently-live `holds_bytes:sha256:*` attestation
-    /// for from `attesting_key_id`.
+    /// [`list_holders`](BlobStorage::list_holders): every blob whose latest
+    /// claim by `attesting_key_id` is a live `here` (v55.0.0: over
+    /// `custody:ack:v1`,
+    /// [`list_held_by_of`](crate::federation::holding_claim::list_held_by_of)).
+    /// Sorted. Empty when the holder has no live claims.
     ///
-    /// # Filter discipline (matches `list_holders`)
-    ///
-    /// 1. WHERE `attestation_type` starts with the
-    ///    [`HOLDS_BYTES_ATTESTATION_TYPE_PREFIX`].
-    /// 2. AND `attesting_key_id` equals the caller-supplied actor.
-    /// 3. AND the [`DEFAULT_HOLDS_BYTES_TTL`] freshness window has not
-    ///    lapsed (rows whose `asserted_at + TTL <= now` are stale and
-    ///    excluded — CEG §10.1.2 freshness window).
-    /// 4. AND the attester has not emitted a `withdraws` against the
-    ///    holds_bytes row's `attestation_id` (CEG §10.1.2 ContentMiss
-    ///    feedback loop).
-    ///
-    /// # FEDERATION_SCALING_MODEL §9 — identity-aware-storage
-    ///
-    /// The scaling model rests on the property "you know whose data
-    /// you are storing, and can evict their data at any time." This
-    /// method is the "whose bytes?" half of the proof: every actor's
-    /// holdings on this Engine are addressable.
-    ///
-    /// Returns an empty `Vec` when the actor has no live holdings.
+    /// FEDERATION_SCALING_MODEL §9 — identity-aware storage: every holder's
+    /// claims on this Engine are addressable.
     fn list_held_by(
         &self,
         attesting_key_id: &str,
     ) -> impl Future<Output = Result<Vec<[u8; 32]>, BlobError>> + Send;
 
-    /// v3.5.0 (CIRISPersist#125) — per-actor eviction. Delete every
-    /// `federation_blobs` row this Engine holds for `attesting_key_id`,
-    /// AND emit a `withdraws` structural composer against each of the
-    /// actor's `holds_bytes` attestations (CEG §10.1.2).
+    /// v3.5.0 (CIRISPersist#125) — per-actor eviction: delete every
+    /// `federation_blobs` row this Engine holds that `attesting_key_id`
+    /// claims `here` (any age), and retract `signer`'s OWN `here` claims about
+    /// each with its own `withdraws`, placed at the claim's scope.
     ///
-    /// # Mechanics
-    ///
-    /// 1. Resolve the actor's live holdings via [`list_held_by`].
-    /// 2. For each holding's `holds_bytes` attestation THIS signer signed
-    ///    (v55.0.0, CIRISPersist#1007: only the holder retracts its own
-    ///    claim, CC 3.1.3.3 rule 4; another key's claim is skipped and the
-    ///    door would refuse it): emit a
-    ///    `withdraws` attestation HYBRID-signed by `signer`
-    ///    (Ed25519 + ML-DSA-65), canonicalized via the CEG produce gate
-    ///    ([`crate::verify::canonical::ceg_produce_canonicalize`]) — the
-    ///    federation-tier ingest gate (CC 5.3.2.4.3.1) requires the PQC
-    ///    half, so a non-hybrid signer cannot emit a conformant withdraws.
-    /// 3. Delete the corresponding `federation_blobs` row keyed on the
-    ///    SHA the `holds_bytes` referenced.
+    /// v55.0.0 (CIRISPersist#989, CC 3.1.3.3 rule 4) — a holding claim is
+    /// retracted by its signer alone: when `attesting_key_id` is a peer, its
+    /// claims stand and only this node's copies and this node's claims go.
+    /// One implementation:
+    /// [`evict_actor_of`](crate::federation::holding_claim::evict_actor_of).
     ///
     /// # Fail-honest contract
     ///
-    /// The blob deletion proceeds even if the withdraws emission
-    /// fails — orphan withdraws is worse than a missing withdraws (the
-    /// same posture the v3.4.0 sweeper takes; CIRISPersist#123).
-    /// `withdraws_failed` counts the signer/FK failures so the caller
-    /// can detect the partial-failure path.
+    /// The blob deletion proceeds even if a retraction fails — orphan
+    /// withdraws is worse than a missing withdraws (CIRISPersist#123).
+    /// `withdraws_failed` counts the signer/FK failures so the caller can
+    /// detect the partial-failure path. The signer must hybrid-sign (CC
+    /// 5.3.2.4.3.1).
     ///
     /// # Race tolerance
     ///
-    /// Concurrent `put_blob` calls during eviction may leave newly
-    /// written rows untouched (the actor's holdings were captured at
-    /// step 1). Callers requiring strict completion re-invoke until
-    /// the report shows zero blobs evicted.
+    /// Concurrent `put_blob` calls during eviction may leave newly written
+    /// rows untouched (the holdings were captured first). Callers requiring
+    /// strict completion re-invoke until the report shows zero blobs
+    /// evicted.
     ///
     /// Returns an [`EvictActorReport`] tallying the work done.
     fn evict_actor<'s>(
@@ -3744,11 +3666,11 @@ pub trait BlobStorage: Send + Sync {
     ///
     /// This is the destructive half of the sweep and it is deliberately
     /// narrow: it removes this node's bytes and the epoch binding, after
-    /// emitting a `withdraws` for each `holds_bytes` this node announced
-    /// **under its own signing key** (§11.5). An announcement made under some
-    /// other attesting key — the FFI's `put_blob_signing` lets a caller name
-    /// one — is that key's holder's to retract; this node cannot sign a
-    /// withdraws for it and does not pretend to. It does
+    /// emitting a `withdraws` for each holding claim this node made
+    /// **under its own signing key** (§11.5; v55.0.0: `custody:ack:v1`, placed
+    /// at the claim's own scope). A claim by any other key is that holder's to
+    /// retract (CC 3.1.3.3 rule 4); this node cannot sign a withdraws for it
+    /// and does not pretend to. It does
     /// **not** recall copies already fountained to peers — rotation is not
     /// recall (§10.6), and the mechanism that reaches other holders is the
     /// tombstone plane, not this call. A caller that treats this as erasure
@@ -3898,7 +3820,7 @@ pub trait BlobStorage: Send + Sync {
 /// v47.2.0 (CIRISPersist#862) — what [`Engine::evict_blob`](crate::Engine::evict_blob) did for one sha.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EvictBlobReport {
-    /// This node's `holds_bytes` claims retracted (a `withdraws` each).
+    /// This node's holding claims retracted (a `withdraws` each).
     pub withdraws_emitted: usize,
     /// Whether a blob row was deleted (false: nothing was held).
     pub blob_deleted: bool,
@@ -3915,13 +3837,9 @@ pub struct EvictBlobReport {
 /// actually deleted from `federation_blobs`; `withdraws_emitted` and
 /// `withdraws_failed` count the per-row `withdraws` attestation
 /// outcomes independently. `withdraws_emitted + withdraws_failed`
-/// equals the number of `holds_bytes` rows targeted for withdrawal.
-/// `blobs_evicted` can exceed both because a holds_bytes row whose
-/// blob is already gone still counts as no-op on the delete side; in
-/// practice for this method the two numbers are tied by construction
-/// (every targeted holdings entry is deleted), so the report's
-/// invariant is `blobs_evicted == withdraws_emitted + withdraws_failed`
-/// when no concurrent deletions race with the call.
+/// equals the number of this node's own holding claims targeted for
+/// retraction (v55.0.0: zero when the actor is a peer — CC 3.1.3.3 rule
+/// 4), and `blobs_evicted` the rows deleted.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EvictActorReport {
     /// Number of `federation_blobs` rows actually deleted by this call.
@@ -3934,14 +3852,17 @@ pub struct EvictActorReport {
     pub withdraws_failed: usize,
 }
 
-/// Caller-supplied envelope for the holder attestation emitted by
-/// [`BlobStorage::put_blob`].
+/// Caller-supplied signed components of the holding claim a blob door
+/// stores: [`BlobStorage::put_blob`], `put_blob_with_scope`,
+/// `adopt_sealed_blob_at` and [`BlobStorage::put_holding_claim`].
 ///
-/// Persist auto-emits a `holds_bytes:sha256:<prefix>` attestation on
-/// every successful `put_blob`. The attestation requires the same
-/// scrub-signature fields as any other federation attestation (V004
-/// schema NOT NULL columns) — the caller pre-signs the envelope and
-/// hands persist the components.
+/// v55.0.0 (CIRISPersist#989) — the claim is `custody:ack:v1` `here`
+/// ([`holding_claim_row`](crate::federation::holding_claim::holding_claim_row)),
+/// placed at the content's scope, which the door derives from the content it
+/// stores; the caller signs the row that builder produces for the same inputs
+/// ([`sign_holding_claim`](crate::federation::holding_claim::sign_holding_claim)
+/// does it for a `LocalSigner`), and the door rebuilds it and checks the
+/// caller's hash covers it.
 #[derive(Debug, Clone)]
 pub struct PutBlobAttestation {
     /// `attesting_key_id` for the holder attestation. The
@@ -3985,8 +3906,9 @@ pub struct PutBlobAttestation {
     /// its key.
     ///
     /// Truncated to the substrate resolution when the envelope is stamped (see
-    /// [`holds_bytes_attestation_row`]), so a caller passing `Utc::now()`
-    /// verbatim is correct rather than refused.
+    /// [`holding_claim_row`](crate::federation::holding_claim::holding_claim_row)),
+    /// so a caller passing `Utc::now()` verbatim is correct rather than
+    /// refused.
     pub asserted_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -4076,164 +3998,6 @@ pub fn check_announcing_signer(
         )));
     }
     Ok(())
-}
-
-/// #846 (`BLOB_REPLICATION.md` §6.1) — sign the `holds_bytes` claim for
-/// `sha256`, exactly as [`BlobStorage::put_blob_signing_at`] does: the
-/// v31-shaped envelope, the produce-side canonicalizer, the signer's DERIVED
-/// key id as `scrub_key_id` (I23). One function, so the signing door and the
-/// adopt door cannot drift on what a holder claim is.
-///
-/// **HYBRID/PQC ONLY — no legacy fallback** (operator ruling, #851 §20.5).
-/// The claim is FEDERATION-tier: the cursor serves it and every peer's ingest
-/// gate demands the hybrid form (CC 5.3.2.4.3.1), so it is signed by `local`
-/// — this node's PQC `LocalSigner` — and by nothing else. There is no
-/// classical path: a `LocalSigner` that is not the claimed attester, or that
-/// has no ML-DSA-65 half, REFUSES here rather than producing a claim no peer
-/// will admit.
-pub async fn sign_holds_bytes_claim(
-    local: &crate::signing::LocalSigner,
-    sha256: &[u8; 32],
-    attesting_key_id: &str,
-    attestation_id: uuid::Uuid,
-    now: chrono::DateTime<chrono::Utc>,
-    size: u64,
-) -> Result<PutBlobAttestation, BlobError> {
-    use base64::engine::general_purpose::STANDARD as B64;
-    use base64::Engine as _;
-    use sha2::{Digest, Sha256};
-
-    if attesting_key_id.is_empty() {
-        return Err(BlobError::InvalidArgument(
-            "attesting_key_id is empty".into(),
-        ));
-    }
-    // The signer IS the claimed attester: an Engine whose composed `signer`
-    // and `local_signer` are different identities (`from_shared_with_local`)
-    // must not announce a row signed by one key and attributed to another —
-    // every peer verifies the signature against `attesting_key_id`.
-    let derived = local.derived_key_id();
-    if derived != attesting_key_id {
-        return Err(BlobError::AttestationEmissionFailed(format!(
-            "hybrid-only: the LocalSigner ({derived}) is not the claimed attester \
-             ({attesting_key_id}); a holds_bytes claim is signed by the attester itself \
-             (CIRISPersist#851 §20.5 / CC 5.3.2.4.3.1)"
-        )));
-    }
-    // v31.0.0 (CIRISPersist#652) — the v31-SHAPED envelope: the #598
-    // instants and the #643 mirror ride the bytes this signer is about
-    // to sign. `put_blob` rebuilds these exact bytes from the same
-    // four inputs, so persist still verifies the caller signed the row
-    // it is storing. `now` is BOTH instants here because the signing
-    // helper mints the claim and signs it in one motion — a caller
-    // that wants to assert an older claim uses `put_blob` directly and
-    // states `asserted_at` itself.
-    if size == 0 {
-        return Err(BlobError::InvalidArgument(
-            "holds_bytes claim: size must be the positive byte length of the blob \
-             (CC 5.3.2.5: every blob carries its size, checked first)"
-                .into(),
-        ));
-    }
-    let envelope = holds_bytes_attestation_envelope(
-        sha256,
-        attesting_key_id,
-        &attestation_id.to_string(),
-        now,
-        size,
-    );
-    // v4.6 (#176) — produce-side gate (Python pre-cut, JCS post-cut).
-    let canonical_bytes =
-        crate::verify::canonical::ceg_produce_canonicalize(&envelope).map_err(|e| {
-            BlobError::InvalidArgument(format!("canonicalize holds_bytes envelope: {e}"))
-        })?;
-    let original_content_hash_hex = hex::encode(Sha256::digest(&canonical_bytes));
-
-    // Both halves, the way `attestation_emit::assemble` does it: the classical
-    // half is the hybrid's classical half, the PQC half rides
-    // `scrub_signature_pqc`, and `scrub_key_id` is the derived id (#247 — the
-    // FK target is the wire key_id, never the keystore alias).
-    let sig = local.sign_hybrid(&canonical_bytes).await.map_err(|e| {
-        BlobError::AttestationEmissionFailed(match e {
-            crate::signing::LocalSignerError::PqcNotConfigured => format!(
-                "hybrid-only: {attesting_key_id} has no ML-DSA-65 key, so it cannot sign a \
-                 federation-tier holds_bytes claim; a classical-only producer does not \
-                 announce (CIRISPersist#851 §20.5 / CC 5.3.2.4.3.1)"
-            ),
-            other => format!("sign_hybrid: {other}"),
-        })
-    })?;
-
-    Ok(PutBlobAttestation {
-        attesting_key_id: attesting_key_id.to_string(),
-        attestation_id: attestation_id.to_string(),
-        size,
-        original_content_hash_hex,
-        scrub_signature_classical: B64.encode(&sig.classical.signature),
-        scrub_signature_pqc: Some(B64.encode(&sig.pqc.signature)),
-        scrub_key_id: derived,
-        scrub_timestamp: now,
-        asserted_at: now,
-    })
-}
-
-/// #846 — a `holds_bytes` row a backend inserts verbatim: the admitted
-/// [`Attestation`](crate::federation::Attestation) plus the two serialized
-/// columns both dialects store beside it. Built by
-/// [`prepare_holds_bytes_row`], which runs the same admission check the
-/// `put_blob` door runs, so the adopt floor's announce is admitted on the
-/// same terms as every other holder claim.
-#[derive(Debug, Clone)]
-pub struct PreparedHoldsBytes {
-    /// The admitted row, every column populated.
-    pub row: crate::federation::Attestation,
-    /// `attestation_envelope` as stored (JSON text).
-    pub envelope_text: String,
-    /// `original_content_hash` decoded from the caller's hex.
-    pub original_content_hash: Vec<u8>,
-}
-
-/// #846 — rebuild and ADMIT the `holds_bytes` row for `sha256` from the
-/// caller's signed components (the `put_blob` door's own steps: rebuild the
-/// envelope from the row identity, verify the caller signed those bytes,
-/// stamp the row hash). Refuses exactly what `put_blob` refuses.
-// The admission check it runs exists only with a backend (a witness module
-// that calls plumbing carries the backend cfg; this helper is that plumbing).
-#[cfg(any(feature = "postgres", feature = "sqlite"))]
-pub(crate) fn prepare_holds_bytes_row(
-    sha256: &[u8; 32],
-    attestation: &PutBlobAttestation,
-) -> Result<PreparedHoldsBytes, BlobError> {
-    let original_content_hash =
-        hex::decode(&attestation.original_content_hash_hex).map_err(|e| {
-            BlobError::InvalidArgument(format!("original_content_hash hex decode: {e}"))
-        })?;
-    let mut row = holds_bytes_attestation_row(
-        sha256,
-        &attestation.attesting_key_id,
-        &attestation.attestation_id,
-        attestation.asserted_at,
-        attestation.size,
-    );
-    row.original_content_hash = attestation.original_content_hash_hex.clone();
-    row.scrub_signature_classical = attestation.scrub_signature_classical.clone();
-    row.scrub_signature_pqc = attestation.scrub_signature_pqc.clone();
-    row.scrub_key_id = attestation.scrub_key_id.clone();
-    row.scrub_timestamp = attestation.scrub_timestamp;
-    check_put_blob_admission(
-        &row,
-        &attestation.original_content_hash_hex,
-        chrono::Utc::now(),
-    )?;
-    row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)
-        .map_err(|e| BlobError::Backend(format!("persist_row_hash: {e}")))?;
-    let envelope_text = serde_json::to_string(&row.attestation_envelope)
-        .map_err(|e| BlobError::Backend(format!("envelope serialize: {e}")))?;
-    Ok(PreparedHoldsBytes {
-        row,
-        envelope_text,
-        original_content_hash,
-    })
 }
 
 /// v2.3 (CIRISPersist#103) — typed errors from the [`BlobStorage`] trait.
@@ -4566,155 +4330,11 @@ impl BlobError {
     }
 }
 
-/// v2.3 (CIRISPersist#103) — compute the `holds_bytes:sha256:<prefix>`
-/// attestation_type string for the given full SHA-256.
-pub fn holds_bytes_attestation_type(sha256: &[u8; 32]) -> String {
-    let full_hex = hex::encode(sha256);
-    debug_assert!(full_hex.len() >= HOLDS_BYTES_PREFIX_HEX_LEN);
-    format!(
-        "{}{}",
-        HOLDS_BYTES_ATTESTATION_TYPE_PREFIX,
-        &full_hex[..HOLDS_BYTES_PREFIX_HEX_LEN]
-    )
-}
-
-/// v2.3 (CIRISPersist#103) — the canonical `attestation_envelope` JSON for a
-/// `holds_bytes` attestation.
-///
-/// Base shape, before the v31 bindings below are stamped onto it:
-///
-/// ```json
-/// {
-///   "kind": "holds_bytes",
-///   "evidence_refs": ["<full-hex-sha256>"]
-/// }
-/// ```
-///
-/// # v31.0.0 (CIRISPersist#652) — why this takes the row, not just the SHA
-///
-/// It used to take `sha256` alone, and that was the whole defect. The
-/// `put_blob` door RECONSTRUCTS this envelope rather than storing the
-/// caller's, so the envelope must be a pure function of things persist also
-/// knows — which is what kept it to the SHA, and which is exactly why it could
-/// carry neither the #598 instants nor the #643 mirror. Both bind ROW fields.
-///
-/// So the row's identity is threaded in instead. Determinism — the property
-/// the whole door rests on — is preserved, because every remaining bound field
-/// is fixed BY CONSTRUCTION at this door: `attested_key_id` is the attester (a
-/// holder attests itself), `attestation_type` is
-/// [`holds_bytes_attestation_type`] of the same SHA, `subject_key_ids` is
-/// empty, `cohort_scope` is `federation`, and `weight` / `expires_at` are
-/// `None`. Persist can still rebuild these exact bytes and therefore still
-/// verify that the caller signed the row it is actually storing. The rule is
-/// unchanged — **the party that MINTS the bytes stamps, the party that
-/// RECEIVES them checks** — it simply runs over a bigger input.
-#[must_use]
-pub fn holds_bytes_attestation_envelope(
-    sha256: &[u8; 32],
-    attesting_key_id: &str,
-    attestation_id: &str,
-    asserted_at: chrono::DateTime<chrono::Utc>,
-    size: u64,
-) -> serde_json::Value {
-    holds_bytes_attestation_row(sha256, attesting_key_id, attestation_id, asserted_at, size)
-        .attestation_envelope
-}
-
-/// v31.0.0 (CIRISPersist#652) — **the ONE definition of a `holds_bytes` row**,
-/// v31-shaped and ready to sign, with the scrub fields left empty for whoever
-/// fills them.
-///
-/// # What was open
-///
-/// `put_blob` raw-INSERTed straight into `federation_attestations`, bypassing
-/// `put_attestation` and therefore BOTH binding gates. Three consequences, and
-/// the third is the one that bites:
-///
-/// 1. the envelope was `{"kind","evidence_refs"}` — no #598 instants, no #643
-///    mirror, so every field that decides what the row MEANS was unsigned;
-/// 2. `asserted_at` was populated from `scrub_timestamp` — *when the signature
-///    was made* standing in for *when the claim was asserted*, two different
-///    facts sharing one column;
-/// 3. the `tier` column was **omitted from the INSERT entirely**, so it took
-///    the schema default `'federation'` — and `list_attestations_since`
-///    filters on exactly that tier. **The tier nobody chose is the tier that
-///    replicates.** So these rows went out to every peer, and every peer's
-///    `put_attestation` refused them, because they were minted through a door
-///    that never asked what the peers ask.
-///
-/// # Shape
-///
-/// Returns the row with `original_content_hash` / `scrub_signature_*` /
-/// `scrub_key_id` / `persist_row_hash` blank. The signing side
-/// ([`BlobStorage::put_blob_signing`]) canonicalizes
-/// `attestation_envelope`, signs, and fills them; the receiving side
-/// (`put_blob`) rebuilds the identical row and copies the caller's values in.
-/// One definition, so the bytes the caller signed and the bytes persist stores
-/// cannot drift — which is the #649/#643 defect class, and the reason this is
-/// a function and not two struct literals in two backends.
-///
-/// Infallible by construction: the mirror stamp fails only on a non-finite
-/// `weight` (always `None` here) and the instant stamp only on a non-object
-/// envelope (built as an object one line above).
-#[must_use]
-///
-/// v45.0.0 (CIRISPersist#871, `FSD/MEDIA_SOURCE.md` §4) — the envelope
-/// carries **`size`**, the blob's byte length, bound into the signed bytes:
-/// CC 5.3.2.5 makes every blob carry its size and every consumer check it
-/// BEFORE hashing; a puller that only holds this claim needs the number
-/// here. Both blob doors pass the length they store and refuse a claim that
-/// declares another (AV-89); the ingest door refuses a claim without one.
-pub fn holds_bytes_attestation_row(
-    sha256: &[u8; 32],
-    attesting_key_id: &str,
-    attestation_id: &str,
-    asserted_at: chrono::DateTime<chrono::Utc>,
-    size: u64,
-) -> crate::federation::Attestation {
-    let mut row = crate::federation::Attestation {
-        attestation_id: attestation_id.to_owned(),
-        attesting_key_id: attesting_key_id.to_owned(),
-        // A holder attestation attests the HOLDER ITSELF — "I (key_id=X) hold
-        // the bytes". No second key is involved.
-        attested_key_id: attesting_key_id.to_owned(),
-        attestation_type: holds_bytes_attestation_type(sha256),
-        weight: None,
-        asserted_at,
-        expires_at: None,
-        attestation_envelope: serde_json::json!({
-            "kind": "holds_bytes",
-            "evidence_refs": [hex::encode(sha256)],
-            "size": size,
-        }),
-        original_content_hash: String::new(),
-        scrub_signature_classical: String::new(),
-        scrub_signature_pqc: None,
-        scrub_key_id: String::new(),
-        scrub_timestamp: asserted_at,
-        pqc_completed_at: None,
-        persist_row_hash: String::new(),
-        // v3.7.0 (CIRISPersist#146, CEG 0.6) — holds_bytes is a
-        // self-attestation; subject-side authority does not apply.
-        subject_key_ids: Vec::new(),
-        withdraws_admission_rule: None,
-        cohort_scope: crate::federation::types::cohort_scope::FEDERATION.to_owned(),
-        // v31.0.0 (CIRISPersist#652) — STATED, not defaulted. Both backends
-        // omitted this column from the INSERT and inherited the schema default,
-        // which happens to be the tier `list_attestations_since` serves.
-        tier: crate::federation::types::attestation_tier::FEDERATION.to_owned(),
-        promoted_at: None,
-        additional_scrubs: Vec::new(),
-    };
-    crate::federation::envelope::stamp_signed_instants(&mut row)
-        .expect("the holds_bytes envelope is built as an object one line above");
-    crate::federation::envelope::RowMirror::stamp_row(&mut row)
-        .expect("a holds_bytes row carries no weight, so the mirror cannot fail");
-    row
-}
-
 /// v31.0.0 (CIRISPersist#656) — **the `put_blob` door's admission gate**, run
-/// by both backends on the row [`holds_bytes_attestation_row`] just rebuilt,
-/// before anything is written.
+/// on the holding-claim row
+/// [`prepare_holding_claim_row`](crate::federation::holding_claim::prepare_holding_claim_row)
+/// just rebuilt (v55.0.0, CIRISPersist#989; the `holds_bytes` row before
+/// it), before anything is written.
 ///
 /// # What #652 left open
 ///
@@ -4739,7 +4359,8 @@ pub fn holds_bytes_attestation_row(
 ///    an envelope it reconstructed itself, and nothing checked that the two
 ///    describe the same thing. The reconstruction being deterministic is
 ///    exactly what makes the cross-check possible — it is the property
-///    [`holds_bytes_attestation_row`]'s doc rests its *"the party that MINTS
+///    [`holding_claim_row`](crate::federation::holding_claim::holding_claim_row)'s
+///    doc rests its *"the party that MINTS
 ///    the bytes stamps, the party that RECEIVES them checks"* claim on — so it
 ///    is used here rather than assumed. A signature over a different envelope
 ///    than the one stored is the #649 divergence with the halves swapped.
@@ -4780,6 +4401,35 @@ pub(crate) fn check_put_blob_admission(
     Ok(())
 }
 
+/// v55.0.0 (CIRISPersist#989) — the holding-claim envelope `put_blob` (the
+/// commons door) rebuilds for these inputs: the test twin of the retired
+/// `holds_bytes_attestation_envelope`, through the one builder.
+#[cfg(all(test, any(feature = "postgres", feature = "sqlite")))]
+pub(crate) fn commons_claim_envelope(
+    sha256: &[u8; 32],
+    holder: &str,
+    attestation_id: &str,
+    asserted_at: chrono::DateTime<chrono::Utc>,
+    size: u64,
+) -> serde_json::Value {
+    let scope = crate::federation::holding_claim::ClaimScope::of_content(
+        crate::federation::types::cohort_scope::CryptoTier::Plaintext,
+        crate::federation::types::cohort_scope::FEDERATION,
+        None,
+    )
+    .expect("the commons claim scope");
+    crate::federation::holding_claim::holding_claim_row(
+        sha256,
+        holder,
+        attestation_id,
+        asserted_at,
+        size,
+        &scope,
+    )
+    .expect("a sized holding claim")
+    .attestation_envelope
+}
+
 /// v31.0.0 (CIRISPersist#656) — **a `PutBlobAttestation` whose declared
 /// content hash actually covers the envelope `put_blob` will rebuild.**
 ///
@@ -4790,8 +4440,9 @@ pub(crate) fn check_put_blob_admission(
 /// the fixtures asserted the door's behaviour on rows whose declared hash
 /// covered nothing, so no test could tell a correct hash from an absent one.
 /// This mints the hash the way [`BlobStorage::put_blob_signing`] does — from
-/// [`holds_bytes_attestation_envelope`] over the same four inputs — so the
-/// fixtures now exercise the shape production actually produces.
+/// [`holding_claim_row`](crate::federation::holding_claim::holding_claim_row)
+/// over the same inputs, at the commons claim scope `put_blob` derives — so
+/// the fixtures exercise the shape production actually produces.
 ///
 /// The signature stays a placeholder: `put_blob` does not verify signatures
 /// (see [`check_put_blob_admission`] for what it does check), and pretending
@@ -4807,15 +4458,10 @@ pub(crate) fn sealed_put_blob_attestation(
     size: u64,
 ) -> PutBlobAttestation {
     use sha2::{Digest, Sha256};
-    let envelope = holds_bytes_attestation_envelope(
-        sha256,
-        attesting_key_id,
-        attestation_id,
-        asserted_at,
-        size,
-    );
+    let envelope =
+        commons_claim_envelope(sha256, attesting_key_id, attestation_id, asserted_at, size);
     let canonical = crate::verify::canonical::ceg_produce_canonicalize(&envelope)
-        .expect("the holds_bytes envelope canonicalizes");
+        .expect("the holding claim envelope canonicalizes");
     PutBlobAttestation {
         attesting_key_id: attesting_key_id.to_owned(),
         attestation_id: attestation_id.to_owned(),
@@ -4975,12 +4621,13 @@ where
 /// withdraws-emission triple (build envelope → canonicalize via
 /// production canonicalizer → sign → put_attestation) into a single
 /// shared helper. Used by [`BlobStorage::evict_actor`] across both
-/// backends, and intended for reuse by future surfaces that need to
-/// emit a `withdraws` attestation against a prior `holds_bytes`.
+/// backends, and by every surface that retracts this node's own holding
+/// claim (v55.0.0: `custody:ack:v1`, CIRISPersist#989 — placed at the
+/// claim's own scope).
 ///
 /// # Inputs
 ///
-/// - `prior` — the holds_bytes attestation being withdrawn. Its
+/// - `prior` — the attestation being withdrawn (this node's own). Its
 ///   `attestation_id` + `attestation_type` are recorded on the
 ///   withdraws envelope so consumers can walk the structural-composer
 ///   reference back to the row being retracted.
@@ -5035,10 +4682,30 @@ pub(crate) async fn emit_withdraws_attestation_helper(
     // attests it itself no longer holds the bytes (a self-revocation).
     let signer_key_id = signer.derived_key_id();
 
-    let envelope = crate::federation::withdraws_attestation_envelope(
+    let mut envelope = crate::federation::withdraws_attestation_envelope(
         &prior.attestation_id,
         &prior.attestation_type,
     );
+    // v55.0.0 (CIRISPersist#989, CC 3.1.3.3) — a holding claim is placed at
+    // its content's scope, and the retraction goes where the claim went: the
+    // same cohort and target, so a bounded cohort's custody facts never reach
+    // `federation` by way of their retraction.
+    let placement = if crate::federation::custody_ack::is_custody_row(prior) {
+        let target =
+            crate::federation::admission::envelope_cohort_target(&prior.attestation_envelope)
+                .map_err(|e| BlobError::Backend(format!("withdraws placement: {e}")))?;
+        if let (Some(t), Some(obj)) = (target, envelope.as_object_mut()) {
+            let key = if prior.cohort_scope == crate::federation::types::cohort_scope::FAMILY {
+                "family_key_id"
+            } else {
+                "community_id"
+            };
+            obj.insert(key.to_owned(), serde_json::Value::String(t.to_owned()));
+        }
+        prior.cohort_scope.clone()
+    } else {
+        crate::federation::types::cohort_scope::FEDERATION.to_owned()
+    };
     // v31.0.0 (#643/#598) — the row is ASSEMBLED FIRST, then stamped, then
     // signed. This helper hand-rolls the emit recipe (it predates
     // `attestation_emit`), and the two bindings are both over material the
@@ -5074,7 +4741,7 @@ pub(crate) async fn emit_withdraws_attestation_helper(
         // (rule 2/3) doesn't apply on this path.
         subject_key_ids: Vec::new(),
         withdraws_admission_rule: None,
-        cohort_scope: "federation".to_string(),
+        cohort_scope: placement,
         tier: crate::federation::types::attestation_tier::FEDERATION.to_string(),
         promoted_at: None,
         additional_scrubs: Vec::new(),
@@ -5836,7 +5503,7 @@ mod put_blob_binding_tests {
     /// `put_blob` skips.**
     ///
     /// `put_blob` raw-INSERTs into `federation_attestations`, so neither
-    /// binding gate ever ran on a `holds_bytes` row. Combined with the `tier`
+    /// binding gate ever ran on its holder claim. Combined with the `tier`
     /// column being omitted from that INSERT — taking the schema default
     /// `'federation'`, which is exactly what `list_attestations_since` serves
     /// — every blob announcement replicated to every peer and every peer
@@ -5873,7 +5540,7 @@ mod put_blob_binding_tests {
         );
         let scrub_timestamp =
             crate::federation::admission::truncate_to_substrate_resolution(chrono::Utc::now());
-        let envelope = holds_bytes_attestation_envelope(
+        let envelope = commons_claim_envelope(
             &sha,
             holder,
             &attestation_id,
@@ -5913,7 +5580,7 @@ mod put_blob_binding_tests {
             .get_attestation(&attestation_id)
             .await
             .expect("read back")
-            .expect("#652: the holds_bytes row was written");
+            .expect("#652: the holding claim was written");
 
         // (1) THE TWO GATES `put_blob` NEVER ASKED.
         crate::federation::admission::check_instant_binding(
@@ -5921,9 +5588,9 @@ mod put_blob_binding_tests {
             chrono::Utc::now(),
             crate::federation::admission::DEFAULT_MAX_TOUCH_SKEW,
         )
-        .expect("#652/#598: the stored holds_bytes row must carry its signed instants");
+        .expect("#652/#598: the stored holding claim must carry its signed instants");
         crate::federation::admission::check_row_column_binding(&stored)
-            .expect("#652/#643: the stored holds_bytes row must carry its typed-column mirror");
+            .expect("#652/#643: the stored holding claim must carry its typed-column mirror");
 
         // (2) `asserted_at` IS THE CLAIM'S INSTANT, not the signature's.
         assert_eq!(
@@ -5982,7 +5649,7 @@ mod put_blob_binding_tests {
         .await
         .unwrap_or_else(|e| {
             panic!(
-                "#652: a `holds_bytes` row is federation-tier and therefore REPLICATES — \
+                "#652: a commons holding claim is federation-scoped and therefore REPLICATES — \
                  `list_attestations_since` serves exactly this tier. A row every peer refuses \
                  is a blob announcement that announces nothing. Refusal: {e}"
             )
@@ -5995,7 +5662,7 @@ mod put_blob_binding_tests {
 ///
 /// `cohort_scope` was omitted from the `federation_attestations` column list on
 /// BOTH SQL backends and took the V056 schema default `'federation'`. That
-/// happened to equal what [`holds_bytes_attestation_row`] puts in the row the
+/// happened to equal what the claim builder puts in the row the
 /// `persist_row_hash` is computed over — and, since #643, what the signed `row`
 /// MIRROR inside the envelope declares. Two values agreeing because nobody chose
 /// either is not a binding: change the builder or the schema default and the
@@ -6028,7 +5695,7 @@ where
     let attestation_id = uuid::Uuid::new_v4().to_string();
     let asserted_at =
         crate::federation::admission::truncate_to_substrate_resolution(chrono::Utc::now());
-    let envelope = holds_bytes_attestation_envelope(
+    let envelope = commons_claim_envelope(
         &sha,
         &holder,
         &attestation_id,
@@ -6060,14 +5727,14 @@ where
     let stored = crate::federation::FederationDirectory::get_attestation(be, &attestation_id)
         .await
         .expect("read back")
-        .unwrap_or_else(|| panic!("[{tag}] the holds_bytes row must have been written"));
+        .unwrap_or_else(|| panic!("[{tag}] the holding claim must have been written"));
 
     // THE ASSERTION WITH TEETH: the stored columns must match the signed mirror.
     // An INSERT that omits `cohort_scope` and lets the default fill it in reds
     // here the moment the builder and the default stop coinciding.
     crate::federation::admission::check_row_column_binding(&stored).unwrap_or_else(|e| {
         panic!(
-            "[{tag}] the STORED holds_bytes row must satisfy the #643 column binding — a \
+            "[{tag}] the STORED holding claim must satisfy the #643 column binding — a \
              column the INSERT never named cannot be one the signature covers: {e}"
         )
     });
@@ -6094,44 +5761,44 @@ mod tests {
         assert_eq!(MAX_CHUNKS_PER_EPOCH, 16_777_216);
     }
 
+    /// v55.0.0 (CIRISPersist#989) — the commons holding claim's envelope: a
+    /// `custody:ack:v1` `here` report citing the full digest, with the two
+    /// bindings the `put_blob` door relies on, and a pure function of its
+    /// inputs (the door rebuilds it).
     #[test]
-    fn holds_bytes_prefix_shape() {
-        let sha = [0xab_u8; 32];
-        let kind = holds_bytes_attestation_type(&sha);
-        assert_eq!(kind, "holds_bytes:sha256:abababab");
-        assert_eq!(
-            kind.len(),
-            HOLDS_BYTES_ATTESTATION_TYPE_PREFIX.len() + HOLDS_BYTES_PREFIX_HEX_LEN
-        );
-    }
-
-    #[test]
-    fn holds_bytes_envelope_shape() {
+    fn holding_claim_envelope_shape() {
         let sha = [0x42_u8; 32];
         let at: chrono::DateTime<chrono::Utc> = "2026-05-01T00:00:00Z".parse().unwrap();
-        let env = holds_bytes_attestation_envelope(&sha, "k-holder", "att-1", at, 7);
-        assert_eq!(env["kind"], "holds_bytes");
-        let refs = env["evidence_refs"].as_array().unwrap();
+        let scope = crate::federation::holding_claim::ClaimScope::of_content(
+            crate::federation::types::cohort_scope::CryptoTier::Plaintext,
+            "federation",
+            None,
+        )
+        .unwrap();
+        let env = |id: &str| {
+            crate::federation::holding_claim::holding_claim_row(&sha, "k-holder", id, at, 7, &scope)
+                .unwrap()
+                .attestation_envelope
+        };
+        let e = env("att-1");
+        assert_eq!(e["dimension"], "custody:ack:v1");
+        assert_eq!(e["custody_state"], "here");
+        let refs = e["evidence_refs"].as_array().unwrap();
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0], hex::encode(sha));
-
-        // v31.0.0 (CIRISPersist#652) — and the two BINDINGS, which is the
-        // whole point of the widened signature. Without them `put_blob`
-        // minted federation-tier rows that no peer's `put_attestation` would
-        // accept, through a door that never asked what the peers ask.
         assert_eq!(
-            env[crate::federation::envelope::paths::ASSERTED_AT],
+            e[crate::federation::envelope::paths::ASSERTED_AT],
             serde_json::json!(crate::federation::admission::render_signed_instant(at)),
-            "#598: the holder's assertion instant rides the SIGNED bytes — and v39.0.0 renders \
-             every MINTED instant as CC 2.6.2 `.sssZ`"
+            "#598: the holder's assertion instant rides the SIGNED bytes"
         );
-        assert!(
-            env.get(crate::federation::envelope::paths::EXPIRES_AT)
-                .is_none(),
-            "#598: a holder claim carries no expiry, and the binding is \
-             both-directions, so the key must be ABSENT rather than null"
+        assert_eq!(
+            e[crate::federation::envelope::paths::EXPIRES_AT],
+            serde_json::json!(crate::federation::admission::render_signed_instant(
+                at + chrono::Duration::hours(72)
+            )),
+            "CC 3.1.3.3 rule 5: freshness is the row's — the 72 h window, signed"
         );
-        let mirror = &env[crate::federation::envelope::paths::ROW];
+        let mirror = &e[crate::federation::envelope::paths::ROW];
         use crate::federation::envelope::row_paths as rp;
         assert_eq!(mirror[rp::ATTESTATION_ID], "att-1");
         assert_eq!(mirror[rp::ATTESTING_KEY_ID], "k-holder");
@@ -6140,20 +5807,12 @@ mod tests {
             "k-holder",
             "#643: a holder attests ITSELF — 'I hold the bytes'"
         );
-        assert_eq!(
-            mirror[rp::ATTESTATION_TYPE],
-            holds_bytes_attestation_type(&sha)
-        );
+        assert_eq!(mirror[rp::ATTESTATION_TYPE], "scores");
         assert_eq!(mirror[rp::COHORT_SCOPE], "federation");
-
-        // DETERMINISM — the property the `put_blob` door rests on. Persist
-        // reconstructs this envelope rather than storing the caller's, so the
-        // same four inputs must give byte-identical bytes or the caller's
-        // signature covers something else.
         assert_eq!(
-            env,
-            holds_bytes_attestation_envelope(&sha, "k-holder", "att-1", at, 7),
-            "the envelope must be a PURE function of its five inputs"
+            e,
+            env("att-1"),
+            "the envelope must be a PURE function of its inputs"
         );
     }
 
@@ -6600,7 +6259,8 @@ mod tests {
     /// v3.3.0 (CIRISPersist#121) — **canonicalizer identity** pin.
     ///
     /// The `put_blob_signing` default impl MUST canonicalize the
-    /// holds_bytes envelope via the production
+    /// holding-claim envelope (v55.0.0: `custody:ack:v1`; `holds_bytes`
+    /// before) via the production
     /// `PythonJsonDumpsCanonicalizer`. This test pins identity by
     /// computing the expected `original_content_hash_hex` directly
     /// from the Python-compat canonical bytes; the round-trip tests
@@ -6609,28 +6269,39 @@ mod tests {
     /// `federation_attestations.original_content_hash` column matches
     /// this expected value byte-for-byte.
     ///
-    /// **Why this isn't a divergence test**: the `holds_bytes`
-    /// envelope shape is `{"kind": "holds_bytes", "evidence_refs":
-    /// ["<hex>"]}` — ASCII-only keys, ASCII-only values, no floats.
+    /// **Why this isn't a divergence test**: the claim envelope is
+    /// ASCII-only keys and values; its two floats (`score`/`confidence`,
+    /// 1.0) are the custody leaf's own and canonicalize through the CEG
+    /// produce gate like every custody report.
     /// For ASCII-only payloads `PythonJsonDumpsCanonicalizer` and
     /// `Rfc8785Canonicalizer` produce byte-identical output (see
     /// `verify/canonical.rs::ascii_only_python_matches_jcs`). The
     /// JCS-vs-Python silent-correctness trap CIRISPersist#121 names
     /// manifests for **non-ASCII** or **float-divergent** payloads;
-    /// the holds_bytes envelope is structurally immune to the
+    /// the claim envelope is structurally immune to the
     /// divergence. The trap could STILL bite if someone introduces a
     /// new canonicalizer that disagrees on ANY shape (e.g., a
     /// whitespace-emitting variant); this identity test catches
     /// THAT regression even though the specific Python/JCS pair
-    /// happens to agree on holds_bytes.
+    /// happens to agree on this envelope.
     #[test]
-    fn put_blob_signing_canonicalizer_identity_holds_bytes_envelope() {
+    fn put_blob_signing_canonicalizer_identity_holding_claim_envelope() {
         use crate::verify::canonical::{Canonicalizer, PythonJsonDumpsCanonicalizer};
         use sha2::{Digest, Sha256};
 
         let sha = [0x42u8; 32];
         let at: chrono::DateTime<chrono::Utc> = "2026-05-01T00:00:00Z".parse().unwrap();
-        let envelope = holds_bytes_attestation_envelope(&sha, "k-holder", "att-1", at, 7);
+        let scope = crate::federation::holding_claim::ClaimScope::of_content(
+            crate::federation::types::cohort_scope::CryptoTier::Plaintext,
+            "federation",
+            None,
+        )
+        .unwrap();
+        let envelope = crate::federation::holding_claim::holding_claim_row(
+            &sha, "k-holder", "att-1", at, 7, &scope,
+        )
+        .unwrap()
+        .attestation_envelope;
 
         // The production canonicalizer's output for this envelope.
         let python_bytes = PythonJsonDumpsCanonicalizer

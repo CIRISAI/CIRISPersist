@@ -348,7 +348,7 @@ pub(crate) mod bodies {
     ///
     /// **I791b** (v55.0.0, CIRISPersist#1007) — B's `custody:ack:v1` report
     /// is B's alone to retract: A's `withdraws` of it is
-    /// `carrier_withdraws_not_the_holder` at B's door; B's own is admitted.
+    /// `custody_ack_withdraws_not_the_holder` at B's door; B's own is admitted.
     pub(crate) async fn i784_a_sealed_dag_is_announced_at_promotion<B>(
         dsn_a: &str,
         dsn_b: &str,
@@ -441,7 +441,7 @@ pub(crate) mod bodies {
         assert!(
             refused
                 .to_string()
-                .contains("carrier_withdraws_not_the_holder"),
+                .contains("custody_ack_withdraws_not_the_holder"),
             "I791b: {refused}"
         );
         assert_eq!(
@@ -857,19 +857,29 @@ pub(crate) mod bodies {
                 "I823 chunk {seq} is not served by hash"
             );
         }
-        // The round-4 sweep: the tombstone outlives the bytes, so a manifest
-        // re-delivered after finalize is held but never served again.
-        p.b.adopt_sealed_blob(
-            &inline(p.sa.as_ref(), &root).await,
-            prov(&p),
-            None,
-            AdoptDisposition::LocalOnly,
-        )
-        .await
-        .expect("I823: the bytes may be re-delivered");
+        // The round-4 sweep: the tombstone outlives the bytes. v55.0.0
+        // (CIRISPersist#1007, operator ruling) — a manifest re-delivered after
+        // finalize is REFUSED at the write door (`Purged`, naming the notice)
+        // and nothing is held again; before v55 it was held and withheld.
+        let again =
+            p.b.adopt_sealed_blob(
+                &inline(p.sa.as_ref(), &root).await,
+                prov(&p),
+                None,
+                AdoptDisposition::LocalOnly,
+            )
+            .await;
+        assert!(
+            matches!(&again, Err(BlobError::Purged { notice_id, .. }) if *notice_id == exec.notice_id),
+            "I823: a re-delivered purged manifest is refused at write: {again:?}"
+        );
+        assert!(
+            !p.sb.has_blob(&root).await.unwrap(),
+            "I823: nothing new is held"
+        );
         assert!(
             matches!(served(&p, &root).await, Err(BlobError::Purged { .. })),
-            "I823: a re-delivered purged manifest stays withheld"
+            "I823: and it is still withheld"
         );
         assert!(
             p.sb.has_blob(&shared).await.unwrap(),

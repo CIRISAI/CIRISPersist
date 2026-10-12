@@ -121,6 +121,8 @@ pub(crate) enum Class {
 ///   anything is stored. Classified by what they do, not what they are called.
 #[cfg(test)]
 pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
+    // v55.0.0 (CIRISPersist#952) — Gate: the finalize refuses a chunk not held whole.
+    ("check_held_dag_chunk", Class::Gate),
     // v46.3.0 (#884) — `minter_of_blob`'s community arm IS the #876 read
     // (`community_dek_blob_epoch`, another door): its answer is the binding's
     // minter, no refusal of the caller's input here.
@@ -137,6 +139,10 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("apply_migration_lock_timeout", Class::Delegates),
     ("as_array", Class::Plumbing),
     ("assemble_chunk_dag_range", Class::Plumbing),
+    // v55.0.0 (CIRISPersist#952) — Plumbing: the manifest row the finalize writes.
+    ("prepare_manifest_row", Class::Plumbing),
+    // v55.0.0 (CIRISPersist#1007) — Gate: taken-down or purged bytes never come back.
+    ("refuse_tombstoned_bytes", Class::Gate),
     // #832 — `build_transaction()…start()`: the REPEATABLE READ transaction
     // `stream_chunks` opens so the listing and the STH are one snapshot.
     // Driver plumbing; it cannot refuse anything about the caller's input.
@@ -280,10 +286,10 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // v44.8.0 (#866 C1) — the scope-token grammar gate: a `consent:state:*`
     // envelope whose `scope` names a token the fold cannot match is refused.
     ("check_consent_scope_tokens", Class::Gate),
-    // v45.0.0 (#871) — the media Source struct grammar gate and the holder
-    // claim's required size: a malformed descriptor is refused by member.
+    // v45.0.0 (#871) — the media Source struct grammar gate: a malformed
+    // descriptor is refused by member. (The holder claim's size gate retired
+    // with `holds_bytes` in v55.0.0; the custody parse requires it.)
     ("check_media_source", Class::Gate),
-    ("check_holder_claim_size", Class::Gate),
     // v45.0.0 (#871, FSD §5) — the placement rule: a rendition whose
     // original THIS node holds must name the original's `cohort_scope`.
     // One name at the six write doors on all three backends (memory's
@@ -682,9 +688,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("prepare", Class::Plumbing),
     ("prepare_chunk_rows", Class::Plumbing),
     ("prepare_decision", Class::Gate),
-    // #846 — rebuilds and ADMITS a holds_bytes row from the caller's signed
-    // components (runs `check_put_blob_admission`): it refuses caller input.
-    ("prepare_holds_bytes_row", Class::Gate),
     ("prepare_proposal", Class::Gate),
     // v44.7.0 (#864) — the rebind store steps' shared pre-check: same pubkeys,
     // self-signed, claim byte-equal; refuses the write with `Conflict`.
@@ -927,6 +930,52 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("verify_stream_sth_signature", Class::Gate),
     ("verify_stream_sth_witnesses", Class::Gate),
     ("verify_touch_claim_admission", Class::Gate),
+    // ── v55.0.0 (CIRISPersist#989, #1053) — the one holding claim; public rooms ──
+    // v55.0.0 (CIRISPersist#1053, CC 3.2) — Gate: refuses a `community:listing:v1`
+    // row off `federation`, malformed, for a non-public room, or by a signer that
+    // is neither founder nor moderate-holder. A statement about the input.
+    ("check_community_listing_admission", Class::Gate),
+    // v55.0.0 (CIRISPersist#989) — Gate: a plaintext write's claim scope; refuses
+    // a sealed family / room write that names no group.
+    ("of_content", Class::Gate),
+    // v55.0.0 (CIRISPersist#989) — Plumbing: the stored row's claim scope (a
+    // read of its tier, cohort and group) for a sealed announce.
+    ("content_claim_scope", Class::Plumbing),
+    // v55.0.0 (CIRISPersist#989, CC 3.1.3.3 rule 2) — Gate: refuses a holding
+    // claim whose holder is not in the cohort it is placed at.
+    ("check_holding_claim_audience", Class::Gate),
+    // v55.0.0 (CIRISPersist#989, CC 3.1.3.3 rule 1) — Gate: refuses a holding
+    // claim about a blob this node holds placed at a scope that is not the
+    // blob's. A statement about the input, judged against the held row.
+    ("check_holding_claim_scope", Class::Gate),
+    // v55.0.0 (CIRISPersist#989) — the ONE `evict_actor` both blob backends
+    // call (`holding_claim.rs`); its retractions go through the shared
+    // withdraws helper.
+    ("evict_actor_of", Class::Delegates),
+    // v55.0.0 (CIRISPersist#989) — postgres: the holding claim's INSERT inside
+    // the caller's transaction (serve position + row). Storage; the claim was
+    // admitted by `prepare_holding_claim_row` + the audience gate before.
+    ("insert_holding_claim_tx", Class::Plumbing),
+    // v55.0.0 (CIRISPersist#989) — the shared holder-directory reads: folds
+    // over the held rows, refusing nothing.
+    ("list_held_by_of", Class::Plumbing),
+    ("list_holders_of", Class::Plumbing),
+    ("list_local_holders_of", Class::Plumbing),
+    // v55.0.0 (CIRISPersist#989) — Gate: `put_holding_claim`'s pre-check —
+    // scope is the stored content's, size is the stored length, the row
+    // rebuilds and admits, the holder is in the cohort.
+    ("prepare_announcement", Class::Gate),
+    // #846 / v55.0.0 (CIRISPersist#989) — rebuilds and ADMITS the holding
+    // claim from the caller's signed components (runs
+    // `check_put_blob_admission`): it refuses caller input.
+    ("prepare_holding_claim_row", Class::Gate),
+    // v55.0.0 (CIRISPersist#989, CC 3.1.3.3 rule 4) — this node's own
+    // holding-claim retractions, through the shared withdraws helper; a
+    // refused one aborts the eviction (I18).
+    ("retract_own_claims", Class::Delegates),
+    // v55.0.0 (CIRISPersist#989) — sqlite: the holding claim's INSERT inside
+    // the caller's transaction. Storage, as `insert_holding_claim_tx`.
+    ("sqlite_insert_holding_claim", Class::Plumbing),
 ];
 
 /// One reviewed, written-down reason a single backend's gate sequence differs

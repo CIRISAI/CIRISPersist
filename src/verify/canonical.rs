@@ -189,7 +189,7 @@ pub fn canonicalizer_for(version: CanonVersion) -> &'static dyn Canonicalizer {
 /// 2.9.6 substrate triple (agent 2.9.6 hard-JCS / persist 4.15 / verify
 /// 5.0) flips persist's produce side to RFC 8785 JCS, the CEG §0.9
 /// conformance state. Every persist-produced CEG signing payload
-/// (attestations / holds_bytes / withdraws / key registration / blob
+/// (attestations / holding claims / withdraws / key registration / blob
 /// `original_content_hash` / FFI `canonicalize_envelope`) routes through
 /// [`ceg_produce_canonicalize`], so this one const is the whole produce
 /// flip. persist's produce envelopes are structured-ASCII (key_ids,
@@ -212,7 +212,7 @@ pub const fn produce_canon_version() -> CanonVersion {
 /// canonicalization entry point: routing every persist-produced signing
 /// payload through here makes the 2.9.6 flip a one-line change and keeps
 /// the produce epoch consistent across all surfaces (withdraws /
-/// holds_bytes / attestation_promote / key registration / FFI).
+/// holding claims / attestation_promote / key registration / FFI).
 pub fn ceg_produce_canonicalize(value: &serde_json::Value) -> Result<Vec<u8>, Error> {
     canonicalizer_for(produce_canon_version()).canonicalize_value(value)
 }

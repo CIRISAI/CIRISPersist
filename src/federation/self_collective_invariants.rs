@@ -554,7 +554,7 @@ pub(crate) mod bodies {
         const TYPES: &str = include_str!("types.rs");
         assert!(
             TYPES.contains("matches!(s, SELF | FAMILY)"),
-            "I140: suppresses_holds_bytes still says self | family — no claim at any scope (CC 5.2)"
+            "I140: is_structurally_invisible still says self | family — their claims stay in the cohort (CC 5.2)"
         );
     }
 }

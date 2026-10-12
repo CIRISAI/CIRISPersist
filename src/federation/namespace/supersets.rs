@@ -1743,7 +1743,7 @@ mod tests {
         // visible one-line diff, which is the same discipline the FFI taxonomy
         // and the CC 3.1.9.2 prose-rule count are held to.
         // One number, stated once: the message reads it, so it cannot go stale.
-        const EXPECTED: usize = 197;
+        const EXPECTED: usize = 202;
         assert_eq!(
             checked, EXPECTED,
             "checked {checked} version-pinned persist src/ rows, expected {EXPECTED}. \
@@ -1853,6 +1853,20 @@ mod tests {
     /// citation (if the symbol is still present, it must satisfy the liveness
     /// bar like everything else).
     const DELETED_PENDING_REVENDOR: &[(&str, &str)] = &[
+        (
+            "holds_bytes_attestation_envelope",
+            "deleted in v55.0.0 (CIRISPersist#989, CIRISConstitution#141): the `holds_bytes` \
+             carrier is retired; the holding claim is `custody:ack:v1` at the content's scope, \
+             built by `holding_claim::holding_claim_row`. The walk's citation graduates at the \
+             next re-vendor; persist's evidence row already names the new builder.",
+        ),
+        (
+            "suppresses_holds_bytes",
+            "renamed in v55.0.0 (CIRISPersist#989, clean break) to \
+             `cohort_scope::is_structurally_invisible`: every tier now carries holding claims, \
+             placed at the content's scope, so the self/family predicate no longer suppresses \
+             a claim. The walk's citation graduates at the next re-vendor.",
+        ),
         (
             "duty_holders_from_signed_subjects",
             "deleted in v22.0.0 (#543): unioned caller-declared subject_key_ids into the \

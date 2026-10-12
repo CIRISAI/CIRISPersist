@@ -9,10 +9,11 @@
 //! - **I370** an unregistered type is refused at the local put, the replication
 //!   apply and the emit under `Enforce`; nothing is stored.
 //! - **I371** CC's `row_type_vectors` (25 at rc7) replay through [`classify`];
-//!   the two retired rc6 carriers persist still admits until CIRISPersist#989
-//!   are the only departures.
+//!   the rc6 carrier persist still admits until v55 slice B (the key-grant
+//!   set) is the only departure — v55 slice A retired `holds_bytes`
+//!   (CIRISPersist#989).
 //! - **I372** the carrier shape: every violation refused (always enforced);
-//!   today's `holds_bytes` and `key_grant` rows satisfy it.
+//!   today's `key_grant` rows satisfy it.
 //! - **I373** a carrier token is never a `dimension` (since rc7, `key_grant:`
 //!   is a registered family held shut until #989 and the `holds_bytes`
 //!   token has no version tail).
@@ -67,9 +68,9 @@ mod pure {
                 RowTypeClass::Carrier(_) => Some("carrier"),
                 RowTypeClass::Unregistered => None,
             };
-            // rc7 retired both carriers; persist still admits them until #989
-            // (`registry::RC6_RETIRED_CARRIERS_ADMITTED_UNTIL_989`). Those two
-            // vectors, and only those, are answered "carrier" against CC's
+            // rc7 retired both carriers; persist still admits the key-grant set
+            // until v55 slice B (`registry::RC6_RETIRED_CARRIERS_ADMITTED_UNTIL_989`).
+            // That vector, and only that, is answered "carrier" against CC's
             // refusal.
             if got == Some("carrier") && v["class"].is_null() {
                 assert!(
@@ -133,18 +134,24 @@ mod pure {
     /// I372 — every part of the carrier shape, and today's real rows.
     #[test]
     fn i372_carrier_shape() {
-        let hb = crate::federation::blobs::holds_bytes_attestation_row(
+        // v55.0.0 (CIRISPersist#989) — the holding claim is a `scores` row
+        // now: one of the five, never a carrier.
+        let scope = crate::federation::holding_claim::ClaimScope::of_content(
+            crate::federation::types::cohort_scope::CryptoTier::Plaintext,
+            "federation",
+            None,
+        )
+        .unwrap();
+        let hb = crate::federation::holding_claim::holding_claim_row(
             &[7u8; 32],
             "holder",
             "hb-1",
             chrono::Utc::now(),
             3,
-        );
-        assert_eq!(check_row_type(&hb).unwrap(), classify(&hb.attestation_type));
-        assert!(matches!(
-            classify(&hb.attestation_type),
-            RowTypeClass::Carrier(_)
-        ));
+            &scope,
+        )
+        .unwrap();
+        assert_eq!(check_row_type(&hb).unwrap(), RowTypeClass::Structural);
 
         let kg = "key_grant:epoch:v1";
         let ok = || {
@@ -239,10 +246,12 @@ mod pure {
                 crate::federation::key_grant::KEY_GRANT_ENVELOPE_KIND
             );
         }
-        assert!(matches!(
-            classify(&crate::federation::holds_bytes_attestation_type(&[0xab; 32])),
-            RowTypeClass::Carrier(c) if c.kind == "holds_bytes"
-        ));
+        // v55.0.0 (CIRISPersist#989) — the retired carrier classifies
+        // unregistered, and is refused whatever the mode (I709).
+        assert_eq!(
+            classify("holds_bytes:sha256:abababab"),
+            RowTypeClass::Unregistered
+        );
     }
 
     /// I374 — the composer dimension gate, as the put doors call it.
@@ -516,15 +525,11 @@ pub(crate) mod bodies {
             .map_or(0, |(_, n)| n)
     }
 
-    /// The types I370 probes. Each is unregistered; the last two sit under a
-    /// carrier stem.
-    const PROBES: [&str; 5] = [
-        "foo",
-        "scores ",
-        "SCORES",
-        "key_grant:epoch:v2",
-        "holds_bytes:sha256:0A1B2C3D",
-    ];
+    /// The types I370 probes. Each is unregistered; the last sits under a
+    /// carrier stem. (A retired carrier — `holds_bytes:` — is refused under
+    /// BOTH modes, even at assembly, so it is no probe of the `Enforce` switch:
+    /// I709 and I718 witness it, v55.0.0 / CIRISPersist#989.)
+    const PROBES: [&str; 4] = ["foo", "scores ", "SCORES", "key_grant:epoch:v2"];
 
     /// **I370** — refused at the local put, the replication apply and the emit
     /// under `Enforce`; nothing stored.
@@ -534,8 +539,6 @@ pub(crate) mod bodies {
     ) {
         let w = who(b, &format!("i370-{s}"), USER).await;
         for (n, t) in PROBES.iter().enumerate() {
-            // `size` so the media-source gate (CC 5.3.2.5), which reads any
-            // `holds_bytes`-prefixed type, has nothing to say first.
             let r = signed(
                 &w,
                 input(

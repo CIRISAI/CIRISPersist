@@ -299,7 +299,7 @@ def test_register_self_then_put_blob_signing_275() -> None:
     `scrub_key_id` the DERIVED federation key_id
     (`derive_key_id(<alias>, <pubkey>)` = `<label>-<fp>`), but
     `register_self_federation_key` kept registering the bare keystore
-    ALIAS — so `put_blob_signing`'s holds_bytes scrub FK pointed at a row
+    ALIAS — so `put_blob_signing`'s holding-claim scrub FK pointed at a row
     that never existed and FK-failed (`blob_attestation_emission_failed`)
     on every persist >= 9.3.0. The fix registers (and returns) the derived
     id. Skips on a non-sqlite wheel."""
@@ -369,16 +369,22 @@ def test_register_self_then_put_blob_signing_275() -> None:
         )
 
         # CIRISPersist#851 §20.5 (operator ruling) — hybrid/PQC only, no
-        # legacy fallback. The commons door's holds_bytes claim ALWAYS carries
+        # legacy fallback. The commons door's holding claim (v55.0.0:
+        # custody:ack:v1 `here` at federation, CIRISPersist#989) ALWAYS carries
         # its PQC half, because an engine without one cannot announce at all:
         # its door refuses before storing anything announced (I80, I83). This
         # engine has a PQC LocalSigner, so the claim must be hybrid. Read back
         # through a host door.
         rows = json.loads(eng.list_attestations_by(kid))
-        claims = [r for r in rows if str(r.get("attestation_type", "")).startswith("holds_bytes:")]
-        assert claims, "the holds_bytes claim is stored under the derived id"
+        claims = [
+            r
+            for r in rows
+            if r.get("attestation_type") == "scores"
+            and (r.get("attestation_envelope") or {}).get("dimension") == "custody:ack:v1"
+        ]
+        assert claims, "the holding claim is stored under the derived id"
         assert all(r.get("scrub_signature_pqc") for r in claims), (
-            "hybrid-only (#851 §20.5): every announced holds_bytes claim carries its "
+            "hybrid-only (#851 §20.5): every announced holding claim carries its "
             "ML-DSA-65 half — a classical claim no peer admits can no longer be produced"
         )
 

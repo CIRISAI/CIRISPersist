@@ -447,11 +447,17 @@ where
                     "resolve_write_tier: infra check: {e}"
                 ))
             })?;
-    Ok(if infra {
-        CryptoTier::Plaintext
-    } else {
-        cs::crypto_tier(cohort_scope, None)
-    })
+    // v55.0.0 (CIRISPersist#1053, CC 3.2) — a `public` room is Commons tier:
+    // plaintext, no DEK. Founded by anyone, so the label alone decides; no
+    // record crosses the `public` boundary (`public_room`), so the label can
+    // never drop a private room's DEK.
+    Ok(
+        if infra || crate::federation::public_room::is_public_community(&community) {
+            CryptoTier::Plaintext
+        } else {
+            cs::crypto_tier(cohort_scope, None)
+        },
+    )
 }
 
 /// The three answers [`body_is_sealed`] can give. `Unverifiable` is
@@ -1308,8 +1314,8 @@ pub mod orchestrate {
         let envelope_bytes = envelope.to_bytes();
         let at_rest_sha256: [u8; 32] = Sha256::digest(&envelope_bytes).into();
 
-        // 2. Store the ciphertext, structurally invisible (no holds_bytes;
-        //    suppresses_holds_bytes is true for self/family).
+        // 2. Store the ciphertext. The floor announces nothing; the write door
+        //    announces at the content's own scope (`announce_sealed`, v55).
         backend
             .store_blob_local(
                 &at_rest_sha256,
@@ -3368,6 +3374,40 @@ pub mod orchestrate {
         }
     }
 
+    /// v55.0.0 (CIRISPersist#989, CC 3.1.3.3) — the sealed write doors'
+    /// announcement: [`emit_holding_claim`](crate::federation::holding_claim::emit_holding_claim)
+    /// for the row the cascade just stored, at the content's own scope. A node
+    /// outside the cohort claims nothing (logged, not an error: it stored the
+    /// bytes as the author's write and is simply not a member device).
+    pub(crate) async fn announce_stored<B>(
+        backend: &B,
+        local: &crate::signing::LocalSigner,
+        at_rest_sha256: &[u8; 32],
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<crate::federation::holding_claim::HoldingClaimOutcome, BlobError>
+    where
+        B: BlobStorage + crate::federation::FederationDirectory + Sync,
+    {
+        let outcome = crate::federation::holding_claim::emit_holding_claim(
+            backend,
+            local,
+            at_rest_sha256,
+            now,
+        )
+        .await?;
+        if let crate::federation::holding_claim::HoldingClaimOutcome::NotInCohort { scope } =
+            &outcome
+        {
+            tracing::debug!(
+                sha256_prefix = &hex::encode(at_rest_sha256)[..16],
+                cohort_scope = scope.cohort_scope(),
+                "stored sealed content this node is not a cohort device for; no holding claim \
+                 (CC 3.1.3.3 rule 2)"
+            );
+        }
+        Ok(outcome)
+    }
+
     /// v43.0.0 (`BLOB_ENCRYPTION_AT_REST.md` §11.2) — **THE write door**, as
     /// a free function so the Engine and the PyO3 surface share one body
     /// rather than two copies that can drift.
@@ -3375,17 +3415,23 @@ pub mod orchestrate {
     /// Store `plaintext` at `cohort_scope`. The tier is resolved from the
     /// DIRECTORY ([`resolve_write_tier`](super::resolve_write_tier)); the
     /// caller never supplies it and never supplies sealed bytes:
-    /// - **Plaintext** (commons, or an AUTHORIZED infrastructure community —
-    ///   CC 4.4.3.2.1) → stored as given, `holds_bytes` announced, row
+    /// - **Plaintext** (commons, an AUTHORIZED infrastructure community — CC
+    ///   4.4.3.2.1 — or a `public` room, CC 3.2) → stored as given, the
+    ///   holding claim placed at `federation` in the same transaction, row
     ///   records the scope;
     /// - **InvisibleEncrypted** (`self` / `family`) → the self/family cascade:
-    ///   fresh DEK, wrapped to every active occurrence, no `holds_bytes`. The
-    ///   owner (self) or family key rides in `community_key_id`'s slot;
+    ///   fresh DEK, wrapped to every active occurrence. The owner (self) or
+    ///   family key rides in `community_key_id`'s slot;
     /// - **CommunityDek** → the community cascade under the current epoch
-    ///   DEK, wrapped to every active member, AND `holds_bytes` announced for
-    ///   the SEALED bytes — community content federates with cleartext
-    ///   provenance, and the cascade alone never emitted the announcement it
-    ///   documented as the caller's job.
+    ///   DEK, wrapped to every active member.
+    ///
+    /// v55.0.0 (CIRISPersist#989, CC 3.1.3.3) — at both sealed tiers the
+    /// cascade then announces this node's holding claim through
+    /// [`emit_holding_claim`](crate::federation::holding_claim::emit_holding_claim),
+    /// placed at the content's own scope (`self`, the family, the room) and
+    /// therefore reaching only the cohort. A node not in that cohort (an
+    /// unclaimed node, a server-class occurrence holding its owner's `self`
+    /// content) stores the bytes and claims nothing.
     ///
     /// There is no other consumer-reachable write that accepts an encrypted
     /// cohort. The commons doors record `federation` by construction and
@@ -3486,6 +3532,8 @@ pub mod orchestrate {
                     Some(signer_key_id),
                 )
                 .await?;
+                // v55.0.0 (CIRISPersist#989) — the claim, at the content's scope.
+                announce_stored(backend, local, &r.at_rest_sha256, now).await?;
                 Ok(PutBlobScopedResult {
                     at_rest_sha256: r.at_rest_sha256,
                     tier,
@@ -3520,28 +3568,12 @@ pub mod orchestrate {
                     Some(signer_key_id),
                 )
                 .await?;
-                // ANNOUNCE the sealed bytes: community content federates with
-                // cleartext provenance.
-                let Some(BlobBody::Inline(sealed)) = backend.get_blob(&r.at_rest_sha256).await?
-                else {
-                    return Err(BlobError::Backend(
-                        "community cascade stored no inline body".into(),
-                    ));
-                };
-                backend
-                    .put_blob_signing_at(
-                        cohort_scope,
-                        crate::federation::StorageFloor::resolved(CryptoTier::CommunityDek),
-                        &r.at_rest_sha256,
-                        BlobBody::Inline(sealed),
-                        media_type,
-                        signer_key_id,
-                        local,
-                        now,
-                        uuid::Uuid::new_v4(),
-                        Some(comm),
-                    )
-                    .await?;
+                // v55.0.0 (CIRISPersist#989, CIRISConstitution#141) — ANNOUNCE
+                // the sealed bytes with a claim placed at the ROOM's scope: it
+                // reaches the roster and nobody else (the retired `holds_bytes`
+                // claim was at `federation`, advertising the room's content to
+                // everyone).
+                announce_stored(backend, local, &r.at_rest_sha256, now).await?;
                 // #848 (§14, epoch axis) — emitted when the fan-out minted or
                 // granted anew; otherwise the set already replicated.
                 let key_grant_emission =
@@ -4481,13 +4513,15 @@ pub mod blob_invariants {
         let alice = format!("{tag}-alice-{run}");
         let alice_occ = format!("{tag}-alice-occ-{run}");
         let node = format!("{tag}-node-{run}");
-        crate::federation::community_dek::lifecycle_support::seed_community(
+        // v55.0.0 (CIRISPersist#989) — the announcing node is a member's
+        // device: a room's holding claim is placed at the room's scope.
+        let signer = crate::federation::community_dek::lifecycle_support::seed_community_with_node(
             backend,
             &comm,
             &[(&alice, &alice_occ)],
+            &node,
         )
         .await;
-        let signer = node_signer(backend, &node).await;
         let minter = signer.derived_key_id();
 
         let sealed = encrypt_and_cascade_community(backend, &comm, b"old", None, Some(&minter))
@@ -4520,7 +4554,7 @@ pub mod blob_invariants {
                 None,
             )
             .await
-            .unwrap_or_else(|e| panic!("{tag} I9: announce holds_bytes: {e}"));
+            .unwrap_or_else(|e| panic!("{tag} I9: announce the holding claim: {e}"));
         assert!(
             backend
                 .list_holders(&sealed.at_rest_sha256)
@@ -4550,7 +4584,7 @@ pub mod blob_invariants {
         let holders = backend.list_holders(&sealed.at_rest_sha256).await.unwrap();
         assert!(
             !holders.contains(&node_derived),
-            "{tag} I9: this node STILL advertises holds_bytes for bytes it no longer holds — \
+            "{tag} I9: this node STILL claims bytes it no longer holds — \
              eviction deleted without emitting withdraws: holders={holders:?}"
         );
     }
@@ -4560,7 +4594,8 @@ pub mod blob_invariants {
     /// the CC 4.4.3.2.1 infrastructure carve-out.**
     ///
     /// An AUTHORIZED infrastructure community stores plaintext and announces
-    /// `holds_bytes`; a merely-labeled one does not get the carve-out. The
+    /// its holding claim at `federation`; a merely-labeled one does not get
+    /// the carve-out. The
     /// first implementation passed `cohort_subkind = None` to the tier
     /// resolver, so infra content was refused at the write door AND by the
     /// cascade — unstorable by any route.
@@ -4610,7 +4645,7 @@ pub mod blob_invariants {
                 .await
                 .unwrap()
                 .contains(&signer.derived_key_id()),
-            "{tag} I10: commons-tier infra content announces holds_bytes"
+            "{tag} I10: commons-tier infra content announces its holding claim"
         );
     }
     // ── I15 ──────────────────────────────────────────────────────────────
@@ -4803,16 +4838,17 @@ pub mod blob_invariants {
         let alice = format!("{tag}-alice-{run}");
         let alice_occ = format!("{tag}-alice-occ-{run}");
         let node = format!("{tag}-node-{run}");
-        crate::federation::community_dek::lifecycle_support::seed_community(
+        // v55.0.0 (CIRISPersist#989) — the announcing node is a member's
+        // device: a room's holding claim is placed at the room's scope.
+        let signer = crate::federation::community_dek::lifecycle_support::seed_community_with_node(
             backend,
             &comm,
             &[(&alice, &alice_occ)],
+            &node,
         )
         .await;
-        let signer = node_signer(backend, &node).await;
         let minter = signer.derived_key_id();
         let node_derived = signer.derived_key_id();
-        let prefix = crate::federation::HOLDS_BYTES_ATTESTATION_TYPE_PREFIX;
         async fn withdraws_by<D: FederationDirectory + Sync>(backend: &D, node: &str) -> usize {
             backend
                 .list_attestations_by(node)
@@ -4855,7 +4891,7 @@ pub mod blob_invariants {
             .await
             .unwrap()
             .into_iter()
-            .find(|a| a.attestation_type.starts_with(prefix))
+            .find(crate::federation::custody_ack::is_custody_row)
             .expect("the announcement");
         crate::federation::blobs::emit_withdraws_attestation_helper(
             &prior,
@@ -7013,9 +7049,9 @@ pub mod blob_invariants {
     }
 
     // ── I52 ──────────────────────────────────────────────────────────────
-    /// **`Announce` emits `holds_bytes` by THIS node beside the cleartext
-    /// provenance; `LocalOnly` emits nothing; self/family provenance can
-    /// never `Announce`.** The provenance a holder keeps or evicts on —
+    /// **`Announce` emits THIS node's holding claim beside the cleartext
+    /// provenance; `LocalOnly` emits nothing; a self/family `Announce` claims
+    /// only inside its cohort (v55.0.0).** The provenance a holder keeps or evicts on —
     /// `author_key_id`, `community_key_id` — is readable in the clear from
     /// the row (`blob_provenance`) the claim announces; the signed claim's
     /// preimage is unchanged (v31, #652).
@@ -7087,7 +7123,12 @@ pub mod blob_invariants {
             backend.list_holders(&sha2).await.unwrap().is_empty(),
             "{tag} I52: LocalOnly emitted a holder claim"
         );
-        // self / family + Announce: refused BEFORE the floor (CC 5.2).
+        // self / family + Announce — v55.0.0 (CIRISPersist#989, CC 3.1.3.3):
+        // the claim is placed at the content's own cohort, so it may announce
+        // there, and only a device IN that cohort may (rule 2). This node is
+        // no one's device and in no family, so the floor refuses the claim
+        // (`custody_ack_outside_cohort`) before anything is written — never a
+        // claim at `federation` for structurally invisible content.
         for scope in [SELF, FAMILY] {
             let prov = crate::federation::BlobProvenance {
                 author_key_id: our.clone(),
@@ -7111,8 +7152,11 @@ pub mod blob_invariants {
                 "{tag} I52: an announced {scope} blob — structurally invisible content got a \
                  holder claim"
             ));
+            // (a node not party to the family is refused even earlier, by the
+            // hold decision)
             assert!(
-                matches!(err, BlobError::InvalidArgument(_)),
+                matches!(&err, BlobError::InvalidArgument(m) if m.contains("custody_ack_outside_cohort"))
+                    || matches!(err, BlobError::NotPartyTo { .. }),
                 "{tag} I52: {err:?}"
             );
         }

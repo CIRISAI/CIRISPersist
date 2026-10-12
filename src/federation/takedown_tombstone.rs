@@ -46,7 +46,7 @@
 //! A holder's own claim is still the holder's: the Engine retracts THIS node's
 //! holding claim for the taken-down bytes (the holder re-acknowledging `none`,
 //! CC 4.5.3 step 2), and the withdraws door refuses every non-holder's
-//! `withdraws` of a holding claim (`carrier_withdraws_not_the_holder`).
+//! `withdraws` of a holding claim (`custody_ack_withdraws_not_the_holder`).
 
 use serde::{Deserialize, Serialize};
 use sha2::Digest as _;

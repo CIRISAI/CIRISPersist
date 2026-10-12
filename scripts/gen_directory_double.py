@@ -81,8 +81,14 @@ DELEGATED_DEFAULTS = (
     # v54.1.0 (#1044) — defaulted `Unsupported`, overridden by every backend.
     "store_invalid_replaced_key_record",
     # v45.0.0 (#871) — defaulted `Unsupported`, overridden by every backend.
-    "list_holders_sized",
+    # (`list_holders_sized` left this list in v55.0.0, CIRISPersist#989: it is
+    # now a provided COMPOSITION over `list_attestations_citing_by_dimension`
+    # and the custody fold, so through the double it runs the default and a
+    # fault on the leaf is observed.)
     "list_derived_hex",
+    # v55.0.0 (#989) — defaulted `Unsupported`, overridden by every backend;
+    # the holder directory's candidate seek.
+    "list_attestations_citing_by_dimension",
     # v49.0.0 (#908) — defaulted `Unsupported`, overridden by every backend;
     # the authorized roster fold reads it through the double.
     "community_roster_signers",

@@ -9,7 +9,7 @@
 # Columns: decimal_id, claim_id, repo, path#symbol, crate@version
 decimal_id	claim_id	repo	path#symbol	crate@version
 3.1.1	CLM-nsproc-family-roster-membership-change-via-entr-accord	CIRISPersist	ciris-verify-core/src/accord_genesis.rs#build_accord_family_envelope	ciris-persist@31.0.0
-3.1.1	CLM-nsproc-holds-bytes-agent-files-kind-platform-or-target	CIRISPersist	src/federation/blobs.rs#holds_bytes_attestation_envelope	ciris-persist@54.1.0
+3.1.1	CLM-nsproc-holds-bytes-agent-files-kind-platform-or-target	CIRISPersist	src/federation/holding_claim.rs#holding_claim_row	ciris-persist@54.1.0
 3.1.1	CLM-nsproc-kind-open-vocab-registration-collision-g-agent-files-kind-platform-or-target	CIRISPersist	src/federation/schema_resolver.rs#BlobBackedSchemaResolver	ciris-persist@54.1.0
 3.1.2	CLM-nsproc-witness-key-id-transparency-log-cosigned-tree-size	CIRISPersist	src/federation/admission.rs#default_reserved_prefix_rules	ciris-persist@54.1.0
 3.1.2	CLM-nsproc-restrictions-attestation-license-validity	CIRISPersist	src/federation/consent_grammar.rs#RestrictionOp::StripField	ciris-persist@54.1.0
@@ -220,6 +220,11 @@ decimal_id	claim_id	repo	path#symbol	crate@version
 4.5.3	CLM-purge-whole-or-not	CIRISPersist	src/federation/steward_purge.rs#purge_rows	ciris-persist@54.1.0
 4.5.3	CLM-purge-whole-or-not	CIRISPersist	src/federation/steward_purge.rs#purge_finalize	ciris-persist@54.1.0
 4.5.3	CLM-purge-whole-or-not	CIRISPersist	src/federation/steward_purge.rs#refuse_if_tombstoned_attestation	ciris-persist@54.1.0
+3.1.3.3	CLM-custody-receipt	CIRISPersist	src/federation/holding_claim.rs#emit_holding_claim	ciris-persist@54.1.0
+3.1.3.3	CLM-custody-receipt	CIRISPersist	src/federation/holding_claim.rs#check_holding_claim_scope	ciris-persist@54.1.0
+3.1.3.3	CLM-custody-receipt	CIRISPersist	src/federation/custody_ack.rs#check_custody_withdraws_signer	ciris-persist@54.1.0
+3.2	CLM-public-community	CIRISPersist	src/federation/public_room.rs#check_public_room_conformance	ciris-persist@54.1.0
+3.2	CLM-public-community	CIRISPersist	src/federation/public_room.rs#check_community_listing_admission	ciris-persist@54.1.0
 4.5.3	CLM-one-tombstone-row	CIRISPersist	src/federation/takedown_tombstone.rs#takedown_tombstone	ciris-persist@54.1.0
 4.5.3	CLM-one-tombstone-row	CIRISPersist	src/federation/takedown_tombstone.rs#apply_replicated_takedown	ciris-persist@54.1.0
 4.5.3	CLM-one-tombstone-row	CIRISPersist	src/federation/takedown_tombstone.rs#settles_at	ciris-persist@54.1.0

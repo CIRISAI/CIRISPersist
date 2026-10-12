@@ -61,12 +61,13 @@
 //!
 //! ## `size` on the holder claim
 //!
-//! A `holds_bytes:*` claim is a one-member descriptor: `size` is REQUIRED on
-//! it too (FSD §4), checked by the same positive-integer rule
-//! ([`holds_bytes_claim_size`]), refused with the same kind. The puller caps
-//! its read at that number BEFORE hashing (AV-88); a holder whose claimed size
-//! disagrees with the author's descriptor is refused by the puller (AV-89) —
-//! [`HolderClaim`] is what the sized holder read returns so it can compare.
+//! A holding claim carries the blob's `size` too (FSD §4). v55.0.0
+//! (CIRISPersist#989) — the claim is `custody:ack:v1` `here`, whose parse
+//! (`custody_ack::parse_custody_ack`) requires the size, so the retired
+//! `holds_bytes` size gate is gone. The puller caps its read at that number
+//! BEFORE hashing (AV-88); a holder whose claimed size disagrees with the
+//! author's descriptor is refused by the puller (AV-89) — [`HolderClaim`] is
+//! what the sized holder read returns so it can compare.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -76,7 +77,7 @@ pub const MEDIA_MEMBER: &str = "media";
 /// The envelope member that cites blobs — bare sha256 strings (CC 3.3.13),
 /// the reading `admission::envelope_binds_content` has always used.
 pub const EVIDENCE_REFS_MEMBER: &str = "evidence_refs";
-/// The size member, on the struct and on the `holds_bytes` claim alike.
+/// The size member, on the struct and on the holding claim alike.
 pub const SIZE_MEMBER: &str = "size";
 
 /// Every member the struct may carry, in declaration order. Anything else is
@@ -298,8 +299,8 @@ const PLACEHOLDER_B64: base64::engine::GeneralPurpose = base64::engine::GeneralP
         .with_decode_padding_mode(base64::engine::DecodePaddingMode::Indifferent),
 );
 
-/// The positive-integer rule shared by the struct's `size` and the
-/// `holds_bytes` claim's `size`: present, a JSON number, an integer, > 0.
+/// The positive-integer rule of the struct's `size`: present, a JSON number,
+/// an integer, > 0.
 /// `required` is the reason given when the member is absent.
 fn positive_size(member: &str, v: Option<&Value>, required: &str) -> Result<u64, MediaSourceError> {
     let v = v.ok_or_else(|| refuse(member, required))?;
@@ -761,33 +762,6 @@ pub fn check_media_source(envelope: &Value) -> Result<(), super::Error> {
             )
             .into());
         }
-    }
-    Ok(())
-}
-
-/// FSD §4 — the `size` a `holds_bytes` claim's envelope declares: present, a
-/// JSON number, an integer, > 0; else `Error::MediaSourceInvalid { member:
-/// "size", .. }` (a claim is a one-member descriptor, so it is the same
-/// kind). Returns the size so the two blob doors can compare it against the
-/// byte length they store (AV-89) and the sized holder read can return it.
-pub fn holds_bytes_claim_size(envelope: &Value) -> Result<u64, super::Error> {
-    Ok(positive_size(
-        SIZE_MEMBER,
-        envelope.get(SIZE_MEMBER),
-        "required on a `holds_bytes` claim (CC 3.3.13 / 5.3.2.5): the byte length the holder \
-         stores, the number a puller caps its read at before hashing",
-    )?)
-}
-
-/// The ingest-side form of [`holds_bytes_claim_size`]: for a row whose
-/// `attestation_type` is a `holds_bytes:sha256:*` claim, require the size;
-/// for every other row, nothing to check.
-pub fn check_holder_claim_size(
-    envelope: &Value,
-    attestation_type: &str,
-) -> Result<(), super::Error> {
-    if attestation_type.starts_with(super::blobs::HOLDS_BYTES_ATTESTATION_TYPE_PREFIX) {
-        holds_bytes_claim_size(envelope)?;
     }
     Ok(())
 }
@@ -1465,59 +1439,6 @@ mod tests {
             "digest": DIGEST, "size": 1, "format": "image/webp", "derived_from": OTHER
         }});
         assert!(check_media_source(&derived).is_ok());
-    }
-
-    /// I117's ingest half, at the function.
-    #[test]
-    fn a_holds_bytes_claim_declares_a_positive_integer_size() {
-        let claim = |size: Value| {
-            let mut env = json!({"kind": "holds_bytes", "evidence_refs": [DIGEST]});
-            if !size.is_null() {
-                env["size"] = size;
-            }
-            env
-        };
-        for (n, size) in [
-            ("absent", Value::Null),
-            ("zero", json!(0)),
-            ("string", json!("12")),
-            ("negative", json!(-1)),
-            ("float", json!(12.0)),
-            ("object", json!({"bytes": 12})),
-        ] {
-            let err = holds_bytes_claim_size(&claim(size)).expect_err(n);
-            assert_eq!(err.kind(), "federation_media_source_invalid", "{n}: {err}");
-            assert!(err.to_string().contains("size"), "{n}: {err}");
-            assert!(
-                matches!(&err, super::super::Error::MediaSourceInvalid { member, .. } if member == "size"),
-                "{n}: {err}"
-            );
-        }
-        assert_eq!(holds_bytes_claim_size(&claim(json!(12))).unwrap(), 12);
-        assert_eq!(
-            holds_bytes_claim_size(&claim(json!(u64::MAX))).unwrap(),
-            u64::MAX
-        );
-        let absent = holds_bytes_claim_size(&claim(Value::Null)).unwrap_err();
-        assert!(absent.to_string().contains("holds_bytes"), "{absent}");
-    }
-
-    #[test]
-    fn the_holder_claim_check_only_looks_at_holds_bytes_rows() {
-        let without_size = json!({"kind": "holds_bytes", "evidence_refs": [DIGEST]});
-        let holds = format!(
-            "{}{DIGEST}",
-            super::super::blobs::HOLDS_BYTES_ATTESTATION_TYPE_PREFIX
-        );
-        let err = check_holder_claim_size(&without_size, &holds).unwrap_err();
-        assert_eq!(err.kind(), "federation_media_source_invalid");
-        assert!(check_holder_claim_size(&without_size, "scores").is_ok());
-        assert!(
-            check_holder_claim_size(&without_size, "holds_bytes").is_ok(),
-            "the type, not the kind member"
-        );
-        let sized = json!({"kind": "holds_bytes", "evidence_refs": [DIGEST], "size": 12});
-        assert!(check_holder_claim_size(&sized, &holds).is_ok());
     }
 
     #[test]

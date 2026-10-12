@@ -401,6 +401,18 @@ impl FederationDirectory for FaultInjectingDirectory {
         }
         self.inner.list_attestations_by(attesting_key_id).await
     }
+    async fn list_attestations_citing_by_dimension(
+        &self,
+        dimension: &str,
+        evidence_ref: &str,
+    ) -> Result<Vec<Attestation>, Error> {
+        if let Some(e) = self.faulted("list_attestations_citing_by_dimension") {
+            return Err(e);
+        }
+        self.inner
+            .list_attestations_citing_by_dimension(dimension, evidence_ref)
+            .await
+    }
     async fn list_attestations_for(
         &self,
         attested_key_id: &str,
@@ -537,15 +549,6 @@ impl FederationDirectory for FaultInjectingDirectory {
         self.inner
             .list_held_fountain_content(publisher_key_id)
             .await
-    }
-    async fn list_holders_sized(
-        &self,
-        sha256: &[u8; 32],
-    ) -> Result<Vec<renditions::HolderClaim>, Error> {
-        if let Some(e) = self.faulted("list_holders_sized") {
-            return Err(e);
-        }
-        self.inner.list_holders_sized(sha256).await
     }
     async fn list_hybrid_pending_attestations(
         &self,

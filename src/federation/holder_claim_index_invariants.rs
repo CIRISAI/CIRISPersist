@@ -4,7 +4,8 @@
 //! the index hook).
 //!
 //! The defect, measured on a three-node chat ladder: `put_blob_with_scope` and
-//! `adopt_sealed_blob_at` INSERT the `holds_bytes` claim inside their own
+//! `adopt_sealed_blob_at` INSERT the holding claim (then `holds_bytes`; since
+//! v55.0.0 `custody:ack:v1`, CIRISPersist#989) inside their own
 //! transaction and never ran the post-write `index_stored_record("Attestation",
 //! …)` that `put_attestation` runs. The claim was *advertised* (the summary
 //! reads `list_attestations_since`, a federation-tier row qualifies) and
@@ -31,19 +32,23 @@ pub(crate) mod bodies {
         sha2::Sha256::digest(bytes).into()
     }
 
-    /// The `holds_bytes` row `holder` wrote for `sha`, from the directory.
+    /// The holding claim (v55.0.0: `custody:ack:v1`) `holder` wrote for
+    /// `sha`, from the directory.
     async fn holder_claim<B: FederationDirectory + Sync>(
         d: &B,
         holder: &str,
         sha: &[u8; 32],
     ) -> Attestation {
-        let want = crate::federation::holds_bytes_attestation_type(sha);
-        d.list_attestations_by(holder)
-            .await
-            .unwrap()
-            .into_iter()
-            .find(|a| a.attestation_type == want)
-            .expect("the holder claim is a stored row")
+        d.list_attestations_by_dimension_citing(
+            holder,
+            crate::federation::custody_ack::CUSTODY_ACK_DIMENSION,
+            &hex::encode(sha),
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("the holder claim is a stored row")
     }
 
     /// The property both doors must satisfy: the claim's index entry exists
@@ -164,7 +169,7 @@ pub(crate) mod bodies {
     /// `apply_replicated_attestation` per row. Returns how many rows B
     /// admitted. Nothing is hand-copied — a row A holds but does not index
     /// never arrives, which is the defect's exact shape.
-    async fn deliver_attestation_plane<B>(a: &B, b: &B) -> usize
+    pub(crate) async fn deliver_attestation_plane<B>(a: &B, b: &B) -> usize
     where
         B: FederationDirectory + Sync,
     {
@@ -294,6 +299,11 @@ mod run {
             "sqlite_write_local_attestation",
             "pg_write_local_attestation",
         ];
+        // v55.0.0 (CIRISPersist#989) — the holding claim's shared in-transaction
+        // INSERT. It cannot index (the index reload reads COMMITTED rows); every
+        // door that calls it indexes after its commit, which is asserted below.
+        const CLAIM_INSERT_HELPERS: &[&str] =
+            &["sqlite_insert_holding_claim", "insert_holding_claim_tx"];
         let mut sites_seen = 0usize;
         let mut offenders: Vec<String> = Vec::new();
         for (rel, text, needle) in [
@@ -332,6 +342,7 @@ mod run {
                     "\n    pub async fn ",
                     "\n    pub(crate) async fn ",
                     "\n    fn ",
+                    "\nfn ",
                 ]
                 .iter()
                 .filter_map(|p| head.rfind(p).map(|i| (i, p.len())))
@@ -353,8 +364,40 @@ mod run {
                 // share (`index_holder_claim`, pinned below to BE the hook).
                 let indexed = body.contains("index_stored_record(\"Attestation\"")
                     || body.contains("index_holder_claim(");
-                if !indexed && !LOCAL_TIER_WRITERS.contains(&name) {
+                if !indexed
+                    && !LOCAL_TIER_WRITERS.contains(&name)
+                    && !CLAIM_INSERT_HELPERS.contains(&name)
+                {
                     offenders.push(format!("{rel}: `{name}` inserts a federation_attestations row and never indexes it"));
+                }
+            }
+        }
+        // v55.0.0 — every caller of a claim-insert helper indexes after it.
+        for (rel, text) in [
+            ("src/store/sqlite.rs", include_str!("../store/sqlite.rs")),
+            (
+                "src/store/postgres.rs",
+                include_str!("../store/postgres.rs"),
+            ),
+        ] {
+            for helper in CLAIM_INSERT_HELPERS {
+                let call = format!("{helper}(");
+                for (site, _) in text.match_indices(&call) {
+                    let head = &text[..site];
+                    if head.ends_with("fn ") {
+                        continue;
+                    }
+                    let start = head.rfind("\n    async fn ").expect("a caller method");
+                    let end = text[site..]
+                        .find("\n    }\n")
+                        .map(|k| site + k)
+                        .unwrap_or(text.len());
+                    let body = &text[start..end];
+                    if !body.contains("#[cfg(test)]") && !body.contains("index_holder_claim(") {
+                        offenders.push(format!(
+                            "{rel}: a caller of `{helper}` never runs `index_holder_claim`"
+                        ));
+                    }
                 }
             }
         }
@@ -376,10 +419,12 @@ mod run {
                 "I114: {rel}'s index_holder_claim is the Attestation index hook, not a stand-in"
             );
         }
+        // v55.0.0 (CIRISPersist#989) — the two blob doors' INSERTs became ONE
+        // shared claim helper per backend (checked above through its callers).
         assert!(
-            sites_seen >= 8,
-            "I114: expected at least 8 production INSERT sites across both backends (put door, \
-             two blob doors, local writer, each), saw {sites_seen} — a gate that finds nothing \
+            sites_seen >= 6,
+            "I114: expected at least 6 production INSERT sites across both backends (put door, \
+             the claim helper, local writer, each), saw {sites_seen} — a gate that finds nothing \
              holds nothing"
         );
         assert!(

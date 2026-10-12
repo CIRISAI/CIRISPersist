@@ -88,7 +88,7 @@ use serde::{Deserialize, Serialize};
 pub const MINTER_SENTINEL: &str = "__this_node__";
 
 /// `attestation_type` prefix every `KeyGrant` row carries — the kind's
-/// structural primitive, a sibling of `holds_bytes:`.
+/// structural primitive, a sibling of the retired `holds_bytes:` (v55.0.0).
 pub const KEY_GRANT_ATTESTATION_TYPE_PREFIX: &str = "key_grant:";
 /// The epoch-axis row type: `(community, minter, epoch)`.
 pub const KEY_GRANT_EPOCH_ATTESTATION_TYPE: &str = "key_grant:epoch:v1";

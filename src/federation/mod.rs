@@ -80,8 +80,16 @@ pub mod consent_peer_set;
 /// a cohort's own devices hold a blob, folded at read time.
 pub mod custody_ack;
 mod custody_ack_invariants;
+/// v55.0.0 (CIRISPersist#989, CC 3.1.3.3, CIRISConstitution#141) — the ONE
+/// holding claim: `custody:ack:v1` `here` at the content's scope, its
+/// emission and the holder directory read.
+pub mod holding_claim;
+mod holding_claim_invariants;
 /// v51.0.0 (CIRISPersist#938/#937) — the lineage-head cosign object and predicates.
 pub mod lineage_witness;
+/// v55.0.0 (CIRISPersist#1053, CC 3.2, CIRISConstitution#142) — the `public`
+/// room: Commons tier, open admission, the `community:listing:v1` door.
+pub mod public_room;
 /// v53.0.0 (CC 3.2 T6, rc7 `36432c6`) — roster rows and the head: a version
 /// must reflect the fold, an uncovered row lags the head.
 pub mod roster_head;
@@ -667,16 +675,15 @@ pub use admission::{
 };
 pub use blackhole::{BlackholeRecord, BlackholeRules, RETICULUM_IDENTITY_HASH_LEN};
 pub use blobs::{
-    holds_bytes_attestation_envelope, holds_bytes_attestation_type, sign_holds_bytes_claim,
     AbandonFloorReport, BlobBody, BlobEpochBinding, BlobError, BlobHead, BlobProvenanceRow,
     BlobRange, BlobStorage, ChunkKeyRef, ChunkManifest, ChunkRef, ChunkSlice, DekKeyState,
     EpochBinding, EvictActorReport, EvictBlobReport, ExternalRef, GrantWrap, GroupDekRef,
     ManifestChildRef, ManifestChildRow, ManifestRowSpec, MemberGrant, NestedManifest,
-    ParsedManifest, PreparedHoldsBytes, PutBlobAttestation, PutBlobScopedResult, RosterPartition,
-    ScopeBlobSymbol, StorageFloor, StreamChunkRef, StreamChunks, StreamClaim, StreamDekRecord,
-    StreamHead, StreamKeySlot, StreamKeyState, CHUNK_KEYS_STREAM_EPOCH, CHUNK_MANIFEST_VERSION,
+    ParsedManifest, PutBlobAttestation, PutBlobScopedResult, RosterPartition, ScopeBlobSymbol,
+    StorageFloor, StreamChunkRef, StreamChunks, StreamClaim, StreamDekRecord, StreamHead,
+    StreamKeySlot, StreamKeyState, CHUNK_KEYS_STREAM_EPOCH, CHUNK_MANIFEST_VERSION,
     CHUNK_MANIFEST_VERSION_NESTED, CHUNK_MANIFEST_VERSION_SEALED, CHUNK_MANIFEST_VERSION_STREAM,
-    DEFAULT_INLINE_BYTES_CAP, HOLDS_BYTES_ATTESTATION_TYPE_PREFIX, HOLDS_BYTES_PREFIX_HEX_LEN,
+    DEFAULT_INLINE_BYTES_CAP,
 };
 pub use cohort::{Cohort, GroupRef, GroupVersion, RevokeSpec, RosterMember};
 pub use consent::consent_role_of;
@@ -693,6 +700,9 @@ pub use goal::{
 pub use hard_case::{
     check_admin_action_attribution, AdminActionRefusal, ConsentPromotionOverdueRow, ConsentState,
     ConsentWatchReport, HardCaseEvent, HardCaseFilter,
+};
+pub use holding_claim::{
+    emit_holding_claim, holding_claim_row, sign_holding_claim, ClaimScope, HoldingClaimOutcome,
 };
 // v25.1.0 (CIRISPersist#570 ask 5) — the quarantine marker plane. Exported
 // beside the refusal taxonomies above; downstream keys on the `as_str` tokens.
@@ -2906,25 +2916,35 @@ pub trait FederationDirectory: Send + Sync {
     }
 
     /// v45.0.0 (CIRISPersist#871, `FSD/MEDIA_SOURCE.md` §4, AV-88/AV-89) —
-    /// **the puller's budget read.** Every live `holds_bytes` claim for
-    /// `sha256` with the byte length the holder SIGNED, sorted by `key_id`.
-    /// The selection is `list_holders`'s — the claim's type prefix, the
-    /// full digest in its `evidence_refs`, and the holder's own
-    /// `withdraws` / `recants` folded out — WITHOUT the CEG §10.1.2 freshness
-    /// window (this read answers "what did the holder commit to", the way
-    /// `list_local_holders` does; freshness is the discovery read's axis).
-    /// A claim whose envelope has no positive integer `size` is SKIPPED, not
-    /// an error: the receive door refuses those from this cut on, and a
-    /// legacy row without one is not a holder a puller can budget for.
-    /// Default `Unsupported`; every real backend overrides.
+    /// **the puller's budget read.** Every holder whose latest claim about
+    /// `sha256` is `here`, with the byte length the holder SIGNED, sorted by
+    /// `key_id`.
+    ///
+    /// v55.0.0 (CIRISPersist#989, CC 3.1.3.3) — the claims are the one
+    /// holding claim, `custody:ack:v1` `here`, folded per holder exactly as
+    /// the holder directory folds them ([`holding_claim::holder_claims`]: the
+    /// holder's own retractions and later `none` fold out) — WITHOUT the
+    /// 72-hour freshness window: this read answers "what did the holder
+    /// commit to", the way `list_local_holders` does; freshness is the
+    /// discovery read's axis. A provided composition over
+    /// [`Self::list_attestations_citing_by_dimension`].
     async fn list_holders_sized(
         &self,
         sha256: &[u8; 32],
     ) -> Result<Vec<renditions::HolderClaim>, Error> {
-        let _ = sha256;
-        Err(Error::Unsupported {
-            method: "list_holders_sized",
-        })
+        Ok(
+            holding_claim::holder_claims(self, sha256, chrono::Utc::now())
+                .await?
+                .into_iter()
+                .filter(|c| c.state == custody_ack::CustodyState::Here)
+                .filter_map(|c| {
+                    c.size.map(|size| renditions::HolderClaim {
+                        key_id: c.holder_key_id,
+                        size,
+                    })
+                })
+                .collect(),
+        )
     }
 
     /// v45.0.0 (CIRISPersist#871, `FSD/MEDIA_SOURCE.md` §5, CC 3.3.13) —
@@ -3622,6 +3642,25 @@ pub trait FederationDirectory: Send + Sync {
                     && first_evidence_ref(&a.attestation_envelope) == Some(evidence_ref)
             })
             .collect())
+    }
+
+    /// v55.0.0 (CIRISPersist#989, V190) — the federation-tier rows of ANY
+    /// attester under exactly `dimension` whose envelope's `evidence_refs`
+    /// FIRST element is `evidence_ref`: every device's `custody:ack:v1`
+    /// holding claims about one blob, the holder directory's candidate set
+    /// ([`holding_claim::holder_claims`]). Ordered by `asserted_at` DESC.
+    /// Served by V190's `(dimension, evidence_refs[0])`. Defaulted
+    /// `Unsupported` (no unbounded read is keyed this way); every backend
+    /// overrides.
+    async fn list_attestations_citing_by_dimension(
+        &self,
+        dimension: &str,
+        evidence_ref: &str,
+    ) -> Result<Vec<Attestation>, Error> {
+        let _ = (dimension, evidence_ref);
+        Err(Error::Unsupported {
+            method: "list_attestations_citing_by_dimension",
+        })
     }
 
     /// v53.1.6 — the federation-tier rows placed at one of `cohort_scopes`
@@ -5029,7 +5068,7 @@ pub trait FederationDirectory: Send + Sync {
     /// collision with differing content.
     ///
     /// Unlike `self` / `family`, community content is NOT structurally
-    /// invisible ([`crate::federation::types::cohort_scope::suppresses_holds_bytes`]
+    /// invisible ([`crate::federation::types::cohort_scope::is_structurally_invisible`]
     /// is false for `community`) — read paths federate community
     /// content normally.
     async fn put_community(&self, community: SignedCommunity) -> Result<(), Error>;
@@ -9815,9 +9854,9 @@ pub enum Error {
     /// `media` Source struct did not parse (CC 3.3.13: a missing or
     /// non-positive `size`, a malformed `format`, a MUST-NOT `safe` /
     /// `renderable` / tier bit, an unknown member, a `digest` the row does
-    /// not cite in `evidence_refs[]`), or a `holds_bytes` claim carries no
-    /// `size` (CC 5.3.2.5: size is checked first, so a claim without one is
-    /// a claim nobody can check). Refused at every door so a descriptor the
+    /// not cite in `evidence_refs[]`). (Before v55.0.0 also a `holds_bytes`
+    /// claim with no `size`; the holding claim's size is now the custody
+    /// parse's, CIRISPersist#989.) Refused at every door so a descriptor the
     /// puller cannot bound its read by is never admitted. `member` names
     /// WHICH member; `reason` is [`media_source::MediaSourceError`]'s text.
     #[error("media source member `{member}` refused: {reason}")]
@@ -10508,8 +10547,9 @@ pub enum Error {
     },
 
     /// v53.0.0 (CIRISPersist#975, **CC 2.4** carrier shape). A row of a
-    /// registered CARRIER type (`holds_bytes:sha256:{prefix}`,
-    /// `key_grant:{axis}:v1`) whose shape is not a carrier's: not a
+    /// registered CARRIER type (`key_grant:{axis}:v1` while v55's temporary
+    /// exception admits it; `holds_bytes` retired in v55.0.0) whose shape is
+    /// not a carrier's: not a
     /// self-attestation, an envelope `kind` other than the carrier's, or a
     /// `dimension` / `score` / `confidence` / `weight` / non-empty
     /// `subject_key_ids` — the members that would make it a claim. Enforced in

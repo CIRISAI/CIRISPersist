@@ -1,5 +1,14 @@
 # FSD: Blob Replication — the holder plane, and the decision to hold
 
+> **v55.0.0 (CIRISPersist#989, CIRISConstitution#141) — superseded on the
+> holding claim.** Wherever this document says `holds_bytes:sha256:{prefix}`,
+> read the one holding claim: `custody:ack:v1` `here`, placed at the
+> CONTENT's scope (`federation` for Commons-tier content, the bytes' own
+> `self` / `family` / room cohort otherwise), freshness its own `expires_at`
+> (72 h), retracted by its signer alone. `src/federation/holding_claim.rs` is
+> its home. A `holds_bytes` row is a retired carrier: refused at every door,
+> never served, read by no fold.
+
 **Status:** §1–§10 implemented in v44.2.0 (design locked 2026-09-14; the
 operator's party-to correction applied before the build reached §4).
 §11–§18 (key transport, #848) locked 2026-09-15 for v44.3.0.
