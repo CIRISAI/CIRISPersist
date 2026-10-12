@@ -1715,6 +1715,11 @@ pub mod orchestrate {
         // wrap under the stream's owner.
         let mut changed_streams: Vec<(String, u64, String)> = Vec::new();
         for rec in &streams {
+            // v55.0.0 (#981) — an unkept, caller-supplied epoch is wrapped to
+            // nobody, newcomers included (CC 5.3.3.2.5).
+            if !rec.keep {
+                continue;
+            }
             let already: std::collections::HashSet<String> = backend
                 .stream_dek_grants(&rec.stream_id, rec.epoch, &rec.owner_key_id)
                 .await?
@@ -6805,110 +6810,117 @@ pub mod blob_invariants {
     where
         B: BlobStorage + FederationDirectory + Sync,
     {
-        use crate::federation::adopt_cascade::adopt_sealed_chunk;
-        use crate::federation::chunk_dag_cascade::orchestrate::put_blob_chunk_scoped;
-        use crate::federation::community_dek::lifecycle_support::seed_community;
-        use crate::federation::types::cohort_scope::COMMUNITY;
-        let run = uuid::Uuid::new_v4().simple().to_string();
-        // Two members of one community: the AUTHOR and the ADOPTER.
-        let author_node = format!("{tag}-author-{run}");
-        let author_signer = node_signer(backend, &author_node).await;
-        let author_adapter = crate::signing::LocalSignerHardwareAdapter::new(author_signer.clone());
-        let author = author_signer.derived_key_id();
-        let node = format!("{tag}-node-{run}");
-        let signer = node_signer(backend, &node).await;
-        let adapter = crate::signing::LocalSignerHardwareAdapter::new(signer.clone());
-        let our = signer.derived_key_id();
-        let family: Vec<String> = Vec::new();
-        let comm = format!("{tag}-comm-{run}");
-        let alice = format!("{tag}-alice-{run}");
-        let alice_occ = format!("{tag}-alice-occ-{run}");
-        let bob = format!("{tag}-bob-{run}");
-        let bob_occ = format!("{tag}-bob-occ-{run}");
-        seed_community(backend, &comm, &[(&alice, &alice_occ), (&bob, &bob_occ)]).await;
-        join_as_occurrence(backend, &alice, &our).await;
-        join_as_occurrence(backend, &bob, &author).await;
+        // v55.0.0 (#977): a LEGACY room stream — the pre-v55 per-chunk-bound
+        // DAG every upgraded node still holds; its assertions are unchanged.
+        crate::federation::chunk_dag_cascade::invariants::legacy_room_streams(async move {
+            use crate::federation::adopt_cascade::adopt_sealed_chunk;
+            use crate::federation::chunk_dag_cascade::orchestrate::put_blob_chunk_scoped;
+            use crate::federation::community_dek::lifecycle_support::seed_community;
+            use crate::federation::types::cohort_scope::COMMUNITY;
+            let run = uuid::Uuid::new_v4().simple().to_string();
+            // Two members of one community: the AUTHOR and the ADOPTER.
+            let author_node = format!("{tag}-author-{run}");
+            let author_signer = node_signer(backend, &author_node).await;
+            let author_adapter =
+                crate::signing::LocalSignerHardwareAdapter::new(author_signer.clone());
+            let author = author_signer.derived_key_id();
+            let node = format!("{tag}-node-{run}");
+            let signer = node_signer(backend, &node).await;
+            let adapter = crate::signing::LocalSignerHardwareAdapter::new(signer.clone());
+            let our = signer.derived_key_id();
+            let family: Vec<String> = Vec::new();
+            let comm = format!("{tag}-comm-{run}");
+            let alice = format!("{tag}-alice-{run}");
+            let alice_occ = format!("{tag}-alice-occ-{run}");
+            let bob = format!("{tag}-bob-{run}");
+            let bob_occ = format!("{tag}-bob-occ-{run}");
+            seed_community(backend, &comm, &[(&alice, &alice_occ), (&bob, &bob_occ)]).await;
+            join_as_occurrence(backend, &alice, &our).await;
+            join_as_occurrence(backend, &bob, &author).await;
 
-        // The author appends seq 0 to its own stream: a sealed chunk.
-        let src_stream = format!("{tag}-src-{run}");
-        let put = put_blob_chunk_scoped(
-            backend,
-            &author_adapter,
-            COMMUNITY,
-            Some(&comm),
-            &src_stream,
-            0,
-            b"segment 0",
-            1,
-            None,
-        )
-        .await
-        .unwrap();
-        let epoch = put.epoch.expect("community chunk carries its epoch");
-        let Some(BlobBody::Inline(env)) = backend.get_blob(&put.chunk_sha256).await.unwrap() else {
-            panic!("chunk inline");
-        };
-        // The adopter holds it under the AUTHOR's stream id, as received.
-        let stream = format!("{tag}-adopted-{run}");
-        let ctx = hold_ctx(false, &our, &family);
-        let prov = community_provenance(&author, &comm, epoch);
-        // The chunk row already exists (same backend); the ADOPTED stream is
-        // a new stream id, so the floor's stream row is written here.
-        let sha = adopt_sealed_chunk(backend, &ctx, &stream, 0, &env, 1, 9, &prov)
+            // The author appends seq 0 to its own stream: a sealed chunk.
+            let src_stream = format!("{tag}-src-{run}");
+            let put = put_blob_chunk_scoped(
+                backend,
+                &author_adapter,
+                COMMUNITY,
+                Some(&comm),
+                &src_stream,
+                0,
+                b"segment 0",
+                1,
+                None,
+            )
             .await
-            .unwrap_or_else(|e| panic!("{tag} I50: adopt chunk: {e}"));
-        assert_eq!(sha, put.chunk_sha256);
-        let head = backend
-            .stream_chunks(&stream)
-            .await
-            .unwrap()
-            .stream
-            .expect("stream row");
-        assert_eq!(
+            .unwrap();
+            let epoch = put.epoch.expect("community chunk carries its epoch");
+            let Some(BlobBody::Inline(env)) = backend.get_blob(&put.chunk_sha256).await.unwrap()
+            else {
+                panic!("chunk inline");
+            };
+            // The adopter holds it under the AUTHOR's stream id, as received.
+            let stream = format!("{tag}-adopted-{run}");
+            let ctx = hold_ctx(false, &our, &family);
+            let prov = community_provenance(&author, &comm, epoch);
+            // The chunk row already exists (same backend); the ADOPTED stream is
+            // a new stream id, so the floor's stream row is written here.
+            let sha = adopt_sealed_chunk(backend, &ctx, &stream, 0, &env, 1, 9, &prov)
+                .await
+                .unwrap_or_else(|e| panic!("{tag} I50: adopt chunk: {e}"));
+            assert_eq!(sha, put.chunk_sha256);
+            let head = backend
+                .stream_chunks(&stream)
+                .await
+                .unwrap()
+                .stream
+                .expect("stream row");
+            assert_eq!(
             head.owner_key_id.as_deref(),
             Some(author.as_str()),
             "{tag} I50: the adopted stream's owner is not the AUTHOR — a relay could take it over"
         );
-        assert_eq!(head.community_key_id.as_deref(), Some(comm.as_str()));
-        // The adopter — a member, with a signer — cannot append as if it owned it.
-        let err = put_blob_chunk_scoped(
-            backend,
-            &adapter,
-            COMMUNITY,
-            Some(&comm),
-            &stream,
-            1,
-            b"hijack",
-            1,
-            None,
-        )
-        .await
-        .expect_err(&format!(
-            "{tag} I50: the ADOPTER appended to a stream it merely holds — the stream's owner \
+            assert_eq!(head.community_key_id.as_deref(), Some(comm.as_str()));
+            // The adopter — a member, with a signer — cannot append as if it owned it.
+            let err = put_blob_chunk_scoped(
+                backend,
+                &adapter,
+                COMMUNITY,
+                Some(&comm),
+                &stream,
+                1,
+                b"hijack",
+                1,
+                None,
+            )
+            .await
+            .expect_err(&format!(
+                "{tag} I50: the ADOPTER appended to a stream it merely holds — the stream's owner \
              must be the author (I41 across nodes)"
-        ));
-        assert!(
-            matches!(err, BlobError::InvalidArgument(_)),
-            "{tag} I50: refused as a foreign writer, got {err:?}"
-        );
-        assert!(
-            !err.to_string().contains(&author),
-            "{tag} I50: the refusal named the owner: {err}"
-        );
-        // The author itself still can (it owns the stream on every node).
-        put_blob_chunk_scoped(
-            backend,
-            &author_adapter,
-            COMMUNITY,
-            Some(&comm),
-            &stream,
-            1,
-            b"segment 1",
-            1,
-            None,
-        )
+            ));
+            assert!(
+                matches!(err, BlobError::InvalidArgument(_)),
+                "{tag} I50: refused as a foreign writer, got {err:?}"
+            );
+            assert!(
+                !err.to_string().contains(&author),
+                "{tag} I50: the refusal named the owner: {err}"
+            );
+            // The author itself still can (it owns the stream on every node).
+            put_blob_chunk_scoped(
+                backend,
+                &author_adapter,
+                COMMUNITY,
+                Some(&comm),
+                &stream,
+                1,
+                b"segment 1",
+                1,
+                None,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{tag} I50: the author refused its own stream: {e}"));
+        })
         .await
-        .unwrap_or_else(|e| panic!("{tag} I50: the author refused its own stream: {e}"));
     }
 
     // ── I51 ──────────────────────────────────────────────────────────────

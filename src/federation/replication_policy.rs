@@ -113,13 +113,20 @@ pub enum EnvelopeKind {
     /// one identity — epoch-addressed `(community, minter, epoch)` for
     /// community / affiliations, content-addressed `(at_rest_sha256,
     /// cohort_scope, owner)` for self / family. Rides the attestation store
-    /// as a `key_grant:*` row (`key_grant::SignedKeyGrantSet`), so peers pull
+    /// as a `key_grant:*` row (the retired v44.3–v54 set row), so peers pull
     /// it through the cursor they already have; a receiver routes it to
     /// `apply_replicated_key_grant`, which resolves the signer from its OWN
     /// directory (never the sender), requires the minter (epoch axis) or the
     /// author (content axis) to have signed, and projects every wrap as a
     /// UNION ([`Projection::KeyGrants`]). Grants are never retracted —
     /// forward secrecy is by rotation — so this kind has no withdraw.
+    ///
+    /// v55.0.0 (CIRISPersist#989, CC 3.3.2 rc7): the SET is retired. A wrap is
+    /// one `scores` row per recipient on `key_grant:{axis}:v1`
+    /// (`key_grant::SignedKeyGrantRow`), which rides the attestation kind
+    /// itself; the typed attestation doors project it. The kind stays in this
+    /// appended, position-pinned vocabulary as the name of the plane the rows
+    /// project into.
     KeyGrant,
     /// v48.0.0 (CIRISPersist#860) — `federation_community_membership_widenings`:
     /// the addition plane, the mirror of the revocation (E4); the 17th kind, APPENDED. A forged
@@ -591,8 +598,8 @@ pub const SETTLE_EXEMPT: &[(EnvelopeKind, &str)] = &[
     ),
     (
         EnvelopeKind::KeyGrant,
-        "rides the attestation store; a re-delivered set must still reach the apply door, which \
-         projects a pending set once its bytes name the author (I65 step 4)",
+        "rides the attestation store; a re-delivered row must still reach the apply door, which \
+         projects a pending row once its bytes name the author (I65 step 4)",
     ),
 ];
 

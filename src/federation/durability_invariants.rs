@@ -557,23 +557,17 @@ pub(crate) mod engine_bodies {
         // node B adopts the manifest AS RECEIVED (inline, not promoted: no
         // chunk held). Nothing on the row says DAG; the opened plaintext does.
         p.a.emit_pending_key_grants().await.unwrap();
-        for set in
-            p.sa.list_attestations_by(&p.key_a)
-                .await
-                .unwrap()
-                .into_iter()
-                .filter(|x| {
-                    x.attestation_type
-                        == crate::federation::key_grant::KEY_GRANT_CONTENT_ATTESTATION_TYPE
-                        || x.attestation_type
-                            == crate::federation::key_grant::KEY_GRANT_STREAM_ATTESTATION_TYPE
-                })
+        // v55.0.0 (#989) — the rows A's plane delivers to B.
+        for set in crate::federation::key_grant_invariants::two_node::key_grant_rows_for(
+            p.sa.as_ref(),
+            &p.key_a,
+            &p.key_b,
+        )
+        .await
         {
-            p.b.apply_replicated_key_grant(crate::federation::key_grant::SignedKeyGrantSet {
-                attestation: set,
-            })
-            .await
-            .expect("B applies A's set");
+            p.b.apply_replicated_key_grant(set)
+                .await
+                .expect("B applies A's row");
         }
         let Some(crate::federation::BlobBody::Inline(menv)) = p.sa.get_blob(&whole).await.unwrap()
         else {

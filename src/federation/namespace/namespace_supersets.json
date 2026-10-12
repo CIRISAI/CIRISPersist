@@ -15310,6 +15310,46 @@
     "manifest_round": "backfill-1052"
    },
    {
+    "decimal_id": "3.3.2",
+    "claim_id": "CLM-key-grant-rows",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/key_grant.rs#check_key_grant_row_admission",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v55-989"
+   },
+   {
+    "decimal_id": "3.3.2",
+    "claim_id": "CLM-key-grant-rows",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/key_grant.rs#KeyGrantRow::from_attestation",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v55-989"
+   },
+   {
+    "decimal_id": "3.3.2",
+    "claim_id": "CLM-key-grant-rows",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/key_grant.rs#project_key_grant_row",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v55-989"
+   },
+   {
+    "decimal_id": "5.3.3.2.5",
+    "claim_id": "CLM-one-chunk-seal",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/chunk_dag_cascade.rs#register_stream_epoch_dek",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v55-981"
+   },
+   {
+    "decimal_id": "5.3.3.2.5",
+    "claim_id": "CLM-one-chunk-seal",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/chunk_dag_cascade.rs#stream_epoch_verdict",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v55-981"
+   },
+   {
     "decimal_id": "3.4.5",
     "claim_id": "CLM-config-self-or-owner-gate",
     "repo": "CIRISPersist",

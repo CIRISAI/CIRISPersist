@@ -204,6 +204,32 @@ pub fn assemble(
     sig: ciris_crypto::HybridSignature,
     input: EmitAttestationInput,
 ) -> Result<(Attestation, EmittedAttestation), Error> {
+    let (row, emitted) = assemble_any_row_type(key_id, canonical, sig, input)?;
+    // v53.0.0 (CIRISPersist#975, CC 2.4) — the closed row-type slot at the
+    // mint, for the same reason: a row assembled and put later fails where it
+    // was built. Uncounted; the put door counts what it admits.
+    super::row_type::check_row_type(&row)?;
+    Ok((row, emitted))
+}
+
+/// [`assemble`] without the row-type slot: for a witness that must put a
+/// validly signed row of a refused type (a retired carrier) at a door.
+#[cfg(all(test, any(feature = "postgres", feature = "sqlite")))]
+pub(crate) fn assemble_for_door_witness(
+    key_id: String,
+    canonical: &[u8],
+    sig: ciris_crypto::HybridSignature,
+    input: EmitAttestationInput,
+) -> Result<(Attestation, EmittedAttestation), Error> {
+    assemble_any_row_type(key_id, canonical, sig, input)
+}
+
+fn assemble_any_row_type(
+    key_id: String,
+    canonical: &[u8],
+    sig: ciris_crypto::HybridSignature,
+    input: EmitAttestationInput,
+) -> Result<(Attestation, EmittedAttestation), Error> {
     use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
     use sha2::{Digest, Sha256};
 
@@ -338,10 +364,6 @@ pub fn assemble(
     // store call one layer away. Also catches an `input` whose envelope was
     // stamped for a DIFFERENT signer than the `key_id` assembling it.
     super::admission::check_row_column_binding(&row)?;
-    // v53.0.0 (CIRISPersist#975, CC 2.4) — the closed row-type slot at the
-    // mint, for the same reason: a row assembled and put later fails where it
-    // was built. Uncounted; the put door counts what it admits.
-    super::row_type::check_row_type(&row)?;
     let emitted = EmittedAttestation {
         attestation_id: row.attestation_id.clone(),
         attesting_key_id: key_id,

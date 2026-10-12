@@ -414,95 +414,66 @@ pub fn row_types() -> Option<&'static RowTypes> {
     .as_ref()
 }
 
-/// **TEMPORARY — an rc6 carrier rc7 retired, still admitted
-/// (CIRISPersist#989).** `(kind, pattern, sample, token)`, copied verbatim
-/// from the rc6 manifest's `_meta.row_types.carriers` (CC 1.0-rc6 @
-/// `3c3e63f`).
-///
-/// CC 1.0-rc7 empties `_meta.row_types.carriers` (CC 2.4: "For one rc6 week
-/// it also admitted a second class, the carrier … Both are gone"):
-/// `holds_bytes` becomes the `custody:ack:v1` holding claim (CC 3.1.3.3,
-/// CIRISConstitution#141) and the key-grant set becomes one `scores` row per
-/// recipient on `key_grant:{axis}:v1` (CC 3.3.2, CIRISConstitution#143).
-/// The v55 re-vendor (CIRISPersist#753, slice A0) kept both rc6 carriers
-/// admitted here while persist still wrote them. v55 slice A
-/// (CIRISPersist#989) moved the holding claim onto `custody:ack:v1` and
-/// removed the `holds_bytes` pattern: a `holds_bytes` row is now a retired
-/// carrier, refused at every door and never served
-/// ([`RETIRED_CARRIER_STEMS`]). The key-grant
-/// set stays admitted, with the rc6 carrier shape still enforced, until
-/// slice B moves its emitter onto per-recipient rows; whichever slice merges
-/// last deletes this const.
-///
-/// It admits exactly the remaining rc6 pattern and nothing else: the vendored
-/// carriers are read first, then these, by the same whole-string,
-/// re-anchored match ([`carrier_row_type`], [`carriers`]).
-/// `tests::the_rc6_carrier_exception_admits_only_the_retired_carriers`
-/// pins that, and the from-disk gate
-/// `tests::the_rc6_carrier_exception_does_not_outlive_v55` fails the build
-/// once `CHANGELOG.md` dates a 55.0.0 or later release while this const is
-/// still non-empty, so v55.0.0 cannot ship with it.
-pub const RC6_RETIRED_CARRIERS_ADMITTED_UNTIL_989: &[(&str, &str, &str, &str)] = &[(
-    "key_grant",
-    "^key_grant:(content|epoch|stream):v1$",
-    "key_grant:epoch:v1",
-    "key_grant:{axis}:{version}",
-)];
-
 /// The retired rc6 holding-claim carrier's type stem (`holds_bytes:`), named
 /// once: [`RETIRED_CARRIER_STEMS`] refuses it, and the re-ack
 /// (`holding_claim::reack_own_claims`) reads this node's OWN held rows of it
 /// once, to claim those bytes as `custody:ack:v1` after an upgrade.
 pub const RETIRED_HOLDING_CLAIM_STEM: &str = "holds_bytes:";
 
-/// v55.0.0 (CIRISPersist#989, CC 2.4 rc7, CIRISConstitution#141) — **the
-/// carrier families rc7 retired whose rows persist refuses at EVERY door and
-/// leaves out of EVERY serve read, whatever the row-type enforcement mode**:
-/// `(type stem, why)`. Matched on the stem, so no spelling of the family —
-/// the rc6 8-hex form or any other — is admitted. The vendored cut carries no
-/// list of retired carriers (`_meta.row_types` names only what IS admitted),
-/// so this is persist's, beside [`RC6_RETIRED_CARRIERS_ADMITTED_UNTIL_989`]
-/// and [`RETIRED_FAMILIES`], read by `row_type::retired_carrier`.
-/// `holds_bytes` became the `custody:ack:v1` holding claim (CC 3.1.3.3); the
-/// key-grant set joins this list in v55 slice B, when its emitter moves.
-pub const RETIRED_CARRIER_STEMS: &[(&str, &str)] = &[(
-    RETIRED_HOLDING_CLAIM_STEM,
-    "CC 2.4 rc7 / CIRISConstitution#141: the holding claim is custody:ack:v1 at the content's \
-     scope",
-)];
+/// v55.0.0 (CIRISPersist#989, CC 2.4 rc7, CIRISConstitution#141/#143) —
+/// **the carrier families rc7 retired whose rows persist refuses at EVERY
+/// door and leaves out of EVERY serve read, whatever the row-type enforcement
+/// mode**: `(type stem, why)`. CC 1.0-rc7 empties `_meta.row_types.carriers`
+/// (CC 2.4: "For one rc6 week it also admitted a second class, the carrier …
+/// Both are gone"), and the vendored cut carries no list of retired carriers
+/// (`_meta.row_types` names only what IS admitted), so this is persist's,
+/// beside [`RETIRED_FAMILIES`], read by `row_type::retired_carrier` and
+/// `row_type::not_retired_carrier_sql`. A PREFIX match: the holding-claim
+/// entry is a stem, so no spelling of `holds_bytes` — the rc6 8-hex form or
+/// any other — is admitted; each key-grant entry names a whole type, because
+/// the filter is class-blind and a bare `key_grant:` stem would also name a
+/// future type sharing it.
+///
+/// The v55 re-vendor (CIRISPersist#753, slice A0) kept both rc6 carriers
+/// admitted by a temporary exception while persist still wrote them. Slice A
+/// moved the holding claim onto `custody:ack:v1` (CC 3.1.3.3) and slice B
+/// moved each key wrap onto a per-recipient `scores` row on
+/// `key_grant:{axis}:v1` (CC 3.3.2); with both merged the exception is
+/// deleted, and I701 holds it deleted.
+pub const RETIRED_CARRIER_STEMS: &[(&str, &str)] = &[
+    (
+        RETIRED_HOLDING_CLAIM_STEM,
+        "CC 2.4 rc7 / CIRISConstitution#141: the holding claim is custody:ack:v1 at the \
+         content's scope",
+    ),
+    // The rc6 key-grant SET, retired by CC 2.4 rc7 (CIRISConstitution#143): a
+    // wrap is a per-recipient `scores` row on `key_grant:{axis}:v1`. Each node
+    // re-emits its own wraps as rows (operator ruling Q3, V192).
+    ("key_grant:content:v1", "CIRISPersist#989"),
+    ("key_grant:epoch:v1", "CIRISPersist#989"),
+    ("key_grant:stream:v1", "CIRISPersist#989"),
+];
 
 /// Every carrier row type the row-type gate admits: the vendored cut's
-/// `_meta.row_types.carriers`, then [`RC6_RETIRED_CARRIERS_ADMITTED_UNTIL_989`].
+/// `_meta.row_types.carriers` and nothing persist adds (rc7 registers none).
 /// Built once. The one list [`carrier_row_type`] and the serve filter
 /// ([`crate::federation::row_type::registered_row_type_sql`]) read.
 #[must_use]
 pub fn carriers() -> &'static [CarrierRowType] {
     static C: OnceLock<Vec<CarrierRowType>> = OnceLock::new();
     C.get_or_init(|| {
-        let mut out: Vec<CarrierRowType> = row_types()
+        row_types()
             .map(|rt| rt.carriers.clone())
-            .unwrap_or_default();
-        for (kind, pattern, sample, token) in RC6_RETIRED_CARRIERS_ADMITTED_UNTIL_989 {
-            if !out.iter().any(|c| c.kind == *kind) {
-                out.push(CarrierRowType {
-                    kind: (*kind).to_owned(),
-                    pattern: (*pattern).to_owned(),
-                    sample: (*sample).to_owned(),
-                    token: (*token).to_owned(),
-                });
-            }
-        }
-        out
+            .unwrap_or_default()
     })
 }
 
 /// The admitted CARRIER row type (CC 2.4) `attestation_type` is a
 /// whole-string, byte-exact match for, or `None`.
 ///
-/// Each carrier's pattern ([`carriers`]: the vendored `_meta.row_types`, plus
-/// the temporary [`RC6_RETIRED_CARRIERS_ADMITTED_UNTIL_989`]) is compiled
-/// once, re-anchored `\A(?:…)\z` whatever anchors the row spells, so a
-/// trailing newline is never admitted. The row-type gate (CIRISPersist#975,
+/// Each carrier's pattern ([`carriers`]: the vendored `_meta.row_types`) is
+/// compiled once, re-anchored `\A(?:…)\z` whatever anchors the row spells, so
+/// a trailing newline is never admitted. The row-type gate (CIRISPersist#975,
 /// [`crate::federation::row_type`]) reads this for the carrier's envelope
 /// `kind`; no type constant in the tree decides admission.
 #[must_use]
@@ -1055,9 +1026,9 @@ mod tests {
     }
 
     /// CC 2.4 (rc7) — the closed row-type set is vendored and parses: the five
-    /// and NO carrier (rc7 retired both, CIRISConstitution#141/#143). The rc6
-    /// carriers persist still admits are [`RC6_RETIRED_CARRIERS_ADMITTED_UNTIL_989`],
-    /// pinned by the tests below. Enforcement is CIRISPersist#975.
+    /// and NO carrier (rc7 retired both, CIRISConstitution#141/#143). Persist
+    /// admits no carrier of its own either (v55 slices A and B retired the
+    /// emitters; I700, I701). Enforcement is CIRISPersist#975.
     #[test]
     fn the_row_type_set_is_vendored_and_parses() {
         let rt = row_types().expect("rc7 carries _meta.row_types");
@@ -1075,69 +1046,68 @@ mod tests {
         assert!(
             rt.carriers.is_empty(),
             "rc7 registers no carrier; a re-vendor that brings one back must re-read \
-             RC6_RETIRED_CARRIERS_ADMITTED_UNTIL_989: {:?}",
+             RETIRED_CARRIER_STEMS: {:?}",
             rt.carriers
         );
         // The vectors file carries CC's row-type vectors beside the dimension
         // ones, replayed in full by `row_type_invariants::pure::i371`. The
         // carrier half is replayed here against the one reader that answers
-        // "carrier": a vector CC classes `carrier` is one, and the only type
-        // persist answers "carrier" for against CC's refusal is the one the
-        // temporary exception still names (v55 slice A retired holds_bytes).
+        // "carrier": a vector CC classes `carrier` is one, and every other is
+        // not. v55.0.0 (slices A and B, #989): persist departs from no vector;
+        // the rc6 carriers it once excepted are retired.
         let vectors: serde_json::Value =
             serde_json::from_str(super::super::matcher::VECTORS_JSON).unwrap();
         let rtv = vectors["row_type_vectors"]
             .as_array()
             .expect("row_type_vectors");
         assert_eq!(rtv.len(), 25);
-        let mut excepted = Vec::new();
+        let mut departures = Vec::new();
         for v in rtv {
             let t = v["attestation_type"].as_str().unwrap();
-            if is_registered_carrier_row_type(t) && v["class"] != "carrier" {
-                excepted.push(t);
-            } else {
-                assert_eq!(
-                    is_registered_carrier_row_type(t),
-                    v["class"] == "carrier",
-                    "{t:?}"
-                );
+            if is_registered_carrier_row_type(t) != (v["class"] == "carrier") {
+                departures.push(t);
             }
         }
-        assert_eq!(
-            excepted,
-            ["key_grant:epoch:v1"],
-            "the vector persist departs from is exactly the rc6 carrier still excepted"
+        assert!(
+            departures.is_empty(),
+            "persist departs from no CC row-type vector: {departures:?}"
         );
         assert!(rtv
             .iter()
             .all(|v| v["refusal"].is_null() || v["refusal"] == rt.refusal));
     }
 
-    /// I700 (CIRISPersist#753, #989) — the temporary carrier exception admits
-    /// the retired rc6 carrier it still names (the key-grant set; v55 slice A
-    /// removed `holds_bytes`), byte-exact and whole-string, and nothing else:
-    /// no other kind, no other axis, no other version, no case variant, no
-    /// trailing newline, no dimension spelling of the same family — and no
-    /// `holds_bytes` row of any spelling.
+    /// I700 (CIRISPersist#753, #989) — persist admits no carrier rc7 does not:
+    /// [`carriers`] is the vendored list exactly (empty at rc7). Neither rc6
+    /// carrier is admitted in any spelling — the key-grant set's three types
+    /// (slice B) and `holds_bytes` (slice A) — nor any near spelling of either,
+    /// and every rc6 carrier type is a RETIRED carrier
+    /// ([`RETIRED_CARRIER_STEMS`]): refused at every door, never served.
     #[test]
     fn the_rc6_carrier_exception_admits_only_the_retired_carriers() {
+        let vendored: Vec<&str> = row_types()
+            .map(|rt| rt.carriers.iter().map(|c| c.kind.as_str()).collect())
+            .unwrap_or_default();
         let kinds: Vec<&str> = carriers().iter().map(|c| c.kind.as_str()).collect();
-        assert_eq!(kinds, ["key_grant"], "I700");
-        for (kind, pattern, sample, _) in RC6_RETIRED_CARRIERS_ADMITTED_UNTIL_989 {
-            let c = carrier_row_type(sample).expect("I700: the sample is admitted");
-            assert_eq!(c.kind, *kind);
-            assert_eq!(c.pattern, *pattern);
-        }
+        assert_eq!(kinds, vendored, "I700: persist adds no carrier");
+        assert!(kinds.is_empty(), "I700: rc7 admits no carrier");
         for t in [
             "key_grant:content:v1",
             "key_grant:epoch:v1",
             "key_grant:stream:v1",
-        ] {
-            assert!(is_registered_carrier_row_type(t), "I700 admits {t:?}");
-        }
-        for t in [
             "holds_bytes:sha256:0a1b2c3d",
             "holds_bytes:sha256:ffffffff",
+        ] {
+            assert!(
+                !is_registered_carrier_row_type(t),
+                "I700: a retired rc6 carrier is not admitted: {t:?}"
+            );
+            assert!(
+                crate::federation::row_type::retired_carrier(t).is_some(),
+                "I700: {t:?} is a retired carrier"
+            );
+        }
+        for t in [
             "holds_bytes:sha256:0a1b2c3",
             "holds_bytes:sha256:0a1b2c3d0",
             "holds_bytes:sha256:0A1B2C3D",
@@ -1157,103 +1127,64 @@ mod tests {
         ] {
             assert!(
                 !is_registered_carrier_row_type(t),
-                "I700: the exception must not admit {t:?}"
+                "I700: nothing admits {t:?}"
             );
         }
     }
 
-    /// I701 (CIRISPersist#753, #989) — FROM DISK: the temporary carrier
-    /// exception does not outlive v55. `CHANGELOG.md` must carry an
-    /// `## [55.0.0] - UNRELEASED` heading while the const is non-empty; once a
-    /// 55.0.0-or-later heading carries a date (the release is cut) and the
-    /// const still has an entry in production source, this fails, so the
-    /// release that retires the carriers (slice B) must delete it. A missing
-    /// marker fails too: a gate that cannot find its marker is not a pass.
-    ///
-    /// The const is counted in the registry source with comments and every
-    /// test-only item removed (`crate::test_cfg::is_test_only_cfg`), so a
-    /// commented-out or test-gated copy neither keeps it alive nor hides it.
+    /// I701 (CIRISPersist#753, #989) — FROM DISK: the temporary rc6 carrier
+    /// exception is gone and stays gone. A0 added
+    /// `RC6_RETIRED_CARRIERS_ADMITTED_UNTIL_989` to keep the two rc6 carriers
+    /// admitted while persist still wrote them; this gate once failed the
+    /// build if v55.0.0 was cut with it non-empty. Slices A and B retired both
+    /// emitters, so the const is deleted: no `.rs` file under `src/` names it
+    /// in code (comments stripped, tests included), so neither a production
+    /// nor a test-gated copy can bring the exception back. Non-vacuous: the
+    /// walk must read this file and the registry's own carrier reader.
     #[test]
     fn the_rc6_carrier_exception_does_not_outlive_v55() {
-        fn production_entries(src: &str) -> usize {
-            let mut out = Vec::new();
-            let mut skip_depth: Option<i32> = None;
-            let mut depth = 0i32;
-            let mut pending_test_item = false;
-            for line in src.lines() {
+        // Built from parts, so this test's own source does not name it.
+        let needle = concat!("RC6_RETIRED_CARRIERS", "_ADMITTED_UNTIL_989");
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for e in std::fs::read_dir(dir).expect("src/ reads") {
+                let p = e.expect("a dir entry").path();
+                if p.is_dir() {
+                    walk(&p, out);
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    out.push(p);
+                }
+            }
+        }
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        walk(&src, &mut files);
+        let mut read_self = false;
+        let mut hits = Vec::new();
+        for f in &files {
+            let text = std::fs::read_to_string(f).expect("a source file reads");
+            if f.ends_with("federation/namespace/registry.rs") {
+                assert!(
+                    text.contains("pub fn carriers()"),
+                    "I701: the walk read the registry's carrier reader"
+                );
+                read_self = true;
+            }
+            for (n, line) in text.lines().enumerate() {
                 let code = line.split("//").next().unwrap_or("");
-                if skip_depth.is_none() && crate::test_cfg::is_test_only_cfg(line) {
-                    pending_test_item = true;
-                    continue;
+                if code.contains(needle) {
+                    hits.push(format!("{}:{}", f.display(), n + 1));
                 }
-                let opens = code.matches('{').count() as i32;
-                let closes = code.matches('}').count() as i32;
-                if pending_test_item && opens > 0 {
-                    skip_depth = Some(depth);
-                    pending_test_item = false;
-                }
-                depth += opens - closes;
-                if let Some(d) = skip_depth {
-                    if depth <= d {
-                        skip_depth = None;
-                    }
-                    continue;
-                }
-                out.push(code);
             }
-            let prod = out.join("\n");
-            let decl = "pub const RC6_RETIRED_CARRIERS_ADMITTED_UNTIL_989";
-            let Some(i) = prod.find(decl) else { return 0 };
-            let body = &prod[i..];
-            let body = &body[..body.find("];").expect("the const closes")];
-            // One tuple opener per entry, read after the value's `= &[`: a
-            // lone entry's `(` closes that line (`= &[(`) and each of several
-            // stands on its own line; a pattern's own parentheses sit inside
-            // a string, never alone.
-            let rhs = &body[body.find("= &[").expect("the const's value") + 4..];
-            rhs.lines().filter(|l| l.trim() == "(").count()
-        }
-        let entries = production_entries(include_str!("registry.rs"));
-        assert_eq!(
-            entries,
-            RC6_RETIRED_CARRIERS_ADMITTED_UNTIL_989.len(),
-            "I701: the from-disk count must read the const the build compiled"
-        );
-        let changelog = include_str!("../../../CHANGELOG.md");
-        let mut marker = false;
-        let mut cut = Vec::new();
-        for line in changelog.lines() {
-            let Some(rest) = line.strip_prefix("## [") else {
-                continue;
-            };
-            let Some((ver, tail)) = rest.split_once(']') else {
-                continue;
-            };
-            let Some(major) = ver.split('.').next().and_then(|m| m.parse::<u32>().ok()) else {
-                continue;
-            };
-            if major < 55 {
-                continue;
-            }
-            if ver == "55.0.0" && tail.trim() == "- UNRELEASED" {
-                marker = true;
-            } else {
-                cut.push(line.to_owned());
-            }
-        }
-        if entries == 0 {
-            return;
         }
         assert!(
-            cut.is_empty(),
-            "I701: RC6_RETIRED_CARRIERS_ADMITTED_UNTIL_989 outlived v55 — {cut:?} is cut while the \
-             temporary carrier exception still admits {entries} retired rc6 carrier(s). Retire the \
-             emitters onto rc7's grammar (CIRISPersist#989) and delete the const."
+            read_self && files.len() > 100,
+            "I701: the walk read {} files and never the registry",
+            files.len()
         );
         assert!(
-            marker,
-            "I701: no `## [55.0.0] - UNRELEASED` heading in CHANGELOG.md — the temporary carrier \
-             exception's marker is missing, so this gate cannot tell whether v55 is cut"
+            hits.is_empty(),
+            "I701: the rc6 carrier exception is back in code: {hits:?}. rc7 admits no \
+             carrier; a retired one belongs in RETIRED_CARRIER_STEMS."
         );
     }
 

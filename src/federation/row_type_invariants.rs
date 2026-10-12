@@ -8,15 +8,15 @@
 //!
 //! - **I370** an unregistered type is refused at the local put, the replication
 //!   apply and the emit under `Enforce`; nothing is stored.
-//! - **I371** CC's `row_type_vectors` (25 at rc7) replay through [`classify`];
-//!   the rc6 carrier persist still admits until v55 slice B (the key-grant
-//!   set) is the only departure — v55 slice A retired `holds_bytes`
+//! - **I371** CC's `row_type_vectors` (25 at rc7) replay through [`classify`]
+//!   with no departure: v55 slices A and B retired both rc6 carriers
 //!   (CIRISPersist#989).
-//! - **I372** the carrier shape: every violation refused (always enforced);
-//!   today's `key_grant` rows satisfy it.
-//! - **I373** a carrier token is never a `dimension` (since rc7, `key_grant:`
-//!   is a registered family held shut until #989 and the `holds_bytes`
-//!   token has no version tail).
+//! - **I372** the carrier shape, measured against the rc6 holding-claim
+//!   carrier's published shape (no type classifies `Carrier` at rc7); every
+//!   row of a retired carrier is refused whatever its shape; the key-grant
+//!   emit input is a structural `scores` row.
+//! - **I373** the retired holding-claim token is never a `dimension`
+//!   (`key_grant:{axis}:v1` is a dimension since slice B, gated by I742).
 //! - **I374** the dimension gate follows the dimension onto the four composers
 //!   (CC 2.4 ask 3): refused under `Enforce`, counted under `Report`; persist's
 //!   own composer dimensions admit.
@@ -68,19 +68,8 @@ mod pure {
                 RowTypeClass::Carrier(_) => Some("carrier"),
                 RowTypeClass::Unregistered => None,
             };
-            // rc7 retired both carriers; persist still admits the key-grant set
-            // until v55 slice B (`registry::RC6_RETIRED_CARRIERS_ADMITTED_UNTIL_989`).
-            // That vector, and only that, is answered "carrier" against CC's
-            // refusal.
-            if got == Some("carrier") && v["class"].is_null() {
-                assert!(
-                    registry::RC6_RETIRED_CARRIERS_ADMITTED_UNTIL_989
-                        .iter()
-                        .any(|(_, _, sample, _)| *sample == t),
-                    "{t:?}: answered carrier, and no retired rc6 carrier names it"
-                );
-                continue;
-            }
+            // rc7 retired both carriers, and since v55 slices A and B persist
+            // admits neither: no vector is a departure.
             assert_eq!(got, v["class"].as_str(), "{t:?}: {}", v["why"]);
             assert_eq!(
                 got.is_none(),
@@ -153,17 +142,25 @@ mod pure {
         .unwrap();
         assert_eq!(check_row_type(&hb).unwrap(), RowTypeClass::Structural);
 
-        let kg = "key_grant:epoch:v1";
-        let ok = || {
-            row(
-                kg,
-                serde_json::json!({"kind": "key_grant", "axis": "epoch"}),
-            )
+        // v55.0.0 (#989, slices A and B): rc7 admits no carrier and persist's
+        // rc6 exception is deleted, so NO row type classifies `Carrier`. The
+        // shape check stays for a carrier a future cut registers: it is
+        // measured against the rc6 holding-claim carrier's own published
+        // shape, and the door is asked what it makes of those rows now — a
+        // retired carrier, refused whatever its shape and whatever the mode.
+        let kg = "holds_bytes:sha256:0a1b2c3d";
+        assert_eq!(classify(kg), RowTypeClass::Unregistered);
+        let rc6 = registry::CarrierRowType {
+            kind: "holds_bytes".into(),
+            pattern: "^holds_bytes:sha256:[0-9a-f]{8}$".into(),
+            sample: kg.into(),
+            token: "holds_bytes:sha256:{prefix}".into(),
         };
-        let RowTypeClass::Carrier(c) = classify(kg) else {
-            panic!("key_grant:epoch:v1 is a carrier")
-        };
+        let c = &rc6;
+        let ok = || row(kg, serde_json::json!({"kind": "holds_bytes"}));
         assert_eq!(carrier_shape_violation(&ok(), c), None);
+        let e = check_row_type(&ok()).expect_err("a well-shaped retired carrier is refused");
+        assert_eq!(e.kind(), "federation_attestation_type_unregistered", "{e}");
 
         let cases: Vec<(Attestation, CarrierShapeViolation)> = vec![
             (
@@ -175,7 +172,7 @@ mod pure {
                 CarrierShapeViolation::NotSelfAttested,
             ),
             (
-                row(kg, serde_json::json!({"kind": "holds_bytes"})),
+                row(kg, serde_json::json!({"kind": "key_grant"})),
                 CarrierShapeViolation::KindDisagrees,
             ),
             (
@@ -185,18 +182,18 @@ mod pure {
             (
                 row(
                     kg,
-                    serde_json::json!({"kind": "key_grant", "dimension": "x:v1"}),
+                    serde_json::json!({"kind": "holds_bytes", "dimension": "x:v1"}),
                 ),
                 CarrierShapeViolation::CarriesDimension,
             ),
             (
-                row(kg, serde_json::json!({"kind": "key_grant", "score": 1})),
+                row(kg, serde_json::json!({"kind": "holds_bytes", "score": 1})),
                 CarrierShapeViolation::CarriesScore,
             ),
             (
                 row(
                     kg,
-                    serde_json::json!({"kind": "key_grant", "confidence": 1}),
+                    serde_json::json!({"kind": "holds_bytes", "confidence": 1}),
                 ),
                 CarrierShapeViolation::CarriesConfidence,
             ),
@@ -219,18 +216,19 @@ mod pure {
         ];
         for (r, want) in cases {
             assert_eq!(carrier_shape_violation(&r, c), Some(want));
-            // Enforced in BOTH modes — the shape is not behind the switch.
-            let e = check_row_type(&r).expect_err("a malformed carrier is refused");
-            assert_eq!(e.kind(), "federation_carrier_row_malformed");
-            assert!(e.to_string().contains(want.as_str()), "{e}");
+            // Refused under the shipped `Report` too: a retired carrier is
+            // refused before its shape is asked.
+            let e = check_row_type(&r).expect_err("a retired carrier is refused");
+            assert_eq!(e.kind(), "federation_attestation_type_unregistered", "{e}");
         }
         // A structural row carries whatever its own gates allow.
         assert!(check_row_type(&row("scores", serde_json::json!({"dimension": "x:v1"}))).is_ok());
     }
 
-    /// I372 — the real key-grant emit input (all three axes) assembles into a
-    /// carrier of the right shape: what `KeyGrantSet::emit_input` builds is
-    /// what the gate admits.
+    /// I372 — the key-grant emit input is a STRUCTURAL `scores` row since v55
+    /// slice B (CIRISPersist#989, CC 3.3.2 rc7): the rc6 SET types are no
+    /// carrier any more (they are a retired row type, never served), and
+    /// neither is the holding claim's (slice A).
     #[test]
     fn i372_key_grant_emit_input_is_a_carrier() {
         for t in [
@@ -238,20 +236,32 @@ mod pure {
             "key_grant:content:v1",
             "key_grant:stream:v1",
         ] {
-            let RowTypeClass::Carrier(c) = classify(t) else {
-                panic!("{t} is a registered carrier")
-            };
-            assert_eq!(
-                c.kind,
-                crate::federation::key_grant::KEY_GRANT_ENVELOPE_KIND
+            assert_eq!(classify(t), RowTypeClass::Unregistered, "{t}");
+            assert!(
+                crate::federation::row_type::retired_carrier(t).is_some(),
+                "{t}"
             );
         }
-        // v55.0.0 (CIRISPersist#989) — the retired carrier classifies
-        // unregistered, and is refused whatever the mode (I709).
+        // v55.0.0 (CIRISPersist#989) — the retired holding-claim carrier
+        // classifies unregistered, and is refused whatever the mode (I709).
         assert_eq!(
             classify("holds_bytes:sha256:abababab"),
             RowTypeClass::Unregistered
         );
+        let row = crate::federation::key_grant::KeyGrantRow {
+            axis: crate::federation::key_grant::KeyGrantAxis::Epoch {
+                community_key_id: "c".into(),
+                minter_key_id: "m".into(),
+                epoch: 0,
+            },
+            wrap: crate::federation::GrantWrap {
+                recipient_key_id: "r".into(),
+                wrap_algorithm: "x25519_mlkem768_aes256_gcm_hkdf_sha256".into(),
+                wrapped_dek: "w".into(),
+            },
+        };
+        let input = row.emit_input().unwrap();
+        assert_eq!(classify(&input.attestation_type), RowTypeClass::Structural);
     }
 
     /// I374 — the composer dimension gate, as the put doors call it.
@@ -596,8 +606,8 @@ pub(crate) mod bodies {
         let w = who(b, &format!("i372-{s}"), USER).await;
         let bad = || {
             input(
-                "key_grant:epoch:v1",
-                serde_json::json!({"kind": "key_grant", "dimension": "x:v1"}),
+                "holds_bytes:sha256:0a1b2c3d",
+                serde_json::json!({"kind": "holds_bytes", "size": 3, "dimension": "x:v1"}),
             )
         };
         let e = emit_with_local_signer(b, &w.signer, bad())
@@ -614,8 +624,8 @@ pub(crate) mod bodies {
             // assembles and graft the claim member into the envelope BEFORE the
             // mirror is stamped — the shape a non-persist producer would send.
             let mut ok = input(
-                "key_grant:epoch:v1",
-                serde_json::json!({"kind": "key_grant"}),
+                "holds_bytes:sha256:0a1b2c3d",
+                serde_json::json!({"kind": "holds_bytes", "size": 3}),
             );
             let c = stamp_and_canonicalize(&mut ok, &w.key, chrono::Utc::now()).unwrap();
             let sg = w.signer.sign_hybrid(&c).await.unwrap();
@@ -634,17 +644,19 @@ pub(crate) mod bodies {
     }
 
     /// **I373** — a carrier token is never a dimension. On `scores` it is
-    /// refused under the shipped setting (`key_grant:` is held shut by
-    /// `admission::REGISTERED_FAMILIES_HELD_SHUT` since rc7 registered it —
-    /// rc6 gated the stem; the `holds_bytes` token has no version tail). On a
-    /// composer `key_grant:` is refused by the same hold always, and the
-    /// `holds_bytes` token by the ask-3 dimension gate, so under `Enforce`.
+    /// refused under the shipped setting (the `holds_bytes` token has no
+    /// version tail); on a composer by the ask-3 dimension gate, so under
+    /// `Enforce`. (`key_grant:{axis}:v1` left this witness with v55 slice B:
+    /// it is the per-recipient row's dimension, I742.)
     pub async fn i373_carrier_token_is_not_a_dimension<B: FederationDirectory + Sync>(
         b: &B,
         s: &str,
     ) {
         let w = who(b, &format!("i373-{s}"), USER).await;
-        for dim in ["key_grant:epoch:v1", "holds_bytes:sha256:0a1b2c3d"] {
+        // v55 slice B (#989): `key_grant:{axis}:v1` is a DIMENSION now (the
+        // per-recipient row, gated by the key-grant rule, I742). The retired
+        // holding claim's token (slice A) is still refused as one.
+        for dim in ["holds_bytes:sha256:0a1b2c3d"] {
             for t in ["scores", "delegates_to"] {
                 let mut i = input(
                     t,
@@ -670,8 +682,8 @@ pub(crate) mod bodies {
                 );
             }
         }
-        // `scores` refuses both under the SHIPPED setting.
-        for dim in ["key_grant:epoch:v1", "holds_bytes:sha256:0a1b2c3d"] {
+        // `scores` refuses it under the SHIPPED setting.
+        for dim in ["holds_bytes:sha256:0a1b2c3d"] {
             let r = signed(
                 &w,
                 input(

@@ -648,10 +648,27 @@ pub(crate) mod bodies {
             !ra::may_receive(d, &sibling, &g).await.unwrap().allowed(),
             "I397 a sibling node does not"
         );
-        // A key-grant set naming the server-class laptop at a family it may
-        // not receive does not reach it by naming it (coordinator ruling).
+        // A key-grant row TO the server-class laptop, at a family it may not
+        // receive, does not reach it by naming it (coordinator ruling; v55.0.0
+        // #989: refers-to delivery is governed by the audience).
         let fam = format!("i397-f-{s}");
         family(d, &fam, &[&owner]).await;
+        let mut row = ts::bare_attestation(
+            "i397-row",
+            &sibling,
+            &laptop,
+            &serde_json::json!({
+                "dimension": crate::federation::key_grant::KEY_GRANT_CONTENT_DIMENSION,
+                "family_key_id": fam,
+            }),
+        );
+        row.attestation_type = crate::federation::types::attestation_type::SCORES.into();
+        row.cohort_scope = FAMILY.into();
+        assert!(
+            !ra::may_receive(d, &laptop, &row).await.unwrap().allowed(),
+            "I397 a key-grant row to a device outside the cohort's audience does not reach it"
+        );
+        // And a retired SET (rc6) reaches nobody but its signer.
         let mut set = ts::bare_attestation(
             "i397-set",
             &sibling,
@@ -663,7 +680,7 @@ pub(crate) mod bodies {
         set.subject_key_ids = vec![laptop.clone()];
         assert!(
             !ra::may_receive(d, &laptop, &set).await.unwrap().allowed(),
-            "I397 a key set naming a device outside the cohort's audience does not reach it"
+            "I397 a retired key-grant set is served to nobody"
         );
         let mut own = ts::bare_attestation("i397-own", &laptop, &laptop, &serde_json::json!({}));
         own.cohort_scope = SELF.into();

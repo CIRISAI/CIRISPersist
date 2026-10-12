@@ -1582,6 +1582,23 @@ impl MemoryBackend {
             .clone()
     }
 
+    /// v55.0.0 (CIRISPersist#989, test only) — hold an attestation BELOW
+    /// every admission gate, at the next serve position: the memory twin of
+    /// a raw `INSERT`, for the witness that a row an older build admitted (a
+    /// retired carrier) is never served. Never reachable outside `cfg(test)`.
+    #[cfg(test)]
+    pub(crate) fn plant_attestation_below_the_door(&self, row: crate::federation::Attestation) {
+        let mut state = self.state.lock().expect("memory backend lock");
+        let admitted_at = next_plane_position(
+            &state,
+            PLANE_ATTESTATION,
+            attestation_rows(&state).into_iter(),
+        );
+        let id = row.attestation_id.clone();
+        state.federation_attestations.push(row);
+        stamp_plane_position(&mut state, PLANE_ATTESTATION, id, admitted_at);
+    }
+
     /// v50.0.0 (CIRISPersist#926, test only) — store a signed community row
     /// BELOW every admission gate: the memory twin of a raw `INSERT`, for the
     /// witness that a pre-v50 row the trust-root door never judged is not

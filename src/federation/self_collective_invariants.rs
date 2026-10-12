@@ -8,7 +8,6 @@
 
 #[cfg(test)]
 pub(crate) mod bodies {
-    use crate::federation::key_grant::SignedKeyGrantSet;
     use crate::federation::key_grant_invariants::two_node::{introduce_as, Node};
     use crate::federation::tier_ingest::test_support as ts;
     use crate::federation::types::cohort_scope::{self, CryptoTier};
@@ -255,7 +254,18 @@ pub(crate) mod bodies {
                 ml_kem_768_base64: id.ml_kem_768_pubkey_b64,
             }
         };
-        bind(l.ba.as_ref(), &owner, &l.node_a, Some(kem_a)).await;
+        bind(l.ba.as_ref(), &owner, &l.node_a, Some(kem_a.clone())).await;
+        // B is the owner's occurrence too, known to A before the seal: a row
+        // is addressed to one occurrence, so A's row to B is what crosses
+        // (v55.0.0, #989).
+        let kem_b = {
+            let id = l.bb.load_or_init_content_kem_identity().await.unwrap();
+            EncryptionPubkeys {
+                x25519_base64: id.x25519_pubkey_b64,
+                ml_kem_768_base64: id.ml_kem_768_pubkey_b64,
+            }
+        };
+        bind(l.ba.as_ref(), &owner, &l.node_b, Some(kem_b.clone())).await;
         let rs = l
             .engine_a
             .put_blob_scoped(cohort_scope::SELF, Some(&owner), b"self minter", None, None)
@@ -277,39 +287,39 @@ pub(crate) mod bodies {
         // The content set is emitted by the door or drained by the host's
         // emission sweep — the same sweep edge runs; either way it is a row.
         l.engine_a.emit_pending_key_grants().await.unwrap();
-        let sets: Vec<_> =
-            l.ba.list_attestations_by(&l.node_a)
-                .await
-                .unwrap()
-                .into_iter()
-                .filter(|x| {
-                    x.attestation_type
-                        == crate::federation::key_grant::KEY_GRANT_CONTENT_ATTESTATION_TYPE
-                })
-                .collect();
+        // v55.0.0 (#989) — the content rows A's plane delivers to B.
+        let sets = crate::federation::key_grant_invariants::two_node::key_grant_rows_for(
+            l.ba.as_ref(),
+            &l.node_a,
+            &l.node_b,
+        )
+        .await
+        .into_iter()
+        .filter(|a| {
+            a.attestation
+                .attestation_envelope
+                .get("at_rest_sha256")
+                .and_then(|v| v.as_str())
+                == Some(hex::encode(rs.at_rest_sha256).as_str())
+        })
+        .collect::<Vec<_>>();
         assert!(
             !sets.is_empty(),
-            "I139: the self write emitted a content set"
+            "I139: the self write emitted a content row for B"
         );
+        // B knows A is the owner's occurrence (the binding's own plane), so
+        // A speaks for the owner on B as on A.
+        bind(l.bb.as_ref(), &owner, &l.node_a, Some(kem_a)).await;
+        bind(l.bb.as_ref(), &owner, &l.node_b, Some(kem_b)).await;
         for a in &sets {
-            let _ = l
-                .engine_b
-                .apply_replicated_key_grant(SignedKeyGrantSet {
-                    attestation: a.clone(),
-                })
-                .await;
+            l.engine_b
+                .apply_replicated_key_grant(a.clone())
+                .await
+                .unwrap_or_else(|e| panic!("I139: B admits A's content row: {e:?}"));
         }
         // The peer ADOPTS the bytes with the row's author — the PERSON — so
         // its provenance names the author and the set names the sealer; the
         // read must answer the sealer. (B is the owner's occurrence too.)
-        let kem_b = {
-            let id = l.bb.load_or_init_content_kem_identity().await.unwrap();
-            EncryptionPubkeys {
-                x25519_base64: id.x25519_pubkey_b64,
-                ml_kem_768_base64: id.ml_kem_768_pubkey_b64,
-            }
-        };
-        bind(l.bb.as_ref(), &owner, &l.node_b, Some(kem_b)).await;
         let Some(BlobBody::Inline(bytes)) = l.ba.get_blob(&rs.at_rest_sha256).await.unwrap() else {
             panic!("inline")
         };
@@ -438,33 +448,28 @@ pub(crate) mod bodies {
         );
         // The sets A emitted travel to B (the R2 send set now names B).
         engine_a.emit_pending_key_grants().await.unwrap();
-        let sets: Vec<_> = sa
-            .list_attestations_by(&a.key)
-            .await
-            .unwrap()
-            .into_iter()
-            .filter(|x| {
-                x.attestation_type
-                    == crate::federation::key_grant::KEY_GRANT_CONTENT_ATTESTATION_TYPE
-            })
-            .collect();
+        // v55.0.0 (#989) — the content rows A's plane delivers to B.
+        let sets = crate::federation::key_grant_invariants::two_node::key_grant_rows_for(
+            sa.as_ref(),
+            &a.key,
+            &b.key,
+        )
+        .await;
         assert!(
             !sets.is_empty(),
-            "I138: A emitted at least one content set (write + re-key)"
+            "I138: A emitted at least one content row for B (the re-key)"
         );
-        // The sets arrive BEFORE the bytes (the ordinary case: B was offline
-        // at write time): admitted as carriers, pending, nothing projected
-        // (I65). They are signed by the NODE A, not the owner who authored
-        // the row — §4.1 is what lets the adopt below project them.
+        // The rows arrive BEFORE the bytes (the ordinary case: B was offline
+        // at write time): admitted, pending, nothing projected (I65). They are
+        // signed by the NODE A, not the owner who authored the row — §4.1 is
+        // what lets the adopt below project them.
         for s in &sets {
             let adm = engine_b
-                .apply_replicated_key_grant(SignedKeyGrantSet {
-                    attestation: s.clone(),
-                })
+                .apply_replicated_key_grant(s.clone())
                 .await
-                .expect("I138: a node-signed content set is admitted as a carrier");
+                .expect("I138: a node-signed content row is admitted");
             assert!(
-                adm.pending && adm.wraps_written == 0,
+                adm.pending && !adm.projected,
                 "I138: pending until the bytes name the author: {adm:?}"
             );
         }
@@ -500,7 +505,7 @@ pub(crate) mod bodies {
                 .expect("I138: B OPENS what A wrote before B existed"),
             b"before the second device existed"
         );
-        // §4.1's other edge: a set for the same blob signed by a key that
+        // §4.1's other edge: a row for the same blob signed by a key that
         // shares NO principal with the author — a stranger who somehow knows
         // the DEK — is refused by name once the bytes name the author.
         let stranger_alias = format!("sc-stranger-{run}");
@@ -512,26 +517,26 @@ pub(crate) mod bodies {
             USER,
         )
         .await;
-        let forged = crate::federation::key_grant::KeyGrantSet {
+        let forged = crate::federation::key_grant::KeyGrantRow {
             axis: crate::federation::key_grant::KeyGrantAxis::Content {
                 at_rest_sha256: hex::encode(sha),
                 cohort_scope: cohort_scope::SELF.into(),
                 owner_key_id: owner.clone(),
             },
-            wraps: vec![crate::federation::GrantWrap {
+            wrap: crate::federation::GrantWrap {
                 recipient_key_id: b.key.clone(),
                 wrap_algorithm: crate::federation::at_rest_cascade::WRAP_ALGORITHM_V2.into(),
                 wrapped_dek: "{}".into(),
-            }],
+            },
         };
-        let signed = crate::federation::key_grant_invariants::two_node::sign_set_unstored(
+        let signed = crate::federation::key_grant_invariants::two_node::sign_row_unstored(
             &stranger, &forged,
         )
         .await;
         let err = engine_b
             .apply_replicated_key_grant(signed)
             .await
-            .expect_err("I138: a stranger's content set is refused once the bytes name the author");
+            .expect_err("I138: a stranger's content row is refused once the bytes name the author");
         assert!(
             matches!(&err, crate::federation::Error::KeyGrantRefused { reason, .. }
                 if *reason == crate::federation::key_grant::KeyGrantRefusalReason::SignerNotAuthor.as_str()),

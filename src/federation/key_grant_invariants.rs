@@ -24,14 +24,15 @@ pub mod two_node {
     use crate::federation::community_dek::orchestrate::encrypt_and_cascade_community;
     use crate::federation::key_grant::{
         admit_replicated_key_grant, emit_content_key_grant_with_local_signer,
-        emit_epoch_key_grant_with_local_signer, KeyGrantAxis, KeyGrantSet, SignedKeyGrantSet,
+        emit_epoch_key_grant_with_local_signer, KeyGrantAdmission, KeyGrantAxis, KeyGrantEmission,
+        KeyGrantRow, SignedKeyGrantRow,
     };
     use crate::federation::tier_ingest::test_support as ts;
     use crate::federation::types::cohort_scope::{CryptoTier, COMMUNITY, SELF};
     use crate::federation::types::identity_type::USER;
     use crate::federation::{
         BlobBody, BlobError, BlobProvenance, BlobStorage, EncryptionPubkeys, Error,
-        FederationDirectory, GrantWrap,
+        FederationDirectory,
     };
     use std::sync::Arc;
 
@@ -190,13 +191,14 @@ pub mod two_node {
         }
     }
 
-    /// The wire crossing: take the row `emitted` on `from` and hand it to
-    /// `to`'s apply door. Nothing else moves.
+    /// The wire crossing for ONE row: take the row `attestation_id` stored on
+    /// `from` and hand it to `to`'s apply door, whoever it is for (a relay
+    /// that forwards what it holds). Nothing else moves.
     pub async fn carry_key_grant<B>(
         from: &Node<'_, B>,
         to: &Node<'_, B>,
         attestation_id: &str,
-    ) -> Result<crate::federation::key_grant::KeyGrantAdmission, Error>
+    ) -> Result<KeyGrantAdmission, Error>
     where
         B: BlobStorage + FederationDirectory + Sync,
     {
@@ -206,7 +208,98 @@ pub mod two_node {
             .await
             .expect("read the emitted row")
             .expect("the emitted row exists on the emitter");
-        admit_replicated_key_grant(to.backend, SignedKeyGrantSet { attestation: row }).await
+        admit_replicated_key_grant(to.backend, SignedKeyGrantRow { attestation: row }).await
+    }
+
+    /// v55.0.0 (#989) — **the wire crossing through the plane**: every row
+    /// `emission` names that `from`'s serve gate
+    /// ([`may_receive`](crate::federation::replication_audience::may_receive),
+    /// on `from`'s own directory) would send to `to`, each through `to`'s
+    /// apply door. A row for another recipient does not cross: a key-grant
+    /// row reaches its recipient's node and no other (CC 6.1.5.3).
+    pub async fn carry_key_grants<B>(
+        from: &Node<'_, B>,
+        to: &Node<'_, B>,
+        emission: &KeyGrantEmission,
+    ) -> Result<Vec<KeyGrantAdmission>, Error>
+    where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        let mut out = Vec::new();
+        for id in &emission.attestation_ids {
+            let row = from
+                .backend
+                .get_attestation(id)
+                .await
+                .expect("read the emitted row")
+                .expect("the emitted row exists on the emitter");
+            if !crate::federation::replication_audience::may_receive(from.backend, &to.key, &row)
+                .await?
+                .allowed()
+            {
+                continue;
+            }
+            out.push(
+                admit_replicated_key_grant(to.backend, SignedKeyGrantRow { attestation: row })
+                    .await?,
+            );
+        }
+        Ok(out)
+    }
+
+    /// v55.0.0 (#989) — **the key-grant rows `signer` emitted that the plane
+    /// delivers to `recipient`**, read off `dir`'s replication cursor and
+    /// kept by its serve gate
+    /// ([`may_receive`](crate::federation::replication_audience::may_receive)):
+    /// what a host hands `recipient`'s apply door.
+    pub async fn key_grant_rows_for<D>(
+        dir: &D,
+        signer: &str,
+        recipient: &str,
+    ) -> Vec<SignedKeyGrantRow>
+    where
+        D: FederationDirectory + ?Sized,
+    {
+        let mut out = Vec::new();
+        for served in dir.list_attestations_since(None, 100_000).await.unwrap() {
+            let row = served.attestation;
+            if row.attesting_key_id != signer
+                || !crate::federation::key_grant::is_key_grant_row(&row)
+            {
+                continue;
+            }
+            if crate::federation::replication_audience::may_receive(dir, recipient, &row)
+                .await
+                .unwrap()
+                .allowed()
+            {
+                out.push(SignedKeyGrantRow { attestation: row });
+            }
+        }
+        out
+    }
+
+    /// The emitted row of `emission` whose recipient is `recipient`.
+    pub async fn emitted_row_for<B>(
+        from: &Node<'_, B>,
+        emission: &KeyGrantEmission,
+        recipient: &str,
+    ) -> crate::federation::Attestation
+    where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        for id in &emission.attestation_ids {
+            let row = from
+                .backend
+                .get_attestation(id)
+                .await
+                .unwrap()
+                .expect("the emitted row exists on the emitter");
+            if row.attested_key_id == recipient {
+                return row;
+            }
+        }
+        panic!("no emitted row for {recipient}: {emission:?}")
     }
 
     /// The bytes crossing: `to` adopts the sealed bytes `from` holds, with
@@ -255,14 +348,15 @@ pub mod two_node {
         Ok(out.sha256)
     }
 
-    /// Sign a set with `signer` WITHOUT storing it anywhere — a forger's
-    /// row, or a row built off-node.
-    pub async fn sign_set_unstored(
+    /// Sign one key-grant row with `signer` WITHOUT storing it anywhere — a
+    /// forger's row, or an honest row at a fresh signed instant built
+    /// off-node (the emitter re-emits nothing it already holds as a row).
+    pub async fn sign_row_unstored(
         signer: &crate::signing::LocalSigner,
-        set: &KeyGrantSet,
-    ) -> SignedKeyGrantSet {
+        row: &KeyGrantRow,
+    ) -> SignedKeyGrantRow {
         let key = signer.derived_key_id();
-        let mut input = set.emit_input();
+        let mut input = row.emit_input().expect("emit input");
         let canonical = crate::federation::attestation_emit::stamp_and_canonicalize(
             &mut input,
             &key,
@@ -272,13 +366,33 @@ pub mod two_node {
         let sig = signer.sign_hybrid(&canonical).await.expect("hybrid sign");
         let (row, _) = crate::federation::attestation_emit::assemble(key, &canonical, sig, input)
             .expect("assemble");
-        SignedKeyGrantSet { attestation: row }
+        SignedKeyGrantRow { attestation: row }
+    }
+
+    /// The row this node holds for `axis` to `recipient`, as a [`KeyGrantRow`].
+    pub async fn held_row<B>(n: &Node<'_, B>, axis: &KeyGrantAxis, recipient: &str) -> KeyGrantRow
+    where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        let set = crate::federation::key_grant::build_set_for_axis(n.backend, axis)
+            .await
+            .unwrap()
+            .expect("the node holds wraps for the axis");
+        set.rows()
+            .into_iter()
+            .find(|r| r.recipient() == recipient)
+            .unwrap_or_else(|| panic!("no wrap for {recipient} on {axis:?}"))
     }
 
     fn refusal_reason(e: &Error) -> &'static str {
         match e {
             Error::KeyGrantRefused { reason, .. } => reason,
-            other => panic!("expected a typed KeyGrantRefused, got {other:?}"),
+            // v55.0.0 (#989) — the self-axis sealer leg's retryable refusal.
+            Error::SignerDoesNotActFor {
+                plane: crate::federation::key_grant::KEY_GRANT_PLANE,
+                ..
+            } => "signer_not_acting_for",
+            other => panic!("expected a typed key-grant refusal, got {other:?}"),
         }
     }
 
@@ -307,36 +421,39 @@ pub mod two_node {
             encrypt_and_cascade_community(a.backend, &comm, b"minutes", None, Some(&a.key))
                 .await
                 .unwrap_or_else(|e| panic!("{tag} I60: A seals: {e}"));
-        let honest = crate::federation::key_grant::build_epoch_set(a.backend, &comm, &a.key, 0)
-            .await
-            .unwrap()
-            .expect("A holds wraps for (C, A, 0)");
         assert_eq!(sealed.epoch, 0);
+        let axis = KeyGrantAxis::Epoch {
+            community_key_id: comm.clone(),
+            minter_key_id: a.key.clone(),
+            epoch: 0,
+        };
+        // A's genuine wrap to B — the row each forgery below is built from.
+        let honest = held_row(a, &axis, &b.key).await;
 
-        // (1) Mallory signs A's set, claiming A's counter.
-        let forged = sign_set_unstored(&mallory, &honest).await;
+        // (1) Mallory signs A's row, claiming A's counter.
+        let forged = sign_row_unstored(&mallory, &honest).await;
         let err = admit_replicated_key_grant(b.backend, forged)
             .await
-            .expect_err("a set signed by someone other than its minter must be refused");
+            .expect_err("a row signed by someone other than its minter must be refused");
         assert_eq!(
             refusal_reason(&err),
             "signer_not_minter",
             "{tag} I60: mallory signing A's counter must be refused as not-the-minter, got {err}"
         );
 
-        // (2) Mallory signs a set for Mallory's own counter — but Mallory is
+        // (2) Mallory signs a row for Mallory's own counter — but Mallory is
         //     no member of C at asserted_at per B's roster fold.
-        let own = KeyGrantSet {
+        let own = KeyGrantRow {
             axis: KeyGrantAxis::Epoch {
                 community_key_id: comm.clone(),
                 minter_key_id: mallory_key.clone(),
                 epoch: 0,
             },
-            wraps: honest.wraps.clone(),
+            wrap: honest.wrap.clone(),
         };
-        let err = admit_replicated_key_grant(b.backend, sign_set_unstored(&mallory, &own).await)
+        let err = admit_replicated_key_grant(b.backend, sign_row_unstored(&mallory, &own).await)
             .await
-            .expect_err("a non-member's set must be refused");
+            .expect_err("a non-member's row must be refused");
         assert_eq!(
             refusal_reason(&err),
             "signer_not_active_member",
@@ -345,8 +462,8 @@ pub mod two_node {
 
         // (3) A wrap that is not v2, signed by the honest minter.
         let mut v1 = honest.clone();
-        v1.wraps[0].wrap_algorithm = "v1".into();
-        let err = admit_replicated_key_grant(b.backend, sign_set_unstored(&a.signer, &v1).await)
+        v1.wrap.wrap_algorithm = "v1".into();
+        let err = admit_replicated_key_grant(b.backend, sign_row_unstored(&a.signer, &v1).await)
             .await
             .expect_err("a non-v2 wrap must be refused");
         assert_eq!(
@@ -357,20 +474,34 @@ pub mod two_node {
 
         // (4) A community B has never heard of: the signer cannot be an
         //     active member of a roster B does not hold.
-        let ghost = KeyGrantSet {
+        let ghost = KeyGrantRow {
             axis: KeyGrantAxis::Epoch {
                 community_key_id: format!("{tag}-ghost-{run}"),
                 minter_key_id: a.key.clone(),
                 epoch: 0,
             },
-            wraps: honest.wraps.clone(),
+            wrap: honest.wrap.clone(),
         };
-        let err = admit_replicated_key_grant(b.backend, sign_set_unstored(&a.signer, &ghost).await)
+        let err = admit_replicated_key_grant(b.backend, sign_row_unstored(&a.signer, &ghost).await)
             .await
-            .expect_err("a set for an unknown community must be refused");
+            .expect_err("a row for an unknown community must be refused");
         assert_eq!(
             refusal_reason(&err),
             "signer_not_active_member",
+            "{tag} I60: {err}"
+        );
+
+        // (5) v55.0.0 (#989) — the honest minter wrapping to a key that is no
+        //     occurrence of any member: the recipient rule refuses it.
+        let mut stranger = honest.clone();
+        stranger.wrap.recipient_key_id = mallory_key.clone();
+        let err =
+            admit_replicated_key_grant(b.backend, sign_row_unstored(&a.signer, &stranger).await)
+                .await
+                .expect_err("a wrap to a non-member must be refused");
+        assert_eq!(
+            refusal_reason(&err),
+            "recipient_not_in_audience",
             "{tag} I60: {err}"
         );
 
@@ -380,14 +511,21 @@ pub mod two_node {
                 .community_dek_has_member_grant(&comm, &a.key, 0, &b.key)
                 .await
                 .unwrap(),
-            "{tag} I60: a refused set must project NOTHING"
+            "{tag} I60: a refused row must project NOTHING"
+        );
+        assert!(
+            !b.backend
+                .community_dek_has_member_grant(&comm, &a.key, 0, &mallory_key)
+                .await
+                .unwrap(),
+            "{tag} I60: a refused row must project NOTHING (the stranger)"
         );
         assert!(
             !b.backend
                 .community_dek_has_member_grant(&comm, &mallory_key, 0, &b.key)
                 .await
                 .unwrap(),
-            "{tag} I60: a refused set must project NOTHING (mallory's counter)"
+            "{tag} I60: a refused row must project NOTHING (mallory's counter)"
         );
     }
 
@@ -428,42 +566,55 @@ pub mod two_node {
             "{tag} I61: got {err:?}"
         );
 
-        // A emits the FULL set for (C, A, 0) through its attestation store.
+        // A emits one row per wrap for (C, A, 0) through its attestation
+        // store (v55.0.0, #989: the SET is retired).
         let emitted = emit_epoch_key_grant_with_local_signer(a.backend, &a.signer, &comm, 0)
             .await
             .unwrap_or_else(|e| panic!("{tag} I61: A emits: {e}"))
             .expect("A holds wraps to emit");
+        assert!(
+            emitted.attestation_ids.len() >= 2,
+            "{tag} I61: one row per recipient (A's own and B's): {emitted:?}"
+        );
 
-        // The set is what a PEER pulls: it rides the federation-tier
-        // attestation cursor (§14 — "listable by the replication reader"),
-        // under the epoch-axis row type, signed by the minter.
+        // Each row is what a PEER pulls: it rides the federation-tier
+        // attestation cursor (§14 — "listable by the replication reader") as
+        // a `scores` row on `key_grant:epoch:v1`, signed by the minter, to
+        // ONE recipient.
         let served = a
             .backend
             .list_attestations_since(None, 1_000)
             .await
             .expect("the attestation cursor");
+        let to_b = emitted_row_for(a, &emitted, &b.key).await;
         let row = served
             .iter()
-            .find(|x| x.attestation.attestation_id == emitted.attestation_id)
-            .unwrap_or_else(|| {
-                panic!("{tag} I61: the emitted set is not on A's replication cursor")
-            });
+            .find(|x| x.attestation.attestation_id == to_b.attestation_id)
+            .unwrap_or_else(|| panic!("{tag} I61: the row to B is not on A's replication cursor"));
+        assert_eq!(row.attestation.attestation_type, "scores");
         assert_eq!(
-            row.attestation.attestation_type,
-            crate::federation::key_grant::KEY_GRANT_EPOCH_ATTESTATION_TYPE
+            crate::federation::admission::envelope_dimension(&row.attestation.attestation_envelope),
+            Some(crate::federation::key_grant::KEY_GRANT_EPOCH_DIMENSION)
         );
         assert_eq!(
             row.attestation.attesting_key_id, a.key,
             "{tag} I61: signed by the minter"
         );
+        assert_eq!(row.attestation.attested_key_id, b.key, "{tag} I61: to B");
 
-        // The wire: the set, then the bytes.
-        let admission = carry_key_grant(a, b, &emitted.attestation_id)
+        // The wire: through A's plane, then the bytes. Only B's own row
+        // crosses (refers-to under the audience).
+        let admissions = carry_key_grants(a, b, &emitted)
             .await
-            .unwrap_or_else(|e| panic!("{tag} I61: B admits A's set: {e}"));
+            .unwrap_or_else(|e| panic!("{tag} I61: B admits A's rows: {e}"));
+        assert_eq!(
+            admissions.len(),
+            1,
+            "{tag} I61: the plane delivers B exactly its own row: {admissions:?}"
+        );
         assert!(
-            admission.wraps_written >= 1,
-            "{tag} I61: B projected A's wraps: {admission:?}"
+            admissions[0].projected && admissions[0].recipient_key_id == b.key,
+            "{tag} I61: B projected its wrap: {admissions:?}"
         );
         assert!(
             b.backend
@@ -518,29 +669,30 @@ pub mod two_node {
             matches!(err, BlobError::NotGranted { .. }),
             "{tag} I61: expected NotGranted, got {err:?}"
         );
-        // And A's own occurrence, asked on B, is granted there too (the set
-        // carried every wrap) — but its private half lives on A, so B cannot
-        // open for it. The refusal names that, not `NotGranted`.
+        // v55.0.0 (#989) — A's own wrap is a row to A: it does not reach B.
+        // A wrap is useful to its recipient alone (CC 6.1.5.3).
         assert!(
-            b.backend
+            !b.backend
                 .community_dek_has_member_grant(&comm, &a.key, 0, &a.key)
                 .await
                 .unwrap(),
-            "{tag} I61: the set carried A's own wrap too (§13: every recipient)"
+            "{tag} I61: the row to A did not cross to B"
         );
-        let err = read_any_for_viewer(b.backend, &sha, &a.key, None)
-            .await
-            .expect_err("{tag} I61: A's private half is not on B");
+        let to_a = emitted_row_for(a, &emitted, &a.key).await;
         assert!(
-            !matches!(err, BlobError::NotGranted { .. }),
-            "{tag} I61: A IS granted; B just cannot open for A — got {err:?}"
+            !crate::federation::replication_audience::may_receive(a.backend, &b.key, &to_a)
+                .await
+                .unwrap()
+                .allowed(),
+            "{tag} I61: A's plane does not serve B the row for A"
         );
     }
 
     // ── I62 ──────────────────────────────────────────────────────────────
     /// **The projection is a union and order-independent**: re-applying a
-    /// set, applying a superset, and applying the set before the bytes
-    /// arrive all leave every prior grant in place and add the new ones.
+    /// row, a later re-wrap with the same identity, a refused row, and a row
+    /// applied before the bytes arrive all leave every prior grant in place
+    /// (v55.0.0, #989: the union key is the row's identity).
     pub async fn exercise_i62_union_order_independent<B>(
         a: &Node<'_, B>,
         b: &Node<'_, B>,
@@ -561,33 +713,30 @@ pub mod two_node {
             .await
             .unwrap()
             .expect("wraps");
+        let to_b = emitted_row_for(a, &emitted, &b.key).await;
 
-        // (1) The set BEFORE the bytes: stored, nothing lost.
-        let first = carry_key_grant(a, b, &emitted.attestation_id)
-            .await
-            .unwrap();
+        // (1) The row BEFORE the bytes: stored, projected, nothing lost.
+        let first = carry_key_grant(a, b, &to_b.attestation_id).await.unwrap();
         assert!(
-            first.wraps_written >= 2,
-            "{tag} I62: first admit writes: {first:?}"
+            first.projected,
+            "{tag} I62: first admit projects: {first:?}"
         );
         let before: Vec<String> = b
             .backend
             .community_dek_member_grant_recipients(&comm, &a.key, 0)
             .await
             .unwrap();
-        assert!(
-            before.contains(&b.key) && before.contains(&a.key),
-            "{tag} I62: {before:?}"
-        );
-
-        // (2) Re-apply the SAME set: idempotent, nothing removed.
-        let again = carry_key_grant(a, b, &emitted.attestation_id)
+        assert!(before.contains(&b.key), "{tag} I62: {before:?}");
+        let wrap_before = b
+            .backend
+            .community_dek_member_grant_wrap(&comm, &a.key, 0, &b.key)
             .await
-            .unwrap();
-        assert_eq!(
-            again.wraps_written, 0,
-            "{tag} I62: a re-applied set writes nothing new"
-        );
+            .unwrap()
+            .expect("B's wrap is held");
+
+        // (2) Re-apply the SAME row: idempotent, nothing removed.
+        let again = carry_key_grant(a, b, &to_b.attestation_id).await.unwrap();
+        assert!(again.projected, "{tag} I62: {again:?}");
         assert_eq!(
             b.backend
                 .community_dek_member_grant_recipients(&comm, &a.key, 0)
@@ -597,57 +746,45 @@ pub mod two_node {
             "{tag} I62: re-emission un-granted somebody"
         );
 
-        // (3) A SUPERSET (a late recipient) adds and keeps.
-        let mut superset =
-            crate::federation::key_grant::build_epoch_set(a.backend, &comm, &a.key, 0)
+        // (3) v55.0.0 (#989, CC 3.3.2) — a later row with the SAME identity
+        // and different wrap bytes (a re-wrap, at a fresh signed instant) is
+        // admitted and changes nothing: the union key is the identity, and
+        // CC 2's latest-wins over `(attester, dimension, attested)` does not
+        // apply to the family.
+        let mut rewrap = KeyGrantRow::from_attestation(&to_b).unwrap();
+        rewrap.wrap.wrapped_dek =
+            "{\"algorithm\":\"x25519_mlkem768_aes256_gcm_hkdf_sha256\"}".into();
+        let later =
+            admit_replicated_key_grant(b.backend, sign_row_unstored(&a.signer, &rewrap).await)
+                .await
+                .unwrap_or_else(|e| panic!("{tag} I62: a re-wrap is admitted: {e}"));
+        assert!(later.projected, "{tag} I62: {later:?}");
+        assert_eq!(
+            b.backend
+                .community_dek_member_grant_wrap(&comm, &a.key, 0, &b.key)
                 .await
                 .unwrap()
-                .unwrap();
-        let late = format!("{tag}-late-occ-{run}");
-        superset.wraps.push(GrantWrap {
-            recipient_key_id: late.clone(),
-            wrap_algorithm: crate::federation::at_rest_cascade::WRAP_ALGORITHM_V2.into(),
-            wrapped_dek: "{\"algorithm\":\"x25519_mlkem768_aes256_gcm_hkdf_sha256\"}".into(),
-        });
-        let sup =
-            admit_replicated_key_grant(b.backend, sign_set_unstored(&a.signer, &superset).await)
-                .await
-                .unwrap_or_else(|e| panic!("{tag} I62: superset: {e}"));
-        assert_eq!(
-            sup.wraps_written, 1,
-            "{tag} I62: exactly the late wrap is new"
-        );
-        let after: Vec<String> = b
-            .backend
-            .community_dek_member_grant_recipients(&comm, &a.key, 0)
-            .await
-            .unwrap();
-        for prior in &before {
-            assert!(
-                after.contains(prior),
-                "{tag} I62: {prior} was dropped by a superset"
-            );
-        }
-        assert!(
-            after.contains(&late),
-            "{tag} I62: the late recipient was added"
+                .expect("still held"),
+            wrap_before,
+            "{tag} I62: a wrap once admitted is never replaced by a later one"
         );
 
-        // (4) A SUBSET later (a partial re-emission) removes nothing.
-        let subset = KeyGrantSet {
-            axis: superset.axis.clone(),
-            wraps: vec![superset.wraps[0].clone()],
-        };
-        admit_replicated_key_grant(b.backend, sign_set_unstored(&a.signer, &subset).await)
-            .await
-            .unwrap();
+        // (4) A wrap to a key outside the audience adds nothing and removes
+        // nothing: refused at the gate (`recipient_not_in_audience`).
+        let mut outside = rewrap.clone();
+        outside.wrap.recipient_key_id = format!("{tag}-late-occ-{run}");
+        let err =
+            admit_replicated_key_grant(b.backend, sign_row_unstored(&a.signer, &outside).await)
+                .await
+                .expect_err("a wrap to a non-occurrence is refused");
+        assert_eq!(refusal_reason(&err), "recipient_not_in_audience");
         assert_eq!(
             b.backend
                 .community_dek_member_grant_recipients(&comm, &a.key, 0)
                 .await
                 .unwrap(),
-            after,
-            "{tag} I62: a subset re-emission must remove NOTHING (CC 3: cannot un-share)"
+            before,
+            "{tag} I62: a refused row must remove NOTHING and add nothing (CC 3: cannot un-share)"
         );
 
         // (5) Now the bytes arrive — and open.
@@ -668,7 +805,7 @@ pub mod two_node {
                 .await
                 .unwrap(),
             b"v1",
-            "{tag} I62: a set admitted before its bytes is read when they arrive"
+            "{tag} I62: a row admitted before its bytes is read when they arrive"
         );
     }
 
@@ -841,9 +978,9 @@ pub mod two_node {
                 .await
                 .unwrap()
                 .expect("wraps");
-            carry_key_grant(n, b, &emitted.attestation_id)
+            carry_key_grants(n, b, &emitted)
                 .await
-                .unwrap_or_else(|e| panic!("{tag} I64: B admits {}'s set: {e}", n.key));
+                .unwrap_or_else(|e| panic!("{tag} I64: B admits {}'s rows: {e}", n.key));
             carry_bytes(
                 n,
                 b,
@@ -949,23 +1086,38 @@ pub mod two_node {
             "{tag} I65: the second device is granted"
         );
         let sha = sealed.at_rest_sha256;
-        // (1) A FORGED content set from the second device — a recipient who
-        // knows the DEK — naming an outsider, delivered BEFORE the bytes.
-        // v46.3.0 (#884, §4.1): an ACTIVE occurrence of the owner speaks
-        // with the owner's voice on the key plane (the sealing node is one),
-        // so the forger here is the owner's LOST device — its occurrence
-        // revoked, no owner binding — which still knows the DEK. The author
-        // is not yet known here, so the signer cannot be checked against it:
-        // the carrier is stored, NOTHING is projected (§13, PR #850 review)
-        // — and nothing ever will be, see (3).
+        // (1) A FORGED content row from the owner's LOST device — its
+        // occurrence revoked, no owner binding — which still knows the DEK,
+        // naming an outsider, delivered BEFORE the bytes. v46.3.0 (#884,
+        // §4.1): an ACTIVE occurrence of the owner speaks with the owner's
+        // voice on the key plane (the sealing node is one); a revoked one
+        // does not. v55.0.0 (#989): the sealer rule asks that at admission, on
+        // the self axis, before the bytes name the author — refused
+        // (retryable `SignerDoesNotActFor`, plane `key_grant`), nothing stored.
         // Revoked NOW: `IdentityOccurrenceRevocation::revokes` treats an
         // occurrence asserted after its revocation as re-established.
+        let lost = node_signer(a2.backend, &format!("{tag}-lost-{run}")).await;
+        let lost_key = lost.derived_key_id();
+        a2.backend
+            .put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
+                identity_key_id: owner.clone(),
+                occurrence_key_id: lost_key.clone(),
+                device_class: crate::federation::types::device_class::LAPTOP.into(),
+                hardware_attestation: None,
+                asserted_at: chrono::Utc::now() - chrono::Duration::seconds(5),
+                valid_until: None,
+                encryption_pubkeys: Some(a.kem.clone()),
+                transport_binding: None,
+                persist_row_hash: String::new(),
+            })
+            .await
+            .unwrap();
         let revoked_at = chrono::Utc::now();
         a2.backend
             .put_identity_occurrence_revocation_local(
                 crate::federation::types::IdentityOccurrenceRevocation {
                     identity_key_id: owner.clone(),
-                    occurrence_key_id: a2.key.clone(),
+                    occurrence_key_id: lost_key.clone(),
                     revoked_at,
                     effective_at: revoked_at,
                     reason: Some("lost device (I65)".into()),
@@ -974,29 +1126,37 @@ pub mod two_node {
                 },
             )
             .await
-            .unwrap_or_else(|e| {
-                panic!("{tag} I65: the second device's occurrence is revoked: {e}")
-            });
+            .unwrap_or_else(|e| panic!("{tag} I65: the lost device's occurrence is revoked: {e}"));
         let outsider = format!("{tag}-outsider-{run}");
-        let forged = KeyGrantSet {
+        let forged = KeyGrantRow {
             axis: KeyGrantAxis::Content {
                 at_rest_sha256: hex::encode(sha),
                 cohort_scope: SELF.into(),
                 owner_key_id: owner.clone(),
             },
-            wraps: vec![crate::federation::GrantWrap {
+            wrap: crate::federation::GrantWrap {
                 recipient_key_id: outsider.clone(),
                 wrap_algorithm: crate::federation::at_rest_cascade::WRAP_ALGORITHM_V2.into(),
                 wrapped_dek: "{}".into(),
-            }],
+            },
         };
-        let forged_admission =
-            admit_replicated_key_grant(a2.backend, sign_set_unstored(&a2.signer, &forged).await)
-                .await
-                .unwrap_or_else(|e| panic!("{tag} I65: a set before its bytes is stored: {e}"));
+        let forged_row = sign_row_unstored(&lost, &forged).await;
+        let forged_id = forged_row.attestation.attestation_id.clone();
+        let err = admit_replicated_key_grant(a2.backend, forged_row)
+            .await
+            .expect_err("a revoked device does not speak for the owner");
+        assert_eq!(
+            refusal_reason(&err),
+            "signer_not_acting_for",
+            "{tag} I65: {err}"
+        );
         assert!(
-            forged_admission.pending && forged_admission.wraps_written == 0,
-            "{tag} I65: before the bytes, a content set projects NOTHING: {forged_admission:?}"
+            a2.backend
+                .get_attestation(&forged_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "{tag} I65: the forged row is not stored"
         );
         assert!(
             a2.backend
@@ -1006,15 +1166,18 @@ pub mod two_node {
                 .is_none(),
             "{tag} I65: the outsider has no grant row"
         );
-        // (2) The AUTHOR's set, also before the bytes: pending, nothing yet.
+        // (2) The AUTHOR's rows, also before the bytes: the plane delivers
+        // the second device its own, pending, nothing projected yet.
         let emitted =
             emit_content_key_grant_with_local_signer(a.backend, &a.signer, &sha, SELF, &owner)
                 .await
                 .unwrap()
                 .expect("wraps");
-        let admission = carry_key_grant(a, a2, &emitted.attestation_id)
+        let admissions = carry_key_grants(a, a2, &emitted)
             .await
-            .unwrap_or_else(|e| panic!("{tag} I65: the second device admits the set: {e}"));
+            .unwrap_or_else(|e| panic!("{tag} I65: the second device admits its row: {e}"));
+        assert_eq!(admissions.len(), 1, "{tag} I65: {admissions:?}");
+        let admission = &admissions[0];
         assert_eq!(
             match &admission.axis {
                 KeyGrantAxis::Content { at_rest_sha256, .. } => at_rest_sha256.clone(),
@@ -1023,8 +1186,8 @@ pub mod two_node {
             hex::encode(sha)
         );
         assert!(
-            admission.pending && admission.wraps_written == 0,
-            "{tag} I65: the author's set is pending until the bytes name the author: {admission:?}"
+            admission.pending && !admission.projected,
+            "{tag} I65: the author's row is pending until the bytes name the author: {admission:?}"
         );
         assert!(
             a2.backend
@@ -1064,7 +1227,7 @@ pub mod two_node {
                 .await
                 .unwrap()
                 .is_none(),
-            "{tag} I65: a set the author did not sign never projects"
+            "{tag} I65: a row the author did not sign never projects"
         );
         // The pending index (V146) was TAKEN by the adopt: nothing left.
         assert!(
@@ -1075,15 +1238,13 @@ pub mod two_node {
                 .is_empty(),
             "{tag} I65: the adopt retired every pending row for the blob"
         );
-        // (4) A re-delivered author set after the bytes projects directly —
-        // the row is present, the author is checked, every wrap already held.
-        let again = carry_key_grant(a, a2, &emitted.attestation_id)
+        // (4) A re-delivered author row after the bytes projects directly —
+        // the row is present, the author is checked, the wrap already held.
+        let to_a2 = emitted_row_for(a, &emitted, &a2.key).await;
+        let again = carry_key_grant(a, a2, &to_a2.attestation_id)
             .await
             .unwrap_or_else(|e| panic!("{tag} I65: re-delivery: {e}"));
-        assert!(
-            !again.pending && again.wraps_written == 0,
-            "{tag} I65: {again:?}"
-        );
+        assert!(!again.pending && again.projected, "{tag} I65: {again:?}");
         assert!(
             a2.backend
                 .get_at_rest_grant(&sha, crate::federation::at_rest_cascade::PERSIST_SELF_RECIPIENT)
@@ -1111,7 +1272,7 @@ pub mod two_node {
             .unwrap_err();
         assert!(
             matches!(err, BlobError::NotGranted { .. }),
-            "{tag} I65: the outsider the forged set named stays refused: {err:?}"
+            "{tag} I65: the outsider the forged row named stays refused: {err:?}"
         );
         // (5) A retroactive ADD on the ADOPTING node (PR #850, round three):
         // the owner admits a third device on a2. The peer-authored blob is
@@ -1245,24 +1406,20 @@ pub mod two_node {
             emit_content_key_grant_with_local_signer(a.backend, &a.signer, &sha, FAMILY, &fam)
                 .await
                 .unwrap_or_else(|e| {
-                    panic!("{tag} I199: the author's own door stores the family set: {e}")
+                    panic!("{tag} I199: the author's own door stores the family rows: {e}")
                 })
-                .expect("the family set has wraps");
-        let row = a
-            .backend
-            .get_attestation(&emitted.attestation_id)
-            .await
-            .unwrap()
-            .expect("stored");
+                .expect("the family blob has wraps");
+        let row = emitted_row_for(a, &emitted, &b.key).await;
         assert_eq!(
             crate::federation::admission::envelope_cohort_target(&row.attestation_envelope)
                 .unwrap(),
             Some(fam.as_str()),
-            "{tag} I199: the set names its family where the write gate reads the target"
+            "{tag} I199: the row names its family where the write gate reads the target"
         );
-        carry_key_grant(a, b, &emitted.attestation_id)
+        let admitted = carry_key_grants(a, b, &emitted)
             .await
-            .unwrap_or_else(|e| panic!("{tag} I199: bob's node admits the family set: {e}"));
+            .unwrap_or_else(|e| panic!("{tag} I199: bob's node admits the family row: {e}"));
+        assert_eq!(admitted.len(), 1, "{tag} I199: {admitted:?}");
         carry_bytes(
             a,
             b,
@@ -1524,8 +1681,14 @@ pub mod two_node {
             .await
             .unwrap()
             .expect("A holds wraps");
+        let axis = KeyGrantAxis::Epoch {
+            community_key_id: comm.clone(),
+            minter_key_id: a.key.clone(),
+            epoch: 0,
+        };
+        let to_b = emitted_row_for(a, &emitted, &b.key).await;
         // (1) No occurrence for A on B, no binding: refused — as today.
-        let err = carry_key_grant(a, b, &emitted.attestation_id)
+        let err = carry_key_grant(a, b, &to_b.attestation_id)
             .await
             .expect_err("{tag} I77: an unbound node is nobody's instrument");
         assert_eq!(
@@ -1542,10 +1705,10 @@ pub mod two_node {
             })
             .await
             .unwrap_or_else(|e| panic!("{tag} I77: B admits alice's owner binding for A: {e}"));
-        let admission = carry_key_grant(a, b, &emitted.attestation_id)
+        let admission = carry_key_grant(a, b, &to_b.attestation_id)
             .await
             .unwrap_or_else(|e| panic!("{tag} I77: an owned node lifts to its owner: {e}"));
-        assert!(admission.wraps_written >= 1, "{tag} I77: {admission:?}");
+        assert!(admission.projected, "{tag} I77: {admission:?}");
         assert!(
             b.backend
                 .community_dek_has_member_grant(&comm, &a.key, 0, &b.key)
@@ -1553,7 +1716,7 @@ pub mod two_node {
                 .unwrap(),
             "{tag} I77: B's own wrap projected"
         );
-        // (3) alice removed, effective before a later set's asserted_at: the
+        // (3) alice removed, effective before a later row's asserted_at: the
         // principal is no longer a member — refused.
         // v49.0.0 (#908): alice leaves on her own signature.
         let rev = ts::sign_community_membership_revocation(
@@ -1573,13 +1736,13 @@ pub mod two_node {
             .await
             .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        let late = emit_epoch_key_grant_with_local_signer(a.backend, &a.signer, &comm, 0)
-            .await
-            .unwrap()
-            .expect("A still holds wraps");
-        let err = carry_key_grant(a, b, &late.attestation_id)
-            .await
-            .expect_err("{tag} I77: the removed owner's instrument is refused");
+        // A later row: A re-signs its wrap to B at a fresh instant (the
+        // emitter re-emits nothing it already holds as a row).
+        let wrap_to_b = held_row(a, &axis, &b.key).await;
+        let err =
+            admit_replicated_key_grant(b.backend, sign_row_unstored(&a.signer, &wrap_to_b).await)
+                .await
+                .expect_err("{tag} I77: the removed owner's instrument is refused");
         assert_eq!(
             refusal_reason(&err),
             "signer_not_active_member",
@@ -1643,15 +1806,26 @@ pub mod two_node {
             })
             .await
             .unwrap();
-            let row = a
-                .backend
-                .get_attestation(&emitted.attestation_id)
-                .await
-                .unwrap()
-                .unwrap();
+            // The recipient: bob's occurrence B (v55.0.0, #989 — the
+            // recipient rule asks that the wrap's recipient may hold the key).
+            ts::register_hybrid_key_as(&c, &b.key, "i77-b", USER).await;
+            c.put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
+                identity_key_id: bob.clone(),
+                occurrence_key_id: b.key.clone(),
+                device_class: crate::federation::types::device_class::SERVER.into(),
+                hardware_attestation: None,
+                asserted_at: chrono::Utc::now(),
+                valid_until: None,
+                encryption_pubkeys: Some(b.kem.clone()),
+                transport_binding: None,
+                persist_row_hash: String::new(),
+            })
+            .await
+            .unwrap();
+            let row = to_b.clone();
             let err = admit_replicated_key_grant(
                 &c,
-                SignedKeyGrantSet {
+                SignedKeyGrantRow {
                     attestation: row.clone(),
                 },
             )
@@ -1672,7 +1846,7 @@ pub mod two_node {
             .unwrap();
             admit_replicated_key_grant(
                 &c,
-                SignedKeyGrantSet {
+                SignedKeyGrantRow {
                     attestation: row.clone(),
                 },
             )
@@ -1692,17 +1866,8 @@ pub mod two_node {
             .await
             .unwrap();
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            let fresh = emit_epoch_key_grant_with_local_signer(a.backend, &a.signer, &comm, 0)
-                .await
-                .unwrap()
-                .expect("A still holds wraps");
-            let row2 = a
-                .backend
-                .get_attestation(&fresh.attestation_id)
-                .await
-                .unwrap()
-                .unwrap();
-            let err = admit_replicated_key_grant(&c, SignedKeyGrantSet { attestation: row2 })
+            let row2 = sign_row_unstored(&a.signer, &wrap_to_b).await;
+            let err = admit_replicated_key_grant(&c, row2)
                 .await
                 .expect_err("{tag} I77 (5): a revoked occurrence is not lifted by a live binding");
             assert_eq!(
@@ -1790,17 +1955,8 @@ pub mod two_node {
             .await
             .unwrap();
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            let newest = emit_epoch_key_grant_with_local_signer(a.backend, &a.signer, &comm, 0)
-                .await
-                .unwrap()
-                .expect("A still holds wraps");
-            let row3 = a
-                .backend
-                .get_attestation(&newest.attestation_id)
-                .await
-                .unwrap()
-                .unwrap();
-            let err = admit_replicated_key_grant(&d, SignedKeyGrantSet { attestation: row3 })
+            let row3 = sign_row_unstored(&a.signer, &wrap_to_b).await;
+            let err = admit_replicated_key_grant(&d, row3)
                 .await
                 .expect_err("{tag} I77 (6): a revocation on ANY row for the key is final");
             assert_eq!(
@@ -1858,6 +2014,21 @@ pub mod two_node {
             .unwrap();
             e.apply_replicated_attestation(crate::federation::SignedAttestation {
                 attestation: ts::owner_binding_attestation(&format!("ob-e-{run}"), &alice, &a.key),
+            })
+            .await
+            .unwrap();
+            // The recipient: bob's occurrence B (v55.0.0, #989).
+            ts::register_hybrid_key_as(&e, &b.key, "i77-b", USER).await;
+            e.put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
+                identity_key_id: bob.clone(),
+                occurrence_key_id: b.key.clone(),
+                device_class: crate::federation::types::device_class::SERVER.into(),
+                hardware_attestation: None,
+                asserted_at: chrono::Utc::now(),
+                valid_until: None,
+                encryption_pubkeys: Some(b.kem.clone()),
+                transport_binding: None,
+                persist_row_hash: String::new(),
             })
             .await
             .unwrap();
@@ -1921,17 +2092,8 @@ pub mod two_node {
             .await
             .unwrap();
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            let latest = emit_epoch_key_grant_with_local_signer(a.backend, &a.signer, &comm, 0)
-                .await
-                .unwrap()
-                .expect("A still holds wraps");
-            let row4 = a
-                .backend
-                .get_attestation(&latest.attestation_id)
-                .await
-                .unwrap()
-                .unwrap();
-            admit_replicated_key_grant(&e, SignedKeyGrantSet { attestation: row4 })
+            let row4 = sign_row_unstored(&a.signer, &wrap_to_b).await;
+            admit_replicated_key_grant(&e, row4)
                 .await
                 .unwrap_or_else(|err| {
                     panic!("{tag} I77 (7): carol's revocation of HER row must not disable A: {err}")
@@ -2002,13 +2164,8 @@ pub mod two_node {
             })
             .await
             .unwrap();
-            let row5 = a
-                .backend
-                .get_attestation(&emitted.attestation_id)
-                .await
-                .unwrap()
-                .unwrap();
-            let err = admit_replicated_key_grant(&f, SignedKeyGrantSet { attestation: row5 })
+            let row5 = to_b.clone();
+            let err = admit_replicated_key_grant(&f, SignedKeyGrantRow { attestation: row5 })
                 .await
                 .expect_err("{tag} I77 (8): a stale row under a former owner is not a principal");
             assert_eq!(
@@ -2407,12 +2564,7 @@ pub mod two_node {
             .await
             .unwrap()
             .expect("A holds wraps");
-        let early_row = a
-            .backend
-            .get_attestation(&early.attestation_id)
-            .await
-            .unwrap()
-            .expect("the early row");
+        let early_row = emitted_row_for(a, &early, &b.key).await;
         // B learns that A's occurrence was revoked AFTER the early set was
         // asserted (and before now).
         b.backend
@@ -2430,7 +2582,7 @@ pub mod two_node {
             .await
             .unwrap_or_else(|e| panic!("{tag} I60b: B records the revocation: {e}"));
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        let err = carry_key_grant(a, b, &early.attestation_id)
+        let err = carry_key_grant(a, b, &early_row.attestation_id)
             .await
             .expect_err("{tag} I60b: the plane's cohort gate refuses a revoked occurrence");
         // The plane's write-path gate propagates as its own error, not as a
@@ -2453,14 +2605,16 @@ pub mod two_node {
         );
         // The same minter, speaking AFTER the revocation: the fold itself
         // refuses, before the plane is asked.
-        let late = emit_epoch_key_grant_with_local_signer(a.backend, &a.signer, &comm, 0)
+        let axis = KeyGrantAxis::Epoch {
+            community_key_id: comm.clone(),
+            minter_key_id: a.key.clone(),
+            epoch: 0,
+        };
+        let late = sign_row_unstored(&a.signer, &held_row(a, &axis, &b.key).await).await;
+        assert_ne!(late.attestation.attestation_id, early_row.attestation_id);
+        let err = admit_replicated_key_grant(b.backend, late)
             .await
-            .unwrap()
-            .expect("A still holds wraps");
-        assert_ne!(late.attestation_id, early.attestation_id);
-        let err = carry_key_grant(a, b, &late.attestation_id)
-            .await
-            .expect_err("{tag} I60b: a set asserted after the revocation is refused");
+            .expect_err("{tag} I60b: a row asserted after the revocation is refused");
         assert_eq!(
             refusal_reason(&err),
             "signer_not_active_member",
@@ -2640,6 +2794,8 @@ mod tests {
             "put_blob_encrypted_self_family",
             "put_blob_chunk_scoped",
             "seal_stream_scoped",
+            // v55.0.0 (#981) — a kept supplied epoch's rows.
+            "register_stream_epoch_dek",
         ] {
             assert!(
                 method_body(&prod, door).contains("emit_key_grant_axis_async"),
@@ -3423,18 +3579,16 @@ mod tests {
             exercise_i65_content_axis_second_device(&a, &a2, "sqlite").await;
         }
 
-        /// **I68 — a retroactive ADD emits each changed blob's content set**
+        /// **I68 — a retroactive ADD emits each changed blob's content rows**
         /// (PR #850 review). `rekey_self_occurrence_add` writes new per-blob
-        /// wraps for a newcomer device; the Engine door emits the FULL
-        /// content-axis set for every blob it changed, so the newcomer's
+        /// wraps for a newcomer device; the Engine door emits a row for every
+        /// wrap of every blob it changed not yet held as a row, so the newcomer's
         /// remote node receives the key for historical bytes through the
         /// same path a fresh write uses. Idempotent: a second walk changes
         /// nothing and emits nothing.
         #[tokio::test]
         async fn i68_rekey_for_a_newcomer_emits_each_changed_blobs_content_set_sqlite() {
-            use crate::federation::key_grant::{
-                KeyGrantAxis, KeyGrantSet, KEY_GRANT_CONTENT_ATTESTATION_TYPE,
-            };
+            use crate::federation::key_grant::{KeyGrantAxis, KeyGrantRow};
             use crate::federation::tier_ingest::test_support as ts;
             use crate::federation::types::cohort_scope::SELF;
             use crate::federation::types::identity_type::USER;
@@ -3481,22 +3635,31 @@ mod tests {
                 .await
                 .expect("I68: the owner's first device seals");
             let sha = r.at_rest_sha256;
-            let sets_for = |sq: std::sync::Arc<SqliteBackend>, me: String| async move {
-                let mut out: Vec<KeyGrantSet> = Vec::new();
+            // v55.0.0 (#989) — the content-axis ROWS this node signed for the
+            // blob, one per recipient.
+            let rows_for = |sq: std::sync::Arc<SqliteBackend>, me: String| async move {
+                let mut out: Vec<KeyGrantRow> = Vec::new();
                 for row in sq.list_attestations_by(&me).await.unwrap() {
-                    if row.attestation_type != KEY_GRANT_CONTENT_ATTESTATION_TYPE {
+                    if !crate::federation::key_grant::is_key_grant_row(&row) {
                         continue;
                     }
-                    let set = KeyGrantSet::from_attestation(&row).unwrap();
-                    if matches!(&set.axis, KeyGrantAxis::Content { at_rest_sha256, .. } if *at_rest_sha256 == hex::encode(sha))
+                    let r = KeyGrantRow::from_attestation(&row).unwrap();
+                    if matches!(&r.axis, KeyGrantAxis::Content { at_rest_sha256, .. } if *at_rest_sha256 == hex::encode(sha))
                     {
-                        out.push(set);
+                        out.push(r);
                     }
                 }
                 out
             };
-            let before = sets_for(sq.clone(), me.clone()).await;
-            assert_eq!(before.len(), 1, "I68: the write emitted one content set");
+            let before = rows_for(sq.clone(), me.clone()).await;
+            assert_eq!(
+                before
+                    .iter()
+                    .map(|r| r.recipient().to_owned())
+                    .collect::<Vec<_>>(),
+                vec![me.clone()],
+                "I68: the write emitted one row, to the first device"
+            );
             // A NEW device of the owner, with its own content-KEM identity.
             let other = fresh().await;
             let dev2 = format!("i68-dev2-{run}");
@@ -3517,18 +3680,16 @@ mod tests {
                 "I68: the walk names the blob it changed"
             );
             assert!(sq.get_at_rest_grant(&sha, &dev2).await.unwrap().is_some());
-            let after = sets_for(sq.clone(), me.clone()).await;
+            let after = rows_for(sq.clone(), me.clone()).await;
+            let mut recipients: Vec<String> =
+                after.iter().map(|r| r.recipient().to_owned()).collect();
+            recipients.sort();
+            let mut want = vec![me.clone(), dev2.clone()];
+            want.sort();
             assert_eq!(
-                after.len(),
-                2,
-                "I68: the rekey emitted the blob's content set"
-            );
-            assert!(
-                after
-                    .iter()
-                    .any(|s| s.wraps.iter().any(|w| w.recipient_key_id == dev2)
-                        && s.wraps.iter().any(|w| w.recipient_key_id == me)),
-                "I68: the emitted set is the FULL set — the new device AND the first"
+                recipients, want,
+                "I68: the rekey emitted the new device's row, and the first device's row was not \
+                 emitted twice (a wrap already held as a row is skipped)"
             );
             // Idempotent: nothing changed, nothing emitted.
             let rk2 = engine
@@ -3536,7 +3697,7 @@ mod tests {
                 .await
                 .unwrap();
             assert!(rk2.changed_blobs.is_empty(), "I68: {rk2:?}");
-            assert_eq!(sets_for(sq.clone(), me.clone()).await.len(), 2);
+            assert_eq!(rows_for(sq.clone(), me.clone()).await.len(), 2);
         }
 
         /// **I75 (#851 §20.4) — THE END TO END, DELIVERED.** Two Engines. Every
@@ -3544,11 +3705,12 @@ mod tests {
         /// other side: keys through the Key plane, owner bindings through the
         /// attestation cursor, occurrences through
         /// `list_signed_identity_occurrences_since` → `put_identity_occurrence`,
-        /// the set through the cursor → `apply_replicated_key_grant`. Nothing
-        /// is copied by hand — the plane I61 could not run.
+        /// the key-grant row through the cursor, the sender's serve gate and
+        /// the generic `apply_replicated_attestation` (v55.0.0, #989: it
+        /// projects the wrap). Nothing is copied by hand — the plane I61 could
+        /// not run.
         #[tokio::test]
         async fn i75_end_to_end_delivered_by_the_planes_sqlite() {
-            use crate::federation::key_grant::SignedKeyGrantSet;
             use crate::federation::tier_ingest::test_support as ts;
             use crate::federation::types::cohort_scope::{CryptoTier, COMMUNITY};
             use crate::federation::types::identity_type::USER;
@@ -3617,9 +3779,22 @@ mod tests {
                 to: &crate::Engine,
                 to_backend: &SqliteBackend,
             ) -> usize {
+                let to_key = to.local_derived_key_id().await.unwrap();
                 let mut n = 0;
                 for served in from.list_attestations_since(None, 1_000).await.unwrap() {
                     let row = served.attestation;
+                    // v55.0.0 (#989) — a key-grant row crosses only to its
+                    // recipient's node: the sender's serve gate decides.
+                    if crate::federation::key_grant::is_key_grant_row(&row)
+                        && !crate::federation::replication_audience::may_receive(
+                            from, &to_key, &row,
+                        )
+                        .await
+                        .unwrap()
+                        .allowed()
+                    {
+                        continue;
+                    }
                     if to_backend
                         .get_attestation(&row.attestation_id)
                         .await
@@ -3635,18 +3810,15 @@ mod tests {
                         row.scrub_signature_pqc.is_some()
                     );
                     let signer = row.attesting_key_id.clone();
-                    if row.attestation_type.starts_with("key_grant:") {
-                        to.apply_replicated_key_grant(SignedKeyGrantSet { attestation: row })
-                            .await
-                            .unwrap_or_else(|e| panic!("I75: the far node admits the set: {e}"));
-                    } else {
-                        to_backend
-                            .apply_replicated_attestation(SignedAttestation { attestation: row })
-                            .await
-                            .unwrap_or_else(|e| {
-                                panic!("I75: the far node admits the row {kind} by {signer}: {e}")
-                            });
-                    }
+                    // v55.0.0 (#989) — ONE door for every row, a key-grant row
+                    // included: the typed attestation apply projects its wrap
+                    // (Edge's pull path needs no key-grant routing).
+                    to_backend
+                        .apply_replicated_attestation(SignedAttestation { attestation: row })
+                        .await
+                        .unwrap_or_else(|e| {
+                            panic!("I75: the far node admits the row {kind} by {signer}: {e}")
+                        });
                     n += 1;
                 }
                 n
@@ -3769,10 +3941,10 @@ mod tests {
             );
             assert!(r.key_grant_emission.is_some());
             let sha = r.at_rest_sha256;
-            // The set crosses through the cursor to the Engine door.
+            // B's row crosses through the cursor and the serve gate.
             assert!(
                 deliver_attestations(&sa, &engine_b, &sb).await >= 1,
-                "I75: the set reaches B"
+                "I75: the row reaches B"
             );
             assert!(
                 sb.community_dek_has_member_grant(&comm, &a_key, r.epoch.unwrap_or(0), &b_key)
@@ -4388,7 +4560,6 @@ mod tests {
         #[tokio::test]
         async fn i70_emission_ledger_repairs_a_missed_emission_sqlite() {
             use crate::federation::community_dek::orchestrate::encrypt_and_cascade_community;
-            use crate::federation::key_grant::KEY_GRANT_EPOCH_ATTESTATION_TYPE;
             use crate::federation::tier_ingest::test_support as ts;
             use crate::federation::types::cohort_scope::COMMUNITY;
             use crate::federation::types::identity_type::USER;
@@ -4441,12 +4612,17 @@ mod tests {
             })
             .await
             .unwrap();
+            // v55.0.0 (#989) — the epoch-axis ROWS this node signed (one per
+            // recipient: this node's occurrence and the member's).
             let epoch_sets = |sq: std::sync::Arc<SqliteBackend>, me: String| async move {
                 sq.list_attestations_by(&me)
                     .await
                     .unwrap()
                     .into_iter()
-                    .filter(|r| r.attestation_type == KEY_GRANT_EPOCH_ATTESTATION_TYPE)
+                    .filter(|r| {
+                        crate::federation::admission::envelope_dimension(&r.attestation_envelope)
+                            == Some(crate::federation::key_grant::KEY_GRANT_EPOCH_DIMENSION)
+                    })
                     .count()
             };
             // (1) The crash shape: the cascade ran, no door emitted.
@@ -4477,8 +4653,8 @@ mod tests {
             );
             assert_eq!(
                 epoch_sets(sq.clone(), me.clone()).await,
-                1,
-                "I70: the set is on the cursor"
+                2,
+                "I70: the rows are on the cursor, one per recipient"
             );
             assert!(!sq
                 .community_dek_key_grant_dirty(&comm, &me, sealed.epoch)
@@ -4493,7 +4669,7 @@ mod tests {
                 r2.key_grant_emission.is_none(),
                 "I70: clean epoch, no emission"
             );
-            assert_eq!(epoch_sets(sq.clone(), me.clone()).await, 1);
+            assert_eq!(epoch_sets(sq.clone(), me.clone()).await, 2);
             // (4) The boot sweep on a fresh community left dirty by a "crash".
             let comm2 = format!("i70-comm2-{run}");
             // Seeded by hand: alice (this node's identity) is already
@@ -4550,10 +4726,10 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 engine.emit_pending_key_grants().await.unwrap(),
-                1,
-                "I70: the sweep emits the dirty epoch"
+                2,
+                "I70: the sweep emits the dirty epoch's rows"
             );
-            assert_eq!(epoch_sets(sq.clone(), me.clone()).await, 2);
+            assert_eq!(epoch_sets(sq.clone(), me.clone()).await, 4);
             assert_eq!(
                 engine.emit_pending_key_grants().await.unwrap(),
                 0,
@@ -4569,7 +4745,7 @@ mod tests {
         /// `Engine::read_blob_as`. `Engine::emit_key_grant` re-emits on demand.
         #[tokio::test]
         async fn i61_end_to_end_through_the_engine_doors_sqlite() {
-            use crate::federation::key_grant::{KeyGrantAxis, SignedKeyGrantSet};
+            use crate::federation::key_grant::{KeyGrantAxis, SignedKeyGrantRow};
             use crate::federation::tier_ingest::test_support as ts;
             use crate::federation::types::cohort_scope::{CryptoTier, COMMUNITY};
             use crate::federation::types::identity_type::USER;
@@ -4640,24 +4816,28 @@ mod tests {
                 .unwrap()
                 .into_iter()
                 .filter(|x| {
-                    x.attestation_type
-                        == crate::federation::key_grant::KEY_GRANT_EPOCH_ATTESTATION_TYPE
+                    crate::federation::admission::envelope_dimension(&x.attestation_envelope)
+                        == Some(crate::federation::key_grant::KEY_GRANT_EPOCH_DIMENSION)
                 })
                 .collect();
             assert_eq!(
                 emitted.len(),
-                1,
-                "exactly one epoch-axis set emitted by the door"
+                2,
+                "one epoch-axis row per recipient emitted by the door (A's own, B's)"
             );
+            let to_b = emitted
+                .iter()
+                .find(|x| x.attested_key_id == b.key)
+                .expect("a row to B");
 
             // B admits through the Engine door, adopts through the Engine door.
             let admission = engine_b
-                .apply_replicated_key_grant(SignedKeyGrantSet {
-                    attestation: emitted[0].clone(),
+                .apply_replicated_key_grant(SignedKeyGrantRow {
+                    attestation: to_b.clone(),
                 })
                 .await
-                .expect("B admits A's set through the Engine door");
-            assert!(admission.wraps_written >= 1);
+                .expect("B admits A's row through the Engine door");
+            assert!(admission.projected, "{admission:?}");
             let Some(BlobBody::Inline(bytes)) = sa.get_blob(&sha).await.unwrap() else {
                 panic!("inline")
             };
@@ -4684,7 +4864,8 @@ mod tests {
                     .expect("B reads through the Engine door"),
                 b"engine minutes"
             );
-            // Re-emission on demand carries the full set again (idempotent).
+            // Re-emission on demand is idempotent: every wrap is held as a row
+            // already, so nothing new is emitted (v55.0.0, #989).
             let again = engine_a
                 .emit_key_grant(&KeyGrantAxis::Epoch {
                     community_key_id: comm.clone(),
@@ -4692,11 +4873,10 @@ mod tests {
                     epoch: 0,
                 })
                 .await
-                .expect("re-emit");
-            assert!(
-                again.is_some(),
-                "A holds wraps, so a re-emission carries them"
-            );
+                .expect("re-emit")
+                .expect("A holds wraps");
+            assert!(again.attestation_ids.is_empty(), "{again:?}");
+            assert_eq!(again.already_emitted.len(), 2, "{again:?}");
             // A second seal in the same epoch changes no grant: no new set.
             let r2 = engine_a
                 .put_blob_scoped(COMMUNITY, Some(&comm), b"more minutes", None, None)

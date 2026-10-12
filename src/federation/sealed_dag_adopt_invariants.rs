@@ -14,7 +14,6 @@
 
 pub(crate) mod bodies {
     use crate::federation::epoch_minter_invariants::bodies::{ladder, Pick};
-    use crate::federation::key_grant::SignedKeyGrantSet;
     use crate::federation::key_grant_invariants::two_node::{introduce_as, Node};
     use crate::federation::self_collective_invariants::bodies::bind;
     use crate::federation::tier_ingest::test_support as ts;
@@ -153,31 +152,24 @@ pub(crate) mod bodies {
         );
         // The content sets A's node emitted, carried to B.
         engine_a.emit_pending_key_grants().await.unwrap();
-        let sets: Vec<_> = sa
-            .list_attestations_by(&a.key)
-            .await
-            .unwrap()
-            .into_iter()
-            .filter(|x| {
-                x.attestation_type
-                    == crate::federation::key_grant::KEY_GRANT_CONTENT_ATTESTATION_TYPE
-                    || x.attestation_type
-                        == crate::federation::key_grant::KEY_GRANT_STREAM_ATTESTATION_TYPE
-            })
-            .collect();
-        // #969 — a set per stream EPOCH and one per manifest, not one per chunk.
+        // v55.0.0 (#989) — the rows A's plane delivers to B.
+        let sets = crate::federation::key_grant_invariants::two_node::key_grant_rows_for(
+            sa.as_ref(),
+            &a.key,
+            &b.key,
+        )
+        .await;
+        // #969 — a row per stream EPOCH and one per manifest, not one per chunk.
         assert!(
             sets.len() >= 2,
-            "a stream set and one for the manifest: {}",
+            "a stream row and one for the manifest: {}",
             sets.len()
         );
         for a in &sets {
             engine_b
-                .apply_replicated_key_grant(SignedKeyGrantSet {
-                    attestation: a.clone(),
-                })
+                .apply_replicated_key_grant(a.clone())
                 .await
-                .expect("B applies A's set");
+                .expect("B applies A's row");
         }
         let prov = BlobProvenance {
             author_key_id: owner.clone(),

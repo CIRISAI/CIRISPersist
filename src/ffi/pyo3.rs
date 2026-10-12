@@ -1350,8 +1350,8 @@ impl PyEngine {
     /// #848 (§14) — **the emission every Python write door performs after
     /// a cascade that minted or granted anew** (CIRISPersist#850 review: the
     /// specialized doors `put_blob_encrypted_community` /
-    /// `put_blob_encrypted_self_family` emitted nothing). The set is signed
-    /// by the LocalSigner (the hybrid signer this engine has) and stored
+    /// `put_blob_encrypted_self_family` emitted nothing). The rows (one per
+    /// recipient, v55.0.0 #989) are signed by the LocalSigner (the hybrid signer this engine has) and stored
     /// through the attestation plane so it replicates; an engine that cannot
     /// sign it says so rather than leaving members with bytes and no key.
     /// `async` — the caller blocks inside `py.detach` (CIRISPersist#580).
@@ -1361,8 +1361,8 @@ impl PyEngine {
     ) -> PyResult<()> {
         let local = self.local_signer.clone().ok_or_else(|| {
             blob_err_to_py(crate::federation::BlobError::AttestationEmissionFailed(
-                "the key_grant set for this write cannot be emitted: this engine has no \
-                 LocalSigner to hybrid-sign it (BLOB_REPLICATION.md §14); the bytes are \
+                "the key_grant rows for this write cannot be emitted: this engine has no \
+                 LocalSigner to hybrid-sign them (BLOB_REPLICATION.md §14); the bytes are \
                  stored and the key cannot follow them"
                     .into(),
             ))
@@ -2373,54 +2373,39 @@ impl PyEngine {
                     if let Err(e) = rewrapped {
                         tracing::warn!(error = %e, "member-device re-wrap sweep failed at init (#916)");
                     }
-                    let mut emitted = 0usize;
+                    // v55.0.0 (#989) — rows, per axis; one failing axis is
+                    // logged and left dirty, the rest still go out.
                     match &backend {
                         #[cfg(feature = "postgres")]
                         BackendDispatch::Postgres(pg) => {
-                            for axis in
-                                crate::federation::key_grant::dirty_axes(pg.as_ref(), &me).await?
-                            {
-                                if crate::federation::key_grant::emit_key_grant_axis_with_local_signer(
-                                    pg.as_ref(),
-                                    &local,
-                                    &axis,
-                                )
-                                .await?
-                                .is_some()
-                                {
-                                    emitted += 1;
-                                }
-                            }
+                            crate::federation::key_grant::emit_dirty_with_local_signer(
+                                pg.as_ref(),
+                                &local,
+                            )
+                            .await
                         }
                         #[cfg(feature = "sqlite")]
                         BackendDispatch::Sqlite(sq) => {
-                            for axis in
-                                crate::federation::key_grant::dirty_axes(sq.as_ref(), &me).await?
-                            {
-                                if crate::federation::key_grant::emit_key_grant_axis_with_local_signer(
-                                    sq.as_ref(),
-                                    &local,
-                                    &axis,
-                                )
-                                .await?
-                                .is_some()
-                                {
-                                    emitted += 1;
-                                }
-                            }
+                            crate::federation::key_grant::emit_dirty_with_local_signer(
+                                sq.as_ref(),
+                                &local,
+                            )
+                            .await
                         }
                     }
-                    Ok(emitted)
                 })
             });
             match sweep {
                 Ok(0) => {}
                 Ok(n) => {
-                    tracing::info!(sets = n, "pending KeyGrant sets emitted at init (#848 §14)")
+                    tracing::info!(
+                        rows = n,
+                        "pending key-grant rows emitted at init (#848 §14, #989)"
+                    )
                 }
                 Err(e) => tracing::warn!(
                     error = %e,
-                    "pending KeyGrant sets could not be emitted at init; the write doors retry (#848 §14)"
+                    "pending key-grant rows could not be emitted at init; the write doors retry (#848 §14)"
                 ),
             }
         }
@@ -6659,25 +6644,28 @@ impl PyEngine {
         })
     }
 
-    /// CIRISPersist#848 (`BLOB_REPLICATION.md` §12–§13) — **admit a
-    /// replicated `KeyGrant` set and project every wrap.** FFI mirror of
-    /// [`Engine::apply_replicated_key_grant`](crate::engine::Engine::apply_replicated_key_grant):
-    /// the apply a replication bridge routes a `key_grant:*` attestation to
-    /// (CIRISEdge#601's pull-on-attestation hook) instead of
-    /// `apply_replicated_attestation`.
+    /// CIRISPersist#848 (`BLOB_REPLICATION.md` §12–§13), v55.0.0 (#989, CC
+    /// 3.3.2 rc7) — **admit one replicated key-grant row and project its
+    /// wrap.** FFI mirror of
+    /// [`Engine::apply_replicated_key_grant`](crate::engine::Engine::apply_replicated_key_grant).
+    /// `apply_replicated_attestation` admits and projects a key-grant row too;
+    /// this door also reports the projection.
     ///
-    /// `signed_key_grant_json` is the `SignedKeyGrantSet` — the same shape as
-    /// a `SignedAttestation` whose `attestation_type` is `key_grant:epoch:v1`
-    /// or `key_grant:content:v1`. The signer is resolved from THIS node's
-    /// directory; it must be the set's minter (epoch axis, and an active
-    /// member at `asserted_at`) or the blob's author (content axis, when the
-    /// row is present); every wrap must be v2. Returns the
-    /// `KeyGrantAdmission` as JSON: `axis`, the attestation plane's
-    /// `attestation` outcome, `wraps_offered`, `pending` (content axis, the
-    /// bytes have not arrived: the carrier is stored, nothing projected until
-    /// the adopt names the author — §13), `wraps_written` (a union: a
-    /// re-applied set writes 0 and is still admitted). A refusal is a
-    /// `federation_key_grant_refused` error naming its reason.
+    /// `signed_key_grant_json` is the `SignedKeyGrantRow` — the same shape as
+    /// a `SignedAttestation` whose `attestation_type` is `scores` and whose
+    /// envelope `dimension` is `key_grant:{content|epoch|stream}:v1`. The rule
+    /// runs against THIS node's directory: the sealer (the minter, an active
+    /// member at `asserted_at`; or a key that speaks for the owner and for the
+    /// held content's author), a v2 wrap, a recipient the one audience rule
+    /// admits. Returns the `KeyGrantAdmission` as JSON: `axis`,
+    /// `recipient_key_id`, the attestation plane's `attestation` outcome,
+    /// `projected` (the wrap is held after the call — a union, so a re-applied
+    /// row is still `true`), `pending` (content axis, the bytes have not
+    /// arrived: the row is stored, nothing projected until the adopt names the
+    /// author — §13). A refusal is a `federation_key_grant_refused` error
+    /// naming its reason, or `federation_signer_not_acting_for` (plane
+    /// `key_grant`, retryable). A retired key-grant SET is refused
+    /// `set_retired`.
     fn apply_replicated_key_grant(
         &self,
         py: Python<'_>,
@@ -6686,9 +6674,9 @@ impl PyEngine {
         self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
-            let set: crate::federation::key_grant::SignedKeyGrantSet =
+            let set: crate::federation::key_grant::SignedKeyGrantRow =
                 serde_json::from_str(signed_key_grant_json).map_err(|e| {
-                    PyValueError::new_err(format!("SignedKeyGrantSet JSON decode: {e}"))
+                    PyValueError::new_err(format!("SignedKeyGrantRow JSON decode: {e}"))
                 })?;
             let outcome = py.detach(|| match &self.backend {
                 #[cfg(feature = "postgres")]
@@ -6722,18 +6710,20 @@ impl PyEngine {
         })
     }
 
-    /// CIRISPersist#848 (`BLOB_REPLICATION.md` §14) — **emit the
-    /// `KeyGrant` set for an axis on demand.** FFI mirror of
+    /// CIRISPersist#848 (`BLOB_REPLICATION.md` §14), v55.0.0 (#989) — **emit
+    /// the key-grant rows for an axis on demand.** FFI mirror of
     /// [`Engine::emit_key_grant`](crate::engine::Engine::emit_key_grant).
     /// Every write door emits after a fan-out that changed; this is the
     /// re-emission door — a node that died mid-fan-out, or an operator
-    /// re-seeding a late device, carries the FULL set again (idempotent on
-    /// every receiver, §13). `axis_json` is a `KeyGrantAxis`:
+    /// re-seeding a late device, emits one row per wrap it holds that it has
+    /// not emitted yet (a wrap already held as a row is skipped). `axis_json`
+    /// is a `KeyGrantAxis`:
     /// `{"axis":"epoch","community_key_id":…,"minter_key_id":…,"epoch":N}` or
     /// `{"axis":"content","at_rest_sha256":hex,"cohort_scope":…,"owner_key_id":…}`
-    /// or (v53.0.0, #969)
-    /// `{"axis":"stream","stream_id":…,"epoch":N,"cohort_scope":…,"owner_key_id":…}`.
-    /// Returns the emitted row's `attestation_id`, or `null` when this node
+    /// or `{"axis":"stream","stream_id":…,"epoch":N,"cohort_scope":…,"owner_key_id":…}`.
+    /// Returns the `KeyGrantEmission` as JSON (`axis`, `attestation_ids` — one
+    /// per row emitted, `already_emitted`, `withheld` — recipients the audience
+    /// rule no longer admits, `sealer_refused`), or `null` when this node
     /// holds no wrap for the axis. Needs the LocalSigner (hybrid).
     fn emit_key_grant(&self, py: Python<'_>, axis_json: &str) -> PyResult<Option<String>> {
         self.ensure_usable()?;
@@ -6743,12 +6733,12 @@ impl PyEngine {
                 .map_err(|e| PyValueError::new_err(format!("KeyGrantAxis JSON decode: {e}")))?;
             let local = self.local_signer.clone().ok_or_else(|| {
                 blob_err_to_py(crate::federation::BlobError::AttestationEmissionFailed(
-                    "emit_key_grant requires a LocalSigner to hybrid-sign the set (§14); this \
+                    "emit_key_grant requires a LocalSigner to hybrid-sign the rows (§14); this \
                      engine has none"
                         .into(),
                 ))
             })?;
-            // Review round ten — peers enforce signer == minter, so a set signed
+            // Review round ten — peers enforce signer == minter, so a row signed
             // by a foreign or PQC-less key is one every peer rejects.
             {
                 let node_key_id =
@@ -6784,26 +6774,34 @@ impl PyEngine {
                     }
                 }
                 .map_err(federation_err_to_py)?;
-                Ok(emitted.map(|e| e.attestation_id))
+                emitted
+                    .map(|e| {
+                        serde_json::to_string(&e).map_err(|e| {
+                            PyValueError::new_err(format!("emit_key_grant outcome serialize: {e}"))
+                        })
+                    })
+                    .transpose()
             })
         })
     }
 
     /// CIRISPersist#848 (BLOB_REPLICATION.md §14, V146) —
-    /// **emit every KeyGrant set this node owes and has not yet carried**: each
+    /// **emit every key-grant row this node owes and has not yet carried**: each
     /// epoch it minted whose set is dirty per the emission ledger (never
     /// emitted, or a grant newer than the last emission — the shape a crash
     /// between a cascade and its emission leaves) and each self/family blob it
     /// authored likewise. Runs at `__init__` after the sentinel resolves (best
-    /// effort, logged); reachable on demand. Returns how many sets were
-    /// emitted. FFI mirror of [`Engine::emit_pending_key_grants`](crate::engine::Engine::emit_pending_key_grants).
+    /// effort, logged); reachable on demand. Returns how many rows were
+    /// emitted (v55.0.0, #989: one per recipient; was one per set). After
+    /// V192 the first call re-emits every wrap this node holds as sealer or
+    /// minter. FFI mirror of [`Engine::emit_pending_key_grants`](crate::engine::Engine::emit_pending_key_grants).
     fn emit_pending_key_grants(&self, py: Python<'_>) -> PyResult<usize> {
         self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let local = self.local_signer.clone().ok_or_else(|| {
                 blob_err_to_py(crate::federation::BlobError::AttestationEmissionFailed(
-                    "emit_pending_key_grants requires a LocalSigner to hybrid-sign the sets \
+                    "emit_pending_key_grants requires a LocalSigner to hybrid-sign the rows \
                      (§14); this engine has none"
                         .into(),
                 ))
@@ -6847,59 +6845,33 @@ impl PyEngine {
                 if let Err(e) = rewrapped {
                     tracing::warn!(error = %e, "member-device re-wrap sweep failed (#916)");
                 }
-                let axes = match &self.backend {
+                // v55.0.0 (#989) — rows, per axis; one failing axis is
+                // logged and left dirty, the rest still go out.
+                match &self.backend {
                     #[cfg(feature = "postgres")]
                     BackendDispatch::Postgres(pg) => {
                         let backend = pg.clone();
                         runtime.block_on(async move {
-                            crate::federation::key_grant::dirty_axes(backend.as_ref(), &me).await
+                            crate::federation::key_grant::emit_dirty_with_local_signer(
+                                backend.as_ref(),
+                                &local,
+                            )
+                            .await
                         })
                     }
                     #[cfg(feature = "sqlite")]
                     BackendDispatch::Sqlite(sq) => {
                         let backend = sq.clone();
                         runtime.block_on(async move {
-                            crate::federation::key_grant::dirty_axes(backend.as_ref(), &me).await
+                            crate::federation::key_grant::emit_dirty_with_local_signer(
+                                backend.as_ref(),
+                                &local,
+                            )
+                            .await
                         })
                     }
                 }
-                .map_err(federation_err_to_py)?;
-                let mut emitted = 0usize;
-                for axis in &axes {
-                    let done = match &self.backend {
-                        #[cfg(feature = "postgres")]
-                        BackendDispatch::Postgres(pg) => {
-                            let backend = pg.clone();
-                            let local = local.clone();
-                            runtime.block_on(async move {
-                                crate::federation::key_grant::emit_key_grant_axis_with_local_signer(
-                                    backend.as_ref(),
-                                    &local,
-                                    axis,
-                                )
-                                .await
-                            })
-                        }
-                        #[cfg(feature = "sqlite")]
-                        BackendDispatch::Sqlite(sq) => {
-                            let backend = sq.clone();
-                            let local = local.clone();
-                            runtime.block_on(async move {
-                                crate::federation::key_grant::emit_key_grant_axis_with_local_signer(
-                                    backend.as_ref(),
-                                    &local,
-                                    axis,
-                                )
-                                .await
-                            })
-                        }
-                    }
-                    .map_err(federation_err_to_py)?;
-                    if done.is_some() {
-                        emitted += 1;
-                    }
-                }
-                Ok(emitted)
+                .map_err(federation_err_to_py)
             })
         })
     }
@@ -15866,6 +15838,124 @@ impl PyEngine {
                     "excluded": r.excluded,
                     "roster": r.roster,
                     "readable_by_nobody": readable_by_nobody,
+                })
+                .to_string())
+            })
+        })
+    }
+
+    /// v55.0.0 (CIRISPersist#981, CC 5.3.3.2.5) — **supply the DEK of a
+    /// stream's next epoch** (the MLS exporter secret of a live call), so the
+    /// live and the stored stream are one key. FFI mirror of
+    /// [`Engine::register_stream_epoch_dek`](crate::engine::Engine::register_stream_epoch_dek).
+    /// `dek_b64` is the 32-byte DEK; `group_key_id` the owner (self), family
+    /// or community key; `keep` whether the stream is kept (recorded, or
+    /// `history_on_join: full`): only a kept stream's DEK is wrapped to the
+    /// audience as `key_grant:stream:v1` rows. The writer is the same signer
+    /// `put_blob_chunk_scoped` writes under. Then chunks go through
+    /// `put_blob_chunk_scoped` at `epoch`.
+    ///
+    /// Returns JSON: `stream_id`, `epoch`, `tier`, `keep`, `granted`,
+    /// `excluded`, `roster`. Refusals (ValueError, token then JSON):
+    /// `blob_stream_not_authored`, `blob_stream_epoch_dek_exists`,
+    /// `blob_invalid_argument`. A later chunk may be refused
+    /// `blob_stream_epoch_rotation_required` (`reason` `removal` naming
+    /// `removed_key_id`, or `cap`) or `blob_stream_epoch_dek_missing`, both
+    /// retryable after the next epoch's DEK is supplied.
+    #[pyo3(signature = (cohort_scope, group_key_id, stream_id, epoch, dek_b64, keep, aad_b64=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn register_stream_epoch_dek(
+        &self,
+        py: Python<'_>,
+        cohort_scope: &str,
+        group_key_id: &str,
+        stream_id: &str,
+        epoch: u64,
+        dek_b64: &str,
+        keep: bool,
+        aad_b64: Option<&str>,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            use crate::federation::chunk_dag_cascade::orchestrate::register_stream_epoch_dek;
+            use base64::engine::general_purpose::STANDARD as B64;
+            use base64::Engine as _;
+            let runtime = self.runtime.clone();
+            let dek: [u8; 32] = B64
+                .decode(dek_b64)
+                .map_err(|e| {
+                    PyValueError::new_err(format!("register_stream_epoch_dek dek_b64 decode: {e}"))
+                })?
+                .try_into()
+                .map_err(|_| {
+                    PyValueError::new_err("register_stream_epoch_dek: the DEK is 32 bytes")
+                })?;
+            let aad = decode_aad_b64(aad_b64)?;
+            let (scope, group, stream) = (
+                cohort_scope.to_owned(),
+                group_key_id.to_owned(),
+                stream_id.to_owned(),
+            );
+            // The writer: the signer `put_blob_chunk_scoped` writes under, so
+            // the supplied epoch and its chunks have one single sender.
+            let signer: Arc<dyn ciris_keyring::HardwareSigner> = match &self.local_signer {
+                Some(local) => Arc::new(crate::signing::LocalSignerHardwareAdapter::new(
+                    local.clone(),
+                )),
+                None => self.signer.clone(),
+            };
+            py.detach(move || {
+                let r = match &self.backend {
+                    #[cfg(feature = "postgres")]
+                    BackendDispatch::Postgres(pg) => {
+                        let backend = pg.clone();
+                        runtime.block_on(async move {
+                            register_stream_epoch_dek(
+                                backend.as_ref(),
+                                &*signer,
+                                &scope,
+                                &group,
+                                &stream,
+                                epoch,
+                                &dek,
+                                keep,
+                                aad.as_deref(),
+                            )
+                            .await
+                        })
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => {
+                        let backend = sq.clone();
+                        runtime.block_on(async move {
+                            register_stream_epoch_dek(
+                                backend.as_ref(),
+                                &*signer,
+                                &scope,
+                                &group,
+                                &stream,
+                                epoch,
+                                &dek,
+                                keep,
+                                aad.as_deref(),
+                            )
+                            .await
+                        })
+                    }
+                }
+                .map_err(blob_err_to_py)?;
+                // #848 (§14) — a kept epoch's key follows the chunks.
+                if let Some(axis) = r.key_grant_emission.as_ref() {
+                    runtime.block_on(self.emit_key_grant_axis_async(axis))?;
+                }
+                Ok(serde_json::json!({
+                    "stream_id": r.stream_id,
+                    "epoch": r.epoch,
+                    "tier": r.tier.as_str(),
+                    "keep": r.keep,
+                    "granted": r.granted,
+                    "excluded": r.excluded,
+                    "roster": r.roster,
                 })
                 .to_string())
             })
@@ -35253,6 +35343,46 @@ fn blob_err_to_py(e: crate::federation::BlobError) -> PyErr {
                 .map(|c| format!(" community {c}"))
                 .unwrap_or_default()
         )),
+        // v55.0.0 (CIRISPersist#981) — a caller-keyed stream's refusals, each
+        // its own token with the detail as JSON after it (the
+        // `ChunkKeyNotYetGranted` shape), ValueError like every caller-side
+        // blob refusal. `retryable` says which a host may resend after
+        // supplying the next epoch's DEK.
+        crate::federation::BlobError::StreamEpochRotationRequired {
+            ref stream_id,
+            epoch,
+            reason,
+            ref removed_key_id,
+        } => PyValueError::new_err(format!(
+            "{kind}: {}",
+            serde_json::json!({
+                "stream_id": stream_id,
+                "epoch": epoch,
+                "reason": reason,
+                "removed_key_id": removed_key_id,
+                "retryable": true,
+            })
+        )),
+        crate::federation::BlobError::StreamEpochDekMissing {
+            ref stream_id,
+            epoch,
+        } => PyValueError::new_err(format!(
+            "{kind}: {}",
+            serde_json::json!({ "stream_id": stream_id, "epoch": epoch, "retryable": true })
+        )),
+        crate::federation::BlobError::StreamEpochDekExists {
+            ref stream_id,
+            epoch,
+        } => PyValueError::new_err(format!(
+            "{kind}: {}",
+            serde_json::json!({ "stream_id": stream_id, "epoch": epoch, "retryable": false })
+        )),
+        crate::federation::BlobError::StreamNotAuthored { ref stream_id } => {
+            PyValueError::new_err(format!(
+                "{kind}: {}",
+                serde_json::json!({ "stream_id": stream_id, "retryable": false })
+            ))
+        }
         crate::federation::BlobError::Backend(_) => PyRuntimeError::new_err(kind),
     }
 }

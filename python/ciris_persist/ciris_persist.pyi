@@ -613,7 +613,7 @@ class Engine:
         """(derived) deontic — v50.0.0 (CIRISPersist#925/#931) — the REPLICATED community entry: admit a SignedCommunity received from a peer (the shape the signed since-read ser..."""
 
     def apply_replicated_key_grant(self, signed_key_grant_json: str) -> str:
-        """(derived) deontic — CIRISPersist#848 (BLOB_REPLICATION.md §12–§13) — admit a replicated KeyGrant set and project every wrap. FFI mirror of [Engine::apply_replicated_ke..."""
+        """(derived) deontic — CIRISPersist#848 (BLOB_REPLICATION.md §12–§13), v55.0.0 (#989, CC 3.3.2 rc7) — admit one replicated key-grant row and project its wrap. FFI mirror..."""
 
     def apply_replicated_key_record(
         self,
@@ -806,10 +806,10 @@ class Engine:
         """(derived) deontic — v9.4.0 (CIRISPersist#253) — node-self emit over the engine's OWN composed signer (the common case: a node emitting a federation-tier row about itse..."""
 
     def emit_key_grant(self, axis_json: str) -> str | None:
-        """(derived) deontic — CIRISPersist#848 (BLOB_REPLICATION.md §14) — emit the KeyGrant set for an axis on demand. FFI mirror of [Engine::emit_key_grant](crate::engine::Eng..."""
+        """(derived) deontic — CIRISPersist#848 (BLOB_REPLICATION.md §14), v55.0.0 (#989) — emit the key-grant rows for an axis on demand. FFI mirror of [Engine::emit_key_grant](..."""
 
     def emit_pending_key_grants(self) -> int:
-        """(derived) deontic — CIRISPersist#848 (BLOB_REPLICATION.md §14, V146) — emit every KeyGrant set this node owes and has not yet carried: each epoch it minted whose set i..."""
+        """(derived) deontic — CIRISPersist#848 (BLOB_REPLICATION.md §14, V146) — emit every key-grant row this node owes and has not yet carried: each epoch it minted whose set..."""
 
     def enter_mesh(self, attestation_id: str, contextual_integrity: str) -> dict[str, Any]:
         """(derived) deontic — v39.0.0 — enter the mesh: flip a local-tier row to the federation tier over the SAME bytes (CC 5.3.2.4.2). Replaces attestation_promote, which re-s..."""
@@ -1215,6 +1215,9 @@ class Engine:
         Idempotent on the same key/value; rejects rotation (registering
         a different key for an existing key id raises).
         """
+
+    def register_stream_epoch_dek(self, cohort_scope: str, group_key_id: str, stream_id: str, epoch: int, dek_b64: str, keep: bool, aad_b64: str | None = None) -> str:
+        """(derived) deontic — v55.0.0 (CIRISPersist#981, CC 5.3.3.2.5) — supply the DEK of a stream's next epoch (the MLS exporter secret of a live call), so the live and the st..."""
 
     def rekey_community_member_device_add_json(self, community_key_id: str, member_key_id: str, new_occurrence_key_id: str, authority_key_id: str) -> str:
         """(derived) deontic — v50.0.0 (CIRISPersist#916, FSD/SECOND_DEVICE.md §3) — a member's new device receives exactly what the member holds: every retained community DEK ep..."""

@@ -319,6 +319,28 @@ pub mod orchestrate {
         active_member_occurrences(backend, &community).await
     }
 
+    /// v55.0.0 (CIRISPersist#977) — **a room stream's wrap targets**: the same
+    /// recipients this cascade wraps an epoch DEK to
+    /// ([`resolve_community_members`], the infrastructure carve-out included),
+    /// partitioned as the self/family fan-out reports them. What a
+    /// stream-keyed community chunk's `(stream_id, epoch)` DEK is wrapped to.
+    pub(crate) async fn room_targets<B>(
+        backend: &B,
+        community_key_id: &str,
+    ) -> Result<
+        (
+            Vec<(String, crate::federation::types::EncryptionPubkeys)>,
+            GrantReport,
+        ),
+        BlobError,
+    >
+    where
+        B: FederationDirectory + Sync,
+    {
+        let (members, _) = resolve_community_members(backend, community_key_id).await?;
+        Ok(partition_roster(members))
+    }
+
     /// The community's ACTIVE members, each with its active occurrences:
     /// roster minus effective revocations, then each remaining identity's
     /// active occurrences — BY MEMBER (#843), so a member whose enumeration
@@ -1121,6 +1143,19 @@ pub mod orchestrate {
             .community_dek_retain_past_epochs(community_key_id, &minter)
             .await?;
         let mut report = SweepReport::default();
+
+        // v55.0.0 (CIRISPersist#977, operator ruling) — a room's retention
+        // bound covers every byte sealed for the room: the chunks of a
+        // stream-keyed ROOM stream are evicted under the same policy as the
+        // community epoch their stream epoch was minted at (`room_epoch`), by
+        // the rule below (`current - room_epoch > n`).
+        if let Some(n) = retain {
+            if let Some(bound) = current.checked_sub(n.saturating_add(1)) {
+                report.evicted_objects += backend
+                    .stream_dek_evict_room_chunks(community_key_id, &minter, bound, now)
+                    .await?;
+            }
+        }
 
         for (epoch, state) in backend
             .community_dek_epochs(community_key_id, &minter)

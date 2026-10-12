@@ -679,14 +679,6 @@ pub const NOT_A_FAMILY_RULE: &[(&str, &str)] = &[
          `attestation_type`, never a `scores` family; the holding claim is `custody:ack:v1`",
     ),
     (
-        "key_grant:",
-        "an `attestation_type` prefix for the CC 3 `key_grant` carrier on the sixteenth \
-         replicated kind (`key_grant::KEY_GRANT_ATTESTATION_TYPE_PREFIX`, CIRISPersist#848) — \
-         a structural primitive like the retired `holds_bytes:`, admitted by \
-         `apply_replicated_key_grant`'s \
-         signer rules rather than by a dimension family",
-    ),
-    (
         "identity:",
         "`identity:canonical_binding:{H}` is consumed as an authority-WIDENING input on the \
          withdraws path, not gated at emit; CC Part 3 catalogues no `identity:` family",
@@ -813,6 +805,12 @@ pub fn persist_ruled_prefixes() -> Vec<String> {
                 // the proposal / acceptance / decline row rules and the growth
                 // gate every roster door runs.
                 crate::federation::membership_acceptance::MEMBERSHIP_FAMILY_STEM,
+                // v55.0.0 (CIRISPersist#989, CC 3.3.2 rc7) — persist rules on
+                // `key_grant:`: the per-recipient row's shape, sealer and
+                // recipient rules (`key_grant::check_key_grant_row_admission`).
+                // Before rc7 the stem was a carrier ROW TYPE and was declared
+                // in `NOT_A_FAMILY_RULE`.
+                crate::federation::key_grant::KEY_GRANT_DIMENSION_PREFIX,
             ]
             .into_iter()
             .map(str::to_owned),

@@ -1,5 +1,6 @@
 //! CIRISPersist#848 (`FSD/BLOB_REPLICATION.md` Part II) — **key
-//! transport: the key follows the bytes.**
+//! transport: the key follows the bytes.** v55.0.0 (CIRISPersist#989, CC
+//! 3.3.2 rc7, CIRISConstitution#143) — **one `scores` row per recipient.**
 //!
 //! v44.2.0 got a sealed blob's BYTES to a member's node (`adopt_sealed_blob`,
 //! #846) and not the KEY: the per-epoch wraps and the per-blob grants were
@@ -8,73 +9,104 @@
 //! correctly, because the wrap addressed to that occurrence existed only on
 //! the author's node.
 //!
-//! # The carrier is the Constitution's own object
+//! # The row (CC 3.3.2 rc7)
 //!
-//! CC 3 defines **`key_grant`** — `wrapped_dek` under the recipient's
-//! encryption pubkeys, `wrap_algorithm` (v2, mandatory), a supersession
-//! lineage — and CC 5.1 names its two addressing axes: **content-addressed**
-//! `(content_sha256, recipient)` and **epoch-addressed** `(stream_id, epoch[,
-//! recipient])`. Persist invents no dimension; it gives that object a
-//! replicated kind, [`EnvelopeKind::KeyGrant`](crate::federation::replication_policy::EnvelopeKind::KeyGrant)
-//! — the sixteenth, appended — carrying one **set** per identity:
+//! A wrap of one data-encryption key to one recipient is one `scores` row on
+//! `key_grant:{axis}:v1` ([`KeyGrantRow`]). v44.3 through v54 carried the
+//! wraps of one identity as a SET in one carrier row (`attestation_type =
+//! key_grant:{axis}:v1`); CC rc7 retires the carrier class (CC 2.4), and the
+//! set is gone: a node refuses a new set ([`KeyGrantRefusalReason::SetRetired`])
+//! and serves none it holds. Its wire shape (persist's, cited by CC):
 //!
-//! | axis | identity | `wraps[]` | who signs |
-//! |---|---|---|---|
-//! | epoch (community / affiliations) | `(community_key_id, minter_key_id, epoch)` | every recipient occurrence the minter could wrap to at emission | the MINTER's occurrence key |
-//! | content (self / family) | `(at_rest_sha256, cohort_scope, owner_key_id)` | every recipient occurrence of the self-collective / family | the blob's AUTHOR |
-//! | stream (self / family chunk streams, v53.0.0 #969) | `(stream_id, epoch, cohort_scope, owner_key_id)` | every recipient occurrence of the stream's one access set | the stream's OWNER (single sender) |
+//! | column / member | value |
+//! |---|---|
+//! | `attestation_type` | `scores` |
+//! | `dimension` | `key_grant:content:v1` / `key_grant:epoch:v1` / `key_grant:stream:v1` |
+//! | `attesting_key_id` | the sealer: the minter (epoch), a key that speaks for the owner (content, stream) |
+//! | `attested_key_id` | the RECIPIENT occurrence, whose content-KEM keys the DEK is wrapped to |
+//! | `score` | `1.0` (positive-only) |
+//! | `cohort_scope` | the content's own scope; `community` on the epoch axis |
+//! | `subject_key_ids` | empty: the recipient gains no retraction authority |
+//! | `expires_at` | absent: never withdrawn, forward secrecy is by rotation |
+//! | `axis` | `content` / `epoch` / `stream`, agreeing with the dimension |
+//! | `at_rest_sha256` | content: the sealed blob's at-rest digest (never in `evidence_refs`) |
+//! | `owner_key_id` | content, stream: the self identity, family or community the content is sealed for |
+//! | `community_key_id`, `minter_key_id` | epoch |
+//! | `epoch` | epoch, stream |
+//! | `stream_id` | stream |
+//! | `wrap_algorithm` | `x25519_mlkem768_aes256_gcm_hkdf_sha256` (v2 only) |
+//! | `wrapped_dek` | the hybrid wrap |
 //!
-//! The set rides the attestation plane as a row whose `attestation_type` is
-//! [`KEY_GRANT_EPOCH_ATTESTATION_TYPE`] / [`KEY_GRANT_CONTENT_ATTESTATION_TYPE`]
-//! and whose envelope carries the vocabulary ([`KeyGrantSet::envelope_extra`]).
-//! It is stored through the normal attestation store, so it is served by the
-//! same cursor peers already pull (`list_attestations_since`) and replicates
-//! by the plane's projection ([`Plane::KeyGrant`](crate::federation::namespace::Plane::KeyGrant):
-//! `SelfOwn` on the content axis, `Cohort` on the epoch axis, never `Global`).
+//! plus the CC 2 cohort target: `family_key_id` on a family row,
+//! `community_id` on a community row and on every epoch row.
+//!
+//! # Identity, union, never withdrawn
+//!
+//! A wrap's identity is `(dimension, attesting_key_id, attested_key_id, axis
+//! identity)` ([`KeyGrantRow::identity`]). CC 2's latest-wins / dedup triple
+//! `(attester, dimension, attested)` does NOT apply to the family: one
+//! recipient holds wraps for many blobs and epochs from one sealer. The
+//! projection is a union into this node's grant tables (`ON CONFLICT DO
+//! NOTHING`); a row once admitted is never removed by a later one, and a
+//! `withdraws` / `recants` naming one is refused.
 //!
 //! # An epoch belongs to its minter (§11)
 //!
-//! Two members writing at the same epoch number used to mint two random DEKs
-//! both labelled E, and the grant table could hold one. The Constitution
-//! rules `(community, epoch)` with no lease and no per-delegate fold a FORK
-//! (ledger clause 3; CC 5.3.3). So key state, self-retention and grants are
-//! keyed `(community, minter, epoch)`; a blob's key identity is
-//! `(community, author, epoch)`; the signer rule falls out (M signs M's
-//! counter); and every minter rotates its own counter after admitting a
-//! removal (§15, [`community_dek::orchestrate::ensure_epoch_dek`](crate::federation::community_dek::orchestrate::ensure_epoch_dek)).
+//! Key state, self-retention and grants are keyed `(community, minter,
+//! epoch)`; a blob's key identity is `(community, author, epoch)`; the signer
+//! rule falls out (M signs M's counter); and every minter rotates its own
+//! counter after admitting a removal (§15,
+//! [`community_dek::orchestrate::ensure_epoch_dek`](crate::federation::community_dek::orchestrate::ensure_epoch_dek)).
 //!
-//! # Admission (§12) — the E-edges, CC §0
+//! # Admission — one rule, every door ([`check_key_grant_row_admission`])
 //!
-//! [`admit_replicated_key_grant`]: the signer is resolved from the admitting
-//! node's OWN directory (the attestation plane's hybrid-Strict ingest gate,
-//! never the sender); on the epoch axis the signer must equal the envelope's
-//! `minter_key_id` and be an ACTIVE member occurrence of the community at
-//! `asserted_at` per the replicated roster fold; on the content axis the
-//! signer must equal the blob row's `author_key_id` when the row is present,
-//! and the set is accepted before the row arrives (order independence). A
-//! wrap whose algorithm is not v2 is refused. Any other signer is refused.
+//! Every federation-tier row passes `check_reserved_prefix_admission`, which
+//! asks this module's rule: the shape ([`KeyGrantRow::from_attestation`]);
+//! `wrap_algorithm` v2; signed by the party it speaks for; the SEALER rule
+//! (epoch: the minter or its `grant` delegate, an active member occurrence at
+//! `asserted_at`; content / stream at `self`: a key that speaks for the
+//! owner; at a group scope the write gate's membership check; and, where this
+//! node holds the blob or stream, a key that speaks for its author / owner);
+//! and the RECIPIENT rule (the recipient is an occurrence the one audience
+//! rule lets hold the cohort's key, #963). The delegation chain is judged at
+//! [`crate::federation::admission::grant_chain_instant`] — the seam
+//! CIRISPersist#1049 moves to the row's signed instant.
 //!
-//! # The projection is a UNION (§13)
+//! # Projection ([`project_key_grant_row`])
 //!
-//! `Projection::KeyGrants` writes every wrap of the set — `ON CONFLICT DO
-//! NOTHING` — so a grant once admitted is never removed by a later set, a
-//! re-applied set is a no-op, and a set admitted before its bytes is stored
-//! and read when they arrive. CC 3: a publisher "retains existing key_grants
-//! (cannot retroactively un-share)". Forward secrecy is by rotation only
-//! (I67). The projection consults no keyring: every recipient's wrap is
-//! stored, and the read door finds the viewer's row and unwraps it with the
-//! private half this node keeps for its own occurrence.
+//! A row admitted through either typed attestation door (wire, sync) is
+//! projected into this node's grant tables by the backend hook
+//! [`FederationDirectory::project_key_grant_row`]. A content-axis row whose
+//! bytes have not arrived is held in the pending index and projected by the
+//! adopt ([`project_pending_content_grants`]).
 //!
-//! # Emission (§14)
+//! # Delivery (CC 6.1.5.3)
 //!
-//! The minter emits the FULL set for `(C, M, E)` after every mint and every
-//! fan-out that granted a new recipient — the full enumeration, never the
-//! delta — so a node that dies mid-fan-out re-emits on its next write and
-//! every receiver converges by union. The author emits one content-axis set
-//! per self/family blob after its cascade.
+//! A row reaches its recipient's node because it refers to it, and only
+//! when the cohort's audience contains that node
+//! ([`crate::federation::replication_audience::may_receive`]); being named in
+//! a wrap delivers nothing else.
+//!
+//! # Emission ([`plan_key_grant_emission`])
+//!
+//! The local grant tables stay the record (operator ruling Q3). After a
+//! cascade minted or granted anew, the sealer emits one row per wrap it holds
+//! for the axis that it has not emitted as a row yet, to every recipient the
+//! audience rule still admits, while the sealer itself may still sign as
+//! sealer (CC conditions on #989). The full enumeration, never the delta, so
+//! a node that dies mid-emission re-emits on its next write, and re-emission
+//! is idempotent: a wrap already held as a row is skipped.
+//!
+//! # The legacy re-emit (operator ruling Q3)
+//!
+//! V192 marks every emission axis dirty. On its first boot after it, a node's
+//! pending sweep re-emits the wraps it holds as sealer or minter as
+//! per-recipient rows, each at a fresh signed instant (so each recipient is
+//! re-checked against the audience at that instant), and drops the pending
+//! index entries the retired sets left. The legacy set rows stay where they
+//! are, unserved.
 
 use crate::federation::attestation_apply::ReplicatedAttestationOutcome;
-use crate::federation::envelope::EnvelopeCore;
 use crate::federation::self_collective::speaks_for;
 use crate::federation::types::cohort_scope;
 use crate::federation::{
@@ -87,22 +119,23 @@ use serde::{Deserialize, Serialize};
 /// node's own derived key at boot; a survivor aborts the boot (§16, I66).
 pub const MINTER_SENTINEL: &str = "__this_node__";
 
-/// `attestation_type` prefix every `KeyGrant` row carries — the kind's
-/// structural primitive, a sibling of the retired `holds_bytes:` (v55.0.0).
-pub const KEY_GRANT_ATTESTATION_TYPE_PREFIX: &str = "key_grant:";
-/// The epoch-axis row type: `(community, minter, epoch)`.
-pub const KEY_GRANT_EPOCH_ATTESTATION_TYPE: &str = "key_grant:epoch:v1";
-/// The content-axis row type: `(at_rest_sha256, cohort_scope, owner)`.
-pub const KEY_GRANT_CONTENT_ATTESTATION_TYPE: &str = "key_grant:content:v1";
-/// v53.0.0 (CIRISPersist#969, #975 ruling) — the stream-axis row type:
-/// `(stream_id, epoch)` of a self/family chunk stream, signed by the
-/// stream's owner. CC 5.1's epoch-addressed `(stream_id, epoch[, recipient])`
-/// axis, for the streams CC 5.3.3.1 seals under one DEK per epoch.
-pub const KEY_GRANT_STREAM_ATTESTATION_TYPE: &str = "key_grant:stream:v1";
-/// The envelope `kind` token.
-pub const KEY_GRANT_ENVELOPE_KIND: &str = "key_grant";
+/// The dimension stem every key-grant row carries (CC 3.1.3 `key_grant:{axis}`).
+pub const KEY_GRANT_DIMENSION_PREFIX: &str = "key_grant:";
+/// The epoch-axis dimension: `(community, minter, epoch)`.
+pub const KEY_GRANT_EPOCH_DIMENSION: &str = "key_grant:epoch:v1";
+/// The content-axis dimension: `(at_rest_sha256, cohort_scope, owner)`.
+pub const KEY_GRANT_CONTENT_DIMENSION: &str = "key_grant:content:v1";
+/// v53.0.0 (CIRISPersist#969, #975 ruling) — the stream-axis dimension:
+/// `(stream_id, epoch, cohort_scope, owner)`, signed by the stream's owner.
+/// CC 5.1's epoch-addressed `(stream_id, epoch[, recipient])` axis, for the
+/// streams CC 5.3.3.1 seals under one DEK per epoch.
+pub const KEY_GRANT_STREAM_DIMENSION: &str = "key_grant:stream:v1";
 
-/// CC 5.1's two addressing axes for a `key_grant` (§12).
+/// v55.0.0 (#989) — the `score` (and `confidence`) every key-grant row
+/// carries: the family is positive-only, and a wrap is a fact, not a degree.
+pub const KEY_GRANT_SCORE: f64 = 1.0;
+
+/// CC 5.1's addressing axes for a `key_grant` (§12).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "axis", rename_all = "snake_case")]
 pub enum KeyGrantAxis {
@@ -115,7 +148,7 @@ pub enum KeyGrantAxis {
         /// The minter's own counter value.
         epoch: u64,
     },
-    /// Content-addressed: self / family. Signed by the blob's author.
+    /// Content-addressed: self / family. Signed by the blob's sealer.
     Content {
         /// Hex of the at-rest content address (SHA-256 of the ciphertext).
         at_rest_sha256: String,
@@ -124,36 +157,36 @@ pub enum KeyGrantAxis {
         /// The owner (self) or family key the blob was sealed for.
         owner_key_id: String,
     },
-    /// v53.0.0 (CIRISPersist#969) — stream-epoch-addressed: one self/family
-    /// chunk stream's `(stream_id, epoch)` DEK. Signed by the stream's owner
-    /// (the single sender, CC 5.3.3.1); one set per recipient per epoch,
-    /// where the content axis carried one per CHUNK.
+    /// v53.0.0 (CIRISPersist#969) — stream-epoch-addressed: one chunk
+    /// stream's `(stream_id, epoch)` DEK. Signed by the stream's owner (the
+    /// single sender, CC 5.3.3.1); one row per recipient per epoch, where the
+    /// content axis carried one per CHUNK. v55.0.0 (#977) — community streams
+    /// ride this axis too.
     Stream {
         /// The stream.
         stream_id: String,
         /// The stream epoch the DEK seals.
         epoch: u64,
-        /// `self` or `family`.
+        /// `self`, `family`, `community` or `affiliations`.
         cohort_scope: String,
-        /// The owner (self) or family key the stream is sealed for.
+        /// The owner (self), family or community key the stream is sealed for.
         owner_key_id: String,
     },
 }
 
 impl KeyGrantAxis {
-    /// The attestation type a set on this axis rides under.
+    /// The `key_grant:{axis}:v1` dimension a row on this axis carries.
     #[must_use]
-    pub fn attestation_type(&self) -> &'static str {
+    pub fn dimension(&self) -> &'static str {
         match self {
-            KeyGrantAxis::Epoch { .. } => KEY_GRANT_EPOCH_ATTESTATION_TYPE,
-            KeyGrantAxis::Content { .. } => KEY_GRANT_CONTENT_ATTESTATION_TYPE,
-            KeyGrantAxis::Stream { .. } => KEY_GRANT_STREAM_ATTESTATION_TYPE,
+            KeyGrantAxis::Epoch { .. } => KEY_GRANT_EPOCH_DIMENSION,
+            KeyGrantAxis::Content { .. } => KEY_GRANT_CONTENT_DIMENSION,
+            KeyGrantAxis::Stream { .. } => KEY_GRANT_STREAM_DIMENSION,
         }
     }
 
-    /// The `cohort_scope` the row is emitted at: the community scope on the
-    /// epoch axis (the plane projects it `Cohort`), the blob's own scope on
-    /// the content axis (`SelfOwn`).
+    /// The `cohort_scope` a row is emitted at: the community scope on the
+    /// epoch axis, the content's own scope on the content and stream axes.
     #[must_use]
     pub fn emission_cohort_scope(&self) -> &str {
         match self {
@@ -163,9 +196,21 @@ impl KeyGrantAxis {
         }
     }
 
-    /// The stable axis token (`epoch` / `content` / `stream`) for the plane
-    /// registry. `stream` is APPENDED (v53.0.0, #969): the projection is
-    /// decided by the emission scope, never by this token.
+    /// The group the content is placed in: the community (epoch), else the
+    /// owner, family or community key (content, stream).
+    #[must_use]
+    pub fn group_key_id(&self) -> &str {
+        match self {
+            KeyGrantAxis::Epoch {
+                community_key_id, ..
+            } => community_key_id,
+            KeyGrantAxis::Content { owner_key_id, .. }
+            | KeyGrantAxis::Stream { owner_key_id, .. } => owner_key_id,
+        }
+    }
+
+    /// The stable axis token (`epoch` / `content` / `stream`) the envelope's
+    /// `axis` member carries.
     #[must_use]
     pub fn token(&self) -> &'static str {
         match self {
@@ -176,49 +221,72 @@ impl KeyGrantAxis {
     }
 }
 
-/// One `KeyGrant` set: an identity on one axis and every wrap the emitter
-/// held for it at emission (§12, §14).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// The wraps one node holds for one axis — what the emitter reads out of its
+/// grant tables ([`build_set_for_axis`]) before emitting one row per wrap.
+/// A builder, never a wire object (v55.0.0, #989: the set row is retired).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeyGrantSet {
     /// Which identity the wraps belong to.
-    #[serde(flatten)]
     pub axis: KeyGrantAxis,
-    /// Every recipient's wrap. Never reduced by a later set (§13).
+    /// Every recipient's wrap this node holds.
     pub wraps: Vec<GrantWrap>,
 }
 
-/// The wire form of one `KeyGrant`: the signed attestation row that carries a
-/// [`KeyGrantSet`] in its envelope. Named in the style of
-/// [`SignedAttestation`] because on the wire it IS one — the same bytes a
-/// peer pulls from `list_attestations_since` — routed to
-/// [`admit_replicated_key_grant`] by its `attestation_type`.
+impl KeyGrantSet {
+    /// One [`KeyGrantRow`] per wrap.
+    #[must_use]
+    pub fn rows(&self) -> Vec<KeyGrantRow> {
+        self.wraps
+            .iter()
+            .map(|w| KeyGrantRow {
+                axis: self.axis.clone(),
+                wrap: w.clone(),
+            })
+            .collect()
+    }
+}
+
+/// v55.0.0 (CIRISPersist#989, CC 3.3.2 rc7) — **one wrap of one DEK to one
+/// recipient**: the `scores` row on `key_grant:{axis}:v1`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyGrantRow {
+    /// The key's identity on its axis.
+    pub axis: KeyGrantAxis,
+    /// The wrap: `recipient_key_id` is the row's `attested_key_id`.
+    pub wrap: GrantWrap,
+}
+
+/// The wire form of one key-grant row: the signed attestation, routed to
+/// [`admit_replicated_key_grant`]. The same JSON shape a `SignedAttestation`
+/// has (`{"attestation": {…}}`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct SignedKeyGrantSet {
-    /// The row: `attestation_type` is one of the two `key_grant:*` types,
-    /// the envelope carries the set, `attesting_key_id` / `scrub_key_id` is
-    /// the minter (epoch) or the author (content).
+pub struct SignedKeyGrantRow {
+    /// The `scores` row on `key_grant:{axis}:v1`.
     pub attestation: Attestation,
 }
 
-/// Why a `KeyGrant` was refused at admission (§12). Stable tokens.
+/// Why a key-grant row was refused at admission. Stable tokens.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum KeyGrantRefusalReason {
-    /// The envelope does not parse as a `key_grant` set, or its
-    /// `attestation_type` and `axis` disagree.
+    /// The row does not parse as a key-grant row: a member missing, present
+    /// on an axis that does not use it, or disagreeing with its column; the
+    /// `axis` disagreeing with the dimension; a score other than `1.0`; a
+    /// subject, an expiry, or the digest cited in `evidence_refs`.
     Malformed,
-    /// A wrap carries a `wrap_algorithm` other than v2.
+    /// The wrap carries a `wrap_algorithm` other than v2.
     WrapAlgorithmNotV2,
-    /// The row's attester and scrub key differ: a set is signed by the party
-    /// it speaks for, never scrubbed on their behalf.
+    /// The row's attester and scrub key differ: a key-grant row is signed by
+    /// the party it speaks for, never scrubbed on their behalf.
     SignerNotSelf,
-    /// Epoch axis: the signer is not the envelope's `minter_key_id`.
+    /// Epoch axis: the signer is neither the row's `minter_key_id` nor a
+    /// holder of a live `grant`-scoped delegation from it.
     SignerNotMinter,
     /// Epoch axis: the signer is not an active member occurrence of the
     /// community at `asserted_at` per this node's roster fold.
     SignerNotActiveMember,
-    /// Content axis: the blob row is present and its `author_key_id` is not
-    /// the signer.
+    /// Content axis: this node holds the blob and the signer does not speak
+    /// for its author.
     SignerNotAuthor,
     /// The attestation plane refused the row (a conflicting row under the
     /// same id, or a lost store race); nothing was projected.
@@ -226,6 +294,14 @@ pub enum KeyGrantRefusalReason {
     /// v53.0.0 (#969) — stream axis: this node holds the stream under an
     /// owner the signer does not speak for.
     SignerNotStreamOwner,
+    /// v55.0.0 (#989) — the recipient is not an occurrence the one audience
+    /// rule (#963) lets hold the cohort's key on this node. Retryable: the
+    /// occurrence, the roster or the allow list may not have landed yet.
+    RecipientNotInAudience,
+    /// v55.0.0 (#989, CC 2.4 rc7) — a key-grant SET (`attestation_type =
+    /// key_grant:{axis}:v1`, the retired rc6 carrier). Terminal: re-emit the
+    /// wraps as per-recipient rows.
+    SetRetired,
 }
 
 impl KeyGrantRefusalReason {
@@ -241,26 +317,42 @@ impl KeyGrantRefusalReason {
             KeyGrantRefusalReason::SignerNotAuthor => "signer_not_author",
             KeyGrantRefusalReason::AttestationRefused => "attestation_refused",
             KeyGrantRefusalReason::SignerNotStreamOwner => "signer_not_stream_owner",
+            KeyGrantRefusalReason::RecipientNotInAudience => "recipient_not_in_audience",
+            KeyGrantRefusalReason::SetRetired => "set_retired",
         }
     }
+
+    /// Every reason, for the token census.
+    pub const ALL: [KeyGrantRefusalReason; 10] = [
+        KeyGrantRefusalReason::Malformed,
+        KeyGrantRefusalReason::WrapAlgorithmNotV2,
+        KeyGrantRefusalReason::SignerNotSelf,
+        KeyGrantRefusalReason::SignerNotMinter,
+        KeyGrantRefusalReason::SignerNotActiveMember,
+        KeyGrantRefusalReason::SignerNotAuthor,
+        KeyGrantRefusalReason::AttestationRefused,
+        KeyGrantRefusalReason::SignerNotStreamOwner,
+        KeyGrantRefusalReason::RecipientNotInAudience,
+        KeyGrantRefusalReason::SetRetired,
+    ];
 }
 
-/// What [`admit_replicated_key_grant`] did.
+/// What [`admit_replicated_key_grant`] did with one row.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct KeyGrantAdmission {
-    /// The identity the set was for.
+    /// The key's identity.
     pub axis: KeyGrantAxis,
-    /// The attestation plane's outcome for the carrier row.
+    /// The recipient the wrap is for (the row's `attested_key_id`).
+    pub recipient_key_id: String,
+    /// The attestation plane's outcome for the row.
     pub attestation: ReplicatedAttestationOutcome,
-    /// How many wraps the set carried.
-    pub wraps_offered: usize,
-    /// How many grant rows this admit INSERTED (a union: already-held rows
-    /// count zero, so a re-applied set reports 0 here and is still `Ok`).
-    pub wraps_written: usize,
+    /// The wrap is in this node's grant tables after the call (a union: a
+    /// re-applied row reports `true` and wrote nothing new).
+    pub projected: bool,
     /// Content axis only: the bytes have not arrived, so the author is not
-    /// yet known and the set was NOT projected — the carrier row is stored
-    /// and [`project_pending_content_grants`] projects it (if the author
-    /// signed it) when the adopt names the author (§13).
+    /// yet known and the wrap is NOT projected — the row is stored and
+    /// [`project_pending_content_grants`] projects it (if its signer speaks
+    /// for the author) when the adopt names the author.
     pub pending: bool,
 }
 
@@ -269,6 +361,42 @@ fn refuse(reason: KeyGrantRefusalReason, detail: impl Into<String>) -> Error {
         reason: reason.as_str(),
         detail: detail.into(),
     }
+}
+
+fn malformed(detail: impl Into<String>) -> Error {
+    refuse(KeyGrantRefusalReason::Malformed, detail)
+}
+
+/// Is `row` a key-grant row (`scores` on a `key_grant:` dimension)?
+#[must_use]
+pub fn is_key_grant_row(row: &Attestation) -> bool {
+    row.attestation_type == crate::federation::types::attestation_type::SCORES
+        && crate::federation::admission::envelope_dimension(&row.attestation_envelope)
+            .is_some_and(|d| d.starts_with(KEY_GRANT_DIMENSION_PREFIX))
+}
+
+/// The `key_grant:{axis}:v1` dimension `row` carries when it is a key-grant
+/// row, else `None`.
+#[must_use]
+pub fn key_grant_dimension_of(row: &Attestation) -> Option<&'static str> {
+    if !is_key_grant_row(row) {
+        return None;
+    }
+    let d = crate::federation::admission::envelope_dimension(&row.attestation_envelope)?;
+    [
+        KEY_GRANT_CONTENT_DIMENSION,
+        KEY_GRANT_EPOCH_DIMENSION,
+        KEY_GRANT_STREAM_DIMENSION,
+    ]
+    .into_iter()
+    .find(|k| *k == d)
+}
+
+/// v55.0.0 (#989) — is `attestation_type` a retired key-grant SET carrier
+/// (`key_grant:{axis}:{version}`, any spelling under the stem)?
+#[must_use]
+pub fn is_retired_key_grant_set_type(attestation_type: &str) -> bool {
+    attestation_type.starts_with(KEY_GRANT_DIMENSION_PREFIX)
 }
 
 /// v54.0.0 (CIRISPersist#1033, CC 2.4.1.2.1 / CC 4.4.3.4.3) — **may `signer`
@@ -280,13 +408,19 @@ fn refuse(reason: KeyGrantRefusalReason, detail: impl Into<String>) -> Error {
 /// [`speaks_for`] (the owner, or one of the owner's active occurrences —
 /// #884); the second is a live `grant`-scoped chain to `signer` rooted at
 /// `owner` or at one of its principals, via
-/// [`holds_grant_delegation`](crate::federation::admission::holds_grant_delegation).
+/// [`holds_grant_delegation`](crate::federation::admission::holds_grant_delegation),
+/// judged at `chain_instant` ([`crate::federation::admission::grant_chain_instant`]).
 ///
 /// The ONE predicate every signer check on the content and stream axes asks —
-/// at admission, at the pending re-check, at the pending projection, and on
-/// the stream read path's sealer filter — so a set admitted under the
-/// delegate arm is never then refused by a sibling that asks only the first.
-pub async fn may_issue_grant_for<D>(dir: &D, signer: &str, owner: &str) -> Result<bool, Error>
+/// at admission, at the pending projection, and on the stream read path's
+/// sealer filter — so a row admitted under the delegate arm is never then
+/// refused by a sibling that asks only the first.
+pub async fn may_issue_grant_for<D>(
+    dir: &D,
+    signer: &str,
+    owner: &str,
+    chain_instant: chrono::DateTime<chrono::Utc>,
+) -> Result<bool, Error>
 where
     D: FederationDirectory + ?Sized,
 {
@@ -296,7 +430,6 @@ where
     // The chain may be rooted at the owner key or at one of its principals —
     // the same reading `speaks_for` gives the first arm: what a node seals is
     // its human's (#884), so the human's `grant` delegate speaks for it too.
-    let now = chrono::Utc::now();
     let mut roots = crate::federation::self_collective::principals_of(dir, owner).await?;
     if !roots.iter().any(|r| r == owner) {
         roots.insert(0, owner.to_owned());
@@ -306,7 +439,7 @@ where
             dir.as_dyn_directory(),
             root,
             signer,
-            now,
+            chain_instant,
         )
         .await?
         {
@@ -316,26 +449,64 @@ where
     Ok(false)
 }
 
-impl KeyGrantSet {
-    /// The set's identity as the envelope carries it, beside the CEG
-    /// envelope members `stamp_and_canonicalize` adds. `wraps[]` entries are
-    /// `{ recipient_occurrence_key_id, wrap_algorithm, wrapped_dek }` — CC 3's
-    /// vocabulary, not this crate's column names.
+fn member_str<'a>(env: &'a serde_json::Value, name: &str) -> Result<&'a str, Error> {
+    env.get(name)
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| malformed(format!("key_grant row lacks a non-empty string `{name}`")))
+}
+
+fn member_u64(env: &serde_json::Value, name: &str) -> Result<u64, Error> {
+    env.get(name)
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| malformed(format!("key_grant row lacks an unsigned `{name}`")))
+}
+
+/// The axis members, each present only on the axis that uses it (persist's
+/// wire shape, CIRISPersist#989 → CC 3.3.2).
+const AXIS_MEMBERS: [(&str, [bool; 3]); 6] = [
+    // (member, [content, epoch, stream])
+    ("at_rest_sha256", [true, false, false]),
+    ("owner_key_id", [true, false, true]),
+    ("community_key_id", [false, true, false]),
+    ("minter_key_id", [false, true, false]),
+    ("epoch", [false, true, true]),
+    ("stream_id", [false, false, true]),
+];
+
+impl KeyGrantRow {
+    /// The recipient (the row's `attested_key_id`).
     #[must_use]
-    pub fn envelope_extra(&self) -> serde_json::Map<String, serde_json::Value> {
+    pub fn recipient(&self) -> &str {
+        &self.wrap.recipient_key_id
+    }
+
+    /// The wrap's identity beside the signer: `(dimension, recipient, axis
+    /// identity)` — the union key the projection and the emitter's
+    /// already-held check read. The signer completes it.
+    #[must_use]
+    pub fn identity(&self) -> (&'static str, &str, &KeyGrantAxis) {
+        (self.axis.dimension(), self.recipient(), &self.axis)
+    }
+
+    /// The signed envelope's members (the CEG mirror and the signed instants
+    /// are added by `stamp_and_canonicalize`).
+    #[must_use]
+    pub fn envelope(&self) -> serde_json::Value {
         let mut m = serde_json::Map::new();
-        m.insert(
-            "kind".into(),
-            serde_json::Value::String(KEY_GRANT_ENVELOPE_KIND.into()),
-        );
+        m.insert("dimension".into(), self.axis.dimension().into());
+        m.insert("score".into(), KEY_GRANT_SCORE.into());
+        m.insert("confidence".into(), KEY_GRANT_SCORE.into());
+        m.insert("axis".into(), self.axis.token().into());
         match &self.axis {
             KeyGrantAxis::Epoch {
                 community_key_id,
                 minter_key_id,
                 epoch,
             } => {
-                m.insert("axis".into(), "epoch".into());
                 m.insert("community_key_id".into(), community_key_id.as_str().into());
+                // CC 2 — a community row names its community as the target.
+                m.insert("community_id".into(), community_key_id.as_str().into());
                 m.insert("minter_key_id".into(), minter_key_id.as_str().into());
                 m.insert("epoch".into(), (*epoch).into());
             }
@@ -344,17 +515,9 @@ impl KeyGrantSet {
                 cohort_scope,
                 owner_key_id,
             } => {
-                m.insert("axis".into(), "content".into());
                 m.insert("at_rest_sha256".into(), at_rest_sha256.as_str().into());
-                m.insert("cohort_scope".into(), cohort_scope.as_str().into());
                 m.insert("owner_key_id".into(), owner_key_id.as_str().into());
-                // #953 — the write gate reads a row's cohort target from the
-                // envelope's target fields, never from `owner_key_id`. A
-                // family set that named its family only as the owner was
-                // refused `scope_no_family_membership` at its author's door.
-                if cohort_scope == crate::federation::types::cohort_scope::FAMILY {
-                    m.insert("family_key_id".into(), owner_key_id.as_str().into());
-                }
+                insert_target(&mut m, cohort_scope, owner_key_id);
             }
             KeyGrantAxis::Stream {
                 stream_id,
@@ -362,222 +525,625 @@ impl KeyGrantSet {
                 cohort_scope,
                 owner_key_id,
             } => {
-                m.insert("axis".into(), "stream".into());
                 m.insert("stream_id".into(), stream_id.as_str().into());
                 m.insert("epoch".into(), (*epoch).into());
-                m.insert("cohort_scope".into(), cohort_scope.as_str().into());
                 m.insert("owner_key_id".into(), owner_key_id.as_str().into());
-                // #953 — the cohort target rides the envelope on a family set.
-                if cohort_scope == crate::federation::types::cohort_scope::FAMILY {
-                    m.insert("family_key_id".into(), owner_key_id.as_str().into());
-                }
+                insert_target(&mut m, cohort_scope, owner_key_id);
             }
         }
         m.insert(
-            "wraps".into(),
-            serde_json::Value::Array(
-                self.wraps
-                    .iter()
-                    .map(|w| {
-                        serde_json::json!({
-                            "recipient_occurrence_key_id": w.recipient_key_id,
-                            "wrap_algorithm": w.wrap_algorithm,
-                            "wrapped_dek": w.wrapped_dek,
-                        })
-                    })
-                    .collect(),
-            ),
+            "wrap_algorithm".into(),
+            self.wrap.wrap_algorithm.as_str().into(),
         );
-        m
+        m.insert("wrapped_dek".into(), self.wrap.wrapped_dek.as_str().into());
+        serde_json::Value::Object(m)
     }
 
-    /// Read the set back out of a stored / replicated row. Refuses a row
-    /// whose `attestation_type` is not a `key_grant:*` type, whose envelope
-    /// is not the `key_grant` kind, or whose `axis` disagrees with the type.
+    /// The emit input: `scores`, the envelope, the recipient as
+    /// `attested_key_id`, the content's scope.
+    ///
+    /// # Errors
+    ///
+    /// Never in practice: the envelope is built here and always parses.
+    pub fn emit_input(&self) -> Result<EmitAttestationInput, Error> {
+        let core: crate::federation::envelope::EnvelopeCore =
+            serde_json::from_value(self.envelope())
+                .map_err(|e| Error::Backend(format!("key_grant row envelope: {e}")))?;
+        let mut input = EmitAttestationInput::with_envelope(
+            crate::federation::types::attestation_type::SCORES,
+            core,
+            self.axis.emission_cohort_scope(),
+        );
+        input.attested_key_id = Some(self.wrap.recipient_key_id.clone());
+        Ok(input)
+    }
+
+    /// Read a key-grant row back out of a stored / replicated attestation.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::KeyGrantRefused`] with `malformed` for any departure from the
+    /// shape in the module doc (`set_retired` for a retired set row).
     pub fn from_attestation(row: &Attestation) -> Result<Self, Error> {
-        let env = &row.attestation_envelope;
-        let field = |name: &str| -> Result<String, Error> {
-            env.get(name)
-                .and_then(|v| v.as_str())
-                .map(str::to_owned)
-                .ok_or_else(|| {
-                    refuse(
-                        KeyGrantRefusalReason::Malformed,
-                        format!("key_grant envelope lacks `{name}`"),
-                    )
-                })
-        };
-        if field("kind")? != KEY_GRANT_ENVELOPE_KIND {
+        if is_retired_key_grant_set_type(&row.attestation_type) {
             return Err(refuse(
-                KeyGrantRefusalReason::Malformed,
-                "envelope `kind` is not `key_grant`",
+                KeyGrantRefusalReason::SetRetired,
+                format!(
+                    "attestation_type {:?} is the retired rc6 key-grant SET (CC 2.4 rc7, \
+                     CIRISConstitution#143): a wrap is one `scores` row per recipient on \
+                     `key_grant:{{axis}}:v1`",
+                    row.attestation_type
+                ),
             ));
         }
-        let axis_token = field("axis")?;
-        let axis = match (row.attestation_type.as_str(), axis_token.as_str()) {
-            (KEY_GRANT_EPOCH_ATTESTATION_TYPE, "epoch") => KeyGrantAxis::Epoch {
-                community_key_id: field("community_key_id")?,
-                minter_key_id: field("minter_key_id")?,
-                epoch: env.get("epoch").and_then(|v| v.as_u64()).ok_or_else(|| {
-                    refuse(
-                        KeyGrantRefusalReason::Malformed,
-                        "key_grant envelope lacks an unsigned `epoch`",
-                    )
-                })?,
-            },
-            (KEY_GRANT_CONTENT_ATTESTATION_TYPE, "content") => {
-                let at_rest_sha256 = field("at_rest_sha256")?;
-                if hex::decode(&at_rest_sha256).map(|v| v.len()).ok() != Some(32) {
-                    return Err(refuse(
-                        KeyGrantRefusalReason::Malformed,
-                        "key_grant `at_rest_sha256` is not 32 hex bytes",
+        if row.attestation_type != crate::federation::types::attestation_type::SCORES {
+            return Err(malformed(format!(
+                "a key_grant row is a `scores` row, not {:?}",
+                row.attestation_type
+            )));
+        }
+        let env = &row.attestation_envelope;
+        let dimension = member_str(env, "dimension")?;
+        let axis_token = member_str(env, "axis")?;
+        let index = match (dimension, axis_token) {
+            (KEY_GRANT_CONTENT_DIMENSION, "content") => 0,
+            (KEY_GRANT_EPOCH_DIMENSION, "epoch") => 1,
+            (KEY_GRANT_STREAM_DIMENSION, "stream") => 2,
+            (d, a) => {
+                return Err(malformed(format!(
+                    "dimension {d:?} and axis {a:?} do not name one key_grant axis"
+                )))
+            }
+        };
+        for (member, on) in AXIS_MEMBERS {
+            if !on[index] && env.get(member).is_some() {
+                return Err(malformed(format!(
+                    "`{member}` is not a member of the {axis_token} axis"
+                )));
+            }
+        }
+        // Positive-only, a fact: score (and confidence when present) is 1.0.
+        if env.get("score").and_then(serde_json::Value::as_f64) != Some(KEY_GRANT_SCORE) {
+            return Err(malformed("a key_grant row carries `score` 1.0"));
+        }
+        if env
+            .get("confidence")
+            .is_some_and(|c| c.as_f64() != Some(KEY_GRANT_SCORE))
+        {
+            return Err(malformed(
+                "a key_grant row carries `confidence` 1.0 when present",
+            ));
+        }
+        if row.weight.is_some_and(|w| w != KEY_GRANT_SCORE) {
+            return Err(malformed("a key_grant row's weight is 1.0"));
+        }
+        if !row.subject_key_ids.is_empty() {
+            return Err(malformed(
+                "a key_grant row names no subject: the recipient gains no retraction authority",
+            ));
+        }
+        if row.expires_at.is_some() {
+            return Err(malformed(
+                "a key_grant row carries no expiry: it is never withdrawn, forward secrecy is \
+                 by rotation",
+            ));
+        }
+        let scope = row.cohort_scope.as_str();
+        let axis = match index {
+            0 => {
+                let at_rest_sha256 = member_str(env, "at_rest_sha256")?;
+                if !(at_rest_sha256.len() == 64
+                    && at_rest_sha256
+                        .bytes()
+                        .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
+                {
+                    return Err(malformed(
+                        "`at_rest_sha256` is not 64 lowercase hex characters",
                     ));
                 }
-                let scope = field("cohort_scope")?;
                 if scope != cohort_scope::SELF && scope != cohort_scope::FAMILY {
-                    return Err(refuse(
-                        KeyGrantRefusalReason::Malformed,
-                        format!("content-axis key_grant at cohort_scope {scope:?}; only self / family carry per-blob grants"),
+                    return Err(malformed(format!(
+                        "a content-axis key_grant row sits at self / family, not {scope:?}"
+                    )));
+                }
+                // CC 3.3.2 — the digest is a member, never a citation.
+                if env
+                    .get("evidence_refs")
+                    .and_then(|v| v.as_array())
+                    .is_some_and(|refs| {
+                        refs.iter()
+                            .any(|r| r.as_str().is_some_and(|s| s.contains(at_rest_sha256)))
+                    })
+                {
+                    return Err(malformed(
+                        "`at_rest_sha256` is cited in `evidence_refs`; a key wrap is not a \
+                         content binding (CC 3.3.2)",
                     ));
                 }
-                let owner_key_id = field("owner_key_id")?;
-                // #953 — a family set names its family twice (owner slot and
-                // cohort target) and they are one id; a self set names none.
-                let named_family = env.get("family_key_id");
-                let agrees = if scope == cohort_scope::FAMILY {
-                    named_family.and_then(|v| v.as_str()) == Some(owner_key_id.as_str())
-                } else {
-                    named_family.is_none()
-                };
-                if !agrees {
-                    return Err(refuse(
-                        KeyGrantRefusalReason::Malformed,
-                        format!(
-                            "content-axis key_grant at cohort_scope {scope:?}: `family_key_id` \
-                             {named_family:?} must equal `owner_key_id` {owner_key_id:?} on a \
-                             family set and be absent on a self set"
-                        ),
-                    ));
-                }
+                let owner_key_id = member_str(env, "owner_key_id")?;
+                check_target(env, scope, owner_key_id)?;
                 KeyGrantAxis::Content {
-                    at_rest_sha256,
-                    cohort_scope: scope,
-                    owner_key_id,
+                    at_rest_sha256: at_rest_sha256.to_owned(),
+                    cohort_scope: scope.to_owned(),
+                    owner_key_id: owner_key_id.to_owned(),
                 }
             }
-            (KEY_GRANT_STREAM_ATTESTATION_TYPE, "stream") => {
-                let stream_id = field("stream_id")?;
-                if stream_id.is_empty() {
-                    return Err(refuse(
-                        KeyGrantRefusalReason::Malformed,
-                        "stream-axis key_grant names an empty stream_id",
-                    ));
+            1 => {
+                if scope != cohort_scope::COMMUNITY {
+                    return Err(malformed(format!(
+                        "an epoch-axis key_grant row sits at community, not {scope:?}"
+                    )));
                 }
-                let epoch = env.get("epoch").and_then(|v| v.as_u64()).ok_or_else(|| {
-                    refuse(
-                        KeyGrantRefusalReason::Malformed,
-                        "key_grant envelope lacks an unsigned `epoch`",
-                    )
-                })?;
-                let scope = field("cohort_scope")?;
-                if scope != cohort_scope::SELF && scope != cohort_scope::FAMILY {
-                    return Err(refuse(
-                        KeyGrantRefusalReason::Malformed,
-                        format!("stream-axis key_grant at cohort_scope {scope:?}; only self / family streams are stream-keyed"),
-                    ));
+                let community_key_id = member_str(env, "community_key_id")?;
+                check_target(env, scope, community_key_id)?;
+                KeyGrantAxis::Epoch {
+                    community_key_id: community_key_id.to_owned(),
+                    minter_key_id: member_str(env, "minter_key_id")?.to_owned(),
+                    epoch: member_u64(env, "epoch")?,
                 }
-                let owner_key_id = field("owner_key_id")?;
-                // #953 — as on the content axis.
-                let named_family = env.get("family_key_id");
-                let agrees = if scope == cohort_scope::FAMILY {
-                    named_family.and_then(|v| v.as_str()) == Some(owner_key_id.as_str())
-                } else {
-                    named_family.is_none()
-                };
-                if !agrees {
-                    return Err(refuse(
-                        KeyGrantRefusalReason::Malformed,
-                        format!(
-                            "stream-axis key_grant at cohort_scope {scope:?}: `family_key_id` \
-                             {named_family:?} must equal `owner_key_id` {owner_key_id:?} on a \
-                             family set and be absent on a self set"
-                        ),
-                    ));
+            }
+            _ => {
+                let scope_ok = matches!(
+                    scope,
+                    cohort_scope::SELF
+                        | cohort_scope::FAMILY
+                        | cohort_scope::COMMUNITY
+                        | cohort_scope::AFFILIATIONS
+                );
+                if !scope_ok {
+                    return Err(malformed(format!(
+                        "a stream-axis key_grant row sits at a private scope, not {scope:?}"
+                    )));
                 }
+                let owner_key_id = member_str(env, "owner_key_id")?;
+                check_target(env, scope, owner_key_id)?;
                 KeyGrantAxis::Stream {
-                    stream_id,
-                    epoch,
-                    cohort_scope: scope,
-                    owner_key_id,
+                    stream_id: member_str(env, "stream_id")?.to_owned(),
+                    epoch: member_u64(env, "epoch")?,
+                    cohort_scope: scope.to_owned(),
+                    owner_key_id: owner_key_id.to_owned(),
                 }
             }
-            (t, a) => {
-                return Err(refuse(
-                    KeyGrantRefusalReason::Malformed,
-                    format!(
-                    "attestation_type {t:?} and envelope axis {a:?} do not name one key_grant axis"
-                ),
-                ))
-            }
         };
-        let wraps = env
-            .get("wraps")
-            .and_then(|v| v.as_array())
-            .ok_or_else(|| {
-                refuse(
-                    KeyGrantRefusalReason::Malformed,
-                    "key_grant envelope lacks `wraps[]`",
-                )
-            })?
-            .iter()
-            .map(|w| {
-                let s = |name: &str| -> Result<String, Error> {
-                    w.get(name)
-                        .and_then(|v| v.as_str())
-                        .map(str::to_owned)
-                        .ok_or_else(|| {
-                            refuse(
-                                KeyGrantRefusalReason::Malformed,
-                                format!("key_grant wrap lacks `{name}`"),
-                            )
-                        })
-                };
-                Ok(GrantWrap {
-                    recipient_key_id: s("recipient_occurrence_key_id")?,
-                    wrap_algorithm: s("wrap_algorithm")?,
-                    wrapped_dek: s("wrapped_dek")?,
-                })
-            })
-            .collect::<Result<Vec<_>, Error>>()?;
-        Ok(KeyGrantSet { axis, wraps })
+        if row.attested_key_id.is_empty() {
+            return Err(malformed("a key_grant row names its recipient"));
+        }
+        Ok(KeyGrantRow {
+            axis,
+            wrap: GrantWrap {
+                recipient_key_id: row.attested_key_id.clone(),
+                wrap_algorithm: member_str(env, "wrap_algorithm")?.to_owned(),
+                wrapped_dek: member_str(env, "wrapped_dek")?.to_owned(),
+            },
+        })
     }
+}
 
-    /// The emit input for this set: the row type, the envelope, the scope.
-    /// `stamp_and_canonicalize` adds the signed instants and the row mirror.
-    #[must_use]
-    pub fn emit_input(&self) -> EmitAttestationInput {
-        let envelope = EnvelopeCore {
-            extra: self.envelope_extra(),
-            ..EnvelopeCore::default()
-        };
-        EmitAttestationInput::with_envelope(
-            self.axis.attestation_type(),
-            envelope,
-            self.axis.emission_cohort_scope(),
-        )
+/// The CC 2 cohort target a content / stream row names: `family_key_id` at
+/// family, `community_id` at a room scope, none at self.
+fn insert_target(m: &mut serde_json::Map<String, serde_json::Value>, scope: &str, group: &str) {
+    match scope {
+        cohort_scope::FAMILY => {
+            m.insert("family_key_id".into(), group.into());
+        }
+        cohort_scope::COMMUNITY | cohort_scope::AFFILIATIONS => {
+            m.insert("community_id".into(), group.into());
+        }
+        _ => {}
     }
+}
+
+/// The target agreement [`insert_target`] writes, read back: the group is
+/// named exactly once, by the alias its scope uses, and nothing else names a
+/// target (the write gate refuses a split-brain row on its own).
+fn check_target(env: &serde_json::Value, scope: &str, group: &str) -> Result<(), Error> {
+    let want: Option<&str> = match scope {
+        cohort_scope::FAMILY => Some("family_key_id"),
+        cohort_scope::COMMUNITY | cohort_scope::AFFILIATIONS => Some("community_id"),
+        _ => None,
+    };
+    for field in ["family_key_id", "community_id", "cohort_key_id"] {
+        let named = env.get(field);
+        let ok = if Some(field) == want {
+            named.and_then(|v| v.as_str()) == Some(group)
+        } else {
+            named.is_none()
+        };
+        if !ok {
+            return Err(malformed(format!(
+                "a {scope} key_grant row names its group {group:?} as `{}` and no other target; \
+                 `{field}` is {named:?}",
+                want.unwrap_or("no target")
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// v55.0.0 (#989, CC 3.3.2 / #963) — **may `recipient` hold the key of
+/// content placed at `scope` in `group`?** The fan-out's own rule, asked of
+/// one recipient: an ACTIVE occurrence of the owner (`self`), of an active
+/// family member (`family`), or of a member on the community's authorized
+/// roster now (`community` / `affiliations`) that
+/// [`occurrence_may_hold_key`](crate::federation::replication_audience::occurrence_may_hold_key)
+/// (the room variant for a room) admits. A member whose own key is its
+/// occurrence keeps its wrap.
+pub async fn recipient_may_hold_key<D>(
+    dir: &D,
+    scope: &str,
+    group: &str,
+    recipient: &str,
+) -> Result<bool, Error>
+where
+    D: FederationDirectory + ?Sized,
+{
+    use crate::federation::replication_audience::{
+        occurrence_may_hold_key, occurrence_may_hold_room_key, OwnerCohort,
+    };
+    let room = matches!(scope, cohort_scope::COMMUNITY | cohort_scope::AFFILIATIONS);
+    let members: Vec<String> = match scope {
+        cohort_scope::SELF => vec![group.to_owned()],
+        cohort_scope::FAMILY => match dir.active_family_members(group).await {
+            Ok(m) => m.into_iter().map(|m| m.key_id).collect(),
+            Err(Error::InvalidArgument(_)) => Vec::new(),
+            Err(e) => return Err(e),
+        },
+        _ if room => match dir.lookup_community(group).await? {
+            Some(c) => {
+                crate::federation::authorized_community_roster_at(dir, &c, chrono::Utc::now())
+                    .await?
+                    .into_iter()
+                    .map(|m| m.key_id)
+                    .collect()
+            }
+            None => Vec::new(),
+        },
+        _ => Vec::new(),
+    };
+    for member in &members {
+        for o in dir.list_identity_occurrences_active(member).await? {
+            if o.occurrence_key_id != recipient {
+                continue;
+            }
+            let may = if room {
+                occurrence_may_hold_room_key(dir, member, &o, group).await?
+            } else {
+                let cohort = if scope == cohort_scope::SELF {
+                    OwnerCohort::SelfContent
+                } else {
+                    OwnerCohort::Group {
+                        scope,
+                        target: group,
+                    }
+                };
+                occurrence_may_hold_key(dir, member, &o, cohort).await?
+            };
+            if may {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// §12 / §20.1 — is `signer` an ACTIVE member of `community_key_id` at
+/// `as_of`, per this node's replicated roster fold — asked about the
+/// PRINCIPAL, not the instrument (CIRISPersist#851, the #765 lift):
+/// `signer` is first resolved through
+/// [`admission_identity_for_writer`](crate::federation::admission::admission_identity_for_writer)
+/// — an occurrence lifts to its identity, an owned node to its single live
+/// owner, anything else stays itself — and the principal must be on the
+/// roster minus effective removals
+/// ([`removed_key_ids_at`](crate::federation::removed_key_ids_at) — the same
+/// fold the cascade wraps by). The occurrence walk remains for a signer that
+/// is a member's occurrence on this node. An unknown community admits nobody.
+pub async fn is_active_member_at<D>(
+    directory: &D,
+    community_key_id: &str,
+    signer: &str,
+    as_of: chrono::DateTime<chrono::Utc>,
+) -> Result<bool, Error>
+where
+    D: FederationDirectory + ?Sized,
+{
+    let Some(community) = directory.lookup_community(community_key_id).await? else {
+        return Ok(false);
+    };
+    // The principals (§20.1, PR #852 review rounds two–four):
+    // - every row bound under the signer's key is read (the table's key is
+    //   (identity, occurrence), so one key may be bound under several
+    //   identities); a revocation counts ONLY on the row of the identity the
+    //   lift resolves to — an identity may bind any key as its occurrence and
+    //   revoke it, which must not disable that key for everyone else;
+    // - a NODE-role key (the role on the Key-plane record) lifts only through
+    //   its live owner binding, refused if the owner's own row for the key is
+    //   revoked, never through a row a prior admission left;
+    // - a device key lifts to each identity whose row for it is unrevoked.
+    let rows = directory
+        .list_identity_occurrences_by_occurrence_key(signer)
+        .await?;
+    let mut revoked_under: std::collections::BTreeSet<String> = Default::default();
+    for o in &rows {
+        let revs = directory
+            .list_identity_occurrence_revocations_for(&o.identity_key_id)
+            .await?;
+        if revs.iter().any(|r| r.revokes(o, as_of)) {
+            revoked_under.insert(o.identity_key_id.clone());
+        }
+    }
+    let is_node = directory.lookup_public_key(signer).await?.is_some_and(|k| {
+        k.identity_type == crate::federation::types::identity_type::NODE
+            || k.claims_role(crate::federation::types::identity_type::NODE)
+    });
+    // v48.0.0 (CIRISPersist#860) — the roster AS OF `as_of` is the one fold
+    // (record + widenings − revocations), never the record alone.
+    // v49.0.0 (#908): only events whose signer has standing count.
+    let roster =
+        crate::federation::authorized_community_roster_at(directory, &community, as_of).await?;
+    // A NODE minter has exactly ONE principal — its live owner — and no
+    // fallback: not the key itself, not a stale row under a former owner,
+    // not the member-occurrence walk below (PR #852 review, round five: an
+    // ownership transfer must end the old community's minting authority).
+    if is_node {
+        return Ok(
+            match crate::federation::admission::owner_of(directory, signer).await? {
+                Some(owner) if !revoked_under.contains(&owner) => {
+                    roster.iter().any(|m| m.key_id == owner)
+                }
+                _ => false,
+            },
+        );
+    }
+    let mut principals: Vec<String> = vec![signer.to_owned()];
+    for o in &rows {
+        if !revoked_under.contains(&o.identity_key_id) {
+            principals.push(o.identity_key_id.clone());
+        }
+    }
+    for member in &roster {
+        if principals.contains(&member.key_id) {
+            return Ok(true);
+        }
+        // Folded at `as_of`, not at the wall clock: a row emitted while its
+        // minter occurrence was active, delivered after that occurrence was
+        // revoked, is a valid historical row (CIRISPersist#850 review).
+        let revs = directory
+            .list_identity_occurrence_revocations_for(&member.key_id)
+            .await?;
+        let occurrences = directory
+            .list_identity_occurrences_for(&member.key_id)
+            .await?;
+        if occurrences
+            .iter()
+            .filter(|o| !revs.iter().any(|r| r.revokes(o, as_of)))
+            .any(|o| o.occurrence_key_id == signer)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// v55.0.0 (#989) — **the sealer rule, asked of `signer` for `axis` at
+/// `asserted_at`** (CC 3.1.3 `key_grant:{axis}`, "Reserved — sealer-only").
+///
+/// - epoch: the minter, or a holder of a live `grant` delegation from it
+///   (`signer_not_minter`), and an active member occurrence of the community
+///   at `asserted_at` (`signer_not_active_member`);
+/// - content / stream: where THIS node holds the blob or the stream
+///   ([`FederationDirectory::key_grant_held_owner`]), a key that speaks for
+///   its author / owner, or its `grant` delegate (`signer_not_author` /
+///   `signer_not_stream_owner`, terminal); then at `self` a key that speaks
+///   for the owner, or its `grant` delegate (`SignerDoesNotActFor`, plane
+///   `key_grant`, retryable: the occurrence may not have landed). At a group
+///   scope the write gate's membership check is the owner rule.
+///
+/// Asked by the admission gate and by the emitter (which withholds rows it
+/// could no longer sign as sealer).
+pub async fn check_sealer(
+    dir: &dyn FederationDirectory,
+    signer: &str,
+    axis: &KeyGrantAxis,
+    asserted_at: chrono::DateTime<chrono::Utc>,
+    chain_instant: chrono::DateTime<chrono::Utc>,
+) -> Result<(), Error> {
+    match axis {
+        KeyGrantAxis::Epoch {
+            community_key_id,
+            minter_key_id,
+            ..
+        } => {
+            // v54.0.0 (#1033, CC 2.4.1.2.1) — the minter, or a holder of a
+            // live `grant`-scoped chain from the minter.
+            if signer != minter_key_id
+                && !crate::federation::admission::holds_grant_delegation(
+                    dir,
+                    minter_key_id,
+                    signer,
+                    chain_instant,
+                )
+                .await?
+            {
+                return Err(refuse(
+                    KeyGrantRefusalReason::SignerNotMinter,
+                    format!(
+                        "signer {signer:?} is not the row's minter {minter_key_id:?} and holds no \
+                         live `grant`-scoped delegation from it; only M, or M's `grant` delegate, \
+                         issues a grant over M's counter (BLOB_REPLICATION.md §11; CC 2.4.1.2.1)"
+                    ),
+                ));
+            }
+            if !is_active_member_at(dir, community_key_id, signer, asserted_at).await? {
+                return Err(refuse(
+                    KeyGrantRefusalReason::SignerNotActiveMember,
+                    format!(
+                        "signer {signer:?} is not an active member occurrence of community \
+                         {community_key_id:?} at {} per this node's roster fold",
+                        asserted_at.to_rfc3339()
+                    ),
+                ));
+            }
+            Ok(())
+        }
+        KeyGrantAxis::Content {
+            cohort_scope: scope,
+            owner_key_id,
+            at_rest_sha256: id,
+        }
+        | KeyGrantAxis::Stream {
+            cohort_scope: scope,
+            owner_key_id,
+            stream_id: id,
+            ..
+        } => {
+            let content = matches!(axis, KeyGrantAxis::Content { .. });
+            // The held-state leg first: where this node holds the content its
+            // verdict is definitive (terminal), where the owner leg below may
+            // only be an ordering gap (retryable).
+            if let Some(held) = dir.key_grant_held_owner(axis).await? {
+                if !may_issue_grant_for(dir, signer, &held, chain_instant).await? {
+                    return Err(if content {
+                        refuse(
+                            KeyGrantRefusalReason::SignerNotAuthor,
+                            format!(
+                                "signer {signer:?} is neither the author {held:?} of blob {id} \
+                                 nor an active occurrence of them"
+                            ),
+                        )
+                    } else {
+                        refuse(
+                            KeyGrantRefusalReason::SignerNotStreamOwner,
+                            format!(
+                                "signer {signer:?} does not speak for the owner {held:?} of \
+                                 stream {id:?} on this node; a stream's keys are \
+                                 granted by its single sender (CC 5.3.3.1)"
+                            ),
+                        )
+                    });
+                }
+            }
+            if scope == cohort_scope::SELF
+                && !may_issue_grant_for(dir, signer, owner_key_id, chain_instant).await?
+            {
+                return Err(Error::SignerDoesNotActFor {
+                    attesting_key_id: signer.to_owned(),
+                    identity_key_id: owner_key_id.clone(),
+                    plane: KEY_GRANT_PLANE,
+                });
+            }
+            Ok(())
+        }
+    }
+}
+
+/// The `plane` a key-grant `SignerDoesNotActFor` refusal names.
+pub const KEY_GRANT_PLANE: &str = "key_grant";
+
+/// v55.0.0 (CIRISPersist#989, CC 3.3.2 rc7) — **the key-grant admission
+/// rule**, asked of every federation-tier row by
+/// `check_reserved_prefix_admission` on every backend:
+///
+/// - (a retired key-grant SET never reaches it: the row-type gate refuses a
+///   retired carrier first, and [`KeyGrantRow::from_attestation`] answers
+///   `set_retired` at the key-grant door);
+/// - a `scores` row on `key_grant:` must parse ([`KeyGrantRow::from_attestation`]),
+///   carry a v2 wrap, be self-signed (`attesting_key_id == scrub_key_id`),
+///   meet the sealer rule ([`check_sealer`], at the row's `asserted_at`, its
+///   delegation chain at [`grant_chain_instant`](crate::federation::admission::grant_chain_instant)),
+///   and name a recipient [`recipient_may_hold_key`] admits
+///   (`recipient_not_in_audience`).
+///
+/// Every other row passes untouched.
+pub async fn check_key_grant_row_admission(
+    dir: &dyn FederationDirectory,
+    row: &Attestation,
+) -> Result<(), Error> {
+    let Some(dimension) =
+        crate::federation::admission::envelope_dimension(&row.attestation_envelope)
+    else {
+        return Ok(());
+    };
+    if !dimension.starts_with(KEY_GRANT_DIMENSION_PREFIX) {
+        return Ok(());
+    }
+    // A `key_grant:` dimension rides `scores` only: a composer naming one
+    // states nothing CC 3.3.2 defines.
+    let parsed = KeyGrantRow::from_attestation(row)?;
+    check_wrap_algorithm(&parsed.wrap)?;
+    let signer = row.scrub_key_id.as_str();
+    if signer.is_empty() || signer != row.attesting_key_id {
+        return Err(refuse(
+            KeyGrantRefusalReason::SignerNotSelf,
+            format!(
+                "attesting_key_id {:?} != scrub_key_id {:?}; a key_grant row is signed by the \
+                 party it speaks for",
+                row.attesting_key_id, row.scrub_key_id
+            ),
+        ));
+    }
+    check_sealer(
+        dir,
+        signer,
+        &parsed.axis,
+        row.asserted_at,
+        crate::federation::admission::grant_chain_instant(row),
+    )
+    .await?;
+    if !recipient_may_hold_key(
+        dir,
+        parsed.axis.emission_cohort_scope(),
+        parsed.axis.group_key_id(),
+        parsed.recipient(),
+    )
+    .await?
+    {
+        return Err(refuse(
+            KeyGrantRefusalReason::RecipientNotInAudience,
+            format!(
+                "recipient {:?} is not an occurrence that may hold the key of {} content in \
+                 {:?} on this node (the one audience rule, #963); re-offer once its occurrence, \
+                 the roster and its owner's allow list have landed",
+                parsed.recipient(),
+                parsed.axis.emission_cohort_scope(),
+                parsed.axis.group_key_id()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn check_wrap_algorithm(wrap: &GrantWrap) -> Result<(), Error> {
+    use crate::federation::at_rest_cascade::WRAP_ALGORITHM_V2;
+    if wrap.wrap_algorithm != WRAP_ALGORITHM_V2 {
+        return Err(refuse(
+            KeyGrantRefusalReason::WrapAlgorithmNotV2,
+            format!(
+                "wrap for {:?} carries wrap_algorithm {:?}; only {WRAP_ALGORITHM_V2:?} is \
+                 admissible (CC 4.4.3.4.1 / CC 5.2)",
+                wrap.recipient_key_id, wrap.wrap_algorithm
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn map_blob_err(e: BlobError) -> Error {
     Error::Backend(format!("key_grant: {e}"))
 }
 
+fn sha_of(at_rest_sha256: &str) -> Result<[u8; 32], Error> {
+    hex::decode(at_rest_sha256)
+        .ok()
+        .and_then(|v| v.try_into().ok())
+        .ok_or_else(|| malformed("at_rest_sha256"))
+}
+
 /// §14 — what an emission attempt means for the caller. A community that
 /// has lost (or never had) a live steward-bound moderator MAY NOT federate
 /// at moderated capability (CC 4.5.4 / §11.11), and the attestation plane
 /// refuses every federation-tier row keyed on it — on this node and on every
-/// peer. A `KeyGrant` for such a community therefore has nowhere to go: no
-/// peer could be party to its bytes, and the local write is still whole
+/// peer. A key-grant row for such a community therefore has nowhere to go:
+/// no peer could be party to its bytes, and the local write is still whole
 /// (the minter reads through its own self-retention). That ONE verdict is
 /// reported as `Ok(None)` with a warning rather than failing the write;
 /// every other failure — a signer that cannot sign, a row the plane refuses
@@ -589,7 +1155,7 @@ pub fn emission_outcome<T>(r: Result<T, Error>) -> Result<Option<T>, Error> {
         Err(Error::CommunityHasNoModerator { community_key_id }) => {
             tracing::warn!(
                 community = %community_key_id,
-                "key_grant set not emitted: the community has no live moderator and may not \
+                "key_grant row not emitted: the community has no live moderator and may not \
                  federate at moderated capability (CC 4.5.4); nothing outside this node can be \
                  party to its content until one is appointed"
             );
@@ -599,8 +1165,8 @@ pub fn emission_outcome<T>(r: Result<T, Error>) -> Result<Option<T>, Error> {
     }
 }
 
-/// §14 — the FULL epoch-axis set for `(community, minter, epoch)` as this
-/// node holds it, or `None` if it holds no wrap for it (nothing to emit).
+/// §14 — every epoch-axis wrap this node holds for `(community, minter,
+/// epoch)`, or `None` if it holds none.
 pub async fn build_epoch_set<B>(
     backend: &B,
     community_key_id: &str,
@@ -626,9 +1192,8 @@ where
     }))
 }
 
-/// §14 — the FULL content-axis set for one self/family blob: every at-rest
-/// grant except persist's own self-retention row, or `None` if there is
-/// nothing a peer could use.
+/// §14 — every content-axis wrap this node holds for one self/family blob
+/// except persist's own self-retention row, or `None`.
 pub async fn build_content_set<B>(
     backend: &B,
     at_rest_sha256: &[u8; 32],
@@ -652,10 +1217,8 @@ where
     }))
 }
 
-/// v53.0.0 (CIRISPersist#969) — the FULL stream-axis set for one
-/// `(stream_id, epoch)` this node sealed: every recipient wrap under the
-/// stream's owner, or `None` if there is nothing a peer could use (or this
-/// node holds the stream under no owner).
+/// v53.0.0 (CIRISPersist#969) — every stream-axis wrap this node holds for
+/// one `(stream_id, epoch)` it sealed, under the stream's owner, or `None`.
 pub async fn build_stream_set<B>(
     backend: &B,
     stream_id: &str,
@@ -666,7 +1229,16 @@ pub async fn build_stream_set<B>(
 where
     B: BlobStorage + Sync,
 {
-    let Some(sealer) = backend.stream_key_state(stream_id).await?.owner_key_id else {
+    // The epoch's sealer is its DEK row's writer (v55.0.0, #981: a supplied
+    // epoch is wrapped before the stream holds its first chunk, so the
+    // stream's own row may not exist yet).
+    let Some(sealer) = backend
+        .stream_dek_list(stream_id)
+        .await?
+        .into_iter()
+        .find(|r| r.epoch == epoch)
+        .map(|r| r.owner_key_id)
+    else {
         return Ok(None);
     };
     let wraps = backend.stream_dek_grants(stream_id, epoch, &sealer).await?;
@@ -684,85 +1256,315 @@ where
     }))
 }
 
-/// §14 — emit the full epoch-axis set for `(community, M, epoch)` where M
-/// is `signer`'s derived key, through the normal attestation store (so it
-/// replicates). `Ok(None)` when this node holds no wrap for the epoch.
-///
-/// The backend-generic emitter, for the cascade paths and the two-node
-/// witnesses; the Engine's composed-signer form is
-/// [`Engine::emit_epoch_key_grant`](crate::engine::Engine::emit_epoch_key_grant).
-pub async fn emit_epoch_key_grant_with_local_signer<B>(
+/// §14 — the wraps this node holds for an emission axis a write door
+/// reported (`PutBlobScopedResult::key_grant_emission` and its chunk twins),
+/// or `None`.
+pub async fn build_set_for_axis<B>(
     backend: &B,
-    signer: &crate::signing::LocalSigner,
-    community_key_id: &str,
-    epoch: u64,
-) -> Result<Option<crate::federation::attestation_emit::EmittedAttestation>, Error>
+    axis: &KeyGrantAxis,
+) -> Result<Option<KeyGrantSet>, BlobError>
+where
+    B: BlobStorage + Sync,
+{
+    match axis {
+        KeyGrantAxis::Epoch {
+            community_key_id,
+            minter_key_id,
+            epoch,
+        } => build_epoch_set(backend, community_key_id, minter_key_id, *epoch).await,
+        KeyGrantAxis::Content {
+            at_rest_sha256,
+            cohort_scope,
+            owner_key_id,
+        } => {
+            let sha: [u8; 32] = hex::decode(at_rest_sha256)
+                .ok()
+                .and_then(|v| v.try_into().ok())
+                .ok_or_else(|| {
+                    BlobError::InvalidArgument(format!(
+                        "key_grant axis names a non-hex at_rest_sha256 {at_rest_sha256:?}"
+                    ))
+                })?;
+            build_content_set(backend, &sha, cohort_scope, owner_key_id).await
+        }
+        KeyGrantAxis::Stream {
+            stream_id,
+            epoch,
+            cohort_scope,
+            owner_key_id,
+        } => build_stream_set(backend, stream_id, *epoch, cohort_scope, owner_key_id).await,
+    }
+}
+
+/// v55.0.0 (#989) — what one emission planned: the rows to sign, and why the
+/// others were not.
+#[derive(Debug, Clone, PartialEq)]
+pub struct KeyGrantEmissionPlan {
+    /// The axis.
+    pub axis: KeyGrantAxis,
+    /// One row per wrap not yet held as a row, to a recipient the audience
+    /// rule still admits.
+    pub rows: Vec<KeyGrantRow>,
+    /// Recipients whose wrap is already held as a row by this signer (the
+    /// re-emission's idempotence).
+    pub already_emitted: Vec<String>,
+    /// Recipients the audience rule no longer admits (CC 4.4.3.2.2: a party
+    /// removed since the wrap was written is not re-wrapped).
+    pub withheld: Vec<String>,
+    /// Recipients with no key record on this node yet (a row may only name a
+    /// registered key, `check_attested_subject_admission`): their rows wait,
+    /// and the axis stays dirty so the next pass emits them.
+    pub deferred: Vec<String>,
+    /// The signer can no longer sign as the axis's sealer: nothing is
+    /// emitted, and the axis is marked clean (a node re-emits only wraps it
+    /// can sign as sealer or minter).
+    pub sealer_refused: Option<String>,
+    /// The ledger watermark, read BEFORE the wraps (§14, V146).
+    pub watermark: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// v55.0.0 (#989) — what one emission did.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct KeyGrantEmission {
+    /// The axis.
+    pub axis: KeyGrantAxis,
+    /// The `attestation_id` of each row emitted, one per recipient.
+    pub attestation_ids: Vec<String>,
+    /// Recipients whose wrap this signer had already emitted as a row.
+    pub already_emitted: Vec<String>,
+    /// Recipients withheld: the audience rule no longer admits them.
+    pub withheld: Vec<String>,
+    /// Recipients whose key record has not reached this node: not emitted
+    /// yet, the axis left dirty for the next pass.
+    pub deferred: Vec<String>,
+    /// The signer could no longer sign as sealer; nothing was emitted.
+    pub sealer_refused: Option<String>,
+}
+
+/// v55.0.0 (#989) — **plan the rows `signer` owes for `axis`**: the
+/// watermark first (§14), then the wraps; per wrap, skip one this signer
+/// already holds as a row with the same identity, and withhold one whose
+/// recipient [`recipient_may_hold_key`] no longer admits. When `signer` can
+/// no longer sign as the axis's sealer ([`check_sealer`] at now), nothing is
+/// planned and `sealer_refused` says why. `None` when no wrap is held.
+pub async fn plan_key_grant_emission<B>(
+    backend: &B,
+    signer: &str,
+    axis: &KeyGrantAxis,
+) -> Result<Option<KeyGrantEmissionPlan>, Error>
 where
     B: BlobStorage + FederationDirectory + Sync,
 {
-    let minter = signer.derived_key_id();
-    let wm_axis = KeyGrantAxis::Epoch {
-        community_key_id: community_key_id.to_owned(),
-        minter_key_id: minter.clone(),
-        epoch,
-    };
-    let watermark = watermark_for_axis(backend, &wm_axis).await?;
-    let Some(set) = build_epoch_set(backend, community_key_id, &minter, epoch)
+    let watermark = watermark_for_axis(backend, axis).await?;
+    let Some(set) = build_set_for_axis(backend, axis)
         .await
         .map_err(map_blob_err)?
     else {
         return Ok(None);
     };
-    let emitted = emission_outcome(
-        crate::federation::attestation_emit::emit_with_local_signer(
+    let now = chrono::Utc::now();
+    let mut plan = KeyGrantEmissionPlan {
+        axis: axis.clone(),
+        rows: Vec::new(),
+        already_emitted: Vec::new(),
+        withheld: Vec::new(),
+        deferred: Vec::new(),
+        sealer_refused: None,
+        watermark,
+    };
+    match check_sealer(backend.as_dyn_directory(), signer, axis, now, now).await {
+        Ok(()) => {}
+        Err(e @ (Error::KeyGrantRefused { .. } | Error::SignerDoesNotActFor { .. })) => {
+            plan.sealer_refused = Some(e.to_string());
+            return Ok(Some(plan));
+        }
+        Err(e) => return Err(e),
+    }
+    for row in set.rows() {
+        if key_grant_row_held(backend, signer, &row).await? {
+            plan.already_emitted.push(row.recipient().to_owned());
+            continue;
+        }
+        if !recipient_may_hold_key(
             backend,
-            signer,
-            set.emit_input(),
+            axis.emission_cohort_scope(),
+            axis.group_key_id(),
+            row.recipient(),
         )
-        .await,
-    )?;
-    if let (Some(_), Some(watermark)) = (&emitted, watermark) {
-        mark_emitted(backend, &set.axis, watermark).await?;
+        .await?
+        {
+            plan.withheld.push(row.recipient().to_owned());
+            continue;
+        }
+        if backend.lookup_public_key(row.recipient()).await?.is_none() {
+            plan.deferred.push(row.recipient().to_owned());
+            continue;
+        }
+        plan.rows.push(row);
+    }
+    Ok(Some(plan))
+}
+
+/// Does this node hold a key-grant row signed by `signer` with `row`'s
+/// identity? (The emitter's idempotence check: the identity is the union key,
+/// so a second row with it is a re-wrap the projection would ignore.)
+pub async fn key_grant_row_held<D>(dir: &D, signer: &str, row: &KeyGrantRow) -> Result<bool, Error>
+where
+    D: FederationDirectory + ?Sized,
+{
+    Ok(dir
+        .list_attestations_for_dimension_prefix(row.recipient(), Some(signer), row.axis.dimension())
+        .await?
+        .iter()
+        .filter(|a| is_key_grant_row(a))
+        .filter_map(|a| KeyGrantRow::from_attestation(a).ok())
+        .any(|held| held.axis == row.axis && held.recipient() == row.recipient()))
+}
+
+/// §14 — the full emission through `emit_one`: plan, sign and store each row,
+/// then mark the axis clean when every planned row was stored and none waits
+/// on a recipient's key record (or nothing was owed). A community with no
+/// live moderator stores nothing and leaves the axis dirty
+/// ([`emission_outcome`]).
+async fn emit_planned<B, F, Fut>(
+    backend: &B,
+    signer: &str,
+    axis: &KeyGrantAxis,
+    mut emit_one: F,
+) -> Result<Option<KeyGrantEmission>, Error>
+where
+    B: BlobStorage + FederationDirectory + Sync,
+    F: FnMut(EmitAttestationInput) -> Fut,
+    Fut: std::future::Future<Output = Result<String, Error>>,
+{
+    let Some(plan) = plan_key_grant_emission(backend, signer, axis).await? else {
+        return Ok(None);
+    };
+    let mut ids = Vec::with_capacity(plan.rows.len());
+    let mut skipped = false;
+    for row in &plan.rows {
+        match emission_outcome(emit_one(row.emit_input()?).await)? {
+            Some(id) => ids.push(id),
+            None => skipped = true,
+        }
+    }
+    if !skipped && plan.deferred.is_empty() {
+        if let Some(watermark) = plan.watermark {
+            mark_emitted(backend, &plan.axis, watermark).await?;
+        }
+    }
+    Ok(Some(KeyGrantEmission {
+        axis: plan.axis,
+        attestation_ids: ids,
+        already_emitted: plan.already_emitted,
+        withheld: plan.withheld,
+        deferred: plan.deferred,
+        sealer_refused: plan.sealer_refused,
+    }))
+}
+
+/// §14 — emit the rows for `axis` signed by `signer` through the attestation
+/// store. The PyO3 doors' and the witnesses' emitter (its hybrid signer is the
+/// `LocalSigner`); the Engine's is
+/// [`Engine::emit_key_grant`](crate::engine::Engine::emit_key_grant).
+pub async fn emit_key_grant_axis_with_local_signer<B>(
+    backend: &B,
+    signer: &crate::signing::LocalSigner,
+    axis: &KeyGrantAxis,
+) -> Result<Option<KeyGrantEmission>, Error>
+where
+    B: BlobStorage + FederationDirectory + Sync,
+{
+    let me = signer.derived_key_id();
+    emit_planned(backend, &me, axis, |input| async move {
+        crate::federation::attestation_emit::emit_with_local_signer(backend, signer, input)
+            .await
+            .map(|e| e.attestation_id)
+    })
+    .await
+}
+
+/// §14 (V146) — **every dirty axis `signer` owes, emitted** ([`dirty_axes`]
+/// under the signer's derived key): the PyO3 init sweep's and
+/// `emit_pending_key_grants`' loop, and after V192 the legacy re-emit. One
+/// axis that cannot be emitted is logged and left dirty; it does not hold
+/// back the others. Returns the rows emitted.
+pub async fn emit_dirty_with_local_signer<B>(
+    backend: &B,
+    signer: &crate::signing::LocalSigner,
+) -> Result<usize, Error>
+where
+    B: BlobStorage + FederationDirectory + Sync,
+{
+    let me = signer.derived_key_id();
+    let mut emitted = 0usize;
+    for axis in dirty_axes(backend, &me).await? {
+        match emit_key_grant_axis_with_local_signer(backend, signer, &axis).await {
+            Ok(Some(e)) => emitted += e.attestation_ids.len(),
+            Ok(None) => {}
+            Err(e) => tracing::warn!(
+                axis = ?axis,
+                error = %e,
+                "key-grant rows for this axis could not be emitted; it stays dirty (#989)"
+            ),
+        }
     }
     Ok(emitted)
 }
 
-/// §14 — emit the full content-axis set for one self/family blob authored
-/// by `signer`. `Ok(None)` when the blob has no recipient grant.
+/// §14 — the epoch-axis rows for `(community, M, epoch)` where M is
+/// `signer`'s derived key. `Ok(None)` when this node holds no wrap for it.
+pub async fn emit_epoch_key_grant_with_local_signer<B>(
+    backend: &B,
+    signer: &crate::signing::LocalSigner,
+    community_key_id: &str,
+    epoch: u64,
+) -> Result<Option<KeyGrantEmission>, Error>
+where
+    B: BlobStorage + FederationDirectory + Sync,
+{
+    let axis = KeyGrantAxis::Epoch {
+        community_key_id: community_key_id.to_owned(),
+        minter_key_id: signer.derived_key_id(),
+        epoch,
+    };
+    emit_key_grant_axis_with_local_signer(backend, signer, &axis).await
+}
+
+/// §14 — the content-axis rows for one self/family blob sealed by `signer`.
+/// `Ok(None)` when the blob has no recipient grant.
 pub async fn emit_content_key_grant_with_local_signer<B>(
     backend: &B,
     signer: &crate::signing::LocalSigner,
     at_rest_sha256: &[u8; 32],
     scope: &str,
     owner_key_id: &str,
-) -> Result<Option<crate::federation::attestation_emit::EmittedAttestation>, Error>
+) -> Result<Option<KeyGrantEmission>, Error>
 where
     B: BlobStorage + FederationDirectory + Sync,
 {
-    let wm_axis = KeyGrantAxis::Content {
+    let axis = KeyGrantAxis::Content {
         at_rest_sha256: hex::encode(at_rest_sha256),
         cohort_scope: scope.to_owned(),
         owner_key_id: owner_key_id.to_owned(),
     };
-    let watermark = watermark_for_axis(backend, &wm_axis).await?;
-    let Some(set) = build_content_set(backend, at_rest_sha256, scope, owner_key_id)
-        .await
-        .map_err(map_blob_err)?
-    else {
-        return Ok(None);
-    };
-    let emitted = emission_outcome(
-        crate::federation::attestation_emit::emit_with_local_signer(
-            backend,
-            signer,
-            set.emit_input(),
-        )
-        .await,
-    )?;
-    if let (Some(_), Some(watermark)) = (&emitted, watermark) {
-        mark_emitted(backend, &set.axis, watermark).await?;
-    }
-    Ok(emitted)
+    emit_key_grant_axis_with_local_signer(backend, signer, &axis).await
+}
+
+/// §14 — the Engine's emitter: the same plan, each row through
+/// `emit_attestation_self`-shaped `emit_one`.
+pub async fn emit_key_grant_axis_with<B, F, Fut>(
+    backend: &B,
+    signer_key_id: &str,
+    axis: &KeyGrantAxis,
+    emit_one: F,
+) -> Result<Option<KeyGrantEmission>, Error>
+where
+    B: BlobStorage + FederationDirectory + Sync,
+    F: FnMut(EmitAttestationInput) -> Fut,
+    Fut: std::future::Future<Output = Result<String, Error>>,
+{
+    emit_planned(backend, signer_key_id, axis, emit_one).await
 }
 
 /// #851 (§20.3) — **publish this node's own content-only occurrence under
@@ -890,10 +1692,9 @@ where
 }
 
 /// §14 (V146, PR #850 review) — **the emission ledger: stamp the axis as
-/// emitted** with the database's own clock. Called by every emitter on a
-/// successful (`Some`) emission — the Engine's composed-signer door and the
-/// local-signer emitters alike — so the ledger never depends on which door
-/// carried the set.
+/// emitted** with the database's own clock. Called by every emitter once
+/// every planned row of the axis is stored, so the ledger never depends on
+/// which door carried the rows.
 pub async fn mark_emitted<B>(
     backend: &B,
     axis: &KeyGrantAxis,
@@ -917,10 +1718,7 @@ where
             .await
             .map_err(map_blob_err),
         KeyGrantAxis::Content { at_rest_sha256, .. } => {
-            let sha: [u8; 32] = hex::decode(at_rest_sha256)
-                .ok()
-                .and_then(|v| v.try_into().ok())
-                .ok_or_else(|| refuse(KeyGrantRefusalReason::Malformed, "at_rest_sha256"))?;
+            let sha = sha_of(at_rest_sha256)?;
             backend
                 .blob_mark_key_grant_emitted(&sha, watermark)
                 .await
@@ -935,11 +1733,11 @@ where
     }
 }
 
-/// §14 (V146) — **the grant watermark for an axis, read BEFORE the set is
-/// built**: the newest grant's `created_at` under it. The set built next
-/// carries every grant at or before it; a grant that lands after it — a
-/// concurrent rekey, say — is newer than the mark and keeps the axis dirty
-/// (PR #850 review, round three). `None` when no grant exists yet.
+/// §14 (V146) — **the grant watermark for an axis, read BEFORE the wraps**:
+/// the newest grant's `created_at` under it. The rows built next carry every
+/// grant at or before it; a grant that lands after it — a concurrent rekey,
+/// say — is newer than the mark and keeps the axis dirty (PR #850 review,
+/// round three). `None` when no grant exists yet.
 pub async fn watermark_for_axis<B>(
     backend: &B,
     axis: &KeyGrantAxis,
@@ -957,10 +1755,7 @@ where
             .await
             .map_err(map_blob_err),
         KeyGrantAxis::Content { at_rest_sha256, .. } => {
-            let sha: [u8; 32] = hex::decode(at_rest_sha256)
-                .ok()
-                .and_then(|v| v.try_into().ok())
-                .ok_or_else(|| refuse(KeyGrantRefusalReason::Malformed, "at_rest_sha256"))?;
+            let sha = sha_of(at_rest_sha256)?;
             backend
                 .blob_key_grant_watermark(&sha)
                 .await
@@ -976,11 +1771,12 @@ where
 }
 
 /// §14 (V146) — **every axis this node owes an emission on**: each epoch
-/// `me` minted whose set is dirty, then each `invisible_encrypted` blob `me`
-/// authored whose set is dirty (its owner is the blob row's
+/// `me` minted whose rows are dirty, then each `invisible_encrypted` blob
+/// `me` sealed whose rows are dirty (its owner is the blob row's
 /// `community_key_id` — the self identity or the family — or `me` when the
-/// row carries none). What the boot sweep and `emit_pending_key_grants`
-/// iterate.
+/// row carries none), then each stream epoch `me` sealed. What the boot sweep
+/// and `emit_pending_key_grants` iterate — and, after V192, the legacy
+/// re-emit.
 pub async fn dirty_axes<B>(backend: &B, me: &str) -> Result<Vec<KeyGrantAxis>, Error>
 where
     B: BlobStorage + Sync,
@@ -1011,7 +1807,7 @@ where
             owner_key_id: prov.community_key_id.unwrap_or_else(|| me.to_owned()),
         });
     }
-    // v53.0.0 (#969) — each stream epoch `me` sealed whose set is dirty.
+    // v53.0.0 (#969) — each stream epoch `me` sealed whose rows are dirty.
     for d in backend
         .stream_dek_list_key_grant_dirty(me)
         .await
@@ -1027,472 +1823,58 @@ where
     Ok(out)
 }
 
-/// §14 — the full set for an emission axis a write door reported
-/// (`PutBlobScopedResult::key_grant_emission` and its chunk twins), or
-/// `None` if this node holds nothing to emit for it.
-pub async fn build_set_for_axis<B>(
-    backend: &B,
-    axis: &KeyGrantAxis,
-) -> Result<Option<KeyGrantSet>, BlobError>
-where
-    B: BlobStorage + Sync,
-{
-    match axis {
-        KeyGrantAxis::Epoch {
-            community_key_id,
-            minter_key_id,
-            epoch,
-        } => build_epoch_set(backend, community_key_id, minter_key_id, *epoch).await,
-        KeyGrantAxis::Content {
-            at_rest_sha256,
-            cohort_scope,
-            owner_key_id,
-        } => {
-            let sha: [u8; 32] = hex::decode(at_rest_sha256)
-                .ok()
-                .and_then(|v| v.try_into().ok())
-                .ok_or_else(|| {
-                    BlobError::InvalidArgument(format!(
-                        "key_grant axis names a non-hex at_rest_sha256 {at_rest_sha256:?}"
-                    ))
-                })?;
-            build_content_set(backend, &sha, cohort_scope, owner_key_id).await
-        }
-        KeyGrantAxis::Stream {
-            stream_id,
-            epoch,
-            cohort_scope,
-            owner_key_id,
-        } => build_stream_set(backend, stream_id, *epoch, cohort_scope, owner_key_id).await,
-    }
+/// What [`project_key_grant_row`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyGrantProjection {
+    /// The wrap is in the grant tables (`written` new rows: 0 on a re-apply).
+    Projected {
+        /// New grant rows written (a union).
+        written: usize,
+    },
+    /// Content axis: the bytes have not arrived; the row waits in the pending
+    /// index for the adopt.
+    Pending,
 }
 
-/// §14 — emit the set a write door reported, signed by `signer` through the
-/// attestation store. The PyO3 door's emitter (its hybrid signer is the
-/// `LocalSigner`); the Engine's is
-/// [`Engine::emit_key_grant`](crate::engine::Engine::emit_key_grant).
-pub async fn emit_key_grant_axis_with_local_signer<B>(
+/// §13 — **project one admitted key-grant row into this node's grant
+/// tables**: the union write for its axis. A content-axis row whose bytes
+/// this node does not hold is put in the pending index (V146) and projected
+/// by the adopt, and the race with an adopt that lands meanwhile is closed by
+/// re-reading the author after the index row is written (PR #850 review).
+///
+/// Called by the sqlite / postgres hook
+/// ([`FederationDirectory::project_key_grant_row`]) after either typed
+/// attestation door admitted the row, and by [`admit_replicated_key_grant`].
+/// Idempotent.
+pub async fn project_key_grant_row<B>(
     backend: &B,
-    signer: &crate::signing::LocalSigner,
-    axis: &KeyGrantAxis,
-) -> Result<Option<crate::federation::attestation_emit::EmittedAttestation>, Error>
+    row: &Attestation,
+) -> Result<KeyGrantProjection, Error>
 where
     B: BlobStorage + FederationDirectory + Sync,
 {
-    let wm_axis = axis.clone();
-    let watermark = watermark_for_axis(backend, &wm_axis).await?;
-    let Some(set) = build_set_for_axis(backend, axis)
-        .await
-        .map_err(map_blob_err)?
-    else {
-        return Ok(None);
-    };
-    let emitted = emission_outcome(
-        crate::federation::attestation_emit::emit_with_local_signer(
-            backend,
-            signer,
-            set.emit_input(),
-        )
-        .await,
-    )?;
-    if let (Some(_), Some(watermark)) = (&emitted, watermark) {
-        mark_emitted(backend, &set.axis, watermark).await?;
-    }
-    Ok(emitted)
-}
-
-/// §12 / §20.1 — is `signer` an ACTIVE member of `community_key_id` at
-/// `as_of`, per this node's replicated roster fold — asked about the
-/// PRINCIPAL, not the instrument (CIRISPersist#851, the #765 lift):
-/// `signer` is first resolved through
-/// [`admission_identity_for_writer`](crate::federation::admission::admission_identity_for_writer)
-/// — an occurrence lifts to its identity, an owned node to its single live
-/// owner, anything else stays itself — and the principal must be on the
-/// roster minus effective removals
-/// ([`removed_key_ids_at`](crate::federation::removed_key_ids_at) — the same
-/// fold the cascade wraps by). The occurrence walk remains for a signer that
-/// is a member's occurrence on this node. An unknown community admits nobody.
-async fn is_active_member_at<D>(
-    directory: &D,
-    community_key_id: &str,
-    signer: &str,
-    as_of: chrono::DateTime<chrono::Utc>,
-) -> Result<bool, Error>
-where
-    D: FederationDirectory + Sync,
-{
-    let Some(community) = directory.lookup_community(community_key_id).await? else {
-        return Ok(false);
-    };
-    // The principals (§20.1, PR #852 review rounds two–four):
-    // - every row bound under the signer's key is read (the table's key is
-    //   (identity, occurrence), so one key may be bound under several
-    //   identities); a revocation counts ONLY on the row of the identity the
-    //   lift resolves to — an identity may bind any key as its occurrence and
-    //   revoke it, which must not disable that key for everyone else;
-    // - a NODE-role key (the role on the Key-plane record) lifts only through
-    //   its live owner binding, refused if the owner's own row for the key is
-    //   revoked, never through a row a prior admission left;
-    // - a device key lifts to each identity whose row for it is unrevoked.
-    let rows = directory
-        .list_identity_occurrences_by_occurrence_key(signer)
-        .await?;
-    let mut revoked_under: std::collections::BTreeSet<String> = Default::default();
-    for o in &rows {
-        let revs = directory
-            .list_identity_occurrence_revocations_for(&o.identity_key_id)
-            .await?;
-        if revs.iter().any(|r| r.revokes(o, as_of)) {
-            revoked_under.insert(o.identity_key_id.clone());
-        }
-    }
-    let is_node = directory.lookup_public_key(signer).await?.is_some_and(|k| {
-        k.identity_type == crate::federation::types::identity_type::NODE
-            || k.claims_role(crate::federation::types::identity_type::NODE)
-    });
-    // v48.0.0 (CIRISPersist#860) — the roster AS OF `as_of` is the one fold
-    // (record + widenings − revocations), never the record alone.
-    // v49.0.0 (#908): only events whose signer has standing count.
-    let roster =
-        crate::federation::authorized_community_roster_at(directory, &community, as_of).await?;
-    // A NODE minter has exactly ONE principal — its live owner — and no
-    // fallback: not the key itself, not a stale row under a former owner,
-    // not the member-occurrence walk below (PR #852 review, round five: an
-    // ownership transfer must end the old community's minting authority).
-    if is_node {
-        return Ok(
-            match crate::federation::admission::owner_of(directory, signer).await? {
-                Some(owner) if !revoked_under.contains(&owner) => {
-                    roster.iter().any(|m| m.key_id == owner)
-                }
-                _ => false,
-            },
-        );
-    }
-    let mut principals: Vec<String> = vec![signer.to_owned()];
-    for o in &rows {
-        if !revoked_under.contains(&o.identity_key_id) {
-            principals.push(o.identity_key_id.clone());
-        }
-    }
-    for member in &roster {
-        if principals.contains(&member.key_id) {
-            return Ok(true);
-        }
-        // Folded at `as_of`, not at the wall clock: a set emitted while its
-        // minter occurrence was active, delivered after that occurrence was
-        // revoked, is a valid historical set (CIRISPersist#850 review).
-        let revs = directory
-            .list_identity_occurrence_revocations_for(&member.key_id)
-            .await?;
-        let occurrences = directory
-            .list_identity_occurrences_for(&member.key_id)
-            .await?;
-        if occurrences
-            .iter()
-            .filter(|o| !revs.iter().any(|r| r.revokes(o, as_of)))
-            .any(|o| o.occurrence_key_id == signer)
-        {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-/// §12–§13 — **admit a replicated `KeyGrant` set and project every wrap.**
-///
-/// 1. Parse the set off the row ([`KeyGrantSet::from_attestation`]); refuse
-///    any wrap not at v2.
-/// 2. The signer of record is the row's `scrub_key_id`, and it must equal
-///    `attesting_key_id`: a set speaks for exactly the party that signed it.
-/// 3. Epoch axis: signer == `minter_key_id`, and an active member occurrence
-///    of the community at `asserted_at` per the roster fold (occurrence
-///    revocations folded at `asserted_at` too; the attestation plane's
-///    cohort gate is the backstop at now — `asserted_at` is signer-chosen).
-///    Content axis: signer == the blob row's `author_key_id` when the row is
-///    present; when it is absent the set is **pending** — the carrier row is
-///    admitted and nothing is projected until the adopt names the author
-///    ([`project_pending_content_grants`]; PR #850 review).
-/// 4. The attestation plane admits the carrier row —
-///    [`apply_replicated_attestation`](FederationDirectory::apply_replicated_attestation),
-///    which runs the hybrid-Strict federation-tier ingest gate against THIS
-///    node's directory (`SignerSource::RegisteredSigner`) and every other
-///    `put_attestation` gate. `Inserted` / `Unchanged` /
-///    `Refused { AlreadyPresentIdentical }` proceed — the last two are a
-///    re-emission, which must still project (a row stored earlier through
-///    the generic attestation door carries grants nobody wrote yet).
-///    `ConflictingAttestation` / `StoreConflict` refuse.
-/// 5. The projection: every wrap, one transaction, a union.
-///
-/// Steps 4 and 5 are two transactions. A crash between them leaves a stored
-/// row and no grants, which the next re-emission repairs (the same set,
-/// re-applied, projects on `Unchanged`). That is the shape the FSD's "in the
-/// admit transaction" is satisfied by here: the row's admission and the
-/// grants' projection are ordered, idempotent, and never leave a grant
-/// without its admitted row.
-pub async fn admit_replicated_key_grant<B>(
-    backend: &B,
-    set: SignedKeyGrantSet,
-) -> Result<KeyGrantAdmission, Error>
-where
-    B: BlobStorage + FederationDirectory + Sync,
-{
-    use crate::federation::at_rest_cascade::WRAP_ALGORITHM_V2;
-    use crate::federation::attestation_apply::AttestationRefusalReason;
-
-    let row = &set.attestation;
-    let parsed = KeyGrantSet::from_attestation(row)?;
-    if let Some(bad) = parsed
-        .wraps
-        .iter()
-        .find(|w| w.wrap_algorithm != WRAP_ALGORITHM_V2)
-    {
-        return Err(refuse(
-            KeyGrantRefusalReason::WrapAlgorithmNotV2,
-            format!(
-                "wrap for {:?} carries wrap_algorithm {:?}; only {WRAP_ALGORITHM_V2:?} is admissible \
-                 (CC 4.4.3.4.1 / CC 5.2)",
-                bad.recipient_key_id, bad.wrap_algorithm
-            ),
-        ));
-    }
-    // The signer of record is the scrub key — the one the plane's ingest
-    // gate verifies against OUR directory. A set is self-spoken.
-    let signer = row.scrub_key_id.as_str();
-    let mut pending = false;
-    let mut retire_after_projection: Option<([u8; 32], String)> = None;
-    if signer.is_empty() || signer != row.attesting_key_id {
-        return Err(refuse(
-            KeyGrantRefusalReason::SignerNotSelf,
-            format!(
-                "attesting_key_id {:?} != scrub_key_id {:?}; a key_grant set is signed by the party \
-                 it speaks for",
-                row.attesting_key_id, row.scrub_key_id
-            ),
-        ));
-    }
-    match &parsed.axis {
-        KeyGrantAxis::Epoch {
-            community_key_id,
-            minter_key_id,
-            ..
-        } => {
-            // v54.0.0 (#1033, CC 2.4.1.2.1) — the minter, or a holder of a
-            // live `grant`-scoped chain from the minter.
-            if signer != minter_key_id
-                && !crate::federation::admission::holds_grant_delegation(
-                    backend.as_dyn_directory(),
-                    minter_key_id,
-                    signer,
-                    chrono::Utc::now(),
-                )
-                .await?
-            {
-                return Err(refuse(
-                    KeyGrantRefusalReason::SignerNotMinter,
-                    format!(
-                        "signer {signer:?} is not the set's minter {minter_key_id:?} and holds no \
-                         live `grant`-scoped delegation from it; only M, or M's `grant` delegate, \
-                         issues a grant over M's counter (BLOB_REPLICATION.md §11; CC 2.4.1.2.1)"
-                    ),
-                ));
-            }
-            if !is_active_member_at(backend, community_key_id, signer, row.asserted_at).await? {
-                return Err(refuse(
-                    KeyGrantRefusalReason::SignerNotActiveMember,
-                    format!(
-                        "signer {signer:?} is not an active member occurrence of community \
-                         {community_key_id:?} at {} per this node's roster fold",
-                        row.asserted_at.to_rfc3339()
-                    ),
-                ));
-            }
-        }
-        KeyGrantAxis::Content { at_rest_sha256, .. } => {
-            let sha: [u8; 32] = hex::decode(at_rest_sha256)
-                .ok()
-                .and_then(|v| v.try_into().ok())
-                .ok_or_else(|| refuse(KeyGrantRefusalReason::Malformed, "at_rest_sha256"))?;
-            match backend
-                .blob_provenance(&sha)
-                .await
-                .map_err(map_blob_err)?
-                .and_then(|p| p.author_key_id)
-            {
-                // v46.3.0 (CIRISPersist#884, `FSD/SELF_COLLECTIVE_TRANSFER.md`
-                // §4.1) — the set is signed by the node that SEALED the
-                // bytes; the row is authored by a PERSON. The signer speaks
-                // for the author when it is the author or one of the
-                // author's ACTIVE occurrences (CC 3.3.6) — never a revoked
-                // one, never a family member's device (I65).
-                Some(author) => {
-                    if !may_issue_grant_for(backend, signer, &author).await? {
-                        return Err(refuse(
-                            KeyGrantRefusalReason::SignerNotAuthor,
-                            format!(
-                                "signer {signer:?} is neither the author {author:?} of blob \
-                                 {at_rest_sha256} nor an active occurrence of them"
-                            ),
-                        ));
-                    }
-                }
-                // The bytes have not arrived: the author is not yet known
-                // to this node, so the signer cannot be checked against it.
-                // The carrier row is admitted (it is a signed attestation
-                // like any other) and NOTHING is projected — a recipient who
-                // knows the DEK must not be able to grant an outsider by
-                // speaking first. `project_pending_content_grants` projects
-                // the sets the AUTHOR signed once the adopt names the author
-                // (order independence, kept; CIRISPersist#850 review).
-                None => pending = true,
-            }
-        }
-        // v53.0.0 (#969) — the stream's single sender signs its epochs'
-        // sets. Where this node holds the stream (an adopted chunk wrote its
-        // row naming the author), the signer must speak for that owner. Where
-        // it does not yet, the wraps are projected UNDER THE SIGNER as
-        // sealer, and the reader takes a wrap only from a sealer that speaks
-        // for the stream's owner once it is known — so a set for someone
-        // else's stream id grants nothing, in either order.
-        KeyGrantAxis::Stream { stream_id, .. } => {
-            if let Some(owner) = backend
-                .stream_key_state(stream_id)
-                .await
-                .map_err(map_blob_err)?
-                .owner_key_id
-            {
-                if !may_issue_grant_for(backend, signer, &owner).await? {
-                    return Err(refuse(
-                        KeyGrantRefusalReason::SignerNotStreamOwner,
-                        format!(
-                            "signer {signer:?} does not speak for the owner of stream {stream_id:?} \
-                             on this node; a stream's keys are granted by its single sender \
-                             (CC 5.3.3.1)"
-                        ),
-                    ));
-                }
-            }
-        }
-    }
-
-    // The carrier row, through the attestation plane's own admission.
-    let row_id = set.attestation.attestation_id.clone();
-    let signer = signer.to_owned();
-    let signer = signer.as_str();
-    let outcome = backend
-        .apply_replicated_attestation(SignedAttestation {
-            attestation: set.attestation,
-        })
-        .await?;
-    match &outcome {
-        ReplicatedAttestationOutcome::Inserted
-        | ReplicatedAttestationOutcome::Unchanged
-        | ReplicatedAttestationOutcome::Deduplicated
-        | ReplicatedAttestationOutcome::Refused {
-            reason: AttestationRefusalReason::AlreadyPresentIdentical,
-        } => {}
-        ReplicatedAttestationOutcome::Refused { reason } => {
-            return Err(refuse(
-                KeyGrantRefusalReason::AttestationRefused,
-                format!("the attestation plane refused the carrier row: {reason:?}"),
-            ));
-        }
-    }
-
-    if pending {
-        let KeyGrantAxis::Content {
-            at_rest_sha256,
-            cohort_scope,
-            ..
-        } = &parsed.axis
-        else {
-            unreachable!("pending is a content-axis verdict");
-        };
-        let sha: [u8; 32] = hex::decode(at_rest_sha256)
-            .ok()
-            .and_then(|v| v.try_into().ok())
-            .ok_or_else(|| refuse(KeyGrantRefusalReason::Malformed, "at_rest_sha256"))?;
-        // V146 — the pending index the adopt takes by (sha, scope).
-        backend
-            .key_grant_pending_put(&sha, cohort_scope, &row_id, signer)
-            .await
-            .map_err(map_blob_err)?;
-        // The race double-check (PR #850 review): an adopt that stored the
-        // row and took the pending index between our first look and the
-        // carrier's insert would otherwise leave this set unprojected
-        // forever. Re-read now that the carrier is stored — every
-        // interleaving is covered: if the adopt's row landed before this
-        // read we project here; if after, the adopt's take sees our index
-        // row (written before this read).
-        let author = backend
-            .blob_provenance(&sha)
-            .await
-            .map_err(map_blob_err)?
-            .and_then(|p| p.author_key_id);
-        let speaks = match &author {
-            Some(a) => may_issue_grant_for(backend, signer, a).await?,
-            None => false,
-        };
-        match author {
-            None => {
-                return Ok(KeyGrantAdmission {
-                    wraps_offered: parsed.wraps.len(),
-                    axis: parsed.axis,
-                    attestation: outcome,
-                    wraps_written: 0,
-                    pending: true,
-                });
-            }
-            Some(author) if !speaks => {
-                // The author is known now and the signer does not speak for
-                // them (§4.1): the carrier stays a stored attestation, its
-                // index row is dropped, nothing projects.
-                backend
-                    .key_grant_pending_delete(&sha, cohort_scope, &row_id)
-                    .await
-                    .map_err(map_blob_err)?;
-                return Err(refuse(
-                    KeyGrantRefusalReason::SignerNotAuthor,
-                    format!(
-                        "signer {signer:?} is neither the author {author:?} of blob \
-                         {at_rest_sha256} nor an active occurrence of them"
-                    ),
-                ));
-            }
-            Some(_) => {
-                // The bytes arrived meanwhile: project directly (below) and
-                // retire this set's index row only AFTER the union write
-                // succeeds (PR #850, round four) — the adopt may also project
-                // it; both paths are unions.
-                retire_after_projection = Some((sha, cohort_scope.clone()));
-            }
-        }
-    }
-    // The projection: every wrap, a union.
-    let wraps_written = match &parsed.axis {
+    let parsed = KeyGrantRow::from_attestation(row)?;
+    let signer = row.attesting_key_id.as_str();
+    let wraps = std::slice::from_ref(&parsed.wrap);
+    let written = match &parsed.axis {
         KeyGrantAxis::Epoch {
             community_key_id,
             minter_key_id,
             epoch,
         } => {
             let n = backend
-                .community_dek_put_member_grants(
-                    community_key_id,
-                    minter_key_id,
-                    *epoch,
-                    &parsed.wraps,
-                )
+                .community_dek_put_member_grants(community_key_id, minter_key_id, *epoch, wraps)
                 .await
                 .map_err(map_blob_err)?;
             // v46.0.0 (CIRISPersist#876, `FSD/EPOCH_MINTER.md` §3) — THE
-            // REPAIR. This set is the proof of who minted
-            // `(community, epoch)`. Any blob binding at that community and
-            // epoch whose recorded minter holds neither DEK state nor a
-            // grant is stranded — written before the key set arrived, or
-            // under the pre-v46 premise that the row's AUTHOR minted it —
-            // and can never authorize anyone. Rebind it here, because
-            // nobody re-sends bytes to fix a key column. A binding whose
-            // minter does hold state is left exactly as it is.
+            // REPAIR. This row is proof of who minted `(community, epoch)`.
+            // Any blob binding at that community and epoch whose recorded
+            // minter holds neither DEK state nor a grant is stranded —
+            // written before the key arrived, or under the pre-v46 premise
+            // that the row's AUTHOR minted it — and can never authorize
+            // anyone. Rebind it here, because nobody re-sends bytes to fix a
+            // key column. A binding whose minter does hold state is left
+            // exactly as it is.
             let rebound = backend
                 .rebind_stranded_blob_epochs(community_key_id, minter_key_id, *epoch)
                 .await
@@ -1513,12 +1895,43 @@ where
             cohort_scope,
             ..
         } => {
-            let sha: [u8; 32] = hex::decode(at_rest_sha256)
-                .ok()
-                .and_then(|v| v.try_into().ok())
-                .ok_or_else(|| refuse(KeyGrantRefusalReason::Malformed, "at_rest_sha256"))?;
+            let sha = sha_of(at_rest_sha256)?;
+            let author = backend
+                .blob_provenance(&sha)
+                .await
+                .map_err(map_blob_err)?
+                .and_then(|p| p.author_key_id);
+            if author.is_none() {
+                // V146 — the pending index the adopt takes by (sha, scope).
+                backend
+                    .key_grant_pending_put(&sha, cohort_scope, &row.attestation_id, signer)
+                    .await
+                    .map_err(map_blob_err)?;
+                // The race double-check (PR #850 review): an adopt that stored
+                // the row and took the pending index between the first look
+                // and the index write would leave this row unprojected
+                // forever. Re-read now that the index row is written.
+                let author = backend
+                    .blob_provenance(&sha)
+                    .await
+                    .map_err(map_blob_err)?
+                    .and_then(|p| p.author_key_id);
+                if author.is_none() {
+                    return Ok(KeyGrantProjection::Pending);
+                }
+                // The bytes arrived meanwhile: hand the row to the adopt's
+                // own projection (one body decides the author verdict).
+                let n = project_pending_content_grants(
+                    backend,
+                    &sha,
+                    cohort_scope,
+                    author.as_deref().unwrap_or_default(),
+                )
+                .await?;
+                return Ok(KeyGrantProjection::Projected { written: n });
+            }
             backend
-                .put_at_rest_grants(&sha, cohort_scope, &parsed.wraps)
+                .put_at_rest_grants(&sha, cohort_scope, wraps)
                 .await
                 .map_err(map_blob_err)?
         }
@@ -1528,35 +1941,150 @@ where
             cohort_scope,
             ..
         } => backend
-            .stream_dek_put_grants(stream_id, *epoch, signer, cohort_scope, &parsed.wraps)
+            .stream_dek_put_grants(stream_id, *epoch, signer, cohort_scope, wraps)
             .await
             .map_err(map_blob_err)?,
     };
-    if let Some((sha, scope)) = retire_after_projection {
-        backend
-            .key_grant_pending_delete(&sha, &scope, &row_id)
+    Ok(KeyGrantProjection::Projected { written })
+}
+
+/// The sqlite / postgres body of
+/// [`FederationDirectory::key_grant_held_owner`]: the held blob's author
+/// (content), the recorded owner of the held stream (stream), else `None`.
+pub async fn held_owner<B>(backend: &B, axis: &KeyGrantAxis) -> Result<Option<String>, Error>
+where
+    B: BlobStorage + Sync,
+{
+    match axis {
+        KeyGrantAxis::Epoch { .. } => Ok(None),
+        KeyGrantAxis::Content { at_rest_sha256, .. } => Ok(backend
+            .blob_provenance(&sha_of(at_rest_sha256)?)
             .await
-            .map_err(map_blob_err)?;
+            .map_err(map_blob_err)?
+            .and_then(|p| p.author_key_id)),
+        KeyGrantAxis::Stream { stream_id, .. } => Ok(backend
+            .stream_key_state(stream_id)
+            .await
+            .map_err(map_blob_err)?
+            .owner_key_id),
     }
-    Ok(KeyGrantAdmission {
-        wraps_offered: parsed.wraps.len(),
-        axis: parsed.axis,
-        attestation: outcome,
-        wraps_written,
-        pending: false,
+}
+
+/// The sqlite / postgres body of [`FederationDirectory::project_key_grant_row`]:
+/// [`project_key_grant_row`] for a key-grant row, nothing for any other.
+pub async fn project_if_key_grant_row<B>(backend: &B, row: &Attestation) -> Result<(), Error>
+where
+    B: BlobStorage + FederationDirectory + Sync,
+{
+    if is_key_grant_row(row) {
+        project_key_grant_row(backend, row).await?;
+    }
+    Ok(())
+}
+
+/// Is `row`'s wrap in this node's grant tables?
+async fn wrap_is_projected<B>(backend: &B, row: &KeyGrantRow, signer: &str) -> Result<bool, Error>
+where
+    B: BlobStorage + Sync,
+{
+    let r = row.recipient();
+    Ok(match &row.axis {
+        KeyGrantAxis::Epoch {
+            community_key_id,
+            minter_key_id,
+            epoch,
+        } => backend
+            .community_dek_has_member_grant(community_key_id, minter_key_id, *epoch, r)
+            .await
+            .map_err(map_blob_err)?,
+        KeyGrantAxis::Content { at_rest_sha256, .. } => backend
+            .get_at_rest_grant(&sha_of(at_rest_sha256)?, r)
+            .await
+            .map_err(map_blob_err)?
+            .is_some(),
+        KeyGrantAxis::Stream {
+            stream_id, epoch, ..
+        } => backend
+            .stream_dek_grants(stream_id, *epoch, signer)
+            .await
+            .map_err(map_blob_err)?
+            .iter()
+            .any(|g| g.recipient_key_id == r),
     })
 }
 
-/// §13 — **project the content-axis sets that were admitted before their
+/// §12–§13 — **admit one replicated key-grant row and project its wrap.**
+///
+/// 1. The key-grant rule ([`check_key_grant_row_admission`]) answers first,
+///    in its own tokens; then the row goes through the attestation plane's
+///    own admission
+///    ([`apply_replicated_attestation`](FederationDirectory::apply_replicated_attestation)),
+///    which runs the hybrid-Strict federation-tier ingest gate against THIS
+///    node's directory and asks the same rule again.
+///    `Inserted` / `Unchanged` / `Deduplicated` /
+///    `Refused { AlreadyPresentIdentical }` proceed; any other refusal is
+///    `attestation_refused`.
+/// 2. The projection ([`project_key_grant_row`]) — the plane's own hook ran
+///    it on insert; it runs again here so a row stored earlier without its
+///    wrap (a crash between the two transactions) is repaired by a re-offer.
+///    A union, so the second run writes nothing.
+pub async fn admit_replicated_key_grant<B>(
+    backend: &B,
+    signed: SignedKeyGrantRow,
+) -> Result<KeyGrantAdmission, Error>
+where
+    B: BlobStorage + FederationDirectory + Sync,
+{
+    use crate::federation::attestation_apply::AttestationRefusalReason;
+
+    let row = signed.attestation;
+    // The typed refusals first, before the plane: a row that is not a
+    // key-grant row is never handed to this door's projection, and the
+    // key-grant rule answers in its own tokens whichever plane gate the
+    // backend asks first. The plane asks the same rule again (one function).
+    let parsed = KeyGrantRow::from_attestation(&row)?;
+    check_key_grant_row_admission(backend.as_dyn_directory(), &row).await?;
+    let outcome = backend
+        .apply_replicated_attestation(SignedAttestation {
+            attestation: row.clone(),
+        })
+        .await?;
+    match &outcome {
+        ReplicatedAttestationOutcome::Inserted
+        | ReplicatedAttestationOutcome::Unchanged
+        | ReplicatedAttestationOutcome::Deduplicated
+        | ReplicatedAttestationOutcome::Refused {
+            reason: AttestationRefusalReason::AlreadyPresentIdentical,
+        } => {}
+        ReplicatedAttestationOutcome::Refused { reason } => {
+            return Err(refuse(
+                KeyGrantRefusalReason::AttestationRefused,
+                format!("the attestation plane refused the row: {reason:?}"),
+            ));
+        }
+    }
+    let projection = project_key_grant_row(backend, &row).await?;
+    let pending = projection == KeyGrantProjection::Pending;
+    let projected = !pending && wrap_is_projected(backend, &parsed, &row.attesting_key_id).await?;
+    Ok(KeyGrantAdmission {
+        recipient_key_id: parsed.wrap.recipient_key_id.clone(),
+        axis: parsed.axis,
+        attestation: outcome,
+        projected,
+        pending,
+    })
+}
+
+/// §13 — **project the content-axis rows that were admitted before their
 /// bytes.** Called by the adopt path the moment a blob row exists with its
-/// author known: the pending index rows for `(sha, scope)` are listed (V146
-/// — an adopt reads its own rows, never an author's attestations), each is
-/// retired only once its verdict is final, and each stored `key_grant:content:v1` row among them
-/// *signed by `author_key_id`* is projected as a union; a row signed by
-/// anyone else grants nothing (the same `SignerNotAuthor` verdict
-/// [`admit_replicated_key_grant`] gives when the row is present).
-/// Idempotent — `ON CONFLICT DO NOTHING` under it. Returns the wraps
-/// written.
+/// author known: the pending index rows for `(sha, scope)` are listed (V146 —
+/// an adopt reads its own rows, never an author's attestations), each is
+/// retired only once its verdict is final, and each stored
+/// `key_grant:content:v1` row among them *whose signer speaks for
+/// `author_key_id`* is projected as a union; a row signed by anyone else
+/// grants nothing (the same `signer_not_author` verdict admission gives when
+/// the blob is held). Idempotent — `ON CONFLICT DO NOTHING` under it.
+/// Returns the wraps written.
 pub async fn project_pending_content_grants<B>(
     backend: &B,
     sha256: &[u8; 32],
@@ -1566,7 +2094,6 @@ pub async fn project_pending_content_grants<B>(
 where
     B: BlobStorage + FederationDirectory + Sync,
 {
-    use crate::federation::at_rest_cascade::WRAP_ALGORITHM_V2;
     let want = hex::encode(sha256);
     let mut written = 0usize;
     for (attestation_id, signer) in backend
@@ -1579,27 +2106,32 @@ where
         // adopt (PR #850 review, round three). v46.3.0 (#884, §4.1): the
         // author's own active occurrence — the node that sealed the bytes —
         // speaks for the author.
-        if !may_issue_grant_for(backend, &signer, author_key_id).await? {
+        let Some(row) = backend.get_attestation(&attestation_id).await? else {
+            continue;
+        };
+        if !may_issue_grant_for(
+            backend,
+            &signer,
+            author_key_id,
+            crate::federation::admission::grant_chain_instant(&row),
+        )
+        .await?
+        {
             backend
                 .key_grant_pending_delete(sha256, cohort_scope, &attestation_id)
                 .await
                 .map_err(map_blob_err)?;
             continue;
         }
-        let Some(row) = backend.get_attestation(&attestation_id).await? else {
-            continue;
-        };
-        let projectable = row.attestation_type == KEY_GRANT_CONTENT_ATTESTATION_TYPE
-            && row.scrub_key_id == signer
-            && KeyGrantSet::from_attestation(&row).ok().is_some_and(|parsed| {
-                matches!(&parsed.axis, KeyGrantAxis::Content { at_rest_sha256, cohort_scope: set_scope, .. }
-                    if *at_rest_sha256 == want && set_scope == cohort_scope)
-                    && parsed.wraps.iter().all(|w| w.wrap_algorithm == WRAP_ALGORITHM_V2)
-            });
-        if projectable {
-            let parsed = KeyGrantSet::from_attestation(&row)?;
+        let projectable = KeyGrantRow::from_attestation(&row).ok().filter(|parsed| {
+            row.attesting_key_id == signer
+                && matches!(&parsed.axis, KeyGrantAxis::Content { at_rest_sha256, cohort_scope: s, .. }
+                    if *at_rest_sha256 == want && s == cohort_scope)
+                && check_wrap_algorithm(&parsed.wrap).is_ok()
+        });
+        if let Some(parsed) = projectable {
             written += backend
-                .put_at_rest_grants(sha256, cohort_scope, &parsed.wraps)
+                .put_at_rest_grants(sha256, cohort_scope, std::slice::from_ref(&parsed.wrap))
                 .await
                 .map_err(map_blob_err)?;
         }
@@ -1617,12 +2149,12 @@ where
 mod tests {
     use super::*;
 
-    fn row(attestation_type: &str, envelope: serde_json::Value) -> Attestation {
+    fn row(recipient: &str, cohort_scope: &str, envelope: serde_json::Value) -> Attestation {
         Attestation {
             attestation_id: "id".into(),
             attesting_key_id: "m".into(),
-            attested_key_id: "m".into(),
-            attestation_type: attestation_type.into(),
+            attested_key_id: recipient.into(),
+            attestation_type: "scores".into(),
             weight: None,
             asserted_at: chrono::Utc::now(),
             expires_at: None,
@@ -1636,113 +2168,164 @@ mod tests {
             persist_row_hash: String::new(),
             subject_key_ids: vec![],
             withdraws_admission_rule: None,
-            cohort_scope: "community".into(),
+            cohort_scope: cohort_scope.into(),
             tier: "federation".into(),
             promoted_at: None,
             additional_scrubs: vec![],
         }
     }
 
-    /// The envelope round-trips on both axes, byte for byte through the
-    /// CC 3 vocabulary (`recipient_occurrence_key_id`, not a column name).
-    #[test]
-    fn key_grant_set_round_trips_through_its_envelope() {
-        for set in [
-            KeyGrantSet {
-                axis: KeyGrantAxis::Epoch {
-                    community_key_id: "c".into(),
-                    minter_key_id: "m".into(),
-                    epoch: 3,
-                },
-                wraps: vec![GrantWrap {
-                    recipient_key_id: "r1".into(),
-                    wrap_algorithm: "x25519_mlkem768_aes256_gcm_hkdf_sha256".into(),
-                    wrapped_dek: "{}".into(),
-                }],
-            },
-            KeyGrantSet {
-                axis: KeyGrantAxis::Content {
-                    at_rest_sha256: "ab".repeat(32),
-                    cohort_scope: "self".into(),
-                    owner_key_id: "m".into(),
-                },
-                wraps: vec![],
-            },
-        ] {
-            let env = serde_json::Value::Object(set.envelope_extra());
-            assert_eq!(env["wraps"].as_array().map(Vec::len), Some(set.wraps.len()));
-            if let Some(w) = env["wraps"].as_array().and_then(|a| a.first()) {
-                assert!(w.get("recipient_occurrence_key_id").is_some());
-            }
-            let back =
-                KeyGrantSet::from_attestation(&row(set.axis.attestation_type(), env)).unwrap();
-            assert_eq!(back, set);
+    fn wrap(r: &str) -> GrantWrap {
+        GrantWrap {
+            recipient_key_id: r.into(),
+            wrap_algorithm: "x25519_mlkem768_aes256_gcm_hkdf_sha256".into(),
+            wrapped_dek: "{}".into(),
         }
     }
 
-    /// #953 — a family content set names its family as `family_key_id`
-    /// (the cohort target the write gate reads), equal to `owner_key_id`;
-    /// a self set names none. Anything else is `malformed`.
-    #[test]
-    fn a_family_content_set_names_its_family_as_the_target_953() {
-        let family = KeyGrantSet {
-            axis: KeyGrantAxis::Content {
+    fn row_of(r: &KeyGrantRow) -> Attestation {
+        row(r.recipient(), r.axis.emission_cohort_scope(), r.envelope())
+    }
+
+    fn malformed_of(a: &Attestation) -> bool {
+        matches!(
+            KeyGrantRow::from_attestation(a),
+            Err(Error::KeyGrantRefused {
+                reason: "malformed",
+                ..
+            })
+        )
+    }
+
+    fn axes() -> Vec<KeyGrantAxis> {
+        vec![
+            KeyGrantAxis::Epoch {
+                community_key_id: "c".into(),
+                minter_key_id: "m".into(),
+                epoch: 3,
+            },
+            KeyGrantAxis::Content {
+                at_rest_sha256: "ab".repeat(32),
+                cohort_scope: "self".into(),
+                owner_key_id: "m".into(),
+            },
+            KeyGrantAxis::Content {
                 at_rest_sha256: "cd".repeat(32),
                 cohort_scope: "family".into(),
                 owner_key_id: "fam".into(),
             },
-            wraps: vec![],
-        };
-        let env = serde_json::Value::Object(family.envelope_extra());
-        assert_eq!(env["family_key_id"], "fam");
-        let t = family.axis.attestation_type();
-        assert_eq!(
-            KeyGrantSet::from_attestation(&row(t, env.clone())).unwrap(),
-            family
-        );
-        let malformed = |env: serde_json::Value| {
-            matches!(
-                KeyGrantSet::from_attestation(&row(t, env)),
-                Err(Error::KeyGrantRefused {
-                    reason: "malformed",
-                    ..
-                })
-            )
-        };
-        let mut other = env.clone();
-        other["family_key_id"] = "fam-2".into();
-        assert!(malformed(other), "a family set naming another family");
-        let mut absent = env.clone();
-        absent.as_object_mut().unwrap().remove("family_key_id");
-        assert!(malformed(absent), "a family set naming no target");
-        let mut selfish = env;
-        selfish["cohort_scope"] = "self".into();
-        assert!(malformed(selfish), "a self set naming a family");
+            KeyGrantAxis::Stream {
+                stream_id: "s".into(),
+                epoch: 2,
+                cohort_scope: "community".into(),
+                owner_key_id: "c".into(),
+            },
+        ]
     }
 
-    /// A type/axis disagreement is `malformed`, not a parse of whichever
-    /// half looked right.
+    /// I740 (#989) — a row round-trips through its envelope on every axis,
+    /// with persist's member names (CC 3.3.2 cites them), the recipient as
+    /// `attested_key_id`, and the CC 2 target on group scopes.
     #[test]
-    fn key_grant_type_and_axis_must_agree() {
-        let set = KeyGrantSet {
-            axis: KeyGrantAxis::Epoch {
-                community_key_id: "c".into(),
-                minter_key_id: "m".into(),
-                epoch: 1,
-            },
-            wraps: vec![],
+    fn i740_key_grant_row_round_trips_through_its_envelope() {
+        for axis in axes() {
+            let r = KeyGrantRow {
+                axis,
+                wrap: wrap("r1"),
+            };
+            let env = r.envelope();
+            assert_eq!(env["dimension"], r.axis.dimension());
+            assert_eq!(env["score"], 1.0);
+            assert_eq!(env["axis"], r.axis.token());
+            assert!(env.get("wraps").is_none() && env.get("kind").is_none());
+            let back = KeyGrantRow::from_attestation(&row_of(&r)).unwrap();
+            assert_eq!(back, r);
+        }
+        let fam = KeyGrantRow {
+            axis: axes()[2].clone(),
+            wrap: wrap("r"),
         };
-        let err = KeyGrantSet::from_attestation(&row(
-            KEY_GRANT_CONTENT_ATTESTATION_TYPE,
-            serde_json::Value::Object(set.envelope_extra()),
-        ))
-        .unwrap_err();
+        assert_eq!(fam.envelope()["family_key_id"], "fam");
+        let ep = KeyGrantRow {
+            axis: axes()[0].clone(),
+            wrap: wrap("r"),
+        };
+        assert_eq!(ep.envelope()["community_id"], "c");
+    }
+
+    /// I741 (#989) — every departure from the shape is `malformed`: a member
+    /// on an axis that does not use it, dimension/axis disagreement, a score
+    /// other than 1.0, a subject, an expiry, the digest in `evidence_refs`, a
+    /// wrong scope, a wrong or missing target. A retired SET type is
+    /// `set_retired`.
+    #[test]
+    fn i741_every_departure_from_the_row_shape_is_refused() {
+        let content = KeyGrantRow {
+            axis: axes()[1].clone(),
+            wrap: wrap("r"),
+        };
+        let base = row_of(&content);
+        let mut a = base.clone();
+        a.attestation_envelope["epoch"] = 1.into();
+        assert!(malformed_of(&a), "a foreign axis member");
+        let mut a = base.clone();
+        a.attestation_envelope["dimension"] = KEY_GRANT_EPOCH_DIMENSION.into();
+        assert!(malformed_of(&a), "dimension and axis disagree");
+        let mut a = base.clone();
+        a.attestation_envelope["score"] = 0.5.into();
+        assert!(malformed_of(&a), "score 0.5");
+        let mut a = base.clone();
+        a.subject_key_ids = vec!["s".into()];
+        assert!(malformed_of(&a), "a subject");
+        let mut a = base.clone();
+        a.expires_at = Some(chrono::Utc::now());
+        assert!(malformed_of(&a), "an expiry");
+        let mut a = base.clone();
+        a.attestation_envelope["evidence_refs"] = serde_json::json!(["ab".repeat(32)]);
+        assert!(malformed_of(&a), "the digest cited");
+        let mut a = base.clone();
+        a.cohort_scope = "community".into();
+        assert!(malformed_of(&a), "a content row at community");
+        let mut a = base.clone();
+        a.attestation_envelope["family_key_id"] = "f".into();
+        assert!(malformed_of(&a), "a self row naming a family");
+        let fam = row_of(&KeyGrantRow {
+            axis: axes()[2].clone(),
+            wrap: wrap("r"),
+        });
+        let mut a = fam.clone();
+        a.attestation_envelope["family_key_id"] = "other".into();
+        assert!(malformed_of(&a), "a family row naming another family");
+        let mut a = fam;
+        a.attestation_envelope
+            .as_object_mut()
+            .unwrap()
+            .remove("family_key_id");
+        assert!(malformed_of(&a), "a family row naming no family");
+        let mut a = base.clone();
+        a.attestation_type = KEY_GRANT_CONTENT_DIMENSION.into();
         assert!(matches!(
-            err,
-            Error::KeyGrantRefused {
-                reason: "malformed",
+            KeyGrantRow::from_attestation(&a),
+            Err(Error::KeyGrantRefused {
+                reason: "set_retired",
                 ..
-            }
+            })
         ));
+        let mut a = base;
+        a.attested_key_id = String::new();
+        assert!(malformed_of(&a), "no recipient");
+    }
+
+    /// The refusal tokens are distinct and stable.
+    #[test]
+    fn refusal_tokens_are_distinct() {
+        let mut seen = std::collections::BTreeSet::new();
+        for r in KeyGrantRefusalReason::ALL {
+            assert!(seen.insert(r.as_str()), "{r:?}");
+            assert_eq!(
+                serde_json::to_value(r).unwrap(),
+                serde_json::Value::String(r.as_str().into())
+            );
+        }
     }
 }

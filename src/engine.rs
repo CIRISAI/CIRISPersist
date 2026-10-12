@@ -6580,15 +6580,17 @@ impl Engine {
         Ok(r)
     }
 
-    /// CIRISPersist#848 (`BLOB_REPLICATION.md` §14) — **emit the
-    /// `KeyGrant` set for an axis**: the FULL set this node holds for
-    /// `(community, minter, epoch)` or for one self/family blob, signed by
-    /// this Engine's composed hybrid signer and stored through
-    /// [`emit_attestation_self`](Self::emit_attestation_self), so it rides the
-    /// attestation cursor peers already pull and projects by the KeyGrant
-    /// plane (`Cohort` / `SelfOwn`). Re-emission carries the full set and is
-    /// idempotent on every receiver (§13). `Ok(None)` when this node holds
-    /// no wrap for the axis (nothing to carry).
+    /// CIRISPersist#848 (`BLOB_REPLICATION.md` §14), v55.0.0 (#989, CC 3.3.2
+    /// rc7) — **emit the key-grant rows for an axis**: one `scores` row on
+    /// `key_grant:{axis}:v1` per wrap this node holds for `(community, minter,
+    /// epoch)`, one self/family blob or one stream epoch, signed by this
+    /// Engine's composed hybrid signer and stored through
+    /// [`emit_attestation_self`](Self::emit_attestation_self), so each rides
+    /// the attestation cursor to its recipient. A wrap this signer already
+    /// holds as a row is skipped (re-emission is idempotent), and one whose
+    /// recipient the audience rule no longer admits is withheld
+    /// ([`key_grant::plan_key_grant_emission`](crate::federation::key_grant::plan_key_grant_emission)).
+    /// `Ok(None)` when this node holds no wrap for the axis.
     ///
     /// Called by every write door after a cascade that minted or granted
     /// anew; reachable directly so a node that died mid-fan-out, or an
@@ -6597,63 +6599,34 @@ impl Engine {
     pub async fn emit_key_grant(
         &self,
         axis: &crate::federation::key_grant::KeyGrantAxis,
-    ) -> Result<Option<String>, crate::federation::BlobError> {
+    ) -> Result<Option<crate::federation::key_grant::KeyGrantEmission>, crate::federation::BlobError>
+    {
         self.ensure_minter_sentinels_resolved().await.map_err(|e| {
             crate::federation::BlobError::Backend(format!("V145 minter sentinel (#848): {e}"))
         })?;
-        use crate::federation::key_grant::{build_set_for_axis, watermark_for_axis};
-        // §14 (V146) — the watermark FIRST, then the set: the mark below
-        // stamps this instant, so a grant landing after it stays dirty.
-        let ledger = |e: crate::federation::Error| {
-            crate::federation::BlobError::Backend(format!("key_grant ledger: {e}"))
-        };
-        let (watermark, set) = match &self.backend {
+        let me = self.local_derived_key_id().await.map_err(|e| {
+            crate::federation::BlobError::Backend(format!("emit_key_grant: node key: {e}"))
+        })?;
+        use crate::federation::key_grant::emit_key_grant_axis_with;
+        let emit_one = |input| self.emit_attestation_self(input);
+        match &self.backend {
             #[cfg(feature = "postgres")]
-            BackendDispatch::Postgres(arc) => (
-                watermark_for_axis(arc.as_ref(), axis)
-                    .await
-                    .map_err(ledger)?,
-                build_set_for_axis(arc.as_ref(), axis).await?,
-            ),
+            BackendDispatch::Postgres(arc) => {
+                emit_key_grant_axis_with(arc.as_ref(), &me, axis, emit_one).await
+            }
             #[cfg(feature = "sqlite")]
-            BackendDispatch::Sqlite(arc) => (
-                watermark_for_axis(arc.as_ref(), axis)
-                    .await
-                    .map_err(ledger)?,
-                build_set_for_axis(arc.as_ref(), axis).await?,
-            ),
-        };
-        let Some(set) = set else {
-            return Ok(None);
-        };
+            BackendDispatch::Sqlite(arc) => {
+                emit_key_grant_axis_with(arc.as_ref(), &me, axis, emit_one).await
+            }
+        }
         // A community with no live moderator may not federate at all
-        // (`key_grant::emission_outcome`): nothing to carry, the write stands.
-        let emitted = crate::federation::key_grant::emission_outcome(
-            self.emit_attestation_self(set.emit_input()).await,
-        )
+        // (`key_grant::emission_outcome`): nothing carried, the write stands.
         .map_err(|e| {
             crate::federation::BlobError::AttestationEmissionFailed(format!(
-                "key_grant set for {axis:?} could not be emitted — the bytes are stored, the \
+                "key_grant rows for {axis:?} could not be emitted — the bytes are stored, the \
                  key cannot follow them until this succeeds ({e})"
             ))
-        })?;
-        // §14 (V146) — the emission ledger: the axis is clean from this
-        // instant until a newer grant lands under it. A skipped emission
-        // (`None`) leaves it dirty, so the next door or the boot sweep retries.
-        if let (Some(_), Some(watermark)) = (&emitted, watermark) {
-            match &self.backend {
-                #[cfg(feature = "postgres")]
-                BackendDispatch::Postgres(b) => {
-                    crate::federation::key_grant::mark_emitted(b.as_ref(), axis, watermark).await
-                }
-                #[cfg(feature = "sqlite")]
-                BackendDispatch::Sqlite(b) => {
-                    crate::federation::key_grant::mark_emitted(b.as_ref(), axis, watermark).await
-                }
-            }
-            .map_err(|e| crate::federation::BlobError::Backend(format!("key_grant ledger: {e}")))?;
-        }
-        Ok(emitted)
+        })
     }
 
     /// CIRISPersist#851 §20.5 (operator ruling) — **the announcing signer:
@@ -6770,7 +6743,7 @@ impl Engine {
     /// self/family blob this node authored likewise. Called at every
     /// constructor after the sentinel resolves (a failure is logged, never a
     /// boot abort — the doors retry on their own writes), and reachable on
-    /// demand. Returns how many sets were emitted.
+    /// demand. Returns how many key-grant rows were emitted (v55.0.0, #989: rows, not sets).
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     pub async fn emit_pending_key_grants(&self) -> Result<usize, crate::federation::BlobError> {
         self.ensure_minter_sentinels_resolved().await.map_err(|e| {
@@ -6822,29 +6795,40 @@ impl Engine {
             }
         }
         .map_err(|e| crate::federation::BlobError::Backend(format!("key_grant ledger: {e}")))?;
+        // v55.0.0 (#989) — rows, not sets; and one axis that cannot be
+        // emitted does not hold back the others (the legacy re-emit sweeps
+        // every axis a node owns): it stays dirty and is retried.
         let mut emitted = 0usize;
         for axis in &axes {
-            if self.emit_key_grant(axis).await?.is_some() {
-                emitted += 1;
+            match self.emit_key_grant(axis).await {
+                Ok(Some(e)) => emitted += e.attestation_ids.len(),
+                Ok(None) => {}
+                Err(e) => tracing::warn!(
+                    axis = ?axis,
+                    error = %e,
+                    "key-grant rows for this axis could not be emitted; it stays dirty (#989)"
+                ),
             }
         }
         Ok(emitted)
     }
 
-    /// CIRISPersist#848 (`BLOB_REPLICATION.md` §12–§13) — **admit a
-    /// replicated `KeyGrant` set and project every wrap.** The apply a
-    /// replication bridge routes a `key_grant:*` attestation to instead of
-    /// `apply_replicated_attestation`: the signer is resolved from THIS
-    /// node's directory, must be the set's minter (epoch axis; and an active
-    /// member at `asserted_at`) or the blob's author (content axis; when the
-    /// row is present), every wrap must be v2, and then the carrier row is
-    /// admitted through the attestation plane and every wrap written as a
-    /// UNION. Refusals are typed
-    /// ([`Error::KeyGrantRefused`](crate::federation::Error::KeyGrantRefused)).
+    /// CIRISPersist#848 (`BLOB_REPLICATION.md` §12–§13), v55.0.0 (#989, CC
+    /// 3.3.2 rc7) — **admit one replicated key-grant row and project its
+    /// wrap.** The row (`scores` on `key_grant:{axis}:v1`) goes through the
+    /// attestation plane's own admission, which runs the key-grant rule
+    /// against THIS node's directory (the sealer: the minter, active at
+    /// `asserted_at`, or a key that speaks for the owner and for the held
+    /// content's author; a v2 wrap; a recipient the audience rule admits),
+    /// then its wrap is written as a UNION. Refusals are typed
+    /// ([`Error::KeyGrantRefused`](crate::federation::Error::KeyGrantRefused),
+    /// or `SignerDoesNotActFor` plane `key_grant`, retryable).
+    /// [`apply_replicated_attestation`](Self::apply_replicated_attestation)
+    /// projects a key-grant row too; this door also reports the projection.
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     pub async fn apply_replicated_key_grant(
         &self,
-        set: crate::federation::key_grant::SignedKeyGrantSet,
+        row: crate::federation::key_grant::SignedKeyGrantRow,
     ) -> Result<crate::federation::key_grant::KeyGrantAdmission, crate::federation::Error> {
         self.ensure_minter_sentinels_resolved().await.map_err(|e| {
             crate::federation::Error::Backend(format!("V145 minter sentinel (#848): {e}"))
@@ -6852,9 +6836,9 @@ impl Engine {
         use crate::federation::key_grant::admit_replicated_key_grant;
         match &self.backend {
             #[cfg(feature = "postgres")]
-            BackendDispatch::Postgres(arc) => admit_replicated_key_grant(arc.as_ref(), set).await,
+            BackendDispatch::Postgres(arc) => admit_replicated_key_grant(arc.as_ref(), row).await,
             #[cfg(feature = "sqlite")]
-            BackendDispatch::Sqlite(arc) => admit_replicated_key_grant(arc.as_ref(), set).await,
+            BackendDispatch::Sqlite(arc) => admit_replicated_key_grant(arc.as_ref(), row).await,
         }
     }
 
@@ -6922,10 +6906,13 @@ impl Engine {
         #[cfg(any(feature = "postgres", feature = "sqlite"))]
         match self.emit_pending_key_grants().await {
             Ok(0) => {}
-            Ok(n) => tracing::info!(sets = n, "pending KeyGrant sets emitted at boot (#848 §14)"),
+            Ok(n) => tracing::info!(
+                rows = n,
+                "pending key-grant rows emitted at boot (#848 §14, #989)"
+            ),
             Err(e) => tracing::warn!(
                 error = %e,
-                "pending KeyGrant sets could not be emitted at boot; the write doors retry (#848 §14)"
+                "pending key-grant rows could not be emitted at boot; the write doors retry (#848 §14)"
             ),
         }
     }
@@ -7658,6 +7645,78 @@ impl Engine {
             }
         }?;
         // #848 (§14) — the key follows the chunk.
+        if let Some(axis) = &r.key_grant_emission {
+            self.emit_key_grant(axis).await?;
+        }
+        Ok(r)
+    }
+
+    /// v55.0.0 (CIRISPersist#981, CC 5.3.3.2.5) — **supply the DEK of a
+    /// stream's next epoch**: the MLS exporter secret of a live call, so the
+    /// live stream and the stored one are one key. The writer is this Engine's
+    /// signer (the stream's single sender); `group_key_id` is the owner,
+    /// family or community the stream is sealed for. Closes the stream's open
+    /// epoch with its terminator, records the DEK (persist never mints or rolls
+    /// the stream's epochs from now on: a removal or the nonce cap refuses the
+    /// next chunk with the retryable `stream_epoch_rotation_required`), and
+    /// when `keep` wraps it to the stream's audience and emits the
+    /// `key_grant:stream:v1` rows. An unkept stream is wrapped to nobody.
+    /// Chunks then go through
+    /// [`put_blob_chunk_scoped`](Self::put_blob_chunk_scoped) at `epoch`.
+    /// Refusals: `stream_not_authored`, `stream_epoch_dek_exists`, or
+    /// `InvalidArgument` (plaintext tier, an epoch below the newest, a
+    /// per-chunk-keyed stream, another cohort).
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn register_stream_epoch_dek(
+        &self,
+        cohort_scope: &str,
+        group_key_id: &str,
+        stream_id: &str,
+        epoch: u64,
+        dek: &[u8; 32],
+        keep: bool,
+        aad: Option<&[u8]>,
+    ) -> Result<
+        crate::federation::chunk_dag_cascade::RegisteredStreamEpoch,
+        crate::federation::BlobError,
+    > {
+        self.ensure_minter_sentinels_resolved().await.map_err(|e| {
+            crate::federation::BlobError::Backend(format!("V145 minter sentinel (#848): {e}"))
+        })?;
+        use crate::federation::chunk_dag_cascade::orchestrate::register_stream_epoch_dek;
+        let r = match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(arc) => {
+                register_stream_epoch_dek(
+                    arc.as_ref(),
+                    &*self.signer,
+                    cohort_scope,
+                    group_key_id,
+                    stream_id,
+                    epoch,
+                    dek,
+                    keep,
+                    aad,
+                )
+                .await
+            }
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(arc) => {
+                register_stream_epoch_dek(
+                    arc.as_ref(),
+                    &*self.signer,
+                    cohort_scope,
+                    group_key_id,
+                    stream_id,
+                    epoch,
+                    dek,
+                    keep,
+                    aad,
+                )
+                .await
+            }
+        }?;
         if let Some(axis) = &r.key_grant_emission {
             self.emit_key_grant(axis).await?;
         }

@@ -376,9 +376,9 @@ pub mod key_grant_arms {
     use crate::federation::admission::{DELEGATION_SCOPE_GRANT, DELEGATION_SCOPE_MODERATE};
     use crate::federation::at_rest_cascade::blob_invariants::node_signer;
     use crate::federation::community_dek::orchestrate::encrypt_and_cascade_community;
-    use crate::federation::key_grant::{admit_replicated_key_grant, KeyGrantAxis, KeyGrantSet};
+    use crate::federation::key_grant::{admit_replicated_key_grant, KeyGrantAxis, KeyGrantRow};
     use crate::federation::key_grant_invariants::two_node::{
-        seed_community_everywhere, sign_set_unstored, Node,
+        seed_community_everywhere, sign_row_unstored, Node,
     };
     use crate::federation::tier_ingest::test_support as ts;
     use crate::federation::types::cohort_scope::SELF;
@@ -389,7 +389,7 @@ pub mod key_grant_arms {
         match r {
             Err(Error::KeyGrantRefused { reason, .. }) => reason,
             Err(e) => panic!("expected a typed KeyGrantRefused, got {e:?}"),
-            Ok(a) => panic!("expected a refusal, the set was admitted: {a:?}"),
+            Ok(a) => panic!("expected a refusal, the row was admitted: {a:?}"),
         }
     }
 
@@ -399,6 +399,30 @@ pub mod key_grant_arms {
             wrap_algorithm: crate::federation::at_rest_cascade::WRAP_ALGORITHM_V2.into(),
             wrapped_dek: "{}".into(),
         }
+    }
+
+    /// v55.0.0 (#989) — an onward recipient the audience rule admits: a
+    /// registered personal device of `identity`, so the row's recipient leg
+    /// passes and the arm measures the issuer rule alone.
+    async fn recipient_of<B>(n: &Node<'_, B>, identity: &str, recipient: &str)
+    where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        ts::register_hybrid_key_as(n.backend, recipient, recipient, USER).await;
+        n.backend
+            .put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
+                identity_key_id: identity.to_owned(),
+                occurrence_key_id: recipient.to_owned(),
+                device_class: crate::federation::types::device_class::LAPTOP.into(),
+                hardware_attestation: None,
+                asserted_at: chrono::Utc::now(),
+                valid_until: None,
+                encryption_pubkeys: Some(n.kem.clone()),
+                transport_binding: None,
+                persist_row_hash: String::new(),
+            })
+            .await
+            .unwrap();
     }
 
     /// **I591b** — the content axis, one node.
@@ -441,18 +465,19 @@ pub mod key_grant_arms {
         let d_alias = format!("{tag}-delegate-{run}");
         let delegate = node_signer(a.backend, &d_alias).await;
         let d_key = delegate.derived_key_id();
-        let set_for = |recipient: &str| KeyGrantSet {
+        let set_for = |recipient: &str| KeyGrantRow {
             axis: KeyGrantAxis::Content {
                 at_rest_sha256: hex::encode(sha),
                 cohort_scope: SELF.into(),
                 owner_key_id: owner.clone(),
             },
-            wraps: vec![wrap(recipient)],
+            wrap: wrap(recipient),
         };
         let r1 = format!("{tag}-r1-{run}");
+        recipient_of(a, &owner, &r1).await;
         let r = admit_replicated_key_grant(
             a.backend,
-            sign_set_unstored(&delegate, &set_for(&r1)).await,
+            sign_row_unstored(&delegate, &set_for(&r1)).await,
         )
         .await;
         assert_eq!(
@@ -475,7 +500,7 @@ pub mod key_grant_arms {
         .await;
         let r = admit_replicated_key_grant(
             a.backend,
-            sign_set_unstored(&delegate, &set_for(&r1)).await,
+            sign_row_unstored(&delegate, &set_for(&r1)).await,
         )
         .await;
         assert_eq!(
@@ -496,12 +521,12 @@ pub mod key_grant_arms {
         .await;
         let admitted = admit_replicated_key_grant(
             a.backend,
-            sign_set_unstored(&delegate, &set_for(&r1)).await,
+            sign_row_unstored(&delegate, &set_for(&r1)).await,
         )
         .await
         .unwrap_or_else(|e| panic!("{tag} I591b (3): the author's `grant` delegate: {e}"));
         assert!(
-            !admitted.pending && admitted.wraps_written == 1,
+            !admitted.pending && admitted.projected,
             "{tag} I591b (3): admitted AND projected: {admitted:?}"
         );
         assert!(
@@ -515,9 +540,10 @@ pub mod key_grant_arms {
 
         withdraw(dir, &owner, &owner, &d_key, &edge).await;
         let r2 = format!("{tag}-r2-{run}");
+        recipient_of(a, &owner, &r2).await;
         let r = admit_replicated_key_grant(
             a.backend,
-            sign_set_unstored(&delegate, &set_for(&r2)).await,
+            sign_row_unstored(&delegate, &set_for(&r2)).await,
         )
         .await;
         assert_eq!(
@@ -531,7 +557,7 @@ pub mod key_grant_arms {
                 .await
                 .unwrap()
                 .is_none(),
-            "{tag} I591b (4): a refused set projects nothing"
+            "{tag} I591b (4): a refused row projects nothing"
         );
     }
 
@@ -573,13 +599,13 @@ pub mod key_grant_arms {
         .await
         .unwrap_or_else(|e| panic!("{tag} I596b: A seals self: {e}"));
         let sha = sealed.at_rest_sha256;
-        let set_for = |recipient: &str| KeyGrantSet {
+        let set_for = |recipient: &str| KeyGrantRow {
             axis: KeyGrantAxis::Content {
                 at_rest_sha256: hex::encode(sha),
                 cohort_scope: SELF.into(),
                 owner_key_id: owner.clone(),
             },
-            wraps: vec![wrap(recipient)],
+            wrap: wrap(recipient),
         };
         let dir = a.backend.as_dyn_directory();
         let now = chrono::Utc::now();
@@ -621,9 +647,10 @@ pub mod key_grant_arms {
             let d_key = delegate.derived_key_id();
             put_grant_with_term(dir, &owner, &d_key, at, from, until).await;
             let recipient = format!("{tag}-i596-r{i}-{run}");
+            recipient_of(a, &owner, &recipient).await;
             let r = admit_replicated_key_grant(
                 a.backend,
-                sign_set_unstored(&delegate, &set_for(&recipient)).await,
+                sign_row_unstored(&delegate, &set_for(&recipient)).await,
             )
             .await;
             let projected = a
@@ -636,20 +663,20 @@ pub mod key_grant_arms {
                 let admitted =
                     r.unwrap_or_else(|e| panic!("{tag} I596b {what}: must be admitted: {e}"));
                 assert!(
-                    !admitted.pending && admitted.wraps_written == 1 && projected,
+                    !admitted.pending && admitted.projected && projected,
                     "{tag} I596b {what}: admitted AND projected: {admitted:?}"
                 );
             } else {
                 assert_eq!(reason(&r), "signer_not_author", "{tag} I596b {what}");
                 assert!(
                     !projected,
-                    "{tag} I596b {what}: a refused set projects nothing"
+                    "{tag} I596b {what}: a refused row projects nothing"
                 );
             }
         }
     }
 
-    /// **I591c** — the epoch axis, two nodes: B admits sets for A's counter.
+    /// **I591c** — the epoch axis, two nodes: B admits rows for A's counter.
     pub async fn exercise_i591c_epoch_axis<B>(
         a: &Node<'_, B>,
         a_alias: &str,
@@ -670,15 +697,16 @@ pub mod key_grant_arms {
             .await
             .unwrap()
             .expect("A holds wraps for (C, A, 0)");
-        let set_for = |recipient: &str| KeyGrantSet {
+        let set_for = |recipient: &str| KeyGrantRow {
             axis: honest.axis.clone(),
-            wraps: vec![wrap(recipient)],
+            wrap: wrap(recipient),
         };
         let r1 = format!("{tag}-r1-{run}");
+        recipient_of(b, &bob, &r1).await;
         // (1) B's own member occurrence signs A's counter: not the minter.
         let r = admit_replicated_key_grant(
             b.backend,
-            sign_set_unstored(&b.signer, &set_for(&r1)).await,
+            sign_row_unstored(&b.signer, &set_for(&r1)).await,
         )
         .await;
         assert_eq!(
@@ -701,7 +729,7 @@ pub mod key_grant_arms {
         .await;
         let r = admit_replicated_key_grant(
             b.backend,
-            sign_set_unstored(&b.signer, &set_for(&r1)).await,
+            sign_row_unstored(&b.signer, &set_for(&r1)).await,
         )
         .await;
         assert_eq!(
@@ -720,7 +748,7 @@ pub mod key_grant_arms {
             None,
         )
         .await;
-        admit_replicated_key_grant(b.backend, sign_set_unstored(&b.signer, &set_for(&r1)).await)
+        admit_replicated_key_grant(b.backend, sign_row_unstored(&b.signer, &set_for(&r1)).await)
             .await
             .unwrap_or_else(|e| panic!("{tag} I591c (3): the minter's `grant` delegate: {e}"));
         assert!(
@@ -733,9 +761,10 @@ pub mod key_grant_arms {
 
         withdraw(dir, &a.key, a_alias, &b.key, &edge).await;
         let r2 = format!("{tag}-r2-{run}");
+        recipient_of(b, &bob, &r2).await;
         let r = admit_replicated_key_grant(
             b.backend,
-            sign_set_unstored(&b.signer, &set_for(&r2)).await,
+            sign_row_unstored(&b.signer, &set_for(&r2)).await,
         )
         .await;
         assert_eq!(

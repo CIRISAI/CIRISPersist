@@ -10,9 +10,9 @@
 //! whole-string, byte-exact match for a registered **carrier**; anything else
 //! is refused `attestation_type_unregistered`. rc7 registers no carrier (the
 //! two rc6 carriers became rows on the five, CIRISConstitution#141/#143), so
-//! the slot is the five, plus what the temporary
-//! [`registry::RC6_RETIRED_CARRIERS_ADMITTED_UNTIL_989`] still admits until
-//! v55 slice B lands. The set is read from the vendored
+//! the slot is the five; the rc6 carriers are retired
+//! ([`registry::RETIRED_CARRIER_STEMS`], v55 slices A and B). The set is read
+//! from the vendored
 //! registry's `_meta.row_types` ([`registry::row_types`],
 //! [`registry::carrier_row_type`]) and from nothing in this tree.
 //!

@@ -742,7 +742,6 @@ mod tests {
     async fn i85_a_withdraws_naming_a_key_grant_row_is_refused_sqlite() {
         use crate::federation::tier_ingest::test_support as ts;
         use crate::federation::types::identity_type::USER;
-        use crate::federation::FederationDirectory;
         use crate::store::Backend as _;
         let backend = crate::store::sqlite::SqliteBackend::open_in_memory()
             .await
@@ -751,28 +750,79 @@ mod tests {
         let run = uuid::Uuid::new_v4().simple().to_string();
         let minter = format!("i85-minter-{run}");
         ts::register_identity_key(&backend, &minter, USER).await;
-        // A stored key_grant carrier row, and a withdraws naming it.
-        // A stored key_grant carrier, sealed the way every admissible row is
-        // (instants + the #643 mirror), then a withdraws naming it.
+        // A HELD retired key_grant carrier (a v54 node's set, kept on an
+        // upgraded node — v55.0.0, #989: refused at every door now, so it is
+        // seeded below the doors), and a `scores` key-grant ROW, the v55
+        // shape (seeded the same way: this witness is about the composer
+        // gate, not the row's own admission).
         let target_id = format!("kg-{run}");
-        let mut carrier = ts::bare_attestation(
-            &target_id,
-            &minter,
-            &minter,
-            &serde_json::json!({ "id": target_id, "kind": "key_grant" }),
-        );
-        carrier.attestation_type =
-            crate::federation::key_grant::KEY_GRANT_EPOCH_ATTESTATION_TYPE.to_owned();
-        // v53.0.0 (#975, CC 2.4) — a carrier carries no weight; the fixture's
-        // default one would be refused `carrier_carries_weight`.
-        carrier.weight = None;
-        let carrier = ts::seal_row(&minter, carrier);
-        backend
-            .apply_replicated_attestation(crate::federation::SignedAttestation {
-                attestation: carrier,
-            })
-            .await
-            .expect("I85: the carrier row stores");
+        let row_id = format!("kgr-{run}");
+        {
+            let conn = backend.conn_handle();
+            let conn = conn.lock();
+            for (id, ty, env) in [
+                (
+                    target_id.clone(),
+                    "key_grant:epoch:v1",
+                    serde_json::json!({ "id": target_id, "kind": "key_grant" }),
+                ),
+                (
+                    row_id.clone(),
+                    "scores",
+                    serde_json::json!({
+                        "id": row_id,
+                        "dimension": crate::federation::key_grant::KEY_GRANT_EPOCH_DIMENSION,
+                    }),
+                ),
+            ] {
+                conn.execute(
+                    "INSERT INTO federation_attestations (\
+                        attestation_id, attesting_key_id, attested_key_id, attestation_type, \
+                        weight, asserted_at, expires_at, attestation_envelope, \
+                        original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
+                        scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, tier, \
+                        cohort_scope, admitted_at\
+                     ) VALUES (?1, ?2, ?2, ?3, NULL, '2026-01-01T00:00:00Z', NULL, ?4, x'00', \
+                        'c2ln', NULL, ?2, '2026-01-01T00:00:00Z', NULL, '0', 'federation', \
+                        'community', '2026-01-01T00:00:00Z')",
+                    rusqlite::params![id, minter, ty, env.to_string()],
+                )
+                .expect("I85: the held row is seeded");
+            }
+        }
+        // v55.0.0 (#989, CC 3.3.2 rc7) — a withdraws or a recants naming the
+        // ROW is refused too, the sealer's own recants included.
+        for (kind, ty) in [
+            (
+                "withdraws",
+                crate::federation::types::attestation_type::WITHDRAWS,
+            ),
+            (
+                "recants",
+                crate::federation::types::attestation_type::RECANTS,
+            ),
+        ] {
+            let id = format!("{kind}-row-{run}");
+            let mut c = ts::bare_attestation(
+                &id,
+                &minter,
+                &minter,
+                &serde_json::json!({
+                    "id": id,
+                    "kind": kind,
+                    "references_attestation_id": row_id,
+                }),
+            );
+            c.attestation_type = ty.to_owned();
+            let c = ts::seal_row(&minter, c);
+            let err = crate::federation::admission::check_withdraws_admission(&backend, &c)
+                .await
+                .expect_err("I85: a composer naming a key-grant row is refused");
+            assert!(
+                err.to_string().contains("cannot be retroactively"),
+                "I85 ({kind} of the row): {err}"
+            );
+        }
         let w_id = format!("w-{run}");
         let mut w = ts::bare_attestation(
             &w_id,
@@ -807,8 +857,7 @@ mod tests {
                 "id": format!("w2-{run}"),
                 "kind": "withdraws",
                 "references_attestation_id": absent,
-                "references_attestation_type":
-                    crate::federation::key_grant::KEY_GRANT_EPOCH_ATTESTATION_TYPE,
+                "references_attestation_type": "key_grant:epoch:v1",
             }),
         );
         deferred.attestation_type =

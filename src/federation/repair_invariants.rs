@@ -13,7 +13,7 @@
 //! - **I415f** (two nodes, sqlite and postgres) — whole-file repair: B evicts
 //!   the manifest and every chunk; the manifest's at-rest grant survives the
 //!   eviction (a grant is a key-plane fact), and after B re-fetches the bytes
-//!   it reads whole with NO key_grant set applied again.
+//!   it reads whole with NO key-grant row applied again.
 //!
 //! A tombstone never deleted a grant (the I67 gate pins the only grant-delete
 //! sites: `delete_blob` until v53, the epoch destruction sweep, an abandoned
@@ -25,7 +25,6 @@
 pub(crate) mod bodies {
     use crate::federation::custody_ack::CustodyState;
     use crate::federation::epoch_minter_invariants::bodies::Pick;
-    use crate::federation::key_grant::SignedKeyGrantSet;
     use crate::federation::nested_manifest_invariants::bodies::{pair, Pair};
     use crate::federation::types::cohort_scope::{self, CryptoTier};
     use crate::federation::{
@@ -95,7 +94,7 @@ pub(crate) mod bodies {
         }
     }
 
-    /// B receives A's DAG the way a host delivers it: A's key_grant sets,
+    /// B receives A's DAG the way a host delivers it: A's key-grant rows,
     /// the sealed manifest, every chunk at its position, then the promote.
     /// Returns the chunks as `(seq, sha, envelope, epoch, size)`.
     async fn deliver<B>(
@@ -107,16 +106,17 @@ pub(crate) mod bodies {
         B: BlobStorage + FederationDirectory + Sync + 'static,
     {
         p.a.emit_pending_key_grants().await.unwrap();
-        for set in
-            p.sa.list_attestations_by(&p.key_a)
-                .await
-                .unwrap()
-                .into_iter()
-                .filter(|x| x.attestation_type.starts_with("key_grant:"))
+        // v55.0.0 (#989) — the rows A's plane delivers to B.
+        for set in crate::federation::key_grant_invariants::two_node::key_grant_rows_for(
+            p.sa.as_ref(),
+            &p.key_a,
+            &p.key_b,
+        )
+        .await
         {
-            p.b.apply_replicated_key_grant(SignedKeyGrantSet { attestation: set })
+            p.b.apply_replicated_key_grant(set)
                 .await
-                .expect("B applies A's set");
+                .expect("B applies A's row");
         }
         p.b.adopt_sealed_blob(
             &inline(p.sa.as_ref(), root).await,
@@ -304,7 +304,7 @@ pub(crate) mod bodies {
                 .is_some(),
             "I415f an eviction removes bytes, not the key-plane grant"
         );
-        // Re-fetch: the manifest and the chunks, no key_grant set re-applied.
+        // Re-fetch: the manifest and the chunks, no key-grant row re-applied.
         p.b.adopt_sealed_blob(&manifest_env, prov(&p), None, AdoptDisposition::LocalOnly)
             .await
             .expect("I415f B re-adopts the manifest");

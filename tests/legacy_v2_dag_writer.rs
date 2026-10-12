@@ -12,8 +12,9 @@
 #![cfg(all(feature = "test-anchor", feature = "sqlite"))]
 
 use ciris_persist::federation::chunk_dag_cascade::test_support::write_legacy_v2_dag;
-use ciris_persist::federation::key_grant::SignedKeyGrantSet;
-use ciris_persist::federation::key_grant_invariants::two_node::{introduce_as, Node};
+use ciris_persist::federation::key_grant_invariants::two_node::{
+    introduce_as, key_grant_rows_for, Node,
+};
 use ciris_persist::federation::tier_ingest::test_support as ts;
 use ciris_persist::federation::types::cohort_scope::{CryptoTier, SELF};
 use ciris_persist::federation::types::device_class::LAPTOP;
@@ -158,20 +159,18 @@ async fn pull_a_legacy_v2_dag(aad: Option<Vec<u8>>) {
     assert!(on_a.chunks.iter().all(|c| c.epoch.is_none()));
     assert_eq!(on_a.chunks.len(), segs.len(), "no terminator on a v2 DAG");
     a.emit_pending_key_grants().await.unwrap();
-    let sets: Vec<_> = sa
-        .list_attestations_by(&na.key)
-        .await
-        .unwrap()
-        .into_iter()
-        .filter(|x| x.attestation_type.starts_with("key_grant:"))
-        .collect();
-    assert!(!sets.is_empty(), "A emitted the v2 file's key-grant sets");
+    // v55.0.0 (#989) — the key-grant rows A's plane delivers to B.
+    let sets = key_grant_rows_for(sa.as_ref(), &na.key, &nb.key).await;
+    assert!(
+        !sets.is_empty(),
+        "A emitted the v2 file's key-grant rows for B"
+    );
 
-    // ── B pulls: the sets, the sealed manifest, each sealed chunk, promote. ──
+    // ── B pulls: the rows, the sealed manifest, each sealed chunk, promote. ──
     for set in sets {
-        b.apply_replicated_key_grant(SignedKeyGrantSet { attestation: set })
+        b.apply_replicated_key_grant(set)
             .await
-            .expect("B applies a key-grant set");
+            .expect("B applies a key-grant row");
     }
     let prov = BlobProvenance {
         author_key_id: owner.clone(),

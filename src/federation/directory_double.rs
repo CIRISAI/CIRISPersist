@@ -134,7 +134,7 @@ impl FaultInjectingDirectory {
     }
 }
 
-// 113 delegations, generated. Every one: fault first, then delegate.
+// 115 delegations, generated. Every one: fault first, then delegate.
 #[async_trait::async_trait]
 impl FederationDirectory for FaultInjectingDirectory {
     async fn apply_replicated_accord_evidence(
@@ -358,6 +358,15 @@ impl FederationDirectory for FaultInjectingDirectory {
         self.inner
             .insert_known_wire_hash(kind, content_hash, advertised_by, now)
             .await
+    }
+    async fn key_grant_held_owner(
+        &self,
+        axis: &key_grant::KeyGrantAxis,
+    ) -> Result<Option<String>, Error> {
+        if let Some(e) = self.faulted("key_grant_held_owner") {
+            return Err(e);
+        }
+        self.inner.key_grant_held_owner(axis).await
     }
     async fn known_wire_hash_contains(
         &self,
@@ -973,6 +982,12 @@ impl FederationDirectory for FaultInjectingDirectory {
         self.inner
             .lookup_signed_record_by_content_hash(kind, content_hash)
             .await
+    }
+    async fn project_key_grant_row(&self, row: &Attestation) -> Result<(), Error> {
+        if let Some(e) = self.faulted("project_key_grant_row") {
+            return Err(e);
+        }
+        self.inner.project_key_grant_row(row).await
     }
     async fn put_accord_decision(
         &self,

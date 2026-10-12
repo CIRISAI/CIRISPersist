@@ -1326,7 +1326,8 @@ fn pg_prepare_chunk_item(
 const PG_STREAM_DEK_SELECT: &str = "SELECT d.stream_id, d.epoch, d.owner_key_id, \
     d.cohort_scope, d.group_key_id, d.self_retention_wrap, \
     COALESCE(c.chunk_count, 0)::BIGINT AS chunk_count, \
-    (d.closed_at IS NOT NULL) AS closed, (d.terminated_at IS NOT NULL) AS terminated \
+    (d.closed_at IS NOT NULL) AS closed, (d.terminated_at IS NOT NULL) AS terminated, \
+    d.supplied, d.keep, d.room_epoch \
     FROM cirislens.federation_stream_deks d \
     LEFT JOIN cirislens.federation_stream_epoch_counts c \
       ON c.stream_id = d.stream_id AND c.epoch = d.epoch";
@@ -1347,6 +1348,11 @@ fn pg_stream_dek_row(
         chunk_count: u64::try_from(count).unwrap_or_default(),
         closed: r.safe_get_with("closed", B)?,
         terminated: r.safe_get_with("terminated", B)?,
+        supplied: r.safe_get_with("supplied", B)?,
+        keep: r.safe_get_with("keep", B)?,
+        room_epoch: r
+            .safe_get_with::<Option<i64>, _, _, _>("room_epoch", B)?
+            .map(|e| u64::try_from(e).unwrap_or_default()),
     })
 }
 
@@ -7218,6 +7224,24 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 crate::federation::Error::Backend(format!("lookup_role_withdrawal: {e}"))
             })?;
         row.map(pg_row_to_role_withdrawal).transpose()
+    }
+
+    /// v55.0.0 (CIRISPersist#989) — the key-grant sealer rule's held-state
+    /// leg: the held blob's author, the recorded owner of the held stream.
+    async fn key_grant_held_owner(
+        &self,
+        axis: &crate::federation::key_grant::KeyGrantAxis,
+    ) -> Result<Option<String>, crate::federation::Error> {
+        crate::federation::key_grant::held_owner(self, axis).await
+    }
+
+    /// v55.0.0 (CIRISPersist#989) — a key-grant row admitted by a typed door
+    /// carries its wrap into this node's grant tables.
+    async fn project_key_grant_row(
+        &self,
+        row: &crate::federation::Attestation,
+    ) -> Result<(), crate::federation::Error> {
+        crate::federation::key_grant::project_if_key_grant_row(self, row).await
     }
 
     /// v50.0.0 (CIRISPersist#916) — the receive doors' re-wrap: this node's
@@ -19004,8 +19028,9 @@ impl crate::federation::BlobStorage for PostgresBackend {
         client
             .execute(
                 "INSERT INTO cirislens.federation_stream_deks \
-                    (stream_id, epoch, owner_key_id, cohort_scope, group_key_id, self_retention_wrap) \
-                 VALUES ($1, $2, $3, $4, $5, $6) \
+                    (stream_id, epoch, owner_key_id, cohort_scope, group_key_id, \
+                     self_retention_wrap, supplied, keep, room_epoch) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
                  ON CONFLICT (stream_id, epoch) DO NOTHING",
                 &[
                     &record.stream_id,
@@ -19014,6 +19039,11 @@ impl crate::federation::BlobStorage for PostgresBackend {
                     &record.cohort_scope,
                     &record.group_key_id,
                     &record.self_retention_wrap,
+                    &record.supplied,
+                    &record.keep,
+                    &record
+                        .room_epoch
+                        .map(|e| i64::try_from(e).unwrap_or(i64::MAX)),
                 ],
             )
             .await
@@ -19026,6 +19056,54 @@ impl crate::federation::BlobStorage for PostgresBackend {
             .await
             .map_err(be)?;
         pg_stream_dek_row(&row)
+    }
+
+    async fn stream_dek_evict_room_chunks(
+        &self,
+        community_key_id: &str,
+        minter_key_id: &str,
+        max_room_epoch: u64,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<u64, crate::federation::BlobError> {
+        let mut client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
+        let be = |e: tokio_postgres::Error| {
+            crate::federation::BlobError::Backend(format!("stream_dek_evict_room_chunks: {e}"))
+        };
+        let bound = i64::try_from(max_room_epoch).unwrap_or(i64::MAX);
+        // One transaction: the chunk rows go, the epoch rows stay, stamped.
+        // Scoped to epochs not yet evicted, so a re-run deletes nothing.
+        const EPOCHS: &str = "FROM cirislens.federation_stream_deks d \
+            WHERE d.group_key_id = $1 AND d.owner_key_id = $2 \
+              AND d.cohort_scope IN ('community', 'affiliations') \
+              AND d.room_epoch IS NOT NULL AND d.room_epoch <= $3 \
+              AND d.evicted_at IS NULL";
+        let tx = client.transaction().await.map_err(be)?;
+        let n = tx
+            .execute(
+                &format!(
+                    "DELETE FROM cirislens.federation_blobs WHERE sha256 IN ( \
+                        SELECT c.chunk_sha FROM cirislens.federation_stream_chunks c \
+                         WHERE EXISTS (SELECT 1 {EPOCHS} \
+                                         AND d.stream_id = c.stream_id AND d.epoch = c.epoch))"
+                ),
+                &[&community_key_id, &minter_key_id, &bound],
+            )
+            .await
+            .map_err(be)?;
+        tx.execute(
+            &format!(
+                "UPDATE cirislens.federation_stream_deks SET evicted_at = $4 \
+                  WHERE (stream_id, epoch) IN (SELECT d.stream_id, d.epoch {EPOCHS})"
+            ),
+            &[&community_key_id, &minter_key_id, &bound, &now],
+        )
+        .await
+        .map_err(be)?;
+        tx.commit().await.map_err(be)?;
+        Ok(n)
     }
 
     async fn stream_dek_close(
@@ -19917,7 +19995,8 @@ impl crate::federation::BlobStorage for PostgresBackend {
     }
 
     /// v46.3.0 (#884, FSD/SELF_COLLECTIVE_TRANSFER.md §3 R4) — the sqlite
-    /// twin: the community binding's minter, else the content set's attester.
+    /// twin: the community binding's minter, else the content-axis key-grant
+    /// row's attester (v55.0.0, #989).
     async fn minter_of_blob(
         &self,
         at_rest_sha256: &[u8; 32],
@@ -19930,11 +20009,13 @@ impl crate::federation::BlobStorage for PostgresBackend {
             .await
             .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
         let hex = hex::encode(at_rest_sha256);
-        let ty = crate::federation::key_grant::KEY_GRANT_CONTENT_ATTESTATION_TYPE;
+        // v55.0.0 (#989) — the content-axis key-grant ROW's sealer; a
+        // retired SET is not read.
+        let ty = crate::federation::key_grant::KEY_GRANT_CONTENT_DIMENSION;
         let row = client
             .query_opt(
                 "SELECT attesting_key_id FROM cirislens.federation_attestations \
-                  WHERE attestation_type = $1 \
+                  WHERE attestation_type = 'scores' AND dimension = $1 \
                     AND attestation_envelope::jsonb->>'at_rest_sha256' = $2 \
                   ORDER BY asserted_at ASC LIMIT 1",
                 &[&ty, &hex],
