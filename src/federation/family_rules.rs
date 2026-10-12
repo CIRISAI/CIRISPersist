@@ -673,15 +673,17 @@ pub const NOT_A_FAMILY_RULE: &[(&str, &str)] = &[
     ),
     (
         "holds_bytes:",
-        "an `attestation_type` prefix for blob-holding receipts \
-         (`blobs::HOLDS_BYTES_ATTESTATION_TYPE_PREFIX`), a structural primitive rather than a \
-         `scores` family",
+        "the RETIRED rc6 carrier row type (CC 2.4, CIRISConstitution#141; persist v55.0.0, \
+         CIRISPersist#989): named only by `registry::RETIRED_CARRIER_STEMS`, which refuses a new row \
+         of it at every door and leaves held rows out of the serve reads. It was an \
+         `attestation_type`, never a `scores` family; the holding claim is `custody:ack:v1`",
     ),
     (
         "key_grant:",
         "an `attestation_type` prefix for the CC 3 `key_grant` carrier on the sixteenth \
          replicated kind (`key_grant::KEY_GRANT_ATTESTATION_TYPE_PREFIX`, CIRISPersist#848) — \
-         a structural primitive like `holds_bytes:`, admitted by `apply_replicated_key_grant`'s \
+         a structural primitive like the retired `holds_bytes:`, admitted by \
+         `apply_replicated_key_grant`'s \
          signer rules rather than by a dimension family",
     ),
     (

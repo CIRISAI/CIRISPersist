@@ -414,7 +414,7 @@ pub fn row_types() -> Option<&'static RowTypes> {
     .as_ref()
 }
 
-/// **TEMPORARY — the rc6 carriers rc7 retired, still admitted
+/// **TEMPORARY — an rc6 carrier rc7 retired, still admitted
 /// (CIRISPersist#989).** `(kind, pattern, sample, token)`, copied verbatim
 /// from the rc6 manifest's `_meta.row_types.carriers` (CC 1.0-rc6 @
 /// `3c3e63f`).
@@ -424,14 +424,17 @@ pub fn row_types() -> Option<&'static RowTypes> {
 /// `holds_bytes` becomes the `custody:ack:v1` holding claim (CC 3.1.3.3,
 /// CIRISConstitution#141) and the key-grant set becomes one `scores` row per
 /// recipient on `key_grant:{axis}:v1` (CC 3.3.2, CIRISConstitution#143).
-/// Persist's blob doors and key-grant sets still WRITE both carriers, and
-/// nodes hold rows of both. Re-vendoring rc7 without this line would make
-/// every such row `attestation_type_unregistered`, so the v55 re-vendor
-/// (CIRISPersist#753, slice A0) keeps them admitted here, with the rc6
-/// carrier shape still enforced, until v55 slices A (holding) and B (grants)
-/// move the emitters onto rc7's grammar. Slice B deletes this const.
+/// The v55 re-vendor (CIRISPersist#753, slice A0) kept both rc6 carriers
+/// admitted here while persist still wrote them. v55 slice A
+/// (CIRISPersist#989) moved the holding claim onto `custody:ack:v1` and
+/// removed the `holds_bytes` pattern: a `holds_bytes` row is now a retired
+/// carrier, refused at every door and never served
+/// ([`RETIRED_CARRIER_STEMS`]). The key-grant
+/// set stays admitted, with the rc6 carrier shape still enforced, until
+/// slice B moves its emitter onto per-recipient rows; whichever slice merges
+/// last deletes this const.
 ///
-/// It admits exactly the two rc6 patterns and nothing else: the vendored
+/// It admits exactly the remaining rc6 pattern and nothing else: the vendored
 /// carriers are read first, then these, by the same whole-string,
 /// re-anchored match ([`carrier_row_type`], [`carriers`]).
 /// `tests::the_rc6_carrier_exception_admits_only_the_retired_carriers`
@@ -439,20 +442,28 @@ pub fn row_types() -> Option<&'static RowTypes> {
 /// `tests::the_rc6_carrier_exception_does_not_outlive_v55` fails the build
 /// once `CHANGELOG.md` dates a 55.0.0 or later release while this const is
 /// still non-empty, so v55.0.0 cannot ship with it.
-pub const RC6_RETIRED_CARRIERS_ADMITTED_UNTIL_989: &[(&str, &str, &str, &str)] = &[
-    (
-        "holds_bytes",
-        "^holds_bytes:sha256:[0-9a-f]{8}$",
-        "holds_bytes:sha256:0a1b2c3d",
-        "holds_bytes:sha256:{prefix}",
-    ),
-    (
-        "key_grant",
-        "^key_grant:(content|epoch|stream):v1$",
-        "key_grant:epoch:v1",
-        "key_grant:{axis}:{version}",
-    ),
-];
+pub const RC6_RETIRED_CARRIERS_ADMITTED_UNTIL_989: &[(&str, &str, &str, &str)] = &[(
+    "key_grant",
+    "^key_grant:(content|epoch|stream):v1$",
+    "key_grant:epoch:v1",
+    "key_grant:{axis}:{version}",
+)];
+
+/// v55.0.0 (CIRISPersist#989, CC 2.4 rc7, CIRISConstitution#141) — **the
+/// carrier families rc7 retired whose rows persist refuses at EVERY door and
+/// leaves out of EVERY serve read, whatever the row-type enforcement mode**:
+/// `(type stem, why)`. Matched on the stem, so no spelling of the family —
+/// the rc6 8-hex form or any other — is admitted. The vendored cut carries no
+/// list of retired carriers (`_meta.row_types` names only what IS admitted),
+/// so this is persist's, beside [`RC6_RETIRED_CARRIERS_ADMITTED_UNTIL_989`]
+/// and [`RETIRED_FAMILIES`], read by `row_type::retired_carrier`.
+/// `holds_bytes` became the `custody:ack:v1` holding claim (CC 3.1.3.3); the
+/// key-grant set joins this list in v55 slice B, when its emitter moves.
+pub const RETIRED_CARRIER_STEMS: &[(&str, &str)] = &[(
+    "holds_bytes:",
+    "CC 2.4 rc7 / CIRISConstitution#141: the holding claim is custody:ack:v1 at the content's \
+     scope",
+)];
 
 /// Every carrier row type the row-type gate admits: the vendored cut's
 /// `_meta.row_types.carriers`, then [`RC6_RETIRED_CARRIERS_ADMITTED_UNTIL_989`].
@@ -871,9 +882,9 @@ pub const RETIRED_FAMILIES: &[&str] = &[
     "age_self_declared:{band}:{version}",
     // rc7 (CIRISConstitution#141, CC 2.4 + CC 3.1.9.1): the `holds_bytes`
     // carrier is retired; the holder directory is the `custody:ack:v1` holding
-    // claim at the content's scope (CC 3.1.3.3). Persist's emitters still write
-    // the carrier ROW TYPE until v55 slice A, admitted by
-    // `RC6_RETIRED_CARRIERS_ADMITTED_UNTIL_989`; the dimension row is gone.
+    // claim at the content's scope (CC 3.1.3.3). v55 slice A (CIRISPersist#989)
+    // moved persist's emitters onto it; a carrier row of the type is refused at
+    // every door (`RETIRED_CARRIER_STEMS`); the dimension row is gone.
     "holds_bytes:sha256:{prefix}",
 ];
 
@@ -1064,9 +1075,9 @@ mod tests {
         // The vectors file carries CC's row-type vectors beside the dimension
         // ones, replayed in full by `row_type_invariants::pure::i371`. The
         // carrier half is replayed here against the one reader that answers
-        // "carrier": a vector CC classes `carrier` is one, and the only types
-        // persist answers "carrier" for against CC's refusal are the two the
-        // temporary exception names.
+        // "carrier": a vector CC classes `carrier` is one, and the only type
+        // persist answers "carrier" for against CC's refusal is the one the
+        // temporary exception still names (v55 slice A retired holds_bytes).
         let vectors: serde_json::Value =
             serde_json::from_str(super::super::matcher::VECTORS_JSON).unwrap();
         let rtv = vectors["row_type_vectors"]
@@ -1088,8 +1099,8 @@ mod tests {
         }
         assert_eq!(
             excepted,
-            ["holds_bytes:sha256:0a1b2c3d", "key_grant:epoch:v1"],
-            "the vectors persist departs from are exactly the retired rc6 carriers"
+            ["key_grant:epoch:v1"],
+            "the vector persist departs from is exactly the rc6 carrier still excepted"
         );
         assert!(rtv
             .iter()
@@ -1097,21 +1108,21 @@ mod tests {
     }
 
     /// I700 (CIRISPersist#753, #989) — the temporary carrier exception admits
-    /// the two retired rc6 carriers, byte-exact and whole-string, and nothing
-    /// else: no other kind, no other axis, no other version, no case variant,
-    /// no trailing newline, and no dimension spelling of the same family.
+    /// the retired rc6 carrier it still names (the key-grant set; v55 slice A
+    /// removed `holds_bytes`), byte-exact and whole-string, and nothing else:
+    /// no other kind, no other axis, no other version, no case variant, no
+    /// trailing newline, no dimension spelling of the same family — and no
+    /// `holds_bytes` row of any spelling.
     #[test]
     fn the_rc6_carrier_exception_admits_only_the_retired_carriers() {
         let kinds: Vec<&str> = carriers().iter().map(|c| c.kind.as_str()).collect();
-        assert_eq!(kinds, ["holds_bytes", "key_grant"], "I700");
+        assert_eq!(kinds, ["key_grant"], "I700");
         for (kind, pattern, sample, _) in RC6_RETIRED_CARRIERS_ADMITTED_UNTIL_989 {
             let c = carrier_row_type(sample).expect("I700: the sample is admitted");
             assert_eq!(c.kind, *kind);
             assert_eq!(c.pattern, *pattern);
         }
         for t in [
-            "holds_bytes:sha256:0a1b2c3d",
-            "holds_bytes:sha256:ffffffff",
             "key_grant:content:v1",
             "key_grant:epoch:v1",
             "key_grant:stream:v1",
@@ -1119,6 +1130,8 @@ mod tests {
             assert!(is_registered_carrier_row_type(t), "I700 admits {t:?}");
         }
         for t in [
+            "holds_bytes:sha256:0a1b2c3d",
+            "holds_bytes:sha256:ffffffff",
             "holds_bytes:sha256:0a1b2c3",
             "holds_bytes:sha256:0a1b2c3d0",
             "holds_bytes:sha256:0A1B2C3D",
@@ -1187,8 +1200,12 @@ mod tests {
             let Some(i) = prod.find(decl) else { return 0 };
             let body = &prod[i..];
             let body = &body[..body.find("];").expect("the const closes")];
-            // One `(` per entry tuple after the type annotation's `&[(`.
-            body.matches("    (").count()
+            // One tuple opener per entry, read after the value's `= &[`: a
+            // lone entry's `(` closes that line (`= &[(`) and each of several
+            // stands on its own line; a pattern's own parentheses sit inside
+            // a string, never alone.
+            let rhs = &body[body.find("= &[").expect("the const's value") + 4..];
+            rhs.lines().filter(|l| l.trim() == "(").count()
         }
         let entries = production_entries(include_str!("registry.rs"));
         assert_eq!(

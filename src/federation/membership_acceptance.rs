@@ -16,6 +16,17 @@
 //! instant — needs a live acceptance ([`check_growth_accepted`]). A founding
 //! record admits only the members who signed it ([`check_founding_signers`]),
 //! and a supersede never adds ([`check_supersede_adds_no_member`]).
+//!
+//! v55.0.0 (CIRISPersist#1053, CC 3.2 open admission, CIRISConstitution#142)
+//! — a `public` room that declares `admission: open` admits on a **standing**
+//! proposal: the founder's `membership:proposal:v1` names NO invitee
+//! (`subject_key_ids` empty, "resolved at acceptance"), and any requester's
+//! own `membership:acceptance:v1` naming it is that requester's consent. The
+//! two-consents ruling is whole: the founder's act is a standing offer, the
+//! joiner still signs, and the widening that seats them is admitted under the
+//! room's `consensus_protocol` as now. A standing proposal is admitted only
+//! from a founder of an open public room, and seats nobody once the room is
+//! no longer open ([`RULE_OPEN_PROPOSAL_NOT_OPEN`]).
 
 use super::types::{attestation_tier, attestation_type, cohort_scope};
 use super::{Attestation, Error, FederationDirectory};
@@ -47,6 +58,10 @@ pub const RULE_REPLY_CONFLICT: &str = "membership_reply_conflict";
 pub const RULE_FOUNDING_MEMBER_UNSIGNED: &str = "membership_founding_member_unsigned";
 /// A supersede whose roster adds a member.
 pub const RULE_SUPERSEDE_CANNOT_ADD: &str = "membership_supersede_cannot_add";
+/// v55.0.0 (CIRISPersist#1053, CC 3.2) — a standing proposal (no invitee) for
+/// a group that is not an open `public` room, or not from its founder; or an
+/// acceptance of one whose room is no longer open at the growth.
+pub const RULE_OPEN_PROPOSAL_NOT_OPEN: &str = "membership_open_proposal_not_open";
 
 /// The two retryable rules: rows arrive out of order and persist holds no
 /// deferral queue, so the caller re-submits.
@@ -93,6 +108,13 @@ pub fn membership_row(row: &Attestation) -> Option<MembershipRow> {
 #[must_use]
 pub fn is_invitee_subject_list(row: &Attestation) -> bool {
     membership_row(row) == Some(MembershipRow::Proposal) && row.subject_key_ids.len() == 1
+}
+
+/// v55.0.0 (CIRISPersist#1053, CC 3.2) — a **standing** proposal: one that
+/// names no invitee, addressed to any requester of an open public room.
+#[must_use]
+pub fn is_standing_proposal(row: &Attestation) -> bool {
+    membership_row(row) == Some(MembershipRow::Proposal) && row.subject_key_ids.is_empty()
 }
 
 /// v53.0.0 (CIRISEdge#761) — **the roster plane a membership row is placed
@@ -209,9 +231,12 @@ pub fn check_membership_row_shape(row: &Attestation) -> Result<(), Error> {
     env_role(row)?;
     match kind {
         MembershipRow::Proposal => {
-            if row.subject_key_ids.len() != 1 {
+            // v55.0.0 (CIRISPersist#1053) — one invitee, or none for a standing
+            // proposal of an open public room (judged where the room is held).
+            if row.subject_key_ids.len() > 1 {
                 return Err(Error::InvalidArgument(format!(
-                    "{PROPOSAL_DIMENSION}: names exactly one invitee in subject_key_ids, got {}",
+                    "{PROPOSAL_DIMENSION}: names at most one invitee in subject_key_ids (none \
+                     for a standing proposal of an open public room), got {}",
                     row.subject_key_ids.len()
                 )));
             }
@@ -247,7 +272,9 @@ pub fn check_membership_row_shape(row: &Attestation) -> Result<(), Error> {
 pub(crate) struct Proposal {
     pub(crate) row: Attestation,
     pub(crate) group: String,
-    pub(crate) invitee: String,
+    /// The invitee; `None` for a standing proposal (v55.0.0, CC 3.2), whose
+    /// invitee is whoever accepts it.
+    pub(crate) invitee: Option<String>,
     pub(crate) role: Option<String>,
     pub(crate) expires_at: chrono::DateTime<chrono::Utc>,
 }
@@ -257,7 +284,10 @@ pub(crate) fn as_proposal(row: Attestation) -> Option<Proposal> {
         return None;
     }
     let group = group_of(&row).ok()?;
-    let invitee = row.subject_key_ids.first()?.clone();
+    if row.subject_key_ids.len() > 1 {
+        return None;
+    }
+    let invitee = row.subject_key_ids.first().cloned();
     let role = env_role(&row).ok()?;
     let expires_at = row.expires_at?;
     Some(Proposal {
@@ -274,7 +304,9 @@ fn reply_matches(reply: &Attestation, p: &Proposal) -> bool {
     group_of(reply).is_ok_and(|g| g == p.group)
         && same_membership_plane(&reply.cohort_scope, &p.row.cohort_scope)
         && env_str(reply, "proposal_hash") == Some(p.row.original_content_hash.as_str())
-        && reply.attested_key_id == p.invitee
+        && p.invitee
+            .as_ref()
+            .is_none_or(|i| reply.attested_key_id == *i)
         && (membership_row(reply) != Some(MembershipRow::Acceptance)
             || env_role(reply).ok().flatten() == p.role)
 }
@@ -389,6 +421,9 @@ where
                 Some(&group),
             )
             .await?;
+            if is_standing_proposal(row) {
+                return check_standing_proposal(dir, row, &group).await;
+            }
             check_proposer_under_founder_only(dir, row, &group).await
         }
         MembershipRow::Acceptance | MembershipRow::Decline => {
@@ -404,7 +439,10 @@ where
             };
             let signer =
                 super::admission::admission_identity_for_writer(dir, &row.attesting_key_id).await?;
-            let invitee = super::admission::admission_identity_for_writer(dir, &p.invitee).await?;
+            // v55.0.0 (CIRISPersist#1053) — a standing proposal's invitee is
+            // resolved at acceptance: whoever the reply is attested to.
+            let invitee_key = p.invitee.as_deref().unwrap_or(member);
+            let invitee = super::admission::admission_identity_for_writer(dir, invitee_key).await?;
             if signer != invitee || !reply_matches(row, &p) {
                 return Err(refuse(&group, member, RULE_ACCEPTANCE_MISMATCH));
             }
@@ -420,6 +458,43 @@ where
             }
             Ok(())
         }
+    }
+}
+
+/// v55.0.0 (CIRISPersist#1053, CC 3.2) — a standing proposal is admitted only
+/// for an open `public` room, from one of its founders ("the founder's
+/// standing proposal").
+async fn check_standing_proposal<F>(dir: &F, row: &Attestation, group: &str) -> Result<(), Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let open = membership_plane(&row.cohort_scope) == Some(cohort_scope::TargetPlane::Room)
+        && match dir.lookup_community(group).await? {
+            Some(c) => {
+                super::public_room::is_public_community(&c)
+                    && super::public_room::is_open_admission(&c)
+                    && {
+                        let proposer = super::admission::admission_identity_for_writer(
+                            dir,
+                            &row.attesting_key_id,
+                        )
+                        .await?;
+                        dir.active_community_members(group).await?.iter().any(|m| {
+                            m.role.as_deref() == Some(super::admission::MEMBER_ROLE_FOUNDER)
+                                && (m.key_id == proposer || m.key_id == row.attesting_key_id)
+                        })
+                    }
+            }
+            None => false,
+        };
+    if open {
+        Ok(())
+    } else {
+        Err(refuse(
+            group,
+            &row.attesting_key_id,
+            RULE_OPEN_PROPOSAL_NOT_OPEN,
+        ))
     }
 }
 
@@ -565,6 +640,12 @@ where
             note(RULE_ACCEPTANCE_MISMATCH);
             continue;
         }
+        // v55.0.0 (CIRISPersist#1053, CC 3.2) — a standing proposal seats
+        // only while its room is an open public room.
+        if p.invitee.is_none() && !room_is_open(dir, scope, group).await? {
+            note(RULE_OPEN_PROPOSAL_NOT_OPEN);
+            continue;
+        }
         if a.asserted_at > p.expires_at
             || growth_instant > p.expires_at
             || proposal_withdrawn(dir, &p).await?
@@ -598,6 +679,19 @@ where
         member,
         worst.unwrap_or(RULE_ACCEPTANCE_UNRESOLVED),
     ))
+}
+
+/// Is `group` (at `scope`) an open `public` room held here?
+async fn room_is_open<F>(dir: &F, scope: &str, group: &str) -> Result<bool, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    if membership_plane(scope) != Some(cohort_scope::TargetPlane::Room) {
+        return Ok(false);
+    }
+    Ok(dir.lookup_community(group).await?.is_some_and(|c| {
+        super::public_room::is_public_community(&c) && super::public_room::is_open_admission(&c)
+    }))
 }
 
 /// **The founding rule** (Q1): every member a founding record lists signed
@@ -798,12 +892,17 @@ where
         if proposal_withdrawn(dir, &p).await? {
             continue;
         }
-        let replies = replies_of(dir, &p.invitee).await?;
+        // v55.0.0 (CIRISPersist#1053) — a standing proposal names nobody:
+        // its requesters are not invitees until they accept.
+        let Some(invitee) = p.invitee else {
+            continue;
+        };
+        let replies = replies_of(dir, &invitee).await?;
         let declined = replies_to(&replies, &p.row.attestation_id)
             .iter()
             .any(|r| membership_row(r) == Some(MembershipRow::Decline));
         if !declined {
-            out.insert(p.invitee);
+            out.insert(invitee);
         }
     }
     Ok(out.into_iter().collect())
@@ -845,6 +944,27 @@ pub fn proposal_input(
     );
     input.subject_key_ids = vec![invitee.to_owned()];
     input.expires_at = Some(expires_at);
+    input
+}
+
+/// v55.0.0 (CIRISPersist#1053, CC 3.2) — the emit input for a founder's
+/// STANDING proposal to an open public room: [`proposal_input`] at
+/// `community` with no invitee (`subject_key_ids` empty, resolved at
+/// acceptance).
+#[must_use]
+pub fn standing_proposal_input(
+    community_key_id: &str,
+    role: Option<&str>,
+    expires_at: chrono::DateTime<chrono::Utc>,
+) -> super::types::EmitAttestationInput {
+    let mut input = proposal_input(
+        cohort_scope::COMMUNITY,
+        community_key_id,
+        "",
+        role,
+        expires_at,
+    );
+    input.subject_key_ids = Vec::new();
     input
 }
 

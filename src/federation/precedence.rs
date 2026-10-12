@@ -196,7 +196,7 @@ pub fn retraction_entitled(g: &Attestation, target: &Attestation) -> bool {
         return true;
     }
     // v53.1.2 (CIRISPersist#984 row 13) — a registered CARRIER row (a
-    // `holds_bytes` claim, a `key_grant` set) is the holder's self-attestation
+    // `key_grant` set; the retired `holds_bytes` claim) is the holder's self-attestation
     // and only the holder retracts it: a carrier has no subjects, and a
     // resolved consent-revocation rule (arm 3) is about a Contribution, never
     // about a holder's claim. Without this a replicated `withdraws` carrying a
@@ -207,6 +207,14 @@ pub fn retraction_entitled(g: &Attestation, target: &Attestation) -> bool {
         super::row_type::classify(&target.attestation_type),
         super::row_type::RowTypeClass::Carrier(_)
     ) {
+        return false;
+    }
+    // v55.0.0 (CIRISPersist#989, CC 3.1.3.3 rule 4) — the holding claim is
+    // `custody:ack:v1`, and it too is retracted by its signer alone: "nobody
+    // withdraws another device's report" (the door refuses it,
+    // `custody_ack::check_custody_withdraws_signer`; this fold never honours
+    // one that arrived some other way).
+    if super::custody_ack::is_custody_row(target) {
         return false;
     }
     // v53.1.2 (CIRISPersist#984 row 12, CC 2.4.1.1) — a `recants` is the

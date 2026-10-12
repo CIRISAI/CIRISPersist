@@ -2847,8 +2847,9 @@ pub(crate) mod bodies {
         );
         assert_nothing_written(d, &forged.notice).await;
 
-        // A person's device holds bytes: its `holds_bytes` claim (the holder
-        // attests itself) is a local holding row too.
+        // A person's device holds bytes: its holding claim (v55.0.0:
+        // `custody:ack:v1` `here`; the holder attests itself) is a local
+        // holding row too.
         const BOB: &str = "bob-human-holder-i821";
         ts::register_hybrid_key_as(dir, BOB, BOB, crate::federation::types::identity_type::USER)
             .await;
@@ -2858,12 +2859,15 @@ pub(crate) mod bodies {
             BOB,
             BOB,
             &serde_json::json!({
-                "kind": "holds_bytes",
+                "dimension": crate::federation::custody_ack::CUSTODY_ACK_DIMENSION,
+                "custody_state": "here",
                 "evidence_refs": [hex::encode(held)],
                 "size": 12,
+                "score": 1.0,
+                "confidence": 1.0,
             }),
         );
-        claim.attestation_type = crate::federation::holds_bytes_attestation_type(&held);
+        claim.attestation_type = "scores".into();
         claim.weight = None;
         ts::reseal(&mut claim);
         dir.put_attestation(SignedAttestation { attestation: claim })

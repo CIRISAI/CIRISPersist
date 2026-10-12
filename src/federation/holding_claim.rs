@@ -1,0 +1,950 @@
+//! v55.0.0 (CIRISPersist#989, CC 3.1.3.3 / 2.4 / 5.3.2.1, CIRISConstitution#141)
+//! — **the ONE holding claim.**
+//!
+//! `custody:ack:v1` with `custody_state: here` is the holding claim of the
+//! mesh at every tier. It replaces the retired `holds_bytes:sha256:{prefix}`
+//! carrier, which was a second holding claim with its audience hard-coded to
+//! `federation`, so community content advertised its existence to everyone
+//! and the bytes-plane fold had to exclude it by type (CC 2.4).
+//!
+//! CC 3.1.3.3's five rules, and where each lives:
+//!
+//! 1. **Scope is the content's.** A claim is placed at the `cohort_scope` of
+//!    the blob it is about: `federation` for Commons-tier content (plaintext,
+//!    which includes `public` and `infrastructure` rooms), the bytes' own
+//!    `self` / `family` / `community` / `affiliations` cohort otherwise.
+//!    [`ClaimScope::of_content`] is the one derivation, and every door that
+//!    emits a claim takes the scope from the content it stores, never from a
+//!    caller. The admission gate refuses a claim whose scope is not its
+//!    content's ([`check_holding_claim_scope`]) wherever this node holds the
+//!    content.
+//! 2. **Audience follows from the one rule** (CC 6.1.5.3): the claim is a row
+//!    at the content's scope, so replication delivers it exactly as any row
+//!    at that scope. At `federation` the `here` rows ARE the holder directory
+//!    ([`live_holders`]).
+//! 3. **Never a content binding.** `envelope_binds_content` excludes the
+//!    `custody:` family; the bytes-plane fold reads liveness from the
+//!    content's own rows only.
+//! 4. **Retracted by its signer alone** — a later `none`, or the signer's own
+//!    `withdraws` ([`check_custody_withdraws_signer`](super::custody_ack::check_custody_withdraws_signer)).
+//! 5. **Freshness is the row's.** A claim carries `expires_at` = its signed
+//!    instant + 72 h ([`CUSTODY_LIVE_SECS`]); no second TTL exists.
+//!
+//! # Emission
+//!
+//! [`emit_holding_claim`] announces a claim for a row this node ALREADY
+//! stores, through [`BlobStorage::put_holding_claim`]. The write doors that
+//! store and announce in one transaction (`put_blob_with_scope`,
+//! `adopt_sealed_blob_at`) rebuild the same row through
+//! [`prepare_holding_claim_row`]. Either way the row is
+//! [`holding_claim_row`], signed by [`sign_holding_claim`], admitted through
+//! the custody gate (audience at a bounded scope).
+//!
+//! # Legacy `holds_bytes` rows
+//!
+//! A `holds_bytes:sha256:{prefix}` row a node already holds is, per CC 2.4,
+//! "reported to the operator, … neither served nor replicated, and … not
+//! deleted": it stays stored, `row_type_report` counts it, the serve reads
+//! leave it out, and no fold reads it. Its 24 h freshness lapsed with the
+//! carrier; nothing re-emits it (CIRISPersist#989 item 4). A new one is
+//! refused `attestation_type_unregistered` at every door, whatever the
+//! row-type enforcement mode
+//! ([`registry::RETIRED_CARRIER_STEMS`](super::namespace::registry::RETIRED_CARRIER_STEMS)).
+
+use chrono::{DateTime, Utc};
+
+use super::custody_ack::{
+    custody_ack_envelope, parse_custody_ack, CustodyState, CUSTODY_ACK_DIMENSION, CUSTODY_LIVE_SECS,
+};
+use super::types::cohort_scope::{self as cs, CryptoTier};
+use super::{Attestation, BlobError, BlobStorage, Error, FederationDirectory, PutBlobAttestation};
+
+/// **Where a holding claim is placed** (CC 3.1.3.3 rule 1): the content's
+/// cohort, as the claim's `cohort_scope` and the cohort target its envelope
+/// names (`family_key_id` for a family, `community_id` for a room, none for
+/// `self` and the commons).
+///
+/// Constructed only from the content ([`Self::of_content`]); no door takes a
+/// claim scope from a caller.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimScope {
+    cohort_scope: String,
+    target: Option<String>,
+}
+
+impl ClaimScope {
+    /// **The one derivation.** `tier` is the tier the content is stored at
+    /// (the row's resolved tier), `cohort_scope` the cohort the write named,
+    /// `group` the group it named (the owner for `self`, the family, the
+    /// room).
+    ///
+    /// - [`CryptoTier::Plaintext`] — the Commons tier, which is the commons
+    ///   scopes AND the plaintext rooms (`public`, `infrastructure`): the
+    ///   claim is at `federation` with no target. "There is nothing to hide
+    ///   at this tier" (CC 3.2).
+    /// - a sealed tier — the content's own cohort, with its group as the
+    ///   target. `self` names none (a self report is about the device's own
+    ///   principal); `family`, `community` and `affiliations` must name it.
+    ///
+    /// # Errors
+    ///
+    /// [`BlobError::InvalidArgument`] `holding_claim_scope_unresolved` when a
+    /// sealed family or room content names no group, or the cohort is not a
+    /// sealed one.
+    pub fn of_content(
+        tier: CryptoTier,
+        cohort_scope: &str,
+        group: Option<&str>,
+    ) -> Result<Self, BlobError> {
+        if tier == CryptoTier::Plaintext {
+            return Ok(Self {
+                cohort_scope: cs::FEDERATION.to_owned(),
+                target: None,
+            });
+        }
+        let group = group.filter(|g| !g.is_empty());
+        match (cohort_scope, group) {
+            (cs::SELF, _) => Ok(Self {
+                cohort_scope: cs::SELF.to_owned(),
+                target: None,
+            }),
+            (cs::FAMILY | cs::COMMUNITY | cs::AFFILIATIONS, Some(g)) => Ok(Self {
+                cohort_scope: cohort_scope.to_owned(),
+                target: Some(g.to_owned()),
+            }),
+            (cs::FAMILY | cs::COMMUNITY | cs::AFFILIATIONS, None) => {
+                Err(BlobError::InvalidArgument(format!(
+                    "{HOLDING_CLAIM_SCOPE_UNRESOLVED}: {cohort_scope} content at the {tier:?} tier \
+                     names no {cohort_scope}, so its holding claim has no cohort to be placed at \
+                     (CC 3.1.3.3 rule 1: the claim is at the content's scope)"
+                )))
+            }
+            _ => Err(BlobError::InvalidArgument(format!(
+                "{HOLDING_CLAIM_SCOPE_UNRESOLVED}: {cohort_scope:?} content at the sealed {tier:?} \
+                 tier — a sealed blob is self, family, community or affiliations content"
+            ))),
+        }
+    }
+
+    /// The claim's `cohort_scope`.
+    #[must_use]
+    pub fn cohort_scope(&self) -> &str {
+        &self.cohort_scope
+    }
+
+    /// The cohort the claim's envelope names, if any.
+    #[must_use]
+    pub fn target(&self) -> Option<&str> {
+        self.target.as_deref()
+    }
+
+    /// Is this the holder directory scope (`federation`)?
+    #[must_use]
+    pub fn is_directory(&self) -> bool {
+        self.cohort_scope == cs::FEDERATION
+    }
+
+    /// The scope a stored claim row is placed at: its `cohort_scope` and the
+    /// cohort target its envelope names.
+    ///
+    /// # Errors
+    ///
+    /// The envelope's cohort-target aliases disagree.
+    pub fn of_row(row: &Attestation) -> Result<Self, Error> {
+        Ok(Self {
+            cohort_scope: row.cohort_scope.clone(),
+            target: super::admission::envelope_cohort_target(&row.attestation_envelope)?
+                .map(str::to_owned),
+        })
+    }
+}
+
+/// Refusal token: the content names no group for its holding claim.
+pub const HOLDING_CLAIM_SCOPE_UNRESOLVED: &str = "holding_claim_scope_unresolved";
+
+/// Refusal token (CC 3.1.3.3 rule 1): a holding claim placed at a scope that
+/// is not its content's, judged where this node holds the content.
+pub const CUSTODY_ACK_SCOPE_MISMATCH: &str = "custody_ack_scope_mismatch";
+
+/// **The ONE definition of a holding-claim row**, ready to sign: a `scores`
+/// row on [`CUSTODY_ACK_DIMENSION`], `custody_state: here`, attested by and
+/// about `holder`, citing the blob's full digest in `evidence_refs`, carrying
+/// its `size`, placed at `scope`, with `expires_at` = the truncated signed
+/// instant + [`CUSTODY_LIVE_SECS`] (CC 3.1.3.3 rule 5). The scrub fields are
+/// blank for whoever fills them.
+///
+/// A pure function of its inputs, so the door that stores the claim REBUILDS
+/// these bytes and checks the caller signed them
+/// ([`prepare_holding_claim_row`]) — the party that mints the bytes stamps,
+/// the party that receives them checks.
+///
+/// # Errors
+///
+/// [`BlobError::InvalidArgument`] when `size` is zero (CC 5.3.2.5: every blob
+/// carries its size) or `scope` cannot carry a custody report.
+pub fn holding_claim_row(
+    sha256: &[u8; 32],
+    holder_key_id: &str,
+    attestation_id: &str,
+    asserted_at: DateTime<Utc>,
+    size: u64,
+    scope: &ClaimScope,
+) -> Result<Attestation, BlobError> {
+    if size == 0 {
+        return Err(BlobError::InvalidArgument(
+            "holding claim: size must be the positive byte length of the blob (CC 5.3.2.5: \
+             every blob carries its size, checked first)"
+                .into(),
+        ));
+    }
+    let envelope = custody_ack_envelope(
+        sha256,
+        CustodyState::Here,
+        Some(size),
+        scope.cohort_scope(),
+        scope.target(),
+    )
+    .map_err(|e| BlobError::InvalidArgument(e.to_string()))?;
+    let asserted_at = super::admission::truncate_to_substrate_resolution(asserted_at);
+    let mut row = Attestation {
+        attestation_id: attestation_id.to_owned(),
+        attesting_key_id: holder_key_id.to_owned(),
+        // A holder self-report: the device the claim is about signs it.
+        attested_key_id: holder_key_id.to_owned(),
+        attestation_type: super::types::attestation_type::SCORES.to_owned(),
+        weight: None,
+        asserted_at,
+        expires_at: Some(asserted_at + chrono::Duration::seconds(CUSTODY_LIVE_SECS)),
+        attestation_envelope: envelope,
+        original_content_hash: String::new(),
+        scrub_signature_classical: String::new(),
+        scrub_signature_pqc: None,
+        scrub_key_id: String::new(),
+        scrub_timestamp: asserted_at,
+        pqc_completed_at: None,
+        persist_row_hash: String::new(),
+        subject_key_ids: Vec::new(),
+        withdraws_admission_rule: None,
+        cohort_scope: scope.cohort_scope().to_owned(),
+        // Stated, never defaulted (#652): the claim rides the federation
+        // plane, and its cohort_scope decides who receives it.
+        tier: super::types::attestation_tier::FEDERATION.to_owned(),
+        promoted_at: None,
+        additional_scrubs: Vec::new(),
+    };
+    super::envelope::stamp_signed_instants(&mut row)
+        .map_err(|e| BlobError::Backend(format!("holding claim instants: {e}")))?;
+    super::envelope::RowMirror::stamp_row(&mut row)
+        .map_err(|e| BlobError::Backend(format!("holding claim mirror: {e}")))?;
+    Ok(row)
+}
+
+/// **Sign a holding claim** for `sha256` at `scope` as this node: the
+/// [`holding_claim_row`] envelope, the produce-side canonicalizer, the
+/// signer's DERIVED key id as attester and `scrub_key_id` (I23).
+///
+/// HYBRID/PQC ONLY (CIRISPersist#851 §20.5): a claim rides the federation
+/// plane and every peer's ingest gate demands both halves, so a `local` with
+/// no ML-DSA-65 key refuses here rather than producing a claim no peer will
+/// admit.
+///
+/// # Errors
+///
+/// [`BlobError::AttestationEmissionFailed`] when `local` has no PQC half;
+/// [`BlobError::InvalidArgument`] as [`holding_claim_row`].
+pub async fn sign_holding_claim(
+    local: &crate::signing::LocalSigner,
+    sha256: &[u8; 32],
+    attestation_id: uuid::Uuid,
+    now: DateTime<Utc>,
+    size: u64,
+    scope: &ClaimScope,
+) -> Result<PutBlobAttestation, BlobError> {
+    use base64::engine::general_purpose::STANDARD as B64;
+    use base64::Engine as _;
+    use sha2::{Digest, Sha256};
+
+    let holder = local.derived_key_id();
+    let row = holding_claim_row(
+        sha256,
+        &holder,
+        &attestation_id.to_string(),
+        now,
+        size,
+        scope,
+    )?;
+    let canonical = crate::verify::canonical::ceg_produce_canonicalize(&row.attestation_envelope)
+        .map_err(|e| {
+        BlobError::InvalidArgument(format!("canonicalize holding claim envelope: {e}"))
+    })?;
+    let original_content_hash_hex = hex::encode(Sha256::digest(&canonical));
+    let sig = local.sign_hybrid(&canonical).await.map_err(|e| {
+        BlobError::AttestationEmissionFailed(match e {
+            crate::signing::LocalSignerError::PqcNotConfigured => format!(
+                "hybrid-only: {holder} has no ML-DSA-65 key, so it cannot sign a holding claim; \
+                 a classical-only producer does not announce (CIRISPersist#851 §20.5 / CC \
+                 5.3.2.4.3.1)"
+            ),
+            other => format!("sign_hybrid: {other}"),
+        })
+    })?;
+    Ok(PutBlobAttestation {
+        attesting_key_id: holder.clone(),
+        attestation_id: attestation_id.to_string(),
+        size,
+        original_content_hash_hex,
+        scrub_signature_classical: B64.encode(&sig.classical.signature),
+        scrub_signature_pqc: Some(B64.encode(&sig.pqc.signature)),
+        scrub_key_id: holder,
+        scrub_timestamp: row.asserted_at,
+        asserted_at: row.asserted_at,
+    })
+}
+
+/// A holding-claim row a backend inserts verbatim: the admitted row plus the
+/// two serialized columns both dialects store beside it.
+#[derive(Debug, Clone)]
+pub struct PreparedHoldingClaim {
+    /// The admitted row, every column populated.
+    pub row: Attestation,
+    /// `attestation_envelope` as stored (JSON text).
+    pub envelope_text: String,
+    /// `original_content_hash` decoded from the caller's hex.
+    pub original_content_hash: Vec<u8>,
+}
+
+/// **Rebuild and ADMIT the holding claim** for `sha256` at `scope` from the
+/// caller's signed components: rebuild the row ([`holding_claim_row`]),
+/// copy the caller's scrub in, run the door's own gates (the future-skew
+/// bound, and the caller's hash covering the bytes persist rebuilt —
+/// [`super::blobs::check_put_blob_admission`]), parse it back as a custody
+/// report, and stamp the row hash. Refuses before anything is written.
+///
+/// The audience half of the custody gate needs the directory and is asked
+/// by the async caller ([`check_holding_claim_audience`]).
+///
+/// # Errors
+///
+/// As [`holding_claim_row`] and `check_put_blob_admission`.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub(crate) fn prepare_holding_claim_row(
+    sha256: &[u8; 32],
+    claim: &PutBlobAttestation,
+    scope: &ClaimScope,
+) -> Result<PreparedHoldingClaim, BlobError> {
+    let original_content_hash = hex::decode(&claim.original_content_hash_hex).map_err(|e| {
+        BlobError::InvalidArgument(format!("original_content_hash hex decode: {e}"))
+    })?;
+    let mut row = holding_claim_row(
+        sha256,
+        &claim.attesting_key_id,
+        &claim.attestation_id,
+        claim.asserted_at,
+        claim.size,
+        scope,
+    )?;
+    row.original_content_hash = claim.original_content_hash_hex.clone();
+    row.scrub_signature_classical = claim.scrub_signature_classical.clone();
+    row.scrub_signature_pqc = claim.scrub_signature_pqc.clone();
+    row.scrub_key_id = claim.scrub_key_id.clone();
+    row.scrub_timestamp = claim.scrub_timestamp;
+    super::blobs::check_put_blob_admission(&row, &claim.original_content_hash_hex, Utc::now())?;
+    parse_custody_ack(&row)
+        .map_err(|e| BlobError::InvalidArgument(e.to_string()))?
+        .ok_or_else(|| {
+            BlobError::Backend("holding claim row did not parse as a custody report".into())
+        })?;
+    row.persist_row_hash = super::types::compute_persist_row_hash(&row)
+        .map_err(|e| BlobError::Backend(format!("persist_row_hash: {e}")))?;
+    let envelope_text = serde_json::to_string(&row.attestation_envelope)
+        .map_err(|e| BlobError::Backend(format!("envelope serialize: {e}")))?;
+    Ok(PreparedHoldingClaim {
+        row,
+        envelope_text,
+        original_content_hash,
+    })
+}
+
+/// **The pre-transaction half of `BlobStorage::put_holding_claim`**, shared by
+/// both backends: the scope must be the stored content's
+/// (`custody_ack_scope_mismatch`), the claim's size the stored length (AV-89),
+/// the row rebuilt and admitted ([`prepare_holding_claim_row`]) and the holder
+/// in the cohort ([`check_holding_claim_audience`]). Returns the prepared row
+/// for the backend's transaction, which re-checks the row is still held.
+///
+/// # Errors
+///
+/// [`BlobError::NotHeld`] when nothing is held; the refusals above.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub(crate) async fn prepare_announcement<B>(
+    backend: &B,
+    sha256: &[u8; 32],
+    claim: &PutBlobAttestation,
+    scope: &ClaimScope,
+) -> Result<PreparedHoldingClaim, BlobError>
+where
+    B: BlobStorage + FederationDirectory + Sync,
+{
+    let not_held = || BlobError::NotHeld {
+        sha256_hex: hex::encode(sha256),
+    };
+    let want = content_claim_scope(backend, sha256)
+        .await?
+        .ok_or_else(not_held)?;
+    if &want != scope {
+        return Err(BlobError::InvalidArgument(format!(
+            "{CUSTODY_ACK_SCOPE_MISMATCH}: a holding claim about {} at {} {:?}, but the stored \
+             content is at {} {:?} (CC 3.1.3.3 rule 1)",
+            hex::encode(sha256),
+            scope.cohort_scope,
+            scope.target,
+            want.cohort_scope,
+            want.target
+        )));
+    }
+    let size = backend
+        .blob_head(sha256)
+        .await?
+        .ok_or_else(not_held)?
+        .size_bytes;
+    if claim.size != size {
+        return Err(BlobError::InvalidArgument(format!(
+            "holding claim declares size {} but the stored bytes are {size} (CC 5.3.2.5 / AV-89: \
+             a holder announces exactly what it holds)",
+            claim.size
+        )));
+    }
+    let prepared = prepare_holding_claim_row(sha256, claim, scope)?;
+    check_holding_claim_audience(backend, &prepared.row).await?;
+    Ok(prepared)
+}
+
+/// **The audience half of the custody gate** for a holding claim a blob door
+/// is about to write (CC 3.1.3.3 rule 2): the holder must be in the claim's
+/// cohort. Trivially true at `federation`.
+///
+/// # Errors
+///
+/// `custody_ack_outside_cohort` (as the attestation door refuses it).
+pub async fn check_holding_claim_audience(
+    dir: &dyn FederationDirectory,
+    row: &Attestation,
+) -> Result<(), BlobError> {
+    super::custody_ack::check_custody_ack_admission(dir, row)
+        .await
+        .map_err(|e| BlobError::InvalidArgument(e.to_string()))
+}
+
+/// **The claim scope of the content this node stores for `sha256`**, or
+/// `None` when no row is held: the one derivation ([`ClaimScope::of_content`])
+/// over the row's own columns — its resolved tier, its cohort, and its group
+/// (the sealing epoch's community where a binding exists, else the group the
+/// write recorded).
+///
+/// # Errors
+///
+/// Backend errors; `holding_claim_scope_unresolved` for a sealed family or
+/// room row that records no group.
+pub async fn content_claim_scope<B>(
+    backend: &B,
+    sha256: &[u8; 32],
+) -> Result<Option<ClaimScope>, BlobError>
+where
+    B: BlobStorage + Sync + ?Sized,
+{
+    let Some(head) = backend.blob_head(sha256).await? else {
+        return Ok(None);
+    };
+    if head.crypto_tier == CryptoTier::Plaintext {
+        return ClaimScope::of_content(CryptoTier::Plaintext, &head.cohort_scope, None).map(Some);
+    }
+    let bound = match head.cohort_scope.as_str() {
+        cs::COMMUNITY | cs::AFFILIATIONS => backend
+            .community_dek_blob_epoch(sha256)
+            .await?
+            .map(|(community, _, _)| community),
+        _ => None,
+    };
+    let group = match bound {
+        Some(c) => Some(c),
+        None => backend
+            .blob_provenance(sha256)
+            .await?
+            .and_then(|p| p.group_key_id),
+    };
+    ClaimScope::of_content(head.crypto_tier, &head.cohort_scope, group.as_deref()).map(Some)
+}
+
+/// **CC 3.1.3.3 rule 1 at admission** — a holding claim (`custody:ack:v1`
+/// `here` or `none`) about a blob this node HOLDS must be placed at that
+/// blob's claim scope ([`content_claim_scope`]). A claim about a blob this
+/// node does not hold is not judged here: the content's scope is not known to
+/// it (a commons directory row about bytes held elsewhere is the ordinary
+/// case). A no-op off the custody leaf.
+///
+/// # Errors
+///
+/// `custody_ack_scope_mismatch`.
+pub async fn check_holding_claim_scope<B>(backend: &B, row: &Attestation) -> Result<(), Error>
+where
+    B: super::renditions::HeldBlobScope + Sync + ?Sized,
+{
+    let Some(ack) = parse_custody_ack(row)? else {
+        return Ok(());
+    };
+    let Ok(sha) = <[u8; 32]>::try_from(hex::decode(&ack.blob_sha256_hex).unwrap_or_default())
+    else {
+        return Ok(());
+    };
+    // A held sealed row that records no group (pre-V177) has no derivable
+    // target: the content's scope cannot be judged here, as for a blob not
+    // held.
+    let want = match backend.held_claim_scope(&sha).await {
+        Ok(Some(w)) => w,
+        Ok(None) => return Ok(()),
+        Err(Error::InvalidArgument(m)) if m.contains(HOLDING_CLAIM_SCOPE_UNRESOLVED) => {
+            return Ok(())
+        }
+        Err(e) => return Err(e),
+    };
+    let got = ClaimScope::of_row(row)?;
+    // A self report names no target; compare the cohort alone there.
+    let agrees = got.cohort_scope == want.cohort_scope
+        && (want.cohort_scope == cs::SELF || got.target == want.target);
+    if agrees {
+        Ok(())
+    } else {
+        Err(Error::InvalidArgument(format!(
+            "{CUSTODY_ACK_SCOPE_MISMATCH}: a holding claim about {} is placed at {} {:?}, but the \
+             content is at {} {:?} — a claim is placed at its content's scope, never one its \
+             emitter chooses (CC 3.1.3.3 rule 1)",
+            ack.blob_sha256_hex, got.cohort_scope, got.target, want.cohort_scope, want.target
+        )))
+    }
+}
+
+/// What [`emit_holding_claim`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HoldingClaimOutcome {
+    /// A claim was signed and stored.
+    Emitted {
+        /// The claim's `attestation_id`.
+        attestation_id: String,
+        /// Where it was placed.
+        scope: ClaimScope,
+    },
+    /// This node is not in the content's cohort, so it cannot claim (CC
+    /// 3.1.3.3 rule 2: the holder of a bounded-cohort claim is in the
+    /// cohort). Decided structurally, before signing; nothing was written.
+    /// Never at `federation`, where everyone is audience.
+    NotInCohort {
+        /// The scope the claim would have been placed at.
+        scope: ClaimScope,
+    },
+}
+
+impl HoldingClaimOutcome {
+    /// Was a claim stored?
+    #[must_use]
+    pub fn emitted(&self) -> bool {
+        matches!(self, Self::Emitted { .. })
+    }
+}
+
+/// **Emit this node's holding claim for a blob it already stores** (CC
+/// 3.1.3.3): the one shared emission every door after the bytes reaches.
+///
+/// The scope is the stored content's ([`content_claim_scope`]); the size is
+/// the stored length. At a bounded scope the claim is emitted only when this
+/// node is in the cohort ([`HoldingClaimOutcome::NotInCohort`] otherwise — an
+/// unclaimed node, or a server-class occurrence holding its owner's `self`
+/// content, reports nothing). Signed by `local` (hybrid only) and stored
+/// through [`BlobStorage::put_holding_claim`], which checks the row is still
+/// held and runs the custody gate.
+///
+/// A chunk DAG is claimed by its manifest; the write doors that call this
+/// hold every chunk by construction. A node asking for a DAG it adopted uses
+/// `put_custody_ack`, which checks completeness first.
+///
+/// # Errors
+///
+/// [`BlobError::NotHeld`] when no row is held; signing and admission errors.
+pub async fn emit_holding_claim<B>(
+    backend: &B,
+    local: &crate::signing::LocalSigner,
+    sha256: &[u8; 32],
+    now: DateTime<Utc>,
+) -> Result<HoldingClaimOutcome, BlobError>
+where
+    B: BlobStorage + FederationDirectory + Sync,
+{
+    let not_held = || BlobError::NotHeld {
+        sha256_hex: hex::encode(sha256),
+    };
+    let scope = content_claim_scope(backend, sha256)
+        .await?
+        .ok_or_else(not_held)?;
+    let size = backend
+        .blob_head(sha256)
+        .await?
+        .ok_or_else(not_held)?
+        .size_bytes;
+    let holder = local.derived_key_id();
+    if !scope.is_directory()
+        && !super::custody_ack::holder_in_cohort(
+            backend,
+            &holder,
+            scope.cohort_scope(),
+            scope.target(),
+        )
+        .await
+        .map_err(|e| BlobError::Backend(format!("holding claim audience: {e}")))?
+    {
+        return Ok(HoldingClaimOutcome::NotInCohort { scope });
+    }
+    let attestation_id = uuid::Uuid::new_v4();
+    let claim = sign_holding_claim(local, sha256, attestation_id, now, size, &scope).await?;
+    backend.put_holding_claim(sha256, claim, &scope).await?;
+    Ok(HoldingClaimOutcome::Emitted {
+        attestation_id: attestation_id.to_string(),
+        scope,
+    })
+}
+
+// ── the holder directory ─────────────────────────────────────────────
+
+/// One holder's latest admitted claim about one blob, folded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HolderClaimState {
+    /// The holder (attester).
+    pub holder_key_id: String,
+    /// The latest non-retired report's state.
+    pub state: CustodyState,
+    /// Its size, for `here`.
+    pub size: Option<u64>,
+    /// Its signed instant.
+    pub instant: DateTime<Utc>,
+    /// Its `attestation_id`.
+    pub attestation_id: String,
+    /// Is it live at the reader's `now` (CC 3.1.3.3 rule 5)?
+    pub live: bool,
+}
+
+/// **Every holder's latest claim about `sha256`**, re-derived from the rows:
+/// for each attester of a `custody:ack:v1` row citing the blob, its latest
+/// non-retired report (by signed instant, ties by row hash), folded exactly
+/// as the custody view folds a device ([`super::custody_ack::custody_acks_of`]).
+/// Sorted by holder.
+///
+/// # Errors
+///
+/// Directory errors.
+pub async fn holder_claims<D>(
+    dir: &D,
+    sha256: &[u8; 32],
+    now: DateTime<Utc>,
+) -> Result<Vec<HolderClaimState>, Error>
+where
+    D: FederationDirectory + ?Sized,
+{
+    let hex_sha = hex::encode(sha256);
+    let mut holders: Vec<String> = dir
+        .list_attestations_citing_by_dimension(CUSTODY_ACK_DIMENSION, &hex_sha)
+        .await?
+        .into_iter()
+        .map(|r| r.attesting_key_id)
+        .collect();
+    holders.sort();
+    holders.dedup();
+    let mut out = Vec::with_capacity(holders.len());
+    for h in holders {
+        let acks = super::custody_ack::custody_acks_of(dir, &h, &hex_sha).await?;
+        let Some(latest) = acks
+            .iter()
+            .max_by(|a, b| (a.instant, &a.row_hash).cmp(&(b.instant, &b.row_hash)))
+        else {
+            continue;
+        };
+        out.push(HolderClaimState {
+            holder_key_id: h,
+            state: latest.state,
+            size: latest.size,
+            instant: latest.instant,
+            attestation_id: latest.attestation_id.clone(),
+            live: super::custody_ack::is_live(latest.instant, now),
+        });
+    }
+    Ok(out)
+}
+
+/// **The holder directory read** (CC 5.3.2.1): every holder whose latest
+/// claim about `sha256` is a LIVE `here`. Sorted.
+///
+/// # Errors
+///
+/// Directory errors.
+pub async fn live_holders<D>(
+    dir: &D,
+    sha256: &[u8; 32],
+    now: DateTime<Utc>,
+) -> Result<Vec<String>, Error>
+where
+    D: FederationDirectory + ?Sized,
+{
+    Ok(holder_claims(dir, sha256, now)
+        .await?
+        .into_iter()
+        .filter(|c| c.live && c.state == CustodyState::Here)
+        .map(|c| c.holder_key_id)
+        .collect())
+}
+
+/// **Every blob `holder` claims `here`** (the inverse read): the blobs its
+/// `custody:ack:v1` rows cite whose latest non-retired report by `holder` is
+/// `here`, live at `now` when `live_only`. Sorted, deduplicated.
+///
+/// # Errors
+///
+/// Directory errors.
+pub async fn held_by<D>(
+    dir: &D,
+    holder_key_id: &str,
+    now: DateTime<Utc>,
+    live_only: bool,
+) -> Result<Vec<[u8; 32]>, Error>
+where
+    D: FederationDirectory + ?Sized,
+{
+    let mut shas: Vec<String> = dir
+        .list_attestations_by_dimension_prefix(holder_key_id, CUSTODY_ACK_DIMENSION)
+        .await?
+        .iter()
+        .filter_map(|r| parse_custody_ack(r).ok().flatten())
+        .map(|a| a.blob_sha256_hex)
+        .collect();
+    shas.sort();
+    shas.dedup();
+    let mut out = Vec::with_capacity(shas.len());
+    for hex_sha in shas {
+        let acks = super::custody_ack::custody_acks_of(dir, holder_key_id, &hex_sha).await?;
+        let Some(latest) = acks
+            .iter()
+            .max_by(|a, b| (a.instant, &a.row_hash).cmp(&(b.instant, &b.row_hash)))
+        else {
+            continue;
+        };
+        if latest.state != CustodyState::Here
+            || (live_only && !super::custody_ack::is_live(latest.instant, now))
+        {
+            continue;
+        }
+        if let Ok(sha) = <[u8; 32]>::try_from(hex::decode(&hex_sha).unwrap_or_default()) {
+            out.push(sha);
+        }
+    }
+    Ok(out)
+}
+
+/// The `attestation_id`s of `holder`'s own non-retired `here` claims about
+/// `sha256` — what an eviction retracts with the holder's own `withdraws`
+/// (rule 4: the signer retracts; nobody else).
+///
+/// # Errors
+///
+/// Directory errors.
+pub async fn own_here_claims<D>(
+    dir: &D,
+    holder_key_id: &str,
+    sha256: &[u8; 32],
+) -> Result<Vec<String>, Error>
+where
+    D: FederationDirectory + ?Sized,
+{
+    Ok(
+        super::custody_ack::custody_acks_of(dir, holder_key_id, &hex::encode(sha256))
+            .await?
+            .into_iter()
+            .filter(|a| a.state == CustodyState::Here)
+            .map(|a| a.attestation_id)
+            .collect(),
+    )
+}
+
+// ── the BlobStorage holder doors, once ───────────────────────────────
+
+/// **`BlobStorage::list_holders`, one implementation for every backend**:
+/// [`live_holders`] — every holder whose latest claim about `sha256` is a live
+/// `here`. When this node holds the bytes itself, freshness is not asked
+/// (v3.6.4, CIRISPersist#130: the 72 h window is a backstop for peers that go
+/// silent; for bytes held here the row's age says nothing), and a holder's own
+/// retraction or later `none` is still honoured.
+///
+/// # Errors
+///
+/// Backend errors.
+pub async fn list_holders_of<B>(backend: &B, sha256: &[u8; 32]) -> Result<Vec<String>, BlobError>
+where
+    B: BlobStorage + FederationDirectory + Sync,
+{
+    let held_here = backend.has_blob(sha256).await?;
+    let claims = holder_claims(backend, sha256, Utc::now())
+        .await
+        .map_err(|e| BlobError::Backend(format!("list_holders: {e}")))?;
+    Ok(claims
+        .into_iter()
+        .filter(|c| c.state == CustodyState::Here && (held_here || c.live))
+        .map(|c| c.holder_key_id)
+        .collect())
+}
+
+/// **`BlobStorage::list_local_holders`, once**: empty when this node does not
+/// hold the bytes; otherwise every holder whose latest claim is `here`,
+/// whatever its age (the local-truth read, CIRISPersist#130).
+///
+/// # Errors
+///
+/// Backend errors.
+pub async fn list_local_holders_of<B>(
+    backend: &B,
+    sha256: &[u8; 32],
+) -> Result<Vec<String>, BlobError>
+where
+    B: BlobStorage + FederationDirectory + Sync,
+{
+    if !backend.has_blob(sha256).await? {
+        return Ok(Vec::new());
+    }
+    Ok(holder_claims(backend, sha256, Utc::now())
+        .await
+        .map_err(|e| BlobError::Backend(format!("list_local_holders: {e}")))?
+        .into_iter()
+        .filter(|c| c.state == CustodyState::Here)
+        .map(|c| c.holder_key_id)
+        .collect())
+}
+
+/// **`BlobStorage::list_held_by`, once**: [`held_by`] at the 72 h freshness.
+///
+/// # Errors
+///
+/// Backend errors.
+pub async fn list_held_by_of<B>(
+    backend: &B,
+    holder_key_id: &str,
+) -> Result<Vec<[u8; 32]>, BlobError>
+where
+    B: BlobStorage + FederationDirectory + Sync,
+{
+    held_by(backend, holder_key_id, Utc::now(), true)
+        .await
+        .map_err(|e| BlobError::Backend(format!("list_held_by: {e}")))
+}
+
+/// **`BlobStorage::evict_actor`, once.** Every blob `actor` claims `here`
+/// (whatever the claim's age) is deleted from this node, and `signer`'s OWN
+/// `here` claims about each are retracted with its own `withdraws` (CC
+/// 3.1.3.3 rule 4: the signer retracts; nobody retracts another device's
+/// claim — so when `actor` is a peer, its claims stand and only this node's
+/// copies and claims go). Fail-honest as before: the bytes go even when a
+/// retraction fails, and the report counts both.
+///
+/// # Errors
+///
+/// Backend errors on the read or the delete.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub async fn evict_actor_of<B>(
+    backend: &B,
+    actor: &str,
+    signer: &crate::signing::LocalSigner,
+    now: DateTime<Utc>,
+) -> Result<super::EvictActorReport, BlobError>
+where
+    B: BlobStorage + FederationDirectory + Sync,
+{
+    let shas = held_by(backend, actor, now, false)
+        .await
+        .map_err(|e| BlobError::Backend(format!("evict_actor: {e}")))?;
+    let me = signer.derived_key_id();
+    let mut report = super::EvictActorReport::default();
+    for sha in shas {
+        let own = own_here_claims(backend, &me, &sha)
+            .await
+            .map_err(|e| BlobError::Backend(format!("evict_actor: {e}")))?;
+        for claim_id in own {
+            let Some(prior) = backend
+                .get_attestation(&claim_id)
+                .await
+                .map_err(|e| BlobError::Backend(format!("evict_actor: {e}")))?
+            else {
+                continue;
+            };
+            match super::blobs::emit_withdraws_attestation_helper(&prior, &me, signer, backend, now)
+                .await
+            {
+                Ok(()) => report.withdraws_emitted += 1,
+                Err(e) => {
+                    report.withdraws_failed += 1;
+                    tracing::warn!(
+                        error = %e,
+                        actor = %actor,
+                        sha256_prefix = &hex::encode(sha)[..16],
+                        "evict_actor: holding-claim retraction failed"
+                    );
+                }
+            }
+        }
+        if backend.delete_blob(&sha).await? {
+            report.blobs_evicted += 1;
+        }
+    }
+    Ok(report)
+}
+
+/// **Retract this node's own holding claims about `sha256`** (CC 3.1.3.3 rule
+/// 4): every non-retired `here` claim `holder_key_id` (this node — `signer`'s
+/// derived key) made about the blob gets `signer`'s own `withdraws`, placed at
+/// the claim's scope. A claim already
+/// retracted is not re-retracted (the fold drops it), so a retry after a
+/// partial failure is safe. The first retraction that cannot be admitted
+/// ABORTS with its error: the doors that delete bytes after this (epoch
+/// eviction, purge eviction) leave the bytes in place for the retry rather
+/// than leave a claim naming bytes that are gone. Returns how many were
+/// retracted.
+///
+/// # Errors
+///
+/// [`BlobError::AttestationEmissionFailed`] naming the claim; backend errors.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub async fn retract_own_claims(
+    dir: &dyn FederationDirectory,
+    holder_key_id: &str,
+    signer: &crate::signing::LocalSigner,
+    sha256: &[u8; 32],
+    now: DateTime<Utc>,
+) -> Result<usize, BlobError> {
+    let me = holder_key_id;
+    let ids = own_here_claims(dir, me, sha256)
+        .await
+        .map_err(|e| BlobError::Backend(format!("own holding claims: {e}")))?;
+    let mut n = 0;
+    for id in ids {
+        let Some(prior) = dir
+            .get_attestation(&id)
+            .await
+            .map_err(|e| BlobError::Backend(format!("holding claim {id}: {e}")))?
+        else {
+            continue;
+        };
+        super::blobs::emit_withdraws_attestation_helper(&prior, me, signer, dir, now)
+            .await
+            .map_err(|e| {
+                BlobError::AttestationEmissionFailed(format!(
+                    "the retraction of holding claim {id} about {} could not be admitted; bytes \
+                     left in place for retry: {e}",
+                    hex::encode(sha256)
+                ))
+            })?;
+        n += 1;
+    }
+    Ok(n)
+}

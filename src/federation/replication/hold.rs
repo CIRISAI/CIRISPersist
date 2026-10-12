@@ -6,7 +6,7 @@
 //! - [`is_proxy_content`] — *is this row held for others?* Read by the
 //!   force-evict sweep, the serve refusal and the accept decision, so the
 //!   three agree by construction (I49). It used to be three copies keyed on
-//!   the `holds_bytes` ATTESTER, which for anything a node adopts is the node
+//!   the holding claim's ATTESTER, which for anything a node adopts is the node
 //!   itself — every relayed blob classified as protected.
 //! - [`would_hold`] — *WILL this node hold content it MAY hold, now?* The
 //!   accept rule every consumer-reachable accept door runs (I46). Its

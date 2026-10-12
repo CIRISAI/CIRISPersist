@@ -811,7 +811,7 @@ class Engine:
         """(derived) deontic — The lifecycle door (registry's RequestKeyRecovery outcome path): "active" may move to "recovered" / "revoked" / "expired"; a same-state re-assertio... [build-conditional: #[cfg(feature = "registry_key_escrows")]]"""
 
     def evict_actor_json(self, attesting_key_id: str, now_iso: str) -> str:
-        """(derived) deontic — v3.5.0 (CIRISPersist#125) — Federation blob storage: per-actor eviction. Deletes every federation_blobs row this Engine holds for attesting_key_id,..."""
+        """(derived) deontic — v3.5.0 (CIRISPersist#125) — Federation blob storage: per-actor eviction. Deletes every federation_blobs row this Engine holds that attesting_key_id..."""
 
     def federation_grant_trust(self, signed_grant_json: str) -> None:
         """(derived) deontic — Federation directory: grant trust to a key."""
@@ -995,7 +995,7 @@ class Engine:
                 "record": {
                     "attestation_id": str,           # UUID
                     "attesting_key_id": str,
-                    "attestation_type": str,         # e.g. "holds_bytes:sha256:..."
+                    "attestation_type": str,         # one of the five, e.g. "scores"
                     "attestation_envelope": <opaque JSON>,
                     "references_attestation_id": str | None,
                     "references_attestation_type": str | None,
@@ -1028,7 +1028,7 @@ class Engine:
         """(derived) deontic — #832 (§12.3) — append one plaintext segment to a live stream at cohort_scope, sealed where the tier requires it. The chunk twin of put_blob_scoped:..."""
 
     def put_blob_chunks_signing_json(self, payload_json: str) -> str:
-        """(derived) deontic — v51.3.0 (CIRISPersist#947 ask 3) — store a plaintext chunk DAG and announce its manifest (holds_bytes, this node's claim), so a pulled commons DAG..."""
+        """(derived) deontic — v51.3.0 (CIRISPersist#947 ask 3) — store a plaintext chunk DAG and announce its manifest (this node's holding claim), so a pulled commons DAG is no..."""
 
     def put_blob_encrypted_community(self, community_key_id: str, plaintext_b64: str, media_type: str | None = None) -> str:
         """(derived) deontic — v43.0.0 (FSD/BLOB_ENCRYPTION_AT_REST.md §10.1) — store a blob encrypted under a community's current-epoch DEK."""
@@ -1050,10 +1050,10 @@ class Engine:
         attestation_id_uuid: str,
     ) -> None:
         """v3.3.0 (#121) — One-call blob ingest: persist computes the
-        holds_bytes envelope, canonicalizes via the production
-        ``PythonJsonDumpsCanonicalizer``, signs via the engine's own
-        ``HardwareSigner``, and atomically commits the blob row + the
-        holder attestation.
+        holding-claim envelope (v55.0.0: ``custody:ack:v1`` ``here`` at
+        ``federation``, CIRISPersist#989), canonicalizes via the production
+        canonicalizer, signs via the engine's own signer, and atomically
+        commits the blob row + the holding claim.
 
         ``body_inline_b64`` XOR ``external_ref_json`` — exactly one
         body source. Inline bodies are base64-standard-alphabet;
@@ -3095,9 +3095,11 @@ class Engine:
 
     def list_holders_json(self, sha256_hex: str) -> str:
         """v2.3.0 (#103) — JSON-encoded list of ``attesting_key_id``
-        for every currently-live holder of this blob. Filters out
-        rows past the CEG §10.1.2 24-hour TTL AND rows with a
-        ``withdraws`` structural composer from the attester. Empty
+        for every currently-live holder of this blob: v55.0.0
+        (CIRISPersist#989) — every holder whose latest holding claim
+        (``custody:ack:v1``) is a ``here`` within its 72-hour window (any age
+        when this node holds the bytes itself). A holder's own
+        ``withdraws`` / ``recants`` or later ``none`` folds it out. Empty
         list when no live holders.
 
         Used by CIRISConformance to verify the §9.1 identity-aware-
@@ -3110,7 +3112,7 @@ class Engine:
         """
 
     def list_holders_sized_json(self, sha256_hex: str) -> str:
-        """(derived) empirical — v45.0.0 (CIRISPersist#871, FSD/MEDIA_SOURCE.md §4, AV-88/AV-89) — the puller's budget read. Every live holds_bytes claim for the blob with the byte..."""
+        """(derived) empirical — v45.0.0 (CIRISPersist#871, FSD/MEDIA_SOURCE.md §4, AV-88/AV-89) — the puller's budget read. Every holder whose latest holding claim (v55.0.0: custo..."""
 
     def list_key_registration_history(self, key_id: str) -> str:
         """(derived) empirical — v44.7.0 (CIRISPersist#864) — the registration claims key_id has REPLACED through a rebind, oldest first, as a JSON array of KeyRegistrationHistoryR..."""
@@ -3119,7 +3121,7 @@ class Engine:
         """(derived) empirical — Page through cirislens.trace_llm_calls rows. Filters compose AND-style; cursor-paged newest-first. Returns JSON-encoded LlmCallListPage."""
 
     def list_local_holders_json(self, sha256_hex: str) -> str:
-        """(derived) empirical — v3.5.2 (CIRISPersist#130) — Federation blob storage: local-truth holder query. Returns a JSON array of attesting_key_id strings for every holds_byt..."""
+        """(derived) empirical — v3.5.2 (CIRISPersist#130) — Federation blob storage: local-truth holder query. Returns a JSON array of attesting_key_id strings for every holder wh..."""
 
     def list_org_memberships_for(self, org_id: str) -> str:
         """(derived) empirical — Federation directory: list all org_membership rows for one org_id. Returns a JSON array of OrgMembership."""
@@ -3295,7 +3297,7 @@ class Engine:
         """(derived) empirical — #249 Cut B — the user-role key(s) that steward-bind key_id (who key_id is steward-bound TO). Returns a JSON array of key_ids; empty when key_id is..."""
 
     def store_blob_local_json(self, payload_json: str) -> None:
-        """(derived) empirical — v3.9.2 (CIRISPersist#153 Ask 5, CEG 0.7 §10.1.4) — store blob bytes locally at the COMMONS tier WITHOUT emitting a holds_bytes directory attestation."""
+        """(derived) empirical — v3.9.2 (CIRISPersist#153 Ask 5, CEG 0.7 §10.1.4) — store blob bytes locally at the COMMONS tier WITHOUT emitting a holding claim."""
 
     def task_delete(self, task_id: str) -> bool:
         """v1.5.9 — Delete a task by id.

@@ -5,12 +5,20 @@
 //! and landed via `put_contribution`, the orchestrator side runs:
 //!
 //!   1. [`list_holders`](crate::federation::BlobStorage::list_holders)
-//!      to discover the currently-live holders of the content_sha256.
-//!   2. For each holder: emit a `withdraws` attestation against the
-//!      holder's `holds_bytes` row (via [`emit_withdraws_attestation_helper`]).
-//!   3. If [`LegalBasis::requires_immediate_eviction`] is true: also
-//!      call [`evict_actor`](crate::federation::BlobStorage::evict_actor)
-//!      for each holder.
+//!      to discover the currently-live holders of the content_sha256
+//!      (reported, not acted on).
+//!   2. THIS node retracts its own holding claims about the bytes (a
+//!      `withdraws` each, via `holding_claim::retract_own_claims`).
+//!   3. If [`LegalBasis::requires_immediate_eviction`] is true: this node
+//!      also deletes its local copy.
+//!
+//! v55.0.0 (CIRISPersist#989, CC 3.1.3.3 rule 4) — a holding claim is
+//! retracted by its signer alone: "nobody withdraws another device's report,
+//! and a takedown is the CC 2.3 tombstone path, not a withdrawal of holders".
+//! Before v55 this handler withdrew every holder's `holds_bytes` row and ran
+//! `evict_actor` per holder; a `withdraws` against another device's claim is
+//! now refused at the door. What reaches other holders is the CC 2.3
+//! tombstone (CIRISPersist#1007).
 //!   4. If [`LegalBasis::admits_counter_notice`] is true: schedule the
 //!      delayed eviction (the persist-side hook lives at the
 //!      `cirisnode.scheduled_takedown_actions` table; this module
@@ -41,22 +49,23 @@ use crate::federation::{BlobError, BlobStorage, FederationDirectory};
 /// Report from [`process_takedown_admission`]. Counts withdraws +
 /// evictions + (when scheduled) the deadline the sweeper applies.
 ///
-/// CEG 0.3 §11.4 takedown-isn't-a-coup: the holder's
-/// `federation_keys` row is NEVER touched by the handler. Only the
-/// holder's `holds_bytes` attestation is withdrawn, and (for
-/// immediate-removal bases) the holder's `federation_blobs` row is
-/// evicted. Key revocation is a separate, distinct primitive.
+/// CEG 0.3 §11.4 takedown-isn't-a-coup: no `federation_keys` row is EVER
+/// touched by the handler. Only this node's own holding claims are
+/// withdrawn, and (for immediate-removal bases) this node's
+/// `federation_blobs` row is evicted. Key revocation is a separate, distinct
+/// primitive.
 #[derive(Debug, Clone, Default)]
 pub struct TakedownReport {
     /// Holders identified by `list_holders` at the time of the
     /// admission call.
     pub holders_seen: usize,
-    /// `withdraws` attestations the handler emitted.
+    /// `withdraws` attestations the handler emitted — v55.0.0: this node's
+    /// own holding claims only (CC 3.1.3.3 rule 4).
     pub withdraws_emitted: usize,
     /// `withdraws` emissions that failed (signer / FK).
     pub withdraws_failed: usize,
-    /// Holder evictions the handler ran (immediate-eviction bases
-    /// only).
+    /// Local evictions the handler ran (immediate-eviction bases only):
+    /// v55.0.0 — 1 when this node deleted its own copy, else 0.
     pub holders_evicted: usize,
     /// Holder evictions that failed.
     pub holders_evict_failed: usize,
@@ -75,8 +84,8 @@ pub struct TakedownReport {
 /// that has already cleared `put_contribution`.
 ///
 /// `blob_storage` is the substrate. `directory` is the
-/// `FederationDirectory` for the `holds_bytes` enumerate + the
-/// `withdraws` write target. `signer` produces the canonical Ed25519
+/// `FederationDirectory` for this node's holding claims + the `withdraws`
+/// write target. `signer` produces the canonical Ed25519
 /// signature over the withdraws envelope; `signer_key_id` is the
 /// `federation_keys.key_id` that fills both `attesting_key_id` and
 /// `attested_key_id` on the withdraws row (the self-attestation
@@ -186,69 +195,41 @@ where
     let admits_counter = notice.legal_basis.admits_counter_notice();
     report.age_gate_applied = is_age_gated;
 
-    for holder in &holders {
-        // For each live holder, find their `holds_bytes` attestation
-        // for this SHA so we can emit a `withdraws` against it. We
-        // use `list_attestations_by(holder)` and filter to the
-        // matching attestation_type — same filter discipline as the
-        // evict_actor path uses (`emit_withdraws_attestation_helper`
-        // requires the prior Attestation row).
-        let by = directory.list_attestations_by(holder).await.map_err(|e| {
-            Error::Backend(format!(
-                "list_attestations_by for holder {holder} in takedown: {e}"
-            ))
-        })?;
-        let target_type = crate::federation::holds_bytes_attestation_type(&sha);
-        let prior_opt = by.into_iter().find(|a| a.attestation_type == target_type);
-        let prior = match prior_opt {
-            Some(p) => p,
-            None => {
-                // Holder appeared in `list_holders` but no matching
-                // attestation found — a race against eviction; treat
-                // as a no-op for this holder (no withdraws to emit).
-                continue;
-            }
-        };
-
-        let withdraws_outcome = crate::federation::blobs::emit_withdraws_attestation_helper(
-            &prior,
-            signer_key_id,
-            signer,
-            directory,
-            now,
-        )
-        .await;
-        match withdraws_outcome {
-            Ok(()) => report.withdraws_emitted += 1,
+    // v55.0.0 (CIRISPersist#989, CC 3.1.3.3 rule 4) — this node retracts ITS
+    // OWN holding claims about the bytes; another holder's claim is that
+    // holder's to retract, and the CC 2.3 tombstone path (CIRISPersist#1007)
+    // is what reaches it.
+    match crate::federation::holding_claim::retract_own_claims(
+        directory,
+        signer_key_id,
+        signer,
+        &sha,
+        now,
+    )
+    .await
+    {
+        Ok(n) => report.withdraws_emitted += n,
+        Err(e) => {
+            report.withdraws_failed += 1;
+            tracing::warn!(
+                error = %e,
+                basis = ?notice.legal_basis,
+                "ciris-persist takedown: retraction of this node's holding claim failed"
+            );
+        }
+    }
+    if requires_eviction {
+        // CEG 0.3 §11.4 takedown-isn't-a-coup: the local copy goes; no
+        // `federation_keys` row is touched.
+        match blob_storage.delete_blob(&sha).await {
+            Ok(deleted) => report.holders_evicted += usize::from(deleted),
             Err(e) => {
-                report.withdraws_failed += 1;
+                report.holders_evict_failed += 1;
                 tracing::warn!(
                     error = %e,
-                    holder = %holder,
                     basis = ?notice.legal_basis,
-                    "ciris-persist v3.6.0 takedown: withdraws emission failed"
+                    "ciris-persist takedown: local eviction failed"
                 );
-            }
-        }
-
-        if requires_eviction {
-            // CEG 0.3 §11.4 takedown-isn't-a-coup: evict_actor deletes
-            // the holder's `federation_blobs` rows + emits withdraws
-            // against their holds_bytes attestations. It DOES NOT
-            // touch `federation_keys`. The holder's identity remains
-            // in the directory; only their possession of the
-            // offending content is retired.
-            match blob_storage.evict_actor(holder, signer, now).await {
-                Ok(_) => report.holders_evicted += 1,
-                Err(e) => {
-                    report.holders_evict_failed += 1;
-                    tracing::warn!(
-                        error = %e,
-                        holder = %holder,
-                        basis = ?notice.legal_basis,
-                        "ciris-persist v3.6.0 takedown: evict_actor failed"
-                    );
-                }
             }
         }
     }

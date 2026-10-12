@@ -19,7 +19,7 @@ use super::admission::CallerAdmission;
 ///   `cohort_scope ∈ {community, affiliations, species, biosphere,
 ///   federation}` — the non-suppressed tiers per §8.1.13.3. It refuses
 ///   `self` + `family` (for which
-///   `cohort_scope::suppresses_holds_bytes` is true).
+///   `cohort_scope::is_structurally_invisible` is true).
 /// - [`CallerScope::Authenticated`] additionally admits `self` /
 ///   `family` / `community` rows, but only by *admission resolution*
 ///   on the caller's identity — never by caller assertion. The

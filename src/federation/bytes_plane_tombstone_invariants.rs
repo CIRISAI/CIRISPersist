@@ -538,7 +538,6 @@ pub mod bodies {
     where
         B: BlobStorage + FederationDirectory + Sync,
     {
-        let prefix = crate::federation::HOLDS_BYTES_ATTESTATION_TYPE_PREFIX;
         // The announcing key is the ENGINE's own local signer: `evict_blob`
         // retracts THIS node's claims, which are the ones that key made. The
         // runner seeds the engine from the label below; the assert pins it.
@@ -558,7 +557,8 @@ pub mod bodies {
                 .filter(|a| a.attestation_type == attestation_type::WITHDRAWS)
                 .count()
         };
-        // This node announces a blob (put_blob_signing_at emits holds_bytes).
+        // This node announces a blob (put_blob_signing_at emits the holding
+        // claim, `custody:ack:v1` — v55.0.0).
         let body = format!("held by this node {s}").into_bytes();
         let sha = *blake_free_sha(&body);
         b.put_blob_signing_at(
@@ -582,8 +582,8 @@ pub mod bodies {
                 .await
                 .unwrap()
                 .iter()
-                .any(|a| a.attestation_type.starts_with(prefix)),
-            "I153: precondition — a holds_bytes claim"
+                .any(crate::federation::custody_ack::is_custody_row),
+            "I153: precondition — a holding claim"
         );
         assert_eq!(withdraws_by(node.clone()).await, 0);
 

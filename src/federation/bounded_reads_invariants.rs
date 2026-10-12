@@ -354,11 +354,16 @@ pub(crate) mod bodies {
                 {
                     continue;
                 }
+                // v55.0.0 (CIRISPersist#1053) — a standing proposal names no
+                // invitee; the live invitees are the named ones.
+                let Some(invitee) = p.invitee.clone() else {
+                    continue;
+                };
                 if ma::proposal_withdrawn(dir, &p).await? {
                     continue;
                 }
                 let replies = dir
-                    .list_attestations_for(&p.invitee)
+                    .list_attestations_for(&invitee)
                     .await?
                     .into_iter()
                     .filter(|r| {
@@ -373,7 +378,7 @@ pub(crate) mod bodies {
                     .iter()
                     .any(|r| ma::membership_row(r) == Some(ma::MembershipRow::Decline));
                 if !declined {
-                    out.insert(p.invitee);
+                    out.insert(invitee);
                 }
             }
         }

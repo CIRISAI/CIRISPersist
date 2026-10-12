@@ -2251,9 +2251,9 @@ impl PostgresBackend {
     /// index is stale for this row, the self-healing point read and
     /// `rebuild_signed_wire_index` are the repair paths, and the error is
     /// logged at ERROR rather than swallowed silently.
-    /// v44.8.1 (CIRISPersist#870) — see the sqlite twin: index a `holds_bytes`
-    /// claim a blob door just wrote, as `put_attestation` indexes every
-    /// federation-tier row.
+    /// v44.8.1 (CIRISPersist#870) — see the sqlite twin: index a holding claim
+    /// (v55.0.0: `custody:ack:v1`, CIRISPersist#989) a blob door just wrote,
+    /// as `put_attestation` indexes every federation-tier row.
     async fn index_holder_claim(
         &self,
         attestation_id: &str,
@@ -2267,9 +2267,75 @@ impl PostgresBackend {
             .await
             .map_err(|e| {
                 crate::federation::BlobError::Backend(format!(
-                    "holds_bytes claim {attestation_id}: signed_wire_index: {e}"
+                    "holding claim {attestation_id}: signed_wire_index: {e}"
                 ))
             })
+    }
+
+    /// v55.0.0 (CIRISPersist#989) — **insert one admitted holding claim**
+    /// inside the caller's transaction, at this node's serve position (V130).
+    /// Every column is LISTED — `tier`, `cohort_scope` and `expires_at` among
+    /// them — because a column left to its schema default is a value nobody
+    /// chose and the value that replicates (#652/#660). `weight` is omitted
+    /// (a claim carries none, and there is no f64→NUMERIC bind for a NULL).
+    /// The three claim doors (`put_blob_with_scope`, `adopt_sealed_blob_at`,
+    /// `put_holding_claim`) share it.
+    async fn insert_holding_claim_tx(
+        &self,
+        tx: &deadpool_postgres::Transaction<'_>,
+        prepared: &crate::federation::holding_claim::PreparedHoldingClaim,
+    ) -> Result<(), crate::federation::BlobError> {
+        let row = &prepared.row;
+        let pqc_completed_at_null: Option<chrono::DateTime<chrono::Utc>> = None;
+        let admitted_at = self
+            .next_plane_position(tx, "federation_attestations")
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(format!("serve position: {e}")))?;
+        tx.execute(
+            "INSERT INTO cirislens.federation_attestations (\
+                attestation_id, attesting_key_id, attested_key_id, attestation_type, \
+                asserted_at, expires_at, attestation_envelope, \
+                original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
+                scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, tier, \
+                cohort_scope, admitted_at\
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)",
+            &[
+                &row.attestation_id,
+                &row.attesting_key_id,
+                &row.attested_key_id,
+                &row.attestation_type,
+                &row.asserted_at,
+                &row.expires_at,
+                &prepared.envelope_text,
+                &prepared.original_content_hash,
+                &row.scrub_signature_classical,
+                &row.scrub_signature_pqc,
+                &row.scrub_key_id,
+                &row.scrub_timestamp,
+                &pqc_completed_at_null,
+                &row.persist_row_hash,
+                &row.tier,
+                &row.cohort_scope,
+                &admitted_at,
+            ],
+        )
+        .await
+        .map_err(|e| {
+            let msg = e.to_string();
+            if msg.contains("foreign key") {
+                crate::federation::BlobError::AttestationEmissionFailed(format!(
+                    "FK violation on the holding claim: {msg}"
+                ))
+            } else if msg.contains("duplicate key") {
+                // attestation_id PK collision — caller reused a UUID.
+                crate::federation::BlobError::AttestationEmissionFailed(format!(
+                    "attestation_id collision: {msg}"
+                ))
+            } else {
+                crate::federation::BlobError::Backend(format!("insert holding claim: {msg}"))
+            }
+        })?;
+        Ok(())
     }
 
     pub(crate) async fn index_stored_record(
@@ -4957,6 +5023,30 @@ impl PostgresBackend {
             .map_err(|e| crate::federation::Error::Backend(e.to_string()))
     }
 
+    /// v55.0.0 (CIRISPersist#989) — TEST SEAM: reproduce a row of a type no
+    /// door admits today (a retired `holds_bytes` carrier a node still holds):
+    /// rewrite the typed `attestation_type` column. Nothing else moves.
+    #[cfg(any(test, feature = "test-anchor"))]
+    pub async fn test_seam_set_attestation_type(
+        &self,
+        attestation_id: &str,
+        attestation_type: &str,
+    ) -> Result<(), crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        client
+            .execute(
+                "UPDATE cirislens.federation_attestations SET attestation_type = $2 \
+                 WHERE attestation_id::text = $1",
+                &[&attestation_id, &attestation_type],
+            )
+            .await
+            .map(|_| ())
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))
+    }
+
     /// v54.0.0 (CIRISPersist#995 row 2) — TEST SEAM: reproduce what a
     /// pre-v53.1.4 UPDATE door left behind: `additional_scrubs` emptied while
     /// `persist_row_hash` still binds the full record. Nothing else moves.
@@ -6530,60 +6620,6 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .collect()
     }
 
-    /// v45.0.0 (CIRISPersist#871, FSD §4) — the puller's budget read: every
-    /// `holds_bytes` claim for `sha256` (type prefix, then the full digest
-    /// confirmed in `evidence_refs`), the holder's own `withdraws` /
-    /// `recants` folded out by the same `NOT EXISTS` `list_holders` uses, no
-    /// freshness window; a claim with no positive `size` is skipped. Sorted
-    /// by key; one entry per holder.
-    async fn list_holders_sized(
-        &self,
-        sha256: &[u8; 32],
-    ) -> Result<Vec<crate::federation::renditions::HolderClaim>, crate::federation::Error> {
-        let attestation_type = crate::federation::holds_bytes_attestation_type(sha256);
-        let full_hex = hex::encode(sha256);
-        let client = self
-            .get_client()
-            .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
-        let rows = client
-            .query(
-                "SELECT a.attesting_key_id, a.attestation_envelope \
-                 FROM cirislens.federation_attestations a \
-                 WHERE a.attestation_type = $1 \
-                   AND NOT EXISTS ( \
-                     SELECT 1 FROM cirislens.federation_attestations w \
-                     WHERE w.attestation_type IN ($2, $3) \
-                       AND w.attesting_key_id = a.attesting_key_id \
-                       AND w.attestation_envelope::jsonb->>'references_attestation_id' = \
-                           a.attestation_id::text \
-                   ) \
-                 ORDER BY a.attesting_key_id ASC, a.attestation_id ASC",
-                &[
-                    &attestation_type,
-                    &crate::federation::types::attestation_type::WITHDRAWS,
-                    &crate::federation::types::attestation_type::RECANTS,
-                ],
-            )
-            .await
-            .map_err(|e| crate::federation::Error::Backend(format!("list_holders_sized: {e}")))?;
-        let col = |e: tokio_postgres::Error| {
-            crate::federation::Error::Backend(format!("list_holders_sized: {e}"))
-        };
-        let mut candidates: Vec<(String, serde_json::Value)> = Vec::with_capacity(rows.len());
-        for r in rows {
-            let key_id: String = r.try_get("attesting_key_id").map_err(col)?;
-            // TEXT since V122; a row whose envelope does not parse is not a claim.
-            let text: String = r.try_get("attestation_envelope").map_err(col)?;
-            if let Ok(env) = serde_json::from_str(&text) {
-                candidates.push((key_id, env));
-            }
-        }
-        Ok(crate::federation::renditions::sized_holder_claims(
-            &full_hex, candidates,
-        ))
-    }
-
     /// v45.0.0 (CIRISPersist#871, FSD §5) — the rendition index read: a plain
     /// SELECT over V149 `cirislens.blob_renditions`, ordered by
     /// `rendition_sha256`.
@@ -7401,14 +7437,9 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             // a token the fold cannot match. Pure; same gate at every door.
             crate::federation::consent_scope::check_consent_scope_tokens(&row.attestation_envelope)?;
             // v45.0.0 (CIRISPersist#871, `FSD/MEDIA_SOURCE.md` §3–§4) — the media
-            // Source struct is refused by member name, and a `holds_bytes` claim
-            // without a positive `size` is refused: a descriptor a puller cannot
-            // budget by is not admitted. Pure; the same gate at every door.
+            // Source struct is refused by member name (a holding claim without a
+            // positive `size` is the custody parse\'s to refuse, v55) Pure; the same gate at every door.
             crate::federation::media_source::check_media_source(&row.attestation_envelope)?;
-            crate::federation::media_source::check_holder_claim_size(
-                &row.attestation_envelope,
-                &row.attestation_type,
-            )?;
 
             // v31.0.0 (CIRISPersist#598) — THE CONSENT INSTANT BINDING. A
             // `consent:state:*` row is refused unless its signed envelope carries
@@ -7921,6 +7952,13 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             // CC 3.1.3.3 — `custody:ack:v1` is a holder self-report, placed within
             // the blob's own cohort (v53.0.0, CIRISPersist#942 part 2).
             crate::federation::custody_ack::check_custody_ack_admission(self, &row).await?;
+            // v55.0.0 (CIRISPersist#989, CC 3.1.3.3 rule 1) — a holding claim about a blob
+            // this node holds is placed at that blob's scope, never one its emitter
+            // chose. Reads the blob store, so it sits with the custody gate.
+            crate::federation::holding_claim::check_holding_claim_scope(self, &row).await?;
+            // CC 3.2 — a `community:listing:v1` row is federation-scoped and signed by the
+            // room's founder or a current moderate-holder (v55.0.0, CIRISPersist#1053).
+            crate::federation::public_room::check_community_listing_admission(self, &row).await?;
             // CC 3.1 — a lowercase family stem, or the row evades every family gate
             // (v42.0.0, CIRISPersist#814).
             crate::federation::admission::check_dimension_case_rule(&row)?;
@@ -8651,6 +8689,47 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             bytes,
         );
         Ok(rows)
+    }
+
+    /// v55.0.0 (CIRISPersist#989) — V190's `(dimension COLLATE "C",
+    /// evidence_refs[0])` seek; the expression is spelled as the index is.
+    async fn list_attestations_citing_by_dimension(
+        &self,
+        dimension: &str,
+        evidence_ref: &str,
+    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
+        let sql = format!(
+            "SELECT {PG_ATTESTATION_COLUMNS} FROM cirislens.federation_attestations \
+             WHERE dimension COLLATE \"C\" = $1 \
+               AND (attestation_envelope::jsonb->'evidence_refs'->>0) = $2 \
+               AND tier = 'federation' \
+             ORDER BY asserted_at DESC"
+        );
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let rows = client
+            .query(&sql, &[&dimension, &evidence_ref])
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!(
+                    "list_attestations_citing_by_dimension: {e}"
+                ))
+            })?;
+        let bytes = pg_envelope_bytes(&rows);
+        rows.into_iter()
+            .map(pg_row_to_attestation)
+            .collect::<Result<Vec<_>, _>>()
+            .inspect(|rows| {
+                crate::observe::record_read(
+                    crate::observe::StoreBackend::Postgres,
+                    crate::observe::Door::ListAttestationsByDimensionCiting,
+                    dimension,
+                    rows,
+                    bytes,
+                )
+            })
     }
 
     /// v53.1.6 — V180's `(attesting_key_id, dimension COLLATE "C",
@@ -17509,6 +17588,21 @@ impl crate::federation::renditions::HeldBlobScope for PostgresBackend {
             .await
             .map_err(|e| crate::federation::Error::Backend(format!("held blob cohort_scope: {e}")))
     }
+
+    async fn held_claim_scope(
+        &self,
+        sha256: &[u8; 32],
+    ) -> Result<Option<crate::federation::holding_claim::ClaimScope>, crate::federation::Error>
+    {
+        crate::federation::holding_claim::content_claim_scope(self, sha256)
+            .await
+            .map_err(|e| match e {
+                crate::federation::BlobError::InvalidArgument(m) => {
+                    crate::federation::Error::InvalidArgument(m)
+                }
+                other => crate::federation::Error::Backend(format!("held claim scope: {other}")),
+            })
+    }
 }
 
 impl crate::federation::BlobStorage for PostgresBackend {
@@ -17592,19 +17686,6 @@ impl crate::federation::BlobStorage for PostgresBackend {
             }
             crate::federation::blobs::verify_inline_hash(sha256, bytes)?;
         }
-        // v30.6.0 (CIRISPersist#622) — bind the id as TEXT. It was parsed into a
-        // `uuid::Uuid` because the column was `uuid`-typed (V004); V121 relaxed it so
-        // the column can hold the ids the genesis ceremony SIGNED
-        // (`genesis-charter`, `genesis-grant:…`, `genesis-lifecycle`). Relaxing the
-        // column alone was NOT enough — this Rust-side parse produced the identical
-        // `attestation_id is not a valid UUID` refusal with the schema already fixed.
-        let original_content_hash =
-            hex::decode(&attestation.original_content_hash_hex).map_err(|e| {
-                crate::federation::BlobError::InvalidArgument(format!(
-                    "original_content_hash hex decode: {e}"
-                ))
-            })?;
-
         let storage_kind = body.storage_kind();
         let size_bytes_i64 = i64::try_from(body.size_bytes()).map_err(|_| {
             crate::federation::BlobError::InvalidArgument(
@@ -17622,60 +17703,54 @@ impl crate::federation::BlobStorage for PostgresBackend {
             }
         };
 
-        // 3. Compose the holder attestation envelope. Attestation type
-        //    + envelope shape are centralized in
-        //    crate::federation::blobs so list_holders can recompose
-        //    the same prefix string.
-        // v31.0.0 (CIRISPersist#652) — through the ONE builder, which stamps
-        // the #598 instants and the #643 mirror into the envelope. Persist
-        // REBUILDS the caller's bytes here rather than storing bytes it was
-        // handed, so the builder is what makes "the caller signed the row we
-        // are storing" a checkable statement instead of an assumption.
+        // 3. Compose the holding claim.
+        //
         // v45.0.0 (CIRISPersist#871, AV-89) — the claim's declared size must be
         // the length of the bytes this door stores. Checked BEFORE the rebuild
         // so the refusal names the size, not a hash: a holder that announces
         // one length and holds another is refused here, never advertised.
         if attestation.size != body.size_bytes() {
             return Err(crate::federation::BlobError::InvalidArgument(format!(
-                "holds_bytes claim declares size {} but the stored bytes are {} \
+                "holding claim declares size {} but the stored bytes are {} \
                  (CC 5.3.2.5 / AV-89: a holder announces exactly what it holds)",
                 attestation.size,
                 body.size_bytes()
             )));
         }
-        let attestation_type = crate::federation::holds_bytes_attestation_type(sha256);
-        let mut attestation_row = crate::federation::blobs::holds_bytes_attestation_row(
+        // v55.0.0 (CIRISPersist#989, CC 3.1.3.3 rule 1) — the claim is placed
+        // at the content's scope, derived from THIS write (its tier, cohort and
+        // group), and rebuilt through the ONE builder; the caller's hash must
+        // cover the rebuilt bytes (#656), and at a bounded scope the holder
+        // must be in the cohort (rule 2) — both before anything is written.
+        //
+        // A sealed-tier token ANNOUNCES a row a cascade already stored, so its
+        // scope is read off that row (`content_claim_scope`: the binding's
+        // room, the recorded group) and an absent row is `NotHeld` before any
+        // other question (§11.5 / I28); a plaintext write's scope is this
+        // write's.
+        let claim_scope =
+            if floor.tier() == crate::federation::types::cohort_scope::CryptoTier::Plaintext {
+                crate::federation::holding_claim::ClaimScope::of_content(
+                    floor.tier(),
+                    cohort_scope,
+                    group_key_id,
+                )?
+            } else {
+                crate::federation::holding_claim::content_claim_scope(self, sha256)
+                    .await?
+                    .ok_or_else(|| crate::federation::BlobError::NotHeld {
+                        sha256_hex: hex::encode(sha256),
+                    })?
+            };
+        let prepared = crate::federation::holding_claim::prepare_holding_claim_row(
             sha256,
-            &attestation.attesting_key_id,
-            &attestation.attestation_id,
-            attestation.asserted_at,
-            attestation.size,
-        );
-        attestation_row.original_content_hash = attestation.original_content_hash_hex.clone();
-        attestation_row.scrub_signature_classical = attestation.scrub_signature_classical.clone();
-        attestation_row.scrub_signature_pqc = attestation.scrub_signature_pqc.clone();
-        attestation_row.scrub_key_id = attestation.scrub_key_id.clone();
-        attestation_row.scrub_timestamp = attestation.scrub_timestamp;
-        // v31.0.0 (CIRISPersist#656) — THE GATES #652 did not wire. The
-        // bindings hold by construction; the future-skew bound and "the
-        // caller's hash covers the bytes we rebuilt" do not. Both backends,
-        // one helper.
-        crate::federation::blobs::check_put_blob_admission(
-            &attestation_row,
-            &attestation.original_content_hash_hex,
-            chrono::Utc::now(),
+            &attestation,
+            &claim_scope,
         )?;
-        // v31.0.0 (#644) — attestation_envelope is TEXT since V122. (Name kept
-        // at the bind site below; the container is what changed.)
-        let attestation_envelope_jsonb =
-            serde_json::to_string(&attestation_row.attestation_envelope).map_err(|e| {
-                crate::federation::BlobError::Backend(format!("attestation_envelope encode: {e}"))
-            })?;
-        let persist_row_hash = crate::federation::types::compute_persist_row_hash(&attestation_row)
-            .map_err(|e| crate::federation::BlobError::Backend(format!("persist_row_hash: {e}")))?;
+        crate::federation::holding_claim::check_holding_claim_audience(self, &prepared.row).await?;
 
         // 4. Atomic transaction: insert blob row (idempotent on PK)
-        //    THEN insert holder attestation. If the attestation FK
+        //    THEN insert the holding claim. If the attestation FK
         //    fails, the blob row is rolled back too — caller sees no
         //    half-written state.
         let mut client = self
@@ -17790,87 +17865,10 @@ impl crate::federation::BlobStorage for PostgresBackend {
             .map_err(|e| crate::federation::BlobError::Backend(format!("announce author: {e}")))?;
         }
 
-        // Holder attestation. Insert is idempotent at the
-        // (attestation_id) PK; the caller supplies a fresh UUID per
-        // call so the same host re-attesting the same blob lands as
-        // a new row (audit chain — every put_blob leaves a trace).
-        //
-        // weight + expires_at + pqc_completed_at are omitted from the
-        // INSERT column list — the holder attestation has no weight /
-        // expiry / pqc_completed_at semantics, and omitting them lets
-        // Postgres apply the column NULL default (which is unambiguous
-        // without forcing postgres-types to resolve the NULL bind type
-        // — there's no f64→NUMERIC built-in, so `&None::<f64>` against
-        // weight NUMERIC errors with "error serializing parameter").
-        let expires_at_null: Option<chrono::DateTime<chrono::Utc>> = None;
-        let pqc_completed_at_null: Option<chrono::DateTime<chrono::Utc>> = None;
-        // v36.0.0 (#668) — THIS node's serve position (V130), inside the same
-        // transaction as the write.
-        let admitted_at = self
-            .next_plane_position(&tx, "federation_attestations")
-            .await
-            .map_err(|e| crate::federation::BlobError::Backend(format!("serve position: {e}")))?;
-        tx.execute(
-            "INSERT INTO cirislens.federation_attestations (\
-                attestation_id, attesting_key_id, attested_key_id, attestation_type, \
-                asserted_at, expires_at, attestation_envelope, \
-                original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
-                scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, tier, \
-                cohort_scope, admitted_at\
-             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)",
-            &[
-                &attestation.attestation_id,
-                &attestation.attesting_key_id,
-                &attestation.attesting_key_id,
-                &attestation_type,
-                // v31.0.0 (CIRISPersist#652) — from the ROW, which carries the
-                // TRUNCATED instant the builder also mirrored into the signed
-                // envelope, and which is `asserted_at` rather than
-                // `scrub_timestamp`: when the CLAIM was asserted, not when the
-                // signature was made.
-                &attestation_row.asserted_at,
-                &expires_at_null,
-                &attestation_envelope_jsonb,
-                &original_content_hash,
-                &attestation.scrub_signature_classical,
-                &attestation.scrub_signature_pqc,
-                &attestation.scrub_key_id,
-                &attestation.scrub_timestamp,
-                &pqc_completed_at_null,
-                &persist_row_hash,
-                // v31.0.0 (CIRISPersist#652) — STATED. It was omitted from the
-                // column list, so it took the schema default `'federation'` —
-                // and `list_attestations_since` filters on exactly that tier.
-                // The tier nobody chose is the tier that replicates.
-                &attestation_row.tier,
-                // v31.0.0 (CIRISPersist#660) — and `cohort_scope` alongside it,
-                // for the identical reason: omitted from the column list, it
-                // took the V056 schema default `'federation'`, which happens to
-                // equal what `holds_bytes_attestation_row` puts in the row the
-                // persist_row_hash covers. Two values agreeing because nobody
-                // chose either is not a binding.
-                &attestation_row.cohort_scope,
-                &admitted_at,
-            ],
-        )
-        .await
-        .map_err(|e| {
-            let msg = e.to_string();
-            if msg.contains("foreign key") {
-                crate::federation::BlobError::AttestationEmissionFailed(format!(
-                    "FK violation on holds_bytes attestation: {msg}"
-                ))
-            } else if msg.contains("duplicate key") {
-                // attestation_id PK collision — caller reused a UUID.
-                crate::federation::BlobError::AttestationEmissionFailed(format!(
-                    "attestation_id collision: {msg}"
-                ))
-            } else {
-                crate::federation::BlobError::Backend(format!(
-                    "insert holds_bytes attestation: {msg}"
-                ))
-            }
-        })?;
+        // v55.0.0 (CIRISPersist#989) — the holding claim, in the same
+        // transaction as the write, through the one insert the three claim
+        // doors share.
+        self.insert_holding_claim_tx(&tx, &prepared).await?;
 
         tx.commit().await.map_err(|e| {
             crate::federation::BlobError::Backend(format!("commit blob+attestation: {e}"))
@@ -17887,17 +17885,64 @@ impl crate::federation::BlobStorage for PostgresBackend {
         // and every blob-backed body read `not_fetched`. Same hook, same
         // posture as `put_attestation`: the primary write is durable; an index
         // failure is logged loudly by the hook and repaired by the rebuild.
-        self.index_holder_claim(&attestation.attestation_id, &attestation_row.tier)
+        self.index_holder_claim(&prepared.row.attestation_id, &prepared.row.tier)
             .await?;
 
         Ok(())
     }
 
+    async fn put_holding_claim(
+        &self,
+        sha256: &[u8; 32],
+        claim: crate::federation::PutBlobAttestation,
+        scope: &crate::federation::holding_claim::ClaimScope,
+    ) -> Result<(), crate::federation::BlobError> {
+        // v55.0.0 (CIRISPersist#989) — scope, size, rebuild and audience, before
+        // the transaction; the transaction re-asks only "still held".
+        let prepared =
+            crate::federation::holding_claim::prepare_announcement(self, sha256, &claim, scope)
+                .await?;
+        let sha_vec = sha256.to_vec();
+        let mut client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(format!("begin tx: {e}")))?;
+        // §11.5 / I28 — an announcement never stores; an evicted binding is an
+        // eviction RECORD, not a held row.
+        let held = tx
+            .query_one(
+                "SELECT (EXISTS(SELECT 1 FROM cirislens.federation_blobs WHERE sha256 = $1) \
+                    AND NOT EXISTS(SELECT 1 FROM cirislens.federation_community_blob_epoch \
+                                    WHERE at_rest_sha256 = $1 AND evicted_at IS NOT NULL)) AS h",
+                &[&sha_vec],
+            )
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(format!("announce: {e}")))?;
+        let held: bool = held.safe_get_with("h", crate::federation::BlobError::Backend)?;
+        if !held {
+            let _ = tx.rollback().await;
+            return Err(crate::federation::BlobError::NotHeld {
+                sha256_hex: hex::encode(sha256),
+            });
+        }
+        self.insert_holding_claim_tx(&tx, &prepared).await?;
+        tx.commit().await.map_err(|e| {
+            crate::federation::BlobError::Backend(format!("commit holding claim: {e}"))
+        })?;
+        drop(client);
+        self.index_holder_claim(&prepared.row.attestation_id, &prepared.row.tier)
+            .await
+    }
+
     // v3.9.2 (CIRISPersist#153 Ask 5, CEG 0.7 §10.1.4) — store blob
-    // bytes WITHOUT a holds_bytes attestation (structural invisibility
-    // for cohort_scope self/family). Same byte-validation as put_blob;
-    // no attestation, no admission gate (local content is the
-    // operator's own data — #149 anti-rec).
+    // bytes WITHOUT a holding claim (the sealing cascades' floor; they
+    // announce through `emit_holding_claim` at the content's scope). Same
+    // byte-validation as put_blob; no attestation, no admission gate (local
+    // content is the operator's own data — #149 anti-rec).
     async fn blob_cohort_scope(
         &self,
         sha256: &[u8; 32],
@@ -19728,7 +19773,6 @@ impl crate::federation::BlobStorage for PostgresBackend {
         signer: &crate::signing::LocalSigner,
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<u64, crate::federation::BlobError> {
-        use crate::federation::FederationDirectory as _;
         let ep = i64::try_from(epoch).unwrap_or(i64::MAX);
         let client = self
             .get_client()
@@ -19758,45 +19802,22 @@ impl crate::federation::BlobStorage for PostgresBackend {
         if sha_hexes.is_empty() {
             return Ok(0);
         }
-        // v43.0.0 (§11.5) — retract, then delete. See the SQLite twin.
+        // v43.0.0 (§11.5) — retract, then delete. See the SQLite twin: this
+        // node's own holding claims (v55.0.0, CIRISPersist#989), each by its
+        // signer; a refused retraction ABORTS (I18), a retracted one is not
+        // retracted twice.
         let node = signer.derived_key_id();
-        let prefix = crate::federation::HOLDS_BYTES_ATTESTATION_TYPE_PREFIX;
-        let mine = self.list_attestations_by(&node).await.map_err(|e| {
-            crate::federation::BlobError::Backend(format!("evict epoch: list_attestations_by: {e}"))
-        })?;
-        // §11.5 / I18 — an announcement this node ALREADY retracted is not in
-        // this list: the directory folds retractions at write (#502 E7), so a
-        // retry after a partial failure never double-retracts. I18(a) pins
-        // that property; a second filter here was mutation-tested and found
-        // to guard nothing, so there is none.
-        let announced: Vec<crate::federation::Attestation> = mine
-            .into_iter()
-            .filter(|a| a.attestation_type.starts_with(prefix))
-            .filter(|a| {
-                a.attestation_envelope
-                    .get("evidence_refs")
-                    .and_then(|v| v.as_array())
-                    .and_then(|arr| arr.first())
-                    .and_then(|v| v.as_str())
-                    .is_some_and(|h| sha_hexes.contains(h))
-            })
-            .collect();
-        // §11.5 / I18 — a retraction that cannot be admitted ABORTS the
-        // eviction: the bytes stay, the error surfaces, the next sweep
-        // retries. Deleting anyway would leave `list_holders` naming this
-        // node for content it no longer has.
-        for prior in &announced {
-            crate::federation::blobs::emit_withdraws_attestation_helper(
-                prior, &node, signer, self, now,
-            )
-            .await
-            .map_err(|e| {
-                crate::federation::BlobError::AttestationEmissionFailed(format!(
-                    "evict epoch {epoch} of {community_key_id:?}: withdraws for announcement {} \
-                     could not be admitted; bytes left in place for retry: {e}",
-                    prior.attestation_id
-                ))
-            })?;
+        for sha_hex in &sha_hexes {
+            let Ok(sha) = <[u8; 32]>::try_from(hex::decode(sha_hex).unwrap_or_default()) else {
+                continue;
+            };
+            crate::federation::holding_claim::retract_own_claims(self, &node, signer, &sha, now)
+                .await
+                .map_err(|e| {
+                    crate::federation::BlobError::AttestationEmissionFailed(format!(
+                        "evict epoch {epoch} of {community_key_id:?}: {e}"
+                    ))
+                })?;
         }
         let mut client = self
             .get_client()
@@ -21587,6 +21608,7 @@ impl crate::federation::BlobStorage for PostgresBackend {
         author_key_id: &str,
         floor: crate::federation::StorageFloor,
         binding: Option<crate::federation::EpochBinding>,
+        group_key_id: Option<&str>,
         announce: Option<crate::federation::PutBlobAttestation>,
     ) -> Result<[u8; 32], crate::federation::BlobError> {
         use sha2::Digest as _;
@@ -21611,18 +21633,45 @@ impl crate::federation::BlobStorage for PostgresBackend {
         if let Some(a) = &announce {
             if a.size != envelope_bytes.len() as u64 {
                 return Err(crate::federation::BlobError::InvalidArgument(format!(
-                    "holds_bytes claim declares size {} but the adopted bytes are {} \
+                    "holding claim declares size {} but the adopted bytes are {} \
                      (CC 5.3.2.5 / AV-89: a holder announces exactly what it holds)",
                     a.size,
                     envelope_bytes.len()
                 )));
             }
         }
-        // The holder claim is admitted on the same terms as `put_blob`'s.
+        // v55.0.0 (CIRISPersist#989, CC 3.1.3.3 rule 1) — the group a sealed
+        // room row names is its binding's community: a group that disagrees
+        // with the binding is a contradiction the floor refuses.
+        if let (Some(b), Some(g)) = (&binding, group_key_id) {
+            if b.community_key_id != g {
+                return Err(crate::federation::BlobError::InvalidArgument(format!(
+                    "adopt_sealed_blob_at: group {g:?} is not the binding's community {:?}",
+                    b.community_key_id
+                )));
+            }
+        }
+        let group = group_key_id
+            .map(str::to_owned)
+            .or_else(|| binding.as_ref().map(|b| b.community_key_id.clone()));
+        // The holding claim is admitted on the same terms as `put_blob`'s, at
+        // the content's scope, with the holder in the cohort.
         let prepared = match announce.as_ref() {
-            Some(a) => Some(crate::federation::blobs::prepare_holds_bytes_row(
-                &sha256, a,
-            )?),
+            Some(a) => {
+                let claim_scope = crate::federation::holding_claim::ClaimScope::of_content(
+                    floor.tier(),
+                    cohort_scope,
+                    group.as_deref(),
+                )?;
+                let p = crate::federation::holding_claim::prepare_holding_claim_row(
+                    &sha256,
+                    a,
+                    &claim_scope,
+                )?;
+                crate::federation::holding_claim::check_holding_claim_audience(self, &p.row)
+                    .await?;
+                Some(p)
+            }
             None => None,
         };
         let sha_vec = sha256.to_vec();
@@ -21643,12 +21692,13 @@ impl crate::federation::BlobStorage for PostgresBackend {
             lock_community_tx(&tx, &b.community_key_id).await?;
         }
         // 1. The row, verbatim bytes, tier from the token, cohort and author
-        //    AS DECLARED. First-write-wins on the address.
+        //    AS DECLARED, and (v55.0.0) the group the provenance names (V177).
+        //    First-write-wins on the address.
         tx.execute(
             "INSERT INTO cirislens.federation_blobs (\
                 sha256, storage_kind, bytes_inline, external_ref, size_bytes, media_type, \
-                cohort_scope, crypto_tier, author_key_id\
-             ) VALUES ($1, 'inline', $2, NULL, $3, $4, $5, $6, $7) \
+                cohort_scope, crypto_tier, author_key_id, group_key_id\
+             ) VALUES ($1, 'inline', $2, NULL, $3, $4, $5, $6, $7, $8) \
              ON CONFLICT (sha256) DO NOTHING",
             &[
                 &sha_vec,
@@ -21658,6 +21708,7 @@ impl crate::federation::BlobStorage for PostgresBackend {
                 &scope,
                 &tier,
                 &author_key_id,
+                &group,
             ],
         )
         .await
@@ -21685,59 +21736,7 @@ impl crate::federation::BlobStorage for PostgresBackend {
         // 3. The holder claim, signed by THIS node (§6.1 (4)), in the same
         //    transaction as the row it announces.
         if let Some(p) = &prepared {
-            let expires_at_null: Option<chrono::DateTime<chrono::Utc>> = None;
-            let pqc_completed_at_null: Option<chrono::DateTime<chrono::Utc>> = None;
-            let admitted_at = self
-                .next_plane_position(&tx, "federation_attestations")
-                .await
-                .map_err(|e| {
-                    crate::federation::BlobError::Backend(format!("serve position: {e}"))
-                })?;
-            tx.execute(
-                "INSERT INTO cirislens.federation_attestations (\
-                    attestation_id, attesting_key_id, attested_key_id, attestation_type, \
-                    asserted_at, expires_at, attestation_envelope, \
-                    original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
-                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, tier, \
-                    cohort_scope, admitted_at\
-                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)",
-                &[
-                    &p.row.attestation_id,
-                    &p.row.attesting_key_id,
-                    &p.row.attested_key_id,
-                    &p.row.attestation_type,
-                    &p.row.asserted_at,
-                    &expires_at_null,
-                    &p.envelope_text,
-                    &p.original_content_hash,
-                    &p.row.scrub_signature_classical,
-                    &p.row.scrub_signature_pqc,
-                    &p.row.scrub_key_id,
-                    &p.row.scrub_timestamp,
-                    &pqc_completed_at_null,
-                    &p.row.persist_row_hash,
-                    &p.row.tier,
-                    &p.row.cohort_scope,
-                    &admitted_at,
-                ],
-            )
-            .await
-            .map_err(|e| {
-                let msg = e.to_string();
-                if msg.contains("foreign key") || msg.contains("violates foreign key") {
-                    crate::federation::BlobError::AttestationEmissionFailed(format!(
-                        "FK violation on holds_bytes attestation: {msg}"
-                    ))
-                } else if msg.contains("duplicate key") {
-                    crate::federation::BlobError::AttestationEmissionFailed(format!(
-                        "attestation_id collision: {msg}"
-                    ))
-                } else {
-                    crate::federation::BlobError::Backend(format!(
-                        "adopt_sealed_blob_at announce: {msg}"
-                    ))
-                }
-            })?;
+            self.insert_holding_claim_tx(&tx, p).await?;
         }
         tx.commit().await.map_err(|e| {
             crate::federation::BlobError::Backend(format!("adopt_sealed_blob_at commit: {e}"))
@@ -22624,310 +22623,25 @@ impl crate::federation::BlobStorage for PostgresBackend {
         &self,
         sha256: &[u8; 32],
     ) -> Result<Vec<String>, crate::federation::BlobError> {
-        // v3.0.0 (CIRISPersist#116, CEG 0.2 §10.1.2):
-        // 1. server-side prefix filter on attestation_type
-        //    ("holds_bytes:sha256:<8-hex>") — narrows the candidate
-        //    set well below O(table) without an extra index.
-        // 2. client-side full-SHA filter against
-        //    attestation_envelope->'evidence_refs' — discriminates
-        //    32-bit prefix collisions.
-        // 3. TTL filter — DEFAULT_HOLDS_BYTES_TTL (24 hours) measured
-        //    from `asserted_at`; expired rows are treated as stale per
-        //    CEG §10.1.2.
-        // 4. ContentMiss withdraws filter — drop rows whose attester
-        //    emitted a `withdraws` against the holds_bytes row's
-        //    attestation_id (CEG §10.1.2 ContentMiss feedback loop).
-        //
-        // The TTL window is applied via the WHERE clause with
-        // `asserted_at + interval` so the index on asserted_at (if
-        // present) can prune. The withdraws filter is a NOT EXISTS
-        // subquery against the same table; the JSONB extraction
-        // `->>'references_attestation_id'` matches the structural-
-        // composer dedup query shape.
-        // v3.6.4 (CIRISPersist#130 reopen): bypass TTL when blob is
-        // locally present in `federation_blobs`. See the SQLite mirror
-        // for full rationale; in short, the bytes are definitive proof
-        // of holding so the freshness window doesn't apply.
-        let attestation_type = crate::federation::holds_bytes_attestation_type(sha256);
-        let full_hex = hex::encode(sha256);
-        let now = chrono::Utc::now();
-        let ttl_seconds: i64 = i64::try_from(
-            crate::federation::blobs::DEFAULT_HOLDS_BYTES_TTL.as_secs(),
-        )
-        .map_err(|_| {
-            crate::federation::BlobError::Backend("DEFAULT_HOLDS_BYTES_TTL out of i64 range".into())
-        })?;
-        let cutoff = now - chrono::Duration::seconds(ttl_seconds);
-
-        let client = self
-            .get_client()
-            .await
-            .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
-
-        // v3.6.4 local-truth gate.
-        let blob_locally_held = client
-            .query_opt(
-                "SELECT 1 FROM cirislens.federation_blobs WHERE sha256 = $1",
-                &[&sha256.to_vec()],
-            )
-            .await
-            .map_err(|e| {
-                crate::federation::BlobError::Backend(format!(
-                    "list_holders local-truth probe: {e}"
-                ))
-            })?
-            .is_some();
-
-        // When locally held, drop the `asserted_at > cutoff` clause so
-        // every un-withdrawn holds_bytes attestation lands. The
-        // withdraws NOT EXISTS subquery stays in both branches — it's
-        // the active eviction signal, not a freshness backstop.
-        // v36.0.0 (CIRISPersist#686) — RECANTS evicts too: a holder's
-        // falsity admission outranks a withdraws (§6.1) and was the one
-        // retraction form these folds were blind to. Both retraction types
-        // are bound; both branches bind the cutoff so they share one
-        // parameter layout (the locally-held SQL simply never reads $3).
-        let sql = if blob_locally_held {
-            "SELECT attestation_id::text, attesting_key_id, attestation_envelope \
-             FROM cirislens.federation_attestations \
-             WHERE attestation_type = $1 \
-               AND $3::timestamptz IS NOT NULL \
-               AND NOT EXISTS ( \
-                 SELECT 1 FROM cirislens.federation_attestations w \
-                 WHERE w.attestation_type IN ($2, $4) \
-                   AND w.attesting_key_id = \
-                       cirislens.federation_attestations.attesting_key_id \
-                   AND w.attestation_envelope::jsonb->>'references_attestation_id' = \
-                       cirislens.federation_attestations.attestation_id::text \
-               )"
-        } else {
-            "SELECT attestation_id::text, attesting_key_id, attestation_envelope \
-             FROM cirislens.federation_attestations \
-             WHERE attestation_type = $1 \
-               AND asserted_at > $3 \
-               AND NOT EXISTS ( \
-                 SELECT 1 FROM cirislens.federation_attestations w \
-                 WHERE w.attestation_type IN ($2, $4) \
-                   AND w.attesting_key_id = \
-                       cirislens.federation_attestations.attesting_key_id \
-                   AND w.attestation_envelope::jsonb->>'references_attestation_id' = \
-                       cirislens.federation_attestations.attestation_id::text \
-               )"
-        };
-        let withdraws_type = crate::federation::types::attestation_type::WITHDRAWS;
-        let recants_type = crate::federation::types::attestation_type::RECANTS;
-        let rows = client
-            .query(
-                sql,
-                &[&attestation_type, &withdraws_type, &cutoff, &recants_type],
-            )
-            .await
-            .map_err(|e| {
-                crate::federation::BlobError::Backend(format!("list_holders query: {e}"))
-            })?;
-
-        let mut holders: Vec<String> = Vec::with_capacity(rows.len());
-        let mut seen = std::collections::HashSet::new();
-        for row in rows {
-            // v31.0.0 (#644) — TEXT since V122.
-            let envelope_text: String = row.safe_get_with(
-                "attestation_envelope",
-                crate::federation::BlobError::Backend,
-            )?;
-            let envelope: serde_json::Value =
-                serde_json::from_str(&envelope_text).map_err(|e| {
-                    crate::federation::BlobError::Backend(format!(
-                        "attestation_envelope decode: {e}"
-                    ))
-                })?;
-            let matches = envelope
-                .get("evidence_refs")
-                .and_then(|v| v.as_array())
-                .map(|arr| arr.iter().any(|v| v.as_str() == Some(full_hex.as_str())))
-                .unwrap_or(false);
-            if !matches {
-                continue;
-            }
-            let key_id: String =
-                row.safe_get_with("attesting_key_id", crate::federation::BlobError::Backend)?;
-            if seen.insert(key_id.clone()) {
-                holders.push(key_id);
-            }
-        }
-        Ok(holders)
+        // v55.0.0 (CIRISPersist#989) — the holder directory over the one
+        // holding claim; one implementation for every backend.
+        crate::federation::holding_claim::list_holders_of(self, sha256).await
     }
 
-    // v3.5.2 (CIRISPersist#130) — local-truth holder query, bypasses
-    // CEG §10.1.2 TTL. See trait docstring for the semantic split
-    // between this and `list_holders`. Returns empty if blob is not
-    // in `federation_blobs` (local-truth premise doesn't apply).
+    // v3.5.2 (CIRISPersist#130) — local-truth holder query, no freshness
+    // window. See the trait docstring for the split with `list_holders`.
     async fn list_local_holders(
         &self,
         sha256: &[u8; 32],
     ) -> Result<Vec<String>, crate::federation::BlobError> {
-        let attestation_type = crate::federation::holds_bytes_attestation_type(sha256);
-        let full_hex = hex::encode(sha256);
-        let client = self
-            .get_client()
-            .await
-            .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
-
-        // Gate: blob must be locally present.
-        let sha_vec = sha256.to_vec();
-        let blob_present: bool = client
-            .query_opt(
-                "SELECT 1 FROM cirislens.federation_blobs WHERE sha256 = $1",
-                &[&sha_vec],
-            )
-            .await
-            .map_err(|e| {
-                crate::federation::BlobError::Backend(format!(
-                    "list_local_holders blob lookup: {e}"
-                ))
-            })?
-            .is_some();
-        if !blob_present {
-            return Ok(Vec::new());
-        }
-
-        // Collect every holds_bytes attestation for this SHA prefix
-        // — NO TTL filter. The withdraws filter (NOT EXISTS) is
-        // applied inline same as list_holders.
-        let rows = client
-            .query(
-                "SELECT attestation_id::text, attesting_key_id, attestation_envelope \
-                 FROM cirislens.federation_attestations \
-                 WHERE attestation_type = $1 \
-                   AND NOT EXISTS ( \
-                     SELECT 1 FROM cirislens.federation_attestations w \
-                     WHERE w.attestation_type IN ($2, $3) \
-                       AND w.attesting_key_id = \
-                           cirislens.federation_attestations.attesting_key_id \
-                       AND w.attestation_envelope::jsonb->>'references_attestation_id' = \
-                           cirislens.federation_attestations.attestation_id::text \
-                   )",
-                &[
-                    &attestation_type,
-                    &crate::federation::types::attestation_type::WITHDRAWS,
-                    &crate::federation::types::attestation_type::RECANTS,
-                ],
-            )
-            .await
-            .map_err(|e| {
-                crate::federation::BlobError::Backend(format!("list_local_holders query: {e}"))
-            })?;
-
-        let mut holders: Vec<String> = Vec::with_capacity(rows.len());
-        let mut seen = std::collections::HashSet::new();
-        for row in rows {
-            // v31.0.0 (#644) — TEXT since V122.
-            let envelope_text: String = row.safe_get_with(
-                "attestation_envelope",
-                crate::federation::BlobError::Backend,
-            )?;
-            let envelope: serde_json::Value =
-                serde_json::from_str(&envelope_text).map_err(|e| {
-                    crate::federation::BlobError::Backend(format!(
-                        "attestation_envelope decode: {e}"
-                    ))
-                })?;
-            let matches = envelope
-                .get("evidence_refs")
-                .and_then(|v| v.as_array())
-                .map(|arr| arr.iter().any(|v| v.as_str() == Some(full_hex.as_str())))
-                .unwrap_or(false);
-            if !matches {
-                continue;
-            }
-            let key_id: String =
-                row.safe_get_with("attesting_key_id", crate::federation::BlobError::Backend)?;
-            if seen.insert(key_id.clone()) {
-                holders.push(key_id);
-            }
-        }
-        Ok(holders)
+        crate::federation::holding_claim::list_local_holders_of(self, sha256).await
     }
 
     async fn list_held_by(
         &self,
         attesting_key_id: &str,
     ) -> Result<Vec<[u8; 32]>, crate::federation::BlobError> {
-        // v3.5.0 (CIRISPersist#125) — inverse of list_holders.
-        //
-        // Same four-clause filter discipline as list_holders, but
-        // pivoted on `attesting_key_id` instead of `attestation_type`
-        // (the prefix-match shifts to a LIKE).
-        let prefix = crate::federation::HOLDS_BYTES_ATTESTATION_TYPE_PREFIX;
-        let now = chrono::Utc::now();
-        let ttl_seconds: i64 = i64::try_from(
-            crate::federation::blobs::DEFAULT_HOLDS_BYTES_TTL.as_secs(),
-        )
-        .map_err(|_| {
-            crate::federation::BlobError::Backend("DEFAULT_HOLDS_BYTES_TTL out of i64 range".into())
-        })?;
-        let cutoff = now - chrono::Duration::seconds(ttl_seconds);
-        let like_pattern = format!("{prefix}%");
-
-        let client = self
-            .get_client()
-            .await
-            .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
-        let rows = client
-            .query(
-                "SELECT attestation_id::text, attestation_envelope \
-                 FROM cirislens.federation_attestations \
-                 WHERE attesting_key_id = $1 \
-                   AND attestation_type LIKE $2 \
-                   AND asserted_at > $3 \
-                   AND NOT EXISTS ( \
-                     SELECT 1 FROM cirislens.federation_attestations w \
-                     WHERE w.attestation_type IN ($4, $5) \
-                       AND w.attesting_key_id = $1 \
-                       AND w.attestation_envelope::jsonb->>'references_attestation_id' = \
-                           cirislens.federation_attestations.attestation_id::text \
-                   )",
-                &[
-                    &attesting_key_id,
-                    &like_pattern,
-                    &cutoff,
-                    &crate::federation::types::attestation_type::WITHDRAWS,
-                    &crate::federation::types::attestation_type::RECANTS,
-                ],
-            )
-            .await
-            .map_err(|e| {
-                crate::federation::BlobError::Backend(format!("list_held_by query: {e}"))
-            })?;
-
-        let mut out: Vec<[u8; 32]> = Vec::with_capacity(rows.len());
-        let mut seen: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
-        for row in rows {
-            // v31.0.0 (#644) — TEXT since V122.
-            let envelope_text: String = row.safe_get_with(
-                "attestation_envelope",
-                crate::federation::BlobError::Backend,
-            )?;
-            let envelope: serde_json::Value =
-                serde_json::from_str(&envelope_text).map_err(|e| {
-                    crate::federation::BlobError::Backend(format!(
-                        "attestation_envelope decode: {e}"
-                    ))
-                })?;
-            let sha_hex = envelope
-                .get("evidence_refs")
-                .and_then(|v| v.as_array())
-                .and_then(|arr| arr.first())
-                .and_then(|v| v.as_str());
-            let Some(sha_hex) = sha_hex else { continue };
-            let mut sha = [0u8; 32];
-            if hex::decode_to_slice(sha_hex, &mut sha).is_err() {
-                continue;
-            }
-            if seen.insert(sha) {
-                out.push(sha);
-            }
-        }
-        Ok(out)
+        crate::federation::holding_claim::list_held_by_of(self, attesting_key_id).await
     }
 
     async fn evict_actor(
@@ -22936,73 +22650,10 @@ impl crate::federation::BlobStorage for PostgresBackend {
         signer: &crate::signing::LocalSigner,
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<crate::federation::EvictActorReport, crate::federation::BlobError> {
-        // v3.5.0 (CIRISPersist#125) — per-actor eviction. Same shape as
-        // the SQLite impl; backend asymmetry is in the row source, not
-        // the orchestration.
-        use crate::federation::FederationDirectory;
-
-        let all = self
-            .list_attestations_by(attesting_key_id)
-            .await
-            .map_err(|e| {
-                crate::federation::BlobError::Backend(format!(
-                    "evict_actor: list_attestations_by failed: {e}"
-                ))
-            })?;
-
-        let prefix = crate::federation::HOLDS_BYTES_ATTESTATION_TYPE_PREFIX;
-        let holds_bytes_rows: Vec<crate::federation::Attestation> = all
-            .into_iter()
-            .filter(|a| a.attestation_type.starts_with(prefix))
-            .collect();
-
-        let mut report = crate::federation::EvictActorReport::default();
-        for prior in holds_bytes_rows {
-            let sha_hex = prior
-                .attestation_envelope
-                .get("evidence_refs")
-                .and_then(|v| v.as_array())
-                .and_then(|arr| arr.first())
-                .and_then(|v| v.as_str())
-                .map(str::to_owned);
-            let sha = match sha_hex {
-                Some(hex_str) => {
-                    let mut s = [0u8; 32];
-                    if hex::decode_to_slice(&hex_str, &mut s).is_err() {
-                        continue;
-                    }
-                    s
-                }
-                None => continue,
-            };
-
-            let withdraws_outcome = crate::federation::blobs::emit_withdraws_attestation_helper(
-                &prior,
-                attesting_key_id,
-                signer,
-                self,
-                now,
-            )
-            .await;
-
-            let deleted = self.delete_blob(&sha).await?;
-            if deleted {
-                report.blobs_evicted += 1;
-            }
-            match withdraws_outcome {
-                Ok(()) => report.withdraws_emitted += 1,
-                Err(e) => {
-                    report.withdraws_failed += 1;
-                    tracing::warn!(
-                        error = %e,
-                        actor = %attesting_key_id,
-                        sha256_prefix = &hex::encode(sha)[..16],
-                        "ciris-persist v3.5.0 evict_actor: withdraws emission failed"
-                    );
-                }
-            }
-        }
-        Ok(report)
+        // v3.5.0 (CIRISPersist#125) / v55.0.0 (CIRISPersist#989, CC 3.1.3.3
+        // rule 4) — the actor's claimed blobs go; this node retracts only its
+        // own claims.
+        crate::federation::holding_claim::evict_actor_of(self, attesting_key_id, signer, now).await
     }
 }
 
@@ -33243,6 +32894,15 @@ mod tests {
         .await;
         let adapter = crate::signing::LocalSignerHardwareAdapter::new(signer.clone());
         let _node_derived = signer.derived_key_id();
+        // v55.0.0 (CIRISPersist#989) — the announcing node is a member's
+        // device (a room's claim is placed at the room's scope), so the
+        // announce reaches its transaction and waits on the lock like the rest.
+        crate::federation::at_rest_cascade::blob_invariants::join_as_occurrence(
+            backend.as_ref(),
+            &format!("{tag}-alice"),
+            &signer.derived_key_id(),
+        )
+        .await;
         // Seed: one sealed object at epoch 0, then rotate so epoch 0 is past.
         let sealed =
             encrypt_and_cascade_community(backend.as_ref(), &comm, b"x", None, Some(&node))
@@ -41814,10 +41474,10 @@ mod tests {
         // Bytes readable locally.
         let got = backend.get_blob(&sha).await.expect("get").expect("present");
         assert_eq!(got, BlobBody::Inline(bytes));
-        // Nothing announced — no holds_bytes attestation.
+        // Nothing announced — store_blob_local signs no holding claim.
         assert!(
             backend.list_holders(&sha).await.unwrap().is_empty(),
-            "self/family content must emit no holds_bytes attestation"
+            "store_blob_local must emit no holding claim"
         );
     }
 
@@ -45070,8 +44730,7 @@ mod tests {
         let bytes = pg_blob_payload("local-truth-stale");
         let sha = pg_sha256_of(&bytes);
         let backdated = chrono::Utc::now()
-            - chrono::Duration::from_std(crate::federation::blobs::DEFAULT_HOLDS_BYTES_TTL)
-                .unwrap()
+            - chrono::Duration::seconds(crate::federation::custody_ack::CUSTODY_LIVE_SECS)
             - chrono::Duration::hours(1);
         backend
             .put_blob(
@@ -45123,8 +44782,7 @@ mod tests {
         let bytes = pg_blob_payload("ttl-expired");
         let sha = pg_sha256_of(&bytes);
         let backdated = chrono::Utc::now()
-            - chrono::Duration::from_std(crate::federation::blobs::DEFAULT_HOLDS_BYTES_TTL)
-                .unwrap()
+            - chrono::Duration::seconds(crate::federation::custody_ack::CUSTODY_LIVE_SECS)
             - chrono::Duration::hours(1);
         backend
             .put_blob(
@@ -48727,15 +48385,15 @@ mod tests {
         let report = engine.sweep_evictions_once().await.expect("sweep");
         assert!(report.rows_evicted > 0);
         // On a shared PG database the sweeper may evict blobs left
-        // behind by other tests (they have no holds_bytes from THIS
+        // behind by other tests (they have no holding claims from THIS
         // signer); for those the withdraws emission is silently
         // skipped per architect's contract. So we assert the
         // emission count covers AT LEAST the blobs WE inserted
-        // (whose prior holds_bytes IS owned by `host`).
+        // (whose prior holding claim IS owned by `host`).
         assert!(
             report.withdraws_emitted >= 1,
-            "withdraws_emitted must be ≥1 since we seeded holds_bytes \
-             attestations under this host"
+            "withdraws_emitted must be ≥1 since we seeded holding claims \
+             under this host"
         );
         assert!(
             report.withdraws_emitted <= report.rows_evicted,
@@ -49011,41 +48669,35 @@ mod tests {
         pg_blob_bootstrap_host(&backend, &actor).await;
         let signer = pg_test_signer_for(&actor);
         let shas = pg_seed_blobs_for_actor(&backend, &actor, &signer, 1, "withdrawn").await;
+        let holder = signer.derived_key_id();
 
-        use crate::federation::FederationDirectory;
-        let atts = backend
-            .list_attestations_by(&signer.derived_key_id())
+        // v55.0.0 (CIRISPersist#989, CC 3.1.3.3 rule 4) — the holder retracts
+        // its own holding claim; nobody else can.
+        use crate::federation::{BlobStorage, FederationDirectory};
+        assert!(
+            backend
+                .list_held_by(&holder)
+                .await
+                .unwrap()
+                .contains(&shas[0]),
+            "precondition: the claim is held"
+        );
+        let claim = crate::federation::holding_claim::own_here_claims(&backend, &holder, &shas[0])
             .await
             .unwrap();
-        let holds_bytes = atts
-            .into_iter()
-            .find(|a| {
-                a.attestation_type
-                    .starts_with(crate::federation::HOLDS_BYTES_ATTESTATION_TYPE_PREFIX)
-            })
-            .expect("holds_bytes from actor");
-        // v9.0.0 (CC 5.3.2.4.3.1) — build via pg_scores_attestation +
-        // pg_resign so the federation-tier ingest gate verifies it.
-        let mut withdraws = pg_scores_attestation(&actor, &actor, &actor, "identity_binding:v1");
-        withdraws.attestation_type =
-            crate::federation::types::attestation_type::WITHDRAWS.to_owned();
-        withdraws.weight = None;
-        crate::federation::tier_ingest::test_support::reseal(&mut withdraws);
-        withdraws.attestation_envelope = serde_json::json!({
-            "kind": "withdraws",
-            "references_attestation_id": holds_bytes.attestation_id,
-            "references_attestation_type": holds_bytes.attestation_type,
-        });
-        pg_resign(&mut withdraws);
-        backend
-            .put_attestation(crate::federation::SignedAttestation {
-                attestation: withdraws,
-            })
-            .await
-            .unwrap();
+        assert_eq!(claim.len(), 1, "one holding claim");
+        let prior = backend.get_attestation(&claim[0]).await.unwrap().unwrap();
+        crate::federation::blobs::emit_withdraws_attestation_helper(
+            &prior,
+            &holder,
+            &signer,
+            &backend,
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
 
-        use crate::federation::BlobStorage;
-        let held = backend.list_held_by(&actor).await.unwrap();
+        let held = backend.list_held_by(&holder).await.unwrap();
         assert!(
             !held.contains(&shas[0]),
             "withdrawn blob must be excluded, got {held:?}"

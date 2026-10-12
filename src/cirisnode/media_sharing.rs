@@ -16,9 +16,9 @@
 //!     `content_sha256` + `legal_basis` into dedicated indexed columns
 //!     (V054), and the takedown handler
 //!     ([`super::takedown_handler::process_takedown_admission`]) emits
-//!     `withdraws` attestations against every live `holds_bytes` row
-//!     for the SHA + optionally `evict_actor`s for immediate-eviction
-//!     bases.
+//!     `withdraws` against this node's own holding claims for the SHA and
+//!     optionally deletes the local copy for immediate-eviction bases
+//!     (v55.0.0: other holders are the CC 2.3 tombstone path's).
 //!
 //!   - [`KEY_GRANT_SUBJECT_KIND`] — key-distribution envelope binding a
 //!     wrapped DEK to a recipient `key_id` over a `content_sha256` (or

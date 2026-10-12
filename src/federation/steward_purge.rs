@@ -448,7 +448,8 @@ pub fn selection_digest<S: AsRef<str>>(record_ids: &[S]) -> String {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PurgeSelection {
     /// Every row `key_id` AUTHORED (`attesting_key_id`), every trace it
-    /// signed, the bytes its `holds_bytes` claims name, and everything
+    /// signed, the bytes its holding claims name (v55.0.0: its
+    /// `custody:ack:v1` `here` rows, CIRISPersist#989), and everything
     /// derived. NEVER its key, and never a row another key signed about it
     /// (operator ruling 2026-10-09). CSD-065 Descend moves onto this.
     ByActor {
@@ -666,18 +667,19 @@ struct RowFacts {
     references: Option<String>,
     is_scores: bool,
     refs: Vec<String>,
-    holds_bytes_sha: Option<String>,
+    holding_claim_sha: Option<String>,
 }
 
 impl RowFacts {
     fn of(row: &Attestation) -> Self {
-        let holds_bytes_sha = row
-            .attestation_type
-            .starts_with(super::HOLDS_BYTES_ATTESTATION_TYPE_PREFIX)
-            .then(|| super::first_evidence_ref(&row.attestation_envelope))
+        // v55.0.0 (CIRISPersist#989) — the holding claim is `custody:ack:v1`
+        // `here`; a `none` report names bytes the signer does not hold.
+        let holding_claim_sha = super::custody_ack::parse_custody_ack(row)
+            .ok()
             .flatten()
-            .filter(|s| is_hex64(s))
-            .map(str::to_owned);
+            .filter(|a| a.state == super::custody_ack::CustodyState::Here)
+            .map(|a| a.blob_sha256_hex)
+            .filter(|s| is_hex64(s));
         Self {
             id: row.attestation_id.clone(),
             accountability: super::admission::envelope_dimension(&row.attestation_envelope)
@@ -691,7 +693,7 @@ impl RowFacts {
             .map(str::to_owned),
             is_scores: row.attestation_type == attestation_type::SCORES,
             refs: evidence_refs(&row.attestation_envelope),
-            holds_bytes_sha,
+            holding_claim_sha,
         }
     }
 }
@@ -918,7 +920,7 @@ where
             .values()
             .filter(|r| r.plane == PurgePlane::Attestation)
             .filter_map(|r| {
-                let sha = facts.get(&r.id)?.holds_bytes_sha.clone()?;
+                let sha = facts.get(&r.id)?.holding_claim_sha.clone()?;
                 Some(PurgeRecord {
                     plane: PurgePlane::Blob,
                     id: sha,
@@ -1136,8 +1138,8 @@ fn attestation_subjects(row: &Attestation) -> BTreeSet<String> {
 /// - a **trace**: the author and subjects of its own `trace:complete:v1`
 ///   attestation (every held trace has one, #473/#478) — the signing agent;
 /// - a **blob**: the subjects of EVERY row held here that holds or binds it
-///   (each `holds_bytes` claim on its sha, and each `scores` row whose
-///   `evidence_refs` cite it), every tier, resolved LOCALLY
+///   (each `scores` row whose `evidence_refs` cite it — the holding claims,
+///   `custody:ack:v1`, among them since v55.0.0), every tier, resolved LOCALLY
 ///   ([`blob_binding_subjects`]). Never the record's `derived_from`: on a
 ///   replicated bundle that is the sender's metadata, and a peer could point a
 ///   person's blob at a harmless row (Codex round 2 on PR #1057). A blob no
@@ -1242,10 +1244,13 @@ where
 }
 
 /// The subjects of the rows held HERE that hold or bind each blob in `shas`
-/// (64-hex sha256): every `holds_bytes` claim whose first `evidence_refs`
-/// entry is the sha, and every `scores` row whose `evidence_refs` cite it,
-/// every tier, in one attestation scan. A sha no held row names is absent
-/// from the map. Local state only: never a bundle's `derived_from`.
+/// (64-hex sha256): every `scores` row whose `evidence_refs` cite it, every
+/// tier, in one attestation scan. v55.0.0 (CIRISPersist#989) — the holding
+/// claim is a `scores` row on `custody:ack:v1` citing its blob, so it is one
+/// of them; a retired `holds_bytes` row a node still holds is read by no fold
+/// and names nothing here (a blob only it named is not proven non-human and
+/// is refused, fail-closed). A sha no held row names is absent from the map.
+/// Local state only: never a bundle's `derived_from`.
 ///
 /// # Errors
 ///
@@ -1262,15 +1267,7 @@ where
         return Ok(out);
     }
     scan_attestations(directory, |row| {
-        let named: Vec<&String> = if row
-            .attestation_type
-            .starts_with(super::HOLDS_BYTES_ATTESTATION_TYPE_PREFIX)
-        {
-            super::first_evidence_ref(&row.attestation_envelope)
-                .and_then(|sha| shas.get(sha))
-                .into_iter()
-                .collect()
-        } else if row.attestation_type == attestation_type::SCORES {
+        let named: Vec<&String> = if row.attestation_type == attestation_type::SCORES {
             evidence_refs(&row.attestation_envelope)
                 .iter()
                 .filter_map(|e| shas.get(e.as_str()))

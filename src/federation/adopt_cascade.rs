@@ -23,7 +23,7 @@
 
 use crate::federation::at_rest_cascade::AtRestEnvelope;
 use crate::federation::replication::hold::{would_hold, BlobProvenance, HoldContext};
-use crate::federation::types::cohort_scope::{self as cs, CryptoTier};
+use crate::federation::types::cohort_scope::CryptoTier;
 use crate::federation::{BlobError, BlobStorage, EpochBinding, FederationDirectory, StorageFloor};
 
 /// #846 (§4, §6.1) — Edge's `admit_blob_store` trichotomy, minus `Refuse`
@@ -31,8 +31,9 @@ use crate::federation::{BlobError, BlobStorage, EpochBinding, FederationDirector
 /// does not second-guess the MAY decision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdoptDisposition {
-    /// Store and emit `holds_bytes` signed by this node, carrying the
-    /// cleartext provenance CC 3.2 requires.
+    /// Store and emit this node's holding claim (v55.0.0, CIRISPersist#989:
+    /// `custody:ack:v1` `here`), placed at the content's own scope — the
+    /// owner's `self`, the family, the room — so it reaches the cohort only.
     Announce,
     /// Store; emit nothing.
     LocalOnly,
@@ -43,7 +44,7 @@ pub enum AdoptDisposition {
 pub struct AdoptOutcome {
     /// The address: SHA-256 of the ciphertext as stored.
     pub sha256: [u8; 32],
-    /// Whether a `holds_bytes` claim was emitted.
+    /// Whether a holding claim was emitted.
     pub announced: bool,
     /// Content-axis wraps projected from `KeyGrant` sets that arrived before
     /// the bytes and were signed by the author (§13; 0 when none waited).
@@ -141,14 +142,29 @@ where
     Ok((floor, binding))
 }
 
+/// v55.0.0 (CIRISPersist#989) — the group an adopted sealed row names: the
+/// binding's community for a room, else the provenance's owner or family.
+/// Recorded on the row (V177) and the scope its holding claim is placed at.
+fn adopt_group<'a>(
+    provenance: &'a BlobProvenance,
+    binding: Option<&'a EpochBinding>,
+) -> Option<&'a str> {
+    binding
+        .map(|b| b.community_key_id.as_str())
+        .or(provenance.community_key_id.as_deref())
+}
+
 /// #846 (§6.1) — **adopt a received sealed blob.** See the module doc for
 /// the order; `ctx` is the Engine's hold context (pressure, local-or-family,
 /// this node's key), and `signer` signs the holder claim when `disposition`
 /// is [`AdoptDisposition::Announce`].
 ///
-/// A `self` / `family` provenance can never announce (CC 5.2 — no holder
-/// claim is ever emitted for structurally invisible content); it is refused
-/// before the floor (I52).
+/// v55.0.0 (CIRISPersist#989, CC 3.1.3.3) — every sealed tier may announce:
+/// the claim is placed at the content's scope (`self`, the family, the room),
+/// so a `self` / `family` adopt announces to its own cohort and nobody else
+/// (I52 refused it while the only claim was the federation-scoped
+/// `holds_bytes`). The holder must be in the cohort; a node that is not is
+/// refused at the floor before anything is written.
 ///
 /// `pqc` — CIRISPersist#851 §20.5: a classical-only claim is confined to
 /// local tier (CC 5.3.2.4.3.1); with a LocalSigner the claim is
@@ -171,13 +187,6 @@ where
     let _ = aad;
     let (floor, binding) = resolve_adopt(backend, ctx.our_key_id, envelope, provenance).await?;
     let announce = disposition == AdoptDisposition::Announce;
-    if announce && cs::suppresses_holds_bytes(&provenance.cohort_scope) {
-        return Err(BlobError::InvalidArgument(format!(
-            "adopt: {:?} content is structurally invisible — no holds_bytes claim is ever \
-             emitted for it (CC 5.2); adopt it LocalOnly",
-            provenance.cohort_scope
-        )));
-    }
     would_hold(backend, ctx, provenance).await?;
     let claim = if announce {
         use sha2::Digest as _;
@@ -191,14 +200,21 @@ where
                     .into(),
             )
         })?;
+        // v55.0.0 (CIRISPersist#989) — the claim at the content's scope; the
+        // floor rebuilds the same scope from its own tier, cohort and group.
+        let scope = crate::federation::holding_claim::ClaimScope::of_content(
+            provenance.tier,
+            &provenance.cohort_scope,
+            adopt_group(provenance, binding.as_ref()),
+        )?;
         Some(
-            crate::federation::blobs::sign_holds_bytes_claim(
+            crate::federation::holding_claim::sign_holding_claim(
                 local,
                 &sha256,
-                ctx.our_key_id,
                 uuid::Uuid::new_v4(),
                 chrono::Utc::now(),
                 envelope.len() as u64,
+                &scope,
             )
             .await?,
         )
@@ -212,7 +228,8 @@ where
             &provenance.cohort_scope,
             &provenance.author_key_id,
             floor,
-            binding,
+            binding.clone(),
+            adopt_group(provenance, binding.as_ref()),
             claim,
         )
         .await?;

@@ -1285,7 +1285,7 @@ impl PyEngine {
     /// 2. The headless-darwin `Keychain not unlocked` failure mode
     ///    that CIRISConformance #140 surfaced for `evict_actor_json`
     ///    — when the platform signer can't reach the keychain, every
-    ///    holds_bytes withdraws emission fails; the local-signer
+    ///    holding-claim withdraws emission fails; the local-signer
     ///    fast-path bypasses that entirely when applicable.
     fn select_signer(&self, attesting_key_id: &str) -> Arc<dyn ciris_keyring::HardwareSigner> {
         match self
@@ -1301,8 +1301,8 @@ impl PyEngine {
     }
 
     /// CIRISPersist#851 §20.5 (operator ruling) — **the announcing signer:
-    /// hybrid/PQC only, no legacy fallback.** A federation-tier `holds_bytes`
-    /// claim is signed by the LocalSigner whose derived id IS the claimed
+    /// hybrid/PQC only, no legacy fallback.** A holding claim (v55.0.0:
+    /// `custody:ack:v1`) is signed by the LocalSigner whose derived id IS the claimed
     /// attester (a normal Python call attests as the derived id; a
     /// keystore-alias caller matches by alias). No LocalSigner, or one that
     /// is not this attester, and the door REFUSES — never a classical claim
@@ -1327,7 +1327,7 @@ impl PyEngine {
         let local = self.local_signer.clone().ok_or_else(|| {
             blob_err_to_py(crate::federation::BlobError::AttestationEmissionFailed(
                 "hybrid-only: this engine has no PQC LocalSigner and cannot announce a \
-                 federation-tier holds_bytes claim (CIRISPersist#851 §20.5 / CC 5.3.2.4.3.1)"
+                 holding claim (CIRISPersist#851 §20.5 / CC 5.3.2.4.3.1)"
                     .into(),
             ))
         })?;
@@ -2232,7 +2232,7 @@ impl PyEngine {
         // P-256 signer (its `public_key()` is a 65-byte uncompressed EC point,
         // NOT a 32-byte Ed25519 key), so using it as `self.signer` desynced
         // every key_id-deriving / scrub path (`local_derived_key_id`,
-        // `put_blob_signing`'s holds_bytes scrub, `register_self_federation_key`)
+        // `put_blob_signing`'s holding-claim scrub, `register_self_federation_key`)
         // from `sign_hybrid` (which signs classical via the Ed25519
         // `local_signer`) — and stored an unverifiable P-256 key under
         // `pubkey_ed25519_base64`. When a software-tier platform signer is
@@ -7304,7 +7304,7 @@ impl PyEngine {
     /// key_id `derive_key_id(<alias>, <pubkey>)` (= `engine.local_derived_key_id()`),
     /// NOT the bare keystore alias. Thread this returned value back as the
     /// `attesting_key_id` to `put_blob_signing` / the emit helpers so the
-    /// holds_bytes / withdraws `scrub_key_id` FK resolves (CIRISPersist#275;
+    /// holding-claim / withdraws `scrub_key_id` FK resolves (CIRISPersist#275;
     /// the #247 floor).
     ///
     /// Idempotent on `(key_id)` PRIMARY KEY of `federation_keys` — the
@@ -7352,7 +7352,7 @@ impl PyEngine {
             // every emit/scrub path derives its key_id from), keyed by the
             // DERIVED federation key_id. Pre-#275 this FFI registered the
             // `LocalSigner` seed's identity (or, earlier, the bare alias) —
-            // a row the holds_bytes / withdraws scrub FK could never resolve
+            // a row the holding-claim / withdraws scrub FK could never resolve
             // against when the composed signer and the local seed are
             // distinct identities, so `put_blob_signing` FK-failed on every
             // persist ≥ 9.3.0. Reconstruct the hybrid-capable engine over
@@ -10349,8 +10349,7 @@ impl PyEngine {
     }
 
     /// v3.9.2 (CIRISPersist#153 Ask 5, CEG 0.7 §10.1.4) — store blob
-    /// bytes locally at the COMMONS tier WITHOUT emitting a `holds_bytes`
-    /// directory attestation.
+    /// bytes locally at the COMMONS tier WITHOUT emitting a holding claim.
     ///
     /// **v43.0.0 (`BLOB_ENCRYPTION_AT_REST.md` §11.2): this is not the
     /// private-content door any more.** The row it writes is
@@ -10427,7 +10426,7 @@ impl PyEngine {
     /// **the LocalOnly plaintext door.** Store commons bytes this node
     /// verified itself (size first, then digest — CC 5.3.2.5), announcing
     /// nothing: `cohort_scope = federation`, `crypto_tier = plaintext`, no
-    /// `holds_bytes` claim, no signer. Content-address checked
+    /// holding claim, no signer. Content-address checked
     /// (`sha256(bytes) == sha256_hex`, else `HashMismatch`) and bounded by
     /// the inline cap. Idempotent on the address. The plaintext twin of
     /// `adopt_sealed_blob_json`'s `LocalOnly` disposition; the raw-bytes
@@ -13581,7 +13580,10 @@ impl PyEngine {
     }
 
     /// Federation blob storage: list holders of a blob by SHA-256
-    /// (hex). Returns a JSON array of attesting_key_id strings.
+    /// (hex). Returns a JSON array of attesting_key_id strings: every
+    /// holder whose latest holding claim (v55.0.0: `custody:ack:v1`,
+    /// CIRISPersist#989) is a live `here` (72 h; any age when this node
+    /// holds the bytes itself).
     fn list_holders_json(&self, py: Python<'_>, sha256_hex: &str) -> PyResult<String> {
         self.ensure_usable()?;
         catch_panic(|| {
@@ -13615,12 +13617,13 @@ impl PyEngine {
     }
 
     /// v45.0.0 (CIRISPersist#871, `FSD/MEDIA_SOURCE.md` §4, AV-88/AV-89) —
-    /// **the puller's budget read.** Every live `holds_bytes` claim for the
-    /// blob with the byte length the holder SIGNED, as a JSON array of
+    /// **the puller's budget read.** Every holder whose latest holding claim
+    /// (v55.0.0: `custody:ack:v1` `here`) about the blob stands, with the
+    /// byte length the holder SIGNED, as a JSON array of
     /// `{"key_id": "...", "size": N}` sorted by `key_id`. The selection is
-    /// `list_holders_json`'s without the CEG §10.1.2 freshness window (the
-    /// holder's own `withdraws` / `recants` are still folded out); a claim
-    /// with no positive integer `size` is skipped. A puller caps its
+    /// `list_holders_json`'s without the 72-hour freshness window (the
+    /// holder's own `withdraws` / `recants` and later `none` still fold it
+    /// out). A puller caps its
     /// `ContentFetch` read at `size` BEFORE hashing and refuses a holder
     /// whose number disagrees with the descriptor it is fetching for.
     fn list_holders_sized_json(&self, py: Python<'_>, sha256_hex: &str) -> PyResult<String> {
@@ -13706,9 +13709,9 @@ impl PyEngine {
 
     /// v3.5.2 (CIRISPersist#130) — Federation blob storage:
     /// **local-truth** holder query. Returns a JSON array of
-    /// `attesting_key_id` strings for every holds_bytes attestation
-    /// the substrate has for this blob, **regardless of the CEG
-    /// §10.1.2 24-hour TTL window**. The bytes are locally held
+    /// `attesting_key_id` strings for every holder whose latest holding
+    /// claim (v55.0.0: `custody:ack:v1`) about this blob is `here`,
+    /// **regardless of the 72-hour freshness window**. The bytes are locally held
     /// (verified by checking `federation_blobs`); the substrate's
     /// audit chain is the source of truth.
     ///
@@ -13802,9 +13805,10 @@ impl PyEngine {
 
     /// v3.5.0 (CIRISPersist#125) — Federation blob storage: per-actor
     /// eviction. Deletes every `federation_blobs` row this Engine
-    /// holds for `attesting_key_id`, AND emits a `withdraws`
-    /// attestation against each of the actor's `holds_bytes`
-    /// attestations (CEG §10.1.2). Returns a JSON-encoded
+    /// holds that `attesting_key_id` claims `here`, AND retracts THIS
+    /// node's own holding claims about each with its own `withdraws`
+    /// (v55.0.0, CC 3.1.3.3 rule 4: nobody retracts another device's
+    /// claim). Returns a JSON-encoded
     /// [`crate::federation::EvictActorReport`].
     ///
     /// The signer is sourced internally from the Engine's composed
@@ -14351,7 +14355,7 @@ impl PyEngine {
             let signer = self.local_signer.clone().ok_or_else(|| {
                 blob_err_to_py(crate::federation::BlobError::Backend(
                     "sweep_community_epochs requires a LocalSigner to sign the withdraws that \
-                     retract holds_bytes announcements (§11.5); this engine has none"
+                     retract this node's holding claims (§11.5); this engine has none"
                         .into(),
                 ))
             })?;
@@ -14949,7 +14953,8 @@ impl PyEngine {
     /// #846 (`BLOB_REPLICATION.md` §6.1) — **adopt a sealed blob received
     /// from a peer**: store the `AtRestEnvelope` verbatim at the tier and
     /// under the `(community, epoch)` binding its provenance declares, and
-    /// — for `"announce"` — emit `holds_bytes` signed by this node. Never
+    /// — for `"announce"` — emit this node's holding claim, placed at the
+    /// content's own scope (v55.0.0, CIRISPersist#989). Never
     /// opens the envelope (I45); the binding is the author's fact (no
     /// current-epoch check, no key state required — §3).
     ///
@@ -15482,7 +15487,7 @@ impl PyEngine {
     }
 
     /// v51.3.0 (CIRISPersist#947 ask 3) — **store a plaintext chunk DAG and
-    /// announce its manifest** (`holds_bytes`, this node's claim), so a
+    /// announce its manifest** (this node's holding claim), so a
     /// pulled commons DAG is not a silent holder. Payload: the
     /// `put_blob_chunks_json` payload plus `"author_key_id"` (whose content
     /// this is). Returns JSON `{"manifest_sha256": "<hex>", "announced": true}`.
@@ -15690,7 +15695,7 @@ impl PyEngine {
     /// `cohort_scope`.** Refuses unless every chunk ROW is at the DAG's tier
     /// (I32); builds the manifest (v2 with PLAINTEXT sizes for a sealed
     /// tier), seals it under the DAG's DEK, stores it, and announces
-    /// `holds_bytes` under the local signer at `Plaintext` / `CommunityDek`.
+    /// this node's holding claim at the content's scope (every tier, v55.0.0).
     ///
     /// Returns JSON: `manifest_sha256` (hex — the DAG's content address),
     /// `tier`, `epoch`, `chunk_count`, `total_size` (plaintext), `granted`,
@@ -15973,10 +15978,10 @@ impl PyEngine {
     ///
     /// The `InvisibleEncrypted` tier: a fresh per-write DEK wrapped to every
     /// ACTIVE occurrence of the owner (`self`) or of every member
-    /// (`family`), plus persist's own self-retention wrap. Unlike the
-    /// community tier this also SUPPRESSES `holds_bytes` — self/family bytes
+    /// (`family`), plus persist's own self-retention wrap. Self/family bytes
     /// never cost the federation a directory entry (the locality dividend,
-    /// FEDERATION_SCALING_MODEL §9.5).
+    /// FEDERATION_SCALING_MODEL §9.5): v55.0.0 — their holding claims are
+    /// placed at `self` / the family and reach the cohort only.
     ///
     /// `cohort_scope` must be `self` or `family`; anything else is refused
     /// (the community tiers go through
@@ -16109,7 +16114,8 @@ impl PyEngine {
     }
 
     /// v3.3.0 (CIRISPersist#121) — one-call ingest. Persist owns the
-    /// holds_bytes envelope construction, canonicalization (via the
+    /// holding-claim envelope construction (v55.0.0: `custody:ack:v1`
+    /// `here` at `federation`), canonicalization (via the
     /// production `PythonJsonDumpsCanonicalizer`, NOT JCS), signing
     /// (via the engine's composed `Arc<dyn HardwareSigner>` —
     /// cross-cdylib accessors `keyring_signer_capsule` /
@@ -25698,8 +25704,9 @@ impl PyEngine {
     /// `community_dek` blob the epoch binding's minter (#876); for a `self` /
     /// `family` blob the attester of the admitted `key_grant:content:v1` set
     /// naming the sha; `null` when this node holds neither. A puller for a
-    /// self/family blob asks THIS, never `list_holders` (CC 5.2: no holder
-    /// claim exists at those scopes). JSON string or `null`.
+    /// self/family blob asks THIS for the key; v55.0.0 — its holders are
+    /// the holding claims at `self` / the family, which reach only the
+    /// cohort's own nodes (CC 3.1.3.3). JSON string or `null`.
     fn minter_of_blob_json(&self, py: Python<'_>, sha256_hex: &str) -> PyResult<String> {
         self.ensure_usable()?;
         catch_panic(|| {
@@ -34662,8 +34669,8 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         // v44.8.0 (CIRISPersist#866 C1) — a malformed consent scope token is
         // caller-fault malformed content; ValueError (4xx), the kind names it.
         crate::federation::Error::ConsentScopeTokenInvalid { .. } => PyValueError::new_err(kind),
-        // v45.0.0 (CIRISPersist#871) — a malformed media Source struct, or a
-        // `holds_bytes` claim without a size, is caller-fault malformed
+        // v45.0.0 (CIRISPersist#871) — a malformed media Source struct is
+        // caller-fault malformed
         // content; ValueError (4xx), the kind names it.
         crate::federation::Error::MediaSourceInvalid { .. } => PyValueError::new_err(kind),
         // v3.4.0 (CIRISPersist#123) — trust gate rejection is
@@ -35093,7 +35100,7 @@ fn blob_err_to_py(e: crate::federation::BlobError) -> PyErr {
         // v10.0.1 (CIRISPersist#275) — keep the stable `kind` token as a
         // prefix (callers branching on `str(e).startswith(...)` / `in`
         // still match) but append the inner detail, which carries the
-        // underlying cause (e.g. the holds_bytes/withdraws scrub_key_id FK
+        // underlying cause (e.g. the holding-claim/withdraws scrub_key_id FK
         // violation) — previously swallowed to a bare token.
         crate::federation::BlobError::AttestationEmissionFailed(ref detail) => {
             PyValueError::new_err(format!("{kind}: {detail}"))
@@ -35412,7 +35419,7 @@ fn parse_put_blob_payload(json: &str) -> PyResult<PutBlobPayload> {
 
 /// v3.9.2 (CIRISPersist#153 Ask 5) — wire shape for
 /// `store_blob_local_json`: `put_blob_json` minus the `attestation`
-/// field (local-only storage emits no holds_bytes attestation).
+/// field (local-only storage emits no holding claim).
 #[derive(serde::Deserialize)]
 struct StoreBlobLocalJsonWire {
     sha256: String,
@@ -39589,7 +39596,7 @@ fn install_panic_logger() -> bool {
 /// paired with that pin so a future reader can tell the witness is
 /// load-bearing rather than vacuous.
 ///
-/// `blobs.rs`'s `put_blob_signing_canonicalizer_identity_holds_bytes_envelope`
+/// `blobs.rs`'s `put_blob_signing_canonicalizer_identity_holding_claim_envelope`
 /// and `pipeline.rs`'s edge-signing pins record the ASCII-AGREEMENT property;
 /// this module is deliberately their mirror image.
 #[cfg(test)]

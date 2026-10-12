@@ -1,6 +1,7 @@
 //! Eviction sweeper — bounded-batch LRU+frequency eviction over
-//! `federation_blobs`, plus signed `withdraws` emission against the
-//! prior `holds_bytes` attestation per evicted row.
+//! `federation_blobs`, plus signed `withdraws` emission against this node's
+//! own holding claims (v55.0.0: `custody:ack:v1`, CIRISPersist#989) per
+//! evicted row.
 //!
 //! v3.4.0 (CIRISPersist#123). The sweeper owns one
 //! [`tokio::task::JoinHandle`]; the `EngineCell` singleton holds the
@@ -78,7 +79,7 @@ impl EvictionDecay {
 /// v3.4.0 (CIRISPersist#123) — one candidate row returned by a
 /// backend's sweeper scan. Carries everything the Engine needs to:
 /// 1. compute the decay-weighted eviction score (Rust-side ranking),
-/// 2. look up the prior `holds_bytes` attestation_id by SHA,
+/// 2. look up this node's own holding claims about the SHA,
 /// 3. tally `bytes_freed` per delete.
 #[derive(Debug, Clone)]
 pub struct EvictionCandidate {
