@@ -554,11 +554,15 @@ impl RowMirror {
             weight: match row.weight {
                 None => None,
                 Some(w) => Some(serde_json::Number::from_f64(w).ok_or_else(|| {
-                    super::Error::InvalidArgument(format!(
-                        "attestation {}: `weight` {w} is not finite and cannot be bound into the \
-                         signed envelope (CIRISPersist#643)",
-                        row.attestation_id
-                    ))
+                    super::Error::malformed_row(
+                        "attestation",
+                        super::malformed_row::ENVELOPE_MEMBER_INVALID,
+                        format!(
+                            "attestation {}: `weight` {w} is not finite and cannot be bound into \
+                             the signed envelope (CIRISPersist#643)",
+                            row.attestation_id
+                        ),
+                    )
                 })?),
             },
         })

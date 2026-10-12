@@ -412,6 +412,52 @@ threat-model citations because this crate's audit story is the point.
   evidence_refs[0])`, both dialects: the holder directory's attester-free
   citation seek.
 
+### Slice D — hardening backlog
+
+#### Changed — a malformed signed row is a typed, TERMINAL refusal (#1055, from CIRISEdge's adopt of v54.1)
+
+- **`Error::MalformedRow { plane, reason, message }`**, kind `federation_malformed_row`, replaces the generic `InvalidArgument` wherever a signed row's own bytes cannot be read as the claim they carry. It is terminal at the first refusal: no row this node could receive later changes the verdict on those bytes. `reason` is a stable token from the new public `federation::malformed_row` (`ALL` lists them): `no_signer`, `envelope_member_missing`, `envelope_member_invalid`, `typed_diverges_from_envelope`, `envelope_not_canonical`, `custody_ack_malformed`, `moderation_subject_digest_malformed`. `plane` names the door: `identity_occurrence`, `identity_occurrence_revocation`, `transport_destination`, `touch_claim`, `attestation`, `key_registration`, `trust_grant`, `trust_revocation`, `custody_ack`, or the plane `unknown_signer` was asked for. The Display is the previous text without the `invalid argument:` prefix. Python raises `ValueError("federation_malformed_row: {plane}: {reason}")`, the same type as the `InvalidArgument` arm it replaces.
+- **What moved.** An empty signer id (every door's signer lookup, and the key plane's empty `scrub_key_id`); a signed envelope member that is missing or ill-typed (not a string, not RFC 3339, not a finite number, an instant finer than a microsecond, a cosignature set that is not a threshold-signature array); a typed column that diverges from the envelope it mirrors (the #643 row mirror, `asserted_at`, `expires_at`, and the occurrence, revocation, transport-destination and touch-claim projections, `device_class` among them); an envelope that does not canonicalize; a malformed `custody_ack`; a malformed moderation subject digest.
+- **What stayed an `InvalidArgument`.** A caller's argument error, and every POLICY refusal (a duty naming a permission this node does not hold, a lease over the bound, a self-report by a third party, …). So did the two time-dependent refusals: an `asserted_at` or `fresh_as_of` past the skew bound is not malformed, because the same bytes admit once the clock catches up. The local producer's own builders (`emit_attestation`, `bind_revocation_into_envelope`), `check_encryption_pubkeys` (the local occurrence door's typed keys) and the bytes plane's `BlobError` are unchanged.
+- **`LicensureDelegatorNotAuthority`'s Display** is now `licensure_delegator_not_authority: {reason}: …`, without the `invalid argument:` prefix that made logs read it as an `InvalidArgument`. `kind()` and the Python message are unchanged.
+- **I834** (memory, sqlite, postgres): a typed `asserted_at`, a typed mirror column and a typed occurrence `device_class` moved off the signed envelope are each `MalformedRow { reason: typed_diverges_from_envelope }` on their plane, and the untouched rows admit. **I632** now pins `MalformedRow { reason: no_signer }`.
+
+#### Changed — `purge_unauthorised` says WHY, and whether to retry (#1055, CIRISEdge's ask)
+
+- The `PurgeRefused` body of a `purge_unauthorised` refusal is now `{notice_id, reason, retryable, detail}`. **`reason` is a token** from the new public `steward_purge::unauthorised_reason`, and **the prose moved to `detail`** (before, `reason` was the prose).
+- **Retryable** (an ordering gap: a later row or this node's clock can turn the refusal into an authorisation): `root_not_held`, `root_not_rooted`, `cosigner_key_not_held`, `not_yet_valid`. **Terminal**: `stalled`, `expired`, `not_a_seat`, `duplicate_cosigner`, `signature_invalid`, `no_cosignature`, `quorum_not_met`, `protocol_unevaluable`, `wrong_basis`, `notice_malformed`. `retryable` is `unauthorised_reason::is_retryable(reason)`; `RETRYABLE` and `ALL` list them.
+- `canonical_community::trust_root_cosigners_over` returns `Ok(Err((reason, detail)))`; its one caller is the purge door.
+- **I833** (memory, sqlite, postgres): a rootless receiver refuses a bundle `root_not_held`, `retryable: true`, and once the root lands the same bundle is no longer refused as unauthorised; a notice from this node's future is `not_yet_valid` and authorises once the clock reaches it; a forged cosignature is `signature_invalid`, `retryable: false`. **I650** now asserts the reason and the retryable bit of each of its eleven cases.
+
+#### Changed — the release pre-flight fails a bundle with no `charter_root_key_id` (#1056)
+
+- `scripts/preflight_trust_root.py` adopts CIRISEdge#571's stricter rule, so persist's copy and Edge's vendored one (CIRISEdge#575) converge: a v3 `bundle` response whose `charter_root_key_id` is absent, empty or not a string FAILS, even with its quorum met. Three new self-test fixtures (absent, blank, non-string); the self-test is 15 fixtures. I190 (f)'s short-quorum body now names its charter root, so its refusal is the quorum's alone, and it asserts that.
+
+#### Fixed — steward purge follow-ups (#1058)
+
+- **A purged v3 root takes its nested DAG, and an evicted child page cannot be served back.** `delete_blob` deleted a v3 root's `federation_manifest_children` relation with the root. That relation is what tells the purge plane a child page is withheld (`purge_withheld` walks child -> root), so after `purge_finalize` a child page a peer re-offered related to nothing and was served back by hash. The relation now stays, as V176's chunk relation already did (I483); `manifest_children` answers a held root's held children, so a promote and I202 read as before. `delete_blob` also deleted every child of the root regardless of other parents; it now deletes only a child no other HELD root relates. Both SQL backends.
+- **The Python raw byte reads ask the disposition.** `get_blob_json` and `get_blob_range` read the storage trait directly and asked neither a withdrawn binding nor a purge, and their docs offered them "for relays". They now refuse `blob_purged` / `blob_withdrawn` exactly as the viewer and serve doors do (`refuse_if_withdrawn`).
+- **I835** (sqlite, postgres, two nodes): a 60-chunk stream sealed at a 4 KiB cap (a v3 root over child pages) is delivered to B, bound, purged and finalized. The root, every child page and every chunk are gone; a child page a live root also relates stays and serves; an evicted child page and an evicted chunk a peer re-offers are held but withheld (`Purged`) at the serve door.
+- **I836** (from disk, comments and every test-gating form stripped): every Python method and every `pub` Engine method that calls the raw `get_blob` / `get_blob_range` asks `refuse_if_withdrawn` or `check_serve_disposition` in the same item.
+- The DSAR thought-signature orphan this issue's comment also named shipped in v54.1.0 (I831).
+
+#### Added — evidence rows for the steward purge door (#1059)
+
+- `evidence/cc_impl.tsv` publishes seven claims of the v54.1.0 steward purge door's Codex hardening, 16 rows, through `namespace_supersets.json` (appended entries, `manifest_round: cc-rc8-1059`, each naming its witnesses in `witness`) and `scripts/evidence_tsv.py write`. Every row points at the production definition.
+  - **CC 3.3.2:** `CLM-steward-purge-authorisation` (`verify_purge_authorisation`, `trust_root_cosigners_over`; I650, I833, I656).
+  - **CC 4.5.3:** `CLM-purge-atomic-commit` (`check_purge_put_set`, both backends' `purge_put_execution`; I695), `CLM-purge-dwell-node-clock` (`purge_clock`, `purge_finalize`; I822, I655), `CLM-purge-out-of-order-void` (`tombstone_void_reason`, `refuse_if_tombstoned_attestation`; I697, I828), `CLM-purge-subject-unknown-retryable` (`refuse_if_tombstoned_attestation`, `refuse_if_tombstoned_trace`; I832), `CLM-purge-blob-withheld` (`purge_withheld`, `refuse_if_withdrawn`; I824, I835, I836) and `CLM-purge-projections-removed` (`ATTESTATION_PROJECTIONS`, both backends' `purge_attestation_projections`; I829, I829b).
+- Not published, because a row graduates only when its whole claim is backed: `CLM-takedown-notice-row` (not shipped; rides the rc8 vendor); `CLM-one-tombstone-row` and `CLM-derived-rows-follow-reason` waited on their takedown halves, which slice C (#1007) ships and publishes in this release; `CLM-purge-digest-preimage` ("the notice is an admitted Contribution" waits for the rc8 vendor's notice row).
+- The version-pin witness's exact count is 218 in the integrated 55.0.0: 188 at v54.1.0, +14 from slices A and C, +16 here.
+
+#### Adoption (Edge, Server)
+
+- **New exhaustive enum variant:** `federation::Error::MalformedRow { plane: &'static str, reason: &'static str, message: String }` (kind `federation_malformed_row`). A `match` on `federation::Error` needs an arm. It is TERMINAL; Edge's 8-refusal bound for these `InvalidArgument`s can go.
+- **New refusal tokens:** `federation::malformed_row::{NO_SIGNER, ENVELOPE_MEMBER_MISSING, ENVELOPE_MEMBER_INVALID, TYPED_DIVERGES_FROM_ENVELOPE, ENVELOPE_NOT_CANONICAL, CUSTODY_ACK, MODERATION_SUBJECT_DIGEST}`; `steward_purge::unauthorised_reason::{ROOT_NOT_HELD, ROOT_NOT_ROOTED, COSIGNER_KEY_NOT_HELD, NOT_YET_VALID, STALLED, EXPIRED, NOT_A_SEAT, DUPLICATE_COSIGNER, SIGNATURE_INVALID, NO_COSIGNATURE, QUORUM_NOT_MET, PROTOCOL_UNEVALUABLE, WRONG_BASIS, NOTICE_MALFORMED}`.
+- **Kind changes:** rows that were `federation_invalid_argument` for the reasons above are now `federation_malformed_row`. The Python exception TYPE is unchanged (`ValueError`); the message is `federation_malformed_row: {plane}: {reason}` instead of `federation_invalid_argument`.
+- **Display changes:** `LicensureDelegatorNotAuthority` and every `MalformedRow` lose the `invalid argument:` prefix. Edge's witnesses that pin the licensure text need the new prefix.
+- **`purge_unauthorised` body:** read `reason` as a token and `retryable` as the verdict; the prose is `detail`. v54.1's "treat replicated-apply `purge_unauthorised` as retryable with a cap" becomes: retry only when `retryable` is true.
+- **Python `get_blob_json` / `get_blob_range`** now raise `ValueError` `blob_purged` / `blob_withdrawn` for withheld bytes.
+
 ## [54.1.0] - 2026-10-10
 
 ### Added — the generic steward purge door (#1046, CIRISConstitution#165, CSD-108)

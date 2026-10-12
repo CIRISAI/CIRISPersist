@@ -1121,6 +1121,99 @@ mod tests {
         );
     }
 
+    /// The items of `text` (comments stripped), one per `fn`, with the
+    /// item's header line: `(header, body)`. Crude — an item runs to the next
+    /// `fn` header — which errs toward a LONGER body, never a shorter one.
+    fn fn_items(text: &str) -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = Vec::new();
+        for line in text.lines() {
+            let t = line.trim_start();
+            if t.starts_with("//") {
+                continue;
+            }
+            let code = t.split(" //").next().unwrap_or(t);
+            let is_fn = [
+                "fn ",
+                "pub fn ",
+                "async fn ",
+                "pub async fn ",
+                "pub(crate) fn ",
+                "pub(crate) async fn ",
+                "pub(super) fn ",
+                "pub(super) async fn ",
+            ]
+            .iter()
+            .any(|p| code.starts_with(p));
+            if is_fn {
+                out.push((code.to_owned(), String::new()));
+            } else if let Some((_, body)) = out.last_mut() {
+                body.push_str(code);
+                body.push('\n');
+            }
+        }
+        out
+    }
+
+    /// **I836** (v55.0.0, CIRISPersist#1058) — **no host surface reads stored
+    /// bytes without asking the disposition.** The storage trait's raw
+    /// `get_blob` / `get_blob_range` ask nothing (neither a withdrawn binding
+    /// nor a steward purge); every door built over them does. A Python method
+    /// (`src/ffi/pyo3.rs`) or a `pub` Engine method that calls either must
+    /// ask [`refuse_if_withdrawn`](crate::federation::at_rest_cascade::refuse_if_withdrawn)
+    /// or `check_serve_disposition` in the same item. Before v55.0.0
+    /// `get_blob_json` and `get_blob_range` (Python) were the raw read,
+    /// documented "for relays". Production text only, comments stripped.
+    #[test]
+    fn i836_every_host_byte_read_asks_the_disposition() {
+        let raw = [".get_blob(", ".get_blob_range("];
+        let asks = ["refuse_if_withdrawn(", "check_serve_disposition("];
+        let mut offenders = Vec::new();
+        let mut reads = 0usize;
+        for (file, host) in [
+            ("src/ffi/pyo3.rs", (|_: &str| true) as fn(&str) -> bool),
+            ("src/engine.rs", |h: &str| {
+                h.starts_with("pub fn ") || h.starts_with("pub async fn ")
+            }),
+        ] {
+            for (header, body) in fn_items(&production_only(&src(file))) {
+                if !host(&header) || !raw.iter().any(|r| body.contains(r)) {
+                    continue;
+                }
+                reads += 1;
+                if !asks.iter().any(|a| body.contains(a)) {
+                    offenders.push(format!("{file}: {header}"));
+                }
+            }
+        }
+        assert!(
+            reads >= 4,
+            "I836: the scan found the known raw reads (serve, ranged serve, Python's two): {reads}"
+        );
+        assert!(
+            offenders.is_empty(),
+            "I836: a host surface reads stored bytes without asking the disposition \
+             (purged / withdrawn):\n{}",
+            offenders.join("\n")
+        );
+    }
+
+    /// I836's item splitter keeps a later item's call out of an earlier one,
+    /// and strips comments.
+    #[test]
+    fn i836_fn_items_splits_and_strips() {
+        let items = fn_items(
+            "fn a() {\n    // x.get_blob(\n    refuse_if_withdrawn(\n}\n\
+             pub async fn b() {\n    s.get_blob(\n}\n",
+        );
+        assert_eq!(items.len(), 2);
+        assert!(
+            !items[0].1.contains(".get_blob("),
+            "the comment is stripped"
+        );
+        assert!(items[1].0.starts_with("pub async fn b"));
+        assert!(items[1].1.contains(".get_blob(") && !items[1].1.contains("refuse_if"));
+    }
+
     fn walkdir(rel: &str) -> Vec<String> {
         let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(rel);
         let mut out = Vec::new();

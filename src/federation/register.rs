@@ -535,7 +535,9 @@ pub(crate) async fn stored_record_fails_verification<D: FederationDirectory + ?S
     }
     match verify_key_registration(directory, stored).await {
         Ok(_) | Err(Error::AttesterKeyUnknown { .. }) => Ok(false),
-        Err(Error::SignatureInvalid(_) | Error::InvalidArgument(_)) => Ok(true),
+        Err(
+            Error::SignatureInvalid(_) | Error::InvalidArgument(_) | Error::MalformedRow { .. },
+        ) => Ok(true),
         Err(e) => Err(e),
     }
 }
@@ -939,7 +941,9 @@ pub(crate) async fn prepare_invalid_replace<D: FederationDirectory + ?Sized>(
 pub(crate) fn key_refusal_of_verify_error(e: Error) -> Result<KeyRefusalReason, Error> {
     match e {
         Error::AttesterKeyUnknown { .. } => Ok(KeyRefusalReason::AttesterKeyUnknown),
-        Error::SignatureInvalid(_) | Error::InvalidArgument(_) => {
+        // v55.0.0 (CIRISPersist#1055) — a malformed record (no scrubber) is
+        // the same terminal outcome it was as an `InvalidArgument`.
+        Error::SignatureInvalid(_) | Error::InvalidArgument(_) | Error::MalformedRow { .. } => {
             Ok(KeyRefusalReason::UnverifiableSignature)
         }
         other => Err(other),
@@ -1431,8 +1435,10 @@ where
         ));
     }
     if record.scrub_key_id.is_empty() {
-        return Err(Error::InvalidArgument(
-            "scrub_key_id must be non-empty for registration".to_string(),
+        return Err(Error::malformed_row(
+            "key_registration",
+            super::malformed_row::NO_SIGNER,
+            "scrub_key_id must be non-empty for registration",
         ));
     }
     // #275 hardening — the classical pubkey must be a valid 32-byte Ed25519

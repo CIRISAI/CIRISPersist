@@ -143,6 +143,103 @@ pub mod token {
     ];
 }
 
+/// v55.0.0 (CIRISPersist#1055, from CIRISEdge's adopt of v54.1) — the closed
+/// set of `reason` tokens a [`token::UNAUTHORISED`] body carries, so an adopter
+/// maps an ORDERING GAP (retryable, capped) apart from a VERDICT (terminal)
+/// without reading prose. The body is `{notice_id, reason, retryable,
+/// detail}`: `reason` one of these, `retryable` = [`is_retryable`]`(reason)`,
+/// `detail` the prose (before v55.0.0 the prose was `reason`).
+///
+/// A replicated bundle is judged against the receiver's OWN trust root: a
+/// receiver that does not hold the claimant root's row (or a cosigner's key
+/// record) YET refuses it, and the same bundle authorises once that row
+/// lands. That is the gap; everything else is a verdict on the bytes or on
+/// the root as this node holds it.
+pub mod unauthorised_reason {
+    /// No community row at the claimant id: the trust root is not held YET.
+    /// **Retryable.**
+    pub const ROOT_NOT_HELD: &str = "root_not_held";
+    /// A row is held at the claimant id but does not root (its chain is not
+    /// held whole, or it never passed the accord door). **Retryable**: an
+    /// accord birth replaces a row that does not root.
+    pub const ROOT_NOT_ROOTED: &str = "root_not_rooted";
+    /// A cosigning seat's key record is not held YET. **Retryable.**
+    pub const COSIGNER_KEY_NOT_HELD: &str = "cosigner_key_not_held";
+    /// The notice is asserted beyond the clock-skew bound in this node's
+    /// future: it authorises once this node's clock reaches it.
+    /// **Retryable.**
+    pub const NOT_YET_VALID: &str = "not_yet_valid";
+    /// The held trust root is stalled (CC 3.2 T7): valid but non-admitting.
+    /// Terminal.
+    pub const STALLED: &str = "stalled";
+    /// The notice's window has closed. Terminal.
+    pub const EXPIRED: &str = "expired";
+    /// A cosignature is not a seat on the held trust root. Terminal.
+    pub const NOT_A_SEAT: &str = "not_a_seat";
+    /// A seat signed twice. Terminal.
+    pub const DUPLICATE_COSIGNER: &str = "duplicate_cosigner";
+    /// A cosignature does not verify over the notice. Terminal.
+    pub const SIGNATURE_INVALID: &str = "signature_invalid";
+    /// The notice carries no cosignature. Terminal.
+    pub const NO_COSIGNATURE: &str = "no_cosignature";
+    /// The verified seats do not meet the root's `consensus_protocol`.
+    /// Terminal.
+    pub const QUORUM_NOT_MET: &str = "quorum_not_met";
+    /// The root's `consensus_protocol` cannot be evaluated. Terminal.
+    pub const PROTOCOL_UNEVALUABLE: &str = "protocol_unevaluable";
+    /// The notice's `legal_basis` is not `steward_purge`. Terminal.
+    pub const WRONG_BASIS: &str = "wrong_basis";
+    /// The notice is missing a member, carries an ill-typed one, or does not
+    /// canonicalize. Terminal.
+    pub const NOTICE_MALFORMED: &str = "notice_malformed";
+
+    /// Every token.
+    pub const ALL: &[&str] = &[
+        ROOT_NOT_HELD,
+        ROOT_NOT_ROOTED,
+        COSIGNER_KEY_NOT_HELD,
+        NOT_YET_VALID,
+        STALLED,
+        EXPIRED,
+        NOT_A_SEAT,
+        DUPLICATE_COSIGNER,
+        SIGNATURE_INVALID,
+        NO_COSIGNATURE,
+        QUORUM_NOT_MET,
+        PROTOCOL_UNEVALUABLE,
+        WRONG_BASIS,
+        NOTICE_MALFORMED,
+    ];
+
+    /// The ordering gaps: a later row (or this node's clock) can turn the
+    /// refusal into an authorisation, so a sender re-offers with a cap.
+    pub const RETRYABLE: &[&str] = &[
+        ROOT_NOT_HELD,
+        ROOT_NOT_ROOTED,
+        COSIGNER_KEY_NOT_HELD,
+        NOT_YET_VALID,
+    ];
+
+    /// Is `reason` an ordering gap?
+    #[must_use]
+    pub fn is_retryable(reason: &str) -> bool {
+        RETRYABLE.contains(&reason)
+    }
+}
+
+/// A [`token::UNAUTHORISED`] refusal with its typed reason.
+fn unauthorised(notice_id: Option<&str>, reason: &'static str, detail: String) -> Error {
+    let mut body = serde_json::json!({
+        "reason": reason,
+        "retryable": unauthorised_reason::is_retryable(reason),
+        "detail": detail,
+    });
+    if let Some(id) = notice_id {
+        body["notice_id"] = serde_json::Value::String(id.to_owned());
+    }
+    refused(token::UNAUTHORISED, body)
+}
+
 /// The `takedown_notice` basis that authorises a steward purge (CC 3.3.2
 /// `LegalBasis::StewardPurge`, CIRISConstitution rc8@8c8f536).
 pub const STEWARD_PURGE_BASIS: &str = "steward_purge";
@@ -1426,9 +1523,10 @@ pub struct NoticeTerms {
 /// [`token::UNAUTHORISED`] when the envelope does not canonicalize.
 pub fn notice_signing_bytes(envelope: &serde_json::Value) -> Result<Vec<u8>, Error> {
     ciris_verify_core::accord_genesis::accord_family_signing_bytes(envelope).map_err(|e| {
-        refused(
-            token::UNAUTHORISED,
-            serde_json::json!({"reason": format!("the notice envelope does not canonicalize: {e}")}),
+        unauthorised(
+            None,
+            unauthorised_reason::NOTICE_MALFORMED,
+            format!("the notice envelope does not canonicalize: {e}"),
         )
     })
 }
@@ -1442,10 +1540,11 @@ pub fn notice_signing_bytes(envelope: &serde_json::Value) -> Result<Vec<u8>, Err
 pub fn notice_terms(envelope: &serde_json::Value) -> Result<NoticeTerms, Error> {
     let bytes = notice_signing_bytes(envelope)?;
     let notice_id = hex::encode(sha2::Sha256::digest(&bytes));
-    let unauth = |reason: String| {
-        refused(
-            token::UNAUTHORISED,
-            serde_json::json!({"notice_id": notice_id, "reason": reason}),
+    let unauth = |detail: String| {
+        unauthorised(
+            Some(&notice_id),
+            unauthorised_reason::NOTICE_MALFORMED,
+            detail,
         )
     };
     let s = |k: &str| -> Result<String, Error> {
@@ -1456,10 +1555,14 @@ pub fn notice_terms(envelope: &serde_json::Value) -> Result<NoticeTerms, Error> 
     };
     let basis = s("legal_basis")?;
     if basis != STEWARD_PURGE_BASIS {
-        return Err(unauth(format!(
-            "legal_basis {basis:?} does not authorise a steward purge (only \
+        return Err(unauthorised(
+            Some(&notice_id),
+            unauthorised_reason::WRONG_BASIS,
+            format!(
+                "legal_basis {basis:?} does not authorise a steward purge (only \
              `{STEWARD_PURGE_BASIS}` does, CIRISConstitution#165)"
-        )));
+            ),
+        ));
     }
     let claimant_key_id = s("claimant_key_id")?;
     // CC 3.3.2: for `steward_purge`, `content_sha256` IS the selection digest.
@@ -1546,24 +1649,23 @@ where
     F: FederationDirectory + ?Sized,
 {
     let terms = notice_terms(&notice.envelope)?;
-    let unauth = |reason: String| {
-        refused(
-            token::UNAUTHORISED,
-            serde_json::json!({"notice_id": terms.notice_id, "reason": reason}),
-        )
-    };
+    let unauth =
+        |reason: &'static str, detail: String| unauthorised(Some(&terms.notice_id), reason, detail);
     let skew = super::admission::DEFAULT_MAX_TOUCH_SKEW;
     if terms.asserted_at > now + skew {
-        return Err(unauth(format!(
-            "the notice is asserted at {}, in the future",
-            terms.asserted_at.to_rfc3339()
-        )));
+        return Err(unauth(
+            unauthorised_reason::NOT_YET_VALID,
+            format!(
+                "the notice is asserted at {}, in the future",
+                terms.asserted_at.to_rfc3339()
+            ),
+        ));
     }
     if terms.expires_at <= now {
-        return Err(unauth(format!(
-            "the notice expired at {}",
-            terms.expires_at.to_rfc3339()
-        )));
+        return Err(unauth(
+            unauthorised_reason::EXPIRED,
+            format!("the notice expired at {}", terms.expires_at.to_rfc3339()),
+        ));
     }
     match super::canonical_community::trust_root_cosigners_over(
         directory,
@@ -1575,7 +1677,7 @@ where
     .await?
     {
         Ok(signers) => Ok((terms, signers)),
-        Err(reason) => Err(unauth(reason)),
+        Err((reason, detail)) => Err(unauth(reason, detail)),
     }
 }
 

@@ -2201,7 +2201,10 @@ pub trait BlobStorage: Send + Sync {
     /// v52.0.0 (CIRISPersist#954) — the children a v3 root names on this
     /// node, as `(index, child_sha)` in index order, from
     /// `federation_manifest_children`. Empty for any other row. Read without
-    /// opening anything (I45): what eviction and serving walk.
+    /// opening anything (I45): what eviction and serving walk. v55.0.0
+    /// (CIRISPersist#1058): the relation rows outlive an evicted root (the
+    /// purge plane walks child -> root), so this answers only a HELD root's
+    /// HELD children.
     fn manifest_children(
         &self,
         root_sha256: &[u8; 32],

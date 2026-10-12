@@ -18986,9 +18986,18 @@ impl crate::federation::BlobStorage for SqliteBackend {
         let rows: Vec<(i64, Vec<u8>)> = self
             .read(
                 move |conn| -> Result<Vec<(i64, Vec<u8>)>, rusqlite::Error> {
+                    // v55.0.0 (CIRISPersist#1058) — the relation outlives an
+                    // evicted root (the purge plane walks it), so "names on
+                    // this node" is the HELD root's HELD children.
                     let mut stmt = conn.prepare(
-                        "SELECT child_index, child_sha256 FROM federation_manifest_children \
-                      WHERE root_sha256 = ?1 ORDER BY child_index ASC",
+                        "SELECT mc.child_index, mc.child_sha256 \
+                           FROM federation_manifest_children mc \
+                          WHERE mc.root_sha256 = ?1 \
+                            AND EXISTS (SELECT 1 FROM federation_blobs r \
+                                         WHERE r.sha256 = mc.root_sha256) \
+                            AND EXISTS (SELECT 1 FROM federation_blobs c \
+                                         WHERE c.sha256 = mc.child_sha256) \
+                          ORDER BY mc.child_index ASC",
                     )?;
                     let it =
                         stmt.query_map(rusqlite::params![root], |r| Ok((r.get(0)?, r.get(1)?)))?;
@@ -21618,11 +21627,23 @@ impl SqliteBackend {
         self.write(move |conn| -> Result<usize, rusqlite::Error> {
             let tx = conn.transaction()?;
             // v52.0.0 (#954) — a v3 root's children die with it (found by
-            // the relation, never by opening the root), and so does the
-            // relation itself.
+            // the relation, never by opening the root).
+            //
+            // v55.0.0 (CIRISPersist#1058) — but only a child no OTHER held
+            // root relates: a child two roots share stays while either is
+            // held. And the RELATION stays, as V176's chunk relation does
+            // (I483): it is what tells the purge plane a child page whose
+            // root was purged is withheld (`purge_withheld` walks child ->
+            // root). Deleting it let a peer re-offer an evicted child page
+            // and have this node serve it back by hash (I835).
             let children: Vec<Vec<u8>> = {
                 let mut stmt = tx.prepare(
-                    "SELECT child_sha256 FROM federation_manifest_children WHERE root_sha256 = ?1",
+                    "SELECT mc.child_sha256 FROM federation_manifest_children mc \
+                      WHERE mc.root_sha256 = ?1 \
+                        AND NOT EXISTS (SELECT 1 FROM federation_manifest_children o \
+                                          JOIN federation_blobs b ON b.sha256 = o.root_sha256 \
+                                         WHERE o.child_sha256 = mc.child_sha256 \
+                                           AND o.root_sha256 <> ?1)",
                 )?;
                 let it = stmt.query_map(rusqlite::params![sha_vec], |r| r.get(0))?;
                 it.collect::<Result<_, _>>()?
@@ -21639,10 +21660,6 @@ impl SqliteBackend {
                     rusqlite::params![sha],
                 )?;
             }
-            tx.execute(
-                "DELETE FROM federation_manifest_children WHERE root_sha256 = ?1",
-                rusqlite::params![sha_vec],
-            )?;
             // v54.0.0 (#995 row 4) — the rooms die with the row.
             tx.execute(
                 "DELETE FROM federation_blob_associations WHERE sha256 = ?1",

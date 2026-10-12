@@ -13310,6 +13310,10 @@ impl PyEngine {
     /// - Inline: `{"inline": "<base64-bytes>"}`
     /// - External: `{"external": {"uri": "...", "size_bytes": N,
     ///   "media_type": "...|null"}}`
+    ///
+    /// v55.0.0 (CIRISPersist#1058): raises `ValueError` (`blob_purged`) for a
+    /// blob a steward purge withholds and (`blob_withdrawn`) for one whose
+    /// binding row was withdrawn — the disposition every byte door asks.
     fn get_blob_json(&self, py: Python<'_>, sha256_hex: &str) -> PyResult<Option<String>> {
         self.ensure_usable()?;
         catch_panic(|| {
@@ -13321,6 +13325,15 @@ impl PyEngine {
                     let backend = pg.clone();
                     runtime.block_on(async move {
                         use crate::federation::BlobStorage;
+                        // v55.0.0 (CIRISPersist#1058) — the storage read is a
+                        // host surface: it asks the disposition every byte
+                        // door asks (purged, withdrawn), I836.
+                        crate::federation::at_rest_cascade::refuse_if_withdrawn(
+                            &*backend as &dyn crate::federation::FederationDirectory,
+                            &sha,
+                        )
+                        .await
+                        .map_err(blob_err_to_py)?;
                         let body_opt = backend.get_blob(&sha).await.map_err(blob_err_to_py)?;
                         match body_opt {
                             None => Ok(None),
@@ -13333,6 +13346,15 @@ impl PyEngine {
                     let backend = sq.clone();
                     runtime.block_on(async move {
                         use crate::federation::BlobStorage;
+                        // v55.0.0 (CIRISPersist#1058) — the storage read is a
+                        // host surface: it asks the disposition every byte
+                        // door asks (purged, withdrawn), I836.
+                        crate::federation::at_rest_cascade::refuse_if_withdrawn(
+                            &*backend as &dyn crate::federation::FederationDirectory,
+                            &sha,
+                        )
+                        .await
+                        .map_err(blob_err_to_py)?;
                         let body_opt = backend.get_blob(&sha).await.map_err(blob_err_to_py)?;
                         match body_opt {
                             None => Ok(None),
@@ -13393,6 +13415,9 @@ impl PyEngine {
     /// - External blob → a dict `{"external_uri": str, "range_start":
     ///   int, "range_end_inclusive": int}` — persist does NOT
     ///   dereference; the caller fetches that range from the URI itself.
+    ///
+    /// v55.0.0 (CIRISPersist#1058): `blob_purged` / `blob_withdrawn` as
+    /// `get_blob_json`.
     fn get_blob_range(
         &self,
         py: Python<'_>,
@@ -13410,6 +13435,13 @@ impl PyEngine {
                     let backend = pg.clone();
                     runtime.block_on(async move {
                         use crate::federation::BlobStorage;
+                        // v55.0.0 (CIRISPersist#1058) — see `get_blob_json`.
+                        crate::federation::at_rest_cascade::refuse_if_withdrawn(
+                            &*backend as &dyn crate::federation::FederationDirectory,
+                            &sha,
+                        )
+                        .await
+                        .map_err(blob_err_to_py)?;
                         backend
                             .get_blob_range(&sha, start, end_inclusive)
                             .await
@@ -13421,6 +13453,13 @@ impl PyEngine {
                     let backend = sq.clone();
                     runtime.block_on(async move {
                         use crate::federation::BlobStorage;
+                        // v55.0.0 (CIRISPersist#1058) — see `get_blob_json`.
+                        crate::federation::at_rest_cascade::refuse_if_withdrawn(
+                            &*backend as &dyn crate::federation::FederationDirectory,
+                            &sha,
+                        )
+                        .await
+                        .map_err(blob_err_to_py)?;
                         backend
                             .get_blob_range(&sha, start, end_inclusive)
                             .await
@@ -34552,6 +34591,12 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         // (ValueError), so it keeps that type; the KIND
         // (`federation_signer_not_acting_for`) marks it retryable.
         crate::federation::Error::SignerDoesNotActFor { .. } => PyValueError::new_err(kind),
+        // v55.0.0 (CIRISPersist#1055) — typed out of `InvalidArgument`
+        // (ValueError), so it keeps that type; the plane and the TERMINAL
+        // reason token ride with the kind.
+        crate::federation::Error::MalformedRow { plane, reason, .. } => {
+            PyValueError::new_err(format!("{kind}: {plane}: {reason}"))
+        }
         // v54.1.0 (CIRISPersist#1042 follow-up C) — typed out of
         // `InvalidArgument` / `Conflict` (both ValueError); same type, and the
         // licensure reason token rides with the kind.

@@ -692,7 +692,7 @@ pub mod bodies {
             reason.as_str()
         );
         // v54.1.0 (#1042 follow-up C) — typed: the kind and the reason token,
-        // never prose; the Display above is the pre-typing text, unchanged.
+        // never prose.
         assert_eq!(
             err.kind(),
             "federation_licensure_delegator_not_authority",
@@ -704,12 +704,12 @@ pub mod bodies {
             "{what}: the typed reason is `{}`: {err:?}",
             reason.as_str()
         );
+        // v55.0.0 (CIRISPersist#1055) — the Display begins with the refusal
+        // token: the `invalid argument:` prefix made logs read it as an
+        // InvalidArgument.
         assert!(
-            text.starts_with(&format!(
-                "invalid argument: {REFUSAL}: {}: ",
-                reason.as_str()
-            )),
-            "{what}: the Display keeps its pre-typing prefix: {text}"
+            text.starts_with(&format!("{REFUSAL}: {}: ", reason.as_str())),
+            "{what}: the Display begins with the refusal token: {text}"
         );
         assert!(
             dir.get_attestation(&row.attestation_id)
