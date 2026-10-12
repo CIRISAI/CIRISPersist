@@ -1455,6 +1455,55 @@ pub(crate) mod two_node {
             sets_on(a, &l.comm, &foreign, 0).await.is_empty(),
             "(D) no set is ever signed for an epoch this node did not mint"
         );
+
+        // (D') THE POSITIVE OUTCOME (v55.0.0, #989, CC 6.1.5.3): B's epoch is
+        // B's to re-wrap. d5's binding and anchor reach B; B's own door
+        // re-wraps B's epoch 0 to d5 and emits B's row to d5, and d5 opens it
+        // to the DEK B sealed under, so the re-added device reads B's content.
+        anchor_local(b, &bob, &d5).await;
+        let _ = bind_on_b(b, &bob, &d5.key, run).await;
+        let rb = l
+            .engine_b
+            .rekey_community_member_device_add(&l.comm, &bob, &d5.key, &bob)
+            .await
+            .unwrap_or_else(|e| panic!("(D') the door on B: {e}"));
+        assert!(
+            rb.granted.contains(&(l.node_b.clone(), 0)),
+            "(D') B re-wraps its own epoch 0 to d5: {rb:?}"
+        );
+        let row = set_carrying(b, &l.comm, &l.node_b, 0, &d5.key)
+            .await
+            .expect("(D') B emitted its epoch 0 row to d5");
+        let d5_wrap = KeyGrantRow::from_attestation(&row).unwrap().wrap;
+        assert_eq!(d5_wrap.recipient_key_id, d5.key, "(D') the row's recipient");
+        // B's serve gate hands the row to d5's node (refers-to), and to A —
+        // which hosts none of bob's holders — not at all.
+        assert!(
+            crate::federation::replication_audience::may_receive(b, &d5.key, &row)
+                .await
+                .unwrap()
+                .allowed(),
+            "(D') B's row crosses to d5"
+        );
+        assert!(
+            !crate::federation::replication_audience::may_receive(b, &l.node_a, &row)
+                .await
+                .unwrap()
+                .allowed(),
+            "(D') B's row to d5 never crosses to A"
+        );
+        let (_, b_own) = b
+            .community_dek_member_grant_wrap(&l.comm, &l.node_b, 0, &l.node_b)
+            .await
+            .unwrap()
+            .expect("(D') B's own wrap of its epoch 0");
+        let b_priv = b.load_content_kem_private_halves().await.unwrap();
+        assert_eq!(
+            unwrap_dek_v2_json(&d5.private, &d5_wrap.wrapped_dek)
+                .unwrap_or_else(|e| panic!("(D') d5 opens B's row: {e}")),
+            unwrap_dek_v2_json(&b_priv, &b_own).unwrap(),
+            "(D') d5 holds the DEK B's content is sealed under"
+        );
     }
 
     /// **I188(k) — CIRISPersist#967: a room that NEVER rotated is re-wrapped
