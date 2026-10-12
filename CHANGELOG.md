@@ -7,6 +7,20 @@ threat-model citations because this crate's audit story is the point.
 
 ## [Unreleased]
 
+## [54.1.1] - UNRELEASED
+
+### Fixed — the v54.1.0 tag's Windows wheel job
+
+- The v54.1.0 tag CI failed in one job, `maturin abi3-py311 wheel (windows-x86_64)`, at the new #1022 cache-trim step (`scripts/ci_cache_trim.py`).
+  - The trim itself had run. Its summary line prints `→`, and a Windows runner's Python stdio is cp1252, so it raised `UnicodeEncodeError`.
+  - The wheel had already been built and uploaded. The failure skipped the tag-gated "Sign + register multi-target build manifests" and "Attest wheels, release assets and cc_impl.tsv" jobs, so v54.1.0's GitHub release has no signed desktop manifests or attestations.
+- The fix:
+  - The script reconfigures stdout and stderr to UTF-8.
+  - `ci.yml` sets `PYTHONUTF8=1` for every job.
+  - Each of the five cache-trim steps is `continue-on-error`, because a cache optimisation never fails the build it follows.
+- Witness: `PYTHONIOENCODING=cp1252 python3 -c "print('→')"` raises; after the reconfigure, it prints.
+- No library code changed. Adopters of v54.1.0 need nothing new; v54.1.1 exists only to produce the signed, attested release artifacts.
+
 ## [54.1.0] - 2026-10-10
 
 ### Added — the generic steward purge door (#1046, CIRISConstitution#165, CSD-108)
