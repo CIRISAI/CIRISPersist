@@ -19,6 +19,13 @@
 //! - **I765** (sqlite, postgres) — a legacy v2 DAG's chunk 0 (granted through
 //!   `grant_dek_to_cohort`, no emission) reaches the owner's second device
 //!   through the dirty loop, with no manual emit.
+//! - **I769** (sqlite, postgres) — THE UPGRADED NODE. v54 shipped the owner
+//!   bug, so every v54 node holds self/family content axes marked emitted
+//!   with no rows. V192 (`key_grant_rows_reemit`, slice B's SET → rows step)
+//!   resets EVERY emission axis dirty, content axes included, and the boot
+//!   sweep then emits under the fixed owner: the seeded v54 state (blob,
+//!   ledger clean, no row) reaches the owner's second device after V192 and a
+//!   boot; V192 replayed and a second boot emit nothing more.
 //! - **I766** (sqlite, postgres) — a LEGITIMATE withholding still clears: the
 //!   signer holds no wrap of its own (a server-class occurrence) and the only
 //!   recipient's occurrence was revoked, so every recipient is withheld and
@@ -401,6 +408,97 @@ pub(crate) mod bodies {
         );
     }
 
+    /// Replay V192's bytes over a backend, as the migration runner does on a
+    /// node that took v54's migrations.
+    pub(crate) type ReplayV192<B> =
+        fn(&B) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>>;
+
+    /// **I769** — see the module doc.
+    pub(crate) async fn i769_an_upgraded_node_re_emits_v54s_cleared_content_axes<B>(
+        dsn_a: &str,
+        dsn_b: &str,
+        run: &str,
+        pick: Pick<B>,
+        replay_v192: ReplayV192<B>,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync + 'static,
+    {
+        use crate::federation::at_rest_cascade::orchestrate::encrypt_and_cascade;
+        let p = pair(dsn_a, dsn_b, run, pick, "i769").await;
+        let sealed = encrypt_and_cascade(
+            p.sa.as_ref(),
+            SELF,
+            &p.owner,
+            b"a v54 photo",
+            None,
+            None,
+            Some(&p.key_a),
+        )
+        .await
+        .expect("I769: A seals a self blob");
+        let sha = sealed.at_rest_sha256;
+        // ── v54 state: the axis planned under the node key, every recipient
+        // withheld, and marked emitted anyway. No row.
+        let wm =
+            p.sa.blob_key_grant_watermark(&sha)
+                .await
+                .unwrap()
+                .expect("a grant exists");
+        p.sa.blob_mark_key_grant_emitted(&sha, wm).await.unwrap();
+        assert!(
+            !dirty(p.sa.as_ref(), &p.key_a, &sha).await,
+            "I769 precondition: the v54 ledger is clean"
+        );
+        assert!(
+            content_rows_to(p.sa.as_ref(), &p.key_a, &sha, &p.key_b)
+                .await
+                .is_empty(),
+            "I769 precondition: no row"
+        );
+        p.a.emit_pending_key_grants().await.unwrap();
+        assert!(
+            content_rows_to(p.sa.as_ref(), &p.key_a, &sha, &p.key_b)
+                .await
+                .is_empty(),
+            "I769 precondition: a clean ledger is never revisited without the upgrade"
+        );
+        // ── the upgrade: V192, then a boot (the boot sweep).
+        replay_v192(p.sa.as_ref()).await;
+        assert!(
+            dirty(p.sa.as_ref(), &p.key_a, &sha).await,
+            "I769: V192 marks the content axis dirty"
+        );
+        let alias = format!("i769-a-{run}");
+        let boot = || async {
+            crate::Engine::with_signer_pre_genesis(ts::local_signer(&alias), dsn_a)
+                .await
+                .expect("the upgraded node boots")
+        };
+        let booted = boot().await;
+        assert_eq!(
+            content_rows_to(p.sa.as_ref(), &p.key_a, &sha, &p.key_b)
+                .await
+                .len(),
+            1,
+            "I769: the boot sweep re-emitted the content row to the second device"
+        );
+        assert!(
+            !dirty(p.sa.as_ref(), &p.key_a, &sha).await,
+            "I769: and the ledger is clean again"
+        );
+        // Once: V192 replayed and a second boot emit nothing more.
+        drop(booted);
+        replay_v192(p.sa.as_ref()).await;
+        let _again = boot().await;
+        assert_eq!(
+            content_rows_to(p.sa.as_ref(), &p.key_a, &sha, &p.key_b)
+                .await
+                .len(),
+            1,
+            "I769: the re-emit is idempotent"
+        );
+    }
+
     macro_rules! runners {
         ($modname:ident, $dsn:expr, $pick:expr) => {
             mod $modname {
@@ -441,6 +539,59 @@ pub(crate) mod bodies {
                 }
             }
         };
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn i769_sqlite() {
+        let dir = tempfile::tempdir().unwrap();
+        let dsn = format!("sqlite:///{}", dir.path().join("a.db").display());
+        let run = uuid::Uuid::new_v4().simple().to_string()[..12].to_owned();
+        i769_an_upgraded_node_re_emits_v54s_cleared_content_axes(
+            &dsn,
+            "sqlite::memory:",
+            &run,
+            |e: &crate::Engine| e.sqlite_backend().unwrap().clone(),
+            |b: &crate::store::sqlite::SqliteBackend| {
+                Box::pin(async move {
+                    let conn = b.conn_handle();
+                    let conn = conn.lock();
+                    conn.execute_batch(include_str!(
+                        "../../migrations/sqlite/lens/V192__key_grant_rows_reemit.sql"
+                    ))
+                    .expect("V192 replays");
+                })
+            },
+        )
+        .await;
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn i769_postgres() {
+        let (Some(a), Some(b)) = (crate::test_pg::empty_dsn(), crate::test_pg::empty_dsn()) else {
+            return;
+        };
+        let run = uuid::Uuid::new_v4().simple().to_string()[..12].to_owned();
+        i769_an_upgraded_node_re_emits_v54s_cleared_content_axes(
+            &a,
+            &b,
+            &run,
+            |e: &crate::Engine| e.postgres_backend().unwrap().clone(),
+            |b: &crate::store::postgres::PostgresBackend| {
+                Box::pin(async move {
+                    b.get_client()
+                        .await
+                        .unwrap()
+                        .batch_execute(include_str!(
+                            "../../migrations/postgres/lens/V192__key_grant_rows_reemit.sql"
+                        ))
+                        .await
+                        .expect("V192 replays");
+                })
+            },
+        )
+        .await;
     }
 
     #[cfg(feature = "sqlite")]
