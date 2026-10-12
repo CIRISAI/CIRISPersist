@@ -270,6 +270,10 @@ pub(crate) mod stream_key_invariants;
 // stream-keyed; a stream epoch's DEK may be the caller's.
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod stream_epoch_dek_invariants;
+// v55.0.0 (CIRISEdge v55 adopt) — I762–I765: the dirty loop emits a
+// self/family blob's content rows to the owner's devices.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod content_grant_owner_invariants;
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod stream_sth_producer_invariants;
 /// v50.0.0 (CIRISPersist#919) — I186: the consent sweep never widens a placed row.
