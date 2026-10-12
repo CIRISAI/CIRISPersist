@@ -303,6 +303,62 @@ pub struct AdoptChunkItem<'a> {
     pub plaintext_size: u64,
 }
 
+/// v55.0.0 (CIRISPersist#977) — **a stream-keyed room chunk is never bound
+/// under a community epoch.** A `community_dek` chunk provenance that names
+/// an epoch is the pre-v55 shape (a chunk sealed under the community DEK);
+/// for a stream-keyed chunk the epoch is the manifest pointer's, carried over
+/// by reusing the manifest's provenance, and binding it records the chunk
+/// under a key that did not seal it: the positional read then opens it under
+/// the community DEK and fails, and the community epoch counts it as one of
+/// its objects. Refused wherever this node already knows `(stream_id,
+/// epoch)` is stream-keyed: it holds that stream epoch's DEK row, or a wrap
+/// of it addressed to this node or sealed by the chunk's author
+/// (`key_grant:stream:v1`). Where it does not know yet (the chunk arrived
+/// before the stream's key rows), the chunk lands bound and the promote,
+/// which opens the manifest, refuses the DAG with the same token
+/// (`promote_checks`): nothing is promoted or announced under a wrong
+/// binding. Build the chunk's provenance with
+/// [`BlobProvenance::for_stream_keyed_chunk`].
+async fn refuse_community_epoch_on_a_stream_keyed_chunk<B>(
+    backend: &B,
+    our_key_id: &str,
+    stream_id: &str,
+    epoch: u64,
+    provenance: &BlobProvenance,
+) -> Result<(), BlobError>
+where
+    B: BlobStorage + Sync + ?Sized,
+{
+    let Some(named) = provenance.epoch else {
+        return Ok(());
+    };
+    if provenance.tier != CryptoTier::CommunityDek {
+        return Ok(());
+    }
+    let stream_keyed = backend
+        .stream_dek_list(stream_id)
+        .await?
+        .iter()
+        .any(|r| r.epoch == epoch)
+        || !backend
+            .stream_dek_grants_for_recipient(stream_id, epoch, our_key_id)
+            .await?
+            .is_empty()
+        || !backend
+            .stream_dek_grants(stream_id, epoch, &provenance.author_key_id)
+            .await?
+            .is_empty();
+    if stream_keyed {
+        return Err(BlobError::StreamKeyedChunkCommunityEpoch {
+            stream_id: stream_id.to_owned(),
+            epoch,
+            community_epoch: named,
+            chunk_sha256_hex: None,
+        });
+    }
+    Ok(())
+}
+
 /// v52.0.0 (CIRISPersist#957) — **adopt a run of sealed chunks of one
 /// stream**: [`adopt_sealed_chunk`]'s steps once per batch where they are
 /// per-stream (the provenance's tier and binding, the WILL decision) and
@@ -350,6 +406,14 @@ where
         floor.check_scope(&provenance.cohort_scope)?;
         (floor, None)
     } else {
+        refuse_community_epoch_on_a_stream_keyed_chunk(
+            backend,
+            ctx.our_key_id,
+            stream_id,
+            epoch,
+            provenance,
+        )
+        .await?;
         resolve_provenance(backend, ctx.our_key_id, provenance).await?
     };
     would_hold(backend, ctx, provenance).await?;
@@ -365,6 +429,13 @@ where
             &provenance.author_key_id,
             floor,
             binding,
+            // v55.0.0 (#977) — a room stream is the room's whether or not a
+            // community epoch binds its chunks (the origin's claim names it);
+            // a self/family stream's claim is unchanged.
+            provenance
+                .community_key_id
+                .as_deref()
+                .filter(|_| provenance.tier == CryptoTier::CommunityDek),
         )
         .await?;
     for ((slot, _), got) in shaped.iter().zip(stored) {

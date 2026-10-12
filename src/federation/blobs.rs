@@ -1892,6 +1892,11 @@ pub trait BlobStorage: Send + Sync {
     /// insert-if-absent naming the author, so a later append by the adopter
     /// is refused as a foreign writer (I41 carried across nodes). The
     /// binding is written as declared, no current-epoch check.
+    ///
+    /// v55.0.0 (CIRISPersist#977) — `community_key_id` is the community the
+    /// provenance names. The stream's claim names it whether or not a
+    /// community epoch binds the chunk: a stream-keyed room chunk has no
+    /// binding and is still the room's, as at the origin.
     #[allow(clippy::too_many_arguments)]
     fn adopt_sealed_chunk_at(
         &self,
@@ -1904,6 +1909,7 @@ pub trait BlobStorage: Send + Sync {
         author_key_id: &str,
         floor: StorageFloor,
         binding: Option<EpochBinding>,
+        community_key_id: Option<&str>,
     ) -> impl Future<Output = Result<[u8; 32], BlobError>> + Send;
 
     /// v52.0.0 (CIRISPersist#957) — **[`adopt_sealed_chunk_at`](Self::adopt_sealed_chunk_at),
@@ -1925,6 +1931,7 @@ pub trait BlobStorage: Send + Sync {
         author_key_id: &str,
         floor: StorageFloor,
         binding: Option<EpochBinding>,
+        community_key_id: Option<&str>,
     ) -> impl Future<Output = Result<Vec<Result<[u8; 32], BlobError>>, BlobError>> + Send;
 
     /// v51.3.0 (CIRISPersist#947) — **promote an ADOPTED sealed manifest row
@@ -4405,6 +4412,34 @@ pub enum BlobError {
         /// The epoch the chunk named.
         epoch: u64,
     },
+    /// v55.0.0 (CIRISPersist#977; found by CIRISEdge's v55 adopt) — a
+    /// STREAM-KEYED room chunk was offered, or found held, under a community
+    /// epoch. Such a chunk is sealed under its stream epoch's DEK and carries
+    /// no community binding; a `community_dek` provenance naming an epoch is
+    /// the room row's (its manifest pointer's), reused for the chunk. Raised
+    /// by the chunk adopt doors when this node knows `(stream_id, epoch)` is
+    /// stream-keyed (whole batch refused, nothing written; `chunk_sha256_hex`
+    /// is `None`), and by the promote when the opened manifest names a held
+    /// chunk stream-keyed that a community epoch binds (nothing promoted or
+    /// announced; names the chunk). Terminal for this provenance: build the
+    /// chunk's with
+    /// [`BlobProvenance::for_stream_keyed_chunk`](crate::federation::BlobProvenance::for_stream_keyed_chunk).
+    #[error(
+        "stream {stream_id} epoch {epoch} is stream-keyed: its chunks carry no community epoch, \
+         but {} is bound to community epoch {community_epoch}; build a stream-keyed chunk's \
+         provenance with BlobProvenance::for_stream_keyed_chunk (CIRISPersist#977)",
+        chunk_sha256_hex.as_deref().map(|c| format!("chunk {c}")).unwrap_or_else(|| "the offered provenance".into())
+    )]
+    StreamKeyedChunkCommunityEpoch {
+        /// The stream.
+        stream_id: String,
+        /// The chunk's STREAM epoch.
+        epoch: u64,
+        /// The community epoch the provenance named, or the binding holds.
+        community_epoch: u64,
+        /// The bound chunk, at the promote; `None` at an adopt door.
+        chunk_sha256_hex: Option<String>,
+    },
     /// Backend-level error (DB connection, serialization, etc.).
     #[error("backend: {0}")]
     Backend(String),
@@ -4468,6 +4503,9 @@ impl BlobError {
             BlobError::StreamEpochDekExists { .. } => "blob_stream_epoch_dek_exists",
             BlobError::StreamNotAuthored { .. } => "blob_stream_not_authored",
             BlobError::StreamEpochDekMissing { .. } => "blob_stream_epoch_dek_missing",
+            BlobError::StreamKeyedChunkCommunityEpoch { .. } => {
+                "blob_stream_keyed_chunk_community_epoch"
+            }
             BlobError::Backend(_) => "blob_backend",
         }
     }

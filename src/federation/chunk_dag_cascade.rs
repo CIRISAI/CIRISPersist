@@ -2662,6 +2662,37 @@ pub mod orchestrate {
         }
         if !keyed_chunks.is_empty() {
             check_held_stream_structure(backend, sha256, &keyed_chunks).await?;
+            refuse_community_bound_stream_keyed_chunks(backend, &stream_id, &keyed_chunks).await?;
+        }
+        Ok(())
+    }
+
+    /// v55.0.0 (CIRISPersist#977; CIRISEdge's v55 adopt) — **the promote's
+    /// backstop for a stream-keyed chunk adopted under a community epoch.**
+    /// The chunk door refuses that provenance only where this node already
+    /// knows the stream epoch is stream-keyed; a chunk that arrived before the
+    /// stream's key rows landed bound. The opened manifest is the author's
+    /// word on how each chunk was keyed, so a chunk it names stream-keyed that
+    /// a community epoch binds is refused here, naming the chunk, before the
+    /// row becomes a `chunk_dag` and before any holding claim: no DAG is
+    /// promoted or announced over a binding that did not seal its chunk.
+    async fn refuse_community_bound_stream_keyed_chunks<B>(
+        backend: &B,
+        stream_id: &str,
+        chunks: &[ChunkRef],
+    ) -> Result<(), BlobError>
+    where
+        B: BlobStorage + Sync,
+    {
+        for c in chunks {
+            if let Some((_, _, community_epoch)) = backend.community_dek_blob_epoch(&c.sha).await? {
+                return Err(BlobError::StreamKeyedChunkCommunityEpoch {
+                    stream_id: stream_id.to_owned(),
+                    epoch: c.epoch.unwrap_or_default(),
+                    community_epoch,
+                    chunk_sha256_hex: Some(hex::encode(c.sha)),
+                });
+            }
         }
         Ok(())
     }

@@ -60,8 +60,19 @@ pub(crate) mod bodies {
         epoch: u64,
     ) -> Result<[u8; 32], BlobError> {
         let (env, n) = sealed_of(stream, seq);
-        b.adopt_sealed_chunk_at(stream, seq, env, epoch, n, "self", author, floor(), None)
-            .await
+        b.adopt_sealed_chunk_at(
+            stream,
+            seq,
+            env,
+            epoch,
+            n,
+            "self",
+            author,
+            floor(),
+            None,
+            None,
+        )
+        .await
     }
 
     async fn batch<B: BlobStorage + Sync>(
@@ -78,7 +89,7 @@ pub(crate) mod bodies {
                 (*s, env, n)
             })
             .collect();
-        b.adopt_sealed_chunks_at(stream, items, epoch, "self", author, floor(), None)
+        b.adopt_sealed_chunks_at(stream, items, epoch, "self", author, floor(), None, None)
             .await
     }
 
@@ -178,7 +189,7 @@ pub(crate) mod bodies {
         let again = format!("i288-again-{tag}-{run}");
         for seq in 0..4 {
             let (env, n) = sealed_of(&gone, seq);
-            b.adopt_sealed_chunk_at(&again, seq, env, 0, n, "self", author, floor(), None)
+            b.adopt_sealed_chunk_at(&again, seq, env, 0, n, "self", author, floor(), None, None)
                 .await
                 .unwrap();
         }
@@ -202,14 +213,25 @@ pub(crate) mod bodies {
             })
             .collect();
         let batched = one
-            .adopt_sealed_chunks_at(&stream, run.clone(), 0, "self", author, floor(), None)
+            .adopt_sealed_chunks_at(&stream, run.clone(), 0, "self", author, floor(), None, None)
             .await
             .unwrap();
         let mut singles = Vec::new();
         for (s, env, n) in run {
             singles.push(
                 other
-                    .adopt_sealed_chunk_at(&stream, s, env, 0, n, "self", author, floor(), None)
+                    .adopt_sealed_chunk_at(
+                        &stream,
+                        s,
+                        env,
+                        0,
+                        n,
+                        "self",
+                        author,
+                        floor(),
+                        None,
+                        None,
+                    )
                     .await
                     .unwrap(),
             );
@@ -317,6 +339,7 @@ pub(crate) mod bodies {
                 "i290-author-y",
                 floor(),
                 None,
+                None,
             )
             .await
             .expect_err("I290: another author's stream");
@@ -339,6 +362,7 @@ pub(crate) mod bodies {
                 "i290-author-x",
                 floor(),
                 None,
+                None,
             )
             .await
             .expect_err("I290: an abandoned stream");
@@ -358,6 +382,7 @@ pub(crate) mod bodies {
                 "i290-author-x",
                 floor(),
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -373,7 +398,16 @@ pub(crate) mod bodies {
         // A reserved (SHA-shaped) id.
         let reserved = hex::encode(sha);
         let e = b
-            .adopt_sealed_chunks_at(&reserved, vec![(0, env, n)], 0, "self", "x", floor(), None)
+            .adopt_sealed_chunks_at(
+                &reserved,
+                vec![(0, env, n)],
+                0,
+                "self",
+                "x",
+                floor(),
+                None,
+                None,
+            )
             .await
             .expect_err("I290: a reserved id");
         assert!(matches!(&e, BlobError::InvalidArgument(m) if m.contains("reserved")));
@@ -402,6 +436,7 @@ pub(crate) mod bodies {
             "self",
             author,
             StorageFloor::resolved(CryptoTier::InvisibleEncrypted),
+            None,
             None,
         )
         .await
@@ -595,6 +630,7 @@ mod sqlite {
                 crate::federation::StorageFloor::resolved(
                     crate::federation::types::cohort_scope::CryptoTier::InvisibleEncrypted,
                 ),
+                None,
                 None,
             )
             .await

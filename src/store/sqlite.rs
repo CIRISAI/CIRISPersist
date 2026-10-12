@@ -18773,13 +18773,17 @@ impl crate::federation::BlobStorage for SqliteBackend {
         author_key_id: &str,
         floor: crate::federation::StorageFloor,
         binding: Option<crate::federation::EpochBinding>,
+        community_key_id: Option<&str>,
     ) -> Result<[u8; 32], crate::federation::BlobError> {
         // #846 (§6.2, I50) — the AUTHOR is the claimed owner: the stream row
         // is written insert-if-absent naming the author, so the adopter can
         // never append to it as its own (I41 carried across nodes). The
         // binding is written AS DECLARED (no current-epoch check).
         let claim = crate::federation::StreamClaim {
-            community_key_id: binding.as_ref().map(|b| b.community_key_id.clone()),
+            // v55.0.0 (#977) — the provenance's community, bound or not.
+            community_key_id: community_key_id
+                .map(str::to_owned)
+                .or_else(|| binding.as_ref().map(|b| b.community_key_id.clone())),
             owner_key_id: Some(author_key_id.to_owned()),
             stream_key: None,
         };
@@ -18809,11 +18813,15 @@ impl crate::federation::BlobStorage for SqliteBackend {
         author_key_id: &str,
         floor: crate::federation::StorageFloor,
         binding: Option<crate::federation::EpochBinding>,
+        community_key_id: Option<&str>,
     ) -> Result<Vec<Result<[u8; 32], crate::federation::BlobError>>, crate::federation::BlobError>
     {
         // #846 (§6.2, I50) — the AUTHOR is the claimed owner, as for one chunk.
         let claim = crate::federation::StreamClaim {
-            community_key_id: binding.as_ref().map(|b| b.community_key_id.clone()),
+            // v55.0.0 (#977) — the provenance's community, bound or not.
+            community_key_id: community_key_id
+                .map(str::to_owned)
+                .or_else(|| binding.as_ref().map(|b| b.community_key_id.clone())),
             owner_key_id: Some(author_key_id.to_owned()),
             stream_key: None,
         };

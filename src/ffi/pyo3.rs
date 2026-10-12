@@ -35383,6 +35383,24 @@ fn blob_err_to_py(e: crate::federation::BlobError) -> PyErr {
                 serde_json::json!({ "stream_id": stream_id, "retryable": false })
             ))
         }
+        // v55.0.0 (CIRISPersist#977) — a stream-keyed room chunk under a
+        // community epoch: the same token-then-JSON shape, terminal for the
+        // provenance (rebuild it with `for_stream_keyed_chunk`).
+        crate::federation::BlobError::StreamKeyedChunkCommunityEpoch {
+            ref stream_id,
+            epoch,
+            community_epoch,
+            ref chunk_sha256_hex,
+        } => PyValueError::new_err(format!(
+            "{kind}: {}",
+            serde_json::json!({
+                "stream_id": stream_id,
+                "epoch": epoch,
+                "community_epoch": community_epoch,
+                "chunk_sha256_hex": chunk_sha256_hex,
+                "retryable": false,
+            })
+        )),
         crate::federation::BlobError::Backend(_) => PyRuntimeError::new_err(kind),
     }
 }
