@@ -26,6 +26,10 @@ threat-model citations because this crate's audit story is the point.
 - `canonical_community::trust_root_cosigners_over` returns `Ok(Err((reason, detail)))`; its one caller is the purge door.
 - **I833** (memory, sqlite, postgres): a rootless receiver refuses a bundle `root_not_held`, `retryable: true`, and once the root lands the same bundle is no longer refused as unauthorised; a notice from this node's future is `not_yet_valid` and authorises once the clock reaches it; a forged cosignature is `signature_invalid`, `retryable: false`. **I650** now asserts the reason and the retryable bit of each of its eleven cases.
 
+#### Changed — the release pre-flight fails a bundle with no `charter_root_key_id` (#1056)
+
+- `scripts/preflight_trust_root.py` adopts CIRISEdge#571's stricter rule, so persist's copy and Edge's vendored one (CIRISEdge#575) converge: a v3 `bundle` response whose `charter_root_key_id` is absent, empty or not a string FAILS, even with its quorum met. Three new self-test fixtures (absent, blank, non-string); the self-test is 15 fixtures. I190 (f)'s short-quorum body now names its charter root, so its refusal is the quorum's alone, and it asserts that.
+
 #### Adoption (Edge, Server)
 
 - **New exhaustive enum variant:** `federation::Error::MalformedRow { plane: &'static str, reason: &'static str, message: String }` (kind `federation_malformed_row`). A `match` on `federation::Error` needs an arm. It is TERMINAL; Edge's 8-refusal bound for these `InvalidArgument`s can go.
