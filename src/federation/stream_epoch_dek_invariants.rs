@@ -1330,6 +1330,25 @@ pub(crate) mod bodies {
                     && reg.to_string() == chunk.to_string(),
                 "I770: the chunk door's own error: {reg:?} vs {chunk:?}"
             );
+            // The name rule comes FIRST, before any other judgment of the
+            // call: at a plaintext cohort the refusal is still the name's.
+            let first = l
+                .engine_a
+                .register_stream_epoch_dek(
+                    crate::federation::types::cohort_scope::FEDERATION,
+                    &l.comm,
+                    &id,
+                    0,
+                    &mls_exporter(),
+                    None,
+                )
+                .await
+                .expect_err("I770: refused at a plaintext cohort too");
+            assert_eq!(
+                first.to_string(),
+                chunk.to_string(),
+                "I770: the stream-name rule is judged first"
+            );
             assert!(
                 l.ba.stream_dek_list(&id).await.unwrap().is_empty(),
                 "I770: no stream DEK row"
