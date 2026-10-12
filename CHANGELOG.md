@@ -775,6 +775,74 @@ threat-model citations because this crate's audit story is the point.
   three stream-keyed legs, the tier guard and the claim's community were
   mutation-checked: each mutation turns a witness red.
 
+### Fixed — self/family content key grants never emitted (CIRISEdge v55 adopt)
+
+- **The bug.** `key_grant::dirty_axes` took a content axis's owner from the
+  row's epoch binding (`community_key_id`). A self or family row has no
+  binding: its owner is the group the write recorded (`group_key_id`, V177).
+  So the axis fell back to the NODE's own key. The audience rule then withheld
+  every recipient (`attestation_ids: []`, every recipient in `withheld`), and
+  `mark_emitted` cleared the ledger anyway, so nothing ever retried.
+  - In the field: a device re-classed into the owner's audience (server to
+    phone) got its stream rows and never its content row, and its pull parked
+    on `DagAwaitingKey` for good.
+  - A legacy v2 DAG's chunk 0 (`write_legacy_v2_dag`, granted through
+    `grant_dek_to_cohort`) never reached the owner's other devices, for the
+    same reason.
+  - A manual `emit_key_grant` that named the owner was correct, which is why
+    the witnesses that emit manually never saw it.
+- **The owner.** A `self` / `family` axis is now owned by the row's group,
+  falling back to the binding's community. A room axis is owned by the
+  community, falling back to the group. The node key is only the last resort,
+  for a row that names no group, and the guard below catches that case. The
+  stream axis was already right. No other place derives an axis owner from a
+  provenance.
+- **A mis-built axis is never cleared silently.** The rule: if a plan
+  withholds EVERY recipient and this signer's own wrap is among them,
+  `plan_key_grant_emission` reports it as mis-built.
+  - Why the rule holds: the signer already passed the sealer rule, so it
+    speaks for the owner. The audience rule refusing the signer's own
+    occurrence therefore means the axis names the wrong group.
+  - What happens: nothing is emitted, the axis stays dirty, and the reason is
+    in `KeyGrantEmissionPlan::misbuilt` and `KeyGrantEmission::misbuilt`. In
+    Python it is the `misbuilt` key of `emit_key_grant`'s JSON.
+  - What still clears as before: a plan that withholds only SOME recipients
+    (a revoked device, a removed member), or one where the signer holds no
+    wrap of its own (a server-class sealer).
+- **The dirty loop backs off a mis-built axis.**
+  - `key_grant::emit_dirty_axes` (new) is now the one loop body behind
+    `Engine::emit_pending_key_grants` and PyO3's `emit_dirty_with_local_signer`
+    sweeps.
+  - It logs a mis-built axis at error level once per `MISBUILT_AXIS_RETRY`
+    (300 s), with how many passes planned and skipped it.
+  - It does not plan the axis again until the interval has passed.
+  - `DirtyEmissionReport {emitted, misbuilt, backed_off}` counts each pass.
+    `misbuilt_axis_state(signer, axis)` reads the per-axis state, which lives
+    in this process only.
+  - An axis that later emits normally forgets its state.
+- **Adoption:** `KeyGrantEmission` and `KeyGrantEmissionPlan` gain the field
+  `misbuilt: Option<String>`, so a struct literal must name it. It is
+  `#[serde(default)]` on the wire.
+- Witnesses I762–I766 (sqlite, postgres), each fails before the fix:
+  - I762: a self blob on a node with two owner devices. The dirty loop emits
+    the content row, owned by the owner, to the second device, and the ledger
+    clears only after that.
+  - I763: the same for a family blob.
+  - I764: a mis-built axis stays dirty and is reported. Two passes inside the
+    interval plan it once and skip it once.
+  - I765: a legacy v2 chunk 0 reaches the second device through the loop,
+    with no manual emit.
+  - I766: a legitimate withholding of every recipient, with no wrap of the
+    signer's own, still clears.
+- Mutation-checked, and each mutation turns a witness red:
+  - the owner fix;
+  - the owner fix reverted together with clearing on a mis-built axis (the
+    pre-fix behaviour);
+  - the guard;
+  - the guard's signer clause;
+  - the backoff;
+  - the no-clear on a mis-built axis.
+
 ## [54.1.1] - 2026-10-12
 
 ### Fixed — the v54.1.0 tag's Windows wheel job
