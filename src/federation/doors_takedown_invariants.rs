@@ -1297,10 +1297,12 @@ mod run {
         super::bodies::i793_the_settle_is_the_basis()
     }
 
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     fn suffix() -> String {
         uuid::Uuid::new_v4().simple().to_string()[..8].to_owned()
     }
 
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     macro_rules! engine_runners {
         ($modname:ident, $dsns:expr, $pick:expr) => {
             mod $modname {

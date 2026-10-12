@@ -2610,6 +2610,7 @@ where
 /// # Errors
 ///
 /// [`BlobError::Purged`](super::BlobError::Purged); the lookup's read error.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
 pub(crate) async fn refuse_tombstoned_bytes<F>(
     directory: &F,
     sha256: &[u8; 32],
