@@ -1217,7 +1217,7 @@ class Engine:
         """
 
     def register_stream_epoch_dek(self, cohort_scope: str, group_key_id: str, stream_id: str, epoch: int, dek_b64: str, aad_b64: str | None = None) -> str:
-        """(derived) deontic — v55.0.0 (CIRISPersist#981, CC 5.3.3.2.5) — supply the DEK of a stream's next epoch (the MLS exporter secret of a live call), so the live and the st..."""
+        """(derived) deontic — v55.0.0 (CIRISPersist#981, CC 5.3.3.2.5) — supply the DEK of a stream's next epoch (the stream's per-(stream, epoch) DEK the producer derives from..."""
 
     def rekey_community_member_device_add_json(self, community_key_id: str, member_key_id: str, new_occurrence_key_id: str, authority_key_id: str) -> str:
         """(derived) deontic — v50.0.0 (CIRISPersist#916, FSD/SECOND_DEVICE.md §3) — a member's new device receives exactly what the member holds: every retained community DEK ep..."""

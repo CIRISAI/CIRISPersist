@@ -15848,14 +15848,16 @@ impl PyEngine {
     }
 
     /// v55.0.0 (CIRISPersist#981, CC 5.3.3.2.5) — **supply the DEK of a
-    /// stream's next epoch** (the MLS exporter secret of a live call), so the
-    /// live and the stored stream are one key. FFI mirror of
+    /// stream's next epoch** (the stream's per-(stream, epoch) DEK the
+    /// producer derives from the group's MLS exporter, CC 5.1;
+    /// CIRISConstitution#169, rc8 ruling), so the live and the stored stream
+    /// are one key; persist never sees the exporter secret. FFI mirror of
     /// [`Engine::register_stream_epoch_dek`](crate::engine::Engine::register_stream_epoch_dek).
     /// `dek_b64` is the 32-byte DEK; `group_key_id` the owner (self), family
     /// or community key. The DEK is wrapped to the audience as
     /// `key_grant:stream:v1` rows: a supplied epoch is always kept, and an
     /// unrecorded live call never comes to this door (CC rc7 part 5 — its
-    /// frames are sealed in memory under the MLS exporter secret and only the
+    /// frames are sealed in memory under that per-stream DEK and only the
     /// ciphertext may be adopted). The writer is the same signer
     /// `put_blob_chunk_scoped` writes under. Then chunks go through
     /// `put_blob_chunk_scoped` at `epoch`.

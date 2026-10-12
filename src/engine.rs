@@ -7648,8 +7648,11 @@ impl Engine {
     }
 
     /// v55.0.0 (CIRISPersist#981, CC 5.3.3.2.5) — **supply the DEK of a
-    /// stream's next epoch**: the MLS exporter secret of a live call, so the
-    /// live stream and the stored one are one key. The writer is this Engine's
+    /// stream's next epoch**: the stream's per-(stream, epoch) DEK the
+    /// producer derives from the group's MLS exporter (CC 5.1;
+    /// CIRISConstitution#169, rc8 ruling), so the live stream and the stored
+    /// one are one key. Persist never derives it and never sees the exporter
+    /// secret. The writer is this Engine's
     /// signer (the stream's single sender); `group_key_id` is the owner,
     /// family or community the stream is sealed for. Closes the stream's open
     /// epoch with its terminator, records the DEK (persist never mints or rolls
@@ -7660,7 +7663,7 @@ impl Engine {
     /// to this door (CC rc7 part 5 — "An unrecorded live call wraps
     /// nothing"); its frames are sealed in memory with
     /// [`seal_stream_chunk`](crate::federation::stream_seal::seal_stream_chunk)
-    /// under the MLS exporter secret. Chunks then go through
+    /// under that per-stream DEK. Chunks then go through
     /// [`put_blob_chunk_scoped`](Self::put_blob_chunk_scoped) at `epoch`.
     /// Refusals: `stream_not_authored`, `stream_epoch_dek_exists`, or
     /// `InvalidArgument` (plaintext tier, an epoch below the newest, a

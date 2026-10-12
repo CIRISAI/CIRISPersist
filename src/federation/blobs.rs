@@ -4348,7 +4348,8 @@ pub enum BlobError {
         notice_id: String,
     },
     /// v55.0.0 (CIRISPersist#981) — a stream whose epoch DEK the CALLER
-    /// supplies (`register_stream_epoch_dek`: the MLS exporter secret) needs
+    /// supplies (`register_stream_epoch_dek`: the per-(stream, epoch) DEK the
+    /// producer derives from the group's MLS exporter, CC 5.1; rc8 ruling) needs
     /// its next epoch before this chunk can be stored: a recipient the epoch
     /// was wrapped to has left the audience (`Removal`, naming it, so the
     /// caller commits the matching MLS removal), or only the terminator's slot

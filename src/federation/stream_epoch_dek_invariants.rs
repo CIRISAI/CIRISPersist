@@ -19,8 +19,9 @@
 //!   `stream_seal::open_stream_chunk`.
 //! - **I753** (sqlite, postgres; #981, CC rc7 part 5) — an unrecorded live
 //!   call never reaches persist's DEK door (a supplied epoch is always kept):
-//!   its frames are sealed in memory with `seal_stream_chunk` under the MLS
-//!   exporter secret, and their ciphertext, adopted through
+//!   its frames are sealed in memory with `seal_stream_chunk` under the
+//!   per-(stream, epoch) DEK the producer derives from the group's MLS
+//!   exporter (rc8 ruling), and their ciphertext, adopted through
 //!   `adopt_sealed_chunks` with a `for_stream_keyed_chunk` provenance for a
 //!   `(stream, epoch)` this node never registered and holds no wrap for, is
 //!   admitted as ciphertext only: no stream DEK row, no wrap, no
@@ -340,7 +341,8 @@ pub(crate) mod bodies {
         );
     }
 
-    /// A fresh 32-byte DEK, standing in for an MLS exporter secret.
+    /// A fresh 32-byte DEK, standing in for the per-(stream, epoch) DEK a
+    /// producer derives from its group's MLS exporter.
     fn mls_exporter() -> [u8; 32] {
         let mut k = [0u8; 32];
         for (i, b) in k.iter_mut().enumerate() {
@@ -390,7 +392,7 @@ pub(crate) mod bodies {
         .unwrap();
         let (opened, slot) =
             crate::federation::stream_seal::open_stream_chunk(&dek, &stream, 0, None, 0, &env)
-                .expect("I752: the MLS exporter opens the stored chunk");
+                .expect("I752: the producer's per-stream DEK opens the stored chunk");
         assert_eq!(opened, segment(0));
         assert_eq!((slot.counter, slot.last), (0, false));
         let sealed = l
@@ -421,8 +423,8 @@ pub(crate) mod bodies {
         let l = ladder(dsn_a, dsn_b, run, pick).await;
         let stream = format!("i753-{run}");
         let epoch = 3;
-        // The live call's frames, sealed in memory under the MLS exporter
-        // secret: no persist door ever saw the DEK.
+        // The live call's frames, sealed in memory under the per-stream DEK
+        // (the producer's): no persist door ever saw the DEK.
         let dek = mls_exporter();
         let segs: Vec<Vec<u8>> = (0..3).map(segment).collect();
         let envelopes: Vec<Vec<u8>> = segs

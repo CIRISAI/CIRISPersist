@@ -931,9 +931,11 @@ pub mod orchestrate {
     }
 
     /// v55.0.0 (CIRISPersist#981, CC 5.3.3.2.5) — **seal a stream's next
-    /// epoch under a DEK the CALLER supplies**: the MLS exporter secret of a
-    /// live call, so the live stream and the stored one are one key, carried
-    /// by the same `key_grant:stream:v1` cascade.
+    /// epoch under a DEK the CALLER supplies**: the stream's per-(stream,
+    /// epoch) DEK the producer derives from the group's MLS exporter (CC 5.1;
+    /// CIRISConstitution#169, rc8 ruling), so the live stream and the stored
+    /// one are one key, carried by the same `key_grant:stream:v1` cascade.
+    /// Persist never derives it and never sees the exporter secret.
     ///
     /// The writer is `signer`'s derived key: the stream's single sender (CC
     /// 5.3.3.1). The door refuses, writing nothing,
@@ -960,7 +962,7 @@ pub mod orchestrate {
     /// nothing"). Storing a DEK at all is a durable wrap, so an unrecorded
     /// live call never comes to this door: the adopter seals its frames in
     /// memory with [`seal_stream_chunk`](crate::federation::stream_seal::seal_stream_chunk)
-    /// under the MLS exporter secret and, if it holds the resulting ciphertext,
+    /// under that per-stream DEK and, if it holds the resulting ciphertext,
     /// adopts it through `adopt_sealed_chunks` with a
     /// [`for_stream_keyed_chunk`](crate::federation::BlobProvenance::for_stream_keyed_chunk)
     /// provenance; persist stores the ciphertext and no key.

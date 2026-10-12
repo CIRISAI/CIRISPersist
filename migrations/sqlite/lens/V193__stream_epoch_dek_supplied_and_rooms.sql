@@ -18,7 +18,8 @@
 --    the same `retain_past_epochs` policy as the community epoch's own
 --    objects (operator ruling: a room's retention bound covers every byte
 --    sealed for that room).
--- 2. #981 — a live call's DEK is the MLS exporter secret. The caller SUPPLIES
+-- 2. #981 — a live call's DEK is the per-(stream, epoch) DEK its producer
+--    derives from the group's MLS exporter (CC 5.1; rc8 ruling). The caller SUPPLIES
 --    the (stream_id, epoch) DEK (`supplied`); a supplied epoch is always kept
 --    and wrapped to the audience. An unrecorded live call never reaches
 --    persist: CC rc7 part 5 ("An unrecorded live call wraps nothing") forbids
