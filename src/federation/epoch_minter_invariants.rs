@@ -621,7 +621,7 @@ pub(crate) mod bodies {
     /// authored by the PERSON, whose body is sealed under the ROOM's DEK and
     /// referenced by a typed `BlobPointer` under a named member — plus the
     /// blob-native citation edge now writes beside it.
-    fn chat_row(
+    pub(crate) fn chat_row(
         id: &str,
         author: &str,
         comm: &str,

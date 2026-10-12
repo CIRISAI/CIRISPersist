@@ -34,6 +34,23 @@
 //!   chunks fall under the room's retention: the community sweep evicts the
 //!   chunks of a stream epoch minted at a past community epoch and keeps those
 //!   inside retention.
+//! - **I758** (sqlite, postgres; #977) — a stream-keyed room chunk is never
+//!   bound under a community epoch: the room row's provenance
+//!   (`from_attestation`, epoch filled from the manifest pointer) reused for a
+//!   chunk is refused at the chunk door once the stream epoch's wrap is held,
+//!   nothing stored or bound; `for_stream_keyed_chunk` adopts every chunk
+//!   unbound, the DAG and the positional read both open, and the community
+//!   epoch counts the manifest alone.
+//! - **I759** (sqlite, postgres; #977) — the ordering gap: a stream-keyed
+//!   room chunk adopted under the manifest's provenance BEFORE the stream's
+//!   key rows reach this node lands bound (nothing yet says it is
+//!   stream-keyed), and the promote, which opens the manifest, refuses the
+//!   DAG naming that chunk: nothing promoted, nothing announced. Evicting the
+//!   bound chunks and re-adopting them with `for_stream_keyed_chunk` promotes
+//!   and both reads open.
+//! - **I760** (sqlite, postgres; #977) — a legacy (pre-v55, per-chunk-bound)
+//!   room chunk still adopts under a community epoch, binds, promotes and
+//!   reads positionally: the refusal is for stream-keyed chunks only.
 //! - **I756** (pure; #981) — the roll rule: cap and removal roll a minted
 //!   epoch and refuse a supplied one with the reason; nothing else does.
 
@@ -681,12 +698,497 @@ pub(crate) mod bodies {
         );
     }
 
+    /// **I758** — see the module doc.
+    pub(crate) async fn i758_a_stream_keyed_chunk_is_never_bound_to_a_community_epoch<B>(
+        dsn_a: &str,
+        dsn_b: &str,
+        run: &str,
+        pick: Pick<B>,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync + 'static,
+    {
+        let l = ladder(dsn_a, dsn_b, run, pick).await;
+        let stream = format!("i758-{run}");
+        let plain = write_room(&l, &stream, 4, 0).await;
+        let sealed = l
+            .engine_a
+            .seal_stream_scoped(COMMUNITY, Some(&l.comm), &stream, None, None)
+            .await
+            .expect("A seals the room stream");
+        let root = sealed.manifest_sha256;
+        let room_epoch = sealed
+            .epoch
+            .expect("a room manifest names its community epoch");
+        l.engine_a.emit_pending_key_grants().await.unwrap();
+        for row in key_grant_rows_for(l.ba.as_ref(), &l.node_a, &l.node_b).await {
+            l.engine_b
+                .apply_replicated_key_grant(row)
+                .await
+                .unwrap_or_else(|e| panic!("I758: B admits A's row: {e}"));
+        }
+        // The room row that points at the manifest, the way a message does.
+        // `from_attestation` with NO epoch still answers the pointer's
+        // community epoch: right for the manifest, wrong for its chunks.
+        let row = crate::federation::epoch_minter_invariants::bodies::chat_row(
+            &format!("i758-{run}"),
+            &l.node_a,
+            &l.comm,
+            &hex::encode(root),
+            "community_dek",
+            Some(room_epoch),
+            true,
+        );
+        let manifest_prov = BlobProvenance::from_attestation(&row, &root, None, None)
+            .expect("I758: the room row is the manifest's provenance");
+        assert_eq!(
+            manifest_prov.epoch,
+            Some(room_epoch),
+            "I758: the pointer fills the epoch the caller left out"
+        );
+        l.engine_b
+            .adopt_sealed_blob(
+                &inline(l.ba.as_ref(), &root).await,
+                manifest_prov.clone(),
+                None,
+                crate::federation::AdoptDisposition::LocalOnly,
+            )
+            .await
+            .expect("I758: B adopts the manifest");
+        let chunks = l.ba.stream_chunks(&stream).await.unwrap().chunks;
+
+        // (1) The manifest's provenance reused for a chunk is refused, and
+        // nothing is stored or bound.
+        let first = &chunks[0];
+        let e = l
+            .engine_b
+            .adopt_sealed_chunk(
+                &stream,
+                first.seq,
+                &inline(l.ba.as_ref(), &first.chunk_sha).await,
+                first.epoch,
+                first.plaintext_size,
+                manifest_prov.clone(),
+            )
+            .await
+            .expect_err("I758 (1): a community epoch on a stream-keyed chunk is refused");
+        assert!(
+            matches!(
+                &e,
+                BlobError::StreamKeyedChunkCommunityEpoch {
+                    stream_id, epoch, community_epoch, chunk_sha256_hex: None
+                } if *stream_id == stream && *epoch == first.epoch && *community_epoch == room_epoch
+            ),
+            "I758 (1): {e:?}"
+        );
+        assert_eq!(e.kind(), "blob_stream_keyed_chunk_community_epoch");
+        assert!(
+            !l.bb.has_blob(&first.chunk_sha).await.unwrap(),
+            "I758 (1): nothing stored"
+        );
+        assert!(
+            l.bb.community_dek_blob_epoch(&first.chunk_sha)
+                .await
+                .unwrap()
+                .is_none(),
+            "I758 (1): nothing bound"
+        );
+
+        // (2) The explicit chunk provenance: no epoch, no minter, the rest
+        // the row's. Every chunk lands unbound.
+        let chunk_prov = manifest_prov
+            .for_stream_keyed_chunk()
+            .expect("I758 (2): a room provenance");
+        assert_eq!(
+            (chunk_prov.epoch, chunk_prov.minter_key_id.as_deref()),
+            (None, None)
+        );
+        assert_eq!(
+            (
+                &chunk_prov.author_key_id,
+                &chunk_prov.cohort_scope,
+                &chunk_prov.community_key_id,
+                chunk_prov.tier
+            ),
+            (
+                &manifest_prov.author_key_id,
+                &manifest_prov.cohort_scope,
+                &manifest_prov.community_key_id,
+                manifest_prov.tier
+            )
+        );
+        for c in &chunks {
+            l.engine_b
+                .adopt_sealed_chunk(
+                    &stream,
+                    c.seq,
+                    &inline(l.ba.as_ref(), &c.chunk_sha).await,
+                    c.epoch,
+                    c.plaintext_size,
+                    chunk_prov.clone(),
+                )
+                .await
+                .unwrap_or_else(|e| panic!("I758 (2): chunk {}: {e}", c.seq));
+            assert!(
+                l.bb.community_dek_blob_epoch(&c.chunk_sha)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "I758 (2): chunk {} carries no community binding",
+                c.seq
+            );
+        }
+        assert_eq!(
+            l.bb.stream_chunks(&stream)
+                .await
+                .unwrap()
+                .stream
+                .and_then(|h| h.community_key_id),
+            Some(l.comm.clone()),
+            "I758 (2): the adopted stream is the room's, as at the origin"
+        );
+        l.engine_b
+            .promote_adopted_manifest_to_dag(
+                &root,
+                &l.node_b,
+                None,
+                crate::federation::AdoptDisposition::LocalOnly,
+            )
+            .await
+            .expect("I758 (2): B promotes");
+        // (3) Both reads open, and the community epoch counts the manifest
+        // alone.
+        assert_eq!(
+            l.engine_b
+                .read_blob_as(&root, &l.node_b, None)
+                .await
+                .unwrap(),
+            plain,
+            "I758 (3): the DAG read"
+        );
+        assert_eq!(
+            l.engine_b
+                .read_stream_chunk_as(&stream, first.seq, &l.node_b, None)
+                .await
+                .expect("I758 (3): the positional read opens under the stream epoch"),
+            segment(0),
+            "I758 (3): the positional read"
+        );
+        assert_eq!(
+            l.bb.community_dek_epoch_object_count(&l.comm, &l.node_a, room_epoch)
+                .await
+                .unwrap(),
+            1,
+            "I758 (3): the community epoch holds the manifest, not the chunks"
+        );
+        // A self provenance has no stream-keyed room chunk.
+        let self_prov = BlobProvenance {
+            tier: CryptoTier::InvisibleEncrypted,
+            community_key_id: None,
+            ..manifest_prov
+        };
+        assert!(self_prov.for_stream_keyed_chunk().is_err());
+    }
+
+    /// The room row that points at `root` and the provenance
+    /// `from_attestation` answers for it with NO epoch argument: the
+    /// pointer's community epoch, right for the manifest and wrong for a
+    /// stream-keyed chunk.
+    fn room_row_provenance<B>(
+        l: &Ladder<B>,
+        id: &str,
+        root: &[u8; 32],
+        epoch: u64,
+    ) -> BlobProvenance
+    where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        let row = crate::federation::epoch_minter_invariants::bodies::chat_row(
+            id,
+            &l.node_a,
+            &l.comm,
+            &hex::encode(root),
+            "community_dek",
+            Some(epoch),
+            true,
+        );
+        BlobProvenance::from_attestation(&row, root, None, None)
+            .expect("the room row is the manifest's provenance")
+    }
+
+    /// B adopts every chunk of `stream` under `prov`, panicking on a refusal.
+    async fn adopt_chunks<B>(l: &Ladder<B>, stream: &str, prov: &BlobProvenance, tag: &str)
+    where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        for c in l.ba.stream_chunks(stream).await.unwrap().chunks {
+            l.engine_b
+                .adopt_sealed_chunk(
+                    stream,
+                    c.seq,
+                    &inline(l.ba.as_ref(), &c.chunk_sha).await,
+                    c.epoch,
+                    c.plaintext_size,
+                    prov.clone(),
+                )
+                .await
+                .unwrap_or_else(|e| panic!("{tag}: chunk {}: {e}", c.seq));
+        }
+    }
+
+    /// **I759** — see the module doc.
+    pub(crate) async fn i759_a_chunk_bound_before_its_stream_keys_is_refused_at_the_promote<B>(
+        dsn_a: &str,
+        dsn_b: &str,
+        run: &str,
+        pick: Pick<B>,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync + 'static,
+    {
+        let l = ladder(dsn_a, dsn_b, run, pick).await;
+        let stream = format!("i759-{run}");
+        let plain = write_room(&l, &stream, 4, 0).await;
+        let sealed = l
+            .engine_a
+            .seal_stream_scoped(COMMUNITY, Some(&l.comm), &stream, None, None)
+            .await
+            .expect("A seals the room stream");
+        let root = sealed.manifest_sha256;
+        let room_epoch = sealed.epoch.expect("a room manifest names its epoch");
+        l.engine_a.emit_pending_key_grants().await.unwrap();
+        // The community epoch's rows reach B; the stream's do not, yet.
+        let (stream_rows, epoch_rows): (Vec<_>, Vec<_>) =
+            key_grant_rows_for(l.ba.as_ref(), &l.node_a, &l.node_b)
+                .await
+                .into_iter()
+                .partition(|r| {
+                    key_grant_dimension_of(&r.attestation) == Some(KEY_GRANT_STREAM_DIMENSION)
+                });
+        assert!(
+            !stream_rows.is_empty(),
+            "I759: A wrapped the stream epoch to B"
+        );
+        for row in epoch_rows {
+            l.engine_b.apply_replicated_key_grant(row).await.unwrap();
+        }
+        let manifest_prov = room_row_provenance(&l, &format!("i759-{run}"), &root, room_epoch);
+        l.engine_b
+            .adopt_sealed_blob(
+                &inline(l.ba.as_ref(), &root).await,
+                manifest_prov.clone(),
+                None,
+                crate::federation::AdoptDisposition::LocalOnly,
+            )
+            .await
+            .expect("I759: B adopts the manifest");
+        // (1) Nothing on B says the stream is stream-keyed: the chunks land
+        // under the community epoch the provenance names.
+        adopt_chunks(&l, &stream, &manifest_prov, "I759 (1)").await;
+        let chunks = l.ba.stream_chunks(&stream).await.unwrap().chunks;
+        for c in &chunks {
+            assert!(
+                l.bb.community_dek_blob_epoch(&c.chunk_sha)
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "I759 (1): chunk {} landed bound",
+                c.seq
+            );
+        }
+        // (2) The promote opens the manifest, which names every chunk
+        // stream-keyed, and refuses: nothing promoted.
+        let e = l
+            .engine_b
+            .promote_adopted_manifest_to_dag(
+                &root,
+                &l.node_b,
+                None,
+                crate::federation::AdoptDisposition::LocalOnly,
+            )
+            .await
+            .expect_err("I759 (2): a community-bound stream-keyed chunk is refused at the promote");
+        let first = &chunks[0];
+        let named = hex::encode(first.chunk_sha);
+        assert!(
+            matches!(
+                &e,
+                BlobError::StreamKeyedChunkCommunityEpoch {
+                    stream_id, epoch, community_epoch, chunk_sha256_hex: Some(c)
+                } if *stream_id == stream && *epoch == first.epoch
+                    && *community_epoch == room_epoch && *c == named
+            ),
+            "I759 (2): {e:?}"
+        );
+        assert_ne!(
+            l.bb.blob_head(&root)
+                .await
+                .unwrap()
+                .expect("held")
+                .storage_kind,
+            "chunk_dag",
+            "I759 (2): the manifest row was not promoted"
+        );
+        // (3) The remedy: the stream's rows arrive, the bound chunks are
+        // evicted and re-adopted with the chunk provenance; the DAG promotes
+        // and both reads open.
+        for row in stream_rows {
+            l.engine_b.apply_replicated_key_grant(row).await.unwrap();
+        }
+        for c in &chunks {
+            l.engine_b
+                .evict_blob(&c.chunk_sha, chrono::Utc::now())
+                .await
+                .unwrap_or_else(|e| panic!("I759 (3): evict chunk {}: {e}", c.seq));
+        }
+        let chunk_prov = manifest_prov.for_stream_keyed_chunk().unwrap();
+        adopt_chunks(&l, &stream, &chunk_prov, "I759 (3)").await;
+        l.engine_b
+            .promote_adopted_manifest_to_dag(
+                &root,
+                &l.node_b,
+                None,
+                crate::federation::AdoptDisposition::LocalOnly,
+            )
+            .await
+            .expect("I759 (3): B promotes");
+        assert_eq!(
+            l.engine_b
+                .read_blob_as(&root, &l.node_b, None)
+                .await
+                .unwrap(),
+            plain,
+            "I759 (3): the DAG read"
+        );
+        assert_eq!(
+            l.engine_b
+                .read_stream_chunk_as(&stream, first.seq, &l.node_b, None)
+                .await
+                .expect("I759 (3): the positional read"),
+            segment(0)
+        );
+    }
+
+    /// **I760** — see the module doc.
+    pub(crate) async fn i760_a_legacy_room_chunk_still_adopts_under_its_community_epoch<B>(
+        dsn_a: &str,
+        dsn_b: &str,
+        run: &str,
+        pick: Pick<B>,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync + 'static,
+    {
+        use crate::federation::chunk_dag_cascade::invariants::legacy_room_streams;
+        let l = ladder(dsn_a, dsn_b, run, pick).await;
+        let stream = format!("i760-{run}");
+        let (plain, sealed) = legacy_room_streams(async {
+            let plain = write_room(&l, &stream, 3, 0).await;
+            let sealed = l
+                .engine_a
+                .seal_stream_scoped(COMMUNITY, Some(&l.comm), &stream, None, None)
+                .await
+                .expect("A seals the legacy room stream");
+            (plain, sealed)
+        })
+        .await;
+        let root = sealed.manifest_sha256;
+        let room_epoch = sealed.epoch.expect("a room manifest names its epoch");
+        assert!(
+            l.ba.stream_dek_list(&stream).await.unwrap().is_empty(),
+            "I760: a legacy room stream has no stream epoch"
+        );
+        l.engine_a.emit_pending_key_grants().await.unwrap();
+        for row in key_grant_rows_for(l.ba.as_ref(), &l.node_a, &l.node_b).await {
+            l.engine_b.apply_replicated_key_grant(row).await.unwrap();
+        }
+        // The room row's provenance, epoch and all, is right for every legacy
+        // chunk: each was sealed under that community epoch.
+        let prov = room_row_provenance(&l, &format!("i760-{run}"), &root, room_epoch);
+        l.engine_b
+            .adopt_sealed_blob(
+                &inline(l.ba.as_ref(), &root).await,
+                prov.clone(),
+                None,
+                crate::federation::AdoptDisposition::LocalOnly,
+            )
+            .await
+            .expect("I760: B adopts the manifest");
+        adopt_chunks(&l, &stream, &prov, "I760").await;
+        let chunks = l.ba.stream_chunks(&stream).await.unwrap().chunks;
+        for c in &chunks {
+            assert_eq!(
+                l.bb.community_dek_blob_epoch(&c.chunk_sha)
+                    .await
+                    .unwrap()
+                    .map(|(_, _, e)| e),
+                Some(room_epoch),
+                "I760: legacy chunk {} is bound under its community epoch",
+                c.seq
+            );
+        }
+        l.engine_b
+            .promote_adopted_manifest_to_dag(
+                &root,
+                &l.node_b,
+                None,
+                crate::federation::AdoptDisposition::LocalOnly,
+            )
+            .await
+            .expect("I760: B promotes the legacy DAG");
+        assert_eq!(
+            l.engine_b
+                .read_blob_as(&root, &l.node_b, None)
+                .await
+                .unwrap(),
+            plain,
+            "I760: the DAG read"
+        );
+        assert_eq!(
+            l.engine_b
+                .read_stream_chunk_as(&stream, chunks[0].seq, &l.node_b, None)
+                .await
+                .expect("I760: the positional read opens under the community epoch"),
+            segment(0)
+        );
+    }
+
     macro_rules! runners {
         ($modname:ident, $dsn:expr, $pick:expr) => {
             mod $modname {
                 use super::*;
                 fn run() -> String {
                     uuid::Uuid::new_v4().simple().to_string()[..12].to_owned()
+                }
+                #[tokio::test]
+                async fn i758() {
+                    let Some((a, b)) = $dsn else { return };
+                    i758_a_stream_keyed_chunk_is_never_bound_to_a_community_epoch(
+                        &a,
+                        &b,
+                        &run(),
+                        $pick,
+                    )
+                    .await
+                }
+                #[tokio::test]
+                async fn i759() {
+                    let Some((a, b)) = $dsn else { return };
+                    i759_a_chunk_bound_before_its_stream_keys_is_refused_at_the_promote(
+                        &a,
+                        &b,
+                        &run(),
+                        $pick,
+                    )
+                    .await
+                }
+                #[tokio::test]
+                async fn i760() {
+                    let Some((a, b)) = $dsn else { return };
+                    i760_a_legacy_room_chunk_still_adopts_under_its_community_epoch(
+                        &a,
+                        &b,
+                        &run(),
+                        $pick,
+                    )
+                    .await
                 }
                 #[tokio::test]
                 async fn i750() {
