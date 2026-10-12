@@ -20899,8 +20899,17 @@ impl crate::federation::BlobStorage for PostgresBackend {
             .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
         let rows = client
             .query(
-                "SELECT child_index, child_sha256 FROM cirislens.federation_manifest_children \
-                  WHERE root_sha256 = $1 ORDER BY child_index ASC",
+                // v55.0.0 (CIRISPersist#1058) — the relation outlives an
+                // evicted root (the purge plane walks it), so "names on this
+                // node" is the HELD root's HELD children.
+                "SELECT mc.child_index, mc.child_sha256 \
+                   FROM cirislens.federation_manifest_children mc \
+                  WHERE mc.root_sha256 = $1 \
+                    AND EXISTS (SELECT 1 FROM cirislens.federation_blobs r \
+                                 WHERE r.sha256 = mc.root_sha256) \
+                    AND EXISTS (SELECT 1 FROM cirislens.federation_blobs c \
+                                 WHERE c.sha256 = mc.child_sha256) \
+                  ORDER BY mc.child_index ASC",
                 &[&root_sha256.to_vec()],
             )
             .await
@@ -23500,11 +23509,19 @@ impl PostgresBackend {
             .transaction()
             .await
             .map_err(|e| crate::federation::BlobError::Backend(format!("delete_blob tx: {e}")))?;
-        // v52.0.0 (#954) — a v3 root's children die with it (see the sqlite twin).
+        // v52.0.0 (#954) — a v3 root's children die with it (see the sqlite
+        // twin); v55.0.0 (CIRISPersist#1058) only those no other held root
+        // relates, and the relation stays (the purge plane's child -> root
+        // walk, I835).
         let children: Vec<Vec<u8>> = tx
             .query(
-                "SELECT child_sha256 FROM cirislens.federation_manifest_children \
-                  WHERE root_sha256 = $1",
+                "SELECT mc.child_sha256 FROM cirislens.federation_manifest_children mc \
+                  WHERE mc.root_sha256 = $1 \
+                    AND NOT EXISTS (SELECT 1 FROM cirislens.federation_manifest_children o \
+                                      JOIN cirislens.federation_blobs b \
+                                        ON b.sha256 = o.root_sha256 \
+                                     WHERE o.child_sha256 = mc.child_sha256 \
+                                       AND o.root_sha256 <> $1)",
                 &[&sha_vec],
             )
             .await
@@ -23534,12 +23551,6 @@ impl PostgresBackend {
                 crate::federation::BlobError::Backend(format!("delete_blob child: {e}"))
             })?;
         }
-        tx.execute(
-            "DELETE FROM cirislens.federation_manifest_children WHERE root_sha256 = $1",
-            &[&sha_vec],
-        )
-        .await
-        .map_err(|e| crate::federation::BlobError::Backend(format!("delete_blob relation: {e}")))?;
         // v54.0.0 (#995 row 4) — the rooms die with the row.
         tx.execute(
             "DELETE FROM cirislens.federation_blob_associations WHERE sha256 = $1",

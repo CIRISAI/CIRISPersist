@@ -30,6 +30,14 @@ threat-model citations because this crate's audit story is the point.
 
 - `scripts/preflight_trust_root.py` adopts CIRISEdge#571's stricter rule, so persist's copy and Edge's vendored one (CIRISEdge#575) converge: a v3 `bundle` response whose `charter_root_key_id` is absent, empty or not a string FAILS, even with its quorum met. Three new self-test fixtures (absent, blank, non-string); the self-test is 15 fixtures. I190 (f)'s short-quorum body now names its charter root, so its refusal is the quorum's alone, and it asserts that.
 
+#### Fixed — steward purge follow-ups (#1058)
+
+- **A purged v3 root takes its nested DAG, and an evicted child page cannot be served back.** `delete_blob` deleted a v3 root's `federation_manifest_children` relation with the root. That relation is what tells the purge plane a child page is withheld (`purge_withheld` walks child -> root), so after `purge_finalize` a child page a peer re-offered related to nothing and was served back by hash. The relation now stays, as V176's chunk relation already did (I483); `manifest_children` answers a held root's held children, so a promote and I202 read as before. `delete_blob` also deleted every child of the root regardless of other parents; it now deletes only a child no other HELD root relates. Both SQL backends.
+- **The Python raw byte reads ask the disposition.** `get_blob_json` and `get_blob_range` read the storage trait directly and asked neither a withdrawn binding nor a purge, and their docs offered them "for relays". They now refuse `blob_purged` / `blob_withdrawn` exactly as the viewer and serve doors do (`refuse_if_withdrawn`).
+- **I835** (sqlite, postgres, two nodes): a 60-chunk stream sealed at a 4 KiB cap (a v3 root over child pages) is delivered to B, bound, purged and finalized. The root, every child page and every chunk are gone; a child page a live root also relates stays and serves; an evicted child page and an evicted chunk a peer re-offers are held but withheld (`Purged`) at the serve door.
+- **I836** (from disk, comments and every test-gating form stripped): every Python method and every `pub` Engine method that calls the raw `get_blob` / `get_blob_range` asks `refuse_if_withdrawn` or `check_serve_disposition` in the same item.
+- The DSAR thought-signature orphan this issue's comment also named shipped in v54.1.0 (I831).
+
 #### Adoption (Edge, Server)
 
 - **New exhaustive enum variant:** `federation::Error::MalformedRow { plane: &'static str, reason: &'static str, message: String }` (kind `federation_malformed_row`). A `match` on `federation::Error` needs an arm. It is TERMINAL; Edge's 8-refusal bound for these `InvalidArgument`s can go.
@@ -37,6 +45,7 @@ threat-model citations because this crate's audit story is the point.
 - **Kind changes:** rows that were `federation_invalid_argument` for the reasons above are now `federation_malformed_row`. The Python exception TYPE is unchanged (`ValueError`); the message is `federation_malformed_row: {plane}: {reason}` instead of `federation_invalid_argument`.
 - **Display changes:** `LicensureDelegatorNotAuthority` and every `MalformedRow` lose the `invalid argument:` prefix. Edge's witnesses that pin the licensure text need the new prefix.
 - **`purge_unauthorised` body:** read `reason` as a token and `retryable` as the verdict; the prose is `detail`. v54.1's "treat replicated-apply `purge_unauthorised` as retryable with a cap" becomes: retry only when `retryable` is true.
+- **Python `get_blob_json` / `get_blob_range`** now raise `ValueError` `blob_purged` / `blob_withdrawn` for withheld bytes.
 
 ## [54.1.0] - 2026-10-10
 

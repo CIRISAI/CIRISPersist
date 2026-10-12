@@ -79,6 +79,8 @@ pub(crate) mod bodies {
     pub(crate) trait LinkSeam {
         async fn dag_link(&self, manifest: &[u8; 32], add: Option<(u64, [u8; 32], &str)>);
         async fn drop_stream_row(&self, stream_id: &str, seq: u64);
+        /// The backend's inline cap (a small cap seals a v3 root, #954).
+        fn set_cap(&self, cap: usize);
     }
     #[cfg(feature = "sqlite")]
     impl LinkSeam for crate::store::sqlite::SqliteBackend {
@@ -88,6 +90,9 @@ pub(crate) mod bodies {
         async fn drop_stream_row(&self, stream_id: &str, seq: u64) {
             self.test_drop_stream_chunk_row(stream_id, seq).await
         }
+        fn set_cap(&self, cap: usize) {
+            self.set_inline_bytes_cap(cap);
+        }
     }
     #[cfg(feature = "postgres")]
     impl LinkSeam for crate::store::postgres::PostgresBackend {
@@ -96,6 +101,9 @@ pub(crate) mod bodies {
         }
         async fn drop_stream_row(&self, stream_id: &str, seq: u64) {
             self.test_drop_stream_chunk_row(stream_id, seq).await
+        }
+        fn set_cap(&self, cap: usize) {
+            self.set_inline_bytes_cap(cap);
         }
     }
 
@@ -727,6 +735,176 @@ pub(crate) mod bodies {
         );
     }
 
+    /// **I835** (v55.0.0, CIRISPersist#1058) — a purged v3 root takes its
+    /// whole nested DAG, and nothing it evicted can be served back by hash.
+    ///
+    /// A 60-chunk `self` stream sealed at a 4 KiB cap is a v3 root over v2
+    /// child pages (I202). B receives it whole, binds it, and a steward purge
+    /// of the binding row and the root finalizes. Then on B: the root, every
+    /// child page and every chunk are gone (the walk reached the nested
+    /// DAG); a child page a LIVE root also relates stays and serves
+    /// (`delete_blob` took children regardless of their other parents); and
+    /// an evicted child page or chunk a peer re-offers is withheld (`Purged`)
+    /// at the serve door. Before v55.0.0 `delete_blob` also deleted the
+    /// root -> child relation, so a re-offered child page related to nothing
+    /// and was served back.
+    pub(crate) async fn i835_a_purged_v3_root_takes_its_nested_dag<B>(
+        dsn_a: &str,
+        dsn_b: &str,
+        run: &str,
+        pick: Pick<B>,
+    ) where
+        B: BlobStorage + FederationDirectory + LinkSeam + Sync + 'static,
+    {
+        use crate::federation::steward_purge::{self as sp, PurgePlane};
+        let p = pair(dsn_a, dsn_b, run, pick, "i835").await;
+        p.sa.set_cap(4096);
+        let stream = format!("i835-{run}");
+        let root = write_and_seal(&p, &stream, 60).await;
+        // B receives the nested DAG the way I204's second device does.
+        p.a.emit_pending_key_grants().await.unwrap();
+        for set in
+            p.sa.list_attestations_by(&p.key_a)
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|x| x.attestation_type.starts_with("key_grant:"))
+        {
+            let _ =
+                p.b.apply_replicated_key_grant(SignedKeyGrantSet { attestation: set })
+                    .await;
+        }
+        p.b.adopt_sealed_blob(
+            &inline(p.sa.as_ref(), &root).await,
+            prov(&p),
+            None,
+            AdoptDisposition::LocalOnly,
+        )
+        .await
+        .expect("I835: B adopts the root");
+        let view =
+            p.b.open_sealed_manifest_as(&root, &p.key_b, None)
+                .await
+                .expect("I835: B opens the root");
+        assert_eq!(view.version, 3, "I835: the root is v3");
+        assert!(view.children.len() >= 2, "I835: two child pages at least");
+        let mut children = Vec::new();
+        let mut chunks = Vec::new();
+        for c in &view.children {
+            let sha = hexsha(&c.sha256_hex);
+            p.b.adopt_sealed_manifest_child(
+                &root,
+                c.index,
+                &inline(p.sa.as_ref(), &sha).await,
+                prov(&p),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("I835: child {}: {e}", c.index));
+            children.push(sha);
+            let page =
+                p.b.open_sealed_manifest_page_as(&root, c.index, &p.key_b, None)
+                    .await
+                    .unwrap_or_else(|e| panic!("I835: page {}: {e}", c.index));
+            for ch in page {
+                let csha = hexsha(&ch.sha256_hex);
+                let env = inline(p.sa.as_ref(), &csha).await;
+                p.b.adopt_sealed_chunk(
+                    &stream,
+                    ch.seq,
+                    &env,
+                    ch.epoch.unwrap_or(0),
+                    u64::from(ch.size),
+                    prov(&p),
+                )
+                .await
+                .unwrap_or_else(|e| panic!("I835: chunk {}: {e}", ch.seq));
+                chunks.push((ch.seq, csha, env, ch.epoch.unwrap_or(0), ch.size));
+            }
+        }
+        p.b.promote_adopted_manifest_to_dag(&root, &p.key_b, None)
+            .await
+            .expect("I835: B promotes");
+        // A LIVE root on B also relates the first child page.
+        let keep_stream = format!("i835-keep-{run}");
+        let keep = write_and_seal(&p, &keep_stream, 2).await;
+        deliver(&p, &keep_stream, &keep).await;
+        p.sb.record_manifest_child(&keep, 1_000, &children[0])
+            .await
+            .expect("I835: the live root relates child 0 too");
+        let row = bind(
+            p.sb.as_ref(),
+            &format!("i835-file-{run}"),
+            &p.owner,
+            &hex::encode(root),
+            None,
+        )
+        .await;
+        for c in &children {
+            served(&p, c)
+                .await
+                .expect("I835 control: a child page serves");
+        }
+        let t = chrono::Utc::now();
+        let exec = execute_purge(
+            p.sb.as_ref(),
+            &p.key_b,
+            &[
+                (PurgePlane::Attestation, row),
+                (PurgePlane::Blob, hex::encode(root)),
+            ],
+            t,
+        )
+        .await;
+        sp::test_clock::set(Some(
+            t + chrono::Duration::seconds(sp::PURGE_SETTLE_DWELL_SECS + 1),
+        ));
+        p.b.purge_finalize(&exec.notice_id)
+            .await
+            .expect("I835: the purge finalizes");
+        sp::test_clock::set(None);
+
+        assert!(!p.sb.has_blob(&root).await.unwrap(), "I835 the root goes");
+        for (i, c) in children.iter().enumerate().skip(1) {
+            assert!(
+                !p.sb.has_blob(c).await.unwrap(),
+                "I835 child page {i} goes with its purged root"
+            );
+        }
+        for (seq, c, ..) in &chunks {
+            assert!(
+                !p.sb.has_blob(c).await.unwrap(),
+                "I835 chunk {seq} of the nested DAG goes"
+            );
+        }
+        assert!(
+            p.sb.has_blob(&children[0]).await.unwrap(),
+            "I835 a child page a live root relates stays"
+        );
+        served(&p, &children[0])
+            .await
+            .expect("I835 and it still serves");
+
+        // A peer re-offers what was evicted.
+        let withheld = |r: Result<(), BlobError>, what: &str| {
+            assert!(
+                matches!(r, Err(BlobError::Purged { .. })),
+                "I835 a re-offered {what} is withheld: {r:?}"
+            );
+        };
+        let page = inline(p.sa.as_ref(), &children[1]).await;
+        p.b.adopt_sealed_blob(&page, prov(&p), None, AdoptDisposition::LocalOnly)
+            .await
+            .expect("I835: a child page's bytes may be re-delivered");
+        assert!(p.sb.has_blob(&children[1]).await.unwrap());
+        withheld(served(&p, &children[1]).await, "child page");
+        let (seq, csha, env, epoch, size) = &chunks[0];
+        p.b.adopt_sealed_chunk(&stream, *seq, env, *epoch, u64::from(*size), prov(&p))
+            .await
+            .expect("I835: a chunk's bytes may be re-delivered");
+        assert!(p.sb.has_blob(csha).await.unwrap());
+        withheld(served(&p, csha).await, "chunk");
+    }
+
     /// **I484** — a chunk two DAGs hold.
     pub(crate) async fn i484_a_shared_chunk_needs_both_withdrawn<B>(
         dsn_a: &str,
@@ -1267,6 +1445,7 @@ mod runners {
     pair_case!(i823, i823_a_purged_manifest_takes_its_chunks);
     pair_case!(i824, i824_a_purged_blob_is_withheld_from_execution);
     pair_case!(i830, i830_a_shared_chunk_waits_for_every_settle);
+    pair_case!(i835, i835_a_purged_v3_root_takes_its_nested_dag);
     pair_case!(i485, i485_a_forged_pointer_revives_nothing);
     pair_case!(i486_487, i486_487_an_unrelated_dag_and_the_backfill);
     pair_case!(i576, i576_the_backfill_sweep);
