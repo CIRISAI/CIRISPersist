@@ -222,10 +222,6 @@ decimal_id	claim_id	repo	path#symbol	crate@version
 4.5.3	CLM-purge-whole-or-not	CIRISPersist	src/federation/steward_purge.rs#refuse_if_tombstoned_attestation	ciris-persist@54.1.0
 3.3.2	CLM-steward-purge-authorisation	CIRISPersist	src/federation/steward_purge.rs#verify_purge_authorisation	ciris-persist@54.1.0
 3.3.2	CLM-steward-purge-authorisation	CIRISPersist	src/federation/canonical_community.rs#trust_root_cosigners_over	ciris-persist@54.1.0
-2.4.1.1	CLM-derived-rows-follow-reason	CIRISPersist	src/federation/steward_purge.rs#resolve_selection	ciris-persist@54.1.0
-2.4.1.1	CLM-derived-rows-follow-reason	CIRISPersist	src/federation/steward_purge.rs#withhold_orphaned_derivatives	ciris-persist@54.1.0
-3.3.2	CLM-purge-digest-preimage	CIRISPersist	src/federation/steward_purge.rs#selection_digest	ciris-persist@54.1.0
-3.3.2	CLM-purge-digest-preimage	CIRISPersist	src/federation/steward_purge.rs#notice_terms	ciris-persist@54.1.0
 4.5.3	CLM-purge-atomic-commit	CIRISPersist	src/federation/steward_purge.rs#check_purge_put_set	ciris-persist@54.1.0
 4.5.3	CLM-purge-atomic-commit	CIRISPersist	src/store/sqlite.rs#purge_put_execution	ciris-persist@54.1.0
 4.5.3	CLM-purge-atomic-commit	CIRISPersist	src/store/postgres.rs#purge_put_execution	ciris-persist@54.1.0

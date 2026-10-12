@@ -40,12 +40,11 @@ threat-model citations because this crate's audit story is the point.
 
 #### Added — evidence rows for the steward purge door (#1059)
 
-- `evidence/cc_impl.tsv` publishes nine claims of the v54.1.0 steward purge door and its Codex hardening, 20 rows, through `namespace_supersets.json` (appended entries, `manifest_round: cc-rc8-1059`, each naming its witnesses in `witness`) and `scripts/evidence_tsv.py write`. Every row points at the production definition.
-  - **CC 3.3.2:** `CLM-steward-purge-authorisation` (`verify_purge_authorisation`, `trust_root_cosigners_over`; I650, I833, I656) and `CLM-purge-digest-preimage` (`selection_digest`, `notice_terms`; I651, I654, I656).
-  - **CC 2.4.1.1:** `CLM-derived-rows-follow-reason` (`resolve_selection`, `withhold_orphaned_derivatives`; I654, I662, I820).
+- `evidence/cc_impl.tsv` publishes seven claims of the v54.1.0 steward purge door's Codex hardening, 16 rows, through `namespace_supersets.json` (appended entries, `manifest_round: cc-rc8-1059`, each naming its witnesses in `witness`) and `scripts/evidence_tsv.py write`. Every row points at the production definition.
+  - **CC 3.3.2:** `CLM-steward-purge-authorisation` (`verify_purge_authorisation`, `trust_root_cosigners_over`; I650, I833, I656).
   - **CC 4.5.3:** `CLM-purge-atomic-commit` (`check_purge_put_set`, both backends' `purge_put_execution`; I695), `CLM-purge-dwell-node-clock` (`purge_clock`, `purge_finalize`; I822, I655), `CLM-purge-out-of-order-void` (`tombstone_void_reason`, `refuse_if_tombstoned_attestation`; I697, I828), `CLM-purge-subject-unknown-retryable` (`refuse_if_tombstoned_attestation`, `refuse_if_tombstoned_trace`; I832), `CLM-purge-blob-withheld` (`purge_withheld`, `refuse_if_withdrawn`; I824, I835, I836) and `CLM-purge-projections-removed` (`ATTESTATION_PROJECTIONS`, both backends' `purge_attestation_projections`; I829, I829b).
-- Not published: `CLM-takedown-notice-row` (not shipped; rides the rc8 vendor) and `CLM-one-tombstone-row` (published with takedown's row, #1007).
-- The version-pin witness's exact count is 208.
+- Not published, because a row graduates only when its whole claim is backed: `CLM-takedown-notice-row` (not shipped; rides the rc8 vendor); `CLM-one-tombstone-row` and `CLM-derived-rows-follow-reason` (their takedown halves ship with #1007, slice C); `CLM-purge-digest-preimage` ("the notice is an admitted Contribution" waits for the rc8 vendor's notice row).
+- The version-pin witness's exact count is 204.
 
 #### Adoption (Edge, Server)
 
