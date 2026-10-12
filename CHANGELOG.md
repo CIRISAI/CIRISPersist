@@ -775,7 +775,7 @@ threat-model citations because this crate's audit story is the point.
   three stream-keyed legs, the tier guard and the claim's community were
   mutation-checked: each mutation turns a witness red.
 
-### Fixed — self/family content key grants never emitted (CIRISEdge v55 adopt)
+### Fixed — self/family content key grants never emitted (CIRISEdge v55 legacy-v2 wake)
 
 - **The bug.** `key_grant::dirty_axes` took a content axis's owner from the
   row's epoch binding (`community_key_id`). A self or family row has no
@@ -793,10 +793,10 @@ threat-model citations because this crate's audit story is the point.
     the witnesses that emit manually never saw it.
 - **The owner.** A `self` / `family` axis is now owned by the row's group,
   falling back to the binding's community. A room axis is owned by the
-  community, falling back to the group. The node key is only the last resort,
-  for a row that names no group, and the guard below catches that case. The
-  stream axis was already right. No other place derives an axis owner from a
-  provenance.
+  community, falling back to the group. The node's own key is never the
+  owner: a dirty row that names no group is not planned, stays dirty and is
+  logged once per `MISBUILT_AXIS_RETRY`. The stream axis was already right.
+  No other place derives an axis owner from a provenance.
 - **A mis-built axis is never cleared silently.** The rule: if a plan
   withholds EVERY recipient and this signer's own wrap is among them,
   `plan_key_grant_emission` reports it as mis-built.

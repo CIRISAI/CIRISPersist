@@ -1578,6 +1578,28 @@ pub fn misbuilt_axis_state(signer: &str, axis: &KeyGrantAxis) -> Option<Misbuilt
         .copied()
 }
 
+/// One throttled event under `key`: `true` (log it, count it planned) when
+/// the key's interval has passed or it was never seen, else `false` (count
+/// it skipped).
+fn throttle_tick(key: &str) -> bool {
+    let now = std::time::Instant::now();
+    let mut map = misbuilt_axes()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let st = map.entry(key.to_owned()).or_insert(MisbuiltAxisState {
+        next_retry: now,
+        planned: 0,
+        skipped: 0,
+    });
+    if now < st.next_retry {
+        st.skipped += 1;
+        return false;
+    }
+    st.planned += 1;
+    st.next_retry = now + MISBUILT_AXIS_RETRY;
+    true
+}
+
 /// What one pass of the dirty loop did.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DirtyEmissionReport {
@@ -1954,19 +1976,31 @@ where
         // (V177), the community for a room. A self/family row has no epoch
         // binding, so `community_key_id` is `None` there and the owner fell
         // back to THIS NODE's key: the audience rule withheld every
-        // recipient and the ledger cleared with nothing emitted. The node
-        // key stays only as the last resort for a row that names no group,
-        // and that plan is caught as mis-built, never cleared.
+        // recipient and the ledger cleared with nothing emitted. A row that
+        // names no group has no owner this node can name: never the node's
+        // own key. It is not planned (nothing could be emitted), stays dirty,
+        // and is logged once per `MISBUILT_AXIS_RETRY`.
         let owner = match prov.cohort_scope.as_str() {
             cohort_scope::SELF | cohort_scope::FAMILY => {
                 prov.group_key_id.or(prov.community_key_id)
             }
             _ => prov.community_key_id.or(prov.group_key_id),
         };
+        let Some(owner) = owner else {
+            if throttle_tick(&format!("{me}\u{0}ownerless\u{0}{}", hex::encode(sha))) {
+                tracing::error!(
+                    at_rest_sha256 = %hex::encode(sha),
+                    cohort_scope = %prov.cohort_scope,
+                    "a dirty blob names no owner group (no group_key_id, no binding): its \
+                     content rows cannot be planned and it stays dirty"
+                );
+            }
+            continue;
+        };
         out.push(KeyGrantAxis::Content {
             at_rest_sha256: hex::encode(sha),
             cohort_scope: prov.cohort_scope,
-            owner_key_id: owner.unwrap_or_else(|| me.to_owned()),
+            owner_key_id: owner,
         });
     }
     // v53.0.0 (#969) — each stream epoch `me` sealed whose rows are dirty.
