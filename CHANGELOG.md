@@ -657,19 +657,19 @@ threat-model citations because this crate's audit story is the point.
 - **`register_stream_epoch_dek`** (`chunk_dag_cascade::orchestrate`,
   `Engine::register_stream_epoch_dek`, PyO3
   `register_stream_epoch_dek(cohort_scope, group_key_id, stream_id, epoch,
-  dek_b64, keep, aad_b64=None) -> str`): the caller supplies the
+  dek_b64, aad_b64=None) -> str`): the caller supplies the
   `(stream_id, epoch)` DEK (the MLS exporter secret of a live call), so the
   live and the stored stream are one key. The door closes the stream's open
   epoch with its terminator, self-retains the DEK under the content master
-  (never derivable from persist state alone), marks the epoch `supplied`, and
-  when `keep` (the stream is recorded, or `history_on_join: full`) wraps it to
-  the stream's audience and emits the `key_grant:stream:v1` rows. An unkept
-  stream is wrapped to NOBODY and has no row, so MLS forward secrecy survives.
+  (never derivable from persist state alone), marks the epoch `supplied`,
+  wraps it to the stream's audience and emits the `key_grant:stream:v1` rows.
+  A supplied epoch is always kept: an unrecorded live call never reaches this
+  door (see "Changed — register_stream_epoch_dek has no `keep`" below).
   Chunks then go through `put_blob_chunk_scoped` at that epoch and read
   through the same doors as any stream-keyed chunk. Self, family and room
   streams alike.
 - **Persist never mints or rolls a supplied stream's epoch.** A removal from
-  the audience of a kept epoch, or the nonce cap, refuses the next chunk with
+  the audience of an epoch, or the nonce cap, refuses the next chunk with
   the retryable `stream_epoch_rotation_required` (reason `removal`, naming the
   removed key, or `cap`); a chunk naming an epoch nobody supplied is the
   retryable `stream_epoch_dek_missing`. No timer forces a rotation: CC 5.1's
@@ -680,12 +680,11 @@ threat-model citations because this crate's audit story is the point.
   the stream and never the writer, the I41 rule a foreign append already
   follows), `InvalidArgument` (a plaintext tier, an epoch below the newest, a
   per-chunk-keyed stream, another cohort).
-- Retroactive re-key walks skip an unkept epoch.
 - Migration **V193** (`stream_epoch_dek_supplied_and_rooms`), sqlite and
-  postgres: `federation_stream_deks` gains `supplied`, `keep`, `room_epoch`
-  and `evicted_at`, and both
-  stream-DEK tables admit the room scopes (sqlite rebuilds them in place under
-  their final names; every existing row is a minted, kept epoch).
+  postgres: `federation_stream_deks` gains `supplied`, `room_epoch` and
+  `evicted_at`, and both stream-DEK tables admit the room scopes (sqlite
+  rebuilds them in place under their final names; every existing row is a
+  minted epoch).
 - Evidence: `CLM-one-chunk-seal` (CC 5.3.3.2.5) cites
   `register_stream_epoch_dek` and `stream_epoch_verdict`.
 - Witnesses I750–I757 (sqlite, postgres; I756 pure).
@@ -704,12 +703,18 @@ threat-model citations because this crate's audit story is the point.
   manifest's provenance and do NOT rely on `from_attestation(.., epoch=None,
   ..)`: it fills the epoch from the pointer, which carries the COMMUNITY
   epoch (see "Fixed — provenance epoch on stream-keyed room chunks" below).
-- **New door:** `register_stream_epoch_dek` (above).
+- **New door:** `register_stream_epoch_dek` (above). No `keep`: an unrecorded
+  live call seals its frames in memory with `stream_seal::seal_stream_chunk`
+  under the MLS exporter secret and never calls it.
+- **`chunk_dag_cascade::terminator_seq(epoch)` and `TERMINATOR_SEQ_BASE` are
+  public** (also under `orchestrate`): an epoch terminator's storage seq, the
+  `storage_seq` argument to `seal_stream_chunk` / `open_stream_chunk` for a
+  terminator. Do not hand-copy 2^62 (I768 pins the value).
 - **New exhaustive enum variants:** `BlobError::{StreamEpochRotationRequired
   {stream_id, epoch, reason, removed_key_id}, StreamEpochDekExists {stream_id,
   epoch}, StreamNotAuthored {stream_id}, StreamEpochDekMissing
   {stream_id, epoch}}`; new enum `blobs::StreamRotationReason {Removal, Cap}`
-  (`removal` / `cap`). `StreamDekRecord` gains `supplied`, `keep` and
+  (`removal` / `cap`). `StreamDekRecord` gains `supplied` and
   `room_epoch`; `BlobStorage` gains `stream_dek_evict_room_chunks` (a required
   method: an out-of-tree `BlobStorage` must implement it).
 - **Python:** each is a `ValueError` whose message is the kind token then JSON
@@ -842,6 +847,42 @@ threat-model citations because this crate's audit story is the point.
   - the guard's signer clause;
   - the backoff;
   - the no-clear on a mis-built axis.
+
+### Changed — register_stream_epoch_dek has no `keep`: an unrecorded call never reaches persist (CC 5.1)
+
+- **Why:** CC rc7 part 5, "One DEK per `(stream_id, epoch)`, two
+  distributors" (normative), says: "An unrecorded live call wraps nothing: its
+  DEK exists only inside the live group, so an ordinary call keeps the forward
+  secrecy MLS gives it and leaves no durable wrap that could later open it."
+  `register_stream_epoch_dek(keep=false)` still stored the DEK under the
+  content master on the stream-DEK row, which is a durable wrap. And an unkept
+  stream cannot be sealed through persist's put path without persisting its
+  DEK. So the door had no conforming `keep=false` meaning.
+- **The change, a clean break:**
+  - `keep` is removed from `register_stream_epoch_dek` everywhere: the
+    orchestration, `Engine`, PyO3 (`register_stream_epoch_dek(cohort_scope,
+    group_key_id, stream_id, epoch, dek_b64, aad_b64=None)`) and the stub.
+  - It is removed from `RegisteredStreamEpoch` and the Python result JSON.
+  - It is removed from `StreamDekRecord` and its read and write paths.
+  - It is removed from V193 on both dialects. V193 is unshipped v55, so it was
+    edited in place and its checksums re-pinned.
+  - A supplied epoch is always kept and wrapped to the stream's audience. The
+    retro re-key and seal-time grant walks no longer skip anything.
+- **An unrecorded live call** never comes to persist's DEK door. The adopter
+  seals its frames in memory with `stream_seal::seal_stream_chunk` under the
+  MLS exporter secret. If it holds the resulting ciphertext, it may adopt it
+  through `adopt_sealed_chunks` with a `for_stream_keyed_chunk` provenance;
+  persist stores the ciphertext and no key (I753).
+- **Witnesses:**
+  - I767 (from disk): the CC rc7 paragraph is vendored byte-for-byte as
+    `src/federation/namespace/cc_rc7_part_5_one_dek_two_distributors.md`
+    (line 44 of `constitution/part_5_transport_substrate.md` at
+    `VENDORED_CC_COMMIT`), and its SHA-256 is pinned. With comments stripped,
+    the door's signatures, the PyO3 signature attribute, the stub,
+    `RegisteredStreamEpoch`, `StreamDekRecord` and both V193s name no `keep`.
+  - I753 (sqlite, postgres) now witnesses the unrecorded call's ciphertext. It
+    replaces the old unkept-stream witness.
+  - I768 pins `terminator_seq`.
 
 ## [54.1.1] - 2026-10-12
 
