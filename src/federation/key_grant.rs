@@ -1321,6 +1321,13 @@ pub struct KeyGrantEmissionPlan {
     pub sealer_refused: Option<String>,
     /// The ledger watermark, read BEFORE the wraps (§14, V146).
     pub watermark: Option<chrono::DateTime<chrono::Utc>>,
+    /// v55.0.0 (CIRISEdge v55 adopt) — the axis is MIS-BUILT: every
+    /// recipient was withheld, the signer's own wrap among them. The signer
+    /// passed [`check_sealer`], so it still speaks for the axis's owner, and
+    /// the audience rule refusing its own occurrence means the axis names the
+    /// wrong group (a self/family content axis owned by the node key, the
+    /// pre-fix [`dirty_axes`]). Nothing is emitted and the axis stays dirty.
+    pub misbuilt: Option<String>,
 }
 
 /// v55.0.0 (#989) — what one emission did.
@@ -1339,6 +1346,11 @@ pub struct KeyGrantEmission {
     pub deferred: Vec<String>,
     /// The signer could no longer sign as sealer; nothing was emitted.
     pub sealer_refused: Option<String>,
+    /// v55.0.0 (CIRISEdge v55 adopt) — the axis was mis-built (see
+    /// [`KeyGrantEmissionPlan::misbuilt`]): nothing was emitted and the axis
+    /// was left dirty, never cleared.
+    #[serde(default)]
+    pub misbuilt: Option<String>,
 }
 
 /// v55.0.0 (#989) — **plan the rows `signer` owes for `axis`**: the
@@ -1371,6 +1383,7 @@ where
         deferred: Vec::new(),
         sealer_refused: None,
         watermark,
+        misbuilt: None,
     };
     match check_sealer(backend.as_dyn_directory(), signer, axis, now, now).await {
         Ok(()) => {}
@@ -1401,6 +1414,24 @@ where
             continue;
         }
         plan.rows.push(row);
+    }
+    // A plan that withholds EVERY recipient, this signer's own wrap among
+    // them, is a construction error, not an audience change: a signer that
+    // passed the sealer rule speaks for the owner, so the audience rule
+    // refusing the signer itself means the axis names the wrong group. A
+    // plan that withholds SOME recipients (a removed device or member) is
+    // the audience rule working, and clears as before; so does one where
+    // the signer holds no wrap of its own (nothing proves the group wrong).
+    if plan.rows.is_empty()
+        && plan.already_emitted.is_empty()
+        && plan.deferred.is_empty()
+        && plan.withheld.iter().any(|r| r == signer)
+    {
+        plan.misbuilt = Some(format!(
+            "every recipient of {axis:?} was withheld, this signer's own wrap among them: the \
+             axis names the wrong group ({})",
+            axis.group_key_id()
+        ));
     }
     Ok(Some(plan))
 }
@@ -1448,7 +1479,7 @@ where
             None => skipped = true,
         }
     }
-    if !skipped && plan.deferred.is_empty() {
+    if !skipped && plan.deferred.is_empty() && plan.misbuilt.is_none() {
         if let Some(watermark) = plan.watermark {
             mark_emitted(backend, &plan.axis, watermark).await?;
         }
@@ -1460,6 +1491,7 @@ where
         withheld: plan.withheld,
         deferred: plan.deferred,
         sealer_refused: plan.sealer_refused,
+        misbuilt: plan.misbuilt,
     }))
 }
 
@@ -1497,10 +1529,126 @@ where
     B: BlobStorage + FederationDirectory + Sync,
 {
     let me = signer.derived_key_id();
-    let mut emitted = 0usize;
-    for axis in dirty_axes(backend, &me).await? {
-        match emit_key_grant_axis_with_local_signer(backend, signer, &axis).await {
-            Ok(Some(e)) => emitted += e.attestation_ids.len(),
+    let axes = dirty_axes(backend, &me).await?;
+    Ok(emit_dirty_axes(&me, axes, |axis| async move {
+        emit_key_grant_axis_with_local_signer(backend, signer, &axis).await
+    })
+    .await
+    .emitted)
+}
+
+/// v55.0.0 (CIRISEdge v55 adopt) — how long a MIS-BUILT axis
+/// ([`KeyGrantEmissionPlan::misbuilt`]) waits before the dirty loop plans it
+/// again, and the interval its log is throttled to. A mis-built axis stays
+/// dirty, so without this every pass would re-plan and re-log it.
+pub const MISBUILT_AXIS_RETRY: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// One mis-built axis's state in this process: when it may be planned
+/// again, and how often it has been planned and skipped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MisbuiltAxisState {
+    /// The earliest instant the dirty loop plans it again.
+    pub next_retry: std::time::Instant,
+    /// Passes that planned it and found it mis-built (one log line each).
+    pub planned: u64,
+    /// Passes that skipped it inside the retry interval.
+    pub skipped: u64,
+}
+
+fn misbuilt_axes() -> &'static std::sync::Mutex<std::collections::HashMap<String, MisbuiltAxisState>>
+{
+    static AXES: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, MisbuiltAxisState>>,
+    > = std::sync::OnceLock::new();
+    AXES.get_or_init(Default::default)
+}
+
+fn misbuilt_axis_key(signer: &str, axis: &KeyGrantAxis) -> String {
+    format!("{signer}\u{0}{axis:?}")
+}
+
+/// v55.0.0 — the state the dirty loop keeps for `signer`'s mis-built
+/// `axis` in this process, or `None` when it is not (or no longer) mis-built.
+#[must_use]
+pub fn misbuilt_axis_state(signer: &str, axis: &KeyGrantAxis) -> Option<MisbuiltAxisState> {
+    misbuilt_axes()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&misbuilt_axis_key(signer, axis))
+        .copied()
+}
+
+/// What one pass of the dirty loop did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DirtyEmissionReport {
+    /// Rows emitted.
+    pub emitted: usize,
+    /// Axes planned this pass and found mis-built (left dirty, logged).
+    pub misbuilt: usize,
+    /// Mis-built axes skipped inside their retry interval.
+    pub backed_off: usize,
+}
+
+/// v55.0.0 (CIRISEdge v55 adopt) — **one pass of the dirty loop over
+/// `axes`**, emitted by `emit` (the LocalSigner door or the Engine's). One
+/// axis that cannot be emitted is logged and left dirty; it does not hold
+/// back the others (#989). A MIS-BUILT axis is left dirty and logged at
+/// error level once per [`MISBUILT_AXIS_RETRY`], and is not planned again
+/// until the interval has passed; the log carries how many passes planned
+/// and skipped it. An axis that emits normally forgets its state.
+pub async fn emit_dirty_axes<F, Fut, E>(
+    signer: &str,
+    axes: Vec<KeyGrantAxis>,
+    mut emit: F,
+) -> DirtyEmissionReport
+where
+    F: FnMut(KeyGrantAxis) -> Fut,
+    Fut: std::future::Future<Output = Result<Option<KeyGrantEmission>, E>>,
+    E: std::fmt::Display,
+{
+    let mut report = DirtyEmissionReport::default();
+    for axis in axes {
+        let key = misbuilt_axis_key(signer, &axis);
+        let now = std::time::Instant::now();
+        {
+            let mut map = misbuilt_axes()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(st) = map.get_mut(&key) {
+                if now < st.next_retry {
+                    st.skipped += 1;
+                    report.backed_off += 1;
+                    continue;
+                }
+            }
+        }
+        match emit(axis.clone()).await {
+            Ok(Some(e)) => {
+                report.emitted += e.attestation_ids.len();
+                let mut map = misbuilt_axes()
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if let Some(reason) = &e.misbuilt {
+                    report.misbuilt += 1;
+                    let st = map.entry(key).or_insert(MisbuiltAxisState {
+                        next_retry: now,
+                        planned: 0,
+                        skipped: 0,
+                    });
+                    st.planned += 1;
+                    st.next_retry = now + MISBUILT_AXIS_RETRY;
+                    tracing::error!(
+                        axis = ?axis,
+                        withheld = ?e.withheld,
+                        planned = st.planned,
+                        skipped = st.skipped,
+                        retry_secs = MISBUILT_AXIS_RETRY.as_secs(),
+                        "key-grant axis is mis-built and was NOT cleared: {reason}"
+                    );
+                } else {
+                    map.remove(&key);
+                }
+            }
             Ok(None) => {}
             Err(e) => tracing::warn!(
                 axis = ?axis,
@@ -1509,7 +1657,7 @@ where
             ),
         }
     }
-    Ok(emitted)
+    report
 }
 
 /// §14 — the epoch-axis rows for `(community, M, epoch)` where M is
@@ -1801,10 +1949,24 @@ where
         let Some(prov) = backend.blob_provenance(&sha).await.map_err(map_blob_err)? else {
             continue;
         };
+        // v55.0.0 (CIRISEdge v55 adopt) — the axis's owner is the group the
+        // row names: the owner (self) or the family the write recorded
+        // (V177), the community for a room. A self/family row has no epoch
+        // binding, so `community_key_id` is `None` there and the owner fell
+        // back to THIS NODE's key: the audience rule withheld every
+        // recipient and the ledger cleared with nothing emitted. The node
+        // key stays only as the last resort for a row that names no group,
+        // and that plan is caught as mis-built, never cleared.
+        let owner = match prov.cohort_scope.as_str() {
+            cohort_scope::SELF | cohort_scope::FAMILY => {
+                prov.group_key_id.or(prov.community_key_id)
+            }
+            _ => prov.community_key_id.or(prov.group_key_id),
+        };
         out.push(KeyGrantAxis::Content {
             at_rest_sha256: hex::encode(sha),
             cohort_scope: prov.cohort_scope,
-            owner_key_id: prov.community_key_id.unwrap_or_else(|| me.to_owned()),
+            owner_key_id: owner.unwrap_or_else(|| me.to_owned()),
         });
     }
     // v53.0.0 (#969) — each stream epoch `me` sealed whose rows are dirty.

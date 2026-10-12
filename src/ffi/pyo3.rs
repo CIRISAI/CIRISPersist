@@ -6723,8 +6723,11 @@ impl PyEngine {
     /// or `{"axis":"stream","stream_id":…,"epoch":N,"cohort_scope":…,"owner_key_id":…}`.
     /// Returns the `KeyGrantEmission` as JSON (`axis`, `attestation_ids` — one
     /// per row emitted, `already_emitted`, `withheld` — recipients the audience
-    /// rule no longer admits, `sealer_refused`), or `null` when this node
-    /// holds no wrap for the axis. Needs the LocalSigner (hybrid).
+    /// rule no longer admits, `sealer_refused`, and v55.0.0 `misbuilt` — a
+    /// reason when every recipient, this node's own wrap among them, was
+    /// withheld: the axis names the wrong group and stays dirty), or `null`
+    /// when this node holds no wrap for the axis. Needs the LocalSigner
+    /// (hybrid).
     fn emit_key_grant(&self, py: Python<'_>, axis_json: &str) -> PyResult<Option<String>> {
         self.ensure_usable()?;
         catch_panic(|| {

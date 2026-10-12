@@ -6798,19 +6798,15 @@ impl Engine {
         // v55.0.0 (#989) — rows, not sets; and one axis that cannot be
         // emitted does not hold back the others (the legacy re-emit sweeps
         // every axis a node owns): it stays dirty and is retried.
-        let mut emitted = 0usize;
-        for axis in &axes {
-            match self.emit_key_grant(axis).await {
-                Ok(Some(e)) => emitted += e.attestation_ids.len(),
-                Ok(None) => {}
-                Err(e) => tracing::warn!(
-                    axis = ?axis,
-                    error = %e,
-                    "key-grant rows for this axis could not be emitted; it stays dirty (#989)"
-                ),
-            }
-        }
-        Ok(emitted)
+        // A mis-built axis is left dirty, logged once per retry interval and
+        // backed off (`key_grant::emit_dirty_axes`).
+        Ok(
+            crate::federation::key_grant::emit_dirty_axes(me, axes, |axis| async move {
+                self.emit_key_grant(&axis).await
+            })
+            .await
+            .emitted,
+        )
     }
 
     /// CIRISPersist#848 (`BLOB_REPLICATION.md` §12–§13), v55.0.0 (#989, CC
