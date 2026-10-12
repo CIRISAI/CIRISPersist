@@ -697,9 +697,13 @@ threat-model citations because this crate's audit story is the point.
   for it and names missing keys per epoch; its chunks need the
   `key_grant:stream:v1` row (at the room's scope) as well as the manifest's
   `key_grant:epoch:v1` row; `PutChunkScopedResult.epoch` is `None` for such a
-  chunk (it was the community epoch). To adopt such a chunk, pass a provenance
-  with `tier = community_dek`, the community, and `epoch = None`; the chunk
-  adopt's own `epoch` argument is the stream epoch.
+  chunk (it was the community epoch). To adopt such a chunk, build its
+  provenance with `BlobProvenance::for_stream_keyed_chunk()` over the room
+  row's provenance (`community_dek`, the community, no epoch, no minter); the
+  chunk adopt's own `epoch` argument is the stream epoch. Do NOT reuse the
+  manifest's provenance and do NOT rely on `from_attestation(.., epoch=None,
+  ..)`: it fills the epoch from the pointer, which carries the COMMUNITY
+  epoch (see "Fixed — provenance epoch on stream-keyed room chunks" below).
 - **New door:** `register_stream_epoch_dek` (above).
 - **New exhaustive enum variants:** `BlobError::{StreamEpochRotationRequired
   {stream_id, epoch, reason, removed_key_id}, StreamEpochDekExists {stream_id,
@@ -714,6 +718,62 @@ threat-model citations because this crate's audit story is the point.
   `blob_stream_epoch_dek_missing` (`retryable: true`),
   `blob_stream_epoch_dek_exists` and `blob_stream_not_authored`
   (`retryable: false`).
+
+### Fixed — provenance epoch on stream-keyed room chunks (CIRISEdge v55 adopt)
+
+- **The bug.** `BlobProvenance::from_attestation(row, sha, epoch, minter)`
+  fills `epoch` from the row's pointer when the caller passes `None`, and a
+  room row's pointer carries the COMMUNITY epoch. Following the slice-B note
+  (`epoch = None`) through `from_attestation`, or reusing the manifest's
+  provenance for its chunks, handed the chunk door a community epoch. The door
+  then bound the stream-keyed chunk under a community epoch that did not seal
+  it: `read_stream_chunk_as` opened it under the community DEK and failed, the
+  community epoch counted it among its objects (holding up that epoch's
+  destroy), and the promote accepted the DAG.
+- **`BlobProvenance::for_stream_keyed_chunk(&self) -> Result<Self, BlobError>`**
+  (new): the row's provenance with no epoch and no minter. `InvalidArgument`
+  unless it is a `community_dek` provenance naming its community.
+- **The chunk adopt doors refuse it** (`adopt_sealed_chunk`, which delegates to
+  `adopt_sealed_chunks`; Engine and PyO3 alike). A `community_dek` provenance
+  that names an epoch is refused when this node knows `(stream_id, epoch)` is
+  stream-keyed: it holds the epoch's DEK row, a wrap addressed to it, or a wrap
+  sealed by the chunk's author. The whole batch is refused and nothing is
+  written. A legacy (pre-v55, per-chunk-bound) room chunk still adopts under
+  its community epoch.
+- **The ordering gap is closed at the promote.** A chunk that arrives before
+  the stream's `key_grant:stream:v1` rows cannot be told from a legacy one, so
+  it lands bound. `promote_adopted_manifest_to_dag` opens the manifest, the
+  author's own record of how each chunk was keyed, and refuses a stream-keyed
+  chunk that a community epoch binds, naming the chunk. Nothing is promoted
+  and nothing is announced. The remedy is `evict_blob` on each bound chunk,
+  then re-adopting it with `for_stream_keyed_chunk` and promoting again.
+- **The adopted room stream names its room.** `BlobStorage::adopt_sealed_chunk_at`
+  and `adopt_sealed_chunks_at` gain a trailing `community_key_id:
+  Option<&str>`, which is the provenance's community for a `community_dek`
+  adopt. The stream's claim records that community whether or not a community
+  epoch binds the chunk, as the origin's claim does. Before this, an adopted
+  stream-keyed room stream claimed no community, and a stream first adopted
+  bound refused the corrected re-adopt (I41). Self and family adopts are
+  unchanged.
+- **New exhaustive enum variant:** `BlobError::StreamKeyedChunkCommunityEpoch
+  {stream_id, epoch, community_epoch, chunk_sha256_hex}`, where `epoch` is the
+  STREAM epoch. `chunk_sha256_hex` is `None` at an adopt door and the bound
+  chunk at the promote. Its kind token is
+  `blob_stream_keyed_chunk_community_epoch`. **Python:** `ValueError`, whose
+  message is the token then JSON `{stream_id, epoch, community_epoch,
+  chunk_sha256_hex, retryable: false}`. The refusal is terminal for that
+  provenance: rebuild it with `for_stream_keyed_chunk`.
+- **Breaking for out-of-tree `BlobStorage` implementations:** the two
+  signatures above changed.
+- **What Edge must change:** build every stream-keyed room chunk's provenance
+  with `for_stream_keyed_chunk()`. A chunk is stream-keyed when
+  `sealed_dag_readiness` answers `chunk_keys: "stream_epoch"`, or when the
+  opened manifest is v4 with per-chunk epochs. Handle the new token at the
+  chunk adopt and at the promote. At the promote, evict the named chunks and
+  re-adopt them.
+- Witnesses I758–I761 (sqlite, postgres). Each refusal clause, each of the
+  three stream-keyed legs, the tier guard and the claim's community were
+  mutation-checked: each mutation turns a witness red.
 
 ## [54.1.1] - 2026-10-12
 
