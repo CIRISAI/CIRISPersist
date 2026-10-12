@@ -7,7 +7,7 @@ threat-model citations because this crate's audit story is the point.
 
 ## [Unreleased]
 
-## [54.1.1] - UNRELEASED
+## [54.1.1] - 2026-10-12
 
 ### Fixed — the v54.1.0 tag's Windows wheel job
 
