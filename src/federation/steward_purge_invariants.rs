@@ -190,6 +190,7 @@
 pub(crate) mod bodies {
     use crate::federation::canonical_community::CIRIS_CANONICAL_COMMUNITY_KEY_ID as CANON;
     use crate::federation::canonical_community_invariants::bodies as cc;
+    use crate::federation::steward_purge::unauthorised_reason as why;
     use crate::federation::steward_purge::{
         self as sp, token, PurgePlane, PurgeSelection, StewardPurgeNotice,
     };
@@ -749,15 +750,39 @@ pub(crate) mod bodies {
             "a notice without the CC 3.3.2 holder list" => "content_holder_key_ids",
             _ => "holds no seat",
         };
+        // v55.0.0 (CIRISPersist#1055) — and its typed reason, with the
+        // retryable bit the reason implies: only the claimant this node does
+        // not hold is an ordering gap here.
+        let reason = |what: &str| match what {
+            "no cosignature" => why::NO_COSIGNATURE,
+            "one of quorum:2/3" | "one founder and a non-founder seat" => why::QUORUM_NOT_MET,
+            "a founder quorum with one founder signing twice" => why::DUPLICATE_COSIGNER,
+            "a forged cosignature" => why::SIGNATURE_INVALID,
+            "another basis" => why::WRONG_BASIS,
+            "an expired notice" => why::EXPIRED,
+            "a claimant that is not a rooted trust root" => why::ROOT_NOT_HELD,
+            "a notice without the CC 3.3.2 holder list" => why::NOTICE_MALFORMED,
+            _ => why::NOT_A_SEAT,
+        };
         for (what, notice) in cases {
             let e = rows_at(dir, &sel, &notice, NODE, t).await.expect_err(what);
             let (tok, body) = refusal(&e);
             assert_eq!(tok, token::UNAUTHORISED, "I650 {what}: {body}");
             assert!(
-                body["reason"]
+                body["detail"]
                     .as_str()
                     .is_some_and(|r| r.contains(clause(what))),
                 "I650 {what}: refused by another clause: {body}"
+            );
+            assert_eq!(
+                body["reason"].as_str(),
+                Some(reason(what)),
+                "I650 {what}: the typed reason: {body}"
+            );
+            assert_eq!(
+                body["retryable"].as_bool(),
+                Some(reason(what) == why::ROOT_NOT_HELD),
+                "I650 {what}: retryable is the gap alone: {body}"
             );
             assert_eq!(e.kind(), "purge_unauthorised", "I650 the kind IS the token");
             assert_nothing_written(d, &notice).await;
@@ -1197,6 +1222,108 @@ pub(crate) mod bodies {
     }
 
     // ── I656 ──────────────────────────────────────────────────────────────
+    /// **I833 (v55.0.0, CIRISPersist#1055, CIRISEdge's ask) — a retryable
+    /// `purge_unauthorised` is one a later row or instant turns into an
+    /// authorisation.** A receiver that does not hold the claimant trust root
+    /// refuses the bundle `root_not_held`, `retryable: true`; once the root
+    /// lands, the SAME bundle is no longer refused as unauthorised. A notice
+    /// asserted in this node's future is `not_yet_valid`, retryable, and
+    /// authorises once the clock reaches it. A forged cosignature on a node
+    /// that holds the root is `signature_invalid`, `retryable: false`.
+    pub(crate) async fn i833_unauthorised_reason_splits_the_gap_from_the_verdict<D: Seams>(
+        a: &D,
+        c: &D,
+    ) {
+        root(a).await;
+        mock_world(a, "i833").await;
+        let t = now();
+        let da = a.as_dyn_directory();
+        let dry = sp::purge_dry_run(da, &mock_selection()).await.unwrap();
+
+        // A notice from this node's future: the gap is the clock.
+        let ahead = t + chrono::Duration::hours(1);
+        let future = notice_for(
+            &dry.notice_template,
+            &[cc::FOUNDERS[0], cc::FOUNDERS[1]],
+            ahead,
+        );
+        sp::test_clock::set(Some(t));
+        let e = sp::verify_purge_authorisation(da, &future)
+            .await
+            .expect_err("I833: a notice from the future authorises nothing yet");
+        let (tok, body) = refusal(&e);
+        assert_eq!(tok, token::UNAUTHORISED, "I833 future: {body}");
+        assert_eq!(
+            body["reason"].as_str(),
+            Some(why::NOT_YET_VALID),
+            "I833: {body}"
+        );
+        assert_eq!(body["retryable"].as_bool(), Some(true), "I833: {body}");
+        sp::test_clock::set(Some(ahead + chrono::Duration::minutes(1)));
+        sp::verify_purge_authorisation(da, &future)
+            .await
+            .expect("I833: the same notice authorises once the clock reaches it");
+
+        let notice = notice_for(&dry.notice_template, &[cc::FOUNDERS[0], cc::FOUNDERS[1]], t);
+        rows_at(da, &mock_selection(), &notice, NODE, t)
+            .await
+            .unwrap();
+        let bundle = sp::list_purge_bundles_since(da, None, 10)
+            .await
+            .unwrap()
+            .remove(0);
+
+        // The receiver does not hold the root YET.
+        let dc = c.as_dyn_directory();
+        let e = apply_at(dc, &bundle, "node-c", t)
+            .await
+            .expect_err("I833: a rootless receiver refuses");
+        let (tok, body) = refusal(&e);
+        assert_eq!(tok, token::UNAUTHORISED, "I833 rootless: {body}");
+        assert_eq!(
+            body["reason"].as_str(),
+            Some(why::ROOT_NOT_HELD),
+            "I833: {body}"
+        );
+        assert_eq!(body["retryable"].as_bool(), Some(true), "I833: {body}");
+        assert!(
+            body["detail"]
+                .as_str()
+                .is_some_and(|d| d.contains("no community row")),
+            "I833: the prose rides in `detail`: {body}"
+        );
+
+        // A forged cosignature is a verdict, on a node that holds the root.
+        let mut forged = bundle.clone();
+        forged.notice.cosignatures[0] = ts::threshold_sign(cc::FOUNDERS[0], b"not the notice");
+        root(c).await;
+        let (tok, body) = refusal(&apply_at(dc, &forged, "node-c", t).await.unwrap_err());
+        assert_eq!(tok, token::UNAUTHORISED, "I833 forged: {body}");
+        assert_eq!(
+            body["reason"].as_str(),
+            Some(why::SIGNATURE_INVALID),
+            "I833: {body}"
+        );
+        assert_eq!(body["retryable"].as_bool(), Some(false), "I833: {body}");
+
+        // The root landed: the SAME bundle is no longer an unauthorised one.
+        match apply_at(dc, &bundle, "node-c", t).await {
+            Ok(_) => {}
+            Err(e) => {
+                let (tok, body) = refusal(&e);
+                assert_ne!(
+                    tok,
+                    token::UNAUTHORISED,
+                    "I833: once the root is held the gap is closed: {body}"
+                );
+            }
+        }
+        for r in why::RETRYABLE {
+            assert!(why::ALL.contains(r) && why::is_retryable(r));
+        }
+        assert!(!why::is_retryable(why::NOT_A_SEAT));
+    }
+
     pub(crate) async fn i656_the_tombstone_replicates_re_verified<D: Seams>(a: &D, b: &D, c: &D) {
         root(a).await;
         root(b).await;
@@ -3481,6 +3608,13 @@ mod run {
                         return;
                     };
                     b::i656_the_tombstone_replicates_re_verified(&a, &c, &e).await
+                }
+                #[tokio::test]
+                async fn i833() {
+                    let (Some(a), Some(c)) = ($fresh.await, $fresh.await) else {
+                        return;
+                    };
+                    b::i833_unauthorised_reason_splits_the_gap_from_the_verdict(&a, &c).await
                 }
                 #[tokio::test]
                 async fn i670() {

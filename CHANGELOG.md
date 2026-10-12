@@ -7,6 +7,33 @@ threat-model citations because this crate's audit story is the point.
 
 ## [Unreleased]
 
+## [55.0.0] - UNRELEASED
+
+### Slice D — hardening backlog
+
+#### Changed — a malformed signed row is a typed, TERMINAL refusal (#1055, from CIRISEdge's adopt of v54.1)
+
+- **`Error::MalformedRow { plane, reason, message }`**, kind `federation_malformed_row`, replaces the generic `InvalidArgument` wherever a signed row's own bytes cannot be read as the claim they carry. It is terminal at the first refusal: no row this node could receive later changes the verdict on those bytes. `reason` is a stable token from the new public `federation::malformed_row` (`ALL` lists them): `no_signer`, `envelope_member_missing`, `envelope_member_invalid`, `typed_diverges_from_envelope`, `envelope_not_canonical`, `custody_ack_malformed`, `moderation_subject_digest_malformed`. `plane` names the door: `identity_occurrence`, `identity_occurrence_revocation`, `transport_destination`, `touch_claim`, `attestation`, `key_registration`, `trust_grant`, `trust_revocation`, `custody_ack`, or the plane `unknown_signer` was asked for. The Display is the previous text without the `invalid argument:` prefix. Python raises `ValueError("federation_malformed_row: {plane}: {reason}")`, the same type as the `InvalidArgument` arm it replaces.
+- **What moved.** An empty signer id (every door's signer lookup, and the key plane's empty `scrub_key_id`); a signed envelope member that is missing or ill-typed (not a string, not RFC 3339, not a finite number, an instant finer than a microsecond, a cosignature set that is not a threshold-signature array); a typed column that diverges from the envelope it mirrors (the #643 row mirror, `asserted_at`, `expires_at`, and the occurrence, revocation, transport-destination and touch-claim projections, `device_class` among them); an envelope that does not canonicalize; a malformed `custody_ack`; a malformed moderation subject digest.
+- **What stayed an `InvalidArgument`.** A caller's argument error, and every POLICY refusal (a duty naming a permission this node does not hold, a lease over the bound, a self-report by a third party, …). So did the two time-dependent refusals: an `asserted_at` or `fresh_as_of` past the skew bound is not malformed, because the same bytes admit once the clock catches up. The local producer's own builders (`emit_attestation`, `bind_revocation_into_envelope`), `check_encryption_pubkeys` (the local occurrence door's typed keys) and the bytes plane's `BlobError` are unchanged.
+- **`LicensureDelegatorNotAuthority`'s Display** is now `licensure_delegator_not_authority: {reason}: …`, without the `invalid argument:` prefix that made logs read it as an `InvalidArgument`. `kind()` and the Python message are unchanged.
+- **I834** (memory, sqlite, postgres): a typed `asserted_at`, a typed mirror column and a typed occurrence `device_class` moved off the signed envelope are each `MalformedRow { reason: typed_diverges_from_envelope }` on their plane, and the untouched rows admit. **I632** now pins `MalformedRow { reason: no_signer }`.
+
+#### Changed — `purge_unauthorised` says WHY, and whether to retry (#1055, CIRISEdge's ask)
+
+- The `PurgeRefused` body of a `purge_unauthorised` refusal is now `{notice_id, reason, retryable, detail}`. **`reason` is a token** from the new public `steward_purge::unauthorised_reason`, and **the prose moved to `detail`** (before, `reason` was the prose).
+- **Retryable** (an ordering gap: a later row or this node's clock can turn the refusal into an authorisation): `root_not_held`, `root_not_rooted`, `cosigner_key_not_held`, `not_yet_valid`. **Terminal**: `stalled`, `expired`, `not_a_seat`, `duplicate_cosigner`, `signature_invalid`, `no_cosignature`, `quorum_not_met`, `protocol_unevaluable`, `wrong_basis`, `notice_malformed`. `retryable` is `unauthorised_reason::is_retryable(reason)`; `RETRYABLE` and `ALL` list them.
+- `canonical_community::trust_root_cosigners_over` returns `Ok(Err((reason, detail)))`; its one caller is the purge door.
+- **I833** (memory, sqlite, postgres): a rootless receiver refuses a bundle `root_not_held`, `retryable: true`, and once the root lands the same bundle is no longer refused as unauthorised; a notice from this node's future is `not_yet_valid` and authorises once the clock reaches it; a forged cosignature is `signature_invalid`, `retryable: false`. **I650** now asserts the reason and the retryable bit of each of its eleven cases.
+
+#### Adoption (Edge, Server)
+
+- **New exhaustive enum variant:** `federation::Error::MalformedRow { plane: &'static str, reason: &'static str, message: String }` (kind `federation_malformed_row`). A `match` on `federation::Error` needs an arm. It is TERMINAL; Edge's 8-refusal bound for these `InvalidArgument`s can go.
+- **New refusal tokens:** `federation::malformed_row::{NO_SIGNER, ENVELOPE_MEMBER_MISSING, ENVELOPE_MEMBER_INVALID, TYPED_DIVERGES_FROM_ENVELOPE, ENVELOPE_NOT_CANONICAL, CUSTODY_ACK, MODERATION_SUBJECT_DIGEST}`; `steward_purge::unauthorised_reason::{ROOT_NOT_HELD, ROOT_NOT_ROOTED, COSIGNER_KEY_NOT_HELD, NOT_YET_VALID, STALLED, EXPIRED, NOT_A_SEAT, DUPLICATE_COSIGNER, SIGNATURE_INVALID, NO_COSIGNATURE, QUORUM_NOT_MET, PROTOCOL_UNEVALUABLE, WRONG_BASIS, NOTICE_MALFORMED}`.
+- **Kind changes:** rows that were `federation_invalid_argument` for the reasons above are now `federation_malformed_row`. The Python exception TYPE is unchanged (`ValueError`); the message is `federation_malformed_row: {plane}: {reason}` instead of `federation_invalid_argument`.
+- **Display changes:** `LicensureDelegatorNotAuthority` and every `MalformedRow` lose the `invalid argument:` prefix. Edge's witnesses that pin the licensure text need the new prefix.
+- **`purge_unauthorised` body:** read `reason` as a token and `retryable` as the verdict; the prose is `detail`. v54.1's "treat replicated-apply `purge_unauthorised` as retryable with a cap" becomes: retry only when `retryable` is true.
+
 ## [54.1.0] - 2026-10-10
 
 ### Added — the generic steward purge door (#1046, CIRISConstitution#165, CSD-108)

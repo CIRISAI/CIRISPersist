@@ -422,17 +422,112 @@ pub(crate) mod bodies {
             .expect("I631: without the fault the same row verifies");
     }
 
-    /// `e` is a terminal `InvalidArgument`, never the retryable gap.
+    /// `e` is the terminal `MalformedRow { reason: no_signer }` (v55.0.0,
+    /// CIRISPersist#1055; before, an `InvalidArgument`), never the retryable
+    /// gap.
     fn expect_malformed(e: &Error, what: &str) {
         // The key plane refuses an empty `scrub_key_id` before its lookup (its
         // own pre-existing guard); every other door reaches the lookup's.
         assert!(
-            matches!(e, Error::InvalidArgument(m)
-                if m.contains("names no signer") || m.contains("scrub_key_id must be non-empty")),
-            "{what}: a row naming no signer is malformed (InvalidArgument, from the signer \
-             lookup's own guard), got {} ({e:?})",
+            matches!(e, Error::MalformedRow { reason: "no_signer", message, .. }
+                if message.contains("names no signer")
+                    || message.contains("scrub_key_id must be non-empty")),
+            "{what}: a row naming no signer is malformed (MalformedRow no_signer, from the \
+             signer lookup's own guard), got {} ({e:?})",
             e.kind()
         );
+        assert_eq!(e.kind(), "federation_malformed_row", "{what}");
+    }
+
+    /// `e` is the terminal `MalformedRow` on `plane` for `reason`.
+    fn expect_malformed_as(e: &Error, plane: &str, reason: &str, what: &str) {
+        assert!(
+            matches!(e, Error::MalformedRow { plane: p, reason: r, .. } if *p == plane && *r == reason),
+            "{what}: expected MalformedRow {{ {plane}, {reason} }}, got {} ({e:?})",
+            e.kind()
+        );
+        assert_eq!(e.kind(), "federation_malformed_row", "{what}");
+        assert!(
+            crate::federation::malformed_row::ALL.contains(&reason),
+            "{what}: {reason} is in the closed set"
+        );
+        assert!(
+            !e.to_string().starts_with("invalid argument:"),
+            "{what}: the Display does not read as an InvalidArgument: {e}"
+        );
+    }
+
+    /// **I834 (v55.0.0, CIRISPersist#1055, CIRISEdge's adopt of v54.1) — a
+    /// signed row whose typed columns diverge from its signed envelope is the
+    /// TERMINAL `MalformedRow`, typed apart from a caller's argument error.**
+    /// On the attestation door: a typed `asserted_at` and a typed mirror
+    /// column (`attested_key_id`) moved off the envelope the signature
+    /// covers. On the occurrence door: a typed `device_class` moved off the
+    /// signed envelope (the exact case Edge reported). Each is refused with
+    /// its plane and reason token, and the untouched row admits.
+    pub async fn i834_typed_divergence_is_malformed_row(d: &dyn FederationDirectory, s: &str) {
+        use crate::federation::malformed_row as why;
+        let attester = format!("i834-att-{s}");
+        ts::register_hybrid_key(d, &attester).await;
+        let row = scored_row(&attester, &format!("i834-a-{s}"));
+
+        let mut moved = row.clone();
+        moved.asserted_at += chrono::Duration::seconds(1);
+        let e = d
+            .put_attestation(SignedAttestation { attestation: moved })
+            .await
+            .expect_err("I834: a typed asserted_at off its envelope");
+        expect_malformed_as(
+            &e,
+            "attestation",
+            why::TYPED_DIVERGES_FROM_ENVELOPE,
+            "I834 asserted_at",
+        );
+
+        let mut moved = row.clone();
+        moved.attested_key_id = format!("i834-other-{s}");
+        let e = d
+            .put_attestation(SignedAttestation { attestation: moved })
+            .await
+            .expect_err("I834: a typed mirror column off its envelope");
+        expect_malformed_as(
+            &e,
+            "attestation",
+            why::TYPED_DIVERGES_FROM_ENVELOPE,
+            "I834 mirror",
+        );
+
+        d.put_attestation(SignedAttestation { attestation: row })
+            .await
+            .expect("I834: the untouched row admits");
+
+        let identity = format!("i834-id-{s}");
+        let occ = format!("i834-occ-{s}");
+        ts::register_identity_key(d, &identity, USER).await;
+        ts::register_identity_key(d, &occ, AGENT).await;
+        let signed =
+            ts::signed_content_only_occurrence(&identity, &identity, &occ, chrono::Utc::now())
+                .await;
+        let mut moved = signed.clone();
+        moved.identity_occurrence.device_class =
+            if moved.identity_occurrence.device_class == "phone" {
+                "laptop".to_owned()
+            } else {
+                "phone".to_owned()
+            };
+        let e = d
+            .put_identity_occurrence(moved)
+            .await
+            .expect_err("I834: a typed device_class off its signed envelope");
+        expect_malformed_as(
+            &e,
+            "identity_occurrence",
+            why::TYPED_DIVERGES_FROM_ENVELOPE,
+            "I834 device_class",
+        );
+        d.put_identity_occurrence(signed)
+            .await
+            .expect("I834: the untouched occurrence admits");
     }
 
     /// **I632 (#1042 follow-up B, CIRISEdge#858) — a row that names NO signer
@@ -532,6 +627,11 @@ mod run {
                 async fn i632_empty_signer_is_malformed() {
                     let Some(b) = $fresh.await else { return };
                     bodies::i632_empty_signer_is_malformed(&b, &super::suffix()).await
+                }
+                #[tokio::test]
+                async fn i834_typed_divergence_is_malformed_row() {
+                    let Some(b) = $fresh.await else { return };
+                    bodies::i834_typed_divergence_is_malformed_row(&b, &super::suffix()).await
                 }
                 #[tokio::test]
                 async fn i631_lookup_failure_is_not_a_verdict() {

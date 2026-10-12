@@ -129,10 +129,14 @@ pub struct CustodyAck {
 }
 
 fn malformed(detail: impl std::fmt::Display) -> Error {
-    Error::InvalidArgument(format!(
-        "custody_ack_malformed: {detail} ({CUSTODY_ACK_DIMENSION}, CC 3.1.3.3) — a malformed \
-         custody report is refused, never read as an absent one"
-    ))
+    Error::malformed_row(
+        "custody_ack",
+        super::malformed_row::CUSTODY_ACK,
+        format!(
+            "custody_ack_malformed: {detail} ({CUSTODY_ACK_DIMENSION}, CC 3.1.3.3) — a malformed \
+             custody report is refused, never read as an absent one"
+        ),
+    )
 }
 
 fn is_lower_hex_digest(s: &str) -> bool {

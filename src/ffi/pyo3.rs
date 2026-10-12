@@ -34525,6 +34525,12 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         // (ValueError), so it keeps that type; the KIND
         // (`federation_signer_not_acting_for`) marks it retryable.
         crate::federation::Error::SignerDoesNotActFor { .. } => PyValueError::new_err(kind),
+        // v55.0.0 (CIRISPersist#1055) — typed out of `InvalidArgument`
+        // (ValueError), so it keeps that type; the plane and the TERMINAL
+        // reason token ride with the kind.
+        crate::federation::Error::MalformedRow { plane, reason, .. } => {
+            PyValueError::new_err(format!("{kind}: {plane}: {reason}"))
+        }
         // v54.1.0 (CIRISPersist#1042 follow-up C) — typed out of
         // `InvalidArgument` / `Conflict` (both ValueError); same type, and the
         // licensure reason token rides with the kind.

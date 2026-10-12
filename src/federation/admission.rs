@@ -794,7 +794,13 @@ pub fn trust_grant_signing_bytes(grant: &super::TrustGrant) -> Result<Vec<u8>, E
     });
     crate::verify::canonical::canonicalizer_for(crate::verify::canonical::CanonVersion::V2Jcs)
         .canonicalize_value(&value)
-        .map_err(|e| Error::InvalidArgument(format!("trust grant canonicalize: {e}")))
+        .map_err(|e| {
+            Error::malformed_row(
+                "trust_grant",
+                super::malformed_row::ENVELOPE_NOT_CANONICAL,
+                format!("trust grant canonicalize: {e}"),
+            )
+        })
 }
 
 /// v38.0.0 (CIRISPersist#721) — the pinned signing bytes for a trust
@@ -812,7 +818,13 @@ pub fn trust_revocation_signing_bytes(
     });
     crate::verify::canonical::canonicalizer_for(crate::verify::canonical::CanonVersion::V2Jcs)
         .canonicalize_value(&value)
-        .map_err(|e| Error::InvalidArgument(format!("trust revocation canonicalize: {e}")))
+        .map_err(|e| {
+            Error::malformed_row(
+                "trust_revocation",
+                super::malformed_row::ENVELOPE_NOT_CANONICAL,
+                format!("trust revocation canonicalize: {e}"),
+            )
+        })
 }
 
 /// v38.0.0 (CIRISPersist#721) — **the trust-grant authority gate.** The
@@ -3459,10 +3471,15 @@ pub fn check_session_lease_bound(
             .and_then(serde_json::Value::as_str)
             .and_then(|v| v.parse::<chrono::DateTime<chrono::Utc>>().ok())
             .ok_or_else(|| {
-                Error::InvalidArgument(format!(
-                    "{dimension}: `{member}` is REQUIRED on every session row as a CC 2.6.2 instant \
-                     (CC 3.1.3.1) — a row without it is malformed on this family, not a claim"
-                ))
+                Error::malformed_row(
+                    "attestation",
+                    super::malformed_row::ENVELOPE_MEMBER_MISSING,
+                    format!(
+                        "{dimension}: `{member}` is REQUIRED on every session row as a CC 2.6.2 \
+                         instant (CC 3.1.3.1) — a row without it is malformed on this family, \
+                         not a claim"
+                    ),
+                )
             })
     };
     let claimed_at = instant("claimed_at")?;
@@ -5126,9 +5143,11 @@ pub async fn verify_signed_identity_occurrence(
             .and_then(|v| v.as_str())
             .map(|s| s.to_owned())
             .ok_or_else(|| {
-                Error::InvalidArgument(format!(
-                    "signed identity_occurrence envelope missing string field `{k}`"
-                ))
+                Error::malformed_row(
+                    "identity_occurrence",
+                    super::malformed_row::ENVELOPE_MEMBER_MISSING,
+                    format!("signed identity_occurrence envelope missing string field `{k}`"),
+                )
             })
     };
     // CIRISPersist#851 (BLOB_REPLICATION.md §20.2) — the CONTENT-ONLY form: no
@@ -5168,9 +5187,13 @@ pub async fn verify_signed_identity_occurrence(
     // (2) The typed projection persist will STORE must equal the envelope — the
     // signature only covers the envelope, so a divergent projection is a MITM.
     let diverges = |what: &str| {
-        Error::InvalidArgument(format!(
-            "signed identity_occurrence: typed {what} diverges from the signed envelope (rejected)"
-        ))
+        Error::malformed_row(
+            "identity_occurrence",
+            super::malformed_row::TYPED_DIVERGES_FROM_ENVELOPE,
+            format!(
+                "signed identity_occurrence: typed {what} diverges from the signed envelope (rejected)"
+        ),
+        )
     };
     if str_field(env, "identity_key_id")? != row.identity_key_id {
         return Err(diverges("identity_key_id"));
@@ -5238,7 +5261,11 @@ pub async fn verify_signed_identity_occurrence(
         signature: signed.signature.clone(),
     };
     let verdict = verify_transport_binding(&binding, &key_directory).map_err(|e| {
-        Error::InvalidArgument(format!("signed identity_occurrence canonicalize: {e}"))
+        Error::malformed_row(
+            "identity_occurrence",
+            super::malformed_row::ENVELOPE_NOT_CANONICAL,
+            format!("signed identity_occurrence canonicalize: {e}"),
+        )
     })?;
     if !verdict.authentic {
         return Err(Error::SignatureInvalid(format!(
@@ -5297,23 +5324,30 @@ async fn verify_content_only_identity_occurrence(
             .and_then(|v| v.as_str())
             .map(|s| s.to_owned())
             .ok_or_else(|| {
-                Error::InvalidArgument(format!(
-                    "signed identity_occurrence envelope missing string field `{k}`"
-                ))
+                Error::malformed_row(
+                    "identity_occurrence",
+                    super::malformed_row::ENVELOPE_MEMBER_MISSING,
+                    format!("signed identity_occurrence envelope missing string field `{k}`"),
+                )
             })
     };
     let diverges = |what: &str| {
-        Error::InvalidArgument(format!(
-            "signed identity_occurrence: typed {what} diverges from the signed envelope (rejected)"
-        ))
+        Error::malformed_row(
+            "identity_occurrence",
+            super::malformed_row::TYPED_DIVERGES_FROM_ENVELOPE,
+            format!(
+                "signed identity_occurrence: typed {what} diverges from the signed envelope (rejected)"
+        ),
+        )
     };
     // (1) The envelope must carry the content-KEM pubkeys — a content-only
     // occurrence with neither transport nor keys binds nothing.
     let Some(enc) = env.get("encryption_pubkeys").filter(|e| !e.is_null()) else {
-        return Err(Error::InvalidArgument(
+        return Err(Error::malformed_row(
+            "identity_occurrence",
+            super::malformed_row::ENVELOPE_MEMBER_MISSING,
             "signed identity_occurrence must carry a transport_destination (occurrence-KEX \
-             #418) or encryption_pubkeys (content-only, CIRISPersist#851)"
-                .into(),
+             #418) or encryption_pubkeys (content-only, CIRISPersist#851)",
         ));
     };
     let env_enc = (
@@ -5403,7 +5437,11 @@ async fn verify_content_only_identity_occurrence(
         ));
     };
     let bytes = crate::verify::canonical::ceg_produce_canonicalize(env).map_err(|e| {
-        Error::InvalidArgument(format!("signed identity_occurrence canonicalize: {e}"))
+        Error::malformed_row(
+            "identity_occurrence",
+            super::malformed_row::ENVELOPE_NOT_CANONICAL,
+            format!("signed identity_occurrence canonicalize: {e}"),
+        )
     })?;
     let members = [ThresholdMember {
         member_id: signer_key.key_id.clone(),
@@ -5534,9 +5572,13 @@ pub async fn verify_signed_identity_occurrence_revocation(
             .and_then(|v| v.as_str())
             .map(|s| s.to_owned())
             .ok_or_else(|| {
-                Error::InvalidArgument(format!(
-                    "signed identity_occurrence_revocation envelope missing string field `{k}`"
-                ))
+                Error::malformed_row(
+                    "identity_occurrence_revocation",
+                    super::malformed_row::ENVELOPE_MEMBER_MISSING,
+                    format!(
+                        "signed identity_occurrence_revocation envelope missing string field `{k}`"
+                    ),
+                )
             })
     };
     let ts_field = |k: &str| -> Result<chrono::DateTime<chrono::Utc>, Error> {
@@ -5544,16 +5586,24 @@ pub async fn verify_signed_identity_occurrence_revocation(
         chrono::DateTime::parse_from_rfc3339(&s)
             .map(|t| t.with_timezone(&chrono::Utc))
             .map_err(|e| {
-                Error::InvalidArgument(format!(
-                    "signed identity_occurrence_revocation envelope `{k}` not RFC-3339: {e}"
-                ))
+                Error::malformed_row(
+                    "identity_occurrence_revocation",
+                    super::malformed_row::ENVELOPE_MEMBER_INVALID,
+                    format!(
+                        "signed identity_occurrence_revocation envelope `{k}` not RFC-3339: {e}"
+                    ),
+                )
             })
     };
     let diverges = |what: &str| {
-        Error::InvalidArgument(format!(
-            "signed identity_occurrence_revocation: typed {what} diverges from the signed \
-             envelope (rejected)"
-        ))
+        Error::malformed_row(
+            "identity_occurrence_revocation",
+            super::malformed_row::TYPED_DIVERGES_FROM_ENVELOPE,
+            format!(
+                "signed identity_occurrence_revocation: typed {what} diverges from the signed \
+                 envelope (rejected)"
+            ),
+        )
     };
     if str_field("identity_key_id")? != row.identity_key_id {
         return Err(diverges("identity_key_id"));
@@ -5585,9 +5635,11 @@ pub async fn verify_signed_identity_occurrence_revocation(
         ));
     };
     let bytes = crate::verify::canonical::ceg_produce_canonicalize(env).map_err(|e| {
-        Error::InvalidArgument(format!(
-            "signed identity_occurrence_revocation canonicalize: {e}"
-        ))
+        Error::malformed_row(
+            "identity_occurrence_revocation",
+            super::malformed_row::ENVELOPE_NOT_CANONICAL,
+            format!("signed identity_occurrence_revocation canonicalize: {e}"),
+        )
     })?;
     let members = [ThresholdMember {
         member_id: signer_key.key_id.clone(),
@@ -5667,18 +5719,22 @@ pub async fn verify_signed_transport_destination(
             .and_then(|v| v.as_str())
             .map(|s| s.to_owned())
             .ok_or_else(|| {
-                Error::InvalidArgument(format!(
-                    "signed transport_destination envelope missing string field `{k}`"
-                ))
+                Error::malformed_row(
+                    "transport_destination",
+                    super::malformed_row::ENVELOPE_MEMBER_MISSING,
+                    format!("signed transport_destination envelope missing string field `{k}`"),
+                )
             })
     };
     let parse_ts = |k: &str, s: &str| -> Result<chrono::DateTime<chrono::Utc>, Error> {
         chrono::DateTime::parse_from_rfc3339(s)
             .map(|t| t.with_timezone(&chrono::Utc))
             .map_err(|e| {
-                Error::InvalidArgument(format!(
-                    "signed transport_destination envelope `{k}` not RFC-3339: {e}"
-                ))
+                Error::malformed_row(
+                    "transport_destination",
+                    super::malformed_row::ENVELOPE_MEMBER_INVALID,
+                    format!("signed transport_destination envelope `{k}` not RFC-3339: {e}"),
+                )
             })
     };
     // Optional string field: absent/null ⇒ None; a non-string is malformed.
@@ -5686,16 +5742,22 @@ pub async fn verify_signed_transport_destination(
         match env.get(k) {
             None | Some(serde_json::Value::Null) => Ok(None),
             Some(serde_json::Value::String(s)) => Ok(Some(s.clone())),
-            Some(_) => Err(Error::InvalidArgument(format!(
-                "signed transport_destination envelope `{k}` must be a string"
-            ))),
+            Some(_) => Err(Error::malformed_row(
+                "transport_destination",
+                super::malformed_row::ENVELOPE_MEMBER_INVALID,
+                format!("signed transport_destination envelope `{k}` must be a string"),
+            )),
         }
     };
     let diverges = |what: &str| {
-        Error::InvalidArgument(format!(
-            "signed transport_destination: typed {what} diverges from the signed envelope \
-             (rejected)"
-        ))
+        Error::malformed_row(
+            "transport_destination",
+            super::malformed_row::TYPED_DIVERGES_FROM_ENVELOPE,
+            format!(
+                "signed transport_destination: typed {what} diverges from the signed envelope \
+                 (rejected)"
+            ),
+        )
     };
     if str_field("occurrence_key_id")? != row.occurrence_key_id {
         return Err(diverges("occurrence_key_id"));
@@ -5712,8 +5774,10 @@ pub async fn verify_signed_transport_destination(
     // `epoch` is the anti-rollback clock — REQUIRED in the envelope (a
     // serde-default 0 in the typed projection must not be silently trusted).
     let env_epoch = env.get("epoch").and_then(|v| v.as_u64()).ok_or_else(|| {
-        Error::InvalidArgument(
-            "signed transport_destination envelope missing unsigned-integer field `epoch`".into(),
+        Error::malformed_row(
+            "transport_destination",
+            super::malformed_row::ENVELOPE_MEMBER_MISSING,
+            "signed transport_destination envelope missing unsigned-integer field `epoch`",
         )
     })?;
     if env_epoch != row.epoch {
@@ -5760,7 +5824,11 @@ pub async fn verify_signed_transport_destination(
         ));
     };
     let bytes = crate::verify::canonical::ceg_produce_canonicalize(env).map_err(|e| {
-        Error::InvalidArgument(format!("signed transport_destination canonicalize: {e}"))
+        Error::malformed_row(
+            "transport_destination",
+            super::malformed_row::ENVELOPE_NOT_CANONICAL,
+            format!("signed transport_destination canonicalize: {e}"),
+        )
     })?;
     let members = [ThresholdMember {
         member_id: signer_key.key_id.clone(),
@@ -5928,15 +5996,20 @@ pub fn local_row_instant(
         Some(serde_json::Value::String(s)) => chrono::DateTime::parse_from_rfc3339(s)
             .map(|t| t.with_timezone(&chrono::Utc))
             .map_err(|e| {
-                Error::InvalidArgument(format!(
-                    "local attestation envelope `asserted_at` is not RFC-3339: {e} \
-                     (CIRISPersist#598)"
-                ))
+                Error::malformed_row(
+                    "attestation",
+                    super::malformed_row::ENVELOPE_MEMBER_INVALID,
+                    format!(
+                        "local attestation envelope `asserted_at` is not RFC-3339: {e} \
+                         (CIRISPersist#598)"
+                    ),
+                )
             }),
-        Some(_) => Err(Error::InvalidArgument(
+        Some(_) => Err(Error::malformed_row(
+            "attestation",
+            super::malformed_row::ENVELOPE_MEMBER_INVALID,
             "local attestation envelope `asserted_at` must be an RFC-3339 string or absent \
-             (CIRISPersist#598)"
-                .into(),
+             (CIRISPersist#598)",
         )),
     }
 }
@@ -6046,11 +6119,15 @@ pub fn check_instant_binding(
         chrono::DateTime::parse_from_rfc3339(s)
             .map(|t| t.with_timezone(&chrono::Utc))
             .map_err(|e| {
-                Error::InvalidArgument(format!(
-                    "attestation {}: signed envelope `{key}` is not RFC-3339: {e} \
-                     (CIRISPersist#598)",
-                    row.attestation_id
-                ))
+                Error::malformed_row(
+                    "attestation",
+                    super::malformed_row::ENVELOPE_MEMBER_INVALID,
+                    format!(
+                        "attestation {}: signed envelope `{key}` is not RFC-3339: {e} \
+                         (CIRISPersist#598)",
+                        row.attestation_id
+                    ),
+                )
             })
     };
     let on_resolution = |key: &str, t: chrono::DateTime<chrono::Utc>| -> Result<(), Error> {
@@ -6058,37 +6135,49 @@ pub fn check_instant_binding(
         if t.nanosecond() % CONSENT_INSTANT_RESOLUTION_NANOS == 0 {
             return Ok(());
         }
-        Err(Error::InvalidArgument(format!(
-            "attestation {}: `{key}` = {} carries sub-microsecond precision, which \
-             postgres TIMESTAMPTZ cannot store — the same op sequence would be a strict order \
-             on sqlite/memory and a TIE on postgres. Truncate to microseconds at the producer \
-             (CIRISPersist#598)",
-            row.attestation_id,
-            t.to_rfc3339(),
-        )))
+        Err(Error::malformed_row(
+            "attestation",
+            super::malformed_row::ENVELOPE_MEMBER_INVALID,
+            format!(
+                "attestation {}: `{key}` = {} carries sub-microsecond precision, which \
+                 postgres TIMESTAMPTZ cannot store — the same op sequence would be a strict order \
+                 on sqlite/memory and a TIE on postgres. Truncate to microseconds at the producer \
+                 (CIRISPersist#598)",
+                row.attestation_id,
+                t.to_rfc3339(),
+            ),
+        ))
     };
 
     // (1) asserted_at — REQUIRED, and the row column must equal it.
     let Some(serde_json::Value::String(env_asserted)) = env.get(paths::ASSERTED_AT) else {
-        return Err(Error::InvalidArgument(format!(
-            "attestation {} carries no signed `{}` string in its envelope. Folds pick a \
-             winner by the `asserted_at` COLUMN, which no signature covers — an unbound \
-             row is a replay waiting to happen, so it is REFUSED (no legacy regime; \
-             CIRISPersist#598)",
-            row.attestation_id,
-            paths::ASSERTED_AT,
-        )));
+        return Err(Error::malformed_row(
+            "attestation",
+            super::malformed_row::ENVELOPE_MEMBER_MISSING,
+            format!(
+                "attestation {} carries no signed `{}` string in its envelope. Folds pick a \
+                 winner by the `asserted_at` COLUMN, which no signature covers — an unbound \
+                 row is a replay waiting to happen, so it is REFUSED (no legacy regime; \
+                 CIRISPersist#598)",
+                row.attestation_id,
+                paths::ASSERTED_AT,
+            ),
+        ));
     };
     let env_asserted = parse(paths::ASSERTED_AT, env_asserted)?;
     if env_asserted != row.asserted_at {
-        return Err(Error::InvalidArgument(format!(
-            "attestation {}: typed `asserted_at` {} diverges from the signed envelope's \
-             {} (rejected — the column decides which claim wins, so it may not differ \
-             from the signed instant; CIRISPersist#598)",
-            row.attestation_id,
-            row.asserted_at.to_rfc3339(),
-            env_asserted.to_rfc3339(),
-        )));
+        return Err(Error::malformed_row(
+            "attestation",
+            super::malformed_row::TYPED_DIVERGES_FROM_ENVELOPE,
+            format!(
+                "attestation {}: typed `asserted_at` {} diverges from the signed envelope's \
+                 {} (rejected — the column decides which claim wins, so it may not differ \
+                 from the signed instant; CIRISPersist#598)",
+                row.attestation_id,
+                row.asserted_at.to_rfc3339(),
+                env_asserted.to_rfc3339(),
+            ),
+        ));
     }
     on_resolution(paths::ASSERTED_AT, row.asserted_at)?;
 
@@ -6097,23 +6186,31 @@ pub fn check_instant_binding(
         None | Some(serde_json::Value::Null) => None,
         Some(serde_json::Value::String(s)) => Some(parse(paths::EXPIRES_AT, s)?),
         Some(_) => {
-            return Err(Error::InvalidArgument(format!(
-                "attestation {}: signed envelope `{}` must be an RFC-3339 string or absent \
-                 (CIRISPersist#598)",
-                row.attestation_id,
-                paths::EXPIRES_AT,
-            )))
+            return Err(Error::malformed_row(
+                "attestation",
+                super::malformed_row::ENVELOPE_MEMBER_INVALID,
+                format!(
+                    "attestation {}: signed envelope `{}` must be an RFC-3339 string or absent \
+                     (CIRISPersist#598)",
+                    row.attestation_id,
+                    paths::EXPIRES_AT,
+                ),
+            ))
         }
     };
     if env_expires != row.expires_at {
-        return Err(Error::InvalidArgument(format!(
-            "attestation {}: typed `expires_at` {:?} diverges from the signed envelope's \
-             {:?} (rejected — folds DROP an expired row, so an unsigned expiry is an \
-             unsigned mute button on whatever the row retracts; CIRISPersist#598)",
-            row.attestation_id,
-            row.expires_at.map(|t| t.to_rfc3339()),
-            env_expires.map(|t| t.to_rfc3339()),
-        )));
+        return Err(Error::malformed_row(
+            "attestation",
+            super::malformed_row::TYPED_DIVERGES_FROM_ENVELOPE,
+            format!(
+                "attestation {}: typed `expires_at` {:?} diverges from the signed envelope's \
+                 {:?} (rejected — folds DROP an expired row, so an unsigned expiry is an \
+                 unsigned mute button on whatever the row retracts; CIRISPersist#598)",
+                row.attestation_id,
+                row.expires_at.map(|t| t.to_rfc3339()),
+                env_expires.map(|t| t.to_rfc3339()),
+            ),
+        ));
     }
     if let Some(exp) = row.expires_at {
         on_resolution(paths::EXPIRES_AT, exp)?;
@@ -6233,40 +6330,52 @@ pub fn check_row_column_binding(row: &super::Attestation) -> Result<(), Error> {
         // from — and `RowMirror` is `deny_unknown_fields` with only
         // `subject_key_ids` / `weight` defaulted, so a five-member mirror is
         // refused again by the very message that specified it.
-        return Err(Error::InvalidArgument(format!(
-            "attestation {} carries no signed `{}` object in its envelope. The signature covers \
-             `attestation_envelope` and NOTHING ELSE, so `attestation_id` (the row's identity), \
-             `attesting_key_id` (who made the claim), `attestation_type` (the verb), \
-             `subject_key_ids` (which grants revocation authority), `attested_key_id`, \
-             `cohort_scope` and `weight` were unsigned columns a relay could rewrite while the \
-             signature still verified. The mirror's members are exactly {:?} — all seven, \
-             REQUIRED except `subject_key_ids` (defaults to empty) and `weight` (absent ⇔ the \
-             column is NULL), and no others (the member set is closed). An unbound row is \
-             REFUSED (no legacy regime; CIRISPersist#643)",
-            row.attestation_id,
-            paths::ROW,
-            ROW_MIRROR_MEMBERS,
-        )));
+        return Err(Error::malformed_row(
+            "attestation",
+            super::malformed_row::ENVELOPE_MEMBER_MISSING,
+            format!(
+                "attestation {} carries no signed `{}` object in its envelope. The signature covers \
+                 `attestation_envelope` and NOTHING ELSE, so `attestation_id` (the row's identity), \
+                 `attesting_key_id` (who made the claim), `attestation_type` (the verb), \
+                 `subject_key_ids` (which grants revocation authority), `attested_key_id`, \
+                 `cohort_scope` and `weight` were unsigned columns a relay could rewrite while the \
+                 signature still verified. The mirror's members are exactly {:?} — all seven, \
+                 REQUIRED except `subject_key_ids` (defaults to empty) and `weight` (absent ⇔ the \
+                 column is NULL), and no others (the member set is closed). An unbound row is \
+                 REFUSED (no legacy regime; CIRISPersist#643)",
+                row.attestation_id,
+                paths::ROW,
+                ROW_MIRROR_MEMBERS,
+        ),
+        ));
     };
     let mirror: RowMirror = serde_json::from_value(raw.clone()).map_err(|e| {
-        Error::InvalidArgument(format!(
-            "attestation {}: signed envelope `{}` is not a well-formed typed-column mirror: {e} \
-             (members are exactly {:?} — all seven, and no others; CIRISPersist#643)",
-            row.attestation_id,
-            paths::ROW,
-            ROW_MIRROR_MEMBERS,
-        ))
+        Error::malformed_row(
+            "attestation",
+            super::malformed_row::ENVELOPE_MEMBER_INVALID,
+            format!(
+                "attestation {}: signed envelope `{}` is not a well-formed typed-column mirror: {e} \
+                 (members are exactly {:?} — all seven, and no others; CIRISPersist#643)",
+                row.attestation_id,
+                paths::ROW,
+                ROW_MIRROR_MEMBERS,
+        ),
+        )
     })?;
 
     // THE typed projection — ONE definition, shared with the stamp side.
     let expected = RowMirror::of(row)?;
 
     let diverges = |member: &str, typed: String, signed: String| {
-        Error::InvalidArgument(format!(
-            "attestation {}: typed `{member}` {typed} diverges from the signed envelope's \
-             {signed} (rejected — CIRISPersist#643)",
-            row.attestation_id,
-        ))
+        Error::malformed_row(
+            "attestation",
+            super::malformed_row::TYPED_DIVERGES_FROM_ENVELOPE,
+            format!(
+                "attestation {}: typed `{member}` {typed} diverges from the signed envelope's \
+                 {signed} (rejected — CIRISPersist#643)",
+                row.attestation_id,
+            ),
+        )
     };
 
     // THE ROW'S IDENTITY. First, because it is what makes a REPLAY of an
@@ -6337,13 +6446,17 @@ pub fn check_row_column_binding(row: &super::Attestation) -> Result<(), Error> {
     let mirror_weight = match &mirror.weight {
         None => None,
         Some(n) => Some(n.as_f64().ok_or_else(|| {
-            Error::InvalidArgument(format!(
-                "attestation {}: signed envelope `{}.{}` {n} is not a finite JSON number \
-                 (CIRISPersist#643)",
-                row.attestation_id,
-                paths::ROW,
-                row_paths::WEIGHT,
-            ))
+            Error::malformed_row(
+                "attestation",
+                super::malformed_row::ENVELOPE_MEMBER_INVALID,
+                format!(
+                    "attestation {}: signed envelope `{}.{}` {n} is not a finite JSON number \
+                     (CIRISPersist#643)",
+                    row.attestation_id,
+                    paths::ROW,
+                    row_paths::WEIGHT,
+                ),
+            )
         })?),
     };
     if mirror_weight != row.weight {
@@ -6552,15 +6665,21 @@ pub async fn verify_signed_touch_claim(
             .and_then(|v| v.as_str())
             .map(|s| s.to_owned())
             .ok_or_else(|| {
-                Error::InvalidArgument(format!(
-                    "signed touch_claim envelope missing string field `{k}`"
-                ))
+                Error::malformed_row(
+                    "touch_claim",
+                    super::malformed_row::ENVELOPE_MEMBER_MISSING,
+                    format!("signed touch_claim envelope missing string field `{k}`"),
+                )
             })
     };
     let diverges = |what: &str| {
-        Error::InvalidArgument(format!(
-            "signed touch_claim: typed {what} diverges from the signed envelope (rejected)"
-        ))
+        Error::malformed_row(
+            "touch_claim",
+            super::malformed_row::TYPED_DIVERGES_FROM_ENVELOPE,
+            format!(
+                "signed touch_claim: typed {what} diverges from the signed envelope (rejected)"
+            ),
+        )
     };
     if str_field("target_key_id")? != claim.target_key_id {
         return Err(diverges("target_key_id"));
@@ -6572,9 +6691,11 @@ pub async fn verify_signed_touch_claim(
     let env_fresh_as_of = chrono::DateTime::parse_from_rfc3339(&env_fresh_str)
         .map(|t| t.with_timezone(&chrono::Utc))
         .map_err(|e| {
-            Error::InvalidArgument(format!(
-                "signed touch_claim envelope `fresh_as_of` not RFC-3339: {e}"
-            ))
+            Error::malformed_row(
+                "touch_claim",
+                super::malformed_row::ENVELOPE_MEMBER_INVALID,
+                format!("signed touch_claim envelope `fresh_as_of` not RFC-3339: {e}"),
+            )
         })?;
     if env_fresh_as_of != claim.fresh_as_of {
         return Err(diverges("fresh_as_of"));
@@ -6613,8 +6734,13 @@ pub async fn verify_signed_touch_claim(
         }
         e
     };
-    let bytes = crate::verify::canonical::ceg_produce_canonicalize(&sig_env)
-        .map_err(|e| Error::InvalidArgument(format!("signed touch_claim canonicalize: {e}")))?;
+    let bytes = crate::verify::canonical::ceg_produce_canonicalize(&sig_env).map_err(|e| {
+        Error::malformed_row(
+            "touch_claim",
+            super::malformed_row::ENVELOPE_NOT_CANONICAL,
+            format!("signed touch_claim canonicalize: {e}"),
+        )
+    })?;
     let members = [ThresholdMember {
         member_id: signer_key.key_id.clone(),
         ed25519_public_key_base64: signer_key.pubkey_ed25519_base64.clone(),
@@ -6674,11 +6800,16 @@ pub async fn verify_signed_touch_claim(
                  co-signature set in the signed envelope"
             ))
         })?;
-        let cosigs: Vec<ThresholdSignature> = serde_json::from_value(cosigs_val.clone())
-            .map_err(|e| {
-                Error::InvalidArgument(format!(
-                    "signed touch_claim: `{TOUCH_COSIGNATURES_FIELD}` is not a threshold-signature array: {e}"
-                ))
+        let cosigs: Vec<ThresholdSignature> =
+            serde_json::from_value(cosigs_val.clone()).map_err(|e| {
+                Error::malformed_row(
+                    "touch_claim",
+                    super::malformed_row::ENVELOPE_MEMBER_INVALID,
+                    format!(
+                        "signed touch_claim: `{TOUCH_COSIGNATURES_FIELD}` is not a \
+                         threshold-signature array: {e}"
+                    ),
+                )
             })?;
         // Distinct + independent-of-target signer set, primary included.
         let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
@@ -15032,10 +15163,14 @@ pub fn moderation_subject_digest(
         .and_then(super::key_digest::Sha256Ed25519Raw::parse)
         .map(Some)
         .map_err(|e| {
-            Error::InvalidArgument(format!(
-                "moderation_subject_digest_malformed: `{MODERATION_SUBJECT_DIGEST_ENVELOPE_FIELD}` \
-                 {v}: {e} (CIRISPersist#784)"
-            ))
+            Error::malformed_row(
+                "attestation",
+                super::malformed_row::MODERATION_SUBJECT_DIGEST,
+                format!(
+                    "moderation_subject_digest_malformed: `{MODERATION_SUBJECT_DIGEST_ENVELOPE_FIELD}` \
+                     {v}: {e} (CIRISPersist#784)"
+            ),
+            )
         })
 }
 
@@ -16108,8 +16243,13 @@ pub fn check_delivery_mode_vocabulary(envelope: &serde_json::Value) -> Result<()
 /// model this door's stamp to do that, and a second spelling of a projection
 /// that drifts is precisely how #643 and #598 each acquired their defect.
 pub fn check_envelope_size_admission(envelope: &serde_json::Value) -> Result<(), Error> {
-    let canonical = crate::verify::canonical::ceg_produce_canonicalize(envelope)
-        .map_err(|e| Error::InvalidArgument(format!("envelope canonicalize: {e}")))?;
+    let canonical = crate::verify::canonical::ceg_produce_canonicalize(envelope).map_err(|e| {
+        Error::malformed_row(
+            "attestation",
+            super::malformed_row::ENVELOPE_NOT_CANONICAL,
+            format!("envelope canonicalize: {e}"),
+        )
+    })?;
     if canonical.len() > MAX_ATTESTATION_ENVELOPE_BYTES {
         return Err(Error::EnvelopeTooLarge {
             bytes: canonical.len(),

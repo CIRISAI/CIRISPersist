@@ -9712,6 +9712,34 @@ pub enum Error {
         plane: &'static str,
     },
 
+    /// v55.0.0 (CIRISPersist#1055, from CIRISEdge's adopt of v54.1) — **the
+    /// signed row is malformed.** Its bytes cannot be read as the claim they
+    /// carry: it names no signer, a member of its signed envelope is missing
+    /// or ill-typed, a typed column diverges from the envelope it mirrors, or
+    /// the envelope does not canonicalize. **Terminal at the first refusal**:
+    /// no row this node could receive later changes the verdict on these
+    /// bytes, so a sender stops re-offering them. Before v55.0.0 each was an
+    /// [`Error::InvalidArgument`] an adopter could not tell from a caller
+    /// argument error (Edge bounded them at 8 refusals, then terminal).
+    ///
+    /// `reason` is the stable token, one of [`malformed_row`]'s constants;
+    /// `plane` names the door. The Display is the pre-v55 text without the
+    /// `invalid argument:` prefix. Stable `kind()` token
+    /// `federation_malformed_row`; Python `ValueError("federation_malformed_row:
+    /// {plane}: {reason}")`, the type of the `InvalidArgument` arm it replaces.
+    #[error("{message}")]
+    MalformedRow {
+        /// The door that read the row: `identity_occurrence`,
+        /// `identity_occurrence_revocation`, `transport_destination`,
+        /// `touch_claim`, `attestation`, `key_registration`, `signed_envelope`,
+        /// `custody_ack`, …
+        plane: &'static str,
+        /// Why: a [`malformed_row`] token.
+        reason: &'static str,
+        /// The full refusal text (the Display).
+        message: String,
+    },
+
     /// v54.1.0 (CIRISPersist#1042 follow-up C, CIRISEdge#858) — a
     /// `licensure:{A}` row that claims a delegation (`delegation_id`) is not
     /// the authority's own issuance on a live `license` chain from `A` (CC
@@ -9720,11 +9748,15 @@ pub enum Error {
     /// to prefix-match; `reason` is now the stable token, one of
     /// [`admission::licensure_refusal`]'s constants (the
     /// [`admission::LicensureChainBreak`] tokens and
-    /// `not_authority_at_receipt`). The Display is the pre-v54.1 text,
-    /// unchanged. Stable `kind()` token
+    /// `not_authority_at_receipt`). Stable `kind()` token
     /// `federation_licensure_delegator_not_authority`; Python `ValueError`, the
     /// type of the `InvalidArgument` arm it replaces.
-    #[error("invalid argument: {message}")]
+    ///
+    /// v55.0.0 (CIRISPersist#1055) — the Display is `{message}` alone, which
+    /// begins `licensure_delegator_not_authority: {reason}: …`. The
+    /// `invalid argument:` prefix it kept from the arm it replaced made logs
+    /// read it as an `InvalidArgument`.
+    #[error("{message}")]
     LicensureDelegatorNotAuthority {
         /// The row's emitter.
         attesting_key_id: String,
@@ -11921,18 +11953,73 @@ pub enum Error {
     },
 }
 
+/// v55.0.0 (CIRISPersist#1055) — the closed set of [`Error::MalformedRow`]
+/// reasons. Every one is TERMINAL for the bytes it names.
+pub mod malformed_row {
+    /// The row names no signer (an empty or blank signer id): no Key row can
+    /// ever land for `""`.
+    pub const NO_SIGNER: &str = "no_signer";
+    /// A member the signed envelope must carry is absent.
+    pub const ENVELOPE_MEMBER_MISSING: &str = "envelope_member_missing";
+    /// A signed envelope member is present but ill-typed: not a string, not
+    /// RFC 3339, not a finite number, not base64 of the right length, not an
+    /// array of threshold signatures, an instant finer than a microsecond.
+    pub const ENVELOPE_MEMBER_INVALID: &str = "envelope_member_invalid";
+    /// A typed column diverges from the signed envelope member it mirrors.
+    pub const TYPED_DIVERGES_FROM_ENVELOPE: &str = "typed_diverges_from_envelope";
+    /// The signed envelope does not canonicalize (JCS), so there are no bytes
+    /// a signature could cover.
+    pub const ENVELOPE_NOT_CANONICAL: &str = "envelope_not_canonical";
+    /// A `custody_ack` report's dimension or envelope does not parse (CC
+    /// 3.1.3.3).
+    pub const CUSTODY_ACK: &str = "custody_ack_malformed";
+    /// A moderation row's signed subject digest does not parse
+    /// (CIRISPersist#784).
+    pub const MODERATION_SUBJECT_DIGEST: &str = "moderation_subject_digest_malformed";
+
+    /// Every token, for the from-disk witnesses and adopters' tables.
+    pub const ALL: &[&str] = &[
+        NO_SIGNER,
+        ENVELOPE_MEMBER_MISSING,
+        ENVELOPE_MEMBER_INVALID,
+        TYPED_DIVERGES_FROM_ENVELOPE,
+        ENVELOPE_NOT_CANONICAL,
+        CUSTODY_ACK,
+        MODERATION_SUBJECT_DIGEST,
+    ];
+}
+
 impl Error {
+    /// v55.0.0 (CIRISPersist#1055) — THE constructor of
+    /// [`Error::MalformedRow`].
+    pub(crate) fn malformed_row(
+        plane: &'static str,
+        reason: &'static str,
+        message: impl Into<String>,
+    ) -> Self {
+        Error::MalformedRow {
+            plane,
+            reason,
+            message: message.into(),
+        }
+    }
+
     /// v54.1.0 (CIRISPersist#1042 follow-up B, CIRISEdge#858) — the refusal
     /// for a signer this node holds no Key row for. THE one constructor of
     /// [`Error::AttesterKeyUnknown`]: a row that names NO signer (an empty or
-    /// blank id) is malformed, a terminal [`Error::InvalidArgument`], never the
-    /// retryable ordering gap — no Key row can ever land for `""`.
+    /// blank id) is malformed, a terminal [`Error::MalformedRow`]
+    /// ([`malformed_row::NO_SIGNER`], v55.0.0), never the retryable ordering
+    /// gap — no Key row can ever land for `""`.
     pub(crate) fn unknown_signer(attesting_key_id: &str, plane: &'static str) -> Self {
         if attesting_key_id.trim().is_empty() {
-            return Error::InvalidArgument(format!(
-                "{plane}: the row names no signer (empty attesting key id) — malformed, not an \
-                 ordering gap"
-            ));
+            return Error::malformed_row(
+                plane,
+                malformed_row::NO_SIGNER,
+                format!(
+                    "{plane}: the row names no signer (empty attesting key id) — malformed, not \
+                     an ordering gap"
+                ),
+            );
         }
         Error::AttesterKeyUnknown {
             attesting_key_id: attesting_key_id.to_owned(),
@@ -11948,6 +12035,7 @@ impl Error {
             Error::SignatureInvalid(_) => "federation_signature_invalid",
             Error::AttesterKeyUnknown { .. } => "federation_attester_key_unknown",
             Error::SignerDoesNotActFor { .. } => "federation_signer_not_acting_for",
+            Error::MalformedRow { .. } => "federation_malformed_row",
             Error::LicensureDelegatorNotAuthority { .. } => {
                 "federation_licensure_delegator_not_authority"
             }

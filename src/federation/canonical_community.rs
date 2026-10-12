@@ -1229,6 +1229,7 @@ fn is_row_verdict(e: &Error) -> bool {
     matches!(
         e,
         Error::InvalidArgument(_)
+            | Error::MalformedRow { .. }
             | Error::RosterAuthorityUnauthorized { .. }
             | Error::RoleNotAccordConferred { .. }
             | Error::FederationTierUnverified { .. }
@@ -3781,47 +3782,62 @@ where
 ///
 /// # Errors
 ///
-/// `Ok(Err(reason))` names why the signers do not authorise (the caller maps
-/// it to its own typed refusal); `Err` is a directory read failure.
+/// `Ok(Err((reason, detail)))` names why the signers do not authorise:
+/// `reason` is a [`unauthorised_reason`](super::steward_purge::unauthorised_reason)
+/// token (v55.0.0, CIRISPersist#1055) that separates an ordering gap (the
+/// root or a cosigner's key is not held yet) from a verdict, and `detail` is
+/// the prose. `Err` is a directory read failure.
 pub async fn trust_root_cosigners_over<F>(
     directory: &F,
     community_key_id: &str,
     envelope: &serde_json::Value,
     signatures: &[ciris_verify_core::threshold::ThresholdSignature],
     now: chrono::DateTime<chrono::Utc>,
-) -> Result<Result<std::collections::BTreeSet<String>, String>, Error>
+) -> Result<Result<std::collections::BTreeSet<String>, (&'static str, String)>, Error>
 where
     F: FederationDirectory + ?Sized,
 {
+    use super::steward_purge::unauthorised_reason as why;
     use ciris_verify_core::threshold::ThresholdMember;
     let head = match stored_standing_at(directory, community_key_id, now).await? {
         StoredStanding::Rooted(head) => head,
         StoredStanding::Stalled { reason, .. } => {
-            return Ok(Err(format!(
-                "the trust root {community_key_id:?} is stalled ({reason}): valid but \
+            return Ok(Err((
+                why::STALLED,
+                format!(
+                    "the trust root {community_key_id:?} is stalled ({reason}): valid but \
                  non-admitting (CC 3.2 T7), so it authorises nothing new"
+                ),
             )))
         }
         StoredStanding::NotRooted { reason } => {
-            return Ok(Err(format!(
-                "the row at {community_key_id:?} is not rooted ({reason})"
+            return Ok(Err((
+                why::ROOT_NOT_ROOTED,
+                format!("the row at {community_key_id:?} is not rooted ({reason})"),
             )))
         }
         StoredStanding::Absent => {
-            return Ok(Err(format!(
+            return Ok(Err((
+                why::ROOT_NOT_HELD,
+                format!(
                 "no community row at {community_key_id:?}: the claimant is not a trust root this \
                  node holds"
+            ),
             )))
         }
     };
     if signatures.is_empty() {
-        return Ok(Err("the notice carries no cosignature".to_owned()));
+        return Ok(Err((
+            why::NO_COSIGNATURE,
+            "the notice carries no cosignature".to_owned(),
+        )));
     }
     let bytes = match ciris_verify_core::accord_genesis::accord_family_signing_bytes(envelope) {
         Ok(b) => b,
         Err(e) => {
-            return Ok(Err(format!(
-                "the notice envelope does not canonicalize: {e}"
+            return Ok(Err((
+                why::NOTICE_MALFORMED,
+                format!("the notice envelope does not canonicalize: {e}"),
             )))
         }
     };
@@ -3834,18 +3850,27 @@ where
             .iter()
             .any(|m| m.key_id == sig.member_id)
         {
-            return Ok(Err(format!(
-                "cosigner {:?} holds no seat on the trust root {community_key_id:?}",
-                sig.member_id
+            return Ok(Err((
+                why::NOT_A_SEAT,
+                format!(
+                    "cosigner {:?} holds no seat on the trust root {community_key_id:?}",
+                    sig.member_id
+                ),
             )));
         }
         if !signers.insert(sig.member_id.clone()) {
-            return Ok(Err(format!("cosigner {:?} signed twice", sig.member_id)));
+            return Ok(Err((
+                why::DUPLICATE_COSIGNER,
+                format!("cosigner {:?} signed twice", sig.member_id),
+            )));
         }
         let Some(rec) = memo.record(directory, &sig.member_id).await? else {
-            return Ok(Err(format!(
-                "cosigner {:?} has no key record on this node",
-                sig.member_id
+            return Ok(Err((
+                why::COSIGNER_KEY_NOT_HELD,
+                format!(
+                    "cosigner {:?} has no key record on this node",
+                    sig.member_id
+                ),
             )));
         };
         let member = ThresholdMember {
@@ -3862,9 +3887,12 @@ where
         )
         .is_err()
         {
-            return Ok(Err(format!(
-                "cosigner {:?}'s signature does not verify over the notice",
-                sig.member_id
+            return Ok(Err((
+                why::SIGNATURE_INVALID,
+                format!(
+                    "cosigner {:?}'s signature does not verify over the notice",
+                    sig.member_id
+                ),
             )));
         }
     }
@@ -3886,13 +3914,19 @@ where
     });
     match verdict {
         super::consensus::Verdict::Admit => Ok(Ok(signers)),
-        super::consensus::Verdict::Insufficient { detail } => Ok(Err(format!(
-            "the trust root's consensus_protocol {:?} is not met: {detail}",
-            head.community.consensus_protocol
+        super::consensus::Verdict::Insufficient { detail } => Ok(Err((
+            why::QUORUM_NOT_MET,
+            format!(
+                "the trust root's consensus_protocol {:?} is not met: {detail}",
+                head.community.consensus_protocol
+            ),
         ))),
-        super::consensus::Verdict::Unevaluable { reason } => Ok(Err(format!(
-            "the trust root's consensus_protocol {:?} cannot be evaluated: {reason}",
-            head.community.consensus_protocol
+        super::consensus::Verdict::Unevaluable { reason } => Ok(Err((
+            why::PROTOCOL_UNEVALUABLE,
+            format!(
+                "the trust root's consensus_protocol {:?} cannot be evaluated: {reason}",
+                head.community.consensus_protocol
+            ),
         ))),
     }
 }
