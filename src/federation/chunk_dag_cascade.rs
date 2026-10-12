@@ -139,16 +139,14 @@ pub struct RegisteredStreamEpoch {
     pub epoch: u64,
     /// The tier the stream's chunks are recorded at.
     pub tier: CryptoTier,
-    /// The stream is kept: the DEK was wrapped to the audience.
-    pub keep: bool,
-    /// Occurrences granted a wrap of the DEK (empty for an unkept stream).
+    /// Occurrences granted a wrap of the DEK.
     pub granted: Vec<String>,
     /// Occurrences fail-secure excluded (no valid `encryption_pubkeys`).
     pub excluded: Vec<String>,
     /// The same fan-out by roster MEMBER.
     pub roster: RosterPartition,
-    /// The stream-axis rows the caller emits (`None` for an unkept stream:
-    /// no `key_grant:stream:v1` row exists for it, CC 5.3.3.2.5).
+    /// The stream-axis rows the caller emits (`None` when no new wrap was
+    /// written).
     pub key_grant_emission: Option<crate::federation::key_grant::KeyGrantAxis>,
 }
 
@@ -196,6 +194,11 @@ impl SealStreamScopedResult {
         self.tier != CryptoTier::Plaintext && self.roster.readable_by_nobody()
     }
 }
+
+/// v55.0.0 — an epoch terminator's storage seq, for adopters that seal or
+/// open a terminator themselves (`stream_seal::seal_stream_chunk` /
+/// `open_stream_chunk`).
+pub use orchestrate::{terminator_seq, TERMINATOR_SEQ_BASE};
 
 /// The doors and the reads. Free functions over any backend that is both a
 /// `FederationDirectory` and a `BlobStorage`, so the Engine and PyO3 share
@@ -602,7 +605,6 @@ pub mod orchestrate {
                 closed: false,
                 terminated: false,
                 supplied: false,
-                keep: true,
                 room_epoch,
             })
             .await
@@ -856,12 +858,7 @@ pub mod orchestrate {
                 }
             }
             let dek = stream_epoch_dek(backend, &rec).await?;
-            // v55.0.0 (#981) — an unkept epoch is wrapped to nobody.
-            let granted_new = if rec.keep {
-                grant_stream_epoch(backend, &rec, &dek, &targets, &held).await?
-            } else {
-                0
-            };
+            let granted_new = grant_stream_epoch(backend, &rec, &dek, &targets, &held).await?;
             let counter = u32::try_from(rec.chunk_count).map_err(|_| {
                 BlobError::Backend(format!(
                     "stream {} epoch {} counts {} chunks, past the STREAM counter",
@@ -954,11 +951,19 @@ pub mod orchestrate {
     /// act, as at every roll) and records the epoch's DEK — self-retained under
     /// this node's content master, never derivable from persist state alone,
     /// marked `supplied` so persist never mints or rolls the stream's epochs
-    /// (a removal or the nonce cap is `stream_epoch_rotation_required`). When
-    /// `keep` (the stream is recorded, or `history_on_join: full`) the DEK is
-    /// wrapped to the stream's audience and the stream-axis rows are reported
-    /// for emission; an unkept stream is wrapped to NOBODY and has no
-    /// `key_grant:stream:v1` row, so MLS forward secrecy survives.
+    /// (a removal or the nonce cap is `stream_epoch_rotation_required`). The
+    /// DEK is wrapped to the stream's audience and the stream-axis rows are
+    /// reported for emission.
+    ///
+    /// **A supplied epoch is always kept** (CC rc7 part 5, "One DEK per
+    /// (stream_id, epoch), two distributors": "An unrecorded live call wraps
+    /// nothing"). Storing a DEK at all is a durable wrap, so an unrecorded
+    /// live call never comes to this door: the adopter seals its frames in
+    /// memory with [`seal_stream_chunk`](crate::federation::stream_seal::seal_stream_chunk)
+    /// under the MLS exporter secret and, if it holds the resulting ciphertext,
+    /// adopts it through `adopt_sealed_chunks` with a
+    /// [`for_stream_keyed_chunk`](crate::federation::BlobProvenance::for_stream_keyed_chunk)
+    /// provenance; persist stores the ciphertext and no key.
     ///
     /// Chunks then go through `put_blob_chunk_scoped` at `epoch`, sealed with
     /// the STREAM nonce under the supplied DEK, and read through the same
@@ -972,7 +977,6 @@ pub mod orchestrate {
         stream_id: &str,
         epoch: u64,
         dek: &[u8; 32],
-        keep: bool,
         aad: Option<&[u8]>,
     ) -> Result<RegisteredStreamEpoch, BlobError>
     where
@@ -1065,7 +1069,6 @@ pub mod orchestrate {
                 closed: false,
                 terminated: false,
                 supplied: true,
-                keep,
                 room_epoch: room_epoch_of(backend, w).await?,
             })
             .await?;
@@ -1078,23 +1081,15 @@ pub mod orchestrate {
             });
         }
         let (targets, report) = stream_targets(backend, cohort_scope, group_key_id).await?;
-        let granted_new = if keep {
-            grant_stream_epoch(backend, &rec, dek, &targets, &Default::default()).await?
-        } else {
-            0
-        };
+        let granted_new =
+            grant_stream_epoch(backend, &rec, dek, &targets, &Default::default()).await?;
         Ok(RegisteredStreamEpoch {
             stream_id: stream_id.to_owned(),
             epoch,
             tier,
-            keep,
-            granted: if keep { report.granted } else { Vec::new() },
-            excluded: if keep { report.excluded } else { Vec::new() },
-            roster: if keep {
-                report.roster
-            } else {
-                RosterPartition::default()
-            },
+            granted: report.granted,
+            excluded: report.excluded,
+            roster: report.roster,
             key_grant_emission: (granted_new > 0).then(|| {
                 crate::federation::key_grant::KeyGrantAxis::Stream {
                     stream_id: stream_id.to_owned(),
@@ -1157,10 +1152,20 @@ pub mod orchestrate {
     /// so in seq order each epoch's terminator is its final chunk, and a
     /// manifest's positions stay strictly increasing. `2^62` keeps every
     /// position inside the index's signed 64-bit column.
-    pub(crate) const TERMINATOR_SEQ_BASE: u64 = 1 << 62;
+    ///
+    /// v55.0.0 (public for adopters) — use [`terminator_seq`] for an epoch's
+    /// terminator position; do not hand-copy 2^62.
+    pub const TERMINATOR_SEQ_BASE: u64 = 1 << 62;
 
-    /// The position of epoch `epoch`'s terminator.
-    pub(crate) fn terminator_seq(epoch: u64) -> Result<u64, BlobError> {
+    /// The storage seq of epoch `epoch`'s terminator: the `storage_seq`
+    /// argument to [`seal_stream_chunk`](crate::federation::stream_seal::seal_stream_chunk)
+    /// / [`open_stream_chunk`](crate::federation::stream_seal::open_stream_chunk)
+    /// for a terminator. Do not hand-copy 2^62.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidArgument` for an epoch past the terminator range.
+    pub fn terminator_seq(epoch: u64) -> Result<u64, BlobError> {
         TERMINATOR_SEQ_BASE
             .checked_add(epoch)
             .filter(|s| i64::try_from(*s).is_ok())
@@ -1733,9 +1738,6 @@ pub mod orchestrate {
     {
         let mut out = Vec::new();
         for rec in stream_epochs {
-            if !rec.keep {
-                continue;
-            }
             let held: std::collections::HashSet<String> = backend
                 .stream_dek_grants(&rec.stream_id, rec.epoch, &rec.owner_key_id)
                 .await?

@@ -1715,11 +1715,6 @@ pub mod orchestrate {
         // wrap under the stream's owner.
         let mut changed_streams: Vec<(String, u64, String)> = Vec::new();
         for rec in &streams {
-            // v55.0.0 (#981) — an unkept, caller-supplied epoch is wrapped to
-            // nobody, newcomers included (CC 5.3.3.2.5).
-            if !rec.keep {
-                continue;
-            }
             let already: std::collections::HashSet<String> = backend
                 .stream_dek_grants(&rec.stream_id, rec.epoch, &rec.owner_key_id)
                 .await?

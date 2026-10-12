@@ -15758,7 +15758,7 @@ fn scope_blob_symbol_from_sqlite_row(
 /// every stream-DEK read shares, joined to the epoch's V165 count.
 const SQLITE_STREAM_DEK_SELECT: &str = "SELECT d.stream_id, d.epoch, d.owner_key_id, \
     d.cohort_scope, d.group_key_id, d.self_retention_wrap, COALESCE(c.chunk_count, 0), \
-    d.closed_at IS NOT NULL, d.terminated_at IS NOT NULL, d.supplied, d.keep, d.room_epoch \
+    d.closed_at IS NOT NULL, d.terminated_at IS NOT NULL, d.supplied, d.room_epoch \
     FROM federation_stream_deks d \
     LEFT JOIN federation_stream_epoch_counts c ON c.stream_id = d.stream_id AND c.epoch = d.epoch";
 
@@ -15776,9 +15776,8 @@ fn sqlite_stream_dek_row(
         closed: r.get(7)?,
         terminated: r.get(8)?,
         supplied: r.get(9)?,
-        keep: r.get(10)?,
         room_epoch: r
-            .get::<_, Option<i64>>(11)?
+            .get::<_, Option<i64>>(10)?
             .map(|e| u64::try_from(e).unwrap_or_default()),
     })
 }
@@ -17125,8 +17124,8 @@ impl crate::federation::BlobStorage for SqliteBackend {
                 tx.execute(
                     "INSERT INTO federation_stream_deks \
                         (stream_id, epoch, owner_key_id, cohort_scope, group_key_id, \
-                         self_retention_wrap, supplied, keep, room_epoch) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
+                         self_retention_wrap, supplied, room_epoch) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
                      ON CONFLICT (stream_id, epoch) DO NOTHING",
                     rusqlite::params![
                         r.stream_id,
@@ -17136,7 +17135,6 @@ impl crate::federation::BlobStorage for SqliteBackend {
                         r.group_key_id,
                         r.self_retention_wrap,
                         r.supplied,
-                        r.keep,
                         r.room_epoch.map(|e| i64::try_from(e).unwrap_or(i64::MAX))
                     ],
                 )?;

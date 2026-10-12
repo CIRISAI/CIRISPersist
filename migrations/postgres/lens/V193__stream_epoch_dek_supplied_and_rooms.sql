@@ -1,4 +1,4 @@
--- V193 — a stream epoch's DEK may be caller-supplied and kept or not, and a
+-- V193 — a stream epoch's DEK may be caller-supplied (always kept), and a
 -- room's stream is stream-keyed too. PostgreSQL dialect.
 -- v55.0.0 (CIRISPersist#981, #977; CC 5.3.3.1, CC 5.1, CC 5.3.3.2.5).
 --
@@ -25,7 +25,6 @@ ALTER TABLE cirislens.federation_stream_deks
     ADD CONSTRAINT federation_stream_deks_cohort_scope_v193
         CHECK (cohort_scope IN ('self', 'family', 'community', 'affiliations')),
     ADD COLUMN supplied BOOLEAN NOT NULL DEFAULT FALSE,
-    ADD COLUMN keep BOOLEAN NOT NULL DEFAULT TRUE,
     ADD COLUMN room_epoch BIGINT CHECK (room_epoch IS NULL OR room_epoch >= 0),
     ADD COLUMN evicted_at TIMESTAMPTZ;
 

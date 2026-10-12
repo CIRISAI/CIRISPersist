@@ -12,14 +12,19 @@
 //! - **I751** (sqlite, postgres; #977) — a removal rolls a room stream's
 //!   epoch: the next chunk is at a fresh epoch the removed member holds no
 //!   wrap of, and the member keeps the epoch it held (AV-70).
-//! - **I752** (sqlite, postgres; #981) — a KEPT stream sealed under a supplied
+//! - **I752** (sqlite, postgres; #981) — a stream sealed under a supplied
 //!   DEK: one `key_grant:stream:v1` row per audience recipient; the far node
 //!   reads it whole through the plane, byte-identical; the same DEK, given to
 //!   an MLS-only reader, opens a stored chunk with the public
 //!   `stream_seal::open_stream_chunk`.
-//! - **I753** (sqlite, postgres; #981) — an UNKEPT stream: zero
-//!   `key_grant:stream:v1` rows, the sealer still reads it, a member's node is
-//!   told which key it lacks.
+//! - **I753** (sqlite, postgres; #981, CC rc7 part 5) — an unrecorded live
+//!   call never reaches persist's DEK door (a supplied epoch is always kept):
+//!   its frames are sealed in memory with `seal_stream_chunk` under the MLS
+//!   exporter secret, and their ciphertext, adopted through
+//!   `adopt_sealed_chunks` with a `for_stream_keyed_chunk` provenance for a
+//!   `(stream, epoch)` this node never registered and holds no wrap for, is
+//!   admitted as ciphertext only: no stream DEK row, no wrap, no
+//!   `key_grant:stream:v1` row, no community binding.
 //! - **I754** (sqlite, postgres; #981) — a second supply for an epoch is
 //!   `stream_epoch_dek_exists` and the stored key stays; a supply by a writer
 //!   that is not the stream's is `stream_not_authored`, naming the stream and
@@ -358,14 +363,14 @@ pub(crate) mod bodies {
         let dek = mls_exporter();
         let reg = l
             .engine_a
-            .register_stream_epoch_dek(COMMUNITY, &l.comm, &stream, 0, &dek, true, None)
+            .register_stream_epoch_dek(COMMUNITY, &l.comm, &stream, 0, &dek, None)
             .await
             .expect("I752: A supplies epoch 0's DEK");
-        assert!(reg.keep && reg.granted.contains(&l.node_b), "I752: {reg:?}");
+        assert!(reg.granted.contains(&l.node_b), "I752: {reg:?}");
         let plain = write_room(&l, &stream, 4, 0).await;
         let epochs = l.ba.stream_dek_list(&stream).await.unwrap();
         assert_eq!(epochs.len(), 1, "I752: persist minted no epoch of its own");
-        assert!(epochs[0].supplied && epochs[0].keep);
+        assert!(epochs[0].supplied);
         // One row per audience recipient (A's own node and B's).
         let rows = stream_rows(l.ba.as_ref(), &l.node_a).await;
         let mut recipients: Vec<String> = rows.iter().map(|r| r.attested_key_id.clone()).collect();
@@ -404,7 +409,7 @@ pub(crate) mod bodies {
     }
 
     /// **I753** — see the module doc.
-    pub(crate) async fn i753_an_unkept_stream_wraps_to_nobody<B>(
+    pub(crate) async fn i753_an_unrecorded_calls_ciphertext_is_adopted_keyless<B>(
         dsn_a: &str,
         dsn_b: &str,
         run: &str,
@@ -412,48 +417,87 @@ pub(crate) mod bodies {
     ) where
         B: BlobStorage + FederationDirectory + Sync + 'static,
     {
+        use crate::federation::stream_seal::seal_stream_chunk;
         let l = ladder(dsn_a, dsn_b, run, pick).await;
         let stream = format!("i753-{run}");
-        let reg = l
-            .engine_a
-            .register_stream_epoch_dek(COMMUNITY, &l.comm, &stream, 0, &mls_exporter(), false, None)
+        let epoch = 3;
+        // The live call's frames, sealed in memory under the MLS exporter
+        // secret: no persist door ever saw the DEK.
+        let dek = mls_exporter();
+        let segs: Vec<Vec<u8>> = (0..3).map(segment).collect();
+        let envelopes: Vec<Vec<u8>> = segs
+            .iter()
+            .enumerate()
+            .map(|(i, seg)| {
+                seal_stream_chunk(&dek, &stream, epoch, i as u32, false, None, i as u64, seg)
+                    .expect("seal in memory")
+                    .to_bytes()
+            })
+            .collect();
+        let items: Vec<crate::federation::adopt_cascade::AdoptChunkItem<'_>> = envelopes
+            .iter()
+            .zip(&segs)
+            .enumerate()
+            .map(
+                |(i, (e, seg))| crate::federation::adopt_cascade::AdoptChunkItem {
+                    seq: i as u64,
+                    envelope: e,
+                    plaintext_size: seg.len() as u64,
+                },
+            )
+            .collect();
+        let room = BlobProvenance {
+            author_key_id: l.node_a.clone(),
+            cohort_scope: COMMUNITY.to_owned(),
+            community_key_id: Some(l.comm.clone()),
+            epoch: Some(1),
+            tier: CryptoTier::CommunityDek,
+            minter_key_id: None,
+        };
+        let prov = room
+            .for_stream_keyed_chunk()
+            .expect("I753: a room provenance");
+        let got = l
+            .engine_b
+            .adopt_sealed_chunks(&stream, &items, epoch, prov)
             .await
-            .unwrap();
-        assert!(!reg.keep && reg.granted.is_empty() && reg.key_grant_emission.is_none());
-        let plain = write_room(&l, &stream, 3, 0).await;
-        let sealed = l
-            .engine_a
-            .seal_stream_scoped(COMMUNITY, Some(&l.comm), &stream, None, None)
-            .await
-            .unwrap();
-        l.engine_a.emit_pending_key_grants().await.unwrap();
+            .expect("I753: B admits the ciphertext of a (stream, epoch) it holds no key for");
+        assert_eq!(got.len(), envelopes.len(), "I753: one answer per chunk");
+        for (i, (r, env)) in got.iter().zip(&envelopes).enumerate() {
+            let sha = r
+                .as_ref()
+                .unwrap_or_else(|e| panic!("I753: chunk {i} admitted: {e}"));
+            assert_eq!(
+                inline(l.bb.as_ref(), sha).await,
+                *env,
+                "I753: chunk {i} is the ciphertext, verbatim"
+            );
+            assert!(
+                l.bb.community_dek_blob_epoch(sha).await.unwrap().is_none(),
+                "I753: chunk {i} is bound to no community epoch"
+            );
+        }
         assert!(
-            stream_rows(l.ba.as_ref(), &l.node_a).await.is_empty(),
-            "I753: an unkept stream has NO key_grant:stream:v1 row (CC 5.3.3.2.5)"
+            l.bb.stream_dek_list(&stream).await.unwrap().is_empty(),
+            "I753: no stream DEK row: B stored no key"
         );
         assert!(
-            l.ba.stream_dek_grants(&stream, 0, &l.node_a)
+            l.bb.stream_dek_grants_for_recipient(&stream, epoch, &l.node_b)
                 .await
                 .unwrap()
-                .is_empty(),
-            "I753: and no wrap"
+                .is_empty()
+                && l.bb
+                    .stream_dek_grants(&stream, epoch, &l.node_a)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+            "I753: no wrap of the DEK"
         );
-        assert_eq!(
-            l.engine_a
-                .read_blob_as(&sealed.manifest_sha256, &l.node_a, None)
-                .await
-                .expect("I753: the sealer reads through its self-retention"),
-            plain
+        assert!(
+            stream_rows(l.bb.as_ref(), &l.node_b).await.is_empty()
+                && stream_rows(l.bb.as_ref(), &l.node_a).await.is_empty(),
+            "I753: no key_grant:stream:v1 row"
         );
-        deliver_dag(&l, &stream, &sealed.manifest_sha256, sealed.epoch.unwrap()).await;
-        match l
-            .engine_b
-            .read_blob_as(&sealed.manifest_sha256, &l.node_b, None)
-            .await
-        {
-            Err(BlobError::ChunkKeyNotYetGranted { .. }) => {}
-            other => panic!("I753: the member's node lacks the stream key: {other:?}"),
-        }
     }
 
     /// **I754** — see the module doc.
@@ -469,13 +513,13 @@ pub(crate) mod bodies {
         let stream = format!("i754-{run}");
         let first = mls_exporter();
         l.engine_a
-            .register_stream_epoch_dek(COMMUNITY, &l.comm, &stream, 0, &first, true, None)
+            .register_stream_epoch_dek(COMMUNITY, &l.comm, &stream, 0, &first, None)
             .await
             .unwrap();
         write_room(&l, &stream, 1, 0).await;
         let e = l
             .engine_a
-            .register_stream_epoch_dek(COMMUNITY, &l.comm, &stream, 0, &mls_exporter(), true, None)
+            .register_stream_epoch_dek(COMMUNITY, &l.comm, &stream, 0, &mls_exporter(), None)
             .await
             .expect_err("I754: a second supply for epoch 0");
         assert!(
@@ -530,7 +574,7 @@ pub(crate) mod bodies {
             .unwrap();
         let e = l
             .engine_b
-            .register_stream_epoch_dek(COMMUNITY, &l.comm, &stream, 1, &mls_exporter(), true, None)
+            .register_stream_epoch_dek(COMMUNITY, &l.comm, &stream, 1, &mls_exporter(), None)
             .await
             .expect_err("I754: a supply by a writer that is not the stream's");
         assert!(
@@ -560,7 +604,7 @@ pub(crate) mod bodies {
         let bob = format!("em-bob-{run}");
         let stream = format!("i755-{run}");
         l.engine_a
-            .register_stream_epoch_dek(COMMUNITY, &l.comm, &stream, 0, &mls_exporter(), true, None)
+            .register_stream_epoch_dek(COMMUNITY, &l.comm, &stream, 0, &mls_exporter(), None)
             .await
             .unwrap();
         write_room(&l, &stream, 2, 0).await;
@@ -606,7 +650,7 @@ pub(crate) mod bodies {
         );
         // The caller commits the MLS removal and supplies epoch 1.
         l.engine_a
-            .register_stream_epoch_dek(COMMUNITY, &l.comm, &stream, 1, &mls_exporter(), true, None)
+            .register_stream_epoch_dek(COMMUNITY, &l.comm, &stream, 1, &mls_exporter(), None)
             .await
             .unwrap();
         l.engine_a
@@ -1226,7 +1270,6 @@ pub(crate) mod bodies {
             closed: false,
             terminated: false,
             supplied: false,
-            keep: true,
             room_epoch: Some(3),
         })
         .await
@@ -1315,7 +1358,8 @@ pub(crate) mod bodies {
                 #[tokio::test]
                 async fn i753() {
                     let Some((a, b)) = $dsn else { return };
-                    i753_an_unkept_stream_wraps_to_nobody(&a, &b, &run(), $pick).await
+                    i753_an_unrecorded_calls_ciphertext_is_adopted_keyless(&a, &b, &run(), $pick)
+                        .await
                 }
                 #[tokio::test]
                 async fn i754() {
@@ -1366,7 +1410,6 @@ pub(crate) mod bodies {
             closed: false,
             terminated: false,
             supplied,
-            keep: true,
             room_epoch: Some(4),
         };
         let cap = 10;

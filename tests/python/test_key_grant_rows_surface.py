@@ -91,15 +91,15 @@ def test_key_grant_rows_round_trip_between_two_nodes_989(tmp_path) -> None:
         stream = "py-989-stream"
         dek = bytes(range(32))
         reg = json.loads(
-            a.register_stream_epoch_dek("self", ka, stream, 0, base64.b64encode(dek).decode(), True)
+            a.register_stream_epoch_dek("self", ka, stream, 0, base64.b64encode(dek).decode())
         )
         assert reg["stream_id"] == stream and reg["epoch"] == 0, reg
-        assert reg["keep"] is True and reg["tier"] == "invisible_encrypted", reg
+        assert "keep" not in reg and reg["tier"] == "invisible_encrypted", reg
         assert reg["granted"] == [ka], reg
         # One DEK per (stream, epoch): a second supply is refused, terminally.
         with pytest.raises(ValueError, match="blob_stream_epoch_dek_exists") as exc:
             a.register_stream_epoch_dek(
-                "self", ka, stream, 0, base64.b64encode(bytes(32)).decode(), True
+                "self", ka, stream, 0, base64.b64encode(bytes(32)).decode()
             )
         body = json.loads(str(exc.value).split(": ", 1)[1])
         assert body["retryable"] is False, body

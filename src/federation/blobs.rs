@@ -1388,12 +1388,6 @@ pub struct StreamDekRecord {
     /// stream's epochs; a removal or the nonce cap is refused, retryably, until
     /// the caller supplies the next one.
     pub supplied: bool,
-    /// v55.0.0 (#981, V193) — the stream is KEPT (recorded, or
-    /// `history_on_join: full`): the epoch's DEK is wrapped to the audience
-    /// as `key_grant:stream:v1` rows. An unkept epoch is wrapped to nobody
-    /// (CC 5.3.3.2.5: MLS forward secrecy survives). Every persist-minted
-    /// epoch is kept.
-    pub keep: bool,
     /// v55.0.0 (#977, V193) — a ROOM stream epoch's place in the room's
     /// retention: the writer's community epoch when this stream epoch was
     /// minted. The community retention sweep evicts the epoch's chunks under

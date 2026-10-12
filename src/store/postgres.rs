@@ -1327,7 +1327,7 @@ const PG_STREAM_DEK_SELECT: &str = "SELECT d.stream_id, d.epoch, d.owner_key_id,
     d.cohort_scope, d.group_key_id, d.self_retention_wrap, \
     COALESCE(c.chunk_count, 0)::BIGINT AS chunk_count, \
     (d.closed_at IS NOT NULL) AS closed, (d.terminated_at IS NOT NULL) AS terminated, \
-    d.supplied, d.keep, d.room_epoch \
+    d.supplied, d.room_epoch \
     FROM cirislens.federation_stream_deks d \
     LEFT JOIN cirislens.federation_stream_epoch_counts c \
       ON c.stream_id = d.stream_id AND c.epoch = d.epoch";
@@ -1349,7 +1349,6 @@ fn pg_stream_dek_row(
         closed: r.safe_get_with("closed", B)?,
         terminated: r.safe_get_with("terminated", B)?,
         supplied: r.safe_get_with("supplied", B)?,
-        keep: r.safe_get_with("keep", B)?,
         room_epoch: r
             .safe_get_with::<Option<i64>, _, _, _>("room_epoch", B)?
             .map(|e| u64::try_from(e).unwrap_or_default()),
@@ -19029,8 +19028,8 @@ impl crate::federation::BlobStorage for PostgresBackend {
             .execute(
                 "INSERT INTO cirislens.federation_stream_deks \
                     (stream_id, epoch, owner_key_id, cohort_scope, group_key_id, \
-                     self_retention_wrap, supplied, keep, room_epoch) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+                     self_retention_wrap, supplied, room_epoch) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
                  ON CONFLICT (stream_id, epoch) DO NOTHING",
                 &[
                     &record.stream_id,
@@ -19040,7 +19039,6 @@ impl crate::federation::BlobStorage for PostgresBackend {
                     &record.group_key_id,
                     &record.self_retention_wrap,
                     &record.supplied,
-                    &record.keep,
                     &record
                         .room_epoch
                         .map(|e| i64::try_from(e).unwrap_or(i64::MAX)),

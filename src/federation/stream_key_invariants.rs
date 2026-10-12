@@ -2120,7 +2120,6 @@ mod unit {
             closed,
             terminated: false,
             supplied: false,
-            keep: true,
             room_epoch: None,
         };
         assert_eq!(stream_target_epoch(None, 4), 4);

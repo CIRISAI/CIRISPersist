@@ -1216,7 +1216,7 @@ class Engine:
         a different key for an existing key id raises).
         """
 
-    def register_stream_epoch_dek(self, cohort_scope: str, group_key_id: str, stream_id: str, epoch: int, dek_b64: str, keep: bool, aad_b64: str | None = None) -> str:
+    def register_stream_epoch_dek(self, cohort_scope: str, group_key_id: str, stream_id: str, epoch: int, dek_b64: str, aad_b64: str | None = None) -> str:
         """(derived) deontic — v55.0.0 (CIRISPersist#981, CC 5.3.3.2.5) — supply the DEK of a stream's next epoch (the MLS exporter secret of a live call), so the live and the st..."""
 
     def rekey_community_member_device_add_json(self, community_key_id: str, member_key_id: str, new_occurrence_key_id: str, authority_key_id: str) -> str:

@@ -15852,20 +15852,22 @@ impl PyEngine {
     /// live and the stored stream are one key. FFI mirror of
     /// [`Engine::register_stream_epoch_dek`](crate::engine::Engine::register_stream_epoch_dek).
     /// `dek_b64` is the 32-byte DEK; `group_key_id` the owner (self), family
-    /// or community key; `keep` whether the stream is kept (recorded, or
-    /// `history_on_join: full`): only a kept stream's DEK is wrapped to the
-    /// audience as `key_grant:stream:v1` rows. The writer is the same signer
+    /// or community key. The DEK is wrapped to the audience as
+    /// `key_grant:stream:v1` rows: a supplied epoch is always kept, and an
+    /// unrecorded live call never comes to this door (CC rc7 part 5 — its
+    /// frames are sealed in memory under the MLS exporter secret and only the
+    /// ciphertext may be adopted). The writer is the same signer
     /// `put_blob_chunk_scoped` writes under. Then chunks go through
     /// `put_blob_chunk_scoped` at `epoch`.
     ///
-    /// Returns JSON: `stream_id`, `epoch`, `tier`, `keep`, `granted`,
+    /// Returns JSON: `stream_id`, `epoch`, `tier`, `granted`,
     /// `excluded`, `roster`. Refusals (ValueError, token then JSON):
     /// `blob_stream_not_authored`, `blob_stream_epoch_dek_exists`,
     /// `blob_invalid_argument`. A later chunk may be refused
     /// `blob_stream_epoch_rotation_required` (`reason` `removal` naming
     /// `removed_key_id`, or `cap`) or `blob_stream_epoch_dek_missing`, both
     /// retryable after the next epoch's DEK is supplied.
-    #[pyo3(signature = (cohort_scope, group_key_id, stream_id, epoch, dek_b64, keep, aad_b64=None))]
+    #[pyo3(signature = (cohort_scope, group_key_id, stream_id, epoch, dek_b64, aad_b64=None))]
     #[allow(clippy::too_many_arguments)]
     fn register_stream_epoch_dek(
         &self,
@@ -15875,7 +15877,6 @@ impl PyEngine {
         stream_id: &str,
         epoch: u64,
         dek_b64: &str,
-        keep: bool,
         aad_b64: Option<&str>,
     ) -> PyResult<String> {
         self.ensure_usable()?;
@@ -15921,7 +15922,6 @@ impl PyEngine {
                                 &stream,
                                 epoch,
                                 &dek,
-                                keep,
                                 aad.as_deref(),
                             )
                             .await
@@ -15939,7 +15939,6 @@ impl PyEngine {
                                 &stream,
                                 epoch,
                                 &dek,
-                                keep,
                                 aad.as_deref(),
                             )
                             .await
@@ -15947,7 +15946,7 @@ impl PyEngine {
                     }
                 }
                 .map_err(blob_err_to_py)?;
-                // #848 (§14) — a kept epoch's key follows the chunks.
+                // #848 (§14) — the epoch's key follows the chunks.
                 if let Some(axis) = r.key_grant_emission.as_ref() {
                     runtime.block_on(self.emit_key_grant_axis_async(axis))?;
                 }
@@ -15955,7 +15954,6 @@ impl PyEngine {
                     "stream_id": r.stream_id,
                     "epoch": r.epoch,
                     "tier": r.tier.as_str(),
-                    "keep": r.keep,
                     "granted": r.granted,
                     "excluded": r.excluded,
                     "roster": r.roster,

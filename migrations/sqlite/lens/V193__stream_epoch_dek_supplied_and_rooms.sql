@@ -1,4 +1,4 @@
--- V193 — a stream epoch's DEK may be caller-supplied and kept or not, and a
+-- V193 — a stream epoch's DEK may be caller-supplied (always kept), and a
 -- room's stream is stream-keyed too. SQLite dialect.
 -- v55.0.0 (CIRISPersist#981, #977; CC 5.3.3.1, CC 5.1, CC 5.3.3.2.5).
 --
@@ -19,9 +19,10 @@
 --    objects (operator ruling: a room's retention bound covers every byte
 --    sealed for that room).
 -- 2. #981 — a live call's DEK is the MLS exporter secret. The caller SUPPLIES
---    the (stream_id, epoch) DEK (`supplied`), and says whether the stream is
---    kept (`keep`: recorded, or `history_on_join: full`). An unkept epoch is
---    wrapped to nobody, so MLS forward secrecy survives (CC 5.3.3.2.5).
+--    the (stream_id, epoch) DEK (`supplied`); a supplied epoch is always kept
+--    and wrapped to the audience. An unrecorded live call never reaches
+--    persist: CC rc7 part 5 ("An unrecorded live call wraps nothing") forbids
+--    any durable wrap of its DEK, and a stored DEK row is one.
 --    Persist never mints or rolls a supplied stream's epoch: a removal or the
 --    nonce cap is the typed retryable `stream_epoch_rotation_required`.
 --
@@ -30,8 +31,7 @@
 -- SQLite cannot widen a CHECK in place, so both tables are rebuilt: staged,
 -- dropped, and re-created UNDER THEIR FINAL NAMES (no `_new` + RENAME: the
 -- V136 lesson). Neither table is the target or the source of a foreign key.
--- Every existing row is a persist-minted, kept epoch: `supplied = 0`,
--- `keep = 1`.
+-- Every existing row is a persist-minted epoch: `supplied = 0`.
 CREATE TABLE _v193_stage_stream_deks AS
     SELECT stream_id, epoch, owner_key_id, cohort_scope, group_key_id,
            self_retention_wrap, minted_at, closed_at, terminated_at,
@@ -61,8 +61,6 @@ CREATE TABLE federation_stream_deks (
     key_grant_emitted_at  TEXT,
     -- #981 — the caller supplied this epoch's DEK (persist never rolls it).
     supplied              INTEGER NOT NULL DEFAULT 0 CHECK (supplied IN (0, 1)),
-    -- #981 — the stream is kept: the epoch's DEK is wrapped to the audience.
-    keep                  INTEGER NOT NULL DEFAULT 1 CHECK (keep IN (0, 1)),
     -- #977 — a room stream epoch's place in the room's retention: the
     -- writer's community epoch when the stream epoch was minted. The
     -- community retention sweep evicts the epoch's chunks under the same
@@ -93,10 +91,10 @@ CREATE INDEX IF NOT EXISTS federation_stream_dek_grants_recipient
 INSERT INTO federation_stream_deks
     (stream_id, epoch, owner_key_id, cohort_scope, group_key_id,
      self_retention_wrap, minted_at, closed_at, terminated_at,
-     key_grant_emitted_at, supplied, keep)
+     key_grant_emitted_at, supplied)
 SELECT stream_id, epoch, owner_key_id, cohort_scope, group_key_id,
        self_retention_wrap, minted_at, closed_at, terminated_at,
-       key_grant_emitted_at, 0, 1
+       key_grant_emitted_at, 0
 FROM _v193_stage_stream_deks;
 
 INSERT INTO federation_stream_dek_grants

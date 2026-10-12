@@ -7654,10 +7654,13 @@ impl Engine {
     /// family or community the stream is sealed for. Closes the stream's open
     /// epoch with its terminator, records the DEK (persist never mints or rolls
     /// the stream's epochs from now on: a removal or the nonce cap refuses the
-    /// next chunk with the retryable `stream_epoch_rotation_required`), and
-    /// when `keep` wraps it to the stream's audience and emits the
-    /// `key_grant:stream:v1` rows. An unkept stream is wrapped to nobody.
-    /// Chunks then go through
+    /// next chunk with the retryable `stream_epoch_rotation_required`), wraps
+    /// it to the stream's audience and emits the `key_grant:stream:v1` rows.
+    /// A supplied epoch is always kept: an unrecorded live call never comes
+    /// to this door (CC rc7 part 5 — "An unrecorded live call wraps
+    /// nothing"); its frames are sealed in memory with
+    /// [`seal_stream_chunk`](crate::federation::stream_seal::seal_stream_chunk)
+    /// under the MLS exporter secret. Chunks then go through
     /// [`put_blob_chunk_scoped`](Self::put_blob_chunk_scoped) at `epoch`.
     /// Refusals: `stream_not_authored`, `stream_epoch_dek_exists`, or
     /// `InvalidArgument` (plaintext tier, an epoch below the newest, a
@@ -7671,7 +7674,6 @@ impl Engine {
         stream_id: &str,
         epoch: u64,
         dek: &[u8; 32],
-        keep: bool,
         aad: Option<&[u8]>,
     ) -> Result<
         crate::federation::chunk_dag_cascade::RegisteredStreamEpoch,
@@ -7692,7 +7694,6 @@ impl Engine {
                     stream_id,
                     epoch,
                     dek,
-                    keep,
                     aad,
                 )
                 .await
@@ -7707,7 +7708,6 @@ impl Engine {
                     stream_id,
                     epoch,
                     dek,
-                    keep,
                     aad,
                 )
                 .await
