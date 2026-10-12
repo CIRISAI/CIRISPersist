@@ -909,10 +909,13 @@ pub(crate) mod bodies {
     /// child page and every chunk are gone (the walk reached the nested
     /// DAG); a child page a LIVE root also relates stays and serves
     /// (`delete_blob` took children regardless of their other parents); and
-    /// an evicted child page or chunk a peer re-offers is withheld (`Purged`)
-    /// at the serve door. Before v55.0.0 `delete_blob` also deleted the
-    /// root -> child relation, so a re-offered child page related to nothing
-    /// and was served back.
+    /// an evicted child page or chunk a peer re-offers is refused (`Purged`)
+    /// at the write floor (`refuse_tombstoned_bytes`, the slice C ruling:
+    /// taken-down bytes never come back), is not held, and does not serve.
+    /// The floor finds a child page purged only through the surviving
+    /// root -> child relation. Before v55.0.0 `delete_blob` also deleted that
+    /// relation, so a re-offered child page related to nothing and was
+    /// served back.
     pub(crate) async fn i835_a_purged_v3_root_takes_its_nested_dag<B>(
         dsn_a: &str,
         dsn_b: &str,
@@ -1054,25 +1057,45 @@ pub(crate) mod bodies {
             .await
             .expect("I835 and it still serves");
 
-        // A peer re-offers what was evicted.
-        let withheld = |r: Result<(), BlobError>, what: &str| {
+        // A peer re-offers what was evicted: refused at the write floor
+        // (slice C's ruling, `refuse_tombstoned_bytes`), never stored, and
+        // never served.
+        let refused = |r: Result<(), BlobError>, what: &str| {
             assert!(
                 matches!(r, Err(BlobError::Purged { .. })),
-                "I835 a re-offered {what} is withheld: {r:?}"
+                "I835 a re-offered {what} is refused Purged: {r:?}"
             );
         };
         let page = inline(p.sa.as_ref(), &children[1]).await;
-        p.b.adopt_sealed_blob(&page, prov(&p), None, AdoptDisposition::LocalOnly)
-            .await
-            .expect("I835: a child page's bytes may be re-delivered");
-        assert!(p.sb.has_blob(&children[1]).await.unwrap());
-        withheld(served(&p, &children[1]).await, "child page");
+        refused(
+            p.b.adopt_sealed_blob(&page, prov(&p), None, AdoptDisposition::LocalOnly)
+                .await
+                .map(|_| ()),
+            "child page",
+        );
+        assert!(
+            !p.sb.has_blob(&children[1]).await.unwrap(),
+            "I835 a refused child page is not held"
+        );
+        assert!(
+            served(&p, &children[1]).await.is_err(),
+            "I835 a refused child page does not serve"
+        );
         let (seq, csha, env, epoch, size) = &chunks[0];
-        p.b.adopt_sealed_chunk(&stream, *seq, env, *epoch, u64::from(*size), prov(&p))
-            .await
-            .expect("I835: a chunk's bytes may be re-delivered");
-        assert!(p.sb.has_blob(csha).await.unwrap());
-        withheld(served(&p, csha).await, "chunk");
+        refused(
+            p.b.adopt_sealed_chunk(&stream, *seq, env, *epoch, u64::from(*size), prov(&p))
+                .await
+                .map(|_| ()),
+            "chunk",
+        );
+        assert!(
+            !p.sb.has_blob(csha).await.unwrap(),
+            "I835 a refused chunk is not held"
+        );
+        assert!(
+            served(&p, csha).await.is_err(),
+            "I835 a refused chunk does not serve"
+        );
     }
 
     /// **I484** — a chunk two DAGs hold.
