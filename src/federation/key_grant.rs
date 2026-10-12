@@ -697,8 +697,17 @@ impl KeyGrantRow {
                 }
                 let owner_key_id = member_str(env, "owner_key_id")?;
                 check_target(env, scope, owner_key_id)?;
+                let stream_id = member_str(env, "stream_id")?;
+                // v55.0.0 — a stream id reserved for an inline blob's log
+                // (#953) names no stream any node can hold.
+                if crate::federation::stream_sth::refuse_reserved_stream_id(stream_id).is_err() {
+                    return Err(malformed(format!(
+                        "a stream-axis key_grant row names stream {stream_id:?}, shaped like a \
+                         SHA-256 and reserved for an inline blob's log (CIRISPersist#953)"
+                    )));
+                }
                 KeyGrantAxis::Stream {
-                    stream_id: member_str(env, "stream_id")?.to_owned(),
+                    stream_id: stream_id.to_owned(),
                     epoch: member_u64(env, "epoch")?,
                     cohort_scope: scope.to_owned(),
                     owner_key_id: owner_key_id.to_owned(),
@@ -2460,6 +2469,17 @@ mod tests {
             axis: axes()[1].clone(),
             wrap: wrap("r"),
         };
+        // v55.0.0 (#953) — a stream row naming a reserved (SHA-shaped) id.
+        let reserved = KeyGrantRow {
+            axis: KeyGrantAxis::Stream {
+                stream_id: "ab".repeat(32),
+                epoch: 0,
+                cohort_scope: "community".into(),
+                owner_key_id: "c".into(),
+            },
+            wrap: wrap("r"),
+        };
+        assert!(malformed_of(&row_of(&reserved)), "a reserved stream id");
         let base = row_of(&content);
         let mut a = base.clone();
         a.attestation_envelope["epoch"] = 1.into();

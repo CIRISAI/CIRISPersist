@@ -19014,6 +19014,9 @@ impl crate::federation::BlobStorage for PostgresBackend {
         &self,
         record: &crate::federation::StreamDekRecord,
     ) -> Result<crate::federation::StreamDekRecord, crate::federation::BlobError> {
+        // v55.0.0 — the chunk floor's stream-name rule (#953): no stream row
+        // under a name reserved for an inline blob's log.
+        crate::federation::stream_sth::refuse_reserved_stream_id(&record.stream_id)?;
         let client = self
             .get_client()
             .await
@@ -19133,6 +19136,9 @@ impl crate::federation::BlobStorage for PostgresBackend {
         cohort_scope: &str,
         wraps: &[crate::federation::GrantWrap],
     ) -> Result<usize, crate::federation::BlobError> {
+        // v55.0.0 — the chunk floor's stream-name rule (#953): no stream row
+        // under a name reserved for an inline blob's log.
+        crate::federation::stream_sth::refuse_reserved_stream_id(stream_id)?;
         let mut client = self
             .get_client()
             .await

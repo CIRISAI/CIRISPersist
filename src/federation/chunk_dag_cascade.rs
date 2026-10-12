@@ -984,6 +984,11 @@ pub mod orchestrate {
     where
         B: BlobStorage + FederationDirectory + Sync,
     {
+        // v55.0.0 (Edge on a6c36c7d) — the chunk door's stream-name rule
+        // first (#953): a DEK for a stream no chunk can ever be written to is
+        // refused with the chunk door's own error, and nothing is written (no
+        // terminator, no DEK row).
+        crate::federation::stream_sth::refuse_reserved_stream_id(stream_id)?;
         let tier = resolve_write_tier(backend, cohort_scope, Some(group_key_id)).await?;
         if tier == CryptoTier::Plaintext {
             return Err(BlobError::InvalidArgument(format!(

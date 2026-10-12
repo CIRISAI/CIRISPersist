@@ -62,6 +62,11 @@
 //!   this node alone, and a wrap sealed by the chunk's author alone each
 //!   refuse a community epoch; none of them admits, as does another epoch,
 //!   a provenance naming no epoch and a self-tier provenance.
+//! - **I770** (sqlite, postgres; #953, Edge on a6c36c7d) — the register door
+//!   applies the chunk door's stream-name rule: a 64-hex stream id is refused
+//!   with the chunk door's own error, nothing written (no DEK row, no chunk,
+//!   no terminator); the stream-DEK floors (`stream_dek_insert`,
+//!   `stream_dek_put_grants`) refuse it too.
 //! - **I756** (pure; #981) — the roll rule: cap and removal roll a minted
 //!   epoch and refuse a supplied one with the reason; nothing else does.
 
@@ -1297,6 +1302,87 @@ pub(crate) mod bodies {
             .expect("I761: a self provenance");
     }
 
+    /// **I770** — see the module doc.
+    pub(crate) async fn i770_the_register_door_keeps_the_stream_name_rule<B>(
+        dsn_a: &str,
+        dsn_b: &str,
+        run: &str,
+        pick: Pick<B>,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync + 'static,
+    {
+        use sha2::Digest as _;
+        let l = ladder(dsn_a, dsn_b, run, pick).await;
+        let reserved = hex::encode(sha2::Sha256::digest(format!("i770-{run}").as_bytes()));
+        for id in [reserved.clone(), reserved.to_uppercase()] {
+            let chunk = l
+                .engine_a
+                .put_blob_chunk_scoped(COMMUNITY, Some(&l.comm), &id, 0, b"x", 0, None)
+                .await
+                .expect_err("I770: the chunk door refuses a reserved id");
+            let reg = l
+                .engine_a
+                .register_stream_epoch_dek(COMMUNITY, &l.comm, &id, 0, &mls_exporter(), None)
+                .await
+                .expect_err("I770: the register door refuses it too");
+            assert!(
+                matches!(&reg, BlobError::InvalidArgument(_))
+                    && reg.to_string() == chunk.to_string(),
+                "I770: the chunk door's own error: {reg:?} vs {chunk:?}"
+            );
+            assert!(
+                l.ba.stream_dek_list(&id).await.unwrap().is_empty(),
+                "I770: no stream DEK row"
+            );
+            let listing = l.ba.stream_chunks(&id).await.unwrap();
+            assert!(
+                listing.chunks.is_empty() && listing.stream.is_none(),
+                "I770: no chunk, no terminator, no stream row"
+            );
+            // The floors refuse it whoever calls them.
+            let rec = crate::federation::StreamDekRecord {
+                stream_id: id.clone(),
+                epoch: 0,
+                owner_key_id: l.node_a.clone(),
+                cohort_scope: COMMUNITY.to_owned(),
+                group_key_id: l.comm.clone(),
+                self_retention_wrap: "r".into(),
+                chunk_count: 0,
+                closed: false,
+                terminated: false,
+                supplied: true,
+                room_epoch: None,
+            };
+            assert!(
+                matches!(
+                    l.ba.stream_dek_insert(&rec).await,
+                    Err(BlobError::InvalidArgument(_))
+                ),
+                "I770: stream_dek_insert"
+            );
+            let wrap = crate::federation::GrantWrap {
+                recipient_key_id: l.node_b.clone(),
+                wrap_algorithm: crate::federation::at_rest_cascade::WRAP_ALGORITHM_V2.into(),
+                wrapped_dek: "w".into(),
+            };
+            assert!(
+                matches!(
+                    l.ba.stream_dek_put_grants(&id, 0, &l.node_a, COMMUNITY, &[wrap])
+                        .await,
+                    Err(BlobError::InvalidArgument(_))
+                ),
+                "I770: stream_dek_put_grants"
+            );
+            assert!(l.ba.stream_dek_list(&id).await.unwrap().is_empty());
+            assert!(l
+                .ba
+                .stream_dek_grants(&id, 0, &l.node_a)
+                .await
+                .unwrap()
+                .is_empty());
+        }
+    }
+
     macro_rules! runners {
         ($modname:ident, $dsn:expr, $pick:expr) => {
             mod $modname {
@@ -1341,6 +1427,11 @@ pub(crate) mod bodies {
                 async fn i761() {
                     let Some((a, b)) = $dsn else { return };
                     i761_each_leg_alone_names_a_stream_keyed_epoch(&a, &b, &run(), $pick).await
+                }
+                #[tokio::test]
+                async fn i770() {
+                    let Some((a, b)) = $dsn else { return };
+                    i770_the_register_door_keeps_the_stream_name_rule(&a, &b, &run(), $pick).await
                 }
                 #[tokio::test]
                 async fn i750() {
