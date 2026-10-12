@@ -7,7 +7,7 @@ threat-model citations because this crate's audit story is the point.
 
 ## [Unreleased]
 
-## [55.0.0] - UNRELEASED
+## [55.0.0] - 2026-10-12
 
 ### Changed — CIRISConstitution v1.0-rc7 vendored (#753, slice A0)
 
