@@ -599,48 +599,68 @@ pub(crate) mod bodies {
         }
     }
 
-    /// **I372 (door)** — a carrier of the wrong shape is refused where it is
-    /// minted (the emit recipe) and at the put door, under the SHIPPED setting:
-    /// the shape is not behind the switch.
+    /// **I372 (door)** — v55.0.0 (CIRISPersist#989, slices A and B): rc7
+    /// registers no carrier and persist's rc6 exception is deleted, so no row
+    /// reaches the carrier-shape refusal at a door any more (the shape check is
+    /// pinned pure, I372). A row of the rc6 holding-claim carrier, well-formed
+    /// or malformed, is a RETIRED carrier: refused
+    /// `attestation_type_unregistered` where it is minted (the emit recipe)
+    /// and at the put door under the SHIPPED setting, before its shape is
+    /// asked, and nothing is stored.
     pub async fn i372_malformed_carrier_refused<B: FederationDirectory + Sync>(b: &B, s: &str) {
         let w = who(b, &format!("i372-{s}"), USER).await;
-        let bad = || {
-            input(
-                "holds_bytes:sha256:0a1b2c3d",
-                serde_json::json!({"kind": "holds_bytes", "size": 3, "dimension": "x:v1"}),
-            )
+        let hb = "holds_bytes:sha256:0a1b2c3d";
+        let rows = || {
+            [
+                (
+                    "well-formed",
+                    input(hb, serde_json::json!({"kind": "holds_bytes", "size": 3})),
+                ),
+                (
+                    "malformed",
+                    input(
+                        hb,
+                        serde_json::json!({"kind": "holds_bytes", "size": 3, "dimension": "x:v1"}),
+                    ),
+                ),
+            ]
         };
-        let e = emit_with_local_signer(b, &w.signer, bad())
-            .await
-            .expect_err("the mint refuses the shape");
-        assert_eq!(e.kind(), "federation_carrier_row_malformed");
-        // A peer's row of the same shape: built past the mint, offered to the
-        // replication door.
-        let mut i = bad();
-        let canonical = stamp_and_canonicalize(&mut i, &w.key, chrono::Utc::now()).unwrap();
-        let sig = w.signer.sign_hybrid(&canonical).await.unwrap();
-        let mut row = with_enforcement(RowTypeEnforcement::Report, async {
-            // `assemble` refuses it, so take the row the well-formed twin
-            // assembles and graft the claim member into the envelope BEFORE the
-            // mirror is stamped — the shape a non-persist producer would send.
-            let mut ok = input(
-                "holds_bytes:sha256:0a1b2c3d",
-                serde_json::json!({"kind": "holds_bytes", "size": 3}),
+        for (what, i) in rows() {
+            let e = emit_with_local_signer(b, &w.signer, i)
+                .await
+                .expect_err("the mint refuses a retired carrier");
+            assert_eq!(
+                e.kind(),
+                "federation_attestation_type_unregistered",
+                "{what}: {e}"
             );
-            let c = stamp_and_canonicalize(&mut ok, &w.key, chrono::Utc::now()).unwrap();
+        }
+        // A peer's row of the same type: validly signed, built past the mint,
+        // offered to the replication door.
+        #[cfg(any(feature = "sqlite", feature = "postgres"))]
+        for (what, mut i) in rows() {
+            let c = stamp_and_canonicalize(&mut i, &w.key, chrono::Utc::now()).unwrap();
             let sg = w.signer.sign_hybrid(&c).await.unwrap();
-            assemble(w.key.clone(), &c, sg, ok).unwrap().0
-        })
-        .await;
-        let _ = (canonical, sig);
-        row.attestation_envelope["dimension"] = serde_json::json!("x:v1");
-        let id = row.attestation_id.clone();
-        let e = b
-            .put_attestation(SignedAttestation { attestation: row })
-            .await
-            .expect_err("the put door refuses a malformed carrier");
-        assert_eq!(e.kind(), "federation_carrier_row_malformed", "{e}");
-        assert!(b.get_attestation(&id).await.unwrap().is_none());
+            let row = crate::federation::attestation_emit::assemble_for_door_witness(
+                w.key.clone(),
+                &c,
+                sg,
+                i,
+            )
+            .unwrap()
+            .0;
+            let id = row.attestation_id.clone();
+            let e = b
+                .put_attestation(SignedAttestation { attestation: row })
+                .await
+                .expect_err("the put door refuses a retired carrier");
+            assert_eq!(
+                e.kind(),
+                "federation_attestation_type_unregistered",
+                "{what}: {e}"
+            );
+            assert!(b.get_attestation(&id).await.unwrap().is_none(), "{what}");
+        }
     }
 
     /// **I373** — a carrier token is never a dimension. On `scores` it is
