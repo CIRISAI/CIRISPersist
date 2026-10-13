@@ -1,4 +1,4 @@
-//! v56.0.0 (CIRISPersist#1001) — **I900–I906: the typed bounded read.**
+//! v56.0.0 (CIRISPersist#1001) — **I900–I906 + I913: the typed bounded read.**
 //!
 //! - **I900** every query shape pages to exactly the rows its predicate
 //!   admits, in `(asserted_at, attestation_id)` order (newest or oldest
@@ -20,6 +20,12 @@
 //!   refused read come back `NotServed` (with the reason's kind), an
 //!   unmatched filter comes back `Served` with zero rows, on all three
 //!   backends.
+//! - **I913** `DimensionFilter::AnyOf` returns exactly the rows whose
+//!   dimension is one of the set (two members present, one absent), and
+//!   `ScopeFilter` exactly the rows of the `cohort_scope` (and, when given,
+//!   the `cohort_target`), on `by` and `to` queries and combined with a
+//!   dimension prefix — as I900 shapes, so they page, order and seek like
+//!   every other shape (I901/I903). An empty `AnyOf` is refused (I902).
 //! - **I906** `as_of(t)` keeps exactly the rows whose SIGNED `asserted_at <=
 //!   t`, in `ByAssertedAt` order with the id tie-break, both directions,
 //!   paged; a row landed AFTER the read, dated after `t`, never enters the
@@ -53,6 +59,10 @@ pub(crate) mod bodies {
         pub dimension: Option<String>,
         pub at: chrono::DateTime<chrono::Utc>,
         pub local: bool,
+        /// The stored `cohort_scope`.
+        pub scope: String,
+        /// The envelope's cohort target (V150's generated column).
+        pub target: Option<String>,
     }
 
     /// The corpus: three keys, every type/dimension shape a query narrows
@@ -61,6 +71,9 @@ pub(crate) mod bodies {
         pub a: String,
         pub b: String,
         pub c: String,
+        /// Two community ids the scoped rows target (I913).
+        pub comm1: String,
+        pub comm2: String,
         pub rows: Vec<Row>,
     }
 
@@ -77,9 +90,28 @@ pub(crate) mod bodies {
         dimension: &str,
         minute: i64,
     ) -> Row {
+        put_scoped(d, by, to, dimension, minute, None).await
+    }
+
+    /// A `scores` row; `scope` = `(cohort_scope, community_id)` stamps the
+    /// row's visibility scope and (when given) its envelope cohort target.
+    async fn put_scoped(
+        d: &dyn FederationDirectory,
+        by: &str,
+        to: &str,
+        dimension: &str,
+        minute: i64,
+        scope: Option<(&str, Option<&str>)>,
+    ) -> Row {
         let id = uuid::Uuid::new_v4().to_string();
-        let env = serde_json::json!({ "dimension": dimension, "id": id });
+        let mut env = serde_json::json!({ "dimension": dimension, "id": id });
+        if let Some((_, Some(target))) = scope {
+            env["community_id"] = serde_json::Value::String(target.to_owned());
+        }
         let mut r = ts::bare_attestation(&id, by, to, &env);
+        if let Some((cohort_scope, _)) = scope {
+            r.cohort_scope = cohort_scope.to_owned();
+        }
         r.attestation_type = attestation_type::SCORES.into();
         r.weight = None;
         r.asserted_at = base() + chrono::Duration::minutes(minute);
@@ -98,6 +130,9 @@ pub(crate) mod bodies {
                 .map(str::to_owned),
             at: r.asserted_at,
             local,
+            scope: r.cohort_scope.clone(),
+            target: crate::federation::cohort_target_of_envelope(&r.attestation_envelope)
+                .map(str::to_owned),
         };
         d.put_attestation(SignedAttestation { attestation: r })
             .await
@@ -131,6 +166,35 @@ pub(crate) mod bodies {
         // B about A.
         rows.push(put_scores(d, &b, &a, "i900x:c:v1", -45).await);
         rows.push(put_scores(d, &b, &a, "i900x:c2:v1", -5).await);
+        // I913 — scoped rows: two communities, one species-wide row.
+        let comm1 = format!("i900-comm1-{s}");
+        let comm2 = format!("i900-comm2-{s}");
+        let community = crate::federation::types::cohort_scope::COMMUNITY;
+        let species = crate::federation::types::cohort_scope::SPECIES;
+        rows.push(
+            put_scoped(
+                d,
+                &a,
+                &a,
+                "i900s:a:v1",
+                -48,
+                Some((community, Some(&comm1))),
+            )
+            .await,
+        );
+        rows.push(
+            put_scoped(
+                d,
+                &a,
+                &a,
+                "i900s:b:v1",
+                -12,
+                Some((community, Some(&comm2))),
+            )
+            .await,
+        );
+        rows.push(put_scoped(d, &b, &a, "i900s:c:v1", -8, Some((community, Some(&comm1)))).await);
+        rows.push(put_scoped(d, &a, &b, "i900s:d:v1", -22, Some((species, None))).await);
         // C noise.
         for (leaf, m) in [
             ("i900x:a:v1", -55),
@@ -187,9 +251,18 @@ pub(crate) mod bodies {
             dimension: Some("i900x:a:v1".into()),
             at: local[0].asserted_at,
             local: true,
+            scope: crate::federation::types::cohort_scope::SELF.to_owned(),
+            target: None,
         });
         let _ = read_probe::take();
-        Corpus { a, b, c, rows }
+        Corpus {
+            a,
+            b,
+            c,
+            comm1,
+            comm2,
+            rows,
+        }
     }
 
     /// The oracle: a hand-written filter per shape, then the order.
@@ -295,6 +368,99 @@ pub(crate) mod bodies {
                 expect(
                     corpus,
                     |r| fed(r) && r.to == a && r.kind.starts_with("sc"),
+                    oldest,
+                ),
+            ));
+            // I913 — DimensionFilter::AnyOf: exact dimensions OR'd.
+            out.push((
+                "by A, any of config:a:v1 / config:b2:v1",
+                o(AttestationQuery::by(a, lim).dimension_any_of(&["i900x:a:v1", "i900x:b2:v1"])),
+                expect(
+                    corpus,
+                    |r| {
+                        fed(r)
+                            && r.by == a
+                            && matches!(r.dimension.as_deref(), Some("i900x:a:v1" | "i900x:b2:v1"))
+                    },
+                    oldest,
+                ),
+            ));
+            out.push((
+                "to B, any of config:a:v1 / config:ab:v1 / absent",
+                o(AttestationQuery::to(b, lim).dimension_any_of(&[
+                    "i900x:a:v1",
+                    "i900x:ab:v1",
+                    "i900x:none:v1",
+                ])),
+                expect(
+                    corpus,
+                    |r| {
+                        fed(r)
+                            && r.to == b
+                            && matches!(r.dimension.as_deref(), Some("i900x:a:v1" | "i900x:ab:v1"))
+                    },
+                    oldest,
+                ),
+            ));
+            // I913 — ScopeFilter: cohort_scope, and cohort_target when given.
+            let (c1, c2) = (corpus.comm1.as_str(), corpus.comm2.as_str());
+            let community = crate::federation::types::cohort_scope::COMMUNITY;
+            let species = crate::federation::types::cohort_scope::SPECIES;
+            out.push((
+                "to A, scope community",
+                o(AttestationQuery::to(a, lim).scope(community, None)),
+                expect(
+                    corpus,
+                    |r| fed(r) && r.to == a && r.scope == community,
+                    oldest,
+                ),
+            ));
+            out.push((
+                "to A, scope community comm1",
+                o(AttestationQuery::to(a, lim).scope(community, Some(c1))),
+                expect(
+                    corpus,
+                    |r| {
+                        fed(r)
+                            && r.to == a
+                            && r.scope == community
+                            && r.target.as_deref() == Some(c1)
+                    },
+                    oldest,
+                ),
+            ));
+            out.push((
+                "by A, scope community",
+                o(AttestationQuery::by(a, lim).scope(community, None)),
+                expect(
+                    corpus,
+                    |r| fed(r) && r.by == a && r.scope == community,
+                    oldest,
+                ),
+            ));
+            out.push((
+                "by A, scope species",
+                o(AttestationQuery::by(a, lim).scope(species, None)),
+                expect(
+                    corpus,
+                    |r| fed(r) && r.by == a && r.scope == species,
+                    oldest,
+                ),
+            ));
+            out.push((
+                "by A, prefix i900s: + scope community comm2",
+                o(AttestationQuery::by(a, lim)
+                    .dimension_prefix("i900s:")
+                    .scope(community, Some(c2))),
+                expect(
+                    corpus,
+                    |r| {
+                        fed(r)
+                            && r.by == a
+                            && dim(r, "i900s:")
+                            && r.scope == community
+                            && r.target.as_deref() == Some(c2)
+                    },
                     oldest,
                 ),
             ));
@@ -424,6 +590,11 @@ pub(crate) mod bodies {
         let mut huge = q.clone();
         huge.limit = NonZeroU32::new(crate::federation::attestation_query::MAX_PAGE + 1).unwrap();
         assert!(refused(d.query_attestations(&huge).await));
+        // I913 — an empty AnyOf names no dimension: refused, never "any"
+        // and never an empty page.
+        assert!(refused(
+            d.query_attestations(&q.clone().dimension_any_of(&[])).await
+        ));
         let page = d.query_attestations(&q).await.served().unwrap();
         let mut c = page.next.expect("A has more than one row");
         c.version = "v0".into();

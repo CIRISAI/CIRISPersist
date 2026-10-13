@@ -84,6 +84,35 @@ pub enum DimensionFilter {
     Prefix(String),
     /// Exactly this dimension.
     Exact(String),
+    /// Exactly one of these dimensions, OR'd in one statement
+    /// (`dimension IN (…)`: one equality seek per member on the
+    /// `(key, dimension)` index). An EMPTY set is refused at the wrapper
+    /// ([`AttestationQuery::validate`]): it would match nothing, and a caller
+    /// that built one has a bug, not a question.
+    ///
+    /// Retraction rows (`withdraws` / `supersedes` / `recants`) carry NO
+    /// envelope `dimension`, so no dimension filter — this one included —
+    /// returns them: see [`AttestationQuery`]'s "Retractions" note.
+    AnyOf(Vec<String>),
+}
+
+/// v56.0.0 (CIRISPersist#1001) — the visibility-scope narrowing: rows whose
+/// stored `cohort_scope` is [`Self::cohort_scope`] and, when given, whose
+/// `cohort_target` (V150's generated column: the envelope's first present
+/// `community_id` / `community_key_id` / `cohort_key_id` / `family_key_id`)
+/// is [`Self::cohort_target`].
+///
+/// Pushed down on the indexed columns: a `to` query seeks V060's
+/// `(attested_key_id, cohort_scope, asserted_at DESC)`; a `by` query filters
+/// the attester's ordered walk (no index leads with the attester and the
+/// scope), bounded by the page like an exclusion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScopeFilter {
+    /// The stored `cohort_scope` (`self` / `family` / `community` /
+    /// `affiliations` / `species` / `biosphere` / `federation`).
+    pub cohort_scope: String,
+    /// The stored `cohort_target`, or any target (and none) when `None`.
+    pub cohort_target: Option<String>,
 }
 
 /// Which storage tier the rows come from.
@@ -144,6 +173,20 @@ impl QueryOrder {
 /// One bounded attestation read. Built with [`AttestationQuery::by`] or
 /// [`AttestationQuery::to`] (a query always pins a key), narrowed by the
 /// builder methods, executed by [`AttestationReads::query_attestations`].
+///
+/// **The whole set is a loop.** A page holds at most `limit` rows; a caller
+/// that needs every matching row follows [`Page::next`] (or walks
+/// [`AttestationQuery::pages`]) until it is `None`. There is no unbounded
+/// form.
+///
+/// **Retractions.** The structural composers (`withdraws`, `supersedes`,
+/// `recants`) carry NO envelope `dimension` — a `withdraws` envelope is
+/// `{kind, references_attestation_id, references_attestation_type}` — so a
+/// dimension-filtered page ([`DimensionFilter::Prefix`], `Exact`, `AnyOf`)
+/// never carries its own rows' retractions. The bounded second read is
+/// `AttestationQuery::by(k, limit).types(&["withdraws", "supersedes",
+/// "recants"])` paged on `next`, joined on the envelope's
+/// `references_attestation_id`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttestationQuery {
     /// Rows `by` authored (`attesting_key_id`).
@@ -172,6 +215,8 @@ pub struct AttestationQuery {
     pub after: Option<AttestationCursor>,
     /// Only rows whose SIGNED `asserted_at` is at or before this instant.
     pub as_of: Option<DateTime<Utc>>,
+    /// Only rows in this visibility scope (and target).
+    pub scope: Option<ScopeFilter>,
 }
 
 impl AttestationQuery {
@@ -188,6 +233,7 @@ impl AttestationQuery {
             limit,
             after: None,
             as_of: None,
+            scope: None,
         }
     }
 
@@ -228,6 +274,27 @@ impl AttestationQuery {
     #[must_use]
     pub fn dimension(mut self, dimension: &str) -> Self {
         self.dimension = DimensionFilter::Exact(dimension.to_owned());
+        self
+    }
+
+    /// Only rows whose envelope `dimension` is exactly one of `dimensions`
+    /// ([`DimensionFilter::AnyOf`]; an empty slice is refused at the read).
+    #[must_use]
+    pub fn dimension_any_of(mut self, dimensions: &[&str]) -> Self {
+        self.dimension =
+            DimensionFilter::AnyOf(dimensions.iter().map(|d| (*d).to_owned()).collect());
+        self
+    }
+
+    /// Only rows whose stored `cohort_scope` is `cohort_scope` and, when
+    /// `cohort_target` is `Some`, whose `cohort_target` is it
+    /// ([`ScopeFilter`]).
+    #[must_use]
+    pub fn scope(mut self, cohort_scope: &str, cohort_target: Option<&str>) -> Self {
+        self.scope = Some(ScopeFilter {
+            cohort_scope: cohort_scope.to_owned(),
+            cohort_target: cohort_target.map(str::to_owned),
+        });
         self
     }
 
@@ -288,25 +355,29 @@ impl AttestationQuery {
     }
 
     /// Whether the query narrows below its pinned key's whole slice (a type,
-    /// a dimension, or an exclusion). A witness's "slice read" is a query
-    /// that does not.
+    /// a dimension, an exclusion, or a scope). A witness's "slice read" is a
+    /// query that does not.
     #[must_use]
     pub fn is_narrowed(&self) -> bool {
         !self.types.is_empty()
             || self.type_prefix.is_some()
             || self.dimension != DimensionFilter::Any
             || !self.excluded_dimensions.is_empty()
+            || self.scope.is_some()
     }
 
     /// Whether a narrower index than the key's `(key, asserted_at)` one
     /// serves the query (a type or a dimension pins a `(key, type, …)` /
     /// `(key, dimension)` prefix). An exclusion alone does not: it is a
-    /// filter on the key's ordered walk.
+    /// filter on the key's ordered walk. A scope on a `to` query seeks
+    /// V060's `(attested_key_id, cohort_scope, asserted_at DESC)`; on a `by`
+    /// query it is a filter on the attester's walk, like an exclusion.
     #[must_use]
     pub fn seeks_narrow_index(&self) -> bool {
         !self.types.is_empty()
             || self.type_prefix.is_some()
             || self.dimension != DimensionFilter::Any
+            || (self.scope.is_some() && self.to.is_some())
     }
 
     /// The read this query's shape replaced (v56.0.0, CIRISPersist#1001):
@@ -378,6 +449,11 @@ impl AttestationQuery {
                 self.limit
             )));
         }
+        if self.dimension == DimensionFilter::AnyOf(Vec::new()) {
+            return Err(Error::InvalidArgument(
+                "AttestationQuery DimensionFilter::AnyOf names no dimension".to_owned(),
+            ));
+        }
         if let Some(c) = &self.after {
             if c.version != "v1" {
                 return Err(Error::InvalidArgument(format!(
@@ -401,7 +477,14 @@ impl AttestationQuery {
                 DimensionFilter::Any => true,
                 DimensionFilter::Prefix(p) => dimension.is_some_and(|d| d.starts_with(p.as_str())),
                 DimensionFilter::Exact(x) => dimension == Some(x.as_str()),
+                DimensionFilter::AnyOf(xs) => dimension.is_some_and(|d| xs.iter().any(|x| x == d)),
             }
+            && self.scope.as_ref().is_none_or(|s| {
+                a.cohort_scope == s.cohort_scope
+                    && s.cohort_target.as_deref().is_none_or(|t| {
+                        super::cohort_target_of_envelope(&a.attestation_envelope) == Some(t)
+                    })
+            })
             && (self.types.is_empty() || self.types.contains(&a.attestation_type))
             && self
                 .type_prefix
@@ -753,6 +836,33 @@ pub fn render_sql(q: &AttestationQuery, dialect: Dialect, table: &str, columns: 
         DimensionFilter::Exact(x) => {
             binds.push(Bind::Text(x.clone()));
             parts.push(format!("{dim} = {}", ph(&binds)));
+        }
+        DimensionFilter::AnyOf(xs) => {
+            // One statement: an IN list is one equality seek per member on
+            // the `(key, dimension)` index (sqlite and postgres both). An
+            // empty list never reaches here (`validate`); were it to, `IN
+            // (NULL)` matches nothing rather than rendering invalid SQL.
+            let phs: Vec<String> = xs
+                .iter()
+                .map(|x| {
+                    binds.push(Bind::Text(x.clone()));
+                    ph(&binds)
+                })
+                .collect();
+            let list = if phs.is_empty() {
+                "NULL".to_owned()
+            } else {
+                phs.join(", ")
+            };
+            parts.push(format!("{dim} IN ({list})"));
+        }
+    }
+    if let Some(s) = &q.scope {
+        binds.push(Bind::Text(s.cohort_scope.clone()));
+        parts.push(format!("cohort_scope = {}", ph(&binds)));
+        if let Some(t) = &s.cohort_target {
+            binds.push(Bind::Text(t.clone()));
+            parts.push(format!("cohort_target = {}", ph(&binds)));
         }
     }
     if !q.types.is_empty() {
