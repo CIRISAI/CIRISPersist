@@ -93,6 +93,13 @@ pub(crate) enum Class {
     /// Another door or a same-file helper that itself runs gates. Contributes
     /// the callee's own sequence, inlined.
     Delegates,
+    /// v56.0.0 (CIRISPersist#934) — a SHARED plan: one backend-free function
+    /// that holds the door's whole decision. Contributes `plan:NAME`, never
+    /// the plan's gates, so a door that only executes a plan reads as
+    /// `shared` and not as three identical copies. The plan's own body is
+    /// scanned once, from its own file, and held to this same partition
+    /// (`SHARED_PLANS`).
+    Plan,
 }
 
 /// **The alphabet, as a partition over a derived universe.**
@@ -121,6 +128,62 @@ pub(crate) enum Class {
 ///   anything is stored. Classified by what they do, not what they are called.
 #[cfg(test)]
 pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
+    // v56.0.0 (CIRISPersist#934 step 1) — the attestation plane's shared door
+    // and the executor's one re-ask under its lock: each is a SHARED plan.
+    ("put_attestation_planned", Class::Plan),
+    ("recheck_cycle_under_lock", Class::Plan),
+    // Inside the shared plan: its two same-file halves.
+    ("plan_put_attestation", Class::Delegates),
+    ("execute_planned", Class::Delegates),
+    // The executor's storage steps, called by the shared plan. Each is itself
+    // an `AttestationStore` door, compared across backends on its own.
+    ("store_planned_attestation", Class::Plumbing),
+    ("repair_withdraws_depth", Class::Plumbing),
+    ("attesting_identity_type", Class::Plumbing),
+    ("composer_replay_held", Class::Plumbing),
+    // The hybrid-completion door (`attach_attestation_pqc_signature`): the
+    // shared door, its decision (a refusal of an unknown or already-complete
+    // row, so a Gate), and the executor's guarded write.
+    ("attach_attestation_pqc_planned", Class::Plan),
+    // The local-tier doors (`attestation_upsert_local` /
+    // `attestation_insert_local`), door 2: until v56.0.0 each delegated its
+    // body to a per-backend helper the scan could not see past (both doors read
+    // `gateless` while each helper ran seventeen gates). The shared door, its
+    // plan, the occupied-id clause (a refusal: a Gate) and the executor.
+    ("write_local_attestation_planned", Class::Plan),
+    ("plan_write_local_attestation", Class::Delegates),
+    ("local_occupied_id_verdict", Class::Gate),
+    ("store_planned_local_attestation", Class::Plumbing),
+    // Door 4, the re-seal: the shared door, its plan, the executor, and the
+    // shared re-ask the executor makes inside its write step (a Plan: the
+    // shape gate on the row it holds).
+    ("reseal_attestation_planned", Class::Plan),
+    ("plan_reseal_attestation", Class::Delegates),
+    ("store_planned_reseal", Class::Plumbing),
+    ("sealed_over", Class::Plan),
+    // Doors 5 and 6, the two purges: shared doors over one executor delete.
+    ("purge_attestation_planned", Class::Plan),
+    ("purge_genesis_delegation_row_planned", Class::Plan),
+    ("delete_attestation", Class::Plumbing),
+    // ...and the local plan's own gates, seen for the first time with it:
+    // the local-tier eligibility rule, the caller-signed transit verify, the
+    // signed-instant read (refuses a malformed instant) and the local stamp
+    // (refuses an envelope it cannot place the instants in).
+    ("check_local_tier_eligibility", Class::Gate),
+    ("verify_caller_signed_local_row", Class::Gate),
+    ("local_row_instant", Class::Gate),
+    ("stamp_local_row", Class::Gate),
+    // `opt.map(..).ok_or_else(..)?`: `ok_or_else` is transparent, so the
+    // token lands on `map`. Plumbing, in the fail-open direction, and why:
+    // `map` is an adapter, not a decision. Classified as a Gate it put a `map`
+    // token into four unrelated doors (`blob_key_grant_watermark` among them)
+    // wherever one backend wrote `.map(..)?` and another did not — syntax, not
+    // policy. The one refusal it hides here is the local helpers' "the envelope
+    // must carry a dimension string", which every backend writes identically
+    // and which I951's local-door rows exercise.
+    ("map", Class::Plumbing),
+    ("plan_attach_attestation_pqc_signature", Class::Gate),
+    ("store_pqc_completion", Class::Plumbing),
     // v55.0.0 (CIRISPersist#952) — Gate: the finalize refuses a chunk not held whole.
     ("check_held_dag_chunk", Class::Gate),
     // v46.3.0 (#884) — `minter_of_blob`'s community arm IS the #876 read
@@ -765,7 +828,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("safe_get_with", Class::Plumbing),
     ("scope_blob_symbol_from_pg_row", Class::Delegates),
     ("seal_content_kem_private", Class::Plumbing),
-    ("self_key_id", Class::Plumbing),
     ("serialize_signature", Class::Plumbing),
     ("serialize_witness_signatures", Class::Plumbing),
     // v36.0.0 (CIRISPersist#707/#668) — the sqlite allocator spellings.
@@ -1024,22 +1086,17 @@ pub(crate) const DECLARED_DIVERGENCES: &[DeclaredDivergence] = &[
                  relative order is not observable in state, only in which message an operator \
                  sees when a row violates both.",
     },
-    DeclaredDivergence {
-        trait_name: "FederationDirectory",
-        method: "reseal_attestation_v31",
-        backend: "memory",
-        expected: &[
-            "check_reseal_admission",
-            "check_reseal_seal_admission",
-            "check_reseal_admission",
-        ],
-        reason: "Memory asks the pure shape gate TWICE: once before the lock, in the AV-76 tier \
-                 order its siblings run, and again on the row it actually found under the lock. \
-                 The SQL backends get that second answer from their transaction — they read and \
-                 update inside one — and memory's read is a separate `get_attestation` that locks \
-                 and releases, so without the re-ask the door would gate one row and mutate \
-                 another. An extra ask of a pure refusal is the safe direction of this difference.",
-    },
+    // v56.0.0 (CIRISPersist#934 door 4) — the `reseal_attestation_v31`
+    // declaration that stood here is gone, and its reason was false. It said
+    // the SQL backends "get that second answer from their transaction — they
+    // read and update inside one". They did not: sqlite and postgres read the
+    // row through `get_attestation` BEFORE their write transaction and asked
+    // nothing inside it, so a change landing between the read and the write was
+    // overwritten (I953, red on both before the fix). Memory alone re-asked
+    // under its lock. The door is now shared on all three: the plan asks the
+    // shape and seal gates, and every executor re-asks the shape gate on the
+    // row it holds inside its write step (`PlannedReseal::sealed_over`;
+    // SHARED_DOORS below).
     DeclaredDivergence {
         trait_name: "FederationDirectory",
         method: "list_signed_transport_destinations_since",
@@ -1093,10 +1150,103 @@ mod tests {
     /// The traits whose impls are compared, and where each trait's **default**
     /// bodies live. A backend that does not override a defaulted method runs
     /// the default, so the default's gate sequence is what it contributes.
-    const TRAITS: [(&str, &str); 3] = [
+    const TRAITS: [(&str, &str); 4] = [
         ("FederationDirectory", "src/federation/mod.rs"),
         ("BlobStorage", "src/federation/blobs.rs"),
         ("Backend", "src/store/backend.rs"),
+        // v56.0.0 (CIRISPersist#934) — the attestation plane's executor: its
+        // methods are compared across backends like any door, so a decision
+        // that drifts back into an executor is seen.
+        ("AttestationStore", "src/federation/attestation_admit.rs"),
+    ];
+
+    /// v56.0.0 (CIRISPersist#934) — the shared plans, read from their own
+    /// files: `(file, fn)`. Each body is held to the same [`CALL_CLASSES`]
+    /// partition as a backend door, and its sequence is what a door's
+    /// `plan:NAME` token stands for.
+    const SHARED_PLANS: [(&str, &str); 8] = [
+        (
+            "src/federation/attestation_admit.rs",
+            "put_attestation_planned",
+        ),
+        (
+            "src/federation/attestation_admit.rs",
+            "recheck_cycle_under_lock",
+        ),
+        (
+            "src/federation/attestation_admit.rs",
+            "attach_attestation_pqc_planned",
+        ),
+        (
+            "src/federation/attestation_admit.rs",
+            "write_local_attestation_planned",
+        ),
+        (
+            "src/federation/attestation_admit.rs",
+            "reseal_attestation_planned",
+        ),
+        ("src/federation/attestation_admit.rs", "sealed_over"),
+        (
+            "src/federation/attestation_admit.rs",
+            "purge_attestation_planned",
+        ),
+        (
+            "src/federation/attestation_admit.rs",
+            "purge_genesis_delegation_row_planned",
+        ),
+    ];
+
+    /// v56.0.0 (CIRISPersist#934) — **the doors that decide nothing in a
+    /// backend**: `(trait, method, plan)`. On every backend that implements
+    /// the trait, the door's whole sequence is exactly `plan:<plan>` — no gate
+    /// of its own before, after or instead of the shared one. A door enters
+    /// this list on the commit that moves its decision into a plan, and
+    /// cannot drift back: a gate added to one backend's copy fails
+    /// [`shared_doors_decide_nothing_in_a_backend`].
+    const SHARED_DOORS: [(&str, &str, &str); 9] = [
+        (
+            "FederationDirectory",
+            "put_attestation_with_origin",
+            "put_attestation_planned",
+        ),
+        // The executor's one re-ask: the plan's cycle gate under the write lock.
+        (
+            "AttestationStore",
+            "store_planned_attestation",
+            "recheck_cycle_under_lock",
+        ),
+        (
+            "FederationDirectory",
+            "attach_attestation_pqc_signature",
+            "attach_attestation_pqc_planned",
+        ),
+        (
+            "FederationDirectory",
+            "attestation_upsert_local",
+            "write_local_attestation_planned",
+        ),
+        (
+            "FederationDirectory",
+            "attestation_insert_local",
+            "write_local_attestation_planned",
+        ),
+        (
+            "FederationDirectory",
+            "reseal_attestation_v31",
+            "reseal_attestation_planned",
+        ),
+        // The executor's re-ask inside its write step.
+        ("AttestationStore", "store_planned_reseal", "sealed_over"),
+        (
+            "FederationDirectory",
+            "purge_attestation_v31",
+            "purge_attestation_planned",
+        ),
+        (
+            "FederationDirectory",
+            "purge_genesis_delegation_row_v31",
+            "purge_genesis_delegation_row_planned",
+        ),
     ];
 
     /// Combinators that pass their receiver's failure through unchanged. The
@@ -1115,6 +1265,11 @@ mod tests {
     /// `check_revocation_anti_rollback_sqlite` and `..._postgres` are ONE
     /// logical gate whose "find the newest stored row" half is per-substrate.
     const SUBSTRATE_SUFFIXES: [&str; 5] = ["_memory", "_sqlite", "_postgres", "_pg", "_mem"];
+
+    /// The prefix a [`Class::Plan`] call contributes to a door's sequence:
+    /// the decision is the shared plan's, so the door's token NAMES the plan
+    /// rather than inlining its gates (which would read as "identical x3").
+    const PLAN_TOKEN: &str = "plan:";
 
     /// How deep a [`Class::Delegates`] call is followed.
     const INLINE_DEPTH: usize = 2;
@@ -1360,12 +1515,13 @@ mod tests {
         for (call, close) in &raw {
             let mut propagates = false;
             let tail = text[close + 1..].trim_start();
-            if tail.starts_with('?') {
+            if tail.starts_with('?') || is_body_tail(tail, call) {
                 propagates = true;
             } else if let Some(rest) = tail.strip_prefix('.') {
                 let rest = rest.trim_start();
                 if let Some(after_await) = rest.strip_prefix("await") {
-                    propagates = after_await.trim_start().starts_with('?');
+                    let after_await = after_await.trim_start();
+                    propagates = after_await.starts_with('?') || is_body_tail(after_await, call);
                 }
             }
             if !propagates {
@@ -1406,6 +1562,32 @@ mod tests {
         }
         out.sort_by_key(|c| c.at);
         out
+    }
+
+    /// v56.0.0 (CIRISPersist#934) — **the fifth propagating form: the body's
+    /// tail expression.** `f(..)` or `f(..).await` standing last in the door
+    /// IS the door's result, so its failure is the door's failure. The four
+    /// `?`-shaped forms missed it, which made a door that delegates its whole
+    /// body to a helper — `attestation_upsert_local` →
+    /// `sqlite_write_local_attestation(input, true).await` — read as
+    /// `gateless` on all three backends while its helper ran fourteen gates.
+    ///
+    /// Only a call this alphabet already CLASSIFIES counts in tail position.
+    /// Counting every tail call surfaced 236 helpers and iterator adapters
+    /// (`collect`, `clone`, row mappers) that no gate had ever needed named;
+    /// classifying them is the scanner's own burndown, not this cut's. A door
+    /// whose tail call is a gate, a delegating helper or a shared plan is what
+    /// the blind spot hid, and that is what this form now sees.
+    ///
+    /// Plumbing — `map_err` among it — does not count in tail position: a
+    /// transparent combinator there would walk back to whatever receiver it
+    /// wraps, and plumbing cannot refuse the caller's input anyway.
+    fn is_body_tail(rest: &str, call: &Call) -> bool {
+        rest.trim() == "}"
+            && matches!(
+                classify(&call.name),
+                Some(Class::Gate | Class::Delegates | Class::Plan)
+            )
     }
 
     /// For `EXPR.combinator(..)`, the close paren of `EXPR`'s own call, if it
@@ -1568,6 +1750,7 @@ mod tests {
                     seq.push(tok);
                 }
                 Some(Class::Plumbing) => {}
+                Some(Class::Plan) => seq.push(format!("{PLAN_TOKEN}{}", call.name)),
                 Some(Class::Delegates) => {
                     if depth == 0 || seen.contains(&call.name) {
                         continue;
@@ -1611,6 +1794,8 @@ mod tests {
         unclassified: Vec<(String, String, usize)>,
         /// Every classified name actually seen, for the staleness half.
         seen_classes: BTreeSet<String>,
+        /// [`SHARED_PLANS`] fn name -> its gate sequence.
+        plans: BTreeMap<String, Vec<String>>,
     }
 
     fn scan() -> Scan {
@@ -1689,12 +1874,32 @@ mod tests {
             }
         }
 
+        let mut plans: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for (rel, name) in SHARED_PLANS {
+            let stripped = strip_file(&read(rel));
+            let index = index_functions(&stripped);
+            let &(a, b) = index
+                .get(name)
+                .and_then(|r| r.first())
+                .unwrap_or_else(|| panic!("shared plan `{name}` not found in {rel}"));
+            let mut seen = BTreeSet::new();
+            seen.insert(name.to_owned());
+            let mut collected = Collected::default();
+            let seq = gate_sequence(&stripped, a, b, &index, INLINE_DEPTH, &seen, &mut collected);
+            for (n, line) in collected.unclassified {
+                unclassified.push((format!("shared plan {rel}"), n, line));
+            }
+            seen_classes.extend(collected.used);
+            plans.insert(name.to_owned(), seq);
+        }
+
         Scan {
             doors,
             implements,
             defaults,
             unclassified,
             seen_classes,
+            plans,
         }
     }
 
@@ -1941,7 +2146,8 @@ mod tests {
             .values()
             .flat_map(|m| m.values())
             .map(|(s, _)| s.len())
-            .sum();
+            .sum::<usize>()
+            + scan.plans.values().map(Vec::len).sum::<usize>();
         assert!(
             total > 300,
             "only {total} gate calls found across all backends — the call lexer stopped matching"
@@ -1965,26 +2171,20 @@ mod tests {
         .iter()
         .map(|p| p.join("_"))
         .collect();
-        for (backend, _) in BACKENDS {
-            let seq = &scan
-                .doors
-                .get(&(
-                    "FederationDirectory".to_owned(),
-                    // v41.0.0 (#804) — the stored-write door carries its origin
-                    // now; `put_attestation` is a thin default over it, so the
-                    // gate SEQUENCE lives here.
-                    ["put", "attestation", "with", "origin"].join("_"),
-                ))
-                .expect("put_attestation_with_origin is scanned")[backend]
-                .0;
-            let mut it = seq.iter();
-            for needle in &must_contain {
-                assert!(
-                    it.any(|g| g == needle),
-                    "put_attestation on `{backend}` no longer shows `{needle}` in order — either \
-                     the door lost a gate or the scanner stopped seeing it. Sequence: {seq:?}"
-                );
-            }
+        // v56.0.0 (CIRISPersist#934) — the sequence lives in ONE place now:
+        // the shared plan every backend's `put_attestation_with_origin` calls
+        // (v41.0.0 #804: `put_attestation` is a thin default over that door).
+        let seq = scan
+            .plans
+            .get(&["put", "attestation", "planned"].join("_"))
+            .expect("the shared attestation plan is scanned");
+        let mut it = seq.iter();
+        for needle in &must_contain {
+            assert!(
+                it.any(|g| g == needle),
+                "the shared put_attestation plan no longer shows `{needle}` in order — either \
+                 the plan lost a gate or the scanner stopped seeing it. Sequence: {seq:?}"
+            );
         }
     }
 
@@ -2159,5 +2359,346 @@ mod tests {
                  partition — pin the count or the second copy is invisible."
             );
         }
+    }
+
+    /// v56.0.0 (CIRISPersist#934 step 1; the CIRISConstitution review's
+    /// condition one) — which of the plan's two named instants
+    /// ([`PlanInstants`](crate::federation::attestation_admit::PlanInstants))
+    /// a call inside a shared plan receives.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+    enum Reads {
+        /// The row's signed instant: a fold over other rows.
+        FoldAt,
+        /// The receiver's clock at the door: a receipt bound, or a fold that
+        /// read the clock before #934 (a #1049 candidate).
+        ReceivedAt,
+        /// Both: judged at receipt AND at the signed instant.
+        Both,
+    }
+
+    /// v56.0.0 — **every time-dependent call in a shared plan, and the instant
+    /// it is given**: `(plan fn, callee, instant)`. A call whose arguments name
+    /// neither instant reads neither (it reads only the row, or no time at
+    /// all). [`every_plan_call_reads_its_declared_instant`] derives the same
+    /// table from the plan bodies and fails on any difference, so a gate that
+    /// moves from one instant to the other (#1049) moves a row here, and the CC
+    /// register can point at the row.
+    const PLAN_INSTANTS: &[(&str, &str, Reads)] = &[
+        // Receipt bounds (CC 2.6.7 W; the future-skew sanity bound).
+        (
+            "plan_put_attestation",
+            "check_instant_binding",
+            Reads::ReceivedAt,
+        ),
+        (
+            "plan_put_attestation",
+            "check_attach_freshness",
+            Reads::ReceivedAt,
+        ),
+        // Folds that read the clock before #934 and still read receipt
+        // (unchanged behaviour; #1049 candidates).
+        (
+            "plan_put_attestation",
+            "check_capacity_consent_admission",
+            Reads::ReceivedAt,
+        ),
+        (
+            "plan_put_attestation",
+            "check_delegation_cycle_admission",
+            Reads::ReceivedAt,
+        ),
+        (
+            "plan_put_attestation",
+            "check_trust_charter_admission",
+            Reads::ReceivedAt,
+        ),
+        (
+            "plan_put_attestation",
+            "check_peer_deadmission",
+            Reads::ReceivedAt,
+        ),
+        // Judged at both instants (#1032/#1049's licensure reading).
+        (
+            "plan_put_attestation",
+            "check_licensure_delegator_is_authority",
+            Reads::Both,
+        ),
+        // Folded at the signed instant (CC 3.3.1: owner at the grant's instant).
+        (
+            "plan_put_attestation",
+            "check_community_trust_grant_admission",
+            Reads::FoldAt,
+        ),
+        // The executor's re-ask under its lock: the same instant as the plan's.
+        (
+            "recheck_cycle_under_lock",
+            "check_delegation_cycle_admission",
+            Reads::ReceivedAt,
+        ),
+        // The hybrid completion stamps the receipt instant into the row.
+        (
+            "plan_attach_attestation_pqc_signature",
+            "Some",
+            Reads::ReceivedAt,
+        ),
+        // The local door mints the row's instant from the receipt clock (or the
+        // signed envelope), and every gate it ran read the receipt clock.
+        (
+            "plan_write_local_attestation",
+            "check_trust_charter_admission",
+            Reads::ReceivedAt,
+        ),
+        (
+            "plan_write_local_attestation",
+            "check_attach_freshness",
+            Reads::ReceivedAt,
+        ),
+        (
+            "plan_write_local_attestation",
+            "local_row_instant",
+            Reads::ReceivedAt,
+        ),
+        (
+            "plan_write_local_attestation",
+            "check_instant_binding",
+            Reads::ReceivedAt,
+        ),
+        // The re-seal's shape gate read the receipt clock (its skew bound).
+        (
+            "plan_reseal_attestation",
+            "check_reseal_admission",
+            Reads::ReceivedAt,
+        ),
+        ("sealed_over", "check_reseal_admission", Reads::ReceivedAt),
+    ];
+
+    /// The plan fns [`PLAN_INSTANTS`] covers, in `src/federation/attestation_admit.rs`.
+    const INSTANT_PLANS: [&str; 6] = [
+        "plan_put_attestation",
+        "recheck_cycle_under_lock",
+        "plan_attach_attestation_pqc_signature",
+        "plan_write_local_attestation",
+        "plan_reseal_attestation",
+        "sealed_over",
+    ];
+
+    /// For every mention of `word` in `body`, the innermost CALL it is an
+    /// argument of: walk back to the unmatched `(` and read the identifier
+    /// before it. A mention inside an unmatched `{` first (a struct literal)
+    /// is not a call argument.
+    fn callees_receiving(body: &str, word: &str) -> BTreeSet<String> {
+        let b = body.as_bytes();
+        let is_ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+        let mut out = BTreeSet::new();
+        let mut from = 0usize;
+        while let Some(p) = body[from..].find(word) {
+            let at = from + p;
+            from = at + word.len();
+            let before_ok = at == 0 || !is_ident(b[at - 1]);
+            let after_ok = from >= b.len() || !is_ident(b[from]);
+            if !before_ok || !after_ok {
+                continue;
+            }
+            let (mut paren, mut brace) = (0i32, 0i32);
+            let mut k = at;
+            while k > 0 {
+                k -= 1;
+                match b[k] {
+                    b')' => paren += 1,
+                    b'}' => brace += 1,
+                    b'{' if brace == 0 => break,
+                    b'{' => brace -= 1,
+                    b'(' if paren == 0 => {
+                        let mut e = k;
+                        while e > 0 && b[e - 1].is_ascii_whitespace() {
+                            e -= 1;
+                        }
+                        let mut s = e;
+                        while s > 0 && is_ident(b[s - 1]) {
+                            s -= 1;
+                        }
+                        if s < e {
+                            out.insert(body[s..e].to_owned());
+                        }
+                        break;
+                    }
+                    b'(' => paren -= 1,
+                    _ => {}
+                }
+            }
+        }
+        out
+    }
+
+    /// v56.0.0 (CIRISPersist#934 step 1) — **each time-dependent call in a
+    /// shared plan receives the instant [`PLAN_INSTANTS`] says, and no plan
+    /// reads the clock.** Prints the table it derived (the per-gate instant
+    /// column of the #934 inventory).
+    #[test]
+    fn every_plan_call_reads_its_declared_instant() {
+        let rel = "src/federation/attestation_admit.rs";
+        let stripped = strip_file(&read(rel));
+        let index = index_functions(&stripped);
+        let mut derived: BTreeSet<(String, String, Reads)> = BTreeSet::new();
+        for plan in INSTANT_PLANS {
+            let &(a, b) = index
+                .get(plan)
+                .and_then(|r| r.first())
+                .unwrap_or_else(|| panic!("plan `{plan}` not found in {rel}"));
+            let whole = stripped[a..=b].join("\n");
+            // The body only: a parameter named for an instant is not a call.
+            let body = &whole[whole.find('{').map_or(0, |i| i + 1)..];
+            assert!(
+                !body.contains("Utc::now"),
+                "`{plan}` reads the clock: a plan takes its instants as inputs (#934)"
+            );
+            let fold = callees_receiving(body, "fold_at");
+            let recv = callees_receiving(body, "received_at");
+            for c in fold.union(&recv) {
+                let reads = match (fold.contains(c), recv.contains(c)) {
+                    (true, true) => Reads::Both,
+                    (true, false) => Reads::FoldAt,
+                    _ => Reads::ReceivedAt,
+                };
+                derived.insert((plan.to_owned(), c.clone(), reads));
+            }
+        }
+        for (plan, callee, reads) in &derived {
+            eprintln!("{plan:<40} {callee:<44} {reads:?}");
+        }
+        let declared: BTreeSet<(String, String, Reads)> = PLAN_INSTANTS
+            .iter()
+            .map(|(p, c, r)| ((*p).to_owned(), (*c).to_owned(), *r))
+            .collect();
+        let extra: Vec<_> = derived.difference(&declared).collect();
+        let missing: Vec<_> = declared.difference(&derived).collect();
+        assert!(
+            extra.is_empty() && missing.is_empty(),
+            "PLAN_INSTANTS disagrees with the plans: undeclared {extra:?}; declared but not \
+             found {missing:?}. A gate that changes instant moves its row (#1049)."
+        );
+    }
+
+    /// v56.0.0 (CIRISPersist#934 step 1) — **a shared door stays shared.**
+    /// Every [`SHARED_DOORS`] row's door is exactly `plan:<plan>` on every
+    /// backend; every `plan:` token anywhere names a [`SHARED_PLANS`] body;
+    /// and every shared plan runs at least one gate (a plan the scanner reads
+    /// as empty would make every door that calls it read as decided).
+    #[test]
+    fn shared_doors_decide_nothing_in_a_backend() {
+        let scan = scan();
+        let mut failures = Vec::new();
+        for (trait_name, method, plan) in SHARED_DOORS {
+            let want = vec![format!("{PLAN_TOKEN}{plan}")];
+            let per_backend = scan
+                .doors
+                .get(&(trait_name.to_owned(), method.to_owned()))
+                .unwrap_or_else(|| {
+                    panic!("SHARED_DOORS names {trait_name}::{method}, not scanned")
+                });
+            for (backend, _) in BACKENDS {
+                if !scan
+                    .implements
+                    .get(backend)
+                    .is_some_and(|t| t.contains(trait_name))
+                {
+                    continue;
+                }
+                match per_backend.get(backend) {
+                    Some((seq, line)) if *seq != want => failures.push(format!(
+                        "{trait_name}::{method} on `{backend}` (line {line}) runs {seq:?}, not \
+                         {want:?}: a decision moved back into the backend"
+                    )),
+                    None => failures.push(format!(
+                        "{trait_name}::{method} has no `{backend}` impl to scan"
+                    )),
+                    Some(_) => {}
+                }
+            }
+        }
+        let planned: BTreeSet<&str> = SHARED_PLANS.iter().map(|(_, n)| *n).collect();
+        for per_backend in scan.doors.values() {
+            for (seq, _) in per_backend.values() {
+                for t in seq {
+                    if let Some(p) = t.strip_prefix(PLAN_TOKEN) {
+                        if !planned.contains(p) {
+                            failures.push(format!("`{t}` names no SHARED_PLANS body"));
+                        }
+                    }
+                }
+            }
+        }
+        for (name, seq) in &scan.plans {
+            if !seq.iter().any(|t| !t.starts_with(PLAN_TOKEN)) {
+                failures.push(format!("shared plan `{name}` reads as running no gate"));
+            }
+        }
+        failures.sort();
+        failures.dedup();
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// v56.0.0 (CIRISPersist#934 step 1) — **the door report**: one line per
+    /// door saying WHERE its decision lives, the question #934 asks of every
+    /// door. A report, not a gate: [`every_backend_runs_the_same_gates_in_the_same_order`]
+    /// and [`shared_doors_decide_nothing_in_a_backend`] are the gates. Run with
+    /// `cargo test --lib store::parity::tests::door_report -- --ignored --nocapture`.
+    ///
+    /// - `shared` — every backend's door is a call into a shared plan and runs
+    ///   no gate of its own (the #934 target shape);
+    /// - `identical xN (k gates)` — the decision is written N times, byte-equal
+    ///   by this scan (the #670 state, the triplication #934 removes);
+    /// - `declared` — a [`DECLARED_DIVERGENCES`] row pins one backend's shape;
+    /// - `gateless` — no backend runs a gate in this door.
+    #[test]
+    #[ignore = "report: run with --ignored --nocapture"]
+    fn door_report() {
+        let scan = scan();
+        let filter = std::env::var("PARITY_DOOR_FILTER").unwrap_or_default();
+        for ((trait_name, method), per_backend) in &scan.doors {
+            if !filter.is_empty() && !method.contains(&filter) {
+                continue;
+            }
+            let seqs: Vec<(&str, &Vec<String>)> = BACKENDS
+                .iter()
+                .filter_map(|(b, _)| per_backend.get(*b).map(|(s, _)| (*b, s)))
+                .collect();
+            let verdict = door_verdict(trait_name, method, &seqs);
+            eprintln!("{trait_name}::{method:<52} {verdict}");
+            for (b, s) in &seqs {
+                if !s.is_empty() {
+                    eprintln!("    {b:<8} {s:?}");
+                }
+            }
+        }
+    }
+
+    /// The one-word answer [`door_report`] prints for a door.
+    fn door_verdict(trait_name: &str, method: &str, seqs: &[(&str, &Vec<String>)]) -> String {
+        if seqs
+            .iter()
+            .any(|(b, _)| declared(trait_name, method, b).is_some())
+        {
+            return "declared".to_owned();
+        }
+        if seqs.iter().all(|(_, s)| s.is_empty()) {
+            return "gateless".to_owned();
+        }
+        if seqs
+            .iter()
+            .all(|(_, s)| !s.is_empty() && s.iter().all(|t| t.starts_with(PLAN_TOKEN)))
+        {
+            return "shared".to_owned();
+        }
+        let distinct: BTreeSet<&Vec<String>> = seqs.iter().map(|(_, s)| *s).collect();
+        if distinct.len() == 1 {
+            let gates = seqs[0]
+                .1
+                .iter()
+                .filter(|t| !t.starts_with(PLAN_TOKEN))
+                .count();
+            return format!("identical x{} ({gates} gates)", seqs.len());
+        }
+        "DIVERGENT".to_owned()
     }
 }

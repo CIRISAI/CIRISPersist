@@ -45,6 +45,10 @@ pub mod adopt_cascade;
 pub mod affiliation_config;
 pub mod age;
 pub mod at_rest_cascade;
+/// v56.0.0 (CIRISPersist#934 step 1) — the attestation plane's stored write,
+/// decided once: `plan_put_attestation` + the per-backend `AttestationStore`
+/// executor.
+pub(crate) mod attestation_admit;
 /// v36.0.0 (CIRISPersist#624) — the typed, pre-write replicated
 /// ATTESTATION-plane apply (`AttestationRefusalReason` /
 /// `ReplicatedAttestationOutcome`): the Key plane's #565 twin.
@@ -216,14 +220,26 @@ mod retraction_invariants;
 /// cohort and the typed config record (I592–I594).
 #[cfg(test)]
 pub mod affiliation_invariants;
+/// v56.0.0 (CIRISPersist#934 step 1) — the shared attestation plan judges at
+/// the instant it is given (I950).
+#[cfg(test)]
+pub(crate) mod attestation_admit_invariants;
 /// v54.0.0 (CIRISPersist#1031, CC 4.1.1) — the cycle-closing `delegates_to`
 /// is refused at admission (I590).
 #[cfg(test)]
 pub mod delegation_cycle_invariants;
+/// v56.0.0 (CIRISPersist#934 step 1, door 6) — the genesis re-bake purge
+/// door refuses, at the store, an id the bundle does not carry (I954).
+#[cfg(test)]
+pub(crate) mod genesis_purge_door_invariants;
 /// v54.0.0 (CIRISPersist#1033, CC 2.4.1.2.1) — the `grant` scope admits its
 /// holder (I591).
 #[cfg(test)]
 pub mod grant_scope_invariants;
+/// v56.0.0 (CIRISPersist#934 step 1) — the local write door's occupied-id
+/// divergence across backends, pinned (I951).
+#[cfg(test)]
+pub(crate) mod local_door_divergence_invariants;
 /// CIRISPersist#972 — I335–I339, a node is seated without an acceptance.
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod node_seat_invariants;
@@ -252,6 +268,10 @@ mod remint_invariants;
 /// custody report under the data a DAG was sealed with.
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod repair_invariants;
+/// v56.0.0 (CIRISPersist#934 step 1, door 4) — a re-seal judges the row it
+/// overwrites (I953).
+#[cfg(test)]
+pub(crate) mod reseal_race_invariants;
 #[cfg(test)]
 pub mod room_roster_authority_invariants;
 /// v48.0.0 (CIRISPersist#860) — the room-roster planes witnesses.
@@ -2345,7 +2365,11 @@ pub(crate) fn owner_binding_of(row: &Attestation) -> Option<(String, String)> {
 /// here (the next write rolls the epochs the node held). A lookup that fails
 /// is logged and treated as no change: the row stands, and the pending sweep
 /// is where a missed re-wrap is retried.
-#[cfg(any(feature = "sqlite", feature = "postgres"))]
+///
+/// v56.0.0 (CIRISPersist#934) — no longer feature-gated: the shared
+/// attestation door (`attestation_admit::put_attestation_planned`) asks it on
+/// every backend. Memory's re-wrap is the trait's no-op default, so a memory
+/// store observes the same outcome it did when it never asked.
 pub(crate) async fn consent_list_change_of<F>(
     directory: &F,
     row: &Attestation,
@@ -9950,6 +9974,31 @@ pub enum Error {
         reason: String,
     },
 
+    /// v56.0.0 (CIRISPersist#934 step 1, door 2) — a local upsert
+    /// (`attestation_upsert_local`) named an `attestation_id` held by a row it
+    /// does not replace: a row of another dimension, another attester, or the
+    /// federation tier. An upsert replaces only its own `(attester, dimension)`
+    /// local row. Refused with nothing written and nothing deleted. Before
+    /// v56.0.0 memory returned the id without writing, and sqlite and postgres
+    /// deleted the upsert's own row and stored nothing (I951). Stable `kind()`
+    /// token `federation_local_attestation_id_occupied`; Python `ValueError`,
+    /// the type of the local door's `InvalidArgument` refusals.
+    #[error(
+        "local attestation_id {attestation_id} is held by a row this upsert does not replace \
+         (attester {held_attesting_key_id}, dimension {held_dimension:?}, tier {held_tier}): \
+         an upsert replaces only its own (attester, dimension) local row"
+    )]
+    LocalAttestationIdOccupied {
+        /// The id the caller chose.
+        attestation_id: String,
+        /// The held row's attester.
+        held_attesting_key_id: String,
+        /// The held row's envelope dimension, if it carries one.
+        held_dimension: Option<String>,
+        /// The held row's tier.
+        held_tier: String,
+    },
+
     /// Row would conflict with an existing row whose content differs.
     /// Idempotent re-submission of the *same* content is OK; this
     /// fires only when the caller is overwriting.
@@ -12160,6 +12209,7 @@ impl Error {
             Error::ConsentGateRefused(_) => "federation_consent_gate_refused",
             Error::ConsentScopeTokenInvalid { .. } => "federation_consent_scope_token_invalid",
             Error::MediaSourceInvalid { .. } => "federation_media_source_invalid",
+            Error::LocalAttestationIdOccupied { .. } => "federation_local_attestation_id_occupied",
             Error::Conflict(_) => "federation_conflict",
             Error::AdminActionUnattributed { .. } => "federation_admin_action_unattributed",
             Error::RevocationBoundInvalid { .. } => "federation_revocation_bound_invalid",

@@ -13,3 +13,4 @@ files:
   - src/store/postgres.rs
   - src/store/memory.rs
   - src/federation/admission.rs
+  - src/federation/attestation_admit.rs

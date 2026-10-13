@@ -459,16 +459,13 @@ mod pure {
             ("postgres", include_str!("../store/postgres.rs")),
         ] {
             let s = strip(src);
+            // v56.0.0 (CIRISPersist#934 step 1) — the put door is a call into
+            // the shared attestation plan; the binding and the row-type gate
+            // are read there, once, below.
             let put = body(&s, "async fn put_attestation_with_origin(");
-            let bind = "crate::federation::admission::check_row_column_binding(&row)?;";
-            let gate = "crate::federation::row_type::admit_row_type(&row)?;";
-            let after_bind = put
-                .split(bind)
-                .nth(1)
-                .unwrap_or_else(|| panic!("{name}: the put door binds the row"));
             assert!(
-                after_bind.trim_start().starts_with(gate),
-                "{name}: the row-type gate must sit IMMEDIATELY after the binding (#975)"
+                put.contains("attestation_admit::put_attestation_planned("),
+                "{name}: the put door is the shared attestation door"
             );
             for read in [
                 "async fn list_attestations_since(",
@@ -482,6 +479,18 @@ mod pure {
                 );
             }
         }
+        let admit = strip(include_str!("attestation_admit.rs"));
+        let plan = body(&admit, "pub(crate) async fn plan_put_attestation<");
+        let bind = "crate::federation::admission::check_row_column_binding(&row)?;";
+        let gate = "crate::federation::row_type::admit_row_type(&row)?;";
+        let after_bind = plan
+            .split(bind)
+            .nth(1)
+            .unwrap_or_else(|| panic!("the shared put plan binds the row"));
+        assert!(
+            after_bind.trim_start().starts_with(gate),
+            "the row-type gate must sit IMMEDIATELY after the binding (#975)"
+        );
         let adm = strip(include_str!("admission.rs"));
         let promo = body(&adm, "pub async fn check_promotion_admission(");
         assert!(

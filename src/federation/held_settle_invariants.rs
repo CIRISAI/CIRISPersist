@@ -541,6 +541,17 @@ mod from_disk {
             let src = std::fs::read_to_string(format!("{root}/src/store/{backend}.rs")).unwrap();
             for (kind, door) in DOORS {
                 let body = body_lines(&src, door);
+                // v56.0.0 (CIRISPersist#934 step 1) — the attestation door's
+                // decision is the shared plan, read once below; each backend's
+                // door is a call into it.
+                if *kind == EnvelopeKind::Attestation {
+                    assert!(
+                        body.join(" ")
+                            .contains("attestation_admit::put_attestation_planned("),
+                        "I235: {backend}::{door} is not the shared attestation door"
+                    );
+                    continue;
+                }
                 let settle = format!(
                     "crate::federation::replication_policy::EnvelopeKind::{}",
                     kind.as_str()
@@ -554,25 +565,42 @@ mod from_disk {
                     stmt.contains(&settle),
                     "I235: {backend}::{door} settles under the wrong kind: {stmt}"
                 );
-                if *kind == EnvelopeKind::Attestation {
-                    let quota = joined
-                        .find("peer_write_quota")
-                        .unwrap_or_else(|| panic!("I235: {backend}::{door} has no quota"));
-                    assert!(
-                        at < quota,
-                        "I235: {backend}::{door} settles AFTER the per-peer quota"
-                    );
-                } else {
-                    assert!(
-                        body[0].starts_with(
-                            "if crate::federation::replication_policy::settle_if_held("
-                        ),
-                        "I235: {backend}::{door}'s first statement must be the settle, got `{}`",
-                        body[0]
-                    );
-                }
+                assert!(
+                    body[0]
+                        .starts_with("if crate::federation::replication_policy::settle_if_held("),
+                    "I235: {backend}::{door}'s first statement must be the settle, got `{}`",
+                    body[0]
+                );
             }
         }
+        // The shared attestation plan: it settles under the Attestation kind,
+        // ahead of the per-peer quota.
+        let admit =
+            std::fs::read_to_string(format!("{root}/src/federation/attestation_admit.rs")).unwrap();
+        let start = admit
+            .find("pub(crate) async fn plan_put_attestation<")
+            .expect("I235: the shared attestation plan");
+        let plan = &admit[start..];
+        let plan: String = plan[..plan.find("\n}\n").unwrap_or(plan.len())]
+            .lines()
+            .map(|l| l.split("//").next().unwrap_or("").trim())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let at = plan
+            .find("replication_policy::settle_if_held(")
+            .expect("I235: the shared attestation plan never settles");
+        let stmt = &plan[at..plan[at..].find('}').map_or(plan.len(), |e| at + e)];
+        assert!(
+            stmt.contains("replication_policy::EnvelopeKind::Attestation"),
+            "I235: the shared attestation plan settles under the wrong kind: {stmt}"
+        );
+        let quota = plan
+            .find("cx.quota.check_write")
+            .expect("I235: the shared attestation plan has no quota");
+        assert!(
+            at < quota,
+            "I235: the shared attestation plan settles AFTER the per-peer quota"
+        );
     }
 }
 

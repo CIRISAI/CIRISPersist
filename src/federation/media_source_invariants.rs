@@ -993,10 +993,14 @@ mod run {
         const MEM: &str = include_str!("../store/memory.rs");
         const ADMISSION: &str = include_str!("admission.rs");
         const ENVELOPE: &str = include_str!("envelope.rs");
+        // v56.0.0 (CIRISPersist#934 step 1) — the ingest door's gate lives in
+        // the shared attestation plan, once; each backend's
+        // `put_attestation_with_origin` is a call into it (held there by
+        // `store::parity::shared_doors_decide_nothing_in_a_backend`). The local
+        // door's plan (door 2) runs it there too: two calls, one file.
+        const ADMIT: &str = include_str!("attestation_admit.rs");
         for (name, text, n) in [
-            ("sqlite.rs", SQLITE, 2),
-            ("postgres.rs", PG, 2),
-            ("memory.rs", MEM, 2),
+            ("attestation_admit.rs", ADMIT, 2),
             ("admission.rs", ADMISSION, 1),
         ] {
             // Comment lines do not count: a commented-out call is not a door
@@ -1008,6 +1012,22 @@ mod run {
                 calls >= n,
                 "I119: {name} runs the media gate at its doors ({calls} < {n})"
             );
+        }
+        // Every backend's ingest and local doors are the shared doors.
+        for (name, text) in [
+            ("sqlite.rs", SQLITE),
+            ("postgres.rs", PG),
+            ("memory.rs", MEM),
+        ] {
+            for door in [
+                "attestation_admit::put_attestation_planned(",
+                "attestation_admit::write_local_attestation_planned(",
+            ] {
+                assert!(
+                    text.contains(door),
+                    "I119: {name}'s attestation door is not the shared `{door}`"
+                );
+            }
         }
         assert!(
             ENVELOPE.contains("paths::MEDIA,"),

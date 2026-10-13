@@ -3826,19 +3826,34 @@ mod run {
     #[test]
     fn i661_every_backend_door_carries_the_purge_gates() {
         let root = env!("CARGO_MANIFEST_DIR");
+        let admit = strip(
+            &std::fs::read_to_string(format!("{root}/src/federation/attestation_admit.rs"))
+                .unwrap(),
+        );
+        let start = admit
+            .find("pub(crate) async fn plan_put_attestation<")
+            .expect("I661: the shared attestation plan");
+        let plan = &admit[start..];
+        let plan = &plan[..plan.find("\n}\n").unwrap_or(plan.len())];
+        for gate in [
+            "steward_purge::refuse_if_tombstoned_attestation(dir, &row).await?",
+            "steward_purge::refuse_mock_trace_attestation(&row)?",
+        ] {
+            assert!(
+                plan.contains(gate),
+                "I661: the shared attestation plan carries {gate}"
+            );
+        }
         for backend in ["memory", "sqlite", "postgres"] {
             let src =
                 strip(&std::fs::read_to_string(format!("{root}/src/store/{backend}.rs")).unwrap());
+            // v56.0.0 (CIRISPersist#934 step 1) — the attestation put is a call
+            // into the shared plan, which carries both gates (read below).
             let put = body(&src, "async fn put_attestation_with_origin(");
-            for gate in [
-                "steward_purge::refuse_if_tombstoned_attestation(self, &row).await?",
-                "steward_purge::refuse_mock_trace_attestation(&row)?",
-            ] {
-                assert!(
-                    put.contains(gate),
-                    "I661 {backend}: the attestation put carries {gate}"
-                );
-            }
+            assert!(
+                put.contains("attestation_admit::put_attestation_planned("),
+                "I661 {backend}: the attestation put is the shared attestation door"
+            );
             for door in [
                 "async fn put_public_key(",
                 "async fn apply_replicated_key_record(",

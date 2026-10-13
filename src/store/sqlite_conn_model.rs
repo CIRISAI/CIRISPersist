@@ -251,7 +251,6 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("aggregate_scoring_factors_rollup_batch", ConnClass::Read),
     ("aggregate_scoring_factors_uncached", ConnClass::Read),
     ("aggregate_scrub_stats", ConnClass::Read),
-    ("attach_attestation_pqc_signature", ConnClass::Write),
     ("attach_key_pqc_signature", ConnClass::Write),
     ("attach_revocation_pqc_signature", ConnClass::Write),
     // v53.0.0 (#975) — the row-type census: one GROUP BY, read-only.
@@ -533,8 +532,6 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("peer_metadata_for", ConnClass::Read),
     ("pinned_blob_bytes", ConnClass::Read),
     ("purge_attestation_projections", ConnClass::Write),
-    ("purge_attestation_v31", ConnClass::Write),
-    ("purge_genesis_delegation_row_v31", ConnClass::Write),
     ("put_accord_decision", ConnClass::Write),
     ("put_accord_participation", ConnClass::Write),
     ("put_accord_proposal", ConnClass::Write),
@@ -567,7 +564,6 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("key_grant_pending_put", ConnClass::Write),
     ("key_grant_pending_list", ConnClass::Read),
     ("key_grant_pending_delete", ConnClass::Write),
-    ("put_attestation_with_origin", ConnClass::Write),
     // v52.0.0 (#957) — the chunk floor's ONE body, batched: ONE write
     // transaction for a run of chunks. `put_blob_chunk_floor` is its batch of
     // one and touches no connection; `put_blob_chunk_with_scope`,
@@ -696,7 +692,6 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     // schema-history table, run before refinery validates it.
     ("repair_v070_checksum", ConnClass::Write),
     ("replay_abandoned", ConnClass::Write),
-    ("reseal_attestation_v31", ConnClass::Write),
     ("resolve_scores", ConnClass::Read),
     ("retire_goal", ConnClass::Write),
     ("revocations_for_subject", ConnClass::Read),
@@ -734,7 +729,19 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("sqlite_upsert_wire_index", ConnClass::HelperWrite),
     // v55.0.0 (CIRISPersist#989) — the three claim doors' shared INSERT.
     ("sqlite_insert_holding_claim", ConnClass::HelperWrite),
-    ("sqlite_write_local_attestation", ConnClass::Write),
+    ("store_planned_local_attestation", ConnClass::Write),
+    // v56.0.0 (CIRISPersist#934 step 1) — the attestation plane's executor
+    // (`AttestationStore`): its two reads and its writes. The doors that held
+    // these statements (`put_attestation_with_origin`,
+    // `attach_attestation_pqc_signature`, `sqlite_write_local_attestation`) are
+    // calls into the shared plans now and touch no connection.
+    ("attesting_identity_type", ConnClass::Read),
+    ("composer_replay_held", ConnClass::Read),
+    ("delete_attestation", ConnClass::Write),
+    ("repair_withdraws_depth", ConnClass::Write),
+    ("store_pqc_completion", ConnClass::Write),
+    ("store_planned_attestation", ConnClass::Write),
+    ("store_planned_reseal", ConnClass::Write),
     ("store_blob_local", ConnClass::Write),
     ("stream_consistency_proof", ConnClass::Read),
     ("stream_inclusion_proof", ConnClass::Read),
