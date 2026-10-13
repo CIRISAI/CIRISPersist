@@ -909,21 +909,34 @@ threat-model citations because this crate's audit story is the point.
 Two findings are fixed here. The two plaintext-DAG input checks are deferred
 to #1072. The repeats are in #1070 and #1071, or were already fixed.
 
-- **The re-ack sweeper runs its first pass at spawn** (`engine.rs`, P2,
-  upgrade).
+- **The re-ack sweeper's first pass runs after a short start delay**
+  (`engine.rs`, P2, upgrade).
   - The bug: the auto-spawned sweeper slept an hour before its first pass.
     That pass carries the upgrade conversion of a v54 node's retired rc6
     holding claims, which v55's holder reads no longer count. So an upgraded
     node was undiscoverable for its first hour, and a node restarting more
     often than hourly never converted.
-  - The fix: one pass at spawn, then the interval.
+  - The fix: the first pass runs after `HOLDING_CLAIM_REACK_START_DELAY`
+    (90 s, next to the interval), then once every interval.
+    `Engine::spawn_reack_sweeper_with(start_delay, interval)` takes both.
+  - Why not t = 0: a pass at t = 0 would land on the announce cold-start and
+    the replication catch-up, and its own-claims read is unbounded until
+    #1071.
+  - The pass runs inside the spawned task, so the spawn returns at once and
+    boot never waits on it.
+  - No lock is held across the walk. Each read is its own short acquisition,
+    and the walk yields between rows.
+  - An error mid-pass is logged and the loop continues until `stop()`.
   - Class sweep of the other auto-spawned loops:
     - the disk-budget eviction sweeper also sleeps first, but its pass is
       budget relief, not upgrade or repair work, so it is unchanged;
     - the key-grant dirty loop already runs at boot;
     - the retention sweep and the takedown finalize are host-driven, not
       spawned.
-  - Witness: I803.
+  - Witness: I803. The spawn returns at once and a concurrent write
+    succeeds. There is no pass before the delay; the node is converted
+    shortly after it; and a claim seeded after the first pass waits for the
+    next tick.
 - **The room retention sweep never orphans a retained DAG manifest**
   (`community_dek.rs`, P1, data loss).
   - The bug: the room-stream leg could evict every chunk of a stream epoch
