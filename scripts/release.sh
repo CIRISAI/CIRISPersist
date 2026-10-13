@@ -2,7 +2,7 @@
 # release.sh — one command from a finished CHANGELOG section to a pushed tag,
 # with no agent in the loop between stages.
 #
-#   scripts/release.sh <version> [--pr-body FILE] [--merge-body FILE] [--subject TEXT] [--skip-codex]
+#   scripts/release.sh <version> [--pr-body FILE] [--merge-body FILE] [--subject TEXT] [--skip-codex] [--hold]
 #   scripts/release.sh --dry-run <version>
 #
 # Run from the release worktree, on the release branch, with the section
@@ -10,20 +10,26 @@
 #
 #   1 preflight   clean tree, branch is not `v<version>`, Cargo.toml at the
 #                 previous section's version, the UNRELEASED header present,
-#                 a gh with `gh attestation` (2.49+; GH=/path/to/gh) for stage 9
+#                 a gh with `gh attestation` (2.49+; GH=/path/to/gh) for stage 10
 #   2 cheap       the five no-backend axes, the pyo3 lane, both clippy passes,
 #                 pyi_surface — the legs certify most often goes red on late
 #   3 bump        Cargo version, evidence/cc_impl.tsv re-stamp (count
 #                 asserted), CHANGELOG date, `cargo check`, the release commit
 #   4 pr          push the branch, open (or reuse) the PR
-#   5 certify     `LANES=${LANES:-1} scripts/certify.sh full`, once no foreign
+#   5 codex       read Codex's review of HEAD if one exists and stop on any
+#                 finding — BEFORE the hour of certify is spent on a head a
+#                 finding will replace (v55.0.0: four rounds, each re-certified).
+#                 Never waits (CODEX_TIMEOUT_SECS, default 0: the subscription
+#                 ended 2026-10-13; the free tier reviews at random; >0 waits
+#                 that long). --skip-codex skips even the read
+#   6 certify     `LANES=${LANES:-1} scripts/certify.sh full`, once no foreign
 #                 cargo has run for 60 s (waits up to RELEASE_STRAY_WAIT_SECS)
-#   6 prci        wait for the PR's CI run green (auto-retry reruns respected)
-#   7 codex       wait (CODEX_TIMEOUT_SECS, default 30 min) for Codex's review of
-#                 HEAD; stop on any finding on HEAD; fail OPEN, loudly, if no
-#                 review arrives. --skip-codex skips it (operator override)
-#   8 ship        scripts/release_ship.sh → merge + tag, prints the tag run id
-#   9 stop        print the scripts/release_finish.sh command
+#   7 prci        wait for the PR's CI run green (auto-retry reruns respected)
+#   8 hold        with --hold: stop here, green, without merging — the tag
+#                 waits for an external report (Edge's re-gate of this head);
+#                 re-run without --hold and the state resumes at ship
+#   9 ship        scripts/release_ship.sh → merge + tag, prints the tag run id
+#  10 stop        print the scripts/release_finish.sh command
 #
 # RESUME: every completed stage writes `.release/<version>/<stage>.done`; a
 # re-run skips it. The state is bound to the branch preflight ran on and the
@@ -44,12 +50,13 @@
 set -uo pipefail
 
 usage() { sed -n '5,6p' "$0" | sed 's/^# *//'; exit 2; }
-dry=0; ver=""; pr_body=""; merge_body=""; skip_codex=0
+dry=0; ver=""; pr_body=""; merge_body=""; skip_codex=0; hold=0
 subject_override=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --dry-run) dry=1;;
         --skip-codex) skip_codex=1;;
+        --hold) hold=1;;
         --pr-body) pr_body="${2:?--pr-body FILE}"; shift;;
         --merge-body) merge_body="${2:?--merge-body FILE}"; shift;;
         --subject) subject_override="${2:?--subject TEXT}"; shift;;
@@ -113,14 +120,16 @@ if [ "$dry" -eq 1 ]; then
     if [ -d "$S" ] && rl_done "$S" preflight; then rl_resume_check "$S" "$ver" "$branch" || rc=32; fi
     if [ -d "$S" ] && rl_done "$S" bump; then echo "bump already done — preflight not re-run"; else preflight || rc=$?; fi
     echo "plan for v$ver (state dir $S):"
-    for st in preflight cheap bump pr certify prci codex ship; do
+    for st in preflight cheap bump pr codex certify prci ship; do
         if rl_done "$S" "$st"; then echo "  $st: done ($(head -1 "$S/$st.done"))"; else echo "  $st: pending"; fi
     done
+    [ "$hold" -eq 0 ] || echo "hold: stop green after prci — no merge, no tag (--hold)"
     echo "cheap legs (RUSTFLAGS from ci.yml):"; cheap_legs | sed 's/^/    /'
     echo "commit/merge subject: ${subject_override:-$(rl_subject CHANGELOG.md "$ver")}"
     echo "certify: LANES=${LANES:-1} scripts/certify.sh full"
     if [ "$skip_codex" -eq 1 ]; then echo "codex: SKIPPED (--skip-codex, operator override)"
-    else echo "codex: wait up to $(( ${CODEX_TIMEOUT_SECS:-1800} / 60 )) min for $RL_CODEX_BOT's review of HEAD; exit 30 on any finding"; fi
+    elif [ "${CODEX_TIMEOUT_SECS:-0}" -gt 0 ]; then echo "codex: wait up to $(( CODEX_TIMEOUT_SECS / 60 )) min for $RL_CODEX_BOT's review of HEAD; exit 30 on any finding"
+    else echo "codex: read $RL_CODEX_BOT's review of HEAD if one exists (no wait; CODEX_TIMEOUT_SECS=0); exit 30 on any finding"; fi
     exit "$rc"
 fi
 
@@ -226,7 +235,29 @@ pr_stage() {
 echo "--- stage pr"; pr_stage || exit 23
 pr="$(rl_get "$S" pr)"
 
-# ── 5. certify ──────────────────────────────────────────────────────────
+# ── 5. Codex review ─────────────────────────────────────────────────────
+# Before certify, not after: Codex reviews the pushed HEAD within minutes, and
+# a finding means a fix commit and a full re-certify of the new head — so the
+# hour of certify is never spent on a head a finding will replace (v55.0.0 ran
+# four rounds that way). Never ship over Codex findings on HEAD. A review keyed
+# to an older head does not count, and the stage is done only while HEAD is the
+# sha it passed on.
+if [ "$skip_codex" -eq 1 ]; then
+    echo "!!! CODEX REVIEW SKIPPED (--skip-codex, operator override) — PR #$pr proceeds without waiting for or reading Codex's review of $(git rev-parse --short HEAD) !!!"
+elif ! rl_done_at "$S" codex "$(head_sha)"; then
+    echo "--- stage codex"
+    rl_codex_review "$repo" "$pr" "$(head_sha)"; rc=$?
+    case "$rc" in
+        0) ;;
+        30) exit 30;;
+        31) if [ "${CODEX_TIMEOUT_SECS:-0}" -gt 0 ]; then echo "::warning::Codex review did not arrive; proceeding without it (no review of $(git rev-parse --short HEAD) by $RL_CODEX_BOT in $(( CODEX_TIMEOUT_SECS / 60 )) min)"
+            else echo "codex: no review of $(git rev-parse --short HEAD) by $RL_CODEX_BOT at this moment; not waited (CODEX_TIMEOUT_SECS=0, subscription ended 2026-10-13); proceeding"; fi;;
+        *) echo "codex stage: unexpected exit $rc — refusing to proceed"; exit 30;;
+    esac
+    rl_mark_at "$S" codex "$(head_sha)"
+fi
+
+# ── 6. certify ──────────────────────────────────────────────────────────
 certify() {
     local rc
     # Wait out a foreign cargo instead of letting certify's stray guard
@@ -247,7 +278,7 @@ if ! rl_done_at "$S" certify "$(head_sha)"; then
     echo "--- stage certify"; certify; rc=$?; [ "$rc" -eq 0 ] || exit "$rc"; rl_mark_at "$S" certify "$(head_sha)"
 fi
 
-# ── 6. PR CI ────────────────────────────────────────────────────────────
+# ── 7. PR CI ────────────────────────────────────────────────────────────
 prci() {
     local head limit waited=0 run st attempt grace ended retry
     head="$(head_sha)"; limit=$(( ${PRCI_TIMEOUT_MIN:-180} * 60 ))
@@ -285,24 +316,18 @@ if ! rl_done_at "$S" prci "$(head_sha)"; then
     echo "--- stage prci"; prci; rc=$?; [ "$rc" -eq 0 ] || exit "$rc"; rl_mark_at "$S" prci "$(head_sha)"
 fi
 
-# ── 7. Codex review ─────────────────────────────────────────────────────
-# Never ship over Codex findings on HEAD. A review keyed to an older head does
-# not count, and the stage is done only while HEAD is the sha it passed on.
-if [ "$skip_codex" -eq 1 ]; then
-    echo "!!! CODEX REVIEW SKIPPED (--skip-codex, operator override) — shipping PR #$pr without waiting for or reading Codex's review of $(git rev-parse --short HEAD) !!!"
-elif ! rl_done_at "$S" codex "$(head_sha)"; then
-    echo "--- stage codex"
-    rl_codex_review "$repo" "$pr" "$(head_sha)"; rc=$?
-    case "$rc" in
-        0) ;;
-        30) exit 30;;
-        31) echo "::warning::Codex review did not arrive; shipping without it (no review of $(git rev-parse --short HEAD) by $RL_CODEX_BOT in $(( ${CODEX_TIMEOUT_SECS:-1800} / 60 )) min)";;
-        *) echo "codex stage: unexpected exit $rc — refusing to ship"; exit 30;;
-    esac
-    rl_mark_at "$S" codex "$(head_sha)"
+# ── 8. hold ─────────────────────────────────────────────────────────────
+# Everything that judges the tree is green. With --hold the chain stops here,
+# before anything irreversible, so an external report (Edge's re-gate of this
+# head) lands first; the next run without --hold resumes at ship. v55.0.0 was
+# tagged ahead of that report because nothing here waited for it.
+if [ "$hold" -eq 1 ] && ! rl_done "$S" ship; then
+    echo "=== RELEASE_HELD v$ver at $(git rev-parse --short HEAD): cheap, codex, certify and PR CI green; not merged, not tagged (--hold) ==="
+    echo "ship with the same command without --hold (the state resumes at ship)"
+    exit 0
 fi
 
-# ── 8. ship ─────────────────────────────────────────────────────────────
+# ── 9. ship ─────────────────────────────────────────────────────────────
 if ! rl_done "$S" ship; then
     echo "--- stage ship"
     [ -f "$S/merge_body.md" ] || rl_changelog_section CHANGELOG.md "$ver" > "$S/merge_body.md"
@@ -313,6 +338,6 @@ if ! rl_done "$S" ship; then
     rl_mark "$S" ship
 fi
 
-# ── 9. stop ─────────────────────────────────────────────────────────────
+# ── 10. stop ────────────────────────────────────────────────────────────
 echo "=== RELEASE_TAGGED v$ver — tag CI run $(rl_get "$S" tag_run) ==="
 echo "finish with:  ${GH:+GH=$GH }scripts/release_finish.sh $ver $(rl_get "$S" tag_run)"

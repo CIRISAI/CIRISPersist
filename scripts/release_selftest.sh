@@ -291,11 +291,14 @@ expect_eq "codex: summary says HEAD done, a finding on HEAD still stops (30)" "$
 echo "release.sh codex stage"
 expect_eq "--skip-codex is a known flag" "$(scripts/release.sh --skip-codex 1.2 2>&1 | grep -c 'unknown flag')" "0"
 _l() { grep -n "$1" scripts/release.sh | head -1 | cut -d: -f1; }
-if [ "$(_l '"--- stage prci"')" -lt "$(_l '"--- stage codex"')" ] && [ "$(_l '"--- stage codex"')" -lt "$(_l '"--- stage ship"')" ]; then
-    ok "the codex stage runs after prci and before ship"; else bad "the codex stage is not between prci and ship"; fi
+if [ "$(_l '"--- stage pr"')" -lt "$(_l '"--- stage codex"')" ] && [ "$(_l '"--- stage codex"')" -lt "$(_l '"--- stage certify"')" ]; then
+    ok "the codex stage runs after pr and before certify (a finding never costs a certify)"; else bad "the codex stage is not between pr and certify"; fi
+if [ "$(_l '"--- stage prci"')" -lt "$(_l 'RELEASE_HELD')" ] && [ "$(_l 'RELEASE_HELD')" -lt "$(_l '"--- stage ship"')" ]; then
+    ok "--hold stops after prci and before ship"; else bad "--hold is not between prci and ship"; fi
+expect_eq "--hold is a known flag" "$(scripts/release.sh --hold 1.2 2>&1 | grep -c 'unknown flag')" "0"
 # shellcheck disable=SC2016  # literal: python / jq / grep text, expanded by them
 grep -q 'rl_done_at "$S" codex "$(head_sha)"' scripts/release.sh && ok "the codex marker is keyed to HEAD's sha" || bad "the codex marker is not keyed to HEAD"
-grep -q 'for st in preflight cheap bump pr certify prci codex ship' scripts/release.sh && ok "--dry-run lists the codex stage" || bad "--dry-run does not list the codex stage"
+grep -q 'for st in preflight cheap bump pr codex certify prci ship' scripts/release.sh && ok "--dry-run lists the stages in run order (codex before certify)" || bad "--dry-run does not list the stages in run order"
 
 echo "release_ship.sh local tag annotation"
 # A re-run that finds v<version> locally at the merge sha must also find the

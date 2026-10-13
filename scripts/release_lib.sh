@@ -182,7 +182,10 @@ rl_stage() {
 # so already-fixed findings from an older head would block forever.
 RL_CODEX_BOT="chatgpt-codex-connector[bot]"
 rl_codex_review() {
-    local repo="$1" pr="$2" head="$3" h7="${3:0:7}" waited=0 limit="${CODEX_TIMEOUT_SECS:-1800}"
+    # Default 0: check ONCE, never wait. The Codex subscription ended 2026-10-13;
+    # the free tier may still review a PR at random, and a review that IS there
+    # is read (a finding on HEAD still stops). CODEX_TIMEOUT_SECS>0 restores the wait.
+    local repo="$1" pr="$2" head="$3" h7="${3:0:7}" waited=0 limit="${CODEX_TIMEOUT_SECS:-0}"
     local poll="${CODEX_POLL_SECS:-60}" reviews summary ids found
     while :; do
         reviews="$(gh api --paginate "repos/$repo/pulls/$pr/reviews" 2>/dev/null | jq -s 'add // []' 2>/dev/null)" || reviews="[]"

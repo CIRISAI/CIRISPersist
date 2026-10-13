@@ -3,7 +3,7 @@
 Three checked-in scripts take a release from a written CHANGELOG section to a published GitHub release. No agent or person has to act between their stages.
 
 ```
-scripts/release.sh <version> [--pr-body FILE] [--merge-body FILE] [--skip-codex]   # stages 1-9, ends at the tag push
+scripts/release.sh <version> [--pr-body FILE] [--merge-body FILE] [--skip-codex] [--hold]   # stages 1-10, ends at the tag push (or held before it)
 scripts/release_finish.sh <version> <tag-run-id>                    # tag CI → release → release body
 ```
 
@@ -16,7 +16,7 @@ scripts/release_finish.sh <version> <tag-run-id>                    # tag CI →
 - `CHANGELOG.md` has the header `## [<version>] - UNRELEASED` with the full section under it. That section becomes the PR body, the merge body, the tag annotation and the release body, so write it before you start.
 - For a release that names a CC version, run `scripts/check_vendored_cc.sh <cc-tag>` first.
 - `scripts/release.sh --dry-run <version>` runs preflight and prints the plan, the cheap-leg commands and the commit subject. It writes nothing.
-- A gh with `gh attestation` (2.49+). Stage 9's `release_finish.sh` verifies the published wheels with it, and the system gh here is 2.45: v53.2.0's finish failed on it after the release was public. Preflight checks it (v54.1.0, #1045); `GH=/path/to/gh` selects another, and the printed finish command carries it.
+- A gh with `gh attestation` (2.49+). Stage 10's `release_finish.sh` verifies the published wheels with it, and the system gh here is 2.45: v53.2.0's finish failed on it after the release was public. Preflight checks it (v54.1.0, #1045); `GH=/path/to/gh` selects another, and the printed finish command carries it.
 - `CARGO_BUILD_JOBS` defaults to 6 in `release.sh` and `certify.sh` (v54.1.0, #1045). This host has 32 cores, and cargo at `-j32` was reaped three times for memory during v53.2.0. Set it in the environment to override.
 
 ## Stages
@@ -27,11 +27,12 @@ scripts/release_finish.sh <version> <tag-run-id>                    # tag CI →
 | 2 | cheap | `cargo check --all-targets --no-default-features --features <axis>` for each of `ci_feature_matrix.AXIS_LEGS`, the pyo3 lane (`nextest --features pyo3,sqlite -E 'test(/pyo3/)'`), clippy on the lint set and on `--all-features`, and `pyi_surface.py check`. RUSTFLAGS is read from ci.yml, as certify reads it. | `cheap.done` + one per leg, **at a sha** |
 | 3 | bump | Cargo version, `evidence/cc_impl.tsv` re-stamp (`ciris-persist@<prev>` → `@<version>`, count asserted), CHANGELOG date, `cargo check --features sqlite`, the evidence pin test, and the commit `release(v<version>): version, evidence re-stamp — <### headings>`. The hooks run. | `bump.done` |
 | 4 | pr | Pushes the branch if origin differs from HEAD, then opens the PR or reuses the open one, through REST. The body is `--pr-body` or the section. | runs every time (idempotent) |
-| 5 | certify | Waits while any foreign cargo runs, until none has run for `RELEASE_QUIET_SECS` (60), at most `RELEASE_STRAY_WAIT_SECS` (7200; then exit 24): certify's stray-cargo guard used to refuse, and the stage exited 24 with nothing red. `CERTIFY_IGNORE_STRAY=1` skips the wait, as it skips certify's guard. Then `LANES=${LANES:-1} scripts/certify.sh full` > `.release/<v>/certify.log`. Green means exit 0 **and** the line `EVERY CI LEG GREEN BY EXIT CODE.` | `certify.done`, **at a sha** |
-| 6 | prci | Waits for the PR's CI run on HEAD (`PRCI_TIMEOUT_MIN`, default 180). Auto-retry reruns are respected (see below). | `prci.done`, **at a sha** |
-| 7 | codex | Waits for `chatgpt-codex-connector[bot]`'s review of HEAD (`CODEX_TIMEOUT_SECS`, default 1800; polled every `CODEX_POLL_SECS`, default 60). Reviewed means a bot review whose `commit_id` is HEAD, or the bot's summary comment showing a Completed row for HEAD's short sha (a clean pass posts no review, only a 👍). A review of an older head does not count. Any bot inline comment made on HEAD (its `original_commit_id`, or it belongs to a bot review of HEAD) stops the release with exit 30 and prints each finding's `path:line` and title. If no review arrives in time, the stage fails OPEN with `::warning::Codex review did not arrive; shipping without it`. `--skip-codex` skips the stage (an operator override, printed loudly). | `codex.done`, **at a sha** |
-| 8 | ship | `release_ship.sh <pr> <version> <head7> "<subject>" <merge-body>`: merge, tag at the merge commit, push the tag once main's run is visible, and print `TAG_RUN_ID`. | `ship.done` + `tag_run` |
-| 9 | stop | Prints `scripts/release_finish.sh <version> <tag-run-id>`. | — |
+| 5 | codex | Reads `chatgpt-codex-connector[bot]`'s review of HEAD if one exists, and does not wait for one: `CODEX_TIMEOUT_SECS` defaults to 0 since the subscription ended (2026-10-13; the free tier reviews at random). A value above 0 restores the wait, polled every `CODEX_POLL_SECS` (default 60). Reviewed means a bot review whose `commit_id` is HEAD, or the bot's summary comment showing a Completed row for HEAD's short sha (a clean pass posts no review, only a 👍). A review of an older head does not count. Any bot inline comment made on HEAD (its `original_commit_id`, or it belongs to a bot review of HEAD) stops the release with exit 30 and prints each finding's `path:line` and title. With no review present (or none arriving within a positive timeout) the stage proceeds and says so. `--skip-codex` skips even the read (an operator override, printed loudly). It runs before certify (see below). | `codex.done`, **at a sha** |
+| 6 | certify | Waits while any foreign cargo runs, until none has run for `RELEASE_QUIET_SECS` (60), at most `RELEASE_STRAY_WAIT_SECS` (7200; then exit 24): certify's stray-cargo guard used to refuse, and the stage exited 24 with nothing red. `CERTIFY_IGNORE_STRAY=1` skips the wait, as it skips certify's guard. Then `LANES=${LANES:-1} scripts/certify.sh full` > `.release/<v>/certify.log`. Green means exit 0 **and** the line `EVERY CI LEG GREEN BY EXIT CODE.` | `certify.done`, **at a sha** |
+| 7 | prci | Waits for the PR's CI run on HEAD (`PRCI_TIMEOUT_MIN`, default 180). Auto-retry reruns are respected (see below). | `prci.done`, **at a sha** |
+| 8 | hold | Only with `--hold`: prints `RELEASE_HELD` and exits 0 with everything green and nothing merged. The same command without `--hold` resumes at ship. For a head an external party (Edge's re-gate) must report on before the tag. | — |
+| 9 | ship | `release_ship.sh <pr> <version> <head7> "<subject>" <merge-body>`: merge, tag at the merge commit, push the tag once main's run is visible, and print `TAG_RUN_ID`. | `ship.done` + `tag_run` |
+| 10 | stop | Prints `scripts/release_finish.sh <version> <tag-run-id>`. | — |
 
 Then run `release_finish.sh`. It checks that the run id is this tag's CI push run, waits for it (`FINISH_TIMEOUT_MIN`, default 180) and re-runs it if the same-SHA dedup cancelled it. It then waits for the release to exist, sets the body from the annotation of origin's tag (never a local copy; a different local tag is refused), asserts the body is at least the tag body's bytes minus 64, runs `scripts/verify_release.sh` (below), and prints `RELEASE_SHIP_DONE`.
 
@@ -52,6 +53,12 @@ v53.1.8's ship script was killed at the harness's 2-hour background cap while ta
 ### Why release.sh waits for Codex (CIRISPersist#1039)
 
 On PR #1039 the chain would have merged and tagged v53.2.0 about ten minutes after Codex posted six findings, one of them a P1 that emptied the CHANGELOG cut under gawk. Certify and PR CI were green, and nothing in the chain read the review. It was stopped by hand. The `codex` stage reads it. Findings are keyed to the commit Codex reviewed, not to a comment's current `commit_id`: GitHub moves that forward to the newest head while the line is unchanged, so an old finding that was already fixed would otherwise block every later push. The stage fails open after its timeout because Codex is an external service, and its absence must not hold a release indefinitely. The warning line makes that visible.
+
+### Why Codex runs before certify, and what `--hold` is for (v55.0.0)
+
+Codex reviews a pushed head within minutes; certify takes about an hour. With codex after certify, every finding cost a fix commit and a full re-certify of the new head. v55.0.0 went through four Codex rounds that way, and six chain launches in all: most of a night was spent re-certifying heads that a finding then replaced. With codex right after the PR push, a finding stops the chain before certify starts, and the hour is spent once, on the head that ships.
+
+The chain has no other external gate. v55.0.0 was tagged minutes after its last clean Codex pass, before Edge had reported its re-gate on that head, because nothing waited for it. `--hold` is that wait: the chain stops green after PR CI and prints `RELEASE_HELD`; the same command without the flag resumes at ship.
 
 ## The resume rule
 
