@@ -18,8 +18,9 @@ The verdicts the report prints:
 | `put_attestation_with_origin` (under `put_attestation`, `put_attestation_authored`, and the replicated apply's fresh-id store) | identical x3 (59 gates) | shared: `plan:put_attestation_planned` | done (door 1) |
 | `attach_attestation_pqc_signature` | gateless (its two refusals and the hash recompute were inline, written three times) | shared: `plan:attach_attestation_pqc_planned` | done (door 3) |
 | `attestation_upsert_local` / `attestation_insert_local` | gateless (a scanner blind spot, see below); really identical x3 (17 gates) | shared: `plan:write_local_attestation_planned` | done (door 2); the occupied-id divergence ruled (I951) |
-| `reseal_attestation_v31` | declared (memory re-asks `check_reseal_admission` under its lock) | unchanged | not attempted: needs #681's closure form |
-| `purge_attestation_v31`, `purge_genesis_delegation_row_v31` | identical x3 (1 gate each) | unchanged | not attempted: steward-purge plane, 13 `CLM-purge-*` rows |
+| `reseal_attestation_v31` | declared (memory 3 gates, sqlite and postgres 2; memory re-asked `check_reseal_admission` under its lock, the SQL backends asked nothing inside their transaction) | shared: `plan_reseal_attestation`; executor `store_planned_reseal` shared: `plan:sealed_over` | done (door 4); the race fixed (I953) |
+| `purge_attestation_v31` | identical x3 (1 gate) | shared: `purge_attestation_planned` over `delete_attestation(id, None)` | done (door 5); no behaviour change |
+| `purge_genesis_delegation_row_v31` | identical x3 (1 gate) | shared: `purge_genesis_delegation_row_planned` over `delete_attestation(id, Some(hash))` | done (door 6); I954 added (the gate's mutation survived without it) |
 | `enter_mesh` (promotion) | declared; decision already `crossing::plan_enter_mesh` (v39) | unchanged | already planned |
 | `put_holding_claim` | identical x2; decision already `holding_claim::prepare_announcement` | unchanged | already planned (memory holds no blobs) |
 | `apply_replicated_attestation`, `put_attestation_synced` | `attestation_apply::apply_planned` (v50); a fresh id stores through door 1 | unchanged | already planned |
@@ -92,6 +93,30 @@ The lead ruled that an upsert replaces its own row and that any other holder
 of the id is a typed refusal. `attestation_admit::local_occupied_id_verdict`
 is the one clause.
 
+### Door 4: the re-seal race (I953, `federation::reseal_race_invariants`)
+
+At v55.0.0 sqlite and postgres read the row through `get_attestation` before
+their write transaction and asked nothing inside it. A local row that
+crossed to the federation tier between that read and the write took the
+local re-seal's envelope. Memory re-asked the shape gate under its lock and
+refused. The `store::parity` declared reason said the SQL backends got that
+second answer from their transaction, which was false.
+
+| backend | before (c2b987dc) | after (029a3010) |
+|---|---|---|
+| memory | refused | refused |
+| sqlite | `Ok(true)`, crossed row overwritten | refused |
+| postgres | `Ok(true)`, crossed row overwritten | refused |
+
+### Doors 5 and 6: the purges
+
+Both purges read the row and delete it in two steps on every backend, as at
+v55.0.0. The window is the same on all three, so it is not a divergence. It
+is a candidate for the re-seal's in-write re-ask, reported and not changed.
+I954 (`federation::genesis_purge_door_invariants`) offers the store's genesis
+door an ordinary row's id: refused on all three backends. Without I954 the
+re-bake gate could be deleted from the shared plan with every test green.
+
 ## The CC conditions (CIRISConstitution review on #934, 2026-10-13)
 
 **1. Two named instants, both inputs.** A plan takes
@@ -120,8 +145,11 @@ bodies and fails on any difference:
 | executor re-ask | `check_delegation_cycle_admission` | `received_at` | clock | the plan's instant, under the write lock |
 | PQC completion | completion stamp | `received_at` | clock | `pqc_completed_at` |
 | local | `check_trust_charter_admission`, `check_attach_freshness`, `local_row_instant`, `check_instant_binding` | `received_at` | clock | the local door mints its own instant |
+| re-seal | `check_reseal_admission` | `received_at` | clock | its future-skew bound |
+| re-seal executor re-ask | `sealed_over` calls `check_reseal_admission` | `received_at` | clock | the plan's instant, on the row read inside the write step |
 
-Every other gate reads neither instant. It reads the row, or no time at all.
+The two purge plans take no instants: their gates read only the row or the
+compiled-in bundle. Every other gate reads neither instant. It reads the row, or no time at all.
 Gates that read the clock two or more calls deep are not yet audited one by
 one.
 

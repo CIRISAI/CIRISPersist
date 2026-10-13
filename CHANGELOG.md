@@ -28,6 +28,24 @@ sequences and the open items are in `docs/ATTESTATION_WRITE_DOORS_934.md`.
   `plan_attach_attestation_pqc_signature`: unknown id, already complete, and
   the completed row's hash. Memory's executor gains the SQL backends'
   "concurrently completed" guard.
+- **`reseal_attestation_v31`** (door 4) is decided once in
+  `plan_reseal_attestation`: the shape gate (`check_reseal_admission`) and
+  the seal gate over the row as read. Each executor's `store_planned_reseal`
+  then re-reads the row INSIDE its write step (memory's lock, sqlite's
+  transaction, postgres's `SELECT … FOR UPDATE`) and hands it to the shared
+  `PlannedReseal::sealed_over`, which re-asks the shape gate on that row. The
+  scan reports the door and its re-ask as `shared`; the memory
+  `DeclaredDivergence` is gone.
+- **`purge_attestation_v31` and `purge_genesis_delegation_row_v31`** (doors 5
+  and 6) are decided once in `purge_attestation_planned` (the exclusion gate,
+  `migration::check_purge_admission`, over the row as read) and
+  `purge_genesis_delegation_row_planned` (the re-bake gate, then a
+  compare-and-delete on the expected `persist_row_hash`). Both execute through
+  one new `AttestationStore::delete_attestation(id, only_if_hash)`. No
+  behaviour change: the purge's read and delete stay two steps on every
+  backend, as before. I954 is new: nothing had offered the STORE's genesis
+  door an id the bundle does not carry, so removing its gate left every test
+  green. I954 does, on memory, sqlite and postgres.
 - **A plan takes two named instants, `PlanInstants { fold_at, received_at }`**
   (the Constitution's condition 1 on #934). `fold_at` is the row's signed
   instant, for folds over other rows. `received_at` is the receiver's clock at
@@ -35,6 +53,25 @@ sequences and the open items are in `docs/ATTESTATION_WRITE_DOORS_934.md`.
   Each gate reads the instant it read before. Four folds still read receipt
   and are listed as #1049 candidates. `store::parity`'s `PLAN_INSTANTS` pins
   which gate reads which, and I950 is the witness on all three backends.
+
+  | plan | call | instant | before #934 |
+  |---|---|---|---|
+  | put | `check_instant_binding` | `received_at` | clock (future-skew bound) |
+  | put | `check_attach_freshness` | `received_at` | clock (CC 2.6.7 window W) |
+  | put | `check_capacity_consent_admission` | `received_at` | clock (#1049 candidate) |
+  | put | `check_delegation_cycle_admission` | `received_at` | clock (#1049 candidate) |
+  | put | `check_trust_charter_admission` | `received_at` | clock (#1049 candidate) |
+  | put | `check_peer_deadmission` | `received_at` | clock (#1049 candidate) |
+  | put | `check_licensure_delegator_is_authority` | both | clock and `asserted_at` |
+  | put | `check_community_trust_grant_admission` | `fold_at` | `asserted_at` (CC 3.3.1) |
+  | put executor re-ask | `check_delegation_cycle_admission` | `received_at` | clock, under the write lock |
+  | PQC completion | `pqc_completed_at` stamp | `received_at` | clock |
+  | local | `check_trust_charter_admission`, `check_attach_freshness`, `local_row_instant`, `check_instant_binding` | `received_at` | clock |
+  | re-seal plan | `check_reseal_admission` | `received_at` | clock (its skew bound) |
+  | re-seal re-ask | `sealed_over` → `check_reseal_admission` | `received_at` | clock |
+
+  The two purge plans read neither instant: both gates read only the row or
+  the compiled-in bundle.
 
 ### Fixed
 
@@ -44,6 +81,15 @@ sequences and the open items are in `docs/ATTESTATION_WRITE_DOORS_934.md`.
   `Error::LocalAttestationIdOccupied`. An insert of a held id still writes
   nothing. This is the first divergence the one-door extraction made visible;
   I951 asserts one outcome on all three backends.
+- **A re-seal racing a crossing overwrote the crossed row on sqlite and
+  postgres.** Both read the row before their write transaction and asked
+  nothing inside it, so a row that crossed to the federation tier between
+  the read and the write took the local re-seal's envelope. Memory re-asked
+  under its lock and refused. Every backend now re-asks the shape gate on the
+  row it is about to overwrite, inside its write step, and refuses ("diverges
+  from the stored"). I953 was red on sqlite and postgres before the fix and is
+  green on all three after. Behaviour changes only under that race, in the
+  refusing direction.
 
 **Adopter-visible.**
 
@@ -65,6 +111,23 @@ sequences and the open items are in `docs/ATTESTATION_WRITE_DOORS_934.md`.
 - A substrate failure while reading the row in
   `attach_attestation_pqc_signature` now reads `get_attestation: …` (it was
   `attach lookup: …`). The read is now recorded by the read probe.
+
+### Known gap
+
+- **Non-row reads still in the put plan.** CC condition 2 asks that no
+  admission decision read a projection. These reads in
+  `plan_put_attestation` are not signed rows, and none was re-derived in this
+  step:
+  - the AV-76 per-peer quota and its cohort-affinity memo (node-local,
+    receipt-time rate state);
+  - `settle_if_held`'s wire-index lookup (an accelerator that settles only on
+    a byte-identical held row);
+  - the blob store, read by `check_rendition_placement` and
+    `check_holding_claim_scope`;
+  - the purge tombstones table, read by `refuse_if_tombstoned_attestation`.
+- **The purge's read and delete are two steps** on every backend, as before
+  #934. It is a candidate for the re-seal's in-write re-ask; reported, not
+  changed.
 
 ## [55.0.0] - 2026-10-12
 
