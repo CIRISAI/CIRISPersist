@@ -494,7 +494,13 @@ jobs:
         # (cirisgraph 16.9 on v52.0.2's main run, 34.1 here), so the bound was
         # inside the runner's variance. Same reasoning as above: the per-test
         # hang detector is `.config/nextest.toml`, this is the runner backstop.
-        timeout-minutes: 50
+        #
+        # v55.0.1 — 50 → 75. The `secrets` leg is ~46 min warm, and a cold or
+        # repaired cache adds up to 25 min of compile (v55.0.1's PR run: the
+        # first unit repair over a manifest-less blob took the compile phase
+        # from 8.3 to 23.5 min and timed the leg out at test 655/4935). A hung
+        # test is still caught by `.config/nextest.toml`, by name.
+        timeout-minutes: 75
         env:
           CIRIS_PERSIST_TEST_PG_URL: postgres://ciris:ciris@localhost:5432/ciris_persist_test
         # v30.2.0 (CIRISPersist#17) — `--test-threads=1` is GONE, and with it

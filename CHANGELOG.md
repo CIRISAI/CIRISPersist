@@ -40,14 +40,40 @@ No library code changed.
     `.fingerprint/<pkg>-<hash>/`. Cargo then reruns that build script. The
     step is NOT continue-on-error, so a target/ that cannot be checked is not
     built on.
-  - Today's blobs carry no manifests, so their first restore reruns every
-    build script once, and the next save carries manifests.
+  - **A unit with no manifest** (every blob saved before v55.0.1) is judged
+    by a bound, not removed outright.
+    - Why: removing all of them cost the v55.0.1 PR run's `secrets` leg 272
+      units and 15 compile minutes, and it timed out.
+    - The prune is a file LRU, so a pruned file is no newer than the oldest
+      surviving file (`cutoff`). A build-script run writes `out/` during the
+      run and `output` at its end, so a pruned sibling implies
+      `output <= cutoff + R_MAX`, where `R_MAX` = 2 h bounds a script's
+      runtime.
+    - A manifest-less run unit whose `output` is newer than that is kept.
+      One at or below it is removed with its fingerprint, as is a run unit
+      with no `output`. A script-compile unit is judged by its newest file.
+    - A restore that clobbered every mtime makes everything fall within the
+      bound, so everything manifest-less is removed, which is the safe
+      direction.
+    - The repair prints three counts: removed (manifest), removed
+      (boundary), and kept (unverified).
+- **The linux test legs' step timeout is now 75 minutes** (was 50). The
+  `secrets` leg runs about 46 minutes warm, and a cold or repaired cache adds
+  up to 25. A hung test is still caught by name by `.config/nextest.toml`.
 - **Witness:** `scripts/ci_cache_units.py --self-test`, run in the hygiene
   job. It builds a fixture target/ with a consistent unit, a sealed
   build-script unit, a unit pruned of one out file, and a unit saved before
   manifests existed. The repair removes the last two with their
   fingerprints and keeps the first two, and the seal touches out files to
   now. Turning the repair off, or keeping the fingerprint, fails it.
+  - The bound's own legs, which use fixed offsets:
+    - a manifest-less run unit far above the cutoff is kept, and one within
+      `R_MAX` of it is removed;
+    - a run unit with no `output` is removed;
+    - a script unit far from the cutoff is kept, and one near it is removed;
+    - clobbered mtimes remove everything.
+  - Setting `R_MAX = 0`, or inverting the boundary comparison, turns legs
+    red.
 
 ## [55.0.0] - 2026-10-12
 
