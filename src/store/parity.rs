@@ -145,6 +145,31 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // shared door, its decision (a refusal of an unknown or already-complete
     // row, so a Gate), and the executor's guarded write.
     ("attach_attestation_pqc_planned", Class::Plan),
+    // The local-tier doors (`attestation_upsert_local` /
+    // `attestation_insert_local`) delegate their whole body to a same-file
+    // helper; until v56.0.0 the scan could not see past the tail call and
+    // reported both doors `gateless` on all three backends while each helper
+    // ran fourteen gates. Delegates: the helper's sequence is the door's.
+    ("memory_write_local_attestation", Class::Delegates),
+    ("sqlite_write_local_attestation", Class::Delegates),
+    ("pg_write_local_attestation", Class::Delegates),
+    // ...and the local helpers' own gates, seen for the first time with them:
+    // the local-tier eligibility rule, the caller-signed transit verify, the
+    // signed-instant read (refuses a malformed instant) and the local stamp
+    // (refuses an envelope it cannot place the instants in).
+    ("check_local_tier_eligibility", Class::Gate),
+    ("verify_caller_signed_local_row", Class::Gate),
+    ("local_row_instant", Class::Gate),
+    ("stamp_local_row", Class::Gate),
+    // `opt.map(..).ok_or_else(..)?`: `ok_or_else` is transparent, so the
+    // token lands on `map`. Plumbing, in the fail-open direction, and why:
+    // `map` is an adapter, not a decision. Classified as a Gate it put a `map`
+    // token into four unrelated doors (`blob_key_grant_watermark` among them)
+    // wherever one backend wrote `.map(..)?` and another did not — syntax, not
+    // policy. The one refusal it hides here is the local helpers' "the envelope
+    // must carry a dimension string", which every backend writes identically
+    // and which I951's local-door rows exercise.
+    ("map", Class::Plumbing),
     ("plan_attach_attestation_pqc_signature", Class::Gate),
     ("store_pqc_completion", Class::Plumbing),
     // v55.0.0 (CIRISPersist#952) — Gate: the finalize refuses a chunk not held whole.

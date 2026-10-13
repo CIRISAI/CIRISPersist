@@ -11,10 +11,46 @@ threat-model citations because this crate's audit story is the point.
 
 ### Changed — the attestation plane's write doors share one plan (#934 step 1)
 
-- `put_attestation_with_origin` (under `put_attestation`,
+Each door below is now a shared plan plus a per-backend executor. The plan
+holds every admission decision and is pure over reads. The executor in each
+backend does only SQL, row mapping and transactions. The inventory, the gate
+sequences and the open items are in `docs/ATTESTATION_WRITE_DOORS_934.md`.
+
+- **`put_attestation_with_origin`** (under `put_attestation`,
   `put_attestation_authored` and the replicated apply's fresh-id store) is
-  decided once, in `federation::attestation_admit::plan_put_attestation`;
-  each backend implements only the storage executor.
+  decided once in `federation::attestation_admit::plan_put_attestation`. Its
+  59 gates were written three times. The `store::parity` scan now reports the
+  door as `shared`.
+- **`attach_attestation_pqc_signature`** is decided once in
+  `plan_attach_attestation_pqc_signature`: unknown id, already complete, and
+  the completed row's hash. Memory's executor gains the SQL backends'
+  "concurrently completed" guard.
+- **The plans take their instant as an input** (the Constitution's condition 1
+  on #934). Each door reads the clock once and passes `at`, and nothing inside
+  a plan reads the clock. I950 is the witness: one row planned at two instants
+  gets each instant's verdict on all three backends.
+- **The local doors (`attestation_upsert_local` / `attestation_insert_local`)
+  are not moved.** Their 17 gates match on all three backends. Their storage
+  halves disagree when the caller re-uses a held `attestation_id`: memory
+  keeps the held row, while sqlite and postgres replace it, or delete the
+  dimension's row and store nothing. I951 pins the split until it is ruled.
+- **`store::parity`** now sees a door that delegates its whole body as a tail
+  call. The local doors read `gateless` before this and `identical x3 (17
+  gates)` after it.
+
+**Adopter-visible.**
+
+- Five public gate functions gain a trailing `at: DateTime<Utc>` parameter:
+  `admission::check_capacity_consent_admission`,
+  `admission::check_delegation_cycle_admission`,
+  `admission::check_licensure_delegator_is_authority`,
+  `admission::check_peer_deadmission` and
+  `trust_root::check_trust_charter_admission`. Pass `chrono::Utc::now()` for
+  the previous behaviour.
+- A substrate failure while reading the row in `attach_attestation_pqc_signature`
+  now reads `get_attestation: …` (it was `attach lookup: …`). The read is now
+  recorded by the read probe.
+- No decided outcome changes on any backend.
 
 ## [55.0.0] - 2026-10-12
 
