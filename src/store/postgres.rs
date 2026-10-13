@@ -24532,8 +24532,8 @@ where
         })
 }
 
-/// v54.0.0 (Codex round 2 on PR #1050) — the cycle gate's two walk reads
-/// ([`DelegationGraphReads`](crate::federation::admission::DelegationGraphReads))
+/// v54.0.0 (Codex round 2 on PR #1050) — the cycle gate's walk reads
+/// ([`AttestationQueryExec`](crate::federation::attestation_query::AttestationQueryExec))
 /// answered on the transaction that holds the delegation advisory lock. The
 /// re-check under the lock reads through this, never through the backend, so
 /// it takes no second pooled client while the lock's transaction holds one
@@ -24541,21 +24541,15 @@ where
 struct PgTxDelegationGraph<'a, C>(&'a C);
 
 #[async_trait::async_trait]
-impl<C> crate::federation::admission::DelegationGraphReads for PgTxDelegationGraph<'_, C>
+impl<C> crate::federation::attestation_query::AttestationQueryExec for PgTxDelegationGraph<'_, C>
 where
     C: tokio_postgres::GenericClient + Sync,
 {
-    async fn list_attestations_by(
+    async fn run_attestation_query(
         &self,
-        attesting_key_id: &str,
-    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
-        pg_list_attestations_by(self.0, attesting_key_id).await
-    }
-    async fn list_attestations_for(
-        &self,
-        attested_key_id: &str,
-    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
-        pg_list_attestations_for(self.0, attested_key_id).await
+        q: &crate::federation::attestation_query::AttestationQuery,
+    ) -> Result<crate::federation::attestation_query::QueryRows, crate::federation::Error> {
+        pg_execute_attestation_query(self.0, q).await
     }
 }
 
@@ -33927,8 +33921,10 @@ mod tests {
         let backend = PostgresBackend::connect(&dsn).await.expect("connect");
         backend.run_migrations().await.expect("migrations run");
         let suffix = uuid_like();
-        crate::federation::reverse_quorum::test_support::exercise_escalation_on_silence(
-            &backend, &suffix,
+        Box::pin(
+            crate::federation::reverse_quorum::test_support::exercise_escalation_on_silence(
+                &backend, &suffix,
+            ),
         )
         .await;
     }

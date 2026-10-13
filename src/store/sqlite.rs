@@ -32446,9 +32446,11 @@ mod tests {
     async fn escalation_on_silence_parity_sqlite_591() {
         let backend = SqliteBackend::open_in_memory().await.unwrap();
         backend.run_migrations().await.unwrap();
-        crate::federation::reverse_quorum::test_support::exercise_escalation_on_silence(
-            &backend,
-            "sqlite-esc",
+        Box::pin(
+            crate::federation::reverse_quorum::test_support::exercise_escalation_on_silence(
+                &backend,
+                "sqlite-esc",
+            ),
         )
         .await;
     }

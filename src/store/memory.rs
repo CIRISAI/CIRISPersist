@@ -23618,9 +23618,11 @@ mod tests {
     #[tokio::test]
     async fn escalation_on_silence_parity_memory_591() {
         let backend = MemoryBackend::new();
-        crate::federation::reverse_quorum::test_support::exercise_escalation_on_silence(
-            &backend,
-            "memory-esc",
+        Box::pin(
+            crate::federation::reverse_quorum::test_support::exercise_escalation_on_silence(
+                &backend,
+                "memory-esc",
+            ),
         )
         .await;
     }

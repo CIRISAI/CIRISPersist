@@ -66,8 +66,13 @@ pub const fn page_size(n: u32) -> NonZeroU32 {
 
 /// The page size of a fold that walks every matching row through [`Pages`]:
 /// large enough that a typical slice is one statement, small enough that no
-/// page is a history.
-pub const FOLD_PAGE: NonZeroU32 = page_size(500);
+/// page is a history. Under `cfg(test)` it is 3, so every fold's witness
+/// walks more than one page and exercises the cursor on its own fixture.
+pub const FOLD_PAGE: NonZeroU32 = if cfg!(test) {
+    page_size(3)
+} else {
+    page_size(500)
+};
 
 /// What the query asks of the envelope's top-level `dimension`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -196,6 +201,13 @@ impl AttestationQuery {
     #[must_use]
     pub fn authored_by(mut self, attesting_key_id: &str) -> Self {
         self.by = Some(attesting_key_id.to_owned());
+        self
+    }
+
+    /// Also pin the attested key.
+    #[must_use]
+    pub fn attested_to(mut self, attested_key_id: &str) -> Self {
+        self.to = Some(attested_key_id.to_owned());
         self
     }
 
@@ -368,6 +380,7 @@ impl AttestationQuery {
         Pages {
             query: self,
             done: false,
+            last: None,
         }
     }
 }
@@ -400,6 +413,9 @@ pub struct Page {
 pub struct Pages {
     query: AttestationQuery,
     done: bool,
+    /// The cursor the previous page returned: the next one must differ, or
+    /// the walk would never end.
+    last: Option<AttestationCursor>,
 }
 
 impl Pages {
@@ -407,7 +423,9 @@ impl Pages {
     ///
     /// # Errors
     ///
-    /// Whatever the read returns.
+    /// Whatever the read returns; [`Error::Backend`] when a page returns the
+    /// same cursor as the page before it (a cursor the executor ignored —
+    /// the walk would repeat that page forever).
     pub async fn next<E: AttestationQueryExec + ?Sized>(
         &mut self,
         dir: &E,
@@ -417,7 +435,16 @@ impl Pages {
         }
         let page = dir.query_attestations(&self.query).await.served()?;
         match page.next {
-            Some(c) => self.query.after = Some(c),
+            Some(c) => {
+                if self.last.as_ref() == Some(&c) {
+                    return Err(Error::Backend(format!(
+                        "attestation query cursor did not advance past ({}, {})",
+                        c.last_asserted_at, c.last_attestation_id
+                    )));
+                }
+                self.last = Some(c.clone());
+                self.query.after = Some(c);
+            }
             None => self.done = true,
         }
         Ok(Some(page.rows))

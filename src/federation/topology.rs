@@ -38,7 +38,10 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use std::num::NonZeroU32;
+
 use super::admission::envelope_dimension;
+use super::attestation_query::{AttestationQuery, AttestationReads, FOLD_PAGE};
 use super::types::attestation_type;
 use super::{Attestation, Error, FederationDirectory, KeyRecord};
 
@@ -188,21 +191,27 @@ pub async fn build_trust_topology(
         ));
     }
 
-    // Step 1 — fetch attestations.
-    let mut candidates: Vec<Attestation> = match (&filter.granter_key, &filter.grantee_key) {
-        (Some(g), _) => directory.list_attestations_by(g).await?,
-        (None, Some(g)) => directory.list_attestations_for(g).await?,
+    // Step 1 — fetch attestations: both sides and the purpose (the envelope's
+    // `dimension`) pinned in the query, every page of it.
+    let mut q = match (&filter.granter_key, &filter.grantee_key) {
+        (Some(g), grantee) => {
+            let q = AttestationQuery::by(g, FOLD_PAGE);
+            match grantee {
+                Some(t) => q.attested_to(t),
+                None => q,
+            }
+        }
+        (None, Some(g)) => AttestationQuery::to(g, FOLD_PAGE),
         // Guarded by the InvalidArgument check above.
-        (None, None) => Vec::new(),
+        (None, None) => unreachable!("granter_key or grantee_key is set"),
     };
-
-    // Apply the other-side filter in-memory if both are set.
-    if let (Some(_), Some(grantee)) = (&filter.granter_key, &filter.grantee_key) {
-        candidates.retain(|a| &a.attested_key_id == grantee);
-    }
-    // Purpose filter — checks the envelope's `dimension` field.
     if let Some(p) = &filter.purpose {
-        candidates.retain(|a| envelope_dimension(&a.attestation_envelope) == Some(p.as_str()));
+        q = q.dimension(p);
+    }
+    let mut candidates: Vec<Attestation> = Vec::new();
+    let mut pages = q.pages();
+    while let Some(page) = pages.next(directory).await? {
+        candidates.extend(page);
     }
 
     // Split by attestation_type — we need scores for the edges,
@@ -248,10 +257,11 @@ pub async fn build_trust_topology(
         granters_seen.insert(s.attesting_key_id.clone());
     }
     for g in &granters_seen {
-        for a in directory.list_attestations_for(g).await? {
-            if a.attestation_type == attestation_type::DELEGATES_TO {
-                delegated_granters.insert(a.attested_key_id.clone());
-            }
+        let mut pages = AttestationQuery::to(g, FOLD_PAGE)
+            .types(&[attestation_type::DELEGATES_TO])
+            .pages();
+        while let Some(page) = pages.next(directory).await? {
+            delegated_granters.extend(page.into_iter().map(|a| a.attested_key_id));
         }
     }
 
@@ -485,7 +495,18 @@ pub async fn build_delegation_graph(
         if depth >= effective_depth {
             continue;
         }
-        let rows = directory.list_attestations_by(&current).await?;
+        // The node's edges and its retractions of them.
+        let mut rows = Vec::new();
+        let mut pages = AttestationQuery::by(&current, FOLD_PAGE)
+            .types(&[
+                attestation_type::DELEGATES_TO,
+                attestation_type::WITHDRAWS,
+                attestation_type::RECANTS,
+            ])
+            .pages();
+        while let Some(page) = pages.next(directory).await? {
+            rows.extend(page);
+        }
         // Bucket retractions by recipient for fast lookup.
         let mut retractions: HashMap<String, WithdrawalEntry> = HashMap::new();
         for r in &rows {
@@ -548,11 +569,13 @@ pub async fn build_delegation_graph(
 /// depth cap, emit a `delegates_to` the walk may not follow? One read. Used
 /// for a recipient at the cap and, under a zero cap, for the root itself.
 async fn delegates_onward(directory: &dyn FederationDirectory, key: &str) -> Result<bool, Error> {
-    Ok(directory
-        .list_attestations_by(key)
-        .await?
-        .iter()
-        .any(|n| n.attestation_type == attestation_type::DELEGATES_TO))
+    let q = AttestationQuery::by(key, NonZeroU32::MIN).types(&[attestation_type::DELEGATES_TO]);
+    Ok(!directory
+        .query_attestations(&q)
+        .await
+        .served()?
+        .rows
+        .is_empty())
 }
 
 // ─── 2b. Outbound delegate standing ───────────────────────────────
@@ -660,7 +683,13 @@ where
             "live_delegate_standing: subject and candidate must be non-empty".into(),
         ));
     }
-    let rows = directory.list_attestations_by(subject).await?;
+    // Every row `subject` authored: the precedence fold below reads the whole
+    // record.
+    let mut rows = Vec::new();
+    let mut pages = AttestationQuery::by(subject, FOLD_PAGE).pages();
+    while let Some(page) = pages.next(directory).await? {
+        rows.extend(page);
+    }
 
     // Clause (2) — the ONE consolidated retraction fold. Every row here is
     // authored by `subject`, so a retraction among them is entitled under the

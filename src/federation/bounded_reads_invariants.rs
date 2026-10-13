@@ -58,15 +58,16 @@ pub(crate) mod bodies {
     /// Rows returned by reads of `method` keyed on `key`, summed.
     fn rows_of(log: &[read_probe::Read], method: &str, key: &str) -> usize {
         log.iter()
-            .filter(|r| r.method == method && r.key == key)
+            .filter(|r| r.is(method, key))
             .map(|r| r.rows)
             .sum()
     }
 
-    /// Calls of `method` keyed on `key`.
+    /// Calls of `method` keyed on `key`. A typed query's continuation pages
+    /// (a cursor set) are the same call, walked.
     fn calls_of(log: &[read_probe::Read], method: &str, key: &str) -> usize {
         log.iter()
-            .filter(|r| r.method == method && r.key == key)
+            .filter(|r| r.is(method, key) && r.is_first_page())
             .count()
     }
 
@@ -1400,7 +1401,7 @@ pub(crate) mod bodies {
                 "list_attestations",
             ] {
                 assert!(
-                    !log.iter().any(|r| r.method == m),
+                    !log.iter().any(|r| r.door() == m),
                     "I546: live_conferrals reads no slice ({m}): {log:?}"
                 );
             }
@@ -1426,7 +1427,7 @@ pub(crate) mod bodies {
     /// Calls of either whole-slice read, any key.
     fn slice_reads(log: &[read_probe::Read]) -> usize {
         log.iter()
-            .filter(|r| r.method == "list_attestations_by" || r.method == "list_attestations_for")
+            .filter(|r| r.is_slice_read() && r.is_first_page())
             .count()
     }
 

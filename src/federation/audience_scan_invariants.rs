@@ -1025,7 +1025,7 @@ pub(crate) mod bodies {
     /// The whole-slice reads a door made over `key`, from the probe.
     fn slice_reads_over(log: &[read_probe::Read], method: &str, key: &str) -> Vec<usize> {
         log.iter()
-            .filter(|r| r.method == method && r.key == key)
+            .filter(|r| r.is(method, key))
             .map(|r| r.rows)
             .collect()
     }
@@ -1033,7 +1033,7 @@ pub(crate) mod bodies {
     /// (rows, bytes) returned by every read keyed on `key`, whatever the method.
     fn reads_keyed_on(log: &[read_probe::Read], key: &str) -> (usize, usize) {
         log.iter()
-            .filter(|r| r.key == key)
+            .filter(|r| r.key == key || r.door_key() == key)
             .fold((0, 0), |(r, b), x| (r + x.rows, b + x.bytes))
     }
 
