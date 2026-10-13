@@ -1673,6 +1673,20 @@ jobs:
       # evidence export; the committed file must be exactly the generated one.
       - name: evidence tsv is generated from the manifest
         run: python3 scripts/evidence_tsv_test.py
+      # v56.0.0 (#934, #1076 slice T item 0) — every src/ row of
+      # evidence/cc_impl.tsv names a DEFINITION in its cited file at this
+      # commit (comments and literals blanked; a mention or a call site does
+      # not resolve). A GATE: a dead pointer is a false evidence claim.
+      - name: evidence pointers resolve to definitions
+        run: |
+          set -euo pipefail
+          python3 scripts/evidence_pointers_test.py
+          python3 scripts/evidence_pointers.py check
+      # v56.0.0 (#934) — the size counter behind evidence/size.tsv (fixtures, no
+      # cargo). The size DELTA itself is a report (ci-hygiene.yml, reports.yml);
+      # this step only proves the instrument counts what it claims to.
+      - name: size report witnesses
+        run: python3 scripts/size_report_test.py
       # v43.0.0 (BLOB_ENCRYPTION_AT_REST.md I22) — the storage floor token is
       # unconstructible outside the crate. The witness is a `compile_fail`
       # doctest, and nextest never runs doctests, so it gets its own step.

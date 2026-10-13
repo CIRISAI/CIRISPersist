@@ -1,0 +1,231 @@
+# REPORTS (non-gating) — CIRISPersist#934, #1076 slice T.
+#
+# Every job here prints what it found, uploads it, and stays green: each is
+# `continue-on-error: true` and each script exits 0 on a finding. Nothing in
+# this file can turn a PR or main red; promoting any of it to a gate is the
+# operator's call (docs/TOOLING.md says which tool is a report and which,
+# elsewhere, is a gate).
+#
+#   size       PR       per-file size of src/ vs the PR base (scripts/size_report.py)
+#   semver     PR, dispatch
+#                       public-API breaks vs the latest v* tag reachable from
+#                       the base (scripts/api_break_report.sh) — the CHANGELOG's
+#                       and Edge's break list
+#   coverage   weekly, dispatch
+#                       cargo llvm-cov per certify feature set (scripts/coverage.sh);
+#                       the legs are DERIVED (ci_feature_matrix.py legs), not listed
+#   mutants-diff  PR labelled `run-mutants`, dispatch
+#                       cargo-mutants on the changed lines only (scripts/mutants_diff.sh);
+#                       never runs by default
+#
+# On a PR, `size` shows this PR's own delta (vs the base), while `semver`
+# shows every break since the last release — main's and this PR's together,
+# which is the list the next CHANGELOG and Edge need.
+
+name: reports (non-gating)
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+  schedule:
+    - cron: '29 5 * * 1'      # Monday: coverage per feature set
+  workflow_dispatch:
+    inputs:
+      baseline:
+        description: 'semver baseline tag (default: latest v* tag reachable from the base)'
+        required: false
+      mutants_base:
+        description: 'mutants-diff base ref (default: origin/main)'
+        required: false
+        default: origin/main
+      run:
+        description: 'which report(s): all | semver | coverage | mutants-diff'
+        required: false
+        default: all
+
+permissions:
+  contents: read
+
+concurrency:
+  # A `labeled` event runs only mutants-diff, and only for its own label: it
+  # gets a group of its own per label, so adding a label never cancels a
+  # running size/semver report, nor a second label a running mutants job.
+  group: reports-${{ github.event_name }}-${{ github.event.action == 'labeled' && format('label-{0}', github.event.label.name) || 'run' }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: '10'
+  PYTHONUTF8: "1"
+
+jobs:
+  size:
+    name: size vs base (report)
+    if: github.event_name == 'pull_request' && github.event.action != 'labeled'
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: size of src/ vs the PR base (report)
+        env:
+          BASE: origin/${{ github.base_ref }}
+        run: |
+          { echo '```'; python3 scripts/size_report.py check --against "$BASE"; echo '```'; } | tee -a "$GITHUB_STEP_SUMMARY"
+
+  semver:
+    name: semver-checks vs previous release (report)
+    if: >-
+      (github.event_name == 'pull_request' && github.event.action != 'labeled')
+      || (github.event_name == 'workflow_dispatch' && contains(fromJSON('["all","semver"]'), inputs.run))
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Free runner disk (two rustdoc builds of the crate and its graph)
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+                      /usr/local/.ghcup /opt/hostedtoolcache/CodeQL 2>/dev/null || true
+          df -h / | tail -1
+      - uses: dtolnay/rust-toolchain@1.97.0
+      - uses: ./.github/actions/ciriscache
+        with:
+          plat: linux-x86_64
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-semver-checks
+      - name: derive the baseline tag
+        id: base
+        env:
+          INPUT: ${{ inputs.baseline }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          git fetch --tags --force --quiet
+          if [ -n "${INPUT:-}" ]; then tag="$INPUT"
+          else tag="$(git describe --tags --abbrev=0 --match 'v[0-9]*' "$BASE_SHA")"; fi
+          echo "baseline: $tag (latest v* tag reachable from ${BASE_SHA})"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+      - name: API breaks (report)
+        env:
+          TAG: ${{ steps.base.outputs.tag }}
+        run: |
+          scripts/api_break_report.sh "$TAG"
+          { echo "### API breaks vs $TAG (report)"; echo '```'; cat "target/semver/$TAG.summary" 2>/dev/null || echo "no summary — see the log"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: semver-report
+          path: target/semver/
+          retention-days: 30
+
+  coverage-legs:
+    if: >-
+      github.event_name == 'schedule'
+      || (github.event_name == 'workflow_dispatch' && contains(fromJSON('["all","coverage"]'), inputs.run))
+    runs-on: ubuntu-latest
+    outputs:
+      legs: ${{ steps.legs.outputs.legs }}
+    steps:
+      - uses: actions/checkout@v6
+      - id: legs
+        run: echo "legs=$(python3 scripts/ci_feature_matrix.py legs | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read().split()))')" >> "$GITHUB_OUTPUT"
+
+  coverage:
+    name: coverage ${{ matrix.leg }} (report)
+    needs: coverage-legs
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        leg: ${{ fromJSON(needs.coverage-legs.outputs.legs) }}
+    services:
+      postgres:
+        image: ghcr.io/cirisai/postgres:16
+        credentials:
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+        env:
+          POSTGRES_USER: ciris
+          POSTGRES_PASSWORD: ciris
+          POSTGRES_DB: ciris_persist_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ciris"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v6
+      - name: Free runner disk (instrumented objects are large)
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+                      /usr/local/.ghcup /opt/hostedtoolcache/CodeQL 2>/dev/null || true
+          df -h / | tail -1
+      - uses: dtolnay/rust-toolchain@1.97.0
+        with:
+          components: llvm-tools-preview
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest,cargo-llvm-cov
+      - name: psql client for pg_test_db.sh
+        run: command -v psql || (sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-client)
+      - name: coverage, leg ${{ matrix.leg }} (report)
+        env:
+          CIRIS_PERSIST_PG_ADMIN_URL: postgres://ciris:ciris@localhost:5432/ciris_persist_test
+          LEG: ${{ matrix.leg }}
+        run: |
+          scripts/coverage.sh "$LEG"
+          { echo "### coverage — $LEG (report)"; echo '```'; head -1 "target/coverage/$LEG/summary.txt"; grep -E '^TOTAL' "target/coverage/$LEG/summary.txt"; echo '```'; } >> "$GITHUB_STEP_SUMMARY" || true
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: coverage-${{ matrix.leg }}
+          path: |
+            target/coverage/${{ matrix.leg }}/lcov.info
+            target/coverage/${{ matrix.leg }}/summary.txt
+            target/coverage/${{ matrix.leg }}/html/
+          retention-days: 30
+
+  mutants-diff:
+    name: mutants on the diff (report)
+    if: >-
+      (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'run-mutants')
+        && (github.event.action != 'labeled' || github.event.label.name == 'run-mutants'))
+      || (github.event_name == 'workflow_dispatch' && contains(fromJSON('["all","mutants-diff"]'), inputs.run))
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@1.97.0
+      - uses: ./.github/actions/ciriscache
+        with:
+          plat: linux-x86_64
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest,cargo-mutants@27.1.0
+      - name: cargo-mutants on the changed lines (report)
+        env:
+          BASE: ${{ github.event_name == 'pull_request' && format('origin/{0}', github.base_ref) || inputs.mutants_base }}
+          MUTANTS_DIFF_BUDGET_SECS: '7200'
+        run: scripts/mutants_diff.sh "$BASE"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: mutants-diff
+          path: |
+            target/mutants-diff/summary.txt
+            target/mutants-diff/scope.diff
+            target/mutants-diff/list.txt
+            target/mutants-diff/mutants.out/
+          retention-days: 30
