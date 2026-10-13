@@ -953,7 +953,10 @@ pub async fn held_by<D>(
 where
     D: FederationDirectory + ?Sized,
 {
-    let mut shas: Vec<String> = Vec::new();
+    // v56.0.0 (#1071) — deduped as the pages arrive: the holder's reports
+    // include every daily renewal, so a Vec of every row's sha grew with
+    // the claim history; the set holds one entry per blob.
+    let mut shas: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut pages = AttestationQuery::by(holder_key_id, FOLD_PAGE)
         .dimension_prefix(CUSTODY_ACK_DIMENSION)
         .pages();
@@ -964,8 +967,6 @@ where
                 .map(|a| a.blob_sha256_hex),
         );
     }
-    shas.sort();
-    shas.dedup();
     let mut out = Vec::with_capacity(shas.len());
     for hex_sha in shas {
         let acks = super::custody_ack::custody_acks_of(dir, holder_key_id, &hex_sha).await?;
