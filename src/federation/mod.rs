@@ -12075,6 +12075,19 @@ pub mod malformed_row {
     /// A moderation row's signed subject digest does not parse
     /// (CIRISPersist#784).
     pub const MODERATION_SUBJECT_DIGEST: &str = "moderation_subject_digest_malformed";
+    /// v56.0.0 (CIRISPersist#1077, CC 3.3.6.2 rc8) — a signed
+    /// `transport_destination` envelope carries `transit_kex_pubkeys` with only
+    /// one of its two members (`x25519_base64`, `ml_kem_768_base64`), or with
+    /// neither. The pair is both or the member is absent.
+    pub const TRANSIT_KEX_HALF_PAIR: &str = "transit_kex_half_pair";
+    /// v56.0.0 (CIRISPersist#1077) — a `transit_kex_pubkeys` member decodes to
+    /// the wrong number of bytes (x25519: exactly 32; ML-KEM-768: exactly 1184).
+    pub const TRANSIT_KEX_WRONG_LENGTH: &str = "transit_kex_wrong_length";
+    /// v56.0.0 (CIRISPersist#1077, CC 3.3.6.2 key separation) — the transit
+    /// x25519 is the same 32 bytes as the row's own Reticulum link x25519
+    /// (`transport_x25519_pubkey_base64`): the one reuse that is byte-checkable
+    /// inside the envelope.
+    pub const TRANSIT_KEX_KEY_REUSE: &str = "transit_kex_key_reuse";
 
     /// Every token, for the from-disk witnesses and adopters' tables.
     pub const ALL: &[&str] = &[
@@ -12085,6 +12098,9 @@ pub mod malformed_row {
         ENVELOPE_NOT_CANONICAL,
         CUSTODY_ACK,
         MODERATION_SUBJECT_DIGEST,
+        TRANSIT_KEX_HALF_PAIR,
+        TRANSIT_KEX_WRONG_LENGTH,
+        TRANSIT_KEX_KEY_REUSE,
     ];
 }
 

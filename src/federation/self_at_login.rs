@@ -400,6 +400,222 @@ pub struct SignedTransportDestination {
     pub signature: ciris_verify_core::transport_binding::TransportBindingSignature,
 }
 
+// ─── transit KEX pair (CC 3.3.6.2 rc8, CIRISPersist#1077) ───────────
+
+/// v56.0.0 (CIRISPersist#1077, CC 3.3.6.2 at rc8 2a7ed97) — the
+/// `signed_envelope` member carrying a relay's **transit KEX public key pair**
+/// `{x25519, ml_kem_768}`: the static pair a non-member relay publishes for the
+/// CC 5.3.3.5 E1 hop-by-hop hybrid key exchange. The construction (pattern,
+/// labels, KDF, KATs) is CIRISVerify#309's; persist only stores, admits and
+/// serves the pair.
+///
+/// Wire shape inside the signed envelope (sorted keys under JCS):
+///
+/// ```json
+/// "transit_kex_pubkeys": {
+///   "ml_kem_768_base64": "<base64 of exactly 1184 bytes>",
+///   "x25519_base64": "<base64 of exactly 32 bytes>"
+/// }
+/// ```
+///
+/// **Envelope-only.** The pair is deliberately NOT a field of the typed
+/// [`TransportDestination`] projection. Edge's route plane syncs by
+/// `content_hash_of(SignedTransportDestination)` (the whole wrapper: the
+/// projection plus the verbatim envelope), so a serialized projection field
+/// would hash the same row differently on a v55 node and an upgraded one and
+/// churn forever. With the pair only in the envelope, the wrapper's bytes are
+/// identical across versions, and the pair is still hash-covered because the
+/// envelope is. Read it with [`SignedTransportDestination::transit_kex_pair`].
+pub const TRANSIT_KEX_PUBKEYS_MEMBER: &str = "transit_kex_pubkeys";
+/// The x25519 member inside [`TRANSIT_KEX_PUBKEYS_MEMBER`] (standard base64).
+pub const TRANSIT_KEX_X25519_MEMBER: &str = "x25519_base64";
+/// The ML-KEM-768 member inside [`TRANSIT_KEX_PUBKEYS_MEMBER`] (standard base64).
+pub const TRANSIT_KEX_ML_KEM_768_MEMBER: &str = "ml_kem_768_base64";
+/// Exact raw length of the transit x25519 public key.
+pub const TRANSIT_KEX_X25519_LEN: usize = 32;
+/// Exact raw length of the transit ML-KEM-768 encapsulation key.
+pub const TRANSIT_KEX_ML_KEM_768_LEN: usize = 1184;
+
+/// v56.0.0 (CIRISPersist#1077) — a relay's decoded transit KEX public key pair,
+/// as read from a signed transport-destination envelope by
+/// [`SignedTransportDestination::transit_kex_pair`]. The lengths are carried in
+/// the types, so a value of this struct is always a well-formed pair.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransitKexPair {
+    /// The static X25519 public key (32 raw bytes).
+    pub x25519: [u8; TRANSIT_KEX_X25519_LEN],
+    /// The static ML-KEM-768 encapsulation key (1184 raw bytes).
+    pub ml_kem_768: Box<[u8; TRANSIT_KEX_ML_KEM_768_LEN]>,
+}
+
+/// v56.0.0 (CIRISPersist#1077) — THE one reading of the transit KEX pair from a
+/// signed transport-destination envelope; the admission gate and the accessor
+/// both call it, so what admits is what reads.
+///
+/// - member absent ⇒ `Ok(None)` (the v55 shape, unchanged);
+/// - member present but not an object (including `null`) ⇒
+///   [`malformed_row::ENVELOPE_MEMBER_INVALID`](crate::federation::malformed_row::ENVELOPE_MEMBER_INVALID);
+/// - only one of the two members, or neither ⇒
+///   [`malformed_row::TRANSIT_KEX_HALF_PAIR`](crate::federation::malformed_row::TRANSIT_KEX_HALF_PAIR);
+/// - a member that is not a string or not standard base64 ⇒
+///   `ENVELOPE_MEMBER_INVALID`;
+/// - a member that decodes to anything but exactly 32 / 1184 bytes ⇒
+///   [`malformed_row::TRANSIT_KEX_WRONG_LENGTH`](crate::federation::malformed_row::TRANSIT_KEX_WRONG_LENGTH).
+///
+/// Unknown members inside the pair object are tolerated, as unknown members of
+/// the envelope are (the forward-compatible §0.9 member-presence parse).
+///
+/// # Errors
+///
+/// [`crate::federation::Error::MalformedRow`] on plane `transport_destination`,
+/// with one of the reasons above.
+pub fn transit_kex_pair_from_envelope(
+    envelope: &serde_json::Value,
+) -> Result<Option<TransitKexPair>, crate::federation::Error> {
+    use crate::federation::{malformed_row, Error};
+    use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+    const PLANE: &str = "transport_destination";
+
+    let Some(member) = envelope.get(TRANSIT_KEX_PUBKEYS_MEMBER) else {
+        return Ok(None);
+    };
+    let Some(obj) = member.as_object() else {
+        return Err(Error::malformed_row(
+            PLANE,
+            malformed_row::ENVELOPE_MEMBER_INVALID,
+            format!(
+                "signed transport_destination envelope `{TRANSIT_KEX_PUBKEYS_MEMBER}` must be an \
+                 object {{{TRANSIT_KEX_X25519_MEMBER}, {TRANSIT_KEX_ML_KEM_768_MEMBER}}}, got \
+                 {member}"
+            ),
+        ));
+    };
+    let (x, m) = match (
+        obj.get(TRANSIT_KEX_X25519_MEMBER),
+        obj.get(TRANSIT_KEX_ML_KEM_768_MEMBER),
+    ) {
+        (Some(x), Some(m)) => (x, m),
+        (x, m) => {
+            let missing = match (x, m) {
+                (None, None) => {
+                    format!(
+                        "both `{TRANSIT_KEX_X25519_MEMBER}` and `{TRANSIT_KEX_ML_KEM_768_MEMBER}`"
+                    )
+                }
+                (None, _) => format!("`{TRANSIT_KEX_X25519_MEMBER}`"),
+                _ => format!("`{TRANSIT_KEX_ML_KEM_768_MEMBER}`"),
+            };
+            return Err(Error::malformed_row(
+                PLANE,
+                malformed_row::TRANSIT_KEX_HALF_PAIR,
+                format!(
+                    "signed transport_destination `{TRANSIT_KEX_PUBKEYS_MEMBER}` is missing \
+                     {missing}: the transit KEX pair is both members or the member is absent \
+                     (CC 3.3.6.2)"
+                ),
+            ));
+        }
+    };
+    let decode = |label: &str, v: &serde_json::Value, want: usize| -> Result<Vec<u8>, Error> {
+        let s = v.as_str().ok_or_else(|| {
+            Error::malformed_row(
+                PLANE,
+                malformed_row::ENVELOPE_MEMBER_INVALID,
+                format!("`{TRANSIT_KEX_PUBKEYS_MEMBER}.{label}` must be a base64 string"),
+            )
+        })?;
+        let raw = B64.decode(s).map_err(|e| {
+            Error::malformed_row(
+                PLANE,
+                malformed_row::ENVELOPE_MEMBER_INVALID,
+                format!("`{TRANSIT_KEX_PUBKEYS_MEMBER}.{label}` is not standard base64: {e}"),
+            )
+        })?;
+        if raw.len() != want {
+            return Err(Error::malformed_row(
+                PLANE,
+                malformed_row::TRANSIT_KEX_WRONG_LENGTH,
+                format!(
+                    "`{TRANSIT_KEX_PUBKEYS_MEMBER}.{label}` must decode to exactly {want} bytes, \
+                     got {}",
+                    raw.len()
+                ),
+            ));
+        }
+        Ok(raw)
+    };
+    let x = decode(TRANSIT_KEX_X25519_MEMBER, x, TRANSIT_KEX_X25519_LEN)?;
+    let m = decode(TRANSIT_KEX_ML_KEM_768_MEMBER, m, TRANSIT_KEX_ML_KEM_768_LEN)?;
+    let x25519: [u8; TRANSIT_KEX_X25519_LEN] = x
+        .try_into()
+        .expect("length checked above: exactly TRANSIT_KEX_X25519_LEN");
+    let ml_kem_768: Box<[u8; TRANSIT_KEX_ML_KEM_768_LEN]> = m
+        .into_boxed_slice()
+        .try_into()
+        .expect("length checked above: exactly TRANSIT_KEX_ML_KEM_768_LEN");
+    Ok(Some(TransitKexPair { x25519, ml_kem_768 }))
+}
+
+/// v56.0.0 (CIRISPersist#1077) — do two signed envelopes carry the same transit
+/// KEX member (both absent, or byte-equal JSON)? The three backends'
+/// `put_signed_transport_destination` call this before answering `Unchanged`:
+/// the pair is envelope-only, so an equal typed projection at an equal
+/// `(epoch, asserted_at)` no longer means equal content. A same-clock re-sign
+/// that changes the pair is a fork and is `Refused`, never kept silently as
+/// the old pair.
+#[must_use]
+pub fn same_transit_kex_member(a: &serde_json::Value, b: &serde_json::Value) -> bool {
+    a.get(TRANSIT_KEX_PUBKEYS_MEMBER) == b.get(TRANSIT_KEX_PUBKEYS_MEMBER)
+}
+
+impl SignedTransportDestination {
+    /// v56.0.0 (CIRISPersist#1077, CC 3.3.6.2 rc8) — this binding's transit KEX
+    /// pair, read from [`Self::signed_envelope`] by
+    /// [`transit_kex_pair_from_envelope`] (exact 32 / 1184-byte lengths, both
+    /// members or neither). `Ok(None)` is a binding that publishes no pair; per
+    /// CC 3.3.6.2 such a node **cannot relay**.
+    ///
+    /// **Consumer rule:** use the pair only from a binding whose
+    /// [`Self::binding_provenance`] is [`BindingProvenance::Rooted`] (see
+    /// [`Self::rooted_transit_kex_pair`]), and only from a signed binding,
+    /// never from a bare announce. A row read back from persist has already
+    /// passed admission, so this only errs on a value built outside persist.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::federation::Error::MalformedRow`] on plane
+    /// `transport_destination` (`transit_kex_half_pair`,
+    /// `transit_kex_wrong_length`, `envelope_member_invalid`).
+    pub fn transit_kex_pair(&self) -> Result<Option<TransitKexPair>, crate::federation::Error> {
+        transit_kex_pair_from_envelope(&self.signed_envelope)
+    }
+
+    /// v56.0.0 (CIRISPersist#1077) — the binding's trust provenance, read from
+    /// the stored typed projection (which admission proved equal to the signed
+    /// envelope's token).
+    #[must_use]
+    pub fn binding_provenance(&self) -> BindingProvenance {
+        self.transport_destination.binding_provenance
+    }
+
+    /// v56.0.0 (CIRISPersist#1077) — [`Self::transit_kex_pair`] for a
+    /// [`BindingProvenance::Rooted`] binding, `Ok(None)` for an `Advisory`
+    /// one (a routing hint never supplies a hop key). The read a relay
+    /// resolver should use.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::transit_kex_pair`].
+    pub fn rooted_transit_kex_pair(
+        &self,
+    ) -> Result<Option<TransitKexPair>, crate::federation::Error> {
+        match self.binding_provenance() {
+            BindingProvenance::Rooted => self.transit_kex_pair(),
+            BindingProvenance::Advisory => Ok(None),
+        }
+    }
+}
+
 /// v17.0.0 (CIRISPersist#443) — outcome of a
 /// [`put_signed_transport_destination`](crate::federation::FederationDirectory::put_signed_transport_destination)
 /// monotonic apply. Modeled on
@@ -1510,5 +1726,597 @@ pub(crate) mod test_support {
         let rows = dir.list_transport_destinations_for(&occ).await.unwrap();
         assert_eq!(rows.len(), 1, "(4) a newer occurrence revives the route");
         assert_eq!(rows[0].destination, hex::encode([0x30u8; 16]));
+    }
+
+    /// v56.0.0 (CIRISPersist#1077, CC 3.3.6.2 rc8) — an envelope value for a
+    /// route row with an optional transit KEX member spliced in verbatim.
+    pub(crate) fn envelope_with_transit_kex(
+        row: &TransportDestination,
+        member: Option<serde_json::Value>,
+    ) -> serde_json::Value {
+        let mut env = serde_json::to_value(row).expect("route row to value");
+        if let Some(m) = member {
+            env.as_object_mut()
+                .expect("route envelope is an object")
+                .insert(TRANSIT_KEX_PUBKEYS_MEMBER.into(), m);
+        }
+        env
+    }
+
+    /// A well-formed `transit_kex_pubkeys` member from fill bytes.
+    pub(crate) fn transit_kex_member(x_fill: u8, m_fill: u8) -> serde_json::Value {
+        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+        serde_json::json!({
+            TRANSIT_KEX_X25519_MEMBER: B64.encode([x_fill; TRANSIT_KEX_X25519_LEN]),
+            TRANSIT_KEX_ML_KEM_768_MEMBER: B64.encode(vec![m_fill; TRANSIT_KEX_ML_KEM_768_LEN]),
+        })
+    }
+
+    /// `e` is the terminal `MalformedRow` on the route plane for `reason`.
+    pub(crate) fn expect_route_malformed(e: &crate::federation::Error, reason: &str, what: &str) {
+        assert!(
+            matches!(
+                e,
+                crate::federation::Error::MalformedRow { plane: "transport_destination", reason: r, .. }
+                    if *r == reason
+            ),
+            "{what}: expected MalformedRow {{ transport_destination, {reason} }}, got {} ({e:?})",
+            e.kind()
+        );
+    }
+
+    /// **The transit KEX matrix** (v56.0.0, CIRISPersist#1077), run on the
+    /// memory, sqlite and postgres backends. Every envelope is REALLY signed by
+    /// a registered key that may act for the route, so each refusal is the
+    /// pair rule's and not the signature gate's.
+    ///
+    /// - **I1011** a well-formed pair admits; the envelope is stored verbatim;
+    ///   `list_signed_transport_destinations_for` / `_since` and the
+    ///   content-hash point read re-serve it with the member intact; the
+    ///   accessor reads the pair back.
+    /// - **I1012** (backend leg) one member alone, an empty pair, and wrong
+    ///   lengths (31, 33, 1183, 1185) refuse by name; the stored row is
+    ///   untouched. A row with neither member admits and reads `None`.
+    /// - **I1014** rotation rides `(epoch, asserted_at)`: a higher epoch with a
+    ///   new pair supersedes; the older row is then `Refused`.
+    /// - **I1015** a same-clock re-sign that changes only the pair is
+    ///   `Refused` (the projection is equal, the content is not), and the exact
+    ///   replay stays `Unchanged`.
+    /// - **I1016** key separation: a transit x25519 equal to the row's own
+    ///   Reticulum link x25519 refuses (`transit_kex_key_reuse`).
+    pub(crate) async fn run_transit_kex_matrix(dir: &dyn FederationDirectory, suffix: &str) {
+        use crate::federation::malformed_row as mr;
+        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+        use ciris_crypto::{Ed25519Signer, MlDsa65Signer};
+        use ciris_verify_core::self_at_login::HybridSigningIdentity;
+        use ciris_verify_core::transport_binding::produce_signed_identity_occurrence;
+        use TransportDestinationApplyOutcome as Outcome;
+
+        let relay_id = format!("tkex-relay-{suffix}");
+        let relay = Box::new(HybridSigningIdentity::new(
+            &relay_id,
+            Ed25519Signer::random().unwrap(),
+            MlDsa65Signer::new().unwrap(),
+        ));
+        let member = relay.directory_member().unwrap();
+        dir.put_public_key(SignedKeyRecord {
+            record: fixture_key(
+                &relay_id,
+                member.ed25519_public_key_base64.clone(),
+                member.mldsa65_public_key_base64.clone(),
+            ),
+        })
+        .await
+        .expect("register relay key");
+
+        let sign = |row: TransportDestination, m: Option<serde_json::Value>| {
+            let env = envelope_with_transit_kex(&row, m);
+            let relay = relay.as_ref();
+            let relay_id = relay_id.clone();
+            async move {
+                let (env, sig) = produce_signed_identity_occurrence(relay, env)
+                    .await
+                    .expect("sign route envelope");
+                SignedTransportDestination {
+                    transport_destination: row,
+                    attesting_key_id: relay_id,
+                    signed_envelope: env,
+                    signature: sig,
+                }
+            }
+        };
+        let kind = "reticulum";
+
+        // I1012 — the v55 shape: neither member admits, accessor reads None.
+        let r0 = route(&relay_id, kind, "d0", 0, "2026-10-13T00:00:00Z");
+        let s0 = sign(r0.clone(), None).await;
+        assert_eq!(
+            dir.put_signed_transport_destination(&s0).await.unwrap(),
+            Outcome::Inserted,
+            "I1012: a row with no pair admits (v55 shape)"
+        );
+        assert_eq!(s0.transit_kex_pair().unwrap(), None);
+
+        // I1011 — a well-formed pair admits and is served verbatim.
+        let r1 = route(&relay_id, kind, "d1", 1, "2026-10-13T01:00:00Z");
+        let s1 = sign(r1.clone(), Some(transit_kex_member(0x11, 0x22))).await;
+        assert_eq!(
+            dir.put_signed_transport_destination(&s1).await.unwrap(),
+            Outcome::Superseded,
+            "I1011: a pair-bearing row supersedes the pairless one"
+        );
+        let held = dir
+            .list_signed_transport_destinations_for(&relay_id)
+            .await
+            .unwrap();
+        assert_eq!(held.len(), 1);
+        assert_eq!(
+            held[0].signed_envelope, s1.signed_envelope,
+            "I1011: the envelope is stored and re-served verbatim (_for)"
+        );
+        let pair = held[0]
+            .transit_kex_pair()
+            .unwrap()
+            .expect("I1011: pair reads back");
+        assert_eq!(pair.x25519, [0x11; TRANSIT_KEX_X25519_LEN]);
+        assert!(pair.ml_kem_768.iter().all(|b| *b == 0x22));
+        assert_eq!(
+            held[0].rooted_transit_kex_pair().unwrap(),
+            Some(pair.clone())
+        );
+        let served = dir
+            .list_signed_transport_destinations_since(None, 10_000)
+            .await
+            .unwrap();
+        let mine: Vec<_> = served
+            .iter()
+            .filter(|s| s.destination.transport_destination.occurrence_key_id == relay_id)
+            .collect();
+        assert_eq!(mine.len(), 1);
+        assert_eq!(
+            mine[0].destination, s1,
+            "I1011: the serve cursor re-serves the exact signed row (_since)"
+        );
+        assert_eq!(
+            mine[0].destination.transit_kex_pair().unwrap(),
+            Some(pair.clone())
+        );
+        let hash = crate::federation::wire_index::content_hash_of(&s1).unwrap();
+        let bytes = dir
+            .lookup_signed_record_by_content_hash("TransportDestination", &hash)
+            .await
+            .unwrap()
+            .expect("I1011: the pair-bearing row is point-readable by its content hash");
+        assert_eq!(bytes, serde_json::to_vec(&s1).unwrap());
+        let back: SignedTransportDestination = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(back.transit_kex_pair().unwrap(), Some(pair.clone()));
+
+        // I1012 — malformed pairs refuse by name, each REALLY signed; the
+        // stored row is untouched.
+        let x_ok = B64.encode([0x33u8; TRANSIT_KEX_X25519_LEN]);
+        let m_ok = B64.encode(vec![0x44u8; TRANSIT_KEX_ML_KEM_768_LEN]);
+        let cases: Vec<(&str, serde_json::Value, &str)> = vec![
+            (
+                "x25519 alone",
+                serde_json::json!({ TRANSIT_KEX_X25519_MEMBER: x_ok }),
+                mr::TRANSIT_KEX_HALF_PAIR,
+            ),
+            (
+                "ml_kem alone",
+                serde_json::json!({ TRANSIT_KEX_ML_KEM_768_MEMBER: m_ok }),
+                mr::TRANSIT_KEX_HALF_PAIR,
+            ),
+            (
+                "empty pair",
+                serde_json::json!({}),
+                mr::TRANSIT_KEX_HALF_PAIR,
+            ),
+            (
+                "x25519 31",
+                serde_json::json!({ TRANSIT_KEX_X25519_MEMBER: B64.encode([1u8; 31]), TRANSIT_KEX_ML_KEM_768_MEMBER: m_ok }),
+                mr::TRANSIT_KEX_WRONG_LENGTH,
+            ),
+            (
+                "x25519 33",
+                serde_json::json!({ TRANSIT_KEX_X25519_MEMBER: B64.encode([1u8; 33]), TRANSIT_KEX_ML_KEM_768_MEMBER: m_ok }),
+                mr::TRANSIT_KEX_WRONG_LENGTH,
+            ),
+            (
+                "ml_kem 1183",
+                serde_json::json!({ TRANSIT_KEX_X25519_MEMBER: x_ok, TRANSIT_KEX_ML_KEM_768_MEMBER: B64.encode(vec![1u8; 1183]) }),
+                mr::TRANSIT_KEX_WRONG_LENGTH,
+            ),
+            (
+                "ml_kem 1185",
+                serde_json::json!({ TRANSIT_KEX_X25519_MEMBER: x_ok, TRANSIT_KEX_ML_KEM_768_MEMBER: B64.encode(vec![1u8; 1185]) }),
+                mr::TRANSIT_KEX_WRONG_LENGTH,
+            ),
+            (
+                "null member",
+                serde_json::Value::Null,
+                mr::ENVELOPE_MEMBER_INVALID,
+            ),
+        ];
+        for (i, (what, m, reason)) in cases.into_iter().enumerate() {
+            let r = route(
+                &relay_id,
+                kind,
+                "bad",
+                50 + i as u64,
+                "2026-10-13T02:00:00Z",
+            );
+            let s = sign(r, Some(m)).await;
+            let e = dir
+                .put_signed_transport_destination(&s)
+                .await
+                .expect_err(what);
+            expect_route_malformed(&e, reason, &format!("I1012 {what}"));
+        }
+        let still = dir
+            .list_signed_transport_destinations_for(&relay_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            still[0], s1,
+            "I1012: refusals leave the stored row untouched"
+        );
+
+        // I1016 — key separation: transit x25519 == the row's RNS link x25519.
+        let mut r_reuse = route(&relay_id, kind, "reuse", 90, "2026-10-13T02:00:00Z");
+        r_reuse.transport_x25519_pubkey_base64 = Some(B64.encode([0x55u8; 32]));
+        let s_reuse = sign(r_reuse.clone(), Some(transit_kex_member(0x55, 0x66))).await;
+        let e = dir
+            .put_signed_transport_destination(&s_reuse)
+            .await
+            .expect_err("I1016: transit x25519 reusing the link key");
+        expect_route_malformed(&e, mr::TRANSIT_KEX_KEY_REUSE, "I1016");
+        // ... a distinct link key on the same row admits (the check is the
+        // equality, not the presence of a link key).
+        r_reuse.transport_x25519_pubkey_base64 = Some(B64.encode([0x56u8; 32]));
+        let s_sep = sign(r_reuse, Some(transit_kex_member(0x55, 0x66))).await;
+        assert_eq!(
+            dir.put_signed_transport_destination(&s_sep).await.unwrap(),
+            Outcome::Superseded,
+            "I1016: a transit x25519 distinct from the link key admits"
+        );
+        // I1014 — rotation: a higher epoch with a new pair supersedes.
+        let r2 = route(&relay_id, kind, "d2", 100, "2026-10-13T03:00:00Z");
+        let s2 = sign(r2.clone(), Some(transit_kex_member(0x77, 0x88))).await;
+        assert_eq!(
+            dir.put_signed_transport_destination(&s2).await.unwrap(),
+            Outcome::Superseded,
+            "I1014: a higher epoch with a new pair supersedes"
+        );
+        let now = dir
+            .list_signed_transport_destinations_for(&relay_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            now[0].transit_kex_pair().unwrap().unwrap().x25519,
+            [0x77; TRANSIT_KEX_X25519_LEN],
+            "I1014: the rotated pair is the one served"
+        );
+        // ... and the older pair-bearing row is Refused, as today.
+        assert!(
+            matches!(
+                dir.put_signed_transport_destination(&s1).await.unwrap(),
+                Outcome::Refused { .. }
+            ),
+            "I1014: an older row cannot roll the pair back"
+        );
+        // ... nor can the epoch-90 row it superseded.
+        assert!(matches!(
+            dir.put_signed_transport_destination(&s_sep).await.unwrap(),
+            Outcome::Refused { .. }
+        ));
+
+        // I1015 — same (epoch, asserted_at), same projection, different pair:
+        // a fork, Refused; the stored pair is unchanged.
+        let s2_fork = sign(r2.clone(), Some(transit_kex_member(0x99, 0xAA))).await;
+        assert_eq!(s2_fork.transport_destination, s2.transport_destination);
+        assert!(
+            matches!(
+                dir.put_signed_transport_destination(&s2_fork)
+                    .await
+                    .unwrap(),
+                Outcome::Refused { .. }
+            ),
+            "I1015: a same-clock re-sign that changes only the pair is a fork"
+        );
+        // ... and a same-clock re-sign that DROPS the pair is the same fork.
+        let s2_drop = sign(r2.clone(), None).await;
+        assert!(matches!(
+            dir.put_signed_transport_destination(&s2_drop)
+                .await
+                .unwrap(),
+            Outcome::Refused { .. }
+        ));
+        let now = dir
+            .list_signed_transport_destinations_for(&relay_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            now[0], s2,
+            "I1015: the stored row is still the first epoch-100 row"
+        );
+        // ... while the exact replay, and a re-signature of the SAME envelope
+        // (ML-DSA is randomized, so the signature bytes differ), stay Unchanged.
+        assert_eq!(
+            dir.put_signed_transport_destination(&s2).await.unwrap(),
+            Outcome::Unchanged
+        );
+        let s2_resig = sign(r2, Some(transit_kex_member(0x77, 0x88))).await;
+        assert_eq!(
+            dir.put_signed_transport_destination(&s2_resig)
+                .await
+                .unwrap(),
+            Outcome::Unchanged,
+            "I1015: same pair, same projection, fresh signature is idempotent"
+        );
+    }
+}
+
+/// v56.0.0 (CIRISPersist#1077, CC 3.3.6.2 rc8) — the pure transit KEX
+/// witnesses: the cross-version hash lockstep KAT, the parser KATs, and the
+/// v55-reader tolerance (from bytes and from disk).
+#[cfg(test)]
+mod transit_kex_tests {
+    use super::test_support::{envelope_with_transit_kex, transit_kex_member};
+    use super::*;
+    use crate::federation::malformed_row as mr;
+    use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+
+    /// The v55.0.0 `TransportDestination`, field for field and attribute for
+    /// attribute (`self_at_login.rs` at ca6bdf60): the reader an un-upgraded
+    /// node runs.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    struct V55TransportDestination {
+        occurrence_key_id: String,
+        transport_kind: String,
+        destination: String,
+        asserted_at: DateTime<Utc>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        last_seen_at: Option<DateTime<Utc>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        transport_ed25519_pubkey_base64: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        transport_x25519_pubkey_base64: Option<String>,
+        #[serde(default)]
+        binding_provenance: BindingProvenance,
+        #[serde(default)]
+        epoch: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        retired_at: Option<DateTime<Utc>>,
+    }
+
+    /// The v55.0.0 `SignedTransportDestination` wrapper.
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    struct V55SignedTransportDestination {
+        transport_destination: V55TransportDestination,
+        attesting_key_id: String,
+        signed_envelope: serde_json::Value,
+        signature: ciris_verify_core::transport_binding::TransportBindingSignature,
+    }
+
+    /// The fixed pair-bearing row the KAT pins. The projection is PARSED from
+    /// the envelope, as a node builds it, so a projection field that picked
+    /// the pair up would show in the bytes.
+    fn kat_row() -> SignedTransportDestination {
+        let row = TransportDestination {
+            occurrence_key_id: "kat-relay".into(),
+            transport_kind: "reticulum".into(),
+            destination: "kat-dest".into(),
+            asserted_at: "2026-10-13T00:00:00Z".parse().unwrap(),
+            last_seen_at: None,
+            transport_ed25519_pubkey_base64: None,
+            transport_x25519_pubkey_base64: Some(B64.encode([0x0Au8; 32])),
+            binding_provenance: BindingProvenance::Rooted,
+            epoch: 7,
+            retired_at: None,
+        };
+        let env = envelope_with_transit_kex(&row, Some(transit_kex_member(0x11, 0x22)));
+        let projection: TransportDestination = serde_json::from_value(env.clone()).unwrap();
+        assert_eq!(projection, row);
+        SignedTransportDestination {
+            transport_destination: projection,
+            attesting_key_id: "kat-relay".into(),
+            signed_envelope: env,
+            signature: ciris_verify_core::transport_binding::TransportBindingSignature {
+                ed25519_signature_base64: "ZWQyNTUxOQ==".into(),
+                mldsa65_signature_base64: Some("bWxkc2E2NQ==".into()),
+            },
+        }
+    }
+
+    /// The pinned content hash of [`kat_row`] (`sha256(serde_json::to_vec)`,
+    /// what `wire_index::content_hash_of` and CIRISEdge's route plane compute).
+    /// Recomputed independently from the expected wire bytes (struct-order
+    /// projection, sorted-key envelope, compact separators) in Python's
+    /// `hashlib`, not read back from this code.
+    const KAT_CONTENT_HASH: &str =
+        "14da66a0045da51be64ec2fbfb501c57fd8faf745b8320de625b2fee371965e2";
+
+    /// **I1010 (pure, the lockstep KAT).** One pair-bearing row serializes to
+    /// the same bytes under the v56 reader and a v55 reader: the projection
+    /// carries nothing of the pair, the pair rides only in the envelope (and so
+    /// is still hash-covered), and the content hash is pinned. The accessor
+    /// returns the pair.
+    #[test]
+    fn transit_kex_i1010_wrapper_bytes_identical_across_versions() {
+        let row = kat_row();
+        let bytes = serde_json::to_vec(&row).unwrap();
+
+        // The projection carries nothing of the pair.
+        let proj = serde_json::to_value(&row.transport_destination).unwrap();
+        assert!(
+            proj.as_object()
+                .unwrap()
+                .keys()
+                .all(|k| !k.contains("transit_kex")),
+            "I1010: the typed projection must not serialize the pair: {proj}"
+        );
+        // The pair is in the wrapper exactly once: inside the envelope.
+        let text = String::from_utf8(bytes.clone()).unwrap();
+        assert_eq!(text.matches(TRANSIT_KEX_PUBKEYS_MEMBER).count(), 1);
+
+        // A v55 reader parses the same bytes and re-serializes them unchanged.
+        let v55: V55SignedTransportDestination = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(serde_json::to_vec(&v55).unwrap(), bytes, "I1010: v55 bytes");
+        // ... and so does the v56 reader.
+        let v56: SignedTransportDestination = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(serde_json::to_vec(&v56).unwrap(), bytes, "I1010: v56 bytes");
+        // A v55 reader that builds its projection FROM the envelope agrees.
+        let v55_proj: V55TransportDestination =
+            serde_json::from_value(row.signed_envelope.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&v55_proj).unwrap(), proj);
+
+        let h = crate::federation::wire_index::content_hash_of(&row).unwrap();
+        assert_eq!(
+            h,
+            crate::federation::wire_index::content_hash_of(&v55).unwrap(),
+            "I1010: v55 and v56 compute the same content hash"
+        );
+        assert_eq!(h, KAT_CONTENT_HASH, "I1010: pinned content hash");
+
+        // The accessor returns the pair.
+        let pair = row.transit_kex_pair().unwrap().unwrap();
+        assert_eq!(pair.x25519, [0x11; TRANSIT_KEX_X25519_LEN]);
+        assert_eq!(
+            &pair.ml_kem_768[..],
+            &[0x22u8; TRANSIT_KEX_ML_KEM_768_LEN][..]
+        );
+        assert_eq!(row.rooted_transit_kex_pair().unwrap(), Some(pair));
+        // An Advisory binding never supplies a hop key.
+        let mut adv = row.clone();
+        adv.transport_destination.binding_provenance = BindingProvenance::Advisory;
+        assert_eq!(adv.binding_provenance(), BindingProvenance::Advisory);
+        assert_eq!(adv.rooted_transit_kex_pair().unwrap(), None);
+        assert!(adv.transit_kex_pair().unwrap().is_some());
+    }
+
+    /// **I1012 (pure, the length and both-or-neither KATs).**
+    #[test]
+    fn transit_kex_i1012_parser_kats() {
+        let parse = |m: Option<serde_json::Value>| {
+            transit_kex_pair_from_envelope(&match m {
+                Some(m) => serde_json::json!({ "destination": "d", TRANSIT_KEX_PUBKEYS_MEMBER: m }),
+                None => serde_json::json!({ "destination": "d" }),
+            })
+        };
+        let refused = |m: serde_json::Value, reason: &str, what: &str| {
+            let e = parse(Some(m)).expect_err(what);
+            super::test_support::expect_route_malformed(&e, reason, what);
+        };
+        let x = |n: usize| B64.encode(vec![1u8; n]);
+        // Neither: the v55 shape.
+        assert_eq!(parse(None).unwrap(), None);
+        // Both, exact lengths.
+        assert!(parse(Some(transit_kex_member(1, 2))).unwrap().is_some());
+        // One alone, or neither inside the object.
+        refused(
+            serde_json::json!({ TRANSIT_KEX_X25519_MEMBER: x(32) }),
+            mr::TRANSIT_KEX_HALF_PAIR,
+            "x alone",
+        );
+        refused(
+            serde_json::json!({ TRANSIT_KEX_ML_KEM_768_MEMBER: x(1184) }),
+            mr::TRANSIT_KEX_HALF_PAIR,
+            "ml_kem alone",
+        );
+        refused(serde_json::json!({}), mr::TRANSIT_KEX_HALF_PAIR, "empty");
+        // Exact lengths, each side, both directions.
+        for n in [0usize, 31, 33, 64] {
+            refused(
+                serde_json::json!({ TRANSIT_KEX_X25519_MEMBER: x(n), TRANSIT_KEX_ML_KEM_768_MEMBER: x(1184) }),
+                mr::TRANSIT_KEX_WRONG_LENGTH,
+                &format!("x25519 {n}"),
+            );
+        }
+        for n in [1183usize, 1185, 1088, 1568] {
+            refused(
+                serde_json::json!({ TRANSIT_KEX_X25519_MEMBER: x(32), TRANSIT_KEX_ML_KEM_768_MEMBER: x(n) }),
+                mr::TRANSIT_KEX_WRONG_LENGTH,
+                &format!("ml_kem {n}"),
+            );
+        }
+        // Ill-typed.
+        refused(serde_json::Value::Null, mr::ENVELOPE_MEMBER_INVALID, "null");
+        refused(
+            serde_json::json!("pair"),
+            mr::ENVELOPE_MEMBER_INVALID,
+            "string",
+        );
+        refused(
+            serde_json::json!({ TRANSIT_KEX_X25519_MEMBER: 5, TRANSIT_KEX_ML_KEM_768_MEMBER: x(1184) }),
+            mr::ENVELOPE_MEMBER_INVALID,
+            "number",
+        );
+        refused(
+            serde_json::json!({ TRANSIT_KEX_X25519_MEMBER: "!!not base64!!", TRANSIT_KEX_ML_KEM_768_MEMBER: x(1184) }),
+            mr::ENVELOPE_MEMBER_INVALID,
+            "not base64",
+        );
+        // Unknown members inside the pair are tolerated (forward-compatible).
+        let mut m = transit_kex_member(1, 2);
+        m.as_object_mut()
+            .unwrap()
+            .insert("future".into(), serde_json::json!(1));
+        assert!(parse(Some(m)).unwrap().is_some());
+        // The three new reasons are in the closed set.
+        for r in [
+            mr::TRANSIT_KEX_HALF_PAIR,
+            mr::TRANSIT_KEX_WRONG_LENGTH,
+            mr::TRANSIT_KEX_KEY_REUSE,
+        ] {
+            assert!(mr::ALL.contains(&r), "{r}");
+        }
+    }
+
+    /// **I1013 (pure).** A v55-shaped reader admits a pair-bearing envelope:
+    /// the typed projection parse tolerates the member, and no container on
+    /// this plane says `deny_unknown_fields` (checked from disk, comments
+    /// stripped, over the attribute block of each struct).
+    #[test]
+    fn transit_kex_i1013_v55_reader_tolerates_the_member() {
+        let row = kat_row();
+        let td: TransportDestination = serde_json::from_value(row.signed_envelope.clone())
+            .expect("I1013: the v56 projection parses a pair-bearing envelope");
+        assert_eq!(td, row.transport_destination);
+        let v55: V55TransportDestination = serde_json::from_value(row.signed_envelope.clone())
+            .expect("I1013: the v55 projection parses a pair-bearing envelope");
+        assert_eq!(v55.destination, "kat-dest");
+
+        let src = include_str!("self_at_login.rs");
+        let lines: Vec<&str> = src.lines().collect();
+        for name in [
+            "pub struct TransportDestination {",
+            "pub struct SignedTransportDestination {",
+        ] {
+            let at = lines
+                .iter()
+                .position(|l| l.trim_start() == name)
+                .unwrap_or_else(|| panic!("I1013: `{name}` not found on disk"));
+            // The contiguous attribute / doc block above the struct.
+            let mut i = at;
+            while i > 0 {
+                let l = lines[i - 1].trim_start();
+                if l.starts_with("#[") || l.starts_with("///") || l.starts_with("//") {
+                    i -= 1;
+                } else {
+                    break;
+                }
+            }
+            for l in &lines[i..at] {
+                let code = l.trim_start();
+                if code.starts_with("//") {
+                    continue;
+                }
+                assert!(
+                    !code.contains("deny_unknown_fields"),
+                    "I1013: `{name}` must not deny unknown fields (a v55 node must keep \
+                     admitting pair-bearing envelopes): {code}"
+                );
+            }
+        }
     }
 }

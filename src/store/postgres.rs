@@ -13399,23 +13399,39 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // monotonic-clock refusal applies only against a stored row that is
         // itself SIGNED; a signed write always reclaims an unsigned row
         // (occurrence-projection / announce state) regardless of clocks.
-        let stored_signed: bool = if existing.is_some() {
-            client
+        let (stored_signed, stored_envelope): (bool, Option<String>) = if existing.is_some() {
+            let r = client
                 .query_one(
-                    "SELECT signature IS NOT NULL FROM cirislens.transport_destinations \
+                    "SELECT signature IS NOT NULL, signed_envelope \
+                     FROM cirislens.transport_destinations \
                      WHERE occurrence_key_id = $1 AND transport_kind = $2",
                     &[&d.occurrence_key_id, &d.transport_kind],
                 )
                 .await
                 .map_err(|e| {
                     crate::federation::Error::Backend(format!("signed-presence read: {e}"))
-                })?
-                .get(0)
+                })?;
+            (r.get(0), r.get(1))
         } else {
-            false
+            (false, None)
         };
+        // v56.0.0 (#1077) — the transit KEX pair is envelope-only: an equal
+        // typed projection is `Unchanged` only when the stored envelope carries
+        // the same pair. A same-clock re-sign that changes it falls to the
+        // monotonic refusal below.
+        let same_pair = stored_envelope
+            .as_deref()
+            .and_then(|e| serde_json::from_str::<serde_json::Value>(e).ok())
+            .is_some_and(|stored| {
+                crate::federation::self_at_login::same_transit_kex_member(
+                    &stored,
+                    &signed.signed_envelope,
+                )
+            });
         let fresh = match existing {
-            Some(ref ex) if *ex == *d && stored_signed => return Ok(Outcome::Unchanged),
+            Some(ref ex) if *ex == *d && stored_signed && same_pair => {
+                return Ok(Outcome::Unchanged)
+            }
             Some(ref ex)
                 if stored_signed && (d.epoch, d.asserted_at) <= (ex.epoch, ex.asserted_at) =>
             {
@@ -31977,6 +31993,22 @@ mod tests {
     /// #443 — the authenticated route apply + signed tombstone matrix (real
     /// hybrid crypto) on postgres. Shares the assertion body with the memory
     /// + sqlite parity tests.
+    /// v56.0.0 (#1077) — the transit KEX matrix (I1011/I1012/I1014/I1015/
+    /// I1016) on postgres; shares its body with memory + sqlite.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn transit_kex_matrix_postgres() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        let suffix = uuid_like();
+        crate::federation::self_at_login::test_support::run_transit_kex_matrix(&backend, &suffix)
+            .await;
+    }
+
     #[tokio::test]
     #[serial_test::serial(postgres)]
     async fn signed_transport_route_matrix_postgres() {

@@ -7,6 +7,71 @@ threat-model citations because this crate's audit story is the point.
 
 ## [Unreleased]
 
+## [56.0.0] - UNRELEASED
+
+### Added — transit KEX pair on the TransportDestination binding (#1077, CC 3.3.6.2 rc8 2a7ed97)
+
+- **The member.** A signed `transport_destination` envelope may carry
+  `transit_kex_pubkeys {x25519_base64, ml_kem_768_base64}`: a relay's static
+  hybrid KEX pair for the CC 5.3.3.5 E1 hop exchange. Both values are standard
+  base64. The x25519 key decodes to exactly 32 bytes and the ML-KEM-768 key to
+  exactly 1184. The member is optional, and a row without it is the v55 shape,
+  unchanged. Persist stores, admits and serves the pair. It does not implement
+  the key exchange, whose pattern, labels, KDF and KATs belong to
+  CIRISVerify#309.
+- **Admission rules.** `admission::verify_signed_transport_destination`
+  refuses each violation as `Error::MalformedRow` on plane
+  `transport_destination`, before the signature check. A pair object with one
+  member or neither is `transit_kex_half_pair`. A member of the wrong decoded
+  length is `transit_kex_wrong_length`. A transit x25519 equal to the row's
+  own Reticulum link key (`transport_x25519_pubkey_base64`) is
+  `transit_kex_key_reuse`: CC 3.3.6.2 key separation, the reuse checkable from
+  the row's own bytes. A pair that is not an object (including `null`), a
+  non-string member or bad base64 is `envelope_member_invalid`. Unknown
+  members inside the pair object are tolerated. The three tokens join
+  `federation::malformed_row::ALL`.
+- **The accessor.** `SignedTransportDestination::transit_kex_pair(&self) ->
+  Result<Option<TransitKexPair>, Error>` reads the pair from `signed_envelope`
+  through `self_at_login::transit_kex_pair_from_envelope`, the same reading
+  admission applies. `TransitKexPair { x25519: [u8; 32], ml_kem_768: Box<[u8;
+  1184]> }` carries the lengths in its types. `rooted_transit_kex_pair()`
+  returns `None` for an `Advisory` binding, and `binding_provenance()` returns
+  the binding's provenance.
+- **Use the pair only from a Rooted binding.** CC 3.3.6.2 says a consumer
+  resolves a peer's KEX keys from the signed binding, never from a bare
+  announce. A node whose current binding carries no valid pair cannot relay.
+- **The content hash is identical across versions.** The pair is NOT a field
+  of the typed `TransportDestination` projection. CIRISEdge's route plane and
+  persist's wire index hash the whole `SignedTransportDestination` (the
+  projection plus the verbatim envelope). A v55 node and a v56 node therefore
+  produce byte-identical wrapper bytes and the same content hash for a
+  pair-bearing row, so a mixed fleet does not re-advertise and re-pull forever.
+  The pair is still hash-covered, because the envelope is. Witness I1010 pins
+  the hash of a fixed row as `14da66a0…65e2` and parses the same bytes through
+  a replica of the v55 types.
+- **Rotation** rides the existing `(epoch, asserted_at)` supersession, with no
+  new field. Because the projection no longer captures everything that
+  differs, all three backends now answer `Unchanged` only when the stored
+  envelope carries the same pair. A re-sign at the same `(epoch,
+  asserted_at)` that changes or drops the pair is `Refused` as a same-clock
+  fork. Before, it would have been kept as the old pair without a word.
+- **No migration.** The pair lives inside the stored `signed_envelope` text.
+  v55 nodes admit, store and re-serve pair-bearing envelopes unchanged, so this
+  needs no fleet floor.
+- **CIRISEdge adoption.** Build the pair into the envelope only: insert
+  `transit_kex_pubkeys` into the envelope JSON before signing, and leave the
+  typed row as it is. Resolve a peer's pair from cursor-replicated Rooted
+  bindings with `rooted_transit_kex_pair()` (or `transit_kex_pair()` after
+  your own provenance check). `content_hash_of` and its three call sites need
+  no change.
+- **Not enforced here.** CC also requires the pair to differ from the
+  identity's content-KEM keys (CC 3.3.6.1) and its signing keys. The first
+  lives on the occurrence plane, and checking it at this door would depend on
+  arrival order. The second is a different algorithm and is not byte-comparable.
+  Both remain producer obligations, as CC 3.3.6.1 rules for its own check.
+- **Witnesses** I1010–I1016. The memory, sqlite and postgres backends share
+  `run_transit_kex_matrix`.
+
 ## [55.0.0] - 2026-10-12
 
 ### Changed — CIRISConstitution v1.0-rc7 vendored (#753, slice A0)
