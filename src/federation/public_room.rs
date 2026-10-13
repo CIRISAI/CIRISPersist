@@ -357,9 +357,14 @@ where
         .await?;
     let refs: Vec<&Attestation> = rows.iter().chain(composers.iter()).collect();
     let retired = super::precedence::retired_ids(&refs);
+    // Codex r2 on #1065 — a listing expired at the read instant is not live:
+    // dropped BEFORE the maximum, so an older unexpired listing is the room's
+    // live one and a room whose every listing expired has none.
+    let now = chrono::Utc::now();
     Ok(rows
         .into_iter()
         .filter(|r| !retired.contains(&r.attestation_id))
+        .filter(|r| r.expires_at.is_none_or(|e| e > now))
         .max_by(|a, b| {
             (a.asserted_at, &a.persist_row_hash).cmp(&(b.asserted_at, &b.persist_row_hash))
         }))

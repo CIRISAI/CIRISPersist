@@ -637,6 +637,78 @@ pub(crate) mod dyn_bodies {
         );
     }
 
+    /// **I776** (Codex r2 on #1065) — the live listing is chosen among rows
+    /// not expired at the read instant: while the latest listing has expired
+    /// and an older one is live, the older one is returned; once every
+    /// listing has expired there is none.
+    pub(crate) async fn i776_an_expired_listing_is_not_live(
+        d: &dyn FederationDirectory,
+        tag: &str,
+    ) {
+        let (founder, _) = key(d, "i776f", tag).await;
+        let id = format!("i776-pub-{tag}");
+        put_room(d, room(&id, &founder, None, open_policy()))
+            .await
+            .unwrap();
+        let now = Utc::now();
+        let put = |n: &str, asserted: chrono::DateTime<Utc>, expires: chrono::DateTime<Utc>| {
+            let env = serde_json::json!({
+                "dimension": LISTING_DIMENSION, "score": 1.0, "confidence": 1.0,
+                "community_key_id": id, "cohort_subkind": COHORT_SUBKIND_PUBLIC,
+                "admission": ADMISSION_OPEN, "moderator": "m", "name": n, "description": "d",
+                "id": format!("i776-{n}-{tag}"),
+            });
+            let mut row =
+                ts::bare_attestation(&format!("i776-{n}-{tag}"), &founder, &founder, &env);
+            row.attestation_type = crate::federation::types::attestation_type::SCORES.into();
+            row.cohort_scope = cs::FEDERATION.into();
+            row.asserted_at = asserted;
+            row.expires_at = Some(expires);
+            ts::seal_row_in_place(&founder, &mut row);
+            row
+        };
+        let older = put(
+            "older",
+            now - Duration::minutes(2),
+            now + Duration::milliseconds(1500),
+        );
+        let newer = put(
+            "newer",
+            now - Duration::minutes(1),
+            now + Duration::milliseconds(500),
+        );
+        for r in [&older, &newer] {
+            d.put_attestation(SignedAttestation {
+                attestation: r.clone(),
+            })
+            .await
+            .expect("I776 a listing");
+        }
+        let live = || async {
+            live_listing(d, &id)
+                .await
+                .unwrap()
+                .map(|r| r.attestation_id)
+        };
+        assert_eq!(
+            live().await,
+            Some(newer.attestation_id.clone()),
+            "I776 precondition"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+        assert_eq!(
+            live().await,
+            Some(older.attestation_id.clone()),
+            "I776 the latest listing expired: the older live one is the room's"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+        assert_eq!(
+            live().await,
+            None,
+            "I776 every listing expired: none is live"
+        );
+    }
+
     /// **I714** — the listing door and the one live listing.
     pub(crate) async fn i714_the_listing_door(d: &dyn FederationDirectory, tag: &str) {
         let (founder, founder_alias) = key(d, "i714f", tag).await;
@@ -1590,6 +1662,7 @@ mod runners {
                 case!(i713_open_admission_rides_a_standing_proposal);
                 case!(i775_a_public_rooms_rows_reach_non_members);
                 case!(i714_the_listing_door);
+                case!(i776_an_expired_listing_is_not_live);
                 case!(i724_a_listing_waits_for_its_room);
             }
         };
