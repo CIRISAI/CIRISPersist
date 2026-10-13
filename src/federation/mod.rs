@@ -232,6 +232,10 @@ pub mod delegation_cycle_invariants;
 /// holder (I591).
 #[cfg(test)]
 pub mod grant_scope_invariants;
+/// v56.0.0 (CIRISPersist#934 step 1) — the local write door's occupied-id
+/// divergence across backends, pinned (I951).
+#[cfg(test)]
+pub(crate) mod local_door_divergence_invariants;
 /// CIRISPersist#972 — I335–I339, a node is seated without an acceptance.
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod node_seat_invariants;
