@@ -5862,8 +5862,8 @@ pub async fn verify_signed_identity_occurrence_revocation(
 ///    reopening). `last_seen_at` is advisory liveness, not signed material.
 ///    v56.0.0 (#1077) — an optional `transit_kex_pubkeys` pair is read from
 ///    the envelope only ([`crate::federation::self_at_login::transit_kex_pair_from_envelope`]: 32 / 1184 bytes,
-///    both or neither) and its x25519 must not be the row's transport x25519
-///    or ed25519, nor the signer's pinned ed25519.
+///    both or neither) and its x25519 must not be the row's Reticulum link
+///    x25519.
 /// 2. the detached hybrid signature over `JCS(signed_envelope)` verifies at
 ///    threshold **1-of-1** against the PINNED federation pubkeys of
 ///    `attesting_key_id` ([`verify_threshold_signatures`] — RequireHybrid; a
@@ -5990,35 +5990,25 @@ pub async fn verify_signed_transport_destination(
     // field), so there is no typed divergence to check; terminal on the bytes.
     let transit_pair = crate::federation::self_at_login::transit_kex_pair_from_envelope(env)?;
     // Key separation (CC 3.3.6.2, normative and admission-enforced): the
-    // transit x25519 must not be any 32-byte key this row itself names (the
-    // Reticulum link x25519 and the transport ed25519) nor the signer's pinned
-    // ed25519 (checked after the signer lookup below). That in-row rule is the
-    // WHOLE admission duty (CIRISPersist#1078): the identity's other keys live
-    // on another plane, an arrival-order-dependent read, and are judged at use
-    // by `self_at_login::transit_kex_pair_for`.
-    let transit_reuse = |what: &str| {
-        Error::malformed_row(
-            "transport_destination",
-            super::malformed_row::TRANSIT_KEX_KEY_REUSE,
-            format!(
-                "signed transport_destination: `transit_kex_pubkeys.x25519_base64` is the same \
-                 32 bytes as {what}; the transit pair must be key-separated (CC 3.3.6.2)"
-            ),
-        )
-    };
-    let same_32 = |b64: Option<&str>, pair: &crate::federation::self_at_login::TransitKexPair| {
-        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
-        b64.and_then(|s| B64.decode(s).ok()).as_deref() == Some(&pair.x25519[..])
-    };
+    // transit x25519 must not be the row's own Reticulum link x25519, the one
+    // reuse checkable from these bytes. Signing keys are a different algorithm
+    // and not byte-comparable (CC 3.3.6.1). That in-row rule is the WHOLE
+    // admission duty (CIRISPersist#1078): the identity's other keys live on
+    // another plane, an arrival-order-dependent read, and are judged at use by
+    // `self_at_login::transit_kex_pair_for`.
     if let Some(pair) = &transit_pair {
-        if same_32(row.transport_x25519_pubkey_base64.as_deref(), pair) {
-            return Err(transit_reuse(
-                "the Reticulum link key `transport_x25519_pubkey_base64`",
-            ));
-        }
-        if same_32(row.transport_ed25519_pubkey_base64.as_deref(), pair) {
-            return Err(transit_reuse(
-                "the transport key `transport_ed25519_pubkey_base64`",
+        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+        let link = row
+            .transport_x25519_pubkey_base64
+            .as_deref()
+            .and_then(|s| B64.decode(s).ok());
+        if link.as_deref() == Some(&pair.x25519[..]) {
+            return Err(Error::malformed_row(
+                "transport_destination",
+                super::malformed_row::TRANSIT_KEX_KEY_REUSE,
+                "signed transport_destination: `transit_kex_pubkeys.x25519_base64` is the same \
+                 key as the Reticulum link `transport_x25519_pubkey_base64`; the transit pair \
+                 must be key-separated (CC 3.3.6.2)",
             ));
         }
     }
@@ -6036,11 +6026,6 @@ pub async fn verify_signed_transport_destination(
             "transport_destination",
         ));
     };
-    if let Some(pair) = &transit_pair {
-        if same_32(Some(signer_key.pubkey_ed25519_base64.as_str()), pair) {
-            return Err(transit_reuse("the signer's pinned federation ed25519"));
-        }
-    }
     let bytes = crate::verify::canonical::ceg_produce_canonicalize(env).map_err(|e| {
         Error::malformed_row(
             "transport_destination",

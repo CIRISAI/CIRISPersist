@@ -24,11 +24,11 @@ threat-model citations because this crate's audit story is the point.
   `transport_destination`, before the signature check. A pair object with one
   member or neither is `transit_kex_half_pair`. A member of the wrong decoded
   length is `transit_kex_wrong_length`. A transit x25519 equal to the row's
-  own Reticulum link key (`transport_x25519_pubkey_base64`), to its transport
-  ed25519 (`transport_ed25519_pubkey_base64`), or to the signer's pinned
-  federation ed25519 is `transit_kex_key_reuse`. That is CC 3.3.6.2 key
-  separation as far as the row's own bytes and its signer reach, and it is the
-  whole admission duty (CIRISPersist#1078). A pair that is not an object (including `null`), a
+  own Reticulum link key (`transport_x25519_pubkey_base64`) is
+  `transit_kex_key_reuse`. That is CC 3.3.6.2 key separation as far as the
+  row's own bytes reach. Signing keys are a different algorithm and are not
+  byte-comparable (CC 3.3.6.1). This in-row rule is the whole admission duty
+  (CC 3.3.6.2 rc8, CIRISPersist#1078). A pair that is not an object (including `null`), a
   non-string member or bad base64 is `envelope_member_invalid`. Unknown
   members inside the pair object are tolerated. The three tokens join
   `federation::malformed_row::ALL`.
@@ -53,7 +53,8 @@ threat-model citations because this crate's audit story is the point.
   judges the rows as held with no clock. This closes the cross-row reuse case
   at use, deterministically. Admission cannot check it without depending on
   arrival order, which CC 3.2 T8 vii forbids, so there is no deferred check
-  and no retraction.
+  and no retraction. Generating a fresh pair, separate from every other
+  key, stays the producer's duty; the resolver is the consumer's backstop.
 - **The content hash is identical across versions.** The pair is NOT a field
   of the typed `TransportDestination` projection. CIRISEdge's route plane and
   persist's wire index hash the whole `SignedTransportDestination` (the
@@ -74,9 +75,9 @@ threat-model citations because this crate's audit story is the point.
   needs no fleet floor.
 - **CIRISEdge adoption.** Build the pair into the envelope only: insert
   `transit_kex_pubkeys {x25519_base64, ml_kem_768_base64}` into the envelope
-  JSON before signing, and leave the typed row as it is. Keep the transit
-  x25519 distinct from the row's transport keys and the signing key, or
-  admission refuses the row. For per-peer resolution call
+  JSON before signing, and leave the typed row as it is. Generate the pair
+  fresh. A transit x25519 equal to the row's link key is refused at admission,
+  and one equal to any other key of the node resolves to `None` at use. For per-peer resolution call
   `transit_kex_pair_for`, not the raw `transit_kex_pair()` accessor, which
   reads one row's envelope and applies neither the Rooted rule nor the
   occurrence comparison. Admission refusals to map are `transit_kex_half_pair`,

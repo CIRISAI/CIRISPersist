@@ -2076,29 +2076,18 @@ pub(crate) mod test_support {
             .await
             .expect_err("I1016: transit x25519 reusing the link key");
         expect_route_malformed(&e, mr::TRANSIT_KEX_KEY_REUSE, "I1016");
-        // ... the transport ed25519 named in the same row.
-        let mut r_ed = route(&relay_id, kind, "reuse-ed", 91, "2026-10-13T02:00:00Z");
+        // ... while the transport ed25519 and the signer's ed25519 are a
+        // different algorithm (CC 3.3.6.1: not byte-comparable), so an equal
+        // 32 bytes there is NOT an admission refusal; the resolver
+        // (`transit_kex_pair_for`) judges every key at use.
+        let mut r_ed = route(&relay_id, kind, "reuse-ed", 89, "2026-10-13T02:00:00Z");
         r_ed.transport_ed25519_pubkey_base64 = Some(B64.encode([0x57u8; 32]));
         let s_ed = sign(r_ed, Some(transit_kex_member(0x57, 0x66))).await;
-        let e = dir
-            .put_signed_transport_destination(&s_ed)
-            .await
-            .expect_err("I1016: transit x25519 reusing the transport ed25519");
-        expect_route_malformed(&e, mr::TRANSIT_KEX_KEY_REUSE, "I1016 transport ed25519");
-        // ... the signer's pinned federation ed25519.
-        let mut signer_member = transit_kex_member(0x00, 0x66);
-        signer_member[TRANSIT_KEX_X25519_MEMBER] =
-            serde_json::Value::String(member.ed25519_public_key_base64.clone());
-        let s_signer = sign(
-            route(&relay_id, kind, "reuse-signer", 92, "2026-10-13T02:00:00Z"),
-            Some(signer_member),
-        )
-        .await;
-        let e = dir
-            .put_signed_transport_destination(&s_signer)
-            .await
-            .expect_err("I1016: transit x25519 reusing the signer's ed25519");
-        expect_route_malformed(&e, mr::TRANSIT_KEX_KEY_REUSE, "I1016 signer ed25519");
+        assert_eq!(
+            dir.put_signed_transport_destination(&s_ed).await.unwrap(),
+            Outcome::Superseded,
+            "I1016: the in-row duty is the link key only"
+        );
         // ... a distinct link key on the same row admits (the check is the
         // equality, not the presence of a link key).
         r_reuse.transport_x25519_pubkey_base64 = Some(B64.encode([0x56u8; 32]));
