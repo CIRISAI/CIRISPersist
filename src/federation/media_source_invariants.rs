@@ -363,8 +363,9 @@ pub(crate) mod bodies {
         ));
     }
 
-    /// **I117 (directory half) — a `holds_bytes` claim without a size is
-    /// refused at ingest.**
+    /// **I117 (directory half) — a holding claim without a size is refused at
+    /// ingest.** v55.0.0 (CIRISPersist#989): the claim is `custody:ack:v1`
+    /// `here`, whose parse requires a positive size (`custody_ack_malformed`).
     pub async fn i117_a_claim_without_size_is_refused(d: &dyn FederationDirectory, s: &str) {
         let holder = format!("i117-h-{s}");
         ts::register_identity_key(d, &holder, USER).await;
@@ -373,13 +374,18 @@ pub(crate) mod bodies {
             sha2::Sha256::digest(format!("i117-bytes-{s}").as_bytes()).into()
         };
         let claim = |id: &str, size: serde_json::Value| {
-            let mut env =
-                serde_json::json!({"kind": "holds_bytes", "evidence_refs": [hex::encode(sha)]});
+            let mut env = serde_json::json!({
+                "dimension": crate::federation::custody_ack::CUSTODY_ACK_DIMENSION,
+                "custody_state": "here",
+                "evidence_refs": [hex::encode(sha)],
+                "score": 1.0,
+                "confidence": 1.0,
+            });
             if !size.is_null() {
                 env["size"] = size;
             }
             let mut r = row(id, &holder, &holder, env, cohort_scope::FEDERATION);
-            r.attestation_type = crate::federation::holds_bytes_attestation_type(&sha);
+            r.attestation_type = "scores".into();
             ts::reseal(&mut r);
             r
         };
@@ -392,9 +398,8 @@ pub(crate) mod bodies {
             let err = put(d, claim(&format!("i117-{n}-{s}"), size))
                 .await
                 .expect_err(&format!("I117: `{n}` size is refused"));
-            assert_eq!(
-                err.kind(),
-                "federation_media_source_invalid",
+            assert!(
+                err.to_string().contains("custody_ack_malformed"),
                 "I117 `{n}`: {err}"
             );
             assert!(err.to_string().contains("size"), "I117 `{n}`: {err}");
@@ -625,7 +630,7 @@ pub(crate) mod bodies {
         B: crate::federation::BlobStorage + FederationDirectory + Sync,
     {
         use crate::federation::at_rest_cascade::{fresh_dek, seal};
-        use crate::federation::blobs::sign_holds_bytes_claim;
+        use crate::federation::holding_claim::{sign_holding_claim, ClaimScope};
         use crate::federation::key_grant_invariants::two_node::{
             node_as, seed_community_everywhere,
         };
@@ -641,17 +646,25 @@ pub(crate) mod bodies {
             use sha2::Digest as _;
             sha2::Sha256::digest(&bytes).into()
         };
-        let zero = sign_holds_bytes_claim(&n.signer, &sha, &n.key, uuid::Uuid::new_v4(), now, 0)
+        let commons =
+            ClaimScope::of_content(CryptoTier::Plaintext, cohort_scope::FEDERATION, None).unwrap();
+        let zero = sign_holding_claim(&n.signer, &sha, uuid::Uuid::new_v4(), now, 0, &commons)
             .await
             .expect_err("I117d: the signer refuses a zero size");
         assert!(
             matches!(zero, BlobError::InvalidArgument(_)),
             "I117d: {zero}"
         );
-        let wrong =
-            sign_holds_bytes_claim(&n.signer, &sha, &n.key, uuid::Uuid::new_v4(), now, len + 1)
-                .await
-                .unwrap();
+        let wrong = sign_holding_claim(
+            &n.signer,
+            &sha,
+            uuid::Uuid::new_v4(),
+            now,
+            len + 1,
+            &commons,
+        )
+        .await
+        .unwrap();
         let err = b
             .put_blob_with_scope(
                 None,
@@ -674,7 +687,7 @@ pub(crate) mod bodies {
                 && b.list_holders_sized(&sha).await.unwrap().is_empty(),
             "I117d: a refused put stores nothing and announces nothing"
         );
-        let right = sign_holds_bytes_claim(&n.signer, &sha, &n.key, uuid::Uuid::new_v4(), now, len)
+        let right = sign_holding_claim(&n.signer, &sha, uuid::Uuid::new_v4(), now, len, &commons)
             .await
             .unwrap();
         b.put_blob_with_scope(
@@ -712,16 +725,12 @@ pub(crate) mod bodies {
                 epoch: 0,
             })
         };
-        let wrong = sign_holds_bytes_claim(
-            &n.signer,
-            &esha,
-            &n.key,
-            uuid::Uuid::new_v4(),
-            now,
-            elen + 1,
-        )
-        .await
-        .unwrap();
+        let room =
+            ClaimScope::of_content(CryptoTier::CommunityDek, COMMUNITY, Some(&comm)).unwrap();
+        let wrong =
+            sign_holding_claim(&n.signer, &esha, uuid::Uuid::new_v4(), now, elen + 1, &room)
+                .await
+                .unwrap();
         let err = b
             .adopt_sealed_blob_at(
                 envelope.clone(),
@@ -730,6 +739,7 @@ pub(crate) mod bodies {
                 &n.key,
                 StorageFloor::resolved(CryptoTier::CommunityDek),
                 binding(),
+                None,
                 Some(wrong),
             )
             .await
@@ -744,10 +754,9 @@ pub(crate) mod bodies {
             b.blob_cohort_scope(&esha).await.unwrap().is_none(),
             "I117d: a refused adopt stores nothing"
         );
-        let right =
-            sign_holds_bytes_claim(&n.signer, &esha, &n.key, uuid::Uuid::new_v4(), now, elen)
-                .await
-                .unwrap();
+        let right = sign_holding_claim(&n.signer, &esha, uuid::Uuid::new_v4(), now, elen, &room)
+            .await
+            .unwrap();
         let got = b
             .adopt_sealed_blob_at(
                 envelope,
@@ -756,6 +765,7 @@ pub(crate) mod bodies {
                 &n.key,
                 StorageFloor::resolved(CryptoTier::CommunityDek),
                 binding(),
+                None,
                 Some(right),
             )
             .await
@@ -810,8 +820,9 @@ pub(crate) mod bodies {
                 "I119b: a well-formed struct is not what the chokepoint refuses: {err}"
             );
         }
-        // The holder claim's size, carried to the same site: a `holds_bytes`
-        // row without `size` does not cross either.
+        // The holder claim's size, carried to the same site: a holding claim
+        // (`custody:ack:v1` `here`, v55.0.0) without `size` does not cross
+        // either.
         let sha: [u8; 32] = {
             use sha2::Digest as _;
             sha2::Sha256::digest(format!("i119b-bytes-{s}").as_bytes()).into()
@@ -820,17 +831,21 @@ pub(crate) mod bodies {
             &format!("i119b-sizeless-{s}"),
             &signer,
             &signer,
-            serde_json::json!({"kind": "holds_bytes", "evidence_refs": [hex::encode(sha)]}),
+            serde_json::json!({
+                "dimension": crate::federation::custody_ack::CUSTODY_ACK_DIMENSION,
+                "custody_state": "here",
+                "evidence_refs": [hex::encode(sha)],
+                "score": 1.0,
+                "confidence": 1.0,
+            }),
             cohort_scope::FEDERATION,
         );
-        sizeless.attestation_type = crate::federation::holds_bytes_attestation_type(&sha);
         ts::reseal(&mut sizeless);
         let err = check_promotion_admission(d, &sizeless, None)
             .await
             .expect_err("I119b: the chokepoint refuses a size-less holder claim");
-        assert_eq!(
-            err.kind(),
-            "federation_media_source_invalid",
+        assert!(
+            err.to_string().contains("custody_ack_malformed"),
             "I119b: {err}"
         );
         assert!(err.to_string().contains("size"), "I119b: {err}");

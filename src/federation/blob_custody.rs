@@ -85,6 +85,11 @@ pub struct BlobCustody {
     /// takes the stream that names them.
     #[serde(default)]
     pub device_custody: Vec<super::custody_ack::DeviceCustody>,
+    /// v55.0.0 (CIRISEdge v55) — the takedown notice that withholds the blob
+    /// ([`steward_purge::purge_withheld`](super::steward_purge::purge_withheld)),
+    /// so a caller reading custody directly sees it is not to be repaired.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub withheld: Option<String>,
 }
 
 fn tier_token(t: CryptoTier) -> &'static str {
@@ -155,7 +160,8 @@ where
         return Err(refuse_missing_row(backend, at_rest_sha256, viewer_key_id).await?);
     };
     authorize_viewer_by_tier(backend, at_rest_sha256, head.crypto_tier, viewer_key_id).await?;
-    let held_here = backend.has_blob(at_rest_sha256).await?;
+    // A custody read, not an access to the bytes (Codex r2 on #1065).
+    let held_here = backend.blob_head(at_rest_sha256).await?.is_some();
     let self_node = backend.node_key_id();
     let (access, observable_elsewhere, why) = match head.crypto_tier {
         CryptoTier::InvisibleEncrypted => {
@@ -170,9 +176,9 @@ where
                 group_by_person(backend, devices, "at_rest_grant").await?,
                 false,
                 Some(
-                    "self/family bytes are never announced (CC 5.2 structural invisibility): \
-                     copies on other devices are counted from their custody reports (CC \
-                     3.1.3.3); a device with no live report is unknown, not none"
+                    "self/family holding claims stay within the cohort (CC 5.2, 3.1.3.3): \
+                     copies on other devices are counted from their custody reports; a device \
+                     with no live report is unknown, not none"
                         .to_owned(),
                 ),
             )
@@ -253,5 +259,6 @@ where
         copies_observable: true,
         why,
         device_custody,
+        withheld: super::holding_claim::withheld_by(backend, at_rest_sha256).await?,
     })
 }

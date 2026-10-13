@@ -157,16 +157,10 @@ impl NodeCoreService for PostgresBackend {
         if takedown.is_some() {
             // v8.7.2: authority over the SIGNED content provenance — the
             // payload's declared subjects are advisory/routing-only.
-            let (content_sha256, community_id) = super::payload_target_descriptor(&env.payload);
-            super::check_moderation_or_reject(
-                self,
-                &env.author_id,
-                &content_sha256,
-                &community_id,
-                crate::federation::admission::DELEGATION_SCOPE_TAKEDOWN,
-                "takedown_notice",
-            )
-            .await?;
+            // v55.0.0 (CIRISPersist#1007) — the one takedown authority
+            // decision, over the content's HELD binding (never the notice's
+            // community_id).
+            super::check_takedown_or_reject(self, &env.author_id, &env.payload).await?;
         }
         let key_grant =
             super::media_sharing::extract_key_grant_payload(subject_kind, &env.payload)?;

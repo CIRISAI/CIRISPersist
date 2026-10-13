@@ -15,6 +15,11 @@ asserts:
     (1 <= M <= N; an unparseable protocol is refused, never guessed), and the
     DISTINCT authorizing holders that are named in the bundle's own `holders`
     must reach M. Short -> exit 1.
+    The bundle response must also name its `charter_root_key_id` (a
+    non-empty string): a bundle that names no charter root is not a root to
+    sign against. v55.0.0 (CIRISPersist#1056) adopts CIRISEdge#571's stricter
+    rule, which Edge kept beside its byte-for-byte copy of this script
+    (CIRISEdge#575), so the two pre-flights converge.
   * OLD `stewards` shape -> gated on a deployed steward, unchanged.
   * UNRECOGNISED shape / unreadable body -> fails closed.
 
@@ -69,6 +74,12 @@ def check(d):
             f"  consensus_protocol={proto}  holders={len(holders)}  authorizations={len(auths)}",
             f"  serve_nodes={len(b.get('serve_nodes') or [])}  attestations={len(b.get('attestations') or [])}",
         ]
+        charter = d.get("charter_root_key_id")
+        if not isinstance(charter, str) or not charter.strip():
+            raise Refused(
+                "registry response names no charter_root_key_id "
+                "(AV-28 ephemeral-mode guard; CIRISEdge#571, CIRISPersist#1056)"
+            )
         quorum = parse_quorum(proto)
         if quorum is None:
             raise Refused(
@@ -130,8 +141,8 @@ def check(d):
     )
 
 
-def _bundle(auth_ids, proto="quorum:2/3"):
-    return {
+def _bundle(auth_ids, proto="quorum:2/3", charter="humanity-accord"):
+    body = {
         "bundle": {
             "version": 3,
             "family_key_id": "humanity-accord",
@@ -141,9 +152,12 @@ def _bundle(auth_ids, proto="quorum:2/3"):
             "attestations": [],
             "authorizations": [{"holder_key_id": k} for k in auth_ids],
         },
-        "charter_root_key_id": "humanity-accord",
+        "charter_root_key_id": charter,
         "served_by": {"node_key_id": "n", "accepts_this_root": True},
     }
+    if charter is None:
+        del body["charter_root_key_id"]
+    return body
 
 
 # (name, body, must_pass). The `authorizations: []` row is the fixture #809
@@ -157,6 +171,11 @@ FIXTURES = [
     ("bundle non-holder authorization", _bundle(["A1", "Z9"]), False),
     ("bundle unparseable protocol", _bundle(["A1", "B1"], proto="majority"), False),
     ("bundle M > N", _bundle(["A1", "B1"], proto="quorum:4/3"), False),
+    # CIRISPersist#1056 / CIRISEdge#571: a met quorum does not stand in for a
+    # charter root the response does not name.
+    ("bundle 2-of-3, no charter_root_key_id", _bundle(["A1", "B1"], charter=None), False),
+    ("bundle 2-of-3, empty charter_root_key_id", _bundle(["A1", "B1"], charter=" "), False),
+    ("bundle 2-of-3, non-string charter_root_key_id", _bundle(["A1", "B1"], charter=7), False),
     ("old shape, steward deployed", {"stewards": [{"key_id": "s", "deployed": True}]}, True),
     ("old shape, none deployed", {"stewards": [{"key_id": "s", "deployed": False}]}, False),
     ("unknown third shape", {"something": 1}, False),

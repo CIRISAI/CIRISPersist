@@ -1,9 +1,9 @@
 {
  "_meta": {
-  "cc_commit": "3c3e63fdef844f2f849e43081a8242e31cfaf30d",
+  "cc_commit": "536b8cbb931da1f4549425284af24cd227587c36",
   "generator": "scripts/gen_namespace_match_binds.py",
   "reference": "tools/cc_namespace_match.py",
-  "vectors_sha256": "c4226dfb769c8939b608398e9b6b4364dde62b8ac40b2cd25363af9bb4622810"
+  "vectors_sha256": "8fc35ba167f1ab0d2cb5b4ea742865dff3fd92d1bd751105ddbb7fc191a73331"
  },
  "binds": [
   {
@@ -55,6 +55,14 @@
    },
    "dimension": "accord:lifecycle:active:v1",
    "family": "accord:lifecycle:active",
+   "refusal": null
+  },
+  {
+   "binds": {
+    "version": "v1"
+   },
+   "dimension": "accord:lifecycle:confirmed:v1",
+   "family": "accord:lifecycle:confirmed",
    "refusal": null
   },
   {
@@ -300,6 +308,44 @@
    "binds": {},
    "dimension": "accord:lifecycle:active",
    "family": "accord:lifecycle:active",
+   "refusal": "missing_version_segment"
+  },
+  {
+   "binds": {
+    "version": "v1"
+   },
+   "dimension": "accord:lifecycle:confirmed:v1",
+   "family": "accord:lifecycle:confirmed",
+   "refusal": null
+  },
+  {
+   "binds": {},
+   "dimension": "accord:lifecycle:confirmed:V1",
+   "family": "accord:lifecycle:confirmed",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "accord:lifecycle:confirmed:v1:v2",
+   "family": "accord:lifecycle:confirmed",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "accord:lifecycle:confirmed:v1beta",
+   "family": "accord:lifecycle:confirmed",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "Accord:lifecycle:confirmed:v1",
+   "family": "accord:lifecycle:confirmed",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "accord:lifecycle:confirmed",
+   "family": "accord:lifecycle:confirmed",
    "refusal": "missing_version_segment"
   },
   {
@@ -1698,6 +1744,44 @@
    },
    "dimension": "commitment_fulfillment:id1",
    "family": "commitment_fulfillment:{prior_contribution_id}",
+   "refusal": "missing_version_segment"
+  },
+  {
+   "binds": {
+    "version": "v1"
+   },
+   "dimension": "community:listing:v1",
+   "family": "community:listing",
+   "refusal": null
+  },
+  {
+   "binds": {},
+   "dimension": "community:listing:V1",
+   "family": "community:listing",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "community:listing:v1:v2",
+   "family": "community:listing",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "community:listing:v1beta",
+   "family": "community:listing",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "Community:listing:v1",
+   "family": "community:listing",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "community:listing",
+   "family": "community:listing",
    "refusal": "missing_version_segment"
   },
   {
@@ -3950,6 +4034,44 @@
   },
   {
    "binds": {
+    "version": "v1"
+   },
+   "dimension": "group:roster:v1",
+   "family": "group:roster",
+   "refusal": null
+  },
+  {
+   "binds": {},
+   "dimension": "group:roster:V1",
+   "family": "group:roster",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "group:roster:v1:v2",
+   "family": "group:roster",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "group:roster:v1beta",
+   "family": "group:roster",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "Group:roster:v1",
+   "family": "group:roster",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "group:roster",
+   "family": "group:roster",
+   "refusal": "missing_version_segment"
+  },
+  {
+   "binds": {
     "kind": "sample",
     "version": "v1"
    },
@@ -4098,47 +4220,6 @@
   },
   {
    "binds": {
-    "prefix": "ab12",
-    "version": "v1"
-   },
-   "dimension": "holds_bytes:sha256:ab12:v1",
-   "family": "holds_bytes:sha256:{prefix}",
-   "refusal": null
-  },
-  {
-   "binds": {},
-   "dimension": "holds_bytes:sha256:ab12:V1",
-   "family": "holds_bytes:sha256:{prefix}",
-   "refusal": "namespace_dimension_case_malformed"
-  },
-  {
-   "binds": {},
-   "dimension": "holds_bytes:sha256:ab12:v1:v2",
-   "family": "holds_bytes:sha256:{prefix}",
-   "refusal": "namespace_dimension_case_malformed"
-  },
-  {
-   "binds": {},
-   "dimension": "holds_bytes:sha256:ab12:v1beta",
-   "family": "holds_bytes:sha256:{prefix}",
-   "refusal": "namespace_dimension_case_malformed"
-  },
-  {
-   "binds": {},
-   "dimension": "Holds_bytes:sha256:ab12:v1",
-   "family": "holds_bytes:sha256:{prefix}",
-   "refusal": "namespace_dimension_case_malformed"
-  },
-  {
-   "binds": {
-    "prefix": "ab12"
-   },
-   "dimension": "holds_bytes:sha256:ab12",
-   "family": "holds_bytes:sha256:{prefix}",
-   "refusal": "missing_version_segment"
-  },
-  {
-   "binds": {
     "canonical_hash": "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
    },
    "dimension": "identity:canonical_binding:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
@@ -4153,6 +4234,44 @@
    "dimension": "identity:canonical_binding:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789:v1",
    "family": "identity:canonical_binding:{canonical_hash}",
    "refusal": null
+  },
+  {
+   "binds": {
+    "version": "v1"
+   },
+   "dimension": "identity:occurrence:v1",
+   "family": "identity:occurrence",
+   "refusal": null
+  },
+  {
+   "binds": {},
+   "dimension": "identity:occurrence:V1",
+   "family": "identity:occurrence",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "identity:occurrence:v1:v2",
+   "family": "identity:occurrence",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "identity:occurrence:v1beta",
+   "family": "identity:occurrence",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "Identity:occurrence:v1",
+   "family": "identity:occurrence",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "identity:occurrence",
+   "family": "identity:occurrence",
+   "refusal": "missing_version_segment"
   },
   {
    "binds": {
@@ -4380,6 +4499,82 @@
   },
   {
    "binds": {
+    "version": "v1"
+   },
+   "dimension": "key:record:v1",
+   "family": "key:record",
+   "refusal": null
+  },
+  {
+   "binds": {},
+   "dimension": "key:record:V1",
+   "family": "key:record",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "key:record:v1:v2",
+   "family": "key:record",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "key:record:v1beta",
+   "family": "key:record",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "Key:record:v1",
+   "family": "key:record",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "key:record",
+   "family": "key:record",
+   "refusal": "missing_version_segment"
+  },
+  {
+   "binds": {
+    "version": "v1"
+   },
+   "dimension": "key:revocation:v1",
+   "family": "key:revocation",
+   "refusal": null
+  },
+  {
+   "binds": {},
+   "dimension": "key:revocation:V1",
+   "family": "key:revocation",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "key:revocation:v1:v2",
+   "family": "key:revocation",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "key:revocation:v1beta",
+   "family": "key:revocation",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "Key:revocation:v1",
+   "family": "key:revocation",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "key:revocation",
+   "family": "key:revocation",
+   "refusal": "missing_version_segment"
+  },
+  {
+   "binds": {
     "scope": "sample",
     "version": "v1"
    },
@@ -4426,6 +4621,199 @@
    "dimension": "key_boundary:SAMPLE:v1",
    "family": "key_boundary:{scope}",
    "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {
+    "axis": "content",
+    "version": "v1"
+   },
+   "dimension": "key_grant:content:v1",
+   "family": "key_grant:{axis}",
+   "refusal": null
+  },
+  {
+   "binds": {},
+   "dimension": "key_grant:content:V1",
+   "family": "key_grant:{axis}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "key_grant:content:v1:v2",
+   "family": "key_grant:{axis}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "key_grant:content:v1beta",
+   "family": "key_grant:{axis}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "Key_grant:content:v1",
+   "family": "key_grant:{axis}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {
+    "axis": "content"
+   },
+   "dimension": "key_grant:content",
+   "family": "key_grant:{axis}",
+   "refusal": "missing_version_segment"
+  },
+  {
+   "binds": {
+    "axis": "CONTENT"
+   },
+   "dimension": "key_grant:CONTENT:v1",
+   "family": "key_grant:{axis}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {
+    "axis": "not_a_listed_value"
+   },
+   "dimension": "key_grant:not_a_listed_value:v1",
+   "family": "key_grant:{axis}",
+   "refusal": "namespace_vocab_value_unregistered"
+  },
+  {
+   "binds": {
+    "unit": "USD",
+    "version": "v1"
+   },
+   "dimension": "ledger:checkpoint:USD:v1",
+   "family": "ledger:checkpoint:{unit}:{version}",
+   "refusal": null
+  },
+  {
+   "binds": {
+    "unit": "USD",
+    "version": "V1"
+   },
+   "dimension": "ledger:checkpoint:USD:V1",
+   "family": "ledger:checkpoint:{unit}:{version}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "ledger:checkpoint:USD:v1:v2",
+   "family": "ledger:checkpoint:{unit}:{version}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {
+    "unit": "USD",
+    "version": "v1beta"
+   },
+   "dimension": "ledger:checkpoint:USD:v1beta",
+   "family": "ledger:checkpoint:{unit}:{version}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "Ledger:checkpoint:USD:v1",
+   "family": "ledger:checkpoint:{unit}:{version}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {
+    "unit": "USD"
+   },
+   "dimension": "ledger:checkpoint:USD",
+   "family": "ledger:checkpoint:{unit}:{version}",
+   "refusal": "missing_version_segment"
+  },
+  {
+   "binds": {
+    "unit": "USD",
+    "version": "v1"
+   },
+   "dimension": "ledger:head:USD:v1",
+   "family": "ledger:head:{unit}:{version}",
+   "refusal": null
+  },
+  {
+   "binds": {
+    "unit": "USD",
+    "version": "V1"
+   },
+   "dimension": "ledger:head:USD:V1",
+   "family": "ledger:head:{unit}:{version}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "ledger:head:USD:v1:v2",
+   "family": "ledger:head:{unit}:{version}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {
+    "unit": "USD",
+    "version": "v1beta"
+   },
+   "dimension": "ledger:head:USD:v1beta",
+   "family": "ledger:head:{unit}:{version}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "Ledger:head:USD:v1",
+   "family": "ledger:head:{unit}:{version}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {
+    "unit": "USD"
+   },
+   "dimension": "ledger:head:USD",
+   "family": "ledger:head:{unit}:{version}",
+   "refusal": "missing_version_segment"
+  },
+  {
+   "binds": {
+    "version": "v1"
+   },
+   "dimension": "ledger:promotion:v1",
+   "family": "ledger:promotion:{version}",
+   "refusal": null
+  },
+  {
+   "binds": {
+    "version": "V1"
+   },
+   "dimension": "ledger:promotion:V1",
+   "family": "ledger:promotion:{version}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "ledger:promotion:v1:v2",
+   "family": "ledger:promotion:{version}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {
+    "version": "v1beta"
+   },
+   "dimension": "ledger:promotion:v1beta",
+   "family": "ledger:promotion:{version}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "Ledger:promotion:v1",
+   "family": "ledger:promotion:{version}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "ledger:promotion",
+   "family": "ledger:promotion:{version}",
+   "refusal": "missing_version_segment"
   },
   {
    "binds": {
@@ -6290,6 +6678,53 @@
   },
   {
    "binds": {
+    "*": "leaf",
+    "version": "v1"
+   },
+   "dimension": "settlement:leaf:v1",
+   "family": "settlement:*",
+   "refusal": null
+  },
+  {
+   "binds": {
+    "*": "leaf:V1"
+   },
+   "dimension": "settlement:leaf:V1",
+   "family": "settlement:*",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {
+    "*": "leaf:v1"
+   },
+   "dimension": "settlement:leaf:v1:v2",
+   "family": "settlement:*",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {
+    "*": "leaf:v1beta"
+   },
+   "dimension": "settlement:leaf:v1beta",
+   "family": "settlement:*",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "Settlement:leaf:v1",
+   "family": "settlement:*",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {
+    "*": "leaf"
+   },
+   "dimension": "settlement:leaf",
+   "family": "settlement:*",
+   "refusal": "missing_version_segment"
+  },
+  {
+   "binds": {
     "outcome": "sample",
     "version": "v1"
    },
@@ -7164,13 +7599,13 @@
   },
   {
    "binds": {},
-   "dimension": "key_grant:zz_unminted_leaf:v1",
+   "dimension": "device:zz_unminted_leaf:v1",
    "family": null,
    "refusal": "namespace_family_unregistered"
   },
   {
    "binds": {},
-   "dimension": "device:zz_unminted_leaf:v1",
+   "dimension": "community:zz_unminted_leaf:v1",
    "family": null,
    "refusal": "namespace_family_unregistered"
   },
@@ -7320,13 +7755,13 @@
   },
   {
    "binds": {},
-   "dimension": "Key_grant:zz_unminted_leaf:v1",
+   "dimension": "Device:zz_unminted_leaf:v1",
    "family": null,
    "refusal": "namespace_dimension_case_malformed"
   },
   {
    "binds": {},
-   "dimension": "Device:zz_unminted_leaf:v1",
+   "dimension": "Community:zz_unminted_leaf:v1",
    "family": null,
    "refusal": "namespace_dimension_case_malformed"
   },

@@ -15,10 +15,10 @@
 //!     [`TakedownNoticePayload`] shape validator, projects the
 //!     `content_sha256` + `legal_basis` into dedicated indexed columns
 //!     (V054), and the takedown handler
-//!     ([`super::takedown_handler::process_takedown_admission`]) emits
-//!     `withdraws` attestations against every live `holds_bytes` row
-//!     for the SHA + optionally `evict_actor`s for immediate-eviction
-//!     bases.
+//!     ([`super::takedown_handler::process_takedown_admission`]) writes
+//!     ONE bytes-plane tombstone for the SHA (v55.0.0, CIRISPersist#1007;
+//!     CC 4.5.3 step 2), destroying the bytes on receipt for an
+//!     immediate-removal basis.
 //!
 //!   - [`KEY_GRANT_SUBJECT_KIND`] — key-distribution envelope binding a
 //!     wrapped DEK to a recipient `key_id` over a `content_sha256` (or
@@ -44,8 +44,6 @@
 //!     hybrid `X25519MlKem768Aes256GcmHkdfSha256`. The classical-only v1
 //!     is GONE rather than superseded — there is no algorithm to choose,
 //!     so there is no wrong choice to make.
-
-use std::collections::HashSet;
 
 use base64::Engine as _;
 use chrono::{DateTime, Utc};
@@ -223,161 +221,6 @@ impl LegalBasis {
             _ => None,
         }
     }
-}
-
-// ── MultimediaConfig ────────────────────────────────────────────────
-
-/// v3.6.0 (CIRISPersist#134) — operator config for the media-sharing
-/// path. Sibling of [`ReplicationConfig`](crate::federation::ReplicationConfig).
-///
-/// Three knobs:
-///
-///   - [`Self::counter_notice_window_days`] — wall-clock window
-///     (in days) that the
-///     [`takedown_handler`](crate::cirisnode::takedown_handler::process_takedown_admission)
-///     applies to counter-noticed bases. Persist default is 14 (matches
-///     the DSA art. 16 sane-default). Operators with a 10-day DMCA
-///     §512 policy or a 30-day community-standards appeal policy
-///     override per deployment.
-///
-///   - [`Self::immediate_legal_bases`] — set of [`LegalBasis`] values
-///     for which the handler runs [`evict_actor`](crate::federation::BlobStorage::evict_actor)
-///     immediately (in addition to emitting `withdraws`). CEG 0.3
-///     §11.4 locks the default at the 5-basis immediate-removal set:
-///     [`LegalBasis::TvecTerrorist`], [`LegalBasis::NcmecCsam`],
-///     [`LegalBasis::GifctCip`], [`LegalBasis::PerceptualHashCsam`],
-///     [`LegalBasis::CourtOrder`]. Operators may widen or narrow.
-///
-///   - [`Self::age_gate_legal_bases`] — set of [`LegalBasis`] values
-///     that compose with the Policy J age-assurance gate (CEG 0.3
-///     §8.1.10): emit `withdraws` AND attach the age gate, but do NOT
-///     evict. Default `{AvmsdAgeInappropriate}`.
-///
-/// # TODO(CIRISNodeCore#24)
-///
-/// Counter-notice carrier shape pending upstream spec. Persist ships
-/// a single global `counter_notice_window_days` knob as the v1
-/// default until upstream locks the per-basis carrier.
-#[derive(Debug, Clone)]
-pub struct MultimediaConfig {
-    /// Global counter-notice window in days. Default 14 (DSA art. 16
-    /// sane-default).
-    pub counter_notice_window_days: u32,
-
-    /// Set of legal bases that trigger immediate eviction. CEG 0.3
-    /// §11.4 default: the five immediate-removal bases. Operator
-    /// override either widens (e.g. add `OsaIllegalContent` for
-    /// non-counter-noticed jurisdictions) or narrows (e.g. drop
-    /// `CourtOrder` until manual review).
-    pub immediate_legal_bases: HashSet<LegalBasis>,
-
-    /// Set of legal bases that compose with the Policy J age-assurance
-    /// gate. CEG 0.3 §8.1.10 default: `{AvmsdAgeInappropriate}`.
-    /// Operator override accepts additional bases the deployment
-    /// wants gated rather than evicted.
-    pub age_gate_legal_bases: HashSet<LegalBasis>,
-}
-
-impl Default for MultimediaConfig {
-    fn default() -> Self {
-        let mut immediate = HashSet::with_capacity(5);
-        immediate.insert(LegalBasis::TvecTerrorist);
-        immediate.insert(LegalBasis::NcmecCsam);
-        immediate.insert(LegalBasis::GifctCip);
-        immediate.insert(LegalBasis::PerceptualHashCsam);
-        immediate.insert(LegalBasis::CourtOrder);
-        let mut age_gate = HashSet::with_capacity(1);
-        age_gate.insert(LegalBasis::AvmsdAgeInappropriate);
-        Self {
-            counter_notice_window_days: 14,
-            immediate_legal_bases: immediate,
-            age_gate_legal_bases: age_gate,
-        }
-    }
-}
-
-impl MultimediaConfig {
-    /// True iff the basis is in [`Self::immediate_legal_bases`].
-    /// Replaces the hardcoded
-    /// [`LegalBasis::requires_immediate_eviction`] check at the
-    /// `takedown_handler` call site.
-    pub fn is_immediate(&self, basis: LegalBasis) -> bool {
-        self.immediate_legal_bases.contains(&basis)
-    }
-
-    /// True iff the basis is in [`Self::age_gate_legal_bases`].
-    /// Replaces the hardcoded
-    /// [`LegalBasis::composes_with_age_gate`] check at the
-    /// `takedown_handler` call site.
-    pub fn is_age_gated(&self, basis: LegalBasis) -> bool {
-        self.age_gate_legal_bases.contains(&basis)
-    }
-}
-
-/// JSON wire shape for [`MultimediaConfig`] — used by
-/// `PyEngine::set_multimedia_config_json` to round-trip the config
-/// across the FFI boundary.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MultimediaConfigWire {
-    /// Counter-notice window in days.
-    pub counter_notice_window_days: u32,
-    /// Wire-string LegalBasis values that trigger immediate eviction.
-    pub immediate_legal_bases: Vec<String>,
-    /// Wire-string LegalBasis values that compose with the Policy J
-    /// age-assurance gate. Defaults to empty on the wire if not set —
-    /// caller's responsibility to round-trip the default if they want
-    /// it preserved.
-    #[serde(default)]
-    pub age_gate_legal_bases: Vec<String>,
-}
-
-impl MultimediaConfigWire {
-    /// Decode the wire shape into a typed [`MultimediaConfig`].
-    /// Returns [`Error::InvalidArgument`] on unknown LegalBasis variant.
-    pub fn into_config(self) -> Result<MultimediaConfig, Error> {
-        let immediate = decode_basis_set(&self.immediate_legal_bases, "immediate_legal_bases")?;
-        let age_gate = decode_basis_set(&self.age_gate_legal_bases, "age_gate_legal_bases")?;
-        Ok(MultimediaConfig {
-            counter_notice_window_days: self.counter_notice_window_days,
-            immediate_legal_bases: immediate,
-            age_gate_legal_bases: age_gate,
-        })
-    }
-
-    /// Encode a [`MultimediaConfig`] back to the wire shape (e.g. for
-    /// a `get_multimedia_config_json` accessor on PyEngine).
-    pub fn from_config(cfg: &MultimediaConfig) -> Self {
-        let mut immediate: Vec<String> = cfg
-            .immediate_legal_bases
-            .iter()
-            .map(|b| b.as_str().to_owned())
-            .collect();
-        immediate.sort();
-        let mut age_gate: Vec<String> = cfg
-            .age_gate_legal_bases
-            .iter()
-            .map(|b| b.as_str().to_owned())
-            .collect();
-        age_gate.sort();
-        Self {
-            counter_notice_window_days: cfg.counter_notice_window_days,
-            immediate_legal_bases: immediate,
-            age_gate_legal_bases: age_gate,
-        }
-    }
-}
-
-fn decode_basis_set(names: &[String], field: &str) -> Result<HashSet<LegalBasis>, Error> {
-    let mut out = HashSet::with_capacity(names.len());
-    for s in names {
-        let basis = LegalBasis::from_wire_str(s).ok_or_else(|| {
-            Error::InvalidArgument(format!(
-                "MultimediaConfigWire: unknown LegalBasis variant {s:?} in {field}"
-            ))
-        })?;
-        out.insert(basis);
-    }
-    Ok(out)
 }
 
 // ── TakedownNoticePayload ───────────────────────────────────────────
@@ -2347,79 +2190,6 @@ mod tests {
         );
         let parsed: LegalBasis = serde_json::from_str(r#""dmca_512""#).unwrap();
         assert_eq!(parsed, LegalBasis::Dmca512);
-    }
-
-    // ── MultimediaConfig tests ──────────────────────────────────────
-
-    #[test]
-    fn multimedia_config_default_immediate_bases() {
-        // CEG 0.3 §11.4: 5 immediate-removal bases.
-        let cfg = MultimediaConfig::default();
-        assert_eq!(cfg.counter_notice_window_days, 14);
-        assert_eq!(cfg.immediate_legal_bases.len(), 5);
-        assert!(cfg.is_immediate(LegalBasis::NcmecCsam));
-        assert!(cfg.is_immediate(LegalBasis::TvecTerrorist));
-        assert!(cfg.is_immediate(LegalBasis::GifctCip));
-        assert!(cfg.is_immediate(LegalBasis::PerceptualHashCsam));
-        assert!(cfg.is_immediate(LegalBasis::CourtOrder));
-        // Counter-noticed bases default to non-immediate.
-        assert!(!cfg.is_immediate(LegalBasis::Dmca512));
-        assert!(!cfg.is_immediate(LegalBasis::DsaArticle16));
-        assert!(!cfg.is_immediate(LegalBasis::OsaIllegalContent));
-        assert!(!cfg.is_immediate(LegalBasis::CommunityStandards));
-    }
-
-    #[test]
-    fn multimedia_config_default_age_gate_bases() {
-        // CEG 0.3 §8.1.10: AvmsdAgeInappropriate is the only default.
-        let cfg = MultimediaConfig::default();
-        assert_eq!(cfg.age_gate_legal_bases.len(), 1);
-        assert!(cfg.is_age_gated(LegalBasis::AvmsdAgeInappropriate));
-        assert!(!cfg.is_age_gated(LegalBasis::CourtOrder));
-        assert!(!cfg.is_age_gated(LegalBasis::Dmca512));
-    }
-
-    #[test]
-    fn multimedia_config_wire_round_trip() {
-        let cfg = MultimediaConfig::default();
-        let wire = MultimediaConfigWire::from_config(&cfg);
-        let back = wire.into_config().unwrap();
-        assert_eq!(
-            back.counter_notice_window_days,
-            cfg.counter_notice_window_days
-        );
-        assert_eq!(back.immediate_legal_bases, cfg.immediate_legal_bases);
-        assert_eq!(back.age_gate_legal_bases, cfg.age_gate_legal_bases);
-    }
-
-    #[test]
-    fn multimedia_config_wire_rejects_unknown_basis() {
-        let wire = MultimediaConfigWire {
-            counter_notice_window_days: 10,
-            immediate_legal_bases: vec!["nonsense_basis".into()],
-            age_gate_legal_bases: vec![],
-        };
-        let err = wire.into_config().unwrap_err();
-        assert!(matches!(err, Error::InvalidArgument(_)));
-    }
-
-    #[test]
-    fn multimedia_config_wire_rejects_unknown_age_gate_basis() {
-        let wire = MultimediaConfigWire {
-            counter_notice_window_days: 14,
-            immediate_legal_bases: vec![],
-            age_gate_legal_bases: vec!["unknown_age_gate".into()],
-        };
-        let err = wire.into_config().unwrap_err();
-        assert!(matches!(err, Error::InvalidArgument(_)));
-    }
-
-    #[test]
-    fn multimedia_config_operator_override_admits_court_order() {
-        let cfg = MultimediaConfig::default();
-        assert!(cfg.is_immediate(LegalBasis::CourtOrder));
-        // CEG 0.3 §11.4: the hardcoded helper agrees with the default.
-        assert!(LegalBasis::CourtOrder.requires_immediate_eviction());
     }
 
     // ── v16 (#432): require_key_grant_envelope (put_key_grant gate) ──

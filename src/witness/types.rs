@@ -53,7 +53,7 @@ pub struct WitnessLeaf {
     /// the federating root (WW-2 / SR-2/3).
     pub anonymous_tier: bool,
     /// The raw leaf bytes hashed into the Merkle tree (the
-    /// `holds_bytes:*` projection persist commits to). Opaque here.
+    /// holding-claim projection persist commits to). Opaque here.
     pub leaf_bytes: Vec<u8>,
 }
 

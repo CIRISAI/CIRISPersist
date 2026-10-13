@@ -605,11 +605,11 @@ struct EngineCell {
     /// installed config's budget is finite. `None` otherwise.
     /// `close()` calls `.stop()` on the handle.
     sweeper: std::sync::Mutex<Option<crate::federation::EvictionSweeper>>,
-    /// v3.6.0 (CIRISPersist#134) — shared media-sharing config slot.
-    /// `Arc<RwLock<...>>` so every PyEngine handle's
-    /// `set_multimedia_config_json` mutates the same cell-level state.
-    #[cfg(feature = "cirisnode")]
-    multimedia_config: Arc<std::sync::RwLock<Option<Arc<crate::cirisnode::MultimediaConfig>>>>,
+    /// v55.0.0 (CIRISPersist#989, CC 3.1.3.3 rule 5) — the holding-claim
+    /// re-ack loop (`Engine::spawn_reack_sweeper`): spawned at construction
+    /// whenever the engine can sign a claim, so a holder stays advertised
+    /// past the claim's 72 h. `close()` stops it, like `sweeper`.
+    reack_sweeper: std::sync::Mutex<Option<crate::federation::EvictionSweeper>>,
     /// v6.8.0 (CIRISPersist#149) — disk-pressure monitor, installed at
     /// construction when a `disk_pressure` config resolves (kwarg or
     /// env). `None` ⇒ disk-pressure response not active on this engine.
@@ -815,13 +815,6 @@ pub struct PyEngine {
     /// v1.9.0 (CIRISPersist#84) — shared change-feed subscription
     /// registry. Same `Arc` every handle holds.
     subscriptions: SubscriptionRegistry,
-    /// v3.6.0 (CIRISPersist#134) — media-sharing operator config.
-    /// `None` = persist defaults (14-day counter-notice window;
-    /// child-safety + terrorist content bases evict immediately).
-    /// Wrapped in `Arc<RwLock<...>>` so handles share the cell-level
-    /// state — `set_multimedia_config_json` mutates the shared slot.
-    #[cfg(feature = "cirisnode")]
-    multimedia_config: Arc<std::sync::RwLock<Option<Arc<crate::cirisnode::MultimediaConfig>>>>,
     /// v12.3.0 (CIRISPersist#320) — the directory-ops-proxy capsule, built
     /// once and **cached on the engine**. Consumers (CIRISEdge#245) extract the
     /// raw `Directory { data, vtable }` pointer and rely on the capsule (and
@@ -951,6 +944,15 @@ impl PyEngine {
                 // drop satisfies clippy::let_underscore_future.
                 std::mem::drop(sweeper.stop());
             }
+            // v55.0.0 (#989) — and the re-ack loop.
+            if let Some(reack) = cell
+                .reack_sweeper
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .take()
+            {
+                std::mem::drop(reack.stop());
+            }
             // v6.8.0 (#149) — stop the disk-pressure poll loop too.
             if let Some(dp) = cell
                 .disk_pressure_handle
@@ -985,8 +987,6 @@ impl PyEngine {
             construction_pid: cell.construction_pid,
             consumers: cell.consumers.clone(),
             subscriptions: cell.subscriptions.clone(),
-            #[cfg(feature = "cirisnode")]
-            multimedia_config: cell.multimedia_config.clone(),
             directory_ops_capsule_cache: std::sync::OnceLock::new(),
             outbound_queue_ops_capsule_cache: std::sync::OnceLock::new(),
             signer_ops_capsule_cache: std::sync::OnceLock::new(),
@@ -1285,7 +1285,7 @@ impl PyEngine {
     /// 2. The headless-darwin `Keychain not unlocked` failure mode
     ///    that CIRISConformance #140 surfaced for `evict_actor_json`
     ///    — when the platform signer can't reach the keychain, every
-    ///    holds_bytes withdraws emission fails; the local-signer
+    ///    holding-claim withdraws emission fails; the local-signer
     ///    fast-path bypasses that entirely when applicable.
     fn select_signer(&self, attesting_key_id: &str) -> Arc<dyn ciris_keyring::HardwareSigner> {
         match self
@@ -1301,8 +1301,8 @@ impl PyEngine {
     }
 
     /// CIRISPersist#851 §20.5 (operator ruling) — **the announcing signer:
-    /// hybrid/PQC only, no legacy fallback.** A federation-tier `holds_bytes`
-    /// claim is signed by the LocalSigner whose derived id IS the claimed
+    /// hybrid/PQC only, no legacy fallback.** A holding claim (v55.0.0:
+    /// `custody:ack:v1`) is signed by the LocalSigner whose derived id IS the claimed
     /// attester (a normal Python call attests as the derived id; a
     /// keystore-alias caller matches by alias). No LocalSigner, or one that
     /// is not this attester, and the door REFUSES — never a classical claim
@@ -1327,7 +1327,7 @@ impl PyEngine {
         let local = self.local_signer.clone().ok_or_else(|| {
             blob_err_to_py(crate::federation::BlobError::AttestationEmissionFailed(
                 "hybrid-only: this engine has no PQC LocalSigner and cannot announce a \
-                 federation-tier holds_bytes claim (CIRISPersist#851 §20.5 / CC 5.3.2.4.3.1)"
+                 holding claim (CIRISPersist#851 §20.5 / CC 5.3.2.4.3.1)"
                     .into(),
             ))
         })?;
@@ -1350,8 +1350,8 @@ impl PyEngine {
     /// #848 (§14) — **the emission every Python write door performs after
     /// a cascade that minted or granted anew** (CIRISPersist#850 review: the
     /// specialized doors `put_blob_encrypted_community` /
-    /// `put_blob_encrypted_self_family` emitted nothing). The set is signed
-    /// by the LocalSigner (the hybrid signer this engine has) and stored
+    /// `put_blob_encrypted_self_family` emitted nothing). The rows (one per
+    /// recipient, v55.0.0 #989) are signed by the LocalSigner (the hybrid signer this engine has) and stored
     /// through the attestation plane so it replicates; an engine that cannot
     /// sign it says so rather than leaving members with bytes and no key.
     /// `async` — the caller blocks inside `py.detach` (CIRISPersist#580).
@@ -1361,8 +1361,8 @@ impl PyEngine {
     ) -> PyResult<()> {
         let local = self.local_signer.clone().ok_or_else(|| {
             blob_err_to_py(crate::federation::BlobError::AttestationEmissionFailed(
-                "the key_grant set for this write cannot be emitted: this engine has no \
-                 LocalSigner to hybrid-sign it (BLOB_REPLICATION.md §14); the bytes are \
+                "the key_grant rows for this write cannot be emitted: this engine has no \
+                 LocalSigner to hybrid-sign them (BLOB_REPLICATION.md §14); the bytes are \
                  stored and the key cannot follow them"
                     .into(),
             ))
@@ -2232,7 +2232,7 @@ impl PyEngine {
         // P-256 signer (its `public_key()` is a 65-byte uncompressed EC point,
         // NOT a 32-byte Ed25519 key), so using it as `self.signer` desynced
         // every key_id-deriving / scrub path (`local_derived_key_id`,
-        // `put_blob_signing`'s holds_bytes scrub, `register_self_federation_key`)
+        // `put_blob_signing`'s holding-claim scrub, `register_self_federation_key`)
         // from `sign_hybrid` (which signs classical via the Ed25519
         // `local_signer`) — and stored an unverifiable P-256 key under
         // `pubkey_ed25519_base64`. When a software-tier platform signer is
@@ -2373,54 +2373,39 @@ impl PyEngine {
                     if let Err(e) = rewrapped {
                         tracing::warn!(error = %e, "member-device re-wrap sweep failed at init (#916)");
                     }
-                    let mut emitted = 0usize;
+                    // v55.0.0 (#989) — rows, per axis; one failing axis is
+                    // logged and left dirty, the rest still go out.
                     match &backend {
                         #[cfg(feature = "postgres")]
                         BackendDispatch::Postgres(pg) => {
-                            for axis in
-                                crate::federation::key_grant::dirty_axes(pg.as_ref(), &me).await?
-                            {
-                                if crate::federation::key_grant::emit_key_grant_axis_with_local_signer(
-                                    pg.as_ref(),
-                                    &local,
-                                    &axis,
-                                )
-                                .await?
-                                .is_some()
-                                {
-                                    emitted += 1;
-                                }
-                            }
+                            crate::federation::key_grant::emit_dirty_with_local_signer(
+                                pg.as_ref(),
+                                &local,
+                            )
+                            .await
                         }
                         #[cfg(feature = "sqlite")]
                         BackendDispatch::Sqlite(sq) => {
-                            for axis in
-                                crate::federation::key_grant::dirty_axes(sq.as_ref(), &me).await?
-                            {
-                                if crate::federation::key_grant::emit_key_grant_axis_with_local_signer(
-                                    sq.as_ref(),
-                                    &local,
-                                    &axis,
-                                )
-                                .await?
-                                .is_some()
-                                {
-                                    emitted += 1;
-                                }
-                            }
+                            crate::federation::key_grant::emit_dirty_with_local_signer(
+                                sq.as_ref(),
+                                &local,
+                            )
+                            .await
                         }
                     }
-                    Ok(emitted)
                 })
             });
             match sweep {
                 Ok(0) => {}
                 Ok(n) => {
-                    tracing::info!(sets = n, "pending KeyGrant sets emitted at init (#848 §14)")
+                    tracing::info!(
+                        rows = n,
+                        "pending key-grant rows emitted at init (#848 §14, #989)"
+                    )
                 }
                 Err(e) => tracing::warn!(
                     error = %e,
-                    "pending KeyGrant sets could not be emitted at init; the write doors retry (#848 §14)"
+                    "pending key-grant rows could not be emitted at init; the write doors retry (#848 §14)"
                 ),
             }
         }
@@ -2608,8 +2593,7 @@ impl PyEngine {
             // when budget transitions from infinite to finite.
             replication_config: std::sync::RwLock::new(Arc::new(initial_replication_config)),
             sweeper: std::sync::Mutex::new(None),
-            #[cfg(feature = "cirisnode")]
-            multimedia_config: Arc::new(std::sync::RwLock::new(None)),
+            reack_sweeper: std::sync::Mutex::new(None),
             disk_pressure: std::sync::Mutex::new(None),
             disk_pressure_handle: std::sync::Mutex::new(None),
         });
@@ -2647,6 +2631,21 @@ impl PyEngine {
                 if let Some(sweeper) = engine.spawn_sweeper() {
                     *cell.sweeper.lock().unwrap_or_else(|p| p.into_inner()) = Some(sweeper);
                 }
+            }
+        }
+
+        // v55.0.0 (CIRISPersist#989, CC 3.1.3.3 rule 5) — the holding-claim
+        // re-ack loop: always on when this engine can sign a claim (no budget
+        // gate — a claim lapses after 72 h whatever the disk says).
+        {
+            let engine = crate::Engine::from_shared_with_local(
+                cell.engine_backend_dispatch(),
+                cell.signer.clone(),
+                cell.local_signer.clone(),
+            );
+            let _enter = cell.runtime.enter();
+            if let Some(reack) = engine.spawn_reack_sweeper() {
+                *cell.reack_sweeper.lock().unwrap_or_else(|p| p.into_inner()) = Some(reack);
             }
         }
 
@@ -4050,6 +4049,38 @@ impl PyEngine {
         })
     }
 
+    /// v55.0.0 (CIRISPersist#989, CC 3.1.3.3 rule 5) — drive one holding-claim
+    /// **re-ack** pass synchronously: renew this node's own claims that are a
+    /// day old, for bytes it still holds. The background loop spawned at
+    /// construction runs the same pass hourly; sovereign hosts may drive it
+    /// on their own schedule. Returns the report as JSON
+    /// (`scanned`, `renewed`, `fresh`, `not_held`, `not_in_cohort`,
+    /// `failed`, `converted`, and `withheld`: blobs a takedown withholds,
+    /// neither renewed nor converted). Idempotent.
+    fn reack_holding_claims_once(&self, py: Python<'_>) -> PyResult<String> {
+        self.ensure_usable()?;
+        let runtime = self.runtime.clone();
+        let slot = engine_slot();
+        let cell = slot
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("engine cell missing"))?;
+        let engine = crate::Engine::from_shared_with_local(
+            cell.engine_backend_dispatch(),
+            cell.signer.clone(),
+            cell.local_signer.clone(),
+        );
+        drop(slot);
+        py.detach(move || {
+            runtime
+                .block_on(async move { engine.reack_holding_claims_once(chrono::Utc::now()).await })
+                .map_err(blob_err_to_py)
+                .and_then(|r| {
+                    serde_json::to_string(&r)
+                        .map_err(|e| PyRuntimeError::new_err(format!("reack report: {e}")))
+                })
+        })
+    }
+
     /// #227 (residual) — drive one **consent-decay** sweep synchronously
     /// (the time-driven twin of [`Self::sweep_evictions_once`]). Ages every
     /// fountain content unit against its consent-decay schedule (TEMPORARY
@@ -4260,8 +4291,6 @@ impl PyEngine {
             construction_pid: self.construction_pid,
             consumers: self.consumers.clone(),
             subscriptions: self.subscriptions.clone(),
-            #[cfg(feature = "cirisnode")]
-            multimedia_config: self.multimedia_config.clone(),
             directory_ops_capsule_cache: std::sync::OnceLock::new(),
             outbound_queue_ops_capsule_cache: std::sync::OnceLock::new(),
             signer_ops_capsule_cache: std::sync::OnceLock::new(),
@@ -6616,25 +6645,28 @@ impl PyEngine {
         })
     }
 
-    /// CIRISPersist#848 (`BLOB_REPLICATION.md` §12–§13) — **admit a
-    /// replicated `KeyGrant` set and project every wrap.** FFI mirror of
-    /// [`Engine::apply_replicated_key_grant`](crate::engine::Engine::apply_replicated_key_grant):
-    /// the apply a replication bridge routes a `key_grant:*` attestation to
-    /// (CIRISEdge#601's pull-on-attestation hook) instead of
-    /// `apply_replicated_attestation`.
+    /// CIRISPersist#848 (`BLOB_REPLICATION.md` §12–§13), v55.0.0 (#989, CC
+    /// 3.3.2 rc7) — **admit one replicated key-grant row and project its
+    /// wrap.** FFI mirror of
+    /// [`Engine::apply_replicated_key_grant`](crate::engine::Engine::apply_replicated_key_grant).
+    /// `apply_replicated_attestation` admits and projects a key-grant row too;
+    /// this door also reports the projection.
     ///
-    /// `signed_key_grant_json` is the `SignedKeyGrantSet` — the same shape as
-    /// a `SignedAttestation` whose `attestation_type` is `key_grant:epoch:v1`
-    /// or `key_grant:content:v1`. The signer is resolved from THIS node's
-    /// directory; it must be the set's minter (epoch axis, and an active
-    /// member at `asserted_at`) or the blob's author (content axis, when the
-    /// row is present); every wrap must be v2. Returns the
-    /// `KeyGrantAdmission` as JSON: `axis`, the attestation plane's
-    /// `attestation` outcome, `wraps_offered`, `pending` (content axis, the
-    /// bytes have not arrived: the carrier is stored, nothing projected until
-    /// the adopt names the author — §13), `wraps_written` (a union: a
-    /// re-applied set writes 0 and is still admitted). A refusal is a
-    /// `federation_key_grant_refused` error naming its reason.
+    /// `signed_key_grant_json` is the `SignedKeyGrantRow` — the same shape as
+    /// a `SignedAttestation` whose `attestation_type` is `scores` and whose
+    /// envelope `dimension` is `key_grant:{content|epoch|stream}:v1`. The rule
+    /// runs against THIS node's directory: the sealer (the minter, an active
+    /// member at `asserted_at`; or a key that speaks for the owner and for the
+    /// held content's author), a v2 wrap, a recipient the one audience rule
+    /// admits. Returns the `KeyGrantAdmission` as JSON: `axis`,
+    /// `recipient_key_id`, the attestation plane's `attestation` outcome,
+    /// `projected` (the wrap is held after the call — a union, so a re-applied
+    /// row is still `true`), `pending` (content axis, the bytes have not
+    /// arrived: the row is stored, nothing projected until the adopt names the
+    /// author — §13). A refusal is a `federation_key_grant_refused` error
+    /// naming its reason, or `federation_signer_not_acting_for` (plane
+    /// `key_grant`, retryable). A retired key-grant SET is refused
+    /// `set_retired`.
     fn apply_replicated_key_grant(
         &self,
         py: Python<'_>,
@@ -6643,9 +6675,9 @@ impl PyEngine {
         self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
-            let set: crate::federation::key_grant::SignedKeyGrantSet =
+            let set: crate::federation::key_grant::SignedKeyGrantRow =
                 serde_json::from_str(signed_key_grant_json).map_err(|e| {
-                    PyValueError::new_err(format!("SignedKeyGrantSet JSON decode: {e}"))
+                    PyValueError::new_err(format!("SignedKeyGrantRow JSON decode: {e}"))
                 })?;
             let outcome = py.detach(|| match &self.backend {
                 #[cfg(feature = "postgres")]
@@ -6679,19 +6711,24 @@ impl PyEngine {
         })
     }
 
-    /// CIRISPersist#848 (`BLOB_REPLICATION.md` §14) — **emit the
-    /// `KeyGrant` set for an axis on demand.** FFI mirror of
+    /// CIRISPersist#848 (`BLOB_REPLICATION.md` §14), v55.0.0 (#989) — **emit
+    /// the key-grant rows for an axis on demand.** FFI mirror of
     /// [`Engine::emit_key_grant`](crate::engine::Engine::emit_key_grant).
     /// Every write door emits after a fan-out that changed; this is the
     /// re-emission door — a node that died mid-fan-out, or an operator
-    /// re-seeding a late device, carries the FULL set again (idempotent on
-    /// every receiver, §13). `axis_json` is a `KeyGrantAxis`:
+    /// re-seeding a late device, emits one row per wrap it holds that it has
+    /// not emitted yet (a wrap already held as a row is skipped). `axis_json`
+    /// is a `KeyGrantAxis`:
     /// `{"axis":"epoch","community_key_id":…,"minter_key_id":…,"epoch":N}` or
     /// `{"axis":"content","at_rest_sha256":hex,"cohort_scope":…,"owner_key_id":…}`
-    /// or (v53.0.0, #969)
-    /// `{"axis":"stream","stream_id":…,"epoch":N,"cohort_scope":…,"owner_key_id":…}`.
-    /// Returns the emitted row's `attestation_id`, or `null` when this node
-    /// holds no wrap for the axis. Needs the LocalSigner (hybrid).
+    /// or `{"axis":"stream","stream_id":…,"epoch":N,"cohort_scope":…,"owner_key_id":…}`.
+    /// Returns the `KeyGrantEmission` as JSON (`axis`, `attestation_ids` — one
+    /// per row emitted, `already_emitted`, `withheld` — recipients the audience
+    /// rule no longer admits, `sealer_refused`, and v55.0.0 `misbuilt` — a
+    /// reason when every recipient, this node's own wrap among them, was
+    /// withheld: the axis names the wrong group and stays dirty), or `null`
+    /// when this node holds no wrap for the axis. Needs the LocalSigner
+    /// (hybrid).
     fn emit_key_grant(&self, py: Python<'_>, axis_json: &str) -> PyResult<Option<String>> {
         self.ensure_usable()?;
         catch_panic(|| {
@@ -6700,12 +6737,12 @@ impl PyEngine {
                 .map_err(|e| PyValueError::new_err(format!("KeyGrantAxis JSON decode: {e}")))?;
             let local = self.local_signer.clone().ok_or_else(|| {
                 blob_err_to_py(crate::federation::BlobError::AttestationEmissionFailed(
-                    "emit_key_grant requires a LocalSigner to hybrid-sign the set (§14); this \
+                    "emit_key_grant requires a LocalSigner to hybrid-sign the rows (§14); this \
                      engine has none"
                         .into(),
                 ))
             })?;
-            // Review round ten — peers enforce signer == minter, so a set signed
+            // Review round ten — peers enforce signer == minter, so a row signed
             // by a foreign or PQC-less key is one every peer rejects.
             {
                 let node_key_id =
@@ -6741,26 +6778,34 @@ impl PyEngine {
                     }
                 }
                 .map_err(federation_err_to_py)?;
-                Ok(emitted.map(|e| e.attestation_id))
+                emitted
+                    .map(|e| {
+                        serde_json::to_string(&e).map_err(|e| {
+                            PyValueError::new_err(format!("emit_key_grant outcome serialize: {e}"))
+                        })
+                    })
+                    .transpose()
             })
         })
     }
 
     /// CIRISPersist#848 (BLOB_REPLICATION.md §14, V146) —
-    /// **emit every KeyGrant set this node owes and has not yet carried**: each
+    /// **emit every key-grant row this node owes and has not yet carried**: each
     /// epoch it minted whose set is dirty per the emission ledger (never
     /// emitted, or a grant newer than the last emission — the shape a crash
     /// between a cascade and its emission leaves) and each self/family blob it
     /// authored likewise. Runs at `__init__` after the sentinel resolves (best
-    /// effort, logged); reachable on demand. Returns how many sets were
-    /// emitted. FFI mirror of [`Engine::emit_pending_key_grants`](crate::engine::Engine::emit_pending_key_grants).
+    /// effort, logged); reachable on demand. Returns how many rows were
+    /// emitted (v55.0.0, #989: one per recipient; was one per set). After
+    /// V192 the first call re-emits every wrap this node holds as sealer or
+    /// minter. FFI mirror of [`Engine::emit_pending_key_grants`](crate::engine::Engine::emit_pending_key_grants).
     fn emit_pending_key_grants(&self, py: Python<'_>) -> PyResult<usize> {
         self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let local = self.local_signer.clone().ok_or_else(|| {
                 blob_err_to_py(crate::federation::BlobError::AttestationEmissionFailed(
-                    "emit_pending_key_grants requires a LocalSigner to hybrid-sign the sets \
+                    "emit_pending_key_grants requires a LocalSigner to hybrid-sign the rows \
                      (§14); this engine has none"
                         .into(),
                 ))
@@ -6804,59 +6849,33 @@ impl PyEngine {
                 if let Err(e) = rewrapped {
                     tracing::warn!(error = %e, "member-device re-wrap sweep failed (#916)");
                 }
-                let axes = match &self.backend {
+                // v55.0.0 (#989) — rows, per axis; one failing axis is
+                // logged and left dirty, the rest still go out.
+                match &self.backend {
                     #[cfg(feature = "postgres")]
                     BackendDispatch::Postgres(pg) => {
                         let backend = pg.clone();
                         runtime.block_on(async move {
-                            crate::federation::key_grant::dirty_axes(backend.as_ref(), &me).await
+                            crate::federation::key_grant::emit_dirty_with_local_signer(
+                                backend.as_ref(),
+                                &local,
+                            )
+                            .await
                         })
                     }
                     #[cfg(feature = "sqlite")]
                     BackendDispatch::Sqlite(sq) => {
                         let backend = sq.clone();
                         runtime.block_on(async move {
-                            crate::federation::key_grant::dirty_axes(backend.as_ref(), &me).await
+                            crate::federation::key_grant::emit_dirty_with_local_signer(
+                                backend.as_ref(),
+                                &local,
+                            )
+                            .await
                         })
                     }
                 }
-                .map_err(federation_err_to_py)?;
-                let mut emitted = 0usize;
-                for axis in &axes {
-                    let done = match &self.backend {
-                        #[cfg(feature = "postgres")]
-                        BackendDispatch::Postgres(pg) => {
-                            let backend = pg.clone();
-                            let local = local.clone();
-                            runtime.block_on(async move {
-                                crate::federation::key_grant::emit_key_grant_axis_with_local_signer(
-                                    backend.as_ref(),
-                                    &local,
-                                    axis,
-                                )
-                                .await
-                            })
-                        }
-                        #[cfg(feature = "sqlite")]
-                        BackendDispatch::Sqlite(sq) => {
-                            let backend = sq.clone();
-                            let local = local.clone();
-                            runtime.block_on(async move {
-                                crate::federation::key_grant::emit_key_grant_axis_with_local_signer(
-                                    backend.as_ref(),
-                                    &local,
-                                    axis,
-                                )
-                                .await
-                            })
-                        }
-                    }
-                    .map_err(federation_err_to_py)?;
-                    if done.is_some() {
-                        emitted += 1;
-                    }
-                }
-                Ok(emitted)
+                .map_err(federation_err_to_py)
             })
         })
     }
@@ -7304,7 +7323,7 @@ impl PyEngine {
     /// key_id `derive_key_id(<alias>, <pubkey>)` (= `engine.local_derived_key_id()`),
     /// NOT the bare keystore alias. Thread this returned value back as the
     /// `attesting_key_id` to `put_blob_signing` / the emit helpers so the
-    /// holds_bytes / withdraws `scrub_key_id` FK resolves (CIRISPersist#275;
+    /// holding-claim / withdraws `scrub_key_id` FK resolves (CIRISPersist#275;
     /// the #247 floor).
     ///
     /// Idempotent on `(key_id)` PRIMARY KEY of `federation_keys` — the
@@ -7352,7 +7371,7 @@ impl PyEngine {
             // every emit/scrub path derives its key_id from), keyed by the
             // DERIVED federation key_id. Pre-#275 this FFI registered the
             // `LocalSigner` seed's identity (or, earlier, the bare alias) —
-            // a row the holds_bytes / withdraws scrub FK could never resolve
+            // a row the holding-claim / withdraws scrub FK could never resolve
             // against when the composed signer and the local seed are
             // distinct identities, so `put_blob_signing` FK-failed on every
             // persist ≥ 9.3.0. Reconstruct the hybrid-capable engine over
@@ -10349,8 +10368,7 @@ impl PyEngine {
     }
 
     /// v3.9.2 (CIRISPersist#153 Ask 5, CEG 0.7 §10.1.4) — store blob
-    /// bytes locally at the COMMONS tier WITHOUT emitting a `holds_bytes`
-    /// directory attestation.
+    /// bytes locally at the COMMONS tier WITHOUT emitting a holding claim.
     ///
     /// **v43.0.0 (`BLOB_ENCRYPTION_AT_REST.md` §11.2): this is not the
     /// private-content door any more.** The row it writes is
@@ -10427,7 +10445,7 @@ impl PyEngine {
     /// **the LocalOnly plaintext door.** Store commons bytes this node
     /// verified itself (size first, then digest — CC 5.3.2.5), announcing
     /// nothing: `cohort_scope = federation`, `crypto_tier = plaintext`, no
-    /// `holds_bytes` claim, no signer. Content-address checked
+    /// holding claim, no signer. Content-address checked
     /// (`sha256(bytes) == sha256_hex`, else `HashMismatch`) and bounded by
     /// the inline cap. Idempotent on the address. The plaintext twin of
     /// `adopt_sealed_blob_json`'s `LocalOnly` disposition; the raw-bytes
@@ -13268,6 +13286,10 @@ impl PyEngine {
     /// - Inline: `{"inline": "<base64-bytes>"}`
     /// - External: `{"external": {"uri": "...", "size_bytes": N,
     ///   "media_type": "...|null"}}`
+    ///
+    /// v55.0.0 (CIRISPersist#1058): raises `ValueError` (`blob_purged`) for a
+    /// blob a steward purge withholds and (`blob_withdrawn`) for one whose
+    /// binding row was withdrawn — the disposition every byte door asks.
     fn get_blob_json(&self, py: Python<'_>, sha256_hex: &str) -> PyResult<Option<String>> {
         self.ensure_usable()?;
         catch_panic(|| {
@@ -13279,6 +13301,15 @@ impl PyEngine {
                     let backend = pg.clone();
                     runtime.block_on(async move {
                         use crate::federation::BlobStorage;
+                        // v55.0.0 (CIRISPersist#1058) — the storage read is a
+                        // host surface: it asks the disposition every byte
+                        // door asks (purged, withdrawn), I836.
+                        crate::federation::at_rest_cascade::refuse_if_withdrawn(
+                            &*backend as &dyn crate::federation::FederationDirectory,
+                            &sha,
+                        )
+                        .await
+                        .map_err(blob_err_to_py)?;
                         let body_opt = backend.get_blob(&sha).await.map_err(blob_err_to_py)?;
                         match body_opt {
                             None => Ok(None),
@@ -13291,6 +13322,15 @@ impl PyEngine {
                     let backend = sq.clone();
                     runtime.block_on(async move {
                         use crate::federation::BlobStorage;
+                        // v55.0.0 (CIRISPersist#1058) — the storage read is a
+                        // host surface: it asks the disposition every byte
+                        // door asks (purged, withdrawn), I836.
+                        crate::federation::at_rest_cascade::refuse_if_withdrawn(
+                            &*backend as &dyn crate::federation::FederationDirectory,
+                            &sha,
+                        )
+                        .await
+                        .map_err(blob_err_to_py)?;
                         let body_opt = backend.get_blob(&sha).await.map_err(blob_err_to_py)?;
                         match body_opt {
                             None => Ok(None),
@@ -13351,6 +13391,9 @@ impl PyEngine {
     /// - External blob → a dict `{"external_uri": str, "range_start":
     ///   int, "range_end_inclusive": int}` — persist does NOT
     ///   dereference; the caller fetches that range from the URI itself.
+    ///
+    /// v55.0.0 (CIRISPersist#1058): `blob_purged` / `blob_withdrawn` as
+    /// `get_blob_json`.
     fn get_blob_range(
         &self,
         py: Python<'_>,
@@ -13368,6 +13411,13 @@ impl PyEngine {
                     let backend = pg.clone();
                     runtime.block_on(async move {
                         use crate::federation::BlobStorage;
+                        // v55.0.0 (CIRISPersist#1058) — see `get_blob_json`.
+                        crate::federation::at_rest_cascade::refuse_if_withdrawn(
+                            &*backend as &dyn crate::federation::FederationDirectory,
+                            &sha,
+                        )
+                        .await
+                        .map_err(blob_err_to_py)?;
                         backend
                             .get_blob_range(&sha, start, end_inclusive)
                             .await
@@ -13379,6 +13429,13 @@ impl PyEngine {
                     let backend = sq.clone();
                     runtime.block_on(async move {
                         use crate::federation::BlobStorage;
+                        // v55.0.0 (CIRISPersist#1058) — see `get_blob_json`.
+                        crate::federation::at_rest_cascade::refuse_if_withdrawn(
+                            &*backend as &dyn crate::federation::FederationDirectory,
+                            &sha,
+                        )
+                        .await
+                        .map_err(blob_err_to_py)?;
                         backend
                             .get_blob_range(&sha, start, end_inclusive)
                             .await
@@ -13581,7 +13638,10 @@ impl PyEngine {
     }
 
     /// Federation blob storage: list holders of a blob by SHA-256
-    /// (hex). Returns a JSON array of attesting_key_id strings.
+    /// (hex). Returns a JSON array of attesting_key_id strings: every
+    /// holder whose latest holding claim (v55.0.0: `custody:ack:v1`,
+    /// CIRISPersist#989) is a live `here` (72 h; any age when this node
+    /// holds the bytes itself).
     fn list_holders_json(&self, py: Python<'_>, sha256_hex: &str) -> PyResult<String> {
         self.ensure_usable()?;
         catch_panic(|| {
@@ -13615,12 +13675,13 @@ impl PyEngine {
     }
 
     /// v45.0.0 (CIRISPersist#871, `FSD/MEDIA_SOURCE.md` §4, AV-88/AV-89) —
-    /// **the puller's budget read.** Every live `holds_bytes` claim for the
-    /// blob with the byte length the holder SIGNED, as a JSON array of
+    /// **the puller's budget read.** Every holder whose latest holding claim
+    /// (v55.0.0: `custody:ack:v1` `here`) about the blob stands, with the
+    /// byte length the holder SIGNED, as a JSON array of
     /// `{"key_id": "...", "size": N}` sorted by `key_id`. The selection is
-    /// `list_holders_json`'s without the CEG §10.1.2 freshness window (the
-    /// holder's own `withdraws` / `recants` are still folded out); a claim
-    /// with no positive integer `size` is skipped. A puller caps its
+    /// `list_holders_json`'s without the 72-hour freshness window (the
+    /// holder's own `withdraws` / `recants` and later `none` still fold it
+    /// out). A puller caps its
     /// `ContentFetch` read at `size` BEFORE hashing and refuses a holder
     /// whose number disagrees with the descriptor it is fetching for.
     fn list_holders_sized_json(&self, py: Python<'_>, sha256_hex: &str) -> PyResult<String> {
@@ -13706,9 +13767,9 @@ impl PyEngine {
 
     /// v3.5.2 (CIRISPersist#130) — Federation blob storage:
     /// **local-truth** holder query. Returns a JSON array of
-    /// `attesting_key_id` strings for every holds_bytes attestation
-    /// the substrate has for this blob, **regardless of the CEG
-    /// §10.1.2 24-hour TTL window**. The bytes are locally held
+    /// `attesting_key_id` strings for every holder whose latest holding
+    /// claim (v55.0.0: `custody:ack:v1`) about this blob is `here`,
+    /// **regardless of the 72-hour freshness window**. The bytes are locally held
     /// (verified by checking `federation_blobs`); the substrate's
     /// audit chain is the source of truth.
     ///
@@ -13802,9 +13863,10 @@ impl PyEngine {
 
     /// v3.5.0 (CIRISPersist#125) — Federation blob storage: per-actor
     /// eviction. Deletes every `federation_blobs` row this Engine
-    /// holds for `attesting_key_id`, AND emits a `withdraws`
-    /// attestation against each of the actor's `holds_bytes`
-    /// attestations (CEG §10.1.2). Returns a JSON-encoded
+    /// holds that `attesting_key_id` claims `here`, AND retracts THIS
+    /// node's own holding claims about each with its own `withdraws`
+    /// (v55.0.0, CC 3.1.3.3 rule 4: nobody retracts another device's
+    /// claim). Returns a JSON-encoded
     /// [`crate::federation::EvictActorReport`].
     ///
     /// The signer is sourced internally from the Engine's composed
@@ -14351,7 +14413,7 @@ impl PyEngine {
             let signer = self.local_signer.clone().ok_or_else(|| {
                 blob_err_to_py(crate::federation::BlobError::Backend(
                     "sweep_community_epochs requires a LocalSigner to sign the withdraws that \
-                     retract holds_bytes announcements (§11.5); this engine has none"
+                     retract this node's holding claims (§11.5); this engine has none"
                         .into(),
                 ))
             })?;
@@ -14949,7 +15011,8 @@ impl PyEngine {
     /// #846 (`BLOB_REPLICATION.md` §6.1) — **adopt a sealed blob received
     /// from a peer**: store the `AtRestEnvelope` verbatim at the tier and
     /// under the `(community, epoch)` binding its provenance declares, and
-    /// — for `"announce"` — emit `holds_bytes` signed by this node. Never
+    /// — for `"announce"` — emit this node's holding claim, placed at the
+    /// content's own scope (v55.0.0, CIRISPersist#989). Never
     /// opens the envelope (I45); the binding is the author's fact (no
     /// current-epoch check, no key state required — §3).
     ///
@@ -15452,13 +15515,21 @@ impl PyEngine {
     /// be held at `(stream_id, seq)` with the named sha, size and tier
     /// (`ValueError` naming the first missing `(seq, sha)`), and flips the row
     /// to a `chunk_dag`. Returns JSON `{"sha256_hex", "promoted": true|false,
-    /// "chunk_count", "total_size"}`; `promoted: false` means it already was.
-    #[pyo3(signature = (at_rest_sha256_hex, viewer_key_id, caller_aad_b64=None))]
+    /// "chunk_count", "total_size", "announced"}`; `promoted: false` means it
+    /// already was.
+    ///
+    /// v55.0.0 (CIRISPersist#951) — `disposition` (`"announce"` |
+    /// `"local_only"`, required): a sealed DAG is announced HERE, once every
+    /// chunk is held, never at the manifest adopt (adopt the manifest
+    /// `local_only`). `"announce"` emits this node's holding claim for the
+    /// root and answers `"announced": true`.
+    #[pyo3(signature = (at_rest_sha256_hex, viewer_key_id, disposition, caller_aad_b64=None))]
     fn promote_adopted_manifest_to_dag_json(
         &self,
         py: Python<'_>,
         at_rest_sha256_hex: &str,
         viewer_key_id: &str,
+        disposition: &str,
         caller_aad_b64: Option<&str>,
     ) -> PyResult<String> {
         self.ensure_usable()?;
@@ -15466,13 +15537,28 @@ impl PyEngine {
             let sha = parse_sha256_hex(at_rest_sha256_hex)?;
             let viewer = viewer_key_id.to_owned();
             let aad = decode_aad_b64(caller_aad_b64)?;
+            let disposition = match disposition {
+                "announce" => crate::federation::AdoptDisposition::Announce,
+                "local_only" => crate::federation::AdoptDisposition::LocalOnly,
+                other => {
+                    return Err(PyValueError::new_err(format!(
+                        "promote_adopted_manifest_to_dag_json disposition {other:?}: expected \
+                         \"announce\" or \"local_only\""
+                    )))
+                }
+            };
             let engine = self.hold_engine_view();
             let runtime = self.runtime.clone();
             py.detach(move || {
                 let out = runtime
                     .block_on(async move {
                         engine
-                            .promote_adopted_manifest_to_dag(&sha, &viewer, aad.as_deref())
+                            .promote_adopted_manifest_to_dag(
+                                &sha,
+                                &viewer,
+                                aad.as_deref(),
+                                disposition,
+                            )
                             .await
                     })
                     .map_err(blob_err_to_py)?;
@@ -15482,7 +15568,7 @@ impl PyEngine {
     }
 
     /// v51.3.0 (CIRISPersist#947 ask 3) — **store a plaintext chunk DAG and
-    /// announce its manifest** (`holds_bytes`, this node's claim), so a
+    /// announce its manifest** (this node's holding claim), so a
     /// pulled commons DAG is not a silent holder. Payload: the
     /// `put_blob_chunks_json` payload plus `"author_key_id"` (whose content
     /// this is). Returns JSON `{"manifest_sha256": "<hex>", "announced": true}`.
@@ -15510,6 +15596,82 @@ impl PyEngine {
                         engine
                             .put_blob_chunks_signing(manifest, chunks, &author)
                             .await
+                    })
+                    .map_err(blob_err_to_py)?;
+                Ok(
+                    serde_json::json!({ "manifest_sha256": hex::encode(sha), "announced": true })
+                        .to_string(),
+                )
+            })
+        })
+    }
+
+    /// v55.0.0 (CIRISPersist#952, CIRISEdge#734) — **store ONE chunk of a
+    /// plaintext chunk DAG** ahead of its manifest (`Engine::put_plaintext_dag_chunk`).
+    /// `chunk_sha256_hex` and `size` are the chunk's manifest entry; `body`
+    /// must hash to it and be exactly `size` bytes. Writes no manifest row
+    /// and no claim. Returns the chunk's address (hex).
+    fn put_plaintext_dag_chunk(
+        &self,
+        py: Python<'_>,
+        chunk_sha256_hex: &str,
+        size: u32,
+        body: &[u8],
+        author_key_id: &str,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let entry = crate::federation::ChunkRef {
+                sha: parse_sha256_hex(chunk_sha256_hex)?,
+                size,
+                seq: None,
+                epoch: None,
+            };
+            let body = crate::federation::BlobBody::Inline(body.to_vec());
+            let author = author_key_id.to_owned();
+            let engine = self.hold_engine_view();
+            let runtime = self.runtime.clone();
+            py.detach(move || {
+                let sha = runtime
+                    .block_on(
+                        async move { engine.put_plaintext_dag_chunk(&entry, body, &author).await },
+                    )
+                    .map_err(blob_err_to_py)?;
+                Ok(hex::encode(sha))
+            })
+        })
+    }
+
+    /// v55.0.0 (CIRISPersist#952) — **finalize an incremental plaintext chunk
+    /// DAG** (`Engine::finalize_blob_chunks_signing`). Payload:
+    /// `{"manifest": {"v": 1, "total_size": N, "chunks": [{"sha": "<hex>",
+    /// "size": M}, …]}, "author_key_id": "<key>"}`. Every chunk must already
+    /// be held (`put_plaintext_dag_chunk`); a missing one raises the
+    /// `blob_not_held` class naming it, with nothing written. Returns
+    /// `{"manifest_sha256": "<hex>", "announced": true}`.
+    fn finalize_blob_chunks_signing_json(
+        &self,
+        py: Python<'_>,
+        payload_json: &str,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            #[derive(serde::Deserialize)]
+            struct Wire {
+                manifest: ChunkManifestWire,
+                author_key_id: String,
+            }
+            let wire: Wire = serde_json::from_str(payload_json).map_err(|e| {
+                PyValueError::new_err(format!("finalize_blob_chunks_signing_json decode: {e}"))
+            })?;
+            let manifest = plaintext_manifest_from_wire(wire.manifest)?;
+            let author = wire.author_key_id;
+            let engine = self.hold_engine_view();
+            let runtime = self.runtime.clone();
+            py.detach(move || {
+                let sha = runtime
+                    .block_on(async move {
+                        engine.finalize_blob_chunks_signing(manifest, &author).await
                     })
                     .map_err(blob_err_to_py)?;
                 Ok(
@@ -15686,11 +15848,129 @@ impl PyEngine {
         })
     }
 
+    /// v55.0.0 (CIRISPersist#981, CC 5.3.3.2.5) — **supply the DEK of a
+    /// stream's next epoch** (the stream's per-(stream, epoch) DEK the
+    /// producer derives from the group's MLS exporter, CC 5.1;
+    /// CIRISConstitution#169, rc8 ruling), so the live and the stored stream
+    /// are one key; persist never sees the exporter secret. FFI mirror of
+    /// [`Engine::register_stream_epoch_dek`](crate::engine::Engine::register_stream_epoch_dek).
+    /// `dek_b64` is the 32-byte DEK; `group_key_id` the owner (self), family
+    /// or community key. The DEK is wrapped to the audience as
+    /// `key_grant:stream:v1` rows: a supplied epoch is always kept, and an
+    /// unrecorded live call never comes to this door (CC rc7 part 5 — its
+    /// frames are sealed in memory under that per-stream DEK and only the
+    /// ciphertext may be adopted). The writer is the same signer
+    /// `put_blob_chunk_scoped` writes under. Then chunks go through
+    /// `put_blob_chunk_scoped` at `epoch`.
+    ///
+    /// Returns JSON: `stream_id`, `epoch`, `tier`, `granted`,
+    /// `excluded`, `roster`. Refusals (ValueError, token then JSON):
+    /// `blob_stream_not_authored`, `blob_stream_epoch_dek_exists`,
+    /// `blob_invalid_argument`. A later chunk may be refused
+    /// `blob_stream_epoch_rotation_required` (`reason` `removal` naming
+    /// `removed_key_id`, or `cap`) or `blob_stream_epoch_dek_missing`, both
+    /// retryable after the next epoch's DEK is supplied.
+    #[pyo3(signature = (cohort_scope, group_key_id, stream_id, epoch, dek_b64, aad_b64=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn register_stream_epoch_dek(
+        &self,
+        py: Python<'_>,
+        cohort_scope: &str,
+        group_key_id: &str,
+        stream_id: &str,
+        epoch: u64,
+        dek_b64: &str,
+        aad_b64: Option<&str>,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            use crate::federation::chunk_dag_cascade::orchestrate::register_stream_epoch_dek;
+            use base64::engine::general_purpose::STANDARD as B64;
+            use base64::Engine as _;
+            let runtime = self.runtime.clone();
+            let dek: [u8; 32] = B64
+                .decode(dek_b64)
+                .map_err(|e| {
+                    PyValueError::new_err(format!("register_stream_epoch_dek dek_b64 decode: {e}"))
+                })?
+                .try_into()
+                .map_err(|_| {
+                    PyValueError::new_err("register_stream_epoch_dek: the DEK is 32 bytes")
+                })?;
+            let aad = decode_aad_b64(aad_b64)?;
+            let (scope, group, stream) = (
+                cohort_scope.to_owned(),
+                group_key_id.to_owned(),
+                stream_id.to_owned(),
+            );
+            // The writer: the signer `put_blob_chunk_scoped` writes under, so
+            // the supplied epoch and its chunks have one single sender.
+            let signer: Arc<dyn ciris_keyring::HardwareSigner> = match &self.local_signer {
+                Some(local) => Arc::new(crate::signing::LocalSignerHardwareAdapter::new(
+                    local.clone(),
+                )),
+                None => self.signer.clone(),
+            };
+            py.detach(move || {
+                let r = match &self.backend {
+                    #[cfg(feature = "postgres")]
+                    BackendDispatch::Postgres(pg) => {
+                        let backend = pg.clone();
+                        runtime.block_on(async move {
+                            register_stream_epoch_dek(
+                                backend.as_ref(),
+                                &*signer,
+                                &scope,
+                                &group,
+                                &stream,
+                                epoch,
+                                &dek,
+                                aad.as_deref(),
+                            )
+                            .await
+                        })
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => {
+                        let backend = sq.clone();
+                        runtime.block_on(async move {
+                            register_stream_epoch_dek(
+                                backend.as_ref(),
+                                &*signer,
+                                &scope,
+                                &group,
+                                &stream,
+                                epoch,
+                                &dek,
+                                aad.as_deref(),
+                            )
+                            .await
+                        })
+                    }
+                }
+                .map_err(blob_err_to_py)?;
+                // #848 (§14) — the epoch's key follows the chunks.
+                if let Some(axis) = r.key_grant_emission.as_ref() {
+                    runtime.block_on(self.emit_key_grant_axis_async(axis))?;
+                }
+                Ok(serde_json::json!({
+                    "stream_id": r.stream_id,
+                    "epoch": r.epoch,
+                    "tier": r.tier.as_str(),
+                    "granted": r.granted,
+                    "excluded": r.excluded,
+                    "roster": r.roster,
+                })
+                .to_string())
+            })
+        })
+    }
+
     /// #832 (§12.3) — **seal a live stream into a `chunk_dag` at
     /// `cohort_scope`.** Refuses unless every chunk ROW is at the DAG's tier
     /// (I32); builds the manifest (v2 with PLAINTEXT sizes for a sealed
     /// tier), seals it under the DAG's DEK, stores it, and announces
-    /// `holds_bytes` under the local signer at `Plaintext` / `CommunityDek`.
+    /// this node's holding claim at the content's scope (every tier, v55.0.0).
     ///
     /// Returns JSON: `manifest_sha256` (hex — the DAG's content address),
     /// `tier`, `epoch`, `chunk_count`, `total_size` (plaintext), `granted`,
@@ -15973,10 +16253,10 @@ impl PyEngine {
     ///
     /// The `InvisibleEncrypted` tier: a fresh per-write DEK wrapped to every
     /// ACTIVE occurrence of the owner (`self`) or of every member
-    /// (`family`), plus persist's own self-retention wrap. Unlike the
-    /// community tier this also SUPPRESSES `holds_bytes` — self/family bytes
+    /// (`family`), plus persist's own self-retention wrap. Self/family bytes
     /// never cost the federation a directory entry (the locality dividend,
-    /// FEDERATION_SCALING_MODEL §9.5).
+    /// FEDERATION_SCALING_MODEL §9.5): v55.0.0 — their holding claims are
+    /// placed at `self` / the family and reach the cohort only.
     ///
     /// `cohort_scope` must be `self` or `family`; anything else is refused
     /// (the community tiers go through
@@ -16109,7 +16389,8 @@ impl PyEngine {
     }
 
     /// v3.3.0 (CIRISPersist#121) — one-call ingest. Persist owns the
-    /// holds_bytes envelope construction, canonicalization (via the
+    /// holding-claim envelope construction (v55.0.0: `custody:ack:v1`
+    /// `here` at `federation`), canonicalization (via the
     /// production `PythonJsonDumpsCanonicalizer`, NOT JCS), signing
     /// (via the engine's composed `Arc<dyn HardwareSigner>` —
     /// cross-cdylib accessors `keyring_signer_capsule` /
@@ -23559,64 +23840,6 @@ impl PyEngine {
         })
     }
 
-    /// v3.6.0 (CIRISPersist#134) — install / clear the media-sharing
-    /// operator config ([`MultimediaConfig`](crate::cirisnode::MultimediaConfig)).
-    /// Wire shape: see [`MultimediaConfigWire`](crate::cirisnode::MultimediaConfigWire).
-    ///
-    /// Pass `None` (Python None / empty string) to clear; persist
-    /// defaults then apply (14-day window; child-safety + terrorist
-    /// content classes evict immediately).
-    #[cfg(feature = "cirisnode")]
-    fn set_multimedia_config_json(&self, config_json: Option<&str>) -> PyResult<()> {
-        self.ensure_usable()?;
-        catch_panic(|| match config_json {
-            None => {
-                *self
-                    .multimedia_config
-                    .write()
-                    .unwrap_or_else(|p| p.into_inner()) = None;
-                Ok(())
-            }
-            Some(json) => {
-                let wire: crate::cirisnode::MultimediaConfigWire = serde_json::from_str(json)
-                    .map_err(|e| PyValueError::new_err(format!("MultimediaConfig decode: {e}")))?;
-                let cfg = wire
-                    .into_config()
-                    .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
-                *self
-                    .multimedia_config
-                    .write()
-                    .unwrap_or_else(|p| p.into_inner()) = Some(Arc::new(cfg));
-                Ok(())
-            }
-        })
-    }
-
-    /// v3.6.0 (CIRISPersist#134) — snapshot of the currently-installed
-    /// media-sharing config as a JSON string. Returns the wire shape
-    /// (see [`MultimediaConfigWire`](crate::cirisnode::MultimediaConfigWire))
-    /// for the configured values, or `None` when no config is installed
-    /// (persist defaults apply).
-    #[cfg(feature = "cirisnode")]
-    fn get_multimedia_config_json(&self) -> PyResult<Option<String>> {
-        self.ensure_usable()?;
-        catch_panic(|| {
-            let guard = self
-                .multimedia_config
-                .read()
-                .unwrap_or_else(|p| p.into_inner());
-            match guard.as_ref() {
-                None => Ok(None),
-                Some(cfg) => {
-                    let wire = crate::cirisnode::MultimediaConfigWire::from_config(cfg);
-                    serde_json::to_string(&wire).map(Some).map_err(|e| {
-                        PyRuntimeError::new_err(format!("MultimediaConfig encode: {e}"))
-                    })
-                }
-            }
-        })
-    }
-
     /// Retire prior key_grants issued by actor_key_id. Returns
     /// outcome-tagged JSON; "partial" = grants in `failed` are STILL LIVE
     /// and does NOT raise — branch on `outcome`, never on the non-raise.
@@ -23693,104 +23916,39 @@ impl PyEngine {
         })
     }
 
-    /// v3.6.0 (CIRISPersist#134) — run the takedown-admission
-    /// orchestration on a JSON-encoded [`TakedownNoticePayload`](crate::cirisnode::TakedownNoticePayload).
-    /// Consults the installed [`MultimediaConfig`] (or persist defaults
-    /// when none is installed) for the immediate-eviction decision +
-    /// counter-notice window.
+    /// v55.0.0 (CIRISPersist#1007; CC 4.5.3 step 2, CC 4.5.5) — **execute a
+    /// takedown on the bytes plane.** `contribution_json` is the signed
+    /// `takedown_notice` Contribution (the `ContributionEnvelope` JSON
+    /// `cirisnode_put_contribution` admitted). Its signature is re-verified and
+    /// CC 4.5.5 re-asked of this node's state, then ONE tombstone,
+    /// `blob:{content_sha256}`, is recorded on the steward purge's tombstone
+    /// row: the bytes are withheld at once and the tombstone replicates as a
+    /// purge bundle. An immediate-removal basis destroys this node's bytes on
+    /// receipt; a counter-notice basis retracts this node's own holding claim
+    /// and the hard delete waits for `purge_finalize_json` after the window;
+    /// the age-gate basis records nothing. No other device's claim is
+    /// withdrawn.
     ///
-    /// Returns a JSON object:
-    /// `{"holders_seen": u, "withdraws_emitted": u, "withdraws_failed": u,
-    ///   "holders_evicted": u, "holders_evict_failed": u,
-    ///   "scheduled_eviction_at": "<rfc3339>" | null,
-    ///   "age_gate_applied": bool}`.
-    ///
-    /// `age_gate_applied` is `true` when the takedown emitted
-    /// withdraws but did NOT trigger eviction because the basis
-    /// composes with the Policy J age-gate per CEG §8.1.10
-    /// (today only [`LegalBasis::AvmsdAgeInappropriate`] qualifies).
-    /// Python callers need this to distinguish age-gated takedowns
-    /// from any other no-eviction outcome.
+    /// Returns JSON `{"notice_id", "content_sha256", "legal_basis",
+    /// "disposition": {"kind": "destroy_on_receipt" | "withhold_then_delete"
+    /// (+ "window_days") | "age_gate"}, "signer", "tombstoned",
+    /// "settles_at" (RFC 3339 or null), "claims_retracted",
+    /// "bytes_destroyed"}`. A refusal raises `ValueError(token, body_json)`
+    /// with token `takedown_unauthorised`.
     #[cfg(feature = "cirisnode")]
     fn cirisnode_process_takedown_admission_json(
         &self,
         py: Python<'_>,
-        notice_payload_json: &str,
-        signer_key_id: &str,
-        now_iso: &str,
+        contribution_json: &str,
     ) -> PyResult<String> {
         self.ensure_usable()?;
-        catch_panic(|| {
-            let runtime = self.runtime.clone();
-            let notice: crate::cirisnode::TakedownNoticePayload =
-                serde_json::from_str(notice_payload_json).map_err(|e| {
-                    PyValueError::new_err(format!("TakedownNoticePayload decode: {e}"))
-                })?;
-            let signer_kid = signer_key_id.to_owned();
-            let now = chrono::DateTime::parse_from_rfc3339(now_iso)
-                .map_err(|e| {
-                    PyValueError::new_err(format!("process_takedown_admission now_iso parse: {e}"))
-                })?
-                .with_timezone(&chrono::Utc);
-            // v9.0.0 (#237, CC 5.3.2.4.3.1) — the takedown handler emits
-            // federation-tier `withdraws` per holder, which the ingest gate
-            // requires be hybrid-signed. Use the PQC-capable LocalSigner;
-            // error clearly when none is configured (no classical-only
-            // fallback / silent skip / local-tier downgrade).
-            let signer = self.local_signer.clone().ok_or_else(|| {
-                PyValueError::new_err(
-                    "process_takedown_admission requires a hybrid (Ed25519 + ML-DSA-65) \
-                     LocalSigner to sign federation-tier withdraws (CC 5.3.2.4.3.1); none is \
-                     configured on this engine",
-                )
-            })?;
-            let cfg_snapshot = self
-                .multimedia_config
-                .read()
-                .unwrap_or_else(|p| p.into_inner())
-                .clone();
-            py.detach(move || match &self.backend {
-                #[cfg(feature = "postgres")]
-                BackendDispatch::Postgres(pg) => {
-                    let backend = pg.clone();
-                    let cfg = cfg_snapshot.clone();
-                    runtime.block_on(async move {
-                        let report =
-                            crate::cirisnode::takedown_handler::process_takedown_admission_with_config(
-                                &*backend,
-                                &*backend,
-                                &signer,
-                                &signer_kid,
-                                &notice,
-                                now,
-                                cfg.as_deref(),
-                            )
-                            .await
-                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
-                        serialize_takedown_report(&report)
-                    })
-                }
-                #[cfg(feature = "sqlite")]
-                BackendDispatch::Sqlite(sq) => {
-                    let backend = sq.clone();
-                    let cfg = cfg_snapshot.clone();
-                    runtime.block_on(async move {
-                        let report =
-                            crate::cirisnode::takedown_handler::process_takedown_admission_with_config(
-                                &*backend,
-                                &*backend,
-                                &signer,
-                                &signer_kid,
-                                &notice,
-                                now,
-                                cfg.as_deref(),
-                            )
-                            .await
-                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
-                        serialize_takedown_report(&report)
-                    })
-                }
-            })
+        let env: crate::cirisnode::ContributionEnvelope =
+            serde_json::from_str(contribution_json)
+                .map_err(|e| PyValueError::new_err(format!("takedown contribution_json: {e}")))?;
+        let notice = crate::cirisnode::takedown_notice_from_contribution(&env)
+            .map_err(federation_err_to_py)?;
+        self.purge_engine_call(py, move |engine| async move {
+            engine.takedown_tombstone(&notice).await
         })
     }
 
@@ -25698,8 +25856,9 @@ impl PyEngine {
     /// `community_dek` blob the epoch binding's minter (#876); for a `self` /
     /// `family` blob the attester of the admitted `key_grant:content:v1` set
     /// naming the sha; `null` when this node holds neither. A puller for a
-    /// self/family blob asks THIS, never `list_holders` (CC 5.2: no holder
-    /// claim exists at those scopes). JSON string or `null`.
+    /// self/family blob asks THIS for the key; v55.0.0 — its holders are
+    /// the holding claims at `self` / the family, which reach only the
+    /// cohort's own nodes (CC 3.1.3.3). JSON string or `null`.
     fn minter_of_blob_json(&self, py: Python<'_>, sha256_hex: &str) -> PyResult<String> {
         self.ensure_usable()?;
         catch_panic(|| {
@@ -30430,9 +30589,10 @@ impl PyEngine {
     // checkpoints (immutable — a witnessed fact pins, never flips), L2/L6
     // entry-range pointers, L8 fork-evidence records (detection records,
     // adjudication punishes — a fork NEVER fires slashing from here).
-    // Rows on the ledger:* dimension family stay REFUSED at federation
-    // tier until CIRISConstitution#92 graduates the family; these local
-    // verbs are live for consumers that enable the feature.
+    // Rows on the ledger:* dimension family admit at federation tier since
+    // the rc7 re-vendor (v55.0.0, CIRISPersist#753) under the L1 binding and
+    // the owner rule; these local verbs are live for consumers that enable
+    // the feature.
 
     /// CC 3.3.10.1 L1 — register (or idempotently re-register) the ledger
     /// for `(owner_key_id, unit, standard_version)`. Returns JSON
@@ -34525,6 +34685,12 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         // (ValueError), so it keeps that type; the KIND
         // (`federation_signer_not_acting_for`) marks it retryable.
         crate::federation::Error::SignerDoesNotActFor { .. } => PyValueError::new_err(kind),
+        // v55.0.0 (CIRISPersist#1055) — typed out of `InvalidArgument`
+        // (ValueError), so it keeps that type; the plane and the TERMINAL
+        // reason token ride with the kind.
+        crate::federation::Error::MalformedRow { plane, reason, .. } => {
+            PyValueError::new_err(format!("{kind}: {plane}: {reason}"))
+        }
         // v54.1.0 (CIRISPersist#1042 follow-up C) — typed out of
         // `InvalidArgument` / `Conflict` (both ValueError); same type, and the
         // licensure reason token rides with the kind.
@@ -34661,8 +34827,8 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         // v44.8.0 (CIRISPersist#866 C1) — a malformed consent scope token is
         // caller-fault malformed content; ValueError (4xx), the kind names it.
         crate::federation::Error::ConsentScopeTokenInvalid { .. } => PyValueError::new_err(kind),
-        // v45.0.0 (CIRISPersist#871) — a malformed media Source struct, or a
-        // `holds_bytes` claim without a size, is caller-fault malformed
+        // v45.0.0 (CIRISPersist#871) — a malformed media Source struct is
+        // caller-fault malformed
         // content; ValueError (4xx), the kind names it.
         crate::federation::Error::MediaSourceInvalid { .. } => PyValueError::new_err(kind),
         // v3.4.0 (CIRISPersist#123) — trust gate rejection is
@@ -35042,35 +35208,6 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
 /// server-fault → RuntimeError. The `kind()` string travels in the
 /// message for `translate_error_kind`-style retry-policy routing if
 /// the consumer wants it.
-/// v3.6.0 (CIRISPersist#134) — JSON-encode a
-/// [`TakedownReport`](crate::cirisnode::takedown_handler::TakedownReport)
-/// for return across the PyO3 boundary. Field order matches the
-/// rustdoc on `cirisnode_process_takedown_admission_json`.
-#[cfg(feature = "cirisnode")]
-fn serialize_takedown_report(
-    report: &crate::cirisnode::takedown_handler::TakedownReport,
-) -> PyResult<String> {
-    let value = serde_json::json!({
-        "holders_seen": report.holders_seen,
-        "withdraws_emitted": report.withdraws_emitted,
-        "withdraws_failed": report.withdraws_failed,
-        "holders_evicted": report.holders_evicted,
-        "holders_evict_failed": report.holders_evict_failed,
-        "scheduled_eviction_at": report
-            .scheduled_eviction_at
-            .map(|t| t.to_rfc3339()),
-        // v3.6.0 (CIRISPersist#134) — Policy J age-gate observability.
-        // True when the takedown emitted withdraws but did NOT trigger
-        // eviction because the basis composes with the Policy J age
-        // gate per CEG §8.1.10. Python callers need this to
-        // distinguish age-gated takedowns from any other no-eviction
-        // outcome.
-        "age_gate_applied": report.age_gate_applied,
-    });
-    serde_json::to_string(&value)
-        .map_err(|e| PyRuntimeError::new_err(format!("TakedownReport encode: {e}")))
-}
-
 /// #832 / #831 — decode the optional `aad_b64` kwarg every AAD-carrying
 /// binding takes. `None` stays `None`; a malformed string is a `ValueError`
 /// before any backend work.
@@ -35092,14 +35229,21 @@ fn blob_err_to_py(e: crate::federation::BlobError) -> PyErr {
         // v10.0.1 (CIRISPersist#275) — keep the stable `kind` token as a
         // prefix (callers branching on `str(e).startswith(...)` / `in`
         // still match) but append the inner detail, which carries the
-        // underlying cause (e.g. the holds_bytes/withdraws scrub_key_id FK
+        // underlying cause (e.g. the holding-claim/withdraws scrub_key_id FK
         // violation) — previously swallowed to a bare token.
         crate::federation::BlobError::AttestationEmissionFailed(ref detail) => {
             PyValueError::new_err(format!("{kind}: {detail}"))
         }
+        // v55.0.0 (CIRISPersist#989, operator ruling 2026-10-12) — an
+        // invalid-argument refusal keeps its `kind` prefix and carries its
+        // detail, whose leading `<token>:` (`custody_ack_scope_mismatch`,
+        // `holding_claim_scope_unresolved`, `custody_ack_outside_cohort`, …)
+        // is what a host keys on — the convention of the arm above.
+        crate::federation::BlobError::InvalidArgument(ref detail) => {
+            PyValueError::new_err(format!("{kind}: {detail}"))
+        }
         crate::federation::BlobError::HashMismatch { .. }
-        | crate::federation::BlobError::InlineSizeExceeded { .. }
-        | crate::federation::BlobError::InvalidArgument(_) => PyValueError::new_err(kind),
+        | crate::federation::BlobError::InlineSizeExceeded { .. } => PyValueError::new_err(kind),
         // v3.4.0 (CIRISPersist#123) — trust gate rejection.
         crate::federation::BlobError::TrustBelowThreshold { .. } => PyValueError::new_err(kind),
         // v3.6.0 (CIRISPersist#134) — perceptual-hash matcher hit.
@@ -35202,6 +35346,64 @@ fn blob_err_to_py(e: crate::federation::BlobError) -> PyErr {
                 .as_deref()
                 .map(|c| format!(" community {c}"))
                 .unwrap_or_default()
+        )),
+        // v55.0.0 (CIRISPersist#981) — a caller-keyed stream's refusals, each
+        // its own token with the detail as JSON after it (the
+        // `ChunkKeyNotYetGranted` shape), ValueError like every caller-side
+        // blob refusal. `retryable` says which a host may resend after
+        // supplying the next epoch's DEK.
+        crate::federation::BlobError::StreamEpochRotationRequired {
+            ref stream_id,
+            epoch,
+            reason,
+            ref removed_key_id,
+        } => PyValueError::new_err(format!(
+            "{kind}: {}",
+            serde_json::json!({
+                "stream_id": stream_id,
+                "epoch": epoch,
+                "reason": reason,
+                "removed_key_id": removed_key_id,
+                "retryable": true,
+            })
+        )),
+        crate::federation::BlobError::StreamEpochDekMissing {
+            ref stream_id,
+            epoch,
+        } => PyValueError::new_err(format!(
+            "{kind}: {}",
+            serde_json::json!({ "stream_id": stream_id, "epoch": epoch, "retryable": true })
+        )),
+        crate::federation::BlobError::StreamEpochDekExists {
+            ref stream_id,
+            epoch,
+        } => PyValueError::new_err(format!(
+            "{kind}: {}",
+            serde_json::json!({ "stream_id": stream_id, "epoch": epoch, "retryable": false })
+        )),
+        crate::federation::BlobError::StreamNotAuthored { ref stream_id } => {
+            PyValueError::new_err(format!(
+                "{kind}: {}",
+                serde_json::json!({ "stream_id": stream_id, "retryable": false })
+            ))
+        }
+        // v55.0.0 (CIRISPersist#977) — a stream-keyed room chunk under a
+        // community epoch: the same token-then-JSON shape, terminal for the
+        // provenance (rebuild it with `for_stream_keyed_chunk`).
+        crate::federation::BlobError::StreamKeyedChunkCommunityEpoch {
+            ref stream_id,
+            epoch,
+            community_epoch,
+            ref chunk_sha256_hex,
+        } => PyValueError::new_err(format!(
+            "{kind}: {}",
+            serde_json::json!({
+                "stream_id": stream_id,
+                "epoch": epoch,
+                "community_epoch": community_epoch,
+                "chunk_sha256_hex": chunk_sha256_hex,
+                "retryable": false,
+            })
         )),
         crate::federation::BlobError::Backend(_) => PyRuntimeError::new_err(kind),
     }
@@ -35411,7 +35613,7 @@ fn parse_put_blob_payload(json: &str) -> PyResult<PutBlobPayload> {
 
 /// v3.9.2 (CIRISPersist#153 Ask 5) — wire shape for
 /// `store_blob_local_json`: `put_blob_json` minus the `attestation`
-/// field (local-only storage emits no holds_bytes attestation).
+/// field (local-only storage emits no holding claim).
 #[derive(serde::Deserialize)]
 struct StoreBlobLocalJsonWire {
     sha256: String,
@@ -35486,24 +35688,7 @@ fn parse_put_blob_chunks_payload(
 )> {
     let wire: PutBlobChunksJsonWire = serde_json::from_str(json)
         .map_err(|e| PyValueError::new_err(format!("put_blob_chunks_json decode: {e}")))?;
-    let mut mrefs = Vec::with_capacity(wire.manifest.chunks.len());
-    for c in wire.manifest.chunks {
-        let sha = parse_sha256_hex(&c.sha)?;
-        // The commons atomic upload builds a v1 (plaintext) manifest: no position.
-        mrefs.push(crate::federation::ChunkRef {
-            sha,
-            size: c.size,
-            seq: None,
-            epoch: None,
-        });
-    }
-    let manifest = crate::federation::ChunkManifest {
-        chunk_tier: None,
-        stream_id: None,
-        v: wire.manifest.v,
-        total_size: wire.manifest.total_size,
-        chunks: mrefs,
-    };
+    let manifest = plaintext_manifest_from_wire(wire.manifest)?;
     let mut chunks = Vec::with_capacity(wire.chunks.len());
     for c in wire.chunks {
         let sha = parse_sha256_hex(&c.sha)?;
@@ -35521,6 +35706,32 @@ fn parse_put_blob_chunks_payload(
         chunks.push((sha, body));
     }
     Ok((manifest, chunks))
+}
+
+/// The commons manifest wire into a v1 (plaintext) [`ChunkManifest`]: no
+/// chunk position, no sealed-DAG members. Shared by the one-shot upload and
+/// the incremental finalize (CIRISPersist#952).
+fn plaintext_manifest_from_wire(
+    wire: ChunkManifestWire,
+) -> PyResult<crate::federation::ChunkManifest> {
+    let mut mrefs = Vec::with_capacity(wire.chunks.len());
+    for c in wire.chunks {
+        let sha = parse_sha256_hex(&c.sha)?;
+        // The commons atomic upload builds a v1 (plaintext) manifest: no position.
+        mrefs.push(crate::federation::ChunkRef {
+            sha,
+            size: c.size,
+            seq: None,
+            epoch: None,
+        });
+    }
+    Ok(crate::federation::ChunkManifest {
+        chunk_tier: None,
+        stream_id: None,
+        v: wire.v,
+        total_size: wire.total_size,
+        chunks: mrefs,
+    })
 }
 
 /// v2.3 (CIRISPersist#103) — parse a 64-char hex string into a
@@ -36612,6 +36823,35 @@ async fn build_audit_chain_proof(
 mod tests {
     use super::*;
 
+    /// v55.0.0 (CIRISPersist#989, operator ruling 2026-10-12) — **a blob
+    /// invalid-argument refusal shows Python its token.** The error is the
+    /// real gate's (`ClaimScope::of_content` for community content naming no
+    /// room); through v54 the Python text was the bare `blob_invalid_argument`
+    /// kind and a host could not tell which refusal it was. The kind stays the
+    /// prefix (`startswith` callers still match) and the type stays ValueError.
+    #[test]
+    fn blob_invalid_argument_carries_its_token_to_python() {
+        use crate::federation::holding_claim::{ClaimScope, HOLDING_CLAIM_SCOPE_UNRESOLVED};
+        use crate::federation::types::cohort_scope::{CryptoTier, COMMUNITY};
+        let e = ClaimScope::of_content(CryptoTier::CommunityDek, COMMUNITY, None).unwrap_err();
+        assert!(matches!(
+            e,
+            crate::federation::BlobError::InvalidArgument(_)
+        ));
+        Python::initialize();
+        let py_err = blob_err_to_py(e);
+        Python::attach(|py| {
+            assert!(py_err.is_instance_of::<PyValueError>(py));
+            let text = py_err.value(py).to_string();
+            assert!(
+                text.starts_with(&format!(
+                    "blob_invalid_argument: {HOLDING_CLAIM_SCOPE_UNRESOLVED}:"
+                )),
+                "the kind prefix, then the token a host keys on: {text}"
+            );
+        });
+    }
+
     /// A `full_traces` envelope with one ASCII trace — the shape the #690 door
     /// judges. Built through `from_json` so it is a real parsed envelope, not a
     /// struct literal that could drift from what the wire actually produces.
@@ -37223,8 +37463,7 @@ mod tests {
                 crate::federation::ReplicationConfig::default(),
             )),
             sweeper: std::sync::Mutex::new(None),
-            #[cfg(feature = "cirisnode")]
-            multimedia_config: Arc::new(std::sync::RwLock::new(None)),
+            reack_sweeper: std::sync::Mutex::new(None),
             disk_pressure: std::sync::Mutex::new(None),
             disk_pressure_handle: std::sync::Mutex::new(None),
         });
@@ -37378,8 +37617,7 @@ mod tests {
                 crate::federation::ReplicationConfig::default(),
             )),
             sweeper: std::sync::Mutex::new(None),
-            #[cfg(feature = "cirisnode")]
-            multimedia_config: Arc::new(std::sync::RwLock::new(None)),
+            reack_sweeper: std::sync::Mutex::new(None),
             disk_pressure: std::sync::Mutex::new(None),
             disk_pressure_handle: std::sync::Mutex::new(None),
         });
@@ -37466,8 +37704,7 @@ mod tests {
                 crate::federation::ReplicationConfig::default(),
             )),
             sweeper: std::sync::Mutex::new(None),
-            #[cfg(feature = "cirisnode")]
-            multimedia_config: Arc::new(std::sync::RwLock::new(None)),
+            reack_sweeper: std::sync::Mutex::new(None),
             disk_pressure: std::sync::Mutex::new(None),
             disk_pressure_handle: std::sync::Mutex::new(None),
         });
@@ -39588,7 +39825,7 @@ fn install_panic_logger() -> bool {
 /// paired with that pin so a future reader can tell the witness is
 /// load-bearing rather than vacuous.
 ///
-/// `blobs.rs`'s `put_blob_signing_canonicalizer_identity_holds_bytes_envelope`
+/// `blobs.rs`'s `put_blob_signing_canonicalizer_identity_holding_claim_envelope`
 /// and `pipeline.rs`'s edge-signing pins record the ASCII-AGREEMENT property;
 /// this module is deliberately their mirror image.
 #[cfg(test)]

@@ -47,6 +47,10 @@
 //!   manifests share survives the SETTLED purge's finalize while the other
 //!   purge is still in its dwell (withheld meanwhile), and goes at the other's
 //!   finalize.
+//! - **I784 / I791b** (v55.0.0, CIRISPersist#951, #1007) — a sealed DAG is
+//!   announced at promotion under `Announce`, never at the manifest adopt or
+//!   a `LocalOnly` promote, and never while a chunk is missing; B's custody
+//!   report is B's alone to retract.
 //! - **I600** (v54.0.0, Codex on PR #1050) — the sweep RESUMES: with a cap
 //!   of three and three unopenable manifests sorting first, a linkable DAG
 //!   after them is linked within two passes (each pass starts after where the
@@ -64,7 +68,6 @@
 pub(crate) mod bodies {
     use crate::federation::blob_tombstone::{binding_state, BindingState};
     use crate::federation::epoch_minter_invariants::bodies::Pick;
-    use crate::federation::key_grant::SignedKeyGrantSet;
     use crate::federation::nested_manifest_invariants::bodies::{pair, Pair};
     use crate::federation::tier_ingest::test_support as ts;
     use crate::federation::types::attestation_type;
@@ -79,6 +82,8 @@ pub(crate) mod bodies {
     pub(crate) trait LinkSeam {
         async fn dag_link(&self, manifest: &[u8; 32], add: Option<(u64, [u8; 32], &str)>);
         async fn drop_stream_row(&self, stream_id: &str, seq: u64);
+        /// The backend's inline cap (a small cap seals a v3 root, #954).
+        fn set_cap(&self, cap: usize);
     }
     #[cfg(feature = "sqlite")]
     impl LinkSeam for crate::store::sqlite::SqliteBackend {
@@ -88,6 +93,9 @@ pub(crate) mod bodies {
         async fn drop_stream_row(&self, stream_id: &str, seq: u64) {
             self.test_drop_stream_chunk_row(stream_id, seq).await
         }
+        fn set_cap(&self, cap: usize) {
+            self.set_inline_bytes_cap(cap);
+        }
     }
     #[cfg(feature = "postgres")]
     impl LinkSeam for crate::store::postgres::PostgresBackend {
@@ -96,6 +104,9 @@ pub(crate) mod bodies {
         }
         async fn drop_stream_row(&self, stream_id: &str, seq: u64) {
             self.test_drop_stream_chunk_row(stream_id, seq).await
+        }
+        fn set_cap(&self, cap: usize) {
+            self.set_inline_bytes_cap(cap);
         }
     }
 
@@ -151,7 +162,7 @@ pub(crate) mod bodies {
             .manifest_sha256
     }
 
-    /// B receives A's DAG the way a host delivers it — A's key_grant sets, the
+    /// B receives A's DAG the way a host delivers it — A's key-grant rows, the
     /// sealed manifest, every chunk at its position, the promote. Returns the
     /// chunk addresses in seq order (terminator last).
     async fn deliver<B>(p: &Pair<B>, stream: &str, root: &[u8; 32]) -> Vec<(u64, [u8; 32])>
@@ -159,18 +170,17 @@ pub(crate) mod bodies {
         B: BlobStorage + FederationDirectory + Sync + 'static,
     {
         p.a.emit_pending_key_grants().await.unwrap();
-        for set in
-            p.sa.list_attestations_by(&p.key_a)
-                .await
-                .unwrap()
-                .into_iter()
-                .filter(|x| x.attestation_type.starts_with("key_grant:"))
+        // v55.0.0 (#989) — the rows A's plane delivers to B.
+        for set in crate::federation::key_grant_invariants::two_node::key_grant_rows_for(
+            p.sa.as_ref(),
+            &p.key_a,
+            &p.key_b,
+        )
+        .await
         {
-            // A set B already applied answers as a duplicate; the delivery is
+            // A row B already applied answers as a duplicate; the delivery is
             // what matters, not the count.
-            let _ =
-                p.b.apply_replicated_key_grant(SignedKeyGrantSet { attestation: set })
-                    .await;
+            let _ = p.b.apply_replicated_key_grant(set).await;
         }
         p.b.adopt_sealed_blob(
             &inline(p.sa.as_ref(), root).await,
@@ -194,9 +204,14 @@ pub(crate) mod bodies {
                 .unwrap_or_else(|e| panic!("chunk {}: {e}", c.seq));
             out.push((c.seq, sha));
         }
-        p.b.promote_adopted_manifest_to_dag(root, &p.key_b, None)
-            .await
-            .expect("B promotes");
+        p.b.promote_adopted_manifest_to_dag(
+            root,
+            &p.key_b,
+            None,
+            crate::federation::AdoptDisposition::LocalOnly,
+        )
+        .await
+        .expect("B promotes");
         out.sort_by_key(|(seq, _)| *seq);
         out
     }
@@ -305,6 +320,151 @@ pub(crate) mod bodies {
             "I481 B's promote relates the adopted manifest to every chunk it checked"
         );
         assert_eq!(on_b, on_a, "I481 the same relation on both nodes");
+    }
+
+    /// B's live `custody:ack:v1` `here` reports naming `root`.
+    async fn custody_reports<B>(p: &Pair<B>, root: &[u8; 32]) -> Vec<crate::federation::Attestation>
+    where
+        B: BlobStorage + FederationDirectory + Sync + 'static,
+    {
+        let hex_root = hex::encode(root);
+        let all = p.sb.list_attestations_by(&p.key_b).await.unwrap();
+        let retired = {
+            let refs: Vec<&crate::federation::Attestation> = all.iter().collect();
+            crate::federation::precedence::retired_ids(&refs)
+        };
+        all.into_iter()
+            .filter(|a| !retired.contains(&a.attestation_id))
+            .filter(|a| {
+                crate::federation::admission::envelope_dimension(&a.attestation_envelope)
+                    == Some(crate::federation::custody_ack::CUSTODY_ACK_DIMENSION)
+                    && a.attestation_envelope["evidence_refs"][0].as_str()
+                        == Some(hex_root.as_str())
+            })
+            .collect()
+    }
+
+    /// **I784** (v55.0.0, CIRISPersist#951) — a sealed DAG is announced at
+    /// PROMOTION, never at the manifest adopt: B adopts the manifest
+    /// `LocalOnly` and holds no claim for the root; a promote under
+    /// `LocalOnly` announces nothing; under `Announce` it emits B's holding
+    /// claim (`announced: true`), on a re-run over a DAG already promoted
+    /// too. A DAG with a chunk not held refuses the promote and announces
+    /// nothing.
+    ///
+    /// **I791b** (v55.0.0, CIRISPersist#1007) — B's `custody:ack:v1` report
+    /// is B's alone to retract: A's `withdraws` of it is
+    /// `custody_ack_withdraws_not_the_holder` at B's door; B's own is admitted.
+    pub(crate) async fn i784_a_sealed_dag_is_announced_at_promotion<B>(
+        dsn_a: &str,
+        dsn_b: &str,
+        run: &str,
+        pick: Pick<B>,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync + 'static,
+    {
+        let p = pair(dsn_a, dsn_b, run, pick, "i784").await;
+        let stream = format!("i784-{run}");
+        let root = write_and_seal(&p, &stream, 2).await;
+        deliver(&p, &stream, &root).await;
+        assert!(
+            custody_reports(&p, &root).await.is_empty(),
+            "I784: a LocalOnly adopt and promote announce nothing"
+        );
+        let out =
+            p.b.promote_adopted_manifest_to_dag(&root, &p.key_b, None, AdoptDisposition::Announce)
+                .await
+                .expect("I784: B announces the whole DAG");
+        assert!(out.announced && !out.promoted, "I784: {out:?}");
+        let reports = custody_reports(&p, &root).await;
+        assert_eq!(reports.len(), 1, "I784: B's holding claim for the root");
+
+        // A DAG B holds part of: refused, nothing announced.
+        let partial = format!("i784-partial-{run}");
+        let root2 = write_and_seal(&p, &partial, 2).await;
+        p.a.emit_pending_key_grants().await.unwrap();
+        // v55.0.0 (#989) — the key-grant rows A's plane delivers to B.
+        for set in crate::federation::key_grant_invariants::two_node::key_grant_rows_for(
+            p.sa.as_ref(),
+            &p.key_a,
+            &p.key_b,
+        )
+        .await
+        {
+            let _ = p.b.apply_replicated_key_grant(set).await;
+        }
+        p.b.adopt_sealed_blob(
+            &inline(p.sa.as_ref(), &root2).await,
+            prov(&p),
+            None,
+            AdoptDisposition::LocalOnly,
+        )
+        .await
+        .expect("B adopts the manifest");
+        assert!(
+            custody_reports(&p, &root2).await.is_empty(),
+            "I784: the manifest adopt announces nothing"
+        );
+        let view =
+            p.b.open_sealed_manifest_as(&root2, &p.key_b, None)
+                .await
+                .unwrap();
+        let c = &view.chunks[0];
+        let sha = hexsha(&c.sha256_hex);
+        p.b.adopt_sealed_chunk(
+            &partial,
+            c.seq,
+            &inline(p.sa.as_ref(), &sha).await,
+            c.epoch.expect("a v4 chunk names its epoch"),
+            u64::from(c.size),
+            prov(&p),
+        )
+        .await
+        .unwrap();
+        let e =
+            p.b.promote_adopted_manifest_to_dag(&root2, &p.key_b, None, AdoptDisposition::Announce)
+                .await
+                .expect_err("I784: a chunk is not held");
+        assert!(matches!(e, BlobError::InvalidArgument(_)), "I784: {e:?}");
+        assert!(
+            custody_reports(&p, &root2).await.is_empty(),
+            "I784: a partial DAG is never announced"
+        );
+
+        // I791b — only B retracts B's report.
+        let report = &reports[0];
+        let a_signer = ts::local_signer(&format!("i784-a-{run}"));
+        let refused = crate::federation::blobs::emit_withdraws_attestation_helper(
+            report,
+            "",
+            &a_signer,
+            p.sb.as_ref(),
+            chrono::Utc::now(),
+        )
+        .await
+        .expect_err("I791b: A withdraws B's custody report");
+        assert!(
+            refused
+                .to_string()
+                .contains("custody_ack_withdraws_not_the_holder"),
+            "I791b: {refused}"
+        );
+        assert_eq!(
+            custody_reports(&p, &root).await.len(),
+            1,
+            "I791b: it stands"
+        );
+        let b_signer = ts::local_signer(&format!("i784-b-{run}"));
+        crate::federation::blobs::emit_withdraws_attestation_helper(
+            report,
+            "",
+            &b_signer,
+            p.sb.as_ref(),
+            chrono::Utc::now(),
+        )
+        .await
+        .expect("I791b: B retracts its own report");
+        assert!(custody_reports(&p, &root).await.is_empty());
     }
 
     /// **I482 / I483** — Edge's leg: withdraw on B, then serve and evict.
@@ -702,19 +862,29 @@ pub(crate) mod bodies {
                 "I823 chunk {seq} is not served by hash"
             );
         }
-        // The round-4 sweep: the tombstone outlives the bytes, so a manifest
-        // re-delivered after finalize is held but never served again.
-        p.b.adopt_sealed_blob(
-            &inline(p.sa.as_ref(), &root).await,
-            prov(&p),
-            None,
-            AdoptDisposition::LocalOnly,
-        )
-        .await
-        .expect("I823: the bytes may be re-delivered");
+        // The round-4 sweep: the tombstone outlives the bytes. v55.0.0
+        // (CIRISPersist#1007, operator ruling) — a manifest re-delivered after
+        // finalize is REFUSED at the write door (`Purged`, naming the notice)
+        // and nothing is held again; before v55 it was held and withheld.
+        let again =
+            p.b.adopt_sealed_blob(
+                &inline(p.sa.as_ref(), &root).await,
+                prov(&p),
+                None,
+                AdoptDisposition::LocalOnly,
+            )
+            .await;
+        assert!(
+            matches!(&again, Err(BlobError::Purged { notice_id, .. }) if *notice_id == exec.notice_id),
+            "I823: a re-delivered purged manifest is refused at write: {again:?}"
+        );
+        assert!(
+            !p.sb.has_blob(&root).await.unwrap(),
+            "I823: nothing new is held"
+        );
         assert!(
             matches!(served(&p, &root).await, Err(BlobError::Purged { .. })),
-            "I823: a re-delivered purged manifest stays withheld"
+            "I823: and it is still withheld"
         );
         assert!(
             p.sb.has_blob(&shared).await.unwrap(),
@@ -724,6 +894,203 @@ pub(crate) mod bodies {
         assert!(
             p.sb.has_blob(&keep).await.unwrap(),
             "I823 the live DAG stays"
+        );
+    }
+
+    /// **I835** (v55.0.0, CIRISPersist#1058) — a purged v3 root takes its
+    /// whole nested DAG, and nothing it evicted can be served back by hash.
+    ///
+    /// A 60-chunk `self` stream sealed at a 4 KiB cap is a v3 root over v2
+    /// child pages (I202). B receives it whole, binds it, and a steward purge
+    /// of the binding row and the root finalizes. Then on B: the root, every
+    /// child page and every chunk are gone (the walk reached the nested
+    /// DAG); a child page a LIVE root also relates stays and serves
+    /// (`delete_blob` took children regardless of their other parents); and
+    /// an evicted child page or chunk a peer re-offers is refused (`Purged`)
+    /// at the write floor (`refuse_tombstoned_bytes`, the slice C ruling:
+    /// taken-down bytes never come back), is not held, and does not serve.
+    /// The floor finds a child page purged only through the surviving
+    /// root -> child relation. Before v55.0.0 `delete_blob` also deleted that
+    /// relation, so a re-offered child page related to nothing and was
+    /// served back.
+    pub(crate) async fn i835_a_purged_v3_root_takes_its_nested_dag<B>(
+        dsn_a: &str,
+        dsn_b: &str,
+        run: &str,
+        pick: Pick<B>,
+    ) where
+        B: BlobStorage + FederationDirectory + LinkSeam + Sync + 'static,
+    {
+        use crate::federation::steward_purge::{self as sp, PurgePlane};
+        let p = pair(dsn_a, dsn_b, run, pick, "i835").await;
+        p.sa.set_cap(4096);
+        let stream = format!("i835-{run}");
+        let root = write_and_seal(&p, &stream, 60).await;
+        // B receives the nested DAG the way I204's second device does.
+        p.a.emit_pending_key_grants().await.unwrap();
+        // v55.0.0 (#989) — the key-grant rows A's plane delivers to B.
+        for set in crate::federation::key_grant_invariants::two_node::key_grant_rows_for(
+            p.sa.as_ref(),
+            &p.key_a,
+            &p.key_b,
+        )
+        .await
+        {
+            let _ = p.b.apply_replicated_key_grant(set).await;
+        }
+        p.b.adopt_sealed_blob(
+            &inline(p.sa.as_ref(), &root).await,
+            prov(&p),
+            None,
+            AdoptDisposition::LocalOnly,
+        )
+        .await
+        .expect("I835: B adopts the root");
+        let view =
+            p.b.open_sealed_manifest_as(&root, &p.key_b, None)
+                .await
+                .expect("I835: B opens the root");
+        assert_eq!(view.version, 3, "I835: the root is v3");
+        assert!(view.children.len() >= 2, "I835: two child pages at least");
+        let mut children = Vec::new();
+        let mut chunks = Vec::new();
+        for c in &view.children {
+            let sha = hexsha(&c.sha256_hex);
+            p.b.adopt_sealed_manifest_child(
+                &root,
+                c.index,
+                &inline(p.sa.as_ref(), &sha).await,
+                prov(&p),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("I835: child {}: {e}", c.index));
+            children.push(sha);
+            let page =
+                p.b.open_sealed_manifest_page_as(&root, c.index, &p.key_b, None)
+                    .await
+                    .unwrap_or_else(|e| panic!("I835: page {}: {e}", c.index));
+            for ch in page {
+                let csha = hexsha(&ch.sha256_hex);
+                let env = inline(p.sa.as_ref(), &csha).await;
+                p.b.adopt_sealed_chunk(
+                    &stream,
+                    ch.seq,
+                    &env,
+                    ch.epoch.unwrap_or(0),
+                    u64::from(ch.size),
+                    prov(&p),
+                )
+                .await
+                .unwrap_or_else(|e| panic!("I835: chunk {}: {e}", ch.seq));
+                chunks.push((ch.seq, csha, env, ch.epoch.unwrap_or(0), ch.size));
+            }
+        }
+        p.b.promote_adopted_manifest_to_dag(
+            &root,
+            &p.key_b,
+            None,
+            crate::federation::AdoptDisposition::LocalOnly,
+        )
+        .await
+        .expect("I835: B promotes");
+        // A LIVE root on B also relates the first child page.
+        let keep_stream = format!("i835-keep-{run}");
+        let keep = write_and_seal(&p, &keep_stream, 2).await;
+        deliver(&p, &keep_stream, &keep).await;
+        p.sb.record_manifest_child(&keep, 1_000, &children[0])
+            .await
+            .expect("I835: the live root relates child 0 too");
+        let row = bind(
+            p.sb.as_ref(),
+            &format!("i835-file-{run}"),
+            &p.owner,
+            &hex::encode(root),
+            None,
+        )
+        .await;
+        for c in &children {
+            served(&p, c)
+                .await
+                .expect("I835 control: a child page serves");
+        }
+        let t = chrono::Utc::now();
+        let exec = execute_purge(
+            p.sb.as_ref(),
+            &p.key_b,
+            &[
+                (PurgePlane::Attestation, row),
+                (PurgePlane::Blob, hex::encode(root)),
+            ],
+            t,
+        )
+        .await;
+        sp::test_clock::set(Some(
+            t + chrono::Duration::seconds(sp::PURGE_SETTLE_DWELL_SECS + 1),
+        ));
+        p.b.purge_finalize(&exec.notice_id)
+            .await
+            .expect("I835: the purge finalizes");
+        sp::test_clock::set(None);
+
+        assert!(!p.sb.has_blob(&root).await.unwrap(), "I835 the root goes");
+        for (i, c) in children.iter().enumerate().skip(1) {
+            assert!(
+                !p.sb.has_blob(c).await.unwrap(),
+                "I835 child page {i} goes with its purged root"
+            );
+        }
+        for (seq, c, ..) in &chunks {
+            assert!(
+                !p.sb.has_blob(c).await.unwrap(),
+                "I835 chunk {seq} of the nested DAG goes"
+            );
+        }
+        assert!(
+            p.sb.has_blob(&children[0]).await.unwrap(),
+            "I835 a child page a live root relates stays"
+        );
+        served(&p, &children[0])
+            .await
+            .expect("I835 and it still serves");
+
+        // A peer re-offers what was evicted: refused at the write floor
+        // (slice C's ruling, `refuse_tombstoned_bytes`), never stored, and
+        // never served.
+        let refused = |r: Result<(), BlobError>, what: &str| {
+            assert!(
+                matches!(r, Err(BlobError::Purged { .. })),
+                "I835 a re-offered {what} is refused Purged: {r:?}"
+            );
+        };
+        let page = inline(p.sa.as_ref(), &children[1]).await;
+        refused(
+            p.b.adopt_sealed_blob(&page, prov(&p), None, AdoptDisposition::LocalOnly)
+                .await
+                .map(|_| ()),
+            "child page",
+        );
+        assert!(
+            !p.sb.has_blob(&children[1]).await.unwrap(),
+            "I835 a refused child page is not held"
+        );
+        assert!(
+            served(&p, &children[1]).await.is_err(),
+            "I835 a refused child page does not serve"
+        );
+        let (seq, csha, env, epoch, size) = &chunks[0];
+        refused(
+            p.b.adopt_sealed_chunk(&stream, *seq, env, *epoch, u64::from(*size), prov(&p))
+                .await
+                .map(|_| ()),
+            "chunk",
+        );
+        assert!(
+            !p.sb.has_blob(csha).await.unwrap(),
+            "I835 a refused chunk is not held"
+        );
+        assert!(
+            served(&p, csha).await.is_err(),
+            "I835 a refused chunk does not serve"
         );
     }
 
@@ -891,9 +1258,14 @@ pub(crate) mod bodies {
         p.sb.dag_link(&root, None).await;
         assert!(p.b.chunks_of_manifest(&root).await.unwrap().is_empty());
         let again =
-            p.b.promote_adopted_manifest_to_dag(&root, &p.key_b, None)
-                .await
-                .unwrap();
+            p.b.promote_adopted_manifest_to_dag(
+                &root,
+                &p.key_b,
+                None,
+                crate::federation::AdoptDisposition::LocalOnly,
+            )
+            .await
+            .unwrap();
         assert!(!again.promoted, "I487 the row was already a DAG");
         assert_eq!(
             p.b.chunks_of_manifest(&root).await.unwrap(),
@@ -1267,10 +1639,12 @@ mod runners {
     pair_case!(i823, i823_a_purged_manifest_takes_its_chunks);
     pair_case!(i824, i824_a_purged_blob_is_withheld_from_execution);
     pair_case!(i830, i830_a_shared_chunk_waits_for_every_settle);
+    pair_case!(i835, i835_a_purged_v3_root_takes_its_nested_dag);
     pair_case!(i485, i485_a_forged_pointer_revives_nothing);
     pair_case!(i486_487, i486_487_an_unrelated_dag_and_the_backfill);
     pair_case!(i576, i576_the_backfill_sweep);
     pair_case!(i600, i600_the_sweep_resumes_past_skipped_manifests);
+    pair_case!(i784_i791b, i784_a_sealed_dag_is_announced_at_promotion);
 
     /// **I576b** — from disk: every Engine constructor that runs the boot
     /// KeyGrant sweep also runs the V176 backfill (comments stripped).

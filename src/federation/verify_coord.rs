@@ -9,7 +9,7 @@
 //!
 //! - **R1 — τ_propagate**: how fast a revocation propagates across the
 //!   federation under the normal and degraded paths. Drives the
-//!   `holds_bytes` directory freshness check (CEG §10.1.2) and the
+//!   holder-directory freshness check (CC 3.1.3.3) and the
 //!   F-AV-13 cache TTL (revocation cache MUST be ≤ τ_normal/2).
 //! - **Q1 — quorum-write**: cross-region write consistency under
 //!   bounded staleness, with a deterministic 3-tier merge rule that
@@ -60,8 +60,8 @@
 //! and computes the merge under contention. Verify ships the spec
 //! text + the contract; persist enforces the constants in the row
 //! lifecycle. Same split as `cohort_scope` (CEG normative; persist
-//! enforces admission) and `holds_bytes` suppression (CEG normative;
-//! persist enforces `store_blob_local`).
+//! enforces admission) and the holding claim's scope (CC 3.1.3.3;
+//! persist enforces it at every claim door, v55.0.0).
 
 use std::cmp::Ordering;
 use std::time::Duration;

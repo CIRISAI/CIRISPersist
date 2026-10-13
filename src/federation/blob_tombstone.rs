@@ -101,7 +101,7 @@ async fn rows_state(
 /// The composer that retires `row` under §6.1 precedence, with every
 /// `withdraws`/`recants` entitlement RE-DERIVED against `row` as this node
 /// holds it now — or `None` if the row is live.
-async fn retiring_composer(
+pub(crate) async fn retiring_composer(
     directory: &dyn FederationDirectory,
     row: &Attestation,
 ) -> Result<Option<String>, Error> {
@@ -122,7 +122,7 @@ async fn retiring_composer(
         if is_retraction {
             // THE CONSTRAINT: never the stored rule. `Ok(Some(_))` is the only
             // entitled verdict; `Ok(None)` (target absent at admission, or a
-            // holds_bytes target) and `Err(WithdrawsNotAdmitted)` both mean
+            // carrier target) and `Err(WithdrawsNotAdmitted)` both mean
             // "this composer does not retire the bytes". The stored column is
             // overwritten with the re-derived one so `retraction_entitled`'s
             // arm 3 sees exactly what was proven now.

@@ -171,8 +171,15 @@ pub struct DurabilityDeficit {
     /// lapsed report. Sorted. A node outside the audience is never listed.
     pub missing: Vec<String>,
     /// Full-blob or tuple placement for this audience (`None` when the
-    /// audience is not enumerable).
+    /// audience is not enumerable, or the blob is withheld).
     pub mode: Option<DurabilityMode>,
+    /// v55.0.0 (CIRISEdge v55) — the takedown notice that withholds the blob
+    /// ([`steward_purge::purge_withheld`](super::steward_purge::purge_withheld)).
+    /// A withheld blob is NOT deficit and is never repaired: `missing` and
+    /// `live_here` are empty and `mode` is `None`; the audience stays, so an
+    /// operator sees whose content it is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub withheld: Option<String>,
 }
 
 /// **The durability deficit of `at_rest_sha256`** for `viewer_key_id`,
@@ -325,6 +332,12 @@ where
     D: FederationDirectory + ?Sized,
 {
     use super::custody_ack::{device_custody_of, CustodyVerdict};
+    let mut raw = [0u8; 32];
+    let withheld = if hex::decode_to_slice(sha256_hex, &mut raw).is_ok() {
+        super::steward_purge::purge_withheld(dir, &raw).await?
+    } else {
+        None
+    };
     let nodes = match audience {
         ContentAudience::Everyone | ContentAudience::Unresolvable => {
             return Ok(DurabilityDeficit {
@@ -337,10 +350,23 @@ where
                 live_here: Vec::new(),
                 missing: Vec::new(),
                 mode: None,
+                withheld,
             })
         }
         ContentAudience::Nodes(n) => n,
     };
+    if withheld.is_some() {
+        // v55.0.0 (CIRISEdge v55) — taken-down content is never deficit:
+        // nothing is missing, so nothing is repaired.
+        return Ok(DurabilityDeficit {
+            sha256_hex: sha256_hex.to_owned(),
+            audience: DeficitAudience::Nodes(nodes.into_iter().collect()),
+            live_here: Vec::new(),
+            missing: Vec::new(),
+            mode: None,
+            withheld,
+        });
+    }
     let mut live_here = Vec::new();
     let mut missing = Vec::new();
     for node in &nodes {
@@ -364,6 +390,7 @@ where
         audience: DeficitAudience::Nodes(nodes.into_iter().collect()),
         live_here,
         missing,
+        withheld: None,
     })
 }
 

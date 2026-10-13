@@ -751,13 +751,6 @@ pub struct Engine {
     /// substrate refuses nothing).
     disk_pressure_state:
         Option<tokio::sync::watch::Receiver<crate::federation::DiskPressureSnapshot>>,
-    /// v3.6.0 (CIRISPersist#134) — media-sharing operator config
-    /// (counter-notice window + immediate-eviction basis set). `None`
-    /// = persist defaults (14-day window; child-safety + terrorist
-    /// content classes evict immediately). Interior-mutable so the
-    /// runtime PyO3 setter can update without consuming the engine.
-    #[cfg(feature = "cirisnode")]
-    multimedia_config: Arc<std::sync::RwLock<Option<Arc<crate::cirisnode::MultimediaConfig>>>>,
 }
 
 /// v2.12.0 (CIRISPersist#112) — error from [`Engine::sign_hybrid`].
@@ -1052,8 +1045,6 @@ impl Engine {
             replication_config: None,
             disk_pressure_config: None,
             disk_pressure_state: None,
-            #[cfg(feature = "cirisnode")]
-            multimedia_config: Arc::new(std::sync::RwLock::new(None)),
         };
         // v30.2.0 (CIRISPersist#607) — a node knows who it IS at construction,
         // so the backend is told here rather than waiting on
@@ -1137,8 +1128,6 @@ impl Engine {
             replication_config: None,
             disk_pressure_config: None,
             disk_pressure_state: None,
-            #[cfg(feature = "cirisnode")]
-            multimedia_config: Arc::new(std::sync::RwLock::new(None)),
         };
         // v30.2.0 (CIRISPersist#607) — a node knows who it IS at construction,
         // so the backend is told here rather than waiting on
@@ -1215,8 +1204,6 @@ impl Engine {
             replication_config: None,
             disk_pressure_config: None,
             disk_pressure_state: None,
-            #[cfg(feature = "cirisnode")]
-            multimedia_config: Arc::new(std::sync::RwLock::new(None)),
         };
         // CIRISPersist#848 (I66) — see `with_signer`.
         if let Ok(id) = engine.local_derived_key_id().await {
@@ -1288,8 +1275,6 @@ impl Engine {
             replication_config: None,
             disk_pressure_config: None,
             disk_pressure_state: None,
-            #[cfg(feature = "cirisnode")]
-            multimedia_config: Arc::new(std::sync::RwLock::new(None)),
         };
         // CIRISPersist#848 (I66) — see `with_signer`.
         if let Ok(id) = engine.local_derived_key_id().await {
@@ -1390,8 +1375,6 @@ impl Engine {
             replication_config: None,
             disk_pressure_config: None,
             disk_pressure_state: None,
-            #[cfg(feature = "cirisnode")]
-            multimedia_config: Arc::new(std::sync::RwLock::new(None)),
         };
         engine.tell_shared_backend_its_node_key();
         engine
@@ -1418,8 +1401,6 @@ impl Engine {
             replication_config: None,
             disk_pressure_config: None,
             disk_pressure_state: None,
-            #[cfg(feature = "cirisnode")]
-            multimedia_config: Arc::new(std::sync::RwLock::new(None)),
         };
         engine.tell_shared_backend_its_node_key();
         engine
@@ -1568,32 +1549,6 @@ impl Engine {
             Some(rx) => *rx.borrow(),
             None => crate::federation::DiskPressureSnapshot::normal(),
         }
-    }
-
-    /// v3.6.0 (CIRISPersist#134) — install / replace the media-sharing
-    /// operator config. `None` clears it (persist defaults apply).
-    ///
-    /// The
-    /// [`process_takedown_admission_with_config`](crate::cirisnode::takedown_handler::process_takedown_admission_with_config)
-    /// handler consults this when present; the v3.6.0 default keeps
-    /// child-safety / terrorist-content bases as immediate-eviction and
-    /// the counter-notice window at 14 days.
-    #[cfg(feature = "cirisnode")]
-    pub fn set_multimedia_config(&self, cfg: Option<crate::cirisnode::MultimediaConfig>) {
-        *self
-            .multimedia_config
-            .write()
-            .unwrap_or_else(|p| p.into_inner()) = cfg.map(Arc::new);
-    }
-
-    /// v3.6.0 (CIRISPersist#134) — snapshot of the installed
-    /// media-sharing config. `None` = persist defaults apply.
-    #[cfg(feature = "cirisnode")]
-    pub fn multimedia_config(&self) -> Option<Arc<crate::cirisnode::MultimediaConfig>> {
-        self.multimedia_config
-            .read()
-            .unwrap_or_else(|p| p.into_inner())
-            .clone()
     }
 
     /// v22.0.0 (CIRISPersist#543 / AV-77) — declare THIS NODE'S OWN key id on
@@ -1836,7 +1791,7 @@ impl Engine {
 
     /// v6.8.0 (CIRISPersist#149) — disk-pressure variant of
     /// [`Self::sweep_evictions_once`]. When `force_evict_proxy_first`
-    /// is set, candidates with NO local `holds_bytes` attestation
+    /// is set, candidates whose row's author is not local or family
     /// (proxy content this node merely relays) are evicted ahead of
     /// locally-attested (local/family) content, ignoring the standard
     /// popularity × freshness order. Local/family rows are evicted only
@@ -1883,14 +1838,11 @@ impl Engine {
         let target_freed = bytes_before.saturating_sub(watermark);
         let decay = EvictionDecay::new(cfg.eviction_decay_half_life_days);
         let now = chrono::Utc::now();
-        // v9.3.0 (#247) — the sweeper matches its OWN `holds_bytes`
-        // attestations (`list_attestations_by`, the proxy-vs-local
-        // classification) and emits the paired `withdraws`. A correctly-
-        // registered node emits both under its DERIVED federation key_id
-        // (`<label>-<fp>`), so the lookup key must be the derived id, NOT
-        // the keystore alias — matching the `emit_withdraws_attestation`
-        // floor. Falls back to the alias only if the derived id can't be
-        // resolved (no signer pubkey), preserving prior behaviour.
+        // v9.3.0 (#247) — the sweeper retracts its OWN holding claims, which a
+        // correctly-registered node emits under its DERIVED federation key_id
+        // (`<label>-<fp>`), so the lookup key is the derived id, NOT the
+        // keystore alias. Falls back to the alias only if the derived id
+        // can't be resolved (no signer pubkey), preserving prior behaviour.
         let signer_key_id = self
             .local_derived_key_id()
             .await
@@ -1901,53 +1853,14 @@ impl Engine {
         // hitting target_freed, the next tick (or the next caller of
         // sweep_evictions_once) picks up where we left off.
         let mut candidates = self.sweep_candidates_batch(&cfg).await?;
-
-        // Lookup prior holds_bytes attestations once per cycle so we
-        // don't pay an O(N) directory query for each candidate. The
-        // sweeper only withdraws attestations IT (the local signer)
-        // emitted — that's what the federation graph expects: each
-        // host announces eviction of its OWN holds_bytes rows.
         let directory = self.federation_directory();
-        let signer_attestations = directory
-            .list_attestations_by(&signer_key_id)
-            .await
-            .map_err(|e| {
-                crate::federation::BlobError::Backend(format!(
-                    "sweeper: list_attestations_by failed: {e}"
-                ))
-            })?;
-        // Index by attestation_type so per-candidate lookup is O(1).
-        // A single signer may have emitted multiple holds_bytes rows
-        // over time for the same SHA (replay / re-attestation); the
-        // sweeper withdraws the MOST RECENT one (max asserted_at).
-        let mut holds_bytes_by_type: std::collections::HashMap<
-            String,
-            crate::federation::Attestation,
-        > = std::collections::HashMap::new();
-        for att in signer_attestations {
-            if !att
-                .attestation_type
-                .starts_with(crate::federation::HOLDS_BYTES_ATTESTATION_TYPE_PREFIX)
-            {
-                continue;
-            }
-            holds_bytes_by_type
-                .entry(att.attestation_type.clone())
-                .and_modify(|existing| {
-                    if att.asserted_at > existing.asserted_at {
-                        *existing = att.clone();
-                    }
-                })
-                .or_insert(att);
-        }
 
         // #846 (§5, I49) — classify each candidate on the ROW's author,
-        // through the one predicate. It used to key on the holds_bytes
+        // through the one predicate. It used to key on the holding claim's
         // ATTESTER, which for anything this node adopted is this node —
-        // every relayed blob read as protected. The holds_bytes index above
-        // stays what it is for: the withdraws the sweeper emits for its OWN
-        // announcements. A NULL author (pre-V144, or a signer-less commons
-        // chunk) is unknown ⇒ proxy: fail toward evictable.
+        // every relayed blob read as protected. A NULL author (pre-V144, or
+        // a signer-less commons chunk) is unknown ⇒ proxy: fail toward
+        // evictable.
         let (our_key, fam) = self.local_or_family_parts().await?;
         let local_or_family = local_or_family_predicate(our_key, fam);
         let is_proxy = |candidate: &crate::federation::EvictionCandidate| -> bool {
@@ -2066,31 +1979,46 @@ impl Engine {
             {
                 continue;
             }
-            // Try to emit a withdraws attestation for this SHA. If
-            // the local signer never emitted a holds_bytes for it
-            // (cohabitation drift, signer rotation, etc.), skip the
-            // withdraws emission and STILL delete — orphaned
-            // withdraws is worse than no withdraws.
-            let holds_bytes_type =
-                crate::federation::holds_bytes_attestation_type(&candidate.sha256);
-            let withdraws_outcome = match holds_bytes_by_type.get(&holds_bytes_type) {
-                Some(prior) => {
-                    match self
-                        .emit_withdraws_attestation(&prior.attestation_id, &holds_bytes_type)
-                        .await
-                    {
-                        Ok(()) => Some(Ok(())),
-                        Err(e) => Some(Err(e)),
+            // v55.0.0 (CIRISPersist#989, CC 3.1.3.3 rule 4) — retract THIS
+            // node's own holding claims about the SHA, each with its own
+            // `withdraws` at the claim's scope. None (cohabitation drift,
+            // signer rotation, a LocalOnly row) ⇒ nothing to retract, and the
+            // row is STILL deleted — an orphaned withdraws is worse than none.
+            let mut withdraws_outcomes: Vec<Result<(), crate::federation::BlobError>> = Vec::new();
+            match crate::federation::holding_claim::own_here_claims(
+                &*directory,
+                &signer_key_id,
+                &candidate.sha256,
+            )
+            .await
+            {
+                Ok(ids) => {
+                    for id in ids {
+                        let prior = match directory.get_attestation(&id).await {
+                            Ok(Some(p)) => p,
+                            Ok(None) => continue,
+                            Err(e) => {
+                                withdraws_outcomes.push(Err(
+                                    crate::federation::BlobError::Backend(format!(
+                                        "sweeper: holding claim {id}: {e}"
+                                    )),
+                                ));
+                                continue;
+                            }
+                        };
+                        withdraws_outcomes.push(self.emit_withdraws_attestation(&prior).await);
                     }
                 }
-                None => None,
-            };
+                Err(e) => withdraws_outcomes.push(Err(crate::federation::BlobError::Backend(
+                    format!("sweeper: own holding claims: {e}"),
+                ))),
+            }
 
             // Delete the blob row regardless of withdraws outcome —
             // the local copy is gone either way. The directory now
             // either has an explicit withdraws (consumers will skip
-            // the holder) or simply will see TTL-expire the
-            // holds_bytes row on its own freshness window.
+            // the holder) or will see the claim lapse at its own
+            // `expires_at` (72 h, CC 3.1.3.3 rule 5).
             let deleted = self.delete_blob(&candidate.sha256).await?;
             if deleted {
                 rows_evicted += 1;
@@ -2102,19 +2030,17 @@ impl Engine {
                     pinned_bytes_held = pinned_bytes_held.saturating_sub(candidate.size_bytes);
                 }
             }
-            match withdraws_outcome {
-                Some(Ok(())) => withdraws_emitted += 1,
-                Some(Err(e)) => {
-                    withdraws_failed += 1;
-                    tracing::warn!(
-                        error = %e,
-                        sha256_prefix = &hex::encode(candidate.sha256)[..16],
-                        "ciris-persist v3.4.0 sweeper: withdraws emission failed"
-                    );
-                }
-                None => {
-                    // No prior holds_bytes from this signer — silent
-                    // skip is the documented behavior.
+            for outcome in withdraws_outcomes {
+                match outcome {
+                    Ok(()) => withdraws_emitted += 1,
+                    Err(e) => {
+                        withdraws_failed += 1;
+                        tracing::warn!(
+                            error = %e,
+                            sha256_prefix = &hex::encode(candidate.sha256)[..16],
+                            "ciris-persist v3.4.0 sweeper: withdraws emission failed"
+                        );
+                    }
                 }
             }
         }
@@ -2197,6 +2123,113 @@ impl Engine {
         Some(crate::federation::EvictionSweeper::new(handle, shutdown))
     }
 
+    /// v55.0.0 (CIRISPersist#989, CC 3.1.3.3 rule 5) — **one re-ack pass**:
+    /// renew this node's own holding claims that are a day old, for bytes it
+    /// still holds ([`reack_own_claims`](crate::federation::holding_claim::reack_own_claims)).
+    /// Idempotent; `now` is threaded for deterministic tests (the background
+    /// loop and the FFI pass wall-clock time).
+    ///
+    /// # Errors
+    ///
+    /// No announcing signer on this Engine; directory errors on the scan.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn reack_holding_claims_once(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<crate::federation::holding_claim::ReackReport, crate::federation::BlobError> {
+        let local = self.announcing_signer().await?;
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(arc) => {
+                crate::federation::holding_claim::reack_own_claims(arc.as_ref(), local, now).await
+            }
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(arc) => {
+                crate::federation::holding_claim::reack_own_claims(arc.as_ref(), local, now).await
+            }
+        }
+    }
+
+    /// v55.0.0 (CIRISPersist#989, CC 3.1.3.3 rule 5) — **spawn the background
+    /// re-ack sweeper**, the eviction sweeper's shape: a loop that wakes every
+    /// [`HOLDING_CLAIM_REACK_SWEEP_INTERVAL`](crate::federation::holding_claim::HOLDING_CLAIM_REACK_SWEEP_INTERVAL)
+    /// and runs [`Engine::reack_holding_claims_once`], until the returned
+    /// handle's `stop()`. Every holding claim lapses 72 h after it was signed;
+    /// this keeps a holder advertised while it holds.
+    ///
+    /// Codex r4 on #1065 — the FIRST pass runs after
+    /// [`HOLDING_CLAIM_REACK_START_DELAY`](crate::federation::holding_claim::HOLDING_CLAIM_REACK_START_DELAY)
+    /// (90 s), then every interval: the pass carries the upgrade conversion (a
+    /// v54 node's retired rc6 claims, which v55's holder reads no longer
+    /// count), so waiting a whole interval left an upgraded node
+    /// undiscoverable for an hour, and one restarting more often than hourly
+    /// never converted; a pass at t = 0 would land on the announce cold-start
+    /// and replication catch-up with an unbounded read (#1071).
+    ///
+    /// The pass runs INSIDE the spawned task: this returns at once and boot
+    /// never waits on it. No lock is held across the walk (each read is its
+    /// own short acquisition, and the walk yields between rows), and an error
+    /// mid-pass (a store going away) is logged and the loop goes on until
+    /// `stop()`. [`Self::spawn_reack_sweeper_with`] takes both durations.
+    ///
+    /// Returns `None` when this Engine has no PQC local signer (it cannot sign
+    /// a claim, so it has none to renew). Disk-independent: no budget gate.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub fn spawn_reack_sweeper(&self) -> Option<crate::federation::EvictionSweeper> {
+        self.spawn_reack_sweeper_with(
+            crate::federation::holding_claim::HOLDING_CLAIM_REACK_START_DELAY,
+            crate::federation::holding_claim::HOLDING_CLAIM_REACK_SWEEP_INTERVAL,
+        )
+    }
+
+    /// [`Self::spawn_reack_sweeper`] with its two durations: the first pass
+    /// after `start_delay`, then one every `interval`.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub fn spawn_reack_sweeper_with(
+        &self,
+        start_delay: std::time::Duration,
+        interval: std::time::Duration,
+    ) -> Option<crate::federation::EvictionSweeper> {
+        self.local_signer.as_ref()?;
+        let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
+        let shutdown_for_loop = shutdown.clone();
+        let engine = self.clone();
+        let handle = tokio::spawn(async move {
+            let mut wait = start_delay;
+            loop {
+                tokio::select! {
+                    _ = shutdown_for_loop.notified() => {
+                        tracing::info!("ciris-persist v55.0.0 re-ack sweeper: shutdown signal received");
+                        return;
+                    }
+                    _ = tokio::time::sleep(wait) => {}
+                }
+                wait = interval;
+                match engine.reack_holding_claims_once(chrono::Utc::now()).await {
+                    Ok(report)
+                        if report.renewed > 0 || report.failed > 0 || report.converted > 0 =>
+                    {
+                        tracing::info!(
+                            scanned = report.scanned,
+                            renewed = report.renewed,
+                            converted = report.converted,
+                            withheld = report.withheld,
+                            not_held = report.not_held,
+                            not_in_cohort = report.not_in_cohort,
+                            failed = report.failed,
+                            "ciris-persist v55.0.0 re-ack sweeper cycle"
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::warn!(error = %e, "ciris-persist v55.0.0 re-ack sweeper cycle failed");
+                    }
+                }
+            }
+        });
+        Some(crate::federation::EvictionSweeper::new(handle, shutdown))
+    }
+
     /// v3.4.0 (CIRISPersist#123) — backend-dispatched candidate fetch.
     /// Per-backend ranking strategy:
     /// - PG ranks by full decay-weighted score in SQL.
@@ -2226,7 +2259,7 @@ impl Engine {
     /// **the LocalOnly plaintext door**: keep commons bytes this node
     /// verified itself (size first, then digest — CC 5.3.2.5), announcing
     /// nothing. Fixed at `cohort_scope = federation`, `crypto_tier =
-    /// plaintext`; content-address checked; no `holds_bytes` claim. A thin
+    /// plaintext`; content-address checked; no holding claim. A thin
     /// dispatch onto
     /// [`BlobStorage::store_plaintext_local`](crate::federation::BlobStorage::store_plaintext_local).
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
@@ -2965,30 +2998,15 @@ impl Engine {
     }
 
     /// v3.4.0 (CIRISPersist#123) — build, sign, and persist a
-    /// `withdraws` attestation that retracts a prior `holds_bytes`
-    /// emission. The canonical envelope is produced via
-    /// [`crate::federation::withdraws_attestation_envelope`] and
-    /// canonicalized via
-    /// [`crate::verify::canonical::PythonJsonDumpsCanonicalizer`]
-    /// (NOT JCS — the same #121 discipline `put_blob_signing`
-    /// follows).
+    /// `withdraws` attestation that retracts this node's own prior row —
+    /// v55.0.0 (CIRISPersist#989): its holding claim, retracted by its
+    /// signer alone and placed at the claim's own scope (CC 3.1.3.3 rule 4),
+    /// through the one shared helper every eviction path uses.
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     async fn emit_withdraws_attestation(
         &self,
-        target_attestation_id: &str,
-        target_holds_bytes_type: &str,
+        prior: &crate::federation::Attestation,
     ) -> Result<(), crate::federation::BlobError> {
-        // v9.3.0 (#248) — persist's OWN withdraws producer now composes the
-        // `emit_attestation` primitive instead of hand-rolling the
-        // canonicalize → SHA-256 → hybrid-sign → 20-field-`Attestation` →
-        // `put_attestation` recipe. This subsumes the hand-roll AND inherits
-        // the #247 derived-key_id floor for free: the attester/scrub key is
-        // the signer's registered DERIVED federation key_id (was
-        // `current_alias()` plumbed in from the sweeper — the same #247 FK
-        // bug class as `attestation_promote`). A withdraws targets the
-        // holds_bytes `attestation_id` (in the envelope), not a key, so the
-        // default self-attestation (`attested_key_id == attester`) keeps the
-        // FK honest: "I attest I no longer hold these bytes."
         let signer = self.local_signer.as_ref().ok_or_else(|| {
             crate::federation::BlobError::Backend(
                 "withdraws emit: Engine has no LocalSigner — a conformant federation-tier withdraws \
@@ -2996,20 +3014,15 @@ impl Engine {
                     .to_string(),
             )
         })?;
-        let envelope = crate::federation::withdraws_attestation_envelope(
-            target_attestation_id,
-            target_holds_bytes_type,
-        );
-        let input = crate::federation::EmitAttestationInput::with_envelope(
-            crate::federation::types::attestation_type::WITHDRAWS,
-            crate::federation::envelope::EnvelopeCore::from_value(envelope)
-                .expect("engine-built envelope is a JSON object"),
-            crate::federation::types::cohort_scope::FEDERATION,
-        );
-        self.emit_attestation(signer, input).await.map_err(|e| {
-            crate::federation::BlobError::Backend(format!("withdraws emit_attestation: {e}"))
-        })?;
-        Ok(())
+        let directory = self.federation_directory();
+        crate::federation::blobs::emit_withdraws_attestation_helper(
+            prior,
+            &signer.derived_key_id(),
+            signer,
+            &*directory,
+            chrono::Utc::now(),
+        )
+        .await
     }
 
     /// v3.4.0 (CIRISPersist#123) — total bytes currently held by
@@ -3124,14 +3137,14 @@ impl Engine {
     /// ([`Self::local_derived_key_id`] = `derive_key_id(<alias>, <ed25519
     /// pubkey>)` = `<label>-<fp>`), carries `self.signer`'s Ed25519 pubkey,
     /// and a classical self-signature over the canonical
-    /// `registration_envelope`. This is the row the holds_bytes / withdraws
+    /// `registration_envelope`. This is the row the holding-claim / withdraws
     /// / emit `scrub_key_id` FK resolves against (the #247 floor).
     ///
     /// # Why `self.signer`, not a `LocalSigner`
     ///
     /// Pre-#275 the FFI bootstrap registered the **`LocalSigner`** seed's
     /// identity (and historically the bare keystore alias). But every
-    /// federation-tier emit — [`Self::put_blob_signing`]'s holds_bytes
+    /// federation-tier emit — [`Self::put_blob_signing`]'s holding-claim
     /// scrub, [`Self::emit_attestation_self`], [`Self::attestation_promote`],
     /// the eviction `withdraws` — derives its key_id from `self.signer`
     /// ([`Self::local_derived_key_id`]). When the composed signer and the
@@ -4251,7 +4264,7 @@ impl Engine {
         use crate::federation::{
             crossing, types::cohort_scope, CrossingBasis, MeshCrossingOutcome,
         };
-        if cohort_scope::suppresses_holds_bytes(&placement.audience)
+        if cohort_scope::is_structurally_invisible(&placement.audience)
             || placement.audience == row.cohort_scope
         {
             return;
@@ -5350,7 +5363,8 @@ impl Engine {
     /// v3.3.0 (CIRISPersist#121) — convenience facade over
     /// [`BlobStorage::put_blob_signing`](crate::federation::blobs::BlobStorage::put_blob_signing).
     ///
-    /// Persist owns the holds_bytes envelope construction +
+    /// Persist owns the holding-claim envelope construction (v55.0.0:
+    /// `custody:ack:v1` `here` at `federation`, CIRISPersist#989) +
     /// canonicalization (via the production
     /// [`PythonJsonDumpsCanonicalizer`](crate::verify::canonical::PythonJsonDumpsCanonicalizer)),
     /// signs via the Engine's composed `Arc<dyn HardwareSigner>`, and
@@ -5379,7 +5393,7 @@ impl Engine {
     /// `author_key_id` is WHOSE CONTENT this is — the proxy decision — and is
     /// recorded on the row. It is NOT who claims to hold the bytes: the
     /// holder claim is always THIS NODE's (I23), signed by this node, because
-    /// the federation-tier ingest gate verifies a `holds_bytes` row against
+    /// the federation-tier ingest gate verifies a holding claim against
     /// its own `attesting_key_id`. Before §20.5 this door bound the author
     /// into the claim, so a proxy write announced a row no peer could verify
     /// — served by the cursor and refused by every one of them (the classical
@@ -5579,7 +5593,8 @@ impl Engine {
     /// under the `(community, epoch)` binding its provenance declares,
     /// addressed by the SHA-256 of the ciphertext, and — for
     /// [`AdoptDisposition::Announce`](crate::federation::AdoptDisposition::Announce)
-    /// — emit `holds_bytes` signed by this node. The receiver-side twin of
+    /// — emit this node's holding claim, placed at the content's own scope
+    /// (v55.0.0, CIRISPersist#989). The receiver-side twin of
     /// [`serve_blob_to_peer`](Self::serve_blob_to_peer); like it, it never
     /// opens the envelope (I45).
     ///
@@ -5917,8 +5932,67 @@ impl Engine {
     /// the named sha, size and tier, and flips the row to a `chunk_dag`, after
     /// which [`read_blob_as`](Self::read_blob_as) and the range read serve the
     /// file. Idempotent.
+    ///
+    /// v55.0.0 (CIRISPersist#951) — **a sealed DAG is announced here, never at
+    /// the manifest adopt.** `disposition` is the puller's: under
+    /// [`AdoptDisposition::Announce`](crate::federation::AdoptDisposition::Announce)
+    /// this node's holding claim for the DAG root is emitted once the
+    /// promotion's checks pass (every chunk held), the moment the plaintext
+    /// door announces; `LocalOnly` emits nothing. The puller adopts the
+    /// manifest `LocalOnly`. A re-run on a DAG already promoted re-checks
+    /// every chunk and announces again under `Announce` (the resume path).
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     pub async fn promote_adopted_manifest_to_dag(
+        &self,
+        at_rest_sha256: &[u8; 32],
+        viewer_key_id: &str,
+        caller_aad: Option<&[u8]>,
+        disposition: crate::federation::AdoptDisposition,
+    ) -> Result<
+        crate::federation::chunk_dag_cascade::orchestrate::DagPromotion,
+        crate::federation::BlobError,
+    > {
+        let mut out = self
+            .promote_adopted_manifest_to_dag_floor(at_rest_sha256, viewer_key_id, caller_aad)
+            .await?;
+        if disposition == crate::federation::AdoptDisposition::Announce {
+            // v55.0.0 (CIRISPersist#989) — the one holding claim,
+            // `custody:ack:v1` `here` at the content's scope, now that the
+            // promotion's checks found every chunk held.
+            let local = self.announcing_signer().await?;
+            let now = chrono::Utc::now();
+            let emitted = match &self.backend {
+                #[cfg(feature = "postgres")]
+                BackendDispatch::Postgres(arc) => {
+                    crate::federation::holding_claim::emit_holding_claim(
+                        arc.as_ref(),
+                        local,
+                        at_rest_sha256,
+                        now,
+                    )
+                    .await?
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(arc) => {
+                    crate::federation::holding_claim::emit_holding_claim(
+                        arc.as_ref(),
+                        local,
+                        at_rest_sha256,
+                        now,
+                    )
+                    .await?
+                }
+            };
+            out.announced = matches!(
+                emitted,
+                crate::federation::holding_claim::HoldingClaimOutcome::Emitted { .. }
+            );
+        }
+        Ok(out)
+    }
+
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    async fn promote_adopted_manifest_to_dag_floor(
         &self,
         at_rest_sha256: &[u8; 32],
         viewer_key_id: &str,
@@ -6092,11 +6166,14 @@ impl Engine {
     /// v51.3.0 (CIRISPersist#947 ask 3) — **store a plaintext chunk DAG and
     /// announce it**: [`put_blob_chunks`](crate::federation::BlobStorage::put_blob_chunks)
     /// (every chunk verified against the manifest), then the manifest's
-    /// `holds_bytes` claim through [`put_blob_signing`](Self::put_blob_signing)
-    /// — the shape `seal_stream_scoped` uses for a commons stream at the
-    /// origin, so a pulled commons DAG is not a silent holder. `author_key_id`
-    /// is whose content this is (the proxy decision); the claim is this
-    /// node's. Returns the manifest's address.
+    /// holding claim ([`emit_holding_claim`](crate::federation::holding_claim::emit_holding_claim),
+    /// v55.0.0) — the shape `seal_stream_scoped` uses for a commons stream at
+    /// the origin, so a pulled commons DAG is not a silent holder. The claim
+    /// is this node's. `author_key_id` is whose content this is: the WILL
+    /// decision ([`would_hold`](Self::would_hold)) is asked of it before
+    /// anything is stored or announced (Codex r2 on #1065: a non-local proxy
+    /// author at the stop tier is refused, as the incremental door refuses
+    /// it); the chunk floor records no author. Returns the manifest's address.
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     pub async fn put_blob_chunks_signing(
         &self,
@@ -6106,6 +6183,8 @@ impl Engine {
     ) -> Result<[u8; 32], crate::federation::BlobError> {
         use crate::federation::BlobStorage;
         use sha2::Digest as _;
+        self.would_hold(&plaintext_dag_provenance(author_key_id))
+            .await?;
         let jcs = manifest.to_jcs_bytes();
         let sha256: [u8; 32] = sha2::Sha256::digest(&jcs).into();
         match &self.backend {
@@ -6114,18 +6193,150 @@ impl Engine {
             #[cfg(feature = "sqlite")]
             BackendDispatch::Sqlite(arc) => arc.put_blob_chunks(manifest, chunks).await?,
         }
-        // The row exists; the signing floor's insert is a no-op on conflict and
-        // the attestation is what this adds.
-        self.put_blob_signing(
-            &sha256,
-            crate::federation::BlobBody::Inline(jcs),
-            None,
-            author_key_id,
-            chrono::Utc::now(),
-            uuid::Uuid::new_v4(),
-        )
-        .await?;
+        // The claim is this node's.
+        let _ = jcs;
+        self.announce_plaintext_dag(&sha256).await?;
         Ok(sha256)
+    }
+
+    /// v55.0.0 (CIRISPersist#952, CIRISEdge#734) — **store ONE chunk of a
+    /// plaintext chunk DAG**, ahead of its manifest, so a puller holds a few
+    /// chunks in memory rather than the whole file. `entry` is the chunk's
+    /// manifest entry: an `Inline` body must hash to `entry.sha` and be
+    /// exactly `entry.size` bytes (the one-shot door's per-chunk checks, the
+    /// same function); `author_key_id` is whose content this is, asked of the
+    /// WILL decision as the one-shot door asks it. The row is a plain
+    /// commons chunk row: no manifest row and no holding claim exist until
+    /// [`finalize_blob_chunks_signing`](Self::finalize_blob_chunks_signing),
+    /// so the DAG's address reads as absent until then. Idempotent on the
+    /// chunk's address. Returns it.
+    ///
+    /// A chunk stored here and never finalized is an unclaimed commons row:
+    /// the retention sweep may evict it like any other, and a finalize that
+    /// finds it gone names it ([`BlobError::NotHeld`](crate::federation::BlobError::NotHeld)).
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn put_plaintext_dag_chunk(
+        &self,
+        entry: &crate::federation::ChunkRef,
+        body: crate::federation::BlobBody,
+        author_key_id: &str,
+    ) -> Result<[u8; 32], crate::federation::BlobError> {
+        use crate::federation::types::cohort_scope::CryptoTier;
+        use crate::federation::BlobStorage;
+        self.would_hold(&plaintext_dag_provenance(author_key_id))
+            .await?;
+        let floor = crate::federation::StorageFloor::resolved(CryptoTier::Plaintext);
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(arc) => {
+                crate::federation::blobs::prepare_dag_chunk_row(
+                    0,
+                    &body,
+                    entry,
+                    arc.inline_bytes_cap(),
+                )?;
+                arc.store_blob_local(
+                    &entry.sha,
+                    body,
+                    None,
+                    crate::federation::types::cohort_scope::FEDERATION,
+                    floor,
+                    Some(author_key_id),
+                    None,
+                )
+                .await?;
+            }
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(arc) => {
+                crate::federation::blobs::prepare_dag_chunk_row(
+                    0,
+                    &body,
+                    entry,
+                    arc.inline_bytes_cap(),
+                )?;
+                arc.store_blob_local(
+                    &entry.sha,
+                    body,
+                    None,
+                    crate::federation::types::cohort_scope::FEDERATION,
+                    floor,
+                    Some(author_key_id),
+                    None,
+                )
+                .await?;
+            }
+        }
+        Ok(entry.sha)
+    }
+
+    /// v55.0.0 (CIRISPersist#952) — **finalize an incremental plaintext chunk
+    /// DAG**: the manifest's shape (version 1, no sealed-DAG members, at least
+    /// one chunk, `total_size` the sum), then, in ONE transaction, every chunk
+    /// it names held as a plaintext row of its entry's size and the
+    /// `chunk_dag` manifest row written; then the manifest's holding claim,
+    /// exactly as [`put_blob_chunks_signing`](Self::put_blob_chunks_signing)
+    /// emits it. Before this returns there is no manifest row and no claim.
+    /// A missing chunk is [`BlobError::NotHeld`](crate::federation::BlobError::NotHeld)
+    /// naming it; nothing is written. Idempotent. Returns the manifest's
+    /// address.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn finalize_blob_chunks_signing(
+        &self,
+        manifest: crate::federation::ChunkManifest,
+        author_key_id: &str,
+    ) -> Result<[u8; 32], crate::federation::BlobError> {
+        use crate::federation::BlobStorage;
+        crate::federation::blobs::check_plaintext_dag_manifest(&manifest)?;
+        // Codex r2 on #1065 — the WILL decision again before the manifest row
+        // and the announcement (pressure may have risen since the chunks);
+        // the claim is this node's (as the one-shot door).
+        self.would_hold(&plaintext_dag_provenance(author_key_id))
+            .await?;
+        let sha256 = match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(arc) => arc.put_dag_manifest_over_held(manifest).await?,
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(arc) => arc.put_dag_manifest_over_held(manifest).await?,
+        };
+        self.announce_plaintext_dag(&sha256).await?;
+        Ok(sha256)
+    }
+
+    /// The holding claim of a plaintext chunk DAG this node now holds whole,
+    /// shared by the one-shot door and the incremental finalize so the two
+    /// emit the same claim: v55.0.0 (CIRISPersist#989) this node's
+    /// `custody:ack:v1` `here` at the content's scope (`federation`), sized as
+    /// the row is stored ([`emit_holding_claim`](crate::federation::holding_claim::emit_holding_claim)).
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    async fn announce_plaintext_dag(
+        &self,
+        sha256: &[u8; 32],
+    ) -> Result<(), crate::federation::BlobError> {
+        let local = self.announcing_signer().await?;
+        let now = chrono::Utc::now();
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(arc) => {
+                crate::federation::holding_claim::emit_holding_claim(
+                    arc.as_ref(),
+                    local,
+                    sha256,
+                    now,
+                )
+                .await?
+            }
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(arc) => {
+                crate::federation::holding_claim::emit_holding_claim(
+                    arc.as_ref(),
+                    local,
+                    sha256,
+                    now,
+                )
+                .await?
+            }
+        };
+        Ok(())
     }
 
     /// #846 (`BLOB_REPLICATION.md` §6.2, I50) — **adopt one sealed chunk** of
@@ -6235,7 +6446,8 @@ impl Engine {
     ///
     /// 1. generates a fresh per-write DEK and AES-256-GCM-seals the body
     ///    into a self-describing ciphertext envelope (the format marker);
-    /// 2. stores the envelope **structurally invisible** (no `holds_bytes`),
+    /// 2. stores the envelope **structurally invisible** (no holding claim
+    ///    from this door; `put_blob_scoped` claims at the content's scope),
     ///    keyed on the ciphertext SHA-256 — the returned **at-rest content
     ///    address**;
     /// 3. records persist's content-master self-retention grant (so the
@@ -6322,16 +6534,17 @@ impl Engine {
     /// tier, and it never supplies sealed bytes.
     ///
     /// The tier is resolved from the DIRECTORY (`resolve_write_tier`):
-    /// - **Plaintext** (commons, or an AUTHORIZED infrastructure community —
-    ///   CC 4.4.3.2.1) → stored as given, `holds_bytes` announced, row
-    ///   records the scope;
+    /// - **Plaintext** (commons, an AUTHORIZED infrastructure community — CC
+    ///   4.4.3.2.1 — or a `public` room, CC 3.2) → stored as given, the
+    ///   holding claim at `federation`, row records the scope;
     /// - **InvisibleEncrypted** (`self` / `family`) → the self/family cascade:
-    ///   fresh DEK, wrapped to every active occurrence, no `holds_bytes`;
+    ///   fresh DEK, wrapped to every active occurrence, the holding claim at
+    ///   `self` / the family (v55.0.0, CIRISPersist#989);
     /// - **CommunityDek** → the community cascade under the current epoch DEK,
-    ///   wrapped to every active member, AND `holds_bytes` announced —
-    ///   community content federates with cleartext provenance, and the
-    ///   cascade alone never emitted the announcement it documented as the
-    ///   caller's job.
+    ///   wrapped to every active member, AND the holding claim announced at
+    ///   the community's scope — it reaches the roster only (v55.0.0,
+    ///   CIRISPersist#989; the retired `holds_bytes` claim was at
+    ///   `federation`).
     ///
     /// There is no other consumer-reachable write that accepts an encrypted
     /// cohort. The commons doors (`put_blob_signing`, `put_blob_json`) record
@@ -6399,15 +6612,17 @@ impl Engine {
         Ok(r)
     }
 
-    /// CIRISPersist#848 (`BLOB_REPLICATION.md` §14) — **emit the
-    /// `KeyGrant` set for an axis**: the FULL set this node holds for
-    /// `(community, minter, epoch)` or for one self/family blob, signed by
-    /// this Engine's composed hybrid signer and stored through
-    /// [`emit_attestation_self`](Self::emit_attestation_self), so it rides the
-    /// attestation cursor peers already pull and projects by the KeyGrant
-    /// plane (`Cohort` / `SelfOwn`). Re-emission carries the full set and is
-    /// idempotent on every receiver (§13). `Ok(None)` when this node holds
-    /// no wrap for the axis (nothing to carry).
+    /// CIRISPersist#848 (`BLOB_REPLICATION.md` §14), v55.0.0 (#989, CC 3.3.2
+    /// rc7) — **emit the key-grant rows for an axis**: one `scores` row on
+    /// `key_grant:{axis}:v1` per wrap this node holds for `(community, minter,
+    /// epoch)`, one self/family blob or one stream epoch, signed by this
+    /// Engine's composed hybrid signer and stored through
+    /// [`emit_attestation_self`](Self::emit_attestation_self), so each rides
+    /// the attestation cursor to its recipient. A wrap this signer already
+    /// holds as a row is skipped (re-emission is idempotent), and one whose
+    /// recipient the audience rule no longer admits is withheld
+    /// ([`key_grant::plan_key_grant_emission`](crate::federation::key_grant::plan_key_grant_emission)).
+    /// `Ok(None)` when this node holds no wrap for the axis.
     ///
     /// Called by every write door after a cascade that minted or granted
     /// anew; reachable directly so a node that died mid-fan-out, or an
@@ -6416,68 +6631,39 @@ impl Engine {
     pub async fn emit_key_grant(
         &self,
         axis: &crate::federation::key_grant::KeyGrantAxis,
-    ) -> Result<Option<String>, crate::federation::BlobError> {
+    ) -> Result<Option<crate::federation::key_grant::KeyGrantEmission>, crate::federation::BlobError>
+    {
         self.ensure_minter_sentinels_resolved().await.map_err(|e| {
             crate::federation::BlobError::Backend(format!("V145 minter sentinel (#848): {e}"))
         })?;
-        use crate::federation::key_grant::{build_set_for_axis, watermark_for_axis};
-        // §14 (V146) — the watermark FIRST, then the set: the mark below
-        // stamps this instant, so a grant landing after it stays dirty.
-        let ledger = |e: crate::federation::Error| {
-            crate::federation::BlobError::Backend(format!("key_grant ledger: {e}"))
-        };
-        let (watermark, set) = match &self.backend {
+        let me = self.local_derived_key_id().await.map_err(|e| {
+            crate::federation::BlobError::Backend(format!("emit_key_grant: node key: {e}"))
+        })?;
+        use crate::federation::key_grant::emit_key_grant_axis_with;
+        let emit_one = |input| self.emit_attestation_self(input);
+        match &self.backend {
             #[cfg(feature = "postgres")]
-            BackendDispatch::Postgres(arc) => (
-                watermark_for_axis(arc.as_ref(), axis)
-                    .await
-                    .map_err(ledger)?,
-                build_set_for_axis(arc.as_ref(), axis).await?,
-            ),
+            BackendDispatch::Postgres(arc) => {
+                emit_key_grant_axis_with(arc.as_ref(), &me, axis, emit_one).await
+            }
             #[cfg(feature = "sqlite")]
-            BackendDispatch::Sqlite(arc) => (
-                watermark_for_axis(arc.as_ref(), axis)
-                    .await
-                    .map_err(ledger)?,
-                build_set_for_axis(arc.as_ref(), axis).await?,
-            ),
-        };
-        let Some(set) = set else {
-            return Ok(None);
-        };
+            BackendDispatch::Sqlite(arc) => {
+                emit_key_grant_axis_with(arc.as_ref(), &me, axis, emit_one).await
+            }
+        }
         // A community with no live moderator may not federate at all
-        // (`key_grant::emission_outcome`): nothing to carry, the write stands.
-        let emitted = crate::federation::key_grant::emission_outcome(
-            self.emit_attestation_self(set.emit_input()).await,
-        )
+        // (`key_grant::emission_outcome`): nothing carried, the write stands.
         .map_err(|e| {
             crate::federation::BlobError::AttestationEmissionFailed(format!(
-                "key_grant set for {axis:?} could not be emitted — the bytes are stored, the \
+                "key_grant rows for {axis:?} could not be emitted — the bytes are stored, the \
                  key cannot follow them until this succeeds ({e})"
             ))
-        })?;
-        // §14 (V146) — the emission ledger: the axis is clean from this
-        // instant until a newer grant lands under it. A skipped emission
-        // (`None`) leaves it dirty, so the next door or the boot sweep retries.
-        if let (Some(_), Some(watermark)) = (&emitted, watermark) {
-            match &self.backend {
-                #[cfg(feature = "postgres")]
-                BackendDispatch::Postgres(b) => {
-                    crate::federation::key_grant::mark_emitted(b.as_ref(), axis, watermark).await
-                }
-                #[cfg(feature = "sqlite")]
-                BackendDispatch::Sqlite(b) => {
-                    crate::federation::key_grant::mark_emitted(b.as_ref(), axis, watermark).await
-                }
-            }
-            .map_err(|e| crate::federation::BlobError::Backend(format!("key_grant ledger: {e}")))?;
-        }
-        Ok(emitted)
+        })
     }
 
     /// CIRISPersist#851 §20.5 (operator ruling) — **the announcing signer:
     /// hybrid/PQC only, no legacy fallback.** Every door that emits a
-    /// federation-tier `holds_bytes` claim signs with this node's PQC
+    /// holding claim signs with this node's PQC
     /// `LocalSigner`; an Engine without one (a classical `with_hardware_signer`
     /// build, or `from_shared` with no local key) holds and reads but does not
     /// announce, and says so here rather than storing bytes under a claim no
@@ -6496,7 +6682,7 @@ impl Engine {
         let local = self.local_signer.as_deref().ok_or_else(|| {
             crate::federation::BlobError::AttestationEmissionFailed(
                 "hybrid-only: this engine has no PQC LocalSigner and cannot announce a \
-                 federation-tier holds_bytes claim (CIRISPersist#851 §20.5 / CC 5.3.2.4.3.1); \
+                 holding claim (CIRISPersist#851 §20.5 / CC 5.3.2.4.3.1); \
                  construct with `with_signer` / `with_hardware_signer_hybrid` / \
                  `from_shared_with_local` to announce"
                     .into(),
@@ -6589,7 +6775,7 @@ impl Engine {
     /// self/family blob this node authored likewise. Called at every
     /// constructor after the sentinel resolves (a failure is logged, never a
     /// boot abort — the doors retry on their own writes), and reachable on
-    /// demand. Returns how many sets were emitted.
+    /// demand. Returns how many key-grant rows were emitted (v55.0.0, #989: rows, not sets).
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     pub async fn emit_pending_key_grants(&self) -> Result<usize, crate::federation::BlobError> {
         self.ensure_minter_sentinels_resolved().await.map_err(|e| {
@@ -6641,29 +6827,36 @@ impl Engine {
             }
         }
         .map_err(|e| crate::federation::BlobError::Backend(format!("key_grant ledger: {e}")))?;
-        let mut emitted = 0usize;
-        for axis in &axes {
-            if self.emit_key_grant(axis).await?.is_some() {
-                emitted += 1;
-            }
-        }
-        Ok(emitted)
+        // v55.0.0 (#989) — rows, not sets; and one axis that cannot be
+        // emitted does not hold back the others (the legacy re-emit sweeps
+        // every axis a node owns): it stays dirty and is retried.
+        // A mis-built axis is left dirty, logged once per retry interval and
+        // backed off (`key_grant::emit_dirty_axes`).
+        Ok(
+            crate::federation::key_grant::emit_dirty_axes(me, axes, |axis| async move {
+                self.emit_key_grant(&axis).await
+            })
+            .await
+            .emitted,
+        )
     }
 
-    /// CIRISPersist#848 (`BLOB_REPLICATION.md` §12–§13) — **admit a
-    /// replicated `KeyGrant` set and project every wrap.** The apply a
-    /// replication bridge routes a `key_grant:*` attestation to instead of
-    /// `apply_replicated_attestation`: the signer is resolved from THIS
-    /// node's directory, must be the set's minter (epoch axis; and an active
-    /// member at `asserted_at`) or the blob's author (content axis; when the
-    /// row is present), every wrap must be v2, and then the carrier row is
-    /// admitted through the attestation plane and every wrap written as a
-    /// UNION. Refusals are typed
-    /// ([`Error::KeyGrantRefused`](crate::federation::Error::KeyGrantRefused)).
+    /// CIRISPersist#848 (`BLOB_REPLICATION.md` §12–§13), v55.0.0 (#989, CC
+    /// 3.3.2 rc7) — **admit one replicated key-grant row and project its
+    /// wrap.** The row (`scores` on `key_grant:{axis}:v1`) goes through the
+    /// attestation plane's own admission, which runs the key-grant rule
+    /// against THIS node's directory (the sealer: the minter, active at
+    /// `asserted_at`, or a key that speaks for the owner and for the held
+    /// content's author; a v2 wrap; a recipient the audience rule admits),
+    /// then its wrap is written as a UNION. Refusals are typed
+    /// ([`Error::KeyGrantRefused`](crate::federation::Error::KeyGrantRefused),
+    /// or `SignerDoesNotActFor` plane `key_grant`, retryable).
+    /// [`apply_replicated_attestation`](Self::apply_replicated_attestation)
+    /// projects a key-grant row too; this door also reports the projection.
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     pub async fn apply_replicated_key_grant(
         &self,
-        set: crate::federation::key_grant::SignedKeyGrantSet,
+        row: crate::federation::key_grant::SignedKeyGrantRow,
     ) -> Result<crate::federation::key_grant::KeyGrantAdmission, crate::federation::Error> {
         self.ensure_minter_sentinels_resolved().await.map_err(|e| {
             crate::federation::Error::Backend(format!("V145 minter sentinel (#848): {e}"))
@@ -6671,9 +6864,9 @@ impl Engine {
         use crate::federation::key_grant::admit_replicated_key_grant;
         match &self.backend {
             #[cfg(feature = "postgres")]
-            BackendDispatch::Postgres(arc) => admit_replicated_key_grant(arc.as_ref(), set).await,
+            BackendDispatch::Postgres(arc) => admit_replicated_key_grant(arc.as_ref(), row).await,
             #[cfg(feature = "sqlite")]
-            BackendDispatch::Sqlite(arc) => admit_replicated_key_grant(arc.as_ref(), set).await,
+            BackendDispatch::Sqlite(arc) => admit_replicated_key_grant(arc.as_ref(), row).await,
         }
     }
 
@@ -6741,10 +6934,13 @@ impl Engine {
         #[cfg(any(feature = "postgres", feature = "sqlite"))]
         match self.emit_pending_key_grants().await {
             Ok(0) => {}
-            Ok(n) => tracing::info!(sets = n, "pending KeyGrant sets emitted at boot (#848 §14)"),
+            Ok(n) => tracing::info!(
+                rows = n,
+                "pending key-grant rows emitted at boot (#848 §14, #989)"
+            ),
             Err(e) => tracing::warn!(
                 error = %e,
-                "pending KeyGrant sets could not be emitted at boot; the write doors retry (#848 §14)"
+                "pending key-grant rows could not be emitted at boot; the write doors retry (#848 §14)"
             ),
         }
     }
@@ -6873,7 +7069,7 @@ impl Engine {
         let signer = self.local_signer.as_ref().ok_or_else(|| {
             crate::federation::BlobError::Backend(
                 "sweep_community_epochs requires a LocalSigner to hybrid-sign the withdraws \
-                 that retract this node's holds_bytes announcements (§11.5); this Engine has \
+                 that retract this node's holding claims (§11.5); this Engine has \
                  none (constructed via from_shared)"
                     .to_string(),
             )
@@ -6944,12 +7140,11 @@ impl Engine {
     /// [`read_blob_for_community_viewer`](Engine::read_blob_for_community_viewer)
     /// can find the right key later.
     ///
-    /// Unlike the self/family cascade this does **not** suppress
-    /// `holds_bytes`: community content federates with cleartext
-    /// provenance (CEG 0.8 §8.1.13.3 — the community privacy property is
-    /// cohort-filtered visibility, not byte-level invisibility). The caller
-    /// emits the `holds_bytes:*` row; this owns the at-rest crypto and the
-    /// grants.
+    /// Community content carries cleartext provenance (CEG 0.8 §8.1.13.3 —
+    /// the community privacy property is cohort-filtered visibility, not
+    /// byte-level invisibility). The caller announces the holding claim, at
+    /// the community's scope (v55.0.0, CIRISPersist#989); this owns the
+    /// at-rest crypto and the grants.
     ///
     /// # Refusals
     ///
@@ -7484,6 +7679,81 @@ impl Engine {
         Ok(r)
     }
 
+    /// v55.0.0 (CIRISPersist#981, CC 5.3.3.2.5) — **supply the DEK of a
+    /// stream's next epoch**: the stream's per-(stream, epoch) DEK the
+    /// producer derives from the group's MLS exporter (CC 5.1;
+    /// CIRISConstitution#169, rc8 ruling), so the live stream and the stored
+    /// one are one key. Persist never derives it and never sees the exporter
+    /// secret. The writer is this Engine's
+    /// signer (the stream's single sender); `group_key_id` is the owner,
+    /// family or community the stream is sealed for. Closes the stream's open
+    /// epoch with its terminator, records the DEK (persist never mints or rolls
+    /// the stream's epochs from now on: a removal or the nonce cap refuses the
+    /// next chunk with the retryable `stream_epoch_rotation_required`), wraps
+    /// it to the stream's audience and emits the `key_grant:stream:v1` rows.
+    /// A supplied epoch is always kept: an unrecorded live call never comes
+    /// to this door (CC rc7 part 5 — "An unrecorded live call wraps
+    /// nothing"); its frames are sealed in memory with
+    /// [`seal_stream_chunk`](crate::federation::stream_seal::seal_stream_chunk)
+    /// under that per-stream DEK. Chunks then go through
+    /// [`put_blob_chunk_scoped`](Self::put_blob_chunk_scoped) at `epoch`.
+    /// Refusals: `stream_not_authored`, `stream_epoch_dek_exists`, or
+    /// `InvalidArgument` (plaintext tier, an epoch below the newest, a
+    /// per-chunk-keyed stream, another cohort).
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn register_stream_epoch_dek(
+        &self,
+        cohort_scope: &str,
+        group_key_id: &str,
+        stream_id: &str,
+        epoch: u64,
+        dek: &[u8; 32],
+        aad: Option<&[u8]>,
+    ) -> Result<
+        crate::federation::chunk_dag_cascade::RegisteredStreamEpoch,
+        crate::federation::BlobError,
+    > {
+        self.ensure_minter_sentinels_resolved().await.map_err(|e| {
+            crate::federation::BlobError::Backend(format!("V145 minter sentinel (#848): {e}"))
+        })?;
+        use crate::federation::chunk_dag_cascade::orchestrate::register_stream_epoch_dek;
+        let r = match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(arc) => {
+                register_stream_epoch_dek(
+                    arc.as_ref(),
+                    &*self.signer,
+                    cohort_scope,
+                    group_key_id,
+                    stream_id,
+                    epoch,
+                    dek,
+                    aad,
+                )
+                .await
+            }
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(arc) => {
+                register_stream_epoch_dek(
+                    arc.as_ref(),
+                    &*self.signer,
+                    cohort_scope,
+                    group_key_id,
+                    stream_id,
+                    epoch,
+                    dek,
+                    aad,
+                )
+                .await
+            }
+        }?;
+        if let Some(axis) = &r.key_grant_emission {
+            self.emit_key_grant(axis).await?;
+        }
+        Ok(r)
+    }
+
     /// #838 (§12.10) — **read one chunk of a stream by POSITION, as
     /// `viewer_key_id`.** The DVR / catch-up read: the row at
     /// `(stream_id, seq)` authorizes the viewer by its tier first, then a
@@ -7519,8 +7789,8 @@ impl Engine {
     /// #832 (§12.3) — **seal a live stream into a `chunk_dag` at
     /// `cohort_scope`.** Checks every chunk ROW is at the DAG's tier (I32),
     /// builds the manifest (v2 with plaintext sizes for a sealed tier),
-    /// seals it under the DAG's DEK, stores it, and announces `holds_bytes`
-    /// under this Engine's signer at `Plaintext` / `CommunityDek`. Returns
+    /// seals it under the DAG's DEK, stores it, and announces this node's
+    /// holding claim at the content's scope (every tier, v55.0.0). Returns
     /// the DAG's content address. `aad` (#831) binds the manifest's seal.
     ///
     /// `pqc` — CIRISPersist#851 §20.5: a classical-only claim is confined to
@@ -8387,7 +8657,7 @@ impl Engine {
     /// [`is_proxy_content`](crate::federation::is_proxy_content)): a blob is
     /// PROXY when the ROW's `author_key_id` is neither this node nor family
     /// — content held for others. A row with no recorded author (pre-V144)
-    /// is unknown and classifies proxy. It used to key on the `holds_bytes`
+    /// is unknown and classifies proxy. It used to key on the holding claim's
     /// ATTESTER, which for anything this node adopted is this node itself,
     /// so every relayed blob read as protected.
     ///
@@ -8662,14 +8932,10 @@ impl Engine {
 
     /// v3.5.0 (CIRISPersist#125) — Engine-facade for
     /// [`BlobStorage::list_held_by`](crate::federation::BlobStorage::list_held_by).
-    /// Returns the full SHA-256 of every blob this Engine has a
-    /// currently-live `holds_bytes:sha256:*` attestation for from
-    /// `attesting_key_id` — the inverse of
+    /// Returns the full SHA-256 of every blob whose latest claim by
+    /// `attesting_key_id` is a live `here` (v55.0.0: `custody:ack:v1`,
+    /// CIRISPersist#989) — the inverse of
     /// [`list_holders`](crate::federation::BlobStorage::list_holders).
-    ///
-    /// See the trait method's doc-comment for the filter discipline
-    /// (TTL window, withdraws filter, full-SHA recovery from the
-    /// envelope's `evidence_refs`).
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     pub async fn list_held_by(
         &self,
@@ -8727,8 +8993,9 @@ impl Engine {
     }
 
     /// v47.2.0 (CIRISPersist#862, `FSD/BYTES_PLANE_TOMBSTONE.md` §3.6) — evict
-    /// ONE sha in the sweep's order: retract this node's live `holds_bytes`
-    /// claims (a hybrid-signed federation-tier `withdraws` each), THEN delete
+    /// ONE sha in the sweep's order: retract this node's own holding claims
+    /// (v55.0.0: `custody:ack:v1`, a hybrid-signed `withdraws` each at the
+    /// claim's scope, CIRISPersist#989), THEN delete
     /// the bytes. I18's contract verbatim: a retraction that cannot be admitted
     /// ABORTS — bytes and binding stay, the error propagates; a retry after a
     /// partial failure never double-retracts (the directory's retraction fold at
@@ -8964,8 +9231,112 @@ impl Engine {
             crate::federation::Error::Backend(format!("apply_replicated_purge signer: {e}"))
         })?;
         let directory = self.federation_directory();
+        // v55.0.0 (CIRISPersist#1007) — one tombstone plane, two bases: a
+        // bundle whose notice is a duty-holder takedown is re-verified under
+        // CC 4.5.5 and reaches the bytes plane only; an immediate-removal
+        // basis destroys the bytes on receipt here too (CC 4.5.3 step 2).
+        if crate::federation::takedown_tombstone::is_takedown_notice_envelope(
+            &bundle.notice.envelope,
+        ) {
+            let notice = crate::federation::takedown_tombstone::TakedownNotice {
+                envelope: bundle.notice.envelope.clone(),
+            };
+            let report = crate::federation::takedown_tombstone::apply_replicated_takedown(
+                directory.as_ref(),
+                &notice,
+                &bundle.record_ids,
+                &node,
+            )
+            .await?;
+            let outcome = crate::federation::steward_purge::ApplyPurgeOutcome {
+                notice_id: report.notice_id.clone(),
+                tombstoned: u64::from(report.tombstoned),
+                already_tombstoned: u64::from(!report.tombstoned),
+            };
+            self.takedown_holder_action(report).await?;
+            return Ok(outcome);
+        }
         crate::federation::steward_purge::apply_replicated_purge(directory.as_ref(), bundle, &node)
             .await
+    }
+
+    /// v55.0.0 (CIRISPersist#1007; CC 4.5.3 step 2, CC 4.5.5, CC 2.3) — **take
+    /// content down on the bytes plane** under a signed `takedown_notice`
+    /// Contribution. The notice's signature is verified and CC 4.5.5 is asked
+    /// of this node's own state (the signer holds the `takedown` duty over the
+    /// content); then ONE tombstone, `blob:{content_sha256}`, is recorded on
+    /// the steward purge's tombstone row, which withholds the bytes from every
+    /// read door at once and replicates as a purge bundle. Then this node acts
+    /// as a holder: an immediate-removal basis destroys the bytes now; a
+    /// counter-notice basis retracts this node's own holding claim now and
+    /// leaves the hard delete to [`purge_finalize`](Self::purge_finalize)
+    /// after its window; the age-gate basis records nothing. No other
+    /// device's claim is touched. Idempotent on the notice. Typed refusals:
+    /// `takedown_unauthorised`.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn takedown_tombstone(
+        &self,
+        notice: &crate::federation::takedown_tombstone::TakedownNotice,
+    ) -> Result<crate::federation::takedown_tombstone::TakedownReport, crate::federation::Error>
+    {
+        let node = self.local_derived_key_id().await.map_err(|e| {
+            crate::federation::Error::Backend(format!("takedown_tombstone signer: {e}"))
+        })?;
+        let directory = self.federation_directory();
+        let report = crate::federation::takedown_tombstone::takedown_tombstone(
+            directory.as_ref(),
+            notice,
+            &node,
+        )
+        .await?;
+        self.takedown_holder_action(report).await
+    }
+
+    /// What THIS node does as a holder once a takedown's tombstone is held:
+    /// destroy the bytes on receipt (immediate-removal), or retract its own
+    /// holding claim (counter-notice). Never another device's claim.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    async fn takedown_holder_action(
+        &self,
+        mut report: crate::federation::takedown_tombstone::TakedownReport,
+    ) -> Result<crate::federation::takedown_tombstone::TakedownReport, crate::federation::Error>
+    {
+        use crate::federation::takedown_tombstone::TakedownDisposition;
+        let mut sha = [0u8; 32];
+        hex::decode_to_slice(&report.content_sha256, &mut sha)
+            .map_err(|e| crate::federation::Error::Backend(format!("takedown sha: {e}")))?;
+        match report.disposition {
+            TakedownDisposition::AgeGate => {}
+            TakedownDisposition::DestroyOnReceipt => {
+                // The header settles at its own execution instant, so the
+                // finalize runs now: retract this node's claim, delete the
+                // bytes and the DAG children no live manifest keeps.
+                let done = self.purge_finalize(&report.notice_id).await?;
+                report.bytes_destroyed = done.blobs_evicted > 0;
+            }
+            TakedownDisposition::WithholdThenDelete { .. } => {
+                let Some(signer) = self.local_signer.as_ref() else {
+                    // No LocalSigner, no claim of this node's to retract.
+                    return Ok(report);
+                };
+                let node = self.local_derived_key_id().await.map_err(|e| {
+                    crate::federation::Error::Backend(format!("takedown signer: {e}"))
+                })?;
+                let now = crate::federation::steward_purge::purge_clock();
+                let directory = self.federation_directory();
+                let retracted = crate::federation::holding_claim::retract_own_claims(
+                    directory.as_ref(),
+                    &node,
+                    signer,
+                    &sha,
+                    now,
+                )
+                .await
+                .map_err(|e| crate::federation::Error::Backend(format!("takedown: {e}")))?;
+                report.claims_retracted = retracted as u64;
+            }
+        }
+        Ok(report)
     }
 
     /// v9.1.0 (CC 1.13.3 / FSD §2.4, CIRISPersist#243) — Engine-facade for
@@ -11267,6 +11638,21 @@ pub enum EngineError {
 /// evicted the same way, retract-then-delete. A chunk another live (or
 /// unbound) manifest still holds stays. Bytes only: the relation rows and the
 /// at-rest grants stay, as for any eviction.
+/// The provenance a plaintext chunk DAG's WILL decision is asked of: the
+/// commons (`federation`, plaintext), authored by `author_key_id`. One
+/// spelling for the one-shot door, the chunk door and the finalize.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+fn plaintext_dag_provenance(author_key_id: &str) -> crate::federation::BlobProvenance {
+    crate::federation::BlobProvenance {
+        author_key_id: author_key_id.to_owned(),
+        cohort_scope: crate::federation::types::cohort_scope::FEDERATION.to_owned(),
+        community_key_id: None,
+        epoch: None,
+        tier: crate::federation::types::cohort_scope::CryptoTier::Plaintext,
+        minter_key_id: None,
+    }
+}
+
 #[cfg(any(feature = "postgres", feature = "sqlite"))]
 async fn evict_blob_on<B>(
     backend: &B,
@@ -11290,7 +11676,9 @@ where
         return Ok(report);
     }
     for (_, chunk) in backend.dag_chunks_of_manifest(sha256).await? {
-        if !backend.has_blob(&chunk).await? {
+        // An eviction walk's existence probe is not an access (Codex r2 on
+        // #1065): a chunk it leaves must not look hot to the sweeper.
+        if backend.blob_head(&chunk).await?.is_none() {
             continue;
         }
         if matches!(fold(chunk).await?, BindingState::Withdrawn { .. }) {
@@ -11359,7 +11747,7 @@ where
             }
             gone.insert(child);
             work.push(child);
-            if backend.has_blob(&child).await? {
+            if backend.blob_head(&child).await?.is_some() {
                 let r = evict_one_on(backend, node, signer, &child, now).await?;
                 report.withdraws_emitted += r.withdraws_emitted;
                 if r.blob_deleted {
@@ -11383,49 +11771,24 @@ async fn evict_one_on<B>(
 where
     B: crate::federation::BlobStorage + crate::federation::FederationDirectory + Sync,
 {
-    use crate::federation::{BlobError, EvictBlobReport};
-    let sha_hex = hex::encode(sha256);
-    let prefix = crate::federation::HOLDS_BYTES_ATTESTATION_TYPE_PREFIX;
-    let mine = backend
-        .list_attestations_by(node)
-        .await
-        .map_err(|e| BlobError::Backend(format!("evict_blob: list claims: {e}")))?;
-    // A retry after a partial failure must find nothing to retract: the
-    // node's own earlier withdraws is in `mine`, so fold it (the same
-    // `retired_ids` every retraction reader uses) and skip retired claims.
-    let retired = {
-        let refs: Vec<&crate::federation::Attestation> = mine.iter().collect();
-        crate::federation::precedence::retired_ids(&refs)
+    use crate::federation::EvictBlobReport;
+    // v55.0.0 (CIRISPersist#989, CC 3.1.3.3 rule 4) — RETRACT FIRST: this
+    // node's own non-retired holding claims about the sha, each by its own
+    // `withdraws` at the claim's scope. A refused retraction aborts: bytes and
+    // binding stay (I18). A retry finds nothing already retracted (the fold
+    // drops it).
+    let retracted =
+        crate::federation::holding_claim::retract_own_claims(backend, node, signer, sha256, now)
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!(
+                    "evict_blob: eviction ABORTED, the bytes stay (I18): {e}"
+                ))
+            })?;
+    let mut report = EvictBlobReport {
+        withdraws_emitted: retracted,
+        ..EvictBlobReport::default()
     };
-    let claims: Vec<_> = mine
-        .into_iter()
-        .filter(|a| {
-            !retired.contains(&a.attestation_id)
-                && a.attestation_type.starts_with(prefix)
-                && a.attestation_envelope
-                    .get("evidence_refs")
-                    .and_then(|v| v.as_array())
-                    .and_then(|arr| arr.first())
-                    .and_then(|v| v.as_str())
-                    == Some(sha_hex.as_str())
-        })
-        .collect();
-    let mut report = EvictBlobReport::default();
-    for prior in &claims {
-        // RETRACT FIRST. A refused retraction aborts: bytes and binding stay.
-        crate::federation::blobs::emit_withdraws_attestation_helper(
-            prior, node, signer, backend, now,
-        )
-        .await
-        .map_err(|e| {
-            BlobError::Backend(format!(
-                "evict_blob: the withdraws for {} was not admitted — eviction ABORTED, the \
-                     bytes stay (I18): {e}",
-                prior.attestation_id
-            ))
-        })?;
-        report.withdraws_emitted += 1;
-    }
     report.blob_deleted = backend.delete_blob(sha256).await?;
     Ok(report)
 }
@@ -14312,9 +14675,8 @@ mod tests {
     #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn put_blob_signing_canonicalizes_via_ceg_produce_gate_sqlite() {
-        use crate::federation::{
-            holds_bytes_attestation_envelope, holds_bytes_attestation_type, BlobBody, BlobStorage,
-        };
+        use crate::federation::blobs::commons_claim_envelope;
+        use crate::federation::{BlobBody, BlobStorage};
         use crate::verify::canonical::ceg_produce_canonicalize;
         use sha2::{Digest, Sha256};
 
@@ -14348,7 +14710,7 @@ mod tests {
         let now =
             crate::federation::admission::truncate_to_substrate_resolution(chrono::Utc::now());
         let attestation_id = uuid::Uuid::new_v4();
-        let envelope = holds_bytes_attestation_envelope(
+        let envelope = commons_claim_envelope(
             &sha,
             &signer_alias,
             &attestation_id.to_string(),
@@ -14376,7 +14738,8 @@ mod tests {
         let sq = engine.sqlite_backend().expect("sqlite backend");
         let conn = sq.conn_handle();
         let attestation_id_str = attestation_id.to_string();
-        let attestation_type = holds_bytes_attestation_type(&sha);
+        // v55.0.0 (CIRISPersist#989) — the claim is a `scores` row.
+        let attestation_type = "scores".to_owned();
         let (stored_hash_hex, stored_scrub_key_id): (String, String) =
             tokio::task::spawn_blocking(move || {
                 let conn = conn.lock();
@@ -14725,10 +15088,8 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(postgres)]
     async fn put_blob_signing_canonicalizes_via_ceg_produce_gate_postgres() {
-        use crate::federation::{
-            holds_bytes_attestation_envelope, holds_bytes_attestation_type, BlobBody,
-            FederationDirectory,
-        };
+        use crate::federation::blobs::commons_claim_envelope;
+        use crate::federation::{BlobBody, FederationDirectory};
         use crate::verify::canonical::ceg_produce_canonicalize;
         use sha2::{Digest, Sha256};
 
@@ -14817,7 +15178,7 @@ mod tests {
         let now =
             crate::federation::admission::truncate_to_substrate_resolution(chrono::Utc::now());
         let attestation_id = uuid::Uuid::new_v4();
-        let envelope = holds_bytes_attestation_envelope(
+        let envelope = commons_claim_envelope(
             &sha,
             &key_id,
             &attestation_id.to_string(),
@@ -14840,7 +15201,7 @@ mod tests {
 
         // Pin the stored hash equals the CEG produce-gate canonical
         // hash — same invariant the SQLite test checks.
-        let attestation_type = holds_bytes_attestation_type(&sha);
+        let attestation_type = "scores".to_owned();
         let client = pg.pool().get().await.expect("pg client");
         let row = client
             .query_one(

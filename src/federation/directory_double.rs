@@ -134,7 +134,7 @@ impl FaultInjectingDirectory {
     }
 }
 
-// 113 delegations, generated. Every one: fault first, then delegate.
+// 115 delegations, generated. Every one: fault first, then delegate.
 #[async_trait::async_trait]
 impl FederationDirectory for FaultInjectingDirectory {
     async fn apply_replicated_accord_evidence(
@@ -359,6 +359,15 @@ impl FederationDirectory for FaultInjectingDirectory {
             .insert_known_wire_hash(kind, content_hash, advertised_by, now)
             .await
     }
+    async fn key_grant_held_owner(
+        &self,
+        axis: &key_grant::KeyGrantAxis,
+    ) -> Result<Option<String>, Error> {
+        if let Some(e) = self.faulted("key_grant_held_owner") {
+            return Err(e);
+        }
+        self.inner.key_grant_held_owner(axis).await
+    }
     async fn known_wire_hash_contains(
         &self,
         kind: &str,
@@ -400,6 +409,18 @@ impl FederationDirectory for FaultInjectingDirectory {
             return Err(e);
         }
         self.inner.list_attestations_by(attesting_key_id).await
+    }
+    async fn list_attestations_citing_by_dimension(
+        &self,
+        dimension: &str,
+        evidence_ref: &str,
+    ) -> Result<Vec<Attestation>, Error> {
+        if let Some(e) = self.faulted("list_attestations_citing_by_dimension") {
+            return Err(e);
+        }
+        self.inner
+            .list_attestations_citing_by_dimension(dimension, evidence_ref)
+            .await
     }
     async fn list_attestations_for(
         &self,
@@ -537,15 +558,6 @@ impl FederationDirectory for FaultInjectingDirectory {
         self.inner
             .list_held_fountain_content(publisher_key_id)
             .await
-    }
-    async fn list_holders_sized(
-        &self,
-        sha256: &[u8; 32],
-    ) -> Result<Vec<renditions::HolderClaim>, Error> {
-        if let Some(e) = self.faulted("list_holders_sized") {
-            return Err(e);
-        }
-        self.inner.list_holders_sized(sha256).await
     }
     async fn list_hybrid_pending_attestations(
         &self,
@@ -970,6 +982,12 @@ impl FederationDirectory for FaultInjectingDirectory {
         self.inner
             .lookup_signed_record_by_content_hash(kind, content_hash)
             .await
+    }
+    async fn project_key_grant_row(&self, row: &Attestation) -> Result<(), Error> {
+        if let Some(e) = self.faulted("project_key_grant_row") {
+            return Err(e);
+        }
+        self.inner.project_key_grant_row(row).await
     }
     async fn put_accord_decision(
         &self,

@@ -478,6 +478,13 @@ where
             if super::admission::is_authorized_infrastructure_community(dir, &c).await? {
                 return Ok(true);
             }
+            // v55.0.0 (CC 3.2; Codex r2 on #1065) — a held `public` room is a
+            // public group: its rows fan out to everyone, the subjectless
+            // standing proposal a non-member needs to join included. The ONE
+            // predicate the tier decisions ask, never a re-derivation.
+            if super::public_room::is_public_community(&c) {
+                return Ok(true);
+            }
             // v53.0.0 — a KEYLESS trust-root community (`ciris-canonical`) has
             // no key record to carry `substrate_persist`; its authority is
             // its chain from an accord birth. ROOTED by the one rooting
@@ -701,12 +708,20 @@ where
     if row.attesting_key_id == recipient {
         return Ok(Verdict::Yes(Reason::Origin));
     }
-    // A key-grant set carries KEYS for a cohort's content: naming a device
-    // is not a reason to send it there. It reaches only the cohort's audience
-    // (coordinator ruling on #963 — a deny is not cosmetic).
-    let key_set = row
-        .attestation_type
-        .starts_with(super::key_grant::KEY_GRANT_ATTESTATION_TYPE_PREFIX);
+    // v55.0.0 (CIRISPersist#989, CC 3.3.2 rc7 / CC 6.1.5.3) — a key-grant row
+    // carries ONE wrap to ONE recipient: it reaches that recipient's node
+    // because it refers to it, and only when the cohort's audience (below)
+    // contains that node — naming a device is not a reason to send it there
+    // (coordinator ruling on #963: a deny is not cosmetic). No other node
+    // receives it: a wrap is useful to nobody else. A retired SET is served to
+    // nobody but its signer.
+    if super::key_grant::is_retired_key_grant_set_type(&row.attestation_type) {
+        return Ok(Verdict::No(Reason::NotInAudience));
+    }
+    let key_set = super::key_grant::is_key_grant_row(row);
+    if key_set && row.attested_key_id != recipient {
+        return Ok(Verdict::No(Reason::NotInAudience));
+    }
     if !key_set
         && (row.attested_key_id == recipient
             || row.subject_key_ids.iter().any(|s| s == recipient)
@@ -769,7 +784,11 @@ where
     {
         for p in super::self_collective::principals_of(dir, &row.attesting_key_id).await? {
             if owner_node_receives(dir, &p, recipient, OwnerCohort::SelfContent).await? {
-                return Ok(Verdict::Yes(Reason::Cohort));
+                return Ok(Verdict::Yes(if key_set {
+                    Reason::RefersTo
+                } else {
+                    Reason::Cohort
+                }));
             }
         }
         return Ok(Verdict::No(Reason::NotInAudience));
@@ -779,7 +798,11 @@ where
         Err(_) => return Ok(Verdict::No(Reason::Malformed)),
     };
     match audience_nodes(dir, &row.cohort_scope, target).await? {
+        // A key-grant row to its recipient (the arm above kept only those):
+        // refers-to, governed by the audience.
+        Audience::Everyone if key_set => Ok(Verdict::Yes(Reason::RefersTo)),
         Audience::Everyone => Ok(Verdict::Yes(Reason::Public)),
+        a if a.contains(recipient) && key_set => Ok(Verdict::Yes(Reason::RefersTo)),
         a if a.contains(recipient) => Ok(Verdict::Yes(Reason::Cohort)),
         _ => Ok(Verdict::No(Reason::NotInAudience)),
     }

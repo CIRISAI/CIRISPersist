@@ -1329,6 +1329,26 @@ impl MemoryBackend {
         Ok(())
     }
 
+    /// v55.0.0 (CIRISPersist#989) — TEST SEAM: reproduce a row of a type no
+    /// door admits today (a retired `holds_bytes` carrier a node still holds):
+    /// rewrite the typed `attestation_type`. Nothing else moves.
+    #[cfg(any(test, feature = "test-anchor"))]
+    pub async fn test_seam_set_attestation_type(
+        &self,
+        attestation_id: &str,
+        attestation_type: &str,
+    ) -> Result<(), crate::federation::Error> {
+        let mut state = self.state.lock().expect("memory backend lock");
+        if let Some(a) = state
+            .federation_attestations
+            .iter_mut()
+            .find(|a| a.attestation_id == attestation_id)
+        {
+            a.attestation_type = attestation_type.to_owned();
+        }
+        Ok(())
+    }
+
     /// v54.0.0 (CIRISPersist#995 row 2) — TEST SEAM: reproduce what a
     /// pre-v53.1.4 UPDATE door left behind: `additional_scrubs` emptied while
     /// `persist_row_hash` still binds the full record. Nothing else moves.
@@ -1560,6 +1580,23 @@ impl MemoryBackend {
             .read()
             .unwrap_or_else(|p| p.into_inner())
             .clone()
+    }
+
+    /// v55.0.0 (CIRISPersist#989, test only) — hold an attestation BELOW
+    /// every admission gate, at the next serve position: the memory twin of
+    /// a raw `INSERT`, for the witness that a row an older build admitted (a
+    /// retired carrier) is never served. Never reachable outside `cfg(test)`.
+    #[cfg(test)]
+    pub(crate) fn plant_attestation_below_the_door(&self, row: crate::federation::Attestation) {
+        let mut state = self.state.lock().expect("memory backend lock");
+        let admitted_at = next_plane_position(
+            &state,
+            PLANE_ATTESTATION,
+            attestation_rows(&state).into_iter(),
+        );
+        let id = row.attestation_id.clone();
+        state.federation_attestations.push(row);
+        stamp_plane_position(&mut state, PLANE_ATTESTATION, id, admitted_at);
     }
 
     /// v50.0.0 (CIRISPersist#926, test only) — store a signed community row
@@ -3113,6 +3150,14 @@ impl crate::federation::renditions::HeldBlobScope for MemoryBackend {
     ) -> Result<Option<String>, crate::federation::Error> {
         Ok(None)
     }
+
+    async fn held_claim_scope(
+        &self,
+        _sha256: &[u8; 32],
+    ) -> Result<Option<crate::federation::holding_claim::ClaimScope>, crate::federation::Error>
+    {
+        Ok(None)
+    }
 }
 
 /// v52.0.0 (CIRISPersist#930) — the V161 append, unique on the assertion's key.
@@ -3570,38 +3615,6 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             .get(key_id)
             .cloned()
             .unwrap_or_default())
-    }
-
-    /// v45.0.0 (CIRISPersist#871, FSD §4) — the puller's budget read: every
-    /// `holds_bytes` claim for `sha256` (type prefix + full digest cited),
-    /// the holder's own `withdraws` / `recants` folded out, no freshness
-    /// window; a claim with no positive `size` is skipped. Sorted by key.
-    async fn list_holders_sized(
-        &self,
-        sha256: &[u8; 32],
-    ) -> Result<Vec<crate::federation::renditions::HolderClaim>, crate::federation::Error> {
-        use crate::federation::types::attestation_type::{RECANTS, WITHDRAWS};
-        let attestation_type = crate::federation::holds_bytes_attestation_type(sha256);
-        let full_hex = hex::encode(sha256);
-        let state = self.state.lock().expect("memory backend lock");
-        let retracted = |attester: &str, attestation_id: &str| {
-            state.federation_attestations.iter().any(|w| {
-                (w.attestation_type == WITHDRAWS || w.attestation_type == RECANTS)
-                    && w.attesting_key_id == attester
-                    && crate::federation::precedence::references_attestation_id_from_envelope(
-                        &w.attestation_envelope,
-                    ) == Some(attestation_id)
-            })
-        };
-        Ok(crate::federation::renditions::sized_holder_claims(
-            &full_hex,
-            state
-                .federation_attestations
-                .iter()
-                .filter(|a| a.attestation_type == attestation_type)
-                .filter(|a| !retracted(&a.attesting_key_id, &a.attestation_id))
-                .map(|a| (a.attesting_key_id.clone(), a.attestation_envelope.clone())),
-        ))
     }
 
     /// v45.0.0 (CIRISPersist#871, FSD §5) — the rendition index read over the
@@ -4074,14 +4087,9 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // a token the fold cannot match. Pure; same gate at every door.
         crate::federation::consent_scope::check_consent_scope_tokens(&row.attestation_envelope)?;
         // v45.0.0 (CIRISPersist#871, `FSD/MEDIA_SOURCE.md` §3–§4) — the media
-        // Source struct is refused by member name, and a `holds_bytes` claim
-        // without a positive `size` is refused: a descriptor a puller cannot
-        // budget by is not admitted. Pure; the same gate at every door.
+        // Source struct is refused by member name (a holding claim without a
+        // positive `size` is the custody parse\'s to refuse, v55) Pure; the same gate at every door.
         crate::federation::media_source::check_media_source(&row.attestation_envelope)?;
-        crate::federation::media_source::check_holder_claim_size(
-            &row.attestation_envelope,
-            &row.attestation_type,
-        )?;
 
         // v31.0.0 (CIRISPersist#598) — THE CONSENT INSTANT BINDING. A
         // `consent:state:*` row is refused unless its signed envelope carries
@@ -4536,6 +4544,12 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // CC 3.1.3.3 — `custody:ack:v1` is a holder self-report, placed within
         // the blob's own cohort (v53.0.0, CIRISPersist#942 part 2).
         crate::federation::custody_ack::check_custody_ack_admission(self, &row).await?;
+        // v55.0.0 (CIRISPersist#989, CC 3.1.3.3 rule 1) — a holding claim about a blob
+        // this node holds is placed at that blob's scope (memory holds none).
+        crate::federation::holding_claim::check_holding_claim_scope(self, &row).await?;
+        // CC 3.2 — a `community:listing:v1` row is federation-scoped and signed by the
+        // room's founder or a current moderate-holder (v55.0.0, CIRISPersist#1053).
+        crate::federation::public_room::check_community_listing_admission(self, &row).await?;
         // CC 3.1 — a lowercase family stem, or the row evades every family gate
         // (v42.0.0, CIRISPersist#814).
         crate::federation::admission::check_dimension_case_rule(&row)?;
@@ -5440,6 +5454,38 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         Ok(rows)
     }
 
+    /// v55.0.0 (CIRISPersist#989) — every attester's federation-tier rows on
+    /// `dimension` whose `evidence_refs[0]` is `evidence_ref` (the holder
+    /// directory's candidates).
+    async fn list_attestations_citing_by_dimension(
+        &self,
+        dimension: &str,
+        evidence_ref: &str,
+    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        let mut rows: Vec<_> = state
+            .federation_attestations
+            .iter()
+            .filter(|a| {
+                a.tier == crate::federation::types::attestation_tier::FEDERATION
+                    && crate::federation::admission::envelope_dimension(&a.attestation_envelope)
+                        == Some(dimension)
+                    && crate::federation::first_evidence_ref(&a.attestation_envelope)
+                        == Some(evidence_ref)
+            })
+            .cloned()
+            .collect();
+        rows.sort_by_key(|a| std::cmp::Reverse(a.asserted_at));
+        crate::observe::record_read(
+            crate::observe::StoreBackend::Memory,
+            crate::observe::Door::ListAttestationsByDimensionCiting,
+            dimension,
+            &rows,
+            0,
+        );
+        Ok(rows)
+    }
+
     async fn list_attestations_by_dimension_citing(
         &self,
         attesting_key_id: &str,
@@ -5645,7 +5691,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
     /// v21.12.0 (CIRISPersist#530) — the repair sweep's page source: the
     /// stranded rows (`tier = 'federation'` with a suppressed
     /// `cohort_scope`). Twin of `list_local_tier_attestations`; the
-    /// predicate uses [`crate::federation::types::cohort_scope::suppresses_holds_bytes`]
+    /// predicate uses [`crate::federation::types::cohort_scope::is_structurally_invisible`]
     /// (`self`/`family`) directly rather than a literal set so the memory
     /// backend can never drift from the taxonomy the SQL backends spell out.
     async fn list_widening_candidates(
@@ -5660,7 +5706,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             .iter()
             .filter(|a| {
                 a.tier == attestation_tier::FEDERATION
-                    && cohort_scope::suppresses_holds_bytes(&a.cohort_scope)
+                    && cohort_scope::is_structurally_invisible(&a.cohort_scope)
                     // v50.0.0 (CIRISPersist#919) — stranded rows only: a row
                     // naming a cohort target was PLACED (the SQL backends
                     // render this same predicate).
@@ -5687,7 +5733,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                     // other means, there is nothing here awaiting anybody.
                     && !state.federation_attestations.iter().any(|e| {
                         e.tier == attestation_tier::FEDERATION
-                            && !cohort_scope::suppresses_holds_bytes(&e.cohort_scope)
+                            && !cohort_scope::is_structurally_invisible(&e.cohort_scope)
                             // `delegates_to` ONLY: there `(attester, attested,
                             // dimension)` identifies the edge. Two `scores` or
                             // `chat:` rows share all four and are DIFFERENT

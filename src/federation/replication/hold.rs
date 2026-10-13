@@ -6,7 +6,7 @@
 //! - [`is_proxy_content`] — *is this row held for others?* Read by the
 //!   force-evict sweep, the serve refusal and the accept decision, so the
 //!   three agree by construction (I49). It used to be three copies keyed on
-//!   the `holds_bytes` ATTESTER, which for anything a node adopts is the node
+//!   the holding claim's ATTESTER, which for anything a node adopts is the node
 //!   itself — every relayed blob classified as protected.
 //! - [`would_hold`] — *WILL this node hold content it MAY hold, now?* The
 //!   accept rule every consumer-reachable accept door runs (I46). Its
@@ -219,6 +219,41 @@ impl BlobProvenance {
             epoch: epoch.or(pointer_epoch),
             tier,
             minter_key_id: minter_key_id.map(str::to_owned),
+        })
+    }
+
+    /// v55.0.0 (CIRISPersist#977) — **the provenance of a STREAM-KEYED room
+    /// chunk**, from the provenance of the row the stream's file flowed from
+    /// (usually [`from_attestation`](Self::from_attestation) over the room
+    /// row that points at the sealed manifest).
+    ///
+    /// A stream-keyed room chunk is sealed under its stream epoch's DEK, not
+    /// the community's, so it carries no community epoch and no minter: the
+    /// chunk adopt's own `epoch` argument is the STREAM epoch. A manifest's
+    /// provenance names the community epoch its pointer carries, and
+    /// [`from_attestation`](Self::from_attestation) fills that epoch even
+    /// when its `epoch` argument is `None` (the pointer is the fallback), so
+    /// reusing it for a chunk would bind the chunk under the community epoch:
+    /// the chunk door refuses that wherever this node knows the stream epoch.
+    /// Everything else — author, placement, community, tier — is the row's.
+    ///
+    /// # Errors
+    ///
+    /// [`BlobError::InvalidArgument`] unless `self` is a `community_dek`
+    /// provenance naming its community (only a room stream is stream-keyed
+    /// under a community; a self/family chunk carries its own grants).
+    pub fn for_stream_keyed_chunk(&self) -> Result<Self, BlobError> {
+        if self.tier != CryptoTier::CommunityDek || self.community_key_id.is_none() {
+            return Err(BlobError::InvalidArgument(format!(
+                "for_stream_keyed_chunk: a stream-keyed room chunk's provenance is \
+                 community_dek and names its community; this one is {:?} at {:?}",
+                self.tier, self.community_key_id
+            )));
+        }
+        Ok(Self {
+            epoch: None,
+            minter_key_id: None,
+            ..self.clone()
         })
     }
 }

@@ -306,8 +306,39 @@ pub mod orchestrate {
                  Commons-tier plaintext (CC 4.4.3.2.1 opt-out); the DEK cascade must not run for it"
             )));
         }
+        // v55.0.0 (CIRISPersist#1053, CC 3.2) — a `public` room is Commons tier
+        // too: a DEK over a room anyone may join would be ceremony without a
+        // secret, and a mis-dispatched public emission is a loud error.
+        if crate::federation::public_room::is_public_community(&community) {
+            return Err(BlobError::InvalidArgument(format!(
+                "community {community_key_id:?} is cohort_subkind:public — Commons-tier \
+                 plaintext (CC 3.2); the DEK cascade must not run for it"
+            )));
+        }
 
         active_member_occurrences(backend, &community).await
+    }
+
+    /// v55.0.0 (CIRISPersist#977) — **a room stream's wrap targets**: the same
+    /// recipients this cascade wraps an epoch DEK to
+    /// ([`resolve_community_members`], the infrastructure carve-out included),
+    /// partitioned as the self/family fan-out reports them. What a
+    /// stream-keyed community chunk's `(stream_id, epoch)` DEK is wrapped to.
+    pub(crate) async fn room_targets<B>(
+        backend: &B,
+        community_key_id: &str,
+    ) -> Result<
+        (
+            Vec<(String, crate::federation::types::EncryptionPubkeys)>,
+            GrantReport,
+        ),
+        BlobError,
+    >
+    where
+        B: FederationDirectory + Sync,
+    {
+        let (members, _) = resolve_community_members(backend, community_key_id).await?;
+        Ok(partition_roster(members))
     }
 
     /// The community's ACTIVE members, each with its active occurrences:
@@ -1183,6 +1214,28 @@ pub mod orchestrate {
                 report.blocked.push((epoch, remaining));
             }
         }
+
+        // v55.0.0 (CIRISPersist#977, operator ruling) — a room's retention
+        // bound covers every byte sealed for the room: the chunks of a
+        // stream-keyed ROOM stream are evicted under the same policy as the
+        // community epoch their stream epoch was minted at (`room_epoch`), by
+        // the rule above (`current - room_epoch > n`).
+        //
+        // Codex r4 on #1065 — run AFTER the epoch loop, and never orphaning a
+        // retained manifest: a stream epoch whose chunks a still-held DAG
+        // manifest relates (`federation_dag_chunks`) is kept whole, because
+        // the retention bound applies to the content AS ADVERTISED — the DAG,
+        // bound to the community epoch it was sealed under — not to the
+        // epoch its chunks' key was minted at. Once the manifest goes (its
+        // own epoch's eviction, above in this same sweep, or a takedown) the
+        // chunks follow in this pass or the next.
+        if let Some(n) = retain {
+            if let Some(bound) = current.checked_sub(n.saturating_add(1)) {
+                report.evicted_objects += backend
+                    .stream_dek_evict_room_chunks(community_key_id, &minter, bound, now)
+                    .await?;
+            }
+        }
         Ok(report)
     }
 
@@ -1615,6 +1668,45 @@ pub mod lifecycle_support {
             None,
         )
         .await
+    }
+
+    /// v55.0.0 (CIRISPersist#989, CC 3.1.3.3) — [`seed_community`] with THIS
+    /// NODE seated as a member's device, and the node's signer. A holding
+    /// claim about room content is placed at the room's scope and only a
+    /// device in the room may make one, as in production, where the sealing
+    /// node is a member's. `node_alias` (normalized, ≥ 32 bytes) shares its
+    /// first 32 bytes with its derived id, so the key the roster names and
+    /// the key the signer signs with are one keypair.
+    pub async fn seed_community_with_node<B>(
+        backend: &B,
+        community_key_id: &str,
+        members: &[(&str, &str)],
+        node_alias: &str,
+    ) -> std::sync::Arc<crate::signing::LocalSigner>
+    where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        use crate::federation::tier_ingest::test_support as ts;
+        let alias = node_alias.replace('_', "-").to_lowercase();
+        let signer = ts::local_signer(&alias);
+        let derived = signer.derived_key_id();
+        assert_eq!(
+            &derived.as_bytes()[..32],
+            &alias.as_bytes()[..32],
+            "a seed-sharing node alias (normalized, at least 32 bytes)"
+        );
+        ts::register_hybrid_key_as(
+            backend,
+            &alias,
+            &alias,
+            crate::federation::types::identity_type::USER,
+        )
+        .await;
+        let owner = format!("{alias}-owner");
+        let mut all: Vec<(&str, &str)> = members.to_vec();
+        all.push((&owner, &derived));
+        seed_community(backend, community_key_id, &all).await;
+        signer
     }
 
     /// As [`seed_community`], with control over the community key's
@@ -2261,7 +2353,16 @@ pub mod lifecycle_harness {
         // The first implementation's sweep had zero postgres coverage; this
         // step runs on every backend that runs the harness.
         // Announce epoch 0's sealed bytes as this sweeper node, so there is
-        // an announcement to retract.
+        // an announcement to retract. v55.0.0 (CIRISPersist#989, CC 3.1.3.3)
+        // — a room's holding claim is placed at the room's scope and made by
+        // a device in the room: seat the sweeper as Alice's device first
+        // (after the fan-outs above, so no grant count moves).
+        crate::federation::at_rest_cascade::blob_invariants::join_as_occurrence(
+            backend,
+            &alice,
+            &sweeper_id,
+        )
+        .await;
         let crate::federation::BlobBody::Inline(sealed0) = backend
             .get_blob(&before.at_rest_sha256)
             .await

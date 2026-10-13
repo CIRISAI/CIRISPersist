@@ -769,17 +769,75 @@ pub const UNREGISTERED_GATED_FAMILIES: &[&str] = &[
 /// [`tests::staged_families_are_still_unregistered_and_tracked`] fails until
 /// it is deleted — the same self-deleting discipline as the exceptions list.
 pub const STAGED_GOVERNED_FAMILIES: &[(&str, &str)] = &[
-    // CC 3.3.10.1 (1.0-rc4.3) — in-grammar ledgers. Persist's working index
-    // and the pure standard shipped ahead of ratification; `ledger:*` rows
-    // refuse at federation tier until CIRISConstitution#92 graduates the
-    // family. Local-tier rows are the node's own business, as everywhere.
-    ("ledger:", "CIRISConstitution#92"),
+    // EMPTY as of the rc7 re-vendor (v55.0.0, CIRISPersist#753). It carried
+    // `ledger:` (CC 3.3.10.1 in-grammar ledgers, staged on
+    // CIRISConstitution#92) from v38.0.0 until CC rc7 registered
+    // `ledger:head|checkpoint|promotion` (CIRISConstitution#105); the
+    // re-vendor brought the rows in,
+    // `tests::staged_families_are_still_unregistered_and_tracked` failed by
+    // name, and the line was deleted. The family is now gated by
+    // `check_ledger_binding_admission` and `check_ledger_emitter_admission`.
 ];
 
+/// **Registered dimensions held shut** `(prefix, tracking ref)` — CC registers
+/// them, persist has no door for them yet, and a dimension under one is
+/// refused at every federation-tier door until the door lands
+/// ([`check_registered_family_not_held`]). A prefix is a family stem or a leaf
+/// with its trailing `:` (`membership:widening:`), matched on that boundary.
+///
+/// The staged latch's twin for a family that is ALREADY registered, where
+/// [`STAGED_GOVERNED_FAMILIES`] cannot hold it (R2(b) stands aside for a
+/// registered stem). It is for a registration that WIDENS what a node admits:
+/// a dimension the previous cut refused, which the re-vendor would otherwise
+/// open to any signer before persist enforces CC's rule on it.
+/// `tests::held_dimensions_are_registered_and_tracked` fails once a line names
+/// nothing the registry carries, and the cut that builds the door deletes the
+/// line.
+pub const REGISTERED_FAMILIES_HELD_SHUT: &[(&str, &str)] = &[
+    // `key_grant:` was held here by the rc7 re-vendor (A0) until v55 slice B
+    // built its door: the per-recipient row with CC 3.3.2's sealer rule,
+    // `key_grant::check_key_grant_row_admission` (CIRISPersist#989).
+    // CC 3.1.3.2 rc7: three new `membership:{stage}` leaves — widening and
+    // removal "cosigned under the group's consensus_protocol", resignation
+    // "the leaving member". rc6's closed vocabulary refused all three;
+    // `membership_acceptance` gates only proposal / acceptance / decline, so
+    // the re-vendor would admit these from any signer. The cosigned-row doors
+    // are CIRISPersist#991's.
+    ("membership:widening:", "CIRISPersist#991"),
+    ("membership:removal:", "CIRISPersist#991"),
+    ("membership:resignation:", "CIRISPersist#991"),
+];
+
+/// The reason token a [`REGISTERED_FAMILIES_HELD_SHUT`] refusal carries, on the
+/// existing [`Error::DimensionRejected`] shape (the [`LEDGER_BINDING_REASON`]
+/// precedent: the pyo3 FFI matches the shape, so a token needs no FFI change).
+pub const REGISTERED_FAMILY_HELD_SHUT_REASON: &str = "registered_family_held_shut";
+
+/// v55.0.0 (CIRISPersist#753) — refuse a dimension under a
+/// [`REGISTERED_FAMILIES_HELD_SHUT`] prefix. Pure; asked of the envelope
+/// `dimension` of every federation-tier row, whatever its type, beside R2(b).
+///
+/// # Errors
+///
+/// [`Error::DimensionRejected`] with [`REGISTERED_FAMILY_HELD_SHUT_REASON`].
+pub fn check_registered_family_not_held(dimension: &str) -> Result<(), Error> {
+    if REGISTERED_FAMILIES_HELD_SHUT
+        .iter()
+        .any(|(p, _)| dimension.starts_with(p))
+    {
+        return Err(Error::DimensionRejected {
+            dimension: dimension.to_owned(),
+            reason: REGISTERED_FAMILY_HELD_SHUT_REASON,
+        });
+    }
+    Ok(())
+}
+
 /// v38.0.0 (CIRISPersist#754) — the CC 3.3.10.1 `ledger:*` dimension family
-/// stem. Staged on CIRISConstitution#92 (see [`STAGED_GOVERNED_FAMILIES`]);
-/// the L1 binding arm below is live from day one so graduation opens an
-/// already-gated door, never an open one.
+/// stem. Staged on CIRISConstitution#92 until the rc7 re-vendor (v55.0.0,
+/// CIRISPersist#753) registered it; gated by the L1 binding arm
+/// ([`check_ledger_binding_admission`]) and the owner rule
+/// ([`check_ledger_emitter_admission`]).
 pub const LEDGER_DIMENSION_PREFIX: &str = "ledger:";
 
 /// v38.0.0 (CIRISPersist#721) — the pinned signing bytes for a
@@ -794,7 +852,13 @@ pub fn trust_grant_signing_bytes(grant: &super::TrustGrant) -> Result<Vec<u8>, E
     });
     crate::verify::canonical::canonicalizer_for(crate::verify::canonical::CanonVersion::V2Jcs)
         .canonicalize_value(&value)
-        .map_err(|e| Error::InvalidArgument(format!("trust grant canonicalize: {e}")))
+        .map_err(|e| {
+            Error::malformed_row(
+                "trust_grant",
+                super::malformed_row::ENVELOPE_NOT_CANONICAL,
+                format!("trust grant canonicalize: {e}"),
+            )
+        })
 }
 
 /// v38.0.0 (CIRISPersist#721) — the pinned signing bytes for a trust
@@ -812,7 +876,13 @@ pub fn trust_revocation_signing_bytes(
     });
     crate::verify::canonical::canonicalizer_for(crate::verify::canonical::CanonVersion::V2Jcs)
         .canonicalize_value(&value)
-        .map_err(|e| Error::InvalidArgument(format!("trust revocation canonicalize: {e}")))
+        .map_err(|e| {
+            Error::malformed_row(
+                "trust_revocation",
+                super::malformed_row::ENVELOPE_NOT_CANONICAL,
+                format!("trust revocation canonicalize: {e}"),
+            )
+        })
 }
 
 /// v38.0.0 (CIRISPersist#721) — **the trust-grant authority gate.** The
@@ -998,6 +1068,98 @@ pub fn check_ledger_binding_admission(
         }
     }
     Ok(())
+}
+
+/// v55.0.0 (CIRISPersist#753) — **the `ledger:*` owner rule.** CC 3.1.3's
+/// table reserves the three ledger rows to "the ledger's single owner (the
+/// steward-bound identity of its `ledger_id` triple) or a delegate under its
+/// declared serialization discipline" (CC 3.3.10.1 clauses 1–3). The owner is
+/// `attested_key_id` ([`check_ledger_binding_admission`] binds the triple to
+/// it), so the signer must act for that identity: its own key, a live
+/// occurrence of it, or a node bound to it (the one `signer_acts_for` rule).
+///
+/// The rc7 registry rows carry `substrate-self-report` instead — the CC 3.1.3
+/// section's default — which would refuse every owner. Persist follows the
+/// table cell, the more specific text, and is stricter than it in one
+/// direction: the `delegates_to` delegate path is refused until a door reads
+/// the ledger's declared serialization discipline (clause 3: "Concurrent
+/// unleased writes at one sequence number ARE a fork").
+///
+/// # Errors
+///
+/// [`Error::SignerDoesNotActFor`] (plane `ledger`) when the signer does not
+/// act for the owner — retryable, since the binding may not have landed yet.
+pub async fn check_ledger_emitter_admission(
+    directory: &dyn super::FederationDirectory,
+    row: &super::Attestation,
+) -> Result<(), Error> {
+    if row.attestation_type != attestation_type::SCORES {
+        return Ok(());
+    }
+    let Some(dimension) = envelope_dimension(&row.attestation_envelope) else {
+        return Ok(());
+    };
+    if !dimension.starts_with(LEDGER_DIMENSION_PREFIX) {
+        return Ok(());
+    }
+    check_signer_acts_for(
+        directory,
+        &row.attesting_key_id,
+        &row.attested_key_id,
+        LEDGER_EMITTER_PLANE,
+    )
+    .await
+}
+
+/// The `plane` a [`check_ledger_emitter_admission`] refusal names.
+pub const LEDGER_EMITTER_PLANE: &str = "ledger";
+
+/// v55.0.0 (CIRISPersist#753) — the CC 3.3.10 `settlement:*` dimension stem.
+pub const SETTLEMENT_DIMENSION_PREFIX: &str = "settlement:";
+
+/// v55.0.0 (CIRISPersist#753) — **`settlement:*` admission, CC 3.3.10.**
+///
+/// A settlement row is "a bare `scores` on a `settlement:*` dimension against
+/// the paid Contribution", signed by the payer (Identity = Wallet: "the same
+/// federation key that signs this attestation controls the Base wallet that
+/// emitted `settlement_ref`"), and the payee MAY counter-attest on
+/// `settlement:received:*`. The leaves are open (`settlement:paid:v1`
+/// canonical) and the `cohort_scope` is the producer's choice — `self` by
+/// default (the private arm), `public` / `federation` opt-in — so no emitter
+/// role and no scope is asked here.
+///
+/// What IS asked: the row carries no payment-processor identifier. CC 3.3.10
+/// keeps billing "entirely Portal+Stripe, off-wire" and cites a settlement the
+/// way `evidence_refs[]` cite a blob (a chain tx hash, an x402 receipt id);
+/// the same recursive scan the operational envelopes get
+/// ([`crate::federation::operational::reject_payment_processor_identifiers`])
+/// runs over the whole signed envelope, so a Stripe id cannot ride an open
+/// field of a settlement either. Linkage references in, processor
+/// identifiers out.
+///
+/// The rc7 registry row carries the CC 3.1.3 section default
+/// `substrate-self-report`; the CC 3.1.3 table marks the row "Reserved? No"
+/// and CC 3.3.10 names the payer as the signer. Persist follows the text:
+/// gating the family to `substrate_persist` would refuse every conformant
+/// settlement (the CC 3.1.7 R2 failure mode).
+///
+/// Pure. Every federation-tier row reaches it through
+/// [`check_reserved_prefix_admission`], on all three backends.
+///
+/// # Errors
+///
+/// [`Error::PaymentProcessorIdentifier`] on the first processor identifier.
+pub fn check_settlement_admission(row: &super::Attestation) -> Result<(), Error> {
+    if row.attestation_type != attestation_type::SCORES {
+        return Ok(());
+    }
+    let Some(dimension) = envelope_dimension(&row.attestation_envelope) else {
+        return Ok(());
+    };
+    if !dimension.starts_with(SETTLEMENT_DIMENSION_PREFIX) {
+        return Ok(());
+    }
+    crate::federation::operational::reject_payment_processor_identifiers(&row.attestation_envelope)
 }
 
 /// **CIRISPersist#571 — the three media-plane families persist STOPPED gating,
@@ -1754,9 +1916,9 @@ pub fn envelope_binds_content(envelope: &serde_json::Value, content_sha256: &str
 /// hook produces the machine-readable typed rejection consumers
 /// pattern-match on (`kind() == "federation_cohort_scope_rejected"`).
 ///
-/// `self`-tier locality enforcement (a `cohort_scope: self`
-/// attestation MUST NOT emit `holds_bytes` to peers — the
-/// FEDERATION_SCALING_MODEL §9.5 locality dividend) is a separate,
+/// `self`-tier locality enforcement (a `cohort_scope: self` row is never
+/// advertised beyond the owner — the FEDERATION_SCALING_MODEL §9.5 locality
+/// dividend; v55.0.0 its holding claims stay at `self`) is a separate,
 /// emission-side concern tracked by #153 Ask 5 and is not part of this
 /// value-validation layer.
 pub fn check_cohort_scope(cohort_scope: &str) -> Result<(), Error> {
@@ -2237,6 +2399,19 @@ impl std::fmt::Display for CohortStandingRefusal {
     }
 }
 
+/// v55.0.0 (CIRISPersist#989, CC 3.3.2 rc7) — AV-84's second exception: a
+/// `key_grant:{axis}:v1` row is placed at its content's scope and names its
+/// RECIPIENT occurrence as `attested_key_id` ("`attested_key_id` is the
+/// recipient occurrence … placed at the content's scope"). The recipient is
+/// not a third party the row speaks ABOUT: the key-grant rule
+/// (`key_grant::check_key_grant_row_admission`) requires it to be an
+/// occurrence the cohort's audience rule lets hold the key, and the row
+/// reaches that recipient's node alone. Subjects stay refused: a key-grant row
+/// names none.
+fn names_its_key_grant_recipient(row: &super::Attestation) -> bool {
+    super::key_grant::is_key_grant_row(row) && row.subject_key_ids.is_empty()
+}
+
 /// The ONE standing comparison, parameterised over party resolution: refuse
 /// iff any named party RESOLVES differently from the producer. The string
 /// form ([`check_promotion_cohort_standing`], resolution = identity fn) and
@@ -2256,7 +2431,10 @@ fn cohort_standing_core(
             reason,
         })
     };
-    if row.attested_key_id != producer && resolve(&row.attested_key_id) != producer_identity {
+    if row.attested_key_id != producer
+        && resolve(&row.attested_key_id) != producer_identity
+        && !names_its_key_grant_recipient(row)
+    {
         return refuse(CohortStandingRefusal::AttestedParty, &row.attested_key_id);
     }
     // v52.0.0 (CIRISPersist#955) — AV-84's one exception: a membership
@@ -2323,6 +2501,7 @@ pub async fn check_cohort_standing_resolved(
         })
     };
     if row.attested_key_id != producer
+        && !names_its_key_grant_recipient(row)
         && admission_identity_for_writer(directory, &row.attested_key_id).await?
             != producer_identity
     {
@@ -2627,7 +2806,7 @@ pub async fn check_promotion_admission(
     // crossing is over the same bytes (CC 5.3.2.4.2) and `cohort_scope` is
     // one of those bytes, so a `(local, self)` row crosses to
     // `(federation, self)`: the CC 5.2 shape — replicated to the owner's own
-    // nodes by consent fan-out, never advertised via `holds_bytes`. #315
+    // nodes by consent fan-out, its holding claims kept at `self`. #315
     // called this a dead plane because nothing consumed it; edge's own-device
     // fan-out (`CohortScope::SelfOnly`) now does. Widening is a separate
     // `supersedes` row (`FederationDirectory::widen_audience`), and THAT door
@@ -2699,10 +2878,8 @@ pub async fn check_promotion_admission(
     super::consent_scope::check_consent_scope_tokens(&row.attestation_envelope)?;
     // v45.0.0 (CIRISPersist#871) — the media Source struct gate at the promotion
     // chokepoint: a local row admitted before this cut does not cross with a
-    // malformed struct; a promoted holder claim (there is none) would need its
-    // size.
+    // malformed struct. (A holding claim's size is the custody parse's, v55.)
     super::media_source::check_media_source(&row.attestation_envelope)?;
-    super::media_source::check_holder_claim_size(&row.attestation_envelope, &row.attestation_type)?;
     check_capacity_consent_admission(directory, row).await?;
 
     // v38.7.0 (CIRISPersist#778) — CC 3.4.5's OTHER emitter rule: `config:*`
@@ -2732,6 +2909,10 @@ pub async fn check_promotion_admission(
     // CC 3.1.3.3 — a custody report is a holder self-report within the blob's
     // own cohort (v53.0.0, CIRISPersist#942 part 2).
     super::custody_ack::check_custody_ack_admission(directory, row).await?;
+    // CC 3.2 — a `community:listing:v1` row is federation-scoped and signed by
+    // the room's founder or a current moderate-holder (v55.0.0,
+    // CIRISPersist#1053).
+    super::public_room::check_community_listing_admission(directory, row).await?;
 
     // CC 3.1 — a dimension's family stem is lowercase, or it evades every
     // family gate in this file (v42.0.0, CIRISPersist#814, found by review).
@@ -3459,10 +3640,15 @@ pub fn check_session_lease_bound(
             .and_then(serde_json::Value::as_str)
             .and_then(|v| v.parse::<chrono::DateTime<chrono::Utc>>().ok())
             .ok_or_else(|| {
-                Error::InvalidArgument(format!(
-                    "{dimension}: `{member}` is REQUIRED on every session row as a CC 2.6.2 instant \
-                     (CC 3.1.3.1) — a row without it is malformed on this family, not a claim"
-                ))
+                Error::malformed_row(
+                    "attestation",
+                    super::malformed_row::ENVELOPE_MEMBER_MISSING,
+                    format!(
+                        "{dimension}: `{member}` is REQUIRED on every session row as a CC 2.6.2 \
+                         instant (CC 3.1.3.1) — a row without it is malformed on this family, \
+                         not a claim"
+                    ),
+                )
             })
     };
     let claimed_at = instant("claimed_at")?;
@@ -5126,9 +5312,11 @@ pub async fn verify_signed_identity_occurrence(
             .and_then(|v| v.as_str())
             .map(|s| s.to_owned())
             .ok_or_else(|| {
-                Error::InvalidArgument(format!(
-                    "signed identity_occurrence envelope missing string field `{k}`"
-                ))
+                Error::malformed_row(
+                    "identity_occurrence",
+                    super::malformed_row::ENVELOPE_MEMBER_MISSING,
+                    format!("signed identity_occurrence envelope missing string field `{k}`"),
+                )
             })
     };
     // CIRISPersist#851 (BLOB_REPLICATION.md §20.2) — the CONTENT-ONLY form: no
@@ -5168,9 +5356,14 @@ pub async fn verify_signed_identity_occurrence(
     // (2) The typed projection persist will STORE must equal the envelope — the
     // signature only covers the envelope, so a divergent projection is a MITM.
     let diverges = |what: &str| {
-        Error::InvalidArgument(format!(
-            "signed identity_occurrence: typed {what} diverges from the signed envelope (rejected)"
-        ))
+        Error::malformed_row(
+            "identity_occurrence",
+            super::malformed_row::TYPED_DIVERGES_FROM_ENVELOPE,
+            format!(
+                "signed identity_occurrence: typed {what} diverges from the signed envelope \
+                 (rejected)"
+            ),
+        )
     };
     if str_field(env, "identity_key_id")? != row.identity_key_id {
         return Err(diverges("identity_key_id"));
@@ -5238,7 +5431,11 @@ pub async fn verify_signed_identity_occurrence(
         signature: signed.signature.clone(),
     };
     let verdict = verify_transport_binding(&binding, &key_directory).map_err(|e| {
-        Error::InvalidArgument(format!("signed identity_occurrence canonicalize: {e}"))
+        Error::malformed_row(
+            "identity_occurrence",
+            super::malformed_row::ENVELOPE_NOT_CANONICAL,
+            format!("signed identity_occurrence canonicalize: {e}"),
+        )
     })?;
     if !verdict.authentic {
         return Err(Error::SignatureInvalid(format!(
@@ -5297,23 +5494,31 @@ async fn verify_content_only_identity_occurrence(
             .and_then(|v| v.as_str())
             .map(|s| s.to_owned())
             .ok_or_else(|| {
-                Error::InvalidArgument(format!(
-                    "signed identity_occurrence envelope missing string field `{k}`"
-                ))
+                Error::malformed_row(
+                    "identity_occurrence",
+                    super::malformed_row::ENVELOPE_MEMBER_MISSING,
+                    format!("signed identity_occurrence envelope missing string field `{k}`"),
+                )
             })
     };
     let diverges = |what: &str| {
-        Error::InvalidArgument(format!(
-            "signed identity_occurrence: typed {what} diverges from the signed envelope (rejected)"
-        ))
+        Error::malformed_row(
+            "identity_occurrence",
+            super::malformed_row::TYPED_DIVERGES_FROM_ENVELOPE,
+            format!(
+                "signed identity_occurrence: typed {what} diverges from the signed envelope \
+                 (rejected)"
+            ),
+        )
     };
     // (1) The envelope must carry the content-KEM pubkeys — a content-only
     // occurrence with neither transport nor keys binds nothing.
     let Some(enc) = env.get("encryption_pubkeys").filter(|e| !e.is_null()) else {
-        return Err(Error::InvalidArgument(
+        return Err(Error::malformed_row(
+            "identity_occurrence",
+            super::malformed_row::ENVELOPE_MEMBER_MISSING,
             "signed identity_occurrence must carry a transport_destination (occurrence-KEX \
-             #418) or encryption_pubkeys (content-only, CIRISPersist#851)"
-                .into(),
+             #418) or encryption_pubkeys (content-only, CIRISPersist#851)",
         ));
     };
     let env_enc = (
@@ -5403,7 +5608,11 @@ async fn verify_content_only_identity_occurrence(
         ));
     };
     let bytes = crate::verify::canonical::ceg_produce_canonicalize(env).map_err(|e| {
-        Error::InvalidArgument(format!("signed identity_occurrence canonicalize: {e}"))
+        Error::malformed_row(
+            "identity_occurrence",
+            super::malformed_row::ENVELOPE_NOT_CANONICAL,
+            format!("signed identity_occurrence canonicalize: {e}"),
+        )
     })?;
     let members = [ThresholdMember {
         member_id: signer_key.key_id.clone(),
@@ -5534,9 +5743,13 @@ pub async fn verify_signed_identity_occurrence_revocation(
             .and_then(|v| v.as_str())
             .map(|s| s.to_owned())
             .ok_or_else(|| {
-                Error::InvalidArgument(format!(
-                    "signed identity_occurrence_revocation envelope missing string field `{k}`"
-                ))
+                Error::malformed_row(
+                    "identity_occurrence_revocation",
+                    super::malformed_row::ENVELOPE_MEMBER_MISSING,
+                    format!(
+                        "signed identity_occurrence_revocation envelope missing string field `{k}`"
+                    ),
+                )
             })
     };
     let ts_field = |k: &str| -> Result<chrono::DateTime<chrono::Utc>, Error> {
@@ -5544,16 +5757,24 @@ pub async fn verify_signed_identity_occurrence_revocation(
         chrono::DateTime::parse_from_rfc3339(&s)
             .map(|t| t.with_timezone(&chrono::Utc))
             .map_err(|e| {
-                Error::InvalidArgument(format!(
-                    "signed identity_occurrence_revocation envelope `{k}` not RFC-3339: {e}"
-                ))
+                Error::malformed_row(
+                    "identity_occurrence_revocation",
+                    super::malformed_row::ENVELOPE_MEMBER_INVALID,
+                    format!(
+                        "signed identity_occurrence_revocation envelope `{k}` not RFC-3339: {e}"
+                    ),
+                )
             })
     };
     let diverges = |what: &str| {
-        Error::InvalidArgument(format!(
-            "signed identity_occurrence_revocation: typed {what} diverges from the signed \
-             envelope (rejected)"
-        ))
+        Error::malformed_row(
+            "identity_occurrence_revocation",
+            super::malformed_row::TYPED_DIVERGES_FROM_ENVELOPE,
+            format!(
+                "signed identity_occurrence_revocation: typed {what} diverges from the signed \
+                 envelope (rejected)"
+            ),
+        )
     };
     if str_field("identity_key_id")? != row.identity_key_id {
         return Err(diverges("identity_key_id"));
@@ -5585,9 +5806,11 @@ pub async fn verify_signed_identity_occurrence_revocation(
         ));
     };
     let bytes = crate::verify::canonical::ceg_produce_canonicalize(env).map_err(|e| {
-        Error::InvalidArgument(format!(
-            "signed identity_occurrence_revocation canonicalize: {e}"
-        ))
+        Error::malformed_row(
+            "identity_occurrence_revocation",
+            super::malformed_row::ENVELOPE_NOT_CANONICAL,
+            format!("signed identity_occurrence_revocation canonicalize: {e}"),
+        )
     })?;
     let members = [ThresholdMember {
         member_id: signer_key.key_id.clone(),
@@ -5667,18 +5890,22 @@ pub async fn verify_signed_transport_destination(
             .and_then(|v| v.as_str())
             .map(|s| s.to_owned())
             .ok_or_else(|| {
-                Error::InvalidArgument(format!(
-                    "signed transport_destination envelope missing string field `{k}`"
-                ))
+                Error::malformed_row(
+                    "transport_destination",
+                    super::malformed_row::ENVELOPE_MEMBER_MISSING,
+                    format!("signed transport_destination envelope missing string field `{k}`"),
+                )
             })
     };
     let parse_ts = |k: &str, s: &str| -> Result<chrono::DateTime<chrono::Utc>, Error> {
         chrono::DateTime::parse_from_rfc3339(s)
             .map(|t| t.with_timezone(&chrono::Utc))
             .map_err(|e| {
-                Error::InvalidArgument(format!(
-                    "signed transport_destination envelope `{k}` not RFC-3339: {e}"
-                ))
+                Error::malformed_row(
+                    "transport_destination",
+                    super::malformed_row::ENVELOPE_MEMBER_INVALID,
+                    format!("signed transport_destination envelope `{k}` not RFC-3339: {e}"),
+                )
             })
     };
     // Optional string field: absent/null ⇒ None; a non-string is malformed.
@@ -5686,16 +5913,22 @@ pub async fn verify_signed_transport_destination(
         match env.get(k) {
             None | Some(serde_json::Value::Null) => Ok(None),
             Some(serde_json::Value::String(s)) => Ok(Some(s.clone())),
-            Some(_) => Err(Error::InvalidArgument(format!(
-                "signed transport_destination envelope `{k}` must be a string"
-            ))),
+            Some(_) => Err(Error::malformed_row(
+                "transport_destination",
+                super::malformed_row::ENVELOPE_MEMBER_INVALID,
+                format!("signed transport_destination envelope `{k}` must be a string"),
+            )),
         }
     };
     let diverges = |what: &str| {
-        Error::InvalidArgument(format!(
-            "signed transport_destination: typed {what} diverges from the signed envelope \
-             (rejected)"
-        ))
+        Error::malformed_row(
+            "transport_destination",
+            super::malformed_row::TYPED_DIVERGES_FROM_ENVELOPE,
+            format!(
+                "signed transport_destination: typed {what} diverges from the signed envelope \
+                 (rejected)"
+            ),
+        )
     };
     if str_field("occurrence_key_id")? != row.occurrence_key_id {
         return Err(diverges("occurrence_key_id"));
@@ -5712,8 +5945,10 @@ pub async fn verify_signed_transport_destination(
     // `epoch` is the anti-rollback clock — REQUIRED in the envelope (a
     // serde-default 0 in the typed projection must not be silently trusted).
     let env_epoch = env.get("epoch").and_then(|v| v.as_u64()).ok_or_else(|| {
-        Error::InvalidArgument(
-            "signed transport_destination envelope missing unsigned-integer field `epoch`".into(),
+        Error::malformed_row(
+            "transport_destination",
+            super::malformed_row::ENVELOPE_MEMBER_MISSING,
+            "signed transport_destination envelope missing unsigned-integer field `epoch`",
         )
     })?;
     if env_epoch != row.epoch {
@@ -5760,7 +5995,11 @@ pub async fn verify_signed_transport_destination(
         ));
     };
     let bytes = crate::verify::canonical::ceg_produce_canonicalize(env).map_err(|e| {
-        Error::InvalidArgument(format!("signed transport_destination canonicalize: {e}"))
+        Error::malformed_row(
+            "transport_destination",
+            super::malformed_row::ENVELOPE_NOT_CANONICAL,
+            format!("signed transport_destination canonicalize: {e}"),
+        )
     })?;
     let members = [ThresholdMember {
         member_id: signer_key.key_id.clone(),
@@ -5928,15 +6167,20 @@ pub fn local_row_instant(
         Some(serde_json::Value::String(s)) => chrono::DateTime::parse_from_rfc3339(s)
             .map(|t| t.with_timezone(&chrono::Utc))
             .map_err(|e| {
-                Error::InvalidArgument(format!(
-                    "local attestation envelope `asserted_at` is not RFC-3339: {e} \
-                     (CIRISPersist#598)"
-                ))
+                Error::malformed_row(
+                    "attestation",
+                    super::malformed_row::ENVELOPE_MEMBER_INVALID,
+                    format!(
+                        "local attestation envelope `asserted_at` is not RFC-3339: {e} \
+                         (CIRISPersist#598)"
+                    ),
+                )
             }),
-        Some(_) => Err(Error::InvalidArgument(
+        Some(_) => Err(Error::malformed_row(
+            "attestation",
+            super::malformed_row::ENVELOPE_MEMBER_INVALID,
             "local attestation envelope `asserted_at` must be an RFC-3339 string or absent \
-             (CIRISPersist#598)"
-                .into(),
+             (CIRISPersist#598)",
         )),
     }
 }
@@ -6046,11 +6290,15 @@ pub fn check_instant_binding(
         chrono::DateTime::parse_from_rfc3339(s)
             .map(|t| t.with_timezone(&chrono::Utc))
             .map_err(|e| {
-                Error::InvalidArgument(format!(
-                    "attestation {}: signed envelope `{key}` is not RFC-3339: {e} \
-                     (CIRISPersist#598)",
-                    row.attestation_id
-                ))
+                Error::malformed_row(
+                    "attestation",
+                    super::malformed_row::ENVELOPE_MEMBER_INVALID,
+                    format!(
+                        "attestation {}: signed envelope `{key}` is not RFC-3339: {e} \
+                         (CIRISPersist#598)",
+                        row.attestation_id
+                    ),
+                )
             })
     };
     let on_resolution = |key: &str, t: chrono::DateTime<chrono::Utc>| -> Result<(), Error> {
@@ -6058,37 +6306,49 @@ pub fn check_instant_binding(
         if t.nanosecond() % CONSENT_INSTANT_RESOLUTION_NANOS == 0 {
             return Ok(());
         }
-        Err(Error::InvalidArgument(format!(
-            "attestation {}: `{key}` = {} carries sub-microsecond precision, which \
-             postgres TIMESTAMPTZ cannot store — the same op sequence would be a strict order \
-             on sqlite/memory and a TIE on postgres. Truncate to microseconds at the producer \
-             (CIRISPersist#598)",
-            row.attestation_id,
-            t.to_rfc3339(),
-        )))
+        Err(Error::malformed_row(
+            "attestation",
+            super::malformed_row::ENVELOPE_MEMBER_INVALID,
+            format!(
+                "attestation {}: `{key}` = {} carries sub-microsecond precision, which \
+                 postgres TIMESTAMPTZ cannot store — the same op sequence would be a strict order \
+                 on sqlite/memory and a TIE on postgres. Truncate to microseconds at the producer \
+                 (CIRISPersist#598)",
+                row.attestation_id,
+                t.to_rfc3339(),
+            ),
+        ))
     };
 
     // (1) asserted_at — REQUIRED, and the row column must equal it.
     let Some(serde_json::Value::String(env_asserted)) = env.get(paths::ASSERTED_AT) else {
-        return Err(Error::InvalidArgument(format!(
-            "attestation {} carries no signed `{}` string in its envelope. Folds pick a \
-             winner by the `asserted_at` COLUMN, which no signature covers — an unbound \
-             row is a replay waiting to happen, so it is REFUSED (no legacy regime; \
-             CIRISPersist#598)",
-            row.attestation_id,
-            paths::ASSERTED_AT,
-        )));
+        return Err(Error::malformed_row(
+            "attestation",
+            super::malformed_row::ENVELOPE_MEMBER_MISSING,
+            format!(
+                "attestation {} carries no signed `{}` string in its envelope. Folds pick a \
+                 winner by the `asserted_at` COLUMN, which no signature covers — an unbound \
+                 row is a replay waiting to happen, so it is REFUSED (no legacy regime; \
+                 CIRISPersist#598)",
+                row.attestation_id,
+                paths::ASSERTED_AT,
+            ),
+        ));
     };
     let env_asserted = parse(paths::ASSERTED_AT, env_asserted)?;
     if env_asserted != row.asserted_at {
-        return Err(Error::InvalidArgument(format!(
-            "attestation {}: typed `asserted_at` {} diverges from the signed envelope's \
-             {} (rejected — the column decides which claim wins, so it may not differ \
-             from the signed instant; CIRISPersist#598)",
-            row.attestation_id,
-            row.asserted_at.to_rfc3339(),
-            env_asserted.to_rfc3339(),
-        )));
+        return Err(Error::malformed_row(
+            "attestation",
+            super::malformed_row::TYPED_DIVERGES_FROM_ENVELOPE,
+            format!(
+                "attestation {}: typed `asserted_at` {} diverges from the signed envelope's \
+                 {} (rejected — the column decides which claim wins, so it may not differ \
+                 from the signed instant; CIRISPersist#598)",
+                row.attestation_id,
+                row.asserted_at.to_rfc3339(),
+                env_asserted.to_rfc3339(),
+            ),
+        ));
     }
     on_resolution(paths::ASSERTED_AT, row.asserted_at)?;
 
@@ -6097,23 +6357,31 @@ pub fn check_instant_binding(
         None | Some(serde_json::Value::Null) => None,
         Some(serde_json::Value::String(s)) => Some(parse(paths::EXPIRES_AT, s)?),
         Some(_) => {
-            return Err(Error::InvalidArgument(format!(
-                "attestation {}: signed envelope `{}` must be an RFC-3339 string or absent \
-                 (CIRISPersist#598)",
-                row.attestation_id,
-                paths::EXPIRES_AT,
-            )))
+            return Err(Error::malformed_row(
+                "attestation",
+                super::malformed_row::ENVELOPE_MEMBER_INVALID,
+                format!(
+                    "attestation {}: signed envelope `{}` must be an RFC-3339 string or absent \
+                     (CIRISPersist#598)",
+                    row.attestation_id,
+                    paths::EXPIRES_AT,
+                ),
+            ))
         }
     };
     if env_expires != row.expires_at {
-        return Err(Error::InvalidArgument(format!(
-            "attestation {}: typed `expires_at` {:?} diverges from the signed envelope's \
-             {:?} (rejected — folds DROP an expired row, so an unsigned expiry is an \
-             unsigned mute button on whatever the row retracts; CIRISPersist#598)",
-            row.attestation_id,
-            row.expires_at.map(|t| t.to_rfc3339()),
-            env_expires.map(|t| t.to_rfc3339()),
-        )));
+        return Err(Error::malformed_row(
+            "attestation",
+            super::malformed_row::TYPED_DIVERGES_FROM_ENVELOPE,
+            format!(
+                "attestation {}: typed `expires_at` {:?} diverges from the signed envelope's \
+                 {:?} (rejected — folds DROP an expired row, so an unsigned expiry is an \
+                 unsigned mute button on whatever the row retracts; CIRISPersist#598)",
+                row.attestation_id,
+                row.expires_at.map(|t| t.to_rfc3339()),
+                env_expires.map(|t| t.to_rfc3339()),
+            ),
+        ));
     }
     if let Some(exp) = row.expires_at {
         on_resolution(paths::EXPIRES_AT, exp)?;
@@ -6233,40 +6501,52 @@ pub fn check_row_column_binding(row: &super::Attestation) -> Result<(), Error> {
         // from — and `RowMirror` is `deny_unknown_fields` with only
         // `subject_key_ids` / `weight` defaulted, so a five-member mirror is
         // refused again by the very message that specified it.
-        return Err(Error::InvalidArgument(format!(
-            "attestation {} carries no signed `{}` object in its envelope. The signature covers \
-             `attestation_envelope` and NOTHING ELSE, so `attestation_id` (the row's identity), \
-             `attesting_key_id` (who made the claim), `attestation_type` (the verb), \
-             `subject_key_ids` (which grants revocation authority), `attested_key_id`, \
-             `cohort_scope` and `weight` were unsigned columns a relay could rewrite while the \
-             signature still verified. The mirror's members are exactly {:?} — all seven, \
-             REQUIRED except `subject_key_ids` (defaults to empty) and `weight` (absent ⇔ the \
-             column is NULL), and no others (the member set is closed). An unbound row is \
-             REFUSED (no legacy regime; CIRISPersist#643)",
-            row.attestation_id,
-            paths::ROW,
-            ROW_MIRROR_MEMBERS,
-        )));
+        return Err(Error::malformed_row(
+            "attestation",
+            super::malformed_row::ENVELOPE_MEMBER_MISSING,
+            format!(
+                "attestation {} carries no signed `{}` object in its envelope. The signature \
+                 covers `attestation_envelope` and NOTHING ELSE, so `attestation_id` (the row's identity), \
+                 `attesting_key_id` (who made the claim), `attestation_type` (the verb), \
+                 `subject_key_ids` (which grants revocation authority), `attested_key_id`, \
+                 `cohort_scope` and `weight` were unsigned columns a relay could rewrite while the \
+                 signature still verified. The mirror's members are exactly {:?} — all seven, \
+                 REQUIRED except `subject_key_ids` (defaults to empty) and `weight` (absent ⇔ the \
+                 column is NULL), and no others (the member set is closed). An unbound row is \
+                 REFUSED (no legacy regime; CIRISPersist#643)",
+                row.attestation_id,
+                paths::ROW,
+                ROW_MIRROR_MEMBERS,
+            ),
+        ));
     };
     let mirror: RowMirror = serde_json::from_value(raw.clone()).map_err(|e| {
-        Error::InvalidArgument(format!(
-            "attestation {}: signed envelope `{}` is not a well-formed typed-column mirror: {e} \
-             (members are exactly {:?} — all seven, and no others; CIRISPersist#643)",
-            row.attestation_id,
-            paths::ROW,
-            ROW_MIRROR_MEMBERS,
-        ))
+        Error::malformed_row(
+            "attestation",
+            super::malformed_row::ENVELOPE_MEMBER_INVALID,
+            format!(
+                "attestation {}: signed envelope `{}` is not a well-formed typed-column \
+                 mirror: {e} (members are exactly {:?} — all seven, and no others; CIRISPersist#643)",
+                row.attestation_id,
+                paths::ROW,
+                ROW_MIRROR_MEMBERS,
+            ),
+        )
     })?;
 
     // THE typed projection — ONE definition, shared with the stamp side.
     let expected = RowMirror::of(row)?;
 
     let diverges = |member: &str, typed: String, signed: String| {
-        Error::InvalidArgument(format!(
-            "attestation {}: typed `{member}` {typed} diverges from the signed envelope's \
-             {signed} (rejected — CIRISPersist#643)",
-            row.attestation_id,
-        ))
+        Error::malformed_row(
+            "attestation",
+            super::malformed_row::TYPED_DIVERGES_FROM_ENVELOPE,
+            format!(
+                "attestation {}: typed `{member}` {typed} diverges from the signed envelope's \
+                 {signed} (rejected — CIRISPersist#643)",
+                row.attestation_id,
+            ),
+        )
     };
 
     // THE ROW'S IDENTITY. First, because it is what makes a REPLAY of an
@@ -6337,13 +6617,17 @@ pub fn check_row_column_binding(row: &super::Attestation) -> Result<(), Error> {
     let mirror_weight = match &mirror.weight {
         None => None,
         Some(n) => Some(n.as_f64().ok_or_else(|| {
-            Error::InvalidArgument(format!(
-                "attestation {}: signed envelope `{}.{}` {n} is not a finite JSON number \
-                 (CIRISPersist#643)",
-                row.attestation_id,
-                paths::ROW,
-                row_paths::WEIGHT,
-            ))
+            Error::malformed_row(
+                "attestation",
+                super::malformed_row::ENVELOPE_MEMBER_INVALID,
+                format!(
+                    "attestation {}: signed envelope `{}.{}` {n} is not a finite JSON number \
+                     (CIRISPersist#643)",
+                    row.attestation_id,
+                    paths::ROW,
+                    row_paths::WEIGHT,
+                ),
+            )
         })?),
     };
     if mirror_weight != row.weight {
@@ -6552,15 +6836,21 @@ pub async fn verify_signed_touch_claim(
             .and_then(|v| v.as_str())
             .map(|s| s.to_owned())
             .ok_or_else(|| {
-                Error::InvalidArgument(format!(
-                    "signed touch_claim envelope missing string field `{k}`"
-                ))
+                Error::malformed_row(
+                    "touch_claim",
+                    super::malformed_row::ENVELOPE_MEMBER_MISSING,
+                    format!("signed touch_claim envelope missing string field `{k}`"),
+                )
             })
     };
     let diverges = |what: &str| {
-        Error::InvalidArgument(format!(
-            "signed touch_claim: typed {what} diverges from the signed envelope (rejected)"
-        ))
+        Error::malformed_row(
+            "touch_claim",
+            super::malformed_row::TYPED_DIVERGES_FROM_ENVELOPE,
+            format!(
+                "signed touch_claim: typed {what} diverges from the signed envelope (rejected)"
+            ),
+        )
     };
     if str_field("target_key_id")? != claim.target_key_id {
         return Err(diverges("target_key_id"));
@@ -6572,9 +6862,11 @@ pub async fn verify_signed_touch_claim(
     let env_fresh_as_of = chrono::DateTime::parse_from_rfc3339(&env_fresh_str)
         .map(|t| t.with_timezone(&chrono::Utc))
         .map_err(|e| {
-            Error::InvalidArgument(format!(
-                "signed touch_claim envelope `fresh_as_of` not RFC-3339: {e}"
-            ))
+            Error::malformed_row(
+                "touch_claim",
+                super::malformed_row::ENVELOPE_MEMBER_INVALID,
+                format!("signed touch_claim envelope `fresh_as_of` not RFC-3339: {e}"),
+            )
         })?;
     if env_fresh_as_of != claim.fresh_as_of {
         return Err(diverges("fresh_as_of"));
@@ -6613,8 +6905,13 @@ pub async fn verify_signed_touch_claim(
         }
         e
     };
-    let bytes = crate::verify::canonical::ceg_produce_canonicalize(&sig_env)
-        .map_err(|e| Error::InvalidArgument(format!("signed touch_claim canonicalize: {e}")))?;
+    let bytes = crate::verify::canonical::ceg_produce_canonicalize(&sig_env).map_err(|e| {
+        Error::malformed_row(
+            "touch_claim",
+            super::malformed_row::ENVELOPE_NOT_CANONICAL,
+            format!("signed touch_claim canonicalize: {e}"),
+        )
+    })?;
     let members = [ThresholdMember {
         member_id: signer_key.key_id.clone(),
         ed25519_public_key_base64: signer_key.pubkey_ed25519_base64.clone(),
@@ -6674,11 +6971,16 @@ pub async fn verify_signed_touch_claim(
                  co-signature set in the signed envelope"
             ))
         })?;
-        let cosigs: Vec<ThresholdSignature> = serde_json::from_value(cosigs_val.clone())
-            .map_err(|e| {
-                Error::InvalidArgument(format!(
-                    "signed touch_claim: `{TOUCH_COSIGNATURES_FIELD}` is not a threshold-signature array: {e}"
-                ))
+        let cosigs: Vec<ThresholdSignature> =
+            serde_json::from_value(cosigs_val.clone()).map_err(|e| {
+                Error::malformed_row(
+                    "touch_claim",
+                    super::malformed_row::ENVELOPE_MEMBER_INVALID,
+                    format!(
+                        "signed touch_claim: `{TOUCH_COSIGNATURES_FIELD}` is not a \
+                         threshold-signature array: {e}"
+                    ),
+                )
             })?;
         // Distinct + independent-of-target signer set, primary included.
         let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
@@ -7453,7 +7755,7 @@ impl DelegationWalkPolicy {
 /// the siblings model §6.1 self-retraction only, and narrowing this fold to
 /// that would drop the subject and proxy revocations it exists to see.
 /// `withdraws_admission_rule` is `None` for several distinct reasons (deferred,
-/// malformed, non-`withdraws`, `holds_bytes` target), so it is used only as an
+/// malformed, non-`withdraws`, a retired carrier target), so it is used only as an
 /// admitting arm and never as the sole test.
 /// v36.0.0 (CIRISPersist#686) — delegates to the CONSOLIDATED fold
 /// [`crate::federation::precedence::retired_ids`]. This fold contributed the
@@ -8820,32 +9122,18 @@ pub async fn owner_granters_in_force_at(
 ///
 /// # Scope — CONSENT-revocation withdraws ONLY (v6.4.0 regression fix)
 ///
-/// CEG §3.2.3 broadens the authority basis for **consent**-revocation.
-/// It is NOT the only authority basis for a `withdraws`. The substrate
-/// emits `withdraws` on several SEPARATELY-authorized paths whose target
-/// `T` is a `holds_bytes:sha256:*` **content-location directory entry**,
-/// not a consent-bearing Contribution:
+/// CEG §3.2.3 broadens the authority basis for **consent**-revocation. It is
+/// not the only authority basis for a `withdraws`: a host retracting its OWN
+/// holding claim (`evict_actor`, the sweeper, an epoch eviction) is rule 1,
+/// the producer's own retraction.
 ///
-/// - **takedown** ([`crate::cirisnode::takedown_handler`]) — a
-///   moderation/operator key (already authorized by the takedown path)
-///   withdraws each holder's `holds_bytes` row.
-/// - **Policy-J age-gate** — same handler, age-assurance composition.
-/// - **`evict_actor` / sweeper** ([`crate::federation::blobs`],
-///   `engine.rs`) — a host self-attests it no longer holds the bytes.
-///
-/// These are content-location retractions, not consent revocations;
-/// their authority is established upstream of persist (the moderation
-/// path / the host's own self-attestation). The consent gate would
-/// wrongly reject a moderation key withdrawing a third-party holder's
-/// `holds_bytes` row (issuer ≠ holder, no subjects, no delegation), so
-/// the gate is **scoped to NON-`holds_bytes` targets**: a `withdraws`
-/// whose target `T.attestation_type` begins with
-/// [`crate::federation::blobs::HOLDS_BYTES_ATTESTATION_TYPE_PREFIX`]
-/// bypasses the consent rules entirely (`Ok(None)`). Genuine consent
-/// withdraws target a consent-bearing Contribution (a `scores` /
-/// content attestation that may carry `subject_key_ids`), never a
-/// `holds_bytes` directory row — so the 4-rule gate still fully applies
-/// to them.
+/// v55.0.0 (CIRISPersist#989, CC 3.1.3.3 rule 4) — the v6.4.0 carve-out that
+/// let a `withdraws` against a `holds_bytes:sha256:*` row bypass the consent
+/// rules (so a moderation key could withdraw a third party's claim on the
+/// takedown path) is gone with the carrier. A holding claim is
+/// `custody:ack:v1` and is retracted by its signer alone
+/// ([`custody_ack::check_custody_withdraws_signer`](super::custody_ack::check_custody_withdraws_signer));
+/// a takedown is the CC 2.3 tombstone path.
 pub async fn check_withdraws_admission(
     directory: &dyn super::FederationDirectory,
     row: &super::Attestation,
@@ -8909,6 +9197,15 @@ pub async fn check_withdraws_admission_at(
         let Some(target) = directory.get_attestation(target_id).await? else {
             return Ok(None);
         };
+        // v55.0.0 (#989, CC 3.3.2 rc7) — "a `withdraws` or `recants` naming a
+        // `key_grant` row is refused", the sealer's own recants included: once
+        // shared, always shared; forward secrecy is by rotation.
+        if crate::federation::key_grant::is_key_grant_row(&target) {
+            return Err(Error::InvalidArgument(format!(
+                "recants names a key_grant row ({target_id}) — a shared key cannot be \
+                 retroactively un-shared (CC 3.3.2); rotate the epoch instead"
+            )));
+        }
         if !crate::federation::precedence::retraction_entitled(row, &target) {
             return Err(Error::InvalidArgument(format!(
                 "recants_not_admitted: {} is not the attester of {target_id} — only the original \
@@ -8941,9 +9238,7 @@ pub async fn check_withdraws_admission_at(
             .attestation_envelope
             .get("references_attestation_type")
             .and_then(|v| v.as_str())
-            .is_some_and(|t| {
-                t.starts_with(crate::federation::key_grant::KEY_GRANT_ATTESTATION_TYPE_PREFIX)
-            })
+            .is_some_and(crate::federation::key_grant::is_retired_key_grant_set_type)
         {
             return Err(Error::InvalidArgument(
                 "withdraws declares a key_grant target — a shared key cannot be retroactively \
@@ -8961,47 +9256,25 @@ pub async fn check_withdraws_admission_at(
     // and that nothing enforces (the fail-silent class). The honest verdict
     // is at the gate. Forward secrecy on this axis is ROTATION (§15): bump
     // the epoch, and the next seal is unreadable to the removed party.
-    if target
-        .attestation_type
-        .starts_with(crate::federation::key_grant::KEY_GRANT_ATTESTATION_TYPE_PREFIX)
+    // v55.0.0 (#989, CC 3.3.2 rc7) — the per-recipient `scores` row on
+    // `key_grant:{axis}:v1` ("a `withdraws` or `recants` naming a `key_grant`
+    // row is refused"), and a held retired SET alike.
+    if crate::federation::key_grant::is_key_grant_row(&target)
+        || crate::federation::key_grant::is_retired_key_grant_set_type(&target.attestation_type)
     {
         return Err(Error::InvalidArgument(format!(
             "withdraws names a key_grant row ({}) — a shared key cannot be retroactively \
              un-shared (CC 3); rotate the epoch instead (BLOB_REPLICATION.md §15)",
-            target.attestation_type
+            envelope_dimension(&target.attestation_envelope).unwrap_or(&target.attestation_type)
         )));
     }
-    // Scope discriminator: a `holds_bytes:sha256:*` target is a
-    // content-location directory entry whose `withdraws` is emitted by a
-    // separately-authorized moderation / host self-attestation path
-    // (takedown / age-gate / evict_actor / sweeper). The §3.2.3 consent
-    // gate does NOT apply — admit with rule `None` (the moderation path
-    // owns its own authorization).
-    if target
-        .attestation_type
-        .starts_with(crate::federation::blobs::HOLDS_BYTES_ATTESTATION_TYPE_PREFIX)
-    {
-        // v53.1.2 (CIRISPersist#984 row 13) — a holder's claim is retired by
-        // the holder alone, and the fold (`precedence::retraction_entitled`)
-        // never lets a resolved rule retire a carrier. So a non-holder's
-        // `withdraws` that ARRIVES with a `withdraws_admission_rule` stamp —
-        // which this door never resolves for a carrier target, so it can only
-        // be a replicated row's forged claim of entitlement — is refused by
-        // name rather than stored with a stamp nothing honours. An unstamped
-        // non-holder `withdraws` (the takedown handler's and `evict_actor`'s
-        // audit rows, whose authority is the moderation path's) is admitted
-        // with no rule, inert in every fold, exactly as before.
-        if row.attesting_key_id != target.attesting_key_id && row.withdraws_admission_rule.is_some()
-        {
-            return Err(Error::InvalidArgument(format!(
-                "carrier_withdraws_not_the_holder: {} is not the holder {} whose {} claim this \
-                 withdraws names, yet it carries a resolved admission rule — only the holder \
-                 retracts its own claim; a takedown is the CC 2.3 tombstone path (#984 row 13)",
-                row.attesting_key_id, target.attesting_key_id, target.attestation_type
-            )));
-        }
-        return Ok(None);
-    }
+    // v55.0.0 (CIRISPersist#989, CC 3.1.3.3 rule 4) — a holding claim
+    // (`custody:ack:v1`) is retracted by its signer alone: "nobody withdraws
+    // another device's report, and a takedown is the CC 2.3 tombstone path,
+    // not a withdrawal of holders". The retired `holds_bytes` carve-out that
+    // let a moderation key withdraw a third party's claim is gone with the
+    // carrier; a holder's own retraction falls through to rule 1 below.
+    super::custody_ack::check_custody_withdraws_signer(row, &target)?;
     // v25.x (CIRISPersist#578, CIRISConstitution rc3 CC 3.2) — **the recovery
     // gate, in BOTH directions.**
     //
@@ -13619,6 +13892,8 @@ pub async fn check_infrastructure_founder_count_unchanged(
 /// conformance checks over a whole community record, for the record doors
 /// (`put_community`, the supersede door): a founder exists, then the protocol
 /// and its `N` (they read nothing), then the founders' node-bearing.
+/// v55.0.0 (CIRISPersist#1053) — then the `public` room's conformance
+/// ([`public_room::check_public_room_conformance`](super::public_room::check_public_room_conformance)).
 pub async fn check_infrastructure_community_conformance(
     directory: &dyn super::FederationDirectory,
     community: &super::Community,
@@ -13638,7 +13913,10 @@ pub async fn check_infrastructure_community_conformance(
         });
     }
     check_infrastructure_consensus_protocol(community)?;
-    check_infrastructure_founders_not_node(directory, community, chrono::Utc::now()).await
+    check_infrastructure_founders_not_node(directory, community, chrono::Utc::now()).await?;
+    // v55.0.0 (CIRISPersist#1053, CC 3.2 `public`) — `admission: open` only on
+    // a public room, and no version crosses the `public` boundary.
+    super::public_room::check_public_room_conformance(directory, community).await
 }
 
 /// v50.0.0 (CIRISPersist#925/#927, final check) — **a conformant room never
@@ -13666,9 +13944,16 @@ pub async fn check_replicated_supersede_does_not_degrade(
     else {
         return Ok(());
     };
-    if stored.persist_row_hash == super::types::compute_persist_row_hash(offered)?
-        || !is_infrastructure_labeled(&stored)
-    {
+    if stored.persist_row_hash == super::types::compute_persist_row_hash(offered)? {
+        return Ok(());
+    }
+    if !is_infrastructure_labeled(&stored) {
+        // v55.0.0 (CIRISPersist#1053) — a stored public room never degrades
+        // through the replicated door either: the offered version stays on the
+        // public side with a well-formed admission.
+        if super::public_room::is_public_community(&stored) {
+            return super::public_room::check_public_room_conformance(directory, offered).await;
+        }
         return Ok(());
     }
     match check_infrastructure_community_conformance(directory, &stored).await {
@@ -13694,9 +13979,6 @@ pub async fn check_infrastructure_record_admission(
     directory: &dyn super::FederationDirectory,
     community: &super::Community,
 ) -> Result<(), Error> {
-    if !is_infrastructure_labeled(community) {
-        return Ok(());
-    }
     if let Some(stored) = directory
         .lookup_community(&community.community_key_id)
         .await?
@@ -13704,6 +13986,12 @@ pub async fn check_infrastructure_record_admission(
         if stored.persist_row_hash == super::types::compute_persist_row_hash(community)? {
             return Ok(());
         }
+    }
+    if !is_infrastructure_labeled(community) {
+        // v55.0.0 (CIRISPersist#1053, CC 3.2 `public`) — every NEW or CHANGED
+        // room record, infrastructure or not, keeps `admission: open` on the
+        // public side and does not cross the `public` boundary.
+        return super::public_room::check_public_room_conformance(directory, community).await;
     }
     check_infrastructure_community_conformance(directory, community).await
 }
@@ -14896,6 +15184,17 @@ pub async fn duty_holders_for_community(
     named_moderator_holders(directory, community_id, duty).await
 }
 
+/// v55.0.0 (CIRISPersist#1007) — [`named_moderator_holders`] for a caller
+/// that resolved the community from HELD state (the takedown authority
+/// reads it from the content's binding rows, never from a notice).
+pub(crate) async fn community_duty_roots(
+    directory: &dyn super::FederationDirectory,
+    community_id: &str,
+    duty: &str,
+) -> Result<std::collections::HashSet<String>, Error> {
+    named_moderator_holders(directory, community_id, duty).await
+}
+
 /// Materialize the named-moderator AUTHORITY ROOTS for `community_id` /
 /// `duty` into the duty-holder set: each steward-bound member of the
 /// community authority set. (The full `is_named_moderator` relation —
@@ -14974,7 +15273,7 @@ pub async fn check_consent_for_key_admission(
             directory,
             for_key,
             &row.attesting_key_id,
-            chrono::Utc::now(),
+            grant_chain_instant(row),
         )
         .await?
     {
@@ -15032,10 +15331,14 @@ pub fn moderation_subject_digest(
         .and_then(super::key_digest::Sha256Ed25519Raw::parse)
         .map(Some)
         .map_err(|e| {
-            Error::InvalidArgument(format!(
-                "moderation_subject_digest_malformed: `{MODERATION_SUBJECT_DIGEST_ENVELOPE_FIELD}` \
-                 {v}: {e} (CIRISPersist#784)"
-            ))
+            Error::malformed_row(
+                "attestation",
+                super::malformed_row::MODERATION_SUBJECT_DIGEST,
+                format!(
+                    "moderation_subject_digest_malformed: \
+                     `{MODERATION_SUBJECT_DIGEST_ENVELOPE_FIELD}` {v}: {e} (CIRISPersist#784)"
+                ),
+            )
         })
 }
 
@@ -15271,6 +15574,8 @@ pub async fn check_node_agency_admission(
 ///
 /// `owner == issuer` is NOT a reach (no edge carries a scope to the self); the
 /// owner's own issuance is the caller's other arm.
+///
+/// The `now` every grant-issuing door passes is [`grant_chain_instant`].
 pub async fn holds_grant_delegation(
     directory: &dyn super::FederationDirectory,
     owner: &str,
@@ -15296,6 +15601,25 @@ pub async fn holds_grant_delegation(
     )
     .await?
     .hit_target)
+}
+
+/// v55.0.0 (CIRISPersist#989; the seam for CIRISPersist#1049) — **the instant
+/// a grant row's `grant` delegation chain is judged at**: a `key_grant:{axis}`
+/// row's issuer chain ([`holds_grant_delegation`] under
+/// `key_grant::check_sealer`, and the pending projection) and a consent row's
+/// `for_key_id` chain.
+///
+/// Today it is this node's clock, whatever the row: v54.0.0 kept "now"
+/// because judging at the signed `asserted_at` with no past bound lets a
+/// withdrawn delegate backdate a grant into its old window (#1049). The
+/// bound is W = 72 h, refusal `asserted_at_stale`, on CC rc8 (untagged), so
+/// it ships with the rc8 vendor. That cut changes this one function to the
+/// row's `asserted_at` and puts the freshness refusal in front of every
+/// caller; no caller passes its own instant.
+#[must_use]
+pub fn grant_chain_instant(row: &super::Attestation) -> chrono::DateTime<chrono::Utc> {
+    let _ = row;
+    chrono::Utc::now()
 }
 
 /// v54.0.0 (CIRISPersist#1031, CC 4.1.1) — **the cycle-closing `delegates_to`
@@ -16108,8 +16432,13 @@ pub fn check_delivery_mode_vocabulary(envelope: &serde_json::Value) -> Result<()
 /// model this door's stamp to do that, and a second spelling of a projection
 /// that drifts is precisely how #643 and #598 each acquired their defect.
 pub fn check_envelope_size_admission(envelope: &serde_json::Value) -> Result<(), Error> {
-    let canonical = crate::verify::canonical::ceg_produce_canonicalize(envelope)
-        .map_err(|e| Error::InvalidArgument(format!("envelope canonicalize: {e}")))?;
+    let canonical = crate::verify::canonical::ceg_produce_canonicalize(envelope).map_err(|e| {
+        Error::malformed_row(
+            "attestation",
+            super::malformed_row::ENVELOPE_NOT_CANONICAL,
+            format!("envelope canonicalize: {e}"),
+        )
+    })?;
     if canonical.len() > MAX_ATTESTATION_ENVELOPE_BYTES {
         return Err(Error::EnvelopeTooLarge {
             bytes: canonical.len(),
@@ -16321,6 +16650,7 @@ pub async fn check_reserved_prefix_admission(
     }
     if let Some(dim) = envelope_dimension(&row.attestation_envelope) {
         check_namespace_family_registered(dim)?;
+        check_registered_family_not_held(dim)?;
     }
 
     // (CIRISPersist#571) — CC 3.1.7 R2's Private Use range: `x_private:*` MUST
@@ -16341,10 +16671,21 @@ pub async fn check_reserved_prefix_admission(
 
     // CC 3.3.10.1 L1 (CIRISPersist#754) — a `ledger:*` row's declared
     // ledger_id must BE the derivation of its (attested identity, unit,
-    // standard_version) triple. Dormant pre-graduation (R2(b) above refuses
-    // the staged family first) and live the moment CIRISConstitution#92
-    // lands the registry row — the door graduation opens is already gated.
+    // standard_version) triple. Live since the rc7 re-vendor (v55.0.0,
+    // CIRISPersist#753) registered the family and the staging latch went.
     check_ledger_binding_admission(at, &row.attestation_envelope, &row.attested_key_id)?;
+    // And the signer must act for the ledger's owner (CC 3.1.3 table:
+    // "the ledger's single owner … or a delegate").
+    check_ledger_emitter_admission(directory, row).await?;
+
+    // CC 3.3.10 (CIRISPersist#753) — a `settlement:*` row links an action to
+    // its off-stack settlement and carries no payment-processor identifier.
+    check_settlement_admission(row)?;
+
+    // CC 3.3.2 rc7 (CIRISPersist#989) — a `key_grant:{axis}:v1` row is one
+    // wrap to one recipient, sealer-only, at the content's scope; the retired
+    // rc6 SET is refused whatever the row-type switch says.
+    super::key_grant::check_key_grant_row_admission(directory, row).await?;
 
     // v37.0.0 (CIRISPersist#733) — **AN `accord:*` ROW NAMES ITS OWN ACCORD.**
     //
@@ -19263,6 +19604,31 @@ mod tests {
         // identity type expresses. The gate is
         // `custody_ack::check_custody_ack_admission`.
         "custody:",
+        // rc7 re-vendor (v55.0.0, CIRISPersist#753) — the rows carry the CC
+        // 3.1.3 section default `substrate-self-report`; the table cell says
+        // "the ledger's single owner … or a delegate" (CC 3.3.10.1), which no
+        // identity type expresses. Gated by `check_ledger_binding_admission`
+        // and `check_ledger_emitter_admission`.
+        "ledger:",
+        // rc7 re-vendor (v55.0.0, CIRISPersist#753) — the row carries the
+        // section default `substrate-self-report`, but the CC 3.1.3 table marks
+        // it "Reserved? No" and CC 3.3.10 names the payer as the signer, with a
+        // payee counter-attestation on `settlement:received:*`. Open emitter;
+        // the gate is `check_settlement_admission` (no payment-processor
+        // identifier).
+        "settlement:",
+        // v55.0.0 (CIRISPersist#1053, CC 3.2 public rooms) — "founder- or
+        // moderate-holder-signed for the community it names; one live row per
+        // community; federation scope": the rule asks who the room's founders
+        // and moderators ARE, which no identity type expresses. The gate is
+        // `public_room::check_community_listing_admission`; "one live row" is
+        // the read fold `public_room::live_listing`.
+        "community:listing",
+        // rc7 re-vendor (v55.0.0, CIRISPersist#753) — "sealer-only" (CC 3.3.2):
+        // the minter (epoch) or a key that speaks for the owner (content,
+        // stream), which no identity type expresses. The gate is
+        // `key_grant::check_key_grant_row_admission` (CIRISPersist#989).
+        "key_grant:",
     ];
 
     /// Manifest-reserved families persist has **no gate for yet** — a different
@@ -19286,6 +19652,15 @@ mod tests {
         // CC 3.1.1 — owner-signed, self scope only. The server's row
         // (`self:device_label`, renamed); persist has no emitter.
         ("device:label", "CIRISConstitution#137"),
+        // rc7 re-vendor (v55.0.0, CIRISPersist#753). Each was unregistered open
+        // vocabulary in rc6, so nothing admits that did not admit before. The
+        // planes they name are persist's own (the key record, the occurrence,
+        // the revocation, the roster head), held today on their typed tables;
+        // the `scores` rows that carry them, with CC's rule, are #991's.
+        ("key:record", "CIRISPersist#991"),
+        ("key:revocation", "CIRISPersist#991"),
+        ("identity:occurrence", "CIRISPersist#991"),
+        ("group:roster", "CIRISPersist#991"),
     ];
 
     /// **CC 3.1.7 R2(a) — the mint gate.** Every family persist declares itself
@@ -19613,6 +19988,57 @@ mod tests {
                 ),
                 "staged family {stem:?} did not refuse at R2(b)"
             );
+        }
+    }
+
+    /// I702 (CIRISPersist#753) — every held-shut prefix ends on a segment
+    /// boundary, names a tracking issue, and covers a dimension the vendored
+    /// registry RESOLVES (a line whose dimension CC no longer registers holds
+    /// nothing shut and must go); the refusal fires on the registry's own
+    /// sample and spares the neighbours the prefix must not reach.
+    #[test]
+    fn held_dimensions_are_registered_and_tracked() {
+        use crate::federation::namespace::matcher::{match_family, sample_dimension};
+        use crate::federation::namespace::registry;
+        assert!(!REGISTERED_FAMILIES_HELD_SHUT.is_empty());
+        for (prefix, tracked) in REGISTERED_FAMILIES_HELD_SHUT {
+            assert!(prefix.ends_with(':'), "I702 {prefix:?} ends on a boundary");
+            assert!(tracked.contains('#'), "I702 {prefix:?} names its door");
+            let probe = format!("{prefix}v1");
+            let probe = if match_family(&probe).refusal.is_none() {
+                probe
+            } else {
+                registry::entries()
+                    .iter()
+                    .filter_map(|e| sample_dimension(&e.prefix))
+                    .find(|d| d.starts_with(prefix) && match_family(d).refusal.is_none())
+                    .unwrap_or_else(|| {
+                        panic!("I702 {prefix:?} holds nothing the registry resolves — delete it")
+                    })
+            };
+            assert!(
+                matches!(
+                    check_registered_family_not_held(&probe),
+                    Err(Error::DimensionRejected { reason, .. })
+                        if reason == REGISTERED_FAMILY_HELD_SHUT_REASON
+                ),
+                "I702 {probe:?} is held shut"
+            );
+        }
+        for open in [
+            "membership:proposal:v1",
+            "membership:acceptance:v1",
+            "membership:decline:v1",
+            "key:record:v1",
+            "custody:ack:v1",
+            "key_granted:v1",
+            // v55 slice B (#989) built the key-grant row door.
+            "key_grant:epoch:v1",
+            "key_grant:content:v1",
+            "key_grant:stream:v1",
+        ] {
+            check_registered_family_not_held(open)
+                .unwrap_or_else(|e| panic!("I702 {open:?} is not held: {e}"));
         }
     }
 
@@ -20137,12 +20563,12 @@ mod tests {
     // ── #153 Ask 5: structural-invisibility classification ─────────
 
     #[test]
-    fn cohort_scope_suppresses_holds_bytes_only_for_self_and_family() {
+    fn cohort_scope_is_structurally_invisible_only_for_self_and_family() {
         use crate::federation::types::cohort_scope as cs;
-        // self + family are structurally invisible — no holds_bytes.
-        assert!(cs::suppresses_holds_bytes(cs::SELF));
-        assert!(cs::suppresses_holds_bytes(cs::FAMILY));
-        // everything else federates and emits holds_bytes per status quo
+        // self + family are structurally invisible — never discoverable.
+        assert!(cs::is_structurally_invisible(cs::SELF));
+        assert!(cs::is_structurally_invisible(cs::FAMILY));
+        // everything else is not structurally invisible
         // (CEG 0.8 §8.1.13.3 is explicit that community is NOT suppressed).
         for scope in [
             cs::COMMUNITY,
@@ -20152,13 +20578,13 @@ mod tests {
             cs::FEDERATION,
         ] {
             assert!(
-                !cs::suppresses_holds_bytes(scope),
-                "{scope:?} must federate (emit holds_bytes)"
+                !cs::is_structurally_invisible(scope),
+                "{scope:?} must not be structurally invisible"
             );
         }
         // unknown values are not suppressors (they're rejected upstream
         // by is_valid / the admission gate).
-        assert!(!cs::suppresses_holds_bytes("global"));
+        assert!(!cs::is_structurally_invisible("global"));
     }
 
     // ── AV-45 (FSD §4.6): write-path cohort_scope admission gate ────

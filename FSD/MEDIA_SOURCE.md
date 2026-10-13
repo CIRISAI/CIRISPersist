@@ -1,5 +1,14 @@
 # The media Source struct, and size on every claim (CIRISPersist#871)
 
+> **v55.0.0 (CIRISPersist#989, CIRISConstitution#141) — superseded on the
+> holding claim.** Wherever this document says `holds_bytes:sha256:{prefix}`,
+> read the one holding claim: `custody:ack:v1` `here`, placed at the
+> CONTENT's scope (`federation` for Commons-tier content, the bytes' own
+> `self` / `family` / room cohort otherwise), freshness its own `expires_at`
+> (72 h), retracted by its signer alone. `src/federation/holding_claim.rs` is
+> its home. A `holds_bytes` row is a retired carrier: refused at every door,
+> never served, read by no fold.
+
 **Status:** v45.0.0 design. Filed from CIRISEdge's #871 (the persist half of
 CIRISConstitution#104, ruled on rc5: CC 3.3.13 the multimedia Source struct,
 CC 5.3.2.5 size checked first, CC 5.3.2.6 the render tier is receiver

@@ -299,7 +299,7 @@ def test_register_self_then_put_blob_signing_275() -> None:
     `scrub_key_id` the DERIVED federation key_id
     (`derive_key_id(<alias>, <pubkey>)` = `<label>-<fp>`), but
     `register_self_federation_key` kept registering the bare keystore
-    ALIAS — so `put_blob_signing`'s holds_bytes scrub FK pointed at a row
+    ALIAS — so `put_blob_signing`'s holding-claim scrub FK pointed at a row
     that never existed and FK-failed (`blob_attestation_emission_failed`)
     on every persist >= 9.3.0. The fix registers (and returns) the derived
     id. Skips on a non-sqlite wheel."""
@@ -369,16 +369,22 @@ def test_register_self_then_put_blob_signing_275() -> None:
         )
 
         # CIRISPersist#851 §20.5 (operator ruling) — hybrid/PQC only, no
-        # legacy fallback. The commons door's holds_bytes claim ALWAYS carries
+        # legacy fallback. The commons door's holding claim (v55.0.0:
+        # custody:ack:v1 `here` at federation, CIRISPersist#989) ALWAYS carries
         # its PQC half, because an engine without one cannot announce at all:
         # its door refuses before storing anything announced (I80, I83). This
         # engine has a PQC LocalSigner, so the claim must be hybrid. Read back
         # through a host door.
         rows = json.loads(eng.list_attestations_by(kid))
-        claims = [r for r in rows if str(r.get("attestation_type", "")).startswith("holds_bytes:")]
-        assert claims, "the holds_bytes claim is stored under the derived id"
+        claims = [
+            r
+            for r in rows
+            if r.get("attestation_type") == "scores"
+            and (r.get("attestation_envelope") or {}).get("dimension") == "custody:ack:v1"
+        ]
+        assert claims, "the holding claim is stored under the derived id"
         assert all(r.get("scrub_signature_pqc") for r in claims), (
-            "hybrid-only (#851 §20.5): every announced holds_bytes claim carries its "
+            "hybrid-only (#851 §20.5): every announced holding claim carries its "
             "ML-DSA-65 half — a classical claim no peer admits can no longer be produced"
         )
 
@@ -1355,6 +1361,64 @@ def test_ciris_canonical_trust_root_surface_926() -> None:
                     }
                 )
             )
+    finally:
+        eng.close(force=True)
+    ciris_persist.reset_engine()
+
+
+def test_reack_holding_claims_once_is_host_reachable_989() -> None:
+    """v55.0.0 (#989, CC 3.1.3.3 rule 5) — the re-ack pass is reachable from
+    Python and returns its report as JSON. A fresh commons claim is a day
+    younger than the renewal threshold, so one pass renews nothing and finds
+    it fresh; a second pass is the same (idempotent). Skips on a non-sqlite
+    wheel."""
+    import base64
+    import hashlib
+    import json
+    import os
+    import secrets
+    import tempfile
+
+    import pytest
+
+    ciris_persist.reset_engine()
+    d = tempfile.mkdtemp()
+    seed = os.path.join(d, "seed")
+    pqc_seed = os.path.join(d, "pqc.seed")
+    with open(seed, "wb") as fh:
+        fh.write(secrets.token_bytes(32))
+    with open(pqc_seed, "wb") as fh:
+        fh.write(secrets.token_bytes(32))
+    alias = "node-" + secrets.token_hex(8)
+    try:
+        eng = ciris_persist.Engine(
+            "sqlite::memory:",
+            alias,
+            local_key_id=alias,
+            local_key_path=seed,
+            local_pqc_key_id=alias + "-pqc",
+            local_pqc_key_path=pqc_seed,
+        )
+    except ValueError as exc:
+        if "sqlite" in str(exc) and "feature" in str(exc):
+            pytest.skip("wheel built without the sqlite feature")
+        raise
+    try:
+        eng.register_self_federation_key("agent", "ref", None, None, None)
+        body = b"commons bytes " + secrets.token_bytes(8)
+        put = json.loads(
+            eng.put_blob_scoped("federation", base64.b64encode(body).decode(), None, None)
+        )
+        assert put["at_rest_sha256"] == hashlib.sha256(body).hexdigest(), put
+        for _ in range(2):
+            report = json.loads(eng.reack_holding_claims_once())
+            assert set(report) == {
+                "scanned", "renewed", "fresh", "not_held", "not_in_cohort", "failed", "converted",
+                "withheld",
+            }, report
+            assert report["withheld"] == 0, report
+            assert report["scanned"] == 1 and report["fresh"] == 1, report
+            assert report["renewed"] == 0 and report["failed"] == 0, report
     finally:
         eng.close(force=True)
     ciris_persist.reset_engine()

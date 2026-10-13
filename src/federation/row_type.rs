@@ -7,9 +7,12 @@
 //!
 //! CC 2.4 closes the slot: a row's type is one of the five structural types
 //! (`scores`, `delegates_to`, `supersedes`, `withdraws`, `recants`) or a
-//! whole-string, byte-exact match for a registered **carrier**
-//! (`holds_bytes:sha256:{prefix}`, `key_grant:{axis}:v1`); anything else is
-//! refused `attestation_type_unregistered`. The set is read from the vendored
+//! whole-string, byte-exact match for a registered **carrier**; anything else
+//! is refused `attestation_type_unregistered`. rc7 registers no carrier (the
+//! two rc6 carriers became rows on the five, CIRISConstitution#141/#143), so
+//! the slot is the five; the rc6 carriers are retired
+//! ([`registry::RETIRED_CARRIER_STEMS`], v55 slices A and B). The set is read
+//! from the vendored
 //! registry's `_meta.row_types` ([`registry::row_types`],
 //! [`registry::carrier_row_type`]) and from nothing in this tree.
 //!
@@ -33,6 +36,14 @@
 //!   [`row_type_report`]; never deleted. Under `Enforce` the two serve reads
 //!   (`list_attestations_since`, `list_attestation_log`) leave them out
 //!   ([`serve_filter_sql`]).
+//! - **A RETIRED carrier is refused and never served — ENFORCED, whatever
+//!   the mode** (v55.0.0, CIRISPersist#989; [`registry::RETIRED_CARRIER_STEMS`]). The
+//!   Report mode exists for types a host still writes while it moves (the
+//!   Server's `consent` rows); a retired carrier has no emitter left anywhere
+//!   — persist was its only one (CIRISEdge's audit on #975), and persist now
+//!   writes the holding claim — so there is nothing to wait for. A held row
+//!   of one stays stored and reported, "neither served nor replicated, and …
+//!   not deleted" (CC 2.4).
 //!
 //! A later release flips [`ROW_TYPE_ENFORCEMENT`] to `Enforce` — one constant,
 //! fleet-wide, never a per-node setting (two nodes disagreeing about which rows
@@ -96,6 +107,15 @@ pub async fn with_enforcement<F: std::future::Future>(
     fut: F,
 ) -> F::Output {
     ENFORCEMENT_OVERRIDE.scope(mode, fut).await
+}
+
+/// The retired carrier stem `attestation_type` falls under, if any.
+#[must_use]
+pub fn retired_carrier(attestation_type: &str) -> Option<&'static str> {
+    registry::RETIRED_CARRIER_STEMS
+        .iter()
+        .find(|(entry, how, _)| how.matches(entry, attestation_type))
+        .map(|(entry, _, _)| *entry)
 }
 
 /// What the closed slot makes of a row type.
@@ -220,7 +240,8 @@ pub const ATTESTATION_TYPE_UNREGISTERED: &str = "attestation_type_unregistered";
 ///
 /// [`Error::CarrierRowMalformed`] for a carrier of the wrong shape (always);
 /// [`Error::AttestationTypeUnregistered`] for an unregistered type under
-/// [`RowTypeEnforcement::Enforce`].
+/// [`RowTypeEnforcement::Enforce`], and for a RETIRED carrier
+/// ([`registry::RETIRED_CARRIER_STEMS`]) under either mode.
 pub fn check_row_type(row: &Attestation) -> Result<RowTypeClass, Error> {
     let class = classify(&row.attestation_type);
     match class {
@@ -234,7 +255,9 @@ pub fn check_row_type(row: &Attestation) -> Result<RowTypeClass, Error> {
             }
         }
         RowTypeClass::Unregistered => {
-            if enforcement() == RowTypeEnforcement::Enforce {
+            if enforcement() == RowTypeEnforcement::Enforce
+                || retired_carrier(&row.attestation_type).is_some()
+            {
                 return Err(unregistered(&row.attestation_type));
             }
         }
@@ -265,7 +288,9 @@ pub fn admit_row_type(row: &Attestation) -> Result<(), Error> {
 /// [`Error::AttestationTypeUnregistered`] under `Enforce`.
 pub fn admit_local_row_type(attestation_type: &str) -> Result<(), Error> {
     if classify(attestation_type) == RowTypeClass::Unregistered {
-        if enforcement() == RowTypeEnforcement::Enforce {
+        if enforcement() == RowTypeEnforcement::Enforce
+            || retired_carrier(attestation_type).is_some()
+        {
             return Err(unregistered(attestation_type));
         }
         record_unregistered_admission(attestation_type, "(local)");
@@ -470,7 +495,7 @@ pub fn registered_row_type_sql(column: &str, dialect: SqlDialect) -> String {
             .collect::<Vec<_>>()
             .join(", ")
     )];
-    for c in &rt.carriers {
+    for c in registry::carriers() {
         match dialect {
             SqlDialect::Sqlite => {
                 for g in carrier_globs(&c.pattern) {
@@ -489,18 +514,48 @@ pub fn registered_row_type_sql(column: &str, dialect: SqlDialect) -> String {
     format!("({})", arms.join(" OR "))
 }
 
-/// The serve-read filter: `Some(predicate)` under `Enforce` (held rows of an
-/// unregistered type are neither served nor replicated), `None` under
-/// `Report`. Read once per query, on the calling task.
+/// `column` is NOT a retired carrier type ([`registry::RETIRED_CARRIER_STEMS`]), as a
+/// SQL boolean expression both dialects read the same way: a `substr`
+/// comparison for a stem and a whole-string `<>` for an exact entry, never
+/// `LIKE` (whose `_` is a wildcard and whose case rule differs by dialect).
+/// The same split [`retired_carrier`] makes (Codex r2 on #1065).
+#[must_use]
+pub fn not_retired_carrier_sql(column: &str) -> String {
+    let arms: Vec<String> = registry::RETIRED_CARRIER_STEMS
+        .iter()
+        .map(|(entry, how, _)| match how {
+            registry::RetiredMatch::Stem => format!(
+                "substr({column}, 1, {}) <> {}",
+                entry.chars().count(),
+                sql_quote(entry)
+            ),
+            registry::RetiredMatch::Exact => format!("{column} <> {}", sql_quote(entry)),
+        })
+        .collect();
+    format!("({})", arms.join(" AND "))
+}
+
+/// The serve-read filter. Under `Enforce`, `Some(registered)`: held rows of
+/// an unregistered type are neither served nor replicated. Under `Report`,
+/// v55.0.0 (CIRISPersist#989): `Some(not retired)` — a retired carrier is
+/// left out in either mode (CC 2.4: "neither served nor replicated"), every
+/// other unregistered type is served while the mode reports. Read once per
+/// query, on the calling task.
 #[must_use]
 pub fn serve_filter_sql(column: &str, dialect: SqlDialect) -> Option<String> {
-    (enforcement() == RowTypeEnforcement::Enforce).then(|| registered_row_type_sql(column, dialect))
+    Some(match enforcement() {
+        RowTypeEnforcement::Enforce => registered_row_type_sql(column, dialect),
+        RowTypeEnforcement::Report => not_retired_carrier_sql(column),
+    })
 }
 
 /// The memory backend's serve filter: does `row` survive it?
 #[must_use]
 pub fn served_under_enforcement(row: &Attestation) -> bool {
-    enforcement() == RowTypeEnforcement::Report || is_registered(&row.attestation_type)
+    match enforcement() {
+        RowTypeEnforcement::Enforce => is_registered(&row.attestation_type),
+        RowTypeEnforcement::Report => retired_carrier(&row.attestation_type).is_none(),
+    }
 }
 
 // ── the report door ──────────────────────────────────────────────────

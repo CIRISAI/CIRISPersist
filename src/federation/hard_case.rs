@@ -115,6 +115,14 @@ pub mod kind {
     pub const COMMUNITY_LIVENESS_STALLED: &str = "community_liveness_stalled";
     /// v51.0.0 (CIRISPersist#939) — the reverse transition.
     pub const COMMUNITY_LIVENESS_RESTORED: &str = "community_liveness_restored";
+    /// v55.0.0 (CIRISPersist#1007, CC 4.5.3 step 4) — a takedown under an
+    /// immediate-removal basis was executed (or applied from a peer) on this
+    /// node: every fast-path takedown enters the audit trail for downstream
+    /// review, where a `reconsideration:procedural_error` may contest a
+    /// misclassified basis. `target_key_id` = the notice id; `detail` carries
+    /// `content_sha256`, `legal_basis`, `signer`, `origin`. One per notice per
+    /// node (`event_id` derived from the notice id).
+    pub const FAST_PATH_TAKEDOWN: &str = "fast_path_takedown";
 }
 
 /// Named-here canonical `admin_action:{op}` suffixes (CIRISPersist#570). Open

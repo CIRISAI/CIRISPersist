@@ -931,27 +931,37 @@ mod custody {
         assert_eq!(v.tier, "invisible_encrypted");
         assert!(v.held_here);
         // v53.0.0 (CIRISPersist#942 part 2, CC 3.1.3.3) — self/family copies
-        // are counted from custody reports now. With none filed yet, every
-        // device is `unknown` (never a copy, never `none`), and the only copy
-        // counted is this node's own.
+        // are counted from custody reports. v55.0.0 (CIRISPersist#989): the
+        // write files the writing device's own holding claim at `self`, so
+        // node A is `here`; every other device, with no report, is `unknown`
+        // (never a copy, never `none`), and the one copy counted is A's.
         assert!(
             v.copies_observable,
             "self/family copies are observable through custody reports: {v:?}"
         );
         assert_eq!(
             v.copies_known, 1,
-            "only this node's own copy, before any report: {v:?}"
+            "only this node's own copy, before any other report: {v:?}"
         );
         assert!(
-            v.device_custody
-                .iter()
-                .all(|d| d.state == crate::federation::custody_ack::CustodyVerdict::Unknown),
-            "no report filed: every device is unknown: {v:?}"
+            v.device_custody.iter().all(|d| {
+                use crate::federation::custody_ack::CustodyVerdict as V;
+                if d.device_key_id == l.node_a {
+                    d.state == V::Here
+                } else {
+                    d.state == V::Unknown
+                }
+            }),
+            "the writer's claim is here; every other device is unknown: {v:?}"
+        );
+        assert!(
+            v.device_custody.iter().any(|d| d.device_key_id == l.node_a),
+            "the writing device is in the view: {v:?}"
         );
         assert!(
             v.why
                 .as_deref()
-                .is_some_and(|w| w.contains("never announced") && w.contains("unknown, not none")),
+                .is_some_and(|w| w.contains("within the cohort") && w.contains("unknown, not none")),
             "{v:?}"
         );
         assert!(

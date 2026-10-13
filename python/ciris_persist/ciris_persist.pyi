@@ -613,7 +613,7 @@ class Engine:
         """(derived) deontic — v50.0.0 (CIRISPersist#925/#931) — the REPLICATED community entry: admit a SignedCommunity received from a peer (the shape the signed since-read ser..."""
 
     def apply_replicated_key_grant(self, signed_key_grant_json: str) -> str:
-        """(derived) deontic — CIRISPersist#848 (BLOB_REPLICATION.md §12–§13) — admit a replicated KeyGrant set and project every wrap. FFI mirror of [Engine::apply_replicated_ke..."""
+        """(derived) deontic — CIRISPersist#848 (BLOB_REPLICATION.md §12–§13), v55.0.0 (#989, CC 3.3.2 rc7) — admit one replicated key-grant row and project its wrap. FFI mirror..."""
 
     def apply_replicated_key_record(
         self,
@@ -702,17 +702,27 @@ class Engine:
     def cirisnode_cast_vote(self, envelope_json: str) -> None:
         """(derived) deontic — v0.7.0 — Verify-and-insert a Vote envelope. [build-conditional: #[cfg(feature = "cirisnode")]]"""
 
-    def cirisnode_process_takedown_admission_json(
-        self, notice_payload_json: str, signer_key_id: str, now_iso: str
-    ) -> str:
-        """v3.6.0 (CIRISPersist#134) — run the takedown-admission orchestration
-        over a JSON ``TakedownNoticePayload``, consulting the installed
-        ``MultimediaConfig`` (or persist's defaults when none is installed) for
-        the immediate-eviction decision and the counter-notice window.
+    def cirisnode_process_takedown_admission_json(self, contribution_json: str) -> str:
+        """v55.0.0 (CIRISPersist#1007; CC 4.5.3 step 2, CC 4.5.5) — execute a
+        takedown on the bytes plane from the SIGNED ``takedown_notice``
+        Contribution (the ``ContributionEnvelope`` JSON). The signature is
+        re-verified and CC 4.5.5 re-asked of this node's state; then ONE
+        tombstone, ``blob:{content_sha256}``, is recorded on the steward
+        purge's tombstone row and replicates as a purge bundle. An
+        immediate-removal basis destroys this node's bytes on receipt; a
+        counter-notice basis retracts this node's own holding claim and the
+        hard delete waits for ``purge_finalize_json`` after the window; the
+        age-gate basis records nothing. No other device's claim is withdrawn.
 
-        Returns the admission outcome as JSON — **a truthy string on the refusal
-        arm too**. This one both DECIDES and ACTS: a caller who mis-reads the
-        verdict may re-drive it and evict content twice.
+        Returns JSON ``{"notice_id", "content_sha256", "legal_basis",
+        "disposition", "signer", "tombstoned", "settles_at",
+        "claims_retracted", "bytes_destroyed"}``. Idempotent on the notice.
+
+        Raises:
+            ValueError: ``(token, body_json)`` with token
+                ``takedown_unauthorised`` (bad signature, basis outside the
+                closed set, outside its window, or a signer holding no
+                ``takedown`` duty over the content here).
         """
 
     def cirisnode_put_key_grant_json(self, envelope_json: str) -> None:
@@ -796,10 +806,10 @@ class Engine:
         """(derived) deontic — v9.4.0 (CIRISPersist#253) — node-self emit over the engine's OWN composed signer (the common case: a node emitting a federation-tier row about itse..."""
 
     def emit_key_grant(self, axis_json: str) -> str | None:
-        """(derived) deontic — CIRISPersist#848 (BLOB_REPLICATION.md §14) — emit the KeyGrant set for an axis on demand. FFI mirror of [Engine::emit_key_grant](crate::engine::Eng..."""
+        """(derived) deontic — CIRISPersist#848 (BLOB_REPLICATION.md §14), v55.0.0 (#989) — emit the key-grant rows for an axis on demand. FFI mirror of [Engine::emit_key_grant](..."""
 
     def emit_pending_key_grants(self) -> int:
-        """(derived) deontic — CIRISPersist#848 (BLOB_REPLICATION.md §14, V146) — emit every KeyGrant set this node owes and has not yet carried: each epoch it minted whose set i..."""
+        """(derived) deontic — CIRISPersist#848 (BLOB_REPLICATION.md §14, V146) — emit every key-grant row this node owes and has not yet carried: each epoch it minted whose set..."""
 
     def enter_mesh(self, attestation_id: str, contextual_integrity: str) -> dict[str, Any]:
         """(derived) deontic — v39.0.0 — enter the mesh: flip a local-tier row to the federation tier over the SAME bytes (CC 5.3.2.4.2). Replaces attestation_promote, which re-s..."""
@@ -811,7 +821,7 @@ class Engine:
         """(derived) deontic — The lifecycle door (registry's RequestKeyRecovery outcome path): "active" may move to "recovered" / "revoked" / "expired"; a same-state re-assertio... [build-conditional: #[cfg(feature = "registry_key_escrows")]]"""
 
     def evict_actor_json(self, attesting_key_id: str, now_iso: str) -> str:
-        """(derived) deontic — v3.5.0 (CIRISPersist#125) — Federation blob storage: per-actor eviction. Deletes every federation_blobs row this Engine holds for attesting_key_id,..."""
+        """(derived) deontic — v3.5.0 (CIRISPersist#125) — Federation blob storage: per-actor eviction. Deletes every federation_blobs row this Engine holds that attesting_key_id..."""
 
     def federation_grant_trust(self, signed_grant_json: str) -> None:
         """(derived) deontic — Federation directory: grant trust to a key."""
@@ -821,6 +831,9 @@ class Engine:
 
     def file_moderation(self, content_sha256: str, community_id: str, duty: str, allegation_type: str) -> str:
         """(derived) deontic — v9.3.0 (#249, §11.10 EMIT) — file a moderation report: a scores on the moderation:{allegation_type} dimension over content_sha256, naming community..."""
+
+    def finalize_blob_chunks_signing_json(self, payload_json: str) -> str:
+        """(derived) deontic — v55.0.0 (CIRISPersist#952) — finalize an incremental plaintext chunk DAG (Engine::finalize_blob_chunks_signing). Payload: {"manifest": {"v": 1, "to..."""
 
     def get_blob_for_viewer(self, at_rest_sha256_hex: str, viewer_key_id: str) -> str:
         """(derived) deontic — v43.0.0 (§10.1) — read a self/family-encrypted blob as viewer_key_id."""
@@ -960,7 +973,7 @@ class Engine:
     def pin_trust_from_bundle_response_json(self, response_json: str) -> str:
         """(derived) deontic — v50.0.0 (CIRISPersist#926) — the consumer half of CC 4.4 / 5.3.4: pin ciris-canonical from ONE TrustRootBundleResponse JSON (the bundle's quorum ve..."""
 
-    def promote_adopted_manifest_to_dag_json(self, at_rest_sha256_hex: str, viewer_key_id: str, caller_aad_b64: str | None = None) -> str:
+    def promote_adopted_manifest_to_dag_json(self, at_rest_sha256_hex: str, viewer_key_id: str, disposition: str, caller_aad_b64: str | None = None) -> str:
         """(derived) deontic — v51.3.0 (CIRISPersist#947) — finish a sealed DAG adopt. adopt_sealed_blob_json stores a received sealed manifest as an inline envelope; until this..."""
 
     def publish_self_occurrence(self, identity_key_id: str, device_class: str, valid_until_iso: str | None = None) -> str:
@@ -995,7 +1008,7 @@ class Engine:
                 "record": {
                     "attestation_id": str,           # UUID
                     "attesting_key_id": str,
-                    "attestation_type": str,         # e.g. "holds_bytes:sha256:..."
+                    "attestation_type": str,         # one of the five, e.g. "scores"
                     "attestation_envelope": <opaque JSON>,
                     "references_attestation_id": str | None,
                     "references_attestation_type": str | None,
@@ -1028,7 +1041,7 @@ class Engine:
         """(derived) deontic — #832 (§12.3) — append one plaintext segment to a live stream at cohort_scope, sealed where the tier requires it. The chunk twin of put_blob_scoped:..."""
 
     def put_blob_chunks_signing_json(self, payload_json: str) -> str:
-        """(derived) deontic — v51.3.0 (CIRISPersist#947 ask 3) — store a plaintext chunk DAG and announce its manifest (holds_bytes, this node's claim), so a pulled commons DAG..."""
+        """(derived) deontic — v51.3.0 (CIRISPersist#947 ask 3) — store a plaintext chunk DAG and announce its manifest (this node's holding claim), so a pulled commons DAG is no..."""
 
     def put_blob_encrypted_community(self, community_key_id: str, plaintext_b64: str, media_type: str | None = None) -> str:
         """(derived) deontic — v43.0.0 (FSD/BLOB_ENCRYPTION_AT_REST.md §10.1) — store a blob encrypted under a community's current-epoch DEK."""
@@ -1050,10 +1063,10 @@ class Engine:
         attestation_id_uuid: str,
     ) -> None:
         """v3.3.0 (#121) — One-call blob ingest: persist computes the
-        holds_bytes envelope, canonicalizes via the production
-        ``PythonJsonDumpsCanonicalizer``, signs via the engine's own
-        ``HardwareSigner``, and atomically commits the blob row + the
-        holder attestation.
+        holding-claim envelope (v55.0.0: ``custody:ack:v1`` ``here`` at
+        ``federation``, CIRISPersist#989), canonicalizes via the production
+        canonicalizer, signs via the engine's own signer, and atomically
+        commits the blob row + the holding claim.
 
         ``body_inline_b64`` XOR ``external_ref_json`` — exactly one
         body source. Inline bodies are base64-standard-alphabet;
@@ -1101,6 +1114,9 @@ class Engine:
 
     def put_partner_record(self, signed_json: str) -> None:
         """(derived) deontic — Federation directory: admit a partner_record envelope (M-of-N steward quorum; CEG 1.0-RC2 §5.6.8.13). signed_json = SignedPartnerRecord (carries th..."""
+
+    def put_plaintext_dag_chunk(self, chunk_sha256_hex: str, size: int, body: bytes, author_key_id: str) -> str:
+        """(derived) deontic — v55.0.0 (CIRISPersist#952, CIRISEdge#734) — store ONE chunk of a plaintext chunk DAG ahead of its manifest (Engine::put_plaintext_dag_chunk). chunk..."""
 
     def put_public_key(self, signed_key_record_json: str) -> None:
         """(derived) deontic — Federation directory: register a public key."""
@@ -1199,6 +1215,9 @@ class Engine:
         Idempotent on the same key/value; rejects rotation (registering
         a different key for an existing key id raises).
         """
+
+    def register_stream_epoch_dek(self, cohort_scope: str, group_key_id: str, stream_id: str, epoch: int, dek_b64: str, aad_b64: str | None = None) -> str:
+        """(derived) deontic — v55.0.0 (CIRISPersist#981, CC 5.3.3.2.5) — supply the DEK of a stream's next epoch (the stream's per-(stream, epoch) DEK the producer derives from..."""
 
     def rekey_community_member_device_add_json(self, community_key_id: str, member_key_id: str, new_occurrence_key_id: str, authority_key_id: str) -> str:
         """(derived) deontic — v50.0.0 (CIRISPersist#916, FSD/SECOND_DEVICE.md §3) — a member's new device receives exactly what the member holds: every retained community DEK ep..."""
@@ -1530,9 +1549,6 @@ class Engine:
 
     def set_consent_role(self, key_id: str, consent_role: str | None = None) -> None:
         """(derived) deontic — v13.0.0 (CIRISPersist#365, CC 3.4.7.2 OQ-1) — assign or overwrite the Counter-RII consent_role of key_id. consent_role=None revokes it (resets the..."""
-
-    def set_multimedia_config_json(self, config_json: str | None) -> None:
-        """(derived) deontic — v3.6.0 (CIRISPersist#134) — install / clear the media-sharing operator config ([MultimediaConfig](crate::cirisnode::MultimediaConfig)). Wire shape:... [build-conditional: #[cfg(feature = "cirisnode")]]"""
 
     def set_retention(self, table_name: str, min_keep_secs: int, time_column: str, pressure_trigger_bytes: int | None = None, pressure_target_bytes: int | None = None, interval_secs: int = ...) -> None:
         """(derived) deontic — v6.0.1 (CIRISPersist#218) — Set (upsert) the retention policy for table_name. table_name and time_column are validated as strict SQL identifiers in..."""
@@ -2953,9 +2969,6 @@ class Engine:
     def get_installed_storage_budget_json(self, node_id: str) -> str | None:
         """(derived) empirical — #370 — the installed StorageBudgetV1 wire JSON for node_id, VERBATIM as accepted (re-verifiable with verify_storage_budget_v1). None when no budget..."""
 
-    def get_multimedia_config_json(self) -> str | None:
-        """(derived) empirical — v3.6.0 (CIRISPersist#134) — snapshot of the currently-installed media-sharing config as a JSON string. Returns the wire shape (see [MultimediaConfi... [build-conditional: #[cfg(feature = "cirisnode")]]"""
-
     def get_retention(self, table_name: str) -> str | None:
         """(derived) empirical — v6.0.1 (CIRISPersist#218) — Stored retention policy for table_name as a JSON-encoded RetentionPolicy, or None when no policy exists."""
 
@@ -3095,9 +3108,11 @@ class Engine:
 
     def list_holders_json(self, sha256_hex: str) -> str:
         """v2.3.0 (#103) — JSON-encoded list of ``attesting_key_id``
-        for every currently-live holder of this blob. Filters out
-        rows past the CEG §10.1.2 24-hour TTL AND rows with a
-        ``withdraws`` structural composer from the attester. Empty
+        for every currently-live holder of this blob: v55.0.0
+        (CIRISPersist#989) — every holder whose latest holding claim
+        (``custody:ack:v1``) is a ``here`` within its 72-hour window (any age
+        when this node holds the bytes itself). A holder's own
+        ``withdraws`` / ``recants`` or later ``none`` folds it out. Empty
         list when no live holders.
 
         Used by CIRISConformance to verify the §9.1 identity-aware-
@@ -3110,7 +3125,7 @@ class Engine:
         """
 
     def list_holders_sized_json(self, sha256_hex: str) -> str:
-        """(derived) empirical — v45.0.0 (CIRISPersist#871, FSD/MEDIA_SOURCE.md §4, AV-88/AV-89) — the puller's budget read. Every live holds_bytes claim for the blob with the byte..."""
+        """(derived) empirical — v45.0.0 (CIRISPersist#871, FSD/MEDIA_SOURCE.md §4, AV-88/AV-89) — the puller's budget read. Every holder whose latest holding claim (v55.0.0: custo..."""
 
     def list_key_registration_history(self, key_id: str) -> str:
         """(derived) empirical — v44.7.0 (CIRISPersist#864) — the registration claims key_id has REPLACED through a rebind, oldest first, as a JSON array of KeyRegistrationHistoryR..."""
@@ -3119,7 +3134,7 @@ class Engine:
         """(derived) empirical — Page through cirislens.trace_llm_calls rows. Filters compose AND-style; cursor-paged newest-first. Returns JSON-encoded LlmCallListPage."""
 
     def list_local_holders_json(self, sha256_hex: str) -> str:
-        """(derived) empirical — v3.5.2 (CIRISPersist#130) — Federation blob storage: local-truth holder query. Returns a JSON array of attesting_key_id strings for every holds_byt..."""
+        """(derived) empirical — v3.5.2 (CIRISPersist#130) — Federation blob storage: local-truth holder query. Returns a JSON array of attesting_key_id strings for every holder wh..."""
 
     def list_org_memberships_for(self, org_id: str) -> str:
         """(derived) empirical — Federation directory: list all org_membership rows for one org_id. Returns a JSON array of OrgMembership."""
@@ -3295,7 +3310,7 @@ class Engine:
         """(derived) empirical — #249 Cut B — the user-role key(s) that steward-bind key_id (who key_id is steward-bound TO). Returns a JSON array of key_ids; empty when key_id is..."""
 
     def store_blob_local_json(self, payload_json: str) -> None:
-        """(derived) empirical — v3.9.2 (CIRISPersist#153 Ask 5, CEG 0.7 §10.1.4) — store blob bytes locally at the COMMONS tier WITHOUT emitting a holds_bytes directory attestation."""
+        """(derived) empirical — v3.9.2 (CIRISPersist#153 Ask 5, CEG 0.7 §10.1.4) — store blob bytes locally at the COMMONS tier WITHOUT emitting a holding claim."""
 
     def task_delete(self, task_id: str) -> bool:
         """v1.5.9 — Delete a task by id.
@@ -3830,6 +3845,9 @@ class Engine:
 
     def promote_consented_backlog(self) -> dict[str, Any]:
         """(derived) procedural — v21.2.0 (CIRISPersist#509 FLOOR) — run the promote-on-consent sweep ON DEMAND: the same idempotent Engine::promote_consented_backlog primitive the... [build-conditional: #[cfg(any(feature = "postgres", feature = "sqlite"))]]"""
+
+    def reack_holding_claims_once(self) -> str:
+        """(derived) procedural — v55.0.0 (CIRISPersist#989, CC 3.1.3.3 rule 5) — drive one holding-claim re-ack pass synchronously: renew this node's own claims that are a day old,..."""
 
     def replay_abandoned(self, queue_id: str) -> None:
         """(derived) procedural — v0.4.0 — Operator-driven replay. Resets attempt_count=0 and requeues an abandoned row."""

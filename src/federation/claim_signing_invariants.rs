@@ -1,7 +1,8 @@
 //! CIRISPersist#851 (`FSD/BLOB_REPLICATION.md` §20.5) — **the holder
 //! claim crosses the federation-tier gate.**
 //!
-//! A `holds_bytes` claim is FEDERATION-tier: the attestation cursor serves
+//! A holding claim (v55.0.0: `custody:ack:v1`, CIRISPersist#989; the
+//! `holds_bytes` carrier before it) rides the federation plane: the attestation cursor serves
 //! it and every peer runs it through the tier ingest gate, which requires a
 //! hybrid Ed25519 + ML-DSA-65 signature (CC 5.3.2.4.3.1). A classical-only
 //! claim is confined to local tier — served, and refused by every peer. An
@@ -28,7 +29,7 @@ mod tests {
     /// it and B refused it at the federation-tier ingest gate ("PQC signature
     /// without pubkey"), so no peer ever learned who held the bytes.
     #[tokio::test]
-    async fn i79_holds_bytes_claim_is_hybrid_signed_and_a_peer_admits_it_sqlite() {
+    async fn i79_holding_claim_is_hybrid_signed_and_a_peer_admits_it_sqlite() {
         let run = uuid::Uuid::new_v4().simple().to_string();
         let (alias_a, alias_b) = (format!("i79-a-{run}"), format!("i79-b-{run}"));
         let engine_a =
@@ -84,7 +85,12 @@ mod tests {
             .unwrap()
             .into_iter()
             .map(|served| served.attestation)
-            .filter(|row| row.attestation_type.starts_with("holds_bytes:"))
+            .filter(|row| {
+                crate::federation::custody_ack::parse_custody_ack(row)
+                    .ok()
+                    .flatten()
+                    .is_some()
+            })
             .collect();
         assert_eq!(
             claims.len(),
@@ -102,7 +108,7 @@ mod tests {
         );
         assert!(
             claim.scrub_signature_pqc.is_some(),
-            "I79: an Engine with a LocalSigner signs the holds_bytes claim HYBRID — a \
+            "I79: an Engine with a LocalSigner signs the holding claim HYBRID — a \
              classical-only claim is confined to local tier (CC 5.3.2.4.3.1) and every peer \
              refuses it; row {} (tier={}) carries no PQC half",
             claim.attestation_type,
@@ -144,7 +150,10 @@ mod tests {
             .into_iter()
             .map(|served| served.attestation)
             .filter(|row| {
-                row.attestation_type == crate::federation::holds_bytes_attestation_type(&sha)
+                crate::federation::custody_ack::parse_custody_ack(row)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|a| a.blob_sha256_hex == hex::encode(sha))
             })
             .collect();
         assert_eq!(commons.len(), 1, "I79/2: the commons door announced once");
@@ -176,7 +185,7 @@ mod tests {
     /// minting a federation-tier claim every peer's ingest gate discards.
     #[tokio::test]
     async fn i80_a_pqc_less_local_signer_cannot_sign_a_claim() {
-        use crate::federation::blobs::sign_holds_bytes_claim;
+        use crate::federation::holding_claim::{sign_holding_claim, ClaimScope};
         use crate::signing::LocalSigner;
         let ed = ed25519_dalek::SigningKey::from_bytes(&[0x51u8; 32]);
         let local = LocalSigner::from_parts(ed, "i80-classical-only".to_owned(), None, None);
@@ -184,14 +193,14 @@ mod tests {
             local.pqc_signer().is_none(),
             "I80: precondition — no PQC signer"
         );
-        let key = local.derived_key_id();
-        let err = sign_holds_bytes_claim(
+        let scope = ClaimScope::of_content(CryptoTier::Plaintext, "federation", None).unwrap();
+        let err = sign_holding_claim(
             &local,
             &[0x80u8; 32],
-            &key,
             uuid::Uuid::new_v4(),
             chrono::Utc::now(),
             1,
+            &scope,
         )
         .await
         .expect_err("I80: a classical-only producer must not announce");
@@ -202,34 +211,36 @@ mod tests {
         );
     }
 
-    /// **I81 — the signer of a claim IS its claimed attester.** A LocalSigner
-    /// belonging to another identity never signs (an Engine whose composed
-    /// signer and LocalSigner differ, `from_shared_with_local`): the claim
-    /// would be attributed to one key and signed by another, which every peer
-    /// refuses. There is no classical fallback to drop to — it REFUSES.
+    /// **I81 — the signer of a claim IS its claimed attester.** v55.0.0
+    /// (CIRISPersist#989): `sign_holding_claim` takes no attester at all — the
+    /// claim is attributed to the signer's own derived key and signed by it,
+    /// so a claim attributed to one key and signed by another cannot be
+    /// minted. A foreign LocalSigner mints ITS OWN claim, never the attester's.
     #[tokio::test]
     async fn i81_a_local_signer_that_is_not_the_attester_refuses() {
-        use crate::federation::blobs::sign_holds_bytes_claim;
+        use crate::federation::holding_claim::{sign_holding_claim, ClaimScope};
         let attester = crate::federation::tier_ingest::test_support::local_signer("i81-attester");
         let other = crate::federation::tier_ingest::test_support::local_signer("i81-other");
         assert_ne!(attester.derived_key_id(), other.derived_key_id());
         let key = attester.derived_key_id();
         let sha = [0x81u8; 32];
+        let scope = ClaimScope::of_content(CryptoTier::Plaintext, "federation", None).unwrap();
         let (id, now) = (uuid::Uuid::new_v4(), chrono::Utc::now());
-        let err = sign_holds_bytes_claim(&other, &sha, &key, id, now, 1)
+        let foreign = sign_holding_claim(&other, &sha, id, now, 1, &scope)
             .await
-            .expect_err("I81: a foreign LocalSigner must not sign this attester's claim");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("hybrid-only") && msg.contains("not the claimed attester"),
-            "I81: the refusal names the mismatch: {msg}"
+            .expect("I81: a LocalSigner signs its own claim");
+        assert_ne!(
+            foreign.attesting_key_id, key,
+            "I81: a foreign LocalSigner never mints the attester's claim"
         );
+        assert_eq!(foreign.attesting_key_id, foreign.scrub_key_id);
         // The attester's own LocalSigner signs, hybrid, attributed to itself.
-        let own = sign_holds_bytes_claim(&attester, &sha, &key, id, now, 1)
+        let own = sign_holding_claim(&attester, &sha, id, now, 1, &scope)
             .await
             .expect("I81: the attester signs its own claim");
         assert!(own.scrub_signature_pqc.is_some(), "I81: hybrid");
         assert_eq!(own.scrub_key_id, key);
+        assert_eq!(own.attesting_key_id, key);
     }
 
     /// **I83 — an Engine with no PQC LocalSigner cannot announce, and stores
@@ -355,7 +366,7 @@ mod tests {
             .await
             .expect_err("I88: a PQC-less announcing engine must refuse the commons door");
         // The orphan check FIRST — it is the claim. A deeper gate
-        // (`sign_holds_bytes_claim`) also refuses a PQC-less signer, so the
+        // (`sign_holding_claim`) also refuses a PQC-less signer, so the
         // ERROR alone cannot tell a preflight from a late failure; only the
         // absence of stored bytes can.
         assert!(
@@ -731,7 +742,6 @@ mod tests {
     async fn i85_a_withdraws_naming_a_key_grant_row_is_refused_sqlite() {
         use crate::federation::tier_ingest::test_support as ts;
         use crate::federation::types::identity_type::USER;
-        use crate::federation::FederationDirectory;
         use crate::store::Backend as _;
         let backend = crate::store::sqlite::SqliteBackend::open_in_memory()
             .await
@@ -740,28 +750,79 @@ mod tests {
         let run = uuid::Uuid::new_v4().simple().to_string();
         let minter = format!("i85-minter-{run}");
         ts::register_identity_key(&backend, &minter, USER).await;
-        // A stored key_grant carrier row, and a withdraws naming it.
-        // A stored key_grant carrier, sealed the way every admissible row is
-        // (instants + the #643 mirror), then a withdraws naming it.
+        // A HELD retired key_grant carrier (a v54 node's set, kept on an
+        // upgraded node — v55.0.0, #989: refused at every door now, so it is
+        // seeded below the doors), and a `scores` key-grant ROW, the v55
+        // shape (seeded the same way: this witness is about the composer
+        // gate, not the row's own admission).
         let target_id = format!("kg-{run}");
-        let mut carrier = ts::bare_attestation(
-            &target_id,
-            &minter,
-            &minter,
-            &serde_json::json!({ "id": target_id, "kind": "key_grant" }),
-        );
-        carrier.attestation_type =
-            crate::federation::key_grant::KEY_GRANT_EPOCH_ATTESTATION_TYPE.to_owned();
-        // v53.0.0 (#975, CC 2.4) — a carrier carries no weight; the fixture's
-        // default one would be refused `carrier_carries_weight`.
-        carrier.weight = None;
-        let carrier = ts::seal_row(&minter, carrier);
-        backend
-            .apply_replicated_attestation(crate::federation::SignedAttestation {
-                attestation: carrier,
-            })
-            .await
-            .expect("I85: the carrier row stores");
+        let row_id = format!("kgr-{run}");
+        {
+            let conn = backend.conn_handle();
+            let conn = conn.lock();
+            for (id, ty, env) in [
+                (
+                    target_id.clone(),
+                    "key_grant:epoch:v1",
+                    serde_json::json!({ "id": target_id, "kind": "key_grant" }),
+                ),
+                (
+                    row_id.clone(),
+                    "scores",
+                    serde_json::json!({
+                        "id": row_id,
+                        "dimension": crate::federation::key_grant::KEY_GRANT_EPOCH_DIMENSION,
+                    }),
+                ),
+            ] {
+                conn.execute(
+                    "INSERT INTO federation_attestations (\
+                        attestation_id, attesting_key_id, attested_key_id, attestation_type, \
+                        weight, asserted_at, expires_at, attestation_envelope, \
+                        original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
+                        scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, tier, \
+                        cohort_scope, admitted_at\
+                     ) VALUES (?1, ?2, ?2, ?3, NULL, '2026-01-01T00:00:00Z', NULL, ?4, x'00', \
+                        'c2ln', NULL, ?2, '2026-01-01T00:00:00Z', NULL, '0', 'federation', \
+                        'community', '2026-01-01T00:00:00Z')",
+                    rusqlite::params![id, minter, ty, env.to_string()],
+                )
+                .expect("I85: the held row is seeded");
+            }
+        }
+        // v55.0.0 (#989, CC 3.3.2 rc7) — a withdraws or a recants naming the
+        // ROW is refused too, the sealer's own recants included.
+        for (kind, ty) in [
+            (
+                "withdraws",
+                crate::federation::types::attestation_type::WITHDRAWS,
+            ),
+            (
+                "recants",
+                crate::federation::types::attestation_type::RECANTS,
+            ),
+        ] {
+            let id = format!("{kind}-row-{run}");
+            let mut c = ts::bare_attestation(
+                &id,
+                &minter,
+                &minter,
+                &serde_json::json!({
+                    "id": id,
+                    "kind": kind,
+                    "references_attestation_id": row_id,
+                }),
+            );
+            c.attestation_type = ty.to_owned();
+            let c = ts::seal_row(&minter, c);
+            let err = crate::federation::admission::check_withdraws_admission(&backend, &c)
+                .await
+                .expect_err("I85: a composer naming a key-grant row is refused");
+            assert!(
+                err.to_string().contains("cannot be retroactively"),
+                "I85 ({kind} of the row): {err}"
+            );
+        }
         let w_id = format!("w-{run}");
         let mut w = ts::bare_attestation(
             &w_id,
@@ -796,8 +857,7 @@ mod tests {
                 "id": format!("w2-{run}"),
                 "kind": "withdraws",
                 "references_attestation_id": absent,
-                "references_attestation_type":
-                    crate::federation::key_grant::KEY_GRANT_EPOCH_ATTESTATION_TYPE,
+                "references_attestation_type": "key_grant:epoch:v1",
             }),
         );
         deferred.attestation_type =
@@ -887,8 +947,10 @@ mod tests {
             .unwrap()
             .into_iter()
             .find(|a| {
-                a.attestation_type
-                    .starts_with(crate::federation::HOLDS_BYTES_ATTESTATION_TYPE_PREFIX)
+                crate::federation::custody_ack::parse_custody_ack(a)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|c| c.blob_sha256_hex == hex::encode(sha))
             })
             .expect("I86: the claim is stored under the node");
         assert!(claim.scrub_signature_pqc.is_some(), "I86: hybrid claim");

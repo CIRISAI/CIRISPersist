@@ -1248,6 +1248,14 @@ pub mod delegation_scope {
              (Error::MembershipListingRefused.rule = \"envelope_listed_scope_invalid\"), not a \
              delegates_to scope value; `scope` in its name is the cohort scope a listing named",
         ),
+        (
+            "holding_claim::HOLDING_CLAIM_SCOPE_UNRESOLVED",
+            "v55.0.0 (CIRISPersist#989) — a REFUSAL TOKEN (a holding claim whose content names              no cohort to be placed at), not a delegates_to scope value; `scope` in its name is              the claim's cohort scope",
+        ),
+        (
+            "holding_claim::CUSTODY_ACK_SCOPE_MISMATCH",
+            "v55.0.0 (CIRISPersist#989) — a REFUSAL TOKEN (a holding claim placed at another              cohort scope than its content's, CC 3.1.3.3 rule 1), not a delegates_to scope value",
+        ),
     ];
 
     /// CC 3.4.7.3 — the legacy **unprefixed** agency kinds (the pre-split
@@ -2173,8 +2181,8 @@ fn is_default_cohort_scope(s: &String) -> bool {
 /// `{species, biosphere, federation}`, not a wire enum value.
 pub mod cohort_scope {
     /// Locally-held content (locality dividend per
-    /// FEDERATION_SCALING_MODEL §9.5). Never emits federation-tier
-    /// holds_bytes; substrate-local-only.
+    /// FEDERATION_SCALING_MODEL §9.5). Its holding claims stay at `self`
+    /// (v55.0.0, CIRISPersist#989); never advertised beyond the owner.
     pub const SELF: &str = "self";
     /// Content shared with a partnered family/group (CEG §8.1.8).
     /// Visible to peers with `trust:partnered` or `trust:direct`.
@@ -2379,54 +2387,48 @@ pub mod cohort_scope {
     }
 
     /// v3.9.2 (CIRISPersist#153 Ask 5, CEG 0.7 §10.1.4) — the
-    /// structural-invisibility classification.
+    /// structural-invisibility classification: true for [`SELF`] and
+    /// [`FAMILY`], whose content never leaves the self-collective or the
+    /// family by any directory or discovery surface (CC 5.2).
     ///
-    /// True iff content tagged with this `cohort_scope` is
-    /// **structurally invisible** to the federation: the substrate
-    /// MUST NOT emit a `holds_bytes:sha256:*` directory attestation
-    /// for it, and MUST NOT propagate it beyond the self-collective /
-    /// family scope via any directory or discovery surface. A
-    /// non-member peer cannot issue a ContentFetch for it and cannot
-    /// even discover the bytes exist — the `holds_bytes` row *is* the
-    /// discovery surface, so not emitting it is the privacy primitive
-    /// (the ciris.ai/cewp "the wire format can't carry them" claim).
-    ///
-    /// True for [`SELF`] and [`FAMILY`]. False for `community` /
-    /// `affiliations` / `species` / `biosphere` / `federation`, which
-    /// federate per status quo and emit `holds_bytes` normally — CEG
-    /// 0.8 §8.1.13.3 is explicit that community content is NOT
-    /// suppressed (communities can be large; per-member byte-level
-    /// invisibility is infeasible, and the community privacy property
-    /// is cohort-filtered visibility, not byte-level invisibility).
-    ///
-    /// This is the locality dividend of FEDERATION_SCALING_MODEL §9.5:
-    /// self/family bytes never cost the federation a directory entry.
-    pub fn suppresses_holds_bytes(s: &str) -> bool {
+    /// v55.0.0 (CIRISPersist#989, CC 3.1.3.3) — renamed from
+    /// `suppresses_holds_bytes`, a clean break. Content at these scopes now
+    /// carries holding claims like every tier, but the claims are placed at
+    /// the content's own scope and reach only the cohort, so the property is
+    /// what it always was: an outsider cannot discover the bytes exist. The
+    /// rows that asked "is this self/family" (the stranded-row repair, the
+    /// self-collective placement) keep asking it here.
+    pub fn is_structurally_invisible(s: &str) -> bool {
         matches!(s, SELF | FAMILY)
     }
 
     /// v4.12.0 (CIRISPersist#152 / #188, CEG 0.17 §8.1.13.3 / §10.1.4) —
     /// the at-rest crypto tier a `cohort_scope` resolves to. **Orthogonal
-    /// to [`suppresses_holds_bytes`]**: self/family are encrypted AND
-    /// suppressed; community/affiliations are encrypted but still emit
-    /// `holds_bytes` (with cleartext provenance); Commons is plaintext.
+    /// to [`is_structurally_invisible`]**: self/family are encrypted and
+    /// invisible; community/affiliations are encrypted with cleartext
+    /// provenance; Commons is plaintext. v55.0.0 (CIRISPersist#989) — every
+    /// tier carries holding claims, placed at the content's scope: the
+    /// sealed tiers at their own cohort, the plaintext tier at `federation`.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     #[serde(rename_all = "snake_case")]
     pub enum CryptoTier {
         /// `self` / `family` — per-write fresh DEK wrapped to every active
-        /// occurrence/member; structurally invisible (no `holds_bytes`).
+        /// occurrence/member; structurally invisible (holding claims stay in
+        /// the cohort).
         /// **Opt-in / default-off** (defense-in-depth over already-invisible
         /// bytes; the v1 migration posture). #152.
         InvisibleEncrypted,
         /// `community` / `affiliations` — a shared per-community DEK (the
         /// §10.5.3 epoch-DEK cascade with the roster as subscriber set),
-        /// rotated on membership change; emits `holds_bytes:*` **with**
-        /// cleartext provenance. **Mandatory** (the DEK is community
+        /// rotated on membership change; cleartext provenance, holding claims
+        /// within the roster. **Mandatory** (the DEK is community
         /// content's sole confidentiality boundary). CEG 0.17 §8.1.13.3.
         CommunityDek,
         /// Commons (`species` / `biosphere` / `federation`), the
-        /// `cohort_subkind: infrastructure` governance carve-out, and any
-        /// **unrecognized** scope — plaintext, `holds_bytes` normally.
+        /// `cohort_subkind: infrastructure` governance carve-out, the
+        /// `public` room (v55.0.0, CIRISPersist#1053), and any
+        /// **unrecognized** scope — plaintext, holding claims at
+        /// `federation`.
         Plaintext,
     }
 
@@ -3098,9 +3100,10 @@ pub struct FamilyMember {
 /// Content scoped `cohort_scope: family` lands in substrate, is
 /// wrapped under the family DEK by the v3.13+ at-rest cascade
 /// (CIRISPersist#152), and is delivered to all current members via
-/// `key_grant` per §5.6.8.4 — but never emits `holds_bytes:sha256:*`
-/// to non-members (the structural-invisibility primitive shipped in
-/// v3.9.2).
+/// `key_grant` per §5.6.8.4 — and its holding claims are placed at
+/// `family`, so nothing about it reaches a non-member (the
+/// structural-invisibility primitive shipped in v3.9.2; v55.0.0,
+/// CIRISPersist#989).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Family {
     /// The family's own `federation_keys.key_id`.
@@ -3266,10 +3269,11 @@ pub struct CommunityMember {
 /// semantic difference: **community content is NOT structurally
 /// invisible.**
 ///
-/// [`cohort_scope::suppresses_holds_bytes`] returns `false` for
+/// [`cohort_scope::is_structurally_invisible`] returns `false` for
 /// `community` (true for `self` / `family`). Community content
-/// federates normally — it emits `holds_bytes:sha256:*` directory
-/// attestations and propagates per status quo (communities can be
+/// replicates to its roster — v55.0.0 (CIRISPersist#989, CC 3.1.3.3): its
+/// holding claims are placed at the community's scope and reach its
+/// members only; a `public` room's are at `federation` — (communities can be
 /// large; per-member byte-level invisibility is infeasible — the
 /// community privacy property is cohort-filtered visibility, not
 /// byte-level invisibility). This is the lens-trace path: a

@@ -279,28 +279,34 @@ pub const RULES_NOT_ON_THE_ROW: &[PersistFamilyRule] = &[
                  open emitter; the delegated-chain rule of CC 3.3.9 / CC 4.4.3.4.3 is prose, \
                  not a row field)",
     },
-     // v38.0.0 (CIRISPersist#754) — CC 3.3.10.1 in-grammar ledgers, STAGED on
-    // CIRISConstitution#92. Two rules ride the one prefix: the staging latch
-    // (R2(b) refuses the whole family at federation tier until the CC row
-    // lands and the re-vendor opens the door by itself), and the L1 binding
-    // arm (a `ledger:*` row's declared ledger_id must BE the derivation of
-    // its (attested identity, unit, standard_version) triple — one ledger per
-    // triple, no parallel books, fail-secure per the rc4.3 text). The L1 arm
-    // is live from day one so graduation opens an already-gated door.
+     // v38.0.0 (CIRISPersist#754) — CC 3.3.10.1 in-grammar ledgers. The L1
+    // binding arm (a `ledger:*` row's declared ledger_id must BE the
+    // derivation of its (attested identity, unit, standard_version) triple —
+    // one ledger per triple, no parallel books) was live from day one so
+    // graduation opened an already-gated door. v55.0.0 (CIRISPersist#753):
+    // CC rc7 graduated the family (CIRISConstitution#92/#105) and the staging
+    // latch is gone. rc7 rows the three catalogued leaves only, each with the
+    // section default `substrate-self-report`, while the CC 3.1.3 table names
+    // "the ledger's single owner … or a delegate"; persist gates the whole
+    // prefix by the L1 binding and by the owner rule (signer_acts_for the
+    // attested owner — the delegate path waits on a door that reads the
+    // ledger's declared serialization discipline).
     PersistFamilyRule {
         prefix: "ledger:",
-        rule: "STAGED (refused at federation tier pending CIRISConstitution#92) + \
-               L1 triple binding: declared ledger_id must equal \
-               derive_ledger_id(attested_key_id, unit, standard_version)",
+        rule: "L1 triple binding: declared ledger_id must equal \
+               derive_ledger_id(attested_key_id, unit, standard_version); a malformed \
+               ledger:* dimension refuses; and the signer must act for the attested owner \
+               (the owner's key, a live occurrence, or its node binding)",
         enforced_at: &[
             "federation::admission::check_ledger_binding_admission",
-            "federation::admission::check_namespace_family_registered",
+            "federation::admission::check_ledger_emitter_admission",
         ],
-        gap: RowRuleGap::NoRuleOnTheRow,
+        gap: RowRuleGap::RuleOnCataloguedLeavesOnly,
         minted_by_persist: false,
-        cc_ask: "CIRISConstitution#92 — graduation lands the registry row (with the CC \
-                 3.3.10.1 reserved_rule) and deletes the staged latch; this entry then \
-                 shrinks to the L1 binding rule alone until the row states it",
+        cc_ask: "CIRISConstitution#105 follow-up — the rc7 rows carry the CC 3.1.3 section \
+                 default `substrate-self-report` while the table cell says owner-or-delegate \
+                 (CC 3.3.10.1 clauses 1-3); land the owner rule on the three rows and a \
+                 family-level rule for `ledger:`",
     },
     // ── NoRuleOnTheRow: the row is silent, so the classifier is too. ───────
     PersistFamilyRule {
@@ -667,16 +673,10 @@ pub const NOT_A_FAMILY_RULE: &[(&str, &str)] = &[
     ),
     (
         "holds_bytes:",
-        "an `attestation_type` prefix for blob-holding receipts \
-         (`blobs::HOLDS_BYTES_ATTESTATION_TYPE_PREFIX`), a structural primitive rather than a \
-         `scores` family",
-    ),
-    (
-        "key_grant:",
-        "an `attestation_type` prefix for the CC 3 `key_grant` carrier on the sixteenth \
-         replicated kind (`key_grant::KEY_GRANT_ATTESTATION_TYPE_PREFIX`, CIRISPersist#848) — \
-         a structural primitive like `holds_bytes:`, admitted by `apply_replicated_key_grant`'s \
-         signer rules rather than by a dimension family",
+        "the RETIRED rc6 carrier row type (CC 2.4, CIRISConstitution#141; persist v55.0.0, \
+         CIRISPersist#989): named only by `registry::RETIRED_CARRIER_STEMS`, which refuses a new row \
+         of it at every door and leaves held rows out of the serve reads. It was an \
+         `attestation_type`, never a `scores` family; the holding claim is `custody:ack:v1`",
     ),
     (
         "identity:",
@@ -805,6 +805,12 @@ pub fn persist_ruled_prefixes() -> Vec<String> {
                 // the proposal / acceptance / decline row rules and the growth
                 // gate every roster door runs.
                 crate::federation::membership_acceptance::MEMBERSHIP_FAMILY_STEM,
+                // v55.0.0 (CIRISPersist#989, CC 3.3.2 rc7) — persist rules on
+                // `key_grant:`: the per-recipient row's shape, sealer and
+                // recipient rules (`key_grant::check_key_grant_row_admission`).
+                // Before rc7 the stem was a carrier ROW TYPE and was declared
+                // in `NOT_A_FAMILY_RULE`.
+                crate::federation::key_grant::KEY_GRANT_DIMENSION_PREFIX,
             ]
             .into_iter()
             .map(str::to_owned),

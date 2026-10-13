@@ -37,10 +37,10 @@
 //! Persist exposes the substrate; consumers compose policy. The trust
 //! score formula and the eviction order are deterministic primitives;
 //! the threshold + budget + cadence are operator knobs the deployer
-//! tunes. The sweeper emits structural withdraws against the prior
-//! `holds_bytes` attestation so the directory remains the
-//! single-source-of-truth about who holds what — eviction is
-//! announced, not silent.
+//! tunes. The sweeper emits structural withdraws against this node's
+//! prior holding claim (v55.0.0: `custody:ack:v1`, CIRISPersist#989) so the
+//! directory remains the single-source-of-truth about who holds what —
+//! eviction is announced, not silent.
 
 use std::time::Duration;
 
@@ -157,32 +157,32 @@ impl ReplicationConfig {
 }
 
 /// v3.4.0 (CIRISPersist#123) — canonical envelope shape for a
-/// `withdraws` attestation that retracts a prior `holds_bytes`
-/// emission. The sweeper signs canonical bytes of this envelope to
-/// announce the eviction.
+/// `withdraws` attestation that retracts this node's own prior row — v55.0.0
+/// (CIRISPersist#989): its holding claim, `custody:ack:v1`. The sweeper signs
+/// canonical bytes of this envelope to announce the eviction.
 ///
 /// Wire shape (sorted-keys when canonicalized):
 ///
 /// ```json
 /// {
 ///   "kind": "withdraws",
-///   "references_attestation_id": "<uuid of the withdrawn holds_bytes row>",
-///   "references_attestation_type": "<holds_bytes:sha256:<8-hex-prefix>>"
+///   "references_attestation_id": "<uuid of the withdrawn row>",
+///   "references_attestation_type": "<its attestation_type, e.g. scores>"
 /// }
 /// ```
 ///
 /// The two `references_*` fields mirror the structural-composer dedup
 /// path: `crate::federation::precedence::references_attestation_id_from_envelope`
-/// already reads `references_attestation_id`; the directory's
-/// `list_holders` `NOT EXISTS` filter joins on it.
+/// already reads `references_attestation_id`; the holder directory's
+/// retraction fold joins on it.
 pub fn withdraws_attestation_envelope(
     target_attestation_id: &str,
-    target_holds_bytes_type: &str,
+    target_attestation_type: &str,
 ) -> serde_json::Value {
     serde_json::json!({
         "kind": "withdraws",
         "references_attestation_id": target_attestation_id,
-        "references_attestation_type": target_holds_bytes_type,
+        "references_attestation_type": target_attestation_type,
     })
 }
 
@@ -259,7 +259,7 @@ mod tests {
     /// production
     /// [`crate::verify::canonical::PythonJsonDumpsCanonicalizer`]
     /// produces for the `withdraws` envelope. Mirrors the existing
-    /// `put_blob_signing_canonicalizer_identity_holds_bytes_envelope`
+    /// `put_blob_signing_canonicalizer_identity_holding_claim_envelope`
     /// pin (`src/federation/blobs.rs`).
     ///
     /// **Why an identity test**: persist's production canonicalizer
@@ -275,10 +275,7 @@ mod tests {
         use crate::verify::canonical::{Canonicalizer, PythonJsonDumpsCanonicalizer};
         use sha2::{Digest, Sha256};
 
-        let env = withdraws_attestation_envelope(
-            "11111111-1111-1111-1111-111111111111",
-            "holds_bytes:sha256:abababab",
-        );
+        let env = withdraws_attestation_envelope("11111111-1111-1111-1111-111111111111", "scores");
         let bytes = PythonJsonDumpsCanonicalizer
             .canonicalize_value(&env)
             .expect("python canonicalize");
@@ -286,7 +283,7 @@ mod tests {
         let expected = concat!(
             r#"{"kind":"withdraws","#,
             r#""references_attestation_id":"11111111-1111-1111-1111-111111111111","#,
-            r#""references_attestation_type":"holds_bytes:sha256:abababab"}"#
+            r#""references_attestation_type":"scores"}"#
         );
         assert_eq!(bytes, expected.as_bytes());
         // Pin the hash too — any future canonicalizer drift will
@@ -297,18 +294,12 @@ mod tests {
 
     #[test]
     fn withdraws_envelope_shape() {
-        let env = withdraws_attestation_envelope(
-            "11111111-1111-1111-1111-111111111111",
-            "holds_bytes:sha256:abababab",
-        );
+        let env = withdraws_attestation_envelope("11111111-1111-1111-1111-111111111111", "scores");
         assert_eq!(env["kind"], "withdraws");
         assert_eq!(
             env["references_attestation_id"],
             "11111111-1111-1111-1111-111111111111"
         );
-        assert_eq!(
-            env["references_attestation_type"],
-            "holds_bytes:sha256:abababab"
-        );
+        assert_eq!(env["references_attestation_type"], "scores");
     }
 }

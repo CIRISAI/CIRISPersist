@@ -80,8 +80,16 @@ pub mod consent_peer_set;
 /// a cohort's own devices hold a blob, folded at read time.
 pub mod custody_ack;
 mod custody_ack_invariants;
+/// v55.0.0 (CIRISPersist#989, CC 3.1.3.3, CIRISConstitution#141) — the ONE
+/// holding claim: `custody:ack:v1` `here` at the content's scope, its
+/// emission and the holder directory read.
+pub mod holding_claim;
+mod holding_claim_invariants;
 /// v51.0.0 (CIRISPersist#938/#937) — the lineage-head cosign object and predicates.
 pub mod lineage_witness;
+/// v55.0.0 (CIRISPersist#1053, CC 3.2, CIRISConstitution#142) — the `public`
+/// room: Commons tier, open admission, the `community:listing:v1` door.
+pub mod public_room;
 /// v53.0.0 (CC 3.2 T6, rc7 `36432c6`) — roster rows and the head: a version
 /// must reflect the fold, an uncovered row lags the head.
 pub mod roster_head;
@@ -258,6 +266,14 @@ pub(crate) mod sealed_dag_adopt_invariants;
 pub mod self_collective_invariants;
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod stream_key_invariants;
+// v55.0.0 (CIRISPersist#977, #981) — I750–I756: a room's stream is
+// stream-keyed; a stream epoch's DEK may be the caller's.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod stream_epoch_dek_invariants;
+// v55.0.0 (CIRISEdge v55 adopt) — I762–I765: the dirty loop emits a
+// self/family blob's content rows to the owner's devices.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod content_grant_owner_invariants;
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod stream_sth_producer_invariants;
 /// v50.0.0 (CIRISPersist#919) — I186: the consent sweep never widens a placed row.
@@ -315,6 +331,10 @@ pub mod key_grant;
 // consumers can drive them against their own backends.
 #[cfg(any(test, feature = "test-anchor"))]
 pub mod key_grant_invariants;
+// v55.0.0 (CIRISPersist#989) — I742–I745: the key-grant SET retired, one
+// `scores` row per recipient (the upgraded node included).
+#[cfg(test)]
+mod key_grant_rows_invariants;
 // CIRISPersist#851 §20.5 — I79: the holder claim is hybrid-signed when a
 // LocalSigner exists, so peers admit it at the federation-tier gate.
 #[cfg(any(test, feature = "test-anchor"))]
@@ -508,6 +528,10 @@ mod accord_roster_invariants;
 /// v53.0.0 (CC 3.2 T6) — I440–I449, the head moves with the record.
 #[cfg(test)]
 mod lineage_head_invariants;
+/// v55.0.0 (CIRISPersist#753) — I700–I709, the CC rc7 re-vendor: the held
+/// families, the ledger owner rule, settlement admission.
+#[cfg(test)]
+mod rc7_vendor_invariants;
 pub mod register;
 /// v53.0.0 (CC 3.2 T6, rc7 `36432c6`) — I450–I459, roster rows and the head.
 #[cfg(test)]
@@ -562,8 +586,13 @@ pub mod schema_resolver;
 pub mod scores;
 pub mod scores_read_audit;
 pub mod steward_purge;
+// v55.0.0 (CIRISPersist#1007) — the duty-holder takedown on the steward
+// purge's tombstone row (CC 4.5.3 step 2, CC 4.5.5).
+#[cfg(test)]
+pub(crate) mod doors_takedown_invariants;
 #[cfg(test)]
 mod steward_purge_invariants;
+pub mod takedown_tombstone;
 pub mod trust_root;
 // CIRISPersist#210 — cross-process leader election (RNS shared-instance
 // owner; CIRISEdge#100). Backend-agnostic types + staleness helper; the
@@ -658,16 +687,15 @@ pub use admission::{
 };
 pub use blackhole::{BlackholeRecord, BlackholeRules, RETICULUM_IDENTITY_HASH_LEN};
 pub use blobs::{
-    holds_bytes_attestation_envelope, holds_bytes_attestation_type, sign_holds_bytes_claim,
     AbandonFloorReport, BlobBody, BlobEpochBinding, BlobError, BlobHead, BlobProvenanceRow,
     BlobRange, BlobStorage, ChunkKeyRef, ChunkManifest, ChunkRef, ChunkSlice, DekKeyState,
     EpochBinding, EvictActorReport, EvictBlobReport, ExternalRef, GrantWrap, GroupDekRef,
     ManifestChildRef, ManifestChildRow, ManifestRowSpec, MemberGrant, NestedManifest,
-    ParsedManifest, PreparedHoldsBytes, PutBlobAttestation, PutBlobScopedResult, RosterPartition,
-    ScopeBlobSymbol, StorageFloor, StreamChunkRef, StreamChunks, StreamClaim, StreamDekRecord,
-    StreamHead, StreamKeySlot, StreamKeyState, CHUNK_KEYS_STREAM_EPOCH, CHUNK_MANIFEST_VERSION,
+    ParsedManifest, PutBlobAttestation, PutBlobScopedResult, RosterPartition, ScopeBlobSymbol,
+    StorageFloor, StreamChunkRef, StreamChunks, StreamClaim, StreamDekRecord, StreamHead,
+    StreamKeySlot, StreamKeyState, CHUNK_KEYS_STREAM_EPOCH, CHUNK_MANIFEST_VERSION,
     CHUNK_MANIFEST_VERSION_NESTED, CHUNK_MANIFEST_VERSION_SEALED, CHUNK_MANIFEST_VERSION_STREAM,
-    DEFAULT_INLINE_BYTES_CAP, HOLDS_BYTES_ATTESTATION_TYPE_PREFIX, HOLDS_BYTES_PREFIX_HEX_LEN,
+    DEFAULT_INLINE_BYTES_CAP,
 };
 pub use cohort::{Cohort, GroupRef, GroupVersion, RevokeSpec, RosterMember};
 pub use consent::consent_role_of;
@@ -684,6 +712,9 @@ pub use goal::{
 pub use hard_case::{
     check_admin_action_attribution, AdminActionRefusal, ConsentPromotionOverdueRow, ConsentState,
     ConsentWatchReport, HardCaseEvent, HardCaseFilter,
+};
+pub use holding_claim::{
+    emit_holding_claim, holding_claim_row, sign_holding_claim, ClaimScope, HoldingClaimOutcome,
 };
 // v25.1.0 (CIRISPersist#570 ask 5) — the quarantine marker plane. Exported
 // beside the refusal taxonomies above; downstream keys on the `as_str` tokens.
@@ -2897,25 +2928,39 @@ pub trait FederationDirectory: Send + Sync {
     }
 
     /// v45.0.0 (CIRISPersist#871, `FSD/MEDIA_SOURCE.md` §4, AV-88/AV-89) —
-    /// **the puller's budget read.** Every live `holds_bytes` claim for
-    /// `sha256` with the byte length the holder SIGNED, sorted by `key_id`.
-    /// The selection is `list_holders`'s — the claim's type prefix, the
-    /// full digest in its `evidence_refs`, and the holder's own
-    /// `withdraws` / `recants` folded out — WITHOUT the CEG §10.1.2 freshness
-    /// window (this read answers "what did the holder commit to", the way
-    /// `list_local_holders` does; freshness is the discovery read's axis).
-    /// A claim whose envelope has no positive integer `size` is SKIPPED, not
-    /// an error: the receive door refuses those from this cut on, and a
-    /// legacy row without one is not a holder a puller can budget for.
-    /// Default `Unsupported`; every real backend overrides.
+    /// **the puller's budget read.** Every holder whose latest claim about
+    /// `sha256` is `here`, with the byte length the holder SIGNED, sorted by
+    /// `key_id`.
+    ///
+    /// v55.0.0 (CIRISPersist#989, CC 3.1.3.3) — the claims are the one
+    /// holding claim, `custody:ack:v1` `here`, folded per holder exactly as
+    /// the holder directory folds them ([`holding_claim::holder_claims`]: the
+    /// holder's own retractions and later `none` fold out) — WITHOUT the
+    /// 72-hour freshness window: this read answers "what did the holder
+    /// commit to", the way `list_local_holders` does; freshness is the
+    /// discovery read's axis. A provided composition over
+    /// [`Self::list_attestations_citing_by_dimension`].
     async fn list_holders_sized(
         &self,
         sha256: &[u8; 32],
     ) -> Result<Vec<renditions::HolderClaim>, Error> {
-        let _ = sha256;
-        Err(Error::Unsupported {
-            method: "list_holders_sized",
-        })
+        // v55.0.0 (CIRISEdge v55) — withheld bytes are no puller's target.
+        if steward_purge::purge_withheld(self, sha256).await?.is_some() {
+            return Ok(Vec::new());
+        }
+        Ok(
+            holding_claim::holder_claims(self, sha256, chrono::Utc::now())
+                .await?
+                .into_iter()
+                .filter(|c| c.state == custody_ack::CustodyState::Here)
+                .filter_map(|c| {
+                    c.size.map(|size| renditions::HolderClaim {
+                        key_id: c.holder_key_id,
+                        size,
+                    })
+                })
+                .collect(),
+        )
     }
 
     /// v45.0.0 (CIRISPersist#871, `FSD/MEDIA_SOURCE.md` §5, CC 3.3.13) —
@@ -3218,6 +3263,40 @@ pub trait FederationDirectory: Send + Sync {
     /// self/family keys this node holds.
     async fn rewrap_own_epochs_for_device(&self, owner: &str, device: &str) -> Result<(), Error> {
         let _ = (owner, device);
+        Ok(())
+    }
+
+    /// v55.0.0 (CIRISPersist#989, CC 3.3.2 rc7) — **whose content does this
+    /// node hold under a key-grant axis?** The author of the blob it holds at
+    /// `at_rest_sha256` (content axis), the owner it recorded for `stream_id`
+    /// (stream axis), `None` on the epoch axis or when nothing is held. The
+    /// sealer rule's held-state leg
+    /// ([`key_grant::check_sealer`](crate::federation::key_grant::check_sealer)):
+    /// where this node holds the content, the row's signer must speak for its
+    /// author.
+    ///
+    /// The default is `None`: a directory with no blob plane holds no content.
+    /// The sqlite and postgres backends answer from their blob and stream
+    /// tables.
+    async fn key_grant_held_owner(
+        &self,
+        axis: &key_grant::KeyGrantAxis,
+    ) -> Result<Option<String>, Error> {
+        let _ = axis;
+        Ok(None)
+    }
+
+    /// v55.0.0 (CIRISPersist#989) — **project an admitted key-grant row into
+    /// this node's grant tables**
+    /// ([`key_grant::project_key_grant_row`](crate::federation::key_grant::project_key_grant_row)).
+    /// The typed attestation doors (wire, sync) call it after the store
+    /// inserted or already held the row, so a row that reaches this node by
+    /// any typed door carries its wrap with it.
+    ///
+    /// The default is a no-op: a directory with no grant tables has nothing to
+    /// project into. The sqlite and postgres backends project.
+    async fn project_key_grant_row(&self, row: &Attestation) -> Result<(), Error> {
+        let _ = row;
         Ok(())
     }
 
@@ -3613,6 +3692,25 @@ pub trait FederationDirectory: Send + Sync {
                     && first_evidence_ref(&a.attestation_envelope) == Some(evidence_ref)
             })
             .collect())
+    }
+
+    /// v55.0.0 (CIRISPersist#989, V190) — the federation-tier rows of ANY
+    /// attester under exactly `dimension` whose envelope's `evidence_refs`
+    /// FIRST element is `evidence_ref`: every device's `custody:ack:v1`
+    /// holding claims about one blob, the holder directory's candidate set
+    /// ([`holding_claim::holder_claims`]). Ordered by `asserted_at` DESC.
+    /// Served by V190's `(dimension, evidence_refs[0])`. Defaulted
+    /// `Unsupported` (no unbounded read is keyed this way); every backend
+    /// overrides.
+    async fn list_attestations_citing_by_dimension(
+        &self,
+        dimension: &str,
+        evidence_ref: &str,
+    ) -> Result<Vec<Attestation>, Error> {
+        let _ = (dimension, evidence_ref);
+        Err(Error::Unsupported {
+            method: "list_attestations_citing_by_dimension",
+        })
     }
 
     /// v53.1.6 — the federation-tier rows placed at one of `cohort_scopes`
@@ -5020,7 +5118,7 @@ pub trait FederationDirectory: Send + Sync {
     /// collision with differing content.
     ///
     /// Unlike `self` / `family`, community content is NOT structurally
-    /// invisible ([`crate::federation::types::cohort_scope::suppresses_holds_bytes`]
+    /// invisible ([`crate::federation::types::cohort_scope::is_structurally_invisible`]
     /// is false for `community`) — read paths federate community
     /// content normally.
     async fn put_community(&self, community: SignedCommunity) -> Result<(), Error>;
@@ -9712,6 +9810,34 @@ pub enum Error {
         plane: &'static str,
     },
 
+    /// v55.0.0 (CIRISPersist#1055, from CIRISEdge's adopt of v54.1) — **the
+    /// signed row is malformed.** Its bytes cannot be read as the claim they
+    /// carry: it names no signer, a member of its signed envelope is missing
+    /// or ill-typed, a typed column diverges from the envelope it mirrors, or
+    /// the envelope does not canonicalize. **Terminal at the first refusal**:
+    /// no row this node could receive later changes the verdict on these
+    /// bytes, so a sender stops re-offering them. Before v55.0.0 each was an
+    /// [`Error::InvalidArgument`] an adopter could not tell from a caller
+    /// argument error (Edge bounded them at 8 refusals, then terminal).
+    ///
+    /// `reason` is the stable token, one of [`malformed_row`]'s constants;
+    /// `plane` names the door. The Display is the pre-v55 text without the
+    /// `invalid argument:` prefix. Stable `kind()` token
+    /// `federation_malformed_row`; Python `ValueError("federation_malformed_row:
+    /// {plane}: {reason}")`, the type of the `InvalidArgument` arm it replaces.
+    #[error("{message}")]
+    MalformedRow {
+        /// The door that read the row: `identity_occurrence`,
+        /// `identity_occurrence_revocation`, `transport_destination`,
+        /// `touch_claim`, `attestation`, `key_registration`, `signed_envelope`,
+        /// `custody_ack`, …
+        plane: &'static str,
+        /// Why: a [`malformed_row`] token.
+        reason: &'static str,
+        /// The full refusal text (the Display).
+        message: String,
+    },
+
     /// v54.1.0 (CIRISPersist#1042 follow-up C, CIRISEdge#858) — a
     /// `licensure:{A}` row that claims a delegation (`delegation_id`) is not
     /// the authority's own issuance on a live `license` chain from `A` (CC
@@ -9720,11 +9846,15 @@ pub enum Error {
     /// to prefix-match; `reason` is now the stable token, one of
     /// [`admission::licensure_refusal`]'s constants (the
     /// [`admission::LicensureChainBreak`] tokens and
-    /// `not_authority_at_receipt`). The Display is the pre-v54.1 text,
-    /// unchanged. Stable `kind()` token
+    /// `not_authority_at_receipt`). Stable `kind()` token
     /// `federation_licensure_delegator_not_authority`; Python `ValueError`, the
     /// type of the `InvalidArgument` arm it replaces.
-    #[error("invalid argument: {message}")]
+    ///
+    /// v55.0.0 (CIRISPersist#1055) — the Display is `{message}` alone, which
+    /// begins `licensure_delegator_not_authority: {reason}: …`. The
+    /// `invalid argument:` prefix it kept from the arm it replaced made logs
+    /// read it as an `InvalidArgument`.
+    #[error("{message}")]
     LicensureDelegatorNotAuthority {
         /// The row's emitter.
         attesting_key_id: String,
@@ -9806,9 +9936,9 @@ pub enum Error {
     /// `media` Source struct did not parse (CC 3.3.13: a missing or
     /// non-positive `size`, a malformed `format`, a MUST-NOT `safe` /
     /// `renderable` / tier bit, an unknown member, a `digest` the row does
-    /// not cite in `evidence_refs[]`), or a `holds_bytes` claim carries no
-    /// `size` (CC 5.3.2.5: size is checked first, so a claim without one is
-    /// a claim nobody can check). Refused at every door so a descriptor the
+    /// not cite in `evidence_refs[]`). (Before v55.0.0 also a `holds_bytes`
+    /// claim with no `size`; the holding claim's size is now the custody
+    /// parse's, CIRISPersist#989.) Refused at every door so a descriptor the
     /// puller cannot bound its read by is never admitted. `member` names
     /// WHICH member; `reason` is [`media_source::MediaSourceError`]'s text.
     #[error("media source member `{member}` refused: {reason}")]
@@ -10499,8 +10629,9 @@ pub enum Error {
     },
 
     /// v53.0.0 (CIRISPersist#975, **CC 2.4** carrier shape). A row of a
-    /// registered CARRIER type (`holds_bytes:sha256:{prefix}`,
-    /// `key_grant:{axis}:v1`) whose shape is not a carrier's: not a
+    /// registered CARRIER type (`key_grant:{axis}:v1` while v55's temporary
+    /// exception admits it; `holds_bytes` retired in v55.0.0) whose shape is
+    /// not a carrier's: not a
     /// self-attestation, an envelope `kind` other than the carrier's, or a
     /// `dimension` / `score` / `confidence` / `weight` / non-empty
     /// `subject_key_ids` — the members that would make it a claim. Enforced in
@@ -11921,18 +12052,73 @@ pub enum Error {
     },
 }
 
+/// v55.0.0 (CIRISPersist#1055) — the closed set of [`Error::MalformedRow`]
+/// reasons. Every one is TERMINAL for the bytes it names.
+pub mod malformed_row {
+    /// The row names no signer (an empty or blank signer id): no Key row can
+    /// ever land for `""`.
+    pub const NO_SIGNER: &str = "no_signer";
+    /// A member the signed envelope must carry is absent.
+    pub const ENVELOPE_MEMBER_MISSING: &str = "envelope_member_missing";
+    /// A signed envelope member is present but ill-typed: not a string, not
+    /// RFC 3339, not a finite number, not base64 of the right length, not an
+    /// array of threshold signatures, an instant finer than a microsecond.
+    pub const ENVELOPE_MEMBER_INVALID: &str = "envelope_member_invalid";
+    /// A typed column diverges from the signed envelope member it mirrors.
+    pub const TYPED_DIVERGES_FROM_ENVELOPE: &str = "typed_diverges_from_envelope";
+    /// The signed envelope does not canonicalize (JCS), so there are no bytes
+    /// a signature could cover.
+    pub const ENVELOPE_NOT_CANONICAL: &str = "envelope_not_canonical";
+    /// A `custody_ack` report's dimension or envelope does not parse (CC
+    /// 3.1.3.3).
+    pub const CUSTODY_ACK: &str = "custody_ack_malformed";
+    /// A moderation row's signed subject digest does not parse
+    /// (CIRISPersist#784).
+    pub const MODERATION_SUBJECT_DIGEST: &str = "moderation_subject_digest_malformed";
+
+    /// Every token, for the from-disk witnesses and adopters' tables.
+    pub const ALL: &[&str] = &[
+        NO_SIGNER,
+        ENVELOPE_MEMBER_MISSING,
+        ENVELOPE_MEMBER_INVALID,
+        TYPED_DIVERGES_FROM_ENVELOPE,
+        ENVELOPE_NOT_CANONICAL,
+        CUSTODY_ACK,
+        MODERATION_SUBJECT_DIGEST,
+    ];
+}
+
 impl Error {
+    /// v55.0.0 (CIRISPersist#1055) — THE constructor of
+    /// [`Error::MalformedRow`].
+    pub(crate) fn malformed_row(
+        plane: &'static str,
+        reason: &'static str,
+        message: impl Into<String>,
+    ) -> Self {
+        Error::MalformedRow {
+            plane,
+            reason,
+            message: message.into(),
+        }
+    }
+
     /// v54.1.0 (CIRISPersist#1042 follow-up B, CIRISEdge#858) — the refusal
     /// for a signer this node holds no Key row for. THE one constructor of
     /// [`Error::AttesterKeyUnknown`]: a row that names NO signer (an empty or
-    /// blank id) is malformed, a terminal [`Error::InvalidArgument`], never the
-    /// retryable ordering gap — no Key row can ever land for `""`.
+    /// blank id) is malformed, a terminal [`Error::MalformedRow`]
+    /// ([`malformed_row::NO_SIGNER`], v55.0.0), never the retryable ordering
+    /// gap — no Key row can ever land for `""`.
     pub(crate) fn unknown_signer(attesting_key_id: &str, plane: &'static str) -> Self {
         if attesting_key_id.trim().is_empty() {
-            return Error::InvalidArgument(format!(
-                "{plane}: the row names no signer (empty attesting key id) — malformed, not an \
-                 ordering gap"
-            ));
+            return Error::malformed_row(
+                plane,
+                malformed_row::NO_SIGNER,
+                format!(
+                    "{plane}: the row names no signer (empty attesting key id) — malformed, not \
+                     an ordering gap"
+                ),
+            );
         }
         Error::AttesterKeyUnknown {
             attesting_key_id: attesting_key_id.to_owned(),
@@ -11948,6 +12134,7 @@ impl Error {
             Error::SignatureInvalid(_) => "federation_signature_invalid",
             Error::AttesterKeyUnknown { .. } => "federation_attester_key_unknown",
             Error::SignerDoesNotActFor { .. } => "federation_signer_not_acting_for",
+            Error::MalformedRow { .. } => "federation_malformed_row",
             Error::LicensureDelegatorNotAuthority { .. } => {
                 "federation_licensure_delegator_not_authority"
             }

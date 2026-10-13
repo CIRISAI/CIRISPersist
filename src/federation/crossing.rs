@@ -25,8 +25,8 @@
 //!
 //! A row authored at `(local, self)` therefore crosses to `(federation, self)`
 //! — the CC 5.2 shape: replicated to the owner's own nodes by consent fan-out,
-//! **not discoverable** (no `holds_bytes`). Widening it to a community is a
-//! second row. This is what the constitution's worked example (CC 8.1.5) shows,
+//! **not discoverable** (its holding claims stay in the cohort). Widening it
+//! to a community is a second row. This is what the constitution's worked example (CC 8.1.5) shows,
 //! and it is what edge's `share` composes from these two verbs.
 //!
 //! ## Custody — the three-key model made mechanical
@@ -173,8 +173,8 @@ pub enum RevocationAuthority {
 /// (AV-45, [`admission::DimensionAdmissionPolicy::check_write_cohort_scope`])
 /// against the cohort the row names, so a family/community audience without
 /// its id is not an audience. Edge's `With::MyFamily` / `With::Community(id)`
-/// map onto these. [`Audience::discoverable`] is CC 5.2: `self`/`family`
-/// replicate by consent fan-out but never emit `holds_bytes`.
+/// map onto these. [`Audience::discoverable`] is CC 5.2 / 3.1.3.3: only a
+/// Commons placement's holding claims are at `federation`.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Audience {
@@ -285,12 +285,17 @@ impl Audience {
         Self::from_cohort_scope(&row.cohort_scope, target)
     }
 
-    /// CC 5.2 — whether the row emits `holds_bytes`. `self`/`family` do NOT:
-    /// they still replicate (to the owner's / the family's nodes, by consent
-    /// fan-out) but are structurally undiscoverable.
+    /// CC 5.2 / 3.1.3.3 — whether content placed here is discoverable by
+    /// anyone: its holding claims are at `federation`. v55.0.0
+    /// (CIRISPersist#989, CIRISConstitution#141) — only a Commons placement:
+    /// `self`/`family` and the rooms replicate to their cohort, and their
+    /// holding claims are placed at the cohort's scope and reach its members
+    /// only. (A `public` room is Commons-TIER, a property of the community
+    /// record, not of this placement.)
     #[must_use]
     pub fn discoverable(&self) -> bool {
-        !cohort_scope::suppresses_holds_bytes(self.cohort_scope())
+        cohort_scope::Scope::parse(self.cohort_scope())
+            .is_some_and(|s| s.placement() == cohort_scope::Placement::Commons)
     }
 }
 
@@ -434,8 +439,8 @@ pub enum Custody {
 pub struct Replicates {
     /// The wire kinds this row is served under.
     pub kinds: Vec<String>,
-    /// CC 5.2 — `false` for `self`/`family`: replicated by consent fan-out,
-    /// never advertised via `holds_bytes`.
+    /// CC 5.2 / 3.1.3.3 — `true` only for a Commons placement, whose holding
+    /// claims are the federation's holder directory.
     pub discoverable: bool,
 }
 

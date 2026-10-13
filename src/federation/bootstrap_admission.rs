@@ -3470,9 +3470,11 @@ pub mod test_support {
                 msg.contains(member) && msg.contains("643"),
                 "({tag}) B11-{arm}: the refusal must name `{member}` and the rule: {msg}"
             );
+            // v55.0.0 (CIRISPersist#1055) — a column off its signed mirror is
+            // the terminal `MalformedRow`, typed apart from an argument error.
             assert_eq!(
                 err.kind(),
-                "federation_invalid_argument",
+                "federation_malformed_row",
                 "({tag}) B11-{arm}: refusal kind is parity-asserted across backends: {err:?}"
             );
             // REFUSED, not refused-after-storing (AV-9).

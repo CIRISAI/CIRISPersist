@@ -7,6 +7,1116 @@ threat-model citations because this crate's audit story is the point.
 
 ## [Unreleased]
 
+## [55.0.0] - 2026-10-12
+
+### Changed — CIRISConstitution v1.0-rc7 vendored (#753, slice A0)
+
+- `namespace_registry.json` and `namespace_match_vectors.json` are copied
+  byte-for-byte from the `v1.0-rc7` TAG (`536b8cb`, annotated tag `686d274`):
+  168 families (was 158), `registry_sha256 796f6099…` (was `f666f334…`), 1103
+  dimension vectors and 25 row-type vectors. `scripts/check_vendored_cc.sh
+  v1.0-rc7` passes. `namespace_match_binds.json` is regenerated from the
+  reference matcher at the tag.
+- **Families added (11):** `accord:lifecycle:confirmed`, `community:listing`,
+  `group:roster`, `identity:occurrence`, `key:record`, `key:revocation`,
+  `key_grant:{axis}`, `ledger:head:{unit}:{version}`,
+  `ledger:checkpoint:{unit}:{version}`, `ledger:promotion:{version}`,
+  `settlement:*`. **Retired (1):** `holds_bytes:sha256:{prefix}` (CC 2.4,
+  CIRISConstitution#141). **Changed:** `accord:*` lists the new leaf;
+  `membership:{stage}` gains `widening`, `removal`, `resignation`. The
+  `key_grant:` reserved stem ("carrier row type, never a dimension") is gone
+  and a `community:` stem is gated ("community:listing is the only leaf").
+- **The `ledger:` staging latch is deleted.** CC rc7 registers the CC
+  3.3.10.1 ledger leaves (CIRISConstitution#92/#105), so `ledger:*` rows now
+  admit at federation tier, under the L1 triple binding and a new owner rule
+  (`check_ledger_emitter_admission`): the signer must act for the attested
+  owner (its key, a live occurrence, or its node binding). The rc7 rows carry
+  the CC 3.1.3 section default `substrate-self-report`; persist follows the
+  table cell ("the ledger's single owner … or a delegate") and refuses the
+  `delegates_to` delegate path until a door reads the ledger's declared
+  serialization discipline.
+- **`settlement:*` admits (CC 3.3.10).** A `scores` row on any
+  `settlement:*` leaf admits from the payer, on the private arm
+  (`cohort_scope: self`) and the auditable arm (`federation` / `public`), and
+  the payee's `settlement:received:*` counter-attestation admits too. Its
+  envelope is scanned by `reject_payment_processor_identifiers`, the gate the
+  operational envelopes already run: a Stripe-shaped identifier anywhere in a
+  settlement row is refused. The rc7 row says `substrate-self-report`; the CC
+  3.1.3 table says "Reserved? No" and CC 3.3.10 names the payer, and persist
+  follows the text.
+- **Held shut until their door:** `key_grant:{axis}:v1` as a dimension (v55
+  slice B, #989) and `membership:widening|removal|resignation:v1` (#991).
+  rc6 refused all four; rc7 registers them; persist has no gate that enforces
+  CC's rule on them yet, so `admission::REGISTERED_FAMILIES_HELD_SHUT` refuses
+  them at every federation-tier door.
+- **TEMPORARY carrier exception.** rc7 empties `_meta.row_types.carriers`.
+  Persist's blob doors and key-grant sets still write the two rc6 carriers, so
+  `registry::RC6_RETIRED_CARRIERS_ADMITTED_UNTIL_989` keeps exactly
+  `holds_bytes:sha256:{8 hex}` and `key_grant:(content|epoch|stream):v1`
+  admitted as carrier row types, carrier shape still enforced, until v55
+  slices A and B retire them. A from-disk gate (I701) fails once a 55.0.0 or
+  later release is dated in this file while the const is non-empty.
+- Reserved and not yet gated (admitted as before, when they were unregistered
+  open vocabulary): `key:record`, `key:revocation`, `identity:occurrence`,
+  `group:roster` (#991), `community:listing` (#1053).
+- Evidence: the `CLM-ledger-standard` row that cited the staging latch now
+  cites `check_ledger_emitter_admission`.
+- Witnesses I700–I706 (memory, sqlite, postgres).
+
+### Adoption — what Edge and Server must handle (#753)
+
+- **New refusal reason token** `registered_family_held_shut` on the existing
+  `federation_dimension_rejected` kind (`Error::DimensionRejected`), for a
+  dimension under `key_grant:` or `membership:widening:` /
+  `membership:removal:` / `membership:resignation:`. Terminal for this release.
+- **`ledger:*` rows** now refuse `federation_signer_not_acting_for`
+  (`Error::SignerDoesNotActFor`, plane `"ledger"`, retryable) when the signer
+  does not act for the attested owner, and `federation_dimension_rejected` /
+  `ledger_l1_binding_violation` on a binding mismatch, where they were refused
+  `federation_namespace_family_unregistered` before.
+- **`settlement:*` rows** refuse `federation_payment_processor_identifier`
+  (`Error::PaymentProcessorIdentifier`) on a processor identifier.
+- **Matcher answers that change:** `key_grant:{axis}:v1`,
+  `membership:{widening|removal|resignation}:v1`, the ledger and settlement
+  leaves, `community:listing:v1`, `group:roster:v1`, `key:record:v1`,
+  `key:revocation:v1`, `identity:occurrence:v1` and
+  `accord:lifecycle:confirmed:v1` now resolve; any other `community:*` leaf
+  refuses `namespace_family_unregistered`; `holds_bytes:sha256:*` no longer
+  resolves to a family. `authority_for` gives the ledger rows and
+  `settlement:*` the `SubstrateSelf` class (CC's row data).
+- No new error variant, no new exhaustive enum variant, no FFI or `.pyi`
+  surface change, no migration.
+
+### Slice C — doors and takedown (#952, #951, #1007, #1059)
+
+- **#952 — the incremental plaintext chunk-DAG write.** Two doors replace
+  buffering a whole commons file: `Engine::put_plaintext_dag_chunk(entry,
+  body, author_key_id)` stores ONE chunk against its manifest entry (the
+  one-shot door's per-chunk checks, now the shared
+  `blobs::prepare_dag_chunk_row`: an inline body hashes to the entry and is
+  exactly its size; the WILL decision asked as the one-shot door asks it) and
+  writes no manifest row and no claim; `Engine::finalize_blob_chunks_signing(
+  manifest, author_key_id)` checks the manifest is a plaintext v1 DAG, then in
+  ONE transaction (`BlobStorage::put_dag_manifest_over_held`, new trait
+  method, sqlite and postgres) reads every chunk row it names and writes the
+  `chunk_dag` row only over a whole DAG, then emits the manifest's holding
+  claim exactly as `put_blob_chunks_signing` does (one shared call site,
+  `announce_plaintext_dag`). Until finalize the DAG's address is absent to
+  every read and listing. A missing chunk is `blob_not_held` naming it, with
+  nothing written. A chunk stored and never finalized is an unclaimed commons
+  row the retention sweep may evict like any other.
+- **#951 — a sealed DAG is announced at promotion, never at the manifest
+  adopt.** `Engine::promote_adopted_manifest_to_dag` gains a required
+  `disposition: AdoptDisposition`. Under `Announce` this node's holding claim
+  for the root (`custody:ack:v1` `here`, whose door asks again that every
+  chunk is held) is emitted once the promotion's checks pass, on a re-run too;
+  `LocalOnly` emits nothing. `DagPromotion` gains `announced`. The puller
+  adopts the manifest `LocalOnly`.
+- **#1007 — takedown on the CC 2.3 tombstone (CC 4.5.3 step 2, CC 4.5.5).**
+  A takedown is now ONE bytes-plane tombstone, `blob:{content_sha256}`,
+  written on the steward purge's V187 tables in its row shape (one shape for
+  both bases, one row per record keyed by its digest): the header carries the
+  notice's `legal_basis`, `record_count` 1, the digest of `["blob:{sha}"]`,
+  the notice's JCS (whose hash is the notice id) and no cosignatures. New
+  module `federation::takedown_tombstone`:
+  - `takedown_tombstone(directory, notice, executed_by)` verifies the signed
+    `takedown_notice` Contribution (the cirisnode track's own signature rule)
+    and asks CC 4.5.5 of THIS node's state through ONE function,
+    `takedown_authority`, which `put_contribution`'s takedown gate now calls
+    too: a signed subject of a row binding the content, a named moderator of a
+    community the content is BOUND INTO here, or a delegate a steward-bound
+    duty-holder reaches over a live `takedown`-scoped chain. **The content's
+    community is read from the held binding rows, never from the notice's
+    `community_id`** (operator ruling; before v55 `put_contribution` judged a
+    takedown under whatever community the notice named). No binding row held
+    is `takedown_content_unbound` (retryable: an ordering gap). Every basis
+    needs a duty-holder (operator ruling; CC is asked whether "from any
+    claimant" was meant for the immediate-removal bases);
+  - the tombstone withholds the bytes from every read door at once
+    (`blob_purged`, naming the notice) and replicates as a `PurgeBundle`;
+    `apply_replicated_takedown` re-verifies the signature and CC 4.5.5 on the
+    RECEIVER's state and refuses a bundle naming anything but the notice's
+    own content on the bytes plane (`takedown_not_bytes_plane`);
+  - per basis (`basis_disposition`, CC 4.5.3): an immediate-removal basis
+    (`tvec_terrorist`, `ncmec_csam`, `gifct_cip`, `perceptual_hash_csam`,
+    `court_order`) settles at once and the Engine destroys this node's bytes
+    on receipt (locally and on a replica); a counter-notice basis
+    (`dmca_512` 10 d, `dsa_article_16` 14 d, `osa_illegal_content` 14 d,
+    `community_standards` 30 d) withholds at once, retracts this node's own
+    holding claim, and `purge_finalize` deletes after the window; the age-gate
+    basis writes no tombstone. `steward_purge`'s settle reads the header's
+    basis through `takedown_tombstone::settles_at` (W = 72 h for
+    `steward_purge`, unchanged). An immediate-removal takedown records ONE
+    `hard_case:fast_path_takedown` per notice on each node that executes or
+    applies it (CC 4.5.3 step 4; the `hard_case:{kind}` family is registered
+    at rc7, open vocabulary): `target_key_id` the notice id, `detail` the
+    content, basis, signer and origin. The fast path waives the CC 4.5.1
+    quorum and the counter notice, never the duty-holder gate (confirmed by
+    the CC session; "any claimant" is corrected in rc8 CC 4.5.3 step 1).
+  - **A non-holder's `withdraws` of a holding claim is refused at the door**,
+    stamped or not (`custody_ack_withdraws_not_the_holder`, CC 3.1.3.3 rule 4):
+    a `holds_bytes` claim, and the rc7 `custody:ack:v1` report. Before v55 the
+    unstamped form was admitted inert because the takedown handler and
+    `evict_actor` emitted it.
+  - `cirisnode::process_takedown_admission` now takes the Engine and the
+    signed `ContributionEnvelope` and runs the tombstone door; it no longer
+    lists holders, withdraws their claims, or runs `evict_actor` per holder
+    (which deleted every blob a holder held, not the one taken down).
+    `process_takedown_admission_with_config` and the cirisnode
+    `TakedownReport` are removed. **`MultimediaConfig` is removed** (clean
+    break, operator ruling): its three knobs only steered the old handler,
+    and narrowing CC 4.5.3's immediate set made a node non-conformant.
+  - **Taken-down bytes never come back** (operator ruling): every byte write
+    floor (`put_blob_with_scope`, `store_blob_local`, `put_blob_chunks`, the
+    chunk floor, `adopt_sealed_blob_at`, `put_dag_manifest_over_held`, both
+    backends) asks `steward_purge::refuse_tombstoned_bytes` before it stores
+    an address, for a takedown's tombstone and a steward purge's alike, and
+    refuses `BlobError::Purged` naming the notice (the read doors' answer).
+    A from-disk gate (I797) holds every `federation_blobs` insert to it.
+  - `evict_actor` (sqlite, postgres) retracts only claims the evicting signer
+    signed; the bytes are deleted as before. `retract_own_holding_claims_on`
+    is the eviction's first half, shared with the takedown.
+- **#1059 — evidence.** `CLM-one-tombstone-row` (CC 4.5.3, 5 rows) and
+  `CLM-derived-rows-follow-reason` (CC 2.4.1.1, 4 rows: the purge half's
+  `resolve_selection` and `withhold_orphaned_derivatives`, and the takedown
+  half: a score over content later taken down on a legal basis stands, its
+  evidence ref resolving to the tombstone through `purge_withheld`) are
+  published through `namespace_supersets.json` (`manifest_round:
+  v55-c-1007`, each naming its witnesses) and `scripts/evidence_tsv.py
+  write`. The version-pin witness's exact count rises by 9.
+- Witnesses I780–I799 (`doors_takedown_invariants`; I784/I791b in
+  `dag_link_invariants`; I785/I785b in `cirisnode::takedown_handler`; I791
+  also extends I520 in `retraction_invariants`).
+- No migration.
+
+### Adoption — slice C (what Edge and Server must handle)
+
+- **New doors:** `Engine::put_plaintext_dag_chunk` / Python
+  `put_plaintext_dag_chunk(chunk_sha256_hex, size, body, author_key_id) ->
+  str`; `Engine::finalize_blob_chunks_signing` / Python
+  `finalize_blob_chunks_signing_json(payload_json) -> str` (`{"manifest": {…},
+  "author_key_id": …}` → `{"manifest_sha256", "announced": true}`; a missing
+  chunk raises the `blob_not_held` class). `Engine::takedown_tombstone(&
+  TakedownNotice)`. `BlobStorage::put_dag_manifest_over_held` (trait
+  implementers: a new required method).
+- **Changed signatures:** `Engine::promote_adopted_manifest_to_dag(sha,
+  viewer, aad, disposition)`; Python `promote_adopted_manifest_to_dag_json(
+  at_rest_sha256_hex, viewer_key_id, disposition, caller_aad_b64=None)` with
+  `disposition` `"announce"` | `"local_only"` (required) and an `announced`
+  field in the answer. Edge's sealed-DAG pull adopts the manifest
+  `local_only` and promotes with `announce`.
+  `cirisnode::process_takedown_admission(engine, contribution)`; Python
+  `cirisnode_process_takedown_admission_json(contribution_json)` takes the
+  signed `takedown_notice` `ContributionEnvelope` JSON and returns the
+  tombstone report `{notice_id, content_sha256, legal_basis, disposition:
+  {kind: destroy_on_receipt | withhold_then_delete (+ window_days) |
+  age_gate}, signer, tombstoned, settles_at, claims_retracted,
+  bytes_destroyed}`. Server's takedown report fields
+  `holders_seen` / `withdraws_*` / `holders_evict*` /
+  `scheduled_eviction_at` / `age_gate_applied` are gone.
+- **Removed:** `cirisnode::process_takedown_admission_with_config`, the
+  cirisnode `TakedownReport`.
+- **New refusal tokens** on `Error::PurgeRefused` (Python
+  `ValueError(token, body_json)`): `takedown_unauthorised`,
+  `takedown_not_bytes_plane`, and `takedown_content_unbound` (RETRYABLE,
+  body `retryable: true`: no row binding the content is held yet). A
+  replicated takedown bundle arrives through the existing
+  `apply_replicated_purge(_json)` door; a v54.1 receiver refuses one
+  `purge_unauthorised`.
+- **`put_contribution` of a `takedown_notice`** is judged under the
+  content's HELD binding: a notice for content with no binding row held is
+  now `cirisnode_not_found` (`takedown_content_unbound: …`, retry once the
+  binding replicates), and a moderator of the community the notice names is
+  refused when the content is bound elsewhere.
+- **Byte writes of taken-down or purged content** (`put_blob*`,
+  `store_plaintext_local`, adopts, chunk appends, both DAG doors) now refuse
+  `blob_purged` (`BlobError::Purged`), where they stored the bytes withheld.
+- **New audit row** `hard_case:fast_path_takedown` (listed by
+  `list_hard_case_events`) for every immediate-removal takedown.
+- **Removed (Server sets these):** `cirisnode::MultimediaConfig`,
+  `cirisnode::MultimediaConfigWire`, `Engine::set_multimedia_config`,
+  `Engine::multimedia_config`, Python `set_multimedia_config_json` /
+  `get_multimedia_config_json`, and the fields `counter_notice_window_days`,
+  `immediate_legal_bases`, `age_gate_legal_bases`.
+- **Newly refused:** a `withdraws` of another key's `holds_bytes` claim or
+  `custody:ack:v1` report, unstamped, is `custody_ack_withdraws_not_the_holder`
+  (`federation_invalid_argument`, `ValueError`), where it was admitted inert.
+- New enum `takedown_tombstone::TakedownDisposition` (`DestroyOnReceipt`,
+  `WithholdThenDelete { window_days }`, `AgeGate`); `DagPromotion` gains
+  `announced`. No exhaustive enum an adopter matches gains a variant.
+
+### Slice A — one holding claim (#989 / CIRISConstitution#141), public rooms (#1053 / #142), the row-type slot (#975)
+
+#### Changed — the holding claim is `custody:ack:v1` at the content's scope
+
+- **`holds_bytes` is retired; `custody:ack:v1` `here` is the one holding
+  claim at every tier (CC 3.1.3.3, 2.4, 5.3.2.1).** `holding_claim.rs` is its
+  one home: `ClaimScope::of_content` (the scope is the CONTENT's — Commons
+  tier, which includes `public` and `infrastructure` rooms, at `federation`
+  with no target; sealed content at its own `self` / `family` / `community` /
+  `affiliations` cohort and group), `holding_claim_row` (the one row: a
+  `scores` row on `custody:ack:v1`, `here`, attested by and about the holder,
+  the full digest in `evidence_refs`, the size, `expires_at` = signed instant
+  + 72 h), `sign_holding_claim`, and `emit_holding_claim(backend, local, sha,
+  now)` for a row this node already stores.
+- **Every door emits it.** `put_blob*` (the commons doors, in the write's
+  transaction, as before), `put_blob_scoped` at every tier (the sealed
+  cascades announce through `emit_holding_claim` — a room's claim is at the
+  ROOM's scope, never `federation`, which was the rc6 defect; a self/family
+  write is claimed at `self` / the family), `adopt_sealed_blob*` with
+  `Announce` (now admitted for `self` / `family` too: the claim stays in the
+  cohort), `seal_stream_scoped` (every tier) and `put_blob_chunks_signing`. A
+  node that is not in the content's cohort (an unclaimed node, a server-class
+  occurrence holding its owner's `self` content) stores the bytes and claims
+  nothing (`HoldingClaimOutcome::NotInCohort`, decided before signing).
+- **New BlobStorage door `put_holding_claim(sha, claim, scope)`** — announce a
+  claim for a held row (the floor `emit_holding_claim` ends at); refuses a
+  scope that is not the stored content's, a size that is not the stored
+  length, and a row no longer held.
+- **Every reader moved.** `list_holders` / `list_local_holders` /
+  `list_held_by` / `evict_actor` and `FederationDirectory::list_holders_sized`
+  have ONE implementation each (`holding_claim::*_of`, a provided default for
+  the sized read) over the custody fold: a holder's latest non-retired claim,
+  `here`, live for 72 h (any age when this node holds the bytes). The new
+  `list_attestations_citing_by_dimension` seek (V190) finds the candidates.
+  The steward purge's blob provenance (`blob_binding_subjects`, I821) and its
+  `ByActor` "bytes follow the claim" read the custody claim; the eviction
+  sweeper, `Engine::evict_blob` / `purge_evict_blob`, the epoch eviction and
+  `evict_actor` retract this node's OWN claims (a `withdraws` each, placed at
+  the claim's scope); the takedown handler retracts this node's own claim and
+  deletes its local copy (other holders are the CC 2.3 tombstone path's,
+  #1007). `MeshCrossing.replicates.discoverable` is true only for a Commons
+  placement.
+- **Admission.** The custody report admits `federation` and `affiliations`
+  placements; its `expires_at`, when present, must be the 72 h window
+  (`custody_ack_malformed`). A claim about a blob this node holds must sit at
+  that blob's scope (`custody_ack_scope_mismatch`, all three backends). A
+  `withdraws` of another device's claim is refused
+  (`custody_ack_withdraws_not_the_holder`), and the retraction fold never
+  lets one retire it (CC 3.1.3.3 rule 4); the v6.4.0 carve-out that let a
+  moderation key withdraw a `holds_bytes` row is gone.
+- **Who may claim (CC 3.1.3.3 rule 2).** A `family` claim is admitted only for
+  a holder on that family's roster (an active member, or an occurrence of one
+  whose allow list lets the family through); an unknown family has no roster.
+  Through v54 the custody gate asked whether the holder received its OWN row,
+  whose principal arm answered from the holder's owner alone — so a node in
+  no family could report custody at any family (witnessed by I52's family
+  arm, red before). A `self` claim's principal is the reporting device
+  (custody:ack:v1 names no owner): any claimed personal device may claim at
+  `self`, and the claim reaches only its own owner's devices.
+- **Plaintext room content is Commons (CC 3.2 infrastructure: "holding claims
+  at federation scope").** A custody report about an infrastructure room's
+  plaintext blob is at `federation` and names no room; one naming a room —
+  its own or another — is `custody_ack_malformed` (I525, I579 updated).
+- **The advertisement plane survives (I723).** A Commons claim crosses to a
+  node that shares no cohort with the writer and holds no copy; that node
+  lists the writer as a live, sized holder.
+- **Legacy `holds_bytes` rows.** A row a node holds is "reported to the
+  operator, … neither served nor replicated, and … not deleted" (CC 2.4):
+  `row_type_report` lists it, both serve reads leave it out, no fold reads it.
+  A new one is refused `attestation_type_unregistered` at every door under
+  either row-type mode (`registry::RETIRED_CARRIER_STEMS`). The temporary
+  rc6 exception (`RC6_RETIRED_CARRIERS_ADMITTED_UNTIL_989`) keeps only the
+  key-grant pattern; slice B removes it and the const.
+
+#### Added — the `public` room (#1053, CC 3.2)
+
+- `public_room.rs`: a `cohort_subkind: public` room is Commons tier
+  (`resolve_write_tier` → plaintext; the community DEK cascade refuses it),
+  its holding claims at `federation`. `admission: open` is admissible only on
+  a `public` room; an `admission` value other than `open` is malformed; no
+  version crosses the `public` boundary (all
+  `federation_community_consensus_protocol_violation`, rules
+  `open_admission_not_public`, `admission_malformed`, `public_subkind_changed`).
+- **Open admission:** a founder's STANDING `membership:proposal:v1` (no
+  invitee) of an open public room is admitted; any requester's own
+  `membership:acceptance:v1` naming it is their consent and satisfies the
+  growth gate while the room is open (`membership_open_proposal_not_open`
+  otherwise). `membership_acceptance::standing_proposal_input` builds one.
+- **`community:listing:v1` door** (`check_community_listing_admission`, all
+  three backends and the promotion chokepoint): federation-scoped, names the
+  room and its moderator, states the room's subkind and admission policy, by
+  a founder or a current `moderate`-holder. A listing whose room record this
+  node does not hold YET is refused RETRYABLY — the signer's authority lives
+  in the record — as `federation_write_scope_refused` /
+  `scope_membership_unresolved` (the #797 "roster not held here yet" shape),
+  and the same row is admitted when re-offered after the record lands (I724).
+  `public_room::live_listing` is the "one live row per community" read fold.
+- Delivering a standing proposal to a non-member requester is not built
+  (#1063).
+
+#### Added — the re-ack (CC 3.1.3.3 rule 5)
+
+- **`holding_claim::reack_own_claims(backend, local, now)`** renews this
+  node's own holding claims once they are a day old
+  (`HOLDING_CLAIM_REACK_AFTER_SECS`), through `emit_holding_claim` (the same
+  content-derived scope), for bytes it still holds. A claim about bytes it no
+  longer holds is never renewed and lapses at 72 h; a blob it never claimed (a
+  `LocalOnly` copy) is never claimed by it. Idempotent: a second pass at the
+  same instant renews nothing. Returns `ReackReport { scanned, renewed,
+  fresh, not_held, not_in_cohort, failed }` (I725).
+- **`Engine::reack_holding_claims_once(now)`** and
+  **`Engine::spawn_reack_sweeper()`**, which has the eviction sweeper's task
+  shape (`EvictionSweeper` handle with `stop()`). It wakes hourly
+  (`HOLDING_CLAIM_REACK_SWEEP_INTERVAL`) and is `None` without a PQC local
+  signer. The Python engine spawns it at construction and stops it at
+  `close()`. Python: **`Engine.reack_holding_claims_once()`** returns the
+  report as JSON.
+
+#### Changed — Python sees the blob refusal's token
+
+- `BlobError::InvalidArgument` now reaches Python as `ValueError(
+  "blob_invalid_argument: <detail>")`, so the detail's leading `<token>:`
+  (`custody_ack_scope_mismatch`, `holding_claim_scope_unresolved`,
+  `custody_ack_outside_cohort`, …) is what a host keys on. The kind stays the
+  prefix, so `startswith("blob_invalid_argument")` still matches; through v54
+  the text was the bare kind.
+
+#### Deploy ordering — upgrade the fleet together
+
+- **v55 nodes do not read v54 `holds_bytes` claims** (a held one is inert,
+  CC 2.4), and v54 nodes do not read v55 `custody:ack:v1` claims as holders.
+  During a mixed fleet, discovery of bytes held ONLY by v54 peers waits until
+  those peers upgrade and re-announce. Upgrade the fleet together. A v55 node
+  claims the bytes it holds on its next write, adopt or announce, and the
+  re-ack keeps those claims live.
+
+#### #975 — the row-type slot
+
+- Report-only as shipped in v53 (`ROW_TYPE_ENFORCEMENT = Report`): with rc7
+  vendored the allowlist is the five plus the one rc6 carrier still excepted;
+  any other type is admitted, counted per stem and logged, except a RETIRED
+  carrier, which is refused in either mode. The flip to `Enforce` waits on
+  the Server census (0 of 606 legacy `consent` authors re-authored at
+  2026-10-05).
+
+#### Removed (clean break, no aliases)
+
+- `sign_holds_bytes_claim`, `holds_bytes_attestation_envelope`,
+  `holds_bytes_attestation_type`, `holds_bytes_attestation_row`,
+  `PreparedHoldsBytes`, `prepare_holds_bytes_row`, `DEFAULT_HOLDS_BYTES_TTL`
+  (the 24 h TTL), `HOLDS_BYTES_ATTESTATION_TYPE_PREFIX`,
+  `HOLDS_BYTES_PREFIX_HEX_LEN`, `media_source::holds_bytes_claim_size`,
+  `media_source::check_holder_claim_size`, `renditions::holder_claim_size`,
+  `renditions::sized_holder_claims`.
+- Renamed: `cohort_scope::suppresses_holds_bytes` →
+  `cohort_scope::is_structurally_invisible`;
+  `replication::withdraws_attestation_envelope`'s second parameter is the
+  target's `attestation_type`.
+- `BlobStorage::adopt_sealed_blob_at` gains `group_key_id: Option<&str>`
+  (recorded on the row, V177; the claim's target).
+
+#### Migrations
+
+- **V190** `federation_attestations_dimension_citation` — `(dimension,
+  evidence_refs[0])`, both dialects: the holder directory's attester-free
+  citation seek.
+
+### Slice D — hardening backlog
+
+#### Changed — a malformed signed row is a typed, TERMINAL refusal (#1055, from CIRISEdge's adopt of v54.1)
+
+- **`Error::MalformedRow { plane, reason, message }`**, kind `federation_malformed_row`, replaces the generic `InvalidArgument` wherever a signed row's own bytes cannot be read as the claim they carry. It is terminal at the first refusal: no row this node could receive later changes the verdict on those bytes. `reason` is a stable token from the new public `federation::malformed_row` (`ALL` lists them): `no_signer`, `envelope_member_missing`, `envelope_member_invalid`, `typed_diverges_from_envelope`, `envelope_not_canonical`, `custody_ack_malformed`, `moderation_subject_digest_malformed`. `plane` names the door: `identity_occurrence`, `identity_occurrence_revocation`, `transport_destination`, `touch_claim`, `attestation`, `key_registration`, `trust_grant`, `trust_revocation`, `custody_ack`, or the plane `unknown_signer` was asked for. The Display is the previous text without the `invalid argument:` prefix. Python raises `ValueError("federation_malformed_row: {plane}: {reason}")`, the same type as the `InvalidArgument` arm it replaces.
+- **What moved.** An empty signer id (every door's signer lookup, and the key plane's empty `scrub_key_id`); a signed envelope member that is missing or ill-typed (not a string, not RFC 3339, not a finite number, an instant finer than a microsecond, a cosignature set that is not a threshold-signature array); a typed column that diverges from the envelope it mirrors (the #643 row mirror, `asserted_at`, `expires_at`, and the occurrence, revocation, transport-destination and touch-claim projections, `device_class` among them); an envelope that does not canonicalize; a malformed `custody_ack`; a malformed moderation subject digest.
+- **What stayed an `InvalidArgument`.** A caller's argument error, and every POLICY refusal (a duty naming a permission this node does not hold, a lease over the bound, a self-report by a third party, …). So did the two time-dependent refusals: an `asserted_at` or `fresh_as_of` past the skew bound is not malformed, because the same bytes admit once the clock catches up. The local producer's own builders (`emit_attestation`, `bind_revocation_into_envelope`), `check_encryption_pubkeys` (the local occurrence door's typed keys) and the bytes plane's `BlobError` are unchanged.
+- **`LicensureDelegatorNotAuthority`'s Display** is now `licensure_delegator_not_authority: {reason}: …`, without the `invalid argument:` prefix that made logs read it as an `InvalidArgument`. `kind()` and the Python message are unchanged.
+- **I834** (memory, sqlite, postgres): a typed `asserted_at`, a typed mirror column and a typed occurrence `device_class` moved off the signed envelope are each `MalformedRow { reason: typed_diverges_from_envelope }` on their plane, and the untouched rows admit. **I632** now pins `MalformedRow { reason: no_signer }`.
+
+#### Changed — `purge_unauthorised` says WHY, and whether to retry (#1055, CIRISEdge's ask)
+
+- The `PurgeRefused` body of a `purge_unauthorised` refusal is now `{notice_id, reason, retryable, detail}`. **`reason` is a token** from the new public `steward_purge::unauthorised_reason`, and **the prose moved to `detail`** (before, `reason` was the prose).
+- **Retryable** (an ordering gap: a later row or this node's clock can turn the refusal into an authorisation): `root_not_held`, `root_not_rooted`, `cosigner_key_not_held`, `not_yet_valid`. **Terminal**: `stalled`, `expired`, `not_a_seat`, `duplicate_cosigner`, `signature_invalid`, `no_cosignature`, `quorum_not_met`, `protocol_unevaluable`, `wrong_basis`, `notice_malformed`. `retryable` is `unauthorised_reason::is_retryable(reason)`; `RETRYABLE` and `ALL` list them.
+- `canonical_community::trust_root_cosigners_over` returns `Ok(Err((reason, detail)))`; its one caller is the purge door.
+- **I833** (memory, sqlite, postgres): a rootless receiver refuses a bundle `root_not_held`, `retryable: true`, and once the root lands the same bundle is no longer refused as unauthorised; a notice from this node's future is `not_yet_valid` and authorises once the clock reaches it; a forged cosignature is `signature_invalid`, `retryable: false`. **I650** now asserts the reason and the retryable bit of each of its eleven cases.
+
+#### Changed — the release pre-flight fails a bundle with no `charter_root_key_id` (#1056)
+
+- `scripts/preflight_trust_root.py` adopts CIRISEdge#571's stricter rule, so persist's copy and Edge's vendored one (CIRISEdge#575) converge: a v3 `bundle` response whose `charter_root_key_id` is absent, empty or not a string FAILS, even with its quorum met. Three new self-test fixtures (absent, blank, non-string); the self-test is 15 fixtures. I190 (f)'s short-quorum body now names its charter root, so its refusal is the quorum's alone, and it asserts that.
+
+#### Fixed — steward purge follow-ups (#1058)
+
+- **A purged v3 root takes its nested DAG, and an evicted child page cannot be served back.** `delete_blob` deleted a v3 root's `federation_manifest_children` relation with the root. That relation is what tells the purge plane a child page is withheld (`purge_withheld` walks child -> root), so after `purge_finalize` a child page a peer re-offered related to nothing and was served back by hash. The relation now stays, as V176's chunk relation already did (I483); `manifest_children` answers a held root's held children, so a promote and I202 read as before. `delete_blob` also deleted every child of the root regardless of other parents; it now deletes only a child no other HELD root relates. Both SQL backends.
+- **The Python raw byte reads ask the disposition.** `get_blob_json` and `get_blob_range` read the storage trait directly and asked neither a withdrawn binding nor a purge, and their docs offered them "for relays". They now refuse `blob_purged` / `blob_withdrawn` exactly as the viewer and serve doors do (`refuse_if_withdrawn`).
+- **I835** (sqlite, postgres, two nodes): a 60-chunk stream sealed at a 4 KiB cap (a v3 root over child pages) is delivered to B, bound, purged and finalized. The root, every child page and every chunk are gone; a child page a live root also relates stays and serves; an evicted child page and an evicted chunk a peer re-offers are refused `Purged` at the write floor (slice C's `refuse_tombstoned_bytes`), not held, and not served. The floor finds the child page purged only through the relation this fix keeps.
+- **I836** (from disk, comments and every test-gating form stripped): every Python method and every `pub` Engine method that calls the raw `get_blob` / `get_blob_range` asks `refuse_if_withdrawn` or `check_serve_disposition` in the same item.
+- The DSAR thought-signature orphan this issue's comment also named shipped in v54.1.0 (I831).
+
+#### Added — evidence rows for the steward purge door (#1059)
+
+- `evidence/cc_impl.tsv` publishes seven claims of the v54.1.0 steward purge door's Codex hardening, 16 rows, through `namespace_supersets.json` (appended entries, `manifest_round: cc-rc8-1059`, each naming its witnesses in `witness`) and `scripts/evidence_tsv.py write`. Every row points at the production definition.
+  - **CC 3.3.2:** `CLM-steward-purge-authorisation` (`verify_purge_authorisation`, `trust_root_cosigners_over`; I650, I833, I656).
+  - **CC 4.5.3:** `CLM-purge-atomic-commit` (`check_purge_put_set`, both backends' `purge_put_execution`; I695), `CLM-purge-dwell-node-clock` (`purge_clock`, `purge_finalize`; I822, I655), `CLM-purge-out-of-order-void` (`tombstone_void_reason`, `refuse_if_tombstoned_attestation`; I697, I828), `CLM-purge-subject-unknown-retryable` (`refuse_if_tombstoned_attestation`, `refuse_if_tombstoned_trace`; I832), `CLM-purge-blob-withheld` (`purge_withheld`, `refuse_if_withdrawn`; I824, I835, I836) and `CLM-purge-projections-removed` (`ATTESTATION_PROJECTIONS`, both backends' `purge_attestation_projections`; I829, I829b).
+- Not published, because a row graduates only when its whole claim is backed: `CLM-takedown-notice-row` (not shipped; rides the rc8 vendor); `CLM-one-tombstone-row` and `CLM-derived-rows-follow-reason` waited on their takedown halves, which slice C (#1007) ships and publishes in this release; `CLM-purge-digest-preimage` ("the notice is an admitted Contribution" waits for the rc8 vendor's notice row).
+- The version-pin witness's exact count is 218 in the integrated 55.0.0: 188 at v54.1.0, +14 from slices A and C, +16 here.
+
+#### Adoption (Edge, Server)
+
+- **New exhaustive enum variant:** `federation::Error::MalformedRow { plane: &'static str, reason: &'static str, message: String }` (kind `federation_malformed_row`). A `match` on `federation::Error` needs an arm. It is TERMINAL; Edge's 8-refusal bound for these `InvalidArgument`s can go.
+- **New refusal tokens:** `federation::malformed_row::{NO_SIGNER, ENVELOPE_MEMBER_MISSING, ENVELOPE_MEMBER_INVALID, TYPED_DIVERGES_FROM_ENVELOPE, ENVELOPE_NOT_CANONICAL, CUSTODY_ACK, MODERATION_SUBJECT_DIGEST}`; `steward_purge::unauthorised_reason::{ROOT_NOT_HELD, ROOT_NOT_ROOTED, COSIGNER_KEY_NOT_HELD, NOT_YET_VALID, STALLED, EXPIRED, NOT_A_SEAT, DUPLICATE_COSIGNER, SIGNATURE_INVALID, NO_COSIGNATURE, QUORUM_NOT_MET, PROTOCOL_UNEVALUABLE, WRONG_BASIS, NOTICE_MALFORMED}`.
+- **Kind changes:** rows that were `federation_invalid_argument` for the reasons above are now `federation_malformed_row`. The Python exception TYPE is unchanged (`ValueError`); the message is `federation_malformed_row: {plane}: {reason}` instead of `federation_invalid_argument`.
+- **Display changes:** `LicensureDelegatorNotAuthority` and every `MalformedRow` lose the `invalid argument:` prefix. Edge's witnesses that pin the licensure text need the new prefix.
+- **`purge_unauthorised` body:** read `reason` as a token and `retryable` as the verdict; the prose is `detail`. v54.1's "treat replicated-apply `purge_unauthorised` as retryable with a cap" becomes: retry only when `retryable` is true.
+- **Python `get_blob_json` / `get_blob_range`** now raise `ValueError` `blob_purged` / `blob_withdrawn` for withheld bytes.
+
+### Slice B — key grants as rows (#989, CC 3.3.2 rc7, CIRISConstitution#143)
+
+#### Changed — one `scores` row per recipient replaces the key-grant SET
+
+- **The row.** A wrap of one data-encryption key to one recipient is one
+  `scores` row on `key_grant:content:v1` / `key_grant:epoch:v1` /
+  `key_grant:stream:v1` (`key_grant::KeyGrantRow`): `attesting_key_id` the
+  sealer (the epoch's minter; a key that speaks for the owner on the content
+  and stream axes), `attested_key_id` the RECIPIENT occurrence, `score` and
+  `confidence` 1.0, no subject, no expiry, at the content's own `cohort_scope`
+  (`community` on the epoch axis). Envelope members, each present only on the
+  axis that uses it: `axis`, `at_rest_sha256`, `owner_key_id`,
+  `community_key_id`, `minter_key_id`, `epoch`, `stream_id`, `wrap_algorithm`
+  (v2 only), `wrapped_dek`, plus the CC 2 target (`family_key_id` on a family
+  row, `community_id` on a community row and on every epoch row). The digest
+  is a member and never an `evidence_refs` citation, so the CC 2.3 bytes-plane
+  fold cannot read a wrap as a content binding.
+- **The admission rule opens the dimension.** A0 held `key_grant:` shut
+  (`registered_family_held_shut`); the line is deleted and every
+  federation-tier row now meets `key_grant::check_key_grant_row_admission`
+  (from `check_reserved_prefix_admission`, on memory, sqlite and postgres):
+  the shape (`KeyGrantRow::from_attestation`: any departure is `malformed`, a
+  `key_grant:` dimension on a composer included); a v2 wrap
+  (`wrap_algorithm_not_v2`); self-signed (`signer_not_self`); the SEALER rule
+  (`key_grant::check_sealer`: epoch, the minter or a holder of a live `grant`
+  delegation from it (`signer_not_minter`) and an active member occurrence of
+  the community at `asserted_at` (`signer_not_active_member`); content and
+  stream, where this node holds the blob or stream a key that speaks for its
+  author / owner (`signer_not_author` / `signer_not_stream_owner`), then at
+  `self` a key that speaks for the owner (`federation_signer_not_acting_for`,
+  plane `key_grant`, retryable), at a group scope the write gate's membership
+  check); and the RECIPIENT rule (`key_grant::recipient_may_hold_key`: an
+  active occurrence of the owner / a family member / a member on the room's
+  authorized roster that the one audience rule, #963, lets hold the cohort's
+  key; `recipient_not_in_audience`, retryable).
+- **The #1049 seam.** The `grant` delegation chain of a key-grant row (and of
+  a consent row's `for_key_id`) is judged at
+  `admission::grant_chain_instant(row)`, which is this node's clock today.
+  CIRISPersist#1049 (W = 72 h, `asserted_at_stale`, CC rc8, untagged) changes
+  that one function to the row's signed `asserted_at` and adds the freshness
+  refusal in front of its callers. Not implemented here.
+- **Never withdrawn.** A `withdraws` or a `recants` naming a key-grant row is
+  refused, the sealer's own `recants` included (CC 3.3.2).
+- **Union by identity.** The projection is keyed by the row's identity
+  `(dimension, attester, attested, axis identity)`; CC 2's latest-wins over
+  `(attester, dimension, attested)` does not apply. A later row with the same
+  identity (a re-wrap) admits and changes nothing.
+- **Projection on both typed doors.** `apply_replicated_attestation` and
+  `put_attestation_synced` project a key-grant row's wrap into the grant
+  tables (the backend hook `FederationDirectory::project_key_grant_row`, run
+  on insert and on a re-offer, so a crash between the two transactions is
+  repaired). A content-axis row whose bytes have not arrived waits in the V146
+  pending index and is projected by the adopt, as before.
+  `apply_replicated_key_grant` remains as the door that reports the
+  projection.
+- **Delivery (CC 6.1.5.3).** `replication_audience::may_receive` delivers a
+  key-grant row to its recipient's node (refers-to) when the cohort's audience
+  contains that node, and to no other node. A set used to reach the whole
+  cohort audience with every wrap in it.
+- **Emission.** The local grant tables stay the record (operator ruling Q3).
+  `key_grant::plan_key_grant_emission` emits one row per wrap the node holds
+  for an axis that it has not emitted as a row yet (re-emission is idempotent),
+  withholds a wrap whose recipient the audience rule no longer admits, defers
+  one whose recipient has no key record on this node yet (the axis stays
+  dirty), and emits nothing when the node can no longer sign as the axis's
+  sealer.
+- **The legacy re-emit (V192).** V192 marks every emission axis dirty and
+  drops the pending index entries the retired sets left. On the first boot
+  after it, the pending sweep re-emits every wrap the node holds as sealer or
+  minter as a per-recipient row, each at a fresh signed instant (so each
+  recipient is re-checked against the audience at that instant, CC 4.4.3.2.2).
+  The held legacy set rows stay where they are.
+- **The retired SET.** The three set types join
+  `registry::RETIRED_CARRIER_STEMS` (slice A's list, whole type names). A new
+  set row is refused at every door whatever `ROW_TYPE_ENFORCEMENT` says: the
+  row-type gate answers `attestation_type_unregistered` at the plane doors and
+  the mint, and `apply_replicated_key_grant` answers `set_retired`. Held set
+  rows are never served: `row_type::not_retired_carrier_sql` joins the serve
+  filter of `list_attestations_since` and `list_attestation_log` on sqlite and
+  postgres, and memory's `served_under_enforcement` asks
+  `row_type::retired_carrier`, under `Report` as under `Enforce`.
+  With slice A's `holds_bytes` retirement merged too, A0's
+  `RC6_RETIRED_CARRIERS_ADMITTED_UNTIL_989` is deleted: `registry::carriers()`
+  is the vendored list exactly (empty at rc7). I700 pins that no rc6 carrier
+  spelling is admitted and each is a retired carrier; I701 (from disk) fails
+  if any `src/` code names the const again; the registry vector replay and
+  I371 expect no departure from CC's row-type vectors. I372 measures the
+  carrier shape check against the rc6 holding-claim carrier's published shape
+  (no type classifies `Carrier` at rc7) and pins that every such row is
+  refused as retired; I373 refuses the retired holding-claim token as a
+  dimension.
+- **Readers moved to the rows:** the epoch key transport and the community
+  DEK epochs (rows on `key_grant:epoch:v1`, projected per recipient),
+  `minter_of_blob` (the content row's sealer), the stream read path's sealer
+  filter, the withdraws gate, the serve gate, consent's chain instant, and
+  the replication pull path (a key-grant row through
+  `apply_replicated_attestation` needs no routing).
+- `family_rules`: `key_grant:` moves from `NOT_A_FAMILY_RULE` to the
+  persist-ruled families. Evidence: `CLM-key-grant-rows` (CC 3.3.2) cites
+  `check_key_grant_row_admission`, `KeyGrantRow::from_attestation` and
+  `project_key_grant_row`.
+- Migration **V192** (`key_grant_rows_reemit`, data only), sqlite and
+  postgres.
+
+#### Adoption — what Edge and Server must handle (#989)
+
+- **Removed:** `key_grant::SignedKeyGrantSet` (now `SignedKeyGrantRow`, the
+  same `{"attestation": {…}}` JSON shape); `KeyGrantSet::{envelope_extra,
+  from_attestation, emit_input}` (a `KeyGrantSet` is a builder only, with
+  `rows()`); `KEY_GRANT_ATTESTATION_TYPE_PREFIX`,
+  `KEY_GRANT_{EPOCH,CONTENT,STREAM}_ATTESTATION_TYPE` (now
+  `KEY_GRANT_DIMENSION_PREFIX`, `KEY_GRANT_{EPOCH,CONTENT,STREAM}_DIMENSION`);
+  `KEY_GRANT_ENVELOPE_KIND`; `KeyGrantAxis::attestation_type()` (now
+  `dimension()`).
+- **Changed:** `KeyGrantAdmission` is `{axis, recipient_key_id, attestation,
+  projected, pending}` (was `wraps_offered`, `wraps_written`).
+  `Engine::emit_key_grant` returns `Option<KeyGrantEmission>` and PyO3
+  `emit_key_grant(axis_json)` returns the `KeyGrantEmission` JSON
+  (`axis`, `attestation_ids`, `already_emitted`, `withheld`, `deferred`,
+  `sealer_refused`) or `null`, where it returned one attestation id.
+  `emit_*_key_grant_with_local_signer` return `Option<KeyGrantEmission>`.
+  `emit_pending_key_grants` (Engine and PyO3) counts ROWS. `may_issue_grant_for`
+  takes the chain instant.
+- **Routing.** A key-grant row is `attestation_type = "scores"` with a
+  `key_grant:` dimension. A pull path that routed `attestation_type`
+  `key_grant:*` to `apply_replicated_key_grant` now sees `scores` rows and
+  may hand them to `apply_replicated_attestation`, which projects; or route by
+  `dimension` to `apply_replicated_key_grant`, which also reports the
+  projection.
+- **New refusal reasons** on `federation_key_grant_refused`
+  (`Error::KeyGrantRefused`, Python `ValueError`): `recipient_not_in_audience`
+  (retryable: the occurrence, roster or allow list may not have landed) and
+  `set_retired` (terminal; `apply_replicated_key_grant` only). The self-axis owner leg answers
+  `federation_signer_not_acting_for` (`Error::SignerDoesNotActFor`, plane
+  `key_grant`, retryable). New exhaustive enum variants:
+  `KeyGrantRefusalReason::{RecipientNotInAudience, SetRetired}`.
+- **New public items:** `KeyGrantRow`, `SignedKeyGrantRow`,
+  `KeyGrantEmission`, `KeyGrantEmissionPlan`, `KeyGrantProjection`,
+  `check_key_grant_row_admission`, `check_sealer`, `recipient_may_hold_key`,
+  `is_key_grant_row`, `key_grant_dimension_of`,
+  `is_retired_key_grant_set_type`, `plan_key_grant_emission`,
+  `key_grant_row_held`, `emit_key_grant_axis_with`,
+  `emit_dirty_with_local_signer`, `project_key_grant_row`,
+  `admission::grant_chain_instant`, and (shared with slice A)
+  `registry::RETIRED_CARRIER_STEMS`, `row_type::{retired_carrier,
+  not_retired_carrier_sql}`;
+  `FederationDirectory::{key_grant_held_owner, project_key_grant_row}`
+  (defaulted; an out-of-tree directory needs nothing).
+- **Scores readers:** a consumer folding `scores` rows must not apply CC 2's
+  latest-wins over `(attester, dimension, attested)` to `key_grant:*`; the
+  union key is the row's identity.
+- A v55 node and a v54 node exchange no wraps: the v55 node refuses the v54
+  set and the v54 node does not admit the v55 row. The fleet moves together.
+- Witnesses I740–I746: the row shape (pure); the admission rule at the plane
+  door on memory, sqlite and postgres, one step per clause (I742); delivery
+  through the planes (I743); idempotent re-emission (I744); the upgraded node
+  (I745: v54 state, V192 replayed, booted on v55); memory never serves a held
+  set (I746).
+- **A device-add re-wrap on one node no longer reports a peer's epoch as
+  `minted_elsewhere` for a member whose holders the peer's rows never
+  reached:** a row crosses only to its recipient's node, so the node holds no
+  such epoch. The single-node report is unchanged (I188).
+
+#### Changed — a room's stream is stream-keyed (#977, CC 5.3.3.1 / CC 5.1)
+
+- CC rc7 5.3.3.1 binds per-chunk sealing to SFrame with `KID = stream_id` and
+  keys per epoch, and CC 5.1 keys an N>1 stream per `(stream_id, epoch)`,
+  carried by the flat per-epoch key-grant cascade. A community chunk DAG was
+  sealed per chunk under the community epoch DEK with a random nonce. Now a
+  `community` / `affiliations` stream takes the #969 path: one DEK per
+  `(stream_id, epoch)`, the STREAM nonce, a terminator per epoch, the epoch's
+  DEK wrapped to the room's audience (the community cascade's own roster fold
+  and audience rule, `community_dek::orchestrate::room_targets`) and emitted
+  as `key_grant:stream:v1` rows at the room's scope. A removal or the nonce
+  cap rolls the epoch. The chunks are recorded at `CommunityDek` with NO
+  community binding; the manifest is still sealed under the community epoch
+  DEK, with its binding, as before.
+- **Retention (operator ruling).** A room's retention bound covers every
+  byte sealed for the room. A room stream epoch records `room_epoch`, the
+  writer's community epoch at its mint, and the community retention sweep
+  (`sweep_rotated_epochs`) evicts its chunks under the same
+  `retain_past_epochs` rule as that community epoch's own objects
+  (`BlobStorage::stream_dek_evict_room_chunks`; the epoch row stays, stamped
+  `evicted_at`).
+- A stream that already holds per-chunk-bound community chunks (written
+  before v55) keeps sealing them that way to its seal (one DAG never mixes the
+  two), and every legacy community DAG reads as before.
+- Readers: `open_stream_chunk_row_for_viewer` takes the stream epoch's key for
+  a room chunk that a v4 manifest names stream-keyed (or that carries no
+  binding, on a live read); `read_stream_chunk_as` authorizes such a chunk in
+  the opener; the seal door terminates a room stream's epochs and wraps them
+  at the seal; `adopt_sealed_chunks` admits a room chunk whose provenance
+  names its community and no community epoch (no binding written).
+
+#### Added — a stream epoch's DEK may be the caller's (#981, CC 5.3.3.2.5)
+
+- **`register_stream_epoch_dek`** (`chunk_dag_cascade::orchestrate`,
+  `Engine::register_stream_epoch_dek`, PyO3
+  `register_stream_epoch_dek(cohort_scope, group_key_id, stream_id, epoch,
+  dek_b64, aad_b64=None) -> str`): the caller supplies the
+  `(stream_id, epoch)` DEK (the stream's per-(stream, epoch) DEK the producer
+  derives from the group's MLS exporter, CC 5.1; CIRISConstitution#169, rc8
+  ruling: persist never derives it and never sees the exporter secret), so
+  the live and the stored stream are one key. The door closes the stream's open
+  epoch with its terminator, self-retains the DEK under the content master
+  (never derivable from persist state alone), marks the epoch `supplied`,
+  wraps it to the stream's audience and emits the `key_grant:stream:v1` rows.
+  A supplied epoch is always kept: an unrecorded live call never reaches this
+  door (see "Changed — register_stream_epoch_dek has no `keep`" below).
+  Chunks then go through `put_blob_chunk_scoped` at that epoch and read
+  through the same doors as any stream-keyed chunk. Self, family and room
+  streams alike.
+- **Persist never mints or rolls a supplied stream's epoch.** A removal from
+  the audience of an epoch, or the nonce cap, refuses the next chunk with
+  the retryable `stream_epoch_rotation_required` (reason `removal`, naming the
+  removed key, or `cap`); a chunk naming an epoch nobody supplied is the
+  retryable `stream_epoch_dek_missing`. No timer forces a rotation: CC 5.1's
+  time / bytes hygiene is the caller's schedule.
+- **The stream-name rule first** (Edge on a6c36c7d): a 64-hex stream id is
+  reserved for an inline blob's log (#953). The chunk door refused it, but
+  this door wrote a DEK row for a stream that could never hold a chunk. It now
+  refuses the id first, with the chunk door's own `InvalidArgument` and
+  nothing written. `stream_dek_insert` and `stream_dek_put_grants` refuse it
+  at the floor (sqlite, postgres), and a `key_grant:stream:v1` row naming
+  such an id is `malformed`. Witnesses: I770 (sqlite, postgres) and I741.
+- Refusals at the door, nothing written: `stream_epoch_dek_exists` (an
+  epoch's key is never replaced; a racing second supply is caught at the
+  insert), `stream_not_authored` (the stream is another writer's; it names
+  the stream and never the writer, the I41 rule a foreign append already
+  follows), `InvalidArgument` (a plaintext tier, an epoch below the newest, a
+  per-chunk-keyed stream, another cohort).
+- Migration **V193** (`stream_epoch_dek_supplied_and_rooms`), sqlite and
+  postgres: `federation_stream_deks` gains `supplied`, `room_epoch` and
+  `evicted_at`, and both stream-DEK tables admit the room scopes (sqlite
+  rebuilds them in place under their final names; every existing row is a
+  minted epoch).
+- Evidence: `CLM-one-chunk-seal` (CC 5.3.3.2.5) cites
+  `register_stream_epoch_dek` and `stream_epoch_verdict`.
+- Witnesses I750–I757 (sqlite, postgres; I756 pure).
+
+#### Adoption — what Edge must handle (#977, #981)
+
+- **Room chunk DAGs.** A new `community` / `affiliations` stream is
+  stream-keyed: `sealed_dag_readiness` answers `chunk_keys: "stream_epoch"`
+  for it and names missing keys per epoch; its chunks need the
+  `key_grant:stream:v1` row (at the room's scope) as well as the manifest's
+  `key_grant:epoch:v1` row; `PutChunkScopedResult.epoch` is `None` for such a
+  chunk (it was the community epoch). To adopt such a chunk, build its
+  provenance with `BlobProvenance::for_stream_keyed_chunk()` over the room
+  row's provenance (`community_dek`, the community, no epoch, no minter); the
+  chunk adopt's own `epoch` argument is the stream epoch. Do NOT reuse the
+  manifest's provenance and do NOT rely on `from_attestation(.., epoch=None,
+  ..)`: it fills the epoch from the pointer, which carries the COMMUNITY
+  epoch (see "Fixed — provenance epoch on stream-keyed room chunks" below).
+- **New door:** `register_stream_epoch_dek` (above). No `keep`: an unrecorded
+  live call seals its frames in memory with `stream_seal::seal_stream_chunk`
+  under its per-(stream, epoch) DEK and never calls it.
+- **`chunk_dag_cascade::terminator_seq(epoch)` and `TERMINATOR_SEQ_BASE` are
+  public** (also under `orchestrate`): an epoch terminator's storage seq, the
+  `storage_seq` argument to `seal_stream_chunk` / `open_stream_chunk` for a
+  terminator. Do not hand-copy 2^62 (I768 pins the value).
+- **New exhaustive enum variants:** `BlobError::{StreamEpochRotationRequired
+  {stream_id, epoch, reason, removed_key_id}, StreamEpochDekExists {stream_id,
+  epoch}, StreamNotAuthored {stream_id}, StreamEpochDekMissing
+  {stream_id, epoch}}`; new enum `blobs::StreamRotationReason {Removal, Cap}`
+  (`removal` / `cap`). `StreamDekRecord` gains `supplied` and
+  `room_epoch`; `BlobStorage` gains `stream_dek_evict_room_chunks` (a required
+  method: an out-of-tree `BlobStorage` must implement it).
+- **Python:** each is a `ValueError` whose message is the kind token then JSON
+  with `retryable`: `blob_stream_epoch_rotation_required`
+  (`{stream_id, epoch, reason, removed_key_id, retryable: true}`),
+  `blob_stream_epoch_dek_missing` (`retryable: true`),
+  `blob_stream_epoch_dek_exists` and `blob_stream_not_authored`
+  (`retryable: false`).
+
+### Fixed — provenance epoch on stream-keyed room chunks (CIRISEdge v55 adopt)
+
+- **The bug.** `BlobProvenance::from_attestation(row, sha, epoch, minter)`
+  fills `epoch` from the row's pointer when the caller passes `None`, and a
+  room row's pointer carries the COMMUNITY epoch. Following the slice-B note
+  (`epoch = None`) through `from_attestation`, or reusing the manifest's
+  provenance for its chunks, handed the chunk door a community epoch. The door
+  then bound the stream-keyed chunk under a community epoch that did not seal
+  it: `read_stream_chunk_as` opened it under the community DEK and failed, the
+  community epoch counted it among its objects (holding up that epoch's
+  destroy), and the promote accepted the DAG.
+- **`BlobProvenance::for_stream_keyed_chunk(&self) -> Result<Self, BlobError>`**
+  (new): the row's provenance with no epoch and no minter. `InvalidArgument`
+  unless it is a `community_dek` provenance naming its community.
+- **The chunk adopt doors refuse it** (`adopt_sealed_chunk`, which delegates to
+  `adopt_sealed_chunks`; Engine and PyO3 alike). A `community_dek` provenance
+  that names an epoch is refused when this node knows `(stream_id, epoch)` is
+  stream-keyed: it holds the epoch's DEK row, a wrap addressed to it, or a wrap
+  sealed by the chunk's author. The whole batch is refused and nothing is
+  written. A legacy (pre-v55, per-chunk-bound) room chunk still adopts under
+  its community epoch.
+- **The ordering gap is closed at the promote.** A chunk that arrives before
+  the stream's `key_grant:stream:v1` rows cannot be told from a legacy one, so
+  it lands bound. `promote_adopted_manifest_to_dag` opens the manifest, the
+  author's own record of how each chunk was keyed, and refuses a stream-keyed
+  chunk that a community epoch binds, naming the chunk. Nothing is promoted
+  and nothing is announced. The remedy is `evict_blob` on each bound chunk,
+  then re-adopting it with `for_stream_keyed_chunk` and promoting again.
+- **The adopted room stream names its room.** `BlobStorage::adopt_sealed_chunk_at`
+  and `adopt_sealed_chunks_at` gain a trailing `community_key_id:
+  Option<&str>`, which is the provenance's community for a `community_dek`
+  adopt. The stream's claim records that community whether or not a community
+  epoch binds the chunk, as the origin's claim does. Before this, an adopted
+  stream-keyed room stream claimed no community, and a stream first adopted
+  bound refused the corrected re-adopt (I41). Self and family adopts are
+  unchanged.
+- **New exhaustive enum variant:** `BlobError::StreamKeyedChunkCommunityEpoch
+  {stream_id, epoch, community_epoch, chunk_sha256_hex}`, where `epoch` is the
+  STREAM epoch. `chunk_sha256_hex` is `None` at an adopt door and the bound
+  chunk at the promote. Its kind token is
+  `blob_stream_keyed_chunk_community_epoch`. **Python:** `ValueError`, whose
+  message is the token then JSON `{stream_id, epoch, community_epoch,
+  chunk_sha256_hex, retryable: false}`. The refusal is terminal for that
+  provenance: rebuild it with `for_stream_keyed_chunk`.
+- **Breaking for out-of-tree `BlobStorage` implementations:** the two
+  signatures above changed.
+- **What Edge must change:** build every stream-keyed room chunk's provenance
+  with `for_stream_keyed_chunk()`. A chunk is stream-keyed when
+  `sealed_dag_readiness` answers `chunk_keys: "stream_epoch"`, or when the
+  opened manifest is v4 with per-chunk epochs. Handle the new token at the
+  chunk adopt and at the promote. At the promote, evict the named chunks and
+  re-adopt them.
+- Witnesses I758–I761 (sqlite, postgres). Each refusal clause, each of the
+  three stream-keyed legs, the tier guard and the claim's community were
+  mutation-checked: each mutation turns a witness red.
+
+### Fixed — self/family content key grants never emitted (CIRISEdge v55 legacy-v2 wake)
+
+- **The bug.** `key_grant::dirty_axes` took a content axis's owner from the
+  row's epoch binding (`community_key_id`). A self or family row has no
+  binding: its owner is the group the write recorded (`group_key_id`, V177).
+  So the axis fell back to the NODE's own key. The audience rule then withheld
+  every recipient (`attestation_ids: []`, every recipient in `withheld`), and
+  `mark_emitted` cleared the ledger anyway, so nothing ever retried.
+  - In the field: a device re-classed into the owner's audience (server to
+    phone) got its stream rows and never its content row, and its pull parked
+    on `DagAwaitingKey` for good.
+  - A legacy v2 DAG's chunk 0 (`write_legacy_v2_dag`, granted through
+    `grant_dek_to_cohort`) never reached the owner's other devices, for the
+    same reason.
+  - A manual `emit_key_grant` that named the owner was correct, which is why
+    the witnesses that emit manually never saw it.
+- **The owner.** A `self` / `family` axis is now owned by the row's group,
+  falling back to the binding's community. A room axis is owned by the
+  community, falling back to the group. The node's own key is never the
+  owner: a dirty row that names no group is not planned, stays dirty and is
+  logged once per `MISBUILT_AXIS_RETRY`. The stream axis was already right.
+  No other place derives an axis owner from a provenance.
+- **A mis-built axis is never cleared silently.** The rule: if a plan
+  withholds EVERY recipient and this signer's own wrap is among them,
+  `plan_key_grant_emission` reports it as mis-built.
+  - Why the rule holds: the signer already passed the sealer rule, so it
+    speaks for the owner. The audience rule refusing the signer's own
+    occurrence therefore means the axis names the wrong group.
+  - What happens: nothing is emitted, the axis stays dirty, and the reason is
+    in `KeyGrantEmissionPlan::misbuilt` and `KeyGrantEmission::misbuilt`. In
+    Python it is the `misbuilt` key of `emit_key_grant`'s JSON.
+  - What still clears as before: a plan that withholds only SOME recipients
+    (a revoked device, a removed member), or one where the signer holds no
+    wrap of its own (a server-class sealer).
+- **The dirty loop backs off a mis-built axis.**
+  - `key_grant::emit_dirty_axes` (new) is now the one loop body behind
+    `Engine::emit_pending_key_grants` and PyO3's `emit_dirty_with_local_signer`
+    sweeps.
+  - It logs a mis-built axis at error level once per `MISBUILT_AXIS_RETRY`
+    (300 s), with how many passes planned and skipped it.
+  - It does not plan the axis again until the interval has passed.
+  - `DirtyEmissionReport {emitted, misbuilt, backed_off}` counts each pass.
+    `misbuilt_axis_state(signer, axis)` reads the per-axis state, which lives
+    in this process only.
+  - An axis that later emits normally forgets its state.
+- **Upgraded nodes:** v54 shipped the owner bug, so every v54 node holds
+  self/family content axes marked emitted with no row. No new step is needed:
+  V192 (`key_grant_rows_reemit`, the slice-B SET → rows reset, run once by the
+  migration runner) already sets EVERY emission axis dirty, content axes
+  included. The first boot sweep on v55 then emits them under the fixed owner.
+  I769 (sqlite, postgres) witnesses this: a seeded v54 state (blob, ledger
+  clean, no row) gets no row from the dirty loop before the upgrade, then
+  reaches the owner's second device after V192 and a boot. V192 replayed and a
+  second boot emit nothing more. Removing V192's `federation_blobs` reset, or
+  reverting the owner fix, turns I769 red.
+- **Adoption:** `KeyGrantEmission` and `KeyGrantEmissionPlan` gain the field
+  `misbuilt: Option<String>`, so a struct literal must name it. It is
+  `#[serde(default)]` on the wire.
+- Witnesses I762–I766 (sqlite, postgres), each fails before the fix:
+  - I762: a self blob on a node with two owner devices. The dirty loop emits
+    the content row, owned by the owner, to the second device, and the ledger
+    clears only after that.
+  - I763: the same for a family blob.
+  - I764: a mis-built axis stays dirty and is reported. Two passes inside the
+    interval plan it once and skip it once.
+  - I765: a legacy v2 chunk 0 reaches the second device through the loop,
+    with no manual emit.
+  - I766: a legitimate withholding of every recipient, with no wrap of the
+    signer's own, still clears.
+- Mutation-checked, and each mutation turns a witness red:
+  - the owner fix;
+  - the owner fix reverted together with clearing on a mis-built axis (the
+    pre-fix behaviour);
+  - the guard;
+  - the guard's signer clause;
+  - the backoff;
+  - the no-clear on a mis-built axis.
+
+### Changed — register_stream_epoch_dek has no `keep`: an unrecorded call never reaches persist (CC 5.1)
+
+- **Why:** CC rc7 part 5, "One DEK per `(stream_id, epoch)`, two
+  distributors" (normative), says: "An unrecorded live call wraps nothing: its
+  DEK exists only inside the live group, so an ordinary call keeps the forward
+  secrecy MLS gives it and leaves no durable wrap that could later open it."
+  `register_stream_epoch_dek(keep=false)` still stored the DEK under the
+  content master on the stream-DEK row, which is a durable wrap. And an unkept
+  stream cannot be sealed through persist's put path without persisting its
+  DEK. So the door had no conforming `keep=false` meaning.
+- **The change, a clean break:**
+  - `keep` is removed from `register_stream_epoch_dek` everywhere: the
+    orchestration, `Engine`, PyO3 (`register_stream_epoch_dek(cohort_scope,
+    group_key_id, stream_id, epoch, dek_b64, aad_b64=None)`) and the stub.
+  - It is removed from `RegisteredStreamEpoch` and the Python result JSON.
+  - It is removed from `StreamDekRecord` and its read and write paths.
+  - It is removed from V193 on both dialects. V193 is unshipped v55, so it was
+    edited in place and its checksums re-pinned.
+  - A supplied epoch is always kept and wrapped to the stream's audience. The
+    retro re-key and seal-time grant walks no longer skip anything.
+- **An unrecorded live call** never comes to persist's DEK door. The adopter
+  seals its frames in memory with `stream_seal::seal_stream_chunk` under the
+  stream's per-(stream, epoch) DEK, which it derives from the group's MLS
+  exporter (CC 5.1; CIRISConstitution#169, rc8 ruling). If it holds the resulting ciphertext, it may adopt it
+  through `adopt_sealed_chunks` with a `for_stream_keyed_chunk` provenance;
+  persist stores the ciphertext and no key (I753).
+- **Witnesses:**
+  - I767 (from disk): the CC rc7 paragraph is vendored byte-for-byte as
+    `src/federation/namespace/cc_rc7_part_5_one_dek_two_distributors.md`
+    (line 44 of `constitution/part_5_transport_substrate.md` at
+    `VENDORED_CC_COMMIT`), and its SHA-256 is pinned. With comments stripped,
+    the door's signatures, the PyO3 signature attribute, the stub,
+    `RegisteredStreamEpoch`, `StreamDekRecord` and both V193s name no `keep`.
+  - I753 (sqlite, postgres) now witnesses the unrecorded call's ciphertext. It
+    replaces the old unkept-stream witness.
+  - I768 pins `terminator_seq`.
+
+### Fixed — Codex round 4 on #1065
+
+Two findings are fixed here. The two plaintext-DAG input checks are deferred
+to #1072. The repeats are in #1070 and #1071, or were already fixed.
+
+- **The re-ack sweeper's first pass runs after a short start delay**
+  (`engine.rs`, P2, upgrade).
+  - The bug: the auto-spawned sweeper slept an hour before its first pass.
+    That pass carries the upgrade conversion of a v54 node's retired rc6
+    holding claims, which v55's holder reads no longer count. So an upgraded
+    node was undiscoverable for its first hour, and a node restarting more
+    often than hourly never converted.
+  - The fix: the first pass runs after `HOLDING_CLAIM_REACK_START_DELAY`
+    (90 s, next to the interval), then once every interval.
+    `Engine::spawn_reack_sweeper_with(start_delay, interval)` takes both.
+  - Why not t = 0: a pass at t = 0 would land on the announce cold-start and
+    the replication catch-up, and its own-claims read is unbounded until
+    #1071.
+  - The pass runs inside the spawned task, so the spawn returns at once and
+    boot never waits on it.
+  - No lock is held across the walk. Each read is its own short acquisition,
+    and the walk yields between rows.
+  - An error mid-pass is logged and the loop continues until `stop()`.
+  - Class sweep of the other auto-spawned loops:
+    - the disk-budget eviction sweeper also sleeps first, but its pass is
+      budget relief, not upgrade or repair work, so it is unchanged;
+    - the key-grant dirty loop already runs at boot;
+    - the retention sweep and the takedown finalize are host-driven, not
+      spawned.
+  - Witness: I803. The spawn returns at once and a concurrent write
+    succeeds. There is no pass before the delay; the node is converted
+    shortly after it; and a claim seeded after the first pass waits for the
+    next tick.
+- **The room retention sweep never orphans a retained DAG manifest**
+  (`community_dek.rs`, P1, data loss).
+  - The bug: the room-stream leg could evict every chunk of a stream epoch
+    minted at community epoch N after the stream was sealed under N+1. The
+    manifest and its live holding claim stayed, so an advertised DAG failed
+    every read.
+  - The rule chosen: the room's retention bound applies to the content as
+    advertised, the DAG, bound to the community epoch it was sealed under. It
+    does not apply to the epoch at which its chunks' key was minted.
+    Evicting the manifest early instead would delete content the room's own
+    policy keeps.
+  - The fix (sqlite and postgres, one predicate):
+    `stream_dek_evict_room_chunks` skips a stream epoch any of whose chunks
+    a still-held manifest relates (`federation_dag_chunks`).
+    `sweep_rotated_epochs` runs the room leg after the epoch loop, so a
+    manifest that its own epoch's eviction removes takes its chunks in the
+    same sweep.
+  - Witness: I779. Sealed under a newer epoch, the DAG is retained whole and
+    reads in full. Once that epoch is past retention, the manifest and every
+    chunk go in one sweep and nothing is advertised. It is never half a DAG.
+    I757 now seals its stream within its own room epoch.
+
+### Fixed — withheld blobs are not deficit (CIRISEdge v55)
+
+- **The bug:** `durability_deficit` / `deficit_over` and `blob_custody` never
+  asked the tombstone. A blob under a takedown (a counter-notice withholding,
+  or an executed immediate one whose rows linger) therefore read as
+  under-replicated. Edge's durability pass filed `here`, which is refused
+  since round 3, and pushed a REPAIR copy of taken-down content to other
+  nodes.
+- **The deficit:** a blob that `steward_purge::purge_withheld` names lists
+  nobody `missing` and no `live_here`, has `mode: None`, and carries the new
+  `DurabilityDeficit::withheld` (the notice id). The audience stays, so an
+  operator can see whose content it is. It is never repaired.
+- **The custody view:** `blob_custody` / `blob_custody_at` carry the new
+  `BlobCustody::withheld`.
+- **Class sweep:** one predicate everywhere (`holding_claim::is_withheld` /
+  `withheld_by` over `purge_withheld`).
+  - `list_holders`, `list_local_holders` and the puller's
+    `list_holders_sized` name no holder of withheld bytes.
+  - `list_held_by` (adopt suggestions) drops withheld blobs.
+  - The serve and read doors already refuse such bytes (`Purged`).
+- **Witnesses:**
+  - I801 (memory, sqlite, postgres): a three-node self blob with one `here`,
+    under a counter-notice, is not deficit, names its notice, and has no pull
+    target. An ordinary under-replicated blob is still deficit.
+  - I802 (sqlite, postgres): the custody view flag, plus the holder reads
+    over a withheld blob whose live claim stands.
+  - Each guard was mutation-checked.
+- **Adoption:** `DurabilityDeficit` and `BlobCustody` gain the field
+  `withheld: Option<String>`. It is `#[serde(default)]` and omitted from JSON
+  when absent, so existing key sets are unchanged unless a blob is withheld.
+
+### Fixed — Codex round 3 on #1065
+
+Three new findings are fixed here. Round 3's other findings are already
+addressed: seven repeat round 2, and the takedown-robustness ones stay with
+#1070. The perf finding about the re-ack's legacy rescan is deferred to #1071.
+
+- **No holding claim about withheld bytes** (`holding_claim.rs`, P1).
+  - The bug: a counter-notice takedown keeps the bytes on disk through its
+    window. For a blob this node had announced only under the rc6 carrier,
+    the re-ack's upgrade conversion could emit a fresh `here` claim after the
+    tombstone.
+  - The fix, at the shared emission: `emit_holding_claim` refuses bytes that
+    `steward_purge::purge_withheld` names, as `BlobError::Purged`. Every
+    caller inherits it.
+  - The re-ack and the conversion count such a blob as the new
+    `ReackReport::withheld`, not as a failure.
+  - The custody-report door refuses `here` with `Error::PurgeRefused`, token
+    `blob_purged` (`steward_purge::token::BLOB_PURGED`, the same token as
+    `BlobError::Purged`), body `{sha256_hex, notice_id, retryable: false}`.
+  - Witness: I778.
+- **The room retention sweep never evicts an OPEN stream epoch**
+  (`sqlite.rs` / `postgres.rs`, P1).
+  - The bug: `stream_dek_evict_room_chunks` evicted an open epoch and stamped
+    it. Appends went on under its DEK and were never swept.
+  - The fix: only TERMINATED stream epochs are eligible.
+  - Why exclude rather than terminate at the sweep: the retention bound is a
+    room-level policy over past content. Closing a producer's live epoch from
+    a background sweep would roll its keys under it, and a supplied stream
+    cannot roll at all. A closed but unterminated epoch is excluded too,
+    since its terminator is still to come.
+  - An open epoch is swept by the first sweep after its seal or roll.
+  - I757 now seals its stream before sweeping.
+  - Witness: I779.
+- **The content-grant projection re-judges its signer**
+  (`key_grant.rs`, P1).
+  - The bug: a content row admitted while the bytes were absent could reach
+    the direct projection after the blob arrived. An unrelated signer could
+    then take the first-write-wins `(at_rest_sha256, recipient)` grant row
+    ahead of the author.
+  - The fix: the direct path asks `may_issue_grant_for(signer, author)`
+    first, and answers the new `KeyGrantProjection::NotAuthor` (nothing
+    written).
+  - Witness: I800.
+- **Adoption:**
+  - `KeyGrantProjection` gains the exhaustive variant `NotAuthor`.
+  - `ReackReport` gains the field `withheld`.
+  - `emit_holding_claim` may now return `BlobError::Purged`.
+  - A custody `here` report about withheld bytes is refused with
+    `Error::PurgeRefused` and token `blob_purged`. That is the new
+    `steward_purge::token::BLOB_PURGED`, the same token as
+    `BlobError::Purged` (whose `kind()` now returns the constant). Python
+    receives a `ValueError` with args `("blob_purged", body_json)`. There is
+    no `custody_ack_here_withheld` string.
+  - `steward_purge::purge_withheld` is the canonical host-facing predicate
+    for whether a blob is taken down. `token::ALL` gains `blob_purged`.
+
+### Fixed — Codex round 2 on #1065
+
+Nine findings are fixed here. Three takedown-robustness findings are deferred
+to #1070: the immediate path without a LocalSigner, resuming a recorded
+takedown before reauthorizing it, and the tombstone/write race. Each fix below
+has a witness on sqlite and postgres (memory too where it has the plane), and
+a mutation of each clause turns its witness red.
+
+- **The re-ack scan is not an access** (`holding_claim.rs`, P1).
+  - The bug: `has_blob` bumps `access_count` and `last_accessed_at`. The
+    hourly re-ack scan called it for every claimed blob, so every advertised
+    blob looked hot and cold bytes evaded the storage-budget sweeper.
+  - The fix: these existence reads now read the row head (`blob_head`): the
+    re-ack scan and its legacy conversion, the holder directory reads
+    (`list_holders`, `list_local_holders`), the custody view, and the evict
+    walks' chunk and child probes. The user-facing `has_blob` door still
+    counts as an access.
+  - Witness: I771.
+- **Takedown authority reads only LIVE bindings** (`takedown_tombstone.rs`, P1).
+  - The bug: every binding row granted authority, including expired,
+    withdrawn and recanted ones. So a former subject or a former room's
+    moderator could still authorize while the digest stayed bound elsewhere.
+  - The fix: a row expired at the read instant, or retired under the
+    bytes-plane fold (`blob_tombstone::retiring_composer`, every entitlement
+    re-derived), confers nothing.
+  - Two further fixes in the same fold: a live row's non-empty
+    `attested_key_id` is a subject (P1), and an `affiliations` row's
+    `community_id` is a bound community (P2).
+  - Witness: I772.
+- **A plaintext DAG's chunks follow it** (`sqlite.rs` / `postgres.rs`, P1).
+  - The bug: the incremental finalize (`put_dag_manifest_over_held`) and the
+    one-shot `put_blob_chunks` wrote the `chunk_dag` row without its
+    `federation_dag_chunks` relation. A takedown of the DAG therefore reached
+    only its root.
+  - The fix: both write the relation in the same transaction
+    (`blobs::manifest_chunk_links`), as the sealed seal and the promote do.
+  - Witness: I773, both doors.
+- **The plaintext DAG doors ask the WILL decision** (`engine.rs`, P2
+  regression).
+  - The bug: `put_blob_chunks_signing` stored and announced a non-local
+    proxy author's DAG at the stop tier.
+  - The fix: it and `finalize_blob_chunks_signing` now ask `would_hold` first,
+    through one provenance spelling shared with the chunk door.
+  - Witness: I774.
+- **A `public` room is a public group** (`replication_audience.rs`, P1).
+  - The fix: `is_public_group` answers true for a held community that
+    `public_room::is_public_community` calls public. Its community-scoped rows
+    therefore fan out to non-members, the subjectless standing proposal
+    included.
+  - Witness: I775.
+- **`live_listing` skips expired listings** (`public_room.rs`, P2).
+  - The fix: rows expired at the read instant are dropped before the latest
+    is chosen. An older unexpired listing is then the room's live one, and a
+    room whose every listing expired has none.
+  - Witness: I776.
+- **Retired key-grant carriers match whole strings** (`row_type.rs`, P2).
+  - The bug: the prefix match read `key_grant:content:v10` and
+    `key_grant:content:v1beta` as retired.
+  - The fix: `registry::RETIRED_CARRIER_STEMS` entries now carry
+    `registry::RetiredMatch {Stem, Exact}`. `holds_bytes:` is the one stem;
+    the three key-grant SET types are exact. The same split is applied in
+    `row_type::retired_carrier`, in the Report serve filter
+    (`not_retired_carrier_sql`: `substr` for a stem, `<>` for an exact type),
+    and in `key_grant::is_retired_key_grant_set_type`.
+  - Witness: I777 (pure, plus the SQL filter on sqlite and postgres).
+- **Adoption:**
+  - `RETIRED_CARRIER_STEMS` is now `&[(&str, RetiredMatch, &str)]`.
+  - `RetiredMatch` is a new exhaustive enum.
+  - `blob_tombstone::retiring_composer` is `pub(crate)`.
+  - Nothing changes on the wire.
+
 ## [54.1.1] - 2026-10-12
 
 ### Fixed — the v54.1.0 tag's Windows wheel job
@@ -1480,7 +2590,7 @@ The retroactive key-grant ADD walk (`rekey_for_newcomers`) took its cohort-visib
 
 ### Fixed — an imported root lost to an older bake, a forged rule retiring a holder's claim, a withdrawal a peer dropped (#984 rows 11, 13, 19)
 - **Row 11.** A node that IMPORTED a later ceremony and booted a binary with an older one compiled in lost the imported root: the accord head, the `ciris-canonical` birth, `genesis-charter` and `genesis-lifecycle` all moved to the older bake. The mechanism was in the import door, not the boot: `install_genesis_bundle_roster` baked the delegation rows BEFORE the accord head existed, and the bake admits the charter through the family it names, so on a fresh node the charter and lifecycle were skipped ("no constitutional trust root yet"); the head and birth landed naming a charter no row held, and the next boot's compiled rows — of any vintage — filled the holes and `charter_superseded` took the head and birth with them. The import now installs the accord head first, as the boot seed does; with the rows held, the existing #665 rule (signed-instant `candidate_is_strictly_newer`) leaves a newer ceremony's rows at boot, the head's charter stays live, the birth stays, and the posture is `Entrenched` (a root ahead of its binary is allowed). No new vintage comparison was added. **I521** (memory, sqlite, postgres): import v3, boot v2 — every plane stays v3's; boot v3 — unchanged.
-- **Row 13.** `precedence::retraction_entitled`'s resolved-rule arm honoured a `withdraws_admission_rule` stamp on any `withdraws`, and the door's `holds_bytes` bypass left a replicated row's stamp in place, so a third party's `withdraws` carrying a forged rule retired a holder's `holds_bytes` claim in the fold while `list_holders` (which folds the holder's own retractions only) still listed it. A registered carrier row is retired by its attester alone: the subject and rule arms never apply to a carrier (`row_type::classify`), and a non-holder's stamped `withdraws` of a carrier is refused at the door as `carrier_withdraws_not_the_holder`. An unstamped non-holder `withdraws` of a `holds_bytes` row — what `takedown_handler` and `evict_actor` emit as audit rows — is admitted with no rule and inert in every fold, exactly as before; moving those paths onto a CC 2.3 tombstone door is a separate row (no such door exists yet). **I520** (memory, sqlite, postgres): the stamped third-party `withdraws` refused and inert; the holder's own retires it in the fold and the listing.
+- **Row 13.** `precedence::retraction_entitled`'s resolved-rule arm honoured a `withdraws_admission_rule` stamp on any `withdraws`, and the door's `holds_bytes` bypass left a replicated row's stamp in place, so a third party's `withdraws` carrying a forged rule retired a holder's `holds_bytes` claim in the fold while `list_holders` (which folds the holder's own retractions only) still listed it. A registered carrier row is retired by its attester alone: the subject and rule arms never apply to a carrier (`row_type::classify`), and a non-holder's stamped `withdraws` of a carrier is refused at the door as `custody_ack_withdraws_not_the_holder`. An unstamped non-holder `withdraws` of a `holds_bytes` row — what `takedown_handler` and `evict_actor` emit as audit rows — is admitted with no rule and inert in every fold, exactly as before; moving those paths onto a CC 2.3 tombstone door is a separate row (no such door exists yet). **I520** (memory, sqlite, postgres): the stamped third-party `withdraws` refused and inert; the holder's own retires it in the fold and the listing.
 - **Row 19.** A peer offered a withdrawn location proof (the attester's re-signed row, v53.1.2 row 16) through `put_location_proof` refused it on the primary key (sqlite, postgres) or overwrote the held row unchecked (memory). A held `(subject, asserted_at)` re-offered with `withdrawn_at` set is now handed to `withdraw_location_proof` — one predicate for the local and the replicated path — and any other re-offer keeps its path. **I522** (memory, sqlite, postgres): B applies A's served withdrawal and its in-force fold excludes the proof; a live delegate who did not attest it is refused by name; a stranger by standing.
 - Mutation-checked: baking before the head reds I521; dropping the carrier exclusion from the fold, or the stamped-rule refusal at the door, reds I520; dropping the held-PK routing on all three backends reds I522.
 

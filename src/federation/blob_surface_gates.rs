@@ -133,6 +133,8 @@ mod tests {
             // cannot admit the key is the state #848 was opened on.
             ("apply_replicated_key_grant(", "apply_replicated_key_grant"),
             ("emit_key_grant(", "emit_key_grant"),
+            // v55.0.0 (#981) — the caller-supplied stream epoch DEK.
+            ("register_stream_epoch_dek(", "register_stream_epoch_dek"),
         ];
         let mut missing = Vec::new();
         for (sym, _) in ops {
@@ -1121,6 +1123,99 @@ mod tests {
         );
     }
 
+    /// The items of `text` (comments stripped), one per `fn`, with the
+    /// item's header line: `(header, body)`. Crude — an item runs to the next
+    /// `fn` header — which errs toward a LONGER body, never a shorter one.
+    fn fn_items(text: &str) -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = Vec::new();
+        for line in text.lines() {
+            let t = line.trim_start();
+            if t.starts_with("//") {
+                continue;
+            }
+            let code = t.split(" //").next().unwrap_or(t);
+            let is_fn = [
+                "fn ",
+                "pub fn ",
+                "async fn ",
+                "pub async fn ",
+                "pub(crate) fn ",
+                "pub(crate) async fn ",
+                "pub(super) fn ",
+                "pub(super) async fn ",
+            ]
+            .iter()
+            .any(|p| code.starts_with(p));
+            if is_fn {
+                out.push((code.to_owned(), String::new()));
+            } else if let Some((_, body)) = out.last_mut() {
+                body.push_str(code);
+                body.push('\n');
+            }
+        }
+        out
+    }
+
+    /// **I836** (v55.0.0, CIRISPersist#1058) — **no host surface reads stored
+    /// bytes without asking the disposition.** The storage trait's raw
+    /// `get_blob` / `get_blob_range` ask nothing (neither a withdrawn binding
+    /// nor a steward purge); every door built over them does. A Python method
+    /// (`src/ffi/pyo3.rs`) or a `pub` Engine method that calls either must
+    /// ask [`refuse_if_withdrawn`](crate::federation::at_rest_cascade::refuse_if_withdrawn)
+    /// or `check_serve_disposition` in the same item. Before v55.0.0
+    /// `get_blob_json` and `get_blob_range` (Python) were the raw read,
+    /// documented "for relays". Production text only, comments stripped.
+    #[test]
+    fn i836_every_host_byte_read_asks_the_disposition() {
+        let raw = [".get_blob(", ".get_blob_range("];
+        let asks = ["refuse_if_withdrawn(", "check_serve_disposition("];
+        let mut offenders = Vec::new();
+        let mut reads = 0usize;
+        for (file, host) in [
+            ("src/ffi/pyo3.rs", (|_: &str| true) as fn(&str) -> bool),
+            ("src/engine.rs", |h: &str| {
+                h.starts_with("pub fn ") || h.starts_with("pub async fn ")
+            }),
+        ] {
+            for (header, body) in fn_items(&production_only(&src(file))) {
+                if !host(&header) || !raw.iter().any(|r| body.contains(r)) {
+                    continue;
+                }
+                reads += 1;
+                if !asks.iter().any(|a| body.contains(a)) {
+                    offenders.push(format!("{file}: {header}"));
+                }
+            }
+        }
+        assert!(
+            reads >= 4,
+            "I836: the scan found the known raw reads (serve, ranged serve, Python's two): {reads}"
+        );
+        assert!(
+            offenders.is_empty(),
+            "I836: a host surface reads stored bytes without asking the disposition \
+             (purged / withdrawn):\n{}",
+            offenders.join("\n")
+        );
+    }
+
+    /// I836's item splitter keeps a later item's call out of an earlier one,
+    /// and strips comments.
+    #[test]
+    fn i836_fn_items_splits_and_strips() {
+        let items = fn_items(
+            "fn a() {\n    // x.get_blob(\n    refuse_if_withdrawn(\n}\n\
+             pub async fn b() {\n    s.get_blob(\n}\n",
+        );
+        assert_eq!(items.len(), 2);
+        assert!(
+            !items[0].1.contains(".get_blob("),
+            "the comment is stripped"
+        );
+        assert!(items[1].0.starts_with("pub async fn b"));
+        assert!(items[1].1.contains(".get_blob(") && !items[1].1.contains("refuse_if"));
+    }
+
     fn walkdir(rel: &str) -> Vec<String> {
         let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(rel);
         let mut out = Vec::new();
@@ -1136,5 +1231,115 @@ mod tests {
             }
         }
         out
+    }
+
+    /// Drop `//` comments (line and trailing, doc comments included) so a
+    /// gate reads code, not prose about the code. Crude: a `//` inside a
+    /// string literal would cut the line too; none of the scanned spans has
+    /// one.
+    fn strip_line_comments(text: &str) -> String {
+        text.lines()
+            .map(|l| l.find("//").map_or(l, |i| &l[..i]))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The text of the item that starts at `start` in `text`, up to its body's
+    /// opening brace (the signature), comments stripped.
+    fn signature_at(text: &str, start: &str) -> String {
+        let at = text
+            .find(start)
+            .unwrap_or_else(|| panic!("`{start}` is in the file"));
+        let rest = &text[at..];
+        let end = rest.find('{').expect("a body follows the signature");
+        strip_line_comments(&rest[..end])
+    }
+
+    /// **I767** (v55.0.0, CC rc7 part 5) — **an unrecorded live call never
+    /// reaches persist's DEK door.** The CC sentence is pinned in the vendored
+    /// rc7 paragraph (byte-for-byte from `constitution/part_5_transport_substrate.md`
+    /// line 44 at `VENDORED_CC_COMMIT`, checked by its SHA-256), and the door
+    /// has no `keep`: not in the orchestration, the Engine, the PyO3 binding
+    /// or its signature attribute, the stub, the record, or V193.
+    #[test]
+    fn i767_register_stream_epoch_dek_has_no_keep() {
+        use sha2::Digest as _;
+        let cc = src("src/federation/namespace/cc_rc7_part_5_one_dek_two_distributors.md");
+        assert_eq!(
+            hex::encode(sha2::Sha256::digest(cc.as_bytes())),
+            "a1075162cc481ff25c8c27b03dd4f54f408899920bbc27629fb0e76a156ad9f9",
+            "I767: the vendored CC rc7 paragraph changed; re-vendor it from the tag"
+        );
+        assert!(
+            cc.contains(
+                "An unrecorded live call wraps nothing: its DEK exists only inside the live \
+                 group, so an ordinary call keeps the forward secrecy MLS gives it and leaves \
+                 no durable wrap that could later open it."
+            ),
+            "I767: the CC sentence the door conforms to"
+        );
+        let has_keep = |t: &str| {
+            t.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                .any(|w| w == "keep")
+        };
+        for (file, start) in [
+            (
+                "src/federation/chunk_dag_cascade.rs",
+                "pub async fn register_stream_epoch_dek<",
+            ),
+            ("src/engine.rs", "pub async fn register_stream_epoch_dek("),
+            (
+                "src/ffi/pyo3.rs",
+                "#[pyo3(signature = (cohort_scope, group_key_id, stream_id, epoch, dek_b64",
+            ),
+            (
+                "src/federation/chunk_dag_cascade.rs",
+                "pub struct RegisteredStreamEpoch",
+            ),
+        ] {
+            let text = production_only(&src(file));
+            let sig = if start.starts_with("pub struct") {
+                let at = text.find(start).expect("the struct");
+                let body = &text[at..];
+                strip_line_comments(&body[..body.find("\n}").expect("struct end")])
+            } else {
+                signature_at(&text, start)
+            };
+            assert!(!has_keep(&sig), "I767: {file} `{start}` names keep:\n{sig}");
+        }
+        let blobs = production_only(&src("src/federation/blobs.rs"));
+        let at = blobs
+            .find("pub struct StreamDekRecord")
+            .expect("StreamDekRecord");
+        let rec = strip_line_comments(&blobs[at..at + blobs[at..].find("\n}").unwrap()]);
+        assert!(!has_keep(&rec), "I767: StreamDekRecord has no keep field");
+        let stub = src("python/ciris_persist/ciris_persist.pyi");
+        let line = stub
+            .lines()
+            .find(|l| l.contains("def register_stream_epoch_dek("))
+            .expect("the stub");
+        assert!(!has_keep(line), "I767: the stub names keep: {line}");
+        for m in [
+            "migrations/sqlite/lens/V193__stream_epoch_dek_supplied_and_rooms.sql",
+            "migrations/postgres/lens/V193__stream_epoch_dek_supplied_and_rooms.sql",
+        ] {
+            let ddl: String = src(m)
+                .lines()
+                .map(|l| l.find("--").map_or(l, |i| &l[..i]))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(!has_keep(&ddl), "I767: {m} adds a keep column");
+        }
+    }
+
+    /// **I768** (v55.0.0) — an epoch terminator's storage seq is public and
+    /// pinned: adopters seal and open terminators with it, never a hand copy.
+    #[test]
+    fn i768_the_terminator_seq_is_pinned() {
+        use crate::federation::chunk_dag_cascade::{terminator_seq, TERMINATOR_SEQ_BASE};
+        assert_eq!(TERMINATOR_SEQ_BASE, 4_611_686_018_427_387_904);
+        assert_eq!(terminator_seq(0).unwrap(), 1 << 62);
+        assert_eq!(terminator_seq(7).unwrap(), (1 << 62) + 7);
+        assert!(terminator_seq(u64::MAX - (1 << 62)).is_err());
     }
 }

@@ -15,7 +15,8 @@
 //! - **I406** — a report placed at a cohort the device is not in is refused;
 //!   a member's report at the same cohort is admitted.
 //! - **I407** — malformed is a refusal: `here` without size, `none` with size,
-//!   an unknown state, a missing state, a bad digest, a commons placement;
+//!   an unknown state, a missing state, a bad digest, a commons placement
+//!   other than `federation` (v55.0.0: `federation` is the directory's);
 //!   and a signed instant more than the skew bound ahead of the receiving
 //!   node's clock.
 //! - **I408** — a report is never in the audience of a node outside its
@@ -472,18 +473,31 @@ pub(crate) mod bodies {
                 &format!("I407 {what}"),
             );
         }
+        // v55.0.0 (CIRISPersist#989, CC 3.1.3.3 rule 1) — `federation` is the
+        // commons claim's placement now (the holder directory); a scope
+        // outside the closed placement set is still malformed.
+        emit(
+            d,
+            &dev,
+            None,
+            row(serde_json::json!({"custody_state": "none"})),
+            cs::FEDERATION,
+            t,
+        )
+        .await
+        .expect("I407 a commons placement is the holder directory's");
         refused(
             emit(
                 d,
                 &dev,
                 None,
                 row(serde_json::json!({"custody_state": "none"})),
-                cs::FEDERATION,
+                cs::SPECIES,
                 t,
             )
             .await,
             "custody_ack_malformed",
-            "I407 a commons placement",
+            "I407 a commons scope other than federation",
         );
         // The signer's instant may run at most 300 s ahead of the receiving
         // node's clock (the universal instant gate's bound): a future-dated
@@ -959,37 +973,39 @@ mod engine_bodies {
             crate::federation::types::cohort_scope::CryptoTier::Plaintext,
             "I525 precondition — an infrastructure room is plaintext"
         );
-        let r = e
-            .put_custody_ack(
-                &p.at_rest_sha256,
-                CustodyState::Here,
-                None,
-                Some(&other),
-                None,
-            )
-            .await;
-        assert!(
-            r.as_ref()
-                .is_err_and(|e| e.to_string().contains("custody_ack_malformed")),
-            "I525 plaintext room: a target that is not the row's is malformed: {r:?}"
-        );
+        // v55.0.0 (CIRISPersist#989, CC 3.1.3.3 rule 1; CC 3.2 infrastructure:
+        // "holding claims at federation scope") — a plaintext room blob is
+        // Commons content: its report is at `federation` and names no room, so
+        // a caller naming ANY room — another, or the row's own — is malformed.
+        for named in [&other, &room] {
+            let r = e
+                .put_custody_ack(
+                    &p.at_rest_sha256,
+                    CustodyState::Here,
+                    None,
+                    Some(named),
+                    None,
+                )
+                .await;
+            assert!(
+                r.as_ref()
+                    .is_err_and(|e| e.to_string().contains("custody_ack_malformed")),
+                "I525 plaintext room: a report naming {named} is malformed: {r:?}"
+            );
+        }
         let id = e
-            .put_custody_ack(
-                &p.at_rest_sha256,
-                CustodyState::Here,
-                None,
-                Some(&room),
-                None,
-            )
+            .put_custody_ack(&p.at_rest_sha256, CustodyState::Here, None, None, None)
             .await
-            .unwrap_or_else(|e| panic!("I525 plaintext room, its own target: {e}"));
+            .unwrap_or_else(|e| panic!("I525 plaintext room, at the content's scope: {e}"));
         let row = stored(ba, &id).await;
         assert_eq!(
-            row.attestation_envelope
-                .get("community_id")
-                .and_then(|v| v.as_str()),
-            Some(room.as_str()),
-            "I525 the envelope names the row's room"
+            row.cohort_scope,
+            crate::federation::types::cohort_scope::FEDERATION,
+            "I525 the plaintext room's report is at federation"
+        );
+        assert!(
+            row.attestation_envelope.get("community_id").is_none(),
+            "I525 a federation report names no room"
         );
         // An affiliations blob: sealed under the room's DEK, bound under the
         // `affiliations` cohort. A report naming another room is refused —
@@ -1071,9 +1087,10 @@ mod engine_bodies {
     /// keeps every room.** The same bytes written into infrastructure rooms A
     /// and B are one content-addressed row whose provenance columns name A
     /// (`ON CONFLICT DO NOTHING`). Through v53 a custody report naming B was
-    /// refused `custody_ack_malformed`. Now both rooms are associations: a
-    /// report naming B is accepted and names B, a room that never wrote the
-    /// bytes is still malformed, and the durability audience covers B.
+    /// refused `custody_ack_malformed`. Now both rooms are associations, and
+    /// the durability audience covers B. (v55.0.0, CIRISPersist#989: the
+    /// report itself is at `federation` and names no room — CC 3.1.3.3 rule
+    /// 1 — so naming B is malformed again, for that reason.)
     pub(crate) async fn i579_shared_plaintext_keeps_every_room<B>(
         dsn_a: &str,
         dsn_b: &str,
@@ -1125,27 +1142,30 @@ mod engine_bodies {
             want,
             "I579 both rooms are associations"
         );
+        // v55.0.0 (CIRISPersist#989, CC 3.1.3.3 rule 1) — shared plaintext is
+        // Commons content, so its one report is at `federation` and names no
+        // room: naming room B, or a room that never wrote the bytes, is
+        // malformed, and the report at the content's scope is accepted.
         let id = e
-            .put_custody_ack(&sha, CustodyState::Here, None, Some(&room_b), None)
+            .put_custody_ack(&sha, CustodyState::Here, None, None, None)
             .await
-            .unwrap_or_else(|e| panic!("I579 a report naming room B is accepted: {e}"));
+            .unwrap_or_else(|e| panic!("I579 the report at the content's scope: {e}"));
+        let row = stored(ba, &id).await;
         assert_eq!(
-            stored(ba, &id)
-                .await
-                .attestation_envelope
-                .get("community_id")
-                .and_then(|v| v.as_str()),
-            Some(room_b.as_str()),
-            "I579 the envelope names room B"
+            row.cohort_scope,
+            crate::federation::types::cohort_scope::FEDERATION
         );
-        let r = e
-            .put_custody_ack(&sha, CustodyState::Here, None, Some(&stranger), None)
-            .await;
-        assert!(
-            r.as_ref()
-                .is_err_and(|e| e.to_string().contains("custody_ack_malformed")),
-            "I579 a room that never wrote the bytes is malformed: {r:?}"
-        );
+        assert!(row.attestation_envelope.get("community_id").is_none());
+        for named in [&room_b, &stranger] {
+            let r = e
+                .put_custody_ack(&sha, CustodyState::Here, None, Some(named), None)
+                .await;
+            assert!(
+                r.as_ref()
+                    .is_err_and(|e| e.to_string().contains("custody_ack_malformed")),
+                "I579 a report naming {named} is malformed: {r:?}"
+            );
+        }
         let d = e.durability_deficit(&sha, &l.node_a, None).await.unwrap();
         // Room B's own audience is contained in the blob's.
         match content_audience(

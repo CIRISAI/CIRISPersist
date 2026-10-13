@@ -5,8 +5,15 @@
 //! A family must be able to see how many copies of its content exist ("only
 //! one copy, back it up") without weakening encryption or outsider
 //! invisibility. A device says so itself, in a `scores` row on its own leaf,
-//! `custody:ack:v1` — never a `holds_bytes:*` sub-form, so no matcher error
-//! can advertise self/family holdings to outsiders.
+//! `custody:ack:v1`.
+//!
+//! v55.0.0 (CIRISPersist#989, CIRISConstitution#141) — **this is the one
+//! holding claim at every tier.** The retired `holds_bytes` carrier was a
+//! second one with its audience hard-coded to `federation`; a `here` report
+//! placed at the content's own scope replaces it, and at `federation` (the
+//! Commons tier) the `here` rows are the holder directory. The claim, its
+//! emission and the directory read are [`super::holding_claim`]; this module
+//! is the report's parse, gate and fold.
 //!
 //! # The row
 //!
@@ -26,10 +33,15 @@
 //!   refuses one more than [`DEFAULT_MAX_TOUCH_SKEW`](super::admission::DEFAULT_MAX_TOUCH_SKEW)
 //!   ahead of the receiving node's clock, so a future-dated `here` cannot stay
 //!   live for ever;
+//! - `expires_at` — v55.0.0 (CC 3.1.3.3 rule 5): when present it is the
+//!   signed instant + [`CUSTODY_LIVE_SECS`], the claim's own freshness; a
+//!   report signed before v55 carries none and is live by its instant alone;
 //! - the cohort target (`community_id` / `family_key_id`) per the row's
-//!   `cohort_scope`, which is the blob's own: `self`, `family` or
-//!   `community`. Nothing about the blob beyond its address and size rides
-//!   the row; its name and format stay in the sealed descriptor.
+//!   `cohort_scope`, which is the blob's own: `self`, `family`, `community`
+//!   or `affiliations` for a bounded cohort, `federation` for Commons-tier
+//!   content (CC 3.1.3.3 rule 1). Nothing about the blob beyond its address
+//!   and size rides the row; its name and format stay in the sealed
+//!   descriptor.
 //!
 //! # The fold (read time; never a stored verdict)
 //!
@@ -129,20 +141,29 @@ pub struct CustodyAck {
 }
 
 fn malformed(detail: impl std::fmt::Display) -> Error {
-    Error::InvalidArgument(format!(
-        "custody_ack_malformed: {detail} ({CUSTODY_ACK_DIMENSION}, CC 3.1.3.3) — a malformed \
-         custody report is refused, never read as an absent one"
-    ))
+    Error::malformed_row(
+        "custody_ack",
+        super::malformed_row::CUSTODY_ACK,
+        format!(
+            "custody_ack_malformed: {detail} ({CUSTODY_ACK_DIMENSION}, CC 3.1.3.3) — a malformed \
+             custody report is refused, never read as an absent one"
+        ),
+    )
 }
 
 fn is_lower_hex_digest(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
-/// The cohorts a custody report may be placed at (CC 3.1.3.3: "`self` for a
-/// person's own devices, `family`, or `community`").
+/// The cohorts a custody report may be placed at (CC 3.1.3.3 rule 1:
+/// "`self`, `family`, `community` or `affiliations` for a bounded cohort,
+/// `federation` for Commons and `public` content"). v55.0.0 adds the last two
+/// (CIRISPersist#989): the report is the one holding claim at every tier.
 fn is_custody_scope(scope: &str) -> bool {
-    matches!(scope, cs::SELF | cs::FAMILY | cs::COMMUNITY)
+    matches!(
+        scope,
+        cs::SELF | cs::FAMILY | cs::COMMUNITY | cs::AFFILIATIONS | cs::FEDERATION
+    )
 }
 
 /// **Parse a row as a custody report.** `Ok(None)` when the row is not on
@@ -183,9 +204,13 @@ pub fn parse_custody_ack(row: &Attestation) -> Result<Option<CustodyAck>, Error>
         .filter(|d| is_lower_hex_digest(d))
         .ok_or_else(|| malformed("the blob's address digest is not 64 lowercase hex"))?;
     let size = match (state, env.get(CUSTODY_SIZE_MEMBER)) {
+        // v55.0.0 (CIRISPersist#989) — the holding claim is the puller's
+        // budget (CC 5.3.2.5): a positive integer, as the retired carrier's
+        // size was.
         (CustodyState::Here, Some(v)) => Some(
             v.as_u64()
-                .ok_or_else(|| malformed(format!("size {v} is not a non-negative integer")))?,
+                .filter(|n| *n > 0)
+                .ok_or_else(|| malformed(format!("size {v} is not a positive integer")))?,
         ),
         (CustodyState::Here, None) => {
             return Err(malformed("a `here` report carries the blob's size"));
@@ -197,10 +222,22 @@ pub fn parse_custody_ack(row: &Attestation) -> Result<Option<CustodyAck>, Error>
     };
     if !is_custody_scope(&row.cohort_scope) {
         return Err(malformed(format!(
-            "a custody report is placed at the blob's own cohort (self | family | community), \
-             not {:?}",
+            "a custody report is placed at the blob's own cohort (self | family | community | \
+             affiliations, or federation for Commons-tier content), not {:?}",
             row.cohort_scope
         )));
+    }
+    // v55.0.0 (CC 3.1.3.3 rule 5) — "the 72-hour window is the claim's
+    // `expires_at`; no second TTL exists". A report that carries one carries
+    // exactly that window: a longer one would outlive the fold's liveness, a
+    // shorter one would be a second TTL.
+    if let Some(expires_at) = row.expires_at {
+        if expires_at != row.asserted_at + chrono::Duration::seconds(CUSTODY_LIVE_SECS) {
+            return Err(malformed(format!(
+                "expires_at {expires_at} is not the signed instant + {CUSTODY_LIVE_SECS}s — a \
+                 report's freshness is its 72-hour window and nothing else"
+            )));
+        }
     }
     Ok(Some(CustodyAck {
         device_key_id: row.attesting_key_id.clone(),
@@ -216,13 +253,44 @@ pub fn parse_custody_ack(row: &Attestation) -> Result<Option<CustodyAck>, Error>
 /// **Is the reporting device in the blob's cohort?** The ONE audience call
 /// site of this module. A `self` report is the device's own self; a `family`
 /// or `community` report needs the device (or a human it is an occurrence of)
-/// on that roster.
+/// on that roster; a `federation` report is everyone's.
 async fn device_in_cohort(
     directory: &dyn FederationDirectory,
     row: &Attestation,
     target: Option<&str>,
 ) -> Result<bool, Error> {
-    let device = row.attesting_key_id.as_str();
+    holder_in_cohort(directory, &row.attesting_key_id, &row.cohort_scope, target).await
+}
+
+/// **Is `holder` in the cohort `(cohort_scope, target)`?** — the audience
+/// predicate the custody gate and the holding-claim emitter
+/// ([`super::holding_claim::emit_holding_claim`]) share, so a claim the
+/// emitter decides to sign is a claim the gate admits.
+pub(crate) async fn holder_in_cohort<D>(
+    directory: &D,
+    holder: &str,
+    cohort_scope: &str,
+    target: Option<&str>,
+) -> Result<bool, Error>
+where
+    D: FederationDirectory + ?Sized,
+{
+    // v55.0.0 (CIRISPersist#989) — a FAMILY claim asks the family's own
+    // roster: the holder is an active member, or an occurrence of one whose
+    // allow list lets the family through to it. The general arm below asks
+    // whether the holder receives its OWN row, and for a family placement its
+    // principal arm answers that from the holder's owner alone — whoever the
+    // family is — so a node in no family could claim at any family.
+    if cohort_scope == super::types::cohort_scope::FAMILY {
+        let Some(family) = target else {
+            return Ok(false);
+        };
+        // A family this node does not know has no roster it is on.
+        if directory.lookup_family(family).await?.is_none() {
+            return Ok(false);
+        }
+        return super::replication::hold::family_audience(directory, holder, family).await;
+    }
     // v53.0.0 (#963) — the ONE audience rule, with no exemption for the
     // reporter: a `self` report is admitted iff the device is in its
     // principal's self audience — a claimed personal occurrence (or one its
@@ -231,11 +299,11 @@ async fn device_in_cohort(
     // deficit would never count it.
     super::replication::hold::is_audience(
         directory,
-        &row.cohort_scope,
+        cohort_scope,
         target,
-        device,
+        holder,
         |_| false,
-        device,
+        holder,
     )
     .await
 }
@@ -282,6 +350,47 @@ pub async fn check_custody_ack_admission(
     Ok(())
 }
 
+/// Is `row` on the custody family (`custody:*`)? The one family test the
+/// retraction rule and the binding fold share.
+#[must_use]
+pub fn is_custody_row(row: &Attestation) -> bool {
+    super::admission::envelope_dimension(&row.attestation_envelope)
+        .is_some_and(|d| d.starts_with(CUSTODY_FAMILY_STEM))
+}
+
+/// Refusal token (CC 3.1.3.3 rule 4): a `withdraws` or `recants` naming a
+/// custody report signed by anyone but the report's own device.
+pub const CUSTODY_ACK_WITHDRAWS_NOT_THE_HOLDER: &str = "custody_ack_withdraws_not_the_holder";
+
+/// **CC 3.1.3.3 rule 4 — a holding claim is retracted by its signer alone.**
+/// A device ends its own report by re-acknowledging `none` or by its own
+/// `withdraws`; "nobody withdraws another device's report, and a takedown is
+/// the CC 2.3 tombstone path, not a withdrawal of holders". So a retraction
+/// whose target is a custody report and whose attester is not that report's
+/// attester is refused at the door (the read-side fold,
+/// `precedence::retraction_entitled`, never lets one retire it either).
+///
+/// # Errors
+///
+/// `custody_ack_withdraws_not_the_holder`.
+pub fn check_custody_withdraws_signer(
+    retraction: &Attestation,
+    target: &Attestation,
+) -> Result<(), Error> {
+    if !is_custody_row(target) || retraction.attesting_key_id == target.attesting_key_id {
+        return Ok(());
+    }
+    Err(Error::InvalidArgument(format!(
+        "{CUSTODY_ACK_WITHDRAWS_NOT_THE_HOLDER}: {} is not the device {} whose holding claim {} \
+         this {} names — a holding claim is retracted by its signer alone, and a takedown is the \
+         CC 2.3 tombstone path (CC 3.1.3.3 rule 4)",
+        retraction.attesting_key_id,
+        target.attesting_key_id,
+        target.attestation_id,
+        retraction.attestation_type
+    )))
+}
+
 /// **The envelope of a custody report** for `blob` — what a device signs.
 /// `size` is REQUIRED for `here` and refused for `none`; the cohort target is
 /// written under `community_id` (community) or `family_key_id` (family).
@@ -294,7 +403,7 @@ pub fn custody_ack_envelope(
 ) -> Result<serde_json::Value, Error> {
     if !is_custody_scope(cohort_scope) {
         return Err(malformed(format!(
-            "cohort {cohort_scope:?} is not self | family | community"
+            "cohort {cohort_scope:?} is not self | family | community | affiliations | federation"
         )));
     }
     let mut env = serde_json::json!({
@@ -313,11 +422,18 @@ pub fn custody_ack_envelope(
         (CustodyState::None, None) => {}
     }
     match (cohort_scope, cohort_target) {
-        (cs::COMMUNITY, Some(c)) => env["community_id"] = serde_json::json!(c),
+        (cs::COMMUNITY | cs::AFFILIATIONS, Some(c)) => env["community_id"] = serde_json::json!(c),
         (cs::FAMILY, Some(f)) => env["family_key_id"] = serde_json::json!(f),
-        (cs::COMMUNITY | cs::FAMILY, None) => {
+        (cs::COMMUNITY | cs::AFFILIATIONS | cs::FAMILY, None) => {
             return Err(malformed(format!(
                 "a {cohort_scope} report names its {cohort_scope}"
+            )));
+        }
+        // v55.0.0 — the commons and `self` name no cohort target; a target
+        // there would be a placement the scope does not have.
+        (cs::FEDERATION | cs::SELF, Some(t)) => {
+            return Err(malformed(format!(
+                "a {cohort_scope} report names no cohort target, not {t:?}"
             )));
         }
         _ => {}
@@ -611,7 +727,10 @@ where
 /// **What this node signs for `blob`** — the input of a custody report,
 /// derived from what the node holds. `here` needs the blob's row on this node
 /// (a device does not report a copy it does not have) and takes its size from
-/// the stored row; the cohort is the stored row's, and a caller-named cohort that
+/// the stored row. With a row held, the report is placed at the CONTENT's
+/// claim scope ([`content_claim_scope`](super::holding_claim::content_claim_scope),
+/// CC 3.1.3.3 rule 1 — v55.0.0: `federation` for Commons-tier content, the
+/// row's own sealed cohort otherwise); a caller-named cohort or target that
 /// differs is refused. With no row held, only `none` can be reported, at the
 /// caller-named cohort.
 ///
@@ -642,37 +761,63 @@ where
 {
     let blob_err = |e: BlobError| Error::Backend(format!("custody report: {e}"));
     let head = backend.blob_head(blob_sha256).await.map_err(blob_err)?;
-    // v54.0.0 (CIRISPersist#995 row 4, V184) — a PLAINTEXT row is shared by
-    // content address: its provenance columns name the first writer's room,
-    // and every room that wrote the same bytes is an association. A cohort
-    // and target the caller names are valid iff they are one of them.
-    let associations: Vec<(String, Option<String>)> = match &head {
-        Some(h) if h.crypto_tier == super::types::cohort_scope::CryptoTier::Plaintext => backend
-            .blob_associations(blob_sha256)
-            .await
-            .map_err(blob_err)?,
-        _ => Vec::new(),
-    };
-    let (scope, size) = match (&head, state) {
+    let (scope, target, size): (String, Option<String>, Option<u64>) = match (&head, state) {
         (Some(h), _) => {
-            let named_is_associated = |named: &str| associations.iter().any(|(s, _)| s == named);
-            if let Some(named) =
-                cohort_scope.filter(|c| *c != h.cohort_scope && !named_is_associated(c))
-            {
+            // v55.0.0 (CC 3.1.3.3 rule 1) — the content's claim scope, never
+            // the caller's: an emitter does not choose where its claim goes. A
+            // sealed family / room row that records no group (pre-V177) has no
+            // derivable target; there the caller's names it, as before.
+            let (claim_scope, claim_target): (String, Option<String>) =
+                match super::holding_claim::content_claim_scope(backend, blob_sha256).await {
+                    Ok(Some(c)) => (c.cohort_scope().to_owned(), c.target().map(str::to_owned)),
+                    Ok(None) => {
+                        return Err(Error::Backend(
+                            "custody report: the held row vanished".into(),
+                        ))
+                    }
+                    Err(BlobError::InvalidArgument(m))
+                        if m.contains(super::holding_claim::HOLDING_CLAIM_SCOPE_UNRESOLVED)
+                            && cohort_target.is_some() =>
+                    {
+                        (h.cohort_scope.clone(), cohort_target.map(str::to_owned))
+                    }
+                    Err(BlobError::InvalidArgument(m)) => return Err(Error::InvalidArgument(m)),
+                    Err(e) => return Err(blob_err(e)),
+                };
+            if let Some(named) = cohort_scope.filter(|c| *c != claim_scope) {
                 return Err(malformed(format!(
-                    "the blob is held at cohort {:?}, not {named:?}",
-                    h.cohort_scope
+                    "the blob's holding claims are placed at {claim_scope:?}, not {named:?} (CC \
+                     3.1.3.3 rule 1: the claim is at the content's scope)"
                 )));
             }
-            // The held row IS this node's copy: `blob_head` reads the same
-            // stored row `has_blob` counts, so there is no row without bytes
-            // to refuse here.
+            if let Some(named) = cohort_target.filter(|t| Some(*t) != claim_target.as_deref()) {
+                return Err(malformed(format!(
+                    "the blob is held for {claim_scope} {claim_target:?}, not {named:?}"
+                )));
+            }
             // v53.0.0 (CIRISPersist#963) — for a chunk DAG the row is only the
             // manifest, so `here` also asks that every chunk is held: a node
             // holding the manifest and missing a chunk is not a copy, and the
             // durability deficit must still list it. Asked as THIS node (the
             // report's signer); a manifest it cannot open refuses `here`.
             if state == CustodyState::Here {
+                // Codex r3 on #1065 — a `here` report about bytes a tombstone
+                // withholds would re-advertise them through the takedown's
+                // window; refused, as `emit_holding_claim` refuses them.
+                // The refusal is the purge family's typed one, under the SAME
+                // token `BlobError::Purged` carries, so a host matches one.
+                if let Some(notice_id) =
+                    super::steward_purge::purge_withheld(backend, blob_sha256).await?
+                {
+                    return Err(Error::PurgeRefused {
+                        token: super::steward_purge::token::BLOB_PURGED,
+                        body: serde_json::json!({
+                            "sha256_hex": hex::encode(blob_sha256),
+                            "notice_id": notice_id,
+                            "retryable": false,
+                        }),
+                    });
+                }
                 use super::chunk_dag_cascade::orchestrate::{held_dag_completeness, DagHolding};
                 // v53.1.2 (CIRISPersist#984 row 9) — asked as THIS node, or
                 // not at all: a backend that does not know its key would ask
@@ -715,16 +860,13 @@ where
                     }
                 }
             }
+            // The held row IS this node's copy: `blob_head` reads the same
+            // stored row `has_blob` counts.
             let size = match state {
                 CustodyState::Here => Some(h.size_bytes),
                 CustodyState::None => None,
             };
-            // The named cohort when it is one of the row's (checked above),
-            // else the row's own.
-            (
-                cohort_scope.map_or_else(|| h.cohort_scope.clone(), str::to_owned),
-                size,
-            )
+            (claim_scope, claim_target, size)
         }
         (None, CustodyState::Here) => {
             return Err(Error::InvalidArgument(
@@ -739,81 +881,25 @@ where
                     malformed("with no row held, a `none` report names the blob's cohort")
                 })?
                 .to_owned(),
+            cohort_target.map(str::to_owned),
             None,
         ),
-    };
-    // v53.1.2 (CIRISPersist#984 row 7) — with a row held, the target is the
-    // ROW's: the sealing epoch's community, or the V177 group of a self/family
-    // row. A caller value that differs is malformed (a device in two rooms
-    // was filing A's blob as a copy held for room B); one that matches is
-    // accepted; `None` resolves to the row's. With no row held, or a row
-    // that records no group (pre-V177), the caller's value stands.
-    let row_target: Option<String> = match (&head, scope.as_str()) {
-        // v53.1.3 (Codex on #985 P1, #986) — every ROOM shape: the sealing
-        // epoch's community where a binding exists, else the V177 group the
-        // row records — a PLAINTEXT room (an infrastructure community) has no
-        // binding, and an `affiliations` row is a room row too. Before, both
-        // fell to `None` and the caller's room was trusted.
-        (Some(_), cs::COMMUNITY | cs::AFFILIATIONS) => {
-            let bound = backend
-                .community_dek_blob_epoch(blob_sha256)
-                .await
-                .map_err(blob_err)?
-                .map(|(community, _, _)| community);
-            match bound {
-                Some(c) => Some(c),
-                None => backend
-                    .blob_provenance(blob_sha256)
-                    .await
-                    .map_err(blob_err)?
-                    .and_then(|p| p.group_key_id),
-            }
-        }
-        (Some(_), cs::SELF | cs::FAMILY) => backend
-            .blob_provenance(blob_sha256)
-            .await
-            .map_err(blob_err)?
-            .and_then(|p| p.group_key_id),
-        _ => None,
-    };
-    // v54.0.0 (#995 row 4) — a shared plaintext row: the target is one of
-    // the rooms that wrote it at this cohort, or it is malformed; with none
-    // named, the one room at this cohort, else the row's own.
-    let rooms_at_scope: Vec<&str> = associations
-        .iter()
-        .filter(|(s, _)| *s == scope)
-        .filter_map(|(_, g)| g.as_deref())
-        .collect();
-    let target = if associations.is_empty() {
-        match (cohort_target, row_target) {
-            (Some(named), Some(rows)) if named != rows => {
-                return Err(malformed(format!(
-                    "the blob is held for {scope} {rows:?}, not {named:?}"
-                )));
-            }
-            (Some(named), _) => Some(named.to_owned()),
-            (None, rows) => rows,
-        }
-    } else {
-        match cohort_target {
-            Some(named) if rooms_at_scope.contains(&named) => Some(named.to_owned()),
-            Some(named) => {
-                return Err(malformed(format!(
-                    "the blob is held for {scope} {rooms_at_scope:?}, not {named:?}"
-                )));
-            }
-            None if rooms_at_scope.len() == 1 => Some(rooms_at_scope[0].to_owned()),
-            None => row_target,
-        }
     };
     let env = custody_ack_envelope(blob_sha256, state, size, &scope, target.as_deref())?;
     let core: super::envelope::EnvelopeCore = serde_json::from_value(env)
         .map_err(|e| Error::Backend(format!("custody report envelope: {e}")))?;
-    Ok(super::EmitAttestationInput::with_envelope(
+    let mut input = super::EmitAttestationInput::with_envelope(
         super::types::attestation_type::SCORES,
         core,
         scope,
-    ))
+    );
+    // v55.0.0 (CC 3.1.3.3 rule 5) — the report's freshness is its own
+    // `expires_at`: the signed instant is fixed here (the emit recipe honours
+    // a producer-set `asserted_at`) so the window is exactly 72 hours after it.
+    let now = super::admission::truncate_to_substrate_resolution(Utc::now());
+    input.attestation_envelope.asserted_at = Some(super::admission::render_signed_instant(now));
+    input.expires_at = Some(now + chrono::Duration::seconds(CUSTODY_LIVE_SECS));
+    Ok(input)
 }
 
 #[cfg(test)]

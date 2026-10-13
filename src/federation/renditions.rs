@@ -13,7 +13,8 @@
 //!
 //! CC 5.3.2.5: *"Every blob carries its size, and size is checked first."*
 //! [`HolderClaim`] is the puller's budget: the holder's key and the byte
-//! length its SIGNED `holds_bytes` claim declares, so a `ContentFetch` caps
+//! length its SIGNED holding claim (`custody:ack:v1` `here`, v55.0.0,
+//! CIRISPersist#989) declares, so a `ContentFetch` caps
 //! its read BEFORE hashing (AV-88) and refuses a holder whose number
 //! disagrees with the descriptor it is fetching for (AV-89).
 //!
@@ -51,8 +52,9 @@ pub struct Rendition {
     pub cohort_scope: String,
 }
 
-/// v45.0.0 (#871, FSD §4) — one live `holds_bytes` claim with the byte
-/// length the holder SIGNED. The puller's budget for a `ContentFetch`.
+/// v45.0.0 (#871, FSD §4) — one holder's `here` claim with the byte length
+/// the holder SIGNED. The puller's budget for a `ContentFetch`. v55.0.0
+/// (CIRISPersist#989) — the claim is the one holding claim, `custody:ack:v1`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HolderClaim {
     /// The holder (`attesting_key_id` of the claim).
@@ -127,47 +129,6 @@ pub fn rendition_of_row(row: &Attestation) -> Option<Rendition> {
     })
 }
 
-/// The byte length a `holds_bytes` claim's envelope declares, or `None`
-/// when the claim carries no `size`, a non-integer one, or zero. The
-/// receive door refuses those from this cut on (FSD §4); a legacy row
-/// without one is not a holder a puller can budget for, so the sized read
-/// SKIPS it rather than failing.
-#[must_use]
-pub fn holder_claim_size(envelope: &serde_json::Value) -> Option<u64> {
-    envelope
-        .get("size")
-        .and_then(serde_json::Value::as_u64)
-        .filter(|s| *s > 0)
-}
-
-/// v45.0.0 (#871) — **the pure tail of `list_holders_sized`**, shared by
-/// the three backends so they cannot disagree on what a sized holder is.
-/// `candidates` are `(attesting_key_id, envelope)` pairs the backend has
-/// already narrowed to the claim's type prefix and folded the holder's own
-/// `withdraws` / `recants` out of; this keeps the ones that cite `full_hex`
-/// in `evidence_refs` (the prefix-collision discriminator) and carry a
-/// positive `size`, one per holder (first wins), sorted by key.
-pub fn sized_holder_claims(
-    full_hex: &str,
-    candidates: impl IntoIterator<Item = (String, serde_json::Value)>,
-) -> Vec<HolderClaim> {
-    let mut out: Vec<HolderClaim> = Vec::new();
-    for (key_id, env) in candidates {
-        if !super::admission::envelope_binds_content(&env, full_hex) {
-            continue;
-        }
-        let Some(size) = holder_claim_size(&env) else {
-            continue;
-        };
-        if out.iter().any(|c| c.key_id == key_id) {
-            continue;
-        }
-        out.push(HolderClaim { key_id, size });
-    }
-    out.sort_by(|a, b| a.key_id.cmp(&b.key_id));
-    out
-}
-
 /// The 32-byte digest a `list_derived_hex` argument names, or
 /// `InvalidArgument` when it is not 64 hex characters. Every backend decodes
 /// through this so the three agree on what a malformed argument is.
@@ -203,6 +164,15 @@ pub trait HeldBlobScope {
         &self,
         sha256: &[u8; 32],
     ) -> impl std::future::Future<Output = Result<Option<String>, Error>> + Send;
+
+    /// v55.0.0 (CIRISPersist#989, CC 3.1.3.3 rule 1) — the scope a holding
+    /// claim about the blob `sha256` must be placed at, if this node holds it
+    /// ([`content_claim_scope`](super::holding_claim::content_claim_scope)).
+    /// Memory holds no blobs and answers `None`, as for the placement rule.
+    fn held_claim_scope(
+        &self,
+        sha256: &[u8; 32],
+    ) -> impl std::future::Future<Output = Result<Option<super::holding_claim::ClaimScope>, Error>> + Send;
 }
 
 /// The `derived_from` digest a row's struct names, when it names one.
@@ -271,24 +241,34 @@ pub(crate) mod witnesses {
     use crate::federation::tier_ingest::test_support as ts;
     use crate::federation::types::identity_type::USER;
     use crate::federation::types::{attestation_type, cohort_scope};
-    use crate::federation::{holds_bytes_attestation_type, Attestation, FederationDirectory};
+    use crate::federation::{Attestation, FederationDirectory};
 
     fn sha_of(seed: &str) -> [u8; 32] {
         use sha2::Digest as _;
         sha2::Sha256::digest(seed.as_bytes()).into()
     }
 
-    /// A signed, sized `holds_bytes` claim by `holder` over `cited` whose
-    /// type prefix is that of `typed` (the two differ only in a
-    /// prefix-collision case).
-    fn claim(id: &str, holder: &str, typed: &[u8; 32], cited: &[u8; 32], size: u64) -> Attestation {
-        let env = serde_json::json!({
-            "kind": "holds_bytes",
-            "evidence_refs": [hex::encode(cited)],
-            "size": size,
-        });
-        let mut r = row(id, holder, holder, env, cohort_scope::FEDERATION);
-        r.attestation_type = holds_bytes_attestation_type(typed);
+    /// A signed, sized holding claim (v55.0.0: `custody:ack:v1` `here` at
+    /// `federation`, CIRISPersist#989) by `holder` over `cited`.
+    fn claim(id: &str, holder: &str, cited: &[u8; 32], size: u64) -> Attestation {
+        let scope = crate::federation::holding_claim::ClaimScope::of_content(
+            crate::federation::types::cohort_scope::CryptoTier::Plaintext,
+            cohort_scope::FEDERATION,
+            None,
+        )
+        .unwrap();
+        let mut r = crate::federation::holding_claim::holding_claim_row(
+            cited,
+            holder,
+            id,
+            chrono::Utc::now() - chrono::Duration::minutes(5),
+            size,
+            &scope,
+        )
+        .unwrap();
+        // The pure row leaves the scrub to its signer (`sign_holding_claim`);
+        // here the holder seals it.
+        r.scrub_key_id = holder.to_owned();
         ts::reseal(&mut r);
         r
     }
@@ -308,8 +288,9 @@ pub(crate) mod witnesses {
 
     /// `list_holders_sized`: one sorted entry per holder with the size the
     /// claim SIGNED; a holder's own `withdraws` or `recants` folds its claim
-    /// out; a claim on a prefix-colliding digest is not this blob's; a
-    /// second holder's retraction of a claim it did not make folds nothing.
+    /// out; a claim on another digest is not this blob's; a second holder's
+    /// retraction of a claim it did not make is refused at the door (v55.0.0,
+    /// CC 3.1.3.3 rule 4) and folds nothing.
     pub async fn sized_holders_fold_retractions(d: &dyn FederationDirectory, s: &str) {
         let (h1, h2, h3) = (
             format!("871-h1-{s}"),
@@ -320,28 +301,22 @@ pub(crate) mod witnesses {
             ts::register_identity_key(d, h, USER).await;
         }
         let sha = sha_of(&format!("871-bytes-{s}"));
-        // Same 8-hex type prefix, different digest.
+        // Another digest (the retired carrier keyed an 8-hex prefix; the claim
+        // cites the full digest).
         let mut colliding = sha;
         colliding[31] ^= 0xff;
-        assert_eq!(
-            holds_bytes_attestation_type(&sha),
-            holds_bytes_attestation_type(&colliding)
-        );
         assert!(d.list_holders_sized(&sha).await.unwrap().is_empty());
 
         // h3 first so the sort is visible; h1 claims the colliding digest too.
         let c3 = format!("871-c3-{s}");
-        put(d, claim(&c3, &h3, &sha, &sha, 30)).await.unwrap();
+        put(d, claim(&c3, &h3, &sha, 30)).await.unwrap();
         let c1 = format!("871-c1-{s}");
-        put(d, claim(&c1, &h1, &sha, &sha, 10)).await.unwrap();
-        put(
-            d,
-            claim(&format!("871-c1x-{s}"), &h1, &colliding, &colliding, 99),
-        )
-        .await
-        .unwrap();
+        put(d, claim(&c1, &h1, &sha, 10)).await.unwrap();
+        put(d, claim(&format!("871-c1x-{s}"), &h1, &colliding, 99))
+            .await
+            .unwrap();
         let c2 = format!("871-c2-{s}");
-        put(d, claim(&c2, &h2, &sha, &sha, 20)).await.unwrap();
+        put(d, claim(&c2, &h2, &sha, 20)).await.unwrap();
         assert_eq!(
             d.list_holders_sized(&sha).await.unwrap(),
             vec![
@@ -368,8 +343,9 @@ pub(crate) mod witnesses {
             }]
         );
 
-        // h2 retracts h1's claim: not h2's to retract; nothing folds.
-        put(
+        // h2 retracts h1's claim: not h2's to retract — refused at the door
+        // (CC 3.1.3.3 rule 4), and nothing folds.
+        let foreign = put(
             d,
             retraction(
                 &format!("871-w-foreign-{s}"),
@@ -379,7 +355,13 @@ pub(crate) mod witnesses {
             ),
         )
         .await
-        .unwrap();
+        .unwrap_err();
+        assert!(
+            foreign
+                .to_string()
+                .contains("custody_ack_withdraws_not_the_holder"),
+            "{foreign}"
+        );
         assert_eq!(d.list_holders_sized(&sha).await.unwrap().len(), 3);
 
         // h1 withdraws its own claim; h3 recants its own claim.
@@ -782,56 +764,6 @@ mod tests {
                 "{member} = {bad} must not project"
             );
         }
-    }
-
-    #[test]
-    fn a_holder_claim_size_is_a_positive_integer_or_nothing() {
-        assert_eq!(
-            holder_claim_size(&serde_json::json!({"size": 12})),
-            Some(12)
-        );
-        assert_eq!(holder_claim_size(&serde_json::json!({})), None);
-        assert_eq!(holder_claim_size(&serde_json::json!({"size": 0})), None);
-        assert_eq!(holder_claim_size(&serde_json::json!({"size": -1})), None);
-        assert_eq!(holder_claim_size(&serde_json::json!({"size": "12"})), None);
-        assert_eq!(holder_claim_size(&serde_json::json!({"size": 1.5})), None);
-    }
-
-    #[test]
-    fn the_sized_tail_keeps_cited_sized_claims_once_per_holder_sorted() {
-        let sha = hex64("bytes");
-        let other = hex64("other-bytes");
-        let claim = |k: &str, env: serde_json::Value| (k.to_owned(), env);
-        let got = sized_holder_claims(
-            &sha,
-            vec![
-                claim("z", serde_json::json!({"evidence_refs": [sha], "size": 9})),
-                // prefix collision: a different digest is not this blob
-                claim(
-                    "a",
-                    serde_json::json!({"evidence_refs": [other], "size": 9}),
-                ),
-                // legacy claim with no size: not a holder a puller can budget for
-                claim("b", serde_json::json!({"evidence_refs": [sha]})),
-                claim("c", serde_json::json!({"evidence_refs": [sha], "size": 0})),
-                claim("m", serde_json::json!({"evidence_refs": [sha], "size": 4})),
-                // a second claim by the same holder: first wins
-                claim("m", serde_json::json!({"evidence_refs": [sha], "size": 5})),
-            ],
-        );
-        assert_eq!(
-            got,
-            vec![
-                HolderClaim {
-                    key_id: "m".into(),
-                    size: 4
-                },
-                HolderClaim {
-                    key_id: "z".into(),
-                    size: 9
-                },
-            ]
-        );
     }
 
     #[test]

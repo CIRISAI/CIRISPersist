@@ -376,6 +376,8 @@ pub mod bodies {
 
     /// A federation-tier `custody:ack:v1` `here` by `device` for `sha`: the
     /// row node B holds once a device's report reaches it (CIRISEdge#763).
+    /// v55.0.0 (CIRISPersist#989, CC 3.1.3.3 rule 1) — placed at the
+    /// content's scope: [`seal_blob`] writes Commons content, so `federation`.
     #[cfg(test)]
     async fn custody_here<B>(b: &B, id: &str, device: &str, sha: &[u8; 32])
     where
@@ -385,14 +387,14 @@ pub mod bodies {
             sha,
             crate::federation::custody_ack::CustodyState::Here,
             Some(4096),
-            crate::federation::types::cohort_scope::SELF,
+            crate::federation::types::cohort_scope::FEDERATION,
             None,
         )
         .expect("custody envelope");
         env["id"] = serde_json::json!(id);
         let mut row = ts::bare_attestation(id, device, device, &env);
         row.attestation_type = attestation_type::SCORES.into();
-        row.cohort_scope = crate::federation::types::cohort_scope::SELF.into();
+        row.cohort_scope = crate::federation::types::cohort_scope::FEDERATION.into();
         ts::seal_row_in_place(device, &mut row);
         b.put_attestation(SignedAttestation { attestation: row })
             .await
@@ -538,7 +540,6 @@ pub mod bodies {
     where
         B: BlobStorage + FederationDirectory + Sync,
     {
-        let prefix = crate::federation::HOLDS_BYTES_ATTESTATION_TYPE_PREFIX;
         // The announcing key is the ENGINE's own local signer: `evict_blob`
         // retracts THIS node's claims, which are the ones that key made. The
         // runner seeds the engine from the label below; the assert pins it.
@@ -558,7 +559,8 @@ pub mod bodies {
                 .filter(|a| a.attestation_type == attestation_type::WITHDRAWS)
                 .count()
         };
-        // This node announces a blob (put_blob_signing_at emits holds_bytes).
+        // This node announces a blob (put_blob_signing_at emits the holding
+        // claim, `custody:ack:v1` — v55.0.0).
         let body = format!("held by this node {s}").into_bytes();
         let sha = *blake_free_sha(&body);
         b.put_blob_signing_at(
@@ -582,8 +584,8 @@ pub mod bodies {
                 .await
                 .unwrap()
                 .iter()
-                .any(|a| a.attestation_type.starts_with(prefix)),
-            "I153: precondition — a holds_bytes claim"
+                .any(crate::federation::custody_ack::is_custody_row),
+            "I153: precondition — a holding claim"
         );
         assert_eq!(withdraws_by(node.clone()).await, 0);
 

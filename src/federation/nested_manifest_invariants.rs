@@ -33,7 +33,6 @@
 
 pub(crate) mod bodies {
     use crate::federation::epoch_minter_invariants::bodies::{ladder, Pick};
-    use crate::federation::key_grant::{SignedKeyGrantSet, KEY_GRANT_CONTENT_ATTESTATION_TYPE};
     use crate::federation::key_grant_invariants::two_node::{introduce_as, Node};
     use crate::federation::self_collective_invariants::bodies::bind;
     use crate::federation::tier_ingest::test_support as ts;
@@ -273,20 +272,17 @@ pub(crate) mod bodies {
                 .unwrap()
                 .manifest_sha256;
         p.a.emit_pending_key_grants().await.unwrap();
-        for set in
-            p.sa.list_attestations_by(&p.key_a)
-                .await
-                .unwrap()
-                .into_iter()
-                .filter(|x| {
-                    x.attestation_type == KEY_GRANT_CONTENT_ATTESTATION_TYPE
-                        || x.attestation_type
-                            == crate::federation::key_grant::KEY_GRANT_STREAM_ATTESTATION_TYPE
-                })
+        // v55.0.0 (#989) — the rows A's plane delivers to B.
+        for set in crate::federation::key_grant_invariants::two_node::key_grant_rows_for(
+            p.sa.as_ref(),
+            &p.key_a,
+            &p.key_b,
+        )
+        .await
         {
-            p.b.apply_replicated_key_grant(SignedKeyGrantSet { attestation: set })
+            p.b.apply_replicated_key_grant(set)
                 .await
-                .expect("B applies A's set");
+                .expect("B applies A's row");
         }
         let prov = BlobProvenance {
             author_key_id: p.owner.clone(),
@@ -359,9 +355,14 @@ pub(crate) mod bodies {
             );
             if i == 0 && view.children.len() > 1 {
                 let e =
-                    p.b.promote_adopted_manifest_to_dag(&root, &p.key_b, None)
-                        .await
-                        .expect_err("children missing");
+                    p.b.promote_adopted_manifest_to_dag(
+                        &root,
+                        &p.key_b,
+                        None,
+                        crate::federation::AdoptDisposition::LocalOnly,
+                    )
+                    .await
+                    .expect_err("children missing");
                 assert!(
                     matches!(&e, BlobError::InvalidArgument(m) if m.contains("child 1") && m.contains("not held")),
                     "{e:?}"
@@ -381,9 +382,14 @@ pub(crate) mod bodies {
             .unwrap_or_else(|e| panic!("I204: chunk {}: {e}", c.seq));
         }
         let promoted =
-            p.b.promote_adopted_manifest_to_dag(&root, &p.key_b, None)
-                .await
-                .expect("I204: promoted");
+            p.b.promote_adopted_manifest_to_dag(
+                &root,
+                &p.key_b,
+                None,
+                crate::federation::AdoptDisposition::LocalOnly,
+            )
+            .await
+            .expect("I204: promoted");
         assert!(promoted.promoted);
         assert_eq!(
             promoted.chunk_count, 61,

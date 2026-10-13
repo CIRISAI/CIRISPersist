@@ -548,12 +548,22 @@ pub const POLARITY_RANGES: &[(&str, DeclaredRange)] = &[
 /// under the boolean fold exactly as the negative ranges above pin `Refuted`:
 /// an accord invocation is asserted, never scored, so the band is the
 /// dimension. Recorded here as the census says to, not argued away.
+///
+/// # v55.0.0 (CIRISPersist#753) — the rc7 re-vendor adds one on each side
+///
+/// `accord:lifecycle:confirmed` (a strict majority's confirmation of a halt,
+/// `+1.0 only`) pins `Supported` like its sibling accord leaves, and
+/// `key:revocation` (`-1 only`, never withdrawn) pins `Refuted` like
+/// `revocation:{entity_type}:{reason}`. Both are claims whose band IS the
+/// dimension.
 pub const PINNING_FAMILIES: &[&str] = &[
     "accord:invoke:constitutional:{halt_id}",
     "accord:invoke:drill:{drill_id}",
     "accord:invoke:notify:{notify_id}",
     "accord:lifecycle",
     "accord:lifecycle:active",
+    "accord:lifecycle:confirmed",
+    "key:revocation",
     "prohibited:{category}",
     "revocation:{entity_type}:{reason}",
     "rollback_detected:{revision_field}",
@@ -1745,7 +1755,7 @@ mod tests {
         );
         // The literal is not empty, so the census is a finding and not a
         // formality — and it is not everything, so it discriminates.
-        assert_eq!(PINNING_FAMILIES.len(), 8);
+        assert_eq!(PINNING_FAMILIES.len(), 10);
     }
 
     /// **CC 3.4.5's acceptance criterion, stated as it was written**: feasible
@@ -1785,8 +1795,14 @@ mod tests {
 
     /// **The measurement behind `RetainedCell::open_contradictions`'s doc.**
     ///
-    /// Retaining the contradiction count pins 138 of the registry's 158
-    /// families; withholding it pins 8. (137 of 149 until the v53.0.0 rc6 @
+    /// Retaining the contradiction count pins 143 of the registry's 168
+    /// families; withholding it pins 10. (138 of 158 / 8 until the v55.0.0
+    /// rc7 re-vendor: of its eleven new families the four `signed` ones (the
+    /// three ledger leaves, `settlement:*`) join the retained side, the two
+    /// single-polarity ones (`accord:lifecycle:confirmed`, `key:revocation`)
+    /// join both sides, the five `positive-only` rows pin on neither, and the
+    /// retired `holds_bytes` row (`boolean-via-score`) leaves the retained
+    /// side: 138 + 4 + 2 − 1. 137 of 149 until the v53.0.0 rc6 @
     /// `v1.0-rc6` re-vendor, whose nine new families put one on the retained
     /// side — `observation:reachability`, signed — while the eight
     /// `positive-only` leaves (`collection:`, `custody:`, `device:label`,
@@ -1808,11 +1824,11 @@ mod tests {
         let withheld = pinned_families(false).len();
         assert_eq!(
             (retained, withheld),
-            (138, 8),
+            (143, 10),
             "the contradiction-count contrast moved (retained={retained}, \
              withheld={withheld})"
         );
-        assert_eq!(vendored_family_polarities().len(), 158);
+        assert_eq!(vendored_family_polarities().len(), 168);
     }
 
     /// **The signed fold's escape hatch is a zero-confidence row — and that is

@@ -3574,7 +3574,10 @@ mod run {
                                 {"record": {"key_id": "C1"}}],
                     "consensus_protocol": "quorum:2/3",
                     "authorizations": [],
-                }
+                },
+                // Named, so the refusal below is the quorum's alone (the
+                // charter rule, CIRISPersist#1056, refuses before it).
+                "charter_root_key_id": "humanity-accord",
             })
             .to_string(),
         )
@@ -3588,6 +3591,11 @@ mod run {
             short.status.code(),
             Some(1),
             "a short bundle quorum reds the pre-flight: {}",
+            String::from_utf8_lossy(&short.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&short.stderr).contains("quorum NOT met"),
+            "refused BY the quorum: {}",
             String::from_utf8_lossy(&short.stderr)
         );
     }

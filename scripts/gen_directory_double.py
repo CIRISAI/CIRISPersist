@@ -81,8 +81,14 @@ DELEGATED_DEFAULTS = (
     # v54.1.0 (#1044) — defaulted `Unsupported`, overridden by every backend.
     "store_invalid_replaced_key_record",
     # v45.0.0 (#871) — defaulted `Unsupported`, overridden by every backend.
-    "list_holders_sized",
+    # (`list_holders_sized` left this list in v55.0.0, CIRISPersist#989: it is
+    # now a provided COMPOSITION over `list_attestations_citing_by_dimension`
+    # and the custody fold, so through the double it runs the default and a
+    # fault on the leaf is observed.)
     "list_derived_hex",
+    # v55.0.0 (#989) — defaulted `Unsupported`, overridden by every backend;
+    # the holder directory's candidate seek.
+    "list_attestations_citing_by_dimension",
     # v49.0.0 (#908) — defaulted `Unsupported`, overridden by every backend;
     # the authorized roster fold reads it through the double.
     "community_roster_signers",
@@ -91,6 +97,11 @@ DELEGATED_DEFAULTS = (
     # v50.0.0 (#916) — defaulted no-op, overridden by sqlite/postgres (the
     # receive doors' re-wrap); through the double it must reach the override.
     "rewrap_own_epochs_for_device",
+    # v55.0.0 (CIRISPersist#989) — the key-grant hooks: leaf operations the
+    # sqlite / postgres backends override (the held content's author, the
+    # projection into the grant tables); neither composes a trait method.
+    "key_grant_held_owner",
+    "project_key_grant_row",
     # v50.0.0 (#926) — defaulted `Unsupported`, overridden by every backend;
     # the trust-root reads re-derive the accord quorum from it.
     "lookup_signed_community",

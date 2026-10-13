@@ -127,6 +127,14 @@ pub mod token {
     /// notice completes it. Persist-local. Body: `{notice_id, record_count,
     /// tombstones}`.
     pub const EXECUTION_INCOMPLETE: &str = "purge_execution_incomplete";
+    /// v55.0.0 (CIRISEdge v55) — bytes a tombstone withholds
+    /// ([`purge_withheld`](super::purge_withheld)): the ONE token for "taken
+    /// down", whether a byte door refuses them as
+    /// [`BlobError::Purged`](crate::federation::BlobError::Purged) (whose
+    /// `kind()` IS this constant) or a federation-plane door (the custody
+    /// report's `here`) as [`Error::PurgeRefused`](crate::federation::Error::PurgeRefused).
+    /// Body (the federation form): `{sha256_hex, notice_id, retryable: false}`.
+    pub const BLOB_PURGED: &str = "blob_purged";
 
     /// Every token, for the registry and the from-disk witnesses.
     pub const ALL: &[&str] = &[
@@ -140,7 +148,105 @@ pub mod token {
         SELECTION_MALFORMED,
         HUMAN_SUBJECT_PENDING_NOTICE_ROW,
         EXECUTION_INCOMPLETE,
+        BLOB_PURGED,
     ];
+}
+
+/// v55.0.0 (CIRISPersist#1055, from CIRISEdge's adopt of v54.1) — the closed
+/// set of `reason` tokens a [`token::UNAUTHORISED`] body carries, so an adopter
+/// maps an ORDERING GAP (retryable, capped) apart from a VERDICT (terminal)
+/// without reading prose. The body is `{notice_id, reason, retryable,
+/// detail}`: `reason` one of these, `retryable` = [`is_retryable`]`(reason)`,
+/// `detail` the prose (before v55.0.0 the prose was `reason`).
+///
+/// A replicated bundle is judged against the receiver's OWN trust root: a
+/// receiver that does not hold the claimant root's row (or a cosigner's key
+/// record) YET refuses it, and the same bundle authorises once that row
+/// lands. That is the gap; everything else is a verdict on the bytes or on
+/// the root as this node holds it.
+pub mod unauthorised_reason {
+    /// No community row at the claimant id: the trust root is not held YET.
+    /// **Retryable.**
+    pub const ROOT_NOT_HELD: &str = "root_not_held";
+    /// A row is held at the claimant id but does not root (its chain is not
+    /// held whole, or it never passed the accord door). **Retryable**: an
+    /// accord birth replaces a row that does not root.
+    pub const ROOT_NOT_ROOTED: &str = "root_not_rooted";
+    /// A cosigning seat's key record is not held YET. **Retryable.**
+    pub const COSIGNER_KEY_NOT_HELD: &str = "cosigner_key_not_held";
+    /// The notice is asserted beyond the clock-skew bound in this node's
+    /// future: it authorises once this node's clock reaches it.
+    /// **Retryable.**
+    pub const NOT_YET_VALID: &str = "not_yet_valid";
+    /// The held trust root is stalled (CC 3.2 T7): valid but non-admitting.
+    /// Terminal.
+    pub const STALLED: &str = "stalled";
+    /// The notice's window has closed. Terminal.
+    pub const EXPIRED: &str = "expired";
+    /// A cosignature is not a seat on the held trust root. Terminal.
+    pub const NOT_A_SEAT: &str = "not_a_seat";
+    /// A seat signed twice. Terminal.
+    pub const DUPLICATE_COSIGNER: &str = "duplicate_cosigner";
+    /// A cosignature does not verify over the notice. Terminal.
+    pub const SIGNATURE_INVALID: &str = "signature_invalid";
+    /// The notice carries no cosignature. Terminal.
+    pub const NO_COSIGNATURE: &str = "no_cosignature";
+    /// The verified seats do not meet the root's `consensus_protocol`.
+    /// Terminal.
+    pub const QUORUM_NOT_MET: &str = "quorum_not_met";
+    /// The root's `consensus_protocol` cannot be evaluated. Terminal.
+    pub const PROTOCOL_UNEVALUABLE: &str = "protocol_unevaluable";
+    /// The notice's `legal_basis` is not `steward_purge`. Terminal.
+    pub const WRONG_BASIS: &str = "wrong_basis";
+    /// The notice is missing a member, carries an ill-typed one, or does not
+    /// canonicalize. Terminal.
+    pub const NOTICE_MALFORMED: &str = "notice_malformed";
+
+    /// Every token.
+    pub const ALL: &[&str] = &[
+        ROOT_NOT_HELD,
+        ROOT_NOT_ROOTED,
+        COSIGNER_KEY_NOT_HELD,
+        NOT_YET_VALID,
+        STALLED,
+        EXPIRED,
+        NOT_A_SEAT,
+        DUPLICATE_COSIGNER,
+        SIGNATURE_INVALID,
+        NO_COSIGNATURE,
+        QUORUM_NOT_MET,
+        PROTOCOL_UNEVALUABLE,
+        WRONG_BASIS,
+        NOTICE_MALFORMED,
+    ];
+
+    /// The ordering gaps: a later row (or this node's clock) can turn the
+    /// refusal into an authorisation, so a sender re-offers with a cap.
+    pub const RETRYABLE: &[&str] = &[
+        ROOT_NOT_HELD,
+        ROOT_NOT_ROOTED,
+        COSIGNER_KEY_NOT_HELD,
+        NOT_YET_VALID,
+    ];
+
+    /// Is `reason` an ordering gap?
+    #[must_use]
+    pub fn is_retryable(reason: &str) -> bool {
+        RETRYABLE.contains(&reason)
+    }
+}
+
+/// A [`token::UNAUTHORISED`] refusal with its typed reason.
+fn unauthorised(notice_id: Option<&str>, reason: &'static str, detail: String) -> Error {
+    let mut body = serde_json::json!({
+        "reason": reason,
+        "retryable": unauthorised_reason::is_retryable(reason),
+        "detail": detail,
+    });
+    if let Some(id) = notice_id {
+        body["notice_id"] = serde_json::Value::String(id.to_owned());
+    }
+    refused(token::UNAUTHORISED, body)
 }
 
 /// The `takedown_notice` basis that authorises a steward purge (CC 3.3.2
@@ -448,7 +554,8 @@ pub fn selection_digest<S: AsRef<str>>(record_ids: &[S]) -> String {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PurgeSelection {
     /// Every row `key_id` AUTHORED (`attesting_key_id`), every trace it
-    /// signed, the bytes its `holds_bytes` claims name, and everything
+    /// signed, the bytes its holding claims name (v55.0.0: its
+    /// `custody:ack:v1` `here` rows, CIRISPersist#989), and everything
     /// derived. NEVER its key, and never a row another key signed about it
     /// (operator ruling 2026-10-09). CSD-065 Descend moves onto this.
     ByActor {
@@ -666,18 +773,19 @@ struct RowFacts {
     references: Option<String>,
     is_scores: bool,
     refs: Vec<String>,
-    holds_bytes_sha: Option<String>,
+    holding_claim_sha: Option<String>,
 }
 
 impl RowFacts {
     fn of(row: &Attestation) -> Self {
-        let holds_bytes_sha = row
-            .attestation_type
-            .starts_with(super::HOLDS_BYTES_ATTESTATION_TYPE_PREFIX)
-            .then(|| super::first_evidence_ref(&row.attestation_envelope))
+        // v55.0.0 (CIRISPersist#989) — the holding claim is `custody:ack:v1`
+        // `here`; a `none` report names bytes the signer does not hold.
+        let holding_claim_sha = super::custody_ack::parse_custody_ack(row)
+            .ok()
             .flatten()
-            .filter(|s| is_hex64(s))
-            .map(str::to_owned);
+            .filter(|a| a.state == super::custody_ack::CustodyState::Here)
+            .map(|a| a.blob_sha256_hex)
+            .filter(|s| is_hex64(s));
         Self {
             id: row.attestation_id.clone(),
             accountability: super::admission::envelope_dimension(&row.attestation_envelope)
@@ -691,7 +799,7 @@ impl RowFacts {
             .map(str::to_owned),
             is_scores: row.attestation_type == attestation_type::SCORES,
             refs: evidence_refs(&row.attestation_envelope),
-            holds_bytes_sha,
+            holding_claim_sha,
         }
     }
 }
@@ -918,7 +1026,7 @@ where
             .values()
             .filter(|r| r.plane == PurgePlane::Attestation)
             .filter_map(|r| {
-                let sha = facts.get(&r.id)?.holds_bytes_sha.clone()?;
+                let sha = facts.get(&r.id)?.holding_claim_sha.clone()?;
                 Some(PurgeRecord {
                     plane: PurgePlane::Blob,
                     id: sha,
@@ -1136,8 +1244,8 @@ fn attestation_subjects(row: &Attestation) -> BTreeSet<String> {
 /// - a **trace**: the author and subjects of its own `trace:complete:v1`
 ///   attestation (every held trace has one, #473/#478) — the signing agent;
 /// - a **blob**: the subjects of EVERY row held here that holds or binds it
-///   (each `holds_bytes` claim on its sha, and each `scores` row whose
-///   `evidence_refs` cite it), every tier, resolved LOCALLY
+///   (each `scores` row whose `evidence_refs` cite it — the holding claims,
+///   `custody:ack:v1`, among them since v55.0.0), every tier, resolved LOCALLY
 ///   ([`blob_binding_subjects`]). Never the record's `derived_from`: on a
 ///   replicated bundle that is the sender's metadata, and a peer could point a
 ///   person's blob at a harmless row (Codex round 2 on PR #1057). A blob no
@@ -1242,10 +1350,13 @@ where
 }
 
 /// The subjects of the rows held HERE that hold or bind each blob in `shas`
-/// (64-hex sha256): every `holds_bytes` claim whose first `evidence_refs`
-/// entry is the sha, and every `scores` row whose `evidence_refs` cite it,
-/// every tier, in one attestation scan. A sha no held row names is absent
-/// from the map. Local state only: never a bundle's `derived_from`.
+/// (64-hex sha256): every `scores` row whose `evidence_refs` cite it, every
+/// tier, in one attestation scan. v55.0.0 (CIRISPersist#989) — the holding
+/// claim is a `scores` row on `custody:ack:v1` citing its blob, so it is one
+/// of them; a retired `holds_bytes` row a node still holds is read by no fold
+/// and names nothing here (a blob only it named is not proven non-human and
+/// is refused, fail-closed). A sha no held row names is absent from the map.
+/// Local state only: never a bundle's `derived_from`.
 ///
 /// # Errors
 ///
@@ -1262,15 +1373,7 @@ where
         return Ok(out);
     }
     scan_attestations(directory, |row| {
-        let named: Vec<&String> = if row
-            .attestation_type
-            .starts_with(super::HOLDS_BYTES_ATTESTATION_TYPE_PREFIX)
-        {
-            super::first_evidence_ref(&row.attestation_envelope)
-                .and_then(|sha| shas.get(sha))
-                .into_iter()
-                .collect()
-        } else if row.attestation_type == attestation_type::SCORES {
+        let named: Vec<&String> = if row.attestation_type == attestation_type::SCORES {
             evidence_refs(&row.attestation_envelope)
                 .iter()
                 .filter_map(|e| shas.get(e.as_str()))
@@ -1429,9 +1532,10 @@ pub struct NoticeTerms {
 /// [`token::UNAUTHORISED`] when the envelope does not canonicalize.
 pub fn notice_signing_bytes(envelope: &serde_json::Value) -> Result<Vec<u8>, Error> {
     ciris_verify_core::accord_genesis::accord_family_signing_bytes(envelope).map_err(|e| {
-        refused(
-            token::UNAUTHORISED,
-            serde_json::json!({"reason": format!("the notice envelope does not canonicalize: {e}")}),
+        unauthorised(
+            None,
+            unauthorised_reason::NOTICE_MALFORMED,
+            format!("the notice envelope does not canonicalize: {e}"),
         )
     })
 }
@@ -1445,10 +1549,11 @@ pub fn notice_signing_bytes(envelope: &serde_json::Value) -> Result<Vec<u8>, Err
 pub fn notice_terms(envelope: &serde_json::Value) -> Result<NoticeTerms, Error> {
     let bytes = notice_signing_bytes(envelope)?;
     let notice_id = hex::encode(sha2::Sha256::digest(&bytes));
-    let unauth = |reason: String| {
-        refused(
-            token::UNAUTHORISED,
-            serde_json::json!({"notice_id": notice_id, "reason": reason}),
+    let unauth = |detail: String| {
+        unauthorised(
+            Some(&notice_id),
+            unauthorised_reason::NOTICE_MALFORMED,
+            detail,
         )
     };
     let s = |k: &str| -> Result<String, Error> {
@@ -1459,10 +1564,14 @@ pub fn notice_terms(envelope: &serde_json::Value) -> Result<NoticeTerms, Error> 
     };
     let basis = s("legal_basis")?;
     if basis != STEWARD_PURGE_BASIS {
-        return Err(unauth(format!(
-            "legal_basis {basis:?} does not authorise a steward purge (only \
+        return Err(unauthorised(
+            Some(&notice_id),
+            unauthorised_reason::WRONG_BASIS,
+            format!(
+                "legal_basis {basis:?} does not authorise a steward purge (only \
              `{STEWARD_PURGE_BASIS}` does, CIRISConstitution#165)"
-        )));
+            ),
+        ));
     }
     let claimant_key_id = s("claimant_key_id")?;
     // CC 3.3.2: for `steward_purge`, `content_sha256` IS the selection digest.
@@ -1549,24 +1658,23 @@ where
     F: FederationDirectory + ?Sized,
 {
     let terms = notice_terms(&notice.envelope)?;
-    let unauth = |reason: String| {
-        refused(
-            token::UNAUTHORISED,
-            serde_json::json!({"notice_id": terms.notice_id, "reason": reason}),
-        )
-    };
+    let unauth =
+        |reason: &'static str, detail: String| unauthorised(Some(&terms.notice_id), reason, detail);
     let skew = super::admission::DEFAULT_MAX_TOUCH_SKEW;
     if terms.asserted_at > now + skew {
-        return Err(unauth(format!(
-            "the notice is asserted at {}, in the future",
-            terms.asserted_at.to_rfc3339()
-        )));
+        return Err(unauth(
+            unauthorised_reason::NOT_YET_VALID,
+            format!(
+                "the notice is asserted at {}, in the future",
+                terms.asserted_at.to_rfc3339()
+            ),
+        ));
     }
     if terms.expires_at <= now {
-        return Err(unauth(format!(
-            "the notice expired at {}",
-            terms.expires_at.to_rfc3339()
-        )));
+        return Err(unauth(
+            unauthorised_reason::EXPIRED,
+            format!("the notice expired at {}", terms.expires_at.to_rfc3339()),
+        ));
     }
     match super::canonical_community::trust_root_cosigners_over(
         directory,
@@ -1578,7 +1686,7 @@ where
     .await?
     {
         Ok(signers) => Ok((terms, signers)),
-        Err(reason) => Err(unauth(reason)),
+        Err((reason, detail)) => Err(unauth(reason, detail)),
     }
 }
 
@@ -1958,8 +2066,11 @@ where
     })
 }
 
+/// v55.0.0 (CIRISPersist#1007) — the settle is the header's BASIS's: a
+/// steward purge after `W`, a duty-holder takedown per its basis (one
+/// tombstone row serves both, CC 4.5.3 step 2).
 fn settles_at(e: &PurgeExecution) -> chrono::DateTime<chrono::Utc> {
-    e.executed_at + chrono::Duration::seconds(PURGE_SETTLE_DWELL_SECS)
+    super::takedown_tombstone::settles_at(e)
 }
 
 /// **Status** of an executed purge, at [`purge_clock`].
@@ -2523,7 +2634,17 @@ where
 }
 
 /// v54.1.0 (Codex round 3 on PR #1057) — **is this blob withheld by a
-/// purge?** `Some(notice_id)` when a steward purge tombstoned `sha256`, or
+/// purge?**
+///
+/// v55.0.0 (CIRISEdge v55) — **THE canonical, host-facing predicate for
+/// "this blob is taken down"**: a steward purge or a takedown on the CC 2.3
+/// tombstone (a counter-notice withholding, an executed immediate removal
+/// whose rows linger). Every persist door that refuses, flags or skips
+/// withheld bytes asks this one function (the write floors, the read and
+/// serve doors, `emit_holding_claim`, the custody report, the durability
+/// deficit, `blob_custody`, the holder reads); a host deciding whether to
+/// repair, replicate or advertise a blob asks it too, never a re-derivation.
+/// Refusals name it with [`token::BLOB_PURGED`]. `Some(notice_id)` when a steward purge tombstoned `sha256`, or
 /// when it is a sealed-DAG child and EVERY manifest it belongs to is withheld
 /// (transitively: a v3 child of a purged root). The byte doors refuse it from
 /// EXECUTION onward; `purge_finalize`'s hard delete still waits for the settle.
@@ -2592,6 +2713,41 @@ where
             }
         }
         Ok(first)
+    }
+}
+
+/// v55.0.0 (CIRISPersist#1007; operator ruling, v55 slice C) — **bytes a
+/// tombstone took down never come back.** Every byte write floor asks this
+/// for each address it is about to store (the one-shot and chunk DAG puts,
+/// the plaintext and scoped puts, the local store, the adopt, the chunk
+/// floor, the incremental DAG finalize): an address a steward purge or a
+/// takedown tombstoned, or a DAG child every manifest of which is, is refused
+/// [`BlobError::Purged`](super::BlobError::Purged) naming the notice — the
+/// read doors' own answer ([`purge_withheld`]). A peer re-pushing taken-down
+/// bytes is refused at receipt; retaining them withheld would be knowing
+/// possession (CC 4.5.3 step 2). The from-disk gate I797 holds every floor
+/// to it.
+///
+/// # Errors
+///
+/// [`BlobError::Purged`](super::BlobError::Purged); the lookup's read error.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub(crate) async fn refuse_tombstoned_bytes<F>(
+    directory: &F,
+    sha256: &[u8; 32],
+) -> Result<(), super::BlobError>
+where
+    F: FederationDirectory + ?Sized,
+{
+    match purge_withheld(directory, sha256).await {
+        Ok(None) => Ok(()),
+        Ok(Some(notice_id)) => Err(super::BlobError::Purged {
+            sha256_hex: hex::encode(sha256),
+            notice_id,
+        }),
+        Err(e) => Err(super::BlobError::Backend(format!(
+            "tombstone plane at write: {e}"
+        ))),
     }
 }
 

@@ -8,10 +8,15 @@
 //!
 //! - **I370** an unregistered type is refused at the local put, the replication
 //!   apply and the emit under `Enforce`; nothing is stored.
-//! - **I371** CC's 39 `row_type_vectors` replay through [`classify`].
-//! - **I372** the carrier shape: every violation refused (always enforced);
-//!   today's `holds_bytes` and `key_grant` rows satisfy it.
-//! - **I373** a carrier token is never a `dimension`.
+//! - **I371** CC's `row_type_vectors` (25 at rc7) replay through [`classify`]
+//!   with no departure: v55 slices A and B retired both rc6 carriers
+//!   (CIRISPersist#989).
+//! - **I372** the carrier shape, measured against the rc6 holding-claim
+//!   carrier's published shape (no type classifies `Carrier` at rc7); every
+//!   row of a retired carrier is refused whatever its shape; the key-grant
+//!   emit input is a structural `scores` row.
+//! - **I373** the retired holding-claim token is never a `dimension`
+//!   (`key_grant:{axis}:v1` is a dimension since slice B, gated by I742).
 //! - **I374** the dimension gate follows the dimension onto the four composers
 //!   (CC 2.4 ask 3): refused under `Enforce`, counted under `Report`; persist's
 //!   own composer dimensions admit.
@@ -50,7 +55,7 @@ mod pure {
     #[test]
     fn i371_cc_row_type_vectors_replay() {
         let vs = vectors();
-        assert_eq!(vs.len(), 39, "CC rc6 publishes 39 row-type vectors");
+        assert_eq!(vs.len(), 25, "CC rc7 publishes 25 row-type vectors");
         assert_eq!(
             registry::row_types().unwrap().refusal,
             ATTESTATION_TYPE_UNREGISTERED,
@@ -63,6 +68,8 @@ mod pure {
                 RowTypeClass::Carrier(_) => Some("carrier"),
                 RowTypeClass::Unregistered => None,
             };
+            // rc7 retired both carriers, and since v55 slices A and B persist
+            // admits neither: no vector is a departure.
             assert_eq!(got, v["class"].as_str(), "{t:?}: {}", v["why"]);
             assert_eq!(
                 got.is_none(),
@@ -116,30 +123,44 @@ mod pure {
     /// I372 — every part of the carrier shape, and today's real rows.
     #[test]
     fn i372_carrier_shape() {
-        let hb = crate::federation::blobs::holds_bytes_attestation_row(
+        // v55.0.0 (CIRISPersist#989) — the holding claim is a `scores` row
+        // now: one of the five, never a carrier.
+        let scope = crate::federation::holding_claim::ClaimScope::of_content(
+            crate::federation::types::cohort_scope::CryptoTier::Plaintext,
+            "federation",
+            None,
+        )
+        .unwrap();
+        let hb = crate::federation::holding_claim::holding_claim_row(
             &[7u8; 32],
             "holder",
             "hb-1",
             chrono::Utc::now(),
             3,
-        );
-        assert_eq!(check_row_type(&hb).unwrap(), classify(&hb.attestation_type));
-        assert!(matches!(
-            classify(&hb.attestation_type),
-            RowTypeClass::Carrier(_)
-        ));
+            &scope,
+        )
+        .unwrap();
+        assert_eq!(check_row_type(&hb).unwrap(), RowTypeClass::Structural);
 
-        let kg = "key_grant:epoch:v1";
-        let ok = || {
-            row(
-                kg,
-                serde_json::json!({"kind": "key_grant", "axis": "epoch"}),
-            )
+        // v55.0.0 (#989, slices A and B): rc7 admits no carrier and persist's
+        // rc6 exception is deleted, so NO row type classifies `Carrier`. The
+        // shape check stays for a carrier a future cut registers: it is
+        // measured against the rc6 holding-claim carrier's own published
+        // shape, and the door is asked what it makes of those rows now — a
+        // retired carrier, refused whatever its shape and whatever the mode.
+        let kg = "holds_bytes:sha256:0a1b2c3d";
+        assert_eq!(classify(kg), RowTypeClass::Unregistered);
+        let rc6 = registry::CarrierRowType {
+            kind: "holds_bytes".into(),
+            pattern: "^holds_bytes:sha256:[0-9a-f]{8}$".into(),
+            sample: kg.into(),
+            token: "holds_bytes:sha256:{prefix}".into(),
         };
-        let RowTypeClass::Carrier(c) = classify(kg) else {
-            panic!("key_grant:epoch:v1 is a carrier")
-        };
+        let c = &rc6;
+        let ok = || row(kg, serde_json::json!({"kind": "holds_bytes"}));
         assert_eq!(carrier_shape_violation(&ok(), c), None);
+        let e = check_row_type(&ok()).expect_err("a well-shaped retired carrier is refused");
+        assert_eq!(e.kind(), "federation_attestation_type_unregistered", "{e}");
 
         let cases: Vec<(Attestation, CarrierShapeViolation)> = vec![
             (
@@ -151,7 +172,7 @@ mod pure {
                 CarrierShapeViolation::NotSelfAttested,
             ),
             (
-                row(kg, serde_json::json!({"kind": "holds_bytes"})),
+                row(kg, serde_json::json!({"kind": "key_grant"})),
                 CarrierShapeViolation::KindDisagrees,
             ),
             (
@@ -161,18 +182,18 @@ mod pure {
             (
                 row(
                     kg,
-                    serde_json::json!({"kind": "key_grant", "dimension": "x:v1"}),
+                    serde_json::json!({"kind": "holds_bytes", "dimension": "x:v1"}),
                 ),
                 CarrierShapeViolation::CarriesDimension,
             ),
             (
-                row(kg, serde_json::json!({"kind": "key_grant", "score": 1})),
+                row(kg, serde_json::json!({"kind": "holds_bytes", "score": 1})),
                 CarrierShapeViolation::CarriesScore,
             ),
             (
                 row(
                     kg,
-                    serde_json::json!({"kind": "key_grant", "confidence": 1}),
+                    serde_json::json!({"kind": "holds_bytes", "confidence": 1}),
                 ),
                 CarrierShapeViolation::CarriesConfidence,
             ),
@@ -195,18 +216,19 @@ mod pure {
         ];
         for (r, want) in cases {
             assert_eq!(carrier_shape_violation(&r, c), Some(want));
-            // Enforced in BOTH modes — the shape is not behind the switch.
-            let e = check_row_type(&r).expect_err("a malformed carrier is refused");
-            assert_eq!(e.kind(), "federation_carrier_row_malformed");
-            assert!(e.to_string().contains(want.as_str()), "{e}");
+            // Refused under the shipped `Report` too: a retired carrier is
+            // refused before its shape is asked.
+            let e = check_row_type(&r).expect_err("a retired carrier is refused");
+            assert_eq!(e.kind(), "federation_attestation_type_unregistered", "{e}");
         }
         // A structural row carries whatever its own gates allow.
         assert!(check_row_type(&row("scores", serde_json::json!({"dimension": "x:v1"}))).is_ok());
     }
 
-    /// I372 — the real key-grant emit input (all three axes) assembles into a
-    /// carrier of the right shape: what `KeyGrantSet::emit_input` builds is
-    /// what the gate admits.
+    /// I372 — the key-grant emit input is a STRUCTURAL `scores` row since v55
+    /// slice B (CIRISPersist#989, CC 3.3.2 rc7): the rc6 SET types are no
+    /// carrier any more (they are a retired row type, never served), and
+    /// neither is the holding claim's (slice A).
     #[test]
     fn i372_key_grant_emit_input_is_a_carrier() {
         for t in [
@@ -214,18 +236,32 @@ mod pure {
             "key_grant:content:v1",
             "key_grant:stream:v1",
         ] {
-            let RowTypeClass::Carrier(c) = classify(t) else {
-                panic!("{t} is a registered carrier")
-            };
-            assert_eq!(
-                c.kind,
-                crate::federation::key_grant::KEY_GRANT_ENVELOPE_KIND
+            assert_eq!(classify(t), RowTypeClass::Unregistered, "{t}");
+            assert!(
+                crate::federation::row_type::retired_carrier(t).is_some(),
+                "{t}"
             );
         }
-        assert!(matches!(
-            classify(&crate::federation::holds_bytes_attestation_type(&[0xab; 32])),
-            RowTypeClass::Carrier(c) if c.kind == "holds_bytes"
-        ));
+        // v55.0.0 (CIRISPersist#989) — the retired holding-claim carrier
+        // classifies unregistered, and is refused whatever the mode (I709).
+        assert_eq!(
+            classify("holds_bytes:sha256:abababab"),
+            RowTypeClass::Unregistered
+        );
+        let row = crate::federation::key_grant::KeyGrantRow {
+            axis: crate::federation::key_grant::KeyGrantAxis::Epoch {
+                community_key_id: "c".into(),
+                minter_key_id: "m".into(),
+                epoch: 0,
+            },
+            wrap: crate::federation::GrantWrap {
+                recipient_key_id: "r".into(),
+                wrap_algorithm: "x25519_mlkem768_aes256_gcm_hkdf_sha256".into(),
+                wrapped_dek: "w".into(),
+            },
+        };
+        let input = row.emit_input().unwrap();
+        assert_eq!(classify(&input.attestation_type), RowTypeClass::Structural);
     }
 
     /// I374 — the composer dimension gate, as the put doors call it.
@@ -288,6 +324,78 @@ mod pure {
             .into_iter()
             .find(|(l, _)| l == label)
             .map_or(0, |(_, n)| n)
+    }
+
+    /// I777 (Codex r2 on #1065) — the retired key-grant carriers are matched
+    /// as WHOLE strings and only `holds_bytes:` as a stem: under `Report`,
+    /// `key_grant:content:v10` and `key_grant:content:v1beta` are reported
+    /// and served, the three exact types stay retired (refused, never
+    /// served), and the Report serve filter makes the same split in SQL.
+    pub(crate) const I777_CASES: &[(&str, bool)] = &[
+        ("key_grant:content:v1", true),
+        ("key_grant:epoch:v1", true),
+        ("key_grant:stream:v1", true),
+        ("key_grant:content:v10", false),
+        ("key_grant:content:v1beta", false),
+        ("key_grant:stream:v1x", false),
+        ("holds_bytes:sha256:0a1b2c3d", true),
+        ("holds_bytes:anything", true),
+        ("scores", false),
+    ];
+
+    #[tokio::test]
+    async fn i777_retired_key_grant_carriers_match_whole_strings() {
+        use crate::federation::row_type::{
+            retired_carrier, served_under_enforcement, with_enforcement, RowTypeEnforcement,
+        };
+        for (t, retired) in I777_CASES {
+            assert_eq!(retired_carrier(t).is_some(), *retired, "I777 {t}");
+            if t.starts_with("key_grant:") {
+                assert_eq!(
+                    crate::federation::key_grant::is_retired_key_grant_set_type(t),
+                    *retired,
+                    "I777 the key-grant door's reading of {t}"
+                );
+            }
+            let mut row = crate::federation::tier_ingest::test_support::bare_attestation(
+                "i777",
+                "a",
+                "b",
+                &serde_json::json!({"dimension": "x:v1"}),
+            );
+            row.attestation_type = (*t).to_owned();
+            let (door, served) = with_enforcement(RowTypeEnforcement::Report, async move {
+                (
+                    crate::federation::row_type::check_row_type(&row).is_ok(),
+                    served_under_enforcement(&row),
+                )
+            })
+            .await;
+            assert_eq!(served, !retired, "I777 {t}: served under Report");
+            if *retired {
+                assert!(!door, "I777 {t}: a retired carrier is refused under Report");
+            } else if *t != "scores" {
+                assert!(
+                    door,
+                    "I777 {t}: an unregistered type is reported, not refused"
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn i777_sqlite_the_report_filter_makes_the_same_split() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let f = crate::federation::row_type::not_retired_carrier_sql("t");
+        for (t, retired) in I777_CASES {
+            let kept: bool = conn
+                .query_row(&format!("SELECT {f} FROM (SELECT ?1 AS t)"), [t], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert_eq!(kept, !retired, "I777 {t:?} under {f}");
+        }
     }
 
     /// I376 (sqlite) — the generated SQL predicate agrees with [`classify`] on
@@ -499,15 +607,11 @@ pub(crate) mod bodies {
             .map_or(0, |(_, n)| n)
     }
 
-    /// The types I370 probes. Each is unregistered; the last two sit under a
-    /// carrier stem.
-    const PROBES: [&str; 5] = [
-        "foo",
-        "scores ",
-        "SCORES",
-        "key_grant:epoch:v2",
-        "holds_bytes:sha256:0A1B2C3D",
-    ];
+    /// The types I370 probes. Each is unregistered; the last sits under a
+    /// carrier stem. (A retired carrier — `holds_bytes:` — is refused under
+    /// BOTH modes, even at assembly, so it is no probe of the `Enforce` switch:
+    /// I709 and I718 witness it, v55.0.0 / CIRISPersist#989.)
+    const PROBES: [&str; 4] = ["foo", "scores ", "SCORES", "key_grant:epoch:v2"];
 
     /// **I370** — refused at the local put, the replication apply and the emit
     /// under `Enforce`; nothing stored.
@@ -517,8 +621,6 @@ pub(crate) mod bodies {
     ) {
         let w = who(b, &format!("i370-{s}"), USER).await;
         for (n, t) in PROBES.iter().enumerate() {
-            // `size` so the media-source gate (CC 5.3.2.5), which reads any
-            // `holds_bytes`-prefixed type, has nothing to say first.
             let r = signed(
                 &w,
                 input(
@@ -569,61 +671,84 @@ pub(crate) mod bodies {
         }
     }
 
-    /// **I372 (door)** — a carrier of the wrong shape is refused where it is
-    /// minted (the emit recipe) and at the put door, under the SHIPPED setting:
-    /// the shape is not behind the switch.
+    /// **I372 (door)** — v55.0.0 (CIRISPersist#989, slices A and B): rc7
+    /// registers no carrier and persist's rc6 exception is deleted, so no row
+    /// reaches the carrier-shape refusal at a door any more (the shape check is
+    /// pinned pure, I372). A row of the rc6 holding-claim carrier, well-formed
+    /// or malformed, is a RETIRED carrier: refused
+    /// `attestation_type_unregistered` where it is minted (the emit recipe)
+    /// and at the put door under the SHIPPED setting, before its shape is
+    /// asked, and nothing is stored.
     pub async fn i372_malformed_carrier_refused<B: FederationDirectory + Sync>(b: &B, s: &str) {
         let w = who(b, &format!("i372-{s}"), USER).await;
-        let bad = || {
-            input(
-                "key_grant:epoch:v1",
-                serde_json::json!({"kind": "key_grant", "dimension": "x:v1"}),
-            )
+        let hb = "holds_bytes:sha256:0a1b2c3d";
+        let rows = || {
+            [
+                (
+                    "well-formed",
+                    input(hb, serde_json::json!({"kind": "holds_bytes", "size": 3})),
+                ),
+                (
+                    "malformed",
+                    input(
+                        hb,
+                        serde_json::json!({"kind": "holds_bytes", "size": 3, "dimension": "x:v1"}),
+                    ),
+                ),
+            ]
         };
-        let e = emit_with_local_signer(b, &w.signer, bad())
-            .await
-            .expect_err("the mint refuses the shape");
-        assert_eq!(e.kind(), "federation_carrier_row_malformed");
-        // A peer's row of the same shape: built past the mint, offered to the
-        // replication door.
-        let mut i = bad();
-        let canonical = stamp_and_canonicalize(&mut i, &w.key, chrono::Utc::now()).unwrap();
-        let sig = w.signer.sign_hybrid(&canonical).await.unwrap();
-        let mut row = with_enforcement(RowTypeEnforcement::Report, async {
-            // `assemble` refuses it, so take the row the well-formed twin
-            // assembles and graft the claim member into the envelope BEFORE the
-            // mirror is stamped — the shape a non-persist producer would send.
-            let mut ok = input(
-                "key_grant:epoch:v1",
-                serde_json::json!({"kind": "key_grant"}),
+        for (what, i) in rows() {
+            let e = emit_with_local_signer(b, &w.signer, i)
+                .await
+                .expect_err("the mint refuses a retired carrier");
+            assert_eq!(
+                e.kind(),
+                "federation_attestation_type_unregistered",
+                "{what}: {e}"
             );
-            let c = stamp_and_canonicalize(&mut ok, &w.key, chrono::Utc::now()).unwrap();
+        }
+        // A peer's row of the same type: validly signed, built past the mint,
+        // offered to the replication door.
+        #[cfg(any(feature = "sqlite", feature = "postgres"))]
+        for (what, mut i) in rows() {
+            let c = stamp_and_canonicalize(&mut i, &w.key, chrono::Utc::now()).unwrap();
             let sg = w.signer.sign_hybrid(&c).await.unwrap();
-            assemble(w.key.clone(), &c, sg, ok).unwrap().0
-        })
-        .await;
-        let _ = (canonical, sig);
-        row.attestation_envelope["dimension"] = serde_json::json!("x:v1");
-        let id = row.attestation_id.clone();
-        let e = b
-            .put_attestation(SignedAttestation { attestation: row })
-            .await
-            .expect_err("the put door refuses a malformed carrier");
-        assert_eq!(e.kind(), "federation_carrier_row_malformed", "{e}");
-        assert!(b.get_attestation(&id).await.unwrap().is_none());
+            let row = crate::federation::attestation_emit::assemble_for_door_witness(
+                w.key.clone(),
+                &c,
+                sg,
+                i,
+            )
+            .unwrap()
+            .0;
+            let id = row.attestation_id.clone();
+            let e = b
+                .put_attestation(SignedAttestation { attestation: row })
+                .await
+                .expect_err("the put door refuses a retired carrier");
+            assert_eq!(
+                e.kind(),
+                "federation_attestation_type_unregistered",
+                "{what}: {e}"
+            );
+            assert!(b.get_attestation(&id).await.unwrap().is_none(), "{what}");
+        }
     }
 
     /// **I373** — a carrier token is never a dimension. On `scores` it is
-    /// refused under the shipped setting (R2(b) gates `key_grant:`; the
-    /// `holds_bytes` token has no version tail). On a composer `key_grant:` is
-    /// refused by R2(b) always, and the `holds_bytes` token by the ask-3
-    /// dimension gate, so under `Enforce`.
+    /// refused under the shipped setting (the `holds_bytes` token has no
+    /// version tail); on a composer by the ask-3 dimension gate, so under
+    /// `Enforce`. (`key_grant:{axis}:v1` left this witness with v55 slice B:
+    /// it is the per-recipient row's dimension, I742.)
     pub async fn i373_carrier_token_is_not_a_dimension<B: FederationDirectory + Sync>(
         b: &B,
         s: &str,
     ) {
         let w = who(b, &format!("i373-{s}"), USER).await;
-        for dim in ["key_grant:epoch:v1", "holds_bytes:sha256:0a1b2c3d"] {
+        // v55 slice B (#989): `key_grant:{axis}:v1` is a DIMENSION now (the
+        // per-recipient row, gated by the key-grant rule, I742). The retired
+        // holding claim's token (slice A) is still refused as one.
+        for dim in ["holds_bytes:sha256:0a1b2c3d"] {
             for t in ["scores", "delegates_to"] {
                 let mut i = input(
                     t,
@@ -649,8 +774,8 @@ pub(crate) mod bodies {
                 );
             }
         }
-        // `scores` refuses both under the SHIPPED setting.
-        for dim in ["key_grant:epoch:v1", "holds_bytes:sha256:0a1b2c3d"] {
+        // `scores` refuses it under the SHIPPED setting.
+        for dim in ["holds_bytes:sha256:0a1b2c3d"] {
             let r = signed(
                 &w,
                 input(
@@ -936,6 +1061,26 @@ mod pg_predicate {
     use crate::federation::row_type::{
         classify, registered_row_type_sql, RowTypeClass, SqlDialect,
     };
+
+    #[tokio::test]
+    async fn i777_postgres_the_report_filter_makes_the_same_split() {
+        let Some(dsn) = crate::test_pg::empty_dsn() else {
+            return;
+        };
+        let (client, conn) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+            .await
+            .unwrap();
+        tokio::spawn(conn);
+        let f = crate::federation::row_type::not_retired_carrier_sql("t");
+        for (t, retired) in super::pure::I777_CASES {
+            let kept: bool = client
+                .query_one(&format!("SELECT {f} FROM (SELECT $1::text AS t) q"), &[t])
+                .await
+                .unwrap()
+                .get(0);
+            assert_eq!(kept, !retired, "I777 {t:?} under {f}");
+        }
+    }
 
     #[tokio::test]
     async fn i376_postgres_predicate_agrees_with_the_classifier() {
