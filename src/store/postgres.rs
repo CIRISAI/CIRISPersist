@@ -31993,6 +31993,24 @@ mod tests {
     /// #443 — the authenticated route apply + signed tombstone matrix (real
     /// hybrid crypto) on postgres. Shares the assertion body with the memory
     /// + sqlite parity tests.
+    /// v56.0.0 (#1078) — the transit KEX resolver matrix (I1017–I1022);
+    /// shares its body with the other two backends.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn transit_kex_resolver_matrix_postgres() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        let suffix = uuid_like();
+        crate::federation::self_at_login::test_support::run_transit_kex_resolver_matrix(
+            &backend, &suffix,
+        )
+        .await;
+    }
+
     /// v56.0.0 (#1077) — the transit KEX matrix (I1011/I1012/I1014/I1015/
     /// I1016) on postgres; shares its body with memory + sqlite.
     #[tokio::test]

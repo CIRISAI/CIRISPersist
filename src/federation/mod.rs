@@ -12084,9 +12084,10 @@ pub mod malformed_row {
     /// the wrong number of bytes (x25519: exactly 32; ML-KEM-768: exactly 1184).
     pub const TRANSIT_KEX_WRONG_LENGTH: &str = "transit_kex_wrong_length";
     /// v56.0.0 (CIRISPersist#1077, CC 3.3.6.2 key separation) — the transit
-    /// x25519 is the same 32 bytes as the row's own Reticulum link x25519
-    /// (`transport_x25519_pubkey_base64`): the one reuse that is byte-checkable
-    /// inside the envelope.
+    /// x25519 is the same 32 bytes as a key the row itself names (its
+    /// Reticulum link x25519 or transport ed25519) or as the signer's pinned
+    /// ed25519. Reuse of the identity's other keys is judged at use
+    /// (CIRISPersist#1078), never here.
     pub const TRANSIT_KEX_KEY_REUSE: &str = "transit_kex_key_reuse";
 
     /// Every token, for the from-disk witnesses and adopters' tables.

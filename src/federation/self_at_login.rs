@@ -579,11 +579,13 @@ impl SignedTransportDestination {
     /// members or neither). `Ok(None)` is a binding that publishes no pair; per
     /// CC 3.3.6.2 such a node **cannot relay**.
     ///
-    /// **Consumer rule:** use the pair only from a binding whose
-    /// [`Self::binding_provenance`] is [`BindingProvenance::Rooted`] (see
-    /// [`Self::rooted_transit_kex_pair`]), and only from a signed binding,
-    /// never from a bare announce. A row read back from persist has already
-    /// passed admission, so this only errs on a value built outside persist.
+    /// **Consumer rule:** for per-peer resolution call
+    /// [`transit_kex_pair_for`] (CIRISPersist#1078), not this raw read: it
+    /// takes the pair only from a live [`BindingProvenance::Rooted`] binding
+    /// and returns `None` when the pair reuses any key on the node's current
+    /// occurrence. This accessor reads one row's envelope, nothing more. A row
+    /// read back from persist has already passed admission, so this only errs
+    /// on a value built outside persist.
     ///
     /// # Errors
     ///
@@ -618,6 +620,106 @@ impl SignedTransportDestination {
             BindingProvenance::Advisory => Ok(None),
         }
     }
+}
+
+/// v56.0.0 (CIRISPersist#1078, CC 3.3.6.2 rc8) — **the per-peer transit KEX
+/// resolver**: the pair a consumer may use to key a hop to the relay
+/// `occurrence_key_id`, or `None` when that node carries no valid transit pair
+/// and so cannot relay. CIRISEdge and every other consumer call this for
+/// per-peer resolution, never the raw [`SignedTransportDestination::transit_kex_pair`].
+///
+/// Admission enforces only the in-row key separation (the arrival-order-free
+/// part, CC 3.2 T8 vii). The cross-row case is closed HERE, at use,
+/// deterministically over the rows as held (no clock, no write):
+///
+/// 1. read the node's signed transport destinations; take the pair only from
+///    live (unretired) [`BindingProvenance::Rooted`] bindings. No such binding,
+///    or none carrying a pair ⇒ `None`. Two live Rooted bindings that carry
+///    DIFFERENT pairs ⇒ `None` (an ambiguous hop key is no hop key).
+/// 2. gather every key on the node's current occurrence rows
+///    ([`list_identity_occurrences_by_occurrence_key`]): `encryption_pubkeys`
+///    x25519 / ML-KEM-768, the occurrence transport binding's Reticulum
+///    x25519 / ed25519, the pinned federation signing keys (ed25519 and
+///    ML-DSA-65) of the occurrence key and of each identity it is bound under,
+///    and the transport keys of the node's live bindings.
+/// 3. the transit x25519 or ML-KEM-768 bytes equal to ANY of them ⇒ `None`;
+///    otherwise `Some(pair)`.
+///
+/// [`list_identity_occurrences_by_occurrence_key`]: crate::federation::FederationDirectory::list_identity_occurrences_by_occurrence_key
+///
+/// # Errors
+///
+/// A backend read error; a stored binding whose pair does not parse (it
+/// passed admission, so this means a corrupted row).
+pub async fn transit_kex_pair_for<D: crate::federation::FederationDirectory + ?Sized>(
+    dir: &D,
+    occurrence_key_id: &str,
+) -> Result<Option<TransitKexPair>, crate::federation::Error> {
+    use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+
+    let bindings = dir
+        .list_signed_transport_destinations_for(occurrence_key_id)
+        .await?;
+    let live: Vec<&SignedTransportDestination> = bindings
+        .iter()
+        .filter(|b| b.transport_destination.retired_at.is_none())
+        .collect();
+    let mut pair: Option<TransitKexPair> = None;
+    for b in &live {
+        let Some(p) = b.rooted_transit_kex_pair()? else {
+            continue;
+        };
+        match &pair {
+            None => pair = Some(p),
+            Some(q) if *q == p => {}
+            Some(_) => return Ok(None),
+        }
+    }
+    let Some(pair) = pair else {
+        return Ok(None);
+    };
+
+    let mut keys: Vec<Vec<u8>> = Vec::new();
+    let mut push = |b64: Option<&str>| {
+        if let Some(raw) = b64.and_then(|s| B64.decode(s).ok()) {
+            keys.push(raw);
+        }
+    };
+    for b in &live {
+        let td = &b.transport_destination;
+        push(td.transport_x25519_pubkey_base64.as_deref());
+        push(td.transport_ed25519_pubkey_base64.as_deref());
+    }
+    let occurrences = dir
+        .list_identity_occurrences_by_occurrence_key(occurrence_key_id)
+        .await?;
+    let mut signers: Vec<String> = vec![occurrence_key_id.to_owned()];
+    for o in &occurrences {
+        if let Some(k) = &o.encryption_pubkeys {
+            push(Some(&k.x25519_base64));
+            push(Some(&k.ml_kem_768_base64));
+        }
+        if let Some(t) = &o.transport_binding {
+            push(Some(&t.reticulum_x25519_pubkey_base64));
+            push(Some(&t.reticulum_ed25519_pubkey_base64));
+        }
+        signers.push(o.identity_key_id.clone());
+    }
+    signers.sort();
+    signers.dedup();
+    for id in &signers {
+        if let Some(k) = dir.lookup_public_key(id).await? {
+            push(Some(&k.pubkey_ed25519_base64));
+            push(k.pubkey_ml_dsa_65_base64.as_deref());
+        }
+    }
+    if keys
+        .iter()
+        .any(|k| k[..] == pair.x25519[..] || k[..] == pair.ml_kem_768[..])
+    {
+        return Ok(None);
+    }
+    Ok(Some(pair))
 }
 
 /// v17.0.0 (CIRISPersist#443) — outcome of a
@@ -1974,6 +2076,29 @@ pub(crate) mod test_support {
             .await
             .expect_err("I1016: transit x25519 reusing the link key");
         expect_route_malformed(&e, mr::TRANSIT_KEX_KEY_REUSE, "I1016");
+        // ... the transport ed25519 named in the same row.
+        let mut r_ed = route(&relay_id, kind, "reuse-ed", 91, "2026-10-13T02:00:00Z");
+        r_ed.transport_ed25519_pubkey_base64 = Some(B64.encode([0x57u8; 32]));
+        let s_ed = sign(r_ed, Some(transit_kex_member(0x57, 0x66))).await;
+        let e = dir
+            .put_signed_transport_destination(&s_ed)
+            .await
+            .expect_err("I1016: transit x25519 reusing the transport ed25519");
+        expect_route_malformed(&e, mr::TRANSIT_KEX_KEY_REUSE, "I1016 transport ed25519");
+        // ... the signer's pinned federation ed25519.
+        let mut signer_member = transit_kex_member(0x00, 0x66);
+        signer_member[TRANSIT_KEX_X25519_MEMBER] =
+            serde_json::Value::String(member.ed25519_public_key_base64.clone());
+        let s_signer = sign(
+            route(&relay_id, kind, "reuse-signer", 92, "2026-10-13T02:00:00Z"),
+            Some(signer_member),
+        )
+        .await;
+        let e = dir
+            .put_signed_transport_destination(&s_signer)
+            .await
+            .expect_err("I1016: transit x25519 reusing the signer's ed25519");
+        expect_route_malformed(&e, mr::TRANSIT_KEX_KEY_REUSE, "I1016 signer ed25519");
         // ... a distinct link key on the same row admits (the check is the
         // equality, not the presence of a link key).
         r_reuse.transport_x25519_pubkey_base64 = Some(B64.encode([0x56u8; 32]));
@@ -2057,6 +2182,224 @@ pub(crate) mod test_support {
             Outcome::Unchanged,
             "I1015: same pair, same projection, fresh signature is idempotent"
         );
+    }
+
+    /// **The transit KEX resolver matrix** (v56.0.0, CIRISPersist#1078, CC
+    /// 3.3.6.2 rc8), run on memory, sqlite and postgres:
+    /// [`transit_kex_pair_for`] judged over the rows as held.
+    ///
+    /// - **I1017** a clean pair on a live Rooted binding resolves to it.
+    /// - **I1018** a pair whose x25519 equals the occurrence's content-KEM
+    ///   x25519 resolves to `None`; likewise its ML-KEM-768 against the
+    ///   content-KEM ML-KEM-768.
+    /// - **I1019** a pair whose x25519 equals the OWNER identity's federation
+    ///   ed25519 (a key on the occurrence, not in the route row, so admission
+    ///   cannot see it) resolves to `None`.
+    /// - **I1020** an `Advisory` binding resolves to `None`.
+    /// - **I1021** a node with no binding resolves to `None`.
+    /// - **I1022** two live Rooted bindings carrying different pairs resolve
+    ///   to `None`; a retired binding's pair is never used.
+    pub(crate) async fn run_transit_kex_resolver_matrix(
+        dir: &dyn FederationDirectory,
+        suffix: &str,
+    ) {
+        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+        use ciris_crypto::{Ed25519Signer, MlDsa65Signer};
+        use ciris_verify_core::self_at_login::HybridSigningIdentity;
+        use ciris_verify_core::transport_binding::produce_signed_identity_occurrence;
+        use TransportDestinationApplyOutcome as Outcome;
+
+        let owner_id = format!("tkr-owner-{suffix}");
+        let owner = Box::new(HybridSigningIdentity::new(
+            &owner_id,
+            Ed25519Signer::random().unwrap(),
+            MlDsa65Signer::new().unwrap(),
+        ));
+        let owner_member = owner.directory_member().unwrap();
+        dir.put_public_key(SignedKeyRecord {
+            record: fixture_key(
+                &owner_id,
+                owner_member.ed25519_public_key_base64.clone(),
+                owner_member.mldsa65_public_key_base64.clone(),
+            ),
+        })
+        .await
+        .expect("register owner key");
+
+        // One node per scenario: a registered hybrid key, bound as an
+        // occurrence of the owner with content-KEM keys from `kem` fills.
+        let mut nodes = Vec::new();
+        for (tag, kem_x, kem_m) in [
+            ("clean", 0xC1u8, 0xC2u8),
+            ("kemx", 0xD1, 0xD2),
+            ("kemm", 0xE1, 0xE2),
+            ("ownerkey", 0xF1, 0xF2),
+            ("adv", 0xB1, 0xB2),
+            ("none", 0xA1, 0xA2),
+            ("two", 0x91, 0x92),
+        ] {
+            let id = format!("tkr-{tag}-{suffix}");
+            let ident = Box::new(HybridSigningIdentity::new(
+                &id,
+                Ed25519Signer::random().unwrap(),
+                MlDsa65Signer::new().unwrap(),
+            ));
+            let m = ident.directory_member().unwrap();
+            dir.put_public_key(SignedKeyRecord {
+                record: fixture_key(
+                    &id,
+                    m.ed25519_public_key_base64.clone(),
+                    m.mldsa65_public_key_base64.clone(),
+                ),
+            })
+            .await
+            .expect("register node key");
+            dir.put_identity_occurrence_local(crate::federation::IdentityOccurrence {
+                identity_key_id: owner_id.clone(),
+                occurrence_key_id: id.clone(),
+                device_class: crate::federation::types::device_class::AGENT.into(),
+                hardware_attestation: None,
+                asserted_at: ts("2026-10-01T00:00:00Z"),
+                valid_until: None,
+                encryption_pubkeys: Some(crate::federation::types::EncryptionPubkeys {
+                    x25519_base64: B64.encode([kem_x; 32]),
+                    ml_kem_768_base64: B64.encode(vec![kem_m; TRANSIT_KEX_ML_KEM_768_LEN]),
+                }),
+                transport_binding: None,
+                persist_row_hash: String::new(),
+            })
+            .await
+            .expect("bind node occurrence");
+            nodes.push((tag, id, ident));
+        }
+        let node = |tag: &str| {
+            let (_, id, ident) = nodes.iter().find(|(t, _, _)| *t == tag).unwrap();
+            (id.clone(), ident.as_ref())
+        };
+        async fn put(
+            dir: &dyn FederationDirectory,
+            ident: &HybridSigningIdentity,
+            row: TransportDestination,
+            member: Option<serde_json::Value>,
+        ) -> Outcome {
+            let env = envelope_with_transit_kex(&row, member);
+            let (env, sig) = produce_signed_identity_occurrence(ident, env)
+                .await
+                .unwrap();
+            dir.put_signed_transport_destination(&SignedTransportDestination {
+                transport_destination: row.clone(),
+                attesting_key_id: row.occurrence_key_id.clone(),
+                signed_envelope: env,
+                signature: sig,
+            })
+            .await
+            .expect("admit route")
+        }
+        let at = "2026-10-13T00:00:00Z";
+
+        // I1017 — a clean pair resolves.
+        let (id, ident) = node("clean");
+        put(
+            dir,
+            ident,
+            route(&id, "reticulum", "d", 1, at),
+            Some(transit_kex_member(0x01, 0x02)),
+        )
+        .await;
+        let got = transit_kex_pair_for(dir, &id)
+            .await
+            .unwrap()
+            .expect("I1017: clean pair resolves");
+        assert_eq!(got.x25519, [0x01; TRANSIT_KEX_X25519_LEN]);
+
+        // I1018 — equal to the occurrence's content-KEM x25519 / ML-KEM-768.
+        let (id, ident) = node("kemx");
+        assert_eq!(
+            put(
+                dir,
+                ident,
+                route(&id, "reticulum", "d", 1, at),
+                Some(transit_kex_member(0xD1, 0x03))
+            )
+            .await,
+            Outcome::Inserted,
+            "I1018: admission cannot see the occurrence's keys and admits"
+        );
+        assert_eq!(
+            transit_kex_pair_for(dir, &id).await.unwrap(),
+            None,
+            "I1018: a transit x25519 equal to the content-KEM x25519 is no valid pair"
+        );
+        let (id, ident) = node("kemm");
+        put(
+            dir,
+            ident,
+            route(&id, "reticulum", "d", 1, at),
+            Some(transit_kex_member(0x04, 0xE2)),
+        )
+        .await;
+        assert_eq!(
+            transit_kex_pair_for(dir, &id).await.unwrap(),
+            None,
+            "I1018: a transit ML-KEM-768 equal to the content-KEM ML-KEM-768 is no valid pair"
+        );
+
+        // I1019 — equal to the owner identity's federation ed25519.
+        let (id, ident) = node("ownerkey");
+        let mut m = transit_kex_member(0x00, 0x05);
+        m[TRANSIT_KEX_X25519_MEMBER] =
+            serde_json::Value::String(owner_member.ed25519_public_key_base64.clone());
+        put(dir, ident, route(&id, "reticulum", "d", 1, at), Some(m)).await;
+        assert_eq!(transit_kex_pair_for(dir, &id).await.unwrap(), None, "I1019");
+
+        // I1020 — an Advisory binding never supplies a hop key.
+        let (id, ident) = node("adv");
+        let mut r = route(&id, "reticulum", "d", 1, at);
+        r.binding_provenance = BindingProvenance::Advisory;
+        put(dir, ident, r, Some(transit_kex_member(0x06, 0x07))).await;
+        assert_eq!(transit_kex_pair_for(dir, &id).await.unwrap(), None, "I1020");
+
+        // I1021 — no binding at all.
+        let (id, _) = node("none");
+        assert_eq!(transit_kex_pair_for(dir, &id).await.unwrap(), None, "I1021");
+        assert_eq!(
+            transit_kex_pair_for(dir, &format!("tkr-unknown-{suffix}"))
+                .await
+                .unwrap(),
+            None,
+            "I1021: an unknown node"
+        );
+
+        // I1022 — two live Rooted bindings disagree ⇒ None; once one is
+        // retired, the other's pair resolves.
+        let (id, ident) = node("two");
+        put(
+            dir,
+            ident,
+            route(&id, "reticulum", "d", 1, at),
+            Some(transit_kex_member(0x08, 0x09)),
+        )
+        .await;
+        put(
+            dir,
+            ident,
+            route(&id, "websocket", "wss://n", 1, at),
+            Some(transit_kex_member(0x0A, 0x0B)),
+        )
+        .await;
+        assert_eq!(
+            transit_kex_pair_for(dir, &id).await.unwrap(),
+            None,
+            "I1022: ambiguous"
+        );
+        let mut retired = route(&id, "websocket", "wss://n", 2, "2026-10-13T01:00:00Z");
+        retired.retired_at = Some(ts("2026-10-13T01:00:00Z"));
+        put(dir, ident, retired, Some(transit_kex_member(0x0A, 0x0B))).await;
+        let got = transit_kex_pair_for(dir, &id)
+            .await
+            .unwrap()
+            .expect("I1022: retired pair ignored");
+        assert_eq!(got.x25519, [0x08; TRANSIT_KEX_X25519_LEN]);
     }
 }
 

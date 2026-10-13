@@ -13152,8 +13152,19 @@ mod accord_tests {
     /// #443 — the authenticated route apply + signed tombstone matrix (real
     /// hybrid crypto) on the memory backend. Shares the assertion body with
     /// the sqlite + pg parity tests.
+    /// v56.0.0 (#1078) — the transit KEX resolver matrix (I1017–I1022);
+    /// shares its body with the other two backends.
+    #[tokio::test]
+    async fn transit_kex_resolver_matrix_memory() {
+        let backend = MemoryBackend::new();
+        crate::federation::self_at_login::test_support::run_transit_kex_resolver_matrix(
+            &backend, "mem",
+        )
+        .await;
+    }
+
     /// v56.0.0 (#1077) — the transit KEX matrix (I1011/I1012/I1014/I1015/
-    /// I1016) on the memory backend; shares its body with sqlite + pg.
+    /// I1016) on memory; shares its body with sqlite + pg.
     #[tokio::test]
     async fn transit_kex_matrix_memory() {
         let backend = MemoryBackend::new();

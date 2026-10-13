@@ -56195,6 +56195,18 @@ INSERT INTO transport_destinations (occurrence_key_id, transport_kind, destinati
     /// #443 — the authenticated route apply + signed tombstone matrix (real
     /// hybrid crypto) on sqlite. Shares the assertion body with the memory +
     /// pg parity tests.
+    /// v56.0.0 (#1078) — the transit KEX resolver matrix (I1017–I1022);
+    /// shares its body with the other two backends.
+    #[tokio::test]
+    async fn transit_kex_resolver_matrix_sqlite() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::self_at_login::test_support::run_transit_kex_resolver_matrix(
+            &backend, "sqlite",
+        )
+        .await;
+    }
+
     /// v56.0.0 (#1077) — the transit KEX matrix (I1011/I1012/I1014/I1015/
     /// I1016) on sqlite; shares its body with memory + pg.
     #[tokio::test]
