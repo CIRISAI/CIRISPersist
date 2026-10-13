@@ -20,6 +20,12 @@
 //!   never listed, its `here` never a copy.
 //! - **I416** a lapsed `here` (72 h + 1 s) is missing; exactly 72 h is a copy;
 //!   a `received` verdict is missing.
+//! - **I801** (memory, sqlite, postgres; CIRISEdge v55) — withheld content is
+//!   never deficit: a self blob with three audience nodes and one live
+//!   `here`, under a counter-notice takedown, lists nobody missing, carries
+//!   `withheld` naming the notice and no placement mode, and the puller's
+//!   sized-holders read names no holder; an ordinary under-replicated blob of
+//!   the same audience still lists its two missing nodes.
 //! - **I415b** (sqlite, postgres; the engine) a node holding a DAG's manifest
 //!   but missing one chunk cannot file `here`, and the deficit lists it; with
 //!   every chunk held it can, and the deficit counts it.
@@ -401,6 +407,80 @@ pub(crate) mod bodies {
         assert_eq!(v.mode, Some(DurabilityMode::Full), "I415 3 < N + K");
     }
 
+    /// **I801** — see the module doc.
+    pub(crate) async fn i801_withheld_content_is_never_deficit(
+        d: &dyn FederationDirectory,
+        s: &str,
+    ) {
+        use crate::federation::doors_takedown_invariants::bodies::{claimant, establish, notice};
+        use chrono::Duration;
+        let owner = format!("i801-o-{s}");
+        users(d, &[&owner]).await;
+        let mut devs = Vec::new();
+        for tag in ["a", "b", "c"] {
+            let k = cust::device_as(
+                d,
+                &format!("i801-withheld-{s}--{tag}"),
+                crate::federation::types::identity_type::NODE,
+            )
+            .await;
+            claim(d, &owner, &k, device_class::LAPTOP).await;
+            devs.push(k);
+        }
+        let sha_of = |what: &str| -> [u8; 32] {
+            use sha2::Digest as _;
+            sha2::Sha256::digest(format!("i801-{what}-{s}")).into()
+        };
+        let (taken, ordinary) = (sha_of("taken"), sha_of("ordinary"));
+        let t0 = cust::base();
+        for sha in [&taken, &ordinary] {
+            cust::report(d, &devs[0], sha, CustodyState::Here, t0).await;
+        }
+        let now = t0 + Duration::hours(1);
+        let before = deficit(d, &owner, &taken, &Default::default(), now).await;
+        assert_eq!(
+            before.missing.len(),
+            2,
+            "I801 precondition: under-replicated"
+        );
+        // A counter-notice takedown of the first blob.
+        let complainant = claimant(0xb1);
+        establish(d, "i801-producer", &complainant.id, &hex::encode(taken)).await;
+        let t = crate::federation::takedown_tombstone::takedown_tombstone(
+            d,
+            &notice(&complainant, &hex::encode(taken), "dmca_512"),
+            "i801-node",
+        )
+        .await
+        .expect("I801 the takedown");
+        let v = deficit(d, &owner, &taken, &Default::default(), now).await;
+        assert_eq!(
+            v.withheld.as_deref(),
+            Some(t.notice_id.as_str()),
+            "I801 {v:?}"
+        );
+        assert!(
+            v.missing.is_empty() && v.live_here.is_empty() && v.mode.is_none(),
+            "I801 withheld content is not deficit: {v:?}"
+        );
+        assert!(
+            d.list_holders_sized(&taken).await.unwrap().is_empty(),
+            "I801 no holder is a pull target"
+        );
+        let o = deficit(d, &owner, &ordinary, &Default::default(), now).await;
+        assert_eq!(o.withheld, None);
+        assert_eq!(
+            o.missing,
+            sorted(vec![devs[1].clone(), devs[2].clone()]),
+            "I801 an ordinary under-replicated blob is still deficit"
+        );
+        assert_eq!(
+            d.list_holders_sized(&ordinary).await.unwrap().len(),
+            1,
+            "I801 its holder is still listed"
+        );
+    }
+
     /// **I416** — a lapsed `here` is missing (72 h at the reader's clock, both
     /// sides of the boundary), and so is a device whose verdict is `received`.
     pub(crate) async fn i416_an_expired_here_is_missing(d: &dyn FederationDirectory, s: &str) {
@@ -688,6 +768,7 @@ mod runners {
                 case!(i417_i418_holdings_stay_in_the_cohort);
                 case!(i415_the_deficit_is_the_audience_without_a_live_here);
                 case!(i416_an_expired_here_is_missing);
+                case!(i801_withheld_content_is_never_deficit);
             }
         };
     }

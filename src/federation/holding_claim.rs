@@ -588,10 +588,7 @@ where
     let not_held = || BlobError::NotHeld {
         sha256_hex: hex::encode(sha256),
     };
-    if let Some(notice_id) = super::steward_purge::purge_withheld(backend, sha256)
-        .await
-        .map_err(|e| BlobError::Backend(format!("holding claim: tombstone: {e}")))?
-    {
+    if let Some(notice_id) = withheld_by(backend, sha256).await? {
         return Err(BlobError::Purged {
             sha256_hex: hex::encode(sha256),
             notice_id,
@@ -964,6 +961,11 @@ pub async fn list_holders_of<B>(backend: &B, sha256: &[u8; 32]) -> Result<Vec<St
 where
     B: BlobStorage + FederationDirectory + Sync,
 {
+    // v55.0.0 (CIRISEdge v55) — withheld bytes have no holder to fetch from
+    // or fan out to: the takedown's content is never a pull or repair target.
+    if is_withheld(backend, sha256).await? {
+        return Ok(Vec::new());
+    }
     // A directory read, not an access to the bytes (Codex r2 on #1065).
     let held_here = backend.blob_head(sha256).await?.is_some();
     let claims = holder_claims(backend, sha256, Utc::now())
@@ -990,7 +992,7 @@ pub async fn list_local_holders_of<B>(
 where
     B: BlobStorage + FederationDirectory + Sync,
 {
-    if backend.blob_head(sha256).await?.is_none() {
+    if backend.blob_head(sha256).await?.is_none() || is_withheld(backend, sha256).await? {
         return Ok(Vec::new());
     }
     Ok(holder_claims(backend, sha256, Utc::now())
@@ -1014,9 +1016,46 @@ pub async fn list_held_by_of<B>(
 where
     B: BlobStorage + FederationDirectory + Sync,
 {
-    held_by(backend, holder_key_id, Utc::now(), true)
+    let mut out = Vec::new();
+    for sha in held_by(backend, holder_key_id, Utc::now(), true)
         .await
-        .map_err(|e| BlobError::Backend(format!("list_held_by: {e}")))
+        .map_err(|e| BlobError::Backend(format!("list_held_by: {e}")))?
+    {
+        // v55.0.0 (CIRISEdge v55) — a withheld blob is no adopt suggestion.
+        if !is_withheld(backend, &sha).await? {
+            out.push(sha);
+        }
+    }
+    Ok(out)
+}
+
+/// v55.0.0 (CIRISEdge v55) — **is `sha256` withheld by a tombstone here?**
+/// The ONE question every read that feeds replication or repair asks
+/// ([`steward_purge::purge_withheld`](super::steward_purge::purge_withheld)):
+/// the holder directory, the durability deficit, the custody view.
+///
+/// # Errors
+///
+/// Directory reads.
+pub async fn is_withheld<D>(dir: &D, sha256: &[u8; 32]) -> Result<bool, BlobError>
+where
+    D: FederationDirectory + ?Sized,
+{
+    Ok(withheld_by(dir, sha256).await?.is_some())
+}
+
+/// [`is_withheld`], naming the notice that withholds the bytes.
+///
+/// # Errors
+///
+/// Directory reads.
+pub async fn withheld_by<D>(dir: &D, sha256: &[u8; 32]) -> Result<Option<String>, BlobError>
+where
+    D: FederationDirectory + ?Sized,
+{
+    super::steward_purge::purge_withheld(dir, sha256)
+        .await
+        .map_err(|e| BlobError::Backend(format!("tombstone: {e}")))
 }
 
 /// **`BlobStorage::evict_actor`, once.** Every blob `actor` claims `here`

@@ -85,6 +85,11 @@ pub struct BlobCustody {
     /// takes the stream that names them.
     #[serde(default)]
     pub device_custody: Vec<super::custody_ack::DeviceCustody>,
+    /// v55.0.0 (CIRISEdge v55) — the takedown notice that withholds the blob
+    /// ([`steward_purge::purge_withheld`](super::steward_purge::purge_withheld)),
+    /// so a caller reading custody directly sees it is not to be repaired.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub withheld: Option<String>,
 }
 
 fn tier_token(t: CryptoTier) -> &'static str {
@@ -254,5 +259,6 @@ where
         copies_observable: true,
         why,
         device_custody,
+        withheld: super::holding_claim::withheld_by(backend, at_rest_sha256).await?,
     })
 }

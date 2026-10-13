@@ -2944,6 +2944,10 @@ pub trait FederationDirectory: Send + Sync {
         &self,
         sha256: &[u8; 32],
     ) -> Result<Vec<renditions::HolderClaim>, Error> {
+        // v55.0.0 (CIRISEdge v55) — withheld bytes are no puller's target.
+        if steward_purge::purge_withheld(self, sha256).await?.is_some() {
+            return Ok(Vec::new());
+        }
         Ok(
             holding_claim::holder_claims(self, sha256, chrono::Utc::now())
                 .await?

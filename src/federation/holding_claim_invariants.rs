@@ -1278,6 +1278,9 @@ pub(crate) mod blob_bodies {
     }
 
     /// **I778** (Codex r3 on #1065) — no holding claim about withheld bytes.
+    /// With **I802** (CIRISEdge v55): `blob_custody` reports `withheld` naming
+    /// the notice; `list_holders`, `list_local_holders` and `list_held_by`
+    /// name no holder of / no withheld blob; an ordinary blob is untouched.
     /// A counter-notice takedown keeps the bytes on disk through its window;
     /// a blob this node announced only under the retired rc6 carrier (no
     /// custody row yet) is NOT converted by the re-ack (counted `withheld`,
@@ -1367,6 +1370,52 @@ pub(crate) mod blob_bodies {
         assert!(
             e.to_string().contains("custody_ack_here_withheld"),
             "I778 {e}"
+        );
+        // I802 (CIRISEdge v55) — the custody view flags the takedown, and the
+        // holder reads that feed fan-out and adopt suggestions name nothing.
+        let other = format!("i778-other {s}").into_bytes();
+        let other_sha = sha256_of(&other);
+        b.put_blob_signing_scoped(
+            cs::FEDERATION,
+            None,
+            &other_sha,
+            BlobBody::Inline(other),
+            None,
+            &n.key,
+            &n.signer,
+            chrono::Utc::now(),
+            uuid::Uuid::new_v4(),
+        )
+        .await
+        .unwrap();
+        let c = crate::federation::blob_custody::blob_custody(b, &sha, &n.key)
+            .await
+            .expect("I802 the custody view");
+        assert_eq!(
+            c.withheld.as_deref(),
+            Some(t.notice_id.as_str()),
+            "I802 {c:?}"
+        );
+        let c = crate::federation::blob_custody::blob_custody(b, &other_sha, &n.key)
+            .await
+            .unwrap();
+        assert_eq!(c.withheld, None, "I802 an ordinary blob is not flagged");
+        assert!(
+            b.list_holders(&sha).await.unwrap().is_empty(),
+            "I802 list_holders"
+        );
+        assert!(
+            b.list_local_holders(&sha).await.unwrap().is_empty(),
+            "I802 list_local_holders"
+        );
+        let held = b.list_held_by(&n.key).await.unwrap();
+        assert!(
+            !held.contains(&sha) && held.contains(&other_sha),
+            "I802 list_held_by drops the withheld blob only: {held:?}"
+        );
+        assert_eq!(
+            b.list_holders(&other_sha).await.unwrap(),
+            vec![n.key.clone()]
         );
     }
 
