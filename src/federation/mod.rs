@@ -228,6 +228,10 @@ pub(crate) mod attestation_admit_invariants;
 /// is refused at admission (I590).
 #[cfg(test)]
 pub mod delegation_cycle_invariants;
+/// v56.0.0 (CIRISPersist#934 step 1, door 6) — the genesis re-bake purge
+/// door refuses, at the store, an id the bundle does not carry (I954).
+#[cfg(test)]
+pub(crate) mod genesis_purge_door_invariants;
 /// v54.0.0 (CIRISPersist#1033, CC 2.4.1.2.1) — the `grant` scope admits its
 /// holder (I591).
 #[cfg(test)]
