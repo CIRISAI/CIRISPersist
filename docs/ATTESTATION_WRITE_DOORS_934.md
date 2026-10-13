@@ -17,7 +17,7 @@ The verdicts the report prints:
 |---|---|---|---|
 | `put_attestation_with_origin` (under `put_attestation`, `put_attestation_authored`, and the replicated apply's fresh-id store) | identical x3 (59 gates) | shared: `plan:put_attestation_planned` | done (door 1) |
 | `attach_attestation_pqc_signature` | gateless (its two refusals and the hash recompute were inline, written three times) | shared: `plan:attach_attestation_pqc_planned` | done (door 3) |
-| `attestation_upsert_local` / `attestation_insert_local` | gateless (a scanner blind spot, see below); really identical x3 (17 gates) | identical x3 (17 gates) | stopped: storage halves diverge (I951) |
+| `attestation_upsert_local` / `attestation_insert_local` | gateless (a scanner blind spot, see below); really identical x3 (17 gates) | shared: `plan:write_local_attestation_planned` | done (door 2); the occupied-id divergence ruled (I951) |
 | `reseal_attestation_v31` | declared (memory re-asks `check_reseal_admission` under its lock) | unchanged | not attempted: needs #681's closure form |
 | `purge_attestation_v31`, `purge_genesis_delegation_row_v31` | identical x3 (1 gate each) | unchanged | not attempted: steward-purge plane, 13 `CLM-purge-*` rows |
 | `enter_mesh` (promotion) | declared; decision already `crossing::plan_enter_mesh` (v39) | unchanged | already planned |
@@ -75,51 +75,61 @@ The v55 scanner counted only `?`-shaped propagation, so it reported both doors
 classified gate, delegating helper or plan, and the three helpers are
 classified.
 
-**The divergence (I951, `federation::local_door_divergence_invariants`).**
-When the caller-chosen `attestation_id` is already held, memory returns the id
-before the upsert's replace-DELETE. sqlite and postgres run that DELETE, then
-an insert-if-absent, then re-project and, for a `withdraws`, overwrite the
+**The divergence, and the ruling (I951,
+`federation::local_door_divergence_invariants`).** When the caller-chosen
+`attestation_id` was already held, memory returned the id before the upsert's
+replace-DELETE. sqlite and postgres ran that DELETE, then an
+insert-if-absent, then re-projected and, for a `withdraws`, overwrote the
 admission depth.
 
-- An upsert re-using the held same-dimension row's id with a new weight: memory
-  keeps the old row, while sqlite and postgres store the new one.
-- An upsert re-using another dimension's held id: memory changes nothing, while
-  sqlite and postgres delete the upsert dimension's held row and store nothing
-  in its place.
+| case | memory before | sqlite, postgres before | all three now |
+|---|---|---|---|
+| upsert re-uses its own `(attester, dimension)` row's id | old row kept | replaced | replaced |
+| upsert re-uses another dimension's row's id | Ok, nothing changed | Ok, the upsert's own row deleted, nothing stored | `LocalAttestationIdOccupied`, nothing changed |
+| insert re-uses a held id | Ok, nothing written | Ok, nothing written | Ok, nothing written |
 
-I951 pins both outcomes per backend. The door's extraction waits for a ruling
-on which outcome is correct.
+The lead ruled that an upsert replaces its own row and that any other holder
+of the id is a typed refusal. `attestation_admit::local_occupied_id_verdict`
+is the one clause.
 
 ## The CC conditions (CIRISConstitution review on #934, 2026-10-13)
 
-**1. Judged at an instant that is an input.** `plan_put_attestation` takes
-`at`, and so does `plan_attach_attestation_pqc_signature`. Neither reads the
-clock. Each door samples the receipt clock once and passes it in. Five gates
-the put plan calls read the clock directly; they now take `at` under their
-existing names, so no `evidence/cc_impl.tsv` row moves:
+**1. Two named instants, both inputs.** A plan takes
+`PlanInstants { fold_at, received_at }` and reads no clock.
 
-- `check_capacity_consent_admission`
-- `check_delegation_cycle_admission`
-- `check_licensure_delegator_is_authority`
-- `check_peer_deadmission`
-- `trust_root::check_trust_charter_admission`
+- `fold_at` is the row's signed instant, used for folds over other rows. The
+  live door passes the row's `asserted_at`, and a replay of `V(rows, t)`
+  passes `t`.
+- `received_at` is the receiver's clock at the door, used for the receipt
+  bounds.
 
-I950 is the witness: one signed row, planned at two instants, gets each
-instant's verdict on memory, sqlite and postgres.
+#934 changes no behaviour, so each gate is wired to the instant it read
+before. `store::parity`'s `PLAN_INSTANTS` derives this table from the plan
+bodies and fails on any difference:
 
-`at` is the instant the row is judged AT, not the row's `asserted_at`. Two
-gates compare the two instants by design.
+| plan | call | instant | before #934 | note |
+|---|---|---|---|---|
+| put | `check_instant_binding` | `received_at` | clock | receipt bound: future skew |
+| put | `check_attach_freshness` | `received_at` | clock | receipt bound: CC 2.6.7 window W |
+| put | `check_capacity_consent_admission` | `received_at` | clock | fold still at receipt: #1049 candidate |
+| put | `check_delegation_cycle_admission` | `received_at` | clock | fold still at receipt: #1049 candidate |
+| put | `check_trust_charter_admission` | `received_at` | clock | fold still at receipt: #1049 candidate |
+| put | `check_peer_deadmission` | `received_at` | clock | fold still at receipt: #1049 candidate |
+| put | `check_licensure_delegator_is_authority` | both | clock and `asserted_at` | judged at receipt and at the signed instant |
+| put | `check_community_trust_grant_admission` | `fold_at` | `asserted_at` | owner bindings at the grant's instant (CC 3.3.1) |
+| executor re-ask | `check_delegation_cycle_admission` | `received_at` | clock | the plan's instant, under the write lock |
+| PQC completion | completion stamp | `received_at` | clock | `pqc_completed_at` |
+| local | `check_trust_charter_admission`, `check_attach_freshness`, `local_row_instant`, `check_instant_binding` | `received_at` | clock | the local door mints its own instant |
 
-- `check_instant_binding` refuses an `asserted_at` more than the skew allowance
-  ahead of `at`.
-- `check_attach_freshness` judges the attach window at `at`.
+Every other gate reads neither instant. It reads the row, or no time at all.
+Gates that read the clock two or more calls deep are not yet audited one by
+one.
 
-With `at = asserted_at`, the skew bound would be vacuous and the window would
-be judged at a signer-chosen instant. `check_licensure_delegator_is_authority`
-already judges at both instants.
-
-Not done: gates that read the clock inside helpers they call, two or more calls
-deep. These are not yet audited one by one.
+I950 is the witness. One row is planned under different pairs and gets each
+gate's verdict on memory, sqlite and postgres, covering the skew bound, the
+cycle fold at receipt, and the owner fold at `fold_at`. Two mutations each
+turn a leg red on all three backends: the skew bound given `fold_at`, and the
+owner fold given `received_at`.
 
 **2. No admission decision reads a projection.** These reads in the put plan
 are not signed rows:
@@ -136,10 +146,12 @@ The directory walks read the attestation rows and their subject projection.
 None of these was re-derived in this step.
 
 **3. Manifest rows move with the symbol.** No decision symbol was renamed or
-moved: the gates kept their names and files. `evidence_tsv.py check` matches all
+moved. The gates kept their names and files, and gained only instant
+parameters. `evidence_tsv.py check` matches all
 225 rows.
 
 **4. rc8's rules land once.** The extension point is `plan_put_attestation`. A
 new admission rule is one call in its tier (pure gates in AV-76 tier 1,
-directory walks in tier 4), judged at `at`. The local doors get the same point
-once door 2 lands.
+directory walks in tier 4), given `fold_at` or `received_at` by name and
+recorded in `PLAN_INSTANTS`. The local doors' point is
+`plan_write_local_attestation`.

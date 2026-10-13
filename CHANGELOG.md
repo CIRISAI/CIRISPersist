@@ -21,36 +21,50 @@ sequences and the open items are in `docs/ATTESTATION_WRITE_DOORS_934.md`.
   decided once in `federation::attestation_admit::plan_put_attestation`. Its
   59 gates were written three times. The `store::parity` scan now reports the
   door as `shared`.
+- **`attestation_upsert_local` / `attestation_insert_local`** are decided once
+  in `plan_write_local_attestation`. Their 17 gates were written three times,
+  and the v55 scan read both doors as `gateless`.
 - **`attach_attestation_pqc_signature`** is decided once in
   `plan_attach_attestation_pqc_signature`: unknown id, already complete, and
   the completed row's hash. Memory's executor gains the SQL backends'
   "concurrently completed" guard.
-- **The plans take their instant as an input** (the Constitution's condition 1
-  on #934). Each door reads the clock once and passes `at`, and nothing inside
-  a plan reads the clock. I950 is the witness: one row planned at two instants
-  gets each instant's verdict on all three backends.
-- **The local doors (`attestation_upsert_local` / `attestation_insert_local`)
-  are not moved.** Their 17 gates match on all three backends. Their storage
-  halves disagree when the caller re-uses a held `attestation_id`: memory
-  keeps the held row, while sqlite and postgres replace it, or delete the
-  dimension's row and store nothing. I951 pins the split until it is ruled.
-- **`store::parity`** now sees a door that delegates its whole body as a tail
-  call. The local doors read `gateless` before this and `identical x3 (17
-  gates)` after it.
+- **A plan takes two named instants, `PlanInstants { fold_at, received_at }`**
+  (the Constitution's condition 1 on #934). `fold_at` is the row's signed
+  instant, for folds over other rows. `received_at` is the receiver's clock at
+  the door, for the receipt bounds. Nothing inside a plan reads the clock.
+  Each gate reads the instant it read before. Four folds still read receipt
+  and are listed as #1049 candidates. `store::parity`'s `PLAN_INSTANTS` pins
+  which gate reads which, and I950 is the witness on all three backends.
+
+### Fixed
+
+- **Local upsert with an occupied `attestation_id`.** Memory kept the old
+  row, and sqlite and postgres could delete without storing. One plan now
+  replaces in-dimension and refuses cross-dimension with the new typed
+  `Error::LocalAttestationIdOccupied`. An insert of a held id still writes
+  nothing. This is the first divergence the one-door extraction made visible;
+  I951 asserts one outcome on all three backends.
 
 **Adopter-visible.**
 
-- Five public gate functions gain a trailing `at: DateTime<Utc>` parameter:
-  `admission::check_capacity_consent_admission`,
-  `admission::check_delegation_cycle_admission`,
-  `admission::check_licensure_delegator_is_authority`,
-  `admission::check_peer_deadmission` and
-  `trust_root::check_trust_charter_admission`. Pass `chrono::Utc::now()` for
-  the previous behaviour.
-- A substrate failure while reading the row in `attach_attestation_pqc_signature`
-  now reads `get_attestation: …` (it was `attach lookup: …`). The read is now
-  recorded by the read probe.
-- No decided outcome changes on any backend.
+- New `Error::LocalAttestationIdOccupied` (kind
+  `federation_local_attestation_id_occupied`, Python `ValueError`). An
+  exhaustive `match` on `federation::Error` must name it.
+- Gate signatures now take explicit instants. `received_at: DateTime<Utc>` is
+  added to:
+  - `admission::check_capacity_consent_admission`
+  - `admission::check_delegation_cycle_admission`
+  - `admission::check_peer_deadmission`
+  - `trust_root::check_trust_charter_admission`
+- `admission::check_licensure_delegator_is_authority` takes
+  `(received_at, fold_at)`.
+- `community_trust_consent::check_community_trust_grant_admission` takes
+  `fold_at`.
+- To keep the previous behaviour, pass `chrono::Utc::now()` for
+  `received_at`, and the row's `asserted_at` for `fold_at`.
+- A substrate failure while reading the row in
+  `attach_attestation_pqc_signature` now reads `get_attestation: …` (it was
+  `attach lookup: …`). The read is now recorded by the read probe.
 
 ## [55.0.0] - 2026-10-12
 
