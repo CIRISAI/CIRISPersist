@@ -6684,8 +6684,24 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             // itself SIGNED; a signed write always reclaims an unsigned row
             // (occurrence-projection / announce state) regardless of clocks.
             let stored_signed = state.transport_destination_sigs.contains_key(&key);
+            // v56.0.0 (#1077) — the transit KEX pair is envelope-only, so an
+            // equal typed projection is `Unchanged` only when the stored
+            // envelope carries the same pair; a same-clock re-sign that changes
+            // the pair falls through to the monotonic refusal below.
+            let same_pair =
+                state
+                    .transport_destination_sigs
+                    .get(&key)
+                    .is_some_and(|(_, env, _)| {
+                        crate::federation::self_at_login::same_transit_kex_member(
+                            env,
+                            &signed.signed_envelope,
+                        )
+                    });
             let fresh = match state.transport_destinations.get(&key) {
-                Some(ex) if *ex == *d && stored_signed => return Ok(Outcome::Unchanged),
+                Some(ex) if *ex == *d && stored_signed && same_pair => {
+                    return Ok(Outcome::Unchanged)
+                }
                 Some(ex)
                     if stored_signed && (d.epoch, d.asserted_at) <= (ex.epoch, ex.asserted_at) =>
                 {
@@ -13136,6 +13152,26 @@ mod accord_tests {
     /// #443 — the authenticated route apply + signed tombstone matrix (real
     /// hybrid crypto) on the memory backend. Shares the assertion body with
     /// the sqlite + pg parity tests.
+    /// v56.0.0 (#1078) — the transit KEX resolver matrix (I1017–I1022);
+    /// shares its body with the other two backends.
+    #[tokio::test]
+    async fn transit_kex_resolver_matrix_memory() {
+        let backend = MemoryBackend::new();
+        crate::federation::self_at_login::test_support::run_transit_kex_resolver_matrix(
+            &backend, "mem",
+        )
+        .await;
+    }
+
+    /// v56.0.0 (#1077) — the transit KEX matrix (I1011/I1012/I1014/I1015/
+    /// I1016) on memory; shares its body with sqlite + pg.
+    #[tokio::test]
+    async fn transit_kex_matrix_memory() {
+        let backend = MemoryBackend::new();
+        crate::federation::self_at_login::test_support::run_transit_kex_matrix(&backend, "mem")
+            .await;
+    }
+
     #[tokio::test]
     async fn signed_transport_route_matrix_memory() {
         let backend = MemoryBackend::new();

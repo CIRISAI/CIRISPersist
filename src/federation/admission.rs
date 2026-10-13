@@ -5860,6 +5860,10 @@ pub async fn verify_signed_identity_occurrence_revocation(
 ///    transport pubkeys, `binding_provenance`), and the typed projection
 ///    persist will store EQUALS them (a divergent projection is the hijack
 ///    reopening). `last_seen_at` is advisory liveness, not signed material.
+///    v56.0.0 (#1077) — an optional `transit_kex_pubkeys` pair is read from
+///    the envelope only ([`crate::federation::self_at_login::transit_kex_pair_from_envelope`]: 32 / 1184 bytes,
+///    both or neither) and its x25519 must not be the row's Reticulum link
+///    x25519.
 /// 2. the detached hybrid signature over `JCS(signed_envelope)` verifies at
 ///    threshold **1-of-1** against the PINNED federation pubkeys of
 ///    `attesting_key_id` ([`verify_threshold_signatures`] — RequireHybrid; a
@@ -5979,6 +5983,34 @@ pub async fn verify_signed_transport_destination(
     )?;
     if env_provenance != row.binding_provenance {
         return Err(diverges("binding_provenance"));
+    }
+    // v56.0.0 (CIRISPersist#1077, CC 3.3.6.2 rc8) — the optional transit KEX
+    // pair, read by THE one reading the accessor also uses: exact 32 / 1184
+    // bytes, both members or neither. It is envelope-only (never a projection
+    // field), so there is no typed divergence to check; terminal on the bytes.
+    let transit_pair = crate::federation::self_at_login::transit_kex_pair_from_envelope(env)?;
+    // Key separation (CC 3.3.6.2, normative and admission-enforced): the
+    // transit x25519 must not be the row's own Reticulum link x25519, the one
+    // reuse checkable from these bytes. Signing keys are a different algorithm
+    // and not byte-comparable (CC 3.3.6.1). That in-row rule is the WHOLE
+    // admission duty (CIRISPersist#1078): the identity's other keys live on
+    // another plane, an arrival-order-dependent read, and are judged at use by
+    // `self_at_login::transit_kex_pair_for`.
+    if let Some(pair) = &transit_pair {
+        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+        let link = row
+            .transport_x25519_pubkey_base64
+            .as_deref()
+            .and_then(|s| B64.decode(s).ok());
+        if link.as_deref() == Some(&pair.x25519[..]) {
+            return Err(Error::malformed_row(
+                "transport_destination",
+                super::malformed_row::TRANSIT_KEX_KEY_REUSE,
+                "signed transport_destination: `transit_kex_pubkeys.x25519_base64` is the same \
+                 key as the Reticulum link `transport_x25519_pubkey_base64`; the transit pair \
+                 must be key-separated (CC 3.3.6.2)",
+            ));
+        }
     }
 
     // (2) Hybrid signature over JCS(signed_envelope) against the PINNED

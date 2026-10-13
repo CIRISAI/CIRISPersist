@@ -11609,6 +11609,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         let signature_json = serde_json::to_string(&signed.signature)
             .map_err(|e| crate::federation::Error::Backend(format!("signature: {e}")))?;
         let asserted = d.asserted_at.to_rfc3339();
+        let incoming_envelope = signed.signed_envelope.clone();
         let last_seen = d.last_seen_at.map(|t| t.to_rfc3339());
         let retired = d.retired_at.map(|t| t.to_rfc3339());
         let epoch = i64::try_from(d.epoch).map_err(|_| {
@@ -11649,15 +11650,29 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     // regardless of (epoch, asserted_at) — otherwise whichever
                     // unsigned writer landed last with the freshest clock kept
                     // the admitted producer signature out forever.
-                    let stored_signed: bool = conn.query_row(
-                        "SELECT signature IS NOT NULL FROM transport_destinations \
-                     WHERE occurrence_key_id = ?1 AND transport_kind = ?2",
+                    let (stored_signed, stored_envelope): (bool, Option<String>) = conn.query_row(
+                        "SELECT signature IS NOT NULL, signed_envelope \
+                             FROM transport_destinations \
+                             WHERE occurrence_key_id = ?1 AND transport_kind = ?2",
                         rusqlite::params![d.occurrence_key_id, d.transport_kind],
-                        |r| r.get(0),
+                        |r| Ok((r.get(0)?, r.get(1)?)),
                     )?;
-                    if ex == d && stored_signed {
-                        // Byte-identical typed content on an already-signed row —
-                        // idempotent re-offer.
+                    // v56.0.0 (#1077) — the transit KEX pair is envelope-only:
+                    // an equal typed projection is `Unchanged` only when the
+                    // stored envelope carries the same pair. A same-clock
+                    // re-sign that changes it falls to the refusal below.
+                    let same_pair = stored_envelope
+                        .as_deref()
+                        .and_then(|e| serde_json::from_str::<serde_json::Value>(e).ok())
+                        .is_some_and(|stored| {
+                            crate::federation::self_at_login::same_transit_kex_member(
+                                &stored,
+                                &incoming_envelope,
+                            )
+                        });
+                    if ex == d && stored_signed && same_pair {
+                        // Byte-identical typed content (and pair) on an
+                        // already-signed row — idempotent re-offer.
                         return Ok(Outcome::Unchanged);
                     }
                     if stored_signed && (d.epoch, d.asserted_at) <= (ex.epoch, ex.asserted_at) {
@@ -56180,6 +56195,28 @@ INSERT INTO transport_destinations (occurrence_key_id, transport_kind, destinati
     /// #443 — the authenticated route apply + signed tombstone matrix (real
     /// hybrid crypto) on sqlite. Shares the assertion body with the memory +
     /// pg parity tests.
+    /// v56.0.0 (#1078) — the transit KEX resolver matrix (I1017–I1022);
+    /// shares its body with the other two backends.
+    #[tokio::test]
+    async fn transit_kex_resolver_matrix_sqlite() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::self_at_login::test_support::run_transit_kex_resolver_matrix(
+            &backend, "sqlite",
+        )
+        .await;
+    }
+
+    /// v56.0.0 (#1077) — the transit KEX matrix (I1011/I1012/I1014/I1015/
+    /// I1016) on sqlite; shares its body with memory + pg.
+    #[tokio::test]
+    async fn transit_kex_matrix_sqlite() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::self_at_login::test_support::run_transit_kex_matrix(&backend, "sqlite")
+            .await;
+    }
+
     #[tokio::test]
     async fn signed_transport_route_matrix_sqlite() {
         let backend = SqliteBackend::open_in_memory().await.unwrap();

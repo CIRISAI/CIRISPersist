@@ -127,6 +127,87 @@ evidence claim. `docs/TOOLING.md` says how to run each and which is which.
   ci-hygiene `evidence-pointers` job (daily); `evidenceptrcc` reports the
   Constitution register when a checkout is found.
 
+### Added — transit KEX pair on the TransportDestination binding (#1077, CC 3.3.6.2 rc8 2a7ed97)
+
+- **The member.** A signed `transport_destination` envelope may carry
+  `transit_kex_pubkeys {x25519_base64, ml_kem_768_base64}`: a relay's static
+  hybrid KEX pair for the CC 5.3.3.5 E1 hop exchange. Both values are standard
+  base64. The x25519 key decodes to exactly 32 bytes and the ML-KEM-768 key to
+  exactly 1184. The member is optional, and a row without it is the v55 shape,
+  unchanged. Persist stores, admits and serves the pair. It does not implement
+  the key exchange, whose pattern, labels, KDF and KATs belong to
+  CIRISVerify#309.
+- **Admission rules.** `admission::verify_signed_transport_destination`
+  refuses each violation as `Error::MalformedRow` on plane
+  `transport_destination`, before the signature check. A pair object with one
+  member or neither is `transit_kex_half_pair`. A member of the wrong decoded
+  length is `transit_kex_wrong_length`. A transit x25519 equal to the row's
+  own Reticulum link key (`transport_x25519_pubkey_base64`) is
+  `transit_kex_key_reuse`. That is CC 3.3.6.2 key separation as far as the
+  row's own bytes reach. Signing keys are a different algorithm and are not
+  byte-comparable (CC 3.3.6.1). This in-row rule is the whole admission duty
+  (CC 3.3.6.2 rc8, CIRISPersist#1078). A pair that is not an object (including `null`), a
+  non-string member or bad base64 is `envelope_member_invalid`. Unknown
+  members inside the pair object are tolerated. The three tokens join
+  `federation::malformed_row::ALL`.
+- **The accessor.** `SignedTransportDestination::transit_kex_pair(&self) ->
+  Result<Option<TransitKexPair>, Error>` reads the pair from `signed_envelope`
+  through `self_at_login::transit_kex_pair_from_envelope`, the same reading
+  admission applies. `TransitKexPair { x25519: [u8; 32], ml_kem_768: Box<[u8;
+  1184]> }` carries the lengths in its types. `rooted_transit_kex_pair()`
+  returns `None` for an `Advisory` binding, and `binding_provenance()` returns
+  the binding's provenance.
+- **The per-peer resolver (CIRISPersist#1078, CC 3.3.6.2 rc8).**
+  `self_at_login::transit_kex_pair_for(dir, occurrence_key_id) ->
+  Result<Option<TransitKexPair>, Error>` is the one place a consumer gets a
+  relay's hop key. It takes the pair only from a live `Rooted` signed binding.
+  It returns `None` when the node has no such binding, when two live Rooted
+  bindings carry different pairs, or when the transit x25519 or ML-KEM-768
+  bytes equal any key on the node's current occurrence. Those keys are the
+  `encryption_pubkeys` pair, the occurrence transport binding's Reticulum
+  keys, the federation signing keys of the occurrence key and of each identity
+  it is bound under, and the transport keys of its live bindings. `None`
+  means the node cannot relay (CC 3.3.6.2). The resolver only reads, and it
+  judges the rows as held with no clock. This closes the cross-row reuse case
+  at use, deterministically. Admission cannot check it without depending on
+  arrival order, which CC 3.2 T8 vii forbids, so there is no deferred check
+  and no retraction. Generating a fresh pair, separate from every other
+  key, stays the producer's duty; the resolver is the consumer's backstop.
+- **The content hash is identical across versions.** The pair is NOT a field
+  of the typed `TransportDestination` projection. CIRISEdge's route plane and
+  persist's wire index hash the whole `SignedTransportDestination` (the
+  projection plus the verbatim envelope). A v55 node and a v56 node therefore
+  produce byte-identical wrapper bytes and the same content hash for a
+  pair-bearing row, so a mixed fleet does not re-advertise and re-pull forever.
+  The pair is still hash-covered, because the envelope is. Witness I1010 pins
+  the hash of a fixed row as `14da66a0…65e2` and parses the same bytes through
+  a replica of the v55 types.
+- **Rotation** rides the existing `(epoch, asserted_at)` supersession, with no
+  new field. Because the projection no longer captures everything that
+  differs, all three backends now answer `Unchanged` only when the stored
+  envelope carries the same pair. A re-sign at the same `(epoch,
+  asserted_at)` that changes or drops the pair is `Refused` as a same-clock
+  fork. Before, it would have been kept as the old pair without a word.
+- **No migration.** The pair lives inside the stored `signed_envelope` text.
+  v55 nodes admit, store and re-serve pair-bearing envelopes unchanged, so this
+  needs no fleet floor.
+- **CIRISEdge adoption.** Build the pair into the envelope only: insert
+  `transit_kex_pubkeys {x25519_base64, ml_kem_768_base64}` into the envelope
+  JSON before signing, and leave the typed row as it is. Generate the pair
+  fresh. A transit x25519 equal to the row's link key is refused at admission,
+  and one equal to any other key of the node resolves to `None` at use. Publish the same transit pair on every transport kind and rotate them
+  together; a node whose bindings disagree cannot relay until they match. For per-peer resolution call
+  `transit_kex_pair_for`, not the raw `transit_kex_pair()` accessor, which
+  reads one row's envelope and applies neither the Rooted rule nor the
+  occurrence comparison. Admission refusals to map are `transit_kex_half_pair`,
+  `transit_kex_wrong_length`, `transit_kex_key_reuse`, and
+  `envelope_member_invalid` for shape and base64, each as
+  `Error::MalformedRow` on plane `transport_destination`. `content_hash_of`
+  and its three call sites need no change.
+- **Witnesses** I1010–I1022. The memory, sqlite and postgres backends share
+  `run_transit_kex_matrix` (I1011–I1016) and `run_transit_kex_resolver_matrix`
+  (I1017–I1022).
+
 ## [55.0.0] - 2026-10-12
 
 ### Changed — CIRISConstitution v1.0-rc7 vendored (#753, slice A0)
