@@ -77,7 +77,8 @@ threat-model citations because this crate's audit story is the point.
   `transit_kex_pubkeys {x25519_base64, ml_kem_768_base64}` into the envelope
   JSON before signing, and leave the typed row as it is. Generate the pair
   fresh. A transit x25519 equal to the row's link key is refused at admission,
-  and one equal to any other key of the node resolves to `None` at use. For per-peer resolution call
+  and one equal to any other key of the node resolves to `None` at use. Publish the same transit pair on every transport kind and rotate them
+  together; a node whose bindings disagree cannot relay until they match. For per-peer resolution call
   `transit_kex_pair_for`, not the raw `transit_kex_pair()` accessor, which
   reads one row's envelope and applies neither the Rooted rule nor the
   occurrence comparison. Admission refusals to map are `transit_kex_half_pair`,
