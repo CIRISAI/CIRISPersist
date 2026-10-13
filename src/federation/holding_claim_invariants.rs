@@ -1472,64 +1472,113 @@ pub(crate) mod blob_bodies {
         );
     }
 
-    /// **I803** (Codex r4 on #1065) — the auto-spawned re-ack sweeper runs
-    /// its FIRST pass at spawn: an upgraded node (a blob announced only under
-    /// the retired rc6 carrier, no custody row, so dark to v55's holder
-    /// reads) is a listed holder again with no interval elapsed.
-    pub(crate) async fn i803_the_reack_sweeper_converts_at_spawn<B>(
+    /// **I803** (Codex r4 on #1065; CIRISEdge's constraints) — the re-ack
+    /// sweeper's first pass runs after its START DELAY, inside the spawned
+    /// task: spawn returns at once; an upgraded node (a blob announced only
+    /// under the retired rc6 carrier, so dark to v55's holder reads) is not
+    /// converted before the delay, IS converted by shortly after it, and a
+    /// second retired claim seeded after that pass is converted by the next
+    /// interval tick; writes made while the sweeper runs succeed. Driven with
+    /// short real durations through `spawn_reack_sweeper_with` (the store's
+    /// reads run on the blocking pool, which paused tokio time does not
+    /// wait for).
+    pub(crate) async fn i803_the_reack_sweeper_converts_after_its_start_delay<B>(
         engine: &crate::Engine,
         b: &B,
         s: &str,
     ) where
         B: BlobStorage + FederationDirectory + Sync + LegacySeam,
     {
+        use std::time::{Duration, Instant};
+        const DELAY: Duration = Duration::from_millis(600);
+        const INTERVAL: Duration = Duration::from_millis(2500);
         let me = engine.local_derived_key_id().await.unwrap();
-        let bytes = format!("i803 bytes {s}").into_bytes();
-        let sha = sha256_of(&bytes);
+        // A blob this node announced, its claim left as the rc6 carrier.
+        let legacy = |tag: &'static str| {
+            let me = me.clone();
+            async move {
+                let bytes = format!("i803 {tag} {s}").into_bytes();
+                let sha = sha256_of(&bytes);
+                engine
+                    .put_blob_signing(
+                        &sha,
+                        BlobBody::Inline(bytes),
+                        None,
+                        &me,
+                        chrono::Utc::now(),
+                        uuid::Uuid::new_v4(),
+                    )
+                    .await
+                    .expect("I803 the node announces a blob");
+                let claim = claims_of(b, &me, &sha).await.remove(0);
+                let rc6 = serde_json::json!({
+                    "kind": "holds_bytes", "evidence_refs": [hex::encode(sha)],
+                });
+                b.set_type(
+                    &claim.attestation_id,
+                    &format!("holds_bytes:sha256:{}", &hex::encode(sha)[..8]),
+                    Some(&rc6),
+                )
+                .await;
+                assert!(b.list_holders(&sha).await.unwrap().is_empty(), "I803 dark");
+                sha
+            }
+        };
+        let first = legacy("first").await;
+        let listed = |sha: [u8; 32]| {
+            let me = me.clone();
+            async move { b.list_holders(&sha).await.unwrap().contains(&me) }
+        };
+        let t0 = Instant::now();
+        let sweeper = engine
+            .spawn_reack_sweeper_with(DELAY, INTERVAL)
+            .expect("I803 the engine has a PQC local signer");
+        assert!(
+            t0.elapsed() < Duration::from_millis(100),
+            "I803 spawn returns at once: {:?}",
+            t0.elapsed()
+        );
+        // A write while the sweeper runs succeeds.
+        let side = format!("i803 side {s}").into_bytes();
         engine
             .put_blob_signing(
-                &sha,
-                BlobBody::Inline(bytes),
+                &sha256_of(&side),
+                BlobBody::Inline(side),
                 None,
                 &me,
                 chrono::Utc::now(),
                 uuid::Uuid::new_v4(),
             )
             .await
-            .expect("I803 the node announces a blob");
-        // What a v54 node left: the same claim, as the rc6 carrier.
-        let claim = claims_of(b, &me, &sha).await.remove(0);
-        let rc6 = serde_json::json!({
-            "kind": "holds_bytes", "evidence_refs": [hex::encode(sha)],
-        });
-        b.set_type(
-            &claim.attestation_id,
-            &format!("holds_bytes:sha256:{}", &hex::encode(sha)[..8]),
-            Some(&rc6),
-        )
-        .await;
+            .expect("I803 a concurrent write succeeds");
+        tokio::time::sleep(DELAY / 3).await;
+        assert!(!listed(first).await, "I803 no pass before the start delay");
+        // Converted by shortly after the delay (well before the interval).
+        let by = DELAY + Duration::from_millis(900);
+        while t0.elapsed() < by && !listed(first).await {
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
         assert!(
-            b.list_holders(&sha).await.unwrap().is_empty(),
-            "I803 precondition: dark after the upgrade"
+            listed(first).await,
+            "I803 converted by the start delay ({DELAY:?}), not at the interval ({INTERVAL:?})"
         );
-        let sweeper = engine
-            .spawn_reack_sweeper()
-            .expect("I803 the engine has a PQC local signer");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        let mut seen = false;
-        while std::time::Instant::now() < deadline {
-            if b.list_holders(&sha).await.unwrap().contains(&me) {
-                seen = true;
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let first_pass = t0.elapsed();
+        // The cadence: a second retired claim waits for the next tick.
+        let second = legacy("second").await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !listed(second).await,
+            "I803 no pass between ticks ({:?} after the first)",
+            t0.elapsed() - first_pass
+        );
+        let next = DELAY + INTERVAL + Duration::from_millis(1500);
+        while t0.elapsed() < next && !listed(second).await {
+            tokio::time::sleep(Duration::from_millis(40)).await;
         }
         let _ = sweeper.stop().await;
         assert!(
-            seen,
-            "I803 the first pass ran at spawn: the node is a listed holder within seconds, not \
-             after the {:?} interval",
-            crate::federation::holding_claim::HOLDING_CLAIM_REACK_SWEEP_INTERVAL
+            listed(second).await,
+            "I803 the interval tick converted the second"
         );
     }
 
@@ -1951,7 +2000,7 @@ mod runners {
 
     #[cfg(feature = "sqlite")]
     #[tokio::test]
-    async fn i803_the_reack_sweeper_converts_at_spawn_sqlite() {
+    async fn i803_the_reack_sweeper_converts_after_its_start_delay_sqlite() {
         let alias = format!("i803-{}", suffix());
         let engine = crate::Engine::with_signer_pre_genesis(
             crate::federation::tier_ingest::test_support::local_signer(&alias),
@@ -1970,7 +2019,7 @@ mod runners {
             .await
             .unwrap();
         let b = engine.sqlite_backend().unwrap().clone();
-        super::blob_bodies::i803_the_reack_sweeper_converts_at_spawn(
+        super::blob_bodies::i803_the_reack_sweeper_converts_after_its_start_delay(
             &engine,
             b.as_ref(),
             &suffix(),
@@ -1980,7 +2029,7 @@ mod runners {
 
     #[cfg(feature = "postgres")]
     #[tokio::test]
-    async fn i803_the_reack_sweeper_converts_at_spawn_postgres() {
+    async fn i803_the_reack_sweeper_converts_after_its_start_delay_postgres() {
         let Some(dsn) = crate::test_pg::empty_dsn() else {
             return;
         };
@@ -2002,7 +2051,7 @@ mod runners {
             .await
             .unwrap();
         let b = engine.postgres_backend().unwrap().clone();
-        super::blob_bodies::i803_the_reack_sweeper_converts_at_spawn(
+        super::blob_bodies::i803_the_reack_sweeper_converts_after_its_start_delay(
             &engine,
             b.as_ref(),
             &suffix(),

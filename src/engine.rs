@@ -2157,34 +2157,54 @@ impl Engine {
     /// handle's `stop()`. Every holding claim lapses 72 h after it was signed;
     /// this keeps a holder advertised while it holds.
     ///
-    /// Codex r4 on #1065 — the FIRST pass runs at spawn, then the interval:
-    /// the pass carries the upgrade conversion (a v54 node's retired rc6
-    /// claims, which v55's holder reads no longer count), so sleeping first
-    /// left an upgraded node undiscoverable for an hour, and one restarting
-    /// more often than hourly never converted at all.
+    /// Codex r4 on #1065 — the FIRST pass runs after
+    /// [`HOLDING_CLAIM_REACK_START_DELAY`](crate::federation::holding_claim::HOLDING_CLAIM_REACK_START_DELAY)
+    /// (90 s), then every interval: the pass carries the upgrade conversion (a
+    /// v54 node's retired rc6 claims, which v55's holder reads no longer
+    /// count), so waiting a whole interval left an upgraded node
+    /// undiscoverable for an hour, and one restarting more often than hourly
+    /// never converted; a pass at t = 0 would land on the announce cold-start
+    /// and replication catch-up with an unbounded read (#1071).
+    ///
+    /// The pass runs INSIDE the spawned task: this returns at once and boot
+    /// never waits on it. No lock is held across the walk (each read is its
+    /// own short acquisition, and the walk yields between rows), and an error
+    /// mid-pass (a store going away) is logged and the loop goes on until
+    /// `stop()`. [`Self::spawn_reack_sweeper_with`] takes both durations.
     ///
     /// Returns `None` when this Engine has no PQC local signer (it cannot sign
     /// a claim, so it has none to renew). Disk-independent: no budget gate.
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     pub fn spawn_reack_sweeper(&self) -> Option<crate::federation::EvictionSweeper> {
+        self.spawn_reack_sweeper_with(
+            crate::federation::holding_claim::HOLDING_CLAIM_REACK_START_DELAY,
+            crate::federation::holding_claim::HOLDING_CLAIM_REACK_SWEEP_INTERVAL,
+        )
+    }
+
+    /// [`Self::spawn_reack_sweeper`] with its two durations: the first pass
+    /// after `start_delay`, then one every `interval`.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub fn spawn_reack_sweeper_with(
+        &self,
+        start_delay: std::time::Duration,
+        interval: std::time::Duration,
+    ) -> Option<crate::federation::EvictionSweeper> {
         self.local_signer.as_ref()?;
         let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
         let shutdown_for_loop = shutdown.clone();
-        let interval = crate::federation::holding_claim::HOLDING_CLAIM_REACK_SWEEP_INTERVAL;
         let engine = self.clone();
         let handle = tokio::spawn(async move {
-            let mut first = true;
+            let mut wait = start_delay;
             loop {
-                if !first {
-                    tokio::select! {
-                        _ = shutdown_for_loop.notified() => {
-                            tracing::info!("ciris-persist v55.0.0 re-ack sweeper: shutdown signal received");
-                            return;
-                        }
-                        _ = tokio::time::sleep(interval) => {}
+                tokio::select! {
+                    _ = shutdown_for_loop.notified() => {
+                        tracing::info!("ciris-persist v55.0.0 re-ack sweeper: shutdown signal received");
+                        return;
                     }
+                    _ = tokio::time::sleep(wait) => {}
                 }
-                first = false;
+                wait = interval;
                 match engine.reack_holding_claims_once(chrono::Utc::now()).await {
                     Ok(report)
                         if report.renewed > 0 || report.failed > 0 || report.converted > 0 =>

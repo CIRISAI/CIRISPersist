@@ -641,6 +641,13 @@ pub const HOLDING_CLAIM_REACK_AFTER_SECS: i64 = 24 * 60 * 60;
 pub const HOLDING_CLAIM_REACK_SWEEP_INTERVAL: std::time::Duration =
     std::time::Duration::from_secs(60 * 60);
 
+/// v55.0.0 (Codex r4 on #1065; CIRISEdge) — how long after spawn the re-ack
+/// sweeper's FIRST pass runs: short, so an upgraded node converts its retired
+/// rc6 claims within minutes rather than an interval, and not zero, so the
+/// pass (whose own-claims read is unbounded until #1071) does not land on the
+/// announce cold-start and replication catch-up.
+pub const HOLDING_CLAIM_REACK_START_DELAY: std::time::Duration = std::time::Duration::from_secs(90);
+
 /// What one [`reack_own_claims`] pass did.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
 pub struct ReackReport {
@@ -700,6 +707,9 @@ where
         .await
         .map_err(|e| BlobError::Backend(format!("reack: {e}")))?;
     for sha in shas {
+        // One row at a time, each read its own short acquisition; yield
+        // between rows so a long walk never starves the writers.
+        tokio::task::yield_now().await;
         report.scanned += 1;
         // Codex r2 on #1065 — a maintenance scan reads the row HEAD, never
         // `has_blob`, which counts as an access (access_count,
@@ -759,6 +769,7 @@ where
     legacy.sort_unstable();
     legacy.dedup();
     for sha in legacy {
+        tokio::task::yield_now().await;
         if backend.blob_head(&sha).await?.is_none()
             || !super::custody_ack::custody_acks_of(backend, &me, &hex::encode(sha))
                 .await
