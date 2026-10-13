@@ -904,6 +904,37 @@ threat-model citations because this crate's audit story is the point.
     replaces the old unkept-stream witness.
   - I768 pins `terminator_seq`.
 
+### Fixed — withheld blobs are not deficit (CIRISEdge v55)
+
+- **The bug:** `durability_deficit` / `deficit_over` and `blob_custody` never
+  asked the tombstone. A blob under a takedown (a counter-notice withholding,
+  or an executed immediate one whose rows linger) therefore read as
+  under-replicated. Edge's durability pass filed `here`, which is refused
+  since round 3, and pushed a REPAIR copy of taken-down content to other
+  nodes.
+- **The deficit:** a blob that `steward_purge::purge_withheld` names lists
+  nobody `missing` and no `live_here`, has `mode: None`, and carries the new
+  `DurabilityDeficit::withheld` (the notice id). The audience stays, so an
+  operator can see whose content it is. It is never repaired.
+- **The custody view:** `blob_custody` / `blob_custody_at` carry the new
+  `BlobCustody::withheld`.
+- **Class sweep:** one predicate everywhere (`holding_claim::is_withheld` /
+  `withheld_by` over `purge_withheld`).
+  - `list_holders`, `list_local_holders` and the puller's
+    `list_holders_sized` name no holder of withheld bytes.
+  - `list_held_by` (adopt suggestions) drops withheld blobs.
+  - The serve and read doors already refuse such bytes (`Purged`).
+- **Witnesses:**
+  - I801 (memory, sqlite, postgres): a three-node self blob with one `here`,
+    under a counter-notice, is not deficit, names its notice, and has no pull
+    target. An ordinary under-replicated blob is still deficit.
+  - I802 (sqlite, postgres): the custody view flag, plus the holder reads
+    over a withheld blob whose live claim stands.
+  - Each guard was mutation-checked.
+- **Adoption:** `DurabilityDeficit` and `BlobCustody` gain the field
+  `withheld: Option<String>`. It is `#[serde(default)]` and omitted from JSON
+  when absent, so existing key sets are unchanged unless a blob is withheld.
+
 ### Fixed — Codex round 3 on #1065
 
 Three new findings are fixed here. Round 3's other findings are already
