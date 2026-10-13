@@ -11,22 +11,28 @@
 #                       public-API breaks vs the latest v* tag reachable from
 #                       the base (scripts/api_break_report.sh) — the CHANGELOG's
 #                       and Edge's break list
+#   coverage   weekly, dispatch
+#                       cargo llvm-cov per certify feature set (scripts/coverage.sh);
+#                       the legs are DERIVED (ci_feature_matrix.py legs), not listed
 #
-# On a PR the size and semver jobs give the delta this PR makes; the CHANGELOG
-# break list for a release is `scripts/api_break_report.sh <prev-tag>` locally.
+# On a PR, `size` shows this PR's own delta (vs the base), while `semver`
+# shows every break since the last release — main's and this PR's together,
+# which is the list the next CHANGELOG and Edge need.
 
 name: reports (non-gating)
 
 on:
   pull_request:
     types: [opened, synchronize, reopened]
+  schedule:
+    - cron: '29 5 * * 1'      # Monday: coverage per feature set
   workflow_dispatch:
     inputs:
       baseline:
         description: 'semver baseline tag (default: latest v* tag reachable from the base)'
         required: false
       run:
-        description: 'which report(s): all | semver'
+        description: 'which report(s): all | semver | coverage'
         required: false
         default: all
 
@@ -105,4 +111,75 @@ jobs:
         with:
           name: semver-report
           path: target/semver/
+          retention-days: 30
+
+  coverage-legs:
+    if: >-
+      github.event_name == 'schedule'
+      || (github.event_name == 'workflow_dispatch' && contains(fromJSON('["all","coverage"]'), inputs.run))
+    runs-on: ubuntu-latest
+    outputs:
+      legs: ${{ steps.legs.outputs.legs }}
+    steps:
+      - uses: actions/checkout@v6
+      - id: legs
+        run: echo "legs=$(python3 scripts/ci_feature_matrix.py legs | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read().split()))')" >> "$GITHUB_OUTPUT"
+
+  coverage:
+    name: coverage ${{ matrix.leg }} (report)
+    needs: coverage-legs
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        leg: ${{ fromJSON(needs.coverage-legs.outputs.legs) }}
+    services:
+      postgres:
+        image: ghcr.io/cirisai/postgres:16
+        credentials:
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+        env:
+          POSTGRES_USER: ciris
+          POSTGRES_PASSWORD: ciris
+          POSTGRES_DB: ciris_persist_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ciris"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v6
+      - name: Free runner disk (instrumented objects are large)
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+                      /usr/local/.ghcup /opt/hostedtoolcache/CodeQL 2>/dev/null || true
+          df -h / | tail -1
+      - uses: dtolnay/rust-toolchain@1.97.0
+        with:
+          components: llvm-tools-preview
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest,cargo-llvm-cov
+      - name: psql client for pg_test_db.sh
+        run: command -v psql || (sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-client)
+      - name: coverage, leg ${{ matrix.leg }} (report)
+        env:
+          CIRIS_PERSIST_PG_ADMIN_URL: postgres://ciris:ciris@localhost:5432/ciris_persist_test
+          LEG: ${{ matrix.leg }}
+        run: |
+          scripts/coverage.sh "$LEG"
+          { echo "### coverage — $LEG (report)"; echo '```'; head -1 "target/coverage/$LEG/summary.txt"; grep -E '^TOTAL' "target/coverage/$LEG/summary.txt"; echo '```'; } >> "$GITHUB_STEP_SUMMARY" || true
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: coverage-${{ matrix.leg }}
+          path: |
+            target/coverage/${{ matrix.leg }}/lcov.info
+            target/coverage/${{ matrix.leg }}/summary.txt
+            target/coverage/${{ matrix.leg }}/html/
           retention-days: 30
