@@ -904,6 +904,54 @@ threat-model citations because this crate's audit story is the point.
     replaces the old unkept-stream witness.
   - I768 pins `terminator_seq`.
 
+### Fixed — Codex round 3 on #1065
+
+Three new findings are fixed here. Round 3's other findings are already
+addressed: seven repeat round 2, and the takedown-robustness ones stay with
+#1070. The perf finding about the re-ack's legacy rescan is deferred to #1071.
+
+- **No holding claim about withheld bytes** (`holding_claim.rs`, P1).
+  - The bug: a counter-notice takedown keeps the bytes on disk through its
+    window. For a blob this node had announced only under the rc6 carrier,
+    the re-ack's upgrade conversion could emit a fresh `here` claim after the
+    tombstone.
+  - The fix, at the shared emission: `emit_holding_claim` refuses bytes that
+    `steward_purge::purge_withheld` names, as `BlobError::Purged`. Every
+    caller inherits it.
+  - The re-ack and the conversion count such a blob as the new
+    `ReackReport::withheld`, not as a failure.
+  - The custody-report door refuses `here` as `custody_ack_here_withheld`.
+  - Witness: I778.
+- **The room retention sweep never evicts an OPEN stream epoch**
+  (`sqlite.rs` / `postgres.rs`, P1).
+  - The bug: `stream_dek_evict_room_chunks` evicted an open epoch and stamped
+    it. Appends went on under its DEK and were never swept.
+  - The fix: only TERMINATED stream epochs are eligible.
+  - Why exclude rather than terminate at the sweep: the retention bound is a
+    room-level policy over past content. Closing a producer's live epoch from
+    a background sweep would roll its keys under it, and a supplied stream
+    cannot roll at all. A closed but unterminated epoch is excluded too,
+    since its terminator is still to come.
+  - An open epoch is swept by the first sweep after its seal or roll.
+  - I757 now seals its stream before sweeping.
+  - Witness: I779.
+- **The content-grant projection re-judges its signer**
+  (`key_grant.rs`, P1).
+  - The bug: a content row admitted while the bytes were absent could reach
+    the direct projection after the blob arrived. An unrelated signer could
+    then take the first-write-wins `(at_rest_sha256, recipient)` grant row
+    ahead of the author.
+  - The fix: the direct path asks `may_issue_grant_for(signer, author)`
+    first, and answers the new `KeyGrantProjection::NotAuthor` (nothing
+    written).
+  - Witness: I800.
+- **Adoption:**
+  - `KeyGrantProjection` gains the exhaustive variant `NotAuthor`.
+  - `ReackReport` gains the field `withheld`.
+  - `emit_holding_claim` may now return `BlobError::Purged`.
+  - A custody `here` report about withheld bytes is refused with
+    `custody_ack_here_withheld`.
+
 ### Fixed — Codex round 2 on #1065
 
 Nine findings are fixed here. Three takedown-robustness findings are deferred
