@@ -47,8 +47,8 @@ impl Read {
     /// | `to` K + dimension                   | `list_attestations_for_dimension_prefix`  |
     /// | `by` K + one type, no exclusion      | `list_attestations_by_type`               |
     /// | `to` K + one type, no exclusion      | `list_attestations_for_type`              |
-    /// | `by` K + types                       | `list_attestations_by_types`              |
-    /// | `to` K + types                       | `list_attestations_for_types`             |
+    /// | `by` K + types or a type prefix      | `list_attestations_by_types`              |
+    /// | `to` K + types or a type prefix      | `list_attestations_for_types`             |
     /// | `tier = local`                       | `list_local_tier_attestations`            |
     ///
     /// An exclusion alone (no type, no dimension) is a filter on the key's
@@ -63,6 +63,13 @@ impl Read {
             return "list_local_tier_attestations";
         }
         let to = q.to.is_some();
+        if q.type_prefix.is_some() && q.dimension == DimensionFilter::Any {
+            return if to {
+                "list_attestations_for_types"
+            } else {
+                "list_attestations_by_types"
+            };
+        }
         match (q.dimension != DimensionFilter::Any, q.types.len(), to) {
             (true, _, false) => "list_attestations_by_dimension_prefix",
             (true, _, true) => "list_attestations_for_dimension_prefix",

@@ -281,6 +281,24 @@ pub(crate) mod bodies {
                 ),
             ));
             out.push((
+                "by A, type prefix wi",
+                o(AttestationQuery::by(a, lim).type_prefix("wi")),
+                expect(
+                    corpus,
+                    |r| fed(r) && r.by == a && r.kind.starts_with("wi"),
+                    oldest,
+                ),
+            ));
+            out.push((
+                "to A, type prefix sc",
+                o(AttestationQuery::to(a, lim).type_prefix("sc")),
+                expect(
+                    corpus,
+                    |r| fed(r) && r.to == a && r.kind.starts_with("sc"),
+                    oldest,
+                ),
+            ));
+            out.push((
                 "local by A",
                 o(AttestationQuery::by(a, lim).tier(QueryTier::Local)),
                 expect(corpus, |r| r.local && r.by == a, oldest),

@@ -53,6 +53,7 @@
 
 use chrono::{DateTime, Utc};
 
+use super::attestation_query::{AttestationQuery, FOLD_PAGE};
 use super::custody_ack::{
     custody_ack_envelope, parse_custody_ack, CustodyState, CUSTODY_ACK_DIMENSION, CUSTODY_LIVE_SECS,
 };
@@ -644,9 +645,21 @@ pub const HOLDING_CLAIM_REACK_SWEEP_INTERVAL: std::time::Duration =
 /// v55.0.0 (Codex r4 on #1065; CIRISEdge) — how long after spawn the re-ack
 /// sweeper's FIRST pass runs: short, so an upgraded node converts its retired
 /// rc6 claims within minutes rather than an interval, and not zero, so the
-/// pass (whose own-claims read is unbounded until #1071) does not land on the
-/// announce cold-start and replication catch-up.
+/// pass does not land on the announce cold-start and replication catch-up.
 pub const HOLDING_CLAIM_REACK_START_DELAY: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// v56.0.0 (CIRISPersist#1071; CIRISEdge) — **the most claims ONE re-ack pass
+/// signs**, renewals and upgrade conversions together. Each is a hybrid sign
+/// and a write on the shared writer, and a node back from a long downtime has
+/// every claim due at once, alongside replication catch-up. The pass renews
+/// the OLDEST claims first (the nearest expiry), so a claim waits at most
+/// `due / cap` passes; the rest is counted in [`ReackReport::deferred`] and
+/// taken by the next pass. A claim is due at
+/// [`HOLDING_CLAIM_REACK_AFTER_SECS`] (24 h) and lapses at
+/// [`CUSTODY_LIVE_SECS`] (72 h): 48 hourly passes between, so 256 a pass keeps
+/// about 12,000 claims live at a pass a wake. 2 under `cfg(test)`, so the
+/// witnesses run the deferral on a handful of claims.
+pub const HOLDING_CLAIM_REACK_MAX_PER_PASS: u64 = if cfg!(test) { 2 } else { 256 };
 
 /// What one [`reack_own_claims`] pass did.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
@@ -670,6 +683,10 @@ pub struct ReackReport {
     /// Blobs a tombstone withholds (Codex r3 on #1065): neither renewed nor
     /// converted, and not a failure — the next pass skips them the same way.
     pub withheld: u64,
+    /// v56.0.0 (#1071) — renewals and conversions that were due but past
+    /// this pass's [`HOLDING_CLAIM_REACK_MAX_PER_PASS`]: the next pass takes
+    /// them, oldest first.
+    pub deferred: u64,
 }
 
 /// **Re-acknowledge this node's own holdings** (CC 3.1.3.3 rule 5: "freshness
@@ -684,6 +701,10 @@ pub struct ReackReport {
 /// had announced under the retired rc6 carrier with its OWN row, and has made
 /// no custody report about ([`ReackReport::converted`]); a peer's retired row
 /// stays inert (CC 2.4).
+///
+/// v56.0.0 (CIRISPersist#1071): at most [`HOLDING_CLAIM_REACK_MAX_PER_PASS`]
+/// emissions a pass, the oldest claims first; what is left over is
+/// [`ReackReport::deferred`] and the next pass takes it.
 ///
 /// Idempotent: a renewed claim is fresh, so a second pass at the same `now`
 /// renews nothing. It never claims a blob this node did not already claim
@@ -703,9 +724,15 @@ where
 {
     let me = local.derived_key_id();
     let mut report = ReackReport::default();
+    // v56.0.0 (#1071) — every emission this pass may make.
+    let mut budget = HOLDING_CLAIM_REACK_MAX_PER_PASS;
     let shas = held_by(backend, &me, now, false)
         .await
         .map_err(|e| BlobError::Backend(format!("reack: {e}")))?;
+    // First the due set: each held blob whose latest `here` is a day old (or
+    // absent), with that instant. Bounded by the blobs this node claims, not
+    // by its history.
+    let mut due: Vec<(DateTime<Utc>, [u8; 32])> = Vec::new();
     for sha in shas {
         // One row at a time, each read its own short acquisition; yield
         // between rows so a long walk never starves the writers.
@@ -729,6 +756,17 @@ where
             report.fresh += 1;
             continue;
         }
+        due.push((latest.unwrap_or(DateTime::<Utc>::MIN_UTC), sha));
+    }
+    // Oldest first: the nearest expiry is renewed before a later one, so the
+    // cap defers only claims with the most time left (#1071).
+    due.sort_unstable();
+    for (_, sha) in due {
+        if budget == 0 {
+            report.deferred += 1;
+            continue;
+        }
+        budget -= 1;
         match emit_holding_claim(backend, local, &sha, now).await {
             Ok(HoldingClaimOutcome::Emitted { .. }) => report.renewed += 1,
             Ok(HoldingClaimOutcome::NotInCohort { .. }) => report.not_in_cohort += 1,
@@ -748,49 +786,63 @@ where
     // and has made no custody report about — not even `none` — is claimed
     // now, at the content's scope. Once: the claim it emits is a custody
     // report, so a later pass finds it above and only renews it.
-    let mut legacy: Vec<[u8; 32]> = backend
-        .list_attestations_by(&me)
+    //
+    // v56.0.0 (#1071) — the retired rows are SOUGHT (the `holds_bytes:` type
+    // prefix on the attester+type index), not filtered out of every row this
+    // node ever authored, and walked a page at a time: no full-history Vec.
+    // The conversion shares the pass's budget, after the renewals (a
+    // conversion is a new claim; a renewal is one about to lapse).
+    let mut seen: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
+    let mut pages = AttestationQuery::by(&me, FOLD_PAGE)
+        .type_prefix(super::namespace::registry::RETIRED_HOLDING_CLAIM_STEM)
+        .pages();
+    while let Some(page) = pages
+        .next(backend)
         .await
         .map_err(|e| BlobError::Backend(format!("reack: {e}")))?
-        .iter()
-        .filter(|r| {
-            r.attestation_type
-                .starts_with(super::namespace::registry::RETIRED_HOLDING_CLAIM_STEM)
-        })
-        .filter_map(|r| {
-            r.attestation_envelope
+    {
+        for r in page {
+            let Some(sha) = r
+                .attestation_envelope
                 .get("evidence_refs")
                 .and_then(|v| v.get(0))
                 .and_then(serde_json::Value::as_str)
                 .and_then(|h| hex::decode(h).ok())
                 .and_then(|b| <[u8; 32]>::try_from(b).ok())
-        })
-        .collect();
-    legacy.sort_unstable();
-    legacy.dedup();
-    for sha in legacy {
-        tokio::task::yield_now().await;
-        if backend.blob_head(&sha).await?.is_none()
-            || !super::custody_ack::custody_acks_of(backend, &me, &hex::encode(sha))
-                .await
-                .map_err(|e| BlobError::Backend(format!("reack: {e}")))?
-                .is_empty()
-        {
-            continue;
-        }
-        match emit_holding_claim(backend, local, &sha, now).await {
-            Ok(HoldingClaimOutcome::Emitted { .. }) => report.converted += 1,
-            Ok(HoldingClaimOutcome::NotInCohort { .. }) => report.not_in_cohort += 1,
-            // Codex r3 on #1065 — a counter-notice takedown keeps the bytes
-            // through its window; the conversion never re-advertises them.
-            Err(BlobError::Purged { .. }) => report.withheld += 1,
-            Err(e) => {
-                report.failed += 1;
-                tracing::warn!(
-                    error = %e,
-                    sha256_prefix = &hex::encode(sha)[..16],
-                    "retired-claim conversion failed; the next pass retries"
-                );
+            else {
+                continue;
+            };
+            if !seen.insert(sha) {
+                continue;
+            }
+            tokio::task::yield_now().await;
+            if backend.blob_head(&sha).await?.is_none()
+                || !super::custody_ack::custody_acks_of(backend, &me, &hex::encode(sha))
+                    .await
+                    .map_err(|e| BlobError::Backend(format!("reack: {e}")))?
+                    .is_empty()
+            {
+                continue;
+            }
+            if budget == 0 {
+                report.deferred += 1;
+                continue;
+            }
+            budget -= 1;
+            match emit_holding_claim(backend, local, &sha, now).await {
+                Ok(HoldingClaimOutcome::Emitted { .. }) => report.converted += 1,
+                Ok(HoldingClaimOutcome::NotInCohort { .. }) => report.not_in_cohort += 1,
+                // Codex r3 on #1065 — a counter-notice takedown keeps the bytes
+                // through its window; the conversion never re-advertises them.
+                Err(BlobError::Purged { .. }) => report.withheld += 1,
+                Err(e) => {
+                    report.failed += 1;
+                    tracing::warn!(
+                        error = %e,
+                        sha256_prefix = &hex::encode(sha)[..16],
+                        "retired-claim conversion failed; the next pass retries"
+                    );
+                }
             }
         }
     }
@@ -901,13 +953,17 @@ pub async fn held_by<D>(
 where
     D: FederationDirectory + ?Sized,
 {
-    let mut shas: Vec<String> = dir
-        .list_attestations_by_dimension_prefix(holder_key_id, CUSTODY_ACK_DIMENSION)
-        .await?
-        .iter()
-        .filter_map(|r| parse_custody_ack(r).ok().flatten())
-        .map(|a| a.blob_sha256_hex)
-        .collect();
+    let mut shas: Vec<String> = Vec::new();
+    let mut pages = AttestationQuery::by(holder_key_id, FOLD_PAGE)
+        .dimension_prefix(CUSTODY_ACK_DIMENSION)
+        .pages();
+    while let Some(page) = pages.next(dir).await? {
+        shas.extend(
+            page.iter()
+                .filter_map(|r| parse_custody_ack(r).ok().flatten())
+                .map(|a| a.blob_sha256_hex),
+        );
+    }
     shas.sort();
     shas.dedup();
     let mut out = Vec::with_capacity(shas.len());

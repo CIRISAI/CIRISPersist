@@ -154,6 +154,11 @@ pub struct AttestationQuery {
     pub dimension: DimensionFilter,
     /// `attestation_type` is one of these; empty is any type.
     pub types: Vec<String>,
+    /// `attestation_type` starts with this byte prefix (the half-open range
+    /// on the `(key, attestation_type, …)` index; never `LIKE`). For a row
+    /// family whose type slot carries a variable suffix — the retired rc6
+    /// `holds_bytes:sha256:{prefix}` carrier.
+    pub type_prefix: Option<String>,
     /// The envelope `dimension` is none of these (absent and non-string
     /// dimensions are kept).
     pub excluded_dimensions: Vec<String>,
@@ -176,6 +181,7 @@ impl AttestationQuery {
             to,
             dimension: DimensionFilter::Any,
             types: Vec::new(),
+            type_prefix: None,
             excluded_dimensions: Vec::new(),
             tier: QueryTier::Federation,
             order: QueryOrder::ByAssertedAt(Direction::Desc),
@@ -232,6 +238,13 @@ impl AttestationQuery {
         self
     }
 
+    /// Only rows whose `attestation_type` starts with `prefix`.
+    #[must_use]
+    pub fn type_prefix(mut self, prefix: &str) -> Self {
+        self.type_prefix = Some(prefix.to_owned());
+        self
+    }
+
     /// Drop rows whose envelope `dimension` is one of `dimensions`.
     #[must_use]
     pub fn excluding_dimensions(mut self, dimensions: &[&str]) -> Self {
@@ -280,6 +293,7 @@ impl AttestationQuery {
     #[must_use]
     pub fn is_narrowed(&self) -> bool {
         !self.types.is_empty()
+            || self.type_prefix.is_some()
             || self.dimension != DimensionFilter::Any
             || !self.excluded_dimensions.is_empty()
     }
@@ -290,7 +304,9 @@ impl AttestationQuery {
     /// filter on the key's ordered walk.
     #[must_use]
     pub fn seeks_narrow_index(&self) -> bool {
-        !self.types.is_empty() || self.dimension != DimensionFilter::Any
+        !self.types.is_empty()
+            || self.type_prefix.is_some()
+            || self.dimension != DimensionFilter::Any
     }
 
     /// The key the query is pinned on, for the probe: the attester, else the
@@ -343,6 +359,10 @@ impl AttestationQuery {
                 DimensionFilter::Exact(x) => dimension == Some(x.as_str()),
             }
             && (self.types.is_empty() || self.types.contains(&a.attestation_type))
+            && self
+                .type_prefix
+                .as_deref()
+                .is_none_or(|p| a.attestation_type.starts_with(p))
             && !dimension.is_some_and(|d| self.excluded_dimensions.iter().any(|x| x == d))
             && self.as_of.is_none_or(|t| a.asserted_at <= t)
             && self.after.as_ref().is_none_or(|c| {
@@ -635,6 +655,10 @@ pub fn render_sql(q: &AttestationQuery, dialect: Dialect, table: &str, columns: 
         Dialect::Sqlite => "dimension",
         Dialect::Postgres => "dimension COLLATE \"C\"",
     };
+    let ty = match dialect {
+        Dialect::Sqlite => "attestation_type",
+        Dialect::Postgres => "attestation_type COLLATE \"C\"",
+    };
     let id = match dialect {
         Dialect::Sqlite => "attestation_id",
         Dialect::Postgres => "attestation_id::text COLLATE \"C\"",
@@ -697,6 +721,25 @@ pub fn render_sql(q: &AttestationQuery, dialect: Dialect, table: &str, columns: 
             })
             .collect();
         parts.push(format!("attestation_type IN ({})", phs.join(", ")));
+    }
+    if let Some(p) = &q.type_prefix {
+        match crate::ceg::list::federation::dimension_prefix_bounds(p) {
+            Some((lo, hi)) => {
+                binds.push(Bind::Text(lo));
+                let a = ph(&binds);
+                binds.push(Bind::Text(hi));
+                let b = ph(&binds);
+                parts.push(format!("({ty} >= {a} AND {ty} < {b})"));
+            }
+            None => {
+                binds.push(Bind::Text(p.clone()));
+                parts.push(format!(
+                    "substr(attestation_type, 1, {}) = {}",
+                    p.chars().count(),
+                    ph(&binds)
+                ));
+            }
+        }
     }
     if !q.excluded_dimensions.is_empty() {
         let phs: Vec<String> = q
