@@ -7,6 +7,48 @@ threat-model citations because this crate's audit story is the point.
 
 ## [Unreleased]
 
+## [55.0.1] - UNRELEASED
+
+### Fixed — tag CI: a restored cache never carries a build-script unit with missing outputs
+
+No library code changed.
+
+- **The failure:** the v55.0.0 tag CI (run 38380545287) failed twice, the
+  same way each time, in one job: `maturin abi3-py311 wheel
+  (windows-x86_64)`, with ``couldn't read
+  target\release\build\libsqlite3-sys-…\out/bindgen.rs``.
+  - rust-cache found nothing, so the CIRISCache restore that won was the
+    `ciris-substrate-v1-windows-x64-release-rustc1.97.0-phead-enone-v20.1.0`
+    blob an earlier tag's wheel job saved.
+  - That save prunes target/ to its budget by deleting the OLDEST-mtime FILES
+    (`cc_prune_lru`). It deleted a build-script run's output (`out/bindgen.rs`)
+    and kept the unit's fingerprint. Cargo then trusted the run and
+    `include!`d a file that was not there.
+  - Main pushes do not run the wheel jobs, so nothing re-saved that blob, and
+    every later tag would have failed the same way.
+- **The fix, in persist's workflow** (no registry deletion, no CIRISCache
+  change): `scripts/ci_cache_units.py`.
+  - **Save side:** before each CIRISCache save (every
+    `CIRISCache/save@v1.1` call site, the wheel save included), `seal`
+    writes each build-script unit's `out.manifest` (every file in the unit,
+    sorted) and touches its `out/` files to now, so a file-by-file prune
+    drops them last. This step is continue-on-error, because it is an
+    optimisation.
+  - **Restore side:** in `.github/actions/ciriscache`, after the restore,
+    `repair` removes a build-script unit whose manifest is missing, or names
+    an absent file, as a whole unit: its `build/<pkg>-<hash>/` and its
+    `.fingerprint/<pkg>-<hash>/`. Cargo then reruns that build script. The
+    step is NOT continue-on-error, so a target/ that cannot be checked is not
+    built on.
+  - Today's blobs carry no manifests, so their first restore reruns every
+    build script once, and the next save carries manifests.
+- **Witness:** `scripts/ci_cache_units.py --self-test`, run in the hygiene
+  job. It builds a fixture target/ with a consistent unit, a sealed
+  build-script unit, a unit pruned of one out file, and a unit saved before
+  manifests existed. The repair removes the last two with their
+  fingerprints and keeps the first two, and the seal touches out files to
+  now. Turning the repair off, or keeping the fingerprint, fails it.
+
 ## [55.0.0] - 2026-10-12
 
 ### Changed — CIRISConstitution v1.0-rc7 vendored (#753, slice A0)
