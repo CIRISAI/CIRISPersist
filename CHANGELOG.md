@@ -11,7 +11,123 @@ threat-model citations because this crate's audit story is the point.
 
 ### Changed — typed bounded reads (#1001, #1071)
 
-- In progress (slice R of #1076).
+**One bounded attestation read replaces the wide ones.** Every attestation
+read the directory makes on a key's slice is now an `AttestationQuery`
+(`federation::attestation_query`) executed through
+`AttestationReads::query_attestations`, which returns ONE page. There is no
+default page size and no "every row" form. The statement is planned once
+(`render_sql`, one parameterised `SELECT … LIMIT n + 1` on sqlite and
+postgres; the memory backend evaluates the same predicate,
+`AttestationQuery::admits`), so the three backends agree by construction.
+Every caller in persist moved onto it, plane by plane (delegation/admission,
+trust/ownership, consent/audience, identity facts, custody/config/index,
+the trait's default bodies, the Python surface). No migration: the existing
+indexes serve every shape (I903 reads the sqlite plan of each; on postgres
+each plan tops out in a `Limit`).
+
+The query (all fields public; builders in brackets):
+
+| field | meaning |
+|---|---|
+| `by` / `to` [`AttestationQuery::by(k, limit)`, `::to(k, limit)`, `.authored_by`, `.attested_to`] | the pinned attester / attested key; at least one is required |
+| `dimension: DimensionFilter` [`.dimension_prefix`, `.dimension`, `.dimension_any_of`] | `Any`, `Prefix` (byte range, never `LIKE`), `Exact`, or **`AnyOf(Vec<String>)`**: exact dimensions OR'd in one statement (`dimension IN (…)`, one seek per member on the `(key, dimension)` index). An empty `AnyOf` is refused. |
+| `types`, `type_prefix` [`.types`, `.type_prefix`] | `attestation_type` is one of / starts with |
+| `excluded_dimensions` [`.excluding_dimensions`] | dimension is none of these (absent kept) |
+| **`scope: Option<ScopeFilter>`** [`.scope(cohort_scope, Option<cohort_target>)`] | stored `cohort_scope`, and V150's `cohort_target` when given. A `to` query seeks V060's `(attested_key_id, cohort_scope, asserted_at DESC)`; a `by` query filters the attester's ordered walk. |
+| `tier: QueryTier` [`.tier`] | `Federation` (default) or `Local` |
+| `order: QueryOrder` [`.oldest_first`, `.order`] | `ByAssertedAt(Direction)`: the SIGNED instant, ties broken by `attestation_id`; newest first by default |
+| `limit: NonZeroU32` | required page size, at most `MAX_PAGE` (10,000) |
+| `after: Option<AttestationCursor>` [`.after`] | resume after this row |
+| `as_of: Option<DateTime<Utc>>` [`.as_of`] | only rows whose signed `asserted_at <= t`: a fold over an `as_of(t)` query replays identically on every node and at every later moment |
+
+**The whole set is a loop.** A `Page` holds at most `limit` rows and `next:
+Option<AttestationCursor>`, which is `Some` exactly when another row exists.
+A caller that needs every matching row passes `next` back as `after` until it
+is `None`, or walks `AttestationQuery::pages()` in a `while let`. The loop is
+visible at the call site; `FOLD_PAGE` (500) is the page persist's own folds
+use.
+
+**Not served is never empty.** `query_attestations` returns
+`ReadOutcome::Served(Page)` (possibly zero rows: the store answered and
+nothing matched) or `ReadOutcome::NotServed(NotServedReason)`, which is
+`Refused` (no pinned key, a page above `MAX_PAGE`, an empty `AnyOf`, an
+unknown cursor version, a proxy's `Unsupported`) or `Fault` (the backend
+failed, or returned rows past `limit + 1`). Those are the only two reasons.
+Pressure is not one: a read under load is served or faulted, never shortened
+or emptied. `ReadOutcome::served()` is the `?` form; a fold sees a not-served
+read as an error.
+
+**Retractions are a second query.** The structural composers (`withdraws`,
+`supersedes`, `recants`) carry NO envelope `dimension` (a `withdraws`
+envelope is `{kind, references_attestation_id, references_attestation_type}`).
+A dimension-filtered page (`Prefix`, `Exact`, `AnyOf`) therefore never
+carries its own rows' retractions. The bounded second read is
+`AttestationQuery::by(k, limit).types(&["withdraws", "supersedes",
+"recants"])`, paged on `next`, joined on the envelope's
+`references_attestation_id`.
+
+**#1071, the re-ack pass.** One pass signs at most
+`HOLDING_CLAIM_REACK_MAX_PER_PASS` (256) claims, renewals before upgrade
+conversions, the OLDEST due claim first (the nearest expiry), and counts the
+rest in `ReackReport::deferred` for the next hourly pass. A claim is due at
+24 h and lapses at 72 h, so 48 passes lie between. Both of its walks page an
+`AttestationQuery` (the node's `custody:ack:` reports; its retired
+`holds_bytes:` rows by type prefix), and the held-blob set is deduped as the
+pages arrive instead of growing with the claim history.
+
+**API break.**
+
+- `FederationDirectory::list_attestations_by` / `list_attestations_for` are
+  **demoted**: `#[cfg(any(test, feature = "test-anchor"))]` provided methods
+  that page the bounded query. No production build has them. They are deleted
+  in v57.
+- Removed from the trait (and every backend): `list_attestations_by_dimension_prefix`,
+  `list_attestations_for_dimension_prefix`, `list_attestations_by_type`,
+  `list_attestations_for_type`, `list_attestations_by_types`,
+  `list_attestations_for_types`. Removed: the free fn
+  `federation::types_and_dimension_admit` and `admission::DelegationGraphReads`
+  (its role is `attestation_query::AttestationQueryExec`).
+- New required trait method: `execute_attestation_query(&AttestationQuery) ->
+  Result<QueryRows, Error>` (storage only; a wrapper delegates, a proxy that
+  cannot answer returns `Unsupported`, which surfaces as `NotServed(Refused)`).
+  `list_attestations_by_dimension_citing` loses its default body (it composed
+  over a removed read) and is now required.
+- Telemetry: the eight per-method `door` label values of the attestation read
+  counters collapse into one, `attestation_query`.
+- Python: `Engine.list_attestations_by(attesting_key_id, limit, cursor_json=None,
+  dimension_prefix=None)` returns ONE page as `AttestationListPage` JSON
+  (`{"items": […], "next_cursor": …}`) instead of a JSON list of every row;
+  `limit` is required. A read that is not served raises.
+- New public API: `federation::attestation_query::{AttestationQuery,
+  DimensionFilter, ScopeFilter, QueryTier, QueryOrder, Direction, Page, Pages,
+  ReadOutcome, NotServedReason, AttestationReads, AttestationQueryExec,
+  QueryRows, MAX_PAGE, FOLD_PAGE, page_size, render_sql, Dialect, Bind,
+  Statement}`.
+
+**Gates.** I914 classifies every production `list_*` method on the trait as
+paged, bounded by the schema (with the reason), or open (with what it grows
+with) in `federation/bounded_reads_table.rs`, and fails on an unclassified
+method or a classification its signature contradicts. The open rows are
+named, not fixed, here. I915 walks `src/` with comments, strings and test-only
+items stripped and finds no production call of the demoted reads.
+
+**Adopting (CIRISEdge).**
+
+- Replace each `dir.list_attestations_by(k)` / `_for(k)` with the narrowest
+  query that answers the fold: `AttestationQuery::by(k, FOLD_PAGE)` plus
+  `.types`, `.dimension_prefix`, `.dimension_any_of` or `.scope`, and loop
+  on `next` (or `.pages()`) when the fold needs every match.
+- Several exact dimensions in one read: `.dimension_any_of(&[…])`. Rows of
+  one community: `.scope("community", Some(community_id))`.
+- A fold that honours retractions pairs its dimension-filtered page with the
+  bounded composer query above; the dimension filter never returns them.
+- Handle `ReadOutcome::NotServed` as an error (`.served()?`), never as "no
+  rows".
+- Tests may keep calling `list_attestations_by` / `_for` through the
+  `test-anchor` dev-dependency until v57. A production `impl
+  FederationDirectory` must drop its own `list_attestations_by` / `_for` (and
+  the six removed methods) and implement `execute_attestation_query` (a
+  wrapper delegates to its inner directory).
 
 ## [55.0.0] - 2026-10-12
 
