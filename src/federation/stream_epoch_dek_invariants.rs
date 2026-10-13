@@ -792,8 +792,13 @@ pub(crate) mod bodies {
                 .await
                 .expect("I779: the sweep runs")
         };
-        sweep().await;
+        let r = sweep().await;
+        assert_eq!(
+            r.evicted_objects, 0,
+            "I779: the open epoch is not swept: {r:?}"
+        );
         let open = l.ba.stream_chunks(&stream).await.unwrap().chunks;
+        assert_eq!(open.len(), 2, "I779: both chunks still listed");
         for c in &open {
             assert!(
                 l.ba.blob_head(&c.chunk_sha).await.unwrap().is_some(),
