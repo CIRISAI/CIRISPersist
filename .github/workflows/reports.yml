@@ -14,6 +14,9 @@
 #   coverage   weekly, dispatch
 #                       cargo llvm-cov per certify feature set (scripts/coverage.sh);
 #                       the legs are DERIVED (ci_feature_matrix.py legs), not listed
+#   mutants-diff  PR labelled `run-mutants`, dispatch
+#                       cargo-mutants on the changed lines only (scripts/mutants_diff.sh);
+#                       never runs by default
 #
 # On a PR, `size` shows this PR's own delta (vs the base), while `semver`
 # shows every break since the last release — main's and this PR's together,
@@ -23,7 +26,7 @@ name: reports (non-gating)
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened]
+    types: [opened, synchronize, reopened, labeled]
   schedule:
     - cron: '29 5 * * 1'      # Monday: coverage per feature set
   workflow_dispatch:
@@ -31,8 +34,12 @@ on:
       baseline:
         description: 'semver baseline tag (default: latest v* tag reachable from the base)'
         required: false
+      mutants_base:
+        description: 'mutants-diff base ref (default: origin/main)'
+        required: false
+        default: origin/main
       run:
-        description: 'which report(s): all | semver | coverage'
+        description: 'which report(s): all | semver | coverage | mutants-diff'
         required: false
         default: all
 
@@ -40,7 +47,10 @@ permissions:
   contents: read
 
 concurrency:
-  group: reports-${{ github.event_name }}-${{ github.ref }}
+  # A `labeled` event runs only mutants-diff, and only for its own label: it
+  # gets a group of its own per label, so adding a label never cancels a
+  # running size/semver report, nor a second label a running mutants job.
+  group: reports-${{ github.event_name }}-${{ github.event.action == 'labeled' && format('label-{0}', github.event.label.name) || 'run' }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -182,4 +192,40 @@ jobs:
             target/coverage/${{ matrix.leg }}/lcov.info
             target/coverage/${{ matrix.leg }}/summary.txt
             target/coverage/${{ matrix.leg }}/html/
+          retention-days: 30
+
+  mutants-diff:
+    name: mutants on the diff (report)
+    if: >-
+      (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'run-mutants')
+        && (github.event.action != 'labeled' || github.event.label.name == 'run-mutants'))
+      || (github.event_name == 'workflow_dispatch' && contains(fromJSON('["all","mutants-diff"]'), inputs.run))
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@1.97.0
+      - uses: ./.github/actions/ciriscache
+        with:
+          plat: linux-x86_64
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest,cargo-mutants@27.1.0
+      - name: cargo-mutants on the changed lines (report)
+        env:
+          BASE: ${{ github.event_name == 'pull_request' && format('origin/{0}', github.base_ref) || inputs.mutants_base }}
+          MUTANTS_DIFF_BUDGET_SECS: '7200'
+        run: scripts/mutants_diff.sh "$BASE"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: mutants-diff
+          path: |
+            target/mutants-diff/summary.txt
+            target/mutants-diff/scope.diff
+            target/mutants-diff/list.txt
+            target/mutants-diff/mutants.out/
           retention-days: 30
