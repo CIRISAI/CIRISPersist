@@ -564,7 +564,7 @@ fn substrate_expiry_bound_to_subject(
 /// are gone.
 ///
 /// `rows` is everything the directory holds ABOUT the target
-/// ([`list_attestations_for`](super::FederationDirectory::list_attestations_for)
+/// ([`list_attestations_for`](crate::federation::attestation_query::AttestationQuery::to)
 /// — federation tier). Four stages:
 ///
 /// 1. **The universe.** The subject's own `consent:state:*` statements about

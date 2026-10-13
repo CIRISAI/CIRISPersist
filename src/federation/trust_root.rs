@@ -4401,7 +4401,8 @@ pub(crate) mod v53_1_6_reference {
     where
         F: FederationDirectory + ?Sized,
     {
-        let by_node = match directory.list_attestations_by(node_key_id).await {
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
+        let by_node = match directory.all_attestations_by(node_key_id).await {
             Ok(rows) => rows,
             Err(Error::Unsupported { .. }) => Vec::new(),
             Err(e) => return Err(e),
@@ -4443,6 +4444,7 @@ pub(crate) mod v53_1_6_reference {
     where
         F: FederationDirectory + ?Sized,
     {
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
         // A self-root is the immutable BASE, never a valid EXTERNAL root (the
         // FSD's gate demands a SHARED external root).
         if user_key_id == root_ref {
@@ -4497,9 +4499,9 @@ pub(crate) mod v53_1_6_reference {
         // tombstones — a withdraws on your own edge is attested by YOU), and
         // everything attested about/by the root (self-declaration + its
         // tombstones + lifecycle rows).
-        let by_user = directory.list_attestations_by(user_key_id).await?;
-        let by_root = directory.list_attestations_by(legs_ref).await?;
-        let about_root = directory.list_attestations_for(legs_ref).await?;
+        let by_user = directory.all_attestations_by(user_key_id).await?;
+        let by_root = directory.all_attestations_by(legs_ref).await?;
+        let about_root = directory.all_attestations_for(legs_ref).await?;
 
         let now = chrono::Utc::now();
 
@@ -4772,10 +4774,11 @@ pub(crate) mod v53_1_6_reference {
     where
         F: FederationDirectory + ?Sized,
     {
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
         // Every grant ABOUT the subject (delegates_to(* → subject)) plus its
         // tombstones — a withdraws/recants on a grant is attested about the
         // same subject, so the one about-read carries both.
-        let about_subject = directory.list_attestations_for(subject_key_id).await?;
+        let about_subject = directory.all_attestations_for(subject_key_id).await?;
         let about_refs: Vec<&Attestation> = about_subject.iter().collect();
         let dead = tombstoned_ids(&about_refs);
         let now = chrono::Utc::now();
@@ -4944,6 +4947,7 @@ pub(crate) mod v53_1_6_reference {
         user_key_id: &str,
         peer_key_id: &str,
     ) -> Result<(TransitEligibility, usize), Error> {
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
         use crate::federation::types::{delegation_scope, identity_type};
 
         // A node is not its own hop. Short-circuited before any read: the
@@ -4980,7 +4984,7 @@ pub(crate) mod v53_1_6_reference {
         // `transit_candidate_roots` for why that boundary is the anti-inflation
         // property and not merely an optimization.
         let now = chrono::Utc::now();
-        let by_user = directory.list_attestations_by(user_key_id).await?;
+        let by_user = directory.all_attestations_by(user_key_id).await?;
         let mut roots_walked = 0usize;
         for candidate in transit_candidate_roots(&by_user, user_key_id, now) {
             roots_walked += 1;
@@ -5034,7 +5038,8 @@ pub(crate) mod v53_1_6_reference {
     where
         F: FederationDirectory + ?Sized,
     {
-        let about_subject = directory.list_attestations_for(subject_key_id).await?;
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
+        let about_subject = directory.all_attestations_for(subject_key_id).await?;
         let about_refs: Vec<&Attestation> = about_subject.iter().collect();
         let dead = tombstoned_ids(&about_refs);
         let now = chrono::Utc::now();

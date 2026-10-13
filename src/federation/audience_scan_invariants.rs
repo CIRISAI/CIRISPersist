@@ -64,7 +64,8 @@ pub(crate) mod bodies {
         owner: &str,
         node: &str,
     ) -> Result<Option<BTreeSet<CohortEntry>>, Error> {
-        let rows = dir.list_attestations_by(owner).await?;
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
+        let rows = dir.all_attestations_by(owner).await?;
         let retired: HashSet<&str> = rows
             .iter()
             .filter(|r| crate::federation::precedence::is_structural_composer(&r.attestation_type))
@@ -107,6 +108,7 @@ pub(crate) mod bodies {
         dir: &dyn FederationDirectory,
         group: &str,
     ) -> Result<bool, Error> {
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
         if group == crate::federation::canonical_community::accord_family_key_id() {
             return Ok(true);
         }
@@ -136,7 +138,7 @@ pub(crate) mod bodies {
             HeadCharter::KeyRoot => None,
             _ => return Ok(false),
         };
-        let about = dir.list_attestations_for(group).await?;
+        let about = dir.all_attestations_for(group).await?;
         let refs: Vec<&Attestation> = about.iter().collect();
         let dead = crate::federation::precedence::retired_ids(&refs);
         Ok(about.iter().any(|a| {
@@ -156,7 +158,8 @@ pub(crate) mod bodies {
         subject: &str,
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<ConsentState, Error> {
-        let rows = dir.list_attestations_for(target).await?;
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
+        let rows = dir.all_attestations_for(target).await?;
         Ok(consent::fold_stance(&rows, subject, now, None))
     }
 
@@ -169,7 +172,8 @@ pub(crate) mod bodies {
         qualifier: Option<&str>,
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<ScopedStance, Error> {
-        let rows = dir.list_attestations_for(target).await?;
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
+        let rows = dir.all_attestations_for(target).await?;
         Ok(consent::fold_scoped_stance(
             &rows, subject, now, scope, qualifier,
         ))
@@ -185,12 +189,13 @@ pub(crate) mod bodies {
         qualifier: Option<&str>,
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<ScopedStance, Error> {
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
         let mut folded = vec![
             resolve_scoped_stance_reference(dir, target, subject, scope, qualifier, now).await?,
         ];
         let stewards = admission::steward_bindings_of(dir, subject).await?;
         if !stewards.is_empty() {
-            let rows = dir.list_attestations_for(target).await?;
+            let rows = dir.all_attestations_for(target).await?;
             for p in &stewards {
                 if p == subject {
                     continue;
@@ -1418,7 +1423,7 @@ pub(crate) mod bodies {
             )
             .await;
         }
-        let about_t = FederationDirectory::list_attestations_for(d, &t)
+        let about_t = crate::federation::attestation_query::test_support::AllAttestations::all_attestations_for(d, &t)
             .await
             .unwrap()
             .len();

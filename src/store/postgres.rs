@@ -340,45 +340,6 @@ impl PostgresBackend {
 /// `apply_replicated_community` the replicated one (a record authored
 /// elsewhere, admitted as data). Every other gate is the same on both.
 impl PostgresBackend {
-    /// v53.1.7 — the body of `list_attestations_for_types` / `_by_types` over
-    /// `key_column`: the (key, type) prefix seek, the exclusion on V122's
-    /// generated `dimension` (`NULL` kept; `->>` of a non-string never equals
-    /// a bound string).
-    async fn pg_typed_read(
-        &self,
-        key_column: &'static str,
-        key: &str,
-        attestation_types: &[&str],
-        excluded_dimensions: &[&str],
-    ) -> Result<(Vec<crate::federation::Attestation>, u64), crate::federation::Error> {
-        if attestation_types.is_empty() {
-            return Ok((Vec::new(), 0));
-        }
-        let sql = format!(
-            "SELECT {PG_ATTESTATION_COLUMNS} FROM cirislens.federation_attestations \
-             WHERE {key_column} = $1 AND attestation_type = ANY($2) AND tier = 'federation' \
-               AND (dimension IS NULL OR NOT (dimension = ANY($3))) \
-             ORDER BY asserted_at DESC"
-        );
-        let types: Vec<&str> = attestation_types.to_vec();
-        let excluded: Vec<&str> = excluded_dimensions.to_vec();
-        let client = self
-            .get_client()
-            .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
-        let rows = client
-            .query(&sql, &[&key, &types, &excluded])
-            .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
-        let bytes = pg_envelope_bytes(&rows);
-        Ok((
-            rows.into_iter()
-                .map(pg_row_to_attestation)
-                .collect::<Result<_, _>>()?,
-            bytes,
-        ))
-    }
-
     /// v53.1.0 (#979) — TEST SEAM: drop the V176 relation of a manifest (a
     /// DAG from before V176) or add one row of it (a chunk shared by two DAGs,
     /// which two real streams never produce: each seal encrypts its own bytes).
@@ -8427,116 +8388,6 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         pg_execute_attestation_query(&**client, q).await
     }
 
-    async fn list_attestations_for(
-        &self,
-        attested_key_id: &str,
-    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
-        let client = self
-            .get_client()
-            .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
-        pg_list_attestations_for(&**client, attested_key_id).await
-    }
-
-    async fn list_attestations_by(
-        &self,
-        attesting_key_id: &str,
-    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
-        let client = self
-            .get_client()
-            .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
-        pg_list_attestations_by(&**client, attesting_key_id).await
-    }
-
-    /// v53.1.5 — V137's `(attesting_key_id, dimension COLLATE "C")` seek;
-    /// the prefix is the #817/#818 half-open byte range under `COLLATE "C"`.
-    async fn list_attestations_by_dimension_prefix(
-        &self,
-        attesting_key_id: &str,
-        dimension_prefix: &str,
-    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
-        let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> =
-            vec![Box::new(attesting_key_id.to_owned())];
-        let prefix_sql = pg_dimension_prefix_clause(dimension_prefix, &mut params);
-        let sql = format!(
-            "SELECT {PG_ATTESTATION_COLUMNS} FROM cirislens.federation_attestations \
-             WHERE attesting_key_id = $1 AND tier = 'federation' AND {prefix_sql} \
-             ORDER BY asserted_at DESC"
-        );
-        let client = self
-            .get_client()
-            .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
-        let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
-            params.iter().map(|p| p.as_ref() as _).collect();
-        let rows = client.query(&sql, &params_ref[..]).await.map_err(|e| {
-            crate::federation::Error::Backend(format!("list_attestations_by_dimension_prefix: {e}"))
-        })?;
-        let bytes = pg_envelope_bytes(&rows);
-        rows.into_iter()
-            .map(pg_row_to_attestation)
-            .collect::<Result<Vec<_>, _>>()
-            .inspect(|rows| {
-                crate::observe::record_read(
-                    crate::observe::StoreBackend::Postgres,
-                    crate::observe::Door::ListAttestationsByDimensionPrefix,
-                    attesting_key_id,
-                    rows,
-                    bytes,
-                )
-            })
-    }
-
-    /// v53.1.5 — V178's `(attested_key_id, dimension COLLATE "C")` seek, the
-    /// attested twin; the optional attester narrows in the same statement.
-    async fn list_attestations_for_dimension_prefix(
-        &self,
-        attested_key_id: &str,
-        attesting_key_id: Option<&str>,
-        dimension_prefix: &str,
-    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
-        let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> =
-            vec![Box::new(attested_key_id.to_owned())];
-        let prefix_sql = pg_dimension_prefix_clause(dimension_prefix, &mut params);
-        let attester_sql = match attesting_key_id {
-            Some(k) => {
-                params.push(Box::new(k.to_owned()));
-                format!(" AND attesting_key_id = ${}", params.len())
-            }
-            None => String::new(),
-        };
-        let sql = format!(
-            "SELECT {PG_ATTESTATION_COLUMNS} FROM cirislens.federation_attestations \
-             WHERE attested_key_id = $1 AND tier = 'federation' AND {prefix_sql}{attester_sql} \
-             ORDER BY asserted_at DESC"
-        );
-        let client = self
-            .get_client()
-            .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
-        let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
-            params.iter().map(|p| p.as_ref() as _).collect();
-        let rows = client.query(&sql, &params_ref[..]).await.map_err(|e| {
-            crate::federation::Error::Backend(format!(
-                "list_attestations_for_dimension_prefix: {e}"
-            ))
-        })?;
-        let bytes = pg_envelope_bytes(&rows);
-        rows.into_iter()
-            .map(pg_row_to_attestation)
-            .collect::<Result<Vec<_>, _>>()
-            .inspect(|rows| {
-                crate::observe::record_read(
-                    crate::observe::StoreBackend::Postgres,
-                    crate::observe::Door::ListAttestationsForDimensionPrefix,
-                    attested_key_id,
-                    rows,
-                    bytes,
-                )
-            })
-    }
-
     /// v53.1.5 — `list_attestations_referencing` for a SET of ids (one
     /// `text[]` bind), with the attested / attesting axes the folds pin so
     /// V178's `(attested_key_id, attestation_type, ref)` or V107's attesting
@@ -8595,138 +8446,6 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     bytes,
                 )
             })
-    }
-
-    /// v53.1.6 — V178's `(attested_key_id, attestation_type, …)` prefix seek.
-    async fn list_attestations_for_type(
-        &self,
-        attested_key_id: &str,
-        attestation_type: &str,
-    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
-        let sql = format!(
-            "SELECT {PG_ATTESTATION_COLUMNS} FROM cirislens.federation_attestations \
-             WHERE attested_key_id = $1 AND attestation_type = $2 AND tier = 'federation' \
-             ORDER BY asserted_at DESC"
-        );
-        let client = self
-            .get_client()
-            .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
-        let rows = client
-            .query(&sql, &[&attested_key_id, &attestation_type])
-            .await
-            .map_err(|e| {
-                crate::federation::Error::Backend(format!("list_attestations_for_type: {e}"))
-            })?;
-        let bytes = pg_envelope_bytes(&rows);
-        rows.into_iter()
-            .map(pg_row_to_attestation)
-            .collect::<Result<Vec<_>, _>>()
-            .inspect(|rows| {
-                crate::observe::record_read(
-                    crate::observe::StoreBackend::Postgres,
-                    crate::observe::Door::ListAttestationsForType,
-                    attested_key_id,
-                    rows,
-                    bytes,
-                )
-            })
-    }
-
-    /// v53.1.6 — V107's `(attesting_key_id, attestation_type, …)` prefix
-    /// seek (`federation_attestations_composer_ref`, V122-rebuilt).
-    async fn list_attestations_by_type(
-        &self,
-        attesting_key_id: &str,
-        attestation_type: &str,
-    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
-        let sql = format!(
-            "SELECT {PG_ATTESTATION_COLUMNS} FROM cirislens.federation_attestations \
-             WHERE attesting_key_id = $1 AND attestation_type = $2 AND tier = 'federation' \
-             ORDER BY asserted_at DESC"
-        );
-        let client = self
-            .get_client()
-            .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
-        let rows = client
-            .query(&sql, &[&attesting_key_id, &attestation_type])
-            .await
-            .map_err(|e| {
-                crate::federation::Error::Backend(format!("list_attestations_by_type: {e}"))
-            })?;
-        let bytes = pg_envelope_bytes(&rows);
-        rows.into_iter()
-            .map(pg_row_to_attestation)
-            .collect::<Result<Vec<_>, _>>()
-            .inspect(|rows| {
-                crate::observe::record_read(
-                    crate::observe::StoreBackend::Postgres,
-                    crate::observe::Door::ListAttestationsByType,
-                    attesting_key_id,
-                    rows,
-                    bytes,
-                )
-            })
-    }
-
-    /// v53.1.7 — V178's `(attested_key_id, attestation_type, …)` seek; the
-    /// dimension exclusion is evaluated on V122's generated `dimension`, so an
-    /// excluded row is never decoded.
-    async fn list_attestations_for_types(
-        &self,
-        attested_key_id: &str,
-        attestation_types: &[&str],
-        excluded_dimensions: &[&str],
-    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
-        let (rows, bytes) = self
-            .pg_typed_read(
-                "attested_key_id",
-                attested_key_id,
-                attestation_types,
-                excluded_dimensions,
-            )
-            .await
-            .map_err(|e| {
-                crate::federation::Error::Backend(format!("list_attestations_for_types: {e}"))
-            })?;
-        crate::observe::record_read(
-            crate::observe::StoreBackend::Postgres,
-            crate::observe::Door::ListAttestationsForTypes,
-            attested_key_id,
-            &rows,
-            bytes,
-        );
-        Ok(rows)
-    }
-
-    /// v53.1.7 — V107's `(attesting_key_id, attestation_type, …)` seek, the
-    /// attesting twin of the read above.
-    async fn list_attestations_by_types(
-        &self,
-        attesting_key_id: &str,
-        attestation_types: &[&str],
-        excluded_dimensions: &[&str],
-    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
-        let (rows, bytes) = self
-            .pg_typed_read(
-                "attesting_key_id",
-                attesting_key_id,
-                attestation_types,
-                excluded_dimensions,
-            )
-            .await
-            .map_err(|e| {
-                crate::federation::Error::Backend(format!("list_attestations_by_types: {e}"))
-            })?;
-        crate::observe::record_read(
-            crate::observe::StoreBackend::Postgres,
-            crate::observe::Door::ListAttestationsByTypes,
-            attesting_key_id,
-            &rows,
-            bytes,
-        );
-        Ok(rows)
     }
 
     /// v55.0.0 (CIRISPersist#989) — V190's `(dimension COLLATE "C",
@@ -24449,87 +24168,6 @@ where
         bytes,
         backend: crate::observe::StoreBackend::Postgres,
     })
-}
-
-/// v54.0.0 (Codex round 2 on PR #1050) — `list_attestations_for` on any
-/// client: the directory method's own statement, so a caller holding a
-/// transaction reads through it instead of checking out another client.
-async fn pg_list_attestations_for<C>(
-    client: &C,
-    attested_key_id: &str,
-) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error>
-where
-    C: tokio_postgres::GenericClient + Sync,
-{
-    let rows = client
-        .query(
-            // weight::float8 AS weight — tokio-postgres has no
-            // built-in NUMERIC<->f64 deserializer, so the read
-            // path mirrors the write-path `$5::float8::numeric`
-            // cast. NUMERIC→FLOAT8 is the inverse hop;
-            // pg_row_to_attestation reads weight as Option<f64>.
-            "SELECT attestation_id::text, attesting_key_id, attested_key_id, attestation_type, \
-                weight::float8 AS weight, asserted_at, expires_at, attestation_envelope, \
-                original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
-                scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at, additional_scrubs \
-             FROM cirislens.federation_attestations \
-             WHERE attested_key_id = $1 AND tier = 'federation' \
-             ORDER BY asserted_at DESC",
-            &[&attested_key_id],
-        )
-        .await
-        .map_err(|e| crate::federation::Error::Backend(format!("list_attestations_for: {e}")))?;
-    let bytes = pg_envelope_bytes(&rows);
-    rows.into_iter()
-        .map(pg_row_to_attestation)
-        .collect::<Result<Vec<_>, _>>()
-        .inspect(|rows| {
-            crate::observe::record_read(
-                crate::observe::StoreBackend::Postgres,
-                crate::observe::Door::ListAttestationsFor,
-                attested_key_id,
-                rows,
-                bytes,
-            )
-        })
-}
-
-/// v54.0.0 (Codex round 2 on PR #1050) — `list_attestations_by` on any
-/// client (see [`pg_list_attestations_for`]).
-async fn pg_list_attestations_by<C>(
-    client: &C,
-    attesting_key_id: &str,
-) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error>
-where
-    C: tokio_postgres::GenericClient + Sync,
-{
-    let rows = client
-        .query(
-            // weight::float8 AS weight — see pg_list_attestations_for.
-            "SELECT attestation_id::text, attesting_key_id, attested_key_id, attestation_type, \
-                weight::float8 AS weight, asserted_at, expires_at, attestation_envelope, \
-                original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
-                scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at, additional_scrubs \
-             FROM cirislens.federation_attestations \
-             WHERE attesting_key_id = $1 AND tier = 'federation' \
-             ORDER BY asserted_at DESC",
-            &[&attesting_key_id],
-        )
-        .await
-        .map_err(|e| crate::federation::Error::Backend(format!("list_attestations_by: {e}")))?;
-    let bytes = pg_envelope_bytes(&rows);
-    rows.into_iter()
-        .map(pg_row_to_attestation)
-        .collect::<Result<Vec<_>, _>>()
-        .inspect(|rows| {
-            crate::observe::record_read(
-                crate::observe::StoreBackend::Postgres,
-                crate::observe::Door::ListAttestationsBy,
-                attesting_key_id,
-                rows,
-                bytes,
-            )
-        })
 }
 
 /// v54.0.0 (Codex round 2 on PR #1050) — the cycle gate's walk reads
@@ -42196,6 +41834,7 @@ mod tests {
     #[serial_test::serial(postgres)]
     async fn pg_no_moderator_federate_apply_broadened_keying() {
         use crate::federation::admission::MEMBER_ROLE_FOUNDER;
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
         use crate::federation::FederationDirectory;
         let Some(dsn) = pg_dsn() else {
             eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
@@ -42279,7 +41918,7 @@ mod tests {
         );
         assert_eq!(err.kind(), "federation_community_no_moderator");
         assert!(backend
-            .list_attestations_for(&comm_no)
+            .all_attestations_for(&comm_no)
             .await
             .unwrap()
             .is_empty());
@@ -42297,7 +41936,7 @@ mod tests {
             .await
             .expect("moderatored community continues to federate");
         assert_eq!(
-            backend.list_attestations_for(&comm_ok).await.unwrap().len(),
+            backend.all_attestations_for(&comm_ok).await.unwrap().len(),
             1
         );
 
@@ -42351,6 +41990,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(postgres)]
     async fn pg_node_agency_scope_split_matrix() {
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
         use crate::federation::types::delegation_scope as ds;
         use crate::federation::FederationDirectory;
         let Some(dsn) = pg_dsn() else {
@@ -42393,7 +42033,7 @@ mod tests {
             .put_attestation(crate::federation::SignedAttestation { attestation: att_a })
             .await
             .unwrap();
-        let stored = backend.list_attestations_for(&node).await.unwrap();
+        let stored = backend.all_attestations_for(&node).await.unwrap();
         assert_eq!(stored.len(), 1);
         assert_eq!(stored[0].attestation_id, id_a);
 
@@ -42422,7 +42062,7 @@ mod tests {
         }
         assert_eq!(err.kind(), "federation_node_agency_forbidden");
         // Run-scoped: still exactly the one (a) row for this node; id_b absent.
-        let after_b = backend.list_attestations_for(&node).await.unwrap();
+        let after_b = backend.all_attestations_for(&node).await.unwrap();
         assert_eq!(after_b.len(), 1);
         assert!(after_b.iter().all(|r| r.attestation_id != id_b));
 
@@ -42464,7 +42104,7 @@ mod tests {
             .put_attestation(crate::federation::SignedAttestation { attestation: att_d })
             .await
             .unwrap();
-        let on_agent = backend.list_attestations_for(&agent).await.unwrap();
+        let on_agent = backend.all_attestations_for(&agent).await.unwrap();
         assert_eq!(on_agent.len(), 1);
         assert_eq!(on_agent[0].attestation_id, id_d);
     }
@@ -42477,6 +42117,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(postgres)]
     async fn pg_node_agency_duplicate_identity_type_token() {
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
         use crate::federation::types::{delegation_scope as ds, identity_type};
         use crate::federation::FederationDirectory;
         let Some(dsn) = pg_dsn() else {
@@ -42545,11 +42186,7 @@ mod tests {
                 matches!(err, crate::federation::Error::NodeAgencyForbidden { .. }),
                 "{node}: dup/whitespace node token must still hit the gate, got {err:?}"
             );
-            assert!(backend
-                .list_attestations_for(node)
-                .await
-                .unwrap()
-                .is_empty());
+            assert!(backend.all_attestations_for(node).await.unwrap().is_empty());
         }
         // v38.6.0 (CIRISPersist#773, CC 3.4.7.3 Clause B) — INVERTED, and
         // the PG twin of the memory/sqlite pair.
@@ -42577,7 +42214,7 @@ mod tests {
                  exclusivity",
             );
         // Verify-before-mutation: the refusal leaves no trace.
-        let on_hybrid = backend.list_attestations_for(&hybrid).await.unwrap();
+        let on_hybrid = backend.all_attestations_for(&hybrid).await.unwrap();
         assert!(
             on_hybrid.is_empty(),
             "#773: a refused delegation must not be stored"
@@ -44149,6 +43786,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(postgres)]
     async fn pg_put_attestation_accepts_accord_dimension_from_accord_holder() {
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
         let Some(dsn) = pg_dsn() else {
             eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
             return;
@@ -44183,7 +43821,7 @@ mod tests {
             .put_attestation(crate::federation::SignedAttestation { attestation: att })
             .await
             .unwrap();
-        let rows = backend.list_attestations_for(&agent_k).await.unwrap();
+        let rows = backend.all_attestations_for(&agent_k).await.unwrap();
         assert_eq!(rows.len(), 1);
     }
 
@@ -44238,6 +43876,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(postgres)]
     async fn pg_put_attestation_rejects_invalid_cohort_scope() {
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
         let Some(dsn) = pg_dsn() else {
             eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
             return;
@@ -44283,7 +43922,7 @@ mod tests {
         }
         // Rejected before INSERT — no row leaked through.
         assert!(backend
-            .list_attestations_for(&agent_k)
+            .all_attestations_for(&agent_k)
             .await
             .unwrap()
             .is_empty());
@@ -44294,6 +43933,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(postgres)]
     async fn pg_put_attestation_accepts_self_cohort_scope() {
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
         let Some(dsn) = pg_dsn() else {
             eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
             return;
@@ -44330,7 +43970,7 @@ mod tests {
             .put_attestation(crate::federation::SignedAttestation { attestation: att })
             .await
             .unwrap();
-        let rows = backend.list_attestations_for(&agent_k).await.unwrap();
+        let rows = backend.all_attestations_for(&agent_k).await.unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].cohort_scope, "self");
     }
@@ -44383,6 +44023,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(postgres)]
     async fn pg_put_attestation_accepts_correlated_action_v1() {
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
         let Some(dsn) = pg_dsn() else {
             eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
             return;
@@ -44428,7 +44069,7 @@ mod tests {
             .put_attestation(crate::federation::SignedAttestation { attestation: att })
             .await
             .unwrap();
-        let rows = backend.list_attestations_for(&agent_k).await.unwrap();
+        let rows = backend.all_attestations_for(&agent_k).await.unwrap();
         assert_eq!(rows.len(), 1);
     }
 
@@ -44494,6 +44135,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(postgres)]
     async fn pg_put_attestation_admits_truth_grounding_cross_attestation() {
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
         // CC 3.4.8 (CIRISPersist#366) — a non-detector peer cross-checking a
         // detector verdict emits under the DISTINCT `truth_grounding:detection:*`
         // prefix, which is UNGATED (does not start with `detection:`).
@@ -44536,13 +44178,14 @@ mod tests {
             .put_attestation(crate::federation::SignedAttestation { attestation: att })
             .await
             .unwrap();
-        let rows = backend.list_attestations_for(&subj).await.unwrap();
+        let rows = backend.all_attestations_for(&subj).await.unwrap();
         assert_eq!(rows.len(), 1);
     }
 
     #[tokio::test]
     #[serial_test::serial(postgres)]
     async fn pg_put_attestation_exempts_structural_rename_chain() {
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
         let Some(dsn) = pg_dsn() else {
             eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
             return;
@@ -44584,7 +44227,7 @@ mod tests {
             .put_attestation(crate::federation::SignedAttestation { attestation: att })
             .await
             .unwrap();
-        let rows = backend.list_attestations_for(&agent_k).await.unwrap();
+        let rows = backend.all_attestations_for(&agent_k).await.unwrap();
         assert_eq!(rows.len(), 1);
     }
 
@@ -44630,6 +44273,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(postgres)]
     async fn pg_put_attestation_structural_dedup_silent_noop_on_replay() {
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
         let Some(dsn) = pg_dsn() else {
             eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
             return;
@@ -44678,7 +44322,7 @@ mod tests {
             .put_attestation(crate::federation::SignedAttestation { attestation: w2 })
             .await
             .unwrap();
-        let rows = backend.list_attestations_by(&steward).await.unwrap();
+        let rows = backend.all_attestations_by(&steward).await.unwrap();
         let withdraws_for_upstream: Vec<_> = rows
             .iter()
             .filter(|r| {
@@ -44699,6 +44343,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(postgres)]
     async fn pg_precedence_recants_wins_over_withdraws() {
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
         let Some(dsn) = pg_dsn() else {
             eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
             return;
@@ -44755,7 +44400,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let all = backend.list_attestations_by(&steward).await.unwrap();
+        let all = backend.all_attestations_by(&steward).await.unwrap();
         let group: Vec<_> = all
             .iter()
             .filter(|r| {
@@ -45731,6 +45376,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(postgres)]
     async fn pg_persist_row_hash_surfaces_on_federation_reads() {
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
         let Some(dsn) = pg_dsn() else {
             eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
             return;
@@ -45821,10 +45467,10 @@ mod tests {
         assert_eq!(k1.persist_row_hash, k2.persist_row_hash);
 
         // Attestations.
-        let att1 = backend.list_attestations_for(&target).await.unwrap();
+        let att1 = backend.all_attestations_for(&target).await.unwrap();
         assert_eq!(att1.len(), 1);
         assert_eq!(att1[0].persist_row_hash.len(), 64);
-        let att2 = backend.list_attestations_for(&target).await.unwrap();
+        let att2 = backend.all_attestations_for(&target).await.unwrap();
         assert_eq!(att1[0].persist_row_hash, att2[0].persist_row_hash);
 
         // Revocations.
@@ -48605,6 +48251,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(postgres)]
     async fn sweeper_emits_withdraws_on_eviction_pg() {
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
         let Some(dsn) = pg_dsn() else {
             eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
             return;
@@ -48692,7 +48339,7 @@ mod tests {
         // Confirm at least one withdraws row exists in PG
         // federation_attestations for this signer.
         let directory = engine.federation_directory();
-        let atts = directory.list_attestations_by(&derived).await.unwrap();
+        let atts = directory.all_attestations_by(&derived).await.unwrap();
         let withdraws_count = atts
             .iter()
             .filter(|a| a.attestation_type == crate::federation::types::attestation_type::WITHDRAWS)
@@ -49905,7 +49552,7 @@ mod tests {
             "PG upsert replaces on (occurrence, dimension)"
         );
         // AV-59: federation trust-read does not surface local rows.
-        let trust = crate::federation::FederationDirectory::list_attestations_for(&backend, &occ)
+        let trust = crate::federation::attestation_query::test_support::AllAttestations::all_attestations_for(&backend, &occ)
             .await
             .unwrap();
         assert!(trust.is_empty(), "local rows must not leak (AV-59)");

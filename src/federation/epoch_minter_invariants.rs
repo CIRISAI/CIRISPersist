@@ -105,6 +105,7 @@ pub(crate) mod bodies {
     where
         B: BlobStorage + FederationDirectory + Sync,
     {
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
         let r = l
             .engine_a
             .put_blob_scoped(COMMUNITY, Some(&l.comm), plaintext, None, None)
@@ -114,7 +115,7 @@ pub(crate) mod bodies {
         let sha = r.at_rest_sha256;
         let sa = l.ba.clone();
         let emitted: Vec<_> = sa
-            .list_attestations_by(&l.node_a)
+            .all_attestations_by(&l.node_a)
             .await
             .unwrap()
             .into_iter()

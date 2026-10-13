@@ -15428,6 +15428,7 @@ mod tests {
     #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn sweeper_emits_withdraws_on_eviction_sqlite() {
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
         let cfg = crate::federation::ReplicationConfig {
             storage_budget_bytes: 2 * 1024,
             steady_state_utilization: 0.5,
@@ -15447,7 +15448,7 @@ mod tests {
         // federation key_id, so query by that, not the bare alias.
         let derived = test_signer().derived_key_id();
         let directory = engine.federation_directory();
-        let atts = directory.list_attestations_by(&derived).await.unwrap();
+        let atts = directory.all_attestations_by(&derived).await.unwrap();
         let withdraws_count = atts
             .iter()
             .filter(|a| a.attestation_type == crate::federation::types::attestation_type::WITHDRAWS)
@@ -17095,6 +17096,7 @@ mod tests {
     #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn consent_sweep_enters_and_widens_node_rows_and_waits_for_actors() {
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
         use crate::federation::tier_ingest::test_support as ts;
         use crate::federation::types::{attestation_tier, attestation_type, cohort_scope};
         use crate::federation::FederationDirectory;
@@ -17148,7 +17150,7 @@ mod tests {
             "over the same bytes"
         );
         let widened: Vec<_> = sq
-            .list_attestations_by(&node)
+            .all_attestations_by(&node)
             .await
             .unwrap()
             .into_iter()
@@ -17218,6 +17220,7 @@ mod tests {
     #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn consent_sweep_widens_a_row_that_entered_before_the_grant() {
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
         use crate::federation::types::{attestation_type, cohort_scope};
         use crate::federation::FederationDirectory;
         let (engine, sq, node) = engine_with_registered_node("node-39g").await;
@@ -17242,7 +17245,7 @@ mod tests {
         );
         let _grant = emit_509_grant_audience(&engine, "peer-39g", &["trace:"], "federation").await;
         let sup: Vec<_> = sq
-            .list_attestations_by(&node)
+            .all_attestations_by(&node)
             .await
             .unwrap()
             .into_iter()
@@ -17268,6 +17271,7 @@ mod tests {
     #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn consent_sweep_widening_honors_strip_restrictions_510() {
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
         use crate::federation::types::{attestation_type, cohort_scope};
         use crate::federation::{envelope::paths, FederationDirectory};
         let (engine, sq, node) = engine_with_registered_node("node-39h").await;
@@ -17317,7 +17321,7 @@ mod tests {
             "the hook's widening already landed: {again:?}"
         );
         let sup: Vec<_> = sq
-            .list_attestations_by(&node)
+            .all_attestations_by(&node)
             .await
             .unwrap()
             .into_iter()
@@ -17586,6 +17590,7 @@ mod tests {
     #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn consent_sweep_promotes_covered_backlog_509() {
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
         use crate::federation::FederationDirectory;
 
         let signer = crate::federation::tier_ingest::test_support::local_signer("node-509a");
@@ -17627,7 +17632,7 @@ mod tests {
             "the crossing never changes the scope — it is one of the bytes"
         );
         let widened: Vec<_> = sq
-            .list_attestations_by(&derived)
+            .all_attestations_by(&derived)
             .await
             .unwrap()
             .into_iter()
@@ -17887,6 +17892,7 @@ mod tests {
     #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn promotion_applies_strip_field_510() {
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
         use crate::federation::FederationDirectory;
 
         let signer = crate::federation::tier_ingest::test_support::local_signer("node-510strip");
@@ -17957,7 +17963,7 @@ mod tests {
             .expect("the crossed row verifies over its own canonical");
 
         let sup = sq
-            .list_attestations_by(&derived)
+            .all_attestations_by(&derived)
             .await
             .unwrap()
             .into_iter()
@@ -18359,6 +18365,7 @@ mod tests {
     #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn assemble_attestation_self_does_not_store_and_the_door_admits_it() {
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
         use crate::federation::types::attestation_type::SCORES;
         use crate::federation::FederationDirectory;
 
@@ -18391,7 +18398,7 @@ mod tests {
                 .await
                 .expect("assemble");
         }
-        let held = sq.list_attestations_by(&derived).await.expect("list");
+        let held = sq.all_attestations_by(&derived).await.expect("list");
         assert_eq!(
             held.len(),
             0,
@@ -18409,7 +18416,7 @@ mod tests {
         sq.put_attestation(assembled)
             .await
             .expect("the ordinary door must admit an assembled row unmodified");
-        let held = sq.list_attestations_by(&derived).await.expect("list");
+        let held = sq.all_attestations_by(&derived).await.expect("list");
         assert_eq!(held.len(), 1, "exactly the row we put");
         assert_eq!(held[0].attestation_id, id);
         assert!(
@@ -19006,6 +19013,7 @@ mod tests {
     #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn grant_delegation_stores_edge_under_derived_key_id_sqlite() {
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
         use crate::federation::FederationDirectory;
         let signer = crate::federation::tier_ingest::test_support::local_signer("granter");
         let derived = signer.derived_key_id();
@@ -19041,7 +19049,7 @@ mod tests {
         assert_eq!(row.scrub_key_id, derived, "scrub == derived (#247)");
         assert_eq!(row.attested_key_id, "delegate", "edge keyed by recipient");
         // Stored + listable by the signer's derived id.
-        let by = sq.list_attestations_by(&derived).await.unwrap();
+        let by = sq.all_attestations_by(&derived).await.unwrap();
         assert!(by.iter().any(|a| a.attestation_id == att_id));
     }
 

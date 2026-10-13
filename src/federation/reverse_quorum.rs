@@ -787,7 +787,7 @@ pub enum ObjectionRefusalReason {
     /// The row's `attested_key_id` is not the objected-to action's AUTHOR.
     ///
     /// Objections and dismissals are found by
-    /// [`list_attestations_for`](super::FederationDirectory::list_attestations_for)`(action.attesting_key_id)`,
+    /// [`list_attestations_for`](crate::federation::attestation_query::AttestationQuery::to)`(action.attesting_key_id)`,
     /// so a row filed against any other key would be stored and then never
     /// counted by anything — admitted, durable, and permanently inert. Refused
     /// instead: the preserve set must equal the verified set, and a marker
@@ -4583,6 +4583,7 @@ pub(crate) mod test_support {
     /// :2/5` separates them — reversal 2, dismissal 3 — so the witness itself
     /// fails if reversal is ever floored at a strict majority.
     pub(crate) async fn exercise_reverse_quorum(dir: &dyn FederationDirectory, suffix: &str) {
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
         let alice = format!("rq-alice-{suffix}");
         let bob = format!("rq-bob-{suffix}");
         let carol = format!("rq-carol-{suffix}");
@@ -4911,11 +4912,7 @@ pub(crate) mod test_support {
         .await
         .expect("peer action");
         let mut replicated = 0usize;
-        for r in dir
-            .list_attestations_for(&actor)
-            .await
-            .expect("origin rows")
-        {
+        for r in dir.all_attestations_for(&actor).await.expect("origin rows") {
             if r.attestation_id == action_id {
                 continue;
             }
@@ -5109,6 +5106,7 @@ pub(crate) mod test_support {
         dir: &dyn FederationDirectory,
         suffix: &str,
     ) {
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
         let founder = format!("esc-founder-{suffix}");
         let members: Vec<String> = (0..7).map(|i| format!("esc-m{i}-{suffix}")).collect();
         // The actor is a MEMBER — the recusal cases only exist when the person
@@ -5562,11 +5560,7 @@ pub(crate) mod test_support {
         .await
         .expect("peer community");
         let mut replicated = 0usize;
-        for r in dir
-            .list_attestations_for(&actor)
-            .await
-            .expect("origin rows")
-        {
+        for r in dir.all_attestations_for(&actor).await.expect("origin rows") {
             peer.put_attestation(SignedAttestation {
                 attestation: r.clone(),
             })

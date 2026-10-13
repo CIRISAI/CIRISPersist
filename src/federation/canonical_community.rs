@@ -3945,6 +3945,7 @@ pub(crate) mod v53_1_6_reference {
     where
         F: FederationDirectory + ?Sized,
     {
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
         let is_charter = |a: &crate::federation::Attestation| {
             a.attestation_type == crate::federation::types::attestation_type::DELEGATES_TO
                 && a.attested_key_id == family
@@ -3953,7 +3954,7 @@ pub(crate) mod v53_1_6_reference {
                     crate::federation::trust_root::TRUST_CHARTER_DIMENSION,
                 )
         };
-        let rows = directory.list_attestations_for(family).await?;
+        let rows = directory.all_attestations_for(family).await?;
         let refs: Vec<&crate::federation::Attestation> = rows.iter().collect();
         let retired = crate::federation::precedence::retired_ids(&refs);
         let denied = crate::federation::trust_root::direction_denied_ids(

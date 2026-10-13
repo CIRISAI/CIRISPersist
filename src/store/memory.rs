@@ -118,16 +118,14 @@ pub struct MemoryBackend {
     /// for) would be an immediate cross-test flake. Always on; the limit is
     /// a substrate constant, not an operator knob.
     peer_write_quota: crate::federation::replication::admission::PeerWriteQuota,
-    /// (CIRISPersist#593) — how many times has
-    /// [`FederationDirectory::list_attestations_by`] been called on this
-    /// instance? See [`MemoryBackend::attestation_read_counts`]; this exists so
-    /// a walk's read cost can be **measured** rather than estimated.
-    ///
-    /// [`FederationDirectory::list_attestations_by`]: crate::federation::FederationDirectory::list_attestations_by
+    /// (CIRISPersist#593) — how many attestation read statements pinned on an
+    /// ATTESTER this instance has run. v56.0.0 (CIRISPersist#1001): one per
+    /// executed typed query (one per page) whose `by` is set, the reads
+    /// `list_attestations_by` made before it was retired. See
+    /// [`MemoryBackend::attestation_read_counts`]; this exists so a walk's read
+    /// cost can be **measured** rather than estimated.
     attestation_reads_by: std::sync::atomic::AtomicU64,
-    /// (CIRISPersist#593) — the [`list_attestations_for`] twin.
-    ///
-    /// [`list_attestations_for`]: crate::federation::FederationDirectory::list_attestations_for
+    /// (CIRISPersist#593) — the twin: typed queries whose `to` is set.
     attestation_reads_for: std::sync::atomic::AtomicU64,
 }
 
@@ -5213,121 +5211,6 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         })
     }
 
-    async fn list_attestations_for(
-        &self,
-        attested_key_id: &str,
-    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
-        self.attestation_reads_for
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let state = self.state.lock().expect("memory backend lock");
-        let mut rows: Vec<_> = state
-            .federation_attestations
-            .iter()
-            .filter(|a| {
-                a.attested_key_id == attested_key_id
-                    && a.tier == crate::federation::types::attestation_tier::FEDERATION
-            })
-            .cloned()
-            .collect();
-        // Match postgres ORDER BY asserted_at DESC.
-        rows.sort_by_key(|a| std::cmp::Reverse(a.asserted_at));
-        crate::observe::record_read(
-            crate::observe::StoreBackend::Memory,
-            crate::observe::Door::ListAttestationsFor,
-            attested_key_id,
-            &rows,
-            0,
-        );
-        Ok(rows)
-    }
-
-    async fn list_attestations_by(
-        &self,
-        attesting_key_id: &str,
-    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
-        self.attestation_reads_by
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let state = self.state.lock().expect("memory backend lock");
-        let mut rows: Vec<_> = state
-            .federation_attestations
-            .iter()
-            .filter(|a| {
-                a.attesting_key_id == attesting_key_id
-                    && a.tier == crate::federation::types::attestation_tier::FEDERATION
-            })
-            .cloned()
-            .collect();
-        rows.sort_by_key(|a| std::cmp::Reverse(a.asserted_at));
-        crate::observe::record_read(
-            crate::observe::StoreBackend::Memory,
-            crate::observe::Door::ListAttestationsBy,
-            attesting_key_id,
-            &rows,
-            0,
-        );
-        Ok(rows)
-    }
-
-    /// v53.1.5 — the same predicate the SQL backends seek: top-level
-    /// envelope `dimension`, byte prefix.
-    async fn list_attestations_by_dimension_prefix(
-        &self,
-        attesting_key_id: &str,
-        dimension_prefix: &str,
-    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
-        let state = self.state.lock().expect("memory backend lock");
-        let mut rows: Vec<_> = state
-            .federation_attestations
-            .iter()
-            .filter(|a| {
-                a.attesting_key_id == attesting_key_id
-                    && a.tier == crate::federation::types::attestation_tier::FEDERATION
-                    && crate::federation::admission::envelope_dimension(&a.attestation_envelope)
-                        .is_some_and(|d| d.starts_with(dimension_prefix))
-            })
-            .cloned()
-            .collect();
-        rows.sort_by_key(|a| std::cmp::Reverse(a.asserted_at));
-        crate::observe::record_read(
-            crate::observe::StoreBackend::Memory,
-            crate::observe::Door::ListAttestationsByDimensionPrefix,
-            attesting_key_id,
-            &rows,
-            0,
-        );
-        Ok(rows)
-    }
-
-    async fn list_attestations_for_dimension_prefix(
-        &self,
-        attested_key_id: &str,
-        attesting_key_id: Option<&str>,
-        dimension_prefix: &str,
-    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
-        let state = self.state.lock().expect("memory backend lock");
-        let mut rows: Vec<_> = state
-            .federation_attestations
-            .iter()
-            .filter(|a| {
-                a.attested_key_id == attested_key_id
-                    && a.tier == crate::federation::types::attestation_tier::FEDERATION
-                    && attesting_key_id.is_none_or(|k| a.attesting_key_id == k)
-                    && crate::federation::admission::envelope_dimension(&a.attestation_envelope)
-                        .is_some_and(|d| d.starts_with(dimension_prefix))
-            })
-            .cloned()
-            .collect();
-        rows.sort_by_key(|a| std::cmp::Reverse(a.asserted_at));
-        crate::observe::record_read(
-            crate::observe::StoreBackend::Memory,
-            crate::observe::Door::ListAttestationsForDimensionPrefix,
-            attested_key_id,
-            &rows,
-            0,
-        );
-        Ok(rows)
-    }
-
     async fn list_composers_referencing_any(
         &self,
         target_attestation_ids: &[String],
@@ -5362,124 +5245,6 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             crate::observe::StoreBackend::Memory,
             crate::observe::Door::ListComposersReferencingAny,
             attested_key_id.or(attesting_key_id).unwrap_or("*"),
-            &rows,
-            0,
-        );
-        Ok(rows)
-    }
-
-    async fn list_attestations_for_type(
-        &self,
-        attested_key_id: &str,
-        attestation_type: &str,
-    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
-        let state = self.state.lock().expect("memory backend lock");
-        let mut rows: Vec<_> = state
-            .federation_attestations
-            .iter()
-            .filter(|a| {
-                a.attested_key_id == attested_key_id
-                    && a.attestation_type == attestation_type
-                    && a.tier == crate::federation::types::attestation_tier::FEDERATION
-            })
-            .cloned()
-            .collect();
-        rows.sort_by_key(|a| std::cmp::Reverse(a.asserted_at));
-        crate::observe::record_read(
-            crate::observe::StoreBackend::Memory,
-            crate::observe::Door::ListAttestationsForType,
-            attested_key_id,
-            &rows,
-            0,
-        );
-        Ok(rows)
-    }
-
-    async fn list_attestations_by_type(
-        &self,
-        attesting_key_id: &str,
-        attestation_type: &str,
-    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
-        let state = self.state.lock().expect("memory backend lock");
-        let mut rows: Vec<_> = state
-            .federation_attestations
-            .iter()
-            .filter(|a| {
-                a.attesting_key_id == attesting_key_id
-                    && a.attestation_type == attestation_type
-                    && a.tier == crate::federation::types::attestation_tier::FEDERATION
-            })
-            .cloned()
-            .collect();
-        rows.sort_by_key(|a| std::cmp::Reverse(a.asserted_at));
-        crate::observe::record_read(
-            crate::observe::StoreBackend::Memory,
-            crate::observe::Door::ListAttestationsByType,
-            attesting_key_id,
-            &rows,
-            0,
-        );
-        Ok(rows)
-    }
-
-    async fn list_attestations_for_types(
-        &self,
-        attested_key_id: &str,
-        attestation_types: &[&str],
-        excluded_dimensions: &[&str],
-    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
-        let state = self.state.lock().expect("memory backend lock");
-        let mut rows: Vec<_> = state
-            .federation_attestations
-            .iter()
-            .filter(|a| {
-                a.attested_key_id == attested_key_id
-                    && a.tier == crate::federation::types::attestation_tier::FEDERATION
-                    && crate::federation::types_and_dimension_admit(
-                        a,
-                        attestation_types,
-                        excluded_dimensions,
-                    )
-            })
-            .cloned()
-            .collect();
-        rows.sort_by_key(|a| std::cmp::Reverse(a.asserted_at));
-        crate::observe::record_read(
-            crate::observe::StoreBackend::Memory,
-            crate::observe::Door::ListAttestationsForTypes,
-            attested_key_id,
-            &rows,
-            0,
-        );
-        Ok(rows)
-    }
-
-    async fn list_attestations_by_types(
-        &self,
-        attesting_key_id: &str,
-        attestation_types: &[&str],
-        excluded_dimensions: &[&str],
-    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
-        let state = self.state.lock().expect("memory backend lock");
-        let mut rows: Vec<_> = state
-            .federation_attestations
-            .iter()
-            .filter(|a| {
-                a.attesting_key_id == attesting_key_id
-                    && a.tier == crate::federation::types::attestation_tier::FEDERATION
-                    && crate::federation::types_and_dimension_admit(
-                        a,
-                        attestation_types,
-                        excluded_dimensions,
-                    )
-            })
-            .cloned()
-            .collect();
-        rows.sort_by_key(|a| std::cmp::Reverse(a.asserted_at));
-        crate::observe::record_read(
-            crate::observe::StoreBackend::Memory,
-            crate::observe::Door::ListAttestationsByTypes,
-            attesting_key_id,
             &rows,
             0,
         );
@@ -15695,6 +15460,7 @@ mod tests {
     /// (a) delegates_to → node key with ONLY infra:* scopes → ADMITTED.
     #[tokio::test]
     async fn node_delegation_infra_only_admitted() {
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
         use crate::federation::types::delegation_scope as ds;
         let backend = MemoryBackend::new();
         bootstrap_node_agency(&backend).await;
@@ -15710,7 +15476,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let stored = backend.list_attestations_for("node-key").await.unwrap();
+        let stored = backend.all_attestations_for("node-key").await.unwrap();
         assert_eq!(stored.len(), 1);
         assert_eq!(stored[0].attestation_id, "d-infra");
     }
@@ -15789,6 +15555,7 @@ mod tests {
 
     #[tokio::test]
     async fn node_delegation_agency_rejected_not_stored() {
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
         use crate::federation::types::delegation_scope as ds;
         let backend = MemoryBackend::new();
         bootstrap_node_agency(&backend).await;
@@ -15820,7 +15587,7 @@ mod tests {
         assert_eq!(err.kind(), "federation_node_agency_forbidden");
         // Not stored (verify-before-mutation).
         assert!(backend
-            .list_attestations_for("node-key")
+            .all_attestations_for("node-key")
             .await
             .unwrap()
             .is_empty());
@@ -15830,6 +15597,7 @@ mod tests {
     /// kind (`act_on_behalf`) → REJECTED.
     #[tokio::test]
     async fn node_delegation_legacy_agency_rejected() {
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
         use crate::federation::self_at_login::SCOPE_ACT_ON_BEHALF;
         let backend = MemoryBackend::new();
         bootstrap_node_agency(&backend).await;
@@ -15850,7 +15618,7 @@ mod tests {
             crate::federation::Error::NodeAgencyForbidden { .. }
         ));
         assert!(backend
-            .list_attestations_for("node-key")
+            .all_attestations_for("node-key")
             .await
             .unwrap()
             .is_empty());
@@ -15880,6 +15648,7 @@ mod tests {
     /// The gate ONLY constrains node recipients — no over-reject.
     #[tokio::test]
     async fn agent_delegation_agency_admitted_not_over_rejected() {
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
         use crate::federation::types::delegation_scope as ds;
         let backend = MemoryBackend::new();
         bootstrap_node_agency(&backend).await;
@@ -15895,7 +15664,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let stored = backend.list_attestations_for("agent-key").await.unwrap();
+        let stored = backend.all_attestations_for("agent-key").await.unwrap();
         assert_eq!(stored.len(), 1);
         assert_eq!(stored[0].attestation_id, "d-agent");
     }
@@ -15907,6 +15676,7 @@ mod tests {
     /// the `parse_set` non-dedup bypass (CC 3.4.7.3 / CC 4.4.3.4.3).
     #[tokio::test]
     async fn node_delegation_agency_rejected_with_duplicate_identity_type_token() {
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
         use crate::federation::types::delegation_scope as ds;
         use crate::federation::types::identity_type;
         for (key_id, dup_ity) in [("node-dup", "node,node"), ("node-ws", "node, node")] {
@@ -15949,7 +15719,7 @@ mod tests {
             );
             assert_eq!(err.kind(), "federation_node_agency_forbidden");
             assert!(backend
-                .list_attestations_for(key_id)
+                .all_attestations_for(key_id)
                 .await
                 .unwrap()
                 .is_empty());
@@ -15979,6 +15749,7 @@ mod tests {
     /// asserts that a key with NO node role still carries agency freely.
     #[tokio::test]
     async fn node_agent_hybrid_carries_agency_admitted() {
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
         use crate::federation::types::delegation_scope as ds;
         use crate::federation::types::identity_type;
         let backend = MemoryBackend::new();
@@ -16014,7 +15785,7 @@ mod tests {
                  amendment closes.",
             );
         // Verify-before-mutation: the refusal leaves NO trace.
-        let stored = backend.list_attestations_for("node-agent").await.unwrap();
+        let stored = backend.all_attestations_for("node-agent").await.unwrap();
         assert!(
             stored.is_empty(),
             "#773: a refused delegation must not be stored — the gate runs before the row \
@@ -16193,6 +15964,7 @@ mod tests {
     /// non-empty (the server computed it on the put).
     #[tokio::test]
     async fn persist_row_hash_surfaces_on_federation_reads() {
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
         use crate::federation::FederationDirectory;
         let backend = MemoryBackend::new();
         backend
@@ -16237,13 +16009,13 @@ mod tests {
         );
 
         // Attestations.
-        let att1 = backend.list_attestations_for("k-target").await.unwrap();
+        let att1 = backend.all_attestations_for("k-target").await.unwrap();
         assert_eq!(att1.len(), 1);
         assert!(
             !att1[0].persist_row_hash.is_empty(),
             "attestation row_hash empty"
         );
-        let att2 = backend.list_attestations_for("k-target").await.unwrap();
+        let att2 = backend.all_attestations_for("k-target").await.unwrap();
         assert_eq!(att1[0].persist_row_hash, att2[0].persist_row_hash);
 
         // Revocations.
@@ -16729,6 +16501,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_attestations_for_and_by() {
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
         let backend = MemoryBackend::new();
         // Bootstrap: registry-steward, two primitives, three attestations.
         backend
@@ -16774,13 +16547,13 @@ mod tests {
 
         // Two attestations from registry-steward.
         let by = backend
-            .list_attestations_by("registry-steward")
+            .all_attestations_by("registry-steward")
             .await
             .unwrap();
         assert_eq!(by.len(), 2);
 
         // One attestation FOR k-a.
-        let for_a = backend.list_attestations_for("k-a").await.unwrap();
+        let for_a = backend.all_attestations_for("k-a").await.unwrap();
         assert_eq!(for_a.len(), 1);
         assert_eq!(for_a[0].attestation_id, "att-1");
     }
@@ -16942,6 +16715,7 @@ mod tests {
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     #[tokio::test]
     async fn attach_pqc_for_attestation_and_revocation() {
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
         let backend = MemoryBackend::new();
         backend
             .put_public_key(SignedKeyRecord {
@@ -16965,7 +16739,7 @@ mod tests {
             .attach_attestation_pqc_signature("att-1", "att-pqc-sig")
             .await
             .unwrap();
-        let atts = backend.list_attestations_for("k-target").await.unwrap();
+        let atts = backend.all_attestations_for("k-target").await.unwrap();
         assert!(atts[0].is_pqc_complete());
         grant_slash(&backend, "steward").await;
 
@@ -17579,6 +17353,7 @@ mod tests {
 
     #[tokio::test]
     async fn memory_put_attestation_structural_dedup_silent_noop() {
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
         let backend = MemoryBackend::new();
         backend
             .put_public_key(SignedKeyRecord {
@@ -17611,7 +17386,7 @@ mod tests {
             .await
             .unwrap();
         let rows = backend
-            .list_attestations_for("registry-steward")
+            .all_attestations_for("registry-steward")
             .await
             .unwrap();
         let composers: Vec<_> = rows
@@ -21782,6 +21557,7 @@ mod tests {
     /// emitted an `identity:canonical_binding:{H}` self-assertion.
     #[tokio::test]
     async fn canonical_binding_widens_withdraws_rule2() {
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
         let backend = MemoryBackend::new();
         for k in ["registry-steward", "K", "producer"] {
             backend
@@ -21862,7 +21638,7 @@ mod tests {
             })
             .await
             .expect("post-binding withdraws admits");
-        let rows = backend.list_attestations_by("K").await.unwrap();
+        let rows = backend.all_attestations_by("K").await.unwrap();
         let w = rows
             .iter()
             .find(|r| r.attestation_id == "W-post")

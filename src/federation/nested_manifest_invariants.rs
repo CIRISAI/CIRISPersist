@@ -413,6 +413,7 @@ pub(crate) mod bodies {
     where
         B: BlobStorage + FederationDirectory + Sync + 'static,
     {
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
         let p = pair(dsn_a, dsn_b, run, pick, "i207").await;
         let stream = format!("i207-{run}");
         write_self(&p.a, &p.owner, &stream, 3).await;
@@ -447,7 +448,7 @@ pub(crate) mod bodies {
         // CC 3 — the sets already emitted stay: no withdraws was written.
         assert!(
             !p.sa
-                .list_attestations_by(&p.key_a)
+                .all_attestations_by(&p.key_a)
                 .await
                 .unwrap()
                 .iter()

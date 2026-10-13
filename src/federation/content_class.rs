@@ -144,7 +144,7 @@ pub fn is_withdrawal(att: &Attestation) -> bool {
 ///
 /// See the [module docs](self) for the asymmetry this implements and why it is
 /// asymmetric. The backing read is
-/// [`list_attestations_for`](FederationDirectory::list_attestations_for)
+/// [`list_attestations_for`](crate::federation::attestation_query::AttestationQuery::to)
 /// (`attested_key_id = subject`), the same about-subject read the trust walk
 /// itself uses, so there is one notion of "rows about this subject" rather than
 /// two that can drift.

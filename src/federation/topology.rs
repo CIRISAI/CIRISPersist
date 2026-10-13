@@ -21,8 +21,8 @@
 //! # Why these don't live on the [`FederationDirectory`] trait
 //!
 //! The three aggregates compose on top of the trait's CRUD surface
-//! ([`FederationDirectory::list_attestations_by`] /
-//! [`FederationDirectory::list_attestations_for`] /
+//! ([`AttestationQuery::by`](crate::federation::attestation_query::AttestationQuery::by) /
+//! [`AttestationQuery::to`](crate::federation::attestation_query::AttestationQuery::to) /
 //! [`FederationDirectory::lookup_public_key`]) and the
 //! [`crate::audit::AuditService`] surface. They don't add new
 //! backend-level SQL; they're pure aggregations over what already
@@ -50,8 +50,8 @@ use super::{Attestation, Error, FederationDirectory, KeyRecord};
 /// Filter for [`build_trust_topology`]. At least one of `granter_key`
 /// or `grantee_key` MUST be set — the [`FederationDirectory`] trait
 /// only exposes per-key attestation lookups
-/// ([`FederationDirectory::list_attestations_by`] /
-/// [`FederationDirectory::list_attestations_for`]), so a full
+/// ([`AttestationQuery::by`](crate::federation::attestation_query::AttestationQuery::by) /
+/// [`AttestationQuery::to`](crate::federation::attestation_query::AttestationQuery::to)), so a full
 /// "enumerate everything" mode would force a schema-level scan we
 /// don't want to surface on a UI hot path.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -163,8 +163,8 @@ pub struct TrustTopology {
 /// # Algorithm
 ///
 /// 1. Fetch attestations either by `granter_key` (via
-///    [`FederationDirectory::list_attestations_by`]) or by
-///    `grantee_key` (via [`FederationDirectory::list_attestations_for`]).
+///    [`AttestationQuery::by`](crate::federation::attestation_query::AttestationQuery::by)) or by
+///    `grantee_key` (via [`AttestationQuery::to`](crate::federation::attestation_query::AttestationQuery::to)).
 ///    If both are set, the granter-side fetch is used and the
 ///    grantee filter is applied in-memory.
 /// 2. Bucket by `(attesting_key_id, attested_key_id, dimension)`.
@@ -459,7 +459,7 @@ pub fn effective_delegation_depth(requested: Option<usize>) -> usize {
 /// 1. Queue `(from_key, 0)`. Maintain a `visited` set keyed on
 ///    granter key.
 /// 2. For each `(current, depth)` dequeued: call
-///    [`FederationDirectory::list_attestations_by`]`(current)`.
+///    [`AttestationQuery::by`](crate::federation::attestation_query::AttestationQuery::by)`(current)`.
 /// 3. Partition into `delegates_to` (out-edges) and `withdraws` /
 ///    `recants` (annotations).
 /// 4. For each `delegates_to` row at `depth < max_depth`: emit a
@@ -623,7 +623,7 @@ impl DelegateStanding {
 /// # Why this is not [`build_delegation_graph`]
 ///
 /// The graph builder is a UI aggregate: an unbounded BFS that issues one
-/// [`FederationDirectory::list_attestations_by`] per visited key and returns
+/// [`AttestationQuery::by`](crate::federation::attestation_query::AttestationQuery::by) per visited key and returns
 /// every edge it finds so a consumer can render them. Used as an authority
 /// predicate it is wrong twice over. It costs a whole traversal per admitted
 /// row to answer a one-hop question, and — decisively — its

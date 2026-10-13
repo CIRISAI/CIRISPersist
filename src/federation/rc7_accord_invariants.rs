@@ -558,6 +558,7 @@ pub(crate) mod bodies {
         d: &dyn FederationDirectory,
         tag: &str,
     ) {
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
         let e = rotate_the_edge(d, tag).await;
         let roots = trusted_roots_of(d, &e.user, chrono::Utc::now())
             .await
@@ -569,7 +570,7 @@ pub(crate) mod bodies {
         );
         // The transit candidate set reaches the successor's root (each
         // candidate is then judged by `trust_root_valid`, I437).
-        let by_user = d.list_attestations_by(&e.user).await.unwrap();
+        let by_user = d.all_attestations_by(&e.user).await.unwrap();
         let candidates: Vec<String> = crate::federation::trust_root::transit_candidate_roots(
             &by_user,
             &e.user,

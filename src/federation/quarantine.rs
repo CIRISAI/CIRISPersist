@@ -161,7 +161,7 @@ pub const NAMESPACE_FAMILY: &str = "quarantine:{state}";
 pub mod field {
     /// The `federation_keys.key_id` being withheld / released. Also the
     /// marker's `attested_key_id`, so one existing read
-    /// ([`list_attestations_for`](crate::federation::FederationDirectory::list_attestations_for))
+    /// ([`list_attestations_for`](crate::federation::attestation_query::AttestationQuery::to))
     /// finds every marker about a key.
     pub const QUARANTINES: &str = "quarantines_key_id";
     /// The community whose named moderators are the `slash` duty-holder roots.

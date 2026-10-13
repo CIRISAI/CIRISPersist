@@ -2682,17 +2682,6 @@ pub fn first_evidence_ref(envelope: &serde_json::Value) -> Option<&str> {
         .and_then(serde_json::Value::as_str)
 }
 
-/// v53.1.7 — the predicate of [`FederationDirectory::list_attestations_for_types`]
-/// / `_by_types`, as the memory backend and the default bodies compute it:
-/// the row's type is one of `types`, and its top-level envelope `dimension`
-/// (a string; anything else is no dimension) is none of `excluded`.
-#[must_use]
-pub fn types_and_dimension_admit(a: &Attestation, types: &[&str], excluded: &[&str]) -> bool {
-    types.contains(&a.attestation_type.as_str())
-        && !admission::envelope_dimension(&a.attestation_envelope)
-            .is_some_and(|d| excluded.contains(&d))
-}
-
 /// v53.1.6 — V150's `cohort_target` as the memory backend and the default
 /// bodies compute it: the first present of `community_id`,
 /// `community_key_id`, `cohort_key_id`, `family_key_id` (the generated
@@ -3511,69 +3500,6 @@ pub trait FederationDirectory: Send + Sync {
         q: &attestation_query::AttestationQuery,
     ) -> Result<attestation_query::QueryRows, Error>;
 
-    /// All attestations targeting `attested_key_id` (consumer asks
-    /// "who vouches for K?"). Ordered by `asserted_at` DESC.
-    async fn list_attestations_for(&self, attested_key_id: &str)
-        -> Result<Vec<Attestation>, Error>;
-
-    /// All attestations issued by `attesting_key_id` (consumer asks
-    /// "which keys does K vouch for?"). Ordered by `asserted_at` DESC.
-    async fn list_attestations_by(&self, attesting_key_id: &str)
-        -> Result<Vec<Attestation>, Error>;
-
-    /// v53.1.5 — the federation-tier rows `attesting_key_id` authored whose
-    /// envelope `dimension` starts with `dimension_prefix` (a byte prefix —
-    /// the #817/#818 half-open range, never `LIKE`). Ordered by `asserted_at`
-    /// DESC. The bounded read behind
-    /// [`replication_audience::owner_allow_list`]: an owner's
-    /// `consent:replication:v1` grants without every row the owner ever
-    /// authored. Served by V137's `(attesting_key_id, dimension)`.
-    async fn list_attestations_by_dimension_prefix(
-        &self,
-        attesting_key_id: &str,
-        dimension_prefix: &str,
-    ) -> Result<Vec<Attestation>, Error> {
-        // Pin-compatible default: today's semantics over the unbounded read.
-        // memory / sqlite / postgres override with the indexed seek.
-        Ok(self
-            .list_attestations_by(attesting_key_id)
-            .await?
-            .into_iter()
-            .filter(|a| {
-                admission::envelope_dimension(&a.attestation_envelope)
-                    .is_some_and(|d| d.starts_with(dimension_prefix))
-            })
-            .collect())
-    }
-
-    /// v53.1.5 — the federation-tier rows attested TO `attested_key_id`
-    /// whose envelope `dimension` starts with `dimension_prefix`, optionally
-    /// only those `attesting_key_id` authored. Ordered by `asserted_at` DESC.
-    /// The bounded read behind the consent fold
-    /// ([`consent::scoped_fold_rows`]: a principal's `consent:state:*` rows
-    /// about the target) and [`replication_audience::is_public_group`] (a
-    /// group's `trust:charter:v1` rows). Served by V178's
-    /// `(attested_key_id, dimension)`.
-    async fn list_attestations_for_dimension_prefix(
-        &self,
-        attested_key_id: &str,
-        attesting_key_id: Option<&str>,
-        dimension_prefix: &str,
-    ) -> Result<Vec<Attestation>, Error> {
-        // Pin-compatible default: today's semantics over the unbounded read.
-        // memory / sqlite / postgres override with the indexed seek.
-        Ok(self
-            .list_attestations_for(attested_key_id)
-            .await?
-            .into_iter()
-            .filter(|a| {
-                attesting_key_id.is_none_or(|k| a.attesting_key_id == k)
-                    && admission::envelope_dimension(&a.attestation_envelope)
-                        .is_some_and(|d| d.starts_with(dimension_prefix))
-            })
-            .collect())
-    }
-
     /// v53.1.5 — every federation-tier STRUCTURAL COMPOSER (`withdraws` /
     /// `recants` / `supersedes`) whose envelope `references_attestation_id`
     /// names one of `target_attestation_ids`, optionally only those attested
@@ -3610,110 +3536,19 @@ pub trait FederationDirectory: Send + Sync {
         Ok(out)
     }
 
-    /// v53.1.6 — the federation-tier rows attested TO `attested_key_id`
-    /// whose `attestation_type` is `attestation_type` (a `delegates_to`
-    /// subject's incoming edges; a subject's `withdraws` / `recants`).
-    /// Ordered by `asserted_at` DESC. Served by V178's
-    /// `(attested_key_id, attestation_type, …)` prefix. Pin-compatible
-    /// default over the unbounded read; every backend overrides.
-    async fn list_attestations_for_type(
-        &self,
-        attested_key_id: &str,
-        attestation_type: &str,
-    ) -> Result<Vec<Attestation>, Error> {
-        Ok(self
-            .list_attestations_for(attested_key_id)
-            .await?
-            .into_iter()
-            .filter(|a| a.attestation_type == attestation_type)
-            .collect())
-    }
-
-    /// v53.1.6 — the federation-tier rows `attesting_key_id` authored whose
-    /// `attestation_type` is `attestation_type` (a steward's outgoing
-    /// `delegates_to` edges — the candidates of [`admission::nodes_owned_by`]
-    /// and [`admission::nodes_stewarded_by`]). Ordered by `asserted_at` DESC.
-    /// Served by V107's `(attesting_key_id, attestation_type, …)` prefix.
-    /// Pin-compatible default over the unbounded read; every backend
-    /// overrides.
-    async fn list_attestations_by_type(
-        &self,
-        attesting_key_id: &str,
-        attestation_type: &str,
-    ) -> Result<Vec<Attestation>, Error> {
-        Ok(self
-            .list_attestations_by(attesting_key_id)
-            .await?
-            .into_iter()
-            .filter(|a| a.attestation_type == attestation_type)
-            .collect())
-    }
-
-    /// v53.1.7 — the federation-tier rows attested TO `attested_key_id` whose
-    /// `attestation_type` is one of `attestation_types` and whose envelope
-    /// `dimension` is NOT one of `excluded_dimensions` (absent and non-string
-    /// dimensions are kept). Ordered by `asserted_at` DESC. The bounded read
-    /// behind the trust-root walks: a subject's conferrals or a root's
-    /// charters without every trust edge naming it (`excluded_dimensions` =
-    /// the `trust:{job}` labels the predicate refuses). Served by V178's
-    /// `(attested_key_id, attestation_type, …)` prefix. Pin-compatible default
-    /// over the unbounded read; every backend overrides.
-    async fn list_attestations_for_types(
-        &self,
-        attested_key_id: &str,
-        attestation_types: &[&str],
-        excluded_dimensions: &[&str],
-    ) -> Result<Vec<Attestation>, Error> {
-        Ok(self
-            .list_attestations_for(attested_key_id)
-            .await?
-            .into_iter()
-            .filter(|a| types_and_dimension_admit(a, attestation_types, excluded_dimensions))
-            .collect())
-    }
-
-    /// v53.1.7 — the federation-tier rows `attesting_key_id` authored, typed
-    /// and dimension-filtered as [`Self::list_attestations_for_types`]. Ordered
-    /// by `asserted_at` DESC. A user's or a node's trust edges without its
-    /// whole history. Served by V107's `(attesting_key_id, attestation_type,
-    /// …)` prefix. Pin-compatible default over the unbounded read; every
-    /// backend overrides.
-    async fn list_attestations_by_types(
-        &self,
-        attesting_key_id: &str,
-        attestation_types: &[&str],
-        excluded_dimensions: &[&str],
-    ) -> Result<Vec<Attestation>, Error> {
-        Ok(self
-            .list_attestations_by(attesting_key_id)
-            .await?
-            .into_iter()
-            .filter(|a| types_and_dimension_admit(a, attestation_types, excluded_dimensions))
-            .collect())
-    }
-
     /// v53.1.6 — the federation-tier rows `attesting_key_id` authored under
     /// exactly `dimension` whose envelope's `evidence_refs` FIRST element is
     /// `evidence_ref` — a device's `custody:ack:v1` reports about one blob.
     /// Ordered by `asserted_at` DESC. Served by V180's
-    /// `(attesting_key_id, dimension, evidence_refs[0])`. Pin-compatible
-    /// default over the dimension read; every backend overrides.
+    /// `(attesting_key_id, dimension, evidence_refs[0])`. v56.0.0
+    /// (CIRISPersist#1001): required — its default composed over a retired
+    /// dimension read, and no default may read wider than its own query.
     async fn list_attestations_by_dimension_citing(
         &self,
         attesting_key_id: &str,
         dimension: &str,
         evidence_ref: &str,
-    ) -> Result<Vec<Attestation>, Error> {
-        Ok(self
-            .list_attestations_by_dimension_prefix(attesting_key_id, dimension)
-            .await?
-            .into_iter()
-            .filter(|a| {
-                admission::envelope_dimension(&a.attestation_envelope) == Some(dimension)
-                    && first_evidence_ref(&a.attestation_envelope) == Some(evidence_ref)
-            })
-            .collect())
-    }
+    ) -> Result<Vec<Attestation>, Error>;
 
     /// v55.0.0 (CIRISPersist#989, V190) — the federation-tier rows of ANY
     /// attester under exactly `dimension` whose envelope's `evidence_refs`
@@ -4446,7 +4281,7 @@ pub trait FederationDirectory: Send + Sync {
     ///   1. Enumerate all `trusted_publisher`-type keys via
     ///      [`Self::list_keys_by_identity_type`].
     ///   2. For each, list attestations issued by the key via
-    ///      [`Self::list_attestations_by`].
+    ///      [`AttestationQuery::by`](crate::federation::attestation_query::AttestationQuery::by).
     ///   3. Keep `scores` attestations whose envelope `dimension`
     ///      starts with `content_rating:` AND whose `evidence_refs`
     ///      array contains the hex `content_sha256`.
@@ -4462,7 +4297,7 @@ pub trait FederationDirectory: Send + Sync {
     /// # Default impl rationale
     ///
     /// Composes [`Self::list_keys_by_identity_type`] +
-    /// [`Self::list_attestations_by`] (both already trait-required);
+    /// [`AttestationQuery::by`](crate::federation::attestation_query::AttestationQuery::by) (both already trait-required);
     /// no per-backend SQL needed. Memory / Postgres / SQLite backends
     /// inherit the same shape. Backends with a `content_rating:*`
     /// secondary index may override for O(log N) lookup instead of the
@@ -9184,7 +9019,7 @@ pub trait FederationDirectory: Send + Sync {
 
     /// CEG §8.1.11.1 — effective consent stance of subject `s` over
     /// target Contribution `T` at `now`. Default impl over
-    /// [`list_attestations_for`](Self::list_attestations_for): the latest
+    /// [`list_attestations_for`](crate::federation::attestation_query::AttestationQuery::to): the latest
     /// non-expired `consent:state:*` attestation whose `attesting_key_id`
     /// is `s`, by `asserted_at`. `Unspecified` if `s` never declared a
     /// stance against `T`.
@@ -9313,7 +9148,7 @@ pub trait FederationDirectory: Send + Sync {
     ///
     /// The whole design, including why RAISES are deliberately **not**
     /// conferral-filtered, lives in [`content_class`]. Default impl over
-    /// [`Self::list_attestations_for`] + the capability walk — no per-backend
+    /// [`AttestationQuery::to`](crate::federation::attestation_query::AttestationQuery::to) + the capability walk — no per-backend
     /// SQL, so memory / sqlite / postgres inherit one fold.
     ///
     /// # Errors
@@ -9339,7 +9174,7 @@ pub trait FederationDirectory: Send + Sync {
     /// [`Attestation`] rows (`attested_key_id` = target `T`,
     /// `attesting_key_id` = subject `s`, `asserted_at` = revocation time,
     /// `tier`/`promoted_at` for the §10.1.3 local-tier check). Includes
-    /// **local-tier** rows (unlike [`list_attestations_for`](Self::list_attestations_for),
+    /// **local-tier** rows (unlike [`list_attestations_for`](crate::federation::attestation_query::AttestationQuery::to),
     /// which is federation-only) — the promotion-overdue check needs them.
     /// `since` bounds the scan; `None` = all.
     async fn list_consent_revocations(
@@ -9363,7 +9198,7 @@ pub trait FederationDirectory: Send + Sync {
     ///
     /// Backend-agnostic default composing
     /// [`list_consent_revocations`](Self::list_consent_revocations) +
-    /// [`list_attestations_for`](Self::list_attestations_for) +
+    /// [`list_attestations_for`](crate::federation::attestation_query::AttestationQuery::to) +
     /// [`record_hard_case`](Self::record_hard_case). Emission is idempotent
     /// (deterministic `event_id`), so running every tick re-emits nothing
     /// for already-recorded conditions. NOTE: the per-revocation

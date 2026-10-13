@@ -393,6 +393,7 @@ pub(crate) mod bodies {
     /// stance a scorer is told is what this pins.
     pub async fn i548f_a_swept_stewards_grant_reads_expired(d: &dyn FederationDirectory, s: &str) {
         use crate::federation::attestation_emit::emit_with_local_signer;
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
         use crate::federation::consent_expiry::run_consent_expiry_sweep;
         let p = parties(d, &format!("f-{s}")).await;
         put(
@@ -429,7 +430,7 @@ pub(crate) mod bodies {
             "I548f precondition: the sweep records the one lapsed grant: {report:?}"
         );
         let expired: Vec<Attestation> = d
-            .list_attestations_for(&p.canonical)
+            .all_attestations_for(&p.canonical)
             .await
             .unwrap()
             .into_iter()

@@ -106,6 +106,7 @@ pub(crate) mod bodies {
         d: &dyn FederationDirectory,
         tag: &str,
     ) {
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
         use crate::federation::types::identity_type::NODE;
         let (holder, third) = (format!("i520-h-{tag}"), format!("i520-t-{tag}"));
         for k in [&holder, &third] {
@@ -198,7 +199,7 @@ pub(crate) mod bodies {
         )
         .await
         .expect("I520 the holder withdraws its own claim");
-        let mine = d.list_attestations_by(&holder).await.unwrap();
+        let mine = d.all_attestations_by(&holder).await.unwrap();
         assert!(
             retired(&mine, &claim_id),
             "I520 the holder's own withdraws retires it"
@@ -211,6 +212,7 @@ pub(crate) mod bodies {
         d: &dyn FederationDirectory,
         tag: &str,
     ) {
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
         let (attester, subject) = (format!("i516-k-{tag}"), format!("i516-s-{tag}"));
         for k in [&attester, &subject] {
             ts::register_identity_key(d, k, USER).await;
@@ -250,9 +252,9 @@ pub(crate) mod bodies {
         )
         .await
         .expect("I516 (b) the attester recants its own row");
-        let rows = d.list_attestations_for(&subject).await.unwrap();
+        let rows = d.all_attestations_for(&subject).await.unwrap();
         let mut all = rows.clone();
-        all.extend(d.list_attestations_by(&attester).await.unwrap());
+        all.extend(d.all_attestations_by(&attester).await.unwrap());
         assert!(
             retired(&all, &t1),
             "I516 (b) the attester's recants retires t1"
@@ -273,8 +275,8 @@ pub(crate) mod bodies {
         )
         .await
         .expect("I516 (c) the subject withdraws a row about them");
-        let mut all = d.list_attestations_for(&subject).await.unwrap();
-        all.extend(d.list_attestations_by(&subject).await.unwrap());
+        let mut all = d.all_attestations_for(&subject).await.unwrap();
+        all.extend(d.all_attestations_by(&subject).await.unwrap());
         assert!(
             retired(&all, &t2),
             "I516 (c) the subject's withdraws retires t2"

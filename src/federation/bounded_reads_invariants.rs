@@ -331,6 +331,7 @@ pub(crate) mod bodies {
         group: &str,
         members: &[String],
     ) -> Result<Vec<String>, Error> {
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
         use crate::federation::membership_acceptance as ma;
         use crate::federation::types::attestation_tier;
         let now = chrono::Utc::now();
@@ -342,7 +343,7 @@ pub(crate) mod bodies {
         }
         let mut out = BTreeSet::new();
         for s in &signers {
-            for row in dir.list_attestations_by(s).await? {
+            for row in dir.all_attestations_by(s).await? {
                 if row.tier != attestation_tier::FEDERATION {
                     continue;
                 }
@@ -364,7 +365,7 @@ pub(crate) mod bodies {
                     continue;
                 }
                 let replies = dir
-                    .list_attestations_for(&invitee)
+                    .all_attestations_for(&invitee)
                     .await?
                     .into_iter()
                     .filter(|r| {
@@ -510,12 +511,13 @@ pub(crate) mod bodies {
         subject: &str,
         filter: admission::DelegationEdgeFilter,
     ) -> Result<BTreeSet<String>, Error> {
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
         use crate::federation::types::identity_type;
         let mut out: BTreeSet<String> = BTreeSet::new();
         let mut granter_live: std::collections::HashMap<String, bool> =
             std::collections::HashMap::new();
         let now = chrono::Utc::now();
-        let rows = directory.list_attestations_for(subject).await?;
+        let rows = directory.all_attestations_for(subject).await?;
         let withdrawn = admission::retracted_edge_ids(&rows);
         for r in rows {
             if r.attestation_type != attestation_type::DELEGATES_TO {
@@ -554,7 +556,7 @@ pub(crate) mod bodies {
                 });
             let granter_retracted = is_user
                 && directory
-                    .list_attestations_by(&r.attesting_key_id)
+                    .all_attestations_by(&r.attesting_key_id)
                     .await?
                     .into_iter()
                     .any(|g| {
@@ -750,6 +752,7 @@ pub(crate) mod bodies {
         directory: &dyn FederationDirectory,
         row: &Attestation,
     ) -> Result<(), Error> {
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
         let Some(dimension) = admission::envelope_dimension(&row.attestation_envelope) else {
             return Ok(());
         };
@@ -764,9 +767,7 @@ pub(crate) mod bodies {
             // and is unchanged by v53.1.6; this oracle covers the renewal arm.)
             return admission::check_config_renewal_supersedes(directory, row).await;
         }
-        let existing = directory
-            .list_attestations_for(&row.attested_key_id)
-            .await?;
+        let existing = directory.all_attestations_for(&row.attested_key_id).await?;
         let refs: Vec<&Attestation> = existing.iter().collect();
         let retired = crate::federation::precedence::retired_ids(&refs);
         for prior in &existing {
@@ -883,8 +884,9 @@ pub(crate) mod bodies {
         device_key_id: &str,
         blob_sha256_hex: &str,
     ) -> Result<Vec<crate::federation::custody_ack::CustodyAck>, Error> {
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
         use crate::federation::custody_ack::parse_custody_ack;
-        let rows = directory.list_attestations_by(device_key_id).await?;
+        let rows = directory.all_attestations_by(device_key_id).await?;
         let refs: Vec<&Attestation> = rows.iter().collect();
         let retired = crate::federation::precedence::retired_ids(&refs);
         Ok(rows
@@ -987,8 +989,9 @@ pub(crate) mod bodies {
         directory: &dyn FederationDirectory,
         steward_user_key_id: &str,
     ) -> Result<Vec<String>, Error> {
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
         let mut candidates: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for r in directory.list_attestations_by(steward_user_key_id).await? {
+        for r in directory.all_attestations_by(steward_user_key_id).await? {
             if r.attestation_type == attestation_type::DELEGATES_TO {
                 candidates.insert(r.attested_key_id);
             }
@@ -1020,8 +1023,9 @@ pub(crate) mod bodies {
         directory: &dyn FederationDirectory,
         person: &str,
     ) -> Result<Vec<String>, Error> {
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
         let mut candidates = std::collections::BTreeSet::new();
-        for row in directory.list_attestations_by(person).await? {
+        for row in directory.all_attestations_by(person).await? {
             if row.attestation_type == attestation_type::DELEGATES_TO
                 && admission::is_owner_binding_envelope(&row.attestation_envelope)
                 && !row.attested_key_id.is_empty()
@@ -1277,6 +1281,7 @@ pub(crate) mod bodies {
         d: &dyn FederationDirectory,
         s: &str,
     ) {
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
         use crate::federation::grant_supersede_invariants::bodies as gs;
         use crate::federation::trust_root::{
             capability_roots_to_trusted_root, live_conferrals, INFRA_ATTEST_SCOPE,
@@ -1347,7 +1352,7 @@ pub(crate) mod bodies {
         }
 
         for f in [&fx, &fx2] {
-            let rows = d.list_attestations_for(&f.subject).await.unwrap();
+            let rows = d.all_attestations_for(&f.subject).await.unwrap();
             let shaped: Vec<&Attestation> = rows
                 .iter()
                 .filter(|r| {
@@ -1442,6 +1447,7 @@ pub(crate) mod bodies {
     /// key; and no walk reads any key's whole slice (`list_attestations_by` /
     /// `_for`), while the v53.1.6 bodies do.
     pub async fn i547_trust_root_walks_read_what_they_select(d: &dyn FederationDirectory, s: &str) {
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
         use crate::federation::canonical_community::{
             live_charter_rows, v53_1_6_reference::live_charter_rows_reference,
         };
@@ -1538,7 +1544,7 @@ pub(crate) mod bodies {
         .await;
         let fx3 = gs::fixture(d, &format!("i547c-{s}")).await;
         let charter3 = d
-            .list_attestations_by(&fx3.root)
+            .all_attestations_by(&fx3.root)
             .await
             .unwrap()
             .into_iter()
@@ -1561,7 +1567,7 @@ pub(crate) mod bodies {
         // fx's root drill, withdrawn by its witness (a composer attested to
         // the root): the drill leg reads its composers too.
         let drill = d
-            .list_attestations_for(&fx.root)
+            .all_attestations_for(&fx.root)
             .await
             .unwrap()
             .into_iter()

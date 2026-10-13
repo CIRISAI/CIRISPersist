@@ -4621,7 +4621,7 @@ pub fn check_config_sensitive_leaf_floor(row: &super::Attestation) -> Result<(),
 ///
 /// The gate reads `attested_key_id`, because that is the field CC 3.4.5 names
 /// and the field
-/// [`list_attestations_for`](super::FederationDirectory::list_attestations_for)
+/// [`list_attestations_for`](crate::federation::attestation_query::AttestationQuery::to)
 /// — the read a peer uses to ask *"what is node N running?"* — keys on. It does
 /// **not** constrain `subject_key_ids`, so an attacker can still write a
 /// `config:*` row about ITSELF (`attesting == attested`, which is a true
@@ -7398,7 +7398,7 @@ pub fn parse_canonical_binding_hash(dimension: &str) -> Option<&str> {
 /// `subject_key_ids` (§3.2.3 rule 2/3). A binding is a `scores` row with
 /// `attesting_key_id = K` on the reserved `identity:canonical_binding:{H}`
 /// dimension; we read K's out-rows via
-/// [`FederationDirectory::list_attestations_by`] and collect every `H`.
+/// [`AttestationQuery::by`](crate::federation::attestation_query::AttestationQuery::by) and collect every `H`.
 ///
 /// Authorization is consumer-policy (§5.6.8.14: proof-of-control of H is
 /// out-of-band, NOT a wire obligation) — persist admits the self-assertion
@@ -8481,7 +8481,7 @@ async fn scoped_delegation_reach_at(
 /// # Algorithm
 ///
 /// BFS from `issuer`. At each granter, pull its `delegates_to`
-/// out-edges via [`FederationDirectory::list_attestations_by`]; an
+/// out-edges via [`AttestationQuery::by`](crate::federation::attestation_query::AttestationQuery::by); an
 /// edge is *traversable* only if its envelope `scope ⊇
 /// {consent_revocation}`. If a traversable edge's recipient is in
 /// `targets`, return `true`. Cycle-guarded on the granter key and
@@ -10744,7 +10744,7 @@ pub async fn may_act_through(
 /// person is bound to*.
 ///
 /// **One fold, not two**: candidates come from the granter-side index
-/// ([`FederationDirectory::list_attestations_by_type`]`(U, delegates_to)`,
+/// ([`AttestationQuery::types`](crate::federation::attestation_query::AttestationQuery::types)`(U, delegates_to)`,
 /// v53.1.6, filtered to owner-binding envelopes), but each candidate's VERDICT is
 /// [`owner_of`] itself — so liveness (expiry + admitted `withdraws`,
 /// #578/#584) and the single-owner rule are answered by the same spelling
@@ -28561,6 +28561,7 @@ pub(crate) mod ungated_doors_test_support {
         dir: &dyn FederationDirectory,
         suffix: &str,
     ) {
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
         let author = format!("cs713-{suffix}");
         register(dir, &author, crate::federation::types::identity_type::NODE).await;
 
@@ -28598,7 +28599,7 @@ pub(crate) mod ungated_doors_test_support {
 
         // And the by-subject read, which advertisement also walks.
         let by_subject = dir
-            .list_attestations_by(&author)
+            .all_attestations_by(&author)
             .await
             .expect("by-author read");
         let same = by_subject
@@ -29444,6 +29445,7 @@ pub(crate) mod ungated_doors_test_support {
         dir: &dyn FederationDirectory,
         suffix: &str,
     ) {
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
         use crate::federation::operational::test_support::establish_trust_root;
         use crate::federation::trust_root::{capability_roots_to_trusted_root, INFRA_SERVE_SCOPE};
         use crate::federation::types::identity_type;
@@ -29475,7 +29477,7 @@ pub(crate) mod ungated_doors_test_support {
 
         // The conferral row the attack will name: delegates_to(root → subject).
         let about = dir
-            .list_attestations_for(&subject)
+            .all_attestations_for(&subject)
             .await
             .expect("inbound rows about the subject");
         let conferral_id = about

@@ -48,6 +48,7 @@ pub(crate) mod bodies {
     }
 
     pub(crate) async fn fixture(d: &dyn FederationDirectory, tag: &str) -> Fx {
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
         let user = format!("gs-user-{tag}");
         let root = format!("gs-root-{tag}");
         let subject = format!("gs-subject-{tag}");
@@ -57,7 +58,7 @@ pub(crate) mod bodies {
             .await
             .expect("the #536 fixture stands up the root and the grant");
         let grant = d
-            .list_attestations_for(&subject)
+            .all_attestations_for(&subject)
             .await
             .unwrap()
             .into_iter()

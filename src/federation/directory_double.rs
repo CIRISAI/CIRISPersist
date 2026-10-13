@@ -134,7 +134,7 @@ impl FaultInjectingDirectory {
     }
 }
 
-// 116 delegations, generated. Every one: fault first, then delegate.
+// 115 delegations, generated. Every one: fault first, then delegate.
 #[async_trait::async_trait]
 impl FederationDirectory for FaultInjectingDirectory {
     async fn apply_replicated_accord_evidence(
@@ -413,14 +413,18 @@ impl FederationDirectory for FaultInjectingDirectory {
             .list_accord_proposals_by_anchor(action, prior_family_digest)
             .await
     }
-    async fn list_attestations_by(
+    async fn list_attestations_by_dimension_citing(
         &self,
         attesting_key_id: &str,
+        dimension: &str,
+        evidence_ref: &str,
     ) -> Result<Vec<Attestation>, Error> {
-        if let Some(e) = self.faulted("list_attestations_by") {
+        if let Some(e) = self.faulted("list_attestations_by_dimension_citing") {
             return Err(e);
         }
-        self.inner.list_attestations_by(attesting_key_id).await
+        self.inner
+            .list_attestations_by_dimension_citing(attesting_key_id, dimension, evidence_ref)
+            .await
     }
     async fn list_attestations_citing_by_dimension(
         &self,
@@ -433,15 +437,6 @@ impl FederationDirectory for FaultInjectingDirectory {
         self.inner
             .list_attestations_citing_by_dimension(dimension, evidence_ref)
             .await
-    }
-    async fn list_attestations_for(
-        &self,
-        attested_key_id: &str,
-    ) -> Result<Vec<Attestation>, Error> {
-        if let Some(e) = self.faulted("list_attestations_for") {
-            return Err(e);
-        }
-        self.inner.list_attestations_for(attested_key_id).await
     }
     async fn list_attestations_referencing(
         &self,

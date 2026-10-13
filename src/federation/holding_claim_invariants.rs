@@ -886,6 +886,7 @@ pub(crate) mod blob_bodies {
     where
         B: BlobStorage + FederationDirectory + Sync,
     {
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
         let n = node_as(b, &format!("i715-holder-{s}"), NODE).await;
         let bytes = format!("i715 public bytes {s}").into_bytes();
         let sha = sha256_of(&bytes);
@@ -914,7 +915,7 @@ pub(crate) mod blob_bodies {
         assert_eq!(c.attestation_envelope["size"], bytes.len() as u64);
         assert!(c.expires_at.is_some(), "I715 the row carries its freshness");
         assert!(
-            b.list_attestations_by(&n.key)
+            b.all_attestations_by(&n.key)
                 .await
                 .unwrap()
                 .iter()

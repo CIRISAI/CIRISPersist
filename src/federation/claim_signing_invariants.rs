@@ -881,6 +881,7 @@ mod tests {
     #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn i86_a_proxy_write_records_the_peer_author_and_announces_as_the_node_sqlite() {
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
         use crate::federation::tier_ingest::test_support as ts;
         use crate::federation::types::identity_type::USER;
         use crate::federation::{BlobBody, BlobStorage};
@@ -942,7 +943,7 @@ mod tests {
             "I86: the holder claim is this node's (I23)"
         );
         let claim = backend
-            .list_attestations_by(&node)
+            .all_attestations_by(&node)
             .await
             .unwrap()
             .into_iter()

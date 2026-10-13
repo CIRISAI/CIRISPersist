@@ -97,24 +97,8 @@ label_set! {
     Door {
         /// `ReadEngine::list_attestations` (the cursor-paged filter read).
         ListAttestations => "list_attestations",
-        /// `FederationDirectory::list_attestations_by`.
-        ListAttestationsBy => "list_attestations_by",
         /// `FederationDirectory::list_attestations_by_dimension_citing`.
         ListAttestationsByDimensionCiting => "list_attestations_by_dimension_citing",
-        /// `FederationDirectory::list_attestations_by_dimension_prefix`.
-        ListAttestationsByDimensionPrefix => "list_attestations_by_dimension_prefix",
-        /// `FederationDirectory::list_attestations_by_type`.
-        ListAttestationsByType => "list_attestations_by_type",
-        /// `FederationDirectory::list_attestations_by_types`.
-        ListAttestationsByTypes => "list_attestations_by_types",
-        /// `FederationDirectory::list_attestations_for`.
-        ListAttestationsFor => "list_attestations_for",
-        /// `FederationDirectory::list_attestations_for_dimension_prefix`.
-        ListAttestationsForDimensionPrefix => "list_attestations_for_dimension_prefix",
-        /// `FederationDirectory::list_attestations_for_type`.
-        ListAttestationsForType => "list_attestations_for_type",
-        /// `FederationDirectory::list_attestations_for_types`.
-        ListAttestationsForTypes => "list_attestations_for_types",
         /// `FederationDirectory::list_attestations_referencing`.
         ListAttestationsReferencing => "list_attestations_referencing",
         /// `FederationDirectory::list_composers_referencing_any`.
@@ -140,7 +124,9 @@ label_set! {
         /// `FederationDirectory::list_attestation_log`.
         ListAttestationLog => "list_attestation_log",
         /// v56.0.0 (CIRISPersist#1001) — `AttestationReads::query_attestations`,
-        /// the typed bounded read; recorded once, in its shared wrapper.
+        /// the typed bounded read; recorded once, in its shared wrapper. It
+        /// replaces the `list_attestations_{by,for}` doors and their six
+        /// narrowed siblings, whose labels are retired with them.
         AttestationQuery => "attestation_query",
     }
 }

@@ -30,32 +30,8 @@ groups:
           - id: list_attestations
             value: "list_attestations"
             stability: development
-          - id: list_attestations_by
-            value: "list_attestations_by"
-            stability: development
           - id: list_attestations_by_dimension_citing
             value: "list_attestations_by_dimension_citing"
-            stability: development
-          - id: list_attestations_by_dimension_prefix
-            value: "list_attestations_by_dimension_prefix"
-            stability: development
-          - id: list_attestations_by_type
-            value: "list_attestations_by_type"
-            stability: development
-          - id: list_attestations_by_types
-            value: "list_attestations_by_types"
-            stability: development
-          - id: list_attestations_for
-            value: "list_attestations_for"
-            stability: development
-          - id: list_attestations_for_dimension_prefix
-            value: "list_attestations_for_dimension_prefix"
-            stability: development
-          - id: list_attestations_for_type
-            value: "list_attestations_for_type"
-            stability: development
-          - id: list_attestations_for_types
-            value: "list_attestations_for_types"
             stability: development
           - id: list_attestations_referencing
             value: "list_attestations_referencing"

@@ -179,7 +179,7 @@ pub mod field {
     /// The trust root this row is issued UNDER — a `federation_keys.key_id` or
     /// a constitutional family id. Also the row's `attested_key_id`, so one
     /// existing read
-    /// ([`list_attestations_for`](crate::federation::FederationDirectory::list_attestations_for))
+    /// ([`list_attestations_for`](crate::federation::attestation_query::AttestationQuery::to))
     /// finds every row a root has issued.
     pub const ROOT_REF: &str = "root_ref";
     /// `"emergency"` or `"durable"` — see

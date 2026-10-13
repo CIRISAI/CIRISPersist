@@ -88,15 +88,7 @@ pub const BACKEND_VALUES: &[&str] = &["memory", "sqlite", "postgres"];
 /// Every `door` label value.
 pub const DOOR_VALUES: &[&str] = &[
     "list_attestations",
-    "list_attestations_by",
     "list_attestations_by_dimension_citing",
-    "list_attestations_by_dimension_prefix",
-    "list_attestations_by_type",
-    "list_attestations_by_types",
-    "list_attestations_for",
-    "list_attestations_for_dimension_prefix",
-    "list_attestations_for_type",
-    "list_attestations_for_types",
     "list_attestations_referencing",
     "list_composers_referencing_any",
     "list_targeted_by_dimension_prefix",

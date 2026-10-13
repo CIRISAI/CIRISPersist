@@ -615,7 +615,7 @@ fn i692_a_read_inside_folds_returns_within_a_deadline() {
         rt.block_on(super::fold(
             Fold::ResolveServeTier,
             super::fold(Fold::IsPublicGroup, async {
-                one_read(Door::ListAttestationsFor);
+                one_read(Door::AttestationQuery);
             }),
         ));
         let snap = local.snapshot();
@@ -838,6 +838,7 @@ pub(crate) async fn i550_the_snapshot_is_reachable_through_engine(
     backend: StoreBackend,
     s: &str,
 ) {
+    use crate::federation::attestation_query::test_support::AllAttestations as _;
     use crate::federation::tier_ingest::test_support as ts;
     let local = ts::local_signer(&format!("i550-node-{s}"));
     let signer: std::sync::Arc<dyn ciris_keyring::HardwareSigner> =
@@ -845,7 +846,7 @@ pub(crate) async fn i550_the_snapshot_is_reachable_through_engine(
     let engine = crate::Engine::from_shared(dispatch, signer);
     let counters = LocalCounters::install();
     let before = engine.telemetry_snapshot();
-    d.list_attestations_for(&format!("i550-nobody-{s}"))
+    d.all_attestations_for(&format!("i550-nobody-{s}"))
         .await
         .unwrap();
     let after = engine.telemetry_snapshot();
@@ -856,8 +857,8 @@ pub(crate) async fn i550_the_snapshot_is_reachable_through_engine(
     );
     assert_eq!(
         delta3(
-            before.door(backend, Door::ListAttestationsFor),
-            after.door(backend, Door::ListAttestationsFor)
+            before.door(backend, Door::AttestationQuery),
+            after.door(backend, Door::AttestationQuery)
         ),
         (1, 0, 0),
         "I550 one empty read, through Engine::telemetry_snapshot"

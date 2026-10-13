@@ -3274,12 +3274,17 @@ impl FederationDirectory for OpsDirectory {
             method: "execute_attestation_query",
         })
     }
-    async fn list_attestations_for(
+    // v56.0.0 (CIRISPersist#1001) — required now (its default composed over a
+    // retired read): not proxied across the capsule.
+    async fn list_attestations_by_dimension_citing(
         &self,
-        attested_key_id: &str,
+        attesting_key_id: &str,
+        dimension: &str,
+        evidence_ref: &str,
     ) -> Result<Vec<Attestation>, Error> {
+        let _ = (attesting_key_id, dimension, evidence_ref);
         Err(Error::Unsupported {
-            method: "list_attestations_for",
+            method: "list_attestations_by_dimension_citing",
         })
     }
     async fn list_attestations_referencing(
@@ -3289,35 +3294,6 @@ impl FederationDirectory for OpsDirectory {
         // v47.2.0 (#853) — as its siblings: not proxied across the capsule.
         Err(Error::Unsupported {
             method: "list_attestations_referencing",
-        })
-    }
-    async fn list_attestations_by(
-        &self,
-        attesting_key_id: &str,
-    ) -> Result<Vec<Attestation>, Error> {
-        Err(Error::Unsupported {
-            method: "list_attestations_by",
-        })
-    }
-    // v53.1.5 — the bounded reads, as their siblings: not proxied across
-    // the capsule.
-    async fn list_attestations_by_dimension_prefix(
-        &self,
-        attesting_key_id: &str,
-        dimension_prefix: &str,
-    ) -> Result<Vec<Attestation>, Error> {
-        Err(Error::Unsupported {
-            method: "list_attestations_by_dimension_prefix",
-        })
-    }
-    async fn list_attestations_for_dimension_prefix(
-        &self,
-        attested_key_id: &str,
-        attesting_key_id: Option<&str>,
-        dimension_prefix: &str,
-    ) -> Result<Vec<Attestation>, Error> {
-        Err(Error::Unsupported {
-            method: "list_attestations_for_dimension_prefix",
         })
     }
     async fn list_composers_referencing_any(
