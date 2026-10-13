@@ -45,6 +45,10 @@ pub mod adopt_cascade;
 pub mod affiliation_config;
 pub mod age;
 pub mod at_rest_cascade;
+/// v56.0.0 (CIRISPersist#934 step 1) — the attestation plane's stored write,
+/// decided once: `plan_put_attestation` + the per-backend `AttestationStore`
+/// executor.
+pub(crate) mod attestation_admit;
 /// v36.0.0 (CIRISPersist#624) — the typed, pre-write replicated
 /// ATTESTATION-plane apply (`AttestationRefusalReason` /
 /// `ReplicatedAttestationOutcome`): the Key plane's #565 twin.
@@ -2345,7 +2349,11 @@ pub(crate) fn owner_binding_of(row: &Attestation) -> Option<(String, String)> {
 /// here (the next write rolls the epochs the node held). A lookup that fails
 /// is logged and treated as no change: the row stands, and the pending sweep
 /// is where a missed re-wrap is retried.
-#[cfg(any(feature = "sqlite", feature = "postgres"))]
+///
+/// v56.0.0 (CIRISPersist#934) — no longer feature-gated: the shared
+/// attestation door (`attestation_admit::put_attestation_planned`) asks it on
+/// every backend. Memory's re-wrap is the trait's no-op default, so a memory
+/// store observes the same outcome it did when it never asked.
 pub(crate) async fn consent_list_change_of<F>(
     directory: &F,
     row: &Attestation,

@@ -7,6 +7,15 @@ threat-model citations because this crate's audit story is the point.
 
 ## [Unreleased]
 
+## [56.0.0] - UNRELEASED
+
+### Changed — the attestation plane's write doors share one plan (#934 step 1)
+
+- `put_attestation_with_origin` (under `put_attestation`,
+  `put_attestation_authored` and the replicated apply's fresh-id store) is
+  decided once, in `federation::attestation_admit::plan_put_attestation`;
+  each backend implements only the storage executor.
+
 ## [55.0.0] - 2026-10-12
 
 ### Changed — CIRISConstitution v1.0-rc7 vendored (#753, slice A0)
