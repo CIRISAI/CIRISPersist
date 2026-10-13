@@ -2820,6 +2820,13 @@ mod tests {
             "attestation_type::",
             "attestation_type.as_str()",
             "attestation_type = $",
+            // v56.0.0 (CIRISPersist#934) — sqlite's placeholder spelling of the
+            // same SQL comparison. The structural-composer replay read moved
+            // out of the put door (where `is_structural_composer` sat inside
+            // the window) into sqlite's executor, whose statement binds
+            // `WHERE attestation_type = ?1`; postgres's twin already matched
+            // `attestation_type = $` above.
+            "attestation_type = ?",
             "attestation_type LIKE $",
             // v53.1.7 — the SQL membership test against a composer set, bound
             // as placeholders (sqlite `IN (?2, ?3, ?4)`, the V181 seek's
