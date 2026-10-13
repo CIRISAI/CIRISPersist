@@ -494,7 +494,13 @@ jobs:
         # (cirisgraph 16.9 on v52.0.2's main run, 34.1 here), so the bound was
         # inside the runner's variance. Same reasoning as above: the per-test
         # hang detector is `.config/nextest.toml`, this is the runner backstop.
-        timeout-minutes: 50
+        #
+        # v55.0.1 — 50 → 75. The `secrets` leg is ~46 min warm, and a cold or
+        # repaired cache adds up to 25 min of compile (v55.0.1's PR run: the
+        # first unit repair over a manifest-less blob took the compile phase
+        # from 8.3 to 23.5 min and timed the leg out at test 655/4935). A hung
+        # test is still caught by `.config/nextest.toml`, by name.
+        timeout-minutes: 75
         env:
           CIRIS_PERSIST_TEST_PG_URL: postgres://ciris:ciris@localhost:5432/ciris_persist_test
         # v30.2.0 (CIRISPersist#17) — `--test-threads=1` is GONE, and with it
@@ -681,6 +687,13 @@ jobs:
         if: (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) && matrix.substrate.name == 'core-1'
         shell: bash
         run: du -sh target/release target/debug/{deps,build,incremental,.fingerprint} 2>/dev/null || true
+      - name: seal build-script units before the CIRISCache save (v55.0.1)
+        # Each unit's out.manifest, and its out/ files touched to now so the
+        # LRU prune drops them last. An optimisation: never fails the build.
+        continue-on-error: true
+        if: (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) && matrix.substrate.name == 'core-1'   # always warm: save on main AND release tags — a released version's blob MUST exist or edge/server/next-build cold-compile persist from source (far more than the ~9min save)
+        shell: bash
+        run: for py in python3 python; do "$py" -c 'import sys' 2>/dev/null && exec "$py" scripts/ci_cache_units.py seal target; done; echo '::warning::no python for the unit seal'
       - uses: CIRISAI/CIRISCache/save@v1.1
         id: cache_save
         # v53.2.0 (#1022) — CIRISCache v1.1: the TAG run's save is strict (a failed
@@ -788,6 +801,13 @@ jobs:
       # never completed — so restore-only loses no cache that exists, while
       # un-redding every tag run. Re-enable via #762 when CIRISCache can save
       # under the mac VM resource ceiling.
+      - name: seal build-script units before the CIRISCache save (v55.0.1)
+        # Each unit's out.manifest, and its out/ files touched to now so the
+        # LRU prune drops them last. An optimisation: never fails the build.
+        continue-on-error: true
+        if: false   # CIRISPersist#762 — see above; was: main + tags/v*
+        shell: bash
+        run: for py in python3 python; do "$py" -c 'import sys' 2>/dev/null && exec "$py" scripts/ci_cache_units.py seal target; done; echo '::warning::no python for the unit seal'
       - uses: CIRISAI/CIRISCache/save@v1.1
         id: cache_save
         if: false   # CIRISPersist#762 — see above; was: main + tags/v*
@@ -895,6 +915,13 @@ jobs:
         if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
         shell: bash
         run: du -sh target/release target/debug/{deps,build,incremental,.fingerprint} 2>/dev/null || true
+      - name: seal build-script units before the CIRISCache save (v55.0.1)
+        # Each unit's out.manifest, and its out/ files touched to now so the
+        # LRU prune drops them last. An optimisation: never fails the build.
+        continue-on-error: true
+        if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: for py in python3 python; do "$py" -c 'import sys' 2>/dev/null && exec "$py" scripts/ci_cache_units.py seal target; done; echo '::warning::no python for the unit seal'
       - uses: CIRISAI/CIRISCache/save@v1.1
         id: cache_save
         if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
@@ -1093,6 +1120,13 @@ jobs:
         if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
         shell: bash
         run: du -sh target/release target/debug/{deps,build,incremental,.fingerprint} 2>/dev/null || true
+      - name: seal build-script units before the CIRISCache save (v55.0.1)
+        # Each unit's out.manifest, and its out/ files touched to now so the
+        # LRU prune drops them last. An optimisation: never fails the build.
+        continue-on-error: true
+        if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')   # always warm: save on main AND release tags (else the released version cold-compiles downstream)
+        shell: bash
+        run: for py in python3 python; do "$py" -c 'import sys' 2>/dev/null && exec "$py" scripts/ci_cache_units.py seal target; done; echo '::warning::no python for the unit seal'
       - uses: CIRISAI/CIRISCache/save@v1.1
         id: cache_save
         if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')   # always warm: save on main AND release tags (else the released version cold-compiles downstream)
@@ -1365,6 +1399,13 @@ jobs:
         if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
         shell: bash
         run: du -sh target/release target/debug/{deps,build,incremental,.fingerprint} 2>/dev/null || true
+      - name: seal build-script units before the CIRISCache save (v55.0.1)
+        # Each unit's out.manifest, and its out/ files touched to now so the
+        # LRU prune drops them last. An optimisation: never fails the build.
+        continue-on-error: true
+        if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')   # always warm: save on main AND release tags (else the released version cold-compiles downstream)
+        shell: bash
+        run: for py in python3 python; do "$py" -c 'import sys' 2>/dev/null && exec "$py" scripts/ci_cache_units.py seal target; done; echo '::warning::no python for the unit seal'
       - uses: CIRISAI/CIRISCache/save@v1.1
         id: cache_save
         if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')   # always warm: save on main AND release tags (else the released version cold-compiles downstream)
@@ -1623,6 +1664,11 @@ jobs:
       # dependency's (fixture target/, no cargo).
       - name: cache trim witnesses
         run: python3 scripts/ci_cache_trim_test.py
+      # v55.0.1 — the unit seal and the restore repair: a pruned build-script
+      # unit and a manifest-less one are removed with their fingerprints, a
+      # consistent one is kept (fixture target/, no cargo).
+      - name: cache unit witnesses
+        run: python3 scripts/ci_cache_units.py --self-test
       # v54.1.0 (#1052) — evidence/cc_impl.tsv is generated from the manifest's
       # evidence export; the committed file must be exactly the generated one.
       - name: evidence tsv is generated from the manifest
@@ -2172,6 +2218,13 @@ jobs:
         if: (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) && (matrix.label == 'linux-aarch64' || matrix.label == 'windows-x86_64')
         shell: bash
         run: du -sh target/release target/debug/{deps,build,incremental,.fingerprint} 2>/dev/null || true
+      - name: seal build-script units before the CIRISCache save (v55.0.1)
+        # Each unit's out.manifest, and its out/ files touched to now so the
+        # LRU prune drops them last. An optimisation: never fails the build.
+        continue-on-error: true
+        if: (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) && (matrix.label == 'linux-aarch64' || matrix.label == 'windows-x86_64')   # always warm: save on main AND release tags
+        shell: bash
+        run: for py in python3 python; do "$py" -c 'import sys' 2>/dev/null && exec "$py" scripts/ci_cache_units.py seal target; done; echo '::warning::no python for the unit seal'
       - name: Save CIRISCache (linux-aarch64 + windows-x64 — #314, push-once+alias)
         id: cache_save
         if: (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) && (matrix.label == 'linux-aarch64' || matrix.label == 'windows-x86_64')   # always warm: save on main AND release tags

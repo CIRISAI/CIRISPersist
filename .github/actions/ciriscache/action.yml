@@ -79,3 +79,24 @@ runs:
           ${{ env.CIRISCACHE_KEY_HEAD }}
           ${{ env.CIRISCACHE_KEY_HEAD_ANYV }}
           ${{ env.CIRISCACHE_KEY_VERIFY }}
+    # v55.0.1 — a restored target/ is made self-consistent at the cargo UNIT
+    # level before anything builds on it. The save's LRU prune deletes single
+    # FILES by age, so it can drop a build-script run's output (the v55.0.0
+    # tag's Windows wheel job: libsqlite3-sys `out/bindgen.rs`) while keeping
+    # the unit's fingerprint; cargo then trusts the run and `include!`s a file
+    # that is not there. Every build-script unit whose `out.manifest` (written
+    # at save) is missing or names an absent file is removed whole, with its
+    # fingerprint, so cargo reruns it. NOT continue-on-error: a target/ that
+    # cannot be checked must not be built on.
+    - name: Repair restored build-script units (v55.0.1)
+      shell: bash
+      run: |
+        for py in python3 python; do
+          if "$py" -c 'import sys' 2>/dev/null; then
+            # One blob is restored here (first hit wins), so the script's
+            # single-cutoff bound holds. A layered restore (several blobs
+            # overlaid) must repair after each layer or pass --strict.
+            exec "$py" scripts/ci_cache_units.py repair target
+          fi
+        done
+        echo '::error::no python to repair the restored target/'; exit 1

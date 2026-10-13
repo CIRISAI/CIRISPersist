@@ -202,7 +202,7 @@ done
 # The leg is skippable ONLY by CERTIFY_SKIP_PYTHON=1, and never silently — the
 # verdict table carries a SKIPPED line and the run stops claiming full
 # certification.
-ALL_KEYS="$LEGS default python fmt clippy pyi featmatrix wheelfeat docver pyo3sqlite dirdouble astgates weaver bitschanged mutmatrix cachetrim evidencetsv floortoken$AXIS_KEYS"
+ALL_KEYS="$LEGS default python fmt clippy pyi featmatrix wheelfeat docver pyo3sqlite dirdouble astgates weaver bitschanged mutmatrix cachetrim cacheunits evidencetsv floortoken$AXIS_KEYS"
 
 FOCUS_LEG=""; FOCUS_FILTER=""
 if [ "$MODE" = "focus" ]; then
@@ -583,6 +583,8 @@ run_bg bitschanged scripts/bits_changed_test.sh
 run_bg mutmatrix  python3 scripts/mutants_matrix_test.py
 # v54.1.0 (CIRISPersist#1022) — the pre-save cache trim (fixture target/).
 run_bg cachetrim  python3 scripts/ci_cache_trim_test.py
+# v55.0.1 — the cache unit seal and the restore repair (fixture target/).
+run_bg cacheunits python3 scripts/ci_cache_units.py --self-test
 # v54.1.0 (CIRISPersist#1052) — the committed evidence tsv is the generated one.
 run_bg evidencetsv python3 scripts/evidence_tsv_test.py
 # v35.0.0 (CIRISPersist#710) — tested-wheel ⊇ shipped-wheel, and nobody
@@ -625,7 +627,7 @@ wait
 # before the expensive legs dispatch, is the point of the fast stage: a compile
 # break under `--features cirisnode` alone should cost seconds, not the full
 # test matrix first.
-FAST_GATES="fmt pyi featmatrix wheelfeat docver pyo3sqlite dirdouble astgates weaver bitschanged mutmatrix cachetrim evidencetsv floortoken$AXIS_KEYS"
+FAST_GATES="fmt pyi featmatrix wheelfeat docver pyo3sqlite dirdouble astgates weaver bitschanged mutmatrix cachetrim cacheunits evidencetsv floortoken$AXIS_KEYS"
 
 # Every `.rc` this run produced must be claimed by a key someone reads. The log
 # directory is wiped at startup, so anything here was written by this run.
