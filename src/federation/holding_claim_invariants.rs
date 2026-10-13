@@ -1472,6 +1472,67 @@ pub(crate) mod blob_bodies {
         );
     }
 
+    /// **I803** (Codex r4 on #1065) — the auto-spawned re-ack sweeper runs
+    /// its FIRST pass at spawn: an upgraded node (a blob announced only under
+    /// the retired rc6 carrier, no custody row, so dark to v55's holder
+    /// reads) is a listed holder again with no interval elapsed.
+    pub(crate) async fn i803_the_reack_sweeper_converts_at_spawn<B>(
+        engine: &crate::Engine,
+        b: &B,
+        s: &str,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync + LegacySeam,
+    {
+        let me = engine.local_derived_key_id().await.unwrap();
+        let bytes = format!("i803 bytes {s}").into_bytes();
+        let sha = sha256_of(&bytes);
+        engine
+            .put_blob_signing(
+                &sha,
+                BlobBody::Inline(bytes),
+                None,
+                &me,
+                chrono::Utc::now(),
+                uuid::Uuid::new_v4(),
+            )
+            .await
+            .expect("I803 the node announces a blob");
+        // What a v54 node left: the same claim, as the rc6 carrier.
+        let claim = claims_of(b, &me, &sha).await.remove(0);
+        let rc6 = serde_json::json!({
+            "kind": "holds_bytes", "evidence_refs": [hex::encode(sha)],
+        });
+        b.set_type(
+            &claim.attestation_id,
+            &format!("holds_bytes:sha256:{}", &hex::encode(sha)[..8]),
+            Some(&rc6),
+        )
+        .await;
+        assert!(
+            b.list_holders(&sha).await.unwrap().is_empty(),
+            "I803 precondition: dark after the upgrade"
+        );
+        let sweeper = engine
+            .spawn_reack_sweeper()
+            .expect("I803 the engine has a PQC local signer");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut seen = false;
+        while std::time::Instant::now() < deadline {
+            if b.list_holders(&sha).await.unwrap().contains(&me) {
+                seen = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let _ = sweeper.stop().await;
+        assert!(
+            seen,
+            "I803 the first pass ran at spawn: the node is a listed holder within seconds, not \
+             after the {:?} interval",
+            crate::federation::holding_claim::HOLDING_CLAIM_REACK_SWEEP_INTERVAL
+        );
+    }
+
     /// **I717** — the content's scope, at admission and at the announce door.
     pub(crate) async fn i717_the_claim_scope_is_the_contents<B>(b: &B, s: &str)
     where
@@ -1887,6 +1948,67 @@ mod runners {
         b.run_migrations().await.unwrap();
         Some(b)
     });
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn i803_the_reack_sweeper_converts_at_spawn_sqlite() {
+        let alias = format!("i803-{}", suffix());
+        let engine = crate::Engine::with_signer_pre_genesis(
+            crate::federation::tier_ingest::test_support::local_signer(&alias),
+            "sqlite::memory:",
+        )
+        .await
+        .unwrap();
+        engine
+            .register_self_federation_key(
+                crate::federation::types::identity_type::NODE,
+                &alias,
+                None,
+                serde_json::json!({}),
+                vec![],
+            )
+            .await
+            .unwrap();
+        let b = engine.sqlite_backend().unwrap().clone();
+        super::blob_bodies::i803_the_reack_sweeper_converts_at_spawn(
+            &engine,
+            b.as_ref(),
+            &suffix(),
+        )
+        .await;
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn i803_the_reack_sweeper_converts_at_spawn_postgres() {
+        let Some(dsn) = crate::test_pg::empty_dsn() else {
+            return;
+        };
+        let alias = format!("i803-{}", suffix());
+        let engine = crate::Engine::with_signer_pre_genesis(
+            crate::federation::tier_ingest::test_support::local_signer(&alias),
+            &dsn,
+        )
+        .await
+        .unwrap();
+        engine
+            .register_self_federation_key(
+                crate::federation::types::identity_type::NODE,
+                &alias,
+                None,
+                serde_json::json!({}),
+                vec![],
+            )
+            .await
+            .unwrap();
+        let b = engine.postgres_backend().unwrap().clone();
+        super::blob_bodies::i803_the_reack_sweeper_converts_at_spawn(
+            &engine,
+            b.as_ref(),
+            &suffix(),
+        )
+        .await;
+    }
 
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     macro_rules! blob_runners {

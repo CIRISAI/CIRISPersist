@@ -2157,6 +2157,12 @@ impl Engine {
     /// handle's `stop()`. Every holding claim lapses 72 h after it was signed;
     /// this keeps a holder advertised while it holds.
     ///
+    /// Codex r4 on #1065 — the FIRST pass runs at spawn, then the interval:
+    /// the pass carries the upgrade conversion (a v54 node's retired rc6
+    /// claims, which v55's holder reads no longer count), so sleeping first
+    /// left an upgraded node undiscoverable for an hour, and one restarting
+    /// more often than hourly never converted at all.
+    ///
     /// Returns `None` when this Engine has no PQC local signer (it cannot sign
     /// a claim, so it has none to renew). Disk-independent: no budget gate.
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
@@ -2167,19 +2173,27 @@ impl Engine {
         let interval = crate::federation::holding_claim::HOLDING_CLAIM_REACK_SWEEP_INTERVAL;
         let engine = self.clone();
         let handle = tokio::spawn(async move {
+            let mut first = true;
             loop {
-                tokio::select! {
-                    _ = shutdown_for_loop.notified() => {
-                        tracing::info!("ciris-persist v55.0.0 re-ack sweeper: shutdown signal received");
-                        return;
+                if !first {
+                    tokio::select! {
+                        _ = shutdown_for_loop.notified() => {
+                            tracing::info!("ciris-persist v55.0.0 re-ack sweeper: shutdown signal received");
+                            return;
+                        }
+                        _ = tokio::time::sleep(interval) => {}
                     }
-                    _ = tokio::time::sleep(interval) => {}
                 }
+                first = false;
                 match engine.reack_holding_claims_once(chrono::Utc::now()).await {
-                    Ok(report) if report.renewed > 0 || report.failed > 0 => {
+                    Ok(report)
+                        if report.renewed > 0 || report.failed > 0 || report.converted > 0 =>
+                    {
                         tracing::info!(
                             scanned = report.scanned,
                             renewed = report.renewed,
+                            converted = report.converted,
+                            withheld = report.withheld,
                             not_held = report.not_held,
                             not_in_cohort = report.not_in_cohort,
                             failed = report.failed,
