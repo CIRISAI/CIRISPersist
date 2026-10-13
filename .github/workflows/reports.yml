@@ -1,0 +1,108 @@
+# REPORTS (non-gating) — CIRISPersist#934, #1076 slice T.
+#
+# Every job here prints what it found, uploads it, and stays green: each is
+# `continue-on-error: true` and each script exits 0 on a finding. Nothing in
+# this file can turn a PR or main red; promoting any of it to a gate is the
+# operator's call (docs/TOOLING.md says which tool is a report and which,
+# elsewhere, is a gate).
+#
+#   size       PR       per-file size of src/ vs the PR base (scripts/size_report.py)
+#   semver     PR, dispatch
+#                       public-API breaks vs the latest v* tag reachable from
+#                       the base (scripts/api_break_report.sh) — the CHANGELOG's
+#                       and Edge's break list
+#
+# On a PR the size and semver jobs give the delta this PR makes; the CHANGELOG
+# break list for a release is `scripts/api_break_report.sh <prev-tag>` locally.
+
+name: reports (non-gating)
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+    inputs:
+      baseline:
+        description: 'semver baseline tag (default: latest v* tag reachable from the base)'
+        required: false
+      run:
+        description: 'which report(s): all | semver'
+        required: false
+        default: all
+
+permissions:
+  contents: read
+
+concurrency:
+  group: reports-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: '10'
+  PYTHONUTF8: "1"
+
+jobs:
+  size:
+    name: size vs base (report)
+    if: github.event_name == 'pull_request' && github.event.action != 'labeled'
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: size of src/ vs the PR base (report)
+        env:
+          BASE: origin/${{ github.base_ref }}
+        run: |
+          { echo '```'; python3 scripts/size_report.py check --against "$BASE"; echo '```'; } | tee -a "$GITHUB_STEP_SUMMARY"
+
+  semver:
+    name: semver-checks vs previous release (report)
+    if: >-
+      (github.event_name == 'pull_request' && github.event.action != 'labeled')
+      || (github.event_name == 'workflow_dispatch' && contains(fromJSON('["all","semver"]'), inputs.run))
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Free runner disk (two rustdoc builds of the crate and its graph)
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+                      /usr/local/.ghcup /opt/hostedtoolcache/CodeQL 2>/dev/null || true
+          df -h / | tail -1
+      - uses: dtolnay/rust-toolchain@1.97.0
+      - uses: ./.github/actions/ciriscache
+        with:
+          plat: linux-x86_64
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-semver-checks
+      - name: derive the baseline tag
+        id: base
+        env:
+          INPUT: ${{ inputs.baseline }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          git fetch --tags --force --quiet
+          if [ -n "${INPUT:-}" ]; then tag="$INPUT"
+          else tag="$(git describe --tags --abbrev=0 --match 'v[0-9]*' "$BASE_SHA")"; fi
+          echo "baseline: $tag (latest v* tag reachable from ${BASE_SHA})"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+      - name: API breaks (report)
+        env:
+          TAG: ${{ steps.base.outputs.tag }}
+        run: |
+          scripts/api_break_report.sh "$TAG"
+          { echo "### API breaks vs $TAG (report)"; echo '```'; cat "target/semver/$TAG.summary" 2>/dev/null || echo "no summary — see the log"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: semver-report
+          path: target/semver/
+          retention-days: 30

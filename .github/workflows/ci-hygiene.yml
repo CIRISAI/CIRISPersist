@@ -131,7 +131,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       # The per-file size of src/ against the committed evidence/size.tsv: how
       # far main has moved since the table was last written (release cut).
       # `--fail-if-backends-grew` is #934's PR criterion and is NOT used here.
