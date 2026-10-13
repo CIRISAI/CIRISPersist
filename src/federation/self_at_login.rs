@@ -516,7 +516,7 @@ pub fn transit_kex_pair_from_envelope(
             ));
         }
     };
-    let decode = |label: &str, v: &serde_json::Value, want: usize| -> Result<Vec<u8>, Error> {
+    let decode = |label: &str, v: &serde_json::Value| -> Result<Vec<u8>, Error> {
         let s = v.as_str().ok_or_else(|| {
             Error::malformed_row(
                 PLANE,
@@ -524,35 +524,39 @@ pub fn transit_kex_pair_from_envelope(
                 format!("`{TRANSIT_KEX_PUBKEYS_MEMBER}.{label}` must be a base64 string"),
             )
         })?;
-        let raw = B64.decode(s).map_err(|e| {
+        B64.decode(s).map_err(|e| {
             Error::malformed_row(
                 PLANE,
                 malformed_row::ENVELOPE_MEMBER_INVALID,
                 format!("`{TRANSIT_KEX_PUBKEYS_MEMBER}.{label}` is not standard base64: {e}"),
             )
-        })?;
-        if raw.len() != want {
-            return Err(Error::malformed_row(
-                PLANE,
-                malformed_row::TRANSIT_KEX_WRONG_LENGTH,
-                format!(
-                    "`{TRANSIT_KEX_PUBKEYS_MEMBER}.{label}` must decode to exactly {want} bytes, \
-                     got {}",
-                    raw.len()
-                ),
-            ));
-        }
-        Ok(raw)
+        })
     };
-    let x = decode(TRANSIT_KEX_X25519_MEMBER, x, TRANSIT_KEX_X25519_LEN)?;
-    let m = decode(TRANSIT_KEX_ML_KEM_768_MEMBER, m, TRANSIT_KEX_ML_KEM_768_LEN)?;
-    let x25519: [u8; TRANSIT_KEX_X25519_LEN] = x
-        .try_into()
-        .expect("length checked above: exactly TRANSIT_KEX_X25519_LEN");
-    let ml_kem_768: Box<[u8; TRANSIT_KEX_ML_KEM_768_LEN]> = m
-        .into_boxed_slice()
-        .try_into()
-        .expect("length checked above: exactly TRANSIT_KEX_ML_KEM_768_LEN");
+    // The exact-length rule IS the conversion into the fixed-size types: there
+    // is no second check that could drift from it, and no panic path.
+    let wrong_length = |label: &str, want: usize, got: usize| {
+        Error::malformed_row(
+            PLANE,
+            malformed_row::TRANSIT_KEX_WRONG_LENGTH,
+            format!(
+                "`{TRANSIT_KEX_PUBKEYS_MEMBER}.{label}` must decode to exactly {want} bytes, \
+                 got {got}"
+            ),
+        )
+    };
+    let x = decode(TRANSIT_KEX_X25519_MEMBER, x)?;
+    let m = decode(TRANSIT_KEX_ML_KEM_768_MEMBER, m)?;
+    let x25519 = <[u8; TRANSIT_KEX_X25519_LEN]>::try_from(x.as_slice())
+        .map_err(|_| wrong_length(TRANSIT_KEX_X25519_MEMBER, TRANSIT_KEX_X25519_LEN, x.len()))?;
+    let m_len = m.len();
+    let ml_kem_768 = Box::<[u8; TRANSIT_KEX_ML_KEM_768_LEN]>::try_from(m.into_boxed_slice())
+        .map_err(|_| {
+            wrong_length(
+                TRANSIT_KEX_ML_KEM_768_MEMBER,
+                TRANSIT_KEX_ML_KEM_768_LEN,
+                m_len,
+            )
+        })?;
     Ok(Some(TransitKexPair { x25519, ml_kem_768 }))
 }
 
@@ -2116,7 +2120,6 @@ mod transit_kex_tests {
         };
         let env = envelope_with_transit_kex(&row, Some(transit_kex_member(0x11, 0x22)));
         let projection: TransportDestination = serde_json::from_value(env.clone()).unwrap();
-        assert_eq!(projection, row);
         SignedTransportDestination {
             transport_destination: projection,
             attesting_key_id: "kat-relay".into(),
@@ -2146,6 +2149,11 @@ mod transit_kex_tests {
         let row = kat_row();
         let bytes = serde_json::to_vec(&row).unwrap();
 
+        // FIRST, the pinned hash: a projection that picked the pair up changes
+        // these bytes, and this is the assertion that must say so.
+        let h = crate::federation::wire_index::content_hash_of(&row).unwrap();
+        assert_eq!(h, KAT_CONTENT_HASH, "I1010: pinned content hash");
+
         // The projection carries nothing of the pair.
         let proj = serde_json::to_value(&row.transport_destination).unwrap();
         assert!(
@@ -2170,13 +2178,11 @@ mod transit_kex_tests {
             serde_json::from_value(row.signed_envelope.clone()).unwrap();
         assert_eq!(serde_json::to_value(&v55_proj).unwrap(), proj);
 
-        let h = crate::federation::wire_index::content_hash_of(&row).unwrap();
         assert_eq!(
             h,
             crate::federation::wire_index::content_hash_of(&v55).unwrap(),
             "I1010: v55 and v56 compute the same content hash"
         );
-        assert_eq!(h, KAT_CONTENT_HASH, "I1010: pinned content hash");
 
         // The accessor returns the pair.
         let pair = row.transit_kex_pair().unwrap().unwrap();
@@ -2282,6 +2288,8 @@ mod transit_kex_tests {
         let td: TransportDestination = serde_json::from_value(row.signed_envelope.clone())
             .expect("I1013: the v56 projection parses a pair-bearing envelope");
         assert_eq!(td, row.transport_destination);
+        assert_eq!(td.destination, "kat-dest");
+        assert_eq!(td.epoch, 7);
         let v55: V55TransportDestination = serde_json::from_value(row.signed_envelope.clone())
             .expect("I1013: the v55 projection parses a pair-bearing envelope");
         assert_eq!(v55.destination, "kat-dest");
