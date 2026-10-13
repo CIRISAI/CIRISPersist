@@ -147,6 +147,7 @@
 use chrono::{DateTime, Duration, Utc};
 
 use super::admission::is_owner_binding_envelope;
+use super::attestation_query::{AttestationQuery, FOLD_PAGE};
 use super::envelope::EnvelopeCore;
 use super::freshness::merge_floor;
 use super::precedence::references_attestation_id_from_envelope;
@@ -931,18 +932,19 @@ async fn holds_recovery_delegation(
     issuer: &str,
     now: DateTime<Utc>,
 ) -> Result<bool, Error> {
-    for r in directory.list_attestations_by(node).await? {
-        if r.attestation_type != attestation_type::DELEGATES_TO || r.attested_key_id != issuer {
-            continue;
-        }
-        if let Some(exp) = r.expires_at {
-            if exp <= now {
+    let mut pages = AttestationQuery::by(node, FOLD_PAGE)
+        .attested_to(issuer)
+        .types(&[attestation_type::DELEGATES_TO])
+        .pages();
+    while let Some(page) = pages.next(directory).await? {
+        for r in page {
+            if r.expires_at.is_some_and(|exp| exp <= now) {
                 continue;
             }
-        }
-        let scopes = super::admission::delegation_scope_set(&r.attestation_envelope);
-        if scopes.contains(DELEGATION_SCOPE_OWNER_BINDING_RECOVERY) {
-            return Ok(true);
+            let scopes = super::admission::delegation_scope_set(&r.attestation_envelope);
+            if scopes.contains(DELEGATION_SCOPE_OWNER_BINDING_RECOVERY) {
+                return Ok(true);
+            }
         }
     }
     Ok(false)
@@ -1233,14 +1235,19 @@ pub async fn check_post_reclaim_rebinding_admission(
         return Ok(());
     }
     let node = row.attested_key_id.as_str();
-    let reclaimed = directory
-        .list_attestations_for(node)
-        .await?
-        .iter()
-        .any(|r| {
-            r.attestation_type == attestation_type::WITHDRAWS
-                && r.withdraws_admission_rule == Some(RECLAIM_WITHDRAWS_ADMISSION_RULE)
-        });
+    let mut reclaimed = false;
+    let mut pages = AttestationQuery::to(node, FOLD_PAGE)
+        .types(&[attestation_type::WITHDRAWS])
+        .pages();
+    while let Some(page) = pages.next(directory).await? {
+        if page
+            .iter()
+            .any(|r| r.withdraws_admission_rule == Some(RECLAIM_WITHDRAWS_ADMISSION_RULE))
+        {
+            reclaimed = true;
+            break;
+        }
+    }
     if !reclaimed {
         return Ok(());
     }

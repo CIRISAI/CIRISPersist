@@ -46,6 +46,7 @@
 //! chokepoint. A self-declared root confers capability only over users who
 //! signed an edge to it; it gains NO standing in the accord role plane.
 
+use super::attestation_query::{AttestationQuery, FOLD_PAGE};
 use super::precedence;
 use super::types::{attestation_type, Attestation};
 use super::{Error, FederationDirectory};
@@ -1024,15 +1025,20 @@ where
 {
     // v53.1.7 — the node's trust edges (and their composers), never its whole
     // history: the canonical's own key authors thousands of rows.
-    let by_node = match directory
-        .list_attestations_by_types(
-            node_key_id,
-            &[attestation_type::DELEGATES_TO, attestation_type::SUPERSEDES],
-            &jobs_other_than(TRUST_ACCEPTS_DIMENSION),
-        )
-        .await
-    {
-        Ok(rows) => with_slice_composers(directory, rows, None, Some(node_key_id)).await?,
+    let mut rows = Vec::new();
+    let mut pages = AttestationQuery::by(node_key_id, FOLD_PAGE)
+        .types(&[attestation_type::DELEGATES_TO, attestation_type::SUPERSEDES])
+        .excluding_dimensions(&jobs_other_than(TRUST_ACCEPTS_DIMENSION))
+        .pages();
+    let read: Result<(), Error> = async {
+        while let Some(page) = pages.next(directory).await? {
+            rows.extend(page);
+        }
+        Ok(())
+    }
+    .await;
+    let by_node = match read {
+        Ok(()) => with_slice_composers(directory, rows, None, Some(node_key_id)).await?,
         Err(Error::Unsupported { .. }) => Vec::new(),
         Err(e) => return Err(e),
     };
@@ -1467,43 +1473,41 @@ where
     // unchanged and runs over a subset of the slice holding every row it can
     // pick and every composer naming one ([`with_slice_composers`]).
     let edge_types = [attestation_type::DELEGATES_TO, attestation_type::SUPERSEDES];
-    let by_user = with_slice_composers(
-        directory,
-        directory
-            .list_attestations_by_types(
-                user_key_id,
-                &edge_types,
-                &jobs_other_than(TRUST_ACCEPTS_DIMENSION),
-            )
-            .await?,
-        None,
-        Some(user_key_id),
-    )
-    .await?;
+    let mut user_edges = Vec::new();
+    let mut pages = AttestationQuery::by(user_key_id, FOLD_PAGE)
+        .types(&edge_types)
+        .excluding_dimensions(&jobs_other_than(TRUST_ACCEPTS_DIMENSION))
+        .pages();
+    while let Some(page) = pages.next(directory).await? {
+        user_edges.extend(page);
+    }
+    let by_user = with_slice_composers(directory, user_edges, None, Some(user_key_id)).await?;
     let charter_jobs = jobs_other_than(TRUST_CHARTER_DIMENSION);
-    let by_root = with_slice_composers(
-        directory,
-        directory
-            .list_attestations_by_types(legs_ref, &[attestation_type::DELEGATES_TO], &charter_jobs)
-            .await?,
-        None,
-        Some(legs_ref),
-    )
-    .await?;
-    let mut about_selected = directory
-        .list_attestations_for_dimension_prefix(legs_ref, None, ACCORD_HEARTBEAT_DIMENSION)
-        .await?;
+    let mut root_charters = Vec::new();
+    let mut pages = AttestationQuery::by(legs_ref, FOLD_PAGE)
+        .types(&[attestation_type::DELEGATES_TO])
+        .excluding_dimensions(&charter_jobs)
+        .pages();
+    while let Some(page) = pages.next(directory).await? {
+        root_charters.extend(page);
+    }
+    let by_root = with_slice_composers(directory, root_charters, None, Some(legs_ref)).await?;
+    let mut about_selected = Vec::new();
+    let mut pages = AttestationQuery::to(legs_ref, FOLD_PAGE)
+        .dimension_prefix(ACCORD_HEARTBEAT_DIMENSION)
+        .pages();
+    while let Some(page) = pages.next(directory).await? {
+        about_selected.extend(page);
+    }
     // Only the family arm reads charters from the about-slice.
     if family.is_some() {
-        about_selected.extend(
-            directory
-                .list_attestations_for_types(
-                    legs_ref,
-                    &[attestation_type::DELEGATES_TO],
-                    &charter_jobs,
-                )
-                .await?,
-        );
+        let mut pages = AttestationQuery::to(legs_ref, FOLD_PAGE)
+            .types(&[attestation_type::DELEGATES_TO])
+            .excluding_dimensions(&charter_jobs)
+            .pages();
+        while let Some(page) = pages.next(directory).await? {
+            about_selected.extend(page);
+        }
         about_selected.sort_by_key(|a| std::cmp::Reverse(a.asserted_at));
     }
     let about_root = with_slice_composers(directory, about_selected, Some(legs_ref), None).await?;
@@ -2044,19 +2048,16 @@ where
     // same subject, so the one about-read carries both.
     // v53.1.7 — the conferral-shaped rows (by type and job) and their
     // composers, never every trust edge naming the subject.
-    let about_subject = with_slice_composers(
-        directory,
-        directory
-            .list_attestations_for_types(
-                subject_key_id,
-                &[attestation_type::DELEGATES_TO, attestation_type::SUPERSEDES],
-                &jobs_other_than(TRUST_CONFERS_DIMENSION),
-            )
-            .await?,
-        Some(subject_key_id),
-        None,
-    )
-    .await?;
+    let mut conferrals = Vec::new();
+    let mut pages = AttestationQuery::to(subject_key_id, FOLD_PAGE)
+        .types(&[attestation_type::DELEGATES_TO, attestation_type::SUPERSEDES])
+        .excluding_dimensions(&jobs_other_than(TRUST_CONFERS_DIMENSION))
+        .pages();
+    while let Some(page) = pages.next(directory).await? {
+        conferrals.extend(page);
+    }
+    let about_subject =
+        with_slice_composers(directory, conferrals, Some(subject_key_id), None).await?;
     let about_refs: Vec<&Attestation> = about_subject.iter().collect();
     let dead = tombstoned_ids(&about_refs);
     let now = chrono::Utc::now();
@@ -3113,19 +3114,15 @@ pub(crate) async fn transit_eligibility_walk(
     let now = chrono::Utc::now();
     // v53.1.7 — the user's trust edges and their composers (the candidate
     // predicate's whole input), never the user's history.
-    let by_user = with_slice_composers(
-        directory,
-        directory
-            .list_attestations_by_types(
-                user_key_id,
-                &[attestation_type::DELEGATES_TO, attestation_type::SUPERSEDES],
-                &jobs_other_than(TRUST_ACCEPTS_DIMENSION),
-            )
-            .await?,
-        None,
-        Some(user_key_id),
-    )
-    .await?;
+    let mut user_edges = Vec::new();
+    let mut pages = AttestationQuery::by(user_key_id, FOLD_PAGE)
+        .types(&[attestation_type::DELEGATES_TO, attestation_type::SUPERSEDES])
+        .excluding_dimensions(&jobs_other_than(TRUST_ACCEPTS_DIMENSION))
+        .pages();
+    while let Some(page) = pages.next(directory).await? {
+        user_edges.extend(page);
+    }
+    let by_user = with_slice_composers(directory, user_edges, None, Some(user_key_id)).await?;
     let mut roots_walked = 0usize;
     for candidate in transit_candidate_roots(&by_user, user_key_id, now) {
         roots_walked += 1;
@@ -3536,7 +3533,13 @@ where
             // The predecessor's live charter commitment must equal the hash
             // of THIS successor set (the pre-commitment binding).
             let claimed = pre_rotation_commitment(&presented)?;
-            let by_old = directory.list_attestations_by(old_root).await?;
+            // Every row the old root authored: its charters and whatever
+            // tombstones them.
+            let mut by_old = Vec::new();
+            let mut pages = AttestationQuery::by(old_root, FOLD_PAGE).pages();
+            while let Some(page) = pages.next(directory).await? {
+                by_old.extend(page);
+            }
             let old_refs: Vec<&Attestation> = by_old.iter().collect();
             let old_dead = tombstoned_ids(&old_refs);
             let now = chrono::Utc::now();
@@ -3861,19 +3864,16 @@ where
 {
     // v53.1.7 — the subject's `delegates_to` rows that can confer, and their
     // composers; the predicate below is unchanged.
-    let about_subject = with_slice_composers(
-        directory,
-        directory
-            .list_attestations_for_types(
-                subject_key_id,
-                &[attestation_type::DELEGATES_TO],
-                &jobs_other_than(TRUST_CONFERS_DIMENSION),
-            )
-            .await?,
-        Some(subject_key_id),
-        None,
-    )
-    .await?;
+    let mut conferrals = Vec::new();
+    let mut pages = AttestationQuery::to(subject_key_id, FOLD_PAGE)
+        .types(&[attestation_type::DELEGATES_TO])
+        .excluding_dimensions(&jobs_other_than(TRUST_CONFERS_DIMENSION))
+        .pages();
+    while let Some(page) = pages.next(directory).await? {
+        conferrals.extend(page);
+    }
+    let about_subject =
+        with_slice_composers(directory, conferrals, Some(subject_key_id), None).await?;
     let about_refs: Vec<&Attestation> = about_subject.iter().collect();
     let dead = tombstoned_ids(&about_refs);
     let now = chrono::Utc::now();

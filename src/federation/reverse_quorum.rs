@@ -201,6 +201,7 @@
 
 use chrono::{DateTime, Duration, Utc};
 
+use super::attestation_query::{AttestationQuery, FOLD_PAGE};
 use super::types::Attestation;
 use super::{cohort::Cohort, Error, FederationDirectory};
 
@@ -2354,11 +2355,24 @@ async fn objections_against<F>(
 where
     F: FederationDirectory + ?Sized,
 {
-    let rows = match directory.list_attestations_for(action.actor_key_id).await {
-        Ok(rows) => rows,
-        Err(Error::Unsupported { .. }) => Vec::new(),
+    // The four dimensions share the `objection:` family: the prefix seek
+    // carries them, the exact match below picks them.
+    let mut rows = Vec::new();
+    let mut pages = AttestationQuery::to(action.actor_key_id, FOLD_PAGE)
+        .dimension_prefix("objection:")
+        .pages();
+    let read: Result<(), Error> = async {
+        while let Some(page) = pages.next(directory).await? {
+            rows.extend(page);
+        }
+        Ok(())
+    }
+    .await;
+    match read {
+        Ok(()) => {}
+        Err(Error::Unsupported { .. }) => rows.clear(),
         Err(e) => return Err(e),
-    };
+    }
     Ok(rows
         .into_iter()
         .filter(|r| {

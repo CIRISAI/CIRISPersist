@@ -63,6 +63,8 @@ pub mod blackhole;
 mod blob_surface_gates;
 pub mod blobs;
 pub mod bootstrap_admission;
+#[cfg(test)]
+mod bounded_planes_invariants;
 pub mod canonical_at_rest;
 pub mod capacity;
 // v50.0.0 (CIRISPersist#926) — the `ciris-canonical` community row: admitted

@@ -1,0 +1,223 @@
+//! v56.0.0 (CIRISPersist#1001) — **I907–I9xx: each migrated plane's folds
+//! read through the typed bounded query, bounded.**
+//!
+//! Every witness here lands NOISE on a key — third-party `scores` rows under a
+//! dimension no fold reads (`i907noise:*`) — runs a migrated fold, and asks
+//! the read probe two things about every read the fold made:
+//!
+//! 1. **Narrowed.** A fold that reads one family, type or dimension of a
+//!    key's rows never reads the key's whole slice: no read keyed on the key
+//!    answers as `list_attestations_for` / `_by` (see
+//!    [`read_probe::Read::door`]), and the noise never comes back.
+//! 2. **Paged.** Every typed read is one page: at most its limit rows, and
+//!    its limit at most [`FOLD_PAGE`] (3 under `cfg(test)`). A fold that walks
+//!    a whole slice walks it in pages and reads each row once.
+//!
+//! On memory, sqlite and postgres. The mutations recorded in the slice report
+//! (dropping a fold's narrowing, ignoring the cursor) turn these red.
+//!
+//! [`FOLD_PAGE`]: crate::federation::attestation_query::FOLD_PAGE
+
+#[cfg(test)]
+pub(crate) mod bodies {
+    use crate::federation::attestation_query::FOLD_PAGE;
+    use crate::federation::read_probe::{self, Read};
+    use crate::federation::tier_ingest::test_support as ts;
+    use crate::federation::types::attestation_type;
+    use crate::federation::{Attestation, FederationDirectory, SignedAttestation};
+
+    /// Land `n` third-party `scores` rows by `author` about `subject` under
+    /// dimensions no fold reads. Returns their ids.
+    pub async fn noise(
+        d: &dyn FederationDirectory,
+        author: &str,
+        subject: &str,
+        n: usize,
+    ) -> Vec<String> {
+        let mut ids = Vec::new();
+        for i in 0..n {
+            let id = uuid::Uuid::new_v4().to_string();
+            let env = serde_json::json!({ "dimension": format!("i907noise:n{i}:v1"), "id": id });
+            let mut r = ts::bare_attestation(&id, author, subject, &env);
+            r.attestation_type = attestation_type::SCORES.into();
+            r.weight = None;
+            r.asserted_at = chrono::Utc::now() - chrono::Duration::minutes(60 - i as i64);
+            r.scrub_timestamp = r.asserted_at;
+            ts::seal_row_in_place(author, &mut r);
+            d.put_attestation(SignedAttestation { attestation: r })
+                .await
+                .expect("I907 noise row lands");
+            ids.push(id);
+        }
+        ids
+    }
+
+    /// Two registered keys, unique per run.
+    pub async fn keys(d: &dyn FederationDirectory, tag: &str) -> (String, String) {
+        let s = uuid::Uuid::new_v4().simple().to_string();
+        let a = format!("{tag}-a-{}", &s[..10]);
+        let b = format!("{tag}-b-{}", &s[..10]);
+        ts::register_hybrid_key(d, &a).await;
+        ts::register_hybrid_key(d, &b).await;
+        (a, b)
+    }
+
+    /// The reads keyed on `key` (as the door they answer as).
+    fn on<'a>(log: &'a [Read], key: &str) -> Vec<&'a Read> {
+        log.iter().filter(|r| r.door_key() == key).collect()
+    }
+
+    /// Every typed read is one page of at most its limit, and its limit at
+    /// most `FOLD_PAGE`.
+    pub fn assert_paged(log: &[Read], tag: &str) {
+        for r in log {
+            if let Some(q) = &r.query {
+                assert!(
+                    r.rows <= q.limit.get() as usize && q.limit <= FOLD_PAGE,
+                    "{tag}: a read past its page: {r:?}"
+                );
+            }
+        }
+    }
+
+    /// The fold read `key` narrowed: no whole-slice read of it, and none of
+    /// `noise` came back.
+    pub fn assert_narrowed(log: &[Read], key: &str, noise_rows: usize, tag: &str) {
+        let reads = on(log, key);
+        assert!(
+            !reads.is_empty(),
+            "{tag}: the fold read {key} at all: {log:?}"
+        );
+        assert!(
+            !reads.iter().any(|r| r.is_slice_read()),
+            "{tag}: a whole-slice read of {key}: {reads:?}"
+        );
+        let rows: usize = reads.iter().map(|r| r.rows).sum();
+        assert!(
+            rows < noise_rows,
+            "{tag}: {rows} rows read over {key}, the noise is {noise_rows}: {reads:?}"
+        );
+        assert_paged(log, tag);
+    }
+
+    /// **I907** — the trust/ownership plane: quarantine markers, the objection
+    /// fold, the post-reclaim rebinding gate and the node's trust-root signal.
+    pub async fn i907_trust_and_ownership_folds_read_bounded(d: &dyn FederationDirectory) {
+        let (k, other) = keys(d, "i907").await;
+        let n = 7;
+        noise(d, &other, &k, n).await;
+        let now = chrono::Utc::now();
+
+        // Quarantine markers about K: the `quarantine:` family only.
+        let _ = read_probe::take();
+        let fold = crate::federation::quarantine::resolve_quarantine(d, &k, now)
+            .await
+            .expect("I907 quarantine fold");
+        assert!(!fold.withholds(), "I907 noise withholds nothing");
+        assert_narrowed(&read_probe::take(), &k, n, "I907 quarantine");
+
+        // Objections against an action by K: the `objection:` family only.
+        let action = crate::federation::reverse_quorum::ActionRef {
+            actor_key_id: &k,
+            action_id: "i907-action",
+            asserted_at: now - chrono::Duration::minutes(5),
+        };
+        let _ = read_probe::take();
+        crate::federation::reverse_quorum::resolve_reverse_quorum_with(
+            d,
+            crate::federation::cohort::Cohort::Community,
+            &other,
+            vec![],
+            None,
+            None,
+            action,
+            now,
+        )
+        .await
+        .expect("I907 reverse quorum fold");
+        assert_narrowed(&read_probe::take(), &k, n, "I907 objections");
+
+        // A fresh owner binding over K: the gate asks only K's withdrawals.
+        let id = uuid::Uuid::new_v4().to_string();
+        let env = serde_json::json!({
+            "dimension": crate::federation::types::owner_binding::DIMENSION,
+            "id": id,
+        });
+        let mut binding: Attestation = ts::bare_attestation(&id, &other, &k, &env);
+        binding.attestation_type = attestation_type::DELEGATES_TO.into();
+        let _ = read_probe::take();
+        crate::federation::ownership_reclaim::check_post_reclaim_rebinding_admission(d, &binding)
+            .await
+            .expect("I907 no reclaim, no refusal");
+        assert_narrowed(&read_probe::take(), &k, n, "I907 post-reclaim rebinding");
+
+        // The node's trust-root signal walks ITS whole authored slice: in
+        // pages, every row once, and it is readable.
+        let (me, _) = keys(d, "i907me").await;
+        noise(d, &me, &other, n).await;
+        let _ = read_probe::take();
+        let signal =
+            crate::federation::node_state::resolve_trust_root_signal(d, Some(&me), None, now).await;
+        let log = read_probe::take();
+        assert_ne!(
+            signal.standing,
+            crate::federation::node_state::TrustRootStanding::Unreadable,
+            "I907 the walk completes"
+        );
+        let walk: Vec<&Read> = on(&log, &me)
+            .into_iter()
+            .filter(|r| r.is_slice_read())
+            .collect();
+        assert_eq!(
+            walk.iter().map(|r| r.rows).sum::<usize>(),
+            n,
+            "I907 the slice walk reads every row once: {walk:?}"
+        );
+        assert!(walk.len() > 1, "I907 the walk is paged: {walk:?}");
+        assert_paged(&log, "I907 trust-root signal");
+    }
+}
+
+#[cfg(test)]
+mod runners {
+    macro_rules! runners {
+        ($modname:ident, $fresh:expr) => {
+            mod $modname {
+                use crate::federation::FederationDirectory;
+                #[tokio::test]
+                async fn i907_trust_and_ownership_folds_read_bounded() {
+                    let Some(d) = $fresh.await else { return };
+                    super::super::bodies::i907_trust_and_ownership_folds_read_bounded(
+                        &d as &dyn FederationDirectory,
+                    )
+                    .await
+                }
+            }
+        };
+    }
+
+    runners!(memory, async {
+        Some(crate::store::memory::MemoryBackend::new())
+    });
+
+    #[cfg(feature = "sqlite")]
+    runners!(sqlite, async {
+        use crate::store::Backend as _;
+        let b = crate::store::sqlite::SqliteBackend::open_in_memory()
+            .await
+            .unwrap();
+        b.run_migrations().await.unwrap();
+        Some(b)
+    });
+
+    #[cfg(feature = "postgres")]
+    runners!(postgres, async {
+        use crate::store::Backend as _;
+        let dsn = crate::test_pg::empty_dsn()?;
+        let b = crate::store::postgres::PostgresBackend::connect(&dsn)
+            .await
+            .unwrap();
+        b.run_migrations().await.unwrap();
+        Some(b)
+    });
+}
