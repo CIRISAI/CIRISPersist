@@ -694,7 +694,6 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     // schema-history table, run before refinery validates it.
     ("repair_v070_checksum", ConnClass::Write),
     ("replay_abandoned", ConnClass::Write),
-    ("reseal_attestation_v31", ConnClass::Write),
     ("resolve_scores", ConnClass::Read),
     ("retire_goal", ConnClass::Write),
     ("revocations_for_subject", ConnClass::Read),
@@ -743,6 +742,7 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("repair_withdraws_depth", ConnClass::Write),
     ("store_pqc_completion", ConnClass::Write),
     ("store_planned_attestation", ConnClass::Write),
+    ("store_planned_reseal", ConnClass::Write),
     ("store_blob_local", ConnClass::Write),
     ("stream_consistency_proof", ConnClass::Read),
     ("stream_inclusion_proof", ConnClass::Read),

@@ -3053,6 +3053,53 @@ impl crate::federation::attestation_admit::AttestationStore for MemoryBackend {
         Ok(())
     }
 
+    async fn store_planned_reseal(
+        &self,
+        planned: crate::federation::attestation_admit::PlannedReseal,
+    ) -> Result<bool, crate::federation::Error> {
+        #[cfg(test)]
+        self.test_hooks()
+            .pause_if_armed("reseal_before_write")
+            .await;
+        let wire_index_key = {
+            let mut state = self.state.lock().expect("memory backend lock");
+            // v36.0.0 (#668/#707-class) — a re-seal rewrites the served bytes;
+            // the serve position moves with them. Allocated before the mutable
+            // row borrow below, stamped after it ends.
+            let admitted_at = next_plane_position(
+                &state,
+                PLANE_ATTESTATION,
+                attestation_rows(&state).into_iter(),
+            );
+            let Some(row) = state
+                .federation_attestations
+                .iter_mut()
+                .find(|a| a.attestation_id == planned.attestation_id())
+            else {
+                return Ok(false);
+            };
+            // The row this backend holds under its lock, judged and sealed by
+            // the shared plan.
+            *row = planned.sealed_over(row)?;
+            // The wire index moves WITH the row (#610).
+            let wik =
+                (row.tier == crate::federation::types::attestation_tier::FEDERATION).then(|| {
+                    crate::federation::wire_index::record_key(&[(
+                        "attestation_id",
+                        &row.attestation_id,
+                    )])
+                });
+            let id = row.attestation_id.clone();
+            stamp_plane_position(&mut state, PLANE_ATTESTATION, id, admitted_at);
+            wik
+        };
+        if let Some(wire_index_key) = wire_index_key {
+            self.index_stored_record("Attestation", &wire_index_key)
+                .await?;
+        }
+        Ok(true)
+    }
+
     async fn store_planned_attestation(
         &self,
         planned: crate::federation::attestation_admit::PlannedAttestation,
@@ -4972,110 +5019,16 @@ impl crate::federation::FederationDirectory for MemoryBackend {
     /// leave a REFUSED re-seal having already mutated the row — the AV-9
     /// violation the SQL backends are structurally protected from by working on
     /// a loaded copy.
+    /// v56.0.0 (CIRISPersist#934 step 1, door 4) — the decision is
+    /// [`plan_reseal_attestation`](crate::federation::attestation_admit::plan_reseal_attestation)
+    /// and its re-ask in the write step,
+    /// [`PlannedReseal::sealed_over`](crate::federation::attestation_admit::PlannedReseal::sealed_over);
+    /// this backend stores it.
     async fn reseal_attestation_v31(
         &self,
         resealed: &crate::federation::Attestation,
     ) -> Result<bool, crate::federation::Error> {
-        // v31.0.0 (CIRISPersist#656) — THE SEAL, and the two instants the shape
-        // gate does not pin. BEFORE the state lock, because the signature arm
-        // resolves registered pubkeys through the directory, which locks
-        // itself. The stored copy read here is re-found under the lock below
-        // and re-gated by the pure `check_reseal_admission` there, so the
-        // async read outside the lock cannot widen what is admitted.
-        {
-            let Some(stored) = crate::federation::FederationDirectory::get_attestation(
-                self,
-                &resealed.attestation_id,
-            )
-            .await?
-            else {
-                return Ok(false);
-            };
-            // v31.2.0 (CIRISPersist#670) — the PURE shape gate leads, the AV-76
-            // tier order its two siblings already ran and this backend did not.
-            // It used to be asked only under the lock, so a re-seal whose shape
-            // was wrong still paid for the signature arm's directory walk
-            // first: the #660 inversion, one door over. Asking it here does not
-            // remove the ask under the lock — see there for why both are needed.
-            crate::federation::migration::check_reseal_admission(
-                &stored,
-                resealed,
-                chrono::Utc::now(),
-            )?;
-            crate::federation::admission::check_reseal_seal_admission(self, &stored, resealed)
-                .await?;
-        }
-        #[cfg(test)]
-        self.test_hooks()
-            .pause_if_armed("reseal_before_write")
-            .await;
-        let wire_index_key = {
-            let mut state = self.state.lock().expect("memory backend lock");
-            // v36.0.0 (#668/#707-class) — a re-seal rewrites the served bytes;
-            // the serve position moves with them. Allocated before the mutable
-            // row borrow below, stamped after it ends.
-            let admitted_at = next_plane_position(
-                &state,
-                PLANE_ATTESTATION,
-                attestation_rows(&state).into_iter(),
-            );
-            let Some(row) = state
-                .federation_attestations
-                .iter_mut()
-                .find(|a| a.attestation_id == resealed.attestation_id)
-            else {
-                return Ok(false);
-            };
-            // Asked a SECOND time, on the row this backend actually found under
-            // the lock. The pre-lock ask above gated the copy a separate
-            // `get_attestation` returned after taking and releasing this lock;
-            // the SQL backends get the two answers from one transaction, and
-            // memory does not, so without this the door would gate one row and
-            // mutate another. Declared in `store::parity` (CIRISPersist#670).
-            crate::federation::migration::check_reseal_admission(
-                row,
-                resealed,
-                chrono::Utc::now(),
-            )?;
-            row.attestation_envelope = resealed.attestation_envelope.clone();
-            row.original_content_hash = resealed.original_content_hash.clone();
-            row.scrub_signature_classical = resealed.scrub_signature_classical.clone();
-            row.scrub_signature_pqc = resealed.scrub_signature_pqc.clone();
-            row.scrub_key_id = resealed.scrub_key_id.clone();
-            row.scrub_timestamp = resealed.scrub_timestamp;
-            row.additional_scrubs = resealed.additional_scrubs.clone();
-            row.asserted_at = resealed.asserted_at;
-            row.expires_at = resealed.expires_at;
-            row.pqc_completed_at = resealed
-                .scrub_signature_pqc
-                .as_ref()
-                .map(|_| resealed.scrub_timestamp);
-            let mut for_hash = row.clone();
-            for_hash.persist_row_hash = String::new();
-            row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&for_hash)?;
-            // The wire index moves WITH the row (#610): the re-seal recomputes
-            // `persist_row_hash`, so without re-indexing the row advertises a
-            // hash the index does not hold.
-            let wik =
-                (row.tier == crate::federation::types::attestation_tier::FEDERATION).then(|| {
-                    crate::federation::wire_index::record_key(&[(
-                        "attestation_id",
-                        &row.attestation_id,
-                    )])
-                });
-            stamp_plane_position(
-                &mut state,
-                PLANE_ATTESTATION,
-                resealed.attestation_id.clone(),
-                admitted_at,
-            );
-            wik
-        };
-        if let Some(wire_index_key) = wire_index_key {
-            self.index_stored_record("Attestation", &wire_index_key)
-                .await?;
-        }
-        Ok(true)
+        crate::federation::attestation_admit::reseal_attestation_planned(self, resealed).await
     }
 
     /// v31.0.0 (CIRISPersist#650) — hard-delete one attestation row, and the

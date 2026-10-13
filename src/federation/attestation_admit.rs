@@ -207,6 +207,13 @@ pub(crate) trait AttestationStore:
         &self,
         planned: PlannedLocalAttestation,
     ) -> Result<(), Error>;
+
+    /// Store a planned re-seal: INSIDE the write step (memory's lock,
+    /// sqlite's transaction, postgres's `SELECT … FOR UPDATE`), read the row
+    /// as it is now, hand it to [`PlannedReseal::sealed_over`] (the shape gate
+    /// re-asked, the sealed row built), write that row, then re-index a
+    /// federation-tier row. `false` when the row is gone.
+    async fn store_planned_reseal(&self, planned: PlannedReseal) -> Result<bool, Error>;
 }
 
 /// v56.0.0 (CIRISPersist#934 step 1) — a planned hybrid completion
@@ -1392,4 +1399,85 @@ where
         replace,
         withdraws_depth,
     })))
+}
+
+/// v56.0.0 (CIRISPersist#934 step 1, door 4) — an admitted re-seal
+/// (`reseal_attestation_v31`).
+pub(crate) struct PlannedReseal {
+    resealed: Attestation,
+    received_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl PlannedReseal {
+    /// The row the re-seal names.
+    pub(crate) fn attestation_id(&self) -> &str {
+        &self.resealed.attestation_id
+    }
+
+    /// **The re-seal against the row the executor holds** in its write step:
+    /// the shape gate (`migration::check_reseal_admission`) asked again on
+    /// `found`, then `found` with the re-seal's seal fields and its new row
+    /// hash. Before v56.0.0 sqlite and postgres judged the row they read
+    /// before their transaction and overwrote whatever was there by then
+    /// (I953); memory alone re-asked under its lock.
+    pub(crate) fn sealed_over(&self, found: &Attestation) -> Result<Attestation, Error> {
+        let resealed = &self.resealed;
+        crate::federation::migration::check_reseal_admission(found, resealed, self.received_at)?;
+        let mut row = found.clone();
+        row.attestation_envelope = resealed.attestation_envelope.clone();
+        row.original_content_hash = resealed.original_content_hash.clone();
+        row.scrub_signature_classical = resealed.scrub_signature_classical.clone();
+        row.scrub_signature_pqc = resealed.scrub_signature_pqc.clone();
+        row.scrub_key_id = resealed.scrub_key_id.clone();
+        row.scrub_timestamp = resealed.scrub_timestamp;
+        row.additional_scrubs = resealed.additional_scrubs.clone();
+        row.asserted_at = resealed.asserted_at;
+        row.expires_at = resealed.expires_at;
+        row.pqc_completed_at = resealed
+            .scrub_signature_pqc
+            .as_ref()
+            .map(|_| resealed.scrub_timestamp);
+        row.persist_row_hash = String::new();
+        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+        Ok(row)
+    }
+}
+
+/// v56.0.0 (CIRISPersist#934 step 1, door 4) — **the re-seal decision**, once
+/// for all three backends: the shape gate (AV-76 tier order: the pure gate
+/// leads) and the seal gate (#656), over the row as read.
+pub(crate) async fn plan_reseal_attestation<D>(
+    dir: &D,
+    stored: &Attestation,
+    resealed: &Attestation,
+    received_at: chrono::DateTime<chrono::Utc>,
+) -> Result<PlannedReseal, Error>
+where
+    D: AttestationStore,
+{
+    crate::federation::migration::check_reseal_admission(stored, resealed, received_at)?;
+    crate::federation::admission::check_reseal_seal_admission(dir, stored, resealed).await?;
+    Ok(PlannedReseal {
+        resealed: resealed.clone(),
+        received_at,
+    })
+}
+
+/// v56.0.0 (CIRISPersist#934 step 1, door 4) — the door: every backend's
+/// `reseal_attestation_v31` is this call. The one clock read of the door is
+/// here.
+pub(crate) async fn reseal_attestation_planned<D>(
+    dir: &D,
+    resealed: &Attestation,
+) -> Result<bool, Error>
+where
+    D: AttestationStore,
+{
+    let received_at = chrono::Utc::now();
+    let Some(stored) = dir.get_attestation(&resealed.attestation_id).await? else {
+        return Ok(false);
+    };
+    let planned = plan_reseal_attestation(dir, &stored, resealed, received_at).await?;
+    let landed = dir.store_planned_reseal(planned).await?;
+    Ok(landed)
 }

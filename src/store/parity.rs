@@ -154,6 +154,13 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("plan_write_local_attestation", Class::Delegates),
     ("local_occupied_id_verdict", Class::Gate),
     ("store_planned_local_attestation", Class::Plumbing),
+    // Door 4, the re-seal: the shared door, its plan, the executor, and the
+    // shared re-ask the executor makes inside its write step (a Plan: the
+    // shape gate on the row it holds).
+    ("reseal_attestation_planned", Class::Plan),
+    ("plan_reseal_attestation", Class::Delegates),
+    ("store_planned_reseal", Class::Plumbing),
+    ("sealed_over", Class::Plan),
     // ...and the local plan's own gates, seen for the first time with it:
     // the local-tier eligibility rule, the caller-signed transit verify, the
     // signed-instant read (refuses a malformed instant) and the local stamp
@@ -1075,22 +1082,17 @@ pub(crate) const DECLARED_DIVERGENCES: &[DeclaredDivergence] = &[
                  relative order is not observable in state, only in which message an operator \
                  sees when a row violates both.",
     },
-    DeclaredDivergence {
-        trait_name: "FederationDirectory",
-        method: "reseal_attestation_v31",
-        backend: "memory",
-        expected: &[
-            "check_reseal_admission",
-            "check_reseal_seal_admission",
-            "check_reseal_admission",
-        ],
-        reason: "Memory asks the pure shape gate TWICE: once before the lock, in the AV-76 tier \
-                 order its siblings run, and again on the row it actually found under the lock. \
-                 The SQL backends get that second answer from their transaction — they read and \
-                 update inside one — and memory's read is a separate `get_attestation` that locks \
-                 and releases, so without the re-ask the door would gate one row and mutate \
-                 another. An extra ask of a pure refusal is the safe direction of this difference.",
-    },
+    // v56.0.0 (CIRISPersist#934 door 4) — the `reseal_attestation_v31`
+    // declaration that stood here is gone, and its reason was false. It said
+    // the SQL backends "get that second answer from their transaction — they
+    // read and update inside one". They did not: sqlite and postgres read the
+    // row through `get_attestation` BEFORE their write transaction and asked
+    // nothing inside it, so a change landing between the read and the write was
+    // overwritten (I953, red on both before the fix). Memory alone re-asked
+    // under its lock. The door is now shared on all three: the plan asks the
+    // shape and seal gates, and every executor re-asks the shape gate on the
+    // row it holds inside its write step (`PlannedReseal::sealed_over`;
+    // SHARED_DOORS below).
     DeclaredDivergence {
         trait_name: "FederationDirectory",
         method: "list_signed_transport_destinations_since",
@@ -1158,7 +1160,7 @@ mod tests {
     /// files: `(file, fn)`. Each body is held to the same [`CALL_CLASSES`]
     /// partition as a backend door, and its sequence is what a door's
     /// `plan:NAME` token stands for.
-    const SHARED_PLANS: [(&str, &str); 4] = [
+    const SHARED_PLANS: [(&str, &str); 6] = [
         (
             "src/federation/attestation_admit.rs",
             "put_attestation_planned",
@@ -1175,6 +1177,11 @@ mod tests {
             "src/federation/attestation_admit.rs",
             "write_local_attestation_planned",
         ),
+        (
+            "src/federation/attestation_admit.rs",
+            "reseal_attestation_planned",
+        ),
+        ("src/federation/attestation_admit.rs", "sealed_over"),
     ];
 
     /// v56.0.0 (CIRISPersist#934) — **the doors that decide nothing in a
@@ -1184,7 +1191,7 @@ mod tests {
     /// this list on the commit that moves its decision into a plan, and
     /// cannot drift back: a gate added to one backend's copy fails
     /// [`shared_doors_decide_nothing_in_a_backend`].
-    const SHARED_DOORS: [(&str, &str, &str); 5] = [
+    const SHARED_DOORS: [(&str, &str, &str); 7] = [
         (
             "FederationDirectory",
             "put_attestation_with_origin",
@@ -1211,6 +1218,13 @@ mod tests {
             "attestation_insert_local",
             "write_local_attestation_planned",
         ),
+        (
+            "FederationDirectory",
+            "reseal_attestation_v31",
+            "reseal_attestation_planned",
+        ),
+        // The executor's re-ask inside its write step.
+        ("AttestationStore", "store_planned_reseal", "sealed_over"),
     ];
 
     /// Combinators that pass their receiver's failure through unchanged. The
@@ -2427,14 +2441,23 @@ mod tests {
             "check_instant_binding",
             Reads::ReceivedAt,
         ),
+        // The re-seal's shape gate read the receipt clock (its skew bound).
+        (
+            "plan_reseal_attestation",
+            "check_reseal_admission",
+            Reads::ReceivedAt,
+        ),
+        ("sealed_over", "check_reseal_admission", Reads::ReceivedAt),
     ];
 
     /// The plan fns [`PLAN_INSTANTS`] covers, in `src/federation/attestation_admit.rs`.
-    const INSTANT_PLANS: [&str; 4] = [
+    const INSTANT_PLANS: [&str; 6] = [
         "plan_put_attestation",
         "recheck_cycle_under_lock",
         "plan_attach_attestation_pqc_signature",
         "plan_write_local_attestation",
+        "plan_reseal_attestation",
+        "sealed_over",
     ];
 
     /// For every mention of `word` in `body`, the innermost CALL it is an

@@ -6349,121 +6349,16 @@ impl crate::federation::FederationDirectory for SqliteBackend {
     /// [`crate::federation::migration::check_reseal_admission`], shared with
     /// memory and postgres; verify-before-mutation over a LOADED COPY, so a
     /// refused re-seal leaves no trace.
+    /// v56.0.0 (CIRISPersist#934 step 1, door 4) — the decision is
+    /// [`plan_reseal_attestation`](crate::federation::attestation_admit::plan_reseal_attestation)
+    /// and its re-ask in the write step,
+    /// [`PlannedReseal::sealed_over`](crate::federation::attestation_admit::PlannedReseal::sealed_over);
+    /// this backend stores it.
     async fn reseal_attestation_v31(
         &self,
         resealed: &crate::federation::Attestation,
     ) -> Result<bool, crate::federation::Error> {
-        let Some(stored) = self.get_attestation(&resealed.attestation_id).await? else {
-            return Ok(false);
-        };
-        crate::federation::migration::check_reseal_admission(
-            &stored,
-            resealed,
-            chrono::Utc::now(),
-        )?;
-        // v31.0.0 (CIRISPersist#656) — THE SEAL, and the two instants the shape
-        // gate above does not pin. This door was the only write door into
-        // `federation_attestations` with no signature gate at all. One gate,
-        // three backends.
-        crate::federation::admission::check_reseal_seal_admission(self, &stored, resealed).await?;
-
-        let mut row = stored.clone();
-        row.attestation_envelope = resealed.attestation_envelope.clone();
-        row.original_content_hash = resealed.original_content_hash.clone();
-        row.scrub_signature_classical = resealed.scrub_signature_classical.clone();
-        row.scrub_signature_pqc = resealed.scrub_signature_pqc.clone();
-        row.scrub_key_id = resealed.scrub_key_id.clone();
-        row.scrub_timestamp = resealed.scrub_timestamp;
-        row.additional_scrubs = resealed.additional_scrubs.clone();
-        row.asserted_at = resealed.asserted_at;
-        row.expires_at = resealed.expires_at;
-        row.pqc_completed_at = resealed
-            .scrub_signature_pqc
-            .as_ref()
-            .map(|_| resealed.scrub_timestamp);
-        let mut for_hash = row.clone();
-        for_hash.persist_row_hash = String::new();
-        let new_hash = crate::federation::types::compute_persist_row_hash(&for_hash)?;
-
-        let envelope_text = serde_json::to_string(&row.attestation_envelope)
-            .map_err(|e| crate::federation::Error::Backend(format!("envelope serialize: {e}")))?;
-        let och: Vec<u8> = hex::decode(&row.original_content_hash).map_err(|e| {
-            crate::federation::Error::InvalidArgument(format!("original_content_hash hex: {e}"))
-        })?;
-        let scrubs_json = serde_json::to_string(&row.additional_scrubs)
-            .map_err(|e| crate::federation::Error::Backend(format!("scrubs serialize: {e}")))?;
-        let wire_index_key = crate::federation::wire_index::record_key(&[(
-            "attestation_id",
-            &resealed.attestation_id,
-        )]);
-        let id = resealed.attestation_id.clone();
-        let classical = row.scrub_signature_classical.clone();
-        let pqc = row.scrub_signature_pqc.clone();
-        let scrub_key = row.scrub_key_id.clone();
-        let ts = row.scrub_timestamp.to_rfc3339();
-        let pqc_completed = row.pqc_completed_at.map(|t| t.to_rfc3339());
-        let asserted = row.asserted_at.to_rfc3339();
-        let expires = row.expires_at.map(|t| t.to_rfc3339());
-        let federation_tier = row.tier == crate::federation::types::attestation_tier::FEDERATION;
-        #[cfg(test)]
-        self.test_hooks()
-            .pause_if_armed("reseal_before_write")
-            .await;
-        let n = self
-            .write(move |conn| -> Result<usize, rusqlite::Error> {
-                let tx = conn.transaction()?;
-                // v36.0.0 (#668/#707-class) — a re-seal rewrites the served bytes;
-                // the serve position moves with them.
-                let admitted_at =
-                    sqlite_next_plane_position(&tx, "federation_attestations", POS_ATTESTATION)?;
-                let n = tx.execute(
-                    "UPDATE federation_attestations \
-                 SET attestation_envelope = ?2, original_content_hash = ?3, \
-                     scrub_signature_classical = ?4, scrub_signature_pqc = ?5, \
-                     scrub_key_id = ?6, scrub_timestamp = ?7, pqc_completed_at = ?8, \
-                     additional_scrubs = ?9, asserted_at = ?10, expires_at = ?11, \
-                     persist_row_hash = ?12, admitted_at = ?13 \
-                 WHERE attestation_id = ?1",
-                    rusqlite::params![
-                        id,
-                        envelope_text,
-                        och,
-                        classical,
-                        pqc,
-                        scrub_key,
-                        ts,
-                        pqc_completed,
-                        scrubs_json,
-                        asserted,
-                        expires,
-                        new_hash,
-                        admitted_at.to_rfc3339(),
-                    ],
-                )?;
-                // The V106 projection carries `asserted_at`, which the instant
-                // truncation may have moved. Same statement, same transaction.
-                tx.execute(
-                    "UPDATE attestation_subjects SET asserted_at = ?2 WHERE attestation_id = ?1",
-                    rusqlite::params![id, asserted],
-                )?;
-                tx.commit()?;
-                Ok(n)
-            })
-            .await
-            .map_err(|e| {
-                crate::federation::Error::Backend(format!("reseal_attestation_v31: {e}"))
-            })?;
-        if n == 0 {
-            return Ok(false);
-        }
-        // The wire index moves WITH the row (#610): the re-seal recomputes
-        // `persist_row_hash`, so without re-indexing the row advertises a hash
-        // the index does not hold.
-        if federation_tier {
-            self.index_stored_record("Attestation", &wire_index_key)
-                .await?;
-        }
-        Ok(true)
+        crate::federation::attestation_admit::reseal_attestation_planned(self, resealed).await
     }
 
     /// v31.0.0 (CIRISPersist#650) — hard-delete one attestation row.
@@ -22554,6 +22449,105 @@ impl crate::federation::attestation_admit::AttestationStore for SqliteBackend {
             }
         })?;
         Ok(())
+    }
+
+    async fn store_planned_reseal(
+        &self,
+        planned: crate::federation::attestation_admit::PlannedReseal,
+    ) -> Result<bool, crate::federation::Error> {
+        use crate::federation::Error;
+        #[cfg(test)]
+        self.test_hooks()
+            .pause_if_armed("reseal_before_write")
+            .await;
+        let id = planned.attestation_id().to_owned();
+        let sealed = self
+            .write(move |conn| -> Result<Option<crate::federation::Attestation>, Error> {
+                let db = |e: rusqlite::Error| Error::Backend(format!("reseal_attestation_v31: {e}"));
+                let tx = conn.transaction().map_err(db)?;
+                // The row as it is NOW, inside the transaction that writes it.
+                let found = tx
+                    .query_row(
+                        "SELECT attestation_id, attesting_key_id, attested_key_id, attestation_type, \
+                            weight, asserted_at, expires_at, attestation_envelope, \
+                            original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
+                            scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, \
+                            subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at, additional_scrubs \
+                         FROM federation_attestations WHERE attestation_id = ?1",
+                        [&id],
+                        sqlite_row_to_attestation,
+                    )
+                    .optional()
+                    .map_err(db)?;
+                let Some(found) = found else {
+                    return Ok(None);
+                };
+                let row = planned.sealed_over(&found)?;
+                let envelope_text = serde_json::to_string(&row.attestation_envelope)
+                    .map_err(|e| Error::Backend(format!("envelope serialize: {e}")))?;
+                let och: Vec<u8> = hex::decode(&row.original_content_hash)
+                    .map_err(|e| Error::InvalidArgument(format!("original_content_hash hex: {e}")))?;
+                let scrubs_json = serde_json::to_string(&row.additional_scrubs)
+                    .map_err(|e| Error::Backend(format!("scrubs serialize: {e}")))?;
+                // v36.0.0 (#668/#707-class) — a re-seal rewrites the served
+                // bytes; the serve position moves with them.
+                let admitted_at =
+                    sqlite_next_plane_position(&tx, "federation_attestations", POS_ATTESTATION)
+                        .map_err(db)?;
+                let asserted = row.asserted_at.to_rfc3339();
+                tx.execute(
+                    "UPDATE federation_attestations \
+                 SET attestation_envelope = ?2, original_content_hash = ?3, \
+                     scrub_signature_classical = ?4, scrub_signature_pqc = ?5, \
+                     scrub_key_id = ?6, scrub_timestamp = ?7, pqc_completed_at = ?8, \
+                     additional_scrubs = ?9, asserted_at = ?10, expires_at = ?11, \
+                     persist_row_hash = ?12, admitted_at = ?13 \
+                 WHERE attestation_id = ?1",
+                    rusqlite::params![
+                        row.attestation_id,
+                        envelope_text,
+                        och,
+                        row.scrub_signature_classical,
+                        row.scrub_signature_pqc,
+                        row.scrub_key_id,
+                        row.scrub_timestamp.to_rfc3339(),
+                        row.pqc_completed_at.map(|t| t.to_rfc3339()),
+                        scrubs_json,
+                        asserted,
+                        row.expires_at.map(|t| t.to_rfc3339()),
+                        row.persist_row_hash,
+                        admitted_at.to_rfc3339(),
+                    ],
+                )
+                .map_err(db)?;
+                // The V106 projection carries `asserted_at`, which the instant
+                // truncation may have moved. Same transaction.
+                tx.execute(
+                    "UPDATE attestation_subjects SET asserted_at = ?2 WHERE attestation_id = ?1",
+                    rusqlite::params![row.attestation_id, asserted],
+                )
+                .map_err(db)?;
+                tx.commit().map_err(db)?;
+                Ok(Some(row))
+            })
+            .await?;
+        let Some(row) = sealed else {
+            return Ok(false);
+        };
+        // The wire index moves WITH the row (#610): the re-seal recomputes
+        // `persist_row_hash`, so without re-indexing the row advertises a hash
+        // the index does not hold.
+        if row.tier == crate::federation::types::attestation_tier::FEDERATION {
+            self.index_stored_record(
+                "Attestation",
+                &crate::federation::wire_index::record_key(&[(
+                    "attestation_id",
+                    &row.attestation_id,
+                )]),
+            )
+            .await?;
+        }
+        Ok(true)
     }
 
     async fn store_planned_attestation(

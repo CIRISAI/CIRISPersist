@@ -8150,134 +8150,16 @@ impl crate::federation::FederationDirectory for PostgresBackend {
     /// v31.0.0 (CIRISPersist#650) — re-seal in place. Gate stack is
     /// [`crate::federation::migration::check_reseal_admission`], shared with
     /// memory and sqlite; verify-before-mutation over a LOADED COPY.
+    /// v56.0.0 (CIRISPersist#934 step 1, door 4) — the decision is
+    /// [`plan_reseal_attestation`](crate::federation::attestation_admit::plan_reseal_attestation)
+    /// and its re-ask in the write step,
+    /// [`PlannedReseal::sealed_over`](crate::federation::attestation_admit::PlannedReseal::sealed_over);
+    /// this backend stores it.
     async fn reseal_attestation_v31(
         &self,
         resealed: &crate::federation::Attestation,
     ) -> Result<bool, crate::federation::Error> {
-        let Some(stored) = self.get_attestation(&resealed.attestation_id).await? else {
-            return Ok(false);
-        };
-        crate::federation::migration::check_reseal_admission(
-            &stored,
-            resealed,
-            chrono::Utc::now(),
-        )?;
-        // v31.0.0 (CIRISPersist#656) — THE SEAL, and the two instants the shape
-        // gate above does not pin. This door was the only write door into
-        // `federation_attestations` with no signature gate at all. One gate,
-        // three backends.
-        crate::federation::admission::check_reseal_seal_admission(self, &stored, resealed).await?;
-
-        let mut row = stored.clone();
-        row.attestation_envelope = resealed.attestation_envelope.clone();
-        row.original_content_hash = resealed.original_content_hash.clone();
-        row.scrub_signature_classical = resealed.scrub_signature_classical.clone();
-        row.scrub_signature_pqc = resealed.scrub_signature_pqc.clone();
-        row.scrub_key_id = resealed.scrub_key_id.clone();
-        row.scrub_timestamp = resealed.scrub_timestamp;
-        row.additional_scrubs = resealed.additional_scrubs.clone();
-        row.asserted_at = resealed.asserted_at;
-        row.expires_at = resealed.expires_at;
-        row.pqc_completed_at = resealed
-            .scrub_signature_pqc
-            .as_ref()
-            .map(|_| resealed.scrub_timestamp);
-        let mut for_hash = row.clone();
-        for_hash.persist_row_hash = String::new();
-        let new_hash = crate::federation::types::compute_persist_row_hash(&for_hash)?;
-
-        // v31.0.0 (#644) — attestation_envelope is TEXT since V122.
-        let envelope_text = pg_envelope_text(&row.attestation_envelope, "attestation_envelope")?;
-        let och: Vec<u8> = hex::decode(&row.original_content_hash).map_err(|e| {
-            crate::federation::Error::InvalidArgument(format!("original_content_hash hex: {e}"))
-        })?;
-        let scrubs_json = serde_json::to_string(&row.additional_scrubs)
-            .map_err(|e| crate::federation::Error::Backend(format!("scrubs serialize: {e}")))?;
-        let id = resealed.attestation_id.as_str();
-        let classical = row.scrub_signature_classical.clone();
-        let pqc = row.scrub_signature_pqc.clone();
-        let scrub_key = row.scrub_key_id.clone();
-        let scrub_ts = row.scrub_timestamp;
-        let pqc_completed = row.pqc_completed_at;
-        let asserted = row.asserted_at;
-        let expires = row.expires_at;
-        let federation_tier = row.tier == crate::federation::types::attestation_tier::FEDERATION;
-
-        #[cfg(test)]
-        self.test_hooks()
-            .pause_if_armed("reseal_before_write")
-            .await;
-        let mut client = self
-            .get_client()
-            .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
-        let tx = client
-            .transaction()
-            .await
-            .map_err(|e| crate::federation::Error::Backend(format!("begin tx: {e}")))?;
-        // v36.0.0 (#668/#707-class) — a re-seal rewrites the served bytes;
-        // the serve position moves with them.
-        let admitted_at = self
-            .next_plane_position(&tx, "federation_attestations")
-            .await?;
-        let n = tx
-            .execute(
-                "UPDATE cirislens.federation_attestations \
-                 SET attestation_envelope = $2, original_content_hash = $3, \
-                     scrub_signature_classical = $4, scrub_signature_pqc = $5, \
-                     scrub_key_id = $6, scrub_timestamp = $7, pqc_completed_at = $8, \
-                     additional_scrubs = $9, asserted_at = $10, expires_at = $11, \
-                     persist_row_hash = $12, admitted_at = $13 \
-                 WHERE attestation_id = $1",
-                &[
-                    &id,
-                    &envelope_text,
-                    &och,
-                    &classical,
-                    &pqc,
-                    &scrub_key,
-                    &scrub_ts,
-                    &pqc_completed,
-                    &scrubs_json,
-                    &asserted,
-                    &expires,
-                    &new_hash,
-                    &admitted_at,
-                ],
-            )
-            .await
-            .map_err(|e| {
-                crate::federation::Error::Backend(format!("reseal_attestation_v31: {e}"))
-            })?;
-        // The V106 projection carries `asserted_at`, which the instant
-        // truncation may have moved. Same transaction.
-        tx.execute(
-            "UPDATE cirislens.attestation_subjects SET asserted_at = $2 WHERE attestation_id = $1",
-            &[&id, &asserted],
-        )
-        .await
-        .map_err(|e| {
-            crate::federation::Error::Backend(format!("reseal_attestation_v31 subjects: {e}"))
-        })?;
-        tx.commit().await.map_err(|e| {
-            crate::federation::Error::Backend(format!("reseal_attestation_v31 commit: {e}"))
-        })?;
-        drop(client);
-        if n == 0 {
-            return Ok(false);
-        }
-        // The wire index moves WITH the row (#610).
-        if federation_tier {
-            self.index_stored_record(
-                "Attestation",
-                &crate::federation::wire_index::record_key(&[(
-                    "attestation_id",
-                    &resealed.attestation_id,
-                )]),
-            )
-            .await?;
-        }
-        Ok(true)
+        crate::federation::attestation_admit::reseal_attestation_planned(self, resealed).await
     }
 
     /// v31.0.0 (CIRISPersist#650) — hard-delete one attestation row.
@@ -23827,6 +23709,102 @@ impl crate::federation::attestation_admit::AttestationStore for PostgresBackend 
             .await
             .map_err(|e| Error::Backend(format!("local attestation commit: {e}")))?;
         Ok(())
+    }
+
+    async fn store_planned_reseal(
+        &self,
+        planned: crate::federation::attestation_admit::PlannedReseal,
+    ) -> Result<bool, crate::federation::Error> {
+        #[cfg(test)]
+        self.test_hooks()
+            .pause_if_armed("reseal_before_write")
+            .await;
+        let id = planned.attestation_id().to_owned();
+        let mut client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("begin tx: {e}")))?;
+        // The row as it is NOW, locked for this transaction.
+        let found = tx
+            .query_opt(
+                "SELECT attestation_id::text, attesting_key_id, attested_key_id, attestation_type, \
+                    weight::float8 AS weight, asserted_at, expires_at, attestation_envelope, \
+                    original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
+                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at, additional_scrubs \
+                 FROM cirislens.federation_attestations WHERE attestation_id = $1 FOR UPDATE",
+                &[&id],
+            )
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("reseal lookup: {e}")))?;
+        let Some(found) = found.map(pg_row_to_attestation).transpose()? else {
+            return Ok(false);
+        };
+        let row = planned.sealed_over(&found)?;
+        // v31.0.0 (#644) — attestation_envelope is TEXT since V122.
+        let envelope_text = pg_envelope_text(&row.attestation_envelope, "attestation_envelope")?;
+        let och: Vec<u8> = hex::decode(&row.original_content_hash).map_err(|e| {
+            crate::federation::Error::InvalidArgument(format!("original_content_hash hex: {e}"))
+        })?;
+        let scrubs_json = serde_json::to_string(&row.additional_scrubs)
+            .map_err(|e| crate::federation::Error::Backend(format!("scrubs serialize: {e}")))?;
+        // v36.0.0 (#668/#707-class) — a re-seal rewrites the served bytes;
+        // the serve position moves with them.
+        let admitted_at = self
+            .next_plane_position(&tx, "federation_attestations")
+            .await?;
+        tx.execute(
+            "UPDATE cirislens.federation_attestations \
+             SET attestation_envelope = $2, original_content_hash = $3, \
+                 scrub_signature_classical = $4, scrub_signature_pqc = $5, \
+                 scrub_key_id = $6, scrub_timestamp = $7, pqc_completed_at = $8, \
+                 additional_scrubs = $9, asserted_at = $10, expires_at = $11, \
+                 persist_row_hash = $12, admitted_at = $13 \
+             WHERE attestation_id = $1",
+            &[
+                &id,
+                &envelope_text,
+                &och,
+                &row.scrub_signature_classical,
+                &row.scrub_signature_pqc,
+                &row.scrub_key_id,
+                &row.scrub_timestamp,
+                &row.pqc_completed_at,
+                &scrubs_json,
+                &row.asserted_at,
+                &row.expires_at,
+                &row.persist_row_hash,
+                &admitted_at,
+            ],
+        )
+        .await
+        .map_err(|e| crate::federation::Error::Backend(format!("reseal_attestation_v31: {e}")))?;
+        // The V106 projection carries `asserted_at`, which the instant
+        // truncation may have moved. Same transaction.
+        tx.execute(
+            "UPDATE cirislens.attestation_subjects SET asserted_at = $2 WHERE attestation_id = $1",
+            &[&id, &row.asserted_at],
+        )
+        .await
+        .map_err(|e| {
+            crate::federation::Error::Backend(format!("reseal_attestation_v31 subjects: {e}"))
+        })?;
+        tx.commit().await.map_err(|e| {
+            crate::federation::Error::Backend(format!("reseal_attestation_v31 commit: {e}"))
+        })?;
+        drop(client);
+        // The wire index moves WITH the row (#610).
+        if row.tier == crate::federation::types::attestation_tier::FEDERATION {
+            self.index_stored_record(
+                "Attestation",
+                &crate::federation::wire_index::record_key(&[("attestation_id", &id)]),
+            )
+            .await?;
+        }
+        Ok(true)
     }
 
     async fn store_planned_attestation(
