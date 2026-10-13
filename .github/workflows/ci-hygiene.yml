@@ -122,6 +122,23 @@ jobs:
           done
           echo "::notice::Pruned $n skipped auto-retry run(s)."
 
+  # v56.0.0 (CIRISPersist#934, #1076 slice T item 0) — a GATE, unlike the
+  # reports job below: every evidence/cc_impl.tsv pointer on main names a
+  # definition. ci.yml's lint job runs the same check per PR; this one re-asks
+  # daily on main, so a pointer that died in a merge nobody re-linted shows red.
+  evidence-pointers:
+    name: evidence pointers resolve (gate)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+      - name: evidence pointers resolve to definitions
+        run: |
+          set -euo pipefail
+          python3 scripts/evidence_pointers_test.py
+          python3 scripts/evidence_pointers.py check | tee -a "$GITHUB_STEP_SUMMARY"
+
   # v56.0.0 (CIRISPersist#934, #1076 slice T) — REPORTS, not gates. Every step
   # here prints what it found and the job stays green: nothing new goes red on
   # main without the operator. docs/TOOLING.md lists which tool is which.
