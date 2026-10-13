@@ -904,6 +904,48 @@ threat-model citations because this crate's audit story is the point.
     replaces the old unkept-stream witness.
   - I768 pins `terminator_seq`.
 
+### Fixed — Codex round 4 on #1065
+
+Two findings are fixed here. The two plaintext-DAG input checks are deferred
+to #1072. The repeats are in #1070 and #1071, or were already fixed.
+
+- **The re-ack sweeper runs its first pass at spawn** (`engine.rs`, P2,
+  upgrade).
+  - The bug: the auto-spawned sweeper slept an hour before its first pass.
+    That pass carries the upgrade conversion of a v54 node's retired rc6
+    holding claims, which v55's holder reads no longer count. So an upgraded
+    node was undiscoverable for its first hour, and a node restarting more
+    often than hourly never converted.
+  - The fix: one pass at spawn, then the interval.
+  - Class sweep of the other auto-spawned loops:
+    - the disk-budget eviction sweeper also sleeps first, but its pass is
+      budget relief, not upgrade or repair work, so it is unchanged;
+    - the key-grant dirty loop already runs at boot;
+    - the retention sweep and the takedown finalize are host-driven, not
+      spawned.
+  - Witness: I803.
+- **The room retention sweep never orphans a retained DAG manifest**
+  (`community_dek.rs`, P1, data loss).
+  - The bug: the room-stream leg could evict every chunk of a stream epoch
+    minted at community epoch N after the stream was sealed under N+1. The
+    manifest and its live holding claim stayed, so an advertised DAG failed
+    every read.
+  - The rule chosen: the room's retention bound applies to the content as
+    advertised, the DAG, bound to the community epoch it was sealed under. It
+    does not apply to the epoch at which its chunks' key was minted.
+    Evicting the manifest early instead would delete content the room's own
+    policy keeps.
+  - The fix (sqlite and postgres, one predicate):
+    `stream_dek_evict_room_chunks` skips a stream epoch any of whose chunks
+    a still-held manifest relates (`federation_dag_chunks`).
+    `sweep_rotated_epochs` runs the room leg after the epoch loop, so a
+    manifest that its own epoch's eviction removes takes its chunks in the
+    same sweep.
+  - Witness: I779. Sealed under a newer epoch, the DAG is retained whole and
+    reads in full. Once that epoch is past retention, the manifest and every
+    chunk go in one sweep and nothing is advertised. It is never half a DAG.
+    I757 now seals its stream within its own room epoch.
+
 ### Fixed — withheld blobs are not deficit (CIRISEdge v55)
 
 - **The bug:** `durability_deficit` / `deficit_over` and `blob_custody` never
