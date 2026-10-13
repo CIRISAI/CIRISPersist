@@ -1417,6 +1417,52 @@ pub(crate) mod blob_bodies {
             b.list_holders(&other_sha).await.unwrap(),
             vec![n.key.clone()]
         );
+        // A blob whose LIVE claim stands (the directory-level takedown
+        // retracts no claim): the holder reads still name nothing.
+        let claimed = format!("i778-claimed {s}").into_bytes();
+        let claimed_sha = sha256_of(&claimed);
+        b.put_blob_signing_scoped(
+            cs::FEDERATION,
+            None,
+            &claimed_sha,
+            BlobBody::Inline(claimed),
+            None,
+            &n.key,
+            &n.signer,
+            chrono::Utc::now(),
+            uuid::Uuid::new_v4(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            b.list_holders(&claimed_sha).await.unwrap(),
+            vec![n.key.clone()],
+            "I802 precondition: a live claim"
+        );
+        establish(dir, "i778-producer", &owner.id, &hex::encode(claimed_sha)).await;
+        crate::federation::takedown_tombstone::takedown_tombstone(
+            dir,
+            &notice(&owner, &hex::encode(claimed_sha), "dmca_512"),
+            "i778-node",
+        )
+        .await
+        .expect("I802 the second takedown");
+        assert!(
+            !claims_of(b, &n.key, &claimed_sha).await.is_empty(),
+            "I802 precondition: the claim row stands"
+        );
+        assert!(
+            b.list_holders(&claimed_sha).await.unwrap().is_empty(),
+            "I802 list_holders names no holder of withheld bytes"
+        );
+        assert!(
+            b.list_local_holders(&claimed_sha).await.unwrap().is_empty(),
+            "I802 list_local_holders names none either"
+        );
+        assert!(
+            !b.list_held_by(&n.key).await.unwrap().contains(&claimed_sha),
+            "I802 list_held_by drops it"
+        );
     }
 
     /// **I717** — the content's scope, at admission and at the announce door.
