@@ -326,6 +326,78 @@ mod pure {
             .map_or(0, |(_, n)| n)
     }
 
+    /// I777 (Codex r2 on #1065) — the retired key-grant carriers are matched
+    /// as WHOLE strings and only `holds_bytes:` as a stem: under `Report`,
+    /// `key_grant:content:v10` and `key_grant:content:v1beta` are reported
+    /// and served, the three exact types stay retired (refused, never
+    /// served), and the Report serve filter makes the same split in SQL.
+    pub(crate) const I777_CASES: &[(&str, bool)] = &[
+        ("key_grant:content:v1", true),
+        ("key_grant:epoch:v1", true),
+        ("key_grant:stream:v1", true),
+        ("key_grant:content:v10", false),
+        ("key_grant:content:v1beta", false),
+        ("key_grant:stream:v1x", false),
+        ("holds_bytes:sha256:0a1b2c3d", true),
+        ("holds_bytes:anything", true),
+        ("scores", false),
+    ];
+
+    #[tokio::test]
+    async fn i777_retired_key_grant_carriers_match_whole_strings() {
+        use crate::federation::row_type::{
+            retired_carrier, served_under_enforcement, with_enforcement, RowTypeEnforcement,
+        };
+        for (t, retired) in I777_CASES {
+            assert_eq!(retired_carrier(t).is_some(), *retired, "I777 {t}");
+            if t.starts_with("key_grant:") {
+                assert_eq!(
+                    crate::federation::key_grant::is_retired_key_grant_set_type(t),
+                    *retired,
+                    "I777 the key-grant door's reading of {t}"
+                );
+            }
+            let mut row = crate::federation::tier_ingest::test_support::bare_attestation(
+                "i777",
+                "a",
+                "b",
+                &serde_json::json!({"dimension": "x:v1"}),
+            );
+            row.attestation_type = (*t).to_owned();
+            let (door, served) = with_enforcement(RowTypeEnforcement::Report, async move {
+                (
+                    crate::federation::row_type::check_row_type(&row).is_ok(),
+                    served_under_enforcement(&row),
+                )
+            })
+            .await;
+            assert_eq!(served, !retired, "I777 {t}: served under Report");
+            if *retired {
+                assert!(!door, "I777 {t}: a retired carrier is refused under Report");
+            } else if *t != "scores" {
+                assert!(
+                    door,
+                    "I777 {t}: an unregistered type is reported, not refused"
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn i777_sqlite_the_report_filter_makes_the_same_split() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let f = crate::federation::row_type::not_retired_carrier_sql("t");
+        for (t, retired) in I777_CASES {
+            let kept: bool = conn
+                .query_row(&format!("SELECT {f} FROM (SELECT ?1 AS t)"), [t], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert_eq!(kept, !retired, "I777 {t:?} under {f}");
+        }
+    }
+
     /// I376 (sqlite) — the generated SQL predicate agrees with [`classify`] on
     /// every CC vector and on the design's probes.
     #[cfg(feature = "sqlite")]
@@ -989,6 +1061,26 @@ mod pg_predicate {
     use crate::federation::row_type::{
         classify, registered_row_type_sql, RowTypeClass, SqlDialect,
     };
+
+    #[tokio::test]
+    async fn i777_postgres_the_report_filter_makes_the_same_split() {
+        let Some(dsn) = crate::test_pg::empty_dsn() else {
+            return;
+        };
+        let (client, conn) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+            .await
+            .unwrap();
+        tokio::spawn(conn);
+        let f = crate::federation::row_type::not_retired_carrier_sql("t");
+        for (t, retired) in super::pure::I777_CASES {
+            let kept: bool = client
+                .query_one(&format!("SELECT {f} FROM (SELECT $1::text AS t) q"), &[t])
+                .await
+                .unwrap()
+                .get(0);
+            assert_eq!(kept, !retired, "I777 {t:?} under {f}");
+        }
+    }
 
     #[tokio::test]
     async fn i376_postgres_predicate_agrees_with_the_classifier() {

@@ -392,11 +392,15 @@ pub fn key_grant_dimension_of(row: &Attestation) -> Option<&'static str> {
     .find(|k| *k == d)
 }
 
-/// v55.0.0 (#989) — is `attestation_type` a retired key-grant SET carrier
-/// (`key_grant:{axis}:{version}`, any spelling under the stem)?
+/// v55.0.0 (#989) — is `attestation_type` one of the three retired
+/// key-grant SET carriers? A whole-string match against
+/// [`RETIRED_CARRIER_STEMS`](crate::federation::namespace::registry::RETIRED_CARRIER_STEMS)'
+/// key-grant entries (Codex r2 on #1065): another type that only shares the
+/// prefix (`key_grant:content:v10`) is not a retired SET.
 #[must_use]
 pub fn is_retired_key_grant_set_type(attestation_type: &str) -> bool {
     attestation_type.starts_with(KEY_GRANT_DIMENSION_PREFIX)
+        && crate::federation::row_type::retired_carrier(attestation_type).is_some()
 }
 
 /// v54.0.0 (CIRISPersist#1033, CC 2.4.1.2.1 / CC 4.4.3.4.3) — **may `signer`

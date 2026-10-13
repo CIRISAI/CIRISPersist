@@ -114,8 +114,8 @@ pub async fn with_enforcement<F: std::future::Future>(
 pub fn retired_carrier(attestation_type: &str) -> Option<&'static str> {
     registry::RETIRED_CARRIER_STEMS
         .iter()
-        .map(|(stem, _)| *stem)
-        .find(|stem| attestation_type.starts_with(stem))
+        .find(|(entry, how, _)| how.matches(entry, attestation_type))
+        .map(|(entry, _, _)| *entry)
 }
 
 /// What the closed slot makes of a row type.
@@ -516,18 +516,20 @@ pub fn registered_row_type_sql(column: &str, dialect: SqlDialect) -> String {
 
 /// `column` is NOT a retired carrier type ([`registry::RETIRED_CARRIER_STEMS`]), as a
 /// SQL boolean expression both dialects read the same way: a `substr`
-/// comparison, never `LIKE` (whose `_` is a wildcard and whose case rule
-/// differs by dialect).
+/// comparison for a stem and a whole-string `<>` for an exact entry, never
+/// `LIKE` (whose `_` is a wildcard and whose case rule differs by dialect).
+/// The same split [`retired_carrier`] makes (Codex r2 on #1065).
 #[must_use]
 pub fn not_retired_carrier_sql(column: &str) -> String {
     let arms: Vec<String> = registry::RETIRED_CARRIER_STEMS
         .iter()
-        .map(|(stem, _)| {
-            format!(
+        .map(|(entry, how, _)| match how {
+            registry::RetiredMatch::Stem => format!(
                 "substr({column}, 1, {}) <> {}",
-                stem.chars().count(),
-                sql_quote(stem)
-            )
+                entry.chars().count(),
+                sql_quote(entry)
+            ),
+            registry::RetiredMatch::Exact => format!("{column} <> {}", sql_quote(entry)),
         })
         .collect();
     format!("({})", arms.join(" AND "))

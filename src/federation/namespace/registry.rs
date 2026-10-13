@@ -428,11 +428,13 @@ pub const RETIRED_HOLDING_CLAIM_STEM: &str = "holds_bytes:";
 /// Both are gone"), and the vendored cut carries no list of retired carriers
 /// (`_meta.row_types` names only what IS admitted), so this is persist's,
 /// beside [`RETIRED_FAMILIES`], read by `row_type::retired_carrier` and
-/// `row_type::not_retired_carrier_sql`. A PREFIX match: the holding-claim
-/// entry is a stem, so no spelling of `holds_bytes` — the rc6 8-hex form or
-/// any other — is admitted; each key-grant entry names a whole type, because
-/// the filter is class-blind and a bare `key_grant:` stem would also name a
-/// future type sharing it.
+/// `row_type::not_retired_carrier_sql`. Each entry says how it matches
+/// ([`RetiredMatch`]): the holding-claim entry is a STEM, so no spelling of
+/// `holds_bytes` — the rc6 8-hex form or any other — is admitted; each
+/// key-grant entry is a WHOLE type (Codex r2 on #1065: a prefix read
+/// `key_grant:content:v10` and `key_grant:content:v1beta` as retired too, so
+/// under `Report` they were refused and hidden instead of reported and
+/// served, and no later version sharing the prefix could be introduced).
 ///
 /// The v55 re-vendor (CIRISPersist#753, slice A0) kept both rc6 carriers
 /// admitted by a temporary exception while persist still wrote them. Slice A
@@ -440,19 +442,52 @@ pub const RETIRED_HOLDING_CLAIM_STEM: &str = "holds_bytes:";
 /// moved each key wrap onto a per-recipient `scores` row on
 /// `key_grant:{axis}:v1` (CC 3.3.2); with both merged the exception is
 /// deleted, and I701 holds it deleted.
-pub const RETIRED_CARRIER_STEMS: &[(&str, &str)] = &[
+pub const RETIRED_CARRIER_STEMS: &[(&str, RetiredMatch, &str)] = &[
     (
         RETIRED_HOLDING_CLAIM_STEM,
+        RetiredMatch::Stem,
         "CC 2.4 rc7 / CIRISConstitution#141: the holding claim is custody:ack:v1 at the \
          content's scope",
     ),
     // The rc6 key-grant SET, retired by CC 2.4 rc7 (CIRISConstitution#143): a
     // wrap is a per-recipient `scores` row on `key_grant:{axis}:v1`. Each node
     // re-emits its own wraps as rows (operator ruling Q3, V192).
-    ("key_grant:content:v1", "CIRISPersist#989"),
-    ("key_grant:epoch:v1", "CIRISPersist#989"),
-    ("key_grant:stream:v1", "CIRISPersist#989"),
+    (
+        "key_grant:content:v1",
+        RetiredMatch::Exact,
+        "CIRISPersist#989",
+    ),
+    (
+        "key_grant:epoch:v1",
+        RetiredMatch::Exact,
+        "CIRISPersist#989",
+    ),
+    (
+        "key_grant:stream:v1",
+        RetiredMatch::Exact,
+        "CIRISPersist#989",
+    ),
 ];
+
+/// How a [`RETIRED_CARRIER_STEMS`] entry matches an `attestation_type`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetiredMatch {
+    /// Every type that begins with the entry (`holds_bytes:` alone).
+    Stem,
+    /// The entry as a whole string, byte for byte.
+    Exact,
+}
+
+impl RetiredMatch {
+    /// Does `attestation_type` fall under `entry` matched this way?
+    #[must_use]
+    pub fn matches(self, entry: &str, attestation_type: &str) -> bool {
+        match self {
+            Self::Stem => attestation_type.starts_with(entry),
+            Self::Exact => attestation_type == entry,
+        }
+    }
+}
 
 /// Every carrier row type the row-type gate admits: the vendored cut's
 /// `_meta.row_types.carriers` and nothing persist adds (rc7 registers none).
