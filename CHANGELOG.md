@@ -904,6 +904,77 @@ threat-model citations because this crate's audit story is the point.
     replaces the old unkept-stream witness.
   - I768 pins `terminator_seq`.
 
+### Fixed — Codex round 2 on #1065
+
+Nine findings are fixed here. Three takedown-robustness findings are deferred
+to #1070: the immediate path without a LocalSigner, resuming a recorded
+takedown before reauthorizing it, and the tombstone/write race. Each fix below
+has a witness on sqlite and postgres (memory too where it has the plane), and
+a mutation of each clause turns its witness red.
+
+- **The re-ack scan is not an access** (`holding_claim.rs`, P1).
+  - The bug: `has_blob` bumps `access_count` and `last_accessed_at`. The
+    hourly re-ack scan called it for every claimed blob, so every advertised
+    blob looked hot and cold bytes evaded the storage-budget sweeper.
+  - The fix: these existence reads now read the row head (`blob_head`): the
+    re-ack scan and its legacy conversion, the holder directory reads
+    (`list_holders`, `list_local_holders`), the custody view, and the evict
+    walks' chunk and child probes. The user-facing `has_blob` door still
+    counts as an access.
+  - Witness: I771.
+- **Takedown authority reads only LIVE bindings** (`takedown_tombstone.rs`, P1).
+  - The bug: every binding row granted authority, including expired,
+    withdrawn and recanted ones. So a former subject or a former room's
+    moderator could still authorize while the digest stayed bound elsewhere.
+  - The fix: a row expired at the read instant, or retired under the
+    bytes-plane fold (`blob_tombstone::retiring_composer`, every entitlement
+    re-derived), confers nothing.
+  - Two further fixes in the same fold: a live row's non-empty
+    `attested_key_id` is a subject (P1), and an `affiliations` row's
+    `community_id` is a bound community (P2).
+  - Witness: I772.
+- **A plaintext DAG's chunks follow it** (`sqlite.rs` / `postgres.rs`, P1).
+  - The bug: the incremental finalize (`put_dag_manifest_over_held`) and the
+    one-shot `put_blob_chunks` wrote the `chunk_dag` row without its
+    `federation_dag_chunks` relation. A takedown of the DAG therefore reached
+    only its root.
+  - The fix: both write the relation in the same transaction
+    (`blobs::manifest_chunk_links`), as the sealed seal and the promote do.
+  - Witness: I773, both doors.
+- **The plaintext DAG doors ask the WILL decision** (`engine.rs`, P2
+  regression).
+  - The bug: `put_blob_chunks_signing` stored and announced a non-local
+    proxy author's DAG at the stop tier.
+  - The fix: it and `finalize_blob_chunks_signing` now ask `would_hold` first,
+    through one provenance spelling shared with the chunk door.
+  - Witness: I774.
+- **A `public` room is a public group** (`replication_audience.rs`, P1).
+  - The fix: `is_public_group` answers true for a held community that
+    `public_room::is_public_community` calls public. Its community-scoped rows
+    therefore fan out to non-members, the subjectless standing proposal
+    included.
+  - Witness: I775.
+- **`live_listing` skips expired listings** (`public_room.rs`, P2).
+  - The fix: rows expired at the read instant are dropped before the latest
+    is chosen. An older unexpired listing is then the room's live one, and a
+    room whose every listing expired has none.
+  - Witness: I776.
+- **Retired key-grant carriers match whole strings** (`row_type.rs`, P2).
+  - The bug: the prefix match read `key_grant:content:v10` and
+    `key_grant:content:v1beta` as retired.
+  - The fix: `registry::RETIRED_CARRIER_STEMS` entries now carry
+    `registry::RetiredMatch {Stem, Exact}`. `holds_bytes:` is the one stem;
+    the three key-grant SET types are exact. The same split is applied in
+    `row_type::retired_carrier`, in the Report serve filter
+    (`not_retired_carrier_sql`: `substr` for a stem, `<>` for an exact type),
+    and in `key_grant::is_retired_key_grant_set_type`.
+  - Witness: I777 (pure, plus the SQL filter on sqlite and postgres).
+- **Adoption:**
+  - `RETIRED_CARRIER_STEMS` is now `&[(&str, RetiredMatch, &str)]`.
+  - `RetiredMatch` is a new exhaustive enum.
+  - `blob_tombstone::retiring_composer` is `pub(crate)`.
+  - Nothing changes on the wire.
+
 ## [54.1.1] - 2026-10-12
 
 ### Fixed — the v54.1.0 tag's Windows wheel job
