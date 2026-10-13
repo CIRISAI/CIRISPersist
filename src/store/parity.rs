@@ -785,7 +785,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("safe_get_with", Class::Plumbing),
     ("scope_blob_symbol_from_pg_row", Class::Delegates),
     ("seal_content_kem_private", Class::Plumbing),
-    ("self_key_id", Class::Plumbing),
     ("serialize_signature", Class::Plumbing),
     ("serialize_witness_signatures", Class::Plumbing),
     // v36.0.0 (CIRISPersist#707/#668) — the sqlite allocator spellings.
@@ -1481,15 +1480,23 @@ mod tests {
     /// body to a helper — `attestation_upsert_local` →
     /// `sqlite_write_local_attestation(input, true).await` — read as
     /// `gateless` on all three backends while its helper ran fourteen gates.
-    /// A call named in UpperCamelCase is a tuple-struct or variant constructor
-    /// (`Ok(..)`, `Some(..)`), which builds a value and cannot refuse one.
+    ///
+    /// Only a call this alphabet already CLASSIFIES counts in tail position.
+    /// Counting every tail call surfaced 236 helpers and iterator adapters
+    /// (`collect`, `clone`, row mappers) that no gate had ever needed named;
+    /// classifying them is the scanner's own burndown, not this cut's. A door
+    /// whose tail call is a gate, a delegating helper or a shared plan is what
+    /// the blind spot hid, and that is what this form now sees.
+    ///
+    /// Plumbing — `map_err` among it — does not count in tail position: a
+    /// transparent combinator there would walk back to whatever receiver it
+    /// wraps, and plumbing cannot refuse the caller's input anyway.
     fn is_body_tail(rest: &str, call: &Call) -> bool {
         rest.trim() == "}"
-            && !call
-                .name
-                .chars()
-                .next()
-                .is_some_and(|c| c.is_ascii_uppercase())
+            && matches!(
+                classify(&call.name),
+                Some(Class::Gate | Class::Delegates | Class::Plan)
+            )
     }
 
     /// For `EXPR.combinator(..)`, the close paren of `EXPR`'s own call, if it

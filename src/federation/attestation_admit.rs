@@ -94,6 +94,8 @@ pub(crate) struct PlannedAttestation {
     /// comes from the stored row (#646).
     pub(crate) wire_index_key: Option<String>,
     cycle_gated: bool,
+    /// The instant the plan judged at; the under-lock re-ask judges at it too.
+    at: chrono::DateTime<chrono::Utc>,
 }
 
 impl PlannedAttestation {
@@ -112,7 +114,7 @@ impl PlannedAttestation {
         if !self.cycle_gated {
             return Ok(());
         }
-        super::admission::check_delegation_cycle_admission(graph, &self.row).await
+        super::admission::check_delegation_cycle_admission(graph, &self.row, self.at).await
     }
 }
 
@@ -179,19 +181,25 @@ where
     // owner's retraction of one): read before the row moves, acted on only
     // when the store inserted it.
     let consent_change = super::consent_list_change_of(dir, &attestation.attestation).await;
+    // v56.0.0 (CIRISPersist#934, CC review condition 1) — the ONE clock read
+    // of this door. The plan judges every gate at `at` and reads no clock of
+    // its own; the executor reads none either. A replay of `V(rows, t)` calls
+    // the plan with `t`.
+    let at = chrono::Utc::now();
     let outcome = async {
-        match plan_put_attestation(dir, attestation, &origin).await? {
-            AttestationPlan::AlreadyHeld => Ok(AttestationOutcome::AlreadyHeld),
+        let outcome = match plan_put_attestation(dir, attestation, &origin, at).await? {
+            AttestationPlan::AlreadyHeld => AttestationOutcome::AlreadyHeld,
             AttestationPlan::ComposerReplay {
                 repair_withdraws_depth,
             } => {
                 if let Some((id, depth)) = repair_withdraws_depth {
                     dir.repair_withdraws_depth(&id, depth).await?;
                 }
-                Ok(AttestationOutcome::AlreadyHeld)
+                AttestationOutcome::AlreadyHeld
             }
-            AttestationPlan::Insert(planned) => execute_planned(dir, *planned).await,
-        }
+            AttestationPlan::Insert(planned) => execute_planned(dir, *planned).await?,
+        };
+        Ok(outcome)
     }
     .await;
     if let (Ok(AttestationOutcome::Inserted), Some((owner, node))) = (&outcome, consent_change) {
@@ -241,10 +249,21 @@ where
 
 /// **The decision.** Every admission gate of the attestation plane's stored
 /// write, in the AV-76 tier order, once for all three backends.
+///
+/// **`at` is an input** (CIRISConstitution review on #934, condition 1): the
+/// instant every time-dependent gate judges at. Nothing below reads the clock.
+/// The signed instant is the row's own `asserted_at`, which the gates read
+/// from the row; `at` is the instant the row is judged AT. Two gates compare
+/// the two by design and so cannot take `asserted_at` as `at`:
+/// [`check_instant_binding`](super::admission::check_instant_binding) bounds
+/// `asserted_at` to at most the skew allowance ahead of `at`, and
+/// `check_attach_freshness` judges the attach window at `at`. With
+/// `at = asserted_at` both would judge at an instant the signer chose.
 pub(crate) async fn plan_put_attestation<D>(
     dir: &D,
     attestation: super::SignedAttestation,
     origin: &WriteOrigin,
+    at: chrono::DateTime<chrono::Utc>,
 ) -> Result<AttestationPlan, Error>
 where
     D: AttestationStore,
@@ -360,7 +379,7 @@ where
         // the least; an unauthorized writer shouldn't learn about FK /
         // envelope-schema state past it. Free at the default threshold
         // 0 (short-circuits without dispatching to the resolver).
-        if let Some(gate) = cx.admission_gate.as_ref() {
+        if let Some(gate) = &cx.admission_gate {
             gate.check_federation(&row.attesting_key_id).await?;
         }
     }
@@ -439,7 +458,7 @@ where
     // it (B8).
     crate::federation::admission::check_instant_binding(
         &row,
-        chrono::Utc::now(),
+        at,
         crate::federation::admission::DEFAULT_MAX_TOUCH_SKEW,
     )?;
 
@@ -771,7 +790,7 @@ where
     // v54.0.0 (CIRISPersist#1031, CC 4.1.1) — the cycle-closing `delegates_to`
     // is refused: the recipient must not already reach the granter through live
     // `delegates_to` edges. Backend-symmetric with SQLite + Postgres; verify-before-mutation.
-    crate::federation::admission::check_delegation_cycle_admission(dir, &row).await?;
+    crate::federation::admission::check_delegation_cycle_admission(dir, &row, at).await?;
 
     // v12.6.0 (CIRISConstitution#23, CC 1.13.3.3 / CC 3.2) — the single-owner
     // gate: a node has AT MOST ONE responsible steward, so a second,
@@ -788,6 +807,7 @@ where
         &row.attesting_key_id,
         &row.attested_key_id,
         &row.attestation_envelope,
+        at,
     )
     .await?;
     // v51.0.0 (CIRISPersist#937, CC 3.2 T4a) — attaching is gated on a
@@ -800,7 +820,7 @@ where
         &row.attestation_type,
         &row.attested_key_id,
         &row.attestation_envelope,
-        chrono::Utc::now(),
+        at,
     )
     .await?;
     // v24.0.0 (CIRISPersist#557) — a charter naming a constitutional family
@@ -825,7 +845,7 @@ where
     // AV-62/74's dimension-keyed self-emission arm — so a SELF-attested
     // capacity row is still reported as self-emission rather than shadowed
     // by "no consent". Backend-symmetric across memory / sqlite / postgres.
-    crate::federation::admission::check_capacity_consent_admission(dir, &row).await?;
+    crate::federation::admission::check_capacity_consent_admission(dir, &row, at).await?;
     // v45.0.0 (CIRISPersist#871, FSD/MEDIA_SOURCE.md §5) — the placement
     // rule: a rendition (`media.derived_from`) whose original THIS node
     // holds must name the original's own `cohort_scope`. AV-76 TIER 4: it
@@ -877,7 +897,7 @@ where
     crate::federation::admission::check_dimension_case_rule(&row)?;
     // CC 3.3.9 — a `license`-scoped issuance resolves to the authority it
     // names (v42.0.0, CIRISPersist#814).
-    crate::federation::admission::check_licensure_delegator_is_authority(dir, &row).await?;
+    crate::federation::admission::check_licensure_delegator_is_authority(dir, &row, at).await?;
 
     // v22.0.0 (CIRISPersist#543 / AV-77) — THE DE-ADMISSION GATE. A peer
     // this node has de-admitted gets its writes refused here. No-op when
@@ -889,8 +909,8 @@ where
     // + postgres only, which made the CHANGELOG's "all five closed on all
     // three backends" false for AV-77. Same tier position as the SQL
     // backends so a refusal is named by the same gate everywhere.
-    if let Some(me) = cx.self_key_id.clone() {
-        crate::federation::admission::check_peer_deadmission(dir, &row, &me).await?;
+    if let Some(me) = &cx.self_key_id {
+        crate::federation::admission::check_peer_deadmission(dir, &row, me, at).await?;
     }
 
     // v12.5.0 (CIRISPersist#238, CC 4.5.4 / §11.11) — no-moderator-no-
@@ -943,5 +963,6 @@ where
         projected_trace,
         wire_index_key,
         cycle_gated,
+        at,
     })))
 }

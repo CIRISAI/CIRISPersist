@@ -1851,6 +1851,7 @@ impl MemoryBackend {
                 .as_deref()
                 .unwrap_or(&input.attesting_key_id),
             &envelope_value,
+            chrono::Utc::now(),
         )
         .await?;
         // v51.0.0 (CIRISPersist#937, CC 3.2 T4a) — attaching is gated on a

@@ -220,6 +220,10 @@ mod retraction_invariants;
 /// cohort and the typed config record (I592–I594).
 #[cfg(test)]
 pub mod affiliation_invariants;
+/// v56.0.0 (CIRISPersist#934 step 1) — the shared attestation plan judges at
+/// the instant it is given (I950).
+#[cfg(test)]
+pub(crate) mod attestation_admit_invariants;
 /// v54.0.0 (CIRISPersist#1031, CC 4.1.1) — the cycle-closing `delegates_to`
 /// is refused at admission (I590).
 #[cfg(test)]

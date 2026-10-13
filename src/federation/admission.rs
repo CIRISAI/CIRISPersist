@@ -2862,7 +2862,7 @@ pub async fn check_promotion_admission(
     // a sanctioned peer also sheds the amplification cost (same posture as
     // `put_attestation`'s tier-4 placement).
     if let Some(me) = self_key_id {
-        check_peer_deadmission(directory, row, me).await?;
+        check_peer_deadmission(directory, row, me, chrono::Utc::now()).await?;
     }
 
     // AV-62/74 — reserved-prefix + the dimension-keyed capacity self-emission
@@ -2880,7 +2880,7 @@ pub async fn check_promotion_admission(
     // chokepoint: a local row admitted before this cut does not cross with a
     // malformed struct. (A holding claim's size is the custody parse's, v55.)
     super::media_source::check_media_source(&row.attestation_envelope)?;
-    check_capacity_consent_admission(directory, row).await?;
+    check_capacity_consent_admission(directory, row, chrono::Utc::now()).await?;
 
     // v38.7.0 (CIRISPersist#778) — CC 3.4.5's OTHER emitter rule: `config:*`
     // is a self-report. Re-run here under this stack's own inclusion rule —
@@ -2920,7 +2920,7 @@ pub async fn check_promotion_admission(
 
     // CC 3.3.9 / CC 4.4.3.4.3 — a `license`-scoped issuance must resolve to the
     // authority it names (v42.0.0, CIRISPersist#814).
-    check_licensure_delegator_is_authority(directory, row).await?;
+    check_licensure_delegator_is_authority(directory, row, chrono::Utc::now()).await?;
 
     // §11.10 moderation / reconsideration / quarantine duty.
     check_delegated_duty_scores_admission(directory, row).await?;
@@ -2935,7 +2935,7 @@ pub async fn check_promotion_admission(
     // CC 4.1.1 — the cycle-closing `delegates_to` is refused (v54.0.0,
     // CIRISPersist#1031). Re-run at promotion: the walks read the federation
     // tier only, so a local edge closes a cycle at the moment it is promoted.
-    check_delegation_cycle_admission(directory, row).await?;
+    check_delegation_cycle_admission(directory, row, chrono::Utc::now()).await?;
 
     // CC 5.4.6 / CC 3.4.13 Q5 — a minor's owner-binding is never announced
     // (v50.0.0, CIRISPersist#924). Re-run here because "admission MUST refuse
@@ -4365,9 +4365,16 @@ pub async fn licences_issued_under(
 /// ([`LICENSURE_NOT_AUTHORITY_AT_RECEIPT`]: a founder who has left cannot
 /// backdate a direct issuance). The signed-instant rule alone lands with the
 /// window (#1049).
+///
+/// v56.0.0 (CIRISPersist#934 step 1) — `at` is the instant this gate judges
+/// at, an INPUT of the shared attestation plan
+/// (`attestation_admit::plan_put_attestation`) rather than a clock read
+/// inside the gate: the live door passes the one receipt
+/// instant it sampled, and a replay of `V(rows, t)` passes `t`.
 pub async fn check_licensure_delegator_is_authority(
     directory: &dyn super::FederationDirectory,
     row: &super::Attestation,
+    at: chrono::DateTime<chrono::Utc>,
 ) -> Result<(), Error> {
     let Some(dimension) = envelope_dimension(&row.attestation_envelope) else {
         return Ok(());
@@ -4409,7 +4416,7 @@ pub async fn check_licensure_delegator_is_authority(
             message,
         })
     };
-    let at_receipt = licensure_issuance_at(directory, &authority, row, chrono::Utc::now()).await?;
+    let at_receipt = licensure_issuance_at(directory, &authority, row, at).await?;
     if let LicensureIssuance::Unresolved {
         delegation_id,
         reason,
@@ -5175,9 +5182,16 @@ impl From<ConsentGateRefused> for Error {
 /// witnesses it: the node's own `capacity:*` emit about a third party is
 /// refused until that subject grants and admits after, while its
 /// `rollback_detected:*` emit about the same silent subject admits throughout.
+///
+/// v56.0.0 (CIRISPersist#934 step 1) — `at` is the instant this gate judges
+/// at, an INPUT of the shared attestation plan
+/// (`attestation_admit::plan_put_attestation`) rather than a clock read
+/// inside the gate: the live door passes the one receipt
+/// instant it sampled, and a replay of `V(rows, t)` passes `t`.
 pub async fn check_capacity_consent_admission(
     directory: &dyn super::FederationDirectory,
     row: &super::Attestation,
+    at: chrono::DateTime<chrono::Utc>,
 ) -> Result<(), Error> {
     let Some(claim) = consent_gated_claim(row) else {
         return Ok(());
@@ -5209,7 +5223,7 @@ pub async fn check_capacity_consent_admission(
         &row.attesting_key_id,
         &row.attested_key_id,
         claim.family,
-        chrono::Utc::now(),
+        at,
     )
     .await?;
     if stance == super::hard_case::ConsentState::Granted {
@@ -12447,10 +12461,17 @@ pub const PEER_DEADMISSION_DIMENSION: &str = "revocation:peer_admission:v1";
 ///
 /// Fail-secure: a de-admitted author's rows are refused before any DB-walking
 /// gate runs, so de-admission also sheds the AV-76 amplification cost.
+///
+/// v56.0.0 (CIRISPersist#934 step 1) — `at` is the instant this gate judges
+/// at, an INPUT of the shared attestation plan
+/// (`attestation_admit::plan_put_attestation`) rather than a clock read
+/// inside the gate: the live door passes the one receipt
+/// instant it sampled, and a replay of `V(rows, t)` passes `t`.
 pub async fn check_peer_deadmission(
     directory: &dyn super::FederationDirectory,
     row: &super::Attestation,
     self_key_id: &str,
+    at: chrono::DateTime<chrono::Utc>,
 ) -> Result<(), Error> {
     // A node never de-admits itself.
     //
@@ -12490,7 +12511,7 @@ pub async fn check_peer_deadmission(
     let mine = directory.list_attestations_by(self_key_id).await?;
     let refs: Vec<&super::Attestation> = mine.iter().collect();
     let dead = super::trust_root::tombstoned_ids(&refs);
-    let now = chrono::Utc::now();
+    let now = at;
     let de_admitted = mine.iter().any(|a| {
         a.attestation_type == attestation_type::SCORES
             && a.attested_key_id == row.attesting_key_id
@@ -15699,9 +15720,16 @@ pub fn grant_chain_instant(row: &super::Attestation) -> chrono::DateTime<chrono:
 /// `delegates_to` gates, AND [`check_promotion_admission`]: the walks read
 /// the federation tier only, so a local-tier edge closes nothing until it is
 /// promoted, and the graph may have grown since its local write.
+///
+/// v56.0.0 (CIRISPersist#934 step 1) — `at` is the instant this gate judges
+/// at, an INPUT of the shared attestation plan
+/// (`attestation_admit::plan_put_attestation`) rather than a clock read
+/// inside the gate: the live door passes the one receipt
+/// instant it sampled, and a replay of `V(rows, t)` passes `t`.
 pub async fn check_delegation_cycle_admission<G>(
     directory: &G,
     row: &super::Attestation,
+    at: chrono::DateTime<chrono::Utc>,
 ) -> Result<(), Error>
 where
     G: DelegationGraphReads + ?Sized,
@@ -15728,14 +15756,7 @@ where
     if row.attesting_key_id == row.attested_key_id {
         return Ok(());
     }
-    match delegation_path_hops(
-        directory,
-        &row.attested_key_id,
-        &row.attesting_key_id,
-        chrono::Utc::now(),
-    )
-    .await?
-    {
+    match delegation_path_hops(directory, &row.attested_key_id, &row.attesting_key_id, at).await? {
         Some(hops) => refuse(hops),
         None => Ok(()),
     }

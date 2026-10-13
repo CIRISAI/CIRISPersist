@@ -94,7 +94,11 @@ mod tests {
             ),
             (
                 "admission::check_capacity_consent_admission",
-                std::mem::size_of_val(&admission::check_capacity_consent_admission(d, &row)),
+                std::mem::size_of_val(&admission::check_capacity_consent_admission(
+                    d,
+                    &row,
+                    chrono::Utc::now(),
+                )),
             ),
             (
                 "admission::steward_bindings_of",
