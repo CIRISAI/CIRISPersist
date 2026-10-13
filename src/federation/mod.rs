@@ -4516,11 +4516,20 @@ pub trait FederationDirectory: Send + Sync {
             if conferred.is_none() {
                 continue;
             }
-            let attestations = self.list_attestations_by(&publisher.key_id).await?;
+            // The publisher's `content_rating:*` scores: the only rows the
+            // vouch below can match.
+            let mut attestations = Vec::new();
+            let mut pages = attestation_query::AttestationQuery::by(
+                &publisher.key_id,
+                attestation_query::FOLD_PAGE,
+            )
+            .types(&[types::attestation_type::SCORES])
+            .dimension_prefix("content_rating:")
+            .pages();
+            while let Some(page) = pages.next(self).await? {
+                attestations.extend(page);
+            }
             for att in attestations {
-                if att.attestation_type != types::attestation_type::SCORES {
-                    continue;
-                }
                 // CEG 0.3 §5.6.8.3 reserved-prefix rule: content_rating:*
                 // dimensions are emitter-restricted to trusted_publisher,
                 // so a (publisher, content_rating:*) pair carries the
@@ -6743,7 +6752,20 @@ pub trait FederationDirectory: Send + Sync {
                 self.list_signed_transport_destinations_for(subject_key_id)
                     .await?,
             ),
-            K::Attestation => wrap(kind, self.list_attestations_for(subject_key_id).await?),
+            // Every attestation about the subject (the subject-scoped pull),
+            // walked in pages.
+            K::Attestation => {
+                let mut rows = Vec::new();
+                let mut pages = attestation_query::AttestationQuery::to(
+                    subject_key_id,
+                    attestation_query::FOLD_PAGE,
+                )
+                .pages();
+                while let Some(page) = pages.next(self).await? {
+                    rows.extend(page);
+                }
+                wrap(kind, rows)
+            }
             // v16.0.0 (#421): the revocation arm returns the SIGNED container
             // (byte-exact re-publish; signed-put rows only) now that the
             // revocation plane carries the #418 signature discipline.
@@ -7881,19 +7903,24 @@ pub trait FederationDirectory: Send + Sync {
     /// [`Attestation`] rows (deduped on `attestation_id`), so a consumer can
     /// read each edge's scope/expiry/granter.
     ///
-    /// Default impl filters [`Self::list_attestations_for`] to
-    /// `delegates_to`; backends need not override. Returns an empty vec when
-    /// no key delegates to `key_id`.
+    /// v56.0.0 (#1001): the `delegates_to` rows about `key_id`, sought by
+    /// type through the typed query and walked in pages; backends need not
+    /// override. Returns an empty vec when no key delegates to `key_id`.
     async fn delegations_to(&self, key_id: &str) -> Result<Vec<Attestation>, Error> {
         use std::collections::HashSet;
         let mut seen: HashSet<String> = HashSet::new();
-        Ok(self
-            .list_attestations_for(key_id)
-            .await?
-            .into_iter()
-            .filter(|a| a.attestation_type == types::attestation_type::DELEGATES_TO)
-            .filter(|a| seen.insert(a.attestation_id.clone()))
-            .collect())
+        let mut out = Vec::new();
+        let mut pages =
+            attestation_query::AttestationQuery::to(key_id, attestation_query::FOLD_PAGE)
+                .types(&[types::attestation_type::DELEGATES_TO])
+                .pages();
+        while let Some(page) = pages.next(self).await? {
+            out.extend(
+                page.into_iter()
+                    .filter(|a| seen.insert(a.attestation_id.clone())),
+            );
+        }
+        Ok(out)
     }
 
     /// v4.0 (CIRISPersist#160 comment 4, FSD §4.6) — AV-45 write-path
@@ -9365,8 +9392,19 @@ pub trait FederationDirectory: Send + Sync {
             let subject = &rev.attesting_key_id;
             let revoked_at = rev.asserted_at;
 
-            // (a) §8.1.11.3 deletion-SLA breach.
-            let atts = self.list_attestations_for(target).await?;
+            // (a) §8.1.11.3 deletion-SLA breach. The target's
+            // `consent:deletion_sla:*` and `consent:deletion_complete*` rows:
+            // the only two families the checks below read.
+            let mut atts = Vec::new();
+            for prefix in ["consent:deletion_sla:", "consent:deletion_complete"] {
+                let mut pages =
+                    attestation_query::AttestationQuery::to(target, attestation_query::FOLD_PAGE)
+                        .dimension_prefix(prefix)
+                        .pages();
+                while let Some(page) = pages.next(self).await? {
+                    atts.extend(page);
+                }
+            }
             let sla_days = atts
                 .iter()
                 .filter_map(|a| {

@@ -309,6 +309,50 @@ impl AttestationQuery {
             || self.dimension != DimensionFilter::Any
     }
 
+    /// The read this query's shape replaced (v56.0.0, CIRISPersist#1001):
+    /// the name a fault double, a read probe and an operator's log use for
+    /// it, stable across the retirement of the reads themselves.
+    ///
+    /// | query shape                               | shape                                     |
+    /// |-------------------------------------------|-------------------------------------------|
+    /// | `tier = local`                            | `list_local_tier_attestations`            |
+    /// | `by` K, not narrowed                      | `list_attestations_by`                    |
+    /// | `to` K, not narrowed (any `by`)           | `list_attestations_for`                   |
+    /// | `by` K + dimension                        | `list_attestations_by_dimension_prefix`   |
+    /// | `to` K + dimension                        | `list_attestations_for_dimension_prefix`  |
+    /// | `by` K + one type, no exclusion           | `list_attestations_by_type`               |
+    /// | `to` K + one type, no exclusion           | `list_attestations_for_type`              |
+    /// | `by` K + types, or a type prefix          | `list_attestations_by_types`              |
+    /// | `to` K + types, or a type prefix          | `list_attestations_for_types`             |
+    ///
+    /// An exclusion alone (no type, no dimension) filters the key's whole
+    /// ordered slice: it is the slice read's shape.
+    #[must_use]
+    pub fn shape(&self) -> &'static str {
+        if self.tier == QueryTier::Local {
+            return "list_local_tier_attestations";
+        }
+        let to = self.to.is_some();
+        let dim = self.dimension != DimensionFilter::Any;
+        if self.type_prefix.is_some() && !dim {
+            return if to {
+                "list_attestations_for_types"
+            } else {
+                "list_attestations_by_types"
+            };
+        }
+        match (dim, self.types.len(), to) {
+            (true, _, false) => "list_attestations_by_dimension_prefix",
+            (true, _, true) => "list_attestations_for_dimension_prefix",
+            (false, 0, false) => "list_attestations_by",
+            (false, 0, true) => "list_attestations_for",
+            (false, 1, false) if self.excluded_dimensions.is_empty() => "list_attestations_by_type",
+            (false, 1, true) if self.excluded_dimensions.is_empty() => "list_attestations_for_type",
+            (false, _, false) => "list_attestations_by_types",
+            (false, _, true) => "list_attestations_for_types",
+        }
+    }
+
     /// The key the query is pinned on, for the probe: the attester, else the
     /// attested key.
     #[must_use]

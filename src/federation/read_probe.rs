@@ -34,51 +34,18 @@ pub struct Read {
 }
 
 impl Read {
-    /// v56.0.0 (CIRISPersist#1001) — the door this read answers as. A
-    /// non-query read is its own method. A typed query answers as the read
-    /// it replaced, so a witness that asks "did this fold read K's whole
-    /// slice?" keeps asking it after the fold moved onto the query:
+    /// v56.0.0 (CIRISPersist#1001) — the door this read answers as: a
+    /// non-query read is its own method; a typed query answers as the read it
+    /// replaced ([`AttestationQuery::shape`]), so a witness that asks "did
+    /// this fold read K's whole slice?" keeps asking it after the fold moved
+    /// onto the query.
     ///
-    /// | query shape                          | door                                      |
-    /// |--------------------------------------|-------------------------------------------|
-    /// | `by` K, not narrowed                 | `list_attestations_by`                    |
-    /// | `to` K, not narrowed (any `by`)      | `list_attestations_for`                   |
-    /// | `by` K + dimension                   | `list_attestations_by_dimension_prefix`   |
-    /// | `to` K + dimension                   | `list_attestations_for_dimension_prefix`  |
-    /// | `by` K + one type, no exclusion      | `list_attestations_by_type`               |
-    /// | `to` K + one type, no exclusion      | `list_attestations_for_type`              |
-    /// | `by` K + types or a type prefix      | `list_attestations_by_types`              |
-    /// | `to` K + types or a type prefix      | `list_attestations_for_types`             |
-    /// | `tier = local`                       | `list_local_tier_attestations`            |
-    ///
-    /// An exclusion alone (no type, no dimension) is a filter on the key's
-    /// whole ordered slice: it answers as the slice read.
+    /// [`AttestationQuery::shape`]: crate::federation::attestation_query::AttestationQuery::shape
     #[must_use]
     pub fn door(&self) -> &'static str {
-        use crate::federation::attestation_query::{DimensionFilter, QueryTier};
-        let Some(q) = &self.query else {
-            return self.method;
-        };
-        if q.tier == QueryTier::Local {
-            return "list_local_tier_attestations";
-        }
-        let to = q.to.is_some();
-        if q.type_prefix.is_some() && q.dimension == DimensionFilter::Any {
-            return if to {
-                "list_attestations_for_types"
-            } else {
-                "list_attestations_by_types"
-            };
-        }
-        match (q.dimension != DimensionFilter::Any, q.types.len(), to) {
-            (true, _, false) => "list_attestations_by_dimension_prefix",
-            (true, _, true) => "list_attestations_for_dimension_prefix",
-            (false, 0, false) => "list_attestations_by",
-            (false, 0, true) => "list_attestations_for",
-            (false, 1, false) if q.excluded_dimensions.is_empty() => "list_attestations_by_type",
-            (false, 1, true) if q.excluded_dimensions.is_empty() => "list_attestations_for_type",
-            (false, _, false) => "list_attestations_by_types",
-            (false, _, true) => "list_attestations_for_types",
+        match &self.query {
+            None => self.method,
+            Some(q) => q.shape(),
         }
     }
 

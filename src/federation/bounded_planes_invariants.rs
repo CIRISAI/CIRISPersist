@@ -1,4 +1,4 @@
-//! v56.0.0 (CIRISPersist#1001) — **I907–I911: each migrated plane's folds
+//! v56.0.0 (CIRISPersist#1001) — **I907–I912: each migrated plane's folds
 //! read through the typed bounded query, bounded.**
 //!
 //! Every witness here lands NOISE on a key — third-party `scores` rows under a
@@ -342,6 +342,32 @@ pub(crate) mod bodies {
         );
         assert_walked(&read_probe::take(), &k, n, "I911 wire_refs_for_subject");
     }
+
+    /// **I912** — the trait's own default bodies (no default reads wider
+    /// than its query, #1001): `delegations_to` seeks the `delegates_to` rows
+    /// about the key; `list_signed_records(Attestation)` — every row about the
+    /// subject, by definition — walks the slice in pages, each row once.
+    pub async fn i912_trait_default_bodies_read_bounded(d: &dyn FederationDirectory) {
+        let (k, other) = keys(d, "i912").await;
+        let n = 7;
+        noise(d, &other, &k, n).await;
+
+        let _ = read_probe::take();
+        let delegations = d.delegations_to(&k).await.expect("I912 delegations_to");
+        assert!(delegations.is_empty(), "I912 noise delegates nothing");
+        assert_narrowed(&read_probe::take(), &k, n, "I912 delegations_to");
+
+        let _ = read_probe::take();
+        let records = d
+            .list_signed_records(
+                crate::federation::namespace::ReplicatedKind::Attestation,
+                &k,
+            )
+            .await
+            .expect("I912 signed records");
+        assert_eq!(records.len(), n, "I912 every row about the subject");
+        assert_walked(&read_probe::take(), &k, n, "I912 list_signed_records");
+    }
 }
 
 #[cfg(test)]
@@ -362,6 +388,14 @@ mod runners {
                 async fn i911_custody_config_and_index_folds_read_bounded() {
                     let Some(d) = $fresh.await else { return };
                     super::super::bodies::i911_custody_config_and_index_folds_read_bounded(
+                        &d as &dyn FederationDirectory,
+                    )
+                    .await
+                }
+                #[tokio::test]
+                async fn i912_trait_default_bodies_read_bounded() {
+                    let Some(d) = $fresh.await else { return };
+                    super::super::bodies::i912_trait_default_bodies_read_bounded(
                         &d as &dyn FederationDirectory,
                     )
                     .await

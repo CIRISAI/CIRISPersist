@@ -375,7 +375,9 @@ def test_register_self_then_put_blob_signing_275() -> None:
         # its door refuses before storing anything announced (I80, I83). This
         # engine has a PQC LocalSigner, so the claim must be hybrid. Read back
         # through a host door.
-        rows = json.loads(eng.list_attestations_by(kid))
+        # v56.0.0 (CIRISPersist#1001): one bounded page, narrowed to the
+        # custody family.
+        rows = json.loads(eng.list_attestations_by(kid, 500, None, "custody:ack:"))["items"]
         claims = [
             r
             for r in rows

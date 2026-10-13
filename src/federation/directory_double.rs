@@ -310,6 +310,9 @@ impl FederationDirectory for FaultInjectingDirectory {
         if let Some(e) = self.faulted("execute_attestation_query") {
             return Err(e);
         }
+        if let Some(e) = self.faulted(q.shape()) {
+            return Err(e);
+        }
         self.inner.execute_attestation_query(q).await
     }
     async fn family_roster_signers(
