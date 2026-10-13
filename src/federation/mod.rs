@@ -264,6 +264,10 @@ mod remint_invariants;
 /// custody report under the data a DAG was sealed with.
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod repair_invariants;
+/// v56.0.0 (CIRISPersist#934 step 1, door 4) — a re-seal judges the row it
+/// overwrites (I953).
+#[cfg(test)]
+pub(crate) mod reseal_race_invariants;
 #[cfg(test)]
 pub mod room_roster_authority_invariants;
 /// v48.0.0 (CIRISPersist#860) — the room-roster planes witnesses.

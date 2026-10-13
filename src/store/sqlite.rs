@@ -6405,6 +6405,10 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         let asserted = row.asserted_at.to_rfc3339();
         let expires = row.expires_at.map(|t| t.to_rfc3339());
         let federation_tier = row.tier == crate::federation::types::attestation_tier::FEDERATION;
+        #[cfg(test)]
+        self.test_hooks()
+            .pause_if_armed("reseal_before_write")
+            .await;
         let n = self
             .write(move |conn| -> Result<usize, rusqlite::Error> {
                 let tx = conn.transaction()?;

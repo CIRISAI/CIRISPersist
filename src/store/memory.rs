@@ -5005,6 +5005,10 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             crate::federation::admission::check_reseal_seal_admission(self, &stored, resealed)
                 .await?;
         }
+        #[cfg(test)]
+        self.test_hooks()
+            .pause_if_armed("reseal_before_write")
+            .await;
         let wire_index_key = {
             let mut state = self.state.lock().expect("memory backend lock");
             // v36.0.0 (#668/#707-class) — a re-seal rewrites the served bytes;

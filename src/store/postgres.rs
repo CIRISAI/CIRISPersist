@@ -8203,6 +8203,10 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let expires = row.expires_at;
         let federation_tier = row.tier == crate::federation::types::attestation_tier::FEDERATION;
 
+        #[cfg(test)]
+        self.test_hooks()
+            .pause_if_armed("reseal_before_write")
+            .await;
         let mut client = self
             .get_client()
             .await
