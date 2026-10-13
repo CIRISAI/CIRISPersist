@@ -65,6 +65,10 @@ pub mod blobs;
 pub mod bootstrap_admission;
 #[cfg(test)]
 mod bounded_planes_invariants;
+// v56.0.0 (CIRISPersist#1001) — I914/I915: every production `list_*` read
+// classified; no production caller of the demoted wide reads.
+#[cfg(test)]
+mod bounded_reads_table;
 pub mod canonical_at_rest;
 pub mod capacity;
 // v50.0.0 (CIRISPersist#926) — the `ciris-canonical` community row: admitted
@@ -3499,6 +3503,60 @@ pub trait FederationDirectory: Send + Sync {
         &self,
         q: &attestation_query::AttestationQuery,
     ) -> Result<attestation_query::QueryRows, Error>;
+
+    /// **Demoted (v56.0.0, CIRISPersist#1001): test and `test-anchor` builds
+    /// only; deleted in v57.** Every federation-tier row attested TO
+    /// `attested_key_id`, newest first — the whole slice, paged through the
+    /// bounded [`AttestationQuery::to`](attestation_query::AttestationQuery::to)
+    /// at [`FOLD_PAGE`](attestation_query::FOLD_PAGE) per statement. Kept so
+    /// an adopter's test oracle (CIRISEdge's dev-dependency enables
+    /// `test-anchor`) still compiles while its production reads move onto
+    /// [`AttestationQuery`](attestation_query::AttestationQuery). No
+    /// production build has it, and a from-disk gate
+    /// (`bounded_reads_invariants`) holds production call sites at zero.
+    ///
+    /// # Errors
+    ///
+    /// The read's [`NotServed`](attestation_query::ReadOutcome::NotServed)
+    /// reason, as an error — never an empty list.
+    #[cfg(any(test, feature = "test-anchor"))]
+    async fn list_attestations_for(
+        &self,
+        attested_key_id: &str,
+    ) -> Result<Vec<Attestation>, Error> {
+        let mut out = Vec::new();
+        let mut pages =
+            attestation_query::AttestationQuery::to(attested_key_id, attestation_query::FOLD_PAGE)
+                .pages();
+        while let Some(rows) = pages.next(self).await? {
+            out.extend(rows);
+        }
+        Ok(out)
+    }
+
+    /// **Demoted (v56.0.0, CIRISPersist#1001): test and `test-anchor` builds
+    /// only; deleted in v57.** Every federation-tier row `attesting_key_id`
+    /// authored, newest first, paged through the bounded
+    /// [`AttestationQuery::by`](attestation_query::AttestationQuery::by). See
+    /// [`Self::list_attestations_for`].
+    ///
+    /// # Errors
+    ///
+    /// The read's `NotServed` reason, as an error — never an empty list.
+    #[cfg(any(test, feature = "test-anchor"))]
+    async fn list_attestations_by(
+        &self,
+        attesting_key_id: &str,
+    ) -> Result<Vec<Attestation>, Error> {
+        let mut out = Vec::new();
+        let mut pages =
+            attestation_query::AttestationQuery::by(attesting_key_id, attestation_query::FOLD_PAGE)
+                .pages();
+        while let Some(rows) = pages.next(self).await? {
+            out.extend(rows);
+        }
+        Ok(out)
+    }
 
     /// v53.1.5 — every federation-tier STRUCTURAL COMPOSER (`withdraws` /
     /// `recants` / `supersedes`) whose envelope `references_attestation_id`
