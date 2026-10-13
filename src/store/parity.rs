@@ -141,6 +141,12 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("repair_withdraws_depth", Class::Plumbing),
     ("attesting_identity_type", Class::Plumbing),
     ("composer_replay_held", Class::Plumbing),
+    // The hybrid-completion door (`attach_attestation_pqc_signature`): the
+    // shared door, its decision (a refusal of an unknown or already-complete
+    // row, so a Gate), and the executor's guarded write.
+    ("attach_attestation_pqc_planned", Class::Plan),
+    ("plan_attach_attestation_pqc_signature", Class::Gate),
+    ("store_pqc_completion", Class::Plumbing),
     // v55.0.0 (CIRISPersist#952) — Gate: the finalize refuses a chunk not held whole.
     ("check_held_dag_chunk", Class::Gate),
     // v46.3.0 (#884) — `minter_of_blob`'s community arm IS the #876 read
@@ -1126,7 +1132,7 @@ mod tests {
     /// files: `(file, fn)`. Each body is held to the same [`CALL_CLASSES`]
     /// partition as a backend door, and its sequence is what a door's
     /// `plan:NAME` token stands for.
-    const SHARED_PLANS: [(&str, &str); 2] = [
+    const SHARED_PLANS: [(&str, &str); 3] = [
         (
             "src/federation/attestation_admit.rs",
             "put_attestation_planned",
@@ -1134,6 +1140,10 @@ mod tests {
         (
             "src/federation/attestation_admit.rs",
             "recheck_cycle_under_lock",
+        ),
+        (
+            "src/federation/attestation_admit.rs",
+            "attach_attestation_pqc_planned",
         ),
     ];
 
@@ -1144,7 +1154,7 @@ mod tests {
     /// this list on the commit that moves its decision into a plan, and
     /// cannot drift back: a gate added to one backend's copy fails
     /// [`shared_doors_decide_nothing_in_a_backend`].
-    const SHARED_DOORS: [(&str, &str, &str); 2] = [
+    const SHARED_DOORS: [(&str, &str, &str); 3] = [
         (
             "FederationDirectory",
             "put_attestation_with_origin",
@@ -1155,6 +1165,11 @@ mod tests {
             "AttestationStore",
             "store_planned_attestation",
             "recheck_cycle_under_lock",
+        ),
+        (
+            "FederationDirectory",
+            "attach_attestation_pqc_signature",
+            "attach_attestation_pqc_planned",
         ),
     ];
 

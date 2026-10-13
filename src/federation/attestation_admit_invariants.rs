@@ -21,6 +21,13 @@
 //!
 //! Mutating either gate's instant back to the clock turns (1) or (2) red on
 //! all three backends.
+//!
+//! I952 — the hybrid-completion door (`attach_attestation_pqc_signature`),
+//! decided once by `plan_attach_attestation_pqc_signature`: an unknown id is
+//! refused `InvalidArgument`; a second completion of a completed row is the
+//! PLAN's `Conflict` ("already PQC-complete"), not the storage guard's
+//! ("concurrently completed"), so the guard does not hide a lost decision; a
+//! completion stores the caller's half and a completion instant.
 
 /// The backend-agnostic witness bodies.
 #[cfg(test)]
@@ -129,6 +136,63 @@ pub(crate) mod bodies {
     }
 }
 
+/// I952's body, on any directory.
+#[cfg(test)]
+pub(crate) mod pqc_bodies {
+    use crate::federation::tier_ingest::test_support as ts;
+    use crate::federation::{Error, FederationDirectory};
+
+    pub(crate) async fn i952_the_completion_is_decided_once(
+        d: &dyn FederationDirectory,
+        tag: &str,
+    ) {
+        let owner = format!("owner-{tag}");
+        let node = format!("node-{tag}");
+        let id = uuid::Uuid::new_v4().to_string();
+        ts::register_identity_key(d, &owner, crate::federation::types::identity_type::USER).await;
+        ts::register_hybrid_key(d, &node).await;
+
+        // (1) nothing held under the id.
+        match d
+            .attach_attestation_pqc_signature(&uuid::Uuid::new_v4().to_string(), "sig")
+            .await
+        {
+            Err(Error::InvalidArgument(m)) if m.contains("does not exist") => {}
+            other => panic!("(1) an unknown id is refused InvalidArgument; got {other:?}"),
+        }
+
+        // (3) a pending row completes with the caller's half.
+        let mut row = ts::owner_binding_attestation(&id, &owner, &node);
+        let pqc_sig = row.scrub_signature_pqc.clone().expect("a PQC half");
+        row.pqc_completed_at = None;
+        d.put_attestation(crate::federation::SignedAttestation { attestation: row })
+            .await
+            .expect("the pending row");
+        d.attach_attestation_pqc_signature(&id, &pqc_sig)
+            .await
+            .expect("(3) the completion");
+        let stored = d.get_attestation(&id).await.unwrap().expect("(3) held");
+        assert_eq!(
+            stored.scrub_signature_pqc.as_deref(),
+            Some(pqc_sig.as_str()),
+            "(3)"
+        );
+        assert!(
+            stored.pqc_completed_at.is_some(),
+            "(3) a completion instant"
+        );
+
+        // (2) completing it again is the plan's refusal.
+        match d.attach_attestation_pqc_signature(&id, &pqc_sig).await {
+            Err(Error::Conflict(m)) if m.contains("already PQC-complete") => {}
+            other => panic!(
+                "(2) a completed row is refused by the plan (\"already PQC-complete\"), not \
+                 left to the storage guard; got {other:?}"
+            ),
+        }
+    }
+}
+
 #[cfg(test)]
 mod run {
     fn suffix() -> String {
@@ -139,6 +203,8 @@ mod run {
     async fn i950_memory() {
         let b = crate::store::memory::MemoryBackend::new();
         super::bodies::i950_the_plan_judges_at_its_input_instant(&b, &format!("i950-{}", suffix()))
+            .await;
+        super::pqc_bodies::i952_the_completion_is_decided_once(&b, &format!("i952-{}", suffix()))
             .await;
     }
 
@@ -151,6 +217,8 @@ mod run {
             .unwrap();
         b.run_migrations().await.unwrap();
         super::bodies::i950_the_plan_judges_at_its_input_instant(&b, &format!("i950-{}", suffix()))
+            .await;
+        super::pqc_bodies::i952_the_completion_is_decided_once(&b, &format!("i952-{}", suffix()))
             .await;
     }
 
@@ -167,6 +235,8 @@ mod run {
             .unwrap();
         b.run_migrations().await.unwrap();
         super::bodies::i950_the_plan_judges_at_its_input_instant(&b, &format!("i950-{}", suffix()))
+            .await;
+        super::pqc_bodies::i952_the_completion_is_decided_once(&b, &format!("i952-{}", suffix()))
             .await;
         eprintln!("i950_postgres: RAN");
     }

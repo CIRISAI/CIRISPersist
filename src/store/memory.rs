@@ -3199,6 +3199,54 @@ impl crate::federation::attestation_admit::AttestationStore for MemoryBackend {
         Ok(())
     }
 
+    async fn store_pqc_completion(
+        &self,
+        completion: crate::federation::attestation_admit::PqcCompletion,
+    ) -> Result<(), crate::federation::Error> {
+        {
+            let mut state = self.state.lock().expect("memory backend lock");
+            // v36.0.0 (#668/#707-class) — the hybrid-completion write rewrites
+            // served columns; the serve position moves with them.
+            let admitted_at = next_plane_position(
+                &state,
+                PLANE_ATTESTATION,
+                attestation_rows(&state).into_iter(),
+            );
+            // The SQL backends' `WHERE pqc_completed_at IS NULL` guard: the row
+            // was read and planned outside this lock.
+            let Some(row) = state.federation_attestations.iter_mut().find(|a| {
+                a.attestation_id == completion.attestation_id && a.pqc_completed_at.is_none()
+            }) else {
+                return Err(crate::federation::Error::Conflict(format!(
+                    "federation_attestations row {} was concurrently completed",
+                    completion.attestation_id
+                )));
+            };
+            row.scrub_signature_pqc = Some(completion.scrub_signature_pqc);
+            row.pqc_completed_at = Some(completion.pqc_completed_at);
+            row.persist_row_hash = completion.persist_row_hash;
+            stamp_plane_position(
+                &mut state,
+                PLANE_ATTESTATION,
+                completion.attestation_id.clone(),
+                admitted_at,
+            );
+        }
+        // v31.0.0 (CIRISPersist#657) — re-index; see the sqlite twin. Done
+        // AFTER the guard is released, the same shape `attach_key_pqc_signature`
+        // uses on this backend (the shared helper re-reads through the
+        // directory surface, which takes the same lock).
+        self.index_stored_record(
+            "Attestation",
+            &crate::federation::wire_index::record_key(&[(
+                "attestation_id",
+                &completion.attestation_id,
+            )]),
+        )
+        .await?;
+        Ok(())
+    }
+
     async fn store_planned_attestation(
         &self,
         planned: crate::federation::attestation_admit::PlannedAttestation,
@@ -10269,56 +10317,20 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         Ok(())
     }
 
+    /// v56.0.0 (CIRISPersist#934 step 1) — the decision is
+    /// [`plan_attach_attestation_pqc_signature`](crate::federation::attestation_admit::plan_attach_attestation_pqc_signature),
+    /// shared by all three backends; this backend stores it.
     async fn attach_attestation_pqc_signature(
         &self,
         attestation_id: &str,
         scrub_signature_pqc: &str,
     ) -> Result<(), crate::federation::Error> {
-        {
-            let mut state = self.state.lock().expect("memory backend lock");
-            // v36.0.0 (#668/#707-class) — the hybrid-completion write rewrites
-            // served columns; the serve position moves with them.
-            let admitted_at = next_plane_position(
-                &state,
-                PLANE_ATTESTATION,
-                attestation_rows(&state).into_iter(),
-            );
-            let row = state
-                .federation_attestations
-                .iter_mut()
-                .find(|a| a.attestation_id == attestation_id)
-                .ok_or_else(|| {
-                    crate::federation::Error::InvalidArgument(format!(
-                        "federation_attestations row {attestation_id} does not exist"
-                    ))
-                })?;
-            if row.is_pqc_complete() {
-                return Err(crate::federation::Error::Conflict(format!(
-                    "federation_attestations row {attestation_id} is already PQC-complete"
-                )));
-            }
-            row.scrub_signature_pqc = Some(scrub_signature_pqc.to_owned());
-            row.pqc_completed_at = Some(chrono::Utc::now());
-            let mut for_hash = row.clone();
-            for_hash.persist_row_hash = String::new();
-            row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&for_hash)?;
-            stamp_plane_position(
-                &mut state,
-                PLANE_ATTESTATION,
-                attestation_id.to_owned(),
-                admitted_at,
-            );
-        }
-        // v31.0.0 (CIRISPersist#657) — re-index; see the sqlite twin. Done
-        // AFTER the guard is released, the same shape `attach_key_pqc_signature`
-        // uses on this backend (the shared helper re-reads through the
-        // directory surface, which takes the same lock).
-        self.index_stored_record(
-            "Attestation",
-            &crate::federation::wire_index::record_key(&[("attestation_id", attestation_id)]),
+        crate::federation::attestation_admit::attach_attestation_pqc_planned(
+            self,
+            attestation_id,
+            scrub_signature_pqc,
         )
-        .await?;
-        Ok(())
+        .await
     }
 
     async fn get_attestation(

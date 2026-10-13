@@ -12658,95 +12658,20 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         Ok(())
     }
 
+    /// v56.0.0 (CIRISPersist#934 step 1) — the decision is
+    /// [`plan_attach_attestation_pqc_signature`](crate::federation::attestation_admit::plan_attach_attestation_pqc_signature),
+    /// shared by all three backends; this backend stores it.
     async fn attach_attestation_pqc_signature(
         &self,
         attestation_id: &str,
         scrub_signature_pqc: &str,
     ) -> Result<(), crate::federation::Error> {
-        // Read existing row to recompute hash + check pending state.
-        let id = attestation_id.to_owned();
-        let row_opt = self
-            .read(
-            move |conn| -> Result<Option<crate::federation::Attestation>, rusqlite::Error> {
-                conn.query_row(
-                    "SELECT attestation_id, attesting_key_id, attested_key_id, attestation_type, \
-                        weight, asserted_at, expires_at, attestation_envelope, \
-                        original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
-                        scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at, additional_scrubs \
-                     FROM federation_attestations WHERE attestation_id = ?1",
-                    [&id],
-                    sqlite_row_to_attestation,
-                )
-                .optional()
-            })
-        .await
-        .map_err(|e| crate::federation::Error::Backend(format!("attach lookup: {e}")))?;
-        let mut row = row_opt.ok_or_else(|| {
-            crate::federation::Error::InvalidArgument(format!(
-                "federation_attestations row {attestation_id} does not exist"
-            ))
-        })?;
-        if row.is_pqc_complete() {
-            return Err(crate::federation::Error::Conflict(format!(
-                "federation_attestations row {attestation_id} is already PQC-complete"
-            )));
-        }
-        row.scrub_signature_pqc = Some(scrub_signature_pqc.to_owned());
-        let now = chrono::Utc::now();
-        row.pqc_completed_at = Some(now);
-        let mut for_hash = row.clone();
-        for_hash.persist_row_hash = String::new();
-        let new_hash = crate::federation::types::compute_persist_row_hash(&for_hash)?;
-
-        let attestation_id_for_exec = attestation_id.to_owned();
-        let pqc_sig = scrub_signature_pqc.to_owned();
-        let now_str = now.to_rfc3339();
-        let n = self
-            .write(move |conn| -> Result<usize, rusqlite::Error> {
-                // v36.0.0 (#668/#707-class) — the hybrid-completion write rewrites
-                // THREE served columns; the serve position moves with them.
-                let admitted_at =
-                    sqlite_next_plane_position(conn, "federation_attestations", POS_ATTESTATION)?;
-                conn.execute(
-                    "UPDATE federation_attestations \
-                 SET scrub_signature_pqc = ?1, pqc_completed_at = ?2, persist_row_hash = ?3, \
-                     admitted_at = ?5 \
-                 WHERE attestation_id = ?4 AND pqc_completed_at IS NULL",
-                    rusqlite::params![
-                        pqc_sig,
-                        now_str,
-                        new_hash,
-                        attestation_id_for_exec,
-                        admitted_at.to_rfc3339()
-                    ],
-                )
-            })
-            .await
-            .map_err(|e| {
-                crate::federation::Error::Backend(format!("attach_attestation_pqc_signature: {e}"))
-            })?;
-        if n == 0 {
-            return Err(crate::federation::Error::Conflict(
-                "federation_attestations row was concurrently completed".to_string(),
-            ));
-        }
-        // v31.0.0 (CIRISPersist#657) — the hybrid-completion write moves THREE
-        // serialized columns of the attestation (`scrub_signature_pqc`,
-        // `pqc_completed_at`, `persist_row_hash`), so it moves the wire content
-        // hash exactly as the key-plane twin above does. #547 fixed the key
-        // site and #640 made that remedy shared; this site was never redirected
-        // through it, so a federation-tier attestation that completed its PQC
-        // leg kept serving the PRE-completion hash out of `signed_wire_index` —
-        // the point-read advertises one digest and the read surface returns
-        // another. Indexed from the row AS STORED (the shared helper re-reads),
-        // which is what makes the index agree with the read surface on a
-        // backend that rounds `pqc_completed_at`.
-        self.index_stored_record(
-            "Attestation",
-            &crate::federation::wire_index::record_key(&[("attestation_id", attestation_id)]),
+        crate::federation::attestation_admit::attach_attestation_pqc_planned(
+            self,
+            attestation_id,
+            scrub_signature_pqc,
         )
-        .await?;
-        Ok(())
+        .await
     }
 
     async fn get_attestation(
@@ -22434,6 +22359,59 @@ impl crate::federation::attestation_admit::AttestationStore for SqliteBackend {
         .await
         .map(|_| ())
         .map_err(|e| crate::federation::Error::Backend(format!("withdraws depth repair: {e}")))
+    }
+
+    async fn store_pqc_completion(
+        &self,
+        completion: crate::federation::attestation_admit::PqcCompletion,
+    ) -> Result<(), crate::federation::Error> {
+        let attestation_id = completion.attestation_id.clone();
+        let n = self
+            .write(move |conn| -> Result<usize, rusqlite::Error> {
+                // v36.0.0 (#668/#707-class) — the hybrid-completion write rewrites
+                // THREE served columns; the serve position moves with them.
+                let admitted_at =
+                    sqlite_next_plane_position(conn, "federation_attestations", POS_ATTESTATION)?;
+                conn.execute(
+                    "UPDATE federation_attestations \
+                 SET scrub_signature_pqc = ?1, pqc_completed_at = ?2, persist_row_hash = ?3, \
+                     admitted_at = ?5 \
+                 WHERE attestation_id = ?4 AND pqc_completed_at IS NULL",
+                    rusqlite::params![
+                        completion.scrub_signature_pqc,
+                        completion.pqc_completed_at.to_rfc3339(),
+                        completion.persist_row_hash,
+                        completion.attestation_id,
+                        admitted_at.to_rfc3339()
+                    ],
+                )
+            })
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("attach_attestation_pqc_signature: {e}"))
+            })?;
+        if n == 0 {
+            return Err(crate::federation::Error::Conflict(
+                "federation_attestations row was concurrently completed".to_string(),
+            ));
+        }
+        // v31.0.0 (CIRISPersist#657) — the hybrid-completion write moves THREE
+        // serialized columns of the attestation (`scrub_signature_pqc`,
+        // `pqc_completed_at`, `persist_row_hash`), so it moves the wire content
+        // hash exactly as the key-plane twin above does. #547 fixed the key
+        // site and #640 made that remedy shared; this site was never redirected
+        // through it, so a federation-tier attestation that completed its PQC
+        // leg kept serving the PRE-completion hash out of `signed_wire_index` —
+        // the point-read advertises one digest and the read surface returns
+        // another. Indexed from the row AS STORED (the shared helper re-reads),
+        // which is what makes the index agree with the read surface on a
+        // backend that rounds `pqc_completed_at`.
+        self.index_stored_record(
+            "Attestation",
+            &crate::federation::wire_index::record_key(&[("attestation_id", &attestation_id)]),
+        )
+        .await?;
+        Ok(())
     }
 
     async fn store_planned_attestation(

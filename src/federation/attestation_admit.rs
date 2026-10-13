@@ -165,6 +165,79 @@ pub(crate) trait AttestationStore:
         &self,
         planned: PlannedAttestation,
     ) -> Result<StoredAttestation, Error>;
+
+    /// Write a planned hybrid completion: the three columns, guarded on the
+    /// row still being incomplete (a concurrent completion is a
+    /// [`Error::Conflict`], the guard's storage outcome), the serve position
+    /// moved with them, then the wire index re-derived from the row as stored.
+    async fn store_pqc_completion(&self, completion: PqcCompletion) -> Result<(), Error>;
+}
+
+/// v56.0.0 (CIRISPersist#934 step 1) — a planned hybrid completion
+/// (`attach_attestation_pqc_signature`): the three columns the write sets.
+pub(crate) struct PqcCompletion {
+    /// The row being completed.
+    pub(crate) attestation_id: String,
+    /// The ML-DSA-65 half the caller supplied.
+    pub(crate) scrub_signature_pqc: String,
+    /// The completion instant: the plan's `at`.
+    pub(crate) pqc_completed_at: chrono::DateTime<chrono::Utc>,
+    /// The row hash over the completed row.
+    pub(crate) persist_row_hash: String,
+}
+
+/// v56.0.0 (CIRISPersist#934 step 1) — **the hybrid-completion decision**,
+/// once for all three backends: the row must be held and not yet
+/// PQC-complete; the completed row's hash covers the new signature half and
+/// the completion instant `at`. Pure: the held row is the executor's read.
+pub(crate) fn plan_attach_attestation_pqc_signature(
+    held: Option<Attestation>,
+    attestation_id: &str,
+    scrub_signature_pqc: &str,
+    at: chrono::DateTime<chrono::Utc>,
+) -> Result<PqcCompletion, Error> {
+    let mut row = held.ok_or_else(|| {
+        Error::InvalidArgument(format!(
+            "federation_attestations row {attestation_id} does not exist"
+        ))
+    })?;
+    if row.is_pqc_complete() {
+        return Err(Error::Conflict(format!(
+            "federation_attestations row {attestation_id} is already PQC-complete"
+        )));
+    }
+    row.scrub_signature_pqc = Some(scrub_signature_pqc.to_owned());
+    row.pqc_completed_at = Some(at);
+    row.persist_row_hash = String::new();
+    let persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+    Ok(PqcCompletion {
+        attestation_id: attestation_id.to_owned(),
+        scrub_signature_pqc: scrub_signature_pqc.to_owned(),
+        pqc_completed_at: at,
+        persist_row_hash,
+    })
+}
+
+/// v56.0.0 (CIRISPersist#934 step 1) — the door: every backend's
+/// `attach_attestation_pqc_signature` is this call. The one clock read of the
+/// door is here; the plan reads the held row through the directory, and the
+/// executor writes what the plan decided.
+pub(crate) async fn attach_attestation_pqc_planned<D>(
+    dir: &D,
+    attestation_id: &str,
+    scrub_signature_pqc: &str,
+) -> Result<(), Error>
+where
+    D: AttestationStore,
+{
+    let at = chrono::Utc::now();
+    // The row as stored, any tier: the same point read the crossing door
+    // plans over (`enter_mesh`).
+    let held = dir.get_attestation(attestation_id).await?;
+    let completion =
+        plan_attach_attestation_pqc_signature(held, attestation_id, scrub_signature_pqc, at)?;
+    dir.store_pqc_completion(completion).await?;
+    Ok(())
 }
 
 /// The door: every backend's `put_attestation_with_origin` is this call.

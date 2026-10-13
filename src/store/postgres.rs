@@ -14546,96 +14546,20 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         Ok(())
     }
 
+    /// v56.0.0 (CIRISPersist#934 step 1) — the decision is
+    /// [`plan_attach_attestation_pqc_signature`](crate::federation::attestation_admit::plan_attach_attestation_pqc_signature),
+    /// shared by all three backends; this backend stores it.
     async fn attach_attestation_pqc_signature(
         &self,
         attestation_id: &str,
         scrub_signature_pqc: &str,
     ) -> Result<(), crate::federation::Error> {
-        let client = self
-            .get_client()
-            .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
-        // Parse to uuid::Uuid before binding — the driver refuses a &str
-        // against a `uuid`-typed param (see the 1693 / put_revocation note).
-        // v30.6.0 (CIRISPersist#622) — bind the id as TEXT. It was parsed into a
-        // `uuid::Uuid` because the column was `uuid`-typed (V004); V121 relaxed it so
-        // the column can hold the ids the genesis ceremony SIGNED
-        // (`genesis-charter`, `genesis-grant:…`, `genesis-lifecycle`). Relaxing the
-        // column alone was NOT enough — this Rust-side parse produced the identical
-        // `attestation_id is not a valid UUID` refusal with the schema already fixed.
-        // Read existing row to recompute the hash with new fields.
-        let row_opt = client
-            .query_opt(
-                // weight::float8 AS weight — see list_attestations_for.
-                "SELECT attestation_id::text, attesting_key_id, attested_key_id, attestation_type, \
-                    weight::float8 AS weight, asserted_at, expires_at, attestation_envelope, \
-                    original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
-                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at, additional_scrubs \
-                 FROM cirislens.federation_attestations WHERE attestation_id = $1",
-                &[&attestation_id],
-            )
-            .await
-            .map_err(|e| crate::federation::Error::Backend(format!("attach lookup: {e}")))?;
-        let mut row = row_opt
-            .map(pg_row_to_attestation)
-            .transpose()?
-            .ok_or_else(|| {
-                crate::federation::Error::InvalidArgument(format!(
-                    "federation_attestations row {attestation_id} does not exist"
-                ))
-            })?;
-        if row.is_pqc_complete() {
-            return Err(crate::federation::Error::Conflict(format!(
-                "federation_attestations row {attestation_id} is already PQC-complete"
-            )));
-        }
-        row.scrub_signature_pqc = Some(scrub_signature_pqc.to_owned());
-        let now = chrono::Utc::now();
-        row.pqc_completed_at = Some(now);
-        let mut for_hash = row.clone();
-        for_hash.persist_row_hash = String::new();
-        let new_hash = crate::federation::types::compute_persist_row_hash(&for_hash)?;
-        // v36.0.0 (#668/#707-class) — the hybrid-completion write rewrites
-        // THREE served columns; the serve position moves with them.
-        let admitted_at = self
-            .next_plane_position(&client, "federation_attestations")
-            .await?;
-        let n = client
-            .execute(
-                "UPDATE cirislens.federation_attestations \
-                 SET scrub_signature_pqc = $1, pqc_completed_at = $2, persist_row_hash = $3, \
-                     admitted_at = $5 \
-                 WHERE attestation_id = $4 AND pqc_completed_at IS NULL",
-                &[
-                    &scrub_signature_pqc,
-                    &now,
-                    &new_hash,
-                    &attestation_id,
-                    &admitted_at,
-                ],
-            )
-            .await
-            .map_err(|e| {
-                crate::federation::Error::Backend(format!("attach_attestation_pqc_signature: {e}"))
-            })?;
-        if n == 0 {
-            return Err(crate::federation::Error::Conflict(format!(
-                "federation_attestations row {attestation_id} was concurrently completed"
-            )));
-        }
-        // v31.0.0 (CIRISPersist#657) — re-index; see the sqlite twin. The
-        // hybrid-completion write moves three serialized columns, so it moves
-        // the wire content hash. #547 fixed this at the key site and #640 made
-        // the remedy shared, but the attestation site was never redirected
-        // through it. Postgres rounds `pqc_completed_at` to microseconds, which
-        // is exactly why the shared helper re-reads the row rather than hashing
-        // the in-memory value.
-        self.index_stored_record(
-            "Attestation",
-            &crate::federation::wire_index::record_key(&[("attestation_id", attestation_id)]),
+        crate::federation::attestation_admit::attach_attestation_pqc_planned(
+            self,
+            attestation_id,
+            scrub_signature_pqc,
         )
-        .await?;
-        Ok(())
+        .await
     }
 
     async fn get_attestation(
@@ -23705,6 +23629,59 @@ impl crate::federation::attestation_admit::AttestationStore for PostgresBackend 
             .await
             .map(|_| ())
             .map_err(|e| crate::federation::Error::Backend(format!("withdraws depth repair: {e}")))
+    }
+
+    async fn store_pqc_completion(
+        &self,
+        completion: crate::federation::attestation_admit::PqcCompletion,
+    ) -> Result<(), crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        // v36.0.0 (#668/#707-class) — the hybrid-completion write rewrites
+        // THREE served columns; the serve position moves with them.
+        let admitted_at = self
+            .next_plane_position(&client, "federation_attestations")
+            .await?;
+        let n = client
+            .execute(
+                "UPDATE cirislens.federation_attestations \
+                 SET scrub_signature_pqc = $1, pqc_completed_at = $2, persist_row_hash = $3, \
+                     admitted_at = $5 \
+                 WHERE attestation_id = $4 AND pqc_completed_at IS NULL",
+                &[
+                    &completion.scrub_signature_pqc,
+                    &completion.pqc_completed_at,
+                    &completion.persist_row_hash,
+                    &completion.attestation_id,
+                    &admitted_at,
+                ],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("attach_attestation_pqc_signature: {e}"))
+            })?;
+        if n == 0 {
+            return Err(crate::federation::Error::Conflict(format!(
+                "federation_attestations row {} was concurrently completed",
+                completion.attestation_id
+            )));
+        }
+        // v31.0.0 (CIRISPersist#657) — re-index; see the sqlite twin. The
+        // hybrid-completion write moves three serialized columns, so it moves
+        // the wire content hash. Postgres rounds `pqc_completed_at` to
+        // microseconds, which is exactly why the shared helper re-reads the row
+        // rather than hashing the in-memory value.
+        self.index_stored_record(
+            "Attestation",
+            &crate::federation::wire_index::record_key(&[(
+                "attestation_id",
+                &completion.attestation_id,
+            )]),
+        )
+        .await?;
+        Ok(())
     }
 
     async fn store_planned_attestation(
