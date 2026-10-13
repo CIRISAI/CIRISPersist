@@ -1,29 +1,24 @@
-//! v56.0.0 (CIRISPersist#934 step 1) — **the local write door on an occupied
-//! `attestation_id`: a pre-existing backend divergence, witnessed.**
+//! v56.0.0 (CIRISPersist#934 step 1, door 2) — **the local write door on an
+//! occupied `attestation_id`, decided once.**
 //!
 //! `attestation_upsert_local` / `attestation_insert_local` take an optional
-//! caller-chosen `attestation_id`. When that id is already held, the three
-//! backends' storage halves disagree:
+//! caller-chosen `attestation_id`. Before door 2 the three backends' storage
+//! halves disagreed when it was already held (the first divergence the
+//! one-door extraction made visible). Memory returned the id before the
+//! upsert's replace-DELETE; sqlite and postgres ran the DELETE of every local
+//! `(attester, dimension)` row, then an insert-if-absent:
 //!
-//! - **memory** returns the id at once, BEFORE the upsert's replace-DELETE:
-//!   nothing is deleted, nothing is written;
-//! - **sqlite and postgres** run the replace-DELETE of every local row of
-//!   `(attester, dimension)` first, then an insert-if-absent (`INSERT OR
-//!   IGNORE` / `ON CONFLICT DO NOTHING`).
+//! | leg | memory before | sqlite, postgres before | all three now |
+//! |---|---|---|---|
+//! | (A) upsert re-uses its own row's id, new weight | old row kept | replaced | replaced |
+//! | (B) upsert re-uses another dimension's row's id | Ok, nothing changed | Ok, own row DELETED, nothing stored | refused `LocalAttestationIdOccupied`, nothing changed |
+//! | (C) insert re-uses a held id | Ok, nothing written | Ok, nothing written | Ok, nothing written |
 //!
-//! I951 observes two consequences, on each backend:
+//! The ruling (lead, on I951): an upsert REPLACES its own `(attester,
+//! dimension)` local row; an id held by any other row is a typed refusal.
+//! `attestation_admit::local_occupied_id_verdict` is the one clause.
 //!
-//! - (A) an upsert re-using the id of the held row of the SAME dimension, with
-//!   a different weight: memory keeps the old row; sqlite and postgres delete
-//!   it and store the new one;
-//! - (B) an upsert re-using the id of a held row of ANOTHER dimension: memory
-//!   changes nothing; sqlite and postgres delete the held row of the upsert's
-//!   dimension and store nothing in its place.
-//!
-//! #934's rule for a divergence found during an extraction is to stop that
-//! door and report it, never to pick one behaviour silently. So this witness
-//! PINS today's per-backend outcome: it goes red when either side changes,
-//! which is the moment someone has to rule which outcome is right.
+//! I951 asserts the same outcome on memory, sqlite and postgres.
 
 /// What one backend did, per scenario.
 #[cfg(test)]
@@ -35,6 +30,12 @@ pub(crate) struct Observed {
     pub(crate) other_dimension_row_survives: bool,
     /// (B) the dimension held under the re-used id after the upsert.
     pub(crate) reused_id_dimension: Option<String>,
+    /// (B) the upsert's outcome: `Ok`, or the refusal's `kind()` token.
+    pub(crate) cross_dimension_outcome: String,
+    /// (C) the weight held under the id an insert re-used.
+    pub(crate) insert_reuse_weight: Option<f64>,
+    /// (C) the insert's outcome: the id it returned, or `kind()`.
+    pub(crate) insert_reuse_outcome: String,
 }
 
 /// The backend-agnostic witness body.
@@ -102,9 +103,13 @@ pub(crate) mod bodies {
         d.attestation_insert_local(input(&z, &b, BINDING, 1.0))
             .await
             .expect("(B) z, the binding row");
-        d.attestation_upsert_local(input(&y, &b, BINDING, 1.0))
+        let cross_dimension_outcome = match d
+            .attestation_upsert_local(input(&y, &b, BINDING, 1.0))
             .await
-            .expect("(B) the binding upsert re-using y's id");
+        {
+            Ok(_) => "Ok".to_owned(),
+            Err(e) => e.kind().to_owned(),
+        };
         let other_dimension_row_survives = d.get_attestation(&z).await.unwrap().is_some();
         let reused_id_dimension = d.get_attestation(&y).await.unwrap().and_then(|r| {
             r.attestation_envelope
@@ -112,29 +117,35 @@ pub(crate) mod bodies {
                 .and_then(|v| v.as_str())
                 .map(str::to_owned)
         });
+        // (C) an insert re-using the held id `x`, with yet another weight.
+        let insert_reuse_outcome = match d
+            .attestation_insert_local(input(&x, &a, BINDING, 0.25))
+            .await
+        {
+            Ok(id) if id == x => "Ok(x)".to_owned(),
+            Ok(other) => format!("Ok({other})"),
+            Err(e) => e.kind().to_owned(),
+        };
+        let insert_reuse_weight = d.get_attestation(&x).await.unwrap().and_then(|r| r.weight);
         Observed {
             same_dimension_weight,
             other_dimension_row_survives,
             reused_id_dimension,
+            cross_dimension_outcome,
+            insert_reuse_weight,
+            insert_reuse_outcome,
         }
     }
 
-    /// Memory today: the occupied id short-circuits before the replace.
-    pub(crate) fn memory_today() -> Observed {
-        Observed {
-            same_dimension_weight: Some(1.0),
-            other_dimension_row_survives: true,
-            reused_id_dimension: Some(CAPABILITY.to_owned()),
-        }
-    }
-
-    /// sqlite and postgres today: the replace runs, then insert-if-absent.
-    #[cfg(any(feature = "sqlite", feature = "postgres"))]
-    pub(crate) fn sql_today() -> Observed {
+    /// The one outcome, on every backend (lead ruling on I951).
+    pub(crate) fn ruled() -> Observed {
         Observed {
             same_dimension_weight: Some(0.5),
-            other_dimension_row_survives: false,
+            other_dimension_row_survives: true,
             reused_id_dimension: Some(CAPABILITY.to_owned()),
+            cross_dimension_outcome: "federation_local_attestation_id_occupied".to_owned(),
+            insert_reuse_weight: Some(0.5),
+            insert_reuse_outcome: "Ok(x)".to_owned(),
         }
     }
 }
@@ -152,11 +163,7 @@ mod run {
     async fn i951_memory() {
         let b = crate::store::memory::MemoryBackend::new();
         let seen = bodies::i951_observe(&b as &dyn FederationDirectory, &tag()).await;
-        assert_eq!(
-            seen,
-            bodies::memory_today(),
-            "I951 memory (see the module doc)"
-        );
+        assert_eq!(seen, bodies::ruled(), "I951 memory (see the module doc)");
     }
 
     #[cfg(feature = "sqlite")]
@@ -168,11 +175,7 @@ mod run {
             .unwrap();
         b.run_migrations().await.unwrap();
         let seen = bodies::i951_observe(&b as &dyn FederationDirectory, &tag()).await;
-        assert_eq!(
-            seen,
-            bodies::sql_today(),
-            "I951 sqlite (see the module doc)"
-        );
+        assert_eq!(seen, bodies::ruled(), "I951 sqlite (see the module doc)");
     }
 
     #[cfg(feature = "postgres")]
@@ -188,11 +191,7 @@ mod run {
             .unwrap();
         b.run_migrations().await.unwrap();
         let seen = bodies::i951_observe(&b as &dyn FederationDirectory, &tag()).await;
-        assert_eq!(
-            seen,
-            bodies::sql_today(),
-            "I951 postgres (see the module doc)"
-        );
+        assert_eq!(seen, bodies::ruled(), "I951 postgres (see the module doc)");
         eprintln!("i951_postgres: RAN");
     }
 }

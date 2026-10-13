@@ -34831,6 +34831,12 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         // caller-fault malformed
         // content; ValueError (4xx), the kind names it.
         crate::federation::Error::MediaSourceInvalid { .. } => PyValueError::new_err(kind),
+        // v56.0.0 (CIRISPersist#934 door 2) — a local upsert naming an id a
+        // row it does not replace holds: caller-fault, ValueError (the type of
+        // the local door's InvalidArgument refusals), the kind names it.
+        crate::federation::Error::LocalAttestationIdOccupied { .. } => {
+            PyValueError::new_err(kind)
+        }
         // v3.4.0 (CIRISPersist#123) — trust gate rejection is
         // caller-side authorization failure; ValueError (4xx).
         crate::federation::Error::TrustBelowThreshold { .. } => PyValueError::new_err(kind),

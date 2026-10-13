@@ -9966,6 +9966,31 @@ pub enum Error {
         reason: String,
     },
 
+    /// v56.0.0 (CIRISPersist#934 step 1, door 2) — a local upsert
+    /// (`attestation_upsert_local`) named an `attestation_id` held by a row it
+    /// does not replace: a row of another dimension, another attester, or the
+    /// federation tier. An upsert replaces only its own `(attester, dimension)`
+    /// local row. Refused with nothing written and nothing deleted. Before
+    /// v56.0.0 memory returned the id without writing, and sqlite and postgres
+    /// deleted the upsert's own row and stored nothing (I951). Stable `kind()`
+    /// token `federation_local_attestation_id_occupied`; Python `ValueError`,
+    /// the type of the local door's `InvalidArgument` refusals.
+    #[error(
+        "local attestation_id {attestation_id} is held by a row this upsert does not replace \
+         (attester {held_attesting_key_id}, dimension {held_dimension:?}, tier {held_tier}): \
+         an upsert replaces only its own (attester, dimension) local row"
+    )]
+    LocalAttestationIdOccupied {
+        /// The id the caller chose.
+        attestation_id: String,
+        /// The held row's attester.
+        held_attesting_key_id: String,
+        /// The held row's envelope dimension, if it carries one.
+        held_dimension: Option<String>,
+        /// The held row's tier.
+        held_tier: String,
+    },
+
     /// Row would conflict with an existing row whose content differs.
     /// Idempotent re-submission of the *same* content is OK; this
     /// fires only when the caller is overwriting.
@@ -12159,6 +12184,7 @@ impl Error {
             Error::ConsentGateRefused(_) => "federation_consent_gate_refused",
             Error::ConsentScopeTokenInvalid { .. } => "federation_consent_scope_token_invalid",
             Error::MediaSourceInvalid { .. } => "federation_media_source_invalid",
+            Error::LocalAttestationIdOccupied { .. } => "federation_local_attestation_id_occupied",
             Error::Conflict(_) => "federation_conflict",
             Error::AdminActionUnattributed { .. } => "federation_admin_action_unattributed",
             Error::RevocationBoundInvalid { .. } => "federation_revocation_bound_invalid",

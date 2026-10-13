@@ -146,14 +146,15 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // row, so a Gate), and the executor's guarded write.
     ("attach_attestation_pqc_planned", Class::Plan),
     // The local-tier doors (`attestation_upsert_local` /
-    // `attestation_insert_local`) delegate their whole body to a same-file
-    // helper; until v56.0.0 the scan could not see past the tail call and
-    // reported both doors `gateless` on all three backends while each helper
-    // ran fourteen gates. Delegates: the helper's sequence is the door's.
-    ("memory_write_local_attestation", Class::Delegates),
-    ("sqlite_write_local_attestation", Class::Delegates),
-    ("pg_write_local_attestation", Class::Delegates),
-    // ...and the local helpers' own gates, seen for the first time with them:
+    // `attestation_insert_local`), door 2: until v56.0.0 each delegated its
+    // body to a per-backend helper the scan could not see past (both doors read
+    // `gateless` while each helper ran seventeen gates). The shared door, its
+    // plan, the occupied-id clause (a refusal: a Gate) and the executor.
+    ("write_local_attestation_planned", Class::Plan),
+    ("plan_write_local_attestation", Class::Delegates),
+    ("local_occupied_id_verdict", Class::Gate),
+    ("store_planned_local_attestation", Class::Plumbing),
+    // ...and the local plan's own gates, seen for the first time with it:
     // the local-tier eligibility rule, the caller-signed transit verify, the
     // signed-instant read (refuses a malformed instant) and the local stamp
     // (refuses an envelope it cannot place the instants in).
@@ -1157,7 +1158,7 @@ mod tests {
     /// files: `(file, fn)`. Each body is held to the same [`CALL_CLASSES`]
     /// partition as a backend door, and its sequence is what a door's
     /// `plan:NAME` token stands for.
-    const SHARED_PLANS: [(&str, &str); 3] = [
+    const SHARED_PLANS: [(&str, &str); 4] = [
         (
             "src/federation/attestation_admit.rs",
             "put_attestation_planned",
@@ -1170,6 +1171,10 @@ mod tests {
             "src/federation/attestation_admit.rs",
             "attach_attestation_pqc_planned",
         ),
+        (
+            "src/federation/attestation_admit.rs",
+            "write_local_attestation_planned",
+        ),
     ];
 
     /// v56.0.0 (CIRISPersist#934) — **the doors that decide nothing in a
@@ -1179,7 +1184,7 @@ mod tests {
     /// this list on the commit that moves its decision into a plan, and
     /// cannot drift back: a gate added to one backend's copy fails
     /// [`shared_doors_decide_nothing_in_a_backend`].
-    const SHARED_DOORS: [(&str, &str, &str); 3] = [
+    const SHARED_DOORS: [(&str, &str, &str); 5] = [
         (
             "FederationDirectory",
             "put_attestation_with_origin",
@@ -1195,6 +1200,16 @@ mod tests {
             "FederationDirectory",
             "attach_attestation_pqc_signature",
             "attach_attestation_pqc_planned",
+        ),
+        (
+            "FederationDirectory",
+            "attestation_upsert_local",
+            "write_local_attestation_planned",
+        ),
+        (
+            "FederationDirectory",
+            "attestation_insert_local",
+            "write_local_attestation_planned",
         ),
     ];
 
@@ -2390,13 +2405,36 @@ mod tests {
             "Some",
             Reads::ReceivedAt,
         ),
+        // The local door mints the row's instant from the receipt clock (or the
+        // signed envelope), and every gate it ran read the receipt clock.
+        (
+            "plan_write_local_attestation",
+            "check_trust_charter_admission",
+            Reads::ReceivedAt,
+        ),
+        (
+            "plan_write_local_attestation",
+            "check_attach_freshness",
+            Reads::ReceivedAt,
+        ),
+        (
+            "plan_write_local_attestation",
+            "local_row_instant",
+            Reads::ReceivedAt,
+        ),
+        (
+            "plan_write_local_attestation",
+            "check_instant_binding",
+            Reads::ReceivedAt,
+        ),
     ];
 
     /// The plan fns [`PLAN_INSTANTS`] covers, in `src/federation/attestation_admit.rs`.
-    const INSTANT_PLANS: [&str; 3] = [
+    const INSTANT_PLANS: [&str; 4] = [
         "plan_put_attestation",
         "recheck_cycle_under_lock",
         "plan_attach_attestation_pqc_signature",
+        "plan_write_local_attestation",
     ];
 
     /// For every mention of `word` in `body`, the innermost CALL it is an

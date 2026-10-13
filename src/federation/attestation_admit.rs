@@ -198,6 +198,15 @@ pub(crate) trait AttestationStore:
     /// [`Error::Conflict`], the guard's storage outcome), the serve position
     /// moved with them, then the wire index re-derived from the row as stored.
     async fn store_pqc_completion(&self, completion: PqcCompletion) -> Result<(), Error>;
+
+    /// Store a planned local-tier row: for an upsert, first delete every local
+    /// row of `(attester, dimension)` (and their renditions); then insert the
+    /// row if its id is free (a concurrent writer that took it makes this a
+    /// no-op), its subject and rendition projections, and its depth.
+    async fn store_planned_local_attestation(
+        &self,
+        planned: PlannedLocalAttestation,
+    ) -> Result<(), Error>;
 }
 
 /// v56.0.0 (CIRISPersist#934 step 1) — a planned hybrid completion
@@ -1077,5 +1086,310 @@ where
         wire_index_key,
         cycle_gated,
         received_at,
+    })))
+}
+
+/// v56.0.0 (CIRISPersist#934 step 1, door 2) — what the local door's plan
+/// decided.
+pub(crate) enum LocalPlan {
+    /// An insert (`attestation_insert_local`) whose id is already held: the
+    /// held row stands and nothing is written (the #473 replay idempotence of
+    /// a deterministic trace-ingest id).
+    Held(String),
+    /// Write it.
+    Write(Box<PlannedLocalAttestation>),
+}
+
+/// An admitted local-tier row, exactly as the executor stores it.
+pub(crate) struct PlannedLocalAttestation {
+    /// The row: stamped mirror and instants, computed `persist_row_hash`.
+    pub(crate) row: Attestation,
+    /// The `(attester, dimension)` key an upsert replaces.
+    pub(crate) dimension: String,
+    /// Upsert (`true`) or insert.
+    pub(crate) replace: bool,
+    /// The delegation depth a local `withdraws` is recorded at (V157).
+    pub(crate) withdraws_depth: Option<usize>,
+}
+
+/// What a caller-chosen `attestation_id` that is already held means.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum LocalIdVerdict {
+    /// Nothing holds the id.
+    Free,
+    /// An upsert, and the held row is one it replaces: the local row of the
+    /// same `(attester, dimension)`.
+    Replaces,
+    /// An insert: the held row stands, nothing is written.
+    Held,
+}
+
+/// v56.0.0 (CIRISPersist#934 step 1, door 2; lead ruling on I951) — **the
+/// occupied-id clause, once.** Before #934 the three backends disagreed (I951):
+/// memory returned before the upsert's replace; sqlite and postgres replaced,
+/// and on a held row of ANOTHER dimension deleted the upsert's own row and
+/// stored nothing. The ruling: an upsert REPLACES its own `(attester,
+/// dimension)` local row, whatever id that row holds; an id held by any other
+/// row is [`Error::LocalAttestationIdOccupied`], with nothing written and
+/// nothing deleted. An insert of a held id writes nothing (unchanged).
+pub(crate) fn local_occupied_id_verdict(
+    held: Option<&Attestation>,
+    row: &Attestation,
+    dimension: &str,
+    replace: bool,
+) -> Result<LocalIdVerdict, Error> {
+    let Some(held) = held else {
+        return Ok(LocalIdVerdict::Free);
+    };
+    if !replace {
+        return Ok(LocalIdVerdict::Held);
+    }
+    let held_dimension =
+        crate::federation::admission::envelope_dimension(&held.attestation_envelope);
+    if held.tier == crate::federation::types::attestation_tier::LOCAL
+        && held.attesting_key_id == row.attesting_key_id
+        && held_dimension == Some(dimension)
+    {
+        return Ok(LocalIdVerdict::Replaces);
+    }
+    Err(Error::LocalAttestationIdOccupied {
+        attestation_id: row.attestation_id.clone(),
+        held_attesting_key_id: held.attesting_key_id.clone(),
+        held_dimension: held_dimension.map(str::to_owned),
+        held_tier: held.tier.clone(),
+    })
+}
+
+/// v56.0.0 (CIRISPersist#934 step 1, door 2) — the door: every backend's
+/// `attestation_upsert_local` / `attestation_insert_local` is this call. The
+/// one clock read of the door is here.
+pub(crate) async fn write_local_attestation_planned<D>(
+    dir: &D,
+    input: crate::federation::types::LocalAttestationInput,
+    replace: bool,
+) -> Result<String, Error>
+where
+    D: AttestationStore,
+{
+    let received_at = chrono::Utc::now();
+    let id = match plan_write_local_attestation(dir, input, replace, received_at).await? {
+        LocalPlan::Held(id) => id,
+        LocalPlan::Write(planned) => {
+            let id = planned.row.attestation_id.clone();
+            dir.store_planned_local_attestation(*planned).await?;
+            id
+        }
+    };
+    Ok(id)
+}
+
+/// v56.0.0 (CIRISPersist#934 step 1, door 2) — **the local door's decision**,
+/// once for all three backends: the seventeen gates the three
+/// `*_write_local_attestation` helpers each ran, in the same order, then the
+/// occupied-id clause. The local door mints the row's instant itself
+/// (`local_row_instant`, from the signed envelope when it carries one), so it
+/// takes only `received_at`; every gate here read the receipt clock before.
+pub(crate) async fn plan_write_local_attestation<D>(
+    dir: &D,
+    input: crate::federation::types::LocalAttestationInput,
+    replace: bool,
+    received_at: chrono::DateTime<chrono::Utc>,
+) -> Result<LocalPlan, Error>
+where
+    D: AttestationStore,
+{
+    // v17.9.0 (CC#38 interim) — envelope size cap FIRST, before any
+    // parsing/lookups (cheapest-most-specific-rejection-first).
+    // v20.0.0 (#495): the input envelope is TYPED (EnvelopeCore);
+    // serialize once for the Value-based admission checks.
+    let envelope_value = input.attestation_envelope.to_value();
+    crate::federation::admission::check_envelope_size_admission(&envelope_value)?;
+    // v44.8.0 (CIRISPersist#866 C1) — the scope-token gate, at the local
+    // door too (`FSD/CONTEXTUAL_INTEGRITY_ENVELOPE.md` §4.4).
+    crate::federation::consent_scope::check_consent_scope_tokens(&envelope_value)?;
+    // v45.0.0 (CIRISPersist#871) — the media Source struct gate, at the local
+    // door too (`FSD/MEDIA_SOURCE.md` §6). A local row never carries a
+    // holder claim, so only the struct is checked here.
+    crate::federation::media_source::check_media_source(&envelope_value)?;
+    crate::federation::admission::check_trace_dimension_admission(
+        input.dimension(),
+        &input.attesting_key_id,
+        &input.subject_key_ids,
+        &envelope_value,
+    )?;
+    crate::federation::trust_root::check_trust_charter_admission(
+        dir,
+        &input.attestation_type,
+        &input.attesting_key_id,
+        input
+            .attested_key_id
+            .as_deref()
+            .unwrap_or(&input.attesting_key_id),
+        &envelope_value,
+        received_at,
+    )
+    .await?;
+    // v51.0.0 (CIRISPersist#937, CC 3.2 T4a) — attaching is gated on a
+    // witnessed lineage head inside the root's attach window.
+    crate::federation::canonical_community::check_attach_freshness(
+        dir,
+        crate::federation::canonical_community::AttachDoor::Author,
+        input.attestation_id.as_deref(),
+        &input.attesting_key_id,
+        &input.attestation_type,
+        input
+            .attested_key_id
+            .as_deref()
+            .unwrap_or(&input.attesting_key_id),
+        &envelope_value,
+        received_at,
+    )
+    .await?;
+    // The (occurrence, dimension) key + the gate axis. Required.
+    let dimension = input.dimension().map(|s| s.to_string()).ok_or_else(|| {
+        Error::InvalidArgument(
+            "local attestation envelope must carry a \"dimension\" string".into(),
+        )
+    })?;
+
+    // §4.1 local-tier gate: refuse capacity:*; classify subject-side
+    // revocation as TRANSIT (§10.1.3 transit-not-rest).
+    let disposition = crate::federation::admission::check_local_tier_eligibility(
+        &input.attestation_type,
+        Some(dimension.as_str()),
+        &input.attesting_key_id,
+        &input.subject_key_ids,
+        &input.cohort_scope,
+    )?;
+
+    // cohort_scope value validation (closed set).
+    crate::federation::admission::check_cohort_scope(&input.cohort_scope)?;
+
+    // v12.6.0 (CIRISPersist#171, §10.1.3) — a subject-side revocation MAY
+    // *transit* the local write path only if its bound-hybrid signature
+    // verifies (accept on VALID crypto only). `None` for a durable
+    // producer-authority row. Runs before the DB write.
+    let transit =
+        crate::federation::admission::verify_caller_signed_local_row(dir, disposition, &input)
+            .await?;
+
+    // v24.0.0 (CIRISPersist#557) — the attested SUBJECT rule, shared with the
+    // federation write path and with the other two backends. V114 removed
+    // the SQLite `attested_key_id` FK that used to catch this at INSERT, so
+    // the local writer must run the predicate explicitly or the two write
+    // paths would enforce different rules.
+    // v31.2.0 (CIRISPersist#670) — it runs HERE, behind the pure gates, not
+    // ahead of them. It resolves the subject through the directory; the
+    // three gates above are pure functions of `input`. Memory had this
+    // order and the two SQL backends did not, which is the AV-76 tier
+    // inversion of #660 wearing different clothes: a row that fails a free
+    // predicate was paying for a directory walk first, on the two backends
+    // production runs.
+    crate::federation::admission::check_attested_subject_admission(
+        dir,
+        input
+            .attested_key_id
+            .as_deref()
+            .unwrap_or(&input.attesting_key_id),
+    )
+    .await?;
+    // v45.0.0 (CIRISPersist#871, FSD/MEDIA_SOURCE.md §5) — the placement
+    // rule at the local door: a rendition (`media.derived_from`) whose
+    // original THIS node holds must name the original's own
+    // `cohort_scope`. Reads the blob store, so it sits with the other
+    // directory-reading gates, before the write. Backend-symmetric.
+    crate::federation::renditions::check_rendition_placement(
+        dir,
+        &envelope_value,
+        &input.cohort_scope,
+    )
+    .await?;
+
+    // FK precondition + §7.0.1 emitter gate: the attesting key must
+    // exist; its identity_type gates the dimension. Mirrors
+    // put_attestation, minus the federation trust-threshold gate
+    // (local = producer-only authority, not federation-trust-gated).
+    let identity_type = dir
+        .attesting_identity_type(&input.attesting_key_id)
+        .await?
+        .ok_or_else(|| {
+            Error::InvalidArgument(format!(
+                "attesting_key_id {} does not exist in federation_keys",
+                input.attesting_key_id
+            ))
+        })?;
+    let dim = input.dimension();
+    crate::federation::admission::DimensionAdmissionPolicy::default().check(
+        &input.attestation_type,
+        dim,
+        &identity_type,
+    )?;
+
+    // Build the local row + its persist_row_hash. A durable row defers
+    // its signature (empty-sentinel scrub envelope); a TRANSIT revocation
+    // carries the caller's verified bound-hybrid signature + computed hash.
+    // v18.0.0 (#473) — caller-supplied deterministic id (replay-idempotent
+    // trace ingest) or the classic fresh v4.
+    let attestation_id = input
+        .attestation_id
+        .clone()
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    // v31.0.0 (CIRISPersist#598) — the row instant comes from the SIGNED
+    // envelope when it carries one (see `admission::local_row_instant`), so
+    // a `consent:state:*` row staged at the local tier can still satisfy
+    // the instant binding at the promote door.
+    let now = crate::federation::admission::local_row_instant(&envelope_value, received_at)?;
+    let caller_signed = transit.is_some();
+    let mut row = match transit {
+        Some((hash, sig_classical, sig_pqc)) => {
+            input.into_caller_signed_row(attestation_id.clone(), now, hash, sig_classical, sig_pqc)
+        }
+        None => input.into_local_row(attestation_id.clone(), now),
+    };
+    // v31.0.0 (CIRISPersist#660) — THE BAKED GENESIS IDS ARE RESERVED AT
+    // THIS DOOR TOO. See the memory backend's local door for why this one
+    // cannot defer to the promote gate the way `check_reserved_prefix_admission`
+    // does: the harm is the PRIMARY KEY, and a local-tier row already holds it.
+    crate::federation::genesis::check_genesis_attestation_reserved(&row)?;
+    // v31.0.0 (CIRISPersist#649) — STAMP THE MIRROR AT THE LOCAL DOOR.
+    // See `crate::federation::envelope::RowMirror::stamp_local_row` for the
+    // decision and the transit exclusion. One helper, all three backends.
+    crate::federation::envelope::RowMirror::stamp_local_row(&mut row, caller_signed)?;
+    // v31.0.0 (CIRISPersist#653) — SIZE THE ROW AS IT WILL BE STORED. The early call above
+    // measured the PRODUCER's envelope; this one measures the bytes that
+    // actually land, which the #643 mirror and the #598 instants just grew
+    // by ~250. Without it a row in that window is admitted here and refused
+    // by the SAME function at the federation door on promotion or
+    // replication — locally Ok, globally unreplicable. Both calls stay: the
+    // early one is the cheap pre-filter that keeps hostile input away from
+    // the directory reads below it, this one is authoritative. See
+    // `check_envelope_size_admission` for why producers do not reserve
+    // headroom instead.
+    crate::federation::admission::check_envelope_size_admission(&row.attestation_envelope)?;
+    // v31.0.0 (CIRISPersist#598) — the same binding the federation door
+    // asks, asked at the local door too: a `consent:state:*` row that
+    // cannot state its own signed instant is refused where it is written,
+    // not where it is promoted.
+    crate::federation::admission::check_instant_binding(
+        &row,
+        received_at,
+        crate::federation::admission::DEFAULT_MAX_TOUCH_SKEW,
+    )?;
+    row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+    // The occupied-id clause (lead ruling on I951), over the held row as
+    // stored: the same point read the crossing door plans over.
+    let held = dir.get_attestation(&row.attestation_id).await?;
+    if local_occupied_id_verdict(held.as_ref(), &row, &dimension, replace)? == LocalIdVerdict::Held
+    {
+        return Ok(LocalPlan::Held(row.attestation_id));
+    }
+    let withdraws_depth = (row.attestation_type
+        == crate::federation::types::attestation_type::WITHDRAWS)
+        .then(|| dir.withdraws_delegation_depth());
+    Ok(LocalPlan::Write(Box::new(PlannedLocalAttestation {
+        row,
+        dimension,
+        replace,
+        withdraws_depth,
     })))
 }

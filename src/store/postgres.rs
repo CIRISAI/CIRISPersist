@@ -7304,14 +7304,16 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         &self,
         input: crate::federation::types::LocalAttestationInput,
     ) -> Result<String, crate::federation::Error> {
-        self.pg_write_local_attestation(input, true).await
+        crate::federation::attestation_admit::write_local_attestation_planned(self, input, true)
+            .await
     }
 
     async fn attestation_insert_local(
         &self,
         input: crate::federation::types::LocalAttestationInput,
     ) -> Result<String, crate::federation::Error> {
-        self.pg_write_local_attestation(input, false).await
+        crate::federation::attestation_admit::write_local_attestation_planned(self, input, false)
+            .await
     }
 
     async fn list_attestations_referencing(
@@ -23684,6 +23686,145 @@ impl crate::federation::attestation_admit::AttestationStore for PostgresBackend 
         Ok(())
     }
 
+    async fn store_planned_local_attestation(
+        &self,
+        planned: crate::federation::attestation_admit::PlannedLocalAttestation,
+    ) -> Result<(), crate::federation::Error> {
+        use crate::federation::Error;
+        let crate::federation::attestation_admit::PlannedLocalAttestation {
+            row,
+            dimension,
+            replace,
+            withdraws_depth,
+        } = planned;
+        let attesting_key_id = row.attesting_key_id.clone();
+        let attestation_id = row.attestation_id.clone();
+        let mut client = self
+            .get_client()
+            .await
+            .map_err(|e| Error::Backend(e.to_string()))?;
+        // v24.0.0 (CIRISPersist#556) — see the `put_attestation` twin.
+        let additional_scrubs_json = serde_json::to_string(&row.additional_scrubs)
+            .map_err(|e| Error::Backend(format!("additional_scrubs serialize: {e}")))?;
+        let subject_key_ids_json = serde_json::to_value(&row.subject_key_ids)
+            .map_err(|e| Error::Backend(format!("subject_key_ids serialize: {e}")))?;
+        // bytea: durable row hex "" → []; transit row = SHA-256 digest bytes.
+        let original_content_hash: Vec<u8> = hex::decode(&row.original_content_hash)
+            .map_err(|e| Error::Backend(format!("original_content_hash hex decode: {e}")))?;
+        // v30.6.0 (CIRISPersist#622) — no parse: the column is TEXT since V121 so
+        // the id binds as itself. This site had a different `map_err` shape than
+        // its eight siblings, which is exactly how one survives a sweep.
+
+        // v31.0.0 (#644) — attestation_envelope is TEXT since V122.
+        let attestation_envelope_text = serde_json::to_string(&row.attestation_envelope)
+            .map_err(|e| Error::Backend(format!("attestation_envelope encode: {e}")))?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| Error::Backend(format!("begin tx: {e}")))?;
+        if replace {
+            // v45.0.0 (#871) — a replaced row's rendition leaves the V149
+            // index with it (no FK: the index is keyed by the rendition's
+            // digest, the row by its id).
+            tx.execute(
+                "DELETE FROM cirislens.blob_renditions WHERE source_attestation_id IN (\
+                    SELECT attestation_id::text FROM cirislens.federation_attestations \
+                     WHERE attesting_key_id = $1 AND tier = 'local' \
+                       AND attestation_envelope::jsonb->>'dimension' = $2)",
+                &[&attesting_key_id, &dimension],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("local upsert rendition delete: {e}")))?;
+            tx.execute(
+                "DELETE FROM cirislens.federation_attestations \
+                  WHERE attesting_key_id = $1 AND tier = 'local' \
+                    AND attestation_envelope::jsonb->>'dimension' = $2",
+                &[&attesting_key_id, &dimension],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("local upsert delete: {e}")))?;
+        }
+        // v36.0.0 (#668) — serve position (V130). A local-tier row is not
+        // served by `list_attestations_since` (tier filter), but the column
+        // is NOT NULL on this dialect and one column has one meaning on the
+        // shared table (#541's preserve-set rule).
+        let admitted_at = self
+            .next_plane_position(&tx, "federation_attestations")
+            .await?;
+        tx.execute(
+            "INSERT INTO cirislens.federation_attestations (\
+                attestation_id, attesting_key_id, attested_key_id, attestation_type, \
+                weight, asserted_at, expires_at, attestation_envelope, \
+                original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
+                scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, \
+                subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at, \
+                additional_scrubs, admitted_at\
+             ) VALUES ($1, $2, $3, $4, $5::float8::numeric, $6, $7, $8, $9, $10, $11, $12, \
+                       $13, $14, $15, $16, $17, $18, 'local', NULL, $19, $20) \
+             ON CONFLICT (attestation_id) DO NOTHING",
+            &[
+                &attestation_id,
+                &row.attesting_key_id,
+                &row.attested_key_id,
+                &row.attestation_type,
+                &row.weight,
+                &row.asserted_at,
+                &row.expires_at,
+                &attestation_envelope_text,
+                &original_content_hash,
+                &row.scrub_signature_classical,
+                &row.scrub_signature_pqc,
+                &row.scrub_key_id,
+                &row.scrub_timestamp,
+                &row.pqc_completed_at,
+                &row.persist_row_hash,
+                &subject_key_ids_json,
+                &None::<i16>,
+                &row.cohort_scope,
+                // v24.0.0 (CIRISPersist#556) — a local-tier row defers its
+                // signature, so this is `[]` in practice; bound anyway so the
+                // local and federation writers cover the SAME column set (a
+                // preserve set that differs by writer is #541).
+                &additional_scrubs_json,
+                &admitted_at,
+            ],
+        )
+        .await
+        .map_err(map_attestation_pg_err("insert local attestation"))?;
+        // v17.4.0 (V106) — subject projection at `local` tier. On the
+        // upsert-replace path the prior projection rows were dropped by the
+        // DELETE above (FK ON DELETE CASCADE), so no stale rows survive.
+        pg_project_attestation_subjects(
+            &*tx,
+            &row,
+            &attestation_id,
+            crate::federation::types::attestation_tier::LOCAL,
+        )
+        .await
+        .map_err(|e| Error::Backend(format!("local attestation projection: {e}")))?;
+        // v45.0.0 (CIRISPersist#871, FSD §5) — the V149 `blob_renditions`
+        // projection at the local door, in the same transaction.
+        pg_project_rendition_row(&*tx, &row).await?;
+        // v50.0.0 (review H2, final check, 3d) — a local-tier `withdraws`
+        // becomes a federation row in place at `enter_mesh`; its depth is
+        // recorded now, in the same transaction.
+        if let Some(depth) = withdraws_depth {
+            let depth = depth as i32;
+            tx.execute(
+                "INSERT INTO cirislens.federation_withdraws_admission_depths \
+                 (attestation_id, depth) VALUES ($1, $2) \
+                 ON CONFLICT (attestation_id) DO UPDATE SET depth = EXCLUDED.depth",
+                &[&attestation_id, &depth],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("withdraws admission depth: {e}")))?;
+        }
+        tx.commit()
+            .await
+            .map_err(|e| Error::Backend(format!("local attestation commit: {e}")))?;
+        Ok(())
+    }
+
     async fn store_planned_attestation(
         &self,
         planned: crate::federation::attestation_admit::PlannedAttestation,
@@ -23911,329 +24052,7 @@ impl crate::federation::attestation_admit::AttestationStore for PostgresBackend 
     }
 }
 
-impl PostgresBackend {
-    /// v4.4.0 (CIRISPersist#171) — shared local-tier write path for
-    /// `attestation_upsert_local` (`replace = true`) /
-    /// `attestation_insert_local` (`replace = false`). Mirrors the SQLite
-    /// path: §4.1 local-tier gate + dimension/cohort_scope admission,
-    /// deferred-signature `local` row, upsert = delete-prior-then-insert.
-    async fn pg_write_local_attestation(
-        &self,
-        input: crate::federation::types::LocalAttestationInput,
-        replace: bool,
-    ) -> Result<String, crate::federation::Error> {
-        use crate::federation::Error;
-
-        // v17.9.0 (CC#38 interim) — envelope size cap FIRST, before any
-        // parsing/lookups (cheapest-most-specific-rejection-first).
-        // v20.0.0 (#495): the input envelope is TYPED (EnvelopeCore);
-        // serialize once for the Value-based admission checks.
-        let envelope_value = input.attestation_envelope.to_value();
-        crate::federation::admission::check_envelope_size_admission(&envelope_value)?;
-        // v44.8.0 (CIRISPersist#866 C1) — the scope-token gate, at the local
-        // door too (`FSD/CONTEXTUAL_INTEGRITY_ENVELOPE.md` §4.4).
-        crate::federation::consent_scope::check_consent_scope_tokens(&envelope_value)?;
-        // v45.0.0 (CIRISPersist#871) — the media Source struct gate, at the local
-        // door too (`FSD/MEDIA_SOURCE.md` §6). A local row never carries a
-        // holder claim, so only the struct is checked here.
-        crate::federation::media_source::check_media_source(&envelope_value)?;
-        crate::federation::admission::check_trace_dimension_admission(
-            input.dimension(),
-            &input.attesting_key_id,
-            &input.subject_key_ids,
-            &envelope_value,
-        )?;
-        crate::federation::trust_root::check_trust_charter_admission(
-            self,
-            &input.attestation_type,
-            &input.attesting_key_id,
-            input
-                .attested_key_id
-                .as_deref()
-                .unwrap_or(&input.attesting_key_id),
-            &envelope_value,
-            chrono::Utc::now(),
-        )
-        .await?;
-        // v51.0.0 (CIRISPersist#937, CC 3.2 T4a) — attaching is gated on a
-        // witnessed lineage head inside the root's attach window.
-        crate::federation::canonical_community::check_attach_freshness(
-            self,
-            crate::federation::canonical_community::AttachDoor::Author,
-            input.attestation_id.as_deref(),
-            &input.attesting_key_id,
-            &input.attestation_type,
-            input
-                .attested_key_id
-                .as_deref()
-                .unwrap_or(&input.attesting_key_id),
-            &envelope_value,
-            chrono::Utc::now(),
-        )
-        .await?;
-        let dimension = input.dimension().map(|s| s.to_string()).ok_or_else(|| {
-            Error::InvalidArgument(
-                "local attestation envelope must carry a \"dimension\" string".into(),
-            )
-        })?;
-
-        let disposition = crate::federation::admission::check_local_tier_eligibility(
-            &input.attestation_type,
-            Some(dimension.as_str()),
-            &input.attesting_key_id,
-            &input.subject_key_ids,
-            &input.cohort_scope,
-        )?;
-        crate::federation::admission::check_cohort_scope(&input.cohort_scope)?;
-
-        // v12.6.0 (CIRISPersist#171, §10.1.3) — a subject-side revocation MAY
-        // *transit* the local write path only if its bound-hybrid signature
-        // verifies (accept on VALID crypto only). `None` for a durable
-        // producer-authority row. Runs before the client is checked out.
-        let transit =
-            crate::federation::admission::verify_caller_signed_local_row(self, disposition, &input)
-                .await?;
-
-        // v24.0.0 (CIRISPersist#557) — the attested SUBJECT rule, shared with the
-        // federation write path and with the other two backends. V114 removed
-        // the SQLite `attested_key_id` FK that used to catch this at INSERT, so
-        // the local writer must run the predicate explicitly or the two write
-        // paths would enforce different rules.
-        // v31.2.0 (CIRISPersist#670) — it runs HERE, behind the pure gates, not
-        // ahead of them. It resolves the subject through the directory; the
-        // three gates above are pure functions of `input`. Memory had this
-        // order and the two SQL backends did not, which is the AV-76 tier
-        // inversion of #660 wearing different clothes: a row that fails a free
-        // predicate was paying for a directory walk first, on the two backends
-        // production runs.
-        crate::federation::admission::check_attested_subject_admission(
-            self,
-            input
-                .attested_key_id
-                .as_deref()
-                .unwrap_or(&input.attesting_key_id),
-        )
-        .await?;
-        // v45.0.0 (CIRISPersist#871, FSD/MEDIA_SOURCE.md §5) — the placement
-        // rule at the local door: a rendition (`media.derived_from`) whose
-        // original THIS node holds must name the original's own
-        // `cohort_scope`. Reads the blob store, so it sits with the other
-        // directory-reading gates, before the write. Backend-symmetric.
-        crate::federation::renditions::check_rendition_placement(
-            self,
-            &envelope_value,
-            &input.cohort_scope,
-        )
-        .await?;
-
-        let mut client = self
-            .get_client()
-            .await
-            .map_err(|e| Error::Backend(e.to_string()))?;
-
-        // FK precondition + §7.0.1 emitter gate (no federation trust gate
-        // for local — producer-only authority).
-        let identity_type: String = client
-            .query_opt(
-                "SELECT identity_type FROM cirislens.federation_keys WHERE key_id = $1",
-                &[&input.attesting_key_id],
-            )
-            .await
-            .map_err(|e| Error::Backend(format!("lookup attesting identity_type: {e}")))?
-            .ok_or_else(|| {
-                Error::InvalidArgument(format!(
-                    "attesting_key_id {} does not exist in federation_keys",
-                    input.attesting_key_id
-                ))
-            })?
-            .get(0);
-        let dim = input.dimension();
-        crate::federation::admission::DimensionAdmissionPolicy::default().check(
-            &input.attestation_type,
-            dim,
-            &identity_type,
-        )?;
-
-        // v18.0.0 (#473) — caller-supplied deterministic id (replay-idempotent
-        // trace ingest) or the classic fresh v4.
-        let attestation_id = input
-            .attestation_id
-            .clone()
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-        // v31.0.0 (CIRISPersist#598) — the row instant comes from the SIGNED
-        // envelope when it carries one (see `admission::local_row_instant`), so
-        // a `consent:state:*` row staged at the local tier can still satisfy
-        // the instant binding at the promote door.
-        let now =
-            crate::federation::admission::local_row_instant(&envelope_value, chrono::Utc::now())?;
-        let attesting_key_id = input.attesting_key_id.clone();
-        // A durable row defers its signature (empty-sentinel scrub envelope);
-        // a TRANSIT revocation carries the caller's verified bound-hybrid
-        // signature + computed hash (§10.1.3 transit-not-rest).
-        let caller_signed = transit.is_some();
-        let mut row = match transit {
-            Some((hash, sig_classical, sig_pqc)) => input.into_caller_signed_row(
-                attestation_id.clone(),
-                now,
-                hash,
-                sig_classical,
-                sig_pqc,
-            ),
-            None => input.into_local_row(attestation_id.clone(), now),
-        };
-        // v31.0.0 (CIRISPersist#660) — THE BAKED GENESIS IDS ARE RESERVED AT
-        // THIS DOOR TOO. See the memory backend's local door for why this one
-        // cannot defer to the promote gate the way `check_reserved_prefix_admission`
-        // does: the harm is the PRIMARY KEY, and a local-tier row already holds it.
-        crate::federation::genesis::check_genesis_attestation_reserved(&row)?;
-        // v31.0.0 (CIRISPersist#649) — STAMP THE MIRROR AT THE LOCAL DOOR.
-        // See `crate::federation::envelope::RowMirror::stamp_local_row` for the
-        // decision and the transit exclusion. One helper, all three backends.
-        crate::federation::envelope::RowMirror::stamp_local_row(&mut row, caller_signed)?;
-        // v31.0.0 (CIRISPersist#653) — SIZE THE ROW AS IT WILL BE STORED. The early call above
-        // measured the PRODUCER's envelope; this one measures the bytes that
-        // actually land, which the #643 mirror and the #598 instants just grew
-        // by ~250. Without it a row in that window is admitted here and refused
-        // by the SAME function at the federation door on promotion or
-        // replication — locally Ok, globally unreplicable. Both calls stay: the
-        // early one is the cheap pre-filter that keeps hostile input away from
-        // the directory reads below it, this one is authoritative. See
-        // `check_envelope_size_admission` for why producers do not reserve
-        // headroom instead.
-        crate::federation::admission::check_envelope_size_admission(&row.attestation_envelope)?;
-        // v31.0.0 (CIRISPersist#598) — the same binding the federation door
-        // asks, asked at the local door too: a `consent:state:*` row that
-        // cannot state its own signed instant is refused where it is written,
-        // not where it is promoted.
-        crate::federation::admission::check_instant_binding(
-            &row,
-            chrono::Utc::now(),
-            crate::federation::admission::DEFAULT_MAX_TOUCH_SKEW,
-        )?;
-        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
-        // v24.0.0 (CIRISPersist#556) — see the `put_attestation` twin.
-        let additional_scrubs_json = serde_json::to_string(&row.additional_scrubs)
-            .map_err(|e| Error::Backend(format!("additional_scrubs serialize: {e}")))?;
-        let subject_key_ids_json = serde_json::to_value(&row.subject_key_ids)
-            .map_err(|e| Error::Backend(format!("subject_key_ids serialize: {e}")))?;
-        // bytea: durable row hex "" → []; transit row = SHA-256 digest bytes.
-        let original_content_hash: Vec<u8> = hex::decode(&row.original_content_hash)
-            .map_err(|e| Error::Backend(format!("original_content_hash hex decode: {e}")))?;
-        // v30.6.0 (CIRISPersist#622) — no parse: the column is TEXT since V121 so
-        // the id binds as itself. This site had a different `map_err` shape than
-        // its eight siblings, which is exactly how one survives a sweep.
-
-        // v31.0.0 (#644) — attestation_envelope is TEXT since V122.
-        let attestation_envelope_text = serde_json::to_string(&row.attestation_envelope)
-            .map_err(|e| Error::Backend(format!("attestation_envelope encode: {e}")))?;
-        let tx = client
-            .transaction()
-            .await
-            .map_err(|e| Error::Backend(format!("begin tx: {e}")))?;
-        if replace {
-            // v45.0.0 (#871) — a replaced row's rendition leaves the V149
-            // index with it (no FK: the index is keyed by the rendition's
-            // digest, the row by its id).
-            tx.execute(
-                "DELETE FROM cirislens.blob_renditions WHERE source_attestation_id IN (\
-                    SELECT attestation_id::text FROM cirislens.federation_attestations \
-                     WHERE attesting_key_id = $1 AND tier = 'local' \
-                       AND attestation_envelope::jsonb->>'dimension' = $2)",
-                &[&attesting_key_id, &dimension],
-            )
-            .await
-            .map_err(|e| Error::Backend(format!("local upsert rendition delete: {e}")))?;
-            tx.execute(
-                "DELETE FROM cirislens.federation_attestations \
-                  WHERE attesting_key_id = $1 AND tier = 'local' \
-                    AND attestation_envelope::jsonb->>'dimension' = $2",
-                &[&attesting_key_id, &dimension],
-            )
-            .await
-            .map_err(|e| Error::Backend(format!("local upsert delete: {e}")))?;
-        }
-        // v36.0.0 (#668) — serve position (V130). A local-tier row is not
-        // served by `list_attestations_since` (tier filter), but the column
-        // is NOT NULL on this dialect and one column has one meaning on the
-        // shared table (#541's preserve-set rule).
-        let admitted_at = self
-            .next_plane_position(&tx, "federation_attestations")
-            .await?;
-        tx.execute(
-            "INSERT INTO cirislens.federation_attestations (\
-                attestation_id, attesting_key_id, attested_key_id, attestation_type, \
-                weight, asserted_at, expires_at, attestation_envelope, \
-                original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
-                scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, \
-                subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at, \
-                additional_scrubs, admitted_at\
-             ) VALUES ($1, $2, $3, $4, $5::float8::numeric, $6, $7, $8, $9, $10, $11, $12, \
-                       $13, $14, $15, $16, $17, $18, 'local', NULL, $19, $20) \
-             ON CONFLICT (attestation_id) DO NOTHING",
-            &[
-                &attestation_id,
-                &row.attesting_key_id,
-                &row.attested_key_id,
-                &row.attestation_type,
-                &row.weight,
-                &row.asserted_at,
-                &row.expires_at,
-                &attestation_envelope_text,
-                &original_content_hash,
-                &row.scrub_signature_classical,
-                &row.scrub_signature_pqc,
-                &row.scrub_key_id,
-                &row.scrub_timestamp,
-                &row.pqc_completed_at,
-                &row.persist_row_hash,
-                &subject_key_ids_json,
-                &None::<i16>,
-                &row.cohort_scope,
-                // v24.0.0 (CIRISPersist#556) — a local-tier row defers its
-                // signature, so this is `[]` in practice; bound anyway so the
-                // local and federation writers cover the SAME column set (a
-                // preserve set that differs by writer is #541).
-                &additional_scrubs_json,
-                &admitted_at,
-            ],
-        )
-        .await
-        .map_err(map_attestation_pg_err("insert local attestation"))?;
-        // v17.4.0 (V106) — subject projection at `local` tier. On the
-        // upsert-replace path the prior projection rows were dropped by the
-        // DELETE above (FK ON DELETE CASCADE), so no stale rows survive.
-        pg_project_attestation_subjects(
-            &*tx,
-            &row,
-            &attestation_id,
-            crate::federation::types::attestation_tier::LOCAL,
-        )
-        .await
-        .map_err(|e| Error::Backend(format!("local attestation projection: {e}")))?;
-        // v45.0.0 (CIRISPersist#871, FSD §5) — the V149 `blob_renditions`
-        // projection at the local door, in the same transaction.
-        pg_project_rendition_row(&*tx, &row).await?;
-        // v50.0.0 (review H2, final check, 3d) — a local-tier `withdraws`
-        // becomes a federation row in place at `enter_mesh`; its depth is
-        // recorded now, in the same transaction.
-        if row.attestation_type == crate::federation::types::attestation_type::WITHDRAWS {
-            let depth =
-                crate::federation::FederationDirectory::withdraws_delegation_depth(self) as i32;
-            tx.execute(
-                "INSERT INTO cirislens.federation_withdraws_admission_depths \
-                 (attestation_id, depth) VALUES ($1, $2) \
-                 ON CONFLICT (attestation_id) DO UPDATE SET depth = EXCLUDED.depth",
-                &[&attestation_id, &depth],
-            )
-            .await
-            .map_err(|e| Error::Backend(format!("withdraws admission depth: {e}")))?;
-        }
-        tx.commit()
-            .await
-            .map_err(|e| Error::Backend(format!("local attestation commit: {e}")))?;
-        Ok(attestation_id)
-    }
-}
+impl PostgresBackend {}
 
 /// v17.4.0 — the `fa.`-aliased `federation_attestations` column list for the
 /// postgres `scores` read handles (JOINed to `cirislens.attestation_subjects
