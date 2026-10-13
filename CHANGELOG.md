@@ -7,6 +7,60 @@ threat-model citations because this crate's audit story is the point.
 
 ## [Unreleased]
 
+## [56.0.0] - UNRELEASED
+
+### Added — tooling: size tracking, semver-checks, coverage, machete, diff mutants, evidence-pointer gate (#934)
+
+Six instruments beside #934's consolidation (#1076 slice T). **Five are
+reports**: each exits 0 on a finding and every CI job running one is
+`continue-on-error`, so none turns `main` red without the operator. **One is
+a gate**, the evidence-pointer check, because a dead pointer is a false
+evidence claim. `docs/TOOLING.md` says how to run each and which is which.
+
+- **Size tracking.** `scripts/size_report.py` writes `evidence/size.tsv`:
+  code/comment/blank lines per `src/**/*.rs` file (stdlib only; comment- and
+  string-aware, `#[cfg(test)]`-blind), a `BACKENDS` row
+  (`src/store/{sqlite,postgres,memory}.rs`: 137 779 lines at v55.0.0) and a
+  `TOTAL` row (649 639). `check` prints the per-file delta against the
+  committed table or `--against <ref>`; `--fail-if-backends-grew` (exit 1) is
+  #934 step 1's acceptance criterion for the PR that moves a door. certify's
+  fast stage gains `sizetest` (the counter's fixture witnesses — a gate, like
+  the other tool self-tests, also in ci.yml's lint job) and `sizereport` (the
+  delta, always green, totals printed under the fast-gate table).
+- **API breaks.** `scripts/api_break_report.sh [<prev-tag>]` runs
+  `cargo semver-checks check-release` on the shipped-shape feature set at
+  `--release-type minor`, so a major bump does not hide the breaks. v54.1.1 →
+  v55.0.0: 12 lints, 71 distinct instance lines. New workflow `reports.yml`
+  (non-gating): `semver` on every PR against the latest `v*` tag reachable
+  from the base (artefact + step summary), and `size` (the PR's delta vs its
+  base).
+- **Coverage.** `scripts/coverage.sh <leg> [-- <nextest args>]`: `cargo
+  llvm-cov nextest` for ONE certify feature set (derived, never spelled;
+  postgres sets through `pg_test_db.sh`), lcov + summary + html under
+  `target/coverage/<set>/`. `reports.yml` runs every leg weekly (legs derived
+  at run time) and on dispatch.
+- **Unused dependencies.** `cargo machete --with-metadata` in ci-hygiene's new
+  non-gating `reports` job. It names two dev-dependencies, `hex-literal` and
+  `tracing-subscriber`, that no `.rs` file uses; not removed — the operator's
+  call.
+- **Mutants on the diff.** `scripts/mutants_diff.sh <base> [-- <cargo-mutants
+  args>]`: `cargo mutants --in-diff` over the `src/` lines changed since the
+  merge base, with a wall-clock budget; `reports.yml` runs it only for a PR
+  labelled `run-mutants`, or on dispatch. The hand mutation tables and the
+  nightly scoped matrix stay the gates.
+- **Evidence pointers (a GATE).** `scripts/evidence_pointers.py check`:
+  every `src/` row of `evidence/cc_impl.tsv` must name a definition in its
+  cited file, with comments and literals blanked; `Owner::member` must be a
+  member of `Owner`; a mention, a string or a call site never resolves, and a
+  moved symbol fails until repointed. Stricter than the in-crate witness,
+  which let the v54 → v55 dead pointer `blobs.rs#holds_bytes_attestation_envelope`
+  live on a doc comment and a string literal. Clean on this tree (223 rows)
+  and at every tag v46.0.0..v55.0.0; that pointer sat in the Constitution's
+  register, and `register <claims.tsv>` names it on CIRISConstitution
+  `fca367d^`. certify fast gate `evidenceptr`, ci.yml `lint` step,
+  ci-hygiene `evidence-pointers` job (daily); `evidenceptrcc` reports the
+  Constitution register when a checkout is found.
+
 ## [55.0.0] - 2026-10-12
 
 ### Changed — CIRISConstitution v1.0-rc7 vendored (#753, slice A0)
