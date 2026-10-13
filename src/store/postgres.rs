@@ -8416,6 +8416,17 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             })
     }
 
+    async fn execute_attestation_query(
+        &self,
+        q: &crate::federation::attestation_query::AttestationQuery,
+    ) -> Result<crate::federation::attestation_query::QueryRows, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        pg_execute_attestation_query(&**client, q).await
+    }
+
     async fn list_attestations_for(
         &self,
         attested_key_id: &str,
@@ -24389,6 +24400,55 @@ fn decode_ed25519_b64(b64: &str) -> Result<VerifyingKey, Error> {
     }
     let arr: [u8; 32] = bytes.as_slice().try_into().expect("length-checked");
     VerifyingKey::from_bytes(&arr).map_err(|e| Error::Backend(format!("public_key parse: {e}")))
+}
+
+/// v56.0.0 (CIRISPersist#1001) — the typed bounded read's one statement
+/// ([`render_sql`](crate::federation::attestation_query::render_sql)) on any
+/// client: the directory's executor, and the delegation-cycle gate's walk on
+/// the transaction that holds its advisory lock (I602).
+async fn pg_execute_attestation_query<C>(
+    client: &C,
+    q: &crate::federation::attestation_query::AttestationQuery,
+) -> Result<crate::federation::attestation_query::QueryRows, crate::federation::Error>
+where
+    C: tokio_postgres::GenericClient + Sync,
+{
+    use crate::federation::attestation_query::{render_sql, Bind, Dialect};
+    let stmt = render_sql(
+        q,
+        Dialect::Postgres,
+        "cirislens.federation_attestations",
+        PG_ATTESTATION_COLUMNS,
+    );
+    let params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = stmt
+        .binds
+        .into_iter()
+        .map(|b| -> Box<dyn tokio_postgres::types::ToSql + Sync + Send> {
+            match b {
+                Bind::Text(t) => Box::new(t),
+                Bind::Time(t) => Box::new(t),
+                Bind::Int(n) => Box::new(n),
+            }
+        })
+        .collect();
+    let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+        params.iter().map(|p| p.as_ref() as _).collect();
+    let rows = client
+        .query(&stmt.sql, &params_ref[..])
+        .await
+        .map_err(|e| {
+            crate::federation::Error::Backend(format!("execute_attestation_query: {e}"))
+        })?;
+    let bytes = pg_envelope_bytes(&rows);
+    let rows = rows
+        .into_iter()
+        .map(pg_row_to_attestation)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(crate::federation::attestation_query::QueryRows {
+        rows,
+        bytes,
+        backend: crate::observe::StoreBackend::Postgres,
+    })
 }
 
 /// v54.0.0 (Codex round 2 on PR #1050) — `list_attestations_for` on any

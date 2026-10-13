@@ -5181,6 +5181,38 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         Ok(rows)
     }
 
+    /// v56.0.0 (CIRISPersist#1001) — the query's own predicate
+    /// ([`AttestationQuery::admits`]) and order, one past the page.
+    ///
+    /// [`AttestationQuery::admits`]: crate::federation::attestation_query::AttestationQuery::admits
+    async fn execute_attestation_query(
+        &self,
+        q: &crate::federation::attestation_query::AttestationQuery,
+    ) -> Result<crate::federation::attestation_query::QueryRows, crate::federation::Error> {
+        use std::sync::atomic::Ordering::Relaxed;
+        if q.by.is_some() {
+            self.attestation_reads_by.fetch_add(1, Relaxed);
+        }
+        if q.to.is_some() {
+            self.attestation_reads_for.fetch_add(1, Relaxed);
+        }
+        let state = self.state.lock().expect("memory backend lock");
+        let mut rows: Vec<_> = state
+            .federation_attestations
+            .iter()
+            .filter(|a| q.admits(a))
+            .cloned()
+            .collect();
+        drop(state);
+        q.sort(&mut rows);
+        rows.truncate(q.fetch());
+        Ok(crate::federation::attestation_query::QueryRows {
+            rows,
+            bytes: 0,
+            backend: crate::observe::StoreBackend::Memory,
+        })
+    }
+
     async fn list_attestations_for(
         &self,
         attested_key_id: &str,

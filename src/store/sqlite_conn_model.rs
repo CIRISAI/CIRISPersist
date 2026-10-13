@@ -315,6 +315,7 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("evict_fountain_content_to_tier", ConnClass::Write),
     ("evict_known_wire_hashes", ConnClass::Write),
     ("evict_scope_blobs", ConnClass::Write),
+    ("execute_attestation_query", ConnClass::Read),
     ("factor_rollup_present", ConnClass::Read),
     ("fetch_trace_events_page", ConnClass::Read),
     ("fountain_manifest_row", ConnClass::Read),

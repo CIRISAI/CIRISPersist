@@ -6505,6 +6505,50 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         self.sqlite_write_local_attestation(input, false).await
     }
 
+    /// v56.0.0 (CIRISPersist#1001) — the shared plan's one statement
+    /// ([`render_sql`](crate::federation::attestation_query::render_sql)),
+    /// on a reader.
+    async fn execute_attestation_query(
+        &self,
+        q: &crate::federation::attestation_query::AttestationQuery,
+    ) -> Result<crate::federation::attestation_query::QueryRows, crate::federation::Error> {
+        use crate::federation::attestation_query::{render_sql, Bind, Dialect};
+        let stmt = render_sql(
+            q,
+            Dialect::Sqlite,
+            "federation_attestations",
+            SQLITE_ATTESTATION_COLUMNS,
+        );
+        let binds: Vec<SqlValue> = stmt
+            .binds
+            .into_iter()
+            .map(|b| match b {
+                Bind::Text(t) => SqlValue::Text(t),
+                Bind::Time(t) => SqlValue::Text(t.to_rfc3339()),
+                Bind::Int(n) => SqlValue::Integer(n),
+            })
+            .collect();
+        let sql = stmt.sql;
+        let (read, bytes) = self
+            .read_measured(
+                move |conn| -> Result<Vec<crate::federation::Attestation>, rusqlite::Error> {
+                    let mut stmt = conn.prepare(&sql)?;
+                    let rows =
+                        stmt.query_map(params_from_iter(binds.iter()), sqlite_row_to_attestation)?;
+                    rows.collect()
+                },
+            )
+            .await;
+        let rows = read.map_err(|e| {
+            crate::federation::Error::Backend(format!("execute_attestation_query: {e}"))
+        })?;
+        Ok(crate::federation::attestation_query::QueryRows {
+            rows,
+            bytes,
+            backend: crate::observe::StoreBackend::Sqlite,
+        })
+    }
+
     async fn list_attestations_for(
         &self,
         attested_key_id: &str,

@@ -213,13 +213,36 @@ fn i551_each_backend_records_under_its_own_label() {
             BTreeSet::from([own.to_owned()]),
             "I551 {file} records under {named:?}"
         );
-        // Every door that file serves is recorded there.
+        // Every door that file serves is recorded there — except the typed
+        // bounded read (v56.0.0, CIRISPersist#1001), which no backend records:
+        // its one wrapper does.
         assert!(
-            idents_after(code, "observe::Door::").len() >= Door::COUNT - 1,
+            idents_after(code, "observe::Door::").len() >= Door::COUNT - 2,
             "I551 {file} records {} doors",
             idents_after(code, "observe::Door::").len()
         );
+        assert!(
+            !idents_after(code, "observe::Door::").contains("AttestationQuery")
+                && !code.contains("record_query_read"),
+            "I904 {file} records the typed read itself; only its wrapper may"
+        );
     }
+    // **I904** (v56.0.0, CIRISPersist#1001) — the typed read is recorded in
+    // ONE place: `record_query_read` has exactly one caller, the shared
+    // wrapper `AttestationReads::query_attestations`.
+    let callers: Vec<_> = files
+        .iter()
+        .filter_map(|(p, code)| {
+            let n = code.matches("record_query_read(").count();
+            (n > 0).then(|| (p.display().to_string(), n))
+        })
+        .collect();
+    assert!(
+        callers.len() == 1
+            && callers[0].0.ends_with("federation/attestation_query.rs")
+            && callers[0].1 == 1,
+        "I904 the typed read is recorded once, in its wrapper: {callers:?}"
+    );
 }
 
 #[test]

@@ -139,6 +139,9 @@ label_set! {
         ListAttestationsSince => "list_attestations_since",
         /// `FederationDirectory::list_attestation_log`.
         ListAttestationLog => "list_attestation_log",
+        /// v56.0.0 (CIRISPersist#1001) — `AttestationReads::query_attestations`,
+        /// the typed bounded read; recorded once, in its shared wrapper.
+        AttestationQuery => "attestation_query",
     }
 }
 
@@ -308,7 +311,16 @@ pub fn record_read<R: ReadRow>(
     rows: &[R],
     bytes: u64,
 ) {
-    let n = rows.len() as u64;
+    count_read(backend, door, rows.len() as u64, bytes);
+    #[cfg(test)]
+    crate::federation::read_probe::record(door.label(), key, rows);
+    #[cfg(not(test))]
+    let _ = key;
+}
+
+/// The counters half of a door read: the `(backend, door)` totals and every
+/// fold active on this task.
+fn count_read(backend: StoreBackend, door: Door, n: u64, bytes: u64) {
     let c = counters();
     c.doors[backend as usize][door as usize].add(n, bytes);
     if let Ok(mut mask) = ACTIVE_FOLDS.try_with(|m| *m) {
@@ -318,10 +330,24 @@ pub fn record_read<R: ReadRow>(
             mask &= mask - 1;
         }
     }
+}
+
+/// v56.0.0 (CIRISPersist#1001) — record one typed bounded read
+/// ([`Door::AttestationQuery`]). Called from exactly one place,
+/// [`crate::federation::attestation_query::AttestationReads::query_attestations`],
+/// whatever backend ran the statement; under `cfg(test)` the probe also
+/// records the query's shape (its pinned keys, narrowing and limit).
+pub(crate) fn record_query_read(
+    backend: StoreBackend,
+    q: &crate::federation::attestation_query::AttestationQuery,
+    rows: &[crate::federation::Attestation],
+    bytes: u64,
+) {
+    count_read(backend, Door::AttestationQuery, rows.len() as u64, bytes);
     #[cfg(test)]
-    crate::federation::read_probe::record(door.label(), key, rows);
+    crate::federation::read_probe::record_query(q, rows);
     #[cfg(not(test))]
-    let _ = key;
+    let _ = q;
 }
 
 /// Run `fut` as one entry into `fold`: count the call, and credit every door

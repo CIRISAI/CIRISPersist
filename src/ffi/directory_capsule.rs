@@ -3263,6 +3263,17 @@ impl FederationDirectory for OpsDirectory {
             method: "attestation_insert_local",
         })
     }
+    // v56.0.0 (CIRISPersist#1001) — the typed bounded read, as the reads it
+    // replaces: not proxied across the capsule.
+    async fn execute_attestation_query(
+        &self,
+        q: &crate::federation::attestation_query::AttestationQuery,
+    ) -> Result<crate::federation::attestation_query::QueryRows, Error> {
+        let _ = q;
+        Err(Error::Unsupported {
+            method: "execute_attestation_query",
+        })
+    }
     async fn list_attestations_for(
         &self,
         attested_key_id: &str,

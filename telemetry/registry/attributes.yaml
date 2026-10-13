@@ -93,6 +93,9 @@ groups:
           - id: list_attestation_log
             value: "list_attestation_log"
             stability: development
+          - id: attestation_query
+            value: "attestation_query"
+            stability: development
         stability: development
         brief: The attestation-returning read (the method name).
         examples: ["get_attestation"]

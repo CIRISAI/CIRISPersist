@@ -109,6 +109,7 @@ pub const DOOR_VALUES: &[&str] = &[
     "get_attestation",
     "list_attestations_since",
     "list_attestation_log",
+    "attestation_query",
 ];
 
 /// Every `fold` label value.

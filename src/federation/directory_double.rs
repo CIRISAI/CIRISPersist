@@ -134,7 +134,7 @@ impl FaultInjectingDirectory {
     }
 }
 
-// 115 delegations, generated. Every one: fault first, then delegate.
+// 116 delegations, generated. Every one: fault first, then delegate.
 #[async_trait::async_trait]
 impl FederationDirectory for FaultInjectingDirectory {
     async fn apply_replicated_accord_evidence(
@@ -302,6 +302,15 @@ impl FederationDirectory for FaultInjectingDirectory {
             return Err(e);
         }
         self.inner.evict_known_wire_hashes(cutoff, bound).await
+    }
+    async fn execute_attestation_query(
+        &self,
+        q: &attestation_query::AttestationQuery,
+    ) -> Result<attestation_query::QueryRows, Error> {
+        if let Some(e) = self.faulted("execute_attestation_query") {
+            return Err(e);
+        }
+        self.inner.execute_attestation_query(q).await
     }
     async fn family_roster_signers(
         &self,

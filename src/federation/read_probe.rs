@@ -27,6 +27,40 @@ pub struct Read {
     pub rows: usize,
     /// Serialized envelope bytes returned.
     pub bytes: usize,
+    /// v56.0.0 (CIRISPersist#1001) — for a typed bounded read
+    /// (`attestation_query`), the query as it ran; `None` for every other
+    /// door.
+    pub query: Option<crate::federation::attestation_query::AttestationQuery>,
+}
+
+impl Read {
+    /// Whether this read is a typed query pinned on `key` (as attester or
+    /// attested) that does not narrow below the key's whole slice — the
+    /// read the retired `list_attestations_by` / `_for` made, one page of it.
+    #[must_use]
+    pub fn is_slice_read_of(&self, key: &str) -> bool {
+        self.query.as_ref().is_some_and(|q| {
+            !q.is_narrowed() && (q.by.as_deref() == Some(key) || q.to.as_deref() == Some(key))
+        })
+    }
+
+    /// Whether this read is a typed query pinned on `key` as ATTESTER and
+    /// not narrowed (one page of the retired `list_attestations_by(key)`).
+    #[must_use]
+    pub fn is_by_slice_of(&self, key: &str) -> bool {
+        self.query
+            .as_ref()
+            .is_some_and(|q| !q.is_narrowed() && q.by.as_deref() == Some(key))
+    }
+
+    /// Whether this read is a typed query pinned on `key` as ATTESTED and
+    /// not narrowed (one page of the retired `list_attestations_for(key)`).
+    #[must_use]
+    pub fn is_for_slice_of(&self, key: &str) -> bool {
+        self.query
+            .as_ref()
+            .is_some_and(|q| !q.is_narrowed() && q.to.as_deref() == Some(key))
+    }
 }
 
 thread_local! {
@@ -50,6 +84,33 @@ pub fn record<R: crate::observe::ReadRow>(method: &'static str, key: &str, rows:
             key: key.to_owned(),
             rows: rows.len(),
             bytes,
+            query: None,
+        });
+    });
+}
+
+/// v56.0.0 (CIRISPersist#1001) — record one typed bounded read, with its
+/// query. Called only from [`crate::observe::record_query_read`], which the
+/// shared wrapper calls once per query.
+pub fn record_query(
+    q: &crate::federation::attestation_query::AttestationQuery,
+    rows: &[crate::federation::Attestation],
+) {
+    let bytes = rows
+        .iter()
+        .map(|a| {
+            serde_json::to_string(&a.attestation_envelope)
+                .map(|s| s.len())
+                .unwrap_or(0)
+        })
+        .sum();
+    READS.with(|r| {
+        r.borrow_mut().push(Read {
+            method: crate::observe::Door::AttestationQuery.label(),
+            key: q.key().to_owned(),
+            rows: rows.len(),
+            bytes,
+            query: Some(q.clone()),
         });
     });
 }

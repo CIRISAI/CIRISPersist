@@ -7,6 +7,12 @@ threat-model citations because this crate's audit story is the point.
 
 ## [Unreleased]
 
+## [56.0.0] - UNRELEASED
+
+### Changed — typed bounded reads (#1001, #1071)
+
+- In progress (slice R of #1076).
+
 ## [55.0.0] - 2026-10-12
 
 ### Changed — CIRISConstitution v1.0-rc7 vendored (#753, slice A0)

@@ -52,6 +52,10 @@ pub mod attestation_apply;
 /// v25.1.0 (CIRISPersist#582) — the backend-generic signed-ATTESTATION emit
 /// recipe (distinct from [`emit`], the trust-grant/audit-entry API).
 pub mod attestation_emit;
+// v56.0.0 (CIRISPersist#1001) — the typed bounded attestation read.
+pub mod attestation_query;
+#[cfg(test)]
+mod attestation_query_invariants;
 #[cfg(feature = "cirisaudit")]
 pub mod backfill;
 pub mod blackhole;
@@ -3489,6 +3493,21 @@ pub trait FederationDirectory: Send + Sync {
         &self,
         target_attestation_id: &str,
     ) -> Result<Vec<Attestation>, Error>;
+
+    /// v56.0.0 (CIRISPersist#1001) — **the storage half of the typed bounded
+    /// read**: run `q`'s one statement and return at most `q.fetch()` rows in
+    /// `q`'s order (one past the page, so the wrapper knows whether another
+    /// page exists), with the envelope bytes decoded. Storage only: callers
+    /// read through
+    /// [`AttestationReads::query_attestations`](attestation_query::AttestationReads::query_attestations),
+    /// which validates the query, cuts the page, mints the cursor and records
+    /// the read once. No default body: every implementor states how it runs
+    /// the query (a wrapper delegates; a proxy that cannot answer says
+    /// `Unsupported`), so none inherits a read wider than the query.
+    async fn execute_attestation_query(
+        &self,
+        q: &attestation_query::AttestationQuery,
+    ) -> Result<attestation_query::QueryRows, Error>;
 
     /// All attestations targeting `attested_key_id` (consumer asks
     /// "who vouches for K?"). Ordered by `asserted_at` DESC.
