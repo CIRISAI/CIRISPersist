@@ -566,9 +566,16 @@ impl HoldingClaimOutcome {
 /// hold every chunk by construction. A node asking for a DAG it adopted uses
 /// `put_custody_ack`, which checks completeness first.
 ///
+/// v55.0.0 (Codex r3 on #1065) — **never about withheld bytes.** Bytes a
+/// tombstone withholds (a counter-notice takedown keeps them on disk through
+/// its window; `steward_purge::purge_withheld` names the notice) are refused
+/// [`BlobError::Purged`] before anything is signed, so no caller — a write
+/// door, the re-ack, the upgrade conversion — re-advertises them.
+///
 /// # Errors
 ///
-/// [`BlobError::NotHeld`] when no row is held; signing and admission errors.
+/// [`BlobError::NotHeld`] when no row is held; [`BlobError::Purged`] when a
+/// tombstone withholds the bytes; signing and admission errors.
 pub async fn emit_holding_claim<B>(
     backend: &B,
     local: &crate::signing::LocalSigner,
@@ -581,6 +588,15 @@ where
     let not_held = || BlobError::NotHeld {
         sha256_hex: hex::encode(sha256),
     };
+    if let Some(notice_id) = super::steward_purge::purge_withheld(backend, sha256)
+        .await
+        .map_err(|e| BlobError::Backend(format!("holding claim: tombstone: {e}")))?
+    {
+        return Err(BlobError::Purged {
+            sha256_hex: hex::encode(sha256),
+            notice_id,
+        });
+    }
     let scope = content_claim_scope(backend, sha256)
         .await?
         .ok_or_else(not_held)?;
@@ -647,6 +663,9 @@ pub struct ReackReport {
     /// Blobs this node held under a retired rc6 claim of its OWN and had no
     /// custody claim about: claimed now, once (the upgrade conversion).
     pub converted: u64,
+    /// Blobs a tombstone withholds (Codex r3 on #1065): neither renewed nor
+    /// converted, and not a failure — the next pass skips them the same way.
+    pub withheld: u64,
 }
 
 /// **Re-acknowledge this node's own holdings** (CC 3.1.3.3 rule 5: "freshness
@@ -706,6 +725,7 @@ where
         match emit_holding_claim(backend, local, &sha, now).await {
             Ok(HoldingClaimOutcome::Emitted { .. }) => report.renewed += 1,
             Ok(HoldingClaimOutcome::NotInCohort { .. }) => report.not_in_cohort += 1,
+            Err(BlobError::Purged { .. }) => report.withheld += 1,
             Err(e) => {
                 report.failed += 1;
                 tracing::warn!(
@@ -753,6 +773,9 @@ where
         match emit_holding_claim(backend, local, &sha, now).await {
             Ok(HoldingClaimOutcome::Emitted { .. }) => report.converted += 1,
             Ok(HoldingClaimOutcome::NotInCohort { .. }) => report.not_in_cohort += 1,
+            // Codex r3 on #1065 — a counter-notice takedown keeps the bytes
+            // through its window; the conversion never re-advertises them.
+            Err(BlobError::Purged { .. }) => report.withheld += 1,
             Err(e) => {
                 report.failed += 1;
                 tracing::warn!(

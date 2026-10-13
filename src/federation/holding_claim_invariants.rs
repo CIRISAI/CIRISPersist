@@ -1277,6 +1277,99 @@ pub(crate) mod blob_bodies {
         assert_eq!(claims_of(b, &n.key, &own).await.len(), 1);
     }
 
+    /// **I778** (Codex r3 on #1065) — no holding claim about withheld bytes.
+    /// A counter-notice takedown keeps the bytes on disk through its window;
+    /// a blob this node announced only under the retired rc6 carrier (no
+    /// custody row yet) is NOT converted by the re-ack (counted `withheld`,
+    /// no `here` claim, still dark), `emit_holding_claim` called directly is
+    /// `Purged` naming the notice, and the custody-report door refuses `here`.
+    pub(crate) async fn i778_no_holding_claim_about_withheld_bytes<B>(b: &B, s: &str)
+    where
+        B: BlobStorage + FederationDirectory + Sync + LegacySeam,
+    {
+        use crate::federation::doors_takedown_invariants::bodies::{claimant, establish, notice};
+        use crate::federation::holding_claim::{emit_holding_claim, reack_own_claims};
+        let n = node_as(b, &format!("i778-holder-{s}"), NODE).await;
+        let bytes = format!("i778 bytes {s}").into_bytes();
+        let sha = sha256_of(&bytes);
+        b.put_blob_signing_scoped(
+            cs::FEDERATION,
+            None,
+            &sha,
+            BlobBody::Inline(bytes),
+            None,
+            &n.key,
+            &n.signer,
+            chrono::Utc::now(),
+            uuid::Uuid::new_v4(),
+        )
+        .await
+        .unwrap();
+        let claim = claims_of(b, &n.key, &sha).await.remove(0);
+        let rc6 = serde_json::json!({
+            "kind": "holds_bytes", "evidence_refs": [hex::encode(sha)],
+        });
+        b.set_type(
+            &claim.attestation_id,
+            &format!("holds_bytes:sha256:{}", &hex::encode(sha)[..8]),
+            Some(&rc6),
+        )
+        .await;
+        assert!(
+            claims_of(b, &n.key, &sha).await.is_empty(),
+            "I778 precondition"
+        );
+        // A counter-notice takedown: the bytes stay, withheld.
+        let owner = claimant(0xa1);
+        let dir = b.as_dyn_directory();
+        establish(dir, "i778-producer", &owner.id, &hex::encode(sha)).await;
+        let t = crate::federation::takedown_tombstone::takedown_tombstone(
+            dir,
+            &notice(&owner, &hex::encode(sha), "dmca_512"),
+            "i778-node",
+        )
+        .await
+        .expect("I778 the takedown");
+        assert!(
+            t.tombstoned && b.blob_head(&sha).await.unwrap().is_some(),
+            "I778 held, withheld"
+        );
+        let r = reack_own_claims(b, &n.signer, chrono::Utc::now())
+            .await
+            .unwrap();
+        assert_eq!(
+            (r.converted, r.withheld, r.failed),
+            (0, 1, 0),
+            "I778 the conversion skips the withheld blob: {r:?}"
+        );
+        assert!(
+            claims_of(b, &n.key, &sha).await.is_empty()
+                && b.list_holders(&sha).await.unwrap().is_empty(),
+            "I778 no `here` claim: the holder stays dark"
+        );
+        let e = emit_holding_claim(b, &n.signer, &sha, chrono::Utc::now())
+            .await
+            .expect_err("I778 a direct emission is refused");
+        assert!(
+            matches!(&e, crate::federation::BlobError::Purged { notice_id, .. } if *notice_id == t.notice_id),
+            "I778 {e:?}"
+        );
+        let e = crate::federation::custody_ack::custody_ack_input_for(
+            b,
+            &sha,
+            crate::federation::custody_ack::CustodyState::Here,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect_err("I778 the custody door refuses `here`");
+        assert!(
+            e.to_string().contains("custody_ack_here_withheld"),
+            "I778 {e}"
+        );
+    }
+
     /// **I717** — the content's scope, at admission and at the announce door.
     pub(crate) async fn i717_the_claim_scope_is_the_contents<B>(b: &B, s: &str)
     where
@@ -1716,6 +1809,7 @@ mod runners {
                 one!(i725_the_reack_renews_what_is_held);
                 one!(i726_the_reack_converts_its_own_retired_claims);
                 one!(i771_the_reack_scan_is_not_an_access);
+                one!(i778_no_holding_claim_about_withheld_bytes);
                 #[tokio::test]
                 async fn i723_a_commons_claim_is_discovered_across_cohorts() {
                     let Some(a) = $fresh.await else { return };

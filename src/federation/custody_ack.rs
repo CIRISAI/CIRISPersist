@@ -801,6 +801,17 @@ where
             // durability deficit must still list it. Asked as THIS node (the
             // report's signer); a manifest it cannot open refuses `here`.
             if state == CustodyState::Here {
+                // Codex r3 on #1065 — a `here` report about bytes a tombstone
+                // withholds would re-advertise them through the takedown's
+                // window; refused, as `emit_holding_claim` refuses them.
+                if let Some(notice_id) =
+                    super::steward_purge::purge_withheld(backend, blob_sha256).await?
+                {
+                    return Err(Error::InvalidArgument(format!(
+                        "custody_ack_here_withheld: the bytes are withheld by takedown notice \
+                         {notice_id}; no `here` report is made about them (CC 3.1.3.3 rule 4)"
+                    )));
+                }
                 use super::chunk_dag_cascade::orchestrate::{held_dag_completeness, DagHolding};
                 // v53.1.2 (CIRISPersist#984 row 9) — asked as THIS node, or
                 // not at all: a backend that does not know its key would ask
