@@ -63,6 +63,32 @@ pub(crate) struct AdmissionCx<'a> {
     pub(crate) schema_resolver: Arc<dyn SchemaResolver>,
 }
 
+/// v56.0.0 (CIRISPersist#934 step 1; CIRISConstitution review, condition 1)
+/// — **the two instants a plan judges at, named.** Nothing inside a plan
+/// reads the clock; every time-dependent gate takes one of these.
+///
+/// - `fold_at` — the row's signed instant. A judgement of OTHER rows (which
+///   are live, chain validity, membership, supersession) belongs here, so
+///   `V(rows, t)` replays a plan with `fold_at = t`. The live door passes the
+///   row's own `asserted_at`.
+/// - `received_at` — the receiving node's clock at the door. The receipt
+///   bounds read it: the future-skew bound (`check_instant_binding`) and the
+///   attach-freshness window W (`check_attach_freshness`, CC 2.6.7).
+///
+/// #934 changes no behaviour, so each gate reads the instant it read before
+/// the plan existed. Four folds read the receipt clock today and still read
+/// `received_at` (`check_capacity_consent_admission`,
+/// `check_delegation_cycle_admission`, `check_peer_deadmission`,
+/// `check_trust_charter_admission`): candidates for #1049. Which gate reads
+/// which is pinned by `store::parity`'s `PLAN_INSTANTS`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PlanInstants {
+    /// The row's signed instant: where folds over other rows are judged.
+    pub(crate) fold_at: chrono::DateTime<chrono::Utc>,
+    /// The receiving node's clock at the door: the receipt bounds only.
+    pub(crate) received_at: chrono::DateTime<chrono::Utc>,
+}
+
 /// What [`plan_put_attestation`] decided.
 pub(crate) enum AttestationPlan {
     /// A byte-identical federation-tier re-offer this node already holds
@@ -94,8 +120,9 @@ pub(crate) struct PlannedAttestation {
     /// comes from the stored row (#646).
     pub(crate) wire_index_key: Option<String>,
     cycle_gated: bool,
-    /// The instant the plan judged at; the under-lock re-ask judges at it too.
-    at: chrono::DateTime<chrono::Utc>,
+    /// The receipt instant the plan judged the cycle at; the under-lock re-ask
+    /// judges at it too.
+    received_at: chrono::DateTime<chrono::Utc>,
 }
 
 impl PlannedAttestation {
@@ -114,7 +141,7 @@ impl PlannedAttestation {
         if !self.cycle_gated {
             return Ok(());
         }
-        super::admission::check_delegation_cycle_admission(graph, &self.row, self.at).await
+        super::admission::check_delegation_cycle_admission(graph, &self.row, self.received_at).await
     }
 }
 
@@ -180,7 +207,7 @@ pub(crate) struct PqcCompletion {
     pub(crate) attestation_id: String,
     /// The ML-DSA-65 half the caller supplied.
     pub(crate) scrub_signature_pqc: String,
-    /// The completion instant: the plan's `at`.
+    /// The completion instant: the plan's `received_at`.
     pub(crate) pqc_completed_at: chrono::DateTime<chrono::Utc>,
     /// The row hash over the completed row.
     pub(crate) persist_row_hash: String,
@@ -189,12 +216,13 @@ pub(crate) struct PqcCompletion {
 /// v56.0.0 (CIRISPersist#934 step 1) — **the hybrid-completion decision**,
 /// once for all three backends: the row must be held and not yet
 /// PQC-complete; the completed row's hash covers the new signature half and
-/// the completion instant `at`. Pure: the held row is the executor's read.
+/// the completion instant `received_at` (the receiving node's clock at the
+/// door). Pure: the held row is the directory's read.
 pub(crate) fn plan_attach_attestation_pqc_signature(
     held: Option<Attestation>,
     attestation_id: &str,
     scrub_signature_pqc: &str,
-    at: chrono::DateTime<chrono::Utc>,
+    received_at: chrono::DateTime<chrono::Utc>,
 ) -> Result<PqcCompletion, Error> {
     let mut row = held.ok_or_else(|| {
         Error::InvalidArgument(format!(
@@ -207,13 +235,13 @@ pub(crate) fn plan_attach_attestation_pqc_signature(
         )));
     }
     row.scrub_signature_pqc = Some(scrub_signature_pqc.to_owned());
-    row.pqc_completed_at = Some(at);
+    row.pqc_completed_at = Some(received_at);
     row.persist_row_hash = String::new();
     let persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
     Ok(PqcCompletion {
         attestation_id: attestation_id.to_owned(),
         scrub_signature_pqc: scrub_signature_pqc.to_owned(),
-        pqc_completed_at: at,
+        pqc_completed_at: received_at,
         persist_row_hash,
     })
 }
@@ -230,12 +258,16 @@ pub(crate) async fn attach_attestation_pqc_planned<D>(
 where
     D: AttestationStore,
 {
-    let at = chrono::Utc::now();
+    let received_at = chrono::Utc::now();
     // The row as stored, any tier: the same point read the crossing door
     // plans over (`enter_mesh`).
     let held = dir.get_attestation(attestation_id).await?;
-    let completion =
-        plan_attach_attestation_pqc_signature(held, attestation_id, scrub_signature_pqc, at)?;
+    let completion = plan_attach_attestation_pqc_signature(
+        held,
+        attestation_id,
+        scrub_signature_pqc,
+        received_at,
+    )?;
     dir.store_pqc_completion(completion).await?;
     Ok(())
 }
@@ -255,12 +287,15 @@ where
     // when the store inserted it.
     let consent_change = super::consent_list_change_of(dir, &attestation.attestation).await;
     // v56.0.0 (CIRISPersist#934, CC review condition 1) — the ONE clock read
-    // of this door. The plan judges every gate at `at` and reads no clock of
-    // its own; the executor reads none either. A replay of `V(rows, t)` calls
-    // the plan with `t`.
-    let at = chrono::Utc::now();
+    // of this door, and the row's signed instant: the plan's two inputs. The
+    // plan reads no clock of its own and the executor reads none either. A
+    // replay of `V(rows, t)` calls the plan with `fold_at = t`.
+    let instants = PlanInstants {
+        fold_at: attestation.attestation.asserted_at,
+        received_at: chrono::Utc::now(),
+    };
     let outcome = async {
-        let outcome = match plan_put_attestation(dir, attestation, &origin, at).await? {
+        let outcome = match plan_put_attestation(dir, attestation, &origin, instants).await? {
             AttestationPlan::AlreadyHeld => AttestationOutcome::AlreadyHeld,
             AttestationPlan::ComposerReplay {
                 repair_withdraws_depth,
@@ -323,24 +358,21 @@ where
 /// **The decision.** Every admission gate of the attestation plane's stored
 /// write, in the AV-76 tier order, once for all three backends.
 ///
-/// **`at` is an input** (CIRISConstitution review on #934, condition 1): the
-/// instant every time-dependent gate judges at. Nothing below reads the clock.
-/// The signed instant is the row's own `asserted_at`, which the gates read
-/// from the row; `at` is the instant the row is judged AT. Two gates compare
-/// the two by design and so cannot take `asserted_at` as `at`:
-/// [`check_instant_binding`](super::admission::check_instant_binding) bounds
-/// `asserted_at` to at most the skew allowance ahead of `at`, and
-/// `check_attach_freshness` judges the attach window at `at`. With
-/// `at = asserted_at` both would judge at an instant the signer chose.
+/// **The two instants are inputs** (CIRISConstitution review on #934,
+/// condition 1; see [`PlanInstants`]). Nothing below reads the clock.
 pub(crate) async fn plan_put_attestation<D>(
     dir: &D,
     attestation: super::SignedAttestation,
     origin: &WriteOrigin,
-    at: chrono::DateTime<chrono::Utc>,
+    instants: PlanInstants,
 ) -> Result<AttestationPlan, Error>
 where
     D: AttestationStore,
 {
+    let PlanInstants {
+        fold_at,
+        received_at,
+    } = instants;
     let cx = dir.admission_cx();
     let mut row = attestation.attestation;
 
@@ -531,7 +563,7 @@ where
     // it (B8).
     crate::federation::admission::check_instant_binding(
         &row,
-        at,
+        received_at,
         crate::federation::admission::DEFAULT_MAX_TOUCH_SKEW,
     )?;
 
@@ -863,7 +895,7 @@ where
     // v54.0.0 (CIRISPersist#1031, CC 4.1.1) — the cycle-closing `delegates_to`
     // is refused: the recipient must not already reach the granter through live
     // `delegates_to` edges. Backend-symmetric with SQLite + Postgres; verify-before-mutation.
-    crate::federation::admission::check_delegation_cycle_admission(dir, &row, at).await?;
+    crate::federation::admission::check_delegation_cycle_admission(dir, &row, received_at).await?;
 
     // v12.6.0 (CIRISConstitution#23, CC 1.13.3.3 / CC 3.2) — the single-owner
     // gate: a node has AT MOST ONE responsible steward, so a second,
@@ -880,7 +912,7 @@ where
         &row.attesting_key_id,
         &row.attested_key_id,
         &row.attestation_envelope,
-        at,
+        received_at,
     )
     .await?;
     // v51.0.0 (CIRISPersist#937, CC 3.2 T4a) — attaching is gated on a
@@ -893,7 +925,7 @@ where
         &row.attestation_type,
         &row.attested_key_id,
         &row.attestation_envelope,
-        at,
+        received_at,
     )
     .await?;
     // v24.0.0 (CIRISPersist#557) — a charter naming a constitutional family
@@ -918,7 +950,7 @@ where
     // AV-62/74's dimension-keyed self-emission arm — so a SELF-attested
     // capacity row is still reported as self-emission rather than shadowed
     // by "no consent". Backend-symmetric across memory / sqlite / postgres.
-    crate::federation::admission::check_capacity_consent_admission(dir, &row, at).await?;
+    crate::federation::admission::check_capacity_consent_admission(dir, &row, received_at).await?;
     // v45.0.0 (CIRISPersist#871, FSD/MEDIA_SOURCE.md §5) — the placement
     // rule: a rendition (`media.derived_from`) whose original THIS node
     // holds must name the original's own `cohort_scope`. AV-76 TIER 4: it
@@ -954,8 +986,10 @@ where
     crate::federation::admission::check_session_self_report_admission(&row)?;
     // CC 3.3.1 — a `consent:community_trust` grant is the node's own and
     // lists its owner at the grant's instant (v52.0.0, CIRISPersist#946).
-    crate::federation::community_trust_consent::check_community_trust_grant_admission(dir, &row)
-        .await?;
+    crate::federation::community_trust_consent::check_community_trust_grant_admission(
+        dir, &row, fold_at,
+    )
+    .await?;
     // CC 3.1.3.3 — `custody:ack:v1` is a holder self-report, placed within
     // the blob's own cohort (v53.0.0, CIRISPersist#942 part 2).
     crate::federation::custody_ack::check_custody_ack_admission(dir, &row).await?;
@@ -970,7 +1004,13 @@ where
     crate::federation::admission::check_dimension_case_rule(&row)?;
     // CC 3.3.9 — a `license`-scoped issuance resolves to the authority it
     // names (v42.0.0, CIRISPersist#814).
-    crate::federation::admission::check_licensure_delegator_is_authority(dir, &row, at).await?;
+    crate::federation::admission::check_licensure_delegator_is_authority(
+        dir,
+        &row,
+        received_at,
+        fold_at,
+    )
+    .await?;
 
     // v22.0.0 (CIRISPersist#543 / AV-77) — THE DE-ADMISSION GATE. A peer
     // this node has de-admitted gets its writes refused here. No-op when
@@ -983,7 +1023,7 @@ where
     // three backends" false for AV-77. Same tier position as the SQL
     // backends so a refusal is named by the same gate everywhere.
     if let Some(me) = &cx.self_key_id {
-        crate::federation::admission::check_peer_deadmission(dir, &row, me, at).await?;
+        crate::federation::admission::check_peer_deadmission(dir, &row, me, received_at).await?;
     }
 
     // v12.5.0 (CIRISPersist#238, CC 4.5.4 / §11.11) — no-moderator-no-
@@ -1036,6 +1076,6 @@ where
         projected_trace,
         wire_index_key,
         cycle_gated,
-        at,
+        received_at,
     })))
 }

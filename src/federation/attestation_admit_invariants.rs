@@ -1,26 +1,33 @@
 //! v56.0.0 (CIRISPersist#934 step 1) — **the shared attestation plan judges
-//! at the instant it is given.**
+//! at the two instants it is given.**
 //!
 //! The Constitution's review of #934 (2026-10-13, condition 1): a plan is pure
-//! over reads at an instant that is an INPUT, so `V(rows, t)` is a replay of
-//! plans (CIRISConstitution#131 §2–§3, CIRISServer `FSD/TOPOLOGY.md` §4.1).
+//! over reads at instants that are INPUTS, so `V(rows, t)` is a replay of plans
+//! (CIRISConstitution#131 §2–§3, CIRISServer `FSD/TOPOLOGY.md` §4.1).
 //! [`plan_put_attestation`](super::attestation_admit::plan_put_attestation)
-//! takes `at` and reads no clock; the door samples the receipt clock once and
-//! passes it in.
+//! takes [`PlanInstants`](super::attestation_admit::PlanInstants) — `fold_at`
+//! (the row's signed instant) and `received_at` (the receiver's clock) — and
+//! reads no clock.
 //!
 //! I950 — one body, run on memory, sqlite and postgres. The SAME signed row,
-//! planned at two instants, gets the verdict each instant implies, and the
-//! plan writes nothing either time:
+//! planned under two instant pairs, gets the verdict each gate's instant
+//! implies, and the plan writes nothing either time:
 //!
-//! - (1) the future-skew bound (`check_instant_binding`): a row whose signed
-//!   `asserted_at` is an hour ahead of `t0` is refused at `t0` and admitted at
-//!   `t0 + 1h`;
-//! - (2) a directory fold judged at `at` (`check_delegation_cycle_admission`):
-//!   with `a → b` live until `t0 + 1h`, the edge `b → a` closes a cycle at
-//!   `t0` and closes nothing at `t0 + 2h`, when `a → b` has expired.
+//! - (1) a receipt bound on `received_at` (`check_instant_binding`): a row
+//!   signed an hour ahead of `t0` is refused at `received_at = t0` and
+//!   admitted at `received_at = t0 + 1h`, with `fold_at` its own instant both
+//!   times;
+//! - (2) a fold still at receipt (`check_delegation_cycle_admission`, a
+//!   #1049 candidate): with `c → e` live until `t0 + 1h`, `e → c` closes a
+//!   cycle at `received_at = t0` and nothing at `t0 + 2h`;
+//! - (3) a fold on `fold_at` (`check_community_trust_grant_admission`, the
+//!   owner bindings in force): with the owner's binding signed at
+//!   2026-05-01, a capture grant is refused at `fold_at` a month earlier and
+//!   admitted at `fold_at` a day later, with `received_at` the same both
+//!   times.
 //!
-//! Mutating either gate's instant back to the clock turns (1) or (2) red on
-//! all three backends.
+//! Swapping the two instants inside the receipt bound turns (1) red, and
+//! inside the fold turns (3) red, on all three backends.
 //!
 //! I952 — the hybrid-completion door (`attach_attestation_pqc_signature`),
 //! decided once by `plan_attach_attestation_pqc_signature`: an unknown id is
@@ -33,7 +40,7 @@
 #[cfg(test)]
 pub(crate) mod bodies {
     use crate::federation::attestation_admit::{
-        plan_put_attestation, AttestationPlan, AttestationStore,
+        plan_put_attestation, AttestationPlan, AttestationStore, PlanInstants,
     };
     use crate::federation::replication::admission::WriteOrigin;
     use crate::federation::tier_ingest::test_support as ts;
@@ -74,6 +81,16 @@ pub(crate) mod bodies {
         }
     }
 
+    fn at(
+        fold_at: chrono::DateTime<chrono::Utc>,
+        received_at: chrono::DateTime<chrono::Utc>,
+    ) -> PlanInstants {
+        PlanInstants {
+            fold_at,
+            received_at,
+        }
+    }
+
     pub(crate) async fn i950_the_plan_judges_at_its_input_instant<D>(d: &D, tag: &str)
     where
         D: AttestationStore + 'static,
@@ -86,52 +103,115 @@ pub(crate) mod bodies {
         let t0 = truncate(chrono::Utc::now());
         let hour = chrono::Duration::hours(1);
 
-        // (1) the future-skew bound, judged at `at`.
+        // (1) the future-skew bound, judged at `received_at`.
         let ahead = edge(&k("a"), &k("b"), t0 + hour);
         let id = ahead.attestation.attestation_id.clone();
-        let at_t0 = plan_put_attestation(d, ahead.clone(), &WriteOrigin::Wire, t0).await;
-        match &at_t0 {
+        let signed = ahead.attestation.asserted_at;
+        let early =
+            plan_put_attestation(d, ahead.clone(), &WriteOrigin::Wire, at(signed, t0)).await;
+        match &early {
             Err(Error::InvalidArgument(m)) if m.contains("ahead of now") => {}
             other => panic!(
-                "(1) a row signed 1h ahead of t0, planned AT t0, must be refused by the skew \
+                "(1) a row signed 1h ahead of t0, received AT t0, must be refused by the skew \
                  bound; got {}",
                 verdict(other)
             ),
         }
-        let at_t1 = plan_put_attestation(d, ahead, &WriteOrigin::Wire, t0 + hour).await;
+        let on_time =
+            plan_put_attestation(d, ahead, &WriteOrigin::Wire, at(signed, t0 + hour)).await;
         assert!(
-            matches!(at_t1, Ok(AttestationPlan::Insert(_))),
-            "(1) the same row planned AT its own signed instant is inside the skew bound; got {}",
-            verdict(&at_t1)
+            matches!(on_time, Ok(AttestationPlan::Insert(_))),
+            "(1) the same row received at its own signed instant is inside the skew bound; got {}",
+            verdict(&on_time)
         );
         assert!(
             dd.get_attestation(&id).await.unwrap().is_none(),
             "(1) a plan writes nothing"
         );
 
-        // (2) a directory fold judged at `at`: `c → e` is live until t0 + 1h.
+        // (2) a fold still at receipt: `c → e` is live until t0 + 1h.
         ts::put_delegates_to(dd, &k("c"), &k("e"), Some(t0 + hour))
             .await
             .expect("(2) c → e, expiring at t0 + 1h");
         let closing = edge(&k("e"), &k("c"), t0);
         let id = closing.attestation.attestation_id.clone();
-        let live = plan_put_attestation(d, closing.clone(), &WriteOrigin::Wire, t0).await;
+        let live = plan_put_attestation(d, closing.clone(), &WriteOrigin::Wire, at(t0, t0)).await;
         match &live {
             Err(Error::DelegationCycle { hops, .. }) => assert_eq!(*hops, 1, "(2) hops"),
             other => panic!(
-                "(2) at t0, c → e is live, so e → c closes a cycle; got {}",
+                "(2) received at t0, c → e is live, so e → c closes a cycle; got {}",
                 verdict(other)
             ),
         }
-        let expired = plan_put_attestation(d, closing, &WriteOrigin::Wire, t0 + hour * 2).await;
+        let expired =
+            plan_put_attestation(d, closing, &WriteOrigin::Wire, at(t0, t0 + hour * 2)).await;
         assert!(
             matches!(expired, Ok(AttestationPlan::Insert(_))),
-            "(2) at t0 + 2h, c → e has expired, so e → c closes nothing; got {}",
+            "(2) received at t0 + 2h, c → e has expired, so e → c closes nothing; got {}",
             verdict(&expired)
         );
         assert!(
             dd.get_attestation(&id).await.unwrap().is_none(),
             "(2) a plan writes nothing"
+        );
+
+        // (3) a fold on `fold_at`: the owner bindings in force over the node.
+        let (owner, node) = (k("owner"), k("node"));
+        ts::register_identity_key(dd, &owner, identity_type::USER).await;
+        ts::register_hybrid_key_as(dd, &node, &node, identity_type::NODE).await;
+        dd.put_attestation(SignedAttestation {
+            attestation: ts::owner_binding_attestation(&k("ob"), &owner, &node),
+        })
+        .await
+        .expect("(3) the owner binds the node");
+        let gid = uuid::Uuid::new_v4().to_string();
+        let mut grant = ts::bare_attestation(
+            &gid,
+            &node,
+            &node,
+            &serde_json::json!({
+                "id": gid,
+                "dimension": crate::federation::community_trust_consent::COMMUNITY_TRUST_DIMENSION,
+                "score": 1.0,
+            }),
+        );
+        grant.attestation_type = attestation_type::SCORES.to_owned();
+        grant.subject_key_ids = vec![owner.clone()];
+        ts::seal_row_in_place(&node, &mut grant);
+        let grant = SignedAttestation { attestation: grant };
+        let now = truncate(chrono::Utc::now());
+        // `owner_binding_attestation` signs its binding at 2026-05-01.
+        let bound: chrono::DateTime<chrono::Utc> = "2026-05-01T00:00:00Z".parse().unwrap();
+        let before = plan_put_attestation(
+            d,
+            grant.clone(),
+            &WriteOrigin::Wire,
+            at(bound - chrono::Duration::days(30), now),
+        )
+        .await;
+        match &before {
+            Err(Error::InvalidArgument(m)) if m.contains("no owner binding") => {}
+            other => panic!(
+                "(3) folded a month before the owner bound the node, the grant names no \
+                 owner in force; got {}",
+                verdict(other)
+            ),
+        }
+        let after = plan_put_attestation(
+            d,
+            grant,
+            &WriteOrigin::Wire,
+            at(bound + chrono::Duration::days(1), now),
+        )
+        .await;
+        assert!(
+            matches!(after, Ok(AttestationPlan::Insert(_))),
+            "(3) folded a day after, the owner's binding is in force; got {}",
+            verdict(&after)
+        );
+        assert!(
+            dd.get_attestation(&gid).await.unwrap().is_none(),
+            "(3) a plan writes nothing"
         );
     }
 }

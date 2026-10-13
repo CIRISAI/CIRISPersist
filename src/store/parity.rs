@@ -2310,6 +2310,192 @@ mod tests {
         }
     }
 
+    /// v56.0.0 (CIRISPersist#934 step 1; the CIRISConstitution review's
+    /// condition one) — which of the plan's two named instants
+    /// ([`PlanInstants`](crate::federation::attestation_admit::PlanInstants))
+    /// a call inside a shared plan receives.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+    enum Reads {
+        /// The row's signed instant: a fold over other rows.
+        FoldAt,
+        /// The receiver's clock at the door: a receipt bound, or a fold that
+        /// read the clock before #934 (a #1049 candidate).
+        ReceivedAt,
+        /// Both: judged at receipt AND at the signed instant.
+        Both,
+    }
+
+    /// v56.0.0 — **every time-dependent call in a shared plan, and the instant
+    /// it is given**: `(plan fn, callee, instant)`. A call whose arguments name
+    /// neither instant reads neither (it reads only the row, or no time at
+    /// all). [`every_plan_call_reads_its_declared_instant`] derives the same
+    /// table from the plan bodies and fails on any difference, so a gate that
+    /// moves from one instant to the other (#1049) moves a row here, and the CC
+    /// register can point at the row.
+    const PLAN_INSTANTS: &[(&str, &str, Reads)] = &[
+        // Receipt bounds (CC 2.6.7 W; the future-skew sanity bound).
+        (
+            "plan_put_attestation",
+            "check_instant_binding",
+            Reads::ReceivedAt,
+        ),
+        (
+            "plan_put_attestation",
+            "check_attach_freshness",
+            Reads::ReceivedAt,
+        ),
+        // Folds that read the clock before #934 and still read receipt
+        // (unchanged behaviour; #1049 candidates).
+        (
+            "plan_put_attestation",
+            "check_capacity_consent_admission",
+            Reads::ReceivedAt,
+        ),
+        (
+            "plan_put_attestation",
+            "check_delegation_cycle_admission",
+            Reads::ReceivedAt,
+        ),
+        (
+            "plan_put_attestation",
+            "check_trust_charter_admission",
+            Reads::ReceivedAt,
+        ),
+        (
+            "plan_put_attestation",
+            "check_peer_deadmission",
+            Reads::ReceivedAt,
+        ),
+        // Judged at both instants (#1032/#1049's licensure reading).
+        (
+            "plan_put_attestation",
+            "check_licensure_delegator_is_authority",
+            Reads::Both,
+        ),
+        // Folded at the signed instant (CC 3.3.1: owner at the grant's instant).
+        (
+            "plan_put_attestation",
+            "check_community_trust_grant_admission",
+            Reads::FoldAt,
+        ),
+        // The executor's re-ask under its lock: the same instant as the plan's.
+        (
+            "recheck_cycle_under_lock",
+            "check_delegation_cycle_admission",
+            Reads::ReceivedAt,
+        ),
+        // The hybrid completion stamps the receipt instant into the row.
+        (
+            "plan_attach_attestation_pqc_signature",
+            "Some",
+            Reads::ReceivedAt,
+        ),
+    ];
+
+    /// The plan fns [`PLAN_INSTANTS`] covers, in `src/federation/attestation_admit.rs`.
+    const INSTANT_PLANS: [&str; 3] = [
+        "plan_put_attestation",
+        "recheck_cycle_under_lock",
+        "plan_attach_attestation_pqc_signature",
+    ];
+
+    /// For every mention of `word` in `body`, the innermost CALL it is an
+    /// argument of: walk back to the unmatched `(` and read the identifier
+    /// before it. A mention inside an unmatched `{` first (a struct literal)
+    /// is not a call argument.
+    fn callees_receiving(body: &str, word: &str) -> BTreeSet<String> {
+        let b = body.as_bytes();
+        let is_ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+        let mut out = BTreeSet::new();
+        let mut from = 0usize;
+        while let Some(p) = body[from..].find(word) {
+            let at = from + p;
+            from = at + word.len();
+            let before_ok = at == 0 || !is_ident(b[at - 1]);
+            let after_ok = from >= b.len() || !is_ident(b[from]);
+            if !before_ok || !after_ok {
+                continue;
+            }
+            let (mut paren, mut brace) = (0i32, 0i32);
+            let mut k = at;
+            while k > 0 {
+                k -= 1;
+                match b[k] {
+                    b')' => paren += 1,
+                    b'}' => brace += 1,
+                    b'{' if brace == 0 => break,
+                    b'{' => brace -= 1,
+                    b'(' if paren == 0 => {
+                        let mut e = k;
+                        while e > 0 && b[e - 1].is_ascii_whitespace() {
+                            e -= 1;
+                        }
+                        let mut s = e;
+                        while s > 0 && is_ident(b[s - 1]) {
+                            s -= 1;
+                        }
+                        if s < e {
+                            out.insert(body[s..e].to_owned());
+                        }
+                        break;
+                    }
+                    b'(' => paren -= 1,
+                    _ => {}
+                }
+            }
+        }
+        out
+    }
+
+    /// v56.0.0 (CIRISPersist#934 step 1) — **each time-dependent call in a
+    /// shared plan receives the instant [`PLAN_INSTANTS`] says, and no plan
+    /// reads the clock.** Prints the table it derived (the per-gate instant
+    /// column of the #934 inventory).
+    #[test]
+    fn every_plan_call_reads_its_declared_instant() {
+        let rel = "src/federation/attestation_admit.rs";
+        let stripped = strip_file(&read(rel));
+        let index = index_functions(&stripped);
+        let mut derived: BTreeSet<(String, String, Reads)> = BTreeSet::new();
+        for plan in INSTANT_PLANS {
+            let &(a, b) = index
+                .get(plan)
+                .and_then(|r| r.first())
+                .unwrap_or_else(|| panic!("plan `{plan}` not found in {rel}"));
+            let whole = stripped[a..=b].join("\n");
+            // The body only: a parameter named for an instant is not a call.
+            let body = &whole[whole.find('{').map_or(0, |i| i + 1)..];
+            assert!(
+                !body.contains("Utc::now"),
+                "`{plan}` reads the clock: a plan takes its instants as inputs (#934)"
+            );
+            let fold = callees_receiving(body, "fold_at");
+            let recv = callees_receiving(body, "received_at");
+            for c in fold.union(&recv) {
+                let reads = match (fold.contains(c), recv.contains(c)) {
+                    (true, true) => Reads::Both,
+                    (true, false) => Reads::FoldAt,
+                    _ => Reads::ReceivedAt,
+                };
+                derived.insert((plan.to_owned(), c.clone(), reads));
+            }
+        }
+        for (plan, callee, reads) in &derived {
+            eprintln!("{plan:<40} {callee:<44} {reads:?}");
+        }
+        let declared: BTreeSet<(String, String, Reads)> = PLAN_INSTANTS
+            .iter()
+            .map(|(p, c, r)| ((*p).to_owned(), (*c).to_owned(), *r))
+            .collect();
+        let extra: Vec<_> = derived.difference(&declared).collect();
+        let missing: Vec<_> = declared.difference(&derived).collect();
+        assert!(
+            extra.is_empty() && missing.is_empty(),
+            "PLAN_INSTANTS disagrees with the plans: undeclared {extra:?}; declared but not \
+             found {missing:?}. A gate that changes instant moves its row (#1049)."
+        );
+    }
+
     /// v56.0.0 (CIRISPersist#934 step 1) — **a shared door stays shared.**
     /// Every [`SHARED_DOORS`] row's door is exactly `plan:<plan>` on every
     /// backend; every `plan:` token anywhere names a [`SHARED_PLANS`] body;

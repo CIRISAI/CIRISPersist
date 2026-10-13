@@ -3457,18 +3457,19 @@ where
 /// Non-charter rows (any non-`delegates_to`, any non-self-loop, any
 /// self-loop without an `infra:*` scope) fast-exit untouched.
 ///
-/// v56.0.0 (CIRISPersist#934 step 1) — `at` is the instant this gate judges
-/// at, an INPUT of the shared attestation plan
-/// (`attestation_admit::plan_put_attestation`) rather than a clock read
-/// inside the gate: the live door passes the one receipt
-/// instant it sampled, and a replay of `V(rows, t)` passes `t`.
+/// v56.0.0 (CIRISPersist#934 step 1) — `received_at` is the receiving node's
+/// clock at the door, an INPUT of the shared attestation plan
+/// (`attestation_admit::PlanInstants`) rather than a clock read inside the
+/// gate. This gate read the clock before the plan existed, so it judges at
+/// the receipt instant still: unchanged behaviour (#934). Where its judgement
+/// belongs at the row's signed instant instead, moving it is #1049's ruling.
 pub async fn check_trust_charter_admission<F>(
     directory: &F,
     attestation_type_str: &str,
     attesting_key_id: &str,
     attested_key_id: &str,
     envelope: &serde_json::Value,
-    at: chrono::DateTime<chrono::Utc>,
+    received_at: chrono::DateTime<chrono::Utc>,
 ) -> Result<(), Error>
 where
     F: FederationDirectory + ?Sized,
@@ -3546,7 +3547,7 @@ where
             let by_old = directory.list_attestations_by(old_root).await?;
             let old_refs: Vec<&Attestation> = by_old.iter().collect();
             let old_dead = tombstoned_ids(&old_refs);
-            let now = at;
+            let now = received_at;
             let bound = by_old.iter().any(|a| {
                 a.attestation_type == attestation_type::DELEGATES_TO
                     && a.attested_key_id == old_root

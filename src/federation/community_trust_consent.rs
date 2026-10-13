@@ -47,9 +47,16 @@ fn is_community_trust(row: &Attestation) -> bool {
 ///    re-put (first-write-wins on its id, so nothing is lost).
 ///
 /// [`owner_granters_in_force_at`]: super::admission::owner_granters_in_force_at
+///
+/// v56.0.0 (CIRISPersist#934 step 1) — `fold_at` is the instant the owner
+/// bindings are folded at, an INPUT of the shared attestation plan
+/// (`attestation_admit::PlanInstants`). The live door passes the grant's own
+/// `asserted_at`, which is what this gate read before; a replay of
+/// `V(rows, t)` passes `t`.
 pub async fn check_community_trust_grant_admission(
     directory: &dyn FederationDirectory,
     row: &Attestation,
+    fold_at: chrono::DateTime<chrono::Utc>,
 ) -> Result<(), Error> {
     if row.attestation_type != attestation_type::SCORES || !is_community_trust(row) {
         return Ok(());
@@ -61,12 +68,9 @@ pub async fn check_community_trust_grant_admission(
             row.attesting_key_id, row.attested_key_id
         )));
     }
-    let owners = super::admission::owner_granters_in_force_at(
-        directory,
-        &row.attested_key_id,
-        row.asserted_at,
-    )
-    .await?;
+    let owners =
+        super::admission::owner_granters_in_force_at(directory, &row.attested_key_id, fold_at)
+            .await?;
     if owners.is_empty() {
         return Err(Error::InvalidArgument(format!(
             "{COMMUNITY_TRUST_PREFIX}: no owner binding over {:?} is in force at the grant's \
