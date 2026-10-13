@@ -1144,19 +1144,6 @@ pub mod orchestrate {
             .await?;
         let mut report = SweepReport::default();
 
-        // v55.0.0 (CIRISPersist#977, operator ruling) — a room's retention
-        // bound covers every byte sealed for the room: the chunks of a
-        // stream-keyed ROOM stream are evicted under the same policy as the
-        // community epoch their stream epoch was minted at (`room_epoch`), by
-        // the rule below (`current - room_epoch > n`).
-        if let Some(n) = retain {
-            if let Some(bound) = current.checked_sub(n.saturating_add(1)) {
-                report.evicted_objects += backend
-                    .stream_dek_evict_room_chunks(community_key_id, &minter, bound, now)
-                    .await?;
-            }
-        }
-
         for (epoch, state) in backend
             .community_dek_epochs(community_key_id, &minter)
             .await?
@@ -1225,6 +1212,28 @@ pub mod orchestrate {
                 report.destroyed.push(epoch);
             } else {
                 report.blocked.push((epoch, remaining));
+            }
+        }
+
+        // v55.0.0 (CIRISPersist#977, operator ruling) — a room's retention
+        // bound covers every byte sealed for the room: the chunks of a
+        // stream-keyed ROOM stream are evicted under the same policy as the
+        // community epoch their stream epoch was minted at (`room_epoch`), by
+        // the rule above (`current - room_epoch > n`).
+        //
+        // Codex r4 on #1065 — run AFTER the epoch loop, and never orphaning a
+        // retained manifest: a stream epoch whose chunks a still-held DAG
+        // manifest relates (`federation_dag_chunks`) is kept whole, because
+        // the retention bound applies to the content AS ADVERTISED — the DAG,
+        // bound to the community epoch it was sealed under — not to the
+        // epoch its chunks' key was minted at. Once the manifest goes (its
+        // own epoch's eviction, above in this same sweep, or a takedown) the
+        // chunks follow in this pass or the next.
+        if let Some(n) = retain {
+            if let Some(bound) = current.checked_sub(n.saturating_add(1)) {
+                report.evicted_objects += backend
+                    .stream_dek_evict_room_chunks(community_key_id, &minter, bound, now)
+                    .await?;
             }
         }
         Ok(report)

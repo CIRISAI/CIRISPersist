@@ -17176,7 +17176,11 @@ impl crate::federation::BlobStorage for SqliteBackend {
                   AND d.cohort_scope IN ('community', 'affiliations') \
                   AND d.room_epoch IS NOT NULL AND d.room_epoch <= ?3 \
                   AND d.terminated_at IS NOT NULL \
-                  AND d.evicted_at IS NULL";
+                  AND d.evicted_at IS NULL \
+                  AND NOT EXISTS (SELECT 1 FROM federation_stream_chunks c2 \
+                                   JOIN federation_dag_chunks dc ON dc.chunk_sha256 = c2.chunk_sha \
+                                   JOIN federation_blobs m ON m.sha256 = dc.manifest_sha256 \
+                                  WHERE c2.stream_id = d.stream_id AND c2.epoch = d.epoch)";
             let tx = conn.transaction()?;
             let n = tx.execute(
                 &format!(

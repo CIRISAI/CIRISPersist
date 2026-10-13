@@ -19083,7 +19083,11 @@ impl crate::federation::BlobStorage for PostgresBackend {
               AND d.cohort_scope IN ('community', 'affiliations') \
               AND d.room_epoch IS NOT NULL AND d.room_epoch <= $3 \
               AND d.terminated_at IS NOT NULL \
-              AND d.evicted_at IS NULL";
+              AND d.evicted_at IS NULL \
+              AND NOT EXISTS (SELECT 1 FROM cirislens.federation_stream_chunks c2 \
+                               JOIN cirislens.federation_dag_chunks dc ON dc.chunk_sha256 = c2.chunk_sha \
+                               JOIN cirislens.federation_blobs m ON m.sha256 = dc.manifest_sha256 \
+                              WHERE c2.stream_id = d.stream_id AND c2.epoch = d.epoch)";
         let tx = client.transaction().await.map_err(be)?;
         let n = tx
             .execute(

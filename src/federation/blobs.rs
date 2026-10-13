@@ -2373,6 +2373,11 @@ pub trait BlobStorage: Send + Sync {
     /// leave every later chunk outside the sweep (and the stream a missing
     /// prefix). It is swept by the first sweep after its terminator lands
     /// (the stream's seal, or the roll that closes it).
+    ///
+    /// Codex r4 on #1065 — nor a stream epoch any of whose chunks a
+    /// still-held manifest relates (`federation_dag_chunks`): the retention
+    /// bound applies to the DAG as advertised, so its chunks go only once its
+    /// manifest has gone.
     fn stream_dek_evict_room_chunks(
         &self,
         community_key_id: &str,

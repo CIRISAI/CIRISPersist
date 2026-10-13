@@ -70,9 +70,12 @@
 //! - **I779** (sqlite, postgres; Codex r3 on #1065) — the room retention
 //!   sweep never evicts an OPEN stream epoch: past its retention it keeps the
 //!   open epoch's chunks (and appends go on under its DEK); once the stream is
-//!   sealed (the epoch terminated) the next sweep evicts every chunk of it,
+//!   sealed (the epoch terminated) every chunk of it is swept with its DAG,
 //!   the ones appended after the first sweep and the terminator included, so
-//!   no chunk is left outside the sweep.
+//!   no chunk is left outside the sweep. Codex r4 on #1065: sealed under a
+//!   NEWER room epoch, the DAG is retained whole by the next sweep (it reads
+//!   in full); once the DAG's own epoch falls out of retention the manifest
+//!   and every chunk go in one sweep and nothing is advertised. Never half.
 //! - **I756** (pure; #981) — the roll rule: cap and removal roll a minted
 //!   epoch and refuse a supplied one with the reason; nothing else does.
 
@@ -710,6 +713,14 @@ pub(crate) mod bodies {
             Some(0),
             "I757: the stream epoch records the room's epoch at its mint"
         );
+        // The old stream is sealed IN its room epoch: the DAG is bound to
+        // epoch 0, so it and its chunks fall out of retention together (an
+        // open epoch waits for its terminator, and a DAG sealed under a newer
+        // epoch keeps its chunks — I779).
+        l.engine_a
+            .seal_stream_scoped(COMMUNITY, Some(&l.comm), &old_stream, None, None)
+            .await
+            .expect("I757: the old stream seals");
         // The room moves on: a new community epoch, and a stream written in it.
         let current =
             l.ba.community_dek_bump_epoch(&l.comm, &l.node_a)
@@ -726,12 +737,6 @@ pub(crate) mod bodies {
         l.ba.community_dek_set_retain_past_epochs(&l.comm, &l.node_a, Some(0))
             .await
             .unwrap();
-        // The old stream is sealed: its epoch is terminated, so it is swept
-        // (an open one waits for its terminator — I779).
-        l.engine_a
-            .seal_stream_scoped(COMMUNITY, Some(&l.comm), &old_stream, None, None)
-            .await
-            .expect("I757: the old stream seals");
         let old = l.ba.stream_chunks(&old_stream).await.unwrap().chunks;
         let report = sweep_rotated_epochs(l.ba.as_ref(), &l.comm, &signer, chrono::Utc::now())
             .await
@@ -833,12 +838,49 @@ pub(crate) mod bodies {
             "I779: four data chunks and the terminator: {}",
             all.len()
         );
+        // Codex r4 on #1065 — the stream epoch was minted at room epoch 0 but
+        // the DAG was sealed under room epoch 1 (current): the manifest is
+        // retained, so its chunks are too. Never half a DAG.
+        let root =
+            l.ba.dag_manifests_of_chunk(&all[0].chunk_sha)
+                .await
+                .unwrap()
+                .into_iter()
+                .next()
+                .expect("I779: the seal related the chunks to the manifest");
+        let r = sweep().await;
+        assert_eq!(
+            r.evicted_objects, 0,
+            "I779 (r4): a retained DAG keeps its chunks: {r:?}"
+        );
+        let whole = l
+            .engine_a
+            .read_blob_as(&root, &l.node_a, None)
+            .await
+            .expect("I779 (r4): the DAG still reads in full");
+        assert_eq!(
+            whole.len() as u64,
+            (0..4).map(|i| segment(i).len() as u64).sum::<u64>()
+        );
+        // The room moves on again: the DAG's own epoch falls out of
+        // retention, and the manifest and its chunks go in the same sweep.
+        l.ba.community_dek_bump_epoch(&l.comm, &l.node_a)
+            .await
+            .unwrap();
         let r = sweep().await;
         assert!(r.evicted_objects >= all.len() as u64, "I779: {r:?}");
+        assert!(
+            l.ba.blob_head(&root).await.unwrap().is_none(),
+            "I779: the manifest is evicted with its epoch"
+        );
+        assert!(
+            l.ba.list_holders(&root).await.unwrap().is_empty(),
+            "I779: nothing advertised"
+        );
         for c in &all {
             assert!(
                 l.ba.blob_head(&c.chunk_sha).await.unwrap().is_none(),
-                "I779: chunk {} is swept once the epoch is terminated",
+                "I779: chunk {} is swept with its DAG",
                 c.seq
             );
         }
