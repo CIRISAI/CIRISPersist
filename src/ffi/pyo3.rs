@@ -4055,7 +4055,8 @@ impl PyEngine {
     /// construction runs the same pass hourly; sovereign hosts may drive it
     /// on their own schedule. Returns the report as JSON
     /// (`scanned`, `renewed`, `fresh`, `not_held`, `not_in_cohort`,
-    /// `failed`). Idempotent.
+    /// `failed`, `converted`, and `withheld`: blobs a takedown withholds,
+    /// neither renewed nor converted). Idempotent.
     fn reack_holding_claims_once(&self, py: Python<'_>) -> PyResult<String> {
         self.ensure_usable()?;
         let runtime = self.runtime.clone();

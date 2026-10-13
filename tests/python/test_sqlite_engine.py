@@ -1414,7 +1414,9 @@ def test_reack_holding_claims_once_is_host_reachable_989() -> None:
             report = json.loads(eng.reack_holding_claims_once())
             assert set(report) == {
                 "scanned", "renewed", "fresh", "not_held", "not_in_cohort", "failed", "converted",
+                "withheld",
             }, report
+            assert report["withheld"] == 0, report
             assert report["scanned"] == 1 and report["fresh"] == 1, report
             assert report["renewed"] == 0 and report["failed"] == 0, report
     finally:
