@@ -67,6 +67,12 @@
 //!   with the chunk door's own error, nothing written (no DEK row, no chunk,
 //!   no terminator); the stream-DEK floors (`stream_dek_insert`,
 //!   `stream_dek_put_grants`) refuse it too.
+//! - **I779** (sqlite, postgres; Codex r3 on #1065) — the room retention
+//!   sweep never evicts an OPEN stream epoch: past its retention it keeps the
+//!   open epoch's chunks (and appends go on under its DEK); once the stream is
+//!   sealed (the epoch terminated) the next sweep evicts every chunk of it,
+//!   the ones appended after the first sweep and the terminator included, so
+//!   no chunk is left outside the sweep.
 //! - **I756** (pure; #981) — the roll rule: cap and removal roll a minted
 //!   epoch and refuse a supplied one with the reason; nothing else does.
 
@@ -699,7 +705,6 @@ pub(crate) mod bodies {
         assert_eq!(signer.derived_key_id(), l.node_a, "fixture: A's signer");
         let old_stream = format!("i757-old-{run}");
         write_room(&l, &old_stream, 3, 0).await;
-        let old = l.ba.stream_chunks(&old_stream).await.unwrap().chunks;
         assert_eq!(
             l.ba.stream_dek_list(&old_stream).await.unwrap()[0].room_epoch,
             Some(0),
@@ -721,6 +726,13 @@ pub(crate) mod bodies {
         l.ba.community_dek_set_retain_past_epochs(&l.comm, &l.node_a, Some(0))
             .await
             .unwrap();
+        // The old stream is sealed: its epoch is terminated, so it is swept
+        // (an open one waits for its terminator — I779).
+        l.engine_a
+            .seal_stream_scoped(COMMUNITY, Some(&l.comm), &old_stream, None, None)
+            .await
+            .expect("I757: the old stream seals");
+        let old = l.ba.stream_chunks(&old_stream).await.unwrap().chunks;
         let report = sweep_rotated_epochs(l.ba.as_ref(), &l.comm, &signer, chrono::Utc::now())
             .await
             .expect("I757: the sweep runs");
@@ -752,6 +764,79 @@ pub(crate) mod bodies {
             again.evicted_objects, 0,
             "I757: a second sweep evicts nothing more"
         );
+    }
+
+    /// **I779** — see the module doc.
+    pub(crate) async fn i779_an_open_stream_epoch_waits_for_its_terminator<B>(
+        dsn_a: &str,
+        dsn_b: &str,
+        run: &str,
+        pick: Pick<B>,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync + 'static,
+    {
+        use crate::federation::community_dek::orchestrate::sweep_rotated_epochs;
+        let l = ladder(dsn_a, dsn_b, run, pick).await;
+        let signer = ts::local_signer(&format!("em-a-{run}"));
+        let stream = format!("i779-{run}");
+        write_room(&l, &stream, 2, 0).await;
+        // The room moves on past the stream epoch's room epoch.
+        l.ba.community_dek_bump_epoch(&l.comm, &l.node_a)
+            .await
+            .unwrap();
+        l.ba.community_dek_set_retain_past_epochs(&l.comm, &l.node_a, Some(0))
+            .await
+            .unwrap();
+        let sweep = || async {
+            sweep_rotated_epochs(l.ba.as_ref(), &l.comm, &signer, chrono::Utc::now())
+                .await
+                .expect("I779: the sweep runs")
+        };
+        sweep().await;
+        let open = l.ba.stream_chunks(&stream).await.unwrap().chunks;
+        for c in &open {
+            assert!(
+                l.ba.blob_head(&c.chunk_sha).await.unwrap().is_some(),
+                "I779: the open epoch's chunk {} is kept",
+                c.seq
+            );
+        }
+        // Appends go on under the same epoch.
+        for i in 2..4u64 {
+            l.engine_a
+                .put_blob_chunk_scoped(
+                    COMMUNITY,
+                    Some(&l.comm),
+                    &stream,
+                    i,
+                    &segment(i as usize),
+                    0,
+                    None,
+                )
+                .await
+                .unwrap_or_else(|e| panic!("I779: append {i}: {e}"));
+        }
+        let epochs = l.ba.stream_dek_list(&stream).await.unwrap();
+        assert_eq!(epochs.len(), 1, "I779: one epoch, still open");
+        l.engine_a
+            .seal_stream_scoped(COMMUNITY, Some(&l.comm), &stream, None, None)
+            .await
+            .expect("I779: the stream seals, terminating the epoch");
+        let all = l.ba.stream_chunks(&stream).await.unwrap().chunks;
+        assert!(
+            all.len() >= 5,
+            "I779: four data chunks and the terminator: {}",
+            all.len()
+        );
+        let r = sweep().await;
+        assert!(r.evicted_objects >= all.len() as u64, "I779: {r:?}");
+        for c in &all {
+            assert!(
+                l.ba.blob_head(&c.chunk_sha).await.unwrap().is_none(),
+                "I779: chunk {} is swept once the epoch is terminated",
+                c.seq
+            );
+        }
     }
 
     /// **I758** — see the module doc.
@@ -1451,6 +1536,11 @@ pub(crate) mod bodies {
                 async fn i770() {
                     let Some((a, b)) = $dsn else { return };
                     i770_the_register_door_keeps_the_stream_name_rule(&a, &b, &run(), $pick).await
+                }
+                #[tokio::test]
+                async fn i779() {
+                    let Some((a, b)) = $dsn else { return };
+                    i779_an_open_stream_epoch_waits_for_its_terminator(&a, &b, &run(), $pick).await
                 }
                 #[tokio::test]
                 async fn i750() {

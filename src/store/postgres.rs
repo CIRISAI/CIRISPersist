@@ -19075,11 +19075,14 @@ impl crate::federation::BlobStorage for PostgresBackend {
         };
         let bound = i64::try_from(max_room_epoch).unwrap_or(i64::MAX);
         // One transaction: the chunk rows go, the epoch rows stay, stamped.
-        // Scoped to epochs not yet evicted, so a re-run deletes nothing.
+        // Scoped to epochs not yet evicted, so a re-run deletes nothing, and
+        // to TERMINATED epochs only (Codex r3 on #1065): an open epoch is
+        // swept once its terminator lands.
         const EPOCHS: &str = "FROM cirislens.federation_stream_deks d \
             WHERE d.group_key_id = $1 AND d.owner_key_id = $2 \
               AND d.cohort_scope IN ('community', 'affiliations') \
               AND d.room_epoch IS NOT NULL AND d.room_epoch <= $3 \
+              AND d.terminated_at IS NOT NULL \
               AND d.evicted_at IS NULL";
         let tx = client.transaction().await.map_err(be)?;
         let n = tx

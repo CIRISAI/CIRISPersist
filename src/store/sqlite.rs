@@ -17167,11 +17167,15 @@ impl crate::federation::BlobStorage for SqliteBackend {
         self.write(move |conn| -> Result<u64, rusqlite::Error> {
             // One transaction: the chunk rows go, the epoch rows stay,
             // stamped. Scoped to epochs not yet evicted, so a re-run deletes
-            // nothing and never re-stamps.
+            // nothing and never re-stamps. Codex r3 on #1065 — and to
+            // TERMINATED epochs only: an open epoch still takes chunks under
+            // its DEK, and evicting it would stamp it and leave every later
+            // chunk outside the sweep; it is swept once its terminator lands.
             const EPOCHS: &str = "FROM federation_stream_deks d \
                 WHERE d.group_key_id = ?1 AND d.owner_key_id = ?2 \
                   AND d.cohort_scope IN ('community', 'affiliations') \
                   AND d.room_epoch IS NOT NULL AND d.room_epoch <= ?3 \
+                  AND d.terminated_at IS NOT NULL \
                   AND d.evicted_at IS NULL";
             let tx = conn.transaction()?;
             let n = tx.execute(

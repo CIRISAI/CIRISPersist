@@ -2367,6 +2367,12 @@ pub trait BlobStorage: Send + Sync {
     /// or below `max_room_epoch`, and stamp the epoch rows evicted (they stay,
     /// a record). Idempotent: an evicted epoch is not counted again. Returns
     /// the chunk rows deleted.
+    ///
+    /// Codex r3 on #1065 — only a TERMINATED stream epoch is evicted. An open
+    /// one still takes chunks under its DEK; evicting it would stamp it and
+    /// leave every later chunk outside the sweep (and the stream a missing
+    /// prefix). It is swept by the first sweep after its terminator lands
+    /// (the stream's seal, or the roll that closes it).
     fn stream_dek_evict_room_chunks(
         &self,
         community_key_id: &str,
