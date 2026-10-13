@@ -804,13 +804,19 @@ where
                 // Codex r3 on #1065 — a `here` report about bytes a tombstone
                 // withholds would re-advertise them through the takedown's
                 // window; refused, as `emit_holding_claim` refuses them.
+                // The refusal is the purge family's typed one, under the SAME
+                // token `BlobError::Purged` carries, so a host matches one.
                 if let Some(notice_id) =
                     super::steward_purge::purge_withheld(backend, blob_sha256).await?
                 {
-                    return Err(Error::InvalidArgument(format!(
-                        "custody_ack_here_withheld: the bytes are withheld by takedown notice \
-                         {notice_id}; no `here` report is made about them (CC 3.1.3.3 rule 4)"
-                    )));
+                    return Err(Error::PurgeRefused {
+                        token: super::steward_purge::token::BLOB_PURGED,
+                        body: serde_json::json!({
+                            "sha256_hex": hex::encode(blob_sha256),
+                            "notice_id": notice_id,
+                            "retryable": false,
+                        }),
+                    });
                 }
                 use super::chunk_dag_cascade::orchestrate::{held_dag_completeness, DagHolding};
                 // v53.1.2 (CIRISPersist#984 row 9) — asked as THIS node, or

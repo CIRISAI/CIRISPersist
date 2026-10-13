@@ -951,7 +951,9 @@ addressed: seven repeat round 2, and the takedown-robustness ones stay with
     caller inherits it.
   - The re-ack and the conversion count such a blob as the new
     `ReackReport::withheld`, not as a failure.
-  - The custody-report door refuses `here` as `custody_ack_here_withheld`.
+  - The custody-report door refuses `here` with `Error::PurgeRefused`, token
+    `blob_purged` (`steward_purge::token::BLOB_PURGED`, the same token as
+    `BlobError::Purged`), body `{sha256_hex, notice_id, retryable: false}`.
   - Witness: I778.
 - **The room retention sweep never evicts an OPEN stream epoch**
   (`sqlite.rs` / `postgres.rs`, P1).
@@ -981,7 +983,13 @@ addressed: seven repeat round 2, and the takedown-robustness ones stay with
   - `ReackReport` gains the field `withheld`.
   - `emit_holding_claim` may now return `BlobError::Purged`.
   - A custody `here` report about withheld bytes is refused with
-    `custody_ack_here_withheld`.
+    `Error::PurgeRefused` and token `blob_purged`. That is the new
+    `steward_purge::token::BLOB_PURGED`, the same token as
+    `BlobError::Purged` (whose `kind()` now returns the constant). Python
+    receives a `ValueError` with args `("blob_purged", body_json)`. There is
+    no `custody_ack_here_withheld` string.
+  - `steward_purge::purge_withheld` is the canonical host-facing predicate
+    for whether a blob is taken down. `token::ALL` gains `blob_purged`.
 
 ### Fixed — Codex round 2 on #1065
 

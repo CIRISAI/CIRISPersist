@@ -1368,8 +1368,15 @@ pub(crate) mod blob_bodies {
         .await
         .expect_err("I778 the custody door refuses `here`");
         assert!(
-            e.to_string().contains("custody_ack_here_withheld"),
-            "I778 {e}"
+            matches!(
+                &e,
+                crate::federation::Error::PurgeRefused { token, body }
+                    if *token == crate::federation::steward_purge::token::BLOB_PURGED
+                        && body["notice_id"] == t.notice_id.as_str()
+                        && body["sha256_hex"] == hex::encode(sha).as_str()
+                        && body["retryable"] == false
+            ),
+            "I778 the custody door's refusal is PurgeRefused `blob_purged`: {e:?}"
         );
         // I802 (CIRISEdge v55) — the custody view flags the takedown, and the
         // holder reads that feed fan-out and adopt suggestions name nothing.

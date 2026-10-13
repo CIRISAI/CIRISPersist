@@ -127,6 +127,14 @@ pub mod token {
     /// notice completes it. Persist-local. Body: `{notice_id, record_count,
     /// tombstones}`.
     pub const EXECUTION_INCOMPLETE: &str = "purge_execution_incomplete";
+    /// v55.0.0 (CIRISEdge v55) — bytes a tombstone withholds
+    /// ([`purge_withheld`](super::purge_withheld)): the ONE token for "taken
+    /// down", whether a byte door refuses them as
+    /// [`BlobError::Purged`](crate::federation::BlobError::Purged) (whose
+    /// `kind()` IS this constant) or a federation-plane door (the custody
+    /// report's `here`) as [`Error::PurgeRefused`](crate::federation::Error::PurgeRefused).
+    /// Body (the federation form): `{sha256_hex, notice_id, retryable: false}`.
+    pub const BLOB_PURGED: &str = "blob_purged";
 
     /// Every token, for the registry and the from-disk witnesses.
     pub const ALL: &[&str] = &[
@@ -140,6 +148,7 @@ pub mod token {
         SELECTION_MALFORMED,
         HUMAN_SUBJECT_PENDING_NOTICE_ROW,
         EXECUTION_INCOMPLETE,
+        BLOB_PURGED,
     ];
 }
 
@@ -2625,7 +2634,17 @@ where
 }
 
 /// v54.1.0 (Codex round 3 on PR #1057) — **is this blob withheld by a
-/// purge?** `Some(notice_id)` when a steward purge tombstoned `sha256`, or
+/// purge?**
+///
+/// v55.0.0 (CIRISEdge v55) — **THE canonical, host-facing predicate for
+/// "this blob is taken down"**: a steward purge or a takedown on the CC 2.3
+/// tombstone (a counter-notice withholding, an executed immediate removal
+/// whose rows linger). Every persist door that refuses, flags or skips
+/// withheld bytes asks this one function (the write floors, the read and
+/// serve doors, `emit_holding_claim`, the custody report, the durability
+/// deficit, `blob_custody`, the holder reads); a host deciding whether to
+/// repair, replicate or advertise a blob asks it too, never a re-derivation.
+/// Refusals name it with [`token::BLOB_PURGED`]. `Some(notice_id)` when a steward purge tombstoned `sha256`, or
 /// when it is a sealed-DAG child and EVERY manifest it belongs to is withheld
 /// (transitively: a v3 child of a purged root). The byte doors refuse it from
 /// EXECUTION onward; `purge_finalize`'s hard delete still waits for the settle.

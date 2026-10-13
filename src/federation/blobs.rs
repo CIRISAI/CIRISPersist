@@ -4524,7 +4524,7 @@ impl BlobError {
             BlobError::NotPartyTo { .. } => "blob_not_party_to",
             BlobError::SealDidNotOpen { .. } => "blob_seal_did_not_open",
             BlobError::Withdrawn { .. } => "blob_withdrawn",
-            BlobError::Purged { .. } => "blob_purged",
+            BlobError::Purged { .. } => crate::federation::steward_purge::token::BLOB_PURGED,
             BlobError::StreamEpochRotationRequired { .. } => "blob_stream_epoch_rotation_required",
             BlobError::StreamEpochDekExists { .. } => "blob_stream_epoch_dek_exists",
             BlobError::StreamNotAuthored { .. } => "blob_stream_not_authored",

@@ -4074,7 +4074,18 @@ mod run {
                 "purge_selection_malformed",
                 "purge_human_subject_pending_notice_row",
                 "purge_execution_incomplete",
+                "blob_purged",
             ]
+        );
+        // One token for "taken down", on the byte doors and the federation
+        // plane: BlobError::Purged's kind IS the constant (CIRISEdge v55).
+        assert_eq!(
+            crate::federation::BlobError::Purged {
+                sha256_hex: String::new(),
+                notice_id: String::new(),
+            }
+            .kind(),
+            token::BLOB_PURGED
         );
         assert_eq!(
             crate::federation::steward_purge::TRACE_RUN_KIND_MOCK,
