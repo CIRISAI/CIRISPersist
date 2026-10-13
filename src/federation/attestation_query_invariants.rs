@@ -1,4 +1,4 @@
-//! v56.0.0 (CIRISPersist#1001) — **I900–I904: the typed bounded read.**
+//! v56.0.0 (CIRISPersist#1001) — **I900–I906: the typed bounded read.**
 //!
 //! - **I900** every query shape pages to exactly the rows its predicate
 //!   admits, in `(asserted_at, attestation_id)` order (newest or oldest
@@ -14,6 +14,18 @@
 //! - **I903** (sqlite) every shape's statement SEEKS an index and never
 //!   scans `federation_attestations`; (postgres) every statement's plan
 //!   tops out in a `Limit` node.
+//! - **I904** (in `observe/tests.rs`) the read is recorded in ONE place, the
+//!   shared wrapper.
+//! - **I905** *error is not empty* (CSD/3 rule 3): a backend fault and a
+//!   refused read come back `NotServed` (with the reason's kind), an
+//!   unmatched filter comes back `Served` with zero rows, on all three
+//!   backends.
+//! - **I906** `as_of(t)` keeps exactly the rows whose SIGNED `asserted_at <=
+//!   t`, in `ByAssertedAt` order with the id tie-break, both directions,
+//!   paged; a row landed AFTER the read, dated after `t`, never enters the
+//!   replay, and one dated at or before `t` does (the bound is the signer's
+//!   instant, not receipt time). Sqlite and postgres keep it one LIMITed
+//!   statement on an index.
 //!
 //! [`AttestationQuery::admits`]: super::attestation_query::AttestationQuery::admits
 //! [`MAX_PAGE`]: super::attestation_query::MAX_PAGE
@@ -23,7 +35,8 @@ pub(crate) mod bodies {
     use std::num::NonZeroU32;
 
     use crate::federation::attestation_query::{
-        AttestationQuery, AttestationQueryExec, AttestationReads, QueryRows, QueryTier,
+        AttestationQuery, AttestationQueryExec, AttestationReads, NotServedReason, QueryRows,
+        QueryTier, ReadOutcome,
     };
     use crate::federation::read_probe;
     use crate::federation::tier_ingest::test_support as ts;
@@ -105,24 +118,24 @@ pub(crate) mod bodies {
         // One live row per (subject, leaf): a second needs a `supersedes`.
         // A about A: three config:a* leaves (two tied), two config:b*
         // leaves (one tied with an A→B row), other:x.
-        rows.push(put_scores(d, &a, &a, "config:a:v1", -60).await);
-        rows.push(put_scores(d, &a, &a, "config:a2:v1", -50).await);
-        rows.push(put_scores(d, &a, &a, "config:a3:v1", -50).await);
-        rows.push(put_scores(d, &a, &a, "config:b:v1", -40).await);
-        rows.push(put_scores(d, &a, &a, "config:b2:v1", -30).await);
+        rows.push(put_scores(d, &a, &a, "i900x:a:v1", -60).await);
+        rows.push(put_scores(d, &a, &a, "i900x:a2:v1", -50).await);
+        rows.push(put_scores(d, &a, &a, "i900x:a3:v1", -50).await);
+        rows.push(put_scores(d, &a, &a, "i900x:b:v1", -40).await);
+        rows.push(put_scores(d, &a, &a, "i900x:b2:v1", -30).await);
         rows.push(put_scores(d, &a, &a, "other:x:v1", -20).await);
         // A about B and C, one tied with A's config:b2.
-        rows.push(put_scores(d, &a, &b, "config:a:v1", -30).await);
-        rows.push(put_scores(d, &a, &b, "config:ab:v1", -10).await);
-        rows.push(put_scores(d, &a, &c, "config:a:v1", -25).await);
+        rows.push(put_scores(d, &a, &b, "i900x:a:v1", -30).await);
+        rows.push(put_scores(d, &a, &b, "i900x:ab:v1", -10).await);
+        rows.push(put_scores(d, &a, &c, "i900x:a:v1", -25).await);
         // B about A.
-        rows.push(put_scores(d, &b, &a, "config:c:v1", -45).await);
-        rows.push(put_scores(d, &b, &a, "config:c2:v1", -5).await);
+        rows.push(put_scores(d, &b, &a, "i900x:c:v1", -45).await);
+        rows.push(put_scores(d, &b, &a, "i900x:c2:v1", -5).await);
         // C noise.
         for (leaf, m) in [
-            ("config:a:v1", -55),
-            ("config:a2:v1", -35),
-            ("config:a3:v1", -15),
+            ("i900x:a:v1", -55),
+            ("i900x:a2:v1", -35),
+            ("i900x:a3:v1", -15),
         ] {
             rows.push(put_scores(d, &c, &c, leaf, m).await);
         }
@@ -146,7 +159,7 @@ pub(crate) mod bodies {
                 weight: None,
                 expires_at: None,
                 attestation_envelope: crate::federation::envelope::EnvelopeCore::from_value(
-                    serde_json::json!({ "dimension": "config:a:v1" }),
+                    serde_json::json!({ "dimension": "i900x:a:v1" }),
                 )
                 .unwrap(),
                 subject_key_ids: vec![],
@@ -161,6 +174,7 @@ pub(crate) mod bodies {
         let local = d
             .query_attestations(&AttestationQuery::by(&a, NonZeroU32::MIN).tier(QueryTier::Local))
             .await
+            .served()
             .expect("local read")
             .rows;
         assert_eq!(local.len(), 1, "I900 one local row");
@@ -170,7 +184,7 @@ pub(crate) mod bodies {
             by: a.clone(),
             to: a.clone(),
             kind: attestation_type::SCORES.into(),
-            dimension: Some("config:a:v1".into()),
+            dimension: Some("i900x:a:v1".into()),
             at: local[0].asserted_at,
             local: true,
         });
@@ -209,15 +223,15 @@ pub(crate) mod bodies {
             ));
             out.push((
                 "by A, prefix config:",
-                o(AttestationQuery::by(a, lim).dimension_prefix("config:")),
-                expect(corpus, |r| fed(r) && r.by == a && dim(r, "config:"), oldest),
+                o(AttestationQuery::by(a, lim).dimension_prefix("i900x:")),
+                expect(corpus, |r| fed(r) && r.by == a && dim(r, "i900x:"), oldest),
             ));
             out.push((
                 "by A, exact config:a:v1",
-                o(AttestationQuery::by(a, lim).dimension("config:a:v1")),
+                o(AttestationQuery::by(a, lim).dimension("i900x:a:v1")),
                 expect(
                     corpus,
-                    |r| fed(r) && r.by == a && r.dimension.as_deref() == Some("config:a:v1"),
+                    |r| fed(r) && r.by == a && r.dimension.as_deref() == Some("i900x:a:v1"),
                     oldest,
                 ),
             ));
@@ -239,19 +253,19 @@ pub(crate) mod bodies {
                 "by A, withdraws+scores excluding config:a:v1",
                 o(AttestationQuery::by(a, lim)
                     .types(&[attestation_type::SCORES, attestation_type::WITHDRAWS])
-                    .excluding_dimensions(&["config:a:v1"])),
+                    .excluding_dimensions(&["i900x:a:v1"])),
                 expect(
                     corpus,
-                    |r| fed(r) && r.by == a && r.dimension.as_deref() != Some("config:a:v1"),
+                    |r| fed(r) && r.by == a && r.dimension.as_deref() != Some("i900x:a:v1"),
                     oldest,
                 ),
             ));
             out.push((
                 "by A excluding config:a:v1 (no type)",
-                o(AttestationQuery::by(a, lim).excluding_dimensions(&["config:a:v1"])),
+                o(AttestationQuery::by(a, lim).excluding_dimensions(&["i900x:a:v1"])),
                 expect(
                     corpus,
-                    |r| fed(r) && r.by == a && r.dimension.as_deref() != Some("config:a:v1"),
+                    |r| fed(r) && r.by == a && r.dimension.as_deref() != Some("i900x:a:v1"),
                     oldest,
                 ),
             ));
@@ -259,10 +273,10 @@ pub(crate) mod bodies {
                 "to B by A prefix config:a",
                 o(AttestationQuery::to(b, lim)
                     .authored_by(a)
-                    .dimension_prefix("config:a")),
+                    .dimension_prefix("i900x:a")),
                 expect(
                     corpus,
-                    |r| fed(r) && r.to == b && r.by == a && dim(r, "config:a"),
+                    |r| fed(r) && r.to == b && r.by == a && dim(r, "i900x:a"),
                     oldest,
                 ),
             ));
@@ -294,7 +308,7 @@ pub(crate) mod bodies {
                 "I901 {tag}: more pages than rows allow (cursor ignored?)"
             );
             let _ = read_probe::take();
-            let page = d.query_attestations(&q).await.expect("page");
+            let page = d.query_attestations(&q).await.served().expect("page");
             let log = read_probe::take();
             assert!(
                 page.rows.len() <= limit as usize,
@@ -375,28 +389,148 @@ pub(crate) mod bodies {
         let corpus = seed(d, s).await;
         let q = AttestationQuery::by(&corpus.a, NonZeroU32::MIN);
         match Overreturning(d).query_attestations(&q).await {
-            Err(Error::Backend(m)) => assert!(m.contains("past its page"), "{m}"),
+            ReadOutcome::NotServed(NotServedReason::Fault(Error::Backend(m))) => {
+                assert!(m.contains("past its page"), "{m}");
+            }
             other => panic!("I902 an over-returning executor is refused, got {other:?}"),
         }
+        let refused = |o: ReadOutcome| {
+            matches!(
+                o,
+                ReadOutcome::NotServed(NotServedReason::Refused(Error::InvalidArgument(_)))
+            )
+        };
+        let mut unpinned = q.clone();
+        unpinned.by = None;
+        assert!(refused(d.query_attestations(&unpinned).await));
+        let mut huge = q.clone();
+        huge.limit = NonZeroU32::new(crate::federation::attestation_query::MAX_PAGE + 1).unwrap();
+        assert!(refused(d.query_attestations(&huge).await));
+        let page = d.query_attestations(&q).await.served().unwrap();
+        let mut c = page.next.expect("A has more than one row");
+        c.version = "v0".into();
+        assert!(refused(
+            d.query_attestations(&q.clone().after(Some(c))).await
+        ));
+    }
+
+    /// **I905** — error is not empty. `d` is the real backend; it is wrapped
+    /// in the fault double for the fault and the proxy refusal.
+    pub async fn i905_not_served_is_never_an_empty_page(
+        d: std::sync::Arc<dyn FederationDirectory>,
+        s: &str,
+    ) {
+        use crate::federation::directory_double::FaultInjectingDirectory;
+        let corpus = seed(&*d, s).await;
+        // Served, zero rows: the filter matches nothing.
+        let unmatched = AttestationQuery::by(&corpus.a, NonZeroU32::MIN).dimension("i905:never:v1");
+        match d.query_attestations(&unmatched).await {
+            ReadOutcome::Served(p) => {
+                assert!(p.rows.is_empty() && p.next.is_none(), "I905 {p:?}");
+            }
+            other => panic!("I905 an unmatched filter is Served(empty), got {other:?}"),
+        }
+        // And an unknown key: still Served(empty).
+        let nobody = AttestationQuery::to(&format!("i905-nobody-{s}"), NonZeroU32::MIN);
+        assert!(matches!(
+            d.query_attestations(&nobody).await,
+            ReadOutcome::Served(ref p) if p.rows.is_empty()
+        ));
+        // A matching query, for the faults below: Served with rows.
+        let q = AttestationQuery::by(&corpus.a, NonZeroU32::MIN);
+        assert!(matches!(
+            d.query_attestations(&q).await,
+            ReadOutcome::Served(ref p) if p.rows.len() == 1
+        ));
+        // A backend fault: NotServed(Fault), never Served(empty).
+        let faulting =
+            FaultInjectingDirectory::new(d.clone()).erroring("execute_attestation_query");
+        match faulting.query_attestations(&q).await {
+            ReadOutcome::NotServed(NotServedReason::Fault(Error::Backend(m))) => {
+                assert!(m.contains("injected"), "{m}");
+            }
+            other => panic!("I905 a backend fault is NotServed(Fault), got {other:?}"),
+        }
+        // The `?` form propagates it as an error, not as zero rows.
+        assert!(faulting.query_attestations(&q).await.served().is_err());
+        let mut pages = q.clone().pages();
+        assert!(
+            pages.next(&faulting).await.is_err(),
+            "I905 a fold sees the fault"
+        );
+        // A directory that does not serve the read (a proxy): NotServed(Refused).
+        let proxy =
+            FaultInjectingDirectory::new(d.clone()).unsupported("execute_attestation_query");
+        assert!(matches!(
+            proxy.query_attestations(&q).await,
+            ReadOutcome::NotServed(NotServedReason::Refused(Error::Unsupported { .. }))
+        ));
+        // A refused query (no pinned key): NotServed(Refused), on the real
+        // backend.
         let mut unpinned = q.clone();
         unpinned.by = None;
         assert!(matches!(
             d.query_attestations(&unpinned).await,
-            Err(Error::InvalidArgument(_))
+            ReadOutcome::NotServed(NotServedReason::Refused(Error::InvalidArgument(_)))
         ));
-        let mut huge = q.clone();
-        huge.limit = NonZeroU32::new(crate::federation::attestation_query::MAX_PAGE + 1).unwrap();
-        assert!(matches!(
-            d.query_attestations(&huge).await,
-            Err(Error::InvalidArgument(_))
-        ));
-        let page = d.query_attestations(&q).await.unwrap();
-        let mut c = page.next.expect("A has more than one row");
-        c.version = "v0".into();
-        assert!(matches!(
-            d.query_attestations(&q.clone().after(Some(c))).await,
-            Err(Error::InvalidArgument(_))
-        ));
+    }
+
+    /// **I906** — `as_of` replays by the signed instant.
+    pub async fn i906_as_of_replays_by_the_signed_instant(d: &dyn FederationDirectory, s: &str) {
+        let corpus = seed(d, s).await;
+        let a = corpus.a.clone();
+        let fed_by_a = |r: &Row| !r.local && r.by == a;
+        // Cut points: before everything, on a tie (-50: two rows), between
+        // rows, and after everything.
+        let cuts = [-61_i64, -50, -26, 0];
+        for minute in cuts {
+            let t = base() + chrono::Duration::minutes(minute);
+            for oldest in [false, true] {
+                let mut q = AttestationQuery::by(&a, NonZeroU32::MIN).as_of(t);
+                if oldest {
+                    q = q.oldest_first();
+                }
+                let want = expect(&corpus, |r| fed_by_a(r) && r.at <= t, oldest);
+                for limit in [1, 2, 50] {
+                    let got = page_through(d, q.clone(), limit, want.len(), "I906").await;
+                    assert_eq!(
+                        got, want,
+                        "I906 as_of {minute} (limit {limit}, oldest {oldest})"
+                    );
+                }
+            }
+        }
+        // Replay: the as-of(-26) view, read now.
+        let t = base() + chrono::Duration::minutes(-26);
+        let q = AttestationQuery::by(&a, NonZeroU32::new(50).unwrap()).as_of(t);
+        let before = d.query_attestations(&q).await.served().unwrap().rows;
+        // A row RECEIVED now but SIGNED at -40 (inside the view) enters it; a
+        // row received now and signed at -25 (after t) does not — even though
+        // both landed after the first read.
+        let inside = put_scores(d, &a, &corpus.b, "i900x:i906in:v1", -40).await;
+        let outside = put_scores(d, &a, &corpus.b, "i900x:i906out:v1", -25).await;
+        let after = d.query_attestations(&q).await.served().unwrap().rows;
+        let ids: Vec<&str> = after.iter().map(|r| r.attestation_id.as_str()).collect();
+        assert!(
+            ids.contains(&inside.id.as_str()),
+            "I906 a row dated <= t is in the view"
+        );
+        assert!(
+            !ids.contains(&outside.id.as_str()),
+            "I906 a row dated > t never enters the as-of view"
+        );
+        assert_eq!(
+            after.len(),
+            before.len() + 1,
+            "I906 only the inside row joined"
+        );
+        // The order is the signed instant, ties by id: recompute by hand.
+        let mut sorted = after.clone();
+        sorted.sort_by(|x, y| {
+            (y.asserted_at, y.attestation_id.as_str())
+                .cmp(&(x.asserted_at, x.attestation_id.as_str()))
+        });
+        assert_eq!(after, sorted, "I906 ByAssertedAt(Desc), id tie-break");
     }
 }
 
@@ -415,6 +549,24 @@ mod runners {
                 async fn i900_every_shape_pages_to_its_oracle() {
                     let Some(d) = $fresh.await else { return };
                     super::super::bodies::i900_every_shape_pages_to_its_oracle(
+                        &d as &dyn FederationDirectory,
+                        &suffix(),
+                    )
+                    .await
+                }
+                #[tokio::test]
+                async fn i905_not_served_is_never_an_empty_page() {
+                    let Some(d) = $fresh.await else { return };
+                    super::super::bodies::i905_not_served_is_never_an_empty_page(
+                        std::sync::Arc::new(d),
+                        &suffix(),
+                    )
+                    .await
+                }
+                #[tokio::test]
+                async fn i906_as_of_replays_by_the_signed_instant() {
+                    let Some(d) = $fresh.await else { return };
+                    super::super::bodies::i906_as_of_replays_by_the_signed_instant(
                         &d as &dyn FederationDirectory,
                         &suffix(),
                     )
@@ -471,15 +623,25 @@ mod runners {
         d.run_migrations().await.unwrap();
         let corpus = super::bodies::seed(&d, &suffix()).await;
         let mut shapes = super::bodies::shapes(&corpus);
-        // And one with a cursor.
-        let mut q = shapes[0].1.clone();
-        q.after = Some(
-            crate::ceg::list::federation::AttestationCursor::from_trailing(
-                chrono::Utc::now(),
-                "x".into(),
-            ),
-        );
-        shapes.push(("cursor", q, vec![]));
+        // And every shape with a cursor.
+        let cursor: Vec<_> = shapes
+            .iter()
+            .map(|(_, q, _)| {
+                let c = crate::ceg::list::federation::AttestationCursor::from_trailing(
+                    chrono::Utc::now(),
+                    "x".into(),
+                );
+                ("cursor", q.clone().after(Some(c)), vec![])
+            })
+            .collect();
+        shapes.extend(cursor);
+        // And every shape as of an instant (I906): one more range term on
+        // the same index.
+        let as_of: Vec<_> = shapes
+            .iter()
+            .map(|(_, q, _)| ("as_of", q.clone().as_of(chrono::Utc::now()), vec![]))
+            .collect();
+        shapes.extend(as_of);
         for (tag, q, _) in shapes {
             let stmt = render_sql(
                 &q,
@@ -553,7 +715,13 @@ mod runners {
         d.run_migrations().await.unwrap();
         let corpus = super::bodies::seed(&d, &suffix()).await;
         let client = d.get_client().await.unwrap();
-        for (tag, q, _) in super::bodies::shapes(&corpus) {
+        let mut shapes = super::bodies::shapes(&corpus);
+        let as_of: Vec<_> = shapes
+            .iter()
+            .map(|(_, q, _)| ("as_of", q.clone().as_of(chrono::Utc::now()), vec![]))
+            .collect();
+        shapes.extend(as_of);
+        for (tag, q, _) in shapes {
             let stmt = render_sql(
                 &q,
                 Dialect::Postgres,

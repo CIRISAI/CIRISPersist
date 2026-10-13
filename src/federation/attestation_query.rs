@@ -18,10 +18,27 @@
 //! probe and the per-door counters are a property of this wrapper, not of
 //! any backend method.
 //!
-//! **Order and cursor.** Rows come in `(asserted_at, attestation_id)` order,
-//! newest first by default; the cursor is the trailing row's pair, the same
-//! [`AttestationCursor`] the paged read surfaces use. The backend fetches one
-//! row past the limit, so `next` is `Some` exactly when another row exists.
+//! **Order and cursor.** Rows come in `(asserted_at, attestation_id)` order
+//! ([`QueryOrder::ByAssertedAt`], descending by default): the SIGNED instant,
+//! never receipt time, with the id as the deterministic tie-break. The cursor
+//! is the trailing row's pair, the same [`AttestationCursor`] the paged read
+//! surfaces use. The backend fetches one row past the limit, so `next` is
+//! `Some` exactly when another row exists.
+//!
+//! **Replayable as of an instant.** [`AttestationQuery::as_of`] keeps only
+//! rows whose signed `asserted_at <= t` (CIRISServer `FSD/TOPOLOGY.md` §4.1,
+//! CIRISConstitution#131 §5): a fold `V(rows, t)` over the pages of an
+//! `as_of(t)` query is the same on every node and at every later moment,
+//! because no row a later write lands can enter it unless its signer dated it
+//! at or before `t`. The bound is one more range term on the same index.
+//!
+//! **Error is not empty.** [`AttestationReads::query_attestations`] returns a
+//! [`ReadOutcome`]: [`ReadOutcome::Served`] with a [`Page`] (possibly empty —
+//! the store answered, and nothing matched) or [`ReadOutcome::NotServed`] with
+//! the reason (the query was refused, or the backend failed). A refused or
+//! failed read cannot be read as "no rows": the empty page exists only inside
+//! `Served` (CIRISClient `CSD.md` v3.0 §2, CSD/3 rule 3; CIRISRegistry
+//! `FSD/CSD/README.md`).
 //!
 //! [`FederationDirectory::execute_attestation_query`]: super::FederationDirectory::execute_attestation_query
 
@@ -85,14 +102,38 @@ impl QueryTier {
     }
 }
 
-/// The order rows come in, by `(asserted_at, attestation_id)`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// A sort direction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Direction {
+    /// Ascending (oldest first).
+    Asc,
+    /// Descending (newest first).
+    Desc,
+}
+
+/// The order rows come in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueryOrder {
-    /// Newest first.
-    #[default]
-    NewestFirst,
-    /// Oldest first.
-    OldestFirst,
+    /// By the row's SIGNED `asserted_at` (never receipt time), ties broken by
+    /// `attestation_id` (byte order), so the order — and every page cut from
+    /// it — is the same on every backend and every replay.
+    ByAssertedAt(Direction),
+}
+
+impl Default for QueryOrder {
+    fn default() -> Self {
+        QueryOrder::ByAssertedAt(Direction::Desc)
+    }
+}
+
+impl QueryOrder {
+    /// The direction.
+    #[must_use]
+    pub const fn direction(self) -> Direction {
+        match self {
+            QueryOrder::ByAssertedAt(d) => d,
+        }
+    }
 }
 
 /// One bounded attestation read. Built with [`AttestationQuery::by`] or
@@ -119,6 +160,8 @@ pub struct AttestationQuery {
     pub limit: NonZeroU32,
     /// Start after this row (exclusive), in [`Self::order`].
     pub after: Option<AttestationCursor>,
+    /// Only rows whose SIGNED `asserted_at` is at or before this instant.
+    pub as_of: Option<DateTime<Utc>>,
 }
 
 impl AttestationQuery {
@@ -130,9 +173,10 @@ impl AttestationQuery {
             types: Vec::new(),
             excluded_dimensions: Vec::new(),
             tier: QueryTier::Federation,
-            order: QueryOrder::NewestFirst,
+            order: QueryOrder::ByAssertedAt(Direction::Desc),
             limit,
             after: None,
+            as_of: None,
         }
     }
 
@@ -190,10 +234,24 @@ impl AttestationQuery {
         self
     }
 
-    /// Oldest first.
+    /// Oldest first (`ByAssertedAt(Asc)`).
     #[must_use]
     pub fn oldest_first(mut self) -> Self {
-        self.order = QueryOrder::OldestFirst;
+        self.order = QueryOrder::ByAssertedAt(Direction::Asc);
+        self
+    }
+
+    /// Order by the signed instant in `direction`.
+    #[must_use]
+    pub fn order(mut self, order: QueryOrder) -> Self {
+        self.order = order;
+        self
+    }
+
+    /// Only rows whose signed `asserted_at <= t`.
+    #[must_use]
+    pub fn as_of(mut self, t: DateTime<Utc>) -> Self {
+        self.as_of = Some(t);
         self
     }
 
@@ -274,12 +332,13 @@ impl AttestationQuery {
             }
             && (self.types.is_empty() || self.types.contains(&a.attestation_type))
             && !dimension.is_some_and(|d| self.excluded_dimensions.iter().any(|x| x == d))
+            && self.as_of.is_none_or(|t| a.asserted_at <= t)
             && self.after.as_ref().is_none_or(|c| {
                 let here = (a.asserted_at, a.attestation_id.as_str());
                 let mark = (c.last_asserted_at, c.last_attestation_id.as_str());
-                match self.order {
-                    QueryOrder::NewestFirst => here < mark,
-                    QueryOrder::OldestFirst => here > mark,
+                match self.order.direction() {
+                    Direction::Desc => here < mark,
+                    Direction::Asc => here > mark,
                 }
             })
     }
@@ -289,9 +348,9 @@ impl AttestationQuery {
         rows.sort_by(|a, b| {
             let o = (a.asserted_at, a.attestation_id.as_str())
                 .cmp(&(b.asserted_at, b.attestation_id.as_str()));
-            match self.order {
-                QueryOrder::NewestFirst => o.reverse(),
-                QueryOrder::OldestFirst => o,
+            match self.order.direction() {
+                Direction::Desc => o.reverse(),
+                Direction::Asc => o,
             }
         });
     }
@@ -356,7 +415,7 @@ impl Pages {
         if self.done {
             return Ok(None);
         }
-        let page = dir.query_attestations(&self.query).await?;
+        let page = dir.query_attestations(&self.query).await.served()?;
         match page.next {
             Some(c) => self.query.after = Some(c),
             None => self.done = true,
@@ -387,40 +446,102 @@ where
     }
 }
 
+/// Why a read was not served. Never a row count: a refused or failed read
+/// carries its reason, and only [`ReadOutcome::Served`] carries rows.
+#[derive(Debug)]
+pub enum NotServedReason {
+    /// The query was refused before any statement ran
+    /// ([`AttestationQuery::validate`]: no pinned key, a page above
+    /// [`MAX_PAGE`], an unknown cursor version), or the directory does not
+    /// serve this read at all (a proxy's `Unsupported`).
+    Refused(Error),
+    /// The backend failed: the statement errored, or the executor broke the
+    /// page contract (returned rows past `limit + 1`, a dropped LIMIT).
+    Fault(Error),
+}
+
+impl NotServedReason {
+    /// The underlying error.
+    #[must_use]
+    pub fn into_error(self) -> Error {
+        match self {
+            NotServedReason::Refused(e) | NotServedReason::Fault(e) => e,
+        }
+    }
+}
+
+/// The outcome of one typed read: served (with a page, possibly empty) or not
+/// served (with the reason). The two are structurally distinct: "the store
+/// answered and nothing matched" is `Served` with zero rows, and nothing else
+/// is.
+#[derive(Debug)]
+#[must_use = "a read outcome may be NotServed; an ignored outcome is an ignored error"]
+pub enum ReadOutcome {
+    /// The store answered; the page holds what matched (maybe nothing).
+    Served(Page),
+    /// The store did not answer; the reason says why.
+    NotServed(NotServedReason),
+}
+
+impl ReadOutcome {
+    /// The page, or the reason as an error — the `?` form every fold uses:
+    /// a not-served read propagates as an error and can never become an
+    /// empty row set.
+    ///
+    /// # Errors
+    ///
+    /// The [`NotServedReason`]'s error.
+    pub fn served(self) -> Result<Page, Error> {
+        match self {
+            ReadOutcome::Served(p) => Ok(p),
+            ReadOutcome::NotServed(r) => Err(r.into_error()),
+        }
+    }
+
+    /// Whether the store answered.
+    #[must_use]
+    pub fn is_served(&self) -> bool {
+        matches!(self, ReadOutcome::Served(_))
+    }
+}
+
 /// The read every caller makes: validate, run, cut the page, mint the
 /// cursor, and record the read once (the per-door counters and, under test,
 /// the read probe). Blanket-implemented, so no implementor can override it.
 #[async_trait::async_trait]
 pub trait AttestationReads: AttestationQueryExec {
-    /// One page of `q`.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::InvalidArgument`] for a query [`AttestationQuery::validate`]
-    /// refuses; otherwise whatever the backend returns.
-    async fn query_attestations(&self, q: &AttestationQuery) -> Result<Page, Error>;
+    /// One page of `q`, or why it was not served.
+    async fn query_attestations(&self, q: &AttestationQuery) -> ReadOutcome;
 }
 
 #[async_trait::async_trait]
 impl<E: AttestationQueryExec + ?Sized> AttestationReads for E {
-    async fn query_attestations(&self, q: &AttestationQuery) -> Result<Page, Error> {
-        q.validate()?;
+    async fn query_attestations(&self, q: &AttestationQuery) -> ReadOutcome {
+        if let Err(e) = q.validate() {
+            return ReadOutcome::NotServed(NotServedReason::Refused(e));
+        }
         let QueryRows {
             mut rows,
             bytes,
             backend,
-        } = self.run_attestation_query(q).await?;
+        } = match self.run_attestation_query(q).await {
+            Ok(r) => r,
+            Err(e @ Error::Unsupported { .. }) => {
+                return ReadOutcome::NotServed(NotServedReason::Refused(e))
+            }
+            Err(e) => return ReadOutcome::NotServed(NotServedReason::Fault(e)),
+        };
         // The bound is the wrapper's to enforce, not each backend's to
         // remember: an executor that returned more than one row past the
         // page dropped its LIMIT, and its read was as wide as the slice.
         if rows.len() > q.fetch() {
-            return Err(Error::Backend(format!(
+            return ReadOutcome::NotServed(NotServedReason::Fault(Error::Backend(format!(
                 "execute_attestation_query returned {} rows past its page of {} \
                  (limit {} + 1)",
                 rows.len() - q.fetch(),
                 q.fetch(),
                 q.limit
-            )));
+            ))));
         }
         let limit = q.limit.get() as usize;
         let next = if rows.len() > limit {
@@ -431,7 +552,7 @@ impl<E: AttestationQueryExec + ?Sized> AttestationReads for E {
             None
         };
         crate::observe::record_query_read(backend, q, &rows, bytes);
-        Ok(Page { rows, next })
+        ReadOutcome::Served(Page { rows, next })
     }
 }
 
@@ -490,6 +611,16 @@ pub fn render_sql(q: &AttestationQuery, dialect: Dialect, table: &str, columns: 
     let id = match dialect {
         Dialect::Sqlite => "attestation_id",
         Dialect::Postgres => "attestation_id::text COLLATE \"C\"",
+    };
+    // On sqlite a narrowed query must seek its narrow index; any term on a
+    // bare `asserted_at` (the order, the as-of bound, the cursor) is a range
+    // the key's `(key, asserted_at)` index also serves, and the planner then
+    // walks the key's whole slice to test each row (v53.1.6, I545). The
+    // unary plus makes every such term unindexable, so the narrow index wins.
+    let pin = if dialect == Dialect::Sqlite && q.seeks_narrow_index() {
+        "+"
+    } else {
+        ""
     };
     let mut parts: Vec<String> = Vec::new();
     if let Some(k) = &q.by {
@@ -554,22 +685,21 @@ pub fn render_sql(q: &AttestationQuery, dialect: Dialect, table: &str, columns: 
             phs.join(", ")
         ));
     }
-    let (cmp, dir) = match q.order {
-        QueryOrder::NewestFirst => ("<", "DESC"),
-        QueryOrder::OldestFirst => (">", "ASC"),
+    if let Some(t) = q.as_of {
+        binds.push(Bind::Time(t));
+        parts.push(format!("{pin}asserted_at <= {}", ph(&binds)));
+    }
+    let (cmp, dir) = match q.order.direction() {
+        Direction::Desc => ("<", "DESC"),
+        Direction::Asc => (">", "ASC"),
     };
     if let Some(c) = &q.after {
         binds.push(Bind::Time(c.last_asserted_at));
         let a = ph(&binds);
         binds.push(Bind::Text(c.last_attestation_id.clone()));
         let b = ph(&binds);
-        parts.push(format!("(asserted_at, {id}) {cmp} ({a}, {b})"));
+        parts.push(format!("({pin}asserted_at, {id}) {cmp} ({a}, {b})"));
     }
-    let pin = if dialect == Dialect::Sqlite && q.seeks_narrow_index() {
-        "+"
-    } else {
-        ""
-    };
     binds.push(Bind::Int(i64::from(q.limit.get()) + 1));
     let limit = ph(&binds);
     Statement {
