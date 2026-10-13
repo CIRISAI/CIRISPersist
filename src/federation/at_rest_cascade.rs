@@ -2387,11 +2387,23 @@ pub mod orchestrate {
         for h in candidates {
             // Ever bound by anyone else — live, lapsed or withdrawn, which also
             // covers a live foreign owner and an ambiguous one.
-            if backend.list_attestations_for(&h).await?.iter().any(|a| {
-                a.attestation_type == attestation_type::DELEGATES_TO
-                    && is_owner_binding_envelope(&a.attestation_envelope)
-                    && a.attesting_key_id != member_key_id
-            }) {
+            let mut bound_by_another = false;
+            let mut pages = crate::federation::attestation_query::AttestationQuery::to(
+                &h,
+                crate::federation::attestation_query::FOLD_PAGE,
+            )
+            .types(&[attestation_type::DELEGATES_TO])
+            .pages();
+            while let Some(page) = pages.next(backend).await? {
+                if page.iter().any(|a| {
+                    is_owner_binding_envelope(&a.attestation_envelope)
+                        && a.attesting_key_id != member_key_id
+                }) {
+                    bound_by_another = true;
+                    break;
+                }
+            }
+            if bound_by_another {
                 continue;
             }
             if backend

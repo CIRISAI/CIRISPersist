@@ -294,6 +294,54 @@ pub(crate) mod bodies {
         assert!(!flag.flagged, "I909 noise flags nothing");
         assert_narrowed(&read_probe::take(), &k, n, "I909 content class");
     }
+
+    /// **I911** — the custody/config/index plane: a holder's custody claims
+    /// (`held_by`), a producer's retractions (the deletion window), a root's
+    /// conferral of a mesh-config author, a member's candidate holders (the
+    /// at-rest cascade) read narrowed; the subject's wire refs walk its slice
+    /// in pages, each row once.
+    pub async fn i911_custody_config_and_index_folds_read_bounded(d: &dyn FederationDirectory) {
+        let (k, other) = keys(d, "i911").await;
+        let n = 7;
+        noise(d, &k, &other, n).await;
+        noise(d, &other, &k, n).await;
+        let now = chrono::Utc::now();
+
+        let _ = read_probe::take();
+        let held = crate::federation::holding_claim::held_by(d, &k, now, false)
+            .await
+            .expect("I911 held_by");
+        assert!(held.is_empty(), "I911 noise is no custody claim");
+        assert_narrowed(&read_probe::take(), &k, n, "I911 held_by");
+
+        let _ = read_probe::take();
+        let retracted = crate::federation::deletion_window::producer_retracted_ids(d, &k)
+            .await
+            .expect("I911 producer retractions");
+        assert!(retracted.is_empty(), "I911 noise retracts nothing");
+        assert_narrowed(&read_probe::take(), &k, n, "I911 producer_retracted_ids");
+
+        // `other` authored n rows about `k`: the root's conferral read pins
+        // both and one dimension.
+        let _ = read_probe::take();
+        crate::federation::mesh_config::root_authorizes_author(d, &other, &k, now)
+            .await
+            .expect("I911 root authorizes author");
+        assert_narrowed(&read_probe::take(), &k, n, "I911 root_authorizes_author");
+
+        let _ = read_probe::take();
+        let refs = crate::federation::wire_index::wire_refs_for_subject(d, &k)
+            .await
+            .expect("I911 wire refs");
+        assert!(
+            refs.iter()
+                .filter(|(kind, _, _)| *kind == "Attestation")
+                .count()
+                >= n,
+            "I911 every row about the subject is a ref"
+        );
+        assert_walked(&read_probe::take(), &k, n, "I911 wire_refs_for_subject");
+    }
 }
 
 #[cfg(test)]
@@ -306,6 +354,14 @@ mod runners {
                 async fn i908_consent_and_audience_folds_read_bounded() {
                     let Some(d) = $fresh.await else { return };
                     super::super::bodies::i908_consent_and_audience_folds_read_bounded(
+                        &d as &dyn FederationDirectory,
+                    )
+                    .await
+                }
+                #[tokio::test]
+                async fn i911_custody_config_and_index_folds_read_bounded() {
+                    let Some(d) = $fresh.await else { return };
+                    super::super::bodies::i911_custody_config_and_index_folds_read_bounded(
                         &d as &dyn FederationDirectory,
                     )
                     .await

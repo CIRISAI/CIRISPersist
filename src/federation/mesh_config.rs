@@ -113,6 +113,7 @@
 
 use chrono::{DateTime, Duration, Utc};
 
+use super::attestation_query::{AttestationQuery, FOLD_PAGE};
 use super::types::Attestation;
 use super::{Error, FederationDirectory};
 
@@ -1609,7 +1610,7 @@ pub fn fold_mesh_config(
 /// `HUMANITY_ACCORD` signatures to `EmergencyShutdown` and its named siblings
 /// and says the mesh-config author is *"never the accord's ceremony plane"*.
 /// Widening that scope is the thing CIRISConstitution#57 was opened to avoid.
-async fn root_authorizes_author<F>(
+pub(crate) async fn root_authorizes_author<F>(
     directory: &F,
     root_ref: &str,
     author: &str,
@@ -1621,8 +1622,26 @@ where
     if root_ref == author {
         return Ok(AuthorAuthority::Inherent);
     }
-    let by_root = match directory.list_attestations_by(root_ref).await {
-        Ok(rows) => rows,
+    // The root's conferrals to the author and the root's composers naming
+    // them — the rows the tombstone fold and the filter below read (the
+    // trust-root walks' shape, v53.1.7).
+    let mut rows = Vec::new();
+    let mut pages = AttestationQuery::by(root_ref, FOLD_PAGE)
+        .attested_to(author)
+        .types(&[super::types::attestation_type::DELEGATES_TO])
+        .dimension(super::trust_root::TRUST_CONFERS_DIMENSION)
+        .pages();
+    let read: Result<(), Error> = async {
+        while let Some(page) = pages.next(directory).await? {
+            rows.extend(page);
+        }
+        Ok(())
+    }
+    .await;
+    let by_root = match read {
+        Ok(()) => {
+            super::trust_root::with_slice_composers(directory, rows, None, Some(root_ref)).await?
+        }
         Err(Error::Unsupported { .. }) => Vec::new(),
         Err(e) => return Err(e),
     };
@@ -1664,7 +1683,7 @@ where
 /// predicate on their side, correctly, because a second copy of an authority
 /// rule is the drift shape this module exists to avoid.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum AuthorAuthority {
+pub(crate) enum AuthorAuthority {
     /// The author IS the root. There is no delegation, because none is needed:
     /// *"1-of-1 is a legitimate quorum for a root you alone own"*. Nothing to
     /// bind [`field::DELEGATION_ID`] to, so the door keeps requiring it
@@ -1871,11 +1890,23 @@ where
     }
 
     // ── Rows this root already holds on this key — the two history gates.
-    let held = match directory.list_attestations_for(&root_ref).await {
-        Ok(rows) => rows,
-        Err(Error::Unsupported { .. }) => Vec::new(),
+    // The root's `mesh_config:*` rows: the only rows `parse_row` accepts.
+    let mut held = Vec::new();
+    let mut pages = AttestationQuery::to(&root_ref, FOLD_PAGE)
+        .dimension_prefix(DIMENSION_PREFIX)
+        .pages();
+    let read: Result<(), Error> = async {
+        while let Some(page) = pages.next(directory).await? {
+            held.extend(page);
+        }
+        Ok(())
+    }
+    .await;
+    match read {
+        Ok(()) => {}
+        Err(Error::Unsupported { .. }) => held.clear(),
         Err(e) => return Err(e),
-    };
+    }
     let same_key: Vec<(&Attestation, ParsedRow)> = held
         .iter()
         .filter_map(|r| parse_row(r).map(|p| (r, p)))
@@ -1958,7 +1989,19 @@ where
     let mut rows: Vec<Attestation> = Vec::new();
     let mut unreadable: Vec<String> = Vec::new();
     for root in &roots {
-        match directory.list_attestations_for(root).await {
+        // The root's `mesh_config:*` rows, every page.
+        let mut found = Vec::new();
+        let mut pages = AttestationQuery::to(root, FOLD_PAGE)
+            .dimension_prefix(DIMENSION_PREFIX)
+            .pages();
+        let read: Result<(), Error> = async {
+            while let Some(page) = pages.next(directory).await? {
+                found.extend(page);
+            }
+            Ok(())
+        }
+        .await;
+        match read.map(|()| found) {
             Ok(found) => rows.extend(
                 found
                     .into_iter()
