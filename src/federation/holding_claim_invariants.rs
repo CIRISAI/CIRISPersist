@@ -513,6 +513,56 @@ pub(crate) mod dyn_bodies {
         .expect("I713 the acceptance satisfies the growth gate");
     }
 
+    /// **I775** (Codex r2 on #1065) — a `public` room is a public group to
+    /// the replication audience (`is_public_group`, through the one
+    /// `is_public_community` predicate): its community-scoped rows, the
+    /// subjectless standing proposal a non-member needs to join among them,
+    /// fan out to a non-member; a private room is not public and its rows do
+    /// not.
+    pub(crate) async fn i775_a_public_rooms_rows_reach_non_members(
+        d: &dyn FederationDirectory,
+        tag: &str,
+    ) {
+        use crate::federation::replication_audience::{is_public_group, may_receive};
+        let (founder, _) = key(d, "i775f", tag).await;
+        let (outsider, _) = key(d, "i775o", tag).await;
+        let id = format!("i775-pub-{tag}");
+        put_room(d, room(&id, &founder, None, open_policy()))
+            .await
+            .unwrap();
+        let private = format!("i775-priv-{tag}");
+        put_room(d, room(&private, &founder, None, serde_json::json!({})))
+            .await
+            .unwrap();
+        assert!(
+            is_public_group(d, &id).await.unwrap(),
+            "I775 a public room is public"
+        );
+        assert!(
+            !is_public_group(d, &private).await.unwrap(),
+            "I775 a private room is not"
+        );
+        let at = Utc::now() - Duration::hours(1);
+        let mut p = proposal_row(&founder, cs::COMMUNITY, &id, "", None, at);
+        p.subject_key_ids.clear();
+        ts::seal_row_in_place(&founder, &mut p);
+        d.put_attestation(SignedAttestation {
+            attestation: p.clone(),
+        })
+        .await
+        .expect("I775 the founder's standing proposal");
+        assert!(
+            may_receive(d, &outsider, &p).await.unwrap().allowed(),
+            "I775 the standing proposal reaches a non-member"
+        );
+        let mut q = p.clone();
+        q.attestation_envelope["community_id"] = serde_json::json!(private);
+        assert!(
+            !may_receive(d, &outsider, &q).await.unwrap().allowed(),
+            "I775 a private room's row does not"
+        );
+    }
+
     async fn listing(
         d: &dyn FederationDirectory,
         alias: &str,
@@ -1538,6 +1588,7 @@ mod runners {
                 }
                 case!(i712_open_admission_only_on_a_public_room);
                 case!(i713_open_admission_rides_a_standing_proposal);
+                case!(i775_a_public_rooms_rows_reach_non_members);
                 case!(i714_the_listing_door);
                 case!(i724_a_listing_waits_for_its_room);
             }

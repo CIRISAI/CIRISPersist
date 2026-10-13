@@ -478,6 +478,13 @@ where
             if super::admission::is_authorized_infrastructure_community(dir, &c).await? {
                 return Ok(true);
             }
+            // v55.0.0 (CC 3.2; Codex r2 on #1065) — a held `public` room is a
+            // public group: its rows fan out to everyone, the subjectless
+            // standing proposal a non-member needs to join included. The ONE
+            // predicate the tier decisions ask, never a re-derivation.
+            if super::public_room::is_public_community(&c) {
+                return Ok(true);
+            }
             // v53.0.0 — a KEYLESS trust-root community (`ciris-canonical`) has
             // no key record to carry `substrate_persist`; its authority is
             // its chain from an accord birth. ROOTED by the one rooting
