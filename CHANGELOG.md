@@ -7,7 +7,7 @@ threat-model citations because this crate's audit story is the point.
 
 ## [Unreleased]
 
-## [55.0.1] - UNRELEASED
+## [55.0.1] - 2026-10-13
 
 ### Fixed — tag CI: a restored cache never carries a build-script unit with missing outputs
 
