@@ -8434,68 +8434,30 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         Ok(())
     }
 
+    /// v56.0.0 (CIRISPersist#934 step 1, door 5) — decided by
+    /// [`purge_attestation_planned`](crate::federation::attestation_admit::purge_attestation_planned).
     async fn purge_attestation_v31(
         &self,
         attestation_id: &str,
     ) -> Result<bool, crate::federation::Error> {
-        // v31.0.0 (CIRISPersist#650) — the door's own gate, over a LOADED
-        // COPY, before any statement runs (AV-9).
-        if let Some(row) = self.get_attestation(attestation_id).await? {
-            crate::federation::migration::check_purge_admission(&row)?;
-        }
-        let client = self
-            .get_client()
-            .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
-        let n = client
-            .execute(
-                "DELETE FROM cirislens.federation_attestations WHERE attestation_id = $1",
-                &[&attestation_id],
-            )
-            .await
-            .map_err(|e| {
-                crate::federation::Error::Backend(format!("purge_attestation_v31: {e}"))
-            })?;
-        Ok(n > 0)
+        crate::federation::attestation_admit::purge_attestation_planned(self, attestation_id).await
     }
 
-    /// v31.1.0 (CIRISPersist#665) — the re-bake replacement half. Same statement
-    /// as `purge_attestation_v31` above, a different and much narrower gate: the
-    /// general exclusion gate refuses these rows (two of the three are
-    /// `delegates_to`), so this door asks only whether the id is one the
-    /// compiled-in bundle carries. The V106 / V121 cascades follow as they do
-    /// on the purge path.
+    /// v56.0.0 (CIRISPersist#934 step 1, door 6) — decided by
+    /// [`purge_genesis_delegation_row_planned`](crate::federation::attestation_admit::purge_genesis_delegation_row_planned).
     async fn purge_genesis_delegation_row_v31(
         &self,
         attestation_id: &str,
         expected_persist_row_hash: &str,
         authority: &crate::federation::genesis::bundle::GenesisPurgeAuthority<'_>,
     ) -> Result<bool, crate::federation::Error> {
-        // The door's own gate, before any statement runs (AV-9).
-        crate::federation::genesis::check_genesis_rebake_purge_admission_under(
+        crate::federation::attestation_admit::purge_genesis_delegation_row_planned(
+            self,
             attestation_id,
+            expected_persist_row_hash,
             authority,
-        )?;
-        let client = self
-            .get_client()
-            .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
-        // v31.1.0 (CIRISPersist#665 review) — COMPARE-AND-DELETE in ONE
-        // statement. This is the backend the finding is about: two engine
-        // versions initializing one database is what a rolling deployment IS,
-        // and deleting by id alone let a stale initializer remove a newer
-        // ceremony row that landed after its own classifying read.
-        let n = client
-            .execute(
-                "DELETE FROM cirislens.federation_attestations \
-                 WHERE attestation_id = $1 AND persist_row_hash = $2",
-                &[&attestation_id, &expected_persist_row_hash],
-            )
-            .await
-            .map_err(|e| {
-                crate::federation::Error::Backend(format!("purge_genesis_delegation_row_v31: {e}"))
-            })?;
-        Ok(n > 0)
+        )
+        .await
     }
 
     async fn dag_manifests_of_chunk(
@@ -23805,6 +23767,39 @@ impl crate::federation::attestation_admit::AttestationStore for PostgresBackend 
             .await?;
         }
         Ok(true)
+    }
+
+    async fn delete_attestation(
+        &self,
+        attestation_id: &str,
+        only_if_hash: Option<&str>,
+    ) -> Result<bool, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        // `attestation_subjects` follows via `ON DELETE CASCADE` (V106). The
+        // re-bake's compare-and-delete is ONE statement (#665 review).
+        let n =
+            match only_if_hash {
+                None => client
+                    .execute(
+                        "DELETE FROM cirislens.federation_attestations WHERE attestation_id = $1",
+                        &[&attestation_id],
+                    )
+                    .await,
+                Some(h) => {
+                    client
+                        .execute(
+                            "DELETE FROM cirislens.federation_attestations \
+                         WHERE attestation_id = $1 AND persist_row_hash = $2",
+                            &[&attestation_id, &h],
+                        )
+                        .await
+                }
+            }
+            .map_err(|e| crate::federation::Error::Backend(format!("delete_attestation: {e}")))?;
+        Ok(n > 0)
     }
 
     async fn store_planned_attestation(

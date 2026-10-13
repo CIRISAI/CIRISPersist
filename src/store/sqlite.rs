@@ -6671,66 +6671,30 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         Ok(())
     }
 
+    /// v56.0.0 (CIRISPersist#934 step 1, door 5) — decided by
+    /// [`purge_attestation_planned`](crate::federation::attestation_admit::purge_attestation_planned).
     async fn purge_attestation_v31(
         &self,
         attestation_id: &str,
     ) -> Result<bool, crate::federation::Error> {
-        // v31.0.0 (CIRISPersist#650) — the door's own gate, over a LOADED
-        // COPY, before any statement runs (AV-9).
-        if let Some(row) = self.get_attestation(attestation_id).await? {
-            crate::federation::migration::check_purge_admission(&row)?;
-        }
-        let id = attestation_id.to_owned();
-        let n = self
-            .write(move |conn| -> Result<usize, rusqlite::Error> {
-                conn.execute(
-                    "DELETE FROM federation_attestations WHERE attestation_id = ?1",
-                    rusqlite::params![id],
-                )
-            })
-            .await
-            .map_err(|e| {
-                crate::federation::Error::Backend(format!("purge_attestation_v31: {e}"))
-            })?;
-        Ok(n > 0)
+        crate::federation::attestation_admit::purge_attestation_planned(self, attestation_id).await
     }
 
-    /// v31.1.0 (CIRISPersist#665) — the re-bake replacement half. Same statement
-    /// as `purge_attestation_v31` above, a different and much narrower gate: the
-    /// general exclusion gate refuses these rows (two of the three are
-    /// `delegates_to`), so this door asks only whether the id is one the
-    /// compiled-in bundle carries. `attestation_subjects` follows via `ON DELETE
-    /// CASCADE` (V106).
+    /// v56.0.0 (CIRISPersist#934 step 1, door 6) — decided by
+    /// [`purge_genesis_delegation_row_planned`](crate::federation::attestation_admit::purge_genesis_delegation_row_planned).
     async fn purge_genesis_delegation_row_v31(
         &self,
         attestation_id: &str,
         expected_persist_row_hash: &str,
         authority: &crate::federation::genesis::bundle::GenesisPurgeAuthority<'_>,
     ) -> Result<bool, crate::federation::Error> {
-        // The door's own gate, before any statement runs (AV-9).
-        crate::federation::genesis::check_genesis_rebake_purge_admission_under(
+        crate::federation::attestation_admit::purge_genesis_delegation_row_planned(
+            self,
             attestation_id,
+            expected_persist_row_hash,
             authority,
-        )?;
-        let id = attestation_id.to_owned();
-        let expected = expected_persist_row_hash.to_owned();
-        // v31.1.0 (CIRISPersist#665 review) — COMPARE-AND-DELETE in ONE
-        // statement: the row must still be the one the caller classified. A row
-        // replaced by a concurrent initializer between that read and this call
-        // does not match and is left alone.
-        let n = self
-            .write(move |conn| -> Result<usize, rusqlite::Error> {
-                conn.execute(
-                    "DELETE FROM federation_attestations \
-                 WHERE attestation_id = ?1 AND persist_row_hash = ?2",
-                    rusqlite::params![id, expected],
-                )
-            })
-            .await
-            .map_err(|e| {
-                crate::federation::Error::Backend(format!("purge_genesis_delegation_row_v31: {e}"))
-            })?;
-        Ok(n > 0)
+        )
+        .await
     }
 
     async fn dag_manifests_of_chunk(
@@ -22548,6 +22512,34 @@ impl crate::federation::attestation_admit::AttestationStore for SqliteBackend {
             .await?;
         }
         Ok(true)
+    }
+
+    async fn delete_attestation(
+        &self,
+        attestation_id: &str,
+        only_if_hash: Option<&str>,
+    ) -> Result<bool, crate::federation::Error> {
+        let id = attestation_id.to_owned();
+        let expected = only_if_hash.map(str::to_owned);
+        // `attestation_subjects` follows via `ON DELETE CASCADE` (V106). The
+        // re-bake's compare-and-delete is ONE statement (#665 review).
+        let n = self
+            .write(move |conn| -> Result<usize, rusqlite::Error> {
+                match expected {
+                    None => conn.execute(
+                        "DELETE FROM federation_attestations WHERE attestation_id = ?1",
+                        rusqlite::params![id],
+                    ),
+                    Some(h) => conn.execute(
+                        "DELETE FROM federation_attestations \
+                         WHERE attestation_id = ?1 AND persist_row_hash = ?2",
+                        rusqlite::params![id, h],
+                    ),
+                }
+            })
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("delete_attestation: {e}")))?;
+        Ok(n > 0)
     }
 
     async fn store_planned_attestation(

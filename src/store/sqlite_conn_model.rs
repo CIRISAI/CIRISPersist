@@ -532,8 +532,6 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("peer_metadata_for", ConnClass::Read),
     ("pinned_blob_bytes", ConnClass::Read),
     ("purge_attestation_projections", ConnClass::Write),
-    ("purge_attestation_v31", ConnClass::Write),
-    ("purge_genesis_delegation_row_v31", ConnClass::Write),
     ("put_accord_decision", ConnClass::Write),
     ("put_accord_participation", ConnClass::Write),
     ("put_accord_proposal", ConnClass::Write),
@@ -739,6 +737,7 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     // calls into the shared plans now and touch no connection.
     ("attesting_identity_type", ConnClass::Read),
     ("composer_replay_held", ConnClass::Read),
+    ("delete_attestation", ConnClass::Write),
     ("repair_withdraws_depth", ConnClass::Write),
     ("store_pqc_completion", ConnClass::Write),
     ("store_planned_attestation", ConnClass::Write),

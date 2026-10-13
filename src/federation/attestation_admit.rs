@@ -214,6 +214,16 @@ pub(crate) trait AttestationStore:
     /// re-asked, the sealed row built), write that row, then re-index a
     /// federation-tier row. `false` when the row is gone.
     async fn store_planned_reseal(&self, planned: PlannedReseal) -> Result<bool, Error>;
+
+    /// Delete one attestation row (its subject projection follows: `ON DELETE
+    /// CASCADE` on the SQL backends, by hand on memory). With `only_if_hash`,
+    /// a compare-and-delete in one step: a row whose `persist_row_hash` moved
+    /// is left alone. `false` when nothing was deleted.
+    async fn delete_attestation(
+        &self,
+        attestation_id: &str,
+        only_if_hash: Option<&str>,
+    ) -> Result<bool, Error>;
 }
 
 /// v56.0.0 (CIRISPersist#934 step 1) — a planned hybrid completion
@@ -1480,4 +1490,45 @@ where
     let planned = plan_reseal_attestation(dir, &stored, resealed, received_at).await?;
     let landed = dir.store_planned_reseal(planned).await?;
     Ok(landed)
+}
+
+/// v56.0.0 (CIRISPersist#934 step 1, door 5) — `purge_attestation_v31`,
+/// decided once: the exclusion gate (`migration::check_purge_admission`) over
+/// the row as read, then the delete. The read and the delete are two steps on
+/// every backend, as they were before (no backend re-asks under its lock).
+pub(crate) async fn purge_attestation_planned<D>(
+    dir: &D,
+    attestation_id: &str,
+) -> Result<bool, Error>
+where
+    D: AttestationStore,
+{
+    if let Some(row) = dir.get_attestation(attestation_id).await? {
+        crate::federation::migration::check_purge_admission(&row)?;
+    }
+    let gone = dir.delete_attestation(attestation_id, None).await?;
+    Ok(gone)
+}
+
+/// v56.0.0 (CIRISPersist#934 step 1, door 6) — `purge_genesis_delegation_row_v31`,
+/// decided once: the re-bake gate (the id must be one the compiled-in bundle
+/// carries, under the caller's authority), then a compare-and-delete on
+/// `expected_persist_row_hash`.
+pub(crate) async fn purge_genesis_delegation_row_planned<D>(
+    dir: &D,
+    attestation_id: &str,
+    expected_persist_row_hash: &str,
+    authority: &crate::federation::genesis::bundle::GenesisPurgeAuthority<'_>,
+) -> Result<bool, Error>
+where
+    D: AttestationStore,
+{
+    crate::federation::genesis::check_genesis_rebake_purge_admission_under(
+        attestation_id,
+        authority,
+    )?;
+    let gone = dir
+        .delete_attestation(attestation_id, Some(expected_persist_row_hash))
+        .await?;
+    Ok(gone)
 }

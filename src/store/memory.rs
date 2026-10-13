@@ -3100,6 +3100,31 @@ impl crate::federation::attestation_admit::AttestationStore for MemoryBackend {
         Ok(true)
     }
 
+    async fn delete_attestation(
+        &self,
+        attestation_id: &str,
+        only_if_hash: Option<&str>,
+    ) -> Result<bool, crate::federation::Error> {
+        let mut state = self.state.lock().expect("memory backend lock");
+        // One step under the lock: for the re-bake, the compare cannot be
+        // overtaken between the compare and the removal (#665 review).
+        let before = state.federation_attestations.len();
+        state.federation_attestations.retain(|a| {
+            a.attestation_id != attestation_id
+                || only_if_hash.is_some_and(|h| a.persist_row_hash != h)
+        });
+        if state.federation_attestations.len() == before {
+            return Ok(false);
+        }
+        // The V106 subject projection follows the row (the SQL backends get
+        // this from `ON DELETE CASCADE`).
+        for ids in state.subject_index.values_mut() {
+            ids.retain(|id| id != attestation_id);
+        }
+        state.subject_index.retain(|_, ids| !ids.is_empty());
+        Ok(true)
+    }
+
     async fn store_planned_attestation(
         &self,
         planned: crate::federation::attestation_admit::PlannedAttestation,
@@ -5220,69 +5245,30 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             .collect())
     }
 
+    /// v56.0.0 (CIRISPersist#934 step 1, door 5) — decided by
+    /// [`purge_attestation_planned`](crate::federation::attestation_admit::purge_attestation_planned).
     async fn purge_attestation_v31(
         &self,
         attestation_id: &str,
     ) -> Result<bool, crate::federation::Error> {
-        // v31.0.0 (CIRISPersist#650) — the door's own gate (AV-9:
-        // verify-before-mutation). Asked BEFORE the lock is taken, so a refusal
-        // cannot interleave with a mutation.
-        if let Some(row) = self.get_attestation(attestation_id).await? {
-            crate::federation::migration::check_purge_admission(&row)?;
-        }
-        let mut state = self.state.lock().expect("memory backend lock");
-        let before = state.federation_attestations.len();
-        state
-            .federation_attestations
-            .retain(|a| a.attestation_id != attestation_id);
-        if state.federation_attestations.len() == before {
-            return Ok(false);
-        }
-        for ids in state.subject_index.values_mut() {
-            ids.retain(|id| id != attestation_id);
-        }
-        state.subject_index.retain(|_, ids| !ids.is_empty());
-        Ok(true)
+        crate::federation::attestation_admit::purge_attestation_planned(self, attestation_id).await
     }
 
-    /// v31.1.0 (CIRISPersist#665) — the re-bake replacement half. Structurally
-    /// identical to `purge_attestation_v31` above except for WHICH gate it
-    /// re-asks: the general exclusion gate refuses these rows (two of the three
-    /// are `delegates_to`), so this door carries the narrower
-    /// `check_genesis_rebake_purge_admission` — the id must be one the
-    /// compiled-in bundle carries — and nothing else can be reached through it.
+    /// v56.0.0 (CIRISPersist#934 step 1, door 6) — decided by
+    /// [`purge_genesis_delegation_row_planned`](crate::federation::attestation_admit::purge_genesis_delegation_row_planned).
     async fn purge_genesis_delegation_row_v31(
         &self,
         attestation_id: &str,
         expected_persist_row_hash: &str,
         authority: &crate::federation::genesis::bundle::GenesisPurgeAuthority<'_>,
     ) -> Result<bool, crate::federation::Error> {
-        // The door's own gate (AV-9), before the lock, so a refusal cannot
-        // interleave with a mutation.
-        crate::federation::genesis::check_genesis_rebake_purge_admission_under(
+        crate::federation::attestation_admit::purge_genesis_delegation_row_planned(
+            self,
             attestation_id,
+            expected_persist_row_hash,
             authority,
-        )?;
-        let mut state = self.state.lock().expect("memory backend lock");
-        // v31.1.0 (CIRISPersist#665 review) — COMPARE-AND-DELETE, under the same
-        // lock as the removal so the compare cannot be overtaken between the two
-        // (the SQL backends get that from a single `DELETE … WHERE` statement).
-        // A row that changed since the caller classified it is LEFT ALONE.
-        let before = state.federation_attestations.len();
-        state.federation_attestations.retain(|a| {
-            a.attestation_id != attestation_id || a.persist_row_hash != expected_persist_row_hash
-        });
-        if state.federation_attestations.len() == before {
-            return Ok(false);
-        }
-        // The V106 subject projection follows the row, as it does on the purge
-        // path: the SQL backends get this from `ON DELETE CASCADE`, memory has
-        // to say it.
-        for ids in state.subject_index.values_mut() {
-            ids.retain(|id| id != attestation_id);
-        }
-        state.subject_index.retain(|_, ids| !ids.is_empty());
-        Ok(true)
+        )
+        .await
     }
 
     async fn dag_manifests_of_chunk(

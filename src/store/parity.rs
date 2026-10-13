@@ -161,6 +161,10 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("plan_reseal_attestation", Class::Delegates),
     ("store_planned_reseal", Class::Plumbing),
     ("sealed_over", Class::Plan),
+    // Doors 5 and 6, the two purges: shared doors over one executor delete.
+    ("purge_attestation_planned", Class::Plan),
+    ("purge_genesis_delegation_row_planned", Class::Plan),
+    ("delete_attestation", Class::Plumbing),
     // ...and the local plan's own gates, seen for the first time with it:
     // the local-tier eligibility rule, the caller-signed transit verify, the
     // signed-instant read (refuses a malformed instant) and the local stamp
@@ -1160,7 +1164,7 @@ mod tests {
     /// files: `(file, fn)`. Each body is held to the same [`CALL_CLASSES`]
     /// partition as a backend door, and its sequence is what a door's
     /// `plan:NAME` token stands for.
-    const SHARED_PLANS: [(&str, &str); 6] = [
+    const SHARED_PLANS: [(&str, &str); 8] = [
         (
             "src/federation/attestation_admit.rs",
             "put_attestation_planned",
@@ -1182,6 +1186,14 @@ mod tests {
             "reseal_attestation_planned",
         ),
         ("src/federation/attestation_admit.rs", "sealed_over"),
+        (
+            "src/federation/attestation_admit.rs",
+            "purge_attestation_planned",
+        ),
+        (
+            "src/federation/attestation_admit.rs",
+            "purge_genesis_delegation_row_planned",
+        ),
     ];
 
     /// v56.0.0 (CIRISPersist#934) — **the doors that decide nothing in a
@@ -1191,7 +1203,7 @@ mod tests {
     /// this list on the commit that moves its decision into a plan, and
     /// cannot drift back: a gate added to one backend's copy fails
     /// [`shared_doors_decide_nothing_in_a_backend`].
-    const SHARED_DOORS: [(&str, &str, &str); 7] = [
+    const SHARED_DOORS: [(&str, &str, &str); 9] = [
         (
             "FederationDirectory",
             "put_attestation_with_origin",
@@ -1225,6 +1237,16 @@ mod tests {
         ),
         // The executor's re-ask inside its write step.
         ("AttestationStore", "store_planned_reseal", "sealed_over"),
+        (
+            "FederationDirectory",
+            "purge_attestation_v31",
+            "purge_attestation_planned",
+        ),
+        (
+            "FederationDirectory",
+            "purge_genesis_delegation_row_v31",
+            "purge_genesis_delegation_row_planned",
+        ),
     ];
 
     /// Combinators that pass their receiver's failure through unchanged. The
