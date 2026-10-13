@@ -121,3 +121,21 @@ jobs:
               gh api -X DELETE "repos/$REPO/actions/runs/$id" >/dev/null 2>&1 && n=$((n + 1)) || true
           done
           echo "::notice::Pruned $n skipped auto-retry run(s)."
+
+  # v56.0.0 (CIRISPersist#934, #1076 slice T) — REPORTS, not gates. Every step
+  # here prints what it found and the job stays green: nothing new goes red on
+  # main without the operator. docs/TOOLING.md lists which tool is which.
+  reports:
+    name: reports (non-gating)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      # The per-file size of src/ against the committed evidence/size.tsv: how
+      # far main has moved since the table was last written (release cut).
+      # `--fail-if-backends-grew` is #934's PR criterion and is NOT used here.
+      - name: size of src/ vs evidence/size.tsv (report)
+        run: |
+          python3 scripts/size_report_test.py
+          { echo '```'; python3 scripts/size_report.py check; echo '```'; } | tee -a "$GITHUB_STEP_SUMMARY"

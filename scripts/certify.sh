@@ -202,7 +202,7 @@ done
 # The leg is skippable ONLY by CERTIFY_SKIP_PYTHON=1, and never silently — the
 # verdict table carries a SKIPPED line and the run stops claiming full
 # certification.
-ALL_KEYS="$LEGS default python fmt clippy pyi featmatrix wheelfeat docver pyo3sqlite dirdouble astgates weaver bitschanged mutmatrix cachetrim evidencetsv floortoken$AXIS_KEYS"
+ALL_KEYS="$LEGS default python fmt clippy pyi featmatrix wheelfeat docver pyo3sqlite dirdouble astgates weaver bitschanged mutmatrix cachetrim evidencetsv sizetest sizereport floortoken$AXIS_KEYS"
 
 FOCUS_LEG=""; FOCUS_FILTER=""
 if [ "$MODE" = "focus" ]; then
@@ -585,6 +585,15 @@ run_bg mutmatrix  python3 scripts/mutants_matrix_test.py
 run_bg cachetrim  python3 scripts/ci_cache_trim_test.py
 # v54.1.0 (CIRISPersist#1052) — the committed evidence tsv is the generated one.
 run_bg evidencetsv python3 scripts/evidence_tsv_test.py
+# v56.0.0 (CIRISPersist#934, #1076 slice T) — size tracking. `sizetest` is the
+# counter's and the table's witnesses (fixture trees, no cargo) and gates like
+# the other tool self-tests. `sizereport` is a REPORT: the per-file delta of
+# src/ against the committed evidence/size.tsv, printed under the fast-gate
+# table, and green whatever it says — the backend-growth gate
+# (`--fail-if-backends-grew`) belongs to #934's PRs, not to main, until the
+# operator says otherwise.
+run_bg sizetest   python3 scripts/size_report_test.py
+run_bg sizereport bash -c 'python3 scripts/size_report.py check; echo "(sizereport is a report: exit 0 whatever the delta; exit was $?)"; exit 0'
 # v35.0.0 (CIRISPersist#710) — tested-wheel ⊇ shipped-wheel, and nobody
 # hand-spells a `maturin develop --features` list (here or in ci.yml).
 run_bg wheelfeat  python3 scripts/wheel_features.py check
@@ -625,7 +634,7 @@ wait
 # before the expensive legs dispatch, is the point of the fast stage: a compile
 # break under `--features cirisnode` alone should cost seconds, not the full
 # test matrix first.
-FAST_GATES="fmt pyi featmatrix wheelfeat docver pyo3sqlite dirdouble astgates weaver bitschanged mutmatrix cachetrim evidencetsv floortoken$AXIS_KEYS"
+FAST_GATES="fmt pyi featmatrix wheelfeat docver pyo3sqlite dirdouble astgates weaver bitschanged mutmatrix cachetrim evidencetsv sizetest sizereport floortoken$AXIS_KEYS"
 
 # Every `.rc` this run produced must be claimed by a key someone reads. The log
 # directory is wiped at startup, so anything here was written by this run.
@@ -662,6 +671,8 @@ for g in $FAST_GATES; do
         *) fast_infra=1 ;;
     esac
 done
+# The size report is read by a person, not by the table: show its totals.
+echo "  size (report): $(grep -E '^  (BACKENDS|TOTAL) ' "$LOG_DIR/sizereport.log" 2>/dev/null | awk '{printf "%s %s->%s (%s)  ", $1, $2, $3, $4}')"
 if [ "$fast_fail" -ne 0 ] || [ "$fast_infra" -ne 0 ]; then
     echo; echo "STOPPED — a fast gate is not green; nothing expensive was run."
     for g in $FAST_GATES; do
