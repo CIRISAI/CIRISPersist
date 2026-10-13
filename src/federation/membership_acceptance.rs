@@ -28,6 +28,7 @@
 //! from a founder of an open public room, and seats nobody once the room is
 //! no longer open ([`RULE_OPEN_PROPOSAL_NOT_OPEN`]).
 
+use super::attestation_query::{AttestationQuery, FOLD_PAGE};
 use super::types::{attestation_tier, attestation_type, cohort_scope};
 use super::{Attestation, Error, FederationDirectory};
 
@@ -338,9 +339,14 @@ where
 {
     // v53.1.6 — the member's `membership:*` rows (V178's attested+dimension
     // seek), not every row about the member; the filter is unchanged.
-    Ok(dir
-        .list_attestations_for_dimension_prefix(member, None, MEMBERSHIP_FAMILY_STEM)
-        .await?
+    let mut rows = Vec::new();
+    let mut pages = AttestationQuery::to(member, FOLD_PAGE)
+        .dimension_prefix(MEMBERSHIP_FAMILY_STEM)
+        .pages();
+    while let Some(page) = pages.next(dir).await? {
+        rows.extend(page);
+    }
+    Ok(rows
         .into_iter()
         .filter(|r| {
             r.tier == attestation_tier::FEDERATION
@@ -854,10 +860,12 @@ where
         Err(Error::Unsupported { .. }) => {
             let mut rows = Vec::new();
             for s in &signers_of_members(dir, members).await? {
-                rows.extend(
-                    dir.list_attestations_by_dimension_prefix(s, PROPOSAL_DIMENSION)
-                        .await?,
-                );
+                let mut pages = AttestationQuery::by(s, FOLD_PAGE)
+                    .dimension_prefix(PROPOSAL_DIMENSION)
+                    .pages();
+                while let Some(page) = pages.next(dir).await? {
+                    rows.extend(page);
+                }
             }
             rows
         }

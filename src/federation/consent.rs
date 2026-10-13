@@ -62,6 +62,7 @@ pub mod consent_dimension {
     pub const STATE_EXPIRED_PREFIX: &str = "consent:state:expired";
 }
 
+use super::attestation_query::{AttestationQuery, FOLD_PAGE};
 use super::{Error, FederationDirectory};
 
 /// v13.0.0 (CIRISPersist#365, CC 3.4.7.2) — resolve the Counter-RII
@@ -674,29 +675,26 @@ where
     let mut rows: Vec<super::Attestation> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for p in principals {
-        for a in dir
-            .list_attestations_for_dimension_prefix(
-                target_key_id,
-                Some(p),
-                consent_dimension::STATE_PREFIX,
-            )
-            .await?
-        {
-            if seen.insert(a.attestation_id.clone()) {
-                rows.push(a);
+        let mut pages = AttestationQuery::to(target_key_id, FOLD_PAGE)
+            .authored_by(p)
+            .dimension_prefix(consent_dimension::STATE_PREFIX)
+            .pages();
+        while let Some(page) = pages.next(dir).await? {
+            for a in page {
+                if seen.insert(a.attestation_id.clone()) {
+                    rows.push(a);
+                }
             }
         }
     }
-    for a in dir
-        .list_attestations_for_dimension_prefix(
-            target_key_id,
-            None,
-            consent_dimension::STATE_EXPIRED_PREFIX,
-        )
-        .await?
-    {
-        if seen.insert(a.attestation_id.clone()) {
-            rows.push(a);
+    let mut pages = AttestationQuery::to(target_key_id, FOLD_PAGE)
+        .dimension_prefix(consent_dimension::STATE_EXPIRED_PREFIX)
+        .pages();
+    while let Some(page) = pages.next(dir).await? {
+        for a in page {
+            if seen.insert(a.attestation_id.clone()) {
+                rows.push(a);
+            }
         }
     }
     let ids: Vec<String> = rows.iter().map(|a| a.attestation_id.clone()).collect();

@@ -1973,19 +1973,19 @@ where
     };
     // v53.1.7 — the charter-shaped rows and their composers, never every
     // trust edge naming the family.
-    let rows = super::trust_root::with_slice_composers(
-        directory,
-        directory
-            .list_attestations_for_types(
-                family,
-                &[super::types::attestation_type::DELEGATES_TO],
-                &super::trust_root::jobs_other_than(super::trust_root::TRUST_CHARTER_DIMENSION),
-            )
-            .await?,
-        Some(family),
-        None,
-    )
-    .await?;
+    let mut charters = Vec::new();
+    let mut pages =
+        super::attestation_query::AttestationQuery::to(family, super::attestation_query::FOLD_PAGE)
+            .types(&[super::types::attestation_type::DELEGATES_TO])
+            .excluding_dimensions(&super::trust_root::jobs_other_than(
+                super::trust_root::TRUST_CHARTER_DIMENSION,
+            ))
+            .pages();
+    while let Some(page) = pages.next(directory).await? {
+        charters.extend(page);
+    }
+    let rows =
+        super::trust_root::with_slice_composers(directory, charters, Some(family), None).await?;
     let refs: Vec<&super::Attestation> = rows.iter().collect();
     let retired = super::precedence::retired_ids(&refs);
     let denied =

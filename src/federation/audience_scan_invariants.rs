@@ -1529,14 +1529,14 @@ pub(crate) mod bodies {
 
     // ── I539 — a pre-53.1.5 implementor ──────────────────────────────────
 
-    /// **I539** — an implementor of only the pre-53.1.5 required methods
-    /// (the double, which inherits the three reads' DEFAULT bodies over its
-    /// delegated `list_attestations_by` / `_for` / `_referencing`) answers
-    /// every I533 / I534 / I536 question exactly as the real backend does;
-    /// the probe shows the default took the unbounded path and the backend
-    /// did not. Pin compatibility: an out-of-crate implementor compiles
-    /// unchanged and keeps today's answers; the indexed overrides are an
-    /// optimisation, never a semantic.
+    /// **I539** — an implementor of only the REQUIRED methods (the double,
+    /// which overrides no read with a default body) answers every I533 / I534
+    /// / I536 question exactly as the real backend does. v53.1.5–v55 the
+    /// probe showed that implementor taking the unbounded path through the
+    /// defaults; v56.0.0 (CIRISPersist#1001) deleted those defaults, the folds
+    /// read through the typed query every implementor must execute, and the
+    /// bare implementor takes the bounded path too — no default body reads
+    /// wider than its own query.
     pub async fn i539_a_pre_53_1_5_implementor_answers_as_the_backend_does(
         plain: &dyn FederationDirectory,
         legacy: &dyn FederationDirectory,
@@ -1562,8 +1562,8 @@ pub(crate) mod bodies {
                     "I539: owner_allow_list({o}, {n}) through the defaults"
                 );
                 assert!(
-                    !slice_reads_over(&read_probe::take(), "list_attestations_by", o).is_empty(),
-                    "I539: the default body reads the owner's slice — the probe sees it"
+                    slice_reads_over(&read_probe::take(), "list_attestations_by", o).is_empty(),
+                    "I539 (v56.0.0, #1001): the bare implementor takes the bounded path too"
                 );
                 asked += 1;
             }
@@ -1578,13 +1578,12 @@ pub(crate) mod bodies {
             );
             asked += 1;
         }
-        // A family with a charter reaches the slice read in the default.
+        // A family with a charter: the bare implementor reads no slice.
         let _ = read_probe::take();
         ra::is_public_group(legacy, &groups[0].0).await.unwrap();
         assert!(
-            !slice_reads_over(&read_probe::take(), "list_attestations_for", &groups[0].0)
-                .is_empty(),
-            "I539: the default body reads the group's slice — the probe sees it"
+            slice_reads_over(&read_probe::take(), "list_attestations_for", &groups[0].0).is_empty(),
+            "I539 (v56.0.0, #1001): the bare implementor reads no group slice"
         );
         let t = consent.target.as_str();
         for subject in &consent.subjects {
@@ -1627,9 +1626,9 @@ pub(crate) mod bodies {
                         "I539 by principals: {subject} {scope} {qualifier:?}"
                     );
                     assert!(
-                        !slice_reads_over(&read_probe::take(), "list_attestations_for", t)
+                        slice_reads_over(&read_probe::take(), "list_attestations_for", t)
                             .is_empty(),
-                        "I539: the default body reads the target's slice — the probe sees it"
+                        "I539 (v56.0.0, #1001): the bare implementor reads no target slice"
                     );
                     asked += 1;
                 }

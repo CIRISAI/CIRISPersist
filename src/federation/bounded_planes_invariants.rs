@@ -1,4 +1,4 @@
-//! v56.0.0 (CIRISPersist#1001) — **I907–I9xx: each migrated plane's folds
+//! v56.0.0 (CIRISPersist#1001) — **I907–I911: each migrated plane's folds
 //! read through the typed bounded query, bounded.**
 //!
 //! Every witness here lands NOISE on a key — third-party `scores` rows under a
@@ -176,6 +176,54 @@ pub(crate) mod bodies {
         assert!(walk.len() > 1, "I907 the walk is paged: {walk:?}");
         assert_paged(&log, "I907 trust-root signal");
     }
+
+    /// **I908** — the consent/audience plane: a node's community-trust
+    /// consent, a member's membership replies, the key-grant emitter's
+    /// already-held check. (The consent fold's rows, an owner's allow lists,
+    /// a group's public charter and the family's charter rows are held by
+    /// I535/I540/I547.)
+    pub async fn i908_consent_and_audience_folds_read_bounded(d: &dyn FederationDirectory) {
+        let (k, other) = keys(d, "i908").await;
+        let n = 7;
+        noise(d, &other, &k, n).await;
+        // The node's own noise about itself, too: the community-trust read
+        // pins the node as author AND subject.
+        noise(d, &k, &k, n).await;
+
+        let _ = read_probe::take();
+        let consent =
+            crate::federation::community_trust_consent::community_trust_consent_for(d, &k)
+                .await
+                .expect("I908 community trust fold");
+        assert!(consent.is_none(), "I908 noise is no consent");
+        assert_narrowed(&read_probe::take(), &k, n, "I908 community trust");
+
+        let _ = read_probe::take();
+        let replies = crate::federation::membership_acceptance::replies_of(d, &k)
+            .await
+            .expect("I908 replies fold");
+        assert!(replies.is_empty(), "I908 noise is no reply");
+        assert_narrowed(&read_probe::take(), &k, n, "I908 membership replies");
+
+        let row = crate::federation::key_grant::KeyGrantRow {
+            axis: crate::federation::key_grant::KeyGrantAxis::Content {
+                at_rest_sha256: "00".repeat(32),
+                cohort_scope: crate::federation::types::cohort_scope::SELF.to_owned(),
+                owner_key_id: other.clone(),
+            },
+            wrap: crate::federation::blobs::GrantWrap {
+                recipient_key_id: k.clone(),
+                wrap_algorithm: "i908".into(),
+                wrapped_dek: "i908".into(),
+            },
+        };
+        let _ = read_probe::take();
+        let held = crate::federation::key_grant::key_grant_row_held(d, &other, &row)
+            .await
+            .expect("I908 key grant check");
+        assert!(!held, "I908 noise holds no grant");
+        assert_narrowed(&read_probe::take(), &k, n, "I908 key grant held");
+    }
 }
 
 #[cfg(test)]
@@ -184,6 +232,14 @@ mod runners {
         ($modname:ident, $fresh:expr) => {
             mod $modname {
                 use crate::federation::FederationDirectory;
+                #[tokio::test]
+                async fn i908_consent_and_audience_folds_read_bounded() {
+                    let Some(d) = $fresh.await else { return };
+                    super::super::bodies::i908_consent_and_audience_folds_read_bounded(
+                        &d as &dyn FederationDirectory,
+                    )
+                    .await
+                }
                 #[tokio::test]
                 async fn i907_trust_and_ownership_folds_read_bounded() {
                     let Some(d) = $fresh.await else { return };

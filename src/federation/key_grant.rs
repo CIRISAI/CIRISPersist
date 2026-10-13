@@ -107,6 +107,7 @@
 //! are, unserved.
 
 use crate::federation::attestation_apply::ReplicatedAttestationOutcome;
+use crate::federation::attestation_query::{AttestationQuery, FOLD_PAGE};
 use crate::federation::self_collective::speaks_for;
 use crate::federation::types::cohort_scope;
 use crate::federation::{
@@ -1456,13 +1457,21 @@ pub async fn key_grant_row_held<D>(dir: &D, signer: &str, row: &KeyGrantRow) -> 
 where
     D: FederationDirectory + ?Sized,
 {
-    Ok(dir
-        .list_attestations_for_dimension_prefix(row.recipient(), Some(signer), row.axis.dimension())
-        .await?
-        .iter()
-        .filter(|a| is_key_grant_row(a))
-        .filter_map(|a| KeyGrantRow::from_attestation(a).ok())
-        .any(|held| held.axis == row.axis && held.recipient() == row.recipient()))
+    let mut pages = AttestationQuery::to(row.recipient(), FOLD_PAGE)
+        .authored_by(signer)
+        .dimension_prefix(row.axis.dimension())
+        .pages();
+    while let Some(page) = pages.next(dir).await? {
+        if page
+            .iter()
+            .filter(|a| is_key_grant_row(a))
+            .filter_map(|a| KeyGrantRow::from_attestation(a).ok())
+            .any(|held| held.axis == row.axis && held.recipient() == row.recipient())
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// §14 — the full emission through `emit_one`: plan, sign and store each row,
