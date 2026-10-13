@@ -129,6 +129,7 @@ pub(crate) mod bodies {
     }
 
     /// sqlite and postgres today: the replace runs, then insert-if-absent.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     pub(crate) fn sql_today() -> Observed {
         Observed {
             same_dimension_weight: Some(0.5),
