@@ -128,6 +128,7 @@ jobs:
   reports:
     name: reports (non-gating)
     runs-on: ubuntu-latest
+    continue-on-error: true
     permissions:
       contents: read
     steps:
@@ -139,3 +140,15 @@ jobs:
         run: |
           python3 scripts/size_report_test.py
           { echo '```'; python3 scripts/size_report.py check; echo '```'; } | tee -a "$GITHUB_STEP_SUMMARY"
+      # Unused dependencies. `--with-metadata` resolves renamed crates through
+      # `cargo metadata`; the plain mode reported nothing on v55.0.0 where this
+      # one names two dev-dependencies. A finding is the operator's to act on
+      # (remove, or list it under [package.metadata.cargo-machete] ignored
+      # with the reason): this step only prints it.
+      - uses: dtolnay/rust-toolchain@1.97.0
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-machete
+      - name: unused dependencies — cargo machete (report)
+        run: |
+          { echo '```'; cargo machete --with-metadata 2>&1 || true; echo '```'; } | tee -a "$GITHUB_STEP_SUMMARY"
