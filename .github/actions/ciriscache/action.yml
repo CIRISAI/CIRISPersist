@@ -93,6 +93,9 @@ runs:
       run: |
         for py in python3 python; do
           if "$py" -c 'import sys' 2>/dev/null; then
+            # One blob is restored here (first hit wins), so the script's
+            # single-cutoff bound holds. A layered restore (several blobs
+            # overlaid) must repair after each layer or pass --strict.
             exec "$py" scripts/ci_cache_units.py repair target
           fi
         done

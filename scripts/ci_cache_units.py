@@ -49,6 +49,16 @@ not removed outright (removing all of them cost the v55.0.1 PR run's
 It prints three counts: removed (manifest), removed (boundary), kept
 (unverified: manifest-less and far from the cutoff).
 
+The bound assumes ONE restored blob: one save pruned the whole tree in one
+pass, so one cutoff covers every file. A caller that overlays SEVERAL blobs
+(layers from different saves, each pruned at its own save; CIRISEdge
+restores verify → persist → edge) has one cutoff PER LAYER, and a unit of a
+later layer can sit hours above the oldest layer's cutoff with a pruned
+sibling. Such a caller runs `repair` after EACH layer's restore, or passes
+`--strict`, which removes every manifest-less unit (a one-time cold rebuild
+of the build scripts; sealed blobs then carry manifests). CIRISEdge found
+this (#1075).
+
 A build-script unit is a directory under `<profile>/build/` named
 `<pkg>-<16 hex>`. Profiles are `target/<profile>/` and, for a cross build,
 `target/<triple>/<profile>/` (a directory holding `deps/` or `.fingerprint/`).
@@ -149,7 +159,9 @@ def broken(unit: Path) -> str | None:
     return None
 
 
-def repair(target: Path) -> int:
+def repair(target: Path, strict: bool = False) -> int:
+    """`strict`: every manifest-less unit goes (for layered restores, where
+    the single-cutoff bound does not hold)."""
     cutoff = oldest_mtime(target)
     by_manifest = by_boundary = kept = 0
     for u in units(target):
@@ -158,6 +170,9 @@ def repair(target: Path) -> int:
             if why is None:
                 continue
             by_manifest += 1
+        elif strict:
+            why = "no manifest (--strict: layered restore, no single cutoff)"
+            by_boundary += 1
         else:
             why = unverified_verdict(u, cutoff if cutoff is not None else 0.0)
             if why is None:
@@ -284,6 +299,36 @@ def bound_checks() -> list[tuple[bool, str]]:
         repair(t)
         out.append((all(not u.exists() for u in made),
                     "clobbered mtimes remove every manifest-less unit"))
+    # --strict (a layered restore, no single cutoff): a manifest-less unit the
+    # bound would KEEP (far above the cutoff) goes; a sealed, consistent one stays.
+    with tempfile.TemporaryDirectory() as d:
+        t = Path(d) / "target"
+        prof = t / "release"
+        (prof / "deps").mkdir(parents=True)
+        old = time.time() - 30 * 24 * 3600
+        anchor = prof / "deps" / "libold.rlib"
+        anchor.write_text("x", encoding="utf-8")
+        os.utime(anchor, (old, old))
+        far = prof / "build" / "far-1111111111111111"
+        (far / "out").mkdir(parents=True)
+        (far / "output").write_text("x", encoding="utf-8")
+        (far / "out" / "g.rs").write_text("x", encoding="utf-8")
+        (prof / ".fingerprint" / far.name).mkdir(parents=True)
+        for f in (far / "output", far / "out" / "g.rs"):
+            os.utime(f, (old + 10 * 3600, old + 10 * 3600))
+        sealed = prof / "build" / "sealed-2222222222222222"
+        (sealed / "out").mkdir(parents=True)
+        (sealed / "output").write_text("x", encoding="utf-8")
+        (sealed / "out" / "h.rs").write_text("x", encoding="utf-8")
+        (prof / ".fingerprint" / sealed.name).mkdir(parents=True)
+        seal(t)
+        (far / MANIFEST).unlink()
+        repair(t)
+        out.append((far.exists(), "the bound keeps a manifest-less unit far above the cutoff"))
+        repair(t, strict=True)
+        out.append((not far.exists() and not (prof / ".fingerprint" / far.name).exists(),
+                    "--strict removes it, with its fingerprint"))
+        out.append((sealed.exists(), "--strict keeps a sealed, consistent unit"))
     return out
 
 
@@ -294,14 +339,15 @@ def main(argv: list[str]) -> int:
             stream.reconfigure(encoding="utf-8", errors="replace")
     if len(argv) == 2 and argv[1] == "--self-test":
         return self_test()
-    if len(argv) != 3 or argv[1] not in ("seal", "repair"):
+    strict = argv[1:2] == ["repair"] and argv[3:] == ["--strict"]
+    if not strict and (len(argv) != 3 or argv[1] not in ("seal", "repair")):
         print(__doc__, file=sys.stderr)
         return 2
     target = Path(argv[2])
     if not target.is_dir():
         print(f"ci_cache_units: no target directory at {target}; nothing to {argv[1]}")
         return 0
-    return seal(target) if argv[1] == "seal" else repair(target)
+    return seal(target) if argv[1] == "seal" else repair(target, strict=strict)
 
 
 if __name__ == "__main__":
