@@ -20635,6 +20635,10 @@ impl crate::federation::BlobStorage for PostgresBackend {
             crate::federation::steward_purge::refuse_tombstoned_bytes(self, &row.sha256).await?;
         }
 
+        // Codex r2 on #1065 — the manifest's chunk relation, written in the
+        // same transaction (the manifest row is the last prepared row).
+        let manifest_sha = rows.last().map(|r| r.sha256.to_vec());
+        let (links, link_stream) = crate::federation::blobs::manifest_chunk_links(&manifest);
         let mut client = self
             .get_client()
             .await
@@ -20666,16 +20670,13 @@ impl crate::federation::BlobStorage for PostgresBackend {
                 crate::federation::BlobError::Backend(format!("put_blob_chunks insert: {e}"))
             })?;
         }
-        // Codex r2 on #1065 — the manifest's chunk relation, in the same
-        // transaction (the manifest row is the last prepared row).
-        if let Some(m) = rows.last().map(|r| r.sha256.to_vec()) {
-            let (links, link_stream) = crate::federation::blobs::manifest_chunk_links(&manifest);
+        if let Some(m) = &manifest_sha {
             for (seq, chunk) in &links {
                 tx.execute(
                     "INSERT INTO cirislens.federation_dag_chunks \
                      (manifest_sha256, seq, chunk_sha256, stream_id) VALUES ($1, $2, $3, $4) \
                  ON CONFLICT (manifest_sha256, seq) DO NOTHING",
-                    &[&m, seq, chunk, &link_stream],
+                    &[m, seq, chunk, &link_stream],
                 )
                 .await
                 .map_err(|e| {
