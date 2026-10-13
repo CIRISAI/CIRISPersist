@@ -73,6 +73,7 @@
 
 use std::collections::BTreeMap;
 
+use super::attestation_query::{AttestationQuery, FOLD_PAGE};
 use super::types::{attestation_type, delegation_scope};
 use super::{Attestation, Error, FederationDirectory};
 
@@ -185,7 +186,16 @@ where
                      against this node's own trust root",
     })?;
 
-    let rows = directory.list_attestations_for(subject_key_id).await?;
+    // The subject's `scores` rows on exactly this dimension: the only rows
+    // the latest-wins fold below keeps.
+    let mut rows = Vec::new();
+    let mut pages = AttestationQuery::to(subject_key_id, FOLD_PAGE)
+        .types(&[attestation_type::SCORES])
+        .dimension(dimension)
+        .pages();
+    while let Some(page) = pages.next(directory).await? {
+        rows.extend(page);
+    }
 
     // Per-emitter latest-wins FIRST. An emitter speaks with one voice on one
     // dimension: its newest live row is its statement, and a later `withdrawn`

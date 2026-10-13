@@ -224,6 +224,76 @@ pub(crate) mod bodies {
         assert!(!held, "I908 noise holds no grant");
         assert_narrowed(&read_probe::take(), &k, n, "I908 key grant held");
     }
+
+    /// A fold that walks `key`'s whole slice: every row once, in more than one
+    /// page, each page at most its limit.
+    pub fn assert_walked(log: &[Read], key: &str, n: usize, tag: &str) {
+        let walk: Vec<&Read> = on(log, key)
+            .into_iter()
+            .filter(|r| r.is_slice_read())
+            .collect();
+        assert_eq!(
+            walk.iter().map(|r| r.rows).sum::<usize>(),
+            n,
+            "{tag}: the slice walk reads every row once: {walk:?}"
+        );
+        assert!(walk.len() > 1, "{tag}: the walk is paged: {walk:?}");
+        assert_paged(log, tag);
+    }
+
+    /// **I909** — the identity-fact plane. Age, capacity and licensure read a
+    /// claim token that rides either the `scores` dimension or the legacy
+    /// type slot, so they walk the subject's slice — in pages, each row once.
+    /// The content-class flag reads one dimension's `scores` rows. `d` must
+    /// know its node key (the content-class door asks for it).
+    pub async fn i909_identity_fact_folds_read_bounded(d: &dyn FederationDirectory) {
+        let (k, other) = keys(d, "i909").await;
+        let n = 7;
+        noise(d, &other, &k, n).await;
+        let now = chrono::Utc::now();
+
+        let _ = read_probe::take();
+        crate::federation::age::age_band(d, &k)
+            .await
+            .expect("I909 age band");
+        assert_walked(&read_probe::take(), &k, n, "I909 age_band");
+
+        let _ = read_probe::take();
+        crate::federation::age::age_band_fine(d, &k)
+            .await
+            .expect("I909 age band fine");
+        assert_walked(&read_probe::take(), &k, n, "I909 age_band_fine");
+
+        let _ = read_probe::take();
+        crate::federation::capacity::capacity_state(d, &k, "finance")
+            .await
+            .expect("I909 capacity state");
+        assert_walked(&read_probe::take(), &k, n, "I909 capacity_state");
+
+        let _ = read_probe::take();
+        crate::federation::capacity::incapacity_facts(d, &k)
+            .await
+            .expect("I909 incapacity facts");
+        assert_walked(&read_probe::take(), &k, n, "I909 incapacity_facts");
+
+        let _ = read_probe::take();
+        crate::federation::licensure::status_set_for(d, &k, "i909-authority", now)
+            .await
+            .expect("I909 licensure");
+        assert_walked(&read_probe::take(), &k, n, "I909 licensure status_set_for");
+
+        let _ = read_probe::take();
+        let flag = crate::federation::content_class::resolve_content_class_flag(
+            d,
+            &k,
+            "content_class:i909:v1",
+            now,
+        )
+        .await
+        .expect("I909 content class");
+        assert!(!flag.flagged, "I909 noise flags nothing");
+        assert_narrowed(&read_probe::take(), &k, n, "I909 content class");
+    }
 }
 
 #[cfg(test)]
@@ -255,6 +325,41 @@ mod runners {
     runners!(memory, async {
         Some(crate::store::memory::MemoryBackend::new())
     });
+
+    /// I909 needs a directory that knows its node key.
+    #[tokio::test]
+    async fn i909_memory() {
+        let d = crate::store::memory::MemoryBackend::new();
+        d.set_node_key_id("i909-node");
+        super::bodies::i909_identity_fact_folds_read_bounded(&d).await;
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn i909_sqlite() {
+        use crate::store::Backend as _;
+        let d = crate::store::sqlite::SqliteBackend::open_in_memory()
+            .await
+            .unwrap();
+        d.run_migrations().await.unwrap();
+        d.set_node_key_id("i909-node");
+        super::bodies::i909_identity_fact_folds_read_bounded(&d).await;
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn i909_postgres() {
+        use crate::store::Backend as _;
+        let Some(dsn) = crate::test_pg::empty_dsn() else {
+            return;
+        };
+        let d = crate::store::postgres::PostgresBackend::connect(&dsn)
+            .await
+            .unwrap();
+        d.run_migrations().await.unwrap();
+        d.set_node_key_id("i909-node");
+        super::bodies::i909_identity_fact_folds_read_bounded(&d).await;
+    }
 
     #[cfg(feature = "sqlite")]
     runners!(sqlite, async {

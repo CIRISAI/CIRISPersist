@@ -35,6 +35,7 @@
 //!      (see [`super::admission::check_adult_incapacity_binding`] and the
 //!      steward-binding liveness in [`super::admission::steward_bindings_of`]).
 
+use super::attestation_query::{AttestationQuery, FOLD_PAGE};
 use super::{Error, FederationDirectory};
 use std::collections::HashSet;
 
@@ -342,7 +343,15 @@ pub async fn capacity_state(
     d: &str,
 ) -> Result<CapacityState, Error> {
     let now = chrono::Utc::now();
-    for r in directory.list_attestations_for(k).await? {
+    // Every row about `k`, newest first, walked in pages: a claim token
+    // rides either the `scores` dimension or the legacy type slot
+    // (`row_type::claim_token`), so no one narrowing holds both shapes.
+    let mut rows = Vec::new();
+    let mut pages = AttestationQuery::to(k, FOLD_PAGE).pages();
+    while let Some(page) = pages.next(directory).await? {
+        rows.extend(page);
+    }
+    for r in rows {
         if let Some(exp) = r.expires_at {
             if exp <= now {
                 continue; // lapsed — confers nothing.
@@ -393,7 +402,15 @@ pub async fn incapacity_facts(
         reversible_pending_domains: HashSet::new(),
         incapacity_attesters: HashSet::new(),
     };
-    for r in directory.list_attestations_for(k).await? {
+    // Every row about `k`, newest first, walked in pages: a claim token
+    // rides either the `scores` dimension or the legacy type slot
+    // (`row_type::claim_token`), so no one narrowing holds both shapes.
+    let mut rows = Vec::new();
+    let mut pages = AttestationQuery::to(k, FOLD_PAGE).pages();
+    while let Some(page) = pages.next(directory).await? {
+        rows.extend(page);
+    }
+    for r in rows {
         if let Some(exp) = r.expires_at {
             if exp <= now {
                 continue;

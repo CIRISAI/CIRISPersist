@@ -46,6 +46,7 @@
 //! delivers the fan-out to EVERY occurrence and must not decide who may act,
 //! or fan-out collapses into routing.
 
+use super::attestation_query::{AttestationQuery, FOLD_PAGE};
 use super::Error;
 
 /// v38.7.0 (#782) — the dimension a session claim rides.
@@ -189,7 +190,18 @@ pub async fn handler_for(
     let occurrences = super::admission::nodes_stewarded_by(directory, steward_user_key_id).await?;
     let mut claims = Vec::new();
     for occurrence in occurrences {
-        for row in directory.list_attestations_for(&occurrence).await? {
+        // The occurrence's own claims: authored by and about it, on the
+        // session-claim dimension. The checks below still hold each row to
+        // that shape.
+        let mut rows = Vec::new();
+        let mut pages = AttestationQuery::to(&occurrence, FOLD_PAGE)
+            .authored_by(&occurrence)
+            .dimension(SESSION_CLAIM_DIMENSION)
+            .pages();
+        while let Some(page) = pages.next(directory).await? {
+            rows.extend(page);
+        }
+        for row in rows {
             if super::admission::envelope_dimension(&row.attestation_envelope)
                 != Some(SESSION_CLAIM_DIMENSION)
             {
