@@ -1316,6 +1316,117 @@ pub mod two_node {
         );
     }
 
+    // ── I800 ─────────────────────────────────────────────────────────────
+    /// **I800 (Codex r3 on #1065) — the blob-arrival race.** An unrelated
+    /// signer's content row, admitted while the bytes were absent, reaches
+    /// the DIRECT projection after the blob arrived (the author now held):
+    /// it projects nothing (`NotAuthor`) and occupies no grant row, and the
+    /// author's own row then lands and the device opens the blob.
+    pub async fn exercise_i800_the_blob_arrival_race<B>(
+        a: &Node<'_, B>,
+        a2: &Node<'_, B>,
+        tag: &str,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        use crate::federation::at_rest_cascade::orchestrate::encrypt_and_cascade;
+        use crate::federation::key_grant::{project_key_grant_row, KeyGrantProjection};
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let owner = format!("{tag}-owner-{run}");
+        for n in [a, a2] {
+            ts::register_hybrid_key_as(n.backend, &owner, &owner, USER).await;
+            for dev in [a, a2] {
+                n.backend
+                    .put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
+                        identity_key_id: owner.clone(),
+                        occurrence_key_id: dev.key.clone(),
+                        device_class: crate::federation::types::device_class::LAPTOP.into(),
+                        hardware_attestation: None,
+                        asserted_at: chrono::Utc::now(),
+                        valid_until: None,
+                        encryption_pubkeys: Some(dev.kem.clone()),
+                        transport_binding: None,
+                        persist_row_hash: String::new(),
+                    })
+                    .await
+                    .unwrap();
+            }
+        }
+        let sealed = encrypt_and_cascade(
+            a.backend,
+            SELF,
+            &owner,
+            b"race photo",
+            None,
+            None,
+            Some(&a.key),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{tag} I800: A seals: {e}"));
+        let sha = sealed.at_rest_sha256;
+        // The unrelated signer's row, built off-node.
+        let stranger = node_signer(a2.backend, &format!("{tag}-x-{run}")).await;
+        let forged = sign_row_unstored(
+            &stranger,
+            &KeyGrantRow {
+                axis: KeyGrantAxis::Content {
+                    at_rest_sha256: hex::encode(sha),
+                    cohort_scope: SELF.into(),
+                    owner_key_id: owner.clone(),
+                },
+                wrap: crate::federation::GrantWrap {
+                    recipient_key_id: a2.key.clone(),
+                    wrap_algorithm: crate::federation::at_rest_cascade::WRAP_ALGORITHM_V2.into(),
+                    wrapped_dek: "{}".into(),
+                },
+            },
+        )
+        .await;
+        // The bytes arrive (the author is named), THEN the projection runs.
+        carry_bytes(
+            a,
+            a2,
+            &sha,
+            SELF,
+            &owner,
+            None,
+            CryptoTier::InvisibleEncrypted,
+            std::slice::from_ref(&a.key),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{tag} I800: the device adopts: {e}"));
+        assert_eq!(
+            project_key_grant_row(a2.backend, &forged.attestation)
+                .await
+                .unwrap(),
+            KeyGrantProjection::NotAuthor,
+            "{tag} I800: the stranger's row projects nothing"
+        );
+        assert!(
+            a2.backend
+                .get_at_rest_grant(&sha, &a2.key)
+                .await
+                .unwrap()
+                .is_none(),
+            "{tag} I800: the device's grant row is not occupied"
+        );
+        // The author's row lands and opens.
+        let emitted =
+            emit_content_key_grant_with_local_signer(a.backend, &a.signer, &sha, SELF, &owner)
+                .await
+                .unwrap()
+                .expect("wraps");
+        carry_key_grants(a, a2, &emitted)
+            .await
+            .unwrap_or_else(|e| panic!("{tag} I800: the author's row: {e}"));
+        assert_eq!(
+            read_any_for_viewer(a2.backend, &sha, &a2.key, None)
+                .await
+                .unwrap_or_else(|e| panic!("{tag} I800: the device opens: {e}")),
+            b"race photo"
+        );
+    }
+
     // ── I199 ─────────────────────────────────────────────────────────────
     /// **I199 (CIRISPersist#953) — a family member publishes a family blob
     /// and another member's node opens it.** The content-axis set names its
@@ -3571,6 +3682,15 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn i800_the_blob_arrival_race_sqlite() {
+            let (ba, bb) = (fresh().await, fresh().await);
+            let a = node(&ba, "i800-a").await;
+            let a2 = node(&bb, "i800-a2").await;
+            introduce(&[&a, &a2], &["i800-a", "i800-a2"]).await;
+            exercise_i800_the_blob_arrival_race(&a, &a2, "sqlite").await;
+        }
+
+        #[tokio::test]
         async fn i65_content_axis_second_device_sqlite() {
             let (ba, bb) = (fresh().await, fresh().await);
             let a = node(&ba, "i65-a").await;
@@ -5026,6 +5146,18 @@ mod tests {
             let b = node(&bb, "i199-b").await;
             introduce(&[&a, &b], &["i199-a", "i199-b"]).await;
             exercise_i199_family_member_publishes_and_another_opens(&a, &b, "postgres").await;
+        }
+
+        #[tokio::test]
+        async fn i800_the_blob_arrival_race_postgres() {
+            let (Some(ba), Some(bb)) = (fresh().await, fresh().await) else {
+                eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+                return;
+            };
+            let a = node(&ba, "i800-a").await;
+            let a2 = node(&bb, "i800-a2").await;
+            introduce(&[&a, &a2], &["i800-a", "i800-a2"]).await;
+            exercise_i800_the_blob_arrival_race(&a, &a2, "postgres").await;
         }
 
         #[tokio::test]

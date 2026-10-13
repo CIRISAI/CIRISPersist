@@ -2043,6 +2043,12 @@ pub enum KeyGrantProjection {
     /// Content axis: the bytes have not arrived; the row waits in the pending
     /// index for the adopt.
     Pending,
+    /// v55.0.0 (Codex r3 on #1065) — content axis: the bytes are held now and
+    /// the row's signer does not speak for their author (it was admitted
+    /// while the bytes were absent, then the blob arrived before this
+    /// projection). Nothing is written: the stored row grants nothing and
+    /// occupies no `(at_rest_sha256, recipient)` grant row.
+    NotAuthor,
 }
 
 /// §13 — **project one admitted key-grant row into this node's grant
@@ -2138,6 +2144,31 @@ where
                 )
                 .await?;
                 return Ok(KeyGrantProjection::Projected { written: n });
+            }
+            // Codex r3 on #1065 — the blob-arrival race: a row admitted while
+            // the bytes were absent passed the admission rule without an
+            // author to judge it by. The author is known NOW, so the signer is
+            // re-judged against it before any wrap is written, as the pending
+            // projection judges it: an unrelated signer must not take the
+            // first-write-wins `(at_rest_sha256, recipient)` row ahead of the
+            // author's own wrap.
+            let author = author.unwrap_or_default();
+            if !may_issue_grant_for(
+                backend,
+                signer,
+                &author,
+                crate::federation::admission::grant_chain_instant(row),
+            )
+            .await?
+            {
+                tracing::warn!(
+                    signer,
+                    author = %author,
+                    at_rest_sha256 = %at_rest_sha256,
+                    "content key_grant row projects nothing: its signer does not speak for the \
+                     author of the bytes now held (CIRISPersist#1065 r3)"
+                );
+                return Ok(KeyGrantProjection::NotAuthor);
             }
             backend
                 .put_at_rest_grants(&sha, cohort_scope, wraps)
