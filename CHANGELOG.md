@@ -7,6 +7,17 @@ threat-model citations because this crate's audit story is the point.
 
 ## [Unreleased]
 
+## [57.0.0] - UNRELEASED
+
+### Added — tooling: `scripts/cargo_guard.sh` (#1092)
+
+- One build at a time on the box (`flock`), an available-RAM floor (8 GB), and a
+  transient systemd user scope with `MemoryMax` (14 GB, no swap) so a runaway
+  cargo is OOM-killed inside its own scope instead of taking the session with
+  it (four sessions were lost that way during v55/v56). Every agent's cargo,
+  nextest and maturin call goes through it; exit 75/76 when the lock or the
+  floor is never met, 137 when the cap fires.
+
 ## [56.0.0] - 2026-10-14
 
 ### Security — rustls 0.23.46 (RUSTSEC-2026-0346, RUSTSEC-2026-0347)
