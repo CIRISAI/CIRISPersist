@@ -9,6 +9,14 @@ threat-model citations because this crate's audit story is the point.
 
 ## [56.0.0] - 2026-10-14
 
+### Security — rustls 0.23.46 (RUSTSEC-2026-0346, RUSTSEC-2026-0347)
+
+- Lockfile only: rustls 0.23.45 → 0.23.46. Both advisories were published
+  2026-10-14 and stopped this release's push at the pre-push `cargo deny`
+  leg. Neither reaches persist's surface (no custom `ClientSessionStore`
+  `Debug` logging; ECH is not enabled), so this is the dependency floor
+  moving, not a behaviour change.
+
 ### Fixed — tag CI: a restored cache never carries a build-script unit with missing outputs
 
 No library code changed.
