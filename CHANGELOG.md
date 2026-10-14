@@ -9,6 +9,19 @@ threat-model citations because this crate's audit story is the point.
 
 ## [57.0.0] - UNRELEASED
 
+### Fixed — tag CI: the restored cache repair runs `--strict` (v56.0.0 windows wheel)
+
+- No library code changed. The v56.0.0 tag run's `maturin abi3-py311 wheel
+  (windows-x86_64)` failed as v55.0.0's did (`out/bindgen.rs` missing under a
+  trusted `libsqlite3-sys` fingerprint) although the v55.0.1 repair ran: it
+  removed two other `libsqlite3-sys` units and KEPT the poisoned one as
+  "unverified, far from the cutoff". The single-cutoff bound assumes one
+  prune cycle; a unit no re-saving job compiles survives several, and its
+  file was pruned under an earlier cutoff. `.github/actions/ciriscache` now
+  runs `repair --strict`: every manifest-less build-script unit is dropped
+  (build scripts rerun, minutes) until a sealed save replaces the blob.
+  The v56.0.0 release body was set by hand, as v55.0.0's was.
+
 ### Changed — CIRISVerify v20.2.0 re-pin (CIRISVerify#309)
 
 - The seven Rust pins (`ciris-verify-core`, `ciris-keyring` ×4 targets,

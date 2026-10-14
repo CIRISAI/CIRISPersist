@@ -93,10 +93,14 @@ runs:
       run: |
         for py in python3 python; do
           if "$py" -c 'import sys' 2>/dev/null; then
-            # One blob is restored here (first hit wins), so the script's
-            # single-cutoff bound holds. A layered restore (several blobs
-            # overlaid) must repair after each layer or pass --strict.
-            exec "$py" scripts/ci_cache_units.py repair target
+            # --strict (v57.0.0): every manifest-less build-script unit goes.
+            # The single-cutoff bound of v55.0.1 kept the v56.0.0 tag's
+            # poisoned libsqlite3-sys unit: a unit unused by the jobs that
+            # re-saved this blob survives several prune cycles, so its lost
+            # out file was pruned under an EARLIER cutoff than the oldest
+            # surviving mtime implies. Cost: one build-script rerun per
+            # unsealed unit, once per blob, until a sealed save replaces it.
+            exec "$py" scripts/ci_cache_units.py repair --strict target
           fi
         done
         echo '::error::no python to repair the restored target/'; exit 1

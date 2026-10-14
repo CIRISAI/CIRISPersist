@@ -49,6 +49,14 @@ not removed outright (removing all of them cost the v55.0.1 PR run's
 It prints three counts: removed (manifest), removed (boundary), kept
 (unverified: manifest-less and far from the cutoff).
 
+v57.0.0 — the bound is UNSOUND across prune cycles, so the restore side now
+passes `--strict`. The v56.0.0 tag's windows wheel failed on a manifest-less
+`libsqlite3-sys` unit the bound kept: a unit no re-saving job compiled sits
+unused through several save+prune cycles, and its `out/` file was pruned
+under an earlier cutoff than the one the oldest SURVIVING mtime implies.
+The bound stays for a single-cycle restore (and in the self-test), but CI
+does not rely on it.
+
 The bound assumes ONE restored blob: one save pruned the whole tree in one
 pass, so one cutoff covers every file. A caller that overlays SEVERAL blobs
 (layers from different saves, each pruned at its own save; CIRISEdge
