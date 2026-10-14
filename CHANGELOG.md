@@ -514,7 +514,12 @@ pages arrive instead of growing with the claim history.
   `list_attestations_by_dimension_citing` loses its default body (it composed
   over a removed read) and is now required.
 - Telemetry: the eight per-method `door` label values of the attestation read
-  counters collapse into one, `attestation_query`.
+  counters collapse into one, `attestation_query`, recorded once per page by
+  the shared wrapper. Its `rows` are the rows the page returns; its `bytes`
+  are every envelope the statement decoded, which includes the one lookahead
+  row fetched past the page (the decode cost, as for every door). A page of
+  `n` rows with another page behind it reports `n` rows and `n + 1` rows'
+  bytes.
 - Python: `Engine.list_attestations_by(attesting_key_id, limit, cursor_json=None,
   dimension_prefix=None)` returns ONE page as `AttestationListPage` JSON
   (`{"items": […], "next_cursor": …}`) instead of a JSON list of every row;
