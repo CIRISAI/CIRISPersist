@@ -9,6 +9,18 @@ threat-model citations because this crate's audit story is the point.
 
 ## [57.0.0] - UNRELEASED
 
+### Changed — CIRISVerify v20.2.0 re-pin (CIRISVerify#309)
+
+- The seven Rust pins (`ciris-verify-core`, `ciris-keyring` ×4 targets,
+  `ciris-crypto`, the `server` feature set) move v20.1.0 → v20.2.0 together,
+  and the wheel's `Requires-Dist` floor to `ciris-verify>=20.2.0,<21` in
+  lockstep. v20.2.0 adds `ciris_crypto::transit_kex`, the A/V per-hop
+  transit key (CC 5.3.3.5 E1) that runs the hybrid X25519 + ML-KEM-768 KEX
+  against the static `transit_kex_pubkeys` pair persist stores on the
+  `transport_destination` binding since v56.0.0 (#1077). Persist stores the
+  pair; Edge runs the exchange. No persist API changes. `ciris-build-sign`
+  stays at the v20.1.0 prebuilt (no v20.2.0 GitHub release carries one).
+
 ### Added — tooling: `scripts/cargo_guard.sh` (#1092)
 
 - One build at a time on the box (`flock`), an available-RAM floor (8 GB), and a
