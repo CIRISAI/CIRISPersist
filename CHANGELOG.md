@@ -18,6 +18,28 @@ threat-model citations because this crate's audit story is the point.
   nextest and maturin call goes through it; exit 75/76 when the lock or the
   floor is never met, 137 when the cap fires.
 
+### Evidence — the register's hosted rows come home (#1091)
+
+No library code changed. `evidence/cc_impl.tsv` goes from 225 to 271 rows
+(46 added, none removed), each at the claim's own CC decimal under its claim
+id, so the CC's next re-pin can graduate them.
+
+- **27 claims** whose only CC pointer was a row the CIRISServer manifest
+  hosted for persist at ciris-persist@v17.0.1: 28 rows. 24 publish the
+  symbol the server named, which still exists here. Three duties moved:
+  `CLM-contributions` cites `holding_claim.rs#holding_claim_row` (the
+  retired `holds_bytes_attestation_envelope`'s successor, v55.0.0),
+  `CLM-local` cites `Engine::enter_mesh` (replaced `attestation_promote`
+  in v39.0.0), and `CLM-stream` cites `seal_stream_chunk` and
+  `open_stream_chunk` (`stream_nonce` is now a `ciris_crypto` re-export).
+- **13 symbols** persist already published at another decimal, now also at
+  the claim's own decimal (the nine the CC re-staged and the four it kept
+  established with a warning). The rows at the other decimals stay.
+- **`CLM-transit-kex-binding`** (CC 3.3.6.2, #1077), which shipped in
+  v56.0.0 without a row: five rows, `transit_kex_pair_for`, the two
+  `SignedTransportDestination` accessors, `transit_kex_pair_from_envelope`
+  and `verify_signed_transport_destination`.
+
 ## [56.0.0] - 2026-10-14
 
 ### Security — rustls 0.23.46 (RUSTSEC-2026-0346, RUSTSEC-2026-0347)
