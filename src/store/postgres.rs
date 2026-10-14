@@ -30714,6 +30714,12 @@ mod tests {
         };
         let backend = PostgresBackend::connect(&dsn).await.expect("connect");
         backend.run_migrations().await.expect("migrations run");
+        // v57.0.0 (#988 item 2) — a hard_case row needs this node's key.
+        crate::federation::hard_case::test_support::declare_node(
+            &backend,
+            &format!("pg-test-node-{}", uuid::Uuid::new_v4().simple()),
+        )
+        .await;
         let tag = uuid_like();
         crate::federation::node_state::parity_test_support::assert_node_state_surface(
             &backend, &tag,
@@ -33184,6 +33190,12 @@ mod tests {
         };
         let backend = PostgresBackend::connect(&dsn).await.expect("connect");
         backend.run_migrations().await.expect("migrations run");
+        // v57.0.0 (#988 item 2) — a hard_case row needs this node's key.
+        crate::federation::hard_case::test_support::declare_node(
+            &backend,
+            &format!("pg-test-node-{}", uuid::Uuid::new_v4().simple()),
+        )
+        .await;
         let suffix = uuid_like();
         crate::federation::quarantine::test_support::exercise_admin_ops(&backend, &suffix).await;
     }
@@ -34141,6 +34153,12 @@ mod tests {
         };
         let backend = PostgresBackend::connect(&dsn).await.expect("connect");
         backend.run_migrations().await.expect("migrations run");
+        // v57.0.0 (#988 item 2) — a hard_case row needs this node's key.
+        crate::federation::hard_case::test_support::declare_node(
+            &backend,
+            &format!("pg-test-node-{}", uuid::Uuid::new_v4().simple()),
+        )
+        .await;
 
         let now0 = chrono::Utc::now();
         let suffix = uuid_like();
@@ -34286,6 +34304,12 @@ mod tests {
         };
         let backend = PostgresBackend::connect(&dsn).await.expect("connect");
         backend.run_migrations().await.expect("migrations run");
+        // v57.0.0 (#988 item 2) — a hard_case row needs this node's key.
+        crate::federation::hard_case::test_support::declare_node(
+            &backend,
+            &format!("pg-test-node-{}", uuid::Uuid::new_v4().simple()),
+        )
+        .await;
 
         let now0 = chrono::Utc::now();
         let suffix = uuid_like();

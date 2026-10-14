@@ -31651,6 +31651,9 @@ mod tests {
     async fn admin_ops_parity_sqlite_570() {
         let backend = SqliteBackend::open_in_memory().await.unwrap();
         backend.run_migrations().await.unwrap();
+        // v57.0.0 (#988 item 2) — a hard_case row needs this node's key.
+        crate::federation::hard_case::test_support::declare_node(&backend, "sqlite-test-node")
+            .await;
         crate::federation::quarantine::test_support::exercise_admin_ops(&backend, "sqlite-qa")
             .await;
     }
@@ -33560,6 +33563,9 @@ mod tests {
         use std::time::Duration;
         let backend = SqliteBackend::open_in_memory().await.unwrap();
         backend.run_migrations().await.unwrap();
+        // v57.0.0 (#988 item 2) — a hard_case row needs this node's key.
+        crate::federation::hard_case::test_support::declare_node(&backend, "sqlite-test-node")
+            .await;
         for k in ["subject-p", "target-p"] {
             backend
                 .put_public_key(SignedKeyRecord {
@@ -33677,6 +33683,9 @@ mod tests {
         use std::time::Duration;
         let backend = SqliteBackend::open_in_memory().await.unwrap();
         backend.run_migrations().await.unwrap();
+        // v57.0.0 (#988 item 2) — a hard_case row needs this node's key.
+        crate::federation::hard_case::test_support::declare_node(&backend, "sqlite-test-node")
+            .await;
         for k in ["subject-r", "target-r"] {
             backend
                 .put_public_key(SignedKeyRecord {
@@ -41671,6 +41680,9 @@ mod tests {
         use crate::federation::types::{attestation_tier, attestation_type, LocalAttestationInput};
         use std::time::Duration;
         let backend = fresh_backend_with_occurrence("subject-c").await;
+        // v57.0.0 (#988 item 2) — a hard_case row needs this node's key.
+        crate::federation::hard_case::test_support::declare_node(&backend, "sqlite-test-node")
+            .await;
         backend
             .put_public_key(SignedKeyRecord {
                 record: fed_key("target-c", "registry", "target-c"),
@@ -54125,6 +54137,9 @@ INSERT INTO transport_destinations (occurrence_key_id, transport_kind, destinati
     async fn node_state_surface_sqlite() {
         let backend = SqliteBackend::open_in_memory().await.unwrap();
         backend.run_migrations().await.unwrap();
+        // v57.0.0 (#988 item 2) — a hard_case row needs this node's key.
+        crate::federation::hard_case::test_support::declare_node(&backend, "sqlite-test-node")
+            .await;
         crate::federation::node_state::parity_test_support::assert_node_state_surface(
             &backend, "sq",
         )

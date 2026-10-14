@@ -15901,6 +15901,9 @@ mod tests {
     #[tokio::test]
     async fn node_state_surface_memory() {
         let backend = MemoryBackend::new();
+        // v57.0.0 (#988 item 2) — a hard_case row needs this node's key.
+        crate::federation::hard_case::test_support::declare_node(&backend, "memory-test-node")
+            .await;
         crate::federation::node_state::parity_test_support::assert_node_state_surface(
             &backend, "mem",
         )
@@ -21980,6 +21983,9 @@ mod tests {
         use crate::federation::FederationDirectory;
         use std::time::Duration;
         let backend = MemoryBackend::new();
+        // v57.0.0 (#988 item 2) — a hard_case row needs this node's key.
+        crate::federation::hard_case::test_support::declare_node(&backend, "memory-test-node")
+            .await;
         for k in ["subject-c", "target-c"] {
             backend
                 .put_public_key(SignedKeyRecord {
@@ -22164,6 +22170,9 @@ mod tests {
         use crate::federation::FederationDirectory;
         use std::time::Duration;
         let backend = MemoryBackend::new();
+        // v57.0.0 (#988 item 2) — a hard_case row needs this node's key.
+        crate::federation::hard_case::test_support::declare_node(&backend, "memory-test-node")
+            .await;
         for k in ["subject-r", "target-r"] {
             backend
                 .put_public_key(SignedKeyRecord {
@@ -22937,6 +22946,9 @@ mod tests {
     #[tokio::test]
     async fn admin_ops_parity_memory_570() {
         let backend = MemoryBackend::new();
+        // v57.0.0 (#988 item 2) — a hard_case row needs this node's key.
+        crate::federation::hard_case::test_support::declare_node(&backend, "memory-test-node")
+            .await;
         crate::federation::quarantine::test_support::exercise_admin_ops(&backend, "memory-qa")
             .await;
     }
