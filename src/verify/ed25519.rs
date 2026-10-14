@@ -565,6 +565,14 @@ where
 /// it reconstructs exactly the bytes it did before, so no signature over a
 /// pre-#1249 trace changes; a trace WITH it verifies only if the producer
 /// signed it, so it cannot be added, dropped or edited after signing.
+///
+/// v56.0.0 (CIRISPersist#1089) — this lifts the TOP-LEVEL member only, and
+/// must. A `trace_format` v2.8.0 trace signs `run_kind` inside
+/// `deployment_profile`, which enters the canonical bytes as the typed
+/// profile serializes (`DeploymentProfile::run_kind` /
+/// `trace_format_version`); lifting it here as well would add a key the
+/// producer never signed. Run-kind GATES read both places through
+/// [`CompleteTrace::signed_run_kind`].
 fn with_signed_run_kind(canonical: &mut serde_json::Value, trace: &CompleteTrace) {
     if let (Some(kind), Some(obj)) = (&trace.run_kind, canonical.as_object_mut()) {
         obj.insert(
@@ -1506,6 +1514,8 @@ mod tests {
                 deployment_type: "production".into(),
                 deployment_region: None,
                 deployment_trust_mode: "federated_peer".into(),
+                run_kind: None,
+                trace_format_version: None,
             }),
             cohort_scope: "federation".into(),
             cohort_target_id: None,
@@ -1586,6 +1596,8 @@ mod tests {
             deployment_type: "smuggled".into(),
             deployment_region: Some("attacker".into()),
             deployment_trust_mode: "smuggled".into(),
+            run_kind: None,
+            trace_format_version: None,
         }));
         let bytes_a = PythonJsonDumpsCanonicalizer
             .canonicalize_value(&canonical_payload_value(&no_profile))

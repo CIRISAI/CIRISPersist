@@ -2980,15 +2980,26 @@ pub const PURGE_TOMBSTONE_SUBJECT_PLANE: &str = "purge_tombstone_subject";
 pub const TRACE_RUN_KIND_MOCK: &str = "trace_run_kind_mock";
 
 /// The `run_kind` value a mock-LLM run declares (closed vocabulary
-/// `production | qa | battery | mock`, CC 3.1.5).
+/// `schema::trace::RUN_KINDS`, CC 3.1.5).
 pub const RUN_KIND_MOCK: &str = "mock";
 
 /// A trace JSON's `run_kind` member, if it carries one. Pure. A SIGNED member
-/// of the trace (`CompleteTrace::run_kind`); producers emit it from
-/// CIRISAgent#1249.
+/// of the trace, read from either place a producer signs it: the top level
+/// (`CompleteTrace::run_kind`, CIRISAgent#1249) or, from `trace_format`
+/// v2.8.0, `deployment_profile.run_kind` (CIRISPersist#1089). Mirrors
+/// [`crate::schema::CompleteTrace::signed_run_kind`]. On a manifest (which has
+/// no profile) it reads the copied `manifest.run_kind`.
 #[must_use]
 pub fn trace_run_kind(trace: &serde_json::Value) -> Option<&str> {
-    trace.get("run_kind").and_then(serde_json::Value::as_str)
+    trace
+        .get("run_kind")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            trace
+                .get("deployment_profile")
+                .and_then(|p| p.get("run_kind"))
+                .and_then(serde_json::Value::as_str)
+        })
 }
 
 /// A `trace:complete:v1` attestation envelope's `run_kind`, from EITHER

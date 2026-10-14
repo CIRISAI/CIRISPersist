@@ -574,7 +574,9 @@ where
                 Ok(None) | Err(crate::federation::Error::Unsupported { .. }) => {}
                 Err(e) => return Err(IngestError::Store(StoreError::Backend(e.to_string()))),
             }
-            if trace.run_kind.as_deref() != Some(crate::federation::steward_purge::RUN_KIND_MOCK) {
+            // v56.0.0 (#1089) — the signed run_kind from either place it is
+            // signed (top level, or `deployment_profile.run_kind` at v2.8.0).
+            if trace.signed_run_kind() != Some(crate::federation::steward_purge::RUN_KIND_MOCK) {
                 continue;
             }
             let is_canonical = match canonical {
@@ -1228,7 +1230,9 @@ where
             // trace promoted as a manifest crossed the tier unrefused. Absent
             // when the trace carries none (a pre-CIRISAgent#1249 trace), as in
             // the inline form; a manifest without it is the legacy shape.
-            if let Some(kind) = &trace.run_kind {
+            // v56.0.0 (#1089) — copied from wherever the trace signs it:
+            // the top level, or `deployment_profile.run_kind` (v2.8.0).
+            if let Some(kind) = trace.signed_run_kind() {
                 manifest["run_kind"] = serde_json::json!(kind);
             }
             envelope = serde_json::json!({
@@ -2872,6 +2876,8 @@ mod tests {
                 deployment_type: "production".into(),
                 deployment_region: Some("US".into()),
                 deployment_trust_mode: "federated_peer".into(),
+                run_kind: None,
+                trace_format_version: None,
             }),
             cohort_scope: "federation".into(),
             cohort_target_id: None,

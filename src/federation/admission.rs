@@ -3086,21 +3086,45 @@ pub fn check_trace_dimension_admission(
     // v54.1.0 (Codex on PR #1057) — `run_kind` (CC 3.1.5), in EITHER shape,
     // is absent or a member of the closed vocabulary: the federation-tier mock
     // gate reads it as a string, so a malformed one must not read as "none".
-    let run_kind_ok =
-        |form: &str, obj: &serde_json::Map<String, serde_json::Value>| match obj.get("run_kind") {
-            None => Ok(()),
-            Some(serde_json::Value::String(k))
-                if crate::schema::trace::RUN_KINDS.contains(&k.as_str()) =>
-            {
-                Ok(())
-            }
-            Some(other) => Err(Error::TraceDimensionInvalid {
+    // v56.0.0 (#1089) — and the inline trace's `deployment_profile.run_kind`
+    // (`trace_format` v2.8.0) is held to the same vocabulary, since the mock
+    // gate reads it too (`steward_purge::trace_run_kind`).
+    let one_run_kind_ok = |form: &str, at: &str, v: Option<&serde_json::Value>| match v {
+        None => Ok(()),
+        Some(serde_json::Value::String(k))
+            if crate::schema::trace::RUN_KINDS.contains(&k.as_str()) =>
+        {
+            Ok(())
+        }
+        Some(other) => Err(Error::TraceDimensionInvalid {
+            detail: format!(
+                "trace:* {form} form: \"{at}\" {other} is not one of {:?} (CC 3.1.5)",
+                crate::schema::trace::RUN_KINDS
+            ),
+        }),
+    };
+    let run_kind_ok = |form: &str, obj: &serde_json::Map<String, serde_json::Value>| {
+        one_run_kind_ok(form, "run_kind", obj.get("run_kind"))?;
+        one_run_kind_ok(
+            form,
+            "deployment_profile.run_kind",
+            obj.get("deployment_profile")
+                .and_then(|p| p.get("run_kind")),
+        )?;
+        match (
+            obj.get("run_kind"),
+            obj.get("deployment_profile")
+                .and_then(|p| p.get("run_kind")),
+        ) {
+            (Some(a), Some(b)) if a != b => Err(Error::TraceDimensionInvalid {
                 detail: format!(
-                    "trace:* {form} form: \"run_kind\" {other} is not one of {:?} (CC 3.1.5)",
-                    crate::schema::trace::RUN_KINDS
+                    "trace:* {form} form: \"run_kind\" {a} disagrees with \
+                     \"deployment_profile.run_kind\" {b} (CIRISPersist#1089)"
                 ),
             }),
-        };
+            _ => Ok(()),
+        }
+    };
     match (inline, manifest) {
         (Some(t), None) => {
             let Some(t) = t.as_object() else {
