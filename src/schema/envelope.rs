@@ -262,6 +262,11 @@ impl BatchEnvelope {
                             return Err(super::Error::UnknownRunKind(kind.clone()));
                         }
                     }
+                    // v56.0.0 (CIRISPersist#1089) — the `trace_format` gate,
+                    // keyed on the signed `deployment_profile.trace_format_version`:
+                    // a vendored format validates against its pinned schema,
+                    // any other is refused by name, the batch whole.
+                    super::trace_format::check_trace_format(trace)?;
                 }
             }
         }

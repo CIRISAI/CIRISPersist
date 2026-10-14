@@ -24,6 +24,7 @@
 pub mod envelope;
 pub mod events;
 pub mod trace;
+pub mod trace_format;
 pub mod version;
 pub mod wire_datetime;
 
@@ -64,6 +65,38 @@ pub enum Error {
     /// not one of the closed vocabulary `production | qa | battery | mock`.
     #[error("unknown run_kind: {0:?}")]
     UnknownRunKind(String),
+
+    /// v56.0.0 (CIRISPersist#1089) — `deployment_profile.trace_format_version`
+    /// names a trace format this node has not vendored a schema for. Refused
+    /// by name, never truncated to a format it knows.
+    #[error("unsupported trace_format_version: {got:?}; vendored = {vendored:?}")]
+    UnsupportedTraceFormat {
+        /// The format string the producer signed.
+        got: String,
+        /// The formats this build has vendored.
+        vendored: &'static [&'static str],
+    },
+
+    /// v56.0.0 (CIRISPersist#1089) — a trace declaring a vendored
+    /// `trace_format_version` does not validate against that format's pinned
+    /// schema.
+    #[error("trace does not conform to trace_format {format}: {at}")]
+    TraceFormatViolation {
+        /// The vendored format the trace declared.
+        format: &'static str,
+        /// The first violation's instance path and schema path (paths only).
+        at: String,
+    },
+
+    /// v56.0.0 (CIRISPersist#1089) — the top-level `run_kind` and
+    /// `deployment_profile.run_kind` are both present and disagree.
+    #[error("run_kind conflict: top level {top_level:?}, deployment_profile {profile:?}")]
+    RunKindConflict {
+        /// The top-level member.
+        top_level: String,
+        /// The profile member.
+        profile: String,
+    },
 
     /// Required field missing per the wire-format spec.
     #[error("missing required field: {0}")]
@@ -132,6 +165,9 @@ impl Error {
             Error::UnsupportedSchemaVersion { .. } => "schema_unsupported_version",
             Error::UnknownTraceLevel(_) => "schema_unknown_trace_level",
             Error::UnknownRunKind(_) => "schema_unknown_run_kind",
+            Error::UnsupportedTraceFormat { .. } => "schema_unsupported_trace_format",
+            Error::TraceFormatViolation { .. } => "schema_trace_format_violation",
+            Error::RunKindConflict { .. } => "schema_run_kind_conflict",
             Error::MissingField(_) => "schema_missing_field",
             Error::FieldTypeMismatch { .. } => "schema_field_type_mismatch",
             Error::NegativeAttemptIndex(_) => "schema_negative_attempt_index",
@@ -174,6 +210,11 @@ impl Error {
             Error::Json(e) => Some(e.to_string()),
             Error::UnsupportedSchemaVersion { got, .. } => Some(got.clone()),
             Error::UnknownTraceLevel(s) | Error::UnknownRunKind(s) => Some(s.clone()),
+            Error::UnsupportedTraceFormat { got, .. } => Some(got.clone()),
+            Error::TraceFormatViolation { format, at } => Some(format!("{format}:{at}")),
+            Error::RunKindConflict { top_level, profile } => {
+                Some(format!("top_level={top_level},profile={profile}"))
+            }
             Error::MissingField(name) => Some((*name).to_string()),
             Error::FieldTypeMismatch {
                 field,

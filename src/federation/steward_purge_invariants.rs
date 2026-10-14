@@ -1957,6 +1957,388 @@ pub(crate) mod bodies {
         );
     }
 
+    // ── I1030–I1034 (#1089: trace_format v2.8.0 admission) ────────────────
+    /// A `trace_format` v2.8.0 `deployment_profile`: the six members of the 2.7.9 schema
+    /// plus, when given, `run_kind` and `trace_format_version`.
+    fn v28_profile(run_kind: Option<&str>, format: Option<&str>) -> serde_json::Value {
+        let mut p = serde_json::json!({
+            "agent_role": "ally",
+            "agent_template": "ally-v3-default",
+            "deployment_domain": "general",
+            "deployment_type": "personal",
+            "deployment_region": null,
+            "deployment_trust_mode": "federated_peer",
+        });
+        if let Some(k) = run_kind {
+            p["run_kind"] = serde_json::json!(k);
+        }
+        if let Some(f) = format {
+            p["trace_format_version"] = serde_json::json!(f);
+        }
+        p
+    }
+
+    /// A v2.8.0-shaped trace (JCS epoch `"3.0.0"`, `generic`, one THOUGHT_START
+    /// whose data is in the v2.8.0 generic field set), unsigned.
+    fn v28_trace_json(
+        trace_id: &str,
+        signer: &str,
+        run_kind: Option<&str>,
+        format: Option<&str>,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "trace_id": trace_id,
+            "thought_id": "th-1",
+            "task_id": "task-1",
+            "agent_id_hash": "deadbeef",
+            "started_at": "2026-10-14T00:15:53.123456Z",
+            "completed_at": "2026-10-14T00:16:12.789012Z",
+            "trace_level": "generic",
+            "trace_schema_version": "3.0.0",
+            "deployment_profile": v28_profile(run_kind, format),
+            "components": [{
+                "component_type": "observation",
+                "event_type": "THOUGHT_START",
+                "timestamp": "2026-10-14T00:15:53.123Z",
+                "agent_id_hash": "deadbeef",
+                "data": {"round_number": 0, "thought_depth": 1, "thought_type": "standard"},
+            }],
+            "signature": "",
+            "signature_key_id": signer,
+        })
+    }
+
+    /// Hybrid-sign `json` as its producer would, returning the signed trace
+    /// and the exact bytes signed. Built INDEPENDENTLY of persist's typed
+    /// `DeploymentProfile`: the canonical payload is reconstructed WITHOUT
+    /// the profile, and the RAW wire profile (every member the producer
+    /// signed) is spliced in, then JCS-canonicalised (the `"3.0.0"` epoch).
+    /// A typed struct that dropped a member would reconstruct other bytes.
+    fn sign_v28(mut json: serde_json::Value, signer: &str) -> (serde_json::Value, Vec<u8>) {
+        use crate::verify::canonical::Canonicalizer as _;
+        let mut bare = json.clone();
+        bare.as_object_mut().unwrap().remove("deployment_profile");
+        let typed: crate::schema::CompleteTrace = serde_json::from_value(bare).unwrap();
+        let mut canonical = crate::verify::ed25519::canonical_payload_value_v279(&typed);
+        canonical["deployment_profile"] = json["deployment_profile"].clone();
+        let bytes = crate::verify::canonical::JcsCanonicalizer
+            .canonicalize_value(&canonical)
+            .unwrap();
+        let sig = ts::threshold_sign(signer, &bytes);
+        json["signature"] = serde_json::json!(sig.ed25519_signature_base64);
+        json["signature_ml_dsa_65"] = serde_json::json!(sig.mldsa65_signature_base64);
+        json["pubkey_ml_dsa_65"] = serde_json::json!(ts::hybrid_pubkeys(signer).1);
+        json["pqc_key_id"] = serde_json::json!(signer);
+        (json, bytes)
+    }
+
+    /// A one-trace batch at `level`, envelope epoch `"3.0.0"`.
+    fn v28_batch(trace: &serde_json::Value, level: &str) -> Vec<u8> {
+        serde_json::json!({
+            "events": [{"event_type": "complete_trace", "trace_level": level, "trace": trace}],
+            "batch_timestamp": "2026-10-14T15:00:00+00:00",
+            "consent_timestamp": "2025-01-01T00:00:00Z",
+            "trace_level": level,
+            "trace_schema_version": "3.0.0",
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    pub(crate) async fn i1030_a_v28_mock_run_is_refused_from_the_profile<D: Seams>(d: &D) {
+        root(d).await;
+        let dir = d.as_dyn_directory();
+        // Production, signed in the profile: admitted, both halves verified,
+        // and the stored row reads the run kind from the profile.
+        let (prod, _) = sign_v28(
+            v28_trace_json("trace-i1030-prod", AGENT, Some("production"), Some("2.8.0")),
+            AGENT,
+        );
+        let summary = ingest_full(d, &v28_batch(&prod, "generic"))
+            .await
+            .unwrap_or_else(|e| panic!("I1030: a v2.8.0 production trace admits: {e}"));
+        assert_eq!(
+            summary.signatures_verified, 1,
+            "I1030: its signature verifies"
+        );
+        let att = dir
+            .get_attestation(&crate::ingest::trace_attestation_id("trace-i1030-prod"))
+            .await
+            .unwrap()
+            .expect("I1030: the trace attestation");
+        assert_eq!(
+            sp::trace_attestation_run_kind(&att.attestation_envelope),
+            Some("production"),
+            "I1030: the steward-purge read sees the profile's run_kind"
+        );
+        // Mock, signed in the profile, on the canonical: `trace_run_kind_mock`.
+        ts::register_hybrid_key(dir, NODE).await;
+        d.set_node(NODE);
+        d.set_identity_type(NODE, "node,canonical").await;
+        let (mock, _) = sign_v28(
+            v28_trace_json("trace-i1030-mock", AGENT, Some("mock"), Some("2.8.0")),
+            AGENT,
+        );
+        let e = ingest_full(d, &v28_batch(&mock, "generic"))
+            .await
+            .expect_err("I1030: a v2.8.0 mock run is refused on the canonical");
+        assert_eq!(e.kind(), sp::TRACE_RUN_KIND_MOCK, "I1030: {e}");
+        assert_eq!(
+            dir.purge_trace_row_counts(&["trace-i1030-mock".to_owned()])
+                .await
+                .unwrap(),
+            (0, 0),
+            "I1030: nothing written"
+        );
+    }
+
+    pub(crate) async fn i1031_v28_profile_members_round_trip_byte_identically<D: Seams>(d: &D) {
+        use crate::schema::{BatchEnvelope, BatchEvent};
+        root(d).await;
+        let dir = d.as_dyn_directory();
+        let (signed, signed_bytes) = sign_v28(
+            v28_trace_json("trace-i1031", AGENT, Some("qa"), Some("2.8.0")),
+            AGENT,
+        );
+        let bytes = v28_batch(&signed, "generic");
+        // Pure: the parsed trace keeps both members, typed, and re-canonicalises
+        // to exactly the bytes the producer signed.
+        let env = BatchEnvelope::from_json(&bytes).expect("I1031: a v2.8.0 trace parses");
+        let BatchEvent::CompleteTrace { trace, .. } = &env.events[0];
+        let profile = trace.deployment_profile.as_ref().expect("profile");
+        assert_eq!(profile.run_kind.as_deref(), Some("qa"), "I1031");
+        assert_eq!(
+            profile.trace_format_version.as_deref(),
+            Some("2.8.0"),
+            "I1031"
+        );
+        assert_eq!(trace.signed_run_kind(), Some("qa"), "I1031");
+        assert_eq!(
+            serde_json::to_value(profile).unwrap(),
+            signed["deployment_profile"],
+            "I1031: the typed profile serializes back to the wire profile"
+        );
+        let canon = crate::verify::canonical::canonicalizer_for(
+            crate::verify::ed25519::canon_version_for_trace_schema("3.0.0"),
+        );
+        let re = crate::verify::ed25519::canonical_bytes_for_trace(trace, canon).unwrap();
+        assert!(
+            re == signed_bytes,
+            "I1031: re-canonicalised bytes differ from the signed bytes\n re: {}\nsig: {}",
+            String::from_utf8_lossy(&re),
+            String::from_utf8_lossy(&signed_bytes)
+        );
+        // Through the store: admitted, verified, and the stored trace keeps both.
+        let summary = ingest_full(d, &bytes)
+            .await
+            .unwrap_or_else(|e| panic!("I1031: admits: {e}"));
+        assert_eq!(summary.signatures_verified, 1, "I1031");
+        let att = dir
+            .get_attestation(&crate::ingest::trace_attestation_id("trace-i1031"))
+            .await
+            .unwrap()
+            .expect("I1031: the trace attestation");
+        assert_eq!(
+            att.attestation_envelope["trace"]["deployment_profile"], signed["deployment_profile"],
+            "I1031: the stored trace keeps every signed profile member"
+        );
+    }
+
+    pub(crate) async fn i1032_a_v27_trace_is_unchanged<D: Seams>(d: &D) {
+        root(d).await;
+        let dir = d.as_dyn_directory();
+        // A v2.7.0 trace with a signed top-level run_kind: admitted as before.
+        let trace = signed_run_kind_trace("trace-i1032", AGENT, "production", "production");
+        let summary = ingest_full(d, &batch(&trace))
+            .await
+            .unwrap_or_else(|e| panic!("I1032: a v2.7.0 trace admits: {e}"));
+        assert_eq!(summary.signatures_verified, 1, "I1032");
+        let att = dir
+            .get_attestation(&crate::ingest::trace_attestation_id("trace-i1032"))
+            .await
+            .unwrap()
+            .expect("I1032: the trace attestation");
+        let stored = &att.attestation_envelope["trace"];
+        assert_eq!(stored["run_kind"], "production", "I1032");
+        assert!(
+            stored.get("deployment_profile").is_none(),
+            "I1032: {stored}"
+        );
+        // A six-member profile (the 2.7.9 schema): no new member appears, its bytes do
+        // not move, and the format gate passes it.
+        let six = v28_profile(None, None);
+        let typed: crate::schema::DeploymentProfile = serde_json::from_value(six.clone()).unwrap();
+        assert_eq!(typed.run_kind, None, "I1032");
+        assert_eq!(typed.trace_format_version, None, "I1032");
+        // The six members in declaration order, exactly as before #1089.
+        assert_eq!(
+            serde_json::to_string(&typed).unwrap(),
+            "{\"agent_role\":\"ally\",\"agent_template\":\"ally-v3-default\",\
+             \"deployment_domain\":\"general\",\"deployment_type\":\"personal\",\
+             \"deployment_region\":null,\"deployment_trust_mode\":\"federated_peer\"}",
+            "I1032: a v2.7.x profile serializes to the same bytes"
+        );
+        assert_eq!(serde_json::to_value(&typed).unwrap(), six, "I1032");
+        let mut t279 = v28_trace_json("trace-i1032-279", AGENT, None, None);
+        t279["trace_schema_version"] = serde_json::json!("2.7.9");
+        let typed: crate::schema::CompleteTrace = serde_json::from_value(t279).unwrap();
+        crate::schema::trace_format::check_trace_format(&typed)
+            .expect("I1032: a v2.7.x trace passes the format gate");
+        assert_eq!(typed.signed_run_kind(), None, "I1032");
+    }
+
+    pub(crate) async fn i1033_an_unvendored_format_is_refused_by_name<D: Seams>(d: &D) {
+        root(d).await;
+        let dir = d.as_dyn_directory();
+        // Correctly signed, an unvendored format: refused by name, nothing stored.
+        let (t, _) = sign_v28(
+            v28_trace_json("trace-i1033", AGENT, Some("production"), Some("2.9.0")),
+            AGENT,
+        );
+        let e = ingest_full(d, &v28_batch(&t, "generic"))
+            .await
+            .expect_err("I1033: an unvendored trace_format_version is refused");
+        assert_eq!(e.kind(), "schema_unsupported_trace_format", "I1033: {e}");
+        assert_eq!(e.detail().as_deref(), Some("2.9.0"), "I1033: by name");
+        assert!(
+            matches!(e, crate::ingest::IngestError::Schema(_)),
+            "I1033: the schema arm (Python ValueError): {e}"
+        );
+        assert_eq!(
+            dir.purge_trace_row_counts(&["trace-i1033".to_owned()])
+                .await
+                .unwrap(),
+            (0, 0),
+            "I1033: nothing written"
+        );
+        assert!(dir
+            .get_attestation(&crate::ingest::trace_attestation_id("trace-i1033"))
+            .await
+            .unwrap()
+            .is_none());
+        // The neighbouring refusals, each by its own name.
+        let refused = |t: serde_json::Value| async move {
+            ingest_full(d, &v28_batch(&t, "generic"))
+                .await
+                .expect_err("refused")
+        };
+        // run_kind in the profile without the format member.
+        let e = refused(v28_trace_json("trace-i1033-b", AGENT, Some("mock"), None)).await;
+        assert_eq!(e.kind(), "schema_missing_field", "I1033: {e}");
+        assert_eq!(
+            e.detail().as_deref(),
+            Some("deployment_profile.trace_format_version")
+        );
+        // The format on a 2.7.0 trace, whose profile is NOT signed.
+        let mut t = v28_trace_json("trace-i1033-c", AGENT, Some("production"), Some("2.8.0"));
+        t["trace_schema_version"] = serde_json::json!("2.7.0");
+        let e = refused(t).await;
+        assert_eq!(e.kind(), "schema_trace_format_violation", "I1033: {e}");
+        // A member the generic level does not admit: refused, never truncated.
+        let mut t = v28_trace_json("trace-i1033-d", AGENT, Some("production"), Some("2.8.0"));
+        t["components"][0]["data"]["task_description"] = serde_json::json!("full text");
+        let e = refused(t).await;
+        assert_eq!(e.kind(), "schema_trace_format_violation", "I1033: {e}");
+        assert!(
+            e.detail().unwrap().starts_with("2.8.0:/components/0/data"),
+            "I1033: {e:?}"
+        );
+        // Outside the vocabulary.
+        let e = refused(v28_trace_json(
+            "trace-i1033-e",
+            AGENT,
+            Some("staging"),
+            Some("2.8.0"),
+        ))
+        .await;
+        assert_eq!(e.kind(), "schema_unknown_run_kind", "I1033: {e}");
+        // Top level and profile disagree.
+        let mut t = v28_trace_json("trace-i1033-f", AGENT, Some("mock"), Some("2.8.0"));
+        t["run_kind"] = serde_json::json!("production");
+        let e = refused(t).await;
+        assert_eq!(e.kind(), "schema_run_kind_conflict", "I1033: {e}");
+        for tid in ["b", "c", "d", "e", "f"] {
+            assert_eq!(
+                dir.purge_trace_row_counts(&[format!("trace-i1033-{tid}")])
+                    .await
+                    .unwrap(),
+                (0, 0),
+                "I1033 {tid}: nothing written"
+            );
+        }
+    }
+
+    /// A scrubber that reports a named-entity pass at the batch's level, so a
+    /// `full_traces` batch can mint (the #690 gate); content untouched.
+    struct ClaimsNer;
+    impl crate::scrub::Scrubber for ClaimsNer {
+        fn scrub_batch(
+            &self,
+            env: &mut crate::schema::BatchEnvelope,
+        ) -> Result<crate::scrub::ScrubOutcome, crate::scrub::ScrubError> {
+            Ok(crate::scrub::ScrubOutcome {
+                fields_modified: 0,
+                ner_ran: true,
+                applied_trace_level: env.trace_level.as_str().to_owned(),
+                scrubber_model_digest: Some("test-model-1034".to_owned()),
+            })
+        }
+    }
+
+    pub(crate) async fn i1034_the_oversize_mint_copies_the_profile_run_kind<D: Seams>(d: &D) {
+        use ciris_keyring::Ed25519SoftwareSigner;
+        root(d).await;
+        let dir = d.as_dyn_directory();
+        // An oversize v2.8.0 mock trace, run_kind ONLY in the profile, kept by
+        // a node that is not the canonical. Schema-valid at full_traces.
+        let tid = "trace-i1034-big";
+        let mut t = v28_trace_json(tid, AGENT, Some(sp::RUN_KIND_MOCK), Some("2.8.0"));
+        t["trace_level"] = serde_json::json!("full_traces");
+        let chunk = "x".repeat(8000);
+        let n = crate::federation::admission::MAX_ATTESTATION_ENVELOPE_BYTES / 8000 + 16;
+        t["components"][0]["data"]["initial_context"] = serde_json::json!(vec![chunk; n]);
+        let mut signer = Ed25519SoftwareSigner::new("scrub-key-i1034");
+        signer.import_key(&[0xA7u8; 32]).expect("seed");
+        let pipeline = crate::ingest::IngestPipeline {
+            backend: d,
+            canonicalizer: &crate::verify::PythonJsonDumpsCanonicalizer,
+            scrubber: &ClaimsNer,
+            signer: &signer,
+            signer_key_id: "scrub-key-i1034",
+        };
+        pipeline
+            .receive_and_persist_with(
+                &v28_batch(&t, "full_traces"),
+                crate::ingest::VerifyMode::TrustPreVerified,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("I1034: a non-canonical node keeps its QA trace: {e}"));
+        let local = dir
+            .get_attestation(&crate::ingest::trace_attestation_id(tid))
+            .await
+            .unwrap()
+            .expect("I1034: the trace's own attestation");
+        let env = &local.attestation_envelope;
+        assert!(env.get("trace").is_none(), "I1034: the oversize form");
+        assert_eq!(
+            env["manifest"]["run_kind"],
+            sp::RUN_KIND_MOCK,
+            "I1034: the mint copied the profile's signed run_kind: {}",
+            env["manifest"]
+        );
+        assert_eq!(
+            sp::trace_attestation_run_kind(env),
+            Some(sp::RUN_KIND_MOCK),
+            "I1034: steward_purge's run-kind read sees it"
+        );
+        let mut crossing = local.clone();
+        crossing.tier = crate::federation::types::attestation_tier::FEDERATION.to_owned();
+        let e = crate::federation::admission::check_promotion_admission(dir, &crossing, None)
+            .await
+            .expect_err("I1034: a manifest-form v2.8.0 mock trace cannot cross");
+        assert_eq!(e.kind(), sp::TRACE_RUN_KIND_MOCK, "I1034 promotion: {e}");
+    }
+
     // ── I668 ──────────────────────────────────────────────────────────────
     pub(crate) async fn i668_the_receiver_re_asks_admissibility<D: Seams>(d: &D) {
         root(d).await;
@@ -3634,6 +4016,31 @@ mod run {
                 async fn i669() {
                     let Some(d) = $fresh.await else { return };
                     b::i669_a_run_kind_trace_format_is_refused_whole(&d).await
+                }
+                #[tokio::test]
+                async fn i1030() {
+                    let Some(d) = $fresh.await else { return };
+                    b::i1030_a_v28_mock_run_is_refused_from_the_profile(&d).await
+                }
+                #[tokio::test]
+                async fn i1031() {
+                    let Some(d) = $fresh.await else { return };
+                    b::i1031_v28_profile_members_round_trip_byte_identically(&d).await
+                }
+                #[tokio::test]
+                async fn i1032() {
+                    let Some(d) = $fresh.await else { return };
+                    b::i1032_a_v27_trace_is_unchanged(&d).await
+                }
+                #[tokio::test]
+                async fn i1033() {
+                    let Some(d) = $fresh.await else { return };
+                    b::i1033_an_unvendored_format_is_refused_by_name(&d).await
+                }
+                #[tokio::test]
+                async fn i1034() {
+                    let Some(d) = $fresh.await else { return };
+                    b::i1034_the_oversize_mint_copies_the_profile_run_kind(&d).await
                 }
                 #[tokio::test]
                 async fn i668() {

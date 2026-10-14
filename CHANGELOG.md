@@ -127,6 +127,86 @@ evidence claim. `docs/TOOLING.md` says how to run each and which is which.
   ci-hygiene `evidence-pointers` job (daily); `evidenceptrcc` reports the
   Constitution register when a checkout is found.
 
+### Added — trace_format v2.8.0 admission (#1089, CIRISAgent#1255)
+
+A v2.8.0 trace now admits. Before this, a v2.8.0 trace's run kind read as
+absent, so `trace_run_kind_mock` never fired. The two new profile members
+were also dropped on parse, so the re-canonicalised bytes did not match the
+signature.
+
+- **Where `run_kind` is read.** A v2.8.0 trace signs `run_kind` inside
+  `deployment_profile`, the only signed block the agent supplies. Every
+  run-kind gate now reads the signed member from either place through
+  `CompleteTrace::signed_run_kind`: the top level (v2.7.x) or
+  `deployment_profile.run_kind` (v2.8.0).
+  - The ingest mock gate on a canonical node reads it.
+  - The oversize mint copies it into `manifest.run_kind`.
+  - `steward_purge::trace_run_kind` reads it, and so do
+    `trace_attestation_run_kind` and the federation-tier attestation gate.
+  - The `trace:*` inline-form admission check holds
+    `deployment_profile.run_kind` to the closed vocabulary. A top level that
+    disagrees with it is refused.
+  - The canonical reconstruction is unchanged. It lifts only the top-level
+    member, because the profile member is signed where it sits.
+- **Typed, signed profile members.** `DeploymentProfile` gains
+  `run_kind: Option<String>` and `trace_format_version: Option<String>`. Each
+  is skipped when absent, so a v2.7.x profile serializes to the same bytes as
+  before. A v2.8.0 profile round-trips byte-identically through admission.
+- **The format gate keys on `deployment_profile.trace_format_version`.** This
+  is a signed member, distinct from `trace_schema_version`, which keeps
+  selecting canonicalization. The new module is `schema::trace_format`.
+  - `"2.8.0"` validates the whole trace against the vendored
+    `src/schema/trace_format_v2_8_0.json`.
+  - A format this node has not vendored is refused by name:
+    `schema_unsupported_trace_format`, with the format string as `detail`.
+    The batch is refused whole and nothing is written.
+  - A trace that does not conform is `schema_trace_format_violation`, never
+    truncated. The `detail` is the format plus the first violation's instance
+    path and schema path, with no payload values.
+  - `deployment_profile.run_kind` without the format member is
+    `schema_missing_field` (`deployment_profile.trace_format_version`). At
+    2.7.0 the profile is not in the signed bytes, so an unsigned `run_kind`
+    never reaches a gate.
+  - A top-level `run_kind` that disagrees with the profile's is
+    `schema_run_kind_conflict`. A profile `run_kind` outside the vocabulary is
+    `schema_unknown_run_kind`.
+  - All four are `schema::Error` variants. They reach Python as `ValueError`,
+    the type of the schema arm they join.
+- **The vendored schema.** It was copied byte-exact from
+  `CIRISAI/CIRISAgent@e7d9115180e8910999901f4805c31b617b34e8d5`, the head of
+  CIRISAgent#1255, at
+  `ciris_adapters/ciris_accord_metrics/schemas/trace_format_v2_8_0.json`. Its
+  SHA-256 is pinned in `TRACE_FORMAT_V2_8_0_SHA256`:
+
+  ```
+  8c51028c8983741f0e14c89c32988df6aacc0981db5a173814e31d9f461c9f81
+  ```
+
+- **Witnesses I1030–I1035.** They run on memory, sqlite and postgres. I1035
+  is a pure test.
+  - I1030: a v2.8.0 mock run is refused from the profile, and a production
+    run admits and verifies.
+  - I1031: the signed bytes equal the re-canonicalised bytes.
+  - I1032: a v2.7.x trace is unchanged.
+  - I1033: an unvendored format is refused by name, along with the
+    neighbouring refusals.
+  - I1034: the oversize mint copies the profile's `run_kind`, and the tier
+    crossing refuses the mock row.
+  - I1035: the schema hash is pinned.
+
+**CIRISAgent adoption.**
+- Emit `deployment_profile.trace_format_version: "2.8.0"` and
+  `deployment_profile.run_kind` together, with `trace_schema_version`
+  `"3.0.0"` (JCS).
+- A v2.8.0 trace must validate against the pinned schema byte-for-byte. A
+  different schema cut is an unvendored contract until persist re-vendors it.
+  That includes the cut planned on #1089 that adds `prod-personal` and
+  `prod-managed`.
+- Do not also emit a top-level `run_kind` that differs from the profile's.
+- v2.8.0 component data carries no `attempt_index`. At the `"3.0.0"` epoch,
+  persist stores an absent one as 0, so retries of one event share a dedup
+  key.
+
 ### Added — transit KEX pair on the TransportDestination binding (#1077, CC 3.3.6.2 rc8 2a7ed97)
 
 - **The member.** A signed `transport_destination` envelope may carry
