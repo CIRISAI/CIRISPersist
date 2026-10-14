@@ -250,6 +250,7 @@ pub(crate) trait AttestationStore:
     /// projection's live rows and its from-rows rebuild through the same
     /// writer, rendered for a byte comparison
     /// ([`super::silo_projection::check_projection_rebuild`]).
+    #[cfg_attr(not(any(feature = "sqlite", feature = "postgres")), allow(dead_code))]
     async fn projection_rebuild(
         &self,
         projection: super::silo_projection::SiloProjection,

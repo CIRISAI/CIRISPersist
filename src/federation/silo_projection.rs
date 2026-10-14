@@ -78,6 +78,9 @@ impl ProjectionRebuild {
 /// **The gate** (CLM-silo-projection-rebuildable): the projection rebuilt
 /// from the rows is byte-equal to the live table, or a refusal naming the
 /// first row that differs.
+// The no-backend builds hold only the memory backend, whose caller is the
+// test witness; the live predicate is `Engine::check_silo_projection`.
+#[cfg_attr(not(any(feature = "sqlite", feature = "postgres")), allow(dead_code))]
 pub(crate) async fn check_projection_rebuild<D>(
     dir: &D,
     projection: SiloProjection,

@@ -787,6 +787,7 @@ pub(crate) mod test_support {
 
     /// v57.0.0 (CIRISPersist#988) — hold `key_id` as an `identity_type` key,
     /// unless this directory already holds it (a shared test database).
+    #[cfg(feature = "postgres")]
     pub(crate) async fn hold_key_as<D>(dir: &D, key_id: &str, identity_type: &str)
     where
         D: crate::federation::FederationDirectory + ?Sized,

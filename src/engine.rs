@@ -21626,6 +21626,7 @@ mod tests {
     /// v57.0.0 (CIRISPersist#988 item 2) — hold the key an `Engine` declared as
     /// its node key (`set_node_key_id`, from its signer, label `label`), so its
     /// hard_case rows have their attester.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     async fn hold_engine_node_key<D>(dir: &D, label: &str)
     where
         D: crate::federation::FederationDirectory + ?Sized,
