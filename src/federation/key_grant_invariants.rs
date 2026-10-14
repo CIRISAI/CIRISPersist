@@ -3708,6 +3708,7 @@ mod tests {
         /// nothing and emits nothing.
         #[tokio::test]
         async fn i68_rekey_for_a_newcomer_emits_each_changed_blobs_content_set_sqlite() {
+            use crate::federation::attestation_query::test_support::AllAttestations as _;
             use crate::federation::key_grant::{KeyGrantAxis, KeyGrantRow};
             use crate::federation::tier_ingest::test_support as ts;
             use crate::federation::types::cohort_scope::SELF;
@@ -3759,7 +3760,7 @@ mod tests {
             // blob, one per recipient.
             let rows_for = |sq: std::sync::Arc<SqliteBackend>, me: String| async move {
                 let mut out: Vec<KeyGrantRow> = Vec::new();
-                for row in sq.list_attestations_by(&me).await.unwrap() {
+                for row in sq.all_attestations_by(&me).await.unwrap() {
                     if !crate::federation::key_grant::is_key_grant_row(&row) {
                         continue;
                     }
@@ -4679,6 +4680,7 @@ mod tests {
         /// durable, no set on the cursor.
         #[tokio::test]
         async fn i70_emission_ledger_repairs_a_missed_emission_sqlite() {
+            use crate::federation::attestation_query::test_support::AllAttestations as _;
             use crate::federation::community_dek::orchestrate::encrypt_and_cascade_community;
             use crate::federation::tier_ingest::test_support as ts;
             use crate::federation::types::cohort_scope::COMMUNITY;
@@ -4735,7 +4737,7 @@ mod tests {
             // v55.0.0 (#989) — the epoch-axis ROWS this node signed (one per
             // recipient: this node's occurrence and the member's).
             let epoch_sets = |sq: std::sync::Arc<SqliteBackend>, me: String| async move {
-                sq.list_attestations_by(&me)
+                sq.all_attestations_by(&me)
                     .await
                     .unwrap()
                     .into_iter()
@@ -4865,13 +4867,13 @@ mod tests {
         /// `Engine::read_blob_as`. `Engine::emit_key_grant` re-emits on demand.
         #[tokio::test]
         async fn i61_end_to_end_through_the_engine_doors_sqlite() {
+            use crate::federation::attestation_query::test_support::AllAttestations as _;
             use crate::federation::key_grant::{KeyGrantAxis, SignedKeyGrantRow};
             use crate::federation::tier_ingest::test_support as ts;
             use crate::federation::types::cohort_scope::{CryptoTier, COMMUNITY};
             use crate::federation::types::identity_type::USER;
             use crate::federation::{
                 AdoptDisposition, BlobBody, BlobProvenance, BlobStorage, EncryptionPubkeys,
-                FederationDirectory,
             };
             let run = uuid::Uuid::new_v4().simple().to_string();
             let (alias_a, alias_b) = (format!("eng-a-{run}"), format!("eng-b-{run}"));
@@ -4931,7 +4933,7 @@ mod tests {
             );
             let sha = r.at_rest_sha256;
             let emitted: Vec<_> = sa
-                .list_attestations_by(&a.key)
+                .all_attestations_by(&a.key)
                 .await
                 .unwrap()
                 .into_iter()

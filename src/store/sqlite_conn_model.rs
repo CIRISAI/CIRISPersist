@@ -314,6 +314,7 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("evict_fountain_content_to_tier", ConnClass::Write),
     ("evict_known_wire_hashes", ConnClass::Write),
     ("evict_scope_blobs", ConnClass::Write),
+    ("execute_attestation_query", ConnClass::Read),
     ("factor_rollup_present", ConnClass::Read),
     ("fetch_trace_events_page", ConnClass::Read),
     ("fountain_manifest_row", ConnClass::Read),
@@ -358,21 +359,13 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("list_at_rest_grants", ConnClass::Read),
     ("list_attestation_log", ConnClass::Read),
     ("list_attestations", ConnClass::Read),
-    ("list_attestations_by", ConnClass::Read),
-    ("list_attestations_for", ConnClass::Read),
     // v47.2.0 (#853) — composers naming a target, by `references_attestation_id`.
     ("list_attestations_referencing", ConnClass::Read),
-    // v53.1.5 — the bounded reads behind the audience resolver and the
-    // consent fold (V137 / V178 seeks).
-    ("list_attestations_by_dimension_prefix", ConnClass::Read),
-    ("list_attestations_for_dimension_prefix", ConnClass::Read),
+    // v53.1.5 — the composers naming a set of targets (V107 / V178 seeks).
+    // v56.0.0 (#1001): the dimension, type and typed reads beside it are
+    // retired onto `execute_attestation_query`.
     ("list_composers_referencing_any", ConnClass::Read),
-    // v53.1.6 — the type / citation / targeted seeks (V178, V180, V150).
-    ("list_attestations_for_type", ConnClass::Read),
-    ("list_attestations_by_type", ConnClass::Read),
-    // v53.1.7 — the trust-root walks' typed, job-filtered reads (V178 / V107):
-    // `list_attestations_for_types` / `_by_types` share this body.
-    ("sqlite_typed_read", ConnClass::Read),
+    // v53.1.6 — the citation / targeted seeks (V180, V150).
     ("list_attestations_by_dimension_citing", ConnClass::Read),
     // v55.0.0 (CIRISPersist#989) — V190's attester-free citation seek (the
     // holder directory's candidates).

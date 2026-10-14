@@ -38,7 +38,7 @@
       "unit": "By",
       "labels": [
         {"key": "backend", "values": ["memory", "postgres", "sqlite"]},
-        {"key": "door", "values": ["attestations_binding_content", "get_attestation", "list_attestation_log", "list_attestations", "list_attestations_by", "list_attestations_by_dimension_citing", "list_attestations_by_dimension_prefix", "list_attestations_by_type", "list_attestations_by_types", "list_attestations_for", "list_attestations_for_dimension_prefix", "list_attestations_for_migration", "list_attestations_for_type", "list_attestations_for_types", "list_attestations_referencing", "list_attestations_since", "list_composers_referencing_any", "list_live_consent_grants_by", "list_live_consent_grants_for", "list_local_tier_attestations", "list_targeted_by_dimension_prefix", "list_widening_candidates"]}
+        {"key": "door", "values": ["attestation_query", "attestations_binding_content", "get_attestation", "list_attestation_log", "list_attestations", "list_attestations_by_dimension_citing", "list_attestations_for_migration", "list_attestations_referencing", "list_attestations_since", "list_composers_referencing_any", "list_live_consent_grants_by", "list_live_consent_grants_for", "list_local_tier_attestations", "list_targeted_by_dimension_prefix", "list_widening_candidates"]}
       ]
     },
     {
@@ -47,7 +47,7 @@
       "unit": "{read}",
       "labels": [
         {"key": "backend", "values": ["memory", "postgres", "sqlite"]},
-        {"key": "door", "values": ["attestations_binding_content", "get_attestation", "list_attestation_log", "list_attestations", "list_attestations_by", "list_attestations_by_dimension_citing", "list_attestations_by_dimension_prefix", "list_attestations_by_type", "list_attestations_by_types", "list_attestations_for", "list_attestations_for_dimension_prefix", "list_attestations_for_migration", "list_attestations_for_type", "list_attestations_for_types", "list_attestations_referencing", "list_attestations_since", "list_composers_referencing_any", "list_live_consent_grants_by", "list_live_consent_grants_for", "list_local_tier_attestations", "list_targeted_by_dimension_prefix", "list_widening_candidates"]}
+        {"key": "door", "values": ["attestation_query", "attestations_binding_content", "get_attestation", "list_attestation_log", "list_attestations", "list_attestations_by_dimension_citing", "list_attestations_for_migration", "list_attestations_referencing", "list_attestations_since", "list_composers_referencing_any", "list_live_consent_grants_by", "list_live_consent_grants_for", "list_local_tier_attestations", "list_targeted_by_dimension_prefix", "list_widening_candidates"]}
       ]
     },
     {
@@ -56,7 +56,7 @@
       "unit": "{row}",
       "labels": [
         {"key": "backend", "values": ["memory", "postgres", "sqlite"]},
-        {"key": "door", "values": ["attestations_binding_content", "get_attestation", "list_attestation_log", "list_attestations", "list_attestations_by", "list_attestations_by_dimension_citing", "list_attestations_by_dimension_prefix", "list_attestations_by_type", "list_attestations_by_types", "list_attestations_for", "list_attestations_for_dimension_prefix", "list_attestations_for_migration", "list_attestations_for_type", "list_attestations_for_types", "list_attestations_referencing", "list_attestations_since", "list_composers_referencing_any", "list_live_consent_grants_by", "list_live_consent_grants_for", "list_local_tier_attestations", "list_targeted_by_dimension_prefix", "list_widening_candidates"]}
+        {"key": "door", "values": ["attestation_query", "attestations_binding_content", "get_attestation", "list_attestation_log", "list_attestations", "list_attestations_by_dimension_citing", "list_attestations_for_migration", "list_attestations_referencing", "list_attestations_since", "list_composers_referencing_any", "list_live_consent_grants_by", "list_live_consent_grants_for", "list_local_tier_attestations", "list_targeted_by_dimension_prefix", "list_widening_candidates"]}
       ]
     }
   ]

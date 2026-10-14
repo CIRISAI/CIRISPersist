@@ -327,8 +327,9 @@ pub(crate) mod bodies {
     where
         B: BlobStorage + FederationDirectory + Sync + 'static,
     {
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
         let hex_root = hex::encode(root);
-        let all = p.sb.list_attestations_by(&p.key_b).await.unwrap();
+        let all = p.sb.all_attestations_by(&p.key_b).await.unwrap();
         let retired = {
             let refs: Vec<&crate::federation::Attestation> = all.iter().collect();
             crate::federation::precedence::retired_ids(&refs)

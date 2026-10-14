@@ -47,6 +47,7 @@
 //! covered kind's put path right after (ideally in the same transaction as)
 //! the primary write.
 
+use super::attestation_query::{AttestationQuery, FOLD_PAGE};
 use super::Error;
 
 /// Encode a kind-specific primary-key tuple as a small JSON object —
@@ -625,9 +626,14 @@ pub async fn wire_refs_for_subject(
             out.push(("Key", content_hash_of(&wrapped)?, rk));
         }
     }
-    for a in dir.list_attestations_for(subject_key_id).await? {
-        let rk = record_key(&[("attestation_id", &a.attestation_id)]);
-        out.push(("Attestation", content_hash_of(&a)?, rk));
+    // Every attestation about the subject is a ref ("what is about me"):
+    // the whole slice, walked in pages.
+    let mut pages = AttestationQuery::to(subject_key_id, FOLD_PAGE).pages();
+    while let Some(page) = pages.next(dir).await? {
+        for a in page {
+            let rk = record_key(&[("attestation_id", &a.attestation_id)]);
+            out.push(("Attestation", content_hash_of(&a)?, rk));
+        }
     }
     // v31.1.0 (CIRISPersist#655, PR review P1) — the key-level revocation
     // plane. Indexing it made a revocation FETCHABLE by content hash; without

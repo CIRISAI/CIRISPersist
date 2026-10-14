@@ -1537,11 +1537,12 @@ pub mod test_support {
         /// row visible?" without the harness's own bookkeeping being part of
         /// the answer.
         pub async fn read_ids(&self) -> BTreeSet<String> {
+            use crate::federation::attestation_query::test_support::AllAttestations as _;
             let mut ids = BTreeSet::new();
             for p in Principal::ALL {
                 for row in self
                     .dir
-                    .list_attestations_for(self.kid(p).as_str())
+                    .all_attestations_for(self.kid(p).as_str())
                     .await
                     .expect("list_attestations_for")
                 {
@@ -1549,7 +1550,7 @@ pub mod test_support {
                 }
                 for row in self
                     .dir
-                    .list_attestations_by(self.kid(p).as_str())
+                    .all_attestations_by(self.kid(p).as_str())
                     .await
                     .expect("list_attestations_by")
                 {
@@ -1647,13 +1648,14 @@ pub mod test_support {
         /// is the exact defect class this exists to catch. The verifier IS the
         /// list.
         pub async fn assert_i1(&self, at: &str) -> usize {
+            use crate::federation::attestation_query::test_support::AllAttestations as _;
             let mut verified = 0usize;
             for p in Principal::ALL {
                 // The bare read (what `list_signed_records` wraps for the
                 // embedded-signature attestation kind).
                 for row in self
                     .dir
-                    .list_attestations_for(self.kid(p).as_str())
+                    .all_attestations_for(self.kid(p).as_str())
                     .await
                     .expect("list_attestations_for")
                 {
@@ -3319,6 +3321,7 @@ mod proptests {
     /// only incidentally is a property nobody is watching.
     #[tokio::test]
     async fn put_attestation_preserves_the_caller_declared_tier() {
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
         const TAG: &str = "put_attestat";
         use super::test_support::{register_cast, Family, Principal, SigState};
         use crate::federation::types::{attestation_tier, attestation_type, cohort_scope};
@@ -3376,7 +3379,7 @@ mod proptests {
             "AV-78: a row admitted under the local-tier exemption must STAY local"
         );
         assert!(
-            sq.list_attestations_for(Principal::A.key_id_in(TAG).as_str())
+            sq.all_attestations_for(Principal::A.key_id_in(TAG).as_str())
                 .await
                 .expect("list")
                 .is_empty(),
@@ -3482,6 +3485,7 @@ mod proptests {
     /// asserted directly on BOTH backends.
     #[tokio::test]
     async fn attestation_id_uniqueness_is_enforced_on_every_backend() {
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
         const TAG: &str = "idunique";
         use super::test_support::{register_cast, Family, Principal, SigState};
         use crate::federation::types::{attestation_tier, attestation_type, cohort_scope};
@@ -3548,7 +3552,7 @@ mod proptests {
                 "({name}) the original row is intact"
             );
             assert_eq!(
-                dir.list_attestations_by(&Principal::A.key_id_in(TAG))
+                dir.all_attestations_by(&Principal::A.key_id_in(TAG))
                     .await
                     .expect("list")
                     .len(),

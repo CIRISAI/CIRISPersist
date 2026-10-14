@@ -3024,8 +3024,8 @@ class Engine:
     def list_attestations(self, filter_json: str, cursor_json: str | None, limit: int, caller_occurrence_key_id: str | None) -> str:
         """(derived) empirical — Bulk-list federation_attestations. Returns JSON-encoded AttestationListPage."""
 
-    def list_attestations_by(self, attesting_key_id: str) -> str:
-        """(derived) empirical — Federation directory: list attestations issued by attesting_key_id."""
+    def list_attestations_by(self, attesting_key_id: str, limit: int, cursor_json: str | None = None, dimension_prefix: str | None = None) -> str:
+        """(derived) empirical — v56.0.0 (CIRISPersist#1001) — federation directory: ONE PAGE of the federation-tier attestations attesting_key_id issued, newest first, as a JSON A..."""
 
     def list_attestations_for(self, target_key_id: str, cursor_json: str | None = None, limit: int = 100, caller_occurrence_key_id: str | None = None) -> str:
         """(derived) empirical — #135 + part of #150 — list every attestation whose subject is target_key_id (attested_key_id = target_key_id), newest-first, cursor-paged. Scope is..."""

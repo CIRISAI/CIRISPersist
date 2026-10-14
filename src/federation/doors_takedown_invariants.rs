@@ -1503,6 +1503,7 @@ pub(crate) mod engine_bodies {
     ) where
         B: BlobStorage + FederationDirectory + Sync + 'static,
     {
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
         let l = ladder(dsn_a, dsn_b, run, pick).await;
         let author = format!("i791-author-{run}");
         ts::register_hybrid_key_as(l.ba.as_ref(), &author, &author, USER).await;
@@ -1514,7 +1515,7 @@ pub(crate) mod engine_bodies {
 
         let sha = hold(&l.engine_a, &author, format!("i791-{run}").as_bytes()).await;
         let claim = dir
-            .list_attestations_by(&l.node_a)
+            .all_attestations_by(&l.node_a)
             .await
             .unwrap()
             .into_iter()

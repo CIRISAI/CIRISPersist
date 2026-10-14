@@ -64,7 +64,8 @@ pub(crate) mod bodies {
         owner: &str,
         node: &str,
     ) -> Result<Option<BTreeSet<CohortEntry>>, Error> {
-        let rows = dir.list_attestations_by(owner).await?;
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
+        let rows = dir.all_attestations_by(owner).await?;
         let retired: HashSet<&str> = rows
             .iter()
             .filter(|r| crate::federation::precedence::is_structural_composer(&r.attestation_type))
@@ -107,6 +108,7 @@ pub(crate) mod bodies {
         dir: &dyn FederationDirectory,
         group: &str,
     ) -> Result<bool, Error> {
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
         if group == crate::federation::canonical_community::accord_family_key_id() {
             return Ok(true);
         }
@@ -136,7 +138,7 @@ pub(crate) mod bodies {
             HeadCharter::KeyRoot => None,
             _ => return Ok(false),
         };
-        let about = dir.list_attestations_for(group).await?;
+        let about = dir.all_attestations_for(group).await?;
         let refs: Vec<&Attestation> = about.iter().collect();
         let dead = crate::federation::precedence::retired_ids(&refs);
         Ok(about.iter().any(|a| {
@@ -156,7 +158,8 @@ pub(crate) mod bodies {
         subject: &str,
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<ConsentState, Error> {
-        let rows = dir.list_attestations_for(target).await?;
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
+        let rows = dir.all_attestations_for(target).await?;
         Ok(consent::fold_stance(&rows, subject, now, None))
     }
 
@@ -169,7 +172,8 @@ pub(crate) mod bodies {
         qualifier: Option<&str>,
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<ScopedStance, Error> {
-        let rows = dir.list_attestations_for(target).await?;
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
+        let rows = dir.all_attestations_for(target).await?;
         Ok(consent::fold_scoped_stance(
             &rows, subject, now, scope, qualifier,
         ))
@@ -185,12 +189,13 @@ pub(crate) mod bodies {
         qualifier: Option<&str>,
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<ScopedStance, Error> {
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
         let mut folded = vec![
             resolve_scoped_stance_reference(dir, target, subject, scope, qualifier, now).await?,
         ];
         let stewards = admission::steward_bindings_of(dir, subject).await?;
         if !stewards.is_empty() {
-            let rows = dir.list_attestations_for(target).await?;
+            let rows = dir.all_attestations_for(target).await?;
             for p in &stewards {
                 if p == subject {
                     continue;
@@ -1025,7 +1030,7 @@ pub(crate) mod bodies {
     /// The whole-slice reads a door made over `key`, from the probe.
     fn slice_reads_over(log: &[read_probe::Read], method: &str, key: &str) -> Vec<usize> {
         log.iter()
-            .filter(|r| r.method == method && r.key == key)
+            .filter(|r| r.is(method, key))
             .map(|r| r.rows)
             .collect()
     }
@@ -1033,7 +1038,7 @@ pub(crate) mod bodies {
     /// (rows, bytes) returned by every read keyed on `key`, whatever the method.
     fn reads_keyed_on(log: &[read_probe::Read], key: &str) -> (usize, usize) {
         log.iter()
-            .filter(|r| r.key == key)
+            .filter(|r| r.key == key || r.door_key() == key)
             .fold((0, 0), |(r, b), x| (r + x.rows, b + x.bytes))
     }
 
@@ -1418,7 +1423,7 @@ pub(crate) mod bodies {
             )
             .await;
         }
-        let about_t = FederationDirectory::list_attestations_for(d, &t)
+        let about_t = crate::federation::attestation_query::test_support::AllAttestations::all_attestations_for(d, &t)
             .await
             .unwrap()
             .len();
@@ -1529,14 +1534,14 @@ pub(crate) mod bodies {
 
     // ── I539 — a pre-53.1.5 implementor ──────────────────────────────────
 
-    /// **I539** — an implementor of only the pre-53.1.5 required methods
-    /// (the double, which inherits the three reads' DEFAULT bodies over its
-    /// delegated `list_attestations_by` / `_for` / `_referencing`) answers
-    /// every I533 / I534 / I536 question exactly as the real backend does;
-    /// the probe shows the default took the unbounded path and the backend
-    /// did not. Pin compatibility: an out-of-crate implementor compiles
-    /// unchanged and keeps today's answers; the indexed overrides are an
-    /// optimisation, never a semantic.
+    /// **I539** — an implementor of only the REQUIRED methods (the double,
+    /// which overrides no read with a default body) answers every I533 / I534
+    /// / I536 question exactly as the real backend does. v53.1.5–v55 the
+    /// probe showed that implementor taking the unbounded path through the
+    /// defaults; v56.0.0 (CIRISPersist#1001) deleted those defaults, the folds
+    /// read through the typed query every implementor must execute, and the
+    /// bare implementor takes the bounded path too — no default body reads
+    /// wider than its own query.
     pub async fn i539_a_pre_53_1_5_implementor_answers_as_the_backend_does(
         plain: &dyn FederationDirectory,
         legacy: &dyn FederationDirectory,
@@ -1562,8 +1567,8 @@ pub(crate) mod bodies {
                     "I539: owner_allow_list({o}, {n}) through the defaults"
                 );
                 assert!(
-                    !slice_reads_over(&read_probe::take(), "list_attestations_by", o).is_empty(),
-                    "I539: the default body reads the owner's slice — the probe sees it"
+                    slice_reads_over(&read_probe::take(), "list_attestations_by", o).is_empty(),
+                    "I539 (v56.0.0, #1001): the bare implementor takes the bounded path too"
                 );
                 asked += 1;
             }
@@ -1578,13 +1583,12 @@ pub(crate) mod bodies {
             );
             asked += 1;
         }
-        // A family with a charter reaches the slice read in the default.
+        // A family with a charter: the bare implementor reads no slice.
         let _ = read_probe::take();
         ra::is_public_group(legacy, &groups[0].0).await.unwrap();
         assert!(
-            !slice_reads_over(&read_probe::take(), "list_attestations_for", &groups[0].0)
-                .is_empty(),
-            "I539: the default body reads the group's slice — the probe sees it"
+            slice_reads_over(&read_probe::take(), "list_attestations_for", &groups[0].0).is_empty(),
+            "I539 (v56.0.0, #1001): the bare implementor reads no group slice"
         );
         let t = consent.target.as_str();
         for subject in &consent.subjects {
@@ -1627,9 +1631,9 @@ pub(crate) mod bodies {
                         "I539 by principals: {subject} {scope} {qualifier:?}"
                     );
                     assert!(
-                        !slice_reads_over(&read_probe::take(), "list_attestations_for", t)
+                        slice_reads_over(&read_probe::take(), "list_attestations_for", t)
                             .is_empty(),
-                        "I539: the default body reads the target's slice — the probe sees it"
+                        "I539 (v56.0.0, #1001): the bare implementor reads no target slice"
                     );
                     asked += 1;
                 }

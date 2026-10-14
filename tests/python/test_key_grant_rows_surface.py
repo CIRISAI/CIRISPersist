@@ -71,9 +71,19 @@ def _occurrence(eng, identity: str, occurrence: str, enc: dict) -> None:
 
 
 def _key_grant_rows(eng, signer: str) -> list[dict]:
+    # v56.0.0 (CIRISPersist#1001): list_attestations_by is one bounded page;
+    # walk the cursor, narrowed to the key-grant family.
+    rows: list[dict] = []
+    cursor = None
+    while True:
+        page = json.loads(eng.list_attestations_by(signer, 500, cursor, KEY_GRANT_PREFIX))
+        rows.extend(page["items"])
+        if page["next_cursor"] is None:
+            break
+        cursor = json.dumps(page["next_cursor"])
     return [
         r
-        for r in json.loads(eng.list_attestations_by(signer))
+        for r in rows
         if str((r.get("attestation_envelope") or {}).get("dimension", "")).startswith(
             KEY_GRANT_PREFIX
         )

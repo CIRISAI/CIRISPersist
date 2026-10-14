@@ -25,6 +25,7 @@
 
 use std::collections::BTreeSet;
 
+use super::attestation_query::{AttestationQuery, FOLD_PAGE};
 use super::{Attestation, Error, FederationDirectory};
 
 /// The `licensure:` dimension prefix. A dimension is
@@ -148,7 +149,13 @@ pub async fn status_set_for(
     authority_id: &str,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<BTreeSet<LicensureStatus>, Error> {
-    let rows = directory.list_attestations_for(subject_key_id).await?;
+    // Every row about the subject, in pages: each is asked whether it was
+    // issued under the authority, and the fold's retirement reads them all.
+    let mut rows = Vec::new();
+    let mut pages = AttestationQuery::to(subject_key_id, FOLD_PAGE).pages();
+    while let Some(page) = pages.next(directory).await? {
+        rows.extend(page);
+    }
     // v42.0.0 (CIRISPersist#814, CC ruling) — **fold by emitter-resolves-to-A.**
     //
     // A `licensure:{A}` row signed by a key that is neither `A` nor `A`'s

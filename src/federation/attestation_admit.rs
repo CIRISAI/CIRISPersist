@@ -136,7 +136,7 @@ impl PlannedAttestation {
     /// that is not [`Self::cycle_gated`].
     pub(crate) async fn recheck_cycle_under_lock<G>(&self, graph: &G) -> Result<(), Error>
     where
-        G: super::admission::DelegationGraphReads + ?Sized,
+        G: super::attestation_query::AttestationQueryExec + ?Sized,
     {
         if !self.cycle_gated {
             return Ok(());

@@ -95,6 +95,7 @@
 
 use chrono::{DateTime, Utc};
 
+use super::attestation_query::{AttestationQuery, FOLD_PAGE};
 use super::types::Attestation;
 use super::{Error, FederationDirectory};
 
@@ -160,7 +161,7 @@ pub const NAMESPACE_FAMILY: &str = "quarantine:{state}";
 pub mod field {
     /// The `federation_keys.key_id` being withheld / released. Also the
     /// marker's `attested_key_id`, so one existing read
-    /// ([`list_attestations_for`](crate::federation::FederationDirectory::list_attestations_for))
+    /// ([`list_attestations_for`](crate::federation::attestation_query::AttestationQuery::to))
     /// finds every marker about a key.
     pub const QUARANTINES: &str = "quarantines_key_id";
     /// The community whose named moderators are the `slash` duty-holder roots.
@@ -652,11 +653,24 @@ async fn markers_about<F>(directory: &F, key_id: &str) -> Result<Vec<Attestation
 where
     F: FederationDirectory + ?Sized,
 {
-    let rows = match directory.list_attestations_for(key_id).await {
-        Ok(rows) => rows,
-        Err(Error::Unsupported { .. }) => Vec::new(),
+    // Both marker dimensions share the `quarantine:` family: the prefix seek
+    // carries them, the exact match below picks them.
+    let mut rows = Vec::new();
+    let mut pages = AttestationQuery::to(key_id, FOLD_PAGE)
+        .dimension_prefix("quarantine:")
+        .pages();
+    let read: Result<(), Error> = async {
+        while let Some(page) = pages.next(directory).await? {
+            rows.extend(page);
+        }
+        Ok(())
+    }
+    .await;
+    match read {
+        Ok(()) => {}
+        Err(Error::Unsupported { .. }) => rows.clear(),
         Err(e) => return Err(e),
-    };
+    }
     Ok(rows
         .into_iter()
         .filter(|r| envelope_str(r, "dimension").is_some_and(is_marker_dimension))

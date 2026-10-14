@@ -48,6 +48,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use super::admission::envelope_dimension;
+use super::attestation_query::{AttestationQuery, FOLD_PAGE};
 use super::consent::{consent_dimension, grant_lapse_instant, ConsentCausalEdge};
 use super::envelope::{paths, EnvelopeCore};
 use super::types::{attestation_type, EmitAttestationInput};
@@ -174,7 +175,15 @@ where
 
             let target = &grant.attested_key_id;
             if !by_target.contains_key(target) {
-                let rows = dir.list_attestations_for(target).await?;
+                // The target's `consent:state:expired*` rows: the only rows
+                // `already_recorded` can match.
+                let mut rows = Vec::new();
+                let mut pages = AttestationQuery::to(target, FOLD_PAGE)
+                    .dimension_prefix(consent_dimension::STATE_EXPIRED_PREFIX)
+                    .pages();
+                while let Some(page) = pages.next(dir).await? {
+                    rows.extend(page);
+                }
                 by_target.insert(target.clone(), rows);
             }
             let rows = by_target.get(target).map(Vec::as_slice).unwrap_or(&[]);

@@ -52,21 +52,25 @@ pub(crate) mod bodies {
     where
         B: FederationDirectory + Sync,
     {
-        b.list_attestations_for_dimension_prefix(
+        let mut rows = Vec::new();
+        let mut pages = crate::federation::attestation_query::AttestationQuery::to(
             recipient,
-            Some(signer),
-            crate::federation::key_grant::KEY_GRANT_CONTENT_DIMENSION,
+            crate::federation::attestation_query::FOLD_PAGE,
         )
-        .await
-        .unwrap()
-        .iter()
-        .filter(|a| is_key_grant_row(a))
-        .filter_map(|a| KeyGrantRow::from_attestation(a).ok())
-        .filter(|r| {
-            matches!(&r.axis, KeyGrantAxis::Content { at_rest_sha256, .. }
+        .authored_by(signer)
+        .dimension_prefix(crate::federation::key_grant::KEY_GRANT_CONTENT_DIMENSION)
+        .pages();
+        while let Some(page) = pages.next(b).await.unwrap() {
+            rows.extend(page);
+        }
+        rows.iter()
+            .filter(|a| is_key_grant_row(a))
+            .filter_map(|a| KeyGrantRow::from_attestation(a).ok())
+            .filter(|r| {
+                matches!(&r.axis, KeyGrantAxis::Content { at_rest_sha256, .. }
                 if *at_rest_sha256 == hex::encode(sha))
-        })
-        .collect()
+            })
+            .collect()
     }
 
     async fn dirty<B: BlobStorage + Sync>(b: &B, me: &str, sha: &[u8; 32]) -> bool {

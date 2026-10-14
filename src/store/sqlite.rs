@@ -2463,41 +2463,6 @@ struct RawAggregationRow {
 // JSONB→serde_json::Value decode. Wire shape matches PG byte-for-byte.
 
 impl SqliteBackend {
-    /// v53.1.7 — the body of `list_attestations_for_types` / `_by_types`
-    /// over `key_column` ([`sqlite_attestations_typed_sql`]).
-    async fn sqlite_typed_read(
-        &self,
-        key_column: &'static str,
-        key: &str,
-        attestation_types: &[&str],
-        excluded_dimensions: &[&str],
-    ) -> Result<(Vec<crate::federation::Attestation>, u64), rusqlite::Error> {
-        if attestation_types.is_empty() {
-            return Ok((Vec::new(), 0));
-        }
-        let sql = sqlite_attestations_typed_sql(
-            key_column,
-            attestation_types.len(),
-            excluded_dimensions.len(),
-        );
-        let binds: Vec<SqlValue> = std::iter::once(key)
-            .chain(attestation_types.iter().copied())
-            .chain(excluded_dimensions.iter().copied())
-            .map(|v| SqlValue::Text(v.to_owned()))
-            .collect();
-        let (rows, bytes) = self
-            .read_measured(
-                move |conn| -> Result<Vec<crate::federation::Attestation>, rusqlite::Error> {
-                    let mut stmt = conn.prepare(&sql)?;
-                    let rows =
-                        stmt.query_map(params_from_iter(binds.iter()), sqlite_row_to_attestation)?;
-                    rows.collect()
-                },
-            )
-            .await;
-        Ok((rows?, bytes))
-    }
-
     /// #226 (V094) — assign `shard_key` to legacy `trace_events` rows that
     /// predate the sharded dedup index (their `shard_key` is `NULL`).
     ///
@@ -5513,34 +5478,48 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             .await
     }
 
-    async fn list_attestations_for(
+    /// v56.0.0 (CIRISPersist#1001) — the shared plan's one statement
+    /// ([`render_sql`](crate::federation::attestation_query::render_sql)),
+    /// on a reader.
+    async fn execute_attestation_query(
         &self,
-        attested_key_id: &str,
-    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
-        let key = attested_key_id.to_owned();
-        let (read, bytes) = self.read_measured(move |conn| -> Result<Vec<crate::federation::Attestation>, rusqlite::Error> {
-                let mut stmt = conn.prepare(
-                    "SELECT attestation_id, attesting_key_id, attested_key_id, attestation_type, \
-                        weight, asserted_at, expires_at, attestation_envelope, \
-                        original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
-                        scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at, additional_scrubs \
-                     FROM federation_attestations \
-                     WHERE attested_key_id = ?1 AND tier = 'federation' \
-                     ORDER BY asserted_at DESC",
-                )?;
-                let rows = stmt.query_map([&key], sqlite_row_to_attestation)?;
-                rows.collect()
-            }).await;
-        read.map_err(|e| crate::federation::Error::Backend(format!("list_attestations_for: {e}")))
-            .inspect(|rows| {
-                crate::observe::record_read(
-                    crate::observe::StoreBackend::Sqlite,
-                    crate::observe::Door::ListAttestationsFor,
-                    attested_key_id,
-                    rows,
-                    bytes,
-                )
+        q: &crate::federation::attestation_query::AttestationQuery,
+    ) -> Result<crate::federation::attestation_query::QueryRows, crate::federation::Error> {
+        use crate::federation::attestation_query::{render_sql, Bind, Dialect};
+        let stmt = render_sql(
+            q,
+            Dialect::Sqlite,
+            "federation_attestations",
+            SQLITE_ATTESTATION_COLUMNS,
+        );
+        let binds: Vec<SqlValue> = stmt
+            .binds
+            .into_iter()
+            .map(|b| match b {
+                Bind::Text(t) => SqlValue::Text(t),
+                Bind::Time(t) => SqlValue::Text(t.to_rfc3339()),
+                Bind::Int(n) => SqlValue::Integer(n),
             })
+            .collect();
+        let sql = stmt.sql;
+        let (read, bytes) = self
+            .read_measured(
+                move |conn| -> Result<Vec<crate::federation::Attestation>, rusqlite::Error> {
+                    let mut stmt = conn.prepare(&sql)?;
+                    let rows =
+                        stmt.query_map(params_from_iter(binds.iter()), sqlite_row_to_attestation)?;
+                    rows.collect()
+                },
+            )
+            .await;
+        let rows = read.map_err(|e| {
+            crate::federation::Error::Backend(format!("execute_attestation_query: {e}"))
+        })?;
+        Ok(crate::federation::attestation_query::QueryRows {
+            rows,
+            bytes,
+            backend: crate::observe::StoreBackend::Sqlite,
+        })
     }
 
     async fn list_attestations_referencing(
@@ -5581,124 +5560,6 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                 crate::observe::StoreBackend::Sqlite,
                 crate::observe::Door::ListAttestationsReferencing,
                 target_attestation_id,
-                rows,
-                bytes,
-            )
-        })
-    }
-
-    async fn list_attestations_by(
-        &self,
-        attesting_key_id: &str,
-    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
-        let key = attesting_key_id.to_owned();
-        let (read, bytes) = self.read_measured(move |conn| -> Result<Vec<crate::federation::Attestation>, rusqlite::Error> {
-                let mut stmt = conn.prepare(
-                    "SELECT attestation_id, attesting_key_id, attested_key_id, attestation_type, \
-                        weight, asserted_at, expires_at, attestation_envelope, \
-                        original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
-                        scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at, additional_scrubs \
-                     FROM federation_attestations \
-                     WHERE attesting_key_id = ?1 AND tier = 'federation' \
-                     ORDER BY asserted_at DESC",
-                )?;
-                let rows = stmt.query_map([&key], sqlite_row_to_attestation)?;
-                rows.collect()
-            }).await;
-        read.map_err(|e| crate::federation::Error::Backend(format!("list_attestations_by: {e}")))
-            .inspect(|rows| {
-                crate::observe::record_read(
-                    crate::observe::StoreBackend::Sqlite,
-                    crate::observe::Door::ListAttestationsBy,
-                    attesting_key_id,
-                    rows,
-                    bytes,
-                )
-            })
-    }
-
-    /// v53.1.5 — V137's `(attesting_key_id, dimension)` seek; the prefix is
-    /// the #817/#818 half-open byte range (`substr` only when no upper bound
-    /// is representable — never `LIKE`).
-    async fn list_attestations_by_dimension_prefix(
-        &self,
-        attesting_key_id: &str,
-        dimension_prefix: &str,
-    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
-        let mut binds: Vec<SqlValue> = vec![SqlValue::Text(attesting_key_id.to_owned())];
-        let prefix_sql = sqlite_dimension_prefix_clause(dimension_prefix, &mut binds);
-        let sql = format!(
-            "SELECT {SQLITE_ATTESTATION_COLUMNS} FROM federation_attestations \
-             WHERE attesting_key_id = ?1 AND tier = 'federation' AND {prefix_sql} \
-             ORDER BY asserted_at DESC"
-        );
-        let (read, bytes) = self
-            .read_measured(
-                move |conn| -> Result<Vec<crate::federation::Attestation>, rusqlite::Error> {
-                    let mut stmt = conn.prepare(&sql)?;
-                    let rows =
-                        stmt.query_map(params_from_iter(binds.iter()), sqlite_row_to_attestation)?;
-                    rows.collect()
-                },
-            )
-            .await;
-        read.map_err(|e| {
-            crate::federation::Error::Backend(format!("list_attestations_by_dimension_prefix: {e}"))
-        })
-        .inspect(|rows| {
-            crate::observe::record_read(
-                crate::observe::StoreBackend::Sqlite,
-                crate::observe::Door::ListAttestationsByDimensionPrefix,
-                attesting_key_id,
-                rows,
-                bytes,
-            )
-        })
-    }
-
-    /// v53.1.5 — V178's `(attested_key_id, dimension)` seek, the attested
-    /// twin of the read above; the optional attester narrows in the same
-    /// statement.
-    async fn list_attestations_for_dimension_prefix(
-        &self,
-        attested_key_id: &str,
-        attesting_key_id: Option<&str>,
-        dimension_prefix: &str,
-    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
-        let mut binds: Vec<SqlValue> = vec![SqlValue::Text(attested_key_id.to_owned())];
-        let prefix_sql = sqlite_dimension_prefix_clause(dimension_prefix, &mut binds);
-        let attester_sql = match attesting_key_id {
-            Some(k) => {
-                binds.push(SqlValue::Text(k.to_owned()));
-                format!(" AND attesting_key_id = ?{}", binds.len())
-            }
-            None => String::new(),
-        };
-        let sql = format!(
-            "SELECT {SQLITE_ATTESTATION_COLUMNS} FROM federation_attestations \
-             WHERE attested_key_id = ?1 AND tier = 'federation' AND {prefix_sql}{attester_sql} \
-             ORDER BY asserted_at DESC"
-        );
-        let (read, bytes) = self
-            .read_measured(
-                move |conn| -> Result<Vec<crate::federation::Attestation>, rusqlite::Error> {
-                    let mut stmt = conn.prepare(&sql)?;
-                    let rows =
-                        stmt.query_map(params_from_iter(binds.iter()), sqlite_row_to_attestation)?;
-                    rows.collect()
-                },
-            )
-            .await;
-        read.map_err(|e| {
-            crate::federation::Error::Backend(format!(
-                "list_attestations_for_dimension_prefix: {e}"
-            ))
-        })
-        .inspect(|rows| {
-            crate::observe::record_read(
-                crate::observe::StoreBackend::Sqlite,
-                crate::observe::Door::ListAttestationsForDimensionPrefix,
-                attested_key_id,
                 rows,
                 bytes,
             )
@@ -5767,136 +5628,6 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                 bytes,
             )
         })
-    }
-
-    /// v53.1.6 — V178's `(attested_key_id, attestation_type, …)` prefix seek.
-    async fn list_attestations_for_type(
-        &self,
-        attested_key_id: &str,
-        attestation_type: &str,
-    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
-        let binds: Vec<SqlValue> = vec![
-            SqlValue::Text(attested_key_id.to_owned()),
-            SqlValue::Text(attestation_type.to_owned()),
-        ];
-        let sql = sqlite_attestations_for_type_sql();
-        let (read, bytes) = self
-            .read_measured(
-                move |conn| -> Result<Vec<crate::federation::Attestation>, rusqlite::Error> {
-                    let mut stmt = conn.prepare(&sql)?;
-                    let rows =
-                        stmt.query_map(params_from_iter(binds.iter()), sqlite_row_to_attestation)?;
-                    rows.collect()
-                },
-            )
-            .await;
-        read.map_err(|e| {
-            crate::federation::Error::Backend(format!("list_attestations_for_type: {e}"))
-        })
-        .inspect(|rows| {
-            crate::observe::record_read(
-                crate::observe::StoreBackend::Sqlite,
-                crate::observe::Door::ListAttestationsForType,
-                attested_key_id,
-                rows,
-                bytes,
-            )
-        })
-    }
-
-    /// v53.1.6 — V107's `(attesting_key_id, attestation_type, …)` prefix
-    /// seek (`federation_attestations_composer_ref`, V141-preserved).
-    async fn list_attestations_by_type(
-        &self,
-        attesting_key_id: &str,
-        attestation_type: &str,
-    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
-        let binds: Vec<SqlValue> = vec![
-            SqlValue::Text(attesting_key_id.to_owned()),
-            SqlValue::Text(attestation_type.to_owned()),
-        ];
-        let sql = sqlite_attestations_by_type_sql();
-        let (read, bytes) = self
-            .read_measured(
-                move |conn| -> Result<Vec<crate::federation::Attestation>, rusqlite::Error> {
-                    let mut stmt = conn.prepare(&sql)?;
-                    let rows =
-                        stmt.query_map(params_from_iter(binds.iter()), sqlite_row_to_attestation)?;
-                    rows.collect()
-                },
-            )
-            .await;
-        read.map_err(|e| {
-            crate::federation::Error::Backend(format!("list_attestations_by_type: {e}"))
-        })
-        .inspect(|rows| {
-            crate::observe::record_read(
-                crate::observe::StoreBackend::Sqlite,
-                crate::observe::Door::ListAttestationsByType,
-                attesting_key_id,
-                rows,
-                bytes,
-            )
-        })
-    }
-
-    /// v53.1.7 — V178's `(attested_key_id, attestation_type, …)` seek, one
-    /// probe per type; the dimension exclusion is evaluated on the table row,
-    /// so an excluded row is never decoded.
-    async fn list_attestations_for_types(
-        &self,
-        attested_key_id: &str,
-        attestation_types: &[&str],
-        excluded_dimensions: &[&str],
-    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
-        let (rows, bytes) = self
-            .sqlite_typed_read(
-                "attested_key_id",
-                attested_key_id,
-                attestation_types,
-                excluded_dimensions,
-            )
-            .await
-            .map_err(|e| {
-                crate::federation::Error::Backend(format!("list_attestations_for_types: {e}"))
-            })?;
-        crate::observe::record_read(
-            crate::observe::StoreBackend::Sqlite,
-            crate::observe::Door::ListAttestationsForTypes,
-            attested_key_id,
-            &rows,
-            bytes,
-        );
-        Ok(rows)
-    }
-
-    /// v53.1.7 — V107's `(attesting_key_id, attestation_type, …)` seek, the
-    /// attesting twin of the read above.
-    async fn list_attestations_by_types(
-        &self,
-        attesting_key_id: &str,
-        attestation_types: &[&str],
-        excluded_dimensions: &[&str],
-    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
-        let (rows, bytes) = self
-            .sqlite_typed_read(
-                "attesting_key_id",
-                attesting_key_id,
-                attestation_types,
-                excluded_dimensions,
-            )
-            .await
-            .map_err(|e| {
-                crate::federation::Error::Backend(format!("list_attestations_by_types: {e}"))
-            })?;
-        crate::observe::record_read(
-            crate::observe::StoreBackend::Sqlite,
-            crate::observe::Door::ListAttestationsByTypes,
-            attesting_key_id,
-            &rows,
-            bytes,
-        );
-        Ok(rows)
     }
 
     /// v53.1.6 — V180's `(attesting_key_id, dimension, evidence_refs[0])`
@@ -23162,70 +22893,6 @@ fn sqlite_attestations_referencing_sql() -> String {
     )
 }
 
-/// v53.1.7 — `list_attestations_for_type`'s statement (`?1` attested, `?2`
-/// type), spelled once so I546's plan check reads the statement the door runs.
-///
-/// `ORDER BY +asserted_at`, as on [`sqlite_attestations_by_type_sql`]: without
-/// the pin the planner takes `federation_attestations_attested
-/// (attested_key_id, asserted_at DESC)` to skip the sort and walks every row
-/// about the subject to test its type; pinned, V178's `(attested_key_id,
-/// attestation_type, …)` seeks both equalities.
-fn sqlite_attestations_for_type_sql() -> String {
-    format!(
-        "SELECT {SQLITE_ATTESTATION_COLUMNS} FROM federation_attestations \
-         WHERE attested_key_id = ?1 AND attestation_type = ?2 AND tier = 'federation' \
-         ORDER BY +asserted_at DESC"
-    )
-}
-
-/// v53.1.6 — `list_attestations_by_type`'s statement (`?1` attester, `?2`
-/// type), spelled once so I545's plan check reads the statement the door runs.
-///
-/// `ORDER BY +asserted_at` is the documented unary-plus pin (a no-op on the
-/// value and its collation): without it the planner, with no `sqlite_stat1`,
-/// takes `federation_attestations_attesting (attesting_key_id, asserted_at
-/// DESC)` to skip the sort — and so visits EVERY row the attester authored
-/// to test its type, the very walk this read replaces. With the order term
-/// pinned off that index, V107's `composer_ref` seeks on both equalities and
-/// the handful of edges is sorted in a temp b-tree.
-fn sqlite_attestations_by_type_sql() -> String {
-    format!(
-        "SELECT {SQLITE_ATTESTATION_COLUMNS} FROM federation_attestations \
-         WHERE attesting_key_id = ?1 AND attestation_type = ?2 AND tier = 'federation' \
-         ORDER BY +asserted_at DESC"
-    )
-}
-
-/// v53.1.7 — `list_attestations_for_types` / `_by_types`'s statement over
-/// `key_column` (`attested_key_id` or `attesting_key_id`): `?1` the key, then
-/// `n_types` type binds, then `n_excluded` dimension binds. Spelled once so
-/// I547's plan check reads the statement the doors run. `+asserted_at` for
-/// the reason on [`sqlite_attestations_by_type_sql`]: V178 / V107 seek the
-/// (key, type) prefix; the key's `asserted_at`-ordered index would walk its
-/// whole slice. V106's generated `dimension` is the envelope's top-level
-/// `dimension` (`json_extract`, so a non-string value never equals a bound
-/// string); `NULL` is kept.
-fn sqlite_attestations_typed_sql(key_column: &str, n_types: usize, n_excluded: usize) -> String {
-    let types: Vec<String> = (0..n_types).map(|i| format!("?{}", i + 2)).collect();
-    let excluded: Vec<String> = (0..n_excluded)
-        .map(|i| format!("?{}", i + 2 + n_types))
-        .collect();
-    let dimension_sql = if excluded.is_empty() {
-        String::new()
-    } else {
-        format!(
-            " AND (dimension IS NULL OR dimension NOT IN ({}))",
-            excluded.join(", ")
-        )
-    };
-    format!(
-        "SELECT {SQLITE_ATTESTATION_COLUMNS} FROM federation_attestations \
-         WHERE {key_column} = ?1 AND attestation_type IN ({}) AND tier = 'federation'{dimension_sql} \
-         ORDER BY +asserted_at DESC",
-        types.join(", ")
-    )
-}
-
 /// v53.1.5 — the #817/#818 dimension-prefix predicate over V106's generated
 /// column: a half-open byte range when an upper bound is representable
 /// (index-served), `substr` otherwise. Never `LIKE` (case-folding, and
@@ -31148,7 +30815,7 @@ mod tests {
             .await
             .unwrap();
 
-        let got = crate::federation::FederationDirectory::list_attestations_for(&backend, "host-a")
+        let got = crate::federation::attestation_query::test_support::AllAttestations::all_attestations_for(&backend, "host-a")
             .await
             .unwrap()
             .into_iter()
@@ -31473,9 +31140,11 @@ mod tests {
     async fn escalation_on_silence_parity_sqlite_591() {
         let backend = SqliteBackend::open_in_memory().await.unwrap();
         backend.run_migrations().await.unwrap();
-        crate::federation::reverse_quorum::test_support::exercise_escalation_on_silence(
-            &backend,
-            "sqlite-esc",
+        Box::pin(
+            crate::federation::reverse_quorum::test_support::exercise_escalation_on_silence(
+                &backend,
+                "sqlite-esc",
+            ),
         )
         .await;
     }
@@ -33863,13 +33532,13 @@ mod tests {
         assert_eq!(key1.persist_row_hash, key2.persist_row_hash);
 
         let att1 =
-            crate::federation::FederationDirectory::list_attestations_for(&backend, "k-target")
+            crate::federation::attestation_query::test_support::AllAttestations::all_attestations_for(&backend, "k-target")
                 .await
                 .unwrap();
         assert_eq!(att1.len(), 1);
         assert_eq!(att1[0].persist_row_hash.len(), 64);
         let att2 =
-            crate::federation::FederationDirectory::list_attestations_for(&backend, "k-target")
+            crate::federation::attestation_query::test_support::AllAttestations::all_attestations_for(&backend, "k-target")
                 .await
                 .unwrap();
         assert_eq!(att1[0].persist_row_hash, att2[0].persist_row_hash);
@@ -33883,6 +33552,7 @@ mod tests {
 
     #[tokio::test]
     async fn federation_attestation_round_trip() {
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
         let backend = SqliteBackend::open_in_memory().await.unwrap();
         backend.run_migrations().await.unwrap();
         // Bootstrap two keys first (FK requirement).
@@ -33911,11 +33581,11 @@ mod tests {
             .unwrap();
 
         let by = backend
-            .list_attestations_by("registry-steward")
+            .all_attestations_by("registry-steward")
             .await
             .unwrap();
         assert_eq!(by.len(), 1);
-        let for_a = crate::federation::FederationDirectory::list_attestations_for(&backend, "k-a")
+        let for_a = crate::federation::attestation_query::test_support::AllAttestations::all_attestations_for(&backend, "k-a")
             .await
             .unwrap();
         assert_eq!(for_a.len(), 1);
@@ -41115,7 +40785,7 @@ mod tests {
         ));
         // No row leaked through.
         assert!(
-            crate::federation::FederationDirectory::list_attestations_for(&backend, "k-a")
+            crate::federation::attestation_query::test_support::AllAttestations::all_attestations_for(&backend, "k-a")
                 .await
                 .unwrap()
                 .is_empty()
@@ -41160,7 +40830,7 @@ mod tests {
             .put_attestation(SignedAttestation { attestation: att })
             .await
             .unwrap();
-        let rows = crate::federation::FederationDirectory::list_attestations_for(&backend, "k-a")
+        let rows = crate::federation::attestation_query::test_support::AllAttestations::all_attestations_for(&backend, "k-a")
             .await
             .unwrap();
         assert_eq!(rows.len(), 1);
@@ -41237,7 +40907,7 @@ mod tests {
         }
         // Rejected before INSERT — no row leaked through.
         assert!(
-            crate::federation::FederationDirectory::list_attestations_for(&backend, "k-a")
+            crate::federation::attestation_query::test_support::AllAttestations::all_attestations_for(&backend, "k-a")
                 .await
                 .unwrap()
                 .is_empty()
@@ -41269,7 +40939,7 @@ mod tests {
             .put_attestation(SignedAttestation { attestation: att })
             .await
             .unwrap();
-        let rows = crate::federation::FederationDirectory::list_attestations_for(&backend, "k-a")
+        let rows = crate::federation::attestation_query::test_support::AllAttestations::all_attestations_for(&backend, "k-a")
             .await
             .unwrap();
         assert_eq!(rows.len(), 1);
@@ -41407,7 +41077,7 @@ mod tests {
             "local row carries the deferred empty-sentinel signature"
         );
         // AV-59: the FederationDirectory trust-read does NOT surface local.
-        let trust = crate::federation::FederationDirectory::list_attestations_for(&backend, "occ")
+        let trust = crate::federation::attestation_query::test_support::AllAttestations::all_attestations_for(&backend, "occ")
             .await
             .unwrap();
         assert!(
@@ -42918,7 +42588,7 @@ mod tests {
             .put_attestation(SignedAttestation { attestation: att })
             .await
             .unwrap();
-        let rows = crate::federation::FederationDirectory::list_attestations_for(&backend, "k-a")
+        let rows = crate::federation::attestation_query::test_support::AllAttestations::all_attestations_for(&backend, "k-a")
             .await
             .unwrap();
         assert_eq!(rows.len(), 1);
@@ -43008,7 +42678,7 @@ mod tests {
             .put_attestation(SignedAttestation { attestation: att })
             .await
             .unwrap();
-        let rows = crate::federation::FederationDirectory::list_attestations_for(&backend, "k-a")
+        let rows = crate::federation::attestation_query::test_support::AllAttestations::all_attestations_for(&backend, "k-a")
             .await
             .unwrap();
         assert_eq!(rows.len(), 1);
@@ -43128,7 +42798,7 @@ mod tests {
             .put_attestation(SignedAttestation { attestation: att })
             .await
             .unwrap();
-        let rows = crate::federation::FederationDirectory::list_attestations_for(&backend, "k-a")
+        let rows = crate::federation::attestation_query::test_support::AllAttestations::all_attestations_for(&backend, "k-a")
             .await
             .unwrap();
         assert_eq!(rows.len(), 1);
@@ -43168,7 +42838,7 @@ mod tests {
             .put_attestation(SignedAttestation { attestation: att })
             .await
             .unwrap();
-        let rows = crate::federation::FederationDirectory::list_attestations_for(&backend, "k-a")
+        let rows = crate::federation::attestation_query::test_support::AllAttestations::all_attestations_for(&backend, "k-a")
             .await
             .unwrap();
         assert_eq!(rows.len(), 1);
@@ -43260,7 +42930,7 @@ mod tests {
             .put_attestation(SignedAttestation { attestation: w2 })
             .await
             .unwrap();
-        let rows = crate::federation::FederationDirectory::list_attestations_for(
+        let rows = crate::federation::attestation_query::test_support::AllAttestations::all_attestations_for(
             &backend,
             "registry-steward",
         )
@@ -43282,6 +42952,7 @@ mod tests {
 
     #[tokio::test]
     async fn sqlite_put_attestation_structural_dedup_distinguishes_distinct_triples() {
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
         let backend = SqliteBackend::open_in_memory().await.unwrap();
         backend.run_migrations().await.unwrap();
         for k in ["registry-steward", "k-a", "agent-2"] {
@@ -43330,7 +43001,7 @@ mod tests {
                 .unwrap();
         }
         let by_steward = backend
-            .list_attestations_by("registry-steward")
+            .all_attestations_by("registry-steward")
             .await
             .unwrap();
         let composers: Vec<_> = by_steward
@@ -43343,12 +43014,13 @@ mod tests {
             })
             .collect();
         assert_eq!(composers.len(), 3, "expected three distinct triples");
-        let by_agent = backend.list_attestations_by("agent-2").await.unwrap();
+        let by_agent = backend.all_attestations_by("agent-2").await.unwrap();
         assert_eq!(by_agent.len(), 1);
     }
 
     #[tokio::test]
     async fn sqlite_precedence_recants_wins_over_withdraws() {
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
         // CEG §6.1 — `recants` outranks `withdraws` regardless of
         // signed_at. Verified by composing the precedence_winner
         // helper over the same-attester chain.
@@ -43393,7 +43065,7 @@ mod tests {
             .await
             .unwrap();
         let all = backend
-            .list_attestations_by("registry-steward")
+            .all_attestations_by("registry-steward")
             .await
             .unwrap();
         let group: Vec<_> = all
@@ -45832,6 +45504,31 @@ mod tests {
     }
 
     /// `EXPLAIN QUERY PLAN` detail lines for `sql`, in plan order.
+    /// v56.0.0 (CIRISPersist#1001) — the plan of a typed query's one
+    /// statement, as the backend runs it.
+    async fn typed_query_plan(
+        backend: &SqliteBackend,
+        q: &crate::federation::attestation_query::AttestationQuery,
+    ) -> Vec<String> {
+        use crate::federation::attestation_query::{render_sql, Bind, Dialect};
+        let stmt = render_sql(
+            q,
+            Dialect::Sqlite,
+            "federation_attestations",
+            SQLITE_ATTESTATION_COLUMNS,
+        );
+        let binds = stmt
+            .binds
+            .into_iter()
+            .map(|b| match b {
+                Bind::Text(t) => SqlValue::Text(t),
+                Bind::Time(t) => SqlValue::Text(t.to_rfc3339()),
+                Bind::Int(n) => SqlValue::Integer(n),
+            })
+            .collect();
+        sqlite_plan(backend, &stmt.sql, binds).await
+    }
+
     async fn sqlite_plan(backend: &SqliteBackend, sql: &str, binds: Vec<SqlValue>) -> Vec<String> {
         let sql = format!("EXPLAIN QUERY PLAN {sql}");
         backend
@@ -46082,7 +45779,8 @@ mod tests {
         assert_eq!(page.items.len(), 300, "the room reader sees every trace");
     }
 
-    /// I545 (sqlite) — `list_attestations_by_type`'s plan seeks V107's
+    /// I545 (sqlite) — the by-type read's plan (v56.0.0: the typed query
+    /// `by(K).types([delegates_to])`, CIRISPersist#1001) seeks V107's
     /// `federation_attestations_composer_ref` on BOTH equality terms
     /// (attester and type), so a steward's `delegates_to` edges are read
     /// without visiting the steward's other rows.
@@ -46090,13 +45788,13 @@ mod tests {
     async fn i545_by_type_seeks_the_composer_ref_prefix() {
         let backend = SqliteBackend::open_in_memory().await.unwrap();
         backend.run_migrations().await.unwrap();
-        let plan = sqlite_plan(
+        let plan = typed_query_plan(
             &backend,
-            &sqlite_attestations_by_type_sql(),
-            vec![
-                SqlValue::Text("steward".into()),
-                SqlValue::Text("delegates_to".into()),
-            ],
+            &crate::federation::attestation_query::AttestationQuery::by(
+                "steward",
+                std::num::NonZeroU32::MIN,
+            )
+            .types(&["delegates_to"]),
         )
         .await;
         eprintln!("I545 list_attestations_by_type plan: {plan:?}");
@@ -46174,20 +45872,21 @@ mod tests {
         );
     }
 
-    /// I546c (sqlite) — `list_attestations_for_type` seeks V178's
+    /// I546c (sqlite) — the for-type read (v56.0.0: the typed query
+    /// `to(K).types([delegates_to])`) seeks V178's
     /// `(attested_key_id, attestation_type, …)` on both equalities, never the
     /// subject's whole slice in `asserted_at` order.
     #[tokio::test]
     async fn i546c_for_type_seeks_the_attested_type_prefix() {
         let backend = SqliteBackend::open_in_memory().await.unwrap();
         backend.run_migrations().await.unwrap();
-        let plan = sqlite_plan(
+        let plan = typed_query_plan(
             &backend,
-            &sqlite_attestations_for_type_sql(),
-            vec![
-                SqlValue::Text("subject".into()),
-                SqlValue::Text("delegates_to".into()),
-            ],
+            &crate::federation::attestation_query::AttestationQuery::to(
+                "subject",
+                std::num::NonZeroU32::MIN,
+            )
+            .types(&["delegates_to"]),
         )
         .await;
         eprintln!("I546c list_attestations_for_type plan: {plan:?}");
@@ -46228,21 +45927,20 @@ mod tests {
                 "federation_attestations_attesting ",
             ),
         ] {
-            let plan = sqlite_plan(
-                &backend,
-                &sqlite_attestations_typed_sql(column, 2, 2),
-                [
+            let q = if column == "attested_key_id" {
+                crate::federation::attestation_query::AttestationQuery::to(
                     "key",
-                    "delegates_to",
-                    "supersedes",
-                    "trust:accepts:v1",
-                    "trust:confers:v1",
-                ]
-                .into_iter()
-                .map(|v| SqlValue::Text(v.into()))
-                .collect(),
-            )
-            .await;
+                    std::num::NonZeroU32::MIN,
+                )
+            } else {
+                crate::federation::attestation_query::AttestationQuery::by(
+                    "key",
+                    std::num::NonZeroU32::MIN,
+                )
+            }
+            .types(&["delegates_to", "supersedes"])
+            .excluding_dimensions(&["trust:accepts:v1", "trust:confers:v1"]);
+            let plan = typed_query_plan(&backend, &q).await;
             eprintln!("I547 typed read over {column}: {plan:?}");
             assert!(
                 plan.iter().any(|l| l.starts_with(&format!(
@@ -49349,7 +49047,7 @@ mod tests {
             .await
             .unwrap();
         let stored =
-            crate::federation::FederationDirectory::list_attestations_for(&backend, "node-key")
+            crate::federation::attestation_query::test_support::AllAttestations::all_attestations_for(&backend, "node-key")
                 .await
                 .unwrap();
         assert_eq!(stored.len(), 1);
@@ -49387,7 +49085,7 @@ mod tests {
         }
         assert_eq!(err.kind(), "federation_node_agency_forbidden");
         assert!(
-            crate::federation::FederationDirectory::list_attestations_for(&backend, "node-key")
+            crate::federation::attestation_query::test_support::AllAttestations::all_attestations_for(&backend, "node-key")
                 .await
                 .unwrap()
                 .is_empty()
@@ -49410,7 +49108,7 @@ mod tests {
             crate::federation::Error::NodeAgencyForbidden { .. }
         ));
         assert!(
-            crate::federation::FederationDirectory::list_attestations_for(&backend, "node-key")
+            crate::federation::attestation_query::test_support::AllAttestations::all_attestations_for(&backend, "node-key")
                 .await
                 .unwrap()
                 .is_empty()
@@ -49450,7 +49148,7 @@ mod tests {
             .await
             .unwrap();
         let stored =
-            crate::federation::FederationDirectory::list_attestations_for(&backend, "agent-key")
+            crate::federation::attestation_query::test_support::AllAttestations::all_attestations_for(&backend, "agent-key")
                 .await
                 .unwrap();
         assert_eq!(stored.len(), 1);
@@ -49499,7 +49197,7 @@ mod tests {
                 "{dup_ity}: dup/whitespace node token must still hit the gate, got {err:?}"
             );
             assert!(
-                crate::federation::FederationDirectory::list_attestations_for(&backend, key_id)
+                crate::federation::attestation_query::test_support::AllAttestations::all_attestations_for(&backend, key_id)
                     .await
                     .unwrap()
                     .is_empty()
@@ -49576,7 +49274,7 @@ mod tests {
             );
         // Verify-before-mutation: the refusal leaves NO trace.
         let stored =
-            crate::federation::FederationDirectory::list_attestations_for(&backend, "node-agent")
+            crate::federation::attestation_query::test_support::AllAttestations::all_attestations_for(&backend, "node-agent")
                 .await
                 .unwrap();
         assert!(
@@ -49805,7 +49503,7 @@ mod tests {
         );
         assert_eq!(err.kind(), "federation_community_no_moderator");
         assert!(
-            crate::federation::FederationDirectory::list_attestations_for(&backend, "nm-no")
+            crate::federation::attestation_query::test_support::AllAttestations::all_attestations_for(&backend, "nm-no")
                 .await
                 .unwrap()
                 .is_empty()
@@ -49819,7 +49517,7 @@ mod tests {
             .await
             .expect("moderatored community continues to federate");
         assert_eq!(
-            crate::federation::FederationDirectory::list_attestations_for(&backend, "nm-ok")
+            crate::federation::attestation_query::test_support::AllAttestations::all_attestations_for(&backend, "nm-ok")
                 .await
                 .unwrap()
                 .len(),

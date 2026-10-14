@@ -3748,8 +3748,9 @@ pub mod test_support {
         attestation_id: &str,
         digest: &str,
     ) {
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
         let held = directory
-            .list_attestations_for(attested_key_id)
+            .all_attestations_for(attested_key_id)
             .await
             .expect("list charters")
             .into_iter()
@@ -3770,6 +3771,7 @@ pub mod test_support {
         charter: crate::federation::Attestation,
         signers: &[&str],
     ) -> Result<(), crate::federation::Error> {
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
         let family = charter.attested_key_id.clone();
         let id = charter.attestation_id.clone();
         directory
@@ -3778,7 +3780,7 @@ pub mod test_support {
             })
             .await?;
         let held = directory
-            .list_attestations_for(&family)
+            .all_attestations_for(&family)
             .await?
             .into_iter()
             .find(|a| a.attestation_id == id)
@@ -3862,6 +3864,7 @@ pub mod test_support {
         directory: &dyn crate::federation::FederationDirectory,
         tag: &str,
     ) -> Result<(), crate::federation::Error> {
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
         use crate::federation::trust_root::{
             active_roster_of, may_relay_accord_attestation, may_relay_accord_object,
             may_relay_accord_participation, ACCORD_HEARTBEAT_DIMENSION,
@@ -4203,7 +4206,7 @@ pub mod test_support {
             "({tag}) G1: {err}"
         );
         assert!(
-            directory.list_attestations_for(&subject).await?.is_empty(),
+            directory.all_attestations_for(&subject).await?.is_empty(),
             "({tag}) G1: the refused row must not have landed"
         );
 
@@ -4227,7 +4230,7 @@ pub mod test_support {
             .put_attestation(crate::federation::SignedAttestation { attestation: g2 })
             .await?;
         assert_eq!(
-            directory.list_attestations_for(&subject).await?.len(),
+            directory.all_attestations_for(&subject).await?.len(),
             1,
             "({tag}) G2: the same row NAMING its accord admits"
         );

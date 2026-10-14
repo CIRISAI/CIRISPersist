@@ -27,6 +27,60 @@ pub struct Read {
     pub rows: usize,
     /// Serialized envelope bytes returned.
     pub bytes: usize,
+    /// v56.0.0 (CIRISPersist#1001) — for a typed bounded read
+    /// (`attestation_query`), the query as it ran; `None` for every other
+    /// door.
+    pub query: Option<crate::federation::attestation_query::AttestationQuery>,
+}
+
+impl Read {
+    /// v56.0.0 (CIRISPersist#1001) — the door this read answers as: a
+    /// non-query read is its own method; a typed query answers as the read it
+    /// replaced ([`AttestationQuery::shape`]), so a witness that asks "did
+    /// this fold read K's whole slice?" keeps asking it after the fold moved
+    /// onto the query.
+    ///
+    /// [`AttestationQuery::shape`]: crate::federation::attestation_query::AttestationQuery::shape
+    #[must_use]
+    pub fn door(&self) -> &'static str {
+        match &self.query {
+            None => self.method,
+            Some(q) => q.shape(),
+        }
+    }
+
+    /// The key the [`Self::door`] read was pinned on: the attested key for a
+    /// `for` door, the attester for a `by` door.
+    #[must_use]
+    pub fn door_key(&self) -> &str {
+        match &self.query {
+            None => &self.key,
+            Some(q) => q.to.as_deref().or(q.by.as_deref()).unwrap_or("*"),
+        }
+    }
+
+    /// Whether this read answers as `door` over `key`.
+    #[must_use]
+    pub fn is(&self, door: &str, key: &str) -> bool {
+        self.door() == door && self.door_key() == key
+    }
+
+    /// Whether this read starts a walk: every non-query read, and a query's
+    /// first page (no cursor).
+    #[must_use]
+    pub fn is_first_page(&self) -> bool {
+        self.query.as_ref().is_none_or(|q| q.after.is_none())
+    }
+
+    /// Whether this read is a whole-slice read (`list_attestations_by` /
+    /// `_for`, or a query that answers as one) over any key.
+    #[must_use]
+    pub fn is_slice_read(&self) -> bool {
+        matches!(
+            self.door(),
+            "list_attestations_by" | "list_attestations_for"
+        )
+    }
 }
 
 thread_local! {
@@ -50,6 +104,33 @@ pub fn record<R: crate::observe::ReadRow>(method: &'static str, key: &str, rows:
             key: key.to_owned(),
             rows: rows.len(),
             bytes,
+            query: None,
+        });
+    });
+}
+
+/// v56.0.0 (CIRISPersist#1001) — record one typed bounded read, with its
+/// query. Called only from [`crate::observe::record_query_read`], which the
+/// shared wrapper calls once per query.
+pub fn record_query(
+    q: &crate::federation::attestation_query::AttestationQuery,
+    rows: &[crate::federation::Attestation],
+) {
+    let bytes = rows
+        .iter()
+        .map(|a| {
+            serde_json::to_string(&a.attestation_envelope)
+                .map(|s| s.len())
+                .unwrap_or(0)
+        })
+        .sum();
+    READS.with(|r| {
+        r.borrow_mut().push(Read {
+            method: crate::observe::Door::AttestationQuery.label(),
+            key: q.key().to_owned(),
+            rows: rows.len(),
+            bytes,
+            query: Some(q.clone()),
         });
     });
 }

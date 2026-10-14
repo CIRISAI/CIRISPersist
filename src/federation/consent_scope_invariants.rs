@@ -1096,6 +1096,7 @@ mod run {
     #[tokio::test]
     async fn i109_the_sweep_records_expiry_with_its_edge() {
         use super::bodies::{at, put, stance};
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
         use crate::federation::hard_case::ConsentState;
         use crate::federation::tier_ingest::test_support as ts;
         use crate::federation::types::identity_type::USER;
@@ -1151,7 +1152,7 @@ mod run {
             "I109: {r:?}"
         );
         let expired: Vec<_> = d
-            .list_attestations_for(&target)
+            .all_attestations_for(&target)
             .await
             .unwrap()
             .into_iter()

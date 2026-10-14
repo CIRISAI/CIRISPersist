@@ -540,6 +540,7 @@ pub mod bodies {
     where
         B: BlobStorage + FederationDirectory + Sync,
     {
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
         // The announcing key is the ENGINE's own local signer: `evict_blob`
         // retracts THIS node's claims, which are the ones that key made. The
         // runner seeds the engine from the label below; the assert pins it.
@@ -552,7 +553,7 @@ pub mod bodies {
             "I153: the runner's engine must be signed by the label this body rebuilds"
         );
         let withdraws_by = |n: String| async move {
-            b.list_attestations_by(&n)
+            b.all_attestations_by(&n)
                 .await
                 .unwrap()
                 .into_iter()
@@ -580,7 +581,7 @@ pub mod bodies {
         .await
         .expect("I153: announce");
         assert!(
-            b.list_attestations_by(&node)
+            b.all_attestations_by(&node)
                 .await
                 .unwrap()
                 .iter()

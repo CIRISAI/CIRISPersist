@@ -41,6 +41,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use super::attestation_query::{AttestationQuery, FOLD_PAGE};
 use super::hard_case::HardCaseEvent;
 use super::{Attestation, Error, FederationDirectory};
 
@@ -542,14 +543,25 @@ pub const MAX_SCAN_PAGES: usize = 128;
 ///
 /// `list_attestations_by` already narrows to one attester, so grouping by the
 /// referenced id alone IS the §6.1 per-attester grouping.
-async fn producer_retracted_ids(
+pub(crate) async fn producer_retracted_ids(
     dir: &dyn FederationDirectory,
     producer: &str,
 ) -> Result<std::collections::HashSet<String>, Error> {
     use super::precedence;
     use std::collections::{HashMap, HashSet};
 
-    let rows = dir.list_attestations_by(producer).await?;
+    // The producer's structural composers: the only rows grouped below.
+    let mut rows = Vec::new();
+    let mut pages = AttestationQuery::by(producer, FOLD_PAGE)
+        .types(&[
+            super::types::attestation_type::SUPERSEDES,
+            super::types::attestation_type::WITHDRAWS,
+            super::types::attestation_type::RECANTS,
+        ])
+        .pages();
+    while let Some(page) = pages.next(dir).await? {
+        rows.extend(page);
+    }
     let mut groups: HashMap<&str, Vec<&Attestation>> = HashMap::new();
     for composer in &rows {
         if !precedence::is_structural_composer(&composer.attestation_type) {

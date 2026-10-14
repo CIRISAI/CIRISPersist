@@ -854,6 +854,7 @@ pub mod test_support {
         tag: &str,
     ) {
         use crate::federation::admission::PEER_DEADMISSION_DIMENSION;
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
 
         let abuser = format!("{tag}-abuser");
         let innocent = format!("{tag}-innocent");
@@ -937,7 +938,7 @@ pub mod test_support {
         // REFUSED, not refused-after-storing. AV-9 wants the former, and the two
         // are indistinguishable from the error alone.
         let by_abuser = dir
-            .list_attestations_by(&abuser)
+            .all_attestations_by(&abuser)
             .await
             .expect("({tag}) #608: list_attestations_by");
         assert!(

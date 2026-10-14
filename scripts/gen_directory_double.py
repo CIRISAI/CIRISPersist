@@ -406,6 +406,21 @@ def render(methods) -> str:
             A(f"        self.inner.{name}()")
             A("    }")
             continue
+        if name == "execute_attestation_query":
+            # v56.0.0 (CIRISPersist#1001) — the typed read serves every
+            # attestation read, so a fixture also faults ONE query shape by
+            # the read it replaced (`AttestationQuery::shape`, e.g.
+            # "list_attestations_for_dimension_prefix").
+            A(f"    async fn {name}({arglist}) -> {ret} {{")
+            A(f'        if let Some(e) = self.faulted("{name}") {{')
+            A("            return Err(e);")
+            A("        }")
+            A(f"        if let Some(e) = self.faulted({call}.shape()) {{")
+            A("            return Err(e);")
+            A("        }")
+            A(f"        self.inner.{name}({call}).await")
+            A("    }")
+            continue
         A(f"    async fn {name}({arglist}) -> {ret} {{")
         if is_result:
             A(f'        if let Some(e) = self.faulted("{name}") {{')

@@ -21,6 +21,7 @@
 //! smallest attestation id; no grant means no consent. Capture resumes only
 //! on a FRESH grant asserted after `R`.
 
+use super::attestation_query::{AttestationQuery, FOLD_PAGE};
 use super::precedence::{references_attestation_id_from_envelope, retraction_entitled};
 use super::types::attestation_type;
 use super::{Attestation, Error, FederationDirectory};
@@ -140,6 +141,24 @@ pub async fn community_trust_consent_for(
     directory: &dyn FederationDirectory,
     node: &str,
 ) -> Result<Option<Attestation>, Error> {
-    let rows = directory.list_attestations_for(node).await?;
+    // The node's own community-trust grants and the composers about the
+    // node naming them: the fold reads nothing else.
+    let mut rows = Vec::new();
+    let mut pages = AttestationQuery::to(node, FOLD_PAGE)
+        .authored_by(node)
+        .types(&[attestation_type::SCORES])
+        .dimension_prefix(COMMUNITY_TRUST_PREFIX)
+        .pages();
+    while let Some(page) = pages.next(directory).await? {
+        rows.extend(page);
+    }
+    if !rows.is_empty() {
+        let ids: Vec<String> = rows.iter().map(|r| r.attestation_id.clone()).collect();
+        rows.extend(
+            directory
+                .list_composers_referencing_any(&ids, Some(node), None)
+                .await?,
+        );
+    }
     Ok(fold_community_trust(&rows, node))
 }

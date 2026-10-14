@@ -3263,12 +3263,28 @@ impl FederationDirectory for OpsDirectory {
             method: "attestation_insert_local",
         })
     }
-    async fn list_attestations_for(
+    // v56.0.0 (CIRISPersist#1001) — the typed bounded read, as the reads it
+    // replaces: not proxied across the capsule.
+    async fn execute_attestation_query(
         &self,
-        attested_key_id: &str,
-    ) -> Result<Vec<Attestation>, Error> {
+        q: &crate::federation::attestation_query::AttestationQuery,
+    ) -> Result<crate::federation::attestation_query::QueryRows, Error> {
+        let _ = q;
         Err(Error::Unsupported {
-            method: "list_attestations_for",
+            method: "execute_attestation_query",
+        })
+    }
+    // v56.0.0 (CIRISPersist#1001) — required now (its default composed over a
+    // retired read): not proxied across the capsule.
+    async fn list_attestations_by_dimension_citing(
+        &self,
+        attesting_key_id: &str,
+        dimension: &str,
+        evidence_ref: &str,
+    ) -> Result<Vec<Attestation>, Error> {
+        let _ = (attesting_key_id, dimension, evidence_ref);
+        Err(Error::Unsupported {
+            method: "list_attestations_by_dimension_citing",
         })
     }
     async fn list_attestations_referencing(
@@ -3278,35 +3294,6 @@ impl FederationDirectory for OpsDirectory {
         // v47.2.0 (#853) — as its siblings: not proxied across the capsule.
         Err(Error::Unsupported {
             method: "list_attestations_referencing",
-        })
-    }
-    async fn list_attestations_by(
-        &self,
-        attesting_key_id: &str,
-    ) -> Result<Vec<Attestation>, Error> {
-        Err(Error::Unsupported {
-            method: "list_attestations_by",
-        })
-    }
-    // v53.1.5 — the bounded reads, as their siblings: not proxied across
-    // the capsule.
-    async fn list_attestations_by_dimension_prefix(
-        &self,
-        attesting_key_id: &str,
-        dimension_prefix: &str,
-    ) -> Result<Vec<Attestation>, Error> {
-        Err(Error::Unsupported {
-            method: "list_attestations_by_dimension_prefix",
-        })
-    }
-    async fn list_attestations_for_dimension_prefix(
-        &self,
-        attested_key_id: &str,
-        attesting_key_id: Option<&str>,
-        dimension_prefix: &str,
-    ) -> Result<Vec<Attestation>, Error> {
-        Err(Error::Unsupported {
-            method: "list_attestations_for_dimension_prefix",
         })
     }
     async fn list_composers_referencing_any(

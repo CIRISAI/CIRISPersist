@@ -370,7 +370,8 @@ pub(crate) mod two_nodes {
         comm: &str,
         epoch: u64,
     ) -> Vec<(crate::federation::Attestation, KeyGrantRow)> {
-        n.list_attestations_by(signer)
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
+        n.all_attestations_by(signer)
             .await
             .unwrap()
             .into_iter()

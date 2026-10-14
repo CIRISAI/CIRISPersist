@@ -886,6 +886,7 @@ pub(crate) mod blob_bodies {
     where
         B: BlobStorage + FederationDirectory + Sync,
     {
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
         let n = node_as(b, &format!("i715-holder-{s}"), NODE).await;
         let bytes = format!("i715 public bytes {s}").into_bytes();
         let sha = sha256_of(&bytes);
@@ -914,7 +915,7 @@ pub(crate) mod blob_bodies {
         assert_eq!(c.attestation_envelope["size"], bytes.len() as u64);
         assert!(c.expires_at.is_some(), "I715 the row carries its freshness");
         assert!(
-            b.list_attestations_by(&n.key)
+            b.all_attestations_by(&n.key)
                 .await
                 .unwrap()
                 .iter()
@@ -1148,6 +1149,148 @@ pub(crate) mod blob_bodies {
             claims_of(b, &n.key, &kept).await.len(),
             2,
             "I725 one renewal, not one per pass"
+        );
+    }
+
+    /// **I910** (v56.0.0, CIRISPersist#1071) — the re-ack pass is capped,
+    /// oldest first, and nothing lapses. Five claims signed 70 h…66 h before
+    /// the first of three hourly passes, and one blob announced only under the
+    /// retired rc6 carrier: each pass signs at most
+    /// [`HOLDING_CLAIM_REACK_MAX_PER_PASS`] (2 under test) claims; the first
+    /// renews the two OLDEST, the second the next two, the third the last
+    /// renewal and then the conversion (renewals before conversions); the
+    /// rest is `deferred`. Before every pass every claim is still live, and
+    /// after the third every claim is renewed (live 60 h later). Every read a
+    /// pass makes is one page of at most its limit, and none reads the node's
+    /// whole authored slice: the retired rows are sought by type prefix and
+    /// walked a page at a time.
+    ///
+    /// [`HOLDING_CLAIM_REACK_MAX_PER_PASS`]: crate::federation::holding_claim::HOLDING_CLAIM_REACK_MAX_PER_PASS
+    pub(crate) async fn i910_the_reack_pass_is_capped_oldest_first<B>(b: &B, s: &str)
+    where
+        B: BlobStorage + FederationDirectory + Sync + LegacySeam,
+    {
+        use crate::federation::attestation_query::FOLD_PAGE;
+        use crate::federation::holding_claim::{
+            live_holders, reack_own_claims, HOLDING_CLAIM_REACK_MAX_PER_PASS as CAP,
+        };
+        use crate::federation::read_probe;
+        assert_eq!(CAP, 2, "I910 the test cap");
+        let n = node_as(b, &format!("i910-holder-{s}"), NODE).await;
+        let now = chrono::Utc::now();
+        let passes = [
+            now - chrono::Duration::hours(2),
+            now - chrono::Duration::hours(1),
+            now,
+        ];
+        let mut shas = Vec::new();
+        for i in 0..5_i64 {
+            let bytes = format!("i910 bytes {i} {s}").into_bytes();
+            let sha = sha256_of(&bytes);
+            b.put_blob_signing_scoped(
+                cs::FEDERATION,
+                None,
+                &sha,
+                BlobBody::Inline(bytes),
+                None,
+                &n.key,
+                &n.signer,
+                passes[0] - chrono::Duration::hours(70 - i),
+                uuid::Uuid::new_v4(),
+            )
+            .await
+            .expect("I910 an aged claim");
+            shas.push(sha);
+        }
+        // One blob announced only under the retired rc6 carrier.
+        let bytes = format!("i910 legacy {s}").into_bytes();
+        let legacy = sha256_of(&bytes);
+        b.put_blob_signing_scoped(
+            cs::FEDERATION,
+            None,
+            &legacy,
+            BlobBody::Inline(bytes),
+            None,
+            &n.key,
+            &n.signer,
+            passes[0] - chrono::Duration::hours(1),
+            uuid::Uuid::new_v4(),
+        )
+        .await
+        .unwrap();
+        let claim = claims_of(b, &n.key, &legacy).await.remove(0);
+        let rc6 = serde_json::json!({
+            "kind": "holds_bytes", "evidence_refs": [hex::encode(legacy)],
+        });
+        b.set_type(
+            &claim.attestation_id,
+            &format!("holds_bytes:sha256:{}", &hex::encode(legacy)[..8]),
+            Some(&rc6),
+        )
+        .await;
+
+        // (renewed, converted, deferred) per pass, and which claims each
+        // pass renewed (by index, oldest = 0).
+        let want = [
+            ((2, 0, 4), [0, 1]),
+            ((2, 0, 2), [2, 3]),
+            ((1, 1, 0), [4, 4]),
+        ];
+        for (k, (t, (counts, renewed))) in passes.iter().zip(want).enumerate() {
+            for (i, sha) in shas.iter().enumerate() {
+                assert_eq!(
+                    live_holders(b, sha, *t).await.unwrap(),
+                    vec![n.key.clone()],
+                    "I910 claim {i} is still live before pass {k}"
+                );
+            }
+            let _ = read_probe::take();
+            let r = reack_own_claims(b, &n.signer, *t).await.unwrap();
+            let log = read_probe::take();
+            assert!(
+                r.renewed + r.converted <= CAP,
+                "I910 pass {k} signs at most the cap: {r:?}"
+            );
+            assert_eq!(
+                (r.renewed, r.converted, r.deferred),
+                counts,
+                "I910 pass {k}: {r:?}"
+            );
+            for i in renewed {
+                assert!(
+                    claims_of(b, &n.key, &shas[i])
+                        .await
+                        .iter()
+                        .any(|c| (c.asserted_at - *t).num_milliseconds().abs() < 1_000),
+                    "I910 pass {k} renewed claim {i} (the oldest due)"
+                );
+            }
+            for read in &log {
+                if let Some(q) = &read.query {
+                    assert!(
+                        read.rows <= q.limit.get() as usize && q.limit <= FOLD_PAGE,
+                        "I910 pass {k}: a read past its page: {read:?}"
+                    );
+                }
+            }
+            assert!(
+                !log.iter()
+                    .any(|r| r.is_slice_read() && r.door_key() == n.key),
+                "I910 pass {k}: no read of the node's whole authored slice: {log:?}"
+            );
+        }
+        let later = passes[2] + chrono::Duration::hours(60);
+        for (i, sha) in shas.iter().enumerate() {
+            assert_eq!(
+                live_holders(b, sha, later).await.unwrap(),
+                vec![n.key.clone()],
+                "I910 claim {i} was renewed before it lapsed"
+            );
+        }
+        assert_eq!(
+            b.list_holders(&legacy).await.unwrap(),
+            vec![n.key.clone()],
+            "I910 the retired claim was converted"
         );
     }
 
@@ -2082,6 +2225,7 @@ mod runners {
                 one!(i725_the_reack_renews_what_is_held);
                 one!(i726_the_reack_converts_its_own_retired_claims);
                 one!(i771_the_reack_scan_is_not_an_access);
+                one!(i910_the_reack_pass_is_capped_oldest_first);
                 one!(i778_no_holding_claim_about_withheld_bytes);
                 #[tokio::test]
                 async fn i723_a_commons_claim_is_discovered_across_cohorts() {

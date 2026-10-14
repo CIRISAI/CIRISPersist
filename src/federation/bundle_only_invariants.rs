@@ -423,6 +423,7 @@ mod run {
     #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn i370_the_shipped_bundle_still_charters_the_accord_sqlite() {
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
         use crate::federation::genesis;
         use crate::store::Backend as _;
         if genesis::test_anchor_override_active() {
@@ -439,7 +440,7 @@ mod run {
             .await
             .expect("the shipped plane seeds on a fresh node");
         let family = crate::federation::canonical_community::accord_family_key_id();
-        let about = b.list_attestations_for(family).await.unwrap();
+        let about = b.all_attestations_for(family).await.unwrap();
         let charter = about
             .iter()
             .find(|a| a.attestation_id == "genesis-charter")

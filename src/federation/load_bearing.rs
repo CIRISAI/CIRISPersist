@@ -48,6 +48,7 @@
 //! coverage gate in [`super::namespace::supersets`] is what turns that gap
 //! from silent into loud.
 
+use crate::federation::attestation_query::{AttestationQuery, FOLD_PAGE};
 use crate::federation::{Attestation, Error, FederationDirectory};
 use serde::{Deserialize, Serialize};
 
@@ -700,20 +701,24 @@ async fn retained_replication(
     }
     let mut because: Vec<Dependency> = Vec::new();
     for peer in &row.subject_key_ids {
-        for held in directory.list_attestations_by(peer).await? {
-            // The grant itself is not evidence of its own necessity.
-            if held.attestation_id == row.attestation_id {
-                continue;
-            }
-            because.push(Dependency {
-                kind: DependencyKind::RetainedAttestation,
-                object_id: held.attestation_id.clone(),
-                detail: format!(
-                    "retained under this grant: a row authored by consented peer {peer}"
-                ),
-            });
-            if because.len() >= MAX_DEPENDENCIES_REPORTED {
-                return Ok(LoadBearing::Yes { because });
+        // The peer's rows, a page at a time: the report stops at its cap.
+        let mut pages = AttestationQuery::by(peer, FOLD_PAGE).pages();
+        while let Some(page) = pages.next(directory).await? {
+            for held in page {
+                // The grant itself is not evidence of its own necessity.
+                if held.attestation_id == row.attestation_id {
+                    continue;
+                }
+                because.push(Dependency {
+                    kind: DependencyKind::RetainedAttestation,
+                    object_id: held.attestation_id.clone(),
+                    detail: format!(
+                        "retained under this grant: a row authored by consented peer {peer}"
+                    ),
+                });
+                if because.len() >= MAX_DEPENDENCIES_REPORTED {
+                    return Ok(LoadBearing::Yes { because });
+                }
             }
         }
     }
@@ -728,8 +733,8 @@ async fn retained_replication(
 /// The key-record arm: a `federation_keys` row is load-bearing while any held
 /// row names it.
 ///
-/// Persist can prove YES from targeted reads — `list_attestations_by` (the key
-/// as attester) and `list_attestations_for` (the key as subject). It cannot yet
+/// Persist can prove YES from targeted reads — the key's rows as attester and
+/// as subject (the typed query, a page at a time). It cannot yet
 /// prove NO: "which rows name this key as `scrub_key_id` or co-scrub" has no
 /// index, and answering it would need a full corpus scan whose cost is not
 /// stage 1's to spend. So a key with no attestation dependency resolves
@@ -739,18 +744,22 @@ async fn key_record_load_bearing(
     key_id: &str,
 ) -> Result<LoadBearing, Error> {
     let mut because: Vec<Dependency> = Vec::new();
-    for (rows, role) in [
-        (directory.list_attestations_by(key_id).await?, "attester"),
-        (directory.list_attestations_for(key_id).await?, "subject"),
+    for (q, role) in [
+        (AttestationQuery::by(key_id, FOLD_PAGE), "attester"),
+        (AttestationQuery::to(key_id, FOLD_PAGE), "subject"),
     ] {
-        for held in rows {
-            because.push(Dependency {
-                kind: DependencyKind::NamingRow,
-                object_id: held.attestation_id.clone(),
-                detail: format!("a held attestation names {key_id} as its {role}"),
-            });
-            if because.len() >= MAX_DEPENDENCIES_REPORTED {
-                return Ok(LoadBearing::Yes { because });
+        // A page at a time: the report stops at its cap.
+        let mut pages = q.pages();
+        while let Some(page) = pages.next(directory).await? {
+            for held in page {
+                because.push(Dependency {
+                    kind: DependencyKind::NamingRow,
+                    object_id: held.attestation_id.clone(),
+                    detail: format!("a held attestation names {key_id} as its {role}"),
+                });
+                if because.len() >= MAX_DEPENDENCIES_REPORTED {
+                    return Ok(LoadBearing::Yes { because });
+                }
             }
         }
     }
@@ -1041,25 +1050,25 @@ pub async fn load_bearing_closure(
 
         match object {
             ObjectRef::KeyRecord { ref key_id } => {
-                for row in directory.list_attestations_by(key_id).await? {
-                    push(
-                        ObjectRef::Attestation {
-                            attestation_id: row.attestation_id,
-                        },
-                        &mut frontier,
-                        &mut visited,
-                        &mut revisits,
-                    );
-                }
-                for row in directory.list_attestations_for(key_id).await? {
-                    push(
-                        ObjectRef::Attestation {
-                            attestation_id: row.attestation_id,
-                        },
-                        &mut frontier,
-                        &mut visited,
-                        &mut revisits,
-                    );
+                // Every row naming the key, as attester then as subject, a
+                // page at a time.
+                for q in [
+                    AttestationQuery::by(key_id, FOLD_PAGE),
+                    AttestationQuery::to(key_id, FOLD_PAGE),
+                ] {
+                    let mut pages = q.pages();
+                    while let Some(page) = pages.next(directory).await? {
+                        for row in page {
+                            push(
+                                ObjectRef::Attestation {
+                                    attestation_id: row.attestation_id,
+                                },
+                                &mut frontier,
+                                &mut visited,
+                                &mut revisits,
+                            );
+                        }
+                    }
                 }
                 // RE-WALK DELEGATIONS by name (#650). The default impl derives
                 // these from `list_attestations_for`, but a backend may

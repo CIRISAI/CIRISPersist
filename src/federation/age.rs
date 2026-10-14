@@ -41,6 +41,7 @@
 //! axis without changing THIS primitive (the steward-binding axis keeps
 //! `unknown` = non-minor = self-sovereign).
 
+use super::attestation_query::{AttestationQuery, FOLD_PAGE};
 use super::{Error, FederationDirectory};
 
 /// v11.9.0 (CIRISPersist#309, CC 3.4.13 Q1) — the **four-band age
@@ -229,7 +230,15 @@ pub async fn age_band(directory: &dyn FederationDirectory, k: &str) -> Result<Ag
     // `list_attestations_for(k)` is ordered asserted_at DESC, so the first
     // matching witness row is the most recent.
     let mut self_says_minor = false;
-    for r in directory.list_attestations_for(k).await? {
+    // Every row about `k`, newest first, walked in pages: a claim token
+    // rides either the `scores` dimension or the legacy type slot
+    // (`row_type::claim_token`), so no one narrowing holds both shapes.
+    let mut rows = Vec::new();
+    let mut pages = AttestationQuery::to(k, FOLD_PAGE).pages();
+    while let Some(page) = pages.next(directory).await? {
+        rows.extend(page);
+    }
+    for r in rows {
         // Liveness: an expired age attestation confers nothing (#309 will add
         // richer supersede/withdraw liveness; expires_at only here).
         if let Some(exp) = r.expires_at {
@@ -299,7 +308,15 @@ pub async fn age_band_fine(
 ) -> Result<AgeBandFine, Error> {
     let now = chrono::Utc::now();
     let mut best_self_minor: Option<AgeBandFine> = None;
-    for r in directory.list_attestations_for(k).await? {
+    // Every row about `k`, newest first, walked in pages: a claim token
+    // rides either the `scores` dimension or the legacy type slot
+    // (`row_type::claim_token`), so no one narrowing holds both shapes.
+    let mut rows = Vec::new();
+    let mut pages = AttestationQuery::to(k, FOLD_PAGE).pages();
+    while let Some(page) = pages.next(directory).await? {
+        rows.extend(page);
+    }
+    for r in rows {
         if let Some(exp) = r.expires_at {
             if exp <= now {
                 continue;

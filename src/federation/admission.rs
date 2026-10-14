@@ -100,6 +100,7 @@
 use ciris_verify_core::classification::{Classification, Gating};
 use serde::{Deserialize, Serialize};
 
+use super::attestation_query::{AttestationQuery, FOLD_PAGE};
 use super::types::{attestation_type, identity_type};
 use super::Error;
 
@@ -3521,13 +3522,14 @@ pub async fn check_config_renewal_supersedes<F: super::FederationDirectory + ?Si
     // dimension (V178's attested+dimension seek) and the composers attested
     // to the subject naming them — the only rows the loop below can select
     // or retire by — not every row about the subject.
-    let existing = directory
-        .list_attestations_for_dimension_prefix(
-            &row.attested_key_id,
-            Some(&row.attesting_key_id),
-            dimension,
-        )
-        .await?;
+    let mut existing = Vec::new();
+    let mut pages = AttestationQuery::to(&row.attested_key_id, FOLD_PAGE)
+        .authored_by(&row.attesting_key_id)
+        .dimension_prefix(dimension)
+        .pages();
+    while let Some(page) = pages.next(directory).await? {
+        existing.extend(page);
+    }
     let ids: Vec<String> = existing.iter().map(|p| p.attestation_id.clone()).collect();
     let composers = directory
         .list_composers_referencing_any(&ids, Some(&row.attested_key_id), None)
@@ -3782,7 +3784,11 @@ pub async fn distinct_self_reporting_subjects<F: super::FederationDirectory + ?S
     let unexpired_outer = |r: &super::Attestation| r.expires_at.is_none_or(|e| e > now);
     let mut out = std::collections::BTreeSet::new();
     for subject in subject_key_ids {
-        let rows = directory.list_attestations_for(subject).await?;
+        let mut rows = Vec::new();
+        let mut pages = AttestationQuery::to(subject, FOLD_PAGE).pages();
+        while let Some(page) = pages.next(directory).await? {
+            rows.extend(page);
+        }
         let refs: Vec<&super::Attestation> = rows.iter().filter(|r| unexpired_outer(r)).collect();
         let retired = crate::federation::precedence::retired_ids(&refs);
         let superseded: std::collections::HashSet<&str> = rows
@@ -4295,12 +4301,16 @@ pub async fn licences_issued_under(
         if depth >= cap {
             continue;
         }
-        for e in directory.list_attestations_by(&key).await? {
-            if e.attestation_type == attestation_type::DELEGATES_TO
-                && delegation_scope_grants(&e.attestation_envelope, DELEGATION_SCOPE_LICENSE)
-                && issuers.insert(e.attested_key_id.clone())
-            {
-                queue.push_back((e.attested_key_id, depth + 1));
+        let mut pages = AttestationQuery::by(&key, FOLD_PAGE)
+            .types(&[attestation_type::DELEGATES_TO])
+            .pages();
+        while let Some(page) = pages.next(directory).await? {
+            for e in page {
+                if delegation_scope_grants(&e.attestation_envelope, DELEGATION_SCOPE_LICENSE)
+                    && issuers.insert(e.attested_key_id.clone())
+                {
+                    queue.push_back((e.attested_key_id, depth + 1));
+                }
             }
         }
     }
@@ -4311,10 +4321,14 @@ pub async fn licences_issued_under(
     let mut out: Vec<super::Attestation> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for issuer in &issuers {
-        for row in directory
-            .list_attestations_by_dimension_prefix(issuer, &prefix)
-            .await?
-        {
+        let mut rows = Vec::new();
+        let mut pages = AttestationQuery::by(issuer, FOLD_PAGE)
+            .dimension_prefix(&prefix)
+            .pages();
+        while let Some(page) = pages.next(directory).await? {
+            rows.extend(page);
+        }
+        for row in rows {
             // The byte prefix `licensure:acme` also matches `licensure:acmecorp`;
             // the authority is the dimension's own segment, read exactly.
             let names_authority = envelope_dimension(&row.attestation_envelope)
@@ -4625,7 +4639,7 @@ pub fn check_config_sensitive_leaf_floor(row: &super::Attestation) -> Result<(),
 ///
 /// The gate reads `attested_key_id`, because that is the field CC 3.4.5 names
 /// and the field
-/// [`list_attestations_for`](super::FederationDirectory::list_attestations_for)
+/// [`list_attestations_for`](crate::federation::attestation_query::AttestationQuery::to)
 /// — the read a peer uses to ask *"what is node N running?"* — keys on. It does
 /// **not** constrain `subject_key_ids`, so an attacker can still write a
 /// `config:*` row about ITSELF (`attesting == attested`, which is a true
@@ -7442,7 +7456,7 @@ pub fn parse_canonical_binding_hash(dimension: &str) -> Option<&str> {
 /// `subject_key_ids` (§3.2.3 rule 2/3). A binding is a `scores` row with
 /// `attesting_key_id = K` on the reserved `identity:canonical_binding:{H}`
 /// dimension; we read K's out-rows via
-/// [`FederationDirectory::list_attestations_by`] and collect every `H`.
+/// [`AttestationQuery::by`](crate::federation::attestation_query::AttestationQuery::by) and collect every `H`.
 ///
 /// Authorization is consumer-policy (§5.6.8.14: proof-of-control of H is
 /// out-of-band, NOT a wire obligation) — persist admits the self-assertion
@@ -7453,14 +7467,16 @@ async fn canonical_binding_hashes_for(
     issuer: &str,
 ) -> Result<std::collections::HashSet<String>, Error> {
     let mut out = std::collections::HashSet::new();
-    for r in directory.list_attestations_by(issuer).await? {
-        if r.attestation_type != attestation_type::SCORES {
-            continue;
-        }
-        if let Some(h) =
-            envelope_dimension(&r.attestation_envelope).and_then(parse_canonical_binding_hash)
-        {
-            out.insert(format!("{CANONICAL_KEY_ID_PREFIX}{h}"));
+    let mut pages = AttestationQuery::by(issuer, FOLD_PAGE)
+        .types(&[attestation_type::SCORES])
+        .pages();
+    while let Some(page) = pages.next(directory).await? {
+        for r in page {
+            if let Some(h) =
+                envelope_dimension(&r.attestation_envelope).and_then(parse_canonical_binding_hash)
+            {
+                out.insert(format!("{CANONICAL_KEY_ID_PREFIX}{h}"));
+            }
         }
     }
     Ok(out)
@@ -8039,12 +8055,19 @@ async fn scoped_delegates_onward(
     lens: &DelegationWalkLens<'_>,
     is_root: bool,
 ) -> Result<bool, Error> {
-    Ok(directory.list_attestations_by(key).await?.iter().any(|n| {
-        n.attestation_type == attestation_type::DELEGATES_TO
-            && lens.admits_edge(n)
-            && (!is_root || lens.admits_root_edge(n))
-            && delegation_scope_grants(&n.attestation_envelope, scope_token)
-    }))
+    let mut pages = AttestationQuery::by(key, FOLD_PAGE)
+        .types(&[attestation_type::DELEGATES_TO])
+        .pages();
+    while let Some(page) = pages.next(directory).await? {
+        if page.iter().any(|n| {
+            lens.admits_edge(n)
+                && (!is_root || lens.admits_root_edge(n))
+                && delegation_scope_grants(&n.attestation_envelope, scope_token)
+        }) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// v49.0.0 (#908) — a half-open `[start, end)` span during which a key held
@@ -8335,7 +8358,19 @@ async fn scoped_delegation_reach_at(
         if policy.enforce_attenuation_and_sub_delegation && node.budget == Some(0) {
             continue;
         }
-        let rows = directory.list_attestations_by(&node.key).await?;
+        // The granter's edges and its retractions of them — the only types
+        // the two loops below read.
+        let mut rows = Vec::new();
+        let mut pages = AttestationQuery::by(&node.key, FOLD_PAGE)
+            .types(&[
+                attestation_type::DELEGATES_TO,
+                attestation_type::WITHDRAWS,
+                attestation_type::RECANTS,
+            ])
+            .pages();
+        while let Some(page) = pages.next(directory).await? {
+            rows.extend(page);
+        }
         // §11.10: bucket this granter's `withdraws`/`recants` retractions by
         // recipient so a revoked edge invalidates the downstream chain
         // (UCAN-style; topology's edge-retraction model). Unconditional since
@@ -8416,7 +8451,11 @@ async fn scoped_delegation_reach_at(
             // per recipient so the fan-out is bounded by distinct recipients
             // rather than by edges.
             if !incoming_retracted.contains_key(&r.attested_key_id) {
-                let mut incoming = directory.list_attestations_for(&r.attested_key_id).await?;
+                let mut incoming = Vec::new();
+                let mut pages = AttestationQuery::to(&r.attested_key_id, FOLD_PAGE).pages();
+                while let Some(page) = pages.next(directory).await? {
+                    incoming.extend(page);
+                }
                 // v49.0.0 (#908) — only retractions asserted by the instant.
                 // Unset lens: nothing is dropped.
                 incoming.retain(|row| lens.asserted_by(row));
@@ -8500,7 +8539,7 @@ async fn scoped_delegation_reach_at(
 /// # Algorithm
 ///
 /// BFS from `issuer`. At each granter, pull its `delegates_to`
-/// out-edges via [`FederationDirectory::list_attestations_by`]; an
+/// out-edges via [`AttestationQuery::by`](crate::federation::attestation_query::AttestationQuery::by); an
 /// edge is *traversable* only if its envelope `scope ⊇
 /// {consent_revocation}`. If a traversable edge's recipient is in
 /// `targets`, return `true`. Cycle-guarded on the granter key and
@@ -9105,7 +9144,18 @@ pub async fn owner_granters_in_force_at(
     node: &str,
     t: chrono::DateTime<chrono::Utc>,
 ) -> Result<std::collections::BTreeSet<String>, Error> {
-    let rows = directory.list_attestations_for(node).await?;
+    // The bindings and the withdrawals that end them: the only two types the
+    // fold below reads.
+    let mut rows = Vec::new();
+    let mut pages = AttestationQuery::to(node, FOLD_PAGE)
+        .types(&[
+            super::types::attestation_type::DELEGATES_TO,
+            super::types::attestation_type::WITHDRAWS,
+        ])
+        .pages();
+    while let Some(page) = pages.next(directory).await? {
+        rows.extend(page);
+    }
     // PR #943 review (A→B→A) — "the issuer owned the node when `target` was
     // produced", asked of the whole ownership record, not of one binding's
     // signer-chosen instant. A binding is IN FORCE at `t` from its
@@ -10115,9 +10165,13 @@ pub(crate) async fn live_delegation_granters<F: super::FederationDirectory + ?Si
     // about the subject. The subject's `withdraws` / `recants` rows are read
     // once more for the per-granter check (3), where each granter's whole
     // history was read before.
-    let edges = directory
-        .list_attestations_for_type(subject, attestation_type::DELEGATES_TO)
-        .await?;
+    let mut edges = Vec::new();
+    let mut pages = AttestationQuery::to(subject, FOLD_PAGE)
+        .types(&[attestation_type::DELEGATES_TO])
+        .pages();
+    while let Some(page) = pages.next(directory).await? {
+        edges.extend(page);
+    }
     let edge_ids: Vec<String> = edges.iter().map(|e| e.attestation_id.clone()).collect();
     let mut rows = edges;
     rows.extend(
@@ -10125,14 +10179,13 @@ pub(crate) async fn live_delegation_granters<F: super::FederationDirectory + ?Si
             .list_composers_referencing_any(&edge_ids, Some(subject), None)
             .await?,
     );
-    let mut retractions_about_subject = directory
-        .list_attestations_for_type(subject, attestation_type::WITHDRAWS)
-        .await?;
-    retractions_about_subject.extend(
-        directory
-            .list_attestations_for_type(subject, attestation_type::RECANTS)
-            .await?,
-    );
+    let mut retractions_about_subject = Vec::new();
+    let mut pages = AttestationQuery::to(subject, FOLD_PAGE)
+        .types(&[attestation_type::WITHDRAWS, attestation_type::RECANTS])
+        .pages();
+    while let Some(page) = pages.next(directory).await? {
+        retractions_about_subject.extend(page);
+    }
 
     // (2) — a binding withdrawn BY ANYONE the gate admitted is non-live, not
     // only one retracted by its own granter. Two lists that disagree about
@@ -10549,11 +10602,11 @@ pub async fn nodes_stewarded_by(
     // seek, never U's whole history — Edge re-resolves send sets every 30 s,
     // and this read ran once per principal per refresh. Retirement is decided
     // below, on the candidate's side, so the candidate set needs no composers.
-    for r in directory
-        .list_attestations_by_type(steward_user_key_id, attestation_type::DELEGATES_TO)
-        .await?
-    {
-        candidates.insert(r.attested_key_id);
+    let mut pages = AttestationQuery::by(steward_user_key_id, FOLD_PAGE)
+        .types(&[attestation_type::DELEGATES_TO])
+        .pages();
+    while let Some(page) = pages.next(directory).await? {
+        candidates.extend(page.into_iter().map(|r| r.attested_key_id));
     }
     // (2) occurrences speaking for identity U.
     for occ in directory
@@ -10749,7 +10802,7 @@ pub async fn may_act_through(
 /// person is bound to*.
 ///
 /// **One fold, not two**: candidates come from the granter-side index
-/// ([`FederationDirectory::list_attestations_by_type`]`(U, delegates_to)`,
+/// ([`AttestationQuery::types`](crate::federation::attestation_query::AttestationQuery::types)`(U, delegates_to)`,
 /// v53.1.6, filtered to owner-binding envelopes), but each candidate's VERDICT is
 /// [`owner_of`] itself — so liveness (expiry + admitted `withdraws`,
 /// #578/#584) and the single-owner rule are answered by the same spelling
@@ -10769,12 +10822,16 @@ pub async fn nodes_owned_by<F: super::FederationDirectory + ?Sized>(
     // v53.1.6 — the type seek, not the person's whole history (`send_set_for`
     // → `nodes_of` asks this per principal on every Edge memo refresh). The
     // verdict is `owner_of` below, so the candidates need no composers.
-    for row in directory
-        .list_attestations_by_type(person, super::types::attestation_type::DELEGATES_TO)
-        .await?
-    {
-        if is_owner_binding_envelope(&row.attestation_envelope) && !row.attested_key_id.is_empty() {
-            candidates.insert(row.attested_key_id);
+    let mut pages = AttestationQuery::by(person, FOLD_PAGE)
+        .types(&[super::types::attestation_type::DELEGATES_TO])
+        .pages();
+    while let Some(page) = pages.next(directory).await? {
+        for row in page {
+            if is_owner_binding_envelope(&row.attestation_envelope)
+                && !row.attested_key_id.is_empty()
+            {
+                candidates.insert(row.attested_key_id);
+            }
         }
     }
     let mut out = Vec::new();
@@ -12553,7 +12610,13 @@ pub async fn check_peer_deadmission(
     // Live de-admissions THIS node authored about the row's author. The
     // tombstone fold is the shared one — a `withdraws` against the de-admission
     // lifts it, so re-admitting is a first-class, auditable act.
-    let mine = directory.list_attestations_by(self_key_id).await?;
+    // Every row this node authored: the tombstone fold below reads its whole
+    // record (a de-admission and whatever retires it).
+    let mut mine = Vec::new();
+    let mut pages = AttestationQuery::by(self_key_id, FOLD_PAGE).pages();
+    while let Some(page) = pages.next(directory).await? {
+        mine.extend(page);
+    }
     let refs: Vec<&super::Attestation> = mine.iter().collect();
     let dead = super::trust_root::tombstoned_ids(&refs);
     let now = received_at;
@@ -15778,7 +15841,7 @@ pub async fn check_delegation_cycle_admission<G>(
     received_at: chrono::DateTime<chrono::Utc>,
 ) -> Result<(), Error>
 where
-    G: DelegationGraphReads + ?Sized,
+    G: super::attestation_query::AttestationQueryExec + ?Sized,
 {
     if row.attestation_type != attestation_type::DELEGATES_TO {
         return Ok(());
@@ -15843,52 +15906,13 @@ pub(crate) fn delegation_cycle_gated(row: &super::Attestation) -> bool {
         && row.attesting_key_id != row.attested_key_id
 }
 
-/// v54.0.0 (Codex round 2 on PR #1050) — **the two reads the cycle gate's
-/// walk makes**, and nothing else: every `delegates_to` (and the retractions
-/// beside it) a key issued, and every row naming a key. Every
-/// [`FederationDirectory`](super::FederationDirectory) answers them through
-/// its own `list_attestations_by` / `list_attestations_for`.
-///
-/// The postgres backend re-runs the gate inside the transaction that holds
-/// the delegation advisory lock, and that transaction owns its pooled client.
-/// Asked through the directory, each walk read checked out ANOTHER client: on
-/// a one-connection pool, or a pool whose every connection was held that way,
-/// the write waited forever for a connection only it could release (I602).
-/// So postgres answers these two reads on the lock's own transaction, through
-/// the SAME statements its directory methods run.
-#[async_trait::async_trait]
-pub trait DelegationGraphReads: Send + Sync {
-    /// The federation-tier rows `attesting_key_id` issued, newest first.
-    async fn list_attestations_by(
-        &self,
-        attesting_key_id: &str,
-    ) -> Result<Vec<super::Attestation>, Error>;
-    /// The federation-tier rows naming `attested_key_id`, newest first.
-    async fn list_attestations_for(
-        &self,
-        attested_key_id: &str,
-    ) -> Result<Vec<super::Attestation>, Error>;
-}
-
-#[async_trait::async_trait]
-impl<D> DelegationGraphReads for D
-where
-    D: super::FederationDirectory + ?Sized,
-{
-    async fn list_attestations_by(
-        &self,
-        attesting_key_id: &str,
-    ) -> Result<Vec<super::Attestation>, Error> {
-        super::FederationDirectory::list_attestations_by(self, attesting_key_id).await
-    }
-    async fn list_attestations_for(
-        &self,
-        attested_key_id: &str,
-    ) -> Result<Vec<super::Attestation>, Error> {
-        super::FederationDirectory::list_attestations_for(self, attested_key_id).await
-    }
-}
-
+// v54.0.0 (Codex round 2 on PR #1050) — the cycle gate's walk reads.
+// v56.0.0 (CIRISPersist#1001): the walk reads through
+// `AttestationQueryExec`, the typed read's storage half. Every directory
+// answers it; the postgres backend re-runs the gate inside the transaction
+// that holds the delegation advisory lock and answers the SAME statement on
+// that transaction's own client, so no walk read checks out a second pooled
+// client while the lock's transaction holds one (I602).
 /// v54.0.0 (Codex on PR #1050) — the postgres advisory-lock key every
 /// [`delegation_cycle_gated`] write takes in its insert transaction
 /// (`pg_advisory_xact_lock(DELEGATION_CYCLE_LOCK_KEY)`), so a cycle check and
@@ -15926,7 +15950,7 @@ pub(crate) async fn delegation_path_hops<G>(
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<Option<usize>, Error>
 where
-    G: DelegationGraphReads + ?Sized,
+    G: super::attestation_query::AttestationQueryExec + ?Sized,
 {
     use std::collections::{HashMap, HashSet, VecDeque};
     let mut visited: HashSet<String> = HashSet::from([from.to_owned()]);
@@ -15947,7 +15971,17 @@ where
         if depth >= MAX_WITHDRAWS_DELEGATION_DEPTH {
             continue;
         }
-        let rows = directory.list_attestations_by(&key).await?;
+        let mut rows = Vec::new();
+        let mut pages = AttestationQuery::by(&key, FOLD_PAGE)
+            .types(&[
+                attestation_type::DELEGATES_TO,
+                attestation_type::WITHDRAWS,
+                attestation_type::RECANTS,
+            ])
+            .pages();
+        while let Some(page) = pages.next(directory).await? {
+            rows.extend(page);
+        }
         // Gate (a): the granter retracted its own edge to this recipient.
         let granter_retracted: HashSet<&str> = rows
             .iter()
@@ -15971,7 +16005,11 @@ where
             // Filtered as the lensed walk filters it (`scoped_delegation_
             // reach_at`): only rows asserted by `now` reach the fold.
             if !incoming_retracted.contains_key(&r.attested_key_id) {
-                let mut incoming = directory.list_attestations_for(&r.attested_key_id).await?;
+                let mut incoming = Vec::new();
+                let mut pages = AttestationQuery::to(&r.attested_key_id, FOLD_PAGE).pages();
+                while let Some(page) = pages.next(directory).await? {
+                    incoming.extend(page);
+                }
                 incoming.retain(|row| lens.asserted_by(row));
                 incoming_retracted.insert(r.attested_key_id.clone(), retracted_edge_ids(&incoming));
             }
@@ -28597,6 +28635,7 @@ pub(crate) mod ungated_doors_test_support {
         dir: &dyn FederationDirectory,
         suffix: &str,
     ) {
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
         let author = format!("cs713-{suffix}");
         register(dir, &author, crate::federation::types::identity_type::NODE).await;
 
@@ -28634,7 +28673,7 @@ pub(crate) mod ungated_doors_test_support {
 
         // And the by-subject read, which advertisement also walks.
         let by_subject = dir
-            .list_attestations_by(&author)
+            .all_attestations_by(&author)
             .await
             .expect("by-author read");
         let same = by_subject
@@ -29480,6 +29519,7 @@ pub(crate) mod ungated_doors_test_support {
         dir: &dyn FederationDirectory,
         suffix: &str,
     ) {
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
         use crate::federation::operational::test_support::establish_trust_root;
         use crate::federation::trust_root::{capability_roots_to_trusted_root, INFRA_SERVE_SCOPE};
         use crate::federation::types::identity_type;
@@ -29511,7 +29551,7 @@ pub(crate) mod ungated_doors_test_support {
 
         // The conferral row the attack will name: delegates_to(root → subject).
         let about = dir
-            .list_attestations_for(&subject)
+            .all_attestations_for(&subject)
             .await
             .expect("inbound rows about the subject");
         let conferral_id = about

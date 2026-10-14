@@ -67,6 +67,7 @@
 //! [`NodeState::targeted`], each with the binding that answers it, so the
 //! omission is legible rather than silent.
 
+use super::attestation_query::{AttestationQuery, FOLD_PAGE};
 use super::replication::admission::PeerQuotaObservation;
 use super::trust_root::{DrillFreshness, TrustRootVerdict};
 use super::{Error, FederationDirectory};
@@ -683,7 +684,7 @@ async fn resolve_genesis_signal(directory: &dyn FederationDirectory) -> GenesisS
 /// [`transit_candidate_roots`](super::trust_root::transit_candidate_roots) —
 /// the same enumeration `resolve_transit_eligibility` uses, reused rather than
 /// re-derived, so the two cannot disagree about what root this node trusts.
-async fn resolve_trust_root_signal(
+pub(crate) async fn resolve_trust_root_signal(
     directory: &dyn FederationDirectory,
     self_key_id: Option<&str>,
     pinned_root: Option<&str>,
@@ -697,13 +698,26 @@ async fn resolve_trust_root_signal(
     // targets of the node's own live accepts-edges.
     let candidates: Vec<String> = match pinned_root {
         Some(r) => vec![r.to_owned()],
-        None => match directory.list_attestations_by(user).await {
-            Ok(rows) => super::trust_root::transit_candidate_roots(&rows, user, now)
-                .into_iter()
-                .map(|c| c.root_ref)
-                .collect(),
-            Err(_) => return trust_root_signal(TrustRootStanding::Unreadable, None, 0, None),
-        },
+        None => {
+            // Every row the node authored: the candidate predicate reads its
+            // edges and whatever retires them.
+            let mut rows = Vec::new();
+            let mut pages = AttestationQuery::by(user, FOLD_PAGE).pages();
+            let read: Result<(), Error> = async {
+                while let Some(page) = pages.next(directory).await? {
+                    rows.extend(page);
+                }
+                Ok(())
+            }
+            .await;
+            match read {
+                Ok(()) => super::trust_root::transit_candidate_roots(&rows, user, now)
+                    .into_iter()
+                    .map(|c| c.root_ref)
+                    .collect(),
+                Err(_) => return trust_root_signal(TrustRootStanding::Unreadable, None, 0, None),
+            }
+        }
     };
     let considered = candidates.len();
     if considered == 0 {
