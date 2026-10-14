@@ -209,6 +209,11 @@ pub(crate) mod bodies {
             row.attesting_key_id, detector,
             "I961: attester = the detector"
         );
+        // The gate first, so a writer that moved a column is caught by it
+        // before the read-back below sees the same column.
+        check_projection_rebuild(b, SiloProjection::DetectionEvents)
+            .await
+            .expect("I961: detection_events is its rows' rebuild");
         let read = b
             .get_detection_events(crate::derived::EventFilter {
                 trace_id: Some(a.trace_id.clone()),
@@ -221,9 +226,6 @@ pub(crate) mod bodies {
             vec![a.clone()],
             "I961: the projection reads back the event"
         );
-        check_projection_rebuild(b, SiloProjection::DetectionEvents)
-            .await
-            .expect("I961: detection_events is its rows' rebuild");
         (a, c)
     }
 
