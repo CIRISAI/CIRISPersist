@@ -375,7 +375,9 @@ def test_register_self_then_put_blob_signing_275() -> None:
         # its door refuses before storing anything announced (I80, I83). This
         # engine has a PQC LocalSigner, so the claim must be hybrid. Read back
         # through a host door.
-        rows = json.loads(eng.list_attestations_by(kid))
+        # v56.0.0 (CIRISPersist#1001): one bounded page, narrowed to the
+        # custody family.
+        rows = json.loads(eng.list_attestations_by(kid, 500, None, "custody:ack:"))["items"]
         claims = [
             r
             for r in rows
@@ -1414,9 +1416,12 @@ def test_reack_holding_claims_once_is_host_reachable_989() -> None:
             report = json.loads(eng.reack_holding_claims_once())
             assert set(report) == {
                 "scanned", "renewed", "fresh", "not_held", "not_in_cohort", "failed", "converted",
-                "withheld",
+                "withheld", "deferred",
             }, report
             assert report["withheld"] == 0, report
+            # v56.0.0 (#1071): a pass renews at most the cap; the rest is deferred
+            # to the next pass. One fresh claim defers nothing.
+            assert report["deferred"] == 0, report
             assert report["scanned"] == 1 and report["fresh"] == 1, report
             assert report["renewed"] == 0 and report["failed"] == 0, report
     finally:

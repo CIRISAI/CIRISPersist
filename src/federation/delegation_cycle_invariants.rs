@@ -98,7 +98,8 @@ pub mod bodies {
 
     /// No `delegates_to` from `from` to `to` is stored.
     async fn assert_no_edge(d: &dyn FederationDirectory, from: &str, to: &str, what: &str) {
-        let stored = d.list_attestations_by(from).await.unwrap();
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
+        let stored = d.all_attestations_by(from).await.unwrap();
         assert!(
             !stored
                 .iter()
@@ -183,7 +184,8 @@ pub mod bodies {
 
     /// Is a federation-tier `delegates_to(from → to)` stored?
     pub(crate) async fn has_fed_edge(d: &dyn FederationDirectory, from: &str, to: &str) -> bool {
-        d.list_attestations_by(from).await.unwrap().iter().any(|r| {
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
+        d.all_attestations_by(from).await.unwrap().iter().any(|r| {
             r.attestation_type == attestation_type::DELEGATES_TO
                 && r.attested_key_id == to
                 && r.tier == attestation_tier::FEDERATION

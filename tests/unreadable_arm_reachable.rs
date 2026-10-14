@@ -90,11 +90,16 @@ async fn an_unreadable_root_is_not_a_silent_root_603() {
     );
 
     // The SAME directory, with the per-root read declared unsupported. This is
-    // the arm no shipped backend can produce.
-    let unreadable =
-        FaultInjectingDirectory::new(inner.clone()).unsupported("list_attestations_for");
+    // the arm no shipped backend can produce. v56.0.0 (CIRISPersist#1001): the
+    // per-root read is the typed query `to(root).dimension_prefix("mesh_config:")`,
+    // faulted by its shape (`AttestationQuery::shape`); the trusted-root walk
+    // before it is a different shape and still answers.
+    let unreadable = FaultInjectingDirectory::new(inner.clone())
+        .unsupported("list_attestations_for_dimension_prefix");
     assert!(
-        unreadable.faults().contains("list_attestations_for"),
+        unreadable
+            .faults()
+            .contains("list_attestations_for_dimension_prefix"),
         "the fixture must be able to assert its OWN setup, or a fault that \
          silently failed to register reads as a passing test"
     );

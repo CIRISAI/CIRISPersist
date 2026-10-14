@@ -7,7 +7,15 @@ threat-model citations because this crate's audit story is the point.
 
 ## [Unreleased]
 
-## [56.0.0] - UNRELEASED
+## [56.0.0] - 2026-10-14
+
+### Security — rustls 0.23.46 (RUSTSEC-2026-0346, RUSTSEC-2026-0347)
+
+- Lockfile only: rustls 0.23.45 → 0.23.46. Both advisories were published
+  2026-10-14 and stopped this release's push at the pre-push `cargo deny`
+  leg. Neither reaches persist's surface (no custom `ClientSessionStore`
+  `Debug` logging; ECH is not enabled), so this is the dependency floor
+  moving, not a behaviour change.
 
 ### Fixed — tag CI: a restored cache never carries a build-script unit with missing outputs
 
@@ -74,6 +82,486 @@ No library code changed.
     - clobbered mtimes remove everything.
   - Setting `R_MAX = 0`, or inverting the boundary comparison, turns legs
     red.
+
+### Added — tooling: size tracking, semver-checks, coverage, machete, diff mutants, evidence-pointer gate (#934)
+
+Six instruments beside #934's consolidation (#1076 slice T). **Five are
+reports**: each exits 0 on a finding and every CI job running one is
+`continue-on-error`, so none turns `main` red without the operator. **One is
+a gate**, the evidence-pointer check, because a dead pointer is a false
+evidence claim. `docs/TOOLING.md` says how to run each and which is which.
+
+- **Size tracking.** `scripts/size_report.py` writes `evidence/size.tsv`:
+  code/comment/blank lines per `src/**/*.rs` file (stdlib only; comment- and
+  string-aware, `#[cfg(test)]`-blind), a `BACKENDS` row
+  (`src/store/{sqlite,postgres,memory}.rs`: 137 779 lines at v55.0.0) and a
+  `TOTAL` row (649 639). `check` prints the per-file delta against the
+  committed table or `--against <ref>`; `--fail-if-backends-grew` (exit 1) is
+  #934 step 1's acceptance criterion for the PR that moves a door. certify's
+  fast stage gains `sizetest` (the counter's fixture witnesses — a gate, like
+  the other tool self-tests, also in ci.yml's lint job) and `sizereport` (the
+  delta, always green, totals printed under the fast-gate table).
+- **API breaks.** `scripts/api_break_report.sh [<prev-tag>]` runs
+  `cargo semver-checks check-release` on the shipped-shape feature set at
+  `--release-type minor`, so a major bump does not hide the breaks. v54.1.1 →
+  v55.0.0: 12 lints, 71 distinct instance lines. New workflow `reports.yml`
+  (non-gating): `semver` on every PR against the latest `v*` tag reachable
+  from the base (artefact + step summary), and `size` (the PR's delta vs its
+  base).
+- **Coverage.** `scripts/coverage.sh <leg> [-- <nextest args>]`: `cargo
+  llvm-cov nextest` for ONE certify feature set (derived, never spelled;
+  postgres sets through `pg_test_db.sh`), lcov + summary + html under
+  `target/coverage/<set>/`. `reports.yml` runs every leg weekly (legs derived
+  at run time) and on dispatch.
+- **Unused dependencies.** `cargo machete --with-metadata` in ci-hygiene's new
+  non-gating `reports` job. It names two dev-dependencies, `hex-literal` and
+  `tracing-subscriber`, that no `.rs` file uses; not removed — the operator's
+  call.
+- **Mutants on the diff.** `scripts/mutants_diff.sh <base> [-- <cargo-mutants
+  args>]`: `cargo mutants --in-diff` over the `src/` lines changed since the
+  merge base, with a wall-clock budget; `reports.yml` runs it only for a PR
+  labelled `run-mutants`, or on dispatch. The hand mutation tables and the
+  nightly scoped matrix stay the gates.
+- **Evidence pointers (a GATE).** `scripts/evidence_pointers.py check`:
+  every `src/` row of `evidence/cc_impl.tsv` must name a definition in its
+  cited file, with comments and literals blanked; `Owner::member` must be a
+  member of `Owner`; a mention, a string or a call site never resolves, and a
+  moved symbol fails until repointed. Stricter than the in-crate witness,
+  which let the v54 → v55 dead pointer `blobs.rs#holds_bytes_attestation_envelope`
+  live on a doc comment and a string literal. Clean on this tree (223 rows)
+  and at every tag v46.0.0..v55.0.0; that pointer sat in the Constitution's
+  register, and `register <claims.tsv>` names it on CIRISConstitution
+  `fca367d^`. certify fast gate `evidenceptr`, ci.yml `lint` step,
+  ci-hygiene `evidence-pointers` job (daily); `evidenceptrcc` reports the
+  Constitution register when a checkout is found.
+
+### Added — trace_format v2.8.0 admission (#1089, CIRISAgent#1255)
+
+A v2.8.0 trace now admits. Before this, a v2.8.0 trace's run kind read as
+absent, so `trace_run_kind_mock` never fired. The two new profile members
+were also dropped on parse, so the re-canonicalised bytes did not match the
+signature.
+
+- **Where `run_kind` is read.** A v2.8.0 trace signs `run_kind` inside
+  `deployment_profile`, the only signed block the agent supplies. Every
+  run-kind gate now reads the signed member from either place through
+  `CompleteTrace::signed_run_kind`: the top level (v2.7.x) or
+  `deployment_profile.run_kind` (v2.8.0).
+  - The ingest mock gate on a canonical node reads it.
+  - The oversize mint copies it into `manifest.run_kind`.
+  - `steward_purge::trace_run_kind` reads it, and so do
+    `trace_attestation_run_kind` and the federation-tier attestation gate.
+  - The `trace:*` inline-form admission check holds
+    `deployment_profile.run_kind` to the closed vocabulary. A top level that
+    disagrees with it is refused.
+  - The canonical reconstruction is unchanged. It lifts only the top-level
+    member, because the profile member is signed where it sits.
+- **Typed, signed profile members.** `DeploymentProfile` gains
+  `run_kind: Option<String>` and `trace_format_version: Option<String>`. Each
+  is skipped when absent, so a v2.7.x profile serializes to the same bytes as
+  before. A v2.8.0 profile round-trips byte-identically through admission.
+- **The format gate keys on `deployment_profile.trace_format_version`.** This
+  is a signed member, distinct from `trace_schema_version`, which keeps
+  selecting canonicalization. The new module is `schema::trace_format`.
+  - `"2.8.0"` validates the whole trace against the vendored
+    `src/schema/trace_format_v2_8_0.json`.
+  - A format this node has not vendored is refused by name:
+    `schema_unsupported_trace_format`, with the format string as `detail`.
+    The batch is refused whole and nothing is written.
+  - A trace that does not conform is `schema_trace_format_violation`, never
+    truncated. The `detail` is the format plus the first violation's instance
+    path and schema path, with no payload values.
+  - `deployment_profile.run_kind` without the format member is
+    `schema_missing_field` (`deployment_profile.trace_format_version`). At
+    2.7.0 the profile is not in the signed bytes, so an unsigned `run_kind`
+    never reaches a gate.
+  - A top-level `run_kind` that disagrees with the profile's is
+    `schema_run_kind_conflict`. A profile `run_kind` outside the vocabulary is
+    `schema_unknown_run_kind`.
+  - All four are `schema::Error` variants. They reach Python as `ValueError`,
+    the type of the schema arm they join.
+- **The run_kind vocabulary has six values** (operator amendment on #1089).
+  `schema::trace::RUN_KINDS` is now `production | prod-personal |
+  prod-managed | qa | battery | mock`. `prod-personal` is a production run on
+  a personal install. `prod-managed` is a production run on a managed
+  deployment, set by CIRISManager. The three production values admit alike,
+  only `mock` is refused (`trace_run_kind_mock`), and `qa` and `battery` are
+  admitted and labelled as before. `production` stays valid, so v2.7.x traces
+  admit unchanged.
+- **What the vendored schema still refuses.** Under the vendored v2.8.0
+  schema (`8c51028c…`), a v2.8.0 trace with `deployment_profile.run_kind`
+  `prod-personal` or `prod-managed` is refused by schema validation, by name
+  (`schema_trace_format_violation` at `/deployment_profile/run_kind`), until
+  the re-cut schema is vendored. The follow-up is re-vendor + pin swap.
+- **The vendored schema.** It was copied byte-exact from
+  `CIRISAI/CIRISAgent@e7d9115180e8910999901f4805c31b617b34e8d5`, the head of
+  CIRISAgent#1255, at
+  `ciris_adapters/ciris_accord_metrics/schemas/trace_format_v2_8_0.json`. Its
+  file name, SHA-256 and source commit are ONE constant,
+  `schema::trace_format::TRACE_FORMAT_V2_8_0_PIN`, whose bytes are
+  `include_str!` of the same file name. A re-vendor is that one constant plus
+  the file. The SHA-256 is:
+
+  ```
+  8c51028c8983741f0e14c89c32988df6aacc0981db5a173814e31d9f461c9f81
+  ```
+
+- **Witnesses I1030–I1037.** I1030 to I1034 run on memory, sqlite and
+  postgres. I1035 to I1037 are pure tests.
+  - I1030: a v2.8.0 mock run is refused from the profile, and a production
+    run admits and verifies.
+  - I1031: the signed bytes equal the re-canonicalised bytes.
+  - I1032: a v2.7.x trace is unchanged.
+  - I1033: an unvendored format is refused by name, along with the
+    neighbouring refusals.
+  - I1034: the oversize mint copies the profile's `run_kind`, and the tier
+    crossing refuses the mock row.
+  - I1035: the schema hash is pinned.
+  - I1036: the run_kind gate alone admits `prod-personal` and `prod-managed`
+    exactly as it admits `production`, at the parse gate and the `trace:*`
+    shape gate. I670's store-level admission loop now covers both values too.
+  - I1037: under the pre-amendment cut, a v2.8.0 trace carrying either new
+    value is refused by schema validation at the member. The leg flips when
+    the pin moves, and then both values must admit.
+
+**CIRISAgent adoption.**
+- Emit `deployment_profile.trace_format_version: "2.8.0"` and
+  `deployment_profile.run_kind` together, with `trace_schema_version`
+  `"3.0.0"` (JCS).
+- A v2.8.0 trace must validate against the pinned schema. Until persist
+  re-vendors the re-cut schema, emit `prod-personal` and `prod-managed` only
+  in a v2.7.x trace's top-level `run_kind`, or hold them back. A v2.8.0 trace
+  carrying either one is refused at v56.0.0. Post the re-cut hash on #1089.
+- Do not also emit a top-level `run_kind` that differs from the profile's.
+- v2.8.0 component data carries no `attempt_index`. At the `"3.0.0"` epoch,
+  persist stores an absent one as 0, so retries of one event share a dedup
+  key.
+
+### Added — transit KEX pair on the TransportDestination binding (#1077, CC 3.3.6.2 rc8 2a7ed97)
+
+- **The member.** A signed `transport_destination` envelope may carry
+  `transit_kex_pubkeys {x25519_base64, ml_kem_768_base64}`: a relay's static
+  hybrid KEX pair for the CC 5.3.3.5 E1 hop exchange. Both values are standard
+  base64. The x25519 key decodes to exactly 32 bytes and the ML-KEM-768 key to
+  exactly 1184. The member is optional, and a row without it is the v55 shape,
+  unchanged. Persist stores, admits and serves the pair. It does not implement
+  the key exchange, whose pattern, labels, KDF and KATs belong to
+  CIRISVerify#309.
+- **Admission rules.** `admission::verify_signed_transport_destination`
+  refuses each violation as `Error::MalformedRow` on plane
+  `transport_destination`, before the signature check. A pair object with one
+  member or neither is `transit_kex_half_pair`. A member of the wrong decoded
+  length is `transit_kex_wrong_length`. A transit x25519 equal to the row's
+  own Reticulum link key (`transport_x25519_pubkey_base64`) is
+  `transit_kex_key_reuse`. That is CC 3.3.6.2 key separation as far as the
+  row's own bytes reach. Signing keys are a different algorithm and are not
+  byte-comparable (CC 3.3.6.1). This in-row rule is the whole admission duty
+  (CC 3.3.6.2 rc8, CIRISPersist#1078). A pair that is not an object (including `null`), a
+  non-string member or bad base64 is `envelope_member_invalid`. Unknown
+  members inside the pair object are tolerated. The three tokens join
+  `federation::malformed_row::ALL`.
+- **The accessor.** `SignedTransportDestination::transit_kex_pair(&self) ->
+  Result<Option<TransitKexPair>, Error>` reads the pair from `signed_envelope`
+  through `self_at_login::transit_kex_pair_from_envelope`, the same reading
+  admission applies. `TransitKexPair { x25519: [u8; 32], ml_kem_768: Box<[u8;
+  1184]> }` carries the lengths in its types. `rooted_transit_kex_pair()`
+  returns `None` for an `Advisory` binding, and `binding_provenance()` returns
+  the binding's provenance.
+- **The per-peer resolver (CIRISPersist#1078, CC 3.3.6.2 rc8).**
+  `self_at_login::transit_kex_pair_for(dir, occurrence_key_id) ->
+  Result<Option<TransitKexPair>, Error>` is the one place a consumer gets a
+  relay's hop key. It takes the pair only from a live `Rooted` signed binding.
+  It returns `None` when the node has no such binding, when two live Rooted
+  bindings carry different pairs, or when the transit x25519 or ML-KEM-768
+  bytes equal any key on the node's current occurrence. Those keys are the
+  `encryption_pubkeys` pair, the occurrence transport binding's Reticulum
+  keys, the federation signing keys of the occurrence key and of each identity
+  it is bound under, and the transport keys of its live bindings. `None`
+  means the node cannot relay (CC 3.3.6.2). The resolver only reads, and it
+  judges the rows as held with no clock. This closes the cross-row reuse case
+  at use, deterministically. Admission cannot check it without depending on
+  arrival order, which CC 3.2 T8 vii forbids, so there is no deferred check
+  and no retraction. Generating a fresh pair, separate from every other
+  key, stays the producer's duty; the resolver is the consumer's backstop.
+- **The content hash is identical across versions.** The pair is NOT a field
+  of the typed `TransportDestination` projection. CIRISEdge's route plane and
+  persist's wire index hash the whole `SignedTransportDestination` (the
+  projection plus the verbatim envelope). A v55 node and a v56 node therefore
+  produce byte-identical wrapper bytes and the same content hash for a
+  pair-bearing row, so a mixed fleet does not re-advertise and re-pull forever.
+  The pair is still hash-covered, because the envelope is. Witness I1010 pins
+  the hash of a fixed row as `14da66a0…65e2` and parses the same bytes through
+  a replica of the v55 types.
+- **Rotation** rides the existing `(epoch, asserted_at)` supersession, with no
+  new field. Because the projection no longer captures everything that
+  differs, all three backends now answer `Unchanged` only when the stored
+  envelope carries the same pair. A re-sign at the same `(epoch,
+  asserted_at)` that changes or drops the pair is `Refused` as a same-clock
+  fork. Before, it would have been kept as the old pair without a word.
+- **No migration.** The pair lives inside the stored `signed_envelope` text.
+  v55 nodes admit, store and re-serve pair-bearing envelopes unchanged, so this
+  needs no fleet floor.
+- **CIRISEdge adoption.** Build the pair into the envelope only: insert
+  `transit_kex_pubkeys {x25519_base64, ml_kem_768_base64}` into the envelope
+  JSON before signing, and leave the typed row as it is. Generate the pair
+  fresh. A transit x25519 equal to the row's link key is refused at admission,
+  and one equal to any other key of the node resolves to `None` at use. Publish the same transit pair on every transport kind and rotate them
+  together; a node whose bindings disagree cannot relay until they match. For per-peer resolution call
+  `transit_kex_pair_for`, not the raw `transit_kex_pair()` accessor, which
+  reads one row's envelope and applies neither the Rooted rule nor the
+  occurrence comparison. Admission refusals to map are `transit_kex_half_pair`,
+  `transit_kex_wrong_length`, `transit_kex_key_reuse`, and
+  `envelope_member_invalid` for shape and base64, each as
+  `Error::MalformedRow` on plane `transport_destination`. `content_hash_of`
+  and its three call sites need no change.
+- **Witnesses** I1010–I1022. The memory, sqlite and postgres backends share
+  `run_transit_kex_matrix` (I1011–I1016) and `run_transit_kex_resolver_matrix`
+  (I1017–I1022).
+
+### Changed — the attestation plane's write doors share one plan (#934 step 1)
+
+Each door below is now a shared plan plus a per-backend executor. The plan
+holds every admission decision and is pure over reads. The executor in each
+backend does only SQL, row mapping and transactions. The inventory, the gate
+sequences and the open items are in `docs/ATTESTATION_WRITE_DOORS_934.md`.
+
+- **`put_attestation_with_origin`** (under `put_attestation`,
+  `put_attestation_authored` and the replicated apply's fresh-id store) is
+  decided once in `federation::attestation_admit::plan_put_attestation`. Its
+  59 gates were written three times. The `store::parity` scan now reports the
+  door as `shared`.
+- **`attestation_upsert_local` / `attestation_insert_local`** are decided once
+  in `plan_write_local_attestation`. Their 17 gates were written three times,
+  and the v55 scan read both doors as `gateless`.
+- **`attach_attestation_pqc_signature`** is decided once in
+  `plan_attach_attestation_pqc_signature`: unknown id, already complete, and
+  the completed row's hash. Memory's executor gains the SQL backends'
+  "concurrently completed" guard.
+- **`reseal_attestation_v31`** (door 4) is decided once in
+  `plan_reseal_attestation`: the shape gate (`check_reseal_admission`) and
+  the seal gate over the row as read. Each executor's `store_planned_reseal`
+  then re-reads the row INSIDE its write step (memory's lock, sqlite's
+  transaction, postgres's `SELECT … FOR UPDATE`) and hands it to the shared
+  `PlannedReseal::sealed_over`, which re-asks the shape gate on that row. The
+  scan reports the door and its re-ask as `shared`; the memory
+  `DeclaredDivergence` is gone.
+- **`purge_attestation_v31` and `purge_genesis_delegation_row_v31`** (doors 5
+  and 6) are decided once in `purge_attestation_planned` (the exclusion gate,
+  `migration::check_purge_admission`, over the row as read) and
+  `purge_genesis_delegation_row_planned` (the re-bake gate, then a
+  compare-and-delete on the expected `persist_row_hash`). Both execute through
+  one new `AttestationStore::delete_attestation(id, only_if_hash)`. No
+  behaviour change: the purge's read and delete stay two steps on every
+  backend, as before. I954 is new: nothing had offered the STORE's genesis
+  door an id the bundle does not carry, so removing its gate left every test
+  green. I954 does, on memory, sqlite and postgres.
+- **A plan takes two named instants, `PlanInstants { fold_at, received_at }`**
+  (the Constitution's condition 1 on #934). `fold_at` is the row's signed
+  instant, for folds over other rows. `received_at` is the receiver's clock at
+  the door, for the receipt bounds. Nothing inside a plan reads the clock.
+  Each gate reads the instant it read before. Four folds still read receipt
+  and are listed as #1049 candidates. `store::parity`'s `PLAN_INSTANTS` pins
+  which gate reads which, and I950 is the witness on all three backends.
+
+  | plan | call | instant | before #934 |
+  |---|---|---|---|
+  | put | `check_instant_binding` | `received_at` | clock (future-skew bound) |
+  | put | `check_attach_freshness` | `received_at` | clock (CC 2.6.7 window W) |
+  | put | `check_capacity_consent_admission` | `received_at` | clock (#1049 candidate) |
+  | put | `check_delegation_cycle_admission` | `received_at` | clock (#1049 candidate) |
+  | put | `check_trust_charter_admission` | `received_at` | clock (#1049 candidate) |
+  | put | `check_peer_deadmission` | `received_at` | clock (#1049 candidate) |
+  | put | `check_licensure_delegator_is_authority` | both | clock and `asserted_at` |
+  | put | `check_community_trust_grant_admission` | `fold_at` | `asserted_at` (CC 3.3.1) |
+  | put executor re-ask | `check_delegation_cycle_admission` | `received_at` | clock, under the write lock |
+  | PQC completion | `pqc_completed_at` stamp | `received_at` | clock |
+  | local | `check_trust_charter_admission`, `check_attach_freshness`, `local_row_instant`, `check_instant_binding` | `received_at` | clock |
+  | re-seal plan | `check_reseal_admission` | `received_at` | clock (its skew bound) |
+  | re-seal re-ask | `sealed_over` → `check_reseal_admission` | `received_at` | clock |
+
+  The two purge plans read neither instant: both gates read only the row or
+  the compiled-in bundle.
+
+### Fixed
+
+- **Local upsert with an occupied `attestation_id`.** Memory kept the old
+  row, and sqlite and postgres could delete without storing. One plan now
+  replaces in-dimension and refuses cross-dimension with the new typed
+  `Error::LocalAttestationIdOccupied`. An insert of a held id still writes
+  nothing. This is the first divergence the one-door extraction made visible;
+  I951 asserts one outcome on all three backends.
+- **A re-seal racing a crossing overwrote the crossed row on sqlite and
+  postgres.** Both read the row before their write transaction and asked
+  nothing inside it, so a row that crossed to the federation tier between
+  the read and the write took the local re-seal's envelope. Memory re-asked
+  under its lock and refused. Every backend now re-asks the shape gate on the
+  row it is about to overwrite, inside its write step, and refuses ("diverges
+  from the stored"). I953 was red on sqlite and postgres before the fix and is
+  green on all three after. Behaviour changes only under that race, in the
+  refusing direction.
+
+**Adopter-visible.**
+
+- New `Error::LocalAttestationIdOccupied` (kind
+  `federation_local_attestation_id_occupied`, Python `ValueError`). An
+  exhaustive `match` on `federation::Error` must name it.
+- Gate signatures now take explicit instants. `received_at: DateTime<Utc>` is
+  added to:
+  - `admission::check_capacity_consent_admission`
+  - `admission::check_delegation_cycle_admission`
+  - `admission::check_peer_deadmission`
+  - `trust_root::check_trust_charter_admission`
+- `admission::check_licensure_delegator_is_authority` takes
+  `(received_at, fold_at)`.
+- `community_trust_consent::check_community_trust_grant_admission` takes
+  `fold_at`.
+- To keep the previous behaviour, pass `chrono::Utc::now()` for
+  `received_at`, and the row's `asserted_at` for `fold_at`.
+- A substrate failure while reading the row in
+  `attach_attestation_pqc_signature` now reads `get_attestation: …` (it was
+  `attach lookup: …`). The read is now recorded by the read probe.
+
+### Known gap
+
+- **Non-row reads still in the put plan.** CC condition 2 asks that no
+  admission decision read a projection. These reads in
+  `plan_put_attestation` are not signed rows, and none was re-derived in this
+  step:
+  - the AV-76 per-peer quota and its cohort-affinity memo (node-local,
+    receipt-time rate state);
+  - `settle_if_held`'s wire-index lookup (an accelerator that settles only on
+    a byte-identical held row);
+  - the blob store, read by `check_rendition_placement` and
+    `check_holding_claim_scope`;
+  - the purge tombstones table, read by `refuse_if_tombstoned_attestation`.
+- **The purge's read and delete are two steps** on every backend, as before
+  #934. It is a candidate for the re-seal's in-write re-ask; reported, not
+  changed.
+
+### Changed — typed bounded reads (#1001, #1071)
+
+**One bounded attestation read replaces the wide ones.** Every attestation
+read the directory makes on a key's slice is now an `AttestationQuery`
+(`federation::attestation_query`) executed through
+`AttestationReads::query_attestations`, which returns ONE page. There is no
+default page size and no "every row" form. The statement is planned once
+(`render_sql`, one parameterised `SELECT … LIMIT n + 1` on sqlite and
+postgres; the memory backend evaluates the same predicate,
+`AttestationQuery::admits`), so the three backends agree by construction.
+Every caller in persist moved onto it, plane by plane (delegation/admission,
+trust/ownership, consent/audience, identity facts, custody/config/index,
+the trait's default bodies, the Python surface). No migration: the existing
+indexes serve every shape (I903 reads the sqlite plan of each; on postgres
+each plan tops out in a `Limit`).
+
+The query (all fields public; builders in brackets):
+
+| field | meaning |
+|---|---|
+| `by` / `to` [`AttestationQuery::by(k, limit)`, `::to(k, limit)`, `.authored_by`, `.attested_to`] | the pinned attester / attested key; at least one is required |
+| `dimension: DimensionFilter` [`.dimension_prefix`, `.dimension`, `.dimension_any_of`] | `Any`, `Prefix` (byte range, never `LIKE`), `Exact`, or **`AnyOf(Vec<String>)`**: exact dimensions OR'd in one statement (`dimension IN (…)`, one seek per member on the `(key, dimension)` index). An empty `AnyOf` is refused. |
+| `types`, `type_prefix` [`.types`, `.type_prefix`] | `attestation_type` is one of / starts with |
+| `excluded_dimensions` [`.excluding_dimensions`] | dimension is none of these (absent kept) |
+| **`scope: Option<ScopeFilter>`** [`.scope(cohort_scope, Option<cohort_target>)`] | stored `cohort_scope`, and V150's `cohort_target` when given. A `to` query seeks V060's `(attested_key_id, cohort_scope, asserted_at DESC)`; a `by` query filters the attester's ordered walk. |
+| `tier: QueryTier` [`.tier`] | `Federation` (default) or `Local` |
+| `order: QueryOrder` [`.oldest_first`, `.order`] | `ByAssertedAt(Direction)`: the SIGNED instant, ties broken by `attestation_id`; newest first by default |
+| `limit: NonZeroU32` | required page size, at most `MAX_PAGE` (10,000) |
+| `after: Option<AttestationCursor>` [`.after`] | resume after this row |
+| `as_of: Option<DateTime<Utc>>` [`.as_of`] | only rows whose signed `asserted_at <= t`: a fold over an `as_of(t)` query replays identically on every node and at every later moment |
+
+**The whole set is a loop.** A `Page` holds at most `limit` rows and `next:
+Option<AttestationCursor>`, which is `Some` exactly when another row exists.
+A caller that needs every matching row passes `next` back as `after` until it
+is `None`, or walks `AttestationQuery::pages()` in a `while let`. The loop is
+visible at the call site; `FOLD_PAGE` (500) is the page persist's own folds
+use.
+
+**Not served is never empty.** `query_attestations` returns
+`ReadOutcome::Served(Page)` (possibly zero rows: the store answered and
+nothing matched) or `ReadOutcome::NotServed(NotServedReason)`, which is
+`Refused` (no pinned key, a page above `MAX_PAGE`, an empty `AnyOf`, an
+unknown cursor version, a proxy's `Unsupported`) or `Fault` (the backend
+failed, or returned rows past `limit + 1`). Those are the only two reasons.
+Pressure is not one: a read under load is served or faulted, never shortened
+or emptied. `ReadOutcome::served()` is the `?` form; a fold sees a not-served
+read as an error.
+
+**Retractions are a second query.** The structural composers (`withdraws`,
+`supersedes`, `recants`) carry NO envelope `dimension` (a `withdraws`
+envelope is `{kind, references_attestation_id, references_attestation_type}`).
+A dimension-filtered page (`Prefix`, `Exact`, `AnyOf`) therefore never
+carries its own rows' retractions. The bounded second read is
+`AttestationQuery::by(k, limit).types(&["withdraws", "supersedes",
+"recants"])`, paged on `next`, joined on the envelope's
+`references_attestation_id`.
+
+**#1071, the re-ack pass.** One pass signs at most
+`HOLDING_CLAIM_REACK_MAX_PER_PASS` (256) claims, renewals before upgrade
+conversions, the OLDEST due claim first (the nearest expiry), and counts the
+rest in `ReackReport::deferred` for the next hourly pass. A claim is due at
+24 h and lapses at 72 h, so 48 passes lie between. Both of its walks page an
+`AttestationQuery` (the node's `custody:ack:` reports; its retired
+`holds_bytes:` rows by type prefix), and the held-blob set is deduped as the
+pages arrive instead of growing with the claim history.
+
+**API break.**
+
+- `FederationDirectory::list_attestations_by` / `list_attestations_for` are
+  **demoted**: `#[cfg(any(test, feature = "test-anchor"))]` provided methods
+  that page the bounded query. No production build has them. They are deleted
+  in v57.
+- Removed from the trait (and every backend): `list_attestations_by_dimension_prefix`,
+  `list_attestations_for_dimension_prefix`, `list_attestations_by_type`,
+  `list_attestations_for_type`, `list_attestations_by_types`,
+  `list_attestations_for_types`. Removed: the free fn
+  `federation::types_and_dimension_admit` and `admission::DelegationGraphReads`
+  (its role is `attestation_query::AttestationQueryExec`).
+- New required trait method: `execute_attestation_query(&AttestationQuery) ->
+  Result<QueryRows, Error>` (storage only; a wrapper delegates, a proxy that
+  cannot answer returns `Unsupported`, which surfaces as `NotServed(Refused)`).
+  `list_attestations_by_dimension_citing` loses its default body (it composed
+  over a removed read) and is now required.
+- Telemetry: the eight per-method `door` label values of the attestation read
+  counters collapse into one, `attestation_query`, recorded once per page by
+  the shared wrapper. Its `rows` are the rows the page returns; its `bytes`
+  are every envelope the statement decoded, which includes the one lookahead
+  row fetched past the page (the decode cost, as for every door). A page of
+  `n` rows with another page behind it reports `n` rows and `n + 1` rows'
+  bytes.
+- Python: `Engine.list_attestations_by(attesting_key_id, limit, cursor_json=None,
+  dimension_prefix=None)` returns ONE page as `AttestationListPage` JSON
+  (`{"items": […], "next_cursor": …}`) instead of a JSON list of every row;
+  `limit` is required. A read that is not served raises.
+- New public API: `federation::attestation_query::{AttestationQuery,
+  DimensionFilter, ScopeFilter, QueryTier, QueryOrder, Direction, Page, Pages,
+  ReadOutcome, NotServedReason, AttestationReads, AttestationQueryExec,
+  QueryRows, MAX_PAGE, FOLD_PAGE, page_size, render_sql, Dialect, Bind,
+  Statement}`.
+
+**Gates.** I914 classifies every production `list_*` method on the trait as
+paged, bounded by the schema (with the reason), or open (with what it grows
+with) in `federation/bounded_reads_table.rs`, and fails on an unclassified
+method or a classification its signature contradicts. The open rows are
+named, not fixed, here. I915 walks `src/` with comments, strings and test-only
+items stripped and finds no production call of the demoted reads.
+
+**Adopting (CIRISEdge).**
+
+- Replace each `dir.list_attestations_by(k)` / `_for(k)` with the narrowest
+  query that answers the fold: `AttestationQuery::by(k, FOLD_PAGE)` plus
+  `.types`, `.dimension_prefix`, `.dimension_any_of` or `.scope`, and loop
+  on `next` (or `.pages()`) when the fold needs every match.
+- Several exact dimensions in one read: `.dimension_any_of(&[…])`. Rows of
+  one community: `.scope("community", Some(community_id))`.
+- A fold that honours retractions pairs its dimension-filtered page with the
+  bounded composer query above; the dimension filter never returns them.
+- Handle `ReadOutcome::NotServed` as an error (`.served()?`), never as "no
+  rows".
+- Tests may keep calling `list_attestations_by` / `_for` through the
+  `test-anchor` dev-dependency until v57. A production `impl
+  FederationDirectory` must drop its own `list_attestations_by` / `_for` (and
+  the six removed methods) and implement `execute_attestation_query` (a
+  wrapper delegates to its inner directory).
 
 ## [55.0.0] - 2026-10-12
 

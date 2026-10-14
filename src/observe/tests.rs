@@ -213,13 +213,36 @@ fn i551_each_backend_records_under_its_own_label() {
             BTreeSet::from([own.to_owned()]),
             "I551 {file} records under {named:?}"
         );
-        // Every door that file serves is recorded there.
+        // Every door that file serves is recorded there — except the typed
+        // bounded read (v56.0.0, CIRISPersist#1001), which no backend records:
+        // its one wrapper does.
         assert!(
-            idents_after(code, "observe::Door::").len() >= Door::COUNT - 1,
+            idents_after(code, "observe::Door::").len() >= Door::COUNT - 2,
             "I551 {file} records {} doors",
             idents_after(code, "observe::Door::").len()
         );
+        assert!(
+            !idents_after(code, "observe::Door::").contains("AttestationQuery")
+                && !code.contains("record_query_read"),
+            "I904 {file} records the typed read itself; only its wrapper may"
+        );
     }
+    // **I904** (v56.0.0, CIRISPersist#1001) — the typed read is recorded in
+    // ONE place: `record_query_read` has exactly one caller, the shared
+    // wrapper `AttestationReads::query_attestations`.
+    let callers: Vec<_> = files
+        .iter()
+        .filter_map(|(p, code)| {
+            let n = code.matches("record_query_read(").count();
+            (n > 0).then(|| (p.display().to_string(), n))
+        })
+        .collect();
+    assert!(
+        callers.len() == 1
+            && callers[0].0.ends_with("federation/attestation_query.rs")
+            && callers[0].1 == 1,
+        "I904 the typed read is recorded once, in its wrapper: {callers:?}"
+    );
 }
 
 #[test]
@@ -592,7 +615,7 @@ fn i692_a_read_inside_folds_returns_within_a_deadline() {
         rt.block_on(super::fold(
             Fold::ResolveServeTier,
             super::fold(Fold::IsPublicGroup, async {
-                one_read(Door::ListAttestationsFor);
+                one_read(Door::AttestationQuery);
             }),
         ));
         let snap = local.snapshot();
@@ -815,6 +838,7 @@ pub(crate) async fn i550_the_snapshot_is_reachable_through_engine(
     backend: StoreBackend,
     s: &str,
 ) {
+    use crate::federation::attestation_query::test_support::AllAttestations as _;
     use crate::federation::tier_ingest::test_support as ts;
     let local = ts::local_signer(&format!("i550-node-{s}"));
     let signer: std::sync::Arc<dyn ciris_keyring::HardwareSigner> =
@@ -822,7 +846,7 @@ pub(crate) async fn i550_the_snapshot_is_reachable_through_engine(
     let engine = crate::Engine::from_shared(dispatch, signer);
     let counters = LocalCounters::install();
     let before = engine.telemetry_snapshot();
-    d.list_attestations_for(&format!("i550-nobody-{s}"))
+    d.all_attestations_for(&format!("i550-nobody-{s}"))
         .await
         .unwrap();
     let after = engine.telemetry_snapshot();
@@ -833,8 +857,8 @@ pub(crate) async fn i550_the_snapshot_is_reachable_through_engine(
     );
     assert_eq!(
         delta3(
-            before.door(backend, Door::ListAttestationsFor),
-            after.door(backend, Door::ListAttestationsFor)
+            before.door(backend, Door::AttestationQuery),
+            after.door(backend, Door::AttestationQuery)
         ),
         (1, 0, 0),
         "I550 one empty read, through Engine::telemetry_snapshot"

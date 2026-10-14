@@ -832,6 +832,8 @@ mod tests {
             deployment_type: "production".into(),
             deployment_region: Some("US".into()),
             deployment_trust_mode: "federated_peer".into(),
+            run_kind: None,
+            trace_format_version: None,
         });
         let d = decompose(&trace).unwrap();
         // Every event row carries the profile, copied from the trace

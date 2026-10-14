@@ -2387,11 +2387,23 @@ pub mod orchestrate {
         for h in candidates {
             // Ever bound by anyone else — live, lapsed or withdrawn, which also
             // covers a live foreign owner and an ambiguous one.
-            if backend.list_attestations_for(&h).await?.iter().any(|a| {
-                a.attestation_type == attestation_type::DELEGATES_TO
-                    && is_owner_binding_envelope(&a.attestation_envelope)
-                    && a.attesting_key_id != member_key_id
-            }) {
+            let mut bound_by_another = false;
+            let mut pages = crate::federation::attestation_query::AttestationQuery::to(
+                &h,
+                crate::federation::attestation_query::FOLD_PAGE,
+            )
+            .types(&[attestation_type::DELEGATES_TO])
+            .pages();
+            while let Some(page) = pages.next(backend).await? {
+                if page.iter().any(|a| {
+                    is_owner_binding_envelope(&a.attestation_envelope)
+                        && a.attesting_key_id != member_key_id
+                }) {
+                    bound_by_another = true;
+                    break;
+                }
+            }
+            if bound_by_another {
                 continue;
             }
             if backend
@@ -4832,6 +4844,7 @@ pub mod blob_invariants {
     where
         B: BlobStorage + FederationDirectory + Sync,
     {
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
         use crate::federation::community_dek::orchestrate::encrypt_and_cascade_community;
         let run = uuid::Uuid::new_v4().simple().to_string();
         let comm = format!("{tag}-comm-{run}");
@@ -4850,8 +4863,9 @@ pub mod blob_invariants {
         let minter = signer.derived_key_id();
         let node_derived = signer.derived_key_id();
         async fn withdraws_by<D: FederationDirectory + Sync>(backend: &D, node: &str) -> usize {
+            use crate::federation::attestation_query::test_support::AllAttestations as _;
             backend
-                .list_attestations_by(node)
+                .all_attestations_by(node)
                 .await
                 .unwrap()
                 .into_iter()
@@ -4887,7 +4901,7 @@ pub mod blob_invariants {
             .await
             .unwrap();
         let prior = backend
-            .list_attestations_by(&node_derived)
+            .all_attestations_by(&node_derived)
             .await
             .unwrap()
             .into_iter()
@@ -7069,6 +7083,7 @@ pub mod blob_invariants {
         B: BlobStorage + FederationDirectory + Sync,
     {
         use crate::federation::adopt_cascade::{adopt_sealed_blob, AdoptDisposition};
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
         use crate::federation::community_dek::lifecycle_support::seed_community;
         use crate::federation::types::cohort_scope::{CryptoTier, FAMILY, SELF};
         let run = uuid::Uuid::new_v4().simple().to_string();
@@ -7164,7 +7179,7 @@ pub mod blob_invariants {
             if scope == SELF {
                 let out = r.unwrap_or_else(|e| panic!("{tag} I52: a self Announce: {e:?}"));
                 let claims: Vec<_> = backend
-                    .list_attestations_by(&our)
+                    .all_attestations_by(&our)
                     .await
                     .unwrap()
                     .into_iter()

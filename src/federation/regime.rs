@@ -817,6 +817,7 @@ mod tests {
         derived: &str,
         tag: &str,
     ) {
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
         use crate::federation::types::{attestation_tier, cohort_scope};
 
         let local_row = |dimension: &str| crate::federation::types::LocalAttestationInput {
@@ -889,7 +890,7 @@ mod tests {
         // audience is reached by a `supersedes` (clause 3, two rows).
         assert_eq!(after.cohort_scope, cohort_scope::SELF);
         let widened = dir
-            .list_attestations_by(&after.attesting_key_id)
+            .all_attestations_by(&after.attesting_key_id)
             .await
             .unwrap()
             .into_iter()

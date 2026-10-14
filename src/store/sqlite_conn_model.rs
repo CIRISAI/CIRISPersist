@@ -251,7 +251,6 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("aggregate_scoring_factors_rollup_batch", ConnClass::Read),
     ("aggregate_scoring_factors_uncached", ConnClass::Read),
     ("aggregate_scrub_stats", ConnClass::Read),
-    ("attach_attestation_pqc_signature", ConnClass::Write),
     ("attach_key_pqc_signature", ConnClass::Write),
     ("attach_revocation_pqc_signature", ConnClass::Write),
     // v53.0.0 (#975) — the row-type census: one GROUP BY, read-only.
@@ -315,6 +314,7 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("evict_fountain_content_to_tier", ConnClass::Write),
     ("evict_known_wire_hashes", ConnClass::Write),
     ("evict_scope_blobs", ConnClass::Write),
+    ("execute_attestation_query", ConnClass::Read),
     ("factor_rollup_present", ConnClass::Read),
     ("fetch_trace_events_page", ConnClass::Read),
     ("fountain_manifest_row", ConnClass::Read),
@@ -359,22 +359,18 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("list_at_rest_grants", ConnClass::Read),
     ("list_attestation_log", ConnClass::Read),
     ("list_attestations", ConnClass::Read),
-    ("list_attestations_by", ConnClass::Read),
-    ("list_attestations_for", ConnClass::Read),
     // v47.2.0 (#853) — composers naming a target, by `references_attestation_id`.
     ("list_attestations_referencing", ConnClass::Read),
-    // v53.1.5 — the bounded reads behind the audience resolver and the
-    // consent fold (V137 / V178 seeks).
-    ("list_attestations_by_dimension_prefix", ConnClass::Read),
-    ("list_attestations_for_dimension_prefix", ConnClass::Read),
+    // v53.1.5 — the composers naming a set of targets (V107 / V178 seeks).
+    // v56.0.0 (#1001): the dimension, type and typed reads beside it are
+    // retired onto `execute_attestation_query`.
     ("list_composers_referencing_any", ConnClass::Read),
-    // v53.1.6 — the type / citation / targeted seeks (V178, V180, V150).
-    ("list_attestations_for_type", ConnClass::Read),
-    ("list_attestations_by_type", ConnClass::Read),
-    // v53.1.7 — the trust-root walks' typed, job-filtered reads (V178 / V107):
-    // `list_attestations_for_types` / `_by_types` share this body.
-    ("sqlite_typed_read", ConnClass::Read),
+    // v53.1.6 — the citation / targeted seeks (V180, V150).
     ("list_attestations_by_dimension_citing", ConnClass::Read),
+    // v56.0.0 (#1001): `read::ReadEngine::list_attestations_for` — the cursor-paged
+    // subject read (#135/#150), NOT the retired `FederationDirectory` wide read of
+    // the same name, which left the trait (demoted to test-anchor) in this cut.
+    ("list_attestations_for", ConnClass::Read),
     // v55.0.0 (CIRISPersist#989) — V190's attester-free citation seek (the
     // holder directory's candidates).
     ("list_attestations_citing_by_dimension", ConnClass::Read),
@@ -533,8 +529,6 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("peer_metadata_for", ConnClass::Read),
     ("pinned_blob_bytes", ConnClass::Read),
     ("purge_attestation_projections", ConnClass::Write),
-    ("purge_attestation_v31", ConnClass::Write),
-    ("purge_genesis_delegation_row_v31", ConnClass::Write),
     ("put_accord_decision", ConnClass::Write),
     ("put_accord_participation", ConnClass::Write),
     ("put_accord_proposal", ConnClass::Write),
@@ -567,7 +561,6 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("key_grant_pending_put", ConnClass::Write),
     ("key_grant_pending_list", ConnClass::Read),
     ("key_grant_pending_delete", ConnClass::Write),
-    ("put_attestation_with_origin", ConnClass::Write),
     // v52.0.0 (#957) — the chunk floor's ONE body, batched: ONE write
     // transaction for a run of chunks. `put_blob_chunk_floor` is its batch of
     // one and touches no connection; `put_blob_chunk_with_scope`,
@@ -696,7 +689,6 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     // schema-history table, run before refinery validates it.
     ("repair_v070_checksum", ConnClass::Write),
     ("replay_abandoned", ConnClass::Write),
-    ("reseal_attestation_v31", ConnClass::Write),
     ("resolve_scores", ConnClass::Read),
     ("retire_goal", ConnClass::Write),
     ("revocations_for_subject", ConnClass::Read),
@@ -734,7 +726,19 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("sqlite_upsert_wire_index", ConnClass::HelperWrite),
     // v55.0.0 (CIRISPersist#989) — the three claim doors' shared INSERT.
     ("sqlite_insert_holding_claim", ConnClass::HelperWrite),
-    ("sqlite_write_local_attestation", ConnClass::Write),
+    ("store_planned_local_attestation", ConnClass::Write),
+    // v56.0.0 (CIRISPersist#934 step 1) — the attestation plane's executor
+    // (`AttestationStore`): its two reads and its writes. The doors that held
+    // these statements (`put_attestation_with_origin`,
+    // `attach_attestation_pqc_signature`, `sqlite_write_local_attestation`) are
+    // calls into the shared plans now and touch no connection.
+    ("attesting_identity_type", ConnClass::Read),
+    ("composer_replay_held", ConnClass::Read),
+    ("delete_attestation", ConnClass::Write),
+    ("repair_withdraws_depth", ConnClass::Write),
+    ("store_pqc_completion", ConnClass::Write),
+    ("store_planned_attestation", ConnClass::Write),
+    ("store_planned_reseal", ConnClass::Write),
     ("store_blob_local", ConnClass::Write),
     ("stream_consistency_proof", ConnClass::Read),
     ("stream_inclusion_proof", ConnClass::Read),

@@ -401,6 +401,7 @@ pub(crate) mod bodies {
         b: &dyn FederationDirectory,
         tag: &str,
     ) {
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
         let mut v = None;
         let mut decision_rows = None;
         for d in [a, b] {
@@ -419,7 +420,7 @@ pub(crate) mod bodies {
                 // The charter row reaches b as any attestation does.
                 let named = held_charter(a).await;
                 let row = a
-                    .list_attestations_for(accord_family_key_id())
+                    .all_attestations_for(accord_family_key_id())
                     .await
                     .unwrap()
                     .into_iter()
@@ -523,7 +524,8 @@ pub(crate) mod bodies {
         d: &dyn FederationDirectory,
         digest: &str,
     ) -> crate::federation::Attestation {
-        d.list_attestations_for(accord_family_key_id())
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
+        d.all_attestations_for(accord_family_key_id())
             .await
             .unwrap()
             .into_iter()

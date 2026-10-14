@@ -225,10 +225,50 @@ pub struct DeploymentProfile {
     /// Federation participation intent (`sovereign` / `limited_trust` /
     /// `federated_peer`).
     pub deployment_trust_mode: String,
+    /// v56.0.0 (CIRISPersist#1089, CIRISAgent#1255; CC 3.1.5) — the run that
+    /// produced this trace, closed vocabulary [`RUN_KINDS`]. `trace_format`
+    /// v2.8.0 carries `run_kind` HERE rather than at the top level: the
+    /// substrate (ciris-lens-core) assembles and signs the envelope, and
+    /// `deployment_profile` is the only signed block the agent supplies. A
+    /// SIGNED member: the profile serializes into the canonical bytes at every
+    /// schema version that signs it (2.7.9, 3.0.0), so it cannot be added,
+    /// dropped or edited after signing. Absent on every v2.7.x profile, whose
+    /// serialized bytes are therefore unchanged. Admissible only with
+    /// [`trace_format_version`](Self::trace_format_version) (the format gate,
+    /// [`super::trace_format::check_trace_format`]). Read through
+    /// [`CompleteTrace::signed_run_kind`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_kind: Option<String>,
+    /// v56.0.0 (CIRISPersist#1089) — the trace FORMAT this trace declares
+    /// (`"2.8.0"`), a signed member distinct from `trace_schema_version`
+    /// (which stays the canonicalization epoch). The admission gate keys on
+    /// it: a vendored format validates against its pinned schema
+    /// ([`super::trace_format::VENDORED_TRACE_FORMATS`]); any other value is
+    /// refused by name (`schema_unsupported_trace_format`), never truncated.
+    /// Absent on v2.7.x traces.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace_format_version: Option<String>,
 }
 
 /// CC 3.1.5 (CIRISConstitution#166) — the closed `run_kind` vocabulary.
-pub const RUN_KINDS: &[&str] = &["production", "qa", "battery", "mock"];
+///
+/// v56.0.0 (CIRISPersist#1089, operator amendment 2026-10-14) — two values
+/// join the production kind: `prod-personal` (a production run on a personal
+/// install) and `prod-managed` (on a managed deployment; CIRISManager sets
+/// it). The three production values admit alike; only `mock` is refused
+/// (`trace_run_kind_mock`); `qa` and `battery` are admitted and labelled.
+/// `production` stays valid, so v2.7.x traces admit unchanged. The vendored
+/// `trace_format` v2.8.0 schema cut (`8c51028c…`) predates the amendment and
+/// still lists four values, so a v2.8.0 trace carrying a new value is refused
+/// by schema validation until the re-cut schema is vendored (I1037).
+pub const RUN_KINDS: &[&str] = &[
+    "production",
+    "prod-personal",
+    "prod-managed",
+    "qa",
+    "battery",
+    "mock",
+];
 
 /// `CompleteTrace` envelope (TRACE_WIRE_FORMAT.md §3).
 ///
@@ -327,7 +367,8 @@ pub struct CompleteTrace {
 
     /// v54.1.0 (CC 3.1.5, CIRISConstitution#166 at rc8@8c8f536;
     /// CIRISAgent#1249) — the run that produced this trace, closed vocabulary
-    /// `production | qa | battery | mock` ([`RUN_KINDS`]). A SIGNED member:
+    /// `production | prod-personal | prod-managed | qa | battery | mock`
+    /// ([`RUN_KINDS`]; the two `prod-*` values from v56.0.0). A SIGNED member:
     /// when present it is part of the canonical bytes every schema version's
     /// reconstruction signs over (`verify::ed25519::canonical_bytes_for_trace`),
     /// so it cannot be added, removed or changed after signing. Absent on
@@ -389,6 +430,25 @@ pub struct CompleteTrace {
     /// not load-bearing for verify (the bound hybrid signature is).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pqc_key_id: Option<String>,
+}
+
+impl CompleteTrace {
+    /// v56.0.0 (CIRISPersist#1089) — the trace's signed `run_kind`, from
+    /// EITHER place a producer signs it: the top-level member (v2.7.x
+    /// producers, CIRISAgent#1249) or `deployment_profile.run_kind`
+    /// (`trace_format` v2.8.0). Every run-kind gate reads THIS, never the
+    /// field alone, so a v2.8.0 mock run cannot read as "none". Where both
+    /// are present they must agree (`schema_run_kind_conflict` at parse,
+    /// [`super::trace_format::check_trace_format`]); the top level wins only
+    /// on a trace that never passed that gate.
+    #[must_use]
+    pub fn signed_run_kind(&self) -> Option<&str> {
+        self.run_kind.as_deref().or_else(|| {
+            self.deployment_profile
+                .as_ref()
+                .and_then(|p| p.run_kind.as_deref())
+        })
+    }
 }
 
 /// v4.0 (CIRISPersist#160) — default `cohort_scope` for a trace whose

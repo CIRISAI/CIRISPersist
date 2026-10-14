@@ -45,6 +45,10 @@ pub mod adopt_cascade;
 pub mod affiliation_config;
 pub mod age;
 pub mod at_rest_cascade;
+/// v56.0.0 (CIRISPersist#934 step 1) — the attestation plane's stored write,
+/// decided once: `plan_put_attestation` + the per-backend `AttestationStore`
+/// executor.
+pub(crate) mod attestation_admit;
 /// v36.0.0 (CIRISPersist#624) — the typed, pre-write replicated
 /// ATTESTATION-plane apply (`AttestationRefusalReason` /
 /// `ReplicatedAttestationOutcome`): the Key plane's #565 twin.
@@ -52,6 +56,10 @@ pub mod attestation_apply;
 /// v25.1.0 (CIRISPersist#582) — the backend-generic signed-ATTESTATION emit
 /// recipe (distinct from [`emit`], the trust-grant/audit-entry API).
 pub mod attestation_emit;
+// v56.0.0 (CIRISPersist#1001) — the typed bounded attestation read.
+pub mod attestation_query;
+#[cfg(test)]
+mod attestation_query_invariants;
 #[cfg(feature = "cirisaudit")]
 pub mod backfill;
 pub mod blackhole;
@@ -59,6 +67,12 @@ pub mod blackhole;
 mod blob_surface_gates;
 pub mod blobs;
 pub mod bootstrap_admission;
+#[cfg(test)]
+mod bounded_planes_invariants;
+// v56.0.0 (CIRISPersist#1001) — I914/I915: every production `list_*` read
+// classified; no production caller of the demoted wide reads.
+#[cfg(test)]
+mod bounded_reads_table;
 pub mod canonical_at_rest;
 pub mod capacity;
 // v50.0.0 (CIRISPersist#926) — the `ciris-canonical` community row: admitted
@@ -216,14 +230,26 @@ mod retraction_invariants;
 /// cohort and the typed config record (I592–I594).
 #[cfg(test)]
 pub mod affiliation_invariants;
+/// v56.0.0 (CIRISPersist#934 step 1) — the shared attestation plan judges at
+/// the instant it is given (I950).
+#[cfg(test)]
+pub(crate) mod attestation_admit_invariants;
 /// v54.0.0 (CIRISPersist#1031, CC 4.1.1) — the cycle-closing `delegates_to`
 /// is refused at admission (I590).
 #[cfg(test)]
 pub mod delegation_cycle_invariants;
+/// v56.0.0 (CIRISPersist#934 step 1, door 6) — the genesis re-bake purge
+/// door refuses, at the store, an id the bundle does not carry (I954).
+#[cfg(test)]
+pub(crate) mod genesis_purge_door_invariants;
 /// v54.0.0 (CIRISPersist#1033, CC 2.4.1.2.1) — the `grant` scope admits its
 /// holder (I591).
 #[cfg(test)]
 pub mod grant_scope_invariants;
+/// v56.0.0 (CIRISPersist#934 step 1) — the local write door's occupied-id
+/// divergence across backends, pinned (I951).
+#[cfg(test)]
+pub(crate) mod local_door_divergence_invariants;
 /// CIRISPersist#972 — I335–I339, a node is seated without an acceptance.
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod node_seat_invariants;
@@ -252,6 +278,10 @@ mod remint_invariants;
 /// custody report under the data a DAG was sealed with.
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod repair_invariants;
+/// v56.0.0 (CIRISPersist#934 step 1, door 4) — a re-seal judges the row it
+/// overwrites (I953).
+#[cfg(test)]
+pub(crate) mod reseal_race_invariants;
 #[cfg(test)]
 pub mod room_roster_authority_invariants;
 /// v48.0.0 (CIRISPersist#860) — the room-roster planes witnesses.
@@ -2345,7 +2375,11 @@ pub(crate) fn owner_binding_of(row: &Attestation) -> Option<(String, String)> {
 /// here (the next write rolls the epochs the node held). A lookup that fails
 /// is logged and treated as no change: the row stands, and the pending sweep
 /// is where a missed re-wrap is retried.
-#[cfg(any(feature = "sqlite", feature = "postgres"))]
+///
+/// v56.0.0 (CIRISPersist#934) — no longer feature-gated: the shared
+/// attestation door (`attestation_admit::put_attestation_planned`) asks it on
+/// every backend. Memory's re-wrap is the trait's no-op default, so a memory
+/// store observes the same outcome it did when it never asked.
 pub(crate) async fn consent_list_change_of<F>(
     directory: &F,
     row: &Attestation,
@@ -2674,17 +2708,6 @@ pub fn first_evidence_ref(envelope: &serde_json::Value) -> Option<&str> {
         .and_then(serde_json::Value::as_array)
         .and_then(|a| a.first())
         .and_then(serde_json::Value::as_str)
-}
-
-/// v53.1.7 — the predicate of [`FederationDirectory::list_attestations_for_types`]
-/// / `_by_types`, as the memory backend and the default bodies compute it:
-/// the row's type is one of `types`, and its top-level envelope `dimension`
-/// (a string; anything else is no dimension) is none of `excluded`.
-#[must_use]
-pub fn types_and_dimension_admit(a: &Attestation, types: &[&str], excluded: &[&str]) -> bool {
-    types.contains(&a.attestation_type.as_str())
-        && !admission::envelope_dimension(&a.attestation_envelope)
-            .is_some_and(|d| excluded.contains(&d))
 }
 
 /// v53.1.6 — V150's `cohort_target` as the memory backend and the default
@@ -3490,67 +3513,73 @@ pub trait FederationDirectory: Send + Sync {
         target_attestation_id: &str,
     ) -> Result<Vec<Attestation>, Error>;
 
-    /// All attestations targeting `attested_key_id` (consumer asks
-    /// "who vouches for K?"). Ordered by `asserted_at` DESC.
-    async fn list_attestations_for(&self, attested_key_id: &str)
-        -> Result<Vec<Attestation>, Error>;
-
-    /// All attestations issued by `attesting_key_id` (consumer asks
-    /// "which keys does K vouch for?"). Ordered by `asserted_at` DESC.
-    async fn list_attestations_by(&self, attesting_key_id: &str)
-        -> Result<Vec<Attestation>, Error>;
-
-    /// v53.1.5 — the federation-tier rows `attesting_key_id` authored whose
-    /// envelope `dimension` starts with `dimension_prefix` (a byte prefix —
-    /// the #817/#818 half-open range, never `LIKE`). Ordered by `asserted_at`
-    /// DESC. The bounded read behind
-    /// [`replication_audience::owner_allow_list`]: an owner's
-    /// `consent:replication:v1` grants without every row the owner ever
-    /// authored. Served by V137's `(attesting_key_id, dimension)`.
-    async fn list_attestations_by_dimension_prefix(
+    /// v56.0.0 (CIRISPersist#1001) — **the storage half of the typed bounded
+    /// read**: run `q`'s one statement and return at most `q.fetch()` rows in
+    /// `q`'s order (one past the page, so the wrapper knows whether another
+    /// page exists), with the envelope bytes decoded. Storage only: callers
+    /// read through
+    /// [`AttestationReads::query_attestations`](attestation_query::AttestationReads::query_attestations),
+    /// which validates the query, cuts the page, mints the cursor and records
+    /// the read once. No default body: every implementor states how it runs
+    /// the query (a wrapper delegates; a proxy that cannot answer says
+    /// `Unsupported`), so none inherits a read wider than the query.
+    async fn execute_attestation_query(
         &self,
-        attesting_key_id: &str,
-        dimension_prefix: &str,
-    ) -> Result<Vec<Attestation>, Error> {
-        // Pin-compatible default: today's semantics over the unbounded read.
-        // memory / sqlite / postgres override with the indexed seek.
-        Ok(self
-            .list_attestations_by(attesting_key_id)
-            .await?
-            .into_iter()
-            .filter(|a| {
-                admission::envelope_dimension(&a.attestation_envelope)
-                    .is_some_and(|d| d.starts_with(dimension_prefix))
-            })
-            .collect())
-    }
+        q: &attestation_query::AttestationQuery,
+    ) -> Result<attestation_query::QueryRows, Error>;
 
-    /// v53.1.5 — the federation-tier rows attested TO `attested_key_id`
-    /// whose envelope `dimension` starts with `dimension_prefix`, optionally
-    /// only those `attesting_key_id` authored. Ordered by `asserted_at` DESC.
-    /// The bounded read behind the consent fold
-    /// ([`consent::scoped_fold_rows`]: a principal's `consent:state:*` rows
-    /// about the target) and [`replication_audience::is_public_group`] (a
-    /// group's `trust:charter:v1` rows). Served by V178's
-    /// `(attested_key_id, dimension)`.
-    async fn list_attestations_for_dimension_prefix(
+    /// **Demoted (v56.0.0, CIRISPersist#1001): test and `test-anchor` builds
+    /// only; deleted in v57.** Every federation-tier row attested TO
+    /// `attested_key_id`, newest first — the whole slice, paged through the
+    /// bounded [`AttestationQuery::to`](attestation_query::AttestationQuery::to)
+    /// at [`FOLD_PAGE`](attestation_query::FOLD_PAGE) per statement. Kept so
+    /// an adopter's test oracle (CIRISEdge's dev-dependency enables
+    /// `test-anchor`) still compiles while its production reads move onto
+    /// [`AttestationQuery`](attestation_query::AttestationQuery). No
+    /// production build has it, and a from-disk gate
+    /// (`bounded_reads_invariants`) holds production call sites at zero.
+    ///
+    /// # Errors
+    ///
+    /// The read's [`NotServed`](attestation_query::ReadOutcome::NotServed)
+    /// reason, as an error — never an empty list.
+    #[cfg(any(test, feature = "test-anchor"))]
+    async fn list_attestations_for(
         &self,
         attested_key_id: &str,
-        attesting_key_id: Option<&str>,
-        dimension_prefix: &str,
     ) -> Result<Vec<Attestation>, Error> {
-        // Pin-compatible default: today's semantics over the unbounded read.
-        // memory / sqlite / postgres override with the indexed seek.
-        Ok(self
-            .list_attestations_for(attested_key_id)
-            .await?
-            .into_iter()
-            .filter(|a| {
-                attesting_key_id.is_none_or(|k| a.attesting_key_id == k)
-                    && admission::envelope_dimension(&a.attestation_envelope)
-                        .is_some_and(|d| d.starts_with(dimension_prefix))
-            })
-            .collect())
+        let mut out = Vec::new();
+        let mut pages =
+            attestation_query::AttestationQuery::to(attested_key_id, attestation_query::FOLD_PAGE)
+                .pages();
+        while let Some(rows) = pages.next(self).await? {
+            out.extend(rows);
+        }
+        Ok(out)
+    }
+
+    /// **Demoted (v56.0.0, CIRISPersist#1001): test and `test-anchor` builds
+    /// only; deleted in v57.** Every federation-tier row `attesting_key_id`
+    /// authored, newest first, paged through the bounded
+    /// [`AttestationQuery::by`](attestation_query::AttestationQuery::by). See
+    /// [`Self::list_attestations_for`].
+    ///
+    /// # Errors
+    ///
+    /// The read's `NotServed` reason, as an error — never an empty list.
+    #[cfg(any(test, feature = "test-anchor"))]
+    async fn list_attestations_by(
+        &self,
+        attesting_key_id: &str,
+    ) -> Result<Vec<Attestation>, Error> {
+        let mut out = Vec::new();
+        let mut pages =
+            attestation_query::AttestationQuery::by(attesting_key_id, attestation_query::FOLD_PAGE)
+                .pages();
+        while let Some(rows) = pages.next(self).await? {
+            out.extend(rows);
+        }
+        Ok(out)
     }
 
     /// v53.1.5 — every federation-tier STRUCTURAL COMPOSER (`withdraws` /
@@ -3589,110 +3618,19 @@ pub trait FederationDirectory: Send + Sync {
         Ok(out)
     }
 
-    /// v53.1.6 — the federation-tier rows attested TO `attested_key_id`
-    /// whose `attestation_type` is `attestation_type` (a `delegates_to`
-    /// subject's incoming edges; a subject's `withdraws` / `recants`).
-    /// Ordered by `asserted_at` DESC. Served by V178's
-    /// `(attested_key_id, attestation_type, …)` prefix. Pin-compatible
-    /// default over the unbounded read; every backend overrides.
-    async fn list_attestations_for_type(
-        &self,
-        attested_key_id: &str,
-        attestation_type: &str,
-    ) -> Result<Vec<Attestation>, Error> {
-        Ok(self
-            .list_attestations_for(attested_key_id)
-            .await?
-            .into_iter()
-            .filter(|a| a.attestation_type == attestation_type)
-            .collect())
-    }
-
-    /// v53.1.6 — the federation-tier rows `attesting_key_id` authored whose
-    /// `attestation_type` is `attestation_type` (a steward's outgoing
-    /// `delegates_to` edges — the candidates of [`admission::nodes_owned_by`]
-    /// and [`admission::nodes_stewarded_by`]). Ordered by `asserted_at` DESC.
-    /// Served by V107's `(attesting_key_id, attestation_type, …)` prefix.
-    /// Pin-compatible default over the unbounded read; every backend
-    /// overrides.
-    async fn list_attestations_by_type(
-        &self,
-        attesting_key_id: &str,
-        attestation_type: &str,
-    ) -> Result<Vec<Attestation>, Error> {
-        Ok(self
-            .list_attestations_by(attesting_key_id)
-            .await?
-            .into_iter()
-            .filter(|a| a.attestation_type == attestation_type)
-            .collect())
-    }
-
-    /// v53.1.7 — the federation-tier rows attested TO `attested_key_id` whose
-    /// `attestation_type` is one of `attestation_types` and whose envelope
-    /// `dimension` is NOT one of `excluded_dimensions` (absent and non-string
-    /// dimensions are kept). Ordered by `asserted_at` DESC. The bounded read
-    /// behind the trust-root walks: a subject's conferrals or a root's
-    /// charters without every trust edge naming it (`excluded_dimensions` =
-    /// the `trust:{job}` labels the predicate refuses). Served by V178's
-    /// `(attested_key_id, attestation_type, …)` prefix. Pin-compatible default
-    /// over the unbounded read; every backend overrides.
-    async fn list_attestations_for_types(
-        &self,
-        attested_key_id: &str,
-        attestation_types: &[&str],
-        excluded_dimensions: &[&str],
-    ) -> Result<Vec<Attestation>, Error> {
-        Ok(self
-            .list_attestations_for(attested_key_id)
-            .await?
-            .into_iter()
-            .filter(|a| types_and_dimension_admit(a, attestation_types, excluded_dimensions))
-            .collect())
-    }
-
-    /// v53.1.7 — the federation-tier rows `attesting_key_id` authored, typed
-    /// and dimension-filtered as [`Self::list_attestations_for_types`]. Ordered
-    /// by `asserted_at` DESC. A user's or a node's trust edges without its
-    /// whole history. Served by V107's `(attesting_key_id, attestation_type,
-    /// …)` prefix. Pin-compatible default over the unbounded read; every
-    /// backend overrides.
-    async fn list_attestations_by_types(
-        &self,
-        attesting_key_id: &str,
-        attestation_types: &[&str],
-        excluded_dimensions: &[&str],
-    ) -> Result<Vec<Attestation>, Error> {
-        Ok(self
-            .list_attestations_by(attesting_key_id)
-            .await?
-            .into_iter()
-            .filter(|a| types_and_dimension_admit(a, attestation_types, excluded_dimensions))
-            .collect())
-    }
-
     /// v53.1.6 — the federation-tier rows `attesting_key_id` authored under
     /// exactly `dimension` whose envelope's `evidence_refs` FIRST element is
     /// `evidence_ref` — a device's `custody:ack:v1` reports about one blob.
     /// Ordered by `asserted_at` DESC. Served by V180's
-    /// `(attesting_key_id, dimension, evidence_refs[0])`. Pin-compatible
-    /// default over the dimension read; every backend overrides.
+    /// `(attesting_key_id, dimension, evidence_refs[0])`. v56.0.0
+    /// (CIRISPersist#1001): required — its default composed over a retired
+    /// dimension read, and no default may read wider than its own query.
     async fn list_attestations_by_dimension_citing(
         &self,
         attesting_key_id: &str,
         dimension: &str,
         evidence_ref: &str,
-    ) -> Result<Vec<Attestation>, Error> {
-        Ok(self
-            .list_attestations_by_dimension_prefix(attesting_key_id, dimension)
-            .await?
-            .into_iter()
-            .filter(|a| {
-                admission::envelope_dimension(&a.attestation_envelope) == Some(dimension)
-                    && first_evidence_ref(&a.attestation_envelope) == Some(evidence_ref)
-            })
-            .collect())
-    }
+    ) -> Result<Vec<Attestation>, Error>;
 
     /// v55.0.0 (CIRISPersist#989, V190) — the federation-tier rows of ANY
     /// attester under exactly `dimension` whose envelope's `evidence_refs`
@@ -4425,7 +4363,7 @@ pub trait FederationDirectory: Send + Sync {
     ///   1. Enumerate all `trusted_publisher`-type keys via
     ///      [`Self::list_keys_by_identity_type`].
     ///   2. For each, list attestations issued by the key via
-    ///      [`Self::list_attestations_by`].
+    ///      [`AttestationQuery::by`](crate::federation::attestation_query::AttestationQuery::by).
     ///   3. Keep `scores` attestations whose envelope `dimension`
     ///      starts with `content_rating:` AND whose `evidence_refs`
     ///      array contains the hex `content_sha256`.
@@ -4441,7 +4379,7 @@ pub trait FederationDirectory: Send + Sync {
     /// # Default impl rationale
     ///
     /// Composes [`Self::list_keys_by_identity_type`] +
-    /// [`Self::list_attestations_by`] (both already trait-required);
+    /// [`AttestationQuery::by`](crate::federation::attestation_query::AttestationQuery::by) (both already trait-required);
     /// no per-backend SQL needed. Memory / Postgres / SQLite backends
     /// inherit the same shape. Backends with a `content_rating:*`
     /// secondary index may override for O(log N) lookup instead of the
@@ -4495,11 +4433,20 @@ pub trait FederationDirectory: Send + Sync {
             if conferred.is_none() {
                 continue;
             }
-            let attestations = self.list_attestations_by(&publisher.key_id).await?;
+            // The publisher's `content_rating:*` scores: the only rows the
+            // vouch below can match.
+            let mut attestations = Vec::new();
+            let mut pages = attestation_query::AttestationQuery::by(
+                &publisher.key_id,
+                attestation_query::FOLD_PAGE,
+            )
+            .types(&[types::attestation_type::SCORES])
+            .dimension_prefix("content_rating:")
+            .pages();
+            while let Some(page) = pages.next(self).await? {
+                attestations.extend(page);
+            }
             for att in attestations {
-                if att.attestation_type != types::attestation_type::SCORES {
-                    continue;
-                }
                 // CEG 0.3 §5.6.8.3 reserved-prefix rule: content_rating:*
                 // dimensions are emitter-restricted to trusted_publisher,
                 // so a (publisher, content_rating:*) pair carries the
@@ -6722,7 +6669,20 @@ pub trait FederationDirectory: Send + Sync {
                 self.list_signed_transport_destinations_for(subject_key_id)
                     .await?,
             ),
-            K::Attestation => wrap(kind, self.list_attestations_for(subject_key_id).await?),
+            // Every attestation about the subject (the subject-scoped pull),
+            // walked in pages.
+            K::Attestation => {
+                let mut rows = Vec::new();
+                let mut pages = attestation_query::AttestationQuery::to(
+                    subject_key_id,
+                    attestation_query::FOLD_PAGE,
+                )
+                .pages();
+                while let Some(page) = pages.next(self).await? {
+                    rows.extend(page);
+                }
+                wrap(kind, rows)
+            }
             // v16.0.0 (#421): the revocation arm returns the SIGNED container
             // (byte-exact re-publish; signed-put rows only) now that the
             // revocation plane carries the #418 signature discipline.
@@ -7860,19 +7820,24 @@ pub trait FederationDirectory: Send + Sync {
     /// [`Attestation`] rows (deduped on `attestation_id`), so a consumer can
     /// read each edge's scope/expiry/granter.
     ///
-    /// Default impl filters [`Self::list_attestations_for`] to
-    /// `delegates_to`; backends need not override. Returns an empty vec when
-    /// no key delegates to `key_id`.
+    /// v56.0.0 (#1001): the `delegates_to` rows about `key_id`, sought by
+    /// type through the typed query and walked in pages; backends need not
+    /// override. Returns an empty vec when no key delegates to `key_id`.
     async fn delegations_to(&self, key_id: &str) -> Result<Vec<Attestation>, Error> {
         use std::collections::HashSet;
         let mut seen: HashSet<String> = HashSet::new();
-        Ok(self
-            .list_attestations_for(key_id)
-            .await?
-            .into_iter()
-            .filter(|a| a.attestation_type == types::attestation_type::DELEGATES_TO)
-            .filter(|a| seen.insert(a.attestation_id.clone()))
-            .collect())
+        let mut out = Vec::new();
+        let mut pages =
+            attestation_query::AttestationQuery::to(key_id, attestation_query::FOLD_PAGE)
+                .types(&[types::attestation_type::DELEGATES_TO])
+                .pages();
+        while let Some(page) = pages.next(self).await? {
+            out.extend(
+                page.into_iter()
+                    .filter(|a| seen.insert(a.attestation_id.clone())),
+            );
+        }
+        Ok(out)
     }
 
     /// v4.0 (CIRISPersist#160 comment 4, FSD §4.6) — AV-45 write-path
@@ -9136,7 +9101,7 @@ pub trait FederationDirectory: Send + Sync {
 
     /// CEG §8.1.11.1 — effective consent stance of subject `s` over
     /// target Contribution `T` at `now`. Default impl over
-    /// [`list_attestations_for`](Self::list_attestations_for): the latest
+    /// [`list_attestations_for`](crate::federation::attestation_query::AttestationQuery::to): the latest
     /// non-expired `consent:state:*` attestation whose `attesting_key_id`
     /// is `s`, by `asserted_at`. `Unspecified` if `s` never declared a
     /// stance against `T`.
@@ -9265,7 +9230,7 @@ pub trait FederationDirectory: Send + Sync {
     ///
     /// The whole design, including why RAISES are deliberately **not**
     /// conferral-filtered, lives in [`content_class`]. Default impl over
-    /// [`Self::list_attestations_for`] + the capability walk — no per-backend
+    /// [`AttestationQuery::to`](crate::federation::attestation_query::AttestationQuery::to) + the capability walk — no per-backend
     /// SQL, so memory / sqlite / postgres inherit one fold.
     ///
     /// # Errors
@@ -9291,7 +9256,7 @@ pub trait FederationDirectory: Send + Sync {
     /// [`Attestation`] rows (`attested_key_id` = target `T`,
     /// `attesting_key_id` = subject `s`, `asserted_at` = revocation time,
     /// `tier`/`promoted_at` for the §10.1.3 local-tier check). Includes
-    /// **local-tier** rows (unlike [`list_attestations_for`](Self::list_attestations_for),
+    /// **local-tier** rows (unlike [`list_attestations_for`](crate::federation::attestation_query::AttestationQuery::to),
     /// which is federation-only) — the promotion-overdue check needs them.
     /// `since` bounds the scan; `None` = all.
     async fn list_consent_revocations(
@@ -9315,7 +9280,7 @@ pub trait FederationDirectory: Send + Sync {
     ///
     /// Backend-agnostic default composing
     /// [`list_consent_revocations`](Self::list_consent_revocations) +
-    /// [`list_attestations_for`](Self::list_attestations_for) +
+    /// [`list_attestations_for`](crate::federation::attestation_query::AttestationQuery::to) +
     /// [`record_hard_case`](Self::record_hard_case). Emission is idempotent
     /// (deterministic `event_id`), so running every tick re-emits nothing
     /// for already-recorded conditions. NOTE: the per-revocation
@@ -9344,8 +9309,19 @@ pub trait FederationDirectory: Send + Sync {
             let subject = &rev.attesting_key_id;
             let revoked_at = rev.asserted_at;
 
-            // (a) §8.1.11.3 deletion-SLA breach.
-            let atts = self.list_attestations_for(target).await?;
+            // (a) §8.1.11.3 deletion-SLA breach. The target's
+            // `consent:deletion_sla:*` and `consent:deletion_complete*` rows:
+            // the only two families the checks below read.
+            let mut atts = Vec::new();
+            for prefix in ["consent:deletion_sla:", "consent:deletion_complete"] {
+                let mut pages =
+                    attestation_query::AttestationQuery::to(target, attestation_query::FOLD_PAGE)
+                        .dimension_prefix(prefix)
+                        .pages();
+                while let Some(page) = pages.next(self).await? {
+                    atts.extend(page);
+                }
+            }
             let sla_days = atts
                 .iter()
                 .filter_map(|a| {
@@ -9948,6 +9924,31 @@ pub enum Error {
         member: String,
         /// The rule it broke.
         reason: String,
+    },
+
+    /// v56.0.0 (CIRISPersist#934 step 1, door 2) — a local upsert
+    /// (`attestation_upsert_local`) named an `attestation_id` held by a row it
+    /// does not replace: a row of another dimension, another attester, or the
+    /// federation tier. An upsert replaces only its own `(attester, dimension)`
+    /// local row. Refused with nothing written and nothing deleted. Before
+    /// v56.0.0 memory returned the id without writing, and sqlite and postgres
+    /// deleted the upsert's own row and stored nothing (I951). Stable `kind()`
+    /// token `federation_local_attestation_id_occupied`; Python `ValueError`,
+    /// the type of the local door's `InvalidArgument` refusals.
+    #[error(
+        "local attestation_id {attestation_id} is held by a row this upsert does not replace \
+         (attester {held_attesting_key_id}, dimension {held_dimension:?}, tier {held_tier}): \
+         an upsert replaces only its own (attester, dimension) local row"
+    )]
+    LocalAttestationIdOccupied {
+        /// The id the caller chose.
+        attestation_id: String,
+        /// The held row's attester.
+        held_attesting_key_id: String,
+        /// The held row's envelope dimension, if it carries one.
+        held_dimension: Option<String>,
+        /// The held row's tier.
+        held_tier: String,
     },
 
     /// Row would conflict with an existing row whose content differs.
@@ -12075,6 +12076,20 @@ pub mod malformed_row {
     /// A moderation row's signed subject digest does not parse
     /// (CIRISPersist#784).
     pub const MODERATION_SUBJECT_DIGEST: &str = "moderation_subject_digest_malformed";
+    /// v56.0.0 (CIRISPersist#1077, CC 3.3.6.2 rc8) — a signed
+    /// `transport_destination` envelope carries `transit_kex_pubkeys` with only
+    /// one of its two members (`x25519_base64`, `ml_kem_768_base64`), or with
+    /// neither. The pair is both or the member is absent.
+    pub const TRANSIT_KEX_HALF_PAIR: &str = "transit_kex_half_pair";
+    /// v56.0.0 (CIRISPersist#1077) — a `transit_kex_pubkeys` member decodes to
+    /// the wrong number of bytes (x25519: exactly 32; ML-KEM-768: exactly 1184).
+    pub const TRANSIT_KEX_WRONG_LENGTH: &str = "transit_kex_wrong_length";
+    /// v56.0.0 (CIRISPersist#1077, CC 3.3.6.2 key separation) — the transit
+    /// x25519 is the same 32 bytes as the row's own Reticulum link x25519
+    /// (`transport_x25519_pubkey_base64`), the one reuse byte-checkable inside
+    /// the envelope. Reuse of the identity's other keys is judged at use
+    /// (CIRISPersist#1078), never here.
+    pub const TRANSIT_KEX_KEY_REUSE: &str = "transit_kex_key_reuse";
 
     /// Every token, for the from-disk witnesses and adopters' tables.
     pub const ALL: &[&str] = &[
@@ -12085,6 +12100,9 @@ pub mod malformed_row {
         ENVELOPE_NOT_CANONICAL,
         CUSTODY_ACK,
         MODERATION_SUBJECT_DIGEST,
+        TRANSIT_KEX_HALF_PAIR,
+        TRANSIT_KEX_WRONG_LENGTH,
+        TRANSIT_KEX_KEY_REUSE,
     ];
 }
 
@@ -12143,6 +12161,7 @@ impl Error {
             Error::ConsentGateRefused(_) => "federation_consent_gate_refused",
             Error::ConsentScopeTokenInvalid { .. } => "federation_consent_scope_token_invalid",
             Error::MediaSourceInvalid { .. } => "federation_media_source_invalid",
+            Error::LocalAttestationIdOccupied { .. } => "federation_local_attestation_id_occupied",
             Error::Conflict(_) => "federation_conflict",
             Error::AdminActionUnattributed { .. } => "federation_admin_action_unattributed",
             Error::RevocationBoundInvalid { .. } => "federation_revocation_bound_invalid",

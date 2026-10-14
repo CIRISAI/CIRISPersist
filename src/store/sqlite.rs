@@ -2463,41 +2463,6 @@ struct RawAggregationRow {
 // JSONB→serde_json::Value decode. Wire shape matches PG byte-for-byte.
 
 impl SqliteBackend {
-    /// v53.1.7 — the body of `list_attestations_for_types` / `_by_types`
-    /// over `key_column` ([`sqlite_attestations_typed_sql`]).
-    async fn sqlite_typed_read(
-        &self,
-        key_column: &'static str,
-        key: &str,
-        attestation_types: &[&str],
-        excluded_dimensions: &[&str],
-    ) -> Result<(Vec<crate::federation::Attestation>, u64), rusqlite::Error> {
-        if attestation_types.is_empty() {
-            return Ok((Vec::new(), 0));
-        }
-        let sql = sqlite_attestations_typed_sql(
-            key_column,
-            attestation_types.len(),
-            excluded_dimensions.len(),
-        );
-        let binds: Vec<SqlValue> = std::iter::once(key)
-            .chain(attestation_types.iter().copied())
-            .chain(excluded_dimensions.iter().copied())
-            .map(|v| SqlValue::Text(v.to_owned()))
-            .collect();
-        let (rows, bytes) = self
-            .read_measured(
-                move |conn| -> Result<Vec<crate::federation::Attestation>, rusqlite::Error> {
-                    let mut stmt = conn.prepare(&sql)?;
-                    let rows =
-                        stmt.query_map(params_from_iter(binds.iter()), sqlite_row_to_attestation)?;
-                    rows.collect()
-                },
-            )
-            .await;
-        Ok((rows?, bytes))
-    }
-
     /// #226 (V094) — assign `shard_key` to legacy `trace_events` rows that
     /// predate the sharded dedup index (their `shard_key` is `NULL`).
     ///
@@ -5484,1055 +5449,77 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         .and(self_family)
     }
 
+    /// v56.0.0 (CIRISPersist#934 step 1) — the decision is
+    /// [`plan_put_attestation`](crate::federation::attestation_admit::plan_put_attestation),
+    /// shared by all three backends; this backend executes it through its
+    /// [`AttestationStore`](crate::federation::attestation_admit::AttestationStore) impl.
     async fn put_attestation_with_origin(
         &self,
         attestation: crate::federation::SignedAttestation,
         origin: crate::federation::replication::admission::WriteOrigin,
     ) -> Result<crate::federation::AttestationOutcome, crate::federation::Error> {
-        // v53.0.0 (#963) — a row that changes an owner's cohort allow list for
-        // one of its nodes (a `consent:replication` grant FOR the node, or the
-        // owner's retraction of one): read before the row moves, acted on only
-        // when the store inserted it.
-        let consent_change =
-            crate::federation::consent_list_change_of(self, &attestation.attestation).await;
-        let outcome: Result<crate::federation::AttestationOutcome, crate::federation::Error> =
-            async move {
-            let mut row = attestation.attestation;
-
-            // ── AV-76 TIER 0 — the free prologue ────────────────────────
-            // Neither check below reads the row's content or touches the DB.
-            //
-            // v31.1.0 (CIRISPersist#665) — THE BAKED GENESIS IDS ARE RESERVED, and
-            // this gate now runs AHEAD of the quota rather than in tier 1. It is
-            // pure, so it was always free to lead; it has to now, because the quota
-            // classifies these ids into the RESERVED budget and the reverse order
-            // would let a stranger spend the budget that keeps constitutional
-            // traffic writable simply by claiming a genesis id on a row this gate is
-            // about to refuse. See the memory backend for the full rationale;
-            // backend-symmetric across memory / sqlite / postgres.
-            // CC 2.3.2.1 (PR #852 review) — the subject gate runs on EVERY ingest,
-            // not only the local producer: a remote signer can hybrid-sign a row
-            // carrying a malformed subject, and replication would store the same
-            // unmatchable revocation authority the emit path refuses.
-            crate::federation::validate_subject_key_ids_at(
-                &row.subject_key_ids,
-                crate::federation::SubjectGate::Ingest,
-            )?;
-            crate::federation::genesis::check_genesis_attestation_reserved(&row)?;
-            // v52.0.0 (CIRISPersist#672) — a re-offer of a held federation-tier row
-            // settles here: AHEAD of the per-peer quota (a duplicate did no work
-            // and must not spend the sender's budget) and of every verify. Only
-            // an index hit that resolves to a byte-identical held row settles; an
-            // oversized or otherwise inadmissible row is never held, so it misses
-            // and meets the pure gates below exactly as before.
-            if row.tier == crate::federation::types::attestation_tier::FEDERATION
-                && crate::federation::replication_policy::settle_if_held(
-                    self,
-                    crate::federation::replication_policy::EnvelopeKind::Attestation,
-                    &row,
-                )
-                .await?
-            {
-                return Ok(crate::federation::AttestationOutcome::AlreadyHeld);
-            }
-            // v54.1.0 (CIRISPersist#1046) — a row a steward purge tombstoned is
-            // refused; (CIRISPersist#1040) a federation-tier mock-LLM trace is
-            // refused. Backend-symmetric across memory / sqlite / postgres.
-            crate::federation::steward_purge::refuse_if_tombstoned_attestation(self, &row).await?;
-            crate::federation::steward_purge::refuse_mock_trace_attestation(&row)?;
-            if !row.attesting_key_id.is_empty() {
-                // v22.0.0 (CIRISPersist#543 finding 4, AV-76) — per-peer write
-                // quota. It LEADS the state-consulting checks because it is the
-                // only one that consults no shared state at all, so it also
-                // bounds the recursive directory walk the trust scorer runs at
-                // any threshold > 0. It answers "you are writing too fast",
-                // never "that key exists" — strictly less leaky than the gate
-                // it precedes, so the v3.4.0 information-leak boundary is
-                // preserved rather than moved. Per-backend-instance state.
-                //
-                // v24.3.0 (CIRISPersist#575) — takes the ROW now, not the key:
-                // the budget a write is charged against is a pure function of
-                // the row (see `PeerWriteQuota::classify`), and that predicate
-                // lives in the quota so the three backends cannot hold three
-                // opinions of it.
-                match &origin {
-                    // v41.0.0 (#804) — this node authored the row; a node is not a
-                    // peer of itself. The node ceiling only: no peer bucket (which
-                    // would corrupt `tracked_peers`) and no stranger's tail.
-                    crate::federation::replication::admission::WriteOrigin::Authored => {
-                        self.peer_write_quota.check_write_authored(&row)?;
-                    }
-                    // v41.0.0 (#804) — a bulk sync from an AUTHENTICATED peer. The
-                    // caller vouches for WHICH identity it authenticated; whether
-                    // that identity is a cohort-mate is persist's own question,
-                    // answered from its own rosters and memoized. No shared cohort
-                    // ⇒ metered exactly as if it had arrived through the wire door.
-                    crate::federation::replication::admission::WriteOrigin::Sync { peer_key_id } => {
-                        let shares = match self.peer_write_quota.cohort_affinity(peer_key_id) {
-                            Some(known) => known,
-                            None => {
-                                let us = self.self_key_id().unwrap_or_default();
-                                let resolved =
-                                    crate::federation::replication::admission::shares_cohort_with(
-                                        self,
-                                        &us,
-                                        peer_key_id,
-                                    )
-                                    .await?;
-                                self.peer_write_quota
-                                    .remember_cohort_affinity(peer_key_id, resolved);
-                                resolved
-                            }
-                        };
-                        if shares {
-                            self.peer_write_quota
-                                .check_write_synced(&row, peer_key_id)?;
-                        } else {
-                            self.peer_write_quota.check_write(&row)?;
-                        }
-                    }
-                    crate::federation::replication::admission::WriteOrigin::Wire => {
-                        self.peer_write_quota.check_write(&row)?;
-                    }
-                }
-
-                // v3.4.0 (CIRISPersist#123) — trust-threshold gate. Trust is
-                // the cheapest reject that consults state AND the one that
-                // leaks the least information; an unauthorized writer
-                // shouldn't learn about FK / envelope-schema state past the
-                // gate. Free at the default threshold 0 (short-circuits
-                // without dispatching to the resolver).
-                if let Some(gate) = self.admission_gate() {
-                    gate.check_federation(&row.attesting_key_id).await?;
-                }
-            }
-
-            // ── AV-76 TIER 1 — PURE ENVELOPE GATES ──────────────────────
-            // v22.0.0 (CIRISPersist#543 finding 4) — every check in this tier
-            // is a pure function of `row`: no directory read, no lock, no
-            // crypto, no allocation beyond the envelope it was handed. They
-            // used to be scattered across positions 5-19 of a 21-step stack,
-            // BEHIND ~8 DB-walking authority gates — so a row that could never
-            // be admitted still paid for the whole walk (the bootstrap
-            // amplification this cut closes).
-            //
-            // `check_envelope_size_admission` leads deliberately: it BOUNDS
-            // the JCS canonicalization that BOTH the hybrid verify (tier 3)
-            // and `compute_persist_row_hash` (tier 5) pay. That is exactly
-            // what its own doc has always claimed — "no signature
-            // verification or directory lookups are spent on an envelope that
-            // can never be admitted" — while the wiring dissented and ran it
-            // at position 14 of 21.
-            //
-            // This tier is IDENTICAL to the postgres backend's, gate for gate
-            // and order for order.
-            crate::federation::admission::check_envelope_size_admission(&row.attestation_envelope)?;
-            // v31.0.0 (CIRISPersist#647) — CANONICAL AT REST. The envelope is
-            // replaced by its JCS form HERE, immediately behind the size gate
-            // that BOUNDS the canonicalization it pays for, so every gate below
-            // and every bind site downstream sees exactly the bytes the
-            // producer's signature and `original_content_hash` were taken over.
-            // An operator can then `sha256sum` the stored column and compare it
-            // to `original_content_hash` with no JCS implementation in hand.
-            //
-            // Signature-transparent: canonicalization is IDEMPOTENT (proven in
-            // `federation::canonical_at_rest`), so the hash cross-check and the
-            // hybrid verify further down see byte-identical input to what they
-            // would have seen without this line.
-            //
-            // This tier is IDENTICAL across memory / sqlite / postgres.
-            crate::federation::canonical_at_rest::canonicalize_in_place(&mut row.attestation_envelope)?;
-            // v31.0.0 (CIRISPersist#660) — the baked genesis ids are RESERVED; that
-            // gate moved to the top of this function in v31.1.0 (#665), ahead of the
-            // write quota. See it there for why the order is load-bearing.
-            //
-            // v31.0.0 (CIRISPersist#660) — `original_content_hash` must be hex,
-            // STATED rather than left to the `hex::decode` at bind time. See the
-            // memory backend: binding nothing, it accepted what this refuses.
-            crate::federation::admission::check_content_hash_hex(
-                "original_content_hash",
-                &row.original_content_hash,
-            )?;
-            // v22.0.0 (CIRISEdge#428) — closed delivery_mode vocabulary; an
-            // unknown value is refused HERE instead of being silently demoted
-            // to may-drop BestEffort at delivery. Pure predicate, tier 1.
-            crate::federation::admission::check_delivery_mode_vocabulary(&row.attestation_envelope)?;
-            // v44.8.0 (CIRISPersist#866 C1) — a `consent:state:*` row's scope tokens
-            // must parse (`FSD/CONTEXTUAL_INTEGRITY_ENVELOPE.md` §4.4): never admit
-            // a token the fold cannot match. Pure; same gate at every door.
-            crate::federation::consent_scope::check_consent_scope_tokens(&row.attestation_envelope)?;
-            // v45.0.0 (CIRISPersist#871, `FSD/MEDIA_SOURCE.md` §3–§4) — the media
-            // Source struct is refused by member name (a holding claim without a
-            // positive `size` is the custody parse\'s to refuse, v55) Pure; the same gate at every door.
-            crate::federation::media_source::check_media_source(&row.attestation_envelope)?;
-
-            // v31.0.0 (CIRISPersist#598) — THE CONSENT INSTANT BINDING. A
-            // `consent:state:*` row is refused unless its signed envelope carries
-            // an `asserted_at` (and `expires_at`) equal to the row column the
-            // consent fold orders on. `asserted_at` is stored VERBATIM from the
-            // caller here and no signature covers it, so without this a replay of
-            // a subject's own byte-identical, still-valid grant with a bumped
-            // column flipped a revocation back to Granted — and re-opened
-            // `check_capacity_consent_admission`, a gate inside persist. Pure
-            // function of (row, now) ⇒ AV-76 TIER 1, and a REFUSAL, so an early
-            // position is safe. Backend-symmetric across memory / sqlite /
-            // postgres, and asked again at the promote door
-            // (`check_promotion_admission`) so the local tier is not a way around
-            // it (B8).
-            crate::federation::admission::check_instant_binding(
-                &row,
-                chrono::Utc::now(),
-                crate::federation::admission::DEFAULT_MAX_TOUCH_SKEW,
-            )?;
-
-            // v31.0.0 (CIRISPersist#643) — THE TYPED-COLUMN BINDING. The
-            // signature covers `attestation_envelope` and NOTHING ELSE, so
-            // `attestation_type` (the VERB), `subject_key_ids` (which grants
-            // revocation authority), `attested_key_id`, `cohort_scope` and
-            // `weight` were unsigned columns a relay could rewrite with the
-            // producer's own signature still verifying — flip `withdraws` to
-            // `scores` and a retraction becomes a claim while the thing it
-            // retracted stays live. Refused on ABSENCE or DIVERGENCE, no legacy
-            // regime. Pure function of the row => AV-76 TIER 1, tier-blind (a
-            // tier-scoped binding would be skippable by writing `tier = "local"`
-            // and promoting), and backend-symmetric across memory / sqlite /
-            // postgres.
-            crate::federation::admission::check_row_column_binding(&row)?;
-            // v53.0.0 (CIRISPersist#975, CC 2.4) — THE CLOSED ROW-TYPE SLOT, beside
-            // the binding that makes the type a signed fact. The five + registered
-            // carriers; a carrier of the wrong shape refused; an unregistered type
-            // reported (refused once `row_type::ROW_TYPE_ENFORCEMENT` flips). Pure
-            // ⇒ AV-76 TIER 1, backend-symmetric.
-            crate::federation::row_type::admit_row_type(&row)?;
-
-            // v3.9.1 (CIRISPersist#150 Ask 3, CEG 0.4 §4.2.4) — cohort_scope
-            // admission-gate validation. Rejects out-of-closed-set values
-            // (notably `global`, a §8.1.8 feed-name, never a wire value)
-            // BEFORE persist_row_hash + INSERT so rejected rows leave no
-            // trace. The V056 CHECK constraint is the defense-in-depth
-            // backstop for direct-SQL bypass.
-            crate::federation::admission::check_cohort_scope(&row.cohort_scope)?;
-
-            // v26.0.0 (CIRISPersist#589 / AV-83) — `capacity:*` IS NEVER LOCAL.
-            // The rule is v4.4.0's (CEG §7.5 anti-Goodhart / AV-62) and it was
-            // already written and tested — but only inside
-            // `check_local_tier_eligibility`, which runs on
-            // `attestation_insert_local` / `attestation_upsert_local` and NOT
-            // here, while THIS door accepts a `tier = "local"` row. The correct
-            // rule was shipped behind a door the attack does not use. Pure
-            // function of (tier, attestation_type, dimension) ⇒ tier 1; a REFUSAL,
-            // never an accept, so an early position is safe (AV-76). Both wire
-            // shapes are asked. Backend-symmetric with memory + postgres.
-            if row.tier == crate::federation::types::attestation_tier::LOCAL {
-                crate::federation::admission::check_capacity_never_local(
-                    &row.attestation_type,
-                    crate::federation::admission::envelope_dimension(&row.attestation_envelope),
-                )?;
-            }
-
-            // v18.1.0 (CIRISPersist#473 followup) — the `trace:*`
-            // Information-Type validator: self-emission polarity
-            // (`attesting_key_id` ∈ `subject_key_ids`) plus the inline-trace /
-            // manifest shape. No-op for every non-`trace:` dimension.
-            crate::federation::admission::check_trace_dimension_admission(
-                crate::federation::admission::envelope_dimension(&row.attestation_envelope),
-                &row.attesting_key_id,
-                &row.subject_key_ids,
-                &row.attestation_envelope,
-            )?;
-
-            // v21.3.0 (CIRISPersist#510 P1) — the closed consent-transfer
-            // grammar admission chokepoint. A `consent:replication:v1` grant's
-            // `payload` MUST parse through
-            // `consent_grammar::parse_grant_payload` (closed enums, strict
-            // `deny_unknown_fields`) — an unknown restriction op, an
-            // unrecognized payload field, a non-consentable `kinds` entry, a
-            // bad `grants` token, a bad `audience`, or an empty-string
-            // `attestation_prefixes` entry rejects the WHOLE grant. No-op for
-            // every other dimension (a `withdraws`/`recants` referencing a
-            // grant carries its OWN dimension, never GRANT_DIMENSION, so it
-            // never reaches this check). Runs BEFORE persist_row_hash + INSERT
-            // so a rejected grant leaves no trace. Backend-symmetric with
-            // postgres + memory.
-            if crate::federation::admission::envelope_dimension(&row.attestation_envelope)
-                == Some(crate::federation::consent_grammar::GRANT_DIMENSION)
-            {
-                if let Err(reason) = crate::federation::consent_grammar::validate_grant_admission(
-                    &row.attestation_envelope,
-                ) {
-                    return Err(crate::federation::Error::InvalidArgument(format!(
-                        "consent grant rejected by the closed grammar (#510): {reason}"
-                    )));
-                }
-            }
-
-            // ── AV-76 TIER 2 — the one unavoidable directory read ───────
-            // v2.4.0 (CIRISPersist#102 Ask 3) — admission gate. Look up
-            // the attesting key's `identity_type` before insert; let
-            // the FK violation surface as a clearer-typed
-            // `InvalidArgument` if the key is missing. The gate runs
-            // BEFORE persist_row_hash + INSERT so rejected rows leave
-            // no trace.
-            let attesting_identity_type = {
-                let attesting = row.attesting_key_id.clone();
-                self.read(move |conn| -> Result<Option<String>, rusqlite::Error> {
-                    conn.query_row(
-                        "SELECT identity_type FROM federation_keys WHERE key_id = ?1",
-                        [&attesting],
-                        |r| r.get::<_, String>(0),
-                    )
-                    .optional()
-                })
-                .await
-                .map_err(|e| {
-                    crate::federation::Error::Backend(format!("lookup attesting identity_type: {e}"))
-                })?
-            };
-            // v54.1.0 (CIRISPersist#1042) — an attester this node does not
-            // hold is the ORDERING gap (retryable once its Key row lands),
-            // typed apart from a bad signature; it read as `InvalidArgument`.
-            let attesting_identity_type = attesting_identity_type.ok_or_else(|| {
-                crate::federation::Error::unknown_signer(&row.attesting_key_id, "attestation")
-            })?;
-            // AV-76 D2 — the lookup above is a hard DATA dependency of the
-            // dimension policy here (`attesting_identity_type`); the pair
-            // moves as a unit and its internal order is fixed.
-            crate::federation::admission::DimensionAdmissionPolicy::default().check(
-                &row.attestation_type,
-                crate::federation::admission::envelope_dimension(&row.attestation_envelope),
-                &attesting_identity_type,
-            )?;
-
-            // v6.7.0 (CIRISPersist#146 Ask 5, CEG §5.6.8.7) — `consent_record`
-            // ceremony admission (required fields / closed stance set /
-            // substrate-only `expired`). v12.6.0 (CIRISPersist#171, §10.1.3
-            // transit-not-rest): a `revoked` consent_record at local tier MAY
-            // *transit* the local write path only if its bound-hybrid signature
-            // verifies (accept on VALID crypto only). No-op for non-consent_record
-            // rows and durable ones. Backend-symmetric with Memory + Postgres.
-            //
-            // v22.0.0 (AV-76) — deliberately kept AHEAD of the §6.1 dedup, at
-            // its pre-existing position. This is the one crypto gate that must
-            // NOT move behind the dedup: `withdraws` is a structural composer,
-            // so a replayed subject-side revocation would short-circuit at the
-            // dedup and never prove its bound-hybrid signature.
-            crate::federation::admission::verify_consent_record_transit_ingest(self, &row).await?;
-
-            // ── AV-76 TIER 3 — CRYPTO ───────────────────────────────────
-            // v9.0.0 (CIRISPersist#237, CC 5.3.2.4.3.1) — PQC-mandatory
-            // hybrid-verify at the federation-tier bulk store/replicate
-            // ingest gate (parity with the postgres + memory backends). A
-            // no-op for local-tier rows (CC 5.3.2.2 deferred signature); for
-            // a federation-tier row it hybrid-verifies the envelope signature
-            // (Ed25519 + ML-DSA-65, Strict) against the attester's REGISTERED
-            // pubkeys. Composes with — does not replace — the trust-threshold
-            // check_federation + the node-agency gate. Runs BEFORE
-            // persist_row_hash + INSERT so a rejected row leaves no trace
-            // (verify-before-mutation, AV-9; store-then-quarantine is
-            // non-conformant per CC 5.3.2.4.3.1).
-            //
-            // v22.0.0 (CIRISPersist#543 finding 4, AV-76) — MOVED here from
-            // position 21 of 21. The ML-DSA-65 verify is the single most
-            // expensive step in the stack, and it used to run LAST: a row
-            // whose signature could never verify still paid for every
-            // authority walk below. The move is correctness-safe because the
-            // verdict is position-independent — the gate reads only
-            // attestation_envelope / attesting_key_id / scrub_signature_* /
-            // original_content_hash / tier, and NO gate in the stack writes
-            // any of them (the sole field-stamping gate,
-            // `check_withdraws_admission`, writes `withdraws_admission_rule`,
-            // which this never reads).
-            crate::federation::verify_federation_tier_ingest(self, &row).await?;
-
-            // ── AV-76 TIER 4 — the DB-WALK authority gates ──────────────
-            // Everything below walks the directory (delegation chains, family
-            // / community membership, moderator sets, trust charters). All of
-            // it now runs only for a row that has already proven its envelope
-            // is admissible in shape AND that its signature verifies.
-
-            // v4.0 (CIRISPersist#160 comment 4, FSD §4.6) — AV-45 write-path
-            // cohort_scope admission gate. The writer (`attesting_key_id`)
-            // must be a MEMBER of the target cohort they stamp. Attestations
-            // carry a `cohort_scope` label but no `cohort_target_id` field,
-            // so `self` + the broad belonging-tiers pass (no target needed)
-            // while `family` / `community` — which require a named target to
-            // membership-validate — are refused (a downgrade with no provable
-            // membership). Runs AFTER the closed-set value validation in tier
-            // 1 and BEFORE persist_row_hash + INSERT: a refused row leaves no
-            // trace (verify-then-gate-then-persist, MISSION §1.6).
-            // v52.0.0 (CIRISPersist#955) — AV-45 plus the two membership arms (a
-            // proposal reaching its invitee, a reply at a group its signer is not in).
-            crate::federation::membership_acceptance::check_attestation_write_scope(
-                self,
-                &row,
-                "put_attestation",
-            )
-            .await?;
-
-            // v38.2.0 (CIRISPersist#757) — **AV-84 MOVES TO THIS DOOR TOO.**
-            // `check_promotion_cohort_standing` refuses a targeted-cohort row
-            // that names any party but its producer, and it justified being
-            // promote-ONLY with a claim about THIS door: "put_attestation
-            // therefore refuses those two placements outright, and that door is
-            // SHUT, not leaking". The AV-45 call above just unshut it. Without
-            // this line a member could place a row ABOUT A THIRD PARTY into the
-            // whole community's plane — the exact claim AV-84 exists to refuse,
-            // arriving through the door its own doc said could not be reached.
-            // v38.2.0 PR #759 review: the standing comparison RESOLVES
-            // occurrence -> identity (a device signing about its own owning
-            // identity is not a third party), and a targeted placement is never
-            // local-tier (local rows defer signature verification, and an
-            // unverified membership claim is mintable by anyone).
-            crate::federation::admission::check_attestation_tier_vocabulary(&row.tier)?;
-            crate::federation::admission::check_targeted_cohort_requires_federation_tier(
-                &row.tier,
-                &row.cohort_scope,
-            )?;
-            crate::federation::admission::check_cohort_standing_resolved(self, &row).await?;
-
-            // v2.5.0 (CIRISPersist#102 Ask 4) — envelope-schema admission
-            // hook. Same shape as the postgres backend; see
-            // `src/store/postgres.rs` put_attestation for the
-            // architectural commentary. Skipped on the default
-            // `NoOpSchemaResolver`. AV-76 D4 — recomputes the dimension
-            // rather than carrying a binding across the reordered stack;
-            // `envelope_dimension` is pure.
-            if row.attestation_type == crate::federation::types::attestation_type::SCORES {
-                if let Some(dim_str) =
-                    crate::federation::admission::envelope_dimension(&row.attestation_envelope)
-                {
-                    let resolver = self.schema_resolver();
-                    let resolved = resolver.resolve(dim_str).await.map_err(|e| {
-                        crate::federation::Error::Backend(format!(
-                            "schema resolver: {} ({})",
-                            e,
-                            e.kind()
-                        ))
-                    })?;
-                    if let Some(schema) = resolved {
-                        if let Err(violations) =
-                            crate::federation::schema_resolver::validate_envelope_against_schema(
-                                &schema.document,
-                                &row.attestation_envelope,
-                            )
-                        {
-                            let axis = crate::federation::axis_from_dimension(dim_str)
-                                .unwrap_or("")
-                                .to_owned();
-                            return Err(crate::federation::Error::EnvelopeSchemaViolation {
-                                dimension: dim_str.to_string(),
-                                axis,
-                                violations,
-                            });
-                        }
-                    }
-                }
-            }
-
-            // ── AV-76 TIER 4b — the §6.1 idempotent-replay short-circuit ──
-            // v3.0.0 (CIRISPersist#116, CEG 0.2 §6.1) — structural-composer
-            // dedup on `(references_attestation_id, attestation_type,
-            // attesting_key_id)`. Look up the candidate row's references-id
-            // from its envelope; if a row with the same triple already exists,
-            // the second put is a silent no-op (structural composers are
-            // idempotent on replay per §6.1).
-            //
-            // v22.0.0 (CIRISPersist#543 / AV-76 D3 CORRECTED) — **THIS RAN AT
-            // TIER 2b AND THAT WAS A HOLE.** Ahead of crypto, its
-            // `return Ok(())` was an early ACCEPT that skipped EVERY gate below
-            // it: hybrid verification (tier 3) AND the AV-45 write-scope gate.
-            // So a writer who could name an already-referenced
-            // `(ref_id, type, attester)` triple got an unverified, unauthorized
-            // `Ok`. The substrate state machine shrank it to ONE op with a
-            // VALID signature (Withdraw, family=Reserved, cohort_scope=
-            // Community: memory refused on write-scope, sqlite returned Ok).
-            // The reorder that introduced it was mine.
-            //
-            // THE RULE, restated: **a dedup short-circuit may return early to
-            // REFUSE, never to ACCEPT.** Idempotence is a promise about the
-            // EFFECT of a replay (no second row) — never a licence to skip the
-            // proof that the replay was admissible at all. So it now runs at
-            // tier 4b: after everything that is a property of THIS row's bytes
-            // and THIS writer's standing (both of which a replay must still
-            // prove), and before the DB-walk authority gates below. That is the
-            // property D3 actually wanted, and all it ever wanted — a replayed
-            // `withdraws` whose authority has since been revoked stays a silent
-            // no-op instead of flipping to a hard reject.
-            if crate::federation::precedence::is_structural_composer(&row.attestation_type) {
-                if let Some(ref_id) =
-                    crate::federation::precedence::references_attestation_id_from_envelope(
-                        &row.attestation_envelope,
-                    )
-                {
-                    let attestation_type_owned = row.attestation_type.clone();
-                    let attesting_owned = row.attesting_key_id.clone();
-                    let ref_id_owned = ref_id.to_owned();
-                    let dup_exists = self
-                        .read(move |conn| -> Result<bool, rusqlite::Error> {
-                            let mut stmt = conn.prepare(
-                                "SELECT attestation_envelope FROM federation_attestations \
-                             WHERE attestation_type = ?1 AND attesting_key_id = ?2",
-                            )?;
-                            let rows = stmt.query_map(
-                                rusqlite::params![attestation_type_owned, attesting_owned],
-                                |r| r.get::<_, String>(0),
-                            )?;
-                            for env_text in rows {
-                                let env_text = env_text?;
-                                let env: serde_json::Value = match serde_json::from_str(&env_text) {
-                                    Ok(v) => v,
-                                    Err(_) => continue,
-                                };
-                                let existing_ref =
-                                crate::federation::precedence::references_attestation_id_from_envelope(
-                                    &env,
-                                );
-                                if existing_ref == Some(ref_id_owned.as_str()) {
-                                    return Ok(true);
-                                }
-                            }
-                            Ok(false)
-                        })
-                        .await
-                        .map_err(|e| {
-                            crate::federation::Error::Backend(format!(
-                                "dedup lookup structural composer: {e}"
-                            ))
-                        })?;
-                    if dup_exists {
-                        // v50.0.0 (review H2, final check) — an identical re-put of
-                        // a held `withdraws` whose admission depth is missing
-                        // records it now (idempotent repair).
-                        if row.attestation_type == crate::federation::types::attestation_type::WITHDRAWS
-                        {
-                            let id = row.attestation_id.clone();
-                            let depth =
-                                crate::federation::FederationDirectory::withdraws_delegation_depth(self)
-                                    as i64;
-                            self.write(move |conn| {
-                                conn.execute(
-                                    "INSERT OR IGNORE INTO federation_withdraws_admission_depths \
-                                     (attestation_id, depth) \
-                                     SELECT attestation_id, ?2 FROM federation_attestations \
-                                      WHERE attestation_id = ?1",
-                                    rusqlite::params![id, depth],
-                                )
-                            })
-                            .await
-                            .map_err(|e| {
-                                crate::federation::Error::Backend(format!(
-                                    "withdraws depth repair: {e}"
-                                ))
-                            })?;
-                        }
-                        // v38.5.0 (#771) — the dedup path already returned
-                        // success; now it can say WHICH success it was.
-                        return Ok(crate::federation::AttestationOutcome::AlreadyHeld);
-                    }
-                }
-            }
-
-            // v6.4.0 (CIRISPersist#146 Ask 2, CEG §3.2.3) — broadened
-            // `withdraws` admission gate. A no-op for non-`withdraws` rows;
-            // for a `withdraws` it loads the target T (by the envelope's
-            // `references_attestation_id`), resolves WHICH of the 4
-            // admission rules authorizes the issuer, and stamps the rule
-            // number onto the row for the per-rule audit metadata. Runs
-            // AFTER the §6.1 dedup (idempotent replay short-circuits before
-            // the walk) and BEFORE persist_row_hash + INSERT, so a refused
-            // withdraws leaves no trace and the recorded rule is covered by
-            // the row hash.
-            if let Some(rule) =
-                crate::federation::admission::check_withdraws_admission(self, &row).await?
-            {
-                row.withdraws_admission_rule = Some(rule);
-            }
-
-            // v8.7.1 (CIRISPersist#233, CEG §11.10) — FULL moderation gate for
-            // the report→`scores` half (moderation:* / reconsideration:*). A
-            // no-op for any non-matching row; for a moderation/review report it
-            // admits IFF the signer IS a duty-holder over the target (the row's
-            // subject_key_ids ∪ the envelope community_id's named moderators) or
-            // is reached by an steward-bound duty-holder via a live scoped
-            // delegates_to chain. Absence ⇒ REJECT. Runs AFTER the withdraws
-            // gate and BEFORE persist_row_hash + INSERT — a rejected emission
-            // leaves no trace.
-            crate::federation::admission::check_delegated_duty_scores_admission(self, &row).await?;
-            // v44.6.0 (#857) — a machine author may name only itself in for_key_id.
-            crate::federation::admission::check_consent_for_key_admission(self, &row).await?;
-
-            // v9.0.0 (CIRISPersist#236, CC 4.4.3.4.3 / CC 3.4.7.3) — reject-agency-
-            // on-node-key gate (parity with the postgres + memory backends). A
-            // no-op for non-`delegates_to` rows; for a `delegates_to` whose
-            // recipient (`attested_key_id`) resolves to an identity CONTAINING `node` it
-            // REJECTS any scope set that is not `infra:*`-only (agency:* / legacy
-            // unprefixed agency / empty / other) — "infrastructure must not have
-            // agency" made cryptographic. Runs AFTER the delegated-duty gate and
-            // BEFORE persist_row_hash + INSERT — a rejected emission leaves no
-            // trace.
-            crate::federation::admission::check_node_agency_admission(self, &row).await?;
-
-            // v11.5.0 (CIRISPersist#306, CC 3.2 / CC 1.15.6) — the user-target
-            // steward-binding gate: a `delegates_to` onto a `user`-role target is
-            // admissible ONLY as minor-guardianship (proven-minor target +
-            // proven-adult-user granter). Backend-symmetric with memory + Postgres;
-            // verify-before-mutation.
-            crate::federation::admission::check_user_target_steward_binding_admission(self, &row)
-                .await?;
-
-            // v50.0.0 (CIRISPersist#924, CC 5.4.6 / CC 3.4.13 Q5) — a minor's
-            // owner-binding is never ANNOUNCED: refused at `cohort_scope:
-            // federation`. Backend-symmetric; verify-before-mutation.
-            crate::federation::admission::check_minor_owner_binding_not_announced(self, &row).await?;
-
-            // v54.0.0 (CIRISPersist#1031, CC 4.1.1) — the cycle-closing `delegates_to`
-            // is refused: the recipient must not already reach the granter through live
-            // `delegates_to` edges. Backend-symmetric with memory + Postgres; verify-before-mutation.
-            crate::federation::admission::check_delegation_cycle_admission(self, &row).await?;
-
-            // v12.6.0 (CIRISConstitution#23, CC 1.13.3.3 / CC 3.2) — the single-owner
-            // gate: a node has AT MOST ONE responsible steward, so a second,
-            // distinct-owner owner-binding `delegates_to(U → node)` is rejected. Runs
-            // BEFORE persist_row_hash + INSERT so a rejected emission leaves no trace.
-            // Backend-symmetric with memory + Postgres.
-            crate::federation::admission::check_single_node_owner_admission(self, &row).await?;
-
-            // v18.2.0 — trust-charter admission (the charter walk). AV-76: a
-            // directory walk, so it stays in tier 4.
-            crate::federation::trust_root::check_trust_charter_admission(
-                self,
-                &row.attestation_type,
-                &row.attesting_key_id,
-                &row.attested_key_id,
-                &row.attestation_envelope,
-            )
-            .await?;
-            // v51.0.0 (CIRISPersist#937, CC 3.2 T4a) — attaching is gated on a
-            // witnessed lineage head inside the root's attach window.
-            crate::federation::canonical_community::check_attach_freshness(
-                self,
-                crate::federation::canonical_community::AttachDoor::of(&origin),
-                Some(&row.attestation_id),
-                &row.attesting_key_id,
-                &row.attestation_type,
-                &row.attested_key_id,
-                &row.attestation_envelope,
-                chrono::Utc::now(),
-            )
-            .await?;
-            // v24.0.0 (CIRISPersist#557) — a charter naming a constitutional family
-            // must be signed by that family's QUORUM. Sits beside the key-charter
-            // gate above and refuses the same class of row for the same reason: a
-            // root that one seat can declare is not a threshold.
-            crate::federation::trust_root::check_family_charter_admission(self, &row).await?;
-            crate::federation::admission::check_reserved_prefix_admission(self, &row).await?;
-
-            // v22.0.0 (CIRISConstitution#46) — CONSENT BEFORE SCORING. A
-            // federation-tier `capacity:*` claim about subject S from attester P is
-            // refused unless a live `analyze` consent from S covering P exists in
-            // this node's verified corpus. AV-76 TIER 4: it reads the directory
-            // (the scoped consent fold), so it must never run ahead of crypto.
-            // Placed IMMEDIATELY after the reserved-prefix gate — which carries
-            // AV-62/74's dimension-keyed self-emission arm — so a SELF-attested
-            // capacity row is still reported as self-emission rather than shadowed
-            // by "no consent". Backend-symmetric across memory / sqlite / postgres.
-            crate::federation::admission::check_capacity_consent_admission(self, &row).await?;
-            // v45.0.0 (CIRISPersist#871, FSD/MEDIA_SOURCE.md §5) — the placement
-            // rule: a rendition (`media.derived_from`) whose original THIS node
-            // holds must name the original's own `cohort_scope`. AV-76 TIER 4: it
-            // reads the blob store, so it sits with the other state-reading gates.
-            // Backend-symmetric; memory holds no blobs and answers "not held".
-            crate::federation::renditions::check_rendition_placement(
-                self,
-                &row.attestation_envelope,
-                &row.cohort_scope,
-            )
-            .await?;
-
-            // v38.7.0 (CIRISPersist#778, CC 3.4.5) — `config:{scope}` IS A
-            // SELF-REPORT: `attesting_key_id` must be `attested_key_id` or its
-            // live `owner_of`. CC 3.4.7 holds every 3.4.5 emitter rule with three
-            // things — substrate admission, consumer re-check, producer obligation
-            // — and persist had only the third, so a peer could attest
-            // `config:replication` / `config:load` ABOUT A NODE IT DOES NOT OWN
-            // and every honest consumer would believe a healthy node was shedding.
-            // AV-76 TIER 4: the owner arm walks the directory, so it may not lead
-            // the crypto. Placed immediately after the consent gate so the two CC
-            // 3.4.5 gates sit together and a reader finds both at one line.
-            // Backend-symmetric across memory / sqlite / postgres.
-            crate::federation::admission::check_config_self_or_owner_admission(self, &row).await?;
-            // CC 3.1.1 (v42.0.0, CIRISPersist#814 part 1) — a duty rides only a
-            // permission its attester issued, and never out-reaches it.
-            crate::federation::admission::check_duty_admission(self, &row).await?;
-            // CC 3.4.5.1 — a config renewal must supersede the row it replaces
-            // (v42.0.0, CIRISPersist#814 part 3).
-            crate::federation::admission::check_config_renewal_supersedes(self, &row).await?;
-            // CC 3.4.3 — `session:*` is a substrate self-report (v42.0.0,
-            // CIRISPersist#814 part 5; the rc5 re-vendor exposed the gap).
-            crate::federation::admission::check_session_self_report_admission(&row)?;
-            // CC 3.3.1 — a `consent:community_trust` grant is the node's own and
-            // lists its owner at the grant's instant (v52.0.0, CIRISPersist#946).
-            crate::federation::community_trust_consent::check_community_trust_grant_admission(
-                self, &row,
-            )
-            .await?;
-            // CC 3.1.3.3 — `custody:ack:v1` is a holder self-report, placed within
-            // the blob's own cohort (v53.0.0, CIRISPersist#942 part 2).
-            crate::federation::custody_ack::check_custody_ack_admission(self, &row).await?;
-            // v55.0.0 (CIRISPersist#989, CC 3.1.3.3 rule 1) — a holding claim about a blob
-            // this node holds is placed at that blob's scope, never one its emitter
-            // chose. Reads the blob store, so it sits with the custody gate.
-            crate::federation::holding_claim::check_holding_claim_scope(self, &row).await?;
-            // CC 3.2 — a `community:listing:v1` row is federation-scoped and signed by the
-            // room's founder or a current moderate-holder (v55.0.0, CIRISPersist#1053).
-            crate::federation::public_room::check_community_listing_admission(self, &row).await?;
-            // CC 3.1 — a lowercase family stem, or the row evades every family gate
-            // (v42.0.0, CIRISPersist#814).
-            crate::federation::admission::check_dimension_case_rule(&row)?;
-            // CC 3.3.9 — a `license`-scoped issuance resolves to the authority it
-            // names (v42.0.0, CIRISPersist#814).
-            crate::federation::admission::check_licensure_delegator_is_authority(self, &row).await?;
-
-            // v22.0.0 (CIRISPersist#543 / AV-77) — THE DE-ADMISSION GATE. A peer
-            // this node has de-admitted gets its writes refused here, in the cheap
-            // tier, BEFORE any crypto or DB-walking gate — so an abuser this node
-            // has already judged cannot spend our work (the AV-76 rationale). No-op
-            // when the host installed no `self_key_id`: a node that has declared no
-            // identity has authored no de-admissions, so the set is empty.
-            if let Some(me) = self.self_key_id() {
-                crate::federation::admission::check_peer_deadmission(self, &row, &me).await?;
-            }
-
-            // v12.5.0 (CIRISPersist#238, CC 4.5.4 / §11.11; keying broadened by
-            // #369) — no-moderator-no-federate FEDERATION-APPLY re-check (point
-            // ii). A federation-tier row keyed on a community under ANY substrate
-            // shape (envelope `community_id`/`community_key_id`/`cohort_key_id`,
-            // a row endpoint or subject_key_ids entry resolving as a stored
-            // community) is refused if C has lost its last live
-            // `moderate`-holder. No-op for local-tier rows, rows referencing no
-            // known community. Backend-symmetric.
-            crate::federation::admission::check_no_moderator_federate_apply(self, &row).await?;
-            // v24.0.0 (CIRISPersist#557) — the attested SUBJECT must resolve as a
-            // key this node knows OR as a constitutional family it has stored. V114
-            // lifted this rule out of the SQLite schema FK (which cannot express the
-            // keyless-family exception a family trust root needs) into ONE predicate
-            // every backend runs at this same point. All three DID enforce the rule
-            // before (sqlite + postgres by FK, memory by emulation); what none of
-            // them could express is the keyless-family exception.
-            crate::federation::admission::check_attested_subject_admission(self, &row.attested_key_id)
-                .await?;
-
-            // ── AV-76 TIER 5 — hash + INSERT ────────────────────────────
-            // D1: `check_withdraws_admission` above STAMPS
-            // `row.withdraws_admission_rule`, and the row hash covers it — so
-            // that gate must precede this line. It does.
-            // v21.0.0 (#501) — capture the inbound trace projection while `row`
-            // is still owned (before the write closure consumes it).
-            let projected_trace =
-                crate::ingest::project_trace_events_from_attestation(&row.attestation_envelope);
-
-            row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
-
-            let original_content_hash = hex::decode(&row.original_content_hash).map_err(|e| {
-                crate::federation::Error::InvalidArgument(format!(
-                    "original_content_hash hex decode: {e}"
-                ))
-            })?;
-            let attestation_envelope_text = serde_json::to_string(&row.attestation_envelope)
-                .map_err(|e| crate::federation::Error::Backend(format!("envelope serialize: {e}")))?;
-
-            // v3.7.0 (CIRISPersist#146, CEG 0.6) — serialize subject_key_ids
-            // to canonical JSON TEXT; sqlite stores JSON-as-TEXT validated
-            // by the json1 CHECK on the column.
-            let subject_key_ids_json = serde_json::to_string(&row.subject_key_ids).map_err(|e| {
-                crate::federation::Error::Backend(format!("subject_key_ids serialize: {e}"))
-            })?;
-            // v24.0.0 (CIRISPersist#556) — the V113 `additional_scrubs` JSON-array
-            // TEXT column (same encoding as V096's on `federation_keys`, and the
-            // same on postgres). Empty vec → "[]", so an ordinary single-scrub row
-            // is stored exactly as it was before this cut.
-            let additional_scrubs_json =
-                serde_json::to_string(&row.additional_scrubs).map_err(|e| {
-                    crate::federation::Error::Backend(format!("additional_scrubs serialize: {e}"))
-                })?;
-            let withdraws_admission_rule: Option<i64> = row.withdraws_admission_rule.map(|v| v as i64);
-            // v50.0.0 (review H2, V157) — the depth this `withdraws` was
-            // admitted under, recorded in the SAME write as the row.
-            let withdraws_depth: Option<i64> =
-                (row.attestation_type == crate::federation::types::attestation_type::WITHDRAWS).then(
-                    || crate::federation::FederationDirectory::withdraws_delegation_depth(self) as i64,
-                );
-            // v21.1.0 (CIRISPersist#507b) — wire-index this row (federation-tier
-            // only, the E5 invariant — `put_attestation` is the federation write
-            // path so this always holds in practice; the tier check is a
-            // defensive belt). Computed from `row` before the closure moves it;
-            // `Attestation` IS its own signed wrapper (carries the scrub
-            // signature inline), so this hashes the exact `list_attestations_since`
-            // read-surface value.
-            // v31.0.0 (CIRISPersist#646) — only the LOCATOR is derived here; the
-            // hash comes from the stored row, after the write. See
-            // `index_stored_record`.
-            let wire_index_key = (row.tier == crate::federation::types::attestation_tier::FEDERATION)
-                .then(|| {
-                    crate::federation::wire_index::record_key(&[(
-                        "attestation_id",
-                        &row.attestation_id,
-                    )])
-                });
-            // v38.5.0 (#771) — ABSORB, then RE-READ to decide (the #719 shape,
-            // already used for the roster in #758). `OR IGNORE` makes a
-            // re-delivered row stop raising a UNIQUE violation, and the zero-row
-            // result is then resolved by comparing the STORED row's hash against
-            // the offered one: identical is `AlreadyHeld`, differing is a typed
-            // Conflict. `DO NOTHING` alone would silently accept a DIFFERENT row
-            // under an occupied id, which is the opposite defect.
-            // v54.0.0 (Codex on PR #1050) — THE CYCLE CHECK AND THE INSERT ARE ONE
-            // STEP. The tier-4 check above read the graph unlocked; a concurrent
-            // writer of the reverse edge could have passed the same read since. Hold
-            // the delegation write lock from a re-check through the write, so every
-            // gated writer is serialized against it. One process owns this store, so
-            // the in-process lock is the whole serialization.
-            let _cycle_guard = if crate::federation::admission::delegation_cycle_gated(&row) {
-                let guard = self.delegation_write_lock.lock().await;
-                crate::federation::admission::check_delegation_cycle_admission(self, &row).await?;
-                #[cfg(test)]
-                self.test_hooks()
-                    .pause_if_armed("delegation_cycle_before_insert")
-                    .await;
-                Some(guard)
-            } else {
-                None
-            };
-            let offered_hash_for_compare = row.persist_row_hash.clone();
-            let id_for_compare = row.attestation_id.clone();
-            let inserted = self.write(move |conn| -> Result<bool, rusqlite::Error> {
-                // v50.0.0 (review H2, final check) — ONE transaction for the row,
-                // its projections and its admission depth: a depth write that fails
-                // rolls the row back, so a stored `withdraws` never reads as the
-                // lenient 16-hop legacy depth by accident.
-                let tx = conn.transaction()?;
-                // v36.0.0 (#668) — THIS node's serve position (V130).
-                let admitted_at =
-                    sqlite_next_plane_position(&tx, "federation_attestations", POS_ATTESTATION)?;
-                tx.execute(
-                    "INSERT OR IGNORE INTO federation_attestations (\
-                        attestation_id, attesting_key_id, attested_key_id, attestation_type, \
-                        weight, asserted_at, expires_at, attestation_envelope, \
-                        original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
-                        scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, \
-                        subject_key_ids, withdraws_admission_rule, cohort_scope, \
-                        tier, promoted_at, additional_scrubs, admitted_at\
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
-                    rusqlite::params![
-                        row.attestation_id,
-                        row.attesting_key_id,
-                        row.attested_key_id,
-                        row.attestation_type,
-                        row.weight,
-                        row.asserted_at.to_rfc3339(),
-                        row.expires_at.map(|t| t.to_rfc3339()),
-                        attestation_envelope_text,
-                        original_content_hash,
-                        row.scrub_signature_classical,
-                        row.scrub_signature_pqc,
-                        row.scrub_key_id,
-                        row.scrub_timestamp.to_rfc3339(),
-                        row.pqc_completed_at.map(|t| t.to_rfc3339()),
-                        row.persist_row_hash,
-                        subject_key_ids_json,
-                        withdraws_admission_rule,
-                        row.cohort_scope,
-                        // v22.0.0 (CIRISPersist#543 / AV-78) — BIND THE TIER. The
-                        // INSERT omitted `tier` and `promoted_at`, so the schema
-                        // DEFAULT 'federation' silently overrode every Tier::Local
-                        // row: `put_attestation` could not store a local-tier row
-                        // at all. Found by the substrate state machine — memory
-                        // stored `local` for the identical submitted row, which is
-                        // what ruled out any harness explanation.
-                        row.tier,
-                        row.promoted_at.map(|t| t.to_rfc3339()),
-                        // v24.0.0 (CIRISPersist#556) — the co-signature set rides
-                        // the SAME write as the base scrub. A row whose scrubs
-                        // landed in two different statements could be half-written.
-                        additional_scrubs_json,
-                        admitted_at.to_rfc3339(),
-                    ],
-                )?;
-                // v38.5.0 (#771) — zero rows means the id was already occupied.
-                // Return without touching the projections: they were derived
-                // from these same bytes when the row first landed, and
-                // re-deriving them for a duplicate is at best wasted work.
-                let changed = tx.changes() > 0;
-                if !changed {
-                    return Ok(false);
-                }
-                // v17.4.0 (V106) — maintain the subject projection (federation
-                // tier: put_attestation writes federation-visible rows).
-                sqlite_project_attestation_subjects(
-                    &tx,
-                    &row,
-                    crate::federation::types::attestation_tier::FEDERATION,
-                )?;
-                // v21.0.0 (CIRISPersist#502 E7) — maintain the consent_peer_set
-                // projection (grant upsert / withdraws-revocation fold) in the
-                // SAME locked scope as the insert above.
-                sqlite_project_consent_peer_set(&tx, &row)?;
-                // v45.0.0 (CIRISPersist#871, FSD §5) — maintain the V149
-                // `blob_renditions` projection in the SAME locked scope.
-                sqlite_project_rendition_row(&tx, &row)?;
-                if let Some(depth) = withdraws_depth {
-                    tx.execute(
-                        "INSERT OR REPLACE INTO federation_withdraws_admission_depths \
-                         (attestation_id, depth) VALUES (?1, ?2)",
-                        rusqlite::params![row.attestation_id, depth],
-                    )?;
-                }
-                tx.commit()?;
-                Ok(true)
-            }).await
-            .map_err(|e| {
-                let msg = e.to_string();
-                if msg.contains("FOREIGN KEY") {
-                    crate::federation::Error::InvalidArgument(format!(
-                        "FK constraint violated on attestation insert: {msg}"
-                    ))
-                } else {
-                    crate::federation::Error::Backend(format!("insert attestation: {msg}"))
-                }
-            })?;
-
-            if !inserted {
-                // RE-READ decides (#771): identical bytes are an idempotent
-                // no-op the sender must be able to recognise; different bytes
-                // under an occupied id are a real disagreement.
-                let stored = {
-                    let id = id_for_compare.clone();
-                    self.read(move |conn| {
-                        conn.query_row(
-                            "SELECT persist_row_hash FROM federation_attestations \
-                             WHERE attestation_id = ?1",
-                            rusqlite::params![id],
-                            |r| r.get::<_, String>(0),
-                        )
-                        .optional()
-                    })
-                    .await
-                    .map_err(|e| {
-                        crate::federation::Error::Backend(format!("re-read attestation: {e}"))
-                    })?
-                };
-                let Some(stored_hash) = stored else {
-                    // The row vanished between the insert and the re-read (a
-                    // concurrent purge). Report it as a backend condition rather
-                    // than inventing an outcome for a row nobody holds.
-                    return Err(crate::federation::Error::Backend(format!(
-                        "attestation {id_for_compare} was absorbed as a duplicate but is not \
-                         present on re-read"
-                    )));
-                };
-                crate::federation::attestation_reput_verdict(
-                    &stored_hash,
-                    &offered_hash_for_compare,
-                    &id_for_compare,
-                )?;
-                // v50.0.0 (review H2, final check) — an identical re-put of a
-                // `withdraws` whose admission depth is missing records it now
-                // (idempotent repair).
-                if let Some(depth) = withdraws_depth {
-                    let id = id_for_compare.clone();
-                    self.write(move |conn| {
-                        conn.execute(
-                            "INSERT OR IGNORE INTO federation_withdraws_admission_depths \
-                             (attestation_id, depth) VALUES (?1, ?2)",
-                            rusqlite::params![id, depth],
-                        )
-                    })
-                    .await
-                    .map_err(|e| {
-                        crate::federation::Error::Backend(format!("withdraws depth repair: {e}"))
-                    })?;
-                }
-                return Ok(crate::federation::AttestationOutcome::AlreadyHeld);
-            }
-            if let Some(wire_index_key) = &wire_index_key {
-                self.index_stored_record("Attestation", wire_index_key)
-                    .await?;
-            }
-            // v21.0.0 (CIRISPersist#501) — INBOUND trace projection: a replicated
-            // `trace:complete:v1` attestation materializes its `trace_events`
-            // rows (via the SAME decompose the ingest path uses), so a
-            // replicated trace becomes scorer-readable through
-            // `list_trace_summaries`. Idempotent (the trace_events dedup index);
-            // inline form only (manifest payload is a fountain-fetch follow-up).
-            if let Some(decomposed) = projected_trace {
-                if !decomposed.events.is_empty() {
-                    self.insert_trace_events_batch(&decomposed.events)
-                        .await
-                        .map_err(|e| {
-                            crate::federation::Error::Backend(format!("trace projection: {e}"))
-                        })?;
-                }
-                if !decomposed.llm_calls.is_empty() {
-                    self.insert_trace_llm_calls_batch(&decomposed.llm_calls)
-                        .await
-                        .map_err(|e| {
-                            crate::federation::Error::Backend(format!("trace llm projection: {e}"))
-                        })?;
-                }
-            }
-            Ok(crate::federation::AttestationOutcome::Inserted)
-            }
-            .await;
-        if let (Ok(crate::federation::AttestationOutcome::Inserted), Some((owner, node))) =
-            (&outcome, consent_change)
-        {
-            crate::federation::rewrap_after_admission(self, &owner, &node).await;
-        }
-        outcome
+        crate::federation::attestation_admit::put_attestation_planned(self, attestation, origin)
+            .await
     }
 
     async fn attestation_upsert_local(
         &self,
         input: crate::federation::types::LocalAttestationInput,
     ) -> Result<String, crate::federation::Error> {
-        self.sqlite_write_local_attestation(input, true).await
+        crate::federation::attestation_admit::write_local_attestation_planned(self, input, true)
+            .await
     }
 
     async fn attestation_insert_local(
         &self,
         input: crate::federation::types::LocalAttestationInput,
     ) -> Result<String, crate::federation::Error> {
-        self.sqlite_write_local_attestation(input, false).await
+        crate::federation::attestation_admit::write_local_attestation_planned(self, input, false)
+            .await
     }
 
-    async fn list_attestations_for(
+    /// v56.0.0 (CIRISPersist#1001) — the shared plan's one statement
+    /// ([`render_sql`](crate::federation::attestation_query::render_sql)),
+    /// on a reader.
+    async fn execute_attestation_query(
         &self,
-        attested_key_id: &str,
-    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
-        let key = attested_key_id.to_owned();
-        let (read, bytes) = self.read_measured(move |conn| -> Result<Vec<crate::federation::Attestation>, rusqlite::Error> {
-                let mut stmt = conn.prepare(
-                    "SELECT attestation_id, attesting_key_id, attested_key_id, attestation_type, \
-                        weight, asserted_at, expires_at, attestation_envelope, \
-                        original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
-                        scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at, additional_scrubs \
-                     FROM federation_attestations \
-                     WHERE attested_key_id = ?1 AND tier = 'federation' \
-                     ORDER BY asserted_at DESC",
-                )?;
-                let rows = stmt.query_map([&key], sqlite_row_to_attestation)?;
-                rows.collect()
-            }).await;
-        read.map_err(|e| crate::federation::Error::Backend(format!("list_attestations_for: {e}")))
-            .inspect(|rows| {
-                crate::observe::record_read(
-                    crate::observe::StoreBackend::Sqlite,
-                    crate::observe::Door::ListAttestationsFor,
-                    attested_key_id,
-                    rows,
-                    bytes,
-                )
+        q: &crate::federation::attestation_query::AttestationQuery,
+    ) -> Result<crate::federation::attestation_query::QueryRows, crate::federation::Error> {
+        use crate::federation::attestation_query::{render_sql, Bind, Dialect};
+        let stmt = render_sql(
+            q,
+            Dialect::Sqlite,
+            "federation_attestations",
+            SQLITE_ATTESTATION_COLUMNS,
+        );
+        let binds: Vec<SqlValue> = stmt
+            .binds
+            .into_iter()
+            .map(|b| match b {
+                Bind::Text(t) => SqlValue::Text(t),
+                Bind::Time(t) => SqlValue::Text(t.to_rfc3339()),
+                Bind::Int(n) => SqlValue::Integer(n),
             })
+            .collect();
+        let sql = stmt.sql;
+        let (read, bytes) = self
+            .read_measured(
+                move |conn| -> Result<Vec<crate::federation::Attestation>, rusqlite::Error> {
+                    let mut stmt = conn.prepare(&sql)?;
+                    let rows =
+                        stmt.query_map(params_from_iter(binds.iter()), sqlite_row_to_attestation)?;
+                    rows.collect()
+                },
+            )
+            .await;
+        let rows = read.map_err(|e| {
+            crate::federation::Error::Backend(format!("execute_attestation_query: {e}"))
+        })?;
+        Ok(crate::federation::attestation_query::QueryRows {
+            rows,
+            bytes,
+            backend: crate::observe::StoreBackend::Sqlite,
+        })
     }
 
     async fn list_attestations_referencing(
@@ -6573,124 +5560,6 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                 crate::observe::StoreBackend::Sqlite,
                 crate::observe::Door::ListAttestationsReferencing,
                 target_attestation_id,
-                rows,
-                bytes,
-            )
-        })
-    }
-
-    async fn list_attestations_by(
-        &self,
-        attesting_key_id: &str,
-    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
-        let key = attesting_key_id.to_owned();
-        let (read, bytes) = self.read_measured(move |conn| -> Result<Vec<crate::federation::Attestation>, rusqlite::Error> {
-                let mut stmt = conn.prepare(
-                    "SELECT attestation_id, attesting_key_id, attested_key_id, attestation_type, \
-                        weight, asserted_at, expires_at, attestation_envelope, \
-                        original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
-                        scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at, additional_scrubs \
-                     FROM federation_attestations \
-                     WHERE attesting_key_id = ?1 AND tier = 'federation' \
-                     ORDER BY asserted_at DESC",
-                )?;
-                let rows = stmt.query_map([&key], sqlite_row_to_attestation)?;
-                rows.collect()
-            }).await;
-        read.map_err(|e| crate::federation::Error::Backend(format!("list_attestations_by: {e}")))
-            .inspect(|rows| {
-                crate::observe::record_read(
-                    crate::observe::StoreBackend::Sqlite,
-                    crate::observe::Door::ListAttestationsBy,
-                    attesting_key_id,
-                    rows,
-                    bytes,
-                )
-            })
-    }
-
-    /// v53.1.5 — V137's `(attesting_key_id, dimension)` seek; the prefix is
-    /// the #817/#818 half-open byte range (`substr` only when no upper bound
-    /// is representable — never `LIKE`).
-    async fn list_attestations_by_dimension_prefix(
-        &self,
-        attesting_key_id: &str,
-        dimension_prefix: &str,
-    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
-        let mut binds: Vec<SqlValue> = vec![SqlValue::Text(attesting_key_id.to_owned())];
-        let prefix_sql = sqlite_dimension_prefix_clause(dimension_prefix, &mut binds);
-        let sql = format!(
-            "SELECT {SQLITE_ATTESTATION_COLUMNS} FROM federation_attestations \
-             WHERE attesting_key_id = ?1 AND tier = 'federation' AND {prefix_sql} \
-             ORDER BY asserted_at DESC"
-        );
-        let (read, bytes) = self
-            .read_measured(
-                move |conn| -> Result<Vec<crate::federation::Attestation>, rusqlite::Error> {
-                    let mut stmt = conn.prepare(&sql)?;
-                    let rows =
-                        stmt.query_map(params_from_iter(binds.iter()), sqlite_row_to_attestation)?;
-                    rows.collect()
-                },
-            )
-            .await;
-        read.map_err(|e| {
-            crate::federation::Error::Backend(format!("list_attestations_by_dimension_prefix: {e}"))
-        })
-        .inspect(|rows| {
-            crate::observe::record_read(
-                crate::observe::StoreBackend::Sqlite,
-                crate::observe::Door::ListAttestationsByDimensionPrefix,
-                attesting_key_id,
-                rows,
-                bytes,
-            )
-        })
-    }
-
-    /// v53.1.5 — V178's `(attested_key_id, dimension)` seek, the attested
-    /// twin of the read above; the optional attester narrows in the same
-    /// statement.
-    async fn list_attestations_for_dimension_prefix(
-        &self,
-        attested_key_id: &str,
-        attesting_key_id: Option<&str>,
-        dimension_prefix: &str,
-    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
-        let mut binds: Vec<SqlValue> = vec![SqlValue::Text(attested_key_id.to_owned())];
-        let prefix_sql = sqlite_dimension_prefix_clause(dimension_prefix, &mut binds);
-        let attester_sql = match attesting_key_id {
-            Some(k) => {
-                binds.push(SqlValue::Text(k.to_owned()));
-                format!(" AND attesting_key_id = ?{}", binds.len())
-            }
-            None => String::new(),
-        };
-        let sql = format!(
-            "SELECT {SQLITE_ATTESTATION_COLUMNS} FROM federation_attestations \
-             WHERE attested_key_id = ?1 AND tier = 'federation' AND {prefix_sql}{attester_sql} \
-             ORDER BY asserted_at DESC"
-        );
-        let (read, bytes) = self
-            .read_measured(
-                move |conn| -> Result<Vec<crate::federation::Attestation>, rusqlite::Error> {
-                    let mut stmt = conn.prepare(&sql)?;
-                    let rows =
-                        stmt.query_map(params_from_iter(binds.iter()), sqlite_row_to_attestation)?;
-                    rows.collect()
-                },
-            )
-            .await;
-        read.map_err(|e| {
-            crate::federation::Error::Backend(format!(
-                "list_attestations_for_dimension_prefix: {e}"
-            ))
-        })
-        .inspect(|rows| {
-            crate::observe::record_read(
-                crate::observe::StoreBackend::Sqlite,
-                crate::observe::Door::ListAttestationsForDimensionPrefix,
-                attested_key_id,
                 rows,
                 bytes,
             )
@@ -6759,136 +5628,6 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                 bytes,
             )
         })
-    }
-
-    /// v53.1.6 — V178's `(attested_key_id, attestation_type, …)` prefix seek.
-    async fn list_attestations_for_type(
-        &self,
-        attested_key_id: &str,
-        attestation_type: &str,
-    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
-        let binds: Vec<SqlValue> = vec![
-            SqlValue::Text(attested_key_id.to_owned()),
-            SqlValue::Text(attestation_type.to_owned()),
-        ];
-        let sql = sqlite_attestations_for_type_sql();
-        let (read, bytes) = self
-            .read_measured(
-                move |conn| -> Result<Vec<crate::federation::Attestation>, rusqlite::Error> {
-                    let mut stmt = conn.prepare(&sql)?;
-                    let rows =
-                        stmt.query_map(params_from_iter(binds.iter()), sqlite_row_to_attestation)?;
-                    rows.collect()
-                },
-            )
-            .await;
-        read.map_err(|e| {
-            crate::federation::Error::Backend(format!("list_attestations_for_type: {e}"))
-        })
-        .inspect(|rows| {
-            crate::observe::record_read(
-                crate::observe::StoreBackend::Sqlite,
-                crate::observe::Door::ListAttestationsForType,
-                attested_key_id,
-                rows,
-                bytes,
-            )
-        })
-    }
-
-    /// v53.1.6 — V107's `(attesting_key_id, attestation_type, …)` prefix
-    /// seek (`federation_attestations_composer_ref`, V141-preserved).
-    async fn list_attestations_by_type(
-        &self,
-        attesting_key_id: &str,
-        attestation_type: &str,
-    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
-        let binds: Vec<SqlValue> = vec![
-            SqlValue::Text(attesting_key_id.to_owned()),
-            SqlValue::Text(attestation_type.to_owned()),
-        ];
-        let sql = sqlite_attestations_by_type_sql();
-        let (read, bytes) = self
-            .read_measured(
-                move |conn| -> Result<Vec<crate::federation::Attestation>, rusqlite::Error> {
-                    let mut stmt = conn.prepare(&sql)?;
-                    let rows =
-                        stmt.query_map(params_from_iter(binds.iter()), sqlite_row_to_attestation)?;
-                    rows.collect()
-                },
-            )
-            .await;
-        read.map_err(|e| {
-            crate::federation::Error::Backend(format!("list_attestations_by_type: {e}"))
-        })
-        .inspect(|rows| {
-            crate::observe::record_read(
-                crate::observe::StoreBackend::Sqlite,
-                crate::observe::Door::ListAttestationsByType,
-                attesting_key_id,
-                rows,
-                bytes,
-            )
-        })
-    }
-
-    /// v53.1.7 — V178's `(attested_key_id, attestation_type, …)` seek, one
-    /// probe per type; the dimension exclusion is evaluated on the table row,
-    /// so an excluded row is never decoded.
-    async fn list_attestations_for_types(
-        &self,
-        attested_key_id: &str,
-        attestation_types: &[&str],
-        excluded_dimensions: &[&str],
-    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
-        let (rows, bytes) = self
-            .sqlite_typed_read(
-                "attested_key_id",
-                attested_key_id,
-                attestation_types,
-                excluded_dimensions,
-            )
-            .await
-            .map_err(|e| {
-                crate::federation::Error::Backend(format!("list_attestations_for_types: {e}"))
-            })?;
-        crate::observe::record_read(
-            crate::observe::StoreBackend::Sqlite,
-            crate::observe::Door::ListAttestationsForTypes,
-            attested_key_id,
-            &rows,
-            bytes,
-        );
-        Ok(rows)
-    }
-
-    /// v53.1.7 — V107's `(attesting_key_id, attestation_type, …)` seek, the
-    /// attesting twin of the read above.
-    async fn list_attestations_by_types(
-        &self,
-        attesting_key_id: &str,
-        attestation_types: &[&str],
-        excluded_dimensions: &[&str],
-    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
-        let (rows, bytes) = self
-            .sqlite_typed_read(
-                "attesting_key_id",
-                attesting_key_id,
-                attestation_types,
-                excluded_dimensions,
-            )
-            .await
-            .map_err(|e| {
-                crate::federation::Error::Backend(format!("list_attestations_by_types: {e}"))
-            })?;
-        crate::observe::record_read(
-            crate::observe::StoreBackend::Sqlite,
-            crate::observe::Door::ListAttestationsByTypes,
-            attesting_key_id,
-            &rows,
-            bytes,
-        );
-        Ok(rows)
     }
 
     /// v53.1.6 — V180's `(attesting_key_id, dimension, evidence_refs[0])`
@@ -7341,117 +6080,16 @@ impl crate::federation::FederationDirectory for SqliteBackend {
     /// [`crate::federation::migration::check_reseal_admission`], shared with
     /// memory and postgres; verify-before-mutation over a LOADED COPY, so a
     /// refused re-seal leaves no trace.
+    /// v56.0.0 (CIRISPersist#934 step 1, door 4) — the decision is
+    /// [`plan_reseal_attestation`](crate::federation::attestation_admit::plan_reseal_attestation)
+    /// and its re-ask in the write step,
+    /// [`PlannedReseal::sealed_over`](crate::federation::attestation_admit::PlannedReseal::sealed_over);
+    /// this backend stores it.
     async fn reseal_attestation_v31(
         &self,
         resealed: &crate::federation::Attestation,
     ) -> Result<bool, crate::federation::Error> {
-        let Some(stored) = self.get_attestation(&resealed.attestation_id).await? else {
-            return Ok(false);
-        };
-        crate::federation::migration::check_reseal_admission(
-            &stored,
-            resealed,
-            chrono::Utc::now(),
-        )?;
-        // v31.0.0 (CIRISPersist#656) — THE SEAL, and the two instants the shape
-        // gate above does not pin. This door was the only write door into
-        // `federation_attestations` with no signature gate at all. One gate,
-        // three backends.
-        crate::federation::admission::check_reseal_seal_admission(self, &stored, resealed).await?;
-
-        let mut row = stored.clone();
-        row.attestation_envelope = resealed.attestation_envelope.clone();
-        row.original_content_hash = resealed.original_content_hash.clone();
-        row.scrub_signature_classical = resealed.scrub_signature_classical.clone();
-        row.scrub_signature_pqc = resealed.scrub_signature_pqc.clone();
-        row.scrub_key_id = resealed.scrub_key_id.clone();
-        row.scrub_timestamp = resealed.scrub_timestamp;
-        row.additional_scrubs = resealed.additional_scrubs.clone();
-        row.asserted_at = resealed.asserted_at;
-        row.expires_at = resealed.expires_at;
-        row.pqc_completed_at = resealed
-            .scrub_signature_pqc
-            .as_ref()
-            .map(|_| resealed.scrub_timestamp);
-        let mut for_hash = row.clone();
-        for_hash.persist_row_hash = String::new();
-        let new_hash = crate::federation::types::compute_persist_row_hash(&for_hash)?;
-
-        let envelope_text = serde_json::to_string(&row.attestation_envelope)
-            .map_err(|e| crate::federation::Error::Backend(format!("envelope serialize: {e}")))?;
-        let och: Vec<u8> = hex::decode(&row.original_content_hash).map_err(|e| {
-            crate::federation::Error::InvalidArgument(format!("original_content_hash hex: {e}"))
-        })?;
-        let scrubs_json = serde_json::to_string(&row.additional_scrubs)
-            .map_err(|e| crate::federation::Error::Backend(format!("scrubs serialize: {e}")))?;
-        let wire_index_key = crate::federation::wire_index::record_key(&[(
-            "attestation_id",
-            &resealed.attestation_id,
-        )]);
-        let id = resealed.attestation_id.clone();
-        let classical = row.scrub_signature_classical.clone();
-        let pqc = row.scrub_signature_pqc.clone();
-        let scrub_key = row.scrub_key_id.clone();
-        let ts = row.scrub_timestamp.to_rfc3339();
-        let pqc_completed = row.pqc_completed_at.map(|t| t.to_rfc3339());
-        let asserted = row.asserted_at.to_rfc3339();
-        let expires = row.expires_at.map(|t| t.to_rfc3339());
-        let federation_tier = row.tier == crate::federation::types::attestation_tier::FEDERATION;
-        let n = self
-            .write(move |conn| -> Result<usize, rusqlite::Error> {
-                let tx = conn.transaction()?;
-                // v36.0.0 (#668/#707-class) — a re-seal rewrites the served bytes;
-                // the serve position moves with them.
-                let admitted_at =
-                    sqlite_next_plane_position(&tx, "federation_attestations", POS_ATTESTATION)?;
-                let n = tx.execute(
-                    "UPDATE federation_attestations \
-                 SET attestation_envelope = ?2, original_content_hash = ?3, \
-                     scrub_signature_classical = ?4, scrub_signature_pqc = ?5, \
-                     scrub_key_id = ?6, scrub_timestamp = ?7, pqc_completed_at = ?8, \
-                     additional_scrubs = ?9, asserted_at = ?10, expires_at = ?11, \
-                     persist_row_hash = ?12, admitted_at = ?13 \
-                 WHERE attestation_id = ?1",
-                    rusqlite::params![
-                        id,
-                        envelope_text,
-                        och,
-                        classical,
-                        pqc,
-                        scrub_key,
-                        ts,
-                        pqc_completed,
-                        scrubs_json,
-                        asserted,
-                        expires,
-                        new_hash,
-                        admitted_at.to_rfc3339(),
-                    ],
-                )?;
-                // The V106 projection carries `asserted_at`, which the instant
-                // truncation may have moved. Same statement, same transaction.
-                tx.execute(
-                    "UPDATE attestation_subjects SET asserted_at = ?2 WHERE attestation_id = ?1",
-                    rusqlite::params![id, asserted],
-                )?;
-                tx.commit()?;
-                Ok(n)
-            })
-            .await
-            .map_err(|e| {
-                crate::federation::Error::Backend(format!("reseal_attestation_v31: {e}"))
-            })?;
-        if n == 0 {
-            return Ok(false);
-        }
-        // The wire index moves WITH the row (#610): the re-seal recomputes
-        // `persist_row_hash`, so without re-indexing the row advertises a hash
-        // the index does not hold.
-        if federation_tier {
-            self.index_stored_record("Attestation", &wire_index_key)
-                .await?;
-        }
-        Ok(true)
+        crate::federation::attestation_admit::reseal_attestation_planned(self, resealed).await
     }
 
     /// v31.0.0 (CIRISPersist#650) — hard-delete one attestation row.
@@ -7764,66 +6402,30 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         Ok(())
     }
 
+    /// v56.0.0 (CIRISPersist#934 step 1, door 5) — decided by
+    /// [`purge_attestation_planned`](crate::federation::attestation_admit::purge_attestation_planned).
     async fn purge_attestation_v31(
         &self,
         attestation_id: &str,
     ) -> Result<bool, crate::federation::Error> {
-        // v31.0.0 (CIRISPersist#650) — the door's own gate, over a LOADED
-        // COPY, before any statement runs (AV-9).
-        if let Some(row) = self.get_attestation(attestation_id).await? {
-            crate::federation::migration::check_purge_admission(&row)?;
-        }
-        let id = attestation_id.to_owned();
-        let n = self
-            .write(move |conn| -> Result<usize, rusqlite::Error> {
-                conn.execute(
-                    "DELETE FROM federation_attestations WHERE attestation_id = ?1",
-                    rusqlite::params![id],
-                )
-            })
-            .await
-            .map_err(|e| {
-                crate::federation::Error::Backend(format!("purge_attestation_v31: {e}"))
-            })?;
-        Ok(n > 0)
+        crate::federation::attestation_admit::purge_attestation_planned(self, attestation_id).await
     }
 
-    /// v31.1.0 (CIRISPersist#665) — the re-bake replacement half. Same statement
-    /// as `purge_attestation_v31` above, a different and much narrower gate: the
-    /// general exclusion gate refuses these rows (two of the three are
-    /// `delegates_to`), so this door asks only whether the id is one the
-    /// compiled-in bundle carries. `attestation_subjects` follows via `ON DELETE
-    /// CASCADE` (V106).
+    /// v56.0.0 (CIRISPersist#934 step 1, door 6) — decided by
+    /// [`purge_genesis_delegation_row_planned`](crate::federation::attestation_admit::purge_genesis_delegation_row_planned).
     async fn purge_genesis_delegation_row_v31(
         &self,
         attestation_id: &str,
         expected_persist_row_hash: &str,
         authority: &crate::federation::genesis::bundle::GenesisPurgeAuthority<'_>,
     ) -> Result<bool, crate::federation::Error> {
-        // The door's own gate, before any statement runs (AV-9).
-        crate::federation::genesis::check_genesis_rebake_purge_admission_under(
+        crate::federation::attestation_admit::purge_genesis_delegation_row_planned(
+            self,
             attestation_id,
+            expected_persist_row_hash,
             authority,
-        )?;
-        let id = attestation_id.to_owned();
-        let expected = expected_persist_row_hash.to_owned();
-        // v31.1.0 (CIRISPersist#665 review) — COMPARE-AND-DELETE in ONE
-        // statement: the row must still be the one the caller classified. A row
-        // replaced by a concurrent initializer between that read and this call
-        // does not match and is left alone.
-        let n = self
-            .write(move |conn| -> Result<usize, rusqlite::Error> {
-                conn.execute(
-                    "DELETE FROM federation_attestations \
-                 WHERE attestation_id = ?1 AND persist_row_hash = ?2",
-                    rusqlite::params![id, expected],
-                )
-            })
-            .await
-            .map_err(|e| {
-                crate::federation::Error::Backend(format!("purge_genesis_delegation_row_v31: {e}"))
-            })?;
-        Ok(n > 0)
+        )
+        .await
     }
 
     async fn dag_manifests_of_chunk(
@@ -11609,6 +10211,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         let signature_json = serde_json::to_string(&signed.signature)
             .map_err(|e| crate::federation::Error::Backend(format!("signature: {e}")))?;
         let asserted = d.asserted_at.to_rfc3339();
+        let incoming_envelope = signed.signed_envelope.clone();
         let last_seen = d.last_seen_at.map(|t| t.to_rfc3339());
         let retired = d.retired_at.map(|t| t.to_rfc3339());
         let epoch = i64::try_from(d.epoch).map_err(|_| {
@@ -11649,15 +10252,29 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     // regardless of (epoch, asserted_at) — otherwise whichever
                     // unsigned writer landed last with the freshest clock kept
                     // the admitted producer signature out forever.
-                    let stored_signed: bool = conn.query_row(
-                        "SELECT signature IS NOT NULL FROM transport_destinations \
-                     WHERE occurrence_key_id = ?1 AND transport_kind = ?2",
+                    let (stored_signed, stored_envelope): (bool, Option<String>) = conn.query_row(
+                        "SELECT signature IS NOT NULL, signed_envelope \
+                             FROM transport_destinations \
+                             WHERE occurrence_key_id = ?1 AND transport_kind = ?2",
                         rusqlite::params![d.occurrence_key_id, d.transport_kind],
-                        |r| r.get(0),
+                        |r| Ok((r.get(0)?, r.get(1)?)),
                     )?;
-                    if ex == d && stored_signed {
-                        // Byte-identical typed content on an already-signed row —
-                        // idempotent re-offer.
+                    // v56.0.0 (#1077) — the transit KEX pair is envelope-only:
+                    // an equal typed projection is `Unchanged` only when the
+                    // stored envelope carries the same pair. A same-clock
+                    // re-sign that changes it falls to the refusal below.
+                    let same_pair = stored_envelope
+                        .as_deref()
+                        .and_then(|e| serde_json::from_str::<serde_json::Value>(e).ok())
+                        .is_some_and(|stored| {
+                            crate::federation::self_at_login::same_transit_kex_member(
+                                &stored,
+                                &incoming_envelope,
+                            )
+                        });
+                    if ex == d && stored_signed && same_pair {
+                        // Byte-identical typed content (and pair) on an
+                        // already-signed row — idempotent re-offer.
                         return Ok(Outcome::Unchanged);
                     }
                     if stored_signed && (d.epoch, d.asserted_at) <= (ex.epoch, ex.asserted_at) {
@@ -13652,95 +12269,20 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         Ok(())
     }
 
+    /// v56.0.0 (CIRISPersist#934 step 1) — the decision is
+    /// [`plan_attach_attestation_pqc_signature`](crate::federation::attestation_admit::plan_attach_attestation_pqc_signature),
+    /// shared by all three backends; this backend stores it.
     async fn attach_attestation_pqc_signature(
         &self,
         attestation_id: &str,
         scrub_signature_pqc: &str,
     ) -> Result<(), crate::federation::Error> {
-        // Read existing row to recompute hash + check pending state.
-        let id = attestation_id.to_owned();
-        let row_opt = self
-            .read(
-            move |conn| -> Result<Option<crate::federation::Attestation>, rusqlite::Error> {
-                conn.query_row(
-                    "SELECT attestation_id, attesting_key_id, attested_key_id, attestation_type, \
-                        weight, asserted_at, expires_at, attestation_envelope, \
-                        original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
-                        scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at, additional_scrubs \
-                     FROM federation_attestations WHERE attestation_id = ?1",
-                    [&id],
-                    sqlite_row_to_attestation,
-                )
-                .optional()
-            })
-        .await
-        .map_err(|e| crate::federation::Error::Backend(format!("attach lookup: {e}")))?;
-        let mut row = row_opt.ok_or_else(|| {
-            crate::federation::Error::InvalidArgument(format!(
-                "federation_attestations row {attestation_id} does not exist"
-            ))
-        })?;
-        if row.is_pqc_complete() {
-            return Err(crate::federation::Error::Conflict(format!(
-                "federation_attestations row {attestation_id} is already PQC-complete"
-            )));
-        }
-        row.scrub_signature_pqc = Some(scrub_signature_pqc.to_owned());
-        let now = chrono::Utc::now();
-        row.pqc_completed_at = Some(now);
-        let mut for_hash = row.clone();
-        for_hash.persist_row_hash = String::new();
-        let new_hash = crate::federation::types::compute_persist_row_hash(&for_hash)?;
-
-        let attestation_id_for_exec = attestation_id.to_owned();
-        let pqc_sig = scrub_signature_pqc.to_owned();
-        let now_str = now.to_rfc3339();
-        let n = self
-            .write(move |conn| -> Result<usize, rusqlite::Error> {
-                // v36.0.0 (#668/#707-class) — the hybrid-completion write rewrites
-                // THREE served columns; the serve position moves with them.
-                let admitted_at =
-                    sqlite_next_plane_position(conn, "federation_attestations", POS_ATTESTATION)?;
-                conn.execute(
-                    "UPDATE federation_attestations \
-                 SET scrub_signature_pqc = ?1, pqc_completed_at = ?2, persist_row_hash = ?3, \
-                     admitted_at = ?5 \
-                 WHERE attestation_id = ?4 AND pqc_completed_at IS NULL",
-                    rusqlite::params![
-                        pqc_sig,
-                        now_str,
-                        new_hash,
-                        attestation_id_for_exec,
-                        admitted_at.to_rfc3339()
-                    ],
-                )
-            })
-            .await
-            .map_err(|e| {
-                crate::federation::Error::Backend(format!("attach_attestation_pqc_signature: {e}"))
-            })?;
-        if n == 0 {
-            return Err(crate::federation::Error::Conflict(
-                "federation_attestations row was concurrently completed".to_string(),
-            ));
-        }
-        // v31.0.0 (CIRISPersist#657) — the hybrid-completion write moves THREE
-        // serialized columns of the attestation (`scrub_signature_pqc`,
-        // `pqc_completed_at`, `persist_row_hash`), so it moves the wire content
-        // hash exactly as the key-plane twin above does. #547 fixed the key
-        // site and #640 made that remedy shared; this site was never redirected
-        // through it, so a federation-tier attestation that completed its PQC
-        // leg kept serving the PRE-completion hash out of `signed_wire_index` —
-        // the point-read advertises one digest and the read surface returns
-        // another. Indexed from the row AS STORED (the shared helper re-reads),
-        // which is what makes the index agree with the read surface on a
-        // backend that rounds `pqc_completed_at`.
-        self.index_stored_record(
-            "Attestation",
-            &crate::federation::wire_index::record_key(&[("attestation_id", attestation_id)]),
+        crate::federation::attestation_admit::attach_attestation_pqc_planned(
+            self,
+            attestation_id,
+            scrub_signature_pqc,
         )
-        .await?;
-        Ok(())
+        .await
     }
 
     async fn get_attestation(
@@ -23338,215 +21880,163 @@ fn sqlite_row_to_key_record(
     })
 }
 
-impl SqliteBackend {
-    /// v4.4.0 (CIRISPersist#171) — shared local-tier write path for
-    /// `attestation_upsert_local` (`replace = true`) /
-    /// `attestation_insert_local` (`replace = false`). Runs the §4.1
-    /// local-tier gate + the shared dimension/cohort_scope admission,
-    /// builds the deferred-signature `local` row, and writes it (upsert =
-    /// delete prior local rows for `(attesting, dimension)` then insert;
-    /// insert = append a fresh id). Returns the new `attestation_id`.
-    async fn sqlite_write_local_attestation(
+/// v56.0.0 (CIRISPersist#934 step 1) — the attestation plane's executor on
+/// sqlite. Storage only: the decision is
+/// [`plan_put_attestation`](crate::federation::attestation_admit::plan_put_attestation).
+#[async_trait::async_trait]
+impl crate::federation::attestation_admit::AttestationStore for SqliteBackend {
+    fn admission_cx(&self) -> crate::federation::attestation_admit::AdmissionCx<'_> {
+        crate::federation::attestation_admit::AdmissionCx {
+            quota: &self.peer_write_quota,
+            admission_gate: self.admission_gate(),
+            self_key_id: self.self_key_id(),
+            schema_resolver: self.schema_resolver(),
+        }
+    }
+
+    async fn attesting_identity_type(
         &self,
-        input: crate::federation::types::LocalAttestationInput,
-        replace: bool,
-    ) -> Result<String, crate::federation::Error> {
-        use crate::federation::Error;
-
-        // v17.9.0 (CC#38 interim) — envelope size cap FIRST, before any
-        // parsing/lookups (cheapest-most-specific-rejection-first).
-        // v20.0.0 (#495): the input envelope is TYPED (EnvelopeCore);
-        // serialize once for the Value-based admission checks.
-        let envelope_value = input.attestation_envelope.to_value();
-        crate::federation::admission::check_envelope_size_admission(&envelope_value)?;
-        // v44.8.0 (CIRISPersist#866 C1) — the scope-token gate, at the local
-        // door too (`FSD/CONTEXTUAL_INTEGRITY_ENVELOPE.md` §4.4).
-        crate::federation::consent_scope::check_consent_scope_tokens(&envelope_value)?;
-        // v45.0.0 (CIRISPersist#871) — the media Source struct gate, at the local
-        // door too (`FSD/MEDIA_SOURCE.md` §6). A local row never carries a
-        // holder claim, so only the struct is checked here.
-        crate::federation::media_source::check_media_source(&envelope_value)?;
-        crate::federation::admission::check_trace_dimension_admission(
-            input.dimension(),
-            &input.attesting_key_id,
-            &input.subject_key_ids,
-            &envelope_value,
-        )?;
-        crate::federation::trust_root::check_trust_charter_admission(
-            self,
-            &input.attestation_type,
-            &input.attesting_key_id,
-            input
-                .attested_key_id
-                .as_deref()
-                .unwrap_or(&input.attesting_key_id),
-            &envelope_value,
-        )
-        .await?;
-        // v51.0.0 (CIRISPersist#937, CC 3.2 T4a) — attaching is gated on a
-        // witnessed lineage head inside the root's attach window.
-        crate::federation::canonical_community::check_attach_freshness(
-            self,
-            crate::federation::canonical_community::AttachDoor::Author,
-            input.attestation_id.as_deref(),
-            &input.attesting_key_id,
-            &input.attestation_type,
-            input
-                .attested_key_id
-                .as_deref()
-                .unwrap_or(&input.attesting_key_id),
-            &envelope_value,
-            chrono::Utc::now(),
-        )
-        .await?;
-        // The (occurrence, dimension) key + the gate axis. Required.
-        let dimension = input.dimension().map(|s| s.to_string()).ok_or_else(|| {
-            Error::InvalidArgument(
-                "local attestation envelope must carry a \"dimension\" string".into(),
+        key_id: &str,
+    ) -> Result<Option<String>, crate::federation::Error> {
+        let attesting = key_id.to_owned();
+        self.read(move |conn| -> Result<Option<String>, rusqlite::Error> {
+            conn.query_row(
+                "SELECT identity_type FROM federation_keys WHERE key_id = ?1",
+                [&attesting],
+                |r| r.get::<_, String>(0),
             )
-        })?;
+            .optional()
+        })
+        .await
+        .map_err(|e| {
+            crate::federation::Error::Backend(format!("lookup attesting identity_type: {e}"))
+        })
+    }
 
-        // §4.1 local-tier gate: refuse capacity:*; classify subject-side
-        // revocation as TRANSIT (§10.1.3 transit-not-rest).
-        let disposition = crate::federation::admission::check_local_tier_eligibility(
-            &input.attestation_type,
-            Some(dimension.as_str()),
-            &input.attesting_key_id,
-            &input.subject_key_ids,
-            &input.cohort_scope,
-        )?;
+    async fn composer_replay_held(
+        &self,
+        attestation_type: &str,
+        attesting_key_id: &str,
+        references_attestation_id: &str,
+    ) -> Result<bool, crate::federation::Error> {
+        let attestation_type_owned = attestation_type.to_owned();
+        let attesting_owned = attesting_key_id.to_owned();
+        let ref_id_owned = references_attestation_id.to_owned();
+        self.read(move |conn| -> Result<bool, rusqlite::Error> {
+            let mut stmt = conn.prepare(
+                "SELECT attestation_envelope FROM federation_attestations \
+                 WHERE attestation_type = ?1 AND attesting_key_id = ?2",
+            )?;
+            let rows = stmt.query_map(
+                rusqlite::params![attestation_type_owned, attesting_owned],
+                |r| r.get::<_, String>(0),
+            )?;
+            for env_text in rows {
+                let env_text = env_text?;
+                let env: serde_json::Value = match serde_json::from_str(&env_text) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                let existing_ref =
+                    crate::federation::precedence::references_attestation_id_from_envelope(&env);
+                if existing_ref == Some(ref_id_owned.as_str()) {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        })
+        .await
+        .map_err(|e| {
+            crate::federation::Error::Backend(format!("dedup lookup structural composer: {e}"))
+        })
+    }
 
-        // cohort_scope value validation (closed set).
-        crate::federation::admission::check_cohort_scope(&input.cohort_scope)?;
+    async fn repair_withdraws_depth(
+        &self,
+        attestation_id: &str,
+        depth: usize,
+    ) -> Result<(), crate::federation::Error> {
+        let id = attestation_id.to_owned();
+        let depth = depth as i64;
+        self.write(move |conn| {
+            conn.execute(
+                "INSERT OR IGNORE INTO federation_withdraws_admission_depths \
+                 (attestation_id, depth) \
+                 SELECT attestation_id, ?2 FROM federation_attestations \
+                  WHERE attestation_id = ?1",
+                rusqlite::params![id, depth],
+            )
+        })
+        .await
+        .map(|_| ())
+        .map_err(|e| crate::federation::Error::Backend(format!("withdraws depth repair: {e}")))
+    }
 
-        // v12.6.0 (CIRISPersist#171, §10.1.3) — a subject-side revocation MAY
-        // *transit* the local write path only if its bound-hybrid signature
-        // verifies (accept on VALID crypto only). `None` for a durable
-        // producer-authority row. Runs before the DB write.
-        let transit =
-            crate::federation::admission::verify_caller_signed_local_row(self, disposition, &input)
-                .await?;
-
-        // v24.0.0 (CIRISPersist#557) — the attested SUBJECT rule, shared with the
-        // federation write path and with the other two backends. V114 removed
-        // the SQLite `attested_key_id` FK that used to catch this at INSERT, so
-        // the local writer must run the predicate explicitly or the two write
-        // paths would enforce different rules.
-        // v31.2.0 (CIRISPersist#670) — it runs HERE, behind the pure gates, not
-        // ahead of them. It resolves the subject through the directory; the
-        // three gates above are pure functions of `input`. Memory had this
-        // order and the two SQL backends did not, which is the AV-76 tier
-        // inversion of #660 wearing different clothes: a row that fails a free
-        // predicate was paying for a directory walk first, on the two backends
-        // production runs.
-        crate::federation::admission::check_attested_subject_admission(
-            self,
-            input
-                .attested_key_id
-                .as_deref()
-                .unwrap_or(&input.attesting_key_id),
-        )
-        .await?;
-        // v45.0.0 (CIRISPersist#871, FSD/MEDIA_SOURCE.md §5) — the placement
-        // rule at the local door: a rendition (`media.derived_from`) whose
-        // original THIS node holds must name the original's own
-        // `cohort_scope`. Reads the blob store, so it sits with the other
-        // directory-reading gates, before the write. Backend-symmetric.
-        crate::federation::renditions::check_rendition_placement(
-            self,
-            &envelope_value,
-            &input.cohort_scope,
-        )
-        .await?;
-
-        // FK precondition + §7.0.1 emitter gate: the attesting key must
-        // exist; its identity_type gates the dimension. Mirrors
-        // put_attestation, minus the federation trust-threshold gate
-        // (local = producer-only authority, not federation-trust-gated).
-        let identity_type = {
-            let attesting = input.attesting_key_id.clone();
-            self.read(move |conn| -> Result<Option<String>, rusqlite::Error> {
-                conn.query_row(
-                    "SELECT identity_type FROM federation_keys WHERE key_id = ?1",
-                    [&attesting],
-                    |r| r.get::<_, String>(0),
+    async fn store_pqc_completion(
+        &self,
+        completion: crate::federation::attestation_admit::PqcCompletion,
+    ) -> Result<(), crate::federation::Error> {
+        let attestation_id = completion.attestation_id.clone();
+        let n = self
+            .write(move |conn| -> Result<usize, rusqlite::Error> {
+                // v36.0.0 (#668/#707-class) — the hybrid-completion write rewrites
+                // THREE served columns; the serve position moves with them.
+                let admitted_at =
+                    sqlite_next_plane_position(conn, "federation_attestations", POS_ATTESTATION)?;
+                conn.execute(
+                    "UPDATE federation_attestations \
+                 SET scrub_signature_pqc = ?1, pqc_completed_at = ?2, persist_row_hash = ?3, \
+                     admitted_at = ?5 \
+                 WHERE attestation_id = ?4 AND pqc_completed_at IS NULL",
+                    rusqlite::params![
+                        completion.scrub_signature_pqc,
+                        completion.pqc_completed_at.to_rfc3339(),
+                        completion.persist_row_hash,
+                        completion.attestation_id,
+                        admitted_at.to_rfc3339()
+                    ],
                 )
-                .optional()
             })
             .await
-            .map_err(|e| Error::Backend(format!("lookup attesting identity_type: {e}")))?
-            .ok_or_else(|| {
-                Error::InvalidArgument(format!(
-                    "attesting_key_id {} does not exist in federation_keys",
-                    input.attesting_key_id
-                ))
-            })?
-        };
-        let dim = input.dimension();
-        crate::federation::admission::DimensionAdmissionPolicy::default().check(
-            &input.attestation_type,
-            dim,
-            &identity_type,
-        )?;
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("attach_attestation_pqc_signature: {e}"))
+            })?;
+        if n == 0 {
+            return Err(crate::federation::Error::Conflict(
+                "federation_attestations row was concurrently completed".to_string(),
+            ));
+        }
+        // v31.0.0 (CIRISPersist#657) — the hybrid-completion write moves THREE
+        // serialized columns of the attestation (`scrub_signature_pqc`,
+        // `pqc_completed_at`, `persist_row_hash`), so it moves the wire content
+        // hash exactly as the key-plane twin above does. #547 fixed the key
+        // site and #640 made that remedy shared; this site was never redirected
+        // through it, so a federation-tier attestation that completed its PQC
+        // leg kept serving the PRE-completion hash out of `signed_wire_index` —
+        // the point-read advertises one digest and the read surface returns
+        // another. Indexed from the row AS STORED (the shared helper re-reads),
+        // which is what makes the index agree with the read surface on a
+        // backend that rounds `pqc_completed_at`.
+        self.index_stored_record(
+            "Attestation",
+            &crate::federation::wire_index::record_key(&[("attestation_id", &attestation_id)]),
+        )
+        .await?;
+        Ok(())
+    }
 
-        // Build the local row + its persist_row_hash. A durable row defers
-        // its signature (empty-sentinel scrub envelope); a TRANSIT revocation
-        // carries the caller's verified bound-hybrid signature + computed hash.
-        // v18.0.0 (#473) — caller-supplied deterministic id (replay-idempotent
-        // trace ingest) or the classic fresh v4.
-        let attestation_id = input
-            .attestation_id
-            .clone()
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-        // v31.0.0 (CIRISPersist#598) — the row instant comes from the SIGNED
-        // envelope when it carries one (see `admission::local_row_instant`), so
-        // a `consent:state:*` row staged at the local tier can still satisfy
-        // the instant binding at the promote door.
-        let now =
-            crate::federation::admission::local_row_instant(&envelope_value, chrono::Utc::now())?;
-        let attesting_key_id = input.attesting_key_id.clone();
-        let caller_signed = transit.is_some();
-        let mut row = match transit {
-            Some((hash, sig_classical, sig_pqc)) => input.into_caller_signed_row(
-                attestation_id.clone(),
-                now,
-                hash,
-                sig_classical,
-                sig_pqc,
-            ),
-            None => input.into_local_row(attestation_id.clone(), now),
-        };
-        // v31.0.0 (CIRISPersist#660) — THE BAKED GENESIS IDS ARE RESERVED AT
-        // THIS DOOR TOO. See the memory backend's local door for why this one
-        // cannot defer to the promote gate the way `check_reserved_prefix_admission`
-        // does: the harm is the PRIMARY KEY, and a local-tier row already holds it.
-        crate::federation::genesis::check_genesis_attestation_reserved(&row)?;
-        // v31.0.0 (CIRISPersist#649) — STAMP THE MIRROR AT THE LOCAL DOOR.
-        // See `crate::federation::envelope::RowMirror::stamp_local_row` for the
-        // decision and the transit exclusion. One helper, all three backends.
-        crate::federation::envelope::RowMirror::stamp_local_row(&mut row, caller_signed)?;
-        // v31.0.0 (CIRISPersist#653) — SIZE THE ROW AS IT WILL BE STORED. The early call above
-        // measured the PRODUCER's envelope; this one measures the bytes that
-        // actually land, which the #643 mirror and the #598 instants just grew
-        // by ~250. Without it a row in that window is admitted here and refused
-        // by the SAME function at the federation door on promotion or
-        // replication — locally Ok, globally unreplicable. Both calls stay: the
-        // early one is the cheap pre-filter that keeps hostile input away from
-        // the directory reads below it, this one is authoritative. See
-        // `check_envelope_size_admission` for why producers do not reserve
-        // headroom instead.
-        crate::federation::admission::check_envelope_size_admission(&row.attestation_envelope)?;
-        // v31.0.0 (CIRISPersist#598) — the same binding the federation door
-        // asks, asked at the local door too: a `consent:state:*` row that
-        // cannot state its own signed instant is refused where it is written,
-        // not where it is promoted.
-        crate::federation::admission::check_instant_binding(
-            &row,
-            chrono::Utc::now(),
-            crate::federation::admission::DEFAULT_MAX_TOUCH_SKEW,
-        )?;
-        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
-
+    async fn store_planned_local_attestation(
+        &self,
+        planned: crate::federation::attestation_admit::PlannedLocalAttestation,
+    ) -> Result<(), crate::federation::Error> {
+        use crate::federation::Error;
+        let crate::federation::attestation_admit::PlannedLocalAttestation {
+            row,
+            dimension,
+            replace,
+            withdraws_depth,
+        } = planned;
+        let attesting_key_id = row.attesting_key_id.clone();
         let envelope_text = serde_json::to_string(&row.attestation_envelope)
             .map_err(|e| Error::Backend(format!("envelope serialize: {e}")))?;
         let subject_key_ids_json = serde_json::to_string(&row.subject_key_ids)
@@ -23561,10 +22051,7 @@ impl SqliteBackend {
         // v50.0.0 (review H2, final check, 3d) — a local-tier `withdraws`
         // becomes a federation row in place at `enter_mesh`; its depth is
         // recorded now, in the same transaction.
-        let withdraws_depth: Option<i64> =
-            (row.attestation_type == crate::federation::types::attestation_type::WITHDRAWS).then(
-                || crate::federation::FederationDirectory::withdraws_delegation_depth(self) as i64,
-            );
+        let withdraws_depth: Option<i64> = withdraws_depth.map(|d| d as i64);
         self.write(move |conn| -> Result<(), rusqlite::Error> {
             let tx = conn.transaction()?;
             if replace {
@@ -23671,9 +22158,324 @@ impl SqliteBackend {
                 Error::Backend(format!("insert local attestation: {msg}"))
             }
         })?;
-        Ok(attestation_id)
+        Ok(())
+    }
+
+    async fn store_planned_reseal(
+        &self,
+        planned: crate::federation::attestation_admit::PlannedReseal,
+    ) -> Result<bool, crate::federation::Error> {
+        use crate::federation::Error;
+        #[cfg(test)]
+        self.test_hooks()
+            .pause_if_armed("reseal_before_write")
+            .await;
+        let id = planned.attestation_id().to_owned();
+        let sealed = self
+            .write(move |conn| -> Result<Option<crate::federation::Attestation>, Error> {
+                let db = |e: rusqlite::Error| Error::Backend(format!("reseal_attestation_v31: {e}"));
+                let tx = conn.transaction().map_err(db)?;
+                // The row as it is NOW, inside the transaction that writes it.
+                let found = tx
+                    .query_row(
+                        "SELECT attestation_id, attesting_key_id, attested_key_id, attestation_type, \
+                            weight, asserted_at, expires_at, attestation_envelope, \
+                            original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
+                            scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, \
+                            subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at, additional_scrubs \
+                         FROM federation_attestations WHERE attestation_id = ?1",
+                        [&id],
+                        sqlite_row_to_attestation,
+                    )
+                    .optional()
+                    .map_err(db)?;
+                let Some(found) = found else {
+                    return Ok(None);
+                };
+                let row = planned.sealed_over(&found)?;
+                let envelope_text = serde_json::to_string(&row.attestation_envelope)
+                    .map_err(|e| Error::Backend(format!("envelope serialize: {e}")))?;
+                let och: Vec<u8> = hex::decode(&row.original_content_hash)
+                    .map_err(|e| Error::InvalidArgument(format!("original_content_hash hex: {e}")))?;
+                let scrubs_json = serde_json::to_string(&row.additional_scrubs)
+                    .map_err(|e| Error::Backend(format!("scrubs serialize: {e}")))?;
+                // v36.0.0 (#668/#707-class) — a re-seal rewrites the served
+                // bytes; the serve position moves with them.
+                let admitted_at =
+                    sqlite_next_plane_position(&tx, "federation_attestations", POS_ATTESTATION)
+                        .map_err(db)?;
+                let asserted = row.asserted_at.to_rfc3339();
+                tx.execute(
+                    "UPDATE federation_attestations \
+                 SET attestation_envelope = ?2, original_content_hash = ?3, \
+                     scrub_signature_classical = ?4, scrub_signature_pqc = ?5, \
+                     scrub_key_id = ?6, scrub_timestamp = ?7, pqc_completed_at = ?8, \
+                     additional_scrubs = ?9, asserted_at = ?10, expires_at = ?11, \
+                     persist_row_hash = ?12, admitted_at = ?13 \
+                 WHERE attestation_id = ?1",
+                    rusqlite::params![
+                        row.attestation_id,
+                        envelope_text,
+                        och,
+                        row.scrub_signature_classical,
+                        row.scrub_signature_pqc,
+                        row.scrub_key_id,
+                        row.scrub_timestamp.to_rfc3339(),
+                        row.pqc_completed_at.map(|t| t.to_rfc3339()),
+                        scrubs_json,
+                        asserted,
+                        row.expires_at.map(|t| t.to_rfc3339()),
+                        row.persist_row_hash,
+                        admitted_at.to_rfc3339(),
+                    ],
+                )
+                .map_err(db)?;
+                // The V106 projection carries `asserted_at`, which the instant
+                // truncation may have moved. Same transaction.
+                tx.execute(
+                    "UPDATE attestation_subjects SET asserted_at = ?2 WHERE attestation_id = ?1",
+                    rusqlite::params![row.attestation_id, asserted],
+                )
+                .map_err(db)?;
+                tx.commit().map_err(db)?;
+                Ok(Some(row))
+            })
+            .await?;
+        let Some(row) = sealed else {
+            return Ok(false);
+        };
+        // The wire index moves WITH the row (#610): the re-seal recomputes
+        // `persist_row_hash`, so without re-indexing the row advertises a hash
+        // the index does not hold.
+        if row.tier == crate::federation::types::attestation_tier::FEDERATION {
+            self.index_stored_record(
+                "Attestation",
+                &crate::federation::wire_index::record_key(&[(
+                    "attestation_id",
+                    &row.attestation_id,
+                )]),
+            )
+            .await?;
+        }
+        Ok(true)
+    }
+
+    async fn delete_attestation(
+        &self,
+        attestation_id: &str,
+        only_if_hash: Option<&str>,
+    ) -> Result<bool, crate::federation::Error> {
+        let id = attestation_id.to_owned();
+        let expected = only_if_hash.map(str::to_owned);
+        // `attestation_subjects` follows via `ON DELETE CASCADE` (V106). The
+        // re-bake's compare-and-delete is ONE statement (#665 review).
+        let n = self
+            .write(move |conn| -> Result<usize, rusqlite::Error> {
+                match expected {
+                    None => conn.execute(
+                        "DELETE FROM federation_attestations WHERE attestation_id = ?1",
+                        rusqlite::params![id],
+                    ),
+                    Some(h) => conn.execute(
+                        "DELETE FROM federation_attestations \
+                         WHERE attestation_id = ?1 AND persist_row_hash = ?2",
+                        rusqlite::params![id, h],
+                    ),
+                }
+            })
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("delete_attestation: {e}")))?;
+        Ok(n > 0)
+    }
+
+    async fn store_planned_attestation(
+        &self,
+        planned: crate::federation::attestation_admit::PlannedAttestation,
+    ) -> Result<crate::federation::attestation_admit::StoredAttestation, crate::federation::Error>
+    {
+        use crate::federation::attestation_admit::StoredAttestation;
+        let row = &planned.row;
+        let original_content_hash = hex::decode(&row.original_content_hash).map_err(|e| {
+            crate::federation::Error::InvalidArgument(format!(
+                "original_content_hash hex decode: {e}"
+            ))
+        })?;
+        let attestation_envelope_text = serde_json::to_string(&row.attestation_envelope)
+            .map_err(|e| crate::federation::Error::Backend(format!("envelope serialize: {e}")))?;
+        // v3.7.0 (CIRISPersist#146, CEG 0.6) — subject_key_ids as canonical
+        // JSON TEXT, validated by the json1 CHECK on the column.
+        let subject_key_ids_json = serde_json::to_string(&row.subject_key_ids).map_err(|e| {
+            crate::federation::Error::Backend(format!("subject_key_ids serialize: {e}"))
+        })?;
+        // v24.0.0 (CIRISPersist#556) — the V113 `additional_scrubs` JSON-array
+        // TEXT column. Empty vec → "[]".
+        let additional_scrubs_json =
+            serde_json::to_string(&row.additional_scrubs).map_err(|e| {
+                crate::federation::Error::Backend(format!("additional_scrubs serialize: {e}"))
+            })?;
+        let withdraws_admission_rule: Option<i64> = row.withdraws_admission_rule.map(|v| v as i64);
+        let withdraws_depth: Option<i64> = planned.withdraws_depth.map(|d| d as i64);
+        // v54.0.0 (Codex on PR #1050) — THE CYCLE CHECK AND THE INSERT ARE ONE
+        // STEP. The plan read the graph unlocked; a concurrent writer of the
+        // reverse edge could have passed the same read since. Hold the
+        // delegation write lock from the re-ask through the write, so every
+        // gated writer is serialized against it. One process owns this store,
+        // so the in-process lock is the whole serialization.
+        let _cycle_guard = if planned.cycle_gated() {
+            let guard = self.delegation_write_lock.lock().await;
+            planned.recheck_cycle_under_lock(self).await?;
+            #[cfg(test)]
+            self.test_hooks()
+                .pause_if_armed("delegation_cycle_before_insert")
+                .await;
+            Some(guard)
+        } else {
+            None
+        };
+        let crate::federation::attestation_admit::PlannedAttestation {
+            row,
+            projected_trace,
+            wire_index_key,
+            ..
+        } = planned;
+        let id_for_compare = row.attestation_id.clone();
+        // v38.5.0 (#771) — ABSORB, then RE-READ: `OR IGNORE` makes a
+        // re-delivered row stop raising a UNIQUE violation, and the plan's
+        // caller resolves the zero-row result against the STORED hash.
+        let inserted = self
+            .write(move |conn| -> Result<bool, rusqlite::Error> {
+                // v50.0.0 (review H2, final check) — ONE transaction for the
+                // row, its projections and its admission depth.
+                let tx = conn.transaction()?;
+                // v36.0.0 (#668) — THIS node's serve position (V130).
+                let admitted_at =
+                    sqlite_next_plane_position(&tx, "federation_attestations", POS_ATTESTATION)?;
+                tx.execute(
+                    "INSERT OR IGNORE INTO federation_attestations (\
+                        attestation_id, attesting_key_id, attested_key_id, attestation_type, \
+                        weight, asserted_at, expires_at, attestation_envelope, \
+                        original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
+                        scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, \
+                        subject_key_ids, withdraws_admission_rule, cohort_scope, \
+                        tier, promoted_at, additional_scrubs, admitted_at\
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
+                    rusqlite::params![
+                        row.attestation_id,
+                        row.attesting_key_id,
+                        row.attested_key_id,
+                        row.attestation_type,
+                        row.weight,
+                        row.asserted_at.to_rfc3339(),
+                        row.expires_at.map(|t| t.to_rfc3339()),
+                        attestation_envelope_text,
+                        original_content_hash,
+                        row.scrub_signature_classical,
+                        row.scrub_signature_pqc,
+                        row.scrub_key_id,
+                        row.scrub_timestamp.to_rfc3339(),
+                        row.pqc_completed_at.map(|t| t.to_rfc3339()),
+                        row.persist_row_hash,
+                        subject_key_ids_json,
+                        withdraws_admission_rule,
+                        row.cohort_scope,
+                        // v22.0.0 (CIRISPersist#543 / AV-78) — BIND THE TIER: the
+                        // schema DEFAULT 'federation' silently overrode every
+                        // Tier::Local row when this was omitted.
+                        row.tier,
+                        row.promoted_at.map(|t| t.to_rfc3339()),
+                        // v24.0.0 (CIRISPersist#556) — the co-signature set rides
+                        // the SAME write as the base scrub.
+                        additional_scrubs_json,
+                        admitted_at.to_rfc3339(),
+                    ],
+                )?;
+                // v38.5.0 (#771) — zero rows means the id was already
+                // occupied: the projections were derived from these bytes when
+                // the row first landed.
+                if tx.changes() == 0 {
+                    return Ok(false);
+                }
+                // v17.4.0 (V106) — the subject projection.
+                sqlite_project_attestation_subjects(
+                    &tx,
+                    &row,
+                    crate::federation::types::attestation_tier::FEDERATION,
+                )?;
+                // v21.0.0 (CIRISPersist#502 E7) — the consent_peer_set
+                // projection, in the SAME locked scope as the insert.
+                sqlite_project_consent_peer_set(&tx, &row)?;
+                // v45.0.0 (CIRISPersist#871, FSD §5) — the V149
+                // `blob_renditions` projection, in the SAME locked scope.
+                sqlite_project_rendition_row(&tx, &row)?;
+                if let Some(depth) = withdraws_depth {
+                    tx.execute(
+                        "INSERT OR REPLACE INTO federation_withdraws_admission_depths \
+                         (attestation_id, depth) VALUES (?1, ?2)",
+                        rusqlite::params![row.attestation_id, depth],
+                    )?;
+                }
+                tx.commit()?;
+                Ok(true)
+            })
+            .await
+            .map_err(|e| {
+                let msg = e.to_string();
+                if msg.contains("FOREIGN KEY") {
+                    crate::federation::Error::InvalidArgument(format!(
+                        "FK constraint violated on attestation insert: {msg}"
+                    ))
+                } else {
+                    crate::federation::Error::Backend(format!("insert attestation: {msg}"))
+                }
+            })?;
+
+        if !inserted {
+            let stored = self
+                .read(move |conn| {
+                    conn.query_row(
+                        "SELECT persist_row_hash FROM federation_attestations \
+                         WHERE attestation_id = ?1",
+                        rusqlite::params![id_for_compare],
+                        |r| r.get::<_, String>(0),
+                    )
+                    .optional()
+                })
+                .await
+                .map_err(|e| {
+                    crate::federation::Error::Backend(format!("re-read attestation: {e}"))
+                })?;
+            return Ok(StoredAttestation::Occupied {
+                stored_persist_row_hash: stored,
+            });
+        }
+        if let Some(wire_index_key) = &wire_index_key {
+            self.index_stored_record("Attestation", wire_index_key)
+                .await?;
+        }
+        // v21.0.0 (CIRISPersist#501) — INBOUND trace projection: a replicated
+        // `trace:complete:v1` attestation materializes its `trace_events` rows
+        // (the SAME decompose the ingest path uses). Idempotent.
+        if let Some(decomposed) = projected_trace {
+            if !decomposed.events.is_empty() {
+                self.insert_trace_events_batch(&decomposed.events)
+                    .await
+                    .map_err(|e| {
+                        crate::federation::Error::Backend(format!("trace projection: {e}"))
+                    })?;
+            }
+            if !decomposed.llm_calls.is_empty() {
+                self.insert_trace_llm_calls_batch(&decomposed.llm_calls)
+                    .await
+                    .map_err(|e| {
+                        crate::federation::Error::Backend(format!("trace llm projection: {e}"))
+                    })?;
+            }
+        }
+        Ok(StoredAttestation::Inserted)
     }
 }
+
+impl SqliteBackend {}
 
 /// v17.4.0 — the `fa.`-aliased `federation_attestations` column list for the
 /// `scores` read handles (JOINed to `attestation_subjects s`). Column NAMES
@@ -24088,70 +22890,6 @@ fn sqlite_attestations_referencing_sql() -> String {
            AND attestation_type IN (?2, ?3, ?4) \
            AND json_extract(attestation_envelope, '$.references_attestation_id') = ?1 \
          ORDER BY asserted_at DESC"
-    )
-}
-
-/// v53.1.7 — `list_attestations_for_type`'s statement (`?1` attested, `?2`
-/// type), spelled once so I546's plan check reads the statement the door runs.
-///
-/// `ORDER BY +asserted_at`, as on [`sqlite_attestations_by_type_sql`]: without
-/// the pin the planner takes `federation_attestations_attested
-/// (attested_key_id, asserted_at DESC)` to skip the sort and walks every row
-/// about the subject to test its type; pinned, V178's `(attested_key_id,
-/// attestation_type, …)` seeks both equalities.
-fn sqlite_attestations_for_type_sql() -> String {
-    format!(
-        "SELECT {SQLITE_ATTESTATION_COLUMNS} FROM federation_attestations \
-         WHERE attested_key_id = ?1 AND attestation_type = ?2 AND tier = 'federation' \
-         ORDER BY +asserted_at DESC"
-    )
-}
-
-/// v53.1.6 — `list_attestations_by_type`'s statement (`?1` attester, `?2`
-/// type), spelled once so I545's plan check reads the statement the door runs.
-///
-/// `ORDER BY +asserted_at` is the documented unary-plus pin (a no-op on the
-/// value and its collation): without it the planner, with no `sqlite_stat1`,
-/// takes `federation_attestations_attesting (attesting_key_id, asserted_at
-/// DESC)` to skip the sort — and so visits EVERY row the attester authored
-/// to test its type, the very walk this read replaces. With the order term
-/// pinned off that index, V107's `composer_ref` seeks on both equalities and
-/// the handful of edges is sorted in a temp b-tree.
-fn sqlite_attestations_by_type_sql() -> String {
-    format!(
-        "SELECT {SQLITE_ATTESTATION_COLUMNS} FROM federation_attestations \
-         WHERE attesting_key_id = ?1 AND attestation_type = ?2 AND tier = 'federation' \
-         ORDER BY +asserted_at DESC"
-    )
-}
-
-/// v53.1.7 — `list_attestations_for_types` / `_by_types`'s statement over
-/// `key_column` (`attested_key_id` or `attesting_key_id`): `?1` the key, then
-/// `n_types` type binds, then `n_excluded` dimension binds. Spelled once so
-/// I547's plan check reads the statement the doors run. `+asserted_at` for
-/// the reason on [`sqlite_attestations_by_type_sql`]: V178 / V107 seek the
-/// (key, type) prefix; the key's `asserted_at`-ordered index would walk its
-/// whole slice. V106's generated `dimension` is the envelope's top-level
-/// `dimension` (`json_extract`, so a non-string value never equals a bound
-/// string); `NULL` is kept.
-fn sqlite_attestations_typed_sql(key_column: &str, n_types: usize, n_excluded: usize) -> String {
-    let types: Vec<String> = (0..n_types).map(|i| format!("?{}", i + 2)).collect();
-    let excluded: Vec<String> = (0..n_excluded)
-        .map(|i| format!("?{}", i + 2 + n_types))
-        .collect();
-    let dimension_sql = if excluded.is_empty() {
-        String::new()
-    } else {
-        format!(
-            " AND (dimension IS NULL OR dimension NOT IN ({}))",
-            excluded.join(", ")
-        )
-    };
-    format!(
-        "SELECT {SQLITE_ATTESTATION_COLUMNS} FROM federation_attestations \
-         WHERE {key_column} = ?1 AND attestation_type IN ({}) AND tier = 'federation'{dimension_sql} \
-         ORDER BY +asserted_at DESC",
-        types.join(", ")
     )
 }
 
@@ -32077,7 +30815,7 @@ mod tests {
             .await
             .unwrap();
 
-        let got = crate::federation::FederationDirectory::list_attestations_for(&backend, "host-a")
+        let got = crate::federation::attestation_query::test_support::AllAttestations::all_attestations_for(&backend, "host-a")
             .await
             .unwrap()
             .into_iter()
@@ -32402,9 +31140,11 @@ mod tests {
     async fn escalation_on_silence_parity_sqlite_591() {
         let backend = SqliteBackend::open_in_memory().await.unwrap();
         backend.run_migrations().await.unwrap();
-        crate::federation::reverse_quorum::test_support::exercise_escalation_on_silence(
-            &backend,
-            "sqlite-esc",
+        Box::pin(
+            crate::federation::reverse_quorum::test_support::exercise_escalation_on_silence(
+                &backend,
+                "sqlite-esc",
+            ),
         )
         .await;
     }
@@ -34792,13 +33532,13 @@ mod tests {
         assert_eq!(key1.persist_row_hash, key2.persist_row_hash);
 
         let att1 =
-            crate::federation::FederationDirectory::list_attestations_for(&backend, "k-target")
+            crate::federation::attestation_query::test_support::AllAttestations::all_attestations_for(&backend, "k-target")
                 .await
                 .unwrap();
         assert_eq!(att1.len(), 1);
         assert_eq!(att1[0].persist_row_hash.len(), 64);
         let att2 =
-            crate::federation::FederationDirectory::list_attestations_for(&backend, "k-target")
+            crate::federation::attestation_query::test_support::AllAttestations::all_attestations_for(&backend, "k-target")
                 .await
                 .unwrap();
         assert_eq!(att1[0].persist_row_hash, att2[0].persist_row_hash);
@@ -34812,6 +33552,7 @@ mod tests {
 
     #[tokio::test]
     async fn federation_attestation_round_trip() {
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
         let backend = SqliteBackend::open_in_memory().await.unwrap();
         backend.run_migrations().await.unwrap();
         // Bootstrap two keys first (FK requirement).
@@ -34840,11 +33581,11 @@ mod tests {
             .unwrap();
 
         let by = backend
-            .list_attestations_by("registry-steward")
+            .all_attestations_by("registry-steward")
             .await
             .unwrap();
         assert_eq!(by.len(), 1);
-        let for_a = crate::federation::FederationDirectory::list_attestations_for(&backend, "k-a")
+        let for_a = crate::federation::attestation_query::test_support::AllAttestations::all_attestations_for(&backend, "k-a")
             .await
             .unwrap();
         assert_eq!(for_a.len(), 1);
@@ -42044,7 +40785,7 @@ mod tests {
         ));
         // No row leaked through.
         assert!(
-            crate::federation::FederationDirectory::list_attestations_for(&backend, "k-a")
+            crate::federation::attestation_query::test_support::AllAttestations::all_attestations_for(&backend, "k-a")
                 .await
                 .unwrap()
                 .is_empty()
@@ -42089,7 +40830,7 @@ mod tests {
             .put_attestation(SignedAttestation { attestation: att })
             .await
             .unwrap();
-        let rows = crate::federation::FederationDirectory::list_attestations_for(&backend, "k-a")
+        let rows = crate::federation::attestation_query::test_support::AllAttestations::all_attestations_for(&backend, "k-a")
             .await
             .unwrap();
         assert_eq!(rows.len(), 1);
@@ -42166,7 +40907,7 @@ mod tests {
         }
         // Rejected before INSERT — no row leaked through.
         assert!(
-            crate::federation::FederationDirectory::list_attestations_for(&backend, "k-a")
+            crate::federation::attestation_query::test_support::AllAttestations::all_attestations_for(&backend, "k-a")
                 .await
                 .unwrap()
                 .is_empty()
@@ -42198,7 +40939,7 @@ mod tests {
             .put_attestation(SignedAttestation { attestation: att })
             .await
             .unwrap();
-        let rows = crate::federation::FederationDirectory::list_attestations_for(&backend, "k-a")
+        let rows = crate::federation::attestation_query::test_support::AllAttestations::all_attestations_for(&backend, "k-a")
             .await
             .unwrap();
         assert_eq!(rows.len(), 1);
@@ -42336,7 +41077,7 @@ mod tests {
             "local row carries the deferred empty-sentinel signature"
         );
         // AV-59: the FederationDirectory trust-read does NOT surface local.
-        let trust = crate::federation::FederationDirectory::list_attestations_for(&backend, "occ")
+        let trust = crate::federation::attestation_query::test_support::AllAttestations::all_attestations_for(&backend, "occ")
             .await
             .unwrap();
         assert!(
@@ -43847,7 +42588,7 @@ mod tests {
             .put_attestation(SignedAttestation { attestation: att })
             .await
             .unwrap();
-        let rows = crate::federation::FederationDirectory::list_attestations_for(&backend, "k-a")
+        let rows = crate::federation::attestation_query::test_support::AllAttestations::all_attestations_for(&backend, "k-a")
             .await
             .unwrap();
         assert_eq!(rows.len(), 1);
@@ -43937,7 +42678,7 @@ mod tests {
             .put_attestation(SignedAttestation { attestation: att })
             .await
             .unwrap();
-        let rows = crate::federation::FederationDirectory::list_attestations_for(&backend, "k-a")
+        let rows = crate::federation::attestation_query::test_support::AllAttestations::all_attestations_for(&backend, "k-a")
             .await
             .unwrap();
         assert_eq!(rows.len(), 1);
@@ -44057,7 +42798,7 @@ mod tests {
             .put_attestation(SignedAttestation { attestation: att })
             .await
             .unwrap();
-        let rows = crate::federation::FederationDirectory::list_attestations_for(&backend, "k-a")
+        let rows = crate::federation::attestation_query::test_support::AllAttestations::all_attestations_for(&backend, "k-a")
             .await
             .unwrap();
         assert_eq!(rows.len(), 1);
@@ -44097,7 +42838,7 @@ mod tests {
             .put_attestation(SignedAttestation { attestation: att })
             .await
             .unwrap();
-        let rows = crate::federation::FederationDirectory::list_attestations_for(&backend, "k-a")
+        let rows = crate::federation::attestation_query::test_support::AllAttestations::all_attestations_for(&backend, "k-a")
             .await
             .unwrap();
         assert_eq!(rows.len(), 1);
@@ -44189,7 +42930,7 @@ mod tests {
             .put_attestation(SignedAttestation { attestation: w2 })
             .await
             .unwrap();
-        let rows = crate::federation::FederationDirectory::list_attestations_for(
+        let rows = crate::federation::attestation_query::test_support::AllAttestations::all_attestations_for(
             &backend,
             "registry-steward",
         )
@@ -44211,6 +42952,7 @@ mod tests {
 
     #[tokio::test]
     async fn sqlite_put_attestation_structural_dedup_distinguishes_distinct_triples() {
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
         let backend = SqliteBackend::open_in_memory().await.unwrap();
         backend.run_migrations().await.unwrap();
         for k in ["registry-steward", "k-a", "agent-2"] {
@@ -44259,7 +43001,7 @@ mod tests {
                 .unwrap();
         }
         let by_steward = backend
-            .list_attestations_by("registry-steward")
+            .all_attestations_by("registry-steward")
             .await
             .unwrap();
         let composers: Vec<_> = by_steward
@@ -44272,12 +43014,13 @@ mod tests {
             })
             .collect();
         assert_eq!(composers.len(), 3, "expected three distinct triples");
-        let by_agent = backend.list_attestations_by("agent-2").await.unwrap();
+        let by_agent = backend.all_attestations_by("agent-2").await.unwrap();
         assert_eq!(by_agent.len(), 1);
     }
 
     #[tokio::test]
     async fn sqlite_precedence_recants_wins_over_withdraws() {
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
         // CEG §6.1 — `recants` outranks `withdraws` regardless of
         // signed_at. Verified by composing the precedence_winner
         // helper over the same-attester chain.
@@ -44322,7 +43065,7 @@ mod tests {
             .await
             .unwrap();
         let all = backend
-            .list_attestations_by("registry-steward")
+            .all_attestations_by("registry-steward")
             .await
             .unwrap();
         let group: Vec<_> = all
@@ -46761,6 +45504,31 @@ mod tests {
     }
 
     /// `EXPLAIN QUERY PLAN` detail lines for `sql`, in plan order.
+    /// v56.0.0 (CIRISPersist#1001) — the plan of a typed query's one
+    /// statement, as the backend runs it.
+    async fn typed_query_plan(
+        backend: &SqliteBackend,
+        q: &crate::federation::attestation_query::AttestationQuery,
+    ) -> Vec<String> {
+        use crate::federation::attestation_query::{render_sql, Bind, Dialect};
+        let stmt = render_sql(
+            q,
+            Dialect::Sqlite,
+            "federation_attestations",
+            SQLITE_ATTESTATION_COLUMNS,
+        );
+        let binds = stmt
+            .binds
+            .into_iter()
+            .map(|b| match b {
+                Bind::Text(t) => SqlValue::Text(t),
+                Bind::Time(t) => SqlValue::Text(t.to_rfc3339()),
+                Bind::Int(n) => SqlValue::Integer(n),
+            })
+            .collect();
+        sqlite_plan(backend, &stmt.sql, binds).await
+    }
+
     async fn sqlite_plan(backend: &SqliteBackend, sql: &str, binds: Vec<SqlValue>) -> Vec<String> {
         let sql = format!("EXPLAIN QUERY PLAN {sql}");
         backend
@@ -47011,7 +45779,8 @@ mod tests {
         assert_eq!(page.items.len(), 300, "the room reader sees every trace");
     }
 
-    /// I545 (sqlite) — `list_attestations_by_type`'s plan seeks V107's
+    /// I545 (sqlite) — the by-type read's plan (v56.0.0: the typed query
+    /// `by(K).types([delegates_to])`, CIRISPersist#1001) seeks V107's
     /// `federation_attestations_composer_ref` on BOTH equality terms
     /// (attester and type), so a steward's `delegates_to` edges are read
     /// without visiting the steward's other rows.
@@ -47019,13 +45788,13 @@ mod tests {
     async fn i545_by_type_seeks_the_composer_ref_prefix() {
         let backend = SqliteBackend::open_in_memory().await.unwrap();
         backend.run_migrations().await.unwrap();
-        let plan = sqlite_plan(
+        let plan = typed_query_plan(
             &backend,
-            &sqlite_attestations_by_type_sql(),
-            vec![
-                SqlValue::Text("steward".into()),
-                SqlValue::Text("delegates_to".into()),
-            ],
+            &crate::federation::attestation_query::AttestationQuery::by(
+                "steward",
+                std::num::NonZeroU32::MIN,
+            )
+            .types(&["delegates_to"]),
         )
         .await;
         eprintln!("I545 list_attestations_by_type plan: {plan:?}");
@@ -47103,20 +45872,21 @@ mod tests {
         );
     }
 
-    /// I546c (sqlite) — `list_attestations_for_type` seeks V178's
+    /// I546c (sqlite) — the for-type read (v56.0.0: the typed query
+    /// `to(K).types([delegates_to])`) seeks V178's
     /// `(attested_key_id, attestation_type, …)` on both equalities, never the
     /// subject's whole slice in `asserted_at` order.
     #[tokio::test]
     async fn i546c_for_type_seeks_the_attested_type_prefix() {
         let backend = SqliteBackend::open_in_memory().await.unwrap();
         backend.run_migrations().await.unwrap();
-        let plan = sqlite_plan(
+        let plan = typed_query_plan(
             &backend,
-            &sqlite_attestations_for_type_sql(),
-            vec![
-                SqlValue::Text("subject".into()),
-                SqlValue::Text("delegates_to".into()),
-            ],
+            &crate::federation::attestation_query::AttestationQuery::to(
+                "subject",
+                std::num::NonZeroU32::MIN,
+            )
+            .types(&["delegates_to"]),
         )
         .await;
         eprintln!("I546c list_attestations_for_type plan: {plan:?}");
@@ -47157,21 +45927,20 @@ mod tests {
                 "federation_attestations_attesting ",
             ),
         ] {
-            let plan = sqlite_plan(
-                &backend,
-                &sqlite_attestations_typed_sql(column, 2, 2),
-                [
+            let q = if column == "attested_key_id" {
+                crate::federation::attestation_query::AttestationQuery::to(
                     "key",
-                    "delegates_to",
-                    "supersedes",
-                    "trust:accepts:v1",
-                    "trust:confers:v1",
-                ]
-                .into_iter()
-                .map(|v| SqlValue::Text(v.into()))
-                .collect(),
-            )
-            .await;
+                    std::num::NonZeroU32::MIN,
+                )
+            } else {
+                crate::federation::attestation_query::AttestationQuery::by(
+                    "key",
+                    std::num::NonZeroU32::MIN,
+                )
+            }
+            .types(&["delegates_to", "supersedes"])
+            .excluding_dimensions(&["trust:accepts:v1", "trust:confers:v1"]);
+            let plan = typed_query_plan(&backend, &q).await;
             eprintln!("I547 typed read over {column}: {plan:?}");
             assert!(
                 plan.iter().any(|l| l.starts_with(&format!(
@@ -50278,7 +49047,7 @@ mod tests {
             .await
             .unwrap();
         let stored =
-            crate::federation::FederationDirectory::list_attestations_for(&backend, "node-key")
+            crate::federation::attestation_query::test_support::AllAttestations::all_attestations_for(&backend, "node-key")
                 .await
                 .unwrap();
         assert_eq!(stored.len(), 1);
@@ -50316,7 +49085,7 @@ mod tests {
         }
         assert_eq!(err.kind(), "federation_node_agency_forbidden");
         assert!(
-            crate::federation::FederationDirectory::list_attestations_for(&backend, "node-key")
+            crate::federation::attestation_query::test_support::AllAttestations::all_attestations_for(&backend, "node-key")
                 .await
                 .unwrap()
                 .is_empty()
@@ -50339,7 +49108,7 @@ mod tests {
             crate::federation::Error::NodeAgencyForbidden { .. }
         ));
         assert!(
-            crate::federation::FederationDirectory::list_attestations_for(&backend, "node-key")
+            crate::federation::attestation_query::test_support::AllAttestations::all_attestations_for(&backend, "node-key")
                 .await
                 .unwrap()
                 .is_empty()
@@ -50379,7 +49148,7 @@ mod tests {
             .await
             .unwrap();
         let stored =
-            crate::federation::FederationDirectory::list_attestations_for(&backend, "agent-key")
+            crate::federation::attestation_query::test_support::AllAttestations::all_attestations_for(&backend, "agent-key")
                 .await
                 .unwrap();
         assert_eq!(stored.len(), 1);
@@ -50428,7 +49197,7 @@ mod tests {
                 "{dup_ity}: dup/whitespace node token must still hit the gate, got {err:?}"
             );
             assert!(
-                crate::federation::FederationDirectory::list_attestations_for(&backend, key_id)
+                crate::federation::attestation_query::test_support::AllAttestations::all_attestations_for(&backend, key_id)
                     .await
                     .unwrap()
                     .is_empty()
@@ -50505,7 +49274,7 @@ mod tests {
             );
         // Verify-before-mutation: the refusal leaves NO trace.
         let stored =
-            crate::federation::FederationDirectory::list_attestations_for(&backend, "node-agent")
+            crate::federation::attestation_query::test_support::AllAttestations::all_attestations_for(&backend, "node-agent")
                 .await
                 .unwrap();
         assert!(
@@ -50734,7 +49503,7 @@ mod tests {
         );
         assert_eq!(err.kind(), "federation_community_no_moderator");
         assert!(
-            crate::federation::FederationDirectory::list_attestations_for(&backend, "nm-no")
+            crate::federation::attestation_query::test_support::AllAttestations::all_attestations_for(&backend, "nm-no")
                 .await
                 .unwrap()
                 .is_empty()
@@ -50748,7 +49517,7 @@ mod tests {
             .await
             .expect("moderatored community continues to federate");
         assert_eq!(
-            crate::federation::FederationDirectory::list_attestations_for(&backend, "nm-ok")
+            crate::federation::attestation_query::test_support::AllAttestations::all_attestations_for(&backend, "nm-ok")
                 .await
                 .unwrap()
                 .len(),
@@ -56180,6 +54949,28 @@ INSERT INTO transport_destinations (occurrence_key_id, transport_kind, destinati
     /// #443 — the authenticated route apply + signed tombstone matrix (real
     /// hybrid crypto) on sqlite. Shares the assertion body with the memory +
     /// pg parity tests.
+    /// v56.0.0 (#1078) — the transit KEX resolver matrix (I1017–I1022);
+    /// shares its body with the other two backends.
+    #[tokio::test]
+    async fn transit_kex_resolver_matrix_sqlite() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::self_at_login::test_support::run_transit_kex_resolver_matrix(
+            &backend, "sqlite",
+        )
+        .await;
+    }
+
+    /// v56.0.0 (#1077) — the transit KEX matrix (I1011/I1012/I1014/I1015/
+    /// I1016) on sqlite; shares its body with memory + pg.
+    #[tokio::test]
+    async fn transit_kex_matrix_sqlite() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::self_at_login::test_support::run_transit_kex_matrix(&backend, "sqlite")
+            .await;
+    }
+
     #[tokio::test]
     async fn signed_transport_route_matrix_sqlite() {
         let backend = SqliteBackend::open_in_memory().await.unwrap();

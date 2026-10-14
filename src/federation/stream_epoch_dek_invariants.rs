@@ -110,7 +110,8 @@ pub(crate) mod bodies {
         b: &B,
         signer: &str,
     ) -> Vec<crate::federation::Attestation> {
-        b.list_attestations_by(signer)
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
+        b.all_attestations_by(signer)
             .await
             .unwrap()
             .into_iter()

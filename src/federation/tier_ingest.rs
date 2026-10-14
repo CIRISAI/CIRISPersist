@@ -4870,6 +4870,7 @@ mod tests {
     /// backend too (it runs there in production), not only the engine-wrapped
     /// sqlite + postgres backends.
     async fn run_tier_ingest_matrix(dir: &dyn FederationDirectory, tag: &str) {
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
         let attester = format!("ti-attester-{tag}");
         let attested = format!("ti-attested-{tag}");
         register_hybrid_key(dir, &attester).await;
@@ -4886,7 +4887,7 @@ mod tests {
         dir.put_attestation(SignedAttestation { attestation: a })
             .await
             .expect("(a) valid hybrid federation-tier row must be admitted");
-        let by = dir.list_attestations_by(&attester).await.expect("list");
+        let by = dir.all_attestations_by(&attester).await.expect("list");
         assert!(
             by.iter().any(|r| r.attestation_id == a_id),
             "(a) admitted row must be readable"

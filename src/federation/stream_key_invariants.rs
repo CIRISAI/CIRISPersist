@@ -147,6 +147,7 @@ pub(crate) mod bodies {
     ) where
         B: BlobStorage + FederationDirectory + Sync + 'static,
     {
+        use crate::federation::attestation_query::test_support::AllAttestations as _;
         let p = pair(dsn_a, dsn_b, run, pick, "i310").await;
         let stream = format!("i310-{run}");
         let plain = write_self(&p.a, &p.owner, &stream, n).await;
@@ -182,7 +183,7 @@ pub(crate) mod bodies {
         want.sort_unstable();
         assert_eq!(recipients, want, "I310: exactly R = 2 stream wraps");
         let sets: Vec<_> =
-            p.sa.list_attestations_by(&p.key_a)
+            p.sa.all_attestations_by(&p.key_a)
                 .await
                 .unwrap()
                 .into_iter()

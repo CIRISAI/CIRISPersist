@@ -40,6 +40,7 @@
 
 use std::collections::{BTreeSet, HashSet};
 
+use super::attestation_query::{AttestationQuery, FOLD_PAGE};
 use super::consent_grammar::{parse_grant_payload, CohortEntry, GRANT_DIMENSION};
 use super::types::cohort_scope as cs;
 use super::types::device_class;
@@ -164,9 +165,13 @@ impl OwnerAllowLists {
     where
         D: FederationDirectory + ?Sized,
     {
-        let grants = dir
-            .list_attestations_by_dimension_prefix(owner, GRANT_DIMENSION)
-            .await?;
+        let mut grants = Vec::new();
+        let mut pages = AttestationQuery::by(owner, FOLD_PAGE)
+            .dimension_prefix(GRANT_DIMENSION)
+            .pages();
+        while let Some(page) = pages.next(dir).await? {
+            grants.extend(page);
+        }
         let ids: Vec<String> = grants.iter().map(|g| g.attestation_id.clone()).collect();
         let retired: HashSet<String> = if ids.is_empty() {
             HashSet::new()
@@ -521,13 +526,14 @@ where
     // a composer that retires a row about the group is itself attested to
     // the group, its entitlement is decided against the target row alone,
     // and the §6.1 winner is chosen among the composers naming that target.
-    let candidates: Vec<Attestation> = dir
-        .list_attestations_for_dimension_prefix(
-            group,
-            None,
-            super::trust_root::TRUST_CHARTER_DIMENSION,
-        )
-        .await?
+    let mut charters = Vec::new();
+    let mut pages = AttestationQuery::to(group, FOLD_PAGE)
+        .dimension_prefix(super::trust_root::TRUST_CHARTER_DIMENSION)
+        .pages();
+    while let Some(page) = pages.next(dir).await? {
+        charters.extend(page);
+    }
+    let candidates: Vec<Attestation> = charters
         .into_iter()
         .filter(|a| {
             a.attestation_type == super::types::attestation_type::DELEGATES_TO

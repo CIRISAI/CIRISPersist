@@ -303,6 +303,18 @@ impl FederationDirectory for FaultInjectingDirectory {
         }
         self.inner.evict_known_wire_hashes(cutoff, bound).await
     }
+    async fn execute_attestation_query(
+        &self,
+        q: &attestation_query::AttestationQuery,
+    ) -> Result<attestation_query::QueryRows, Error> {
+        if let Some(e) = self.faulted("execute_attestation_query") {
+            return Err(e);
+        }
+        if let Some(e) = self.faulted(q.shape()) {
+            return Err(e);
+        }
+        self.inner.execute_attestation_query(q).await
+    }
     async fn family_roster_signers(
         &self,
         family_key_id: &str,
@@ -401,14 +413,18 @@ impl FederationDirectory for FaultInjectingDirectory {
             .list_accord_proposals_by_anchor(action, prior_family_digest)
             .await
     }
-    async fn list_attestations_by(
+    async fn list_attestations_by_dimension_citing(
         &self,
         attesting_key_id: &str,
+        dimension: &str,
+        evidence_ref: &str,
     ) -> Result<Vec<Attestation>, Error> {
-        if let Some(e) = self.faulted("list_attestations_by") {
+        if let Some(e) = self.faulted("list_attestations_by_dimension_citing") {
             return Err(e);
         }
-        self.inner.list_attestations_by(attesting_key_id).await
+        self.inner
+            .list_attestations_by_dimension_citing(attesting_key_id, dimension, evidence_ref)
+            .await
     }
     async fn list_attestations_citing_by_dimension(
         &self,
@@ -421,15 +437,6 @@ impl FederationDirectory for FaultInjectingDirectory {
         self.inner
             .list_attestations_citing_by_dimension(dimension, evidence_ref)
             .await
-    }
-    async fn list_attestations_for(
-        &self,
-        attested_key_id: &str,
-    ) -> Result<Vec<Attestation>, Error> {
-        if let Some(e) = self.faulted("list_attestations_for") {
-            return Err(e);
-        }
-        self.inner.list_attestations_for(attested_key_id).await
     }
     async fn list_attestations_referencing(
         &self,

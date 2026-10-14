@@ -4055,8 +4055,9 @@ impl PyEngine {
     /// construction runs the same pass hourly; sovereign hosts may drive it
     /// on their own schedule. Returns the report as JSON
     /// (`scanned`, `renewed`, `fresh`, `not_held`, `not_in_cohort`,
-    /// `failed`, `converted`, and `withheld`: blobs a takedown withholds,
-    /// neither renewed nor converted). Idempotent.
+    /// `failed`, `converted`, `withheld`: blobs a takedown withholds, neither
+    /// renewed nor converted, and `deferred`: renewals past this pass's cap,
+    /// rolled to the next pass, oldest first — v56.0.0, #1071). Idempotent.
     fn reack_holding_claims_once(&self, py: Python<'_>) -> PyResult<String> {
         self.ensure_usable()?;
         let runtime = self.runtime.clone();
@@ -8313,40 +8314,52 @@ impl PyEngine {
     // stays for grant-chain topology traversal; only the Python surface
     // moves to the bounded v4.0 contract.
 
-    /// Federation directory: list attestations issued by `attesting_key_id`.
-    fn list_attestations_by(&self, py: Python<'_>, attesting_key_id: &str) -> PyResult<String> {
+    /// v56.0.0 (CIRISPersist#1001) — federation directory: ONE PAGE of the
+    /// federation-tier attestations `attesting_key_id` issued, newest first,
+    /// as a JSON `AttestationListPage` (`{"items": [...], "next_cursor": ...}`).
+    /// `limit` is required (1..=10000; there is no "every row" form); pass the
+    /// previous page's `next_cursor` as `cursor_json` to continue, and
+    /// `dimension_prefix` to narrow to one envelope dimension family (a byte
+    /// prefix). Replaces the uncapped `list_attestations_by(attesting_key_id)`.
+    #[pyo3(signature = (attesting_key_id, limit, cursor_json = None, dimension_prefix = None))]
+    fn list_attestations_by(
+        &self,
+        py: Python<'_>,
+        attesting_key_id: &str,
+        limit: u32,
+        cursor_json: Option<&str>,
+        dimension_prefix: Option<&str>,
+    ) -> PyResult<String> {
         self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
-            let attesting_key_id = attesting_key_id.to_owned();
+            let limit = std::num::NonZeroU32::new(limit)
+                .ok_or_else(|| PyValueError::new_err("limit must be at least 1"))?;
+            let cursor: Option<crate::ceg::list::federation::AttestationCursor> = match cursor_json
+            {
+                None => None,
+                Some(s) => Some(serde_json::from_str(s).map_err(|e| {
+                    PyValueError::new_err(format!("AttestationCursor JSON decode: {e}"))
+                })?),
+            };
+            let mut q =
+                crate::federation::attestation_query::AttestationQuery::by(attesting_key_id, limit)
+                    .after(cursor);
+            if let Some(p) = dimension_prefix {
+                q = q.dimension_prefix(p);
+            }
             py.detach(|| match &self.backend {
                 #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
-                    runtime.block_on(async move {
-                        use crate::federation::FederationDirectory;
-                        let rows = backend
-                            .list_attestations_by(&attesting_key_id)
-                            .await
-                            .map_err(federation_err_to_py)?;
-                        serde_json::to_string(&rows).map_err(|e| {
-                            PyRuntimeError::new_err(format!("Vec<Attestation> JSON encode: {e}"))
-                        })
-                    })
+                    runtime
+                        .block_on(async move { attestation_query_page_json(&*backend, &q).await })
                 }
                 #[cfg(feature = "sqlite")]
                 BackendDispatch::Sqlite(sq) => {
                     let backend = sq.clone();
-                    runtime.block_on(async move {
-                        use crate::federation::FederationDirectory;
-                        let rows = backend
-                            .list_attestations_by(&attesting_key_id)
-                            .await
-                            .map_err(federation_err_to_py)?;
-                        serde_json::to_string(&rows).map_err(|e| {
-                            PyRuntimeError::new_err(format!("Vec<Attestation> JSON encode: {e}"))
-                        })
-                    })
+                    runtime
+                        .block_on(async move { attestation_query_page_json(&*backend, &q).await })
                 }
             })
         })
@@ -34669,6 +34682,31 @@ impl PyEngine {
     }
 }
 
+/// v56.0.0 (CIRISPersist#1001) — one page of a typed attestation query as
+/// `AttestationListPage` JSON. A read that was not served raises; it is never
+/// an empty page.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+async fn attestation_query_page_json<D>(
+    backend: &D,
+    q: &crate::federation::attestation_query::AttestationQuery,
+) -> PyResult<String>
+where
+    D: crate::federation::FederationDirectory + ?Sized,
+{
+    use crate::federation::attestation_query::AttestationReads as _;
+    let page = backend
+        .query_attestations(q)
+        .await
+        .served()
+        .map_err(federation_err_to_py)?;
+    let page = crate::ceg::list::federation::AttestationListPage {
+        items: page.rows,
+        next_cursor: page.next,
+    };
+    serde_json::to_string(&page)
+        .map_err(|e| PyRuntimeError::new_err(format!("AttestationListPage encode: {e}")))
+}
+
 fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
     let kind = e.kind();
     tracing::warn!(error = %e, kind = kind, "federation error");
@@ -34831,6 +34869,12 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         // caller-fault malformed
         // content; ValueError (4xx), the kind names it.
         crate::federation::Error::MediaSourceInvalid { .. } => PyValueError::new_err(kind),
+        // v56.0.0 (CIRISPersist#934 door 2) — a local upsert naming an id a
+        // row it does not replace holds: caller-fault, ValueError (the type of
+        // the local door's InvalidArgument refusals), the kind names it.
+        crate::federation::Error::LocalAttestationIdOccupied { .. } => {
+            PyValueError::new_err(kind)
+        }
         // v3.4.0 (CIRISPersist#123) — trust gate rejection is
         // caller-side authorization failure; ValueError (4xx).
         crate::federation::Error::TrustBelowThreshold { .. } => PyValueError::new_err(kind),
