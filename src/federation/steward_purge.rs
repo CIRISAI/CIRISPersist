@@ -2980,7 +2980,7 @@ pub const PURGE_TOMBSTONE_SUBJECT_PLANE: &str = "purge_tombstone_subject";
 pub const TRACE_RUN_KIND_MOCK: &str = "trace_run_kind_mock";
 
 /// The `run_kind` value a mock-LLM run declares (closed vocabulary
-/// `production | qa | battery | mock`, CC 3.1.5).
+/// `schema::trace::RUN_KINDS`, CC 3.1.5).
 pub const RUN_KIND_MOCK: &str = "mock";
 
 /// A trace JSON's `run_kind` member, if it carries one. Pure. A SIGNED member

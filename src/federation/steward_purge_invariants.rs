@@ -1885,7 +1885,15 @@ pub(crate) mod bodies {
         let dir = d.as_dyn_directory();
         // (a) production / qa / battery: admitted and verified, and the
         // stored trace attestation carries the signed run_kind.
-        for kind in ["production", "qa", "battery"] {
+        // v56.0.0 (#1089) — the two production values the operator added
+        // admit exactly as `production` does.
+        for kind in [
+            "production",
+            "prod-personal",
+            "prod-managed",
+            "qa",
+            "battery",
+        ] {
             let tid = format!("trace-i670-{kind}");
             let trace = signed_run_kind_trace(&tid, AGENT, kind, kind);
             let summary = ingest_full(d, &batch(&trace))

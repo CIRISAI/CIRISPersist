@@ -251,7 +251,24 @@ pub struct DeploymentProfile {
 }
 
 /// CC 3.1.5 (CIRISConstitution#166) — the closed `run_kind` vocabulary.
-pub const RUN_KINDS: &[&str] = &["production", "qa", "battery", "mock"];
+///
+/// v56.0.0 (CIRISPersist#1089, operator amendment 2026-10-14) — two values
+/// join the production kind: `prod-personal` (a production run on a personal
+/// install) and `prod-managed` (on a managed deployment; CIRISManager sets
+/// it). The three production values admit alike; only `mock` is refused
+/// (`trace_run_kind_mock`); `qa` and `battery` are admitted and labelled.
+/// `production` stays valid, so v2.7.x traces admit unchanged. The vendored
+/// `trace_format` v2.8.0 schema cut (`8c51028c…`) predates the amendment and
+/// still lists four values, so a v2.8.0 trace carrying a new value is refused
+/// by schema validation until the re-cut schema is vendored (I1037).
+pub const RUN_KINDS: &[&str] = &[
+    "production",
+    "prod-personal",
+    "prod-managed",
+    "qa",
+    "battery",
+    "mock",
+];
 
 /// `CompleteTrace` envelope (TRACE_WIRE_FORMAT.md §3).
 ///
@@ -350,7 +367,8 @@ pub struct CompleteTrace {
 
     /// v54.1.0 (CC 3.1.5, CIRISConstitution#166 at rc8@8c8f536;
     /// CIRISAgent#1249) — the run that produced this trace, closed vocabulary
-    /// `production | qa | battery | mock` ([`RUN_KINDS`]). A SIGNED member:
+    /// `production | prod-personal | prod-managed | qa | battery | mock`
+    /// ([`RUN_KINDS`]; the two `prod-*` values from v56.0.0). A SIGNED member:
     /// when present it is part of the canonical bytes every schema version's
     /// reconstruction signs over (`verify::ed25519::canonical_bytes_for_trace`),
     /// so it cannot be added, removed or changed after signing. Absent on

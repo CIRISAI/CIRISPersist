@@ -62,7 +62,7 @@ pub enum Error {
     UnknownTraceLevel(String),
 
     /// v54.1.0 (CC 3.1.5, CIRISConstitution#166) — a trace's `run_kind` is
-    /// not one of the closed vocabulary `production | qa | battery | mock`.
+    /// not one of the closed vocabulary [`trace::RUN_KINDS`].
     #[error("unknown run_kind: {0:?}")]
     UnknownRunKind(String),
 

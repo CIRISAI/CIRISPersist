@@ -172,18 +172,34 @@ signature.
     `schema_unknown_run_kind`.
   - All four are `schema::Error` variants. They reach Python as `ValueError`,
     the type of the schema arm they join.
+- **The run_kind vocabulary has six values** (operator amendment on #1089).
+  `schema::trace::RUN_KINDS` is now `production | prod-personal |
+  prod-managed | qa | battery | mock`. `prod-personal` is a production run on
+  a personal install. `prod-managed` is a production run on a managed
+  deployment, set by CIRISManager. The three production values admit alike,
+  only `mock` is refused (`trace_run_kind_mock`), and `qa` and `battery` are
+  admitted and labelled as before. `production` stays valid, so v2.7.x traces
+  admit unchanged.
+- **What the vendored schema still refuses.** Under the vendored v2.8.0
+  schema (`8c51028c…`), a v2.8.0 trace with `deployment_profile.run_kind`
+  `prod-personal` or `prod-managed` is refused by schema validation, by name
+  (`schema_trace_format_violation` at `/deployment_profile/run_kind`), until
+  the re-cut schema is vendored. The follow-up is re-vendor + pin swap.
 - **The vendored schema.** It was copied byte-exact from
   `CIRISAI/CIRISAgent@e7d9115180e8910999901f4805c31b617b34e8d5`, the head of
   CIRISAgent#1255, at
   `ciris_adapters/ciris_accord_metrics/schemas/trace_format_v2_8_0.json`. Its
-  SHA-256 is pinned in `TRACE_FORMAT_V2_8_0_SHA256`:
+  file name, SHA-256 and source commit are ONE constant,
+  `schema::trace_format::TRACE_FORMAT_V2_8_0_PIN`, whose bytes are
+  `include_str!` of the same file name. A re-vendor is that one constant plus
+  the file. The SHA-256 is:
 
   ```
   8c51028c8983741f0e14c89c32988df6aacc0981db5a173814e31d9f461c9f81
   ```
 
-- **Witnesses I1030–I1035.** They run on memory, sqlite and postgres. I1035
-  is a pure test.
+- **Witnesses I1030–I1037.** I1030 to I1034 run on memory, sqlite and
+  postgres. I1035 to I1037 are pure tests.
   - I1030: a v2.8.0 mock run is refused from the profile, and a production
     run admits and verifies.
   - I1031: the signed bytes equal the re-canonicalised bytes.
@@ -193,15 +209,21 @@ signature.
   - I1034: the oversize mint copies the profile's `run_kind`, and the tier
     crossing refuses the mock row.
   - I1035: the schema hash is pinned.
+  - I1036: the run_kind gate alone admits `prod-personal` and `prod-managed`
+    exactly as it admits `production`, at the parse gate and the `trace:*`
+    shape gate. I670's store-level admission loop now covers both values too.
+  - I1037: under the pre-amendment cut, a v2.8.0 trace carrying either new
+    value is refused by schema validation at the member. The leg flips when
+    the pin moves, and then both values must admit.
 
 **CIRISAgent adoption.**
 - Emit `deployment_profile.trace_format_version: "2.8.0"` and
   `deployment_profile.run_kind` together, with `trace_schema_version`
   `"3.0.0"` (JCS).
-- A v2.8.0 trace must validate against the pinned schema byte-for-byte. A
-  different schema cut is an unvendored contract until persist re-vendors it.
-  That includes the cut planned on #1089 that adds `prod-personal` and
-  `prod-managed`.
+- A v2.8.0 trace must validate against the pinned schema. Until persist
+  re-vendors the re-cut schema, emit `prod-personal` and `prod-managed` only
+  in a v2.7.x trace's top-level `run_kind`, or hold them back. A v2.8.0 trace
+  carrying either one is refused at v56.0.0. Post the re-cut hash on #1089.
 - Do not also emit a top-level `run_kind` that differs from the profile's.
 - v2.8.0 component data carries no `attempt_index`. At the `"3.0.0"` epoch,
   persist stores an absent one as 0, so retries of one event share a dedup
