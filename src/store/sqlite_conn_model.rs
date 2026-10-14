@@ -367,6 +367,10 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("list_composers_referencing_any", ConnClass::Read),
     // v53.1.6 — the citation / targeted seeks (V180, V150).
     ("list_attestations_by_dimension_citing", ConnClass::Read),
+    // v56.0.0 (#1001): `read::ReadEngine::list_attestations_for` — the cursor-paged
+    // subject read (#135/#150), NOT the retired `FederationDirectory` wide read of
+    // the same name, which left the trait (demoted to test-anchor) in this cut.
+    ("list_attestations_for", ConnClass::Read),
     // v55.0.0 (CIRISPersist#989) — V190's attester-free citation seek (the
     // holder directory's candidates).
     ("list_attestations_citing_by_dimension", ConnClass::Read),
