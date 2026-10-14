@@ -1453,6 +1453,10 @@ impl MemoryBackend {
     /// (CIRISPersist#593) — snapshot `(list_attestations_by,
     /// list_attestations_for)` call counts for this instance.
     ///
+    /// v56.0.0 (CIRISPersist#1001) — counted in `execute_attestation_query`:
+    /// one per STATEMENT (page) of a typed read pinned on `by` / `to` (a query
+    /// pinning both counts in both). A slice read across `k` pages counts `k`.
+    ///
     /// A directory-read counter, not a walk-internal one: it counts what the
     /// substrate was actually asked for, so a claim like *"the moderation walk
     /// costs at most 2× the reads it used to"* is a measurement rather than an

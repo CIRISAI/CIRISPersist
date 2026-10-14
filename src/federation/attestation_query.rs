@@ -718,6 +718,10 @@ impl<E: AttestationQueryExec + ?Sized> AttestationReads for E {
             ))));
         }
         let limit = q.limit.get() as usize;
+        // Recorded before the page is cut: `bytes` is what the backend
+        // decoded to answer, the lookahead row included (observe's "bytes"
+        // is the decode cost), while the read counts the rows it returns.
+        crate::observe::record_query_read(backend, q, &rows, rows.len().min(limit), bytes);
         let next = if rows.len() > limit {
             rows.truncate(limit);
             rows.last()
@@ -725,7 +729,6 @@ impl<E: AttestationQueryExec + ?Sized> AttestationReads for E {
         } else {
             None
         };
-        crate::observe::record_query_read(backend, q, &rows, bytes);
         ReadOutcome::Served(Page { rows, next })
     }
 }

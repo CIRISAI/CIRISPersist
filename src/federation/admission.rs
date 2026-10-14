@@ -27933,11 +27933,20 @@ pub(crate) mod moderation_walk_liveness_test_support {
             .expect("reachable_under_scope"),
             "the probe target is not in the graph, so the walk runs to exhaustion"
         );
+        // v56.0.0 (CIRISPersist#1001) — the counters count STATEMENTS, and a
+        // slice is read a page at a time: `FOLD_PAGE` rows per statement, 3
+        // under `cfg(test)`, so this five-edge fan-out crosses a page. One
+        // read of a slice of `n` rows is `pages(n)` statements (the lookahead
+        // row ends the walk without an empty trailing page; an empty slice is
+        // still one statement). The granter reads are the founder's five
+        // out-edges and the deputy's none.
+        let pages = |n: u32| u64::from(n.div_ceil(FOLD_PAGE.get()).max(1));
         assert_eq!(
             backend.attestation_read_counts(),
-            (2, 1),
-            "5 edges, ONE distinct recipient, ONE incoming read — memoized per recipient for the \
-             whole walk. Key the memo on the granter instead and this becomes 5"
+            (pages(5) + pages(0), pages(5)),
+            "5 edges, ONE distinct recipient, ONE incoming read of its five-row slice — memoized \
+             per recipient for the whole walk. Key the memo on the granter instead and the \
+             recipient's slice is read 5 times"
         );
 
         // (5) THE CIRISPersist#594 COST — the consent-revocation plane, which

@@ -25,7 +25,9 @@ pub struct Read {
     pub key: String,
     /// Rows returned.
     pub rows: usize,
-    /// Serialized envelope bytes returned.
+    /// Serialized envelope bytes of the rows the read decoded: the rows it
+    /// returned, plus (for a typed bounded read) the one lookahead row
+    /// fetched past the page.
     pub bytes: usize,
     /// v56.0.0 (CIRISPersist#1001) — for a typed bounded read
     /// (`attestation_query`), the query as it ran; `None` for every other
@@ -112,11 +114,18 @@ pub fn record<R: crate::observe::ReadRow>(method: &'static str, key: &str, rows:
 /// v56.0.0 (CIRISPersist#1001) — record one typed bounded read, with its
 /// query. Called only from [`crate::observe::record_query_read`], which the
 /// shared wrapper calls once per query.
+///
+/// `fetched` is every row the backend decoded, the lookahead row past the
+/// page included; `returned` is how many the page serves. `rows` records
+/// `returned`; `bytes` sizes all of `fetched`, the same rows the counters'
+/// decode-cost bytes cover, measured independently (re-serialized here,
+/// stored TEXT length there).
 pub fn record_query(
     q: &crate::federation::attestation_query::AttestationQuery,
-    rows: &[crate::federation::Attestation],
+    fetched: &[crate::federation::Attestation],
+    returned: usize,
 ) {
-    let bytes = rows
+    let bytes = fetched
         .iter()
         .map(|a| {
             serde_json::to_string(&a.attestation_envelope)
@@ -128,7 +137,7 @@ pub fn record_query(
         r.borrow_mut().push(Read {
             method: crate::observe::Door::AttestationQuery.label(),
             key: q.key().to_owned(),
-            rows: rows.len(),
+            rows: returned,
             bytes,
             query: Some(q.clone()),
         });

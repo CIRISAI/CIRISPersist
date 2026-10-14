@@ -323,17 +323,24 @@ fn count_read(backend: StoreBackend, door: Door, n: u64, bytes: u64) {
 /// [`crate::federation::attestation_query::AttestationReads::query_attestations`],
 /// whatever backend ran the statement; under `cfg(test)` the probe also
 /// records the query's shape (its pinned keys, narrowing and limit).
+///
+/// `fetched` is every row the backend decoded (at most `limit + 1`: the
+/// statement fetches one row past the page to learn whether another page
+/// exists); `returned` is how many of them the page serves. `bytes` covers
+/// all of `fetched` (the decode cost, this module's "bytes"), and the read
+/// counts `returned` rows.
 pub(crate) fn record_query_read(
     backend: StoreBackend,
     q: &crate::federation::attestation_query::AttestationQuery,
-    rows: &[crate::federation::Attestation],
+    fetched: &[crate::federation::Attestation],
+    returned: usize,
     bytes: u64,
 ) {
-    count_read(backend, Door::AttestationQuery, rows.len() as u64, bytes);
+    count_read(backend, Door::AttestationQuery, returned as u64, bytes);
     #[cfg(test)]
-    crate::federation::read_probe::record_query(q, rows);
+    crate::federation::read_probe::record_query(q, fetched, returned);
     #[cfg(not(test))]
-    let _ = q;
+    let _ = (q, fetched);
 }
 
 /// Run `fut` as one entry into `fold`: count the call, and credit every door
