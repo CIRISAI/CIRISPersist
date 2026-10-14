@@ -1599,9 +1599,14 @@ impl Backend for SqliteBackend {
         // before the transaction (the plan inside it reads nothing). Held as
         // a Result: a door that deletes nothing records nothing and needs no
         // attester; one that deletes is refused, undone, without one.
-        let attester = crate::federation::attestation_admit::hard_case_attester(self)
-            .await
-            .map_err(|e| format!("{}: {e}", e.kind()));
+        // An act: refused, typed, before anything moves when this node cannot
+        // attest its audit row (CIRISPersist#988 ruling: a host must hold a
+        // node key before any erasure is recorded).
+        let attester: Result<_, String> = Ok(
+            crate::federation::attestation_admit::hard_case_attester(self)
+                .await
+                .map_err(Error::from_hard_case_attester)?,
+        );
         let received_at = chrono::Utc::now();
         let summary = self
             .write(
@@ -1745,9 +1750,14 @@ impl Backend for SqliteBackend {
         let agent = agent_id_hash.to_owned();
         // v57.0.0 (CIRISPersist#988 item 2) — the audit row's attester, read
         // before the transaction (see `delete_traces_for_agent`).
-        let attester = crate::federation::attestation_admit::hard_case_attester(self)
-            .await
-            .map_err(|e| format!("{}: {e}", e.kind()));
+        // An act: refused, typed, before anything moves when this node cannot
+        // attest its audit row (CIRISPersist#988 ruling: a host must hold a
+        // node key before any erasure is recorded).
+        let attester: Result<_, String> = Ok(
+            crate::federation::attestation_admit::hard_case_attester(self)
+                .await
+                .map_err(Error::from_hard_case_attester)?,
+        );
         let summary = self
             .write(
                 move |conn| -> Result<super::types::ErasureSummary, rusqlite::Error> {
@@ -4378,6 +4388,20 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                                     &t.record_ref,
                                 )])])?;
                             }
+                        }
+                    }
+                    // v57.0.0 (CIRISPersist#988 item 3; lead ruling 5) — a
+                    // tombstoned detection row's projection is the V080
+                    // tombstone at its execution's instant, in this write.
+                    for (t, fresh) in ts.iter().zip(&inserted) {
+                        if *fresh
+                            && t.plane == crate::federation::steward_purge::PurgePlane::Attestation
+                        {
+                            sqlite_tombstone_detection_projection(
+                                &tx,
+                                &t.record_ref,
+                                &t.notice_id,
+                            )?;
                         }
                     }
                     tx.commit()?;
@@ -21361,89 +21385,23 @@ fn sqlite_tombstone_detection_events(
     trace_ids: &[String],
     erased_at: &str,
 ) -> Result<u64, rusqlite::Error> {
-    // v57.0.0 (CIRISPersist#988 item 3) — the V080 tombstone is the projection
-    // of the REDACTED ROW: each live detection row of an erased trace loses
-    // its linkage in the row itself (`redact_detection_row`), and its
-    // projection row is re-written from the redacted row. The projection is
-    // read here only to FIND the rows (its trace_id index); nothing decides on
-    // it.
-    let mut tombstoned = 0u64;
+    // v57.0.0 (CIRISPersist#988 item 3; lead ruling 5) — PRE-v57 rows only.
+    // A row-backed detection is a signed row: its erasure goes through the
+    // purge door (its trace is its `evidence_refs`, so a purge of the trace
+    // derives it), never an in-place rewrite here. A legacy row not yet
+    // rehomed has no row: it takes the V080 tombstone in place, as before.
     if trace_ids.is_empty() {
         return Ok(0);
     }
-    let erased = parse_rfc3339(erased_at);
-    // A pre-v57 row not yet rehomed has no row to redact: it takes the V080
-    // tombstone in place, as before.
-    {
-        let mut stmt = tx.prepare(
-            "UPDATE cirislens_derived_detection_events \
-             SET trace_id = NULL, body_sha256 = NULL, \
-                 canonical_bytes = NULL, erased_at = ?2 \
-             WHERE trace_id = ?1 AND erased_at IS NULL AND attestation_id IS NULL",
-        )?;
-        for tid in trace_ids {
-            tombstoned += stmt.execute(rusqlite::params![tid, erased_at])? as u64;
-        }
-    }
-    let mut ids: Vec<String> = Vec::new();
-    {
-        let mut stmt = tx.prepare(
-            "SELECT attestation_id FROM cirislens_derived_detection_events \
-              WHERE trace_id = ?1 AND erased_at IS NULL AND attestation_id IS NOT NULL",
-        )?;
-        for tid in trace_ids {
-            let rows = stmt.query_map([tid], |r| r.get::<_, String>(0))?;
-            for id in rows {
-                ids.push(id?);
-            }
-        }
-    }
-    for id in ids {
-        let row: Option<crate::federation::Attestation> = tx
-            .query_row(
-                "SELECT attestation_id, attesting_key_id, attested_key_id, attestation_type, \
-                    weight, asserted_at, expires_at, attestation_envelope, \
-                    original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
-                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, \
-                    subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at, \
-                    additional_scrubs \
-                 FROM federation_attestations WHERE attestation_id = ?1",
-                [&id],
-                sqlite_row_to_attestation,
-            )
-            .optional()?;
-        let Some(row) = row else { continue };
-        let Some(redacted) = crate::derived::detection_row::redact_detection_row(&row, erased)
-            .map_err(sqlite_plan_err)?
-        else {
-            continue;
-        };
-        let projection = crate::derived::detection_row::project_detection_row(&redacted)
-            .ok_or_else(|| {
-                rusqlite::Error::ToSqlConversionFailure(
-                    "a redacted detection row does not project".into(),
-                )
-            })?;
-        // The row goes to the local tier unsigned: its wire-index entry leaves
-        // with the signature, and the row is re-stored in its redacted form
-        // (the cascade takes the old projection row with the old row).
-        let record_key = crate::federation::wire_index::record_key(&[("attestation_id", &id)]);
-        tx.execute(
-            "DELETE FROM signed_wire_index WHERE kind = 'Attestation' AND record_key = ?1",
-            [&record_key],
-        )?;
-        tx.execute(
-            "DELETE FROM federation_attestations WHERE attestation_id = ?1",
-            [&id],
-        )?;
-        sqlite_insert_local_attestation_row(tx, &redacted, None)?;
-        sqlite_project_detection(
-            tx,
-            "cirislens_derived_detection_events",
-            &redacted.attestation_id,
-            &projection,
-        )?;
-        tombstoned += 1;
+    let mut tombstoned = 0u64;
+    let mut stmt = tx.prepare(
+        "UPDATE cirislens_derived_detection_events \
+         SET trace_id = NULL, body_sha256 = NULL, \
+             canonical_bytes = NULL, erased_at = ?2 \
+         WHERE trace_id = ?1 AND erased_at IS NULL AND attestation_id IS NULL",
+    )?;
+    for tid in trace_ids {
+        tombstoned += stmt.execute(rusqlite::params![tid, erased_at])? as u64;
     }
     Ok(tombstoned)
 }
@@ -22208,7 +22166,9 @@ impl crate::federation::attestation_admit::AttestationStore for SqliteBackend {
                     &event,
                     &attester,
                     crate::federation::attestation_admit::PlanInstants {
-                        fold_at: received_at,
+                        // The silo row's own recorded instant (never the rehome's clock),
+                        // bounded by the receipt clock.
+                        fold_at: event.emitted_at.min(received_at),
                         received_at,
                     },
                 )
@@ -22296,7 +22256,9 @@ impl crate::federation::attestation_admit::AttestationStore for SqliteBackend {
                 &body,
                 &identity_type,
                 crate::federation::attestation_admit::PlanInstants {
-                    fold_at: received_at,
+                    // The silo row's own recorded instant (never the rehome's clock),
+                    // bounded by the receipt clock.
+                    fold_at: body.ts.min(received_at),
                     received_at,
                 },
             ) {
@@ -22394,7 +22356,10 @@ impl crate::federation::attestation_admit::AttestationStore for SqliteBackend {
                         }
                         SiloProjection::DetectionEvents => {
                             if let Some(event) =
-                                crate::derived::detection_row::project_detection_row(row)
+                                crate::derived::detection_row::project_detection_row_under(
+                                    row,
+                                    sqlite_detection_tombstone_instant(&tx, &row.attestation_id)?,
+                                )
                             {
                                 sqlite_project_detection(
                                     &tx,
@@ -24056,6 +24021,55 @@ fn sqlite_project_hard_case(
         ],
     )?;
     Ok(())
+}
+
+/// v57.0.0 (CIRISPersist#988 item 3; lead ruling 5) — the purge door's
+/// tombstone of a detection row, on its projection: the live row for
+/// `attestation_id` becomes the V080 tombstone at the instant `notice_id`
+/// executed. Only a live projection row moves (the earliest-admitted
+/// execution's instant stands), the rebuild's rule
+/// ([`sqlite_detection_tombstone_instant`]).
+fn sqlite_tombstone_detection_projection(
+    tx: &rusqlite::Transaction<'_>,
+    attestation_id: &str,
+    notice_id: &str,
+) -> Result<(), rusqlite::Error> {
+    let executed: Option<String> = tx
+        .query_row(
+            "SELECT executed_at FROM purge_executions WHERE notice_id = ?1",
+            [notice_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(executed) = executed else {
+        return Ok(());
+    };
+    tx.execute(
+        "UPDATE cirislens_derived_detection_events \
+         SET trace_id = NULL, body_sha256 = NULL, canonical_bytes = NULL, erased_at = ?2 \
+         WHERE attestation_id = ?1 AND erased_at IS NULL",
+        rusqlite::params![attestation_id, parse_rfc3339(&executed).to_rfc3339()],
+    )?;
+    Ok(())
+}
+
+/// The instant the earliest-admitted purge execution naming `attestation_id`
+/// executed, if one does (the detection projection's tombstone instant).
+fn sqlite_detection_tombstone_instant(
+    tx: &rusqlite::Transaction<'_>,
+    attestation_id: &str,
+) -> Result<Option<chrono::DateTime<chrono::Utc>>, rusqlite::Error> {
+    let executed: Option<String> = tx
+        .query_row(
+            "SELECT e.executed_at FROM purge_tombstones t \
+               JOIN purge_executions e ON e.notice_id = t.notice_id \
+              WHERE t.plane = 'attestation' AND t.record_ref = ?1 \
+              ORDER BY e.admitted_at, e.notice_id LIMIT 1",
+            [attestation_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(executed.as_deref().map(parse_rfc3339))
 }
 
 /// v57.0.0 (CIRISPersist#988 item 3) — one `detection_events`-shaped row into
@@ -48440,6 +48454,18 @@ mod tests {
             .put_detection_event(de_fixture(det_z, "tr-Z", b"canon-Z"))
             .await
             .unwrap();
+        // v57.0.0 (#988 item 3, lead ruling 5) — the DSAR door's in-place
+        // V080 tombstone now applies only to PRE-v57 silo rows (no backing
+        // row); a row-backed detection is erased through the purge door
+        // (I825). Shape both as pre-v57 rows to keep this witness on the
+        // legacy path it pins.
+        backend
+            .test_execute(
+                "UPDATE cirislens_derived_detection_events SET attestation_id = NULL; \
+                 DELETE FROM federation_attestations \
+                  WHERE substr(dimension, 1, 10) = 'detection:'",
+            )
+            .await;
 
         let summary = backend
             .delete_traces_for_agent_id_hash("deadbeef")

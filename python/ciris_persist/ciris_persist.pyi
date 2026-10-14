@@ -96,6 +96,16 @@ class EngineUsedAcrossFork(PersistError):
     ``fork()`` and used in the child. A tokio runtime does not survive
     a fork; construct ``Engine`` after all forking is done."""
 
+class NodeIdentityRequired(PersistError):
+    """v57.0.0 (CIRISPersist#988) — an act that must record a
+    ``hard_case:{kind}`` row (an erasure, a peer removal) was refused before
+    it changed anything: this node has no declared node key, or does not
+    hold the one it declared. The row's attester is the node key (CC
+    3.1.9.4). Kind ``federation_hard_case_attester_unavailable``; the
+    message names the reason (``node_key_unset`` / ``node_key_not_held``).
+    Remedy: construct the Engine with a signer and register its key
+    (``register_self_federation_key``) before erasing or removing."""
+
 class BatchSummary(TypedDict):
     """Result shape from :meth:`Engine.receive_and_persist`."""
     envelopes_processed: int

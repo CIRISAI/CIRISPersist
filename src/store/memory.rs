@@ -2189,26 +2189,16 @@ impl Backend for MemoryBackend {
     ) -> Result<super::types::DeleteSummary, Error> {
         // v57.0.0 (CIRISPersist#988 item 2) — the audit row's attester, read
         // before the lock (the SQL backends read it before their transaction).
-        let attester = crate::federation::attestation_admit::hard_case_attester(self)
-            .await
-            .map_err(|e| format!("{}: {e}", e.kind()));
+        // An act: refused, typed, before anything moves when this node cannot
+        // attest its audit row (CIRISPersist#988 ruling: a host must hold a
+        // node key before any erasure is recorded).
+        let attester: Result<_, String> = Ok(
+            crate::federation::attestation_admit::hard_case_attester(self)
+                .await
+                .map_err(Error::from_hard_case_attester)?,
+        );
         let received_at = chrono::Utc::now();
         let mut state = self.state.lock().expect("memory backend lock");
-        // An act that would delete something and has no attester is refused
-        // here, before anything moves (the SQL transaction's rollback).
-        if let Err(e) = &attester {
-            let would_delete = state.events.values().any(|(_, row)| {
-                row.agent_id_hash == agent_id_hash && row.signing_key_id == signature_key_id
-            }) || (include_federation_key
-                && state.federation_keys.values().any(|rec| {
-                    rec.identity_type == "agent"
-                        && rec.identity_ref == agent_id_hash
-                        && rec.key_id == signature_key_id
-                }));
-            if would_delete {
-                return Err(Error::Backend(format!("dsar: {e}")));
-            }
-        }
         // Per-key DSAR scope: both agent_id_hash AND signing_key_id
         // must match. trace_llm_calls cascade joins by trace_id
         // (V001 schema — LLM call rows don't carry either field).
@@ -2353,22 +2343,16 @@ impl Backend for MemoryBackend {
     ) -> Result<super::types::ErasureSummary, Error> {
         // v57.0.0 (CIRISPersist#988 item 2) — the audit row's attester, read
         // before the lock.
-        let attester = crate::federation::attestation_admit::hard_case_attester(self)
-            .await
-            .map_err(|e| format!("{}: {e}", e.kind()));
+        // An act: refused, typed, before anything moves when this node cannot
+        // attest its audit row (CIRISPersist#988 ruling: a host must hold a
+        // node key before any erasure is recorded).
+        let attester: Result<_, String> = Ok(
+            crate::federation::attestation_admit::hard_case_attester(self)
+                .await
+                .map_err(Error::from_hard_case_attester)?,
+        );
         let erased_at = chrono::Utc::now();
         let mut state = self.state.lock().expect("memory backend lock");
-        // An erasure that would delete something and has no attester is
-        // refused here, before anything moves (the SQL transaction's rollback).
-        if let Err(e) = &attester {
-            if state
-                .events
-                .values()
-                .any(|(_, row)| row.agent_id_hash == agent_id_hash)
-            {
-                return Err(Error::Backend(format!("erasure: {e}")));
-            }
-        }
 
         // Full erasure: every trace_events row for this agent_id_hash,
         // across all signing keys. trace_llm_calls cascade joins by
@@ -2392,11 +2376,11 @@ impl Backend for MemoryBackend {
             .retain(|row| !target_trace_ids.contains(&row.trace_id));
         let trace_llm_calls = (llm_before - state.llm_calls.len()) as u64;
 
-        // v57.0.0 (CIRISPersist#988 item 3) — the V080 tombstone, on the
-        // rows: memory holds detections since the row door gave it one.
-        let detection_events_tombstoned =
-            memory_tombstone_detections(&mut state, &target_trace_ids, erased_at)
-                .map_err(|e| Error::Backend(format!("erasure: {e}")))?;
+        // v57.0.0 (CIRISPersist#988 item 3; lead ruling 5) — a detection is a
+        // signed row; its erasure goes through the purge door, not this one.
+        // Memory holds no pre-v57 silo rows, so there is nothing to tombstone
+        // in place here.
+        let detection_events_tombstoned = 0u64;
 
         // Audit emit — record a `hard_case:trace_erasure` row, mirroring
         // the durable hard_case_events surface (atomic with the deletes
@@ -3267,8 +3251,11 @@ impl crate::federation::attestation_admit::AttestationStore for MemoryBackend {
                     .federation_attestations
                     .iter()
                     .filter_map(|row| {
-                        crate::derived::detection_row::project_detection_row(row)
-                            .map(|p| (p.detection_id.to_string(), (row.attestation_id.clone(), p)))
+                        crate::derived::detection_row::project_detection_row_under(
+                            row,
+                            memory_detection_tombstone_instant(&state, &row.attestation_id),
+                        )
+                        .map(|p| (p.detection_id.to_string(), (row.attestation_id.clone(), p)))
                     })
                     .collect();
                 (render(live)?, render(rebuilt)?)
@@ -3617,6 +3604,16 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                     state
                         .signed_wire_index
                         .retain(|(kind, _), v| !(kind == "Attestation" && *v == rk));
+                    // v57.0.0 (CIRISPersist#988 item 3) — a tombstoned
+                    // detection row's projection is the V080 tombstone, in
+                    // the same write.
+                    if let Some(at) = state
+                        .purge_executions
+                        .get(&t.notice_id)
+                        .map(|e| e.executed_at)
+                    {
+                        memory_tombstone_detection_projection(&mut state, &t.record_ref, at);
+                    }
                 }
             }
         }
@@ -3771,13 +3768,6 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         if person_signed {
             return Ok((0, 0));
         }
-        // v57.0.0 (CIRISPersist#988 item 3) — the derived detections take the
-        // Art. 17 tombstone, under this lock (the SQL backends' transaction).
-        memory_tombstone_detections(
-            &mut state,
-            &std::iter::once(trace_id.to_owned()).collect(),
-            chrono::Utc::now(),
-        )?;
         let events_before = state.events.len();
         state.events.retain(|_, (_, e)| e.trace_id != trace_id);
         let calls_before = state.llm_calls.len();
@@ -11107,57 +11097,37 @@ fn memory_record_hard_case_in_state(
     Ok(())
 }
 
-/// v57.0.0 (CIRISPersist#988 item 3) — the V080 Art. 17 tombstone, memory
-/// arm: every live detection row of an erased trace is redacted in place
-/// (`redact_detection_row`) and its projection entry re-written from the
-/// redacted row. Returns the detections tombstoned.
-fn memory_tombstone_detections(
+/// v57.0.0 (CIRISPersist#988 item 3; lead ruling 5) — the purge door's
+/// tombstone of a detection row, on its projection: the entry for
+/// `attestation_id`, if live, becomes the V080 tombstone at `executed_at`
+/// (the SQL backends' UPDATE in `purge_put_execution`).
+fn memory_tombstone_detection_projection(
     state: &mut State,
-    trace_ids: &HashSet<String>,
-    erased_at: chrono::DateTime<chrono::Utc>,
-) -> Result<u64, crate::federation::Error> {
-    let ids: Vec<String> = state
-        .derived_detection_events
-        .values()
-        .filter(|(_, p)| {
-            p.erased_at.is_none() && p.trace_id.as_ref().is_some_and(|t| trace_ids.contains(t))
-        })
-        .map(|(id, _)| id.clone())
-        .collect();
-    let mut tombstoned = 0u64;
-    for id in ids {
-        let Some(row) = state
-            .federation_attestations
-            .iter()
-            .find(|a| a.attestation_id == id)
-            .cloned()
-        else {
-            continue;
-        };
-        let Some(redacted) = crate::derived::detection_row::redact_detection_row(&row, erased_at)?
-        else {
-            continue;
-        };
-        let projection = crate::derived::detection_row::project_detection_row(&redacted)
-            .ok_or_else(|| {
-                crate::federation::Error::Backend(
-                    "a redacted detection row does not project".into(),
-                )
-            })?;
-        let record_key = crate::federation::wire_index::record_key(&[("attestation_id", &id)]);
-        state
-            .signed_wire_index
-            .retain(|(kind, _), rk| !(kind == "Attestation" && *rk == record_key));
-        state
-            .federation_attestations
-            .retain(|a| a.attestation_id != id);
-        memory_insert_local_row(state, redacted, None);
-        state
-            .derived_detection_events
-            .insert(projection.detection_id.to_string(), (id, projection));
-        tombstoned += 1;
+    attestation_id: &str,
+    executed_at: chrono::DateTime<chrono::Utc>,
+) {
+    for (id, p) in state.derived_detection_events.values_mut() {
+        if id == attestation_id && p.erased_at.is_none() {
+            *p = p.tombstoned(executed_at);
+        }
     }
-    Ok(tombstoned)
+}
+
+/// The instant the earliest-admitted purge execution naming
+/// `attestation_id` executed, if one does: what the detection projection's
+/// tombstone stamps (the rebuild's half of
+/// [`memory_tombstone_detection_projection`]).
+fn memory_detection_tombstone_instant(
+    state: &State,
+    attestation_id: &str,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    state
+        .purge_tombstones
+        .iter()
+        .filter(|((_, plane, r), _)| plane == "attestation" && r == attestation_id)
+        .filter_map(|((notice, _, _), _)| state.purge_executions.get(notice))
+        .min_by(|a, b| (a.admitted_at, &a.notice_id).cmp(&(b.admitted_at, &b.notice_id)))
+        .map(|e| e.executed_at)
 }
 
 /// v57.0.0 (CIRISPersist#988, V194/V195 mirror) — the SQL backends' `ON

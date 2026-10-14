@@ -171,10 +171,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // for a row that is not its family's, never a refusal.
     ("project_hard_case_row", Class::Plumbing),
     ("project_detection_row", Class::Plumbing),
-    // The Art. 17 redaction of the detection rows of an erased trace: it
-    // rewrites rows the erasure already decided to erase; it fails only on
-    // serialization. Plumbing, in the fail-open direction, for that reason.
-    ("memory_tombstone_detections", Class::Plumbing),
     // v56.0.0 (CIRISPersist#934 step 1) — the attestation plane's shared door
     // and the executor's one re-ask under its lock: each is a SHARED plan.
     ("put_attestation_planned", Class::Plan),
@@ -2525,15 +2521,16 @@ mod tests {
         ),
         ("sealed_over", "check_reseal_admission", Reads::ReceivedAt),
         // v57.0.0 (CIRISPersist#988 items 2, 3) — a hard_case or detection row
-        // judges no other row: it is minted at the receipt instant and bound
-        // to it. `fold_at` is not read.
-        ("plan_hard_case_row", "into_local_row", Reads::ReceivedAt),
+        // judges no other row. Its signed instant is `fold_at` (the receipt
+        // clock at a live door, the silo row's own instant on a rehome); the
+        // instant binding is the receipt bound.
+        ("plan_hard_case_row", "into_local_row", Reads::FoldAt),
         (
             "plan_hard_case_row",
             "check_instant_binding",
             Reads::ReceivedAt,
         ),
-        ("plan_detection_row", "into_local_row", Reads::ReceivedAt),
+        ("plan_detection_row", "into_local_row", Reads::FoldAt),
         (
             "plan_detection_row",
             "check_instant_binding",

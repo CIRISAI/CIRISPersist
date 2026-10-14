@@ -755,6 +755,11 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("sqlite_project_hard_case", ConnClass::HelperWrite),
     ("sqlite_project_detection", ConnClass::HelperWrite),
     ("sqlite_render_table", ConnClass::HelperRead),
+    ("sqlite_detection_tombstone_instant", ConnClass::HelperRead),
+    (
+        "sqlite_tombstone_detection_projection",
+        ConnClass::HelperWrite,
+    ),
     // The test-only raw-SQL seam the projection witnesses tamper with.
     ("test_execute", ConnClass::Write),
     ("store_blob_local", ConnClass::Write),

@@ -26,11 +26,12 @@
 //!
 //! # The Art. 17 tombstone (V080)
 //!
-//! An erasure redacts the ROW, not only the table: [`redact_detection_row`]
-//! drops the PII linkage (`trace_id`, `body_sha256`, `canonical_bytes`) from
-//! the body, stamps `erased_at`, and takes the row to the local tier with no
-//! signature (the bytes it signed are gone). The projection of the redacted
-//! row is the V080 tombstone, so the table stays its rows' rebuild.
+//! A signed row is immutable bytes. Its erasure goes through the purge door
+//! (`steward_purge`), the one tombstone mechanism: the row carries its trace
+//! as `evidence_refs`, so a purge of the trace derives it; while the purge
+//! tombstone stands the projection is the V080 tombstone
+//! ([`project_detection_row_under`]), and when `purge_finalize` deletes the
+//! row its projection row goes with it.
 //!
 //! `calibration_bundles` stays configuration (CC 3.4.8: "calibration bundles
 //! stay configuration, never claims").
@@ -205,10 +206,17 @@ impl DetectionProjection {
 pub fn detection_envelope(
     body: &DetectionProjection,
 ) -> Result<serde_json::Value, serde_json::Error> {
-    Ok(serde_json::json!({
+    let mut envelope = serde_json::json!({
         "dimension": detection_dimension(&body.detector),
         BODY_MEMBER: serde_json::to_value(body)?,
-    }))
+    });
+    // The trace a detection scored is its EVIDENCE: a purge of the trace
+    // derives the detection row (the purge door's "scores over purged
+    // evidence follow it"), so the Art. 17 path needs no second mechanism.
+    if let Some(trace_id) = &body.trace_id {
+        envelope["evidence_refs"] = serde_json::json!([trace_id]);
+    }
+    Ok(envelope)
 }
 
 /// The shape V008's CHECKs hold a detection to, as the refusal message, or
@@ -349,44 +357,26 @@ pub fn check_detection_body(row: &Attestation) -> Result<(), crate::federation::
     Ok(())
 }
 
-/// v57.0.0 (CIRISPersist#988 item 3, V080 on the row) — the Art. 17
-/// redaction of a detection row whose trace was erased: the body loses its
-/// linkage and gains `erased_at` ([`DetectionProjection::tombstoned`]), and
-/// the row goes to the local tier unsigned (the bytes any signature covered
-/// are gone), its mirror and instants re-stamped and its hash recomputed.
-/// `None` when the row is not a live projected detection.
-pub fn redact_detection_row(
+/// v57.0.0 (CIRISPersist#988 item 3; lead ruling 5) — **the projection of a
+/// row the purge door tombstoned.** A signed row is immutable bytes; its
+/// erasure goes through the one tombstone mechanism, the purge door
+/// (`steward_purge`): the door tombstones the row (it is no longer served,
+/// and a replica's copy is refused) and later hard-deletes it at
+/// `purge_finalize`. While the tombstone stands, the row's projection is the
+/// V080 tombstone ([`DetectionProjection::tombstoned`]) at the instant the
+/// earliest-admitted execution naming the row executed; once the row is gone
+/// its projection row goes with it (`ON DELETE CASCADE`). `tombstoned_at` is
+/// that instant, or `None` for a row no tombstone names.
+#[must_use]
+pub fn project_detection_row_under(
     row: &Attestation,
-    erased_at: DateTime<Utc>,
-) -> Result<Option<Attestation>, crate::federation::Error> {
-    let Some(body) = project_detection_row(row) else {
-        return Ok(None);
-    };
-    if body.erased_at.is_some() {
-        return Ok(None);
-    }
-    let tombstone = body.tombstoned(erased_at);
-    let mut redacted = row.clone();
-    let mut envelope = redacted.attestation_envelope.clone();
-    if let Some(obj) = envelope.as_object_mut() {
-        obj.insert(
-            BODY_MEMBER.to_owned(),
-            serde_json::to_value(&tombstone)
-                .map_err(|e| crate::federation::Error::Backend(format!("detection body: {e}")))?,
-        );
-    }
-    redacted.attestation_envelope = envelope;
-    redacted.tier = crate::federation::types::attestation_tier::LOCAL.to_owned();
-    redacted.promoted_at = None;
-    redacted.original_content_hash = String::new();
-    redacted.scrub_signature_classical = String::new();
-    redacted.scrub_signature_pqc = None;
-    redacted.scrub_key_id = redacted.attesting_key_id.clone();
-    redacted.pqc_completed_at = None;
-    redacted.additional_scrubs = Vec::new();
-    redacted.persist_row_hash = String::new();
-    redacted.persist_row_hash = crate::federation::types::compute_persist_row_hash(&redacted)?;
-    Ok(Some(redacted))
+    tombstoned_at: Option<DateTime<Utc>>,
+) -> Option<DetectionProjection> {
+    let body = project_detection_row(row)?;
+    Some(match tombstoned_at {
+        Some(at) if body.erased_at.is_none() => body.tombstoned(at),
+        _ => body,
+    })
 }
 
 /// A refusal of the detection door, in the `DerivedSchema` error tree: a

@@ -785,87 +785,26 @@ async fn pg_tombstone_detection_events(
     trace_ids: &[String],
     erased_at: chrono::DateTime<chrono::Utc>,
 ) -> Result<u64, crate::federation::Error> {
-    use crate::federation::Error;
+    // v57.0.0 (CIRISPersist#988 item 3; lead ruling 5) — PRE-v57 rows only.
+    // A row-backed detection is a signed row: its erasure goes through the
+    // purge door (its trace is its `evidence_refs`, so a purge of the trace
+    // derives it), never an in-place rewrite here. A legacy row not yet
+    // rehomed has no row: it takes the V080 tombstone in place, as before.
     if trace_ids.is_empty() {
         return Ok(0);
     }
-    // A pre-v57 row not yet rehomed has no row to redact: it takes the V080
-    // tombstone in place, as before.
-    let mut tombstoned = tx
-        .execute(
-            "UPDATE cirislens_derived.detection_events \
-             SET trace_id = NULL, body_sha256 = NULL, \
-                 canonical_bytes = NULL, erased_at = $2 \
-             WHERE trace_id = ANY($1::text[]) AND erased_at IS NULL \
-               AND attestation_id IS NULL",
-            &[&trace_ids, &erased_at],
-        )
-        .await
-        .map_err(|e| Error::Backend(format!("tombstone legacy detection_events: {e}")))?;
-    // v57.0.0 (CIRISPersist#988 item 3) — the V080 tombstone is the projection
-    // of the REDACTED ROW (`redact_detection_row`). The projection is read here
-    // only to FIND the rows (its trace_id index); nothing decides on it.
-    let ids: Vec<String> = tx
-        .query(
-            "SELECT attestation_id FROM cirislens_derived.detection_events \
-              WHERE trace_id = ANY($1::text[]) AND erased_at IS NULL \
-                AND attestation_id IS NOT NULL",
-            &[&trace_ids],
-        )
-        .await
-        .map_err(|e| Error::Backend(format!("find detection rows: {e}")))?
-        .into_iter()
-        .map(|r| r.safe_get_with::<String, _, _, _>(0, Error::Backend))
-        .collect::<Result<_, _>>()?;
-    for id in ids {
-        let Some(row) = tx
-            .query_opt(
-                &format!(
-                    "SELECT {PG_ATTESTATION_COLUMNS} FROM cirislens.federation_attestations \
-                     WHERE attestation_id = $1"
-                ),
-                &[&id],
-            )
-            .await
-            .map_err(|e| Error::Backend(format!("read detection row: {e}")))?
-        else {
-            continue;
-        };
-        let row = pg_row_to_attestation(row)?;
-        let Some(redacted) = crate::derived::detection_row::redact_detection_row(&row, erased_at)?
-        else {
-            continue;
-        };
-        let projection = crate::derived::detection_row::project_detection_row(&redacted)
-            .ok_or_else(|| Error::Backend("a redacted detection row does not project".into()))?;
-        // The row goes to the local tier unsigned: its wire-index entry leaves
-        // with the signature, and the row is re-stored in its redacted form
-        // (the cascade takes the old projection row with the old row).
-        let record_key = crate::federation::wire_index::record_key(&[("attestation_id", &id)]);
-        tx.execute(
-            "DELETE FROM cirislens.signed_wire_index \
-             WHERE kind = 'Attestation' AND record_key = $1",
-            &[&record_key],
-        )
-        .await
-        .map_err(|e| Error::Backend(format!("detection wire index: {e}")))?;
-        tx.execute(
-            "DELETE FROM cirislens.federation_attestations WHERE attestation_id = $1",
-            &[&id],
-        )
-        .await
-        .map_err(|e| Error::Backend(format!("redact detection row: {e}")))?;
-        pg_insert_local_attestation_row(tx, &redacted, None).await?;
-        pg_project_detection(
-            tx,
-            "cirislens_derived.detection_events",
-            &redacted.attestation_id,
-            &projection,
-        )
-        .await?;
-        tombstoned += 1;
-    }
-    Ok(tombstoned)
+    tx.execute(
+        "UPDATE cirislens_derived.detection_events \
+         SET trace_id = NULL, body_sha256 = NULL, \
+             canonical_bytes = NULL, erased_at = $2 \
+         WHERE trace_id = ANY($1::text[]) AND erased_at IS NULL \
+           AND attestation_id IS NULL",
+        &[&trace_ids, &erased_at],
+    )
+    .await
+    .map_err(|e| {
+        crate::federation::Error::Backend(format!("tombstone legacy detection_events: {e}"))
+    })
 }
 
 /// CIRISPersist#222 — the rollup's whole-bucket recompute: an idempotent
@@ -3476,9 +3415,14 @@ impl Backend for PostgresBackend {
         // before the transaction (the plan inside it reads nothing). Held as
         // a Result: a door that deletes nothing records nothing and needs no
         // attester; one that deletes is refused, rolled back, without one.
-        let attester = crate::federation::attestation_admit::hard_case_attester(self)
-            .await
-            .map_err(|e| format!("{}: {e}", e.kind()));
+        // An act: refused, typed, before anything moves when this node cannot
+        // attest its audit row (CIRISPersist#988 ruling: a host must hold a
+        // node key before any erasure is recorded).
+        let attester: Result<_, String> = Ok(
+            crate::federation::attestation_admit::hard_case_attester(self)
+                .await
+                .map_err(Error::from_hard_case_attester)?,
+        );
         let received_at = chrono::Utc::now();
         let mut client = self
             .pool
@@ -3651,9 +3595,14 @@ impl Backend for PostgresBackend {
     ) -> Result<super::types::ErasureSummary, Error> {
         // v57.0.0 (CIRISPersist#988 item 2) — the audit row's attester, read
         // before the transaction (see `delete_traces_for_agent`).
-        let attester = crate::federation::attestation_admit::hard_case_attester(self)
-            .await
-            .map_err(|e| format!("{}: {e}", e.kind()));
+        // An act: refused, typed, before anything moves when this node cannot
+        // attest its audit row (CIRISPersist#988 ruling: a host must hold a
+        // node key before any erasure is recorded).
+        let attester: Result<_, String> = Ok(
+            crate::federation::attestation_admit::hard_case_attester(self)
+                .await
+                .map_err(Error::from_hard_case_attester)?,
+        );
         let erased_at = chrono::Utc::now();
         let mut client = self
             .pool
@@ -6133,6 +6082,23 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 )
                 .await
                 .map_err(|e| crate::federation::Error::Backend(format!("purge wire index: {e}")))?;
+                // v57.0.0 (CIRISPersist#988 item 3; lead ruling 5) — a
+                // tombstoned detection row's projection is the V080
+                // tombstone at its execution's instant, in this write. Only
+                // a live projection row moves: the earliest-admitted
+                // execution's instant stands (the rebuild's rule).
+                tx.execute(
+                    "UPDATE cirislens_derived.detection_events \
+                     SET trace_id = NULL, body_sha256 = NULL, canonical_bytes = NULL, \
+                         erased_at = (SELECT executed_at FROM cirislens.purge_executions \
+                                       WHERE notice_id = $2) \
+                     WHERE attestation_id = $1 AND erased_at IS NULL",
+                    &[&t.record_ref, &t.notice_id],
+                )
+                .await
+                .map_err(|e| {
+                    crate::federation::Error::Backend(format!("purge detection projection: {e}"))
+                })?;
             }
         }
         tx.commit()
@@ -23429,7 +23395,9 @@ impl crate::federation::attestation_admit::AttestationStore for PostgresBackend 
                 &event,
                 attester,
                 crate::federation::attestation_admit::PlanInstants {
-                    fold_at: received_at,
+                    // The silo row's own recorded instant (never the rehome's clock),
+                    // bounded by the receipt clock.
+                    fold_at: event.emitted_at.min(received_at),
                     received_at,
                 },
             )?;
@@ -23518,7 +23486,9 @@ impl crate::federation::attestation_admit::AttestationStore for PostgresBackend 
                 &body,
                 &identity_type,
                 crate::federation::attestation_admit::PlanInstants {
-                    fold_at: received_at,
+                    // The silo row's own recorded instant (never the rehome's clock),
+                    // bounded by the receipt clock.
+                    fold_at: body.ts.min(received_at),
                     received_at,
                 },
             ) {
@@ -23618,7 +23588,24 @@ impl crate::federation::attestation_admit::AttestationStore for PostgresBackend 
                     }
                 }
                 SiloProjection::DetectionEvents => {
-                    if let Some(p) = crate::derived::detection_row::project_detection_row(&row) {
+                    // The tombstone instant: the earliest-admitted execution
+                    // naming the row (the live UPDATE's rule).
+                    let tombstoned_at: Option<chrono::DateTime<chrono::Utc>> = tx
+                        .query_opt(
+                            "SELECT e.executed_at FROM cirislens.purge_tombstones t \
+                               JOIN cirislens.purge_executions e ON e.notice_id = t.notice_id \
+                              WHERE t.plane = 'attestation' AND t.record_ref = $1 \
+                              ORDER BY e.admitted_at, e.notice_id LIMIT 1",
+                            &[&row.attestation_id],
+                        )
+                        .await
+                        .map_err(|e| Error::Backend(format!("projection_rebuild tombstone: {e}")))?
+                        .map(|r| r.safe_get_with(0, Error::Backend))
+                        .transpose()?;
+                    if let Some(p) = crate::derived::detection_row::project_detection_row_under(
+                        &row,
+                        tombstoned_at,
+                    ) {
                         pg_project_detection(&*tx, scratch, &row.attestation_id, &p).await?;
                     }
                 }
@@ -34641,6 +34628,21 @@ mod tests {
             .put_detection_event(mk_det(det_z, &trace_unrelated))
             .await
             .unwrap();
+        // v57.0.0 (#988 item 3, lead ruling 5) — the DSAR door's in-place
+        // V080 tombstone now applies only to PRE-v57 silo rows (no backing
+        // row); a row-backed detection is erased through the purge door
+        // (I825). Shape both as pre-v57 rows to keep this witness on the
+        // legacy path it pins.
+        backend
+            .test_execute(&format!(
+                "UPDATE cirislens_derived.detection_events SET attestation_id = NULL \
+                  WHERE detection_id IN ('{det_a}', '{det_z}'); \
+                 DELETE FROM cirislens.federation_attestations \
+                  WHERE attestation_id IN ('{}', '{}')",
+                crate::derived::detection_row::detection_attestation_id(&det_a),
+                crate::derived::detection_row::detection_attestation_id(&det_z),
+            ))
+            .await;
 
         let summary = backend
             .delete_traces_for_agent_id_hash(&agent)

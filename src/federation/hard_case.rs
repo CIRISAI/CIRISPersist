@@ -609,6 +609,31 @@ pub fn recipient_excluded_event_id(
 //  v57.0.0 (CIRISPersist#988 item 2, CC 3.1.9.4) — the row on the plane
 // ─────────────────────────────────────────────────────────────────────────
 
+/// v57.0.0 (CIRISPersist#988 item 2) — **the named refusals of the hard_case
+/// plane**, as the stable `kind()` tokens consumers key on. From-disk
+/// visible on purpose: the CHANGELOG, the Python surface and the gates all
+/// name these constants, never a spelling of their own.
+pub mod refusal {
+    /// A `hard_case:*` row offered to the federation tier (the crossing, the
+    /// put door, the replicated apply) while replication is held
+    /// ([`super::check_hard_case_replication_held`]). Unblocks when
+    /// CIRISConstitution#170 is ruled AND persist can tell which peers carry
+    /// the unpurgeable refusal (a peer capability advertisement, which
+    /// persist does not have today).
+    pub const REPLICATION_HELD: &str = "federation_hard_case_replication_held";
+    /// This node cannot attest a `hard_case:*` row: it has no declared node
+    /// key, or does not hold the one it declared. An act that must record
+    /// one (an erasure, a peer removal, `record_hard_case`) is refused before
+    /// it mutates anything. Python: `ciris_persist.NodeIdentityRequired`.
+    pub const ATTESTER_UNAVAILABLE: &str = "federation_hard_case_attester_unavailable";
+    /// [`ATTESTER_UNAVAILABLE`]'s reason: no node key was declared
+    /// (`set_node_key_id`).
+    pub const NODE_KEY_UNSET: &str = "node_key_unset";
+    /// [`ATTESTER_UNAVAILABLE`]'s reason: the declared node key is not held in
+    /// `federation_keys` (register it with `register_self_federation_key`).
+    pub const NODE_KEY_NOT_HELD: &str = "node_key_not_held";
+}
+
 /// The family stem of every `hard_case:*` row (CC 3.1.9.4).
 pub const DIMENSION_PREFIX: &str = "hard_case:";
 
@@ -705,12 +730,7 @@ where
 {
     let event_id = event.event_id.clone();
     match dir.record_hard_case(event).await {
-        Err(e @ super::Error::NodeIdentityUnset { .. })
-        | Err(
-            e @ super::Error::AttesterKeyUnknown {
-                plane: "hard_case", ..
-            },
-        ) => {
+        Err(e @ super::Error::HardCaseAttesterUnavailable { .. }) => {
             tracing::warn!(
                 event_id,
                 refusal = e.kind(),

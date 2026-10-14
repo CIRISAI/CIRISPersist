@@ -3489,7 +3489,6 @@ pub(crate) mod bodies {
         .unwrap();
     }
 
-    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     fn detection(trace_id: &str, canonical: &[u8]) -> crate::derived::DetectionEvent {
         crate::derived::DetectionEvent {
             detection_id: uuid::Uuid::new_v4(),
@@ -3506,16 +3505,27 @@ pub(crate) mod bodies {
             ed25519_sig: vec![1u8; 64],
             ml_dsa_65_sig: vec![2u8; 3309],
             signing_key_id: "key-lens".to_owned(),
-            ts: chrono::Utc::now(),
+            ts: crate::federation::admission::truncate_to_substrate_resolution(chrono::Utc::now()),
         }
     }
 
-    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    /// I825 (v54.1.0; v57.0.0, CIRISPersist#988 item 3, lead ruling 5) — **a
+    /// purged trace's detections go through the purge door.** A detection is
+    /// a signed `detection:*` row whose `evidence_refs` names its trace, so a
+    /// purge of the trace's actor DERIVES the row ("scores over purged
+    /// evidence follow it"): one tombstone mechanism, no in-place redaction.
+    /// While the tombstone stands the projection row is the V080 tombstone
+    /// and the table is still its rows' rebuild
+    /// (CLM-silo-projection-rebuildable); after `purge_finalize` deletes the
+    /// row its projection row is gone, and the rebuild is byte-equal again.
     pub(crate) async fn i825_a_purged_traces_detections_are_tombstoned<
-        D: Seams + crate::derived::DerivedSchema,
+        D: Seams
+            + crate::derived::DerivedSchema
+            + crate::federation::attestation_admit::AttestationStore,
     >(
         d: &D,
     ) {
+        use crate::federation::silo_projection::{check_projection_rebuild, SiloProjection};
         root(d).await;
         seed_trace(d, "trace-i825", AGENT, "gpt-real").await;
         seed_trace(d, "trace-i825-other", BYSTANDER, "gpt-real").await;
@@ -3528,13 +3538,69 @@ pub(crate) mod bodies {
             crate::federation::types::identity_type::LENSCORE_DETECTOR,
         )
         .await;
-        d.put_detection_event(detection("trace-i825", b"purged-body"))
-            .await
-            .unwrap();
+        let purged = detection("trace-i825", b"purged-body");
+        d.put_detection_event(purged.clone()).await.unwrap();
         d.put_detection_event(detection("trace-i825-other", b"kept-body"))
             .await
             .unwrap();
-        purge_trace(d, "trace-i825").await;
+        let purged_row =
+            crate::derived::detection_row::detection_attestation_id(&purged.detection_id);
+
+        // The purge door: the actor's selection derives the detection row
+        // through its evidence (the trace).
+        let dir = d.as_dyn_directory();
+        let t = now();
+        let sel = PurgeSelection::ByActor {
+            key_id: AGENT.to_owned(),
+        };
+        let dry = sp::purge_dry_run(dir, &sel).await.unwrap();
+        assert!(
+            dry.ledger_tsv
+                .contains(&format!("attestation:{purged_row}\ttrace:trace-i825")),
+            "I825: the purge door derives the detection row from its trace:\n{}",
+            dry.ledger_tsv
+        );
+        let notice = notice_for(&dry.notice_template, &[cc::FOUNDERS[0], cc::FOUNDERS[1]], t);
+        let rep = rows_at(dir, &sel, &notice, NODE, t).await.unwrap();
+
+        // The window: the row is tombstoned, its projection row is the V080
+        // tombstone, and the table is its rows' rebuild.
+        assert!(
+            d.get_attestation(&purged_row).await.unwrap().is_some(),
+            "I825: the row stands until finalize"
+        );
+        check_projection_rebuild(d, SiloProjection::DetectionEvents)
+            .await
+            .expect("I825: in the window, detection_events is its rows' rebuild");
+        let in_window = d
+            .get_detection_events(crate::derived::EventFilter {
+                trace_id: Some("trace-i825".to_owned()),
+                detector: None,
+                since: None,
+            })
+            .await
+            .unwrap();
+        assert!(
+            in_window.is_empty(),
+            "I825: a tombstoned detection is not returned: {in_window:?}"
+        );
+
+        finalize_at(
+            dir,
+            &rep.notice_id,
+            t + chrono::Duration::seconds(sp::PURGE_SETTLE_DWELL_SECS + 1),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            d.get_attestation(&purged_row).await.unwrap().is_none(),
+            "I825: finalize deleted the detection row"
+        );
+        check_projection_rebuild(d, SiloProjection::DetectionEvents)
+            .await
+            .expect("I825: after finalize, detection_events is its rows' rebuild");
+
         let all = d
             .get_detection_events(crate::derived::EventFilter {
                 trace_id: None,
@@ -3571,15 +3637,6 @@ pub(crate) mod bodies {
             matches!(&e, crate::derived::Error::InvalidArgument(m) if m.starts_with(token::TOMBSTONED)),
             "I825: {e:?}"
         );
-        assert!(d
-            .get_detection_events(crate::derived::EventFilter {
-                trace_id: Some("trace-i825".to_owned()),
-                detector: None,
-                since: None,
-            })
-            .await
-            .unwrap()
-            .is_empty());
     }
 
     pub(crate) async fn i826_a_reused_thought_reads_its_own_signature<D: Seams>(d: &D) {
@@ -4163,6 +4220,15 @@ mod run {
                 }
             }
         };
+    }
+
+    /// v57.0.0 (CIRISPersist#988 item 3) — memory holds detections now, so
+    /// I825 runs on all three backends (its rollup sibling I696 stays SQL).
+    #[tokio::test]
+    async fn i825_memory() {
+        let b = crate::store::memory::MemoryBackend::new();
+        crate::federation::hard_case::test_support::declare_node(&b, "inv-node").await;
+        super::bodies::i825_a_purged_traces_detections_are_tombstoned(&b).await
     }
 
     #[cfg(any(feature = "sqlite", feature = "postgres"))]

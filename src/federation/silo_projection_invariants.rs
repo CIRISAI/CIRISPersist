@@ -11,9 +11,23 @@
 //!   The row is unpurgeable (the accountability-record family) and does not
 //!   enter the federation tier (held replication).
 //! - **I961 (`detection_events`)** — `put_detection_event` (twice, plus an
-//!   idempotent re-put and a conflicting one), then the Art. 17 erasure of
-//!   one detection's trace: the redacted row's projection is the V080
-//!   tombstone, and the rebuild is byte-equal again.
+//!   idempotent re-put and a conflicting one), then the DSAR erasure of one
+//!   detection's trace, which leaves the signed rows alone (their erasure is
+//!   the purge door's: I825), and the rebuild is byte-equal again.
+//!
+//! - **I962 (the attester refusal, lead ruling 3)** — with no node key an
+//!   erasure, a peer removal and `record_hard_case` are each refused with the
+//!   typed `HardCaseAttesterUnavailable` (kind
+//!   `hard_case::refusal::ATTESTER_UNAVAILABLE`) and NOTHING moves; with the
+//!   node key held the same erasure SUCCEEDS, records its
+//!   `hard_case:trace_erasure:v1` row, and the projection is its rebuild.
+//! - **I963 (the legacy rehome, lead ruling 4)** — pre-v57 silo rows (no
+//!   backing row) are moved onto the plane by the first emitter after the
+//!   upgrade; each rehomed row's `asserted_at` is the silo row's own
+//!   recorded instant (never the rehome's clock), a second rehome adds
+//!   nothing, and the projection is its rebuild after it. On sqlite and
+//!   postgres; memory holds no pre-v57 rows and its rehome is a declared
+//!   no-op (`store::parity`), asserted here.
 //!
 //! Each runner then TAMPERS with the live table (one column of one row) and
 //! asserts the gate goes red: a witness that cannot fail is a report.
@@ -229,9 +243,13 @@ pub(crate) mod bodies {
         (a, c)
     }
 
-    /// I961, after the runner erased `erased`'s trace: the tombstone is the
-    /// redacted row's projection, the other detection is untouched, and the
-    /// rebuild is byte-equal.
+    /// I961, after the runner ran the DSAR erasure of `erased`'s trace (lead
+    /// ruling 5): a detection is a signed row, and its erasure goes through
+    /// the purge door (I825), never an in-place rewrite. The DSAR door has no
+    /// authority over another key's signed row (the purge door needs the
+    /// trust root's cosigned notice), so it leaves both detections and their
+    /// projection rows as they were, and the table is still its rows'
+    /// rebuild.
     pub(crate) async fn i961_after_erasure<B>(
         b: &B,
         erased: &crate::derived::DetectionEvent,
@@ -239,40 +257,200 @@ pub(crate) mod bodies {
     ) where
         B: AttestationStore + crate::derived::DerivedSchema,
     {
-        let row = b
-            .get_attestation(&crate::derived::detection_row::detection_attestation_id(
-                &erased.detection_id,
-            ))
-            .await
-            .expect("I961: get")
-            .expect("I961: the redacted row stands");
-        let body = crate::derived::detection_row::project_detection_row(&row)
-            .expect("I961: the redacted row projects");
-        assert!(body.erased_at.is_some(), "I961: tombstoned");
-        assert_eq!(body.trace_id, None, "I961: the linkage left the ROW");
-        assert_eq!(body.canonical_bytes, None);
-        assert!(
-            b.get_detection_events(crate::derived::EventFilter {
-                trace_id: Some(erased.trace_id.clone()),
-                ..Default::default()
-            })
-            .await
-            .expect("I961: read")
-            .is_empty(),
-            "I961: a tombstone is not returned"
-        );
-        assert_eq!(
-            b.get_detection_events(crate::derived::EventFilter {
-                trace_id: Some(kept.trace_id.clone()),
-                ..Default::default()
-            })
-            .await
-            .expect("I961: read"),
-            vec![kept.clone()]
-        );
+        for e in [erased, kept] {
+            assert_eq!(
+                b.get_detection_events(crate::derived::EventFilter {
+                    trace_id: Some(e.trace_id.clone()),
+                    ..Default::default()
+                })
+                .await
+                .expect("I961: read"),
+                vec![e.clone()],
+                "I961: the DSAR door does not rewrite a signed detection row"
+            );
+        }
         check_projection_rebuild(b, SiloProjection::DetectionEvents)
             .await
-            .expect("I961: the tombstoned table is its rows' rebuild");
+            .expect("I961: after the DSAR erasure, detection_events is its rows' rebuild");
+    }
+
+    /// I962 (no node key) — every act that must record a hard_case row is
+    /// refused, typed, and nothing moves.
+    pub(crate) async fn i962_refused_without_a_node_key<B>(b: &B, tag: &str)
+    where
+        B: AttestationStore + crate::store::Backend,
+    {
+        use crate::federation::hard_case::refusal;
+        let agent = format!("{tag}-agent-h");
+        b.insert_trace_events_batch(&[trace_row(&format!("{tag}-trace"), &agent)])
+            .await
+            .unwrap();
+        match b.delete_traces_for_agent_id_hash(&agent).await {
+            Err(e @ crate::store::Error::HardCaseAttesterUnavailable(_)) => {
+                assert_eq!(e.kind(), refusal::ATTESTER_UNAVAILABLE, "I962: {e}");
+            }
+            other => panic!("I962: the erasure must refuse, typed, got {other:?}"),
+        }
+        assert_eq!(
+            b.fetch_trace_events_page(0, 10, Some(&agent))
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "I962: the refused erasure deleted nothing"
+        );
+        let peer = format!("{tag}-peer");
+        b.add_peer_record(&peer, "AAAA", identity_type::AGENT, None)
+            .await
+            .unwrap();
+        let e = b
+            .remove_peer_record(&peer, false, "I962", None)
+            .await
+            .expect_err("I962: the peer removal must refuse");
+        assert_eq!(e.kind(), refusal::ATTESTER_UNAVAILABLE, "I962: {e}");
+        assert!(
+            b.peer_metadata_for(&peer)
+                .await
+                .unwrap()
+                .is_some_and(|m| m.removed_at.is_none()),
+            "I962: the refused removal left the peer live"
+        );
+        let e = b
+            .record_hard_case(event(
+                &format!("{tag}-x"),
+                hard_case::kind::CONSENT_SLA_BREACH,
+                serde_json::json!({}),
+            ))
+            .await
+            .expect_err("I962: record_hard_case must refuse");
+        assert_eq!(e.kind(), refusal::ATTESTER_UNAVAILABLE, "I962: {e}");
+        assert!(
+            b.list_hard_case_events(hard_case::HardCaseFilter::default())
+                .await
+                .unwrap()
+                .is_empty(),
+            "I962: nothing was recorded"
+        );
+    }
+
+    /// I962 (node key held) — the same erasure succeeds and records its row.
+    pub(crate) async fn i962_succeeds_with_the_node_key<B>(b: &B, node: &str, tag: &str)
+    where
+        B: AttestationStore + crate::store::Backend,
+    {
+        let agent = format!("{tag}-agent-h");
+        let summary = b
+            .delete_traces_for_agent_id_hash(&agent)
+            .await
+            .expect("I962: with a held node key the erasure succeeds");
+        assert_eq!(summary.trace_events, 1, "I962: the trace was erased");
+        let rows = b
+            .list_hard_case_events(hard_case::HardCaseFilter {
+                kind: Some(hard_case::kind::TRACE_ERASURE.to_owned()),
+                since: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1, "I962: the erasure recorded its row");
+        let row = b
+            .get_attestation(&hard_case::hard_case_attestation_id(&rows[0].event_id))
+            .await
+            .unwrap()
+            .expect("I962: the record is a row");
+        assert_eq!(row.attesting_key_id, node, "I962: attested by the node key");
+        check_projection_rebuild(b, SiloProjection::HardCaseEvents)
+            .await
+            .expect("I962: hard_case_events is its rows' rebuild");
+    }
+
+    /// I963 — after the runner seeded pre-v57 silo rows (`legacy_event_id`
+    /// emitted at `legacy_at`, a detection `legacy_detection` at
+    /// `legacy_detection_ts`), the first emitters rehome them.
+    pub(crate) async fn i963_the_rehome<B>(
+        b: &B,
+        node: &str,
+        tag: &str,
+        legacy_event_id: &str,
+        legacy_at: chrono::DateTime<chrono::Utc>,
+        legacy_detection: Option<(uuid::Uuid, chrono::DateTime<chrono::Utc>, &str)>,
+    ) where
+        B: AttestationStore + crate::derived::DerivedSchema,
+    {
+        let trunc = crate::federation::admission::truncate_to_substrate_resolution;
+        // The first hard_case emitter rehomes the legacy hard_case row.
+        b.record_hard_case(event(
+            &format!("{tag}-new"),
+            hard_case::kind::CONSENT_SLA_BREACH,
+            serde_json::json!({}),
+        ))
+        .await
+        .expect("I963: the first emitter after the upgrade");
+        let row = b
+            .get_attestation(&hard_case::hard_case_attestation_id(legacy_event_id))
+            .await
+            .unwrap()
+            .expect("I963: the legacy event is a row now");
+        assert_eq!(row.attesting_key_id, node);
+        assert_eq!(
+            row.asserted_at,
+            trunc(legacy_at),
+            "I963: the rehomed row is asserted at the silo row's own instant, never the boot clock"
+        );
+        check_projection_rebuild(b, SiloProjection::HardCaseEvents)
+            .await
+            .expect("I963: after the rehome, hard_case_events is its rows' rebuild");
+        if let Some((detection_id, ts, detector)) = legacy_detection {
+            // The first detection put rehomes the legacy detection row.
+            let mut fresh = detection(&format!("{tag}-trace-new"), detector);
+            fresh.ts = trunc(chrono::Utc::now());
+            b.put_detection_event(fresh)
+                .await
+                .expect("I963: a detection put");
+            let row = b
+                .get_attestation(&crate::derived::detection_row::detection_attestation_id(
+                    &detection_id,
+                ))
+                .await
+                .unwrap()
+                .expect("I963: the legacy detection is a row now");
+            assert_eq!(row.attesting_key_id, detector);
+            assert_eq!(
+                row.asserted_at,
+                trunc(ts),
+                "I963: asserted at the detection's ts"
+            );
+            check_projection_rebuild(b, SiloProjection::DetectionEvents)
+                .await
+                .expect("I963: after the rehome, detection_events is its rows' rebuild");
+        }
+        // Idempotent: a second rehome (a second boot) adds nothing.
+        let attester = crate::federation::attestation_admit::HardCaseAttester {
+            key_id: node.to_owned(),
+            identity_type: identity_type::NODE.to_owned(),
+        };
+        let before = b
+            .list_hard_case_events(hard_case::HardCaseFilter::default())
+            .await
+            .unwrap();
+        b.rehome_legacy_hard_case_events(&attester, chrono::Utc::now())
+            .await
+            .unwrap();
+        b.rehome_legacy_detection_events(chrono::Utc::now())
+            .await
+            .unwrap();
+        assert_eq!(
+            b.list_hard_case_events(hard_case::HardCaseFilter::default())
+                .await
+                .unwrap(),
+            before,
+            "I963: a second rehome adds nothing"
+        );
+        check_projection_rebuild(b, SiloProjection::HardCaseEvents)
+            .await
+            .expect("I963: still its rows' rebuild");
+        check_projection_rebuild(b, SiloProjection::DetectionEvents)
+            .await
+            .expect("I963: still its rows' rebuild");
     }
 
     /// A trace event row for `agent` on `trace`, so the erasure has something
@@ -358,8 +536,56 @@ mod run {
             .delete_traces_for_agent_id_hash(&format!("{t}-agent-h"))
             .await
             .unwrap();
-        assert_eq!(summary.detection_events_tombstoned, 1, "I961 memory");
+        assert_eq!(
+            summary.detection_events_tombstoned, 0,
+            "I961 memory: no row is rewritten"
+        );
         bodies::i961_after_erasure(&b, &a, &c).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn i962_memory() {
+        let b = crate::store::memory::MemoryBackend::new();
+        let t = tag("i962m");
+        bodies::i962_refused_without_a_node_key(&b, &t).await;
+        let node = format!("{t}-node");
+        bodies::register_node(&b, &node).await;
+        b.set_node_key_id(&node);
+        bodies::i962_succeeds_with_the_node_key(&b, &node, &t).await;
+    }
+
+    /// Memory holds no pre-v57 rows: its rehome is a no-op (a declared
+    /// divergence in `store::parity`), and the gates hold.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn i963_memory() {
+        use crate::federation::FederationDirectory as _;
+        let b = crate::store::memory::MemoryBackend::new();
+        let t = tag("i963m");
+        let node = format!("{t}-node");
+        bodies::register_node(&b, &node).await;
+        b.set_node_key_id(&node);
+        bodies::i960_hard_case(&b, &node, &t).await;
+        let before = b
+            .list_hard_case_events(crate::federation::hard_case::HardCaseFilter::default())
+            .await
+            .unwrap();
+        let attester = crate::federation::attestation_admit::HardCaseAttester {
+            key_id: node.clone(),
+            identity_type: crate::federation::types::identity_type::NODE.to_owned(),
+        };
+        use crate::federation::attestation_admit::AttestationStore as _;
+        b.rehome_legacy_hard_case_events(&attester, chrono::Utc::now())
+            .await
+            .unwrap();
+        assert_eq!(
+            b.list_hard_case_events(crate::federation::hard_case::HardCaseFilter::default())
+                .await
+                .unwrap(),
+            before
+        );
+        check_projection_rebuild(&b, SiloProjection::HardCaseEvents)
+            .await
+            .unwrap();
     }
 
     /// Memory has no SQL to tamper with; its red is the rebuild of a map
@@ -428,7 +654,10 @@ mod run {
             .delete_traces_for_agent_id_hash(&format!("{t}-agent-h"))
             .await
             .unwrap();
-        assert_eq!(summary.detection_events_tombstoned, 1, "I961 sqlite");
+        assert_eq!(
+            summary.detection_events_tombstoned, 0,
+            "I961 sqlite: no row is rewritten"
+        );
         bodies::i961_after_erasure(&b, &a, &c).await;
         // RED: a projection row whose row is gone is not a rebuild.
         b.test_execute(
@@ -442,6 +671,67 @@ mod run {
                 .is_err(),
             "I961 sqlite: a moved column is red"
         );
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn i962_sqlite() {
+        let b = sqlite().await;
+        let t = tag("i962s");
+        bodies::i962_refused_without_a_node_key(&b, &t).await;
+        let node = format!("{t}-node");
+        bodies::register_node(&b, &node).await;
+        b.set_node_key_id(&node);
+        bodies::i962_succeeds_with_the_node_key(&b, &node, &t).await;
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn i963_sqlite() {
+        let b = sqlite().await;
+        let t = tag("i963s");
+        let legacy_at: chrono::DateTime<chrono::Utc> =
+            "2026-01-02T03:04:05.123456789Z".parse().unwrap();
+        let detection_id = uuid::Uuid::new_v4();
+        let ts: chrono::DateTime<chrono::Utc> = "2026-02-03T04:05:06.654321Z".parse().unwrap();
+        let lens = format!("{t}-lens");
+        crate::federation::tier_ingest::test_support::register_hybrid_key_as(
+            &b,
+            &lens,
+            &lens,
+            crate::federation::types::identity_type::LENSCORE_DETECTOR,
+        )
+        .await;
+        // Pre-v57 silo rows, as a v56 node wrote them (no backing row).
+        b.test_execute(&format!(
+            "INSERT INTO hard_case_events \
+                (event_id, kind, target_key_id, subject_key_id, detail, emitted_at) \
+             VALUES ('{t}-legacy', 'consent_sla_breach', 'tgt', NULL, '{{\"sla_days\":3}}', \
+                     '{}'); \
+             INSERT INTO cirislens_derived_detection_events \
+                (detection_id, trace_id, body_sha256, detector, severity, cohort_cell, \
+                 conformity_variant, conformity_payload, lens_core_version, \
+                 ratchet_calibration_version, canonical_bytes, ed25519_sig, ml_dsa_65_sig, \
+                 signing_key_id, ts) \
+             VALUES ('{detection_id}', '{t}-trace-old', zeroblob(32), \
+                     'manifold_conformity_outlier', 'info', '{{}}', 'numeric', '{{}}', '1', 1, \
+                     x'7b7d', zeroblob(64), zeroblob(3309), '{lens}', '{}')",
+            legacy_at.to_rfc3339(),
+            ts.to_rfc3339(),
+        ))
+        .await;
+        let node = format!("{t}-node");
+        bodies::register_node(&b, &node).await;
+        b.set_node_key_id(&node);
+        bodies::i963_the_rehome(
+            &b,
+            &node,
+            &t,
+            &format!("{t}-legacy"),
+            legacy_at,
+            Some((detection_id, ts, &lens)),
+        )
+        .await;
     }
 
     #[cfg(feature = "postgres")]
@@ -496,7 +786,10 @@ mod run {
             .delete_traces_for_agent_id_hash(&format!("{t}-agent-h"))
             .await
             .unwrap();
-        assert_eq!(summary.detection_events_tombstoned, 1, "I961 postgres");
+        assert_eq!(
+            summary.detection_events_tombstoned, 0,
+            "I961 postgres: no row is rewritten"
+        );
         bodies::i961_after_erasure(&b, &a, &c).await;
         b.test_execute(
             "UPDATE cirislens_derived.detection_events SET severity = 'critical' \
@@ -510,5 +803,69 @@ mod run {
             "I961 postgres: a moved column is red"
         );
         eprintln!("i961_postgres: RAN");
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn i962_postgres() {
+        let Some(b) = postgres().await else { return };
+        let t = tag("i962p");
+        bodies::i962_refused_without_a_node_key(&b, &t).await;
+        let node = format!("{t}-node");
+        bodies::register_node(&b, &node).await;
+        b.set_node_key_id(&node);
+        bodies::i962_succeeds_with_the_node_key(&b, &node, &t).await;
+        eprintln!("i962_postgres: RAN");
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn i963_postgres() {
+        let Some(b) = postgres().await else { return };
+        let t = tag("i963p");
+        let legacy_at: chrono::DateTime<chrono::Utc> =
+            "2026-01-02T03:04:05.123456Z".parse().unwrap();
+        let detection_id = uuid::Uuid::new_v4();
+        let ts: chrono::DateTime<chrono::Utc> = "2026-02-03T04:05:06.654321Z".parse().unwrap();
+        let lens = format!("{t}-lens");
+        crate::federation::tier_ingest::test_support::register_hybrid_key_as(
+            &b,
+            &lens,
+            &lens,
+            crate::federation::types::identity_type::LENSCORE_DETECTOR,
+        )
+        .await;
+        b.test_execute(&format!(
+            "INSERT INTO cirislens.hard_case_events \
+                (event_id, kind, target_key_id, subject_key_id, detail, emitted_at) \
+             VALUES ('{t}-legacy', 'consent_sla_breach', 'tgt', NULL, \
+                     '{{\"sla_days\":3}}'::jsonb, '{}'); \
+             INSERT INTO cirislens_derived.detection_events \
+                (detection_id, trace_id, body_sha256, detector, severity, cohort_cell, \
+                 conformity_variant, conformity_payload, lens_core_version, \
+                 ratchet_calibration_version, canonical_bytes, ed25519_sig, ml_dsa_65_sig, \
+                 signing_key_id, ts) \
+             VALUES ('{detection_id}', '{t}-trace-old', decode(repeat('00', 32), 'hex'), \
+                     'manifold_conformity_outlier', 'info', '{{}}'::jsonb, 'numeric', \
+                     '{{}}'::jsonb, '1', 1, decode('7b7d', 'hex'), \
+                     decode(repeat('00', 64), 'hex'), decode(repeat('00', 3309), 'hex'), \
+                     '{lens}', '{}')",
+            legacy_at.to_rfc3339(),
+            ts.to_rfc3339(),
+        ))
+        .await;
+        let node = format!("{t}-node");
+        bodies::register_node(&b, &node).await;
+        b.set_node_key_id(&node);
+        bodies::i963_the_rehome(
+            &b,
+            &node,
+            &t,
+            &format!("{t}-legacy"),
+            legacy_at,
+            Some((detection_id, ts, &lens)),
+        )
+        .await;
+        eprintln!("i963_postgres: RAN");
     }
 }

@@ -10002,6 +10002,29 @@ pub enum Error {
         dimension: String,
     },
 
+    /// v57.0.0 (CIRISPersist#988 item 2) — this node cannot attest a
+    /// `hard_case:*` row (CC 3.1.9.4: the attester is the node key): it has
+    /// no declared node key (`reason` [`hard_case::refusal::NODE_KEY_UNSET`])
+    /// or does not hold the one it declared
+    /// ([`hard_case::refusal::NODE_KEY_NOT_HELD`]). An act that must record a
+    /// hard_case row (an erasure, a peer removal, `record_hard_case`) is
+    /// refused before it mutates anything. Kind
+    /// [`hard_case::refusal::ATTESTER_UNAVAILABLE`]; Python
+    /// `ciris_persist.NodeIdentityRequired` (a `PersistError`).
+    #[error(
+        "this node cannot attest a hard_case row ({reason}{}): declare and hold a node key \
+         (set_node_key_id + register_self_federation_key) before any erasure or removal is \
+         recorded",
+        node_key_id.as_deref().map(|k| format!(", key {k}")).unwrap_or_default()
+    )]
+    HardCaseAttesterUnavailable {
+        /// [`hard_case::refusal::NODE_KEY_UNSET`] or
+        /// [`hard_case::refusal::NODE_KEY_NOT_HELD`].
+        reason: &'static str,
+        /// The declared key, when there is one.
+        node_key_id: Option<String>,
+    },
+
     /// v25.1.0 (CIRISPersist#570 ask 4) — a revocation's history bound
     /// ([`Revocation::revoked_after`]) failed admission: it is not mirrored in
     /// the SIGNED envelope, the two disagree, it does not parse, or it is
@@ -12196,7 +12219,8 @@ impl Error {
             Error::LocalAttestationIdOccupied { .. } => "federation_local_attestation_id_occupied",
             Error::Conflict(_) => "federation_conflict",
             Error::AdminActionUnattributed { .. } => "federation_admin_action_unattributed",
-            Error::HardCaseReplicationHeld { .. } => "federation_hard_case_replication_held",
+            Error::HardCaseReplicationHeld { .. } => hard_case::refusal::REPLICATION_HELD,
+            Error::HardCaseAttesterUnavailable { .. } => hard_case::refusal::ATTESTER_UNAVAILABLE,
             Error::RevocationBoundInvalid { .. } => "federation_revocation_bound_invalid",
             Error::RevocationEnvelopeUnbound { .. } => "federation_revocation_envelope_unbound",
             Error::RevocationSubjectRefused { .. } => "federation_revocation_subject_refused",

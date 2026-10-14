@@ -44,13 +44,23 @@ same rows as before.
   at the local tier unsigned. Signing at write is not possible for the
   in-transaction emitters (the hybrid signer is async; an erasure's counts
   exist only inside its transaction).
-- **A node identity is now required to record a hard_case.** The attester is
-  the node key (`set_node_key_id`) and it must be held in `federation_keys`.
-  Without one, an ACT is refused before it mutates anything
-  (`NodeIdentityUnset`, or `AttesterKeyUnknown` with plane `hard_case`; both
-  existing arms, Python `RuntimeError` / `ValueError` as before): the two
-  trace erasures (when they would delete something), the peer removal, the
-  `record_hard_case` door itself, and the host-run watchers that call it. An
+- **A host must hold a node key before any erasure or removal is recorded.**
+  The attester of every hard_case row is the node key (`set_node_key_id`),
+  and it must be held in `federation_keys` (`register_self_federation_key`).
+  Without one, every ACT that records a hard_case row is refused before it
+  mutates anything, with the new typed refusal
+  `Error::HardCaseAttesterUnavailable` (kind
+  `federation_hard_case_attester_unavailable`, the const
+  `hard_case::refusal::ATTESTER_UNAVAILABLE`; reason `node_key_unset` or
+  `node_key_not_held`). Python raises the new
+  `ciris_persist.NodeIdentityRequired` (a `PersistError`). The acts: both
+  trace erasures (`delete_traces_for_agent`,
+  `delete_traces_for_agent_id_hash`; refused even when they would delete
+  nothing, store error `store::Error::HardCaseAttesterUnavailable`), the peer
+  removal (after its own `PeerNotFound` / `HardRemoveWithActiveAttestations`
+  refusals), the `record_hard_case` door itself, and the host-run watchers
+  that call it. I962 shows each refusal and that the same erasure SUCCEEDS
+  once the node key is held, on memory, sqlite and postgres. An
   OBSERVATION riding on another row's admission or a cascade (a membership
   change, a liveness transition, a recipient excluded, a fast-path takedown
   applied) records nothing and proceeds (`hard_case::record_observation`), so
@@ -65,7 +75,8 @@ same rows as before.
   federation tier: `crossing::plan_enter_mesh` and the put door (which is also
   the replicated apply) refuse it with the new
   `Error::HardCaseReplicationHeld` (kind
-  `federation_hard_case_replication_held`, Python `RuntimeError`, the posture
+  `federation_hard_case_replication_held`, the const
+  `hard_case::refusal::REPLICATION_HELD`; Python `RuntimeError`, the posture
   of `NoActorSignature`: a held door, not a caller fault). Local-tier rows are
   never served, so no peer receives one. What unblocks it: CIRISConstitution#170
   ruled (hard_case in CC 2.4.1.1's unpurgeable set), and a way to know which
@@ -86,15 +97,29 @@ same rows as before.
   `canonical_bytes` is unchanged). The detector signs the row as the actor at
   the crossing; a federation-tier `detection:*` row a detector emits itself
   through `put_attestation` (hybrid-signed, replicable) projects too, after
-  `detection_row::check_detection_body`. The re-put verdict (same bytes
+  `detection_row::check_detection_body`, when it is the detection's own row
+  (the id derived from its `detection_id`). The envelope names the scored
+  trace as `evidence_refs`. The re-put verdict (same bytes
   no-op, different bytes `Conflict`) reads the held ROW, never the table.
   `calibration_bundles` stays configuration.
-- **The Art. 17 tombstone moves onto the row.** An erasure (DSAR, or a
-  steward purge of the trace) redacts each detection row of the erased trace
-  in place (`detection_row::redact_detection_row`: linkage removed from the
-  body, `erased_at` stamped, the row taken to the local tier unsigned, its
-  wire-index entry removed), and the tombstoned table row is that row's
-  projection. The PII linkage no longer survives in any row.
+- **A detection's erasure goes through the purge door** (lead ruling: a
+  signed row is immutable bytes; one tombstone mechanism). The row's
+  `evidence_refs` names its trace, so a steward purge whose selection
+  reaches the trace derives the detection row ("scores over purged evidence
+  follow it"). While the purge tombstone stands, the projection row is the
+  V080 tombstone (linkage NULL, `erased_at` = the earliest-admitted
+  execution's `executed_at`), written by `purge_put_execution` in the same
+  transaction as the tombstone and rebuilt from it
+  (`detection_row::project_detection_row_under`); `purge_finalize` deletes
+  the row and its projection row goes with it. I825 shows the window and the
+  finalize on memory, sqlite and postgres.
+- **Gap, stated: the DSAR door no longer erases a detection.**
+  `delete_traces_for_agent_id_hash` has no authority over another key's
+  signed row (the purge door needs the trust root's cosigned notice), so a
+  row-backed detection of an erased trace keeps its linkage until a steward
+  purge reaches it; `detection_events_tombstoned` counts only pre-v57 silo
+  rows (no backing row), which still take the V080 tombstone in place. A
+  ByIds purge derives nothing: it must name the detection rows.
 - **Memory holds detections.** The memory backend's `put_detection_event` /
   `get_detection_events` returned `NotImplemented` / empty; they now run the
   same door and projection, so every witness runs on all three backends.
@@ -103,7 +128,10 @@ same rows as before.
   row's row, `REFERENCES federation_attestations ON DELETE CASCADE` (a row
   that leaves takes its projection row), a unique index on it, and a partial
   index over the pre-v57 rows that have none. Those legacy rows are rehomed
-  onto the plane by the first emitter after the upgrade
+  onto the plane by the first emitter after the upgrade, each asserted at the
+  silo row's own recorded instant (`emitted_at` / `ts`, never the rehome's
+  clock), idempotently (a second boot adds nothing; I963 on sqlite and
+  postgres, memory's rehome a declared no-op)
   (`rehome_legacy_hard_case_events`, with the node key in hand;
   `rehome_legacy_detection_events`, with each detector's key, a legacy row
   whose detector key is not held or not a `lenscore_detector` stays and the
@@ -119,10 +147,11 @@ same rows as before.
   red.
 - **Python surface:** no signature changed. `list_hard_case_events`,
   `put_detection_event`, `get_detection_events` and the erasure doors keep
-  their types. New refusals on existing doors: `put_detection_event` raises
-  `ValueError` (the type of its shape refusals) when the signer is not a
-  `lenscore_detector` or is not held; an erasure or peer removal on a node
-  with no held node key raises the type its backend refusals already had.
+  their types. New: the exception class `NodeIdentityRequired`
+  (`PersistError`), raised by an erasure or a peer removal on a node with no
+  held node key. `put_detection_event` raises `ValueError` (the type of its
+  shape refusals) when the signer is not a `lenscore_detector` or is not
+  held.
 
 ## [56.0.0] - 2026-10-14
 

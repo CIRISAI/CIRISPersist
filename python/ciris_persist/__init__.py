@@ -32,6 +32,7 @@ from .ciris_persist import (
     EngineConfigMismatch,
     EngineUsedAcrossFork,
     LensQueryError,
+    NodeIdentityRequired,
     NotFound,
     Permanent,
     PersistError,
@@ -56,6 +57,8 @@ __all__ = [
     "EngineConfigMismatch",
     "EngineUsedAcrossFork",
     "LensQueryError",
+    # v57.0.0 (CIRISPersist#988) — no held node key to attest a hard_case row.
+    "NodeIdentityRequired",
     "NotFound",
     "Permanent",
     "PersistError",

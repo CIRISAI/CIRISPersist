@@ -1626,9 +1626,9 @@ pub(crate) struct HardCaseAttester {
 /// foreign key and a refusal must leave the act undone, never done
 /// unaudited.
 ///
-/// A directory with no node identity refuses
-/// ([`Error::NodeIdentityUnset`]); a declared key this node does not hold
-/// refuses ([`Error::AttesterKeyUnknown`], plane `hard_case`).
+/// A directory with no node identity, or one whose declared key it does not
+/// hold, refuses with [`Error::HardCaseAttesterUnavailable`] (named
+/// [`super::hard_case::refusal::ATTESTER_UNAVAILABLE`]).
 ///
 /// It also rehomes any pre-v57 `hard_case_events` row that has no backing
 /// row yet ([`AttestationStore::rehome_legacy_hard_case_events`]): the first
@@ -1638,17 +1638,18 @@ pub(crate) async fn hard_case_attester<D>(dir: &D) -> Result<HardCaseAttester, E
 where
     D: AttestationStore,
 {
-    let key_id = dir.node_key_id().ok_or(Error::NodeIdentityUnset {
-        method: "record_hard_case",
-        needed_for: "the attester of the hard_case:{kind} row (CC 3.1.9.4: the node key)",
+    let key_id = dir
+        .node_key_id()
+        .ok_or(Error::HardCaseAttesterUnavailable {
+            reason: super::hard_case::refusal::NODE_KEY_UNSET,
+            node_key_id: None,
+        })?;
+    let identity_type = dir.attesting_identity_type(&key_id).await?.ok_or_else(|| {
+        Error::HardCaseAttesterUnavailable {
+            reason: super::hard_case::refusal::NODE_KEY_NOT_HELD,
+            node_key_id: Some(key_id.clone()),
+        }
     })?;
-    let identity_type =
-        dir.attesting_identity_type(&key_id)
-            .await?
-            .ok_or_else(|| Error::AttesterKeyUnknown {
-                attesting_key_id: key_id.clone(),
-                plane: "hard_case",
-            })?;
     let attester = HardCaseAttester {
         key_id,
         identity_type,
@@ -1720,8 +1721,9 @@ pub(crate) struct PlannedHardCase {
 ///
 /// The gates, in order: the envelope size, the dimension gate, the reserved
 /// genesis ids, the mirror and instant stamp, the size of the row as stored,
-/// the instant binding at `received_at`. `fold_at` is not read: a hard_case
-/// row judges no other row.
+/// the instant binding at `received_at`. A hard_case row judges no other row;
+/// its own signed instant is `fold_at` (a live door passes the receipt clock
+/// for both; the rehome passes the silo row's recorded `emitted_at`).
 ///
 /// The #570 attribution gate is the `record_hard_case` DOOR's
 /// ([`record_hard_case_planned`]), as it was before v57: the in-transaction
@@ -1757,7 +1759,10 @@ pub(crate) fn plan_hard_case_row(
         scrub_signature_classical: None,
         scrub_signature_pqc: None,
     };
-    let mut row = input.into_local_row(attestation_id, instants.received_at);
+    // The row's signed instant is `fold_at` (PlanInstants: "the row's signed
+    // instant"): the receipt clock at a live door, the silo row's own
+    // recorded instant when a pre-v57 row is rehomed (never the boot clock).
+    let mut row = input.into_local_row(attestation_id, instants.fold_at);
     crate::federation::genesis::check_genesis_attestation_reserved(&row)?;
     crate::federation::envelope::RowMirror::stamp_local_row(&mut row, false)?;
     crate::federation::admission::check_envelope_size_admission(&row.attestation_envelope)?;
@@ -1866,7 +1871,10 @@ pub(crate) fn plan_detection_row(
         scrub_signature_classical: None,
         scrub_signature_pqc: None,
     };
-    let mut row = input.into_local_row(attestation_id, instants.received_at);
+    // The row's signed instant is `fold_at` (PlanInstants: "the row's signed
+    // instant"): the receipt clock at a live door, the silo row's own
+    // recorded instant when a pre-v57 row is rehomed (never the boot clock).
+    let mut row = input.into_local_row(attestation_id, instants.fold_at);
     crate::federation::genesis::check_genesis_attestation_reserved(&row)?;
     crate::federation::envelope::RowMirror::stamp_local_row(&mut row, false)?;
     crate::federation::admission::check_envelope_size_admission(&row.attestation_envelope)?;

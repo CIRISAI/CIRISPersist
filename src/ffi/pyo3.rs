@@ -185,10 +185,17 @@ mod persist_errors {
         EngineUsedAcrossFork,
         super::persist_errors::PersistError
     );
+    // v57.0.0 (CIRISPersist#988 item 2) — this node cannot attest the
+    // hard_case row an erasure / removal must record (no held node key).
+    pyo3::create_exception!(
+        ciris_persist,
+        NodeIdentityRequired,
+        super::persist_errors::PersistError
+    );
 }
 pub use persist_errors::{
-    Conflict, EngineClosed, EngineConfigMismatch, EngineUsedAcrossFork, NotFound, Permanent,
-    PersistError, Transient,
+    Conflict, EngineClosed, EngineConfigMismatch, EngineUsedAcrossFork, NodeIdentityRequired,
+    NotFound, Permanent, PersistError, Transient,
 };
 
 /// v1.0.0-scaffold helper — map a stable substrate error `kind()` token
@@ -17208,7 +17215,7 @@ impl PyEngine {
                     })
                 }
             });
-            let summary = summary.map_err(|e| PyRuntimeError::new_err(format!("{e}")))?;
+            let summary = summary.map_err(erasure_err_to_py)?;
 
             let dict = PyDict::new(py);
             dict.set_item("trace_events_deleted", summary.trace_events_deleted)?;
@@ -17283,7 +17290,7 @@ impl PyEngine {
                     })
                 }
             });
-            let summary = summary.map_err(|e| PyRuntimeError::new_err(format!("{e}")))?;
+            let summary = summary.map_err(erasure_err_to_py)?;
 
             let dict = PyDict::new(py);
             dict.set_item("trace_events", summary.trace_events)?;
@@ -33906,6 +33913,11 @@ fn fountain_store_err_to_py(e: crate::store::Error) -> PyErr {
         | Error::Backend(_)
         | Error::Migration { .. }
         | Error::MigrationLockTimeout { .. } => PyRuntimeError::new_err(format!("{e}")),
+        // v57.0.0 (CIRISPersist#988 item 2) — the erasure doors' typed
+        // attester refusal (no fountain door raises it).
+        Error::HardCaseAttesterUnavailable(inner) => {
+            NodeIdentityRequired::new_err(format!("{}: {inner}", inner.kind()))
+        }
     }
 }
 
@@ -34707,6 +34719,19 @@ where
         .map_err(|e| PyRuntimeError::new_err(format!("AttestationListPage encode: {e}")))
 }
 
+/// v57.0.0 (CIRISPersist#988 item 2) — an erasure door's store error: the
+/// typed `NodeIdentityRequired` when the node cannot attest the erasure's
+/// hard_case row (refused before anything was deleted), else the
+/// `RuntimeError` these doors always raised.
+fn erasure_err_to_py(e: crate::store::Error) -> PyErr {
+    match e {
+        crate::store::Error::HardCaseAttesterUnavailable(inner) => {
+            NodeIdentityRequired::new_err(format!("{}: {inner}", inner.kind()))
+        }
+        other => PyRuntimeError::new_err(format!("{other}")),
+    }
+}
+
 fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
     let kind = e.kind();
     tracing::warn!(error = %e, kind = kind, "federation error");
@@ -35246,6 +35271,14 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         // v57.0.0 (CIRISPersist#988 item 2) — a held door, not a fault: the
         // row stays at the local tier until hard_case replication is unheld.
         // RuntimeError, the posture of `NoActorSignature` above.
+        // v57.0.0 (CIRISPersist#988 item 2) — the typed refusal of an act
+        // that must record a hard_case row this node cannot attest. Its own
+        // class (a `PersistError`): the remedy is host configuration, not
+        // the call, and a caller must be able to tell it from every other
+        // refusal without parsing text.
+        crate::federation::Error::HardCaseAttesterUnavailable { .. } => {
+            NodeIdentityRequired::new_err(format!("{kind}: {e}"))
+        }
         crate::federation::Error::HardCaseReplicationHeld {
             attestation_id,
             dimension,
@@ -39783,6 +39816,11 @@ pub fn register(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add(
         "EngineUsedAcrossFork",
         py.get_type::<EngineUsedAcrossFork>(),
+    )?;
+    // v57.0.0 (CIRISPersist#988 item 2) — the hard_case attester refusal.
+    m.add(
+        "NodeIdentityRequired",
+        py.get_type::<NodeIdentityRequired>(),
     )?;
     // v1.10.1 (CIRISPersist#88) — handle-free process-singleton
     // reset; the deterministic teardown door for consumer test
