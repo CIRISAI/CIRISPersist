@@ -298,7 +298,11 @@ mod run {
             // (`enter_mesh`) indexes them. Named, with the reason, on purpose.
             // v56.0.0 (CIRISPersist#934 door 2) — the local door's executor,
             // one name on both SQL backends (was `{sqlite,pg}_write_local_attestation`).
-            "store_planned_local_attestation",
+            // v57.0.0 (CIRISPersist#988) — the local door's INSERT moved into one
+            // in-transaction helper per backend, shared with the hard_case and
+            // detection writers (every row it writes is local-tier).
+            "sqlite_insert_local_attestation_row",
+            "pg_insert_local_attestation_row",
         ];
         // v55.0.0 (CIRISPersist#989) — the holding claim's shared in-transaction
         // INSERT. It cannot index (the index reload reads COMMITTED rows); every
@@ -344,6 +348,7 @@ mod run {
                     "\n    pub(crate) async fn ",
                     "\n    fn ",
                     "\nfn ",
+                    "\nasync fn ",
                 ]
                 .iter()
                 .filter_map(|p| head.rfind(p).map(|i| (i, p.len())))

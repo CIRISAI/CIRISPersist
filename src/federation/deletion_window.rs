@@ -1017,6 +1017,8 @@ pub(crate) mod watch_witness {
     #[tokio::test]
     async fn deletion_window_breach_witness_memory() {
         let dir = crate::store::MemoryBackend::new();
+        // v57.0.0 (#988 item 2) — the breach row needs this node's key.
+        crate::federation::hard_case::test_support::declare_node(&dir, "dw-node-mem").await;
         exercise(&dir, "mem", true).await;
     }
 
@@ -1025,6 +1027,7 @@ pub(crate) mod watch_witness {
     async fn deletion_window_breach_witness_sqlite() {
         let dir = crate::store::SqliteBackend::open_in_memory().await.unwrap();
         dir.run_migrations().await.unwrap();
+        crate::federation::hard_case::test_support::declare_node(&dir, "dw-node-sq").await;
         exercise(&dir, "sq", true).await;
     }
 
@@ -1044,6 +1047,8 @@ pub(crate) mod watch_witness {
         dir.run_migrations().await.expect("migrations");
         // A per-process tag: the database is shared and long-lived.
         let tag = format!("pg{:x}", std::process::id());
+        crate::federation::hard_case::test_support::declare_node(&dir, &format!("dw-node-{tag}"))
+            .await;
         exercise(&dir, &tag, false).await;
     }
 }

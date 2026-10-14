@@ -1541,8 +1541,9 @@ pub mod orchestrate {
     {
         use crate::federation::hard_case;
         for excluded in &result.excluded {
-            backend
-                .record_hard_case(hard_case::HardCaseEvent {
+            crate::federation::hard_case::record_observation(
+                backend,
+                hard_case::HardCaseEvent {
                     event_id: hard_case::recipient_excluded_event_id(
                         COMMUNITY,
                         excluded,
@@ -1557,9 +1558,10 @@ pub mod orchestrate {
                         "reason": "no_valid_encryption_pubkeys",
                     }),
                     emitted_at: observed_at,
-                })
-                .await
-                .map_err(|e| BlobError::Backend(format!("emit recipient_excluded: {e}")))?;
+                },
+            )
+            .await
+            .map_err(|e| BlobError::Backend(format!("emit recipient_excluded: {e}")))?;
         }
         Ok(())
     }

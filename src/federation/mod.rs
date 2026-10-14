@@ -294,6 +294,7 @@ pub mod scope_classifier_invariants;
 pub(crate) mod sealed_dag_adopt_invariants;
 #[cfg(any(test, feature = "test-anchor"))]
 pub mod self_collective_invariants;
+pub(crate) mod silo_projection_invariants;
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod stream_key_invariants;
 // v55.0.0 (CIRISPersist#977, #981) — I750–I756: a room's stream is
@@ -631,6 +632,7 @@ pub mod shared_instance;
 // CIRISPersist#146 Ask 3 — the substrate hard_case:* emission surface
 // (consent-SLA watcher + general observability primitive; CEG §8.1.11.3).
 pub mod hard_case;
+pub mod silo_projection;
 // CIRISPersist#183 — the "self at login" substrate vocabulary
 // (delegation/partnership envelope builders + scope tokens +
 // TransportDestination type; CEG §8.1.12.7 / §5.6.8.8.1).
@@ -6887,18 +6889,25 @@ pub trait FederationDirectory: Send + Sync {
         // change_kind=ADDED; idempotent on the event_id.
         if added {
             let now = chrono::Utc::now();
-            self.record_hard_case(hard_case::HardCaseEvent {
-                event_id: hard_case::membership_change_event_id(group_key_id, &member_key_id, now),
-                kind: change_kind.to_string(),
-                target_key_id: Some(group_key_id.to_string()),
-                subject_key_id: Some(member_key_id.clone()),
-                detail: serde_json::json!({
-                    "change_kind": hard_case::change_kind::ADDED,
-                    "subject_key_id": member_key_id,
-                    "cohort_key_id": group_key_id,
-                }),
-                emitted_at: now,
-            })
+            hard_case::record_observation(
+                self,
+                hard_case::HardCaseEvent {
+                    event_id: hard_case::membership_change_event_id(
+                        group_key_id,
+                        &member_key_id,
+                        now,
+                    ),
+                    kind: change_kind.to_string(),
+                    target_key_id: Some(group_key_id.to_string()),
+                    subject_key_id: Some(member_key_id.clone()),
+                    detail: serde_json::json!({
+                        "change_kind": hard_case::change_kind::ADDED,
+                        "subject_key_id": member_key_id,
+                        "cohort_key_id": group_key_id,
+                    }),
+                    emitted_at: now,
+                },
+            )
             .await?;
         }
         Ok(added)
@@ -7017,12 +7026,15 @@ pub trait FederationDirectory: Send + Sync {
         // that is `at_rest_cascade::rekey_community_member_revoke` (epoch bump);
         // for self/family it is inherent (fresh-per-write DEK).
         if let Some(kind) = change_kind {
-            self.record_hard_case(hard_case::membership_removed_event(
-                kind,
-                group_key_id,
-                removed_key_id,
-                effective_at,
-            ))
+            hard_case::record_observation(
+                self,
+                hard_case::membership_removed_event(
+                    kind,
+                    group_key_id,
+                    removed_key_id,
+                    effective_at,
+                ),
+            )
             .await?;
         }
         Ok(())
@@ -8989,7 +9001,7 @@ pub trait FederationDirectory: Send + Sync {
             for proof in proofs {
                 // Retain + surface; NEVER reconcile (N4). Idempotent on
                 // the deterministic event_id.
-                self.record_hard_case(crate::witness::equivocation_hard_case(proof, now))
+                self.record_hard_case(crate::witness::equivocation_hard_case(proof, &stored, now))
                     .await?;
             }
         }
@@ -9084,7 +9096,7 @@ pub trait FederationDirectory: Send + Sync {
             // (the timestamp does not enter the id) so there is exactly
             // one derivation to keep coherent.
             let event_id =
-                crate::witness::equivocation_hard_case(proof, chrono::Utc::now()).event_id;
+                crate::witness::equivocation_hard_case(proof, &[], chrono::Utc::now()).event_id;
             let hard_case = cases.iter().find(|c| c.event_id == event_id).cloned();
             records.push(crate::witness::WitnessEquivocationRecord {
                 peer_id: proof.peer_id.clone(),
@@ -9968,6 +9980,26 @@ pub enum Error {
     AdminActionUnattributed {
         /// WHICH branch refused.
         reason: AdminActionRefusal,
+    },
+
+    /// v57.0.0 (CIRISPersist#988 item 2) — a `hard_case:*` row offered to the
+    /// federation tier (the crossing, the put door or the replicated apply)
+    /// while its replication is held: a peer on an earlier release could purge
+    /// the node's accountability record, and persist cannot yet tell which
+    /// peers carry the refusal (CIRISConstitution#170). The row stays at the
+    /// local tier. Not a caller fault: the call is correct and the door is
+    /// held, so Python sees `RuntimeError` (the posture of `NoActorSignature`).
+    /// See [`hard_case::check_hard_case_replication_held`] for what unblocks it.
+    #[error(
+        "hard_case row {attestation_id} ({dimension}) does not enter the federation tier: \
+         hard_case replication is held until peers carry its unpurgeable refusal \
+         (CIRISConstitution#170)"
+    )]
+    HardCaseReplicationHeld {
+        /// The row offered.
+        attestation_id: String,
+        /// Its `hard_case:{kind}:v1` dimension.
+        dimension: String,
     },
 
     /// v25.1.0 (CIRISPersist#570 ask 4) — a revocation's history bound
@@ -12164,6 +12196,7 @@ impl Error {
             Error::LocalAttestationIdOccupied { .. } => "federation_local_attestation_id_occupied",
             Error::Conflict(_) => "federation_conflict",
             Error::AdminActionUnattributed { .. } => "federation_admin_action_unattributed",
+            Error::HardCaseReplicationHeld { .. } => "federation_hard_case_replication_held",
             Error::RevocationBoundInvalid { .. } => "federation_revocation_bound_invalid",
             Error::RevocationEnvelopeUnbound { .. } => "federation_revocation_envelope_unbound",
             Error::RevocationSubjectRefused { .. } => "federation_revocation_subject_refused",

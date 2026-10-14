@@ -255,3 +255,9 @@ decimal_id	claim_id	repo	path#symbol	crate@version
 4.5.3	CLM-purge-projections-removed	CIRISPersist	src/federation/steward_purge.rs#ATTESTATION_PROJECTIONS	ciris-persist@56.0.0
 4.5.3	CLM-purge-projections-removed	CIRISPersist	src/store/sqlite.rs#purge_attestation_projections	ciris-persist@56.0.0
 4.5.3	CLM-purge-projections-removed	CIRISPersist	src/store/postgres.rs#purge_attestation_projections	ciris-persist@56.0.0
+3.1.9.4	CLM-hard-case-on-base	CIRISPersist	src/federation/attestation_admit.rs#plan_hard_case_row	ciris-persist@56.0.0
+3.1.9.4	CLM-hard-case-on-base	CIRISPersist	src/federation/hard_case.rs#check_hard_case_replication_held	ciris-persist@56.0.0
+3.1.9.4	CLM-hard-case-on-base	CIRISPersist	src/witness/compare.rs#equivocation_hard_case	ciris-persist@56.0.0
+3.4.8	CLM-detection-on-base	CIRISPersist	src/federation/attestation_admit.rs#plan_detection_row	ciris-persist@56.0.0
+3.4.8	CLM-detection-on-base	CIRISPersist	src/derived/detection_row.rs#project_detection_row	ciris-persist@56.0.0
+2.4.2	CLM-silo-projection-rebuildable	CIRISPersist	src/federation/silo_projection.rs#check_projection_rebuild	ciris-persist@56.0.0

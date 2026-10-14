@@ -1703,8 +1703,12 @@ mod run {
         };
     }
 
+    // v57.0.0 (#988 item 2) — every runner's backend holds a node key: the
+    // fast-path takedown's hard_case row is attested by it (I799).
     runners!(memory, async {
-        Some(crate::store::memory::MemoryBackend::new())
+        let b = crate::store::memory::MemoryBackend::new();
+        crate::federation::hard_case::test_support::declare_node(&b, "dt-node").await;
+        Some(b)
     });
 
     #[cfg(feature = "sqlite")]
@@ -1714,6 +1718,7 @@ mod run {
             .await
             .unwrap();
         b.run_migrations().await.unwrap();
+        crate::federation::hard_case::test_support::declare_node(&b, "dt-node").await;
         Some(b)
     });
 
@@ -1725,6 +1730,7 @@ mod run {
             .await
             .unwrap();
         b.run_migrations().await.unwrap();
+        crate::federation::hard_case::test_support::declare_node(&b, "dt-node").await;
         Some(b)
     });
 

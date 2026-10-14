@@ -43,6 +43,7 @@
 
 use std::future::Future;
 
+pub mod detection_row;
 pub mod types;
 
 pub use types::{

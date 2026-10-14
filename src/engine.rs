@@ -3857,6 +3857,30 @@ impl Engine {
         }
     }
 
+    /// v57.0.0 (CIRISPersist#988; CC 2.4.2, CLM-silo-projection-rebuildable)
+    /// — **the projection gate, live**: rebuild `projection` from the rows on
+    /// this node through the same writer, into a scratch table, and compare it
+    /// byte for byte with the live table. `Ok` carries both renderings; a
+    /// divergence is an `Error::Backend` naming the first row that differs.
+    /// Read-only (the scratch table goes with the transaction's rollback).
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn check_silo_projection(
+        &self,
+        projection: crate::federation::silo_projection::SiloProjection,
+    ) -> Result<crate::federation::silo_projection::ProjectionRebuild, crate::federation::Error>
+    {
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(b) => {
+                crate::federation::silo_projection::check_projection_rebuild(&**b, projection).await
+            }
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(b) => {
+                crate::federation::silo_projection::check_projection_rebuild(&**b, projection).await
+            }
+        }
+    }
+
     /// v53.1.0 — **install a verified genesis bundle on this node** (the import
     /// door): verify the ceremony outputs against THIS build's accord roster
     /// (a refusal writes nothing), bake its serve nodes and delegation plane,
@@ -13849,6 +13873,15 @@ mod tests {
             .await
             .expect("construct engine");
         let sq = engine.sqlite_backend().expect("sqlite present");
+        // v57.0.0 (#988 item 3) — a detection row's attester is a held
+        // lenscore_detector key.
+        crate::federation::tier_ingest::test_support::register_hybrid_key_as(
+            &**sq,
+            "test-detector",
+            "test-detector",
+            crate::federation::types::identity_type::LENSCORE_DETECTOR,
+        )
+        .await;
 
         let base_ts = chrono::Utc::now() - chrono::Duration::minutes(10);
         let ev_a = de_event_fixture("tr-A", b"canon-A", base_ts);
@@ -14055,6 +14088,15 @@ mod tests {
             .await
             .expect("construct engine");
         let sq = engine.sqlite_backend().expect("sqlite present");
+        // v57.0.0 (#988 item 3) — a detection row's attester is a held
+        // lenscore_detector key.
+        crate::federation::tier_ingest::test_support::register_hybrid_key_as(
+            &**sq,
+            "test-detector",
+            "test-detector",
+            crate::federation::types::identity_type::LENSCORE_DETECTOR,
+        )
+        .await;
 
         // Seed a row BEFORE subscribing → must NOT be yielded.
         let before_ts = chrono::Utc::now() - chrono::Duration::seconds(10);
@@ -14214,6 +14256,15 @@ mod tests {
             .await
             .expect("construct engine");
         let sq = engine.sqlite_backend().expect("sqlite present");
+        // v57.0.0 (#988 item 3) — a detection row's attester is a held
+        // lenscore_detector key.
+        crate::federation::tier_ingest::test_support::register_hybrid_key_as(
+            &**sq,
+            "test-detector",
+            "test-detector",
+            crate::federation::types::identity_type::LENSCORE_DETECTOR,
+        )
+        .await;
 
         let mut stream = Box::pin(engine.subscribe_detection_events(EventFilter {
             trace_id: Some("tr-MATCH".to_owned()),
@@ -14290,6 +14341,14 @@ mod tests {
             .await
             .expect("construct PG engine");
         let pg = engine.postgres_backend().expect("pg backend");
+        // v57.0.0 (#988 item 3) — a detection row's attester is a held
+        // lenscore_detector key.
+        crate::federation::hard_case::test_support::hold_key_as(
+            &**pg,
+            "test-detector",
+            crate::federation::types::identity_type::LENSCORE_DETECTOR,
+        )
+        .await;
 
         // Use a unique trace_id per run so concurrent runs don't share rows.
         let trace_a = format!("tr-A-{}", uuid::Uuid::new_v4().simple());
@@ -14444,6 +14503,14 @@ mod tests {
             .await
             .expect("construct PG engine");
         let pg = engine.postgres_backend().expect("pg backend");
+        // v57.0.0 (#988 item 3) — a detection row's attester is a held
+        // lenscore_detector key.
+        crate::federation::hard_case::test_support::hold_key_as(
+            &**pg,
+            "test-detector",
+            crate::federation::types::identity_type::LENSCORE_DETECTOR,
+        )
+        .await;
 
         // v31.0.0 (CIRISPersist#658) — ONE trace_id for both rows. The
         // per-run uuid keeps this test isolated from concurrent PG runs, but
@@ -14553,6 +14620,14 @@ mod tests {
             .await
             .expect("construct PG engine");
         let pg = engine.postgres_backend().expect("pg backend");
+        // v57.0.0 (#988 item 3) — a detection row's attester is a held
+        // lenscore_detector key.
+        crate::federation::hard_case::test_support::hold_key_as(
+            &**pg,
+            "test-detector",
+            crate::federation::types::identity_type::LENSCORE_DETECTOR,
+        )
+        .await;
 
         // Per-run uuids so concurrent PG runs cannot cross-contaminate.
         let want = format!("tr-MATCH-{}", uuid::Uuid::new_v4().simple());
@@ -21548,6 +21623,23 @@ mod tests {
         );
     }
 
+    /// v57.0.0 (CIRISPersist#988 item 2) — hold the key an `Engine` declared as
+    /// its node key (`set_node_key_id`, from its signer, label `label`), so its
+    /// hard_case rows have their attester.
+    async fn hold_engine_node_key<D>(dir: &D, label: &str)
+    where
+        D: crate::federation::FederationDirectory + ?Sized,
+    {
+        let node = dir.node_key_id().expect("an Engine declares its node key");
+        crate::federation::tier_ingest::test_support::register_hybrid_key_as(
+            dir,
+            &node,
+            label,
+            crate::federation::types::identity_type::NODE,
+        )
+        .await;
+    }
+
     #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn g4_rekey_events_sqlite() {
@@ -21556,6 +21648,9 @@ mod tests {
             .await
             .expect("engine");
         let sq = engine.sqlite_backend().expect("sqlite").clone();
+        // v57.0.0 (#988 item 2) — the engine's node key, held: the attester
+        // of its hard_case rows.
+        hold_engine_node_key(&*sq, "g4").await;
         g4_rekey_events_body(&*sq, "sq").await;
     }
 
@@ -21571,6 +21666,7 @@ mod tests {
         let signer = crate::federation::tier_ingest::test_support::local_signer(&label);
         let engine = Engine::with_signer(signer, &dsn).await.expect("pg engine");
         let pg = engine.postgres_backend().expect("pg backend").clone();
+        hold_engine_node_key(&*pg, &label).await;
         g4_rekey_events_body(&*pg, &uuid::Uuid::new_v4().simple().to_string()).await;
     }
 
@@ -21594,6 +21690,7 @@ mod tests {
             .await
             .expect("engine");
         let dir = engine.federation_directory();
+        hold_engine_node_key(&*dir, "dw-engine").await;
         let (breached_id, now) = watch_witness::seed_one_breach(&*dir, "eng").await;
 
         // THROUGH the handle — no `engine.sqlite_backend()`, no concrete type.

@@ -638,7 +638,6 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("put_family_membership_widening", ConnClass::Write),
     ("put_community_membership_listing", ConnClass::Write),
     ("put_delivery_receipt", ConnClass::Write),
-    ("put_detection_event", ConnClass::Write),
     ("put_edge_detection_event", ConnClass::Write),
     ("put_family", ConnClass::Write),
     ("put_family_local", ConnClass::Write),
@@ -675,7 +674,6 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("rebuild_signed_wire_index", ConnClass::Write),
     ("record_announced_peer", ConnClass::Write),
     ("record_canonical_withdrawal", ConnClass::Write),
-    ("record_hard_case", ConnClass::Write),
     ("record_role_withdrawal", ConnClass::Write),
     ("refresh_factor_rollup", ConnClass::Write),
     ("register_accord_public_key", ConnClass::Write),
@@ -739,6 +737,26 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("store_pqc_completion", ConnClass::Write),
     ("store_planned_attestation", ConnClass::Write),
     ("store_planned_reseal", ConnClass::Write),
+    // v57.0.0 (CIRISPersist#988 items 2, 3) — the hard_case and detection
+    // doors' executors, the legacy rehomes, the projection rebuild, and the
+    // writers they share. `record_hard_case` and `put_detection_event` are
+    // calls into the shared plans now and touch no connection.
+    ("store_planned_hard_case", ConnClass::Write),
+    ("rehome_legacy_hard_case_events", ConnClass::Write),
+    ("store_planned_detection", ConnClass::Write),
+    ("rehome_legacy_detection_events", ConnClass::Write),
+    ("projection_rebuild", ConnClass::Write),
+    (
+        "sqlite_insert_local_attestation_row",
+        ConnClass::HelperWrite,
+    ),
+    ("sqlite_store_hard_case", ConnClass::HelperWrite),
+    ("sqlite_record_hard_case_in_tx", ConnClass::HelperWrite),
+    ("sqlite_project_hard_case", ConnClass::HelperWrite),
+    ("sqlite_project_detection", ConnClass::HelperWrite),
+    ("sqlite_render_table", ConnClass::HelperRead),
+    // The test-only raw-SQL seam the projection witnesses tamper with.
+    ("test_execute", ConnClass::Write),
     ("store_blob_local", ConnClass::Write),
     ("stream_consistency_proof", ConnClass::Read),
     ("stream_inclusion_proof", ConnClass::Read),

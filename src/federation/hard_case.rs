@@ -605,6 +605,226 @@ pub fn recipient_excluded_event_id(
     )
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+//  v57.0.0 (CIRISPersist#988 item 2, CC 3.1.9.4) — the row on the plane
+// ─────────────────────────────────────────────────────────────────────────
+
+/// The family stem of every `hard_case:*` row (CC 3.1.9.4).
+pub const DIMENSION_PREFIX: &str = "hard_case:";
+
+/// The envelope member that carries the [`HardCaseEvent`] on a
+/// `hard_case:{kind}:v1` row. The projection reads this member and nothing
+/// else ([`project_hard_case_row`]).
+pub const BODY_MEMBER: &str = "hard_case";
+
+/// v57.0.0 (CIRISPersist#988 item 2) — the dimension a `hard_case:{kind}`
+/// event is written under: `hard_case:{kind}:v1`. The trailing version
+/// segment is the one every `scores` dimension carries (CC 3.1.7 R3); the
+/// `{kind}` is the event's open-vocabulary kind, colons and all
+/// (`hard_case:admin_action:quarantine:v1`).
+#[must_use]
+pub fn hard_case_dimension(kind: &str) -> String {
+    format!("{DIMENSION_PREFIX}{kind}:v1")
+}
+
+/// Is `dimension` a `hard_case:*` row's dimension?
+#[must_use]
+pub fn is_hard_case_dimension(dimension: &str) -> bool {
+    dimension.starts_with(DIMENSION_PREFIX)
+}
+
+/// v57.0.0 (CIRISPersist#988 item 2) — the row id of the `hard_case` row an
+/// event is written as: a UUID derived from the event's deterministic
+/// `event_id`, so recording the same observed condition twice names the same
+/// row and the second write is a no-op (the idempotence `hard_case_events`
+/// had on `event_id`, kept by the row). Same construction as
+/// [`crate::ingest::trace_attestation_id`].
+#[must_use]
+pub fn hard_case_attestation_id(event_id: &str) -> String {
+    use sha2::Digest as _;
+    let mut h = sha2::Sha256::new();
+    h.update(b"ciris:hard-case:v1:");
+    h.update(event_id.as_bytes());
+    let digest = h.finalize();
+    let mut b = [0u8; 16];
+    b.copy_from_slice(&digest[..16]);
+    uuid::Uuid::from_bytes(b).to_string()
+}
+
+/// v57.0.0 (CIRISPersist#988 item 2) — the signed envelope of the row an event
+/// is written as: `{dimension, hard_case: <the event>}`. The event rides whole,
+/// as serde writes it, so the projection reads back exactly what the emitter
+/// observed.
+pub fn hard_case_envelope(event: &HardCaseEvent) -> Result<serde_json::Value, serde_json::Error> {
+    Ok(serde_json::json!({
+        "dimension": hard_case_dimension(&event.kind),
+        BODY_MEMBER: serde_json::to_value(event)?,
+    }))
+}
+
+/// v57.0.0 (CIRISPersist#988 item 2; CLM-silo-projection-rebuildable) —
+/// **the projection, rows → `hard_case_events`.** The one function both the
+/// write step (in the same transaction as the row) and the from-rows rebuild
+/// call. `None` for every row that is not a local-tier `hard_case:*` row with
+/// a readable body: only the hard_case door writes those
+/// (`attestation_admit::plan_hard_case_row`), and the federation tier holds
+/// none while replication is held ([`check_hard_case_replication_held`]).
+#[must_use]
+pub fn project_hard_case_row(row: &super::types::Attestation) -> Option<HardCaseEvent> {
+    if row.tier != super::types::attestation_tier::LOCAL
+        || row.attestation_type != super::types::attestation_type::SCORES
+    {
+        return None;
+    }
+    let dimension = row.attestation_envelope.get("dimension")?.as_str()?;
+    if !is_hard_case_dimension(dimension) {
+        return None;
+    }
+    let body = row.attestation_envelope.get(BODY_MEMBER)?;
+    let event: HardCaseEvent = serde_json::from_value(body.clone()).ok()?;
+    // The body must be the event the dimension and the id name: a row whose
+    // three disagree is not one this door wrote.
+    (hard_case_dimension(&event.kind) == dimension
+        && hard_case_attestation_id(&event.event_id) == row.attestation_id)
+        .then_some(event)
+}
+
+/// v57.0.0 (CIRISPersist#988 item 2) — record an OBSERVATION riding on
+/// another row's admission or on a cascade (a membership change, a liveness
+/// transition, a recipient excluded, a takedown applied): through
+/// [`record_hard_case`](crate::federation::FederationDirectory::record_hard_case),
+/// except that a node with no attester for the row (no declared node key, or
+/// one it does not hold) records nothing and proceeds. Refusing the act would
+/// leave a removed member keyed or a takedown unapplied for want of an audit
+/// row nobody could sign. Every other refusal stands. Acts this node performs
+/// (an erasure, a peer removal, an admin action) and the watchers a host runs
+/// call `record_hard_case` itself, which refuses.
+pub async fn record_observation<D>(dir: &D, event: HardCaseEvent) -> Result<(), super::Error>
+where
+    D: super::FederationDirectory + ?Sized,
+{
+    let event_id = event.event_id.clone();
+    match dir.record_hard_case(event).await {
+        Err(e @ super::Error::NodeIdentityUnset { .. })
+        | Err(
+            e @ super::Error::AttesterKeyUnknown {
+                plane: "hard_case", ..
+            },
+        ) => {
+            tracing::warn!(
+                event_id,
+                refusal = e.kind(),
+                "hard_case observation not recorded: this node has no attester ({e})"
+            );
+            Ok(())
+        }
+        other => other,
+    }
+}
+
+/// v57.0.0 (CIRISPersist#988 item 2; CC guidance on #988, 2026-10-13) — **the
+/// held replication.** A `hard_case:*` row does not enter the federation tier:
+/// not by the crossing (`crossing::plan_enter_mesh`), not by the put door
+/// (`attestation_admit::plan_put_attestation`, which is also the replicated
+/// apply). Its rows stay at the local tier, which no serve read returns, so
+/// no peer receives one.
+///
+/// Why held: a `hard_case` row is the node's accountability record and must
+/// be unpurgeable on every node that holds it. This node refuses to purge one
+/// (`migration::ACCOUNTABILITY_RECORD_PREFIXES`); a peer on an earlier
+/// release does not. CIRISConstitution#170 asks the steward to add
+/// `hard_case:*` to CC 2.4.1.1's unpurgeable set.
+///
+/// What unblocks it: #170 ruled, AND a way to know a peer carries the
+/// refusal (persist has no peer capability advertisement today). Then this
+/// check becomes a per-peer serve filter instead of a refusal here.
+pub fn check_hard_case_replication_held(
+    row: &super::types::Attestation,
+) -> Result<(), super::Error> {
+    match row
+        .attestation_envelope
+        .get("dimension")
+        .and_then(|d| d.as_str())
+    {
+        Some(dimension) if is_hard_case_dimension(dimension) => {
+            Err(super::Error::HardCaseReplicationHeld {
+                attestation_id: row.attestation_id.clone(),
+                dimension: dimension.to_owned(),
+            })
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Test support: give a bare backend the node identity a hard_case row needs.
+#[cfg(test)]
+pub(crate) mod test_support {
+    /// The inherent `set_node_key_id` of each backend, behind one name.
+    pub(crate) trait DeclaresNode {
+        /// Set this backend's node key id.
+        fn declare_node_key_for_test(&self, key_id: &str);
+    }
+
+    impl DeclaresNode for crate::store::memory::MemoryBackend {
+        fn declare_node_key_for_test(&self, key_id: &str) {
+            self.set_node_key_id(key_id);
+        }
+    }
+
+    #[cfg(feature = "sqlite")]
+    impl DeclaresNode for crate::store::sqlite::SqliteBackend {
+        fn declare_node_key_for_test(&self, key_id: &str) {
+            self.set_node_key_id(key_id);
+        }
+    }
+
+    #[cfg(feature = "postgres")]
+    impl DeclaresNode for crate::store::postgres::PostgresBackend {
+        fn declare_node_key_for_test(&self, key_id: &str) {
+            self.set_node_key_id(key_id);
+        }
+    }
+
+    /// v57.0.0 (CIRISPersist#988) — hold `key_id` as an `identity_type` key,
+    /// unless this directory already holds it (a shared test database).
+    pub(crate) async fn hold_key_as<D>(dir: &D, key_id: &str, identity_type: &str)
+    where
+        D: crate::federation::FederationDirectory + ?Sized,
+    {
+        if dir
+            .lookup_public_key(key_id)
+            .await
+            .expect("lookup")
+            .is_none()
+        {
+            crate::federation::tier_ingest::test_support::register_hybrid_key_as(
+                dir,
+                key_id,
+                key_id,
+                identity_type,
+            )
+            .await;
+        }
+    }
+
+    /// v57.0.0 (CIRISPersist#988 item 2) — register `key_id` as a held `node`
+    /// key and declare it this backend's node key: the attester every
+    /// `hard_case:{kind}:v1` row needs.
+    pub(crate) async fn declare_node<B>(b: &B, key_id: &str)
+    where
+        B: crate::federation::FederationDirectory + DeclaresNode,
+    {
+        crate::federation::tier_ingest::test_support::register_hybrid_key_as(
+            b,
+            key_id,
+            key_id,
+            crate::federation::types::identity_type::NODE,
+        )
+        .await;
+        b.declare_node_key_for_test(key_id);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

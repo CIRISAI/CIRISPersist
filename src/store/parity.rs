@@ -128,6 +128,53 @@ pub(crate) enum Class {
 ///   anything is stored. Classified by what they do, not what they are called.
 #[cfg(test)]
 pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
+    // v57.0.0 (CIRISPersist#988 items 2, 3) — the hard_case and detection
+    // doors. The two decisions are SHARED plans (pure; each backend's
+    // in-transaction emitters call `plan_hard_case_row` inside their own
+    // transaction). The put plan's two new refusals are Gates.
+    ("plan_hard_case_row", Class::Plan),
+    ("check_hard_case_replication_held", Class::Gate),
+    // The detection plan's V008 shape refusal (a Gate); the two envelope
+    // builders are serialization (Plumbing).
+    ("detection_shape_refusal", Class::Gate),
+    ("hard_case_envelope", Class::Plumbing),
+    ("detection_envelope", Class::Plumbing),
+    ("check_detection_body", Class::Gate),
+    // The same-file emit helpers: each plans a row (the shared plan) and
+    // stores it, so it carries the plan's sequence.
+    ("plan_peer_removal_event", Class::Delegates),
+    ("memory_record_hard_case_in_state", Class::Delegates),
+    ("sqlite_record_hard_case_in_tx", Class::Delegates),
+    ("pg_record_hard_case_in_tx", Class::Delegates),
+    // An observation through the `record_hard_case` door (another door):
+    // Delegates, so the door's plan is what the scan compares.
+    ("record_observation", Class::Delegates),
+    // Storage: the local-row INSERT, the projection writers, row mapping, the
+    // projection render, the scratch-table DDL. Plumbing: each fails only on
+    // the substrate's own terms (SQL, serialization); every refusal is the
+    // plan's, before them.
+    ("sqlite_insert_local_attestation_row", Class::Plumbing),
+    ("pg_insert_local_attestation_row", Class::Plumbing),
+    ("sqlite_store_hard_case", Class::Plumbing),
+    ("pg_store_hard_case", Class::Plumbing),
+    ("sqlite_project_hard_case", Class::Plumbing),
+    ("pg_project_hard_case", Class::Plumbing),
+    ("sqlite_project_detection", Class::Plumbing),
+    ("pg_project_detection", Class::Plumbing),
+    ("pg_row_to_hard_case_event", Class::Plumbing),
+    ("sqlite_render_table", Class::Plumbing),
+    ("pg_render_table", Class::Plumbing),
+    ("render", Class::Plumbing),
+    ("execute_batch", Class::Plumbing),
+    ("batch_execute", Class::Plumbing),
+    // The two projections (rows → table): a derivation that answers `None`
+    // for a row that is not its family's, never a refusal.
+    ("project_hard_case_row", Class::Plumbing),
+    ("project_detection_row", Class::Plumbing),
+    // The Art. 17 redaction of the detection rows of an erased trace: it
+    // rewrites rows the erasure already decided to erase; it fails only on
+    // serialization. Plumbing, in the fail-open direction, for that reason.
+    ("memory_tombstone_detections", Class::Plumbing),
     // v56.0.0 (CIRISPersist#934 step 1) — the attestation plane's shared door
     // and the executor's one re-ask under its lock: each is a SHARED plan.
     ("put_attestation_planned", Class::Plan),
@@ -220,7 +267,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("caller_scope_from_directory", Class::Gate),
     ("canonicalize_in_place", Class::Gate),
     ("check", Class::Gate),
-    ("check_admin_action_attribution", Class::Gate),
     ("check_admissible", Class::Gate),
     ("check_admission_via_envelope", Class::Gate),
     ("check_attested_subject_admission", Class::Gate),
@@ -799,7 +845,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("read", Class::Plumbing),
     ("write", Class::Plumbing),
     ("recompute_and_assert_root", Class::Gate),
-    ("record_hard_case", Class::Delegates),
     ("references_attestation_id_from_envelope", Class::Plumbing),
     ("reject_future_dated_community_revocation", Class::Gate),
     ("reload_record_bytes", Class::Plumbing),
@@ -1054,6 +1099,19 @@ pub(crate) struct DeclaredDivergence {
 /// across the three backends, gate for gate and order for order.
 #[cfg(test)]
 pub(crate) const DECLARED_DIVERGENCES: &[DeclaredDivergence] = &[
+    // v57.0.0 (CIRISPersist#988 item 2) — the legacy rehome.
+    DeclaredDivergence {
+        trait_name: "AttestationStore",
+        method: "rehome_legacy_hard_case_events",
+        backend: "memory",
+        expected: &[],
+        reason: "The rehome moves pre-v57 `hard_case_events` rows (written before the table \
+                 became a projection) onto the plane. Only a durable store can hold such a row: \
+                 the memory backend starts empty every process and has written hard_case rows \
+                 through the plan since the first v57 build, so it has nothing to rehome and \
+                 its rehome plans nothing. Every row it does hold was planned by \
+                 `plan_hard_case_row` at its own door.",
+    },
     DeclaredDivergence {
         trait_name: "FederationDirectory",
         method: "put_revocation",
@@ -1157,7 +1215,10 @@ mod tests {
     /// files: `(file, fn)`. Each body is held to the same [`CALL_CLASSES`]
     /// partition as a backend door, and its sequence is what a door's
     /// `plan:NAME` token stands for.
-    const SHARED_PLANS: [(&str, &str); 8] = [
+    const SHARED_PLANS: [(&str, &str); 10] = [
+        // v57.0.0 (CIRISPersist#988 items 2, 3).
+        ("src/federation/attestation_admit.rs", "plan_hard_case_row"),
+        ("src/federation/attestation_admit.rs", "plan_detection_row"),
         (
             "src/federation/attestation_admit.rs",
             "put_attestation_planned",
@@ -2463,10 +2524,27 @@ mod tests {
             Reads::ReceivedAt,
         ),
         ("sealed_over", "check_reseal_admission", Reads::ReceivedAt),
+        // v57.0.0 (CIRISPersist#988 items 2, 3) — a hard_case or detection row
+        // judges no other row: it is minted at the receipt instant and bound
+        // to it. `fold_at` is not read.
+        ("plan_hard_case_row", "into_local_row", Reads::ReceivedAt),
+        (
+            "plan_hard_case_row",
+            "check_instant_binding",
+            Reads::ReceivedAt,
+        ),
+        ("plan_detection_row", "into_local_row", Reads::ReceivedAt),
+        (
+            "plan_detection_row",
+            "check_instant_binding",
+            Reads::ReceivedAt,
+        ),
     ];
 
     /// The plan fns [`PLAN_INSTANTS`] covers, in `src/federation/attestation_admit.rs`.
-    const INSTANT_PLANS: [&str; 6] = [
+    const INSTANT_PLANS: [&str; 8] = [
+        "plan_hard_case_row",
+        "plan_detection_row",
         "plan_put_attestation",
         "recheck_cycle_under_lock",
         "plan_attach_attestation_pqc_signature",

@@ -18,6 +18,112 @@ threat-model citations because this crate's audit story is the point.
   nextest and maturin call goes through it; exit 75/76 when the lock or the
   floor is never met, 137 when the cap fires.
 
+### Changed — hard_case and detection onto the plane (#988 items 2, 3)
+
+Two silos become rows on the attestation plane. Each table stays, as the
+projection of its rows: written by the row's executor in the same
+transaction, never by anything else, and rebuildable from the rows alone
+(CC 2.4.2, `CLM-silo-projection-rebuildable`). Readers of the two tables
+(`list_hard_case_events`, `get_detection_events`, LensCore's SQL) see the
+same rows as before.
+
+- **`hard_case:{kind}:v1` rows (CC 3.1.9.4, `CLM-hard-case-on-base`).** Every
+  `hard_case` event is a `scores` row: attester = attested = this node's key,
+  `cohort_scope = self`, local tier, the event whole under the `hard_case`
+  member, the row id derived from `event_id` (so a re-record is still a
+  no-op). One pure plan, `attestation_admit::plan_hard_case_row`, decides it
+  for all three backends and all emitters: the `record_hard_case` door, and
+  the four emitters that record inside their own transaction (the two trace
+  erasures, the community membership removal, the peer removal), which plan
+  the row inside that transaction so it commits with the act it records. The
+  generic local door refuses `hard_case:` dimensions (`InvalidArgument`): the
+  hard_case door is the only writer.
+- **The row's signature is deferred**, as on every local-tier row this node
+  attests (the `trace:complete:v1` precedent): the node signs it as the
+  actor at the crossing. The crossing is held (below), so today the rows sit
+  at the local tier unsigned. Signing at write is not possible for the
+  in-transaction emitters (the hybrid signer is async; an erasure's counts
+  exist only inside its transaction).
+- **A node identity is now required to record a hard_case.** The attester is
+  the node key (`set_node_key_id`) and it must be held in `federation_keys`.
+  Without one, an ACT is refused before it mutates anything
+  (`NodeIdentityUnset`, or `AttesterKeyUnknown` with plane `hard_case`; both
+  existing arms, Python `RuntimeError` / `ValueError` as before): the two
+  trace erasures (when they would delete something), the peer removal, the
+  `record_hard_case` door itself, and the host-run watchers that call it. An
+  OBSERVATION riding on another row's admission or a cascade (a membership
+  change, a liveness transition, a recipient excluded, a fast-path takedown
+  applied) records nothing and proceeds (`hard_case::record_observation`), so
+  a node with no identity still applies a peer's removal and rotates its key.
+  An `Engine` built with a signer sets the node key; a host that never
+  registered its own key with `register_self_federation_key` must do so.
+- **Unpurgeable, by the family table.** `hard_case:` joins
+  `migration::ACCOUNTABILITY_RECORD_PREFIXES`, the one list both purge doors
+  and the serve read consult (CIRISConstitution#170, the protective
+  direction). No door special-cases it.
+- **HELD: hard_case replication.** A `hard_case:*` row does not enter the
+  federation tier: `crossing::plan_enter_mesh` and the put door (which is also
+  the replicated apply) refuse it with the new
+  `Error::HardCaseReplicationHeld` (kind
+  `federation_hard_case_replication_held`, Python `RuntimeError`, the posture
+  of `NoActorSignature`: a held door, not a caller fault). Local-tier rows are
+  never served, so no peer receives one. What unblocks it: CIRISConstitution#170
+  ruled (hard_case in CC 2.4.1.1's unpurgeable set), and a way to know which
+  peers carry the refusal (persist has no peer capability advertisement
+  today). Then `hard_case::check_hard_case_replication_held` becomes a
+  per-peer serve filter.
+- **The N4 proof carries both signed witnesses** (CC 6.1.1):
+  `witness::equivocation_hard_case` now puts the two conflicting corpus rows,
+  each with its Ed25519 and ML-DSA-65 halves, under `detail.witnesses`.
+- **`detection:{detector}:v1` rows (CC 3.4.8, `CLM-detection-on-base`).**
+  `put_detection_event` writes a local-tier `scores` row attested by the
+  detector's key, the detection whole under the `detection` member (bytes in
+  base64), the row id derived from `detection_id`; one pure plan,
+  `attestation_admit::plan_detection_row`, holds V008's shape gates and the
+  dimension gate. The `detection:` family is the detector-only reserved
+  family, so the door now refuses a `signing_key_id` whose `identity_type` is
+  not `lenscore_detector` (behaviour change; the caller's hybrid verify of
+  `canonical_bytes` is unchanged). The detector signs the row as the actor at
+  the crossing; a federation-tier `detection:*` row a detector emits itself
+  through `put_attestation` (hybrid-signed, replicable) projects too, after
+  `detection_row::check_detection_body`. The re-put verdict (same bytes
+  no-op, different bytes `Conflict`) reads the held ROW, never the table.
+  `calibration_bundles` stays configuration.
+- **The Art. 17 tombstone moves onto the row.** An erasure (DSAR, or a
+  steward purge of the trace) redacts each detection row of the erased trace
+  in place (`detection_row::redact_detection_row`: linkage removed from the
+  body, `erased_at` stamped, the row taken to the local tier unsigned, its
+  wire-index entry removed), and the tombstoned table row is that row's
+  projection. The PII linkage no longer survives in any row.
+- **Memory holds detections.** The memory backend's `put_detection_event` /
+  `get_detection_events` returned `NotImplemented` / empty; they now run the
+  same door and projection, so every witness runs on all three backends.
+- **Migrations V194 (`hard_case_events`) and V195 (`detection_events`),**
+  sqlite and postgres: an `attestation_id` column naming each projection
+  row's row, `REFERENCES federation_attestations ON DELETE CASCADE` (a row
+  that leaves takes its projection row), a unique index on it, and a partial
+  index over the pre-v57 rows that have none. Those legacy rows are rehomed
+  onto the plane by the first emitter after the upgrade
+  (`rehome_legacy_hard_case_events`, with the node key in hand;
+  `rehome_legacy_detection_events`, with each detector's key, a legacy row
+  whose detector key is not held or not a `lenscore_detector` stays and the
+  rebuild gate reports it). Both tables join
+  `steward_purge::ATTESTATION_PROJECTIONS` as foreign-key cascades.
+- **The gate: `silo_projection::check_projection_rebuild`** (and
+  `Engine::check_silo_projection`, the live predicate). It rebuilds the
+  projection from every held row through the same writer into a scratch
+  table of the live table's shape, renders both in the backend's own column
+  encoding (sqlite `quote()`, postgres `row_to_json(..)::text`, memory serde)
+  and requires them byte-equal. I960 (hard_case) and I961 (detection) run it
+  on memory, sqlite and postgres, and tamper with one live column to show it
+  red.
+- **Python surface:** no signature changed. `list_hard_case_events`,
+  `put_detection_event`, `get_detection_events` and the erasure doors keep
+  their types. New refusals on existing doors: `put_detection_event` raises
+  `ValueError` (the type of its shape refusals) when the signer is not a
+  `lenscore_detector` or is not held; an erasure or peer removal on a node
+  with no held node key raises the type its backend refusals already had.
+
 ## [56.0.0] - 2026-10-14
 
 ### Security — rustls 0.23.46 (RUSTSEC-2026-0346, RUSTSEC-2026-0347)

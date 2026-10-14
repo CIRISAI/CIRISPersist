@@ -2075,7 +2075,12 @@ mod runners {
         };
     }
     rc6_runners!(memory, async {
-        Some(crate::store::memory::MemoryBackend::new())
+        {
+            // v57.0.0 (#988 item 2) — a hard_case row needs this node's key.
+            let b = crate::store::memory::MemoryBackend::new();
+            crate::federation::hard_case::test_support::declare_node(&b, "inv-node").await;
+            Some(b)
+        }
     });
     #[cfg(feature = "sqlite")]
     rc6_runners!(sqlite, async {
@@ -2084,6 +2089,7 @@ mod runners {
             .await
             .unwrap();
         b.run_migrations().await.unwrap();
+        crate::federation::hard_case::test_support::declare_node(&b, "inv-node").await;
         Some(b)
     });
     #[cfg(feature = "postgres")]
@@ -2094,6 +2100,7 @@ mod runners {
             .await
             .unwrap();
         b.run_migrations().await.unwrap();
+        crate::federation::hard_case::test_support::declare_node(&b, "inv-node").await;
         Some(b)
     });
 }

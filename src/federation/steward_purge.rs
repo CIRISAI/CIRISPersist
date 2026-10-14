@@ -372,6 +372,19 @@ pub const ATTESTATION_PROJECTIONS: &[(&str, &str, ProjectionRemoval)] = &[
         "binding_attestation_id",
         ProjectionRemoval::ForeignKeySetNull,
     ),
+    // v57.0.0 (CIRISPersist#988 items 2, 3; V194, V195) — the two silos moved
+    // onto the plane: each is now the projection of its rows
+    // (CLM-silo-projection-rebuildable), and leaves with its row.
+    (
+        "hard_case_events",
+        "attestation_id",
+        ProjectionRemoval::ForeignKeyCascade,
+    ),
+    (
+        "cirislens_derived_detection_events",
+        "attestation_id",
+        ProjectionRemoval::ForeignKeyCascade,
+    ),
 ];
 
 /// Tables with an `*attestation_id` column that are NOT projections of a

@@ -302,6 +302,16 @@ impl SqliteBackend {
         &self.test_hooks
     }
 
+    /// v57.0.0 (CIRISPersist#988, I960/I961) — run raw SQL on the writer: the
+    /// projection witnesses tamper with a live table to prove the gate red.
+    #[cfg(test)]
+    pub(crate) async fn test_execute(&self, sql: &str) {
+        let sql = sql.to_owned();
+        self.write(move |conn| conn.execute_batch(&sql))
+            .await
+            .expect("test_execute");
+    }
+
     /// v50.0.0 (PR #921 review) — the test-only rival write armed for `at`
     /// (see [`crate::store::test_hooks`]), applied through this backend's own
     /// replicated door. Never armed outside a test.
@@ -1585,6 +1595,14 @@ impl Backend for SqliteBackend {
     ) -> Result<super::types::DeleteSummary, Error> {
         let agent = agent_id_hash.to_owned();
         let key = signature_key_id.to_owned();
+        // v57.0.0 (CIRISPersist#988 item 2) — the audit row's attester, read
+        // before the transaction (the plan inside it reads nothing). Held as
+        // a Result: a door that deletes nothing records nothing and needs no
+        // attester; one that deletes is refused, undone, without one.
+        let attester = crate::federation::attestation_admit::hard_case_attester(self)
+            .await
+            .map_err(|e| format!("{}: {e}", e.kind()));
+        let received_at = chrono::Utc::now();
         let summary = self
             .write(
                 move |conn| -> Result<super::types::DeleteSummary, rusqlite::Error> {
@@ -1676,31 +1694,29 @@ impl Backend for SqliteBackend {
                         || federation_attestations_deleted > 0
                         || federation_revocations_deleted > 0
                     {
-                        let event_id = uuid::Uuid::new_v4().to_string();
-                        let detail = serde_json::json!({
-                            "op": "delete_traces_for_agent",
-                            "agent_id_hash": agent,
-                            "signing_key_id": key,
-                            "trace_events": trace_events_deleted,
-                            "trace_llm_calls": trace_llm_calls_deleted,
-                            "federation_keys": federation_keys_deleted,
-                            "federation_attestations": federation_attestations_deleted,
-                            "federation_revocations": federation_revocations_deleted,
-                        })
-                        .to_string();
-                        tx.execute(
-                            "INSERT INTO hard_case_events \
-                        (event_id, kind, target_key_id, subject_key_id, detail, emitted_at) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
-                     ON CONFLICT(event_id) DO NOTHING",
-                            rusqlite::params![
-                                event_id,
-                                crate::federation::hard_case::kind::TRACE_ERASURE,
-                                Some(&agent),
-                                None::<String>,
-                                detail,
-                                chrono::Utc::now().to_rfc3339(),
-                            ],
+                        let event = crate::federation::HardCaseEvent {
+                            event_id: uuid::Uuid::new_v4().to_string(),
+                            kind: crate::federation::hard_case::kind::TRACE_ERASURE.to_owned(),
+                            target_key_id: Some(agent.clone()),
+                            subject_key_id: None,
+                            detail: serde_json::json!({
+                                "op": "delete_traces_for_agent",
+                                "agent_id_hash": agent,
+                                "signing_key_id": key,
+                                "trace_events": trace_events_deleted,
+                                "trace_llm_calls": trace_llm_calls_deleted,
+                                "federation_keys": federation_keys_deleted,
+                                "federation_attestations": federation_attestations_deleted,
+                                "federation_revocations": federation_revocations_deleted,
+                            }),
+                            emitted_at: received_at,
+                        };
+                        sqlite_record_hard_case_in_tx(
+                            &tx,
+                            &attester,
+                            crate::federation::attestation_admit::HardCaseEmitter::Act,
+                            &event,
+                            received_at,
                         )?;
                     }
 
@@ -1727,6 +1743,11 @@ impl Backend for SqliteBackend {
         let erased_at = chrono::Utc::now();
         let erased_s = erased_at.to_rfc3339();
         let agent = agent_id_hash.to_owned();
+        // v57.0.0 (CIRISPersist#988 item 2) — the audit row's attester, read
+        // before the transaction (see `delete_traces_for_agent`).
+        let attester = crate::federation::attestation_admit::hard_case_attester(self)
+            .await
+            .map_err(|e| format!("{}: {e}", e.kind()));
         let summary = self
             .write(
                 move |conn| -> Result<super::types::ErasureSummary, rusqlite::Error> {
@@ -1781,27 +1802,25 @@ impl Backend for SqliteBackend {
                     // Step 5: emit the `hard_case:trace_erasure` audit row inside
                     // the txn (atomic). Emit only when something was erased.
                     if trace_events > 0 || trace_llm_calls > 0 || detection_events_tombstoned > 0 {
-                        let event_id = uuid::Uuid::new_v4().to_string();
-                        let detail = serde_json::json!({
-                            "agent_id_hash": agent,
-                            "trace_events": trace_events,
-                            "trace_llm_calls": trace_llm_calls,
-                            "detection_events_tombstoned": detection_events_tombstoned,
-                        })
-                        .to_string();
-                        tx.execute(
-                            "INSERT INTO hard_case_events \
-                        (event_id, kind, target_key_id, subject_key_id, detail, emitted_at) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
-                     ON CONFLICT(event_id) DO NOTHING",
-                            rusqlite::params![
-                                event_id,
-                                crate::federation::hard_case::kind::TRACE_ERASURE,
-                                Some(&agent),
-                                None::<String>,
-                                detail,
-                                erased_s,
-                            ],
+                        let event = crate::federation::HardCaseEvent {
+                            event_id: uuid::Uuid::new_v4().to_string(),
+                            kind: crate::federation::hard_case::kind::TRACE_ERASURE.to_owned(),
+                            target_key_id: Some(agent.clone()),
+                            subject_key_id: None,
+                            detail: serde_json::json!({
+                                "agent_id_hash": agent,
+                                "trace_events": trace_events,
+                                "trace_llm_calls": trace_llm_calls,
+                                "detection_events_tombstoned": detection_events_tombstoned,
+                            }),
+                            emitted_at: erased_at,
+                        };
+                        sqlite_record_hard_case_in_tx(
+                            &tx,
+                            &attester,
+                            crate::federation::attestation_admit::HardCaseEmitter::Act,
+                            &event,
+                            erased_at,
                         )?;
                     }
 
@@ -8773,7 +8792,9 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         if inserted {
             self.index_stored_record("FamilyMembershipRevocation", &wire_index_key)
                 .await?;
-            self.record_hard_case(removal_event).await?;
+            // v57.0.0 (CIRISPersist#988 item 2) — an observation: a node with
+            // no attester records nothing; the removal already landed.
+            crate::federation::hard_case::record_observation(self, removal_event).await?;
         }
         Ok(())
     }
@@ -8858,9 +8879,14 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             &row.removed_identity_key_id,
             row.effective_at,
         );
-        let removal_detail = serde_json::to_string(&removal_event.detail).map_err(|e| {
-            crate::federation::Error::Backend(format!("hard_case detail serialize: {e}"))
-        })?;
+        // v57.0.0 (CIRISPersist#988 item 2) — the removal's hard_case row is
+        // planned inside the transaction; its attester is read here, before
+        // it. An observation: a node with no attester records nothing and the
+        // removal (and its rotation) still lands.
+        let attester = crate::federation::attestation_admit::hard_case_attester(self)
+            .await
+            .map_err(|e| format!("{}: {e}", e.kind()));
+        let received_at = chrono::Utc::now();
         // v21.0.0 (CIRISPersist#502 E4 followup) — persist the authority
         // signature the gate above already verified (was verified-then-
         // discarded).
@@ -8940,20 +8966,14 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                 // could still take away. Written after commit instead — a crash in
                 // the gap leaves a row `rebuild_signed_wire_index` repairs, where
                 // an atomically-committed WRONG hash is permanent and silent.
-                // Idempotent on the deterministic event_id.
-                tx.execute(
-                    "INSERT INTO hard_case_events \
-                    (event_id, kind, target_key_id, subject_key_id, detail, emitted_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
-                 ON CONFLICT(event_id) DO NOTHING",
-                    rusqlite::params![
-                        removal_event.event_id,
-                        removal_event.kind,
-                        removal_event.target_key_id,
-                        removal_event.subject_key_id,
-                        removal_detail,
-                        removal_event.emitted_at.to_rfc3339(),
-                    ],
+                // Idempotent on the deterministic event_id (the row id derives
+                // from it).
+                sqlite_record_hard_case_in_tx(
+                    &tx,
+                    &attester,
+                    crate::federation::attestation_admit::HardCaseEmitter::Observation,
+                    &removal_event,
+                    received_at,
                 )?;
                 // CC 4.4.3.2.2 rotation-on-removal: bump the community DEK epoch
                 // (epoch 0 → first bump yields 1; subsequent bumps +1). Forward-
@@ -10598,35 +10618,10 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         &self,
         event: crate::federation::HardCaseEvent,
     ) -> Result<(), crate::federation::Error> {
-        // v25.1.0 (CIRISPersist#570 ask 3) — the attribution gate.
-        // Verify-before-mutation: an `admin_action` record that does not carry
-        // {delegation_id, reason} is refused naming WHICH, and no row is
-        // written. A no-op for every observed-condition kind.
-        crate::federation::check_admin_action_attribution(&event)?;
-        let detail_json = serde_json::to_string(&event.detail).map_err(|e| {
-            crate::federation::Error::Backend(format!("hard_case detail serialize: {e}"))
-        })?;
-        let emitted_s = event.emitted_at.to_rfc3339();
-        self.write(move |conn| -> Result<(), rusqlite::Error> {
-            // Idempotent on the deterministic event_id (re-scan = no-op).
-            conn.execute(
-                "INSERT INTO hard_case_events \
-                    (event_id, kind, target_key_id, subject_key_id, detail, emitted_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
-                 ON CONFLICT(event_id) DO NOTHING",
-                rusqlite::params![
-                    event.event_id,
-                    event.kind,
-                    event.target_key_id,
-                    event.subject_key_id,
-                    detail_json,
-                    emitted_s,
-                ],
-            )?;
-            Ok(())
-        })
-        .await
-        .map_err(|e| crate::federation::Error::Backend(format!("record_hard_case: {e}")))
+        // v57.0.0 (CIRISPersist#988 item 2) — a `hard_case:{kind}:v1` row on
+        // the plane, decided once (`plan_hard_case_row`); `hard_case_events`
+        // is its projection, written in the same transaction.
+        crate::federation::attestation_admit::record_hard_case_planned(self, event).await
     }
 
     /// CIRISServer#356 — this backend DOES charge peer writes
@@ -13732,6 +13727,10 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         let delegation_owned = acting_under_delegation_id.map(str::to_owned);
         let now = chrono::Utc::now();
         let now_str = now.to_rfc3339();
+        // v57.0.0 (CIRISPersist#988 item 2) — the record's attester, read
+        // before the transaction; asked for only once the removal's own
+        // refusals have had their say (an act: no attester, no removal).
+        let attester = crate::federation::attestation_admit::hard_case_attester(self).await;
 
         let outcome = self
             .write(
@@ -13824,31 +13823,37 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     // transaction, both faces, exactly like the DSAR sibling: an
                     // admin_action:peer_removal hard_case row carrying the
                     // attribution (delegation_id + reason, the admin_field keys).
-                    let event_id = uuid::Uuid::new_v4().to_string();
-                    let detail = serde_json::json!({
-                        crate::federation::hard_case::admin_field::DELEGATION_ID: delegation_owned,
-                        crate::federation::hard_case::admin_field::REASON: reason_owned,
-                        "hard": hard,
-                    })
-                    .to_string();
-                    tx.execute(
-                        "INSERT INTO hard_case_events \
-                    (event_id, kind, target_key_id, subject_key_id, detail, emitted_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
-                 ON CONFLICT(event_id) DO NOTHING",
-                        rusqlite::params![
-                            event_id,
-                            format!(
-                                "{}{}",
-                                crate::federation::hard_case::kind::ADMIN_ACTION_PREFIX,
-                                crate::federation::hard_case::admin_op::PEER_REMOVAL
-                            ),
-                            Some(&key_id_owned),
-                            None::<String>,
-                            detail,
-                            now_str,
-                        ],
-                    )?;
+                    let event = crate::federation::HardCaseEvent {
+                        event_id: uuid::Uuid::new_v4().to_string(),
+                        kind: crate::federation::hard_case::admin_action_kind(
+                            crate::federation::hard_case::admin_op::PEER_REMOVAL,
+                        ),
+                        target_key_id: Some(key_id_owned.clone()),
+                        subject_key_id: None,
+                        detail: serde_json::json!({
+                            crate::federation::hard_case::admin_field::DELEGATION_ID: delegation_owned,
+                            crate::federation::hard_case::admin_field::REASON: reason_owned,
+                            "hard": hard,
+                        }),
+                        emitted_at: now,
+                    };
+                    let plan = || -> Result<_, crate::federation::Error> {
+                        let planned = crate::federation::attestation_admit::plan_hard_case_row(
+                            &event,
+                            &attester?,
+                            crate::federation::attestation_admit::PlanInstants {
+                                fold_at: now,
+                                received_at: now,
+                            },
+                        )?;
+                        Ok(planned)
+                    };
+                    let planned = match plan() {
+                        Ok(p) => p,
+                        // Refused: the transaction is dropped, nothing stands.
+                        Err(e) => return Ok(Err(e)),
+                    };
+                    sqlite_store_hard_case(&tx, &planned)?;
                     tx.commit()?;
                     Ok(Ok(()))
                 },
@@ -21356,18 +21361,89 @@ fn sqlite_tombstone_detection_events(
     trace_ids: &[String],
     erased_at: &str,
 ) -> Result<u64, rusqlite::Error> {
+    // v57.0.0 (CIRISPersist#988 item 3) — the V080 tombstone is the projection
+    // of the REDACTED ROW: each live detection row of an erased trace loses
+    // its linkage in the row itself (`redact_detection_row`), and its
+    // projection row is re-written from the redacted row. The projection is
+    // read here only to FIND the rows (its trace_id index); nothing decides on
+    // it.
     let mut tombstoned = 0u64;
     if trace_ids.is_empty() {
         return Ok(0);
     }
-    let mut stmt = tx.prepare(
-        "UPDATE cirislens_derived_detection_events \
-         SET trace_id = NULL, body_sha256 = NULL, \
-             canonical_bytes = NULL, erased_at = ?2 \
-         WHERE trace_id = ?1 AND erased_at IS NULL",
-    )?;
-    for tid in trace_ids {
-        tombstoned += stmt.execute(rusqlite::params![tid, erased_at])? as u64;
+    let erased = parse_rfc3339(erased_at);
+    // A pre-v57 row not yet rehomed has no row to redact: it takes the V080
+    // tombstone in place, as before.
+    {
+        let mut stmt = tx.prepare(
+            "UPDATE cirislens_derived_detection_events \
+             SET trace_id = NULL, body_sha256 = NULL, \
+                 canonical_bytes = NULL, erased_at = ?2 \
+             WHERE trace_id = ?1 AND erased_at IS NULL AND attestation_id IS NULL",
+        )?;
+        for tid in trace_ids {
+            tombstoned += stmt.execute(rusqlite::params![tid, erased_at])? as u64;
+        }
+    }
+    let mut ids: Vec<String> = Vec::new();
+    {
+        let mut stmt = tx.prepare(
+            "SELECT attestation_id FROM cirislens_derived_detection_events \
+              WHERE trace_id = ?1 AND erased_at IS NULL AND attestation_id IS NOT NULL",
+        )?;
+        for tid in trace_ids {
+            let rows = stmt.query_map([tid], |r| r.get::<_, String>(0))?;
+            for id in rows {
+                ids.push(id?);
+            }
+        }
+    }
+    for id in ids {
+        let row: Option<crate::federation::Attestation> = tx
+            .query_row(
+                "SELECT attestation_id, attesting_key_id, attested_key_id, attestation_type, \
+                    weight, asserted_at, expires_at, attestation_envelope, \
+                    original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
+                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, \
+                    subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at, \
+                    additional_scrubs \
+                 FROM federation_attestations WHERE attestation_id = ?1",
+                [&id],
+                sqlite_row_to_attestation,
+            )
+            .optional()?;
+        let Some(row) = row else { continue };
+        let Some(redacted) = crate::derived::detection_row::redact_detection_row(&row, erased)
+            .map_err(sqlite_plan_err)?
+        else {
+            continue;
+        };
+        let projection = crate::derived::detection_row::project_detection_row(&redacted)
+            .ok_or_else(|| {
+                rusqlite::Error::ToSqlConversionFailure(
+                    "a redacted detection row does not project".into(),
+                )
+            })?;
+        // The row goes to the local tier unsigned: its wire-index entry leaves
+        // with the signature, and the row is re-stored in its redacted form
+        // (the cascade takes the old projection row with the old row).
+        let record_key = crate::federation::wire_index::record_key(&[("attestation_id", &id)]);
+        tx.execute(
+            "DELETE FROM signed_wire_index WHERE kind = 'Attestation' AND record_key = ?1",
+            [&record_key],
+        )?;
+        tx.execute(
+            "DELETE FROM federation_attestations WHERE attestation_id = ?1",
+            [&id],
+        )?;
+        sqlite_insert_local_attestation_row(tx, &redacted, None)?;
+        sqlite_project_detection(
+            tx,
+            "cirislens_derived_detection_events",
+            &redacted.attestation_id,
+            &projection,
+        )?;
+        tombstoned += 1;
     }
     Ok(tombstoned)
 }
@@ -22037,21 +22113,6 @@ impl crate::federation::attestation_admit::AttestationStore for SqliteBackend {
             withdraws_depth,
         } = planned;
         let attesting_key_id = row.attesting_key_id.clone();
-        let envelope_text = serde_json::to_string(&row.attestation_envelope)
-            .map_err(|e| Error::Backend(format!("envelope serialize: {e}")))?;
-        let subject_key_ids_json = serde_json::to_string(&row.subject_key_ids)
-            .map_err(|e| Error::Backend(format!("subject_key_ids serialize: {e}")))?;
-        // v24.0.0 (CIRISPersist#556) — see the `put_attestation` twin.
-        let additional_scrubs_json = serde_json::to_string(&row.additional_scrubs)
-            .map_err(|e| Error::Backend(format!("additional_scrubs serialize: {e}")))?;
-        // BLOB bytes: durable row hex "" → []; transit row = SHA-256 digest.
-        let original_content_hash: Vec<u8> = hex::decode(&row.original_content_hash)
-            .map_err(|e| Error::Backend(format!("original_content_hash hex decode: {e}")))?;
-
-        // v50.0.0 (review H2, final check, 3d) — a local-tier `withdraws`
-        // becomes a federation row in place at `enter_mesh`; its depth is
-        // recorded now, in the same transaction.
-        let withdraws_depth: Option<i64> = withdraws_depth.map(|d| d as i64);
         self.write(move |conn| -> Result<(), rusqlite::Error> {
             let tx = conn.transaction()?;
             if replace {
@@ -22076,73 +22137,7 @@ impl crate::federation::attestation_admit::AttestationStore for SqliteBackend {
                     rusqlite::params![attesting_key_id, dimension],
                 )?;
             }
-            // v18.0.0 (#473) — INSERT OR IGNORE: a caller-supplied DETERMINISTIC
-            // attestation_id (the trace-ingest mint) makes a replayed batch
-            // re-derive the same id and land 0 rows instead of duplicating.
-            // Inert for classic v4 ids.
-            // v36.0.0 (#668) — serve position (V130). A local-tier row is not
-            // served by `list_attestations_since` (tier filter), but the
-            // column is one column with one meaning on the shared table, and
-            // the postgres dialect enforces NOT NULL — a writer that differs
-            // by tier is the #541 preserve-set class.
-            let admitted_at =
-                sqlite_next_plane_position(&tx, "federation_attestations", POS_ATTESTATION)?;
-            tx.execute(
-                "INSERT OR IGNORE INTO federation_attestations (\
-                    attestation_id, attesting_key_id, attested_key_id, attestation_type, \
-                    weight, asserted_at, expires_at, attestation_envelope, \
-                    original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
-                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, \
-                    subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at, \
-                    additional_scrubs, admitted_at\
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, \
-                           ?16, ?17, ?18, 'local', NULL, ?19, ?20)",
-                rusqlite::params![
-                    row.attestation_id,
-                    row.attesting_key_id,
-                    row.attested_key_id,
-                    row.attestation_type,
-                    row.weight,
-                    row.asserted_at.to_rfc3339(),
-                    row.expires_at.map(|t| t.to_rfc3339()),
-                    envelope_text,
-                    original_content_hash,
-                    row.scrub_signature_classical,
-                    row.scrub_signature_pqc,
-                    row.scrub_key_id,
-                    row.scrub_timestamp.to_rfc3339(),
-                    row.pqc_completed_at.map(|t| t.to_rfc3339()),
-                    row.persist_row_hash,
-                    subject_key_ids_json,
-                    None::<i64>,
-                    row.cohort_scope,
-                    // v24.0.0 (CIRISPersist#556) — a local-tier row defers its
-                    // signature, so this is `[]` in practice; bound anyway so
-                    // the local and federation writers cover the SAME column
-                    // set (a preserve set that differs by writer is #541).
-                    additional_scrubs_json,
-                    admitted_at.to_rfc3339(),
-                ],
-            )?;
-            // v17.4.0 (V106) — maintain the subject projection at `local` tier.
-            // On the upsert-replace path the prior row's projection entries were
-            // already dropped by the DELETE above (FK ON DELETE CASCADE), so no
-            // stale rows survive.
-            sqlite_project_attestation_subjects(
-                &tx,
-                &row,
-                crate::federation::types::attestation_tier::LOCAL,
-            )?;
-            // v45.0.0 (CIRISPersist#871, FSD §5) — the V149 `blob_renditions`
-            // projection at the local door, in the same transaction.
-            sqlite_project_rendition_row(&tx, &row)?;
-            if let Some(depth) = withdraws_depth {
-                tx.execute(
-                    "INSERT OR REPLACE INTO federation_withdraws_admission_depths \
-                     (attestation_id, depth) VALUES (?1, ?2)",
-                    rusqlite::params![row.attestation_id, depth],
-                )?;
-            }
+            sqlite_insert_local_attestation_row(&tx, &row, withdraws_depth)?;
             tx.commit()?;
             Ok(())
         })
@@ -22159,6 +22154,267 @@ impl crate::federation::attestation_admit::AttestationStore for SqliteBackend {
             }
         })?;
         Ok(())
+    }
+
+    async fn store_planned_hard_case(
+        &self,
+        planned: crate::federation::attestation_admit::PlannedHardCase,
+    ) -> Result<(), crate::federation::Error> {
+        self.write(move |conn| -> Result<(), rusqlite::Error> {
+            let tx = conn.transaction()?;
+            sqlite_store_hard_case(&tx, &planned)?;
+            tx.commit()
+        })
+        .await
+        .map_err(|e| crate::federation::Error::Backend(format!("record_hard_case: {e}")))
+    }
+
+    async fn rehome_legacy_hard_case_events(
+        &self,
+        attester: &crate::federation::attestation_admit::HardCaseAttester,
+        received_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), crate::federation::Error> {
+        // The partial index makes the common case (nothing left) one probe,
+        // on a reader: every emitter runs it, so it must not take the writer.
+        let any: Option<i64> = self
+            .read(|conn| {
+                conn.query_row(
+                    "SELECT 1 FROM hard_case_events WHERE attestation_id IS NULL LIMIT 1",
+                    [],
+                    |r| r.get(0),
+                )
+                .optional()
+            })
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("rehome_legacy_hard_case_events: {e}"))
+            })?;
+        if any.is_none() {
+            return Ok(());
+        }
+        let attester = attester.clone();
+        self.write(move |conn| -> Result<(), rusqlite::Error> {
+            let tx = conn.transaction()?;
+            let legacy: Vec<crate::federation::HardCaseEvent> = {
+                let mut stmt = tx.prepare(
+                    "SELECT event_id, kind, target_key_id, subject_key_id, detail, emitted_at \
+                       FROM hard_case_events WHERE attestation_id IS NULL ORDER BY event_id",
+                )?;
+                let rows = stmt.query_map([], sqlite_row_to_hard_case_event)?;
+                rows.collect::<Result<_, _>>()?
+            };
+            for event in legacy {
+                let planned = crate::federation::attestation_admit::plan_hard_case_row(
+                    &event,
+                    &attester,
+                    crate::federation::attestation_admit::PlanInstants {
+                        fold_at: received_at,
+                        received_at,
+                    },
+                )
+                .map_err(sqlite_plan_err)?;
+                // The legacy row is replaced by its row's projection.
+                tx.execute(
+                    "DELETE FROM hard_case_events WHERE event_id = ?1 AND attestation_id IS NULL",
+                    [&event.event_id],
+                )?;
+                sqlite_store_hard_case(&tx, &planned)?;
+            }
+            tx.commit()
+        })
+        .await
+        .map_err(|e| {
+            crate::federation::Error::Backend(format!("rehome_legacy_hard_case_events: {e}"))
+        })
+    }
+
+    async fn store_planned_detection(
+        &self,
+        planned: crate::federation::attestation_admit::PlannedDetection,
+    ) -> Result<bool, crate::federation::Error> {
+        self.write(move |conn| -> Result<bool, rusqlite::Error> {
+            let tx = conn.transaction()?;
+            if sqlite_insert_local_attestation_row(&tx, &planned.row, None)? == 0 {
+                return Ok(false);
+            }
+            sqlite_project_detection(
+                &tx,
+                "cirislens_derived_detection_events",
+                &planned.row.attestation_id,
+                &planned.projection,
+            )?;
+            tx.commit()?;
+            Ok(true)
+        })
+        .await
+        .map_err(|e| {
+            let msg = e.to_string();
+            if msg.contains("FOREIGN KEY") {
+                crate::federation::Error::InvalidArgument(format!(
+                    "FK constraint violated on detection insert (the detector key must exist \
+                     in federation_keys): {msg}"
+                ))
+            } else {
+                crate::federation::Error::Backend(format!("put_detection_event: {msg}"))
+            }
+        })
+    }
+
+    async fn rehome_legacy_detection_events(
+        &self,
+        received_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), crate::federation::Error> {
+        let legacy: Vec<crate::derived::detection_row::DetectionProjection> = self
+            .read(move |conn| -> Result<Vec<_>, rusqlite::Error> {
+                let mut stmt = conn.prepare(
+                    "SELECT detection_id, trace_id, body_sha256, detector, severity, \
+                        cohort_cell, conformity_variant, conformity_payload, \
+                        lens_core_version, ratchet_calibration_version, \
+                        canonical_bytes, ed25519_sig, ml_dsa_65_sig, signing_key_id, ts, erased_at \
+                     FROM cirislens_derived_detection_events WHERE attestation_id IS NULL \
+                     ORDER BY detection_id",
+                )?;
+                let rows = stmt.query_map([], sqlite_detection_projection_from_row)?;
+                rows.collect()
+            })
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("rehome_legacy_detection_events: {e}"))
+            })?;
+        for body in legacy {
+            // The detector's key, as held: a legacy row this node cannot
+            // attest to its detector stays legacy (the rebuild gate names it).
+            let Some(identity_type) = self.attesting_identity_type(&body.signing_key_id).await?
+            else {
+                tracing::warn!(
+                    detection_id = %body.detection_id,
+                    "legacy detection not rehomed: its detector key is not held"
+                );
+                continue;
+            };
+            let planned = match crate::federation::attestation_admit::plan_detection_row(
+                &body,
+                &identity_type,
+                crate::federation::attestation_admit::PlanInstants {
+                    fold_at: received_at,
+                    received_at,
+                },
+            ) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!(
+                        detection_id = %body.detection_id,
+                        refusal = e.kind(),
+                        "legacy detection not rehomed: the detection door refuses it"
+                    );
+                    continue;
+                }
+            };
+            let detection_id = body.detection_id.to_string();
+            self.write(move |conn| -> Result<(), rusqlite::Error> {
+                let tx = conn.transaction()?;
+                tx.execute(
+                    "DELETE FROM cirislens_derived_detection_events \
+                      WHERE detection_id = ?1 AND attestation_id IS NULL",
+                    [&detection_id],
+                )?;
+                if sqlite_insert_local_attestation_row(&tx, &planned.row, None)? > 0 {
+                    sqlite_project_detection(
+                        &tx,
+                        "cirislens_derived_detection_events",
+                        &planned.row.attestation_id,
+                        &planned.projection,
+                    )?;
+                }
+                tx.commit()
+            })
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("rehome_legacy_detection_events: {e}"))
+            })?;
+        }
+        Ok(())
+    }
+
+    async fn projection_rebuild(
+        &self,
+        projection: crate::federation::silo_projection::SiloProjection,
+    ) -> Result<crate::federation::silo_projection::ProjectionRebuild, crate::federation::Error>
+    {
+        use crate::federation::silo_projection::SiloProjection;
+        self.write(
+            move |conn| -> Result<crate::federation::silo_projection::ProjectionRebuild, rusqlite::Error> {
+                let tx = conn.transaction()?;
+                let (live_table, scratch, order, family) = match projection {
+                    SiloProjection::HardCaseEvents => (
+                        "hard_case_events",
+                        "_rebuild_hard_case_events",
+                        "event_id",
+                        crate::federation::hard_case::DIMENSION_PREFIX,
+                    ),
+                    SiloProjection::DetectionEvents => (
+                        "cirislens_derived_detection_events",
+                        "_rebuild_detection_events",
+                        "detection_id",
+                        crate::derived::detection_row::DIMENSION_PREFIX,
+                    ),
+                };
+                tx.execute_batch(&format!(
+                    "CREATE TEMP TABLE {scratch} AS SELECT * FROM {live_table} WHERE 0"
+                ))?;
+                // Every row on the plane, through the projection and the same
+                // writer the live step uses, into the scratch table.
+                let rows: Vec<crate::federation::Attestation> = {
+                    let mut stmt = tx.prepare(
+                        "SELECT attestation_id, attesting_key_id, attested_key_id, attestation_type, \
+                            weight, asserted_at, expires_at, attestation_envelope, \
+                            original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
+                            scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, \
+                            subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at, \
+                            additional_scrubs \
+                         FROM federation_attestations \
+                         WHERE substr(dimension, 1, length(?1)) = ?1 ORDER BY attestation_id",
+                    )?;
+                    let rows = stmt.query_map([family], sqlite_row_to_attestation)?;
+                    rows.collect::<Result<_, _>>()?
+                };
+                for row in &rows {
+                    match projection {
+                        SiloProjection::HardCaseEvents => {
+                            if let Some(event) =
+                                crate::federation::hard_case::project_hard_case_row(row)
+                            {
+                                sqlite_project_hard_case(
+                                    &tx,
+                                    scratch,
+                                    &row.attestation_id,
+                                    &event,
+                                )?;
+                            }
+                        }
+                        SiloProjection::DetectionEvents => {
+                            if let Some(event) =
+                                crate::derived::detection_row::project_detection_row(row)
+                            {
+                                sqlite_project_detection(
+                                    &tx,
+                                    scratch,
+                                    &row.attestation_id,
+                                    &event,
+                                )?;
+                            }
+                        }
+                    }
+                }
+                let live = sqlite_render_table(&tx, live_table, live_table, order)?;
+                let rebuilt = sqlite_render_table(&tx, live_table, scratch, order)?;
+                // Nothing is kept: the scratch table goes with the rollback.
+                tx.rollback()?;
+                Ok(crate::federation::silo_projection::ProjectionRebuild { live, rebuilt })
+            },
+        )
+        .await
+        .map_err(|e| crate::federation::Error::Backend(format!("projection_rebuild: {e}")))
     }
 
     async fn store_planned_reseal(
@@ -22335,6 +22591,7 @@ impl crate::federation::attestation_admit::AttestationStore for SqliteBackend {
         let crate::federation::attestation_admit::PlannedAttestation {
             row,
             projected_trace,
+            projected_detection,
             wire_index_key,
             ..
         } = planned;
@@ -22407,6 +22664,16 @@ impl crate::federation::attestation_admit::AttestationStore for SqliteBackend {
                 // v45.0.0 (CIRISPersist#871, FSD §5) — the V149
                 // `blob_renditions` projection, in the SAME locked scope.
                 sqlite_project_rendition_row(&tx, &row)?;
+                // v57.0.0 (CIRISPersist#988 item 3) — the V195
+                // `detection_events` projection, in the SAME transaction.
+                if let Some(detection) = &projected_detection {
+                    sqlite_project_detection(
+                        &tx,
+                        "cirislens_derived_detection_events",
+                        &row.attestation_id,
+                        detection,
+                    )?;
+                }
                 if let Some(depth) = withdraws_depth {
                     tx.execute(
                         "INSERT OR REPLACE INTO federation_withdraws_admission_depths \
@@ -23606,6 +23873,304 @@ fn sqlite_row_to_hard_case_event(
             .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new())),
         emitted_at: parse_rfc3339(&emitted_at),
     })
+}
+
+/// v56.0.0 (CIRISPersist#934 door 2), lifted in v57.0.0 so the hard_case
+/// writer stores its row through the same statement — insert one local-tier
+/// row inside `tx`: the row (`INSERT OR IGNORE`, so a held id is a no-op), its
+/// subject and rendition projections, and a `withdraws` depth. Returns the
+/// number of rows the INSERT wrote.
+fn sqlite_insert_local_attestation_row(
+    tx: &rusqlite::Transaction<'_>,
+    row: &crate::federation::Attestation,
+    withdraws_depth: Option<usize>,
+) -> Result<usize, rusqlite::Error> {
+    let to_sql_err = |e: serde_json::Error| rusqlite::Error::ToSqlConversionFailure(Box::new(e));
+    let envelope_text = serde_json::to_string(&row.attestation_envelope).map_err(to_sql_err)?;
+    let subject_key_ids_json = serde_json::to_string(&row.subject_key_ids).map_err(to_sql_err)?;
+    // v24.0.0 (CIRISPersist#556) — see the `put_attestation` twin.
+    let additional_scrubs_json =
+        serde_json::to_string(&row.additional_scrubs).map_err(to_sql_err)?;
+    // BLOB bytes: durable row hex "" → []; transit row = SHA-256 digest.
+    let original_content_hash: Vec<u8> = hex::decode(&row.original_content_hash)
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+    // v18.0.0 (#473) — INSERT OR IGNORE: a caller-supplied DETERMINISTIC
+    // attestation_id (the trace-ingest mint) makes a replayed batch
+    // re-derive the same id and land 0 rows instead of duplicating.
+    // Inert for classic v4 ids.
+    // v36.0.0 (#668) — serve position (V130). A local-tier row is not
+    // served by `list_attestations_since` (tier filter), but the
+    // column is one column with one meaning on the shared table, and
+    // the postgres dialect enforces NOT NULL — a writer that differs
+    // by tier is the #541 preserve-set class.
+    let admitted_at = sqlite_next_plane_position(tx, "federation_attestations", POS_ATTESTATION)?;
+    let inserted = tx.execute(
+        "INSERT OR IGNORE INTO federation_attestations (\
+            attestation_id, attesting_key_id, attested_key_id, attestation_type, \
+            weight, asserted_at, expires_at, attestation_envelope, \
+            original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
+            scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, \
+            subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at, \
+            additional_scrubs, admitted_at\
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, \
+                   ?16, ?17, ?18, 'local', NULL, ?19, ?20)",
+        rusqlite::params![
+            row.attestation_id,
+            row.attesting_key_id,
+            row.attested_key_id,
+            row.attestation_type,
+            row.weight,
+            row.asserted_at.to_rfc3339(),
+            row.expires_at.map(|t| t.to_rfc3339()),
+            envelope_text,
+            original_content_hash,
+            row.scrub_signature_classical,
+            row.scrub_signature_pqc,
+            row.scrub_key_id,
+            row.scrub_timestamp.to_rfc3339(),
+            row.pqc_completed_at.map(|t| t.to_rfc3339()),
+            row.persist_row_hash,
+            subject_key_ids_json,
+            None::<i64>,
+            row.cohort_scope,
+            // v24.0.0 (CIRISPersist#556) — a local-tier row defers its
+            // signature, so this is `[]` in practice; bound anyway so
+            // the local and federation writers cover the SAME column
+            // set (a preserve set that differs by writer is #541).
+            additional_scrubs_json,
+            admitted_at.to_rfc3339(),
+        ],
+    )?;
+    // v17.4.0 (V106) — maintain the subject projection at `local` tier.
+    // On the upsert-replace path the prior row's projection entries were
+    // already dropped by the DELETE above (FK ON DELETE CASCADE), so no
+    // stale rows survive.
+    sqlite_project_attestation_subjects(
+        tx,
+        row,
+        crate::federation::types::attestation_tier::LOCAL,
+    )?;
+    // v45.0.0 (CIRISPersist#871, FSD §5) — the V149 `blob_renditions`
+    // projection at the local door, in the same transaction.
+    sqlite_project_rendition_row(tx, row)?;
+    // v50.0.0 (review H2, final check, 3d) — a local-tier `withdraws`
+    // becomes a federation row in place at `enter_mesh`; its depth is
+    // recorded now, in the same transaction.
+    if let Some(depth) = withdraws_depth {
+        tx.execute(
+            "INSERT OR REPLACE INTO federation_withdraws_admission_depths \
+             (attestation_id, depth) VALUES (?1, ?2)",
+            rusqlite::params![row.attestation_id, depth as i64],
+        )?;
+    }
+    Ok(inserted)
+}
+
+/// A plan refusal raised inside a write closure, carried out as a
+/// `rusqlite::Error` and recognisable again by its message.
+fn sqlite_plan_err(e: crate::federation::Error) -> rusqlite::Error {
+    rusqlite::Error::ToSqlConversionFailure(Box::new(e))
+}
+
+/// v57.0.0 (CIRISPersist#988 item 2) — an in-transaction emitter's record:
+/// plan the row (pure) with the attester resolved before the transaction,
+/// and write it inside `tx`.
+///
+/// Without an attester the two kinds of emitter part
+/// ([`crate::federation::attestation_admit::HardCaseEmitter`]): an ACT this
+/// node performs (an erasure, a peer removal) is refused here, so the
+/// transaction rolls back and the act is undone rather than done unaudited;
+/// an OBSERVATION of a row being admitted (a membership removal applied from
+/// a peer) is not recorded, and the admission it rides on proceeds.
+fn sqlite_record_hard_case_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    attester: &Result<crate::federation::attestation_admit::HardCaseAttester, String>,
+    emitter: crate::federation::attestation_admit::HardCaseEmitter,
+    event: &crate::federation::HardCaseEvent,
+    received_at: chrono::DateTime<chrono::Utc>,
+) -> Result<(), rusqlite::Error> {
+    let attester = match attester {
+        Ok(a) => a,
+        Err(e) => {
+            return match emitter.without_attester(&event.event_id, e) {
+                Ok(()) => Ok(()),
+                Err(msg) => Err(rusqlite::Error::ToSqlConversionFailure(msg.into())),
+            }
+        }
+    };
+    let planned = crate::federation::attestation_admit::plan_hard_case_row(
+        event,
+        attester,
+        crate::federation::attestation_admit::PlanInstants {
+            fold_at: received_at,
+            received_at,
+        },
+    )
+    .map_err(sqlite_plan_err)?;
+    sqlite_store_hard_case(tx, &planned)
+}
+
+/// v57.0.0 (CIRISPersist#988 item 2) — **the hard_case writer**, inside
+/// `tx`: the planned row (insert-if-absent on its event-derived id) and,
+/// when it landed, its projection. A re-recorded event writes nothing.
+fn sqlite_store_hard_case(
+    tx: &rusqlite::Transaction<'_>,
+    planned: &crate::federation::attestation_admit::PlannedHardCase,
+) -> Result<(), rusqlite::Error> {
+    if sqlite_insert_local_attestation_row(tx, &planned.row, None)? == 0 {
+        return Ok(());
+    }
+    sqlite_project_hard_case(
+        tx,
+        "hard_case_events",
+        &planned.row.attestation_id,
+        &planned.projection,
+    )
+}
+
+/// v57.0.0 (CIRISPersist#988 item 2) — one `hard_case_events`-shaped row into
+/// `table` (the live table, or the rebuild's scratch copy): the one statement
+/// both write.
+fn sqlite_project_hard_case(
+    tx: &rusqlite::Transaction<'_>,
+    table: &str,
+    attestation_id: &str,
+    event: &crate::federation::HardCaseEvent,
+) -> Result<(), rusqlite::Error> {
+    let detail = serde_json::to_string(&event.detail)
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+    tx.execute(
+        &format!(
+            "INSERT INTO {table} \
+                (event_id, kind, target_key_id, subject_key_id, detail, emitted_at, attestation_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
+        ),
+        rusqlite::params![
+            event.event_id,
+            event.kind,
+            event.target_key_id,
+            event.subject_key_id,
+            detail,
+            event.emitted_at.to_rfc3339(),
+            attestation_id,
+        ],
+    )?;
+    Ok(())
+}
+
+/// v57.0.0 (CIRISPersist#988 item 3) — one `detection_events`-shaped row into
+/// `table` (the live table, or the rebuild's scratch copy): the one statement
+/// both write. The V080 tombstone is the same statement over a tombstoned
+/// body.
+fn sqlite_project_detection(
+    tx: &rusqlite::Transaction<'_>,
+    table: &str,
+    attestation_id: &str,
+    p: &crate::derived::detection_row::DetectionProjection,
+) -> Result<(), rusqlite::Error> {
+    let to_sql_err = |e: serde_json::Error| rusqlite::Error::ToSqlConversionFailure(Box::new(e));
+    let cohort_cell = serde_json::to_string(&p.cohort_cell).map_err(to_sql_err)?;
+    let conformity_payload = serde_json::to_string(&p.conformity_payload).map_err(to_sql_err)?;
+    tx.execute(
+        &format!(
+            "INSERT INTO {table} (\
+                detection_id, trace_id, body_sha256, detector, severity, \
+                cohort_cell, conformity_variant, conformity_payload, \
+                lens_core_version, ratchet_calibration_version, \
+                canonical_bytes, ed25519_sig, ml_dsa_65_sig, signing_key_id, ts, \
+                erased_at, attestation_id\
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)"
+        ),
+        rusqlite::params![
+            p.detection_id.to_string(),
+            p.trace_id,
+            p.body_sha256,
+            p.detector,
+            p.severity.as_db_str(),
+            cohort_cell,
+            p.conformity_variant.as_db_str(),
+            conformity_payload,
+            p.lens_core_version,
+            p.ratchet_calibration_version as i64,
+            p.canonical_bytes,
+            p.ed25519_sig,
+            p.ml_dsa_65_sig,
+            p.signing_key_id,
+            p.ts.to_rfc3339(),
+            p.erased_at.map(|t| t.to_rfc3339()),
+            attestation_id,
+        ],
+    )?;
+    Ok(())
+}
+
+/// v57.0.0 (CIRISPersist#988 item 3) — a `detection_events` row (live or
+/// tombstoned) read back as its [`DetectionProjection`] body, for the legacy
+/// rehome.
+///
+/// [`DetectionProjection`]: crate::derived::detection_row::DetectionProjection
+fn sqlite_detection_projection_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<crate::derived::detection_row::DetectionProjection> {
+    let conv = |i: usize, e: String| {
+        rusqlite::Error::FromSqlConversionFailure(i, rusqlite::types::Type::Text, e.into())
+    };
+    let detection_id: String = row.get("detection_id")?;
+    let severity: String = row.get("severity")?;
+    let variant: String = row.get("conformity_variant")?;
+    let cohort_cell: String = row.get("cohort_cell")?;
+    let conformity_payload: String = row.get("conformity_payload")?;
+    let ts: String = row.get("ts")?;
+    let erased_at: Option<String> = row.get("erased_at")?;
+    Ok(crate::derived::detection_row::DetectionProjection {
+        detection_id: uuid::Uuid::parse_str(&detection_id).map_err(|e| conv(0, e.to_string()))?,
+        trace_id: row.get("trace_id")?,
+        body_sha256: row.get("body_sha256")?,
+        detector: row.get("detector")?,
+        severity: crate::derived::DetectionSeverity::from_db_str(&severity)
+            .ok_or_else(|| conv(4, format!("unknown severity {severity}")))?,
+        cohort_cell: serde_json::from_str(&cohort_cell).map_err(|e| conv(5, e.to_string()))?,
+        conformity_variant: crate::derived::ConformityVariant::from_db_str(&variant)
+            .ok_or_else(|| conv(6, format!("unknown conformity_variant {variant}")))?,
+        conformity_payload: serde_json::from_str(&conformity_payload)
+            .map_err(|e| conv(7, e.to_string()))?,
+        lens_core_version: row.get("lens_core_version")?,
+        ratchet_calibration_version: row.get::<_, i64>("ratchet_calibration_version")? as i32,
+        canonical_bytes: row.get("canonical_bytes")?,
+        ed25519_sig: row.get("ed25519_sig")?,
+        ml_dsa_65_sig: row.get("ml_dsa_65_sig")?,
+        signing_key_id: row.get("signing_key_id")?,
+        ts: parse_rfc3339(&ts),
+        erased_at: erased_at.as_deref().map(parse_rfc3339),
+    })
+}
+
+/// v57.0.0 (CLM-silo-projection-rebuildable) — every row of `table`, in
+/// `order`, rendered as `quote(col1)|quote(col2)|…` over the columns of
+/// `shape` (the live table, so a scratch copy is rendered column for column
+/// the same way). `quote()` is SQLite's own exact literal of a value, type
+/// and bytes, so equal strings are equal rows.
+fn sqlite_render_table(
+    tx: &rusqlite::Transaction<'_>,
+    shape: &str,
+    table: &str,
+    order: &str,
+) -> Result<Vec<String>, rusqlite::Error> {
+    let columns: Vec<String> = {
+        let mut stmt = tx.prepare(&format!("SELECT name FROM pragma_table_info('{shape}')"))?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        rows.collect::<Result<_, _>>()?
+    };
+    let rendered = columns
+        .iter()
+        .map(|c| format!("quote(\"{c}\")"))
+        .collect::<Vec<_>>()
+        .join(" || '|' || ");
+    let mut stmt = tx.prepare(&format!(
+        "SELECT {rendered} FROM {table} ORDER BY \"{order}\""
+    ))?;
+    let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+    rows.collect()
 }
 
 /// v5.1.0 (CIRISPersist#65, CEG 1.0-RC2 §5.6.8.13) — row → Organization.
@@ -27935,27 +28500,6 @@ impl crate::derived::DerivedSchema for SqliteBackend {
         &self,
         event: crate::derived::DetectionEvent,
     ) -> Result<(), crate::derived::Error> {
-        // Fixed-length signature shape gates — surface a typed
-        // InvalidArgument rather than letting the table CHECK fire as
-        // an opaque backend SQL error. Matches the Postgres impl.
-        if event.body_sha256.len() != 32 {
-            return Err(crate::derived::Error::InvalidArgument(format!(
-                "body_sha256 must be 32 bytes (got {})",
-                event.body_sha256.len()
-            )));
-        }
-        if event.ed25519_sig.len() != 64 {
-            return Err(crate::derived::Error::InvalidArgument(format!(
-                "ed25519_sig must be 64 bytes (got {})",
-                event.ed25519_sig.len()
-            )));
-        }
-        if event.ml_dsa_65_sig.len() != 3309 {
-            return Err(crate::derived::Error::InvalidArgument(format!(
-                "ml_dsa_65_sig must be 3309 bytes (got {})",
-                event.ml_dsa_65_sig.len()
-            )));
-        }
         // v54.1.0 (Codex round 4 sweep on PR #1057) — a detection naming a
         // trace a steward purge tombstoned is refused: it would re-attach the
         // linkage and content the purge's finalize tombstoned.
@@ -27967,65 +28511,12 @@ impl crate::derived::DerivedSchema for SqliteBackend {
                 }
                 other => crate::derived::Error::Backend(other.to_string()),
             })?;
-
-        let cohort_cell = serde_json::to_string(&event.cohort_cell)
-            .map_err(|e| crate::derived::Error::Backend(format!("cohort_cell encode: {e}")))?;
-        let conformity_payload = serde_json::to_string(&event.conformity_payload).map_err(|e| {
-            crate::derived::Error::Backend(format!("conformity_payload encode: {e}"))
-        })?;
-        self.write(move |conn| -> Result<(), crate::derived::Error> {
-            // Idempotent on detection_id; raise Conflict on collision
-            // with different canonical_bytes.
-            let changed = conn
-                .execute(
-                    "INSERT INTO cirislens_derived_detection_events (\
-                        detection_id, trace_id, body_sha256, detector, severity, \
-                        cohort_cell, conformity_variant, conformity_payload, \
-                        lens_core_version, ratchet_calibration_version, \
-                        canonical_bytes, ed25519_sig, ml_dsa_65_sig, signing_key_id, ts\
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15) \
-                     ON CONFLICT (detection_id) DO NOTHING",
-                    rusqlite::params![
-                        event.detection_id.to_string(),
-                        event.trace_id,
-                        event.body_sha256,
-                        event.detector,
-                        event.severity.as_db_str(),
-                        cohort_cell,
-                        event.conformity_variant.as_db_str(),
-                        conformity_payload,
-                        event.lens_core_version,
-                        event.ratchet_calibration_version as i64,
-                        event.canonical_bytes,
-                        event.ed25519_sig,
-                        event.ml_dsa_65_sig,
-                        event.signing_key_id,
-                        event.ts.to_rfc3339(),
-                    ],
-                )
-                .map_err(sqlite_derived_err("insert detection_events"))?;
-            if changed == 0 {
-                let existing: Option<Vec<u8>> = conn
-                    .query_row(
-                        "SELECT canonical_bytes FROM cirislens_derived_detection_events \
-                         WHERE detection_id = ?1",
-                        [event.detection_id.to_string()],
-                        |row| row.get(0),
-                    )
-                    .optional()
-                    .map_err(sqlite_derived_err("detection conflict check"))?;
-                if let Some(existing_bytes) = existing {
-                    if existing_bytes != event.canonical_bytes {
-                        return Err(crate::derived::Error::Conflict(format!(
-                            "detection_id {} already exists with different canonical_bytes",
-                            event.detection_id
-                        )));
-                    }
-                }
-            }
-            Ok(())
-        })
-        .await
+        // v57.0.0 (CIRISPersist#988 item 3) — a `detection:{detector}:v1` row
+        // on the plane, decided once (`plan_detection_row`, which also holds
+        // V008's shape gates); the table is its projection.
+        crate::federation::attestation_admit::put_detection_planned(self, &event)
+            .await
+            .map_err(crate::derived::detection_row::derived_error)
     }
 
     async fn get_detection_events(
@@ -31092,9 +31583,11 @@ mod tests {
     async fn reverse_quorum_parity_sqlite_574() {
         let backend = SqliteBackend::open_in_memory().await.unwrap();
         backend.run_migrations().await.unwrap();
-        crate::federation::reverse_quorum::test_support::exercise_reverse_quorum(
-            &backend,
-            "sqlite-rq",
+        Box::pin(
+            crate::federation::reverse_quorum::test_support::exercise_reverse_quorum(
+                &backend,
+                "sqlite-rq",
+            ),
         )
         .await;
     }
@@ -32277,6 +32770,9 @@ mod tests {
         use crate::federation::hard_case;
         let backend = SqliteBackend::open_in_memory().await.unwrap();
         backend.run_migrations().await.unwrap();
+        // v57.0.0 (#988 item 2) — a hard_case row needs this node's key.
+        crate::federation::hard_case::test_support::declare_node(&backend, "sqlite-test-node")
+            .await;
         let fam = format!("fam-{}", uuid::Uuid::new_v4());
         let member = format!("carol-{}", uuid::Uuid::new_v4());
         for k in [&fam, &member] {
@@ -32888,6 +33384,9 @@ mod tests {
         };
         let backend = SqliteBackend::open_in_memory().await.unwrap();
         backend.run_migrations().await.unwrap();
+        // v57.0.0 (#988 item 2) — a hard_case row needs this node's key.
+        crate::federation::hard_case::test_support::declare_node(&backend, "sqlite-test-node")
+            .await;
         let ev = |id: &str, k: &str| HardCaseEvent {
             event_id: id.into(),
             kind: k.into(),
@@ -32950,6 +33449,9 @@ mod tests {
         use std::time::Duration;
         let backend = SqliteBackend::open_in_memory().await.unwrap();
         backend.run_migrations().await.unwrap();
+        // v57.0.0 (#988 item 2) — a hard_case row needs this node's key.
+        crate::federation::hard_case::test_support::declare_node(&backend, "sqlite-test-node")
+            .await;
         for k in ["producer-1", "subject-1", "target-1"] {
             backend
                 .put_public_key(SignedKeyRecord {
@@ -36474,6 +36976,15 @@ mod tests {
             None,
         )
         .await;
+        // v57.0.0 (#988 item 2) — the fixture's node key ("comm-node"), held:
+        // the attester of the recipient_excluded row.
+        crate::federation::tier_ingest::test_support::register_hybrid_key_as(
+            &backend,
+            "comm-node",
+            "comm-node",
+            crate::federation::types::identity_type::NODE,
+        )
+        .await;
 
         let plaintext = b"co-op meeting minutes";
         let result =
@@ -37886,6 +38397,9 @@ mod tests {
 
         let backend = SqliteBackend::open_in_memory().await.unwrap();
         backend.run_migrations().await.unwrap();
+        // v57.0.0 (#988 item 2) — a hard_case row needs this node's key.
+        crate::federation::hard_case::test_support::declare_node(&backend, "sqlite-test-node")
+            .await;
         for k in ["fam", "alice", "carol", "alice-phone", "carol-phone"] {
             backend
                 .put_public_key(SignedKeyRecord {
@@ -47878,6 +48392,18 @@ mod tests {
         use crate::store::Backend;
         let backend = SqliteBackend::open_in_memory().await.unwrap();
         backend.run_migrations().await.unwrap();
+        // v57.0.0 (#988 item 2) — a hard_case row needs this node's key.
+        crate::federation::hard_case::test_support::declare_node(&backend, "sqlite-test-node")
+            .await;
+        // v57.0.0 (#988 item 3) — a detection row's attester is a held
+        // lenscore_detector key (the detector-only reserved family).
+        crate::federation::tier_ingest::test_support::register_hybrid_key_as(
+            &backend,
+            "key-lens",
+            "key-lens",
+            crate::federation::types::identity_type::LENSCORE_DETECTOR,
+        )
+        .await;
 
         // Two traces for the target agent; fixture_event_row stamps
         // agent_id_hash="deadbeef". Distinct trace_ids "tr-A" / "tr-B".
@@ -47982,6 +48508,15 @@ mod tests {
     async fn de_detection_event_round_trip_and_filter() {
         let backend = SqliteBackend::open_in_memory().await.unwrap();
         backend.run_migrations().await.unwrap();
+        // v57.0.0 (#988 item 3) — a detection row's attester is a held
+        // lenscore_detector key (the detector-only reserved family).
+        crate::federation::tier_ingest::test_support::register_hybrid_key_as(
+            &backend,
+            "key-lens",
+            "key-lens",
+            crate::federation::types::identity_type::LENSCORE_DETECTOR,
+        )
+        .await;
         let id_a = uuid::Uuid::new_v4();
         let id_b = uuid::Uuid::new_v4();
         backend
@@ -48020,6 +48555,15 @@ mod tests {
     async fn de_detection_event_idempotent_then_conflict() {
         let backend = SqliteBackend::open_in_memory().await.unwrap();
         backend.run_migrations().await.unwrap();
+        // v57.0.0 (#988 item 3) — a detection row's attester is a held
+        // lenscore_detector key (the detector-only reserved family).
+        crate::federation::tier_ingest::test_support::register_hybrid_key_as(
+            &backend,
+            "key-lens",
+            "key-lens",
+            crate::federation::types::identity_type::LENSCORE_DETECTOR,
+        )
+        .await;
         let id = uuid::Uuid::new_v4();
         backend
             .put_detection_event(de_fixture(id, "tr-A", b"canon-A"))
@@ -50731,6 +51275,9 @@ mod tests {
         use crate::read::FederationKeyFilter;
         let backend = SqliteBackend::open_in_memory().await.unwrap();
         backend.run_migrations().await.unwrap();
+        // v57.0.0 (#988 item 2) — a hard_case row needs this node's key.
+        crate::federation::hard_case::test_support::declare_node(&backend, "sqlite-test-node")
+            .await;
 
         // Two peers in family-acme, one in a different cohort.
         for id in ["peer-fam-1", "peer-fam-2"] {
@@ -50866,6 +51413,9 @@ mod tests {
     async fn remove_peer_record_soft_marks_removed_at_and_hides_from_reads_sqlite() {
         let backend = SqliteBackend::open_in_memory().await.unwrap();
         backend.run_migrations().await.unwrap();
+        // v57.0.0 (#988 item 2) — a hard_case row needs this node's key.
+        crate::federation::hard_case::test_support::declare_node(&backend, "sqlite-test-node")
+            .await;
         backend
             .add_peer_record("peer-soft", "AAAA", "agent", None)
             .await
@@ -50893,6 +51443,9 @@ mod tests {
     async fn remove_peer_record_hard_with_active_attestations_rejects_sqlite() {
         let backend = SqliteBackend::open_in_memory().await.unwrap();
         backend.run_migrations().await.unwrap();
+        // v57.0.0 (#988 item 2) — a hard_case row needs this node's key.
+        crate::federation::hard_case::test_support::declare_node(&backend, "sqlite-test-node")
+            .await;
         // v9.0.0 (CC 5.3.2.4.3.1) — register peer-att-a with REAL hybrid
         // pubkeys first so the federation-tier attestation below verifies,
         // then add_peer_record with the matching Ed25519 pubkey (upsert-
@@ -50942,6 +51495,9 @@ mod tests {
     async fn remove_peer_record_hard_with_no_attestations_cascades_sqlite() {
         let backend = SqliteBackend::open_in_memory().await.unwrap();
         backend.run_migrations().await.unwrap();
+        // v57.0.0 (#988 item 2) — a hard_case row needs this node's key.
+        crate::federation::hard_case::test_support::declare_node(&backend, "sqlite-test-node")
+            .await;
         backend
             .add_peer_record("peer-hard", "AAAA", "agent", None)
             .await
@@ -51089,6 +51645,9 @@ mod tests {
         use crate::federation::FederationDirectory;
         let backend = SqliteBackend::open_in_memory().await.unwrap();
         backend.run_migrations().await.unwrap();
+        // v57.0.0 (#988 item 2) — a hard_case row needs this node's key.
+        crate::federation::hard_case::test_support::declare_node(&backend, "sqlite-test-node")
+            .await;
         backend
             .add_peer_record("peer-gone", "AAAA", "agent", None)
             .await

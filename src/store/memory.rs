@@ -386,7 +386,20 @@ struct State {
     /// the `hard_case:*` emission surface, keyed by the deterministic
     /// `event_id` (idempotent insert = no-op on conflict). Parity with the
     /// postgres/sqlite `hard_case_events` table (V075).
-    federation_hard_case_events: HashMap<String, crate::federation::hard_case::HardCaseEvent>,
+    ///
+    /// v57.0.0 (CIRISPersist#988 item 2, V194 mirror) — a PROJECTION of the
+    /// `hard_case:{kind}:v1` rows, each entry carrying the `attestation_id`
+    /// of the row it came from; [`prune_row_projections`] drops an entry
+    /// whose row left (the SQL backends' `ON DELETE CASCADE`).
+    federation_hard_case_events:
+        HashMap<String, (String, crate::federation::hard_case::HardCaseEvent)>,
+    /// v57.0.0 (CIRISPersist#988 item 3, V195 mirror) — the
+    /// `detection_events` projection of the `detection:{detector}:v1` rows,
+    /// keyed by `detection_id`, each entry carrying its row's
+    /// `attestation_id`. Memory held no detection substrate before v57; the
+    /// row door gives it one, so the projection witness runs here too.
+    derived_detection_events:
+        HashMap<String, (String, crate::derived::detection_row::DetectionProjection)>,
     /// v8.0.0 (CIRISPersist#227) — fountain `content_manifest` rows,
     /// keyed by the `(content_id, corpus_kind)` PK. NEVER evicted.
     /// Parity with the postgres/sqlite `content_manifest` table (V084).
@@ -1004,6 +1017,7 @@ impl Default for MemoryBackend {
                 transport_destination_sigs: HashMap::new(),
                 freshness_floor: HashMap::new(),
                 federation_hard_case_events: HashMap::new(),
+                derived_detection_events: HashMap::new(),
                 fountain_manifests: HashMap::new(),
                 fountain_symbols: HashMap::new(),
                 installed_storage_budgets: HashMap::new(),
@@ -1070,6 +1084,27 @@ impl MemoryBackend {
     #[allow(dead_code)] // unarmed under the `server`-only axis
     pub(crate) fn test_hooks(&self) -> &crate::store::test_hooks::TestHooks {
         &self.test_hooks
+    }
+
+    /// v57.0.0 (CIRISPersist#988, I960) — a `hard_case_events` entry no row
+    /// produces: the projection witness's red on the backend with no SQL.
+    #[cfg(test)]
+    pub(crate) fn test_insert_orphan_hard_case_projection(&self, event_id: &str) {
+        let mut state = self.state.lock().expect("memory backend lock");
+        state.federation_hard_case_events.insert(
+            event_id.to_owned(),
+            (
+                format!("{event_id}-no-row"),
+                crate::federation::hard_case::HardCaseEvent {
+                    event_id: event_id.to_owned(),
+                    kind: "orphan".into(),
+                    target_key_id: None,
+                    subject_key_id: None,
+                    detail: serde_json::json!({}),
+                    emitted_at: chrono::Utc::now(),
+                },
+            ),
+        );
     }
 
     /// v54.1.0 (CIRISPersist#1044, I621) — hold a key row past every
@@ -2152,7 +2187,28 @@ impl Backend for MemoryBackend {
         signature_key_id: &str,
         include_federation_key: bool,
     ) -> Result<super::types::DeleteSummary, Error> {
+        // v57.0.0 (CIRISPersist#988 item 2) — the audit row's attester, read
+        // before the lock (the SQL backends read it before their transaction).
+        let attester = crate::federation::attestation_admit::hard_case_attester(self)
+            .await
+            .map_err(|e| format!("{}: {e}", e.kind()));
+        let received_at = chrono::Utc::now();
         let mut state = self.state.lock().expect("memory backend lock");
+        // An act that would delete something and has no attester is refused
+        // here, before anything moves (the SQL transaction's rollback).
+        if let Err(e) = &attester {
+            let would_delete = state.events.values().any(|(_, row)| {
+                row.agent_id_hash == agent_id_hash && row.signing_key_id == signature_key_id
+            }) || (include_federation_key
+                && state.federation_keys.values().any(|rec| {
+                    rec.identity_type == "agent"
+                        && rec.identity_ref == agent_id_hash
+                        && rec.key_id == signature_key_id
+                }));
+            if would_delete {
+                return Err(Error::Backend(format!("dsar: {e}")));
+            }
+        }
         // Per-key DSAR scope: both agent_id_hash AND signing_key_id
         // must match. trace_llm_calls cascade joins by trace_id
         // (V001 schema — LLM call rows don't carry either field).
@@ -2236,6 +2292,7 @@ impl Backend for MemoryBackend {
             });
             federation_attestations_deleted =
                 (atts_before - state.federation_attestations.len()) as u64;
+            prune_row_projections(&mut state);
 
             // Now safe to delete the federation_keys rows.
             let keys_before = state.federation_keys.len();
@@ -2253,27 +2310,31 @@ impl Backend for MemoryBackend {
             || federation_attestations_deleted > 0
             || federation_revocations_deleted > 0
         {
-            let event_id = uuid::Uuid::new_v4().to_string();
-            state.federation_hard_case_events.insert(
-                event_id.clone(),
-                crate::federation::hard_case::HardCaseEvent {
-                    event_id,
-                    kind: crate::federation::hard_case::kind::TRACE_ERASURE.to_owned(),
-                    target_key_id: Some(agent_id_hash.to_owned()),
-                    subject_key_id: None,
-                    detail: serde_json::json!({
-                        "op": "delete_traces_for_agent",
-                        "agent_id_hash": agent_id_hash,
-                        "signing_key_id": signature_key_id,
-                        "trace_events": trace_events_deleted,
-                        "trace_llm_calls": trace_llm_calls_deleted,
-                        "federation_keys": federation_keys_deleted,
-                        "federation_attestations": federation_attestations_deleted,
-                        "federation_revocations": federation_revocations_deleted,
-                    }),
-                    emitted_at: chrono::Utc::now(),
-                },
-            );
+            let event = crate::federation::hard_case::HardCaseEvent {
+                event_id: uuid::Uuid::new_v4().to_string(),
+                kind: crate::federation::hard_case::kind::TRACE_ERASURE.to_owned(),
+                target_key_id: Some(agent_id_hash.to_owned()),
+                subject_key_id: None,
+                detail: serde_json::json!({
+                    "op": "delete_traces_for_agent",
+                    "agent_id_hash": agent_id_hash,
+                    "signing_key_id": signature_key_id,
+                    "trace_events": trace_events_deleted,
+                    "trace_llm_calls": trace_llm_calls_deleted,
+                    "federation_keys": federation_keys_deleted,
+                    "federation_attestations": federation_attestations_deleted,
+                    "federation_revocations": federation_revocations_deleted,
+                }),
+                emitted_at: received_at,
+            };
+            memory_record_hard_case_in_state(
+                &mut state,
+                &attester,
+                crate::federation::attestation_admit::HardCaseEmitter::Act,
+                &event,
+                received_at,
+            )
+            .map_err(|e| Error::Backend(format!("dsar: {e}")))?;
         }
 
         Ok(super::types::DeleteSummary {
@@ -2290,8 +2351,24 @@ impl Backend for MemoryBackend {
         &self,
         agent_id_hash: &str,
     ) -> Result<super::types::ErasureSummary, Error> {
+        // v57.0.0 (CIRISPersist#988 item 2) — the audit row's attester, read
+        // before the lock.
+        let attester = crate::federation::attestation_admit::hard_case_attester(self)
+            .await
+            .map_err(|e| format!("{}: {e}", e.kind()));
         let erased_at = chrono::Utc::now();
         let mut state = self.state.lock().expect("memory backend lock");
+        // An erasure that would delete something and has no attester is
+        // refused here, before anything moves (the SQL transaction's rollback).
+        if let Err(e) = &attester {
+            if state
+                .events
+                .values()
+                .any(|(_, row)| row.agent_id_hash == agent_id_hash)
+            {
+                return Err(Error::Backend(format!("erasure: {e}")));
+            }
+        }
 
         // Full erasure: every trace_events row for this agent_id_hash,
         // across all signing keys. trace_llm_calls cascade joins by
@@ -2315,36 +2392,39 @@ impl Backend for MemoryBackend {
             .retain(|row| !target_trace_ids.contains(&row.trace_id));
         let trace_llm_calls = (llm_before - state.llm_calls.len()) as u64;
 
-        // detection_events tombstone: the memory backend has no
-        // cirislens_derived storage (DerivedSchema put paths return
-        // NotImplemented), so there is nothing to tombstone. Always 0;
-        // the postgres/sqlite backends carry the real tombstone path.
-        let detection_events_tombstoned = 0u64;
+        // v57.0.0 (CIRISPersist#988 item 3) — the V080 tombstone, on the
+        // rows: memory holds detections since the row door gave it one.
+        let detection_events_tombstoned =
+            memory_tombstone_detections(&mut state, &target_trace_ids, erased_at)
+                .map_err(|e| Error::Backend(format!("erasure: {e}")))?;
 
         // Audit emit — record a `hard_case:trace_erasure` row, mirroring
         // the durable hard_case_events surface (atomic with the deletes
         // since the whole op holds the single state lock). Emit only when
         // something was actually erased, so an idempotent re-run stays a
         // clean no-op.
-        if trace_events > 0 || trace_llm_calls > 0 {
-            let event_id = uuid::Uuid::new_v4().to_string();
-            let detail = serde_json::json!({
-                "agent_id_hash": agent_id_hash,
-                "trace_events": trace_events,
-                "trace_llm_calls": trace_llm_calls,
-                "detection_events_tombstoned": detection_events_tombstoned,
-            });
-            state.federation_hard_case_events.insert(
-                event_id.clone(),
-                crate::federation::hard_case::HardCaseEvent {
-                    event_id,
-                    kind: crate::federation::hard_case::kind::TRACE_ERASURE.to_owned(),
-                    target_key_id: Some(agent_id_hash.to_owned()),
-                    subject_key_id: None,
-                    detail,
-                    emitted_at: erased_at,
-                },
-            );
+        if trace_events > 0 || trace_llm_calls > 0 || detection_events_tombstoned > 0 {
+            let event = crate::federation::hard_case::HardCaseEvent {
+                event_id: uuid::Uuid::new_v4().to_string(),
+                kind: crate::federation::hard_case::kind::TRACE_ERASURE.to_owned(),
+                target_key_id: Some(agent_id_hash.to_owned()),
+                subject_key_id: None,
+                detail: serde_json::json!({
+                    "agent_id_hash": agent_id_hash,
+                    "trace_events": trace_events,
+                    "trace_llm_calls": trace_llm_calls,
+                    "detection_events_tombstoned": detection_events_tombstoned,
+                }),
+                emitted_at: erased_at,
+            };
+            memory_record_hard_case_in_state(
+                &mut state,
+                &attester,
+                crate::federation::attestation_admit::HardCaseEmitter::Act,
+                &event,
+                erased_at,
+            )
+            .map_err(|e| Error::Backend(format!("erasure: {e}")))?;
         }
 
         Ok(super::types::ErasureSummary {
@@ -3011,47 +3091,14 @@ impl crate::federation::attestation_admit::AttestationStore for MemoryBackend {
             state
                 .federation_attestations
                 .retain(|a| !replaced.contains(&a.attestation_id));
+            prune_row_projections(&mut state);
             // v45.0.0 (#871) — a replaced row's rendition leaves the V149
             // mirror with it.
             state
                 .blob_renditions
                 .retain(|r| !replaced.contains(&r.source_attestation_id));
         }
-        // v18.0.0 (#473) — the INSERT OR IGNORE twin: an id still held here (a
-        // concurrent writer took it after the plan read it free) is a no-op.
-        if state
-            .federation_attestations
-            .iter()
-            .any(|a| a.attestation_id == row.attestation_id)
-        {
-            return Ok(());
-        }
-        // v45.0.0 (CIRISPersist#871, FSD §5) — the V149 `blob_renditions`
-        // mirror at the local door, under the same lock as the push below.
-        project_rendition_row(&mut state, &row);
-        // v17.4.0 (V106) — maintain the subject-index mirror at local tier.
-        for subj in &row.subject_key_ids {
-            state
-                .subject_index
-                .entry(subj.clone())
-                .or_default()
-                .push(row.attestation_id.clone());
-        }
-        // v36.0.0 (#668) — serve position (V130 mirror).
-        let admitted_at = next_plane_position(
-            &state,
-            PLANE_ATTESTATION,
-            attestation_rows(&state).into_iter(),
-        );
-        let id_for_stamp = row.attestation_id.clone();
-        // v50.0.0 (review H2, final check, 3d) — a local `withdraws`'s depth.
-        if let Some(depth) = withdraws_depth {
-            state
-                .federation_withdraws_admission_depths
-                .insert(row.attestation_id.clone(), depth);
-        }
-        state.federation_attestations.push(row);
-        stamp_plane_position(&mut state, PLANE_ATTESTATION, id_for_stamp, admitted_at);
+        memory_insert_local_row(&mut state, row, withdraws_depth);
         Ok(())
     }
 
@@ -3124,7 +3171,110 @@ impl crate::federation::attestation_admit::AttestationStore for MemoryBackend {
             ids.retain(|id| id != attestation_id);
         }
         state.subject_index.retain(|_, ids| !ids.is_empty());
+        // v57.0.0 (#988) — and the V194/V195 projections.
+        prune_row_projections(&mut state);
         Ok(true)
+    }
+
+    async fn store_planned_hard_case(
+        &self,
+        planned: crate::federation::attestation_admit::PlannedHardCase,
+    ) -> Result<(), crate::federation::Error> {
+        let mut state = self.state.lock().expect("memory backend lock");
+        memory_store_hard_case(&mut state, planned);
+        Ok(())
+    }
+
+    /// Memory holds no pre-v57 silo rows: nothing to rehome.
+    async fn rehome_legacy_hard_case_events(
+        &self,
+        _attester: &crate::federation::attestation_admit::HardCaseAttester,
+        _received_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), crate::federation::Error> {
+        Ok(())
+    }
+
+    async fn store_planned_detection(
+        &self,
+        planned: crate::federation::attestation_admit::PlannedDetection,
+    ) -> Result<bool, crate::federation::Error> {
+        let mut state = self.state.lock().expect("memory backend lock");
+        let crate::federation::attestation_admit::PlannedDetection { row, projection } = planned;
+        let attestation_id = row.attestation_id.clone();
+        if !memory_insert_local_row(&mut state, row, None) {
+            return Ok(false);
+        }
+        state.derived_detection_events.insert(
+            projection.detection_id.to_string(),
+            (attestation_id, projection),
+        );
+        Ok(true)
+    }
+
+    /// Memory held no detection substrate before v57: nothing to rehome.
+    async fn rehome_legacy_detection_events(
+        &self,
+        _received_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), crate::federation::Error> {
+        Ok(())
+    }
+
+    async fn projection_rebuild(
+        &self,
+        projection: crate::federation::silo_projection::SiloProjection,
+    ) -> Result<crate::federation::silo_projection::ProjectionRebuild, crate::federation::Error>
+    {
+        use crate::federation::silo_projection::SiloProjection;
+        let state = self.state.lock().expect("memory backend lock");
+        // Each entry rendered as its serde form, keyed and ordered like the
+        // SQL tables' primary keys; the rebuild projects every held row
+        // through the same function the writers use.
+        fn render<T: serde::Serialize>(
+            map: std::collections::BTreeMap<String, (String, T)>,
+        ) -> Result<Vec<String>, crate::federation::Error> {
+            map.into_iter()
+                .map(|(k, (id, v))| {
+                    serde_json::to_string(&(k, id, v)).map_err(|e| {
+                        crate::federation::Error::Backend(format!("projection render: {e}"))
+                    })
+                })
+                .collect()
+        }
+        let (live, rebuilt) = match projection {
+            SiloProjection::HardCaseEvents => {
+                let live = state
+                    .federation_hard_case_events
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                let rebuilt = state
+                    .federation_attestations
+                    .iter()
+                    .filter_map(|row| {
+                        crate::federation::hard_case::project_hard_case_row(row)
+                            .map(|e| (e.event_id.clone(), (row.attestation_id.clone(), e)))
+                    })
+                    .collect();
+                (render(live)?, render(rebuilt)?)
+            }
+            SiloProjection::DetectionEvents => {
+                let live = state
+                    .derived_detection_events
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                let rebuilt = state
+                    .federation_attestations
+                    .iter()
+                    .filter_map(|row| {
+                        crate::derived::detection_row::project_detection_row(row)
+                            .map(|p| (p.detection_id.to_string(), (row.attestation_id.clone(), p)))
+                    })
+                    .collect();
+                (render(live)?, render(rebuilt)?)
+            }
+        };
+        Ok(crate::federation::silo_projection::ProjectionRebuild { live, rebuilt })
     }
 
     async fn store_planned_attestation(
@@ -3154,6 +3304,7 @@ impl crate::federation::attestation_admit::AttestationStore for MemoryBackend {
             row,
             withdraws_depth,
             projected_trace,
+            projected_detection,
             wire_index_key,
             ..
         } = planned;
@@ -3237,6 +3388,14 @@ impl crate::federation::attestation_admit::AttestationStore for MemoryBackend {
             // v45.0.0 (CIRISPersist#871, FSD §5) — maintain the V149
             // `blob_renditions` mirror under the same lock, before `row` moves.
             project_rendition_row(&mut state, &row);
+            // v57.0.0 (CIRISPersist#988 item 3) — the V195 `detection_events`
+            // mirror, under the same lock.
+            if let Some(detection) = projected_detection {
+                state.derived_detection_events.insert(
+                    detection.detection_id.to_string(),
+                    (row.attestation_id.clone(), detection),
+                );
+            }
             // v36.0.0 (#668) — serve position (V130 mirror).
             let admitted_at = next_plane_position(
                 &state,
@@ -3582,6 +3741,8 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             ids.retain(|id| id != attestation_id);
         }
         state.subject_index.retain(|_, ids| !ids.is_empty());
+        // v57.0.0 (#988) — and the V194/V195 projections.
+        prune_row_projections(&mut state);
         Ok(true)
     }
 
@@ -3610,6 +3771,13 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         if person_signed {
             return Ok((0, 0));
         }
+        // v57.0.0 (CIRISPersist#988 item 3) — the derived detections take the
+        // Art. 17 tombstone, under this lock (the SQL backends' transaction).
+        memory_tombstone_detections(
+            &mut state,
+            &std::iter::once(trace_id.to_owned()).collect(),
+            chrono::Utc::now(),
+        )?;
         let events_before = state.events.len();
         state.events.retain(|_, (_, e)| e.trace_id != trace_id);
         let calls_before = state.llm_calls.len();
@@ -4898,6 +5066,13 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             .federation_withdraws_admission_depths
             .remove(attestation_id);
         state.federation_trust_direction_held.remove(attestation_id);
+        // v57.0.0 (#988) — the V194/V195 projections of the row.
+        state
+            .federation_hard_case_events
+            .retain(|_, (id, _)| id != attestation_id);
+        state
+            .derived_detection_events
+            .retain(|_, (id, _)| id != attestation_id);
         Ok(())
     }
 
@@ -7163,7 +7338,9 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // `.entry().or_insert()` matched the SQL backends' idempotent upsert —
         // which is exactly what made it invisible. It was one gate away from a
         // hole, permanently, on the arm nobody watches.
-        crate::federation::FederationDirectory::record_hard_case(self, removal_event).await?;
+        // v57.0.0 (CIRISPersist#988 item 2) — an observation: a node with no
+        // attester records nothing; the removal already landed.
+        crate::federation::hard_case::record_observation(self, removal_event).await?;
         Ok(())
     }
 
@@ -7236,6 +7413,12 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             )
             .await?;
         }
+        // v57.0.0 (CIRISPersist#988 item 2) — the removal's hard_case row is
+        // planned under the lock; its attester is read here, before it.
+        let hard_case_attester = crate::federation::attestation_admit::hard_case_attester(self)
+            .await
+            .map_err(|e| format!("{}: {e}", e.kind()));
+        let hard_case_received_at = chrono::Utc::now();
         let wire_index_key = {
             let mut state = self.state.lock().expect("memory backend lock");
             // v48.0.0 (CIRISPersist#860, V151) — the group FK points at the
@@ -7294,10 +7477,16 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                 &row.removed_identity_key_id,
                 row.effective_at,
             );
-            state
-                .federation_hard_case_events
-                .entry(event.event_id.clone())
-                .or_insert(event);
+            // v57.0.0 (CIRISPersist#988 item 2) — an observation: a node with
+            // no attester records nothing and the removal still lands.
+            memory_record_hard_case_in_state(
+                &mut state,
+                &hard_case_attester,
+                crate::federation::attestation_admit::HardCaseEmitter::Observation,
+                &event,
+                hard_case_received_at,
+            )
+            .map_err(crate::federation::Error::Backend)?;
             // CC 4.4.3.2.2 rotation-on-removal: advance the community DEK epoch
             // (the at-rest crypto half lives only on the BlobStorage backends;
             // memory carries the rotation *state* so rotation-on-removal is
@@ -7953,17 +8142,10 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         &self,
         event: crate::federation::hard_case::HardCaseEvent,
     ) -> Result<(), crate::federation::Error> {
-        // v25.1.0 (CIRISPersist#570 ask 3) — the attribution gate.
-        // Verify-before-mutation: an `admin_action` record that does not carry
-        // {delegation_id, reason} is refused naming WHICH, and no row is
-        // written. A no-op for every observed-condition kind.
-        crate::federation::check_admin_action_attribution(&event)?;
-        let mut state = self.state.lock().expect("memory backend lock");
-        state
-            .federation_hard_case_events
-            .entry(event.event_id.clone())
-            .or_insert(event);
-        Ok(())
+        // v57.0.0 (CIRISPersist#988 item 2) — a `hard_case:{kind}:v1` row on
+        // the plane, decided once (`plan_hard_case_row`); the map is its
+        // projection, written under the same lock.
+        crate::federation::attestation_admit::record_hard_case_planned(self, event).await
     }
 
     /// CIRISServer#356 — this backend DOES charge peer writes
@@ -7983,6 +8165,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         let mut rows: Vec<_> = state
             .federation_hard_case_events
             .values()
+            .map(|(_, e)| e)
             .filter(|e| filter.kind.as_ref().is_none_or(|k| &e.kind == k))
             .filter(|e| filter.since.is_none_or(|s| e.emitted_at >= s))
             .cloned()
@@ -10477,6 +10660,10 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                     .into(),
             ));
         }
+        // v57.0.0 (CIRISPersist#988 item 2) — the record's attester, read
+        // before the lock; asked for only once the removal's own refusals
+        // have had their say.
+        let attester = crate::federation::attestation_admit::hard_case_attester(self).await;
         let mut state = self.state.lock().expect("memory backend lock");
         // PeerNotFound when no live metadata row OR (for hard remove)
         // no key row either. Treat "metadata row already removed_at"
@@ -10512,10 +10699,16 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                     attestation_count,
                 });
             }
+        }
+        // v57.0.0 (CIRISPersist#988 item 2) — an act: no attester, no removal.
+        // The record is planned before anything moves.
+        let removal =
+            plan_peer_removal_event(&attester?, key_id, hard, reason, acting_under_delegation_id)?;
+        if hard {
             // Cascade: drop federation_keys row + metadata row.
             state.federation_keys.remove(key_id);
             state.federation_peer_metadata.remove(key_id);
-            record_peer_removal_event(&mut state, key_id, true, reason, acting_under_delegation_id);
+            memory_store_hard_case(&mut state, removal);
         } else {
             // Soft-remove: mark removed_at; bump updated_at;
             // recompute persist_row_hash.
@@ -10535,13 +10728,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             // to a removed peer's audience. Stamp mutated_at so the cursor
             // planes re-serve the sibling row.
             state.key_record_mutated_at.insert(key_id.to_owned(), now);
-            record_peer_removal_event(
-                &mut state,
-                key_id,
-                false,
-                reason,
-                acting_under_delegation_id,
-            );
+            memory_store_hard_case(&mut state, removal);
         }
         Ok(())
     }
@@ -10791,36 +10978,204 @@ impl crate::federation::BlackholeRules for MemoryBackend {
 }
 
 /// v38.0.0 (CIRISPersist#721) — the peer-removal announcement, memory arm:
-/// the same in-transaction `hard_case_events` record the SQL doors write.
-/// Emission is unconditional on the removal succeeding — an announced act,
-/// never a courtesy.
-fn record_peer_removal_event(
-    state: &mut State,
+/// the same in-transaction `hard_case:admin_action:peer_removal:v1` row the
+/// SQL doors write (v57.0.0, CIRISPersist#988 item 2). Planned BEFORE the
+/// removal mutates anything, so a refusal leaves the peer in place; stored
+/// after it, under the same lock. Emission is unconditional on the removal
+/// succeeding — an announced act, never a courtesy.
+fn plan_peer_removal_event(
+    attester: &crate::federation::attestation_admit::HardCaseAttester,
     key_id: &str,
     hard: bool,
     reason: &str,
     delegation_id: Option<&str>,
-) {
-    let event_id = uuid::Uuid::new_v4().to_string();
-    state.federation_hard_case_events.insert(
-        event_id.clone(),
-        crate::federation::hard_case::HardCaseEvent {
-            event_id,
-            kind: format!(
-                "{}{}",
-                crate::federation::hard_case::kind::ADMIN_ACTION_PREFIX,
-                crate::federation::hard_case::admin_op::PEER_REMOVAL
-            ),
-            target_key_id: Some(key_id.to_owned()),
-            subject_key_id: None,
-            detail: serde_json::json!({
-                crate::federation::hard_case::admin_field::DELEGATION_ID: delegation_id,
-                crate::federation::hard_case::admin_field::REASON: reason,
-                "hard": hard,
-            }),
-            emitted_at: chrono::Utc::now(),
+) -> Result<crate::federation::attestation_admit::PlannedHardCase, crate::federation::Error> {
+    let now = chrono::Utc::now();
+    let event = crate::federation::hard_case::HardCaseEvent {
+        event_id: uuid::Uuid::new_v4().to_string(),
+        kind: crate::federation::hard_case::admin_action_kind(
+            crate::federation::hard_case::admin_op::PEER_REMOVAL,
+        ),
+        target_key_id: Some(key_id.to_owned()),
+        subject_key_id: None,
+        detail: serde_json::json!({
+            crate::federation::hard_case::admin_field::DELEGATION_ID: delegation_id,
+            crate::federation::hard_case::admin_field::REASON: reason,
+            "hard": hard,
+        }),
+        emitted_at: now,
+    };
+    crate::federation::attestation_admit::plan_hard_case_row(
+        &event,
+        attester,
+        crate::federation::attestation_admit::PlanInstants {
+            fold_at: now,
+            received_at: now,
         },
+    )
+}
+
+/// v56.0.0 (CIRISPersist#934 door 2), lifted in v57.0.0 so the hard_case
+/// writer stores its row through the same step — push one local-tier row:
+/// the rendition and subject mirrors, its `withdraws` depth, its serve
+/// position. `false` (nothing written) when the id is already held (the
+/// `INSERT OR IGNORE` twin).
+fn memory_insert_local_row(
+    state: &mut State,
+    row: crate::federation::Attestation,
+    withdraws_depth: Option<usize>,
+) -> bool {
+    // v18.0.0 (#473) — the INSERT OR IGNORE twin: an id still held here (a
+    // concurrent writer took it after the plan read it free) is a no-op.
+    if state
+        .federation_attestations
+        .iter()
+        .any(|a| a.attestation_id == row.attestation_id)
+    {
+        return false;
+    }
+    // v45.0.0 (CIRISPersist#871, FSD §5) — the V149 `blob_renditions`
+    // mirror at the local door, under the same lock as the push below.
+    project_rendition_row(state, &row);
+    // v17.4.0 (V106) — maintain the subject-index mirror at local tier.
+    for subj in &row.subject_key_ids {
+        state
+            .subject_index
+            .entry(subj.clone())
+            .or_default()
+            .push(row.attestation_id.clone());
+    }
+    // v36.0.0 (#668) — serve position (V130 mirror).
+    let admitted_at = next_plane_position(
+        state,
+        PLANE_ATTESTATION,
+        attestation_rows(state).into_iter(),
     );
+    let id_for_stamp = row.attestation_id.clone();
+    // v50.0.0 (review H2, final check, 3d) — a local `withdraws`'s depth.
+    if let Some(depth) = withdraws_depth {
+        state
+            .federation_withdraws_admission_depths
+            .insert(row.attestation_id.clone(), depth);
+    }
+    state.federation_attestations.push(row);
+    stamp_plane_position(state, PLANE_ATTESTATION, id_for_stamp, admitted_at);
+    true
+}
+
+/// v57.0.0 (CIRISPersist#988 item 2) — **the hard_case writer**, memory arm:
+/// the planned row (insert-if-absent) and, when it landed, its projection.
+fn memory_store_hard_case(
+    state: &mut State,
+    planned: crate::federation::attestation_admit::PlannedHardCase,
+) {
+    let crate::federation::attestation_admit::PlannedHardCase { row, projection } = planned;
+    let attestation_id = row.attestation_id.clone();
+    if memory_insert_local_row(state, row, None) {
+        state
+            .federation_hard_case_events
+            .insert(projection.event_id.clone(), (attestation_id, projection));
+    }
+}
+
+/// v57.0.0 (CIRISPersist#988 item 2) — an in-lock emitter's record (the SQL
+/// backends' `*_record_hard_case_in_tx`): plan with the attester resolved
+/// before the lock, store under it. Without an attester an act refuses and an
+/// observation records nothing
+/// ([`crate::federation::attestation_admit::HardCaseEmitter`]).
+fn memory_record_hard_case_in_state(
+    state: &mut State,
+    attester: &Result<crate::federation::attestation_admit::HardCaseAttester, String>,
+    emitter: crate::federation::attestation_admit::HardCaseEmitter,
+    event: &crate::federation::hard_case::HardCaseEvent,
+    received_at: chrono::DateTime<chrono::Utc>,
+) -> Result<(), String> {
+    let attester = match attester {
+        Ok(a) => a,
+        Err(e) => return emitter.without_attester(&event.event_id, e),
+    };
+    let planned = crate::federation::attestation_admit::plan_hard_case_row(
+        event,
+        attester,
+        crate::federation::attestation_admit::PlanInstants {
+            fold_at: received_at,
+            received_at,
+        },
+    )
+    .map_err(|e| format!("{}: {e}", e.kind()))?;
+    memory_store_hard_case(state, planned);
+    Ok(())
+}
+
+/// v57.0.0 (CIRISPersist#988 item 3) — the V080 Art. 17 tombstone, memory
+/// arm: every live detection row of an erased trace is redacted in place
+/// (`redact_detection_row`) and its projection entry re-written from the
+/// redacted row. Returns the detections tombstoned.
+fn memory_tombstone_detections(
+    state: &mut State,
+    trace_ids: &HashSet<String>,
+    erased_at: chrono::DateTime<chrono::Utc>,
+) -> Result<u64, crate::federation::Error> {
+    let ids: Vec<String> = state
+        .derived_detection_events
+        .values()
+        .filter(|(_, p)| {
+            p.erased_at.is_none() && p.trace_id.as_ref().is_some_and(|t| trace_ids.contains(t))
+        })
+        .map(|(id, _)| id.clone())
+        .collect();
+    let mut tombstoned = 0u64;
+    for id in ids {
+        let Some(row) = state
+            .federation_attestations
+            .iter()
+            .find(|a| a.attestation_id == id)
+            .cloned()
+        else {
+            continue;
+        };
+        let Some(redacted) = crate::derived::detection_row::redact_detection_row(&row, erased_at)?
+        else {
+            continue;
+        };
+        let projection = crate::derived::detection_row::project_detection_row(&redacted)
+            .ok_or_else(|| {
+                crate::federation::Error::Backend(
+                    "a redacted detection row does not project".into(),
+                )
+            })?;
+        let record_key = crate::federation::wire_index::record_key(&[("attestation_id", &id)]);
+        state
+            .signed_wire_index
+            .retain(|(kind, _), rk| !(kind == "Attestation" && *rk == record_key));
+        state
+            .federation_attestations
+            .retain(|a| a.attestation_id != id);
+        memory_insert_local_row(state, redacted, None);
+        state
+            .derived_detection_events
+            .insert(projection.detection_id.to_string(), (id, projection));
+        tombstoned += 1;
+    }
+    Ok(tombstoned)
+}
+
+/// v57.0.0 (CIRISPersist#988, V194/V195 mirror) — the SQL backends' `ON
+/// DELETE CASCADE` from a projection row to its row: drop every projection
+/// entry whose row is no longer held. Called by every memory door that
+/// removes attestation rows.
+fn prune_row_projections(state: &mut State) {
+    let held: HashSet<String> = state
+        .federation_attestations
+        .iter()
+        .map(|a| a.attestation_id.clone())
+        .collect();
+    state
+        .federation_hard_case_events
+        .retain(|_, (attestation_id, _)| held.contains(attestation_id));
+    state
+        .derived_detection_events
+        .retain(|_, (attestation_id, _)| held.contains(attestation_id));
 }
 
 /// Shared validation for `TrustGrant`. Same rules as the PG CHECK
@@ -11613,20 +11968,44 @@ fn memory_read_unsupported(method: &str) -> crate::read::Error {
 // "no current bundle" rather than an error.
 
 impl crate::derived::DerivedSchema for MemoryBackend {
+    /// v57.0.0 (CIRISPersist#988 item 3) — the row door: memory stores the
+    /// `detection:{detector}:v1` row and its projection like the SQL
+    /// backends (it returned `NotImplemented` before the row existed).
     async fn put_detection_event(
         &self,
-        _event: crate::derived::DetectionEvent,
+        event: crate::derived::DetectionEvent,
     ) -> Result<(), crate::derived::Error> {
-        Err(crate::derived::Error::NotImplemented(
-            "put_detection_event (memory backend; use postgres for federation evidence)",
-        ))
+        crate::federation::steward_purge::refuse_if_tombstoned_trace(self, &event.trace_id)
+            .await
+            .map_err(|e| match e {
+                crate::federation::Error::PurgeRefused { .. } => {
+                    crate::derived::Error::InvalidArgument(format!("{}: {e}", e.kind()))
+                }
+                other => crate::derived::Error::Backend(other.to_string()),
+            })?;
+        crate::federation::attestation_admit::put_detection_planned(self, &event)
+            .await
+            .map_err(crate::derived::detection_row::derived_error)
     }
 
+    /// The projection read, as the SQL backends: live (untombstoned)
+    /// detections only, newest first, at most 1000.
     async fn get_detection_events(
         &self,
-        _filter: crate::derived::EventFilter,
+        filter: crate::derived::EventFilter,
     ) -> Result<Vec<crate::derived::DetectionEvent>, crate::derived::Error> {
-        Ok(Vec::new())
+        let state = self.state.lock().expect("memory backend lock");
+        let mut rows: Vec<crate::derived::DetectionEvent> = state
+            .derived_detection_events
+            .values()
+            .filter_map(|(_, p)| p.to_event())
+            .filter(|e| filter.trace_id.as_ref().is_none_or(|t| &e.trace_id == t))
+            .filter(|e| filter.detector.as_ref().is_none_or(|d| &e.detector == d))
+            .filter(|e| filter.since.is_none_or(|s| e.ts >= s))
+            .collect();
+        rows.sort_by_key(|e| std::cmp::Reverse(e.ts));
+        rows.truncate(1000);
+        Ok(rows)
     }
 
     async fn put_edge_detection_event(
@@ -13557,6 +13936,9 @@ mod tests {
         use crate::federation::FederationDirectory as _;
         use crate::store::Backend as _;
         let backend = MemoryBackend::new();
+        // v57.0.0 (#988 item 2) — a hard_case row needs this node's key.
+        crate::federation::hard_case::test_support::declare_node(&backend, "memory-test-node")
+            .await;
         backend
             .insert_trace_events_batch(&[dsar_fixture_row("agent-721", "key-721", "t-721")])
             .await
@@ -13588,6 +13970,9 @@ mod tests {
     async fn peer_removal_is_announced_attributed_and_moves_the_cursor_721() {
         use crate::federation::FederationDirectory as _;
         let backend = MemoryBackend::new();
+        // v57.0.0 (#988 item 2) — a hard_case row needs this node's key.
+        crate::federation::hard_case::test_support::declare_node(&backend, "memory-test-node")
+            .await;
         backend
             .add_peer_record("peer-721", "cGs=", "node", None)
             .await
@@ -16055,6 +16440,9 @@ mod tests {
     async fn dsar_per_key_scopes_correctly() {
         use crate::store::Backend;
         let backend = MemoryBackend::new();
+        // v57.0.0 (#988 item 2) — a hard_case row needs this node's key.
+        crate::federation::hard_case::test_support::declare_node(&backend, "memory-test-node")
+            .await;
         // Same agent_id_hash, two different signing keys (key1 + key2).
         // Plus a different agent's row (other) under the same key1.
         backend
@@ -16100,6 +16488,9 @@ mod tests {
     async fn dsar_per_key_cascades_llm_calls() {
         use crate::store::Backend;
         let backend = MemoryBackend::new();
+        // v57.0.0 (#988 item 2) — a hard_case row needs this node's key.
+        crate::federation::hard_case::test_support::declare_node(&backend, "memory-test-node")
+            .await;
         backend
             .insert_trace_events_batch(&[
                 dsar_fixture_row("agent-A", "key1", "k1-t1"),
@@ -16165,6 +16556,9 @@ mod tests {
         use crate::federation::{hard_case, FederationDirectory, HardCaseFilter};
         use crate::store::Backend;
         let backend = MemoryBackend::new();
+        // v57.0.0 (#988 item 2) — a hard_case row needs this node's key.
+        crate::federation::hard_case::test_support::declare_node(&backend, "memory-test-node")
+            .await;
         // agent-A under two keys + an unrelated agent-B.
         backend
             .insert_trace_events_batch(&[
@@ -19919,6 +20313,9 @@ mod tests {
     async fn remove_peer_record_soft_marks_removed_at_and_hides_from_reads() {
         use crate::federation::FederationDirectory;
         let backend = MemoryBackend::new();
+        // v57.0.0 (#988 item 2) — a hard_case row needs this node's key.
+        crate::federation::hard_case::test_support::declare_node(&backend, "memory-test-node")
+            .await;
         backend
             .add_peer_record("peer-soft", "AAAA", "agent", None)
             .await
@@ -19950,6 +20347,9 @@ mod tests {
         use crate::federation::FederationDirectory;
         use crate::federation::{SignedAttestation, SignedKeyRecord};
         let backend = MemoryBackend::new();
+        // v57.0.0 (#988 item 2) — a hard_case row needs this node's key.
+        crate::federation::hard_case::test_support::declare_node(&backend, "memory-test-node")
+            .await;
         // Add a peer + a counter-peer so we can build an attestation
         // between them. v9.0.0 (CC 5.3.2.4.3.1): the attestation below is
         // federation-tier, so its attester (peer-att-a) must carry REAL
@@ -20017,6 +20417,9 @@ mod tests {
     async fn remove_peer_record_hard_with_no_attestations_cascades() {
         use crate::federation::FederationDirectory;
         let backend = MemoryBackend::new();
+        // v57.0.0 (#988 item 2) — a hard_case row needs this node's key.
+        crate::federation::hard_case::test_support::declare_node(&backend, "memory-test-node")
+            .await;
         backend
             .add_peer_record("peer-hard", "AAAA", "agent", None)
             .await
@@ -20379,6 +20782,9 @@ mod tests {
     #[tokio::test]
     async fn family_membership_revocation_emits_removed_hard_case() {
         let backend = family_backend("fam-A", "carol").await;
+        // v57.0.0 (#988 item 2) — a hard_case row needs this node's key.
+        crate::federation::hard_case::test_support::declare_node(&backend, "memory-test-node")
+            .await;
         let effective: chrono::DateTime<chrono::Utc> = "2026-06-10T12:00:00Z".parse().unwrap();
         let rev = FamilyMembershipRevocation {
             family_key_id: "fam-A".into(),
@@ -22469,9 +22875,11 @@ mod tests {
     #[tokio::test]
     async fn reverse_quorum_parity_memory_574() {
         let backend = MemoryBackend::new();
-        crate::federation::reverse_quorum::test_support::exercise_reverse_quorum(
-            &backend,
-            "memory-rq",
+        Box::pin(
+            crate::federation::reverse_quorum::test_support::exercise_reverse_quorum(
+                &backend,
+                "memory-rq",
+            ),
         )
         .await;
     }

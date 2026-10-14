@@ -1747,7 +1747,9 @@ mod tests {
         // tombstone row, derived rows follow the reason); slice D +16
         // (CIRISPersist#1059, seven steward purge claims); slice B +5
         // (CIRISPersist#989, the per-recipient key-grant row).
-        const EXPECTED: usize = 223;
+        // v57.0.0 (CIRISPersist#988): +6 — CLM-hard-case-on-base (3),
+        // CLM-detection-on-base (2), CLM-silo-projection-rebuildable (1).
+        const EXPECTED: usize = 229;
         assert_eq!(
             checked, EXPECTED,
             "checked {checked} version-pinned persist src/ rows, expected {EXPECTED}. \

@@ -647,8 +647,9 @@ async fn record(
     // downstream review (`hard_case:fast_path_takedown`, idempotent on the
     // notice).
     if terms.disposition == TakedownDisposition::DestroyOnReceipt {
-        directory
-            .record_hard_case(super::hard_case::HardCaseEvent {
+        crate::federation::hard_case::record_observation(
+            directory,
+            super::hard_case::HardCaseEvent {
                 event_id: format!(
                     "{}:{}",
                     super::hard_case::kind::FAST_PATH_TAKEDOWN,
@@ -664,8 +665,9 @@ async fn record(
                     "origin": from,
                 }),
                 emitted_at: now,
-            })
-            .await?;
+            },
+        )
+        .await?;
     }
     Ok(report)
 }

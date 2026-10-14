@@ -26429,13 +26429,20 @@ pub(crate) mod r2_test_support {
         // to rows that are an input to a decision ABOUT ANOTHER PARTY; a
         // self-attested row is not one, and refusing it would tighten past what
         // #607 asks.
+        //
+        // v57.0.0 (CIRISPersist#988 item 2) — hard_case replication is held: a
+        // federation-tier `hard_case:` row is refused by the hold, which runs
+        // AFTER this gate. Reaching the hold is what proves the #607 gate
+        // admitted the row; a gate that refused it would name itself instead.
         let own = uuid::Uuid::new_v4().to_string();
-        dir.put_attestation(row(&own, &author))
+        let held = dir
+            .put_attestation(row(&own, &author))
             .await
-            .expect("a SELF-attested hard_case row must still admit — see the doc comment");
-        assert!(
-            dir.get_attestation(&own).await.expect("get").is_some(),
-            "the self-attested row must be stored"
+            .expect_err("v57: hard_case replication is held");
+        assert_eq!(
+            held.kind(),
+            "federation_hard_case_replication_held",
+            "a SELF-attested hard_case row must clear the #607 gate and reach the hold: {held}"
         );
 
         // ── (3) ABOUT ANOTHER PARTY, WITH a conferral — ADMITTED ──────────
@@ -26448,17 +26455,16 @@ pub(crate) mod r2_test_support {
         )
         .await;
         let conferred = uuid::Uuid::new_v4().to_string();
-        dir.put_attestation(row(&conferred, &victim)).await.expect(
+        let held = dir
+            .put_attestation(row(&conferred, &victim))
+            .await
+            .expect_err("v57: hard_case replication is held");
+        assert_eq!(
+            held.kind(),
+            "federation_hard_case_replication_held",
             "a substrate_persist CONFERRED infra:record_hard_case by this node's own trust \
-                 root must be able to file the record — otherwise the admin ladder is \
-                 unreachable and leg (1) passes vacuously",
-        );
-        assert!(
-            dir.get_attestation(&conferred)
-                .await
-                .expect("get")
-                .is_some(),
-            "the conferred third-party row must be stored"
+             root must clear the #607 gate and reach the hold — otherwise the admin ladder is \
+             unreachable and leg (1) passes vacuously: {held}"
         );
     }
 

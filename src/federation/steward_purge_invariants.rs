@@ -3519,6 +3519,15 @@ pub(crate) mod bodies {
         root(d).await;
         seed_trace(d, "trace-i825", AGENT, "gpt-real").await;
         seed_trace(d, "trace-i825-other", BYSTANDER, "gpt-real").await;
+        // v57.0.0 (#988 item 3) — a detection row's attester is a held
+        // lenscore_detector key.
+        crate::federation::tier_ingest::test_support::register_hybrid_key_as(
+            d.as_dyn_directory(),
+            "key-lens",
+            "key-lens",
+            crate::federation::types::identity_type::LENSCORE_DETECTOR,
+        )
+        .await;
         d.put_detection_event(detection("trace-i825", b"purged-body"))
             .await
             .unwrap();
@@ -4182,6 +4191,7 @@ mod run {
             .await
             .unwrap();
         b.run_migrations().await.unwrap();
+        crate::federation::hard_case::test_support::declare_node(&b, "inv-node").await;
         Some(b)
     });
 
@@ -4193,11 +4203,17 @@ mod run {
             .await
             .unwrap();
         b.run_migrations().await.unwrap();
+        crate::federation::hard_case::test_support::declare_node(&b, "inv-node").await;
         Some(b)
     });
 
     runners!(memory, async {
-        Some(crate::store::memory::MemoryBackend::new())
+        {
+            // v57.0.0 (#988 item 2) — a hard_case row needs this node's key.
+            let b = crate::store::memory::MemoryBackend::new();
+            crate::federation::hard_case::test_support::declare_node(&b, "inv-node").await;
+            Some(b)
+        }
     });
 
     #[cfg(feature = "sqlite")]
@@ -4207,6 +4223,7 @@ mod run {
             .await
             .unwrap();
         b.run_migrations().await.unwrap();
+        crate::federation::hard_case::test_support::declare_node(&b, "inv-node").await;
         Some(b)
     });
 
@@ -4218,6 +4235,7 @@ mod run {
             .await
             .unwrap();
         b.run_migrations().await.unwrap();
+        crate::federation::hard_case::test_support::declare_node(&b, "inv-node").await;
         Some(b)
     });
 

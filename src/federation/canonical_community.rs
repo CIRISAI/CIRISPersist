@@ -1645,7 +1645,7 @@ where
         detail: serde_json::json!({ "reason": reason, "at": now.to_rfc3339() }),
         emitted_at: now,
     };
-    match directory.record_hard_case(event).await {
+    match super::hard_case::record_observation(directory, event).await {
         Ok(()) => Ok(()),
         Err(Error::Backend(m)) if m.contains("not implemented") => Ok(()),
         Err(e) => Err(e),
@@ -2217,7 +2217,7 @@ where
         detail: serde_json::to_value(e).unwrap_or_default(),
         emitted_at: now,
     };
-    match directory.record_hard_case(event).await {
+    match super::hard_case::record_observation(directory, event).await {
         Ok(()) => Ok(()),
         // a backend with no hard-case plane (the fault double's inner, a bare
         // memory in a unit) still judges; the evidence is the cosign rows
