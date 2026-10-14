@@ -146,9 +146,14 @@ pub(crate) mod bodies {
         let a = format!("i900-a-{s}");
         let b = format!("i900-b-{s}");
         let c = format!("i900-c-{s}");
-        for k in [&a, &b, &c] {
-            ts::register_hybrid_key(d, k).await;
+        // A and B are people: they found and join the I913 communities, and
+        // a community member must be a human or steward-bound (an `agent`
+        // key is refused `UnstewardedCommunityMember`). C is noise.
+        for k in [&a, &b] {
+            ts::register_hybrid_key_as(d, k, k, crate::federation::types::identity_type::USER)
+                .await;
         }
+        ts::register_hybrid_key(d, &c).await;
         let mut rows = Vec::new();
         // One live row per (subject, leaf): a second needs a `supersedes`.
         // A about A: three config:a* leaves (two tied), two config:b*
@@ -166,9 +171,15 @@ pub(crate) mod bodies {
         // B about A.
         rows.push(put_scores(d, &b, &a, "i900x:c:v1", -45).await);
         rows.push(put_scores(d, &b, &a, "i900x:c2:v1", -5).await);
-        // I913 — scoped rows: two communities, one species-wide row.
+        // I913 — scoped rows: two communities, one species-wide row. A
+        // community row lands only when the community's roster is held here
+        // and names its writer (AV-45, `check_write_cohort_scope_for`; an
+        // unheld roster refuses `MembershipUnresolved`), so the rosters land
+        // first: comm1 holds A and B (both write into it), comm2 holds A.
         let comm1 = format!("i900-comm1-{s}");
         let comm2 = format!("i900-comm2-{s}");
+        ts::seed_two_member_community(d, &comm1, &a, &b).await;
+        ts::seed_two_member_community(d, &comm2, &a, &a).await;
         let community = crate::federation::types::cohort_scope::COMMUNITY;
         let species = crate::federation::types::cohort_scope::SPECIES;
         rows.push(
@@ -193,7 +204,11 @@ pub(crate) mod bodies {
             )
             .await,
         );
-        rows.push(put_scoped(d, &b, &a, "i900s:c:v1", -8, Some((community, Some(&comm1)))).await);
+        // B's comm1 row is about B: a row placed at a targeted cohort is its
+        // producer's self-declaration (AV-84, `check_cohort_standing_resolved`
+        // refuses B placing a community row about A as `AttestedParty`). It is
+        // noise every `by A` / `to A` scope shape must leave out.
+        rows.push(put_scoped(d, &b, &b, "i900s:c:v1", -8, Some((community, Some(&comm1)))).await);
         rows.push(put_scoped(d, &a, &b, "i900s:d:v1", -22, Some((species, None))).await);
         // C noise.
         for (leaf, m) in [

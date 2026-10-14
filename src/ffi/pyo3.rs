@@ -4055,8 +4055,9 @@ impl PyEngine {
     /// construction runs the same pass hourly; sovereign hosts may drive it
     /// on their own schedule. Returns the report as JSON
     /// (`scanned`, `renewed`, `fresh`, `not_held`, `not_in_cohort`,
-    /// `failed`, `converted`, and `withheld`: blobs a takedown withholds,
-    /// neither renewed nor converted). Idempotent.
+    /// `failed`, `converted`, `withheld`: blobs a takedown withholds, neither
+    /// renewed nor converted, and `deferred`: renewals past this pass's cap,
+    /// rolled to the next pass, oldest first — v56.0.0, #1071). Idempotent.
     fn reack_holding_claims_once(&self, py: Python<'_>) -> PyResult<String> {
         self.ensure_usable()?;
         let runtime = self.runtime.clone();
