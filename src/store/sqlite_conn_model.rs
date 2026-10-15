@@ -757,6 +757,7 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("sqlite_render_table", ConnClass::HelperRead),
     ("sqlite_art17_delete_detection_rows", ConnClass::HelperWrite),
     ("sqlite_put_art17_execution", ConnClass::HelperWrite),
+    ("sqlite_record_erasure", ConnClass::HelperWrite),
     ("sqlite_detection_tombstone_instant", ConnClass::HelperRead),
     (
         "sqlite_tombstone_detection_projection",

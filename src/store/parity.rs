@@ -180,6 +180,15 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("pg_art17_delete_detection_rows", Class::Plumbing),
     ("sqlite_put_art17_execution", Class::Plumbing),
     ("pg_put_art17_execution", Class::Plumbing),
+    // Each backend's erasure recorder plans the erasure row(s) (the shared
+    // hard_case plan) and writes them with their tombstones: it carries the
+    // plan's sequence.
+    ("memory_plan_erasure", Class::Delegates),
+    ("sqlite_record_erasure", Class::Delegates),
+    ("pg_record_erasure", Class::Delegates),
+    // The pre-erasure move of attestable pre-v57 detections onto the plane:
+    // an executor step of the AttestationStore (its own door).
+    ("rehome_legacy_detection_events", Class::Plumbing),
     // The attester read every hard_case act makes first: it REFUSES the act
     // when this node cannot attest the row (`HardCaseAttesterUnavailable`).
     ("hard_case_attester", Class::Gate),
