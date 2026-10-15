@@ -172,6 +172,14 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("project_hard_case_row", Class::Plumbing),
     ("project_detection_row", Class::Plumbing),
     ("project_detection_row_under", Class::Plumbing),
+    // The DSAR door's Art. 17 erasure of row-backed detections: the
+    // hard-delete, the tombstone header + tombstones it builds (pure) and
+    // writes. Storage on a decision the erasure already made: Plumbing.
+    ("art17_erasure_execution", Class::Plumbing),
+    ("sqlite_art17_delete_detection_rows", Class::Plumbing),
+    ("pg_art17_delete_detection_rows", Class::Plumbing),
+    ("sqlite_put_art17_execution", Class::Plumbing),
+    ("pg_put_art17_execution", Class::Plumbing),
     // The attester read every hard_case act makes first: it REFUSES the act
     // when this node cannot attest the row (`HardCaseAttesterUnavailable`).
     ("hard_case_attester", Class::Gate),
