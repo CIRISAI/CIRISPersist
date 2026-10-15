@@ -138,64 +138,35 @@ same rows as before.
   (`detection_row::project_detection_row_under`); `purge_finalize` deletes
   the row and its projection row goes with it. I825 shows the window and the
   finalize on memory, sqlite and postgres.
-- **The DSAR erasure of a detection hard-deletes its signed row; its V080
-  tombstone rides the erasure's own row.** Both DSAR doors
-  (`delete_traces_for_agent_id_hash`, `delete_traces_for_agent`) delete
-  each row-backed detection of an erased trace in the erasure's transaction
-  (found by the row's own `detection.trace_id`, so a row a steward purge
-  already tombstoned goes too). Never a rewrite. The erasure's
-  `hard_case:trace_erasure:v1` row carries, under
-  `detail.detection_tombstones`, the V080 tombstone content of each erased
-  detection: exactly `detection_id`, `detector`, `severity`, `cohort_cell`,
-  `conformity_variant`, `conformity_payload`, `lens_core_version`,
-  `ratchet_calibration_version`, `signing_key_id`, `ts` (no linkage, no
-  signatures). The same writer that stores that row projects each entry as
-  the V080 tombstone row (linkage and signatures NULL, analytics kept,
-  `erased_at` = the erasure row's `asserted_at`), so the rebuild of
-  `detection_events` is live rows ∪ steward-purge-tombstoned rows ∪
-  erasure-row tombstones. hard_case rows are unpurgeable, so the tombstone
-  fact outlives everything (#222). **Bound:**
-  `detection_row::MAX_ERASED_DETECTIONS_PER_ROW` = 512 entries per row and
-  `MAX_ERASED_DETECTION_BYTES_PER_ROW` = 512 KiB of entries per row (half of
-  `MAX_ATTESTATION_ENVELOPE_BYTES`); an entry is about 0.5 KB for a typical
-  detection, so 512 are about 256 KB. A larger erasure writes one row per
-  chunk (id `{event_id}#{k}`, `chunk_of` naming the first), all in the same
-  transaction; the first carries the counts, `detection_rows_erased` and the
-  `selection_digest`. The erasure also writes one `purge_executions` header
-  (`legal_basis` `steward_purge::ART17_ERASURE_BASIS`, origin local, no
-  cosignatures, finalized at once, citing the first erasure row) with one
-  attestation-plane tombstone per deleted row: it refuses the row's
-  re-admission (the TOMBSTONED gate, asked by `put_detection_event` too) and
-  is never served as a purge bundle. Before the transaction, each door moves
-  the pre-v57 detections it can attest onto the plane, so they are erased
-  the same way; a pre-v57 row it cannot (its detector key not held) keeps
-  the in-place V080 NULLing. `detection_events_tombstoned` counts both.
-  V195 makes the two signature columns NULLABLE and `attestation_id`
-  non-unique (an erasure row projects many). I964 shows it on memory,
-  sqlite and postgres.
-- **What a DSAR erasure leaves, stated plainly (operator-visible).**
-  - An erased row-backed detection leaves no signed row. Its
-    `detection_events` row is the V080 tombstone (linkage and signatures
-    NULL, analytics kept), as in v56.0.0. It is now rebuilt from the
-    erasure's `hard_case:trace_erasure:v1` row instead of being redacted in
-    place. No persist read door serves a tombstoned detection row (I825's
-    "not returned" contract is unchanged). `detection_events_tombstoned`
-    counts it. A pre-v57 row that cannot be rehomed keeps the in-place V080
-    NULLing.
-  - The erasure writes one `purge_executions` header with `legal_basis`
-    `steward_purge::ART17_ERASURE_BASIS` (`"art17_erasure"`). Its claimant
-    and executor are this node's key. It has no cosignatures, is finalized
-    at execution, and cites the erasure's own `hard_case:trace_erasure:v1`
-    row as its notice. `list_purge_executions_since` never serves it, on
-    any backend.
-  - The legacy rehome is lazy. `hard_case_events` rows move onto the plane
-    at the first hard_case emitter after the upgrade. `detection_events` rows
-    move at the first `put_detection_event` or DSAR erasure. Until then
-    `Engine::check_silo_projection` is RED. A pre-v57 detection whose
-    detector key is not held (or is not a `lenscore_detector`) cannot be
-    rehomed and keeps the gate RED. That is the condition an operator sees:
-    register the detector's key, or accept the red as the record of an
-    unattestable legacy row.
+- **The DSAR erasure of a detection hard-deletes its signed row, and no
+  row remains.** Both DSAR doors (`delete_traces_for_agent_id_hash`,
+  `delete_traces_for_agent`) delete each row-backed detection of an erased
+  trace in the erasure's transaction. The row is found by its own
+  `detection.trace_id`, so a row a steward purge already tombstoned goes
+  too. Never a rewrite. The projection row leaves with it by cascade.
+  - **Behaviour change: an erased row-backed detection leaves NO row in
+    `detection_events`.** v56.0.0 kept a PII-free V080 remnant (linkage
+    NULL, analytics kept). No persist read door ever served it, so it was
+    reachable only by direct SQL on the host. `detection_events_tombstoned`
+    still counts the erased detection. The remnant was dropped rather than
+    carried on the erasure's row because `conformity_payload` and
+    `cohort_cell` are opaque consumer JSON: inside an unpurgeable, signed
+    `hard_case` row they could never be erased.
+  - **Pre-v57 rows.** Before its transaction, each door moves onto the plane
+    the pre-v57 detections it can attest, so they are erased the same way. A
+    pre-v57 row it cannot attest (its detector key not held, or not a
+    `lenscore_detector`) keeps the in-place V080 NULLing.
+    `detection_events_tombstoned` counts both kinds.
+  - **The Art. 17 header.** The erasure writes one `purge_executions` header
+    with `legal_basis` `steward_purge::ART17_ERASURE_BASIS`
+    (`"art17_erasure"`). Its claimant and executor are this node's key. It
+    has no cosignatures and is finalized at execution. Its notice is the
+    erasure's own `hard_case:trace_erasure:v1` row, which carries the counts,
+    `detection_rows_erased` and the `selection_digest`. One
+    attestation-plane tombstone per deleted row refuses the row's
+    re-admission: the TOMBSTONED gate, which `put_detection_event` asks too.
+    `list_purge_executions_since` never serves the header, on any backend.
+  - I964 shows it on memory, sqlite and postgres, through both doors.
 - **Memory holds detections.** The memory backend's `put_detection_event` /
   `get_detection_events` returned `NotImplemented` / empty; they now run the
   same door and projection, so every witness runs on all three backends.
@@ -211,7 +182,14 @@ same rows as before.
   (`rehome_legacy_hard_case_events`, with the node key in hand;
   `rehome_legacy_detection_events`, with each detector's key, a legacy row
   whose detector key is not held or not a `lenscore_detector` stays and the
-  rebuild gate reports it). Both tables join
+  rebuild gate reports it). **The rehome is lazy, and the gate shows it.**
+  `hard_case_events` rows move at the first hard_case emitter after the
+  upgrade. `detection_events` rows move at the first `put_detection_event`
+  or DSAR erasure. Until then `Engine::check_silo_projection` is RED. A
+  pre-v57 detection whose detector key is not held keeps it RED for good.
+  That is the operator-visible condition: register the detector's key and
+  emit once, or read the red as the record of a legacy row this node cannot
+  attest. Both tables join
   `steward_purge::ATTESTATION_PROJECTIONS` as foreign-key cascades.
 - **The gate: `silo_projection::check_projection_rebuild`** (and
   `Engine::check_silo_projection`, the live predicate). It rebuilds the
