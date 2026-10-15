@@ -7,6 +7,33 @@ threat-model citations because this crate's audit story is the point.
 
 ## [Unreleased]
 
+## [58.0.0] - Unreleased
+
+### Changed — the halt latch is not a leg of the trust verdict (CIRISPersist#1094 item 1; CC 3.2 T3/T8, 4.2.1.1; steward ruling 2026-10-15)
+
+- `trust_root_valid` no longer folds `halt_latched` into `valid`. A
+  `constitutional` halt is an agent pause (state kept, zero data disruption;
+  the agent's act gate is its only gate). From v24.0.0 to v57.0.0 the latch was
+  a conjunct of the verdict, so the conferral walk
+  (`capability_roots_to_trusted_root`), the transit walk
+  (`transit_eligibility_walk`) and through them `check_reserved_prefix_admission`,
+  `check_revocation_authority`, `resolve_content_class_flag`, serve-tier
+  resolution, the trusted-publisher fold and `resolve_transit_eligibility` all
+  failed closed under a latched halt — the live G7 breaker CC 4.2.1.1 names
+  (CIRISConstitution b9fc6c0). `halt_latched` stays on `TrustRootVerdict` as a
+  reported signal beside `drill_freshness` (a halt must be observable); the
+  Python surface is unchanged.
+- Witness: `exercise_family_trust_root` step (e) now asserts the inverse of
+  what it asserted since v24.0.0 — under a latched family halt the verdict,
+  its `bounded_until` and the conferral walk are unchanged, and a resume only
+  clears the report; `exercise_transit_eligibility` gains step (h): a latched
+  halt on the shared root leaves transit eligibility byte-equal. Both run on
+  the sqlite, postgres and memory backends. Re-adding the conjunct turns both
+  red.
+- Evidence: `CLM-nsproc-halt-latched-trust` (retired on the CC side) is
+  replaced by `CLM-halt-not-a-trust-leg` at `trust_root.rs#trust_root_valid`
+  and `trust_root.rs#transit_eligibility_walk`.
+
 ## [57.0.0] - 2026-10-15
 
 ### Fixed — tag CI: the restored cache repair runs `--strict` (v56.0.0 windows wheel)

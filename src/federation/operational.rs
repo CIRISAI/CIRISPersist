@@ -3229,8 +3229,8 @@ pub mod test_support {
     ///    itself**: `accord:*` is reserved to `accord_holder` (CC 3.4.1) and a
     ///    test engine signs as itself, so the ordinary emit path cannot produce
     ///    it (CIRISPersist#536);
-    /// 4. no accord halt latched for `root` (the default state — nothing to do);
-    ///    plus `delegates_to(root → subject)` carrying `scope` (via [`grant_scope`]);
+    /// 4. `delegates_to(root → subject)` carrying `scope` (via [`grant_scope`]);
+    ///    (the halt latch is not a leg — v58.0.0, CIRISPersist#1094);
     /// 1. `delegates_to(user → root)` — the user's live trust edge — is
     ///    **best-effort** (see below).
     ///
@@ -3388,7 +3388,7 @@ pub mod test_support {
             })
             .await?;
 
-        // Leg 4 — no halt latched (default). Plus the scope-carrying edge.
+        // Leg 4 — the scope-carrying edge (the halt latch is not a leg, v58.0.0).
         grant_scope(directory, root_key_id, subject_key_id, scope).await?;
 
         // POSTCONDITION (CIRISPersist#536) — the root side is GENUINELY up: the
@@ -4300,7 +4300,7 @@ pub mod test_support {
     /// | a | a 1-of-3-signed charter is REFUSED, naming "1 of 2 required distinct holders" | the shortfall is loud and countable, not a silent downgrade |
     /// | d | 2-of-3 charter + 2-of-3 grant + the node's edge ⇒ the walk returns the FAMILY as root | the family root actually confers |
     /// | b | one seat alone cannot re-root, cannot re-grant, and cannot hold the charter leg once its co-signer leaves the roster | the A1-compromise scenario, which is the whole issue |
-    /// | e | the family's drill reports, and the family's HALT LATCH gates | kill switch and root are finally the same object |
+    /// | e | the family's drill reports, and the family's HALT LATCH is reported but gates NOTHING — the verdict, the conferral walk and a resume all read the same | a constitutional halt is an agent pause, not an un-trust (v58.0.0, CIRISPersist#1094, CC 4.2.1.1) |
     ///
     /// Witness (c) — a solo 1-of-1 key root still valid end to end — is
     /// [`exercise_trust_root`], deliberately left untouched: it passing
@@ -4567,7 +4567,7 @@ pub mod test_support {
              class this substrate keeps re-learning"
         );
 
-        // ── (e) the drill reports; the family HALT LATCH gates ───────────
+        // ── (e) the drill reports; the family HALT LATCH is reported, not a gate ─
         let la = format!("{tag}-la");
         register_typed_key(directory, &la, identity_type::ACCORD_HOLDER).await?;
         let drill_id = uuid::Uuid::new_v4().to_string();
@@ -4596,27 +4596,40 @@ pub mod test_support {
              still does not gate: {drilled:?}"
         );
 
-        // The kill switch and the root are finally the same object: before this
-        // cut `get_active_halt` was handed a KEY id while the table is keyed by
-        // FAMILY, so the accord's 2-of-3 brake could never reach the root it was
-        // built to stop.
+        // v58.0.0 (CIRISPersist#1094; CC 3.2 T3/T8 + 4.2.1.1, steward ruling
+        // 2026-10-15) — the INVERSE of what this step asserted from v24.0.0 to
+        // v57.0.0. A constitutional halt is an agent pause: it latches on the
+        // family (the table is family-keyed), it is REPORTED on the verdict so
+        // a halt is observable, and it moves no trust state — the verdict, the
+        // conferral walk and the serve/transit doors on them all answer the
+        // same under the latch as before it. Folding it into `valid` was the
+        // G7 breaker CC 4.2.1.1 names.
         let halt_id = format!("{tag}-halt-1");
+        let before = trust_root_valid(directory, &user, &accord).await?;
         directory.set_active_halt(&accord, &halt_id).await?;
         let halted = trust_root_valid(directory, &user, &accord).await?;
         assert!(
-            halted.halt_latched == Some(true) && !halted.valid,
-            "({tag}) (e) the FAMILY halt latch stops the FAMILY root: {halted:?}"
+            halted.halt_latched == Some(true),
+            "({tag}) (e) the FAMILY halt latch is REPORTED on the family verdict: {halted:?}"
+        );
+        assert!(
+            halted.valid && halted.bounded_until == before.bounded_until,
+            "({tag}) (e) …and it is NOT a leg: the verdict holds under the latch exactly \
+             as before it (CC 4.2.1.1 — a halt pauses agents, it un-trusts nobody): \
+             before={before:?} halted={halted:?}"
         );
         assert!(
             capability_roots_to_trusted_root(directory, &user, &subject, INFRA_SERVE_SCOPE)
                 .await?
-                .is_none(),
-            "({tag}) (e) …and the capability walk agrees — a halted root confers nothing"
+                .is_some(),
+            "({tag}) (e) …and the capability walk agrees — a halted root still confers; \
+             a data door that closed here would be the named breaker"
         );
         directory.clear_active_halt(&accord, &halt_id).await?;
+        let resumed = trust_root_valid(directory, &user, &accord).await?;
         assert!(
-            trust_root_valid(directory, &user, &accord).await?.valid,
-            "({tag}) (e) a resume un-fires the halt — the brake is a lever, not a door"
+            resumed.valid && resumed.halt_latched == Some(false),
+            "({tag}) (e) a resume clears the REPORT and changes nothing else: {resumed:?}"
         );
 
         // ── (b) THE A1-COMPROMISE SCENARIO ───────────────────────────────
@@ -5041,6 +5054,22 @@ pub mod test_support {
             "({tag}) (c) nothing walked is time-bounded here, so the TTL is None (cache \
              until a withdrawal event) — NOT a fabricated finite value: {ok:?}"
         );
+
+        // ── (h) v58.0.0 (CIRISPersist#1094; CC 4.2.1.1) — a latched halt on the
+        // shared root changes NOTHING here. Transit is a data door; a halt is
+        // an agent pause. The latch is keyed by the root id the walk hands
+        // `get_active_halt`, so this exercises the exact read the verdict
+        // performs. With the halt leg back in `valid` this goes red.
+        let halt_id = format!("{tag}-halt");
+        directory.set_active_halt(&root, &halt_id).await?;
+        let under_halt = resolve_transit_eligibility(directory, &user, &peer).await?;
+        assert_eq!(
+            under_halt, ok,
+            "({tag}) (h) a latched constitutional halt on the shared root leaves transit \
+             eligibility UNCHANGED — a relay that closed here would be the breaker \
+             CC 4.2.1.1 names"
+        );
+        directory.clear_active_halt(&root, &halt_id).await?;
 
         // ── (g) the `_over_roster` arm. Driven with a roster the test HOLDS,
         // and it must agree with the default arm exactly — the entry point is
