@@ -34,6 +34,100 @@ threat-model citations because this crate's audit story is the point.
   replaced by `CLM-halt-not-a-trust-leg` at `trust_root.rs#trust_root_valid`
   and `trust_root.rs#transit_eligibility_walk`.
 
+### Changed — CC v1.0-rc8 vendored (slice V)
+
+Both manifests are copied byte-for-byte from the `v1.0-rc8` tag (commit
+`cb77137`, annotated tag `4fdc81c`): registry `99d4d338…`, 174 families
+(168 at rc7), 1147 dimension vectors (1103), 25 row-type vectors, and a new
+`polarity_vectors` list of 10. `scripts/check_vendored_cc.sh v1.0-rc8` passes.
+The binds oracle is regenerated at the tag. `registry.rs` re-pins
+`VENDORED_CC_VERSION`, `VENDORED_SOURCE_SHA256`, `VENDORED_N_FAMILIES`,
+`VENDORED_REGISTRY_SHA256`, `VENDORED_CC_COMMIT` and both file hashes.
+
+For Edge, the manifest diff (`scripts/manifest_diff.py`):
+
+- **Six families added.** The Retirement Standard (CC 3.1.5, CC 7.5.5):
+  `retirement:{state}:v1`, `preserve_request:v1`, `preserve_response:v1`,
+  `archive_release:{basis}:v1` (`{basis}` closed: `wa_approval`,
+  `lawful_order`), `lawful_order:release:v1`. And `takedown_notice:{basis}:v1`
+  (CC 3.1.1, CIRISConstitution#165): `{basis}` closed to CC 3.3.2's eleven
+  wire strings, under a new gated stem `takedown_notice:` ("closed:
+  takedown_notice:{basis}:v1 is the only family"). None removed.
+- **Four families changed.** `prohibited:{category}` is now a closed
+  vocabulary of 22 values, so a category outside the list is refused
+  `namespace_vocab_value_unregistered`. `settlement:*` is no longer reserved.
+  The three `ledger:*` rows carry CC 3.3.10.1's rule ("the ledger's single
+  owner (the steward-bound identity of its ledger_id triple) or a delegate
+  under its declared serialization discipline") in place of
+  `substrate-self-report`, so `authority_for` resolves them, and
+  `settlement:*`, to `ProducerSteward` rather than `SubstrateSelf`.
+- **`_meta.polarity_classes` (new, CC 3.1.7 R4).** Each catalogue polarity is
+  a score set: `signed` and `enumerated` are [−1, 1], `positive-only` is
+  (0, 1], `boolean-via-score` is the points {−1, +1}, `+1.0 only`, `-1 only`
+  and `-1 / -0.5 only` are points, `per-leaf` defers to the leaf's row.
+  `_aliases` folds `see CC 3.4.1`, `per-leaf (CC 3.3.1)` and the restricted
+  boolean onto a class. The refusal is `score_outside_declared_polarity`.
+- **`_meta.case_rule`.** Ten new `refusal_tokens` (the polarity refusal, six
+  `purge_*`, `asserted_at_stale`, `trace_run_kind_mock`,
+  `trace_field_shape_violation`), the `basis` placeholder class, and the
+  `takedown_notice:` gated stem.
+
+What persist does with it:
+
+- **New admission gate: a score outside its family's polarity class is
+  refused.** `admission::check_score_within_declared_polarity` runs in
+  `check_reserved_prefix_admission` beside the R2(b) dimension gate, so the
+  put, authored, replication-apply and promotion doors of all three backends
+  ask it. The class comes from `_meta.polarity_classes` through the one
+  matcher. A present `score` is judged (a non-number is refused); a row with
+  no `score` member is not, because persist's own emitters omit it on
+  positive-only families (the genesis `trust:charter:v1`,
+  `membership:proposal:v1`, `consent:partnership_grant:v1`), which CC 2.1's
+  "required" makes a separate conformance gap. The refusal is
+  `Error::DimensionRejected` with reason
+  `score_outside_declared_polarity`, the Python type of every other
+  dimension refusal. Before v58 persist enforced no score range at all.
+- **The six rc8 families are held shut** (`REGISTERED_FAMILIES_HELD_SHUT`):
+  they parse and match, and a row on any of them is refused
+  `registered_family_held_shut` until its door lands (the retirement program,
+  CIRISPersist#1079–#1088; the takedown notice as a row, #988). Each was open
+  vocabulary at rc7.
+- **The morally-charged-stem deny-list skips CC's own closed vocabulary.**
+  Three registered `prohibited` categories carry a listed stem
+  (`weapons_harmful`, `deception_fraud`, `autonomous_deception`) and were
+  refused `morally_charged_stem`. The deny-list now reads only the text an
+  emitter chose: literal segments and binds from a closed enumeration are
+  skipped once the dimension resolves cleanly to a registered row.
+- **`scores_read_audit::range_for_polarity` reads the registry.** The
+  hand-written `POLARITY_RANGES` table is deleted; it read
+  `boolean-via-score` as [0, 1] where CC's class is {−1, +1}. The pinning
+  census gains the four new single-point families, and `accord:*`, whose
+  `see CC 3.4.1` label CC now aliases to `+1.0 only` (15 in all).
+- **CC rc8 defect, recorded.** All six new families spell their version as a
+  literal `v1` in the prefix, so CC's reference matcher, and persist's port,
+  demand a second version tail: `takedown_notice:dmca512:v1` is refused
+  `missing_version_segment` and only `takedown_notice:dmca512:v1:v1`
+  resolves. The published vectors say the same. Persist matches the
+  reference; I1102 pins it and reds when a re-vendor fixes the generator.
+- **The ledger owner rule is unchanged in effect.** The owner, a live
+  occurrence of the owner, or the owner's node binding admits; a stranger is
+  refused. A `delegates_to` delegate is still refused: CC 3.3.10.1 clause 3
+  requires a ledger to declare its serialization discipline, and no wire
+  member or persist table carries that declaration, so there is no
+  discipline for a delegate to be under.
+- **Known divergence, recorded not fixed.** Persist's cirisnode `LegalBasis`
+  serializes `dmca_512` and `dsa_article_16`; CC 3.3.2 and the rc8 registry
+  say `dmca512` and `dsa_article16`. The V054 CHECK constraint pins persist's
+  spelling, so the rename is a migration.
+  `media_sharing::tests::legal_basis_wire_strings_against_the_rc8_takedown_family`
+  pins exactly those two.
+- **Not adopted.** `asserted_at_stale` (CC 2.6.7 W) and
+  `trace_field_shape_violation` (CC 3.1.5) have no persist door; the token
+  test names them as such.
+- Witnesses I1100–I1109 (`federation::rc8_vendor_invariants`, the matcher's
+  polarity-vector replay); the door witnesses run on memory, sqlite and
+  postgres. Evidence: `CLM-polarity-admission` (3.1.7), four rows.
+
 ## [57.0.0] - 2026-10-15
 
 ### Fixed — tag CI: the restored cache repair runs `--strict` (v56.0.0 windows wheel)

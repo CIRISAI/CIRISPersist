@@ -359,13 +359,12 @@ pub fn log_scores_read(
 /// **The declared value range of one dimension family's `score`**, derived from
 /// the `polarity` column CC 3.1 publishes for it.
 ///
-/// This is the *declared* range, and the distinction is load-bearing: persist
-/// does **not** enforce it. There is no score-range refusal at admission — see
-/// the note on [`PINNING_FAMILIES`] — so this table says what CC says a leaf
-/// may carry, not what persist would refuse. For the feasibility program that
-/// is the correct premise (the program asks what a *conforming* corpus can
-/// look like), and it is also the program's sharpest limitation, reported as
-/// such rather than buried.
+/// This is the *declared* range. Since v58.0.0 (CC 3.1.7 R4 rc8) persist
+/// also ENFORCES the class at admission
+/// ([`check_score_within_declared_polarity`](crate::federation::admission::check_score_within_declared_polarity)),
+/// so a conforming corpus is the only corpus a node holds; this range is the
+/// class widened to an interval (see [`range_for_polarity`]). `confidence` is
+/// still unbounded below — see the note on [`PINNING_FAMILIES`].
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DeclaredRange {
     /// Inclusive lower bound on `score`.
@@ -377,125 +376,56 @@ pub struct DeclaredRange {
     pub lo_open: bool,
 }
 
-/// **The CC polarity vocabulary, as a total map to declared ranges.**
+/// **The CC polarity vocabulary, as a total map to declared ranges** — read
+/// from the registry since v58.0.0.
 ///
-/// Every distinct `polarity` string in the vendored
-/// `namespace/namespace_registry.json` must appear here, and
+/// Until rc8 the registry carried the labels but no bounds, and this module
+/// kept a hand-written `POLARITY_RANGES` table reading the bounds off the label
+/// text. rc8 publishes them (`_meta.polarity_classes`, CC 3.1.7 R4) and the
+/// admission gate reads them
+/// ([`check_score_within_declared_polarity`](crate::federation::admission::check_score_within_declared_polarity)),
+/// so the table is gone: a second spelling of one fact is the shape it would
+/// have drifted into (it read `boolean-via-score` as `[0, 1]`; CC's class is
+/// the two points `{-1, +1}`).
+///
+/// A point class is WIDENED to the interval its points span (`-1 / -0.5 only`
+/// → `[-1, -0.5]`, `boolean-via-score` → `[-1, 1]`), and a `per-leaf` parent to
+/// the widest range. Widening is the sound direction for the feasibility
+/// program: a larger feasible score set can only make the feasible band set
+/// larger, so it can never manufacture a false "not pinned" claim about a
+/// family whose real set is narrower — it can only fail to notice one. A
+/// single point stays a single point, which is what the census is for.
+///
+/// `None` when the label names no class — which
 /// `tests::every_declared_polarity_in_the_vendored_registry_is_classified`
-/// fails naming the label on anything that does not. **There is no fallback
-/// arm.** That absence is the mechanism CC 3.4.5 asked for when it said a
-/// future single-polarity leaf must *fail the build, not review*: a CC release
-/// that introduces a new polarity word stops persist's build until a human maps
-/// it, and mapping it is exactly the moment to notice that the new leaf pins.
-///
-/// The ranges are read off the label text, which is self-describing, and are
-/// hand-written literals — never derived from the classifier they are used to
-/// test.
-///
-/// The four non-numeric labels are mapped to the **widest** range rather than
-/// skipped. Widening is the sound direction: a larger feasible score set can
-/// only make the feasible *band* set larger, so an over-wide range can never
-/// manufacture a false "not pinned" claim about a family whose real range is
-/// narrower — it can only fail to notice one. A skip, by contrast, would make
-/// the family invisible, which is the AV-77 shape this program exists to avoid.
-pub const POLARITY_RANGES: &[(&str, DeclaredRange)] = &[
-    // The CC 4.4.2 default: score spans both signs.
-    (
-        "signed",
-        DeclaredRange {
+/// makes a build failure, not a fallback: CC 3.4.5 asked that a future
+/// single-polarity leaf *fail the build, not review*.
+#[must_use]
+pub fn range_for_polarity(label: &str) -> Option<DeclaredRange> {
+    use crate::federation::namespace::registry::{polarity_classes, PolarityClass};
+    let pc = polarity_classes()?;
+    Some(match pc.classes.get(pc.class_name(label))? {
+        PolarityClass::Points(points) => DeclaredRange {
+            lo: points.iter().copied().fold(f64::INFINITY, f64::min),
+            hi: points.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+            lo_open: false,
+        },
+        PolarityClass::Range {
+            min,
+            max,
+            min_inclusive,
+        } => DeclaredRange {
+            lo: *min,
+            hi: *max,
+            lo_open: !*min_inclusive,
+        },
+        PolarityClass::PerLeaf => DeclaredRange {
             lo: -1.0,
             hi: 1.0,
             lo_open: false,
         },
-    ),
-    // All-must-hold AND semantics; folded by MIN.
-    (
-        "boolean-via-score",
-        DeclaredRange {
-            lo: 0.0,
-            hi: 1.0,
-            lo_open: false,
-        },
-    ),
-    // SINGLE POLARITY — zero is not a value ("positive-only").
-    (
-        "positive-only",
-        DeclaredRange {
-            lo: 0.0,
-            hi: 1.0,
-            lo_open: true,
-        },
-    ),
-    // SINGLE POLARITY, single point.
-    (
-        "-1 only",
-        DeclaredRange {
-            lo: -1.0,
-            hi: -1.0,
-            lo_open: false,
-        },
-    ),
-    // SINGLE POLARITY, single point — the rc5 (CIRISPersist#924) accord
-    // leaves (`accord:invoke:{constitutional,notify,drill}:*`,
-    // `accord:lifecycle`, `accord:lifecycle:active`): an invocation is
-    // asserted, never scored down.
-    (
-        "+1.0 only",
-        DeclaredRange {
-            lo: 1.0,
-            hi: 1.0,
-            lo_open: false,
-        },
-    ),
-    // SINGLE POLARITY, two points; the interval between them is a sound
-    // widening of the two-point set.
-    (
-        "-1 / -0.5 only",
-        DeclaredRange {
-            lo: -1.0,
-            hi: -0.5,
-            lo_open: false,
-        },
-    ),
-    // ── labels that declare no numeric range: widened to `signed` ──
-    // `accord:*` defers to a CC clause rather than stating a range.
-    (
-        "see CC 3.4.1",
-        DeclaredRange {
-            lo: -1.0,
-            hi: 1.0,
-            lo_open: false,
-        },
-    ),
-    // A restricted boolean; widened past its own restriction, deliberately.
-    (
-        "boolean-via-score; Indeterminate allowed → RESTRICTED",
-        DeclaredRange {
-            lo: -1.0,
-            hi: 1.0,
-            lo_open: false,
-        },
-    ),
-    // `consent:{kind}` — the range is per-leaf, so no family-level bound holds.
-    (
-        "per-leaf (CC 3.3.1)",
-        DeclaredRange {
-            lo: -1.0,
-            hi: 1.0,
-            lo_open: false,
-        },
-    ),
-    // `locality:decision:{scale}`, `partner_role:{role}` — a label set, not a
-    // scale; every numeric encoding of it fits inside the widest range.
-    (
-        "enumerated",
-        DeclaredRange {
-            lo: -1.0,
-            hi: 1.0,
-            lo_open: false,
-        },
-    ),
-];
+    })
+}
 
 /// **The families for which the reserved redaction token cannot be honoured**
 /// — the feasibility program's headline result, as a hand-written literal.
@@ -556,17 +486,36 @@ pub const POLARITY_RANGES: &[(&str, DeclaredRange)] = &[
 /// `key:revocation` (`-1 only`, never withdrawn) pins `Refuted` like
 /// `revocation:{entity_type}:{reason}`. Both are claims whose band IS the
 /// dimension.
+///
+/// # v58.0.0 (CC rc8) — four more, each a single point
+///
+/// The rc8 re-vendor adds three `+1.0 only` Retirement Standard rows
+/// (`archive_release:{basis}:v1`, `lawful_order:release:v1`,
+/// `preserve_request:v1`) and the `-1 only` `takedown_notice:{basis}:v1`. A
+/// release, an order, a request and a notice are asserted, never scored, so
+/// the band is the dimension. (persist holds all four shut at admission in
+/// v58.0.0; the census measures the declared class, not what is stored.)
+///
+/// And `accord:*` itself: its catalogue label `see CC 3.4.1` was widened to
+/// `signed` while persist read bounds off label text; rc8's `_aliases` folds it
+/// onto `+1.0 only` ("accord:* parent: every leaf is +1.0 only"), so the
+/// parent pins like its leaves.
 pub const PINNING_FAMILIES: &[&str] = &[
+    "accord:*",
     "accord:invoke:constitutional:{halt_id}",
     "accord:invoke:drill:{drill_id}",
     "accord:invoke:notify:{notify_id}",
     "accord:lifecycle",
     "accord:lifecycle:active",
     "accord:lifecycle:confirmed",
+    "archive_release:{basis}:v1",
     "key:revocation",
+    "lawful_order:release:v1",
+    "preserve_request:v1",
     "prohibited:{category}",
     "revocation:{entity_type}:{reason}",
     "rollback_detected:{revision_field}",
+    "takedown_notice:{basis}:v1",
 ];
 
 /// Which fold a feasibility question is asked under.
@@ -632,9 +581,8 @@ pub struct RetainedCell {
 /// retained-field marginals under declared polarity/range"*. That fixes the
 /// **question** — is the withheld band determined by what is retained? — and
 /// the **pass condition** — at least two bands must remain possible. It does
-/// not fix the numeric range each CC polarity label implies, and the vendored
-/// registry carries the labels but no bounds column. [`POLARITY_RANGES`] is
-/// therefore persist's reading of CC's label vocabulary, marked as such.
+/// not fix the numeric range each CC polarity label implies; since rc8 the
+/// registry does (`_meta.polarity_classes`), and [`range_for_polarity`] reads it.
 ///
 /// # It is a feasibility enumeration, not a simplex call
 ///
@@ -771,42 +719,14 @@ fn odometer(idx: &mut [usize], radix: usize) -> bool {
     false
 }
 
-/// The declared range for a family's polarity label, or `None` when the label
-/// is not in [`POLARITY_RANGES`] — which is a build failure, not a fallback.
-#[must_use]
-pub fn range_for_polarity(label: &str) -> Option<DeclaredRange> {
-    POLARITY_RANGES
-        .iter()
-        .find(|(l, _)| *l == label)
-        .map(|(_, r)| *r)
-}
-
-/// Every `(prefix, polarity)` pair in the vendored CC namespace registry.
-///
-/// Parsed here rather than through
-/// [`namespace::registry`](crate::federation::namespace::registry) because that
-/// module's `RawFamily` deliberately deserializes `reserved_rule` and ignores
-/// every other column — the polarity axis is this module's concern, and adding
-/// it to a shared type to serve one caller is the second-spelling shape persist
-/// spent v31 removing.
+/// Every `(prefix, polarity)` pair in the vendored CC namespace registry —
+/// [`registry::family_polarities`](crate::federation::namespace::registry::family_polarities),
+/// the one parse of the column.
 #[must_use]
 pub fn vendored_family_polarities() -> Vec<(String, String)> {
-    #[derive(serde::Deserialize)]
-    struct Manifest {
-        families: Vec<Family>,
-    }
-    #[derive(serde::Deserialize)]
-    struct Family {
-        prefix: String,
-        #[serde(default)]
-        polarity: Option<String>,
-    }
-    const REGISTRY_JSON: &str = include_str!("namespace/namespace_registry.json");
-    let m: Manifest =
-        serde_json::from_str(REGISTRY_JSON).expect("vendored namespace_registry.json parses");
-    m.families
-        .into_iter()
-        .filter_map(|f| f.polarity.map(|p| (f.prefix, p)))
+    crate::federation::namespace::registry::family_polarities()
+        .iter()
+        .map(|(p, l)| (p.clone(), l.clone()))
         .collect()
 }
 
@@ -838,7 +758,7 @@ mod tests {
     /// divergence row. The registry (CC-generated at the pinned cut) and the
     /// supersets walk (a frozen hand-driven research artifact with no
     /// generator) each carry a per-family `polarity`; nothing ever
-    /// cross-checked them, and `POLARITY_RANGES` reads only the registry's
+    /// cross-checked them, and `range_for_polarity` reads only the registry's
     /// answer — so a family the other manifest ranges NARROWER could make
     /// the marginal-pinning census under-report with no test able to see it.
     ///
@@ -856,7 +776,7 @@ mod tests {
     /// sanctioned walk.
     const KNOWN_POLARITY_DIVERGENCES: &[(&str, &str, &str)] = &[
         // (family stem, registry says, supersets walk says). Two hard value
-        // conflicts with DIFFERENT numeric ranges under POLARITY_RANGES —
+        // conflicts with DIFFERENT numeric ranges under range_for_polarity —
         // the census reads the registry's answer, and these rows are why
         // that choice is now a checked fact instead of an accident:
         ("capacity_assurance:", "signed", "enumerated"),
@@ -1711,29 +1631,9 @@ mod tests {
         assert!(
             unknown.is_empty(),
             "CC declares a polarity persist has never mapped to a value range. \
-             Map it in POLARITY_RANGES and re-read the pinning census — a \
+             Map it in _meta.polarity_classes (CC) and re-read the pinning census — a \
              single-polarity leaf is exactly what the census is for. \
              Unmapped: {unknown:#?}"
-        );
-    }
-
-    /// The partition runs both ways: an entry the corpus no longer contains is
-    /// as much a defect as a label the table lacks.
-    #[test]
-    fn no_polarity_range_entry_is_stale() {
-        let live: BTreeSet<String> = vendored_family_polarities()
-            .into_iter()
-            .map(|(_, p)| p)
-            .collect();
-        let stale: Vec<&str> = POLARITY_RANGES
-            .iter()
-            .map(|(l, _)| *l)
-            .filter(|l| !live.contains(*l))
-            .collect();
-        assert!(
-            stale.is_empty(),
-            "POLARITY_RANGES carries labels the vendored registry no longer \
-             declares: {stale:?}"
         );
     }
 
@@ -1755,7 +1655,7 @@ mod tests {
         );
         // The literal is not empty, so the census is a finding and not a
         // formality — and it is not everything, so it discriminates.
-        assert_eq!(PINNING_FAMILIES.len(), 10);
+        assert_eq!(PINNING_FAMILIES.len(), 15);
     }
 
     /// **CC 3.4.5's acceptance criterion, stated as it was written**: feasible
@@ -1795,8 +1695,13 @@ mod tests {
 
     /// **The measurement behind `RetainedCell::open_contradictions`'s doc.**
     ///
-    /// Retaining the contradiction count pins 143 of the registry's 168
-    /// families; withholding it pins 10. (138 of 158 / 8 until the v55.0.0
+    /// Retaining the contradiction count pins 149 of the registry's 174
+    /// families; withholding it pins 15. (143 of 168 / 10 until the v58.0.0
+    /// rc8 re-vendor: its six new families all join the retained side, the
+    /// four single-point ones (three `+1.0 only` retirement rows,
+    /// `takedown_notice`) join the withheld side too, and `accord:*` joins the
+    /// withheld side once its label reads as CC's `+1.0 only` alias rather
+    /// than persist's old widening to `signed`. 138 of 158 / 8 until the v55.0.0
     /// rc7 re-vendor: of its eleven new families the four `signed` ones (the
     /// three ledger leaves, `settlement:*`) join the retained side, the two
     /// single-polarity ones (`accord:lifecycle:confirmed`, `key:revocation`)
@@ -1824,11 +1729,11 @@ mod tests {
         let withheld = pinned_families(false).len();
         assert_eq!(
             (retained, withheld),
-            (143, 10),
+            (149, 15),
             "the contradiction-count contrast moved (retained={retained}, \
              withheld={withheld})"
         );
-        assert_eq!(vendored_family_polarities().len(), 168);
+        assert_eq!(vendored_family_polarities().len(), 174);
     }
 
     /// **The signed fold's escape hatch is a zero-confidence row — and that is

@@ -32,8 +32,7 @@ decimal_id	claim_id	repo	path#symbol	crate@version
 3.2	CLM-nsproc-delegation-valid-until-ownership	CIRISPersist	src/federation/admission.rs#delegation_valid_until_lapsed	ciris-persist@57.0.0
 3.2	CLM-nsproc-delegation-purpose-ownership	CIRISPersist	src/federation/admission.rs#is_owner_binding_envelope	ciris-persist@57.0.0
 3.2	CLM-nsproc-pre-rotation-commitment-trust	CIRISPersist	src/federation/trust_root.rs#check_trust_charter_admission	ciris-persist@57.0.0
-3.2	CLM-halt-not-a-trust-leg	CIRISPersist	src/federation/trust_root.rs#trust_root_valid	ciris-persist@57.0.0
-3.2	CLM-halt-not-a-trust-leg	CIRISPersist	src/federation/trust_root.rs#transit_eligibility_walk	ciris-persist@57.0.0
+3.2	CLM-nsproc-halt-latched-trust	CIRISPersist	src/federation/trust_root.rs#trust_root_valid	ciris-persist@57.0.0
 3.2	CLM-trust-not-membership	CIRISPersist	src/federation/admission.rs#check_user_target_steward_binding_admission	ciris-persist@57.0.0
 3.2	CLM-nsproc-steward-bound-predicate-trust	CIRISPersist	src/federation/admission.rs#is_steward_bound	ciris-persist@57.0.0
 3.2	CLM-nsproc-steward-bindings-read-fold-trust	CIRISPersist	src/engine.rs#steward_bindings_of	ciris-persist@57.0.0
@@ -314,3 +313,7 @@ decimal_id	claim_id	repo	path#symbol	crate@version
 3.3.6.2	CLM-transit-kex-binding	CIRISPersist	src/federation/self_at_login.rs#SignedTransportDestination::rooted_transit_kex_pair	ciris-persist@57.0.0
 3.3.6.2	CLM-transit-kex-binding	CIRISPersist	src/federation/self_at_login.rs#transit_kex_pair_from_envelope	ciris-persist@57.0.0
 3.3.6.2	CLM-transit-kex-binding	CIRISPersist	src/federation/admission.rs#verify_signed_transport_destination	ciris-persist@57.0.0
+3.1.7	CLM-polarity-admission	CIRISPersist	src/federation/admission.rs#check_score_within_declared_polarity	ciris-persist@57.0.0
+3.1.7	CLM-polarity-admission	CIRISPersist	src/federation/namespace/registry.rs#family_polarity_class	ciris-persist@57.0.0
+3.1.7	CLM-polarity-admission	CIRISPersist	src/federation/namespace/registry.rs#PolarityClass::admits	ciris-persist@57.0.0
+3.1.7	CLM-polarity-admission	CIRISPersist	src/federation/admission.rs#check_dimension_case_rule	ciris-persist@57.0.0
