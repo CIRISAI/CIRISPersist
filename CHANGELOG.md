@@ -64,6 +64,85 @@ id, so the CC's next re-pin can graduate them.
   v56.0.0 without a row: five rows, `transit_kex_pair_for`, the two
   `SignedTransportDestination` accessors, `transit_kex_pair_from_envelope`
   and `verify_signed_transport_destination`.
+### Changed — the community and roster doors share one plan (#934 step 2)
+
+Five doors were written three times, once per backend, with byte-identical
+gate sequences. Each is now one shared door in `federation::community_admit`
+over a shared plan, and each backend keeps only a `CommunityStore` executor:
+row mapping, SQL, the transaction, the wire index and the `cfg(test)` rival
+hook. No behaviour changes.
+
+| door | before (v56.0.0 scan) | shared door | plan | executor |
+|---|---|---|---|---|
+| `put_community` | identical x3 (9 gates) | `put_community_planned` | `plan_put_community` | `store_planned_community` |
+| `apply_replicated_community` | gateless (delegated to the same per-backend body) | `apply_replicated_community_planned` | `plan_put_community` | `store_planned_community` |
+| `put_community_membership_revocation` | identical x3 (4 gates) | `put_community_membership_revocation_planned` | `plan_put_community_membership_revocation` | `store_planned_community_revocation` |
+| `put_community_membership_widening` | identical x3 (6 gates) | `put_community_membership_widening_planned` | `plan_put_community_membership_widening` | `store_planned_community_widening` |
+| `put_community_membership_listing` | identical x3 (1 gate) | `put_community_membership_listing_planned` | `plan_put_community_membership_listing` | `store_planned_community_listing` |
+
+- The `store::parity` scan now reports all five doors as `shared`, and
+  `SHARED_DOORS` holds them there. The per-backend `put_community_at_door`
+  bodies are gone.
+- **The occupied-id route splits into a decision and a write.**
+  `group_amendment::route_occupied_community` read and wrote in one call. It
+  is now `plan_occupied_community`, which reads only and ends the plan, and
+  `apply_occupied_community`, which writes the supersede or the trust-root
+  chain through the shared supersede door after the plan returns. The order
+  of every read and write is the same as before.
+- **The held-row settle stays the door's first statement**, ahead of the
+  plan. It reads the wire index, so the plans do not. I235 now reads the
+  settle from the four shared doors.
+- **Backend line counts**, before and after this cut:
+
+  | file | before | after | delta |
+  |---|---|---|---|
+  | `src/store/memory.rs` | 25,709 | 25,447 | −262 |
+  | `src/store/sqlite.rs` | 55,859 | 55,595 | −264 |
+  | `src/store/postgres.rs` | 52,727 | 52,482 | −245 |
+
+- **Each plan takes `PlanInstants`** and reads no clock. Each gate reads the
+  instant it read before #934. `store::parity`'s `PLAN_INSTANTS` now covers
+  the four community plans.
+
+  | plan | call | instant | before #934 |
+  |---|---|---|---|
+  | community | `check_geographic_community_admission` | `received_at` | clock (#1049 candidate: in-force location proofs) |
+  | community | `check_infrastructure_record_admission` | `received_at` | clock, two calls deep (#1049 candidate: founders' node-bearing) |
+  | community | `check_replicated_supersede_does_not_degrade` | `received_at` | clock, two calls deep (#1049 candidate) |
+  | revocation | `reject_future_dated_community_revocation` | `received_at` | clock (future-skew bound) |
+  | revocation | `check_community_roster_authority` | `fold_at` | `effective_at` |
+  | revocation | `check_infrastructure_founder_count_unchanged` | `fold_at` | `effective_at` |
+  | widening | `reject_future_dated_community_widening` | `received_at` | clock (future-skew bound) |
+  | widening | `check_community_roster_authority`, `check_infrastructure_founders_not_node`, `check_infrastructure_founder_count_unchanged` | `fold_at` | `effective_at` |
+  | listing | `check_community_membership_listing` | `received_at` | clock (future-skew bound) |
+
+  `fold_at` is the row's signed instant: `effective_at` for the three roster
+  rows, and the record's head instant for a community record. No community
+  record gate reads `fold_at` yet.
+
+**Adopter-visible.** Gate signatures now take an explicit instant. To keep
+the previous behaviour, pass `chrono::Utc::now()`.
+
+- `community_dek::reject_future_dated_community_revocation` and
+  `reject_future_dated_community_widening` take `received_at`.
+- `listing::reject_future_dated_community_listing` and
+  `listing::check_community_membership_listing` take `received_at`.
+- `admission::check_infrastructure_record_admission`,
+  `check_replicated_supersede_does_not_degrade` and
+  `check_infrastructure_community_conformance` take `at`. The supersede door
+  (`supersede_group_row`) still passes the clock.
+
+### Known gap — the community plane after #934 step 2
+
+- **Clock reads two or more calls deep.** `check_trust_root_at_door`
+  (through `check_trust_root_community_admission`) and the trust-root chain
+  apply in `apply_occupied_community` still read the clock inside
+  `canonical_community`. They were not re-plumbed in this step.
+- **The occupied-id write still re-asks after a write.** A trust-root chain
+  apply that finds the id empty re-runs the founding-signer check before the
+  insert, inside `apply_occupied_community`, as it did before.
+- **Non-row reads.** The settle reads the wire index before the plan. The
+  plans read the directory's community, key and location-proof rows only.
 
 ## [56.0.0] - 2026-10-14
 

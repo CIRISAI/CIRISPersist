@@ -183,3 +183,27 @@ new admission rule is one call in its tier (pure gates in AV-76 tier 1,
 directory walks in tier 4), given `fold_at` or `received_at` by name and
 recorded in `PLAN_INSTANTS`. The local doors' point is
 `plan_write_local_attestation`.
+
+## Step 2: the community and roster doors (v57.0.0)
+
+The shared doors and plans live in `src/federation/community_admit.rs`; each
+backend implements `CommunityStore` (storage only).
+
+| door | before (v56.0.0) | after |
+|---|---|---|
+| `put_community` | identical x3 (9 gates) | shared: `plan:put_community_planned` |
+| `apply_replicated_community` | gateless (delegated to the per-backend `put_community_at_door`) | shared: `plan:apply_replicated_community_planned` |
+| `put_community_membership_revocation` | identical x3 (4 gates) | shared: `plan:put_community_membership_revocation_planned` |
+| `put_community_membership_widening` | identical x3 (6 gates) | shared: `plan:put_community_membership_widening_planned` |
+| `put_community_membership_listing` | identical x3 (1 gate) | shared: `plan:put_community_membership_listing_planned` |
+
+The community door's gate sequence, identical on all three backends at
+v56.0.0: `verify_community_admission, check_trust_root_at_door,
+check_consensus_protocol_form, check_community_record,
+check_geographic_community_admission, check_infrastructure_record_admission,
+check_replicated_supersede_does_not_degrade,
+check_community_membership_steward_binding, route_occupied_community`. The
+last is now split into `plan_occupied_community` (the plan's last read) and
+`apply_occupied_community` (the write, after the plan). The instants each
+gate reads are in the CHANGELOG [57.0.0] and `store::parity`'s
+`PLAN_INSTANTS`.
