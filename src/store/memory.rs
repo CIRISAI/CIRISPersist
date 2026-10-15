@@ -2342,15 +2342,12 @@ impl Backend for MemoryBackend {
         agent_id_hash: &str,
     ) -> Result<super::types::ErasureSummary, Error> {
         // v57.0.0 (CIRISPersist#988 item 2) — the audit row's attester, read
-        // before the lock.
-        // An act: refused, typed, before anything moves when this node cannot
-        // attest its audit row (CIRISPersist#988 ruling: a host must hold a
-        // node key before any erasure is recorded).
-        let attester: Result<_, String> = Ok(
-            crate::federation::attestation_admit::hard_case_attester(self)
-                .await
-                .map_err(Error::from_hard_case_attester)?,
-        );
+        // before the lock. An act: refused, typed, before anything moves when
+        // this node cannot attest its audit row (lead ruling: a host must hold
+        // a node key before any erasure is recorded).
+        let attester = crate::federation::attestation_admit::hard_case_attester(self)
+            .await
+            .map_err(Error::from_hard_case_attester)?;
         let erased_at = chrono::Utc::now();
         let mut state = self.state.lock().expect("memory backend lock");
 
@@ -2364,51 +2361,108 @@ impl Backend for MemoryBackend {
             .map(|(_, row)| row.trace_id.clone())
             .collect();
 
-        let events_before = state.events.len();
+        // Decided under the lock BEFORE anything moves (the SQL backends'
+        // transaction): the counts, the detection rows, the audit row and its
+        // tombstones. A refusal of the plan leaves everything as it was.
+        let trace_events = state
+            .events
+            .values()
+            .filter(|(_, row)| row.agent_id_hash == agent_id_hash)
+            .count() as u64;
+        let trace_llm_calls = state
+            .llm_calls
+            .iter()
+            .filter(|row| target_trace_ids.contains(&row.trace_id))
+            .count() as u64;
+        // v57.0.0 (CIRISPersist#988 item 3; lead ruling on S1 item 5) — a
+        // ROW-BACKED detection of an erased trace is a signed row: it is
+        // HARD-DELETED (the DSAR door's treatment of signed rows), never
+        // rewritten, under a purge tombstone (`ART17_ERASURE_BASIS`). Memory
+        // holds no pre-v57 silo rows.
+        let erased_rows: Vec<String> = state
+            .derived_detection_events
+            .values()
+            .filter(|(_, p)| {
+                p.trace_id
+                    .as_ref()
+                    .is_some_and(|t| target_trace_ids.contains(t))
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        let detection_events_tombstoned = erased_rows.len() as u64;
+        let record = if trace_events > 0 || trace_llm_calls > 0 || detection_events_tombstoned > 0 {
+            let event = crate::federation::hard_case::trace_erasure_event(
+                agent_id_hash,
+                trace_events,
+                trace_llm_calls,
+                detection_events_tombstoned,
+                &erased_rows,
+                erased_at,
+            );
+            let planned = crate::federation::attestation_admit::plan_hard_case_row(
+                &event,
+                &attester,
+                crate::federation::attestation_admit::PlanInstants {
+                    fold_at: erased_at,
+                    received_at: erased_at,
+                },
+            )
+            .map_err(|e| Error::Backend(format!("erasure: {}: {e}", e.kind())))?;
+            let tombstones = if erased_rows.is_empty() {
+                None
+            } else {
+                Some(
+                    crate::federation::steward_purge::art17_erasure_execution(
+                        &planned.row,
+                        &erased_rows,
+                        &attester.key_id,
+                        erased_at,
+                    )
+                    .map_err(|e| Error::Backend(format!("erasure: {e}")))?,
+                )
+            };
+            Some((planned, tombstones))
+        } else {
+            None
+        };
+
         state
             .events
             .retain(|_, (_, row)| row.agent_id_hash != agent_id_hash);
-        let trace_events = (events_before - state.events.len()) as u64;
-
-        let llm_before = state.llm_calls.len();
         state
             .llm_calls
             .retain(|row| !target_trace_ids.contains(&row.trace_id));
-        let trace_llm_calls = (llm_before - state.llm_calls.len()) as u64;
-
-        // v57.0.0 (CIRISPersist#988 item 3; lead ruling 5) — a detection is a
-        // signed row; its erasure goes through the purge door, not this one.
-        // Memory holds no pre-v57 silo rows, so there is nothing to tombstone
-        // in place here.
-        let detection_events_tombstoned = 0u64;
-
-        // Audit emit — record a `hard_case:trace_erasure` row, mirroring
-        // the durable hard_case_events surface (atomic with the deletes
-        // since the whole op holds the single state lock). Emit only when
-        // something was actually erased, so an idempotent re-run stays a
-        // clean no-op.
-        if trace_events > 0 || trace_llm_calls > 0 || detection_events_tombstoned > 0 {
-            let event = crate::federation::hard_case::HardCaseEvent {
-                event_id: uuid::Uuid::new_v4().to_string(),
-                kind: crate::federation::hard_case::kind::TRACE_ERASURE.to_owned(),
-                target_key_id: Some(agent_id_hash.to_owned()),
-                subject_key_id: None,
-                detail: serde_json::json!({
-                    "agent_id_hash": agent_id_hash,
-                    "trace_events": trace_events,
-                    "trace_llm_calls": trace_llm_calls,
-                    "detection_events_tombstoned": detection_events_tombstoned,
-                }),
-                emitted_at: erased_at,
-            };
-            memory_record_hard_case_in_state(
-                &mut state,
-                &attester,
-                crate::federation::attestation_admit::HardCaseEmitter::Act,
-                &event,
-                erased_at,
-            )
-            .map_err(|e| Error::Backend(format!("erasure: {e}")))?;
+        for id in &erased_rows {
+            let record_key = crate::federation::wire_index::record_key(&[("attestation_id", id)]);
+            state
+                .signed_wire_index
+                .retain(|(kind, _), rk| !(kind == "Attestation" && *rk == record_key));
+            state
+                .federation_attestations
+                .retain(|a| &a.attestation_id != id);
+        }
+        prune_row_projections(&mut state);
+        if let Some((planned, tombstones)) = record {
+            memory_store_hard_case(&mut state, planned);
+            if let Some((mut execution, tombstones)) = tombstones {
+                let last = state.purge_executions.values().map(|e| e.admitted_at).max();
+                execution.admitted_at =
+                    crate::federation::types::monotonic_admission_instant(chrono::Utc::now(), last);
+                state
+                    .purge_executions
+                    .entry(execution.notice_id.clone())
+                    .or_insert(execution);
+                for t in tombstones {
+                    state.purge_tombstones.insert(
+                        (
+                            t.notice_id.clone(),
+                            t.plane.as_str().to_owned(),
+                            t.record_ref.clone(),
+                        ),
+                        t,
+                    );
+                }
+            }
         }
 
         Ok(super::types::ErasureSummary {
@@ -3694,6 +3748,8 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                     (e.admitted_at, e.notice_id.as_str()) > (*at, id.as_str())
                 })
             })
+            // v57.0.0 — an Art. 17 erasure's header is never served.
+            .filter(|e| e.legal_basis != crate::federation::steward_purge::ART17_ERASURE_BASIS)
             .cloned()
             .collect();
         out.sort_by(|a, b| {

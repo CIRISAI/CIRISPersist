@@ -1953,6 +1953,10 @@ where
             received_at,
         },
     )?;
+    // A detection row a purge or an Art. 17 erasure tombstoned is not
+    // re-admitted: the tombstone outlives the row (the purge door's TOMBSTONED
+    // gate, the one the put door asks).
+    crate::federation::steward_purge::refuse_if_tombstoned_attestation(dir, &planned.row).await?;
     let id = planned.row.attestation_id.clone();
     if !dir.store_planned_detection(planned).await? {
         if let Some(held) = dir.get_attestation(&id).await? {

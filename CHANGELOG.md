@@ -113,13 +113,33 @@ same rows as before.
   (`detection_row::project_detection_row_under`); `purge_finalize` deletes
   the row and its projection row goes with it. I825 shows the window and the
   finalize on memory, sqlite and postgres.
-- **Gap, stated: the DSAR door no longer erases a detection.**
-  `delete_traces_for_agent_id_hash` has no authority over another key's
-  signed row (the purge door needs the trust root's cosigned notice), so a
-  row-backed detection of an erased trace keeps its linkage until a steward
-  purge reaches it; `detection_events_tombstoned` counts only pre-v57 silo
-  rows (no backing row), which still take the V080 tombstone in place. A
-  ByIds purge derives nothing: it must name the detection rows.
+- **The DSAR erasure of a detection hard-deletes its signed row, under a
+  purge tombstone.** `delete_traces_for_agent_id_hash` deletes each
+  row-backed detection of an erased trace in the erasure's transaction (the
+  DSAR door's treatment of signed rows; Art. 17 never waits on the purge
+  dwell), and its projection row leaves with it. It writes one
+  `purge_executions` header (`legal_basis` =
+  `steward_purge::ART17_ERASURE_BASIS`, `"art17_erasure"`; origin `local`;
+  no cosignatures; finalized at once) whose `notice_jcs` is the JCS of the
+  erasure's own `hard_case:trace_erasure:v1` row (so its hash is the
+  `notice_id`), and one `purge_tombstones` row per deleted detection (plane
+  `attestation`). The `hard_case:trace_erasure:v1` row binds the set:
+  `detection_rows_erased` and `selection_digest`. The tombstone refuses the
+  row's re-admission (the TOMBSTONED gate, now asked by
+  `put_detection_event` too). An Art. 17 header is never served as a purge
+  bundle (`list_purge_executions_since` excludes the basis on all three
+  backends): a peer has no notice to verify, and the cited row names the
+  erased subject. No row is ever rewritten in place. The V080 tombstone row
+  (linkage NULL, `erased_at` set, analytics columns kept) survives only for
+  pre-v57 rows not yet rehomed, which have no signed row. A row-backed
+  detection keeps no V080 remnant row after its erasure: the remnant's
+  NOT NULL columns (`detector`, `severity`, `cohort_cell`,
+  `conformity_variant`, `conformity_payload`, `lens_core_version`,
+  `ratchet_calibration_version`, `ed25519_sig`, `ml_dsa_65_sig`,
+  `signing_key_id`, `ts`) cannot be rebuilt from a tombstone's ids and
+  instant, and the signed row that held them is gone.
+  `detection_events_tombstoned` counts both kinds. I961 shows it on all
+  three backends.
 - **Memory holds detections.** The memory backend's `put_detection_event` /
   `get_detection_events` returned `NotImplemented` / empty; they now run the
   same door and projection, so every witness runs on all three backends.

@@ -586,6 +586,43 @@ pub fn membership_removed_event(
     }
 }
 
+/// v57.0.0 (CIRISPersist#988 item 3) — the DSAR erasure's
+/// `hard_case:trace_erasure:v1` event, one builder for all three backends.
+/// When the erasure hard-deleted row-backed detections, the event names how
+/// many and binds their tombstone selection (`selection_digest`, the digest
+/// of the `attestation:{id}` record ids): the row is the notice the
+/// erasure's tombstone header cites (`steward_purge::ART17_ERASURE_BASIS`).
+#[must_use]
+pub fn trace_erasure_event(
+    agent_id_hash: &str,
+    trace_events: u64,
+    trace_llm_calls: u64,
+    detection_events_tombstoned: u64,
+    erased_detection_rows: &[String],
+    erased_at: DateTime<Utc>,
+) -> HardCaseEvent {
+    let mut detail = serde_json::json!({
+        "agent_id_hash": agent_id_hash,
+        "trace_events": trace_events,
+        "trace_llm_calls": trace_llm_calls,
+        "detection_events_tombstoned": detection_events_tombstoned,
+    });
+    if !erased_detection_rows.is_empty() {
+        let ids = super::steward_purge::art17_erasure_record_ids(erased_detection_rows);
+        detail["detection_rows_erased"] = serde_json::json!(ids.len());
+        detail["selection_digest"] =
+            serde_json::json!(super::steward_purge::selection_digest(&ids));
+    }
+    HardCaseEvent {
+        event_id: uuid::Uuid::new_v4().to_string(),
+        kind: kind::TRACE_ERASURE.to_owned(),
+        target_key_id: Some(agent_id_hash.to_owned()),
+        subject_key_id: None,
+        detail,
+        emitted_at: erased_at,
+    }
+}
+
 /// Deterministic `event_id` for a [`kind::RECIPIENT_EXCLUDED`] emission
 /// (CIRISPersist#161 Ask 4, v6.1.0) — keyed on `(cohort_scope, excluded
 /// occurrence, observed-at)`. Idempotent on the same walk-instant so a

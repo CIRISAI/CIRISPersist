@@ -3598,11 +3598,9 @@ impl Backend for PostgresBackend {
         // An act: refused, typed, before anything moves when this node cannot
         // attest its audit row (CIRISPersist#988 ruling: a host must hold a
         // node key before any erasure is recorded).
-        let attester: Result<_, String> = Ok(
-            crate::federation::attestation_admit::hard_case_attester(self)
-                .await
-                .map_err(Error::from_hard_case_attester)?,
-        );
+        let attester = crate::federation::attestation_admit::hard_case_attester(self)
+            .await
+            .map_err(Error::from_hard_case_attester)?;
         let erased_at = chrono::Utc::now();
         let mut client = self
             .pool
@@ -3636,9 +3634,19 @@ impl Backend for PostgresBackend {
         // the trace_id set is still resolvable here for symmetry; the
         // tombstone reads its own table by trace_id so ordering is moot,
         // but keeping it inside the txn is what guarantees atomicity.
-        let detection_events_tombstoned = pg_tombstone_detection_events(&tx, &trace_ids, erased_at)
+        let legacy_tombstoned = pg_tombstone_detection_events(&tx, &trace_ids, erased_at)
             .await
             .map_err(|e| Error::Backend(format!("tombstone detection_events: {e}")))?;
+        // v57.0.0 (CIRISPersist#988 item 3; lead ruling on S1 item 5) — a
+        // ROW-BACKED detection of an erased trace is a signed row: it is
+        // HARD-DELETED here (the DSAR door's treatment of signed rows; its
+        // projection row leaves by cascade), never rewritten, and a purge
+        // tombstone (`ART17_ERASURE_BASIS`) is written below so the row cannot
+        // be re-admitted.
+        let erased_rows = pg_art17_delete_detection_rows(&tx, &trace_ids)
+            .await
+            .map_err(|e| Error::Backend(format!("erase detection rows: {e}")))?;
+        let detection_events_tombstoned = legacy_tombstoned + erased_rows.len() as u64;
 
         // Step 3: hard-delete the LLM call rows joined by trace_id.
         let trace_llm_calls = if trace_ids.is_empty() {
@@ -3684,28 +3692,39 @@ impl Backend for PostgresBackend {
         // txn (atomic with the erasure). Emit only when something was
         // erased, so an idempotent re-run stays a clean no-op.
         if trace_events > 0 || trace_llm_calls > 0 || detection_events_tombstoned > 0 {
-            let event = crate::federation::HardCaseEvent {
-                event_id: uuid::Uuid::new_v4().to_string(),
-                kind: crate::federation::hard_case::kind::TRACE_ERASURE.to_owned(),
-                target_key_id: Some(agent_id_hash.to_owned()),
-                subject_key_id: None,
-                detail: serde_json::json!({
-                    "agent_id_hash": agent_id_hash,
-                    "trace_events": trace_events,
-                    "trace_llm_calls": trace_llm_calls,
-                    "detection_events_tombstoned": detection_events_tombstoned,
-                }),
-                emitted_at: erased_at,
-            };
-            pg_record_hard_case_in_tx(
-                &tx,
-                &attester,
-                crate::federation::attestation_admit::HardCaseEmitter::Act,
-                &event,
+            let event = crate::federation::hard_case::trace_erasure_event(
+                agent_id_hash,
+                trace_events,
+                trace_llm_calls,
+                detection_events_tombstoned,
+                &erased_rows,
                 erased_at,
+            );
+            let planned = crate::federation::attestation_admit::plan_hard_case_row(
+                &event,
+                &attester,
+                crate::federation::attestation_admit::PlanInstants {
+                    fold_at: erased_at,
+                    received_at: erased_at,
+                },
             )
-            .await
             .map_err(|e| Error::Backend(format!("emit trace_erasure audit: {e}")))?;
+            pg_store_hard_case(&tx, &planned)
+                .await
+                .map_err(|e| Error::Backend(format!("emit trace_erasure audit: {e}")))?;
+            if !erased_rows.is_empty() {
+                let (execution, tombstones) =
+                    crate::federation::steward_purge::art17_erasure_execution(
+                        &planned.row,
+                        &erased_rows,
+                        &attester.key_id,
+                        erased_at,
+                    )
+                    .map_err(|e| Error::Backend(format!("art17 tombstones: {e}")))?;
+                pg_put_art17_execution(&tx, &execution, &tombstones)
+                    .await
+                    .map_err(|e| Error::Backend(format!("art17 tombstones: {e}")))?;
+            }
         }
 
         tx.commit()
@@ -6222,7 +6241,9 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 &format!(
                     "{PG_PURGE_EXECUTION_SELECT} \
                      WHERE ($1::timestamptz IS NULL OR (admitted_at, notice_id) > ($1, $2)) \
-                     ORDER BY admitted_at ASC, notice_id ASC LIMIT $3"
+                       AND legal_basis <> '{}' \
+                     ORDER BY admitted_at ASC, notice_id ASC LIMIT $3",
+                    crate::federation::steward_purge::ART17_ERASURE_BASIS
                 ),
                 &[&since_at, &since_id, &limit],
             )
@@ -24718,6 +24739,102 @@ fn pg_error_detail(e: &tokio_postgres::Error) -> String {
 /// path had been reported as an opaque `Backend` for as long as the check had
 /// existed, diverging from memory's `InvalidArgument` in a way the differential
 /// harness could not see (it never reaches pg).
+/// v57.0.0 (CIRISPersist#988 item 3; lead ruling on S1 item 5) — the Art. 17
+/// erasure of the ROW-BACKED detections of `trace_ids`, inside the erasure's
+/// transaction: each signed row is hard-deleted (its wire-index entry first;
+/// its projection row leaves by `ON DELETE CASCADE`). Never a rewrite.
+/// Returns the deleted row ids, for the erasure's tombstones.
+async fn pg_art17_delete_detection_rows(
+    tx: &tokio_postgres::Transaction<'_>,
+    trace_ids: &[String],
+) -> Result<Vec<String>, crate::federation::Error> {
+    use crate::federation::Error;
+    if trace_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let ids: Vec<String> = tx
+        .query(
+            "SELECT attestation_id FROM cirislens_derived.detection_events \
+              WHERE trace_id = ANY($1::text[]) AND attestation_id IS NOT NULL",
+            &[&trace_ids],
+        )
+        .await
+        .map_err(|e| Error::Backend(format!("find detection rows: {e}")))?
+        .into_iter()
+        .map(|r| r.safe_get_with::<String, _, _, _>(0, Error::Backend))
+        .collect::<Result<_, _>>()?;
+    for id in &ids {
+        let record_key = crate::federation::wire_index::record_key(&[("attestation_id", id)]);
+        tx.execute(
+            "DELETE FROM cirislens.signed_wire_index \
+             WHERE kind = 'Attestation' AND record_key = $1",
+            &[&record_key],
+        )
+        .await
+        .map_err(|e| Error::Backend(format!("detection wire index: {e}")))?;
+        tx.execute(
+            "DELETE FROM cirislens.federation_attestations WHERE attestation_id = $1",
+            &[id],
+        )
+        .await
+        .map_err(|e| Error::Backend(format!("erase detection row: {e}")))?;
+    }
+    Ok(ids)
+}
+
+/// v57.0.0 — write an Art. 17 erasure's tombstone header (finalized at once)
+/// and its tombstones, inside the erasure's transaction.
+async fn pg_put_art17_execution(
+    tx: &tokio_postgres::Transaction<'_>,
+    e: &crate::federation::steward_purge::PurgeExecution,
+    tombstones: &[crate::federation::steward_purge::PurgeTombstone],
+) -> Result<(), crate::federation::Error> {
+    use crate::federation::Error;
+    let position = pg_next_plane_position(tx, "purge_executions").await?;
+    let count = i64::try_from(e.record_count).unwrap_or(i64::MAX);
+    tx.execute(
+        "INSERT INTO cirislens.purge_executions (notice_id, selection_digest, \
+            claimant_key_id, record_count, notice_jcs, cosignatures_json, executed_by, \
+            origin, executed_at, admitted_at, finalized_at, legal_basis) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
+         ON CONFLICT (notice_id) DO NOTHING",
+        &[
+            &e.notice_id,
+            &e.selection_digest,
+            &e.claimant_key_id,
+            &count,
+            &e.notice_jcs,
+            &e.cosignatures_json,
+            &e.executed_by,
+            &e.origin,
+            &e.executed_at,
+            &position,
+            &e.finalized_at,
+            &e.legal_basis,
+        ],
+    )
+    .await
+    .map_err(|err| Error::Backend(format!("art17 purge header: {err}")))?;
+    for t in tombstones {
+        let ordinal = i64::try_from(t.ordinal).unwrap_or(i64::MAX);
+        tx.execute(
+            "INSERT INTO cirislens.purge_tombstones \
+                (notice_id, plane, record_ref, ordinal, derived_from) \
+             VALUES ($1, $2, $3, $4, $5) ON CONFLICT (notice_id, plane, record_ref) DO NOTHING",
+            &[
+                &t.notice_id,
+                &t.plane.as_str(),
+                &t.record_ref,
+                &ordinal,
+                &t.derived_from,
+            ],
+        )
+        .await
+        .map_err(|err| Error::Backend(format!("art17 purge tombstone: {err}")))?;
+    }
+    Ok(())
+}
+
 /// v56.0.0 (CIRISPersist#934 door 2), lifted in v57.0.0 so the hard_case and
 /// detection writers store their rows through the same statement — insert
 /// one local-tier row inside `tx`: the row (`ON CONFLICT DO NOTHING`, so a

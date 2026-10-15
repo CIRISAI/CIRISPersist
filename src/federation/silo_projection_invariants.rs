@@ -12,8 +12,8 @@
 //!   enter the federation tier (held replication).
 //! - **I961 (`detection_events`)** — `put_detection_event` (twice, plus an
 //!   idempotent re-put and a conflicting one), then the DSAR erasure of one
-//!   detection's trace, which leaves the signed rows alone (their erasure is
-//!   the purge door's: I825), and the rebuild is byte-equal again.
+//!   detection's trace: its signed row is hard-deleted under an Art. 17
+//!   purge tombstone (never rewritten), and the rebuild is byte-equal again.
 //!
 //! - **I962 (the attester refusal, lead ruling 3)** — with no node key an
 //!   erasure, a peer removal and `record_hard_case` are each refused with the
@@ -244,12 +244,13 @@ pub(crate) mod bodies {
     }
 
     /// I961, after the runner ran the DSAR erasure of `erased`'s trace (lead
-    /// ruling 5): a detection is a signed row, and its erasure goes through
-    /// the purge door (I825), never an in-place rewrite. The DSAR door has no
-    /// authority over another key's signed row (the purge door needs the
-    /// trust root's cosigned notice), so it leaves both detections and their
-    /// projection rows as they were, and the table is still its rows'
-    /// rebuild.
+    /// ruling on S1 item 5): the erased detection's signed row was
+    /// HARD-DELETED in the erasure's transaction (never rewritten), its
+    /// projection row left with it, and a purge tombstone under the
+    /// erasure's own `hard_case:trace_erasure:v1` row
+    /// (`steward_purge::ART17_ERASURE_BASIS`) refuses its re-admission and is
+    /// never served as a purge bundle. The other detection is untouched and
+    /// the table is its rows' rebuild.
     pub(crate) async fn i961_after_erasure<B>(
         b: &B,
         erased: &crate::derived::DetectionEvent,
@@ -257,21 +258,71 @@ pub(crate) mod bodies {
     ) where
         B: AttestationStore + crate::derived::DerivedSchema,
     {
-        for e in [erased, kept] {
-            assert_eq!(
-                b.get_detection_events(crate::derived::EventFilter {
-                    trace_id: Some(e.trace_id.clone()),
-                    ..Default::default()
-                })
+        let erased_row =
+            crate::derived::detection_row::detection_attestation_id(&erased.detection_id);
+        assert!(
+            b.get_attestation(&erased_row).await.unwrap().is_none(),
+            "I961: the erased detection's signed row is hard-deleted, not rewritten"
+        );
+        assert!(
+            b.get_detection_events(crate::derived::EventFilter {
+                trace_id: Some(erased.trace_id.clone()),
+                ..Default::default()
+            })
+            .await
+            .expect("I961: read")
+            .is_empty(),
+            "I961: the erased detection is not returned"
+        );
+        assert_eq!(
+            b.get_detection_events(crate::derived::EventFilter {
+                trace_id: Some(kept.trace_id.clone()),
+                ..Default::default()
+            })
+            .await
+            .expect("I961: read"),
+            vec![kept.clone()],
+            "I961: the other detection is untouched"
+        );
+        // The tombstone: under a header citing the erasure's own row, never
+        // served, and it refuses the row's re-admission.
+        let notice = b
+            .purge_tombstoned("attestation", &erased_row)
+            .await
+            .unwrap()
+            .expect("I961: the erased row is tombstoned");
+        let header = b
+            .purge_execution(&notice)
+            .await
+            .unwrap()
+            .expect("I961: the tombstone's header");
+        assert_eq!(
+            header.legal_basis,
+            crate::federation::steward_purge::ART17_ERASURE_BASIS
+        );
+        assert!(header.finalized_at.is_some(), "I961: finalized at once");
+        assert!(
+            b.list_purge_executions_since(None, 100)
                 .await
-                .expect("I961: read"),
-                vec![e.clone()],
-                "I961: the DSAR door does not rewrite a signed detection row"
-            );
-        }
+                .unwrap()
+                .iter()
+                .all(|e| e.notice_id != notice),
+            "I961: an Art. 17 header is never served"
+        );
+        let cited: serde_json::Value = serde_json::from_str(&header.notice_jcs).unwrap();
+        let body = &cited[hard_case::BODY_MEMBER];
+        assert_eq!(body["kind"], hard_case::kind::TRACE_ERASURE);
+        assert_eq!(body["detail"]["detection_rows_erased"], 1);
+        assert_eq!(body["detail"]["selection_digest"], header.selection_digest);
+        let again = b.put_detection_event(erased.clone()).await;
+        assert!(
+            matches!(&again, Err(crate::derived::Error::InvalidArgument(m))
+                if m.starts_with(crate::federation::steward_purge::token::TOMBSTONED)),
+            "I961: the tombstone refuses the row's re-admission: {again:?}"
+        );
         check_projection_rebuild(b, SiloProjection::DetectionEvents)
             .await
-            .expect("I961: after the DSAR erasure, detection_events is its rows' rebuild");
+            .expect("I961: after the erasure, detection_events is its rows' rebuild");
     }
 
     /// I962 (no node key) — every act that must record a hard_case row is
@@ -538,8 +589,8 @@ mod run {
             .await
             .unwrap();
         assert_eq!(
-            summary.detection_events_tombstoned, 0,
-            "I961 memory: no row is rewritten"
+            summary.detection_events_tombstoned, 1,
+            "I961 memory: the row is erased"
         );
         bodies::i961_after_erasure(&b, &a, &c).await;
     }
@@ -656,8 +707,8 @@ mod run {
             .await
             .unwrap();
         assert_eq!(
-            summary.detection_events_tombstoned, 0,
-            "I961 sqlite: no row is rewritten"
+            summary.detection_events_tombstoned, 1,
+            "I961 sqlite: the row is erased"
         );
         bodies::i961_after_erasure(&b, &a, &c).await;
         // RED: a projection row whose row is gone is not a rebuild.
@@ -788,8 +839,8 @@ mod run {
             .await
             .unwrap();
         assert_eq!(
-            summary.detection_events_tombstoned, 0,
-            "I961 postgres: no row is rewritten"
+            summary.detection_events_tombstoned, 1,
+            "I961 postgres: the row is erased"
         );
         bodies::i961_after_erasure(&b, &a, &c).await;
         b.test_execute(

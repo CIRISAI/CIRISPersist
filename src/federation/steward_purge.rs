@@ -1713,6 +1713,81 @@ pub mod origin {
     pub const REPLICATED: &str = "replicated";
 }
 
+/// v57.0.0 (CIRISPersist#988 item 3; lead ruling on S1 item 5) — the
+/// `legal_basis` of an Art. 17 erasure's tombstone header: the data
+/// subject's erasure, executed by this node's DSAR door
+/// (`delete_traces_for_agent_id_hash`), not a steward notice. Its header
+/// cites the erasure's own `hard_case:trace_erasure:v1` row (the JCS of
+/// that row's envelope is the header's `notice_jcs`, so its hash is the
+/// `notice_id`), carries no cosignatures, and is finalized at once: the
+/// erased rows were hard-deleted in the same transaction (Art. 17 never
+/// waits on the purge dwell). It is NEVER served as a purge bundle: a peer
+/// has no authority to verify (no cosigned notice), and the cited row names
+/// the erased subject.
+pub const ART17_ERASURE_BASIS: &str = "art17_erasure";
+
+/// v57.0.0 — the record ids an Art. 17 erasure tombstones, in JCS order
+/// (`attestation:{id}` per hard-deleted detection row): what the erasure's
+/// `hard_case:trace_erasure:v1` row binds as `selection_digest`
+/// ([`selection_digest`]) before its header exists.
+#[must_use]
+pub fn art17_erasure_record_ids(attestation_ids: &[String]) -> Vec<String> {
+    let sorted: BTreeSet<String> = attestation_ids
+        .iter()
+        .map(|id| format!("{}:{id}", PurgePlane::Attestation.as_str()))
+        .collect();
+    sorted.into_iter().collect()
+}
+
+/// v57.0.0 — **the Art. 17 erasure's tombstone header and its tombstones**,
+/// pure: one tombstone per hard-deleted detection row (plane `attestation`,
+/// `record_ref` = its id), under a header whose notice is the erasure's
+/// `hard_case_row` (see [`ART17_ERASURE_BASIS`]). The store writes both in the
+/// erasure's own transaction.
+///
+/// # Errors
+///
+/// The cited row's envelope does not canonicalize.
+pub fn art17_erasure_execution(
+    hard_case_row: &Attestation,
+    attestation_ids: &[String],
+    executed_by: &str,
+    executed_at: chrono::DateTime<chrono::Utc>,
+) -> Result<(PurgeExecution, Vec<PurgeTombstone>), Error> {
+    let notice_jcs = String::from_utf8(crate::federation::attestation_emit::canonicalize(
+        &hard_case_row.attestation_envelope,
+    )?)
+    .map_err(|e| Error::Backend(format!("art17 notice jcs: {e}")))?;
+    let notice_id = hex::encode(sha2::Sha256::digest(notice_jcs.as_bytes()));
+    let record_ids = art17_erasure_record_ids(attestation_ids);
+    let tombstones = record_ids
+        .iter()
+        .enumerate()
+        .map(|(ordinal, id)| PurgeTombstone {
+            notice_id: notice_id.clone(),
+            ordinal: ordinal as u64,
+            plane: PurgePlane::Attestation,
+            record_ref: id.strip_prefix("attestation:").unwrap_or(id).to_owned(),
+            derived_from: None,
+        })
+        .collect::<Vec<_>>();
+    let execution = PurgeExecution {
+        notice_id,
+        selection_digest: selection_digest(&record_ids),
+        claimant_key_id: executed_by.to_owned(),
+        legal_basis: ART17_ERASURE_BASIS.to_owned(),
+        record_count: tombstones.len() as u64,
+        notice_jcs,
+        cosignatures_json: "[]".to_owned(),
+        executed_by: executed_by.to_owned(),
+        origin: origin::LOCAL.to_owned(),
+        executed_at,
+        admitted_at: executed_at,
+        finalized_at: Some(executed_at),
+    };
+    Ok((execution, tombstones))
+}
+
 /// One executed (or applied) purge: the header row of the ledger. Carries
 /// every preimage the ledger claims: the digest, the notice (its JCS bytes,
 /// whose hash IS the notice id) and its whole cosignature set, the count, the
