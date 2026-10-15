@@ -173,6 +173,29 @@ same rows as before.
   V195 makes the two signature columns NULLABLE and `attestation_id`
   non-unique (an erasure row projects many). I964 shows it on memory,
   sqlite and postgres.
+- **What a DSAR erasure leaves, stated plainly (operator-visible).**
+  - An erased row-backed detection leaves no signed row. Its
+    `detection_events` row is the V080 tombstone (linkage and signatures
+    NULL, analytics kept), as in v56.0.0. It is now rebuilt from the
+    erasure's `hard_case:trace_erasure:v1` row instead of being redacted in
+    place. No persist read door serves a tombstoned detection row (I825's
+    "not returned" contract is unchanged). `detection_events_tombstoned`
+    counts it. A pre-v57 row that cannot be rehomed keeps the in-place V080
+    NULLing.
+  - The erasure writes one `purge_executions` header with `legal_basis`
+    `steward_purge::ART17_ERASURE_BASIS` (`"art17_erasure"`). Its claimant
+    and executor are this node's key. It has no cosignatures, is finalized
+    at execution, and cites the erasure's own `hard_case:trace_erasure:v1`
+    row as its notice. `list_purge_executions_since` never serves it, on
+    any backend.
+  - The legacy rehome is lazy. `hard_case_events` rows move onto the plane
+    at the first hard_case emitter after the upgrade. `detection_events` rows
+    move at the first `put_detection_event` or DSAR erasure. Until then
+    `Engine::check_silo_projection` is RED. A pre-v57 detection whose
+    detector key is not held (or is not a `lenscore_detector`) cannot be
+    rehomed and keeps the gate RED. That is the condition an operator sees:
+    register the detector's key, or accept the red as the record of an
+    unattestable legacy row.
 - **Memory holds detections.** The memory backend's `put_detection_event` /
   `get_detection_events` returned `NotImplemented` / empty; they now run the
   same door and projection, so every witness runs on all three backends.
