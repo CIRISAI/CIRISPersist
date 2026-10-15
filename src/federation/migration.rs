@@ -596,12 +596,20 @@ impl ExclusionClass {
 /// (`steward_purge`'s retraction check). Two lists drifted once: the steward
 /// purge refused `key:revocation` and `moderation_track_record:*` while this
 /// door, matching [`ExclusionClass`] prefixes only, deleted them.
+///
+/// v57.0.0 (CIRISPersist#988 item 2) — `hard_case:` joins the list. A
+/// `hard_case:{kind}` row is the node's own accountability record (CC 3.1.9.4;
+/// CIRISConstitution#170 asks the steward to add it to CC 2.4.1.1's set, in
+/// the protective direction). It inherits the refusal from this table, on
+/// both purge doors and on the serve read, rather than from a special case in
+/// any door.
 pub const ACCOUNTABILITY_RECORD_PREFIXES: &[&str] = &[
     "revocation:",
     "key:revocation",
     "moderation:",
     "moderation_track_record:",
     "slashing:",
+    "hard_case:",
 ];
 
 /// The accountability family `dimension` belongs to, if any

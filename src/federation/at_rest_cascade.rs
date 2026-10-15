@@ -1800,8 +1800,9 @@ pub mod orchestrate {
                 .iter()
                 .find(|(k, _)| k == member)
                 .map(|(_, n)| *n);
-            backend
-                .record_hard_case(hard_case::HardCaseEvent {
+            crate::federation::hard_case::record_observation(
+                backend,
+                hard_case::HardCaseEvent {
                     event_id: hard_case::membership_change_event_id(
                         target_key_id,
                         member,
@@ -1826,14 +1827,16 @@ pub mod orchestrate {
                         "excluded": granted_count.is_none(),
                     }),
                     emitted_at: observed_at,
-                })
-                .await
-                .map_err(|e| BlobError::Backend(format!("emit membership_change: {e}")))?;
+                },
+            )
+            .await
+            .map_err(|e| BlobError::Backend(format!("emit membership_change: {e}")))?;
         }
         // One recipient-excluded event per fail-secure exclusion.
         for excluded in &result.excluded {
-            backend
-                .record_hard_case(hard_case::HardCaseEvent {
+            crate::federation::hard_case::record_observation(
+                backend,
+                hard_case::HardCaseEvent {
                     event_id: hard_case::recipient_excluded_event_id(
                         cohort_scope,
                         excluded,
@@ -1848,9 +1851,10 @@ pub mod orchestrate {
                         "reason": "no_valid_encryption_pubkeys",
                     }),
                     emitted_at: observed_at,
-                })
-                .await
-                .map_err(|e| BlobError::Backend(format!("emit recipient_excluded: {e}")))?;
+                },
+            )
+            .await
+            .map_err(|e| BlobError::Backend(format!("emit recipient_excluded: {e}")))?;
         }
         Ok(())
     }
@@ -2251,15 +2255,17 @@ pub mod orchestrate {
             .await?;
         // 3. §9 — emit the membership-removed change event (consumers reconcile
         //    via list_hard_case_events instead of polling).
-        backend
-            .record_hard_case(hard_case::membership_removed_event(
+        crate::federation::hard_case::record_observation(
+            backend,
+            hard_case::membership_removed_event(
                 hard_case::kind::COMMUNITY_MEMBERSHIP_CHANGE,
                 community_key_id,
                 removed_identity_key_id,
                 observed_at,
-            ))
-            .await
-            .map_err(|e| BlobError::Backend(format!("emit membership_removed: {e}")))?;
+            ),
+        )
+        .await
+        .map_err(|e| BlobError::Backend(format!("emit membership_removed: {e}")))?;
         Ok(new_epoch)
     }
 
@@ -2715,8 +2721,9 @@ pub mod orchestrate {
             .resolve_encryption_keys(new_occurrence_key_id)
             .await?;
         let Some(keys) = usable_keys(&keys).cloned() else {
-            backend
-                .record_hard_case(hard_case::HardCaseEvent {
+            crate::federation::hard_case::record_observation(
+                backend,
+                hard_case::HardCaseEvent {
                     event_id: hard_case::recipient_excluded_event_id(
                         crate::federation::types::cohort_scope::COMMUNITY,
                         new_occurrence_key_id,
@@ -2731,8 +2738,9 @@ pub mod orchestrate {
                         "reason": "no_valid_encryption_pubkeys",
                     }),
                     emitted_at: as_of,
-                })
-                .await?;
+                },
+            )
+            .await?;
             return Err(refuse(
                 crate::federation::DEVICE_REKEY_RULE_NO_ENCRYPTION_PUBKEYS,
             ));

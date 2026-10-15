@@ -447,7 +447,7 @@ mod from_disk {
         (EnvelopeKind::Revocation, "put_revocation"),
         (EnvelopeKind::IdentityOccurrence, "put_identity_occurrence"),
         (EnvelopeKind::Family, "put_family"),
-        (EnvelopeKind::Community, "put_community_at_door"),
+        (EnvelopeKind::Community, "put_community"),
         (
             EnvelopeKind::IdentityOccurrenceRevocation,
             "put_identity_occurrence_revocation",
@@ -479,6 +479,24 @@ mod from_disk {
         (
             EnvelopeKind::CommunityMembershipListing,
             "put_community_membership_listing",
+        ),
+    ];
+
+    /// v57.0.0 (CIRISPersist#934 step 2) — the replicated kinds whose door is
+    /// a shared one in `federation::community_admit`: `(kind, shared door)`.
+    const COMMUNITY_SHARED: &[(EnvelopeKind, &str)] = &[
+        (EnvelopeKind::Community, "put_community_planned"),
+        (
+            EnvelopeKind::CommunityMembershipRevocation,
+            "put_community_membership_revocation_planned",
+        ),
+        (
+            EnvelopeKind::CommunityMembershipWidening,
+            "put_community_membership_widening_planned",
+        ),
+        (
+            EnvelopeKind::CommunityMembershipListing,
+            "put_community_membership_listing_planned",
         ),
     ];
 
@@ -552,6 +570,16 @@ mod from_disk {
                     );
                     continue;
                 }
+                // v57.0.0 (CIRISPersist#934 step 2) — the community plane's
+                // doors are calls into their shared doors, read once below.
+                if let Some((_, shared)) = COMMUNITY_SHARED.iter().find(|(k, _)| k == kind) {
+                    assert!(
+                        body.join(" ")
+                            .contains(&format!("community_admit::{shared}(")),
+                        "I235: {backend}::{door} is not the shared door `{shared}`"
+                    );
+                    continue;
+                }
                 let settle = format!(
                     "crate::federation::replication_policy::EnvelopeKind::{}",
                     kind.as_str()
@@ -572,6 +600,41 @@ mod from_disk {
                     body[0]
                 );
             }
+        }
+        // v57.0.0 (CIRISPersist#934 step 2) — each shared community door's
+        // FIRST statement is the settle, under its own kind.
+        let community =
+            std::fs::read_to_string(format!("{root}/src/federation/community_admit.rs")).unwrap();
+        for (kind, shared) in COMMUNITY_SHARED {
+            let start = community
+                .find(&format!("pub(crate) async fn {shared}<"))
+                .unwrap_or_else(|| panic!("I235: the shared door `{shared}`"));
+            let f = &community[start..];
+            let f = &f[..f.find("\n}\n").unwrap_or(f.len())];
+            let open = f.find("\n{\n").expect("I235: a shared door's body") + 3;
+            let first = f[open..]
+                .lines()
+                .map(|l| l.split("//").next().unwrap_or("").trim())
+                .find(|l| !l.is_empty())
+                .unwrap_or("");
+            assert!(
+                first.starts_with("if crate::federation::replication_policy::settle_if_held("),
+                "I235: `{shared}`'s first statement must be the settle, got `{first}`"
+            );
+            let joined: String = f[open..]
+                .lines()
+                .map(|l| l.split("//").next().unwrap_or("").trim())
+                .collect::<Vec<_>>()
+                .join(" ");
+            let at = joined.find("settle_if_held(").unwrap();
+            let stmt = &joined[at..joined[at..].find('}').map_or(joined.len(), |e| at + e)];
+            assert!(
+                stmt.contains(&format!(
+                    "crate::federation::replication_policy::EnvelopeKind::{}",
+                    kind.as_str()
+                )),
+                "I235: `{shared}` settles under the wrong kind: {stmt}"
+            );
         }
         // The shared attestation plan: it settles under the Attestation kind,
         // ahead of the per-peer quota.

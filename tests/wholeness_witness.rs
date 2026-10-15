@@ -493,9 +493,21 @@ fn root_hex_builder_and_wire_shape() {
     assert!(bad.to_verify_witness().is_err());
 }
 
+/// v57.0.0 (CIRISPersist#988 item 2) — an equivocation proof is a
+/// `hard_case:witness_equivocation:v1` row attested by the node's own key, so
+/// each backend declares one it holds.
+async fn hold_node_key<B: FederationDirectory>(backend: &B, node: &str) {
+    backend
+        .add_peer_record(node, "AAAA", "node", None)
+        .await
+        .expect("the node's own key");
+}
+
 #[tokio::test]
 async fn memory_witness_projection() {
     let backend = ciris_persist::store::MemoryBackend::default();
+    hold_node_key(&backend, "ww-node").await;
+    backend.set_node_key_id("ww-node");
     run_projection_assertions(&backend, "memory", true).await;
 }
 
@@ -508,6 +520,8 @@ async fn sqlite_witness_projection() {
         .run_migrations()
         .await
         .expect("sqlite migrations (incl. V085)");
+    hold_node_key(&backend, "ww-node").await;
+    backend.set_node_key_id("ww-node");
     run_projection_assertions(&backend, "sqlite", true).await;
 }
 
@@ -525,6 +539,9 @@ async fn postgres_witness_projection() {
         .await
         .expect("pg migrations (incl. V085)");
     let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let node = format!("ww-node-{suffix}");
+    hold_node_key(&backend, &node).await;
+    backend.set_node_key_id(node);
     // Shared database — skip the all-peers sweep (other runs' peers).
     run_projection_assertions(&backend, &suffix, false).await;
 }
@@ -534,6 +551,14 @@ async fn postgres_witness_projection() {
 #[tokio::test]
 async fn equivocation_emits_hard_case_and_retains_both() {
     let backend = ciris_persist::store::MemoryBackend::default();
+    // v57.0.0 (CIRISPersist#988 item 2) — the equivocation proof is a
+    // `hard_case:witness_equivocation:v1` row attested by THIS node's key, so
+    // the node declares one it holds.
+    backend
+        .add_peer_record("equiv-node", "AAAA", "node", None)
+        .await
+        .expect("the node's own key");
+    backend.set_node_key_id("equiv-node");
     let producer = Producer::new(0x22);
     let pqc_pub = producer.mldsa_pub_b64().await;
     let now = chrono::Utc::now();
@@ -604,6 +629,19 @@ async fn equivocation_emits_hard_case_and_retains_both() {
         "(d) hard_case:witness_equivocation emitted"
     );
     assert_eq!(cases[0].target_key_id.as_deref(), Some(peer));
+    // v57.0.0 (CC 6.1.1, CLM-hard-case-on-base) — the proof carries BOTH
+    // validly-signed witnesses as members, so it is non-repudiable wherever
+    // the row is held.
+    let carried = cases[0].detail["witnesses"]
+        .as_array()
+        .expect("detail.witnesses");
+    assert_eq!(carried.len(), 2, "(d) both signed witnesses on the proof");
+    for w in carried {
+        assert!(w["signature"].as_str().is_some_and(|s| !s.is_empty()));
+        assert!(w["signature_ml_dsa_65"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty()));
+    }
 
     // Idempotent: a re-scan emits no duplicate.
     let _ = backend.reconcile_peer_witnesses(peer, now).await.unwrap();

@@ -9,7 +9,7 @@
 //!
 //! A superseded record now carries a [`GroupSupersedeProof`], and the
 //! replicated door routes an occupied id through [`route_occupied_family`] /
-//! [`route_occupied_community`] — one decision for both group kinds:
+//! [`plan_occupied_community`] — one decision for both group kinds:
 //!
 //! - no stored row: the caller inserts, as before;
 //! - identical content (the same `persist_row_hash`): a no-op, as before;
@@ -240,13 +240,36 @@ where
     Ok(OccupiedRoute::Settled(CommunityWrite::Superseded))
 }
 
-/// v49.0.0 (#910.5) — the occupied-id decision for a replicated
-/// [`SignedCommunity`]. Call AFTER the record's own authority scrub and the
-/// community admission checks have passed.
-pub(crate) async fn route_occupied_community<F>(
+/// v57.0.0 (CIRISPersist#934 step 2) — what an occupied community id gets,
+/// as the shared plan decided it ([`plan_occupied_community`]); written by
+/// [`apply_occupied_community`] after the plan returns.
+#[derive(Debug)]
+pub(crate) enum OccupiedCommunity {
+    /// No row under this id, and the founding signers are admitted: insert.
+    Insert,
+    /// The identical record is held: a no-op.
+    Unchanged,
+    /// A trust-root row (offered or held): applied by its CHAIN, version by
+    /// version, through the shared supersede door.
+    TrustRootChain,
+    /// An amendment this node's own state authorizes: applied as a supersede
+    /// under `cohort`, its history row carrying `authorization`.
+    Supersede {
+        /// The cohort the held record declares (#1034).
+        cohort: Cohort,
+        /// The history row's `change_authorization`.
+        authorization: serde_json::Value,
+    },
+}
+
+/// v49.0.0 (#910.5) — the occupied-id DECISION for a [`SignedCommunity`].
+/// Call AFTER the record's own authority scrub and the community admission
+/// checks have passed. v57.0.0 (#934 step 2): reads only, so the shared plan
+/// ends in it; [`apply_occupied_community`] writes what it decided.
+pub(crate) async fn plan_occupied_community<F>(
     dir: &F,
     community: &SignedCommunity,
-) -> Result<OccupiedRoute, Error>
+) -> Result<OccupiedCommunity, Error>
 where
     F: FederationDirectory + ?Sized,
 {
@@ -254,7 +277,7 @@ where
     let Some(stored) = dir.lookup_community(&c.community_key_id).await? else {
         // v52.0.0 (#955, Q1) — a founding record admits only its signers.
         check_community_founding(dir, community).await?;
-        return Ok(OccupiedRoute::Insert);
+        return Ok(OccupiedCommunity::Insert);
     };
     // v50.0.0 (CIRISPersist#926 re-check, HIGH-A) — a trust-root row is
     // applied by its CHAIN, not by the one-hop proof below: version by version
@@ -264,16 +287,7 @@ where
     if super::canonical_community::is_trust_root_grade(c)
         || super::canonical_community::is_trust_root_grade(&stored)
     {
-        let applied =
-            super::canonical_community::apply_trust_root_chain_counted(dir, community).await;
-        return match lost_race(dir, &c.community_key_id, &offered_hash, applied).await? {
-            None => {
-                check_community_founding(dir, community).await?;
-                Ok(OccupiedRoute::Insert)
-            }
-            Some(0) => Ok(OccupiedRoute::Settled(CommunityWrite::Unchanged)),
-            Some(_) => Ok(OccupiedRoute::Settled(CommunityWrite::Superseded)),
-        };
+        return Ok(OccupiedCommunity::TrustRootChain);
     }
     // v54.0.0 (CIRISPersist#1034) — the version names the cohort the held
     // record declares, and its history row is recorded under it (an
@@ -285,7 +299,7 @@ where
         cohort,
         kind: "community",
         group_key_id: &c.community_key_id,
-        offered_hash: offered_hash.clone(),
+        offered_hash,
         member_key_ids: c.members.iter().map(|m| m.key_id.as_str()).collect(),
         consensus_protocol: &c.consensus_protocol,
         entrenched: None,
@@ -298,20 +312,63 @@ where
         entrenched: false,
     };
     if !admit_amendment(dir, &offer, &stored).await? {
-        return Ok(OccupiedRoute::Settled(CommunityWrite::Unchanged));
+        return Ok(OccupiedCommunity::Unchanged);
     }
-    let snapshot = serde_json::to_value(community)
-        .map_err(|e| Error::Backend(format!("community amendment snapshot serialize: {e}")))?;
-    let written = dir
-        .supersede_group_row(cohort, snapshot, Some(authorization(&offer)))
-        .await
-        .map(|_| Some(1));
-    Ok(
-        match lost_race(dir, &c.community_key_id, &offered_hash, written).await? {
-            Some(0) => OccupiedRoute::Settled(CommunityWrite::Unchanged),
-            _ => OccupiedRoute::Settled(CommunityWrite::Superseded),
-        },
-    )
+    Ok(OccupiedCommunity::Supersede {
+        cohort,
+        authorization: authorization(&offer),
+    })
+}
+
+/// v57.0.0 (CIRISPersist#934 step 2) — write what [`plan_occupied_community`]
+/// decided, through the shared supersede door. A supersede that lost its race
+/// to the same record is `Unchanged` (PR #921 review F3); a trust-root chain
+/// that found the id empty after all inserts, behind the founding check.
+pub(crate) async fn apply_occupied_community<F>(
+    dir: &F,
+    community: &SignedCommunity,
+    occupied: OccupiedCommunity,
+) -> Result<OccupiedRoute, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let c = &community.community;
+    match occupied {
+        OccupiedCommunity::Insert => Ok(OccupiedRoute::Insert),
+        OccupiedCommunity::Unchanged => Ok(OccupiedRoute::Settled(CommunityWrite::Unchanged)),
+        OccupiedCommunity::TrustRootChain => {
+            let offered_hash = super::types::compute_persist_row_hash(c)?;
+            let applied =
+                super::canonical_community::apply_trust_root_chain_counted(dir, community).await;
+            match lost_race(dir, &c.community_key_id, &offered_hash, applied).await? {
+                None => {
+                    check_community_founding(dir, community).await?;
+                    Ok(OccupiedRoute::Insert)
+                }
+                Some(0) => Ok(OccupiedRoute::Settled(CommunityWrite::Unchanged)),
+                Some(_) => Ok(OccupiedRoute::Settled(CommunityWrite::Superseded)),
+            }
+        }
+        OccupiedCommunity::Supersede {
+            cohort,
+            authorization,
+        } => {
+            let offered_hash = super::types::compute_persist_row_hash(c)?;
+            let snapshot = serde_json::to_value(community).map_err(|e| {
+                Error::Backend(format!("community amendment snapshot serialize: {e}"))
+            })?;
+            let written = dir
+                .supersede_group_row(cohort, snapshot, Some(authorization))
+                .await
+                .map(|_| Some(1));
+            Ok(
+                match lost_race(dir, &c.community_key_id, &offered_hash, written).await? {
+                    Some(0) => OccupiedRoute::Settled(CommunityWrite::Unchanged),
+                    _ => OccupiedRoute::Settled(CommunityWrite::Superseded),
+                },
+            )
+        }
+    }
 }
 
 /// v52.0.0 (CIRISPersist#955, Q1) — a founding family admits only the members
@@ -726,6 +783,7 @@ where
     super::admission::check_infrastructure_community_conformance(
         dir.as_dyn_directory(),
         &new.community,
+        chrono::Utc::now(),
     )
     .await?;
     // v50.0.0 (CIRISPersist#926) — a trust-root row amends only as a verified

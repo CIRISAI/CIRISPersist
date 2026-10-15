@@ -116,6 +116,10 @@ pub(crate) struct PlannedAttestation {
     pub(crate) withdraws_depth: Option<usize>,
     /// The inbound `trace:*` projection (#501), decomposed from the envelope.
     pub(crate) projected_trace: Option<crate::store::decompose::Decomposed>,
+    /// v57.0.0 (CIRISPersist#988 item 3) — the `detection_events` row a
+    /// `detection:*` row carrying a detection body projects to, written in the
+    /// row's transaction.
+    pub(crate) projected_detection: Option<crate::derived::detection_row::DetectionProjection>,
     /// The signed-wire-index locator (#507b), federation tier only; the hash
     /// comes from the stored row (#646).
     pub(crate) wire_index_key: Option<String>,
@@ -224,6 +228,50 @@ pub(crate) trait AttestationStore:
         attestation_id: &str,
         only_if_hash: Option<&str>,
     ) -> Result<bool, Error>;
+
+    /// v57.0.0 (CIRISPersist#988 item 2) — store a planned `hard_case` row:
+    /// the row (insert-if-absent on its id, so a re-recorded event is a no-op)
+    /// and, when the row landed, its `hard_case_events` projection, in one
+    /// transaction.
+    async fn store_planned_hard_case(&self, planned: PlannedHardCase) -> Result<(), Error>;
+
+    /// v57.0.0 (CIRISPersist#988 item 2) — move every pre-v57
+    /// `hard_case_events` row that has no backing row onto the plane: plan
+    /// each as `attester`'s row ([`plan_hard_case_row`] at `received_at`),
+    /// store it, and replace the legacy row with the row's projection, in one
+    /// transaction. A no-op when there are none (memory never holds any).
+    async fn rehome_legacy_hard_case_events(
+        &self,
+        attester: &HardCaseAttester,
+        received_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), Error>;
+
+    /// v57.0.0 (CIRISPersist#988; CLM-silo-projection-rebuildable) — the
+    /// projection's live rows and its from-rows rebuild through the same
+    /// writer, rendered for a byte comparison
+    /// ([`super::silo_projection::check_projection_rebuild`]).
+    #[cfg_attr(not(any(feature = "sqlite", feature = "postgres")), allow(dead_code))]
+    async fn projection_rebuild(
+        &self,
+        projection: super::silo_projection::SiloProjection,
+    ) -> Result<super::silo_projection::ProjectionRebuild, Error>;
+
+    /// v57.0.0 (CIRISPersist#988 item 3) — store a planned detection row and,
+    /// when it landed, its `detection_events` projection, in one transaction.
+    /// `false` (nothing written) when the row's id is already held.
+    async fn store_planned_detection(&self, planned: PlannedDetection) -> Result<bool, Error>;
+
+    /// v57.0.0 (CIRISPersist#988 item 3) — move every pre-v57
+    /// `detection_events` row with no backing row onto the plane: plan each as
+    /// its detector's row ([`plan_detection_row`] at `received_at`), store it
+    /// and replace the legacy row with the row's projection. A legacy row
+    /// whose detector key this node does not hold, or whose key the
+    /// `detection:` reserved rule refuses, stays as it is (and the rebuild
+    /// gate reports it). A no-op when there are none.
+    async fn rehome_legacy_detection_events(
+        &self,
+        received_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), Error>;
 }
 
 /// v56.0.0 (CIRISPersist#934 step 1) — a planned hybrid completion
@@ -430,6 +478,9 @@ where
         crate::federation::SubjectGate::Ingest,
     )?;
     crate::federation::genesis::check_genesis_attestation_reserved(&row)?;
+    // v57.0.0 (CIRISPersist#988 item 3) — a `detection:*` row that carries a
+    // detection body carries one the projection can read. Pure.
+    crate::derived::detection_row::check_detection_body(&row)?;
     // v52.0.0 (CIRISPersist#672) — a re-offer of a held federation-tier row
     // settles here: AHEAD of the per-peer quota (a duplicate did no work
     // and must not spend the sender's budget) and of every verify. Only
@@ -966,6 +1017,12 @@ where
     // dimension-keyed `capacity:*` self-emission arm. Backend-symmetric
     // with SQLite + Postgres.
     crate::federation::admission::check_reserved_prefix_admission(dir, &row).await?;
+    // v57.0.0 (CIRISPersist#988 item 2) — hard_case replication is held: a
+    // `hard_case:*` row does not enter the federation tier by this door either
+    // (it is also the replicated apply). AFTER the reserved-prefix gate, so the
+    // #607 conferral refusal still names itself for a third-party row and a
+    // row that clears it is the one the hold stops.
+    super::hard_case::check_hard_case_replication_held(&row)?;
 
     // v22.0.0 (CIRISConstitution#46) — CONSENT BEFORE SCORING. A
     // federation-tier `capacity:*` claim about subject S from attester P is
@@ -1081,6 +1138,9 @@ where
     // row is still owned.
     let projected_trace =
         crate::ingest::project_trace_events_from_attestation(&row.attestation_envelope);
+    // v57.0.0 (CIRISPersist#988 item 3) — the detection projection, read from
+    // the row by the one function the rebuild calls too.
+    let projected_detection = crate::derived::detection_row::project_detection_row(&row);
     row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
     // v21.1.0 (CIRISPersist#507b) — wire-index this row (federation tier
     // only, the E5 invariant). v31.0.0 (CIRISPersist#646) — only the
@@ -1100,6 +1160,7 @@ where
         row,
         withdraws_depth,
         projected_trace,
+        projected_detection,
         wire_index_key,
         cycle_gated,
         received_at,
@@ -1268,6 +1329,15 @@ where
             "local attestation envelope must carry a \"dimension\" string".into(),
         )
     })?;
+    // v57.0.0 (CIRISPersist#988 item 2) — a `hard_case:*` row is written by
+    // the substrate's hard_case door alone (`record_hard_case`, attester = the
+    // node key), so the projection holds only what that door decided.
+    if super::hard_case::is_hard_case_dimension(&dimension) {
+        return Err(Error::InvalidArgument(format!(
+            "{dimension}: a hard_case row is written by the substrate's hard_case door \
+             (record_hard_case), not the local door"
+        )));
+    }
 
     // §4.1 local-tier gate: refuse capacity:*; classify subject-side
     // revocation as TRANSIT (§10.1.3 transit-not-rest).
@@ -1531,4 +1601,364 @@ where
         .delete_attestation(attestation_id, Some(expected_persist_row_hash))
         .await?;
     Ok(gone)
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+//  v57.0.0 (CIRISPersist#988 item 2, CC 3.1.9.4) — the hard_case door
+// ─────────────────────────────────────────────────────────────────────────
+
+/// The attester of every `hard_case:*` row (CC 3.1.9.4, CLM-hard-case-on-base:
+/// "attester = the node key"): this node's declared key, held in
+/// `federation_keys`, with its `identity_type` for the dimension gate.
+#[derive(Debug, Clone)]
+pub(crate) struct HardCaseAttester {
+    /// This node's key id.
+    pub(crate) key_id: String,
+    /// Its `identity_type`, as held.
+    pub(crate) identity_type: String,
+}
+
+/// v57.0.0 (CIRISPersist#988 item 2) — **resolve the hard_case attester**,
+/// before any mutation. Every emitter calls this first: the hard_case door
+/// below, and each backend's in-transaction emitters (the two trace
+/// erasures, the membership removal, the peer removal) BEFORE they open
+/// their transaction, because the row's attester must exist for the row's
+/// foreign key and a refusal must leave the act undone, never done
+/// unaudited.
+///
+/// A directory with no node identity, or one whose declared key it does not
+/// hold, refuses with [`Error::HardCaseAttesterUnavailable`] (named
+/// [`super::hard_case::refusal::ATTESTER_UNAVAILABLE`]).
+///
+/// It also rehomes any pre-v57 `hard_case_events` row that has no backing
+/// row yet ([`AttestationStore::rehome_legacy_hard_case_events`]): the first
+/// emitter after an upgrade, with the node's key in hand, moves the silo onto
+/// the plane.
+pub(crate) async fn hard_case_attester<D>(dir: &D) -> Result<HardCaseAttester, Error>
+where
+    D: AttestationStore,
+{
+    let key_id = dir
+        .node_key_id()
+        .ok_or(Error::HardCaseAttesterUnavailable {
+            reason: super::hard_case::refusal::NODE_KEY_UNSET,
+            node_key_id: None,
+        })?;
+    let identity_type = dir.attesting_identity_type(&key_id).await?.ok_or_else(|| {
+        Error::HardCaseAttesterUnavailable {
+            reason: super::hard_case::refusal::NODE_KEY_NOT_HELD,
+            node_key_id: Some(key_id.clone()),
+        }
+    })?;
+    let attester = HardCaseAttester {
+        key_id,
+        identity_type,
+    };
+    dir.rehome_legacy_hard_case_events(&attester, chrono::Utc::now())
+        .await?;
+    Ok(attester)
+}
+
+/// v57.0.0 (CIRISPersist#988 item 2) — what an in-transaction emitter does
+/// when this node has no attester for the row ([`hard_case_attester`]
+/// refused). Every ACT (an erasure, a peer removal, `record_hard_case`)
+/// resolves its attester before it moves anything and refuses typed there,
+/// so the only in-transaction emitter left without one is an observation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HardCaseEmitter {
+    /// An observation riding on a row being admitted (a membership removal
+    /// applied from a peer): not recorded, and the admission proceeds. A node
+    /// with no identity cannot attest what it saw, and refusing the removal
+    /// would leave the removed member keyed.
+    Observation,
+}
+
+impl HardCaseEmitter {
+    /// The outcome without an attester: logged, and the admission proceeds.
+    pub(crate) fn without_attester(self, event_id: &str, refusal: &str) -> Result<(), String> {
+        match self {
+            Self::Observation => {
+                tracing::warn!(
+                    event_id,
+                    refusal,
+                    "hard_case observation not recorded: this node has no attester"
+                );
+                Ok(())
+            }
+        }
+    }
+}
+
+/// A planned `hard_case:{kind}:v1` row and the `hard_case_events` row it
+/// projects to, written by the executor in one step.
+#[derive(Debug, Clone)]
+pub(crate) struct PlannedHardCase {
+    /// The local-tier row, exactly as stored.
+    pub(crate) row: Attestation,
+    /// [`super::hard_case::project_hard_case_row`] of `row`.
+    pub(crate) projection: super::hard_case::HardCaseEvent,
+}
+
+/// v57.0.0 (CIRISPersist#988 item 2, CC 3.1.9.4) — **the hard_case door's
+/// decision**, once for all three backends, and PURE: no directory read, no
+/// clock. That is what lets each backend call it inside its own transaction,
+/// after an erasure has counted what it deleted, so the row commits with the
+/// act it records (no erasure without its audit row, no audit row without
+/// the erasure).
+///
+/// The row: `scores`, dimension `hard_case:{kind}:v1`
+/// ([`super::hard_case::hard_case_dimension`]), attester = attested = the
+/// node key, `cohort_scope = self`, local tier, the event whole under the
+/// `hard_case` member, id derived from `event_id`
+/// ([`super::hard_case::hard_case_attestation_id`]). Its signature is
+/// deferred, as on every local-tier row this node attests (the
+/// `trace:complete:v1` precedent): the node signs as the actor at the
+/// crossing, and the crossing is held
+/// ([`super::hard_case::check_hard_case_replication_held`]).
+///
+/// The gates, in order: the envelope size, the dimension gate, the reserved
+/// genesis ids, the mirror and instant stamp, the size of the row as stored,
+/// the instant binding at `received_at`. A hard_case row judges no other row;
+/// its own signed instant is `fold_at` (a live door passes the receipt clock
+/// for both; the rehome passes the silo row's recorded `emitted_at`).
+///
+/// The #570 attribution gate is the `record_hard_case` DOOR's
+/// ([`record_hard_case_planned`]), as it was before v57: the in-transaction
+/// emitters build their own events, and the peer removal's
+/// `admin_action:peer_removal` carries a REQUIRED reason and an optional
+/// delegation (#721), which that gate would refuse.
+pub(crate) fn plan_hard_case_row(
+    event: &super::hard_case::HardCaseEvent,
+    attester: &HardCaseAttester,
+    instants: PlanInstants,
+) -> Result<PlannedHardCase, Error> {
+    use crate::federation::types::{attestation_type, cohort_scope, LocalAttestationInput};
+    let envelope = super::hard_case::hard_case_envelope(event)
+        .map_err(|e| Error::Backend(format!("hard_case envelope: {e}")))?;
+    crate::federation::admission::check_envelope_size_admission(&envelope)?;
+    let dimension = super::hard_case::hard_case_dimension(&event.kind);
+    crate::federation::admission::DimensionAdmissionPolicy::default().check(
+        attestation_type::SCORES,
+        Some(&dimension),
+        &attester.identity_type,
+    )?;
+    let attestation_id = super::hard_case::hard_case_attestation_id(&event.event_id);
+    let input = LocalAttestationInput {
+        attestation_id: Some(attestation_id.clone()),
+        attesting_key_id: attester.key_id.clone(),
+        attested_key_id: None,
+        attestation_type: attestation_type::SCORES.to_owned(),
+        weight: None,
+        expires_at: None,
+        attestation_envelope: crate::federation::envelope::EnvelopeCore::from_value(envelope)?,
+        subject_key_ids: Vec::new(),
+        cohort_scope: cohort_scope::SELF.to_owned(),
+        scrub_signature_classical: None,
+        scrub_signature_pqc: None,
+    };
+    // The row's signed instant is `fold_at` (PlanInstants: "the row's signed
+    // instant"): the receipt clock at a live door, the silo row's own
+    // recorded instant when a pre-v57 row is rehomed (never the boot clock).
+    let mut row = input.into_local_row(attestation_id, instants.fold_at);
+    crate::federation::genesis::check_genesis_attestation_reserved(&row)?;
+    crate::federation::envelope::RowMirror::stamp_local_row(&mut row, false)?;
+    crate::federation::admission::check_envelope_size_admission(&row.attestation_envelope)?;
+    crate::federation::admission::check_instant_binding(
+        &row,
+        instants.received_at,
+        crate::federation::admission::DEFAULT_MAX_TOUCH_SKEW,
+    )?;
+    row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+    let projection = super::hard_case::project_hard_case_row(&row).ok_or_else(|| {
+        Error::Backend(format!(
+            "hard_case row {} does not project: the door built a row its own projection \
+             cannot read",
+            row.attestation_id
+        ))
+    })?;
+    Ok(PlannedHardCase { row, projection })
+}
+
+/// v57.0.0 (CIRISPersist#988 item 2) — the door: every backend's
+/// `record_hard_case` is this call. The attribution gate runs first, so an
+/// unattributed admin action is refused naming which half is missing on a
+/// node with or without an identity (the #570 refusal, unchanged); then the
+/// attester, the one clock read, the plan, the write.
+pub(crate) async fn record_hard_case_planned<D>(
+    dir: &D,
+    event: super::hard_case::HardCaseEvent,
+) -> Result<(), Error>
+where
+    D: AttestationStore,
+{
+    super::hard_case::check_admin_action_attribution(&event)?;
+    let attester = hard_case_attester(dir).await?;
+    let now = chrono::Utc::now();
+    let planned = plan_hard_case_row(
+        &event,
+        &attester,
+        PlanInstants {
+            fold_at: now,
+            received_at: now,
+        },
+    )?;
+    dir.store_planned_hard_case(planned).await
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+//  v57.0.0 (CIRISPersist#988 item 3, CC 3.4.8) — the detection door
+// ─────────────────────────────────────────────────────────────────────────
+
+/// A planned `detection:{detector}:v1` row and the `detection_events` row it
+/// projects to.
+#[derive(Debug, Clone)]
+pub(crate) struct PlannedDetection {
+    /// The local-tier row, exactly as stored.
+    pub(crate) row: Attestation,
+    /// [`crate::derived::detection_row::project_detection_row`] of `row`.
+    pub(crate) projection: crate::derived::detection_row::DetectionProjection,
+}
+
+/// v57.0.0 (CIRISPersist#988 item 3, CC 3.4.8) — **the detection door's
+/// decision**, once for all three backends, and pure. The row: `scores`,
+/// dimension `detection:{detector}:v1`, attester = the detector's key
+/// (`signing_key_id`, whose `identity_type` is `attester_identity_type`),
+/// `cohort_scope = self`, local tier, the detection whole under the
+/// `detection` member, id derived from `detection_id`. Its own signature is
+/// deferred (the detector's hybrid signature over `canonical_bytes` rides in
+/// the body, verified by the caller); the detector signs the row as the actor
+/// at the crossing.
+///
+/// The gates: V008's shape (the three signature/digest lengths, the
+/// canonical-bytes bound, a live body or a whole tombstone), the envelope
+/// size, the dimension gate (the `detection:` reserved family:
+/// `lenscore_detector` only, CC 3.4.8), the reserved genesis ids, the mirror
+/// and instant stamp, the size as stored, the instant binding at
+/// `received_at`.
+pub(crate) fn plan_detection_row(
+    body: &crate::derived::detection_row::DetectionProjection,
+    attester_identity_type: &str,
+    instants: PlanInstants,
+) -> Result<PlannedDetection, Error> {
+    use crate::derived::detection_row as dr;
+    use crate::federation::types::{attestation_type, cohort_scope, LocalAttestationInput};
+    if let Some(reason) = dr::detection_shape_refusal(body) {
+        return Err(Error::InvalidArgument(reason));
+    }
+    let envelope = dr::detection_envelope(body)
+        .map_err(|e| Error::Backend(format!("detection envelope: {e}")))?;
+    crate::federation::admission::check_envelope_size_admission(&envelope)?;
+    let dimension = dr::detection_dimension(&body.detector);
+    crate::federation::admission::DimensionAdmissionPolicy::default().check(
+        attestation_type::SCORES,
+        Some(&dimension),
+        attester_identity_type,
+    )?;
+    let attestation_id = dr::detection_attestation_id(&body.detection_id);
+    let input = LocalAttestationInput {
+        attestation_id: Some(attestation_id.clone()),
+        attesting_key_id: body.signing_key_id.clone(),
+        attested_key_id: None,
+        attestation_type: attestation_type::SCORES.to_owned(),
+        weight: None,
+        expires_at: None,
+        attestation_envelope: crate::federation::envelope::EnvelopeCore::from_value(envelope)?,
+        subject_key_ids: Vec::new(),
+        cohort_scope: cohort_scope::SELF.to_owned(),
+        scrub_signature_classical: None,
+        scrub_signature_pqc: None,
+    };
+    // The row's signed instant is `fold_at` (PlanInstants: "the row's signed
+    // instant"): the receipt clock at a live door, the silo row's own
+    // recorded instant when a pre-v57 row is rehomed (never the boot clock).
+    let mut row = input.into_local_row(attestation_id, instants.fold_at);
+    crate::federation::genesis::check_genesis_attestation_reserved(&row)?;
+    crate::federation::envelope::RowMirror::stamp_local_row(&mut row, false)?;
+    crate::federation::admission::check_envelope_size_admission(&row.attestation_envelope)?;
+    crate::federation::admission::check_instant_binding(
+        &row,
+        instants.received_at,
+        crate::federation::admission::DEFAULT_MAX_TOUCH_SKEW,
+    )?;
+    row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+    let projection = dr::project_detection_row(&row).ok_or_else(|| {
+        Error::Backend(format!(
+            "detection row {} does not project: the door built a row its own projection \
+             cannot read",
+            row.attestation_id
+        ))
+    })?;
+    Ok(PlannedDetection { row, projection })
+}
+
+/// v57.0.0 (CIRISPersist#988 item 3) — a re-put of a detection whose row is
+/// held: V008's verdict, over the ROW (never the projection): the same
+/// `canonical_bytes` is an idempotent no-op, different bytes are a conflict,
+/// and an erased detection is not re-attached (no-op, as V080's NULL bytes
+/// were). A held row under the id that is not this detection's is a conflict.
+pub(crate) fn detection_reput_verdict(
+    held: &Attestation,
+    offered: &crate::derived::detection_row::DetectionProjection,
+) -> Result<(), Error> {
+    let Some(stored) = crate::derived::detection_row::project_detection_row(held) else {
+        return Err(Error::Conflict(format!(
+            "row {} is held and is not a detection",
+            held.attestation_id
+        )));
+    };
+    if stored.detection_id != offered.detection_id {
+        return Err(Error::Conflict(format!(
+            "row {} holds detection {}, not {}",
+            held.attestation_id, stored.detection_id, offered.detection_id
+        )));
+    }
+    match (&stored.canonical_bytes, &offered.canonical_bytes) {
+        (Some(a), Some(b)) if a != b => Err(Error::Conflict(format!(
+            "detection_id {} already exists with different canonical_bytes",
+            offered.detection_id
+        ))),
+        _ => Ok(()),
+    }
+}
+
+/// v57.0.0 (CIRISPersist#988 item 3) — the door: every backend's
+/// `put_detection_event` is this call. The detector's hybrid signature over
+/// `canonical_bytes` is the caller's to verify (the `DerivedSchema` verify
+/// boundary, unchanged); this decides and stores the row.
+pub(crate) async fn put_detection_planned<D>(
+    dir: &D,
+    event: &crate::derived::DetectionEvent,
+) -> Result<(), Error>
+where
+    D: AttestationStore,
+{
+    let received_at = chrono::Utc::now();
+    dir.rehome_legacy_detection_events(received_at).await?;
+    let body = crate::derived::detection_row::DetectionProjection::from(event);
+    let identity_type = dir
+        .attesting_identity_type(&event.signing_key_id)
+        .await?
+        .ok_or_else(|| Error::AttesterKeyUnknown {
+            attesting_key_id: event.signing_key_id.clone(),
+            plane: "detection",
+        })?;
+    let planned = plan_detection_row(
+        &body,
+        &identity_type,
+        PlanInstants {
+            fold_at: received_at,
+            received_at,
+        },
+    )?;
+    // A detection row a purge or an Art. 17 erasure tombstoned is not
+    // re-admitted: the tombstone outlives the row (the purge door's TOMBSTONED
+    // gate, the one the put door asks).
+    crate::federation::steward_purge::refuse_if_tombstoned_attestation(dir, &planned.row).await?;
+    let id = planned.row.attestation_id.clone();
+    if !dir.store_planned_detection(planned).await? {
+        if let Some(held) = dir.get_attestation(&id).await? {
+            detection_reput_verdict(&held, &body)?;
+        }
+    }
+    Ok(())
 }

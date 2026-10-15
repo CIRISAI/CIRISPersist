@@ -128,6 +128,74 @@ pub(crate) enum Class {
 ///   anything is stored. Classified by what they do, not what they are called.
 #[cfg(test)]
 pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
+    // v57.0.0 (CIRISPersist#988 items 2, 3) — the hard_case and detection
+    // doors. The two decisions are SHARED plans (pure; each backend's
+    // in-transaction emitters call `plan_hard_case_row` inside their own
+    // transaction). The put plan's two new refusals are Gates.
+    ("plan_hard_case_row", Class::Plan),
+    ("check_hard_case_replication_held", Class::Gate),
+    // The detection plan's V008 shape refusal (a Gate); the two envelope
+    // builders are serialization (Plumbing).
+    ("detection_shape_refusal", Class::Gate),
+    ("hard_case_envelope", Class::Plumbing),
+    ("detection_envelope", Class::Plumbing),
+    ("check_detection_body", Class::Gate),
+    // The same-file emit helpers: each plans a row (the shared plan) and
+    // stores it, so it carries the plan's sequence.
+    ("plan_peer_removal_event", Class::Delegates),
+    ("memory_record_hard_case_in_state", Class::Delegates),
+    ("sqlite_record_hard_case_in_tx", Class::Delegates),
+    ("pg_record_hard_case_in_tx", Class::Delegates),
+    // An observation through the `record_hard_case` door (another door):
+    // Delegates, so the door's plan is what the scan compares.
+    ("record_observation", Class::Delegates),
+    // Storage: the local-row INSERT, the projection writers, row mapping, the
+    // projection render, the scratch-table DDL. Plumbing: each fails only on
+    // the substrate's own terms (SQL, serialization); every refusal is the
+    // plan's, before them.
+    ("sqlite_insert_local_attestation_row", Class::Plumbing),
+    ("pg_insert_local_attestation_row", Class::Plumbing),
+    ("sqlite_store_hard_case", Class::Plumbing),
+    ("pg_store_hard_case", Class::Plumbing),
+    ("sqlite_project_hard_case", Class::Plumbing),
+    ("pg_project_hard_case", Class::Plumbing),
+    ("sqlite_project_detection", Class::Plumbing),
+    ("pg_project_detection", Class::Plumbing),
+    ("pg_row_to_hard_case_event", Class::Plumbing),
+    ("sqlite_render_table", Class::Plumbing),
+    ("pg_render_table", Class::Plumbing),
+    ("render", Class::Plumbing),
+    ("execute_batch", Class::Plumbing),
+    ("batch_execute", Class::Plumbing),
+    // The two projections (rows → table): a derivation that answers `None`
+    // for a row that is not its family's, never a refusal.
+    ("project_hard_case_row", Class::Plumbing),
+    ("project_detection_row", Class::Plumbing),
+    ("project_detection_row_under", Class::Plumbing),
+    // The DSAR door's Art. 17 erasure of row-backed detections: the
+    // hard-delete, the tombstone header + tombstones it builds (pure) and
+    // writes. Storage on a decision the erasure already made: Plumbing.
+    ("art17_erasure_execution", Class::Plumbing),
+    ("sqlite_art17_delete_detection_rows", Class::Plumbing),
+    ("pg_art17_delete_detection_rows", Class::Plumbing),
+    ("sqlite_put_art17_execution", Class::Plumbing),
+    ("pg_put_art17_execution", Class::Plumbing),
+    // Each backend's erasure recorder plans the erasure row(s) (the shared
+    // hard_case plan) and writes them with their tombstones: it carries the
+    // plan's sequence.
+    ("memory_plan_erasure", Class::Delegates),
+    ("sqlite_record_erasure", Class::Delegates),
+    ("pg_record_erasure", Class::Delegates),
+    // The pre-erasure move of attestable pre-v57 detections onto the plane:
+    // an executor step of the AttestationStore (its own door).
+    ("rehome_legacy_detection_events", Class::Plumbing),
+    // The attester read every hard_case act makes first: it REFUSES the act
+    // when this node cannot attest the row (`HardCaseAttesterUnavailable`).
+    ("hard_case_attester", Class::Gate),
+    // The purge door's detection-projection tombstone and its rebuild-side
+    // instant read: storage on a decision the purge door already made.
+    ("sqlite_tombstone_detection_projection", Class::Plumbing),
+    ("sqlite_detection_tombstone_instant", Class::Plumbing),
     // v56.0.0 (CIRISPersist#934 step 1) — the attestation plane's shared door
     // and the executor's one re-ask under its lock: each is a SHARED plan.
     ("put_attestation_planned", Class::Plan),
@@ -165,6 +233,31 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("purge_attestation_planned", Class::Plan),
     ("purge_genesis_delegation_row_planned", Class::Plan),
     ("delete_attestation", Class::Plumbing),
+    // v57.0.0 (CIRISPersist#934 step 2) — the community plane's shared doors
+    // (`put_community`, `apply_replicated_community`, the three roster
+    // doors), their plans (same-file halves), and the executor's storage
+    // steps, each itself a `CommunityStore` door compared across backends.
+    ("put_community_planned", Class::Plan),
+    ("apply_replicated_community_planned", Class::Plan),
+    ("put_community_membership_revocation_planned", Class::Plan),
+    ("put_community_membership_widening_planned", Class::Plan),
+    ("put_community_membership_listing_planned", Class::Plan),
+    ("plan_put_community", Class::Delegates),
+    ("plan_put_community_membership_revocation", Class::Delegates),
+    ("plan_put_community_membership_widening", Class::Delegates),
+    ("plan_put_community_membership_listing", Class::Delegates),
+    // (The three roster executors are each a shared door's tail call, which
+    // the scan does not record for Plumbing.)
+    ("store_planned_community", Class::Plumbing),
+    // The row as inserted: the hash and the wire-index locator, derived.
+    ("community_insert", Class::Plumbing),
+    // The `cfg(test)` rival write, reached through the executor trait; never
+    // armed outside a test.
+    ("rival_community_write_at", Class::Plumbing),
+    // The replicated door's typed verdict: a refusal of the caller's record
+    // (a #758 conflict, a degrading supersede) becomes the typed `Refused`
+    // outcome a cursor records. It decides the door's answer: a Gate.
+    ("replicated_community_outcome", Class::Gate),
     // ...and the local plan's own gates, seen for the first time with it:
     // the local-tier eligibility rule, the caller-signed transit verify, the
     // signed-instant read (refuses a malformed instant) and the local stamp
@@ -220,7 +313,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("caller_scope_from_directory", Class::Gate),
     ("canonicalize_in_place", Class::Gate),
     ("check", Class::Gate),
-    ("check_admin_action_attribution", Class::Gate),
     ("check_admissible", Class::Gate),
     ("check_admission_via_envelope", Class::Gate),
     ("check_attested_subject_admission", Class::Gate),
@@ -313,9 +405,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // of the one key-record store step; the replicated `Insert` arm reaches
     // the same helper with the replicated door.
     ("put_public_key_at_door", Class::Delegates),
-    // v50.0.0 (review, CIRISPersist#931) — Delegates: `put_community` and
-    // `apply_replicated_community` are the two doors of this one store step.
-    ("put_community_at_door", Class::Delegates),
     // v50.0.0 (PR #921 review) — Plumbing: the `cfg(test)` one-shot fault a
     // witness arms inside a backend door (`store::test_hooks`); never armed
     // outside a test, and it judges nothing about the caller's input.
@@ -617,7 +706,13 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // group doors: an identical re-put settles, a differing record is refused
     // unless its supersede proof names this node's prior version and passes
     // the group's own quorum. Gate — it refuses the caller's record.
-    ("route_occupied_community", Class::Gate),
+    // v57.0.0 (CIRISPersist#934 step 2) — the community half, split: the
+    // decision (a refusal of the caller's record: a Gate) ends the shared
+    // plan, and its write (a lost race to a DIFFERENT record stays a
+    // refusal; a chain apply that found the id empty re-asks the founding
+    // signers: a Gate) runs after it.
+    ("plan_occupied_community", Class::Gate),
+    ("apply_occupied_community", Class::Gate),
     ("route_occupied_family", Class::Gate),
     // v49.0.0 (CIRISPersist#910.5) — inside every backend's supersede
     // transaction: a proof over a version this node does not hold is refused
@@ -799,7 +894,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("read", Class::Plumbing),
     ("write", Class::Plumbing),
     ("recompute_and_assert_root", Class::Gate),
-    ("record_hard_case", Class::Delegates),
     ("references_attestation_id_from_envelope", Class::Plumbing),
     ("reject_future_dated_community_revocation", Class::Gate),
     ("reload_record_bytes", Class::Plumbing),
@@ -1054,6 +1148,19 @@ pub(crate) struct DeclaredDivergence {
 /// across the three backends, gate for gate and order for order.
 #[cfg(test)]
 pub(crate) const DECLARED_DIVERGENCES: &[DeclaredDivergence] = &[
+    // v57.0.0 (CIRISPersist#988 item 2) — the legacy rehome.
+    DeclaredDivergence {
+        trait_name: "AttestationStore",
+        method: "rehome_legacy_hard_case_events",
+        backend: "memory",
+        expected: &[],
+        reason: "The rehome moves pre-v57 `hard_case_events` rows (written before the table \
+                 became a projection) onto the plane. Only a durable store can hold such a row: \
+                 the memory backend starts empty every process and has written hard_case rows \
+                 through the plan since the first v57 build, so it has nothing to rehome and \
+                 its rehome plans nothing. Every row it does hold was planned by \
+                 `plan_hard_case_row` at its own door.",
+    },
     DeclaredDivergence {
         trait_name: "FederationDirectory",
         method: "put_revocation",
@@ -1143,7 +1250,7 @@ mod tests {
     /// The traits whose impls are compared, and where each trait's **default**
     /// bodies live. A backend that does not override a defaulted method runs
     /// the default, so the default's gate sequence is what it contributes.
-    const TRAITS: [(&str, &str); 4] = [
+    const TRAITS: [(&str, &str); 5] = [
         ("FederationDirectory", "src/federation/mod.rs"),
         ("BlobStorage", "src/federation/blobs.rs"),
         ("Backend", "src/store/backend.rs"),
@@ -1151,13 +1258,18 @@ mod tests {
         // methods are compared across backends like any door, so a decision
         // that drifts back into an executor is seen.
         ("AttestationStore", "src/federation/attestation_admit.rs"),
+        // v57.0.0 (CIRISPersist#934 step 2) — the community plane's executor.
+        ("CommunityStore", "src/federation/community_admit.rs"),
     ];
 
     /// v56.0.0 (CIRISPersist#934) — the shared plans, read from their own
     /// files: `(file, fn)`. Each body is held to the same [`CALL_CLASSES`]
     /// partition as a backend door, and its sequence is what a door's
     /// `plan:NAME` token stands for.
-    const SHARED_PLANS: [(&str, &str); 8] = [
+    const SHARED_PLANS: [(&str, &str); 15] = [
+        // v57.0.0 (CIRISPersist#988 items 2, 3).
+        ("src/federation/attestation_admit.rs", "plan_hard_case_row"),
+        ("src/federation/attestation_admit.rs", "plan_detection_row"),
         (
             "src/federation/attestation_admit.rs",
             "put_attestation_planned",
@@ -1187,6 +1299,24 @@ mod tests {
             "src/federation/attestation_admit.rs",
             "purge_genesis_delegation_row_planned",
         ),
+        // v57.0.0 (CIRISPersist#934 step 2) — the community plane.
+        ("src/federation/community_admit.rs", "put_community_planned"),
+        (
+            "src/federation/community_admit.rs",
+            "apply_replicated_community_planned",
+        ),
+        (
+            "src/federation/community_admit.rs",
+            "put_community_membership_revocation_planned",
+        ),
+        (
+            "src/federation/community_admit.rs",
+            "put_community_membership_widening_planned",
+        ),
+        (
+            "src/federation/community_admit.rs",
+            "put_community_membership_listing_planned",
+        ),
     ];
 
     /// v56.0.0 (CIRISPersist#934) — **the doors that decide nothing in a
@@ -1196,7 +1326,7 @@ mod tests {
     /// this list on the commit that moves its decision into a plan, and
     /// cannot drift back: a gate added to one backend's copy fails
     /// [`shared_doors_decide_nothing_in_a_backend`].
-    const SHARED_DOORS: [(&str, &str, &str); 9] = [
+    const SHARED_DOORS: [(&str, &str, &str); 14] = [
         (
             "FederationDirectory",
             "put_attestation_with_origin",
@@ -1239,6 +1369,32 @@ mod tests {
             "FederationDirectory",
             "purge_genesis_delegation_row_v31",
             "purge_genesis_delegation_row_planned",
+        ),
+        // v57.0.0 (CIRISPersist#934 step 2) — the community plane.
+        (
+            "FederationDirectory",
+            "put_community",
+            "put_community_planned",
+        ),
+        (
+            "FederationDirectory",
+            "apply_replicated_community",
+            "apply_replicated_community_planned",
+        ),
+        (
+            "FederationDirectory",
+            "put_community_membership_revocation",
+            "put_community_membership_revocation_planned",
+        ),
+        (
+            "FederationDirectory",
+            "put_community_membership_widening",
+            "put_community_membership_widening_planned",
+        ),
+        (
+            "FederationDirectory",
+            "put_community_membership_listing",
+            "put_community_membership_listing_planned",
         ),
     ];
 
@@ -2463,16 +2619,126 @@ mod tests {
             Reads::ReceivedAt,
         ),
         ("sealed_over", "check_reseal_admission", Reads::ReceivedAt),
+        // v57.0.0 (CIRISPersist#988 items 2, 3) — a hard_case or detection row
+        // judges no other row. Its signed instant is `fold_at` (the receipt
+        // clock at a live door, the silo row's own instant on a rehome); the
+        // instant binding is the receipt bound.
+        ("plan_hard_case_row", "into_local_row", Reads::FoldAt),
+        (
+            "plan_hard_case_row",
+            "check_instant_binding",
+            Reads::ReceivedAt,
+        ),
+        ("plan_detection_row", "into_local_row", Reads::FoldAt),
+        (
+            "plan_detection_row",
+            "check_instant_binding",
+            Reads::ReceivedAt,
+        ),
+        // v57.0.0 (CIRISPersist#934 step 2) — the community plane. A community
+        // record's two receipt-time folds read the clock before #934 and still
+        // read receipt (#1049 candidates): the members' in-force location
+        // proofs, and the founders' node-bearing (#925/#927, on both doors).
+        (
+            "plan_put_community",
+            "check_geographic_community_admission",
+            Reads::ReceivedAt,
+        ),
+        (
+            "plan_put_community",
+            "check_infrastructure_record_admission",
+            Reads::ReceivedAt,
+        ),
+        (
+            "plan_put_community",
+            "check_replicated_supersede_does_not_degrade",
+            Reads::ReceivedAt,
+        ),
+        // The roster planes: the future-skew bound at receipt; the #908
+        // authority and the #925 founder gates at the row's signed instant
+        // (`effective_at`), as before #934.
+        (
+            "plan_put_community_membership_revocation",
+            "reject_future_dated_community_revocation",
+            Reads::ReceivedAt,
+        ),
+        (
+            "plan_put_community_membership_revocation",
+            "check_community_roster_authority",
+            Reads::FoldAt,
+        ),
+        (
+            "plan_put_community_membership_revocation",
+            "check_infrastructure_founder_count_unchanged",
+            Reads::FoldAt,
+        ),
+        (
+            "plan_put_community_membership_widening",
+            "reject_future_dated_community_widening",
+            Reads::ReceivedAt,
+        ),
+        (
+            "plan_put_community_membership_widening",
+            "check_community_roster_authority",
+            Reads::FoldAt,
+        ),
+        (
+            "plan_put_community_membership_widening",
+            "check_infrastructure_founders_not_node",
+            Reads::FoldAt,
+        ),
+        (
+            "plan_put_community_membership_widening",
+            "check_infrastructure_founder_count_unchanged",
+            Reads::FoldAt,
+        ),
+        (
+            "plan_put_community_membership_listing",
+            "check_community_membership_listing",
+            Reads::ReceivedAt,
+        ),
     ];
 
-    /// The plan fns [`PLAN_INSTANTS`] covers, in `src/federation/attestation_admit.rs`.
-    const INSTANT_PLANS: [&str; 6] = [
-        "plan_put_attestation",
-        "recheck_cycle_under_lock",
-        "plan_attach_attestation_pqc_signature",
-        "plan_write_local_attestation",
-        "plan_reseal_attestation",
-        "sealed_over",
+    /// The plan fns [`PLAN_INSTANTS`] covers: `(file, fn)`.
+    const INSTANT_PLANS: [(&str, &str); 12] = [
+        // v57.0.0 (CIRISPersist#988 items 2, 3).
+        ("src/federation/attestation_admit.rs", "plan_hard_case_row"),
+        ("src/federation/attestation_admit.rs", "plan_detection_row"),
+        (
+            "src/federation/attestation_admit.rs",
+            "plan_put_attestation",
+        ),
+        (
+            "src/federation/attestation_admit.rs",
+            "recheck_cycle_under_lock",
+        ),
+        (
+            "src/federation/attestation_admit.rs",
+            "plan_attach_attestation_pqc_signature",
+        ),
+        (
+            "src/federation/attestation_admit.rs",
+            "plan_write_local_attestation",
+        ),
+        (
+            "src/federation/attestation_admit.rs",
+            "plan_reseal_attestation",
+        ),
+        ("src/federation/attestation_admit.rs", "sealed_over"),
+        // v57.0.0 (CIRISPersist#934 step 2) — the community plane's plans.
+        ("src/federation/community_admit.rs", "plan_put_community"),
+        (
+            "src/federation/community_admit.rs",
+            "plan_put_community_membership_revocation",
+        ),
+        (
+            "src/federation/community_admit.rs",
+            "plan_put_community_membership_widening",
+        ),
+        (
+            "src/federation/community_admit.rs",
+            "plan_put_community_membership_listing",
+        ),
     ];
 
     /// For every mention of `word` in `body`, the innermost CALL it is an
@@ -2529,11 +2795,10 @@ mod tests {
     /// column of the #934 inventory).
     #[test]
     fn every_plan_call_reads_its_declared_instant() {
-        let rel = "src/federation/attestation_admit.rs";
-        let stripped = strip_file(&read(rel));
-        let index = index_functions(&stripped);
         let mut derived: BTreeSet<(String, String, Reads)> = BTreeSet::new();
-        for plan in INSTANT_PLANS {
+        for (rel, plan) in INSTANT_PLANS {
+            let stripped = strip_file(&read(rel));
+            let index = index_functions(&stripped);
             let &(a, b) = index
                 .get(plan)
                 .and_then(|r| r.first())

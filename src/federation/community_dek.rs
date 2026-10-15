@@ -101,15 +101,20 @@ pub const COMMUNITY_REVOCATION_MAX_FUTURE_SKEW_SECS: i64 = 60;
 /// beyond [`COMMUNITY_REVOCATION_MAX_FUTURE_SKEW_SECS`] is
 /// [`Error::InvalidArgument`](crate::federation::Error::InvalidArgument)
 /// BEFORE any write, on every backend.
+///
+/// v57.0.0 (CIRISPersist#934 step 2) — `received_at` is the receiving node's
+/// clock at the door (the plan's `PlanInstants::received_at`); this gate reads
+/// no clock of its own.
 pub fn reject_future_dated_community_widening(
     effective_at: chrono::DateTime<chrono::Utc>,
+    received_at: chrono::DateTime<chrono::Utc>,
 ) -> Result<(), crate::federation::Error> {
     // v48.0.0 (CIRISPersist#860) — the same skew bound as a removal: a
     // widening is a roster event the fold orders by instant, and a
     // far-future instant would let a row sit unadmitted-in-effect for as long
     // as its signer chose.
-    let now = chrono::Utc::now();
-    let max_allowed = now + chrono::Duration::seconds(COMMUNITY_REVOCATION_MAX_FUTURE_SKEW_SECS);
+    let max_allowed =
+        received_at + chrono::Duration::seconds(COMMUNITY_REVOCATION_MAX_FUTURE_SKEW_SECS);
     if effective_at > max_allowed {
         return Err(crate::federation::Error::InvalidArgument(format!(
             "community membership widening effective_at {effective_at} is future-dated \
@@ -120,11 +125,14 @@ pub fn reject_future_dated_community_widening(
 }
 
 /// SecReview F4 — a community removal is immediate for forward-secrecy.
+/// v57.0.0 (CIRISPersist#934 step 2) — bounded against `received_at`, the
+/// receiving node's clock at the door.
 pub fn reject_future_dated_community_revocation(
     effective_at: chrono::DateTime<chrono::Utc>,
+    received_at: chrono::DateTime<chrono::Utc>,
 ) -> Result<(), crate::federation::Error> {
-    let now = chrono::Utc::now();
-    let max_allowed = now + chrono::Duration::seconds(COMMUNITY_REVOCATION_MAX_FUTURE_SKEW_SECS);
+    let max_allowed =
+        received_at + chrono::Duration::seconds(COMMUNITY_REVOCATION_MAX_FUTURE_SKEW_SECS);
     if effective_at > max_allowed {
         return Err(crate::federation::Error::InvalidArgument(format!(
             "community membership revocation effective_at {effective_at} is future-dated \
@@ -1541,8 +1549,9 @@ pub mod orchestrate {
     {
         use crate::federation::hard_case;
         for excluded in &result.excluded {
-            backend
-                .record_hard_case(hard_case::HardCaseEvent {
+            crate::federation::hard_case::record_observation(
+                backend,
+                hard_case::HardCaseEvent {
                     event_id: hard_case::recipient_excluded_event_id(
                         COMMUNITY,
                         excluded,
@@ -1557,9 +1566,10 @@ pub mod orchestrate {
                         "reason": "no_valid_encryption_pubkeys",
                     }),
                     emitted_at: observed_at,
-                })
-                .await
-                .map_err(|e| BlobError::Backend(format!("emit recipient_excluded: {e}")))?;
+                },
+            )
+            .await
+            .map_err(|e| BlobError::Backend(format!("emit recipient_excluded: {e}")))?;
         }
         Ok(())
     }

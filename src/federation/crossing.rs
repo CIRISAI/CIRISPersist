@@ -546,6 +546,10 @@ pub async fn plan_enter_mesh(
     if current.tier == attestation_tier::FEDERATION {
         return Ok(None);
     }
+    // v57.0.0 (CIRISPersist#988 item 2) — hard_case replication is held: the
+    // node's accountability rows stay at the local tier until peers carry
+    // their unpurgeable refusal (CIRISConstitution#170).
+    super::hard_case::check_hard_case_replication_held(current)?;
     // Deterministic on every backend: the signer's own instant, never a clock
     // read inside the storage layer. See `TierPromotionCustody::crossing_at`.
     let now = custody.crossing_at()?;

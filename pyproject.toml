@@ -76,7 +76,7 @@ classifiers = [
 # floor is the minor that ships the wheel-identity refusals (CIRISVerify#307)
 # the tag job's signer relies on.
 dependencies = [
-    "ciris-verify>=20.1.0,<21",
+    "ciris-verify>=20.2.0,<21",
 ]
 dynamic = ["version"]
 

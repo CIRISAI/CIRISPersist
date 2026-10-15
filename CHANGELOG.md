@@ -7,6 +7,309 @@ threat-model citations because this crate's audit story is the point.
 
 ## [Unreleased]
 
+## [57.0.0] - 2026-10-15
+
+### Fixed — tag CI: the restored cache repair runs `--strict` (v56.0.0 windows wheel)
+
+- No library code changed. The v56.0.0 tag run's `maturin abi3-py311 wheel
+  (windows-x86_64)` failed as v55.0.0's did (`out/bindgen.rs` missing under a
+  trusted `libsqlite3-sys` fingerprint) although the v55.0.1 repair ran: it
+  removed two other `libsqlite3-sys` units and KEPT the poisoned one as
+  "unverified, far from the cutoff". The single-cutoff bound assumes one
+  prune cycle; a unit no re-saving job compiles survives several, and its
+  file was pruned under an earlier cutoff. `.github/actions/ciriscache` now
+  runs `repair --strict`: every manifest-less build-script unit is dropped
+  (build scripts rerun, minutes) until a sealed save replaces the blob.
+  The v56.0.0 release body was set by hand, as v55.0.0's was.
+
+- The repair's CLI accepts `--strict` in either position (`repair --strict <dir>` is the restore action's form). PR #1093's first CI run printed usage and exited 2 on every job; the self-test now exercises the CLI (19 checks).
+
+### Changed — CIRISVerify v20.2.0 re-pin (CIRISVerify#309)
+
+- The seven Rust pins (`ciris-verify-core`, `ciris-keyring` ×4 targets,
+  `ciris-crypto`, the `server` feature set) move v20.1.0 → v20.2.0 together,
+  and the wheel's `Requires-Dist` floor to `ciris-verify>=20.2.0,<21` in
+  lockstep. v20.2.0 adds `ciris_crypto::transit_kex`, the A/V per-hop
+  transit key (CC 5.3.3.5 E1) that runs the hybrid X25519 + ML-KEM-768 KEX
+  against the static `transit_kex_pubkeys` pair persist stores on the
+  `transport_destination` binding since v56.0.0 (#1077). Persist stores the
+  pair; Edge runs the exchange. No persist API changes. `ciris-build-sign`
+  stays at the v20.1.0 prebuilt (no v20.2.0 GitHub release carries one).
+
+### Added — tooling: `scripts/cargo_guard.sh` (#1092)
+
+- One build at a time on the box (`flock`), an available-RAM floor (8 GB), and a
+  transient systemd user scope with `MemoryMax` (14 GB, no swap) so a runaway
+  cargo is OOM-killed inside its own scope instead of taking the session with
+  it (four sessions were lost that way during v55/v56). Every agent's cargo,
+  nextest and maturin call goes through it; exit 75/76 when the lock or the
+  floor is never met, 137 when the cap fires.
+
+### Changed — hard_case and detection onto the plane (#988 items 2, 3)
+
+Two silos become rows on the attestation plane. Each table stays, as the
+projection of its rows: written by the row's executor in the same
+transaction, never by anything else, and rebuildable from the rows alone
+(CC 2.4.2, `CLM-silo-projection-rebuildable`). Readers of the two tables
+(`list_hard_case_events`, `get_detection_events`, LensCore's SQL) see the
+same rows as before.
+
+- **`hard_case:{kind}:v1` rows (CC 3.1.9.4, `CLM-hard-case-on-base`).** Every
+  `hard_case` event is a `scores` row: attester = attested = this node's key,
+  `cohort_scope = self`, local tier, the event whole under the `hard_case`
+  member, the row id derived from `event_id` (so a re-record is still a
+  no-op). One pure plan, `attestation_admit::plan_hard_case_row`, decides it
+  for all three backends and all emitters: the `record_hard_case` door, and
+  the four emitters that record inside their own transaction (the two trace
+  erasures, the community membership removal, the peer removal), which plan
+  the row inside that transaction so it commits with the act it records. The
+  generic local door refuses `hard_case:` dimensions (`InvalidArgument`): the
+  hard_case door is the only writer.
+- **The row's signature is deferred**, as on every local-tier row this node
+  attests (the `trace:complete:v1` precedent): the node signs it as the
+  actor at the crossing. The crossing is held (below), so today the rows sit
+  at the local tier unsigned. Signing at write is not possible for the
+  in-transaction emitters (the hybrid signer is async; an erasure's counts
+  exist only inside its transaction).
+- **A host must hold a node key before any erasure or removal is recorded.**
+  The attester of every hard_case row is the node key (`set_node_key_id`),
+  and it must be held in `federation_keys` (`register_self_federation_key`).
+  Without one, every ACT that records a hard_case row is refused before it
+  mutates anything, with the new typed refusal
+  `Error::HardCaseAttesterUnavailable` (kind
+  `federation_hard_case_attester_unavailable`, the const
+  `hard_case::refusal::ATTESTER_UNAVAILABLE`; reason `node_key_unset` or
+  `node_key_not_held`). Python raises the new
+  `ciris_persist.NodeIdentityRequired` (a `PersistError`). The acts: both
+  trace erasures (`delete_traces_for_agent`,
+  `delete_traces_for_agent_id_hash`; refused even when they would delete
+  nothing, store error `store::Error::HardCaseAttesterUnavailable`), the peer
+  removal (after its own `PeerNotFound` / `HardRemoveWithActiveAttestations`
+  refusals), the `record_hard_case` door itself, and the host-run watchers
+  that call it. I962 shows each refusal and that the same erasure SUCCEEDS
+  once the node key is held, on memory, sqlite and postgres. An
+  OBSERVATION riding on another row's admission or a cascade (a membership
+  change, a liveness transition, a recipient excluded, a fast-path takedown
+  applied) records nothing and proceeds (`hard_case::record_observation`), so
+  a node with no identity still applies a peer's removal and rotates its key.
+  An `Engine` built with a signer sets the node key; a host that never
+  registered its own key with `register_self_federation_key` must do so.
+- **Unpurgeable, by the family table.** `hard_case:` joins
+  `migration::ACCOUNTABILITY_RECORD_PREFIXES`, the one list both purge doors
+  and the serve read consult (CIRISConstitution#170, the protective
+  direction). No door special-cases it.
+- **HELD: hard_case replication.** A `hard_case:*` row does not enter the
+  federation tier: `crossing::plan_enter_mesh` and the put door (which is also
+  the replicated apply) refuse it with the new
+  `Error::HardCaseReplicationHeld` (kind
+  `federation_hard_case_replication_held`, the const
+  `hard_case::refusal::REPLICATION_HELD`; Python `RuntimeError`, the posture
+  of `NoActorSignature`: a held door, not a caller fault). Local-tier rows are
+  never served, so no peer receives one. What unblocks it: CIRISConstitution#170
+  ruled (hard_case in CC 2.4.1.1's unpurgeable set), and a way to know which
+  peers carry the refusal (persist has no peer capability advertisement
+  today). Then `hard_case::check_hard_case_replication_held` becomes a
+  per-peer serve filter.
+- **The N4 proof carries both signed witnesses** (CC 6.1.1):
+  `witness::equivocation_hard_case` now puts the two conflicting corpus rows,
+  each with its Ed25519 and ML-DSA-65 halves, under `detail.witnesses`.
+- **`detection:{detector}:v1` rows (CC 3.4.8, `CLM-detection-on-base`).**
+  `put_detection_event` writes a local-tier `scores` row attested by the
+  detector's key, the detection whole under the `detection` member (bytes in
+  base64), the row id derived from `detection_id`; one pure plan,
+  `attestation_admit::plan_detection_row`, holds V008's shape gates and the
+  dimension gate. The `detection:` family is the detector-only reserved
+  family, so the door now refuses a `signing_key_id` whose `identity_type` is
+  not `lenscore_detector` (behaviour change; the caller's hybrid verify of
+  `canonical_bytes` is unchanged). The detector signs the row as the actor at
+  the crossing; a federation-tier `detection:*` row a detector emits itself
+  through `put_attestation` (hybrid-signed, replicable) projects too, after
+  `detection_row::check_detection_body`, when it is the detection's own row
+  (the id derived from its `detection_id`). The envelope names the scored
+  trace as `evidence_refs`. The re-put verdict (same bytes
+  no-op, different bytes `Conflict`) reads the held ROW, never the table.
+  `calibration_bundles` stays configuration.
+- **A detection's erasure goes through the purge door** (lead ruling: a
+  signed row is immutable bytes; one tombstone mechanism). The row's
+  `evidence_refs` names its trace, so a steward purge whose selection
+  reaches the trace derives the detection row ("scores over purged evidence
+  follow it"). While the purge tombstone stands, the projection row is the
+  V080 tombstone (linkage NULL, `erased_at` = the earliest-admitted
+  execution's `executed_at`), written by `purge_put_execution` in the same
+  transaction as the tombstone and rebuilt from it
+  (`detection_row::project_detection_row_under`); `purge_finalize` deletes
+  the row and its projection row goes with it. I825 shows the window and the
+  finalize on memory, sqlite and postgres.
+- **The DSAR erasure of a detection hard-deletes its signed row, and no
+  row remains.** Both DSAR doors (`delete_traces_for_agent_id_hash`,
+  `delete_traces_for_agent`) delete each row-backed detection of an erased
+  trace in the erasure's transaction. The row is found by its own
+  `detection.trace_id`, so a row a steward purge already tombstoned goes
+  too. Never a rewrite. The projection row leaves with it by cascade.
+  - **Behaviour change: an erased row-backed detection leaves NO row in
+    `detection_events`.** v56.0.0 kept a PII-free V080 remnant (linkage
+    NULL, analytics kept). No persist read door ever served it, so it was
+    reachable only by direct SQL on the host. `detection_events_tombstoned`
+    still counts the erased detection. The remnant was dropped rather than
+    carried on the erasure's row because `conformity_payload` and
+    `cohort_cell` are opaque consumer JSON: inside an unpurgeable, signed
+    `hard_case` row they could never be erased.
+  - **Pre-v57 rows.** Before its transaction, each door moves onto the plane
+    the pre-v57 detections it can attest, so they are erased the same way. A
+    pre-v57 row it cannot attest (its detector key not held, or not a
+    `lenscore_detector`) keeps the in-place V080 NULLing.
+    `detection_events_tombstoned` counts both kinds.
+  - **The Art. 17 header.** The erasure writes one `purge_executions` header
+    with `legal_basis` `steward_purge::ART17_ERASURE_BASIS`
+    (`"art17_erasure"`). Its claimant and executor are this node's key. It
+    has no cosignatures and is finalized at execution. Its notice is the
+    erasure's own `hard_case:trace_erasure:v1` row, which carries the counts,
+    `detection_rows_erased` and the `selection_digest`. One
+    attestation-plane tombstone per deleted row refuses the row's
+    re-admission: the TOMBSTONED gate, which `put_detection_event` asks too.
+    `list_purge_executions_since` never serves the header, on any backend.
+  - I964 shows it on memory, sqlite and postgres, through both doors.
+- **Memory holds detections.** The memory backend's `put_detection_event` /
+  `get_detection_events` returned `NotImplemented` / empty; they now run the
+  same door and projection, so every witness runs on all three backends.
+- **Migrations V194 (`hard_case_events`) and V195 (`detection_events`),**
+  sqlite and postgres: an `attestation_id` column naming each projection
+  row's row, `REFERENCES federation_attestations ON DELETE CASCADE` (a row
+  that leaves takes its projection row), a unique index on it, and a partial
+  index over the pre-v57 rows that have none. Those legacy rows are rehomed
+  onto the plane by the first emitter after the upgrade, each asserted at the
+  silo row's own recorded instant (`emitted_at` / `ts`, never the rehome's
+  clock), idempotently (a second boot adds nothing; I963 on sqlite and
+  postgres, memory's rehome a declared no-op)
+  (`rehome_legacy_hard_case_events`, with the node key in hand;
+  `rehome_legacy_detection_events`, with each detector's key, a legacy row
+  whose detector key is not held or not a `lenscore_detector` stays and the
+  rebuild gate reports it). **The rehome is lazy, and the gate shows it.**
+  `hard_case_events` rows move at the first hard_case emitter after the
+  upgrade. `detection_events` rows move at the first `put_detection_event`
+  or DSAR erasure. Until then `Engine::check_silo_projection` is RED. A
+  pre-v57 detection whose detector key is not held keeps it RED for good.
+  That is the operator-visible condition: register the detector's key and
+  emit once, or read the red as the record of a legacy row this node cannot
+  attest. Both tables join
+  `steward_purge::ATTESTATION_PROJECTIONS` as foreign-key cascades.
+- **The gate: `silo_projection::check_projection_rebuild`** (and
+  `Engine::check_silo_projection`, the live predicate). It rebuilds the
+  projection from every held row through the same writer into a scratch
+  table of the live table's shape, renders both in the backend's own column
+  encoding (sqlite `quote()`, postgres `row_to_json(..)::text`, memory serde)
+  and requires them byte-equal. I960 (hard_case) and I961 (detection) run it
+  on memory, sqlite and postgres, and tamper with one live column to show it
+  red.
+- **Python surface:** no signature changed. `list_hard_case_events`,
+  `put_detection_event`, `get_detection_events` and the erasure doors keep
+  their types. New: the exception class `NodeIdentityRequired`
+  (`PersistError`), raised by an erasure or a peer removal on a node with no
+  held node key. `put_detection_event` raises `ValueError` (the type of its
+  shape refusals) when the signer is not a `lenscore_detector` or is not
+  held.
+
+### Evidence — the register's hosted rows come home (#1091)
+
+No library code changed. `evidence/cc_impl.tsv` goes from 225 to 271 rows
+(46 added, none removed), each at the claim's own CC decimal under its claim
+id, so the CC's next re-pin can graduate them.
+
+- **27 claims** whose only CC pointer was a row the CIRISServer manifest
+  hosted for persist at ciris-persist@v17.0.1: 28 rows. 24 publish the
+  symbol the server named, which still exists here. Three duties moved:
+  `CLM-contributions` cites `holding_claim.rs#holding_claim_row` (the
+  retired `holds_bytes_attestation_envelope`'s successor, v55.0.0),
+  `CLM-local` cites `Engine::enter_mesh` (replaced `attestation_promote`
+  in v39.0.0), and `CLM-stream` cites `seal_stream_chunk` and
+  `open_stream_chunk` (`stream_nonce` is now a `ciris_crypto` re-export).
+- **13 symbols** persist already published at another decimal, now also at
+  the claim's own decimal (the nine the CC re-staged and the four it kept
+  established with a warning). The rows at the other decimals stay.
+- **`CLM-transit-kex-binding`** (CC 3.3.6.2, #1077), which shipped in
+  v56.0.0 without a row: five rows, `transit_kex_pair_for`, the two
+  `SignedTransportDestination` accessors, `transit_kex_pair_from_envelope`
+  and `verify_signed_transport_destination`.
+### Changed — the community and roster doors share one plan (#934 step 2)
+
+Five doors were written three times, once per backend, with byte-identical
+gate sequences. Each is now one shared door in `federation::community_admit`
+over a shared plan, and each backend keeps only a `CommunityStore` executor:
+row mapping, SQL, the transaction, the wire index and the `cfg(test)` rival
+hook. No behaviour changes.
+
+| door | before (v56.0.0 scan) | shared door | plan | executor |
+|---|---|---|---|---|
+| `put_community` | identical x3 (9 gates) | `put_community_planned` | `plan_put_community` | `store_planned_community` |
+| `apply_replicated_community` | gateless (delegated to the same per-backend body) | `apply_replicated_community_planned` | `plan_put_community` | `store_planned_community` |
+| `put_community_membership_revocation` | identical x3 (4 gates) | `put_community_membership_revocation_planned` | `plan_put_community_membership_revocation` | `store_planned_community_revocation` |
+| `put_community_membership_widening` | identical x3 (6 gates) | `put_community_membership_widening_planned` | `plan_put_community_membership_widening` | `store_planned_community_widening` |
+| `put_community_membership_listing` | identical x3 (1 gate) | `put_community_membership_listing_planned` | `plan_put_community_membership_listing` | `store_planned_community_listing` |
+
+- The `store::parity` scan now reports all five doors as `shared`, and
+  `SHARED_DOORS` holds them there. The per-backend `put_community_at_door`
+  bodies are gone.
+- **The occupied-id route splits into a decision and a write.**
+  `group_amendment::route_occupied_community` read and wrote in one call. It
+  is now `plan_occupied_community`, which reads only and ends the plan, and
+  `apply_occupied_community`, which writes the supersede or the trust-root
+  chain through the shared supersede door after the plan returns. The order
+  of every read and write is the same as before.
+- **The held-row settle stays the door's first statement**, ahead of the
+  plan. It reads the wire index, so the plans do not. I235 now reads the
+  settle from the four shared doors.
+- **Backend line counts**, before and after this cut:
+
+  | file | before | after | delta |
+  |---|---|---|---|
+  | `src/store/memory.rs` | 25,709 | 25,447 | −262 |
+  | `src/store/sqlite.rs` | 55,859 | 55,595 | −264 |
+  | `src/store/postgres.rs` | 52,727 | 52,482 | −245 |
+
+- **Each plan takes `PlanInstants`** and reads no clock. Each gate reads the
+  instant it read before #934. `store::parity`'s `PLAN_INSTANTS` now covers
+  the four community plans.
+
+  | plan | call | instant | before #934 |
+  |---|---|---|---|
+  | community | `check_geographic_community_admission` | `received_at` | clock (#1049 candidate: in-force location proofs) |
+  | community | `check_infrastructure_record_admission` | `received_at` | clock, two calls deep (#1049 candidate: founders' node-bearing) |
+  | community | `check_replicated_supersede_does_not_degrade` | `received_at` | clock, two calls deep (#1049 candidate) |
+  | revocation | `reject_future_dated_community_revocation` | `received_at` | clock (future-skew bound) |
+  | revocation | `check_community_roster_authority` | `fold_at` | `effective_at` |
+  | revocation | `check_infrastructure_founder_count_unchanged` | `fold_at` | `effective_at` |
+  | widening | `reject_future_dated_community_widening` | `received_at` | clock (future-skew bound) |
+  | widening | `check_community_roster_authority`, `check_infrastructure_founders_not_node`, `check_infrastructure_founder_count_unchanged` | `fold_at` | `effective_at` |
+  | listing | `check_community_membership_listing` | `received_at` | clock (future-skew bound) |
+
+  `fold_at` is the row's signed instant: `effective_at` for the three roster
+  rows, and the record's head instant for a community record. No community
+  record gate reads `fold_at` yet.
+
+**Adopter-visible.** Gate signatures now take an explicit instant. To keep
+the previous behaviour, pass `chrono::Utc::now()`.
+
+- `community_dek::reject_future_dated_community_revocation` and
+  `reject_future_dated_community_widening` take `received_at`.
+- `listing::reject_future_dated_community_listing` and
+  `listing::check_community_membership_listing` take `received_at`.
+- `admission::check_infrastructure_record_admission`,
+  `check_replicated_supersede_does_not_degrade` and
+  `check_infrastructure_community_conformance` take `at`. The supersede door
+  (`supersede_group_row`) still passes the clock.
+
+### Known gap — the community plane after #934 step 2
+
+- **Clock reads two or more calls deep.** `check_trust_root_at_door`
+  (through `check_trust_root_community_admission`) and the trust-root chain
+  apply in `apply_occupied_community` still read the clock inside
+  `canonical_community`. They were not re-plumbed in this step.
+- **The occupied-id write still re-asks after a write.** A trust-root chain
+  apply that finds the id empty re-runs the founding-signer check before the
+  insert, inside `apply_occupied_community`, as it did before.
+- **Non-row reads.** The settle reads the wire index before the plan. The
+  plans read the directory's community, key and location-proof rows only.
+
 ## [56.0.0] - 2026-10-14
 
 ### Security — rustls 0.23.46 (RUSTSEC-2026-0346, RUSTSEC-2026-0347)

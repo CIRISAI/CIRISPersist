@@ -5570,7 +5570,15 @@ mod tests {
         // the real backend method (NOT the `Backend("… not implemented")`
         // trait default the proxy would otherwise inherit).
         let rt = test_runtime();
-        let (dir, directory) = memory_directory();
+        // v57.0.0 (#988 item 2) — the removal's hard_case row needs this
+        // node's key.
+        let backend: Arc<MemoryBackend> = Arc::new(MemoryBackend::new());
+        rt.block_on(crate::federation::hard_case::test_support::declare_node(
+            &*backend,
+            "capsule-node",
+        ));
+        let dir: Arc<dyn FederationDirectory> = backend;
+        let directory = build_persist_directory(dir.clone());
 
         // AddPeerRecord → Unit, and the row is really there.
         let added = run_op(

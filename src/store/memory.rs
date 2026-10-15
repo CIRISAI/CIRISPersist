@@ -386,7 +386,20 @@ struct State {
     /// the `hard_case:*` emission surface, keyed by the deterministic
     /// `event_id` (idempotent insert = no-op on conflict). Parity with the
     /// postgres/sqlite `hard_case_events` table (V075).
-    federation_hard_case_events: HashMap<String, crate::federation::hard_case::HardCaseEvent>,
+    ///
+    /// v57.0.0 (CIRISPersist#988 item 2, V194 mirror) — a PROJECTION of the
+    /// `hard_case:{kind}:v1` rows, each entry carrying the `attestation_id`
+    /// of the row it came from; [`prune_row_projections`] drops an entry
+    /// whose row left (the SQL backends' `ON DELETE CASCADE`).
+    federation_hard_case_events:
+        HashMap<String, (String, crate::federation::hard_case::HardCaseEvent)>,
+    /// v57.0.0 (CIRISPersist#988 item 3, V195 mirror) — the
+    /// `detection_events` projection of the `detection:{detector}:v1` rows,
+    /// keyed by `detection_id`, each entry carrying its row's
+    /// `attestation_id`. Memory held no detection substrate before v57; the
+    /// row door gives it one, so the projection witness runs here too.
+    derived_detection_events:
+        HashMap<String, (String, crate::derived::detection_row::DetectionProjection)>,
     /// v8.0.0 (CIRISPersist#227) — fountain `content_manifest` rows,
     /// keyed by the `(content_id, corpus_kind)` PK. NEVER evicted.
     /// Parity with the postgres/sqlite `content_manifest` table (V084).
@@ -1004,6 +1017,7 @@ impl Default for MemoryBackend {
                 transport_destination_sigs: HashMap::new(),
                 freshness_floor: HashMap::new(),
                 federation_hard_case_events: HashMap::new(),
+                derived_detection_events: HashMap::new(),
                 fountain_manifests: HashMap::new(),
                 fountain_symbols: HashMap::new(),
                 installed_storage_budgets: HashMap::new(),
@@ -1072,6 +1086,27 @@ impl MemoryBackend {
         &self.test_hooks
     }
 
+    /// v57.0.0 (CIRISPersist#988, I960) — a `hard_case_events` entry no row
+    /// produces: the projection witness's red on the backend with no SQL.
+    #[cfg(test)]
+    pub(crate) fn test_insert_orphan_hard_case_projection(&self, event_id: &str) {
+        let mut state = self.state.lock().expect("memory backend lock");
+        state.federation_hard_case_events.insert(
+            event_id.to_owned(),
+            (
+                format!("{event_id}-no-row"),
+                crate::federation::hard_case::HardCaseEvent {
+                    event_id: event_id.to_owned(),
+                    kind: "orphan".into(),
+                    target_key_id: None,
+                    subject_key_id: None,
+                    detail: serde_json::json!({}),
+                    emitted_at: chrono::Utc::now(),
+                },
+            ),
+        );
+    }
+
     /// v54.1.0 (CIRISPersist#1044, I621) — hold a key row past every
     /// `put_public_key` gate, as a node that admitted it under an older rule
     /// does. Test-only: the role-gated rows a witness needs cannot clear the
@@ -1097,12 +1132,11 @@ impl MemoryBackend {
         at: crate::store::test_hooks::RivalPoint,
     ) -> Result<(), crate::federation::Error> {
         if let Some(rival) = self.test_hooks.take_rival_at(at) {
-            Box::pin(
-                self.put_community_at_door(
-                    rival,
-                    crate::federation::CommunityDoor::ReplicatedApply,
-                ),
-            )
+            Box::pin(crate::federation::community_admit::put_community_planned(
+                self,
+                rival,
+                crate::federation::CommunityDoor::ReplicatedApply,
+            ))
             .await?;
         }
         Ok(())
@@ -2152,6 +2186,15 @@ impl Backend for MemoryBackend {
         signature_key_id: &str,
         include_federation_key: bool,
     ) -> Result<super::types::DeleteSummary, Error> {
+        // v57.0.0 (CIRISPersist#988 item 2) — the audit row's attester, read
+        // before the lock (the SQL backends read it before their transaction).
+        // An act: refused, typed, before anything moves when this node cannot
+        // attest its audit row (CIRISPersist#988 ruling: a host must hold a
+        // node key before any erasure is recorded).
+        let attester = crate::federation::attestation_admit::hard_case_attester(self)
+            .await
+            .map_err(Error::from_hard_case_attester)?;
+        let received_at = chrono::Utc::now();
         let mut state = self.state.lock().expect("memory backend lock");
         // Per-key DSAR scope: both agent_id_hash AND signing_key_id
         // must match. trace_llm_calls cascade joins by trace_id
@@ -2166,6 +2209,11 @@ impl Backend for MemoryBackend {
             .filter(|(_, row)| row_matches(row))
             .map(|(_, row)| row.trace_id.clone())
             .collect();
+        // v57.0.0 (CIRISPersist#988 item 3; lead ruling on the DSAR path) —
+        // the erased traces' row-backed detections are hard-deleted and leave
+        // no projection row. Found BEFORE anything moves.
+        let erased_rows = memory_find_detection_rows(&state, &target_trace_ids);
+        let detection_events_tombstoned = erased_rows.len() as u64;
 
         let trace_events_before = state.events.len();
         state.events.retain(|_, (_, row)| !row_matches(row));
@@ -2236,6 +2284,7 @@ impl Backend for MemoryBackend {
             });
             federation_attestations_deleted =
                 (atts_before - state.federation_attestations.len()) as u64;
+            prune_row_projections(&mut state);
 
             // Now safe to delete the federation_keys rows.
             let keys_before = state.federation_keys.len();
@@ -2252,28 +2301,33 @@ impl Backend for MemoryBackend {
             || federation_keys_deleted > 0
             || federation_attestations_deleted > 0
             || federation_revocations_deleted > 0
+            || detection_events_tombstoned > 0
         {
-            let event_id = uuid::Uuid::new_v4().to_string();
-            state.federation_hard_case_events.insert(
-                event_id.clone(),
-                crate::federation::hard_case::HardCaseEvent {
-                    event_id,
-                    kind: crate::federation::hard_case::kind::TRACE_ERASURE.to_owned(),
-                    target_key_id: Some(agent_id_hash.to_owned()),
-                    subject_key_id: None,
-                    detail: serde_json::json!({
-                        "op": "delete_traces_for_agent",
-                        "agent_id_hash": agent_id_hash,
-                        "signing_key_id": signature_key_id,
-                        "trace_events": trace_events_deleted,
-                        "trace_llm_calls": trace_llm_calls_deleted,
-                        "federation_keys": federation_keys_deleted,
-                        "federation_attestations": federation_attestations_deleted,
-                        "federation_revocations": federation_revocations_deleted,
-                    }),
-                    emitted_at: chrono::Utc::now(),
-                },
+            let mut event = crate::federation::hard_case::HardCaseEvent {
+                event_id: uuid::Uuid::new_v4().to_string(),
+                kind: crate::federation::hard_case::kind::TRACE_ERASURE.to_owned(),
+                target_key_id: Some(agent_id_hash.to_owned()),
+                subject_key_id: None,
+                detail: serde_json::json!({
+                    "op": "delete_traces_for_agent",
+                    "agent_id_hash": agent_id_hash,
+                    "signing_key_id": signature_key_id,
+                    "trace_events": trace_events_deleted,
+                    "trace_llm_calls": trace_llm_calls_deleted,
+                    "federation_keys": federation_keys_deleted,
+                    "federation_attestations": federation_attestations_deleted,
+                    "federation_revocations": federation_revocations_deleted,
+                    "detection_events_tombstoned": detection_events_tombstoned,
+                }),
+                emitted_at: received_at,
+            };
+            crate::federation::hard_case::bind_erased_detection_rows(
+                &mut event.detail,
+                &erased_rows,
             );
+            let plan = memory_plan_erasure(&attester, &event, &erased_rows, received_at)
+                .map_err(|e| Error::Backend(format!("dsar: {e}")))?;
+            memory_apply_erasure(&mut state, &erased_rows, plan);
         }
 
         Ok(super::types::DeleteSummary {
@@ -2290,6 +2344,22 @@ impl Backend for MemoryBackend {
         &self,
         agent_id_hash: &str,
     ) -> Result<super::types::ErasureSummary, Error> {
+        // v57.0.0 (CIRISPersist#988 item 2) — the audit row's attester, read
+        // before the lock. An act: refused, typed, before anything moves when
+        // this node cannot attest its audit row (lead ruling: a host must hold
+        // a node key before any erasure is recorded).
+        let attester = crate::federation::attestation_admit::hard_case_attester(self)
+            .await
+            .map_err(Error::from_hard_case_attester)?;
+        // v57.0.0 (#988 item 3) — a pre-v57 detection this node can attest
+        // to its detector is moved onto the plane first (memory holds none:
+        // a declared no-op, kept so the three doors read alike).
+        {
+            use crate::federation::attestation_admit::AttestationStore as _;
+            self.rehome_legacy_detection_events(chrono::Utc::now())
+                .await
+                .map_err(|e| Error::Backend(format!("rehome before erasure: {e}")))?;
+        }
         let erased_at = chrono::Utc::now();
         let mut state = self.state.lock().expect("memory backend lock");
 
@@ -2303,49 +2373,48 @@ impl Backend for MemoryBackend {
             .map(|(_, row)| row.trace_id.clone())
             .collect();
 
-        let events_before = state.events.len();
+        // Decided under the lock BEFORE anything moves (the SQL backends'
+        // transaction): the counts, the detection rows, the audit row and its
+        // tombstones. A refusal of the plan leaves everything as it was.
+        let trace_events = state
+            .events
+            .values()
+            .filter(|(_, row)| row.agent_id_hash == agent_id_hash)
+            .count() as u64;
+        let trace_llm_calls = state
+            .llm_calls
+            .iter()
+            .filter(|row| target_trace_ids.contains(&row.trace_id))
+            .count() as u64;
+        // v57.0.0 (CIRISPersist#988 item 3; lead ruling on S1 item 5) — a
+        // ROW-BACKED detection of an erased trace is a signed row: it is
+        // HARD-DELETED (the DSAR door's treatment of signed rows), never
+        // rewritten, under a purge tombstone (`ART17_ERASURE_BASIS`). Memory
+        // holds no pre-v57 silo rows.
+        let erased_rows = memory_find_detection_rows(&state, &target_trace_ids);
+        let detection_events_tombstoned = erased_rows.len() as u64;
+        let plan = if trace_events > 0 || trace_llm_calls > 0 || detection_events_tombstoned > 0 {
+            let event = crate::federation::hard_case::trace_erasure_event(
+                agent_id_hash,
+                trace_events,
+                trace_llm_calls,
+                detection_events_tombstoned,
+                &erased_rows,
+                erased_at,
+            );
+            memory_plan_erasure(&attester, &event, &erased_rows, erased_at)
+                .map_err(|e| Error::Backend(format!("erasure: {e}")))?
+        } else {
+            MemoryErasurePlan::default()
+        };
+
         state
             .events
             .retain(|_, (_, row)| row.agent_id_hash != agent_id_hash);
-        let trace_events = (events_before - state.events.len()) as u64;
-
-        let llm_before = state.llm_calls.len();
         state
             .llm_calls
             .retain(|row| !target_trace_ids.contains(&row.trace_id));
-        let trace_llm_calls = (llm_before - state.llm_calls.len()) as u64;
-
-        // detection_events tombstone: the memory backend has no
-        // cirislens_derived storage (DerivedSchema put paths return
-        // NotImplemented), so there is nothing to tombstone. Always 0;
-        // the postgres/sqlite backends carry the real tombstone path.
-        let detection_events_tombstoned = 0u64;
-
-        // Audit emit — record a `hard_case:trace_erasure` row, mirroring
-        // the durable hard_case_events surface (atomic with the deletes
-        // since the whole op holds the single state lock). Emit only when
-        // something was actually erased, so an idempotent re-run stays a
-        // clean no-op.
-        if trace_events > 0 || trace_llm_calls > 0 {
-            let event_id = uuid::Uuid::new_v4().to_string();
-            let detail = serde_json::json!({
-                "agent_id_hash": agent_id_hash,
-                "trace_events": trace_events,
-                "trace_llm_calls": trace_llm_calls,
-                "detection_events_tombstoned": detection_events_tombstoned,
-            });
-            state.federation_hard_case_events.insert(
-                event_id.clone(),
-                crate::federation::hard_case::HardCaseEvent {
-                    event_id,
-                    kind: crate::federation::hard_case::kind::TRACE_ERASURE.to_owned(),
-                    target_key_id: Some(agent_id_hash.to_owned()),
-                    subject_key_id: None,
-                    detail,
-                    emitted_at: erased_at,
-                },
-            );
-        }
+        memory_apply_erasure(&mut state, &erased_rows, plan);
 
         Ok(super::types::ErasureSummary {
             trace_events,
@@ -3011,47 +3080,14 @@ impl crate::federation::attestation_admit::AttestationStore for MemoryBackend {
             state
                 .federation_attestations
                 .retain(|a| !replaced.contains(&a.attestation_id));
+            prune_row_projections(&mut state);
             // v45.0.0 (#871) — a replaced row's rendition leaves the V149
             // mirror with it.
             state
                 .blob_renditions
                 .retain(|r| !replaced.contains(&r.source_attestation_id));
         }
-        // v18.0.0 (#473) — the INSERT OR IGNORE twin: an id still held here (a
-        // concurrent writer took it after the plan read it free) is a no-op.
-        if state
-            .federation_attestations
-            .iter()
-            .any(|a| a.attestation_id == row.attestation_id)
-        {
-            return Ok(());
-        }
-        // v45.0.0 (CIRISPersist#871, FSD §5) — the V149 `blob_renditions`
-        // mirror at the local door, under the same lock as the push below.
-        project_rendition_row(&mut state, &row);
-        // v17.4.0 (V106) — maintain the subject-index mirror at local tier.
-        for subj in &row.subject_key_ids {
-            state
-                .subject_index
-                .entry(subj.clone())
-                .or_default()
-                .push(row.attestation_id.clone());
-        }
-        // v36.0.0 (#668) — serve position (V130 mirror).
-        let admitted_at = next_plane_position(
-            &state,
-            PLANE_ATTESTATION,
-            attestation_rows(&state).into_iter(),
-        );
-        let id_for_stamp = row.attestation_id.clone();
-        // v50.0.0 (review H2, final check, 3d) — a local `withdraws`'s depth.
-        if let Some(depth) = withdraws_depth {
-            state
-                .federation_withdraws_admission_depths
-                .insert(row.attestation_id.clone(), depth);
-        }
-        state.federation_attestations.push(row);
-        stamp_plane_position(&mut state, PLANE_ATTESTATION, id_for_stamp, admitted_at);
+        memory_insert_local_row(&mut state, row, withdraws_depth);
         Ok(())
     }
 
@@ -3124,7 +3160,113 @@ impl crate::federation::attestation_admit::AttestationStore for MemoryBackend {
             ids.retain(|id| id != attestation_id);
         }
         state.subject_index.retain(|_, ids| !ids.is_empty());
+        // v57.0.0 (#988) — and the V194/V195 projections.
+        prune_row_projections(&mut state);
         Ok(true)
+    }
+
+    async fn store_planned_hard_case(
+        &self,
+        planned: crate::federation::attestation_admit::PlannedHardCase,
+    ) -> Result<(), crate::federation::Error> {
+        let mut state = self.state.lock().expect("memory backend lock");
+        memory_store_hard_case(&mut state, planned);
+        Ok(())
+    }
+
+    /// Memory holds no pre-v57 silo rows: nothing to rehome.
+    async fn rehome_legacy_hard_case_events(
+        &self,
+        _attester: &crate::federation::attestation_admit::HardCaseAttester,
+        _received_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), crate::federation::Error> {
+        Ok(())
+    }
+
+    async fn store_planned_detection(
+        &self,
+        planned: crate::federation::attestation_admit::PlannedDetection,
+    ) -> Result<bool, crate::federation::Error> {
+        let mut state = self.state.lock().expect("memory backend lock");
+        let crate::federation::attestation_admit::PlannedDetection { row, projection } = planned;
+        let attestation_id = row.attestation_id.clone();
+        if !memory_insert_local_row(&mut state, row, None) {
+            return Ok(false);
+        }
+        state.derived_detection_events.insert(
+            projection.detection_id.to_string(),
+            (attestation_id, projection),
+        );
+        Ok(true)
+    }
+
+    /// Memory held no detection substrate before v57: nothing to rehome.
+    async fn rehome_legacy_detection_events(
+        &self,
+        _received_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), crate::federation::Error> {
+        Ok(())
+    }
+
+    async fn projection_rebuild(
+        &self,
+        projection: crate::federation::silo_projection::SiloProjection,
+    ) -> Result<crate::federation::silo_projection::ProjectionRebuild, crate::federation::Error>
+    {
+        use crate::federation::silo_projection::SiloProjection;
+        let state = self.state.lock().expect("memory backend lock");
+        // Each entry rendered as its serde form, keyed and ordered like the
+        // SQL tables' primary keys; the rebuild projects every held row
+        // through the same function the writers use.
+        fn render<T: serde::Serialize>(
+            map: std::collections::BTreeMap<String, (String, T)>,
+        ) -> Result<Vec<String>, crate::federation::Error> {
+            map.into_iter()
+                .map(|(k, (id, v))| {
+                    serde_json::to_string(&(k, id, v)).map_err(|e| {
+                        crate::federation::Error::Backend(format!("projection render: {e}"))
+                    })
+                })
+                .collect()
+        }
+        let (live, rebuilt) = match projection {
+            SiloProjection::HardCaseEvents => {
+                let live = state
+                    .federation_hard_case_events
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                let rebuilt = state
+                    .federation_attestations
+                    .iter()
+                    .filter_map(|row| {
+                        crate::federation::hard_case::project_hard_case_row(row)
+                            .map(|e| (e.event_id.clone(), (row.attestation_id.clone(), e)))
+                    })
+                    .collect();
+                (render(live)?, render(rebuilt)?)
+            }
+            SiloProjection::DetectionEvents => {
+                let live = state
+                    .derived_detection_events
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                let rebuilt = state
+                    .federation_attestations
+                    .iter()
+                    .filter_map(|row| {
+                        crate::derived::detection_row::project_detection_row_under(
+                            row,
+                            memory_detection_tombstone_instant(&state, &row.attestation_id),
+                        )
+                        .map(|p| (p.detection_id.to_string(), (row.attestation_id.clone(), p)))
+                    })
+                    .collect();
+                (render(live)?, render(rebuilt)?)
+            }
+        };
+        Ok(crate::federation::silo_projection::ProjectionRebuild { live, rebuilt })
     }
 
     async fn store_planned_attestation(
@@ -3154,6 +3296,7 @@ impl crate::federation::attestation_admit::AttestationStore for MemoryBackend {
             row,
             withdraws_depth,
             projected_trace,
+            projected_detection,
             wire_index_key,
             ..
         } = planned;
@@ -3237,6 +3380,14 @@ impl crate::federation::attestation_admit::AttestationStore for MemoryBackend {
             // v45.0.0 (CIRISPersist#871, FSD §5) — maintain the V149
             // `blob_renditions` mirror under the same lock, before `row` moves.
             project_rendition_row(&mut state, &row);
+            // v57.0.0 (CIRISPersist#988 item 3) — the V195 `detection_events`
+            // mirror, under the same lock.
+            if let Some(detection) = projected_detection {
+                state.derived_detection_events.insert(
+                    detection.detection_id.to_string(),
+                    (row.attestation_id.clone(), detection),
+                );
+            }
             // v36.0.0 (#668) — serve position (V130 mirror).
             let admitted_at = next_plane_position(
                 &state,
@@ -3458,6 +3609,16 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                     state
                         .signed_wire_index
                         .retain(|(kind, _), v| !(kind == "Attestation" && *v == rk));
+                    // v57.0.0 (CIRISPersist#988 item 3) — a tombstoned
+                    // detection row's projection is the V080 tombstone, in
+                    // the same write.
+                    if let Some(at) = state
+                        .purge_executions
+                        .get(&t.notice_id)
+                        .map(|e| e.executed_at)
+                    {
+                        memory_tombstone_detection_projection(&mut state, &t.record_ref, at);
+                    }
                 }
             }
         }
@@ -3538,6 +3699,8 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                     (e.admitted_at, e.notice_id.as_str()) > (*at, id.as_str())
                 })
             })
+            // v57.0.0 — an Art. 17 erasure's header is never served.
+            .filter(|e| e.legal_basis != crate::federation::steward_purge::ART17_ERASURE_BASIS)
             .cloned()
             .collect();
         out.sort_by(|a, b| {
@@ -3582,6 +3745,8 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             ids.retain(|id| id != attestation_id);
         }
         state.subject_index.retain(|_, ids| !ids.is_empty());
+        // v57.0.0 (#988) — and the V194/V195 projections.
+        prune_row_projections(&mut state);
         Ok(true)
     }
 
@@ -4898,6 +5063,13 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             .federation_withdraws_admission_depths
             .remove(attestation_id);
         state.federation_trust_direction_held.remove(attestation_id);
+        // v57.0.0 (#988) — the V194/V195 projections of the row.
+        state
+            .federation_hard_case_events
+            .retain(|_, (id, _)| id != attestation_id);
+        state
+            .derived_detection_events
+            .retain(|_, (id, _)| id != attestation_id);
         Ok(())
     }
 
@@ -6404,8 +6576,12 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         &self,
         community: crate::federation::SignedCommunity,
     ) -> Result<(), crate::federation::Error> {
-        self.put_community_at_door(community, crate::federation::CommunityDoor::Local)
-            .await?;
+        crate::federation::community_admit::put_community_planned(
+            self,
+            community,
+            crate::federation::CommunityDoor::Local,
+        )
+        .await?;
         Ok(())
     }
 
@@ -6418,12 +6594,8 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         &self,
         community: crate::federation::SignedCommunity,
     ) -> Result<crate::federation::ReplicatedCommunityOutcome, crate::federation::Error> {
-        // PR #921 review (Codex F3) — the outcome is what the write did, as
-        // the write saw it; no read taken before it.
-        let stored = self
-            .put_community_at_door(community, crate::federation::CommunityDoor::ReplicatedApply)
-            .await;
-        crate::federation::group_amendment::replicated_community_outcome(stored)
+        crate::federation::community_admit::apply_replicated_community_planned(self, community)
+            .await
     }
 
     fn trust_root_standing_cache(
@@ -7163,7 +7335,9 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // `.entry().or_insert()` matched the SQL backends' idempotent upsert —
         // which is exactly what made it invisible. It was one gate away from a
         // hole, permanently, on the arm nobody watches.
-        crate::federation::FederationDirectory::record_hard_case(self, removal_event).await?;
+        // v57.0.0 (CIRISPersist#988 item 2) — an observation: a node with no
+        // attester records nothing; the removal already landed.
+        crate::federation::hard_case::record_observation(self, removal_event).await?;
         Ok(())
     }
 
@@ -7171,333 +7345,20 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         &self,
         revocation: crate::federation::SignedCommunityMembershipRevocation,
     ) -> Result<(), crate::federation::Error> {
-        // v52.0.0 (CIRISPersist#672) — a re-offer of a held record settles here,
-        // before any verification (`replication_policy::settle_if_held`).
-        if crate::federation::replication_policy::settle_if_held(
-            self,
-            crate::federation::replication_policy::EnvelopeKind::CommunityMembershipRevocation,
-            &revocation,
+        crate::federation::community_admit::put_community_membership_revocation_planned(
+            self, revocation,
         )
-        .await?
-        {
-            return Ok(());
-        }
-        // v21.0.0 (CIRISPersist#502 E4) — mechanistic authorship BEFORE any
-        // other admission step. THE worst-case E4 hole: an unverified
-        // removal here rotates the community DEK epoch below — an
-        // unauthenticated forward-secrecy DoS.
-        crate::federation::verify_community_membership_revocation_admission(self, &revocation)
-            .await?;
-        let mut row = revocation.community_membership_revocation;
-        // SecReview F4 — community removal is immediate for forward-secrecy;
-        // reject a future-dated effective_at BEFORE any state mutation
-        // (3-backend parity with pg + sqlite).
-        crate::federation::community_dek::reject_future_dated_community_revocation(
-            row.effective_at,
-        )?;
-        // v49.0.0 (CIRISPersist#908) — standing, before the epoch rotates.
-        crate::federation::check_community_roster_authority(
-            self,
-            &row.community_key_id,
-            &revocation.authority_key_id,
-            &std::iter::once(revocation.authority_key_id.clone())
-                .chain(
-                    revocation
-                        .cosignatures
-                        .iter()
-                        .map(|c| c.authority_key_id.clone()),
-                )
-                .collect(),
-            crate::federation::types::CommunityMember {
-                key_id: row.removed_identity_key_id.clone(),
-                joined_at: row.effective_at,
-                role: None,
-            },
-            true,
-            row.effective_at,
-        )
-        .await?;
-        // v50.0.0 (review, M1 loophole) — removing a founder of a conformant
-        // infrastructure room would leave its declared N stale.
-        if let Some(stored) = self.lookup_community(&row.community_key_id).await? {
-            let self_leave = revocation.authority_key_id == row.removed_identity_key_id
-                || revocation
-                    .cosignatures
-                    .iter()
-                    .any(|c| c.authority_key_id == row.removed_identity_key_id);
-            crate::federation::admission::check_infrastructure_founder_count_unchanged(
-                self,
-                &stored,
-                &row.removed_identity_key_id,
-                None,
-                true,
-                self_leave,
-                row.effective_at,
-            )
-            .await?;
-        }
-        let wire_index_key = {
-            let mut state = self.state.lock().expect("memory backend lock");
-            // v48.0.0 (CIRISPersist#860, V151) — the group FK points at the
-            // GROUP table: a family / a room is a keyless identifier. The
-            // member is a key.
-            if !state
-                .federation_communities
-                .contains_key(&row.community_key_id)
-            {
-                return Err(crate::federation::Error::InvalidArgument(format!(
-                    "{} does not exist in federation_communities",
-                    row.community_key_id
-                )));
-            }
-            if !state
-                .federation_keys
-                .contains_key(&row.removed_identity_key_id)
-            {
-                return Err(crate::federation::Error::InvalidArgument(format!(
-                    "{} does not exist in federation_keys",
-                    row.removed_identity_key_id
-                )));
-            }
-            row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
-            // Parity with pg/sqlite: the revocation table PK is
-            // (community_key_id, removed_identity_key_id) (V067). A REPLAYED
-            // revocation must not double-bump the DEK epoch or re-announce the
-            // removal. (Until v47.1.0 all three backends REFUSED the replay
-            // with a unique-violation, against the trait's documented
-            // idempotence — CIRISPersist#861; now all three accept it as a
-            // no-op.)
-            // v48.0.0 (CIRISPersist#860) — the PK carries the instant: an exact
-            // repeat is still the #861 no-op; a removal at another instant is
-            // another event (a re-added member can be removed again).
-            let revocation_key = (
-                row.community_key_id.clone(),
-                row.removed_identity_key_id.clone(),
-                row.effective_at,
-            );
-            // v47.1.0 (CIRISPersist#861) — pg/sqlite now honour the
-            // documented idempotence (the unique index decides, a repeat
-            // commits nothing), so memory mirrors THAT: a repeat is `Ok` and
-            // — as before — writes no second hard_case and no second epoch
-            // bump.
-            if state
-                .federation_community_membership_revocations
-                .contains_key(&revocation_key)
-            {
-                return Ok(());
-            }
-            // CEG §7.8 (CIRISPersist#161 Ask 5) — community analog of the §7.7
-            // removal emission (`change_kind: "removed"`). Idempotent on event_id.
-            let event = crate::federation::hard_case::membership_removed_event(
-                crate::federation::hard_case::kind::COMMUNITY_MEMBERSHIP_CHANGE,
-                &row.community_key_id,
-                &row.removed_identity_key_id,
-                row.effective_at,
-            );
-            state
-                .federation_hard_case_events
-                .entry(event.event_id.clone())
-                .or_insert(event);
-            // CC 4.4.3.2.2 rotation-on-removal: advance the community DEK epoch
-            // (the at-rest crypto half lives only on the BlobStorage backends;
-            // memory carries the rotation *state* so rotation-on-removal is
-            // observably present here too). Only on a genuinely new revocation
-            // (replays errored out above) — parity with pg/sqlite. Bump first →
-            // revocation insert moves `row`.
-            *state
-                .federation_community_dek_epoch
-                .entry(row.community_key_id.clone())
-                .or_insert(0) += 1;
-            // v21.1.0 (CIRISPersist#507b) — computed before the moves below
-            // consume `row.clone()` / `revocation.*`.
-            let effective_at_rfc3339 = revocation_key.2.to_rfc3339();
-            let wire_index_key = crate::federation::wire_index::record_key(&[
-                ("community_key_id", &revocation_key.0),
-                ("removed_identity_key_id", &revocation_key.1),
-                ("effective_at", &effective_at_rfc3339),
-            ]);
-            // v21.0.0 (CIRISPersist#502 E4 followup) — persist the authority
-            // signature the gate above already verified (was verified-then-
-            // discarded).
-            state
-                .federation_community_membership_revocation_authority_sigs
-                .insert(
-                    revocation_key.clone(),
-                    (
-                        revocation.authority_key_id,
-                        revocation.scrub_signature_classical,
-                        revocation.scrub_signature_pqc,
-                    ),
-                );
-            // v49.0.0 (CIRISPersist#908, V153 mirror).
-            state
-                .federation_community_membership_revocation_cosignatures
-                .insert(revocation_key.clone(), revocation.cosignatures);
-            // v36.0.0 (#668) — serve position (V130 mirror).
-            let admitted_at = next_plane_position(
-                &state,
-                PLANE_COMMUNITY_MEMBERSHIP_REVOCATION,
-                community_membership_revocation_rows(&state).into_iter(),
-            );
-            let resume = crate::federation::types::compound_resume_id(&[
-                &revocation_key.0,
-                &revocation_key.1,
-                &effective_at_rfc3339,
-            ]);
-            state
-                .federation_community_membership_revocations
-                .insert(revocation_key, row);
-            stamp_plane_position(
-                &mut state,
-                PLANE_COMMUNITY_MEMBERSHIP_REVOCATION,
-                resume,
-                admitted_at,
-            );
-            wire_index_key
-        };
-        self.index_stored_record("CommunityMembershipRevocation", &wire_index_key)
-            .await?;
-        Ok(())
+        .await
     }
 
     async fn put_community_membership_widening(
         &self,
         widening: crate::federation::SignedCommunityMembershipWidening,
     ) -> Result<(), crate::federation::Error> {
-        // v52.0.0 (CIRISPersist#672) — a re-offer of a held record settles here,
-        // before any verification (`replication_policy::settle_if_held`).
-        if crate::federation::replication_policy::settle_if_held(
-            self,
-            crate::federation::replication_policy::EnvelopeKind::CommunityMembershipWidening,
-            &widening,
+        crate::federation::community_admit::put_community_membership_widening_planned(
+            self, widening,
         )
-        .await?
-        {
-            return Ok(());
-        }
-        // v48.0.0 (CIRISPersist#860, FSD §3.2) — the mirror of the revocation
-        // door; see the sqlite twin for the legs.
-        crate::federation::verify_community_membership_widening_admission(self, &widening).await?;
-        let mut row = widening.community_membership_widening;
-        crate::federation::community_dek::reject_future_dated_community_widening(row.effective_at)?;
-        // v49.0.0 (CIRISPersist#908) — the signer must have standing.
-        crate::federation::check_community_roster_authority(
-            self,
-            &row.community_key_id,
-            &widening.authority_key_id,
-            &std::iter::once(widening.authority_key_id.clone())
-                .chain(
-                    widening
-                        .cosignatures
-                        .iter()
-                        .map(|c| c.authority_key_id.clone()),
-                )
-                .collect(),
-            row.member(),
-            false,
-            row.effective_at,
-        )
-        .await?;
-        let community = self
-            .lookup_community(&row.community_key_id)
-            .await?
-            .ok_or_else(|| {
-                crate::federation::Error::InvalidArgument(format!(
-                    "{} does not exist in federation_communities",
-                    row.community_key_id
-                ))
-            })?;
-        let stored_for_count = community.clone();
-        let probe = crate::federation::types::Community {
-            members: vec![row.member()],
-            ..community
-        };
-        // v50.0.0 (CIRISPersist#925) — a widening that seats a node-bearing
-        // key as founder of an infrastructure community is refused.
-        crate::federation::admission::check_infrastructure_founders_not_node(
-            self,
-            &probe,
-            row.effective_at,
-        )
-        .await?;
-        // v50.0.0 (review, M1 loophole) — adding, promoting or demoting a
-        // founder of a conformant infrastructure room would leave N stale.
-        crate::federation::admission::check_infrastructure_founder_count_unchanged(
-            self,
-            &stored_for_count,
-            &row.member_key_id,
-            row.role.as_deref(),
-            false,
-            false,
-            row.effective_at,
-        )
-        .await?;
-        crate::federation::admission::check_community_membership_steward_binding(self, &probe)
-            .await?;
-        let wire_index_key = {
-            let mut state = self.state.lock().expect("memory backend lock");
-            if !state.federation_keys.contains_key(&row.member_key_id) {
-                return Err(crate::federation::Error::InvalidArgument(format!(
-                    "{} does not exist in federation_keys",
-                    row.member_key_id
-                )));
-            }
-            row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
-            let key = (
-                row.community_key_id.clone(),
-                row.member_key_id.clone(),
-                row.effective_at,
-            );
-            if state
-                .federation_community_membership_widenings
-                .contains_key(&key)
-            {
-                return Ok(());
-            }
-            let effective_at_rfc3339 = key.2.to_rfc3339();
-            let wire_index_key = crate::federation::wire_index::record_key(&[
-                ("community_key_id", &key.0),
-                ("member_key_id", &key.1),
-                ("effective_at", &effective_at_rfc3339),
-            ]);
-            state
-                .federation_community_membership_widening_authority_sigs
-                .insert(
-                    key.clone(),
-                    (
-                        widening.authority_key_id,
-                        widening.scrub_signature_classical,
-                        widening.scrub_signature_pqc,
-                    ),
-                );
-            // v49.0.0 (CIRISPersist#908, V153 mirror).
-            state
-                .federation_community_membership_widening_cosignatures
-                .insert(key.clone(), widening.cosignatures);
-            let admitted_at = next_plane_position(
-                &state,
-                PLANE_COMMUNITY_MEMBERSHIP_WIDENING,
-                community_membership_widening_rows(&state).into_iter(),
-            );
-            let resume = crate::federation::types::compound_resume_id(&[
-                &key.0,
-                &key.1,
-                &effective_at_rfc3339,
-            ]);
-            state
-                .federation_community_membership_widenings
-                .insert(key, row);
-            stamp_plane_position(
-                &mut state,
-                PLANE_COMMUNITY_MEMBERSHIP_WIDENING,
-                resume,
-                admitted_at,
-            );
-            wire_index_key
-        };
-        self.index_stored_record("CommunityMembershipWidening", &wire_index_key)
-            .await?;
-        Ok(())
+        .await
     }
 
     async fn put_family_membership_widening(
@@ -7609,76 +7470,8 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         &self,
         listing: crate::federation::SignedCommunityMembershipListing,
     ) -> Result<(), crate::federation::Error> {
-        // v52.0.0 (CIRISPersist#672) — a re-offer of a held record settles here,
-        // before any verification (`replication_policy::settle_if_held`).
-        if crate::federation::replication_policy::settle_if_held(
-            self,
-            crate::federation::replication_policy::EnvelopeKind::CommunityMembershipListing,
-            &listing,
-        )
-        .await?
-        {
-            return Ok(());
-        }
-        // v49.0.0 (CIRISPersist#912) — the one listing door, then the V156
-        // mirror; see the sqlite twin.
-        crate::federation::listing::check_community_membership_listing(self, &listing).await?;
-        let mut listing = listing;
-        let wire_index_key = {
-            let mut state = self.state.lock().expect("memory backend lock");
-            // The V156 FKs: the room (the door checked it) and the member.
-            if !state
-                .federation_communities
-                .contains_key(&listing.community_membership_listing.community_key_id)
-            {
-                return Err(crate::federation::Error::InvalidArgument(format!(
-                    "{} does not exist in federation_communities",
-                    listing.community_membership_listing.community_key_id
-                )));
-            }
-            if !state
-                .federation_keys
-                .contains_key(&listing.community_membership_listing.member_key_id)
-            {
-                return Err(crate::federation::Error::InvalidArgument(format!(
-                    "{} does not exist in federation_keys",
-                    listing.community_membership_listing.member_key_id
-                )));
-            }
-            let row = &mut listing.community_membership_listing;
-            row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&*row)?;
-            let key = (
-                row.community_key_id.clone(),
-                row.member_key_id.clone(),
-                row.effective_at,
-            );
-            if state
-                .federation_community_membership_listings
-                .contains_key(&key)
-            {
-                return Ok(());
-            }
-            let effective_at_rfc3339 = key.2.to_rfc3339();
-            let wire_index_key = crate::federation::wire_index::record_key(&[
-                ("community_key_id", &key.0),
-                ("member_key_id", &key.1),
-                ("effective_at", &effective_at_rfc3339),
-            ]);
-            let resume = crate::federation::types::compound_resume_id(&[
-                &key.0,
-                &key.1,
-                &effective_at_rfc3339,
-            ]);
-            let rows = community_membership_listing_rows(&state);
-            allocate_and_stamp(&mut state, PLANE_COMMUNITY_MEMBERSHIP_LISTING, resume, rows);
-            state
-                .federation_community_membership_listings
-                .insert(key, listing);
-            wire_index_key
-        };
-        self.index_stored_record("CommunityMembershipListing", &wire_index_key)
-            .await?;
-        Ok(())
+        crate::federation::community_admit::put_community_membership_listing_planned(self, listing)
+            .await
     }
 
     async fn list_identity_occurrence_revocations_for(
@@ -7953,17 +7746,10 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         &self,
         event: crate::federation::hard_case::HardCaseEvent,
     ) -> Result<(), crate::federation::Error> {
-        // v25.1.0 (CIRISPersist#570 ask 3) — the attribution gate.
-        // Verify-before-mutation: an `admin_action` record that does not carry
-        // {delegation_id, reason} is refused naming WHICH, and no row is
-        // written. A no-op for every observed-condition kind.
-        crate::federation::check_admin_action_attribution(&event)?;
-        let mut state = self.state.lock().expect("memory backend lock");
-        state
-            .federation_hard_case_events
-            .entry(event.event_id.clone())
-            .or_insert(event);
-        Ok(())
+        // v57.0.0 (CIRISPersist#988 item 2) — a `hard_case:{kind}:v1` row on
+        // the plane, decided once (`plan_hard_case_row`); the map is its
+        // projection, written under the same lock.
+        crate::federation::attestation_admit::record_hard_case_planned(self, event).await
     }
 
     /// CIRISServer#356 — this backend DOES charge peer writes
@@ -7983,6 +7769,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         let mut rows: Vec<_> = state
             .federation_hard_case_events
             .values()
+            .map(|(_, e)| e)
             .filter(|e| filter.kind.as_ref().is_none_or(|k| &e.kind == k))
             .filter(|e| filter.since.is_none_or(|s| e.emitted_at >= s))
             .cloned()
@@ -10477,6 +10264,10 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                     .into(),
             ));
         }
+        // v57.0.0 (CIRISPersist#988 item 2) — the record's attester, read
+        // before the lock; asked for only once the removal's own refusals
+        // have had their say.
+        let attester = crate::federation::attestation_admit::hard_case_attester(self).await;
         let mut state = self.state.lock().expect("memory backend lock");
         // PeerNotFound when no live metadata row OR (for hard remove)
         // no key row either. Treat "metadata row already removed_at"
@@ -10512,10 +10303,16 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                     attestation_count,
                 });
             }
+        }
+        // v57.0.0 (CIRISPersist#988 item 2) — an act: no attester, no removal.
+        // The record is planned before anything moves.
+        let removal =
+            plan_peer_removal_event(&attester?, key_id, hard, reason, acting_under_delegation_id)?;
+        if hard {
             // Cascade: drop federation_keys row + metadata row.
             state.federation_keys.remove(key_id);
             state.federation_peer_metadata.remove(key_id);
-            record_peer_removal_event(&mut state, key_id, true, reason, acting_under_delegation_id);
+            memory_store_hard_case(&mut state, removal);
         } else {
             // Soft-remove: mark removed_at; bump updated_at;
             // recompute persist_row_hash.
@@ -10535,13 +10332,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             // to a removed peer's audience. Stamp mutated_at so the cursor
             // planes re-serve the sibling row.
             state.key_record_mutated_at.insert(key_id.to_owned(), now);
-            record_peer_removal_event(
-                &mut state,
-                key_id,
-                false,
-                reason,
-                acting_under_delegation_id,
-            );
+            memory_store_hard_case(&mut state, removal);
         }
         Ok(())
     }
@@ -10791,36 +10582,292 @@ impl crate::federation::BlackholeRules for MemoryBackend {
 }
 
 /// v38.0.0 (CIRISPersist#721) — the peer-removal announcement, memory arm:
-/// the same in-transaction `hard_case_events` record the SQL doors write.
-/// Emission is unconditional on the removal succeeding — an announced act,
-/// never a courtesy.
-fn record_peer_removal_event(
-    state: &mut State,
+/// the same in-transaction `hard_case:admin_action:peer_removal:v1` row the
+/// SQL doors write (v57.0.0, CIRISPersist#988 item 2). Planned BEFORE the
+/// removal mutates anything, so a refusal leaves the peer in place; stored
+/// after it, under the same lock. Emission is unconditional on the removal
+/// succeeding — an announced act, never a courtesy.
+fn plan_peer_removal_event(
+    attester: &crate::federation::attestation_admit::HardCaseAttester,
     key_id: &str,
     hard: bool,
     reason: &str,
     delegation_id: Option<&str>,
-) {
-    let event_id = uuid::Uuid::new_v4().to_string();
-    state.federation_hard_case_events.insert(
-        event_id.clone(),
-        crate::federation::hard_case::HardCaseEvent {
-            event_id,
-            kind: format!(
-                "{}{}",
-                crate::federation::hard_case::kind::ADMIN_ACTION_PREFIX,
-                crate::federation::hard_case::admin_op::PEER_REMOVAL
-            ),
-            target_key_id: Some(key_id.to_owned()),
-            subject_key_id: None,
-            detail: serde_json::json!({
-                crate::federation::hard_case::admin_field::DELEGATION_ID: delegation_id,
-                crate::federation::hard_case::admin_field::REASON: reason,
-                "hard": hard,
-            }),
-            emitted_at: chrono::Utc::now(),
+) -> Result<crate::federation::attestation_admit::PlannedHardCase, crate::federation::Error> {
+    let now = chrono::Utc::now();
+    let event = crate::federation::hard_case::HardCaseEvent {
+        event_id: uuid::Uuid::new_v4().to_string(),
+        kind: crate::federation::hard_case::admin_action_kind(
+            crate::federation::hard_case::admin_op::PEER_REMOVAL,
+        ),
+        target_key_id: Some(key_id.to_owned()),
+        subject_key_id: None,
+        detail: serde_json::json!({
+            crate::federation::hard_case::admin_field::DELEGATION_ID: delegation_id,
+            crate::federation::hard_case::admin_field::REASON: reason,
+            "hard": hard,
+        }),
+        emitted_at: now,
+    };
+    crate::federation::attestation_admit::plan_hard_case_row(
+        &event,
+        attester,
+        crate::federation::attestation_admit::PlanInstants {
+            fold_at: now,
+            received_at: now,
         },
+    )
+}
+
+/// v56.0.0 (CIRISPersist#934 door 2), lifted in v57.0.0 so the hard_case
+/// writer stores its row through the same step — push one local-tier row:
+/// the rendition and subject mirrors, its `withdraws` depth, its serve
+/// position. `false` (nothing written) when the id is already held (the
+/// `INSERT OR IGNORE` twin).
+fn memory_insert_local_row(
+    state: &mut State,
+    row: crate::federation::Attestation,
+    withdraws_depth: Option<usize>,
+) -> bool {
+    // v18.0.0 (#473) — the INSERT OR IGNORE twin: an id still held here (a
+    // concurrent writer took it after the plan read it free) is a no-op.
+    if state
+        .federation_attestations
+        .iter()
+        .any(|a| a.attestation_id == row.attestation_id)
+    {
+        return false;
+    }
+    // v45.0.0 (CIRISPersist#871, FSD §5) — the V149 `blob_renditions`
+    // mirror at the local door, under the same lock as the push below.
+    project_rendition_row(state, &row);
+    // v17.4.0 (V106) — maintain the subject-index mirror at local tier.
+    for subj in &row.subject_key_ids {
+        state
+            .subject_index
+            .entry(subj.clone())
+            .or_default()
+            .push(row.attestation_id.clone());
+    }
+    // v36.0.0 (#668) — serve position (V130 mirror).
+    let admitted_at = next_plane_position(
+        state,
+        PLANE_ATTESTATION,
+        attestation_rows(state).into_iter(),
     );
+    let id_for_stamp = row.attestation_id.clone();
+    // v50.0.0 (review H2, final check, 3d) — a local `withdraws`'s depth.
+    if let Some(depth) = withdraws_depth {
+        state
+            .federation_withdraws_admission_depths
+            .insert(row.attestation_id.clone(), depth);
+    }
+    state.federation_attestations.push(row);
+    stamp_plane_position(state, PLANE_ATTESTATION, id_for_stamp, admitted_at);
+    true
+}
+
+/// v57.0.0 (CIRISPersist#988 item 2) — **the hard_case writer**, memory arm:
+/// the planned row (insert-if-absent) and, when it landed, its projection.
+fn memory_store_hard_case(
+    state: &mut State,
+    planned: crate::federation::attestation_admit::PlannedHardCase,
+) {
+    let crate::federation::attestation_admit::PlannedHardCase { row, projection } = planned;
+    let attestation_id = row.attestation_id.clone();
+    if memory_insert_local_row(state, row, None) {
+        state
+            .federation_hard_case_events
+            .insert(projection.event_id.clone(), (attestation_id, projection));
+    }
+}
+
+/// v57.0.0 (CIRISPersist#988 item 2) — an in-lock emitter's record (the SQL
+/// backends' `*_record_hard_case_in_tx`): plan with the attester resolved
+/// before the lock, store under it. Without an attester an act refuses and an
+/// observation records nothing
+/// ([`crate::federation::attestation_admit::HardCaseEmitter`]).
+fn memory_record_hard_case_in_state(
+    state: &mut State,
+    attester: &Result<crate::federation::attestation_admit::HardCaseAttester, String>,
+    emitter: crate::federation::attestation_admit::HardCaseEmitter,
+    event: &crate::federation::hard_case::HardCaseEvent,
+    received_at: chrono::DateTime<chrono::Utc>,
+) -> Result<(), String> {
+    let attester = match attester {
+        Ok(a) => a,
+        Err(e) => return emitter.without_attester(&event.event_id, e),
+    };
+    let planned = crate::federation::attestation_admit::plan_hard_case_row(
+        event,
+        attester,
+        crate::federation::attestation_admit::PlanInstants {
+            fold_at: received_at,
+            received_at,
+        },
+    )
+    .map_err(|e| format!("{}: {e}", e.kind()))?;
+    memory_store_hard_case(state, planned);
+    Ok(())
+}
+
+/// v57.0.0 (CIRISPersist#988 item 3; lead ruling 5) — the purge door's
+/// tombstone of a detection row, on its projection: the entry for
+/// `attestation_id`, if live, becomes the V080 tombstone at `executed_at`
+/// (the SQL backends' UPDATE in `purge_put_execution`).
+fn memory_tombstone_detection_projection(
+    state: &mut State,
+    attestation_id: &str,
+    executed_at: chrono::DateTime<chrono::Utc>,
+) {
+    for (id, p) in state.derived_detection_events.values_mut() {
+        if id == attestation_id && p.erased_at.is_none() {
+            *p = p.tombstoned(executed_at);
+        }
+    }
+}
+
+/// The instant the earliest-admitted purge execution naming
+/// `attestation_id` executed, if one does: what the detection projection's
+/// tombstone stamps (the rebuild's half of
+/// [`memory_tombstone_detection_projection`]).
+fn memory_detection_tombstone_instant(
+    state: &State,
+    attestation_id: &str,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    state
+        .purge_tombstones
+        .iter()
+        .filter(|((_, plane, r), _)| plane == "attestation" && r == attestation_id)
+        .filter_map(|((notice, _, _), _)| state.purge_executions.get(notice))
+        .min_by(|a, b| (a.admitted_at, &a.notice_id).cmp(&(b.admitted_at, &b.notice_id)))
+        .map(|e| e.executed_at)
+}
+
+/// v57.0.0 (CIRISPersist#988 item 3; lead ruling on the DSAR path) — the
+/// row-backed detections of `trace_ids`, found by the ROW's own body
+/// (`detection.trace_id`, as the SQL doors read it). Nothing moves.
+fn memory_find_detection_rows(state: &State, trace_ids: &HashSet<String>) -> Vec<String> {
+    let mut found: Vec<String> = state
+        .federation_attestations
+        .iter()
+        .filter(|row| {
+            let env = &row.attestation_envelope;
+            env.get("dimension")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|d| d.starts_with("detection:"))
+                && env
+                    .pointer("/detection/trace_id")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|t| trace_ids.contains(t))
+        })
+        .map(|row| row.attestation_id.clone())
+        .collect();
+    found.sort();
+    found
+}
+
+/// What a memory erasure writes, decided before anything moves.
+#[derive(Default)]
+struct MemoryErasurePlan {
+    row: Option<crate::federation::attestation_admit::PlannedHardCase>,
+    tombstones: Option<(
+        crate::federation::steward_purge::PurgeExecution,
+        Vec<crate::federation::steward_purge::PurgeTombstone>,
+    )>,
+}
+
+/// Plan an erasure's `hard_case:trace_erasure:v1` row and, when it
+/// hard-deleted row-backed detections, the Art. 17 purge tombstone header
+/// citing it. Nothing moves.
+fn memory_plan_erasure(
+    attester: &crate::federation::attestation_admit::HardCaseAttester,
+    event: &crate::federation::hard_case::HardCaseEvent,
+    erased_rows: &[String],
+    at: chrono::DateTime<chrono::Utc>,
+) -> Result<MemoryErasurePlan, String> {
+    let planned = crate::federation::attestation_admit::plan_hard_case_row(
+        event,
+        attester,
+        crate::federation::attestation_admit::PlanInstants {
+            fold_at: at,
+            received_at: at,
+        },
+    )
+    .map_err(|e| format!("{}: {e}", e.kind()))?;
+    let tombstones = if erased_rows.is_empty() {
+        None
+    } else {
+        Some(
+            crate::federation::steward_purge::art17_erasure_execution(
+                &planned.row,
+                erased_rows,
+                &attester.key_id,
+                at,
+            )
+            .map_err(|e| e.to_string())?,
+        )
+    };
+    Ok(MemoryErasurePlan {
+        row: Some(planned),
+        tombstones,
+    })
+}
+
+/// Apply a planned erasure under the lock: hard-delete the erased detection
+/// rows (their projection entries follow), store the erasure row, write the
+/// Art. 17 tombstones.
+fn memory_apply_erasure(state: &mut State, erased_rows: &[String], plan: MemoryErasurePlan) {
+    for id in erased_rows {
+        let record_key = crate::federation::wire_index::record_key(&[("attestation_id", id)]);
+        state
+            .signed_wire_index
+            .retain(|(kind, _), rk| !(kind == "Attestation" && *rk == record_key));
+        state
+            .federation_attestations
+            .retain(|a| &a.attestation_id != id);
+    }
+    prune_row_projections(state);
+    if let Some(planned) = plan.row {
+        memory_store_hard_case(state, planned);
+    }
+    if let Some((mut execution, tombstones)) = plan.tombstones {
+        let last = state.purge_executions.values().map(|e| e.admitted_at).max();
+        execution.admitted_at =
+            crate::federation::types::monotonic_admission_instant(chrono::Utc::now(), last);
+        state
+            .purge_executions
+            .entry(execution.notice_id.clone())
+            .or_insert(execution);
+        for t in tombstones {
+            state.purge_tombstones.insert(
+                (
+                    t.notice_id.clone(),
+                    t.plane.as_str().to_owned(),
+                    t.record_ref.clone(),
+                ),
+                t,
+            );
+        }
+    }
+}
+
+/// v57.0.0 (CIRISPersist#988, V194/V195 mirror) — the SQL backends' `ON
+/// DELETE CASCADE` from a projection row to its row: drop every projection
+/// entry whose row is no longer held. Called by every memory door that
+/// removes attestation rows.
+fn prune_row_projections(state: &mut State) {
+    let held: HashSet<String> = state
+        .federation_attestations
+        .iter()
+        .map(|a| a.attestation_id.clone())
+        .collect();
+    state
+        .federation_hard_case_events
+        .retain(|_, (attestation_id, _)| held.contains(attestation_id));
+    state
+        .derived_detection_events
+        .retain(|_, (attestation_id, _)| held.contains(attestation_id));
 }
 
 /// Shared validation for `TrustGrant`. Same rules as the PG CHECK
@@ -11613,20 +11660,44 @@ fn memory_read_unsupported(method: &str) -> crate::read::Error {
 // "no current bundle" rather than an error.
 
 impl crate::derived::DerivedSchema for MemoryBackend {
+    /// v57.0.0 (CIRISPersist#988 item 3) — the row door: memory stores the
+    /// `detection:{detector}:v1` row and its projection like the SQL
+    /// backends (it returned `NotImplemented` before the row existed).
     async fn put_detection_event(
         &self,
-        _event: crate::derived::DetectionEvent,
+        event: crate::derived::DetectionEvent,
     ) -> Result<(), crate::derived::Error> {
-        Err(crate::derived::Error::NotImplemented(
-            "put_detection_event (memory backend; use postgres for federation evidence)",
-        ))
+        crate::federation::steward_purge::refuse_if_tombstoned_trace(self, &event.trace_id)
+            .await
+            .map_err(|e| match e {
+                crate::federation::Error::PurgeRefused { .. } => {
+                    crate::derived::Error::InvalidArgument(format!("{}: {e}", e.kind()))
+                }
+                other => crate::derived::Error::Backend(other.to_string()),
+            })?;
+        crate::federation::attestation_admit::put_detection_planned(self, &event)
+            .await
+            .map_err(crate::derived::detection_row::derived_error)
     }
 
+    /// The projection read, as the SQL backends: live (untombstoned)
+    /// detections only, newest first, at most 1000.
     async fn get_detection_events(
         &self,
-        _filter: crate::derived::EventFilter,
+        filter: crate::derived::EventFilter,
     ) -> Result<Vec<crate::derived::DetectionEvent>, crate::derived::Error> {
-        Ok(Vec::new())
+        let state = self.state.lock().expect("memory backend lock");
+        let mut rows: Vec<crate::derived::DetectionEvent> = state
+            .derived_detection_events
+            .values()
+            .filter_map(|(_, p)| p.to_event())
+            .filter(|e| filter.trace_id.as_ref().is_none_or(|t| &e.trace_id == t))
+            .filter(|e| filter.detector.as_ref().is_none_or(|d| &e.detector == d))
+            .filter(|e| filter.since.is_none_or(|s| e.ts >= s))
+            .collect();
+        rows.sort_by_key(|e| std::cmp::Reverse(e.ts));
+        rows.truncate(1000);
+        Ok(rows)
     }
 
     async fn put_edge_detection_event(
@@ -11799,145 +11870,36 @@ impl MemoryBackend {
     }
 }
 
-/// v50.0.0 (CIRISPersist#925/#931, review) — the community record store step,
-/// with the door it was reached through: `put_community` is the LOCAL door
-/// (the full CC 3.2 infrastructure gate, whoever signed), and
-/// `apply_replicated_community` the replicated one (a record authored
-/// elsewhere, admitted as data). Every other gate is the same on both.
-impl MemoryBackend {
-    pub(crate) async fn put_community_at_door(
+/// v57.0.0 (CIRISPersist#934 step 2) — the community plane's executor on
+/// memory. Storage only: the decisions are
+/// [`plan_put_community`](crate::federation::community_admit::plan_put_community)
+/// and the three roster plans in `federation::community_admit`.
+#[async_trait::async_trait]
+impl crate::federation::community_admit::CommunityStore for MemoryBackend {
+    async fn store_planned_community(
         &self,
-        community: crate::federation::SignedCommunity,
-        door: crate::federation::CommunityDoor,
-    ) -> Result<crate::federation::group_amendment::CommunityWrite, crate::federation::Error> {
-        // v52.0.0 (CIRISPersist#672) — a re-offer of a held record settles here,
-        // before any verification (`replication_policy::settle_if_held`).
-        if crate::federation::replication_policy::settle_if_held(
-            self,
-            crate::federation::replication_policy::EnvelopeKind::Community,
-            &community,
-        )
-        .await?
-        {
-            return Ok(crate::federation::group_amendment::CommunityWrite::Unchanged);
-        }
-        // Test-only (PR #921 review, F3): a rival write that won the race
-        // lands here, after any read the caller made and before this write's
-        // own gates and reads.
-        #[cfg(test)]
-        self.test_rival_at(crate::store::test_hooks::RivalPoint::DoorStart)
-            .await?;
-        // v21.0.0 (CIRISPersist#502 E4) — mechanistic authorship BEFORE any
-        // other admission step (mirrors put_family). Hybrid-Strict vs the
-        // authority's registered pubkeys.
-        crate::federation::verify_community_admission(self, &community).await?;
-        // v50.0.0 (CIRISPersist#926) — the trust-root door, ONE predicate on
-        // both doors: the reserved `ciris-canonical` id and any
-        // `infrastructure_constraint` row are admitted only as a chain from an
-        // accord birth (caps, shape, founders, links). The replicated door may
-        // keep another id's non-conformant record as data (it reads NotRooted);
-        // the reserved id never. `true` = an authorized infrastructure room.
-        let trust_root = crate::federation::canonical_community::check_trust_root_at_door(
-            self,
-            &community,
-            door == crate::federation::CommunityDoor::ReplicatedApply,
-        )
-        .await?;
+        planned: crate::federation::community_admit::CommunityInsert,
+    ) -> Result<crate::federation::community_admit::StoredCommunity, crate::federation::Error> {
+        let crate::federation::community_admit::CommunityInsert {
+            community,
+            wire_index_key,
+        } = planned;
         let row = community.community;
-        // v4.0 — value-validation admission (consensus_protocol
-        // canonical form). Mirrors put_family.
-        crate::federation::check_consensus_protocol_form(&row.consensus_protocol)?;
-        // v54.0.0 (CIRISPersist#1034, CC 4.4.3.2.8) — the declared cohort parses,
-        // a config rides only on an affiliation, and an affiliation's config
-        // validates against its roster. Backend-symmetric.
-        crate::federation::affiliation_config::check_community_record(&row)?;
-        // v4.11.0 (#154 Ask 4) — geographic cohort_subkind admission. Runs
-        // BEFORE the state lock below: it reads via list_location_proofs_for
-        // (which locks state itself), so calling it under the lock would
-        // deadlock. No-op for non-geographic communities.
-        crate::federation::location::check_geographic_community_admission(
-            self,
-            &row,
-            chrono::Utc::now(),
-        )
-        .await?;
-        // v9.0.0 (CC 3.2 / CC 3.4.7.1) — steward-binding precondition for
-        // non-infrastructure community membership. Resolves member
-        // identity_type + steward-binding via the directory (locks state
-        // itself), so it MUST run before the state lock below to avoid a
-        // re-entrant deadlock. No-op for infrastructure communities and
-        // for rosters with no node/agent members.
-        // v50.0.0 (CIRISPersist#925/#927, CC 3.2) — infrastructure conformance:
-        // a quorum:M/N protocol and no node-bearing founder. Reads the directory, so
-        // before any state lock.
-        if door == crate::federation::CommunityDoor::Local {
-            crate::federation::admission::check_infrastructure_record_admission(self, &row).await?;
-        } else {
-            // v50.0.0 (final check) — a conformant stored room never degrades
-            // through the replicated door.
-            crate::federation::admission::check_replicated_supersede_does_not_degrade(self, &row)
-                .await?;
-        }
-        if !trust_root {
-            crate::federation::admission::check_community_membership_steward_binding(self, &row)
-                .await?;
-        }
-        // v49.0.0 (CIRISPersist#910.5) — an occupied id: an identical re-put
-        // is a no-op, a proof-carrying amendment this node's own state
-        // authorizes is applied as a supersede, anything else is refused (the
-        // #758 verdict below still settles a concurrent insert). Before the
-        // state lock: it reads through the directory.
-        let offered = crate::federation::SignedCommunity {
-            community: row,
-            authority_key_id: community.authority_key_id,
-            scrub_signature_classical: community.scrub_signature_classical,
-            scrub_signature_pqc: community.scrub_signature_pqc,
-            supersede_proof: community.supersede_proof,
-            cosignatures: community.cosignatures,
-            lineage: community.lineage,
-        };
-        if let crate::federation::group_amendment::OccupiedRoute::Settled(written) =
-            crate::federation::group_amendment::route_occupied_community(self, &offered).await?
         {
-            return Ok(written);
-        }
-        let community = offered;
-        let mut row = community.community;
-        // Test-only (PR #921 review, F3): a rival insert lands after the
-        // occupied-id decision said "insert", before this insert.
-        #[cfg(test)]
-        self.test_rival_at(crate::store::test_hooks::RivalPoint::BeforeInsert)
-            .await?;
-        let wire_index_key = {
             let mut state = self.state.lock().expect("memory backend lock");
-            // v48.0.0 (CIRISPersist#860) — a room is a KEYLESS identifier (as
-            // sqlite/postgres have always admitted it); the members are keys.
-            row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
             // v38.2.0 (CIRISPersist#758) — **memory used to silently
             // OVERWRITE.** `HashMap::insert` replaced the stored row AND its
-            // authority signature, so on a memory-backed node a replicated
-            // peer copy could displace the row this node authored — the
-            // opposite failure from the SQL backends, which refused every
-            // re-put. One predicate now answers for all three: identical
-            // content is an idempotent no-op, differing content is refused.
+            // authority signature. An occupied id now writes nothing and
+            // reports the stored hash; the shared door's #758 verdict decides.
             if let Some(existing) = state.federation_communities.get(&row.community_key_id) {
-                let stored = existing.persist_row_hash.clone();
-                let offered = row.persist_row_hash.clone();
-                let id = row.community_key_id.clone();
-                drop(state);
-                return crate::federation::group_amendment::community_insert_lost_to(
-                    &stored, &offered, &id,
+                return Ok(
+                    crate::federation::community_admit::StoredCommunity::Occupied {
+                        stored_persist_row_hash: existing.persist_row_hash.clone(),
+                    },
                 );
             }
-            // v21.1.0 (CIRISPersist#507b) — computed before the moves below
-            // consume `row.clone()` / `community.*`.
-            let wire_index_key = crate::federation::wire_index::record_key(&[(
-                "community_key_id",
-                &row.community_key_id,
-            )]);
-            // v21.0.0 (CIRISPersist#502 E4 followup) — persist the authority
-            // signature the gate above already verified (was verified-then-
-            // discarded).
+            // v21.0.0 (CIRISPersist#502 E4 followup) — persist the verified
+            // authority signature.
             state.federation_community_authority_sigs.insert(
                 row.community_key_id.clone(),
                 (
@@ -11972,11 +11934,253 @@ impl MemoryBackend {
                 .federation_communities
                 .insert(row.community_key_id.clone(), row);
             stamp_plane_position(&mut state, PLANE_COMMUNITY, id_for_stamp, admitted_at);
-            wire_index_key
-        };
+        }
         self.index_stored_record("Community", &wire_index_key)
             .await?;
-        Ok(crate::federation::group_amendment::CommunityWrite::Inserted)
+        Ok(crate::federation::community_admit::StoredCommunity::Inserted)
+    }
+
+    async fn store_planned_community_revocation(
+        &self,
+        planned: crate::federation::community_admit::PlannedCommunityRevocation,
+    ) -> Result<(), crate::federation::Error> {
+        let crate::federation::community_admit::PlannedCommunityRevocation {
+            revocation,
+            removal_event,
+            wire_index_key,
+        } = planned;
+        let row = revocation.community_membership_revocation;
+        // v57.0.0 (CIRISPersist#988 item 2) — the removal's hard_case row is
+        // planned inside the write; its attester is read here, before it. An
+        // observation: a node with no attester records nothing and the
+        // removal (and its rotation) still lands.
+        let hard_case_attester = crate::federation::attestation_admit::hard_case_attester(self)
+            .await
+            .map_err(|e| format!("{}: {e}", e.kind()));
+        let hard_case_received_at = chrono::Utc::now();
+        {
+            let mut state = self.state.lock().expect("memory backend lock");
+            // v48.0.0 (CIRISPersist#860, V151) — the group FK points at the
+            // GROUP table: a family / a room is a keyless identifier. The
+            // member is a key.
+            if !state
+                .federation_communities
+                .contains_key(&row.community_key_id)
+            {
+                return Err(crate::federation::Error::InvalidArgument(format!(
+                    "{} does not exist in federation_communities",
+                    row.community_key_id
+                )));
+            }
+            if !state
+                .federation_keys
+                .contains_key(&row.removed_identity_key_id)
+            {
+                return Err(crate::federation::Error::InvalidArgument(format!(
+                    "{} does not exist in federation_keys",
+                    row.removed_identity_key_id
+                )));
+            }
+            // v47.1.0 (CIRISPersist#861) / v48.0.0 (#860) — idempotent on
+            // `(community, removed, effective_at)`: an exact repeat is `Ok`
+            // and writes no second hard_case and no second epoch bump; a
+            // removal at another instant is another event.
+            let revocation_key = (
+                row.community_key_id.clone(),
+                row.removed_identity_key_id.clone(),
+                row.effective_at,
+            );
+            if state
+                .federation_community_membership_revocations
+                .contains_key(&revocation_key)
+            {
+                return Ok(());
+            }
+            // CEG §7.8 (CIRISPersist#161 Ask 5) — idempotent on event_id (the
+            // row id derives from it).
+            memory_record_hard_case_in_state(
+                &mut state,
+                &hard_case_attester,
+                crate::federation::attestation_admit::HardCaseEmitter::Observation,
+                &removal_event,
+                hard_case_received_at,
+            )
+            .map_err(crate::federation::Error::Backend)?;
+            // CC 4.4.3.2.2 rotation-on-removal: advance the community DEK epoch
+            // (memory carries the rotation *state*), only on a new revocation.
+            *state
+                .federation_community_dek_epoch
+                .entry(row.community_key_id.clone())
+                .or_insert(0) += 1;
+            // v21.0.0 (CIRISPersist#502 E4 followup) — persist the verified
+            // authority signature.
+            state
+                .federation_community_membership_revocation_authority_sigs
+                .insert(
+                    revocation_key.clone(),
+                    (
+                        revocation.authority_key_id,
+                        revocation.scrub_signature_classical,
+                        revocation.scrub_signature_pqc,
+                    ),
+                );
+            // v49.0.0 (CIRISPersist#908, V153 mirror).
+            state
+                .federation_community_membership_revocation_cosignatures
+                .insert(revocation_key.clone(), revocation.cosignatures);
+            // v36.0.0 (#668) — serve position (V130 mirror).
+            let admitted_at = next_plane_position(
+                &state,
+                PLANE_COMMUNITY_MEMBERSHIP_REVOCATION,
+                community_membership_revocation_rows(&state).into_iter(),
+            );
+            let resume = crate::federation::types::compound_resume_id(&[
+                &revocation_key.0,
+                &revocation_key.1,
+                &revocation_key.2.to_rfc3339(),
+            ]);
+            state
+                .federation_community_membership_revocations
+                .insert(revocation_key, row);
+            stamp_plane_position(
+                &mut state,
+                PLANE_COMMUNITY_MEMBERSHIP_REVOCATION,
+                resume,
+                admitted_at,
+            );
+        }
+        self.index_stored_record("CommunityMembershipRevocation", &wire_index_key)
+            .await?;
+        Ok(())
+    }
+
+    async fn store_planned_community_widening(
+        &self,
+        planned: crate::federation::community_admit::PlannedCommunityWidening,
+    ) -> Result<(), crate::federation::Error> {
+        let crate::federation::community_admit::PlannedCommunityWidening {
+            widening,
+            wire_index_key,
+        } = planned;
+        let row = widening.community_membership_widening;
+        {
+            let mut state = self.state.lock().expect("memory backend lock");
+            if !state.federation_keys.contains_key(&row.member_key_id) {
+                return Err(crate::federation::Error::InvalidArgument(format!(
+                    "{} does not exist in federation_keys",
+                    row.member_key_id
+                )));
+            }
+            let key = (
+                row.community_key_id.clone(),
+                row.member_key_id.clone(),
+                row.effective_at,
+            );
+            if state
+                .federation_community_membership_widenings
+                .contains_key(&key)
+            {
+                return Ok(());
+            }
+            state
+                .federation_community_membership_widening_authority_sigs
+                .insert(
+                    key.clone(),
+                    (
+                        widening.authority_key_id,
+                        widening.scrub_signature_classical,
+                        widening.scrub_signature_pqc,
+                    ),
+                );
+            // v49.0.0 (CIRISPersist#908, V153 mirror).
+            state
+                .federation_community_membership_widening_cosignatures
+                .insert(key.clone(), widening.cosignatures);
+            let admitted_at = next_plane_position(
+                &state,
+                PLANE_COMMUNITY_MEMBERSHIP_WIDENING,
+                community_membership_widening_rows(&state).into_iter(),
+            );
+            let resume = crate::federation::types::compound_resume_id(&[
+                &key.0,
+                &key.1,
+                &key.2.to_rfc3339(),
+            ]);
+            state
+                .federation_community_membership_widenings
+                .insert(key, row);
+            stamp_plane_position(
+                &mut state,
+                PLANE_COMMUNITY_MEMBERSHIP_WIDENING,
+                resume,
+                admitted_at,
+            );
+        }
+        self.index_stored_record("CommunityMembershipWidening", &wire_index_key)
+            .await?;
+        Ok(())
+    }
+
+    async fn store_planned_community_listing(
+        &self,
+        planned: crate::federation::community_admit::PlannedCommunityListing,
+    ) -> Result<(), crate::federation::Error> {
+        let crate::federation::community_admit::PlannedCommunityListing {
+            listing,
+            wire_index_key,
+        } = planned;
+        {
+            let mut state = self.state.lock().expect("memory backend lock");
+            let row = &listing.community_membership_listing;
+            // The V156 FKs: the room (the plan checked it) and the member.
+            if !state
+                .federation_communities
+                .contains_key(&row.community_key_id)
+            {
+                return Err(crate::federation::Error::InvalidArgument(format!(
+                    "{} does not exist in federation_communities",
+                    row.community_key_id
+                )));
+            }
+            if !state.federation_keys.contains_key(&row.member_key_id) {
+                return Err(crate::federation::Error::InvalidArgument(format!(
+                    "{} does not exist in federation_keys",
+                    row.member_key_id
+                )));
+            }
+            let key = (
+                row.community_key_id.clone(),
+                row.member_key_id.clone(),
+                row.effective_at,
+            );
+            if state
+                .federation_community_membership_listings
+                .contains_key(&key)
+            {
+                return Ok(());
+            }
+            let resume = crate::federation::types::compound_resume_id(&[
+                &key.0,
+                &key.1,
+                &key.2.to_rfc3339(),
+            ]);
+            let rows = community_membership_listing_rows(&state);
+            allocate_and_stamp(&mut state, PLANE_COMMUNITY_MEMBERSHIP_LISTING, resume, rows);
+            state
+                .federation_community_membership_listings
+                .insert(key, listing);
+        }
+        self.index_stored_record("CommunityMembershipListing", &wire_index_key)
+            .await?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    async fn rival_community_write_at(
+        &self,
+        at: crate::store::test_hooks::RivalPoint,
+    ) -> Result<(), crate::federation::Error> {
+        self.test_rival_at(at).await
     }
 }
 
@@ -13557,6 +13761,9 @@ mod tests {
         use crate::federation::FederationDirectory as _;
         use crate::store::Backend as _;
         let backend = MemoryBackend::new();
+        // v57.0.0 (#988 item 2) — a hard_case row needs this node's key.
+        crate::federation::hard_case::test_support::declare_node(&backend, "memory-test-node")
+            .await;
         backend
             .insert_trace_events_batch(&[dsar_fixture_row("agent-721", "key-721", "t-721")])
             .await
@@ -13588,6 +13795,9 @@ mod tests {
     async fn peer_removal_is_announced_attributed_and_moves_the_cursor_721() {
         use crate::federation::FederationDirectory as _;
         let backend = MemoryBackend::new();
+        // v57.0.0 (#988 item 2) — a hard_case row needs this node's key.
+        crate::federation::hard_case::test_support::declare_node(&backend, "memory-test-node")
+            .await;
         backend
             .add_peer_record("peer-721", "cGs=", "node", None)
             .await
@@ -15516,6 +15726,9 @@ mod tests {
     #[tokio::test]
     async fn node_state_surface_memory() {
         let backend = MemoryBackend::new();
+        // v57.0.0 (#988 item 2) — a hard_case row needs this node's key.
+        crate::federation::hard_case::test_support::declare_node(&backend, "memory-test-node")
+            .await;
         crate::federation::node_state::parity_test_support::assert_node_state_surface(
             &backend, "mem",
         )
@@ -16055,6 +16268,9 @@ mod tests {
     async fn dsar_per_key_scopes_correctly() {
         use crate::store::Backend;
         let backend = MemoryBackend::new();
+        // v57.0.0 (#988 item 2) — a hard_case row needs this node's key.
+        crate::federation::hard_case::test_support::declare_node(&backend, "memory-test-node")
+            .await;
         // Same agent_id_hash, two different signing keys (key1 + key2).
         // Plus a different agent's row (other) under the same key1.
         backend
@@ -16100,6 +16316,9 @@ mod tests {
     async fn dsar_per_key_cascades_llm_calls() {
         use crate::store::Backend;
         let backend = MemoryBackend::new();
+        // v57.0.0 (#988 item 2) — a hard_case row needs this node's key.
+        crate::federation::hard_case::test_support::declare_node(&backend, "memory-test-node")
+            .await;
         backend
             .insert_trace_events_batch(&[
                 dsar_fixture_row("agent-A", "key1", "k1-t1"),
@@ -16165,6 +16384,9 @@ mod tests {
         use crate::federation::{hard_case, FederationDirectory, HardCaseFilter};
         use crate::store::Backend;
         let backend = MemoryBackend::new();
+        // v57.0.0 (#988 item 2) — a hard_case row needs this node's key.
+        crate::federation::hard_case::test_support::declare_node(&backend, "memory-test-node")
+            .await;
         // agent-A under two keys + an unrelated agent-B.
         backend
             .insert_trace_events_batch(&[
@@ -19919,6 +20141,9 @@ mod tests {
     async fn remove_peer_record_soft_marks_removed_at_and_hides_from_reads() {
         use crate::federation::FederationDirectory;
         let backend = MemoryBackend::new();
+        // v57.0.0 (#988 item 2) — a hard_case row needs this node's key.
+        crate::federation::hard_case::test_support::declare_node(&backend, "memory-test-node")
+            .await;
         backend
             .add_peer_record("peer-soft", "AAAA", "agent", None)
             .await
@@ -19950,6 +20175,9 @@ mod tests {
         use crate::federation::FederationDirectory;
         use crate::federation::{SignedAttestation, SignedKeyRecord};
         let backend = MemoryBackend::new();
+        // v57.0.0 (#988 item 2) — a hard_case row needs this node's key.
+        crate::federation::hard_case::test_support::declare_node(&backend, "memory-test-node")
+            .await;
         // Add a peer + a counter-peer so we can build an attestation
         // between them. v9.0.0 (CC 5.3.2.4.3.1): the attestation below is
         // federation-tier, so its attester (peer-att-a) must carry REAL
@@ -20017,6 +20245,9 @@ mod tests {
     async fn remove_peer_record_hard_with_no_attestations_cascades() {
         use crate::federation::FederationDirectory;
         let backend = MemoryBackend::new();
+        // v57.0.0 (#988 item 2) — a hard_case row needs this node's key.
+        crate::federation::hard_case::test_support::declare_node(&backend, "memory-test-node")
+            .await;
         backend
             .add_peer_record("peer-hard", "AAAA", "agent", None)
             .await
@@ -20379,6 +20610,9 @@ mod tests {
     #[tokio::test]
     async fn family_membership_revocation_emits_removed_hard_case() {
         let backend = family_backend("fam-A", "carol").await;
+        // v57.0.0 (#988 item 2) — a hard_case row needs this node's key.
+        crate::federation::hard_case::test_support::declare_node(&backend, "memory-test-node")
+            .await;
         let effective: chrono::DateTime<chrono::Utc> = "2026-06-10T12:00:00Z".parse().unwrap();
         let rev = FamilyMembershipRevocation {
             family_key_id: "fam-A".into(),
@@ -21574,6 +21808,9 @@ mod tests {
         use crate::federation::FederationDirectory;
         use std::time::Duration;
         let backend = MemoryBackend::new();
+        // v57.0.0 (#988 item 2) — a hard_case row needs this node's key.
+        crate::federation::hard_case::test_support::declare_node(&backend, "memory-test-node")
+            .await;
         for k in ["subject-c", "target-c"] {
             backend
                 .put_public_key(SignedKeyRecord {
@@ -21758,6 +21995,9 @@ mod tests {
         use crate::federation::FederationDirectory;
         use std::time::Duration;
         let backend = MemoryBackend::new();
+        // v57.0.0 (#988 item 2) — a hard_case row needs this node's key.
+        crate::federation::hard_case::test_support::declare_node(&backend, "memory-test-node")
+            .await;
         for k in ["subject-r", "target-r"] {
             backend
                 .put_public_key(SignedKeyRecord {
@@ -22469,9 +22709,11 @@ mod tests {
     #[tokio::test]
     async fn reverse_quorum_parity_memory_574() {
         let backend = MemoryBackend::new();
-        crate::federation::reverse_quorum::test_support::exercise_reverse_quorum(
-            &backend,
-            "memory-rq",
+        Box::pin(
+            crate::federation::reverse_quorum::test_support::exercise_reverse_quorum(
+                &backend,
+                "memory-rq",
+            ),
         )
         .await;
     }
@@ -22529,6 +22771,9 @@ mod tests {
     #[tokio::test]
     async fn admin_ops_parity_memory_570() {
         let backend = MemoryBackend::new();
+        // v57.0.0 (#988 item 2) — a hard_case row needs this node's key.
+        crate::federation::hard_case::test_support::declare_node(&backend, "memory-test-node")
+            .await;
         crate::federation::quarantine::test_support::exercise_admin_ops(&backend, "memory-qa")
             .await;
     }

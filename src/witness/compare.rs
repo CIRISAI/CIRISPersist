@@ -164,13 +164,32 @@ pub struct WitnessEquivocationRecord {
 /// peer; `detail` carries the epoch, namespace set, and the two conflicting
 /// roots (hex) so the case is a self-contained non-repudiable record.
 /// `emitted_at` is the observation instant (caller passes `now`).
+///
+/// v57.0.0 (CIRISPersist#988 item 2, CC 6.1.1, CLM-hard-case-on-base) — the
+/// proof row carries BOTH validly-signed witnesses as envelope members
+/// (`detail.witnesses`): the held corpus rows of `peer_id` at `epoch_id`
+/// whose roots are the two conflicting ones, each with its Ed25519 and
+/// ML-DSA-65 signature halves (verified at admission, `put_wholeness_witness`).
+/// The proof is then non-repudiable on every node that holds the row, not
+/// only on the node that held the corpus. `held` is the peer's corpus; a
+/// caller with none passes `&[]` and the row carries the roots alone.
 #[must_use]
 pub fn equivocation_hard_case(
     proof: &Equivocation,
+    held: &[StoredWitness],
     emitted_at: chrono::DateTime<chrono::Utc>,
 ) -> crate::federation::HardCaseEvent {
     let root_a = super::types::encode_root_hex(&proof.roots.0);
     let root_b = super::types::encode_root_hex(&proof.roots.1);
+    let mut witnesses: Vec<&StoredWitness> = held
+        .iter()
+        .filter(|w| {
+            w.peer_id == proof.peer_id
+                && w.epoch_id == proof.epoch_id
+                && (w.merkle_root_hex == root_a || w.merkle_root_hex == root_b)
+        })
+        .collect();
+    witnesses.sort_by(|x, y| x.merkle_root_hex.cmp(&y.merkle_root_hex));
     crate::federation::HardCaseEvent {
         // Deterministic id keyed on (peer, epoch, both roots) so a re-scan
         // of the same equivocation is idempotent (no duplicate row).
@@ -187,6 +206,7 @@ pub fn equivocation_hard_case(
             "claim_namespaces": proof.claim_namespaces,
             "root_a": root_a,
             "root_b": root_b,
+            "witnesses": witnesses,
         }),
         emitted_at,
     }
@@ -264,8 +284,8 @@ mod tests {
             roots: ([1u8; 32], [2u8; 32]),
         };
         let now = chrono::Utc::now();
-        let e1 = equivocation_hard_case(&proof, now);
-        let e2 = equivocation_hard_case(&proof, now);
+        let e1 = equivocation_hard_case(&proof, &[], now);
+        let e2 = equivocation_hard_case(&proof, &[], now);
         assert_eq!(e1.event_id, e2.event_id);
         assert_eq!(e1.kind, WITNESS_EQUIVOCATION);
         assert_eq!(e1.target_key_id.as_deref(), Some("a"));

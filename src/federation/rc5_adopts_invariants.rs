@@ -1957,12 +1957,22 @@ pub mod bodies {
         let founders = || vec![seat(&h1, "founder"), seat(&h2, "founder")];
         let offered = infra_room(&room, "founder_only", founders());
         let clean = FaultInjectingDirectory::new(inner.clone());
-        let e = admission::check_replicated_supersede_does_not_degrade(&clean, &offered)
-            .await
-            .expect_err("a conformant stored room refuses a degrading offer");
+        let e = admission::check_replicated_supersede_does_not_degrade(
+            &clean,
+            &offered,
+            chrono::Utc::now(),
+        )
+        .await
+        .expect_err("a conformant stored room refuses a degrading offer");
         assert_eq!(violation_rule(&e), INFRA_RULE_PROTOCOL_NOT_QUORUM, "{tag}");
         let failing = FaultInjectingDirectory::new(inner.clone()).erroring(READ);
-        match admission::check_replicated_supersede_does_not_degrade(&failing, &offered).await {
+        match admission::check_replicated_supersede_does_not_degrade(
+            &failing,
+            &offered,
+            chrono::Utc::now(),
+        )
+        .await
+        {
             Err(Error::Backend(m)) => assert!(m.contains(READ), "{tag}: {m}"),
             other => panic!(
                 "{tag}: a failed read of the stored row's founders is not legacy \
@@ -1979,6 +1989,7 @@ pub mod bodies {
         admission::check_replicated_supersede_does_not_degrade(
             &failing,
             &infra_room(&legacy, "founder_only", founders()),
+            chrono::Utc::now(),
         )
         .await
         .unwrap_or_else(|e| {

@@ -103,6 +103,15 @@ pub enum Error {
     #[error("backend: {0}")]
     Backend(String),
 
+    /// v57.0.0 (CIRISPersist#988 item 2) — an erasure that must record its
+    /// `hard_case:trace_erasure` row was refused before it deleted anything:
+    /// this node cannot attest the row (no declared node key, or one it does
+    /// not hold). Carries the federation refusal
+    /// ([`crate::federation::Error::HardCaseAttesterUnavailable`]); `kind()`
+    /// is its token. Python `ciris_persist.NodeIdentityRequired`.
+    #[error("{0}")]
+    HardCaseAttesterUnavailable(Box<crate::federation::Error>),
+
     /// v8.0.0 (CIRISPersist#227) — a fountain content admission was
     /// rejected (the #225 hybrid hard cut on the manifest, a per-symbol
     /// SHA-256 mismatch, or a structural-invariant violation). Carries
@@ -200,6 +209,19 @@ impl From<crate::schema::Error> for Error {
 }
 
 impl Error {
+    /// v57.0.0 (CIRISPersist#988 item 2) — a refusal of
+    /// [`crate::federation::attestation_admit::hard_case_attester`] on an
+    /// erasure door: the typed arm for the attester refusal, `Backend` for
+    /// anything else (a substrate failure reading the node's key).
+    pub(crate) fn from_hard_case_attester(e: crate::federation::Error) -> Self {
+        match e {
+            e @ crate::federation::Error::HardCaseAttesterUnavailable { .. } => {
+                Error::HardCaseAttesterUnavailable(Box::new(e))
+            }
+            other => Error::Backend(format!("hard_case attester: {other}")),
+        }
+    }
+
     /// Stable string-token identifying the error variant.
     /// THREAT_MODEL.md AV-15: HTTP / PyO3 sanitization. The verbose
     /// `Display` form (which may include Postgres error context)
@@ -209,6 +231,9 @@ impl Error {
             Error::Schema(s) => s.kind(),
             Error::NotImplemented(_) => "store_not_implemented",
             Error::Backend(_) => "store_backend",
+            Error::HardCaseAttesterUnavailable(_) => {
+                crate::federation::hard_case::refusal::ATTESTER_UNAVAILABLE
+            }
             Error::Migration { .. } => "store_migration",
             Error::MigrationLockTimeout { .. } => "store_migration_lock_timeout",
             Error::FountainAdmit(e) => e.kind(),
