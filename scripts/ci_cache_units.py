@@ -337,6 +337,14 @@ def bound_checks() -> list[tuple[bool, str]]:
         out.append((not far.exists() and not (prof / ".fingerprint" / far.name).exists(),
                     "--strict removes it, with its fingerprint"))
         out.append((sealed.exists(), "--strict keeps a sealed, consistent unit"))
+        # The CLI, both flag positions, and the forms that must refuse.
+        out.append((main(["x", "repair", "--strict", str(t)]) == 0,
+                    "CLI: `repair --strict <dir>` (the restore action's form) runs"))
+        out.append((main(["x", "repair", str(t), "--strict"]) == 0,
+                    "CLI: `repair <dir> --strict` runs"))
+        out.append((main(["x", "seal", str(t)]) == 0, "CLI: `seal <dir>` runs"))
+        out.append((main(["x", "seal", "--strict", str(t)]) == 2, "CLI: `seal --strict` is usage"))
+        out.append((main(["x", "repair"]) == 2, "CLI: a missing dir is usage"))
     return out
 
 
@@ -347,15 +355,20 @@ def main(argv: list[str]) -> int:
             stream.reconfigure(encoding="utf-8", errors="replace")
     if len(argv) == 2 and argv[1] == "--self-test":
         return self_test()
-    strict = argv[1:2] == ["repair"] and argv[3:] == ["--strict"]
-    if not strict and (len(argv) != 3 or argv[1] not in ("seal", "repair")):
+    # `--strict` may sit anywhere after the verb (`repair --strict <dir>` is
+    # what .github/actions/ciriscache runs; `repair <dir> --strict` is the
+    # documented form). v57.0.0: the first cut accepted only the second, and
+    # every PR-CI job of #1093 printed this usage and exited 2.
+    args = [a for a in argv[1:] if a != "--strict"]
+    strict = len(args) != len(argv) - 1
+    if len(args) != 2 or args[0] not in ("seal", "repair") or (strict and args[0] != "repair"):
         print(__doc__, file=sys.stderr)
         return 2
-    target = Path(argv[2])
+    verb, target = args[0], Path(args[1])
     if not target.is_dir():
-        print(f"ci_cache_units: no target directory at {target}; nothing to {argv[1]}")
+        print(f"ci_cache_units: no target directory at {target}; nothing to {verb}")
         return 0
-    return seal(target) if argv[1] == "seal" else repair(target, strict=strict)
+    return seal(target) if verb == "seal" else repair(target, strict=strict)
 
 
 if __name__ == "__main__":

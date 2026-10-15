@@ -22,6 +22,8 @@ threat-model citations because this crate's audit story is the point.
   (build scripts rerun, minutes) until a sealed save replaces the blob.
   The v56.0.0 release body was set by hand, as v55.0.0's was.
 
+- The repair's CLI accepts `--strict` in either position (`repair --strict <dir>` is the restore action's form). PR #1093's first CI run printed usage and exited 2 on every job; the self-test now exercises the CLI (19 checks).
+
 ### Changed — CIRISVerify v20.2.0 re-pin (CIRISVerify#309)
 
 - The seven Rust pins (`ciris-verify-core`, `ciris-keyring` ×4 targets,
