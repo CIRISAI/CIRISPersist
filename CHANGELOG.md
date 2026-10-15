@@ -7,6 +7,16 @@ threat-model citations because this crate's audit story is the point.
 
 ## [Unreleased]
 
+## [58.0.0] - Unreleased
+
+### Changed — BREAKING: the key plane as rows (CIRISPersist#991 plane 1 of 3; CC 3.1.3, CC 3.3.6, CC 2.4.1.1; CLM-planes-as-rows)
+
+- A key's claim of itself is a `scores` row on `key:record:v1` and a key-plane
+  revocation a `scores` row on `key:revocation:v1`; `federation_keys` and
+  `federation_revocations` are their projections (V198: `attestation_id`, FK
+  `ON DELETE SET NULL`). Persist mints each row from the signed object it
+  verified (`federation::key_plane`); the full entry lands with the slice.
+
 ## [57.0.0] - 2026-10-15
 
 ### Fixed — tag CI: the restored cache repair runs `--strict` (v56.0.0 windows wheel)

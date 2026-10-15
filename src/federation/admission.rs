@@ -9338,6 +9338,16 @@ pub async fn check_withdraws_admission_at(
                  retroactively un-shared (CC 3.3.2); rotate the epoch instead"
             )));
         }
+        // v58.0.0 (CIRISPersist#991, CC 2.4.1.1 rule 0, CC 3.1.3) — a
+        // `key:revocation:v1` row is withdrawn by nobody, its revoker included:
+        // revocation is non-rollbackable (CC 3.1.1). A narrower bound is a new
+        // revocation that lowers `revoked_after`.
+        if crate::federation::key_plane::is_never_withdrawn(&target) {
+            return Err(Error::InvalidArgument(format!(
+                "recants names a key:revocation:v1 row ({target_id}) — a key-plane revocation is \
+                 never withdrawn (CC 2.4.1.1 rule 0)"
+            )));
+        }
         if !crate::federation::precedence::retraction_entitled(row, &target) {
             return Err(Error::InvalidArgument(format!(
                 "recants_not_admitted: {} is not the attester of {target_id} — only the original \
@@ -9391,6 +9401,16 @@ pub async fn check_withdraws_admission_at(
     // v55.0.0 (#989, CC 3.3.2 rc7) — the per-recipient `scores` row on
     // `key_grant:{axis}:v1` ("a `withdraws` or `recants` naming a `key_grant`
     // row is refused"), and a held retired SET alike.
+    // v58.0.0 (CIRISPersist#991, CC 2.4.1.1 rule 0, CC 3.1.3) — a
+    // `key:revocation:v1` row is withdrawn by nobody, its revoker included:
+    // revocation is non-rollbackable (CC 3.1.1). Refused, never admitted inert.
+    if crate::federation::key_plane::is_never_withdrawn(&target) {
+        return Err(Error::InvalidArgument(format!(
+            "withdraws names a key:revocation:v1 row ({}) — a key-plane revocation is never \
+             withdrawn (CC 2.4.1.1 rule 0); lower its bound with a new revocation instead",
+            target.attestation_id
+        )));
+    }
     if crate::federation::key_grant::is_key_grant_row(&target)
         || crate::federation::key_grant::is_retired_key_grant_set_type(&target.attestation_type)
     {

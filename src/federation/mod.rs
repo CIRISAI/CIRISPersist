@@ -362,6 +362,8 @@ pub mod key_digest;
 // CIRISPersist#848 (BLOB_REPLICATION.md Part II) — key transport:
 // the CC 3 `key_grant` on the sixteenth replicated kind; per-minter epochs.
 pub mod key_grant;
+// v58.0.0 (CIRISPersist#991 plane 1; CC 3.1.3) — the key plane as rows.
+pub mod key_plane;
 // #848 §18 — the two-node witnesses I59–I67; `pub` under `test-anchor` so
 // consumers can drive them against their own backends.
 #[cfg(any(test, feature = "test-anchor"))]

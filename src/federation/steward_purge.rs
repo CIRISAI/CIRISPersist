@@ -385,6 +385,25 @@ pub const ATTESTATION_PROJECTIONS: &[(&str, &str, ProjectionRemoval)] = &[
         "attestation_id",
         ProjectionRemoval::ForeignKeyCascade,
     ),
+    // v58.0.0 (CIRISPersist#991; V198) — the key plane's three projections.
+    // SET NULL, never CASCADE: a hard delete of a key-plane row leaves the
+    // key, the revocation or the occurrence held, without its row (CC 2.4.1.1:
+    // a purge never deletes a key), and the rebuild gate names it.
+    (
+        "federation_keys",
+        "attestation_id",
+        ProjectionRemoval::ForeignKeySetNull,
+    ),
+    (
+        "federation_revocations",
+        "attestation_id",
+        ProjectionRemoval::ForeignKeySetNull,
+    ),
+    (
+        "federation_identity_occurrences",
+        "attestation_id",
+        ProjectionRemoval::ForeignKeySetNull,
+    ),
 ];
 
 /// Tables with an `*attestation_id` column that are NOT projections of a

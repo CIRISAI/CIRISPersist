@@ -155,6 +155,14 @@ where
         reason,
     };
 
+    // v58.0.0 (CIRISPersist#991, CC 3.1.3) — a key-plane row's signature is
+    // its signed object's own, over the object's own bytes; the row is a pure
+    // function of that object. The family's rule, not the generic one
+    // (`key_plane::verify_plane_row`).
+    if super::key_plane::verify_plane_row(directory, row).await? {
+        return Ok(());
+    }
+
     let computed_hash = verify_envelope_hybrid_signature(
         directory,
         &row.attesting_key_id,

@@ -27,11 +27,26 @@ pub enum SiloProjection {
     HardCaseEvents,
     /// `detection_events` ← `detection:*` rows (#988 item 3).
     DetectionEvents,
+    /// v58.0.0 (CIRISPersist#991, CC 3.1.3) — `federation_keys` ←
+    /// `key:record:v1` rows. Rendered as each record's claim and the row it
+    /// names (`key_plane::render_key_projection`); a key held without its row
+    /// (one that verifies under neither the proof-of-possession rule nor a
+    /// held base signer: hybrid-pending, unsigned, a bad scrub) is a red.
+    FederationKeys,
+    /// v58.0.0 (CIRISPersist#991, CC 2.4.1.1) — `federation_revocations` ←
+    /// `key:revocation:v1` rows. A revocation held without its row (a pre-v58
+    /// Ed25519-only one) is a red.
+    FederationRevocations,
 }
 
 impl SiloProjection {
     /// Every projection, in declaration order.
-    pub const ALL: [SiloProjection; 2] = [Self::HardCaseEvents, Self::DetectionEvents];
+    pub const ALL: [SiloProjection; 4] = [
+        Self::HardCaseEvents,
+        Self::DetectionEvents,
+        Self::FederationKeys,
+        Self::FederationRevocations,
+    ];
 
     /// The stable name: the projection's table name without a schema.
     #[must_use]
@@ -39,6 +54,8 @@ impl SiloProjection {
         match self {
             Self::HardCaseEvents => "hard_case_events",
             Self::DetectionEvents => "detection_events",
+            Self::FederationKeys => "federation_keys",
+            Self::FederationRevocations => "federation_revocations",
         }
     }
 }

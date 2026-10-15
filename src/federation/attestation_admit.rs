@@ -355,6 +355,20 @@ pub(crate) async fn put_attestation_planned<D>(
 where
     D: AttestationStore,
 {
+    // v58.0.0 (CIRISPersist#991, CC 3.1.3) — a key-plane row goes to its
+    // family's door: proof of possession, not resolve-the-attester; the
+    // object's own signature, not one over the row's envelope.
+    if super::key_plane::is_key_plane_row(&attestation.attestation) {
+        use super::key_plane::KeyPlaneApplied;
+        return match super::key_plane::apply_key_plane_row(dir, &attestation.attestation).await? {
+            KeyPlaneApplied::Changed => Ok(AttestationOutcome::Inserted),
+            KeyPlaneApplied::Unchanged => Ok(AttestationOutcome::AlreadyHeld),
+            KeyPlaneApplied::Refused(reason) => Err(Error::Conflict(format!(
+                "key-plane row {} not applied: {reason}",
+                attestation.attestation.attestation_id
+            ))),
+        };
+    }
     // v53.0.0 (#963) — a row that changes an owner's cohort allow list for
     // one of its nodes (a `consent:replication` grant FOR the node, or the
     // owner's retraction of one): read before the row moves, acted on only
