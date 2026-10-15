@@ -4954,7 +4954,7 @@ pub trait FederationDirectory: Send + Sync {
     /// [`Self::put_family`]'s FK-only precedent and the constitutional-family
     /// invariant), so there is no key the boot process could sign with.
     /// **Never reachable from the replication apply / any wire surface** —
-    /// mirrors [`Self::put_identity_occurrence_revocation_local`]'s
+    /// mirrors `Self::put_identity_occurrence_revocation_local` (retired in v58.0.0)'s
     /// trusted-local precedent. Default impl errors; backends override.
     async fn put_family_local(&self, family: Family) -> Result<(), Error> {
         let _ = family;
@@ -5192,7 +5192,7 @@ pub trait FederationDirectory: Send + Sync {
     //     secrecy key_grant gate (Ask 4) depend on.
 
     /// v16.0.0 (CIRISPersist#421) — write a **trusted-local** occurrence
-    /// revocation, bypassing the [`Self::put_identity_occurrence_revocation`]
+    /// revocation, bypassing the `Self::put_identity_occurrence_revocation` (retired in v58.0.0)
     /// signature gate. For engine-internal writes on behalf of the local user
     /// where the revocation is locally produced — NOT peer-received, so not the
     /// permanent-DoS forgery the gate closes. Grandfathered: the signature
@@ -8527,7 +8527,7 @@ pub trait FederationDirectory: Send + Sync {
     /// read**: every SIGNED-put route row of `occurrence_key_id` with its
     /// original `{attesting_key_id, signed_envelope, signature}` container,
     /// byte-exact (the mirror of
-    /// [`Self::list_signed_identity_occurrence_revocations_for`]). Trusted-
+    /// `Self::list_signed_identity_occurrence_revocations_for` (retired in v58.0.0)). Trusted-
     /// local rows (NULL signature columns) are OMITTED — a bare local route
     /// is not replicable (the receiver could not verify it). RETIRED rows are
     /// INCLUDED: tombstones must gossip. Default impl errors; the three

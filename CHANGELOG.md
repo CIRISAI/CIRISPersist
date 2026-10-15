@@ -11,11 +11,81 @@ threat-model citations because this crate's audit story is the point.
 
 ### Changed — BREAKING: the key plane as rows (CIRISPersist#991 plane 1 of 3; CC 3.1.3, CC 3.3.6, CC 2.4.1.1; CLM-planes-as-rows)
 
-- A key's claim of itself is a `scores` row on `key:record:v1` and a key-plane
-  revocation a `scores` row on `key:revocation:v1`; `federation_keys` and
-  `federation_revocations` are their projections (V198: `attestation_id`, FK
-  `ON DELETE SET NULL`). Persist mints each row from the signed object it
-  verified (`federation::key_plane`); the full entry lands with the slice.
+A key's claim of itself, a key-plane revocation and an identity's occurrence
+record are `scores` rows on the attestation plane; `federation_keys`,
+`federation_revocations` and the signed rows of
+`federation_identity_occurrences` are their projections
+(`federation::key_plane`).
+
+- **Who signs a row.** Persist mints each row from the signed object it
+  verified (the `trace:complete:v1` / `detection:*` precedent), so no producer
+  changes its wire. The row carries the object under one envelope member
+  (`key_record`, `revocation`, `identity_occurrence`), its signature columns
+  are the object's own hybrid signature, and its id is
+  `sha256(domain ‖ JCS(object))`. A receiver re-derives the row from the
+  object and refuses one that differs by a byte
+  (`check_canonical_plane_row`); the generic verify defers to that family rule.
+- **`key:record:v1`** (attester = attested = the key) is admitted by proof of
+  possession against the keys it carries
+  (`register::verify_proof_of_possession`). A record whose base scrub is
+  another key's (the pre-rc8 conferral shape: anchor-scrubbed records, the
+  baked `ciris-canonical-1` seed, a scrub-upgraded key) is a row too, verified
+  against its held signer. A record that verifies under neither — Ed25519-only,
+  unsigned (operator-added peers), a bad scrub — is held without a row. A
+  key's newer claim (rebind, rotation, scrub upgrade, PQC completion) is a new
+  row that replaces the older one, whose bytes stay in
+  `federation_key_registration_history`.
+- **`key:revocation:v1`** (attester = the revoker; subject the key digest the
+  object carries). `put_revocation` is one plan on every backend
+  (`key_plane::plan_put_revocation` + `KeyPlaneStore::store_planned_revocation`);
+  `revoked_after` only ever lowers (a raising revocation is refused
+  `RevocationBoundRefusal::BoundRaised`, `bound_raised`); a `withdraws` or
+  `recants` naming the row is refused, its revoker's included. **An
+  Ed25519-only revocation is refused**: the hybrid-pending revocation path
+  ends (`attach_revocation_pqc_signature`, `list_hybrid_pending_revocations`
+  and the revocation leg of `run_pqc_sweep` are removed).
+- **`identity:occurrence:v1`** (attester = the signer, attested = the
+  identity), for a hybrid-signed occurrence. **An occurrence's revocation is a
+  `withdraws` on its row**, admitted when the issuer acts for the identity
+  (`signer_acts_for`, CC 3.3.6); it feeds the local
+  `federation_identity_occurrence_revocations` projection. CC rc8 names no
+  family for occurrence revocations. The signed revocation object and its
+  door are removed (`put_identity_occurrence_revocation`,
+  `list_signed_identity_occurrence_revocations_for`,
+  `SignedIdentityOccurrenceRevocation`,
+  `verify_signed_identity_occurrence_revocation`).
+- **The order rule.** Every other row is admitted only once its signer's key
+  is held; until then the refusal is the retryable `AttesterKeyUnknown`
+  (`federation_attester_key_unknown`, CIRISPersist#1042). A key's own record
+  is the one exception (proof of possession).
+- **V198** (sqlite + postgres): `attestation_id` on the three tables, FK
+  `ON DELETE SET NULL` (a deleted row never deletes a key, CC 2.4.1.1).
+  `silo_projection` gains `FederationKeys`, `FederationRevocations` and
+  `IdentityOccurrences`; `check_projection_rebuild` is red while a key,
+  revocation or signed occurrence is held without its row.
+- **Lazy rehome**, once per backend at the first key-plane write: every
+  pre-V198 record that verifies gets its row, asserted at its own
+  `scrub_timestamp` (an occurrence at its own `asserted_at`); one that does
+  not stays held without a row and the gate names it.
+- **Replication.** Key-plane rows ride the Attestation kind. Retired with the
+  framed carriage: `list_signed_key_records_since`,
+  `list_signed_revocations_since`, `list_signed_identity_occurrences_since`,
+  `list_signed_identity_occurrence_revocations_since` (trait, backends,
+  capsule ops, Python). `DIRECTORY_ABI_VERSION` 7 → 8. The four
+  `EnvelopeKind`s stay in the hashed vocabulary (the v55 `KeyGrant` precedent)
+  and are settle-exempt; the key-plane door settles a byte-identical re-offer.
+  The signed wire index carries the rows as `Attestation` entries;
+  `wire_refs_for_subject` advertises a subject's revocation rows.
+- **Python.** Removed: `list_signed_key_records_since`,
+  `list_signed_revocations_since`, `list_signed_identity_occurrences_since`,
+  `list_signed_identity_occurrence_revocations_since`,
+  `attach_revocation_pqc_signature`. `put_revocation` signs a missing
+  ML-DSA-65 half with the engine's PQC signer before the put (it was a cold
+  attach after it). `run_pqc_sweep()` no longer reports
+  `by_table.federation_revocations`. `put_public_key`, `register_federation_key`,
+  `apply_replicated_key_record` and `put_identity_occurrence_json` keep their
+  signatures.
+- Witnesses I975–I980 on memory, sqlite and postgres (each with a red leg).
 
 ## [57.0.0] - 2026-10-15
 

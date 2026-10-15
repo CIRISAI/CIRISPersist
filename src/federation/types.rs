@@ -3906,14 +3906,14 @@ pub struct ServedRevocation {
     pub revocation: Revocation,
     /// When THIS node admitted the row — receiver-stamped, never read from the
     /// wire, monotonic in this node's own arrival order. The value a caller
-    /// resumes [`list_signed_revocations_since`](crate::federation::FederationDirectory::list_signed_revocations_since)
+    /// resumes `list_signed_revocations_since` (retired in v58.0.0)
     /// from.
     pub admitted_at: chrono::DateTime<chrono::Utc>,
 }
 
 impl ServedKeyRecord {
     /// v36.0.0 (CIRISPersist#668) — the `(admitted_at, id)` PAIR a caller
-    /// resumes [`list_signed_key_records_since`](crate::federation::FederationDirectory::list_signed_key_records_since)
+    /// resumes `list_signed_key_records_since` (retired in v58.0.0)
     /// from. The pair, never the instant alone: a page ordered by
     /// `(instant, id)` and resumed by instant alone skips the remainder of any
     /// tie larger than one page.
@@ -3925,7 +3925,7 @@ impl ServedKeyRecord {
 
 impl ServedRevocation {
     /// v36.0.0 (CIRISPersist#668) — the `(admitted_at, id)` PAIR a caller
-    /// resumes [`list_signed_revocations_since`](crate::federation::FederationDirectory::list_signed_revocations_since)
+    /// resumes `list_signed_revocations_since` (retired in v58.0.0)
     /// from.
     #[must_use]
     pub fn resume_pair(&self) -> (chrono::DateTime<chrono::Utc>, String) {

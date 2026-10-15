@@ -3887,7 +3887,7 @@ impl FederationDirectory for OpsDirectory {
     }
 
     /// v21.1.0 (CIRISPersist#507c) — structural mirror of
-    /// [`Self::list_signed_key_records_since`].
+    /// `Self::list_signed_key_records_since` (retired in v58.0.0).
     async fn list_signed_transport_destinations_since(
         &self,
         since: Option<(chrono::DateTime<chrono::Utc>, String)>,
@@ -3906,7 +3906,7 @@ impl FederationDirectory for OpsDirectory {
     }
 
     /// v21.1.0 (CIRISPersist#507c) — structural mirror of
-    /// [`Self::list_signed_key_records_since`]; federation-tier-only rows
+    /// `Self::list_signed_key_records_since` (retired in v58.0.0); federation-tier-only rows
     /// (the E5 invariant).
     async fn list_attestations_since(
         &self,
@@ -4994,7 +4994,7 @@ mod tests {
     fn directory_op_wire_contract_is_pinned_682() {
         assert_eq!(
             structural_digest("DirectoryOp"),
-            "4efe656f9076f4b918efc8e122c6dfb422da3fb2e98fdbf52f4a6f9dbb17bce1",
+            "80c5a4f927a33355aa6323d29938a121307f59962642706a0567bacec4c21f63",
             "DirectoryOp's wire shape changed. GROWTH (appended a variant, \
              touched nothing existing) → re-pin this digest only. BREAK \
              (changed/renamed/removed/reordered an existing variant) → re-pin \
@@ -5038,7 +5038,7 @@ mod tests {
     fn directory_op_result_wire_contract_is_pinned_682() {
         assert_eq!(
             structural_digest("DirectoryOpResult"),
-            "bf09a0103ca37a06866e6f8160dd01df41c8e10caded5660e3c2fa352b4e9262",
+            "2295b94a42f9da5c7d758c6a0764da0fca8953aaf408dcfd6d672f13a9eff827",
             "DirectoryOpResult's wire shape changed — same fork as the op gate: \
              growth re-pins, a break re-pins AND bumps DIRECTORY_ABI_VERSION."
         );

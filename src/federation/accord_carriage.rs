@@ -26,7 +26,7 @@
 //! declared revoking key resolved from its OWN `federation_keys` before the
 //! row lands. The receive side was therefore already correct; only the SERVE
 //! side was missing. A plain cursor
-//! ([`FederationDirectory::list_signed_revocations_since`](super::FederationDirectory::list_signed_revocations_since))
+//! (`FederationDirectory::list_signed_revocations_since` (retired in v58.0.0))
 //! is the whole fix, and the plane joins the shared `signed_wire_index`
 //! alongside the other fourteen.
 //!

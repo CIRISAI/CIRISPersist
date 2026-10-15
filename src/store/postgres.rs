@@ -30875,25 +30875,6 @@ mod tests {
         .await;
     }
 
-    /// v36.0.0 (CIRISPersist#707) — a consumer-visible key mutation moves the
-    /// SERVE POSITION on postgres; grant/revoke_trust do not.
-    #[tokio::test]
-    #[serial_test::serial(postgres)]
-    async fn key_mutation_moves_serve_position_postgres_707() {
-        let Some(dsn) = pg_dsn() else {
-            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
-            return;
-        };
-        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
-        backend.run_migrations().await.expect("migrations run");
-        crate::federation::operational::test_support::exercise_key_mutation_moves_serve_position(
-            &backend,
-            &format!("pg707-{}", uuid::Uuid::new_v4().simple()),
-        )
-        .await
-        .expect("707 serve-position exercise");
-    }
-
     /// v31.0.0 (CIRISPersist#659) — a signed revocation de-admits the key it
     /// NAMED, at the real `put_revocation` chokepoint, on postgres. The tag
     /// carries a uuid, which is exactly the condition that made the earlier
@@ -33124,26 +33105,6 @@ mod tests {
         crate::federation::admission::r2_test_support::exercise_wire_refs_for_subject_resolve(
             &be,
             &format!("pg-634-{}", uuid_like()),
-        )
-        .await;
-    }
-
-    /// v31.0.0 (CIRISPersist#640) — the POSTGRES leg, and the one that
-    /// actually reddens without the fix: `TIMESTAMPTZ` drops the fixture's
-    /// 789ns tail, so an index written from the in-memory row carries a hash
-    /// this backend's read surface can never reproduce.
-    #[tokio::test]
-    #[serial_test::serial(postgres)]
-    async fn nanosecond_key_wire_ref_resolves_postgres_640() {
-        let Some(dsn) = pg_dsn() else {
-            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
-            return;
-        };
-        let be = PostgresBackend::connect(&dsn).await.expect("connect");
-        be.run_migrations().await.expect("migrations");
-        crate::federation::admission::r2_test_support::exercise_nanosecond_key_wire_ref_resolves(
-            &be,
-            &format!("pg-640-{}", uuid_like()),
         )
         .await;
     }
@@ -36769,126 +36730,6 @@ mod tests {
     //     what a full page contains and how many rows a tie holds, so a shared
     //     database's leftover `federation_keys` rows would make them measure
     //     the fixture instead of the fix.
-
-    /// #682 — a key record signed a year ago and admitted now is still served
-    /// to a consumer whose cursor has passed that instant.
-    ///
-    /// This is the arm that matters most: postgres allocates its position over
-    /// a connection pool rather than under a process-local lock, and it is the
-    /// backend production runs.
-    #[tokio::test]
-    #[serial_test::serial(postgres)]
-    async fn late_replicated_key_record_is_served_pg_682() {
-        let Some(dsn) = pg_dsn() else {
-            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
-            return;
-        };
-        crate::federation::admission::run_in_isolated_pg_db(&dsn, |backend| async move {
-            crate::federation::register::test_support::exercise_late_replicated_key_record_is_served(
-                &backend, "pg",
-            )
-            .await
-            .unwrap();
-        })
-        .await;
-    }
-
-    /// #668 — `limit + 2` rows sharing ONE admission instant page through with
-    /// every row seen exactly once.
-    ///
-    /// The tie is PLANTED because it cannot be produced through this backend's
-    /// write path: `monotonic_admission_instant` allocates strictly above the
-    /// last position. It is reachable in production through the V126 backfill
-    /// (every pre-existing row stamped with its `scrub_timestamp`, and a batch
-    /// from one producer shares one) and through two writers racing the same
-    /// `MAX` — which on this backend is a pool read, not a locked one.
-    #[tokio::test]
-    #[serial_test::serial(postgres)]
-    async fn one_admission_instant_pages_exactly_once_pg_668() {
-        use crate::federation::register::test_support as rts;
-        use crate::federation::FederationDirectory as _;
-        let Some(dsn) = pg_dsn() else {
-            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
-            return;
-        };
-        crate::federation::admission::run_in_isolated_pg_db(&dsn, |backend| async move {
-            let ids: Vec<String> = (0..5).map(|i| format!("k668-pg-{i}")).collect();
-            for id in &ids {
-                backend
-                    .put_public_key(crate::federation::SignedKeyRecord {
-                        record: rts::self_scrubbed_record_signed_at(id, chrono::Utc::now()),
-                    })
-                    .await
-                    .unwrap();
-            }
-
-            // THE TIE, as state: every row collapses onto one instant.
-            let tied_at = rts::truncate_to_micros(chrono::Utc::now());
-            {
-                let client = backend.get_client().await.unwrap();
-                let n = client
-                    .execute(
-                        "UPDATE cirislens.federation_keys SET admitted_at = $1",
-                        &[&tied_at],
-                    )
-                    .await
-                    .unwrap();
-                assert_eq!(
-                    n as usize,
-                    ids.len(),
-                    "the tie plant must touch every seeded row"
-                );
-            }
-
-            rts::assert_one_admission_instant_pages_exactly_once(&backend, "pg", &ids, 3)
-                .await
-                .unwrap();
-        })
-        .await;
-    }
-
-    /// #682 — the admission position survives a backward clock step on this
-    /// backend's real write path. The post-step state is planted directly; two
-    /// admissions under a forward clock would pass with `Utc::now()` and prove
-    /// nothing.
-    #[tokio::test]
-    #[serial_test::serial(postgres)]
-    async fn key_admission_survives_a_backward_clock_step_pg_682() {
-        use crate::federation::register::test_support as rts;
-        use crate::federation::FederationDirectory as _;
-        let Some(dsn) = pg_dsn() else {
-            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
-            return;
-        };
-        crate::federation::admission::run_in_isolated_pg_db(&dsn, |backend| async move {
-            backend
-                .put_public_key(crate::federation::SignedKeyRecord {
-                    record: rts::self_scrubbed_record_signed_at("k682-pg-a", chrono::Utc::now()),
-                })
-                .await
-                .unwrap();
-
-            // THE BACKWARD STEP, as state: the last position handed out is now
-            // an hour ahead of the wall clock.
-            let future = rts::truncate_to_micros(chrono::Utc::now() + chrono::Duration::hours(1));
-            {
-                let client = backend.get_client().await.unwrap();
-                let n = client
-                    .execute(
-                        "UPDATE cirislens.federation_keys SET admitted_at = $1",
-                        &[&future],
-                    )
-                    .await
-                    .unwrap();
-                assert_eq!(n, 1, "the backward-step plant must touch the seeded row");
-            }
-
-            rts::assert_key_admission_survives_backward_step(&backend, "pg", future)
-                .await
-                .unwrap();
-        })
-        .await;
-    }
 
     /// Build a federation KeyRecord with controllable valid_from /
     /// pqc_completed.
