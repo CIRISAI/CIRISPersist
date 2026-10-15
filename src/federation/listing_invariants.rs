@@ -414,9 +414,13 @@ pub mod bodies {
             serde_json::to_vec(&expect).unwrap(),
             "{tag} I183: served byte-exact"
         );
-        crate::federation::listing::check_community_membership_listing(d, &first.listing)
-            .await
-            .unwrap_or_else(|e| panic!("{tag} I183: the served row re-admits: {e}"));
+        crate::federation::listing::check_community_membership_listing(
+            d,
+            &first.listing,
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{tag} I183: the served row re-admits: {e}"));
     }
 
     /// **I183 (convergence)** — B holds the same room and roster history; A's

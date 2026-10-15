@@ -14047,9 +14047,14 @@ pub async fn check_infrastructure_founder_count_unchanged(
 /// and its `N` (they read nothing), then the founders' node-bearing.
 /// v55.0.0 (CIRISPersist#1053) — then the `public` room's conformance
 /// ([`public_room::check_public_room_conformance`](super::public_room::check_public_room_conformance)).
+///
+/// v57.0.0 (CIRISPersist#934 step 2) — `at` is the instant the founders'
+/// node-bearing is judged at; the community doors pass the plan's
+/// `received_at` (they read the clock here before #934: a #1049 candidate).
 pub async fn check_infrastructure_community_conformance(
     directory: &dyn super::FederationDirectory,
     community: &super::Community,
+    at: chrono::DateTime<chrono::Utc>,
 ) -> Result<(), Error> {
     if is_infrastructure_labeled(community)
         && !community
@@ -14066,7 +14071,7 @@ pub async fn check_infrastructure_community_conformance(
         });
     }
     check_infrastructure_consensus_protocol(community)?;
-    check_infrastructure_founders_not_node(directory, community, chrono::Utc::now()).await?;
+    check_infrastructure_founders_not_node(directory, community, at).await?;
     // v55.0.0 (CIRISPersist#1053, CC 3.2 `public`) — `admission: open` only on
     // a public room, and no version crosses the `public` boundary.
     super::public_room::check_public_room_conformance(directory, community).await
@@ -14090,6 +14095,7 @@ pub async fn check_infrastructure_community_conformance(
 pub async fn check_replicated_supersede_does_not_degrade(
     directory: &dyn super::FederationDirectory,
     offered: &super::Community,
+    at: chrono::DateTime<chrono::Utc>,
 ) -> Result<(), Error> {
     let Some(stored) = directory
         .lookup_community(&offered.community_key_id)
@@ -14109,8 +14115,8 @@ pub async fn check_replicated_supersede_does_not_degrade(
         }
         return Ok(());
     }
-    match check_infrastructure_community_conformance(directory, &stored).await {
-        Ok(()) => check_infrastructure_community_conformance(directory, offered).await,
+    match check_infrastructure_community_conformance(directory, &stored, at).await {
+        Ok(()) => check_infrastructure_community_conformance(directory, offered, at).await,
         Err(Error::CommunityConsensusProtocolViolation { .. }) => Ok(()),
         Err(e) => Err(e),
     }
@@ -14131,6 +14137,7 @@ pub async fn check_replicated_supersede_does_not_degrade(
 pub async fn check_infrastructure_record_admission(
     directory: &dyn super::FederationDirectory,
     community: &super::Community,
+    at: chrono::DateTime<chrono::Utc>,
 ) -> Result<(), Error> {
     if let Some(stored) = directory
         .lookup_community(&community.community_key_id)
@@ -14146,7 +14153,7 @@ pub async fn check_infrastructure_record_admission(
         // public side and does not cross the `public` boundary.
         return super::public_room::check_public_room_conformance(directory, community).await;
     }
-    check_infrastructure_community_conformance(directory, community).await
+    check_infrastructure_community_conformance(directory, community, at).await
 }
 
 /// v9.0.0 (CC 3.2 "steward-binding gate for non-infrastructure membership"

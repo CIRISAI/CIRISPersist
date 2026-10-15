@@ -631,12 +631,7 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     // v55.0.0 (CIRISPersist#989) — announce a holding claim for a held row.
     ("put_holding_claim", ConnClass::Write),
     ("put_calibration_bundle", ConnClass::Write),
-    // v50.0.0 (#931) — `put_community` / `apply_replicated_community` delegate here.
-    ("put_community_at_door", ConnClass::Write),
-    ("put_community_membership_revocation", ConnClass::Write),
-    ("put_community_membership_widening", ConnClass::Write),
     ("put_family_membership_widening", ConnClass::Write),
-    ("put_community_membership_listing", ConnClass::Write),
     ("put_delivery_receipt", ConnClass::Write),
     ("put_detection_event", ConnClass::Write),
     ("put_edge_detection_event", ConnClass::Write),
@@ -739,6 +734,14 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("store_pqc_completion", ConnClass::Write),
     ("store_planned_attestation", ConnClass::Write),
     ("store_planned_reseal", ConnClass::Write),
+    // v57.0.0 (CIRISPersist#934 step 2) — the community plane's executor
+    // (`CommunityStore`). The doors that held these statements
+    // (`put_community_at_door`, the three roster doors) are calls into the
+    // shared plans now and touch no connection.
+    ("store_planned_community", ConnClass::Write),
+    ("store_planned_community_revocation", ConnClass::Write),
+    ("store_planned_community_widening", ConnClass::Write),
+    ("store_planned_community_listing", ConnClass::Write),
     ("store_blob_local", ConnClass::Write),
     ("stream_consistency_proof", ConnClass::Read),
     ("stream_inclusion_proof", ConnClass::Read),

@@ -2959,7 +2959,7 @@ fn does_not_extend(id: &str) -> Error {
 }
 
 /// The replicated occupied-id route for a trust-root row (called by
-/// `route_occupied_community` after [`check_trust_root_community_admission`]
+/// `group_amendment::apply_occupied_community` after [`check_trust_root_community_admission`]
 /// admitted it). The offered chain is applied VERSION BY VERSION from the
 /// point this node's state allows, so every stored version is one a proof
 /// names exactly and the version history stays whole:

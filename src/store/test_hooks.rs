@@ -4,7 +4,7 @@
 //! [`crate::federation::directory_double::FaultInjectingDirectory`] wraps a
 //! directory from the OUTSIDE, so it faults the calls a composition makes
 //! through the trait object it was handed. A backend's own door calls
-//! `self`: the gates `put_community_at_door` runs, and the write it ends in,
+//! `self`: the gates the shared community door runs, and the write it ends in,
 //! never pass through the double. Two review findings live exactly there:
 //!
 //! - a read that fails ONCE (a transient backend failure) inside a gate,

@@ -56,6 +56,10 @@ pub mod attestation_apply;
 /// v25.1.0 (CIRISPersist#582) — the backend-generic signed-ATTESTATION emit
 /// recipe (distinct from [`emit`], the trust-grant/audit-entry API).
 pub mod attestation_emit;
+/// v57.0.0 (CIRISPersist#934 step 2) — the community and roster doors,
+/// decided once: `plan_put_community`, the three roster plans, and the
+/// per-backend `CommunityStore` executor.
+pub(crate) mod community_admit;
 // v56.0.0 (CIRISPersist#1001) — the typed bounded attestation read.
 pub mod attestation_query;
 #[cfg(test)]

@@ -98,12 +98,11 @@ impl PostgresBackend {
         at: crate::store::test_hooks::RivalPoint,
     ) -> Result<(), crate::federation::Error> {
         if let Some(rival) = self.test_hooks.take_rival_at(at) {
-            Box::pin(
-                self.put_community_at_door(
-                    rival,
-                    crate::federation::CommunityDoor::ReplicatedApply,
-                ),
-            )
+            Box::pin(crate::federation::community_admit::put_community_planned(
+                self,
+                rival,
+                crate::federation::CommunityDoor::ReplicatedApply,
+            ))
             .await?;
         }
         Ok(())
@@ -412,96 +411,21 @@ impl PostgresBackend {
     }
 }
 
-impl PostgresBackend {
-    pub(crate) async fn put_community_at_door(
+/// v57.0.0 (CIRISPersist#934 step 2) — the community plane's executor on
+/// postgres. Storage only: the decisions are
+/// [`plan_put_community`](crate::federation::community_admit::plan_put_community)
+/// and the three roster plans in `federation::community_admit`.
+#[async_trait::async_trait]
+impl crate::federation::community_admit::CommunityStore for PostgresBackend {
+    async fn store_planned_community(
         &self,
-        community: crate::federation::SignedCommunity,
-        door: crate::federation::CommunityDoor,
-    ) -> Result<crate::federation::group_amendment::CommunityWrite, crate::federation::Error> {
-        // v52.0.0 (CIRISPersist#672) — a re-offer of a held record settles here,
-        // before any verification (`replication_policy::settle_if_held`).
-        if crate::federation::replication_policy::settle_if_held(
-            self,
-            crate::federation::replication_policy::EnvelopeKind::Community,
-            &community,
-        )
-        .await?
-        {
-            return Ok(crate::federation::group_amendment::CommunityWrite::Unchanged);
-        }
-        // Test-only (PR #921 review, F3): a rival write that won the race
-        // lands here, after any read the caller made and before this write's
-        // own gates and reads.
-        #[cfg(test)]
-        self.test_rival_at(crate::store::test_hooks::RivalPoint::DoorStart)
-            .await?;
-        // v21.0.0 (CIRISPersist#502 E4) — mechanistic authorship BEFORE any
-        // other admission step (mirrors put_family).
-        crate::federation::verify_community_admission(self, &community).await?;
-        // v50.0.0 (CIRISPersist#926) — the trust-root door, ONE predicate on
-        // both doors: the reserved `ciris-canonical` id and any
-        // `infrastructure_constraint` row are admitted only as a chain from an
-        // accord birth (caps, shape, founders, links). The replicated door may
-        // keep another id's non-conformant record as data (it reads NotRooted);
-        // the reserved id never. `true` = an authorized infrastructure room.
-        let trust_root = crate::federation::canonical_community::check_trust_root_at_door(
-            self,
-            &community,
-            door == crate::federation::CommunityDoor::ReplicatedApply,
-        )
-        .await?;
+        planned: crate::federation::community_admit::CommunityInsert,
+    ) -> Result<crate::federation::community_admit::StoredCommunity, crate::federation::Error> {
+        let crate::federation::community_admit::CommunityInsert {
+            community,
+            wire_index_key,
+        } = planned;
         let row = community.community;
-        crate::federation::check_consensus_protocol_form(&row.consensus_protocol)?;
-        // v54.0.0 (CIRISPersist#1034, CC 4.4.3.2.8) — the declared cohort parses,
-        // a config rides only on an affiliation, and an affiliation's config
-        // validates against its roster. Backend-symmetric.
-        crate::federation::affiliation_config::check_community_record(&row)?;
-        // v4.11.0 (#154 Ask 4) — geographic cohort_subkind admission.
-        crate::federation::location::check_geographic_community_admission(
-            self,
-            &row,
-            chrono::Utc::now(),
-        )
-        .await?;
-        // v9.0.0 (CC 3.2 / CC 3.4.7.1) — steward-binding precondition for
-        // non-infrastructure community membership. No-op for
-        // infrastructure communities and rosters with no node/agent
-        // members.
-        // v50.0.0 (CIRISPersist#925/#927, CC 3.2) — infrastructure conformance:
-        // a quorum:M/N protocol and no node-bearing founder. Reads the directory, so
-        // before any state lock.
-        if door == crate::federation::CommunityDoor::Local {
-            crate::federation::admission::check_infrastructure_record_admission(self, &row).await?;
-        } else {
-            // v50.0.0 (final check) — a conformant stored room never degrades
-            // through the replicated door.
-            crate::federation::admission::check_replicated_supersede_does_not_degrade(self, &row)
-                .await?;
-        }
-        if !trust_root {
-            crate::federation::admission::check_community_membership_steward_binding(self, &row)
-                .await?;
-        }
-        // v49.0.0 (CIRISPersist#910.5) — an occupied id: an identical re-put
-        // is a no-op, a proof-carrying amendment this node's own state
-        // authorizes is applied as a supersede, anything else is refused (the
-        // #758 verdict below still settles a concurrent insert).
-        let offered = crate::federation::SignedCommunity {
-            community: row,
-            authority_key_id: community.authority_key_id,
-            scrub_signature_classical: community.scrub_signature_classical,
-            scrub_signature_pqc: community.scrub_signature_pqc,
-            supersede_proof: community.supersede_proof,
-            cosignatures: community.cosignatures,
-            lineage: community.lineage,
-        };
-        if let crate::federation::group_amendment::OccupiedRoute::Settled(written) =
-            crate::federation::group_amendment::route_occupied_community(self, &offered).await?
-        {
-            return Ok(written);
-        }
-        let community = offered;
-        let mut row = community.community;
         let supersede_proof_value = pg_supersede_proof_value(community.supersede_proof.as_ref())?;
         // v50.0.0 (CIRISPersist#926, V158) — persisted beside the authority
         // signature, so the served row re-derives its quorum and its chain.
@@ -509,21 +433,14 @@ impl PostgresBackend {
             .map_err(|e| crate::federation::Error::Backend(format!("cosignatures encode: {e}")))?;
         let lineage_value = serde_json::to_value(&community.lineage)
             .map_err(|e| crate::federation::Error::Backend(format!("lineage encode: {e}")))?;
-        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
         let members_value = serde_json::to_value(&row.members)
             .map_err(|e| crate::federation::Error::Backend(format!("members serialize: {e}")))?;
         let policy_blob_value = row.policy_blob.clone();
-        // v21.0.0 (CIRISPersist#502 E4 followup) — persist the authority
-        // signature the gate above already verified (was verified-then-
-        // discarded).
+        // v21.0.0 (CIRISPersist#502 E4 followup) — persist the verified
+        // authority signature.
         let authority_key_id = community.authority_key_id;
         let scrub_signature_classical = community.scrub_signature_classical;
         let scrub_signature_pqc = community.scrub_signature_pqc;
-        // Test-only (PR #921 review, F3): a rival insert lands after the
-        // occupied-id decision said "insert", before this insert.
-        #[cfg(test)]
-        self.test_rival_at(crate::store::test_hooks::RivalPoint::BeforeInsert)
-            .await?;
         let client = self
             .get_client()
             .await
@@ -532,13 +449,9 @@ impl PostgresBackend {
         let admitted_at = self
             .next_plane_position(&client, "federation_communities")
             .await?;
-        // v38.2.0 (CIRISPersist#758) — absorb, then RE-READ to decide. A
-        // convergent community id (CIRISServer's pair chat derives one per
-        // member pair) means two nodes author byte-identical content and
-        // each signs as itself; a plain INSERT refused every replicated
-        // copy. `DO NOTHING` alone would be the opposite error — silently
-        // accepting a DIFFERING roster under an occupied id — so the stored
-        // content hash decides (the #719 shape).
+        // v38.2.0 (CIRISPersist#758) — absorb, then RE-READ the stored hash
+        // for the shared door's verdict (`DO NOTHING` alone would silently
+        // accept a DIFFERING roster under an occupied id; the #719 shape).
         let inserted = client
             .execute(
                 "INSERT INTO cirislens.federation_communities (\
@@ -582,7 +495,7 @@ impl PostgresBackend {
                 }
             })?;
         if inserted == 0 {
-            let stored: String = client
+            let stored_persist_row_hash: String = client
                 .query_one(
                     "SELECT persist_row_hash FROM cirislens.federation_communities \
                      WHERE community_key_id = $1",
@@ -592,23 +505,285 @@ impl PostgresBackend {
                 .map_err(|e| crate::federation::Error::Backend(format!("community re-read: {e}")))?
                 .try_get(0)
                 .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
-            return crate::federation::group_amendment::community_insert_lost_to(
-                &stored,
-                &row.persist_row_hash,
-                &row.community_key_id,
+            return Ok(
+                crate::federation::community_admit::StoredCommunity::Occupied {
+                    stored_persist_row_hash,
+                },
             );
         }
-        // v21.1.0 (CIRISPersist#507b) — computed after the INSERT succeeds
-        // (`row` still owns its final `persist_row_hash`; the execute call
-        // above only borrowed it).
-        let wire_index_key = crate::federation::wire_index::record_key(&[(
-            "community_key_id",
-            &row.community_key_id,
-        )]);
         drop(client);
         self.index_stored_record("Community", &wire_index_key)
             .await?;
-        Ok(crate::federation::group_amendment::CommunityWrite::Inserted)
+        Ok(crate::federation::community_admit::StoredCommunity::Inserted)
+    }
+
+    async fn store_planned_community_revocation(
+        &self,
+        planned: crate::federation::community_admit::PlannedCommunityRevocation,
+    ) -> Result<(), crate::federation::Error> {
+        let crate::federation::community_admit::PlannedCommunityRevocation {
+            revocation,
+            removal_event,
+            wire_index_key,
+        } = planned;
+        let row = revocation.community_membership_revocation;
+        let witness = serde_json::json!(row.witness_set);
+        // v21.0.0 (CIRISPersist#502 E4 followup) — persist the verified
+        // authority signature.
+        let authority_key_id = revocation.authority_key_id;
+        let scrub_signature_classical = revocation.scrub_signature_classical;
+        let scrub_signature_pqc = revocation.scrub_signature_pqc;
+        // v49.0.0 (CIRISPersist#908, V153) — stored so the since-read serves
+        // the co-signed row byte-exact.
+        let cosignatures = serde_json::to_value(&revocation.cosignatures)
+            .map_err(|e| crate::federation::Error::Backend(format!("cosignatures: {e}")))?;
+        let mut client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        // SecReview F5 — INSERT + hard_case + epoch bump in ONE transaction:
+        // a bump failure after the INSERT must NOT leave a durable un-rotated
+        // revocation.
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("begin tx: {e}")))?;
+        // v36.0.0 (#668) — THIS node's serve position (V130), allocated
+        // inside the same transaction as the write.
+        let admitted_at = self
+            .next_plane_position(&tx, "federation_community_membership_revocations")
+            .await?;
+        // v47.1.0 (CIRISPersist#861) — IDEMPOTENT on the PK: the unique index
+        // decides (`ON CONFLICT DO NOTHING`; a check-then-insert would race
+        // under READ COMMITTED, the #894 class). On a repeat the transaction
+        // is ROLLED BACK: no second hard_case event or DEK rotation.
+        let inserted = tx
+            .execute(
+                "INSERT INTO cirislens.federation_community_membership_revocations (\
+                community_key_id, removed_identity_key_id, removed_at, effective_at, \
+                reason, witness_set, persist_row_hash, \
+                authority_key_id, scrub_signature_classical, scrub_signature_pqc, \
+                admitted_at, cosignatures\
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
+             ON CONFLICT (community_key_id, removed_identity_key_id, effective_at) DO NOTHING",
+                &[
+                    &row.community_key_id,
+                    &row.removed_identity_key_id,
+                    &row.removed_at,
+                    &row.effective_at,
+                    &row.reason,
+                    &witness,
+                    &row.persist_row_hash,
+                    &authority_key_id,
+                    &scrub_signature_classical,
+                    &scrub_signature_pqc,
+                    &admitted_at,
+                    &cosignatures,
+                ],
+            )
+            .await
+            .map_err(map_revocation_pg_err("community_membership_revocation"))?;
+        if inserted == 0 {
+            tx.rollback()
+                .await
+                .map_err(|e| crate::federation::Error::Backend(format!("rollback tx: {e}")))?;
+            return Ok(());
+        }
+        // v31.0.0 (CIRISPersist#646) — the wire-index entry is written after
+        // `commit()`: deriving the hash from the row AS STORED means reading
+        // it back on a pooled connection that cannot see this transaction.
+        // Idempotent on event_id.
+        tx.execute(
+            "INSERT INTO cirislens.hard_case_events \
+                (event_id, kind, target_key_id, subject_key_id, detail, emitted_at) \
+             VALUES ($1, $2, $3, $4, $5, $6) \
+             ON CONFLICT (event_id) DO NOTHING",
+            &[
+                &removal_event.event_id,
+                &removal_event.kind,
+                &removal_event.target_key_id,
+                &removal_event.subject_key_id,
+                &removal_event.detail,
+                &removal_event.emitted_at,
+            ],
+        )
+        .await
+        .map_err(|e| crate::federation::Error::Backend(format!("record_hard_case: {e}")))?;
+        // CC 4.4.3.2.2 rotation-on-removal, #848 (§15) PER MINTER: every
+        // counter on this node is one THIS node owns, so all of them advance;
+        // a minter with a self-retention row but no pointer is materialised at
+        // 0 first; this node's own counter advances even before it has minted,
+        // when the node key is known.
+        let node_key: Option<String> = self.node_key_id.read().expect("node_key_id lock").clone();
+        tx.execute(
+            "INSERT INTO cirislens.federation_community_dek_epoch \
+                (community_key_id, minter_key_id, epoch, rotated_at) \
+             SELECT DISTINCT community_key_id, minter_key_id, 0, NOW() \
+               FROM cirislens.federation_community_dek WHERE community_key_id = $1 \
+             ON CONFLICT (community_key_id, minter_key_id) DO NOTHING",
+            &[&row.community_key_id],
+        )
+        .await
+        .map_err(|e| {
+            crate::federation::Error::Backend(format!(
+                "community DEK rotation-on-removal (pointer): {e}"
+            ))
+        })?;
+        if let Some(node) = &node_key {
+            tx.execute(
+                "INSERT INTO cirislens.federation_community_dek_epoch \
+                    (community_key_id, minter_key_id, epoch, rotated_at) \
+                 VALUES ($1, $2, 1, NOW()) \
+                 ON CONFLICT (community_key_id, minter_key_id) DO UPDATE SET \
+                    epoch = cirislens.federation_community_dek_epoch.epoch + 1, \
+                    rotated_at = NOW()",
+                &[&row.community_key_id, node],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("community DEK rotation-on-removal: {e}"))
+            })?;
+        }
+        tx.execute(
+            "UPDATE cirislens.federation_community_dek_epoch \
+                SET epoch = epoch + 1, rotated_at = NOW() \
+              WHERE community_key_id = $1 AND ($2::text IS NULL OR minter_key_id <> $2)",
+            &[&row.community_key_id, &node_key],
+        )
+        .await
+        .map_err(|e| {
+            crate::federation::Error::Backend(format!("community DEK rotation-on-removal: {e}"))
+        })?;
+        tx.commit()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("commit tx: {e}")))?;
+        drop(client);
+        self.index_stored_record("CommunityMembershipRevocation", &wire_index_key)
+            .await?;
+        Ok(())
+    }
+
+    async fn store_planned_community_widening(
+        &self,
+        planned: crate::federation::community_admit::PlannedCommunityWidening,
+    ) -> Result<(), crate::federation::Error> {
+        let crate::federation::community_admit::PlannedCommunityWidening {
+            widening,
+            wire_index_key,
+        } = planned;
+        let row = widening.community_membership_widening;
+        let authority_key_id = widening.authority_key_id;
+        let scrub_signature_classical = widening.scrub_signature_classical;
+        let scrub_signature_pqc = widening.scrub_signature_pqc;
+        // v49.0.0 (CIRISPersist#908, V153).
+        let cosignatures = serde_json::to_value(&widening.cosignatures)
+            .map_err(|e| crate::federation::Error::Backend(format!("cosignatures: {e}")))?;
+        let mut client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("begin tx: {e}")))?;
+        let admitted_at = self
+            .next_plane_position(&tx, "federation_community_membership_widenings")
+            .await?;
+        let inserted = tx
+            .execute(
+                "INSERT INTO cirislens.federation_community_membership_widenings (\
+                community_key_id, member_key_id, joined_at, effective_at, role, \
+                persist_row_hash, authority_key_id, scrub_signature_classical, \
+                scrub_signature_pqc, admitted_at, cosignatures\
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
+             ON CONFLICT (community_key_id, member_key_id, effective_at) DO NOTHING",
+                &[
+                    &row.community_key_id,
+                    &row.member_key_id,
+                    &row.joined_at,
+                    &row.effective_at,
+                    &row.role,
+                    &row.persist_row_hash,
+                    &authority_key_id,
+                    &scrub_signature_classical,
+                    &scrub_signature_pqc,
+                    &admitted_at,
+                    &cosignatures,
+                ],
+            )
+            .await
+            .map_err(map_revocation_pg_err("community_membership_widening"))?;
+        tx.commit()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("commit tx: {e}")))?;
+        if inserted == 1 {
+            self.index_stored_record("CommunityMembershipWidening", &wire_index_key)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn store_planned_community_listing(
+        &self,
+        planned: crate::federation::community_admit::PlannedCommunityListing,
+    ) -> Result<(), crate::federation::Error> {
+        let crate::federation::community_admit::PlannedCommunityListing {
+            listing,
+            wire_index_key,
+        } = planned;
+        let row = listing.community_membership_listing;
+        let authority_key_id = listing.authority_key_id;
+        let scrub_signature_classical = listing.scrub_signature_classical;
+        let scrub_signature_pqc = listing.scrub_signature_pqc;
+        let mut client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("begin tx: {e}")))?;
+        let admitted_at = self
+            .next_plane_position(&tx, "federation_community_membership_listings")
+            .await?;
+        let inserted = tx
+            .execute(
+                "INSERT INTO cirislens.federation_community_membership_listings (\
+                community_key_id, member_key_id, effective_at, listed, \
+                persist_row_hash, authority_key_id, scrub_signature_classical, \
+                scrub_signature_pqc, admitted_at\
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+             ON CONFLICT (community_key_id, member_key_id, effective_at) DO NOTHING",
+                &[
+                    &row.community_key_id,
+                    &row.member_key_id,
+                    &row.effective_at,
+                    &row.listed,
+                    &row.persist_row_hash,
+                    &authority_key_id,
+                    &scrub_signature_classical,
+                    &scrub_signature_pqc,
+                    &admitted_at,
+                ],
+            )
+            .await
+            .map_err(map_revocation_pg_err("community_membership_listing"))?;
+        tx.commit()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("commit tx: {e}")))?;
+        if inserted == 1 {
+            self.index_stored_record("CommunityMembershipListing", &wire_index_key)
+                .await?;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    async fn rival_community_write_at(
+        &self,
+        at: crate::store::test_hooks::RivalPoint,
+    ) -> Result<(), crate::federation::Error> {
+        self.test_rival_at(at).await
     }
 }
 
@@ -9545,8 +9720,12 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         &self,
         community: crate::federation::SignedCommunity,
     ) -> Result<(), crate::federation::Error> {
-        self.put_community_at_door(community, crate::federation::CommunityDoor::Local)
-            .await?;
+        crate::federation::community_admit::put_community_planned(
+            self,
+            community,
+            crate::federation::CommunityDoor::Local,
+        )
+        .await?;
         Ok(())
     }
 
@@ -9559,12 +9738,8 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         &self,
         community: crate::federation::SignedCommunity,
     ) -> Result<crate::federation::ReplicatedCommunityOutcome, crate::federation::Error> {
-        // PR #921 review (Codex F3) — the outcome is what the write did, as
-        // the write saw it; no read taken before it.
-        let stored = self
-            .put_community_at_door(community, crate::federation::CommunityDoor::ReplicatedApply)
-            .await;
-        crate::federation::group_amendment::replicated_community_outcome(stored)
+        crate::federation::community_admit::apply_replicated_community_planned(self, community)
+            .await
     }
 
     fn trust_root_standing_cache(
@@ -10496,376 +10671,20 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         &self,
         revocation: crate::federation::SignedCommunityMembershipRevocation,
     ) -> Result<(), crate::federation::Error> {
-        // v52.0.0 (CIRISPersist#672) — a re-offer of a held record settles here,
-        // before any verification (`replication_policy::settle_if_held`).
-        if crate::federation::replication_policy::settle_if_held(
-            self,
-            crate::federation::replication_policy::EnvelopeKind::CommunityMembershipRevocation,
-            &revocation,
-        )
-        .await?
-        {
-            return Ok(());
-        }
-        // v21.0.0 (CIRISPersist#502 E4) — mechanistic authorship BEFORE any
-        // other admission step. THE worst-case E4 hole: an unverified
-        // removal here rotates the community DEK epoch below — an
-        // unauthenticated forward-secrecy DoS.
-        crate::federation::verify_community_membership_revocation_admission(self, &revocation)
-            .await?;
-        let mut row = revocation.community_membership_revocation;
-        // SecReview F4 — community removal is immediate for forward-secrecy;
-        // reject a future-dated effective_at BEFORE any write.
-        crate::federation::community_dek::reject_future_dated_community_revocation(
-            row.effective_at,
-        )?;
-        // v49.0.0 (CIRISPersist#908) — standing, before the epoch rotates.
-        crate::federation::check_community_roster_authority(
-            self,
-            &row.community_key_id,
-            &revocation.authority_key_id,
-            &std::iter::once(revocation.authority_key_id.clone())
-                .chain(
-                    revocation
-                        .cosignatures
-                        .iter()
-                        .map(|c| c.authority_key_id.clone()),
-                )
-                .collect(),
-            crate::federation::types::CommunityMember {
-                key_id: row.removed_identity_key_id.clone(),
-                joined_at: row.effective_at,
-                role: None,
-            },
-            true,
-            row.effective_at,
-        )
-        .await?;
-        // v50.0.0 (review, M1 loophole) — removing a founder of a conformant
-        // infrastructure room would leave its declared N stale.
-        if let Some(stored) = self.lookup_community(&row.community_key_id).await? {
-            let self_leave = revocation.authority_key_id == row.removed_identity_key_id
-                || revocation
-                    .cosignatures
-                    .iter()
-                    .any(|c| c.authority_key_id == row.removed_identity_key_id);
-            crate::federation::admission::check_infrastructure_founder_count_unchanged(
-                self,
-                &stored,
-                &row.removed_identity_key_id,
-                None,
-                true,
-                self_leave,
-                row.effective_at,
-            )
-            .await?;
-        }
-        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
-        let witness = serde_json::json!(row.witness_set);
-        // CEG §7.8 (CIRISPersist#161 Ask 5) — community analog of the §7.7
-        // removal emission. Built up front so the txn body owns only SQL.
-        let removal_event = crate::federation::hard_case::membership_removed_event(
-            crate::federation::hard_case::kind::COMMUNITY_MEMBERSHIP_CHANGE,
-            &row.community_key_id,
-            &row.removed_identity_key_id,
-            row.effective_at,
-        );
-        // v21.0.0 (CIRISPersist#502 E4 followup) — persist the authority
-        // signature the gate above already verified (was verified-then-
-        // discarded).
-        let authority_key_id = revocation.authority_key_id;
-        let scrub_signature_classical = revocation.scrub_signature_classical;
-        let scrub_signature_pqc = revocation.scrub_signature_pqc;
-        // v49.0.0 (CIRISPersist#908, V153) — stored so the since-read serves
-        // the co-signed row byte-exact.
-        let cosignatures = serde_json::to_value(&revocation.cosignatures)
-            .map_err(|e| crate::federation::Error::Backend(format!("cosignatures: {e}")))?;
-        let mut client = self
-            .get_client()
-            .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
-        // SecReview F5 — INSERT + hard_case + epoch bump in ONE transaction:
-        // a bump failure after the INSERT must NOT leave a durable un-rotated
-        // revocation. The three statements commit atomically or not at all.
-        let tx = client
-            .transaction()
-            .await
-            .map_err(|e| crate::federation::Error::Backend(format!("begin tx: {e}")))?;
-        // v36.0.0 (#668) — THIS node's serve position (V130), allocated
-        // inside the same transaction as the write.
-        let admitted_at = self
-            .next_plane_position(&tx, "federation_community_membership_revocations")
-            .await?;
-        // v47.1.0 (CIRISPersist#861) — IDEMPOTENT on the PK, as the trait
-        // documents. The unique index decides (`ON CONFLICT DO NOTHING`): a
-        // check-then-insert here would race under READ COMMITTED and a second
-        // concurrent repeat would still hit the violation (the #894 class).
-        // On a repeat the transaction is ROLLED BACK — the serve position
-        // above returns, and no second hard_case event or DEK rotation is
-        // written for one removal. The first recorded revocation stands.
-        let inserted = tx
-            .execute(
-                "INSERT INTO cirislens.federation_community_membership_revocations (\
-                community_key_id, removed_identity_key_id, removed_at, effective_at, \
-                reason, witness_set, persist_row_hash, \
-                authority_key_id, scrub_signature_classical, scrub_signature_pqc, \
-                admitted_at, cosignatures\
-             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
-             ON CONFLICT (community_key_id, removed_identity_key_id, effective_at) DO NOTHING",
-                &[
-                    &row.community_key_id,
-                    &row.removed_identity_key_id,
-                    &row.removed_at,
-                    &row.effective_at,
-                    &row.reason,
-                    &witness,
-                    &row.persist_row_hash,
-                    &authority_key_id,
-                    &scrub_signature_classical,
-                    &scrub_signature_pqc,
-                    &admitted_at,
-                    &cosignatures,
-                ],
-            )
-            .await
-            .map_err(map_revocation_pg_err("community_membership_revocation"))?;
-        if inserted == 0 {
-            tx.rollback()
-                .await
-                .map_err(|e| crate::federation::Error::Backend(format!("rollback tx: {e}")))?;
-            return Ok(());
-        }
-        // v21.1.0 (CIRISPersist#507b) — was upserted in the SAME transaction as
-        // the INSERT above.
-        // v31.0.0 (CIRISPersist#646) — it cannot stay there. Deriving the hash
-        // from the row AS STORED means READING the row back, and the reload
-        // runs on a pooled connection that cannot see this transaction's
-        // uncommitted rows: inside the tx it would find nothing and index
-        // nothing. So the entry is written after `commit()`, and the atomicity
-        // this site had is deliberately traded away. The trade is not close —
-        // a crash in the gap leaves a row with no index entry, which
-        // `rebuild_signed_wire_index` repairs and #547's own postmortem shows
-        // is repairable; an entry committed atomically with the WRONG hash is
-        // permanent and silent, because nothing downstream can tell a stale
-        // hash from a correct one.
-        let effective_at_rfc3339 = row.effective_at.to_rfc3339();
-        let wire_index_key = crate::federation::wire_index::record_key(&[
-            ("community_key_id", &row.community_key_id),
-            ("removed_identity_key_id", &row.removed_identity_key_id),
-            // v48.0.0 (#860) — a re-added member can be removed again: the
-            // instant is part of the row's identity.
-            ("effective_at", &effective_at_rfc3339),
-        ]);
-        // Idempotent on event_id.
-        tx.execute(
-            "INSERT INTO cirislens.hard_case_events \
-                (event_id, kind, target_key_id, subject_key_id, detail, emitted_at) \
-             VALUES ($1, $2, $3, $4, $5, $6) \
-             ON CONFLICT (event_id) DO NOTHING",
-            &[
-                &removal_event.event_id,
-                &removal_event.kind,
-                &removal_event.target_key_id,
-                &removal_event.subject_key_id,
-                &removal_event.detail,
-                &removal_event.emitted_at,
-            ],
+        crate::federation::community_admit::put_community_membership_revocation_planned(
+            self, revocation,
         )
         .await
-        .map_err(|e| crate::federation::Error::Backend(format!("record_hard_case: {e}")))?;
-        // CC 4.4.3.2.2 rotation-on-removal: bump the community DEK epoch so
-        // the next emission seals under a fresh DEK wrapped only to the
-        // remaining members. Forward-only — blobs already sealed under the
-        // old epoch keep their grants. A spurious extra bump only skips an
-        // epoch number (the DEK is minted lazily on next emission).
-        // #848 (§15) — PER MINTER: every counter on this node is one THIS
-        // node owns (a peer's epoch never has a self-retention row or a
-        // pointer here), so all of them advance. A minter that has minted (a
-        // self-retention row) but never rotated has no pointer row yet —
-        // epoch 0 is implicit — so its pointer is materialised at 0 first and
-        // then advanced with the rest; and this node's own counter advances
-        // even before it has minted, when the node key is known.
-        // `ensure_epoch_dek`'s removal-vs-mint compare (§15) is the backstop
-        // for a removal admitted where none of this ran.
-        let node_key: Option<String> = self.node_key_id.read().expect("node_key_id lock").clone();
-        tx.execute(
-            "INSERT INTO cirislens.federation_community_dek_epoch \
-                (community_key_id, minter_key_id, epoch, rotated_at) \
-             SELECT DISTINCT community_key_id, minter_key_id, 0, NOW() \
-               FROM cirislens.federation_community_dek WHERE community_key_id = $1 \
-             ON CONFLICT (community_key_id, minter_key_id) DO NOTHING",
-            &[&row.community_key_id],
-        )
-        .await
-        .map_err(|e| {
-            crate::federation::Error::Backend(format!(
-                "community DEK rotation-on-removal (pointer): {e}"
-            ))
-        })?;
-        if let Some(node) = &node_key {
-            tx.execute(
-                "INSERT INTO cirislens.federation_community_dek_epoch \
-                    (community_key_id, minter_key_id, epoch, rotated_at) \
-                 VALUES ($1, $2, 1, NOW()) \
-                 ON CONFLICT (community_key_id, minter_key_id) DO UPDATE SET \
-                    epoch = cirislens.federation_community_dek_epoch.epoch + 1, \
-                    rotated_at = NOW()",
-                &[&row.community_key_id, node],
-            )
-            .await
-            .map_err(|e| {
-                crate::federation::Error::Backend(format!("community DEK rotation-on-removal: {e}"))
-            })?;
-        }
-        tx.execute(
-            "UPDATE cirislens.federation_community_dek_epoch \
-                SET epoch = epoch + 1, rotated_at = NOW() \
-              WHERE community_key_id = $1 AND ($2::text IS NULL OR minter_key_id <> $2)",
-            &[&row.community_key_id, &node_key],
-        )
-        .await
-        .map_err(|e| {
-            crate::federation::Error::Backend(format!("community DEK rotation-on-removal: {e}"))
-        })?;
-        tx.commit()
-            .await
-            .map_err(|e| crate::federation::Error::Backend(format!("commit tx: {e}")))?;
-        drop(client);
-        self.index_stored_record("CommunityMembershipRevocation", &wire_index_key)
-            .await?;
-        Ok(())
     }
 
     async fn put_community_membership_widening(
         &self,
         widening: crate::federation::SignedCommunityMembershipWidening,
     ) -> Result<(), crate::federation::Error> {
-        // v52.0.0 (CIRISPersist#672) — a re-offer of a held record settles here,
-        // before any verification (`replication_policy::settle_if_held`).
-        if crate::federation::replication_policy::settle_if_held(
-            self,
-            crate::federation::replication_policy::EnvelopeKind::CommunityMembershipWidening,
-            &widening,
+        crate::federation::community_admit::put_community_membership_widening_planned(
+            self, widening,
         )
-        .await?
-        {
-            return Ok(());
-        }
-        // v48.0.0 (CIRISPersist#860, FSD §3.2) — the mirror of the revocation
-        // door; see the sqlite twin for the legs.
-        crate::federation::verify_community_membership_widening_admission(self, &widening).await?;
-        let mut row = widening.community_membership_widening;
-        crate::federation::community_dek::reject_future_dated_community_widening(row.effective_at)?;
-        // v49.0.0 (CIRISPersist#908) — the signer must have standing.
-        crate::federation::check_community_roster_authority(
-            self,
-            &row.community_key_id,
-            &widening.authority_key_id,
-            &std::iter::once(widening.authority_key_id.clone())
-                .chain(
-                    widening
-                        .cosignatures
-                        .iter()
-                        .map(|c| c.authority_key_id.clone()),
-                )
-                .collect(),
-            row.member(),
-            false,
-            row.effective_at,
-        )
-        .await?;
-        let community = self
-            .lookup_community(&row.community_key_id)
-            .await?
-            .ok_or_else(|| {
-                crate::federation::Error::InvalidArgument(format!(
-                    "{} does not exist in federation_communities",
-                    row.community_key_id
-                ))
-            })?;
-        let stored_for_count = community.clone();
-        let probe = crate::federation::types::Community {
-            members: vec![row.member()],
-            ..community
-        };
-        // v50.0.0 (CIRISPersist#925) — a widening that seats a node-bearing
-        // key as founder of an infrastructure community is refused.
-        crate::federation::admission::check_infrastructure_founders_not_node(
-            self,
-            &probe,
-            row.effective_at,
-        )
-        .await?;
-        // v50.0.0 (review, M1 loophole) — adding, promoting or demoting a
-        // founder of a conformant infrastructure room would leave N stale.
-        crate::federation::admission::check_infrastructure_founder_count_unchanged(
-            self,
-            &stored_for_count,
-            &row.member_key_id,
-            row.role.as_deref(),
-            false,
-            false,
-            row.effective_at,
-        )
-        .await?;
-        crate::federation::admission::check_community_membership_steward_binding(self, &probe)
-            .await?;
-        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
-        let authority_key_id = widening.authority_key_id;
-        let scrub_signature_classical = widening.scrub_signature_classical;
-        let scrub_signature_pqc = widening.scrub_signature_pqc;
-        // v49.0.0 (CIRISPersist#908, V153).
-        let cosignatures = serde_json::to_value(&widening.cosignatures)
-            .map_err(|e| crate::federation::Error::Backend(format!("cosignatures: {e}")))?;
-        let mut client = self
-            .get_client()
-            .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
-        let tx = client
-            .transaction()
-            .await
-            .map_err(|e| crate::federation::Error::Backend(format!("begin tx: {e}")))?;
-        let admitted_at = self
-            .next_plane_position(&tx, "federation_community_membership_widenings")
-            .await?;
-        let inserted = tx
-            .execute(
-                "INSERT INTO cirislens.federation_community_membership_widenings (\
-                community_key_id, member_key_id, joined_at, effective_at, role, \
-                persist_row_hash, authority_key_id, scrub_signature_classical, \
-                scrub_signature_pqc, admitted_at, cosignatures\
-             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
-             ON CONFLICT (community_key_id, member_key_id, effective_at) DO NOTHING",
-                &[
-                    &row.community_key_id,
-                    &row.member_key_id,
-                    &row.joined_at,
-                    &row.effective_at,
-                    &row.role,
-                    &row.persist_row_hash,
-                    &authority_key_id,
-                    &scrub_signature_classical,
-                    &scrub_signature_pqc,
-                    &admitted_at,
-                    &cosignatures,
-                ],
-            )
-            .await
-            .map_err(map_revocation_pg_err("community_membership_widening"))?;
-        tx.commit()
-            .await
-            .map_err(|e| crate::federation::Error::Backend(format!("commit tx: {e}")))?;
-        if inserted == 1 {
-            let effective_at_rfc3339 = row.effective_at.to_rfc3339();
-            let wire_index_key = crate::federation::wire_index::record_key(&[
-                ("community_key_id", &row.community_key_id),
-                ("member_key_id", &row.member_key_id),
-                ("effective_at", &effective_at_rfc3339),
-            ]);
-            self.index_stored_record("CommunityMembershipWidening", &wire_index_key)
-                .await?;
-        }
-        Ok(())
+        .await
     }
 
     async fn put_family_membership_widening(
@@ -10968,72 +10787,8 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         &self,
         listing: crate::federation::SignedCommunityMembershipListing,
     ) -> Result<(), crate::federation::Error> {
-        // v52.0.0 (CIRISPersist#672) — a re-offer of a held record settles here,
-        // before any verification (`replication_policy::settle_if_held`).
-        if crate::federation::replication_policy::settle_if_held(
-            self,
-            crate::federation::replication_policy::EnvelopeKind::CommunityMembershipListing,
-            &listing,
-        )
-        .await?
-        {
-            return Ok(());
-        }
-        // v49.0.0 (CIRISPersist#912) — the one listing door, then the V156
-        // insert; see the sqlite twin.
-        crate::federation::listing::check_community_membership_listing(self, &listing).await?;
-        let mut row = listing.community_membership_listing;
-        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
-        let authority_key_id = listing.authority_key_id;
-        let scrub_signature_classical = listing.scrub_signature_classical;
-        let scrub_signature_pqc = listing.scrub_signature_pqc;
-        let mut client = self
-            .get_client()
+        crate::federation::community_admit::put_community_membership_listing_planned(self, listing)
             .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
-        let tx = client
-            .transaction()
-            .await
-            .map_err(|e| crate::federation::Error::Backend(format!("begin tx: {e}")))?;
-        let admitted_at = self
-            .next_plane_position(&tx, "federation_community_membership_listings")
-            .await?;
-        let inserted = tx
-            .execute(
-                "INSERT INTO cirislens.federation_community_membership_listings (\
-                community_key_id, member_key_id, effective_at, listed, \
-                persist_row_hash, authority_key_id, scrub_signature_classical, \
-                scrub_signature_pqc, admitted_at\
-             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
-             ON CONFLICT (community_key_id, member_key_id, effective_at) DO NOTHING",
-                &[
-                    &row.community_key_id,
-                    &row.member_key_id,
-                    &row.effective_at,
-                    &row.listed,
-                    &row.persist_row_hash,
-                    &authority_key_id,
-                    &scrub_signature_classical,
-                    &scrub_signature_pqc,
-                    &admitted_at,
-                ],
-            )
-            .await
-            .map_err(map_revocation_pg_err("community_membership_listing"))?;
-        tx.commit()
-            .await
-            .map_err(|e| crate::federation::Error::Backend(format!("commit tx: {e}")))?;
-        if inserted == 1 {
-            let effective_at_rfc3339 = row.effective_at.to_rfc3339();
-            let wire_index_key = crate::federation::wire_index::record_key(&[
-                ("community_key_id", &row.community_key_id),
-                ("member_key_id", &row.member_key_id),
-                ("effective_at", &effective_at_rfc3339),
-            ]);
-            self.index_stored_record("CommunityMembershipListing", &wire_index_key)
-                .await?;
-        }
-        Ok(())
     }
 
     async fn list_identity_occurrence_revocations_for(
