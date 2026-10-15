@@ -587,76 +587,51 @@ pub fn membership_removed_event(
 }
 
 /// v57.0.0 (CIRISPersist#988 item 3) — the DSAR erasure's
-/// `hard_case:trace_erasure:v1` event (the counts), one builder for all three
-/// backends. [`with_erasure_chunks`] then adds the erased detections.
+/// `hard_case:trace_erasure:v1` event, one builder for all three backends.
+/// When the erasure hard-deleted row-backed detections, the event names how
+/// many and binds their tombstone selection (`selection_digest`, the digest
+/// of the `attestation:{id}` record ids): the row is the notice the
+/// erasure's tombstone header cites (`steward_purge::ART17_ERASURE_BASIS`).
 #[must_use]
 pub fn trace_erasure_event(
     agent_id_hash: &str,
     trace_events: u64,
     trace_llm_calls: u64,
     detection_events_tombstoned: u64,
+    erased_detection_rows: &[String],
     erased_at: DateTime<Utc>,
 ) -> HardCaseEvent {
+    let mut detail = serde_json::json!({
+        "agent_id_hash": agent_id_hash,
+        "trace_events": trace_events,
+        "trace_llm_calls": trace_llm_calls,
+        "detection_events_tombstoned": detection_events_tombstoned,
+    });
+    bind_erased_detection_rows(&mut detail, erased_detection_rows);
     HardCaseEvent {
         event_id: uuid::Uuid::new_v4().to_string(),
         kind: kind::TRACE_ERASURE.to_owned(),
         target_key_id: Some(agent_id_hash.to_owned()),
         subject_key_id: None,
-        detail: serde_json::json!({
-            "agent_id_hash": agent_id_hash,
-            "trace_events": trace_events,
-            "trace_llm_calls": trace_llm_calls,
-            "detection_events_tombstoned": detection_events_tombstoned,
-        }),
+        detail,
         emitted_at: erased_at,
     }
 }
 
-/// v57.0.0 (CIRISPersist#988 item 3; lead ruling on the DSAR path) — **one
-/// erasure act, N rows.** `base` is the erasure's `trace_erasure` event (the
-/// counts). When it hard-deleted row-backed detections (`erased_rows`, their
-/// row ids; `erased`, their V080 tombstone content), the base event binds
-/// the set (`detection_rows_erased`, `selection_digest` of the
-/// `attestation:{id}` record ids) and carries the first chunk of `erased`
-/// under [`crate::derived::detection_row::ERASURE_DETAIL_MEMBER`]; each
-/// further chunk is its own `trace_erasure` event, id `{base}#{k}`,
-/// `chunk_of` naming the base. Chunks are bounded by
-/// [`crate::derived::detection_row::chunk_erased_detections`].
-#[must_use]
-pub fn with_erasure_chunks(
-    mut base: HardCaseEvent,
-    erased_rows: &[String],
-    erased: Vec<crate::derived::detection_row::ErasedDetection>,
-) -> Vec<HardCaseEvent> {
-    use crate::derived::detection_row::{chunk_erased_detections, ERASURE_DETAIL_MEMBER};
-    if erased_rows.is_empty() {
-        return vec![base];
+/// v57.0.0 (CIRISPersist#988 item 3) — when a DSAR erasure hard-deleted
+/// row-backed detections, its event names how many and binds their tombstone
+/// selection (`selection_digest` of the `attestation:{id}` record ids). A
+/// no-op for an erasure that deleted none.
+pub fn bind_erased_detection_rows(
+    detail: &mut serde_json::Value,
+    erased_detection_rows: &[String],
+) {
+    if erased_detection_rows.is_empty() {
+        return;
     }
-    let ids = super::steward_purge::art17_erasure_record_ids(erased_rows);
-    base.detail["detection_rows_erased"] = serde_json::json!(ids.len());
-    base.detail["selection_digest"] =
-        serde_json::json!(super::steward_purge::selection_digest(&ids));
-    let mut chunks = chunk_erased_detections(erased).into_iter();
-    let first = chunks.next().unwrap_or_default();
-    let rest: Vec<_> = chunks.collect();
-    base.detail["chunks"] = serde_json::json!(1 + rest.len());
-    base.detail[ERASURE_DETAIL_MEMBER] = serde_json::json!(first);
-    let mut out = vec![base.clone()];
-    for (k, chunk) in rest.into_iter().enumerate() {
-        out.push(HardCaseEvent {
-            event_id: format!("{}#{}", base.event_id, k + 1),
-            kind: base.kind.clone(),
-            target_key_id: base.target_key_id.clone(),
-            subject_key_id: None,
-            detail: serde_json::json!({
-                "chunk_of": base.event_id,
-                "chunk": k + 1,
-                ERASURE_DETAIL_MEMBER: chunk,
-            }),
-            emitted_at: base.emitted_at,
-        });
-    }
-    out
+    let ids = super::steward_purge::art17_erasure_record_ids(erased_detection_rows);
+    detail["detection_rows_erased"] = serde_json::json!(ids.len());
+    detail["selection_digest"] = serde_json::json!(super::steward_purge::selection_digest(&ids));
 }
 
 /// Deterministic `event_id` for a [`kind::RECIPIENT_EXCLUDED`] emission
