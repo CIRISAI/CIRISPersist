@@ -171,6 +171,14 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // for a row that is not its family's, never a refusal.
     ("project_hard_case_row", Class::Plumbing),
     ("project_detection_row", Class::Plumbing),
+    ("project_detection_row_under", Class::Plumbing),
+    // The attester read every hard_case act makes first: it REFUSES the act
+    // when this node cannot attest the row (`HardCaseAttesterUnavailable`).
+    ("hard_case_attester", Class::Gate),
+    // The purge door's detection-projection tombstone and its rebuild-side
+    // instant read: storage on a decision the purge door already made.
+    ("sqlite_tombstone_detection_projection", Class::Plumbing),
+    ("sqlite_detection_tombstone_instant", Class::Plumbing),
     // v56.0.0 (CIRISPersist#934 step 1) — the attestation plane's shared door
     // and the executor's one re-ask under its lock: each is a SHARED plan.
     ("put_attestation_planned", Class::Plan),

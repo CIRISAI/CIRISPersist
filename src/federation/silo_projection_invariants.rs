@@ -366,6 +366,7 @@ pub(crate) mod bodies {
     /// I963 — after the runner seeded pre-v57 silo rows (`legacy_event_id`
     /// emitted at `legacy_at`, a detection `legacy_detection` at
     /// `legacy_detection_ts`), the first emitters rehome them.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     pub(crate) async fn i963_the_rehome<B>(
         b: &B,
         node: &str,
