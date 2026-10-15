@@ -1143,13 +1143,8 @@ where
     // every backend runs at this same point. All three DID enforce the rule
     // before (sqlite + postgres by FK, memory by emulation); what none of
     // them could express is the keyless-family exception.
-    // v58.0.0 (CIRISPersist#1094 item 2) — the row form: a node's CC 2.4.1.1
-    // rule-3 proxy grant to a canonical subject is admitted beside the rule.
-    crate::federation::admission::check_attested_subject_admission_for_row(
-        dir.as_dyn_directory(),
-        &row,
-    )
-    .await?;
+    crate::federation::admission::check_attested_subject_admission(dir, &row.attested_key_id)
+        .await?;
 
     // ── AV-76 TIER 5 — the row as it will be stored ─────────────
     // D1: `check_withdraws_admission` above STAMPS
@@ -1861,11 +1856,12 @@ pub(crate) struct PlannedDetection {
 /// agent's CC 2.3.2.1 canonical hash
 /// ([`subject_erasure::agent_subject`](super::subject_erasure::agent_subject)
 /// of the trace's `agent_id_hash`, [`detection_subject`]), written into
-/// `subject_key_ids`: a detection is a row ABOUT that subject, and the
-/// subject's `withdraws` (the node as CC 2.4.1.1 rule-3 proxy) is what erases
-/// it. `None` when the door cannot tell whose trace it scored (the trace is
-/// not held here): such a row names no subject, and no subject `withdraws`
-/// can reach it.
+/// `subject_key_ids`: a detection is a row ABOUT that subject, and naming it
+/// makes the rows about a subject discoverable (DSAR export, the erasure
+/// door's lookup). It is not an authority path: a detection is adverse, and
+/// is erased only by its producer's rule-1 `withdraws` (CC 4.5.3, the 2.4.1.1
+/// carve-out). `None` when the door cannot tell whose trace it scored (the
+/// trace is not held here): the door never guesses a subject.
 pub(crate) fn plan_detection_row(
     body: &crate::derived::detection_row::DetectionProjection,
     attester_identity_type: &str,

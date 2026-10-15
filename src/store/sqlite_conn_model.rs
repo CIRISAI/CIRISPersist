@@ -753,6 +753,7 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("sqlite_project_detection", ConnClass::HelperWrite),
     ("sqlite_render_table", ConnClass::HelperRead),
     ("sqlite_erase_cited_rows", ConnClass::HelperWrite),
+    ("sqlite_store_erasure_withdraws", ConnClass::HelperWrite),
     ("sqlite_v196_pending", ConnClass::HelperRead),
     ("sqlite_put_erasure_execution", ConnClass::HelperWrite),
     ("sqlite_record_erasure", ConnClass::HelperWrite),

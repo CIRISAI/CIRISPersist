@@ -1086,6 +1086,16 @@ impl MemoryBackend {
         &self.test_hooks
     }
 
+    /// v58.0.0 (CIRISPersist#1094, I967) — TEST SEAM: the key's record expired
+    /// a day ago (a host that no longer holds a live producer key).
+    #[cfg(test)]
+    pub(crate) fn test_expire_key(&self, key_id: &str) {
+        let mut state = self.state.lock().expect("memory backend lock");
+        if let Some(rec) = state.federation_keys.get_mut(key_id) {
+            rec.valid_until = Some(chrono::Utc::now() - chrono::Duration::days(1));
+        }
+    }
+
     /// v57.0.0 (CIRISPersist#988, I960) — a `hard_case_events` entry no row
     /// produces: the projection witness's red on the backend with no SQL.
     #[cfg(test)]
@@ -2194,16 +2204,23 @@ impl Backend for MemoryBackend {
         let attester = crate::federation::attestation_admit::hard_case_attester(self)
             .await
             .map_err(Error::from_hard_case_attester)?;
-        // v58.0.0 (CIRISPersist#1094 item 2, CC 4.5.3) — what a subject
-        // `withdraws` covers, read before the lock.
-        let (citations, retained) = crate::federation::subject_erasure::plan_store_erasure(
+        // v58.0.0 (CIRISPersist#1094 item 2, CC 4.5.3) — each reached row
+        // erased under its producer's rule-1 `withdraws`, or refused with a
+        // reason; read before the lock.
+        let received_at = chrono::Utc::now();
+        let crate::federation::subject_erasure::ErasurePlan {
+            citations,
+            new_withdraws,
+            refused,
+        } = crate::federation::subject_erasure::plan_store_erasure(
             self,
             agent_id_hash,
             Some(signature_key_id),
+            received_at,
         )
         .await
         .map_err(|e| Error::Backend(format!("erasure plan: {e}")))?;
-        let received_at = chrono::Utc::now();
+        let refused_count = refused.len() as u64;
         let mut state = self.state.lock().expect("memory backend lock");
         // Per-key DSAR scope: both agent_id_hash AND signing_key_id
         // must match. trace_llm_calls cascade joins by trace_id
@@ -2218,9 +2235,9 @@ impl Backend for MemoryBackend {
             .filter(|(_, row)| row_matches(row))
             .map(|(_, row)| row.trace_id.clone())
             .collect();
-        // v58.0.0 (CIRISPersist#1094 item 2) — the row-backed detections a
-        // subject `withdraws` covers are hard-deleted and leave no projection
-        // row. Found BEFORE anything moves.
+        // v58.0.0 (CIRISPersist#1094 item 2) — the row-backed detections
+        // their producers' `withdraws` cover are hard-deleted and leave no
+        // projection row. Found BEFORE anything moves.
         let erased_rows = memory_held_citations(&state, &citations);
         let detection_events_tombstoned = erased_rows.len() as u64;
 
@@ -2320,7 +2337,7 @@ impl Backend for MemoryBackend {
                     trace_llm_calls: trace_llm_calls_deleted,
                     detection_events_tombstoned,
                     detection_rows_erased: erased_rows.len() as u64,
-                    detection_rows_retained: retained,
+                    detection_rows_refused: refused_count,
                     federation_keys: federation_keys_deleted,
                     federation_attestations: federation_attestations_deleted,
                     federation_revocations: federation_revocations_deleted,
@@ -2329,7 +2346,7 @@ impl Backend for MemoryBackend {
             );
             let plan = memory_plan_erasure(&attester, &event, &erased_rows, received_at)
                 .map_err(|e| Error::Backend(format!("dsar: {e}")))?;
-            memory_apply_erasure(&mut state, &erased_rows, plan);
+            memory_apply_erasure(&mut state, &new_withdraws, &erased_rows, plan);
         }
 
         Ok(super::types::DeleteSummary {
@@ -2338,6 +2355,7 @@ impl Backend for MemoryBackend {
             federation_keys_deleted,
             federation_attestations_deleted,
             federation_revocations_deleted,
+            detection_rows_refused: refused,
             deleted_at: chrono::Utc::now(),
         })
     }
@@ -2362,13 +2380,23 @@ impl Backend for MemoryBackend {
                 .await
                 .map_err(|e| Error::Backend(format!("rehome before erasure: {e}")))?;
         }
-        // v58.0.0 (CIRISPersist#1094 item 2, CC 4.5.3) — what a subject
-        // `withdraws` covers, read before the lock.
-        let (citations, retained) =
-            crate::federation::subject_erasure::plan_store_erasure(self, agent_id_hash, None)
-                .await
-                .map_err(|e| Error::Backend(format!("erasure plan: {e}")))?;
+        // v58.0.0 (CIRISPersist#1094 item 2, CC 4.5.3) — each reached row
+        // erased under its producer's rule-1 `withdraws`, or refused with a
+        // reason; read before the lock.
         let erased_at = chrono::Utc::now();
+        let crate::federation::subject_erasure::ErasurePlan {
+            citations,
+            new_withdraws,
+            refused,
+        } = crate::federation::subject_erasure::plan_store_erasure(
+            self,
+            agent_id_hash,
+            None,
+            erased_at,
+        )
+        .await
+        .map_err(|e| Error::Backend(format!("erasure plan: {e}")))?;
+        let refused_count = refused.len() as u64;
         let mut state = self.state.lock().expect("memory backend lock");
 
         // Full erasure: every trace_events row for this agent_id_hash,
@@ -2395,7 +2423,7 @@ impl Backend for MemoryBackend {
             .filter(|row| target_trace_ids.contains(&row.trace_id))
             .count() as u64;
         // v58.0.0 (CIRISPersist#1094 item 2, CC 4.5.3) — a ROW-BACKED
-        // detection is erased by the subject's `withdraws`: each cited row is
+        // detection is erased by its producer's rule-1 `withdraws`: each cited row is
         // HARD-DELETED, never rewritten, under a tombstone citing the
         // withdraws. Memory holds no pre-v57 silo rows.
         let erased_rows = memory_held_citations(&state, &citations);
@@ -2408,7 +2436,7 @@ impl Backend for MemoryBackend {
                     trace_llm_calls,
                     detection_events_tombstoned,
                     detection_rows_erased: erased_rows.len() as u64,
-                    detection_rows_retained: retained,
+                    detection_rows_refused: refused_count,
                     ..Default::default()
                 },
                 erased_at,
@@ -2425,12 +2453,13 @@ impl Backend for MemoryBackend {
         state
             .llm_calls
             .retain(|row| !target_trace_ids.contains(&row.trace_id));
-        memory_apply_erasure(&mut state, &erased_rows, plan);
+        memory_apply_erasure(&mut state, &new_withdraws, &erased_rows, plan);
 
         Ok(super::types::ErasureSummary {
             trace_events,
             trace_llm_calls,
             detection_events_tombstoned,
+            detection_rows_refused: refused,
             erased_at,
         })
     }
@@ -10841,7 +10870,7 @@ struct MemoryErasurePlan {
 
 /// v58.0.0 (CIRISPersist#1094 item 2) — plan an erasure's subject-free
 /// `hard_case:trace_erasure:v1` row and, per erased row, the tombstone header
-/// citing the subject's `withdraws`. Nothing moves.
+/// citing the producer's `withdraws`. Nothing moves.
 fn memory_plan_erasure(
     attester: &crate::federation::attestation_admit::HardCaseAttester,
     event: &crate::federation::hard_case::HardCaseEvent,
@@ -10899,9 +10928,15 @@ fn memory_held_citations(
 /// tombstones.
 fn memory_apply_erasure(
     state: &mut State,
+    new_withdraws: &[crate::federation::subject_erasure::PlannedErasureWithdraws],
     erased: &[crate::federation::subject_erasure::ErasureCitation],
     plan: MemoryErasurePlan,
 ) {
+    // v58.0.0 (#1094 item 2) — the producers' withdraws first, through the
+    // local-row writer every local door uses.
+    for w in new_withdraws {
+        memory_insert_local_row(state, w.row.clone(), Some(w.depth));
+    }
     for c in erased {
         let record_key =
             crate::federation::wire_index::record_key(&[("attestation_id", &c.target)]);

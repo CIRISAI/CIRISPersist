@@ -17162,6 +17162,7 @@ impl PyEngine {
     ///   "federation_keys_deleted":        int,  # 0 unless include_federation_key=True
     ///   "federation_attestations_deleted": int,  # 0 unless include_federation_key=True
     ///   "federation_revocations_deleted":  int,  # 0 unless include_federation_key=True
+    ///   "detection_rows_refused":         [ {"record_id": str, "reason": str} ],
     ///   "deleted_at":                     str,  # ISO-8601 UTC
     /// }
     /// ```
@@ -17185,28 +17186,35 @@ impl PyEngine {
             let agent_id_hash = agent_id_hash.to_owned();
             let signature_key_id = signature_key_id.to_owned();
 
-            // v58.0.0 (CIRISPersist#1094 item 2, CC 4.5.3) — through the
-            // Engine: the node signs the subject's proxy grant and its
-            // `withdraws` before the store erases.
-            let backend = match &self.backend {
+            let summary = py.detach(move || match &self.backend {
                 #[cfg(feature = "postgres")]
-                BackendDispatch::Postgres(b) => crate::engine::BackendDispatch::Postgres(b.clone()),
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::store::Backend;
+                        backend
+                            .delete_traces_for_agent(
+                                &agent_id_hash,
+                                &signature_key_id,
+                                include_federation_key,
+                            )
+                            .await
+                    })
+                }
                 #[cfg(feature = "sqlite")]
-                BackendDispatch::Sqlite(b) => crate::engine::BackendDispatch::Sqlite(b.clone()),
-            };
-            let signer = self.signer.clone();
-            let local_signer = self.local_signer.clone();
-            let summary = py.detach(move || {
-                let engine = crate::Engine::from_shared_with_local(backend, signer, local_signer);
-                runtime.block_on(async move {
-                    engine
-                        .delete_traces_for_agent(
-                            &agent_id_hash,
-                            &signature_key_id,
-                            include_federation_key,
-                        )
-                        .await
-                })
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = sq.clone();
+                    runtime.block_on(async move {
+                        use crate::store::Backend;
+                        backend
+                            .delete_traces_for_agent(
+                                &agent_id_hash,
+                                &signature_key_id,
+                                include_federation_key,
+                            )
+                            .await
+                    })
+                }
             });
             let summary = summary.map_err(erasure_err_to_py)?;
 
@@ -17222,6 +17230,10 @@ impl PyEngine {
                 "federation_revocations_deleted",
                 summary.federation_revocations_deleted,
             )?;
+            dict.set_item(
+                "detection_rows_refused",
+                erasure_refusals_to_py(py, &summary.detection_rows_refused)?,
+            )?;
             dict.set_item("deleted_at", summary.deleted_at.to_rfc3339())?;
             Ok(dict)
         })
@@ -17233,25 +17245,27 @@ impl PyEngine {
     /// this erases the agent's ENTIRE corpus and tombstones the derived
     /// detections.
     ///
-    /// v58.0.0 (CIRISPersist#1094 item 2, CC 4.5.3) — the erasure is the
-    /// subject's `withdraws`: this node, as the CC 2.4.1.1 rule-3 proxy for a
-    /// subject who proved identity out of band TO THE CALLER, signs the proxy
-    /// grant `delegates_to(node → canonical subject, [consent_revocation])`
-    /// and one `withdraws` per detection row naming the subject; then, in one
-    /// atomic transaction, hard-deletes `trace_events` + `trace_llm_calls`,
-    /// tombstones pre-v57 silo detections in place, hard-deletes each row a
-    /// subject `withdraws` covers under a tombstone citing it (served to
-    /// peers), and records a SUBJECT-FREE `hard_case:trace_erasure` row.
-    /// Raises `NodeIdentityRequired` with no node identity. Returns a dict:
+    /// In one atomic transaction: hard-deletes `trace_events` +
+    /// `trace_llm_calls`, tombstones pre-v57 silo detections in place, and
+    /// (v58.0.0, CIRISPersist#1094 item 2, CC 4.5.3) erases each row-backed
+    /// detection about the agent under its PRODUCER's rule-1 `withdraws`,
+    /// leaving a tombstone that replicates; records a subject-free
+    /// `hard_case:trace_erasure` row. Returns a dict:
     ///
     /// ```text
     /// {
     ///   "trace_events":                 int,
     ///   "trace_llm_calls":              int,
     ///   "detection_events_tombstoned":  int,
+    ///   "detection_rows_refused":       [ {"record_id": str, "reason": str} ],
     ///   "erased_at":                    str,  # ISO-8601 UTC
     /// }
     /// ```
+    ///
+    /// `detection_rows_refused` lists the rows NOT erased, each with its
+    /// reason (Art. 17(3) refused-with-reason; today
+    /// `erasure_producer_key_not_held`). Raises `NodeIdentityRequired` with
+    /// no node identity.
     ///
     /// **Idempotent**: a second call returns all-zero counts; a not-found
     /// is NOT raised as an error. Persist owns the atomic substrate
@@ -17267,22 +17281,27 @@ impl PyEngine {
             let runtime = self.runtime.clone();
             let agent_id_hash = agent_id_hash.to_owned();
 
-            // v58.0.0 (CIRISPersist#1094 item 2, CC 4.5.3) — through the
-            // Engine: the node signs the subject's proxy grant and its
-            // `withdraws` before the store erases.
-            let backend = match &self.backend {
+            let summary = py.detach(move || match &self.backend {
                 #[cfg(feature = "postgres")]
-                BackendDispatch::Postgres(b) => crate::engine::BackendDispatch::Postgres(b.clone()),
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::store::Backend;
+                        backend
+                            .delete_traces_for_agent_id_hash(&agent_id_hash)
+                            .await
+                    })
+                }
                 #[cfg(feature = "sqlite")]
-                BackendDispatch::Sqlite(b) => crate::engine::BackendDispatch::Sqlite(b.clone()),
-            };
-            let signer = self.signer.clone();
-            let local_signer = self.local_signer.clone();
-            let summary = py.detach(move || {
-                let engine = crate::Engine::from_shared_with_local(backend, signer, local_signer);
-                runtime.block_on(async move {
-                    engine.delete_traces_for_agent_id_hash(&agent_id_hash).await
-                })
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = sq.clone();
+                    runtime.block_on(async move {
+                        use crate::store::Backend;
+                        backend
+                            .delete_traces_for_agent_id_hash(&agent_id_hash)
+                            .await
+                    })
+                }
             });
             let summary = summary.map_err(erasure_err_to_py)?;
 
@@ -17292,6 +17311,10 @@ impl PyEngine {
             dict.set_item(
                 "detection_events_tombstoned",
                 summary.detection_events_tombstoned,
+            )?;
+            dict.set_item(
+                "detection_rows_refused",
+                erasure_refusals_to_py(py, &summary.detection_rows_refused)?,
             )?;
             dict.set_item("erased_at", summary.erased_at.to_rfc3339())?;
             Ok(dict)
@@ -34711,6 +34734,22 @@ where
     };
     serde_json::to_string(&page)
         .map_err(|e| PyRuntimeError::new_err(format!("AttestationListPage encode: {e}")))
+}
+
+/// v58.0.0 (CIRISPersist#1094 item 2) — the rows a DSAR door refused, as a
+/// list of `{"record_id", "reason"}` dicts (Art. 17(3) refused-with-reason).
+fn erasure_refusals_to_py<'py>(
+    py: Python<'py>,
+    refused: &[crate::federation::subject_erasure::ErasureRefusal],
+) -> PyResult<Bound<'py, pyo3::types::PyList>> {
+    let list = pyo3::types::PyList::empty(py);
+    for r in refused {
+        let d = PyDict::new(py);
+        d.set_item("record_id", &r.record_id)?;
+        d.set_item("reason", &r.reason)?;
+        list.append(d)?;
+    }
+    Ok(list)
 }
 
 /// v57.0.0 (CIRISPersist#988 item 2) — an erasure door's store error: the

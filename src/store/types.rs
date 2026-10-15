@@ -392,7 +392,7 @@ pub struct TraceLlmCallRow {
 /// removed AND FK-cascade rows in federation_attestations +
 /// federation_revocations are removed too — required for FK integrity
 /// since persist's federation FKs are not ON DELETE CASCADE.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DeleteSummary {
     /// Rows removed from `cirislens.trace_events`.
     pub trace_events_deleted: u64,
@@ -412,6 +412,13 @@ pub struct DeleteSummary {
     /// referencing the agent's key. Always 0 unless
     /// `include_federation_key=true`.
     pub federation_revocations_deleted: u64,
+    /// v58.0.0 (CIRISPersist#1094 item 2, CC 4.5.3) — the row-backed
+    /// detections of the erased traces this door did NOT erase, each with its
+    /// reason (CC 4.4 `erasure_policy`'s refused-with-reason, GDPR Art.
+    /// 17(3)): today only `erasure_producer_key_not_held` — the host holds no
+    /// live record of the producer key, so its rule-1 `withdraws` cannot be
+    /// made. Empty when everything was erased.
+    pub detection_rows_refused: Vec<crate::federation::subject_erasure::ErasureRefusal>,
     /// Wall-clock when the delete transaction committed.
     pub deleted_at: chrono::DateTime<chrono::Utc>,
 }
@@ -433,7 +440,7 @@ pub struct DeleteSummary {
 /// transaction. **Idempotent**: a second call finds no rows and returns
 /// all-zero counts (`Ok`, never an error — a not-found is not an error
 /// for erasure).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ErasureSummary {
     /// Rows hard-deleted from `cirislens.trace_events` (every row where
     /// `agent_id_hash` matches, across all signing keys).
@@ -442,12 +449,16 @@ pub struct ErasureSummary {
     /// `trace_id` from the erased trace_events set — V001 LLM call rows
     /// carry no `agent_id_hash`).
     pub trace_llm_calls: u64,
-    /// Rows TOMBSTONED in `cirislens_derived.detection_events` — derived
-    /// from the erased agent's traces (matched by `trace_id`), with the
-    /// PII linkage NULLed and `erased_at` stamped. NOT hard-deleted.
-    /// Always 0 on the memory backend (no derived-schema storage) and on
-    /// backends with no detection rows for the agent.
+    /// Detections of the erased agent's traces that were erased: pre-v57
+    /// silo rows tombstoned in place (V080), plus v57+ `detection:*` rows
+    /// hard-deleted under their producer's rule-1 `withdraws` (v58.0.0,
+    /// CC 4.5.3), each leaving a tombstone that replicates.
     pub detection_events_tombstoned: u64,
+    /// v58.0.0 (CIRISPersist#1094 item 2, CC 4.5.3) — the row-backed
+    /// detections this erasure did NOT erase, each with its reason (CC 4.4
+    /// `erasure_policy`'s refused-with-reason, GDPR Art. 17(3)); see
+    /// [`DeleteSummary::detection_rows_refused`].
+    pub detection_rows_refused: Vec<crate::federation::subject_erasure::ErasureRefusal>,
     /// Wall-clock when the erasure transaction committed.
     pub erased_at: chrono::DateTime<chrono::Utc>,
 }

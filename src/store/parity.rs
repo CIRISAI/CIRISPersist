@@ -173,7 +173,7 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("project_detection_row", Class::Plumbing),
     ("project_detection_row_under", Class::Plumbing),
     // v58.0.0 (CIRISPersist#1094 item 2) — the DSAR door's erasure of
-    // row-backed detections under the subject's `withdraws`: the hard-delete
+    // row-backed detections under the producer's rule-1 `withdraws`: the hard-delete
     // of the cited rows, the tombstone header + tombstone it builds (pure) and
     // writes. Storage on a decision `subject_erasure::plan_store_erasure`
     // already made: Plumbing.
@@ -182,14 +182,17 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // before its transaction, once for all three backends (a shared plan:
     // which detections a subject `withdraws` covers).
     ("plan_store_erasure", Class::Plan),
-    // Inside it: the candidate read (storage), and THE authority decision —
-    // a row is erased only under an admitted subject `withdraws`, re-derived
-    // through the one `withdraws` predicate.
+    // Inside it: the candidate reads (storage), and THE authority decisions —
+    // a row is erased only under its producer's admitted rule-1 `withdraws`
+    // (re-derived through the one `withdraws` predicate, or planned and
+    // admitted by it), and a row whose producer key is not held is refused.
     ("detection_row_ids_for_agent", Class::Plumbing),
-    ("authorised_erasures", Class::Gate),
-    // The attested-subject rule for a whole row (the rule-3 proxy grant to a
-    // canonical subject beside `check_attested_subject_admission`).
-    ("check_attested_subject_admission_for_row", Class::Gate),
+    ("erasing_withdraws", Class::Gate),
+    ("producer_key_held", Class::Gate),
+    ("plan_producer_withdraws", Class::Gate),
+    // Each backend's store step for the producers' planned withdraws.
+    ("sqlite_store_erasure_withdraws", Class::Plumbing),
+    ("pg_store_erasure_withdraws", Class::Plumbing),
     // The canonical subject of an agent / a detection's trace: derivations.
     ("agent_subject", Class::Plumbing),
     ("detection_subject", Class::Plumbing),

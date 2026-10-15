@@ -591,7 +591,7 @@ pub fn membership_removed_event(
 /// and the door that ran; never who. CC 4.5.3: "A hard case recording an
 /// erasure MUST NOT name the subject" — no `agent_id_hash`, no signing key,
 /// no subject key, no row id or digest that resolves to the erased subject's
-/// rows. The tombstones that replicate cite the subject's `withdraws`
+/// rows. The tombstones that replicate cite the producer's `withdraws`
 /// (`subject_erasure::ErasureNotice`); this row cites nothing.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct TraceErasureCounts {
@@ -602,15 +602,16 @@ pub struct TraceErasureCounts {
     /// `trace_llm_calls` rows hard-deleted.
     pub trace_llm_calls: u64,
     /// Detections erased: pre-v57 silo rows tombstoned in place plus
-    /// row-backed `detection:*` rows hard-deleted under a subject `withdraws`.
+    /// row-backed `detection:*` rows hard-deleted under their producer's
+    /// rule-1 `withdraws`.
     pub detection_events_tombstoned: u64,
     /// Of those, the row-backed ones (each one tombstone on the attestation
     /// plane).
     pub detection_rows_erased: u64,
-    /// Row-backed detections of the erased traces that NO subject `withdraws`
-    /// covers, left in place (a row naming no subject is reachable by no
-    /// subject's withdraws, CC 2.4.1.1 rules 2–3).
-    pub detection_rows_retained: u64,
+    /// Row-backed detections of the erased traces refused with a reason
+    /// (the host holds no live producer key; CC 4.5.3, Art. 17(3)), left in
+    /// place. The rows themselves are named only in the caller's summary.
+    pub detection_rows_refused: u64,
     /// `federation_keys` rows deleted (the key-scoped door's cascade).
     pub federation_keys: u64,
     /// `federation_attestations` rows deleted (the key-scoped door's cascade).

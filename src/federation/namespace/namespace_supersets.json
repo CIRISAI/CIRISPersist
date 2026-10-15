@@ -16576,7 +16576,7 @@
     "decimal_id": "4.5.3",
     "claim_id": "CLM-erasure-subject-route",
     "repo": "CIRISPersist",
-    "path#symbol": "src/federation/subject_erasure.rs#prepare_subject_erasure",
+    "path#symbol": "src/federation/subject_erasure.rs#plan_store_erasure",
     "tsv_target": "evidence/cc_impl.tsv",
     "manifest_round": "cc-rc8-1094"
    },
@@ -16584,7 +16584,7 @@
     "decimal_id": "4.5.3",
     "claim_id": "CLM-erasure-subject-route",
     "repo": "CIRISPersist",
-    "path#symbol": "src/federation/subject_erasure.rs#authorised_erasures",
+    "path#symbol": "src/federation/subject_erasure.rs#erasing_withdraws",
     "tsv_target": "evidence/cc_impl.tsv",
     "manifest_round": "cc-rc8-1094"
    },
@@ -16600,7 +16600,7 @@
     "decimal_id": "4.5.3",
     "claim_id": "CLM-erasure-subject-route",
     "repo": "CIRISPersist",
-    "path#symbol": "src/federation/admission.rs#subject_revocation_paths",
+    "path#symbol": "src/federation/admission.rs#resolve_withdraws_admission_rule_at",
     "tsv_target": "evidence/cc_impl.tsv",
     "manifest_round": "cc-rc8-1094"
    },

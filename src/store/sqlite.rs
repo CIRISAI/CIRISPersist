@@ -1622,13 +1622,23 @@ impl Backend for SqliteBackend {
                 .map_err(|e| Error::Backend(format!("rehome before erasure: {e}")))?;
         }
         // v58.0.0 (CIRISPersist#1094 item 2, CC 4.5.3) — the row-backed
-        // detections this erasure reaches, and the ones a subject `withdraws`
-        // covers: the door erases exactly those (read before the transaction).
-        let (citations, retained) =
-            crate::federation::subject_erasure::plan_store_erasure(self, &agent, Some(&key))
-                .await
-                .map_err(|e| Error::Backend(format!("erasure plan: {e}")))?;
+        // detections this erasure reaches: each erased under its PRODUCER's
+        // rule-1 `withdraws` (planned here when not already held), or refused
+        // with a reason (read before the transaction).
         let received_at = chrono::Utc::now();
+        let crate::federation::subject_erasure::ErasurePlan {
+            citations,
+            new_withdraws,
+            refused,
+        } = crate::federation::subject_erasure::plan_store_erasure(
+            self,
+            &agent,
+            Some(&key),
+            received_at,
+        )
+        .await
+        .map_err(|e| Error::Backend(format!("erasure plan: {e}")))?;
+        let refused_count = refused.len() as u64;
         let received_s = received_at.to_rfc3339();
         let summary = self
             .write(
@@ -1649,10 +1659,11 @@ impl Backend for SqliteBackend {
                     // v57.0.0 (CIRISPersist#988 item 3) — a pre-v57 silo row
                     // takes the V080 tombstone in place. v58.0.0
                     // (CIRISPersist#1094 item 2) — a ROW-BACKED one is
-                    // hard-deleted only under the subject's `withdraws` (the
+                    // hard-deleted only under its producer's rule-1 `withdraws` (the
                     // citations), and leaves no projection row.
                     let legacy_tombstoned =
                         sqlite_tombstone_detection_events(&tx, &trace_ids, &received_s)?;
+                    sqlite_store_erasure_withdraws(&tx, &new_withdraws)?;
                     let erased_rows = sqlite_erase_cited_rows(&tx, &citations)?;
                     let detection_events_tombstoned = legacy_tombstoned + erased_rows.len() as u64;
 
@@ -1740,7 +1751,7 @@ impl Backend for SqliteBackend {
                                 trace_llm_calls: trace_llm_calls_deleted,
                                 detection_events_tombstoned,
                                 detection_rows_erased: erased_rows.len() as u64,
-                                detection_rows_retained: retained,
+                                detection_rows_refused: refused_count,
                                 federation_keys: federation_keys_deleted,
                                 federation_attestations: federation_attestations_deleted,
                                 federation_revocations: federation_revocations_deleted,
@@ -1757,6 +1768,7 @@ impl Backend for SqliteBackend {
                         federation_keys_deleted,
                         federation_attestations_deleted,
                         federation_revocations_deleted,
+                        detection_rows_refused: refused,
                         deleted_at: chrono::Utc::now(),
                     })
                 },
@@ -1791,12 +1803,17 @@ impl Backend for SqliteBackend {
                 .await
                 .map_err(|e| Error::Backend(format!("rehome before erasure: {e}")))?;
         }
-        // v58.0.0 (CIRISPersist#1094 item 2, CC 4.5.3) — what a subject
-        // `withdraws` covers, read before the transaction.
-        let (citations, retained) =
-            crate::federation::subject_erasure::plan_store_erasure(self, &agent, None)
-                .await
-                .map_err(|e| Error::Backend(format!("erasure plan: {e}")))?;
+        // v58.0.0 (CIRISPersist#1094 item 2, CC 4.5.3) — each reached row
+        // erased under its producer's rule-1 `withdraws`, or refused with a
+        // reason; read before the transaction.
+        let crate::federation::subject_erasure::ErasurePlan {
+            citations,
+            new_withdraws,
+            refused,
+        } = crate::federation::subject_erasure::plan_store_erasure(self, &agent, None, erased_at)
+            .await
+            .map_err(|e| Error::Backend(format!("erasure plan: {e}")))?;
+        let refused_count = refused.len() as u64;
         let summary = self
             .write(
                 move |conn| -> Result<super::types::ErasureSummary, rusqlite::Error> {
@@ -1825,6 +1842,7 @@ impl Backend for SqliteBackend {
                     // its tombstone — citing the withdraws — is written below,
                     // so the row cannot be re-admitted and a peer holding a
                     // replica receives it.
+                    sqlite_store_erasure_withdraws(&tx, &new_withdraws)?;
                     let erased_rows = sqlite_erase_cited_rows(&tx, &citations)?;
                     let detection_events_tombstoned = legacy_tombstoned + erased_rows.len() as u64;
 
@@ -1867,7 +1885,7 @@ impl Backend for SqliteBackend {
                                 trace_llm_calls,
                                 detection_events_tombstoned,
                                 detection_rows_erased: erased_rows.len() as u64,
-                                detection_rows_retained: retained,
+                                detection_rows_refused: refused_count,
                                 ..Default::default()
                             },
                             erased_at,
@@ -1880,6 +1898,7 @@ impl Backend for SqliteBackend {
                         trace_events,
                         trace_llm_calls,
                         detection_events_tombstoned,
+                        detection_rows_refused: refused,
                         erased_at,
                     })
                 },
@@ -23767,8 +23786,21 @@ pub(crate) fn log_v196(counts: Option<(i64, i64, i64)>) {
     }
 }
 
+/// v58.0.0 (CIRISPersist#1094 item 2) — store the producers' planned
+/// `withdraws` rows inside the erasure's transaction, through the local-row
+/// statement every local writer uses (row, subject projection, V157 depth).
+fn sqlite_store_erasure_withdraws(
+    tx: &rusqlite::Transaction<'_>,
+    planned: &[crate::federation::subject_erasure::PlannedErasureWithdraws],
+) -> Result<(), rusqlite::Error> {
+    for w in planned {
+        sqlite_insert_local_attestation_row(tx, &w.row, Some(w.depth))?;
+    }
+    Ok(())
+}
+
 /// v58.0.0 (CIRISPersist#1094 item 2, CC 4.5.3) — erase the ROW-BACKED
-/// detections a subject `withdraws` covers, inside the erasure's transaction:
+/// detections their producer's `withdraws` covers, inside the erasure's transaction:
 /// each cited row is hard-deleted (its wire-index entry first; its projection
 /// row leaves by `ON DELETE CASCADE`). Never a rewrite. Returns the citations
 /// whose row was still there, for their tombstones.
@@ -23797,7 +23829,7 @@ fn sqlite_erase_cited_rows(
 
 /// v58.0.0 (CIRISPersist#1094 item 2) — record a DSAR erasure inside its
 /// transaction: its subject-free `hard_case:trace_erasure:v1` row and, per
-/// erased row, the tombstone header citing the subject's `withdraws`
+/// erased row, the tombstone header citing the producer's `withdraws`
 /// (`subject_erasure::erasure_execution`, finalized at once) and its one
 /// tombstone.
 fn sqlite_record_erasure(

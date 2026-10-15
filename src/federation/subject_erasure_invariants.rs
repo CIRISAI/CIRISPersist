@@ -5,29 +5,28 @@
 //! - **I965** — a `detection:*` row names its subject: the CC 2.3.2.1
 //!   canonical hash of the scored trace's agent, when the trace is held; no
 //!   subject when it is not.
-//! - **I966** — the DSAR erasure is the subject's `withdraws`: the node's
-//!   proxy grant `delegates_to(node → subject, [consent_revocation])` and its
-//!   `withdraws` (admitted as CC 2.4.1.1 rule 3) come first; the store door
-//!   then hard-deletes the row under a tombstone whose header cites the
-//!   withdraws (`legal_basis` = `withdraws`), is SERVED as a purge bundle,
-//!   refuses re-admission, and leaves the projection its rows' rebuild; a
-//!   re-run is a no-op; the key-scoped door erases the same way.
-//! - **I967** — the store door's authority IS the withdraws: without one it
-//!   erases no row-backed detection (counted as retained); once the subject's
-//!   withdraws exists, a re-run erases it (found by its subject, its trace
-//!   long gone).
-//! - **I968** — the anti-Goodhart wall stands beside the route: a node
-//!   without the proxy grant is refused; a non-node key cannot hold the
-//!   canonical proxy grant; the scored agent's own key (a canonical binding,
-//!   CC 2.4.1.1 rule 2) cannot withdraw its detection.
+//! - **I966** — the DSAR erasure is the PRODUCER's `withdraws` (CC 4.5.3,
+//!   controller-only): the door plans the detector's rule-1 `withdraws`
+//!   (local tier, signature deferred) and hard-deletes the row under a
+//!   tombstone whose header cites it (`legal_basis` = `withdraws`), is SERVED
+//!   as a purge bundle, refuses re-admission, and leaves the projection its
+//!   rows' rebuild; a re-run is a no-op; the one-key door erases the same way.
+//! - **I967** — refused with a reason: when the host holds no live record of
+//!   the producer key the row is NOT erased and the summary names it with
+//!   `erasure_producer_key_not_held`; a producer withdraws already held is
+//!   reused, never doubled.
+//! - **I968** — the CC 2.4.1.1 carve-out stays load-bearing: a rule-2
+//!   withdraws (the scored agent bound to the canonical subject) and a rule-3
+//!   withdraws (a node holding a consent_revocation proxy chain to it) of a
+//!   detection row are both refused.
 //! - **I969** — the erasure's hard case names nobody; V196 deletes the
 //!   v57-shaped rows that did, and their `art17_erasure` headers, and the
 //!   projection stays its rows' rebuild (sqlite, postgres).
 //! - **I970** — an immediate-removal basis from a key holding no `takedown`
 //!   duty is refused for every basis (CC 4.5.3 struck "from any claimant").
 //! - **I971** — two nodes: the erasure's tombstone delivered through the
-//!   planes; the receiver re-derives the withdraws on its own state and
-//!   destroys its replica; a bundle whose withdraws has not replicated is
+//!   planes; the receiver re-derives the producer's withdraws on its own state
+//!   (after the crossing) and destroys its replica; a bundle whose withdraws has not replicated is
 //!   refused retryable; one naming another record is refused.
 //! - **I972** — `reconsideration:{grounds}`: the subject of the HELD target
 //!   files; a filer naming itself subject of a target it is not the subject
@@ -35,8 +34,8 @@
 //!   community is the target's.
 //! - **I973** — a target naming its subject by key digest admits the filer
 //!   whose key digests to it, and nobody else.
-//! - **I974** — the Engine door end to end (sqlite, postgres): the node's own
-//!   signer writes the grant and the withdraws, and the erasure takes the row.
+//! - **I974** — the Engine door end to end (sqlite, postgres): the producer
+//!   route through the Engine the Python surface calls.
 
 #[cfg(test)]
 pub(crate) mod bodies {
@@ -83,26 +82,6 @@ pub(crate) mod bodies {
         )
         .await
         .map(|e| e.attestation_id)
-    }
-
-    /// The Engine's signing half, with a test signer: the node's proxy grant
-    /// and `withdraws` for every detection the erasure of `agent` reaches.
-    pub(crate) async fn prepare_as_node<B>(
-        b: &B,
-        node: &Node,
-        agent: &str,
-        signing_key_id: Option<&str>,
-    ) -> Result<se::PreparedErasure, Error>
-    where
-        B: AttestationStore + Sync,
-    {
-        let mut rows = Vec::new();
-        for id in b.detection_row_ids_for_agent(agent, signing_key_id).await? {
-            if let Some(r) = b.get_attestation(&id).await? {
-                rows.push(r);
-            }
-        }
-        se::prepare_subject_erasure(b, &node.id, agent, &rows, |i| emit_as(b, &node.alias, i)).await
     }
 
     pub(crate) fn detection(trace: &str, signer: &str) -> crate::derived::DetectionEvent {
@@ -209,55 +188,26 @@ pub(crate) mod bodies {
     }
 
     // ── I966 ──────────────────────────────────────────────────────────────
-    pub(crate) async fn i966_the_erasure_is_the_subjects_withdraws<B>(b: &B, node: &Node, tag: &str)
+    pub(crate) async fn i966_the_erasure_is_the_producers_withdraws<B>(b: &B, tag: &str)
     where
         B: AttestationStore + crate::derived::DerivedSchema + crate::store::Backend + Sync,
     {
         let agent = format!("{tag}-agent");
         let subject = se::agent_subject(&agent).unwrap();
         let row_id = detected(b, tag, &agent, &format!("{tag}-trace")).await;
-        let prepared = prepare_as_node(b, node, &agent, None)
-            .await
-            .expect("I966: prepare");
-        assert_eq!(prepared.grants_emitted.len(), 1, "I966: one proxy grant");
-        assert_eq!(prepared.withdraws_emitted.len(), 1, "I966: one withdraws");
-        let grant = b
-            .get_attestation(&prepared.grants_emitted[0])
+        let producer = b
+            .get_attestation(&row_id)
             .await
             .unwrap()
-            .unwrap();
-        assert_eq!(grant.attestation_type, attestation_type::DELEGATES_TO);
-        assert_eq!(
-            (
-                grant.attesting_key_id.as_str(),
-                grant.attested_key_id.as_str()
-            ),
-            (node.id.as_str(), subject.as_str()),
-            "I966: delegates_to(node → subject)"
-        );
-        assert_eq!(
-            crate::federation::admission::delegation_scope_set(&grant.attestation_envelope),
-            std::iter::once("consent_revocation".to_owned()).collect(),
-            "I966: scope [consent_revocation]"
-        );
-        let w = b
-            .get_attestation(&prepared.withdraws_emitted[0])
-            .await
             .unwrap()
-            .unwrap();
-        assert_eq!(w.attesting_key_id, node.id);
-        assert_eq!(
-            w.withdraws_admission_rule,
-            Some(3),
-            "I966: the node's withdraws is admitted as CC 2.4.1.1 rule 3"
-        );
-        // A second prepare emits nothing new.
-        let again = prepare_as_node(b, node, &agent, None).await.unwrap();
-        assert_eq!(again.already_withdrawn, vec![row_id.clone()]);
-        assert!(again.withdraws_emitted.is_empty() && again.grants_emitted.is_empty());
+            .attesting_key_id;
 
         let summary = b.delete_traces_for_agent_id_hash(&agent).await.unwrap();
         assert_eq!(summary.detection_events_tombstoned, 1, "I966: the counter");
+        assert!(
+            summary.detection_rows_refused.is_empty(),
+            "I966: nothing refused"
+        );
         assert!(
             b.get_attestation(&row_id).await.unwrap().is_none(),
             "I966: the row is hard-deleted"
@@ -269,14 +219,28 @@ pub(crate) mod bodies {
             .expect("I966: tombstoned");
         let header = b.purge_execution(&notice_id).await.unwrap().unwrap();
         assert_eq!(header.legal_basis, se::WITHDRAWS_AUTHORITY);
-        assert_eq!(header.claimant_key_id, node.id, "I966: the proxy claims");
+        assert_eq!(
+            header.claimant_key_id, producer,
+            "I966: the producer claims"
+        );
         assert!(
             header.finalized_at.is_some(),
             "I966: finalized at execution"
         );
         let cited = ErasureNotice::parse(&serde_json::from_str(&header.notice_jcs).unwrap())
             .expect("I966: the header cites an erasure notice");
-        assert_eq!(cited, ErasureNotice::new(&w.attestation_id, &row_id));
+        assert_eq!(cited.target_attestation_id, row_id);
+        let w = b
+            .get_attestation(&cited.withdraws_attestation_id)
+            .await
+            .unwrap()
+            .expect("I966: the producer's withdraws is held");
+        assert_eq!(w.attestation_type, attestation_type::WITHDRAWS);
+        assert_eq!(
+            w.attesting_key_id, producer,
+            "I966: signed by the producer key"
+        );
+        assert_eq!(w.tier, "local", "I966: signature deferred to the crossing");
         assert!(
             !header.notice_jcs.contains(&agent) && !header.notice_jcs.contains(&subject),
             "I966: the notice names no subject"
@@ -306,16 +270,15 @@ pub(crate) mod bodies {
             "I966: a re-run is a no-op"
         );
 
-        // The key-scoped door, the same route.
+        // The one-key door, the same route.
         let agent2 = format!("{tag}-agent-k");
         let row2 = detected(b, &format!("{tag}k"), &agent2, &format!("{tag}-trace-k")).await;
         let signer_key = format!("{agent2}-signer");
-        prepare_as_node(b, node, &agent2, Some(&signer_key))
-            .await
-            .expect("I966: prepare (key-scoped)");
-        b.delete_traces_for_agent(&agent2, &signer_key, false)
+        let s2 = b
+            .delete_traces_for_agent(&agent2, &signer_key, false)
             .await
             .unwrap();
+        assert!(s2.detection_rows_refused.is_empty());
         assert!(b.get_attestation(&row2).await.unwrap().is_none());
         assert!(b
             .purge_tombstoned("attestation", &row2)
@@ -326,81 +289,117 @@ pub(crate) mod bodies {
         let keyed = events
             .iter()
             .find(|e| e.detail["op"] == crate::federation::hard_case::trace_erasure_op::ONE_KEY)
-            .expect("I966: the key-scoped door's hard case");
-        assert_subject_free(keyed, &agent2, "I966 key-scoped");
+            .expect("I966: the one-key door's hard case");
+        assert_subject_free(keyed, &agent2, "I966 one-key");
         assert!(!serde_json::to_string(keyed).unwrap().contains(&signer_key));
     }
 
     // ── I967 ──────────────────────────────────────────────────────────────
-    pub(crate) async fn i967_the_door_erases_only_what_a_withdraws_covers<B>(
+    /// The seed: a detection of `agent`'s trace and, when `voluntary`, its
+    /// producer's own rule-1 retraction already held. Returns `(row, producer)`.
+    pub(crate) async fn i967_seed<B>(
         b: &B,
-        node: &Node,
         tag: &str,
-    ) where
+        agent: &str,
+        voluntary: bool,
+    ) -> (String, String)
+    where
         B: AttestationStore + crate::derived::DerivedSchema + crate::store::Backend + Sync,
     {
-        let agent = format!("{tag}-agent");
-        let row_id = detected(b, tag, &agent, &format!("{tag}-trace")).await;
-        // The DETECTOR's own retraction (CC 2.4.1.1 rule 1) is admitted, and
-        // is not the subject's erasure: the door does not erase under it.
+        let row_id = detected(b, tag, agent, &format!("{tag}-trace")).await;
         let target = b.get_attestation(&row_id).await.unwrap().unwrap();
-        let mut w = ts::bare_attestation(
-            &format!("{tag}-detector-withdraws"),
-            &target.attesting_key_id,
-            &target.attesting_key_id,
-            &crate::federation::withdraws_attestation_envelope(&row_id, &target.attestation_type),
-        );
-        w.attestation_type = attestation_type::WITHDRAWS.into();
-        w.cohort_scope = target.cohort_scope.clone();
-        let w = ts::seal_row(&target.attesting_key_id, w);
-        b.put_attestation(crate::federation::types::SignedAttestation { attestation: w })
-            .await
-            .expect("I967: the detector retracts its own row");
-        assert_eq!(
-            b.get_attestation(&format!("{tag}-detector-withdraws"))
+        if voluntary {
+            let mut w = ts::bare_attestation(
+                &format!("{tag}-producer-withdraws"),
+                &target.attesting_key_id,
+                &target.attesting_key_id,
+                &crate::federation::withdraws_attestation_envelope(
+                    &row_id,
+                    &target.attestation_type,
+                ),
+            );
+            w.attestation_type = attestation_type::WITHDRAWS.into();
+            w.cohort_scope = target.cohort_scope.clone();
+            let w = ts::seal_row(&target.attesting_key_id, w);
+            b.put_attestation(crate::federation::types::SignedAttestation { attestation: w })
                 .await
-                .unwrap()
-                .unwrap()
-                .withdraws_admission_rule,
-            Some(1)
-        );
-        let summary = b.delete_traces_for_agent_id_hash(&agent).await.unwrap();
+                .expect("I967: the producer retracts its own row");
+        }
+        (row_id, target.attesting_key_id)
+    }
+
+    /// After the runner expired the producer key's record: the row is refused
+    /// with a reason, left in place, counted; nothing is tombstoned.
+    pub(crate) async fn i967_refused_with_reason<B>(b: &B, agent: &str, row_id: &str)
+    where
+        B: AttestationStore + crate::derived::DerivedSchema + crate::store::Backend + Sync,
+    {
+        let summary = b.delete_traces_for_agent_id_hash(agent).await.unwrap();
         assert_eq!(summary.trace_events, 1, "I967: the trace corpus goes");
         assert_eq!(
             summary.detection_events_tombstoned, 0,
-            "I967: no subject withdraws, no erasure of the row"
+            "I967: the row is not erased"
+        );
+        assert_eq!(
+            summary.detection_rows_refused,
+            vec![se::ErasureRefusal {
+                record_id: format!("attestation:{row_id}"),
+                reason: se::token::PRODUCER_KEY_NOT_HELD.to_owned(),
+            }],
+            "I967: refused WITH a reason, named in the summary"
         );
         assert!(
-            b.get_attestation(&row_id).await.unwrap().is_some(),
-            "I967: the row is left"
+            b.get_attestation(row_id).await.unwrap().is_some(),
+            "I967: left in place"
         );
         assert!(b
-            .purge_tombstoned("attestation", &row_id)
+            .purge_tombstoned("attestation", row_id)
             .await
             .unwrap()
             .is_none());
         let events = erasure_events(b).await;
         assert_eq!(
-            events[0].detail["detection_rows_retained"], 1,
+            events[0].detail["detection_rows_refused"], 1,
             "I967: counted"
         );
-        // The subject's withdraws, then a re-run: the row is found by its
-        // subject (its trace is gone) and erased.
-        let p = prepare_as_node(b, node, &agent, None).await.unwrap();
-        assert_eq!(p.withdraws_emitted.len(), 1);
-        let again = b.delete_traces_for_agent_id_hash(&agent).await.unwrap();
-        assert_eq!(
-            again.detection_events_tombstoned, 1,
-            "I967: erased under the withdraws"
-        );
-        assert!(b.get_attestation(&row_id).await.unwrap().is_none());
         check_projection_rebuild(b, SiloProjection::DetectionEvents)
             .await
             .expect("I967: rebuild");
     }
 
+    /// A producer withdraws already held is the authority: reused, not doubled.
+    pub(crate) async fn i967_a_held_producer_withdraws_is_reused<B>(b: &B, tag: &str)
+    where
+        B: AttestationStore + crate::derived::DerivedSchema + crate::store::Backend + Sync,
+    {
+        let agent = format!("{tag}-agent-v");
+        let (row_id, producer) = i967_seed(b, &format!("{tag}v"), &agent, true).await;
+        b.delete_traces_for_agent_id_hash(&agent).await.unwrap();
+        assert!(b.get_attestation(&row_id).await.unwrap().is_none());
+        let n = b
+            .purge_tombstoned("attestation", &row_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let header = b.purge_execution(&n).await.unwrap().unwrap();
+        let cited =
+            ErasureNotice::parse(&serde_json::from_str(&header.notice_jcs).unwrap()).unwrap();
+        assert_eq!(
+            cited.withdraws_attestation_id,
+            format!("{tag}v-producer-withdraws")
+        );
+        let mine = b
+            .list_attestations_referencing(&row_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|w| w.attesting_key_id == producer)
+            .count();
+        assert_eq!(mine, 1, "I967: one producer withdraws, never two");
+    }
+
     // ── I968 ──────────────────────────────────────────────────────────────
-    pub(crate) async fn i968_the_wall_stands_beside_the_route<B>(b: &B, node: &Node, tag: &str)
+    pub(crate) async fn i968_the_carve_out_stays<B>(b: &B, tag: &str)
     where
         B: AttestationStore + crate::derived::DerivedSchema + crate::store::Backend + Sync,
     {
@@ -409,7 +408,7 @@ pub(crate) mod bodies {
         let row_id = detected(b, tag, &agent, &format!("{tag}-trace")).await;
         let target = b.get_attestation(&row_id).await.unwrap().unwrap();
         let withdraws_of = |t: &Attestation| {
-            let mut i = EmitAttestationInput::with_envelope(
+            EmitAttestationInput::with_envelope(
                 attestation_type::WITHDRAWS,
                 crate::federation::envelope::EnvelopeCore::from_value(
                     crate::federation::withdraws_attestation_envelope(
@@ -419,47 +418,10 @@ pub(crate) mod bodies {
                 )
                 .unwrap(),
                 t.cohort_scope.clone(),
-            );
-            i.attested_key_id = None;
-            i
+            )
         };
-        // (a) the node WITHOUT the consent_revocation proxy chain: refused.
-        let e = emit_as(b, &node.alias, withdraws_of(&target))
-            .await
-            .expect_err("I968: a node without the proxy grant is refused");
-        assert_eq!(e.kind(), "federation_withdraws_not_admitted", "I968: {e}");
-        // A grant of the WRONG scope does not make it a proxy.
-        let wrong =
-            crate::federation::delegates_to_envelope(&subject, &["retain".to_owned()], false);
-        let mut gi = EmitAttestationInput::with_envelope(
-            attestation_type::DELEGATES_TO,
-            crate::federation::envelope::EnvelopeCore::from_value(wrong).unwrap(),
-            "self",
-        );
-        gi.attested_key_id = Some(subject.clone());
-        assert!(
-            emit_as(b, &node.alias, gi).await.is_err(),
-            "I968: a canonical recipient is admitted only for the consent_revocation proxy"
-        );
-        // (b) a NON-node key cannot hold the canonical proxy grant.
+        // Rule 2: the scored agent's key bound to the canonical subject.
         let agent_key = signing_node_as(b, &format!("{tag}ag"), identity_type::AGENT).await;
-        let grant = crate::federation::delegates_to_envelope(
-            &subject,
-            &["consent_revocation".to_owned()],
-            false,
-        );
-        let mut gi = EmitAttestationInput::with_envelope(
-            attestation_type::DELEGATES_TO,
-            crate::federation::envelope::EnvelopeCore::from_value(grant).unwrap(),
-            "self",
-        );
-        gi.attested_key_id = Some(subject.clone());
-        assert!(
-            emit_as(b, &agent_key.alias, gi).await.is_err(),
-            "I968: an agent cannot appoint itself proxy for a canonical subject"
-        );
-        // (c) the scored agent's own key, bound to the canonical subject
-        // (rule 2 widening), cannot withdraw its detection.
         let hex = subject.strip_prefix("canonical:sha256:").unwrap();
         let bind = EmitAttestationInput::with_envelope(
             attestation_type::SCORES,
@@ -475,11 +437,41 @@ pub(crate) mod bodies {
             .expect("I968: the agent binds the canonical subject");
         let e = emit_as(b, &agent_key.alias, withdraws_of(&target))
             .await
-            .expect_err("I968: the scored agent cannot withdraw its own detection");
-        assert_eq!(e.kind(), "federation_withdraws_not_admitted", "I968: {e}");
-        // The route itself is open to the node once it holds the grant.
-        let p = prepare_as_node(b, node, &agent, None).await.unwrap();
-        assert_eq!(p.withdraws_emitted.len(), 1, "I968: the node's route");
+            .expect_err("I968: rule 2 does not reach a detection row");
+        assert_eq!(
+            e.kind(),
+            "federation_withdraws_not_admitted",
+            "I968 rule 2: {e}"
+        );
+        // Rule 3: a node holding a consent_revocation proxy chain to the
+        // subject (the subject registered so the edge can name it).
+        ts::register_hybrid_key_as(b, &subject, &subject, identity_type::AGENT).await;
+        let node = signing_node(b, &format!("{tag}n")).await;
+        let mut gi = EmitAttestationInput::with_envelope(
+            attestation_type::DELEGATES_TO,
+            crate::federation::envelope::EnvelopeCore::from_value(
+                crate::federation::delegates_to_envelope(
+                    &subject,
+                    &["consent_revocation".to_owned()],
+                    false,
+                ),
+            )
+            .unwrap(),
+            "self",
+        );
+        gi.attested_key_id = Some(subject.clone());
+        emit_as(b, &node.alias, gi)
+            .await
+            .expect("I968: the proxy grant itself is admissible");
+        let e = emit_as(b, &node.alias, withdraws_of(&target))
+            .await
+            .expect_err("I968: rule 3 does not reach a detection row");
+        assert_eq!(
+            e.kind(),
+            "federation_withdraws_not_admitted",
+            "I968 rule 3: {e}"
+        );
+        assert!(b.get_attestation(&row_id).await.unwrap().is_some());
     }
 
     /// [`signing_node`] with another role.
@@ -684,7 +676,7 @@ pub(crate) mod bodies {
             s.put_detection_event(d.clone()).await.unwrap();
         }
         let row_id = crate::derived::detection_row::detection_attestation_id(&d.detection_id);
-        let p = prepare_as_node(a, node_a, &agent, None).await.unwrap();
+        let _ = node_a;
         a.delete_traces_for_agent_id_hash(&agent).await.unwrap();
         let bundles = crate::federation::steward_purge::list_purge_bundles_since(a, None, 100)
             .await
@@ -712,13 +704,20 @@ pub(crate) mod bodies {
             .expect_err("I971: an erasure names exactly its target");
         assert_eq!(e.kind(), se::token::UNAUTHORISED, "I971: {e}");
 
-        // The grant and the withdraws replicate (A's signed rows, B's door).
-        for id in p.grants_emitted.iter().chain(&p.withdraws_emitted) {
-            let row = a.get_attestation(id).await.unwrap().unwrap();
-            b_.put_attestation(crate::federation::types::SignedAttestation { attestation: row })
-                .await
-                .unwrap_or_else(|e| panic!("I971: B admits A's {id}: {e}"));
-        }
+        // The producer's withdraws crosses (the detector signs it, as it signs
+        // its detection) and replicates to B through B's own door.
+        let cited = ErasureNotice::parse(&bundle.notice.envelope).unwrap();
+        let mut w = a
+            .get_attestation(&cited.withdraws_attestation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        w.tier = crate::federation::types::attestation_tier::FEDERATION.to_owned();
+        w.withdraws_admission_rule = None;
+        let w = ts::seal_row(&lens, w);
+        b_.put_attestation(crate::federation::types::SignedAttestation { attestation: w })
+            .await
+            .unwrap_or_else(|e| panic!("I971: B admits the producer's withdraws: {e}"));
         let out = se::apply_replicated_erasure(b_, &bundle, &node_b.id)
             .await
             .expect("I971: B re-derives the withdraws on its own state");
@@ -1068,20 +1067,80 @@ mod run {
     on_every_backend!(i966, |b, t| {
         let node = bodies::signing_node(&b, &t).await;
         b.set_node_key_id(&node.id);
-        bodies::i966_the_erasure_is_the_subjects_withdraws(&b, &node, &t).await;
+        bodies::i966_the_erasure_is_the_producers_withdraws(&b, &t).await;
     });
 
-    on_every_backend!(i967, |b, t| {
+    on_every_backend!(i967_reuse, |b, t| {
         let node = bodies::signing_node(&b, &t).await;
         b.set_node_key_id(&node.id);
-        bodies::i967_the_door_erases_only_what_a_withdraws_covers(&b, &node, &t).await;
+        bodies::i967_a_held_producer_withdraws_is_reused(&b, &t).await;
     });
 
     on_every_backend!(i968, |b, t| {
         let node = bodies::signing_node(&b, &t).await;
         b.set_node_key_id(&node.id);
-        bodies::i968_the_wall_stands_beside_the_route(&b, &node, &t).await;
+        bodies::i968_the_carve_out_stays(&b, &t).await;
     });
+
+    // I967 — the producer key's record expired (a per-backend seam).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn i967_memory() {
+        let b = crate::store::memory::MemoryBackend::new();
+        let t = tag("i967m");
+        let node = bodies::signing_node(&b, &t).await;
+        b.set_node_key_id(&node.id);
+        let agent = format!("{t}-agent");
+        let (row, producer) = bodies::i967_seed(&b, &t, &agent, false).await;
+        b.test_expire_key(&producer);
+        bodies::i967_refused_with_reason(&b, &agent, &row).await;
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn i967_sqlite() {
+        use crate::store::Backend as _;
+        let b = crate::store::sqlite::SqliteBackend::open_in_memory()
+            .await
+            .unwrap();
+        b.run_migrations().await.unwrap();
+        let t = tag("i967s");
+        let node = bodies::signing_node(&b, &t).await;
+        b.set_node_key_id(&node.id);
+        let agent = format!("{t}-agent");
+        let (row, producer) = bodies::i967_seed(&b, &t, &agent, false).await;
+        b.test_execute(&format!(
+            "UPDATE federation_keys SET valid_until = '2020-01-01T00:00:00+00:00' \
+             WHERE key_id = '{producer}'"
+        ))
+        .await;
+        bodies::i967_refused_with_reason(&b, &agent, &row).await;
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn i967_postgres() {
+        use crate::store::Backend as _;
+        let Some(dsn) = crate::test_pg::empty_dsn() else {
+            eprintln!("i967 postgres: no base DSN — SKIPPED");
+            return;
+        };
+        let b = crate::store::postgres::PostgresBackend::connect(&dsn)
+            .await
+            .unwrap();
+        b.run_migrations().await.unwrap();
+        let t = tag("i967p");
+        let node = bodies::signing_node(&b, &t).await;
+        b.set_node_key_id(&node.id);
+        let agent = format!("{t}-agent");
+        let (row, producer) = bodies::i967_seed(&b, &t, &agent, false).await;
+        b.test_execute(&format!(
+            "UPDATE cirislens.federation_keys SET valid_until = '2020-01-01T00:00:00+00:00' \
+             WHERE key_id = '{producer}'"
+        ))
+        .await;
+        bodies::i967_refused_with_reason(&b, &agent, &row).await;
+        eprintln!("i967_postgres: RAN");
+    }
 
     on_every_backend!(i970, |b, _t| {
         bodies::i970_no_basis_from_any_claimant(&b).await;
@@ -1309,18 +1368,21 @@ mod run {
             .unwrap()
             .unwrap();
         assert_eq!(
-            w.withdraws_admission_rule,
-            Some(3),
-            "I974: rule 3, the node as proxy"
+            w.attestation_type,
+            crate::federation::types::attestation_type::WITHDRAWS
         );
-        assert_eq!(w.tier, "federation", "I974: signed by the node key");
+        assert_eq!(
+            w.attesting_key_id,
+            format!("{t}-lens"),
+            "I974: the producer's withdraws"
+        );
         // The key-scoped Engine door.
         let agent2 = format!("{t}-agent-k");
         let row2 = bodies::detected(b, &format!("{t}k"), &agent2, &format!("{t}-trace-k")).await;
-        engine
-            .delete_traces_for_agent(&agent2, &format!("{agent2}-signer"), false)
+        // The one-key door (the Python surface calls the store's door).
+        b.delete_traces_for_agent(&agent2, &format!("{agent2}-signer"), false)
             .await
-            .expect("I974: the key-scoped Engine door");
+            .expect("I974: the one-key door");
         assert!(b.get_attestation(&row2).await.unwrap().is_none());
     }
 }

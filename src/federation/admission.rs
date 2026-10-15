@@ -8904,110 +8904,6 @@ async fn enumerate_scoped_delegation_reach(
     .reached)
 }
 
-/// v58.0.0 (CIRISPersist#1094 item 2) — which CC 2.4.1.1 subject-authority
-/// rules (2–4) may withdraw a target: [`subject_revocation_paths`]'s answer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SubjectRevocationPaths {
-    /// Rules 2, 3 and 4.
-    All,
-    /// Rule 3 only: the erasure route (CC 4.5.3), the node as the subject's
-    /// proxy.
-    ErasureProxyOnly,
-    /// None: the anti-Goodhart retraction dual (CC 2.4.1.1).
-    None,
-}
-
-/// v58.0.0 (CIRISPersist#1094 item 2; CC 2.4.1.1 carve-out, CC 4.5.3) —
-/// **the one predicate deciding which subject-authority rules reach
-/// `target`.**
-///
-/// - `capacity:*`: none (the anti-Goodhart retraction dual; the subject's
-///   contest path is `reconsideration:{grounds}`, CC 4.5.5).
-/// - `detection:*`: rule 3 alone, and only for a NODE-role issuer
-///   ([`is_node_role_key`]): CC 4.5.3 erases a detection row about a subject
-///   by the subject's `withdraws` with the node acting as the rule-3 proxy
-///   for a subject who proved identity out of band. The scored party's own
-///   key (rule 2, a canonical binding, a rule-4 delegate) and any non-node
-///   proxy stay refused — an agent cannot appoint itself proxy for its own
-///   canonical subject and subtract its adverse detections.
-/// - everything else: all three.
-///
-/// # Errors
-///
-/// Directory reads.
-pub async fn subject_revocation_paths(
-    directory: &dyn super::FederationDirectory,
-    issuer: &str,
-    target: &super::Attestation,
-) -> Result<SubjectRevocationPaths, Error> {
-    let dimension = envelope_dimension(&target.attestation_envelope);
-    if dimension.is_some_and(|d| d.starts_with(CAPACITY_FAMILY_PREFIX)) {
-        return Ok(SubjectRevocationPaths::None);
-    }
-    if dimension.is_some_and(|d| d.starts_with(crate::derived::detection_row::DIMENSION_PREFIX)) {
-        return Ok(if is_node_role_key(directory, issuer).await? {
-            SubjectRevocationPaths::ErasureProxyOnly
-        } else {
-            SubjectRevocationPaths::None
-        });
-    }
-    Ok(SubjectRevocationPaths::All)
-}
-
-/// v58.0.0 (CIRISPersist#1094 item 2) — is `key` a held NODE-role key that is
-/// not also an agent (a fused `{node,agent}` key is the scored party as much
-/// as the node, CC 3.4.7.3 Clause A)? Unknown keys are not.
-pub async fn is_node_role_key(
-    directory: &dyn super::FederationDirectory,
-    key: &str,
-) -> Result<bool, Error> {
-    Ok(directory.lookup_public_key(key).await?.is_some_and(|r| {
-        identity_type::set_contains(&r.identity_type, identity_type::NODE)
-            && !identity_type::set_contains(&r.identity_type, identity_type::AGENT)
-    }))
-}
-
-/// v58.0.0 (CIRISPersist#1094 item 2) — is `id` a CC 2.3.2.1 tagged canonical
-/// hash (`canonical:sha256:` + 64 lowercase hex)? The exact tag only (P3).
-#[must_use]
-pub fn is_canonical_subject_id(id: &str) -> bool {
-    id.strip_prefix(CANONICAL_KEY_ID_PREFIX).is_some_and(|h| {
-        h.len() == 64
-            && h.bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-    })
-}
-
-/// v58.0.0 (CIRISPersist#1094 item 2; CC 2.4.1.1 rule 3, CC 4.5.3) — the
-/// attested-subject rule for a whole row. A `delegates_to` whose recipient is
-/// a CC 2.3.2.1 canonical hash, whose scope is exactly `{consent_revocation}`
-/// and whose attester is a node-role key ([`is_node_role_key`]) is the rule-3
-/// proxy grant `delegates_to(node → canonical subject)`: the subject is an
-/// external party with no `federation_keys` row by definition (CC 2.3.2 form
-/// 2), so it is admitted here. Every other row takes
-/// [`check_attested_subject_admission`] unchanged.
-///
-/// # Errors
-///
-/// [`check_attested_subject_admission`]'s.
-pub async fn check_attested_subject_admission_for_row(
-    directory: &dyn super::FederationDirectory,
-    row: &super::Attestation,
-) -> Result<(), Error> {
-    if row.attestation_type == attestation_type::DELEGATES_TO
-        && is_canonical_subject_id(&row.attested_key_id)
-    {
-        let scopes = delegation_scope_set(&row.attestation_envelope);
-        if scopes.len() == 1
-            && scopes.contains(DELEGATION_SCOPE_CONSENT_REVOCATION)
-            && is_node_role_key(directory, &row.attesting_key_id).await?
-        {
-            return Ok(());
-        }
-    }
-    check_attested_subject_admission(directory, &row.attested_key_id).await
-}
-
 /// v6.4.0 (CIRISPersist#146 Ask 2, CEG §3.2.3 / §8.1.11.2) — the
 /// broadened `withdraws` admission gate. Resolves WHICH of the four
 /// admission rules (if any) authorizes `issuer` to withdraw target
@@ -9161,28 +9057,19 @@ pub async fn resolve_withdraws_admission_rule_at(
     // `reconsideration:{grounds}` standing, this gate must be revisited in the
     // same change — otherwise it goes back to closing a door with nothing
     // behind it, which is what #587 actually objected to.
-    //
-    // v58.0.0 (CIRISPersist#1094 item 2, CC 4.5.3 "Erasure at the subject's
-    // request") — the erasure route through the carve-out, ONE named
-    // predicate: [`subject_revocation_paths`]. A `detection:*` row about a
-    // subject is erased by the subject's `withdraws` with the NODE as the CC
-    // 2.4.1.1 rule-3 proxy, so rule 3 reaches it when the issuer is a
-    // node-role key; rules 2 and 4 stay refused for it (the scored party's own
-    // key still cannot subtract its adverse detections), and `capacity:*` is
-    // unchanged.
-    let paths = subject_revocation_paths(directory, issuer, target).await?;
-    if paths == SubjectRevocationPaths::None {
+    let target_denies_subject_revocation = envelope_dimension(&target.attestation_envelope)
+        .is_some_and(|d| d.starts_with("capacity:") || d.starts_with("detection:"));
+    if target_denies_subject_revocation {
         return Err(Error::WithdrawsNotAdmitted {
             issuer: issuer.to_string(),
             target_attestation_id: target.attestation_id.clone(),
             beyond_delegation_depth_cap: false,
         });
     }
-    let all_paths = paths == SubjectRevocationPaths::All;
 
     // Rule 2 — subject self-revocation. §8.1.11.2: membership in the
     // subject SET, any single element suffices (no quorum).
-    if all_paths && target.subject_key_ids.iter().any(|s| s == issuer) {
+    if target.subject_key_ids.iter().any(|s| s == issuer) {
         return Ok(2);
     }
     // Rule 2 (canonical-binding widening, CEG §5.6.8.14 / §4.2.2.2) —
@@ -9194,7 +9081,7 @@ pub async fn resolve_withdraws_admission_rule_at(
     // subject it has since claimed. (Authorization that K==H is
     // consumer-policy; persist admits the binding and resolves authority
     // structurally — §5.6.8.14 normative-honesty clause.)
-    if all_paths && !target.subject_key_ids.is_empty() {
+    if !target.subject_key_ids.is_empty() {
         let subjects: std::collections::HashSet<&str> =
             target.subject_key_ids.iter().map(String::as_str).collect();
         let bound = canonical_binding_hashes_for(directory, issuer).await?;
@@ -9229,7 +9116,7 @@ pub async fn resolve_withdraws_admission_rule_at(
     // explicit admission path. We reach the producer key OR any
     // subject key; reaching a subject collapses into rule 3's target
     // set, so rule 4 is the producer-reaching arm.
-    if all_paths {
+    {
         let mut rule4_targets: std::collections::HashSet<String> = std::collections::HashSet::new();
         rule4_targets.insert(target.attesting_key_id.clone());
         for s in &target.subject_key_ids {

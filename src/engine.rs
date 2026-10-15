@@ -2379,142 +2379,37 @@ impl Engine {
     /// of an agent's trace corpus, keyed on `agent_id_hash` alone (all
     /// signing keys).
     ///
-    /// v58.0.0 (CIRISPersist#1094 item 2; CC 4.5.3 "Erasure at the subject's
-    /// request", CLM-erasure-subject-route) — **the erasure is the subject's
-    /// `withdraws`.** First, this node — acting as the CC 2.4.1.1 rule-3 proxy
-    /// for the subject, who proved identity out of band to the caller — signs
-    /// with its node key and puts, through the ordinary door:
-    ///
-    /// - the proxy grant `delegates_to(node → S, scope [consent_revocation])`,
-    ///   once per placement it needs, where `S` is the agent's CC 2.3.2.1
-    ///   canonical hash (`canonical:sha256:` of `ciris:agent:{agent_id_hash}`,
-    ///   [`agent_subject`](crate::federation::subject_erasure::agent_subject));
-    ///   written on the subject's out-of-band proof, which the CALLER owns
-    ///   (the DSAR-request authority and its verification are the caller's,
-    ///   as they always were): calling this door is the assertion that the
-    ///   proof was made;
-    /// - one `withdraws` per `detection:*` row of the agent's traces that
-    ///   names `S`, admitted by the one `withdraws` gate as rule 3.
-    ///
-    /// ([`prepare_subject_erasure`](crate::federation::subject_erasure::prepare_subject_erasure).)
-    /// Then, in one atomic transaction, the store hard-deletes the agent's
+    /// v58.0.0 (CIRISPersist#1094 item 2; CC 4.5.3, CLM-erasure-subject-route)
+    /// — in one atomic transaction the backend hard-deletes the agent's
     /// `trace_events` + `trace_llm_calls`, tombstones pre-v57 silo detections
-    /// in place (V080), hard-deletes each row a subject `withdraws` covers
-    /// under a tombstone citing it (served to peers as a purge bundle), and
-    /// records a subject-free `hard_case:trace_erasure:v1` row. A detection
-    /// row that names no subject (its trace was not held when it was put) is
-    /// reachable by no subject's `withdraws` and is left in place, counted in
-    /// the hard case.
+    /// in place (V080), and erases each row-backed `detection:*` row about the
+    /// agent under its PRODUCER's rule-1 `withdraws` (the controller
+    /// withdrawing its own row on the subject's request — no subject path
+    /// reaches an adverse row): the withdraws is the detector's local-tier
+    /// row, signature deferred to the crossing as the detection's own is, and
+    /// each erased row leaves a tombstone citing it that is served to peers. A
+    /// row whose producer key the host does not hold is refused with a reason
+    /// (`ErasureSummary::detection_rows_refused`, GDPR Art. 17(3)). The
+    /// `hard_case:trace_erasure` row names nobody. Returns an
+    /// [`ErasureSummary`](crate::store::types::ErasureSummary) with the
+    /// per-table counts.
     ///
     /// **Idempotent**: a second call returns all-zero counts (`Ok`); a
-    /// not-found is never an error. Typed refusal: no node identity to sign
-    /// with (`HardCaseAttesterUnavailable`, Python `NodeIdentityRequired`).
+    /// not-found is never an error. Persist owns the atomic substrate
+    /// erasure; the caller (CIRISServer's absorbed-lens slice) owns the
+    /// DSAR-request authority + signature verification.
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     pub async fn delete_traces_for_agent_id_hash(
         &self,
         agent_id_hash: &str,
     ) -> Result<crate::store::types::ErasureSummary, crate::store::Error> {
         use crate::store::Backend;
-        self.prepare_subject_erasure(agent_id_hash, None).await?;
         match &self.backend {
             #[cfg(feature = "postgres")]
             BackendDispatch::Postgres(b) => b.delete_traces_for_agent_id_hash(agent_id_hash).await,
             #[cfg(feature = "sqlite")]
             BackendDispatch::Sqlite(b) => b.delete_traces_for_agent_id_hash(agent_id_hash).await,
         }
-    }
-
-    /// v58.0.0 (CIRISPersist#1094 item 2) — the per-signing-key DSAR door
-    /// (`delete_traces_for_agent`) on the Engine, with the same erasure route
-    /// as [`Self::delete_traces_for_agent_id_hash`]: the node's proxy grant and
-    /// `withdraws` for the detections of `signature_key_id`'s traces first,
-    /// then the store's one transaction.
-    #[cfg(any(feature = "postgres", feature = "sqlite"))]
-    pub async fn delete_traces_for_agent(
-        &self,
-        agent_id_hash: &str,
-        signature_key_id: &str,
-        include_federation_key: bool,
-    ) -> Result<crate::store::types::DeleteSummary, crate::store::Error> {
-        use crate::store::Backend;
-        self.prepare_subject_erasure(agent_id_hash, Some(signature_key_id))
-            .await?;
-        match &self.backend {
-            #[cfg(feature = "postgres")]
-            BackendDispatch::Postgres(b) => {
-                b.delete_traces_for_agent(agent_id_hash, signature_key_id, include_federation_key)
-                    .await
-            }
-            #[cfg(feature = "sqlite")]
-            BackendDispatch::Sqlite(b) => {
-                b.delete_traces_for_agent(agent_id_hash, signature_key_id, include_federation_key)
-                    .await
-            }
-        }
-    }
-
-    /// v58.0.0 (CIRISPersist#1094 item 2) — the signing half of both DSAR
-    /// doors: the node's proxy grant and its `withdraws` of every detection
-    /// row the erasure reaches that names the subject. A no-op when there are
-    /// none. With no node identity the erasure is refused typed
-    /// (`HardCaseAttesterUnavailable`) before anything moves.
-    #[cfg(any(feature = "postgres", feature = "sqlite"))]
-    async fn prepare_subject_erasure(
-        &self,
-        agent_id_hash: &str,
-        signing_key_id: Option<&str>,
-    ) -> Result<(), crate::store::Error> {
-        use crate::federation::attestation_admit::AttestationStore as _;
-        let targets = match &self.backend {
-            #[cfg(feature = "postgres")]
-            BackendDispatch::Postgres(b) => {
-                b.detection_row_ids_for_agent(agent_id_hash, signing_key_id)
-                    .await
-            }
-            #[cfg(feature = "sqlite")]
-            BackendDispatch::Sqlite(b) => {
-                b.detection_row_ids_for_agent(agent_id_hash, signing_key_id)
-                    .await
-            }
-        }
-        .map_err(|e| crate::store::Error::Backend(format!("erasure targets: {e}")))?;
-        if targets.is_empty() {
-            return Ok(());
-        }
-        let directory = self.federation_directory();
-        let mut rows = Vec::with_capacity(targets.len());
-        for id in &targets {
-            if let Some(row) = directory
-                .get_attestation(id)
-                .await
-                .map_err(|e| crate::store::Error::Backend(format!("erasure target {id}: {e}")))?
-            {
-                rows.push(row);
-            }
-        }
-        let node = self.local_derived_key_id().await.map_err(|_| {
-            crate::store::Error::from_hard_case_attester(
-                crate::federation::Error::HardCaseAttesterUnavailable {
-                    reason: crate::federation::hard_case::refusal::NODE_KEY_UNSET,
-                    node_key_id: None,
-                },
-            )
-        })?;
-        crate::federation::subject_erasure::prepare_subject_erasure(
-            directory.as_ref(),
-            &node,
-            agent_id_hash,
-            &rows,
-            |input| self.emit_attestation_self(input),
-        )
-        .await
-        .map(|_| ())
-        .map_err(|e| match e {
-            e @ crate::federation::Error::HardCaseAttesterUnavailable { .. } => {
-                crate::store::Error::from_hard_case_attester(e)
-            }
-            other => crate::store::Error::Backend(format!("erasure withdraws: {other}")),
-        })
     }
 
     // ─── v8.0.0 — fountain content primitive (CIRISPersist#227) ─────
@@ -9372,8 +9267,8 @@ impl Engine {
         // CC 4.5.5 and reaches the bytes plane only; an immediate-removal
         // basis destroys the bytes on receipt here too (CC 4.5.3 step 2).
         // v58.0.0 (CIRISPersist#1094 item 2, CC 4.5.3) — an erasure's
-        // tombstone cites the subject's `withdraws`, re-derived against THIS
-        // node's own state; the row is destroyed on receipt.
+        // tombstone cites the row's PRODUCER's rule-1 `withdraws`, re-derived
+        // against THIS node's own state; the row is destroyed on receipt.
         if crate::federation::subject_erasure::is_erasure_notice_envelope(&bundle.notice.envelope) {
             return crate::federation::subject_erasure::apply_replicated_erasure(
                 directory.as_ref(),

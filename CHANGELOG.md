@@ -9,47 +9,45 @@ threat-model citations because this crate's audit story is the point.
 
 ## [58.0.0] - Unreleased
 
-### Changed — Art. 17 erasure is the subject's `withdraws`; the tombstone is the replicated fact (CIRISPersist#1094 item 2; CC 4.5.3 "Erasure at the subject's request", CLM-erasure-subject-route; CIRISConstitution#174)
+### Changed — Art. 17 erasure of an adverse row is its producer's `withdraws`; the tombstone is the replicated fact (CIRISPersist#1094 item 2; CC 4.5.3 "Erasure at the subject's request", CLM-erasure-subject-route; CIRISConstitution#174)
 
-- **A `detection:*` row names its subject.** The detection door writes the
-  scored agent's CC 2.3.2.1 canonical hash into `subject_key_ids`:
-  `canonical:sha256:` + sha256(`ciris:agent:{agent_id_hash}`), read from the
-  trace as this node holds it (`subject_erasure::agent_subject`). A detection
-  whose trace is not held names no subject; the door never guesses one. The
-  legacy rehome names the subject the same way.
-- **The DSAR doors erase by the subject's `withdraws`, the node as the CC
-  2.4.1.1 rule-3 proxy.** `Engine::delete_traces_for_agent_id_hash` (and the
-  new `Engine::delete_traces_for_agent`; both Python surfaces now route
-  through the Engine) first signs with the node key and puts, through the
-  ordinary door, the proxy grant `delegates_to(node → canonical subject,
-  scope [consent_revocation])` and one `withdraws` per detection row that
-  names the subject; the `withdraws` gate admits it as rule 3. The grant is
-  written on the subject's out-of-band proof, which the caller owns, as the
-  DSAR-request authority always was. The store's erasure door then
-  hard-deletes exactly the rows an admitted subject `withdraws` covers
-  (`subject_erasure::plan_store_erasure`, re-derived through
-  `check_withdraws_admission_as_admitted`), each under a tombstone whose
-  header cites the withdraws (`subject_erasure::ErasureNotice`: the withdraws
-  and target ids, nothing else; `legal_basis` column `withdraws`). A row no
-  subject `withdraws` covers is left in place and counted.
+- **Controller-only (steward ruling 2026-10-15, CIRISConstitution
+  `formal/withdraws_admission`).** A `detection:*` row is adverse: the CC
+  2.4.1.1 carve-out keeps every subject-authority path (rules 2–4) closed to
+  it, unchanged (`admission::resolve_withdraws_admission_rule_at`). The
+  subject's Article 17 request is executed by the row's PRODUCER under rule 1.
+  Both DSAR doors (`delete_traces_for_agent_id_hash`, `delete_traces_for_agent`)
+  plan, for each row-backed detection of the erased traces, the producer's
+  `withdraws`: a local-tier row attested by the detector key that signed the
+  detection, its signature deferred to the crossing as the detection's own
+  is, admitted as rule 1 by the one withdraws predicate
+  (`subject_erasure::plan_store_erasure`). A producer withdraws already held
+  is reused. In the door's one transaction the withdraws is stored, the row is
+  hard-deleted, and a tombstone is written whose header cites it
+  (`subject_erasure::ErasureNotice`: the withdraws and target ids, nothing
+  else; `legal_basis` column `withdraws`, settled at execution).
+- **Refused with a reason.** When the host holds no live record of a row's
+  producer key the row is not erased: `ErasureSummary` and `DeleteSummary`
+  gain `detection_rows_refused: Vec<ErasureRefusal { record_id, reason }>`
+  (reason `erasure_producer_key_not_held`; CC 4.4 `erasure_policy`'s
+  refused-with-reason, GDPR Art. 17(3)). Python: both DSAR dicts gain
+  `"detection_rows_refused": [{"record_id": str, "reason": str}]`.
 - **The tombstone replicates.** Erasure headers are served by
   `list_purge_bundles_since` on all three backends; `Engine::apply_replicated_purge`
   routes an erasure bundle to `subject_erasure::apply_replicated_erasure`,
-  which requires the cited `withdraws` held here (else
-  `subject_erasure_withdraws_unheld`, retryable), re-derives its admission on
-  this node's own state, and destroys the replica on receipt. v57's
-  "header never served" gap is closed.
-- **The anti-Goodhart carve-out keeps one door open.**
-  `admission::subject_revocation_paths` (one named predicate) gives a
-  `detection:*` target rule 3 alone, and only for a node-role issuer; rules 2
-  and 4 stay refused for it, `capacity:*` is unchanged. The canonical
-  recipient of the proxy grant is admitted only on that exact shape
-  (`check_attested_subject_admission_for_row`: node attester, scope exactly
-  `{consent_revocation}`).
+  which requires the producer's withdraws held there (else
+  `subject_erasure_withdraws_unheld`, retryable), re-derives it as rule 1 on
+  that node's own state, and destroys the replica on receipt. v57's "header
+  never served" gap is closed.
+- **A `detection:*` row names its subject**: the scored agent's CC 2.3.2.1
+  canonical hash, `canonical:sha256:` + sha256(`ciris:agent:{agent_id_hash}`),
+  read from the trace this node holds (`subject_erasure::agent_subject`), so
+  rows about a subject are discoverable. It is not an authority path. The
+  steward purge's interim human-subject gate resolves that subject as the key
+  that signed the scored trace.
 - **The hard case names nobody.** `hard_case:trace_erasure:v1` carries
   `TraceErasureCounts` alone (the door, counts of traces, LLM calls,
-  detections erased and retained, and the key-scoped door's federation
-  counts): no `agent_id_hash`, no signing key, no `target_key_id`.
+  detections erased and refused, and the one-key door's federation counts).
 - **V196** deletes the v57-shaped `hard_case:trace_erasure:v1` rows that named
   their subject (and their projection rows), pre-v57 silo rows of that kind
   that did, and every `art17_erasure` header with its tombstones (each
@@ -79,6 +77,8 @@ threat-model citations because this crate's audit story is the point.
   `art17_erasure_execution` and `hard_case::bind_erased_detection_rows`
   (clean break, no alias): there is no node-local purge basis for erasure.
   `hard_case::trace_erasure_event` takes `&TraceErasureCounts` now.
+  `ErasureSummary` and `DeleteSummary` are no longer `Copy` (they carry the
+  refusal list).
 
 ## [57.0.0] - 2026-10-15
 

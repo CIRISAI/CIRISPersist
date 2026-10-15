@@ -1,40 +1,49 @@
 //! v58.0.0 (CIRISPersist#1094 item 2; CC 4.5.3 "Erasure at the subject's
-//! request", CLM-erasure-subject-route; CIRISConstitution#174) — **erasure
-//! is the subject's `withdraws`, and the replicated fact is the tombstone.**
+//! request", CLM-erasure-subject-route; CIRISConstitution#174) — **an adverse
+//! row about a subject is erased by its PRODUCER, and the replicated fact is
+//! the tombstone.**
 //!
 //! v57.0.0 hard-deleted an erased trace's signed `detection:*` rows under a
 //! node-local purge basis (`art17_erasure`) whose notice was the erasure's own
 //! `hard_case:trace_erasure:v1` row: a basis outside CIRISConstitution#165, a
 //! header never served (so a peer holding a replica kept it), and a hard case
-//! naming the erased subject. The steward's ruling replaces all three:
+//! naming the erased subject. The steward's ruling (2026-10-15, the
+//! controller-only reading of CC 4.5.3; `formal/withdraws_admission`) replaces
+//! all three:
 //!
-//! - **Authority.** A row about a subject is erased by the subject's own
-//!   `withdraws` (CC 2.4.1.1 rule 2 for an enrolled subject; rule 3 through a
-//!   `delegates_to` proxy chain with `scope ⊇ {consent_revocation}` where the
-//!   subject proved identity out of band, the NODE acting as that proxy). The
-//!   DSAR door's subject is an agent, named on the wire by its CC 2.3.2.1
-//!   canonical hash ([`agent_subject`]): the detection door writes it into
-//!   every `detection:*` row's `subject_key_ids`, and the erasure writes,
-//!   signed by the node key, the proxy grant `delegates_to(node → subject,
-//!   scope [consent_revocation])` and one `withdraws` per row
-//!   ([`prepare_subject_erasure`]). Each is admitted by the ordinary put door,
-//!   whose `withdraws` gate is the ONE predicate
-//!   (`admission::resolve_withdraws_admission_rule_at`); the store's erasure
-//!   door re-derives it ([`authorised_erasures`]) and erases exactly what a
-//!   subject `withdraws` covers.
+//! - **Authority.** A `detection:*` row is ADVERSE (CC 2.4.1.1's carve-out:
+//!   `capacity:*`, `detection:*`, `licensure:*`, `revocation:*`): no
+//!   subject-authority path (rules 2–4) reaches it, and none is added here.
+//!   The subject's Article 17 request is executed by the row's PRODUCER under
+//!   rule 1 — the data controller withdrawing its own row. The DSAR door plans
+//!   that `withdraws` as the producer's row (attester = the detector key that
+//!   signed the detection, held by the host; its signature deferred to the
+//!   crossing exactly as the detection row's own is) through the ordinary
+//!   local door, and asks the ONE withdraws predicate
+//!   (`admission::check_withdraws_admission_at`) to admit it as rule 1
+//!   ([`plan_store_erasure`]). Where the host does not hold the producer's key
+//!   the row is refused with a reason ([`ErasureRefusal`], CC 4.4
+//!   `erasure_policy`'s refused-with-reason shape, GDPR Art. 17(3)) and
+//!   reported in the summary — never skipped silently.
 //! - **The replicated fact.** Each erased row leaves one tombstone by digest
 //!   on the attestation plane, under a header whose notice is
 //!   [`ErasureNotice`] — `{withdraws, target}` ids, nothing else — and whose
 //!   `legal_basis` column is [`WITHDRAWS_AUTHORITY`]. That header is the
-//!   node's informational ledger entry: it is never a notice of its own and
-//!   never a basis; the authority it cites is the withdraws row, which a peer
-//!   verifies against ITS OWN state ([`apply_replicated_erasure`]). The header
-//!   IS served (`list_purge_bundles_since`), so a peer holding a replica
-//!   receives the tombstone and erases it.
+//!   node's informational ledger entry: never a notice of its own, never a
+//!   basis; the authority it cites is the producer's withdraws, which a peer
+//!   re-derives against ITS OWN state ([`apply_replicated_erasure`]). The
+//!   header IS served (`list_purge_bundles_since`).
+//! - **The subject is named, not empowered.** A detection row names the
+//!   scored agent's canonical subject ([`agent_subject`]) so rows about the
+//!   subject are discoverable (DSAR export, the door's own lookup); it is not
+//!   an authority path.
 //! - **The hard case names nobody** (`hard_case::trace_erasure_event`).
 //!
 //! The trace corpus (`trace_events`, `trace_llm_calls`) is not on the
-//! attestation plane and is hard-deleted by the DSAR door as before.
+//! attestation plane and is hard-deleted by the DSAR door as before. The door
+//! touches no ORDINARY row about the subject; such a row is erased by the
+//! subject's own withdraws (rule 2, or rule 3 through a consent_revocation
+//! proxy chain), unchanged.
 
 use serde::{Deserialize, Serialize};
 use sha2::Digest as _;
@@ -66,13 +75,18 @@ pub mod token {
     /// authority is the withdraws row, and it has not replicated here.
     /// RETRYABLE. Body: `{notice_id, withdraws_attestation_id, retryable}`.
     pub const WITHDRAWS_UNHELD: &str = "subject_erasure_withdraws_unheld";
-    /// A replicated erasure whose cited row is not a `withdraws` naming the
-    /// target, or that this node's own `withdraws` gate does not admit under
-    /// a subject rule (2–4), or whose bundle names anything but the one
-    /// target on the attestation plane. Body: `{notice_id, reason}`.
+    /// A replicated erasure whose cited row is not the target's PRODUCER's
+    /// `withdraws` admitted by this node's own gate as rule 1, or whose bundle
+    /// names anything but the one target on the attestation plane. Body:
+    /// `{notice_id, reason}`.
     pub const UNAUTHORISED: &str = "subject_erasure_unauthorised";
+    /// A row's erasure is refused: the host does not hold a live record of
+    /// the row's producer key, so the producer cannot withdraw it (CC 4.5.3:
+    /// "refused with reason under Article 17(3)"). Carried per row in
+    /// [`super::ErasureRefusal::reason`], never raised as an error.
+    pub const PRODUCER_KEY_NOT_HELD: &str = "erasure_producer_key_not_held";
     /// Every token.
-    pub const ALL: &[&str] = &[WITHDRAWS_UNHELD, UNAUTHORISED];
+    pub const ALL: &[&str] = &[WITHDRAWS_UNHELD, UNAUTHORISED, PRODUCER_KEY_NOT_HELD];
 }
 
 /// The CC 2.3.2.1 tagged canonical hash naming the agent `agent_id_hash` as a
@@ -213,12 +227,12 @@ pub fn erasure_execution(
     Ok((execution, tombstone))
 }
 
-/// **The authority, re-derived**: the first `withdraws` naming `target` that
-/// THIS node's own `withdraws` gate admits under a subject rule (2–4) —
-/// `check_withdraws_admission_as_admitted`, the read-time form of the one
-/// predicate. A producer's own retraction (rule 1) is a retraction, not the
-/// subject's erasure, and a stored rule is never read (an out-of-order row
-/// carries `None`).
+/// **The authority, re-derived**: the first `withdraws` naming `target`
+/// that its PRODUCER (`target.attesting_key_id`) issued and THIS node's own
+/// `withdraws` gate admits as rule 1 — `check_withdraws_admission_as_admitted`,
+/// the read-time form of the one predicate. Rules 2–4 never reach an adverse
+/// row (the CC 2.4.1.1 carve-out); the producer's owner lift (also recorded as
+/// rule 1) is not the producer. A stored rule is never read.
 ///
 /// # Errors
 ///
@@ -236,6 +250,7 @@ where
     referencing.sort_by(|a, b| a.attestation_id.cmp(&b.attestation_id));
     for w in referencing {
         if w.attestation_type != attestation_type::WITHDRAWS
+            || w.attesting_key_id != target.attesting_key_id
             || super::precedence::references_attestation_id_from_envelope(&w.attestation_envelope)
                 != Some(target.attestation_id.as_str())
         {
@@ -243,7 +258,7 @@ where
         }
         let dir = directory.as_dyn_directory();
         match super::admission::check_withdraws_admission_as_admitted(dir, &w).await {
-            Ok(Some(rule)) if (2..=4).contains(&rule) => return Ok(Some(w)),
+            Ok(Some(1)) => return Ok(Some(w)),
             Ok(_) | Err(Error::WithdrawsNotAdmitted { .. }) => {}
             Err(e) => return Err(e),
         }
@@ -251,206 +266,180 @@ where
     Ok(None)
 }
 
-/// [`erasing_withdraws`] over `targets` (row ids; one not held is skipped):
-/// what the store's erasure door may erase. Run before the door's
-/// transaction; the door erases exactly these and leaves every other row.
-///
-/// # Errors
-///
-/// Directory reads.
-pub async fn authorised_erasures<F>(
-    directory: &F,
-    targets: &[String],
-) -> Result<Vec<ErasureCitation>, Error>
-where
-    F: FederationDirectory + ?Sized,
-{
-    let mut out = Vec::new();
-    for id in targets {
-        let Some(row) = directory.get_attestation(id).await? else {
-            continue;
-        };
-        if let Some(withdraws) = erasing_withdraws(directory, &row).await? {
-            out.push(ErasureCitation {
-                target: id.clone(),
-                withdraws,
-            });
-        }
-    }
-    Ok(out)
+/// One row the erasure refused, and why: CC 4.4 `erasure_policy`'s
+/// refused-with-reason shape (GDPR Art. 17(3)). `reason` is a [`token`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ErasureRefusal {
+    /// `attestation:{id}` — the row, by its plane identifier.
+    pub record_id: String,
+    /// Why it was not erased.
+    pub reason: String,
+}
+
+/// The store door's decision: what it erases, the producer `withdraws` rows it
+/// writes first, and what it refuses.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ErasurePlan {
+    /// Rows erased, each under its producer's `withdraws`.
+    pub(crate) citations: Vec<ErasureCitation>,
+    /// The planned producer `withdraws` rows the door stores in its
+    /// transaction (a citation whose withdraws was already held has none).
+    pub(crate) new_withdraws: Vec<PlannedErasureWithdraws>,
+    /// Rows refused with a reason.
+    pub(crate) refused: Vec<ErasureRefusal>,
 }
 
 /// v58.0.0 (CIRISPersist#1094 item 2) — **the store door's decision, read
-/// before its transaction**, once for all three backends: the `detection:*`
-/// rows a DSAR erasure of `agent_id_hash` (one signing key's traces when
-/// `signing_key_id` is given) reaches, split into the ones an admitted
-/// subject `withdraws` covers ([`authorised_erasures`] — the door erases
-/// exactly these) and the count it leaves.
+/// before its transaction**, once for all three backends. Every `detection:*`
+/// row a DSAR erasure of `agent_id_hash` reaches (one signing key's traces
+/// when `signing_key_id` is given) is either:
+///
+/// - **cited** under its producer's admitted rule-1 `withdraws` — one already
+///   held, or one planned now: the producer's local-tier row (attester = the
+///   detector key, signature deferred to the crossing as the detection's own
+///   is) through the ordinary local door (`plan_write_local_attestation`), and
+///   admitted as rule 1 by `check_withdraws_admission_at`, the one predicate;
+/// - or **refused** with a reason when the host holds no live record of the
+///   producer key ([`token::PRODUCER_KEY_NOT_HELD`]).
 ///
 /// # Errors
 ///
-/// Directory reads.
+/// A planned withdraws the gate does not admit as rule 1 (it would be the
+/// door forging an authority); directory reads.
 pub(crate) async fn plan_store_erasure<D>(
     dir: &D,
     agent_id_hash: &str,
     signing_key_id: Option<&str>,
-) -> Result<(Vec<ErasureCitation>, u64), Error>
+    at: chrono::DateTime<chrono::Utc>,
+) -> Result<ErasurePlan, Error>
 where
     D: super::attestation_admit::AttestationStore,
 {
-    let candidates = dir
+    let mut plan = ErasurePlan::default();
+    for id in dir
         .detection_row_ids_for_agent(agent_id_hash, signing_key_id)
-        .await?;
-    let citations = authorised_erasures(dir, &candidates).await?;
-    let retained = (candidates.len() - citations.len()) as u64;
-    if retained > 0 {
+        .await?
+    {
+        let Some(target) = dir.get_attestation(&id).await? else {
+            continue;
+        };
+        if let Some(withdraws) = erasing_withdraws(dir, &target).await? {
+            plan.citations.push(ErasureCitation {
+                target: id,
+                withdraws,
+            });
+            continue;
+        }
+        if !producer_key_held(dir, &target.attesting_key_id, at).await? {
+            plan.refused.push(ErasureRefusal {
+                record_id: format!("{}:{id}", PurgePlane::Attestation.as_str()),
+                reason: token::PRODUCER_KEY_NOT_HELD.to_owned(),
+            });
+            continue;
+        }
+        let planned = plan_producer_withdraws(dir, &target, at).await?;
+        plan.citations.push(ErasureCitation {
+            target: id,
+            withdraws: planned.row.clone(),
+        });
+        plan.new_withdraws.push(planned);
+    }
+    if !plan.refused.is_empty() {
         tracing::warn!(
-            retained,
-            "DSAR erasure: row-backed detections no subject withdraws covers are left in place \
-             (CC 4.5.3: erasure is the subject's withdraws)"
+            refused = plan.refused.len(),
+            "DSAR erasure: rows refused with reason (the host holds no live producer key; CC \
+             4.5.3, GDPR Art. 17(3))"
         );
     }
-    Ok((citations, retained))
+    Ok(plan)
 }
 
-/// What [`prepare_subject_erasure`] did.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct PreparedErasure {
-    /// The canonical subject ([`agent_subject`]).
-    pub subject: String,
-    /// The proxy grants this call emitted (one per placement it needed).
-    pub grants_emitted: Vec<String>,
-    /// The `withdraws` rows this call emitted.
-    pub withdraws_emitted: Vec<String>,
-    /// Rows already covered by an admitted subject `withdraws`.
-    pub already_withdrawn: Vec<String>,
-    /// Rows that do not name the subject: no subject `withdraws` can reach
-    /// them (CC 2.4.1.1 rules 2–3 read the target's `subject_key_ids`), so
-    /// the erasure leaves them.
-    pub unreachable: Vec<String>,
-}
-
-/// The proxy grant's scope: CC 2.4.1.1 rule 3's `consent_revocation`, and
-/// nothing else.
-fn proxy_grant_input(subject: &str, placement: &Placement) -> super::EmitAttestationInput {
-    let envelope = super::delegates_to_envelope(
-        subject,
-        &[super::admission::DELEGATION_SCOPE_CONSENT_REVOCATION.to_owned()],
-        false,
-    );
-    let mut input = super::EmitAttestationInput::with_envelope(
-        attestation_type::DELEGATES_TO,
-        super::envelope::EnvelopeCore::from_value(placement.place(envelope))
-            .expect("built envelope is a JSON object"),
-        &placement.cohort_scope,
-    );
-    input.attested_key_id = Some(subject.to_owned());
-    input
-}
-
-/// Where a target row lives, so its erasure's rows go where it went: the same
-/// `cohort_scope` and cohort target (the holding-claim retraction's rule).
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct Placement {
-    cohort_scope: String,
-    target: Option<(&'static str, String)>,
-}
-
-impl Placement {
-    fn of(row: &Attestation) -> Result<Self, Error> {
-        let target =
-            super::admission::envelope_cohort_target(&row.attestation_envelope)?.map(|t| {
-                let key = if row.cohort_scope == super::types::cohort_scope::FAMILY {
-                    "family_key_id"
-                } else {
-                    "community_id"
-                };
-                (key, t.to_owned())
-            });
-        Ok(Self {
-            cohort_scope: row.cohort_scope.clone(),
-            target,
-        })
-    }
-
-    fn place(&self, mut envelope: serde_json::Value) -> serde_json::Value {
-        if let (Some((key, t)), Some(obj)) = (&self.target, envelope.as_object_mut()) {
-            obj.insert((*key).to_owned(), serde_json::Value::String(t.clone()));
-        }
-        envelope
-    }
-}
-
-/// **The DSAR door's half that signs** (Engine-side; the store cannot sign):
-/// for each of `targets` that names the subject ([`agent_subject`] of
-/// `agent_id_hash`) and is not already covered by an admitted subject
-/// `withdraws`, emit — through `emit`, which signs with the node key and puts
-/// through the ordinary door — the node's `withdraws` of it. The withdraws
-/// gate admits it by CC 2.4.1.1 rule 3 when the node holds the proxy grant
-/// `delegates_to(node → subject, scope [consent_revocation])`; when it does
-/// not, the grant is emitted once per placement and the withdraws offered
-/// again. **The proxy grant is written on the subject's out-of-band proof**:
-/// the caller of the DSAR door owns the DSAR-request authority (the identity
-/// proof); persist records the proxy it implies, and a withdraws the gate
-/// still refuses after the grant is the error returned.
-///
-/// # Errors
-///
-/// The `withdraws` gate's refusal; `emit`'s errors; directory reads.
-pub async fn prepare_subject_erasure<F, E, Fut>(
-    directory: &F,
-    node_key_id: &str,
-    agent_id_hash: &str,
-    targets: &[Attestation],
-    emit: E,
-) -> Result<PreparedErasure, Error>
+/// Does the host hold a live record of `key` (present, not expired at `at`)?
+async fn producer_key_held<F>(
+    dir: &F,
+    key: &str,
+    at: chrono::DateTime<chrono::Utc>,
+) -> Result<bool, Error>
 where
     F: FederationDirectory + ?Sized,
-    E: Fn(super::EmitAttestationInput) -> Fut,
-    Fut: std::future::Future<Output = Result<String, Error>>,
 {
-    let subject = agent_subject(agent_id_hash)?;
-    let mut out = PreparedErasure {
-        subject: subject.clone(),
-        ..PreparedErasure::default()
+    Ok(dir
+        .lookup_public_key(key)
+        .await?
+        .is_some_and(|k| k.valid_until.is_none_or(|u| u > at)))
+}
+
+/// A planned producer `withdraws`: the local-tier row, exactly as stored, and
+/// the delegation depth its admission walked (V157).
+#[derive(Debug, Clone)]
+pub(crate) struct PlannedErasureWithdraws {
+    /// The row: attester = the producer, signature deferred, rule 1 stamped.
+    pub(crate) row: Attestation,
+    /// The depth recorded beside it.
+    pub(crate) depth: usize,
+}
+
+/// The producer's `withdraws` of `target`, planned the way the detection door
+/// plans the detection row itself (`attestation_admit::plan_detection_row`):
+/// a local-tier `self` row attested by the producer key the host holds, its
+/// signature deferred to the crossing; the reserved-id, mirror, size and
+/// instant gates; the attested-subject rule; then admitted as RULE 1 by the
+/// one withdraws predicate (`check_withdraws_admission_at`) — anything else is
+/// an error, never a row.
+async fn plan_producer_withdraws<D>(
+    dir: &D,
+    target: &Attestation,
+    at: chrono::DateTime<chrono::Utc>,
+) -> Result<PlannedErasureWithdraws, Error>
+where
+    D: super::attestation_admit::AttestationStore,
+{
+    let envelope =
+        super::withdraws_attestation_envelope(&target.attestation_id, &target.attestation_type);
+    super::admission::check_envelope_size_admission(&envelope)?;
+    let attestation_id = uuid::Uuid::new_v4().to_string();
+    let input = super::types::LocalAttestationInput {
+        attestation_id: Some(attestation_id.clone()),
+        attesting_key_id: target.attesting_key_id.clone(),
+        attested_key_id: None,
+        attestation_type: attestation_type::WITHDRAWS.to_owned(),
+        weight: None,
+        expires_at: None,
+        attestation_envelope: super::envelope::EnvelopeCore::from_value(envelope)?,
+        subject_key_ids: Vec::new(),
+        cohort_scope: super::types::cohort_scope::SELF.to_owned(),
+        scrub_signature_classical: None,
+        scrub_signature_pqc: None,
     };
-    let mut granted: std::collections::BTreeSet<Placement> = std::collections::BTreeSet::new();
-    for target in targets {
-        if !target.subject_key_ids.iter().any(|s| s == &subject) {
-            out.unreachable.push(target.attestation_id.clone());
-            continue;
-        }
-        if erasing_withdraws(directory, target).await?.is_some() {
-            out.already_withdrawn.push(target.attestation_id.clone());
-            continue;
-        }
-        let placement = Placement::of(target)?;
-        let withdraws_input = || {
-            let envelope = super::withdraws_attestation_envelope(
-                &target.attestation_id,
-                &target.attestation_type,
-            );
-            let mut input = super::EmitAttestationInput::with_envelope(
-                attestation_type::WITHDRAWS,
-                super::envelope::EnvelopeCore::from_value(placement.place(envelope))
-                    .expect("built envelope is a JSON object"),
-                &placement.cohort_scope,
-            );
-            input.attested_key_id = Some(node_key_id.to_owned());
-            input
-        };
-        match emit(withdraws_input()).await {
-            Ok(id) => out.withdraws_emitted.push(id),
-            Err(Error::WithdrawsNotAdmitted { .. }) if !granted.contains(&placement) => {
-                let grant = emit(proxy_grant_input(&subject, &placement)).await?;
-                out.grants_emitted.push(grant);
-                granted.insert(placement.clone());
-                out.withdraws_emitted.push(emit(withdraws_input()).await?);
-            }
-            Err(e) => return Err(e),
+    super::admission::check_local_tier_eligibility(
+        &input.attestation_type,
+        None,
+        &input.attesting_key_id,
+        &input.subject_key_ids,
+        &input.cohort_scope,
+    )?;
+    super::admission::check_attested_subject_admission(dir, &target.attesting_key_id).await?;
+    let mut row = input.into_local_row(attestation_id, at);
+    super::genesis::check_genesis_attestation_reserved(&row)?;
+    super::envelope::RowMirror::stamp_local_row(&mut row, false)?;
+    super::admission::check_envelope_size_admission(&row.attestation_envelope)?;
+    super::admission::check_instant_binding(&row, at, super::admission::DEFAULT_MAX_TOUCH_SKEW)?;
+    let depth = dir.withdraws_delegation_depth();
+    match super::admission::check_withdraws_admission_at(dir.as_dyn_directory(), &row, depth)
+        .await?
+    {
+        Some(1) => {}
+        other => {
+            return Err(Error::Backend(format!(
+                "the producer's withdraws of {} was admitted as {other:?}, not rule 1",
+                target.attestation_id
+            )))
         }
     }
-    Ok(out)
+    // Like every local row, the stored rule stays unset: authority is
+    // re-derived on read (`erasing_withdraws`), never read from the column.
+    row.persist_row_hash = super::types::compute_persist_row_hash(&row)?;
+    Ok(PlannedErasureWithdraws { row, depth })
 }
 
 /// **Apply a peer's erasure tombstone** (a
@@ -458,9 +447,9 @@ where
 /// [`ErasureNotice`]). The receiver trusts nothing the sender says: the
 /// bundle must name exactly the notice's target on the attestation plane;
 /// the cited `withdraws` must be held HERE (it replicates as any row does;
-/// until it has, [`token::WITHDRAWS_UNHELD`], retryable), name the target, and
-/// be admitted by THIS node's own `withdraws` gate under a subject rule —
-/// which needs the target held here too. A node holding no replica of the
+/// until it has, [`token::WITHDRAWS_UNHELD`], retryable), be the target's
+/// PRODUCER's, name the target, and be admitted by THIS node's own `withdraws`
+/// gate as rule 1 — which needs the target held here too. A node holding no replica of the
 /// target has nothing to erase and records nothing. Then the header
 /// ([`origin::REPLICATED`]) and its tombstone are recorded and the row is
 /// destroyed on receipt (`purge_finalize`, which settles an erasure at its
@@ -529,8 +518,8 @@ where
         return Err(unauth(
             &notice_id,
             format!(
-                "withdraws {} is not a subject withdraws of {} that this node admits (CC 2.4.1.1 \
-                 rules 2-4, asked of this node's own state)",
+                "withdraws {} is not the producer's rule-1 withdraws of {} that this node \
+                 admits (CC 4.5.3; asked of this node's own state)",
                 withdraws.attestation_id, target.attestation_id
             ),
         ));
