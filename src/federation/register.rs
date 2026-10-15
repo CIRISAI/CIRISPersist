@@ -2448,9 +2448,12 @@ pub mod test_support {
                 record: self_scrubbed_record_signed_at(&early, now - chrono::Duration::minutes(1)),
             })
             .await?;
-        let first_pass = directory
-            .list_signed_key_records_since(None, u32::MAX)
-            .await?;
+        let first_pass = crate::federation::key_plane::test_support::served_key_records(
+            directory.as_dyn_directory(),
+            None,
+            u32::MAX,
+        )
+        .await?;
         let cursor = first_pass
             .iter()
             .find(|r| r.record.key_id == early)
@@ -2474,9 +2477,12 @@ pub mod test_support {
             .await?;
 
         // (3) The consumer resumes from exactly where it stopped.
-        let resumed = directory
-            .list_signed_key_records_since(Some(cursor.clone()), u32::MAX)
-            .await?;
+        let resumed = crate::federation::key_plane::test_support::served_key_records(
+            directory.as_dyn_directory(),
+            Some(cursor.clone()),
+            u32::MAX,
+        )
+        .await?;
         let served = resumed
             .iter()
             .find(|r| r.record.key_id == late)
@@ -2563,9 +2569,12 @@ pub mod test_support {
         );
         // The plant is verified, not assumed: a witness whose setup silently
         // did nothing passes for the wrong reason.
-        let all = directory
-            .list_signed_key_records_since(None, u32::MAX)
-            .await?;
+        let all = crate::federation::key_plane::test_support::served_key_records(
+            directory.as_dyn_directory(),
+            None,
+            u32::MAX,
+        )
+        .await?;
         let tied: Vec<_> = all
             .iter()
             .filter(|r| expected.contains(&r.record.key_id))
@@ -2596,9 +2605,12 @@ pub mod test_support {
                 all.len()
             );
             pages += 1;
-            let rows = directory
-                .list_signed_key_records_since(cursor.clone(), page)
-                .await?;
+            let rows = crate::federation::key_plane::test_support::served_key_records(
+                directory.as_dyn_directory(),
+                cursor.clone(),
+                page,
+            )
+            .await?;
             let Some(last) = rows.last() else { break };
             for r in &rows {
                 if expected.contains(&r.record.key_id) {
@@ -2652,9 +2664,12 @@ pub mod test_support {
         future: chrono::DateTime<chrono::Utc>,
     ) -> Result<(), Error> {
         // The plant is verified, not assumed.
-        let before = directory
-            .list_signed_key_records_since(None, u32::MAX)
-            .await?;
+        let before = crate::federation::key_plane::test_support::served_key_records(
+            directory.as_dyn_directory(),
+            None,
+            u32::MAX,
+        )
+        .await?;
         assert!(
             !before.is_empty(),
             "({tag}) #682: the backward-step plant needs at least one existing row"
@@ -2681,9 +2696,12 @@ pub mod test_support {
             })
             .await?;
 
-        let resumed = directory
-            .list_signed_key_records_since(Some(planted_max.clone()), u32::MAX)
-            .await?;
+        let resumed = crate::federation::key_plane::test_support::served_key_records(
+            directory.as_dyn_directory(),
+            Some(planted_max.clone()),
+            u32::MAX,
+        )
+        .await?;
         let served = resumed
             .iter()
             .find(|r| r.record.key_id == admitted_after_step)
@@ -2733,9 +2751,12 @@ pub mod test_support {
         // The plant is verified, not assumed: the cursor must actually be
         // serving this row AT its fallback instant, or the allocator is not
         // being asked the question.
-        let before = directory
-            .list_signed_key_records_since(None, u32::MAX)
-            .await?;
+        let before = crate::federation::key_plane::test_support::served_key_records(
+            directory.as_dyn_directory(),
+            None,
+            u32::MAX,
+        )
+        .await?;
         let planted = before
             .iter()
             .find(|r| r.record.key_id == unstamped_key_id)
@@ -2766,12 +2787,12 @@ pub mod test_support {
             })
             .await?;
 
-        let resumed = directory
-            .list_signed_key_records_since(
-                Some((fallback_at, unstamped_key_id.to_owned())),
-                u32::MAX,
-            )
-            .await?;
+        let resumed = crate::federation::key_plane::test_support::served_key_records(
+            directory.as_dyn_directory(),
+            Some((fallback_at, unstamped_key_id.to_owned())),
+            u32::MAX,
+        )
+        .await?;
         let served = resumed
             .iter()
             .find(|r| r.record.key_id == after_fallback)

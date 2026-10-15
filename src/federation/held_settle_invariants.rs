@@ -206,14 +206,10 @@ pub(crate) mod bodies {
             })
             .map(|(k, h, _)| (k.to_owned(), h))
             .collect();
-        for kind in [
-            "Key",
-            "Attestation",
-            "Revocation",
-            "LocationProof",
-            "Family",
-            "Community",
-        ] {
+        // v58.0.0 (CIRISPersist#991) — the key and the revocation are
+        // `key:record:v1` / `key:revocation:v1` rows: Attestation-kind entries
+        // under their row ids, settled by the key-plane door (I975+).
+        for kind in ["Attestation", "LocationProof", "Family", "Community"] {
             assert!(
                 mine.iter().any(|(k, _)| k == kind),
                 "[{tag}] I230: no {kind} ref seeded; got {mine:?}"
@@ -442,16 +438,9 @@ mod from_disk {
 
     /// Each replicated kind → the door every backend implements for it.
     const DOORS: &[(EnvelopeKind, &str)] = &[
-        (EnvelopeKind::Key, "apply_replicated_key_record"),
         (EnvelopeKind::Attestation, "put_attestation_with_origin"),
-        (EnvelopeKind::Revocation, "put_revocation"),
-        (EnvelopeKind::IdentityOccurrence, "put_identity_occurrence"),
         (EnvelopeKind::Family, "put_family"),
         (EnvelopeKind::Community, "put_community"),
-        (
-            EnvelopeKind::IdentityOccurrenceRevocation,
-            "put_identity_occurrence_revocation",
-        ),
         (
             EnvelopeKind::FamilyMembershipRevocation,
             "put_family_membership_revocation",

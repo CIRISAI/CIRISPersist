@@ -365,3 +365,5 @@ postgres	194	hard_case_events_projection	15087391581760788339
 sqlite	194	hard_case_events_projection	3656552663033120193
 postgres	195	detection_events_projection	611781505851977676
 sqlite	195	detection_events_projection	5006282587466774693
+sqlite	198	key_plane_projections	8618884001430423445
+postgres	198	key_plane_projections	11252062762509407064

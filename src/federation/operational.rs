@@ -6127,8 +6127,20 @@ pub mod test_support {
         directory
             .put_public_key(crate::federation::SignedKeyRecord { record: rec })
             .await?;
-        assert_advertised_key_ref_is_servable(directory, &pending, tag, "put_public_key (pending)")
-            .await?;
+        // v58.0.0 (CIRISPersist#991) — a hybrid-pending record cannot prove
+        // possession: it is held without a `key:record:v1` row, so nothing is
+        // advertised for it until its ML-DSA-65 half is attached.
+        assert!(
+            !directory
+                .list_attestations_since(None, 10_000)
+                .await?
+                .iter()
+                .any(
+                    |s| crate::federation::key_plane::key_record_of_row(&s.attestation)
+                        .is_some_and(|r| r.key_id == pending)
+                ),
+            "({tag}) a hybrid-pending record is not on the plane"
+        );
         directory
             .attach_key_pqc_signature(&pending, &pqc_pubkey, &pqc_sig)
             .await?;
@@ -6186,9 +6198,12 @@ pub mod test_support {
                 .map(crate::federation::ServedKeyRecord::resume_pair)
                 .expect("the stream cannot be empty after a put")
         };
-        let all = directory
-            .list_signed_key_records_since(None, u32::MAX)
-            .await?;
+        let all = crate::federation::key_plane::test_support::served_key_records(
+            directory.as_dyn_directory(),
+            None,
+            u32::MAX,
+        )
+        .await?;
         let first_admitted = all
             .iter()
             .find(|r| r.record.key_id == node)
@@ -6210,9 +6225,12 @@ pub mod test_support {
             .await
         {
             Ok(_) => {
-                let resumed = directory
-                    .list_signed_key_records_since(Some(cursor.clone()), u32::MAX)
-                    .await?;
+                let resumed = crate::federation::key_plane::test_support::served_key_records(
+                    directory.as_dyn_directory(),
+                    Some(cursor.clone()),
+                    u32::MAX,
+                )
+                .await?;
                 let served = resumed.iter().find(|r| r.record.key_id == node).expect(
                     "#707 adopt_scrub_upgrade: the re-rooted row must be re-served past the \
                          consumer's cursor — its whole purpose is to re-root the key, and a \
@@ -6223,9 +6241,12 @@ pub mod test_support {
                     "({tag}) and the re-served bytes are the NEW (anchored) bytes"
                 );
                 cursor = cursor_at_end(
-                    &directory
-                        .list_signed_key_records_since(None, u32::MAX)
-                        .await?,
+                    &crate::federation::key_plane::test_support::served_key_records(
+                        directory.as_dyn_directory(),
+                        None,
+                        u32::MAX,
+                    )
+                    .await?,
                 );
             }
             Err(crate::federation::Error::InvalidArgument(detail))
@@ -6235,9 +6256,12 @@ pub mod test_support {
 
         // ── door: set_consent_role ─────────────────────────────────────────
         directory.set_consent_role(&node, Some("peer")).await?;
-        let resumed = directory
-            .list_signed_key_records_since(Some(cursor.clone()), u32::MAX)
-            .await?;
+        let resumed = crate::federation::key_plane::test_support::served_key_records(
+            directory.as_dyn_directory(),
+            Some(cursor.clone()),
+            u32::MAX,
+        )
+        .await?;
         let served = resumed.iter().find(|r| r.record.key_id == node).expect(
             "#707 set_consent_role: `consent_role` IS in the served bytes, so the row must \
                  be re-served past the consumer's cursor",
@@ -6262,9 +6286,12 @@ pub mod test_support {
             "({tag}) the serve position is above first admission, not a rewrite of it"
         );
         cursor = cursor_at_end(
-            &directory
-                .list_signed_key_records_since(None, u32::MAX)
-                .await?,
+            &crate::federation::key_plane::test_support::served_key_records(
+                directory.as_dyn_directory(),
+                None,
+                u32::MAX,
+            )
+            .await?,
         );
 
         // ── NEGATIVE leg: grant_trust / revoke_trust must NOT move it ──────
@@ -6295,9 +6322,12 @@ pub mod test_support {
                 ),
             )
             .await?;
-        let after_trust = directory
-            .list_signed_key_records_since(Some(cursor.clone()), u32::MAX)
-            .await?;
+        let after_trust = crate::federation::key_plane::test_support::served_key_records(
+            directory.as_dyn_directory(),
+            Some(cursor.clone()),
+            u32::MAX,
+        )
+        .await?;
         assert!(
             !after_trust.iter().any(|r| r.record.key_id == node),
             "({tag}) #707 negative leg: grant_trust/revoke_trust write only `trust_*` columns — \
@@ -6316,16 +6346,22 @@ pub mod test_support {
             .put_public_key(crate::federation::SignedKeyRecord { record: rec })
             .await?;
         let cursor = cursor_at_end(
-            &directory
-                .list_signed_key_records_since(None, u32::MAX)
-                .await?,
+            &crate::federation::key_plane::test_support::served_key_records(
+                directory.as_dyn_directory(),
+                None,
+                u32::MAX,
+            )
+            .await?,
         );
         directory
             .attach_key_pqc_signature(&pending, &pqc_pubkey, &pqc_sig)
             .await?;
-        let resumed = directory
-            .list_signed_key_records_since(Some(cursor.clone()), u32::MAX)
-            .await?;
+        let resumed = crate::federation::key_plane::test_support::served_key_records(
+            directory.as_dyn_directory(),
+            Some(cursor.clone()),
+            u32::MAX,
+        )
+        .await?;
         let served = resumed.iter().find(|r| r.record.key_id == pending).expect(
             "#707 attach_key_pqc_signature: the hybrid-completion rewrites FOUR served \
                  columns and must re-serve the row past the consumer's cursor",
@@ -6455,29 +6491,34 @@ pub mod test_support {
         tag: &str,
         after: &str,
     ) -> Result<(), crate::federation::Error> {
-        let served_row = directory
-            .list_signed_key_records_since(None, 10_000)
+        // v58.0.0 (CIRISPersist#991) — the key's record rides as its
+        // `key:record:v1` row: the advertised ref is that row's (the
+        // Attestation kind).
+        let row = directory
+            .list_attestations_since(None, 10_000)
             .await?
             .into_iter()
-            .find(|r| r.record.key_id == key_id)
+            .map(|s| s.attestation)
+            .find(|a| {
+                crate::federation::key_plane::key_record_of_row(a)
+                    .is_some_and(|r| r.key_id == key_id)
+            })
             .unwrap_or_else(|| panic!("({tag}) {key_id} is advertised after {after}"));
-        let advertised = crate::federation::SignedKeyRecord {
-            record: served_row.record,
-        };
-        let hash = crate::federation::wire_index::content_hash_of(&advertised)?;
+        let hash = crate::federation::wire_index::content_hash_of(&row)?;
         let served = directory
-            .lookup_signed_record_by_content_hash("Key", &hash)
+            .lookup_signed_record_by_content_hash("Attestation", &hash)
             .await?;
         let served = served.unwrap_or_else(|| {
             panic!(
-                "({tag}) after {after}: {key_id} advertises (Key, {hash}) and CANNOT SERVE IT. \
-                 The row moved and `signed_wire_index` did not follow, so the peer asks for \
-                 exactly the ref we published and gets None — silently (CIRISPersist#547)."
+                "({tag}) after {after}: {key_id} advertises (Attestation, {hash}) and CANNOT \
+                 SERVE IT. The row moved and `signed_wire_index` did not follow, so the peer \
+                 asks for exactly the ref we published and gets None — silently \
+                 (CIRISPersist#547)."
             )
         });
         assert_eq!(
             served,
-            serde_json::to_vec(&advertised).expect("advertised record re-serializes"),
+            serde_json::to_vec(&row).expect("advertised row re-serializes"),
             "({tag}) after {after}: the served bytes must be the advertised bytes"
         );
         Ok(())

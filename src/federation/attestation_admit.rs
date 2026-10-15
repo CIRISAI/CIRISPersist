@@ -374,6 +374,8 @@ where
     // owner's retraction of one): read before the row moves, acted on only
     // when the store inserted it.
     let consent_change = super::consent_list_change_of(dir, &attestation.attestation).await;
+    let occurrence_withdrawal =
+        super::key_plane::occurrence_withdrawal_of(dir, &attestation.attestation).await?;
     // v56.0.0 (CIRISPersist#934, CC review condition 1) — the ONE clock read
     // of this door, and the row's signed instant: the plan's two inputs. The
     // plan reads no clock of its own and the executor reads none either. A
@@ -400,6 +402,15 @@ where
     .await;
     if let (Ok(AttestationOutcome::Inserted), Some((owner, node))) = (&outcome, consent_change) {
         super::rewrap_after_admission(dir, &owner, &node).await;
+    }
+    // v58.0.0 (CIRISPersist#991, CC 3.3.6) — an admitted `withdraws` against an
+    // `identity:occurrence:v1` row feeds the occurrence-revocation projection
+    // (`federation_identity_occurrence_revocations`, this node's local read
+    // model: eviction, transport-route retirement).
+    if let (Ok(AttestationOutcome::Inserted), Some(revocation)) = (&outcome, occurrence_withdrawal)
+    {
+        dir.put_identity_occurrence_revocation_local(revocation)
+            .await?;
     }
     outcome
 }

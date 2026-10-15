@@ -134,7 +134,7 @@ impl FaultInjectingDirectory {
     }
 }
 
-// 115 delegations, generated. Every one: fault first, then delegate.
+// 108 delegations, generated. Every one: fault first, then delegate.
 #[async_trait::async_trait]
 impl FederationDirectory for FaultInjectingDirectory {
     async fn apply_replicated_accord_evidence(
@@ -172,18 +172,6 @@ impl FederationDirectory for FaultInjectingDirectory {
         }
         self.inner
             .attach_key_pqc_signature(key_id, pubkey_ml_dsa_65_base64, scrub_signature_pqc)
-            .await
-    }
-    async fn attach_revocation_pqc_signature(
-        &self,
-        revocation_id: &str,
-        scrub_signature_pqc: &str,
-    ) -> Result<(), Error> {
-        if let Some(e) = self.faulted("attach_revocation_pqc_signature") {
-            return Err(e);
-        }
-        self.inner
-            .attach_revocation_pqc_signature(revocation_id, scrub_signature_pqc)
             .await
     }
     async fn attestation_insert_local(
@@ -581,15 +569,6 @@ impl FederationDirectory for FaultInjectingDirectory {
         }
         self.inner.list_hybrid_pending_keys(limit).await
     }
-    async fn list_hybrid_pending_revocations(
-        &self,
-        limit: i64,
-    ) -> Result<Vec<HybridPendingRow>, Error> {
-        if let Some(e) = self.faulted("list_hybrid_pending_revocations") {
-            return Err(e);
-        }
-        self.inner.list_hybrid_pending_revocations(limit).await
-    }
     async fn list_identity_occurrence_history_by_occurrence(
         &self,
         occurrence_key_id: &str,
@@ -828,40 +807,6 @@ impl FederationDirectory for FaultInjectingDirectory {
             .list_signed_family_membership_widenings_since(since, limit)
             .await
     }
-    async fn list_signed_identity_occurrence_revocations_since(
-        &self,
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        limit: u32,
-    ) -> Result<Vec<ServedIdentityOccurrenceRevocation>, Error> {
-        if let Some(e) = self.faulted("list_signed_identity_occurrence_revocations_since") {
-            return Err(e);
-        }
-        self.inner
-            .list_signed_identity_occurrence_revocations_since(since, limit)
-            .await
-    }
-    async fn list_signed_identity_occurrences_since(
-        &self,
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        limit: u32,
-    ) -> Result<Vec<ServedIdentityOccurrence>, Error> {
-        if let Some(e) = self.faulted("list_signed_identity_occurrences_since") {
-            return Err(e);
-        }
-        self.inner
-            .list_signed_identity_occurrences_since(since, limit)
-            .await
-    }
-    async fn list_signed_key_records_since(
-        &self,
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        limit: u32,
-    ) -> Result<Vec<ServedKeyRecord>, Error> {
-        if let Some(e) = self.faulted("list_signed_key_records_since") {
-            return Err(e);
-        }
-        self.inner.list_signed_key_records_since(since, limit).await
-    }
     async fn list_signed_location_proofs_since(
         &self,
         since: Option<(chrono::DateTime<chrono::Utc>, String)>,
@@ -885,16 +830,6 @@ impl FederationDirectory for FaultInjectingDirectory {
         self.inner
             .list_signed_partner_records_since(since, limit)
             .await
-    }
-    async fn list_signed_revocations_since(
-        &self,
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        limit: u32,
-    ) -> Result<Vec<ServedRevocation>, Error> {
-        if let Some(e) = self.faulted("list_signed_revocations_since") {
-            return Err(e);
-        }
-        self.inner.list_signed_revocations_since(since, limit).await
     }
     async fn list_signed_transport_destinations_since(
         &self,
@@ -1110,17 +1045,6 @@ impl FederationDirectory for FaultInjectingDirectory {
             return Err(e);
         }
         self.inner.put_identity_occurrence(occurrence).await
-    }
-    async fn put_identity_occurrence_revocation(
-        &self,
-        revocation: SignedIdentityOccurrenceRevocation,
-    ) -> Result<(), Error> {
-        if let Some(e) = self.faulted("put_identity_occurrence_revocation") {
-            return Err(e);
-        }
-        self.inner
-            .put_identity_occurrence_revocation(revocation)
-            .await
     }
     async fn put_location_proof(&self, proof: SignedLocationProof) -> Result<(), Error> {
         if let Some(e) = self.faulted("put_location_proof") {

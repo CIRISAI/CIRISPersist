@@ -1905,55 +1905,57 @@ pub mod test_support {
         }
     }
 
-    /// v50.0.0 (CIRISPersist#925 review item 5) — a SIGNED revocation of the
-    /// binding `{identity → occurrence}`, signed by `signer` (the identity or an
-    /// active occurrence of it), taking effect at `effective_at`.
-    pub async fn signed_occurrence_revocation(
+    /// v58.0.0 (CIRISPersist#991, CC 3.3.6) — an occurrence's revocation: a
+    /// `withdraws` against the pair's held `identity:occurrence:v1` row,
+    /// hybrid-signed by `signer` (the identity or a live occurrence of it),
+    /// asserted (revoked and effective) at `effective_at`. Panics when the
+    /// pair holds no signed occurrence row.
+    pub async fn occurrence_withdrawal<D: crate::federation::FederationDirectory + ?Sized>(
+        dir: &D,
         signer: &str,
         identity: &str,
         occurrence: &str,
         effective_at: chrono::DateTime<chrono::Utc>,
-    ) -> crate::federation::SignedIdentityOccurrenceRevocation {
-        let ms = |t: chrono::DateTime<chrono::Utc>| {
-            chrono::DateTime::<chrono::Utc>::from_timestamp_millis(t.timestamp_millis())
-                .expect("ms instant")
-        };
-        let effective_at = ms(effective_at);
-        let revoked_at = effective_at;
-        let envelope = serde_json::json!({
-            "attesting_key_id": signer,
-            "identity_key_id": identity,
-            "occurrence_key_id": occurrence,
-            "revoked_at": revoked_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-            "effective_at": effective_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-        });
-        let id = Box::new(
-            ciris_verify_core::self_at_login::HybridSigningIdentity::new(
-                signer,
-                ed_signer(signer),
-                *mldsa_signer(signer),
-            ),
-        );
-        let (signed_envelope, signature) =
-            ciris_verify_core::transport_binding::produce_signed_identity_occurrence(
-                id.as_ref(),
-                envelope,
-            )
+    ) -> crate::federation::SignedAttestation {
+        let held = dir
+            .list_signed_identity_occurrences_for(identity)
             .await
-            .expect("sign revocation envelope");
-        crate::federation::SignedIdentityOccurrenceRevocation {
-            identity_occurrence_revocation: crate::federation::IdentityOccurrenceRevocation {
-                identity_key_id: identity.to_owned(),
-                occurrence_key_id: occurrence.to_owned(),
-                revoked_at,
-                effective_at,
-                reason: None,
-                witness_set: vec![signer.to_owned()],
-                persist_row_hash: String::new(),
-            },
+            .expect("list occurrences")
+            .into_iter()
+            .find(|s| s.identity_occurrence.occurrence_key_id == occurrence)
+            .expect("the pair holds a signed occurrence");
+        let target = crate::federation::key_plane::occurrence_row(&held)
+            .expect("the held occurrence has a row")
+            .attestation_id;
+        let row = Attestation {
+            attestation_id: uuid::Uuid::new_v4().to_string(),
             attesting_key_id: signer.to_owned(),
-            signed_envelope,
-            signature,
+            attested_key_id: identity.to_owned(),
+            attestation_type: crate::federation::types::attestation_type::WITHDRAWS.to_owned(),
+            weight: None,
+            asserted_at: effective_at,
+            expires_at: None,
+            attestation_envelope: serde_json::json!({
+                "dimension": crate::federation::key_plane::IDENTITY_OCCURRENCE_DIMENSION,
+                "references_attestation_id": target,
+                "withdrawal_reason": "occurrence revoked",
+            }),
+            original_content_hash: String::new(),
+            scrub_signature_classical: String::new(),
+            scrub_signature_pqc: None,
+            scrub_key_id: signer.to_owned(),
+            scrub_timestamp: effective_at,
+            pqc_completed_at: Some(effective_at),
+            persist_row_hash: String::new(),
+            subject_key_ids: Vec::new(),
+            withdraws_admission_rule: None,
+            cohort_scope: crate::federation::types::cohort_scope::FEDERATION.to_owned(),
+            tier: crate::federation::types::attestation_tier::FEDERATION.to_owned(),
+            promoted_at: None,
+            additional_scrubs: Vec::new(),
+        };
+        crate::federation::SignedAttestation {
+            attestation: seal_row(signer, row),
         }
     }
 

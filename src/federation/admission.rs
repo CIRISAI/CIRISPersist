@@ -5760,152 +5760,6 @@ async fn check_signer_acts_for(
     Ok(())
 }
 
-/// v16.0.0 (CIRISPersist#421) — the SIGNED-revocation admission gate: the
-/// revocation-plane mirror of [`verify_signed_identity_occurrence`], closing the
-/// **permanent-DoS forgery** the #418 cut deferred. An unsigned revocation on
-/// the replication plane would let any consented peer fabricate
-/// `{identity: victim, occurrence: victim}` and brick the victim's sealability
-/// (`resolve_encryption_keys → None`) — worse than the occurrence MITM because
-/// it was terminal. Fail-secure; called by every
-/// `put_identity_occurrence_revocation` (HTTP + wire — one gate; edge's
-/// replication apply delegates to `put`, exactly like the occurrence).
-///
-/// **Authority is `signed_envelope`, never the sender's typed projection** —
-/// the #418 discipline verbatim. Verifies, each fail-closed:
-/// 1. the envelope carries `identity_key_id` / `occurrence_key_id` /
-///    `revoked_at` / `effective_at`, and the typed projection persist will
-///    store EQUALS them (a divergent projection is the MITM reopening);
-/// 2. the detached hybrid signature over `JCS(signed_envelope)` verifies at
-///    threshold **1-of-1** against the PINNED federation pubkeys of
-///    `attesting_key_id` ([`verify_threshold_signatures`] — the same bound-sig
-///    rule `verify_transport_binding` composes; that fn itself is NOT reusable
-///    here because it hard-requires a `transport_destination`, which a
-///    revocation envelope rightly lacks);
-/// 3. `signer_acts_for`: the signer is the identity's own key OR an
-///    already-active occurrence of the same identity — the §11.7.4
-///    single-vouch-for-self, ENFORCED (the `witness_set` only shaped it).
-///
-/// NOT feature-gated: backend-agnostic, and the MemoryBackend calls it (the
-/// #418 cfg lesson).
-///
-/// [`verify_threshold_signatures`]: ciris_verify_core::threshold::verify_threshold_signatures
-pub async fn verify_signed_identity_occurrence_revocation(
-    directory: &dyn super::FederationDirectory,
-    signed: &crate::federation::types::SignedIdentityOccurrenceRevocation,
-) -> Result<(), Error> {
-    use ciris_verify_core::threshold::{
-        verify_threshold_signatures, ThresholdMember, ThresholdSignature,
-    };
-
-    let row = &signed.identity_occurrence_revocation;
-    let env = &signed.signed_envelope;
-
-    // (1) Authoritative fields FROM the signed envelope; the typed projection
-    // must equal them (the signature covers only the envelope).
-    let str_field = |k: &str| -> Result<String, Error> {
-        env.get(k)
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_owned())
-            .ok_or_else(|| {
-                Error::malformed_row(
-                    "identity_occurrence_revocation",
-                    super::malformed_row::ENVELOPE_MEMBER_MISSING,
-                    format!(
-                        "signed identity_occurrence_revocation envelope missing string field `{k}`"
-                    ),
-                )
-            })
-    };
-    let ts_field = |k: &str| -> Result<chrono::DateTime<chrono::Utc>, Error> {
-        let s = str_field(k)?;
-        chrono::DateTime::parse_from_rfc3339(&s)
-            .map(|t| t.with_timezone(&chrono::Utc))
-            .map_err(|e| {
-                Error::malformed_row(
-                    "identity_occurrence_revocation",
-                    super::malformed_row::ENVELOPE_MEMBER_INVALID,
-                    format!(
-                        "signed identity_occurrence_revocation envelope `{k}` not RFC-3339: {e}"
-                    ),
-                )
-            })
-    };
-    let diverges = |what: &str| {
-        Error::malformed_row(
-            "identity_occurrence_revocation",
-            super::malformed_row::TYPED_DIVERGES_FROM_ENVELOPE,
-            format!(
-                "signed identity_occurrence_revocation: typed {what} diverges from the signed \
-                 envelope (rejected)"
-            ),
-        )
-    };
-    if str_field("identity_key_id")? != row.identity_key_id {
-        return Err(diverges("identity_key_id"));
-    }
-    if str_field("occurrence_key_id")? != row.occurrence_key_id {
-        return Err(diverges("occurrence_key_id"));
-    }
-    if ts_field("revoked_at")? != row.revoked_at {
-        return Err(diverges("revoked_at"));
-    }
-    // `effective_at` is the terminality clock (the re-establish comparator
-    // reads it), so a divergence here is the whole attack.
-    if ts_field("effective_at")? != row.effective_at {
-        return Err(diverges("effective_at"));
-    }
-
-    // (2) Hybrid signature over JCS(signed_envelope) against the PINNED
-    // federation pubkeys of the claimed signer, threshold 1-of-1 (RequireHybrid
-    // — a classical-only revocation does not count, RC7 §10.1.5.1.1).
-    let Some(signer_key) = directory
-        .lookup_public_key(&signed.attesting_key_id)
-        .await?
-    else {
-        // v54.1.0 (CIRISPersist#1042) — an ordering gap, typed apart from a
-        // bad signature: retryable once the signer's Key row lands.
-        return Err(Error::unknown_signer(
-            &signed.attesting_key_id,
-            "identity_occurrence_revocation",
-        ));
-    };
-    let bytes = crate::verify::canonical::ceg_produce_canonicalize(env).map_err(|e| {
-        Error::malformed_row(
-            "identity_occurrence_revocation",
-            super::malformed_row::ENVELOPE_NOT_CANONICAL,
-            format!("signed identity_occurrence_revocation canonicalize: {e}"),
-        )
-    })?;
-    let members = [ThresholdMember {
-        member_id: signer_key.key_id.clone(),
-        ed25519_public_key_base64: signer_key.pubkey_ed25519_base64.clone(),
-        mldsa65_public_key_base64: signer_key.pubkey_ml_dsa_65_base64.clone(),
-        role: None,
-    }];
-    let sigs = [ThresholdSignature {
-        member_id: signed.attesting_key_id.clone(),
-        ed25519_signature_base64: signed.signature.ed25519_signature_base64.clone(),
-        mldsa65_signature_base64: signed.signature.mldsa65_signature_base64.clone(),
-    }];
-    if verify_threshold_signatures(&bytes, &members, &sigs, 1).is_err() {
-        return Err(Error::SignatureInvalid(format!(
-            "signed identity_occurrence_revocation for {} not authentic (hybrid 1-of-1 over \
-             JCS(envelope) failed against the pinned key of {})",
-            row.occurrence_key_id, signed.attesting_key_id
-        )));
-    }
-
-    // (3) signer_acts_for — THE shared check ([`check_signer_acts_for`]): a
-    // peer cannot revoke a victim's occurrence with its own unrelated key.
-    check_signer_acts_for(
-        directory,
-        &signed.attesting_key_id,
-        &row.identity_key_id,
-        "identity_occurrence_revocation",
-    )
-    .await
-}
-
 /// v17.0.0 (CIRISPersist#443) — the SIGNED transport-destination admission
 /// gate: the route-plane mirror of
 /// [`verify_signed_identity_occurrence_revocation`], closing the
@@ -9410,6 +9264,28 @@ pub async fn check_withdraws_admission_at(
              withdrawn (CC 2.4.1.1 rule 0); lower its bound with a new revocation instead",
             target.attestation_id
         )));
+    }
+    // v58.0.0 (CIRISPersist#991, CC 3.3.6) — an occurrence's revocation is a
+    // `withdraws` against its `identity:occurrence:v1` row, admitted when the
+    // issuer acts for the identity: the identity itself or a live occurrence
+    // of it (the `signer_acts_for` rule the occurrence door runs). Rule 1 for
+    // the row's own signer, 2 for the identity, 4 for another live occurrence.
+    if let Some(signed) = crate::federation::key_plane::occurrence_of_row(&target) {
+        let identity = &signed.identity_occurrence.identity_key_id;
+        check_signer_acts_for(
+            directory,
+            &row.attesting_key_id,
+            identity,
+            "identity_occurrence_withdraws",
+        )
+        .await?;
+        return Ok(Some(if row.attesting_key_id == target.attesting_key_id {
+            1
+        } else if &row.attesting_key_id == identity {
+            2
+        } else {
+            4
+        }));
     }
     if crate::federation::key_grant::is_key_grant_row(&target)
         || crate::federation::key_grant::is_retired_key_grant_set_type(&target.attestation_type)
@@ -25274,13 +25150,15 @@ pub(crate) mod r2_test_support {
         put(ban).await.unwrap_or_else(|e| {
             panic!("({tag}) I227: a digest-only ban of an unheld key is admitted (D1): {e}")
         });
-        let served = dir
-            .list_signed_revocations_since(None, u32::MAX)
-            .await
-            .unwrap()
-            .into_iter()
-            .find(|r| r.revocation.revocation_id == ban_id)
-            .expect("the ban is served");
+        let served = crate::federation::key_plane::test_support::served_revocations(
+            dir.as_dyn_directory(),
+            u32::MAX,
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|r| r.revocation.revocation_id == ban_id)
+        .expect("the ban is served");
         let bytes = serde_json::to_string(&crate::federation::SignedRevocation {
             revocation: served.revocation,
         })
@@ -25348,13 +25226,15 @@ pub(crate) mod r2_test_support {
         a.put_revocation(crate::federation::SignedRevocation { revocation: row })
             .await
             .expect("A admits");
-        let served = a
-            .list_signed_revocations_since(None, u32::MAX)
-            .await
-            .unwrap()
-            .into_iter()
-            .find(|r| r.revocation.revocation_id == id)
-            .expect("A serves it");
+        let served = crate::federation::key_plane::test_support::served_revocations(
+            a.as_dyn_directory(),
+            u32::MAX,
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|r| r.revocation.revocation_id == id)
+        .expect("A serves it");
         b.put_revocation(crate::federation::SignedRevocation {
             revocation: served.revocation,
         })
@@ -29987,18 +29867,8 @@ pub(crate) mod backend_parity_test_support {
              normalized or re-minted id is a backend a consumer cannot address rows on."
         );
 
-        // And the SECOND site of the same defect: the PQC-completion door looked
-        // the row up by a parsed UUID too, so fixing only the write door would
-        // have left a stored row permanently unreachable for hybrid completion.
-        dir.attach_revocation_pqc_signature(&symbolic, "AAAA")
-            .await
-            .expect("the PQC-attach door must find a row by its non-UUID id (#622)");
-        let after = dir.revocations_for(&who).await.expect("read");
-        assert_eq!(
-            after[0].scrub_signature_pqc.as_deref(),
-            Some("AAAA"),
-            "[{tag}] the attach applied to the row addressed by the symbolic id"
-        );
+        // v58.0.0 (CIRISPersist#991) — the PQC-completion door this test also
+        // pinned is gone: a revocation is hybrid at its door.
     }
 
     /// **Gap 2 on the attestation door**: the same non-hex

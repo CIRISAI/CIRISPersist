@@ -37,15 +37,22 @@ pub enum SiloProjection {
     /// `key:revocation:v1` rows. A revocation held without its row (a pre-v58
     /// Ed25519-only one) is a red.
     FederationRevocations,
+    /// v58.0.0 (CIRISPersist#991, CC 3.3.6) — the SIGNED rows of
+    /// `federation_identity_occurrences` ← `identity:occurrence:v1` rows. A
+    /// trusted-local (unsigned) occurrence is the node's own self-write, not a
+    /// claim, and is outside the projection; a signed one held without its row
+    /// (Ed25519-only) is a red.
+    IdentityOccurrences,
 }
 
 impl SiloProjection {
     /// Every projection, in declaration order.
-    pub const ALL: [SiloProjection; 4] = [
+    pub const ALL: [SiloProjection; 5] = [
         Self::HardCaseEvents,
         Self::DetectionEvents,
         Self::FederationKeys,
         Self::FederationRevocations,
+        Self::IdentityOccurrences,
     ];
 
     /// The stable name: the projection's table name without a schema.
@@ -56,6 +63,7 @@ impl SiloProjection {
             Self::DetectionEvents => "detection_events",
             Self::FederationKeys => "federation_keys",
             Self::FederationRevocations => "federation_revocations",
+            Self::IdentityOccurrences => "federation_identity_occurrences",
         }
     }
 }

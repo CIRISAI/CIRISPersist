@@ -1034,13 +1034,15 @@ pub(crate) mod two_node {
 
     /// B's signed occurrence for `device`, carried to A (the since-read).
     async fn carry_occurrence<B: FederationDirectory + Sync>(a: &B, b: &B, device: &str) {
-        let served = b
-            .list_signed_identity_occurrences_since(None, 10_000)
-            .await
-            .unwrap()
-            .into_iter()
-            .find(|s| s.occurrence.identity_occurrence.occurrence_key_id == device)
-            .unwrap_or_else(|| panic!("{device}'s occurrence is on B's since-read"));
+        let served = crate::federation::key_plane::test_support::served_identity_occurrences(
+            b.as_dyn_directory(),
+            10_000,
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|s| s.occurrence.identity_occurrence.occurrence_key_id == device)
+        .unwrap_or_else(|| panic!("{device}'s occurrence is on B's since-read"));
         a.put_identity_occurrence(served.occurrence)
             .await
             .unwrap_or_else(|e| panic!("A admits {device}'s occurrence: {e}"));

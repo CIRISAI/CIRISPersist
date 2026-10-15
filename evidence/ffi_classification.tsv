@@ -454,13 +454,9 @@ epistemic	descriptive	37	Engine	list_signed_communities_since
 epistemic	descriptive	37	Engine	list_signed_community_membership_revocations_since	
 epistemic	descriptive	37	Engine	list_signed_families_since	
 epistemic	descriptive	37	Engine	list_signed_family_membership_revocations_since	
-epistemic	descriptive	37	Engine	list_signed_identity_occurrence_revocations_since	
 epistemic	descriptive	37	Engine	list_signed_identity_occurrences_for_json	
-epistemic	descriptive	37	Engine	list_signed_identity_occurrences_since	
-epistemic	descriptive	37	Engine	list_signed_key_records_since	
 epistemic	descriptive	37	Engine	list_signed_location_proofs_since	
 epistemic	descriptive	37	Engine	list_signed_partner_records_since	
-epistemic	descriptive	37	Engine	list_signed_revocations_since	
 epistemic	descriptive	37	Engine	list_signed_transport_destinations_since	
 epistemic	descriptive	37	Engine	node_state_json	
 epistemic	descriptive	37	Engine	peer_quota_observation_json	
@@ -488,7 +484,6 @@ nomological	descriptive	17	Engine	validate_envelope_canonical_form
 nomological	descriptive	17	Engine	verify_coord_constants_json	
 ontological	descriptive	34	Engine	attach_attestation_pqc_signature	
 ontological	descriptive	34	Engine	attach_key_pqc_signature	
-ontological	descriptive	34	Engine	attach_revocation_pqc_signature	
 ontological	descriptive	34	Engine	canonical_bootstrap_hints	
 ontological	descriptive	34	Engine	deregister_occurrence	
 ontological	descriptive	34	Engine	heartbeat_occurrence	

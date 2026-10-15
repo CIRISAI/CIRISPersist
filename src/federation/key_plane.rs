@@ -145,9 +145,14 @@ impl KeyPlaneFamily {
         Self::ALL.into_iter().find(|f| f.dimension() == dimension)
     }
 
-    /// The family of a row, read from its envelope's `dimension`.
+    /// The family of a `scores` row, read from its envelope's `dimension`.
+    /// A structural composer that names a key-plane dimension (an occurrence's
+    /// `withdraws`) is not itself a key-plane row.
     #[must_use]
     pub fn of_row(row: &Attestation) -> Option<Self> {
+        if row.attestation_type != attestation_type::SCORES {
+            return None;
+        }
         super::admission::envelope_dimension(&row.attestation_envelope).and_then(Self::of_dimension)
     }
 
@@ -676,9 +681,7 @@ pub fn revocation_projection_rebuild(
 /// `None` (held without a row; the gate names it) when it is not hybrid.
 #[must_use]
 pub fn revocation_row_if_hybrid(revocation: &super::types::Revocation) -> Option<Attestation> {
-    if revocation.scrub_signature_pqc.is_none() || revocation.pqc_completed_at.is_none() {
-        return None;
-    }
+    revocation.scrub_signature_pqc.as_ref()?;
     revocation_row(revocation)
         .map_err(|e| {
             tracing::debug!(
@@ -748,8 +751,12 @@ where
     }
     // v31.0.0 (CIRISPersist#660) — a hex content hash, stated.
     super::admission::check_content_hash_hex("original_content_hash", &row.original_content_hash)?;
-    // v58.0.0 (CIRISPersist#991) — hybrid, like every plane row.
-    if row.scrub_signature_pqc.is_none() || row.pqc_completed_at.is_none() {
+    // v58.0.0 (CIRISPersist#991) — hybrid, like every plane row. A revocation
+    // that carries both halves is hybrid from its signing.
+    if row.scrub_signature_pqc.is_some() && row.pqc_completed_at.is_none() {
+        row.pqc_completed_at = Some(row.scrub_timestamp);
+    }
+    if row.scrub_signature_pqc.is_none() {
         return Err(Error::SignatureInvalid(format!(
             "key:revocation:v1 {}: Ed25519-only (hybrid-pending) — a plane row's signature is \
              hybrid (CC 2.4); the hybrid-pending revocation path ended in v58.0.0 \
@@ -790,6 +797,29 @@ where
     })
 }
 
+/// Is exactly this revocation held (the same record, every member)?
+async fn is_held_revocation<D>(
+    dir: &D,
+    revocation: &super::types::Revocation,
+) -> Result<bool, Error>
+where
+    D: super::FederationDirectory + ?Sized,
+{
+    let mut offered = revocation.clone();
+    super::canonical_at_rest::canonicalize_in_place(&mut offered.revocation_envelope)?;
+    if offered.scrub_signature_pqc.is_some() && offered.pqc_completed_at.is_none() {
+        offered.pqc_completed_at = Some(offered.scrub_timestamp);
+    }
+    let hash = super::types::compute_persist_row_hash(&offered)?;
+    Ok(dir
+        .revocations_for_subject(&revocation.revoked_key_sha256_ed25519_raw)
+        .await?
+        .iter()
+        .any(|held| {
+            held.revocation_id == revocation.revocation_id && held.persist_row_hash == hash
+        }))
+}
+
 /// The door every backend's `put_revocation` is: settle a held re-offer, plan,
 /// store.
 pub(crate) async fn put_revocation_planned<D>(
@@ -799,19 +829,205 @@ pub(crate) async fn put_revocation_planned<D>(
 where
     D: KeyPlaneStore,
 {
-    if dir
-        .revocations_for_subject(&revocation.revocation.revoked_key_sha256_ed25519_raw)
-        .await?
-        .iter()
-        .any(|held| {
-            held.revocation_id == revocation.revocation.revocation_id
-                && held.original_content_hash == revocation.revocation.original_content_hash
-        })
-    {
+    // A byte-identical re-offer of a held revocation settles before any verify
+    // (the #672 rule): the whole record, not its id — a relay's re-pasted
+    // column under a held id must still meet the binding gate.
+    if is_held_revocation(dir, &revocation.revocation).await? {
         return Ok(());
     }
     let planned = plan_put_revocation(dir, revocation.revocation, chrono::Utc::now()).await?;
     dir.store_planned_revocation(planned).await
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+//  identity:occurrence:v1
+// ─────────────────────────────────────────────────────────────────────────
+
+/// The signed occurrence as the row carries it: the occurrence (without its
+/// recomputed `persist_row_hash`), its signer, the producer's signed envelope
+/// and the detached hybrid signature over it.
+pub fn occurrence_object(
+    signed: &super::types::SignedIdentityOccurrence,
+) -> Result<serde_json::Value, Error> {
+    let mut v = serde_json::to_value(signed)
+        .map_err(|e| Error::Backend(format!("identity occurrence encode: {e}")))?;
+    if let Some(inner) = v
+        .get_mut("identity_occurrence")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        inner.remove("persist_row_hash");
+    }
+    Ok(v)
+}
+
+/// The `identity:occurrence:v1` row of a signed occurrence (pure, no gate):
+/// attested by its signer (the identity or a live occurrence of it, CC 3.3.6)
+/// about the identity, signed with the occurrence's own detached hybrid
+/// signature over its signed envelope, asserted at the occurrence's own
+/// `asserted_at`. Refused when the signature is Ed25519-only: a plane row's
+/// signature is hybrid (CC 2.4).
+pub fn occurrence_row(
+    signed: &super::types::SignedIdentityOccurrence,
+) -> Result<Attestation, Error> {
+    let occurrence = &signed.identity_occurrence;
+    let Some(pqc) = signed.signature.mldsa65_signature_base64.clone() else {
+        return Err(Error::SignatureInvalid(format!(
+            "identity:occurrence:v1 {}/{}: Ed25519-only signature — a plane row's signature is \
+             hybrid (CC 2.4)",
+            occurrence.identity_key_id, occurrence.occurrence_key_id
+        )));
+    };
+    plane_row(
+        KeyPlaneFamily::IdentityOccurrence,
+        &signed.attesting_key_id,
+        &occurrence.identity_key_id,
+        occurrence_object(signed)?,
+        occurrence.asserted_at,
+        PlaneSignature {
+            scrub_key_id: signed.attesting_key_id.clone(),
+            classical: signed.signature.ed25519_signature_base64.clone(),
+            pqc: Some(pqc),
+            scrub_timestamp: occurrence.asserted_at,
+            pqc_completed_at: Some(occurrence.asserted_at),
+        },
+    )
+}
+
+/// The row of a held signed occurrence, or `None` (held without a row; the
+/// rebuild gate names it) when it is Ed25519-only.
+#[must_use]
+pub fn occurrence_row_if_hybrid(
+    signed: &super::types::SignedIdentityOccurrence,
+) -> Option<Attestation> {
+    occurrence_row(signed)
+        .map_err(|e| {
+            tracing::debug!(
+                identity_key_id = %signed.identity_occurrence.identity_key_id,
+                occurrence_key_id = %signed.identity_occurrence.occurrence_key_id,
+                refusal = e.kind(),
+                "occurrence held without an identity:occurrence:v1 row: {e}"
+            );
+        })
+        .ok()
+}
+
+/// **The projection** of an `identity:occurrence:v1` row: the signed
+/// occurrence it carries, `persist_row_hash` recomputed. `None` for any other
+/// row.
+#[must_use]
+pub fn occurrence_of_row(row: &Attestation) -> Option<super::types::SignedIdentityOccurrence> {
+    let mut object = plane_object(row, KeyPlaneFamily::IdentityOccurrence)?.clone();
+    object
+        .get_mut("identity_occurrence")?
+        .as_object_mut()?
+        .insert(
+            "persist_row_hash".to_owned(),
+            serde_json::Value::String(String::new()),
+        );
+    let mut signed: super::types::SignedIdentityOccurrence = serde_json::from_value(object).ok()?;
+    signed.identity_occurrence.persist_row_hash =
+        super::types::compute_persist_row_hash(&signed.identity_occurrence).ok()?;
+    Some(signed)
+}
+
+/// v58.0.0 (CIRISPersist#991, CC 3.3.6) — the occurrence revocation a
+/// `withdraws` row is, when its target is a held `identity:occurrence:v1` row:
+/// the pair, revoked and effective at the withdrawal's signed instant, its
+/// `withdrawal_reason`. `None` for any other row (or an unheld target, whose
+/// withdrawal the read side defers like every other).
+pub(crate) async fn occurrence_withdrawal_of<D>(
+    dir: &D,
+    row: &Attestation,
+) -> Result<Option<super::types::IdentityOccurrenceRevocation>, Error>
+where
+    D: super::FederationDirectory + ?Sized,
+{
+    if row.attestation_type != attestation_type::WITHDRAWS {
+        return Ok(None);
+    }
+    let Some(target_id) =
+        super::precedence::references_attestation_id_from_envelope(&row.attestation_envelope)
+    else {
+        return Ok(None);
+    };
+    let Some(target) = dir.get_attestation(target_id).await? else {
+        return Ok(None);
+    };
+    let Some(signed) = occurrence_of_row(&target) else {
+        return Ok(None);
+    };
+    Ok(Some(super::types::IdentityOccurrenceRevocation {
+        identity_key_id: signed.identity_occurrence.identity_key_id,
+        occurrence_key_id: signed.identity_occurrence.occurrence_key_id,
+        revoked_at: row.asserted_at,
+        effective_at: row.asserted_at,
+        reason: row
+            .attestation_envelope
+            .get("withdrawal_reason")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        witness_set: Vec::new(),
+        persist_row_hash: String::new(),
+    }))
+}
+
+/// The rebuild gate's rendering of one SIGNED `federation_identity_occurrences`
+/// row: the signed occurrence and the `attestation_id` it names. A
+/// trusted-local (unsigned) occurrence is this node's own self-write, not a
+/// claim on the plane, and is not part of the projection.
+#[must_use]
+pub fn render_occurrence_projection(
+    signed: &super::types::SignedIdentityOccurrence,
+    attestation_id: Option<&str>,
+) -> String {
+    let mut v = serde_json::to_value(signed).unwrap_or(serde_json::Value::Null);
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert(
+            "attestation_id".to_owned(),
+            attestation_id.map_or(serde_json::Value::Null, |a| {
+                serde_json::Value::String(a.to_owned())
+            }),
+        );
+    }
+    crate::verify::canonical::ceg_produce_canonicalize(&v)
+        .map(|b| String::from_utf8_lossy(&b).into_owned())
+        .unwrap_or_default()
+}
+
+/// The from-rows rebuild of the signed `federation_identity_occurrences`, in
+/// `(identity_key_id, occurrence_key_id)` order.
+#[must_use]
+pub fn occurrence_projection_rebuild(
+    live: Vec<(super::types::SignedIdentityOccurrence, Option<String>)>,
+    rows: &[Attestation],
+) -> super::silo_projection::ProjectionRebuild {
+    let key = |s: &super::types::SignedIdentityOccurrence| {
+        (
+            s.identity_occurrence.identity_key_id.clone(),
+            s.identity_occurrence.occurrence_key_id.clone(),
+        )
+    };
+    let mut live: Vec<((String, String), String)> = live
+        .into_iter()
+        .map(|(s, a)| (key(&s), render_occurrence_projection(&s, a.as_deref())))
+        .collect();
+    live.sort();
+    let mut rebuilt: Vec<((String, String), String)> = rows
+        .iter()
+        .filter_map(|row| {
+            occurrence_of_row(row).map(|s| {
+                (
+                    key(&s),
+                    render_occurrence_projection(&s, Some(&row.attestation_id)),
+                )
+            })
+        })
+        .collect();
+    rebuilt.sort();
+    super::silo_projection::ProjectionRebuild {
+        live: live.into_iter().map(|(_, s)| s).collect(),
+        rebuilt: rebuilt.into_iter().map(|(_, s)| s).collect(),
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -851,6 +1067,13 @@ pub(crate) async fn apply_key_plane_row<D>(
 where
     D: super::FederationDirectory + ?Sized,
 {
+    // A byte-identical re-offer of a held row settles ahead of every verify
+    // (the #672 rule): one signed object, one id, one row.
+    if let Some(held) = dir.get_attestation(&row.attestation_id).await? {
+        if held.persist_row_hash == super::types::compute_persist_row_hash(row)? {
+            return Ok(KeyPlaneApplied::Unchanged);
+        }
+    }
     match KeyPlaneFamily::of_row(row) {
         Some(KeyPlaneFamily::KeyRecord) => {
             let record = key_record_of_row(row).ok_or_else(|| {
@@ -894,28 +1117,163 @@ where
                 )
             })?;
             check_canonical_plane_row(row, &revocation_row(&revocation)?)?;
-            let held = dir
-                .revocations_for_subject(&revocation.revoked_key_sha256_ed25519_raw)
-                .await?
-                .iter()
-                .any(|h| {
-                    h.revocation_id == revocation.revocation_id
-                        && h.original_content_hash == revocation.original_content_hash
-                });
-            if held {
+            if is_held_revocation(dir, &revocation).await? {
                 return Ok(KeyPlaneApplied::Unchanged);
             }
             dir.put_revocation(super::SignedRevocation { revocation })
                 .await?;
             Ok(KeyPlaneApplied::Changed)
         }
-        Some(family) => Err(Error::InvalidArgument(format!(
-            "{} rows are not admitted through the attestation door yet",
-            family.dimension()
-        ))),
+        Some(KeyPlaneFamily::IdentityOccurrence) => {
+            let signed = occurrence_of_row(row).ok_or_else(|| {
+                Error::malformed_row(
+                    "identity_occurrence",
+                    super::malformed_row::ENVELOPE_MEMBER_INVALID,
+                    format!(
+                        "identity:occurrence:v1 row {} carries no readable \
+                         `{IDENTITY_OCCURRENCE_MEMBER}`",
+                        row.attestation_id
+                    ),
+                )
+            })?;
+            check_canonical_plane_row(row, &occurrence_row(&signed)?)?;
+            let held = dir
+                .list_signed_identity_occurrences_for(&signed.identity_occurrence.identity_key_id)
+                .await?
+                .into_iter()
+                .any(|h| h == signed);
+            if held {
+                return Ok(KeyPlaneApplied::Unchanged);
+            }
+            dir.put_identity_occurrence(signed).await?;
+            Ok(KeyPlaneApplied::Changed)
+        }
         None => Err(Error::InvalidArgument(format!(
             "row {} is not a key-plane row",
             row.attestation_id
         ))),
+    }
+}
+
+/// v58.0.0 (CIRISPersist#991) — every key record on the plane, as a peer pulls
+/// it: the `key:record:v1` rows of the attestation stream, paged to the end.
+/// A key held without a row (it verifies under neither rule) is not on the
+/// plane and is not here.
+pub async fn key_records_on_the_plane(
+    dir: &dyn super::FederationDirectory,
+) -> Result<Vec<KeyRecord>, Error> {
+    const PAGE: u32 = 1_000;
+    let mut out = Vec::new();
+    let mut since = None;
+    loop {
+        let page = dir.list_attestations_since(since.clone(), PAGE).await?;
+        let Some(last) = page.last() else { break };
+        since = Some(last.resume_pair());
+        let full = page.len() as u32 == PAGE;
+        out.extend(
+            page.iter()
+                .filter_map(|s| key_record_of_row(&s.attestation)),
+        );
+        if !full {
+            break;
+        }
+    }
+    Ok(out)
+}
+
+/// Test support: the key plane as a replicating peer pulls it — through the
+/// attestation stream (`list_attestations_since`), the framed key-plane
+/// cursors being retired in v58.0.0.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::super::types::{ServedIdentityOccurrence, ServedKeyRecord};
+    use super::super::{Error, FederationDirectory};
+
+    async fn all_rows(
+        d: &dyn FederationDirectory,
+    ) -> Result<Vec<super::super::types::ServedAttestation>, Error> {
+        let mut out = Vec::new();
+        let mut since = None;
+        loop {
+            let page = d.list_attestations_since(since.clone(), 1_000).await?;
+            let Some(last) = page.last() else { break };
+            since = Some(last.resume_pair());
+            let n = page.len();
+            out.extend(page);
+            if n < 1_000 {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    /// Every `key:record:v1` row served past `since` — `(admitted_at, key_id)`
+    /// of the row's serve position — as the record it carries.
+    pub(crate) async fn served_key_records(
+        d: &dyn FederationDirectory,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
+        limit: u32,
+    ) -> Result<Vec<ServedKeyRecord>, Error> {
+        let mut out: Vec<ServedKeyRecord> = all_rows(d)
+            .await?
+            .into_iter()
+            .filter_map(|s| {
+                super::key_record_of_row(&s.attestation).map(|record| ServedKeyRecord {
+                    record,
+                    admitted_at: s.admitted_at,
+                })
+            })
+            .filter(|s| {
+                since
+                    .as_ref()
+                    .is_none_or(|c| (s.admitted_at, s.record.key_id.clone()) > *c)
+            })
+            .collect();
+        out.sort_by_key(ServedKeyRecord::resume_pair);
+        out.truncate(limit as usize);
+        Ok(out)
+    }
+
+    /// Every `key:revocation:v1` row served, as the revocation it carries.
+    pub(crate) async fn served_revocations(
+        d: &dyn FederationDirectory,
+        limit: u32,
+    ) -> Result<Vec<super::super::types::ServedRevocation>, Error> {
+        let mut out: Vec<super::super::types::ServedRevocation> = all_rows(d)
+            .await?
+            .into_iter()
+            .filter_map(|s| {
+                super::revocation_of_row(&s.attestation).map(|revocation| {
+                    super::super::types::ServedRevocation {
+                        revocation,
+                        admitted_at: s.admitted_at,
+                    }
+                })
+            })
+            .collect();
+        out.truncate(limit as usize);
+        Ok(out)
+    }
+
+    /// Every `identity:occurrence:v1` row served, as the signed occurrence it
+    /// carries.
+    pub(crate) async fn served_identity_occurrences(
+        d: &dyn FederationDirectory,
+        limit: u32,
+    ) -> Result<Vec<ServedIdentityOccurrence>, Error> {
+        let mut out: Vec<ServedIdentityOccurrence> = all_rows(d)
+            .await?
+            .into_iter()
+            .filter_map(|s| {
+                super::occurrence_of_row(&s.attestation).map(|occurrence| {
+                    ServedIdentityOccurrence {
+                        occurrence,
+                        admitted_at: s.admitted_at,
+                    }
+                })
+            })
+            .collect();
+        out.truncate(limit as usize);
+        Ok(out)
     }
 }
