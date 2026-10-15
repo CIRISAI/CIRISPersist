@@ -586,52 +586,75 @@ pub fn membership_removed_event(
     }
 }
 
-/// v57.0.0 (CIRISPersist#988 item 3) — the DSAR erasure's
-/// `hard_case:trace_erasure:v1` event, one builder for all three backends.
-/// When the erasure hard-deleted row-backed detections, the event names how
-/// many and binds their tombstone selection (`selection_digest`, the digest
-/// of the `attestation:{id}` record ids): the row is the notice the
-/// erasure's tombstone header cites (`steward_purge::ART17_ERASURE_BASIS`).
+/// v58.0.0 (CIRISPersist#1094 item 2, CC 4.5.3) — what a DSAR erasure
+/// counted: the ONLY content of its `hard_case:trace_erasure:v1` row. Counts
+/// and the door that ran; never who. CC 4.5.3: "A hard case recording an
+/// erasure MUST NOT name the subject" — no `agent_id_hash`, no signing key,
+/// no subject key, no row id or digest that resolves to the erased subject's
+/// rows. The tombstones that replicate cite the subject's `withdraws`
+/// (`subject_erasure::ErasureNotice`); this row cites nothing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct TraceErasureCounts {
+    /// Which door ran ([`trace_erasure_op`]).
+    pub op: &'static str,
+    /// `trace_events` rows hard-deleted.
+    pub trace_events: u64,
+    /// `trace_llm_calls` rows hard-deleted.
+    pub trace_llm_calls: u64,
+    /// Detections erased: pre-v57 silo rows tombstoned in place plus
+    /// row-backed `detection:*` rows hard-deleted under a subject `withdraws`.
+    pub detection_events_tombstoned: u64,
+    /// Of those, the row-backed ones (each one tombstone on the attestation
+    /// plane).
+    pub detection_rows_erased: u64,
+    /// Row-backed detections of the erased traces that NO subject `withdraws`
+    /// covers, left in place (a row naming no subject is reachable by no
+    /// subject's withdraws, CC 2.4.1.1 rules 2–3).
+    pub detection_rows_retained: u64,
+    /// `federation_keys` rows deleted (the key-scoped door's cascade).
+    pub federation_keys: u64,
+    /// `federation_attestations` rows deleted (the key-scoped door's cascade).
+    pub federation_attestations: u64,
+    /// `federation_revocations` rows deleted (the key-scoped door's cascade).
+    pub federation_revocations: u64,
+}
+
+/// v58.0.0 — the `op` member of a [`TraceErasureCounts`]: the door's name.
+pub mod trace_erasure_op {
+    /// `delete_traces_for_agent_id_hash` (all signing keys).
+    pub const FULL: &str = "delete_traces_for_agent_id_hash";
+    /// `delete_traces_for_agent` (one signing key).
+    pub const KEY_SCOPED: &str = "delete_traces_for_agent";
+}
+
+/// v58.0.0 (CIRISPersist#1094 item 2, CC 4.5.3) — the DSAR erasure's
+/// `hard_case:trace_erasure:v1` event, subject-free, one builder for both
+/// doors on all three backends: `target_key_id` and `subject_key_id` are
+/// `None` and the detail is [`TraceErasureCounts`] alone.
 #[must_use]
-pub fn trace_erasure_event(
-    agent_id_hash: &str,
-    trace_events: u64,
-    trace_llm_calls: u64,
-    detection_events_tombstoned: u64,
-    erased_detection_rows: &[String],
-    erased_at: DateTime<Utc>,
-) -> HardCaseEvent {
-    let mut detail = serde_json::json!({
-        "agent_id_hash": agent_id_hash,
-        "trace_events": trace_events,
-        "trace_llm_calls": trace_llm_calls,
-        "detection_events_tombstoned": detection_events_tombstoned,
-    });
-    bind_erased_detection_rows(&mut detail, erased_detection_rows);
+pub fn trace_erasure_event(counts: &TraceErasureCounts, erased_at: DateTime<Utc>) -> HardCaseEvent {
     HardCaseEvent {
         event_id: uuid::Uuid::new_v4().to_string(),
         kind: kind::TRACE_ERASURE.to_owned(),
-        target_key_id: Some(agent_id_hash.to_owned()),
+        target_key_id: None,
         subject_key_id: None,
-        detail,
+        detail: serde_json::to_value(counts).unwrap_or_default(),
         emitted_at: erased_at,
     }
 }
 
-/// v57.0.0 (CIRISPersist#988 item 3) — when a DSAR erasure hard-deleted
-/// row-backed detections, its event names how many and binds their tombstone
-/// selection (`selection_digest` of the `attestation:{id}` record ids). A
-/// no-op for an erasure that deleted none.
-pub fn bind_erased_detection_rows(
-    detail: &mut serde_json::Value,
-    erased_detection_rows: &[String],
-) {
-    if erased_detection_rows.is_empty() {
-        return;
-    }
-    let ids = super::steward_purge::art17_erasure_record_ids(erased_detection_rows);
-    detail["detection_rows_erased"] = serde_json::json!(ids.len());
-    detail["selection_digest"] = serde_json::json!(super::steward_purge::selection_digest(&ids));
+/// v58.0.0 (CIRISPersist#1094 item 2) — does a `hard_case:trace_erasure`
+/// event name its subject (the v57.0.0 shape: `agent_id_hash` /
+/// `signing_key_id` in the detail, the agent in `target_key_id`)? V196
+/// deletes the v57-shaped rows this answers `true` for; a v58 event never
+/// does.
+#[must_use]
+pub fn trace_erasure_names_its_subject(event: &HardCaseEvent) -> bool {
+    event.kind == kind::TRACE_ERASURE
+        && (event.target_key_id.is_some()
+            || event.subject_key_id.is_some()
+            || event.detail.get("agent_id_hash").is_some()
+            || event.detail.get("signing_key_id").is_some())
 }
 
 /// Deterministic `event_id` for a [`kind::RECIPIENT_EXCLUDED`] emission

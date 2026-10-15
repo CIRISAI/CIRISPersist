@@ -8904,6 +8904,110 @@ async fn enumerate_scoped_delegation_reach(
     .reached)
 }
 
+/// v58.0.0 (CIRISPersist#1094 item 2) — which CC 2.4.1.1 subject-authority
+/// rules (2–4) may withdraw a target: [`subject_revocation_paths`]'s answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubjectRevocationPaths {
+    /// Rules 2, 3 and 4.
+    All,
+    /// Rule 3 only: the erasure route (CC 4.5.3), the node as the subject's
+    /// proxy.
+    ErasureProxyOnly,
+    /// None: the anti-Goodhart retraction dual (CC 2.4.1.1).
+    None,
+}
+
+/// v58.0.0 (CIRISPersist#1094 item 2; CC 2.4.1.1 carve-out, CC 4.5.3) —
+/// **the one predicate deciding which subject-authority rules reach
+/// `target`.**
+///
+/// - `capacity:*`: none (the anti-Goodhart retraction dual; the subject's
+///   contest path is `reconsideration:{grounds}`, CC 4.5.5).
+/// - `detection:*`: rule 3 alone, and only for a NODE-role issuer
+///   ([`is_node_role_key`]): CC 4.5.3 erases a detection row about a subject
+///   by the subject's `withdraws` with the node acting as the rule-3 proxy
+///   for a subject who proved identity out of band. The scored party's own
+///   key (rule 2, a canonical binding, a rule-4 delegate) and any non-node
+///   proxy stay refused — an agent cannot appoint itself proxy for its own
+///   canonical subject and subtract its adverse detections.
+/// - everything else: all three.
+///
+/// # Errors
+///
+/// Directory reads.
+pub async fn subject_revocation_paths(
+    directory: &dyn super::FederationDirectory,
+    issuer: &str,
+    target: &super::Attestation,
+) -> Result<SubjectRevocationPaths, Error> {
+    let dimension = envelope_dimension(&target.attestation_envelope);
+    if dimension.is_some_and(|d| d.starts_with(CAPACITY_FAMILY_PREFIX)) {
+        return Ok(SubjectRevocationPaths::None);
+    }
+    if dimension.is_some_and(|d| d.starts_with(crate::derived::detection_row::DIMENSION_PREFIX)) {
+        return Ok(if is_node_role_key(directory, issuer).await? {
+            SubjectRevocationPaths::ErasureProxyOnly
+        } else {
+            SubjectRevocationPaths::None
+        });
+    }
+    Ok(SubjectRevocationPaths::All)
+}
+
+/// v58.0.0 (CIRISPersist#1094 item 2) — is `key` a held NODE-role key that is
+/// not also an agent (a fused `{node,agent}` key is the scored party as much
+/// as the node, CC 3.4.7.3 Clause A)? Unknown keys are not.
+pub async fn is_node_role_key(
+    directory: &dyn super::FederationDirectory,
+    key: &str,
+) -> Result<bool, Error> {
+    Ok(directory.lookup_public_key(key).await?.is_some_and(|r| {
+        identity_type::set_contains(&r.identity_type, identity_type::NODE)
+            && !identity_type::set_contains(&r.identity_type, identity_type::AGENT)
+    }))
+}
+
+/// v58.0.0 (CIRISPersist#1094 item 2) — is `id` a CC 2.3.2.1 tagged canonical
+/// hash (`canonical:sha256:` + 64 lowercase hex)? The exact tag only (P3).
+#[must_use]
+pub fn is_canonical_subject_id(id: &str) -> bool {
+    id.strip_prefix(CANONICAL_KEY_ID_PREFIX).is_some_and(|h| {
+        h.len() == 64
+            && h.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    })
+}
+
+/// v58.0.0 (CIRISPersist#1094 item 2; CC 2.4.1.1 rule 3, CC 4.5.3) — the
+/// attested-subject rule for a whole row. A `delegates_to` whose recipient is
+/// a CC 2.3.2.1 canonical hash, whose scope is exactly `{consent_revocation}`
+/// and whose attester is a node-role key ([`is_node_role_key`]) is the rule-3
+/// proxy grant `delegates_to(node → canonical subject)`: the subject is an
+/// external party with no `federation_keys` row by definition (CC 2.3.2 form
+/// 2), so it is admitted here. Every other row takes
+/// [`check_attested_subject_admission`] unchanged.
+///
+/// # Errors
+///
+/// [`check_attested_subject_admission`]'s.
+pub async fn check_attested_subject_admission_for_row(
+    directory: &dyn super::FederationDirectory,
+    row: &super::Attestation,
+) -> Result<(), Error> {
+    if row.attestation_type == attestation_type::DELEGATES_TO
+        && is_canonical_subject_id(&row.attested_key_id)
+    {
+        let scopes = delegation_scope_set(&row.attestation_envelope);
+        if scopes.len() == 1
+            && scopes.contains(DELEGATION_SCOPE_CONSENT_REVOCATION)
+            && is_node_role_key(directory, &row.attesting_key_id).await?
+        {
+            return Ok(());
+        }
+    }
+    check_attested_subject_admission(directory, &row.attested_key_id).await
+}
+
 /// v6.4.0 (CIRISPersist#146 Ask 2, CEG §3.2.3 / §8.1.11.2) — the
 /// broadened `withdraws` admission gate. Resolves WHICH of the four
 /// admission rules (if any) authorizes `issuer` to withdraw target
@@ -9057,19 +9161,28 @@ pub async fn resolve_withdraws_admission_rule_at(
     // `reconsideration:{grounds}` standing, this gate must be revisited in the
     // same change — otherwise it goes back to closing a door with nothing
     // behind it, which is what #587 actually objected to.
-    let target_denies_subject_revocation = envelope_dimension(&target.attestation_envelope)
-        .is_some_and(|d| d.starts_with("capacity:") || d.starts_with("detection:"));
-    if target_denies_subject_revocation {
+    //
+    // v58.0.0 (CIRISPersist#1094 item 2, CC 4.5.3 "Erasure at the subject's
+    // request") — the erasure route through the carve-out, ONE named
+    // predicate: [`subject_revocation_paths`]. A `detection:*` row about a
+    // subject is erased by the subject's `withdraws` with the NODE as the CC
+    // 2.4.1.1 rule-3 proxy, so rule 3 reaches it when the issuer is a
+    // node-role key; rules 2 and 4 stay refused for it (the scored party's own
+    // key still cannot subtract its adverse detections), and `capacity:*` is
+    // unchanged.
+    let paths = subject_revocation_paths(directory, issuer, target).await?;
+    if paths == SubjectRevocationPaths::None {
         return Err(Error::WithdrawsNotAdmitted {
             issuer: issuer.to_string(),
             target_attestation_id: target.attestation_id.clone(),
             beyond_delegation_depth_cap: false,
         });
     }
+    let all_paths = paths == SubjectRevocationPaths::All;
 
     // Rule 2 — subject self-revocation. §8.1.11.2: membership in the
     // subject SET, any single element suffices (no quorum).
-    if target.subject_key_ids.iter().any(|s| s == issuer) {
+    if all_paths && target.subject_key_ids.iter().any(|s| s == issuer) {
         return Ok(2);
     }
     // Rule 2 (canonical-binding widening, CEG §5.6.8.14 / §4.2.2.2) —
@@ -9081,7 +9194,7 @@ pub async fn resolve_withdraws_admission_rule_at(
     // subject it has since claimed. (Authorization that K==H is
     // consumer-policy; persist admits the binding and resolves authority
     // structurally — §5.6.8.14 normative-honesty clause.)
-    if !target.subject_key_ids.is_empty() {
+    if all_paths && !target.subject_key_ids.is_empty() {
         let subjects: std::collections::HashSet<&str> =
             target.subject_key_ids.iter().map(String::as_str).collect();
         let bound = canonical_binding_hashes_for(directory, issuer).await?;
@@ -9116,7 +9229,7 @@ pub async fn resolve_withdraws_admission_rule_at(
     // explicit admission path. We reach the producer key OR any
     // subject key; reaching a subject collapses into rule 3's target
     // set, so rule 4 is the producer-reaching arm.
-    {
+    if all_paths {
         let mut rule4_targets: std::collections::HashSet<String> = std::collections::HashSet::new();
         rule4_targets.insert(target.attesting_key_id.clone());
         for s in &target.subject_key_ids {
@@ -15546,22 +15659,17 @@ pub async fn check_delegated_duty_scores_admission(
         .get("community_id")
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    // v21.11.0 (CIRISPersist#517, CC 4.5.5) — resolve duty-holders from the
-    // community's NAMED MODERATORS ONLY. The prior code seeded the admissible
-    // set from the row's OWN `subject_key_ids`, so any Rooted producer could
-    // file an admissible `reconsideration:*` / `moderation:*` over any
-    // community action by naming THEMSELVES as subject — CC 4.5.5's
-    // target→duty-holder table authorizes NO subject-self clause for these two
-    // dimensions (only `takedown_notice`, on a DIFFERENT content path, gets
-    // `subject_of(content_sha256) ∪ is_named_moderator`). The §11.10 "already
-    // signed-state, leave it" note proves the SIGNER isn't spoofed; it does NOT
-    // prove the SUBJECT claim is genuine — integrity ≠ authority. If a
-    // subject-self carve-out is ever intended it must resolve against the
-    // REFERENCED prior action's signed subjects (a `subject_of`-style
-    // fail-secure resolver keyed on `references_attestation_id`), never from
-    // the row's own envelope. (`duty_holders_from_signed_subjects` is retained
-    // for that future referenced-action resolver; it is no longer reachable
-    // from this self-declared path.)
+    // v58.0.0 (CIRISPersist#1094 item 3, CC 4.5.5 subject standing;
+    // CLM-reconsideration-subject-standing) — a `reconsideration:{grounds}`
+    // FILING against a prior action admits the SUBJECT OF THE TARGET
+    // attestation beside the community's review-holders; a RULING stays with
+    // the review-holders. The subject is resolved from the REFERENCED target
+    // row as this node holds it, never from the filer's own envelope
+    // (v21.11.0 / CIRISPersist#517: integrity of a self-declared subject is
+    // not authority). [`check_reconsideration_admission`] is that decision.
+    if dimension.starts_with(RECONSIDERATION_DIMENSION_PREFIX) {
+        return check_reconsideration_admission(directory, row, dimension, community_id).await;
+    }
     // v30.10.0 (CIRISPersist#632) — SCOPE SELECTS THE RESOLVER.
     //
     // An act naming a `community_id` is community-scoped and resolves its
@@ -15606,6 +15714,137 @@ pub async fn check_delegated_duty_scores_admission(
         dimension,
     )
     .await
+}
+
+/// v58.0.0 (CIRISPersist#1094 item 3) — the envelope member a
+/// `reconsideration:{grounds}` RULING carries: its outcome (`reversed` /
+/// `partial` / `upheld`, CC 3.1.9.2). A row that carries it rules; a row
+/// without it files. Only the filing gains the subject arm (CC 4.5.5: "the
+/// ruling on it stays with the review-holders").
+pub const RECONSIDERATION_OUTCOME_MEMBER: &str = "outcome";
+
+/// v58.0.0 (CIRISPersist#1094 item 3) — the refusal token when a
+/// `reconsideration:{grounds}` names a `community_id` other than its held
+/// target's: the action's community is the TARGET's, and a filer may not
+/// point the review-holder arm at a community it moderates instead.
+/// `Error::InvalidArgument` (Python `ValueError`).
+pub const RECONSIDERATION_COMMUNITY_MISMATCH: &str = "reconsideration_community_mismatch";
+
+/// v58.0.0 (CIRISPersist#1094 item 3, CC 4.5.5; CLM-reconsideration-subject-standing)
+/// — **who may file, and who may rule, a `reconsideration:{grounds}`.**
+///
+/// The target is the row the reconsideration names by
+/// `references_attestation_id`, read from THIS node's store. The action's
+/// community `C` is the held target's `community_id` (a filing that names a
+/// different one is refused, [`RECONSIDERATION_COMMUNITY_MISMATCH`]); with no
+/// target held, `C` is the row's own `community_id` (the pre-v58 reading,
+/// unchanged).
+///
+/// - **A ruling** (the envelope carries [`RECONSIDERATION_OUTCOME_MEMBER`]):
+///   the review-holders of `C` only — `is_named_moderator(·, C, review)`, as
+///   self or through a live `review`-scoped chain from a steward-bound root.
+/// - **A filing**: the same holders ∪ [`reconsideration_target_subjects`] —
+///   the SIGNED subjects of the held target. Absence is never an admit
+///   condition: a target not held here, a licence target (its own arm,
+///   CIRISPersist#1036 item 5, out of this cut) and a target naming no
+///   subject each leave the subject arm empty, so only the review-holders
+///   remain.
+///
+/// A subject admits as itself or, under CC 4.5.5 (b), through a live
+/// `review`-scoped chain it roots, when it is steward-bound.
+///
+/// # Errors
+///
+/// [`Error::DelegatedScopeUnauthorized`] when neither arm holds;
+/// [`RECONSIDERATION_COMMUNITY_MISMATCH`]; directory reads.
+pub async fn check_reconsideration_admission(
+    directory: &dyn super::FederationDirectory,
+    row: &super::Attestation,
+    dimension: &str,
+    declared_community_id: &str,
+) -> Result<(), Error> {
+    let target = match crate::federation::precedence::references_attestation_id_from_envelope(
+        &row.attestation_envelope,
+    ) {
+        Some(id) => directory.get_attestation(id).await?,
+        None => None,
+    };
+    let community_id = match &target {
+        Some(t) => {
+            let held = t
+                .attestation_envelope
+                .get("community_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            if !declared_community_id.is_empty() && declared_community_id != held {
+                return Err(Error::InvalidArgument(format!(
+                    "{RECONSIDERATION_COMMUNITY_MISMATCH}: reconsideration {} names community \
+                     {declared_community_id:?}, its target {} is in {held:?} — the action's \
+                     community is the target's (CC 4.5.5)",
+                    row.attestation_id, t.attestation_id
+                )));
+            }
+            held.to_owned()
+        }
+        None => declared_community_id.to_owned(),
+    };
+    let mut holders =
+        duty_holders_for_community(directory, &community_id, DELEGATION_SCOPE_REVIEW).await?;
+    let is_ruling = row
+        .attestation_envelope
+        .get(RECONSIDERATION_OUTCOME_MEMBER)
+        .is_some();
+    if !is_ruling {
+        if let Some(t) = &target {
+            holders.extend(
+                reconsideration_target_subjects(directory, &row.attesting_key_id, t).await?,
+            );
+        }
+    }
+    check_moderation_admission(
+        directory,
+        &row.attesting_key_id,
+        &holders,
+        DELEGATION_SCOPE_REVIEW,
+        dimension,
+    )
+    .await
+}
+
+/// v58.0.0 (CIRISPersist#1094 item 3, CC 4.5.5) — **the subject of a
+/// reconsideration's target**, from the target row as held: its signed
+/// `subject_key_ids`, plus `filer` when the target names its subject by key
+/// digest ([`MODERATION_SUBJECT_DIGEST_ENVELOPE_FIELD`]) and the filer's
+/// registered key digests to it. Never the reconsideration's own
+/// `subject_key_ids`. Empty for a `licensure:*` target: a licensee's standing
+/// against a licence is CIRISPersist#1036 item 5's arm (A's authority set),
+/// not this one.
+///
+/// # Errors
+///
+/// A malformed subject digest on the target; directory reads.
+pub async fn reconsideration_target_subjects(
+    directory: &dyn super::FederationDirectory,
+    filer: &str,
+    target: &super::Attestation,
+) -> Result<std::collections::HashSet<String>, Error> {
+    let mut subjects = std::collections::HashSet::new();
+    if envelope_dimension(&target.attestation_envelope)
+        .is_some_and(|d| d.starts_with(crate::federation::licensure::LICENSURE_DIMENSION_PREFIX))
+    {
+        return Ok(subjects);
+    }
+    subjects.extend(target.subject_key_ids.iter().cloned());
+    if let Some(digest) = moderation_subject_digest(&target.attestation_envelope)? {
+        if let Some(rec) = directory.lookup_public_key(filer).await? {
+            if super::key_digest::Sha256Ed25519Raw::from_pubkey_base64(&rec.pubkey_ed25519_base64)
+                .is_ok_and(|d| d == digest)
+            {
+                subjects.insert(filer.to_owned());
+            }
+        }
+    }
+    Ok(subjects)
 }
 
 /// v9.0.0 (CIRISPersist#236, CC 4.4.3.4.3 / CC 3.4.7.3) — the

@@ -190,7 +190,7 @@ pub(crate) mod bodies {
 
     /// A community whose only member is `member` (a person, so a
     /// steward-bound authority root: a named moderator).
-    async fn community_of(dir: &dyn FederationDirectory, comm: &str, member: &str) {
+    pub(crate) async fn community_of(dir: &dyn FederationDirectory, comm: &str, member: &str) {
         group_of(dir, comm, &[member], None).await
     }
 

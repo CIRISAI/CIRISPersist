@@ -17185,35 +17185,28 @@ impl PyEngine {
             let agent_id_hash = agent_id_hash.to_owned();
             let signature_key_id = signature_key_id.to_owned();
 
-            let summary = py.detach(move || match &self.backend {
+            // v58.0.0 (CIRISPersist#1094 item 2, CC 4.5.3) — through the
+            // Engine: the node signs the subject's proxy grant and its
+            // `withdraws` before the store erases.
+            let backend = match &self.backend {
                 #[cfg(feature = "postgres")]
-                BackendDispatch::Postgres(pg) => {
-                    let backend = pg.clone();
-                    runtime.block_on(async move {
-                        use crate::store::Backend;
-                        backend
-                            .delete_traces_for_agent(
-                                &agent_id_hash,
-                                &signature_key_id,
-                                include_federation_key,
-                            )
-                            .await
-                    })
-                }
+                BackendDispatch::Postgres(b) => crate::engine::BackendDispatch::Postgres(b.clone()),
                 #[cfg(feature = "sqlite")]
-                BackendDispatch::Sqlite(sq) => {
-                    let backend = sq.clone();
-                    runtime.block_on(async move {
-                        use crate::store::Backend;
-                        backend
-                            .delete_traces_for_agent(
-                                &agent_id_hash,
-                                &signature_key_id,
-                                include_federation_key,
-                            )
-                            .await
-                    })
-                }
+                BackendDispatch::Sqlite(b) => crate::engine::BackendDispatch::Sqlite(b.clone()),
+            };
+            let signer = self.signer.clone();
+            let local_signer = self.local_signer.clone();
+            let summary = py.detach(move || {
+                let engine = crate::Engine::from_shared_with_local(backend, signer, local_signer);
+                runtime.block_on(async move {
+                    engine
+                        .delete_traces_for_agent(
+                            &agent_id_hash,
+                            &signature_key_id,
+                            include_federation_key,
+                        )
+                        .await
+                })
             });
             let summary = summary.map_err(erasure_err_to_py)?;
 
@@ -17240,10 +17233,16 @@ impl PyEngine {
     /// this erases the agent's ENTIRE corpus and tombstones the derived
     /// detections.
     ///
-    /// In one atomic transaction: hard-deletes `trace_events` +
-    /// `trace_llm_calls`, TOMBSTONES the derived `detection_events`
-    /// (NULLs the PII linkage + stamps `erased_at`), and emits a
-    /// `hard_case:trace_erasure` audit row. Returns a dict:
+    /// v58.0.0 (CIRISPersist#1094 item 2, CC 4.5.3) — the erasure is the
+    /// subject's `withdraws`: this node, as the CC 2.4.1.1 rule-3 proxy for a
+    /// subject who proved identity out of band TO THE CALLER, signs the proxy
+    /// grant `delegates_to(node → canonical subject, [consent_revocation])`
+    /// and one `withdraws` per detection row naming the subject; then, in one
+    /// atomic transaction, hard-deletes `trace_events` + `trace_llm_calls`,
+    /// tombstones pre-v57 silo detections in place, hard-deletes each row a
+    /// subject `withdraws` covers under a tombstone citing it (served to
+    /// peers), and records a SUBJECT-FREE `hard_case:trace_erasure` row.
+    /// Raises `NodeIdentityRequired` with no node identity. Returns a dict:
     ///
     /// ```text
     /// {
@@ -17268,27 +17267,22 @@ impl PyEngine {
             let runtime = self.runtime.clone();
             let agent_id_hash = agent_id_hash.to_owned();
 
-            let summary = py.detach(move || match &self.backend {
+            // v58.0.0 (CIRISPersist#1094 item 2, CC 4.5.3) — through the
+            // Engine: the node signs the subject's proxy grant and its
+            // `withdraws` before the store erases.
+            let backend = match &self.backend {
                 #[cfg(feature = "postgres")]
-                BackendDispatch::Postgres(pg) => {
-                    let backend = pg.clone();
-                    runtime.block_on(async move {
-                        use crate::store::Backend;
-                        backend
-                            .delete_traces_for_agent_id_hash(&agent_id_hash)
-                            .await
-                    })
-                }
+                BackendDispatch::Postgres(b) => crate::engine::BackendDispatch::Postgres(b.clone()),
                 #[cfg(feature = "sqlite")]
-                BackendDispatch::Sqlite(sq) => {
-                    let backend = sq.clone();
-                    runtime.block_on(async move {
-                        use crate::store::Backend;
-                        backend
-                            .delete_traces_for_agent_id_hash(&agent_id_hash)
-                            .await
-                    })
-                }
+                BackendDispatch::Sqlite(b) => crate::engine::BackendDispatch::Sqlite(b.clone()),
+            };
+            let signer = self.signer.clone();
+            let local_signer = self.local_signer.clone();
+            let summary = py.detach(move || {
+                let engine = crate::Engine::from_shared_with_local(backend, signer, local_signer);
+                runtime.block_on(async move {
+                    engine.delete_traces_for_agent_id_hash(&agent_id_hash).await
+                })
             });
             let summary = summary.map_err(erasure_err_to_py)?;
 

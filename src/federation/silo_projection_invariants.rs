@@ -12,8 +12,9 @@
 //!   enter the federation tier (held replication).
 //! - **I961 (`detection_events`)** — `put_detection_event` (twice, plus an
 //!   idempotent re-put and a conflicting one), then the DSAR erasure of one
-//!   detection's trace: its signed row is hard-deleted under an Art. 17
-//!   purge tombstone (never rewritten), and the rebuild is byte-equal again.
+//!   detection's trace: its signed row is hard-deleted under a tombstone
+//!   citing the subject's `withdraws` (never rewritten), and the rebuild is
+//!   byte-equal again.
 //!
 //! - **I962 (the attester refusal, lead ruling 3)** — with no node key an
 //!   erasure, a peer removal and `record_hard_case` are each refused with the
@@ -33,8 +34,10 @@
 //!   path)** — on both DSAR doors, the erased trace's signed detection row
 //!   is HARD-DELETED in the erasure's transaction and NO `detection_events`
 //!   row remains for it (no remnant: an opaque consumer payload must stay
-//!   erasable); the Art. 17 header (`ART17_ERASURE_BASIS`) is finalized and
-//!   never served; a re-put is refused TOMBSTONED; the counter counts it
+//!   erasable); v58.0.0 (#1094 item 2) — erased under the subject's
+//!   `withdraws` (the node as CC 2.4.1.1 rule-3 proxy), its tombstone header
+//!   cites that withdraws, is finalized and is SERVED; a re-put is refused
+//!   TOMBSTONED; the counter counts it
 //!   (and, on sqlite and postgres, a pre-v57 row rehomed and erased with
 //!   it); the gate holds and a re-run changes nothing.
 //!
@@ -190,10 +193,18 @@ pub(crate) mod bodies {
         crate::derived::DetectionEvent,
     )
     where
-        B: AttestationStore + crate::derived::DerivedSchema,
+        B: AttestationStore + crate::derived::DerivedSchema + crate::store::Backend,
     {
         let detector = format!("{tag}-lens");
         ts::register_hybrid_key_as(b, &detector, &detector, identity_type::LENSCORE_DETECTOR).await;
+        // v58.0.0 (#1094 item 2) — the traces first, so each row names its
+        // subject (the agent whose trace it scored).
+        b.insert_trace_events_batch(&[
+            trace_row(&format!("{tag}-trace-a"), &format!("{tag}-agent-h")),
+            trace_row(&format!("{tag}-trace-c"), &format!("{tag}-agent-c")),
+        ])
+        .await
+        .unwrap();
         let a = detection(&format!("{tag}-trace-a"), &detector);
         let c = detection(&format!("{tag}-trace-c"), &detector);
         b.put_detection_event(a.clone()).await.expect("I961: a");
@@ -293,8 +304,9 @@ pub(crate) mod bodies {
             vec![kept.clone()],
             "I961: the other detection is untouched"
         );
-        // The tombstone: under a header citing the erasure's own row, never
-        // served, and it refuses the row's re-admission.
+        // v58.0.0 (#1094 item 2) — the tombstone: under a header citing the
+        // subject's `withdraws` (never the erasure's own row), SERVED, and it
+        // refuses the row's re-admission.
         let notice = b
             .purge_tombstoned("attestation", &erased_row)
             .await
@@ -307,7 +319,7 @@ pub(crate) mod bodies {
             .expect("I961: the tombstone's header");
         assert_eq!(
             header.legal_basis,
-            crate::federation::steward_purge::ART17_ERASURE_BASIS
+            crate::federation::subject_erasure::WITHDRAWS_AUTHORITY
         );
         assert!(header.finalized_at.is_some(), "I961: finalized at once");
         assert!(
@@ -315,14 +327,20 @@ pub(crate) mod bodies {
                 .await
                 .unwrap()
                 .iter()
-                .all(|e| e.notice_id != notice),
-            "I961: an Art. 17 header is never served"
+                .any(|e| e.notice_id == notice),
+            "I961: the erasure's header is served"
         );
-        let cited: serde_json::Value = serde_json::from_str(&header.notice_jcs).unwrap();
-        let body = &cited[hard_case::BODY_MEMBER];
-        assert_eq!(body["kind"], hard_case::kind::TRACE_ERASURE);
-        assert_eq!(body["detail"]["detection_rows_erased"], 1);
-        assert_eq!(body["detail"]["selection_digest"], header.selection_digest);
+        let cited = crate::federation::subject_erasure::ErasureNotice::parse(
+            &serde_json::from_str(&header.notice_jcs).unwrap(),
+        )
+        .expect("I961: the header cites the subject's withdraws");
+        assert_eq!(cited.target_attestation_id, erased_row);
+        let withdraws = b
+            .get_attestation(&cited.withdraws_attestation_id)
+            .await
+            .unwrap()
+            .expect("I961: the cited withdraws is held");
+        assert_eq!(withdraws.withdraws_admission_rule, Some(3));
         let again = b.put_detection_event(erased.clone()).await;
         assert!(
             matches!(&again, Err(crate::derived::Error::InvalidArgument(m))
@@ -520,13 +538,15 @@ pub(crate) mod bodies {
     /// key-scoped door (`delete_traces_for_agent`) on a second trace.
     pub(crate) async fn i964_the_dsar_erasure<B>(
         b: &B,
+        node: &crate::federation::subject_erasure_invariants::bodies::Node,
         tag: &str,
         legacy: Option<uuid::Uuid>,
         expected: u64,
     ) where
-        B: AttestationStore + crate::derived::DerivedSchema + crate::store::Backend,
+        B: AttestationStore + crate::derived::DerivedSchema + crate::store::Backend + Sync,
     {
         use crate::derived::detection_row as dr;
+        use crate::federation::subject_erasure_invariants::bodies::prepare_as_node;
         let lens = format!("{tag}-lens");
         crate::federation::hard_case::test_support_hold(b, &lens).await;
         let agent = format!("{tag}-agent-h");
@@ -538,6 +558,11 @@ pub(crate) mod bodies {
         b.put_detection_event(original.clone()).await.unwrap();
         let row_id = dr::detection_attestation_id(&original.detection_id);
 
+        // v58.0.0 (#1094 item 2) — the subject's withdraws first (the node as
+        // its CC 2.4.1.1 rule-3 proxy), then the store door.
+        prepare_as_node(b, node, &agent, None)
+            .await
+            .expect("I964: the node's proxy grant and withdraws");
         let summary = b.delete_traces_for_agent_id_hash(&agent).await.unwrap();
         assert_eq!(
             summary.detection_events_tombstoned, expected,
@@ -563,20 +588,20 @@ pub(crate) mod bodies {
             .expect("I964: the tombstone's header");
         assert_eq!(
             header.legal_basis,
-            crate::federation::steward_purge::ART17_ERASURE_BASIS
+            crate::federation::subject_erasure::WITHDRAWS_AUTHORITY
         );
         assert!(
             header.finalized_at.is_some(),
             "I964: finalized at execution"
         );
-        assert_eq!(header.record_count, expected, "I964: one tombstone per row");
+        assert_eq!(header.record_count, 1, "I964: one tombstone per row");
         assert!(
             b.list_purge_executions_since(None, 100)
                 .await
                 .unwrap()
                 .iter()
-                .all(|e| e.notice_id != notice),
-            "I964: an Art. 17 header is never served"
+                .any(|e| e.notice_id == notice),
+            "I964: the erasure's header is served"
         );
         let again = b.put_detection_event(original.clone()).await;
         assert!(
@@ -606,6 +631,9 @@ pub(crate) mod bodies {
         let second = detection(&trace2, &lens);
         b.put_detection_event(second.clone()).await.unwrap();
         let row2 = dr::detection_attestation_id(&second.detection_id);
+        prepare_as_node(b, node, &agent2, Some(&format!("{agent2}-signer")))
+            .await
+            .expect("I964: the key-scoped door's withdraws");
         b.delete_traces_for_agent(&agent2, &format!("{agent2}-signer"), false)
             .await
             .unwrap();
@@ -695,6 +723,7 @@ pub(crate) mod bodies {
 mod run {
     use super::bodies;
     use crate::federation::silo_projection::{check_projection_rebuild, SiloProjection};
+    use crate::federation::subject_erasure_invariants::bodies as sub;
     use crate::store::Backend as _;
 
     fn tag(n: &str) -> String {
@@ -716,10 +745,9 @@ mod run {
         let b = crate::store::memory::MemoryBackend::new();
         let t = tag("i961m");
         let (a, c) = bodies::i961_detection(&b, &t).await;
-        let node = format!("{t}-node");
-        bodies::register_node(&b, &node).await;
-        b.set_node_key_id(&node);
-        b.insert_trace_events_batch(&[bodies::trace_row(&a.trace_id, &format!("{t}-agent-h"))])
+        let node = sub::signing_node(&b, &t).await;
+        b.set_node_key_id(&node.id);
+        sub::prepare_as_node(&b, &node, &format!("{t}-agent-h"), None)
             .await
             .unwrap();
         let summary = b
@@ -782,10 +810,9 @@ mod run {
     async fn i964_memory() {
         let b = crate::store::memory::MemoryBackend::new();
         let t = tag("i964m");
-        let node = format!("{t}-node");
-        bodies::register_node(&b, &node).await;
-        b.set_node_key_id(&node);
-        bodies::i964_the_dsar_erasure(&b, &t, None, 1).await;
+        let node = sub::signing_node(&b, &t).await;
+        b.set_node_key_id(&node.id);
+        bodies::i964_the_dsar_erasure(&b, &node, &t, None, 1).await;
     }
 
     /// Memory has no SQL to tamper with; its red is the rebuild of a map
@@ -844,10 +871,9 @@ mod run {
         let b = sqlite().await;
         let t = tag("i961s");
         let (a, c) = bodies::i961_detection(&b, &t).await;
-        let node = format!("{t}-node");
-        bodies::register_node(&b, &node).await;
-        b.set_node_key_id(&node);
-        b.insert_trace_events_batch(&[bodies::trace_row(&a.trace_id, &format!("{t}-agent-h"))])
+        let node = sub::signing_node(&b, &t).await;
+        b.set_node_key_id(&node.id);
+        sub::prepare_as_node(&b, &node, &format!("{t}-agent-h"), None)
             .await
             .unwrap();
         let summary = b
@@ -939,9 +965,8 @@ mod run {
     async fn i964_sqlite() {
         let b = sqlite().await;
         let t = tag("i964s");
-        let node = format!("{t}-node");
-        bodies::register_node(&b, &node).await;
-        b.set_node_key_id(&node);
+        let node = sub::signing_node(&b, &t).await;
+        b.set_node_key_id(&node.id);
         let lens = format!("{t}-lens");
         crate::federation::hard_case::test_support_hold(&b, &lens).await;
         // A pre-v57 detection of the same trace, as a v56 node wrote it.
@@ -957,7 +982,7 @@ mod run {
                      zeroblob(3309), '{lens}', '2026-02-03T04:05:06.654321+00:00')"
         ))
         .await;
-        bodies::i964_the_dsar_erasure(&b, &t, Some(legacy), 2).await;
+        bodies::i964_the_dsar_erasure(&b, &node, &t, Some(legacy), 2).await;
     }
 
     #[cfg(feature = "postgres")]
@@ -1002,10 +1027,9 @@ mod run {
         let Some(b) = postgres().await else { return };
         let t = tag("i961p");
         let (a, c) = bodies::i961_detection(&b, &t).await;
-        let node = format!("{t}-node");
-        bodies::register_node(&b, &node).await;
-        b.set_node_key_id(&node);
-        b.insert_trace_events_batch(&[bodies::trace_row(&a.trace_id, &format!("{t}-agent-h"))])
+        let node = sub::signing_node(&b, &t).await;
+        b.set_node_key_id(&node.id);
+        sub::prepare_as_node(&b, &node, &format!("{t}-agent-h"), None)
             .await
             .unwrap();
         let summary = b
@@ -1100,9 +1124,8 @@ mod run {
     async fn i964_postgres() {
         let Some(b) = postgres().await else { return };
         let t = tag("i964p");
-        let node = format!("{t}-node");
-        bodies::register_node(&b, &node).await;
-        b.set_node_key_id(&node);
+        let node = sub::signing_node(&b, &t).await;
+        b.set_node_key_id(&node.id);
         let lens = format!("{t}-lens");
         crate::federation::hard_case::test_support_hold(&b, &lens).await;
         let legacy = uuid::Uuid::new_v4();
@@ -1119,7 +1142,7 @@ mod run {
                      '{lens}', '2026-02-03T04:05:06.654321+00:00')"
         ))
         .await;
-        bodies::i964_the_dsar_erasure(&b, &t, Some(legacy), 2).await;
+        bodies::i964_the_dsar_erasure(&b, &node, &t, Some(legacy), 2).await;
         eprintln!("i964_postgres: RAN");
     }
 }

@@ -153,6 +153,12 @@ pub fn settles_at(execution: &PurgeExecution) -> chrono::DateTime<chrono::Utc> {
     if execution.legal_basis == STEWARD_PURGE_BASIS {
         return purge;
     }
+    // v58.0.0 (CIRISPersist#1094 item 2, CC 4.5.3) — an erasure's tombstone
+    // (the subject's `withdraws` is its authority) is destroyed on receipt:
+    // Art. 17 waits on no dwell.
+    if execution.legal_basis == super::subject_erasure::WITHDRAWS_AUTHORITY {
+        return execution.executed_at;
+    }
     match basis_disposition(&execution.legal_basis) {
         Some(TakedownDisposition::DestroyOnReceipt) => execution.executed_at,
         Some(TakedownDisposition::WithholdThenDelete { window_days }) => {
@@ -445,8 +451,11 @@ pub struct ContentBinding {
 /// names. No binding row held is [`token::CONTENT_UNBOUND`] (retryable).
 ///
 /// `legal_basis` is not consulted: every basis needs a duty-holder (operator
-/// ruling, v55 slice C). Were CC to admit an immediate-removal basis from any
-/// claimant, that is a one-line change here.
+/// ruling, v55 slice C). v58.0.0 (CIRISPersist#1094 item 3): CC 4.5.3 struck
+/// "an immediate-removal basis from any claimant" (steward ruling
+/// 2026-10-15) — step 1's duty-holder gate governs every basis, the
+/// immediate-removal ones included, so there is no basis-dependent arm to
+/// add here (I970 pins it on every backend).
 ///
 /// # Errors
 ///

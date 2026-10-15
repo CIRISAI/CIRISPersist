@@ -7,6 +7,79 @@ threat-model citations because this crate's audit story is the point.
 
 ## [Unreleased]
 
+## [58.0.0] - Unreleased
+
+### Changed — Art. 17 erasure is the subject's `withdraws`; the tombstone is the replicated fact (CIRISPersist#1094 item 2; CC 4.5.3 "Erasure at the subject's request", CLM-erasure-subject-route; CIRISConstitution#174)
+
+- **A `detection:*` row names its subject.** The detection door writes the
+  scored agent's CC 2.3.2.1 canonical hash into `subject_key_ids`:
+  `canonical:sha256:` + sha256(`ciris:agent:{agent_id_hash}`), read from the
+  trace as this node holds it (`subject_erasure::agent_subject`). A detection
+  whose trace is not held names no subject; the door never guesses one. The
+  legacy rehome names the subject the same way.
+- **The DSAR doors erase by the subject's `withdraws`, the node as the CC
+  2.4.1.1 rule-3 proxy.** `Engine::delete_traces_for_agent_id_hash` (and the
+  new `Engine::delete_traces_for_agent`; both Python surfaces now route
+  through the Engine) first signs with the node key and puts, through the
+  ordinary door, the proxy grant `delegates_to(node → canonical subject,
+  scope [consent_revocation])` and one `withdraws` per detection row that
+  names the subject; the `withdraws` gate admits it as rule 3. The grant is
+  written on the subject's out-of-band proof, which the caller owns, as the
+  DSAR-request authority always was. The store's erasure door then
+  hard-deletes exactly the rows an admitted subject `withdraws` covers
+  (`subject_erasure::plan_store_erasure`, re-derived through
+  `check_withdraws_admission_as_admitted`), each under a tombstone whose
+  header cites the withdraws (`subject_erasure::ErasureNotice`: the withdraws
+  and target ids, nothing else; `legal_basis` column `withdraws`). A row no
+  subject `withdraws` covers is left in place and counted.
+- **The tombstone replicates.** Erasure headers are served by
+  `list_purge_bundles_since` on all three backends; `Engine::apply_replicated_purge`
+  routes an erasure bundle to `subject_erasure::apply_replicated_erasure`,
+  which requires the cited `withdraws` held here (else
+  `subject_erasure_withdraws_unheld`, retryable), re-derives its admission on
+  this node's own state, and destroys the replica on receipt. v57's
+  "header never served" gap is closed.
+- **The anti-Goodhart carve-out keeps one door open.**
+  `admission::subject_revocation_paths` (one named predicate) gives a
+  `detection:*` target rule 3 alone, and only for a node-role issuer; rules 2
+  and 4 stay refused for it, `capacity:*` is unchanged. The canonical
+  recipient of the proxy grant is admitted only on that exact shape
+  (`check_attested_subject_admission_for_row`: node attester, scope exactly
+  `{consent_revocation}`).
+- **The hard case names nobody.** `hard_case:trace_erasure:v1` carries
+  `TraceErasureCounts` alone (the door, counts of traces, LLM calls,
+  detections erased and retained, and the key-scoped door's federation
+  counts): no `agent_id_hash`, no signing key, no `target_key_id`.
+- **V196** deletes the v57-shaped `hard_case:trace_erasure:v1` rows that named
+  their subject (and their projection rows), pre-v57 silo rows of that kind
+  that did, and every `art17_erasure` header with its tombstones (each
+  header's notice was such a row). This is the one place a hard_case row is
+  ever deleted: its content is what the erasure required gone, and v57.0.0
+  had no adopters. The boot logs the counts it deleted.
+
+### Changed — the subject of the target may file a reconsideration (CIRISPersist#1094 item 3; CC 4.5.5, CLM-reconsideration-subject-standing)
+
+- `admission::check_reconsideration_admission`: a `reconsideration:{grounds}`
+  FILING naming its target by `references_attestation_id` is admitted from
+  the subject of the target as this node holds it (its signed
+  `subject_key_ids`, or the filer whose key digests to its
+  `subject_sha256_ed25519_raw`) or from a review-holder of the target's
+  community. A RULING (a row carrying `outcome`) stays with the review-holders.
+  The action's community is the target's; a filing naming another is refused
+  (`reconsideration_community_mismatch`). A self-declared subject is never
+  standing; a target not held here, or a `licensure:*` target (its own arm,
+  CIRISPersist#1036 item 5), leaves the subject arm empty.
+- CC 4.5.3 struck "an immediate-removal basis from any claimant": persist had
+  no such path (`takedown_authority` never read the basis); I970 now pins
+  every immediate-removal basis to the duty-holder gate on every backend.
+
+### Removed
+
+- `steward_purge::ART17_ERASURE_BASIS`, `art17_erasure_record_ids`,
+  `art17_erasure_execution` and `hard_case::bind_erased_detection_rows`
+  (clean break, no alias): there is no node-local purge basis for erasure.
+  `hard_case::trace_erasure_event` takes `&TraceErasureCounts` now.
+
 ## [57.0.0] - 2026-10-15
 
 ### Fixed — tag CI: the restored cache repair runs `--strict` (v56.0.0 windows wheel)

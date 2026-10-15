@@ -172,14 +172,17 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("project_hard_case_row", Class::Plumbing),
     ("project_detection_row", Class::Plumbing),
     ("project_detection_row_under", Class::Plumbing),
-    // The DSAR door's Art. 17 erasure of row-backed detections: the
-    // hard-delete, the tombstone header + tombstones it builds (pure) and
-    // writes. Storage on a decision the erasure already made: Plumbing.
-    ("art17_erasure_execution", Class::Plumbing),
-    ("sqlite_art17_delete_detection_rows", Class::Plumbing),
-    ("pg_art17_delete_detection_rows", Class::Plumbing),
-    ("sqlite_put_art17_execution", Class::Plumbing),
-    ("pg_put_art17_execution", Class::Plumbing),
+    // v58.0.0 (CIRISPersist#1094 item 2) — the DSAR door's erasure of
+    // row-backed detections under the subject's `withdraws`: the hard-delete
+    // of the cited rows, the tombstone header + tombstone it builds (pure) and
+    // writes. Storage on a decision `subject_erasure::plan_store_erasure`
+    // already made: Plumbing.
+    ("erasure_execution", Class::Plumbing),
+    ("sqlite_erase_cited_rows", Class::Plumbing),
+    ("pg_erase_cited_rows", Class::Plumbing),
+    ("memory_held_citations", Class::Plumbing),
+    ("sqlite_put_erasure_execution", Class::Plumbing),
+    ("pg_put_erasure_execution", Class::Plumbing),
     // Each backend's erasure recorder plans the erasure row(s) (the shared
     // hard_case plan) and writes them with their tombstones: it carries the
     // plan's sequence.
