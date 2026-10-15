@@ -7,7 +7,7 @@ threat-model citations because this crate's audit story is the point.
 
 ## [Unreleased]
 
-## [57.0.0] - UNRELEASED
+## [57.0.0] - 2026-10-15
 
 ### Fixed — tag CI: the restored cache repair runs `--strict` (v56.0.0 windows wheel)
 
