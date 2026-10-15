@@ -124,12 +124,14 @@ pub struct DetectionProjection {
     /// The bytes the detector signed; `None` once erased.
     #[serde(with = "opt_b64")]
     pub canonical_bytes: Option<Vec<u8>>,
-    /// Ed25519 signature over `canonical_bytes`.
-    #[serde(with = "crate::federation::serde_bytes_b64")]
-    pub ed25519_sig: Vec<u8>,
-    /// ML-DSA-65 signature over `canonical_bytes`.
-    #[serde(with = "crate::federation::serde_bytes_b64")]
-    pub ml_dsa_65_sig: Vec<u8>,
+    /// Ed25519 signature over `canonical_bytes`; `None` only on an
+    /// erasure-derived tombstone ([`erased_detection_projection`]: the bytes
+    /// it covered are gone).
+    #[serde(with = "opt_b64")]
+    pub ed25519_sig: Option<Vec<u8>>,
+    /// ML-DSA-65 signature over `canonical_bytes`; `None` as above.
+    #[serde(with = "opt_b64")]
+    pub ml_dsa_65_sig: Option<Vec<u8>>,
     /// The detector's key (the row's attester).
     pub signing_key_id: String,
     /// The detection's instant.
@@ -153,8 +155,8 @@ impl From<&DetectionEvent> for DetectionProjection {
             lens_core_version: e.lens_core_version.clone(),
             ratchet_calibration_version: e.ratchet_calibration_version,
             canonical_bytes: Some(e.canonical_bytes.clone()),
-            ed25519_sig: e.ed25519_sig.clone(),
-            ml_dsa_65_sig: e.ml_dsa_65_sig.clone(),
+            ed25519_sig: Some(e.ed25519_sig.clone()),
+            ml_dsa_65_sig: Some(e.ml_dsa_65_sig.clone()),
             signing_key_id: e.signing_key_id.clone(),
             ts: e.ts,
             erased_at: None,
@@ -182,8 +184,8 @@ impl DetectionProjection {
             lens_core_version: self.lens_core_version.clone(),
             ratchet_calibration_version: self.ratchet_calibration_version,
             canonical_bytes: self.canonical_bytes.clone()?,
-            ed25519_sig: self.ed25519_sig.clone(),
-            ml_dsa_65_sig: self.ml_dsa_65_sig.clone(),
+            ed25519_sig: self.ed25519_sig.clone()?,
+            ml_dsa_65_sig: self.ml_dsa_65_sig.clone()?,
             signing_key_id: self.signing_key_id.clone(),
             ts: self.ts,
         })
@@ -224,16 +226,20 @@ pub fn detection_envelope(
 /// tombstone carries none and an `erased_at`.
 #[must_use]
 pub fn detection_shape_refusal(body: &DetectionProjection) -> Option<String> {
-    if body.ed25519_sig.len() != ED25519_SIG_LEN {
+    // A detection's row always carries both signature halves: a body
+    // without them is only ever an erasure-derived projection, never a row.
+    let ed = body.ed25519_sig.as_deref().unwrap_or_default();
+    if ed.len() != ED25519_SIG_LEN {
         return Some(format!(
             "ed25519_sig must be {ED25519_SIG_LEN} bytes (got {})",
-            body.ed25519_sig.len()
+            ed.len()
         ));
     }
-    if body.ml_dsa_65_sig.len() != ML_DSA_65_SIG_LEN {
+    let pq = body.ml_dsa_65_sig.as_deref().unwrap_or_default();
+    if pq.len() != ML_DSA_65_SIG_LEN {
         return Some(format!(
             "ml_dsa_65_sig must be {ML_DSA_65_SIG_LEN} bytes (got {})",
-            body.ml_dsa_65_sig.len()
+            pq.len()
         ));
     }
     if let Some(b) = &body.body_sha256 {
@@ -379,6 +385,149 @@ pub fn project_detection_row_under(
     })
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+//  v57.0.0 (CIRISPersist#988 item 3; lead ruling on the DSAR path) — the
+//  Art. 17 erasure's tombstones, carried by the erasure's own row
+// ─────────────────────────────────────────────────────────────────────────
+
+/// The `detail` member of a `hard_case:trace_erasure:v1` row that carries the
+/// V080 tombstone content of every detection the erasure hard-deleted.
+pub const ERASURE_DETAIL_MEMBER: &str = "detection_tombstones";
+
+/// At most this many erased detections ride one `hard_case:trace_erasure:v1`
+/// row; an erasure with more emits one row per chunk (one act, N rows, one
+/// transaction). An entry is about 0.5 KB for a typical detection (the
+/// analytics columns only: no linkage, no signatures), so 512 entries are
+/// about 256 KB, well inside `MAX_ATTESTATION_ENVELOPE_BYTES` (1 MiB).
+pub const MAX_ERASED_DETECTIONS_PER_ROW: usize = 512;
+
+/// A second bound on a chunk, by bytes: an entry's `cohort_cell` and
+/// `conformity_payload` are consumer-shaped JSON, so a chunk also closes once
+/// its serialized entries pass this many bytes (half the envelope cap).
+pub const MAX_ERASED_DETECTION_BYTES_PER_ROW: usize = 512 * 1024;
+
+/// One erased detection, as the erasure row carries it: exactly the columns
+/// V080's tombstone keeps (#222: keep the substrate analytics, drop the
+/// linkage), and neither the three linkage columns nor the signatures.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ErasedDetection {
+    /// Detection identifier.
+    pub detection_id: uuid::Uuid,
+    /// Detector token.
+    pub detector: String,
+    /// Triage bucket.
+    pub severity: DetectionSeverity,
+    /// 6-tuple cohort cell.
+    pub cohort_cell: serde_json::Value,
+    /// Manifold-conformity variant.
+    pub conformity_variant: ConformityVariant,
+    /// Variant-specific payload.
+    pub conformity_payload: serde_json::Value,
+    /// Lens-core version.
+    pub lens_core_version: String,
+    /// Calibration version.
+    pub ratchet_calibration_version: i32,
+    /// The detector's key.
+    pub signing_key_id: String,
+    /// The detection's instant.
+    pub ts: DateTime<Utc>,
+}
+
+impl From<&DetectionProjection> for ErasedDetection {
+    fn from(p: &DetectionProjection) -> Self {
+        Self {
+            detection_id: p.detection_id,
+            detector: p.detector.clone(),
+            severity: p.severity,
+            cohort_cell: p.cohort_cell.clone(),
+            conformity_variant: p.conformity_variant,
+            conformity_payload: p.conformity_payload.clone(),
+            lens_core_version: p.lens_core_version.clone(),
+            ratchet_calibration_version: p.ratchet_calibration_version,
+            signing_key_id: p.signing_key_id.clone(),
+            ts: p.ts,
+        }
+    }
+}
+
+/// The V080 tombstone row an erased detection projects to: linkage and
+/// signatures NULL, analytics kept, `erased_at` = the erasure row's
+/// `asserted_at`.
+#[must_use]
+pub fn erased_detection_projection(
+    e: &ErasedDetection,
+    erased_at: DateTime<Utc>,
+) -> DetectionProjection {
+    DetectionProjection {
+        detection_id: e.detection_id,
+        trace_id: None,
+        body_sha256: None,
+        detector: e.detector.clone(),
+        severity: e.severity,
+        cohort_cell: e.cohort_cell.clone(),
+        conformity_variant: e.conformity_variant,
+        conformity_payload: e.conformity_payload.clone(),
+        lens_core_version: e.lens_core_version.clone(),
+        ratchet_calibration_version: e.ratchet_calibration_version,
+        canonical_bytes: None,
+        ed25519_sig: None,
+        ml_dsa_65_sig: None,
+        signing_key_id: e.signing_key_id.clone(),
+        ts: e.ts,
+        erased_at: Some(erased_at),
+    }
+}
+
+/// v57.0.0 — **the projection of an erasure row** (CLM-silo-projection-
+/// rebuildable): the V080 tombstone of every detection a
+/// `hard_case:trace_erasure:v1` row carries, at the row's `asserted_at`.
+/// The one function the erasure's live write and the rebuild call. Empty for
+/// any other row.
+#[must_use]
+pub fn project_erasure_row(row: &Attestation) -> Vec<DetectionProjection> {
+    let Some(event) = crate::federation::hard_case::project_hard_case_row(row) else {
+        return Vec::new();
+    };
+    if event.kind != crate::federation::hard_case::kind::TRACE_ERASURE {
+        return Vec::new();
+    }
+    let Some(entries) = event.detail.get(ERASURE_DETAIL_MEMBER) else {
+        return Vec::new();
+    };
+    let entries: Vec<ErasedDetection> = serde_json::from_value(entries.clone()).unwrap_or_default();
+    entries
+        .iter()
+        .map(|e| erased_detection_projection(e, row.asserted_at))
+        .collect()
+}
+
+/// v57.0.0 — split an erasure's tombstone entries into chunks, each within
+/// [`MAX_ERASED_DETECTIONS_PER_ROW`] entries and
+/// [`MAX_ERASED_DETECTION_BYTES_PER_ROW`] serialized bytes (a single entry
+/// larger than the byte bound rides alone). Order kept.
+#[must_use]
+pub fn chunk_erased_detections(entries: Vec<ErasedDetection>) -> Vec<Vec<ErasedDetection>> {
+    let mut out: Vec<Vec<ErasedDetection>> = Vec::new();
+    let mut cur: Vec<ErasedDetection> = Vec::new();
+    let mut cur_bytes = 0usize;
+    for e in entries {
+        let n = serde_json::to_vec(&e).map(|v| v.len()).unwrap_or(0);
+        if !cur.is_empty()
+            && (cur.len() >= MAX_ERASED_DETECTIONS_PER_ROW
+                || cur_bytes + n > MAX_ERASED_DETECTION_BYTES_PER_ROW)
+        {
+            out.push(std::mem::take(&mut cur));
+            cur_bytes = 0;
+        }
+        cur_bytes += n;
+        cur.push(e);
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
 /// A refusal of the detection door, in the `DerivedSchema` error tree: a
 /// conflict stays a conflict, a substrate failure stays `Backend`, and every
 /// admission refusal is the caller's (`InvalidArgument`, the type V008's
@@ -443,7 +592,7 @@ mod tests {
         };
         assert!(detection_shape_refusal(&half).is_some());
         let short = DetectionProjection {
-            ml_dsa_65_sig: vec![0u8; 3293],
+            ml_dsa_65_sig: Some(vec![0u8; 3293]),
             ..p
         };
         assert!(detection_shape_refusal(&short).is_some());

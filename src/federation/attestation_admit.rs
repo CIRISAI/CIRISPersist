@@ -1659,14 +1659,13 @@ where
     Ok(attester)
 }
 
-/// v57.0.0 (CIRISPersist#988 item 2) — what an emitter does when this node
-/// has no attester for the row ([`hard_case_attester`] refused).
+/// v57.0.0 (CIRISPersist#988 item 2) — what an in-transaction emitter does
+/// when this node has no attester for the row ([`hard_case_attester`]
+/// refused). Every ACT (an erasure, a peer removal, `record_hard_case`)
+/// resolves its attester before it moves anything and refuses typed there,
+/// so the only in-transaction emitter left without one is an observation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HardCaseEmitter {
-    /// An act this node performs and records (an erasure, a peer removal, an
-    /// admin action): refused, so the act is undone rather than done
-    /// unaudited.
-    Act,
     /// An observation riding on a row being admitted (a membership removal
     /// applied from a peer): not recorded, and the admission proceeds. A node
     /// with no identity cannot attest what it saw, and refusing the removal
@@ -1675,11 +1674,9 @@ pub(crate) enum HardCaseEmitter {
 }
 
 impl HardCaseEmitter {
-    /// The outcome without an attester: `Err(message)` for an act, `Ok(())`
-    /// (logged) for an observation.
+    /// The outcome without an attester: logged, and the admission proceeds.
     pub(crate) fn without_attester(self, event_id: &str, refusal: &str) -> Result<(), String> {
         match self {
-            Self::Act => Err(refusal.to_owned()),
             Self::Observation => {
                 tracing::warn!(
                     event_id,

@@ -2192,11 +2192,9 @@ impl Backend for MemoryBackend {
         // An act: refused, typed, before anything moves when this node cannot
         // attest its audit row (CIRISPersist#988 ruling: a host must hold a
         // node key before any erasure is recorded).
-        let attester: Result<_, String> = Ok(
-            crate::federation::attestation_admit::hard_case_attester(self)
-                .await
-                .map_err(Error::from_hard_case_attester)?,
-        );
+        let attester = crate::federation::attestation_admit::hard_case_attester(self)
+            .await
+            .map_err(Error::from_hard_case_attester)?;
         let received_at = chrono::Utc::now();
         let mut state = self.state.lock().expect("memory backend lock");
         // Per-key DSAR scope: both agent_id_hash AND signing_key_id
@@ -2212,6 +2210,17 @@ impl Backend for MemoryBackend {
             .filter(|(_, row)| row_matches(row))
             .map(|(_, row)| row.trace_id.clone())
             .collect();
+        // v57.0.0 (CIRISPersist#988 item 3; lead ruling on the DSAR path) —
+        // the erased traces' row-backed detections are hard-deleted and their
+        // V080 tombstones ride the erasure's own row. Decided BEFORE anything
+        // moves: found, then the audit rows planned, then applied.
+        let (erased_rows, erased) = memory_find_detection_rows(&state, &target_trace_ids);
+        let detection_events_tombstoned = erased_rows.len() as u64;
+        let erased_plan = if erased_rows.is_empty() {
+            None
+        } else {
+            Some(erased)
+        };
 
         let trace_events_before = state.events.len();
         state.events.retain(|_, (_, row)| !row_matches(row));
@@ -2299,8 +2308,9 @@ impl Backend for MemoryBackend {
             || federation_keys_deleted > 0
             || federation_attestations_deleted > 0
             || federation_revocations_deleted > 0
+            || detection_events_tombstoned > 0
         {
-            let event = crate::federation::hard_case::HardCaseEvent {
+            let base = crate::federation::hard_case::HardCaseEvent {
                 event_id: uuid::Uuid::new_v4().to_string(),
                 kind: crate::federation::hard_case::kind::TRACE_ERASURE.to_owned(),
                 target_key_id: Some(agent_id_hash.to_owned()),
@@ -2314,17 +2324,19 @@ impl Backend for MemoryBackend {
                     "federation_keys": federation_keys_deleted,
                     "federation_attestations": federation_attestations_deleted,
                     "federation_revocations": federation_revocations_deleted,
+                    "detection_events_tombstoned": detection_events_tombstoned,
                 }),
                 emitted_at: received_at,
             };
-            memory_record_hard_case_in_state(
-                &mut state,
+            let plan = memory_plan_erasure(
                 &attester,
-                crate::federation::attestation_admit::HardCaseEmitter::Act,
-                &event,
+                base,
+                &erased_rows,
+                erased_plan.unwrap_or_default(),
                 received_at,
             )
             .map_err(|e| Error::Backend(format!("dsar: {e}")))?;
+            memory_apply_erasure(&mut state, &erased_rows, plan);
         }
 
         Ok(super::types::DeleteSummary {
@@ -2348,6 +2360,16 @@ impl Backend for MemoryBackend {
         let attester = crate::federation::attestation_admit::hard_case_attester(self)
             .await
             .map_err(Error::from_hard_case_attester)?;
+        // v57.0.0 (#988 item 3) — a pre-v57 detection this node can attest
+        // to its detector is moved onto the plane first, so the erasure
+        // below takes it the row way (hard delete + its V080 tombstone on
+        // the erasure row) and the table stays its rows' rebuild.
+        {
+            use crate::federation::attestation_admit::AttestationStore as _;
+            self.rehome_legacy_detection_events(chrono::Utc::now())
+                .await
+                .map_err(|e| Error::Backend(format!("rehome before erasure: {e}")))?;
+        }
         let erased_at = chrono::Utc::now();
         let mut state = self.state.lock().expect("memory backend lock");
 
@@ -2379,49 +2401,20 @@ impl Backend for MemoryBackend {
         // HARD-DELETED (the DSAR door's treatment of signed rows), never
         // rewritten, under a purge tombstone (`ART17_ERASURE_BASIS`). Memory
         // holds no pre-v57 silo rows.
-        let erased_rows: Vec<String> = state
-            .derived_detection_events
-            .values()
-            .filter(|(_, p)| {
-                p.trace_id
-                    .as_ref()
-                    .is_some_and(|t| target_trace_ids.contains(t))
-            })
-            .map(|(id, _)| id.clone())
-            .collect();
+        let (erased_rows, erased) = memory_find_detection_rows(&state, &target_trace_ids);
         let detection_events_tombstoned = erased_rows.len() as u64;
-        let record = if trace_events > 0 || trace_llm_calls > 0 || detection_events_tombstoned > 0 {
-            let event = crate::federation::hard_case::trace_erasure_event(
+        let plan = if trace_events > 0 || trace_llm_calls > 0 || detection_events_tombstoned > 0 {
+            let base = crate::federation::hard_case::trace_erasure_event(
                 agent_id_hash,
                 trace_events,
                 trace_llm_calls,
                 detection_events_tombstoned,
-                &erased_rows,
                 erased_at,
             );
-            let planned = crate::federation::attestation_admit::plan_hard_case_row(
-                &event,
-                &attester,
-                crate::federation::attestation_admit::PlanInstants {
-                    fold_at: erased_at,
-                    received_at: erased_at,
-                },
-            )
-            .map_err(|e| Error::Backend(format!("erasure: {}: {e}", e.kind())))?;
-            let tombstones = if erased_rows.is_empty() {
-                None
-            } else {
-                Some(
-                    crate::federation::steward_purge::art17_erasure_execution(
-                        &planned.row,
-                        &erased_rows,
-                        &attester.key_id,
-                        erased_at,
-                    )
+            Some(
+                memory_plan_erasure(&attester, base, &erased_rows, erased, erased_at)
                     .map_err(|e| Error::Backend(format!("erasure: {e}")))?,
-                )
-            };
-            Some((planned, tombstones))
+            )
         } else {
             None
         };
@@ -2432,37 +2425,9 @@ impl Backend for MemoryBackend {
         state
             .llm_calls
             .retain(|row| !target_trace_ids.contains(&row.trace_id));
-        for id in &erased_rows {
-            let record_key = crate::federation::wire_index::record_key(&[("attestation_id", id)]);
-            state
-                .signed_wire_index
-                .retain(|(kind, _), rk| !(kind == "Attestation" && *rk == record_key));
-            state
-                .federation_attestations
-                .retain(|a| &a.attestation_id != id);
-        }
-        prune_row_projections(&mut state);
-        if let Some((planned, tombstones)) = record {
-            memory_store_hard_case(&mut state, planned);
-            if let Some((mut execution, tombstones)) = tombstones {
-                let last = state.purge_executions.values().map(|e| e.admitted_at).max();
-                execution.admitted_at =
-                    crate::federation::types::monotonic_admission_instant(chrono::Utc::now(), last);
-                state
-                    .purge_executions
-                    .entry(execution.notice_id.clone())
-                    .or_insert(execution);
-                for t in tombstones {
-                    state.purge_tombstones.insert(
-                        (
-                            t.notice_id.clone(),
-                            t.plane.as_str().to_owned(),
-                            t.record_ref.clone(),
-                        ),
-                        t,
-                    );
-                }
-            }
+        match plan {
+            Some(plan) => memory_apply_erasure(&mut state, &erased_rows, plan),
+            None => memory_apply_erasure(&mut state, &erased_rows, MemoryErasurePlan::default()),
         }
 
         Ok(super::types::ErasureSummary {
@@ -3304,12 +3269,15 @@ impl crate::federation::attestation_admit::AttestationStore for MemoryBackend {
                 let rebuilt = state
                     .federation_attestations
                     .iter()
-                    .filter_map(|row| {
+                    .flat_map(|row| {
                         crate::derived::detection_row::project_detection_row_under(
                             row,
                             memory_detection_tombstone_instant(&state, &row.attestation_id),
                         )
+                        .into_iter()
+                        .chain(crate::derived::detection_row::project_erasure_row(row))
                         .map(|p| (p.detection_id.to_string(), (row.attestation_id.clone(), p)))
+                        .collect::<Vec<_>>()
                     })
                     .collect();
                 (render(live)?, render(rebuilt)?)
@@ -11117,10 +11085,19 @@ fn memory_store_hard_case(
 ) {
     let crate::federation::attestation_admit::PlannedHardCase { row, projection } = planned;
     let attestation_id = row.attestation_id.clone();
+    // v57.0.0 (#988 item 3) — an erasure row also projects the V080
+    // tombstone of every detection it erased.
+    let erased = crate::derived::detection_row::project_erasure_row(&row);
     if memory_insert_local_row(state, row, None) {
-        state
-            .federation_hard_case_events
-            .insert(projection.event_id.clone(), (attestation_id, projection));
+        state.federation_hard_case_events.insert(
+            projection.event_id.clone(),
+            (attestation_id.clone(), projection),
+        );
+        for p in erased {
+            state
+                .derived_detection_events
+                .insert(p.detection_id.to_string(), (attestation_id.clone(), p));
+        }
     }
 }
 
@@ -11184,6 +11161,124 @@ fn memory_detection_tombstone_instant(
         .filter_map(|((notice, _, _), _)| state.purge_executions.get(notice))
         .min_by(|a, b| (a.admitted_at, &a.notice_id).cmp(&(b.admitted_at, &b.notice_id)))
         .map(|e| e.executed_at)
+}
+
+/// v57.0.0 (CIRISPersist#988 item 3; lead ruling on the DSAR path) — the
+/// row-backed detections of `trace_ids`, found by the ROW's own body
+/// (`detection.trace_id`): their ids and their V080 tombstone content.
+/// Nothing moves.
+fn memory_find_detection_rows(
+    state: &State,
+    trace_ids: &HashSet<String>,
+) -> (
+    Vec<String>,
+    Vec<crate::derived::detection_row::ErasedDetection>,
+) {
+    let mut found: Vec<(String, crate::derived::detection_row::ErasedDetection)> = state
+        .federation_attestations
+        .iter()
+        .filter_map(|row| {
+            let p = crate::derived::detection_row::project_detection_row(row)?;
+            p.trace_id
+                .as_ref()
+                .is_some_and(|t| trace_ids.contains(t))
+                .then(|| {
+                    (
+                        row.attestation_id.clone(),
+                        crate::derived::detection_row::ErasedDetection::from(&p),
+                    )
+                })
+        })
+        .collect();
+    found.sort_by(|a, b| a.0.cmp(&b.0));
+    found.into_iter().unzip()
+}
+
+/// What a memory erasure writes, decided before anything moves.
+#[derive(Default)]
+struct MemoryErasurePlan {
+    rows: Vec<crate::federation::attestation_admit::PlannedHardCase>,
+    tombstones: Option<(
+        crate::federation::steward_purge::PurgeExecution,
+        Vec<crate::federation::steward_purge::PurgeTombstone>,
+    )>,
+}
+
+/// Plan an erasure's `hard_case:trace_erasure:v1` row(s) (one per chunk of
+/// erased detections) and, when it erased row-backed detections, its Art. 17
+/// purge tombstone header citing the first row.
+fn memory_plan_erasure(
+    attester: &crate::federation::attestation_admit::HardCaseAttester,
+    base: crate::federation::hard_case::HardCaseEvent,
+    erased_rows: &[String],
+    erased: Vec<crate::derived::detection_row::ErasedDetection>,
+    at: chrono::DateTime<chrono::Utc>,
+) -> Result<MemoryErasurePlan, String> {
+    let mut rows = Vec::new();
+    for event in crate::federation::hard_case::with_erasure_chunks(base, erased_rows, erased) {
+        rows.push(
+            crate::federation::attestation_admit::plan_hard_case_row(
+                &event,
+                attester,
+                crate::federation::attestation_admit::PlanInstants {
+                    fold_at: at,
+                    received_at: at,
+                },
+            )
+            .map_err(|e| format!("{}: {e}", e.kind()))?,
+        );
+    }
+    let tombstones = match (rows.first(), erased_rows.is_empty()) {
+        (Some(first), false) => Some(
+            crate::federation::steward_purge::art17_erasure_execution(
+                &first.row,
+                erased_rows,
+                &attester.key_id,
+                at,
+            )
+            .map_err(|e| e.to_string())?,
+        ),
+        _ => None,
+    };
+    Ok(MemoryErasurePlan { rows, tombstones })
+}
+
+/// Apply a planned erasure under the lock: hard-delete the erased detection
+/// rows (their projection entries follow), store the erasure row(s) (whose
+/// writer projects the V080 tombstones), write the Art. 17 tombstones.
+fn memory_apply_erasure(state: &mut State, erased_rows: &[String], plan: MemoryErasurePlan) {
+    for id in erased_rows {
+        let record_key = crate::federation::wire_index::record_key(&[("attestation_id", id)]);
+        state
+            .signed_wire_index
+            .retain(|(kind, _), rk| !(kind == "Attestation" && *rk == record_key));
+        state
+            .federation_attestations
+            .retain(|a| &a.attestation_id != id);
+    }
+    prune_row_projections(state);
+    for planned in plan.rows {
+        memory_store_hard_case(state, planned);
+    }
+    if let Some((mut execution, tombstones)) = plan.tombstones {
+        let last = state.purge_executions.values().map(|e| e.admitted_at).max();
+        execution.admitted_at =
+            crate::federation::types::monotonic_admission_instant(chrono::Utc::now(), last);
+        state
+            .purge_executions
+            .entry(execution.notice_id.clone())
+            .or_insert(execution);
+        for t in tombstones {
+            state.purge_tombstones.insert(
+                (
+                    t.notice_id.clone(),
+                    t.plane.as_str().to_owned(),
+                    t.record_ref.clone(),
+                ),
+                t,
+            );
+        }
+    }
 }
 
 /// v57.0.0 (CIRISPersist#988, V194/V195 mirror) — the SQL backends' `ON

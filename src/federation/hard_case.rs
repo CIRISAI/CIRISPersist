@@ -587,40 +587,76 @@ pub fn membership_removed_event(
 }
 
 /// v57.0.0 (CIRISPersist#988 item 3) — the DSAR erasure's
-/// `hard_case:trace_erasure:v1` event, one builder for all three backends.
-/// When the erasure hard-deleted row-backed detections, the event names how
-/// many and binds their tombstone selection (`selection_digest`, the digest
-/// of the `attestation:{id}` record ids): the row is the notice the
-/// erasure's tombstone header cites (`steward_purge::ART17_ERASURE_BASIS`).
+/// `hard_case:trace_erasure:v1` event (the counts), one builder for all three
+/// backends. [`with_erasure_chunks`] then adds the erased detections.
 #[must_use]
 pub fn trace_erasure_event(
     agent_id_hash: &str,
     trace_events: u64,
     trace_llm_calls: u64,
     detection_events_tombstoned: u64,
-    erased_detection_rows: &[String],
     erased_at: DateTime<Utc>,
 ) -> HardCaseEvent {
-    let mut detail = serde_json::json!({
-        "agent_id_hash": agent_id_hash,
-        "trace_events": trace_events,
-        "trace_llm_calls": trace_llm_calls,
-        "detection_events_tombstoned": detection_events_tombstoned,
-    });
-    if !erased_detection_rows.is_empty() {
-        let ids = super::steward_purge::art17_erasure_record_ids(erased_detection_rows);
-        detail["detection_rows_erased"] = serde_json::json!(ids.len());
-        detail["selection_digest"] =
-            serde_json::json!(super::steward_purge::selection_digest(&ids));
-    }
     HardCaseEvent {
         event_id: uuid::Uuid::new_v4().to_string(),
         kind: kind::TRACE_ERASURE.to_owned(),
         target_key_id: Some(agent_id_hash.to_owned()),
         subject_key_id: None,
-        detail,
+        detail: serde_json::json!({
+            "agent_id_hash": agent_id_hash,
+            "trace_events": trace_events,
+            "trace_llm_calls": trace_llm_calls,
+            "detection_events_tombstoned": detection_events_tombstoned,
+        }),
         emitted_at: erased_at,
     }
+}
+
+/// v57.0.0 (CIRISPersist#988 item 3; lead ruling on the DSAR path) — **one
+/// erasure act, N rows.** `base` is the erasure's `trace_erasure` event (the
+/// counts). When it hard-deleted row-backed detections (`erased_rows`, their
+/// row ids; `erased`, their V080 tombstone content), the base event binds
+/// the set (`detection_rows_erased`, `selection_digest` of the
+/// `attestation:{id}` record ids) and carries the first chunk of `erased`
+/// under [`crate::derived::detection_row::ERASURE_DETAIL_MEMBER`]; each
+/// further chunk is its own `trace_erasure` event, id `{base}#{k}`,
+/// `chunk_of` naming the base. Chunks are bounded by
+/// [`crate::derived::detection_row::chunk_erased_detections`].
+#[must_use]
+pub fn with_erasure_chunks(
+    mut base: HardCaseEvent,
+    erased_rows: &[String],
+    erased: Vec<crate::derived::detection_row::ErasedDetection>,
+) -> Vec<HardCaseEvent> {
+    use crate::derived::detection_row::{chunk_erased_detections, ERASURE_DETAIL_MEMBER};
+    if erased_rows.is_empty() {
+        return vec![base];
+    }
+    let ids = super::steward_purge::art17_erasure_record_ids(erased_rows);
+    base.detail["detection_rows_erased"] = serde_json::json!(ids.len());
+    base.detail["selection_digest"] =
+        serde_json::json!(super::steward_purge::selection_digest(&ids));
+    let mut chunks = chunk_erased_detections(erased).into_iter();
+    let first = chunks.next().unwrap_or_default();
+    let rest: Vec<_> = chunks.collect();
+    base.detail["chunks"] = serde_json::json!(1 + rest.len());
+    base.detail[ERASURE_DETAIL_MEMBER] = serde_json::json!(first);
+    let mut out = vec![base.clone()];
+    for (k, chunk) in rest.into_iter().enumerate() {
+        out.push(HardCaseEvent {
+            event_id: format!("{}#{}", base.event_id, k + 1),
+            kind: base.kind.clone(),
+            target_key_id: base.target_key_id.clone(),
+            subject_key_id: None,
+            detail: serde_json::json!({
+                "chunk_of": base.event_id,
+                "chunk": k + 1,
+                ERASURE_DETAIL_MEMBER: chunk,
+            }),
+            emitted_at: base.emitted_at,
+        });
+    }
+    out
 }
 
 /// Deterministic `event_id` for a [`kind::RECIPIENT_EXCLUDED`] emission
@@ -811,6 +847,30 @@ pub fn check_hard_case_replication_held(
         }
         _ => Ok(()),
     }
+}
+
+/// Test support: hold `key_id` as a `lenscore_detector` key (a detection
+/// row's attester).
+#[cfg(test)]
+pub(crate) async fn test_support_hold<D>(dir: &D, key_id: &str)
+where
+    D: crate::federation::FederationDirectory + ?Sized,
+{
+    if dir
+        .lookup_public_key(key_id)
+        .await
+        .expect("lookup")
+        .is_some()
+    {
+        return;
+    }
+    crate::federation::tier_ingest::test_support::register_hybrid_key_as(
+        dir,
+        key_id,
+        key_id,
+        crate::federation::types::identity_type::LENSCORE_DETECTOR,
+    )
+    .await;
 }
 
 /// Test support: give a bare backend the node identity a hard_case row needs.

@@ -29,6 +29,16 @@
 //!   postgres; memory holds no pre-v57 rows and its rehome is a declared
 //!   no-op (`store::parity`), asserted here.
 //!
+//! - **I964 (the DSAR erasure of a detection, lead ruling on the DSAR
+//!   path)** — the erased trace's signed detection row is HARD-DELETED in
+//!   the erasure's transaction; its V080 tombstone (linkage and signatures
+//!   NULL, analytics equal to the original, `erased_at` = the erasure row's
+//!   `asserted_at`) rides the `hard_case:trace_erasure:v1` row and is the
+//!   projection rebuilt from it; the counter counts it (and, on sqlite and
+//!   postgres, a pre-v57 row erased with it); the gate holds, a re-run
+//!   changes nothing; past `MAX_ERASED_DETECTIONS_PER_ROW` the act writes
+//!   one row per chunk and the gate still holds.
+//!
 //! Each runner then TAMPERS with the live table (one column of one row) and
 //! asserts the gate goes red: a witness that cannot fail is a report.
 
@@ -505,6 +515,177 @@ pub(crate) mod bodies {
             .expect("I963: still its rows' rebuild");
     }
 
+    /// I964 — the DSAR erasure of a trace with a row-backed detection (and,
+    /// when the runner seeded one, a pre-v57 detection of the same trace):
+    /// `expected` is the counter the erasure must report.
+    pub(crate) async fn i964_the_dsar_erasure<B>(b: &B, tag: &str, expected: u64)
+    where
+        B: AttestationStore + crate::derived::DerivedSchema + crate::store::Backend,
+    {
+        use crate::derived::detection_row as dr;
+        let lens = format!("{tag}-lens");
+        crate::federation::hard_case::test_support_hold(b, &lens).await;
+        let agent = format!("{tag}-agent-h");
+        let trace = format!("{tag}-trace");
+        b.insert_trace_events_batch(&[trace_row(&trace, &agent)])
+            .await
+            .unwrap();
+        let original = detection(&trace, &lens);
+        b.put_detection_event(original.clone()).await.unwrap();
+        let row_id = dr::detection_attestation_id(&original.detection_id);
+
+        let summary = b.delete_traces_for_agent_id_hash(&agent).await.unwrap();
+        assert_eq!(
+            summary.detection_events_tombstoned, expected,
+            "I964: the counter"
+        );
+        assert!(
+            b.get_attestation(&row_id).await.unwrap().is_none(),
+            "I964: the signed row is hard-deleted"
+        );
+        // The erasure row carries the tombstone; its projection is the V080
+        // tombstone, and the live table is that rebuild.
+        let erasures = b
+            .list_hard_case_events(hard_case::HardCaseFilter {
+                kind: Some(hard_case::kind::TRACE_ERASURE.to_owned()),
+                since: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(erasures.len(), 1, "I964: one erasure row");
+        let erasure = b
+            .get_attestation(&hard_case::hard_case_attestation_id(&erasures[0].event_id))
+            .await
+            .unwrap()
+            .expect("I964: the erasure row");
+        let tombs = dr::project_erasure_row(&erasure);
+        assert_eq!(
+            tombs.len() as u64,
+            expected,
+            "I964: one tombstone per erased detection"
+        );
+        let t = tombs
+            .iter()
+            .find(|t| t.detection_id == original.detection_id)
+            .expect("I964: the row-backed detection's tombstone");
+        assert_eq!(
+            (&t.trace_id, &t.body_sha256, &t.canonical_bytes),
+            (&None, &None, &None),
+            "I964: no linkage"
+        );
+        assert_eq!(
+            (&t.ed25519_sig, &t.ml_dsa_65_sig),
+            (&None, &None),
+            "I964: no signatures"
+        );
+        assert_eq!(
+            (
+                &t.detector,
+                t.severity,
+                &t.cohort_cell,
+                t.conformity_variant,
+                &t.conformity_payload,
+                &t.lens_core_version,
+                t.ratchet_calibration_version,
+                &t.signing_key_id,
+                t.ts,
+            ),
+            (
+                &original.detector,
+                original.severity,
+                &original.cohort_cell,
+                original.conformity_variant,
+                &original.conformity_payload,
+                &original.lens_core_version,
+                original.ratchet_calibration_version,
+                &original.signing_key_id,
+                original.ts,
+            ),
+            "I964: the analytics are the original's"
+        );
+        assert_eq!(t.erased_at, Some(erasure.asserted_at), "I964: erased_at");
+        let detail = &erasures[0].detail;
+        for linkage in [
+            "trace_id",
+            "body_sha256",
+            "canonical_bytes",
+            "ed25519_sig",
+            "ml_dsa_65_sig",
+        ] {
+            assert!(
+                !detail.to_string().contains(&format!("\"{linkage}\"")),
+                "I964: the erasure row carries no `{linkage}`"
+            );
+        }
+        check_projection_rebuild(b, SiloProjection::DetectionEvents)
+            .await
+            .expect("I964: detection_events is its rows' rebuild after the erasure");
+        // A re-run changes nothing.
+        let again = b.delete_traces_for_agent_id_hash(&agent).await.unwrap();
+        assert_eq!(
+            (again.trace_events, again.detection_events_tombstoned),
+            (0, 0),
+            "I964: a re-run is a no-op"
+        );
+        check_projection_rebuild(b, SiloProjection::DetectionEvents)
+            .await
+            .expect("I964: still its rows' rebuild");
+    }
+
+    /// I964, the chunk leg — an erasure of more detections than one row may
+    /// carry writes one row per chunk; the gate holds.
+    pub(crate) async fn i964_chunks<B>(b: &B, tag: &str)
+    where
+        B: AttestationStore + crate::derived::DerivedSchema + crate::store::Backend,
+    {
+        use crate::derived::detection_row as dr;
+        let lens = format!("{tag}-lens");
+        crate::federation::hard_case::test_support_hold(b, &lens).await;
+        let agent = format!("{tag}-agent-h");
+        let trace = format!("{tag}-trace");
+        b.insert_trace_events_batch(&[trace_row(&trace, &agent)])
+            .await
+            .unwrap();
+        let n = dr::MAX_ERASED_DETECTIONS_PER_ROW + 3;
+        for _ in 0..n {
+            b.put_detection_event(detection(&trace, &lens))
+                .await
+                .unwrap();
+        }
+        let summary = b.delete_traces_for_agent_id_hash(&agent).await.unwrap();
+        assert_eq!(
+            summary.detection_events_tombstoned, n as u64,
+            "I964 chunks: the counter"
+        );
+        let erasures = b
+            .list_hard_case_events(hard_case::HardCaseFilter {
+                kind: Some(hard_case::kind::TRACE_ERASURE.to_owned()),
+                since: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(erasures.len(), 2, "I964 chunks: one act, two rows");
+        let mut carried = 0usize;
+        for e in &erasures {
+            let row = b
+                .get_attestation(&hard_case::hard_case_attestation_id(&e.event_id))
+                .await
+                .unwrap()
+                .unwrap();
+            carried += dr::project_erasure_row(&row).len();
+        }
+        assert_eq!(
+            carried, n,
+            "I964 chunks: every erased detection rides a chunk"
+        );
+        check_projection_rebuild(b, SiloProjection::DetectionEvents)
+            .await
+            .expect("I964 chunks: detection_events is its rows' rebuild");
+        check_projection_rebuild(b, SiloProjection::HardCaseEvents)
+            .await
+            .expect("I964 chunks: hard_case_events is its rows' rebuild");
+    }
+
     /// A trace event row for `agent` on `trace`, so the erasure has something
     /// to erase.
     pub(crate) fn trace_row(trace: &str, agent: &str) -> crate::store::TraceEventRow {
@@ -638,6 +819,26 @@ mod run {
         check_projection_rebuild(&b, SiloProjection::HardCaseEvents)
             .await
             .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn i964_memory() {
+        let b = crate::store::memory::MemoryBackend::new();
+        let t = tag("i964m");
+        let node = format!("{t}-node");
+        bodies::register_node(&b, &node).await;
+        b.set_node_key_id(&node);
+        bodies::i964_the_dsar_erasure(&b, &t, 1).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn i964_memory_chunks() {
+        let b = crate::store::memory::MemoryBackend::new();
+        let t = tag("i964mc");
+        let node = format!("{t}-node");
+        bodies::register_node(&b, &node).await;
+        b.set_node_key_id(&node);
+        bodies::i964_chunks(&b, &t).await;
     }
 
     /// Memory has no SQL to tamper with; its red is the rebuild of a map
@@ -786,6 +987,43 @@ mod run {
         .await;
     }
 
+    #[cfg(feature = "sqlite")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn i964_sqlite() {
+        let b = sqlite().await;
+        let t = tag("i964s");
+        let node = format!("{t}-node");
+        bodies::register_node(&b, &node).await;
+        b.set_node_key_id(&node);
+        let lens = format!("{t}-lens");
+        crate::federation::hard_case::test_support_hold(&b, &lens).await;
+        // A pre-v57 detection of the same trace, as a v56 node wrote it.
+        b.test_execute(&format!(
+            "INSERT INTO cirislens_derived_detection_events \
+                (detection_id, trace_id, body_sha256, detector, severity, cohort_cell, \
+                 conformity_variant, conformity_payload, lens_core_version, \
+                 ratchet_calibration_version, canonical_bytes, ed25519_sig, ml_dsa_65_sig, \
+                 signing_key_id, ts) \
+             VALUES ('{}', '{t}-trace', zeroblob(32), 'manifold_conformity_outlier', 'info', \
+                     '{{}}', 'numeric', '{{}}', '1', 1, x'7b7d', zeroblob(64), \
+                     zeroblob(3309), '{lens}', '2026-02-03T04:05:06.654321+00:00')",
+            uuid::Uuid::new_v4()
+        ))
+        .await;
+        bodies::i964_the_dsar_erasure(&b, &t, 2).await;
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn i964_sqlite_chunks() {
+        let b = sqlite().await;
+        let t = tag("i964sc");
+        let node = format!("{t}-node");
+        bodies::register_node(&b, &node).await;
+        b.set_node_key_id(&node);
+        bodies::i964_chunks(&b, &t).await;
+    }
+
     #[cfg(feature = "postgres")]
     async fn postgres() -> Option<crate::store::postgres::PostgresBackend> {
         let Some(dsn) = crate::test_pg::empty_dsn() else {
@@ -919,5 +1157,45 @@ mod run {
         )
         .await;
         eprintln!("i963_postgres: RAN");
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn i964_postgres() {
+        let Some(b) = postgres().await else { return };
+        let t = tag("i964p");
+        let node = format!("{t}-node");
+        bodies::register_node(&b, &node).await;
+        b.set_node_key_id(&node);
+        let lens = format!("{t}-lens");
+        crate::federation::hard_case::test_support_hold(&b, &lens).await;
+        b.test_execute(&format!(
+            "INSERT INTO cirislens_derived.detection_events \
+                (detection_id, trace_id, body_sha256, detector, severity, cohort_cell, \
+                 conformity_variant, conformity_payload, lens_core_version, \
+                 ratchet_calibration_version, canonical_bytes, ed25519_sig, ml_dsa_65_sig, \
+                 signing_key_id, ts) \
+             VALUES ('{}', '{t}-trace', decode(repeat('00', 32), 'hex'), \
+                     'manifold_conformity_outlier', 'info', '{{}}'::jsonb, 'numeric', \
+                     '{{}}'::jsonb, '1', 1, decode('7b7d', 'hex'), \
+                     decode(repeat('00', 64), 'hex'), decode(repeat('00', 3309), 'hex'), \
+                     '{lens}', '2026-02-03T04:05:06.654321+00:00')",
+            uuid::Uuid::new_v4()
+        ))
+        .await;
+        bodies::i964_the_dsar_erasure(&b, &t, 2).await;
+        eprintln!("i964_postgres: RAN");
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn i964_postgres_chunks() {
+        let Some(b) = postgres().await else { return };
+        let t = tag("i964pc");
+        let node = format!("{t}-node");
+        bodies::register_node(&b, &node).await;
+        b.set_node_key_id(&node);
+        bodies::i964_chunks(&b, &t).await;
+        eprintln!("i964_postgres_chunks: RAN");
     }
 }
