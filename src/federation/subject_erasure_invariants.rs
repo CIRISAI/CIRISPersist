@@ -341,6 +341,29 @@ pub(crate) mod bodies {
     {
         let agent = format!("{tag}-agent");
         let row_id = detected(b, tag, &agent, &format!("{tag}-trace")).await;
+        // The DETECTOR's own retraction (CC 2.4.1.1 rule 1) is admitted, and
+        // is not the subject's erasure: the door does not erase under it.
+        let target = b.get_attestation(&row_id).await.unwrap().unwrap();
+        let mut w = ts::bare_attestation(
+            &format!("{tag}-detector-withdraws"),
+            &target.attesting_key_id,
+            &target.attesting_key_id,
+            &crate::federation::withdraws_attestation_envelope(&row_id, &target.attestation_type),
+        );
+        w.attestation_type = attestation_type::WITHDRAWS.into();
+        w.cohort_scope = target.cohort_scope.clone();
+        let w = ts::seal_row(&target.attesting_key_id, w);
+        b.put_attestation(crate::federation::types::SignedAttestation { attestation: w })
+            .await
+            .expect("I967: the detector retracts its own row");
+        assert_eq!(
+            b.get_attestation(&format!("{tag}-detector-withdraws"))
+                .await
+                .unwrap()
+                .unwrap()
+                .withdraws_admission_rule,
+            Some(1)
+        );
         let summary = b.delete_traces_for_agent_id_hash(&agent).await.unwrap();
         assert_eq!(summary.trace_events, 1, "I967: the trace corpus goes");
         assert_eq!(
