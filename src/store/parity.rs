@@ -233,6 +233,31 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("purge_attestation_planned", Class::Plan),
     ("purge_genesis_delegation_row_planned", Class::Plan),
     ("delete_attestation", Class::Plumbing),
+    // v57.0.0 (CIRISPersist#934 step 2) — the community plane's shared doors
+    // (`put_community`, `apply_replicated_community`, the three roster
+    // doors), their plans (same-file halves), and the executor's storage
+    // steps, each itself a `CommunityStore` door compared across backends.
+    ("put_community_planned", Class::Plan),
+    ("apply_replicated_community_planned", Class::Plan),
+    ("put_community_membership_revocation_planned", Class::Plan),
+    ("put_community_membership_widening_planned", Class::Plan),
+    ("put_community_membership_listing_planned", Class::Plan),
+    ("plan_put_community", Class::Delegates),
+    ("plan_put_community_membership_revocation", Class::Delegates),
+    ("plan_put_community_membership_widening", Class::Delegates),
+    ("plan_put_community_membership_listing", Class::Delegates),
+    // (The three roster executors are each a shared door's tail call, which
+    // the scan does not record for Plumbing.)
+    ("store_planned_community", Class::Plumbing),
+    // The row as inserted: the hash and the wire-index locator, derived.
+    ("community_insert", Class::Plumbing),
+    // The `cfg(test)` rival write, reached through the executor trait; never
+    // armed outside a test.
+    ("rival_community_write_at", Class::Plumbing),
+    // The replicated door's typed verdict: a refusal of the caller's record
+    // (a #758 conflict, a degrading supersede) becomes the typed `Refused`
+    // outcome a cursor records. It decides the door's answer: a Gate.
+    ("replicated_community_outcome", Class::Gate),
     // ...and the local plan's own gates, seen for the first time with it:
     // the local-tier eligibility rule, the caller-signed transit verify, the
     // signed-instant read (refuses a malformed instant) and the local stamp
@@ -380,9 +405,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // of the one key-record store step; the replicated `Insert` arm reaches
     // the same helper with the replicated door.
     ("put_public_key_at_door", Class::Delegates),
-    // v50.0.0 (review, CIRISPersist#931) — Delegates: `put_community` and
-    // `apply_replicated_community` are the two doors of this one store step.
-    ("put_community_at_door", Class::Delegates),
     // v50.0.0 (PR #921 review) — Plumbing: the `cfg(test)` one-shot fault a
     // witness arms inside a backend door (`store::test_hooks`); never armed
     // outside a test, and it judges nothing about the caller's input.
@@ -684,7 +706,13 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // group doors: an identical re-put settles, a differing record is refused
     // unless its supersede proof names this node's prior version and passes
     // the group's own quorum. Gate — it refuses the caller's record.
-    ("route_occupied_community", Class::Gate),
+    // v57.0.0 (CIRISPersist#934 step 2) — the community half, split: the
+    // decision (a refusal of the caller's record: a Gate) ends the shared
+    // plan, and its write (a lost race to a DIFFERENT record stays a
+    // refusal; a chain apply that found the id empty re-asks the founding
+    // signers: a Gate) runs after it.
+    ("plan_occupied_community", Class::Gate),
+    ("apply_occupied_community", Class::Gate),
     ("route_occupied_family", Class::Gate),
     // v49.0.0 (CIRISPersist#910.5) — inside every backend's supersede
     // transaction: a proof over a version this node does not hold is refused
@@ -1222,7 +1250,7 @@ mod tests {
     /// The traits whose impls are compared, and where each trait's **default**
     /// bodies live. A backend that does not override a defaulted method runs
     /// the default, so the default's gate sequence is what it contributes.
-    const TRAITS: [(&str, &str); 4] = [
+    const TRAITS: [(&str, &str); 5] = [
         ("FederationDirectory", "src/federation/mod.rs"),
         ("BlobStorage", "src/federation/blobs.rs"),
         ("Backend", "src/store/backend.rs"),
@@ -1230,13 +1258,15 @@ mod tests {
         // methods are compared across backends like any door, so a decision
         // that drifts back into an executor is seen.
         ("AttestationStore", "src/federation/attestation_admit.rs"),
+        // v57.0.0 (CIRISPersist#934 step 2) — the community plane's executor.
+        ("CommunityStore", "src/federation/community_admit.rs"),
     ];
 
     /// v56.0.0 (CIRISPersist#934) — the shared plans, read from their own
     /// files: `(file, fn)`. Each body is held to the same [`CALL_CLASSES`]
     /// partition as a backend door, and its sequence is what a door's
     /// `plan:NAME` token stands for.
-    const SHARED_PLANS: [(&str, &str); 10] = [
+    const SHARED_PLANS: [(&str, &str); 15] = [
         // v57.0.0 (CIRISPersist#988 items 2, 3).
         ("src/federation/attestation_admit.rs", "plan_hard_case_row"),
         ("src/federation/attestation_admit.rs", "plan_detection_row"),
@@ -1269,6 +1299,24 @@ mod tests {
             "src/federation/attestation_admit.rs",
             "purge_genesis_delegation_row_planned",
         ),
+        // v57.0.0 (CIRISPersist#934 step 2) — the community plane.
+        ("src/federation/community_admit.rs", "put_community_planned"),
+        (
+            "src/federation/community_admit.rs",
+            "apply_replicated_community_planned",
+        ),
+        (
+            "src/federation/community_admit.rs",
+            "put_community_membership_revocation_planned",
+        ),
+        (
+            "src/federation/community_admit.rs",
+            "put_community_membership_widening_planned",
+        ),
+        (
+            "src/federation/community_admit.rs",
+            "put_community_membership_listing_planned",
+        ),
     ];
 
     /// v56.0.0 (CIRISPersist#934) — **the doors that decide nothing in a
@@ -1278,7 +1326,7 @@ mod tests {
     /// this list on the commit that moves its decision into a plan, and
     /// cannot drift back: a gate added to one backend's copy fails
     /// [`shared_doors_decide_nothing_in_a_backend`].
-    const SHARED_DOORS: [(&str, &str, &str); 9] = [
+    const SHARED_DOORS: [(&str, &str, &str); 14] = [
         (
             "FederationDirectory",
             "put_attestation_with_origin",
@@ -1321,6 +1369,32 @@ mod tests {
             "FederationDirectory",
             "purge_genesis_delegation_row_v31",
             "purge_genesis_delegation_row_planned",
+        ),
+        // v57.0.0 (CIRISPersist#934 step 2) — the community plane.
+        (
+            "FederationDirectory",
+            "put_community",
+            "put_community_planned",
+        ),
+        (
+            "FederationDirectory",
+            "apply_replicated_community",
+            "apply_replicated_community_planned",
+        ),
+        (
+            "FederationDirectory",
+            "put_community_membership_revocation",
+            "put_community_membership_revocation_planned",
+        ),
+        (
+            "FederationDirectory",
+            "put_community_membership_widening",
+            "put_community_membership_widening_planned",
+        ),
+        (
+            "FederationDirectory",
+            "put_community_membership_listing",
+            "put_community_membership_listing_planned",
         ),
     ];
 
@@ -2561,18 +2635,110 @@ mod tests {
             "check_instant_binding",
             Reads::ReceivedAt,
         ),
+        // v57.0.0 (CIRISPersist#934 step 2) — the community plane. A community
+        // record's two receipt-time folds read the clock before #934 and still
+        // read receipt (#1049 candidates): the members' in-force location
+        // proofs, and the founders' node-bearing (#925/#927, on both doors).
+        (
+            "plan_put_community",
+            "check_geographic_community_admission",
+            Reads::ReceivedAt,
+        ),
+        (
+            "plan_put_community",
+            "check_infrastructure_record_admission",
+            Reads::ReceivedAt,
+        ),
+        (
+            "plan_put_community",
+            "check_replicated_supersede_does_not_degrade",
+            Reads::ReceivedAt,
+        ),
+        // The roster planes: the future-skew bound at receipt; the #908
+        // authority and the #925 founder gates at the row's signed instant
+        // (`effective_at`), as before #934.
+        (
+            "plan_put_community_membership_revocation",
+            "reject_future_dated_community_revocation",
+            Reads::ReceivedAt,
+        ),
+        (
+            "plan_put_community_membership_revocation",
+            "check_community_roster_authority",
+            Reads::FoldAt,
+        ),
+        (
+            "plan_put_community_membership_revocation",
+            "check_infrastructure_founder_count_unchanged",
+            Reads::FoldAt,
+        ),
+        (
+            "plan_put_community_membership_widening",
+            "reject_future_dated_community_widening",
+            Reads::ReceivedAt,
+        ),
+        (
+            "plan_put_community_membership_widening",
+            "check_community_roster_authority",
+            Reads::FoldAt,
+        ),
+        (
+            "plan_put_community_membership_widening",
+            "check_infrastructure_founders_not_node",
+            Reads::FoldAt,
+        ),
+        (
+            "plan_put_community_membership_widening",
+            "check_infrastructure_founder_count_unchanged",
+            Reads::FoldAt,
+        ),
+        (
+            "plan_put_community_membership_listing",
+            "check_community_membership_listing",
+            Reads::ReceivedAt,
+        ),
     ];
 
-    /// The plan fns [`PLAN_INSTANTS`] covers, in `src/federation/attestation_admit.rs`.
-    const INSTANT_PLANS: [&str; 8] = [
-        "plan_hard_case_row",
-        "plan_detection_row",
-        "plan_put_attestation",
-        "recheck_cycle_under_lock",
-        "plan_attach_attestation_pqc_signature",
-        "plan_write_local_attestation",
-        "plan_reseal_attestation",
-        "sealed_over",
+    /// The plan fns [`PLAN_INSTANTS`] covers: `(file, fn)`.
+    const INSTANT_PLANS: [(&str, &str); 12] = [
+        // v57.0.0 (CIRISPersist#988 items 2, 3).
+        ("src/federation/attestation_admit.rs", "plan_hard_case_row"),
+        ("src/federation/attestation_admit.rs", "plan_detection_row"),
+        (
+            "src/federation/attestation_admit.rs",
+            "plan_put_attestation",
+        ),
+        (
+            "src/federation/attestation_admit.rs",
+            "recheck_cycle_under_lock",
+        ),
+        (
+            "src/federation/attestation_admit.rs",
+            "plan_attach_attestation_pqc_signature",
+        ),
+        (
+            "src/federation/attestation_admit.rs",
+            "plan_write_local_attestation",
+        ),
+        (
+            "src/federation/attestation_admit.rs",
+            "plan_reseal_attestation",
+        ),
+        ("src/federation/attestation_admit.rs", "sealed_over"),
+        // v57.0.0 (CIRISPersist#934 step 2) — the community plane's plans.
+        ("src/federation/community_admit.rs", "plan_put_community"),
+        (
+            "src/federation/community_admit.rs",
+            "plan_put_community_membership_revocation",
+        ),
+        (
+            "src/federation/community_admit.rs",
+            "plan_put_community_membership_widening",
+        ),
+        (
+            "src/federation/community_admit.rs",
+            "plan_put_community_membership_listing",
+        ),
     ];
 
     /// For every mention of `word` in `body`, the innermost CALL it is an
@@ -2629,11 +2795,10 @@ mod tests {
     /// column of the #934 inventory).
     #[test]
     fn every_plan_call_reads_its_declared_instant() {
-        let rel = "src/federation/attestation_admit.rs";
-        let stripped = strip_file(&read(rel));
-        let index = index_functions(&stripped);
         let mut derived: BTreeSet<(String, String, Reads)> = BTreeSet::new();
-        for plan in INSTANT_PLANS {
+        for (rel, plan) in INSTANT_PLANS {
+            let stripped = strip_file(&read(rel));
+            let index = index_functions(&stripped);
             let &(a, b) = index
                 .get(plan)
                 .and_then(|r| r.first())

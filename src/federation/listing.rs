@@ -57,12 +57,14 @@ fn refused(signed: &SignedCommunityMembershipListing, rule: &'static str) -> Err
 /// A listing may not be future-dated beyond the roster planes' skew bound: the
 /// fold reads the latest row at or before an instant, and a far-future row
 /// would sit unapplied for as long as its signer chose, then flip the member's
-/// visibility with no fresh act.
+/// visibility with no fresh act. v57.0.0 (CIRISPersist#934 step 2) — bounded
+/// against `received_at`, the receiving node's clock at the door.
 pub fn reject_future_dated_community_listing(
     effective_at: chrono::DateTime<chrono::Utc>,
+    received_at: chrono::DateTime<chrono::Utc>,
 ) -> Result<(), Error> {
     let skew = super::community_dek::COMMUNITY_REVOCATION_MAX_FUTURE_SKEW_SECS;
-    if effective_at > chrono::Utc::now() + chrono::Duration::seconds(skew) {
+    if effective_at > received_at + chrono::Duration::seconds(skew) {
         return Err(Error::InvalidArgument(format!(
             "community membership listing effective_at {effective_at} is future-dated \
              (> now + {skew}s)"
@@ -87,6 +89,7 @@ pub fn reject_future_dated_community_listing(
 pub async fn check_community_membership_listing<F>(
     directory: &F,
     signed: &SignedCommunityMembershipListing,
+    received_at: chrono::DateTime<chrono::Utc>,
 ) -> Result<(), Error>
 where
     F: FederationDirectory + ?Sized,
@@ -99,7 +102,7 @@ where
     if row.listed.as_deref().is_some_and(|v| v != LISTED_PUBLIC) {
         return Err(refused(signed, LISTED_RULE_BAD_VALUE));
     }
-    reject_future_dated_community_listing(row.effective_at)?;
+    reject_future_dated_community_listing(row.effective_at, received_at)?;
     if directory
         .lookup_community(&row.community_key_id)
         .await?

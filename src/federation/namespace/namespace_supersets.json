@@ -16183,6 +16183,386 @@
     "tsv_target": "evidence/cc_impl.tsv",
     "manifest_round": "v57-988",
     "witness": "I960, I961 (memory, sqlite, postgres)"
+   },
+   {
+    "decimal_id": "2.6.1.3",
+    "claim_id": "CLM-canonical",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/verify/canonical.rs#JcsCanonicalizer",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc8-1091",
+    "tsv_comment_before": [
+     "",
+     "# v57.0.0 (CIRISPersist#1091) — the register's hosted rows come home. (a) the 27",
+     "# claims whose only pointer was a CIRISServer-hosted row at ciris-persist@v17.0.1,",
+     "# published here at the symbol's current home; (b) 13 symbols persist already",
+     "# published at another decimal, now also at the claim's own CC decimal; (c)",
+     "# CLM-transit-kex-binding (CC 3.3.6.2, #1077), shipped in v56.0.0 without a row."
+    ]
+   },
+   {
+    "decimal_id": "2.6.6",
+    "claim_id": "CLM-canonicalization-cell",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/location.rs#parse_canonical_cell",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc8-1091"
+   },
+   {
+    "decimal_id": "2.6.6.1",
+    "claim_id": "CLM-location",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/location.rs#validate_location_cell",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc8-1091"
+   },
+   {
+    "decimal_id": "2.6.6.2",
+    "claim_id": "CLM-cell",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/location.rs#h3_cell_contained",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc8-1091"
+   },
+   {
+    "decimal_id": "3.1.9.1",
+    "claim_id": "CLM-contributions",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/holding_claim.rs#holding_claim_row",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc8-1091",
+    "post_cut_rename_from": "CIRISPersist/src/federation/blobs.rs#holds_bytes_attestation_envelope"
+   },
+   {
+    "decimal_id": "3.3.2",
+    "claim_id": "CLM-subject_kind",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/cirisnode/media_sharing.rs#TakedownNoticePayload",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc8-1091"
+   },
+   {
+    "decimal_id": "3.3.3",
+    "claim_id": "CLM-subject_kind-subject",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/location.rs#validate_location_cell",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc8-1091"
+   },
+   {
+    "decimal_id": "3.3.4",
+    "claim_id": "CLM-family-subject",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/admission.rs#validate_family_members",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc8-1091"
+   },
+   {
+    "decimal_id": "3.3.5",
+    "claim_id": "CLM-consent-subject",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/admission.rs#check_consent_record_admission",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc8-1091"
+   },
+   {
+    "decimal_id": "3.3.6",
+    "claim_id": "CLM-identity",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/admission.rs#verify_signed_identity_occurrence",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc8-1091"
+   },
+   {
+    "decimal_id": "3.3.6.1",
+    "claim_id": "CLM-encryption_pubkeys",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/admission.rs#check_encryption_pubkeys",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc8-1091"
+   },
+   {
+    "decimal_id": "3.4.7",
+    "claim_id": "CLM-enforcement",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/admission.rs#DimensionAdmissionPolicy::check",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc8-1091"
+   },
+   {
+    "decimal_id": "3.4.7.1",
+    "claim_id": "CLM-identity-set",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/types.rs#identity_type::set_contains",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc8-1091"
+   },
+   {
+    "decimal_id": "3.5.1",
+    "claim_id": "CLM-concurrent-write",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/precedence.rs#precedence_winner",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc8-1091"
+   },
+   {
+    "decimal_id": "4.4.3.2.1",
+    "claim_id": "CLM-community-three",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/community_dek.rs#encrypt_and_cascade_community",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc8-1091"
+   },
+   {
+    "decimal_id": "4.4.3.4",
+    "claim_id": "CLM-family-policy",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/at_rest_cascade.rs#resolve_recipients",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc8-1091"
+   },
+   {
+    "decimal_id": "4.4.3.4.1",
+    "claim_id": "CLM-cascade",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/at_rest_cascade.rs#encrypt_and_cascade",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc8-1091"
+   },
+   {
+    "decimal_id": "4.5.12.2",
+    "claim_id": "CLM-envelope-multi",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/admission.rs#DimensionAdmissionPolicy::check_write_cohort_scope",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc8-1091"
+   },
+   {
+    "decimal_id": "4.5.3",
+    "claim_id": "CLM-takedown",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/cirisnode/takedown_handler.rs#process_takedown_admission",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc8-1091"
+   },
+   {
+    "decimal_id": "5.3.2.3",
+    "claim_id": "CLM-merge",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/operational.rs#SubjectKind::merge_intent",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc8-1091"
+   },
+   {
+    "decimal_id": "5.3.2.4",
+    "claim_id": "CLM-attestation-tier",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/admission.rs#check_local_tier_eligibility",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc8-1091"
+   },
+   {
+    "decimal_id": "5.3.2.4.2",
+    "claim_id": "CLM-local",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/engine.rs#Engine::enter_mesh",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc8-1091",
+    "post_cut_rename_from": "CIRISPersist/src/engine.rs#Engine::attestation_promote"
+   },
+   {
+    "decimal_id": "5.3.3.1",
+    "claim_id": "CLM-stream",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/stream_seal.rs#seal_stream_chunk",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc8-1091",
+    "post_cut_rename_from": "CIRISPersist/src/federation/stream_seal.rs#stream_nonce"
+   },
+   {
+    "decimal_id": "5.3.3.1",
+    "claim_id": "CLM-stream",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/stream_seal.rs#open_stream_chunk",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc8-1091",
+    "post_cut_rename_from": "CIRISPersist/src/federation/stream_seal.rs#stream_nonce"
+   },
+   {
+    "decimal_id": "5.3.3.6",
+    "claim_id": "CLM-delivery",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/store/sqlite.rs#put_delivery_receipt",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc8-1091"
+   },
+   {
+    "decimal_id": "5.3.3.7",
+    "claim_id": "CLM-normative",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/stream_sth.rs#log_id_for_stream",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc8-1091"
+   },
+   {
+    "decimal_id": "6.1.2",
+    "claim_id": "CLM-noise-classify",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/fountain/types.rs#classify",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc8-1091"
+   },
+   {
+    "decimal_id": "6.1.2",
+    "claim_id": "CLM-noise-dominance",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/fountain/aggregation.rs#verify_for_admission",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc8-1091"
+   },
+   {
+    "decimal_id": "2.4.1.1",
+    "claim_id": "CLM-withdraws",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/admission.rs#resolve_withdraws_admission_rule_at",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc8-1091"
+   },
+   {
+    "decimal_id": "2.6.7",
+    "claim_id": "CLM-time",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/operational.rs#check_skew_bound",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc8-1091"
+   },
+   {
+    "decimal_id": "3.4.1",
+    "claim_id": "CLM-accord-reservation",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/admission.rs#check_reserved_prefix_admission",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc8-1091"
+   },
+   {
+    "decimal_id": "3.4.2",
+    "claim_id": "CLM-community-location",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/admission.rs#check_reserved_prefix_admission",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc8-1091"
+   },
+   {
+    "decimal_id": "3.4.3",
+    "claim_id": "CLM-system",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/admission.rs#default_reserved_prefix_rules",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc8-1091"
+   },
+   {
+    "decimal_id": "3.4.4",
+    "claim_id": "CLM-family-self",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/admission.rs#check_reserved_prefix_admission",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc8-1091"
+   },
+   {
+    "decimal_id": "3.4.5",
+    "claim_id": "CLM-capacity-score",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/admission.rs#check_reserved_prefix_admission",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc8-1091"
+   },
+   {
+    "decimal_id": "3.4.8",
+    "claim_id": "CLM-detector-only",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/admission.rs#default_reserved_prefix_rules",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc8-1091"
+   },
+   {
+    "decimal_id": "3.4.10",
+    "claim_id": "CLM-witness-emitter",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/admission.rs#default_reserved_prefix_rules",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc8-1091"
+   },
+   {
+    "decimal_id": "4.4.3.5.4",
+    "claim_id": "CLM-multi-subject",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/admission.rs#resolve_withdraws_admission_rule_at",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc8-1091"
+   },
+   {
+    "decimal_id": "4.5.1.1",
+    "claim_id": "CLM-axis",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/schema_resolver.rs#BlobBackedSchemaResolver",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc8-1091"
+   },
+   {
+    "decimal_id": "5.3.2.4.3",
+    "claim_id": "CLM-two",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/tier_ingest.rs#verify_federation_tier_ingest",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc8-1091"
+   },
+   {
+    "decimal_id": "5.3.2.4.3.1",
+    "claim_id": "CLM-admission-pqc",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/tier_ingest.rs#verify_federation_tier_ingest",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc8-1091"
+   },
+   {
+    "decimal_id": "3.3.6.2",
+    "claim_id": "CLM-transit-kex-binding",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/self_at_login.rs#transit_kex_pair_for",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc8-1091"
+   },
+   {
+    "decimal_id": "3.3.6.2",
+    "claim_id": "CLM-transit-kex-binding",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/self_at_login.rs#SignedTransportDestination::transit_kex_pair",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc8-1091"
+   },
+   {
+    "decimal_id": "3.3.6.2",
+    "claim_id": "CLM-transit-kex-binding",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/self_at_login.rs#SignedTransportDestination::rooted_transit_kex_pair",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc8-1091"
+   },
+   {
+    "decimal_id": "3.3.6.2",
+    "claim_id": "CLM-transit-kex-binding",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/self_at_login.rs#transit_kex_pair_from_envelope",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc8-1091"
+   },
+   {
+    "decimal_id": "3.3.6.2",
+    "claim_id": "CLM-transit-kex-binding",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/admission.rs#verify_signed_transport_destination",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc8-1091"
    }
   ],
   "CIRISServer": [

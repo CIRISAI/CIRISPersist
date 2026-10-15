@@ -9,6 +9,31 @@ threat-model citations because this crate's audit story is the point.
 
 ## [57.0.0] - UNRELEASED
 
+### Fixed — tag CI: the restored cache repair runs `--strict` (v56.0.0 windows wheel)
+
+- No library code changed. The v56.0.0 tag run's `maturin abi3-py311 wheel
+  (windows-x86_64)` failed as v55.0.0's did (`out/bindgen.rs` missing under a
+  trusted `libsqlite3-sys` fingerprint) although the v55.0.1 repair ran: it
+  removed two other `libsqlite3-sys` units and KEPT the poisoned one as
+  "unverified, far from the cutoff". The single-cutoff bound assumes one
+  prune cycle; a unit no re-saving job compiles survives several, and its
+  file was pruned under an earlier cutoff. `.github/actions/ciriscache` now
+  runs `repair --strict`: every manifest-less build-script unit is dropped
+  (build scripts rerun, minutes) until a sealed save replaces the blob.
+  The v56.0.0 release body was set by hand, as v55.0.0's was.
+
+### Changed — CIRISVerify v20.2.0 re-pin (CIRISVerify#309)
+
+- The seven Rust pins (`ciris-verify-core`, `ciris-keyring` ×4 targets,
+  `ciris-crypto`, the `server` feature set) move v20.1.0 → v20.2.0 together,
+  and the wheel's `Requires-Dist` floor to `ciris-verify>=20.2.0,<21` in
+  lockstep. v20.2.0 adds `ciris_crypto::transit_kex`, the A/V per-hop
+  transit key (CC 5.3.3.5 E1) that runs the hybrid X25519 + ML-KEM-768 KEX
+  against the static `transit_kex_pubkeys` pair persist stores on the
+  `transport_destination` binding since v56.0.0 (#1077). Persist stores the
+  pair; Edge runs the exchange. No persist API changes. `ciris-build-sign`
+  stays at the v20.1.0 prebuilt (no v20.2.0 GitHub release carries one).
+
 ### Added — tooling: `scripts/cargo_guard.sh` (#1092)
 
 - One build at a time on the box (`flock`), an available-RAM floor (8 GB), and a
@@ -180,6 +205,107 @@ same rows as before.
   held node key. `put_detection_event` raises `ValueError` (the type of its
   shape refusals) when the signer is not a `lenscore_detector` or is not
   held.
+
+### Evidence — the register's hosted rows come home (#1091)
+
+No library code changed. `evidence/cc_impl.tsv` goes from 225 to 271 rows
+(46 added, none removed), each at the claim's own CC decimal under its claim
+id, so the CC's next re-pin can graduate them.
+
+- **27 claims** whose only CC pointer was a row the CIRISServer manifest
+  hosted for persist at ciris-persist@v17.0.1: 28 rows. 24 publish the
+  symbol the server named, which still exists here. Three duties moved:
+  `CLM-contributions` cites `holding_claim.rs#holding_claim_row` (the
+  retired `holds_bytes_attestation_envelope`'s successor, v55.0.0),
+  `CLM-local` cites `Engine::enter_mesh` (replaced `attestation_promote`
+  in v39.0.0), and `CLM-stream` cites `seal_stream_chunk` and
+  `open_stream_chunk` (`stream_nonce` is now a `ciris_crypto` re-export).
+- **13 symbols** persist already published at another decimal, now also at
+  the claim's own decimal (the nine the CC re-staged and the four it kept
+  established with a warning). The rows at the other decimals stay.
+- **`CLM-transit-kex-binding`** (CC 3.3.6.2, #1077), which shipped in
+  v56.0.0 without a row: five rows, `transit_kex_pair_for`, the two
+  `SignedTransportDestination` accessors, `transit_kex_pair_from_envelope`
+  and `verify_signed_transport_destination`.
+### Changed — the community and roster doors share one plan (#934 step 2)
+
+Five doors were written three times, once per backend, with byte-identical
+gate sequences. Each is now one shared door in `federation::community_admit`
+over a shared plan, and each backend keeps only a `CommunityStore` executor:
+row mapping, SQL, the transaction, the wire index and the `cfg(test)` rival
+hook. No behaviour changes.
+
+| door | before (v56.0.0 scan) | shared door | plan | executor |
+|---|---|---|---|---|
+| `put_community` | identical x3 (9 gates) | `put_community_planned` | `plan_put_community` | `store_planned_community` |
+| `apply_replicated_community` | gateless (delegated to the same per-backend body) | `apply_replicated_community_planned` | `plan_put_community` | `store_planned_community` |
+| `put_community_membership_revocation` | identical x3 (4 gates) | `put_community_membership_revocation_planned` | `plan_put_community_membership_revocation` | `store_planned_community_revocation` |
+| `put_community_membership_widening` | identical x3 (6 gates) | `put_community_membership_widening_planned` | `plan_put_community_membership_widening` | `store_planned_community_widening` |
+| `put_community_membership_listing` | identical x3 (1 gate) | `put_community_membership_listing_planned` | `plan_put_community_membership_listing` | `store_planned_community_listing` |
+
+- The `store::parity` scan now reports all five doors as `shared`, and
+  `SHARED_DOORS` holds them there. The per-backend `put_community_at_door`
+  bodies are gone.
+- **The occupied-id route splits into a decision and a write.**
+  `group_amendment::route_occupied_community` read and wrote in one call. It
+  is now `plan_occupied_community`, which reads only and ends the plan, and
+  `apply_occupied_community`, which writes the supersede or the trust-root
+  chain through the shared supersede door after the plan returns. The order
+  of every read and write is the same as before.
+- **The held-row settle stays the door's first statement**, ahead of the
+  plan. It reads the wire index, so the plans do not. I235 now reads the
+  settle from the four shared doors.
+- **Backend line counts**, before and after this cut:
+
+  | file | before | after | delta |
+  |---|---|---|---|
+  | `src/store/memory.rs` | 25,709 | 25,447 | −262 |
+  | `src/store/sqlite.rs` | 55,859 | 55,595 | −264 |
+  | `src/store/postgres.rs` | 52,727 | 52,482 | −245 |
+
+- **Each plan takes `PlanInstants`** and reads no clock. Each gate reads the
+  instant it read before #934. `store::parity`'s `PLAN_INSTANTS` now covers
+  the four community plans.
+
+  | plan | call | instant | before #934 |
+  |---|---|---|---|
+  | community | `check_geographic_community_admission` | `received_at` | clock (#1049 candidate: in-force location proofs) |
+  | community | `check_infrastructure_record_admission` | `received_at` | clock, two calls deep (#1049 candidate: founders' node-bearing) |
+  | community | `check_replicated_supersede_does_not_degrade` | `received_at` | clock, two calls deep (#1049 candidate) |
+  | revocation | `reject_future_dated_community_revocation` | `received_at` | clock (future-skew bound) |
+  | revocation | `check_community_roster_authority` | `fold_at` | `effective_at` |
+  | revocation | `check_infrastructure_founder_count_unchanged` | `fold_at` | `effective_at` |
+  | widening | `reject_future_dated_community_widening` | `received_at` | clock (future-skew bound) |
+  | widening | `check_community_roster_authority`, `check_infrastructure_founders_not_node`, `check_infrastructure_founder_count_unchanged` | `fold_at` | `effective_at` |
+  | listing | `check_community_membership_listing` | `received_at` | clock (future-skew bound) |
+
+  `fold_at` is the row's signed instant: `effective_at` for the three roster
+  rows, and the record's head instant for a community record. No community
+  record gate reads `fold_at` yet.
+
+**Adopter-visible.** Gate signatures now take an explicit instant. To keep
+the previous behaviour, pass `chrono::Utc::now()`.
+
+- `community_dek::reject_future_dated_community_revocation` and
+  `reject_future_dated_community_widening` take `received_at`.
+- `listing::reject_future_dated_community_listing` and
+  `listing::check_community_membership_listing` take `received_at`.
+- `admission::check_infrastructure_record_admission`,
+  `check_replicated_supersede_does_not_degrade` and
+  `check_infrastructure_community_conformance` take `at`. The supersede door
+  (`supersede_group_row`) still passes the clock.
+
+### Known gap — the community plane after #934 step 2
+
+- **Clock reads two or more calls deep.** `check_trust_root_at_door`
+  (through `check_trust_root_community_admission`) and the trust-root chain
+  apply in `apply_occupied_community` still read the clock inside
+  `canonical_community`. They were not re-plumbed in this step.
+- **The occupied-id write still re-asks after a write.** A trust-root chain
+  apply that finds the id empty re-runs the founding-signer check before the
+  insert, inside `apply_occupied_community`, as it did before.
+- **Non-row reads.** The settle reads the wire index before the plan. The
+  plans read the directory's community, key and location-proof rows only.
 
 ## [56.0.0] - 2026-10-14
 

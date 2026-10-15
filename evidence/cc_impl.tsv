@@ -261,3 +261,55 @@ decimal_id	claim_id	repo	path#symbol	crate@version
 3.4.8	CLM-detection-on-base	CIRISPersist	src/federation/attestation_admit.rs#plan_detection_row	ciris-persist@56.0.0
 3.4.8	CLM-detection-on-base	CIRISPersist	src/derived/detection_row.rs#project_detection_row	ciris-persist@56.0.0
 2.4.2	CLM-silo-projection-rebuildable	CIRISPersist	src/federation/silo_projection.rs#check_projection_rebuild	ciris-persist@56.0.0
+
+# v57.0.0 (CIRISPersist#1091) — the register's hosted rows come home. (a) the 27
+# claims whose only pointer was a CIRISServer-hosted row at ciris-persist@v17.0.1,
+# published here at the symbol's current home; (b) 13 symbols persist already
+# published at another decimal, now also at the claim's own CC decimal; (c)
+# CLM-transit-kex-binding (CC 3.3.6.2, #1077), shipped in v56.0.0 without a row.
+2.6.1.3	CLM-canonical	CIRISPersist	src/verify/canonical.rs#JcsCanonicalizer	ciris-persist@56.0.0
+2.6.6	CLM-canonicalization-cell	CIRISPersist	src/federation/location.rs#parse_canonical_cell	ciris-persist@56.0.0
+2.6.6.1	CLM-location	CIRISPersist	src/federation/location.rs#validate_location_cell	ciris-persist@56.0.0
+2.6.6.2	CLM-cell	CIRISPersist	src/federation/location.rs#h3_cell_contained	ciris-persist@56.0.0
+3.1.9.1	CLM-contributions	CIRISPersist	src/federation/holding_claim.rs#holding_claim_row	ciris-persist@56.0.0
+3.3.2	CLM-subject_kind	CIRISPersist	src/cirisnode/media_sharing.rs#TakedownNoticePayload	ciris-persist@56.0.0
+3.3.3	CLM-subject_kind-subject	CIRISPersist	src/federation/location.rs#validate_location_cell	ciris-persist@56.0.0
+3.3.4	CLM-family-subject	CIRISPersist	src/federation/admission.rs#validate_family_members	ciris-persist@56.0.0
+3.3.5	CLM-consent-subject	CIRISPersist	src/federation/admission.rs#check_consent_record_admission	ciris-persist@56.0.0
+3.3.6	CLM-identity	CIRISPersist	src/federation/admission.rs#verify_signed_identity_occurrence	ciris-persist@56.0.0
+3.3.6.1	CLM-encryption_pubkeys	CIRISPersist	src/federation/admission.rs#check_encryption_pubkeys	ciris-persist@56.0.0
+3.4.7	CLM-enforcement	CIRISPersist	src/federation/admission.rs#DimensionAdmissionPolicy::check	ciris-persist@56.0.0
+3.4.7.1	CLM-identity-set	CIRISPersist	src/federation/types.rs#identity_type::set_contains	ciris-persist@56.0.0
+3.5.1	CLM-concurrent-write	CIRISPersist	src/federation/precedence.rs#precedence_winner	ciris-persist@56.0.0
+4.4.3.2.1	CLM-community-three	CIRISPersist	src/federation/community_dek.rs#encrypt_and_cascade_community	ciris-persist@56.0.0
+4.4.3.4	CLM-family-policy	CIRISPersist	src/federation/at_rest_cascade.rs#resolve_recipients	ciris-persist@56.0.0
+4.4.3.4.1	CLM-cascade	CIRISPersist	src/federation/at_rest_cascade.rs#encrypt_and_cascade	ciris-persist@56.0.0
+4.5.12.2	CLM-envelope-multi	CIRISPersist	src/federation/admission.rs#DimensionAdmissionPolicy::check_write_cohort_scope	ciris-persist@56.0.0
+4.5.3	CLM-takedown	CIRISPersist	src/cirisnode/takedown_handler.rs#process_takedown_admission	ciris-persist@56.0.0
+5.3.2.3	CLM-merge	CIRISPersist	src/federation/operational.rs#SubjectKind::merge_intent	ciris-persist@56.0.0
+5.3.2.4	CLM-attestation-tier	CIRISPersist	src/federation/admission.rs#check_local_tier_eligibility	ciris-persist@56.0.0
+5.3.2.4.2	CLM-local	CIRISPersist	src/engine.rs#Engine::enter_mesh	ciris-persist@56.0.0
+5.3.3.1	CLM-stream	CIRISPersist	src/federation/stream_seal.rs#seal_stream_chunk	ciris-persist@56.0.0
+5.3.3.1	CLM-stream	CIRISPersist	src/federation/stream_seal.rs#open_stream_chunk	ciris-persist@56.0.0
+5.3.3.6	CLM-delivery	CIRISPersist	src/store/sqlite.rs#put_delivery_receipt	ciris-persist@56.0.0
+5.3.3.7	CLM-normative	CIRISPersist	src/federation/stream_sth.rs#log_id_for_stream	ciris-persist@56.0.0
+6.1.2	CLM-noise-classify	CIRISPersist	src/fountain/types.rs#classify	ciris-persist@56.0.0
+6.1.2	CLM-noise-dominance	CIRISPersist	src/fountain/aggregation.rs#verify_for_admission	ciris-persist@56.0.0
+2.4.1.1	CLM-withdraws	CIRISPersist	src/federation/admission.rs#resolve_withdraws_admission_rule_at	ciris-persist@56.0.0
+2.6.7	CLM-time	CIRISPersist	src/federation/operational.rs#check_skew_bound	ciris-persist@56.0.0
+3.4.1	CLM-accord-reservation	CIRISPersist	src/federation/admission.rs#check_reserved_prefix_admission	ciris-persist@56.0.0
+3.4.2	CLM-community-location	CIRISPersist	src/federation/admission.rs#check_reserved_prefix_admission	ciris-persist@56.0.0
+3.4.3	CLM-system	CIRISPersist	src/federation/admission.rs#default_reserved_prefix_rules	ciris-persist@56.0.0
+3.4.4	CLM-family-self	CIRISPersist	src/federation/admission.rs#check_reserved_prefix_admission	ciris-persist@56.0.0
+3.4.5	CLM-capacity-score	CIRISPersist	src/federation/admission.rs#check_reserved_prefix_admission	ciris-persist@56.0.0
+3.4.8	CLM-detector-only	CIRISPersist	src/federation/admission.rs#default_reserved_prefix_rules	ciris-persist@56.0.0
+3.4.10	CLM-witness-emitter	CIRISPersist	src/federation/admission.rs#default_reserved_prefix_rules	ciris-persist@56.0.0
+4.4.3.5.4	CLM-multi-subject	CIRISPersist	src/federation/admission.rs#resolve_withdraws_admission_rule_at	ciris-persist@56.0.0
+4.5.1.1	CLM-axis	CIRISPersist	src/federation/schema_resolver.rs#BlobBackedSchemaResolver	ciris-persist@56.0.0
+5.3.2.4.3	CLM-two	CIRISPersist	src/federation/tier_ingest.rs#verify_federation_tier_ingest	ciris-persist@56.0.0
+5.3.2.4.3.1	CLM-admission-pqc	CIRISPersist	src/federation/tier_ingest.rs#verify_federation_tier_ingest	ciris-persist@56.0.0
+3.3.6.2	CLM-transit-kex-binding	CIRISPersist	src/federation/self_at_login.rs#transit_kex_pair_for	ciris-persist@56.0.0
+3.3.6.2	CLM-transit-kex-binding	CIRISPersist	src/federation/self_at_login.rs#SignedTransportDestination::transit_kex_pair	ciris-persist@56.0.0
+3.3.6.2	CLM-transit-kex-binding	CIRISPersist	src/federation/self_at_login.rs#SignedTransportDestination::rooted_transit_kex_pair	ciris-persist@56.0.0
+3.3.6.2	CLM-transit-kex-binding	CIRISPersist	src/federation/self_at_login.rs#transit_kex_pair_from_envelope	ciris-persist@56.0.0
+3.3.6.2	CLM-transit-kex-binding	CIRISPersist	src/federation/admission.rs#verify_signed_transport_destination	ciris-persist@56.0.0
