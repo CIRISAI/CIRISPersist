@@ -365,7 +365,7 @@ pub mod key_grant;
 // v58.0.0 (CIRISPersist#991 plane 1; CC 3.1.3) — the key plane as rows.
 pub mod key_plane;
 // v58.0.0 (CIRISPersist#991) — I975–I980.
-mod key_plane_invariants;
+pub(crate) mod key_plane_invariants;
 // #848 §18 — the two-node witnesses I59–I67; `pub` under `test-anchor` so
 // consumers can drive them against their own backends.
 #[cfg(any(test, feature = "test-anchor"))]
