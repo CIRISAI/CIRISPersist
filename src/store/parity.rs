@@ -178,9 +178,23 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // writes. Storage on a decision `subject_erasure::plan_store_erasure`
     // already made: Plumbing.
     ("erasure_execution", Class::Plumbing),
+    // v58.0.0 (CIRISPersist#1094 item 2) — the erasure door's decision, read
+    // before its transaction, once for all three backends (a shared plan:
+    // which detections a subject `withdraws` covers).
+    ("plan_store_erasure", Class::Plan),
+    // Inside it: the candidate read (storage), and THE authority decision —
+    // a row is erased only under an admitted subject `withdraws`, re-derived
+    // through the one `withdraws` predicate.
+    ("detection_row_ids_for_agent", Class::Plumbing),
+    ("authorised_erasures", Class::Gate),
+    // The attested-subject rule for a whole row (the rule-3 proxy grant to a
+    // canonical subject beside `check_attested_subject_admission`).
+    ("check_attested_subject_admission_for_row", Class::Gate),
+    // The canonical subject of an agent / a detection's trace: derivations.
+    ("agent_subject", Class::Plumbing),
+    ("detection_subject", Class::Plumbing),
     ("sqlite_erase_cited_rows", Class::Plumbing),
     ("pg_erase_cited_rows", Class::Plumbing),
-    ("memory_held_citations", Class::Plumbing),
     ("sqlite_put_erasure_execution", Class::Plumbing),
     ("pg_put_erasure_execution", Class::Plumbing),
     // Each backend's erasure recorder plans the erasure row(s) (the shared
@@ -1269,7 +1283,9 @@ mod tests {
     /// files: `(file, fn)`. Each body is held to the same [`CALL_CLASSES`]
     /// partition as a backend door, and its sequence is what a door's
     /// `plan:NAME` token stands for.
-    const SHARED_PLANS: [(&str, &str); 15] = [
+    const SHARED_PLANS: [(&str, &str); 16] = [
+        // v58.0.0 (CIRISPersist#1094 item 2).
+        ("src/federation/subject_erasure.rs", "plan_store_erasure"),
         // v57.0.0 (CIRISPersist#988 items 2, 3).
         ("src/federation/attestation_admit.rs", "plan_hard_case_row"),
         ("src/federation/attestation_admit.rs", "plan_detection_row"),

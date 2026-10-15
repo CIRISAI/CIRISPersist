@@ -325,7 +325,7 @@ pub(crate) mod bodies {
         let events = erasure_events(b).await;
         let keyed = events
             .iter()
-            .find(|e| e.detail["op"] == crate::federation::hard_case::trace_erasure_op::KEY_SCOPED)
+            .find(|e| e.detail["op"] == crate::federation::hard_case::trace_erasure_op::ONE_KEY)
             .expect("I966: the key-scoped door's hard case");
         assert_subject_free(keyed, &agent2, "I966 key-scoped");
         assert!(!serde_json::to_string(keyed).unwrap().contains(&signer_key));

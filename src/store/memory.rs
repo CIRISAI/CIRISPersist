@@ -2315,7 +2315,7 @@ impl Backend for MemoryBackend {
             // v58.0.0 (#1094 item 2, CC 4.5.3) — subject-free.
             let event = crate::federation::hard_case::trace_erasure_event(
                 &crate::federation::hard_case::TraceErasureCounts {
-                    op: crate::federation::hard_case::trace_erasure_op::KEY_SCOPED,
+                    op: crate::federation::hard_case::trace_erasure_op::ONE_KEY,
                     trace_events: trace_events_deleted,
                     trace_llm_calls: trace_llm_calls_deleted,
                     detection_events_tombstoned,
@@ -16538,7 +16538,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].target_key_id.as_deref(), Some("agent-A"));
+        // v58.0.0 (CIRISPersist#1094 item 2, CC 4.5.3) — the row names nobody.
+        assert_eq!(events[0].target_key_id, None);
+        assert!(!events[0].detail.to_string().contains("agent-A"));
         assert_eq!(events[0].detail["trace_events"], 2);
         assert_eq!(events[0].detail["trace_llm_calls"], 2);
 

@@ -1247,6 +1247,55 @@ fn attestation_subjects(row: &Attestation) -> BTreeSet<String> {
         .collect()
 }
 
+/// v58.0.0 (CIRISPersist#1094 item 2) — a `detection:*` row's canonical
+/// subject (`subject_erasure::agent_subject` of the scored trace's agent),
+/// resolved to the key that signed the scored trace: `(canonical, key)` when
+/// this node holds the trace's own `trace:complete:v1` attestation and the
+/// agent it names hashes to a subject the row carries. `None` otherwise — the
+/// canonical subject then stays unresolved, fail-closed.
+///
+/// # Errors
+///
+/// Directory reads.
+async fn detection_subject_as_agent_key<F>(
+    directory: &F,
+    row: &Attestation,
+) -> Result<Option<(String, String)>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    if !super::admission::envelope_dimension(&row.attestation_envelope)
+        .is_some_and(|d| d.starts_with(crate::derived::detection_row::DIMENSION_PREFIX))
+    {
+        return Ok(None);
+    }
+    let Some(trace_id) = row
+        .attestation_envelope
+        .pointer("/detection/trace_id")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return Ok(None);
+    };
+    let Some(trace_row) = directory
+        .get_attestation(&crate::ingest::trace_attestation_id(trace_id))
+        .await?
+    else {
+        return Ok(None);
+    };
+    let Some(canonical) = trace_row
+        .attestation_envelope
+        .get("agent_id_hash")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|a| super::subject_erasure::agent_subject(a).ok())
+    else {
+        return Ok(None);
+    };
+    Ok(row
+        .subject_key_ids
+        .contains(&canonical)
+        .then(|| (canonical, trace_row.attesting_key_id.clone())))
+}
+
 /// **INTERIM — which records of `records` have a human subject?** CC session
 /// 2026-10-10 (CIRISConstitution rc8@8c8f536): until the notice is an
 /// admitted row that a `reconsideration:{grounds}` can target (CC 4.5.5), a
@@ -1330,6 +1379,15 @@ where
                 let mut subjects = attestation_subjects(&row);
                 if record.plane == PurgePlane::Trace {
                     subjects.insert(row.attesting_key_id.clone());
+                }
+                // v58.0.0 (CIRISPersist#1094 item 2) — a detection row names
+                // the scored agent by its canonical hash; that subject IS the
+                // agent who signed the scored trace, and is judged as that key.
+                if let Some((canonical, agent_key)) =
+                    detection_subject_as_agent_key(directory, &row).await?
+                {
+                    subjects.remove(&canonical);
+                    subjects.insert(agent_key);
                 }
                 subjects
             }

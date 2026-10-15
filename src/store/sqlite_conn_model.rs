@@ -739,6 +739,8 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("store_planned_hard_case", ConnClass::Write),
     ("rehome_legacy_hard_case_events", ConnClass::Write),
     ("store_planned_detection", ConnClass::Write),
+    ("trace_agent_id_hash", ConnClass::Read),
+    ("detection_row_ids_for_agent", ConnClass::Read),
     ("rehome_legacy_detection_events", ConnClass::Write),
     ("projection_rebuild", ConnClass::Write),
     (
@@ -751,6 +753,7 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("sqlite_project_detection", ConnClass::HelperWrite),
     ("sqlite_render_table", ConnClass::HelperRead),
     ("sqlite_erase_cited_rows", ConnClass::HelperWrite),
+    ("sqlite_v196_pending", ConnClass::HelperRead),
     ("sqlite_put_erasure_execution", ConnClass::HelperWrite),
     ("sqlite_record_erasure", ConnClass::HelperWrite),
     ("sqlite_detection_tombstone_instant", ConnClass::HelperRead),

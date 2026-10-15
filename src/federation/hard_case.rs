@@ -624,7 +624,7 @@ pub mod trace_erasure_op {
     /// `delete_traces_for_agent_id_hash` (all signing keys).
     pub const FULL: &str = "delete_traces_for_agent_id_hash";
     /// `delete_traces_for_agent` (one signing key).
-    pub const KEY_SCOPED: &str = "delete_traces_for_agent";
+    pub const ONE_KEY: &str = "delete_traces_for_agent";
 }
 
 /// v58.0.0 (CIRISPersist#1094 item 2, CC 4.5.3) — the DSAR erasure's

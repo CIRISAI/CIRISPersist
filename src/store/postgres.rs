@@ -3771,7 +3771,7 @@ impl Backend for PostgresBackend {
             // v58.0.0 (#1094 item 2, CC 4.5.3) — subject-free.
             let event = crate::federation::hard_case::trace_erasure_event(
                 &crate::federation::hard_case::TraceErasureCounts {
-                    op: crate::federation::hard_case::trace_erasure_op::KEY_SCOPED,
+                    op: crate::federation::hard_case::trace_erasure_op::ONE_KEY,
                     trace_events: trace_events_deleted,
                     trace_llm_calls: trace_llm_calls_deleted,
                     detection_events_tombstoned,
@@ -34683,6 +34683,9 @@ mod tests {
                 crate::derived::detection_row::detection_attestation_id(&det_z),
             ))
             .await;
+        let erasure_started =
+            crate::federation::admission::truncate_to_substrate_resolution(chrono::Utc::now())
+                - chrono::Duration::seconds(1);
 
         let summary = backend
             .delete_traces_for_agent_id_hash(&agent)
@@ -34757,11 +34760,18 @@ mod tests {
             })
             .await
             .unwrap();
+        // v58.0.0 (CIRISPersist#1094 item 2, CC 4.5.3) — the row names nobody,
+        // so it is found by its instant (this test is serial on postgres).
         let mine: Vec<_> = events
             .into_iter()
-            .filter(|e| e.target_key_id.as_deref() == Some(agent.as_str()))
+            .filter(|e| e.emitted_at >= erasure_started)
             .collect();
-        assert_eq!(mine.len(), 1, "exactly one audit row for this agent");
+        assert_eq!(mine.len(), 1, "exactly one audit row for this erasure");
+        assert_eq!(
+            mine[0].target_key_id, None,
+            "the audit row names no subject"
+        );
+        assert!(!mine[0].detail.to_string().contains(agent.as_str()));
         assert_eq!(mine[0].detail["detection_events_tombstoned"], 1);
 
         // Idempotent: second erasure is a clean all-zero no-op.

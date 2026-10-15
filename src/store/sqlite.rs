@@ -1735,7 +1735,7 @@ impl Backend for SqliteBackend {
                         // v58.0.0 (#1094 item 2, CC 4.5.3) — subject-free.
                         let event = crate::federation::hard_case::trace_erasure_event(
                             &crate::federation::hard_case::TraceErasureCounts {
-                                op: crate::federation::hard_case::trace_erasure_op::KEY_SCOPED,
+                                op: crate::federation::hard_case::trace_erasure_op::ONE_KEY,
                                 trace_events: trace_events_deleted,
                                 trace_llm_calls: trace_llm_calls_deleted,
                                 detection_events_tombstoned,

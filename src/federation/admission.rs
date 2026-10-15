@@ -15763,9 +15763,18 @@ pub async fn check_reconsideration_admission(
     dimension: &str,
     declared_community_id: &str,
 ) -> Result<(), Error> {
-    let target = match crate::federation::precedence::references_attestation_id_from_envelope(
-        &row.attestation_envelope,
-    ) {
+    // CC 4.5.1.1 op separation: the pointer is read with its discriminator —
+    // on a `scores` row of the `reconsideration:` family it names the prior
+    // action under review; no composer fold reads it there
+    // (`precedence::is_structural_composer` excludes `scores`).
+    let pointer = (row.attestation_type == attestation_type::SCORES)
+        .then(|| {
+            crate::federation::precedence::references_attestation_id_from_envelope(
+                &row.attestation_envelope,
+            )
+        })
+        .flatten();
+    let target = match pointer {
         Some(id) => directory.get_attestation(id).await?,
         None => None,
     };
