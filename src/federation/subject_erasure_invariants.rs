@@ -491,6 +491,8 @@ pub(crate) mod bodies {
     /// v57-shaped rows, seeded on a store migrated through V195: a
     /// `hard_case:trace_erasure:v1` row naming its agent and the
     /// `art17_erasure` header citing it (with its tombstone).
+    // I969 seeds a V195-migrated store: the SQL backends only.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     pub(crate) fn v57_trace_erasure_event(agent: &str) -> crate::federation::HardCaseEvent {
         crate::federation::HardCaseEvent {
             event_id: uuid::Uuid::new_v4().to_string(),
@@ -510,6 +512,8 @@ pub(crate) mod bodies {
     /// `art17_erasure` header citing it (and its tombstone), and a v58
     /// subject-free erasure row beside them. Returns `(v57 event id, v57
     /// notice id, v58 event id)`.
+    // I969 seeds a V195-migrated store: the SQL backends only.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     pub(crate) async fn i969_seed<B>(b: &B, node: &str, agent: &str) -> (String, String, String)
     where
         B: AttestationStore,
@@ -585,6 +589,8 @@ pub(crate) mod bodies {
     /// After V196 ran over the seeded rows: the v57 row and its header are
     /// gone, a v58 row (seeded beside them) stays, and the projections are
     /// their rows' rebuild.
+    // I969 seeds a V195-migrated store: the SQL backends only.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     pub(crate) async fn i969_after_v196<B>(
         b: &B,
         v57_event_id: &str,
