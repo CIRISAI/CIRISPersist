@@ -62,16 +62,14 @@ pub const VENDORED_REGISTRY_SHA256: &str =
     "22b029cfd977acce779c9481cdb381a4ad274b15e5b8206ac3d502ba7535b495";
 
 /// The CIRISConstitution commit both vendored manifests were copied from: the
-/// commit the `v1.0-rc8.1` tag names, copied from the tag, never a branch tip
+/// commit the `v1.0-rc8.1` tag names (`157039d`), copied from the tag, never a branch tip
 /// (CIRISPersist#753). v1.0-rc8 (`cb77137`) was not vendored: its six new
 /// families carried a literal `:v1` in the prefix (CIRISEdge found it). The
 /// files are also pinned by their own SHA-256
 /// ([`VENDORED_REGISTRY_FILE_SHA256`], [`VENDORED_VECTORS_FILE_SHA256`]), and
 /// `scripts/check_vendored_cc.sh v1.0-rc8.1` byte-compares them against the tag
 /// before a persist release that names rc8.1 is tagged.
-// TODO(v1.0-rc8.1 tag): re-pin to the tag's commit at ship; c5c8f56 is the
-// rc8.1 branch head, whose manifests CC states are byte-identical to the tag's.
-pub const VENDORED_CC_COMMIT: &str = "c5c8f56d476fb561739e96856fb35b073ea2a6f8";
+pub const VENDORED_CC_COMMIT: &str = "157039d3c73e5f8192e88d07bd87aea7172e6b2f";
 
 /// SHA-256 of the vendored `namespace_registry.json` FILE bytes (the whole file,
 /// unlike [`VENDORED_REGISTRY_SHA256`], which is CC's hash of the grammar).

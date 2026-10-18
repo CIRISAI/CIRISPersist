@@ -248,7 +248,8 @@ fleet floor.
 
 ### Changed — CC v1.0-rc8.1 vendored (slice V)
 
-Both manifests are copied byte-for-byte from CIRISConstitution v1.0-rc8.1:
+Both manifests are copied byte-for-byte from CIRISConstitution v1.0-rc8.1
+(tag commit `157039d`):
 registry `22b029cf…`, 174 families (168 at rc7), 1147 dimension vectors
 (1103), 25 row-type vectors, and a new `polarity_vectors` list of 10.
 `scripts/check_vendored_cc.sh v1.0-rc8.1` is the ship gate. v1.0-rc8
