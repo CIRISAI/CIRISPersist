@@ -356,6 +356,14 @@ pub(crate) mod bodies {
                 let mut paged = Vec::new();
                 let mut since = None;
                 loop {
+                    // A cursor that re-serves its last row never ends: bound it.
+                    assert!(
+                        paged.len() <= all.len(),
+                        "[{tag}] I1121 {}: paging re-serves rows ({} paged of {})",
+                        stringify!($method),
+                        paged.len(),
+                        all.len()
+                    );
                     let page = b.$method(since.clone(), 2).await.unwrap();
                     assert!(page.len() <= 2);
                     let Some(last) = page.last() else { break };

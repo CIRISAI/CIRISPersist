@@ -153,11 +153,11 @@ record are `scores` rows on the attestation plane; `federation_keys`,
   `withdraws` on its row**, admitted when the issuer acts for the identity
   (`signer_acts_for`, CC 3.3.6); it feeds the local
   `federation_identity_occurrence_revocations` projection. CC rc8 names no
-  family for occurrence revocations. The signed revocation object and its
-  door are removed (`put_identity_occurrence_revocation`,
-  `list_signed_identity_occurrence_revocations_for`,
+  family for occurrence revocations, so the signed revocation object stays a
+  legitimate authoring door (`put_identity_occurrence_revocation`,
   `SignedIdentityOccurrenceRevocation`,
-  `verify_signed_identity_occurrence_revocation`).
+  `verify_signed_identity_occurrence_revocation`) feeding the same projection
+  — see "compat reads" below.
 - **The order rule.** Every other row is admitted only once its signer's key
   is held; until then the refusal is the retryable `AttesterKeyUnknown`
   (`federation_attester_key_unknown`, CIRISPersist#1042). A key's own record
@@ -171,25 +171,80 @@ record are `scores` rows on the attestation plane; `federation_keys`,
   pre-V198 record that verifies gets its row, asserted at its own
   `scrub_timestamp` (an occurrence at its own `asserted_at`); one that does
   not stays held without a row and the gate names it.
-- **Replication.** Key-plane rows ride the Attestation kind. Retired with the
-  framed carriage: `list_signed_key_records_since`,
-  `list_signed_revocations_since`, `list_signed_identity_occurrences_since`,
-  `list_signed_identity_occurrence_revocations_since` (trait, backends,
-  capsule ops, Python). `DIRECTORY_ABI_VERSION` 7 → 8. The four
-  `EnvelopeKind`s stay in the hashed vocabulary (the v55 `KeyGrant` precedent)
-  and are settle-exempt; the key-plane door settles a byte-identical re-offer.
-  The signed wire index carries the rows as `Attestation` entries;
-  `wire_refs_for_subject` advertises a subject's revocation rows.
-- **Python.** Removed: `list_signed_key_records_since`,
-  `list_signed_revocations_since`, `list_signed_identity_occurrences_since`,
-  `list_signed_identity_occurrence_revocations_since`,
-  `attach_revocation_pqc_signature`. `put_revocation` signs a missing
+- **Replication.** Key-plane rows ride the Attestation kind, beside the
+  framed carriage, which a v58 node still serves (see "compat reads" below).
+  `DIRECTORY_ABI_VERSION` 7 → 8 (the `KeyPlaneRefused` payload). The four
+  `EnvelopeKind`s stay in the hashed vocabulary; `Key`, `Revocation` and
+  `IdentityOccurrence` are settle-exempt (the key-plane door settles a
+  byte-identical re-offered row). The signed wire index carries the rows as
+  `Attestation` entries beside the framed entries; `wire_refs_for_subject`
+  advertises a subject's revocation rows.
+- **Python.** Removed: `attach_revocation_pqc_signature`. `put_revocation` signs a missing
   ML-DSA-65 half with the engine's PQC signer before the put (it was a cold
   attach after it). `run_pqc_sweep()` no longer reports
   `by_table.federation_revocations`. `put_public_key`, `register_federation_key`,
   `apply_replicated_key_record` and `put_identity_occurrence_json` keep their
   signatures.
 - Witnesses I975–I980 on memory, sqlite and postgres (each with a red leg).
+
+### Changed — compat reads: a v58 node still serves the framed key plane (Edge re-gate, operator ruling 2026-10-18)
+
+The slice above first retired the framed outbound listings. A v58 node then
+admitted framed key-plane objects from old peers but could not serve them, so
+once the canonical ran v58 every older node (Edge v41/v42, long-soak agents
+back to edge v18.7.0) would stop receiving its keys — the KEX failure fixed in
+production in #876 / CIRISServer#788. The operator chose compat reads over a
+fleet floor.
+
+- **Restored, with their v57 names and signatures** (trait, memory, sqlite,
+  postgres, the directory double, the capsule ops): `list_signed_key_records_since`,
+  `list_signed_revocations_since`, `list_signed_identity_occurrences_since`,
+  `list_signed_identity_occurrence_revocations_since`,
+  `list_signed_identity_occurrence_revocations_for`,
+  `put_identity_occurrence_revocation`, `SignedIdentityOccurrenceRevocation`,
+  `ServedIdentityOccurrenceRevocation`,
+  `verify_signed_identity_occurrence_revocation`, and
+  `Engine::list_signed_revocations_since`. Python gets back the four listings
+  it had in v57 (`list_signed_key_records_since`,
+  `list_signed_revocations_since`, `list_signed_identity_occurrences_since`,
+  `list_signed_identity_occurrence_revocations_since`).
+- **The same tables, v57's bytes.** The listings read `federation_keys`,
+  `federation_revocations`, `federation_identity_occurrences` and
+  `federation_identity_occurrence_revocations` (v58's projections, which still
+  hold the signed objects) with v57's queries, order and `(admitted_at, id)`
+  cursor, so the framed bytes are the ones a v57 node served. V198 only added
+  a pointer column to the first three.
+- **Outbound replication offers both shapes.** The signed wire index again
+  carries the four framed kinds (`Key`, `Revocation`, `IdentityOccurrence`,
+  `IdentityOccurrenceRevocation`: reload, subject refs, the rebuild scan, the
+  per-put hooks, the v31 boot backfill) beside the key-plane `Attestation`
+  rows; `list_signed_records`' occurrence-revocation arm returns the signed
+  container again. Every peer is offered both; a pre-v58 peer asks for the
+  framed kinds it knows.
+- **Occurrence revocations have two inputs to one projection.** The framed
+  door is an authoring door again (its #672 settle restored, so
+  `IdentityOccurrenceRevocation` leaves `SETTLE_EXEMPT`); a `withdraws` on the
+  occurrence's `identity:occurrence:v1` row is the second. A pair already
+  revoked by either route keeps the revocation it holds: the first to land
+  fixes the instants, the framed door is `ON CONFLICT DO NOTHING`, and the
+  `withdraws` route skips a held pair, so neither rewrites or un-revokes the
+  other. **Gap:** the framed listings serve only revocations that arrived as a
+  framed object; a revocation that arrived only as a `withdraws` is not served
+  framed. While the fleet is mixed, producers must author occurrence
+  revocations through the framed door (`put_identity_occurrence_revocation`)
+  so old peers learn them.
+- **Not restored:** the hybrid-pending revocation path
+  (`attach_revocation_pqc_signature`, `list_hybrid_pending_revocations`, the
+  revocation leg of `run_pqc_sweep`). An Ed25519-only revocation stays refused.
+- **`DIRECTORY_ABI_VERSION` stays 8.** From 7 the break is the payload one:
+  `AttestationRefusalReason::KeyPlaneRefused` inside the existing
+  `ReplicatedAttestationOutcome` result. The restored ops are v7's verbatim
+  (both enum digests are v57.0.0's again), which against 8 is growth, and the
+  capsule's rule does not bump for growth.
+- Witnesses I1120–I1123 on memory, sqlite and postgres: byte identity against
+  the submitted object and the framed wire-index entry, and across a V195 (v57
+  schema) store migrated forward; cursor paging; the mixed fleet; the
+  hybrid-pending path stays gone.
 
 ### Changed — CC v1.0-rc8.1 vendored (slice V)
 
