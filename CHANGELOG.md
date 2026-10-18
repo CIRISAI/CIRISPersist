@@ -7,6 +7,27 @@ threat-model citations because this crate's audit story is the point.
 
 ## [Unreleased]
 
+## [59.0.0] - UNRELEASED
+
+### Added — the two-path decision (CIRISPersist#1099, CC 3.3.6.3, `CLM-self-roster-two-paths`)
+
+- `federation::two_path` — ONE pure, backend-free decision for "one actor
+  proposes, a window, the standing set decides": `decide` / `decide_all` →
+  `TwoPathDecision::{Lands { path: quorum | lone }, Pending { earliest_lone_at,
+  needs }, Refused { reason }}`. Quorum: a strict majority of the live roster
+  at the decision instant, proposer counted (`strict_majority` from
+  verify-core; no threshold is spelled). Lone: the window elapsed on THIS
+  node's clock (from the instant the node first held the proposal, never the
+  signer's `asserted_at`), no strict majority of the other members objects,
+  and for an eviction the target signed nothing since the proposal arrived.
+  A vote from a key off the roster is void; one open proposal per proposer
+  (never a global cap); one open proposal of a kind per target. Refusal
+  tokens: `proposer_not_on_roster`, `target_already_on_roster`,
+  `target_not_on_roster`, `proposer_is_target`, `proposer_has_open_proposal`,
+  `target_has_open_proposal`.
+- The six CC `formal/self_roster` traces (rc9 `cb0513c8`) are vendored under
+  `tests/fixtures/self_roster/` and replayed as door tests.
+
 ## [58.0.0] - 2026-10-18
 
 ### Security — five advisories published after v57.0.0, none reachable (deny.toml)

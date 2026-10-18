@@ -628,10 +628,13 @@ pub mod mesh_config;
 // v24.3.0 (CIRISPersist#574) — reverse quorum: the commons' brake.
 // 1-of-N to protect, m-of-n to undo.
 pub mod reverse_quorum;
+// v59.0.0 (CIRISPersist#1099, CC 3.3.6.3) — the two-path decision: a strict
+// majority at once, or a window with no majority objection. Pure.
 pub mod schema_resolver;
 pub mod scores;
 pub mod scores_read_audit;
 pub mod steward_purge;
+pub mod two_path;
 // v55.0.0 (CIRISPersist#1007) — the duty-holder takedown on the steward
 // purge's tombstone row (CC 4.5.3 step 2, CC 4.5.5).
 #[cfg(test)]
