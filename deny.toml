@@ -93,6 +93,19 @@ ignore = [
     # fix and cargo picks it up. Was blocking pre-push cargo-deny → forcing
     # `--no-verify` bypasses (which let a rustfmt slip reach CI on #323).
     "RUSTSEC-2026-0190",  # anyhow downcast_mut unsound — transitive via candle NER stack
+    # v58.0.0 — two advisories published after v57.0.0, neither upgradable from
+    # persist. `zip` < 9 keeps SUID/SGID bits on EXTRACTION; it is transitive
+    # only via candle-core (model-weight loading) and ciris-verify-core, both
+    # pinned to zip 7.x, and persist never extracts a ZIP archive (no zip::
+    # use in src/). `zbus_names` is unmaintained with no successor crate;
+    # transitive via ciris-keyring → secret-service (Linux keyring), with no
+    # known vulnerability. Re-evaluate on the next candle / ciris-keyring bump.
+    "RUSTSEC-2026-0367",  # zip SUID/SGID on extraction — candle / verify-core, persist never extracts
+    "RUSTSEC-2026-0368",  # zip extract() symlink targets escape the destination — same: persist never extracts
+    "RUSTSEC-2026-0369",  # zip extract() permissions applied through symlinks — same: persist never extracts
+    "RUSTSEC-2026-0371",  # zbus_names unmaintained — ciris-keyring → secret-service
+    "RUSTSEC-2026-0370",  # zvariant unmaintained — same zbus stack
+    "RUSTSEC-2026-0372",  # zvariant_derive unmaintained — same zbus stack
 ]
 
 [sources]

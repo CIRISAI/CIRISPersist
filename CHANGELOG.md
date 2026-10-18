@@ -9,6 +9,16 @@ threat-model citations because this crate's audit story is the point.
 
 ## [58.0.0] - 2026-10-18
 
+### Security — five advisories published after v57.0.0, none reachable (deny.toml)
+
+- `zip` < 9 (RUSTSEC-2026-0367, -0368, -0369): SUID/SGID bits and symlink
+  targets on EXTRACTION. Transitive only via candle-core and
+  ciris-verify-core, both held at zip 7.x; persist never extracts a ZIP
+  archive. `zbus_names`, `zvariant`, `zvariant_derive` unmaintained
+  (RUSTSEC-2026-0370, -0371, -0372) via ciris-keyring → secret-service, with
+  no successor and no known vulnerability. Ignored with that rationale;
+  re-evaluate on the next candle or ciris-keyring bump.
+
 ### Changed — the halt latch is not a leg of the trust verdict (CIRISPersist#1094 item 1; CC 3.2 T3/T8, 4.2.1.1; steward ruling 2026-10-15)
 
 - `trust_root_valid` no longer folds `halt_latched` into `valid`. A
