@@ -7,7 +7,7 @@ threat-model citations because this crate's audit story is the point.
 
 ## [Unreleased]
 
-## [58.0.0] - UNRELEASED
+## [58.0.0] - 2026-10-18
 
 ### Changed — the halt latch is not a leg of the trust verdict (CIRISPersist#1094 item 1; CC 3.2 T3/T8, 4.2.1.1; steward ruling 2026-10-15)
 
