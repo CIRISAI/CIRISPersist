@@ -7,7 +7,7 @@ threat-model citations because this crate's audit story is the point.
 
 ## [Unreleased]
 
-## [58.0.0] - Unreleased
+## [58.0.0] - UNRELEASED
 
 ### Changed — the halt latch is not a leg of the trust verdict (CIRISPersist#1094 item 1; CC 3.2 T3/T8, 4.2.1.1; steward ruling 2026-10-15)
 
@@ -275,6 +275,24 @@ What persist does with it:
 - Witnesses I1100–I1109 (`federation::rc8_vendor_invariants`, the matcher's
   polarity-vector replay); the door witnesses run on memory, sqlite and
   postgres. Evidence: `CLM-polarity-admission` (3.1.7), four rows.
+
+### Known gap — deferred from v58.0.0
+
+- **The 2.4.1.1 carve-out covers two of CC's four adverse classes.**
+  `resolve_withdraws_admission_rule_at` refuses rules 2–4 for `capacity:*` and
+  `detection:*` targets; `licensure:*` and `revocation:*` rows about the
+  subject are not yet closed to a subject's `withdraws` (unchanged behaviour).
+  Lands with CIRISPersist#1036 item 5.
+- **The ledger delegate arm stays refused.** CC 3.3.10.1 names no wire shape
+  for a ledger's serialization discipline (CIRISConstitution#176, rc9).
+- **Takedown basis spellings.** `LegalBasis` still serializes `dmca_512` /
+  `dsa_article_16` against CC's closed `dmca512` / `dsa_article16`; the rename
+  and the notice-as-`scores`-row move together in CIRISPersist#803.
+- **Absent scores are not judged by the polarity gate.** Persist's own
+  positive-only emitters (genesis `trust:charter:v1`, `membership:proposal:v1`,
+  `consent:partnership_grant:v1`, `trust:accepts:v1`) write no `score`.
+- **#991 planes 2 and 3** (`group:roster:v1`, the membership rows, general
+  `cosignatures[]`, `goal:{scale}`) remain.
 
 ## [57.0.0] - 2026-10-15
 
