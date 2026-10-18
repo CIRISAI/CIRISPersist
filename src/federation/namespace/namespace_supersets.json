@@ -14354,15 +14354,19 @@
    },
    {
     "decimal_id": "3.2",
-    "decimal_id_status": "PROPOSED - family is UNREGISTERED; the anchor is the governing CC section, not an owned CC 3.1.N row",
-    "claim_id": "CLM-nsproc-halt-latched-trust",
+    "claim_id": "CLM-halt-not-a-trust-leg",
     "repo": "CIRISPersist",
-    "crate": "ciris-persist@21.4.0",
     "path#symbol": "src/federation/trust_root.rs#trust_root_valid",
     "tsv_target": "evidence/cc_impl.tsv",
-    "field": "halt_latched",
-    "prefix": "trust:*",
-    "manifest_round": "0.3.0-unregistered-addendum"
+    "manifest_round": "cc-rc8-1094"
+   },
+   {
+    "decimal_id": "3.2",
+    "claim_id": "CLM-halt-not-a-trust-leg",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/trust_root.rs#transit_eligibility_walk",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc8-1094"
    },
    {
     "decimal_id": "3.2",

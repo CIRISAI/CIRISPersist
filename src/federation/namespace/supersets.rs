@@ -1754,8 +1754,9 @@ mod tests {
         // CLM-silo-projection-rebuildable (1).
         // v58.0.0: +9 (CIRISPersist#1094, slice E), +8 (CIRISPersist#991,
         // CLM-planes-as-rows: the key plane) and +4 (CC rc8 vendor,
-        // CLM-polarity-admission) over v57.0.0's 275.
-        const EXPECTED: usize = 296;
+        // CLM-polarity-admission) and +1 (CLM-halt-not-a-trust-leg's second
+        // anchor, the retired halt-latched row replaced) over v57.0.0's 275.
+        const EXPECTED: usize = 297;
         assert_eq!(
             checked, EXPECTED,
             "checked {checked} version-pinned persist src/ rows, expected {EXPECTED}. \

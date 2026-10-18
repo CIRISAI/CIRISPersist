@@ -19965,8 +19965,10 @@ mod tests {
         // rc7 re-vendor (v55.0.0, CIRISPersist#753). Each was unregistered open
         // vocabulary in rc6, so nothing admits that did not admit before. The
         // planes they name are persist's own (the key record, the occurrence,
-        // the revocation, the roster head), held today on their typed tables;
-        // the `scores` rows that carry them, with CC's rule, are #991's.
+        // the revocation, the roster head). v58.0.0 (#991 plane 1) puts the
+        // key record, revocation and occurrence on `scores` rows gated by
+        // `key_plane`'s family door, not by this reserved-prefix door, so
+        // they stay listed here; the roster head is #991 plane 2.
         ("key:record", "CIRISPersist#991"),
         ("key:revocation", "CIRISPersist#991"),
         ("identity:occurrence", "CIRISPersist#991"),
