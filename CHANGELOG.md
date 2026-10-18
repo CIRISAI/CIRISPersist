@@ -26,7 +26,112 @@ threat-model citations because this crate's audit story is the point.
   `target_not_on_roster`, `proposer_is_target`, `proposer_has_open_proposal`,
   `target_has_open_proposal`.
 - The six CC `formal/self_roster` traces (rc9 `cb0513c8`) are vendored under
-  `tests/fixtures/self_roster/` and replayed as door tests.
+  `tests/fixtures/self_roster/` and replayed as door tests: every `Execute` of
+  `combined3_stolen`, `combined3_lost` and `combined4_mixed` lands (by the path
+  the trace implies); `unilateral3_stolen`'s final `Execute` (the thief's lone
+  eviction at age 0) does not, and once the owner answers it never does;
+  `combined1_stolen` (one key) and `combined2_stolen` (two keys, stalemate) are
+  pinned as the stated bounds.
+- `member` is the live roster at the DECISION instant, as the model's is at
+  `Execute`: `combined4_mixed` lands its second eviction by two votes of a
+  roster the first eviction shrank to three.
+
+### Changed — the self-key roster door is two-path, not unilateral (CIRISPersist#1099, CC 3.3.6.3, `CLM-self-roster-two-paths`; a defect, `formal/self_roster` `unilateral3_stolen`)
+
+- `federation::self_roster` — a self's **roster** is its genesis key plus every
+  ACTIVE `identity_occurrence` under it whose key is `user`-role (a node's own
+  key and an agent's key are not roster keys; their occurrences are KEM
+  targets, written as before). An ADDITION (a signed occurrence of a user-role
+  key not on the roster) or an EVICTION (a framed occurrence revocation, or a
+  `withdraws` against the pair's `identity:occurrence:v1` row, of a live
+  roster key) signed by one key of a roster of TWO OR MORE is a proposal
+  decided by `two_path::decide_all` under `W_SELF_SECS = 86 400` with target
+  silence for evictions. At one key the addition still lands at once (the
+  add-device approval is unchanged).
+- Every door that can change a roster asks `self_roster::gate` after its
+  signature gate and before any write: `put_identity_occurrence` and
+  `put_identity_occurrence_revocation` on memory, sqlite and postgres, and the
+  attestation door for an occurrence `withdraws`. A change that lands proceeds
+  exactly as before. One that does not is HELD and the door returns the new
+  **`Error::SelfRosterNotLanded`** (`kind()` `federation_self_roster_not_landed`,
+  Python `ValueError("federation_self_roster_not_landed: <decision>: <proposal_id>")`),
+  carrying `identity_key_id`, `target_key_id`, `kind`, `proposal_id`,
+  `decision` (`pending` or a refusal token), `earliest_lone_at`, `needs`.
+  Nothing on the roster changed. Through `apply_replicated_attestation` the
+  same outcome is `Refused { reason: key_plane_refused }` (no new token).
+- **The rows.** A held change is an `objection:proposal:v1` row (proposer →
+  fedID) minted from the signed object it carries (`roster_proposal`:
+  `{identity_key_id, kind, target_key_id, carrier, <carrier>}`, carrier ∈
+  `identity_occurrence` | `withdraws` | `identity_occurrence_revocation`); its
+  signature is the object's own and its id `sha256("ciris:objection:proposal:v1:"
+  ‖ JCS(object))`, so every node names the same proposal. Answers are
+  `scores` rows a roster key signs, attested to the fedID:
+  `objection:assent:v1` / `objection:raised:v1` with `cohort: "self"`,
+  `cohort_key_id`, `objects_to_attestation_id` (`self_roster::vote_envelope`).
+  `proposal` and `assent` are new states of CC 3.1.9.2's `objection:{state}`,
+  reported to CC for registration. Any signed act by the target closes the
+  lone path; a key that both assents and objects counts as an objector; a vote
+  from a key off the roster is void.
+- **Execution.** A held proposal lands by itself: an admitted proposal or
+  answer row runs `self_roster::execute_for` for its self, and the sweep
+  `execute_due` (Python `Engine.execute_self_roster_due()`) lands what the lone
+  path allows once the window closes. The executor re-offers the SAME signed
+  object through the SAME door, which now lets it through — the write path is
+  not spelled twice. `key_plane::minted_row` is the one builder of the key
+  plane's rows and the proposal row.
+- **V199** `federation_self_roster_proposals` (sqlite + postgres twins; memory
+  mirror): this node's first-seen instant per proposal (the window's start, on
+  the node's clock — the purge-dwell precedent) and its settlement. Node-local;
+  never hashed or served. Three trait methods (`note_self_roster_proposal`,
+  `list_open_self_roster_proposals`, `settle_self_roster_proposal`), defaulted
+  `Unsupported`, overridden by every backend and delegated by the double.
+- Python: `Engine.self_roster_standing(identity_key_id)` (every open proposal,
+  decided now), `Engine.execute_self_roster_due()`,
+  `Engine.self_roster_vote_envelope(identity_key_id, proposal_id, assent)`.
+- **Compat (pre-v58 peers):** a pending proposal reaches neither the framed
+  occurrence/revocation planes nor the `identity:occurrence:v1` row stream;
+  once it lands it is served both ways. A v58 peer receives the proposal row
+  and refuses it (its signature is the carried object's).
+- Staged, not refused: the `device-<hex>-<fp>` roster key id
+  (`self_roster::DEVICE_DERIVED_ROSTER_KEY_PREFIX`, `CLM-self-roster-key-id`)
+  waits for CIRISServer#793 to ship `<fedID>-<fp>`.
+- Not carried in this cut: the genesis key's eviction (no row carries it
+  without colliding with the transport self-occurrence's revocation), and
+  re-asserting a live key's occurrence by another roster key (not a roster
+  change; stays `signer_acts_for`).
+
+### Changed — a live roster key acts as its self's steward (CIRISPersist#1099, CIRISServer#793, CC 3.3.6.3, `CLM-self-roster-authority`)
+
+- ONE predicate, `self_roster::acts_as_steward_at(steward, author, at)`: the
+  steward itself, or a live roster key of the steward's self at the row's
+  signed `asserted_at`. The consent fold's steward check
+  (`grant_is_authored_for`, and through it `consent_peers_by_principals`, now
+  read over the live grants themselves) and the one-responsible-steward gate
+  (`check_single_node_owner_admission`) ask it, and `owner_of` names each
+  owner-binding's granter as the self it signed as (`self_of_at`), so a second
+  device restating its owner's binding is the same one steward. A key of
+  another self is refused at both.
+
+### Fold survey — the two-path decision's relatives (CIRISPersist#1099 ruling 3)
+
+Nothing was folded; each site's thresholds differ, so a move would not be
+behaviour-preserving:
+
+- `reverse_quorum.rs` (act-unless-objected) — differs because the act lands
+  ON ARRIVAL and is reversed by objections (no pending state); the reverse
+  threshold is the cohort's declared `m` capped at the roster, the brake is
+  1-of-N, and the window is keyed on the action's signed `asserted_at`.
+- `ownership_reclaim.rs` (a dwell with a challenge) — differs because the
+  authority is a Wise-Authority quorum FINDING, a separate body, over a
+  four-step ceremony with a published 180-day (90-day floor) abandonment
+  window; there is no proposer, no lone path and no roster vote.
+- The accord halt confirmation within the fuse — differs because the tally is
+  verify-core's `accord_live_quorum`, run by CIRISServer; persist stores the
+  participations and the frozen `AccordDecision` and decides nothing.
+- `consensus.rs` — differs because it evaluates a group's DECLARED
+  `consensus_protocol` (`quorum:M/N`, unanimous, weighted, custom,
+  reverse_quorum) over co-signatures on one row at one instant: no window, no
+  pending state, and a declared `M` is not `strict_majority`.
 
 ## [58.0.0] - 2026-10-18
 

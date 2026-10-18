@@ -303,8 +303,22 @@ pub(crate) mod bodies {
             !active(d, &f, &d4).await,
             "I1134: the evicted d1's assent made a majority of the smaller roster"
         );
+        // The evicted key is off the roster the quorum is counted over too: f
+        // proposes d5 and d2 assents, 2 of the live 3 (a roster that kept d1
+        // would need 3 of 4).
+        let d5 = format!("d5-{tag}");
+        keys(d, &[&d5]).await;
+        let p5 = pending(add(d, &f, &f, &d5, ms_now()).await, "f adds d5");
+        vote(d, &d2, &f, &p5, true).await;
+        assert!(
+            active(d, &f, &d5).await,
+            "I1134: 2 of the live 3 lands; the quorum was counted over a roster that kept d1"
+        );
+        // {f, d2, d3, d5}: d4 needs 3 — d2, then d3 and d5.
         vote(d, &d3, &f, &p4, true).await;
-        assert!(active(d, &f, &d4).await, "I1134: a live assent lands it");
+        assert!(!active(d, &f, &d4).await, "I1134: 2 of 4 is no majority");
+        vote(d, &d5, &f, &p4, true).await;
+        assert!(active(d, &f, &d4).await, "I1134: live assents land it");
     }
 
     /// **I1135** — one open proposal per proposer, never a global cap.

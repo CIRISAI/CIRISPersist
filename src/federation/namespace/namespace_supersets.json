@@ -16748,6 +16748,46 @@
     "path#symbol": "src/federation/admission.rs#check_dimension_case_rule",
     "tsv_target": "evidence/cc_impl.tsv",
     "manifest_round": "cc-rc8-vendor"
+   },
+   {
+    "decimal_id": "3.3.6.3",
+    "claim_id": "CLM-self-roster-authority",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/self_roster.rs#acts_as_steward_at",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc9-1099"
+   },
+   {
+    "decimal_id": "3.3.6.3",
+    "claim_id": "CLM-self-roster-authority",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/consent_by_humans.rs#grant_is_authored_for",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc9-1099"
+   },
+   {
+    "decimal_id": "3.3.6.3",
+    "claim_id": "CLM-self-roster-authority",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/admission.rs#check_single_node_owner_admission",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc9-1099"
+   },
+   {
+    "decimal_id": "3.3.6.3",
+    "claim_id": "CLM-self-roster-two-paths",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/two_path.rs#decide",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc9-1099"
+   },
+   {
+    "decimal_id": "3.3.6.3",
+    "claim_id": "CLM-self-roster-two-paths",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/self_roster.rs#gate",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc9-1099"
    }
   ],
   "CIRISServer": [
