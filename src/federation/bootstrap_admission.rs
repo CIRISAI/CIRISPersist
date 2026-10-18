@@ -57,7 +57,7 @@ pub mod test_support {
     pub fn scores_row(id: &str, attester: &str, attested: &str, dimension: &str) -> Attestation {
         let envelope = serde_json::json!({
             "dimension": dimension,
-            "score": 1.0,
+            "score": crate::federation::namespace::registry::in_class_score(dimension),
             "confidence": 0.9,
         });
         let (och, sc, sp) =

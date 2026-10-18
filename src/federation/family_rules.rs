@@ -285,12 +285,14 @@ pub const RULES_NOT_ON_THE_ROW: &[PersistFamilyRule] = &[
     // one ledger per triple, no parallel books) was live from day one so
     // graduation opened an already-gated door. v55.0.0 (CIRISPersist#753):
     // CC rc7 graduated the family (CIRISConstitution#92/#105) and the staging
-    // latch is gone. rc7 rows the three catalogued leaves only, each with the
-    // section default `substrate-self-report`, while the CC 3.1.3 table names
-    // "the ledger's single owner … or a delegate"; persist gates the whole
-    // prefix by the L1 binding and by the owner rule (signer_acts_for the
-    // attested owner — the delegate path waits on a door that reads the
-    // ledger's declared serialization discipline).
+    // latch is gone. v58.0.0 (rc8): the three catalogued rows now carry the
+    // table's rule — "the ledger's single owner (the steward-bound identity of
+    // its ledger_id triple) or a delegate under its declared serialization
+    // discipline" (CC 3.3.10.1) — instead of the section default
+    // `substrate-self-report`. Still rowed per leaf only; persist gates the
+    // whole prefix by the L1 binding and by the owner rule (signer_acts_for
+    // the attested owner). The delegate path stays refused: no wire member
+    // declares a ledger's serialization discipline, so no door can read one.
     PersistFamilyRule {
         prefix: "ledger:",
         rule: "L1 triple binding: declared ledger_id must equal \
@@ -303,10 +305,10 @@ pub const RULES_NOT_ON_THE_ROW: &[PersistFamilyRule] = &[
         ],
         gap: RowRuleGap::RuleOnCataloguedLeavesOnly,
         minted_by_persist: false,
-        cc_ask: "CIRISConstitution#105 follow-up — the rc7 rows carry the CC 3.1.3 section \
-                 default `substrate-self-report` while the table cell says owner-or-delegate \
-                 (CC 3.3.10.1 clauses 1-3); land the owner rule on the three rows and a \
-                 family-level rule for `ledger:`",
+        cc_ask: "CIRISConstitution#105 follow-up — rc8 lands the owner-or-delegate rule on \
+                 the three rows (CC 3.3.10.1); still wanted: a family-level rule for \
+                 `ledger:`, and a wire member for the serialization discipline clause 3 \
+                 requires a ledger to declare (the delegate arm has nothing to read)",
     },
     // ── NoRuleOnTheRow: the row is silent, so the classifier is too. ───────
     PersistFamilyRule {
@@ -535,6 +537,15 @@ pub const RULES_NOT_ON_THE_ROW: &[PersistFamilyRule] = &[
 /// [`tests::not_a_family_rule_entries_are_not_secretly_ruled`], so the
 /// declaration cannot outlive its truth.
 pub const NOT_A_FAMILY_RULE: &[(&str, &str)] = &[
+    (
+        "settlement:",
+        "v58.0.0 (CC rc8) — `settlement:*` is registered and UNRESERVED: any payer \
+         signs it (CC 3.3.10). `admission::SETTLEMENT_DIMENSION_PREFIX` routes the \
+         row to `check_settlement_admission`, a PAYLOAD rule (no payment-processor \
+         identifier anywhere in the envelope — billing stays off-wire), never an \
+         emitter or composition rule; rc7 classified the family by the row's \
+         `substrate-self-report` reservation, which rc8 removed.",
+    ),
     (
         "hardware_custody:",
         "v50.0.0 (CIRISPersist#924) — `hardware_attestation::HARDWARE_CUSTODY_FAMILY` \

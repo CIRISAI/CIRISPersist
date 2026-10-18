@@ -18908,7 +18908,7 @@ mod tests {
                 crate::federation::envelope::EnvelopeCore::from_value(serde_json::json!({
                     "id": uuid::Uuid::new_v4().to_string(),
                     "dimension": dimension,
-                    "score": 1.0,
+                    "score": crate::federation::namespace::registry::in_class_score(dimension),
                     "confidence": 0.9,
                 }))
                 .unwrap(),

@@ -2980,7 +2980,7 @@ pub(crate) mod bodies {
     fn fed_row(id: &str, attester: &str, attested: &str, dimension: &str) -> Attestation {
         let env = serde_json::json!({
             "dimension": dimension,
-            "score": 1.0,
+            "score": crate::federation::namespace::registry::in_class_score(dimension),
             "confidence": 0.9,
         });
         let mut row = ts::bare_attestation(id, attester, attested, &env);

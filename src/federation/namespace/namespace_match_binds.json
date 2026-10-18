@@ -1,9 +1,9 @@
 {
  "_meta": {
-  "cc_commit": "536b8cbb931da1f4549425284af24cd227587c36",
+  "cc_commit": "cb7713719fc07919595e7c62c125218ac734bd3f",
   "generator": "scripts/gen_namespace_match_binds.py",
   "reference": "tools/cc_namespace_match.py",
-  "vectors_sha256": "8fc35ba167f1ab0d2cb5b4ea742865dff3fd92d1bd751105ddbb7fc191a73331"
+  "vectors_sha256": "099b75193494023a37197c2774d62eba08ff1e4b907d328d330d8ebfd5e6bc64"
  },
  "binds": [
   {
@@ -625,6 +625,63 @@
    "dimension": "approach:id1",
    "family": "approach:{goal_id}",
    "refusal": "missing_version_segment"
+  },
+  {
+   "binds": {
+    "basis": "wa_approval",
+    "version": "v1"
+   },
+   "dimension": "archive_release:wa_approval:v1:v1",
+   "family": "archive_release:{basis}:v1",
+   "refusal": null
+  },
+  {
+   "binds": {},
+   "dimension": "archive_release:wa_approval:v1:V1",
+   "family": "archive_release:{basis}:v1",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "archive_release:wa_approval:v1:v1:v2",
+   "family": "archive_release:{basis}:v1",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "archive_release:wa_approval:v1:v1beta",
+   "family": "archive_release:{basis}:v1",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "Archive_release:wa_approval:v1:v1",
+   "family": "archive_release:{basis}:v1",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {
+    "basis": "wa_approval"
+   },
+   "dimension": "archive_release:wa_approval:v1",
+   "family": "archive_release:{basis}:v1",
+   "refusal": "missing_version_segment"
+  },
+  {
+   "binds": {
+    "basis": "WA_APPROVAL"
+   },
+   "dimension": "archive_release:WA_APPROVAL:v1:v1",
+   "family": "archive_release:{basis}:v1",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {
+    "basis": "not_a_listed_value"
+   },
+   "dimension": "archive_release:not_a_listed_value:v1:v1",
+   "family": "archive_release:{basis}:v1",
+   "refusal": "namespace_vocab_value_unregistered"
   },
   {
    "binds": {},
@@ -4681,6 +4738,44 @@
   },
   {
    "binds": {
+    "version": "v1"
+   },
+   "dimension": "lawful_order:release:v1:v1",
+   "family": "lawful_order:release:v1",
+   "refusal": null
+  },
+  {
+   "binds": {},
+   "dimension": "lawful_order:release:v1:V1",
+   "family": "lawful_order:release:v1",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "lawful_order:release:v1:v1:v2",
+   "family": "lawful_order:release:v1",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "lawful_order:release:v1:v1beta",
+   "family": "lawful_order:release:v1",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "Lawful_order:release:v1:v1",
+   "family": "lawful_order:release:v1",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "lawful_order:release:v1",
+   "family": "lawful_order:release:v1",
+   "refusal": "missing_version_segment"
+  },
+  {
+   "binds": {
     "unit": "USD",
     "version": "v1"
    },
@@ -5746,6 +5841,82 @@
   },
   {
    "binds": {
+    "version": "v1"
+   },
+   "dimension": "preserve_request:v1:v1",
+   "family": "preserve_request:v1",
+   "refusal": null
+  },
+  {
+   "binds": {},
+   "dimension": "preserve_request:v1:V1",
+   "family": "preserve_request:v1",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "preserve_request:v1:v1:v2",
+   "family": "preserve_request:v1",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "preserve_request:v1:v1beta",
+   "family": "preserve_request:v1",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "Preserve_request:v1:v1",
+   "family": "preserve_request:v1",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "preserve_request:v1",
+   "family": "preserve_request:v1",
+   "refusal": "missing_version_segment"
+  },
+  {
+   "binds": {
+    "version": "v1"
+   },
+   "dimension": "preserve_response:v1:v1",
+   "family": "preserve_response:v1",
+   "refusal": null
+  },
+  {
+   "binds": {},
+   "dimension": "preserve_response:v1:V1",
+   "family": "preserve_response:v1",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "preserve_response:v1:v1:v2",
+   "family": "preserve_response:v1",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "preserve_response:v1:v1beta",
+   "family": "preserve_response:v1",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "Preserve_response:v1:v1",
+   "family": "preserve_response:v1",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "preserve_response:v1",
+   "family": "preserve_response:v1",
+   "refusal": "missing_version_segment"
+  },
+  {
+   "binds": {
     "method_id": "id1",
     "version": "v1"
    },
@@ -5787,52 +5958,60 @@
   },
   {
    "binds": {
-    "category": "sample",
+    "category": "medical",
     "version": "v1"
    },
-   "dimension": "prohibited:sample:v1",
+   "dimension": "prohibited:medical:v1",
    "family": "prohibited:{category}",
    "refusal": null
   },
   {
    "binds": {},
-   "dimension": "prohibited:sample:V1",
+   "dimension": "prohibited:medical:V1",
    "family": "prohibited:{category}",
    "refusal": "namespace_dimension_case_malformed"
   },
   {
    "binds": {},
-   "dimension": "prohibited:sample:v1:v2",
+   "dimension": "prohibited:medical:v1:v2",
    "family": "prohibited:{category}",
    "refusal": "namespace_dimension_case_malformed"
   },
   {
    "binds": {},
-   "dimension": "prohibited:sample:v1beta",
+   "dimension": "prohibited:medical:v1beta",
    "family": "prohibited:{category}",
    "refusal": "namespace_dimension_case_malformed"
   },
   {
    "binds": {},
-   "dimension": "Prohibited:sample:v1",
+   "dimension": "Prohibited:medical:v1",
    "family": "prohibited:{category}",
    "refusal": "namespace_dimension_case_malformed"
   },
   {
    "binds": {
-    "category": "sample"
+    "category": "medical"
    },
-   "dimension": "prohibited:sample",
+   "dimension": "prohibited:medical",
    "family": "prohibited:{category}",
    "refusal": "missing_version_segment"
   },
   {
    "binds": {
-    "category": "SAMPLE"
+    "category": "MEDICAL"
    },
-   "dimension": "prohibited:SAMPLE:v1",
+   "dimension": "prohibited:MEDICAL:v1",
    "family": "prohibited:{category}",
    "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {
+    "category": "not_a_listed_value"
+   },
+   "dimension": "prohibited:not_a_listed_value:v1",
+   "family": "prohibited:{category}",
+   "refusal": "namespace_vocab_value_unregistered"
   },
   {
    "binds": {
@@ -6411,6 +6590,55 @@
   },
   {
    "binds": {
+    "state": "sample",
+    "version": "v1"
+   },
+   "dimension": "retirement:sample:v1:v1",
+   "family": "retirement:{state}:v1",
+   "refusal": null
+  },
+  {
+   "binds": {},
+   "dimension": "retirement:sample:v1:V1",
+   "family": "retirement:{state}:v1",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "retirement:sample:v1:v1:v2",
+   "family": "retirement:{state}:v1",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "retirement:sample:v1:v1beta",
+   "family": "retirement:{state}:v1",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "Retirement:sample:v1:v1",
+   "family": "retirement:{state}:v1",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {
+    "state": "sample"
+   },
+   "dimension": "retirement:sample:v1",
+   "family": "retirement:{state}:v1",
+   "refusal": "missing_version_segment"
+  },
+  {
+   "binds": {
+    "state": "SAMPLE"
+   },
+   "dimension": "retirement:SAMPLE:v1:v1",
+   "family": "retirement:{state}:v1",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {
     "entity_type": "sample",
     "reason": "sample",
     "version": "v1"
@@ -6818,6 +7046,63 @@
    "dimension": "system:leaf",
    "family": "system:*",
    "refusal": "missing_version_segment"
+  },
+  {
+   "binds": {
+    "basis": "dmca512",
+    "version": "v1"
+   },
+   "dimension": "takedown_notice:dmca512:v1:v1",
+   "family": "takedown_notice:{basis}:v1",
+   "refusal": null
+  },
+  {
+   "binds": {},
+   "dimension": "takedown_notice:dmca512:v1:V1",
+   "family": "takedown_notice:{basis}:v1",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "takedown_notice:dmca512:v1:v1:v2",
+   "family": "takedown_notice:{basis}:v1",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "takedown_notice:dmca512:v1:v1beta",
+   "family": "takedown_notice:{basis}:v1",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "Takedown_notice:dmca512:v1:v1",
+   "family": "takedown_notice:{basis}:v1",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {
+    "basis": "dmca512"
+   },
+   "dimension": "takedown_notice:dmca512:v1",
+   "family": "takedown_notice:{basis}:v1",
+   "refusal": "missing_version_segment"
+  },
+  {
+   "binds": {
+    "basis": "DMCA512"
+   },
+   "dimension": "takedown_notice:DMCA512:v1:v1",
+   "family": "takedown_notice:{basis}:v1",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {
+    "basis": "not_a_listed_value"
+   },
+   "dimension": "takedown_notice:not_a_listed_value:v1:v1",
+   "family": "takedown_notice:{basis}:v1",
+   "refusal": "namespace_vocab_value_unregistered"
   },
   {
    "binds": {
@@ -7616,6 +7901,14 @@
    "refusal": "namespace_family_unregistered"
   },
   {
+   "binds": {
+    "basis": "zz_unminted_leaf"
+   },
+   "dimension": "takedown_notice:zz_unminted_leaf:v1",
+   "family": "takedown_notice:{basis}:v1",
+   "refusal": "namespace_vocab_value_unregistered"
+  },
+  {
    "binds": {},
    "dimension": "x_private:anything:v1",
    "family": null,
@@ -7769,6 +8062,12 @@
    "binds": {},
    "dimension": "Observation:zz_unminted_leaf:v1",
    "family": null,
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "Takedown_notice:zz_unminted_leaf:v1",
+   "family": "takedown_notice:{basis}:v1",
    "refusal": "namespace_dimension_case_malformed"
   }
  ]

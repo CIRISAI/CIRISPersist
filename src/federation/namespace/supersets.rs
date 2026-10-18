@@ -1752,9 +1752,10 @@ mod tests {
         // five CLM-transit-kex-binding rows); +6 (CIRISPersist#988):
         // CLM-hard-case-on-base (3), CLM-detection-on-base (2),
         // CLM-silo-projection-rebuildable (1).
-        // v58.0.0: +9 (CIRISPersist#1094, slice E) and +8 (CIRISPersist#991,
-        // CLM-planes-as-rows: the key plane) over v57.0.0's 275.
-        const EXPECTED: usize = 292;
+        // v58.0.0: +9 (CIRISPersist#1094, slice E), +8 (CIRISPersist#991,
+        // CLM-planes-as-rows: the key plane) and +4 (CC rc8 vendor,
+        // CLM-polarity-admission) over v57.0.0's 275.
+        const EXPECTED: usize = 296;
         assert_eq!(
             checked, EXPECTED,
             "checked {checked} version-pinned persist src/ rows, expected {EXPECTED}. \

@@ -216,6 +216,13 @@ pub enum DimensionRejectionReason {
     /// subject claiming the witness rung's authority on its own
     /// signature. Refused structurally, independent of emitter.
     SelfDeclaredLevelReserved,
+    /// v58.0.0 (CC 3.1.7 R4 rc8, CIRISConstitution#148) — a `scores` row's
+    /// `score` lies outside the polarity class its family declares
+    /// (`_meta.polarity_classes`): a point class admits only its points, a
+    /// range class only its interval. The token is the manifest's
+    /// (`_meta.polarity_classes.refusal`), pinned equal by
+    /// `tests::the_polarity_refusal_token_is_the_manifests`.
+    ScoreOutsideDeclaredPolarity,
 }
 
 impl DimensionRejectionReason {
@@ -227,6 +234,7 @@ impl DimensionRejectionReason {
             Self::MissingVersionSegment => "missing_version_segment",
             Self::EmptyOrMissingDimension => "empty_or_missing_dimension",
             Self::SelfDeclaredLevelReserved => "self_declared_level_reserved",
+            Self::ScoreOutsideDeclaredPolarity => "score_outside_declared_polarity",
         }
     }
 }
@@ -807,6 +815,25 @@ pub const REGISTERED_FAMILIES_HELD_SHUT: &[(&str, &str)] = &[
     ("membership:widening:", "CIRISPersist#991"),
     ("membership:removal:", "CIRISPersist#991"),
     ("membership:resignation:", "CIRISPersist#991"),
+    // CC 3.1.5 rc8 (the Retirement Standard, CC 7.5.5) — five families, each
+    // reserved to a named emitter (the agent, its custodian, a seated Wise
+    // Authority, the steward). Unregistered open vocabulary at rc7, so any
+    // signer's row admitted; persist builds none of their doors in v58.0.0, so
+    // they are registered (they parse and match) and held shut. The doors are
+    // the retirement program's (CIRISPersist#1079–#1088; the basis rows that
+    // open a seal, `archive_release` and `lawful_order:release`, are #1083's).
+    ("retirement:", "CIRISPersist#1087"),
+    ("preserve_request:", "CIRISPersist#1079"),
+    ("preserve_response:", "CIRISPersist#1079"),
+    ("archive_release:", "CIRISPersist#1083"),
+    ("lawful_order:release:", "CIRISPersist#1083"),
+    // CC 3.1.1 rc8 (CIRISConstitution#165) — `takedown_notice:{basis}:v1`, the
+    // notice AS A ROW: duty-holder-signed for the legal bases, cosigned by the
+    // trust root for `steward_purge`. Persist's notice is still the cirisnode
+    // `takedown_notice` Contribution (`takedown_tombstone`); the scores row and
+    // its signer rule are the silo re-home's (CIRISPersist#988). Held shut so
+    // no single key can mint a notice row before that door reads it.
+    ("takedown_notice:", "CIRISPersist#988"),
 ];
 
 /// The reason token a [`REGISTERED_FAMILIES_HELD_SHUT`] refusal carries, on the
@@ -1079,12 +1106,17 @@ pub fn check_ledger_binding_admission(
 /// it), so the signer must act for that identity: its own key, a live
 /// occurrence of it, or a node bound to it (the one `signer_acts_for` rule).
 ///
-/// The rc7 registry rows carry `substrate-self-report` instead — the CC 3.1.3
-/// section's default — which would refuse every owner. Persist follows the
-/// table cell, the more specific text, and is stricter than it in one
-/// direction: the `delegates_to` delegate path is refused until a door reads
-/// the ledger's declared serialization discipline (clause 3: "Concurrent
-/// unleased writes at one sequence number ARE a fork").
+/// v58.0.0 (CC rc8) — the registry rows now carry this rule themselves
+/// (`reserved_rule`, `cc_ref: CC 3.3.10.1`); rc7 carried the CC 3.1.3 section
+/// default `substrate-self-report`, which would have refused every owner, and
+/// persist followed the table cell. Persist is stricter than the rule in one
+/// direction: the `delegates_to` delegate path is refused. Clause 3 says "A
+/// ledger MUST declare its serialization discipline — a write lease, or
+/// per-delegate sub-ledgers folded deterministically", and nothing on the wire
+/// or in persist's ledger tables carries that declaration, so there is no
+/// discipline for a delegate to be "under" (clause 3: "Concurrent unleased
+/// writes at one sequence number ARE a fork"). `rc8_vendor_invariants` I1108
+/// pins owner / occurrence admitted, delegate / stranger refused.
 ///
 /// # Errors
 ///
@@ -1138,11 +1170,12 @@ pub const SETTLEMENT_DIMENSION_PREFIX: &str = "settlement:";
 /// field of a settlement either. Linkage references in, processor
 /// identifiers out.
 ///
-/// The rc7 registry row carries the CC 3.1.3 section default
-/// `substrate-self-report`; the CC 3.1.3 table marks the row "Reserved? No"
-/// and CC 3.3.10 names the payer as the signer. Persist follows the text:
-/// gating the family to `substrate_persist` would refuse every conformant
-/// settlement (the CC 3.1.7 R2 failure mode).
+/// v58.0.0 (CC rc8): the registry row is no longer reserved
+/// (`reserved: false`, no `reserved_rule`), matching the CC 3.1.3 table's
+/// "Reserved? No" and CC 3.3.10's payer-signs rule. rc7 carried the section
+/// default `substrate-self-report`, which persist declined to enforce; the
+/// registry now gives the answer persist already followed, and nothing in
+/// persist reserves the stem.
 ///
 /// Pure. Every federation-tier row reaches it through
 /// [`check_reserved_prefix_admission`], on all three backends.
@@ -1582,7 +1615,19 @@ impl DimensionAdmissionPolicy {
         // tests at once. Case-insensitive substring match keeps
         // the policy minimal — operators can extend the list per
         // deployment.
-        let dim_lc = dim.to_ascii_lowercase();
+        //
+        // v58.0.0 (CC 3.1.7 R3/R4 rc8) — the deny-list reads the text an
+        // EMITTER chose, never CC's own vocabulary. rc8 closes
+        // `prohibited:{category}` to 22 values, three of which carry a listed
+        // stem (`weapons_harmful`, `deception_fraud`, `autonomous_deception`):
+        // the apophatic prefix names what must never be done, and a closed
+        // enumeration value is the registry's word, not an axis an emitter
+        // minted. So when the dimension resolves cleanly to a registered
+        // family, the literal segments and every bind drawn from a CLOSED
+        // `segments[].values` list are skipped; open vocabulary, values and
+        // wildcard tails are still read. A dimension that does not resolve
+        // cleanly is read whole, as before.
+        let dim_lc = emitter_chosen_dimension_text(dim).to_ascii_lowercase();
         for stem in &self.morally_charged_stems {
             if dim_lc.contains(stem.as_str()) {
                 return Err(Error::DimensionRejected {
@@ -3772,6 +3817,98 @@ pub fn check_dimension_case_rule(row: &super::Attestation) -> Result<(), Error> 
          is malformed rather than a sibling, and would otherwise reach the family gates while \
          evading the leaf checks that key on the exact spelling."
     )))
+}
+
+/// v58.0.0 — the parts of `dim` its EMITTER chose, joined by `:`, for the
+/// morally-charged-stem deny-list ([`DimensionAdmissionPolicy::check`] layer
+/// 2a). When the one matcher resolves `dim` cleanly to a registered family,
+/// literal segments and binds drawn from a CLOSED enumeration (CC's own
+/// vocabulary) are dropped; anything else returns `dim` whole.
+fn emitter_chosen_dimension_text(dim: &str) -> std::borrow::Cow<'_, str> {
+    use crate::federation::namespace::matcher::{match_family, placeholder_values};
+    let m = match_family(dim);
+    let (Some(family), None) = (m.family, m.refusal) else {
+        return std::borrow::Cow::Borrowed(dim);
+    };
+    let chosen: Vec<&str> = m
+        .binds
+        .iter()
+        .filter(|(name, value)| {
+            !matches!(
+                placeholder_values(family, &format!("{{{name}}}")),
+                Some((values, false)) if values.iter().any(|v| v == *value)
+            )
+        })
+        .map(|(_, value)| value.as_str())
+        .collect();
+    std::borrow::Cow::Owned(chosen.join(":"))
+}
+
+/// v58.0.0 (CC 3.1.7 R4 rc8, CIRISConstitution#148) — **a family's declared
+/// polarity is an admission rule.**
+///
+/// CC 3.1.7 R4: "A substrate MUST refuse at admission, with
+/// `score_outside_declared_polarity`, a `scores` row whose `score` is outside
+/// its family's class, on local emission and replication alike, reading the
+/// class from the vendored registry and never from this prose — the same door,
+/// and the same kind of fact about the same registry row, as the dimension
+/// gate of CC 2.4."
+///
+/// So it sits beside that gate in [`check_reserved_prefix_admission`], which
+/// every put (all three backends), the replication apply and the promotion
+/// door run. The family is the one matcher's
+/// ([`match_family`](crate::federation::namespace::matcher::match_family));
+/// the class is [`family_polarity_class`](crate::federation::namespace::registry::family_polarity_class),
+/// read from `_meta.polarity_classes` with its `_aliases` folded. Nothing here
+/// spells a class.
+///
+/// - A dimension no row claims (open vocabulary), or one the grammar refuses
+///   (another gate names that refusal), is not this gate's question.
+/// - A `per-leaf` parent constrains nothing itself; the leaf's own row does,
+///   and the matcher resolves a named leaf to that row.
+/// - A `score` member that is present is judged; one that is not a number is
+///   outside every class and refused.
+/// - A row with NO `score` member is not judged. CC 2.1 marks `score`
+///   required, and persist's own emitters omit it on rows whose class
+///   excludes zero (the genesis `trust:charter:v1`, `membership:proposal:v1`,
+///   `consent:partnership_grant:v1`, `trust:accepts:v1`, …), so refusing the
+///   absence — or judging it as the `0.0` `scores::score_of` folds it to —
+///   would refuse persist's own genesis. That is a separate CC 2.1
+///   conformance gap, recorded at
+///   `rc8_vendor_invariants::pure::i1101_gate_judges_a_present_score`, not
+///   something this gate may paper over in either direction.
+///
+/// Pure (no directory read).
+///
+/// # Errors
+///
+/// [`Error::DimensionRejected`] with reason
+/// [`DimensionRejectionReason::ScoreOutsideDeclaredPolarity`].
+pub fn check_score_within_declared_polarity(row: &super::Attestation) -> Result<(), Error> {
+    use crate::federation::namespace::{matcher::match_family, registry};
+    if row.attestation_type != attestation_type::SCORES {
+        return Ok(());
+    }
+    let Some(dimension) = envelope_dimension(&row.attestation_envelope) else {
+        return Ok(());
+    };
+    let m = match_family(dimension);
+    let (Some(family), None) = (m.family, m.refusal) else {
+        return Ok(());
+    };
+    let Some((_, class)) = registry::family_polarity_class(family) else {
+        return Ok(());
+    };
+    let Some(score) = row.attestation_envelope.get("score") else {
+        return Ok(());
+    };
+    if score.as_f64().is_some_and(|s| class.admits(s)) {
+        return Ok(());
+    }
+    Err(Error::DimensionRejected {
+        dimension: dimension.to_owned(),
+        reason: DimensionRejectionReason::ScoreOutsideDeclaredPolarity.as_str(),
+    })
 }
 
 /// v42.0.0 (CIRISPersist#814 part 3, CC 3.4.5.1) — **live self-reports for a
@@ -16826,6 +16963,9 @@ pub async fn check_reserved_prefix_admission(
         check_namespace_family_registered(dim)?;
         check_registered_family_not_held(dim)?;
     }
+    // v58.0.0 (CC 3.1.7 R4 rc8) — the family's declared polarity, read from
+    // the same registry row as the gate above, at the same door.
+    check_score_within_declared_polarity(row)?;
 
     // (CIRISPersist#571) — CC 3.1.7 R2's Private Use range: `x_private:*` MUST
     // NOT admit at federation tier under any authority. The clause's sibling,
@@ -19536,7 +19676,8 @@ mod tests {
             .expect("register author key");
 
         let row = |id: &str, dimension: &str| {
-            let envelope = serde_json::json!({ "dimension": dimension, "score": 0.5 });
+            // `attestation:*` is boolean-via-score: the points {-1, +1} (CC 3.1.7 R4).
+            let envelope = serde_json::json!({ "dimension": dimension, "score": 1.0 });
             let (och, ed_sig, pqc_sig) = sign_envelope(author, &envelope);
             SignedAttestation {
                 attestation: seal_row(
@@ -19778,19 +19919,14 @@ mod tests {
         // identity type expresses. The gate is
         // `custody_ack::check_custody_ack_admission`.
         "custody:",
-        // rc7 re-vendor (v55.0.0, CIRISPersist#753) — the rows carry the CC
-        // 3.1.3 section default `substrate-self-report`; the table cell says
-        // "the ledger's single owner … or a delegate" (CC 3.3.10.1), which no
+        // rc7 re-vendor (v55.0.0, CIRISPersist#753); rc8 (v58.0.0) puts the
+        // CC 3.3.10.1 rule on the rows: "the ledger's single owner … or a
+        // delegate under its declared serialization discipline", which no
         // identity type expresses. Gated by `check_ledger_binding_admission`
         // and `check_ledger_emitter_admission`.
         "ledger:",
-        // rc7 re-vendor (v55.0.0, CIRISPersist#753) — the row carries the
-        // section default `substrate-self-report`, but the CC 3.1.3 table marks
-        // it "Reserved? No" and CC 3.3.10 names the payer as the signer, with a
-        // payee counter-attestation on `settlement:received:*`. Open emitter;
-        // the gate is `check_settlement_admission` (no payment-processor
-        // identifier).
-        "settlement:",
+        // `settlement:` left this list with the rc8 re-vendor (v58.0.0): the
+        // row is no longer reserved, so there is no reservation to explain.
         // v55.0.0 (CIRISPersist#1053, CC 3.2 public rooms) — "founder- or
         // moderate-holder-signed for the community it names; one live row per
         // community; federation scope": the rule asks who the room's founders
@@ -20338,6 +20474,10 @@ mod tests {
                     .iter()
                     .any(|s| dim.starts_with(s))
                 && !RESERVED_AND_NOT_YET_GATED
+                    .iter()
+                    .any(|(s, _)| dim.starts_with(s))
+                // Held shut refuses every emitter: stricter than any rule.
+                && !REGISTERED_FAMILIES_HELD_SHUT
                     .iter()
                     .any(|(s, _)| dim.starts_with(s))
             {

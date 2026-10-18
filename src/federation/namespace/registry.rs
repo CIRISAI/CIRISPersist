@@ -38,14 +38,14 @@ pub(super) const REGISTRY_JSON: &str = include_str!("namespace_registry.json");
 
 /// The CC version [`REGISTRY_JSON`] was generated from. Bump in lockstep when
 /// re-vendoring (the drift gate asserts the file's `_meta.cc_version` matches).
-pub const VENDORED_CC_VERSION: &str = "1.0-rc7";
+pub const VENDORED_CC_VERSION: &str = "1.0-rc8";
 /// SHA-256 of the CC `part_3_the_namespace.md` bytes the manifest was generated
 /// from (the manifest's `_meta.source_sha256`). Pins the exact source cut.
 pub const VENDORED_SOURCE_SHA256: &str =
-    "9032a726082d2db658bac364fd865617b7add3d7ef71dd644010c65297548660";
+    "edaa43d7c60d5d123ceac6d5153e8a1f6d714b8dac3bc389c1c0e3b7221b13e2";
 /// The number of prefix families in this vendored cut (the enumerated leaf
 /// count; CC 3.1's "83" summary is stale — see CIRISConstitution#30).
-pub const VENDORED_N_FAMILIES: usize = 168;
+pub const VENDORED_N_FAMILIES: usize = 174;
 
 /// v50.0.0 (CIRISPersist#924, CIRISConstitution#112) — the manifest's
 /// `_meta.registry_sha256`: the hash of the GRAMMAR (families + `_meta` minus
@@ -55,30 +55,30 @@ pub const VENDORED_N_FAMILIES: usize = 168;
 /// vendored bytes the way `tools/build_cc_namespace.py` does.
 ///
 /// Vendored byte-for-byte from CIRISConstitution commit [`VENDORED_CC_COMMIT`]
-/// (CC 1.0-rc7, the `v1.0-rc7` tag's commit), together with
+/// (CC 1.0-rc8, the `v1.0-rc8` tag's commit), together with
 /// `namespace_match_vectors.json` from the same commit. JSON carries no
 /// comments, so this doc is the vendored files' header.
 pub const VENDORED_REGISTRY_SHA256: &str =
-    "796f609981434b838edab1165462484f1be67889eed7f60c26b210ede5984464";
+    "99d4d3380f42941995c3b017b5ab98d6ebc4ddb00bd0e813f806e3906fe34a3b";
 
 /// The CIRISConstitution commit both vendored manifests were copied from: the
-/// commit the `v1.0-rc7` tag names (`536b8cb`, annotated tag `686d274`),
+/// commit the `v1.0-rc8` tag names (`cb77137`, annotated tag `4fdc81c`),
 /// copied from the tag itself, never a branch tip (CIRISPersist#753). The
 /// files are also pinned by their own SHA-256
 /// ([`VENDORED_REGISTRY_FILE_SHA256`], [`VENDORED_VECTORS_FILE_SHA256`]), and
-/// `scripts/check_vendored_cc.sh v1.0-rc7` byte-compares them against the tag
-/// before a persist release that names rc7 is tagged.
-pub const VENDORED_CC_COMMIT: &str = "536b8cbb931da1f4549425284af24cd227587c36";
+/// `scripts/check_vendored_cc.sh v1.0-rc8` byte-compares them against the tag
+/// before a persist release that names rc8 is tagged.
+pub const VENDORED_CC_COMMIT: &str = "cb7713719fc07919595e7c62c125218ac734bd3f";
 
 /// SHA-256 of the vendored `namespace_registry.json` FILE bytes (the whole file,
 /// unlike [`VENDORED_REGISTRY_SHA256`], which is CC's hash of the grammar).
 /// What `scripts/check_vendored_cc.sh` compares against the tag.
 pub const VENDORED_REGISTRY_FILE_SHA256: &str =
-    "6a14cb027ac65b8515f2004274278e73f4bcc4d3dfe233e9870c27c7d02d3c84";
+    "f3838bda2103632ea264c61f729bd056243d7a8a92c7395cdb7d2efdd0e0c6ce";
 
 /// SHA-256 of the vendored `namespace_match_vectors.json` FILE bytes.
 pub const VENDORED_VECTORS_FILE_SHA256: &str =
-    "8fc35ba167f1ab0d2cb5b4ea742865dff3fd92d1bd751105ddbb7fc191a73331";
+    "099b75193494023a37197c2774d62eba08ff1e4b907d328d330d8ebfd5e6bc64";
 
 /// v42.0.0 (CC 3.1.7 R3, CIRISPersist#815) — the case class of one dimension
 /// SEGMENT, read from the manifest rather than inferred from `{...}` in prose.
@@ -412,6 +412,218 @@ pub fn row_types() -> Option<&'static RowTypes> {
         raw.meta.row_types
     })
     .as_ref()
+}
+
+/// v58.0.0 (CC 3.1.7 R4 rc8, CIRISConstitution#148) — the score set one
+/// polarity CLASS admits, read from `_meta.polarity_classes`.
+///
+/// "Points are points, never intervals": a [`Points`](PolarityClass::Points)
+/// class admits exactly its listed scores (`-1 / -0.5 only` refuses `-0.7`),
+/// a [`Range`](PolarityClass::Range) its interval, and a
+/// [`PerLeaf`](PolarityClass::PerLeaf) parent constrains nothing itself — the
+/// leaf's own row answers (the reference's `score_admissible`).
+#[derive(Debug, Clone, PartialEq)]
+pub enum PolarityClass {
+    /// Exactly these scores, compared within `1e-9` as the reference does.
+    Points(Vec<f64>),
+    /// `(min, max]`, or `[min, max]` when `min_inclusive`.
+    Range {
+        /// The lower bound.
+        min: f64,
+        /// The inclusive upper bound.
+        max: f64,
+        /// Whether `min` itself is admitted (`positive-only` excludes zero).
+        min_inclusive: bool,
+    },
+    /// Resolve the leaf's own row; the parent admits any score.
+    PerLeaf,
+}
+
+/// The comparison tolerance the CC reference (`score_admissible`) applies to
+/// a point or an inclusive bound.
+const POLARITY_EPSILON: f64 = 1e-9;
+
+impl PolarityClass {
+    /// Does this class admit `score`? A port of the reference's
+    /// `score_admissible` arithmetic, byte for byte in its comparisons.
+    #[must_use]
+    pub fn admits(&self, score: f64) -> bool {
+        if !score.is_finite() {
+            return false;
+        }
+        match self {
+            PolarityClass::Points(points) => {
+                points.iter().any(|p| (score - p).abs() < POLARITY_EPSILON)
+            }
+            PolarityClass::Range {
+                min,
+                max,
+                min_inclusive,
+            } => {
+                let lo_ok =
+                    score > *min || (*min_inclusive && (score - min).abs() < POLARITY_EPSILON);
+                lo_ok && score <= *max
+            }
+            PolarityClass::PerLeaf => true,
+        }
+    }
+}
+
+/// The vendored `_meta.polarity_classes` (CC 3.1.7 R4, rc8): every class by
+/// name, the aliases that fold a catalogue label onto a class, and the refusal
+/// token. Parsed once; nothing in persist re-spells a class.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PolarityClasses {
+    /// Class name (`signed`, `+1.0 only`, …) → its score set.
+    pub classes: std::collections::BTreeMap<String, PolarityClass>,
+    /// Catalogue label → class name (`see CC 3.4.1` → `+1.0 only`).
+    pub aliases: std::collections::BTreeMap<String, String>,
+    /// The refusal token (`score_outside_declared_polarity`).
+    pub refusal: String,
+}
+
+impl PolarityClasses {
+    /// The class name a family's catalogue `polarity` label folds to
+    /// (`_aliases` applied once, as the reference applies it).
+    #[must_use]
+    pub fn class_name<'a>(&'a self, label: &'a str) -> &'a str {
+        self.aliases.get(label).map_or(label, String::as_str)
+    }
+}
+
+fn parse_polarity_classes(meta: &serde_json::Value) -> Option<PolarityClasses> {
+    let pc = meta.get("polarity_classes")?.as_object()?;
+    let num = |v: &serde_json::Value, what: &str, name: &str| -> f64 {
+        v.get(what)
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or_else(|| panic!("polarity class {name:?}: {what} is not a number"))
+    };
+    let mut classes = std::collections::BTreeMap::new();
+    for (name, spec) in pc {
+        // `_aliases`, `refusal` and `note` are the block's own keys, not classes.
+        let Some(kind) = spec.get("kind").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let class = match kind {
+            "points" => PolarityClass::Points(
+                spec["points"]
+                    .as_array()
+                    .unwrap_or_else(|| panic!("polarity class {name:?}: points[]"))
+                    .iter()
+                    .map(|p| {
+                        p.as_f64()
+                            .unwrap_or_else(|| panic!("polarity class {name:?}: a point"))
+                    })
+                    .collect(),
+            ),
+            "range" => PolarityClass::Range {
+                min: num(spec, "min", name),
+                max: num(spec, "max", name),
+                min_inclusive: spec
+                    .get("min_inclusive")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or_else(|| panic!("polarity class {name:?}: min_inclusive")),
+            },
+            "per_leaf" => PolarityClass::PerLeaf,
+            other => panic!("polarity class {name:?}: unknown kind {other:?}"),
+        };
+        classes.insert(name.clone(), class);
+    }
+    let aliases = pc
+        .get("_aliases")
+        .and_then(serde_json::Value::as_object)
+        .map(|o| {
+            o.iter()
+                .map(|(k, v)| {
+                    (
+                        k.clone(),
+                        v.as_str()
+                            .unwrap_or_else(|| panic!("polarity alias {k:?} is not a string"))
+                            .to_owned(),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let refusal = pc
+        .get("refusal")
+        .and_then(serde_json::Value::as_str)
+        .expect("_meta.polarity_classes.refusal")
+        .to_owned();
+    Some(PolarityClasses {
+        classes,
+        aliases,
+        refusal,
+    })
+}
+
+/// The vendored cut's `_meta.polarity_classes`, or `None` for a cut generated
+/// before rc8. Parsed once.
+#[must_use]
+pub fn polarity_classes() -> Option<&'static PolarityClasses> {
+    static P: OnceLock<Option<PolarityClasses>> = OnceLock::new();
+    P.get_or_init(|| {
+        let root: serde_json::Value =
+            serde_json::from_str(REGISTRY_JSON).expect("vendored namespace_registry.json is valid");
+        parse_polarity_classes(&root["_meta"])
+    })
+    .as_ref()
+}
+
+/// Every family's catalogue `polarity` label, by prefix. The one parse of the
+/// column (`scores_read_audit::vendored_family_polarities` reads its pairs
+/// from here).
+#[must_use]
+pub fn family_polarities() -> &'static std::collections::BTreeMap<String, String> {
+    static F: OnceLock<std::collections::BTreeMap<String, String>> = OnceLock::new();
+    F.get_or_init(|| {
+        let root: serde_json::Value =
+            serde_json::from_str(REGISTRY_JSON).expect("vendored namespace_registry.json is valid");
+        root["families"]
+            .as_array()
+            .expect("families[]")
+            .iter()
+            .filter_map(|f| {
+                Some((
+                    f.get("prefix")?.as_str()?.to_owned(),
+                    f.get("polarity")?.as_str()?.to_owned(),
+                ))
+            })
+            .collect()
+    })
+}
+
+/// The polarity class `family` (a registry prefix) declares: `(class name,
+/// class)`, aliases folded. `None` when the family declares no polarity, or
+/// declares a label the vendored `_meta.polarity_classes` does not name —
+/// which the reference also reads as "constrains nothing", and which
+/// `tests::every_family_polarity_resolves_to_a_class` makes a build failure.
+#[must_use]
+pub fn family_polarity_class(family: &str) -> Option<(&'static str, &'static PolarityClass)> {
+    let pc = polarity_classes()?;
+    let label = family_polarities().get(family)?;
+    let name = pc.class_name(label);
+    pc.classes.get_key_value(name).map(|(k, v)| (k.as_str(), v))
+}
+
+/// Test fixtures: a score `dimension`'s family class admits — `1.0` when the
+/// class holds it (or the dimension resolves to no classed family), else the
+/// class's first point, else its upper bound. So a fixture row on a `-1 only`
+/// family carries `-1.0` without the fixture spelling the class.
+#[cfg(any(test, feature = "test-anchor"))]
+#[must_use]
+pub fn in_class_score(dimension: &str) -> f64 {
+    let Some(family) = super::matcher::match_family(dimension).family else {
+        return 1.0;
+    };
+    match family_polarity_class(family) {
+        Some((_, c)) if !c.admits(1.0) => match c {
+            PolarityClass::Points(p) => p[0],
+            PolarityClass::Range { max, .. } => *max,
+            PolarityClass::PerLeaf => 1.0,
+        },
+        _ => 1.0,
+    }
 }
 
 /// The retired rc6 holding-claim carrier's type stem (`holds_bytes:`), named
@@ -877,6 +1089,17 @@ pub const VENDORED_FAMILY_PREFIXES: &[&str] = &[
     "ledger:head:{unit}:{version}",
     "ledger:promotion:{version}",
     "settlement:*",
+    // rc8 (CIRISConstitution v1.0-rc8 @ cb77137; CIRISPersist v58.0.0) — six
+    // families added, none retired. The five Retirement Standard rows
+    // (CC 3.1.5, CC 7.5.5) are registered so they parse and match; their doors
+    // are CIRISPersist#1083–#1088. `takedown_notice:{basis}:v1` (CC 3.1.1) is
+    // the one family under the gated `takedown_notice:` stem.
+    "archive_release:{basis}:v1",
+    "lawful_order:release:v1",
+    "preserve_request:v1",
+    "preserve_response:v1",
+    "retirement:{state}:v1",
+    "takedown_notice:{basis}:v1",
 ];
 
 /// Families CC has **deliberately retired** — present in an earlier vendored cut,
@@ -969,9 +1192,14 @@ mod tests {
 
     /// Python's `json.dumps(v, sort_keys=True, separators=(",", ":"))` with its
     /// default `ensure_ascii=True` — the preimage `tools/build_cc_namespace.py`
-    /// hashes for `_meta.registry_sha256`. The manifest carries no floats (a
-    /// float's repr is the one place the two serializers would disagree), and
-    /// this refuses one rather than guessing.
+    /// hashes for `_meta.registry_sha256`.
+    ///
+    /// Floats: rc8's `_meta.polarity_classes` carries the first ones (`-1.0`,
+    /// `-0.5`, `0.0`, `1.0`). Python's `repr(float)` and serde's ryu both print
+    /// the shortest round-tripping decimal, and agree whenever that decimal
+    /// needs no exponent (`1e-05` vs `1e-5` is where they part); so a float is
+    /// admitted only in plain positional form with its `.`, and anything else
+    /// is refused rather than guessed.
     fn python_canonical_json(v: &serde_json::Value, out: &mut String) {
         use serde_json::Value as V;
         fn string(s: &str, out: &mut String) {
@@ -1001,10 +1229,14 @@ mod tests {
             V::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
             V::Number(n) => {
                 let t = n.to_string();
-                assert!(
-                    !t.contains(['.', 'e', 'E']),
-                    "a float in the manifest: {t} — Python's repr and serde's may differ"
-                );
+                if n.is_f64() {
+                    assert!(
+                        t.contains('.') && !t.contains(['e', 'E']),
+                        "a float in exponent form: {t} — Python's repr and serde's differ"
+                    );
+                } else {
+                    assert!(!t.contains(['.', 'e', 'E']), "an integer printed as {t}");
+                }
                 out.push_str(&t);
             }
             V::String(s) => string(s, out),
@@ -1725,8 +1957,9 @@ mod tests {
         const READ_ELSEWHERE: &[(&str, &str)] = &[
             (
                 "polarity",
-                "scores_read_audit.rs#vendored_family_polarities (local parse, documented \
-                 at that site) + the #724 cross-manifest agreement gate",
+                "registry::family_polarities -> family_polarity_class (the CC 3.1.7 R4 \
+                 admission gate, admission::check_score_within_declared_polarity) + \
+                 scores_read_audit.rs#vendored_family_polarities + the #724 agreement gate",
             ),
             // v50.0.0 (CIRISPersist#924, CC 3.1.7 R2(b)/R3) — a reserved
             // wildcard family's published leaves and whether they are closed.
@@ -1822,6 +2055,11 @@ mod tests {
                 (
                     "case_rule",
                     "matcher::parse_rules (the grammar) — accounted key by key below",
+                ),
+                (
+                    "polarity_classes",
+                    "registry::polarity_classes -> family_polarity_class (CC 3.1.7 R4 rc8: \
+                     admission::check_score_within_declared_polarity)",
                 ),
                 (
                     "registry_sha256",

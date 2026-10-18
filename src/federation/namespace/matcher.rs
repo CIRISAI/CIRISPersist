@@ -17,7 +17,7 @@
 //!
 //! # Drift control
 //!
-//! CC publishes `manifests/namespace_match_vectors.json` — 1103 dimensions (rc7) with
+//! CC publishes `manifests/namespace_match_vectors.json` — 1147 dimensions (rc8) with
 //! the family each resolves to and the refusal each earns — and requires every
 //! consumer to replay them against its own matcher, "so a matcher that drifts
 //! from this one fails a build, not a card". The file is vendored byte-for-byte
@@ -960,6 +960,37 @@ pub fn refusal_from_token(token: &str) -> Option<Refusal> {
 }
 
 #[cfg(test)]
+pub(crate) mod tests_support {
+    /// A `scores` row carrying `envelope`, every other member inert.
+    pub(crate) fn scores_row(envelope: serde_json::Value) -> crate::federation::Attestation {
+        let now = chrono::Utc::now();
+        crate::federation::Attestation {
+            attestation_id: uuid::Uuid::new_v4().to_string(),
+            attesting_key_id: "k".to_owned(),
+            attested_key_id: "k".to_owned(),
+            attestation_type: crate::federation::types::attestation_type::SCORES.to_owned(),
+            weight: None,
+            asserted_at: now,
+            expires_at: None,
+            attestation_envelope: envelope,
+            original_content_hash: String::new(),
+            scrub_signature_classical: String::new(),
+            scrub_signature_pqc: None,
+            scrub_key_id: "k".to_owned(),
+            scrub_timestamp: now,
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+            subject_key_ids: Vec::new(),
+            withdraws_admission_rule: None,
+            cohort_scope: crate::federation::types::cohort_scope::SELF.to_owned(),
+            tier: crate::federation::types::attestation_tier::FEDERATION.to_owned(),
+            promoted_at: None,
+            additional_scrubs: Vec::new(),
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -988,8 +1019,8 @@ mod tests {
         let vs = vectors();
         assert_eq!(
             vs.len(),
-            1103,
-            "the rc7 vectors file (v1.0-rc7) carries 1103 dimension vectors"
+            1147,
+            "the rc8 vectors file (v1.0-rc8) carries 1147 dimension vectors"
         );
         let oracle: serde_json::Value = serde_json::from_str(BINDS_JSON).unwrap();
         let oracle = oracle["binds"].as_array().unwrap();
@@ -1052,32 +1083,140 @@ mod tests {
     }
 
     /// The enum spells exactly the manifest's `refusal_tokens`, both ways.
+    ///
+    /// Since rc8 the table also carries tokens that refuse something other
+    /// than a dimension's grammar: the row-type refusal (CC 2.4), the polarity
+    /// refusal (CC 3.1.7 R4), the steward-purge door's tokens (CC 2.4.1.1,
+    /// CIRISConstitution#165) and two CC tokens persist has no door for yet.
+    /// Each is accounted below with the reader that spells it, so a NEW token
+    /// in a re-vendor reds this test until someone says what reads it.
     #[test]
     fn refusal_tokens_are_the_manifests() {
+        use crate::federation::steward_purge::token as purge;
         let root: serde_json::Value =
             serde_json::from_str(super::super::registry::REGISTRY_JSON).unwrap();
         let tokens = root["_meta"]["case_rule"]["refusal_tokens"]
             .as_object()
             .unwrap();
-        // The manifest's token table also names the ROW-TYPE refusal (CC 2.4,
-        // `_meta.row_types.refusal`). It refuses an `attestation_type`, never a
-        // dimension, so the dimension matcher has no variant for it: it is
-        // excluded here by reading it from the manifest, not by spelling it.
         let row_type_refusal = root["_meta"]["row_types"]["refusal"].as_str().unwrap();
-        let dimension_tokens: Vec<&str> = tokens
-            .values()
-            .filter_map(|t| t.as_str())
-            .filter(|t| *t != row_type_refusal)
+        let polarity_refusal = root["_meta"]["polarity_classes"]["refusal"]
+            .as_str()
+            .unwrap();
+        // `(manifest key, the token persist spells for it, or None when
+        // persist has no door that raises it)`. Not dimension refusals, so the
+        // matcher has no variant for any of them.
+        let non_dimension: &[(&str, Option<&str>)] = &[
+            ("attestation_type_unregistered", Some(row_type_refusal)),
+            (
+                "score_outside_declared_polarity",
+                Some(
+                    crate::federation::admission::DimensionRejectionReason::ScoreOutsideDeclaredPolarity
+                        .as_str(),
+                ),
+            ),
+            ("purge_unauthorised", Some(purge::UNAUTHORISED)),
+            (
+                "purge_selection_digest_mismatch",
+                Some(purge::SELECTION_DIGEST_MISMATCH),
+            ),
+            (
+                "purge_selection_count_mismatch",
+                Some(purge::SELECTION_COUNT_MISMATCH),
+            ),
+            (
+                "purge_retraction_inadmissible",
+                Some(purge::RETRACTION_INADMISSIBLE),
+            ),
+            ("purge_not_settled", Some(purge::NOT_SETTLED)),
+            ("purge_tombstoned", Some(purge::TOMBSTONED)),
+            (
+                "trace_run_kind_mock",
+                Some(crate::federation::steward_purge::TRACE_RUN_KIND_MOCK),
+            ),
+            // CC 2.6.7 W (CIRISConstitution#167) — no persist door raises it
+            // at v58.0.0.
+            ("asserted_at_stale", None),
+            // CC 3.1.5 trace field shape (CIRISConstitution#166) — no persist
+            // door raises it at v58.0.0.
+            ("trace_field_shape_violation", None),
+        ];
+        assert_eq!(polarity_refusal, "score_outside_declared_polarity");
+        for (key, spelled) in non_dimension {
+            let manifest = tokens
+                .get(*key)
+                .and_then(|t| t.as_str())
+                .unwrap_or_else(|| panic!("stale non-dimension token pin {key:?}"));
+            if let Some(spelled) = spelled {
+                assert_eq!(*spelled, manifest, "{key}: persist spells it differently");
+            }
+            assert_eq!(
+                refusal_from_token(manifest),
+                None,
+                "{key} is not a dimension refusal"
+            );
+        }
+        let dimension_tokens: Vec<(&String, &str)> = tokens
+            .iter()
+            .filter(|(k, _)| !non_dimension.iter().any(|(n, _)| *n == k.as_str()))
+            .map(|(k, t)| (k, t.as_str().unwrap()))
             .collect();
-        assert_eq!(dimension_tokens.len() + 1, tokens.len());
-        assert_eq!(dimension_tokens.len(), Refusal::ALL.len());
-        assert_eq!(refusal_from_token(row_type_refusal), None);
+        assert_eq!(
+            dimension_tokens.len(),
+            Refusal::ALL.len(),
+            "a refusal token nothing accounts for: {dimension_tokens:?}"
+        );
         for r in Refusal::ALL {
             assert_eq!(
                 tokens.get(r.manifest_key()).and_then(|t| t.as_str()),
                 Some(r.as_str())
             );
             assert_eq!(refusal_from_token(r.as_str()), Some(r));
+        }
+    }
+
+    /// I1100 (v58.0.0, CC 3.1.7 R4 rc8) — **CC's `polarity_vectors` replay
+    /// through persist's admission gate.** Every vector names a family, a
+    /// score and the verdict; the gate
+    /// ([`check_score_within_declared_polarity`](crate::federation::admission::check_score_within_declared_polarity))
+    /// is driven with a `scores` row on that family's class-conformant sample
+    /// dimension and must agree, refusal token included. The loader reads the
+    /// key by name and asserts its count, so a vectors file that drops it (or
+    /// a loader that skips it) fails here rather than passing on nothing.
+    #[test]
+    fn i1100_polarity_vectors_replay_through_the_admission_gate() {
+        let root: serde_json::Value = serde_json::from_str(VECTORS_JSON).unwrap();
+        let pv = root["polarity_vectors"]
+            .as_array()
+            .expect("rc8 carries polarity_vectors");
+        assert_eq!(pv.len(), 10, "CC rc8 publishes 10 polarity vectors");
+        let refusal = super::super::registry::polarity_classes()
+            .expect("rc8 carries _meta.polarity_classes")
+            .refusal
+            .clone();
+        for v in pv {
+            let fam = v["family"].as_str().unwrap();
+            let score = v["score"].as_f64().unwrap();
+            let dim = sample_dimension(fam).unwrap_or_else(|| panic!("{fam}: no sample"));
+            assert_eq!(match_family(&dim).family, Some(fam), "{dim}");
+            let (class, _) = super::super::registry::family_polarity_class(fam)
+                .unwrap_or_else(|| panic!("{fam}: no polarity class"));
+            assert_eq!(Some(class), v["class"].as_str(), "{fam}");
+            let row = super::tests_support::scores_row(
+                serde_json::json!({"dimension": dim, "score": score}),
+            );
+            let got = crate::federation::admission::check_score_within_declared_polarity(&row);
+            match v["admissible"].as_bool().unwrap() {
+                true => assert!(got.is_ok(), "{fam} {score}: {got:?}"),
+                false => {
+                    assert_eq!(v["refusal"].as_str(), Some(refusal.as_str()));
+                    match got {
+                        Err(crate::federation::Error::DimensionRejected { reason, .. }) => {
+                            assert_eq!(reason, refusal, "{fam} {score}");
+                        }
+                        other => panic!("{fam} {score}: want {refusal}, got {other:?}"),
+                    }
+                }
+            }
         }
     }
 

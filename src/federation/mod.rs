@@ -571,6 +571,11 @@ mod lineage_head_invariants;
 /// families, the ledger owner rule, settlement admission.
 #[cfg(test)]
 mod rc7_vendor_invariants;
+/// v58.0.0 (slice V) — I1100–I1109, the CC v1.0-rc8 re-vendor: polarity
+/// classes at admission, the closed apophatic vocabulary, the rc8 families
+/// held shut, the ledger owner rule.
+#[cfg(test)]
+mod rc8_vendor_invariants;
 pub mod register;
 /// v53.0.0 (CC 3.2 T6, rc7 `36432c6`) — I450–I459, roster rows and the head.
 #[cfg(test)]
