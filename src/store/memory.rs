@@ -258,6 +258,10 @@ struct State {
     /// put door admitted, append-only, unique on
     /// `(identity, occurrence, asserted_at, attesting)`.
     federation_identity_occurrence_history: Vec<crate::federation::OccurrenceAssertion>,
+    /// v59.0.0 (CIRISPersist#1099) — the V199 mirror: this node's self-roster
+    /// proposal ledger, keyed by the proposal row's `attestation_id`.
+    self_roster_proposals:
+        std::collections::BTreeMap<String, crate::federation::self_roster::SelfRosterReceipt>,
     /// v14.1.0 (CIRISPersist#418, replication read) — signature container for
     /// signed-put occurrences, keyed like `federation_identity_occurrences`
     /// (`(attesting_key_id, signed_envelope, signature)`). Absent for
@@ -994,6 +998,7 @@ impl Default for MemoryBackend {
                 federation_peer_metadata: HashMap::new(),
                 federation_identity_occurrences: HashMap::new(),
                 federation_identity_occurrence_history: Vec::new(),
+                self_roster_proposals: std::collections::BTreeMap::new(),
                 federation_identity_occurrence_sigs: HashMap::new(),
                 federation_families: HashMap::new(),
                 federation_communities: HashMap::new(),
@@ -5521,6 +5526,9 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // v14.0.0 (CIRISPersist#418) — verify the signature gate BEFORE any write
         // (before locking; the gate locks state internally). Backend-symmetric.
         crate::federation::admission::verify_signed_identity_occurrence(self, &occurrence).await?;
+        // v59.0.0 (CIRISPersist#1099, CC 3.3.6.3) — a roster change lands by
+        // the two-path door or is held as a proposal.
+        crate::federation::self_roster::gate_occurrence(self, &occurrence).await?;
         let mut row = occurrence.identity_occurrence;
         crate::federation::check_device_class(&row.device_class)?;
         crate::federation::check_encryption_pubkeys(row.encryption_pubkeys.as_ref())?;
@@ -7046,6 +7054,9 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             &revocation,
         )
         .await?;
+        // v59.0.0 (CIRISPersist#1099, CC 3.3.6.3) — an eviction lands by the
+        // two-path door or is held as a proposal.
+        crate::federation::self_roster::gate_revocation(self, &revocation).await?;
         let crate::federation::SignedIdentityOccurrenceRevocation {
             identity_occurrence_revocation: mut row,
             attesting_key_id,
@@ -7219,6 +7230,76 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                         route_admitted_at,
                     );
                 }
+            }
+        }
+        Ok(())
+    }
+
+    async fn note_self_roster_proposal(
+        &self,
+        proposal_id: &str,
+        identity_key_id: &str,
+        received_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<crate::federation::self_roster::SelfRosterReceipt, crate::federation::Error> {
+        let mut state = self.state.lock().expect("memory backend lock");
+        // V199's FK: a receipt names a held row.
+        if !state
+            .federation_attestations
+            .iter()
+            .any(|a| a.attestation_id == proposal_id)
+        {
+            return Err(crate::federation::Error::InvalidArgument(format!(
+                "self-roster proposal {proposal_id} is not a held attestation"
+            )));
+        }
+        Ok(state
+            .self_roster_proposals
+            .entry(proposal_id.to_owned())
+            .or_insert_with(|| crate::federation::self_roster::SelfRosterReceipt {
+                proposal_id: proposal_id.to_owned(),
+                identity_key_id: identity_key_id.to_owned(),
+                received_at,
+                settled_at: None,
+                outcome: None,
+            })
+            .clone())
+    }
+
+    async fn list_open_self_roster_proposals(
+        &self,
+        identity_key_id: Option<&str>,
+    ) -> Result<Vec<crate::federation::self_roster::SelfRosterReceipt>, crate::federation::Error>
+    {
+        let state = self.state.lock().expect("memory backend lock");
+        let held: std::collections::HashSet<&str> = state
+            .federation_attestations
+            .iter()
+            .map(|a| a.attestation_id.as_str())
+            .collect();
+        let mut out: Vec<_> = state
+            .self_roster_proposals
+            .values()
+            .filter(|r| r.settled_at.is_none())
+            .filter(|r| identity_key_id.is_none_or(|i| r.identity_key_id == i))
+            // V199's ON DELETE CASCADE: a receipt whose row is gone is gone.
+            .filter(|r| held.contains(r.proposal_id.as_str()))
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| (a.received_at, &a.proposal_id).cmp(&(b.received_at, &b.proposal_id)));
+        Ok(out)
+    }
+
+    async fn settle_self_roster_proposal(
+        &self,
+        proposal_id: &str,
+        outcome: &str,
+        settled_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), crate::federation::Error> {
+        let mut state = self.state.lock().expect("memory backend lock");
+        if let Some(r) = state.self_roster_proposals.get_mut(proposal_id) {
+            if r.settled_at.is_none() {
+                r.settled_at = Some(settled_at);
+                r.outcome = Some(outcome.to_owned());
             }
         }
         Ok(())

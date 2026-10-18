@@ -9727,6 +9727,31 @@ impl Engine {
         .await
     }
 
+    /// v59.0.0 (CIRISPersist#1099, CC 3.3.6.3) — every open proposal to add
+    /// to or evict from `identity_key_id`'s key roster, decided now on this
+    /// node's clock. See
+    /// [`self_roster::standing`](crate::federation::self_roster::standing).
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn self_roster_standing(
+        &self,
+        identity_key_id: &str,
+    ) -> Result<Vec<crate::federation::self_roster::Standing>, crate::federation::Error> {
+        crate::federation::self_roster::standing(
+            self.federation_directory().as_ref(),
+            identity_key_id,
+        )
+        .await
+    }
+
+    /// v59.0.0 (CIRISPersist#1099, CC 3.3.6.3) — the sweep: execute every
+    /// open self-roster proposal that lands now (the lone path lands here,
+    /// when its window closes). Returns how many landed. See
+    /// [`self_roster::execute_due`](crate::federation::self_roster::execute_due).
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn execute_self_roster_due(&self) -> Result<usize, crate::federation::Error> {
+        crate::federation::self_roster::execute_due(self.federation_directory().as_ref()).await
+    }
+
     /// v46.3.0 (CIRISPersist#884, `FSD/SELF_COLLECTIVE_TRANSFER.md` §4) — the
     /// send set of `key_id` for a record at `cohort_scope`: the consent peers
     /// plus, for `self` / `family`, the NODES the key's principals own (and

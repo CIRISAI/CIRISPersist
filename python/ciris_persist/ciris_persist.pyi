@@ -833,6 +833,9 @@ class Engine:
     def evict_actor_json(self, attesting_key_id: str, now_iso: str) -> str:
         """(derived) deontic — v3.5.0 (CIRISPersist#125) — Federation blob storage: per-actor eviction. Deletes every federation_blobs row this Engine holds that attesting_key_id..."""
 
+    def execute_self_roster_due(self) -> int:
+        """(derived) deontic — v59.0.0 (CIRISPersist#1099, CC 3.3.6.3) — execute every open self-roster proposal that lands now; returns how many landed. Run it on a schedule: a..."""
+
     def federation_grant_trust(self, signed_grant_json: str) -> None:
         """(derived) deontic — Federation directory: grant trust to a key."""
 
@@ -1527,6 +1530,12 @@ class Engine:
     def secrets_update_filter_config(self, updates_json: str, accessor: str) -> str:
         """(derived) deontic — v0.6.1 — Write a new filter pattern catalog. Returns JSON-encoded FilterUpdateResult. [build-conditional: #[cfg(feature = "secrets")]]"""
 
+    def self_roster_standing(self, identity_key_id: str) -> str:
+        """(derived) deontic — v59.0.0 (CIRISPersist#1099, CC 3.3.6.3) — every open proposal to add to or evict from identity_key_id's key roster, decided now on this node's cloc..."""
+
+    def self_roster_vote_envelope(self, identity_key_id: str, proposal_id: str, assent: bool) -> str:
+        """(derived) deontic — v59.0.0 (CIRISPersist#1099, CC 3.3.6.3) — the envelope of an answer to a self-roster proposal (assent=True: an assent; False: an objection), for a..."""
+
     def serve_blob_to_peer_json(self, sha256_hex: str, requesting_peer_key_id: str) -> str:
         """(derived) deontic — v6.8.0 (CIRISPersist#149) — serve blob bytes to a federation PEER, with the proactive disk-pressure gate on the proxy-SERVE path. At the stop tier..."""
 
@@ -1985,7 +1994,6 @@ class Engine:
 
     def attach_key_pqc_signature(self, key_id: str, pubkey_ml_dsa_65_base64: str, scrub_signature_pqc: str) -> None:
         """(derived) ontological — Federation directory: attach the cold-path PQC signature to a hybrid-pending federation_keys row. See docs/FEDERATION_DIRECTORY.md §"Trust contract..."""
-
 
     def canonical_bootstrap_hints(self) -> str:
         """(derived) ontological — v13.6.0 (CIRISPersist#402, CIRISEdge#296) — the accord-attested bootstrap dial set as a compact JSON list edge consumes directly:"""

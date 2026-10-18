@@ -635,6 +635,14 @@ pub mod scores;
 pub mod scores_read_audit;
 pub mod steward_purge;
 pub mod two_path;
+// v59.0.0 (CIRISPersist#1099, CC 3.3.6.3) — the key roster of a self: the
+// two-path door its additions and evictions go through, and the steward
+// predicate (a live roster key signs as the fedID).
+pub mod self_roster;
+// CIRISPersist#1099 — I1130–I1139: the self-roster door and the steward
+// predicate on every backend.
+#[cfg(test)]
+mod self_roster_invariants;
 // v55.0.0 (CIRISPersist#1007) — the duty-holder takedown on the steward
 // purge's tombstone row (CC 4.5.3 step 2, CC 4.5.5).
 #[cfg(test)]
@@ -5257,6 +5265,51 @@ pub trait FederationDirectory: Send + Sync {
         ))
     }
 
+    /// v59.0.0 (CIRISPersist#1099, V199) — record that this node holds the
+    /// self-roster proposal row `proposal_id` for `identity_key_id`, first
+    /// seen at `received_at` (THIS node's clock: the window's start).
+    /// Insert-if-absent — the first instant stands and a re-note moves
+    /// nothing. Returns the held receipt.
+    async fn note_self_roster_proposal(
+        &self,
+        proposal_id: &str,
+        identity_key_id: &str,
+        received_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<self_roster::SelfRosterReceipt, Error> {
+        let _ = (proposal_id, identity_key_id, received_at);
+        Err(Error::Unsupported {
+            method: "note_self_roster_proposal",
+        })
+    }
+
+    /// v59.0.0 (CIRISPersist#1099, V199) — this node's OPEN (unsettled)
+    /// self-roster proposals, for one self or (`None`) every self, ordered
+    /// `(received_at, proposal_id)`.
+    async fn list_open_self_roster_proposals(
+        &self,
+        identity_key_id: Option<&str>,
+    ) -> Result<Vec<self_roster::SelfRosterReceipt>, Error> {
+        let _ = identity_key_id;
+        Err(Error::Unsupported {
+            method: "list_open_self_roster_proposals",
+        })
+    }
+
+    /// v59.0.0 (CIRISPersist#1099, V199) — settle an open proposal: executed
+    /// (`lands_quorum` / `lands_lone`) or refused for good. Write-once: a
+    /// settled or unknown proposal is left as it is.
+    async fn settle_self_roster_proposal(
+        &self,
+        proposal_id: &str,
+        outcome: &str,
+        settled_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), Error> {
+        let _ = (proposal_id, outcome, settled_at);
+        Err(Error::Unsupported {
+            method: "settle_self_roster_proposal",
+        })
+    }
+
     /// v4.8.0 — record a family-membership removal. Append-only;
     /// idempotent on the `(family_key_id, removed_identity_key_id,
     /// effective_at)` PK (v49.0.0, #910.1 — V154: a re-added member can be
@@ -9794,6 +9847,42 @@ pub enum Error {
         plane: &'static str,
     },
 
+    /// v59.0.0 (CIRISPersist#1099, CC 3.3.6.3) — **a self-roster change did
+    /// not land.** An addition to or an eviction from a self's key roster
+    /// (an `identity_occurrence` of a new user-role key; a revocation, framed
+    /// or as a `withdraws`, of a live one) signed by one key of a roster of two
+    /// or more is a PROPOSAL, not an effect: it lands at once by a strict
+    /// majority of the live roster, or by the lone path after `W_self` with no
+    /// strict majority of the other members objecting
+    /// ([`two_path`](crate::federation::two_path)). The door HELD it as an
+    /// `objection:proposal:v1` row (`decision` = `pending`), or refused it
+    /// (`decision` = a [`TwoPathRefusal`](crate::federation::two_path::TwoPathRefusal)
+    /// token). Nothing changed on the roster; the occurrence is not active and
+    /// the revocation has not taken effect. A held proposal lands by itself
+    /// when its answers or its window allow (no re-offer needed). Stable
+    /// `kind()` token `federation_self_roster_not_landed`; Python `ValueError`.
+    #[error(
+        "self-roster {kind} of {target_key_id:?} for {identity_key_id:?} did not land: \
+         {decision} (proposal {proposal_id}; lone path {earliest_lone_at:?}; quorum needs \
+         {needs} more) — CC 3.3.6.3: one key of a roster of two or more proposes"
+    )]
+    SelfRosterNotLanded {
+        /// The self (fedID) whose roster the change names.
+        identity_key_id: String,
+        /// The key added or evicted.
+        target_key_id: String,
+        /// `add` or `evict`.
+        kind: &'static str,
+        /// The proposal row's `attestation_id` (answers name it).
+        proposal_id: String,
+        /// `pending`, or the refusal token.
+        decision: &'static str,
+        /// When the lone path opens on this node's clock, if it is open.
+        earliest_lone_at: Option<chrono::DateTime<chrono::Utc>>,
+        /// Approvals the quorum path still needs (0 when refused).
+        needs: usize,
+    },
+
     /// v55.0.0 (CIRISPersist#1055, from CIRISEdge's adopt of v54.1) — **the
     /// signed row is malformed.** Its bytes cannot be read as the claim they
     /// carry: it names no signer, a member of its signed envelope is missing
@@ -12203,6 +12292,7 @@ impl Error {
             Error::SignatureInvalid(_) => "federation_signature_invalid",
             Error::AttesterKeyUnknown { .. } => "federation_attester_key_unknown",
             Error::SignerDoesNotActFor { .. } => "federation_signer_not_acting_for",
+            Error::SelfRosterNotLanded { .. } => "federation_self_roster_not_landed",
             Error::MalformedRow { .. } => "federation_malformed_row",
             Error::LicensureDelegatorNotAuthority { .. } => {
                 "federation_licensure_delegator_not_authority"

@@ -8942,6 +8942,9 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // producer envelope + signer authority + C4 BEFORE any write (one gate,
         // HTTP + wire; fail-secure). Backend-symmetric with SQLite.
         crate::federation::admission::verify_signed_identity_occurrence(self, &occurrence).await?;
+        // v59.0.0 (CIRISPersist#1099, CC 3.3.6.3) — a roster change lands by
+        // the two-path door or is held as a proposal.
+        crate::federation::self_roster::gate_occurrence(self, &occurrence).await?;
         self.rehome_legacy_key_plane().await?;
         let crate::federation::SignedIdentityOccurrence {
             identity_occurrence: mut row,
@@ -10673,6 +10676,9 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             &revocation,
         )
         .await?;
+        // v59.0.0 (CIRISPersist#1099, CC 3.3.6.3) — an eviction lands by the
+        // two-path door or is held as a proposal.
+        crate::federation::self_roster::gate_revocation(self, &revocation).await?;
         let crate::federation::SignedIdentityOccurrenceRevocation {
             identity_occurrence_revocation: mut row,
             attesting_key_id,
@@ -10820,6 +10826,91 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .await
             .map_err(map_revocation_pg_err("identity_occurrence_revocation"))?;
         Ok(())
+    }
+
+    async fn note_self_roster_proposal(
+        &self,
+        proposal_id: &str,
+        identity_key_id: &str,
+        received_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<crate::federation::self_roster::SelfRosterReceipt, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let backend = |e: tokio_postgres::Error| {
+            crate::federation::Error::Backend(format!("self-roster receipt: {e}"))
+        };
+        // V199 — first-seen wins; the FK names a held row.
+        client
+            .execute(
+                "INSERT INTO cirislens.federation_self_roster_proposals \
+                 (attestation_id, identity_key_id, received_at) \
+                 SELECT attestation_id, $2, $3 FROM cirislens.federation_attestations \
+                  WHERE attestation_id = $1 \
+                 ON CONFLICT (attestation_id) DO NOTHING",
+                &[&proposal_id, &identity_key_id, &received_at],
+            )
+            .await
+            .map_err(backend)?;
+        let row = client
+            .query_opt(
+                "SELECT attestation_id, identity_key_id, received_at, settled_at, outcome \
+                   FROM cirislens.federation_self_roster_proposals WHERE attestation_id = $1",
+                &[&proposal_id],
+            )
+            .await
+            .map_err(backend)?
+            .ok_or_else(|| {
+                crate::federation::Error::InvalidArgument(format!(
+                    "self-roster proposal {proposal_id} is not a held attestation"
+                ))
+            })?;
+        pg_self_roster_receipt(&row)
+    }
+
+    async fn list_open_self_roster_proposals(
+        &self,
+        identity_key_id: Option<&str>,
+    ) -> Result<Vec<crate::federation::self_roster::SelfRosterReceipt>, crate::federation::Error>
+    {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let rows = client
+            .query(
+                "SELECT attestation_id, identity_key_id, received_at, settled_at, outcome \
+                   FROM cirislens.federation_self_roster_proposals \
+                  WHERE settled_at IS NULL AND ($1::text IS NULL OR identity_key_id = $1) \
+                  ORDER BY received_at, attestation_id",
+                &[&identity_key_id],
+            )
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("self-roster receipts: {e}")))?;
+        rows.iter().map(pg_self_roster_receipt).collect()
+    }
+
+    async fn settle_self_roster_proposal(
+        &self,
+        proposal_id: &str,
+        outcome: &str,
+        settled_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        client
+            .execute(
+                "UPDATE cirislens.federation_self_roster_proposals \
+                    SET settled_at = $2, outcome = $3 \
+                  WHERE attestation_id = $1 AND settled_at IS NULL",
+                &[&proposal_id, &settled_at, &outcome],
+            )
+            .await
+            .map(|_| ())
+            .map_err(|e| crate::federation::Error::Backend(format!("self-roster settle: {e}")))
     }
 
     async fn put_family_membership_revocation(
@@ -24910,6 +25001,22 @@ async fn pg_insert_plane_row(
     )
     .await
     .map_err(map_attestation_pg_err("insert key-plane row"))
+}
+
+/// v59.0.0 (CIRISPersist#1099) — one V199 row as the receipt it is.
+fn pg_self_roster_receipt(
+    r: &tokio_postgres::Row,
+) -> Result<crate::federation::self_roster::SelfRosterReceipt, crate::federation::Error> {
+    let col = |e: tokio_postgres::Error| {
+        crate::federation::Error::Backend(format!("V199 row decode: {e}"))
+    };
+    Ok(crate::federation::self_roster::SelfRosterReceipt {
+        proposal_id: r.try_get(0).map_err(col)?,
+        identity_key_id: r.try_get(1).map_err(col)?,
+        received_at: r.try_get(2).map_err(col)?,
+        settled_at: r.try_get(3).map_err(col)?,
+        outcome: r.try_get(4).map_err(col)?,
+    })
 }
 
 /// v58.0.0 (CIRISPersist#991) — is V198 applied? A schema before it (only a

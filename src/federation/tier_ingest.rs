@@ -149,12 +149,6 @@ pub async fn verify_row_hybrid_signature<F>(directory: &F, row: &Attestation) ->
 where
     F: FederationDirectory + ?Sized,
 {
-    let reject = |reason: String| Error::FederationTierUnverified {
-        attestation_id: row.attestation_id.clone(),
-        attesting_key_id: row.attesting_key_id.clone(),
-        reason,
-    };
-
     // v58.0.0 (CIRISPersist#991, CC 3.1.3) — a key-plane row's signature is
     // its signed object's own, over the object's own bytes; the row is a pure
     // function of that object. The family's rule, not the generic one
@@ -162,7 +156,30 @@ where
     if super::key_plane::verify_plane_row(directory, row).await? {
         return Ok(());
     }
+    // v59.0.0 (CIRISPersist#1099) — a self-roster proposal row is minted from
+    // the signed object it carries, under the same rule.
+    if super::self_roster::verify_proposal_row(directory, row).await? {
+        return Ok(());
+    }
+    verify_envelope_signed_row(directory, row).await
+}
 
+/// v59.0.0 (CIRISPersist#1099) — [`verify_row_hybrid_signature`]'s generic
+/// rule alone: the row's own scrubs over its own canonical envelope, for a row
+/// that is not a minted one. The self-roster door verifies the `withdraws` a
+/// proposal carries with it (that row is never minted).
+pub(crate) async fn verify_envelope_signed_row<F>(
+    directory: &F,
+    row: &Attestation,
+) -> Result<(), Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let reject = |reason: String| Error::FederationTierUnverified {
+        attestation_id: row.attestation_id.clone(),
+        attesting_key_id: row.attesting_key_id.clone(),
+        reason,
+    };
     let computed_hash = verify_envelope_hybrid_signature(
         directory,
         &row.attesting_key_id,

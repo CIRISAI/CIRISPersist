@@ -26005,6 +26005,60 @@ impl PyEngine {
         })
     }
 
+    /// v59.0.0 (CIRISPersist#1099, CC 3.3.6.3) — every open proposal to add
+    /// to or evict from `identity_key_id`'s key roster, decided now on this
+    /// node's clock: a JSON array of `{proposal, decision, decided_at,
+    /// approvers, objectors}`, `decision.outcome` one of `lands` / `pending` /
+    /// a refusal token. What a host shows the self's devices so they answer.
+    fn self_roster_standing(&self, py: Python<'_>, identity_key_id: &str) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let identity = identity_key_id.to_owned();
+            let engine = self.hold_engine_view();
+            py.detach(move || {
+                let standing = self
+                    .runtime
+                    .block_on(engine.self_roster_standing(&identity))
+                    .map_err(federation_err_to_py)?;
+                serde_json::to_string(&standing)
+                    .map_err(|e| PyRuntimeError::new_err(format!("standing JSON encode: {e}")))
+            })
+        })
+    }
+
+    /// v59.0.0 (CIRISPersist#1099, CC 3.3.6.3) — execute every open
+    /// self-roster proposal that lands now; returns how many landed. Run it
+    /// on a schedule: a proposal that lands by the lone path lands here.
+    fn execute_self_roster_due(&self, py: Python<'_>) -> PyResult<usize> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let engine = self.hold_engine_view();
+            py.detach(move || {
+                self.runtime
+                    .block_on(engine.execute_self_roster_due())
+                    .map_err(federation_err_to_py)
+            })
+        })
+    }
+
+    /// v59.0.0 (CIRISPersist#1099, CC 3.3.6.3) — the envelope of an answer to
+    /// a self-roster proposal (`assent=True`: an assent; `False`: an
+    /// objection), for a roster key of `identity_key_id` to sign and put as a
+    /// `scores` row attested to `identity_key_id`. JSON object.
+    fn self_roster_vote_envelope(
+        &self,
+        identity_key_id: &str,
+        proposal_id: &str,
+        assent: bool,
+    ) -> PyResult<String> {
+        serde_json::to_string(&crate::federation::self_roster::vote_envelope(
+            identity_key_id,
+            proposal_id,
+            assent,
+        ))
+        .map_err(|e| PyRuntimeError::new_err(format!("vote envelope JSON encode: {e}")))
+    }
+
     /// v44.6.0 (#857 §4) — `resolve_scoped_consent` keyed by ANY key that
     /// stands for the subject; the per-principal fold combined as a reverse
     /// quorum on the stop. Returns the stance name. FFI mirror of
@@ -34666,6 +34720,13 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         // (ValueError), so it keeps that type; the KIND
         // (`federation_signer_not_acting_for`) marks it retryable.
         crate::federation::Error::SignerDoesNotActFor { .. } => PyValueError::new_err(kind),
+        // v59.0.0 (CIRISPersist#1099) — the roster change is held as a
+        // proposal (or refused); the decision and the proposal id ride the kind.
+        crate::federation::Error::SelfRosterNotLanded {
+            decision,
+            ref proposal_id,
+            ..
+        } => PyValueError::new_err(format!("{kind}: {decision}: {proposal_id}")),
         // v55.0.0 (CIRISPersist#1055) — typed out of `InvalidArgument`
         // (ValueError), so it keeps that type; the plane and the TERMINAL
         // reason token ride with the kind.

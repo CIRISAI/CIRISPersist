@@ -201,12 +201,16 @@ fn canonical_bytes(v: &serde_json::Value) -> Result<Vec<u8>, Error> {
 /// `sha256(domain ‖ JCS(object))`, as a UUID. One signed object, one id, on
 /// every node: a re-offer is the same row, and a changed object (a new
 /// scrub, a completed hybrid, a rebind) is a new row that replaces the old.
-pub(crate) fn plane_attestation_id(
-    family: KeyPlaneFamily,
+///
+/// The same rule names every row persist mints from a signed object it
+/// verified: the key plane's three families and the self-roster proposal
+/// (`super::self_roster`), each under its own id domain.
+pub(crate) fn minted_attestation_id(
+    id_domain: &[u8],
     object: &serde_json::Value,
 ) -> Result<String, Error> {
     let mut h = Sha256::new();
-    h.update(family.id_domain());
+    h.update(id_domain);
     h.update(canonical_bytes(object)?);
     let digest = h.finalize();
     let mut b = [0u8; 16];
@@ -232,14 +236,54 @@ pub(crate) fn plane_row(
     asserted_at: chrono::DateTime<chrono::Utc>,
     signature: PlaneSignature,
 ) -> Result<Attestation, Error> {
+    minted_row(
+        MintedFamily {
+            dimension: family.dimension(),
+            member: family.member(),
+            score: family.score(),
+            id_domain: family.id_domain(),
+        },
+        attesting_key_id,
+        attested_key_id,
+        object,
+        asserted_at,
+        signature,
+    )
+}
+
+/// What names a family of minted rows: its dimension, the envelope member
+/// its signed object rides under, its score, and its id domain.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct MintedFamily {
+    /// The row's `dimension`.
+    pub(crate) dimension: &'static str,
+    /// The envelope member carrying the signed object.
+    pub(crate) member: &'static str,
+    /// The row's `score`.
+    pub(crate) score: i64,
+    /// The id domain (`sha256(domain ‖ JCS(object))`).
+    pub(crate) id_domain: &'static [u8],
+}
+
+/// [`plane_row`] for any [`MintedFamily`]: the one builder of a row persist
+/// mints from a signed object, so the key plane and the self-roster proposal
+/// (`super::self_roster`) cannot spell the row two ways.
+pub(crate) fn minted_row(
+    family: MintedFamily,
+    attesting_key_id: &str,
+    attested_key_id: &str,
+    object: serde_json::Value,
+    asserted_at: chrono::DateTime<chrono::Utc>,
+    signature: PlaneSignature,
+) -> Result<Attestation, Error> {
     let mut object = object;
     super::canonical_at_rest::canonicalize_in_place(&mut object)?;
-    let attestation_id = plane_attestation_id(family, &object)?;
+    let attestation_id = minted_attestation_id(family.id_domain, &object)?;
     let mut members = serde_json::Map::new();
-    members.insert("dimension".to_owned(), family.dimension().into());
-    members.insert("score".to_owned(), family.score().into());
+    members.insert("dimension".to_owned(), family.dimension.into());
+    members.insert("score".to_owned(), family.score.into());
     members.insert("confidence".to_owned(), 1.into());
-    members.insert(family.member().to_owned(), object);
+    members.insert(family.member.to_owned(), object);
     let envelope = serde_json::Value::Object(members);
     let mut row = Attestation {
         attestation_id,

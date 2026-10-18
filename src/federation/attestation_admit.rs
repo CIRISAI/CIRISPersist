@@ -392,6 +392,16 @@ where
     let consent_change = super::consent_list_change_of(dir, &attestation.attestation).await;
     let occurrence_withdrawal =
         super::key_plane::occurrence_withdrawal_of(dir, &attestation.attestation).await?;
+    // v59.0.0 (CIRISPersist#1099, CC 3.3.6.3) — the row as offered, for the
+    // self-roster door: an eviction of a live roster key is a proposal.
+    let offered_withdrawal = occurrence_withdrawal
+        .as_ref()
+        .map(|_| attestation.attestation.clone());
+    // v59.0.0 (CIRISPersist#1099) — a proposal or an answer to one, executed
+    // after it is stored.
+    let roster_row = (super::self_roster::is_proposal_row(&attestation.attestation)
+        || super::self_roster::answer_identity(&attestation.attestation).is_some())
+    .then(|| attestation.attestation.clone());
     // v56.0.0 (CIRISPersist#934, CC review condition 1) — the ONE clock read
     // of this door, and the row's signed instant: the plan's two inputs. The
     // plan reads no clock of its own and the executor reads none either. A
@@ -411,13 +421,25 @@ where
                 }
                 AttestationOutcome::AlreadyHeld
             }
-            AttestationPlan::Insert(planned) => execute_planned(dir, *planned).await?,
+            AttestationPlan::Insert(planned) => {
+                if let (Some(offered), Some(revocation)) =
+                    (&offered_withdrawal, &occurrence_withdrawal)
+                {
+                    super::self_roster::gate_withdrawal(dir, offered, revocation).await?;
+                }
+                execute_planned(dir, *planned).await?
+            }
         };
         Ok(outcome)
     }
     .await;
     if let (Ok(AttestationOutcome::Inserted), Some((owner, node))) = (&outcome, consent_change) {
         super::rewrap_after_admission(dir, &owner, &node).await;
+    }
+    if let (Ok(AttestationOutcome::Inserted | AttestationOutcome::AlreadyHeld), Some(row)) =
+        (&outcome, &roster_row)
+    {
+        super::self_roster::after_admission(dir, row).await;
     }
     // v58.0.0 (CIRISPersist#991, CC 3.3.6) — an admitted `withdraws` against an
     // `identity:occurrence:v1` row feeds the occurrence-revocation projection

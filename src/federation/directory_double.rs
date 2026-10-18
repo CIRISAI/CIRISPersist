@@ -134,7 +134,7 @@ impl FaultInjectingDirectory {
     }
 }
 
-// 113 delegations, generated. Every one: fault first, then delegate.
+// 116 delegations, generated. Every one: fault first, then delegate.
 #[async_trait::async_trait]
 impl FederationDirectory for FaultInjectingDirectory {
     async fn apply_replicated_accord_evidence(
@@ -664,6 +664,17 @@ impl FederationDirectory for FaultInjectingDirectory {
         }
         self.inner.list_location_proofs_for(subject_key_id).await
     }
+    async fn list_open_self_roster_proposals(
+        &self,
+        identity_key_id: Option<&str>,
+    ) -> Result<Vec<self_roster::SelfRosterReceipt>, Error> {
+        if let Some(e) = self.faulted("list_open_self_roster_proposals") {
+            return Err(e);
+        }
+        self.inner
+            .list_open_self_roster_proposals(identity_key_id)
+            .await
+    }
     async fn list_org_memberships_for(&self, org_id: &str) -> Result<Vec<OrgMembership>, Error> {
         if let Some(e) = self.faulted("list_org_memberships_for") {
             return Err(e);
@@ -969,6 +980,19 @@ impl FederationDirectory for FaultInjectingDirectory {
             .lookup_signed_record_by_content_hash(kind, content_hash)
             .await
     }
+    async fn note_self_roster_proposal(
+        &self,
+        proposal_id: &str,
+        identity_key_id: &str,
+        received_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<self_roster::SelfRosterReceipt, Error> {
+        if let Some(e) = self.faulted("note_self_roster_proposal") {
+            return Err(e);
+        }
+        self.inner
+            .note_self_roster_proposal(proposal_id, identity_key_id, received_at)
+            .await
+    }
     async fn project_key_grant_row(&self, row: &Attestation) -> Result<(), Error> {
         if let Some(e) = self.faulted("project_key_grant_row") {
             return Err(e);
@@ -1175,6 +1199,19 @@ impl FederationDirectory for FaultInjectingDirectory {
             return Err(e);
         }
         self.inner.set_consent_role(key_id, consent_role).await
+    }
+    async fn settle_self_roster_proposal(
+        &self,
+        proposal_id: &str,
+        outcome: &str,
+        settled_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), Error> {
+        if let Some(e) = self.faulted("settle_self_roster_proposal") {
+            return Err(e);
+        }
+        self.inner
+            .settle_self_roster_proposal(proposal_id, outcome, settled_at)
+            .await
     }
     async fn store_invalid_replaced_key_record(
         &self,

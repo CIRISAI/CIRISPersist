@@ -5495,10 +5495,13 @@ pub fn check_encryption_pubkeys(
 /// (compiled without postgres/sqlite) calls it — a `cfg(any(postgres,sqlite))`
 /// gate here breaks reduced-feature builds (darwin no-postgres, the default-
 /// feature manifest bin) with E0425.
-pub async fn verify_signed_identity_occurrence(
-    directory: &dyn super::FederationDirectory,
+pub async fn verify_signed_identity_occurrence<D>(
+    directory: &D,
     signed: &crate::federation::types::SignedIdentityOccurrence,
-) -> Result<(), Error> {
+) -> Result<(), Error>
+where
+    D: super::FederationDirectory + ?Sized,
+{
     use ciris_verify_core::threshold::ThresholdMember;
     use ciris_verify_core::transport_binding::{
         verify_transport_binding, EncryptionPubkeys as VEnc, TransportBinding, TransportDestination,
@@ -5681,10 +5684,13 @@ fn same_instant_ms(envelope: &str, typed: chrono::DateTime<chrono::Utc>) -> bool
 ///    against the PINNED federation pubkeys of `attesting_key_id`;
 /// 3. [`check_signer_acts_for`] with the row's own occurrence key, so a node
 ///    may vouch for its own occurrence through a live owner binding.
-async fn verify_content_only_identity_occurrence(
-    directory: &dyn super::FederationDirectory,
+async fn verify_content_only_identity_occurrence<D>(
+    directory: &D,
     signed: &crate::federation::types::SignedIdentityOccurrence,
-) -> Result<(), Error> {
+) -> Result<(), Error>
+where
+    D: super::FederationDirectory + ?Sized,
+{
     use ciris_verify_core::threshold::{
         verify_threshold_signatures, ThresholdMember, ThresholdSignature,
     };
@@ -5850,12 +5856,15 @@ async fn verify_content_only_identity_occurrence(
 /// single-vouch-for-self). Anything else — including another *registered* but
 /// unrelated key — is refused: a peer cannot sign (or revoke) a victim's
 /// occurrence with its own key.
-async fn check_signer_acts_for(
-    directory: &dyn super::FederationDirectory,
+pub(crate) async fn check_signer_acts_for<D>(
+    directory: &D,
     attesting_key_id: &str,
     identity_key_id: &str,
     plane: &'static str,
-) -> Result<(), Error> {
+) -> Result<(), Error>
+where
+    D: super::FederationDirectory + ?Sized,
+{
     if attesting_key_id == identity_key_id {
         return Ok(());
     }
@@ -5926,10 +5935,13 @@ async fn check_signer_acts_for(
 /// #418 cfg lesson).
 ///
 /// [`verify_threshold_signatures`]: ciris_verify_core::threshold::verify_threshold_signatures
-pub async fn verify_signed_identity_occurrence_revocation(
-    directory: &dyn super::FederationDirectory,
+pub async fn verify_signed_identity_occurrence_revocation<D>(
+    directory: &D,
     signed: &crate::federation::types::SignedIdentityOccurrenceRevocation,
-) -> Result<(), Error> {
+) -> Result<(), Error>
+where
+    D: super::FederationDirectory + ?Sized,
+{
     use ciris_verify_core::threshold::{
         verify_threshold_signatures, ThresholdMember, ThresholdSignature,
     };
@@ -10355,7 +10367,23 @@ pub(crate) async fn live_delegation_granters<F: super::FederationDirectory + ?Si
     subject: &str,
     filter: DelegationEdgeFilter,
 ) -> Result<std::collections::BTreeSet<String>, Error> {
-    let mut out: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    Ok(live_delegation_granter_instants(directory, subject, filter)
+        .await?
+        .into_keys()
+        .collect())
+}
+
+/// v59.0.0 (CIRISPersist#1099) — [`live_delegation_granters`] with each
+/// granter's EARLIEST live edge's signed `asserted_at`: THE body of the walk
+/// (the granter set is this map's keys). The ownership projection reads the
+/// instant to name the self a roster key signed as ([`live_owner_binding_granters`]).
+pub(crate) async fn live_delegation_granter_instants<F: super::FederationDirectory + ?Sized>(
+    directory: &F,
+    subject: &str,
+    filter: DelegationEdgeFilter,
+) -> Result<std::collections::BTreeMap<String, chrono::DateTime<chrono::Utc>>, Error> {
+    let mut out: std::collections::BTreeMap<String, chrono::DateTime<chrono::Utc>> =
+        std::collections::BTreeMap::new();
     // Per-walk memo: granter key_id → "is a live `user`-role anchor for
     // `subject`" (resolves + carries `user` + has not retracted against
     // `subject`). Bounds the granter-scoped reads by DISTINCT granters.
@@ -10433,7 +10461,8 @@ pub(crate) async fn live_delegation_granters<F: super::FederationDirectory + ?Si
         // Already established live for this granter — the remaining checks are
         // granter-scoped, not edge-scoped, so a second edge from the same
         // human costs no reads.
-        if out.contains(&r.attesting_key_id) {
+        if let Some(at) = out.get_mut(&r.attesting_key_id) {
+            *at = (*at).min(r.asserted_at);
             continue;
         }
         // The two granter-scoped reads are memoized per walk: several edges
@@ -10444,7 +10473,7 @@ pub(crate) async fn live_delegation_granters<F: super::FederationDirectory + ?Si
         // agreement is the property CIRISPersist#584 is about).
         if let Some(live) = granter_live.get(r.attesting_key_id.as_str()) {
             if *live {
-                out.insert(r.attesting_key_id);
+                out.insert(r.attesting_key_id, r.asserted_at);
             }
             continue;
         }
@@ -10467,7 +10496,7 @@ pub(crate) async fn live_delegation_granters<F: super::FederationDirectory + ?Si
         let live = is_user && !granter_retracted;
         granter_live.insert(r.attesting_key_id.clone(), live);
         if live {
-            out.insert(r.attesting_key_id);
+            out.insert(r.attesting_key_id, r.asserted_at);
         }
     }
     Ok(out)
@@ -10853,7 +10882,19 @@ async fn live_owner_binding_granters<F: super::FederationDirectory + ?Sized>(
     directory: &F,
     node: &str,
 ) -> Result<std::collections::BTreeSet<String>, Error> {
-    live_delegation_granters(directory, node, DelegationEdgeFilter::OwnerBindingOnly).await
+    // v59.0.0 (CIRISPersist#1099, CC 3.3.6.3, `CLM-self-roster-authority`) —
+    // a binding a live roster key signed is its SELF's binding: each granter
+    // is named as the self it signed as at its binding's `asserted_at`
+    // ([`self_of_at`](super::self_roster::self_of_at)), so a second device
+    // restating its owner's binding is the same one steward, not a second.
+    let mut owners = std::collections::BTreeSet::new();
+    for (granter, at) in
+        live_delegation_granter_instants(directory, node, DelegationEdgeFilter::OwnerBindingOnly)
+            .await?
+    {
+        owners.insert(super::self_roster::self_of_at(directory, &granter, at).await?);
+    }
+    Ok(owners)
 }
 
 /// v38.3.0 (CIRISPersist#765, measured by CIRISServer's two-node chat
@@ -11165,7 +11206,17 @@ pub async fn check_single_node_owner_admission(
     // attesting owner blocks admission — a node cannot accrue a second steward.
     let incumbents = live_owner_binding_granters(directory, &row.attested_key_id).await?;
     for incumbent in incumbents {
-        if incumbent != row.attesting_key_id {
+        // v59.0.0 (CIRISPersist#1099, CC 3.3.6.3) — the incumbent self, or a
+        // live roster key of it at the row's `asserted_at`, is the same one
+        // steward (THE steward predicate); a key of another self is not.
+        if !super::self_roster::acts_as_steward_at(
+            directory,
+            &incumbent,
+            &row.attesting_key_id,
+            row.asserted_at,
+        )
+        .await?
+        {
             return Err(Error::NodeAlreadyOwned {
                 node_key_id: row.attested_key_id.clone(),
                 incumbent_owner: incumbent,

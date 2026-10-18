@@ -6722,6 +6722,9 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         // producer envelope, the signer's authority, and §5.6.8.8.2 C4 key
         // separation BEFORE any write. ONE gate for HTTP + wire; fail-secure.
         crate::federation::admission::verify_signed_identity_occurrence(self, &occurrence).await?;
+        // v59.0.0 (CIRISPersist#1099, CC 3.3.6.3) — a roster change lands by
+        // the two-path door or is held as a proposal.
+        crate::federation::self_roster::gate_occurrence(self, &occurrence).await?;
         self.rehome_legacy_key_plane().await?;
 
         let crate::federation::SignedIdentityOccurrence {
@@ -8512,6 +8515,9 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             &revocation,
         )
         .await?;
+        // v59.0.0 (CIRISPersist#1099, CC 3.3.6.3) — an eviction lands by the
+        // two-path door or is held as a proposal.
+        crate::federation::self_roster::gate_revocation(self, &revocation).await?;
         let crate::federation::SignedIdentityOccurrenceRevocation {
             identity_occurrence_revocation: mut row,
             attesting_key_id,
@@ -8656,6 +8662,86 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         .await
         .map_err(map_revocation_sqlite_err("identity_occurrence_revocation"))?;
         Ok(())
+    }
+
+    async fn note_self_roster_proposal(
+        &self,
+        proposal_id: &str,
+        identity_key_id: &str,
+        received_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<crate::federation::self_roster::SelfRosterReceipt, crate::federation::Error> {
+        let (id, identity) = (proposal_id.to_owned(), identity_key_id.to_owned());
+        let at = self_roster_instant_text(received_at);
+        let held = self
+            .write(
+                move |conn| -> Result<Option<SelfRosterRow>, rusqlite::Error> {
+                    // V199 — first-seen wins; the FK names a held row.
+                    conn.execute(
+                        "INSERT OR IGNORE INTO federation_self_roster_proposals \
+                     (attestation_id, identity_key_id, received_at) \
+                     SELECT attestation_id, ?2, ?3 FROM federation_attestations \
+                      WHERE attestation_id = ?1",
+                        rusqlite::params![id, identity, at],
+                    )?;
+                    conn.query_row(
+                        "SELECT attestation_id, identity_key_id, received_at, settled_at, outcome \
+                       FROM federation_self_roster_proposals WHERE attestation_id = ?1",
+                        rusqlite::params![id],
+                        self_roster_row,
+                    )
+                    .optional()
+                },
+            )
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("self-roster receipt: {e}")))?;
+        held.ok_or_else(|| {
+            crate::federation::Error::InvalidArgument(format!(
+                "self-roster proposal {proposal_id} is not a held attestation"
+            ))
+        })?
+        .into_receipt()
+    }
+
+    async fn list_open_self_roster_proposals(
+        &self,
+        identity_key_id: Option<&str>,
+    ) -> Result<Vec<crate::federation::self_roster::SelfRosterReceipt>, crate::federation::Error>
+    {
+        let identity = identity_key_id.map(str::to_owned);
+        let rows = self
+            .read(move |conn| -> Result<Vec<SelfRosterRow>, rusqlite::Error> {
+                let mut stmt = conn.prepare(
+                    "SELECT attestation_id, identity_key_id, received_at, settled_at, outcome \
+                       FROM federation_self_roster_proposals \
+                      WHERE settled_at IS NULL AND (?1 IS NULL OR identity_key_id = ?1) \
+                      ORDER BY received_at, attestation_id",
+                )?;
+                let rows = stmt.query_map(rusqlite::params![identity], self_roster_row)?;
+                rows.collect()
+            })
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("self-roster receipts: {e}")))?;
+        rows.into_iter().map(SelfRosterRow::into_receipt).collect()
+    }
+
+    async fn settle_self_roster_proposal(
+        &self,
+        proposal_id: &str,
+        outcome: &str,
+        settled_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), crate::federation::Error> {
+        let (id, outcome) = (proposal_id.to_owned(), outcome.to_owned());
+        let at = self_roster_instant_text(settled_at);
+        self.write(move |conn| {
+            conn.execute(
+                "UPDATE federation_self_roster_proposals SET settled_at = ?2, outcome = ?3 \
+                  WHERE attestation_id = ?1 AND settled_at IS NULL",
+                rusqlite::params![id, at, outcome],
+            )
+        })
+        .await
+        .map(|_| ())
+        .map_err(|e| crate::federation::Error::Backend(format!("self-roster settle: {e}")))
     }
 
     async fn put_family_membership_revocation(
@@ -20968,6 +21054,50 @@ fn sqlite_factor_rollup_upsert_sql(source_filter: &str) -> String {
             audit_seq_trace_count = excluded.audit_seq_trace_count, \
             audit_sig_trace_count = excluded.audit_sig_trace_count"
     )
+}
+
+/// v59.0.0 (CIRISPersist#1099) — the V199 instant spelling: fixed-width
+/// RFC 3339 at microseconds, so `ORDER BY received_at` orders as time does.
+fn self_roster_instant_text(t: chrono::DateTime<chrono::Utc>) -> String {
+    t.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string()
+}
+
+/// One V199 row as stored.
+struct SelfRosterRow {
+    proposal_id: String,
+    identity_key_id: String,
+    received_at: String,
+    settled_at: Option<String>,
+    outcome: Option<String>,
+}
+
+fn self_roster_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<SelfRosterRow> {
+    Ok(SelfRosterRow {
+        proposal_id: r.get(0)?,
+        identity_key_id: r.get(1)?,
+        received_at: r.get(2)?,
+        settled_at: r.get(3)?,
+        outcome: r.get(4)?,
+    })
+}
+
+impl SelfRosterRow {
+    fn into_receipt(
+        self,
+    ) -> Result<crate::federation::self_roster::SelfRosterReceipt, crate::federation::Error> {
+        let instant = |s: &str| {
+            parse_sqlite_instant(s).ok_or_else(|| {
+                crate::federation::Error::Backend(format!("V199 instant {s:?} does not parse"))
+            })
+        };
+        Ok(crate::federation::self_roster::SelfRosterReceipt {
+            received_at: instant(&self.received_at)?,
+            settled_at: self.settled_at.as_deref().map(instant).transpose()?,
+            proposal_id: self.proposal_id,
+            identity_key_id: self.identity_key_id,
+            outcome: self.outcome,
+        })
+    }
 }
 
 /// v54.1.0 (CIRISPersist#1046) — the V187 instant spelling: fixed-width

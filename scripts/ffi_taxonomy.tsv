@@ -743,6 +743,9 @@ ScoringFactorStream	__len__	structural
 ScoringFactorStream	__next__	structural	
 ScoringFactorStream	summary	epistemic	
 Engine	consent_peers_by_principals	deontic	
+Engine	execute_self_roster_due	deontic	
+Engine	self_roster_standing	deontic	
+Engine	self_roster_vote_envelope	deontic	
 Engine	resolve_scoped_consent_by_principals	deontic	
 # v53.1.8 (CIRISPersist#1013) — `capacity_consent_stance` is DEONTIC: it is the
 # consent-before-scoring gate's own fold; a wrong answer admits or refuses a score.
