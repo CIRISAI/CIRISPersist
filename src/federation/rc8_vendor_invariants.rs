@@ -318,6 +318,16 @@ mod pure {
         assert!(policy
             .check("scores", Some("chat:weapons_harmful:v1"), USER)
             .is_err());
+        // So is a value in an OPEN enumeration that is not one of its listed
+        // values: only a CLOSED list is CC's whole vocabulary.
+        assert_eq!(
+            match_family("locality:decision:harmful_zone:v1").refusal,
+            None,
+            "the probe resolves cleanly"
+        );
+        assert!(policy
+            .check("scores", Some("locality:decision:harmful_zone:v1"), USER)
+            .is_err());
     }
 
     /// **I1105** — `settlement:*` unreserved; `ledger:*` on the owner rule.
