@@ -419,8 +419,11 @@ pub(crate) mod bodies {
 #[cfg(test)]
 mod run {
     use super::bodies;
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     use crate::federation::silo_projection::{check_projection_rebuild, SiloProjection};
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     use crate::federation::FederationDirectory;
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     use crate::store::Backend as _;
 
     fn tag(n: &str) -> String {
