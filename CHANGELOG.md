@@ -181,13 +181,15 @@ record are `scores` rows on the attestation plane; `federation_keys`,
   signatures.
 - Witnesses I975–I980 on memory, sqlite and postgres (each with a red leg).
 
-### Changed — CC v1.0-rc8 vendored (slice V)
+### Changed — CC v1.0-rc8.1 vendored (slice V)
 
-Both manifests are copied byte-for-byte from the `v1.0-rc8` tag (commit
-`cb77137`, annotated tag `4fdc81c`): registry `99d4d338…`, 174 families
-(168 at rc7), 1147 dimension vectors (1103), 25 row-type vectors, and a new
-`polarity_vectors` list of 10. `scripts/check_vendored_cc.sh v1.0-rc8` passes.
-The binds oracle is regenerated at the tag. `registry.rs` re-pins
+Both manifests are copied byte-for-byte from CIRISConstitution v1.0-rc8.1:
+registry `22b029cf…`, 174 families (168 at rc7), 1147 dimension vectors
+(1103), 25 row-type vectors, and a new `polarity_vectors` list of 10.
+`scripts/check_vendored_cc.sh v1.0-rc8.1` is the ship gate. v1.0-rc8
+(`cb77137`) was not vendored: its six new families carried a literal `:v1`
+inside the prefix, so CC's matcher demanded `takedown_notice:dmca512:v1:v1`
+(CIRISEdge found it). The binds oracle is regenerated. `registry.rs` re-pins
 `VENDORED_CC_VERSION`, `VENDORED_SOURCE_SHA256`, `VENDORED_N_FAMILIES`,
 `VENDORED_REGISTRY_SHA256`, `VENDORED_CC_COMMIT` and both file hashes.
 
@@ -250,12 +252,11 @@ What persist does with it:
   `boolean-via-score` as [0, 1] where CC's class is {−1, +1}. The pinning
   census gains the four new single-point families, and `accord:*`, whose
   `see CC 3.4.1` label CC now aliases to `+1.0 only` (15 in all).
-- **CC rc8 defect, recorded.** All six new families spell their version as a
-  literal `v1` in the prefix, so CC's reference matcher, and persist's port,
-  demand a second version tail: `takedown_notice:dmca512:v1` is refused
-  `missing_version_segment` and only `takedown_notice:dmca512:v1:v1`
-  resolves. The published vectors say the same. Persist matches the
-  reference; I1102 pins it and reds when a re-vendor fixes the generator.
+- **The six families parse as the prose writes them.** `retirement:{state}`,
+  `preserve_request`, `preserve_response`, `archive_release:{basis}`,
+  `lawful_order:release` and `takedown_notice:{basis}` take one trailing
+  version: `takedown_notice:dmca512:v1` resolves cleanly and the doubled
+  `…:v1:v1` form is `namespace_dimension_case_malformed`. I1102 pins it.
 - **The ledger owner rule is unchanged in effect.** The owner, a live
   occurrence of the owner, or the owner's node binding admits; a stranger is
   refused. A `delegates_to` delegate is still refused: CC 3.3.10.1 clause 3

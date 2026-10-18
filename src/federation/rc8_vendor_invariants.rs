@@ -9,7 +9,7 @@
 //! - **I1102** (pure) — the five Retirement Standard families (CC 3.1.5)
 //!   parse and match: each resolves to its own row, a closed `{basis}` refuses
 //!   a value outside it.
-//! - **I1103** (pure) — `takedown_notice:{basis}:v1` (CC 3.1.1) admits every
+//! - **I1103** (pure) — `takedown_notice:{basis}` (CC 3.1.1) admits every
 //!   one of its eleven bases as the only family under the gated
 //!   `takedown_notice:` stem; any other leaf is unregistered and a basis off
 //!   the closed list is refused.
@@ -158,34 +158,27 @@ mod pure {
         check_score_within_declared_polarity(&r).unwrap();
     }
 
-    /// **I1102** — the Retirement Standard rows parse and match, exactly as
-    /// CC's reference matcher answers them.
+    /// **I1102** — the Retirement Standard rows parse and match as the prose
+    /// writes them.
     ///
-    /// **CC rc8 defect, pinned as the reference states it.** All six rc8
-    /// families spell their version as a LITERAL segment (`…:v1`) rather than
-    /// a `{version}` placeholder, so the R3 trailing-version rule demands a
-    /// second tail: the prose wire form `retirement:retired:v1` is refused
-    /// `missing_version_segment`, and only `retirement:retired:v1:v1`
-    /// resolves cleanly (the published vectors say the same:
-    /// `retirement:sample:v1` → `missing_version_segment`). Persist's matcher
-    /// is a port and must agree with the reference, so the fix is CC's
-    /// generator; this witness reds when a re-vendor fixes it.
+    /// CC v1.0-rc8 declared these six families with a LITERAL `:v1` inside
+    /// the prefix, so the R3 trailing-version rule demanded a second tail and
+    /// the prose form (`retirement:retired:v1`) was refused
+    /// `missing_version_segment`. CC v1.0-rc8.1 (found by CIRISEdge before
+    /// persist shipped the rc8 vendor) corrects the prefixes. This witness
+    /// pins the FIX: the single-`:v1` form resolves cleanly and the doubled
+    /// `:v1:v1` form is malformed.
     #[test]
     fn i1102_retirement_families_parse_and_match() {
         for (dim, fam) in [
-            ("retirement:retired:v1:v1", "retirement:{state}:v1"),
-            ("retirement:retiring:v1:v1", "retirement:{state}:v1"),
-            ("preserve_request:v1:v1", "preserve_request:v1"),
-            ("preserve_response:v1:v1", "preserve_response:v1"),
-            (
-                "archive_release:wa_approval:v1:v1",
-                "archive_release:{basis}:v1",
-            ),
-            (
-                "archive_release:lawful_order:v1:v1",
-                "archive_release:{basis}:v1",
-            ),
-            ("lawful_order:release:v1:v1", "lawful_order:release:v1"),
+            ("retirement:retired:v1", "retirement:{state}"),
+            ("retirement:retiring:v1", "retirement:{state}"),
+            ("preserve_request:v1", "preserve_request"),
+            ("preserve_response:v1", "preserve_response"),
+            ("archive_release:wa_approval:v1", "archive_release:{basis}"),
+            ("archive_release:lawful_order:v1", "archive_release:{basis}"),
+            ("lawful_order:release:v1", "lawful_order:release"),
+            ("takedown_notice:dmca512:v1", "takedown_notice:{basis}"),
         ] {
             let m = match_family(dim);
             assert_eq!((m.family, m.refusal), (Some(fam), None), "I1102 {dim}");
@@ -193,26 +186,21 @@ mod pure {
                 registry::VENDORED_FAMILY_PREFIXES.contains(&fam),
                 "I1102 {fam} is pinned against silent removal"
             );
-            // The single-tail prose form: the CC defect above.
-            let single = dim.strip_suffix(":v1").unwrap();
+            let doubled = format!("{dim}:v1");
             assert_eq!(
-                (match_family(single).family, match_family(single).refusal),
-                (Some(fam), Some(Refusal::MissingVersionSegment)),
-                "I1102 {single}: CC rc8's literal-v1 prefixes still demand a second tail"
+                match_family(&doubled).refusal,
+                Some(Refusal::CaseMalformed),
+                "I1102 {doubled}: the doubled version tail CC rc8 demanded is malformed at rc8.1"
             );
         }
-        for dim in [
-            "archive_release:self_approval:v1:v1",
-            "archive_release:self_approval:v1",
-        ] {
-            assert_eq!(
-                match_family(dim).refusal,
-                Some(Refusal::VocabValueUnregistered),
-                "I1102 archive_release's basis is closed: {dim}"
-            );
-        }
+        let dim = "archive_release:self_approval:v1";
         assert_eq!(
-            placeholder_values("archive_release:{basis}:v1", "{basis}"),
+            match_family(dim).refusal,
+            Some(Refusal::VocabValueUnregistered),
+            "I1102 archive_release's basis is closed: {dim}"
+        );
+        assert_eq!(
+            placeholder_values("archive_release:{basis}", "{basis}"),
             Some((
                 &["wa_approval".to_owned(), "lawful_order".to_owned()][..],
                 false
@@ -239,20 +227,26 @@ mod pure {
     #[test]
     fn i1103_takedown_notice_is_the_only_family_under_its_stem() {
         let (values, open) =
-            placeholder_values("takedown_notice:{basis}:v1", "{basis}").expect("closed basis");
+            placeholder_values("takedown_notice:{basis}", "{basis}").expect("closed basis");
         assert!(!open);
         assert_eq!(values, TAKEDOWN_BASES, "I1103 the registry's basis list");
-        // The doubled tail: the CC rc8 literal-`v1` defect pinned at I1102.
+        // CC rc8.1: one trailing version; the doubled tail rc8 demanded is
+        // malformed (I1102 pins the same for the other five families).
         for basis in TAKEDOWN_BASES {
-            let dim = format!("takedown_notice:{basis}:v1:v1");
+            let dim = format!("takedown_notice:{basis}:v1");
             let m = match_family(&dim);
             assert_eq!(
                 (m.family, m.refusal),
-                (Some("takedown_notice:{basis}:v1"), None),
+                (Some("takedown_notice:{basis}"), None),
                 "I1103 {dim}"
             );
             assert_eq!(
-                match_family(&format!("takedown_notice:{basis}:v1")).refusal,
+                match_family(&format!("{dim}:v1")).refusal,
+                Some(Refusal::CaseMalformed),
+                "I1103 {dim}:v1"
+            );
+            assert_eq!(
+                match_family(&format!("takedown_notice:{basis}")).refusal,
                 Some(Refusal::MissingVersionSegment)
             );
         }
@@ -261,21 +255,15 @@ mod pure {
                 .any(|s| s == "takedown_notice:"),
             "I1103 the stem is gated"
         );
-        // Expectations are the CC reference matcher's own answers.
+        // Expectations are CC rc8.1's published vectors.
         for (dim, want) in [
-            ("takedown_notice:other", Refusal::FamilyUnregistered),
-            ("takedown_notice:dmca512:v2", Refusal::FamilyUnregistered),
-            (
-                "takedown_notice:dmca512:extra:v1",
-                Refusal::FamilyUnregistered,
-            ),
+            ("takedown_notice:dmca512:V1", Refusal::CaseMalformed),
+            ("takedown_notice:dmca512:v1:v2", Refusal::CaseMalformed),
+            ("takedown_notice:DMCA512:v1", Refusal::CaseMalformed),
             ("takedown_notice:other:v1", Refusal::VocabValueUnregistered),
+            // persist's shipped LegalBasis spelling is not CC's (#803).
             (
-                "takedown_notice:other:v1:v1",
-                Refusal::VocabValueUnregistered,
-            ),
-            (
-                "takedown_notice:dmca_512:v1:v1",
+                "takedown_notice:dmca_512:v1",
                 Refusal::VocabValueUnregistered,
             ),
         ] {

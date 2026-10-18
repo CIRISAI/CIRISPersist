@@ -38,11 +38,11 @@ pub(super) const REGISTRY_JSON: &str = include_str!("namespace_registry.json");
 
 /// The CC version [`REGISTRY_JSON`] was generated from. Bump in lockstep when
 /// re-vendoring (the drift gate asserts the file's `_meta.cc_version` matches).
-pub const VENDORED_CC_VERSION: &str = "1.0-rc8";
+pub const VENDORED_CC_VERSION: &str = "1.0-rc8.1";
 /// SHA-256 of the CC `part_3_the_namespace.md` bytes the manifest was generated
 /// from (the manifest's `_meta.source_sha256`). Pins the exact source cut.
 pub const VENDORED_SOURCE_SHA256: &str =
-    "edaa43d7c60d5d123ceac6d5153e8a1f6d714b8dac3bc389c1c0e3b7221b13e2";
+    "73aa281f38b6d486ae24127393b8a3b3ec79ddad56fb19a8538db2a87e18f947";
 /// The number of prefix families in this vendored cut (the enumerated leaf
 /// count; CC 3.1's "83" summary is stale — see CIRISConstitution#30).
 pub const VENDORED_N_FAMILIES: usize = 174;
@@ -55,30 +55,33 @@ pub const VENDORED_N_FAMILIES: usize = 174;
 /// vendored bytes the way `tools/build_cc_namespace.py` does.
 ///
 /// Vendored byte-for-byte from CIRISConstitution commit [`VENDORED_CC_COMMIT`]
-/// (CC 1.0-rc8, the `v1.0-rc8` tag's commit), together with
+/// (CC 1.0-rc8.1; see [`VENDORED_CC_COMMIT`] for the tag), together with
 /// `namespace_match_vectors.json` from the same commit. JSON carries no
 /// comments, so this doc is the vendored files' header.
 pub const VENDORED_REGISTRY_SHA256: &str =
-    "99d4d3380f42941995c3b017b5ab98d6ebc4ddb00bd0e813f806e3906fe34a3b";
+    "22b029cfd977acce779c9481cdb381a4ad274b15e5b8206ac3d502ba7535b495";
 
 /// The CIRISConstitution commit both vendored manifests were copied from: the
-/// commit the `v1.0-rc8` tag names (`cb77137`, annotated tag `4fdc81c`),
-/// copied from the tag itself, never a branch tip (CIRISPersist#753). The
+/// commit the `v1.0-rc8.1` tag names, copied from the tag, never a branch tip
+/// (CIRISPersist#753). v1.0-rc8 (`cb77137`) was not vendored: its six new
+/// families carried a literal `:v1` in the prefix (CIRISEdge found it). The
 /// files are also pinned by their own SHA-256
 /// ([`VENDORED_REGISTRY_FILE_SHA256`], [`VENDORED_VECTORS_FILE_SHA256`]), and
-/// `scripts/check_vendored_cc.sh v1.0-rc8` byte-compares them against the tag
-/// before a persist release that names rc8 is tagged.
-pub const VENDORED_CC_COMMIT: &str = "cb7713719fc07919595e7c62c125218ac734bd3f";
+/// `scripts/check_vendored_cc.sh v1.0-rc8.1` byte-compares them against the tag
+/// before a persist release that names rc8.1 is tagged.
+// TODO(v1.0-rc8.1 tag): re-pin to the tag's commit at ship; c5c8f56 is the
+// rc8.1 branch head, whose manifests CC states are byte-identical to the tag's.
+pub const VENDORED_CC_COMMIT: &str = "c5c8f56d476fb561739e96856fb35b073ea2a6f8";
 
 /// SHA-256 of the vendored `namespace_registry.json` FILE bytes (the whole file,
 /// unlike [`VENDORED_REGISTRY_SHA256`], which is CC's hash of the grammar).
 /// What `scripts/check_vendored_cc.sh` compares against the tag.
 pub const VENDORED_REGISTRY_FILE_SHA256: &str =
-    "f3838bda2103632ea264c61f729bd056243d7a8a92c7395cdb7d2efdd0e0c6ce";
+    "44d4d4805990b420c57eaa4c662032ad845d2182c0c6d00199212d1c35b7a9ef";
 
 /// SHA-256 of the vendored `namespace_match_vectors.json` FILE bytes.
 pub const VENDORED_VECTORS_FILE_SHA256: &str =
-    "099b75193494023a37197c2774d62eba08ff1e4b907d328d330d8ebfd5e6bc64";
+    "c1a989a73a66d3371939216fd61351ad56acc5e60289b0162a96f8d44e279b6d";
 
 /// v42.0.0 (CC 3.1.7 R3, CIRISPersist#815) — the case class of one dimension
 /// SEGMENT, read from the manifest rather than inferred from `{...}` in prose.
@@ -1089,17 +1092,17 @@ pub const VENDORED_FAMILY_PREFIXES: &[&str] = &[
     "ledger:head:{unit}:{version}",
     "ledger:promotion:{version}",
     "settlement:*",
-    // rc8 (CIRISConstitution v1.0-rc8 @ cb77137; CIRISPersist v58.0.0) — six
+    // rc8.1 (CIRISConstitution v1.0-rc8.1; CIRISPersist v58.0.0) — six
     // families added, none retired. The five Retirement Standard rows
     // (CC 3.1.5, CC 7.5.5) are registered so they parse and match; their doors
     // are CIRISPersist#1083–#1088. `takedown_notice:{basis}:v1` (CC 3.1.1) is
     // the one family under the gated `takedown_notice:` stem.
-    "archive_release:{basis}:v1",
-    "lawful_order:release:v1",
-    "preserve_request:v1",
-    "preserve_response:v1",
-    "retirement:{state}:v1",
-    "takedown_notice:{basis}:v1",
+    "archive_release:{basis}",
+    "lawful_order:release",
+    "preserve_request",
+    "preserve_response",
+    "retirement:{state}",
+    "takedown_notice:{basis}",
 ];
 
 /// Families CC has **deliberately retired** — present in an earlier vendored cut,

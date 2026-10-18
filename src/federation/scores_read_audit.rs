@@ -508,14 +508,14 @@ pub const PINNING_FAMILIES: &[&str] = &[
     "accord:lifecycle",
     "accord:lifecycle:active",
     "accord:lifecycle:confirmed",
-    "archive_release:{basis}:v1",
+    "archive_release:{basis}",
     "key:revocation",
-    "lawful_order:release:v1",
-    "preserve_request:v1",
+    "lawful_order:release",
+    "preserve_request",
     "prohibited:{category}",
     "revocation:{entity_type}:{reason}",
     "rollback_detected:{revision_field}",
-    "takedown_notice:{basis}:v1",
+    "takedown_notice:{basis}",
 ];
 
 /// Which fold a feasibility question is asked under.

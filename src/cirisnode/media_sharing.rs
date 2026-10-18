@@ -1292,7 +1292,7 @@ mod tests {
         const KNOWN_SPELLING_DIVERGENCES: &[(&str, &str)] =
             &[("dmca_512", "dmca512"), ("dsa_article_16", "dsa_article16")];
         let (values, open) = crate::federation::namespace::matcher::placeholder_values(
-            "takedown_notice:{basis}:v1",
+            "takedown_notice:{basis}",
             "{basis}",
         )
         .expect("rc8 registers takedown_notice:{basis}:v1 with a closed basis");
