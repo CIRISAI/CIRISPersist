@@ -1183,11 +1183,17 @@ pub async fn key_records_on_the_plane(
 
 /// Test support: the key plane as a replicating peer pulls it — through the
 /// attestation stream (`list_attestations_since`), the framed key-plane
-/// cursors being retired in v58.0.0.
-#[cfg(test)]
+/// cursors being retired in v58.0.0. Compiled under `test-anchor` too: the
+/// `*_invariants` modules consumers drive (e.g. `key_grant_invariants`) call it.
+#[cfg(any(test, feature = "test-anchor"))]
 // The no-backend builds hold only the memory backend, whose witnesses read
 // the plane directly; the served-row reads are the SQL tests' fixtures.
-#[cfg_attr(not(any(feature = "sqlite", feature = "postgres")), allow(dead_code))]
+// Under `test-anchor` without `test`, only the consumer-driven invariants
+// call in, and they read occurrences alone.
+#[cfg_attr(
+    any(not(test), not(any(feature = "sqlite", feature = "postgres"))),
+    allow(dead_code)
+)]
 pub(crate) mod test_support {
     use super::super::types::{ServedIdentityOccurrence, ServedKeyRecord};
     use super::super::{Error, FederationDirectory};
