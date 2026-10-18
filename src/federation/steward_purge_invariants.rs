@@ -2980,7 +2980,7 @@ pub(crate) mod bodies {
     fn fed_row(id: &str, attester: &str, attested: &str, dimension: &str) -> Attestation {
         let env = serde_json::json!({
             "dimension": dimension,
-            "score": 1.0,
+            "score": crate::federation::namespace::registry::in_class_score(dimension),
             "confidence": 0.9,
         });
         let mut row = ts::bare_attestation(id, attester, attested, &env);
@@ -2993,7 +2993,35 @@ pub(crate) mod bodies {
         root(d).await;
         let dir = d.as_dyn_directory();
         let t = now();
-        let revocation = uuid::Uuid::new_v4().to_string();
+        // v58.0.0 (CIRISPersist#991) — the key-plane revocation is the
+        // canonical `key:revocation:v1` row of a signed self-revocation: its
+        // id is derived from the revocation, so the bundle names that id.
+        let signed_revocation = ts::seal_revocation(crate::federation::Revocation {
+            revocation_id: uuid::Uuid::new_v4().to_string(),
+            revoked_key_id: Some(AGENT.to_owned()),
+            revoked_key_sha256_ed25519_raw: ts::subject_digest_of(AGENT),
+            revoking_key_id: AGENT.to_owned(),
+            reason: Some("i697 self-revocation".to_owned()),
+            revoked_at: t,
+            effective_at: t,
+            revocation_envelope: serde_json::json!({ "revokes": AGENT }),
+            original_content_hash: String::new(),
+            scrub_signature_classical: String::new(),
+            scrub_signature_pqc: None,
+            scrub_key_id: AGENT.to_owned(),
+            scrub_timestamp: t,
+            pqc_completed_at: None,
+            observed_region: crate::federation::verify_coord::region::US.to_owned(),
+            revoked_after: None,
+            persist_row_hash: String::new(),
+        });
+        let revocation = {
+            let mut planned = signed_revocation.clone();
+            planned.pqc_completed_at = Some(planned.scrub_timestamp);
+            crate::federation::key_plane::revocation_row(&planned)
+                .expect("the revocation's row")
+                .attestation_id
+        };
         let track = uuid::Uuid::new_v4().to_string();
         let plain = uuid::Uuid::new_v4().to_string();
         // A bundle naming three ids this node does not hold yet.
@@ -3019,15 +3047,25 @@ pub(crate) mod bodies {
         assert_eq!(applied.tombstoned, 3);
 
         // The named rows ARRIVE: the accountability record is admitted.
-        for (id, attester, attested, dimension) in [
-            (&revocation, AGENT, AGENT, "key:revocation:v1"),
-            (
-                &track,
-                HARNESS,
-                BYSTANDER,
-                "moderation_track_record:ciris-canonical:v1",
-            ),
-        ] {
+        // v58.0.0 (CIRISPersist#991) — the `key:revocation:v1` row arrives
+        // through its own door (`put_revocation`), over the tombstone.
+        dir.put_revocation(crate::federation::SignedRevocation {
+            revocation: signed_revocation,
+        })
+        .await
+        .unwrap_or_else(|e| {
+            panic!("I697: a key:revocation:v1 row is admitted over a tombstone: {e:?}")
+        });
+        assert!(
+            dir.get_attestation(&revocation).await.unwrap().is_some(),
+            "I697: the revocation's row is the bundle-named id"
+        );
+        for (id, attester, attested, dimension) in [(
+            &track,
+            HARNESS,
+            BYSTANDER,
+            "moderation_track_record:ciris-canonical:v1",
+        )] {
             dir.put_attestation(SignedAttestation {
                 attestation: fed_row(id, attester, attested, dimension),
             })

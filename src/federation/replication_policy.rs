@@ -601,6 +601,27 @@ pub const SETTLE_EXEMPT: &[(EnvelopeKind, &str)] = &[
         "rides the attestation store; a re-delivered row must still reach the apply door, which \
          projects a pending row once its bytes name the author (I65 step 4)",
     ),
+    (
+        EnvelopeKind::Key,
+        "v58.0.0 (CIRISPersist#991): rides the attestation store as a key-plane row, whose \
+         key-plane door settles a byte-identical re-offer (key_plane::apply_key_plane_row); \
+         the framed door a pre-v58 peer still drives is that family's own door, unchanged \
+         by the compat reads",
+    ),
+    (
+        EnvelopeKind::Revocation,
+        "v58.0.0 (CIRISPersist#991): rides the attestation store as a key-plane row, whose \
+         key-plane door settles a byte-identical re-offer (key_plane::apply_key_plane_row); \
+         the framed door a pre-v58 peer still drives is that family's own door, unchanged \
+         by the compat reads",
+    ),
+    (
+        EnvelopeKind::IdentityOccurrence,
+        "v58.0.0 (CIRISPersist#991): rides the attestation store as a key-plane row, whose \
+         key-plane door settles a byte-identical re-offer (key_plane::apply_key_plane_row); \
+         the framed door a pre-v58 peer still drives is that family's own door, unchanged \
+         by the compat reads",
+    ),
 ];
 
 static ALREADY_HELD: [std::sync::atomic::AtomicU64; EnvelopeKind::ALL.len()] =

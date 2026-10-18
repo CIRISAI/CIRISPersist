@@ -670,12 +670,12 @@ pub(crate) mod dyn_bodies {
         let older = put(
             "older",
             now - Duration::minutes(2),
-            now + Duration::milliseconds(1500),
+            now + Duration::seconds(10),
         );
         let newer = put(
             "newer",
             now - Duration::minutes(1),
-            now + Duration::milliseconds(500),
+            now + Duration::seconds(5),
         );
         for r in [&older, &newer] {
             d.put_attestation(SignedAttestation {
@@ -695,13 +695,22 @@ pub(crate) mod dyn_bodies {
             Some(newer.attestation_id.clone()),
             "I776 precondition"
         );
-        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+        // v58.0.0 — the windows are seconds wide and each wait is measured to
+        // the row's own expiry from the clock: a put slowed by a loaded host
+        // (certify under memory pressure) once outlived a 500 ms window
+        // before the precondition was read.
+        let until = |t: chrono::DateTime<Utc>| {
+            (t - Utc::now() + Duration::milliseconds(300))
+                .to_std()
+                .unwrap_or_default()
+        };
+        tokio::time::sleep(until(newer.expires_at.expect("I776 newer expires"))).await;
         assert_eq!(
             live().await,
             Some(older.attestation_id.clone()),
             "I776 the latest listing expired: the older live one is the room's"
         );
-        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+        tokio::time::sleep(until(older.expires_at.expect("I776 older expires"))).await;
         assert_eq!(
             live().await,
             None,

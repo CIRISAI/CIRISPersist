@@ -155,6 +155,14 @@ where
         reason,
     };
 
+    // v58.0.0 (CIRISPersist#991, CC 3.1.3) — a key-plane row's signature is
+    // its signed object's own, over the object's own bytes; the row is a pure
+    // function of that object. The family's rule, not the generic one
+    // (`key_plane::verify_plane_row`).
+    if super::key_plane::verify_plane_row(directory, row).await? {
+        return Ok(());
+    }
+
     let computed_hash = verify_envelope_hybrid_signature(
         directory,
         &row.attesting_key_id,
@@ -1899,7 +1907,8 @@ pub mod test_support {
 
     /// v50.0.0 (CIRISPersist#925 review item 5) — a SIGNED revocation of the
     /// binding `{identity → occurrence}`, signed by `signer` (the identity or an
-    /// active occurrence of it), taking effect at `effective_at`.
+    /// active occurrence of it), taking effect at `effective_at`. v58.0.0 (compat
+    /// reads) — the framed authoring door's input, beside [`occurrence_withdrawal`].
     pub async fn signed_occurrence_revocation(
         signer: &str,
         identity: &str,
@@ -1946,6 +1955,59 @@ pub mod test_support {
             attesting_key_id: signer.to_owned(),
             signed_envelope,
             signature,
+        }
+    }
+    /// v58.0.0 (CIRISPersist#991, CC 3.3.6) — an occurrence's revocation: a
+    /// `withdraws` against the pair's held `identity:occurrence:v1` row,
+    /// hybrid-signed by `signer` (the identity or a live occurrence of it),
+    /// asserted (revoked and effective) at `effective_at`. Panics when the
+    /// pair holds no signed occurrence row.
+    pub async fn occurrence_withdrawal<D: crate::federation::FederationDirectory + ?Sized>(
+        dir: &D,
+        signer: &str,
+        identity: &str,
+        occurrence: &str,
+        effective_at: chrono::DateTime<chrono::Utc>,
+    ) -> crate::federation::SignedAttestation {
+        let held = dir
+            .list_signed_identity_occurrences_for(identity)
+            .await
+            .expect("list occurrences")
+            .into_iter()
+            .find(|s| s.identity_occurrence.occurrence_key_id == occurrence)
+            .expect("the pair holds a signed occurrence");
+        let target = crate::federation::key_plane::occurrence_row(&held)
+            .expect("the held occurrence has a row")
+            .attestation_id;
+        let row = Attestation {
+            attestation_id: uuid::Uuid::new_v4().to_string(),
+            attesting_key_id: signer.to_owned(),
+            attested_key_id: identity.to_owned(),
+            attestation_type: crate::federation::types::attestation_type::WITHDRAWS.to_owned(),
+            weight: None,
+            asserted_at: effective_at,
+            expires_at: None,
+            attestation_envelope: serde_json::json!({
+                "dimension": crate::federation::key_plane::IDENTITY_OCCURRENCE_DIMENSION,
+                "references_attestation_id": target,
+                "withdrawal_reason": "occurrence revoked",
+            }),
+            original_content_hash: String::new(),
+            scrub_signature_classical: String::new(),
+            scrub_signature_pqc: None,
+            scrub_key_id: signer.to_owned(),
+            scrub_timestamp: effective_at,
+            pqc_completed_at: Some(effective_at),
+            persist_row_hash: String::new(),
+            subject_key_ids: Vec::new(),
+            withdraws_admission_rule: None,
+            cohort_scope: crate::federation::types::cohort_scope::FEDERATION.to_owned(),
+            tier: crate::federation::types::attestation_tier::FEDERATION.to_owned(),
+            promoted_at: None,
+            additional_scrubs: Vec::new(),
+        };
+        crate::federation::SignedAttestation {
+            attestation: seal_row(signer, row),
         }
     }
 

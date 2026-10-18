@@ -81,9 +81,10 @@ pub const DRILL_YELLOW_MAX_DAYS: i64 = 180;
 /// genesis root a *shelf life*: a baked witness ages out, so ~90 days after
 /// a mint every node depending on that root would darken together, with no
 /// error at the point of use. That is the wrong failure mode for the wrong
-/// question. A root is valid until **revoked, halted, or un-trusted** —
-/// tombstones, the accord halt latch, and the user's own edge are the
-/// revocation mechanisms, and they are all still hard gates. What a stale
+/// question. A root is valid until **revoked or un-trusted** — tombstones
+/// and the user's own edge are the revocation mechanisms, and they are still
+/// hard gates (v58.0.0: a constitutional halt is likewise reported beside the
+/// verdict and gates nothing — CIRISPersist#1094, CC 3.2 T3). What a stale
 /// drill actually distinguishes is *governed* from *abandoned*, which a
 /// consumer should surface to a human, not enforce against a peer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -135,10 +136,11 @@ impl DrillFreshness {
 /// - [`TrustRootVerdict::valid`] **does not consult it**. A root with a red
 ///   drill signal serves normally.
 ///
-/// **A genesis root is valid until revoked, halted, or un-trusted.**
-/// Tombstones (`withdraws` / `recants`), the accord halt latch, and the
-/// user's own `trust:accepts:v1` edge are the revocation mechanisms, and all
-/// three remain hard gates. Requiring liveness ON TOP of them gave the
+/// **A genesis root is valid until revoked or un-trusted.**
+/// Tombstones (`withdraws` / `recants`) and the user's own `trust:accepts:v1`
+/// edge are the revocation mechanisms, and both remain hard gates (the accord
+/// halt latch was a third until v58.0.0 — CIRISPersist#1094 — and is now a
+/// reported signal like the drill). Requiring liveness ON TOP of them gave the
 /// artifact a shelf life instead: a BAKED witness ages out, so ~90 days
 /// after a mint every node depending on that root darkened **together**,
 /// with no error at the point of use. Shelf life is gone
@@ -852,9 +854,15 @@ pub struct TrustRootVerdict {
     /// id): `Some(true)` = a halt is latched (brake pulled); `Some(false)`
     /// = present-and-clear; `None` = this backend cannot answer
     /// (halt storage unsupported) — reported honestly, never guessed.
+    ///
+    /// v58.0.0 (CIRISPersist#1094; CC 3.2 T3/T8, 4.2.1.1) — **a signal,
+    /// never a gate**, exactly like [`Self::drill_freshness`]: absent from
+    /// [`Self::valid`]. A constitutional halt pauses agents; the agent's act
+    /// gate is its only gate. It stays on the verdict because a halt must be
+    /// observable.
     pub halt_latched: Option<bool>,
-    /// The gate: every leg holds (including charter recovery) and no halt
-    /// is latched.
+    /// The gate: every leg holds (including charter recovery and holder
+    /// hardware). Neither the drill nor the halt latch is a leg.
     pub valid: bool,
     /// v24.0.0 (CIRISPersist#557) — which arm produced this verdict. `#[serde(default)]`
     /// = [`RootKind::Key`], so payloads from pre-v24 producers deserialize unchanged.
@@ -1353,7 +1361,12 @@ where
 /// 2. `root` self-declares (`delegates_to(root → root)` with an
 ///    `infra:attest` / `infra:serve` scope), live, carrying a recovery
 ///    pre-commitment;
-/// 3. no accord halt is latched for `root`.
+/// 3. every holder of a family root is hardware-attested (v47.3.0, #901).
+///
+/// A latched constitutional halt is **not** a leg (v58.0.0, CIRISPersist#1094;
+/// CC 3.2 T3/T8 and 4.2.1.1 as ruled 2026-10-15). It is read and reported as
+/// [`TrustRootVerdict::halt_latched`] and gates nothing here: a halt pauses
+/// agents, and the agent's act gate is its only reader-as-gate.
 ///
 /// # v24.0.0 (CIRISPersist#557) — `root_ref` may name a FAMILY
 ///
@@ -1365,7 +1378,7 @@ where
 /// |---|---|---|
 /// | edge | `delegates_to(user → root_key)` | `delegates_to(user → family_id)` |
 /// | charter | `delegates_to(root → root)`, self-signed | `delegates_to(holder → family)` whose FULL scrub set reaches the family's own threshold |
-/// | halt | `get_active_halt(root_key)` (always misses — the table is family-keyed) | `get_active_halt(family_id)` — the accord's real 2-of-3 kill switch |
+/// | halt (reported, not a leg since v58.0.0) | `get_active_halt(root_key)` (always misses — the table is family-keyed) | `get_active_halt(family_id)` — the accord's kill switch, surfaced beside the verdict |
 ///
 /// The threshold is re-derived from the node's OWN stored state — the family
 /// row's `consensus_protocol`, floored at a strict majority of its OWN
@@ -1383,8 +1396,9 @@ where
 /// ([`TrustRootVerdict::last_drill_at`] /
 /// [`TrustRootVerdict::drill_freshness`]). v23.0.0 (CIRISPersist#551 item
 /// 4) removed the drill from the conjunction: a root is valid until
-/// revoked, halted, or un-trusted, and a deadman on top of those gave the
-/// artifact a shelf life. See [`DrillFreshness`].
+/// revoked or un-trusted, and a deadman on top of those gave the
+/// artifact a shelf life. See [`DrillFreshness`]. v58.0.0 (#1094) removed
+/// the halt latch the same way.
 ///
 /// The rooting-chain leg (FSD §2 item 2's "chain from this node's records
 /// roots to it") stays with the existing [`super::rooting`] /
@@ -1714,8 +1728,8 @@ where
         .max();
     let drill_freshness = DrillFreshness::of(last_drill_at.map(|t| now.signed_duration_since(t)));
 
-    // 4. Halt latch (kill-switch state). Unsupported backends report None
-    // — honestly unknown, never guessed.
+    // 4. Halt latch (kill-switch state), REPORTED ONLY. Unsupported backends
+    // report None — honestly unknown, never guessed.
     // v24.0.0 (CIRISPersist#557) — on the FAMILY arm this argument is finally
     // the kind of id the halt table is keyed by (`accord_active_halt` has
     // `family_key_id` as its PRIMARY KEY), so the accord's 2-of-3 kill switch
@@ -1729,15 +1743,20 @@ where
 
     // v23.0.0 (#551 item 4) — `drill_freshness` is DELIBERATELY absent from
     // this conjunction. The hard gates are the ones that answer "may this
-    // root act": a consensual edge, a real charter, a recovery commitment,
-    // and no halt latched. The drill answers "is anyone still minding it",
-    // which is reported beside the verdict, not enforced inside it.
+    // root act": a consensual edge, a real charter, a recovery commitment.
+    // The drill answers "is anyone still minding it", which is reported
+    // beside the verdict, not enforced inside it.
     // v47.3.0 (#901) — and every holder attested (FSD §2).
-    let valid = edge_exists
-        && root_self_declares
-        && charter_has_recovery
-        && halt_latched != Some(true)
-        && holders_hardware_attested;
+    // v58.0.0 (CIRISPersist#1094; CC 3.2 T3/T8 + 4.2.1.1 as ruled 2026-10-15)
+    // — `halt_latched` is DELIBERATELY absent too. A constitutional halt is
+    // an agent pause: the agent's act gate is its only GATE. Folding it into
+    // `valid` made every consumer of this verdict (the conferral walk, the
+    // transit walk, and through them six write/serve doors) fail closed
+    // under a halt, which CC 4.2.1.1 names as a breaker. The latch is still
+    // READ and reported beside the verdict — a halt must be observable —
+    // exactly as the drill is.
+    let valid =
+        edge_exists && root_self_declares && charter_has_recovery && holders_hardware_attested;
 
     // v24.1.0 (CIRISPersist#561) — when this verdict can first lapse on time.
     // Each leg survives while ANY of its rows is live (latest expiry wins,
@@ -2185,8 +2204,8 @@ where
     // HALF 2 IS UNTOUCHED, deliberately (the corrected #548 ask): the
     // candidate still walks `trust_root_valid(user, subject-as-root)` in
     // full — the user's OWN `delegates_to(user → subject)` edge, the
-    // subject's self-charter with a recovery commitment, a fresh
-    // heartbeat witness, no halt latched. So the operator's un-trust
+    // subject's self-charter with a recovery commitment, every holder
+    // attested. So the operator's un-trust
     // lever survives exactly as designed: delete the one edge row and the
     // verdict goes false, the walk returns None, the serve gate withholds,
     // agent capabilities gate off, manifests stop — all emergent, nothing
@@ -4719,8 +4738,8 @@ pub(crate) mod v53_1_6_reference {
         let drill_freshness =
             DrillFreshness::of(last_drill_at.map(|t| now.signed_duration_since(t)));
 
-        // 4. Halt latch (kill-switch state). Unsupported backends report None
-        // — honestly unknown, never guessed.
+        // 4. Halt latch (kill-switch state), REPORTED ONLY. Unsupported backends
+        // report None — honestly unknown, never guessed.
         // v24.0.0 (CIRISPersist#557) — on the FAMILY arm this argument is finally
         // the kind of id the halt table is keyed by (`accord_active_halt` has
         // `family_key_id` as its PRIMARY KEY), so the accord's 2-of-3 kill switch
@@ -4734,15 +4753,20 @@ pub(crate) mod v53_1_6_reference {
 
         // v23.0.0 (#551 item 4) — `drill_freshness` is DELIBERATELY absent from
         // this conjunction. The hard gates are the ones that answer "may this
-        // root act": a consensual edge, a real charter, a recovery commitment,
-        // and no halt latched. The drill answers "is anyone still minding it",
-        // which is reported beside the verdict, not enforced inside it.
+        // root act": a consensual edge, a real charter, a recovery commitment.
+        // The drill answers "is anyone still minding it", which is reported
+        // beside the verdict, not enforced inside it.
         // v47.3.0 (#901) — and every holder attested (FSD §2).
-        let valid = edge_exists
-            && root_self_declares
-            && charter_has_recovery
-            && halt_latched != Some(true)
-            && holders_hardware_attested;
+        // v58.0.0 (CIRISPersist#1094; CC 3.2 T3/T8 + 4.2.1.1 as ruled 2026-10-15)
+        // — `halt_latched` is DELIBERATELY absent too. A constitutional halt is
+        // an agent pause: the agent's act gate is its only GATE. Folding it into
+        // `valid` made every consumer of this verdict (the conferral walk, the
+        // transit walk, and through them six write/serve doors) fail closed
+        // under a halt, which CC 4.2.1.1 names as a breaker. The latch is still
+        // READ and reported beside the verdict — a halt must be observable —
+        // exactly as the drill is.
+        let valid =
+            edge_exists && root_self_declares && charter_has_recovery && holders_hardware_attested;
 
         // v24.1.0 (CIRISPersist#561) — when this verdict can first lapse on time.
         // Each leg survives while ANY of its rows is live (latest expiry wins,

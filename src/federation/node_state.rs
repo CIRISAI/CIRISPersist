@@ -170,7 +170,9 @@ impl std::fmt::Display for StateBand {
 #[serde(rename_all = "snake_case")]
 pub enum TrustRootStanding {
     /// A root this node's own edges name checks out in full — live trust edge,
-    /// self-declaring charter with a recovery commitment, no halt latched.
+    /// self-declaring charter with a recovery commitment, holders attested.
+    /// A latched halt does not move this (v58.0.0, CIRISPersist#1094): it is
+    /// reported on the verdict, not folded into it.
     Valid,
     /// **The host never declared this node's own key id.** Nothing was walked,
     /// because there is no "this node" to walk from. Call

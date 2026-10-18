@@ -146,7 +146,15 @@ def test_key_grant_rows_round_trip_between_two_nodes_989(tmp_path) -> None:
         assert by_dim["key_grant:content:v1"]["attestation_envelope"]["at_rest_sha256"] == manifest
         assert by_dim["key_grant:stream:v1"]["attestation_envelope"]["stream_id"] == stream
 
-        key_records = json.loads(a.list_signed_key_records_since(None, None, 100))
+        # v58.0.0 (CIRISPersist#991) — key records ride the attestation stream
+        # as key:record:v1 rows.
+        key_rows = [
+            r
+            for r in json.loads(a.list_attestations_since(None, None, 1000))
+            if (r.get("attestation", r).get("attestation_envelope") or {}).get("dimension")
+            == "key:record:v1"
+        ]
+        assert key_rows, "A's own key record is a key:record:v1 row"
     finally:
         a.close(force=True)
     ciris_persist.reset_engine()
@@ -163,8 +171,8 @@ def test_key_grant_rows_round_trip_between_two_nodes_989(tmp_path) -> None:
         with pytest.raises(ValueError, match="recipient_not_in_audience"):
             b.apply_replicated_key_grant(json.dumps({"attestation": stream_row}))
 
-        for rec in key_records:
-            b.apply_replicated_key_record(json.dumps(rec))
+        for row in key_rows:
+            b.apply_replicated_attestation(json.dumps({"attestation": row.get("attestation", row)}))
         _occurrence(b, ka, ka, enc_a)
 
         # A row whose wrap was altered in flight no longer verifies.

@@ -177,20 +177,18 @@ pub(crate) mod bodies {
         let legacy = legacy_record(&k, USER);
         d.put_public_key(signed(legacy.clone())).await.unwrap();
         let before = d.lookup_public_key(&k).await.unwrap().unwrap();
-        // A cursor that has already passed the row.
-        let served = d.list_signed_key_records_since(None, 10_000).await.unwrap();
-        let cursor = served
-            .iter()
-            .find(|r| r.record.key_id == k)
-            .map(|r| r.resume_pair())
-            .expect("I100: the legacy row is served");
-        assert!(
-            d.list_signed_key_records_since(Some(cursor.clone()), 10_000)
+        // v58.0.0 (CIRISPersist#991) — the unbound legacy record does not
+        // verify: it is held without a `key:record:v1` row, so it is not served.
+        async fn served_now(d: &dyn FederationDirectory, k: &str) -> bool {
+            crate::federation::key_plane::test_support::served_key_records(d, None, 10_000)
                 .await
                 .unwrap()
                 .iter()
-                .all(|r| r.record.key_id != k),
-            "I100 precondition: past the cursor, the row is not served"
+                .any(|r| r.record.key_id == k)
+        }
+        assert!(
+            !served_now(d, &k).await,
+            "I100 precondition: the legacy row is not on the plane"
         );
 
         let out = d
@@ -221,12 +219,8 @@ pub(crate) mod bodies {
             "I100: the hash follows the bytes"
         );
         assert!(
-            d.list_signed_key_records_since(Some(cursor), 10_000)
-                .await
-                .unwrap()
-                .iter()
-                .any(|r| r.record.key_id == k),
-            "I100: the rebound row is re-served past the old cursor"
+            served_now(d, &k).await,
+            "I100: the rebound record verifies, so its row is on the plane and served"
         );
         let history = d.list_key_registration_history(&k).await.unwrap();
         assert_eq!(history.len(), 1, "I100: one replaced registration");
@@ -377,16 +371,24 @@ mod run {
             .await
             .expect("I101: A and B hold the legacy row");
         }
-        // C, a fresh peer, REFUSES the legacy record the plane serves: this is
-        // the blocker, reproduced through persist's own gate.
-        let legacy_served = sa
-            .list_signed_key_records_since(None, 10_000)
+        // v58.0.0 (CIRISPersist#991) — an unbound legacy record does not
+        // verify, so it is held without a `key:record:v1` row and the plane
+        // does not serve it at all.
+        assert!(
+            crate::federation::key_plane::test_support::served_key_records(
+                sa.as_dyn_directory(),
+                None,
+                10_000,
+            )
             .await
             .unwrap()
-            .into_iter()
-            .find(|r| r.record.key_id == user)
-            .unwrap()
-            .record;
+            .iter()
+            .all(|r| r.record.key_id != user),
+            "I101: the unbound record is not on the plane"
+        );
+        // C, a fresh peer, REFUSES the legacy record A holds: this is the
+        // blocker, reproduced through persist's own gate.
+        let legacy_served = sa.lookup_public_key(&user).await.unwrap().unwrap();
         // The insert arm runs `verify_key_registration` fail-closed BEFORE any
         // write (v21.0.0 #502 E2). v54.1.0 (#1042): the failure is a TYPED
         // terminal refusal now, not a bare `Err` — the #659 subject-binding
@@ -456,14 +458,17 @@ mod run {
             .await
             .unwrap();
         assert!(matches!(out, RebindOutcome::Rebound), "I101: {out:?}");
-        let healed = sa
-            .list_signed_key_records_since(None, 10_000)
-            .await
-            .unwrap()
-            .into_iter()
-            .find(|r| r.record.key_id == user)
-            .unwrap()
-            .record;
+        let healed = crate::federation::key_plane::test_support::served_key_records(
+            sa.as_dyn_directory(),
+            None,
+            10_000,
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|r| r.record.key_id == user)
+        .unwrap()
+        .record;
         crate::federation::admission::verify_envelope_binds_subject(&healed)
             .expect("I101: the plane serves the bound record");
 

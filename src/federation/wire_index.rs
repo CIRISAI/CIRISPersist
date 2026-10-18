@@ -250,6 +250,11 @@ pub async fn reload_record_bytes(
         Error::Backend(format!("signed_wire_index reload {what}: {e}"))
     };
     let bytes = match kind {
+        // v58.0.0 (compat reads, operator ruling 2026-10-18) — the key plane
+        // rides as attestation rows (`key:record:v1`, `key:revocation:v1`,
+        // `identity:occurrence:v1`: their entries are `Attestation`) AND keeps
+        // its four framed kinds below, so a pre-v58 peer following a framed ref
+        // is still served the framed object it can apply.
         "Key" => {
             let key_id = record_key_field(record_key_json, "key_id")?;
             match dir.lookup_public_key(&key_id).await? {
@@ -619,6 +624,10 @@ pub async fn wire_refs_for_subject(
     // this node advertised would not resolve against the row it stored, because
     // `entry_as_stored` reloads through `lookup_public_key` and wraps in
     // `SignedKeyRecord`. Same treatment as the revocation plane (#655).
+    // v58.0.0 (compat reads, operator ruling 2026-10-18) — the subject's own
+    // `key:record:v1` row and the `identity:occurrence:v1` rows of its
+    // occurrences are attested ABOUT it, so they are refs of the Attestation
+    // slice below; the framed refs stay beside them for pre-v58 peers.
     for r in dir.list_signed_key_records_since(None, u32::MAX).await? {
         if r.record.key_id == subject_key_id {
             let rk = record_key(&[("key_id", &r.record.key_id)]);
@@ -652,6 +661,15 @@ pub async fn wire_refs_for_subject(
             ),
             ("revocation_id", &revocation.revocation_id),
         ]);
+        // v58.0.0 (CIRISPersist#991, CC 2.4.1.1) — a revocation of the key is
+        // also a `key:revocation:v1` row attested by its REVOKER (the subject is
+        // the digest the row carries), so it is not in the Attestation slice
+        // above: its row is added here, advertised only when this node holds it.
+        let row_id = super::key_plane::revocation_row(&revocation)?.attestation_id;
+        if let Some(row) = dir.get_attestation(&row_id).await? {
+            let row_rk = record_key(&[("attestation_id", &row.attestation_id)]);
+            out.push(("Attestation", content_hash_of(&row)?, row_rk));
+        }
         let wrapped = super::SignedRevocation { revocation };
         let hash = content_hash_of(&wrapped)?;
         // v31.1.0 (CIRISPersist#655, PR #667 round-3) — ADVERTISE ONLY WHAT
@@ -758,6 +776,9 @@ pub async fn all_kind_hash_keys(
     // node's position on the record and must stay out of a content hash, or one
     // key record would hash differently on every node holding it. Same
     // treatment as the revocation plane below (#655).
+    // v58.0.0 (compat reads, operator ruling 2026-10-18) — the key plane is
+    // indexed twice: as attestation rows (the Attestation scan below) and as
+    // its four framed kinds, which a pre-v58 peer still asks for.
     for r in dir.list_signed_key_records_since(None, u32::MAX).await? {
         let rk = record_key(&[("key_id", &r.record.key_id)]);
         let wrapped = super::SignedKeyRecord { record: r.record };

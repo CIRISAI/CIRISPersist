@@ -2379,11 +2379,18 @@ impl Engine {
     /// of an agent's trace corpus, keyed on `agent_id_hash` alone (all
     /// signing keys).
     ///
-    /// In one atomic transaction the backend hard-deletes the agent's
-    /// `trace_events` + `trace_llm_calls`, **tombstones** the derived
-    /// `detection_events` (NULLs the PII linkage + stamps `erased_at` —
-    /// the analytics survive, the subject linkage is severed), and emits
-    /// a `hard_case:trace_erasure` audit row. Returns an
+    /// v58.0.0 (CIRISPersist#1094 item 2; CC 4.5.3, CLM-erasure-subject-route)
+    /// — in one atomic transaction the backend hard-deletes the agent's
+    /// `trace_events` + `trace_llm_calls`, tombstones pre-v57 silo detections
+    /// in place (V080), and erases each row-backed `detection:*` row about the
+    /// agent under its PRODUCER's rule-1 `withdraws` (the controller
+    /// withdrawing its own row on the subject's request — no subject path
+    /// reaches an adverse row): the withdraws is the detector's local-tier
+    /// row, signature deferred to the crossing as the detection's own is, and
+    /// each erased row leaves a tombstone citing it that is served to peers. A
+    /// row whose producer key the host does not hold is refused with a reason
+    /// (`ErasureSummary::detection_rows_refused`, GDPR Art. 17(3)). The
+    /// `hard_case:trace_erasure` row names nobody. Returns an
     /// [`ErasureSummary`](crate::store::types::ErasureSummary) with the
     /// per-table counts.
     ///
@@ -9259,6 +9266,17 @@ impl Engine {
         // bundle whose notice is a duty-holder takedown is re-verified under
         // CC 4.5.5 and reaches the bytes plane only; an immediate-removal
         // basis destroys the bytes on receipt here too (CC 4.5.3 step 2).
+        // v58.0.0 (CIRISPersist#1094 item 2, CC 4.5.3) — an erasure's
+        // tombstone cites the row's PRODUCER's rule-1 `withdraws`, re-derived
+        // against THIS node's own state; the row is destroyed on receipt.
+        if crate::federation::subject_erasure::is_erasure_notice_envelope(&bundle.notice.envelope) {
+            return crate::federation::subject_erasure::apply_replicated_erasure(
+                directory.as_ref(),
+                bundle,
+                &node,
+            )
+            .await;
+        }
         if crate::federation::takedown_tombstone::is_takedown_notice_envelope(
             &bundle.notice.envelope,
         ) {
@@ -18923,7 +18941,7 @@ mod tests {
                 crate::federation::envelope::EnvelopeCore::from_value(serde_json::json!({
                     "id": uuid::Uuid::new_v4().to_string(),
                     "dimension": dimension,
-                    "score": 1.0,
+                    "score": crate::federation::namespace::registry::in_class_score(dimension),
                     "confidence": 0.9,
                 }))
                 .unwrap(),
@@ -22666,11 +22684,20 @@ mod tests {
         // the backend, and returning exactly the seeded genesis rows shows
         // that better than an empty page did: an empty page is also what a
         // facade that dispatched nowhere would return.
+        // v58.0.0 (CIRISPersist#991) — the seeded holders' and the canonical
+        // server's key records are `key:record:v1` rows on the same plane.
         let ids: std::collections::BTreeSet<&str> = page
             .items
             .iter()
+            .filter(|a| !crate::federation::key_plane::is_key_plane_row(a))
             .map(|a| a.attestation_id.as_str())
             .collect();
+        assert!(
+            page.items
+                .iter()
+                .any(crate::federation::key_plane::is_key_plane_row),
+            "the seeded key records are on the plane"
+        );
         let baked: std::collections::BTreeSet<&str> =
             crate::federation::genesis::canonical_genesis_bundle()
                 .attestations

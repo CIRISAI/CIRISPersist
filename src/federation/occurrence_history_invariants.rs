@@ -141,11 +141,9 @@ pub(crate) mod bodies {
     ) {
         let (node, install) = keys(d, tag).await;
         bound_at(d, &node, &install, ago(300)).await;
-        d.put_identity_occurrence_revocation(
-            ts::signed_occurrence_revocation(&node, &node, &install, ago(200)).await,
-        )
-        .await
-        .unwrap_or_else(|e| panic!("{tag} I273: revocation: {e}"));
+        d.put_attestation(ts::occurrence_withdrawal(d, &node, &node, &install, ago(200)).await)
+            .await
+            .unwrap_or_else(|e| panic!("{tag} I273: revocation: {e}"));
         bound_at(d, &node, &install, ago(100)).await;
         assert!(
             bearing(d, &install, ago(250)).await,
@@ -168,11 +166,9 @@ pub(crate) mod bodies {
         bound_at(d, &node_b, &install_b, ago(300)).await;
         let at = ago(200);
         signed(d, &install_b, &node_b, &install_b, at).await;
-        d.put_identity_occurrence_revocation(
-            ts::signed_occurrence_revocation(&node_b, &node_b, &install_b, at).await,
-        )
-        .await
-        .unwrap_or_else(|e| panic!("{tag} I273(b): revocation: {e}"));
+        d.put_attestation(ts::occurrence_withdrawal(d, &node_b, &node_b, &install_b, at).await)
+            .await
+            .unwrap_or_else(|e| panic!("{tag} I273(b): revocation: {e}"));
         assert!(
             !bearing(d, &install_b, ago(150)).await,
             "{tag} I273(b): a revocation at an assertion's own instant ends it"

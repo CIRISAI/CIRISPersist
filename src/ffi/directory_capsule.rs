@@ -247,6 +247,19 @@ type BoxedFut = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 /// serde-fails on a digest-only row. `RevocationsForSubject` is APPENDED
 /// (growth). The enum-body digests move only for that growth.
 ///
+/// v8 (v58.0.0, CIRISPersist#991) — a PAYLOAD break, like v6's and v7's:
+/// [`AttestationRefusalReason`](crate::federation::attestation_apply::AttestationRefusalReason),
+/// carried inside the existing `DirectoryOpResult::ReplicatedAttestationOutcome`,
+/// gained `KeyPlaneRefused` (a key-plane row whose family door did not apply
+/// its object). An older consumer serde-fails on it. The framed key-plane ops
+/// (`ListSignedKeyRecordsSince`, `ListSignedRevocationsSince`,
+/// `ListSignedIdentityOccurrencesSince`,
+/// `ListSignedIdentityOccurrenceRevocationsSince`,
+/// `PutIdentityOccurrenceRevocation` and their results) were removed on the
+/// release branch and are restored with their v7 names and shapes (compat
+/// reads, operator ruling 2026-10-18): the op set is v7's, and against the
+/// branch's 8 the restoration is growth, which by the rule above does not bump.
+///
 /// Consumers MUST check the field at capsule-receive time:
 ///
 /// ```ignore
@@ -259,7 +272,7 @@ type BoxedFut = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 ///     "persist directory_capsule ABI version mismatch — pin floor too low"
 /// );
 /// ```
-pub const DIRECTORY_ABI_VERSION: u32 = 7;
+pub const DIRECTORY_ABI_VERSION: u32 = 8;
 
 /// A `FederationDirectory` operation, serialized by the consumer and
 /// dispatched inside persist's `.so`.
@@ -4434,15 +4447,6 @@ impl FederationDirectory for OpsDirectory {
             method: "attach_attestation_pqc_signature",
         })
     }
-    async fn attach_revocation_pqc_signature(
-        &self,
-        revocation_id: &str,
-        scrub_signature_pqc: &str,
-    ) -> Result<(), Error> {
-        Err(Error::Unsupported {
-            method: "attach_revocation_pqc_signature",
-        })
-    }
     async fn get_attestation(&self, attestation_id: &str) -> Result<Option<Attestation>, Error> {
         Err(Error::Unsupported {
             method: "get_attestation",
@@ -4469,14 +4473,6 @@ impl FederationDirectory for OpsDirectory {
     ) -> Result<Vec<HybridPendingRow>, Error> {
         Err(Error::Unsupported {
             method: "list_hybrid_pending_attestations",
-        })
-    }
-    async fn list_hybrid_pending_revocations(
-        &self,
-        limit: i64,
-    ) -> Result<Vec<HybridPendingRow>, Error> {
-        Err(Error::Unsupported {
-            method: "list_hybrid_pending_revocations",
         })
     }
     async fn put_accord_proposal(
@@ -5127,10 +5123,16 @@ mod tests {
     /// puts in the vtable a consumer reads at runtime. A single assertion
     /// comparing them to each other would hold trivially while both drifted.
     #[test]
-    fn abi_version_pinned_at_7() {
+    fn abi_version_pinned_at_8() {
         assert_eq!(
-            DIRECTORY_ABI_VERSION, 7,
-            "v52.0.0 (CIRISPersist#784): the Revocation carried by Revocations / \
+            DIRECTORY_ABI_VERSION, 8,
+            "v58.0.0 (CIRISPersist#991): AttestationRefusalReason, inside the existing \
+             ReplicatedAttestationOutcome result, gained KeyPlaneRefused — a consumer built \
+             against 7 fails to decode it on the hot path (the v6 payload-type form). The \
+             framed key-plane ops the slice first removed are restored with their v7 names \
+             and shapes (compat reads, operator ruling 2026-10-18), so the op SET is v7's: \
+             against 8 that is growth, which does not bump. Previous move: \
+             v52.0.0 (CIRISPersist#784): the Revocation carried by Revocations / \
              SignedRevocations names its subject by revoked_key_sha256_ed25519_raw and its \
              revoked_key_id became optional — a consumer built against 6 fails to decode a \
              digest-only row. Previous move: \
@@ -5149,7 +5151,7 @@ mod tests {
              built for"
         );
         assert_eq!(
-            PERSIST_DIRECTORY_VTABLE.abi_version, 7,
+            PERSIST_DIRECTORY_VTABLE.abi_version, 8,
             "the shipped vtable must advertise what consumers pin against"
         );
     }
@@ -5216,6 +5218,8 @@ mod tests {
     ///   instead of "pin floor too low".
     #[test]
     fn directory_op_wire_contract_is_pinned_682() {
+        // v58.0.0 (compat reads) — v57.0.0's digest: the framed key-plane ops
+        // are restored verbatim, so the enum body is v7's again.
         assert_eq!(
             structural_digest("DirectoryOp"),
             "4efe656f9076f4b918efc8e122c6dfb422da3fb2e98fdbf52f4a6f9dbb17bce1",
@@ -5260,6 +5264,7 @@ mod tests {
     /// (`ReachabilityVerdict::BeyondDepthCap`), not for this.
     #[test]
     fn directory_op_result_wire_contract_is_pinned_682() {
+        // v58.0.0 (compat reads) — v57.0.0's digest, as the op gate's.
         assert_eq!(
             structural_digest("DirectoryOpResult"),
             "bf09a0103ca37a06866e6f8160dd01df41c8e10caded5660e3c2fa352b4e9262",

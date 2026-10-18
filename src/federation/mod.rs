@@ -362,6 +362,12 @@ pub mod key_digest;
 // CIRISPersist#848 (BLOB_REPLICATION.md Part II) — key transport:
 // the CC 3 `key_grant` on the sixteenth replicated kind; per-minter epochs.
 pub mod key_grant;
+// v58.0.0 (CIRISPersist#991 plane 1; CC 3.1.3) — the key plane as rows.
+pub mod key_plane;
+// v58.0.0 (CIRISPersist#991) — I975–I980.
+pub(crate) mod key_plane_invariants;
+// v58.0.0 (compat reads, operator ruling 2026-10-18) — I1120–I1123.
+mod compat_reads_invariants;
 // #848 §18 — the two-node witnesses I59–I67; `pub` under `test-anchor` so
 // consumers can drive them against their own backends.
 #[cfg(any(test, feature = "test-anchor"))]
@@ -567,6 +573,11 @@ mod lineage_head_invariants;
 /// families, the ledger owner rule, settlement admission.
 #[cfg(test)]
 mod rc7_vendor_invariants;
+/// v58.0.0 (slice V) — I1100–I1109, the CC v1.0-rc8 re-vendor: polarity
+/// classes at admission, the closed apophatic vocabulary, the rc8 families
+/// held shut, the ledger owner rule.
+#[cfg(test)]
+mod rc8_vendor_invariants;
 pub mod register;
 /// v53.0.0 (CC 3.2 T6, rc7 `36432c6`) — I450–I459, roster rows and the head.
 #[cfg(test)]
@@ -628,6 +639,11 @@ pub(crate) mod doors_takedown_invariants;
 #[cfg(test)]
 mod steward_purge_invariants;
 pub mod takedown_tombstone;
+// v58.0.0 (CIRISPersist#1094 item 2, CC 4.5.3) — erasure is the subject's
+// withdraws; the replicated fact is the tombstone.
+pub mod subject_erasure;
+#[cfg(test)]
+pub(crate) mod subject_erasure_invariants;
 pub mod trust_root;
 // CIRISPersist#210 — cross-process leader election (RNS shared-instance
 // owner; CIRISEdge#100). Backend-agnostic types + staleness helper; the
@@ -8097,25 +8113,6 @@ pub trait FederationDirectory: Send + Sync {
         scrub_signature_pqc: &str,
     ) -> Result<(), Error>;
 
-    /// Attach the PQC signature to a hybrid-pending
-    /// `federation_revocations` row. Same shape as attestations.
-    ///
-    /// v31.0.0 (CIRISPersist#657) — deliberately does NOT re-index:
-    /// `federation_revocations` (the KEY-revocation plane, as distinct from the
-    /// `*MembershipRevocation` and `IdentityOccurrenceRevocation` planes, which
-    /// do have index kinds) has no `signed_wire_index` kind at all — no arm in
-    /// [`wire_index::reload_record_bytes`](crate::federation::wire_index::reload_record_bytes)
-    /// and no entry in
-    /// [`wire_index::all_kind_hash_keys`](crate::federation::wire_index::all_kind_hash_keys),
-    /// because no bulk signed-since surface serves it. There is no stale index
-    /// to fix here; if that plane ever gains a wire kind, this method gains the
-    /// re-index its two siblings have.
-    async fn attach_revocation_pqc_signature(
-        &self,
-        revocation_id: &str,
-        scrub_signature_pqc: &str,
-    ) -> Result<(), Error>;
-
     /// v4.6 (CIRISPersist#171 phase 2) — fetch a single attestation row
     /// by id (any tier). `None` if absent. Used by `Engine::attestation_
     /// promote` to load the `local` row's envelope before signing.
@@ -8241,14 +8238,6 @@ pub trait FederationDirectory: Send + Sync {
     /// `pqc_completed_at IS NULL`, ordered oldest first by
     /// `asserted_at`.
     async fn list_hybrid_pending_attestations(
-        &self,
-        limit: i64,
-    ) -> Result<Vec<HybridPendingRow>, Error>;
-
-    /// Return up to `limit` `federation_revocations` rows where
-    /// `pqc_completed_at IS NULL`, ordered oldest first by
-    /// `revoked_at`.
-    async fn list_hybrid_pending_revocations(
         &self,
         limit: i64,
     ) -> Result<Vec<HybridPendingRow>, Error>;

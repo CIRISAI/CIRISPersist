@@ -128,6 +128,84 @@ impl PostgresBackend {
         Ok(())
     }
 
+    /// v58.0.0 (CIRISPersist#991, CC 3.1.3) — **the lazy rehome**, once per
+    /// backend, at the first key-plane write: every projection row written
+    /// before V198 (`attestation_id IS NULL`) gets the row its stored object
+    /// plans to. A key record that verifies becomes its `key:record:v1` row,
+    /// asserted at its own `scrub_timestamp`; one that does not stays held
+    /// without a row, and the rebuild gate names it.
+    pub(crate) async fn rehome_legacy_key_plane(&self) -> Result<(), crate::federation::Error> {
+        use std::sync::atomic::Ordering;
+        if self.key_plane_rehomed.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let mut client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("rehome key plane tx: {e}")))?;
+        // A schema before V198 (a test's `run_migrations_through`) has nothing
+        // to rehome yet; the flag stays down for the full migration.
+        if !pg_key_plane_present(&*tx).await? {
+            return Ok(());
+        }
+        let keys: Vec<String> = tx
+            .query(
+                "SELECT key_id FROM cirislens.federation_keys WHERE attestation_id IS NULL",
+                &[],
+            )
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("rehome key plane: {e}")))?
+            .into_iter()
+            .map(|r| r.safe_get_with(0, crate::federation::Error::Backend))
+            .collect::<Result<_, _>>()?;
+        for key_id in &keys {
+            pg_sync_key_record_row(&tx, key_id).await?;
+        }
+        let revocations: Vec<String> = tx
+            .query(
+                "SELECT revocation_id FROM cirislens.federation_revocations \
+                  WHERE attestation_id IS NULL",
+                &[],
+            )
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("rehome key plane: {e}")))?
+            .into_iter()
+            .map(|r| r.safe_get_with(0, crate::federation::Error::Backend))
+            .collect::<Result<_, _>>()?;
+        for revocation_id in &revocations {
+            pg_rehome_revocation(&tx, revocation_id).await?;
+        }
+        let occurrences: Vec<(String, String)> = tx
+            .query(
+                "SELECT identity_key_id, occurrence_key_id \
+                   FROM cirislens.federation_identity_occurrences \
+                  WHERE attestation_id IS NULL AND signature IS NOT NULL",
+                &[],
+            )
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("rehome key plane: {e}")))?
+            .into_iter()
+            .map(|r| -> Result<(String, String), crate::federation::Error> {
+                Ok((
+                    r.safe_get_with(0, crate::federation::Error::Backend)?,
+                    r.safe_get_with(1, crate::federation::Error::Backend)?,
+                ))
+            })
+            .collect::<Result<_, _>>()?;
+        for (identity, occurrence) in &occurrences {
+            pg_sync_occurrence_row(&tx, identity, occurrence).await?;
+        }
+        tx.commit().await.map_err(|e| {
+            crate::federation::Error::Backend(format!("rehome key plane commit: {e}"))
+        })?;
+        self.key_plane_rehomed.store(true, Ordering::Release);
+        Ok(())
+    }
+
     pub(crate) async fn put_public_key_at_door(
         &self,
         record: crate::federation::SignedKeyRecord,
@@ -212,10 +290,17 @@ impl PostgresBackend {
 
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
 
-        let client = self
+        self.rehome_legacy_key_plane().await?;
+        let mut client = self
             .get_client()
             .await
             .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        // v58.0.0 (CIRISPersist#991) — the record and its `key:record:v1` row,
+        // one transaction.
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("put_public_key tx: {e}")))?;
 
         let original_content_hash = hex::decode(&row.original_content_hash).map_err(|e| {
             crate::federation::Error::InvalidArgument(format!(
@@ -266,8 +351,8 @@ impl PostgresBackend {
         // it, so a record whose `scrub_timestamp` is old — the everyday
         // delayed-replication case on the identity plane — still lands ahead of
         // every consumer's cursor instead of behind it.
-        let admitted_at = self.next_key_serve_position(&client).await?;
-        let result = client
+        let admitted_at = self.next_key_serve_position(&tx).await?;
+        let result = tx
             .execute(
                 "INSERT INTO cirislens.federation_keys (\
                     key_id, pubkey_ed25519_base64, pubkey_ml_dsa_65_base64, algorithm, \
@@ -308,7 +393,7 @@ impl PostgresBackend {
 
         if result == 0 {
             // ON CONFLICT triggered — check if hash matches.
-            let existing: Option<String> = client
+            let existing: Option<String> = tx
                 .query_opt(
                     "SELECT persist_row_hash FROM cirislens.federation_keys WHERE key_id = $1",
                     &[&row.key_id],
@@ -335,8 +420,124 @@ impl PostgresBackend {
         // (reachable over the wire from a sqlite-backed origin, whose
         // `to_rfc3339()` TEXT round-trips nanoseconds) or the storage boundary
         // normalizes `consent_role`. See `wire_index::key_entry_as_stored`.
+        pg_sync_key_record_row(&tx, &row.key_id).await?;
+        tx.commit().await.map_err(|e| {
+            crate::federation::Error::Backend(format!("put_public_key commit: {e}"))
+        })?;
         drop(client);
         self.index_stored_key_row(&row.key_id).await?;
+        Ok(())
+    }
+}
+
+/// v58.0.0 (CIRISPersist#991) — the key plane's executor on postgres.
+/// Storage only: the decisions are `federation::key_plane`'s plans.
+#[async_trait::async_trait]
+impl crate::federation::key_plane::KeyPlaneStore for PostgresBackend {
+    async fn store_planned_revocation(
+        &self,
+        planned: crate::federation::key_plane::PlannedRevocation,
+    ) -> Result<(), crate::federation::Error> {
+        use crate::federation::Error;
+        let crate::federation::key_plane::PlannedRevocation {
+            revocation: row,
+            row: plane,
+        } = planned;
+        let original_content_hash = hex::decode(&row.original_content_hash).map_err(|e| {
+            Error::InvalidArgument(format!("original_content_hash hex decode: {e}"))
+        })?;
+        // v31.1.0 (CIRISPersist#622) — `revocation_id` bound as TEXT (V123).
+        // v31.0.0 (#644) — revocation_envelope is TEXT since V122.
+        let revocation_envelope_text =
+            pg_envelope_text(&row.revocation_envelope, "revocation_envelope")?;
+        self.rehome_legacy_key_plane().await?;
+        let mut client = self
+            .get_client()
+            .await
+            .map_err(|e| Error::Backend(e.to_string()))?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| Error::Backend(format!("put_revocation tx: {e}")))?;
+        // v31.1.0 (CIRISPersist#655) — THIS node's admission position (V123),
+        // strictly after the last one handed out (`monotonic_admission_instant`).
+        let last_admitted: Option<chrono::DateTime<chrono::Utc>> = tx
+            .query_one(
+                "SELECT MAX(admitted_at) FROM cirislens.federation_revocations",
+                &[],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("last admitted_at: {e}")))?
+            .safe_get_with(0, Error::Backend)?;
+        let admitted_at = crate::federation::types::monotonic_admission_instant(
+            chrono::Utc::now(),
+            last_admitted,
+        );
+        // v58.0.0 (CIRISPersist#991) — the row first: the projection names it.
+        pg_insert_plane_row(&tx, &plane).await?;
+        tx.execute(
+            "INSERT INTO cirislens.federation_revocations (\
+                revocation_id, revoked_key_id, revoking_key_id, reason, \
+                revoked_at, effective_at, revocation_envelope, \
+                original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
+                scrub_key_id, scrub_timestamp, pqc_completed_at, observed_region, \
+                revoked_after, persist_row_hash, admitted_at, revoked_key_sha256_ed25519_raw, \
+                attestation_id\
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, \
+                $16, $17, $18, $19)",
+            &[
+                &row.revocation_id,
+                &row.revoked_key_id,
+                &row.revoking_key_id,
+                &row.reason,
+                &row.revoked_at,
+                &row.effective_at,
+                &revocation_envelope_text,
+                &original_content_hash,
+                &row.scrub_signature_classical,
+                &row.scrub_signature_pqc,
+                &row.scrub_key_id,
+                &row.scrub_timestamp,
+                &row.pqc_completed_at,
+                &row.observed_region,
+                &row.revoked_after,
+                &row.persist_row_hash,
+                &admitted_at,
+                &row.revoked_key_sha256_ed25519_raw,
+                &plane.attestation_id,
+            ],
+        )
+        .await
+        .map_err(|e| {
+            let msg = e.to_string();
+            if msg.contains("foreign key") {
+                Error::InvalidArgument(format!(
+                    "FK constraint violated on revocation insert: {msg}"
+                ))
+            } else {
+                Error::Backend(format!("insert revocation: {msg}"))
+            }
+        })?;
+        tx.commit()
+            .await
+            .map_err(|e| Error::Backend(format!("put_revocation commit: {e}")))?;
+        drop(client);
+        // v31.1.0 (CIRISPersist#655) — the key-level revocation plane joins the
+        // shared `signed_wire_index`, reloaded through the read path: its framed
+        // entry (v58.0.0 compat reads, still served to pre-v58 peers) and its
+        // row's (the Attestation kind).
+        self.index_stored_record(
+            "Revocation",
+            &crate::federation::wire_index::record_key(&[
+                (
+                    "revoked_key_sha256_ed25519_raw",
+                    row.revoked_key_sha256_ed25519_raw.as_str(),
+                ),
+                ("revocation_id", row.revocation_id.as_str()),
+            ]),
+        )
+        .await?;
+        self.index_plane_row(Some(&plane.attestation_id)).await?;
         Ok(())
     }
 }
@@ -1361,6 +1562,9 @@ pub struct PostgresBackend {
     /// (`from_shared*`) resolves lazily at its first DEK-plane door when
     /// this is still false (CIRISPersist#850 review).
     minter_sentinel_resolved: std::sync::atomic::AtomicBool,
+    /// v58.0.0 (CIRISPersist#991) — set once [`Self::rehome_legacy_key_plane`]
+    /// has run on this backend.
+    key_plane_rehomed: std::sync::atomic::AtomicBool,
     /// v54.1.0 (CIRISPersist#1046) — `true` only between a test-only
     /// `run_migrations_through(v)` with `v` below V187 and the next full
     /// `run_migrations`: the schema predates the purge plane, so it holds no
@@ -2072,6 +2276,7 @@ impl PostgresBackend {
                 crate::federation::topology::DEFAULT_DELEGATION_DEPTH,
             ),
             minter_sentinel_resolved: std::sync::atomic::AtomicBool::new(false),
+            key_plane_rehomed: std::sync::atomic::AtomicBool::new(false),
             pre_purge_schema: std::sync::atomic::AtomicBool::new(false),
             admission_gate: std::sync::RwLock::new(None),
             self_key_id: std::sync::RwLock::new(None),
@@ -2132,6 +2337,7 @@ impl PostgresBackend {
                 crate::federation::topology::DEFAULT_DELEGATION_DEPTH,
             ),
             minter_sentinel_resolved: std::sync::atomic::AtomicBool::new(false),
+            key_plane_rehomed: std::sync::atomic::AtomicBool::new(false),
             pre_purge_schema: std::sync::atomic::AtomicBool::new(false),
             admission_gate: std::sync::RwLock::new(None),
             self_key_id: std::sync::RwLock::new(None),
@@ -2380,9 +2586,51 @@ impl PostgresBackend {
     /// reload takes its own, and nesting two checkouts can exhaust a small
     /// pool.
     async fn index_stored_key_row(&self, key_id: &str) -> Result<(), crate::federation::Error> {
+        // v58.0.0 (compat reads, operator ruling 2026-10-18) — the framed
+        // `Key` entry a pre-v58 peer asks for, beside the row's.
         self.index_stored_record(
             "Key",
             &crate::federation::wire_index::record_key(&[("key_id", key_id)]),
+        )
+        .await?;
+        // v58.0.0 (CIRISPersist#991) — the key's record rides as its
+        // `key:record:v1` row: the entry is that row's (the Attestation kind).
+        let row_id: Option<String> = {
+            let client = self
+                .get_client()
+                .await
+                .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+            if !pg_key_plane_present(&**client).await? {
+                return Ok(());
+            }
+            match client
+                .query_opt(
+                    "SELECT attestation_id FROM cirislens.federation_keys WHERE key_id = $1",
+                    &[&key_id],
+                )
+                .await
+                .map_err(|e| crate::federation::Error::Backend(format!("key row pointer: {e}")))?
+            {
+                Some(r) => r.safe_get_with(0, crate::federation::Error::Backend)?,
+                None => None,
+            }
+        };
+        self.index_plane_row(row_id.as_deref()).await
+    }
+
+    /// v58.0.0 (CIRISPersist#991) — index a key-plane row (minted inside a
+    /// door's transaction by `pg_insert_plane_row`) on the Attestation kind,
+    /// after the door committed.
+    async fn index_plane_row(
+        &self,
+        attestation_id: Option<&str>,
+    ) -> Result<(), crate::federation::Error> {
+        let Some(id) = attestation_id else {
+            return Ok(());
+        };
+        self.index_stored_record(
+            "Attestation",
+            &crate::federation::wire_index::record_key(&[("attestation_id", id)]),
         )
         .await
     }
@@ -3502,6 +3750,9 @@ impl Backend for PostgresBackend {
                 detail: format!("postgres V070 checksum repair (#840): {e}"),
             });
         }
+        // v58.0.0 (CIRISPersist#1094 item 2) — what V196 will delete, counted
+        // before it runs so the boot can say so.
+        let v196 = pg_v196_pending(&lock_client).await;
         let migration_started = std::time::Instant::now();
         // v7.0.0 — V079 (the TimescaleDB continuous-aggregate accelerator)
         // is left IMMUTABLE and unmodified, like V001's hypertable guard:
@@ -3551,6 +3802,18 @@ impl Backend for PostgresBackend {
         drop(lock_client);
 
         migration_result?;
+        #[cfg(feature = "sqlite")]
+        crate::store::sqlite::log_v196(v196);
+        #[cfg(not(feature = "sqlite"))]
+        if let Some((rows, silo, headers)) = v196.filter(|(a, b, c)| a + b + c > 0) {
+            tracing::warn!(
+                hard_case_rows = rows,
+                legacy_silo_rows = silo,
+                art17_erasure_headers = headers,
+                "V196 deleted v57-shaped trace_erasure hard cases that named their subject and \
+                 the art17_erasure purge headers citing them (CIRISPersist#1094)"
+            );
+        }
 
         // v24.1.0 (CIRISPersist#559) — marked ONLY here, on the success path,
         // and BEFORE the backfill because the backfill is not part of what the
@@ -3606,7 +3869,24 @@ impl Backend for PostgresBackend {
                 .await
                 .map_err(|e| Error::Backend(format!("rehome before erasure: {e}")))?;
         }
+        // v58.0.0 (CIRISPersist#1094 item 2, CC 4.5.3) — the row-backed
+        // detections this erasure reaches: each erased under its PRODUCER's
+        // rule-1 `withdraws` (planned here when not already held), or refused
+        // with a reason (read before the transaction).
         let received_at = chrono::Utc::now();
+        let crate::federation::subject_erasure::ErasurePlan {
+            citations,
+            new_withdraws,
+            refused,
+        } = crate::federation::subject_erasure::plan_store_erasure(
+            self,
+            agent_id_hash,
+            Some(signature_key_id),
+            received_at,
+        )
+        .await
+        .map_err(|e| Error::Backend(format!("erasure plan: {e}")))?;
+        let refused_count = refused.len() as u64;
         let mut client = self
             .pool
             .get()
@@ -3634,14 +3914,17 @@ impl Backend for PostgresBackend {
             .map(|row| row.safe_get_with::<String, _, _, _>(0, Error::Backend))
             .collect::<Result<_, _>>()?;
 
-        // v57.0.0 (CIRISPersist#988 item 3; lead ruling on the DSAR path) —
-        // the erased traces' detections: a pre-v57 silo row takes the V080
-        // tombstone in place; a ROW-BACKED one is hard-deleted (never
-        // rewritten) and leaves no projection row.
+        // v57.0.0 (CIRISPersist#988 item 3) — a pre-v57 silo row takes the
+        // V080 tombstone in place. v58.0.0 (CIRISPersist#1094 item 2) — a
+        // ROW-BACKED one is hard-deleted only under its producer's `withdraws`
+        // (the citations), and leaves no projection row.
         let legacy_tombstoned = pg_tombstone_detection_events(&tx, &trace_ids, received_at)
             .await
             .map_err(|e| Error::Backend(format!("tombstone detection_events: {e}")))?;
-        let erased_rows = pg_art17_delete_detection_rows(&tx, &trace_ids)
+        pg_store_erasure_withdraws(&tx, &new_withdraws)
+            .await
+            .map_err(|e| Error::Backend(format!("erasure withdraws: {e}")))?;
+        let erased_rows = pg_erase_cited_rows(&tx, &citations)
             .await
             .map_err(|e| Error::Backend(format!("erase detection rows: {e}")))?;
         let detection_events_tombstoned = legacy_tombstoned + erased_rows.len() as u64;
@@ -3743,27 +4026,20 @@ impl Backend for PostgresBackend {
             || federation_revocations_deleted > 0
             || detection_events_tombstoned > 0
         {
-            let mut event = crate::federation::HardCaseEvent {
-                event_id: uuid::Uuid::new_v4().to_string(),
-                kind: crate::federation::hard_case::kind::TRACE_ERASURE.to_owned(),
-                target_key_id: Some(agent_id_hash.to_owned()),
-                subject_key_id: None,
-                detail: serde_json::json!({
-                    "op": "delete_traces_for_agent",
-                    "agent_id_hash": agent_id_hash,
-                    "signing_key_id": signature_key_id,
-                    "trace_events": trace_events_deleted,
-                    "trace_llm_calls": trace_llm_calls_deleted,
-                    "federation_keys": federation_keys_deleted,
-                    "federation_attestations": federation_attestations_deleted,
-                    "federation_revocations": federation_revocations_deleted,
-                    "detection_events_tombstoned": detection_events_tombstoned,
-                }),
-                emitted_at: received_at,
-            };
-            crate::federation::hard_case::bind_erased_detection_rows(
-                &mut event.detail,
-                &erased_rows,
+            // v58.0.0 (#1094 item 2, CC 4.5.3) — subject-free.
+            let event = crate::federation::hard_case::trace_erasure_event(
+                &crate::federation::hard_case::TraceErasureCounts {
+                    op: crate::federation::hard_case::trace_erasure_op::ONE_KEY,
+                    trace_events: trace_events_deleted,
+                    trace_llm_calls: trace_llm_calls_deleted,
+                    detection_events_tombstoned,
+                    detection_rows_erased: erased_rows.len() as u64,
+                    detection_rows_refused: refused_count,
+                    federation_keys: federation_keys_deleted,
+                    federation_attestations: federation_attestations_deleted,
+                    federation_revocations: federation_revocations_deleted,
+                },
+                received_at,
             );
             pg_record_erasure(&tx, &attester, &event, &erased_rows, received_at)
                 .await
@@ -3780,6 +4056,7 @@ impl Backend for PostgresBackend {
             federation_keys_deleted,
             federation_attestations_deleted,
             federation_revocations_deleted,
+            detection_rows_refused: refused,
             deleted_at: chrono::Utc::now(),
         })
     }
@@ -3806,7 +4083,23 @@ impl Backend for PostgresBackend {
                 .await
                 .map_err(|e| Error::Backend(format!("rehome before erasure: {e}")))?;
         }
+        // v58.0.0 (CIRISPersist#1094 item 2, CC 4.5.3) — each reached row
+        // erased under its producer's rule-1 `withdraws`, or refused with a
+        // reason; read before the transaction.
         let erased_at = chrono::Utc::now();
+        let crate::federation::subject_erasure::ErasurePlan {
+            citations,
+            new_withdraws,
+            refused,
+        } = crate::federation::subject_erasure::plan_store_erasure(
+            self,
+            agent_id_hash,
+            None,
+            erased_at,
+        )
+        .await
+        .map_err(|e| Error::Backend(format!("erasure plan: {e}")))?;
+        let refused_count = refused.len() as u64;
         let mut client = self
             .pool
             .get()
@@ -3842,13 +4135,16 @@ impl Backend for PostgresBackend {
         let legacy_tombstoned = pg_tombstone_detection_events(&tx, &trace_ids, erased_at)
             .await
             .map_err(|e| Error::Backend(format!("tombstone detection_events: {e}")))?;
-        // v57.0.0 (CIRISPersist#988 item 3; lead ruling on S1 item 5) — a
-        // ROW-BACKED detection of an erased trace is a signed row: it is
-        // HARD-DELETED here (the DSAR door's treatment of signed rows; its
-        // projection row leaves by cascade), never rewritten, and a purge
-        // tombstone (`ART17_ERASURE_BASIS`) is written below so the row cannot
-        // be re-admitted.
-        let erased_rows = pg_art17_delete_detection_rows(&tx, &trace_ids)
+        // v58.0.0 (CIRISPersist#1094 item 2, CC 4.5.3) — a ROW-BACKED
+        // detection is erased by its producer's rule-1 `withdraws`: each cited row is
+        // HARD-DELETED here (its projection row leaves by cascade), never
+        // rewritten, and its tombstone — citing the withdraws — is written
+        // below, so the row cannot be re-admitted and a peer holding a replica
+        // receives it.
+        pg_store_erasure_withdraws(&tx, &new_withdraws)
+            .await
+            .map_err(|e| Error::Backend(format!("erasure withdraws: {e}")))?;
+        let erased_rows = pg_erase_cited_rows(&tx, &citations)
             .await
             .map_err(|e| Error::Backend(format!("erase detection rows: {e}")))?;
         let detection_events_tombstoned = legacy_tombstoned + erased_rows.len() as u64;
@@ -3898,11 +4194,15 @@ impl Backend for PostgresBackend {
         // erased, so an idempotent re-run stays a clean no-op.
         if trace_events > 0 || trace_llm_calls > 0 || detection_events_tombstoned > 0 {
             let event = crate::federation::hard_case::trace_erasure_event(
-                agent_id_hash,
-                trace_events,
-                trace_llm_calls,
-                detection_events_tombstoned,
-                &erased_rows,
+                &crate::federation::hard_case::TraceErasureCounts {
+                    op: crate::federation::hard_case::trace_erasure_op::FULL,
+                    trace_events,
+                    trace_llm_calls,
+                    detection_events_tombstoned,
+                    detection_rows_erased: erased_rows.len() as u64,
+                    detection_rows_refused: refused_count,
+                    ..Default::default()
+                },
                 erased_at,
             );
             pg_record_erasure(&tx, &attester, &event, &erased_rows, erased_at)
@@ -3918,6 +4218,7 @@ impl Backend for PostgresBackend {
             trace_events,
             trace_llm_calls,
             detection_events_tombstoned,
+            detection_rows_refused: refused,
             erased_at,
         })
     }
@@ -5041,7 +5342,7 @@ impl PostgresBackend {
         &self,
         records: &[crate::federation::SignedKeyRecord],
     ) -> Result<(), crate::federation::Error> {
-        let client = self
+        let mut client = self
             .get_client()
             .await
             .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
@@ -5084,8 +5385,14 @@ impl PostgresBackend {
             // BY DESIGN, so keying the serve cursor on `scrub_timestamp` would
             // sort every genesis holder behind any consumer's cursor and it
             // would never replicate.
-            let admitted_at = self.next_key_serve_position(&client).await?;
-            client
+            // v58.0.0 (CIRISPersist#991) — the holder's record and its
+            // `key:record:v1` row, one transaction.
+            let tx = client
+                .transaction()
+                .await
+                .map_err(|e| crate::federation::Error::Backend(format!("genesis seed tx: {e}")))?;
+            let admitted_at = self.next_key_serve_position(&tx).await?;
+            tx
                 .execute(
                     "INSERT INTO cirislens.federation_keys (\
                         key_id, pubkey_ed25519_base64, pubkey_ml_dsa_65_base64, algorithm, \
@@ -5125,6 +5432,13 @@ impl PostgresBackend {
                         row.key_id
                     ))
                 })?;
+            pg_sync_key_record_row(&tx, &row.key_id).await?;
+            tx.commit().await.map_err(|e| {
+                crate::federation::Error::Backend(format!(
+                    "genesis seed commit {}: {e}",
+                    row.key_id
+                ))
+            })?;
         }
         Ok(())
     }
@@ -5300,12 +5614,17 @@ impl PostgresBackend {
             crate::federation::Error::Backend(format!("additional_scrubs serialize: {e}"))
         })?;
         let n = {
-            let client = self
+            let mut client = self
                 .get_client()
                 .await
                 .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
-            let mutated_at = self.next_key_serve_position(&client).await?;
-            client
+            // v58.0.0 (CIRISPersist#991) — the repair and its key-plane row,
+            // one transaction.
+            let tx = client.transaction().await.map_err(|e| {
+                crate::federation::Error::Backend(format!("rehydrate_dropped_key_scrubs tx: {e}"))
+            })?;
+            let mutated_at = self.next_key_serve_position(&tx).await?;
+            let n = tx
                 .execute(
                     "UPDATE cirislens.federation_keys SET additional_scrubs = $3, mutated_at = $4 \
                      WHERE key_id = $1 AND persist_row_hash = $2 AND additional_scrubs = '[]'",
@@ -5317,7 +5636,14 @@ impl PostgresBackend {
                         "rehydrate_dropped_key_scrubs {}: {e}",
                         record.key_id
                     ))
-                })?
+                })?;
+            pg_sync_key_record_row(&tx, &record.key_id).await?;
+            tx.commit().await.map_err(|e| {
+                crate::federation::Error::Backend(format!(
+                    "rehydrate_dropped_key_scrubs commit: {e}"
+                ))
+            })?;
+            n
         };
         if n == 0 {
             return Err(crate::federation::Error::Conflict(format!(
@@ -5435,10 +5761,15 @@ impl PostgresBackend {
         } else {
             Some(&row.capability_roles)
         };
-        let client = self
+        let mut client = self
             .get_client()
             .await
             .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        // v58.0.0 (CIRISPersist#991) — the write and its key-plane row, one
+        // transaction.
+        let tx = client.transaction().await.map_err(|e| {
+            crate::federation::Error::Backend(format!("adopt_scrub_upgrade tx: {e}"))
+        })?;
         // WHERE re-asserts the guards atomically: self-signed + same pubkey.
         //
         // v13.0.0 (CIRISPersist#365, CC 3.4.7.2): `consent_role` is
@@ -5459,8 +5790,8 @@ impl PostgresBackend {
         // v36.0.0 (CIRISPersist#707) — this door rewrites consumer-visible
         // `KeyRecord` bytes, so it must MOVE the serve position or a consumer
         // whose cursor has passed the row never learns it changed.
-        let mutated_at = self.next_key_serve_position(&client).await?;
-        let n = client
+        let mutated_at = self.next_key_serve_position(&tx).await?;
+        let n = tx
             .execute(
                 "UPDATE cirislens.federation_keys SET \
                     pubkey_ml_dsa_65_base64 = $2, algorithm = $3, identity_type = $4, \
@@ -5519,6 +5850,10 @@ impl PostgresBackend {
         // `wire_index::key_entry_as_stored`. The pooled client is RELEASED
         // before the reload — `lookup_public_key` takes its own, and holding
         // one while acquiring another is how a small pool deadlocks itself.
+        pg_sync_key_record_row(&tx, &row.key_id).await?;
+        tx.commit().await.map_err(|e| {
+            crate::federation::Error::Backend(format!("adopt_scrub_upgrade commit: {e}"))
+        })?;
         drop(client);
         self.index_stored_key_row(&row.key_id).await?;
         Ok(AdoptScrubOutcome::Upgraded)
@@ -5631,10 +5966,15 @@ impl PostgresBackend {
         } else {
             Some(&row.capability_roles)
         };
-        let client = self
+        let mut client = self
             .get_client()
             .await
             .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        // v58.0.0 (CIRISPersist#991) — the write and its key-plane row, one
+        // transaction.
+        let tx = client.transaction().await.map_err(|e| {
+            crate::federation::Error::Backend(format!("supersede_canonical_record tx: {e}"))
+        })?;
         // Atomic swap guarded on the planned-against version's persist_row_hash;
         // `consent_role` stays out of the SET (operational marker).
         // v31.0.0 (#644) — registration_envelope is TEXT since V122.
@@ -5650,8 +5990,8 @@ impl PostgresBackend {
         // v36.0.0 (CIRISPersist#707) — a canonical rotation rewrites the whole
         // consumer-visible record; the serve position must move or a consumer
         // past the cursor keeps the rotated-away version forever.
-        let mutated_at = self.next_key_serve_position(&client).await?;
-        let n = client
+        let mutated_at = self.next_key_serve_position(&tx).await?;
+        let n = tx
             .execute(
                 "UPDATE cirislens.federation_keys SET \
                     pubkey_ml_dsa_65_base64 = $2, algorithm = $3, identity_type = $4, \
@@ -5704,6 +6044,10 @@ impl PostgresBackend {
         // that skipped this advertised the rotated record and could not serve it.
         // v31.0.0 (CIRISPersist#640) — from the row AS STORED (see
         // `wire_index::key_entry_as_stored`); the client is released first.
+        pg_sync_key_record_row(&tx, &row.key_id).await?;
+        tx.commit().await.map_err(|e| {
+            crate::federation::Error::Backend(format!("supersede_canonical_record commit: {e}"))
+        })?;
         drop(client);
         self.index_stored_key_row(&row.key_id).await?;
         Ok(ReplicatedKeyOutcome::Superseded)
@@ -5967,6 +6311,10 @@ impl PostgresBackend {
                 row.key_id
             )));
         }
+        // v58.0.0 (CIRISPersist#991) — the replaced claim leaves the plane (its
+        // bytes are in the history row above) and the new claim's row lands, in
+        // this transaction.
+        pg_sync_key_record_row(&tx, &row.key_id).await?;
         tx.commit().await.map_err(|e| {
             crate::federation::Error::Backend(format!(
                 "{kind_token} key registration {}: commit: {e}",
@@ -6424,9 +6772,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 &format!(
                     "{PG_PURGE_EXECUTION_SELECT} \
                      WHERE ($1::timestamptz IS NULL OR (admitted_at, notice_id) > ($1, $2)) \
-                       AND legal_basis <> '{}' \
-                     ORDER BY admitted_at ASC, notice_id ASC LIMIT $3",
-                    crate::federation::steward_purge::ART17_ERASURE_BASIS
+                     ORDER BY admitted_at ASC, notice_id ASC LIMIT $3"
                 ),
                 &[&since_at, &since_id, &limit],
             )
@@ -6727,17 +7073,6 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         &self,
         record: crate::federation::SignedKeyRecord,
     ) -> Result<crate::federation::register::ReplicatedKeyOutcome, crate::federation::Error> {
-        // v52.0.0 (CIRISPersist#672) — a re-offer of a held record settles here,
-        // before any verification (`replication_policy::settle_if_held`).
-        if crate::federation::replication_policy::settle_if_held(
-            self,
-            crate::federation::replication_policy::EnvelopeKind::Key,
-            &record,
-        )
-        .await?
-        {
-            return Ok(crate::federation::register::ReplicatedKeyOutcome::Unchanged);
-        }
         PostgresBackend::apply_replicated_key_record(self, record).await
     }
 
@@ -6971,10 +7306,16 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         } else {
             Some(&row.capability_roles)
         };
-        let client = self
+        let mut client = self
             .get_client()
             .await
             .map_err(|e| Error::Backend(e.to_string()))?;
+        // v58.0.0 (CIRISPersist#991) — the write and its key-plane row, one
+        // transaction.
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| Error::Backend(format!("adopt_genesis_reanchor tx: {e}")))?;
         // No `scrub_key_id = key_id` WHERE condition — this path replaces an
         // ANCHORED row under the bundle-quorum authority verified above.
         // v31.0.0 (#644) — registration_envelope is TEXT since V122.
@@ -6988,8 +7329,8 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // v36.0.0 (CIRISPersist#707) — a genesis re-anchor rewrites the whole
         // consumer-visible record; the serve position must move or a consumer
         // past the cursor keeps the pre-anchor row forever.
-        let mutated_at = self.next_key_serve_position(&client).await?;
-        let n = client
+        let mutated_at = self.next_key_serve_position(&tx).await?;
+        let n = tx
             .execute(
                 "UPDATE cirislens.federation_keys SET \
                     pubkey_ml_dsa_65_base64 = $2, algorithm = $3, identity_type = $4, \
@@ -7034,6 +7375,10 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // v24.1.0 (CIRISPersist#547) — index the re-anchored row.
         // v31.0.0 (CIRISPersist#640) — from the row AS STORED; see
         // `wire_index::key_entry_as_stored`.
+        pg_sync_key_record_row(&tx, &row.key_id).await?;
+        tx.commit()
+            .await
+            .map_err(|e| Error::Backend(format!("adopt_genesis_reanchor commit: {e}")))?;
         drop(client);
         self.index_stored_key_row(&row.key_id).await?;
         Ok(())
@@ -8555,201 +8900,9 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         &self,
         revocation: crate::federation::SignedRevocation,
     ) -> Result<(), crate::federation::Error> {
-        // v52.0.0 (CIRISPersist#672) — a re-offer of a held record settles here,
-        // before any verification (`replication_policy::settle_if_held`).
-        if crate::federation::replication_policy::settle_if_held(
-            self,
-            crate::federation::replication_policy::EnvelopeKind::Revocation,
-            &revocation,
-        )
-        .await?
-        {
-            return Ok(());
-        }
-        let mut row = revocation.revocation;
-        // v31.0.0 (CIRISPersist#647) — CANONICAL AT REST: the revocation
-        // envelope is stored as the JCS bytes its scrub signature and
-        // `original_content_hash` cover, so the stored column sha256sums to
-        // the declared hash. Idempotent, therefore signature-transparent.
-        crate::federation::canonical_at_rest::canonicalize_in_place(&mut row.revocation_envelope)?;
-
-        // v31.0.0 (CIRISPersist#659) — THE SUBJECT, BEFORE ANYTHING ELSE. The
-        // signature covers `revocation_envelope` and nothing else, so
-        // `revoked_key_id` / `revocation_id` / the instants were columns a
-        // relay could rewrite while the signature still verified — one
-        // conferred moderator's revocation, re-pasted at any key. Pure
-        // function of the row (AV-76 tier 1), run ahead of the trust gate and
-        // the authority resolution so the refusal never depends on roster,
-        // trust score or custody state.
-        crate::federation::admission::check_revocation_envelope_binding(&row)?;
-
-        // v3.4.0 (CIRISPersist#123) — trust gate first.
-        if !row.revoking_key_id.is_empty() {
-            if let Some(gate) = self.admission_gate() {
-                gate.check_federation(&row.revoking_key_id).await?;
-            }
-        }
-
-        // v31.0.0 (CIRISPersist#660) — `original_content_hash` must be hex,
-        // STATED. The `hex::decode` at bind time refuses the same values but
-        // only as a side effect of binding a BYTEA, which is why the memory
-        // backend — binding nothing — accepted them. Placed HERE, ahead of the
-        // signature verify, on all three backends: `verify_revocation_admission`
-        // also cross-checks the hash, so a hex check sitting behind it on one
-        // backend and ahead of it on another would give two different refusals
-        // for one row.
-        crate::federation::admission::check_content_hash_hex(
-            "original_content_hash",
-            &row.original_content_hash,
-        )?;
-
-        // v21.0.0 (CIRISPersist#502 E1) — mechanistic authorship: the
-        // revocation MUST be hybrid-Strict-signed by its declared revoking
-        // key, resolved from OUR registered directory (was FK + trust-score
-        // only; scrub sig stored, never verified → forgeable de-peer DoS).
-        crate::federation::verify_revocation_admission(self, &row).await?;
-
-        // v3.11.0 (CIRISPersist#143) — region closed-set gate +
-        // anti-rollback monotonicity. Both run BEFORE persist_row_hash
-        // is computed and BEFORE INSERT (same discipline as v3.9.1
-        // cohort_scope admission).
-        // v30.8.0 (CIRISPersist#596 item 1) — revoking SOMEONE ELSE'S key is a
-        // moderation act. Self-revocation passes untouched.
-        crate::federation::admission::check_revocation_authority(self, &row).await?;
-        crate::federation::check_observed_region(&row.observed_region)?;
-        // v31.0.0 (CIRISPersist#659) — the anti-rollback DUAL, before the floor.
-        // See `check_revocation_scrub_skew`: the floor makes `scrub_timestamp` a
-        // monotonic latch on a key's whole de-admission history, and without a
-        // ceiling one self-signed revocation dated far enough forward makes its
-        // own subject immune to every later de-admission.
-        crate::federation::admission::check_revocation_scrub_skew(
-            &row,
-            chrono::Utc::now(),
-            crate::federation::admission::DEFAULT_MAX_TOUCH_SKEW,
-        )?;
-        let client = self
-            .get_client()
-            .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
-        // v52.0.0 (#784) — per SUBJECT, and the subject is the digest.
-        check_revocation_anti_rollback_postgres(
-            &client,
-            &row.revoked_key_sha256_ed25519_raw,
-            row.scrub_timestamp,
-        )
-        .await?;
-
-        // v25.1.0 (CIRISPersist#570 ask 4) — the history bound must be the
-        // one that was SIGNED, and must be coherent with `effective_at`.
-        // Runs here, before persist_row_hash and before INSERT, so a refused
-        // bound leaves no trace (AV-9). See `check_revocation_bound`.
-        crate::federation::check_revocation_bound(&row)?;
-
-        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
-
-        let original_content_hash = hex::decode(&row.original_content_hash).map_err(|e| {
-            crate::federation::Error::InvalidArgument(format!(
-                "original_content_hash hex decode: {e}"
-            ))
-        })?;
-
-        // v31.1.0 (CIRISPersist#622) — bound as TEXT, because V123 typed the
-        // column TEXT. This used to parse the id into a `uuid::Uuid` first, and
-        // that parse was the whole defect: `Revocation::revocation_id` is a
-        // `String`, nothing in the type or the gates constrains it to UUID
-        // shape, and memory and sqlite have always stored whatever they were
-        // handed. A symbolic id was admitted on two backends and refused HERE,
-        // with `revocation_id is not a valid UUID`, before a single admission
-        // gate ran. V121 removed the identical narrowing from `attestation_id`.
-        //
-        // v31.0.0 (#644) — revocation_envelope is TEXT since V122.
-        let revocation_envelope_text =
-            pg_envelope_text(&row.revocation_envelope, "revocation_envelope")?;
-        // v31.1.0 (CIRISPersist#655) — THIS node's admission position (V123).
-        // Not the producer's clock — `scrub_timestamp` is their assertion, and
-        // a late-replicated old one would sort behind every consumer's cursor —
-        // and not the local wall clock either: a backward step (VM restore, NTP
-        // correction) would stamp a later row below a cursor a consumer already
-        // passed, and `> since` would skip it permanently. Allocated strictly
-        // after the last position handed out; see
-        // `monotonic_admission_instant`.
-        //
-        // Two writers racing can still read the same MAX and tie. That is the
-        // composite-cursor question tracked in CIRISPersist#668, and it is a
-        // different failure (one row at a page boundary) from the reversal this
-        // closes (every row after the step, permanently).
-        let last_admitted: Option<chrono::DateTime<chrono::Utc>> = client
-            .query_one(
-                "SELECT MAX(admitted_at) FROM cirislens.federation_revocations",
-                &[],
-            )
-            .await
-            .map_err(|e| crate::federation::Error::Backend(format!("last admitted_at: {e}")))?
-            .get(0);
-        let admitted_at = crate::federation::types::monotonic_admission_instant(
-            chrono::Utc::now(),
-            last_admitted,
-        );
-        client
-            .execute(
-                // v31.1.0 (CIRISPersist#655) — `admitted_at` (V123) is THIS
-                // node's position in its own stream, stamped here and never
-                // read from the wire. The serve cursor keys on it.
-                "INSERT INTO cirislens.federation_revocations (\
-                    revocation_id, revoked_key_id, revoking_key_id, reason, \
-                    revoked_at, effective_at, revocation_envelope, \
-                    original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
-                    scrub_key_id, scrub_timestamp, pqc_completed_at, observed_region, \
-                    revoked_after, persist_row_hash, admitted_at, revoked_key_sha256_ed25519_raw\
-                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, \
-                    $16, $17, $18)",
-                &[
-                    &row.revocation_id,
-                    &row.revoked_key_id,
-                    &row.revoking_key_id,
-                    &row.reason,
-                    &row.revoked_at,
-                    &row.effective_at,
-                    &revocation_envelope_text,
-                    &original_content_hash,
-                    &row.scrub_signature_classical,
-                    &row.scrub_signature_pqc,
-                    &row.scrub_key_id,
-                    &row.scrub_timestamp,
-                    &row.pqc_completed_at,
-                    &row.observed_region,
-                    &row.revoked_after,
-                    &row.persist_row_hash,
-                    &admitted_at,
-                    &row.revoked_key_sha256_ed25519_raw,
-                ],
-            )
-            .await
-            .map_err(|e| {
-                let msg = e.to_string();
-                if msg.contains("foreign key") {
-                    crate::federation::Error::InvalidArgument(format!(
-                        "FK constraint violated on revocation insert: {msg}"
-                    ))
-                } else {
-                    crate::federation::Error::Backend(format!("insert revocation: {msg}"))
-                }
-            })?;
-        // v31.1.0 (CIRISPersist#655) — the key-level revocation plane joins the
-        // shared `signed_wire_index`, reloaded through the read path so the
-        // indexed bytes are the ones this backend actually stores.
-        self.index_stored_record(
-            "Revocation",
-            &crate::federation::wire_index::record_key(&[
-                (
-                    "revoked_key_sha256_ed25519_raw",
-                    row.revoked_key_sha256_ed25519_raw.as_str(),
-                ),
-                ("revocation_id", row.revocation_id.as_str()),
-            ]),
-        )
-        .await?;
-        Ok(())
+        // v58.0.0 (CIRISPersist#991) — one plan for every backend
+        // (`key_plane::plan_put_revocation`); this backend stores.
+        crate::federation::key_plane::put_revocation_planned(self, revocation).await
     }
 
     async fn revocations_for_subject(
@@ -8785,21 +8938,11 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         &self,
         occurrence: crate::federation::SignedIdentityOccurrence,
     ) -> Result<(), crate::federation::Error> {
-        // v52.0.0 (CIRISPersist#672) — a re-offer of a held record settles here,
-        // before any verification (`replication_policy::settle_if_held`).
-        if crate::federation::replication_policy::settle_if_held(
-            self,
-            crate::federation::replication_policy::EnvelopeKind::IdentityOccurrence,
-            &occurrence,
-        )
-        .await?
-        {
-            return Ok(());
-        }
         // v14.0.0 (CIRISPersist#418) — verify the hybrid signature over the exact
         // producer envelope + signer authority + C4 BEFORE any write (one gate,
         // HTTP + wire; fail-secure). Backend-symmetric with SQLite.
         crate::federation::admission::verify_signed_identity_occurrence(self, &occurrence).await?;
+        self.rehome_legacy_key_plane().await?;
         let crate::federation::SignedIdentityOccurrence {
             identity_occurrence: mut row,
             attesting_key_id,
@@ -8829,23 +8972,28 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             })?),
             None => None,
         };
-        let client = self
+        let mut client = self
             .get_client()
             .await
             .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        // v58.0.0 (CIRISPersist#991) — the occurrence and its
+        // `identity:occurrence:v1` row, one transaction.
+        let tx = client.transaction().await.map_err(|e| {
+            crate::federation::Error::Backend(format!("put_identity_occurrence tx: {e}"))
+        })?;
         // v36.0.0 (#668) — THIS node's serve position (V130). One allocation
         // covers both arms: the INSERT stamps it, the last-signed-wins DO
         // UPDATE re-stamps it (`EXCLUDED.admitted_at`) because a supersede
         // rewrites the served bytes and must move the row forward.
         let admitted_at = self
-            .next_plane_position(&client, "federation_identity_occurrences")
+            .next_plane_position(&tx, "federation_identity_occurrences")
             .await?;
         // Last-signed-wins: UPSERT only when strictly newer asserted_at; a
         // stale/equal replay is a safe no-op (poisoned/older row can't win).
         // v52.0.0 (#930) — ONE statement: the current-state upsert, and the
         // assertion appended to the V161 history whether or not the upsert
         // took it (an older verified assertion still bounded a binding).
-        let occurrence_applied: i64 = client
+        let occurrence_applied: i64 = tx
             .query_one(
                 "WITH hist AS (\
                     INSERT INTO cirislens.federation_identity_occurrence_history (\
@@ -8904,6 +9052,10 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     crate::federation::Error::Backend(format!("insert identity_occurrence: {msg}"))
                 }
             })?;
+        pg_sync_occurrence_row(&tx, &row.identity_key_id, &row.occurrence_key_id).await?;
+        tx.commit().await.map_err(|e| {
+            crate::federation::Error::Backend(format!("put_identity_occurrence commit: {e}"))
+        })?;
         // #446 — materialize the embedded binding into the
         // `transport_destinations` read model (local derived row on the
         // occurrence's own (epoch=0, asserted_at) clock — see project_route).
@@ -8916,16 +9068,40 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 crate::federation::FederationDirectory::put_transport_destination(self, &route)
                     .await?;
             }
-            // v21.1.0 (CIRISPersist#507b) — wire-index the exact
-            // `SignedIdentityOccurrence` `list_signed_identity_occurrences_since`
-            // re-serializes.
-            let wire_index_key = crate::federation::wire_index::record_key(&[
-                ("identity_key_id", &row.identity_key_id),
-                ("occurrence_key_id", &row.occurrence_key_id),
-            ]);
+            // v58.0.0 (CIRISPersist#991) — the pair's `identity:occurrence:v1`
+            // row is the wire-index entry (the Attestation kind).
+            // A schema before V198 (a test's `run_migrations_through`) has no
+            // pointer: no row to index.
+            let occurrence_row_id: Option<String> = if !pg_key_plane_present(&**client).await? {
+                None
+            } else {
+                match client
+                    .query_opt(
+                        "SELECT attestation_id FROM cirislens.federation_identity_occurrences \
+                      WHERE identity_key_id = $1 AND occurrence_key_id = $2",
+                        &[&row.identity_key_id, &row.occurrence_key_id],
+                    )
+                    .await
+                    .map_err(|e| {
+                        crate::federation::Error::Backend(format!("occurrence row pointer: {e}"))
+                    })? {
+                    Some(r) => r.safe_get_with(0, crate::federation::Error::Backend)?,
+                    None => None,
+                }
+            };
             drop(client);
-            self.index_stored_record("IdentityOccurrence", &wire_index_key)
-                .await?;
+            // v58.0.0 (compat reads, operator ruling 2026-10-18) — the framed
+            // `IdentityOccurrence` entry a pre-v58 peer asks for, beside the
+            // row's.
+            self.index_stored_record(
+                "IdentityOccurrence",
+                &crate::federation::wire_index::record_key(&[
+                    ("identity_key_id", &row.identity_key_id),
+                    ("occurrence_key_id", &row.occurrence_key_id),
+                ]),
+            )
+            .await?;
+            self.index_plane_row(occurrence_row_id.as_deref()).await?;
         }
         // v50.0.0 (CIRISPersist#916) — a member's device occurrence arriving
         // (typically after its owner-binding): this node re-wraps its own
@@ -10518,13 +10694,18 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let admitted_at = self
             .next_plane_position(&client, "federation_identity_occurrence_revocations")
             .await?;
-        client
+        // v58.0.0 (compat reads) — the pair already revoked, by either route
+        // (this door, or a `withdraws` on its `identity:occurrence:v1` row),
+        // settles without a write: the first revocation to land fixes the
+        // instants, so neither route rewrites (or un-revokes) the other.
+        let inserted = client
             .execute(
                 "INSERT INTO cirislens.federation_identity_occurrence_revocations (\
                     identity_key_id, occurrence_key_id, revoked_at, effective_at, \
                     reason, witness_set, persist_row_hash, \
                     attesting_key_id, signed_envelope, signature, admitted_at\
-                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
+                 ON CONFLICT (identity_key_id, occurrence_key_id) DO NOTHING",
                 &[
                     &row.identity_key_id,
                     &row.occurrence_key_id,
@@ -10541,6 +10722,9 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             )
             .await
             .map_err(map_revocation_pg_err("identity_occurrence_revocation"))?;
+        if inserted == 0 {
+            return Ok(());
+        }
         // v21.1.0 (CIRISPersist#507b) — wire-index the exact
         // `SignedIdentityOccurrenceRevocation` `list_signed_identity_occurrence_revocations_since`
         // re-serializes.
@@ -13917,14 +14101,19 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         for_hash.persist_row_hash = String::new();
         let new_hash = crate::federation::types::compute_persist_row_hash(&for_hash)?;
 
-        let client = self
+        let mut client = self
             .get_client()
             .await
             .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        // v58.0.0 (CIRISPersist#991) — the write and its key-plane row, one
+        // transaction.
+        let tx = client.transaction().await.map_err(|e| {
+            crate::federation::Error::Backend(format!("attach_key_pqc_signature tx: {e}"))
+        })?;
         // v36.0.0 (CIRISPersist#707) — the hybrid-completion write rewrites
         // FOUR served columns; the serve position must move with them.
-        let mutated_at = self.next_key_serve_position(&client).await?;
-        let n = client
+        let mutated_at = self.next_key_serve_position(&tx).await?;
+        let n = tx
             .execute(
                 "UPDATE cirislens.federation_keys \
                  SET pubkey_ml_dsa_65_base64 = $1, scrub_signature_pqc = $2, \
@@ -13961,6 +14150,10 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // surface by construction, whatever a backend rounds.
         // v31.0.0 (CIRISPersist#640) — through the shared helper; this site's
         // remedy is now every site's remedy.
+        pg_sync_key_record_row(&tx, key_id).await?;
+        tx.commit().await.map_err(|e| {
+            crate::federation::Error::Backend(format!("attach_key_pqc_signature commit: {e}"))
+        })?;
         drop(client);
         self.index_stored_key_row(key_id).await?;
         Ok(())
@@ -14551,70 +14744,6 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .collect()
     }
 
-    async fn attach_revocation_pqc_signature(
-        &self,
-        revocation_id: &str,
-        scrub_signature_pqc: &str,
-    ) -> Result<(), crate::federation::Error> {
-        let client = self
-            .get_client()
-            .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
-        // v31.1.0 (CIRISPersist#622) — bound as TEXT since V123. The UUID parse
-        // that used to sit here refused, at the driver, every id its two sibling
-        // backends store without comment. `attach_revocation_pqc_signature` is
-        // the SECOND site of one defect, and it would have kept the row
-        // unreachable for PQC completion even after the write door was fixed.
-        let row_opt = client
-            .query_opt(
-                "SELECT revocation_id::text, revoked_key_id, revoking_key_id, reason, \
-                    revoked_at, effective_at, revocation_envelope, \
-                    original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
-                    scrub_key_id, scrub_timestamp, pqc_completed_at, observed_region, \
-                    revoked_after, persist_row_hash, revoked_key_sha256_ed25519_raw \
-                 FROM cirislens.federation_revocations WHERE revocation_id = $1",
-                &[&revocation_id],
-            )
-            .await
-            .map_err(|e| crate::federation::Error::Backend(format!("attach lookup: {e}")))?;
-        let mut row = row_opt
-            .map(pg_row_to_revocation)
-            .transpose()?
-            .ok_or_else(|| {
-                crate::federation::Error::InvalidArgument(format!(
-                    "federation_revocations row {revocation_id} does not exist"
-                ))
-            })?;
-        if row.is_pqc_complete() {
-            return Err(crate::federation::Error::Conflict(format!(
-                "federation_revocations row {revocation_id} is already PQC-complete"
-            )));
-        }
-        row.scrub_signature_pqc = Some(scrub_signature_pqc.to_owned());
-        let now = chrono::Utc::now();
-        row.pqc_completed_at = Some(now);
-        let mut for_hash = row.clone();
-        for_hash.persist_row_hash = String::new();
-        let new_hash = crate::federation::types::compute_persist_row_hash(&for_hash)?;
-        let n = client
-            .execute(
-                "UPDATE cirislens.federation_revocations \
-                 SET scrub_signature_pqc = $1, pqc_completed_at = $2, persist_row_hash = $3 \
-                 WHERE revocation_id = $4 AND pqc_completed_at IS NULL",
-                &[&scrub_signature_pqc, &now, &new_hash, &revocation_id],
-            )
-            .await
-            .map_err(|e| {
-                crate::federation::Error::Backend(format!("attach_revocation_pqc_signature: {e}"))
-            })?;
-        if n == 0 {
-            return Err(crate::federation::Error::Conflict(format!(
-                "federation_revocations row {revocation_id} was concurrently completed"
-            )));
-        }
-        Ok(())
-    }
-
     async fn list_hybrid_pending_keys(
         &self,
         limit: i64,
@@ -14683,44 +14812,6 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     envelope: pg_envelope_value(
                         &row.safe_get_with::<String, _, _, _>("attestation_envelope", mk_err)?,
                         "attestation_envelope",
-                    )?,
-                    classical_sig_b64: row.safe_get_with("scrub_signature_classical", mk_err)?,
-                })
-            })
-            .collect()
-    }
-
-    async fn list_hybrid_pending_revocations(
-        &self,
-        limit: i64,
-    ) -> Result<Vec<crate::federation::HybridPendingRow>, crate::federation::Error> {
-        let client = self
-            .get_client()
-            .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
-        let rows = client
-            .query(
-                "SELECT revocation_id::text AS revocation_id, \
-                    revocation_envelope, scrub_signature_classical \
-                 FROM cirislens.federation_revocations \
-                 WHERE pqc_completed_at IS NULL \
-                 ORDER BY revoked_at ASC \
-                 LIMIT $1",
-                &[&limit],
-            )
-            .await
-            .map_err(|e| {
-                crate::federation::Error::Backend(format!("list_hybrid_pending_revocations: {e}"))
-            })?;
-        rows.into_iter()
-            .map(|row| {
-                let mk_err = crate::federation::Error::Backend;
-                Ok(crate::federation::HybridPendingRow {
-                    id: row.safe_get_with("revocation_id", mk_err)?,
-                    // v31.0.0 (#644) — TEXT since V122.
-                    envelope: pg_envelope_value(
-                        &row.safe_get_with::<String, _, _, _>("revocation_envelope", mk_err)?,
-                        "revocation_envelope",
                     )?,
                     classical_sig_b64: row.safe_get_with("scrub_signature_classical", mk_err)?,
                 })
@@ -15459,9 +15550,14 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             // Defensive: count attestations that would be orphaned.
             let count_row = tx
                 .query_one(
+                    // v58.0.0 (CIRISPersist#991) — the key's own
+                    // `key:record:v1` claim is the key, not an attestation
+                    // that depends on it.
                     "SELECT COUNT(*)::BIGINT FROM cirislens.federation_attestations \
-                     WHERE attesting_key_id = $1 OR attested_key_id = $1 OR scrub_key_id = $1",
-                    &[&key_id],
+                     WHERE (attesting_key_id = $1 OR attested_key_id = $1 OR scrub_key_id = $1) \
+                       AND NOT (attesting_key_id = $1 AND attested_key_id = $1 \
+                                AND dimension IS NOT DISTINCT FROM $2)",
+                    &[&key_id, &crate::federation::key_plane::KEY_RECORD_DIMENSION],
                 )
                 .await
                 .map_err(|e| {
@@ -15476,6 +15572,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     attestation_count: count as usize,
                 });
             }
+            pg_drop_key_record_rows(&tx, key_id).await?;
             // Cascade: DELETE federation_keys; ON DELETE CASCADE on
             // federation_peer_metadata.key_id picks up the sibling.
             tx.execute(
@@ -23200,6 +23297,64 @@ impl crate::federation::attestation_admit::AttestationStore for PostgresBackend 
             .map_err(|e| Error::Backend(format!("rehome_legacy_hard_case_events commit: {e}")))
     }
 
+    async fn trace_agent_id_hash(
+        &self,
+        trace_id: &str,
+    ) -> Result<Option<String>, crate::federation::Error> {
+        use crate::federation::Error;
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| Error::Backend(e.to_string()))?;
+        client
+            .query_opt(
+                "SELECT agent_id_hash FROM cirislens.trace_events WHERE trace_id = $1 \
+                 ORDER BY event_id LIMIT 1",
+                &[&trace_id],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("trace_agent_id_hash: {e}")))?
+            .map(|r| r.safe_get_with::<String, _, _, _>(0, Error::Backend))
+            .transpose()
+    }
+
+    async fn detection_row_ids_for_agent(
+        &self,
+        agent_id_hash: &str,
+        signing_key_id: Option<&str>,
+    ) -> Result<Vec<String>, crate::federation::Error> {
+        use crate::federation::Error;
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| Error::Backend(e.to_string()))?;
+        // The full erasure also reaches the rows NAMING the subject, so a row
+        // an earlier run left (its trace already gone) is found again.
+        let subject = signing_key_id
+            .is_none()
+            .then(|| crate::federation::subject_erasure::agent_subject(agent_id_hash).ok())
+            .flatten();
+        client
+            .query(
+                "SELECT a.attestation_id FROM cirislens.federation_attestations a \
+                 WHERE substr(a.dimension, 1, 10) = 'detection:' \
+                   AND (a.attestation_envelope::jsonb->'detection'->>'trace_id' IN ( \
+                         SELECT DISTINCT t.trace_id FROM cirislens.trace_events t \
+                          WHERE t.agent_id_hash = $1 \
+                            AND ($2::text IS NULL OR t.signing_key_id = $2)) \
+                     OR a.attestation_id IN ( \
+                         SELECT s.attestation_id FROM cirislens.attestation_subjects s \
+                          WHERE s.subject_key_id = $3)) \
+                 ORDER BY a.attestation_id",
+                &[&agent_id_hash, &signing_key_id, &subject],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("detection_row_ids_for_agent: {e}")))?
+            .into_iter()
+            .map(|r| r.safe_get_with::<String, _, _, _>(0, Error::Backend))
+            .collect()
+    }
+
     async fn store_planned_detection(
         &self,
         planned: crate::federation::attestation_admit::PlannedDetection,
@@ -23266,9 +23421,16 @@ impl crate::federation::attestation_admit::AttestationStore for PostgresBackend 
                 );
                 continue;
             };
+            // v58.0.0 (CIRISPersist#1094 item 2) — the row names its subject.
+            let subject = crate::federation::attestation_admit::detection_subject(
+                self,
+                body.trace_id.as_deref(),
+            )
+            .await?;
             let planned = match crate::federation::attestation_admit::plan_detection_row(
                 &body,
                 &identity_type,
+                subject.as_deref(),
                 crate::federation::attestation_admit::PlanInstants {
                     // The silo row's own recorded instant (never the rehome's clock),
                     // bounded by the receipt clock.
@@ -23337,6 +23499,29 @@ impl crate::federation::attestation_admit::AttestationStore for PostgresBackend 
                 "detection_id",
                 crate::derived::detection_row::DIMENSION_PREFIX,
             ),
+            // v58.0.0 (CIRISPersist#991) — the key plane's rebuild is a pure
+            // function of two reads.
+            SiloProjection::FederationKeys => {
+                let client = self
+                    .get_client()
+                    .await
+                    .map_err(|e| Error::Backend(e.to_string()))?;
+                return pg_key_projection_rebuild(&**client).await;
+            }
+            SiloProjection::FederationRevocations => {
+                let client = self
+                    .get_client()
+                    .await
+                    .map_err(|e| Error::Backend(e.to_string()))?;
+                return pg_revocation_projection_rebuild(&**client).await;
+            }
+            SiloProjection::IdentityOccurrences => {
+                let client = self
+                    .get_client()
+                    .await
+                    .map_err(|e| Error::Backend(e.to_string()))?;
+                return pg_occurrence_projection_rebuild(&**client).await;
+            }
         };
         let mut client = self
             .get_client()
@@ -23366,6 +23551,9 @@ impl crate::federation::attestation_admit::AttestationStore for PostgresBackend 
         for r in rows {
             let row = pg_row_to_attestation(r)?;
             match projection {
+                SiloProjection::FederationKeys
+                | SiloProjection::FederationRevocations
+                | SiloProjection::IdentityOccurrences => {}
                 SiloProjection::HardCaseEvents => {
                     if let Some(event) = crate::federation::hard_case::project_hard_case_row(&row) {
                         pg_project_hard_case(&*tx, scratch, &row.attestation_id, &event).await?;
@@ -24492,46 +24680,82 @@ fn pg_error_detail(e: &tokio_postgres::Error) -> String {
     out
 }
 
-/// v24.0.0 (CIRISPersist#557) — the shared attestation-insert error mapper: a
-/// FK violation → `InvalidArgument` (matching the memory backend's shape), any
-/// other database error → `Backend`, both carrying [`pg_error_detail`].
-///
-/// The FK classification keys on **SQLSTATE 23503**, not on a substring of the
-/// message. The previous `msg.contains("foreign key")` test ran against
-/// `"db error"` and therefore never fired — so a genuine FK violation on this
-/// path had been reported as an opaque `Backend` for as long as the check had
-/// existed, diverging from memory's `InvalidArgument` in a way the differential
-/// harness could not see (it never reaches pg).
-/// v57.0.0 (CIRISPersist#988 item 3; lead ruling on S1 item 5) — the Art. 17
-/// erasure of the ROW-BACKED detections of `trace_ids`, inside the erasure's
-/// transaction: each signed row is hard-deleted (its wire-index entry first;
-/// its projection row leaves by `ON DELETE CASCADE`). Never a rewrite.
-/// Returns the deleted row ids, for the erasure's tombstones.
-async fn pg_art17_delete_detection_rows(
-    tx: &tokio_postgres::Transaction<'_>,
-    trace_ids: &[String],
-) -> Result<Vec<String>, crate::federation::Error> {
-    use crate::federation::Error;
-    if trace_ids.is_empty() {
-        return Ok(Vec::new());
-    }
-    // Found by the ROW's own body (`detection.trace_id`), so a row a steward
-    // purge already tombstoned (its projection linkage NULL) is erased too.
-    let ids: Vec<String> = tx
-        .query(
-            "SELECT attestation_id FROM cirislens.federation_attestations \
-             WHERE substr(dimension, 1, 10) = 'detection:' \
-               AND attestation_envelope::jsonb->'detection'->>'trace_id' = ANY($1::text[]) \
-             ORDER BY attestation_id",
-            &[&trace_ids],
+/// v58.0.0 (CIRISPersist#1094 item 2) — what V196 will delete on this store,
+/// `(hard_case rows, pre-v57 silo rows, art17_erasure headers)`, counted with
+/// V196's own predicates; `None` once V196 is applied or before the tables
+/// exist.
+async fn pg_v196_pending(client: &tokio_postgres::Client) -> Option<(i64, i64, i64)> {
+    let applied: i32 = client
+        .query_one(
+            "SELECT COALESCE(MAX(version), 0) FROM ciris_persist_schema_history",
+            &[],
         )
         .await
-        .map_err(|e| Error::Backend(format!("find detection rows: {e}")))?
-        .into_iter()
-        .map(|r| r.safe_get_with::<String, _, _, _>(0, Error::Backend))
-        .collect::<Result<_, _>>()?;
-    for id in &ids {
-        let record_key = crate::federation::wire_index::record_key(&[("attestation_id", id)]);
+        .ok()?
+        .try_get(0)
+        .ok()?;
+    if applied >= 196 {
+        return None;
+    }
+    let count = |sql: &'static str| async move {
+        client
+            .query_one(sql, &[])
+            .await
+            .ok()
+            .and_then(|r| r.try_get::<_, i64>(0).ok())
+            .unwrap_or(0)
+    };
+    let rows = count(
+        "SELECT COUNT(*) FROM cirislens.federation_attestations \
+          WHERE dimension = 'hard_case:trace_erasure:v1' \
+            AND (COALESCE(attestation_envelope::jsonb #> '{hard_case,target_key_id}', 'null') <> 'null' \
+              OR COALESCE(attestation_envelope::jsonb #> '{hard_case,subject_key_id}', 'null') <> 'null' \
+              OR COALESCE(attestation_envelope::jsonb #> '{hard_case,detail,agent_id_hash}', 'null') <> 'null' \
+              OR COALESCE(attestation_envelope::jsonb #> '{hard_case,detail,signing_key_id}', 'null') <> 'null')",
+    )
+    .await;
+    let silo = count(
+        "SELECT COUNT(*) FROM cirislens.hard_case_events \
+          WHERE attestation_id IS NULL AND kind = 'trace_erasure' \
+            AND (target_key_id IS NOT NULL OR subject_key_id IS NOT NULL \
+              OR COALESCE(detail -> 'agent_id_hash', 'null') <> 'null' \
+              OR COALESCE(detail -> 'signing_key_id', 'null') <> 'null')",
+    )
+    .await;
+    let headers = count(
+        "SELECT COUNT(*) FROM cirislens.purge_executions WHERE legal_basis = 'art17_erasure'",
+    )
+    .await;
+    Some((rows, silo, headers))
+}
+
+/// v58.0.0 (CIRISPersist#1094 item 2) — store the producers' planned
+/// `withdraws` rows inside the erasure's transaction, through the local-row
+/// statement every local writer uses (row, subject projection, V157 depth).
+async fn pg_store_erasure_withdraws(
+    tx: &tokio_postgres::Transaction<'_>,
+    planned: &[crate::federation::subject_erasure::PlannedErasureWithdraws],
+) -> Result<(), crate::federation::Error> {
+    for w in planned {
+        pg_insert_local_attestation_row(tx, &w.row, Some(w.depth)).await?;
+    }
+    Ok(())
+}
+
+/// v58.0.0 (CIRISPersist#1094 item 2, CC 4.5.3) — erase the ROW-BACKED
+/// detections their producer's `withdraws` covers, inside the erasure's transaction:
+/// each cited row is hard-deleted (its wire-index entry first; its projection
+/// row leaves by `ON DELETE CASCADE`). Never a rewrite. Returns the citations
+/// whose row was still there, for their tombstones.
+async fn pg_erase_cited_rows(
+    tx: &tokio_postgres::Transaction<'_>,
+    citations: &[crate::federation::subject_erasure::ErasureCitation],
+) -> Result<Vec<crate::federation::subject_erasure::ErasureCitation>, crate::federation::Error> {
+    use crate::federation::Error;
+    let mut erased = Vec::new();
+    for c in citations {
+        let record_key =
+            crate::federation::wire_index::record_key(&[("attestation_id", &c.target)]);
         tx.execute(
             "DELETE FROM cirislens.signed_wire_index \
              WHERE kind = 'Attestation' AND record_key = $1",
@@ -24539,25 +24763,30 @@ async fn pg_art17_delete_detection_rows(
         )
         .await
         .map_err(|e| Error::Backend(format!("detection wire index: {e}")))?;
-        tx.execute(
-            "DELETE FROM cirislens.federation_attestations WHERE attestation_id = $1",
-            &[id],
-        )
-        .await
-        .map_err(|e| Error::Backend(format!("erase detection row: {e}")))?;
+        let n = tx
+            .execute(
+                "DELETE FROM cirislens.federation_attestations WHERE attestation_id = $1",
+                &[&c.target],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("erase detection row: {e}")))?;
+        if n > 0 {
+            erased.push(c.clone());
+        }
     }
-    Ok(ids)
+    Ok(erased)
 }
 
-/// v57.0.0 (CIRISPersist#988 item 3; lead ruling on the DSAR path) — record a
-/// DSAR erasure inside its transaction: its `hard_case:trace_erasure:v1` row
-/// and, when it hard-deleted row-backed detections, the Art. 17 purge
-/// tombstone header citing that row.
+/// v58.0.0 (CIRISPersist#1094 item 2) — record a DSAR erasure inside its
+/// transaction: its subject-free `hard_case:trace_erasure:v1` row and, per
+/// erased row, the tombstone header citing the producer's `withdraws`
+/// (`subject_erasure::erasure_execution`, finalized at once) and its one
+/// tombstone.
 async fn pg_record_erasure(
     tx: &tokio_postgres::Transaction<'_>,
     attester: &crate::federation::attestation_admit::HardCaseAttester,
     event: &crate::federation::HardCaseEvent,
-    erased_rows: &[String],
+    erased: &[crate::federation::subject_erasure::ErasureCitation],
     at: chrono::DateTime<chrono::Utc>,
 ) -> Result<(), crate::federation::Error> {
     let planned = crate::federation::attestation_admit::plan_hard_case_row(
@@ -24569,21 +24798,22 @@ async fn pg_record_erasure(
         },
     )?;
     pg_store_hard_case(tx, &planned).await?;
-    if !erased_rows.is_empty() {
-        let (execution, tombstones) = crate::federation::steward_purge::art17_erasure_execution(
-            &planned.row,
-            erased_rows,
+    for c in erased {
+        let (execution, tombstone) = crate::federation::subject_erasure::erasure_execution(
+            c,
             &attester.key_id,
+            crate::federation::steward_purge::origin::LOCAL,
             at,
+            Some(at),
         )?;
-        pg_put_art17_execution(tx, &execution, &tombstones).await?;
+        pg_put_erasure_execution(tx, &execution, std::slice::from_ref(&tombstone)).await?;
     }
     Ok(())
 }
 
-/// v57.0.0 — write an Art. 17 erasure's tombstone header (finalized at once)
-/// and its tombstones, inside the erasure's transaction.
-async fn pg_put_art17_execution(
+/// v58.0.0 — write an erasure's tombstone header (finalized at once) and its
+/// tombstone, inside the erasure's transaction.
+async fn pg_put_erasure_execution(
     tx: &tokio_postgres::Transaction<'_>,
     e: &crate::federation::steward_purge::PurgeExecution,
     tombstones: &[crate::federation::steward_purge::PurgeTombstone],
@@ -24613,7 +24843,7 @@ async fn pg_put_art17_execution(
         ],
     )
     .await
-    .map_err(|err| Error::Backend(format!("art17 purge header: {err}")))?;
+    .map_err(|err| Error::Backend(format!("erasure purge header: {err}")))?;
     for t in tombstones {
         let ordinal = i64::try_from(t.ordinal).unwrap_or(i64::MAX);
         tx.execute(
@@ -24629,8 +24859,389 @@ async fn pg_put_art17_execution(
             ],
         )
         .await
-        .map_err(|err| Error::Backend(format!("art17 purge tombstone: {err}")))?;
+        .map_err(|err| Error::Backend(format!("erasure purge tombstone: {err}")))?;
     }
+    Ok(())
+}
+
+/// v58.0.0 (CIRISPersist#991) — insert a key-plane row (federation tier,
+/// minted by `federation::key_plane` from the signed object it carries)
+/// inside `tx`, with its serve position. One signed object, one id: a
+/// re-insert is a no-op.
+async fn pg_insert_plane_row(
+    tx: &tokio_postgres::Transaction<'_>,
+    row: &crate::federation::Attestation,
+) -> Result<u64, crate::federation::Error> {
+    use crate::federation::Error;
+    let original_content_hash: Vec<u8> = hex::decode(&row.original_content_hash)
+        .map_err(|e| Error::Backend(format!("original_content_hash hex decode: {e}")))?;
+    let attestation_envelope_text = serde_json::to_string(&row.attestation_envelope)
+        .map_err(|e| Error::Backend(format!("attestation_envelope encode: {e}")))?;
+    let admitted_at = pg_next_plane_position(tx, "federation_attestations").await?;
+    tx.execute(
+        "INSERT INTO cirislens.federation_attestations (\
+            attestation_id, attesting_key_id, attested_key_id, attestation_type, \
+            weight, asserted_at, expires_at, attestation_envelope, \
+            original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
+            scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, \
+            subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at, \
+            additional_scrubs, admitted_at\
+         ) VALUES ($1, $2, $3, $4, NULL, $5, NULL, $6, $7, $8, $9, $10, $11, $12, $13, \
+                   '[]'::jsonb, NULL, $14, $15, NULL, '[]', $16) \
+         ON CONFLICT (attestation_id) DO NOTHING",
+        &[
+            &row.attestation_id,
+            &row.attesting_key_id,
+            &row.attested_key_id,
+            &row.attestation_type,
+            &row.asserted_at,
+            &attestation_envelope_text,
+            &original_content_hash,
+            &row.scrub_signature_classical,
+            &row.scrub_signature_pqc,
+            &row.scrub_key_id,
+            &row.scrub_timestamp,
+            &row.pqc_completed_at,
+            &row.persist_row_hash,
+            &row.cohort_scope,
+            &row.tier,
+            &admitted_at,
+        ],
+    )
+    .await
+    .map_err(map_attestation_pg_err("insert key-plane row"))
+}
+
+/// v58.0.0 (CIRISPersist#991) — is V198 applied? A schema before it (only a
+/// test's `run_migrations_through` builds one) has no key-plane pointer, and
+/// the key plane is not on it: the row step is a no-op there.
+async fn pg_key_plane_present<C>(client: &C) -> Result<bool, crate::federation::Error>
+where
+    C: tokio_postgres::GenericClient + Sync,
+{
+    client
+        .query_opt(
+            "SELECT 1 FROM information_schema.columns \
+              WHERE table_schema = 'cirislens' AND table_name = 'federation_keys' \
+                AND column_name = 'attestation_id'",
+            &[],
+        )
+        .await
+        .map(|r| r.is_some())
+        .map_err(|e| crate::federation::Error::Backend(format!("key plane schema probe: {e}")))
+}
+
+/// v58.0.0 (CIRISPersist#991) — delete every `key:record:v1` row of `key_id`
+/// (its own claims), ahead of a door that deletes or replaces the key: the
+/// row names the key as its attester, so it must leave first.
+async fn pg_drop_key_record_rows(
+    tx: &tokio_postgres::Transaction<'_>,
+    key_id: &str,
+) -> Result<u64, crate::federation::Error> {
+    tx.execute(
+        "DELETE FROM cirislens.federation_attestations \
+          WHERE attesting_key_id = $1 AND attested_key_id = $1 AND dimension = $2",
+        &[&key_id, &crate::federation::key_plane::KEY_RECORD_DIMENSION],
+    )
+    .await
+    .map_err(|e| crate::federation::Error::Backend(format!("drop key:record rows: {e}")))
+}
+
+/// v58.0.0 (CIRISPersist#991, CC 3.1.3) — **the `key:record:v1` row follows
+/// its key**, inside `tx`: after any write to `federation_keys`, the key's row
+/// is the row its stored record plans to
+/// (`key_plane::key_record_row_if_verifiable`, the base signer's keys read in
+/// this transaction) — inserted, the key's older claims deleted, the
+/// projection's `attestation_id` pointed at it; or no row at all when the
+/// record does not verify (held without a row; the rebuild gate names it). A
+/// deleted key takes its rows with it.
+async fn pg_sync_key_record_row(
+    tx: &tokio_postgres::Transaction<'_>,
+    key_id: &str,
+) -> Result<(), crate::federation::Error> {
+    if !pg_key_plane_present(tx).await? {
+        return Ok(());
+    }
+    use crate::federation::Error;
+    let stored = tx
+        .query_opt(
+            "SELECT * FROM cirislens.federation_keys WHERE key_id = $1",
+            &[&key_id],
+        )
+        .await
+        .map_err(|e| Error::Backend(format!("sync key:record row: {e}")))?;
+    let Some(stored) = stored else {
+        pg_drop_key_record_rows(tx, key_id).await?;
+        return Ok(());
+    };
+    let current: Option<String> = stored.safe_get_with("attestation_id", Error::Backend)?;
+    let record = pg_row_to_key_record(stored)?;
+    let held_signer: crate::federation::key_plane::HeldSigner =
+        if record.scrub_key_id == record.key_id {
+            None
+        } else {
+            tx.query_opt(
+                "SELECT pubkey_ed25519_base64, pubkey_ml_dsa_65_base64 \
+                   FROM cirislens.federation_keys WHERE key_id = $1",
+                &[&record.scrub_key_id],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("sync key:record row signer: {e}")))?
+            .map(|r| -> Result<(String, Option<String>), Error> {
+                Ok((
+                    r.safe_get_with(0, Error::Backend)?,
+                    r.safe_get_with(1, Error::Backend)?,
+                ))
+            })
+            .transpose()?
+        };
+    let planned = crate::federation::key_plane::key_record_row_if_verifiable(&record, &held_signer);
+    if let (Some(cur), Some(p)) = (current.as_deref(), planned.as_ref()) {
+        if cur == p.attestation_id {
+            return Ok(());
+        }
+    }
+    pg_drop_key_record_rows(tx, key_id).await?;
+    if let Some(row) = planned {
+        pg_insert_plane_row(tx, &row).await?;
+        tx.execute(
+            "UPDATE cirislens.federation_keys SET attestation_id = $2 WHERE key_id = $1",
+            &[&key_id, &row.attestation_id],
+        )
+        .await
+        .map_err(|e| Error::Backend(format!("sync key:record row pointer: {e}")))?;
+    }
+    Ok(())
+}
+
+/// v58.0.0 (CIRISPersist#991) — the live `federation_keys` projection and
+/// every `key:record:v1` row, for the rebuild gate.
+async fn pg_key_projection_rebuild<C>(
+    client: &C,
+) -> Result<crate::federation::silo_projection::ProjectionRebuild, crate::federation::Error>
+where
+    C: tokio_postgres::GenericClient + Sync,
+{
+    use crate::federation::Error;
+    let mut live = Vec::new();
+    for r in client
+        .query(
+            "SELECT * FROM cirislens.federation_keys ORDER BY key_id",
+            &[],
+        )
+        .await
+        .map_err(|e| Error::Backend(format!("projection_rebuild keys: {e}")))?
+    {
+        let attestation_id: Option<String> = r.safe_get_with("attestation_id", Error::Backend)?;
+        let mut record = pg_row_to_key_record(r)?;
+        record.consent_role = None;
+        live.push((record, attestation_id));
+    }
+    let rows = pg_plane_rows(client, crate::federation::key_plane::KEY_RECORD_DIMENSION).await?;
+    Ok(crate::federation::key_plane::key_projection_rebuild(
+        live, &rows,
+    ))
+}
+
+/// v58.0.0 (CIRISPersist#991) — every row on the plane with `dimension`.
+async fn pg_plane_rows<C>(
+    client: &C,
+    dimension: &str,
+) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error>
+where
+    C: tokio_postgres::GenericClient + Sync,
+{
+    client
+        .query(
+            &format!(
+                "SELECT {PG_ATTESTATION_COLUMNS} FROM cirislens.federation_attestations \
+                  WHERE dimension = $1 ORDER BY attestation_id"
+            ),
+            &[&dimension],
+        )
+        .await
+        .map_err(|e| crate::federation::Error::Backend(format!("plane rows {dimension}: {e}")))?
+        .into_iter()
+        .map(pg_row_to_attestation)
+        .collect()
+}
+
+/// v58.0.0 (CIRISPersist#991) — the live `federation_revocations` projection
+/// and every `key:revocation:v1` row, for the rebuild gate.
+async fn pg_revocation_projection_rebuild<C>(
+    client: &C,
+) -> Result<crate::federation::silo_projection::ProjectionRebuild, crate::federation::Error>
+where
+    C: tokio_postgres::GenericClient + Sync,
+{
+    use crate::federation::Error;
+    let mut live = Vec::new();
+    for r in client
+        .query(
+            "SELECT * FROM cirislens.federation_revocations ORDER BY revocation_id",
+            &[],
+        )
+        .await
+        .map_err(|e| Error::Backend(format!("projection_rebuild revocations: {e}")))?
+    {
+        let attestation_id: Option<String> = r.safe_get_with("attestation_id", Error::Backend)?;
+        live.push((pg_row_to_revocation(r)?, attestation_id));
+    }
+    let rows = pg_plane_rows(
+        client,
+        crate::federation::key_plane::KEY_REVOCATION_DIMENSION,
+    )
+    .await?;
+    Ok(crate::federation::key_plane::revocation_projection_rebuild(
+        live, &rows,
+    ))
+}
+
+/// v58.0.0 (CIRISPersist#991, CC 3.3.6) — **the `identity:occurrence:v1` row
+/// follows its occurrence**, inside `tx`: the pair's row is the row its stored
+/// SIGNED occurrence plans to (`key_plane::occurrence_row_if_hybrid`; the
+/// signature was verified at the door) — inserted, the pair's previous row
+/// deleted, the pointer moved; none for an unsigned (trusted-local) or
+/// Ed25519-only occurrence, or one whose signer is not held.
+async fn pg_sync_occurrence_row(
+    tx: &tokio_postgres::Transaction<'_>,
+    identity_key_id: &str,
+    occurrence_key_id: &str,
+) -> Result<(), crate::federation::Error> {
+    if !pg_key_plane_present(tx).await? {
+        return Ok(());
+    }
+    use crate::federation::Error;
+    let stored = tx
+        .query_opt(
+            "SELECT * FROM cirislens.federation_identity_occurrences \
+              WHERE identity_key_id = $1 AND occurrence_key_id = $2",
+            &[&identity_key_id, &occurrence_key_id],
+        )
+        .await
+        .map_err(|e| Error::Backend(format!("sync occurrence row: {e}")))?;
+    let (signed, current) = match stored {
+        None => (None, None),
+        Some(r) => {
+            let current: Option<String> = r.safe_get_with("attestation_id", Error::Backend)?;
+            let signature: Option<String> = r.safe_get_with("signature", Error::Backend)?;
+            let signed = match signature {
+                Some(_) => Some(pg_row_to_signed_identity_occurrence(r)?),
+                None => None,
+            };
+            (signed, current)
+        }
+    };
+    let planned = match signed.as_ref() {
+        Some(s) => {
+            let held = tx
+                .query_opt(
+                    "SELECT 1 FROM cirislens.federation_keys WHERE key_id = $1",
+                    &[&s.attesting_key_id],
+                )
+                .await
+                .map_err(|e| Error::Backend(format!("sync occurrence signer: {e}")))?
+                .is_some();
+            if held {
+                crate::federation::key_plane::occurrence_row_if_hybrid(s)
+            } else {
+                None
+            }
+        }
+        None => None,
+    };
+    if let (Some(cur), Some(p)) = (current.as_deref(), planned.as_ref()) {
+        if cur == p.attestation_id {
+            return Ok(());
+        }
+    }
+    if let Some(cur) = current.as_deref() {
+        tx.execute(
+            "DELETE FROM cirislens.federation_attestations WHERE attestation_id = $1",
+            &[&cur],
+        )
+        .await
+        .map_err(|e| Error::Backend(format!("sync occurrence drop row: {e}")))?;
+    }
+    if let Some(row) = planned {
+        pg_insert_plane_row(tx, &row).await?;
+        tx.execute(
+            "UPDATE cirislens.federation_identity_occurrences SET attestation_id = $3 \
+              WHERE identity_key_id = $1 AND occurrence_key_id = $2",
+            &[&identity_key_id, &occurrence_key_id, &row.attestation_id],
+        )
+        .await
+        .map_err(|e| Error::Backend(format!("sync occurrence pointer: {e}")))?;
+    }
+    Ok(())
+}
+
+/// v58.0.0 (CIRISPersist#991) — the live SIGNED occurrences and every
+/// `identity:occurrence:v1` row, for the rebuild gate.
+async fn pg_occurrence_projection_rebuild<C>(
+    client: &C,
+) -> Result<crate::federation::silo_projection::ProjectionRebuild, crate::federation::Error>
+where
+    C: tokio_postgres::GenericClient + Sync,
+{
+    use crate::federation::Error;
+    let mut live = Vec::new();
+    for r in client
+        .query(
+            "SELECT * FROM cirislens.federation_identity_occurrences \
+              WHERE signature IS NOT NULL ORDER BY identity_key_id, occurrence_key_id",
+            &[],
+        )
+        .await
+        .map_err(|e| Error::Backend(format!("projection_rebuild occurrences: {e}")))?
+    {
+        let attestation_id: Option<String> = r.safe_get_with("attestation_id", Error::Backend)?;
+        live.push((pg_row_to_signed_identity_occurrence(r)?, attestation_id));
+    }
+    let rows = pg_plane_rows(
+        client,
+        crate::federation::key_plane::IDENTITY_OCCURRENCE_DIMENSION,
+    )
+    .await?;
+    Ok(crate::federation::key_plane::occurrence_projection_rebuild(
+        live, &rows,
+    ))
+}
+
+/// v58.0.0 (CIRISPersist#991) — the lazy rehome of one pre-V198 revocation:
+/// its `key:revocation:v1` row when it is hybrid, inserted and pointed at.
+async fn pg_rehome_revocation(
+    tx: &tokio_postgres::Transaction<'_>,
+    revocation_id: &str,
+) -> Result<(), crate::federation::Error> {
+    if !pg_key_plane_present(tx).await? {
+        return Ok(());
+    }
+    use crate::federation::Error;
+    let revocation = tx
+        .query_opt(
+            "SELECT * FROM cirislens.federation_revocations \
+              WHERE revocation_id = $1 AND attestation_id IS NULL",
+            &[&revocation_id],
+        )
+        .await
+        .map_err(|e| Error::Backend(format!("rehome revocation: {e}")))?
+        .map(pg_row_to_revocation)
+        .transpose()?;
+    let Some(row) = revocation
+        .as_ref()
+        .and_then(crate::federation::key_plane::revocation_row_if_hybrid)
+    else {
+        return Ok(());
+    };
+    pg_insert_plane_row(tx, &row).await?;
+    tx.execute(
+        "UPDATE cirislens.federation_revocations SET attestation_id = $2 \
+          WHERE revocation_id = $1",
+        &[&revocation_id, &row.attestation_id],
+    )
+    .await
+    .map_err(|e| Error::Backend(format!("rehome revocation pointer: {e}")))?;
     Ok(())
 }
 
@@ -25487,49 +26098,6 @@ fn pg_row_to_signed_community_membership_widening(
         scrub_signature_pqc,
         cosignatures,
     })
-}
-
-/// v3.11.0 (CIRISPersist#143, F-AV-ROLLBACK closure) — anti-rollback
-/// admission check for postgres. Reads the latest `scrub_timestamp`
-/// for the target `revoked_key_id`; rejects with
-/// [`crate::federation::Error::RevocationRollback`] if `submitted_ts`
-/// is not strictly later. First revocation against a target always
-/// admits (no prior row → no rollback possible).
-async fn check_revocation_anti_rollback_postgres(
-    client: &deadpool_postgres::Object,
-    revoked_key_sha256_ed25519_raw: &str,
-    submitted_ts: chrono::DateTime<chrono::Utc>,
-) -> Result<(), crate::federation::Error> {
-    let revoked_key_id = revoked_key_sha256_ed25519_raw;
-    let row = client
-        .query_opt(
-            "SELECT scrub_timestamp FROM cirislens.federation_revocations \
-             WHERE revoked_key_sha256_ed25519_raw = $1 \
-             ORDER BY scrub_timestamp DESC LIMIT 1",
-            &[&revoked_key_id],
-        )
-        .await
-        .map_err(|e| crate::federation::Error::Backend(format!("anti-rollback lookup: {e}")))?;
-
-    // v31.0.0 (CIRISPersist#660) — the LOOKUP is backend-specific, the RULE is
-    // not. See `admission::check_revocation_anti_rollback`.
-    //
-    // Read through `safe_get_with` rather than a bare `Row::get` (#28): a bare
-    // decode PANICS on an unexpected NULL, and panicking inside an ANTI-ROLLBACK
-    // gate would turn a data problem into a downed write path — on the one
-    // check whose whole job is to refuse cleanly.
-    let latest = row
-        .map(|r| {
-            let ts: Result<chrono::DateTime<chrono::Utc>, _> =
-                r.safe_get_with("scrub_timestamp", crate::federation::Error::Backend);
-            ts
-        })
-        .transpose()?;
-    crate::federation::admission::check_revocation_anti_rollback(
-        revoked_key_id,
-        latest,
-        submitted_ts,
-    )
 }
 
 /// v2.10.0 (CIRISPersist#114) — Postgres row → [`crate::federation::Goal`].
@@ -34563,6 +35131,9 @@ mod tests {
                 crate::derived::detection_row::detection_attestation_id(&det_z),
             ))
             .await;
+        let erasure_started =
+            crate::federation::admission::truncate_to_substrate_resolution(chrono::Utc::now())
+                - chrono::Duration::seconds(1);
 
         let summary = backend
             .delete_traces_for_agent_id_hash(&agent)
@@ -34637,11 +35208,18 @@ mod tests {
             })
             .await
             .unwrap();
+        // v58.0.0 (CIRISPersist#1094 item 2, CC 4.5.3) — the row names nobody,
+        // so it is found by its instant (this test is serial on postgres).
         let mine: Vec<_> = events
             .into_iter()
-            .filter(|e| e.target_key_id.as_deref() == Some(agent.as_str()))
+            .filter(|e| e.emitted_at >= erasure_started)
             .collect();
-        assert_eq!(mine.len(), 1, "exactly one audit row for this agent");
+        assert_eq!(mine.len(), 1, "exactly one audit row for this erasure");
+        assert_eq!(
+            mine[0].target_key_id, None,
+            "the audit row names no subject"
+        );
+        assert!(!mine[0].detail.to_string().contains(agent.as_str()));
         assert_eq!(mine[0].detail["detection_events_tombstoned"], 1);
 
         // Idempotent: second erasure is a clean all-zero no-op.
@@ -43371,15 +43949,12 @@ mod tests {
             .put_revocation(crate::federation::SignedRevocation { revocation: rev })
             .await
             .unwrap();
-        backend
-            .attach_revocation_pqc_signature(&rev_id, "rev-pqc-sig")
-            .await
-            .expect("attach revocation PQC sig must serialize the uuid param");
+        // v58.0.0 (CIRISPersist#991) — a revocation is hybrid at its door.
         let revs = backend.revocations_for(&target).await.unwrap();
         assert!(
             revs.iter()
                 .any(|r| r.revocation_id == rev_id && r.is_pqc_complete()),
-            "revocation PQC-complete after attach"
+            "revocation is PQC-complete as admitted"
         );
     }
 

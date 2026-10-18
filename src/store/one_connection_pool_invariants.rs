@@ -88,15 +88,28 @@ async fn i601_the_wire_index_reindex_completes_on_one_connection() {
     };
     let tag = suffix();
     let k = format!("i601-k-{tag}");
-    within_bound("I601 key registration", ts::register_hybrid_key(&b, &k)).await;
+    // v58.0.0 (CIRISPersist#991) — a key's record is its `key:record:v1` row,
+    // indexed on the Attestation kind after the door commits.
+    within_bound(
+        "I601 key registration",
+        b.put_public_key(crate::federation::SignedKeyRecord {
+            record: crate::federation::key_plane_invariants::bodies::pop_record(&k),
+        }),
+    )
+    .await
+    .expect("I601 the key registers");
+    let row_id = crate::federation::key_plane_invariants::bodies::key_row(&b, &k)
+        .await
+        .expect("I601 the key is a key:record:v1 row")
+        .attestation_id;
     assert!(
         indexed(
             &b,
-            "Key",
-            &crate::federation::wire_index::record_key(&[("key_id", &k)])
+            "Attestation",
+            &crate::federation::wire_index::record_key(&[("attestation_id", &row_id)])
         )
         .await,
-        "I601 the key's re-index ran and stored its stored-bytes hash"
+        "I601 the key row's re-index ran and stored its stored-bytes hash"
     );
     // A self-edge is not cycle-gated (the root charter's shape), so this put
     // reaches the re-index without the delegation lock: I601 measures the

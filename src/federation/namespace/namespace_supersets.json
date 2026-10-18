@@ -14354,15 +14354,19 @@
    },
    {
     "decimal_id": "3.2",
-    "decimal_id_status": "PROPOSED - family is UNREGISTERED; the anchor is the governing CC section, not an owned CC 3.1.N row",
-    "claim_id": "CLM-nsproc-halt-latched-trust",
+    "claim_id": "CLM-halt-not-a-trust-leg",
     "repo": "CIRISPersist",
-    "crate": "ciris-persist@21.4.0",
     "path#symbol": "src/federation/trust_root.rs#trust_root_valid",
     "tsv_target": "evidence/cc_impl.tsv",
-    "field": "halt_latched",
-    "prefix": "trust:*",
-    "manifest_round": "0.3.0-unregistered-addendum"
+    "manifest_round": "cc-rc8-1094"
+   },
+   {
+    "decimal_id": "3.2",
+    "claim_id": "CLM-halt-not-a-trust-leg",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/trust_root.rs#transit_eligibility_walk",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc8-1094"
    },
    {
     "decimal_id": "3.2",
@@ -16185,6 +16189,83 @@
     "witness": "I960, I961 (memory, sqlite, postgres)"
    },
    {
+    "decimal_id": "3.1.3",
+    "claim_id": "CLM-planes-as-rows",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/key_plane.rs#plan_key_record_row",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v58-991",
+    "tsv_comment_before": [
+     "",
+     "# v58.0.0 (CIRISPersist#991 plane 1) — the key plane as rows: key:record:v1,",
+     "# key:revocation:v1, identity:occurrence:v1; their tables are projections."
+    ],
+    "witness": "I975 (memory, sqlite, postgres)"
+   },
+   {
+    "decimal_id": "3.1.3",
+    "claim_id": "CLM-planes-as-rows",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/register.rs#verify_proof_of_possession",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v58-991",
+    "witness": "I976 (memory, sqlite, postgres)"
+   },
+   {
+    "decimal_id": "3.1.3",
+    "claim_id": "CLM-planes-as-rows",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/key_plane.rs#apply_key_plane_row",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v58-991",
+    "witness": "I976, I977 (memory, sqlite, postgres)"
+   },
+   {
+    "decimal_id": "3.1.3",
+    "claim_id": "CLM-planes-as-rows",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/mod.rs#unknown_signer",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v58-991",
+    "witness": "I977 (memory, sqlite, postgres)"
+   },
+   {
+    "decimal_id": "3.1.3",
+    "claim_id": "CLM-planes-as-rows",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/key_plane.rs#plan_put_revocation",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v58-991",
+    "witness": "I978 (memory, sqlite, postgres)"
+   },
+   {
+    "decimal_id": "3.1.3",
+    "claim_id": "CLM-planes-as-rows",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/register.rs#check_revocation_bound_lowers",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v58-991",
+    "witness": "I978 (memory, sqlite, postgres)"
+   },
+   {
+    "decimal_id": "3.1.3",
+    "claim_id": "CLM-planes-as-rows",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/key_plane.rs#occurrence_row",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v58-991",
+    "witness": "I979 (memory, sqlite, postgres)"
+   },
+   {
+    "decimal_id": "3.1.3",
+    "claim_id": "CLM-planes-as-rows",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/silo_projection.rs#check_projection_rebuild",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v58-991",
+    "witness": "I975, I978, I979, I980"
+   },
+   {
     "decimal_id": "2.6.1.3",
     "claim_id": "CLM-canonical",
     "repo": "CIRISPersist",
@@ -16563,6 +16644,110 @@
     "path#symbol": "src/federation/admission.rs#verify_signed_transport_destination",
     "tsv_target": "evidence/cc_impl.tsv",
     "manifest_round": "cc-rc8-1091"
+   },
+   {
+    "decimal_id": "4.5.3",
+    "claim_id": "CLM-erasure-subject-route",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/engine.rs#delete_traces_for_agent_id_hash",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc8-1094"
+   },
+   {
+    "decimal_id": "4.5.3",
+    "claim_id": "CLM-erasure-subject-route",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/subject_erasure.rs#plan_store_erasure",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc8-1094"
+   },
+   {
+    "decimal_id": "4.5.3",
+    "claim_id": "CLM-erasure-subject-route",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/subject_erasure.rs#erasing_withdraws",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc8-1094"
+   },
+   {
+    "decimal_id": "4.5.3",
+    "claim_id": "CLM-erasure-subject-route",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/subject_erasure.rs#apply_replicated_erasure",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc8-1094"
+   },
+   {
+    "decimal_id": "4.5.3",
+    "claim_id": "CLM-erasure-subject-route",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/admission.rs#resolve_withdraws_admission_rule_at",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc8-1094"
+   },
+   {
+    "decimal_id": "4.5.3",
+    "claim_id": "CLM-erasure-subject-route",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/hard_case.rs#trace_erasure_event",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc8-1094"
+   },
+   {
+    "decimal_id": "4.5.5",
+    "claim_id": "CLM-reconsideration-subject-standing",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/admission.rs#check_reconsideration_admission",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc8-1094"
+   },
+   {
+    "decimal_id": "4.5.5",
+    "claim_id": "CLM-reconsideration-subject-standing",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/admission.rs#reconsideration_target_subjects",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc8-1094"
+   },
+   {
+    "decimal_id": "4.5.5",
+    "claim_id": "CLM-reconsideration-subject-standing",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/takedown_tombstone.rs#takedown_authority",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc8-1094"
+   },
+   {
+    "decimal_id": "3.1.7",
+    "claim_id": "CLM-polarity-admission",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/admission.rs#check_score_within_declared_polarity",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc8-vendor"
+   },
+   {
+    "decimal_id": "3.1.7",
+    "claim_id": "CLM-polarity-admission",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/namespace/registry.rs#family_polarity_class",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc8-vendor"
+   },
+   {
+    "decimal_id": "3.1.7",
+    "claim_id": "CLM-polarity-admission",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/namespace/registry.rs#PolarityClass::admits",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc8-vendor"
+   },
+   {
+    "decimal_id": "3.1.7",
+    "claim_id": "CLM-polarity-admission",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/admission.rs#check_dimension_case_rule",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc8-vendor"
    }
   ],
   "CIRISServer": [

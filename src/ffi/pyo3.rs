@@ -2448,7 +2448,6 @@ impl PyEngine {
                         failed = summary.total_failed,
                         keys_signed = summary.keys.signed,
                         attestations_signed = summary.attestations.signed,
-                        revocations_signed = summary.revocations.signed,
                         "ciris-persist v0.3.2: cold-path PQC sweep on init complete"
                     );
                 });
@@ -8415,124 +8414,51 @@ impl PyEngine {
     }
 
     /// Federation directory: write a revocation.
+    ///
+    /// v58.0.0 (CIRISPersist#991, CC 3.1.3) — a revocation is a
+    /// `key:revocation:v1` row, and a plane row's signature is hybrid: an
+    /// Ed25519-only revocation is refused at the door. When the submitted
+    /// revocation lacks its ML-DSA-65 half and this engine holds a PQC signer,
+    /// the half is signed HERE, before the put (it was a cold-path attach
+    /// after the put until v57; `attach_revocation_pqc_signature` is gone).
     fn put_revocation(&self, py: Python<'_>, signed_revocation_json: &str) -> PyResult<()> {
         self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
-            let rev: crate::federation::SignedRevocation =
+            let mut rev: crate::federation::SignedRevocation =
                 serde_json::from_str(signed_revocation_json).map_err(|e| {
                     PyValueError::new_err(format!("SignedRevocation JSON decode: {e}"))
                 })?;
-
-            // v0.3.1 — cold-path PQC fill-in (CIRISPersist#10).
-            let cold_path_inputs =
-                self.local_signer
-                    .as_ref()
-                    .and_then(|s| s.pqc_signer())
-                    .map(|signer| {
-                        (
-                            signer,
-                            rev.revocation.revocation_id.clone(),
-                            rev.revocation.revocation_envelope.clone(),
-                            rev.revocation.scrub_signature_classical.clone(),
-                        )
-                    });
-
-            py.detach(|| match &self.backend {
-                #[cfg(feature = "postgres")]
-                BackendDispatch::Postgres(pg) => {
-                    let backend = pg.clone();
-                    runtime.block_on(async move {
-                        use crate::federation::FederationDirectory;
-                        backend
-                            .put_revocation(rev)
+            let signer = self.local_signer.as_ref().and_then(|s| s.pqc_signer());
+            py.detach(|| {
+                runtime.block_on(async move {
+                    use crate::federation::FederationDirectory;
+                    if rev.revocation.scrub_signature_pqc.is_none() {
+                        if let Some(signer) = signer {
+                            let (_pubkey, pqc) = cold_path_pqc_sign(
+                                &*signer,
+                                &rev.revocation.revocation_envelope,
+                                &rev.revocation.scrub_signature_classical,
+                            )
                             .await
-                            .map_err(federation_err_to_py)?;
-                        if let Some((signer, revocation_id, envelope, classical_sig_b64)) =
-                            cold_path_inputs
-                        {
-                            let backend = backend.clone();
-                            tokio::spawn(async move {
-                                match cold_path_pqc_sign(&*signer, &envelope, &classical_sig_b64)
-                                    .await
-                                {
-                                    Ok((_pubkey_b64, pqc_sig_b64)) => {
-                                        if let Err(e) = backend
-                                            .attach_revocation_pqc_signature(
-                                                &revocation_id,
-                                                &pqc_sig_b64,
-                                            )
-                                            .await
-                                        {
-                                            tracing::warn!(
-                                                revocation_id = revocation_id.as_str(),
-                                                error = %e,
-                                                "cold-path PQC \
-                                                 attach_revocation_pqc_signature failed; \
-                                                 row stays hybrid-pending"
-                                            );
-                                        }
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            revocation_id = revocation_id.as_str(),
-                                            error = %e,
-                                            "cold-path PQC sign failed; row stays hybrid-pending"
-                                        );
-                                    }
-                                }
-                            });
+                            .map_err(|e| {
+                                PyRuntimeError::new_err(format!("revocation PQC sign: {e}"))
+                            })?;
+                            rev.revocation.scrub_signature_pqc = Some(pqc);
+                            rev.revocation.pqc_completed_at = Some(rev.revocation.scrub_timestamp);
                         }
-                        Ok(())
-                    })
-                }
-                #[cfg(feature = "sqlite")]
-                BackendDispatch::Sqlite(sq) => {
-                    let backend = sq.clone();
-                    runtime.block_on(async move {
-                        use crate::federation::FederationDirectory;
-                        backend
-                            .put_revocation(rev)
-                            .await
-                            .map_err(federation_err_to_py)?;
-                        if let Some((signer, revocation_id, envelope, classical_sig_b64)) =
-                            cold_path_inputs
-                        {
-                            let backend = backend.clone();
-                            tokio::spawn(async move {
-                                match cold_path_pqc_sign(&*signer, &envelope, &classical_sig_b64)
-                                    .await
-                                {
-                                    Ok((_pubkey_b64, pqc_sig_b64)) => {
-                                        if let Err(e) = backend
-                                            .attach_revocation_pqc_signature(
-                                                &revocation_id,
-                                                &pqc_sig_b64,
-                                            )
-                                            .await
-                                        {
-                                            tracing::warn!(
-                                                revocation_id = revocation_id.as_str(),
-                                                error = %e,
-                                                "cold-path PQC \
-                                                 attach_revocation_pqc_signature failed; \
-                                                 row stays hybrid-pending"
-                                            );
-                                        }
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            revocation_id = revocation_id.as_str(),
-                                            error = %e,
-                                            "cold-path PQC sign failed; row stays hybrid-pending"
-                                        );
-                                    }
-                                }
-                            });
+                    }
+                    match &self.backend {
+                        #[cfg(feature = "postgres")]
+                        BackendDispatch::Postgres(pg) => {
+                            pg.put_revocation(rev).await.map_err(federation_err_to_py)
                         }
-                        Ok(())
-                    })
-                }
+                        #[cfg(feature = "sqlite")]
+                        BackendDispatch::Sqlite(sq) => {
+                            sq.put_revocation(rev).await.map_err(federation_err_to_py)
+                        }
+                    }
+                })
             })
         })
     }
@@ -9702,46 +9628,6 @@ impl PyEngine {
                         use crate::federation::FederationDirectory;
                         backend
                             .attach_attestation_pqc_signature(&attestation_id, &pqc_sig)
-                            .await
-                            .map_err(federation_err_to_py)
-                    })
-                }
-            })
-        })
-    }
-
-    /// Federation directory: attach PQC signature to a hybrid-pending
-    /// federation_revocations row.
-    fn attach_revocation_pqc_signature(
-        &self,
-        py: Python<'_>,
-        revocation_id: &str,
-        scrub_signature_pqc: &str,
-    ) -> PyResult<()> {
-        self.ensure_usable()?;
-        catch_panic(|| {
-            let runtime = self.runtime.clone();
-            let revocation_id = revocation_id.to_owned();
-            let pqc_sig = scrub_signature_pqc.to_owned();
-            py.detach(|| match &self.backend {
-                #[cfg(feature = "postgres")]
-                BackendDispatch::Postgres(pg) => {
-                    let backend = pg.clone();
-                    runtime.block_on(async move {
-                        use crate::federation::FederationDirectory;
-                        backend
-                            .attach_revocation_pqc_signature(&revocation_id, &pqc_sig)
-                            .await
-                            .map_err(federation_err_to_py)
-                    })
-                }
-                #[cfg(feature = "sqlite")]
-                BackendDispatch::Sqlite(sq) => {
-                    let backend = sq.clone();
-                    runtime.block_on(async move {
-                        use crate::federation::FederationDirectory;
-                        backend
-                            .attach_revocation_pqc_signature(&revocation_id, &pqc_sig)
                             .await
                             .map_err(federation_err_to_py)
                     })
@@ -17117,7 +17003,6 @@ impl PyEngine {
             for (name, counts) in [
                 ("federation_keys", &summary.keys),
                 ("federation_attestations", &summary.attestations),
-                ("federation_revocations", &summary.revocations),
             ] {
                 let d = PyDict::new(py);
                 d.set_item("scanned", counts.scanned)?;
@@ -17162,6 +17047,7 @@ impl PyEngine {
     ///   "federation_keys_deleted":        int,  # 0 unless include_federation_key=True
     ///   "federation_attestations_deleted": int,  # 0 unless include_federation_key=True
     ///   "federation_revocations_deleted":  int,  # 0 unless include_federation_key=True
+    ///   "detection_rows_refused":         [ {"record_id": str, "reason": str} ],
     ///   "deleted_at":                     str,  # ISO-8601 UTC
     /// }
     /// ```
@@ -17229,6 +17115,10 @@ impl PyEngine {
                 "federation_revocations_deleted",
                 summary.federation_revocations_deleted,
             )?;
+            dict.set_item(
+                "detection_rows_refused",
+                erasure_refusals_to_py(py, &summary.detection_rows_refused)?,
+            )?;
             dict.set_item("deleted_at", summary.deleted_at.to_rfc3339())?;
             Ok(dict)
         })
@@ -17241,18 +17131,26 @@ impl PyEngine {
     /// detections.
     ///
     /// In one atomic transaction: hard-deletes `trace_events` +
-    /// `trace_llm_calls`, TOMBSTONES the derived `detection_events`
-    /// (NULLs the PII linkage + stamps `erased_at`), and emits a
-    /// `hard_case:trace_erasure` audit row. Returns a dict:
+    /// `trace_llm_calls`, tombstones pre-v57 silo detections in place, and
+    /// (v58.0.0, CIRISPersist#1094 item 2, CC 4.5.3) erases each row-backed
+    /// detection about the agent under its PRODUCER's rule-1 `withdraws`,
+    /// leaving a tombstone that replicates; records a subject-free
+    /// `hard_case:trace_erasure` row. Returns a dict:
     ///
     /// ```text
     /// {
     ///   "trace_events":                 int,
     ///   "trace_llm_calls":              int,
     ///   "detection_events_tombstoned":  int,
+    ///   "detection_rows_refused":       [ {"record_id": str, "reason": str} ],
     ///   "erased_at":                    str,  # ISO-8601 UTC
     /// }
     /// ```
+    ///
+    /// `detection_rows_refused` lists the rows NOT erased, each with its
+    /// reason (Art. 17(3) refused-with-reason; today
+    /// `erasure_producer_key_not_held`). Raises `NodeIdentityRequired` with
+    /// no node identity.
     ///
     /// **Idempotent**: a second call returns all-zero counts; a not-found
     /// is NOT raised as an error. Persist owns the atomic substrate
@@ -17298,6 +17196,10 @@ impl PyEngine {
             dict.set_item(
                 "detection_events_tombstoned",
                 summary.detection_events_tombstoned,
+            )?;
+            dict.set_item(
+                "detection_rows_refused",
+                erasure_refusals_to_py(py, &summary.detection_rows_refused)?,
             )?;
             dict.set_item("erased_at", summary.erased_at.to_rfc3339())?;
             Ok(dict)
@@ -34719,6 +34621,22 @@ where
         .map_err(|e| PyRuntimeError::new_err(format!("AttestationListPage encode: {e}")))
 }
 
+/// v58.0.0 (CIRISPersist#1094 item 2) — the rows a DSAR door refused, as a
+/// list of `{"record_id", "reason"}` dicts (Art. 17(3) refused-with-reason).
+fn erasure_refusals_to_py<'py>(
+    py: Python<'py>,
+    refused: &[crate::federation::subject_erasure::ErasureRefusal],
+) -> PyResult<Bound<'py, pyo3::types::PyList>> {
+    let list = pyo3::types::PyList::empty(py);
+    for r in refused {
+        let d = PyDict::new(py);
+        d.set_item("record_id", &r.record_id)?;
+        d.set_item("reason", &r.reason)?;
+        list.append(d)?;
+    }
+    Ok(list)
+}
+
 /// v57.0.0 (CIRISPersist#988 item 2) — an erasure door's store error: the
 /// typed `NodeIdentityRequired` when the node cannot attest the erasure's
 /// hard_case row (refused before anything was deleted), else the
@@ -35963,7 +35881,6 @@ struct SweepSummary {
     total_failed: i64,
     keys: SweepCounts,
     attestations: SweepCounts,
-    revocations: SweepCounts,
 }
 
 /// v0.3.2 (CIRISPersist#11) — Drive a single-batch sweep across the
@@ -35985,17 +35902,17 @@ where
 {
     let keys = sweep_keys(backend, signer, batch_size).await;
     let attestations = sweep_attestations(backend, signer, batch_size).await;
-    let revocations = sweep_revocations(backend, signer, batch_size).await;
-    let total_scanned = keys.scanned + attestations.scanned + revocations.scanned;
-    let total_signed = keys.signed + attestations.signed + revocations.signed;
-    let total_failed = keys.failed + attestations.failed + revocations.failed;
+    // v58.0.0 (CIRISPersist#991) — no revocation sweep: a revocation is a
+    // `key:revocation:v1` row and is refused unless hybrid at its door.
+    let total_scanned = keys.scanned + attestations.scanned;
+    let total_signed = keys.signed + attestations.signed;
+    let total_failed = keys.failed + attestations.failed;
     SweepSummary {
         total_scanned,
         total_signed,
         total_failed,
         keys,
         attestations,
-        revocations,
     }
 }
 
@@ -36103,67 +36020,6 @@ where
             Err(e) => {
                 tracing::warn!(
                     attestation_id = row.id.as_str(),
-                    error = %e,
-                    "sweep: cold_path_pqc_sign failed"
-                );
-                failed += 1;
-            }
-        }
-    }
-    SweepCounts {
-        scanned,
-        signed,
-        failed,
-    }
-}
-
-async fn sweep_revocations<B>(
-    backend: &Arc<B>,
-    signer: &dyn PqcSigner,
-    batch_size: i64,
-) -> SweepCounts
-where
-    B: crate::federation::FederationDirectory + Send + Sync + 'static,
-{
-    let rows = match backend.list_hybrid_pending_revocations(batch_size).await {
-        Ok(rows) => rows,
-        Err(e) => {
-            tracing::warn!(error = %e, "sweep_revocations: list failed");
-            return SweepCounts {
-                scanned: 0,
-                signed: 0,
-                failed: 0,
-            };
-        }
-    };
-    let scanned = rows.len() as i64;
-    let mut signed = 0i64;
-    let mut failed = 0i64;
-    for row in rows {
-        match cold_path_pqc_sign(signer, &row.envelope, &row.classical_sig_b64).await {
-            Ok((_pubkey_b64, pqc_sig_b64)) => match backend
-                .attach_revocation_pqc_signature(&row.id, &pqc_sig_b64)
-                .await
-            {
-                Ok(()) => signed += 1,
-                Err(crate::federation::Error::Conflict(_)) => {
-                    tracing::debug!(
-                        revocation_id = row.id.as_str(),
-                        "sweep: row hybrid-completed by another worker"
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        revocation_id = row.id.as_str(),
-                        error = %e,
-                        "sweep: attach_revocation_pqc_signature failed"
-                    );
-                    failed += 1;
-                }
-            },
-            Err(e) => {
-                tracing::warn!(
-                    revocation_id = row.id.as_str(),
                     error = %e,
                     "sweep: cold_path_pqc_sign failed"
                 );

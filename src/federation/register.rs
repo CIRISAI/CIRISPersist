@@ -1418,6 +1418,102 @@ pub async fn verify_key_registration<F>(
 where
     F: FederationDirectory + ?Sized,
 {
+    let canonical = registration_canonical_bytes(record)?;
+
+    // Resolve the signer's (scrub_key_id's) public keys. Self-attested
+    // proof-of-possession (scrub_key_id == key_id) reads the pubkeys
+    // straight off the submitted record; a granting-authority
+    // signature (scrub_key_id != key_id) resolves them from the
+    // directory — an unknown signer is rejected (fail-secure).
+    let (ed25519_pubkey_b64, ml_dsa_65_pubkey_b64) = if record.scrub_key_id == record.key_id {
+        (
+            record.pubkey_ed25519_base64.clone(),
+            record.pubkey_ml_dsa_65_base64.clone(),
+        )
+    } else {
+        // v54.1.0 (CIRISPersist#1042) — an unregistered signer is an
+        // ORDERING gap (its Key row has not landed here yet), typed apart
+        // from a signature that does not verify: retryable, not terminal.
+        let signer = directory
+            .lookup_public_key(&record.scrub_key_id)
+            .await?
+            .ok_or_else(|| Error::unknown_signer(&record.scrub_key_id, "key_registration"))?;
+        (signer.pubkey_ed25519_base64, signer.pubkey_ml_dsa_65_base64)
+    };
+    verify_registration_signature(
+        record,
+        &canonical,
+        &ed25519_pubkey_b64,
+        ml_dsa_65_pubkey_b64.as_deref(),
+    )
+}
+
+/// v58.0.0 (CIRISPersist#991, CC 3.1.3) — **proof of possession**: the key
+/// record is the key's claim of itself. Its base scrub is the key's own
+/// (`scrub_key_id == key_id`) and verifies, hybrid and Strict, over the
+/// registration envelope with the pubkeys the record CARRIES — the one
+/// stated exception to resolving the attester through a held row (the
+/// signer's key is not held when its own record arrives). Pure: no directory
+/// read.
+///
+/// Refused: a record scrubbed by another key (use
+/// [`verify_record_signed_by`] with that key's held pubkeys), a
+/// hybrid-pending record (no ML-DSA-65 key or signature — a plane row's
+/// signature is hybrid), and every refusal of [`verify_key_registration`]
+/// (subject binding, content hash, signature).
+pub fn verify_proof_of_possession(record: &KeyRecord) -> Result<(), Error> {
+    if record.scrub_key_id != record.key_id {
+        return Err(Error::SignatureInvalid(format!(
+            "key:record:v1 {}: no proof of possession — the record's base scrub is {}'s, not \
+             the key's own (CC 3.1.3)",
+            record.key_id, record.scrub_key_id
+        )));
+    }
+    verify_record_signed_by(
+        record,
+        &record.pubkey_ed25519_base64,
+        record.pubkey_ml_dsa_65_base64.as_deref(),
+    )
+}
+
+/// v58.0.0 (CIRISPersist#991) — the record's base scrub verifies, hybrid and
+/// Strict, over its registration envelope against `ed25519` / `ml_dsa_65`:
+/// the record's own keys for a proof of possession, a held signer's for a
+/// record another key scrubbed. A hybrid-pending record (either ML-DSA-65
+/// half absent) is refused: a plane row's signature is hybrid (CC 2.4).
+pub fn verify_record_signed_by(
+    record: &KeyRecord,
+    ed25519_pubkey_b64: &str,
+    ml_dsa_65_pubkey_b64: Option<&str>,
+) -> Result<(), Error> {
+    let Some(ml_dsa_65_pubkey_b64) = ml_dsa_65_pubkey_b64 else {
+        return Err(Error::SignatureInvalid(format!(
+            "key:record:v1 {}: the signer {} carries no ML-DSA-65 key (hybrid-pending); a plane \
+             row's signature is hybrid (CC 2.4)",
+            record.key_id, record.scrub_key_id
+        )));
+    };
+    if record.scrub_signature_pqc.is_none() {
+        return Err(Error::SignatureInvalid(format!(
+            "key:record:v1 {}: the record's ML-DSA-65 scrub is not attached (hybrid-pending); a \
+             plane row's signature is hybrid (CC 2.4)",
+            record.key_id
+        )));
+    }
+    let canonical = registration_canonical_bytes(record)?;
+    verify_registration_signature(
+        record,
+        &canonical,
+        ed25519_pubkey_b64,
+        Some(ml_dsa_65_pubkey_b64),
+    )
+    .map(|_| ())
+}
+
+/// The registration gates that read only the record, and the canonical bytes
+/// its scrub signature covers: hybrid algorithm, non-empty ids, a 32-byte
+/// Ed25519 key, the #659 subject binding, the content-hash cross-check.
+fn registration_canonical_bytes(record: &KeyRecord) -> Result<Vec<u8>, Error> {
     // Fail-fast: algorithm must be hybrid. put_public_key + the schema
     // CHECK enforce this too; asserting here keeps a non-hybrid row
     // from ever reaching the PQC verify, and gives the same
@@ -1449,7 +1545,7 @@ where
     // v31.0.0 (CIRISPersist#659, one plane wider) — **THE SIGNED ENVELOPE MUST
     // NAME THE KEY IT REGISTERS.** FIRST, before the canonicalizer, the hash
     // cross-check and above all before the granting-authority signer is
-    // resolved from the directory: everything below this line is a question
+    // resolved from the directory: everything after this is a question
     // about the SIGNER, and until this ran there was no question about the
     // SUBJECT anywhere on the path. Checking it first also makes the refusal
     // deterministic — a subject-blind registration is refused identically
@@ -1482,45 +1578,29 @@ where
             record.original_content_hash
         )));
     }
+    Ok(canonical)
+}
 
-    // Resolve the signer's (scrub_key_id's) public keys. Self-attested
-    // proof-of-possession (scrub_key_id == key_id) reads the pubkeys
-    // straight off the submitted record; a granting-authority
-    // signature (scrub_key_id != key_id) resolves them from the
-    // directory — an unknown signer is rejected (fail-secure).
-    let (ed25519_pubkey_b64, ml_dsa_65_pubkey_b64) = if record.scrub_key_id == record.key_id {
-        (
-            record.pubkey_ed25519_base64.clone(),
-            record.pubkey_ml_dsa_65_base64.clone(),
-        )
-    } else {
-        // v54.1.0 (CIRISPersist#1042) — an unregistered signer is an
-        // ORDERING gap (its Key row has not landed here yet), typed apart
-        // from a signature that does not verify: retryable, not terminal.
-        let signer = directory
-            .lookup_public_key(&record.scrub_key_id)
-            .await?
-            .ok_or_else(|| Error::unknown_signer(&record.scrub_key_id, "key_registration"))?;
-        (signer.pubkey_ed25519_base64, signer.pubkey_ml_dsa_65_base64)
-    };
-
-    // Strict hybrid verify: both Ed25519 and ML-DSA-65 REQUIRED.
-    // Peering is high-stakes; a hybrid-pending (Ed25519-only)
-    // registration is rejected. row_age is irrelevant under Strict.
-    let outcome = verify_hybrid(
-        &canonical,
+/// Strict hybrid verify of the record's base scrub over `canonical`, against
+/// the signer's pubkeys. Peering is high-stakes; a hybrid-pending
+/// (Ed25519-only) registration is rejected. `row_age` is irrelevant under
+/// Strict.
+fn verify_registration_signature(
+    record: &KeyRecord,
+    canonical: &[u8],
+    ed25519_pubkey_b64: &str,
+    ml_dsa_65_pubkey_b64: Option<&str>,
+) -> Result<VerifyOutcome, Error> {
+    verify_hybrid(
+        canonical,
         &record.scrub_signature_classical,
         record.scrub_signature_pqc.as_deref(),
-        &ed25519_pubkey_b64,
-        ml_dsa_65_pubkey_b64.as_deref(),
+        ed25519_pubkey_b64,
+        ml_dsa_65_pubkey_b64,
         HybridPolicy::Strict,
         None,
     )
-    .map_err(|e| {
-        Error::SignatureInvalid(format!("registration hybrid-verify: {e} ({})", e.kind()))
-    })?;
-
-    Ok(outcome)
+    .map_err(|e| Error::SignatureInvalid(format!("registration hybrid-verify: {e} ({})", e.kind())))
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -1575,6 +1655,13 @@ pub enum RevocationBoundRefusal {
     /// the #598 reason: a substrate that silently rewrites a stored row no
     /// longer means what it says.
     BoundSubMicrosecond,
+    /// v58.0.0 (CIRISPersist#991, CC 2.4.1.1, CC 3.1.3 `key:revocation`) — the
+    /// revocation's bound is LATER than the bound this node already holds for
+    /// the same subject (the minimum across its held revocations, an absent
+    /// bound sorting as negative infinity: revoke-all). `revoked_after` is an
+    /// upper bound, not a fact: a later revocation may lower it and never
+    /// raise it. APPENDED.
+    BoundRaised,
 }
 
 impl RevocationBoundRefusal {
@@ -1588,6 +1675,7 @@ impl RevocationBoundRefusal {
             Self::BoundNotRfc3339 => "bound_not_rfc3339",
             Self::BoundAfterEffective => "bound_after_effective",
             Self::BoundSubMicrosecond => "bound_sub_microsecond",
+            Self::BoundRaised => "bound_raised",
         }
     }
 
@@ -1599,6 +1687,7 @@ impl RevocationBoundRefusal {
         Self::BoundNotRfc3339,
         Self::BoundAfterEffective,
         Self::BoundSubMicrosecond,
+        Self::BoundRaised,
     ];
 }
 
@@ -1672,6 +1761,35 @@ pub fn check_revocation_bound(
         }
     }
     Ok(())
+}
+
+/// v58.0.0 (CIRISPersist#991, CC 2.4.1.1; `key:revocation:v1`, CC 3.1.3) —
+/// **`revoked_after` only ever lowers.** The bound this node holds for a
+/// subject is the minimum across its held revocations, an absent bound
+/// sorting as negative infinity (revoke-all); an incoming revocation whose
+/// bound is later than that is refused [`RevocationBoundRefusal::BoundRaised`].
+/// A lower bound, an equal one, or a revoke-all is admitted and supersedes by
+/// the minimum fold. `held` is every revocation this node holds for the
+/// subject; the first revocation of a subject is unconstrained.
+pub fn check_revocation_bound_lowers(
+    held: &[super::types::Revocation],
+    incoming: &super::types::Revocation,
+) -> Result<(), RevocationBoundRefusal> {
+    let held: Vec<_> = held
+        .iter()
+        .filter(|r| r.revocation_id != incoming.revocation_id)
+        .collect();
+    if held.is_empty() {
+        return Ok(());
+    }
+    // `None` is revoke-all: below every instant.
+    let held_bound = held.iter().map(|r| r.revoked_after).min().flatten();
+    match (held_bound, incoming.revoked_after) {
+        // A held revoke-all: any bounded revocation would raise it.
+        (None, Some(_)) => Err(RevocationBoundRefusal::BoundRaised),
+        (Some(h), Some(t)) if t > h => Err(RevocationBoundRefusal::BoundRaised),
+        _ => Ok(()),
+    }
 }
 
 /// v25.1.0 (CIRISPersist#570 ask 4) — what this node's held revocations say

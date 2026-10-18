@@ -7,6 +7,367 @@ threat-model citations because this crate's audit story is the point.
 
 ## [Unreleased]
 
+## [58.0.0] - 2026-10-18
+
+### Security — five advisories published after v57.0.0, none reachable (deny.toml)
+
+- `zip` < 9 (RUSTSEC-2026-0367, -0368, -0369): SUID/SGID bits and symlink
+  targets on EXTRACTION. Transitive only via candle-core and
+  ciris-verify-core, both held at zip 7.x; persist never extracts a ZIP
+  archive. `zbus_names`, `zvariant`, `zvariant_derive` unmaintained
+  (RUSTSEC-2026-0370, -0371, -0372) via ciris-keyring → secret-service, with
+  no successor and no known vulnerability. Ignored with that rationale;
+  re-evaluate on the next candle or ciris-keyring bump.
+
+### Changed — the halt latch is not a leg of the trust verdict (CIRISPersist#1094 item 1; CC 3.2 T3/T8, 4.2.1.1; steward ruling 2026-10-15)
+
+- `trust_root_valid` no longer folds `halt_latched` into `valid`. A
+  `constitutional` halt is an agent pause (state kept, zero data disruption;
+  the agent's act gate is its only gate). From v24.0.0 to v57.0.0 the latch was
+  a conjunct of the verdict, so the conferral walk
+  (`capability_roots_to_trusted_root`), the transit walk
+  (`transit_eligibility_walk`) and through them `check_reserved_prefix_admission`,
+  `check_revocation_authority`, `resolve_content_class_flag`, serve-tier
+  resolution, the trusted-publisher fold and `resolve_transit_eligibility` all
+  failed closed under a latched halt — the live G7 breaker CC 4.2.1.1 names
+  (CIRISConstitution b9fc6c0). `halt_latched` stays on `TrustRootVerdict` as a
+  reported signal beside `drill_freshness` (a halt must be observable); the
+  Python surface is unchanged.
+- Witness: `exercise_family_trust_root` step (e) now asserts the inverse of
+  what it asserted since v24.0.0 — under a latched family halt the verdict,
+  its `bounded_until` and the conferral walk are unchanged, and a resume only
+  clears the report; `exercise_transit_eligibility` gains step (h): a latched
+  halt on the shared root leaves transit eligibility byte-equal. Both run on
+  the sqlite, postgres and memory backends. Re-adding the conjunct turns both
+  red.
+- Evidence: `CLM-nsproc-halt-latched-trust` (retired on the CC side) is
+  replaced by `CLM-halt-not-a-trust-leg` at `trust_root.rs#trust_root_valid`
+  and `trust_root.rs#transit_eligibility_walk`.
+### Changed — Art. 17 erasure of an adverse row is its producer's `withdraws`; the tombstone is the replicated fact (CIRISPersist#1094 item 2; CC 4.5.3 "Erasure at the subject's request", CLM-erasure-subject-route; CIRISConstitution#174)
+
+- **Controller-only (steward ruling 2026-10-15, CIRISConstitution
+  `formal/withdraws_admission`).** A `detection:*` row is adverse: the CC
+  2.4.1.1 carve-out keeps every subject-authority path (rules 2–4) closed to
+  it, unchanged (`admission::resolve_withdraws_admission_rule_at`). The
+  subject's Article 17 request is executed by the row's PRODUCER under rule 1.
+  Both DSAR doors (`delete_traces_for_agent_id_hash`, `delete_traces_for_agent`)
+  plan, for each row-backed detection of the erased traces, the producer's
+  `withdraws`: a local-tier row attested by the detector key that signed the
+  detection, its signature deferred to the crossing as the detection's own
+  is, admitted as rule 1 by the one withdraws predicate
+  (`subject_erasure::plan_store_erasure`). A producer withdraws already held
+  is reused. In the door's one transaction the withdraws is stored, the row is
+  hard-deleted, and a tombstone is written whose header cites it
+  (`subject_erasure::ErasureNotice`: the withdraws and target ids, nothing
+  else; `legal_basis` column `withdraws`, settled at execution).
+- **Refused with a reason.** When the host holds no live record of a row's
+  producer key the row is not erased: `ErasureSummary` and `DeleteSummary`
+  gain `detection_rows_refused: Vec<ErasureRefusal { record_id, reason }>`
+  (reason `erasure_producer_key_not_held`; CC 4.4 `erasure_policy`'s
+  refused-with-reason, GDPR Art. 17(3)). Python: both DSAR dicts gain
+  `"detection_rows_refused": [{"record_id": str, "reason": str}]`.
+- **The tombstone replicates.** Erasure headers are served by
+  `list_purge_bundles_since` on all three backends; `Engine::apply_replicated_purge`
+  routes an erasure bundle to `subject_erasure::apply_replicated_erasure`,
+  which requires the producer's withdraws held there (else
+  `subject_erasure_withdraws_unheld`, retryable), re-derives it as rule 1 on
+  that node's own state, and destroys the replica on receipt. v57's "header
+  never served" gap is closed.
+- **A `detection:*` row names its subject**: the scored agent's CC 2.3.2.1
+  canonical hash, `canonical:sha256:` + sha256(`ciris:agent:{agent_id_hash}`),
+  read from the trace this node holds (`subject_erasure::agent_subject`), so
+  rows about a subject are discoverable. It is not an authority path. The
+  steward purge's interim human-subject gate resolves that subject as the key
+  that signed the scored trace.
+- **The hard case names nobody.** `hard_case:trace_erasure:v1` carries
+  `TraceErasureCounts` alone (the door, counts of traces, LLM calls,
+  detections erased and refused, and the one-key door's federation counts).
+- **V196** deletes the v57-shaped `hard_case:trace_erasure:v1` rows that named
+  their subject (and their projection rows), pre-v57 silo rows of that kind
+  that did, and every `art17_erasure` header with its tombstones (each
+  header's notice was such a row). This is the one place a hard_case row is
+  ever deleted: its content is what the erasure required gone, and v57.0.0
+  had no adopters. The boot logs the counts it deleted.
+
+### Changed — the subject of the target may file a reconsideration (CIRISPersist#1094 item 3; CC 4.5.5, CLM-reconsideration-subject-standing)
+
+- `admission::check_reconsideration_admission`: a `reconsideration:{grounds}`
+  FILING naming its target by `references_attestation_id` is admitted from
+  the subject of the target as this node holds it (its signed
+  `subject_key_ids`, or the filer whose key digests to its
+  `subject_sha256_ed25519_raw`) or from a review-holder of the target's
+  community. A RULING (a row carrying `outcome`) stays with the review-holders.
+  The action's community is the target's; a filing naming another is refused
+  (`reconsideration_community_mismatch`). A self-declared subject is never
+  standing; a target not held here, or a `licensure:*` target (its own arm,
+  CIRISPersist#1036 item 5), leaves the subject arm empty.
+- CC 4.5.3 struck "an immediate-removal basis from any claimant": persist had
+  no such path (`takedown_authority` never read the basis); I970 now pins
+  every immediate-removal basis to the duty-holder gate on every backend.
+
+### Removed
+
+- `steward_purge::ART17_ERASURE_BASIS`, `art17_erasure_record_ids`,
+  `art17_erasure_execution` and `hard_case::bind_erased_detection_rows`
+  (clean break, no alias): there is no node-local purge basis for erasure.
+  `hard_case::trace_erasure_event` takes `&TraceErasureCounts` now.
+  `ErasureSummary` and `DeleteSummary` are no longer `Copy` (they carry the
+  refusal list).
+### Changed — BREAKING: the key plane as rows (CIRISPersist#991 plane 1 of 3; CC 3.1.3, CC 3.3.6, CC 2.4.1.1; CLM-planes-as-rows)
+
+A key's claim of itself, a key-plane revocation and an identity's occurrence
+record are `scores` rows on the attestation plane; `federation_keys`,
+`federation_revocations` and the signed rows of
+`federation_identity_occurrences` are their projections
+(`federation::key_plane`).
+
+- **Who signs a row.** Persist mints each row from the signed object it
+  verified (the `trace:complete:v1` / `detection:*` precedent), so no producer
+  changes its wire. The row carries the object under one envelope member
+  (`key_record`, `revocation`, `identity_occurrence`), its signature columns
+  are the object's own hybrid signature, and its id is
+  `sha256(domain ‖ JCS(object))`. A receiver re-derives the row from the
+  object and refuses one that differs by a byte
+  (`check_canonical_plane_row`); the generic verify defers to that family rule.
+- **`key:record:v1`** (attester = attested = the key) is admitted by proof of
+  possession against the keys it carries
+  (`register::verify_proof_of_possession`). A record whose base scrub is
+  another key's (the pre-rc8 conferral shape: anchor-scrubbed records, the
+  baked `ciris-canonical-1` seed, a scrub-upgraded key) is a row too, verified
+  against its held signer. A record that verifies under neither — Ed25519-only,
+  unsigned (operator-added peers), a bad scrub — is held without a row. A
+  key's newer claim (rebind, rotation, scrub upgrade, PQC completion) is a new
+  row that replaces the older one, whose bytes stay in
+  `federation_key_registration_history`.
+- **`key:revocation:v1`** (attester = the revoker; subject the key digest the
+  object carries). `put_revocation` is one plan on every backend
+  (`key_plane::plan_put_revocation` + `KeyPlaneStore::store_planned_revocation`);
+  `revoked_after` only ever lowers (a raising revocation is refused
+  `RevocationBoundRefusal::BoundRaised`, `bound_raised`); a `withdraws` or
+  `recants` naming the row is refused, its revoker's included. **An
+  Ed25519-only revocation is refused**: the hybrid-pending revocation path
+  ends (`attach_revocation_pqc_signature`, `list_hybrid_pending_revocations`
+  and the revocation leg of `run_pqc_sweep` are removed).
+- **`identity:occurrence:v1`** (attester = the signer, attested = the
+  identity), for a hybrid-signed occurrence. **An occurrence's revocation is a
+  `withdraws` on its row**, admitted when the issuer acts for the identity
+  (`signer_acts_for`, CC 3.3.6); it feeds the local
+  `federation_identity_occurrence_revocations` projection. CC rc8 names no
+  family for occurrence revocations, so the signed revocation object stays a
+  legitimate authoring door (`put_identity_occurrence_revocation`,
+  `SignedIdentityOccurrenceRevocation`,
+  `verify_signed_identity_occurrence_revocation`) feeding the same projection
+  — see "compat reads" below.
+- **The order rule.** Every other row is admitted only once its signer's key
+  is held; until then the refusal is the retryable `AttesterKeyUnknown`
+  (`federation_attester_key_unknown`, CIRISPersist#1042). A key's own record
+  is the one exception (proof of possession).
+- **V198** (sqlite + postgres): `attestation_id` on the three tables, FK
+  `ON DELETE SET NULL` (a deleted row never deletes a key, CC 2.4.1.1).
+  `silo_projection` gains `FederationKeys`, `FederationRevocations` and
+  `IdentityOccurrences`; `check_projection_rebuild` is red while a key,
+  revocation or signed occurrence is held without its row.
+- **Lazy rehome**, once per backend at the first key-plane write: every
+  pre-V198 record that verifies gets its row, asserted at its own
+  `scrub_timestamp` (an occurrence at its own `asserted_at`); one that does
+  not stays held without a row and the gate names it.
+- **Replication.** Key-plane rows ride the Attestation kind, beside the
+  framed carriage, which a v58 node still serves (see "compat reads" below).
+  `DIRECTORY_ABI_VERSION` 7 → 8 (the `KeyPlaneRefused` payload). The four
+  `EnvelopeKind`s stay in the hashed vocabulary; `Key`, `Revocation` and
+  `IdentityOccurrence` are settle-exempt (the key-plane door settles a
+  byte-identical re-offered row). The signed wire index carries the rows as
+  `Attestation` entries beside the framed entries; `wire_refs_for_subject`
+  advertises a subject's revocation rows.
+- **Python.** Removed: `attach_revocation_pqc_signature`. `put_revocation` signs a missing
+  ML-DSA-65 half with the engine's PQC signer before the put (it was a cold
+  attach after it). `run_pqc_sweep()` no longer reports
+  `by_table.federation_revocations`. `put_public_key`, `register_federation_key`,
+  `apply_replicated_key_record` and `put_identity_occurrence_json` keep their
+  signatures.
+- Witnesses I975–I980 on memory, sqlite and postgres (each with a red leg).
+
+### Changed — compat reads: a v58 node still serves the framed key plane (Edge re-gate, operator ruling 2026-10-18)
+
+The slice above first retired the framed outbound listings. A v58 node then
+admitted framed key-plane objects from old peers but could not serve them, so
+once the canonical ran v58 every older node (Edge v41/v42, long-soak agents
+back to edge v18.7.0) would stop receiving its keys — the KEX failure fixed in
+production in #876 / CIRISServer#788. The operator chose compat reads over a
+fleet floor.
+
+- **Restored, with their v57 names and signatures** (trait, memory, sqlite,
+  postgres, the directory double, the capsule ops): `list_signed_key_records_since`,
+  `list_signed_revocations_since`, `list_signed_identity_occurrences_since`,
+  `list_signed_identity_occurrence_revocations_since`,
+  `list_signed_identity_occurrence_revocations_for`,
+  `put_identity_occurrence_revocation`, `SignedIdentityOccurrenceRevocation`,
+  `ServedIdentityOccurrenceRevocation`,
+  `verify_signed_identity_occurrence_revocation`, and
+  `Engine::list_signed_revocations_since`. Python gets back the four listings
+  it had in v57 (`list_signed_key_records_since`,
+  `list_signed_revocations_since`, `list_signed_identity_occurrences_since`,
+  `list_signed_identity_occurrence_revocations_since`).
+- **The same tables, v57's bytes.** The listings read `federation_keys`,
+  `federation_revocations`, `federation_identity_occurrences` and
+  `federation_identity_occurrence_revocations` (v58's projections, which still
+  hold the signed objects) with v57's queries, order and `(admitted_at, id)`
+  cursor, so the framed bytes are the ones a v57 node served. V198 only added
+  a pointer column to the first three.
+- **Outbound replication offers both shapes.** The signed wire index again
+  carries the four framed kinds (`Key`, `Revocation`, `IdentityOccurrence`,
+  `IdentityOccurrenceRevocation`: reload, subject refs, the rebuild scan, the
+  per-put hooks, the v31 boot backfill) beside the key-plane `Attestation`
+  rows; `list_signed_records`' occurrence-revocation arm returns the signed
+  container again. Every peer is offered both; a pre-v58 peer asks for the
+  framed kinds it knows.
+- **Occurrence revocations have two inputs to one projection.** The framed
+  door is an authoring door again (its #672 settle restored, so
+  `IdentityOccurrenceRevocation` leaves `SETTLE_EXEMPT`); a `withdraws` on the
+  occurrence's `identity:occurrence:v1` row is the second. A pair already
+  revoked by either route keeps the revocation it holds: the first to land
+  fixes the instants, the framed door is `ON CONFLICT DO NOTHING`, and the
+  `withdraws` route skips a held pair, so neither rewrites or un-revokes the
+  other. **Gap:** the framed listings serve only revocations that arrived as a
+  framed object; a revocation that arrived only as a `withdraws` is not served
+  framed. While the fleet is mixed, producers must author occurrence
+  revocations through the framed door (`put_identity_occurrence_revocation`)
+  so old peers learn them.
+- **Not restored:** the hybrid-pending revocation path
+  (`attach_revocation_pqc_signature`, `list_hybrid_pending_revocations`, the
+  revocation leg of `run_pqc_sweep`). An Ed25519-only revocation stays refused.
+- **`DIRECTORY_ABI_VERSION` stays 8.** From 7 the break is the payload one:
+  `AttestationRefusalReason::KeyPlaneRefused` inside the existing
+  `ReplicatedAttestationOutcome` result. The restored ops are v7's verbatim
+  (both enum digests are v57.0.0's again), which against 8 is growth, and the
+  capsule's rule does not bump for growth.
+- Witnesses I1120–I1123 on memory, sqlite and postgres: byte identity against
+  the submitted object and the framed wire-index entry, and across a V195 (v57
+  schema) store migrated forward; cursor paging; the mixed fleet; the
+  hybrid-pending path stays gone.
+
+### Changed — CC v1.0-rc8.1 vendored (slice V)
+
+Both manifests are copied byte-for-byte from CIRISConstitution v1.0-rc8.1
+(tag commit `157039d`):
+registry `22b029cf…`, 174 families (168 at rc7), 1147 dimension vectors
+(1103), 25 row-type vectors, and a new `polarity_vectors` list of 10.
+`scripts/check_vendored_cc.sh v1.0-rc8.1` is the ship gate. v1.0-rc8
+(`cb77137`) was not vendored: its six new families carried a literal `:v1`
+inside the prefix, so CC's matcher demanded `takedown_notice:dmca512:v1:v1`
+(CIRISEdge found it). The binds oracle is regenerated. `registry.rs` re-pins
+`VENDORED_CC_VERSION`, `VENDORED_SOURCE_SHA256`, `VENDORED_N_FAMILIES`,
+`VENDORED_REGISTRY_SHA256`, `VENDORED_CC_COMMIT` and both file hashes.
+
+For Edge, the manifest diff (`scripts/manifest_diff.py`):
+
+- **Six families added.** The Retirement Standard (CC 3.1.5, CC 7.5.5):
+  `retirement:{state}:v1`, `preserve_request:v1`, `preserve_response:v1`,
+  `archive_release:{basis}:v1` (`{basis}` closed: `wa_approval`,
+  `lawful_order`), `lawful_order:release:v1`. And `takedown_notice:{basis}:v1`
+  (CC 3.1.1, CIRISConstitution#165): `{basis}` closed to CC 3.3.2's eleven
+  wire strings, under a new gated stem `takedown_notice:` ("closed:
+  takedown_notice:{basis}:v1 is the only family"). None removed.
+- **Four families changed.** `prohibited:{category}` is now a closed
+  vocabulary of 22 values, so a category outside the list is refused
+  `namespace_vocab_value_unregistered`. `settlement:*` is no longer reserved.
+  The three `ledger:*` rows carry CC 3.3.10.1's rule ("the ledger's single
+  owner (the steward-bound identity of its ledger_id triple) or a delegate
+  under its declared serialization discipline") in place of
+  `substrate-self-report`, so `authority_for` resolves them, and
+  `settlement:*`, to `ProducerSteward` rather than `SubstrateSelf`.
+- **`_meta.polarity_classes` (new, CC 3.1.7 R4).** Each catalogue polarity is
+  a score set: `signed` and `enumerated` are [−1, 1], `positive-only` is
+  (0, 1], `boolean-via-score` is the points {−1, +1}, `+1.0 only`, `-1 only`
+  and `-1 / -0.5 only` are points, `per-leaf` defers to the leaf's row.
+  `_aliases` folds `see CC 3.4.1`, `per-leaf (CC 3.3.1)` and the restricted
+  boolean onto a class. The refusal is `score_outside_declared_polarity`.
+- **`_meta.case_rule`.** Ten new `refusal_tokens` (the polarity refusal, six
+  `purge_*`, `asserted_at_stale`, `trace_run_kind_mock`,
+  `trace_field_shape_violation`), the `basis` placeholder class, and the
+  `takedown_notice:` gated stem.
+
+What persist does with it:
+
+- **New admission gate: a score outside its family's polarity class is
+  refused.** `admission::check_score_within_declared_polarity` runs in
+  `check_reserved_prefix_admission` beside the R2(b) dimension gate, so the
+  put, authored, replication-apply and promotion doors of all three backends
+  ask it. The class comes from `_meta.polarity_classes` through the one
+  matcher. A present `score` is judged (a non-number is refused); a row with
+  no `score` member is not, because persist's own emitters omit it on
+  positive-only families (the genesis `trust:charter:v1`,
+  `membership:proposal:v1`, `consent:partnership_grant:v1`), which CC 2.1's
+  "required" makes a separate conformance gap. The refusal is
+  `Error::DimensionRejected` with reason
+  `score_outside_declared_polarity`, the Python type of every other
+  dimension refusal. Before v58 persist enforced no score range at all.
+- **The six rc8 families are held shut** (`REGISTERED_FAMILIES_HELD_SHUT`):
+  they parse and match, and a row on any of them is refused
+  `registered_family_held_shut` until its door lands (the retirement program,
+  CIRISPersist#1079–#1088; the takedown notice as a row, #988). Each was open
+  vocabulary at rc7.
+- **The morally-charged-stem deny-list skips CC's own closed vocabulary.**
+  Three registered `prohibited` categories carry a listed stem
+  (`weapons_harmful`, `deception_fraud`, `autonomous_deception`) and were
+  refused `morally_charged_stem`. The deny-list now reads only the text an
+  emitter chose: literal segments and binds from a closed enumeration are
+  skipped once the dimension resolves cleanly to a registered row.
+- **`scores_read_audit::range_for_polarity` reads the registry.** The
+  hand-written `POLARITY_RANGES` table is deleted; it read
+  `boolean-via-score` as [0, 1] where CC's class is {−1, +1}. The pinning
+  census gains the four new single-point families, and `accord:*`, whose
+  `see CC 3.4.1` label CC now aliases to `+1.0 only` (15 in all).
+- **The six families parse as the prose writes them.** `retirement:{state}`,
+  `preserve_request`, `preserve_response`, `archive_release:{basis}`,
+  `lawful_order:release` and `takedown_notice:{basis}` take one trailing
+  version: `takedown_notice:dmca512:v1` resolves cleanly and the doubled
+  `…:v1:v1` form is `namespace_dimension_case_malformed`. I1102 pins it.
+- **The ledger owner rule is unchanged in effect.** The owner, a live
+  occurrence of the owner, or the owner's node binding admits; a stranger is
+  refused. A `delegates_to` delegate is still refused: CC 3.3.10.1 clause 3
+  requires a ledger to declare its serialization discipline, and no wire
+  member or persist table carries that declaration, so there is no
+  discipline for a delegate to be under.
+- **Known divergence, recorded not fixed.** Persist's cirisnode `LegalBasis`
+  serializes `dmca_512` and `dsa_article_16`; CC 3.3.2 and the rc8 registry
+  say `dmca512` and `dsa_article16`. The V054 CHECK constraint pins persist's
+  spelling, so the rename is a migration.
+  `media_sharing::tests::legal_basis_wire_strings_against_the_rc8_takedown_family`
+  pins exactly those two.
+- **Not adopted.** `asserted_at_stale` (CC 2.6.7 W) and
+  `trace_field_shape_violation` (CC 3.1.5) have no persist door; the token
+  test names them as such.
+- Witnesses I1100–I1109 (`federation::rc8_vendor_invariants`, the matcher's
+  polarity-vector replay); the door witnesses run on memory, sqlite and
+  postgres. Evidence: `CLM-polarity-admission` (3.1.7), four rows.
+
+### Known gap — deferred from v58.0.0
+
+- **The 2.4.1.1 carve-out covers two of CC's four adverse classes.**
+  `resolve_withdraws_admission_rule_at` refuses rules 2–4 for `capacity:*` and
+  `detection:*` targets; `licensure:*` and `revocation:*` rows about the
+  subject are not yet closed to a subject's `withdraws` (unchanged behaviour).
+  Lands with CIRISPersist#1036 item 5.
+- **The ledger delegate arm stays refused.** CC 3.3.10.1 names no wire shape
+  for a ledger's serialization discipline (CIRISConstitution#176, rc9).
+- **Takedown basis spellings.** `LegalBasis` still serializes `dmca_512` /
+  `dsa_article_16` against CC's closed `dmca512` / `dsa_article16`; the rename
+  and the notice-as-`scores`-row move together in CIRISPersist#803.
+- **Absent scores are not judged by the polarity gate.** Persist's own
+  positive-only emitters (genesis `trust:charter:v1`, `membership:proposal:v1`,
+  `consent:partnership_grant:v1`, `trust:accepts:v1`) write no `score`.
+- **The two occurrence-revocation routes can race.** A framed
+  `put_identity_occurrence_revocation` and a `withdraws` on the same
+  occurrence landing concurrently can make the second write's local insert
+  hit the primary-key conflict: the revocation lands, the losing call
+  returns an error (BELIEVED, not witnessed; the window is a check-then-write).
+- **A key revocation minted hybrid at put** carries `pqc_completed_at =
+  scrub_timestamp`; v57 stamped the later cold attach. Each revocation is
+  minted once, so peers see one byte form per revocation.
+- **#991 planes 2 and 3** (`group:roster:v1`, the membership rows, general
+  `cosignatures[]`, `goal:{scale}`) remain.
+
 ## [57.0.0] - 2026-10-15
 
 ### Fixed — tag CI: the restored cache repair runs `--strict` (v56.0.0 windows wheel)

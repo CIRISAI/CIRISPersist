@@ -309,6 +309,12 @@ mod run {
         // door that calls it indexes after its commit, which is asserted below.
         const CLAIM_INSERT_HELPERS: &[&str] =
             &["sqlite_insert_holding_claim", "insert_holding_claim_tx"];
+        // v58.0.0 (CIRISPersist#991) — the key plane's in-transaction row
+        // INSERT (a key-plane door's transaction writes the projection row and
+        // its row together). It cannot index (the reload reads COMMITTED rows);
+        // every key-plane door indexes the row after its commit through
+        // `index_stored_key_row` / `index_plane_row`.
+        const KEY_PLANE_ROW_HELPERS: &[&str] = &["sqlite_insert_plane_row", "pg_insert_plane_row"];
         let mut sites_seen = 0usize;
         let mut offenders: Vec<String> = Vec::new();
         for (rel, text, needle) in [
@@ -373,6 +379,7 @@ mod run {
                 if !indexed
                     && !LOCAL_TIER_WRITERS.contains(&name)
                     && !CLAIM_INSERT_HELPERS.contains(&name)
+                    && !KEY_PLANE_ROW_HELPERS.contains(&name)
                 {
                     offenders.push(format!("{rel}: `{name}` inserts a federation_attestations row and never indexes it"));
                 }

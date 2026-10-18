@@ -488,7 +488,6 @@ nomological	descriptive	17	Engine	validate_envelope_canonical_form
 nomological	descriptive	17	Engine	verify_coord_constants_json	
 ontological	descriptive	34	Engine	attach_attestation_pqc_signature	
 ontological	descriptive	34	Engine	attach_key_pqc_signature	
-ontological	descriptive	34	Engine	attach_revocation_pqc_signature	
 ontological	descriptive	34	Engine	canonical_bootstrap_hints	
 ontological	descriptive	34	Engine	deregister_occurrence	
 ontological	descriptive	34	Engine	heartbeat_occurrence	

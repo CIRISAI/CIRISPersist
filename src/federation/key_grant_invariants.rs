@@ -2382,11 +2382,12 @@ pub mod two_node {
             .expect("the occurrence exists");
         assert_eq!(row.identity_key_id, alice);
         assert!(row.encryption_pubkeys.is_some() && row.transport_binding.is_none());
-        let served = n
-            .backend
-            .list_signed_identity_occurrences_since(None, 1_000)
-            .await
-            .unwrap();
+        let served = crate::federation::key_plane::test_support::served_identity_occurrences(
+            n.backend.as_dyn_directory(),
+            1_000,
+        )
+        .await
+        .unwrap();
         assert!(
             served
                 .iter()
@@ -2410,11 +2411,12 @@ pub mod two_node {
             })
             .await
             .unwrap();
-        let served = n
-            .backend
-            .list_signed_identity_occurrences_since(None, 1_000)
-            .await
-            .unwrap();
+        let served = crate::federation::key_plane::test_support::served_identity_occurrences(
+            n.backend.as_dyn_directory(),
+            1_000,
+        )
+        .await
+        .unwrap();
         assert!(
             !served
                 .iter()
@@ -2946,25 +2948,6 @@ mod tests {
             "I72: adopt_sealed_chunk must be a batch of one through adopt_sealed_chunks, never a \
              second path to the floor that could skip the projection"
         );
-    }
-
-    /// **I78 (from disk, #851) — the occurrence plane advertises signed-put
-    /// rows only**: both dialects' `list_signed_identity_occurrences_since`
-    /// keep the `attesting_key_id IS NOT NULL` filter, so a trusted-local
-    /// row can never be listed (the behavioural half is in I76).
-    #[test]
-    fn i78_occurrence_plane_lists_signed_put_rows_only() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        for file in ["src/store/sqlite.rs", "src/store/postgres.rs"] {
-            let text = std::fs::read_to_string(root.join(file)).unwrap();
-            let prod = production_only(&text);
-            let body = method_body(&prod, "list_signed_identity_occurrences_since");
-            assert!(
-                body.contains("federation_identity_occurrences")
-                    && body.contains("attesting_key_id IS NOT NULL"),
-                "I78: {file}: list_signed_identity_occurrences_since must list signed-put rows only"
-            );
-        }
     }
 
     /// **I66e (from disk) — every DEK-plane door of the Engine resolves the
@@ -3875,10 +3858,13 @@ mod tests {
             // ── the planes ────────────────────────────────────────────
             async fn deliver_keys(from: &SqliteBackend, to: &SqliteBackend) -> usize {
                 let mut n = 0;
-                for served in from
-                    .list_signed_key_records_since(None, 1_000)
-                    .await
-                    .unwrap()
+                for served in crate::federation::key_plane::test_support::served_key_records(
+                    from.as_dyn_directory(),
+                    None,
+                    1_000,
+                )
+                .await
+                .unwrap()
                 {
                     if FederationDirectory::lookup_public_key(to, &served.record.key_id)
                         .await
@@ -3946,8 +3932,11 @@ mod tests {
             }
             async fn deliver_occurrences(from: &SqliteBackend, to: &SqliteBackend) -> usize {
                 let mut n = 0;
-                for served in from
-                    .list_signed_identity_occurrences_since(None, 1_000)
+                for served in
+                    crate::federation::key_plane::test_support::served_identity_occurrences(
+                        from.as_dyn_directory(),
+                        1_000,
+                    )
                     .await
                     .unwrap()
                 {
@@ -3975,7 +3964,9 @@ mod tests {
             );
             ts::register_identity_key(sa.as_ref(), &alice, USER).await;
             ts::register_identity_key(sb.as_ref(), &bob, USER).await;
-            ts::register_hybrid_key_as(sa.as_ref(), &comm, &comm, USER).await;
+            // v58.0.0 (CIRISPersist#991) — a self-signed registration, so the
+            // community key is on the plane and crosses as its row.
+            ts::register_identity_key(sa.as_ref(), &comm, USER).await;
             // alice owns A (born on A); bob owns B (born on B) — attestations.
             sa.apply_replicated_attestation(SignedAttestation {
                 attestation: ts::owner_binding_attestation(&format!("ob-a-{run}"), &alice, &a_key),
@@ -4225,11 +4216,14 @@ mod tests {
             );
             // It is on the plane — the gate admitted the bound member.
             assert!(
-                s.list_signed_identity_occurrences_since(None, 1_000)
-                    .await
-                    .unwrap()
-                    .iter()
-                    .any(|x| x.occurrence.identity_occurrence.valid_until == Some(until_ms)),
+                crate::federation::key_plane::test_support::served_identity_occurrences(
+                    s.as_dyn_directory(),
+                    1_000
+                )
+                .await
+                .unwrap()
+                .iter()
+                .any(|x| x.occurrence.identity_occurrence.valid_until == Some(until_ms)),
                 "I91: the plane serves the row with its expiry"
             );
 
@@ -4353,8 +4347,11 @@ mod tests {
                 "I92: both pubkey-bearing occurrences were published: {outcome:?}"
             );
             assert!(outcome.occurrences_local_only.is_empty(), "{outcome:?}");
-            let on_plane: Vec<String> = sa
-                .list_signed_identity_occurrences_since(None, 1_000)
+            let on_plane: Vec<String> =
+                crate::federation::key_plane::test_support::served_identity_occurrences(
+                    sa.as_dyn_directory(),
+                    1_000,
+                )
                 .await
                 .unwrap()
                 .into_iter()
@@ -4367,10 +4364,12 @@ mod tests {
             // The far node admits them through the SAME gate — the identity's
             // signature verifies against the identity's key, no lift needed.
             let mut delivered = 0;
-            for served in sa
-                .list_signed_identity_occurrences_since(None, 1_000)
-                .await
-                .unwrap()
+            for served in crate::federation::key_plane::test_support::served_identity_occurrences(
+                sa.as_dyn_directory(),
+                1_000,
+            )
+            .await
+            .unwrap()
             {
                 let occ = served.occurrence;
                 let k = occ.identity_occurrence.occurrence_key_id.clone();
@@ -4436,8 +4435,11 @@ mod tests {
                 .expect("I92: self_at_login without a signer still lands (local)");
             assert!(outcome_c.occurrences_published.is_empty(), "{outcome_c:?}");
             assert_eq!(outcome_c.occurrences_local_only.len(), 2, "{outcome_c:?}");
-            let plane_c: Vec<String> = sc
-                .list_signed_identity_occurrences_since(None, 1_000)
+            let plane_c: Vec<String> =
+                crate::federation::key_plane::test_support::served_identity_occurrences(
+                    sc.as_dyn_directory(),
+                    1_000,
+                )
                 .await
                 .unwrap()
                 .into_iter()
@@ -4530,8 +4532,11 @@ mod tests {
                 vec![agent_key.clone()],
                 "{outcome:?}"
             );
-            let plane: Vec<String> = s
-                .list_signed_identity_occurrences_since(None, 1_000)
+            let plane: Vec<String> =
+                crate::federation::key_plane::test_support::served_identity_occurrences(
+                    s.as_dyn_directory(),
+                    1_000,
+                )
                 .await
                 .unwrap()
                 .into_iter()

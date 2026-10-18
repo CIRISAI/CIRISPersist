@@ -569,8 +569,8 @@ pub mod bodies {
             .await
             .unwrap_or_else(|e| panic!("{tag}: (3) the human's scrub admits: {e}"));
         // (4)
-        d.put_identity_occurrence_revocation(
-            ts::signed_occurrence_revocation(&node_identity, &node_identity, &install, t4).await,
+        d.put_attestation(
+            ts::occurrence_withdrawal(d, &node_identity, &node_identity, &install, t4).await,
         )
         .await
         .unwrap_or_else(|e| panic!("{tag}: (4) the revocation: {e}"));

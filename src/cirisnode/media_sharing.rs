@@ -1274,6 +1274,78 @@ mod tests {
         }
     }
 
+    /// v58.0.0 (CC v1.0-rc8, CC 3.1.1 / 3.3.2) — **persist's `LegalBasis`
+    /// wire strings against the registry's closed `takedown_notice:{basis}:v1`
+    /// basis list.**
+    ///
+    /// rc8 registers the notice as a row family whose `{basis}` is CC 3.3.2's
+    /// normative wire string, closed. Persist's cirisnode notice predates that
+    /// table and spells two bases differently (`dmca_512` / `dsa_article_16`;
+    /// CC: `dmca512` / `dsa_article16`), and the V054 CHECK constraint pins
+    /// persist's spelling, so the rename is a migration, not a re-vendor.
+    /// Recorded here rather than left to be found: every other basis must be
+    /// the registry's byte for byte, the registry's eleventh basis must be the
+    /// steward purge's, and the divergence list must stay exactly what still
+    /// diverges (a fixed spelling reds until its line is deleted).
+    #[test]
+    fn legal_basis_wire_strings_against_the_rc8_takedown_family() {
+        const KNOWN_SPELLING_DIVERGENCES: &[(&str, &str)] =
+            &[("dmca_512", "dmca512"), ("dsa_article_16", "dsa_article16")];
+        let (values, open) = crate::federation::namespace::matcher::placeholder_values(
+            "takedown_notice:{basis}",
+            "{basis}",
+        )
+        .expect("rc8 registers takedown_notice:{basis}:v1 with a closed basis");
+        assert!(!open);
+        let all = [
+            LegalBasis::Dmca512,
+            LegalBasis::DsaArticle16,
+            LegalBasis::TvecTerrorist,
+            LegalBasis::NcmecCsam,
+            LegalBasis::GifctCip,
+            LegalBasis::CommunityStandards,
+            LegalBasis::PerceptualHashCsam,
+            LegalBasis::OsaIllegalContent,
+            LegalBasis::AvmsdAgeInappropriate,
+            LegalBasis::CourtOrder,
+        ];
+        let mut covered = std::collections::BTreeSet::new();
+        let mut diverging = Vec::new();
+        for b in all {
+            let ours = b.as_str();
+            if values.iter().any(|v| v == ours) {
+                covered.insert(ours.to_owned());
+                continue;
+            }
+            let (_, cc) = KNOWN_SPELLING_DIVERGENCES
+                .iter()
+                .find(|(p, _)| *p == ours)
+                .unwrap_or_else(|| {
+                    panic!("{ours:?} is neither a registry basis nor a known divergence")
+                });
+            assert!(
+                values.iter().any(|v| v == cc),
+                "{cc:?} is not a registry basis"
+            );
+            covered.insert((*cc).to_owned());
+            diverging.push(ours);
+        }
+        assert_eq!(
+            diverging,
+            KNOWN_SPELLING_DIVERGENCES
+                .iter()
+                .map(|(p, _)| *p)
+                .collect::<Vec<_>>(),
+            "a divergence was fixed (or a new one appeared): update the list"
+        );
+        let rest: Vec<&String> = values.iter().filter(|v| !covered.contains(*v)).collect();
+        assert_eq!(
+            rest,
+            [&crate::federation::steward_purge::STEWARD_PURGE_BASIS.to_owned()],
+            "the registry's only basis outside LegalBasis is the steward purge's"
+        );
+    }
+
     /// CEG 0.3 closed set: the 10 LegalBasis variants split into
     /// exactly 5 (immediate) + 4 (counter-noticed) + 1 (age-gate).
     /// No variant ends up in two categories or in zero.

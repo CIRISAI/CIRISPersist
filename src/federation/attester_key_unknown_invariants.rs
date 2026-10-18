@@ -312,20 +312,22 @@ pub(crate) mod bodies {
         // identity_occurrence_revocation: `sr` revokes `o` before `sr` is bound.
         let sr = k("sr");
         ts::register_identity_key(d, &sr, AGENT).await;
-        let rev = ts::signed_occurrence_revocation(&sr, &identity, &o, chrono::Utc::now()).await;
+        // v58.0.0 (CIRISPersist#991, CC 3.3.6) — the revocation is a
+        // `withdraws` on the occurrence's row; the same signer_acts_for rule.
+        let rev = ts::occurrence_withdrawal(d, &sr, &identity, &o, chrono::Utc::now()).await;
         let e = d
-            .put_identity_occurrence_revocation(rev.clone())
+            .put_attestation(rev.clone())
             .await
             .expect_err("I630: an unbound signer cannot revoke yet");
         expect_not_acting(
             &e,
             &sr,
             &identity,
-            "identity_occurrence_revocation",
+            "identity_occurrence_withdraws",
             "I630 revocation",
         );
         bind(d, &identity, &sr).await;
-        d.put_identity_occurrence_revocation(rev)
+        d.put_attestation(rev)
             .await
             .expect("I630: the same revocation admits once the signer is bound");
 

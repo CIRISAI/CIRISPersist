@@ -1986,8 +1986,6 @@ class Engine:
     def attach_key_pqc_signature(self, key_id: str, pubkey_ml_dsa_65_base64: str, scrub_signature_pqc: str) -> None:
         """(derived) ontological — Federation directory: attach the cold-path PQC signature to a hybrid-pending federation_keys row. See docs/FEDERATION_DIRECTORY.md §"Trust contract..."""
 
-    def attach_revocation_pqc_signature(self, revocation_id: str, scrub_signature_pqc: str) -> None:
-        """(derived) ontological — Federation directory: attach PQC signature to a hybrid-pending federation_revocations row."""
 
     def canonical_bootstrap_hints(self) -> str:
         """(derived) ontological — v13.6.0 (CIRISPersist#402, CIRISEdge#296) — the accord-attested bootstrap dial set as a compact JSON list edge consumes directly:"""

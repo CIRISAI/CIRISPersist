@@ -134,7 +134,7 @@ impl FaultInjectingDirectory {
     }
 }
 
-// 115 delegations, generated. Every one: fault first, then delegate.
+// 113 delegations, generated. Every one: fault first, then delegate.
 #[async_trait::async_trait]
 impl FederationDirectory for FaultInjectingDirectory {
     async fn apply_replicated_accord_evidence(
@@ -172,18 +172,6 @@ impl FederationDirectory for FaultInjectingDirectory {
         }
         self.inner
             .attach_key_pqc_signature(key_id, pubkey_ml_dsa_65_base64, scrub_signature_pqc)
-            .await
-    }
-    async fn attach_revocation_pqc_signature(
-        &self,
-        revocation_id: &str,
-        scrub_signature_pqc: &str,
-    ) -> Result<(), Error> {
-        if let Some(e) = self.faulted("attach_revocation_pqc_signature") {
-            return Err(e);
-        }
-        self.inner
-            .attach_revocation_pqc_signature(revocation_id, scrub_signature_pqc)
             .await
     }
     async fn attestation_insert_local(
@@ -580,15 +568,6 @@ impl FederationDirectory for FaultInjectingDirectory {
             return Err(e);
         }
         self.inner.list_hybrid_pending_keys(limit).await
-    }
-    async fn list_hybrid_pending_revocations(
-        &self,
-        limit: i64,
-    ) -> Result<Vec<HybridPendingRow>, Error> {
-        if let Some(e) = self.faulted("list_hybrid_pending_revocations") {
-            return Err(e);
-        }
-        self.inner.list_hybrid_pending_revocations(limit).await
     }
     async fn list_identity_occurrence_history_by_occurrence(
         &self,

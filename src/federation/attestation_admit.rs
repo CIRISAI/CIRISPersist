@@ -256,6 +256,22 @@ pub(crate) trait AttestationStore:
         projection: super::silo_projection::SiloProjection,
     ) -> Result<super::silo_projection::ProjectionRebuild, Error>;
 
+    /// v58.0.0 (CIRISPersist#1094 item 2) — the `agent_id_hash` of the trace
+    /// `trace_id` as this node holds it (`trace_events`), `None` when no row of
+    /// it is held.
+    async fn trace_agent_id_hash(&self, trace_id: &str) -> Result<Option<String>, Error>;
+
+    /// v58.0.0 (CIRISPersist#1094 item 2) — the ids of the `detection:*` rows
+    /// whose detection names (by its body's `trace_id`) a trace of
+    /// `agent_id_hash` this node holds, restricted to traces signed by
+    /// `signing_key_id` when given (the key-scoped DSAR door). What a DSAR
+    /// erasure of that agent reaches on the attestation plane. Sorted.
+    async fn detection_row_ids_for_agent(
+        &self,
+        agent_id_hash: &str,
+        signing_key_id: Option<&str>,
+    ) -> Result<Vec<String>, Error>;
+
     /// v57.0.0 (CIRISPersist#988 item 3) — store a planned detection row and,
     /// when it landed, its `detection_events` projection, in one transaction.
     /// `false` (nothing written) when the row's id is already held.
@@ -355,11 +371,27 @@ pub(crate) async fn put_attestation_planned<D>(
 where
     D: AttestationStore,
 {
+    // v58.0.0 (CIRISPersist#991, CC 3.1.3) — a key-plane row goes to its
+    // family's door: proof of possession, not resolve-the-attester; the
+    // object's own signature, not one over the row's envelope.
+    if super::key_plane::is_key_plane_row(&attestation.attestation) {
+        use super::key_plane::KeyPlaneApplied;
+        return match super::key_plane::apply_key_plane_row(dir, &attestation.attestation).await? {
+            KeyPlaneApplied::Changed => Ok(AttestationOutcome::Inserted),
+            KeyPlaneApplied::Unchanged => Ok(AttestationOutcome::AlreadyHeld),
+            KeyPlaneApplied::Refused(reason) => Err(Error::Conflict(format!(
+                "key-plane row {} not applied: {reason}",
+                attestation.attestation.attestation_id
+            ))),
+        };
+    }
     // v53.0.0 (#963) — a row that changes an owner's cohort allow list for
     // one of its nodes (a `consent:replication` grant FOR the node, or the
     // owner's retraction of one): read before the row moves, acted on only
     // when the store inserted it.
     let consent_change = super::consent_list_change_of(dir, &attestation.attestation).await;
+    let occurrence_withdrawal =
+        super::key_plane::occurrence_withdrawal_of(dir, &attestation.attestation).await?;
     // v56.0.0 (CIRISPersist#934, CC review condition 1) — the ONE clock read
     // of this door, and the row's signed instant: the plan's two inputs. The
     // plan reads no clock of its own and the executor reads none either. A
@@ -386,6 +418,28 @@ where
     .await;
     if let (Ok(AttestationOutcome::Inserted), Some((owner, node))) = (&outcome, consent_change) {
         super::rewrap_after_admission(dir, &owner, &node).await;
+    }
+    // v58.0.0 (CIRISPersist#991, CC 3.3.6) — an admitted `withdraws` against an
+    // `identity:occurrence:v1` row feeds the occurrence-revocation projection
+    // (`federation_identity_occurrence_revocations`, this node's local read
+    // model: eviction, transport-route retirement).
+    //
+    // v58.0.0 (compat reads, operator ruling 2026-10-18) — the framed door
+    // (`put_identity_occurrence_revocation`) feeds the same projection. A pair
+    // already revoked by either route keeps the revocation it holds: the first
+    // to land fixes the instants, and neither route rewrites (or un-revokes)
+    // the other.
+    if let (Ok(AttestationOutcome::Inserted), Some(revocation)) = (&outcome, occurrence_withdrawal)
+    {
+        let held = dir
+            .list_identity_occurrence_revocations_for(&revocation.identity_key_id)
+            .await?
+            .iter()
+            .any(|r| r.occurrence_key_id == revocation.occurrence_key_id);
+        if !held {
+            dir.put_identity_occurrence_revocation_local(revocation)
+                .await?;
+        }
     }
     outcome
 }
@@ -1835,9 +1889,21 @@ pub(crate) struct PlannedDetection {
 /// `lenscore_detector` only, CC 3.4.8), the reserved genesis ids, the mirror
 /// and instant stamp, the size as stored, the instant binding at
 /// `received_at`.
+///
+/// v58.0.0 (CIRISPersist#1094 item 2, CC 4.5.3) — `subject` is the scored
+/// agent's CC 2.3.2.1 canonical hash
+/// ([`subject_erasure::agent_subject`](super::subject_erasure::agent_subject)
+/// of the trace's `agent_id_hash`, [`detection_subject`]), written into
+/// `subject_key_ids`: a detection is a row ABOUT that subject, and naming it
+/// makes the rows about a subject discoverable (DSAR export, the erasure
+/// door's lookup). It is not an authority path: a detection is adverse, and
+/// is erased only by its producer's rule-1 `withdraws` (CC 4.5.3, the 2.4.1.1
+/// carve-out). `None` when the door cannot tell whose trace it scored (the
+/// trace is not held here): the door never guesses a subject.
 pub(crate) fn plan_detection_row(
     body: &crate::derived::detection_row::DetectionProjection,
     attester_identity_type: &str,
+    subject: Option<&str>,
     instants: PlanInstants,
 ) -> Result<PlannedDetection, Error> {
     use crate::derived::detection_row as dr;
@@ -1863,7 +1929,7 @@ pub(crate) fn plan_detection_row(
         weight: None,
         expires_at: None,
         attestation_envelope: crate::federation::envelope::EnvelopeCore::from_value(envelope)?,
-        subject_key_ids: Vec::new(),
+        subject_key_ids: subject.map(str::to_owned).into_iter().collect(),
         cohort_scope: cohort_scope::SELF.to_owned(),
         scrub_signature_classical: None,
         scrub_signature_pqc: None,
@@ -1921,6 +1987,33 @@ pub(crate) fn detection_reput_verdict(
     }
 }
 
+/// v58.0.0 (CIRISPersist#1094 item 2, CC 4.5.3) — **whose detection this
+/// is**: the canonical subject
+/// ([`subject_erasure::agent_subject`](super::subject_erasure::agent_subject))
+/// of the agent whose trace it scored, read from the trace as THIS node holds
+/// it. `None` when the trace is not held (or names an agent outside the CC
+/// 2.3.2.1 `{id}` production): the door never guesses a subject. One reader
+/// for the live door and the legacy rehome.
+///
+/// # Errors
+///
+/// Directory reads.
+pub(crate) async fn detection_subject<D>(
+    dir: &D,
+    trace_id: Option<&str>,
+) -> Result<Option<String>, Error>
+where
+    D: AttestationStore,
+{
+    let Some(trace_id) = trace_id else {
+        return Ok(None);
+    };
+    Ok(dir
+        .trace_agent_id_hash(trace_id)
+        .await?
+        .and_then(|agent| super::subject_erasure::agent_subject(&agent).ok()))
+}
+
 /// v57.0.0 (CIRISPersist#988 item 3) — the door: every backend's
 /// `put_detection_event` is this call. The detector's hybrid signature over
 /// `canonical_bytes` is the caller's to verify (the `DerivedSchema` verify
@@ -1942,9 +2035,11 @@ where
             attesting_key_id: event.signing_key_id.clone(),
             plane: "detection",
         })?;
+    let subject = detection_subject(dir, body.trace_id.as_deref()).await?;
     let planned = plan_detection_row(
         &body,
         &identity_type,
+        subject.as_deref(),
         PlanInstants {
             fold_at: received_at,
             received_at,

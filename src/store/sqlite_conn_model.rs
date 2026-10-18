@@ -252,7 +252,6 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("aggregate_scoring_factors_uncached", ConnClass::Read),
     ("aggregate_scrub_stats", ConnClass::Read),
     ("attach_key_pqc_signature", ConnClass::Write),
-    ("attach_revocation_pqc_signature", ConnClass::Write),
     // v53.0.0 (#975) — the row-type census: one GROUP BY, read-only.
     ("attestation_type_census", ConnClass::Read),
     ("attestations_binding_content", ConnClass::Read),
@@ -268,7 +267,6 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     // #846 (§5) — the row's author / cohort / community, columns only.
     ("blob_provenance", ConnClass::Read),
     ("cancel_outbound", ConnClass::Write),
-    ("check_revocation_anti_rollback_sqlite", ConnClass::Read),
     ("claim_pending_outbound", ConnClass::Write),
     ("clear_active_halt", ConnClass::Write),
     ("communities_containing", ConnClass::Read),
@@ -415,7 +413,6 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("list_held_fountain_content", ConnClass::Read),
     ("list_hybrid_pending_attestations", ConnClass::Read),
     ("list_hybrid_pending_keys", ConnClass::Read),
-    ("list_hybrid_pending_revocations", ConnClass::Read),
     ("list_identity_occurrence_revocations_for", ConnClass::Read),
     ("list_identity_occurrences_for", ConnClass::Read),
     ("list_installed_storage_budgets", ConnClass::Read),
@@ -654,7 +651,6 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     // v50.0.0 (#928, V157) — the recorded admission depth of a `withdraws`.
     ("withdraws_admission_depth", ConnClass::Read),
     ("trust_direction_held_among", ConnClass::Read),
-    ("put_revocation", ConnClass::Write),
     ("put_scope_blob", ConnClass::Write),
     ("put_signed_transport_destination", ConnClass::Write),
     ("put_stream_sth", ConnClass::Write),
@@ -739,6 +735,8 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("store_planned_hard_case", ConnClass::Write),
     ("rehome_legacy_hard_case_events", ConnClass::Write),
     ("store_planned_detection", ConnClass::Write),
+    ("trace_agent_id_hash", ConnClass::Read),
+    ("detection_row_ids_for_agent", ConnClass::Read),
     ("rehome_legacy_detection_events", ConnClass::Write),
     ("projection_rebuild", ConnClass::Write),
     (
@@ -749,9 +747,26 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("sqlite_record_hard_case_in_tx", ConnClass::HelperWrite),
     ("sqlite_project_hard_case", ConnClass::HelperWrite),
     ("sqlite_project_detection", ConnClass::HelperWrite),
+    // v58.0.0 (CIRISPersist#991) — the key plane's rows and projections.
+    ("sqlite_key_plane_present", ConnClass::HelperRead),
+    ("sqlite_plane_rows", ConnClass::HelperRead),
+    ("sqlite_key_projection_rebuild", ConnClass::HelperRead),
+    (
+        "sqlite_revocation_projection_rebuild",
+        ConnClass::HelperRead,
+    ),
+    (
+        "sqlite_occurrence_projection_rebuild",
+        ConnClass::HelperRead,
+    ),
+    ("rehome_legacy_key_plane", ConnClass::Write),
+    ("store_planned_revocation", ConnClass::Write),
+    ("index_stored_key_row", ConnClass::Read),
     ("sqlite_render_table", ConnClass::HelperRead),
-    ("sqlite_art17_delete_detection_rows", ConnClass::HelperWrite),
-    ("sqlite_put_art17_execution", ConnClass::HelperWrite),
+    ("sqlite_erase_cited_rows", ConnClass::HelperWrite),
+    ("sqlite_store_erasure_withdraws", ConnClass::HelperWrite),
+    ("sqlite_v196_pending", ConnClass::HelperRead),
+    ("sqlite_put_erasure_execution", ConnClass::HelperWrite),
     ("sqlite_record_erasure", ConnClass::HelperWrite),
     ("sqlite_detection_tombstone_instant", ConnClass::HelperRead),
     (
