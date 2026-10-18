@@ -3444,6 +3444,45 @@ impl IdentityOccurrenceRevocation {
     }
 }
 
+/// A SIGNED [`IdentityOccurrenceRevocation`] — the revocation-plane mirror of
+/// [`SignedIdentityOccurrence`] (v16.0.0, CIRISPersist#421; closes the
+/// availability half #418 deferred).
+///
+/// An **unsigned, terminal** revocation on the wire is a permanent-DoS forgery:
+/// any consented replication peer could fabricate `{identity: victim,
+/// occurrence: victim}` and brick the victim's sealability forever
+/// (`resolve_encryption_keys → None`, unrecoverable). This container carries the
+/// same detached-signature discipline as the occurrence: the signature is over
+/// `JCS(signed_envelope)` (the producer's EXACT revocation envelope — persist
+/// never re-canonicalizes, §0.9), verified at
+/// [`put_identity_occurrence_revocation`](crate::federation::FederationDirectory::put_identity_occurrence_revocation)
+/// BEFORE any write, with the #418 `signer_acts_for` + divergent-typed-projection
+/// rejection. Terminality is retired in the same cut:
+/// [`resolve_encryption_keys`](crate::federation::FederationDirectory::resolve_encryption_keys)
+/// lets a strictly-newer signed occurrence re-establish (publish → rotate →
+/// revoke → re-establish, every transition authenticated and recoverable).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SignedIdentityOccurrenceRevocation {
+    /// Persist's typed projection of the revocation (what gets stored). Its
+    /// members are parsed FROM [`Self::signed_envelope`]; the signature is
+    /// verified over `signed_envelope`, not over this projection, so the §0.9
+    /// member-presence discipline is preserved.
+    pub identity_occurrence_revocation: IdentityOccurrenceRevocation,
+    /// The claimed signer — a `federation_keys.key_id`. MUST be the identity's
+    /// own registered key or an already-ACTIVE occurrence of the same identity
+    /// (`signer_acts_for` — the §11.7.4 single-vouch-for-self, enforced).
+    pub attesting_key_id: String,
+    /// The EXACT revocation envelope the producer signed (signature container
+    /// stripped), as received — the bytes the gate JCS-canonicalizes.
+    /// Byte-exact by construction (never rebuilt from the typed projection).
+    pub signed_envelope: serde_json::Value,
+    /// The detached hybrid signature over `JCS(signed_envelope)` (Ed25519 over
+    /// the bytes; ML-DSA-65 over `bytes ‖ ed25519_sig`). Same container type as
+    /// the occurrence — the producer is the same envelope-generic
+    /// `produce_signed_identity_occurrence`.
+    pub signature: ciris_verify_core::transport_binding::TransportBindingSignature,
+}
+
 /// Removes one identity from a V059 family roster. The family's
 /// `members` roster is left intact; the active-membership read filters
 /// against this table.
@@ -3906,14 +3945,14 @@ pub struct ServedRevocation {
     pub revocation: Revocation,
     /// When THIS node admitted the row — receiver-stamped, never read from the
     /// wire, monotonic in this node's own arrival order. The value a caller
-    /// resumes `list_signed_revocations_since` (retired in v58.0.0)
+    /// resumes [`list_signed_revocations_since`](crate::federation::FederationDirectory::list_signed_revocations_since)
     /// from.
     pub admitted_at: chrono::DateTime<chrono::Utc>,
 }
 
 impl ServedKeyRecord {
     /// v36.0.0 (CIRISPersist#668) — the `(admitted_at, id)` PAIR a caller
-    /// resumes `list_signed_key_records_since` (retired in v58.0.0)
+    /// resumes [`list_signed_key_records_since`](crate::federation::FederationDirectory::list_signed_key_records_since)
     /// from. The pair, never the instant alone: a page ordered by
     /// `(instant, id)` and resumed by instant alone skips the remainder of any
     /// tie larger than one page.
@@ -3925,7 +3964,7 @@ impl ServedKeyRecord {
 
 impl ServedRevocation {
     /// v36.0.0 (CIRISPersist#668) — the `(admitted_at, id)` PAIR a caller
-    /// resumes `list_signed_revocations_since` (retired in v58.0.0)
+    /// resumes [`list_signed_revocations_since`](crate::federation::FederationDirectory::list_signed_revocations_since)
     /// from.
     #[must_use]
     pub fn resume_pair(&self) -> (chrono::DateTime<chrono::Utc>, String) {
@@ -4344,6 +4383,29 @@ impl ServedAttestation {
     #[must_use]
     pub fn resume_pair(&self) -> (chrono::DateTime<chrono::Utc>, String) {
         (self.admitted_at, self.attestation.attestation_id.clone())
+    }
+}
+
+/// One signed `federation_identity_occurrence_revocations` row as the serve
+/// cursor returns it (#668). Rows are identified by `(identity_key_id,
+/// occurrence_key_id)`, so the resume id is a [`compound_resume_id`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ServedIdentityOccurrenceRevocation {
+    /// The signed occurrence revocation itself, unchanged.
+    pub revocation: SignedIdentityOccurrenceRevocation,
+    /// THIS node's serve position on the row (node-local, never hashed).
+    pub admitted_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl ServedIdentityOccurrenceRevocation {
+    /// The `(admitted_at, compound id)` pair a caller resumes from.
+    #[must_use]
+    pub fn resume_pair(&self) -> (chrono::DateTime<chrono::Utc>, String) {
+        let r = &self.revocation.identity_occurrence_revocation;
+        (
+            self.admitted_at,
+            compound_resume_id(&[&r.identity_key_id, &r.occurrence_key_id]),
+        )
     }
 }
 

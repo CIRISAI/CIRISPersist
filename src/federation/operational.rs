@@ -6277,7 +6277,7 @@ pub mod test_support {
     /// ADVERTISES for `key_id` and demand the point-read serve it, byte-exact.
     ///
     /// Deliberately reads the ADVERTISE surface
-    /// (`FederationDirectory::list_signed_key_records_since` (retired in v58.0.0))
+    /// ([`FederationDirectory::list_signed_key_records_since`])
     /// rather than `lookup_public_key`, because the advertised row is what a
     /// peer actually asks for — the measured symptom was `ADVERTISED hash ⇒
     /// POINT-READ None`.

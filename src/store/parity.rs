@@ -135,6 +135,36 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // without a row — never refused there). The attestation door hands a
     // key-plane row to its family door (Delegates).
     ("plan_put_revocation", Class::Delegates),
+    // v58.0.0 (compat reads, operator ruling 2026-10-18) — the framed
+    // occurrence-revocation door's signature gate (v57's class), the
+    // restored listings' row decoders (v57's class), and the read the
+    // attestation door makes before feeding a `withdraws` into the occurrence
+    // revocation projection: Delegates, a backend read whose only effect is to
+    // skip a write the framed route already made (an error propagates, so it
+    // fails closed).
+    ("verify_signed_identity_occurrence_revocation", Class::Gate),
+    ("list_identity_occurrence_revocations_for", Class::Delegates),
+    ("pg_row_to_key_record", Class::Delegates),
+    ("pg_row_to_revocation", Class::Delegates),
+    ("pg_row_to_signed_identity_occurrence", Class::Delegates),
+    (
+        "pg_row_to_signed_identity_occurrence_revocation",
+        Class::Delegates,
+    ),
+    ("sqlite_row_to_key_record", Class::Delegates),
+    ("sqlite_row_to_revocation", Class::Delegates),
+    ("sqlite_row_to_identity_occurrence", Class::Delegates),
+    (
+        "sqlite_row_to_identity_occurrence_revocation",
+        Class::Delegates,
+    ),
+    ("pg_row_to_identity_occurrence", Class::Delegates),
+    ("pg_row_to_identity_occurrence_revocation", Class::Delegates),
+    ("sqlite_row_to_signed_identity_occurrence", Class::Delegates),
+    (
+        "sqlite_row_to_signed_identity_occurrence_revocation",
+        Class::Delegates,
+    ),
     ("put_revocation_planned", Class::Plan),
     ("revocations_for_subject", Class::Plumbing),
     ("check_revocation_bound_lowers", Class::Gate),

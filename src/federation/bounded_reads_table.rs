@@ -237,15 +237,23 @@ pub(crate) const LIST_READ_BOUNDS: &[(&str, Bound)] = &[
     ("list_signed_family_membership_revocations_since", Bound::Paged),
     ("list_signed_family_membership_widenings_since", Bound::Paged),
     (
+        "list_signed_identity_occurrence_revocations_for",
+        Bound::Schema("the signed twin of list_identity_occurrence_revocations_for"),
+    ),
+    ("list_signed_identity_occurrence_revocations_since", Bound::Paged),
+    (
         "list_signed_identity_occurrences_for",
         Bound::Schema("the signed twin of list_identity_occurrences_for: one per device"),
     ),
+    ("list_signed_identity_occurrences_since", Bound::Paged),
+    ("list_signed_key_records_since", Bound::Paged),
     ("list_signed_location_proofs_since", Bound::Paged),
     ("list_signed_partner_records_since", Bound::Paged),
     (
         "list_signed_records",
         Bound::Open("every replicated record of one kind for one subject; the history-bearing kinds grow"),
     ),
+    ("list_signed_revocations_since", Bound::Paged),
     (
         "list_signed_transport_destinations_for",
         Bound::Schema("the signed twin of list_transport_destinations_for: one row per transport kind"),

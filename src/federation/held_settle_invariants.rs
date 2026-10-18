@@ -208,8 +208,17 @@ pub(crate) mod bodies {
             .collect();
         // v58.0.0 (CIRISPersist#991) — the key and the revocation are
         // `key:record:v1` / `key:revocation:v1` rows: Attestation-kind entries
-        // under their row ids, settled by the key-plane door (I975+).
-        for kind in ["Attestation", "LocationProof", "Family", "Community"] {
+        // under their row ids, settled by the key-plane door (I975+). Their
+        // framed `Key` / `Revocation` entries stay indexed beside the rows
+        // (compat reads, operator ruling 2026-10-18).
+        for kind in [
+            "Key",
+            "Attestation",
+            "Revocation",
+            "LocationProof",
+            "Family",
+            "Community",
+        ] {
             assert!(
                 mine.iter().any(|(k, _)| k == kind),
                 "[{tag}] I230: no {kind} ref seeded; got {mine:?}"
@@ -264,6 +273,15 @@ pub(crate) mod bodies {
                     "[{tag}] I230 Community"
                 ),
                 other => panic!("[{tag}] I230: unexpected kind {other}"),
+            }
+            // A settle-exempt kind (`SETTLE_EXEMPT`: the framed Key and
+            // Revocation, whose doors are their families' own) answered held
+            // above without the #672 settle; every other kind settles.
+            if crate::federation::replication_policy::SETTLE_EXEMPT
+                .iter()
+                .any(|(k, _)| *k == ek)
+            {
+                continue;
             }
             assert!(
                 already_held_count(ek) > before,
@@ -441,6 +459,12 @@ mod from_disk {
         (EnvelopeKind::Attestation, "put_attestation_with_origin"),
         (EnvelopeKind::Family, "put_family"),
         (EnvelopeKind::Community, "put_community"),
+        // v58.0.0 (compat reads, operator ruling 2026-10-18) — the framed
+        // occurrence-revocation door is an authoring door again.
+        (
+            EnvelopeKind::IdentityOccurrenceRevocation,
+            "put_identity_occurrence_revocation",
+        ),
         (
             EnvelopeKind::FamilyMembershipRevocation,
             "put_family_membership_revocation",

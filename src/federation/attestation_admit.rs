@@ -423,10 +423,23 @@ where
     // `identity:occurrence:v1` row feeds the occurrence-revocation projection
     // (`federation_identity_occurrence_revocations`, this node's local read
     // model: eviction, transport-route retirement).
+    //
+    // v58.0.0 (compat reads, operator ruling 2026-10-18) — the framed door
+    // (`put_identity_occurrence_revocation`) feeds the same projection. A pair
+    // already revoked by either route keeps the revocation it holds: the first
+    // to land fixes the instants, and neither route rewrites (or un-revokes)
+    // the other.
     if let (Ok(AttestationOutcome::Inserted), Some(revocation)) = (&outcome, occurrence_withdrawal)
     {
-        dir.put_identity_occurrence_revocation_local(revocation)
-            .await?;
+        let held = dir
+            .list_identity_occurrence_revocations_for(&revocation.identity_key_id)
+            .await?
+            .iter()
+            .any(|r| r.occurrence_key_id == revocation.occurrence_key_id);
+        if !held {
+            dir.put_identity_occurrence_revocation_local(revocation)
+                .await?;
+        }
     }
     outcome
 }

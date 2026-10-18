@@ -603,27 +603,24 @@ pub const SETTLE_EXEMPT: &[(EnvelopeKind, &str)] = &[
     ),
     (
         EnvelopeKind::Key,
-        "v58.0.0 (CIRISPersist#991): rides the attestation store as a key-plane row; its framed \
-         carriage is retired and the key-plane door settles a byte-identical re-offered row \
-         (key_plane::apply_key_plane_row)",
+        "v58.0.0 (CIRISPersist#991): rides the attestation store as a key-plane row, whose \
+         key-plane door settles a byte-identical re-offer (key_plane::apply_key_plane_row); \
+         the framed door a pre-v58 peer still drives is that family's own door, unchanged \
+         by the compat reads",
     ),
     (
         EnvelopeKind::Revocation,
-        "v58.0.0 (CIRISPersist#991): rides the attestation store as a key-plane row; its framed \
-         carriage is retired and the key-plane door settles a byte-identical re-offered row \
-         (key_plane::apply_key_plane_row)",
+        "v58.0.0 (CIRISPersist#991): rides the attestation store as a key-plane row, whose \
+         key-plane door settles a byte-identical re-offer (key_plane::apply_key_plane_row); \
+         the framed door a pre-v58 peer still drives is that family's own door, unchanged \
+         by the compat reads",
     ),
     (
         EnvelopeKind::IdentityOccurrence,
-        "v58.0.0 (CIRISPersist#991): rides the attestation store as a key-plane row; its framed \
-         carriage is retired and the key-plane door settles a byte-identical re-offered row \
-         (key_plane::apply_key_plane_row)",
-    ),
-    (
-        EnvelopeKind::IdentityOccurrenceRevocation,
-        "v58.0.0 (CIRISPersist#991): rides the attestation store as a key-plane row; its framed \
-         carriage is retired and the key-plane door settles a byte-identical re-offered row \
-         (key_plane::apply_key_plane_row)",
+        "v58.0.0 (CIRISPersist#991): rides the attestation store as a key-plane row, whose \
+         key-plane door settles a byte-identical re-offer (key_plane::apply_key_plane_row); \
+         the framed door a pre-v58 peer still drives is that family's own door, unchanged \
+         by the compat reads",
     ),
 ];
 
