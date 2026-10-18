@@ -30352,6 +30352,19 @@ mod accord_tests {
         ts::assert_attestation_tie_pages_exactly_once(&backend, "sq", &ids, 3).await;
     }
 
+    /// v36.0.0 (CIRISPersist#707) — a consumer-visible key mutation moves the
+    /// SERVE POSITION on sqlite; grant/revoke_trust do not.
+    #[tokio::test]
+    async fn key_mutation_moves_serve_position_sqlite_707() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::operational::test_support::exercise_key_mutation_moves_serve_position(
+            &backend, "sq",
+        )
+        .await
+        .expect("707 serve-position exercise");
+    }
+
     /// v31.0.0 (CIRISPersist#659) — a signed revocation de-admits the key it
     /// NAMED, at the real `put_revocation` chokepoint, on sqlite.
     #[tokio::test]
@@ -30733,6 +30746,21 @@ mod tests {
         crate::federation::admission::r2_test_support::exercise_wire_refs_for_subject_resolve(
             &backend,
             "sqlite-634",
+        )
+        .await;
+    }
+
+    /// v31.0.0 (CIRISPersist#640) — the SQLITE leg. SQLite round-trips the
+    /// nanoseconds (RFC-3339 TEXT) so the timestamp half cannot bite here, but
+    /// the `consent_role` wire ⇔ stored normalization DOES: before the fix this
+    /// backend indexed `Some("unregistered")` while its read surface returns
+    /// `None`.
+    #[tokio::test]
+    async fn nanosecond_key_wire_ref_resolves_sqlite_640() {
+        let backend = fresh_backend_with_occurrence("occ-640").await;
+        crate::federation::admission::r2_test_support::exercise_nanosecond_key_wire_ref_resolves(
+            &backend,
+            "sqlite-640",
         )
         .await;
     }
@@ -35095,6 +35123,98 @@ mod tests {
     // ─── v31.4.0 (CIRISPersist#682 / #668) — the identity plane's serve
     //     cursor, sqlite arm. Assertion bodies shared with the memory and
     //     postgres arms; only the PLANT is backend-specific.
+
+    /// #682 — a key record signed a year ago and admitted now is still served
+    /// to a consumer whose cursor has passed that instant.
+    #[tokio::test]
+    async fn late_replicated_key_record_is_served_sqlite_682() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::register::test_support::exercise_late_replicated_key_record_is_served(
+            &backend, "sq",
+        )
+        .await
+        .unwrap();
+    }
+
+    /// #668 — `limit + 2` rows sharing ONE admission instant page through with
+    /// every row seen exactly once.
+    ///
+    /// The tie is PLANTED because it cannot be produced through this backend's
+    /// write path: `monotonic_admission_instant` allocates strictly above the
+    /// last position, so two admissions here never collide. It is reachable in
+    /// production through the V126 backfill (every pre-existing row stamped
+    /// with its `scrub_timestamp`, and a batch from one producer shares one)
+    /// and through two writers racing the same `MAX`.
+    #[tokio::test]
+    async fn one_admission_instant_pages_exactly_once_sqlite_668() {
+        use crate::federation::register::test_support as rts;
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let ids: Vec<String> = (0..5).map(|i| format!("k668-sq-{i}")).collect();
+        for id in &ids {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: rts::self_scrubbed_record_signed_at(id, chrono::Utc::now()),
+                })
+                .await
+                .unwrap();
+        }
+
+        // THE TIE, as state: every row collapses onto one instant. Written in
+        // the same RFC-3339 form the writer uses, so the stored string and a
+        // cursor round-tripped through `parse_rfc3339` compare equal.
+        let tied_at = rts::truncate_to_micros(chrono::Utc::now());
+        {
+            let conn = backend.conn.lock();
+            let n = conn
+                .execute(
+                    "UPDATE federation_keys SET admitted_at = ?1",
+                    rusqlite::params![tied_at.to_rfc3339()],
+                )
+                .unwrap();
+            assert_eq!(n, ids.len(), "the tie plant must touch every seeded row");
+        }
+
+        rts::assert_one_admission_instant_pages_exactly_once(&backend, "sq", &ids, 3)
+            .await
+            .unwrap();
+    }
+
+    /// #682 — the admission position survives a backward clock step on this
+    /// backend's real write path. The post-step state is planted directly; two
+    /// admissions under a forward clock would pass with `Utc::now()` and prove
+    /// nothing.
+    #[tokio::test]
+    async fn key_admission_survives_a_backward_clock_step_sqlite_682() {
+        use crate::federation::register::test_support as rts;
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: rts::self_scrubbed_record_signed_at("k682-sq-a", chrono::Utc::now()),
+            })
+            .await
+            .unwrap();
+
+        // THE BACKWARD STEP, as state: the last position handed out is now an
+        // hour ahead of the wall clock.
+        let future = rts::truncate_to_micros(chrono::Utc::now() + chrono::Duration::hours(1));
+        {
+            let conn = backend.conn.lock();
+            let n = conn
+                .execute(
+                    "UPDATE federation_keys SET admitted_at = ?1",
+                    rusqlite::params![future.to_rfc3339()],
+                )
+                .unwrap();
+            assert_eq!(n, 1, "the backward-step plant must touch the seeded row");
+        }
+
+        rts::assert_key_admission_survives_backward_step(&backend, "sq", future)
+            .await
+            .unwrap();
+    }
 
     /// #682 — the allocator reads `COALESCE(admitted_at, scrub_timestamp)`, the
     /// same expression the cursor orders by, not the bare column.

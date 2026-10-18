@@ -13984,10 +13984,16 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.kind(), "federation_invalid_argument", "{err}");
 
-        // The soft face: announced + attributed. (v58.0.0, CIRISPersist#991:
-        // an operator-added peer key carries no registration signature, so it
-        // is held without a `key:record:v1` row and was never on the plane; the
-        // framed key cursor this test also moved is retired.)
+        // The soft face: announced + attributed + cursor moves.
+        let before = backend
+            .list_signed_key_records_since(None, u32::MAX)
+            .await
+            .unwrap();
+        let cursor = before
+            .iter()
+            .map(|r| (r.admitted_at, r.record.key_id.clone()))
+            .max()
+            .expect("at least the peer row");
         backend
             .remove_peer_record("peer-721", false, "operator rotation", Some("deleg-1"))
             .await
@@ -14004,6 +14010,16 @@ mod tests {
         assert_eq!(ev.detail["reason"], "operator rotation");
         assert_eq!(ev.detail["delegation_id"], "deleg-1");
         assert_eq!(ev.detail["hard"], false);
+        // The sibling key row re-serves past the old cursor (#707 class).
+        let after = backend
+            .list_signed_key_records_since(Some(cursor), u32::MAX)
+            .await
+            .unwrap();
+        assert!(
+            after.iter().any(|r| r.record.key_id == "peer-721"),
+            "the soft removal changed the served set — the key row must re-serve \
+             so synced peers learn it (#721/#707)"
+        );
     }
 
     /// v38.0.0 (CIRISPersist#721) — **the trust doors refuse the unproven.**
@@ -14608,6 +14624,130 @@ mod tests {
     // ─── v31.4.0 (CIRISPersist#682 / #668) — the identity plane's serve
     //     cursor, memory arm. Assertion bodies shared with the sqlite and
     //     postgres arms; only the PLANT is backend-specific.
+
+    /// #682 — a key record signed a year ago and admitted now is still served
+    /// to a consumer whose cursor has passed that instant.
+    #[tokio::test]
+    async fn late_replicated_key_record_is_served_memory_682() {
+        let backend = MemoryBackend::new();
+        crate::federation::register::test_support::exercise_late_replicated_key_record_is_served(
+            &backend, "mem",
+        )
+        .await
+        .unwrap();
+    }
+
+    /// #668 — `limit + 2` rows sharing ONE admission instant page through with
+    /// every row seen exactly once.
+    ///
+    /// The tie is PLANTED because it cannot be produced through this backend's
+    /// write path: `monotonic_admission_instant` allocates strictly above the
+    /// last position, so two admissions here never collide. It is reachable in
+    /// production through the V126 backfill (every pre-existing row stamped
+    /// with its `scrub_timestamp`, and a batch from one producer shares one)
+    /// and through two writers racing the same `MAX`.
+    #[tokio::test]
+    async fn one_admission_instant_pages_exactly_once_memory_668() {
+        use crate::federation::register::test_support as rts;
+        let backend = MemoryBackend::new();
+        let ids: Vec<String> = (0..5).map(|i| format!("k668-mem-{i}")).collect();
+        for id in &ids {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: rts::self_scrubbed_record_signed_at(id, chrono::Utc::now()),
+                })
+                .await
+                .unwrap();
+        }
+
+        // THE TIE, as state: every row collapses onto one instant.
+        let tied_at = chrono::Utc::now();
+        {
+            let mut st = backend.state.lock().expect("memory backend lock");
+            for id in &ids {
+                st.key_record_admitted_at.insert(id.clone(), tied_at);
+            }
+        }
+
+        rts::assert_one_admission_instant_pages_exactly_once(&backend, "mem", &ids, 3)
+            .await
+            .unwrap();
+    }
+
+    /// #682 — the admission position survives a backward clock step on this
+    /// backend's real write path. The post-step state is planted directly; two
+    /// admissions under a forward clock would pass with `Utc::now()` and prove
+    /// nothing.
+    #[tokio::test]
+    async fn key_admission_survives_a_backward_clock_step_memory_682() {
+        use crate::federation::register::test_support as rts;
+        let backend = MemoryBackend::new();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: rts::self_scrubbed_record_signed_at("k682-mem-a", chrono::Utc::now()),
+            })
+            .await
+            .unwrap();
+
+        // THE BACKWARD STEP, as state: the last position handed out is now an
+        // hour ahead of the wall clock.
+        let future = chrono::Utc::now() + chrono::Duration::hours(1);
+        {
+            let mut st = backend.state.lock().expect("memory backend lock");
+            for v in st.key_record_admitted_at.values_mut() {
+                *v = future;
+            }
+        }
+
+        rts::assert_key_admission_survives_backward_step(&backend, "mem", future)
+            .await
+            .unwrap();
+    }
+
+    /// #682 — the allocator reads the same position expression the cursor
+    /// orders by (`key_record_position`, which falls back to
+    /// `scrub_timestamp`), not just the side map.
+    ///
+    /// Memory mirrors the sqlite dialect here: a row with no entry in
+    /// `key_record_admitted_at` has an effective position of its
+    /// `scrub_timestamp`, and an allocator blind to that stamps below it.
+    #[tokio::test]
+    async fn allocator_reads_the_fallback_position_memory_682() {
+        use crate::federation::register::test_support as rts;
+        let backend = MemoryBackend::new();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: rts::self_scrubbed_record_signed_at("k682-mem-fb", chrono::Utc::now()),
+            })
+            .await
+            .unwrap();
+
+        // THE UNSTAMPED ROW, as state: the side-map entry removed and the
+        // `scrub_timestamp` moved an hour ahead, so the fallback is the largest
+        // position in the map.
+        let fallback_at = chrono::Utc::now() + chrono::Duration::hours(1);
+        {
+            let mut st = backend.state.lock().expect("memory backend lock");
+            assert!(
+                st.key_record_admitted_at.remove("k682-mem-fb").is_some(),
+                "the fallback plant must remove a stamp that was actually there"
+            );
+            let row = st
+                .federation_keys
+                .get_mut("k682-mem-fb")
+                .expect("seeded row");
+            row.scrub_timestamp = fallback_at;
+        }
+
+        rts::assert_allocator_reads_the_fallback_position(
+            &backend,
+            "mem",
+            "k682-mem-fb",
+            fallback_at,
+        )
+        .await
+        .unwrap();
+    }
 
     fn fix_revocation(id: &str, revoked: &str, revoking: &str, scrub_key_id: &str) -> Revocation {
         // v21.0.0 (#502 E1) — real hybrid sig by the revoking key.
@@ -18451,6 +18591,19 @@ mod tests {
             }
         }
         ts::assert_attestation_tie_pages_exactly_once(&backend, "mem", &ids, 3).await;
+    }
+
+    /// v36.0.0 (CIRISPersist#707) — a consumer-visible key mutation moves the
+    /// SERVE POSITION on memory (adopt_scrub_upgrade skips — unimplemented
+    /// here); grant/revoke_trust do not.
+    #[tokio::test]
+    async fn key_mutation_moves_serve_position_memory_707() {
+        let backend = MemoryBackend::new();
+        crate::federation::operational::test_support::exercise_key_mutation_moves_serve_position(
+            &backend, "mem",
+        )
+        .await
+        .expect("707 serve-position exercise");
     }
 
     /// v31.0.0 (CIRISPersist#659) — a signed revocation de-admits the key it
@@ -22824,6 +22977,21 @@ mod tests {
         crate::federation::admission::r2_test_support::exercise_wire_refs_for_subject_resolve(
             &backend,
             "memory-634",
+        )
+        .await;
+    }
+
+    /// v31.0.0 (CIRISPersist#640) — the MEMORY leg (the CONTROL: memory
+    /// neither rounds timestamps nor normalizes `consent_role`, so it must be
+    /// green before and after the fix; a red here means the shared derivation
+    /// broke, not that the skew was caught).
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[tokio::test]
+    async fn nanosecond_key_wire_ref_resolves_memory_640() {
+        let backend = MemoryBackend::new();
+        crate::federation::admission::r2_test_support::exercise_nanosecond_key_wire_ref_resolves(
+            &backend,
+            "memory-640",
         )
         .await;
     }
