@@ -748,10 +748,12 @@ mod run {
             "I97: on A the human stewards the agent"
         );
         let mut crossed = 0;
-        for served in sa
-            .list_signed_identity_occurrences_since(None, 1_000)
-            .await
-            .unwrap()
+        for served in crate::federation::key_plane::test_support::served_identity_occurrences(
+            sa.as_dyn_directory(),
+            1_000,
+        )
+        .await
+        .unwrap()
         {
             if served.occurrence.identity_occurrence.occurrence_key_id == agent {
                 sb.put_identity_occurrence(served.occurrence)

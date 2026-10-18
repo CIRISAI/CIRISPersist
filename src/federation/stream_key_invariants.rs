@@ -693,13 +693,16 @@ pub(crate) mod bodies {
         b: &B,
         dev: &str,
     ) -> crate::federation::SignedIdentityOccurrence {
-        b.list_signed_identity_occurrences_since(None, 10_000)
-            .await
-            .unwrap()
-            .into_iter()
-            .find(|s| s.occurrence.identity_occurrence.occurrence_key_id == dev)
-            .expect("the device's signed occurrence")
-            .occurrence
+        crate::federation::key_plane::test_support::served_identity_occurrences(
+            b.as_dyn_directory(),
+            10_000,
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|s| s.occurrence.identity_occurrence.occurrence_key_id == dev)
+        .expect("the device's signed occurrence")
+        .occurrence
     }
 
     /// **I397b** (v53.0.0, #963) — a device first published under a server

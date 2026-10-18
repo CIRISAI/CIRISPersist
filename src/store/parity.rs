@@ -128,6 +128,39 @@ pub(crate) enum Class {
 ///   anything is stored. Classified by what they do, not what they are called.
 #[cfg(test)]
 pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
+    // v58.0.0 (CIRISPersist#991) — the key plane. The revocation door is one
+    // shared plan; every key-plane write keeps its row with it in the same
+    // transaction (storage, Plumbing: the row is a pure function of the record
+    // the door already admitted, and a record that does not verify is held
+    // without a row — never refused there). The attestation door hands a
+    // key-plane row to its family door (Delegates).
+    ("plan_put_revocation", Class::Delegates),
+    ("put_revocation_planned", Class::Plan),
+    ("revocations_for_subject", Class::Plumbing),
+    ("check_revocation_bound_lowers", Class::Gate),
+    ("revocation_row", Class::Plumbing),
+    ("apply_key_plane_row", Class::Delegates),
+    ("occurrence_withdrawal_of", Class::Plumbing),
+    ("put_identity_occurrence_revocation_local", Class::Plumbing),
+    ("rehome_legacy_key_plane", Class::Plumbing),
+    ("sqlite_sync_key_record_row", Class::Plumbing),
+    ("sqlite_sync_occurrence_row", Class::Plumbing),
+    ("sqlite_drop_key_record_rows", Class::Plumbing),
+    ("sqlite_key_projection_rebuild", Class::Plumbing),
+    ("sqlite_revocation_projection_rebuild", Class::Plumbing),
+    ("sqlite_occurrence_projection_rebuild", Class::Plumbing),
+    ("pg_sync_key_record_row", Class::Plumbing),
+    ("pg_sync_occurrence_row", Class::Plumbing),
+    ("pg_drop_key_record_rows", Class::Plumbing),
+    ("memory_signed_occurrence", Class::Plumbing),
+    ("index_plane_row", Class::Plumbing),
+    ("is_held_revocation", Class::Plumbing),
+    ("sqlite_key_plane_present", Class::Plumbing),
+    ("pg_key_plane_present", Class::Plumbing),
+    ("sqlite_insert_plane_row", Class::Plumbing),
+    ("pg_insert_plane_row", Class::Plumbing),
+    // The plan reads the backend's installed trust gate from its snapshot.
+    ("admission_cx", Class::Plumbing),
     // v57.0.0 (CIRISPersist#988 items 2, 3) — the hard_case and detection
     // doors. The two decisions are SHARED plans (pure; each backend's
     // in-transaction emitters call `plan_hard_case_row` inside their own
@@ -812,16 +845,12 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ),
     ("pg_row_to_family", Class::Delegates),
     ("pg_row_to_family_membership_revocation", Class::Delegates),
-    ("pg_row_to_identity_occurrence", Class::Delegates),
-    ("pg_row_to_identity_occurrence_revocation", Class::Delegates),
     ("pg_row_to_location_proof", Class::Delegates),
     ("pg_row_to_transport_destination", Class::Delegates),
-    ("pg_row_to_key_record", Class::Delegates),
     ("pg_row_to_org_membership", Class::Delegates),
     ("pg_row_to_organization", Class::Delegates),
     ("pg_row_to_partner_record", Class::Delegates),
     ("pg_row_to_peer_metadata_for_hash", Class::Delegates),
-    ("pg_row_to_revocation", Class::Delegates),
     ("pg_row_to_signed_community", Class::Delegates),
     (
         "pg_row_to_signed_community_membership_revocation",
@@ -847,11 +876,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("pg_row_to_signed_family", Class::Delegates),
     (
         "pg_row_to_signed_family_membership_revocation",
-        Class::Delegates,
-    ),
-    ("pg_row_to_signed_identity_occurrence", Class::Delegates),
-    (
-        "pg_row_to_signed_identity_occurrence_revocation",
         Class::Delegates,
     ),
     ("pg_row_to_signed_location_proof", Class::Delegates),
@@ -964,11 +988,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
         "sqlite_row_to_family_membership_revocation",
         Class::Delegates,
     ),
-    ("sqlite_row_to_identity_occurrence", Class::Delegates),
-    (
-        "sqlite_row_to_identity_occurrence_revocation",
-        Class::Delegates,
-    ),
     ("sqlite_row_to_location_proof", Class::Delegates),
     ("sqlite_row_to_transport_destination", Class::Delegates),
     ("sqlite_row_to_org_membership", Class::Delegates),
@@ -1005,11 +1024,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
         "sqlite_row_to_signed_family_membership_revocation",
         Class::Delegates,
     ),
-    ("sqlite_row_to_signed_identity_occurrence", Class::Delegates),
-    (
-        "sqlite_row_to_signed_identity_occurrence_revocation",
-        Class::Delegates,
-    ),
     ("sqlite_row_to_signed_location_proof", Class::Delegates),
     ("sqlite_row_to_signed_partner_record", Class::Delegates),
     (
@@ -1021,8 +1035,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // reference to `query_map`; the pair cursor reads `_pos` alongside the row,
     // so it is now called explicitly and propagates. Same class as every other
     // `sqlite_row_to_*` sibling.
-    ("sqlite_row_to_key_record", Class::Delegates),
-    ("sqlite_row_to_revocation", Class::Delegates),
     ("sqlite_row_to_stored_proposal", Class::Delegates),
     ("sqlite_row_tuple_to_peer_metadata", Class::Delegates),
     ("sqlite_upsert_wire_index", Class::Delegates),
@@ -1089,7 +1101,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("verify_receipt_signature", Class::Gate),
     ("verify_revocation_admission", Class::Gate),
     ("verify_signed_identity_occurrence", Class::Gate),
-    ("verify_signed_identity_occurrence_revocation", Class::Gate),
     ("verify_signed_touch_claim", Class::Gate),
     ("verify_signed_transport_destination", Class::Gate),
     ("verify_stream_sth_signature", Class::Gate),
@@ -1181,31 +1192,6 @@ pub(crate) const DECLARED_DIVERGENCES: &[DeclaredDivergence] = &[
                  its rehome plans nothing. Every row it does hold was planned by \
                  `plan_hard_case_row` at its own door.",
     },
-    DeclaredDivergence {
-        trait_name: "FederationDirectory",
-        method: "put_revocation",
-        backend: "memory",
-        expected: &[
-            "canonicalize_in_place",
-            "check_revocation_envelope_binding",
-            "check_federation",
-            "check_content_hash_hex",
-            "verify_revocation_admission",
-            "check_revocation_authority",
-            "check_observed_region",
-            "check_revocation_scrub_skew",
-            "check_revocation_bound",
-            "check_revocation_anti_rollback",
-        ],
-        reason: "The anti-rollback needs the newest stored `scrub_timestamp` for the subject. On \
-                 sqlite and postgres that is a query the door issues before it opens its write; \
-                 on memory it is a scan under the state lock, and taking the lock is what the \
-                 door does after `check_revocation_bound`. Running it under the SAME lock the \
-                 insert holds is STRONGER than the SQL position, not weaker — the read and the \
-                 write cannot race. Both gates are refusals that mutate nothing, so their \
-                 relative order is not observable in state, only in which message an operator \
-                 sees when a row violates both.",
-    },
     // v56.0.0 (CIRISPersist#934 door 4) — the `reseal_attestation_v31`
     // declaration that stood here is gone, and its reason was false. It said
     // the SQL backends "get that second answer from their transaction — they
@@ -1270,7 +1256,7 @@ mod tests {
     /// The traits whose impls are compared, and where each trait's **default**
     /// bodies live. A backend that does not override a defaulted method runs
     /// the default, so the default's gate sequence is what it contributes.
-    const TRAITS: [(&str, &str); 5] = [
+    const TRAITS: [(&str, &str); 6] = [
         ("FederationDirectory", "src/federation/mod.rs"),
         ("BlobStorage", "src/federation/blobs.rs"),
         ("Backend", "src/store/backend.rs"),
@@ -1280,15 +1266,19 @@ mod tests {
         ("AttestationStore", "src/federation/attestation_admit.rs"),
         // v57.0.0 (CIRISPersist#934 step 2) — the community plane's executor.
         ("CommunityStore", "src/federation/community_admit.rs"),
+        // v58.0.0 (CIRISPersist#991) — the key plane's executor.
+        ("KeyPlaneStore", "src/federation/key_plane.rs"),
     ];
 
     /// v56.0.0 (CIRISPersist#934) — the shared plans, read from their own
     /// files: `(file, fn)`. Each body is held to the same [`CALL_CLASSES`]
     /// partition as a backend door, and its sequence is what a door's
     /// `plan:NAME` token stands for.
-    const SHARED_PLANS: [(&str, &str); 16] = [
+    const SHARED_PLANS: [(&str, &str); 17] = [
         // v58.0.0 (CIRISPersist#1094 item 2).
         ("src/federation/subject_erasure.rs", "plan_store_erasure"),
+        // v58.0.0 (CIRISPersist#991) — the key plane.
+        ("src/federation/key_plane.rs", "put_revocation_planned"),
         // v57.0.0 (CIRISPersist#988 items 2, 3).
         ("src/federation/attestation_admit.rs", "plan_hard_case_row"),
         ("src/federation/attestation_admit.rs", "plan_detection_row"),
@@ -1348,7 +1338,13 @@ mod tests {
     /// this list on the commit that moves its decision into a plan, and
     /// cannot drift back: a gate added to one backend's copy fails
     /// [`shared_doors_decide_nothing_in_a_backend`].
-    const SHARED_DOORS: [(&str, &str, &str); 14] = [
+    const SHARED_DOORS: [(&str, &str, &str); 15] = [
+        // v58.0.0 (CIRISPersist#991) — the revocation door.
+        (
+            "FederationDirectory",
+            "put_revocation",
+            "put_revocation_planned",
+        ),
         (
             "FederationDirectory",
             "put_attestation_with_origin",

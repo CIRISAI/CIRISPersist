@@ -10278,39 +10278,6 @@ impl Engine {
     //    while NO host could enable the thing. These four are the doors an
     //    operator or a carrier actually calls.
 
-    /// v31.1.0 (CIRISPersist#655) — **serve** the key-level revocation plane:
-    /// bulk-list [`ServedRevocation`](crate::federation::ServedRevocation)s
-    /// since a cursor (`admitted_at > since`, ordered `(admitted_at ASC,
-    /// revocation_id ASC)`).
-    ///
-    /// The cursor is THIS node's admission order, not the producer's
-    /// `scrub_timestamp`; resume from the last element's `admitted_at`. Keying
-    /// on the signed instant hid a revocation signed before a consumer's
-    /// cursor and replicated after it — stored, and permanently unservable.
-    ///
-    /// The plane could be destroyed and never rebuilt before this: every
-    /// other replicated plane had a `list_signed_*_since` and this one did
-    /// not, so a DSAR erasure, an operator repair or a restored backup
-    /// removed an exclusion permanently and silently. A revocation row is
-    /// self-authenticating, so serving it ships evidence — the receiver
-    /// re-verifies the hybrid scrub signature against its own directory
-    /// inside [`Self::deregister_federation_key`].
-    /// v36.0.0 (CIRISPersist#668) — `since` is the
-    /// `(admitted_at, revocation_id)` PAIR from
-    /// [`ServedRevocation::resume_pair`](crate::federation::ServedRevocation::resume_pair):
-    /// resumed on the instant alone, a tie larger than one page silently
-    /// dropped its remainder — on the exclusion plane.
-    #[cfg(any(feature = "postgres", feature = "sqlite"))]
-    pub async fn list_signed_revocations_since(
-        &self,
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        limit: u32,
-    ) -> Result<Vec<crate::federation::ServedRevocation>, crate::federation::Error> {
-        self.federation_directory()
-            .list_signed_revocations_since(since, limit)
-            .await
-    }
-
     /// v31.1.0 (CIRISPersist#662) — **serve** the signed accord EVIDENCE
     /// plane: the proposal + its hybrid-signed participation set, bundled per
     /// proposal.
@@ -22684,11 +22651,20 @@ mod tests {
         // the backend, and returning exactly the seeded genesis rows shows
         // that better than an empty page did: an empty page is also what a
         // facade that dispatched nowhere would return.
+        // v58.0.0 (CIRISPersist#991) — the seeded holders' and the canonical
+        // server's key records are `key:record:v1` rows on the same plane.
         let ids: std::collections::BTreeSet<&str> = page
             .items
             .iter()
+            .filter(|a| !crate::federation::key_plane::is_key_plane_row(a))
             .map(|a| a.attestation_id.as_str())
             .collect();
+        assert!(
+            page.items
+                .iter()
+                .any(crate::federation::key_plane::is_key_plane_row),
+            "the seeded key records are on the plane"
+        );
         let baked: std::collections::BTreeSet<&str> =
             crate::federation::genesis::canonical_genesis_bundle()
                 .attestations

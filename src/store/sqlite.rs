@@ -130,6 +130,10 @@ pub struct SqliteBackend {
     /// (`from_shared*`) resolves lazily at its first DEK-plane door when
     /// this is still false (CIRISPersist#850 review).
     minter_sentinel_resolved: std::sync::atomic::AtomicBool,
+    /// v58.0.0 (CIRISPersist#991) — set once [`Self::rehome_legacy_key_plane`]
+    /// has run on this backend: the lazy rehome of the key-plane projections
+    /// written before V198.
+    key_plane_rehomed: std::sync::atomic::AtomicBool,
     /// v54.1.0 (CIRISPersist#1046) — `true` only between a test-only
     /// `run_migrations_through(v)` with `v` below V187 and the next full
     /// `run_migrations`: the schema predates the purge plane, so it holds no
@@ -807,6 +811,7 @@ impl SqliteBackend {
                 crate::federation::topology::DEFAULT_DELEGATION_DEPTH,
             ),
             minter_sentinel_resolved: std::sync::atomic::AtomicBool::new(false),
+            key_plane_rehomed: std::sync::atomic::AtomicBool::new(false),
             pre_purge_schema: std::sync::atomic::AtomicBool::new(false),
             admission_gate: std::sync::RwLock::new(None),
             self_key_id: std::sync::RwLock::new(None),
@@ -3122,9 +3127,40 @@ impl SqliteBackend {
     /// stored at this boundary, so a registration submitting the stored token
     /// used to index bytes `lookup_public_key` never returns.
     async fn index_stored_key_row(&self, key_id: &str) -> Result<(), crate::federation::Error> {
+        // v58.0.0 (CIRISPersist#991) — the key's record rides as its
+        // `key:record:v1` row: the entry is that row's (the Attestation kind).
+        let k = key_id.to_owned();
+        let row_id: Option<String> = self
+            .read(move |conn| {
+                if !sqlite_key_plane_present(conn)? {
+                    return Ok(None);
+                }
+                conn.query_row(
+                    "SELECT attestation_id FROM federation_keys WHERE key_id = ?1",
+                    [&k],
+                    |r| r.get::<_, Option<String>>(0),
+                )
+                .optional()
+            })
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("key row pointer: {e}")))?
+            .flatten();
+        self.index_plane_row(row_id.as_deref()).await
+    }
+
+    /// v58.0.0 (CIRISPersist#991) — index a key-plane row (minted inside a
+    /// door's transaction by `sqlite_insert_plane_row`) on the Attestation
+    /// kind, after the door committed.
+    async fn index_plane_row(
+        &self,
+        attestation_id: Option<&str>,
+    ) -> Result<(), crate::federation::Error> {
+        let Some(id) = attestation_id else {
+            return Ok(());
+        };
         self.index_stored_record(
-            "Key",
-            &crate::federation::wire_index::record_key(&[("key_id", key_id)]),
+            "Attestation",
+            &crate::federation::wire_index::record_key(&[("attestation_id", id)]),
         )
         .await
     }
@@ -3318,7 +3354,10 @@ impl SqliteBackend {
             let admitted_at = self.next_key_admission_position().await?;
             let kid = row.key_id.clone();
             self.write(move |conn| -> Result<(), rusqlite::Error> {
-                conn.execute(
+                // v58.0.0 (CIRISPersist#991) — the holder's record and its
+                // `key:record:v1` row, one transaction.
+                let tx = conn.transaction()?;
+                tx.execute(
                     "INSERT INTO federation_keys (\
                         key_id, pubkey_ed25519_base64, pubkey_ml_dsa_65_base64, algorithm, \
                         identity_type, identity_ref, valid_from, valid_until, registration_envelope, \
@@ -3356,7 +3395,8 @@ impl SqliteBackend {
                         admitted_at.to_rfc3339(),
                     ],
                 )?;
-                Ok(())
+                sqlite_sync_key_record_row(&tx, &row.key_id)?;
+                tx.commit()
             }).await
             .map_err(|e| {
                 crate::federation::Error::Backend(format!("genesis seed insert {kid}: {e}"))
@@ -3512,6 +3552,9 @@ impl SqliteBackend {
         // `SqliteBackend::index_stored_key_row`.
         let n = self
             .write(move |conn| -> Result<usize, rusqlite::Error> {
+                // v58.0.0 (CIRISPersist#991) — the write and its key-plane row, one transaction.
+                let tx = conn.transaction()?;
+                let conn: &rusqlite::Connection = &tx;
                 // v36.0.0 (CIRISPersist#707) — this door rewrites consumer-visible
                 // `KeyRecord` bytes, so it must MOVE the serve position or a
                 // consumer whose cursor has passed the row never learns it
@@ -3559,6 +3602,8 @@ impl SqliteBackend {
                         additional_scrubs_text,
                     ],
                 )?;
+                sqlite_sync_key_record_row(conn, &row.key_id)?;
+                tx.commit()?;
                 Ok(n)
             })
             .await
@@ -3742,12 +3787,18 @@ impl SqliteBackend {
         let k = kid.clone();
         let n = self
             .write(move |conn| -> Result<usize, rusqlite::Error> {
-                let mutated_at = sqlite_next_key_serve_position(conn)?;
-                conn.execute(
+                // v58.0.0 (CIRISPersist#991) — the repair and its key-plane row,
+                // one transaction.
+                let tx = conn.transaction()?;
+                let mutated_at = sqlite_next_key_serve_position(&tx)?;
+                let n = tx.execute(
                     "UPDATE federation_keys SET additional_scrubs = ?3, mutated_at = ?4 \
                      WHERE key_id = ?1 AND persist_row_hash = ?2 AND additional_scrubs = '[]'",
                     rusqlite::params![k, hash, text, mutated_at.to_rfc3339()],
-                )
+                )?;
+                sqlite_sync_key_record_row(&tx, &k)?;
+                tx.commit()?;
+                Ok(n)
             })
             .await
             .map_err(|e| {
@@ -3895,6 +3946,9 @@ impl SqliteBackend {
         // swap; see `SqliteBackend::index_stored_key_row`.
         let n = self
             .write(move |conn| -> Result<usize, rusqlite::Error> {
+                // v58.0.0 (CIRISPersist#991) — the write and its key-plane row, one transaction.
+                let tx = conn.transaction()?;
+                let conn: &rusqlite::Connection = &tx;
                 // v36.0.0 (CIRISPersist#707) — a canonical rotation rewrites the
                 // whole consumer-visible record; the serve position must move or
                 // a consumer past the cursor keeps the rotated-away version
@@ -3939,6 +3993,8 @@ impl SqliteBackend {
                         additional_scrubs_text,
                     ],
                 )?;
+                sqlite_sync_key_record_row(conn, &row.key_id)?;
+                tx.commit()?;
                 Ok(n)
             })
             .await
@@ -4198,6 +4254,10 @@ impl SqliteBackend {
                 if n == 0 {
                     return Ok(0);
                 }
+                // v58.0.0 (CIRISPersist#991) — the replaced claim leaves the
+                // plane (its bytes are in the history row above) and the new
+                // claim's row lands, in this transaction.
+                sqlite_sync_key_record_row(&tx, &row.key_id)?;
                 tx.commit()?;
                 Ok(n)
             })
@@ -5096,6 +5156,9 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         // see `SqliteBackend::index_stored_key_row`.
         let n = self
             .write(move |conn| -> Result<usize, rusqlite::Error> {
+                // v58.0.0 (CIRISPersist#991) — the write and its key-plane row, one transaction.
+                let tx = conn.transaction()?;
+                let conn: &rusqlite::Connection = &tx;
                 // v36.0.0 (CIRISPersist#707) — a genesis re-anchor rewrites the
                 // whole consumer-visible record; the serve position must move or
                 // a consumer past the cursor keeps the pre-anchor row forever.
@@ -5137,6 +5200,8 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                         additional_scrubs_text,
                     ],
                 )?;
+                sqlite_sync_key_record_row(conn, &row.key_id)?;
+                tx.commit()?;
                 Ok(n)
             })
             .await
@@ -5154,17 +5219,6 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         &self,
         record: crate::federation::SignedKeyRecord,
     ) -> Result<crate::federation::register::ReplicatedKeyOutcome, crate::federation::Error> {
-        // v52.0.0 (CIRISPersist#672) — a re-offer of a held record settles here,
-        // before any verification (`replication_policy::settle_if_held`).
-        if crate::federation::replication_policy::settle_if_held(
-            self,
-            crate::federation::replication_policy::EnvelopeKind::Key,
-            &record,
-        )
-        .await?
-        {
-            return Ok(crate::federation::register::ReplicatedKeyOutcome::Unchanged);
-        }
         SqliteBackend::apply_replicated_key_record(self, record).await
     }
 
@@ -6621,196 +6675,9 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         &self,
         revocation: crate::federation::SignedRevocation,
     ) -> Result<(), crate::federation::Error> {
-        // v52.0.0 (CIRISPersist#672) — a re-offer of a held record settles here,
-        // before any verification (`replication_policy::settle_if_held`).
-        if crate::federation::replication_policy::settle_if_held(
-            self,
-            crate::federation::replication_policy::EnvelopeKind::Revocation,
-            &revocation,
-        )
-        .await?
-        {
-            return Ok(());
-        }
-        let mut row = revocation.revocation;
-        // v31.0.0 (CIRISPersist#647) — CANONICAL AT REST: the revocation
-        // envelope is stored as the JCS bytes its scrub signature and
-        // `original_content_hash` cover, so the stored column sha256sums to
-        // the declared hash. Idempotent, therefore signature-transparent.
-        crate::federation::canonical_at_rest::canonicalize_in_place(&mut row.revocation_envelope)?;
-
-        // v31.0.0 (CIRISPersist#659) — THE SUBJECT, BEFORE ANYTHING ELSE. The
-        // signature covers `revocation_envelope` and nothing else, so
-        // `revoked_key_id` / `revocation_id` / the instants were columns a
-        // relay could rewrite while the signature still verified — one
-        // conferred moderator's revocation, re-pasted at any key. Pure
-        // function of the row (AV-76 tier 1), run ahead of the trust gate and
-        // the authority resolution so the refusal never depends on roster,
-        // trust score or custody state.
-        crate::federation::admission::check_revocation_envelope_binding(&row)?;
-
-        // v3.4.0 (CIRISPersist#123) — trust gate first; the revoking
-        // key is the attester.
-        if !row.revoking_key_id.is_empty() {
-            if let Some(gate) = self.admission_gate() {
-                gate.check_federation(&row.revoking_key_id).await?;
-            }
-        }
-
-        // v31.0.0 (CIRISPersist#660) — `original_content_hash` must be hex,
-        // STATED. The `hex::decode` at bind time refuses the same values but
-        // only as a side effect of binding a BLOB, which is why the memory
-        // backend — binding nothing — accepted them. Placed HERE, ahead of the
-        // signature verify, on all three backends: `verify_revocation_admission`
-        // also cross-checks the hash, so a hex check sitting behind it on one
-        // backend and ahead of it on another would give two different refusals
-        // for one row.
-        crate::federation::admission::check_content_hash_hex(
-            "original_content_hash",
-            &row.original_content_hash,
-        )?;
-
-        // v21.0.0 (CIRISPersist#502 E1) — mechanistic authorship: the
-        // revocation MUST be hybrid-Strict-signed by its declared revoking
-        // key, resolved from OUR registered directory (was FK + trust-score
-        // only; scrub sig stored, never verified → forgeable de-peer DoS).
-        crate::federation::verify_revocation_admission(self, &row).await?;
-
-        // v3.11.0 (CIRISPersist#143) — region closed-set gate +
-        // anti-rollback monotonicity. Both run BEFORE persist_row_hash
-        // is computed and BEFORE INSERT, so a rejected row leaves no
-        // trace (same discipline as v3.9.1 cohort_scope admission).
-        // v30.8.0 (CIRISPersist#596 item 1) — revoking SOMEONE ELSE'S key is a
-        // moderation act. Self-revocation passes untouched.
-        crate::federation::admission::check_revocation_authority(self, &row).await?;
-        crate::federation::check_observed_region(&row.observed_region)?;
-        // v31.0.0 (CIRISPersist#659) — the anti-rollback DUAL, before the floor.
-        // See `check_revocation_scrub_skew`: the floor makes `scrub_timestamp` a
-        // monotonic latch on a key's whole de-admission history, and without a
-        // ceiling one self-signed revocation dated far enough forward makes its
-        // own subject immune to every later de-admission.
-        crate::federation::admission::check_revocation_scrub_skew(
-            &row,
-            chrono::Utc::now(),
-            crate::federation::admission::DEFAULT_MAX_TOUCH_SKEW,
-        )?;
-        // v52.0.0 (#784) — per SUBJECT, and the subject is the digest: an
-        // older revocation under another label of the same key cannot roll
-        // back a newer one.
-        check_revocation_anti_rollback_sqlite(
-            self,
-            &row.revoked_key_sha256_ed25519_raw,
-            row.scrub_timestamp,
-        )
-        .await?;
-
-        // v25.1.0 (CIRISPersist#570 ask 4) — the history bound must be the
-        // one that was SIGNED, and must be coherent with `effective_at`.
-        // Runs here, before persist_row_hash and before INSERT, so a refused
-        // bound leaves no trace (AV-9). See `check_revocation_bound`.
-        crate::federation::check_revocation_bound(&row)?;
-
-        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
-
-        let original_content_hash = hex::decode(&row.original_content_hash).map_err(|e| {
-            crate::federation::Error::InvalidArgument(format!(
-                "original_content_hash hex decode: {e}"
-            ))
-        })?;
-        let revocation_envelope_text = serde_json::to_string(&row.revocation_envelope)
-            .map_err(|e| crate::federation::Error::Backend(format!("envelope serialize: {e}")))?;
-
-        // v31.1.0 (CIRISPersist#655) — the wire-index locator, derived before
-        // the INSERT closure takes `row` by move.
-        let wire_index_key = crate::federation::wire_index::record_key(&[
-            (
-                "revoked_key_sha256_ed25519_raw",
-                row.revoked_key_sha256_ed25519_raw.as_str(),
-            ),
-            ("revocation_id", row.revocation_id.as_str()),
-        ]);
-        // THIS node's admission position (V123). Not the producer's clock —
-        // `scrub_timestamp` is their assertion, and a late-replicated old one
-        // would sort behind every consumer's cursor — and not the local wall
-        // clock either: a backward step would stamp a later row below a cursor
-        // a consumer already passed, and `> since` would skip it forever. The
-        // position is allocated strictly after the last one handed out; see
-        // `monotonic_admission_instant`. CIRISPersist#829 — read on a reader;
-        // this was never the same lock acquisition as the INSERT below (the
-        // block released the guard before the write closure took it), so
-        // moving the read off the writer changes nothing about the window.
-        let admitted_at = {
-            let last: Option<String> = self
-                .read(move |conn| {
-                    conn.query_row(
-                        "SELECT MAX(admitted_at) FROM federation_revocations",
-                        [],
-                        |r| r.get(0),
-                    )
-                    .optional()
-                })
-                .await
-                .map_err(|e| crate::federation::Error::Backend(format!("last admitted_at: {e}")))?
-                .flatten();
-            crate::federation::types::monotonic_admission_instant(
-                chrono::Utc::now(),
-                last.as_deref().map(parse_rfc3339),
-            )
-        };
-
-        self.write(move |conn| -> Result<(), rusqlite::Error> {
-            conn.execute(
-                // v31.1.0 (CIRISPersist#655) — `admitted_at` (V123) is THIS
-                // node's position in its own stream, stamped here and never
-                // read from the wire. The serve cursor keys on it.
-                "INSERT INTO federation_revocations (\
-                    revocation_id, revoked_key_id, revoking_key_id, reason, \
-                    revoked_at, effective_at, revocation_envelope, \
-                    original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
-                    scrub_key_id, scrub_timestamp, pqc_completed_at, observed_region, \
-                    revoked_after, persist_row_hash, admitted_at, revoked_key_sha256_ed25519_raw\
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, \
-                    ?16, ?17, ?18)",
-                rusqlite::params![
-                    row.revocation_id,
-                    row.revoked_key_id,
-                    row.revoking_key_id,
-                    row.reason,
-                    row.revoked_at.to_rfc3339(),
-                    row.effective_at.to_rfc3339(),
-                    revocation_envelope_text,
-                    original_content_hash,
-                    row.scrub_signature_classical,
-                    row.scrub_signature_pqc,
-                    row.scrub_key_id,
-                    row.scrub_timestamp.to_rfc3339(),
-                    row.pqc_completed_at.map(|t| t.to_rfc3339()),
-                    row.observed_region,
-                    row.revoked_after.map(|t| t.to_rfc3339()),
-                    row.persist_row_hash,
-                    admitted_at.to_rfc3339(),
-                    row.revoked_key_sha256_ed25519_raw,
-                ],
-            )?;
-            Ok(())
-        })
-        .await
-        .map_err(|e| {
-            let msg = e.to_string();
-            if msg.contains("FOREIGN KEY") {
-                crate::federation::Error::InvalidArgument(format!(
-                    "FK constraint violated on revocation insert: {msg}"
-                ))
-            } else {
-                crate::federation::Error::Backend(format!("insert revocation: {msg}"))
-            }
-        })?;
-        // v31.1.0 (CIRISPersist#655) — the key-level revocation plane joins the
-        // shared `signed_wire_index`. Runs after the connection lock is
-        // released: `index_stored_record` reloads through the read path.
-        self.index_stored_record("Revocation", &wire_index_key)
-            .await?;
-        Ok(())
+        // v58.0.0 (CIRISPersist#991) — one plan for every backend
+        // (`key_plane::plan_put_revocation`); this backend stores.
+        crate::federation::key_plane::put_revocation_planned(self, revocation).await
     }
 
     async fn revocations_for_subject(
@@ -6844,21 +6711,11 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         &self,
         occurrence: crate::federation::SignedIdentityOccurrence,
     ) -> Result<(), crate::federation::Error> {
-        // v52.0.0 (CIRISPersist#672) — a re-offer of a held record settles here,
-        // before any verification (`replication_policy::settle_if_held`).
-        if crate::federation::replication_policy::settle_if_held(
-            self,
-            crate::federation::replication_policy::EnvelopeKind::IdentityOccurrence,
-            &occurrence,
-        )
-        .await?
-        {
-            return Ok(());
-        }
         // v14.0.0 (CIRISPersist#418) — verify the hybrid signature over the exact
         // producer envelope, the signer's authority, and §5.6.8.8.2 C4 key
         // separation BEFORE any write. ONE gate for HTTP + wire; fail-secure.
         crate::federation::admission::verify_signed_identity_occurrence(self, &occurrence).await?;
+        self.rehome_legacy_key_plane().await?;
 
         let crate::federation::SignedIdentityOccurrence {
             identity_occurrence: mut row,
@@ -6899,14 +6756,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             .as_ref()
             .map(|tb| tb.project_route(&row.occurrence_key_id, row.asserted_at))
             .transpose()?;
-        // v21.1.0 (CIRISPersist#507b) — compute the wire-index entry from the
-        // exact `SignedIdentityOccurrence` `list_signed_identity_occurrences_since`
-        // would re-serialize, BEFORE the closure below moves `row` /
-        // `attesting_key_id` / `signed_envelope` / `signature`.
-        let wire_index_key = crate::federation::wire_index::record_key(&[
-            ("identity_key_id", &row.identity_key_id),
-            ("occurrence_key_id", &row.occurrence_key_id),
-        ]);
+        let pair = (row.identity_key_id.clone(), row.occurrence_key_id.clone());
         let occurrence_applied = self
             .write(move |conn| -> Result<usize, rusqlite::Error> {
                 // Last-signed-wins: UPSERT only when the incoming `asserted_at` is
@@ -6976,6 +6826,10 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     Some(signed_envelope_json.as_str()),
                     Some(signature_json.as_str()),
                 )?;
+                // v58.0.0 (CIRISPersist#991) — the pair's
+                // `identity:occurrence:v1` row follows the current signed
+                // occurrence, in this transaction.
+                sqlite_sync_occurrence_row(&tx, &row.identity_key_id, &row.occurrence_key_id)?;
                 tx.commit()?;
                 Ok(applied)
             })
@@ -6995,8 +6849,24 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                 crate::federation::FederationDirectory::put_transport_destination(self, route)
                     .await?;
             }
-            self.index_stored_record("IdentityOccurrence", &wire_index_key)
-                .await?;
+            // v58.0.0 (CIRISPersist#991) — the pair's `identity:occurrence:v1`
+            // row is the wire-index entry (the Attestation kind).
+            let occurrence_row_id: Option<String> = self
+                .read(move |conn| {
+                    conn.query_row(
+                        "SELECT attestation_id FROM federation_identity_occurrences \
+                          WHERE identity_key_id = ?1 AND occurrence_key_id = ?2",
+                        rusqlite::params![pair.0, pair.1],
+                        |r| r.get::<_, Option<String>>(0),
+                    )
+                    .optional()
+                })
+                .await
+                .map_err(|e| {
+                    crate::federation::Error::Backend(format!("occurrence row pointer: {e}"))
+                })?
+                .flatten();
+            self.index_plane_row(occurrence_row_id.as_deref()).await?;
         }
         // v50.0.0 (CIRISPersist#916) — a member's device occurrence arriving
         // (typically after its owner-binding): this node re-wraps its own
@@ -8597,105 +8467,6 @@ impl crate::federation::FederationDirectory for SqliteBackend {
 
     // ─── v4.8.0 (CIRISPersist#161, CEG §11.7.1) — membership revocations.
 
-    async fn put_identity_occurrence_revocation(
-        &self,
-        revocation: crate::federation::SignedIdentityOccurrenceRevocation,
-    ) -> Result<(), crate::federation::Error> {
-        // v52.0.0 (CIRISPersist#672) — a re-offer of a held record settles here,
-        // before any verification (`replication_policy::settle_if_held`).
-        if crate::federation::replication_policy::settle_if_held(
-            self,
-            crate::federation::replication_policy::EnvelopeKind::IdentityOccurrenceRevocation,
-            &revocation,
-        )
-        .await?
-        {
-            return Ok(());
-        }
-        // v16.0.0 (CIRISPersist#421) — verify the signature gate BEFORE any
-        // write (the revocation-plane mirror of the #418 occurrence gate): an
-        // unsigned terminal revocation on the wire is a permanent-DoS forgery.
-        crate::federation::admission::verify_signed_identity_occurrence_revocation(
-            self,
-            &revocation,
-        )
-        .await?;
-        let crate::federation::SignedIdentityOccurrenceRevocation {
-            identity_occurrence_revocation: mut row,
-            attesting_key_id,
-            signed_envelope,
-            signature,
-        } = revocation;
-        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
-        let witness = serde_json::to_string(&row.witness_set)
-            .map_err(|e| crate::federation::Error::Backend(format!("witness_set encode: {e}")))?;
-        let signed_envelope_json = serde_json::to_string(&signed_envelope)
-            .map_err(|e| crate::federation::Error::Backend(format!("signed_envelope: {e}")))?;
-        let signature_json = serde_json::to_string(&signature)
-            .map_err(|e| crate::federation::Error::Backend(format!("signature: {e}")))?;
-        // v21.1.0 (CIRISPersist#507b) — computed before the closure moves
-        // `row` / `attesting_key_id` / `signed_envelope` / `signature`.
-        let wire_index_key = crate::federation::wire_index::record_key(&[
-            ("identity_key_id", &row.identity_key_id),
-            ("occurrence_key_id", &row.occurrence_key_id),
-        ]);
-        self.write(move |conn| -> Result<(), rusqlite::Error> {
-            // v36.0.0 (#668) — THIS node's serve position (V130).
-            let admitted_at = sqlite_next_plane_position(
-                conn,
-                "federation_identity_occurrence_revocations",
-                POS_REVOKED,
-            )?;
-            conn.execute(
-                "INSERT INTO federation_identity_occurrence_revocations (\
-                    identity_key_id, occurrence_key_id, revoked_at, effective_at, \
-                    reason, witness_set, persist_row_hash, \
-                    attesting_key_id, signed_envelope, signature, admitted_at\
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-                rusqlite::params![
-                    row.identity_key_id,
-                    row.occurrence_key_id,
-                    row.revoked_at.to_rfc3339(),
-                    row.effective_at.to_rfc3339(),
-                    row.reason,
-                    witness,
-                    row.persist_row_hash,
-                    attesting_key_id,
-                    signed_envelope_json,
-                    signature_json,
-                    admitted_at.to_rfc3339(),
-                ],
-            )?;
-            // #446 de-projection (the projection's inverse): retire the LOCAL
-            // derived route materialized from this occurrence's binding — else
-            // a revoked occurrence leaves a live routable peer. Narrow on
-            // purpose: only the signed-column-free projected/local row; a live
-            // SIGNED route retires via its own #443 signed-tombstone plane.
-            // v36.0.0 (#668/#707-class) — a retirement is a consumer-visible
-            // rewrite (tombstones must gossip), so the route's serve position
-            // moves with it.
-            let route_admitted_at =
-                sqlite_next_plane_position(conn, "transport_destinations", POS_ASSERTED)?;
-            conn.execute(
-                "UPDATE transport_destinations SET retired_at = ?1, admitted_at = ?4 \
-                 WHERE occurrence_key_id = ?2 AND transport_kind = ?3 \
-                   AND signature IS NULL AND retired_at IS NULL",
-                rusqlite::params![
-                    row.revoked_at.to_rfc3339(),
-                    row.occurrence_key_id,
-                    crate::federation::types::OccurrenceTransportBinding::TRANSPORT_KIND,
-                    route_admitted_at.to_rfc3339(),
-                ],
-            )?;
-            Ok(())
-        })
-        .await
-        .map_err(map_revocation_sqlite_err("identity_occurrence_revocation"))?;
-        self.index_stored_record("IdentityOccurrenceRevocation", &wire_index_key)
-            .await?;
-        Ok(())
-    }
-
     async fn put_identity_occurrence_revocation_local(
         &self,
         revocation: crate::federation::IdentityOccurrenceRevocation,
@@ -9035,38 +8806,6 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         .map_err(|e| {
             crate::federation::Error::Backend(format!(
                 "list_identity_occurrence_revocations_for: {e}"
-            ))
-        })
-    }
-
-    async fn list_signed_identity_occurrence_revocations_for(
-        &self,
-        identity_key_id: &str,
-    ) -> Result<Vec<crate::federation::SignedIdentityOccurrenceRevocation>, crate::federation::Error>
-    {
-        let key = identity_key_id.to_owned();
-        self.read(move |conn| -> Result<Vec<_>, rusqlite::Error> {
-            // #421 replication read: only signed-put rows carry the signature
-            // container; trusted-local rows (NULL sig cols) are omitted.
-            let mut stmt = conn.prepare(
-                "SELECT identity_key_id, occurrence_key_id, revoked_at, effective_at, \
-                        reason, witness_set, persist_row_hash, \
-                        attesting_key_id, signed_envelope, signature \
-                     FROM federation_identity_occurrence_revocations \
-                     WHERE identity_key_id = ?1 \
-                       AND attesting_key_id IS NOT NULL \
-                       AND signed_envelope IS NOT NULL \
-                       AND signature IS NOT NULL \
-                     ORDER BY occurrence_key_id ASC",
-            )?;
-            let rows =
-                stmt.query_map([&key], sqlite_row_to_signed_identity_occurrence_revocation)?;
-            rows.collect()
-        })
-        .await
-        .map_err(|e| {
-            crate::federation::Error::Backend(format!(
-                "list_signed_identity_occurrence_revocations_for: {e}"
             ))
         })
     }
@@ -11348,106 +11087,6 @@ impl crate::federation::FederationDirectory for SqliteBackend {
     // ─── v21.1.0 (CIRISPersist#507c) — bulk signed-since reads for the 5
     //     PRIMARY signed planes.
 
-    async fn list_signed_key_records_since(
-        &self,
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        limit: u32,
-    ) -> Result<Vec<crate::federation::ServedKeyRecord>, crate::federation::Error> {
-        // v31.4.0 (#682/#668) — the serve-position expression matches the
-        // index exactly, and covers the row this dialect cannot force NOT
-        // NULL. The resume compares the PAIR, so a tie larger than one page
-        // continues instead of losing its remainder.
-        // v36.0.0 (#707) — the position is [`KEY_SERVE_POSITION_SQLITE`]:
-        // `admitted_at` OR `mutated_at`, whichever is greater, so a row
-        // rewritten through a mutating door moves FORWARD in the stream and a
-        // consumer past it is served the new bytes again.
-        let since_at = since.as_ref().map(|(t, _)| t.to_rfc3339());
-        let since_id = since.as_ref().map(|(_, id)| id.clone());
-        self.read(move |conn| -> Result<Vec<_>, rusqlite::Error> {
-            let mut stmt = conn.prepare(&format!(
-                "SELECT *, {pos} AS _pos FROM federation_keys \
-                 WHERE (?1 IS NULL OR \
-                        {pos} > ?1 OR \
-                        ({pos} = ?1 AND key_id > ?2)) \
-                 ORDER BY {pos} ASC, key_id ASC LIMIT ?3",
-                pos = KEY_SERVE_POSITION_SQLITE,
-            ))?;
-            let rows = stmt.query_map(rusqlite::params![since_at, since_id, limit], |row| {
-                let pos: String = row.get("_pos")?;
-                Ok((sqlite_row_to_key_record(row)?, pos))
-            })?;
-            let mut out = Vec::new();
-            for r in rows {
-                let (record, pos) = r?;
-                out.push((record, pos));
-            }
-            Ok(out)
-        })
-        .await
-        .map_err(|e| {
-            crate::federation::Error::Backend(format!("list_signed_key_records_since: {e}"))
-        })?
-        .into_iter()
-        .map(|(record, pos)| {
-            Ok(crate::federation::ServedKeyRecord {
-                admitted_at: parse_rfc3339(&pos),
-                record,
-            })
-        })
-        .collect()
-    }
-
-    /// v31.1.0 (CIRISPersist#655) — the exclusion plane's serve cursor. Every
-    /// row is signed (`scrub_signature_classical` is `NOT NULL`), so — as with
-    /// `list_signed_key_records_since` — no signed-only filter applies.
-    async fn list_signed_revocations_since(
-        &self,
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        limit: u32,
-    ) -> Result<Vec<crate::federation::ServedRevocation>, crate::federation::Error> {
-        let since_at = since.as_ref().map(|(t, _)| t.to_rfc3339());
-        let since_id = since.as_ref().map(|(_, id)| id.clone());
-        self.read(move |conn| -> Result<Vec<_>, rusqlite::Error> {
-            // v31.1.0 (CIRISPersist#655) — keyed on `admitted_at` (V123), THIS
-            // node's admission order, never the producer's `scrub_timestamp`.
-            // `COALESCE` covers a row written before the column existed — the
-            // same fallback the V123 backfill applies.
-            // v36.0.0 (#668) — resumed on the PAIR: V123 gave this plane the
-            // right CLOCK but the resume was still the instant alone, so a
-            // tie larger than one page silently dropped its remainder — on
-            // the EXCLUSION plane, where a miss is a revoked key trusted.
-            let mut stmt = conn.prepare(
-                "SELECT revocation_id, revoked_key_id, revoking_key_id, reason, \
-                        revoked_at, effective_at, revocation_envelope, \
-                        original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
-                        scrub_key_id, scrub_timestamp, pqc_completed_at, observed_region, \
-                        revoked_after, persist_row_hash, revoked_key_sha256_ed25519_raw, \
-                        COALESCE(admitted_at, scrub_timestamp) AS admitted_at \
-                 FROM federation_revocations \
-                 WHERE (?1 IS NULL OR COALESCE(admitted_at, scrub_timestamp) > ?1 OR \
-                        (COALESCE(admitted_at, scrub_timestamp) = ?1 AND revocation_id > ?2)) \
-                 ORDER BY COALESCE(admitted_at, scrub_timestamp) ASC, revocation_id ASC \
-                 LIMIT ?3",
-            )?;
-            let rows = stmt.query_map(rusqlite::params![since_at, since_id, limit], |row| {
-                let admitted_at: String = row.get("admitted_at")?;
-                Ok(crate::federation::ServedRevocation {
-                    revocation: sqlite_row_to_revocation(row)?,
-                    admitted_at: parse_rfc3339(&admitted_at),
-                })
-            })?;
-            let mut out = Vec::new();
-            for r in rows {
-                out.push(r?);
-            }
-            Ok(out)
-        })
-        .await
-        .map_err(|e| {
-            crate::federation::Error::Backend(format!("list_signed_revocations_since: {e}"))
-        })
-    }
-
     /// v31.1.0 (CIRISPersist#662) — the signed accord EVIDENCE cursor. `limit`
     /// pages PROPOSALS; the participation set for each is assembled by the
     /// shared
@@ -11522,58 +11161,6 @@ impl crate::federation::FederationDirectory for SqliteBackend {
     ) -> Result<crate::federation::accord_carriage::AccordEvidenceAdmission, crate::federation::Error>
     {
         crate::federation::accord_carriage::admit_replicated_accord_evidence(self, evidence).await
-    }
-
-    async fn list_signed_identity_occurrences_since(
-        &self,
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        limit: u32,
-    ) -> Result<Vec<crate::federation::ServedIdentityOccurrence>, crate::federation::Error> {
-        let since_at = since.as_ref().map(|(t, _)| t.to_rfc3339());
-        let (since_a, since_b) = match since.as_ref() {
-            Some((_, id)) => {
-                let [a, b] = crate::federation::types::split_resume_id::<2>(id);
-                (Some(a.to_owned()), Some(b.to_owned()))
-            }
-            None => (None, None),
-        };
-        self.read(move |conn| -> Result<Vec<_>, rusqlite::Error> {
-            // Signed-put rows only (trusted-local NULL sig cols omitted) —
-            // same contract as `list_signed_identity_occurrences_for`.
-            let mut stmt = conn.prepare(&format!(
-                "SELECT identity_key_id, occurrence_key_id, device_class, \
-                        hardware_attestation, asserted_at, valid_until, persist_row_hash, \
-                        pubkey_x25519_base64, pubkey_ml_kem_768_base64, transport_binding, \
-                        attesting_key_id, signed_envelope, signature, {pos} AS _pos \
-                     FROM federation_identity_occurrences \
-                     WHERE (?1 IS NULL OR {pos} > ?1 OR ({pos} = ?1 AND \
-                            (identity_key_id > ?2 OR (identity_key_id = ?2 \
-                             AND occurrence_key_id > ?3)))) \
-                       AND attesting_key_id IS NOT NULL \
-                       AND signed_envelope IS NOT NULL \
-                       AND signature IS NOT NULL \
-                     ORDER BY {pos} ASC, identity_key_id ASC, occurrence_key_id ASC \
-                     LIMIT ?4",
-                pos = POS_ASSERTED,
-            ))?;
-            let rows = stmt.query_map(
-                rusqlite::params![since_at, since_a, since_b, limit],
-                |row| {
-                    let pos: String = row.get("_pos")?;
-                    Ok(crate::federation::ServedIdentityOccurrence {
-                        occurrence: sqlite_row_to_signed_identity_occurrence(row)?,
-                        admitted_at: parse_rfc3339(&pos),
-                    })
-                },
-            )?;
-            rows.collect()
-        })
-        .await
-        .map_err(|e| {
-            crate::federation::Error::Backend(format!(
-                "list_signed_identity_occurrences_since: {e}"
-            ))
-        })
     }
 
     async fn list_signed_transport_destinations_since(
@@ -11731,58 +11318,6 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             })
     }
 
-    async fn list_signed_identity_occurrence_revocations_since(
-        &self,
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        limit: u32,
-    ) -> Result<Vec<crate::federation::ServedIdentityOccurrenceRevocation>, crate::federation::Error>
-    {
-        let since_at = since.as_ref().map(|(t, _)| t.to_rfc3339());
-        let (since_a, since_b) = match since.as_ref() {
-            Some((_, id)) => {
-                let [a, b] = crate::federation::types::split_resume_id::<2>(id);
-                (Some(a.to_owned()), Some(b.to_owned()))
-            }
-            None => (None, None),
-        };
-        self.read(move |conn| -> Result<Vec<_>, rusqlite::Error> {
-            // Signed-put rows only — same contract as
-            // `list_signed_identity_occurrence_revocations_for`.
-            let mut stmt = conn.prepare(&format!(
-                "SELECT identity_key_id, occurrence_key_id, revoked_at, effective_at, \
-                        reason, witness_set, persist_row_hash, \
-                        attesting_key_id, signed_envelope, signature, {pos} AS _pos \
-                     FROM federation_identity_occurrence_revocations \
-                     WHERE (?1 IS NULL OR {pos} > ?1 OR ({pos} = ?1 AND \
-                            (identity_key_id > ?2 OR (identity_key_id = ?2 \
-                             AND occurrence_key_id > ?3)))) \
-                       AND attesting_key_id IS NOT NULL \
-                       AND signed_envelope IS NOT NULL \
-                       AND signature IS NOT NULL \
-                     ORDER BY {pos} ASC, identity_key_id ASC, occurrence_key_id ASC \
-                     LIMIT ?4",
-                pos = POS_REVOKED,
-            ))?;
-            let rows = stmt.query_map(
-                rusqlite::params![since_at, since_a, since_b, limit],
-                |row| {
-                    let pos: String = row.get("_pos")?;
-                    Ok(crate::federation::ServedIdentityOccurrenceRevocation {
-                        revocation: sqlite_row_to_signed_identity_occurrence_revocation(row)?,
-                        admitted_at: parse_rfc3339(&pos),
-                    })
-                },
-            )?;
-            rows.collect()
-        })
-        .await
-        .map_err(|e| {
-            crate::federation::Error::Backend(format!(
-                "list_signed_identity_occurrence_revocations_since: {e}"
-            ))
-        })
-    }
-
     // ─── v21.1.0 (CIRISPersist#507b) — the shared signed-wire content-hash
     //     index (V111 `signed_wire_index`).
 
@@ -11884,10 +11419,14 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         let now_str = now.to_rfc3339();
         let n = self
             .write(move |conn| -> Result<usize, rusqlite::Error> {
+                // v58.0.0 (CIRISPersist#991) — a completed hybrid is when a
+                // record can first prove possession: its `key:record:v1` row
+                // lands in the completion's transaction.
+                let tx = conn.transaction()?;
                 // v36.0.0 (CIRISPersist#707) — the hybrid-completion write rewrites
                 // FOUR served columns; the serve position must move with them.
-                let mutated_at = sqlite_next_key_serve_position(conn)?;
-                conn.execute(
+                let mutated_at = sqlite_next_key_serve_position(&tx)?;
+                let n = tx.execute(
                     "UPDATE federation_keys \
                  SET pubkey_ml_dsa_65_base64 = ?1, scrub_signature_pqc = ?2, \
                      pqc_completed_at = ?3, persist_row_hash = ?4, mutated_at = ?6 \
@@ -11900,7 +11439,10 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                         key_id_for_exec,
                         mutated_at.to_rfc3339()
                     ],
-                )
+                )?;
+                sqlite_sync_key_record_row(&tx, &key_id_for_exec)?;
+                tx.commit()?;
+                Ok(n)
             })
             .await
             .map_err(|e| {
@@ -12533,71 +12075,6 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         ))
     }
 
-    async fn attach_revocation_pqc_signature(
-        &self,
-        revocation_id: &str,
-        scrub_signature_pqc: &str,
-    ) -> Result<(), crate::federation::Error> {
-        let id = revocation_id.to_owned();
-        let row_opt = self
-            .read(
-                move |conn| -> Result<Option<crate::federation::Revocation>, rusqlite::Error> {
-                    conn.query_row(
-                        "SELECT revocation_id, revoked_key_id, revoking_key_id, reason, \
-                        revoked_at, effective_at, revocation_envelope, \
-                        original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
-                        scrub_key_id, scrub_timestamp, pqc_completed_at, observed_region, \
-                        revoked_after, persist_row_hash, revoked_key_sha256_ed25519_raw \
-                     FROM federation_revocations WHERE revocation_id = ?1",
-                        [&id],
-                        sqlite_row_to_revocation,
-                    )
-                    .optional()
-                },
-            )
-            .await
-            .map_err(|e| crate::federation::Error::Backend(format!("attach lookup: {e}")))?;
-        let mut row = row_opt.ok_or_else(|| {
-            crate::federation::Error::InvalidArgument(format!(
-                "federation_revocations row {revocation_id} does not exist"
-            ))
-        })?;
-        if row.is_pqc_complete() {
-            return Err(crate::federation::Error::Conflict(format!(
-                "federation_revocations row {revocation_id} is already PQC-complete"
-            )));
-        }
-        row.scrub_signature_pqc = Some(scrub_signature_pqc.to_owned());
-        let now = chrono::Utc::now();
-        row.pqc_completed_at = Some(now);
-        let mut for_hash = row.clone();
-        for_hash.persist_row_hash = String::new();
-        let new_hash = crate::federation::types::compute_persist_row_hash(&for_hash)?;
-
-        let revocation_id = revocation_id.to_owned();
-        let pqc_sig = scrub_signature_pqc.to_owned();
-        let now_str = now.to_rfc3339();
-        let n = self
-            .write(move |conn| -> Result<usize, rusqlite::Error> {
-                conn.execute(
-                    "UPDATE federation_revocations \
-                 SET scrub_signature_pqc = ?1, pqc_completed_at = ?2, persist_row_hash = ?3 \
-                 WHERE revocation_id = ?4 AND pqc_completed_at IS NULL",
-                    rusqlite::params![pqc_sig, now_str, new_hash, revocation_id],
-                )
-            })
-            .await
-            .map_err(|e| {
-                crate::federation::Error::Backend(format!("attach_revocation_pqc_signature: {e}"))
-            })?;
-        if n == 0 {
-            return Err(crate::federation::Error::Conflict(
-                "federation_revocations row was concurrently completed".to_string(),
-            ));
-        }
-        Ok(())
-    }
-
     async fn list_hybrid_pending_keys(
         &self,
         limit: i64,
@@ -12677,51 +12154,6 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     serde_json::from_str(&envelope_text).map_err(|e| {
                         crate::federation::Error::Backend(format!(
                             "attestation_envelope decode: {e}"
-                        ))
-                    })?;
-                Ok(crate::federation::HybridPendingRow {
-                    id,
-                    envelope,
-                    classical_sig_b64,
-                })
-            })
-            .collect()
-    }
-
-    async fn list_hybrid_pending_revocations(
-        &self,
-        limit: i64,
-    ) -> Result<Vec<crate::federation::HybridPendingRow>, crate::federation::Error> {
-        let rows = self
-            .read(
-                move |conn| -> Result<Vec<(String, String, String)>, rusqlite::Error> {
-                    let mut stmt = conn.prepare(
-                        "SELECT revocation_id, revocation_envelope, scrub_signature_classical \
-                     FROM federation_revocations \
-                     WHERE pqc_completed_at IS NULL \
-                     ORDER BY revoked_at ASC \
-                     LIMIT ?1",
-                    )?;
-                    let iter = stmt.query_map([limit], |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, String>(2)?,
-                        ))
-                    })?;
-                    iter.collect()
-                },
-            )
-            .await
-            .map_err(|e| {
-                crate::federation::Error::Backend(format!("list_hybrid_pending_revocations: {e}"))
-            })?;
-        rows.into_iter()
-            .map(|(id, envelope_text, classical_sig_b64)| {
-                let envelope: serde_json::Value =
-                    serde_json::from_str(&envelope_text).map_err(|e| {
-                        crate::federation::Error::Backend(format!(
-                            "revocation_envelope decode: {e}"
                         ))
                     })?;
                 Ok(crate::federation::HybridPendingRow {
@@ -13416,10 +12848,19 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     }
 
                     if hard {
+                        // v58.0.0 (CIRISPersist#991) — the key's own
+                        // `key:record:v1` claim is the key, not an attestation
+                        // that depends on it: not counted, and it leaves with
+                        // the key.
                         let count: i64 = tx.query_row(
                             "SELECT COUNT(*) FROM federation_attestations \
-                         WHERE attesting_key_id = ?1 OR attested_key_id = ?1 OR scrub_key_id = ?1",
-                            [&key_id_owned],
+                         WHERE (attesting_key_id = ?1 OR attested_key_id = ?1 OR scrub_key_id = ?1) \
+                           AND NOT (attesting_key_id = ?1 AND attested_key_id = ?1 \
+                                    AND dimension IS ?2)",
+                            rusqlite::params![
+                                &key_id_owned,
+                                crate::federation::key_plane::KEY_RECORD_DIMENSION
+                            ],
                             |r| r.get(0),
                         )?;
                         if count > 0 {
@@ -13430,6 +12871,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                                 },
                             ));
                         }
+                        sqlite_drop_key_record_rows(&tx, &key_id_owned)?;
                         // DELETE federation_keys — FK ON DELETE CASCADE on
                         // federation_peer_metadata cleans up the sibling.
                         tx.execute(
@@ -22032,6 +21474,23 @@ impl crate::federation::attestation_admit::AttestationStore for SqliteBackend {
                         "detection_id",
                         crate::derived::detection_row::DIMENSION_PREFIX,
                     ),
+                    // v58.0.0 (CIRISPersist#991) — the key plane's rebuild
+                    // is a pure function of two reads.
+                    SiloProjection::FederationKeys => {
+                        let rebuild = sqlite_key_projection_rebuild(&tx)?;
+                        tx.rollback()?;
+                        return Ok(rebuild);
+                    }
+                    SiloProjection::FederationRevocations => {
+                        let rebuild = sqlite_revocation_projection_rebuild(&tx)?;
+                        tx.rollback()?;
+                        return Ok(rebuild);
+                    }
+                    SiloProjection::IdentityOccurrences => {
+                        let rebuild = sqlite_occurrence_projection_rebuild(&tx)?;
+                        tx.rollback()?;
+                        return Ok(rebuild);
+                    }
                 };
                 tx.execute_batch(&format!(
                     "CREATE TEMP TABLE {scratch} AS SELECT * FROM {live_table} WHERE 0"
@@ -22066,6 +21525,9 @@ impl crate::federation::attestation_admit::AttestationStore for SqliteBackend {
                                 )?;
                             }
                         }
+                        SiloProjection::FederationKeys
+                        | SiloProjection::FederationRevocations
+                        | SiloProjection::IdentityOccurrences => {}
                         SiloProjection::DetectionEvents => {
                             if let Some(event) =
                                 crate::derived::detection_row::project_detection_row_under(
@@ -23436,38 +22898,6 @@ fn sqlite_row_to_identity_occurrence_revocation(
     })
 }
 
-/// v16.0.0 (#421 replication read) — SQLite row →
-/// [`crate::federation::SignedIdentityOccurrenceRevocation`]. Reconstructs the
-/// signature container byte-exact from the stored `{attesting_key_id,
-/// signed_envelope, signature}` columns (the V103 trio) so a transport
-/// replicator re-wraps the already-signed revocation verbatim. Callers gate on
-/// non-NULL sig columns (the mirror of the V102 occurrence read).
-fn sqlite_row_to_signed_identity_occurrence_revocation(
-    row: &rusqlite::Row<'_>,
-) -> rusqlite::Result<crate::federation::SignedIdentityOccurrenceRevocation> {
-    let identity_occurrence_revocation = sqlite_row_to_identity_occurrence_revocation(row)?;
-    let attesting_key_id: String = row.get("attesting_key_id")?;
-    let signed_envelope_json: String = row.get("signed_envelope")?;
-    let signature_json: String = row.get("signature")?;
-    let json_err = |e: serde_json::Error| {
-        rusqlite::Error::FromSqlConversionFailure(
-            0,
-            rusqlite::types::Type::Text,
-            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
-        )
-    };
-    let signed_envelope: serde_json::Value =
-        serde_json::from_str(&signed_envelope_json).map_err(json_err)?;
-    let signature: ciris_verify_core::transport_binding::TransportBindingSignature =
-        serde_json::from_str(&signature_json).map_err(json_err)?;
-    Ok(crate::federation::SignedIdentityOccurrenceRevocation {
-        identity_occurrence_revocation,
-        attesting_key_id,
-        signed_envelope,
-        signature,
-    })
-}
-
 fn sqlite_row_to_family_membership_revocation(
     row: &rusqlite::Row<'_>,
 ) -> rusqlite::Result<crate::federation::FamilyMembershipRevocation> {
@@ -23550,6 +22980,329 @@ fn sqlite_row_to_hard_case_event(
             .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new())),
         emitted_at: parse_rfc3339(&emitted_at),
     })
+}
+
+/// v58.0.0 (CIRISPersist#991) — insert a key-plane row (federation tier,
+/// minted by `federation::key_plane` from the signed object it carries) in
+/// the caller's transaction, with its serve position. `INSERT OR IGNORE`: one
+/// signed object, one id, so a re-insert is a no-op.
+fn sqlite_insert_plane_row(
+    tx: &rusqlite::Connection,
+    row: &crate::federation::Attestation,
+) -> Result<usize, rusqlite::Error> {
+    let to_sql_err = |e: serde_json::Error| rusqlite::Error::ToSqlConversionFailure(Box::new(e));
+    let envelope_text = serde_json::to_string(&row.attestation_envelope).map_err(to_sql_err)?;
+    let original_content_hash: Vec<u8> = hex::decode(&row.original_content_hash)
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+    let admitted_at = sqlite_next_plane_position(tx, "federation_attestations", POS_ATTESTATION)?;
+    tx.execute(
+        "INSERT OR IGNORE INTO federation_attestations (\
+            attestation_id, attesting_key_id, attested_key_id, attestation_type, \
+            weight, asserted_at, expires_at, attestation_envelope, \
+            original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
+            scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, \
+            subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at, \
+            additional_scrubs, admitted_at\
+         ) VALUES (?1, ?2, ?3, ?4, NULL, ?5, NULL, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, \
+                   '[]', NULL, ?14, ?15, NULL, '[]', ?16)",
+        rusqlite::params![
+            row.attestation_id,
+            row.attesting_key_id,
+            row.attested_key_id,
+            row.attestation_type,
+            row.asserted_at.to_rfc3339(),
+            envelope_text,
+            original_content_hash,
+            row.scrub_signature_classical,
+            row.scrub_signature_pqc,
+            row.scrub_key_id,
+            row.scrub_timestamp.to_rfc3339(),
+            row.pqc_completed_at.map(|t| t.to_rfc3339()),
+            row.persist_row_hash,
+            row.cohort_scope,
+            row.tier,
+            admitted_at.to_rfc3339(),
+        ],
+    )
+}
+
+/// v58.0.0 (CIRISPersist#991) — is V198 applied? A schema before it (only a
+/// test's `run_migrations_through` builds one) has no key-plane pointer, and
+/// the key plane is not on it: the row step is a no-op there.
+fn sqlite_key_plane_present(conn: &rusqlite::Connection) -> Result<bool, rusqlite::Error> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('federation_keys') WHERE name = 'attestation_id'",
+        [],
+        |r| r.get::<_, i64>(0),
+    )
+    .map(|n| n > 0)
+}
+
+/// v58.0.0 (CIRISPersist#991) — delete every `key:record:v1` row of `key_id`
+/// (its own claims), ahead of a door that deletes or replaces the key: the
+/// row names the key as its attester, so it must leave first.
+fn sqlite_drop_key_record_rows(
+    tx: &rusqlite::Connection,
+    key_id: &str,
+) -> Result<usize, rusqlite::Error> {
+    tx.execute(
+        "DELETE FROM federation_attestations \
+          WHERE attesting_key_id = ?1 AND attested_key_id = ?1 AND dimension = ?2",
+        rusqlite::params![key_id, crate::federation::key_plane::KEY_RECORD_DIMENSION],
+    )
+}
+
+/// v58.0.0 (CIRISPersist#991, CC 3.1.3) — **the `key:record:v1` row follows
+/// its key**, in the caller's transaction: after any write to
+/// `federation_keys`, the key's row is the row its stored record plans to
+/// (`key_plane::key_record_row_if_verifiable`) — inserted when the record
+/// verifies (proof of possession, or a held base signer), the previous row (an older claim of the same key)
+/// deleted, the projection's `attestation_id` pointed at it; or no row at
+/// all when it does not verify (held without a row; the
+/// rebuild gate names it). A deleted key takes its row with it.
+fn sqlite_sync_key_record_row(
+    tx: &rusqlite::Connection,
+    key_id: &str,
+) -> Result<(), rusqlite::Error> {
+    if !sqlite_key_plane_present(tx)? {
+        return Ok(());
+    }
+    let stored: Option<(crate::federation::KeyRecord, Option<String>)> = tx
+        .query_row(
+            "SELECT * FROM federation_keys WHERE key_id = ?1",
+            [key_id],
+            |r| {
+                Ok((
+                    sqlite_row_to_key_record(r)?,
+                    r.get::<_, Option<String>>("attestation_id")?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((record, current)) = stored else {
+        sqlite_drop_key_record_rows(tx, key_id)?;
+        return Ok(());
+    };
+    // The base signer's held pubkeys, read in this transaction, when it is
+    // not the key itself (the pre-rc8 conferral shape).
+    let held_signer: crate::federation::key_plane::HeldSigner =
+        if record.scrub_key_id == record.key_id {
+            None
+        } else {
+            tx.query_row(
+                "SELECT pubkey_ed25519_base64, pubkey_ml_dsa_65_base64 FROM federation_keys \
+              WHERE key_id = ?1",
+                [&record.scrub_key_id],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
+            )
+            .optional()?
+        };
+    let planned = crate::federation::key_plane::key_record_row_if_verifiable(&record, &held_signer);
+    if let (Some(cur), Some(p)) = (current.as_deref(), planned.as_ref()) {
+        if cur == p.attestation_id {
+            return Ok(());
+        }
+    }
+    // The key's older claims leave the plane (their bytes are in the record's
+    // history when a door replaced them); `ON DELETE SET NULL` clears the
+    // projection's pointer.
+    sqlite_drop_key_record_rows(tx, key_id)?;
+    if let Some(row) = planned {
+        sqlite_insert_plane_row(tx, &row)?;
+        tx.execute(
+            "UPDATE federation_keys SET attestation_id = ?2 WHERE key_id = ?1",
+            rusqlite::params![key_id, row.attestation_id],
+        )?;
+    }
+    Ok(())
+}
+
+/// v58.0.0 (CIRISPersist#991, CC 3.3.6) — **the `identity:occurrence:v1` row
+/// follows its occurrence**, in the caller's transaction: after a write to
+/// `federation_identity_occurrences`, the pair's row is the row its stored
+/// SIGNED occurrence plans to (`key_plane::occurrence_row_if_hybrid`; the
+/// signature was verified at the door) — inserted, the pair's previous row
+/// deleted, the pointer moved; none for an unsigned (trusted-local) or
+/// Ed25519-only occurrence, or one whose signer is not held.
+fn sqlite_sync_occurrence_row(
+    tx: &rusqlite::Connection,
+    identity_key_id: &str,
+    occurrence_key_id: &str,
+) -> Result<(), rusqlite::Error> {
+    if !sqlite_key_plane_present(tx)? {
+        return Ok(());
+    }
+    let stored: Option<(
+        Option<crate::federation::SignedIdentityOccurrence>,
+        Option<String>,
+    )> = tx
+        .query_row(
+            "SELECT * FROM federation_identity_occurrences \
+              WHERE identity_key_id = ?1 AND occurrence_key_id = ?2",
+            rusqlite::params![identity_key_id, occurrence_key_id],
+            |r| {
+                let signed = if r.get::<_, Option<String>>("signature")?.is_some() {
+                    Some(sqlite_row_to_signed_identity_occurrence(r)?)
+                } else {
+                    None
+                };
+                Ok((signed, r.get::<_, Option<String>>("attestation_id")?))
+            },
+        )
+        .optional()?;
+    let (signed, current) = stored.unwrap_or((None, None));
+    let planned = match signed.as_ref() {
+        Some(s) => {
+            let signer_held: Option<i64> = tx
+                .query_row(
+                    "SELECT 1 FROM federation_keys WHERE key_id = ?1",
+                    [&s.attesting_key_id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            signer_held.and_then(|_| crate::federation::key_plane::occurrence_row_if_hybrid(s))
+        }
+        None => None,
+    };
+    if let (Some(cur), Some(p)) = (current.as_deref(), planned.as_ref()) {
+        if cur == p.attestation_id {
+            return Ok(());
+        }
+    }
+    if let Some(cur) = current.as_deref() {
+        tx.execute(
+            "DELETE FROM federation_attestations WHERE attestation_id = ?1",
+            [cur],
+        )?;
+    }
+    if let Some(row) = planned {
+        sqlite_insert_plane_row(tx, &row)?;
+        tx.execute(
+            "UPDATE federation_identity_occurrences SET attestation_id = ?3 \
+              WHERE identity_key_id = ?1 AND occurrence_key_id = ?2",
+            rusqlite::params![identity_key_id, occurrence_key_id, row.attestation_id],
+        )?;
+    }
+    Ok(())
+}
+
+/// v58.0.0 (CIRISPersist#991) — the live SIGNED occurrences and every
+/// `identity:occurrence:v1` row, for the rebuild gate.
+fn sqlite_occurrence_projection_rebuild(
+    conn: &rusqlite::Connection,
+) -> Result<crate::federation::silo_projection::ProjectionRebuild, rusqlite::Error> {
+    let live: Vec<(crate::federation::SignedIdentityOccurrence, Option<String>)> = {
+        let mut stmt = conn.prepare(
+            "SELECT * FROM federation_identity_occurrences WHERE signature IS NOT NULL \
+              ORDER BY identity_key_id, occurrence_key_id",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                sqlite_row_to_signed_identity_occurrence(r)?,
+                r.get::<_, Option<String>>("attestation_id")?,
+            ))
+        })?;
+        rows.collect::<Result<_, _>>()?
+    };
+    let rows = sqlite_plane_rows(
+        conn,
+        crate::federation::key_plane::IDENTITY_OCCURRENCE_DIMENSION,
+    )?;
+    Ok(crate::federation::key_plane::occurrence_projection_rebuild(
+        live, &rows,
+    ))
+}
+
+/// v58.0.0 (CIRISPersist#991) — the live `federation_revocations` projection
+/// and every `key:revocation:v1` row, for the rebuild gate.
+fn sqlite_revocation_projection_rebuild(
+    conn: &rusqlite::Connection,
+) -> Result<crate::federation::silo_projection::ProjectionRebuild, rusqlite::Error> {
+    let live: Vec<(crate::federation::Revocation, Option<String>)> = {
+        let mut stmt =
+            conn.prepare("SELECT * FROM federation_revocations ORDER BY revocation_id")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                sqlite_row_to_revocation(r)?,
+                r.get::<_, Option<String>>("attestation_id")?,
+            ))
+        })?;
+        rows.collect::<Result<_, _>>()?
+    };
+    let rows = sqlite_plane_rows(conn, crate::federation::key_plane::KEY_REVOCATION_DIMENSION)?;
+    Ok(crate::federation::key_plane::revocation_projection_rebuild(
+        live, &rows,
+    ))
+}
+
+/// v58.0.0 (CIRISPersist#991) — every row on the plane with `dimension`.
+fn sqlite_plane_rows(
+    conn: &rusqlite::Connection,
+    dimension: &str,
+) -> Result<Vec<crate::federation::Attestation>, rusqlite::Error> {
+    let mut stmt = conn.prepare(
+        "SELECT attestation_id, attesting_key_id, attested_key_id, attestation_type, \
+            weight, asserted_at, expires_at, attestation_envelope, \
+            original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
+            scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, \
+            subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at, \
+            additional_scrubs \
+         FROM federation_attestations WHERE dimension = ?1 ORDER BY attestation_id",
+    )?;
+    let rows = stmt.query_map([dimension], sqlite_row_to_attestation)?;
+    rows.collect()
+}
+
+/// v58.0.0 (CIRISPersist#991) — the lazy rehome of one pre-V198 revocation:
+/// its `key:revocation:v1` row when it is hybrid, inserted and pointed at.
+fn sqlite_rehome_revocation(
+    tx: &rusqlite::Connection,
+    revocation_id: &str,
+) -> Result<(), rusqlite::Error> {
+    if !sqlite_key_plane_present(tx)? {
+        return Ok(());
+    }
+    let revocation = tx
+        .query_row(
+            "SELECT * FROM federation_revocations WHERE revocation_id = ?1 \
+               AND attestation_id IS NULL",
+            [revocation_id],
+            sqlite_row_to_revocation,
+        )
+        .optional()?;
+    let Some(row) = revocation
+        .as_ref()
+        .and_then(crate::federation::key_plane::revocation_row_if_hybrid)
+    else {
+        return Ok(());
+    };
+    sqlite_insert_plane_row(tx, &row)?;
+    tx.execute(
+        "UPDATE federation_revocations SET attestation_id = ?2 WHERE revocation_id = ?1",
+        rusqlite::params![revocation_id, row.attestation_id],
+    )?;
+    Ok(())
+}
+
+/// v58.0.0 (CIRISPersist#991) — the live `federation_keys` projection and
+/// every `key:record:v1` row, for the rebuild gate.
+fn sqlite_key_projection_rebuild(
+    conn: &rusqlite::Connection,
+) -> Result<crate::federation::silo_projection::ProjectionRebuild, rusqlite::Error> {
+    let live: Vec<(crate::federation::KeyRecord, Option<String>)> = {
+        let mut stmt = conn.prepare("SELECT * FROM federation_keys ORDER BY key_id")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                sqlite_row_to_key_record(r)?,
+                r.get::<_, Option<String>>("attestation_id")?,
+            ))
+        })?;
+        rows.collect::<Result<_, _>>()?
+    };
+    let rows = sqlite_plane_rows(conn, crate::federation::key_plane::KEY_RECORD_DIMENSION)?;
+    Ok(crate::federation::key_plane::key_projection_rebuild(
+        live, &rows,
+    ))
 }
 
 /// v56.0.0 (CIRISPersist#934 door 2), lifted in v57.0.0 so the hard_case
@@ -24422,44 +24175,6 @@ fn sqlite_row_to_signed_community_membership_widening(
         scrub_signature_pqc,
         cosignatures,
     })
-}
-
-/// v3.11.0 (CIRISPersist#143, F-AV-ROLLBACK closure) — anti-rollback
-/// admission check for sqlite. Reads the latest `scrub_timestamp` for
-/// the target `revoked_key_id`; rejects with
-/// [`crate::federation::Error::RevocationRollback`] if `submitted_ts`
-/// is not strictly later. First revocation against a target always
-/// admits (no prior row → no rollback possible).
-async fn check_revocation_anti_rollback_sqlite(
-    backend: &SqliteBackend,
-    revoked_key_sha256_ed25519_raw: &str,
-    submitted_ts: chrono::DateTime<chrono::Utc>,
-) -> Result<(), crate::federation::Error> {
-    let revoked_key_id_owned = revoked_key_sha256_ed25519_raw.to_owned();
-    let revoked_key_id = revoked_key_sha256_ed25519_raw;
-    let latest = backend
-        .read(move |conn| -> Result<Option<String>, rusqlite::Error> {
-            conn.query_row(
-                "SELECT scrub_timestamp FROM federation_revocations \
-                 WHERE revoked_key_sha256_ed25519_raw = ?1 \
-                 ORDER BY scrub_timestamp DESC LIMIT 1",
-                rusqlite::params![revoked_key_id_owned],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()
-        })
-        .await
-        .map_err(|e| crate::federation::Error::Backend(format!("anti-rollback lookup: {e}")))?;
-
-    // v31.0.0 (CIRISPersist#660) — the LOOKUP is backend-specific, the RULE is
-    // not. See `admission::check_revocation_anti_rollback`: this comparison used
-    // to be written out here, again in the Postgres twin, and nowhere at all on
-    // the memory backend.
-    crate::federation::admission::check_revocation_anti_rollback(
-        revoked_key_id,
-        latest.as_deref().map(parse_rfc3339),
-        submitted_ts,
-    )
 }
 
 /// v2.10.0 (CIRISPersist#114) — SQLite row → `Goal` projection.
@@ -28805,6 +28520,73 @@ impl crate::derived::DerivedSchema for SqliteBackend {
 /// Every gate is the same on both except CC 3.4.7.3 Clause A, which gates
 /// minting only.
 impl SqliteBackend {
+    /// v58.0.0 (CIRISPersist#991, CC 3.1.3) — **the lazy rehome**, once per
+    /// backend, at the first key-plane write: every projection row written
+    /// before V198 (`attestation_id IS NULL`) gets the row its stored object
+    /// plans to. A key record that proves possession becomes its
+    /// `key:record:v1` row, asserted at its own `scrub_timestamp`; one that
+    /// cannot stays held without a row, and the rebuild gate names it.
+    pub(crate) async fn rehome_legacy_key_plane(&self) -> Result<(), crate::federation::Error> {
+        use std::sync::atomic::Ordering;
+        if self.key_plane_rehomed.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        // A schema before V198 (a test's `run_migrations_through`) has nothing
+        // to rehome yet; the flag stays down for the full migration.
+        if !self
+            .read(sqlite_key_plane_present)
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("rehome key plane: {e}")))?
+        {
+            return Ok(());
+        }
+        type Legacy = (Vec<String>, Vec<String>, Vec<(String, String)>);
+        let (keys, revocations, occurrences): Legacy = self
+            .read(|conn| -> Result<Legacy, rusqlite::Error> {
+                let ids = |sql: &str| -> Result<Vec<String>, rusqlite::Error> {
+                    let mut stmt = conn.prepare(sql)?;
+                    let rows = stmt.query_map([], |r| r.get(0))?;
+                    rows.collect()
+                };
+                let pairs = {
+                    let mut stmt = conn.prepare(
+                        "SELECT identity_key_id, occurrence_key_id \
+                           FROM federation_identity_occurrences \
+                          WHERE attestation_id IS NULL AND signature IS NOT NULL",
+                    )?;
+                    let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+                    rows.collect::<Result<Vec<_>, _>>()?
+                };
+                Ok((
+                    ids("SELECT key_id FROM federation_keys WHERE attestation_id IS NULL")?,
+                    ids("SELECT revocation_id FROM federation_revocations \
+                          WHERE attestation_id IS NULL")?,
+                    pairs,
+                ))
+            })
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("rehome key plane: {e}")))?;
+        if !keys.is_empty() || !revocations.is_empty() || !occurrences.is_empty() {
+            self.write(move |conn| -> Result<(), rusqlite::Error> {
+                let tx = conn.transaction()?;
+                for key_id in &keys {
+                    sqlite_sync_key_record_row(&tx, key_id)?;
+                }
+                for revocation_id in &revocations {
+                    sqlite_rehome_revocation(&tx, revocation_id)?;
+                }
+                for (identity, occurrence) in &occurrences {
+                    sqlite_sync_occurrence_row(&tx, identity, occurrence)?;
+                }
+                tx.commit()
+            })
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("rehome key plane: {e}")))?;
+        }
+        self.key_plane_rehomed.store(true, Ordering::Release);
+        Ok(())
+    }
+
     pub(crate) async fn put_public_key_at_door(
         &self,
         record: crate::federation::SignedKeyRecord,
@@ -28980,8 +28762,12 @@ impl SqliteBackend {
         // every consumer's cursor instead of behind it. See
         // [`SqliteBackend::next_key_admission_position`].
         let admitted_at = self.next_key_admission_position().await?;
+        self.rehome_legacy_key_plane().await?;
         self.write(move |conn| -> Result<(), rusqlite::Error> {
-            conn.execute(
+            // v58.0.0 (CIRISPersist#991) — the record and its `key:record:v1`
+            // row, one transaction.
+            let tx = conn.transaction()?;
+            tx.execute(
                 "INSERT INTO federation_keys (\
                     key_id, pubkey_ed25519_base64, pubkey_ml_dsa_65_base64, algorithm, \
                     identity_type, identity_ref, valid_from, valid_until, registration_envelope, \
@@ -29013,10 +28799,103 @@ impl SqliteBackend {
                     admitted_at.to_rfc3339(),
                 ],
             )?;
-            Ok(())
+            sqlite_sync_key_record_row(&tx, &row.key_id)?;
+            tx.commit()
         }).await
         .map_err(|e| crate::federation::Error::Backend(format!("insert federation_keys: {e}")))?;
         self.index_stored_key_row(&key_id_for_index).await?;
+        Ok(())
+    }
+}
+
+/// v58.0.0 (CIRISPersist#991) — the key plane's executor on sqlite. Storage
+/// only: the decisions are `federation::key_plane`'s plans.
+#[async_trait::async_trait]
+impl crate::federation::key_plane::KeyPlaneStore for SqliteBackend {
+    async fn store_planned_revocation(
+        &self,
+        planned: crate::federation::key_plane::PlannedRevocation,
+    ) -> Result<(), crate::federation::Error> {
+        let crate::federation::key_plane::PlannedRevocation {
+            revocation: row,
+            row: plane,
+        } = planned;
+        let original_content_hash = hex::decode(&row.original_content_hash).map_err(|e| {
+            crate::federation::Error::InvalidArgument(format!(
+                "original_content_hash hex decode: {e}"
+            ))
+        })?;
+        let revocation_envelope_text = serde_json::to_string(&row.revocation_envelope)
+            .map_err(|e| crate::federation::Error::Backend(format!("envelope serialize: {e}")))?;
+        let plane_id = plane.attestation_id.clone();
+        self.rehome_legacy_key_plane().await?;
+        self.write(move |conn| -> Result<(), rusqlite::Error> {
+            let tx = conn.transaction()?;
+            // THIS node's admission position (V123), strictly after the last
+            // one handed out (`monotonic_admission_instant`), allocated inside
+            // the write so the read and the INSERT are one step.
+            let last: Option<String> = tx
+                .query_row(
+                    "SELECT MAX(admitted_at) FROM federation_revocations",
+                    [],
+                    |r| r.get(0),
+                )
+                .optional()?
+                .flatten();
+            let admitted_at = crate::federation::types::monotonic_admission_instant(
+                chrono::Utc::now(),
+                last.as_deref().map(parse_rfc3339),
+            );
+            // v58.0.0 (CIRISPersist#991) — the row first: the projection names it.
+            sqlite_insert_plane_row(&tx, &plane)?;
+            tx.execute(
+                "INSERT INTO federation_revocations (\
+                    revocation_id, revoked_key_id, revoking_key_id, reason, \
+                    revoked_at, effective_at, revocation_envelope, \
+                    original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
+                    scrub_key_id, scrub_timestamp, pqc_completed_at, observed_region, \
+                    revoked_after, persist_row_hash, admitted_at, revoked_key_sha256_ed25519_raw, \
+                    attestation_id\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, \
+                    ?16, ?17, ?18, ?19)",
+                rusqlite::params![
+                    row.revocation_id,
+                    row.revoked_key_id,
+                    row.revoking_key_id,
+                    row.reason,
+                    row.revoked_at.to_rfc3339(),
+                    row.effective_at.to_rfc3339(),
+                    revocation_envelope_text,
+                    original_content_hash,
+                    row.scrub_signature_classical,
+                    row.scrub_signature_pqc,
+                    row.scrub_key_id,
+                    row.scrub_timestamp.to_rfc3339(),
+                    row.pqc_completed_at.map(|t| t.to_rfc3339()),
+                    row.observed_region,
+                    row.revoked_after.map(|t| t.to_rfc3339()),
+                    row.persist_row_hash,
+                    admitted_at.to_rfc3339(),
+                    row.revoked_key_sha256_ed25519_raw,
+                    plane.attestation_id,
+                ],
+            )?;
+            tx.commit()
+        })
+        .await
+        .map_err(|e| {
+            let msg = e.to_string();
+            if msg.contains("FOREIGN KEY") {
+                crate::federation::Error::InvalidArgument(format!(
+                    "FK constraint violated on revocation insert: {msg}"
+                ))
+            } else {
+                crate::federation::Error::Backend(format!("insert revocation: {msg}"))
+            }
+        })?;
+        // v31.1.0 (CIRISPersist#655) — the key-level revocation plane joins the
+        // shared `signed_wire_index`.
+        self.index_plane_row(Some(&plane_id)).await?;
         Ok(())
     }
 }
@@ -30061,19 +29940,6 @@ mod accord_tests {
         ts::assert_attestation_tie_pages_exactly_once(&backend, "sq", &ids, 3).await;
     }
 
-    /// v36.0.0 (CIRISPersist#707) — a consumer-visible key mutation moves the
-    /// SERVE POSITION on sqlite; grant/revoke_trust do not.
-    #[tokio::test]
-    async fn key_mutation_moves_serve_position_sqlite_707() {
-        let backend = SqliteBackend::open_in_memory().await.unwrap();
-        backend.run_migrations().await.unwrap();
-        crate::federation::operational::test_support::exercise_key_mutation_moves_serve_position(
-            &backend, "sq",
-        )
-        .await
-        .expect("707 serve-position exercise");
-    }
-
     /// v31.0.0 (CIRISPersist#659) — a signed revocation de-admits the key it
     /// NAMED, at the real `put_revocation` chokepoint, on sqlite.
     #[tokio::test]
@@ -30455,21 +30321,6 @@ mod tests {
         crate::federation::admission::r2_test_support::exercise_wire_refs_for_subject_resolve(
             &backend,
             "sqlite-634",
-        )
-        .await;
-    }
-
-    /// v31.0.0 (CIRISPersist#640) — the SQLITE leg. SQLite round-trips the
-    /// nanoseconds (RFC-3339 TEXT) so the timestamp half cannot bite here, but
-    /// the `consent_role` wire ⇔ stored normalization DOES: before the fix this
-    /// backend indexed `Some("unregistered")` while its read surface returns
-    /// `None`.
-    #[tokio::test]
-    async fn nanosecond_key_wire_ref_resolves_sqlite_640() {
-        let backend = fresh_backend_with_occurrence("occ-640").await;
-        crate::federation::admission::r2_test_support::exercise_nanosecond_key_wire_ref_resolves(
-            &backend,
-            "sqlite-640",
         )
         .await;
     }
@@ -34763,167 +34614,9 @@ mod tests {
         ts::assert_quorum_bundle_survives_backward_clock(&backend, &node, "sq", future).await;
     }
 
-    /// v31.1.0 (CIRISPersist#655, PR #667 round-4) — **the admission position
-    /// survives a backward clock step, on this backend's real write path.**
-    ///
-    /// The allocator's rule is unit-tested in `federation::types`; this asserts
-    /// it is actually WIRED into `put_revocation` here, which a unit test
-    /// cannot say. Two admissions on a forward clock would prove nothing —
-    /// `Utc::now()` passes that trivially. So the post-step state is planted
-    /// directly: an existing row is given a position an hour in the FUTURE,
-    /// which is exactly what a node looks like after an NTP correction or a VM
-    /// restore, and the next admission must still sort after it.
-    ///
-    /// If it does not, the row is invisible to every consumer whose cursor had
-    /// passed that point — a durable exclusion that never propagates.
-    #[tokio::test]
-    async fn admission_position_survives_a_backward_clock_step_sqlite_655() {
-        use crate::federation::FederationDirectory as _;
-        let backend = SqliteBackend::open_in_memory().await.unwrap();
-        backend.run_migrations().await.unwrap();
-        for k in ["rv-a", "rv-b"] {
-            backend
-                .put_public_key(SignedKeyRecord {
-                    record: fed_key(k, "primitive", k),
-                })
-                .await
-                .unwrap();
-        }
-        // Self-revocations: the moderation-authority plane has its own
-        // witnesses and would only add scaffolding here.
-        backend
-            .put_revocation(SignedRevocation {
-                revocation: fed_revocation("rv-1", "rv-a", "rv-a", "rv-a"),
-            })
-            .await
-            .expect("first revocation");
-
-        // THE BACKWARD STEP, as state: the last position handed out is now an
-        // hour ahead of the wall clock.
-        let future = chrono::Utc::now() + chrono::Duration::hours(1);
-        {
-            let conn = backend.conn.lock();
-            conn.execute(
-                "UPDATE federation_revocations SET admitted_at = ?1",
-                rusqlite::params![future.to_rfc3339()],
-            )
-            .unwrap();
-        }
-
-        backend
-            .put_revocation(SignedRevocation {
-                revocation: fed_revocation("rv-2", "rv-b", "rv-b", "rv-b"),
-            })
-            .await
-            .expect("second revocation");
-
-        let served = backend
-            .list_signed_revocations_since(Some((future, "rv-1".to_owned())), u32::MAX)
-            .await
-            .unwrap();
-        assert!(
-            served.iter().any(|r| r.revocation.revocation_id == "rv-2"),
-            "a revocation admitted after a backward clock step must still be served to a \
-             consumer resuming from the pre-step cursor — otherwise the exclusion is stored \
-             and permanently invisible"
-        );
-    }
-
     // ─── v31.4.0 (CIRISPersist#682 / #668) — the identity plane's serve
     //     cursor, sqlite arm. Assertion bodies shared with the memory and
     //     postgres arms; only the PLANT is backend-specific.
-
-    /// #682 — a key record signed a year ago and admitted now is still served
-    /// to a consumer whose cursor has passed that instant.
-    #[tokio::test]
-    async fn late_replicated_key_record_is_served_sqlite_682() {
-        let backend = SqliteBackend::open_in_memory().await.unwrap();
-        backend.run_migrations().await.unwrap();
-        crate::federation::register::test_support::exercise_late_replicated_key_record_is_served(
-            &backend, "sq",
-        )
-        .await
-        .unwrap();
-    }
-
-    /// #668 — `limit + 2` rows sharing ONE admission instant page through with
-    /// every row seen exactly once.
-    ///
-    /// The tie is PLANTED because it cannot be produced through this backend's
-    /// write path: `monotonic_admission_instant` allocates strictly above the
-    /// last position, so two admissions here never collide. It is reachable in
-    /// production through the V126 backfill (every pre-existing row stamped
-    /// with its `scrub_timestamp`, and a batch from one producer shares one)
-    /// and through two writers racing the same `MAX`.
-    #[tokio::test]
-    async fn one_admission_instant_pages_exactly_once_sqlite_668() {
-        use crate::federation::register::test_support as rts;
-        let backend = SqliteBackend::open_in_memory().await.unwrap();
-        backend.run_migrations().await.unwrap();
-        let ids: Vec<String> = (0..5).map(|i| format!("k668-sq-{i}")).collect();
-        for id in &ids {
-            backend
-                .put_public_key(SignedKeyRecord {
-                    record: rts::self_scrubbed_record_signed_at(id, chrono::Utc::now()),
-                })
-                .await
-                .unwrap();
-        }
-
-        // THE TIE, as state: every row collapses onto one instant. Written in
-        // the same RFC-3339 form the writer uses, so the stored string and a
-        // cursor round-tripped through `parse_rfc3339` compare equal.
-        let tied_at = rts::truncate_to_micros(chrono::Utc::now());
-        {
-            let conn = backend.conn.lock();
-            let n = conn
-                .execute(
-                    "UPDATE federation_keys SET admitted_at = ?1",
-                    rusqlite::params![tied_at.to_rfc3339()],
-                )
-                .unwrap();
-            assert_eq!(n, ids.len(), "the tie plant must touch every seeded row");
-        }
-
-        rts::assert_one_admission_instant_pages_exactly_once(&backend, "sq", &ids, 3)
-            .await
-            .unwrap();
-    }
-
-    /// #682 — the admission position survives a backward clock step on this
-    /// backend's real write path. The post-step state is planted directly; two
-    /// admissions under a forward clock would pass with `Utc::now()` and prove
-    /// nothing.
-    #[tokio::test]
-    async fn key_admission_survives_a_backward_clock_step_sqlite_682() {
-        use crate::federation::register::test_support as rts;
-        let backend = SqliteBackend::open_in_memory().await.unwrap();
-        backend.run_migrations().await.unwrap();
-        backend
-            .put_public_key(SignedKeyRecord {
-                record: rts::self_scrubbed_record_signed_at("k682-sq-a", chrono::Utc::now()),
-            })
-            .await
-            .unwrap();
-
-        // THE BACKWARD STEP, as state: the last position handed out is now an
-        // hour ahead of the wall clock.
-        let future = rts::truncate_to_micros(chrono::Utc::now() + chrono::Duration::hours(1));
-        {
-            let conn = backend.conn.lock();
-            let n = conn
-                .execute(
-                    "UPDATE federation_keys SET admitted_at = ?1",
-                    rusqlite::params![future.to_rfc3339()],
-                )
-                .unwrap();
-            assert_eq!(n, 1, "the backward-step plant must touch the seeded row");
-        }
-
-        rts::assert_key_admission_survives_backward_step(&backend, "sq", future)
-            .await
-            .unwrap();
-    }
 
     /// #682 — the allocator reads `COALESCE(admitted_at, scrub_timestamp)`, the
     /// same expression the cursor orders by, not the bare column.
@@ -37938,227 +37631,6 @@ mod tests {
         );
     }
 
-    /// v16.0.0 (CIRISPersist#421) — the FULL LIFECYCLE with the revocation
-    /// plane under the REAL signature gate: publish → rotate → revoke →
-    /// re-establish, every transition asserted, plus the adversarial forgeries
-    /// (garbage sig / unrelated-but-registered signer / divergent typed
-    /// projection) each REJECTED with sealability unharmed. The occurrence
-    /// writes ride the trusted-local path (the occurrence gate has its own
-    /// #418 adversarial test); the REVOCATION writes go through
-    /// `put_identity_occurrence_revocation`'s gate with real hybrid crypto.
-    #[tokio::test]
-    async fn signed_revocation_full_lifecycle_and_forgeries() {
-        use crate::federation::FederationDirectory;
-        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
-        use ciris_crypto::{Ed25519Signer, MlDsa65Signer};
-        use ciris_verify_core::self_at_login::HybridSigningIdentity;
-        use ciris_verify_core::transport_binding::produce_signed_identity_occurrence;
-
-        let backend = SqliteBackend::open_in_memory().await.unwrap();
-        backend.run_migrations().await.unwrap();
-
-        // alice signs her own revocations; mallory is a REGISTERED but
-        // unrelated peer (the "any consented peer" of the attack).
-        let alice = Box::new(HybridSigningIdentity::new(
-            "alice",
-            Ed25519Signer::random().unwrap(),
-            MlDsa65Signer::new().unwrap(),
-        ));
-        let mallory = Box::new(HybridSigningIdentity::new(
-            "mallory",
-            Ed25519Signer::random().unwrap(),
-            MlDsa65Signer::new().unwrap(),
-        ));
-        let a_member = alice.directory_member().unwrap();
-        let m_member = mallory.directory_member().unwrap();
-        let mut a_rec = fed_key("alice", "alice", "alice");
-        a_rec.pubkey_ed25519_base64 = a_member.ed25519_public_key_base64.clone();
-        a_rec.pubkey_ml_dsa_65_base64 = a_member.mldsa65_public_key_base64.clone();
-        let mut m_rec = fed_key("mallory", "mallory", "mallory");
-        m_rec.pubkey_ed25519_base64 = m_member.ed25519_public_key_base64.clone();
-        m_rec.pubkey_ml_dsa_65_base64 = m_member.mldsa65_public_key_base64.clone();
-        for rec in [a_rec, m_rec] {
-            backend
-                .put_public_key(SignedKeyRecord { record: rec })
-                .await
-                .unwrap();
-        }
-        backend
-            .put_public_key(SignedKeyRecord {
-                record: fed_key("alice-phone", "alice", "alice-phone"),
-            })
-            .await
-            .unwrap();
-
-        let occ_at = |ts: &str, seed: u8| {
-            let mut o = occ_signed("alice", "alice-phone", Some(keyed_enc(seed)));
-            o.asserted_at = ts.parse().unwrap();
-            o
-        };
-        // (1) PUBLISH — resolvable.
-        backend
-            .put_identity_occurrence_local(occ_at("2026-06-14T00:00:00Z", 0x11))
-            .await
-            .unwrap();
-        assert!(backend
-            .resolve_encryption_keys("alice-phone")
-            .await
-            .unwrap()
-            .is_some());
-
-        // (2) ROTATE — a newer occurrence supersedes; still resolvable.
-        backend
-            .put_identity_occurrence_local(occ_at("2026-06-16T00:00:00Z", 0x22))
-            .await
-            .unwrap();
-        assert!(backend
-            .resolve_encryption_keys("alice-phone")
-            .await
-            .unwrap()
-            .is_some());
-
-        // The revocation envelope alice will sign (effective AFTER the rotate).
-        let rev_env = serde_json::json!({
-            "identity_key_id": "alice",
-            "occurrence_key_id": "alice-phone",
-            "revoked_at": "2026-06-18T00:00:00Z",
-            "effective_at": "2026-06-18T00:00:00Z",
-        });
-        let typed_rev = || crate::federation::IdentityOccurrenceRevocation {
-            identity_key_id: "alice".into(),
-            occurrence_key_id: "alice-phone".into(),
-            revoked_at: "2026-06-18T00:00:00Z".parse().unwrap(),
-            effective_at: "2026-06-18T00:00:00Z".parse().unwrap(),
-            reason: None,
-            witness_set: vec![],
-            persist_row_hash: String::new(),
-        };
-        // The producer is envelope-generic (#421 design note): the same
-        // `produce_signed_identity_occurrence` signs the revocation envelope.
-        let (signed_env, a_sig) =
-            produce_signed_identity_occurrence(alice.as_ref(), rev_env.clone())
-                .await
-                .unwrap();
-
-        // (3a) FORGED signature → REJECTED; sealability unharmed.
-        let mut bad_sig = a_sig.clone();
-        bad_sig.ed25519_signature_base64 = B64.encode([0u8; 64]);
-        let err = backend
-            .put_identity_occurrence_revocation(
-                crate::federation::SignedIdentityOccurrenceRevocation {
-                    identity_occurrence_revocation: typed_rev(),
-                    attesting_key_id: "alice".into(),
-                    signed_envelope: signed_env.clone(),
-                    signature: bad_sig,
-                },
-            )
-            .await
-            .expect_err("(3a) a forged revocation signature must be REJECTED");
-        assert_eq!(err.kind(), "federation_signature_invalid");
-        assert!(backend
-            .resolve_encryption_keys("alice-phone")
-            .await
-            .unwrap()
-            .is_some());
-
-        // (3b) UNRELATED-but-REGISTERED signer (mallory validly signs the
-        // victim's envelope with her own key) → signer_acts_for REJECTED.
-        let (m_env, m_sig) = produce_signed_identity_occurrence(mallory.as_ref(), rev_env.clone())
-            .await
-            .unwrap();
-        let err = backend
-            .put_identity_occurrence_revocation(
-                crate::federation::SignedIdentityOccurrenceRevocation {
-                    identity_occurrence_revocation: typed_rev(),
-                    attesting_key_id: "mallory".into(),
-                    signed_envelope: m_env,
-                    signature: m_sig,
-                },
-            )
-            .await
-            .expect_err("(3b) a peer's revocation of a victim must be REJECTED");
-        // v54.1.0 (#1042 follow-up) — the signature verifies; the signer does
-        // not act for alice: the typed signer-acts-for refusal.
-        assert_eq!(err.kind(), "federation_signer_not_acting_for");
-        assert!(backend
-            .resolve_encryption_keys("alice-phone")
-            .await
-            .unwrap()
-            .is_some());
-
-        // (3c) DIVERGENT typed projection (envelope says 06-18, typed claims
-        // 06-15 — moving the terminality clock) → REJECTED.
-        let mut divergent = typed_rev();
-        divergent.effective_at = "2026-06-15T00:00:00Z".parse().unwrap();
-        let err = backend
-            .put_identity_occurrence_revocation(
-                crate::federation::SignedIdentityOccurrenceRevocation {
-                    identity_occurrence_revocation: divergent,
-                    attesting_key_id: "alice".into(),
-                    signed_envelope: signed_env.clone(),
-                    signature: a_sig.clone(),
-                },
-            )
-            .await
-            .expect_err("(3c) a typed projection diverging from the envelope must be REJECTED");
-        assert!(format!("{err}").contains("diverges"), "got {err}");
-
-        // (4) GENUINE signed self-revocation → admitted; sealability killed;
-        //     the signed read returns the container byte-exact.
-        backend
-            .put_identity_occurrence_revocation(
-                crate::federation::SignedIdentityOccurrenceRevocation {
-                    identity_occurrence_revocation: typed_rev(),
-                    attesting_key_id: "alice".into(),
-                    signed_envelope: signed_env.clone(),
-                    signature: a_sig.clone(),
-                },
-            )
-            .await
-            .expect("(4) a genuinely-signed self-revocation must be admitted");
-        assert!(
-            backend
-                .resolve_encryption_keys("alice-phone")
-                .await
-                .unwrap()
-                .is_none(),
-            "(4) revoked ⇒ not sealable"
-        );
-        let signed_revs = backend
-            .list_signed_identity_occurrence_revocations_for("alice")
-            .await
-            .unwrap();
-        assert_eq!(
-            signed_revs.len(),
-            1,
-            "(4) signed read returns the container"
-        );
-        assert_eq!(signed_revs[0].signed_envelope, signed_env);
-        assert_eq!(
-            signed_revs[0].signature.ed25519_signature_base64,
-            a_sig.ed25519_signature_base64
-        );
-
-        // (5) RE-ESTABLISH — a fresh occurrence asserted AFTER the revocation
-        //     recovers sealability under the same key_id.
-        backend
-            .put_identity_occurrence_local(occ_at("2026-06-20T00:00:00Z", 0x33))
-            .await
-            .unwrap();
-        assert!(
-            backend
-                .resolve_encryption_keys("alice-phone")
-                .await
-                .unwrap()
-                .is_some(),
-            "(5) a fresh occurrence re-establishes after the revoke"
-        );
-        // (The stale-occurrence / replayed-old-revocation no-ops are covered in
-        // `resolve_encryption_keys_excludes_revoked_occurrence` — the fold
-        // comparator test; the GATED occurrence path additionally refuses the
-        // downgrade via last-signed-wins, per the #418 adversarial test.)
-    }
-
     /// v14.1.0 (CIRISPersist#418 replication read) — the load-bearing property
     /// for CIRISEdge#305: `list_signed_identity_occurrences_for` reconstructs
     /// the signature container BYTE-EXACT, so re-`put`ting the read row on a
@@ -40300,57 +39772,6 @@ mod tests {
     //     returns it byte-exact, and assert `since == the row's own cursor`
     //     excludes it (strict `>`).
 
-    /// `list_signed_key_records_since` returns exactly the one registered
-    /// `SignedKeyRecord`, byte-identical to the stored row.
-    #[tokio::test]
-    async fn list_signed_key_records_since_507c() {
-        let backend = SqliteBackend::open_in_memory().await.unwrap();
-        backend.run_migrations().await.unwrap();
-        let key = fed_key("kr507-key", "acme", "kr507-key");
-        backend
-            .put_public_key(SignedKeyRecord {
-                record: key.clone(),
-            })
-            .await
-            .unwrap();
-
-        let rows = backend
-            .list_signed_key_records_since(None, 100)
-            .await
-            .unwrap();
-        assert_eq!(rows.len(), 1);
-        let mut expect = key;
-        expect.persist_row_hash =
-            crate::federation::types::compute_persist_row_hash(&expect).unwrap();
-        // v31.4.0 (#682) — the RECORD is compared, not the served wrapper.
-        // `ServedKeyRecord::admitted_at` is node-local and deliberately outside
-        // the record's bytes, so that one record hashes identically on every
-        // node; comparing the wrapper would assert the opposite.
-        assert_eq!(
-            serde_json::to_vec(&SignedKeyRecord {
-                record: expect.clone()
-            })
-            .unwrap(),
-            serde_json::to_vec(&SignedKeyRecord {
-                record: rows[0].record.clone()
-            })
-            .unwrap(),
-            "returned SignedKeyRecord must be byte-identical to the stored row"
-        );
-
-        // v31.4.0 (#682/#668) — the cursor is the PAIR, and it is the row's own
-        // ADMISSION position, not its `scrub_timestamp`. Resuming from a row's
-        // own pair must exclude that row and nothing else (strict `>`).
-        let excluded = backend
-            .list_signed_key_records_since(
-                Some((rows[0].admitted_at, rows[0].record.key_id.clone())),
-                100,
-            )
-            .await
-            .unwrap();
-        assert!(excluded.is_empty(), "since == cursor must exclude the row");
-    }
-
     /// `list_attestations_since` returns exactly the one federation-tier
     /// attestation (federation-TIER ROWS ONLY, the E5 invariant) and excludes
     /// a local-tier row.
@@ -40402,125 +39823,6 @@ mod tests {
         // v36.0.0 (#668) — `since` at the row's own resume PAIR excludes it.
         let excluded = backend
             .list_attestations_since(Some(rows[0].resume_pair()), 100)
-            .await
-            .unwrap();
-        assert!(excluded.is_empty(), "since == cursor must exclude the row");
-    }
-
-    /// `list_signed_identity_occurrences_since` returns exactly the one
-    /// signed-put occurrence, byte-identical (including the detached
-    /// signature container), and the since-cursor excludes it at
-    /// `since == asserted_at`.
-    #[tokio::test]
-    async fn list_signed_identity_occurrences_since_507c() {
-        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
-        use ciris_crypto::{Ed25519Signer, MlDsa65Signer};
-        use ciris_verify_core::self_at_login::HybridSigningIdentity;
-        use ciris_verify_core::transport_binding::{
-            compute_destination_hash, produce_signed_identity_occurrence,
-        };
-
-        let backend = SqliteBackend::open_in_memory().await.unwrap();
-        backend.run_migrations().await.unwrap();
-
-        let signer = Box::new(HybridSigningIdentity::new(
-            "io507-id",
-            Ed25519Signer::random().unwrap(),
-            MlDsa65Signer::new().unwrap(),
-        ));
-        let member = signer.directory_member().unwrap();
-        let mut id_rec = fed_key("io507-id", "acme", "io507-id");
-        id_rec.pubkey_ed25519_base64 = member.ed25519_public_key_base64.clone();
-        id_rec.pubkey_ml_dsa_65_base64 = member.mldsa65_public_key_base64.clone();
-        backend
-            .put_public_key(SignedKeyRecord { record: id_rec })
-            .await
-            .unwrap();
-        backend
-            .put_public_key(SignedKeyRecord {
-                record: fed_key("io507-occ", "acme", "io507-occ"),
-            })
-            .await
-            .unwrap();
-
-        let transport_ed = [0x41u8; 32];
-        let transport_x = [0x42u8; 32];
-        let content_x = [0x43u8; 32];
-        let app = "ciris.federation";
-        let aspects = vec!["announce".to_string(), "v1".to_string()];
-        let dest_hash =
-            compute_destination_hash(app, &aspects, &transport_x, &transport_ed).unwrap();
-        let envelope = serde_json::json!({
-            // v31.0.0 (CIRISVerify 13.1.0) - bound; see `self_at_login`.
-            "attesting_key_id": "io507-id",
-            "identity_key_id": "io507-id",
-            "occurrence_key_id": "io507-occ",
-            "transport_destination": {
-                "reticulum_x25519_pubkey": B64.encode(transport_x),
-                "reticulum_ed25519_pubkey": B64.encode(transport_ed),
-                "destination_hash": B64.encode(dest_hash),
-                "app_name": app,
-                "aspects": aspects,
-            },
-            "encryption_pubkeys": {
-                "x25519_base64": B64.encode(content_x),
-                "ml_kem_768_base64": B64.encode(vec![0x44u8; 1184]),
-            },
-            "asserted_at": "2026-06-10T00:00:00.000Z",
-        });
-        let (signed_envelope, signature) =
-            produce_signed_identity_occurrence(signer.as_ref(), envelope)
-                .await
-                .unwrap();
-        let signed = crate::federation::SignedIdentityOccurrence {
-            identity_occurrence: crate::federation::IdentityOccurrence {
-                identity_key_id: "io507-id".into(),
-                occurrence_key_id: "io507-occ".into(),
-                device_class: crate::federation::types::device_class::LAPTOP.into(),
-                hardware_attestation: None,
-                asserted_at: "2026-06-10T00:00:00Z".parse().unwrap(),
-                valid_until: None,
-                encryption_pubkeys: Some(crate::federation::EncryptionPubkeys {
-                    x25519_base64: B64.encode(content_x),
-                    ml_kem_768_base64: B64.encode(vec![0x44u8; 1184]),
-                }),
-                transport_binding: Some(crate::federation::types::OccurrenceTransportBinding {
-                    reticulum_x25519_pubkey_base64: B64.encode(transport_x),
-                    reticulum_ed25519_pubkey_base64: B64.encode(transport_ed),
-                    destination_hash_base64: B64.encode(dest_hash),
-                    app_name: app.into(),
-                    aspects: aspects.clone(),
-                }),
-                persist_row_hash: String::new(),
-            },
-            attesting_key_id: "io507-id".to_string(),
-            signed_envelope,
-            signature,
-        };
-        backend
-            .put_identity_occurrence(signed.clone())
-            .await
-            .expect("genuinely-signed occurrence must be admitted");
-
-        let rows = backend
-            .list_signed_identity_occurrences_since(None, 100)
-            .await
-            .unwrap();
-        assert_eq!(rows.len(), 1);
-        let mut expect = signed;
-        expect.identity_occurrence.persist_row_hash =
-            crate::federation::types::compute_persist_row_hash(&expect.identity_occurrence)
-                .unwrap();
-        assert_eq!(
-            serde_json::to_vec(&expect).unwrap(),
-            serde_json::to_vec(&rows[0].occurrence).unwrap(),
-            "returned SignedIdentityOccurrence must be byte-identical to what was put \
-             (the serve position rides BESIDE the record, never inside it)"
-        );
-
-        // v36.0.0 (#668) — `since` at the row's own resume PAIR excludes it.
-        let excluded = backend
-            .list_signed_identity_occurrences_since(Some(rows[0].resume_pair()), 100)
             .await
             .unwrap();
         assert!(excluded.is_empty(), "since == cursor must exclude the row");
@@ -40979,109 +40281,6 @@ mod tests {
             hex::encode(dest_hash),
             "hex destination preserved — the #393 item-2 probe hits a SIGNED row"
         );
-    }
-
-    /// `list_signed_identity_occurrence_revocations_since` returns exactly
-    /// the one signed-put revocation, byte-identical to what was submitted.
-    #[tokio::test]
-    async fn list_signed_identity_occurrence_revocations_since_507c() {
-        use ciris_crypto::{Ed25519Signer, MlDsa65Signer};
-        use ciris_verify_core::self_at_login::HybridSigningIdentity;
-        use ciris_verify_core::transport_binding::produce_signed_identity_occurrence;
-
-        let backend = SqliteBackend::open_in_memory().await.unwrap();
-        backend.run_migrations().await.unwrap();
-
-        let alice = Box::new(HybridSigningIdentity::new(
-            "ior507-id",
-            Ed25519Signer::random().unwrap(),
-            MlDsa65Signer::new().unwrap(),
-        ));
-        let member = alice.directory_member().unwrap();
-        let mut id_rec = fed_key("ior507-id", "acme", "ior507-id");
-        id_rec.pubkey_ed25519_base64 = member.ed25519_public_key_base64.clone();
-        id_rec.pubkey_ml_dsa_65_base64 = member.mldsa65_public_key_base64.clone();
-        backend
-            .put_public_key(SignedKeyRecord { record: id_rec })
-            .await
-            .unwrap();
-        backend
-            .put_public_key(SignedKeyRecord {
-                record: fed_key("ior507-occ", "acme", "ior507-occ"),
-            })
-            .await
-            .unwrap();
-        // The occurrence itself rides the trusted-local path (the occurrence
-        // gate has its own dedicated adversarial tests); the revocation write
-        // goes through `put_identity_occurrence_revocation`'s REAL gate.
-        backend
-            .put_identity_occurrence_local(crate::federation::IdentityOccurrence {
-                identity_key_id: "ior507-id".into(),
-                occurrence_key_id: "ior507-occ".into(),
-                device_class: crate::federation::types::device_class::LAPTOP.into(),
-                hardware_attestation: None,
-                asserted_at: "2026-06-08T00:00:00Z".parse().unwrap(),
-                valid_until: None,
-                encryption_pubkeys: None,
-                transport_binding: None,
-                persist_row_hash: String::new(),
-            })
-            .await
-            .unwrap();
-
-        let rev_env = serde_json::json!({
-            "identity_key_id": "ior507-id",
-            "occurrence_key_id": "ior507-occ",
-            "revoked_at": "2026-06-10T00:00:00Z",
-            "effective_at": "2026-06-10T00:00:00Z",
-        });
-        let (signed_envelope, signature) =
-            produce_signed_identity_occurrence(alice.as_ref(), rev_env)
-                .await
-                .unwrap();
-        let signed = crate::federation::SignedIdentityOccurrenceRevocation {
-            identity_occurrence_revocation: crate::federation::IdentityOccurrenceRevocation {
-                identity_key_id: "ior507-id".into(),
-                occurrence_key_id: "ior507-occ".into(),
-                revoked_at: "2026-06-10T00:00:00Z".parse().unwrap(),
-                effective_at: "2026-06-10T00:00:00Z".parse().unwrap(),
-                reason: None,
-                witness_set: vec![],
-                persist_row_hash: String::new(),
-            },
-            attesting_key_id: "ior507-id".into(),
-            signed_envelope,
-            signature,
-        };
-        backend
-            .put_identity_occurrence_revocation(signed.clone())
-            .await
-            .expect("genuinely-signed self-revocation must be admitted");
-
-        let rows = backend
-            .list_signed_identity_occurrence_revocations_since(None, 100)
-            .await
-            .unwrap();
-        assert_eq!(rows.len(), 1);
-        let mut expect = signed;
-        expect.identity_occurrence_revocation.persist_row_hash =
-            crate::federation::types::compute_persist_row_hash(
-                &expect.identity_occurrence_revocation,
-            )
-            .unwrap();
-        assert_eq!(
-            serde_json::to_vec(&expect).unwrap(),
-            serde_json::to_vec(&rows[0].revocation).unwrap(),
-            "returned SignedIdentityOccurrenceRevocation must be byte-identical to what was put \
-             (the serve position rides BESIDE the record, never inside it)"
-        );
-
-        // v36.0.0 (#668) — `since` at the row's own resume PAIR excludes it.
-        let excluded = backend
-            .list_signed_identity_occurrence_revocations_since(Some(rows[0].resume_pair()), 100)
-            .await
-            .unwrap();
-        assert!(excluded.is_empty(), "since == cursor must exclude the row");
     }
 
     // ─── v21.1.0 (CIRISPersist#507b) — the content-hash point-read + full-
@@ -47151,8 +46350,15 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(atts.items.len(), 1);
-        assert_eq!(atts.items[0].attestation_id, "att-1");
+        // v58.0.0 (CIRISPersist#991) — the revocation is also a
+        // `key:revocation:v1` row on the plane.
+        let atts: Vec<_> = atts
+            .items
+            .iter()
+            .filter(|a| !crate::federation::key_plane::is_key_plane_row(a))
+            .collect();
+        assert_eq!(atts.len(), 1);
+        assert_eq!(atts[0].attestation_id, "att-1");
 
         let revs = backend
             .list_revocations(

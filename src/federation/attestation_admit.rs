@@ -371,11 +371,27 @@ pub(crate) async fn put_attestation_planned<D>(
 where
     D: AttestationStore,
 {
+    // v58.0.0 (CIRISPersist#991, CC 3.1.3) — a key-plane row goes to its
+    // family's door: proof of possession, not resolve-the-attester; the
+    // object's own signature, not one over the row's envelope.
+    if super::key_plane::is_key_plane_row(&attestation.attestation) {
+        use super::key_plane::KeyPlaneApplied;
+        return match super::key_plane::apply_key_plane_row(dir, &attestation.attestation).await? {
+            KeyPlaneApplied::Changed => Ok(AttestationOutcome::Inserted),
+            KeyPlaneApplied::Unchanged => Ok(AttestationOutcome::AlreadyHeld),
+            KeyPlaneApplied::Refused(reason) => Err(Error::Conflict(format!(
+                "key-plane row {} not applied: {reason}",
+                attestation.attestation.attestation_id
+            ))),
+        };
+    }
     // v53.0.0 (#963) — a row that changes an owner's cohort allow list for
     // one of its nodes (a `consent:replication` grant FOR the node, or the
     // owner's retraction of one): read before the row moves, acted on only
     // when the store inserted it.
     let consent_change = super::consent_list_change_of(dir, &attestation.attestation).await;
+    let occurrence_withdrawal =
+        super::key_plane::occurrence_withdrawal_of(dir, &attestation.attestation).await?;
     // v56.0.0 (CIRISPersist#934, CC review condition 1) — the ONE clock read
     // of this door, and the row's signed instant: the plan's two inputs. The
     // plan reads no clock of its own and the executor reads none either. A
@@ -402,6 +418,15 @@ where
     .await;
     if let (Ok(AttestationOutcome::Inserted), Some((owner, node))) = (&outcome, consent_change) {
         super::rewrap_after_admission(dir, &owner, &node).await;
+    }
+    // v58.0.0 (CIRISPersist#991, CC 3.3.6) — an admitted `withdraws` against an
+    // `identity:occurrence:v1` row feeds the occurrence-revocation projection
+    // (`federation_identity_occurrence_revocations`, this node's local read
+    // model: eviction, transport-route retirement).
+    if let (Ok(AttestationOutcome::Inserted), Some(revocation)) = (&outcome, occurrence_withdrawal)
+    {
+        dir.put_identity_occurrence_revocation_local(revocation)
+            .await?;
     }
     outcome
 }

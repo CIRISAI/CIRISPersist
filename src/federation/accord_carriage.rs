@@ -26,7 +26,7 @@
 //! declared revoking key resolved from its OWN `federation_keys` before the
 //! row lands. The receive side was therefore already correct; only the SERVE
 //! side was missing. A plain cursor
-//! ([`FederationDirectory::list_signed_revocations_since`](super::FederationDirectory::list_signed_revocations_since))
+//! (`FederationDirectory::list_signed_revocations_since` (retired in v58.0.0))
 //! is the whole fix, and the plane joins the shared `signed_wire_index`
 //! alongside the other fourteen.
 //!
@@ -674,14 +674,13 @@ pub async fn project_role_withdrawals_for_proposal(
     proposal: &AccordProposal,
     roster_key_ids: &[String],
 ) -> Result<Vec<(String, String)>, Error> {
-    let candidates = directory
-        .list_signed_key_records_since(None, u32::MAX)
-        .await?;
+    // v58.0.0 (CIRISPersist#991) — the key plane's rows, as a peer pulls them.
+    let candidates = super::key_plane::key_records_on_the_plane(directory).await?;
     let proposal_digest = proposal.digest();
     let mut projected: Vec<(String, String)> = Vec::new();
     for candidate in &candidates {
-        let key_id = &candidate.record.key_id;
-        for (op, role) in withdrawal_ops_for(&candidate.record) {
+        let key_id = &candidate.key_id;
+        for (op, role) in withdrawal_ops_for(candidate) {
             if canonical_withdrawal_payload_sha256(&op, key_id, None)? != proposal.payload_sha256 {
                 continue;
             }
@@ -2050,10 +2049,12 @@ pub(crate) mod carriage_tests {
             .expect("the self-revocation must be admitted");
 
         // ── The cursor exists and finds the row. ──
-        let all = dir
-            .list_signed_revocations_since(None, u32::MAX)
-            .await
-            .expect("the exclusion plane must be servable");
+        let all = crate::federation::key_plane::test_support::served_revocations(
+            dir.as_dyn_directory(),
+            u32::MAX,
+        )
+        .await
+        .expect("the exclusion plane must be servable");
         let served = all
             .iter()
             .find(|r| r.revocation.revocation_id == revocation_id)
@@ -2067,10 +2068,12 @@ pub(crate) mod carriage_tests {
         //    excludes it, so a caller resuming from its last page does not
         //    re-read (#668). ──
         let position = served.resume_pair();
-        let after = dir
-            .list_signed_revocations_since(Some(position.clone()), u32::MAX)
+        let after = crate::federation::key_plane::test_support::served_revocations(dir, u32::MAX)
             .await
-            .unwrap();
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.resume_pair() > position)
+            .collect::<Vec<_>>();
         assert!(
             !after
                 .iter()
@@ -2162,10 +2165,12 @@ pub(crate) mod carriage_tests {
              anti-rollback latch is per-subject",
         );
 
-        let resumed = dir
-            .list_signed_revocations_since(Some(position.clone()), u32::MAX)
+        let resumed = crate::federation::key_plane::test_support::served_revocations(dir, u32::MAX)
             .await
-            .unwrap();
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.resume_pair() > position)
+            .collect::<Vec<_>>();
         let late_served = resumed
             .iter()
             .find(|r| r.revocation.revocation_id == late_id)
@@ -2192,20 +2197,26 @@ pub(crate) mod carriage_tests {
         //    into a content hash would make one revocation hash differently on
         //    every node holding it. A content hash covers the record; the
         //    cursor covers this node's view of it. ──
-        let wrapped = crate::federation::SignedRevocation {
-            revocation: served.revocation.clone(),
-        };
+        // v58.0.0 (CIRISPersist#991) — the revocation rides as its
+        // `key:revocation:v1` row: the index entry is that row's.
+        let row = crate::federation::key_plane::revocation_row(&served.revocation)
+            .expect("the revocation's row");
+        let held = dir
+            .get_attestation(&row.attestation_id)
+            .await
+            .unwrap()
+            .expect("the revocation's row is held");
         let content_hash =
-            crate::federation::wire_index::content_hash_of(&wrapped).expect("hash the record");
+            crate::federation::wire_index::content_hash_of(&held).expect("hash the row");
         let bytes = dir
-            .lookup_signed_record_by_content_hash("Revocation", &content_hash)
+            .lookup_signed_record_by_content_hash("Attestation", &content_hash)
             .await
             .expect("the point read must be wired for this kind")
             .expect("the put path must have indexed the row");
         assert_eq!(
             bytes,
-            serde_json::to_vec(&wrapped).unwrap(),
-            "the index resolves to the exact record bytes, cursor position excluded"
+            serde_json::to_vec(&held).unwrap(),
+            "the index resolves to the exact row bytes, cursor position excluded"
         );
 
         // ── PR #667 review P1 — DISCOVERABLE, not merely fetchable. The
@@ -2219,17 +2230,14 @@ pub(crate) mod carriage_tests {
             .expect("subject-scoped refs");
         let revocation_ref = refs
             .iter()
-            .find(|(kind, _, _)| *kind == "Revocation")
-            .expect("the subject's revocation must be advertised");
+            .find(|(kind, hash, _)| *kind == "Attestation" && *hash == content_hash)
+            .expect("the subject's revocation row must be advertised");
         assert_eq!(
-            revocation_ref.1, content_hash,
-            "the advertised hash must be the one the point read resolves"
-        );
-        assert_eq!(
-            crate::federation::wire_index::record_key_field(&revocation_ref.2, "revocation_id")
+            crate::federation::wire_index::record_key_field(&revocation_ref.2, "attestation_id")
                 .unwrap(),
-            revocation_id
+            row.attestation_id
         );
+        let _ = &revocation_id;
     }
 
     // ─────────────────────────────────────────────────────────────────

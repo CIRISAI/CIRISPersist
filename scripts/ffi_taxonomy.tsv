@@ -167,7 +167,6 @@ Engine	apply_replicated_key_grant	deontic
 Engine	apply_replicated_key_record	deontic
 Engine	attach_attestation_pqc_signature	ontological
 Engine	attach_key_pqc_signature	ontological	
-Engine	attach_revocation_pqc_signature	ontological	
 Engine	attestation_insert_local	empirical	
 Engine	attestation_insert_local_many	empirical	
 Engine	attestation_upsert_local	empirical	
@@ -454,13 +453,9 @@ Engine	list_signed_communities_since	epistemic
 Engine	list_signed_community_membership_revocations_since	epistemic	
 Engine	list_signed_families_since	epistemic	
 Engine	list_signed_family_membership_revocations_since	epistemic	
-Engine	list_signed_identity_occurrence_revocations_since	epistemic	
 Engine	list_signed_identity_occurrences_for_json	epistemic	
-Engine	list_signed_identity_occurrences_since	epistemic	
-Engine	list_signed_key_records_since	epistemic	
 Engine	list_signed_location_proofs_since	epistemic	
 Engine	list_signed_partner_records_since	epistemic
-Engine	list_signed_revocations_since	epistemic
 Engine	list_signed_transport_destinations_since	epistemic
 Engine	list_subscriptions	structural	
 Engine	list_tasks	empirical	

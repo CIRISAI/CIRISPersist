@@ -103,6 +103,11 @@ pub enum AttestationRefusalReason {
     /// untouched, and the record is safe to re-offer — the next round's plan
     /// names the conflict precisely.
     StoreConflict,
+    /// v58.0.0 (CIRISPersist#991) — a key-plane row (`key:record:v1`,
+    /// `key:revocation:v1`, `identity:occurrence:v1`) whose family door did not
+    /// apply its object; the door's own reason is logged with the row id.
+    /// APPENDED.
+    KeyPlaneRefused,
 }
 
 impl AttestationRefusalReason {
@@ -117,6 +122,7 @@ impl AttestationRefusalReason {
             Self::ConflictingAttestation => "conflicting_attestation",
             Self::AlreadyPresentIdentical => "already_present_identical",
             Self::StoreConflict => "store_conflict",
+            Self::KeyPlaneRefused => "key_plane_refused",
         }
     }
 
@@ -126,6 +132,7 @@ impl AttestationRefusalReason {
         Self::ConflictingAttestation,
         Self::AlreadyPresentIdentical,
         Self::StoreConflict,
+        Self::KeyPlaneRefused,
     ];
 }
 
@@ -328,6 +335,25 @@ where
     use ReplicatedAttestationPlan as Plan;
     let incoming = &attestation.attestation;
     let attestation_id = incoming.attestation_id.clone();
+    // v58.0.0 (CIRISPersist#991, CC 3.1.3) — a key-plane row is applied by its
+    // family's door, ahead of the generic plan: a key's newer claim is a new
+    // row that replaces its older one, which the generic same-id plan would
+    // read as a conflict.
+    if super::key_plane::is_key_plane_row(incoming) {
+        use super::key_plane::KeyPlaneApplied;
+        return Ok(
+            match super::key_plane::apply_key_plane_row(dir, incoming).await? {
+                KeyPlaneApplied::Changed => Outcome::Inserted,
+                KeyPlaneApplied::Unchanged => Outcome::Unchanged,
+                KeyPlaneApplied::Refused(reason) => {
+                    tracing::info!(attestation_id = %attestation_id, reason, "key-plane row refused");
+                    Outcome::Refused {
+                        reason: AttestationRefusalReason::KeyPlaneRefused,
+                    }
+                }
+            },
+        );
+    }
     // v50.0.0 (CIRISPersist#916) — an owner-binding is the moment a minter
     // learns a member has a device; read before the row is moved.
     let binding = super::owner_binding_of(incoming);

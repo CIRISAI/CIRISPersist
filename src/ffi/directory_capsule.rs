@@ -115,7 +115,7 @@ use crate::federation::types::{
     Attestation, Community, CommunityMembershipRevocation, Family, FamilyMembershipRevocation,
     HybridPendingRow, IdentityOccurrence, IdentityOccurrenceRevocation, KeyRecord, LocationProof,
     PeerMetadataRow, Revocation, SignedCommunityMembershipRevocation,
-    SignedFamilyMembershipRevocation, SignedIdentityOccurrenceRevocation,
+    SignedFamilyMembershipRevocation,
 };
 use crate::federation::{accord_quorum, cohort, self_at_login, shared_instance, types, Error};
 use crate::federation::{
@@ -259,7 +259,7 @@ type BoxedFut = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 ///     "persist directory_capsule ABI version mismatch — pin floor too low"
 /// );
 /// ```
-pub const DIRECTORY_ABI_VERSION: u32 = 7;
+pub const DIRECTORY_ABI_VERSION: u32 = 8;
 
 /// A `FederationDirectory` operation, serialized by the consumer and
 /// dispatched inside persist's `.so`.
@@ -576,17 +576,6 @@ pub enum DirectoryOp {
         /// The subject `key_id` whose records to enumerate.
         subject_key_id: String,
     },
-    /// [`FederationDirectory::put_identity_occurrence_revocation`] (#421) — the
-    /// SIGNED revocation apply: the wire path edge's replication bridge drives
-    /// (`apply_identity_occurrence_revocation` delegates to `put`, exactly like
-    /// the occurrence). The gate (hybrid 1-of-1 over `JCS(signed_envelope)` +
-    /// `signer_acts_for` + divergence check) runs INSIDE persist's `.so` at
-    /// dispatch — a forged revocation is refused before any write. Result rides
-    /// `Unit`. APPEND-ONLY.
-    PutIdentityOccurrenceRevocation {
-        /// The signed revocation container to admit.
-        revocation: crate::federation::SignedIdentityOccurrenceRevocation,
-    },
     /// [`FederationDirectory::put_signed_transport_destination`] (#443) — the
     /// AUTHENTICATED route-plane replication apply: the wire path edge's
     /// replication bridge drives instead of the trusted-local
@@ -796,33 +785,6 @@ pub enum DirectoryOp {
         /// Page cap.
         limit: u32,
     },
-    /// [`FederationDirectory::list_signed_key_records_since`] (v21.1.0,
-    /// CIRISPersist#507c) — bulk-list `SignedKeyRecord` wrappers since a
-    /// cursor, for the edge advertise/serve responder. Result rides
-    /// `SignedKeyRecords`. APPEND-ONLY.
-    ListSignedKeyRecordsSince {
-        /// Cursor: rows strictly after `(admitted_at, key_id)` (None ⇒ from
-        /// start).
-        ///
-        /// v31.4.0 (#682/#668) — the PAIR, and THIS node's admission position
-        /// rather than the producer's `scrub_timestamp`. A record signed in
-        /// January, replicated late and admitted in February, sorted under
-        /// January and was never served past it; and a resume on the instant
-        /// alone skips the remainder of any tie larger than one page.
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        /// Page cap.
-        limit: u32,
-    },
-    /// [`FederationDirectory::list_signed_identity_occurrences_since`]
-    /// (v21.1.0, CIRISPersist#507c). Structural mirror of
-    /// [`DirectoryOp::ListSignedKeyRecordsSince`]. Result rides
-    /// `SignedIdentityOccurrences`. APPEND-ONLY.
-    ListSignedIdentityOccurrencesSince {
-        /// Cursor: rows with `asserted_at > since` (None ⇒ from start).
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        /// Page cap.
-        limit: u32,
-    },
     /// [`FederationDirectory::list_signed_transport_destinations_since`]
     /// (v21.1.0, CIRISPersist#507c). Structural mirror of
     /// [`DirectoryOp::ListSignedKeyRecordsSince`]. Result rides
@@ -838,16 +800,6 @@ pub enum DirectoryOp {
     /// invariant). Result rides `Attestations`. APPEND-ONLY.
     ListAttestationsSince {
         /// Cursor: rows with `asserted_at > since` (None ⇒ from start).
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        /// Page cap.
-        limit: u32,
-    },
-    /// [`FederationDirectory::list_signed_identity_occurrence_revocations_since`]
-    /// (v21.1.0, CIRISPersist#507c). Structural mirror of
-    /// [`DirectoryOp::ListSignedKeyRecordsSince`]. Result rides
-    /// `SignedIdentityOccurrenceRevocationsSince`. APPEND-ONLY.
-    ListSignedIdentityOccurrenceRevocationsSince {
-        /// Cursor: rows with `revoked_at > since` (None ⇒ from start).
         since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         /// Page cap.
         limit: u32,
@@ -887,15 +839,6 @@ pub enum DirectoryOp {
     RevocationsFor {
         /// The subject whose revocations to list.
         revoked_key_id: String,
-    },
-    /// [`FederationDirectory::list_signed_revocations_since`] (v31.1.0,
-    /// CIRISPersist#655) — the exclusion plane's serve cursor. Result rides
-    /// `SignedRevocations`. APPEND-ONLY.
-    ListSignedRevocationsSince {
-        /// Cursor: rows with `scrub_timestamp > since` (None ⇒ from start).
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        /// Page cap.
-        limit: u32,
     },
     /// [`FederationDirectory::list_signed_accord_quorum_evidence_since`]
     /// (v31.1.0, CIRISPersist#662) — the signed accord EVIDENCE cursor.
@@ -1239,23 +1182,12 @@ pub enum DirectoryOpResult {
     /// v48.0.0 (CIRISPersist#860) — `list_signed_community_membership_widenings_since`.
     /// APPEND-ONLY.
     SignedCommunityMembershipWidenings(Vec<crate::federation::ServedCommunityMembershipWidening>),
-    /// `list_signed_key_records_since` (v21.1.0, CIRISPersist#507c).
-    /// APPEND-ONLY.
-    SignedKeyRecords(Vec<crate::federation::ServedKeyRecord>),
-    /// `list_signed_identity_occurrences_since` (v21.1.0, CIRISPersist#507c).
-    /// APPEND-ONLY.
-    SignedIdentityOccurrencesSince(Vec<crate::federation::ServedIdentityOccurrence>),
     /// `list_signed_transport_destinations_since` (v21.1.0,
     /// CIRISPersist#507c). APPEND-ONLY.
     SignedTransportDestinationsSince(Vec<crate::federation::ServedTransportDestination>),
     /// `list_attestations_since` (v21.1.0, CIRISPersist#507c) — federation-
     /// tier-only rows. APPEND-ONLY.
     Attestations(Vec<crate::federation::ServedAttestation>),
-    /// `list_signed_identity_occurrence_revocations_since` (v21.1.0,
-    /// CIRISPersist#507c). APPEND-ONLY.
-    SignedIdentityOccurrenceRevocationsSince(
-        Vec<crate::federation::ServedIdentityOccurrenceRevocation>,
-    ),
     /// `lookup_signed_record_by_content_hash` (v21.1.0, CIRISPersist#507b) —
     /// the re-serialized record bytes, or `None` on a miss/index-mismatch.
     /// APPEND-ONLY.
@@ -1266,9 +1198,6 @@ pub enum DirectoryOpResult {
     TransitEligibility(crate::federation::trust_root::TransitEligibility),
     /// `revocations_for` (v31.1.0, CIRISPersist#655). APPEND-ONLY.
     Revocations(Vec<Revocation>),
-    /// `list_signed_revocations_since` (v31.1.0, CIRISPersist#655).
-    /// APPEND-ONLY.
-    SignedRevocations(Vec<crate::federation::ServedRevocation>),
     /// `list_signed_accord_quorum_evidence_since` (v31.1.0,
     /// CIRISPersist#662). APPEND-ONLY.
     AccordQuorumEvidence(Vec<crate::federation::accord_carriage::AccordQuorumEvidence>),
@@ -1475,12 +1404,6 @@ pub async fn dispatch_directory_op(
             Ok(v) => DirectoryOpResult::SignedReplicatedRecords(v),
             Err(e) => DirectoryOpResult::Err(e.to_string()),
         },
-        DirectoryOp::PutIdentityOccurrenceRevocation { revocation } => {
-            match dir.put_identity_occurrence_revocation(revocation).await {
-                Ok(()) => DirectoryOpResult::Unit,
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
-            }
-        }
         // #443 — the gate + monotonic apply run INSIDE persist's .so against
         // persist's own vtable; the consumer gets the policy outcome, and a
         // gate failure flattens to the top-level Err (record inadmissible).
@@ -1623,12 +1546,6 @@ pub async fn dispatch_directory_op(
         DirectoryOp::RevocationsFor { revoked_key_id } => {
             match dir.revocations_for(&revoked_key_id).await {
                 Ok(v) => DirectoryOpResult::Revocations(v),
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
-            }
-        }
-        DirectoryOp::ListSignedRevocationsSince { since, limit } => {
-            match dir.list_signed_revocations_since(since, limit).await {
-                Ok(v) => DirectoryOpResult::SignedRevocations(v),
                 Err(e) => DirectoryOpResult::Err(e.to_string()),
             }
         }
@@ -1935,21 +1852,6 @@ pub async fn dispatch_directory_op(
                 Err(e) => DirectoryOpResult::Err(e.to_string()),
             }
         }
-        DirectoryOp::ListSignedKeyRecordsSince { since, limit } => {
-            match dir.list_signed_key_records_since(since, limit).await {
-                Ok(v) => DirectoryOpResult::SignedKeyRecords(v),
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
-            }
-        }
-        DirectoryOp::ListSignedIdentityOccurrencesSince { since, limit } => {
-            match dir
-                .list_signed_identity_occurrences_since(since, limit)
-                .await
-            {
-                Ok(v) => DirectoryOpResult::SignedIdentityOccurrencesSince(v),
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
-            }
-        }
         DirectoryOp::ListSignedTransportDestinationsSince { since, limit } => {
             match dir
                 .list_signed_transport_destinations_since(since, limit)
@@ -1962,15 +1864,6 @@ pub async fn dispatch_directory_op(
         DirectoryOp::ListAttestationsSince { since, limit } => {
             match dir.list_attestations_since(since, limit).await {
                 Ok(v) => DirectoryOpResult::Attestations(v),
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
-            }
-        }
-        DirectoryOp::ListSignedIdentityOccurrenceRevocationsSince { since, limit } => {
-            match dir
-                .list_signed_identity_occurrence_revocations_since(since, limit)
-                .await
-            {
-                Ok(v) => DirectoryOpResult::SignedIdentityOccurrenceRevocationsSince(v),
                 Err(e) => DirectoryOpResult::Err(e.to_string()),
             }
         }
@@ -3507,25 +3400,6 @@ impl FederationDirectory for OpsDirectory {
             method: "list_communities_for_member",
         })
     }
-    async fn put_identity_occurrence_revocation(
-        &self,
-        revocation: SignedIdentityOccurrenceRevocation,
-    ) -> Result<(), Error> {
-        // #421 — routed (was Error::Unsupported): the wire apply for SIGNED
-        // revocations, so the replication bridge's
-        // `apply_identity_occurrence_revocation` reaches persist's gate
-        // (verify-before-mutation inside the .so) exactly like the occurrence.
-        match self
-            .run_op(&DirectoryOp::PutIdentityOccurrenceRevocation { revocation })
-            .await?
-        {
-            DirectoryOpResult::Unit => Ok(()),
-            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
-            _ => Err(Error::Backend(
-                "directory ops proxy: unexpected result variant".into(),
-            )),
-        }
-    }
     async fn put_family_membership_revocation(
         &self,
         revocation: SignedFamilyMembershipRevocation,
@@ -3950,44 +3824,6 @@ impl FederationDirectory for OpsDirectory {
         }
     }
 
-    /// v21.1.0 (CIRISPersist#507c) — the signed key-record bulk read via
-    /// the capsule, for the edge advertise/serve responder.
-    async fn list_signed_key_records_since(
-        &self,
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        limit: u32,
-    ) -> Result<Vec<crate::federation::ServedKeyRecord>, Error> {
-        match self
-            .run_op(&DirectoryOp::ListSignedKeyRecordsSince { since, limit })
-            .await?
-        {
-            DirectoryOpResult::SignedKeyRecords(v) => Ok(v),
-            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
-            _ => Err(Error::Backend(
-                "directory ops proxy: unexpected result variant".into(),
-            )),
-        }
-    }
-
-    /// v31.1.0 (CIRISPersist#655) — the exclusion plane's serve cursor,
-    /// routed. Structural mirror of [`Self::list_signed_key_records_since`].
-    async fn list_signed_revocations_since(
-        &self,
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        limit: u32,
-    ) -> Result<Vec<crate::federation::ServedRevocation>, Error> {
-        match self
-            .run_op(&DirectoryOp::ListSignedRevocationsSince { since, limit })
-            .await?
-        {
-            DirectoryOpResult::SignedRevocations(v) => Ok(v),
-            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
-            _ => Err(Error::Backend(
-                "directory ops proxy: unexpected result variant".into(),
-            )),
-        }
-    }
-
     /// v31.1.0 (CIRISPersist#662) — the signed accord EVIDENCE cursor, routed.
     async fn list_signed_accord_quorum_evidence_since(
         &self,
@@ -4051,26 +3887,7 @@ impl FederationDirectory for OpsDirectory {
     }
 
     /// v21.1.0 (CIRISPersist#507c) — structural mirror of
-    /// [`Self::list_signed_key_records_since`].
-    async fn list_signed_identity_occurrences_since(
-        &self,
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        limit: u32,
-    ) -> Result<Vec<crate::federation::ServedIdentityOccurrence>, Error> {
-        match self
-            .run_op(&DirectoryOp::ListSignedIdentityOccurrencesSince { since, limit })
-            .await?
-        {
-            DirectoryOpResult::SignedIdentityOccurrencesSince(v) => Ok(v),
-            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
-            _ => Err(Error::Backend(
-                "directory ops proxy: unexpected result variant".into(),
-            )),
-        }
-    }
-
-    /// v21.1.0 (CIRISPersist#507c) — structural mirror of
-    /// [`Self::list_signed_key_records_since`].
+    /// `Self::list_signed_key_records_since` (retired in v58.0.0).
     async fn list_signed_transport_destinations_since(
         &self,
         since: Option<(chrono::DateTime<chrono::Utc>, String)>,
@@ -4089,7 +3906,7 @@ impl FederationDirectory for OpsDirectory {
     }
 
     /// v21.1.0 (CIRISPersist#507c) — structural mirror of
-    /// [`Self::list_signed_key_records_since`]; federation-tier-only rows
+    /// `Self::list_signed_key_records_since` (retired in v58.0.0); federation-tier-only rows
     /// (the E5 invariant).
     async fn list_attestations_since(
         &self,
@@ -4101,25 +3918,6 @@ impl FederationDirectory for OpsDirectory {
             .await?
         {
             DirectoryOpResult::Attestations(v) => Ok(v),
-            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
-            _ => Err(Error::Backend(
-                "directory ops proxy: unexpected result variant".into(),
-            )),
-        }
-    }
-
-    /// v21.1.0 (CIRISPersist#507c) — structural mirror of
-    /// [`Self::list_signed_key_records_since`].
-    async fn list_signed_identity_occurrence_revocations_since(
-        &self,
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        limit: u32,
-    ) -> Result<Vec<crate::federation::ServedIdentityOccurrenceRevocation>, Error> {
-        match self
-            .run_op(&DirectoryOp::ListSignedIdentityOccurrenceRevocationsSince { since, limit })
-            .await?
-        {
-            DirectoryOpResult::SignedIdentityOccurrenceRevocationsSince(v) => Ok(v),
             DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
             _ => Err(Error::Backend(
                 "directory ops proxy: unexpected result variant".into(),
@@ -4434,15 +4232,6 @@ impl FederationDirectory for OpsDirectory {
             method: "attach_attestation_pqc_signature",
         })
     }
-    async fn attach_revocation_pqc_signature(
-        &self,
-        revocation_id: &str,
-        scrub_signature_pqc: &str,
-    ) -> Result<(), Error> {
-        Err(Error::Unsupported {
-            method: "attach_revocation_pqc_signature",
-        })
-    }
     async fn get_attestation(&self, attestation_id: &str) -> Result<Option<Attestation>, Error> {
         Err(Error::Unsupported {
             method: "get_attestation",
@@ -4469,14 +4258,6 @@ impl FederationDirectory for OpsDirectory {
     ) -> Result<Vec<HybridPendingRow>, Error> {
         Err(Error::Unsupported {
             method: "list_hybrid_pending_attestations",
-        })
-    }
-    async fn list_hybrid_pending_revocations(
-        &self,
-        limit: i64,
-    ) -> Result<Vec<HybridPendingRow>, Error> {
-        Err(Error::Unsupported {
-            method: "list_hybrid_pending_revocations",
         })
     }
     async fn put_accord_proposal(
@@ -4872,18 +4653,7 @@ mod tests {
             other => panic!("expected Revocations, got {other:?}"),
         }
 
-        // Both serve cursors.
-        match run_op(
-            &rt,
-            &directory,
-            &DirectoryOp::ListSignedRevocationsSince {
-                since: None,
-                limit: 100,
-            },
-        ) {
-            DirectoryOpResult::SignedRevocations(v) => assert!(v.is_empty()),
-            other => panic!("expected SignedRevocations, got {other:?}"),
-        }
+        // The accord serve cursor (v58.0.0: the revocation cursor is retired).
         match run_op(
             &rt,
             &directory,
@@ -5127,10 +4897,16 @@ mod tests {
     /// puts in the vtable a consumer reads at runtime. A single assertion
     /// comparing them to each other would hold trivially while both drifted.
     #[test]
-    fn abi_version_pinned_at_7() {
+    fn abi_version_pinned_at_8() {
         assert_eq!(
-            DIRECTORY_ABI_VERSION, 7,
-            "v52.0.0 (CIRISPersist#784): the Revocation carried by Revocations / \
+            DIRECTORY_ABI_VERSION, 8,
+            "v58.0.0 (CIRISPersist#991): the framed key-plane ops are retired — \
+             ListSignedKeyRecordsSince, ListSignedRevocationsSince, \
+             ListSignedIdentityOccurrencesSince, ListSignedIdentityOccurrenceRevocationsSince and \
+             PutIdentityOccurrenceRevocation (and their results) left DirectoryOp / \
+             DirectoryOpResult; the key plane replicates as attestation rows. A consumer built \
+             against 7 dispatches ops this build cannot decode. Previous move: \
+             v52.0.0 (CIRISPersist#784): the Revocation carried by Revocations / \
              SignedRevocations names its subject by revoked_key_sha256_ed25519_raw and its \
              revoked_key_id became optional — a consumer built against 6 fails to decode a \
              digest-only row. Previous move: \
@@ -5149,7 +4925,7 @@ mod tests {
              built for"
         );
         assert_eq!(
-            PERSIST_DIRECTORY_VTABLE.abi_version, 7,
+            PERSIST_DIRECTORY_VTABLE.abi_version, 8,
             "the shipped vtable must advertise what consumers pin against"
         );
     }
@@ -5218,7 +4994,7 @@ mod tests {
     fn directory_op_wire_contract_is_pinned_682() {
         assert_eq!(
             structural_digest("DirectoryOp"),
-            "4efe656f9076f4b918efc8e122c6dfb422da3fb2e98fdbf52f4a6f9dbb17bce1",
+            "80c5a4f927a33355aa6323d29938a121307f59962642706a0567bacec4c21f63",
             "DirectoryOp's wire shape changed. GROWTH (appended a variant, \
              touched nothing existing) → re-pin this digest only. BREAK \
              (changed/renamed/removed/reordered an existing variant) → re-pin \
@@ -5262,7 +5038,7 @@ mod tests {
     fn directory_op_result_wire_contract_is_pinned_682() {
         assert_eq!(
             structural_digest("DirectoryOpResult"),
-            "bf09a0103ca37a06866e6f8160dd01df41c8e10caded5660e3c2fa352b4e9262",
+            "2295b94a42f9da5c7d758c6a0764da0fca8953aaf408dcfd6d672f13a9eff827",
             "DirectoryOpResult's wire shape changed — same fork as the op gate: \
              growth re-pins, a break re-pins AND bumps DIRECTORY_ABI_VERSION."
         );

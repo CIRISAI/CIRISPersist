@@ -5537,7 +5537,7 @@ fn same_instant_ms(envelope: &str, typed: chrono::DateTime<chrono::Utc>) -> bool
 /// CIRISPersist#851 (`BLOB_REPLICATION.md` §20.2) — the content-only signed
 /// occurrence gate: the envelope carries `encryption_pubkeys` and no
 /// `transport_destination`. Verified exactly as
-/// [`verify_signed_identity_occurrence_revocation`] verifies its envelope:
+/// `verify_signed_identity_occurrence_revocation` (retired in v58.0.0) verifies its envelope:
 /// 1. the typed projection EQUALS the envelope (ids, KEM pubkeys — both
 ///    halves — and `transport_binding: None`);
 /// 2. the hybrid signature over `JCS(signed_envelope)` at threshold 1-of-1
@@ -5760,155 +5760,9 @@ async fn check_signer_acts_for(
     Ok(())
 }
 
-/// v16.0.0 (CIRISPersist#421) — the SIGNED-revocation admission gate: the
-/// revocation-plane mirror of [`verify_signed_identity_occurrence`], closing the
-/// **permanent-DoS forgery** the #418 cut deferred. An unsigned revocation on
-/// the replication plane would let any consented peer fabricate
-/// `{identity: victim, occurrence: victim}` and brick the victim's sealability
-/// (`resolve_encryption_keys → None`) — worse than the occurrence MITM because
-/// it was terminal. Fail-secure; called by every
-/// `put_identity_occurrence_revocation` (HTTP + wire — one gate; edge's
-/// replication apply delegates to `put`, exactly like the occurrence).
-///
-/// **Authority is `signed_envelope`, never the sender's typed projection** —
-/// the #418 discipline verbatim. Verifies, each fail-closed:
-/// 1. the envelope carries `identity_key_id` / `occurrence_key_id` /
-///    `revoked_at` / `effective_at`, and the typed projection persist will
-///    store EQUALS them (a divergent projection is the MITM reopening);
-/// 2. the detached hybrid signature over `JCS(signed_envelope)` verifies at
-///    threshold **1-of-1** against the PINNED federation pubkeys of
-///    `attesting_key_id` ([`verify_threshold_signatures`] — the same bound-sig
-///    rule `verify_transport_binding` composes; that fn itself is NOT reusable
-///    here because it hard-requires a `transport_destination`, which a
-///    revocation envelope rightly lacks);
-/// 3. `signer_acts_for`: the signer is the identity's own key OR an
-///    already-active occurrence of the same identity — the §11.7.4
-///    single-vouch-for-self, ENFORCED (the `witness_set` only shaped it).
-///
-/// NOT feature-gated: backend-agnostic, and the MemoryBackend calls it (the
-/// #418 cfg lesson).
-///
-/// [`verify_threshold_signatures`]: ciris_verify_core::threshold::verify_threshold_signatures
-pub async fn verify_signed_identity_occurrence_revocation(
-    directory: &dyn super::FederationDirectory,
-    signed: &crate::federation::types::SignedIdentityOccurrenceRevocation,
-) -> Result<(), Error> {
-    use ciris_verify_core::threshold::{
-        verify_threshold_signatures, ThresholdMember, ThresholdSignature,
-    };
-
-    let row = &signed.identity_occurrence_revocation;
-    let env = &signed.signed_envelope;
-
-    // (1) Authoritative fields FROM the signed envelope; the typed projection
-    // must equal them (the signature covers only the envelope).
-    let str_field = |k: &str| -> Result<String, Error> {
-        env.get(k)
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_owned())
-            .ok_or_else(|| {
-                Error::malformed_row(
-                    "identity_occurrence_revocation",
-                    super::malformed_row::ENVELOPE_MEMBER_MISSING,
-                    format!(
-                        "signed identity_occurrence_revocation envelope missing string field `{k}`"
-                    ),
-                )
-            })
-    };
-    let ts_field = |k: &str| -> Result<chrono::DateTime<chrono::Utc>, Error> {
-        let s = str_field(k)?;
-        chrono::DateTime::parse_from_rfc3339(&s)
-            .map(|t| t.with_timezone(&chrono::Utc))
-            .map_err(|e| {
-                Error::malformed_row(
-                    "identity_occurrence_revocation",
-                    super::malformed_row::ENVELOPE_MEMBER_INVALID,
-                    format!(
-                        "signed identity_occurrence_revocation envelope `{k}` not RFC-3339: {e}"
-                    ),
-                )
-            })
-    };
-    let diverges = |what: &str| {
-        Error::malformed_row(
-            "identity_occurrence_revocation",
-            super::malformed_row::TYPED_DIVERGES_FROM_ENVELOPE,
-            format!(
-                "signed identity_occurrence_revocation: typed {what} diverges from the signed \
-                 envelope (rejected)"
-            ),
-        )
-    };
-    if str_field("identity_key_id")? != row.identity_key_id {
-        return Err(diverges("identity_key_id"));
-    }
-    if str_field("occurrence_key_id")? != row.occurrence_key_id {
-        return Err(diverges("occurrence_key_id"));
-    }
-    if ts_field("revoked_at")? != row.revoked_at {
-        return Err(diverges("revoked_at"));
-    }
-    // `effective_at` is the terminality clock (the re-establish comparator
-    // reads it), so a divergence here is the whole attack.
-    if ts_field("effective_at")? != row.effective_at {
-        return Err(diverges("effective_at"));
-    }
-
-    // (2) Hybrid signature over JCS(signed_envelope) against the PINNED
-    // federation pubkeys of the claimed signer, threshold 1-of-1 (RequireHybrid
-    // — a classical-only revocation does not count, RC7 §10.1.5.1.1).
-    let Some(signer_key) = directory
-        .lookup_public_key(&signed.attesting_key_id)
-        .await?
-    else {
-        // v54.1.0 (CIRISPersist#1042) — an ordering gap, typed apart from a
-        // bad signature: retryable once the signer's Key row lands.
-        return Err(Error::unknown_signer(
-            &signed.attesting_key_id,
-            "identity_occurrence_revocation",
-        ));
-    };
-    let bytes = crate::verify::canonical::ceg_produce_canonicalize(env).map_err(|e| {
-        Error::malformed_row(
-            "identity_occurrence_revocation",
-            super::malformed_row::ENVELOPE_NOT_CANONICAL,
-            format!("signed identity_occurrence_revocation canonicalize: {e}"),
-        )
-    })?;
-    let members = [ThresholdMember {
-        member_id: signer_key.key_id.clone(),
-        ed25519_public_key_base64: signer_key.pubkey_ed25519_base64.clone(),
-        mldsa65_public_key_base64: signer_key.pubkey_ml_dsa_65_base64.clone(),
-        role: None,
-    }];
-    let sigs = [ThresholdSignature {
-        member_id: signed.attesting_key_id.clone(),
-        ed25519_signature_base64: signed.signature.ed25519_signature_base64.clone(),
-        mldsa65_signature_base64: signed.signature.mldsa65_signature_base64.clone(),
-    }];
-    if verify_threshold_signatures(&bytes, &members, &sigs, 1).is_err() {
-        return Err(Error::SignatureInvalid(format!(
-            "signed identity_occurrence_revocation for {} not authentic (hybrid 1-of-1 over \
-             JCS(envelope) failed against the pinned key of {})",
-            row.occurrence_key_id, signed.attesting_key_id
-        )));
-    }
-
-    // (3) signer_acts_for — THE shared check ([`check_signer_acts_for`]): a
-    // peer cannot revoke a victim's occurrence with its own unrelated key.
-    check_signer_acts_for(
-        directory,
-        &signed.attesting_key_id,
-        &row.identity_key_id,
-        "identity_occurrence_revocation",
-    )
-    .await
-}
-
 /// v17.0.0 (CIRISPersist#443) — the SIGNED transport-destination admission
 /// gate: the route-plane mirror of
-/// [`verify_signed_identity_occurrence_revocation`], closing the
+/// `verify_signed_identity_occurrence_revocation` (retired in v58.0.0), closing the
 /// **route-hijack confused deputy** (CIRISEdge#336): before this the
 /// replication plane applied a bare unsigned `TransportDestination` through
 /// the plain local upsert, so any cohort node could overwrite the durable
@@ -9338,6 +9192,16 @@ pub async fn check_withdraws_admission_at(
                  retroactively un-shared (CC 3.3.2); rotate the epoch instead"
             )));
         }
+        // v58.0.0 (CIRISPersist#991, CC 2.4.1.1 rule 0, CC 3.1.3) — a
+        // `key:revocation:v1` row is withdrawn by nobody, its revoker included:
+        // revocation is non-rollbackable (CC 3.1.1). A narrower bound is a new
+        // revocation that lowers `revoked_after`.
+        if crate::federation::key_plane::is_never_withdrawn(&target) {
+            return Err(Error::InvalidArgument(format!(
+                "recants names a key:revocation:v1 row ({target_id}) — a key-plane revocation is \
+                 never withdrawn (CC 2.4.1.1 rule 0)"
+            )));
+        }
         if !crate::federation::precedence::retraction_entitled(row, &target) {
             return Err(Error::InvalidArgument(format!(
                 "recants_not_admitted: {} is not the attester of {target_id} — only the original \
@@ -9391,6 +9255,38 @@ pub async fn check_withdraws_admission_at(
     // v55.0.0 (#989, CC 3.3.2 rc7) — the per-recipient `scores` row on
     // `key_grant:{axis}:v1` ("a `withdraws` or `recants` naming a `key_grant`
     // row is refused"), and a held retired SET alike.
+    // v58.0.0 (CIRISPersist#991, CC 2.4.1.1 rule 0, CC 3.1.3) — a
+    // `key:revocation:v1` row is withdrawn by nobody, its revoker included:
+    // revocation is non-rollbackable (CC 3.1.1). Refused, never admitted inert.
+    if crate::federation::key_plane::is_never_withdrawn(&target) {
+        return Err(Error::InvalidArgument(format!(
+            "withdraws names a key:revocation:v1 row ({}) — a key-plane revocation is never \
+             withdrawn (CC 2.4.1.1 rule 0); lower its bound with a new revocation instead",
+            target.attestation_id
+        )));
+    }
+    // v58.0.0 (CIRISPersist#991, CC 3.3.6) — an occurrence's revocation is a
+    // `withdraws` against its `identity:occurrence:v1` row, admitted when the
+    // issuer acts for the identity: the identity itself or a live occurrence
+    // of it (the `signer_acts_for` rule the occurrence door runs). Rule 1 for
+    // the row's own signer, 2 for the identity, 4 for another live occurrence.
+    if let Some(signed) = crate::federation::key_plane::occurrence_of_row(&target) {
+        let identity = &signed.identity_occurrence.identity_key_id;
+        check_signer_acts_for(
+            directory,
+            &row.attesting_key_id,
+            identity,
+            "identity_occurrence_withdraws",
+        )
+        .await?;
+        return Ok(Some(if row.attesting_key_id == target.attesting_key_id {
+            1
+        } else if &row.attesting_key_id == identity {
+            2
+        } else {
+            4
+        }));
+    }
     if crate::federation::key_grant::is_key_grant_row(&target)
         || crate::federation::key_grant::is_retired_key_grant_set_type(&target.attestation_type)
     {
@@ -9599,7 +9495,7 @@ pub const MAX_MODERATION_DELEGATION_DEPTH: usize =
 ///   "re-derived from our own verified state" exclusion, verbatim.
 /// - **`scrub_key_id` / `pqc_completed_at`** — signature
 ///   metadata, legitimately rewritten by
-///   [`super::FederationDirectory::attach_revocation_pqc_signature`] when the
+///   `super::FederationDirectory::attach_revocation_pqc_signature` (retired in v58.0.0) when the
 ///   PQC half is completed after the fact. Binding them would make that door
 ///   mint rows that fail their own gate.
 /// - **`original_content_hash` / `scrub_signature_*`** — a signature and its
@@ -25389,13 +25285,15 @@ pub(crate) mod r2_test_support {
         put(ban).await.unwrap_or_else(|e| {
             panic!("({tag}) I227: a digest-only ban of an unheld key is admitted (D1): {e}")
         });
-        let served = dir
-            .list_signed_revocations_since(None, u32::MAX)
-            .await
-            .unwrap()
-            .into_iter()
-            .find(|r| r.revocation.revocation_id == ban_id)
-            .expect("the ban is served");
+        let served = crate::federation::key_plane::test_support::served_revocations(
+            dir.as_dyn_directory(),
+            u32::MAX,
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|r| r.revocation.revocation_id == ban_id)
+        .expect("the ban is served");
         let bytes = serde_json::to_string(&crate::federation::SignedRevocation {
             revocation: served.revocation,
         })
@@ -25463,13 +25361,15 @@ pub(crate) mod r2_test_support {
         a.put_revocation(crate::federation::SignedRevocation { revocation: row })
             .await
             .expect("A admits");
-        let served = a
-            .list_signed_revocations_since(None, u32::MAX)
-            .await
-            .unwrap()
-            .into_iter()
-            .find(|r| r.revocation.revocation_id == id)
-            .expect("A serves it");
+        let served = crate::federation::key_plane::test_support::served_revocations(
+            a.as_dyn_directory(),
+            u32::MAX,
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|r| r.revocation.revocation_id == id)
+        .expect("A serves it");
         b.put_revocation(crate::federation::SignedRevocation {
             revocation: served.revocation,
         })
@@ -25812,10 +25712,9 @@ pub(crate) mod r2_test_support {
             refs.iter().any(|(k, _, _)| *k == "Attestation"),
             "[{tag}] no Attestation ref for the seeded subject; got {refs:?}"
         );
-        assert!(
-            refs.iter().any(|(k, _, _)| *k == "Key"),
-            "[{tag}] no Key ref for the subject's own key record; got {refs:?}"
-        );
+        // v58.0.0 (CIRISPersist#991) — a key's record is a `key:record:v1`
+        // row (an Attestation ref) when it verifies; this fixture's key is an
+        // unsigned registration, held without a row.
 
         for (kind, content_hash, record_key) in &refs {
             let served = dir
@@ -25827,116 +25726,6 @@ pub(crate) mod r2_test_support {
                 "[{tag}] ref ({kind}, {content_hash}) does not resolve — the subject read and \
                  the wire index disagree about this row's bytes (record_key {record_key}). \
                  That is the #634 skew, and a peer asking for this exact ref would get None."
-            );
-        }
-    }
-
-    /// v31.0.0 (CIRISPersist#640) — a key whose timestamps carry
-    /// SUB-MICROSECOND precision, and a `consent_role` submitted in its STORED
-    /// form, must still resolve through the ref this node advertises for it.
-    ///
-    /// # Why this exists separately from the #634 witness
-    ///
-    /// #634's witness seeds keys through
-    /// [`register_hybrid_key`](crate::federation::tier_ingest::test_support::register_hybrid_key),
-    /// which truncates to microseconds. That truncation was added because the
-    /// postgres leg went red, and it was read as a fixture defect. It was not:
-    /// the write paths hashed the row the WRITER held while every read
-    /// re-serializes the row the BACKEND reloaded, and those differ whenever
-    /// storage normalizes anything. Truncating the fixture hid the mechanism
-    /// instead of closing it, and a witness that only fails when the fixture
-    /// cooperates is not a witness.
-    ///
-    /// So this one supplies the divergence ITSELF, deterministically, and does
-    /// not depend on the shared fixture's precision policy:
-    ///
-    /// * **789 nanoseconds** of sub-microsecond tail on `valid_from` /
-    ///   `scrub_timestamp`. Postgres `TIMESTAMPTZ` drops it; sqlite (RFC-3339
-    ///   TEXT) and memory keep it. Deterministic rather than clock-dependent —
-    ///   `Utc::now()` *usually* carries nanoseconds, and a probe that fires
-    ///   "usually" is a flake, not a gate. Kept under 1µs so `valid_from` is
-    ///   never meaningfully in the future.
-    /// * **`consent_role: Some("unregistered")`** — the STORED token, which
-    ///   both SQL backends normalize to wire `None` on read. That instance has
-    ///   nothing to do with clocks, and it is why the remedy is "hash the
-    ///   stored row" rather than "truncate the timestamps": a fix aimed at
-    ///   precision leaves this one live.
-    ///
-    /// Runs on all three backends. Memory normalizes nothing and rounds
-    /// nothing, so it is the CONTROL — it must pass before and after; a change
-    /// that reds memory has broken the derivation, not caught the skew.
-    pub(crate) async fn exercise_nanosecond_key_wire_ref_resolves(
-        dir: &dyn FederationDirectory,
-        tag: &str,
-    ) {
-        use chrono::Timelike as _;
-
-        let subject = format!("nanokey-subject-{tag}");
-        let (ed_pk, mldsa_pk) =
-            crate::federation::tier_ingest::test_support::hybrid_pubkeys(&subject);
-        // A DETERMINISTIC sub-microsecond tail: keep the current microsecond
-        // and append 789ns. Postgres truncates it away on the way in.
-        let now = {
-            let dt = chrono::Utc::now();
-            dt.with_nanosecond(dt.nanosecond() / 1_000 * 1_000 + 789)
-                .expect("789ns tail is a valid nanosecond field")
-        };
-        assert_ne!(
-            now.nanosecond() % 1_000,
-            0,
-            "[{tag}] the fixture must actually carry sub-microsecond precision, \
-             or this witness cannot fail"
-        );
-
-        let rec = crate::federation::KeyRecord {
-            key_id: subject.clone(),
-            pubkey_ed25519_base64: ed_pk,
-            pubkey_ml_dsa_65_base64: mldsa_pk,
-            algorithm: crate::federation::types::algorithm::HYBRID.to_owned(),
-            identity_type: crate::federation::types::identity_type::AGENT.to_owned(),
-            identity_ref: subject.clone(),
-            valid_from: now,
-            valid_until: None,
-            registration_envelope: serde_json::json!({ "id": subject }),
-            original_content_hash: "deadbeef".to_owned(),
-            scrub_signature_classical: "c2lnbmF0dXJl".to_owned(),
-            scrub_signature_pqc: None,
-            scrub_key_id: subject.clone(),
-            scrub_timestamp: now,
-            pqc_completed_at: None,
-            persist_row_hash: String::new(),
-            capability_roles: Vec::new(),
-            attestation_evidence: None,
-            // The STORED form on the wire — reads back as `None` on both SQL
-            // backends. See the doc above.
-            consent_role: Some(crate::federation::types::consent_role::UNREGISTERED.to_owned()),
-            additional_scrubs: Vec::new(),
-        };
-        dir.put_public_key(crate::federation::SignedKeyRecord { record: rec })
-            .await
-            .unwrap_or_else(|e| panic!("[{tag}] nanosecond-bearing key must register: {e}"));
-
-        let refs = crate::federation::wire_index::wire_refs_for_subject(dir, &subject)
-            .await
-            .unwrap_or_else(|e| panic!("[{tag}] wire_refs_for_subject: {e}"));
-
-        // NON-VACUITY. An empty ref set resolves every ref it returns.
-        assert!(
-            refs.iter().any(|(k, _, _)| *k == "Key"),
-            "[{tag}] no Key ref for the registered subject; got {refs:?}"
-        );
-
-        for (kind, content_hash, record_key) in &refs {
-            let served = dir
-                .lookup_signed_record_by_content_hash(kind, content_hash)
-                .await
-                .unwrap_or_else(|e| panic!("[{tag}] lookup {kind}/{content_hash}: {e}"));
-            assert!(
-                served.is_some(),
-                "[{tag}] ref ({kind}, {content_hash}) does not resolve (record_key \
-                 {record_key}). The wire index was written from the row this node HELD, \
-                 not the row it STORED — CIRISPersist#640. A peer asking for the ref \
-                 this node just advertised would get None."
             );
         }
     }
@@ -26137,7 +25926,8 @@ pub(crate) mod r2_test_support {
 
         // NON-VACUITY FIRST. An empty set resolves every ref it contains, so
         // without this the loop below passes on a fixture that seeded nothing.
-        for kind in ["Key", "Attestation", "LocationProof", "Family", "Community"] {
+        // v58.0.0 (CIRISPersist#991) — no `Key` kind: key records ride as rows.
+        for kind in ["Attestation", "LocationProof", "Family", "Community"] {
             assert!(
                 mine.iter().any(|(k, _, _)| *k == kind),
                 "[{tag}] no {kind} ref for the seeded fixture; got {mine:?}"
@@ -30102,18 +29892,8 @@ pub(crate) mod backend_parity_test_support {
              normalized or re-minted id is a backend a consumer cannot address rows on."
         );
 
-        // And the SECOND site of the same defect: the PQC-completion door looked
-        // the row up by a parsed UUID too, so fixing only the write door would
-        // have left a stored row permanently unreachable for hybrid completion.
-        dir.attach_revocation_pqc_signature(&symbolic, "AAAA")
-            .await
-            .expect("the PQC-attach door must find a row by its non-UUID id (#622)");
-        let after = dir.revocations_for(&who).await.expect("read");
-        assert_eq!(
-            after[0].scrub_signature_pqc.as_deref(),
-            Some("AAAA"),
-            "[{tag}] the attach applied to the row addressed by the symbolic id"
-        );
+        // v58.0.0 (CIRISPersist#991) — the PQC-completion door this test also
+        // pinned is gone: a revocation is hybrid at its door.
     }
 
     /// **Gap 2 on the attestation door**: the same non-hex

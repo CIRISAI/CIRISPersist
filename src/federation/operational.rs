@@ -6156,213 +6156,25 @@ pub mod test_support {
         directory
             .put_public_key(crate::federation::SignedKeyRecord { record: rec })
             .await?;
-        assert_advertised_key_ref_is_servable(directory, &pending, tag, "put_public_key (pending)")
-            .await?;
+        // v58.0.0 (CIRISPersist#991) — a hybrid-pending record cannot prove
+        // possession: it is held without a `key:record:v1` row, so nothing is
+        // advertised for it until its ML-DSA-65 half is attached.
+        assert!(
+            !directory
+                .list_attestations_since(None, 10_000)
+                .await?
+                .iter()
+                .any(
+                    |s| crate::federation::key_plane::key_record_of_row(&s.attestation)
+                        .is_some_and(|r| r.key_id == pending)
+                ),
+            "({tag}) a hybrid-pending record is not on the plane"
+        );
         directory
             .attach_key_pqc_signature(&pending, &pqc_pubkey, &pqc_sig)
             .await?;
         assert_advertised_key_ref_is_servable(directory, &pending, tag, "attach_key_pqc_signature")
             .await?;
-        Ok(())
-    }
-
-    /// v36.0.0 (CIRISPersist#707) — **a consumer-visible key mutation MOVES
-    /// THE SERVE POSITION.**
-    ///
-    /// #682 fixed the row that ARRIVES late; this witnesses the row that
-    /// MUTATES after arrival. Wire-index coverage (#547, the sibling exercise
-    /// above) only proves a peer that already knows the new content hash can
-    /// fetch it — the CURSOR is how a peer learns a hash exists, and before
-    /// #707 the five mutating doors left every consumer's cursor past the
-    /// row, permanently unaware.
-    ///
-    /// Per door: a consumer reads the key stream to the end and keeps the
-    /// PAIR cursor; the door rewrites the row; resuming from the old cursor
-    /// MUST re-serve the row, carrying the NEW bytes, at a position strictly
-    /// above the old cursor — while `admitted_at` (first admission, V126)
-    /// stays put, because the mutation position is `mutated_at` (V131), not a
-    /// re-stamp of history.
-    ///
-    /// Doors driven here: `adopt_scrub_upgrade` (skipped where the backend
-    /// does not implement it — memory), `set_consent_role`,
-    /// `attach_key_pqc_signature`, plus the NEGATIVE leg: `grant_trust` /
-    /// `revoke_trust` write only `trust_*` columns — bytes no consumer ever
-    /// received — and must NOT move the position, or every trust flip churns
-    /// the stream for changes no peer can observe.
-    /// (`supersede_canonical_record` and `adopt_genesis_reanchor` re-stamp
-    /// through the identical allocator call in the same statement; their
-    /// fixtures need an m-of-n quorum / genesis bundle and are not driven
-    /// here — stated rather than implied.)
-    pub async fn exercise_key_mutation_moves_serve_position(
-        directory: &dyn crate::federation::FederationDirectory,
-        tag: &str,
-    ) -> Result<(), crate::federation::Error> {
-        use crate::federation::tier_ingest::test_support as ts;
-        use crate::federation::types::identity_type;
-
-        let anchor = format!("{tag}-707-anchor");
-        let node = format!("{tag}-707-node");
-        ts::register_hybrid_key(directory, &anchor).await;
-        directory
-            .put_public_key(crate::federation::SignedKeyRecord {
-                record: ts::replicated_key_record(&node, identity_type::NODE, &node, &node, "boot"),
-            })
-            .await?;
-
-        // One consumer read-to-end + resume, shared by every door leg.
-        let cursor_at_end = |rows: &[crate::federation::ServedKeyRecord]| {
-            rows.last()
-                .map(crate::federation::ServedKeyRecord::resume_pair)
-                .expect("the stream cannot be empty after a put")
-        };
-        let all = directory
-            .list_signed_key_records_since(None, u32::MAX)
-            .await?;
-        let first_admitted = all
-            .iter()
-            .find(|r| r.record.key_id == node)
-            .expect("the boot row is served")
-            .admitted_at;
-        let mut cursor = cursor_at_end(&all);
-
-        // ── door: adopt_scrub_upgrade (where implemented) ──────────────────
-        match directory
-            .adopt_scrub_upgrade(crate::federation::SignedKeyRecord {
-                record: ts::replicated_key_record(
-                    &node,
-                    identity_type::NODE,
-                    &anchor,
-                    &anchor,
-                    "boot",
-                ),
-            })
-            .await
-        {
-            Ok(_) => {
-                let resumed = directory
-                    .list_signed_key_records_since(Some(cursor.clone()), u32::MAX)
-                    .await?;
-                let served = resumed.iter().find(|r| r.record.key_id == node).expect(
-                    "#707 adopt_scrub_upgrade: the re-rooted row must be re-served past the \
-                         consumer's cursor — its whole purpose is to re-root the key, and a \
-                         consumer past the cursor kept the pre-anchor row forever",
-                );
-                assert_eq!(
-                    served.record.scrub_key_id, anchor,
-                    "({tag}) and the re-served bytes are the NEW (anchored) bytes"
-                );
-                cursor = cursor_at_end(
-                    &directory
-                        .list_signed_key_records_since(None, u32::MAX)
-                        .await?,
-                );
-            }
-            Err(crate::federation::Error::InvalidArgument(detail))
-                if detail.contains("not supported on this backend") => {}
-            Err(e) => return Err(e),
-        }
-
-        // ── door: set_consent_role ─────────────────────────────────────────
-        directory.set_consent_role(&node, Some("peer")).await?;
-        let resumed = directory
-            .list_signed_key_records_since(Some(cursor.clone()), u32::MAX)
-            .await?;
-        let served = resumed.iter().find(|r| r.record.key_id == node).expect(
-            "#707 set_consent_role: `consent_role` IS in the served bytes, so the row must \
-                 be re-served past the consumer's cursor",
-        );
-        assert_eq!(
-            served.record.consent_role.as_deref(),
-            Some("peer"),
-            "({tag}) the re-served bytes carry the NEW role"
-        );
-        assert!(
-            served.admitted_at > cursor.0,
-            "({tag}) the serve position moved strictly forward"
-        );
-        // First admission is NOT rewritten: the position that moved is
-        // `mutated_at` (V131); `admitted_at` keeps its V126 meaning. Observable
-        // here because `ServedKeyRecord::admitted_at` reports the SERVE
-        // position (the max), which must exceed the original first-admission
-        // instant rather than replace it in place — the row's own history
-        // question ("how long held?") stays answerable from the column.
-        assert!(
-            served.admitted_at > first_admitted,
-            "({tag}) the serve position is above first admission, not a rewrite of it"
-        );
-        cursor = cursor_at_end(
-            &directory
-                .list_signed_key_records_since(None, u32::MAX)
-                .await?,
-        );
-
-        // ── NEGATIVE leg: grant_trust / revoke_trust must NOT move it ──────
-        // v38.0.0 (#721): the doors take PROVEN grants now — register a
-        // hybrid granter and sign through the test-support twin of the
-        // production signing shape.
-        let granter = format!("trust-granter-707-{tag}");
-        crate::federation::tier_ingest::test_support::register_hybrid_key(directory, &granter)
-            .await;
-        directory
-            .grant_trust(
-                crate::federation::tier_ingest::test_support::signed_trust_grant(
-                    crate::federation::TrustGrant {
-                        key: node.clone(),
-                        trust_type: crate::federation::TrustType::Temporary,
-                        trust_relationship: crate::federation::TrustRelationship::Direct,
-                        trust_domains: None,
-                        trusted_by: granter.clone(),
-                        expires_at: None,
-                    },
-                ),
-            )
-            .await?;
-        directory
-            .revoke_trust(
-                crate::federation::tier_ingest::test_support::signed_trust_revocation(
-                    &node, &granter,
-                ),
-            )
-            .await?;
-        let after_trust = directory
-            .list_signed_key_records_since(Some(cursor.clone()), u32::MAX)
-            .await?;
-        assert!(
-            !after_trust.iter().any(|r| r.record.key_id == node),
-            "({tag}) #707 negative leg: grant_trust/revoke_trust write only `trust_*` columns — \
-             bytes no consumer ever received — and must NOT re-serve the row. Re-stamping on \
-             every UPDATE would churn the stream for changes no peer can observe."
-        );
-
-        // ── door: attach_key_pqc_signature ─────────────────────────────────
-        let pending = format!("{tag}-707-pending");
-        let (rec, pqc_pubkey, pqc_sig) =
-            crate::federation::admission::pqc_attach_test_support::hybrid_pending_self_scrubbed(
-                &pending,
-                identity_type::NODE,
-            );
-        directory
-            .put_public_key(crate::federation::SignedKeyRecord { record: rec })
-            .await?;
-        let cursor = cursor_at_end(
-            &directory
-                .list_signed_key_records_since(None, u32::MAX)
-                .await?,
-        );
-        directory
-            .attach_key_pqc_signature(&pending, &pqc_pubkey, &pqc_sig)
-            .await?;
-        let resumed = directory
-            .list_signed_key_records_since(Some(cursor.clone()), u32::MAX)
-            .await?;
-        let served = resumed.iter().find(|r| r.record.key_id == pending).expect(
-            "#707 attach_key_pqc_signature: the hybrid-completion rewrites FOUR served \
-                 columns and must re-serve the row past the consumer's cursor",
-        );
-        assert!(
-            served.record.pqc_completed_at.is_some(),
-            "({tag}) the re-served bytes are the completed (post-attach) bytes"
-        );
         Ok(())
     }
 
@@ -6465,7 +6277,7 @@ pub mod test_support {
     /// ADVERTISES for `key_id` and demand the point-read serve it, byte-exact.
     ///
     /// Deliberately reads the ADVERTISE surface
-    /// ([`FederationDirectory::list_signed_key_records_since`](crate::federation::FederationDirectory::list_signed_key_records_since))
+    /// (`FederationDirectory::list_signed_key_records_since` (retired in v58.0.0))
     /// rather than `lookup_public_key`, because the advertised row is what a
     /// peer actually asks for — the measured symptom was `ADVERTISED hash ⇒
     /// POINT-READ None`.
@@ -6484,29 +6296,34 @@ pub mod test_support {
         tag: &str,
         after: &str,
     ) -> Result<(), crate::federation::Error> {
-        let served_row = directory
-            .list_signed_key_records_since(None, 10_000)
+        // v58.0.0 (CIRISPersist#991) — the key's record rides as its
+        // `key:record:v1` row: the advertised ref is that row's (the
+        // Attestation kind).
+        let row = directory
+            .list_attestations_since(None, 10_000)
             .await?
             .into_iter()
-            .find(|r| r.record.key_id == key_id)
+            .map(|s| s.attestation)
+            .find(|a| {
+                crate::federation::key_plane::key_record_of_row(a)
+                    .is_some_and(|r| r.key_id == key_id)
+            })
             .unwrap_or_else(|| panic!("({tag}) {key_id} is advertised after {after}"));
-        let advertised = crate::federation::SignedKeyRecord {
-            record: served_row.record,
-        };
-        let hash = crate::federation::wire_index::content_hash_of(&advertised)?;
+        let hash = crate::federation::wire_index::content_hash_of(&row)?;
         let served = directory
-            .lookup_signed_record_by_content_hash("Key", &hash)
+            .lookup_signed_record_by_content_hash("Attestation", &hash)
             .await?;
         let served = served.unwrap_or_else(|| {
             panic!(
-                "({tag}) after {after}: {key_id} advertises (Key, {hash}) and CANNOT SERVE IT. \
-                 The row moved and `signed_wire_index` did not follow, so the peer asks for \
-                 exactly the ref we published and gets None — silently (CIRISPersist#547)."
+                "({tag}) after {after}: {key_id} advertises (Attestation, {hash}) and CANNOT \
+                 SERVE IT. The row moved and `signed_wire_index` did not follow, so the peer \
+                 asks for exactly the ref we published and gets None — silently \
+                 (CIRISPersist#547)."
             )
         });
         assert_eq!(
             served,
-            serde_json::to_vec(&advertised).expect("advertised record re-serializes"),
+            serde_json::to_vec(&row).expect("advertised row re-serializes"),
             "({tag}) after {after}: the served bytes must be the advertised bytes"
         );
         Ok(())

@@ -92,12 +92,20 @@ pub(crate) mod bodies {
         // An INVALID stored row.
         let k = format!("i616-k-{s}");
         let held = seed_failing(d, failing(&k, "a")).await;
-        let served = d.list_signed_key_records_since(None, 10_000).await.unwrap();
-        let cursor = served
-            .iter()
-            .find(|r| r.record.key_id == k)
-            .map(|r| r.resume_pair())
-            .expect("I616: the failing row is served (as on the canonical)");
+        let served = crate::federation::key_plane::test_support::served_key_records(
+            d.as_dyn_directory(),
+            None,
+            10_000,
+        )
+        .await
+        .unwrap();
+        // v58.0.0 (CIRISPersist#991) — a record that does not verify is held
+        // without a `key:record:v1` row: it is not on the plane, so it is not
+        // served.
+        assert!(
+            served.iter().all(|r| r.record.key_id != k),
+            "I616: the failing row is held without a row, not served"
+        );
 
         // Different pubkeys: a different identity.
         let mut swap = valid(&k, "b");
@@ -155,12 +163,16 @@ pub(crate) mod bodies {
         assert_eq!(after.valid_from, held.valid_from);
         assert_ne!(after.persist_row_hash, held.persist_row_hash);
         assert!(
-            d.list_signed_key_records_since(Some(cursor), 10_000)
-                .await
-                .unwrap()
-                .iter()
-                .any(|r| r.record.key_id == k),
-            "I616: mutated_at moved — the replaced row is re-served past the old cursor"
+            crate::federation::key_plane::test_support::served_key_records(
+                d.as_dyn_directory(),
+                None,
+                10_000
+            )
+            .await
+            .unwrap()
+            .iter()
+            .any(|r| r.record.key_id == k),
+            "I616: the repaired record verifies, so its row is on the plane and served"
         );
         let history = d.list_key_registration_history(&k).await.unwrap();
         assert_eq!(history.len(), 1, "I616: one audit row");

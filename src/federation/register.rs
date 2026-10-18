@@ -1418,6 +1418,102 @@ pub async fn verify_key_registration<F>(
 where
     F: FederationDirectory + ?Sized,
 {
+    let canonical = registration_canonical_bytes(record)?;
+
+    // Resolve the signer's (scrub_key_id's) public keys. Self-attested
+    // proof-of-possession (scrub_key_id == key_id) reads the pubkeys
+    // straight off the submitted record; a granting-authority
+    // signature (scrub_key_id != key_id) resolves them from the
+    // directory — an unknown signer is rejected (fail-secure).
+    let (ed25519_pubkey_b64, ml_dsa_65_pubkey_b64) = if record.scrub_key_id == record.key_id {
+        (
+            record.pubkey_ed25519_base64.clone(),
+            record.pubkey_ml_dsa_65_base64.clone(),
+        )
+    } else {
+        // v54.1.0 (CIRISPersist#1042) — an unregistered signer is an
+        // ORDERING gap (its Key row has not landed here yet), typed apart
+        // from a signature that does not verify: retryable, not terminal.
+        let signer = directory
+            .lookup_public_key(&record.scrub_key_id)
+            .await?
+            .ok_or_else(|| Error::unknown_signer(&record.scrub_key_id, "key_registration"))?;
+        (signer.pubkey_ed25519_base64, signer.pubkey_ml_dsa_65_base64)
+    };
+    verify_registration_signature(
+        record,
+        &canonical,
+        &ed25519_pubkey_b64,
+        ml_dsa_65_pubkey_b64.as_deref(),
+    )
+}
+
+/// v58.0.0 (CIRISPersist#991, CC 3.1.3) — **proof of possession**: the key
+/// record is the key's claim of itself. Its base scrub is the key's own
+/// (`scrub_key_id == key_id`) and verifies, hybrid and Strict, over the
+/// registration envelope with the pubkeys the record CARRIES — the one
+/// stated exception to resolving the attester through a held row (the
+/// signer's key is not held when its own record arrives). Pure: no directory
+/// read.
+///
+/// Refused: a record scrubbed by another key (use
+/// [`verify_record_signed_by`] with that key's held pubkeys), a
+/// hybrid-pending record (no ML-DSA-65 key or signature — a plane row's
+/// signature is hybrid), and every refusal of [`verify_key_registration`]
+/// (subject binding, content hash, signature).
+pub fn verify_proof_of_possession(record: &KeyRecord) -> Result<(), Error> {
+    if record.scrub_key_id != record.key_id {
+        return Err(Error::SignatureInvalid(format!(
+            "key:record:v1 {}: no proof of possession — the record's base scrub is {}'s, not \
+             the key's own (CC 3.1.3)",
+            record.key_id, record.scrub_key_id
+        )));
+    }
+    verify_record_signed_by(
+        record,
+        &record.pubkey_ed25519_base64,
+        record.pubkey_ml_dsa_65_base64.as_deref(),
+    )
+}
+
+/// v58.0.0 (CIRISPersist#991) — the record's base scrub verifies, hybrid and
+/// Strict, over its registration envelope against `ed25519` / `ml_dsa_65`:
+/// the record's own keys for a proof of possession, a held signer's for a
+/// record another key scrubbed. A hybrid-pending record (either ML-DSA-65
+/// half absent) is refused: a plane row's signature is hybrid (CC 2.4).
+pub fn verify_record_signed_by(
+    record: &KeyRecord,
+    ed25519_pubkey_b64: &str,
+    ml_dsa_65_pubkey_b64: Option<&str>,
+) -> Result<(), Error> {
+    let Some(ml_dsa_65_pubkey_b64) = ml_dsa_65_pubkey_b64 else {
+        return Err(Error::SignatureInvalid(format!(
+            "key:record:v1 {}: the signer {} carries no ML-DSA-65 key (hybrid-pending); a plane \
+             row's signature is hybrid (CC 2.4)",
+            record.key_id, record.scrub_key_id
+        )));
+    };
+    if record.scrub_signature_pqc.is_none() {
+        return Err(Error::SignatureInvalid(format!(
+            "key:record:v1 {}: the record's ML-DSA-65 scrub is not attached (hybrid-pending); a \
+             plane row's signature is hybrid (CC 2.4)",
+            record.key_id
+        )));
+    }
+    let canonical = registration_canonical_bytes(record)?;
+    verify_registration_signature(
+        record,
+        &canonical,
+        ed25519_pubkey_b64,
+        Some(ml_dsa_65_pubkey_b64),
+    )
+    .map(|_| ())
+}
+
+/// The registration gates that read only the record, and the canonical bytes
+/// its scrub signature covers: hybrid algorithm, non-empty ids, a 32-byte
+/// Ed25519 key, the #659 subject binding, the content-hash cross-check.
+fn registration_canonical_bytes(record: &KeyRecord) -> Result<Vec<u8>, Error> {
     // Fail-fast: algorithm must be hybrid. put_public_key + the schema
     // CHECK enforce this too; asserting here keeps a non-hybrid row
     // from ever reaching the PQC verify, and gives the same
@@ -1449,7 +1545,7 @@ where
     // v31.0.0 (CIRISPersist#659, one plane wider) — **THE SIGNED ENVELOPE MUST
     // NAME THE KEY IT REGISTERS.** FIRST, before the canonicalizer, the hash
     // cross-check and above all before the granting-authority signer is
-    // resolved from the directory: everything below this line is a question
+    // resolved from the directory: everything after this is a question
     // about the SIGNER, and until this ran there was no question about the
     // SUBJECT anywhere on the path. Checking it first also makes the refusal
     // deterministic — a subject-blind registration is refused identically
@@ -1482,45 +1578,29 @@ where
             record.original_content_hash
         )));
     }
+    Ok(canonical)
+}
 
-    // Resolve the signer's (scrub_key_id's) public keys. Self-attested
-    // proof-of-possession (scrub_key_id == key_id) reads the pubkeys
-    // straight off the submitted record; a granting-authority
-    // signature (scrub_key_id != key_id) resolves them from the
-    // directory — an unknown signer is rejected (fail-secure).
-    let (ed25519_pubkey_b64, ml_dsa_65_pubkey_b64) = if record.scrub_key_id == record.key_id {
-        (
-            record.pubkey_ed25519_base64.clone(),
-            record.pubkey_ml_dsa_65_base64.clone(),
-        )
-    } else {
-        // v54.1.0 (CIRISPersist#1042) — an unregistered signer is an
-        // ORDERING gap (its Key row has not landed here yet), typed apart
-        // from a signature that does not verify: retryable, not terminal.
-        let signer = directory
-            .lookup_public_key(&record.scrub_key_id)
-            .await?
-            .ok_or_else(|| Error::unknown_signer(&record.scrub_key_id, "key_registration"))?;
-        (signer.pubkey_ed25519_base64, signer.pubkey_ml_dsa_65_base64)
-    };
-
-    // Strict hybrid verify: both Ed25519 and ML-DSA-65 REQUIRED.
-    // Peering is high-stakes; a hybrid-pending (Ed25519-only)
-    // registration is rejected. row_age is irrelevant under Strict.
-    let outcome = verify_hybrid(
-        &canonical,
+/// Strict hybrid verify of the record's base scrub over `canonical`, against
+/// the signer's pubkeys. Peering is high-stakes; a hybrid-pending
+/// (Ed25519-only) registration is rejected. `row_age` is irrelevant under
+/// Strict.
+fn verify_registration_signature(
+    record: &KeyRecord,
+    canonical: &[u8],
+    ed25519_pubkey_b64: &str,
+    ml_dsa_65_pubkey_b64: Option<&str>,
+) -> Result<VerifyOutcome, Error> {
+    verify_hybrid(
+        canonical,
         &record.scrub_signature_classical,
         record.scrub_signature_pqc.as_deref(),
-        &ed25519_pubkey_b64,
-        ml_dsa_65_pubkey_b64.as_deref(),
+        ed25519_pubkey_b64,
+        ml_dsa_65_pubkey_b64,
         HybridPolicy::Strict,
         None,
     )
-    .map_err(|e| {
-        Error::SignatureInvalid(format!("registration hybrid-verify: {e} ({})", e.kind()))
-    })?;
-
-    Ok(outcome)
+    .map_err(|e| Error::SignatureInvalid(format!("registration hybrid-verify: {e} ({})", e.kind())))
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -1575,6 +1655,13 @@ pub enum RevocationBoundRefusal {
     /// the #598 reason: a substrate that silently rewrites a stored row no
     /// longer means what it says.
     BoundSubMicrosecond,
+    /// v58.0.0 (CIRISPersist#991, CC 2.4.1.1, CC 3.1.3 `key:revocation`) — the
+    /// revocation's bound is LATER than the bound this node already holds for
+    /// the same subject (the minimum across its held revocations, an absent
+    /// bound sorting as negative infinity: revoke-all). `revoked_after` is an
+    /// upper bound, not a fact: a later revocation may lower it and never
+    /// raise it. APPENDED.
+    BoundRaised,
 }
 
 impl RevocationBoundRefusal {
@@ -1588,6 +1675,7 @@ impl RevocationBoundRefusal {
             Self::BoundNotRfc3339 => "bound_not_rfc3339",
             Self::BoundAfterEffective => "bound_after_effective",
             Self::BoundSubMicrosecond => "bound_sub_microsecond",
+            Self::BoundRaised => "bound_raised",
         }
     }
 
@@ -1599,6 +1687,7 @@ impl RevocationBoundRefusal {
         Self::BoundNotRfc3339,
         Self::BoundAfterEffective,
         Self::BoundSubMicrosecond,
+        Self::BoundRaised,
     ];
 }
 
@@ -1672,6 +1761,35 @@ pub fn check_revocation_bound(
         }
     }
     Ok(())
+}
+
+/// v58.0.0 (CIRISPersist#991, CC 2.4.1.1; `key:revocation:v1`, CC 3.1.3) —
+/// **`revoked_after` only ever lowers.** The bound this node holds for a
+/// subject is the minimum across its held revocations, an absent bound
+/// sorting as negative infinity (revoke-all); an incoming revocation whose
+/// bound is later than that is refused [`RevocationBoundRefusal::BoundRaised`].
+/// A lower bound, an equal one, or a revoke-all is admitted and supersedes by
+/// the minimum fold. `held` is every revocation this node holds for the
+/// subject; the first revocation of a subject is unconstrained.
+pub fn check_revocation_bound_lowers(
+    held: &[super::types::Revocation],
+    incoming: &super::types::Revocation,
+) -> Result<(), RevocationBoundRefusal> {
+    let held: Vec<_> = held
+        .iter()
+        .filter(|r| r.revocation_id != incoming.revocation_id)
+        .collect();
+    if held.is_empty() {
+        return Ok(());
+    }
+    // `None` is revoke-all: below every instant.
+    let held_bound = held.iter().map(|r| r.revoked_after).min().flatten();
+    match (held_bound, incoming.revoked_after) {
+        // A held revoke-all: any bounded revocation would raise it.
+        (None, Some(_)) => Err(RevocationBoundRefusal::BoundRaised),
+        (Some(h), Some(t)) if t > h => Err(RevocationBoundRefusal::BoundRaised),
+        _ => Ok(()),
+    }
 }
 
 /// v25.1.0 (CIRISPersist#570 ask 4) — what this node's held revocations say
@@ -2290,389 +2408,6 @@ pub mod test_support {
             consent_role: None,
             additional_scrubs: Vec::new(),
         }
-    }
-
-    /// **v31.4.0 (CIRISPersist#682) — A RECORD REPLICATED LATE IS STILL SERVED,
-    /// on every backend.**
-    ///
-    /// The defect this witnesses, stated as the sequence it drives:
-    ///
-    /// 1. A consumer reads this node's key stream to the end and keeps its
-    ///    cursor.
-    /// 2. A record **signed a year ago** arrives — a peer that was offline
-    ///    reconnects and replicates — and this node admits it now.
-    /// 3. The consumer resumes.
-    ///
-    /// Keyed on `scrub_timestamp`, step 3 returns nothing: the row sorts a year
-    /// back, behind a cursor that has already passed it, and no retry ever
-    /// recovers it because its sort position is fixed by someone else's clock.
-    /// Not late — **never**. On the identity plane that means a peer that never
-    /// learns the key exists, and every signature by that key is unverifiable
-    /// there forever.
-    ///
-    /// Keyed on `admitted_at` it is served, because this node admitted it after
-    /// the cursor was taken.
-    ///
-    /// The old record is admitted SECOND on purpose. Admitting it first would
-    /// pass under either key, and prove nothing.
-    pub async fn exercise_late_replicated_key_record_is_served(
-        directory: &dyn FederationDirectory,
-        tag: &str,
-    ) -> Result<(), Error> {
-        let now = truncate_to_micros(chrono::Utc::now());
-        let early = format!("k682-early-{tag}");
-        let late = format!("k682-late-{tag}");
-
-        // (1) A record signed just now, admitted first. The consumer reads to
-        //     the end and keeps its cursor.
-        directory
-            .put_public_key(crate::federation::SignedKeyRecord {
-                record: self_scrubbed_record_signed_at(&early, now - chrono::Duration::minutes(1)),
-            })
-            .await?;
-        let first_pass = directory
-            .list_signed_key_records_since(None, u32::MAX)
-            .await?;
-        let cursor = first_pass
-            .iter()
-            .find(|r| r.record.key_id == early)
-            .map(|r| (r.admitted_at, r.record.key_id.clone()))
-            .unwrap_or_else(|| {
-                panic!("({tag}) #682: the freshly admitted record must be served at all")
-            });
-
-        // (2) THE LATE REPLICATION. Signed a year before the cursor, admitted
-        //     now. This is the everyday case, not an attack.
-        let stale_signed_at = now - chrono::Duration::days(365);
-        assert!(
-            stale_signed_at < cursor.0,
-            "({tag}) #682: the late record's signed instant must be BELOW the consumer's cursor, \
-             or the witness cannot distinguish the two keys"
-        );
-        directory
-            .put_public_key(crate::federation::SignedKeyRecord {
-                record: self_scrubbed_record_signed_at(&late, stale_signed_at),
-            })
-            .await?;
-
-        // (3) The consumer resumes from exactly where it stopped.
-        let resumed = directory
-            .list_signed_key_records_since(Some(cursor.clone()), u32::MAX)
-            .await?;
-        let served = resumed
-            .iter()
-            .find(|r| r.record.key_id == late)
-            .unwrap_or_else(|| {
-                panic!(
-                    "({tag}) #682: a key record signed a year ago and admitted NOW must still be \
-                     served to a consumer resuming from {cursor:?} — keyed on the producer's \
-                     `scrub_timestamp` it sorts a year back, behind the cursor, and is never \
-                     served to that consumer again. On the identity plane that is a peer that \
-                     never learns the key exists. Served: {:?}",
-                    resumed.iter().map(|r| &r.record.key_id).collect::<Vec<_>>()
-                )
-            });
-
-        // The position is THIS node's, and it is not the producer's instant.
-        assert!(
-            served.admitted_at > cursor.0,
-            "({tag}) #682: the served position must be this node's admission instant, strictly \
-             after the cursor — got {}, cursor {}",
-            served.admitted_at,
-            cursor.0
-        );
-        assert_eq!(
-            served.record.scrub_timestamp, stale_signed_at,
-            "({tag}) #682: `scrub_timestamp` keeps its job unchanged — it is the producer's \
-             assertion and is bound into the signed envelope; the fix adds a position beside it \
-             rather than rewriting it"
-        );
-
-        // And the record's own bytes carry no node-local field: one record must
-        // hash identically on every node while each keeps its own arrival
-        // order. That separation is the reason `admitted_at` lives on
-        // `ServedKeyRecord` and not on `KeyRecord`.
-        let stored = directory
-            .lookup_public_key(&late)
-            .await?
-            .unwrap_or_else(|| panic!("({tag}) #682: the late record must be stored"));
-        assert_eq!(
-            serde_json::to_vec(&crate::federation::SignedKeyRecord {
-                record: stored.clone()
-            })
-            .expect("serialize stored"),
-            serde_json::to_vec(&crate::federation::SignedKeyRecord {
-                record: served.record.clone()
-            })
-            .expect("serialize served"),
-            "({tag}) #682: the SERVED record must be byte-identical to the STORED one — the \
-             admission position rides beside the record, never inside it"
-        );
-        Ok(())
-    }
-
-    /// **v31.4.0 (CIRISPersist#668) — a tie LARGER THAN ONE PAGE resumes
-    /// instead of losing its remainder.**
-    ///
-    /// Call after planting: every `expected` row must already share ONE
-    /// `admitted_at`, and `expected.len()` must exceed `page`. The tie cannot
-    /// be produced through the write path — `monotonic_admission_instant`
-    /// allocates strictly above the last position, so two admissions on this
-    /// node never collide — but it is reachable in production two ways, which
-    /// is why this is planted rather than skipped:
-    ///
-    /// - the **V126 backfill** stamps every pre-existing row with its
-    ///   `scrub_timestamp`, and a batch replicated from one producer shares
-    ///   one; and
-    /// - two writers racing read the same `MAX` and tie (the postgres door
-    ///   reads over a connection pool, not under a process-local lock).
-    ///
-    /// Resumed on the instant ALONE, a page ends mid-tie and the next read asks
-    /// for `> instant`, which skips every remaining row at that instant —
-    /// silently, and permanently. Resumed on the `(instant, key_id)` PAIR it
-    /// continues where it stopped.
-    pub async fn assert_one_admission_instant_pages_exactly_once(
-        directory: &dyn FederationDirectory,
-        tag: &str,
-        expected: &[String],
-        page: u32,
-    ) -> Result<(), Error> {
-        assert!(
-            expected.len() > page as usize,
-            "({tag}) #668: the tie must be LARGER than one page or the witness cannot fail — \
-             {} rows against a page of {page}",
-            expected.len()
-        );
-        // The plant is verified, not assumed: a witness whose setup silently
-        // did nothing passes for the wrong reason.
-        let all = directory
-            .list_signed_key_records_since(None, u32::MAX)
-            .await?;
-        let tied: Vec<_> = all
-            .iter()
-            .filter(|r| expected.contains(&r.record.key_id))
-            .collect();
-        assert_eq!(
-            tied.len(),
-            expected.len(),
-            "({tag}) #668: every planted row must be readable before paging is measured"
-        );
-        let instants: std::collections::BTreeSet<_> = tied.iter().map(|r| r.admitted_at).collect();
-        assert_eq!(
-            instants.len(),
-            1,
-            "({tag}) #668: the planted rows must share exactly ONE admission instant, or this \
-             witness is not measuring a tie at all — got {instants:?}"
-        );
-
-        let mut cursor: Option<(chrono::DateTime<chrono::Utc>, String)> = None;
-        let mut seen: Vec<String> = Vec::new();
-        // A ceiling on page reads: without one, a cursor that fails to advance
-        // spins forever instead of failing.
-        let ceiling = all.len() * 2 + 8;
-        let mut pages = 0usize;
-        loop {
-            assert!(
-                pages < ceiling,
-                "({tag}) #668: the cursor stopped advancing — {pages} pages over {} rows",
-                all.len()
-            );
-            pages += 1;
-            let rows = directory
-                .list_signed_key_records_since(cursor.clone(), page)
-                .await?;
-            let Some(last) = rows.last() else { break };
-            for r in &rows {
-                if expected.contains(&r.record.key_id) {
-                    seen.push(r.record.key_id.clone());
-                }
-            }
-            cursor = Some((last.admitted_at, last.record.key_id.clone()));
-        }
-
-        let mut sorted = seen.clone();
-        sorted.sort();
-        let mut deduped = sorted.clone();
-        deduped.dedup();
-        assert_eq!(
-            sorted, deduped,
-            "({tag}) #668: a row was served TWICE while paging a tie — {seen:?}"
-        );
-        let mut want: Vec<String> = expected.to_vec();
-        want.sort();
-        assert_eq!(
-            sorted,
-            want,
-            "({tag}) #668: paging a tie of {} rows {page} at a time must yield every row EXACTLY \
-             once. Resumed on the instant alone, the read after the first page asks for \
-             `> instant` and skips the rest of the tie — silently, and forever.",
-            expected.len()
-        );
-        Ok(())
-    }
-
-    /// **v31.4.0 (CIRISPersist#682) — the admission position survives a
-    /// BACKWARD CLOCK STEP, on this backend's real write path.**
-    ///
-    /// Call after planting every stored position to `future` — an instant an
-    /// hour ahead of the wall clock, which is what a node looks like after an
-    /// NTP correction or a VM restore. Two admissions under a forward clock
-    /// would pass with a bare `Utc::now()` and prove nothing, which is why the
-    /// post-step state is planted rather than waited for.
-    ///
-    /// The allocator's rule is unit-tested in `federation::types`. What this
-    /// asserts, and a unit test cannot, is that it is actually WIRED into
-    /// `put_public_key` on this backend.
-    ///
-    /// It says nothing about the allocator reading the *fallback* position —
-    /// this plant writes the `admitted_at` column itself, which a bare
-    /// `MAX(admitted_at)` sees. That is a separate claim with its own witness:
-    /// [`assert_allocator_reads_the_fallback_position`].
-    pub async fn assert_key_admission_survives_backward_step(
-        directory: &dyn FederationDirectory,
-        tag: &str,
-        future: chrono::DateTime<chrono::Utc>,
-    ) -> Result<(), Error> {
-        // The plant is verified, not assumed.
-        let before = directory
-            .list_signed_key_records_since(None, u32::MAX)
-            .await?;
-        assert!(
-            !before.is_empty(),
-            "({tag}) #682: the backward-step plant needs at least one existing row"
-        );
-        let planted_max = before
-            .iter()
-            .map(|r| (r.admitted_at, r.record.key_id.clone()))
-            .max()
-            .expect("non-empty");
-        assert_eq!(
-            planted_max.0, future,
-            "({tag}) #682: the plant did not take — the last position handed out must be the \
-             stepped-forward instant, or the next admission is not being asked the question"
-        );
-
-        // The consumer has read everything and holds the post-step cursor.
-        let admitted_after_step = format!("k682-step-{tag}");
-        directory
-            .put_public_key(crate::federation::SignedKeyRecord {
-                record: self_scrubbed_record_signed_at(
-                    &admitted_after_step,
-                    truncate_to_micros(chrono::Utc::now()),
-                ),
-            })
-            .await?;
-
-        let resumed = directory
-            .list_signed_key_records_since(Some(planted_max.clone()), u32::MAX)
-            .await?;
-        let served = resumed
-            .iter()
-            .find(|r| r.record.key_id == admitted_after_step)
-            .unwrap_or_else(|| {
-                panic!(
-                    "({tag}) #682: a record admitted AFTER a backward clock step must still sort \
-                     after every row admitted before it. Stamped from the bare wall clock it \
-                     lands an hour BELOW the cursor {planted_max:?} a consumer already passed, \
-                     and `> since` skips it permanently. Served: {:?}",
-                    resumed.iter().map(|r| &r.record.key_id).collect::<Vec<_>>()
-                )
-            });
-        assert!(
-            served.admitted_at > future,
-            "({tag}) #682: the new position must be strictly above the stepped-forward one — got \
-             {}, planted {future}",
-            served.admitted_at
-        );
-        Ok(())
-    }
-
-    /// **v31.4.0 (CIRISPersist#682) — THE ALLOCATOR READS THE EXPRESSION THE
-    /// READER READS**, on the backends whose position can come from a fallback.
-    ///
-    /// Call after planting one row that has NO stored position, so its
-    /// effective position is its `scrub_timestamp` — and plant that instant in
-    /// the FUTURE, so the fallback is the largest position in the table.
-    ///
-    /// This is only reachable where the column is nullable: the sqlite dialect,
-    /// whose `ALTER TABLE` cannot add a NOT NULL column to a populated table
-    /// and cannot alter nullability in place, and memory, which mirrors it.
-    /// Postgres sets NOT NULL after the V126 backfill and has no such row, so
-    /// it correctly reads the bare column and is deliberately not driven here.
-    ///
-    /// The cursor already reads the fallback — `COALESCE(admitted_at,
-    /// scrub_timestamp)`, and `key_record_position` in memory. If the ALLOCATOR
-    /// does not, it is blind to a position the reader can see, and it stamps
-    /// the next admission BELOW that row. A consumer whose cursor has passed
-    /// the fallback row then never sees the new one: #682 exactly, re-entering
-    /// through the allocator instead of through the cursor.
-    pub async fn assert_allocator_reads_the_fallback_position(
-        directory: &dyn FederationDirectory,
-        tag: &str,
-        unstamped_key_id: &str,
-        fallback_at: chrono::DateTime<chrono::Utc>,
-    ) -> Result<(), Error> {
-        // The plant is verified, not assumed: the cursor must actually be
-        // serving this row AT its fallback instant, or the allocator is not
-        // being asked the question.
-        let before = directory
-            .list_signed_key_records_since(None, u32::MAX)
-            .await?;
-        let planted = before
-            .iter()
-            .find(|r| r.record.key_id == unstamped_key_id)
-            .unwrap_or_else(|| panic!("({tag}) #682: the unstamped row must be served at all"));
-        assert_eq!(
-            planted.admitted_at, fallback_at,
-            "({tag}) #682: the unstamped row's position must come from the FALLBACK — if it does \
-             not, the plant did not take and this witness cannot fail"
-        );
-        assert_eq!(
-            before
-                .iter()
-                .map(|r| r.admitted_at)
-                .max()
-                .expect("non-empty"),
-            fallback_at,
-            "({tag}) #682: the fallback row must hold the LARGEST position in the table, or an \
-             allocator that ignores it would still land above everything by accident"
-        );
-
-        let after_fallback = format!("k682-fb-{tag}");
-        directory
-            .put_public_key(crate::federation::SignedKeyRecord {
-                record: self_scrubbed_record_signed_at(
-                    &after_fallback,
-                    truncate_to_micros(chrono::Utc::now()),
-                ),
-            })
-            .await?;
-
-        let resumed = directory
-            .list_signed_key_records_since(
-                Some((fallback_at, unstamped_key_id.to_owned())),
-                u32::MAX,
-            )
-            .await?;
-        let served = resumed
-            .iter()
-            .find(|r| r.record.key_id == after_fallback)
-            .unwrap_or_else(|| {
-                panic!(
-                    "({tag}) #682: the next admission must sort ABOVE a row whose position comes \
-                     from the `scrub_timestamp` fallback. An allocator reading only the stored \
-                     column cannot see that row, stamps below it, and the new record is invisible \
-                     to every consumer already past it. Served: {:?}",
-                    resumed.iter().map(|r| &r.record.key_id).collect::<Vec<_>>()
-                )
-            });
-        assert!(
-            served.admitted_at > fallback_at,
-            "({tag}) #682: the new position must be strictly above the fallback one — got {}, \
-             fallback {fallback_at}",
-            served.admitted_at
-        );
-        Ok(())
     }
 }
 

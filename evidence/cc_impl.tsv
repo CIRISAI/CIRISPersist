@@ -263,6 +263,17 @@ decimal_id	claim_id	repo	path#symbol	crate@version
 3.4.8	CLM-detection-on-base	CIRISPersist	src/derived/detection_row.rs#project_detection_row	ciris-persist@57.0.0
 2.4.2	CLM-silo-projection-rebuildable	CIRISPersist	src/federation/silo_projection.rs#check_projection_rebuild	ciris-persist@57.0.0
 
+# v58.0.0 (CIRISPersist#991 plane 1) — the key plane as rows: key:record:v1,
+# key:revocation:v1, identity:occurrence:v1; their tables are projections.
+3.1.3	CLM-planes-as-rows	CIRISPersist	src/federation/key_plane.rs#plan_key_record_row	ciris-persist@57.0.0
+3.1.3	CLM-planes-as-rows	CIRISPersist	src/federation/register.rs#verify_proof_of_possession	ciris-persist@57.0.0
+3.1.3	CLM-planes-as-rows	CIRISPersist	src/federation/key_plane.rs#apply_key_plane_row	ciris-persist@57.0.0
+3.1.3	CLM-planes-as-rows	CIRISPersist	src/federation/mod.rs#unknown_signer	ciris-persist@57.0.0
+3.1.3	CLM-planes-as-rows	CIRISPersist	src/federation/key_plane.rs#plan_put_revocation	ciris-persist@57.0.0
+3.1.3	CLM-planes-as-rows	CIRISPersist	src/federation/register.rs#check_revocation_bound_lowers	ciris-persist@57.0.0
+3.1.3	CLM-planes-as-rows	CIRISPersist	src/federation/key_plane.rs#occurrence_row	ciris-persist@57.0.0
+3.1.3	CLM-planes-as-rows	CIRISPersist	src/federation/silo_projection.rs#check_projection_rebuild	ciris-persist@57.0.0
+
 # v57.0.0 (CIRISPersist#1091) — the register's hosted rows come home. (a) the 27
 # claims whose only pointer was a CIRISServer-hosted row at ciris-persist@v17.0.1,
 # published here at the symbol's current home; (b) 13 symbols persist already
