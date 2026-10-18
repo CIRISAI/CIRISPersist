@@ -172,14 +172,34 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("project_hard_case_row", Class::Plumbing),
     ("project_detection_row", Class::Plumbing),
     ("project_detection_row_under", Class::Plumbing),
-    // The DSAR door's Art. 17 erasure of row-backed detections: the
-    // hard-delete, the tombstone header + tombstones it builds (pure) and
-    // writes. Storage on a decision the erasure already made: Plumbing.
-    ("art17_erasure_execution", Class::Plumbing),
-    ("sqlite_art17_delete_detection_rows", Class::Plumbing),
-    ("pg_art17_delete_detection_rows", Class::Plumbing),
-    ("sqlite_put_art17_execution", Class::Plumbing),
-    ("pg_put_art17_execution", Class::Plumbing),
+    // v58.0.0 (CIRISPersist#1094 item 2) — the DSAR door's erasure of
+    // row-backed detections under the producer's rule-1 `withdraws`: the hard-delete
+    // of the cited rows, the tombstone header + tombstone it builds (pure) and
+    // writes. Storage on a decision `subject_erasure::plan_store_erasure`
+    // already made: Plumbing.
+    ("erasure_execution", Class::Plumbing),
+    // v58.0.0 (CIRISPersist#1094 item 2) — the erasure door's decision, read
+    // before its transaction, once for all three backends (a shared plan:
+    // which detections a subject `withdraws` covers).
+    ("plan_store_erasure", Class::Plan),
+    // Inside it: the candidate reads (storage), and THE authority decisions —
+    // a row is erased only under its producer's admitted rule-1 `withdraws`
+    // (re-derived through the one `withdraws` predicate, or planned and
+    // admitted by it), and a row whose producer key is not held is refused.
+    ("detection_row_ids_for_agent", Class::Plumbing),
+    ("erasing_withdraws", Class::Gate),
+    ("producer_key_held", Class::Gate),
+    ("plan_producer_withdraws", Class::Gate),
+    // Each backend's store step for the producers' planned withdraws.
+    ("sqlite_store_erasure_withdraws", Class::Plumbing),
+    ("pg_store_erasure_withdraws", Class::Plumbing),
+    // The canonical subject of an agent / a detection's trace: derivations.
+    ("agent_subject", Class::Plumbing),
+    ("detection_subject", Class::Plumbing),
+    ("sqlite_erase_cited_rows", Class::Plumbing),
+    ("pg_erase_cited_rows", Class::Plumbing),
+    ("sqlite_put_erasure_execution", Class::Plumbing),
+    ("pg_put_erasure_execution", Class::Plumbing),
     // Each backend's erasure recorder plans the erasure row(s) (the shared
     // hard_case plan) and writes them with their tombstones: it carries the
     // plan's sequence.
@@ -1266,7 +1286,9 @@ mod tests {
     /// files: `(file, fn)`. Each body is held to the same [`CALL_CLASSES`]
     /// partition as a backend door, and its sequence is what a door's
     /// `plan:NAME` token stands for.
-    const SHARED_PLANS: [(&str, &str); 15] = [
+    const SHARED_PLANS: [(&str, &str); 16] = [
+        // v58.0.0 (CIRISPersist#1094 item 2).
+        ("src/federation/subject_erasure.rs", "plan_store_erasure"),
         // v57.0.0 (CIRISPersist#988 items 2, 3).
         ("src/federation/attestation_admit.rs", "plan_hard_case_row"),
         ("src/federation/attestation_admit.rs", "plan_detection_row"),

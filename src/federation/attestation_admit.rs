@@ -256,6 +256,22 @@ pub(crate) trait AttestationStore:
         projection: super::silo_projection::SiloProjection,
     ) -> Result<super::silo_projection::ProjectionRebuild, Error>;
 
+    /// v58.0.0 (CIRISPersist#1094 item 2) — the `agent_id_hash` of the trace
+    /// `trace_id` as this node holds it (`trace_events`), `None` when no row of
+    /// it is held.
+    async fn trace_agent_id_hash(&self, trace_id: &str) -> Result<Option<String>, Error>;
+
+    /// v58.0.0 (CIRISPersist#1094 item 2) — the ids of the `detection:*` rows
+    /// whose detection names (by its body's `trace_id`) a trace of
+    /// `agent_id_hash` this node holds, restricted to traces signed by
+    /// `signing_key_id` when given (the key-scoped DSAR door). What a DSAR
+    /// erasure of that agent reaches on the attestation plane. Sorted.
+    async fn detection_row_ids_for_agent(
+        &self,
+        agent_id_hash: &str,
+        signing_key_id: Option<&str>,
+    ) -> Result<Vec<String>, Error>;
+
     /// v57.0.0 (CIRISPersist#988 item 3) — store a planned detection row and,
     /// when it landed, its `detection_events` projection, in one transaction.
     /// `false` (nothing written) when the row's id is already held.
@@ -1835,9 +1851,21 @@ pub(crate) struct PlannedDetection {
 /// `lenscore_detector` only, CC 3.4.8), the reserved genesis ids, the mirror
 /// and instant stamp, the size as stored, the instant binding at
 /// `received_at`.
+///
+/// v58.0.0 (CIRISPersist#1094 item 2, CC 4.5.3) — `subject` is the scored
+/// agent's CC 2.3.2.1 canonical hash
+/// ([`subject_erasure::agent_subject`](super::subject_erasure::agent_subject)
+/// of the trace's `agent_id_hash`, [`detection_subject`]), written into
+/// `subject_key_ids`: a detection is a row ABOUT that subject, and naming it
+/// makes the rows about a subject discoverable (DSAR export, the erasure
+/// door's lookup). It is not an authority path: a detection is adverse, and
+/// is erased only by its producer's rule-1 `withdraws` (CC 4.5.3, the 2.4.1.1
+/// carve-out). `None` when the door cannot tell whose trace it scored (the
+/// trace is not held here): the door never guesses a subject.
 pub(crate) fn plan_detection_row(
     body: &crate::derived::detection_row::DetectionProjection,
     attester_identity_type: &str,
+    subject: Option<&str>,
     instants: PlanInstants,
 ) -> Result<PlannedDetection, Error> {
     use crate::derived::detection_row as dr;
@@ -1863,7 +1891,7 @@ pub(crate) fn plan_detection_row(
         weight: None,
         expires_at: None,
         attestation_envelope: crate::federation::envelope::EnvelopeCore::from_value(envelope)?,
-        subject_key_ids: Vec::new(),
+        subject_key_ids: subject.map(str::to_owned).into_iter().collect(),
         cohort_scope: cohort_scope::SELF.to_owned(),
         scrub_signature_classical: None,
         scrub_signature_pqc: None,
@@ -1921,6 +1949,33 @@ pub(crate) fn detection_reput_verdict(
     }
 }
 
+/// v58.0.0 (CIRISPersist#1094 item 2, CC 4.5.3) — **whose detection this
+/// is**: the canonical subject
+/// ([`subject_erasure::agent_subject`](super::subject_erasure::agent_subject))
+/// of the agent whose trace it scored, read from the trace as THIS node holds
+/// it. `None` when the trace is not held (or names an agent outside the CC
+/// 2.3.2.1 `{id}` production): the door never guesses a subject. One reader
+/// for the live door and the legacy rehome.
+///
+/// # Errors
+///
+/// Directory reads.
+pub(crate) async fn detection_subject<D>(
+    dir: &D,
+    trace_id: Option<&str>,
+) -> Result<Option<String>, Error>
+where
+    D: AttestationStore,
+{
+    let Some(trace_id) = trace_id else {
+        return Ok(None);
+    };
+    Ok(dir
+        .trace_agent_id_hash(trace_id)
+        .await?
+        .and_then(|agent| super::subject_erasure::agent_subject(&agent).ok()))
+}
+
 /// v57.0.0 (CIRISPersist#988 item 3) — the door: every backend's
 /// `put_detection_event` is this call. The detector's hybrid signature over
 /// `canonical_bytes` is the caller's to verify (the `DerivedSchema` verify
@@ -1942,9 +1997,11 @@ where
             attesting_key_id: event.signing_key_id.clone(),
             plane: "detection",
         })?;
+    let subject = detection_subject(dir, body.trace_id.as_deref()).await?;
     let planned = plan_detection_row(
         &body,
         &identity_type,
+        subject.as_deref(),
         PlanInstants {
             fold_at: received_at,
             received_at,

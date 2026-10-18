@@ -437,9 +437,11 @@ pub const RULES_NOT_ON_THE_ROW: &[PersistFamilyRule] = &[
     },
     PersistFamilyRule {
         prefix: "reconsideration:",
-        rule: "review duty-holder only — the community's named moderators (CC 4.5.5), never the \
-               filer's own self-declared subjects",
-        enforced_at: &["federation::admission::check_delegated_duty_scores_admission"],
+        rule: "a filing: the subject of the held target attestation (its signed subjects) or a \
+               review duty-holder of the target's community; a ruling (an `outcome`): the \
+               review duty-holders only — never the filer's own self-declared subjects (CC \
+               4.5.5, CIRISPersist#1094)",
+        enforced_at: &["federation::admission::check_reconsideration_admission"],
         gap: RowRuleGap::NoRuleOnTheRow,
         minted_by_persist: false,
         cc_ask: "CIRISConstitution#67 (same CC 4.5.5 table as `moderation:`; the row states \

@@ -2379,11 +2379,18 @@ impl Engine {
     /// of an agent's trace corpus, keyed on `agent_id_hash` alone (all
     /// signing keys).
     ///
-    /// In one atomic transaction the backend hard-deletes the agent's
-    /// `trace_events` + `trace_llm_calls`, **tombstones** the derived
-    /// `detection_events` (NULLs the PII linkage + stamps `erased_at` —
-    /// the analytics survive, the subject linkage is severed), and emits
-    /// a `hard_case:trace_erasure` audit row. Returns an
+    /// v58.0.0 (CIRISPersist#1094 item 2; CC 4.5.3, CLM-erasure-subject-route)
+    /// — in one atomic transaction the backend hard-deletes the agent's
+    /// `trace_events` + `trace_llm_calls`, tombstones pre-v57 silo detections
+    /// in place (V080), and erases each row-backed `detection:*` row about the
+    /// agent under its PRODUCER's rule-1 `withdraws` (the controller
+    /// withdrawing its own row on the subject's request — no subject path
+    /// reaches an adverse row): the withdraws is the detector's local-tier
+    /// row, signature deferred to the crossing as the detection's own is, and
+    /// each erased row leaves a tombstone citing it that is served to peers. A
+    /// row whose producer key the host does not hold is refused with a reason
+    /// (`ErasureSummary::detection_rows_refused`, GDPR Art. 17(3)). The
+    /// `hard_case:trace_erasure` row names nobody. Returns an
     /// [`ErasureSummary`](crate::store::types::ErasureSummary) with the
     /// per-table counts.
     ///
@@ -9259,6 +9266,17 @@ impl Engine {
         // bundle whose notice is a duty-holder takedown is re-verified under
         // CC 4.5.5 and reaches the bytes plane only; an immediate-removal
         // basis destroys the bytes on receipt here too (CC 4.5.3 step 2).
+        // v58.0.0 (CIRISPersist#1094 item 2, CC 4.5.3) — an erasure's
+        // tombstone cites the row's PRODUCER's rule-1 `withdraws`, re-derived
+        // against THIS node's own state; the row is destroyed on receipt.
+        if crate::federation::subject_erasure::is_erasure_notice_envelope(&bundle.notice.envelope) {
+            return crate::federation::subject_erasure::apply_replicated_erasure(
+                directory.as_ref(),
+                bundle,
+                &node,
+            )
+            .await;
+        }
         if crate::federation::takedown_tombstone::is_takedown_notice_envelope(
             &bundle.notice.envelope,
         ) {

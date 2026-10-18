@@ -15546,22 +15546,17 @@ pub async fn check_delegated_duty_scores_admission(
         .get("community_id")
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    // v21.11.0 (CIRISPersist#517, CC 4.5.5) — resolve duty-holders from the
-    // community's NAMED MODERATORS ONLY. The prior code seeded the admissible
-    // set from the row's OWN `subject_key_ids`, so any Rooted producer could
-    // file an admissible `reconsideration:*` / `moderation:*` over any
-    // community action by naming THEMSELVES as subject — CC 4.5.5's
-    // target→duty-holder table authorizes NO subject-self clause for these two
-    // dimensions (only `takedown_notice`, on a DIFFERENT content path, gets
-    // `subject_of(content_sha256) ∪ is_named_moderator`). The §11.10 "already
-    // signed-state, leave it" note proves the SIGNER isn't spoofed; it does NOT
-    // prove the SUBJECT claim is genuine — integrity ≠ authority. If a
-    // subject-self carve-out is ever intended it must resolve against the
-    // REFERENCED prior action's signed subjects (a `subject_of`-style
-    // fail-secure resolver keyed on `references_attestation_id`), never from
-    // the row's own envelope. (`duty_holders_from_signed_subjects` is retained
-    // for that future referenced-action resolver; it is no longer reachable
-    // from this self-declared path.)
+    // v58.0.0 (CIRISPersist#1094 item 3, CC 4.5.5 subject standing;
+    // CLM-reconsideration-subject-standing) — a `reconsideration:{grounds}`
+    // FILING against a prior action admits the SUBJECT OF THE TARGET
+    // attestation beside the community's review-holders; a RULING stays with
+    // the review-holders. The subject is resolved from the REFERENCED target
+    // row as this node holds it, never from the filer's own envelope
+    // (v21.11.0 / CIRISPersist#517: integrity of a self-declared subject is
+    // not authority). [`check_reconsideration_admission`] is that decision.
+    if dimension.starts_with(RECONSIDERATION_DIMENSION_PREFIX) {
+        return check_reconsideration_admission(directory, row, dimension, community_id).await;
+    }
     // v30.10.0 (CIRISPersist#632) — SCOPE SELECTS THE RESOLVER.
     //
     // An act naming a `community_id` is community-scoped and resolves its
@@ -15606,6 +15601,146 @@ pub async fn check_delegated_duty_scores_admission(
         dimension,
     )
     .await
+}
+
+/// v58.0.0 (CIRISPersist#1094 item 3) — the envelope member a
+/// `reconsideration:{grounds}` RULING carries: its outcome (`reversed` /
+/// `partial` / `upheld`, CC 3.1.9.2). A row that carries it rules; a row
+/// without it files. Only the filing gains the subject arm (CC 4.5.5: "the
+/// ruling on it stays with the review-holders").
+pub const RECONSIDERATION_OUTCOME_MEMBER: &str = "outcome";
+
+/// v58.0.0 (CIRISPersist#1094 item 3) — the refusal token when a
+/// `reconsideration:{grounds}` names a `community_id` other than its held
+/// target's: the action's community is the TARGET's, and a filer may not
+/// point the review-holder arm at a community it moderates instead.
+/// `Error::InvalidArgument` (Python `ValueError`).
+pub const RECONSIDERATION_COMMUNITY_MISMATCH: &str = "reconsideration_community_mismatch";
+
+/// v58.0.0 (CIRISPersist#1094 item 3, CC 4.5.5; CLM-reconsideration-subject-standing)
+/// — **who may file, and who may rule, a `reconsideration:{grounds}`.**
+///
+/// The target is the row the reconsideration names by
+/// `references_attestation_id`, read from THIS node's store. The action's
+/// community `C` is the held target's `community_id` (a filing that names a
+/// different one is refused, [`RECONSIDERATION_COMMUNITY_MISMATCH`]); with no
+/// target held, `C` is the row's own `community_id` (the pre-v58 reading,
+/// unchanged).
+///
+/// - **A ruling** (the envelope carries [`RECONSIDERATION_OUTCOME_MEMBER`]):
+///   the review-holders of `C` only — `is_named_moderator(·, C, review)`, as
+///   self or through a live `review`-scoped chain from a steward-bound root.
+/// - **A filing**: the same holders ∪ [`reconsideration_target_subjects`] —
+///   the SIGNED subjects of the held target. Absence is never an admit
+///   condition: a target not held here, a licence target (its own arm,
+///   CIRISPersist#1036 item 5, out of this cut) and a target naming no
+///   subject each leave the subject arm empty, so only the review-holders
+///   remain.
+///
+/// A subject admits as itself or, under CC 4.5.5 (b), through a live
+/// `review`-scoped chain it roots, when it is steward-bound.
+///
+/// # Errors
+///
+/// [`Error::DelegatedScopeUnauthorized`] when neither arm holds;
+/// [`RECONSIDERATION_COMMUNITY_MISMATCH`]; directory reads.
+pub async fn check_reconsideration_admission(
+    directory: &dyn super::FederationDirectory,
+    row: &super::Attestation,
+    dimension: &str,
+    declared_community_id: &str,
+) -> Result<(), Error> {
+    // CC 4.5.1.1 op separation: the pointer is read with its discriminator —
+    // on a `scores` row of the `reconsideration:` family it names the prior
+    // action under review; no composer fold reads it there
+    // (`precedence::is_structural_composer` excludes `scores`).
+    let pointer = (row.attestation_type == attestation_type::SCORES)
+        .then(|| {
+            crate::federation::precedence::references_attestation_id_from_envelope(
+                &row.attestation_envelope,
+            )
+        })
+        .flatten();
+    let target = match pointer {
+        Some(id) => directory.get_attestation(id).await?,
+        None => None,
+    };
+    let community_id = match &target {
+        Some(t) => {
+            let held = t
+                .attestation_envelope
+                .get("community_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            if !declared_community_id.is_empty() && declared_community_id != held {
+                return Err(Error::InvalidArgument(format!(
+                    "{RECONSIDERATION_COMMUNITY_MISMATCH}: reconsideration {} names community \
+                     {declared_community_id:?}, its target {} is in {held:?} — the action's \
+                     community is the target's (CC 4.5.5)",
+                    row.attestation_id, t.attestation_id
+                )));
+            }
+            held.to_owned()
+        }
+        None => declared_community_id.to_owned(),
+    };
+    let mut holders =
+        duty_holders_for_community(directory, &community_id, DELEGATION_SCOPE_REVIEW).await?;
+    let is_ruling = row
+        .attestation_envelope
+        .get(RECONSIDERATION_OUTCOME_MEMBER)
+        .is_some();
+    if !is_ruling {
+        if let Some(t) = &target {
+            holders.extend(
+                reconsideration_target_subjects(directory, &row.attesting_key_id, t).await?,
+            );
+        }
+    }
+    check_moderation_admission(
+        directory,
+        &row.attesting_key_id,
+        &holders,
+        DELEGATION_SCOPE_REVIEW,
+        dimension,
+    )
+    .await
+}
+
+/// v58.0.0 (CIRISPersist#1094 item 3, CC 4.5.5) — **the subject of a
+/// reconsideration's target**, from the target row as held: its signed
+/// `subject_key_ids`, plus `filer` when the target names its subject by key
+/// digest ([`MODERATION_SUBJECT_DIGEST_ENVELOPE_FIELD`]) and the filer's
+/// registered key digests to it. Never the reconsideration's own
+/// `subject_key_ids`. Empty for a `licensure:*` target: a licensee's standing
+/// against a licence is CIRISPersist#1036 item 5's arm (A's authority set),
+/// not this one.
+///
+/// # Errors
+///
+/// A malformed subject digest on the target; directory reads.
+pub async fn reconsideration_target_subjects(
+    directory: &dyn super::FederationDirectory,
+    filer: &str,
+    target: &super::Attestation,
+) -> Result<std::collections::HashSet<String>, Error> {
+    let mut subjects = std::collections::HashSet::new();
+    if envelope_dimension(&target.attestation_envelope)
+        .is_some_and(|d| d.starts_with(crate::federation::licensure::LICENSURE_DIMENSION_PREFIX))
+    {
+        return Ok(subjects);
+    }
+    subjects.extend(target.subject_key_ids.iter().cloned());
+    if let Some(digest) = moderation_subject_digest(&target.attestation_envelope)? {
+        if let Some(rec) = directory.lookup_public_key(filer).await? {
+            if super::key_digest::Sha256Ed25519Raw::from_pubkey_base64(&rec.pubkey_ed25519_base64)
+                .is_ok_and(|d| d == digest)
+            {
+                subjects.insert(filer.to_owned());
+            }
+        }
+    }
+    Ok(subjects)
 }
 
 /// v9.0.0 (CIRISPersist#236, CC 4.4.3.4.3 / CC 3.4.7.3) — the

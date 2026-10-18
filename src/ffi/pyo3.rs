@@ -17162,6 +17162,7 @@ impl PyEngine {
     ///   "federation_keys_deleted":        int,  # 0 unless include_federation_key=True
     ///   "federation_attestations_deleted": int,  # 0 unless include_federation_key=True
     ///   "federation_revocations_deleted":  int,  # 0 unless include_federation_key=True
+    ///   "detection_rows_refused":         [ {"record_id": str, "reason": str} ],
     ///   "deleted_at":                     str,  # ISO-8601 UTC
     /// }
     /// ```
@@ -17229,6 +17230,10 @@ impl PyEngine {
                 "federation_revocations_deleted",
                 summary.federation_revocations_deleted,
             )?;
+            dict.set_item(
+                "detection_rows_refused",
+                erasure_refusals_to_py(py, &summary.detection_rows_refused)?,
+            )?;
             dict.set_item("deleted_at", summary.deleted_at.to_rfc3339())?;
             Ok(dict)
         })
@@ -17241,18 +17246,26 @@ impl PyEngine {
     /// detections.
     ///
     /// In one atomic transaction: hard-deletes `trace_events` +
-    /// `trace_llm_calls`, TOMBSTONES the derived `detection_events`
-    /// (NULLs the PII linkage + stamps `erased_at`), and emits a
-    /// `hard_case:trace_erasure` audit row. Returns a dict:
+    /// `trace_llm_calls`, tombstones pre-v57 silo detections in place, and
+    /// (v58.0.0, CIRISPersist#1094 item 2, CC 4.5.3) erases each row-backed
+    /// detection about the agent under its PRODUCER's rule-1 `withdraws`,
+    /// leaving a tombstone that replicates; records a subject-free
+    /// `hard_case:trace_erasure` row. Returns a dict:
     ///
     /// ```text
     /// {
     ///   "trace_events":                 int,
     ///   "trace_llm_calls":              int,
     ///   "detection_events_tombstoned":  int,
+    ///   "detection_rows_refused":       [ {"record_id": str, "reason": str} ],
     ///   "erased_at":                    str,  # ISO-8601 UTC
     /// }
     /// ```
+    ///
+    /// `detection_rows_refused` lists the rows NOT erased, each with its
+    /// reason (Art. 17(3) refused-with-reason; today
+    /// `erasure_producer_key_not_held`). Raises `NodeIdentityRequired` with
+    /// no node identity.
     ///
     /// **Idempotent**: a second call returns all-zero counts; a not-found
     /// is NOT raised as an error. Persist owns the atomic substrate
@@ -17298,6 +17311,10 @@ impl PyEngine {
             dict.set_item(
                 "detection_events_tombstoned",
                 summary.detection_events_tombstoned,
+            )?;
+            dict.set_item(
+                "detection_rows_refused",
+                erasure_refusals_to_py(py, &summary.detection_rows_refused)?,
             )?;
             dict.set_item("erased_at", summary.erased_at.to_rfc3339())?;
             Ok(dict)
@@ -34717,6 +34734,22 @@ where
     };
     serde_json::to_string(&page)
         .map_err(|e| PyRuntimeError::new_err(format!("AttestationListPage encode: {e}")))
+}
+
+/// v58.0.0 (CIRISPersist#1094 item 2) — the rows a DSAR door refused, as a
+/// list of `{"record_id", "reason"}` dicts (Art. 17(3) refused-with-reason).
+fn erasure_refusals_to_py<'py>(
+    py: Python<'py>,
+    refused: &[crate::federation::subject_erasure::ErasureRefusal],
+) -> PyResult<Bound<'py, pyo3::types::PyList>> {
+    let list = pyo3::types::PyList::empty(py);
+    for r in refused {
+        let d = PyDict::new(py);
+        d.set_item("record_id", &r.record_id)?;
+        d.set_item("reason", &r.reason)?;
+        list.append(d)?;
+    }
+    Ok(list)
 }
 
 /// v57.0.0 (CIRISPersist#988 item 2) — an erasure door's store error: the

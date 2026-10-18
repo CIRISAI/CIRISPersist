@@ -1559,19 +1559,26 @@ impl Backend for SqliteBackend {
         // env var; quantifies the v3.11.0 → v3.12.x boot-time delta
         // for cohabitation race triage). See
         // `crate::store::migration_timing` for the format.
-        self.write(move |conn| -> Result<(), refinery::Error> {
-            let timing =
-                crate::store::migration_timing::MigrationTiming::from_run("sqlite", || {
-                    embedded::migrations::runner().run(&mut *conn)
-                })?;
-            crate::store::migration_timing::append(&timing);
-            Ok(())
-        })
-        .await
-        .map_err(|e| Error::Migration {
-            sqlstate: None,
-            detail: format!("sqlite migrations: {e}"),
-        })?;
+        let v196 = self
+            .write(
+                move |conn| -> Result<Option<(i64, i64, i64)>, refinery::Error> {
+                    // v58.0.0 (CIRISPersist#1094 item 2) — what V196 will delete,
+                    // counted before it runs so the boot can say so.
+                    let v196 = sqlite_v196_pending(conn);
+                    let timing = crate::store::migration_timing::MigrationTiming::from_run(
+                        "sqlite",
+                        || embedded::migrations::runner().run(&mut *conn),
+                    )?;
+                    crate::store::migration_timing::append(&timing);
+                    Ok(v196)
+                },
+            )
+            .await
+            .map_err(|e| Error::Migration {
+                sqlstate: None,
+                detail: format!("sqlite migrations: {e}"),
+            })?;
+        log_v196(v196);
 
         // #845 (I55) — AFTER the shipped migrations, BEFORE any write: the
         // live schema's `subsec` defaults are rewritten to the portable form,
@@ -1614,7 +1621,24 @@ impl Backend for SqliteBackend {
                 .await
                 .map_err(|e| Error::Backend(format!("rehome before erasure: {e}")))?;
         }
+        // v58.0.0 (CIRISPersist#1094 item 2, CC 4.5.3) — the row-backed
+        // detections this erasure reaches: each erased under its PRODUCER's
+        // rule-1 `withdraws` (planned here when not already held), or refused
+        // with a reason (read before the transaction).
         let received_at = chrono::Utc::now();
+        let crate::federation::subject_erasure::ErasurePlan {
+            citations,
+            new_withdraws,
+            refused,
+        } = crate::federation::subject_erasure::plan_store_erasure(
+            self,
+            &agent,
+            Some(&key),
+            received_at,
+        )
+        .await
+        .map_err(|e| Error::Backend(format!("erasure plan: {e}")))?;
+        let refused_count = refused.len() as u64;
         let received_s = received_at.to_rfc3339();
         let summary = self
             .write(
@@ -1632,14 +1656,15 @@ impl Backend for SqliteBackend {
                         rows.collect::<Result<Vec<_>, _>>()?
                     };
 
-                    // v57.0.0 (CIRISPersist#988 item 3; lead ruling on the
-                    // DSAR path) — the erased traces' detections: a pre-v57
-                    // silo row takes the V080 tombstone in place; a ROW-BACKED
-                    // one is hard-deleted (never rewritten) and leaves no
-                    // projection row.
+                    // v57.0.0 (CIRISPersist#988 item 3) — a pre-v57 silo row
+                    // takes the V080 tombstone in place. v58.0.0
+                    // (CIRISPersist#1094 item 2) — a ROW-BACKED one is
+                    // hard-deleted only under its producer's rule-1 `withdraws` (the
+                    // citations), and leaves no projection row.
                     let legacy_tombstoned =
                         sqlite_tombstone_detection_events(&tx, &trace_ids, &received_s)?;
-                    let erased_rows = sqlite_art17_delete_detection_rows(&tx, &trace_ids)?;
+                    sqlite_store_erasure_withdraws(&tx, &new_withdraws)?;
+                    let erased_rows = sqlite_erase_cited_rows(&tx, &citations)?;
                     let detection_events_tombstoned = legacy_tombstoned + erased_rows.len() as u64;
 
                     // Step 2: delete LLM call rows joined by trace_id.
@@ -1718,27 +1743,20 @@ impl Backend for SqliteBackend {
                         || federation_revocations_deleted > 0
                         || detection_events_tombstoned > 0
                     {
-                        let mut event = crate::federation::HardCaseEvent {
-                            event_id: uuid::Uuid::new_v4().to_string(),
-                            kind: crate::federation::hard_case::kind::TRACE_ERASURE.to_owned(),
-                            target_key_id: Some(agent.clone()),
-                            subject_key_id: None,
-                            detail: serde_json::json!({
-                                "op": "delete_traces_for_agent",
-                                "agent_id_hash": agent,
-                                "signing_key_id": key,
-                                "trace_events": trace_events_deleted,
-                                "trace_llm_calls": trace_llm_calls_deleted,
-                                "federation_keys": federation_keys_deleted,
-                                "federation_attestations": federation_attestations_deleted,
-                                "federation_revocations": federation_revocations_deleted,
-                                "detection_events_tombstoned": detection_events_tombstoned,
-                            }),
-                            emitted_at: received_at,
-                        };
-                        crate::federation::hard_case::bind_erased_detection_rows(
-                            &mut event.detail,
-                            &erased_rows,
+                        // v58.0.0 (#1094 item 2, CC 4.5.3) — subject-free.
+                        let event = crate::federation::hard_case::trace_erasure_event(
+                            &crate::federation::hard_case::TraceErasureCounts {
+                                op: crate::federation::hard_case::trace_erasure_op::ONE_KEY,
+                                trace_events: trace_events_deleted,
+                                trace_llm_calls: trace_llm_calls_deleted,
+                                detection_events_tombstoned,
+                                detection_rows_erased: erased_rows.len() as u64,
+                                detection_rows_refused: refused_count,
+                                federation_keys: federation_keys_deleted,
+                                federation_attestations: federation_attestations_deleted,
+                                federation_revocations: federation_revocations_deleted,
+                            },
+                            received_at,
                         );
                         sqlite_record_erasure(&tx, &attester, &event, &erased_rows, received_at)?;
                     }
@@ -1750,6 +1768,7 @@ impl Backend for SqliteBackend {
                         federation_keys_deleted,
                         federation_attestations_deleted,
                         federation_revocations_deleted,
+                        detection_rows_refused: refused,
                         deleted_at: chrono::Utc::now(),
                     })
                 },
@@ -1784,6 +1803,17 @@ impl Backend for SqliteBackend {
                 .await
                 .map_err(|e| Error::Backend(format!("rehome before erasure: {e}")))?;
         }
+        // v58.0.0 (CIRISPersist#1094 item 2, CC 4.5.3) — each reached row
+        // erased under its producer's rule-1 `withdraws`, or refused with a
+        // reason; read before the transaction.
+        let crate::federation::subject_erasure::ErasurePlan {
+            citations,
+            new_withdraws,
+            refused,
+        } = crate::federation::subject_erasure::plan_store_erasure(self, &agent, None, erased_at)
+            .await
+            .map_err(|e| Error::Backend(format!("erasure plan: {e}")))?;
+        let refused_count = refused.len() as u64;
         let summary = self
             .write(
                 move |conn| -> Result<super::types::ErasureSummary, rusqlite::Error> {
@@ -1805,14 +1835,15 @@ impl Backend for SqliteBackend {
                     // rows are touched (idempotent re-run = no-op).
                     let legacy_tombstoned =
                         sqlite_tombstone_detection_events(&tx, &trace_ids, &erased_s)?;
-                    // v57.0.0 (CIRISPersist#988 item 3; lead ruling on S1
-                    // item 5) — a ROW-BACKED detection of an erased trace is a
-                    // signed row: it is HARD-DELETED here (the DSAR door's
-                    // treatment of signed rows; its projection row leaves by
-                    // cascade), never rewritten, and a purge tombstone
-                    // (`ART17_ERASURE_BASIS`) is written below so the row
-                    // cannot be re-admitted.
-                    let erased_rows = sqlite_art17_delete_detection_rows(&tx, &trace_ids)?;
+                    // v58.0.0 (CIRISPersist#1094 item 2, CC 4.5.3) — a
+                    // ROW-BACKED detection is erased by the subject's
+                    // `withdraws`: each cited row is HARD-DELETED here (its
+                    // projection row leaves by cascade), never rewritten, and
+                    // its tombstone — citing the withdraws — is written below,
+                    // so the row cannot be re-admitted and a peer holding a
+                    // replica receives it.
+                    sqlite_store_erasure_withdraws(&tx, &new_withdraws)?;
+                    let erased_rows = sqlite_erase_cited_rows(&tx, &citations)?;
                     let detection_events_tombstoned = legacy_tombstoned + erased_rows.len() as u64;
 
                     // Step 3: hard-delete LLM call rows joined by trace_id.
@@ -1848,11 +1879,15 @@ impl Backend for SqliteBackend {
                     // the txn (atomic). Emit only when something was erased.
                     if trace_events > 0 || trace_llm_calls > 0 || detection_events_tombstoned > 0 {
                         let event = crate::federation::hard_case::trace_erasure_event(
-                            &agent,
-                            trace_events,
-                            trace_llm_calls,
-                            detection_events_tombstoned,
-                            &erased_rows,
+                            &crate::federation::hard_case::TraceErasureCounts {
+                                op: crate::federation::hard_case::trace_erasure_op::FULL,
+                                trace_events,
+                                trace_llm_calls,
+                                detection_events_tombstoned,
+                                detection_rows_erased: erased_rows.len() as u64,
+                                detection_rows_refused: refused_count,
+                                ..Default::default()
+                            },
                             erased_at,
                         );
                         sqlite_record_erasure(&tx, &attester, &event, &erased_rows, erased_at)?;
@@ -1863,6 +1898,7 @@ impl Backend for SqliteBackend {
                         trace_events,
                         trace_llm_calls,
                         detection_events_tombstoned,
+                        detection_rows_refused: refused,
                         erased_at,
                     })
                 },
@@ -4530,9 +4566,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             let mut stmt = conn.prepare(&format!(
                 "{PURGE_EXECUTION_SELECT} \
                  WHERE (?1 IS NULL OR admitted_at > ?1 OR (admitted_at = ?1 AND notice_id > ?2)) \
-                   AND legal_basis <> '{}' \
-                 ORDER BY admitted_at ASC, notice_id ASC LIMIT ?3",
-                crate::federation::steward_purge::ART17_ERASURE_BASIS
+                 ORDER BY admitted_at ASC, notice_id ASC LIMIT ?3"
             ))?;
             let rows = stmt.query_map(
                 rusqlite::params![since_at, since_id, limit],
@@ -21793,6 +21827,72 @@ impl crate::federation::attestation_admit::AttestationStore for SqliteBackend {
         })
     }
 
+    async fn trace_agent_id_hash(
+        &self,
+        trace_id: &str,
+    ) -> Result<Option<String>, crate::federation::Error> {
+        let trace_id = trace_id.to_owned();
+        self.read(move |conn| -> Result<Option<String>, rusqlite::Error> {
+            conn.query_row(
+                "SELECT agent_id_hash FROM trace_events WHERE trace_id = ?1 \
+                 ORDER BY event_id LIMIT 1",
+                [&trace_id],
+                |r| r.get(0),
+            )
+            .optional()
+        })
+        .await
+        .map_err(|e| crate::federation::Error::Backend(format!("trace_agent_id_hash: {e}")))
+    }
+
+    async fn detection_row_ids_for_agent(
+        &self,
+        agent_id_hash: &str,
+        signing_key_id: Option<&str>,
+    ) -> Result<Vec<String>, crate::federation::Error> {
+        let agent = agent_id_hash.to_owned();
+        let key = signing_key_id.map(str::to_owned);
+        let subject = signing_key_id
+            .is_none()
+            .then(|| crate::federation::subject_erasure::agent_subject(agent_id_hash).ok())
+            .flatten();
+        self.read(move |conn| -> Result<Vec<String>, rusqlite::Error> {
+            let trace_ids: Vec<String> = {
+                let mut stmt = conn.prepare(
+                    "SELECT DISTINCT trace_id FROM trace_events \
+                     WHERE agent_id_hash = ?1 AND (?2 IS NULL OR signing_key_id = ?2)",
+                )?;
+                let rows = stmt.query_map(rusqlite::params![agent, key], |r| r.get(0))?;
+                rows.collect::<Result<_, _>>()?
+            };
+            let mut ids = std::collections::BTreeSet::new();
+            let mut stmt = conn.prepare(
+                "SELECT attestation_id FROM federation_attestations \
+                 WHERE substr(dimension, 1, 10) = 'detection:' \
+                   AND json_extract(attestation_envelope, '$.detection.trace_id') = ?1",
+            )?;
+            for tid in &trace_ids {
+                for id in stmt.query_map([tid], |r| r.get::<_, String>(0))? {
+                    ids.insert(id?);
+                }
+            }
+            // The full erasure also reaches the rows NAMING the subject, so a
+            // row an earlier run left (its trace already gone) is found again.
+            if let Some(subject) = subject {
+                let mut stmt = conn.prepare(
+                    "SELECT attestation_id FROM attestation_subjects \
+                     WHERE subject_key_id = ?1 AND substr(dimension, 1, 10) = 'detection:'",
+                )?;
+                for id in stmt.query_map([&subject], |r| r.get::<_, String>(0))? {
+                    ids.insert(id?);
+                }
+            }
+            Ok(ids.into_iter().collect())
+        })
+        .await
+        .map_err(|e| crate::federation::Error::Backend(format!("detection_row_ids_for_agent: {e}")))
+    }
+
     async fn store_planned_detection(
         &self,
         planned: crate::federation::attestation_admit::PlannedDetection,
@@ -21857,9 +21957,16 @@ impl crate::federation::attestation_admit::AttestationStore for SqliteBackend {
                 );
                 continue;
             };
+            // v58.0.0 (CIRISPersist#1094 item 2) — the row names its subject.
+            let subject = crate::federation::attestation_admit::detection_subject(
+                self,
+                body.trace_id.as_deref(),
+            )
+            .await?;
             let planned = match crate::federation::attestation_admit::plan_detection_row(
                 &body,
                 &identity_type,
+                subject.as_deref(),
                 crate::federation::attestation_admit::PlanInstants {
                     // The silo row's own recorded instant (never the rehome's clock),
                     // bounded by the receipt clock.
@@ -23628,56 +23735,108 @@ fn sqlite_project_hard_case(
     Ok(())
 }
 
-/// v57.0.0 (CIRISPersist#988 item 3; lead ruling on S1 item 5) — the Art. 17
-/// erasure of the ROW-BACKED detections of `trace_ids`, inside the erasure's
-/// transaction: each signed row is hard-deleted (its wire-index entry first;
-/// its projection row leaves by `ON DELETE CASCADE`). Never a rewrite. The
-/// projection is read only to FIND the rows (its `trace_id` index). Returns
-/// the deleted row ids, for the erasure's tombstones.
-fn sqlite_art17_delete_detection_rows(
-    tx: &rusqlite::Transaction<'_>,
-    trace_ids: &[String],
-) -> Result<Vec<String>, rusqlite::Error> {
-    // Found by the ROW's own body (`detection.trace_id`), so a row a steward
-    // purge already tombstoned (its projection linkage NULL) is erased too.
-    let mut ids: Vec<String> = Vec::new();
-    {
-        let mut stmt = tx.prepare(
-            "SELECT attestation_id FROM federation_attestations \
-             WHERE substr(dimension, 1, 10) = 'detection:' \
-               AND json_extract(attestation_envelope, '$.detection.trace_id') = ?1 \
-             ORDER BY attestation_id",
-        )?;
-        for tid in trace_ids {
-            let rows = stmt.query_map([tid], |r| r.get::<_, String>(0))?;
-            for id in rows {
-                ids.push(id?);
-            }
-        }
+/// v58.0.0 (CIRISPersist#1094 item 2) — what V196 will delete on this store,
+/// `(hard_case rows, pre-v57 silo rows, art17_erasure headers)`, counted with
+/// V196's own predicates; `None` once V196 is applied or on a store too new
+/// to have the tables (nothing to count).
+fn sqlite_v196_pending(conn: &rusqlite::Connection) -> Option<(i64, i64, i64)> {
+    let applied: i64 = conn
+        .query_row(
+            "SELECT COALESCE(MAX(version), 0) FROM refinery_schema_history",
+            [],
+            |r| r.get(0),
+        )
+        .ok()?;
+    if applied >= 196 {
+        return None;
     }
-    for id in &ids {
-        let record_key = crate::federation::wire_index::record_key(&[("attestation_id", id)]);
+    let count = |sql: &str| conn.query_row(sql, [], |r| r.get::<_, i64>(0)).unwrap_or(0);
+    let rows = count(
+        "SELECT COUNT(*) FROM federation_attestations \
+          WHERE dimension = 'hard_case:trace_erasure:v1' \
+            AND (json_extract(attestation_envelope, '$.hard_case.target_key_id') IS NOT NULL \
+              OR json_extract(attestation_envelope, '$.hard_case.subject_key_id') IS NOT NULL \
+              OR json_extract(attestation_envelope, '$.hard_case.detail.agent_id_hash') IS NOT NULL \
+              OR json_extract(attestation_envelope, '$.hard_case.detail.signing_key_id') IS NOT NULL)",
+    );
+    let silo = count(
+        "SELECT COUNT(*) FROM hard_case_events \
+          WHERE attestation_id IS NULL AND kind = 'trace_erasure' \
+            AND (target_key_id IS NOT NULL OR subject_key_id IS NOT NULL \
+              OR json_extract(detail, '$.agent_id_hash') IS NOT NULL \
+              OR json_extract(detail, '$.signing_key_id') IS NOT NULL)",
+    );
+    let headers =
+        count("SELECT COUNT(*) FROM purge_executions WHERE legal_basis = 'art17_erasure'");
+    Some((rows, silo, headers))
+}
+
+/// v58.0.0 (CIRISPersist#1094 item 2) — the counted line V196 owes the
+/// operator (both SQL backends): the one place a hard_case row is deleted.
+pub(crate) fn log_v196(counts: Option<(i64, i64, i64)>) {
+    if let Some((rows, silo, headers)) = counts.filter(|(a, b, c)| a + b + c > 0) {
+        tracing::warn!(
+            hard_case_rows = rows,
+            legacy_silo_rows = silo,
+            art17_erasure_headers = headers,
+            "V196 deleted v57-shaped trace_erasure hard cases that named their subject and \
+             the art17_erasure purge headers citing them (CC 4.5.3: a hard case recording \
+             an erasure MUST NOT name the subject; CIRISPersist#1094)"
+        );
+    }
+}
+
+/// v58.0.0 (CIRISPersist#1094 item 2) — store the producers' planned
+/// `withdraws` rows inside the erasure's transaction, through the local-row
+/// statement every local writer uses (row, subject projection, V157 depth).
+fn sqlite_store_erasure_withdraws(
+    tx: &rusqlite::Transaction<'_>,
+    planned: &[crate::federation::subject_erasure::PlannedErasureWithdraws],
+) -> Result<(), rusqlite::Error> {
+    for w in planned {
+        sqlite_insert_local_attestation_row(tx, &w.row, Some(w.depth))?;
+    }
+    Ok(())
+}
+
+/// v58.0.0 (CIRISPersist#1094 item 2, CC 4.5.3) — erase the ROW-BACKED
+/// detections their producer's `withdraws` covers, inside the erasure's transaction:
+/// each cited row is hard-deleted (its wire-index entry first; its projection
+/// row leaves by `ON DELETE CASCADE`). Never a rewrite. Returns the citations
+/// whose row was still there, for their tombstones.
+fn sqlite_erase_cited_rows(
+    tx: &rusqlite::Transaction<'_>,
+    citations: &[crate::federation::subject_erasure::ErasureCitation],
+) -> Result<Vec<crate::federation::subject_erasure::ErasureCitation>, rusqlite::Error> {
+    let mut erased = Vec::new();
+    for c in citations {
+        let record_key =
+            crate::federation::wire_index::record_key(&[("attestation_id", &c.target)]);
         tx.execute(
             "DELETE FROM signed_wire_index WHERE kind = 'Attestation' AND record_key = ?1",
             [&record_key],
         )?;
-        tx.execute(
+        if tx.execute(
             "DELETE FROM federation_attestations WHERE attestation_id = ?1",
-            [id],
-        )?;
+            [&c.target],
+        )? > 0
+        {
+            erased.push(c.clone());
+        }
     }
-    Ok(ids)
+    Ok(erased)
 }
 
-/// v57.0.0 (CIRISPersist#988 item 3; lead ruling on the DSAR path) — record a
-/// DSAR erasure inside its transaction: its `hard_case:trace_erasure:v1` row
-/// and, when it hard-deleted row-backed detections, the Art. 17 purge
-/// tombstone header citing that row.
+/// v58.0.0 (CIRISPersist#1094 item 2) — record a DSAR erasure inside its
+/// transaction: its subject-free `hard_case:trace_erasure:v1` row and, per
+/// erased row, the tombstone header citing the producer's `withdraws`
+/// (`subject_erasure::erasure_execution`, finalized at once) and its one
+/// tombstone.
 fn sqlite_record_erasure(
     tx: &rusqlite::Transaction<'_>,
     attester: &crate::federation::attestation_admit::HardCaseAttester,
     event: &crate::federation::HardCaseEvent,
-    erased_rows: &[String],
+    erased: &[crate::federation::subject_erasure::ErasureCitation],
     at: chrono::DateTime<chrono::Utc>,
 ) -> Result<(), rusqlite::Error> {
     let planned = crate::federation::attestation_admit::plan_hard_case_row(
@@ -23690,23 +23849,23 @@ fn sqlite_record_erasure(
     )
     .map_err(sqlite_plan_err)?;
     sqlite_store_hard_case(tx, &planned)?;
-    if !erased_rows.is_empty() {
-        let (execution, tombstones) = crate::federation::steward_purge::art17_erasure_execution(
-            &planned.row,
-            erased_rows,
+    for c in erased {
+        let (execution, tombstone) = crate::federation::subject_erasure::erasure_execution(
+            c,
             &attester.key_id,
+            crate::federation::steward_purge::origin::LOCAL,
             at,
+            Some(at),
         )
         .map_err(sqlite_plan_err)?;
-        sqlite_put_art17_execution(tx, &execution, &tombstones)?;
+        sqlite_put_erasure_execution(tx, &execution, std::slice::from_ref(&tombstone))?;
     }
     Ok(())
 }
 
-/// v57.0.0 — write an Art. 17 erasure's tombstone header (finalized at once)
-/// and its tombstones, inside the erasure's transaction
-/// ([`crate::federation::steward_purge::art17_erasure_execution`]).
-fn sqlite_put_art17_execution(
+/// v58.0.0 — write an erasure's tombstone header (finalized at once) and its
+/// tombstone, inside the erasure's transaction.
+fn sqlite_put_erasure_execution(
     tx: &rusqlite::Transaction<'_>,
     e: &crate::federation::steward_purge::PurgeExecution,
     tombstones: &[crate::federation::steward_purge::PurgeTombstone],

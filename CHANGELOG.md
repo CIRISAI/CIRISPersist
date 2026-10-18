@@ -33,6 +33,76 @@ threat-model citations because this crate's audit story is the point.
 - Evidence: `CLM-nsproc-halt-latched-trust` (retired on the CC side) is
   replaced by `CLM-halt-not-a-trust-leg` at `trust_root.rs#trust_root_valid`
   and `trust_root.rs#transit_eligibility_walk`.
+### Changed — Art. 17 erasure of an adverse row is its producer's `withdraws`; the tombstone is the replicated fact (CIRISPersist#1094 item 2; CC 4.5.3 "Erasure at the subject's request", CLM-erasure-subject-route; CIRISConstitution#174)
+
+- **Controller-only (steward ruling 2026-10-15, CIRISConstitution
+  `formal/withdraws_admission`).** A `detection:*` row is adverse: the CC
+  2.4.1.1 carve-out keeps every subject-authority path (rules 2–4) closed to
+  it, unchanged (`admission::resolve_withdraws_admission_rule_at`). The
+  subject's Article 17 request is executed by the row's PRODUCER under rule 1.
+  Both DSAR doors (`delete_traces_for_agent_id_hash`, `delete_traces_for_agent`)
+  plan, for each row-backed detection of the erased traces, the producer's
+  `withdraws`: a local-tier row attested by the detector key that signed the
+  detection, its signature deferred to the crossing as the detection's own
+  is, admitted as rule 1 by the one withdraws predicate
+  (`subject_erasure::plan_store_erasure`). A producer withdraws already held
+  is reused. In the door's one transaction the withdraws is stored, the row is
+  hard-deleted, and a tombstone is written whose header cites it
+  (`subject_erasure::ErasureNotice`: the withdraws and target ids, nothing
+  else; `legal_basis` column `withdraws`, settled at execution).
+- **Refused with a reason.** When the host holds no live record of a row's
+  producer key the row is not erased: `ErasureSummary` and `DeleteSummary`
+  gain `detection_rows_refused: Vec<ErasureRefusal { record_id, reason }>`
+  (reason `erasure_producer_key_not_held`; CC 4.4 `erasure_policy`'s
+  refused-with-reason, GDPR Art. 17(3)). Python: both DSAR dicts gain
+  `"detection_rows_refused": [{"record_id": str, "reason": str}]`.
+- **The tombstone replicates.** Erasure headers are served by
+  `list_purge_bundles_since` on all three backends; `Engine::apply_replicated_purge`
+  routes an erasure bundle to `subject_erasure::apply_replicated_erasure`,
+  which requires the producer's withdraws held there (else
+  `subject_erasure_withdraws_unheld`, retryable), re-derives it as rule 1 on
+  that node's own state, and destroys the replica on receipt. v57's "header
+  never served" gap is closed.
+- **A `detection:*` row names its subject**: the scored agent's CC 2.3.2.1
+  canonical hash, `canonical:sha256:` + sha256(`ciris:agent:{agent_id_hash}`),
+  read from the trace this node holds (`subject_erasure::agent_subject`), so
+  rows about a subject are discoverable. It is not an authority path. The
+  steward purge's interim human-subject gate resolves that subject as the key
+  that signed the scored trace.
+- **The hard case names nobody.** `hard_case:trace_erasure:v1` carries
+  `TraceErasureCounts` alone (the door, counts of traces, LLM calls,
+  detections erased and refused, and the one-key door's federation counts).
+- **V196** deletes the v57-shaped `hard_case:trace_erasure:v1` rows that named
+  their subject (and their projection rows), pre-v57 silo rows of that kind
+  that did, and every `art17_erasure` header with its tombstones (each
+  header's notice was such a row). This is the one place a hard_case row is
+  ever deleted: its content is what the erasure required gone, and v57.0.0
+  had no adopters. The boot logs the counts it deleted.
+
+### Changed — the subject of the target may file a reconsideration (CIRISPersist#1094 item 3; CC 4.5.5, CLM-reconsideration-subject-standing)
+
+- `admission::check_reconsideration_admission`: a `reconsideration:{grounds}`
+  FILING naming its target by `references_attestation_id` is admitted from
+  the subject of the target as this node holds it (its signed
+  `subject_key_ids`, or the filer whose key digests to its
+  `subject_sha256_ed25519_raw`) or from a review-holder of the target's
+  community. A RULING (a row carrying `outcome`) stays with the review-holders.
+  The action's community is the target's; a filing naming another is refused
+  (`reconsideration_community_mismatch`). A self-declared subject is never
+  standing; a target not held here, or a `licensure:*` target (its own arm,
+  CIRISPersist#1036 item 5), leaves the subject arm empty.
+- CC 4.5.3 struck "an immediate-removal basis from any claimant": persist had
+  no such path (`takedown_authority` never read the basis); I970 now pins
+  every immediate-removal basis to the duty-holder gate on every backend.
+
+### Removed
+
+- `steward_purge::ART17_ERASURE_BASIS`, `art17_erasure_record_ids`,
+  `art17_erasure_execution` and `hard_case::bind_erased_detection_rows`
+  (clean break, no alias): there is no node-local purge basis for erasure.
+  `hard_case::trace_erasure_event` takes `&TraceErasureCounts` now.
+  `ErasureSummary` and `DeleteSummary` are no longer `Copy` (they carry the
+  refusal list).
 
 ## [57.0.0] - 2026-10-15
 

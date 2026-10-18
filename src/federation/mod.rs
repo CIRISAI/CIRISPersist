@@ -628,6 +628,11 @@ pub(crate) mod doors_takedown_invariants;
 #[cfg(test)]
 mod steward_purge_invariants;
 pub mod takedown_tombstone;
+// v58.0.0 (CIRISPersist#1094 item 2, CC 4.5.3) — erasure is the subject's
+// withdraws; the replicated fact is the tombstone.
+pub mod subject_erasure;
+#[cfg(test)]
+pub(crate) mod subject_erasure_invariants;
 pub mod trust_root;
 // CIRISPersist#210 — cross-process leader election (RNS shared-instance
 // owner; CIRISEdge#100). Backend-agnostic types + staleness helper; the
