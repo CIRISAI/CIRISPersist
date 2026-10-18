@@ -356,6 +356,14 @@ What persist does with it:
 - **Absent scores are not judged by the polarity gate.** Persist's own
   positive-only emitters (genesis `trust:charter:v1`, `membership:proposal:v1`,
   `consent:partnership_grant:v1`, `trust:accepts:v1`) write no `score`.
+- **The two occurrence-revocation routes can race.** A framed
+  `put_identity_occurrence_revocation` and a `withdraws` on the same
+  occurrence landing concurrently can make the second write's local insert
+  hit the primary-key conflict: the revocation lands, the losing call
+  returns an error (BELIEVED, not witnessed; the window is a check-then-write).
+- **A key revocation minted hybrid at put** carries `pqc_completed_at =
+  scrub_timestamp`; v57 stamped the later cold attach. Each revocation is
+  minted once, so peers see one byte form per revocation.
 - **#991 planes 2 and 3** (`group:roster:v1`, the membership rows, general
   `cosignatures[]`, `goal:{scale}`) remain.
 
