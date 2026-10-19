@@ -62,10 +62,61 @@ use serde::{Deserialize, Serialize};
 pub use ciris_verify_core::holonomic::aggregation::descend_order;
 // v10.1.0 (CIRISVerify#194) restored root re-exports for the #191 v3 fns.
 pub use ciris_verify_core::holonomic::{
-    ejection_verdict, mass_commitment, member_commitment, passes_dominance_gate,
-    passes_multiplicity_gate, verify_aggregation_meta, verify_mass_commitment,
-    verify_member_commitment, AggregationMetaVerification, EjectionVerdict,
+    ejection_verdict, mass_commitment, passes_dominance_gate, passes_multiplicity_gate,
+    verify_aggregation_meta, verify_mass_commitment, verify_member_commitment,
+    AggregationMetaVerification, EjectionVerdict,
 };
+
+/// v59.0.0 (CIRISPersist#1102; CC 6.1.1 rc9 `37494c0`,
+/// `CLM-member-commitment-unique`) — **an aggregate's sources are distinct
+/// ids.** verify-core's member commitment sorts its leaves but does not
+/// deduplicate, so `{a, b, c}` and `{a, b, c, c}` share one root, and a padded
+/// list would inflate the `source_count` the mass-dominance gate reads. Every
+/// door that takes a source list asks this BEFORE hashing it: the descent
+/// ([`descend_aggregated_sources_on_backend`]) and the builder
+/// ([`member_commitment`]).
+///
+/// # Errors
+///
+/// [`crate::federation::Error::MalformedRow`]
+/// ([`malformed_row::AGGREGATE_SOURCE_DUPLICATE`](crate::federation::malformed_row::AGGREGATE_SOURCE_DUPLICATE))
+/// naming the first repeated id.
+pub fn check_distinct_sources<'a>(
+    source_member_ids: impl IntoIterator<Item = &'a str>,
+) -> Result<(), crate::federation::Error> {
+    let mut seen = std::collections::BTreeSet::new();
+    for id in source_member_ids {
+        if !seen.insert(id) {
+            return Err(crate::federation::Error::malformed_row(
+                "aggregate_sources",
+                crate::federation::malformed_row::AGGREGATE_SOURCE_DUPLICATE,
+                format!(
+                    "aggregate source list repeats {id:?}: the member commitment does not \
+                     deduplicate, so a padded list shares the distinct list's root and inflates \
+                     its source count (CC 6.1.1, CLM-member-commitment-unique)"
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// v59.0.0 (CIRISPersist#1102) — **the aggregate builder's member
+/// commitment**: verify-core's §19.7.1.1 Merkle root over `source_member_ids`,
+/// after [`check_distinct_sources`]. Its `source_count` is
+/// `source_member_ids.len()`, which a refused padded list cannot inflate.
+///
+/// # Errors
+///
+/// As [`check_distinct_sources`].
+pub fn member_commitment(
+    source_member_ids: &[String],
+) -> Result<[u8; 32], crate::federation::Error> {
+    check_distinct_sources(source_member_ids.iter().map(String::as_str))?;
+    Ok(ciris_verify_core::holonomic::member_commitment(
+        source_member_ids,
+    ))
+}
 
 /// §19.7.1.2 (CIRISVerify#167 / CIRISPersist#357) — the CC 6.1.2 noise-floor
 /// dominance floor persist enforces at admission: a composite's **effective**
@@ -613,6 +664,9 @@ impl EjectionAction {
 /// implementation the engine dispatch and the FFI dispatch both call (so the
 /// gate is byte-identical across PG / SQLite).
 ///
+/// 0. **Distinct sources (CIRISPersist#1102).** A repeated id in `sources` is
+///    refused `federation_malformed_row` / `aggregate_source_duplicate`
+///    ([`check_distinct_sources`]) before anything is read or hashed.
 /// 1. **§19.7.1.1 descent integrity.** Load the stored aggregation record for
 ///    `aggregate_content_id`; the caller-supplied source content_ids MUST
 ///    re-derive its committed `member_commitment`
@@ -632,6 +686,11 @@ pub async fn descend_aggregated_sources_on_backend<B: crate::store::Backend>(
     under_capacity_pressure: bool,
     target_tier: Option<super::eviction::FountainTier>,
 ) -> Result<u64, crate::store::Error> {
+    // v59.0.0 (CIRISPersist#1102) — a repeated source id is refused before
+    // anything is read or hashed: the source_count below is the number of
+    // DISTINCT ids.
+    check_distinct_sources(sources.iter().map(|(id, _)| id.as_str()))
+        .map_err(|e| crate::store::Error::MalformedRow(Box::new(e)))?;
     let record = backend
         .get_aggregation(aggregate_content_id)
         .await?

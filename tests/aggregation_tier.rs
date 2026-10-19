@@ -78,7 +78,7 @@ async fn signed_verify_inputs_v3(
     version: u32,
 ) -> (AggregationMetaVerifyInputsV1, String) {
     let (ed_sk, _ed_pk_b64, mldsa) = producer_pubkeys();
-    let commitment = member_commitment(member_ids);
+    let commitment = member_commitment(member_ids).expect("distinct member ids");
     let commitment_hex = hex_lower(&commitment);
     // §19.7.1.3: equal-mass members (the honest 900/1000 shape — the mass gate
     // sees a balanced fold; only the multiplicity surface exposes the cluster).
@@ -960,6 +960,169 @@ async fn run_aggregation_assertions<B: Backend>(backend: &B, suffix: &str) {
         "eject_aggregated_tier_only",
         "(h) stable telemetry label"
     );
+}
+
+/// **I1152** (CIRISPersist#1102; CC 6.1.1 rc9 `37494c0`,
+/// `CLM-member-commitment-unique`) — an aggregate's sources are distinct ids.
+/// A fold over `{a, b, c}` is admitted; the padded list `{a, b, c, c}` — which
+/// verify-core's commitment maps to the SAME root — is refused
+/// `federation_malformed_row` / `aggregate_source_duplicate` at the builder
+/// (`fountain::member_commitment`) and at the descent
+/// (`descend_aggregated_sources_on_backend`), before anything is hashed or
+/// evicted; the distinct list still builds the same root and descends; its
+/// source count is the number of distinct ids.
+async fn i1152_member_commitment_unique<B: Backend>(backend: &B, suffix: &str) {
+    let (n_source, k_repair, symbol_size) = (6u32, 3u32, 12u32);
+    let source_corpus = "trace";
+    let composite_corpus = aggregate_corpus_kind(source_corpus);
+    let mut sources = Vec::new();
+    for i in 0..3 {
+        let scid = format!("i1152-src-{i}-{suffix}");
+        let (sm, ss) =
+            build_manifest_and_symbols(&scid, source_corpus, n_source, k_repair, symbol_size, true)
+                .await;
+        backend
+            .put_fountain_content(&sm, &ss)
+            .await
+            .expect("I1152: admit source");
+        sources.push((scid, source_corpus.to_owned()));
+    }
+    let ids: Vec<String> = sources.iter().map(|(id, _)| id.clone()).collect();
+    let mut padded_ids = ids.clone();
+    padded_ids.push(ids[2].clone());
+    // The defect: verify-core's root does not see the padding.
+    assert_eq!(
+        ciris_verify_core::holonomic::member_commitment(&ids),
+        ciris_verify_core::holonomic::member_commitment(&padded_ids),
+        "I1152: the premise — the unchecked root is blind to a repeated id"
+    );
+
+    // The builder.
+    let malformed = |e: ciris_persist::federation::Error| {
+        assert_eq!(e.kind(), "federation_malformed_row", "I1152: {e}");
+        assert!(
+            matches!(
+                e,
+                ciris_persist::federation::Error::MalformedRow {
+                    reason: "aggregate_source_duplicate",
+                    ..
+                }
+            ),
+            "I1152: {e:?}"
+        );
+    };
+    malformed(member_commitment(&padded_ids).expect_err("I1152: the builder refuses padding"));
+    let root = member_commitment(&ids).expect("I1152: a distinct list builds");
+    assert_eq!(root, ciris_verify_core::holonomic::member_commitment(&ids));
+
+    // The fold over the distinct list.
+    let fold_cid = format!("i1152-fold-{suffix}");
+    let (verif, commitment) = signed_verify_inputs(&ids, false, false).await;
+    assert_eq!(
+        verif.source_count as usize,
+        ids.len(),
+        "I1152: source_count is the number of distinct ids"
+    );
+    let (fm, fs) = build_manifest_and_symbols(
+        &fold_cid,
+        &composite_corpus,
+        n_source,
+        k_repair,
+        symbol_size,
+        true,
+    )
+    .await;
+    backend
+        .put_aggregated_tier(
+            &fm,
+            &fs,
+            &AggregationMetaV1 {
+                aggregate_content_id: fold_cid.clone(),
+                source_corpus_kind: source_corpus.to_owned(),
+                aggregation_level: 1,
+                fan_in: 3,
+                member_commitment: commitment,
+                aggregation_meta: vec![0x42],
+                verification: verif,
+            },
+            1_500,
+        )
+        .await
+        .expect("I1152: admit the fold");
+
+    // The descent refuses the padded list and touches nothing.
+    let mut padded = sources.clone();
+    padded.push(sources[2].clone());
+    let err = ciris_persist::fountain::descend_aggregated_sources_on_backend(
+        backend,
+        &fold_cid,
+        &padded,
+        ConsentState::Withdrawn,
+        false,
+        None,
+    )
+    .await
+    .expect_err("I1152: the descent refuses a padded source list");
+    assert_eq!(err.kind(), "federation_malformed_row", "I1152: {err}");
+    match err {
+        StoreError::MalformedRow(inner) => malformed(*inner),
+        other => panic!("I1152: {other:?}"),
+    }
+    for (cid, corpus) in &sources {
+        assert!(
+            matches!(
+                backend
+                    .get_fountain_content(cid, corpus)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                FountainContent::Full { .. }
+            ),
+            "I1152: the refused descent evicted nothing"
+        );
+    }
+    // The distinct list descends, unchanged.
+    let evicted = ciris_persist::fountain::descend_aggregated_sources_on_backend(
+        backend,
+        &fold_cid,
+        &sources,
+        ConsentState::Withdrawn,
+        false,
+        None,
+    )
+    .await
+    .expect("I1152: the distinct list descends");
+    assert_eq!(evicted, u64::from(n_source + k_repair) * 3);
+}
+
+#[tokio::test]
+async fn i1152_member_commitment_unique_memory() {
+    let backend = ciris_persist::store::MemoryBackend::new();
+    i1152_member_commitment_unique(&backend, "memory").await;
+}
+
+#[tokio::test]
+async fn i1152_member_commitment_unique_sqlite() {
+    let backend = ciris_persist::store::SqliteBackend::open_in_memory()
+        .await
+        .expect("open sqlite");
+    backend.run_migrations().await.expect("sqlite migrations");
+    i1152_member_commitment_unique(&backend, "sqlite").await;
+}
+
+#[tokio::test]
+async fn i1152_member_commitment_unique_postgres() {
+    let Some(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL").ok() else {
+        eprintln!("i1152 postgres skipped: CIRIS_PERSIST_TEST_PG_URL unset");
+        return;
+    };
+    let backend = ciris_persist::store::PostgresBackend::connect(&dsn)
+        .await
+        .expect("connect postgres");
+    backend.run_migrations().await.expect("pg migrations");
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    i1152_member_commitment_unique(&backend, &suffix).await;
+    eprintln!("i1152_member_commitment_unique_postgres: RAN");
 }
 
 #[tokio::test]

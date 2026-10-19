@@ -139,6 +139,14 @@ pub enum Error {
     #[error("aggregation meta rejected: {0}")]
     AggregationMetaRejected(#[from] crate::fountain::AggregationMetaError),
 
+    /// v59.0.0 (CIRISPersist#1102) — a store-layer door refused malformed
+    /// input with the federation's terminal
+    /// [`crate::federation::Error::MalformedRow`] (e.g. an aggregate source
+    /// list repeating an id); `kind()` is its token,
+    /// `federation_malformed_row`. Nothing was written.
+    #[error("{0}")]
+    MalformedRow(Box<crate::federation::Error>),
+
     /// v13.0.0 (§Q / CIRISPersist#370) — a `StorageBudgetV1` pin-install was
     /// refused: the bound-hybrid signature did not verify (PQC-mandatory —
     /// verify at the gate, before persistence), the shape was structurally
@@ -239,6 +247,7 @@ impl Error {
             Error::FountainAdmit(e) => e.kind(),
             Error::FountainIntegrity(_) => "fountain_integrity",
             Error::AggregationMetaRejected(e) => e.kind(),
+            Error::MalformedRow(e) => e.kind(),
             Error::StorageContention(e) => e.kind(),
         }
     }

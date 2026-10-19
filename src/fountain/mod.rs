@@ -52,7 +52,7 @@ pub use admit::{
     check_admission, check_admission_via_envelope, symbol_sha256_hex, FountainAdmitError,
 };
 pub use aggregation::{
-    aggregate_corpus_kind, aggregation_member_commitment_from_hex,
+    aggregate_corpus_kind, aggregation_member_commitment_from_hex, check_distinct_sources,
     descend_aggregated_sources_on_backend, descend_order, ejection_verdict,
     evict_aggregated_tier_on_backend, member_commitment, verify_aggregation_meta,
     verify_member_commitment, AggregationMetaError, AggregationMetaV1, AggregationMetaVerification,

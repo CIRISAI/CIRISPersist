@@ -12106,6 +12106,12 @@ pub mod malformed_row {
     /// the envelope. Reuse of the identity's other keys is judged at use
     /// (CIRISPersist#1078), never here.
     pub const TRANSIT_KEX_KEY_REUSE: &str = "transit_kex_key_reuse";
+    /// v59.0.0 (CIRISPersist#1102; CC 6.1.1 rc9 `37494c0`,
+    /// `CLM-member-commitment-unique`) — an aggregate's source list repeats a
+    /// member id. The member commitment sorts but does not deduplicate, so a
+    /// padded list shares the distinct list's root while inflating the count
+    /// the mass-dominance gate reads; refused before anything is hashed.
+    pub const AGGREGATE_SOURCE_DUPLICATE: &str = "aggregate_source_duplicate";
 
     /// Every token, for the from-disk witnesses and adopters' tables.
     pub const ALL: &[&str] = &[
@@ -12119,6 +12125,7 @@ pub mod malformed_row {
         TRANSIT_KEX_HALF_PAIR,
         TRANSIT_KEX_WRONG_LENGTH,
         TRANSIT_KEX_KEY_REUSE,
+        AGGREGATE_SOURCE_DUPLICATE,
     ];
 }
 

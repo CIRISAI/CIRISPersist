@@ -9,6 +9,29 @@ threat-model citations because this crate's audit story is the point.
 
 ## [59.0.0] - UNRELEASED
 
+### Security — an aggregate's sources are distinct ids (CIRISPersist#1102, CC 6.1.1 rc9 `37494c0`, `CLM-member-commitment-unique`)
+
+- verify-core's `member_commitment` sorts its leaves but does not deduplicate,
+  so `{a, b, c}` and `{a, b, c, c}` share one root, and the descent set
+  `source_count = n_eff = len(sources)` with no duplicate check: a padded
+  list inflated the count the mass-dominance gate reads. A repeated id is now
+  refused before anything is read or hashed, at the descent
+  (`fountain::descend_aggregated_sources_on_backend`, so `Engine` and Python
+  `descend_aggregated_sources`) and at the builder
+  (`fountain::member_commitment`, now persist's: it returns
+  `Result<[u8; 32], federation::Error>` — a Rust signature change — instead of
+  re-exporting verify-core's), through ONE check
+  `fountain::check_distinct_sources`. The refusal is
+  `federation_malformed_row` with the new reason
+  **`aggregate_source_duplicate`** (appended to the closed
+  `malformed_row::ALL`); on the store path it rides the new
+  `store::Error::MalformedRow` (kind `federation_malformed_row`, Python
+  `ValueError("federation_malformed_row: aggregate_sources:
+  aggregate_source_duplicate")`, the type a rejected aggregation always had).
+  A distinct list is unchanged. Witness **I1152**
+  (`tests/aggregation_tier.rs#i1152_member_commitment_unique`, memory, sqlite,
+  postgres).
+
 ### Added — the two-path decision (CIRISPersist#1099, CC 3.3.6.3, `CLM-self-roster-two-paths`)
 
 - `federation::two_path` — ONE pure, backend-free decision for "one actor

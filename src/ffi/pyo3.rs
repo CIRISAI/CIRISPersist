@@ -33612,6 +33612,18 @@ fn fountain_store_err_to_py(e: crate::store::Error) -> PyErr {
         | Error::AggregationMetaRejected(_)
         | Error::StorageContention(_)
         | Error::Schema(_) => PyValueError::new_err(e.kind()),
+        // v59.0.0 (CIRISPersist#1102) — a malformed source list (a repeated
+        // id) is caller-fault and terminal: ValueError, the type a rejected
+        // aggregation always had, with the plane and reason beside the kind.
+        Error::MalformedRow(inner) => {
+            let kind = inner.kind();
+            match *inner {
+                crate::federation::Error::MalformedRow { plane, reason, .. } => {
+                    PyValueError::new_err(format!("{kind}: {plane}: {reason}"))
+                }
+                _ => PyValueError::new_err(kind),
+            }
+        }
         // v24.1.0 (CIRISPersist#559) — `MigrationLockTimeout` joins the
         // transient-shaped arm: nothing was written and re-running IS the
         // remedy, which is precisely what `RuntimeError` signals here. Its
