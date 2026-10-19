@@ -207,7 +207,10 @@ pub async fn roster_now<D>(dir: &D, identity: &str) -> Result<BTreeSet<String>, 
 where
     D: FederationDirectory + ?Sized,
 {
-    let mut roster = BTreeSet::from([identity.to_owned()]);
+    let mut roster = BTreeSet::new();
+    if !genesis_evicted_at(dir, identity, roster_clock()).await? {
+        roster.insert(identity.to_owned());
+    }
     for o in dir.list_identity_occurrences_active(identity).await? {
         if o.occurrence_key_id != identity && is_user_key(dir, &o.occurrence_key_id).await? {
             roster.insert(o.occurrence_key_id);
@@ -231,7 +234,7 @@ where
     D: FederationDirectory + ?Sized,
 {
     if key == identity {
-        return Ok(true);
+        return Ok(!genesis_evicted_at(dir, identity, at).await?);
     }
     if !is_user_key(dir, key).await? {
         return Ok(false);
@@ -289,10 +292,84 @@ pub async fn acts_as_steward_at<D>(
 where
     D: FederationDirectory + ?Sized,
 {
-    if author == steward {
-        return Ok(true);
-    }
     is_roster_key_at(dir, steward, author, at).await
+}
+
+/// **Was the genesis key of `identity` evicted by `at`?** (CC 3.3.6.3: "the
+/// genesis key is roster key one and nothing more … the string survives as
+/// the self's name if that key is later evicted"). Its eviction is a SIGNED
+/// framed revocation of the self pair `(identity, identity)` by a key OTHER
+/// than the genesis key, in effect at `at` — the only shape the door lets
+/// through ([`gate`], two paths). It is terminal: unlike an occurrence
+/// (#421), a later assertion of the pair does not re-establish it. A
+/// revocation of the pair the genesis key signs itself, or a `withdraws` of
+/// the pair's row, retires its transport self-occurrence and evicts nothing.
+pub async fn genesis_evicted_at<D>(
+    dir: &D,
+    identity: &str,
+    at: DateTime<Utc>,
+) -> Result<bool, Error>
+where
+    D: FederationDirectory + ?Sized,
+{
+    Ok(dir
+        .list_signed_identity_occurrence_revocations_for(identity)
+        .await?
+        .iter()
+        .any(|r| {
+            let row = &r.identity_occurrence_revocation;
+            row.occurrence_key_id == identity
+                && r.attesting_key_id != identity
+                && row.effective_at <= at
+        }))
+}
+
+/// W, the past-freshness window (CIRISPersist#1049; CC 2.6.7, ruled 72 h):
+/// the furthest in the past a row's signed `asserted_at` may sit when the
+/// row is admitted on a roster key's standing at that instant.
+pub const PAST_FRESHNESS_W_SECS: i64 = 259_200;
+
+/// The refusal token of [`check_roster_act_fresh`] (CIRISPersist#1049).
+pub const ASSERTED_AT_STALE: &str = "asserted_at_stale";
+
+/// **The bound on [`acts_as_steward_at`]'s instant, at admission**
+/// (CIRISPersist#1049): a row whose author stands for one of `stewards`
+/// only as a roster key at the row's signed `asserted_at` is refused
+/// [`ASSERTED_AT_STALE`] when that instant is more than
+/// [`PAST_FRESHNESS_W_SECS`] behind this node's clock — so an evicted key
+/// cannot sign into the window in which it was still live. A steward's own
+/// row, and a row whose author is no roster key of any of them, pass (the
+/// latter fails the steward check on its own terms).
+///
+/// # Errors
+///
+/// [`Error::InvalidArgument`] `asserted_at_stale: …`.
+pub async fn check_roster_act_fresh<D>(
+    dir: &D,
+    stewards: &[String],
+    author: &str,
+    asserted_at: DateTime<Utc>,
+) -> Result<(), Error>
+where
+    D: FederationDirectory + ?Sized,
+{
+    if stewards.iter().any(|s| s == author) {
+        return Ok(());
+    }
+    let oldest = roster_clock() - chrono::Duration::seconds(PAST_FRESHNESS_W_SECS);
+    if asserted_at >= oldest {
+        return Ok(());
+    }
+    for s in stewards {
+        if is_roster_key_at(dir, s, author, asserted_at).await? {
+            return Err(Error::InvalidArgument(format!(
+                "{ASSERTED_AT_STALE}: {author} signs as {s}'s roster key at {asserted_at}, more \
+                 than W = {PAST_FRESHNESS_W_SECS} s before this node's clock — a roster act is \
+                 admitted only inside the past-freshness window (CIRISPersist#1049, CC 2.6.7)"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// The self `key` signs as at `at`: the one user-role identity other than
@@ -899,8 +976,17 @@ where
     let (identity, target) = (carried.identity_key_id(), carried.target_key_id());
     // A self is a person (CC 3.3.6.3): a node or agent identity's
     // occurrences are not a roster.
-    if target == identity || !is_user_key(dir, identity).await? {
+    if !is_user_key(dir, identity).await? {
         return Ok(false);
+    }
+    if target == identity {
+        // The genesis key's eviction: a framed revocation of the self pair
+        // signed by ANOTHER roster key. The genesis key revoking its own pair
+        // retires its transport self-occurrence, as before; a `withdraws` of
+        // the pair is that retirement too ([`genesis_evicted_at`]).
+        return Ok(matches!(carried, Carried::Revocation(_))
+            && carried.proposer() != identity
+            && roster.contains(identity));
     }
     Ok(match carried.kind() {
         ProposalKind::Add => !roster.contains(target) && is_user_key(dir, target).await?,

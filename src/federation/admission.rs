@@ -5865,7 +5865,16 @@ pub(crate) async fn check_signer_acts_for<D>(
 where
     D: super::FederationDirectory + ?Sized,
 {
-    if attesting_key_id == identity_key_id {
+    // v59.0.0 (CIRISPersist#1099, CC 3.3.6.3) — the identity's own key acts
+    // for it until the self evicted its genesis key.
+    if attesting_key_id == identity_key_id
+        && !super::self_roster::genesis_evicted_at(
+            directory,
+            identity_key_id,
+            super::self_roster::roster_clock(),
+        )
+        .await?
+    {
         return Ok(());
     }
     // CIRISPersist#851 (BLOB_REPLICATION.md §20.2; PR #852 review, rounds
@@ -11205,6 +11214,15 @@ pub async fn check_single_node_owner_admission(
     // granter here is a pre-existing incumbent. Any incumbent that is NOT the
     // attesting owner blocks admission — a node cannot accrue a second steward.
     let incumbents = live_owner_binding_granters(directory, &row.attested_key_id).await?;
+    // v59.0.0 (CIRISPersist#1049 bound on CIRISPersist#1099's predicate) — a
+    // roster key restating the binding does so inside W.
+    super::self_roster::check_roster_act_fresh(
+        directory,
+        &incumbents.iter().cloned().collect::<Vec<_>>(),
+        &row.attesting_key_id,
+        row.asserted_at,
+    )
+    .await?;
     for incumbent in incumbents {
         // v59.0.0 (CIRISPersist#1099, CC 3.3.6.3) — the incumbent self, or a
         // live roster key of it at the row's `asserted_at`, is the same one
@@ -15650,7 +15668,17 @@ pub async fn check_consent_for_key_admission(
         return Ok(()); // the FK / tier-2 gate answers for an unknown attester
     };
     if identity_type::set_contains(&rec.identity_type, identity_type::USER) {
-        return Ok(());
+        // v59.0.0 (CIRISPersist#1049 bound on CIRISPersist#1099's predicate) —
+        // a person signing for a machine as a roster key of one of its
+        // stewards does so inside W.
+        let stewards = steward_bindings_of(directory, for_key).await?;
+        return super::self_roster::check_roster_act_fresh(
+            directory,
+            &stewards,
+            &row.attesting_key_id,
+            row.asserted_at,
+        )
+        .await;
     }
     // v54.0.0 (CIRISPersist#1033, CC 2.4.1.2.1 / CC 4.4.3.4.3) — the positive
     // arm. A machine may issue a consent grant over a PERSON's data when that

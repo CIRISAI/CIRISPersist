@@ -27,6 +27,11 @@
 //! - **I1140 (a node is not a roster key)** — a node its owner bound
 //!   publishes its own occurrence; its signature on a user-role key's is
 //!   refused `proposer_not_on_roster`, and nothing is held.
+//! - **I1141 (genesis eviction)** — another roster key's framed revocation of
+//!   the self pair lands by quorum; the genesis key leaves the roster, cannot
+//!   sign for the self, and is no steward; the fedID string survives.
+//! - **I1142 (W bound)** — an evicted key signing inside its old live window
+//!   but more than W ago is refused `asserted_at_stale` at both steward gates.
 //! - **I1139 (two nodes)** — a proposal and its assent delivered through the
 //!   attestation plane land on the receiving node too.
 
@@ -512,6 +517,135 @@ pub(crate) mod bodies {
             .is_empty());
     }
 
+    /// **I1141** — the genesis key is evictable: another roster key's framed
+    /// revocation of the self pair is a proposal, lands by quorum, and then
+    /// the genesis key is off the roster, cannot sign for the self, and is no
+    /// steward — while the fedID string keeps naming the self and its other
+    /// keys act as it. The genesis key revoking its own pair (its transport
+    /// self-occurrence) lands at once and evicts nothing.
+    pub(crate) async fn i1141_the_genesis_key_is_evictable(d: &dyn FederationDirectory, tag: &str) {
+        let (f, d1, d2, d3) = (
+            format!("f-{tag}"),
+            format!("d1-{tag}"),
+            format!("d2-{tag}"),
+            format!("d3-{tag}"),
+        );
+        three(d, &f, &d1, &d2).await;
+        keys(d, &[&d3]).await;
+        let rev = ts::signed_occurrence_revocation(&d1, &f, &f, ms_now()).await;
+        let p = pending(
+            d.put_identity_occurrence_revocation(rev).await,
+            "I1141: d1 proposes the genesis key's eviction",
+        );
+        assert!(sr::roster_now(d, &f).await.unwrap().contains(&f));
+        vote(d, &d2, &f, &p, true).await;
+        let roster = sr::roster_now(d, &f).await.unwrap();
+        assert!(
+            !roster.contains(&f) && roster.contains(&d1) && roster.contains(&d2),
+            "I1141: the genesis key left the roster: {roster:?}"
+        );
+        let now = chrono::Utc::now();
+        assert!(!sr::acts_as_steward_at(d, &f, &f, now).await.unwrap());
+        assert!(
+            sr::acts_as_steward_at(d, &f, &d1, now).await.unwrap(),
+            "I1141: the fedID string survives; a live roster key acts as it"
+        );
+        match add(d, &f, &f, &d3, ms_now()).await {
+            Err(Error::SignerDoesNotActFor { .. }) => {}
+            other => panic!("I1141: an evicted genesis key signs for the self: {other:?}"),
+        }
+        // {d1, d2}: d1's addition needs d2.
+        let p3 = pending(add(d, &d1, &f, &d3, ms_now()).await, "I1141: d1 adds d3");
+        vote(d, &d2, &f, &p3, true).await;
+        assert!(
+            active(d, &f, &d3).await,
+            "I1141: the self goes on without its genesis key"
+        );
+
+        // The genesis key retiring its own pair is not an eviction.
+        let (g, e1) = (format!("g-{tag}"), format!("e1-{tag}"));
+        keys(d, &[&g, &e1]).await;
+        add(d, &g, &g, &e1, ms_now()).await.expect("one key");
+        d.put_identity_occurrence_revocation(
+            ts::signed_occurrence_revocation(&g, &g, &g, ms_now()).await,
+        )
+        .await
+        .expect("I1141: the genesis key retires its own self pair at once");
+        assert!(
+            sr::roster_now(d, &g).await.unwrap().contains(&g),
+            "I1141: its own revocation evicts nothing"
+        );
+    }
+
+    /// **I1142** — the steward check's instant is bounded by W at admission
+    /// (CIRISPersist#1049): an evicted key signing inside its old live window
+    /// but more than W ago is refused `asserted_at_stale`, at the consent
+    /// gate and at the owner-binding gate; a live roster key inside W passes.
+    pub(crate) async fn i1142_an_evicted_key_cannot_sign_into_its_old_window(
+        d: &dyn FederationDirectory,
+        tag: &str,
+    ) {
+        use crate::federation::consent_by_humans as cbh;
+        let (f, d1, d2, node, peer) = (
+            format!("f-{tag}"),
+            format!("d1-{tag}"),
+            format!("d2-{tag}"),
+            format!("n-{tag}"),
+            format!("p-{tag}"),
+        );
+        keys(d, &[&f, &d1, &d2, &peer]).await;
+        ts::register_hybrid_key_as(d, &node, &node, it::NODE).await;
+        let days = |n: i64| ms_now() - chrono::Duration::days(n);
+        // d1 live since five days ago; d2 added through the door.
+        add(d, &f, &f, &d1, days(5)).await.expect("one key");
+        let p2 = pending(add(d, &f, &f, &d2, ms_now()).await, "f adds d2");
+        vote(d, &d1, &f, &p2, true).await;
+        d.put_attestation(SignedAttestation {
+            attestation: binding(&f, &node),
+        })
+        .await
+        .expect("I1142: f owns the node");
+        // Evict d1 by quorum: f proposes, d2 assents.
+        let w = ts::occurrence_withdrawal(d, &f, &f, &d1, ms_now()).await;
+        let pe = pending(d.put_attestation(w).await.map(|_| ()), "f evicts d1");
+        vote(d, &d2, &f, &pe, true).await;
+        assert!(!active(d, &f, &d1).await, "I1142: d1 evicted");
+
+        let mut stale = grant(&d1, &peer, &node);
+        stale.asserted_at = days(4);
+        stale.scrub_timestamp = stale.asserted_at;
+        ts::seal_row_in_place(&d1, &mut stale);
+        let e = d
+            .put_attestation(SignedAttestation { attestation: stale })
+            .await
+            .expect_err("I1142: the evicted d1's backdated grant");
+        assert!(e.to_string().contains(sr::ASSERTED_AT_STALE), "I1142: {e}");
+
+        let mut stale_bind = binding(&d1, &node);
+        stale_bind.asserted_at = days(4);
+        stale_bind.scrub_timestamp = stale_bind.asserted_at;
+        ts::seal_row_in_place(&d1, &mut stale_bind);
+        let e = d
+            .put_attestation(SignedAttestation {
+                attestation: stale_bind,
+            })
+            .await
+            .expect_err("I1142: the evicted d1's backdated owner-binding");
+        assert!(e.to_string().contains(sr::ASSERTED_AT_STALE), "I1142: {e}");
+
+        // A live roster key inside W passes, and counts.
+        let mut fresh = grant(&d2, &peer, &node);
+        fresh.asserted_at = ms_now();
+        fresh.scrub_timestamp = fresh.asserted_at;
+        ts::seal_row_in_place(&d2, &mut fresh);
+        d.put_attestation(SignedAttestation {
+            attestation: fresh.clone(),
+        })
+        .await
+        .expect("I1142: d2's grant now is inside W");
+        assert!(cbh::grant_is_authored_for(d, &fresh, &node).await.unwrap());
+    }
+
     /// **I1138** — compat: pending is served neither framed nor as a row.
     pub(crate) async fn i1138_pending_is_not_served(d: &dyn FederationDirectory, tag: &str) {
         let (f, d1, d2) = (format!("f-{tag}"), format!("d1-{tag}"), format!("d2-{tag}"));
@@ -658,6 +792,11 @@ mod tests {
     on_every_backend!(i1137, bodies::i1137_a_second_device_acts_as_its_self);
     on_every_backend!(i1138, bodies::i1138_pending_is_not_served);
     on_every_backend!(i1140, bodies::i1140_a_node_does_not_add_roster_keys);
+    on_every_backend!(i1141, bodies::i1141_the_genesis_key_is_evictable);
+    on_every_backend!(
+        i1142,
+        bodies::i1142_an_evicted_key_cannot_sign_into_its_old_window
+    );
 
     mod i1139 {
         use super::*;
