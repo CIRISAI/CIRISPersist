@@ -5,8 +5,6 @@ in ``-<fp>`` of its own Ed25519 key (``federation_malformed_row:
 key_registration: key_id_fingerprint_mismatch``) and admits one that does.
 """
 
-import base64
-import hashlib
 import json
 
 import pytest
@@ -36,32 +34,23 @@ def _engine(tmp_path):
         raise
 
 
-def _fingerprint(pubkey_b64: str) -> str:
-    digest = hashlib.sha256(base64.b64decode(pubkey_b64)).digest()
-    return base64.b32encode(digest).decode().lower()[:10]
-
-
 def test_put_public_key_refuses_a_mismatched_id_and_admits_a_derived_one_1103(tmp_path) -> None:
     eng, alias = _engine(tmp_path)
     try:
-        held = eng.lookup_public_key(alias)
-        if held is None:
-            pytest.skip("this wheel's engine does not register its own key")
-        record = json.loads(held)
+        # The engine registers its own key under the DERIVED id
+        # (`<alias>-<fp>`), through the unchecked in-process executor.
+        derived = eng.register_self_federation_key("agent", alias)
+        assert derived != alias and derived.startswith(alias + "-"), derived
+        record = json.loads(eng.lookup_public_key(derived))
+
         bad = dict(record, key_id="fp-surface-mismatched")
         with pytest.raises(ValueError) as refused:
             eng.put_public_key(json.dumps({"record": bad}))
         assert "key_id_fingerprint_mismatch" in str(refused.value), refused.value
         assert eng.lookup_public_key("fp-surface-mismatched") is None
 
-        derived = "fp-surface-" + _fingerprint(record["pubkey_ed25519_base64"])
-        good = dict(record, key_id=derived)
-        try:
-            eng.put_public_key(json.dumps({"record": good}))
-        except ValueError as exc:
-            # Only the fingerprint rule is under test: any other gate the raw
-            # door runs on a re-labelled record is out of scope, but it must
-            # not be this one.
-            assert "key_id_fingerprint_mismatch" not in str(exc), exc
+        # The derived id passes the gate (an identical re-put is a no-op).
+        eng.put_public_key(json.dumps({"record": record}))
+        assert eng.lookup_public_key(derived) is not None
     finally:
         ciris_persist.reset_engine()
