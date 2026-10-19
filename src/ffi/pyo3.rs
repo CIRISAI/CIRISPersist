@@ -34506,6 +34506,9 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         // Caller-fault → ValueError (4xx).
         crate::federation::Error::InvalidArgument(_)
         | crate::federation::Error::SignatureInvalid(_) => PyValueError::new_err(kind),
+        // v59.0.0 (CIRISPersist#1049) — typed out of `InvalidArgument`: the
+        // same kind and type.
+        crate::federation::Error::AssertedAtStale { .. } => PyValueError::new_err(kind),
         // v54.1.0 (CIRISPersist#1042) — the ordering gap keeps the Python
         // type of the arm it was split from (`SignatureInvalid` /
         // `FederationTierUnverified`, both ValueError); the KIND tells a

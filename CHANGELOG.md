@@ -124,6 +124,39 @@ threat-model citations because this crate's audit story is the point.
 - Witness **I1155** (memory, sqlite, postgres; the migration on sqlite,
   postgres); I1144 asserts its legacy revocation is carried.
 
+### Changed — typed refusals CIRISEdge asked for (CIRISPersist#1064)
+
+- **Pending vs refused through the replication apply.** `AttestationRefusalReason`
+  gains the APPENDED arm **`SelfRosterPending`** (token `self_roster_pending`):
+  a roster change the self-roster door holds as an open proposal. A refused
+  one stays `KeyPlaneRefused`.
+  - New **`AttestationRefusalReason::is_retryable()`**: `true` for
+    `SelfRosterPending` and `StoreConflict`.
+  - New **`AttestationRefusalReason::of_self_roster_decision(decision)`**.
+  - This is an enum change inside `ReplicatedAttestationOutcome`, so
+    **`DIRECTORY_ABI_VERSION` 9 → 10**. The `DirectoryOp` / `DirectoryOpResult`
+    structural digests are unchanged (they pin the top-level variants):
+    `784929785eec65791e29a7c00cc24914f9f1751ad4e098d3e04b550e86eec931` and
+    `2295b94a42f9da5c7d758c6a0764da0fca8953aaf408dcfd6d672f13a9eff827`.
+- **`replication_policy::ENVELOPE_KIND_RETIRED`** exports the
+  `federation_envelope_kind_retired` token, and `kind()` returns it.
+- **`Error::AssertedAtStale { author, steward, asserted_at, w_secs }`**:
+  `asserted_at_stale` is typed out of `InvalidArgument`.
+  - `kind()` stays `federation_invalid_argument`, and Python still raises
+    `ValueError`.
+  - The Display still leads with `asserted_at_stale`
+    (`self_roster::ASSERTED_AT_STALE`).
+- **`Error::SignerDoesNotActFor` gains `reason: SignerNotActingReason`**:
+  `NotBound` (retryable) or `GenesisEvicted` (terminal: the self evicted its
+  genesis key through the two paths).
+  - The reason has `as_str()` (`not_bound` / `genesis_evicted`) and
+    `is_retryable()`.
+  - `kind()` is unchanged. A Rust consumer that matches the variant with all
+    its fields named must add `..` or `reason`.
+- Witness **I1156** (memory, sqlite, postgres). I1141 asserts `GenesisEvicted`
+  and I1142 asserts the typed stale variant. Mutations collapsing either
+  split are red.
+
 ### Added — the two-path decision (CIRISPersist#1099, CC 3.3.6.3, `CLM-self-roster-two-paths`)
 
 - `federation::two_path` — ONE pure, backend-free decision for "one actor

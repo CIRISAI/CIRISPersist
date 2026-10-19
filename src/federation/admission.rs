@@ -5867,14 +5867,14 @@ where
 {
     // v59.0.0 (CIRISPersist#1099, CC 3.3.6.3) — the identity's own key acts
     // for it until the self evicted its genesis key.
-    if attesting_key_id == identity_key_id
-        && !super::self_roster::genesis_evicted_at(
+    let genesis_evicted = attesting_key_id == identity_key_id
+        && super::self_roster::genesis_evicted_at(
             directory,
             identity_key_id,
             super::self_roster::roster_clock(),
         )
-        .await?
-    {
+        .await?;
+    if attesting_key_id == identity_key_id && !genesis_evicted {
         return Ok(());
     }
     // CIRISPersist#851 (BLOB_REPLICATION.md §20.2; PR #852 review, rounds
@@ -5910,6 +5910,11 @@ where
             attesting_key_id: attesting_key_id.to_owned(),
             identity_key_id: identity_key_id.to_owned(),
             plane,
+            reason: if genesis_evicted {
+                super::SignerNotActingReason::GenesisEvicted
+            } else {
+                super::SignerNotActingReason::NotBound
+            },
         });
     }
     Ok(())

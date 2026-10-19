@@ -1043,6 +1043,7 @@ pub async fn check_sealer(
                     attesting_key_id: signer.to_owned(),
                     identity_key_id: owner_key_id.clone(),
                     plane: KEY_GRANT_PLANE,
+                    reason: super::SignerNotActingReason::NotBound,
                 });
             }
             Ok(())

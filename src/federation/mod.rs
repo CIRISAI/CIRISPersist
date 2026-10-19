@@ -9693,9 +9693,15 @@ pub enum Error {
     /// token `federation_signer_not_acting_for`; Python `ValueError`, the type
     /// of the arm it was split from. Raised by `admission::check_signer_acts_for`.
     #[error(
-        "{plane}: signer {attesting_key_id} does not act for {identity_key_id} on this node yet \
-         (not that identity, an active occurrence of it, nor a node it owns) — re-offer the row \
-         after the binding or occurrence lands"
+        "{plane}: signer {attesting_key_id} does not act for {identity_key_id} on this node \
+         ({}) — {}",
+        reason.as_str(),
+        if reason.is_retryable() {
+            "not that identity, an active occurrence of it, nor a node it owns: re-offer the row \
+             after the binding or occurrence lands"
+        } else {
+            "the self evicted its genesis key through the two-path door: terminal"
+        }
     )]
     SignerDoesNotActFor {
         /// The row's signer.
@@ -9706,6 +9712,34 @@ pub enum Error {
         /// The door: `identity_occurrence`, `identity_occurrence_revocation`,
         /// `transport_destination` or `touch_claim`.
         plane: &'static str,
+        /// v59.0.0 (CIRISPersist#1099, CIRISEdge) — why: no binding yet
+        /// (retryable), or the identity's own key after the self evicted its
+        /// genesis key (terminal). The `kind()` token is unchanged.
+        reason: SignerNotActingReason,
+    },
+
+    /// v59.0.0 (CIRISPersist#1049 / #1099, CIRISEdge) — **a roster act outside
+    /// the past-freshness window W** ([`self_roster::check_roster_act_fresh`]):
+    /// `author` stood for `steward` only as a roster key at the row's signed
+    /// `asserted_at`, is no longer a live roster key of that self, and the
+    /// instant is more than W behind this node's clock. Typed out of
+    /// [`Error::InvalidArgument`], so it keeps that arm's `kind()` token
+    /// (`federation_invalid_argument`) and Python type (`ValueError`); the
+    /// Display still leads with [`self_roster::ASSERTED_AT_STALE`].
+    #[error(
+        "asserted_at_stale: {author} signs as {steward}'s roster key at {asserted_at}, more than \
+         W = {w_secs} s before this node's clock — a roster act is admitted only inside the \
+         past-freshness window (CIRISPersist#1049, CC 2.6.7)"
+    )]
+    AssertedAtStale {
+        /// The row's signer.
+        author: String,
+        /// The self it signed for as a roster key.
+        steward: String,
+        /// The row's signed instant.
+        asserted_at: chrono::DateTime<chrono::Utc>,
+        /// W, in seconds.
+        w_secs: i64,
     },
 
     /// v59.0.0 (sealed-transport floor, operator ruling 2026-10-19; CC 5.3.3.5
@@ -12077,6 +12111,35 @@ pub enum Error {
     },
 }
 
+/// v59.0.0 (CIRISPersist#1099, CIRISEdge) — why a signer does not act for an
+/// identity ([`Error::SignerDoesNotActFor`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignerNotActingReason {
+    /// Not the identity, an active occurrence of it, nor a node it owns — on
+    /// this node, yet: the binding or occurrence may still land. Retryable.
+    NotBound,
+    /// The identity's own key, after the self evicted its genesis key through
+    /// the two-path door (CC 3.3.6.3): terminal, nothing re-establishes it.
+    GenesisEvicted,
+}
+
+impl SignerNotActingReason {
+    /// The stable token: `not_bound` / `genesis_evicted`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotBound => "not_bound",
+            Self::GenesisEvicted => "genesis_evicted",
+        }
+    }
+
+    /// May a later re-offer succeed?
+    #[must_use]
+    pub const fn is_retryable(self) -> bool {
+        matches!(self, Self::NotBound)
+    }
+}
+
 /// v55.0.0 (CIRISPersist#1055) — the closed set of [`Error::MalformedRow`]
 /// reasons. Every one is TERMINAL for the bytes it names.
 pub mod malformed_row {
@@ -12198,7 +12261,8 @@ impl Error {
             Error::AttesterKeyUnknown { .. } => "federation_attester_key_unknown",
             Error::SignerDoesNotActFor { .. } => "federation_signer_not_acting_for",
             Error::SelfRosterNotLanded { .. } => "federation_self_roster_not_landed",
-            Error::EnvelopeKindRetired { .. } => "federation_envelope_kind_retired",
+            Error::AssertedAtStale { .. } => "federation_invalid_argument",
+            Error::EnvelopeKindRetired { .. } => replication_policy::ENVELOPE_KIND_RETIRED,
             Error::MalformedRow { .. } => "federation_malformed_row",
             Error::LicensureDelegatorNotAuthority { .. } => {
                 "federation_licensure_delegator_not_authority"

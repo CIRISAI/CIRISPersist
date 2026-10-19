@@ -637,7 +637,11 @@ pub(crate) mod bodies {
             "I1141: the fedID string survives; a live roster key acts as it"
         );
         match add(d, &f, &f, &d3, ms_now()).await {
-            Err(Error::SignerDoesNotActFor { .. }) => {}
+            // v59.0.0 (CIRISEdge) — typed: terminal, not "not bound yet".
+            Err(Error::SignerDoesNotActFor {
+                reason: crate::federation::SignerNotActingReason::GenesisEvicted,
+                ..
+            }) => {}
             other => panic!("I1141: an evicted genesis key signs for the self: {other:?}"),
         }
         // {d1, d2}: d1's addition needs d2.
@@ -718,7 +722,12 @@ pub(crate) mod bodies {
             .put_attestation(SignedAttestation { attestation: stale })
             .await
             .expect_err("I1142: the evicted d1's backdated grant");
-        assert!(e.to_string().contains(sr::ASSERTED_AT_STALE), "I1142: {e}");
+        assert!(
+            matches!(e, Error::AssertedAtStale { .. })
+                && e.kind() == "federation_invalid_argument"
+                && e.to_string().starts_with(sr::ASSERTED_AT_STALE),
+            "I1142: {e}"
+        );
 
         let mut stale_bind = binding(&d1, &node);
         stale_bind.asserted_at = days(4);
@@ -730,7 +739,12 @@ pub(crate) mod bodies {
             })
             .await
             .expect_err("I1142: the evicted d1's backdated owner-binding");
-        assert!(e.to_string().contains(sr::ASSERTED_AT_STALE), "I1142: {e}");
+        assert!(
+            matches!(e, Error::AssertedAtStale { .. })
+                && e.kind() == "federation_invalid_argument"
+                && e.to_string().starts_with(sr::ASSERTED_AT_STALE),
+            "I1142: {e}"
+        );
 
         // A live roster key inside W passes, and counts.
         let mut fresh = grant(&d2, &peer, &node);
@@ -873,6 +887,45 @@ pub(crate) mod bodies {
             );
         }
         assert!(cbh::grant_is_authored_for(b, &old, &node).await.unwrap());
+    }
+
+    /// **I1156** (CIRISPersist#1064, CIRISEdge) — through the replication
+    /// apply, a roster change held as an OPEN proposal is
+    /// `Refused { SelfRosterPending }` (retryable) and a refused one is
+    /// `Refused { KeyPlaneRefused }` (terminal).
+    pub(crate) async fn i1156_pending_is_retryable_refused_is_terminal(
+        d: &dyn FederationDirectory,
+        tag: &str,
+    ) {
+        use crate::federation::attestation_apply::{
+            AttestationRefusalReason as R, ReplicatedAttestationOutcome as O,
+        };
+        let (f, d1, d2) = (format!("f-{tag}"), format!("d1-{tag}"), format!("d2-{tag}"));
+        keys(d, &[&f, &d1, &d2]).await;
+        add(d, &f, &f, &d1, ms_now()).await.expect("one key");
+        // f signs d2 in at two keys: a proposal, pending.
+        let signed = ts::signed_content_only_occurrence(&f, &f, &d2, ms_now()).await;
+        let row = crate::federation::key_plane::occurrence_row(&signed).expect("row");
+        match d
+            .apply_replicated_attestation(SignedAttestation { attestation: row })
+            .await
+            .unwrap()
+        {
+            O::Refused { reason } => {
+                assert_eq!(reason, R::SelfRosterPending, "I1156");
+                assert!(reason.is_retryable(), "I1156: pending is retryable");
+            }
+            other => panic!("I1156: a pending addition: {other:?}"),
+        }
+        // d1 withdraws its own occurrence: proposer_is_target, refused.
+        let w = ts::occurrence_withdrawal(d, &d1, &f, &d1, ms_now()).await;
+        match d.apply_replicated_attestation(w).await.unwrap() {
+            O::Refused { reason } => {
+                assert_eq!(reason, R::KeyPlaneRefused, "I1156");
+                assert!(!reason.is_retryable(), "I1156: refused is terminal");
+            }
+            other => panic!("I1156: a refused eviction: {other:?}"),
+        }
     }
 
     /// **I1143** — a proposer withdraws its open proposal: it leaves the
@@ -1060,6 +1113,10 @@ mod tests {
     on_every_backend!(i1138, bodies::i1138_pending_is_not_served);
     on_every_backend!(i1140, bodies::i1140_a_node_does_not_add_roster_keys);
     on_every_backend!(i1143, bodies::i1143_the_proposer_withdraws);
+    on_every_backend!(
+        i1156,
+        bodies::i1156_pending_is_retryable_refused_is_terminal
+    );
     on_every_backend!(i1141, bodies::i1141_the_genesis_key_is_evictable);
     on_every_backend!(i1151, bodies::i1151_a_pre_door_withdraws_evicts_nothing);
     on_every_backend!(

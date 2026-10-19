@@ -251,7 +251,7 @@ pub(crate) mod bodies {
     fn expect_not_acting(e: &Error, signer: &str, identity: &str, plane: &str, what: &str) {
         assert_eq!(e.kind(), NOT_ACTING, "{what}: {e}");
         assert!(
-            matches!(e, Error::SignerDoesNotActFor { attesting_key_id, identity_key_id, plane: p }
+            matches!(e, Error::SignerDoesNotActFor { attesting_key_id, identity_key_id, plane: p, .. }
                 if attesting_key_id == signer && identity_key_id == identity && *p == plane),
             "{what}: {e:?}"
         );

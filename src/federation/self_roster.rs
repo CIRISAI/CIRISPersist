@@ -410,7 +410,8 @@ pub const ASSERTED_AT_STALE: &str = "asserted_at_stale";
 ///
 /// # Errors
 ///
-/// [`Error::InvalidArgument`] `asserted_at_stale: …`.
+/// [`Error::AssertedAtStale`] (`kind()` `federation_invalid_argument`,
+/// Display `asserted_at_stale: …`).
 pub async fn check_roster_act_fresh<D>(
     dir: &D,
     stewards: &[String],
@@ -433,11 +434,12 @@ where
         if is_roster_key_at(dir, s, author, asserted_at).await?
             && !is_roster_key_at(dir, s, author, now).await?
         {
-            return Err(Error::InvalidArgument(format!(
-                "{ASSERTED_AT_STALE}: {author} signs as {s}'s roster key at {asserted_at}, more \
-                 than W = {PAST_FRESHNESS_W_SECS} s before this node's clock — a roster act is \
-                 admitted only inside the past-freshness window (CIRISPersist#1049, CC 2.6.7)"
-            )));
+            return Err(Error::AssertedAtStale {
+                author: author.to_owned(),
+                steward: s.clone(),
+                asserted_at,
+                w_secs: PAST_FRESHNESS_W_SECS,
+            });
         }
     }
     Ok(())

@@ -165,6 +165,12 @@ pub fn retired_detail(kind: EnvelopeKind) -> String {
     out
 }
 
+/// v59.0.0 (sealed-transport floor; CIRISEdge matches it) — the `kind()`
+/// token of [`Error::EnvelopeKindRetired`](super::Error::EnvelopeKindRetired):
+/// an inbound object of a retired framed kind. Its Display leads with this
+/// token, then `: <retired_detail>`.
+pub const ENVELOPE_KIND_RETIRED: &str = "federation_envelope_kind_retired";
+
 /// v59.0.0 (sealed-transport floor, operator ruling 2026-10-19) — the kinds
 /// whose FRAMED carriage is retired: a key-plane object travels only as its
 /// row (an `Attestation`). They stay in the hashed vocabulary.

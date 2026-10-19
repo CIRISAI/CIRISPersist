@@ -274,6 +274,12 @@ type BoxedFut = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 /// these ops served is unreachable; the key plane replicates as rows
 /// (`ApplyReplicatedAttestation`).
 ///
+/// v10 (v59.0.0, CIRISPersist#1064, CIRISEdge) — `AttestationRefusalReason`,
+/// inside the existing `ReplicatedAttestationOutcome` result, gains
+/// `SelfRosterPending` (an open self-roster proposal: retryable), split out of
+/// `KeyPlaneRefused` (terminal). A consumer built against 9 fails to decode it
+/// on the hot path (the v6 / v8 payload-type form).
+///
 /// Consumers MUST check the field at capsule-receive time:
 ///
 /// ```ignore
@@ -286,7 +292,7 @@ type BoxedFut = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 ///     "persist directory_capsule ABI version mismatch — pin floor too low"
 /// );
 /// ```
-pub const DIRECTORY_ABI_VERSION: u32 = 9;
+pub const DIRECTORY_ABI_VERSION: u32 = 10;
 
 /// A `FederationDirectory` operation, serialized by the consumer and
 /// dispatched inside persist's `.so`.
@@ -4965,10 +4971,12 @@ mod tests {
     /// puts in the vtable a consumer reads at runtime. A single assertion
     /// comparing them to each other would hold trivially while both drifted.
     #[test]
-    fn abi_version_pinned_at_9() {
+    fn abi_version_pinned_at_10() {
         assert_eq!(
-            DIRECTORY_ABI_VERSION, 9,
-            "v59.0.0 (sealed-transport floor, operator ruling 2026-10-19): the framed \
+            DIRECTORY_ABI_VERSION, 10,
+            "v59.0.0 (CIRISPersist#1064): AttestationRefusalReason gained SelfRosterPending \
+             inside ReplicatedAttestationOutcome — a consumer built against 9 fails to decode \
+             it. Previous move: v59.0.0 (sealed-transport floor, operator ruling 2026-10-19): the framed \
              key-plane listings are removed from the op and result wire and \
              PutIdentityOccurrenceRevocation's payload is retyped — a consumer built against \
              8 sends ops this host no longer decodes. Previous move: \
@@ -4997,7 +5005,7 @@ mod tests {
              built for"
         );
         assert_eq!(
-            PERSIST_DIRECTORY_VTABLE.abi_version, 9,
+            PERSIST_DIRECTORY_VTABLE.abi_version, 10,
             "the shipped vtable must advertise what consumers pin against"
         );
     }
