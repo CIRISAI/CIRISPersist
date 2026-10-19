@@ -135,36 +135,12 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // without a row — never refused there). The attestation door hands a
     // key-plane row to its family door (Delegates).
     ("plan_put_revocation", Class::Delegates),
-    // v58.0.0 (compat reads, operator ruling 2026-10-18) — the framed
-    // occurrence-revocation door's signature gate (v57's class), the
-    // restored listings' row decoders (v57's class), and the read the
-    // attestation door makes before feeding a `withdraws` into the occurrence
-    // revocation projection: Delegates, a backend read whose only effect is to
-    // skip a write the framed route already made (an error propagates, so it
-    // fails closed).
-    ("verify_signed_identity_occurrence_revocation", Class::Gate),
+    // The read the attestation door makes before feeding a `withdraws` into
+    // the occurrence revocation projection: Delegates, a backend read whose
+    // only effect is to skip a write a revocation already made (an error
+    // propagates, so it fails closed). v59.0.0 retired the framed door and the
+    // compat listings' decoders.
     ("list_identity_occurrence_revocations_for", Class::Delegates),
-    ("pg_row_to_key_record", Class::Delegates),
-    ("pg_row_to_revocation", Class::Delegates),
-    ("pg_row_to_signed_identity_occurrence", Class::Delegates),
-    (
-        "pg_row_to_signed_identity_occurrence_revocation",
-        Class::Delegates,
-    ),
-    ("sqlite_row_to_key_record", Class::Delegates),
-    ("sqlite_row_to_revocation", Class::Delegates),
-    ("sqlite_row_to_identity_occurrence", Class::Delegates),
-    (
-        "sqlite_row_to_identity_occurrence_revocation",
-        Class::Delegates,
-    ),
-    ("pg_row_to_identity_occurrence", Class::Delegates),
-    ("pg_row_to_identity_occurrence_revocation", Class::Delegates),
-    ("sqlite_row_to_signed_identity_occurrence", Class::Delegates),
-    (
-        "sqlite_row_to_signed_identity_occurrence_revocation",
-        Class::Delegates,
-    ),
     ("put_revocation_planned", Class::Plan),
     ("revocations_for_subject", Class::Plumbing),
     ("check_revocation_bound_lowers", Class::Gate),
@@ -173,6 +149,9 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("occurrence_withdrawal_of", Class::Plumbing),
     ("put_identity_occurrence_revocation_local", Class::Plumbing),
     ("rehome_legacy_key_plane", Class::Plumbing),
+    // v59.0.0 (sealed-transport floor) — the eager rehome at open: a data
+    // sweep that fails only on the substrate's own terms.
+    ("rehome_key_plane_at_open", Class::Plumbing),
     ("sqlite_sync_key_record_row", Class::Plumbing),
     ("sqlite_sync_occurrence_row", Class::Plumbing),
     ("sqlite_drop_key_record_rows", Class::Plumbing),
@@ -659,8 +638,11 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("from_wire_str", Class::Plumbing),
     // v59.0.0 (CIRISPersist#1099) — the self-roster door: refuses (holds) a
     // roster change one key of two or more signed.
+    ("gate_genesis_withdrawal", Class::Gate),
+    // Reads which self a `withdraws` of a key record evicts the genesis key
+    // of; refuses nothing (the gate after it decides).
+    ("genesis_withdrawal_of", Class::Plumbing),
     ("gate_occurrence", Class::Gate),
-    ("gate_revocation", Class::Gate),
     ("gate_withdrawal", Class::Gate),
     ("get", Class::Plumbing),
     ("get_accord_proposal", Class::Delegates),

@@ -145,6 +145,26 @@ pub enum EnvelopeKind {
     CommunityMembershipListing,
 }
 
+/// v59.0.0 (sealed-transport floor) — the detail an
+/// [`Error::EnvelopeKindRetired`](super::Error::EnvelopeKindRetired) names: the
+/// kind, snake_case (`key`, `revocation`, `identity_occurrence`,
+/// `identity_occurrence_revocation`, …).
+#[must_use]
+pub fn retired_detail(kind: EnvelopeKind) -> String {
+    let mut out = String::new();
+    for (i, c) in kind.as_str().chars().enumerate() {
+        if c.is_ascii_uppercase() {
+            if i > 0 {
+                out.push('_');
+            }
+            out.push(c.to_ascii_lowercase());
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 impl EnvelopeKind {
     /// Every kind, in the canonical (manifest-hashed) order. APPENDED, never
     /// inserted — the order is hashed.

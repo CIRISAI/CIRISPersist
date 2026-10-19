@@ -115,7 +115,7 @@ use crate::federation::types::{
     Attestation, Community, CommunityMembershipRevocation, Family, FamilyMembershipRevocation,
     HybridPendingRow, IdentityOccurrence, IdentityOccurrenceRevocation, KeyRecord, LocationProof,
     PeerMetadataRow, Revocation, SignedCommunityMembershipRevocation,
-    SignedFamilyMembershipRevocation, SignedIdentityOccurrenceRevocation,
+    SignedFamilyMembershipRevocation,
 };
 use crate::federation::{accord_quorum, cohort, self_at_login, shared_instance, types, Error};
 use crate::federation::{
@@ -260,6 +260,20 @@ type BoxedFut = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 /// reads, operator ruling 2026-10-18): the op set is v7's, and against the
 /// branch's 8 the restoration is growth, which by the rule above does not bump.
 ///
+/// v9 (v59.0.0, sealed-transport floor, operator ruling 2026-10-19; CC
+/// 5.3.3.5 E1 option (i)) — a BREAK: the framed key-plane compat reads are
+/// REMOVED (`ListSignedKeyRecordsSince`, `ListSignedRevocationsSince`,
+/// `ListSignedIdentityOccurrencesSince`,
+/// `ListSignedIdentityOccurrenceRevocationsSince` and their results
+/// `SignedKeyRecords`, `SignedRevocations`, `SignedIdentityOccurrencesSince`,
+/// `SignedIdentityOccurrenceRevocationsSince`), and
+/// `PutIdentityOccurrenceRevocation`'s payload is raw JSON answered with the
+/// refusal `federation_envelope_kind_retired: identity_occurrence_revocation`;
+/// `ApplyReplicatedKeyRecord` answers `federation_envelope_kind_retired: key`.
+/// Every RNS byte rides a per-link hybrid seal, so an unsealed pre-v58 peer
+/// these ops served is unreachable; the key plane replicates as rows
+/// (`ApplyReplicatedAttestation`).
+///
 /// Consumers MUST check the field at capsule-receive time:
 ///
 /// ```ignore
@@ -272,7 +286,7 @@ type BoxedFut = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 ///     "persist directory_capsule ABI version mismatch — pin floor too low"
 /// );
 /// ```
-pub const DIRECTORY_ABI_VERSION: u32 = 8;
+pub const DIRECTORY_ABI_VERSION: u32 = 9;
 
 /// A `FederationDirectory` operation, serialized by the consumer and
 /// dispatched inside persist's `.so`.
@@ -596,9 +610,15 @@ pub enum DirectoryOp {
     /// `signer_acts_for` + divergence check) runs INSIDE persist's `.so` at
     /// dispatch — a forged revocation is refused before any write. Result rides
     /// `Unit`. APPEND-ONLY.
+    ///
+    /// v59.0.0 (sealed-transport floor, operator ruling 2026-10-19) — RETIRED:
+    /// the framed occurrence revocation is no longer admitted. The variant is
+    /// kept, its payload read as raw JSON, so an old consumer's op is answered
+    /// with the typed refusal `federation_envelope_kind_retired:
+    /// identity_occurrence_revocation` instead of a decode error.
     PutIdentityOccurrenceRevocation {
-        /// The signed revocation container to admit.
-        revocation: crate::federation::SignedIdentityOccurrenceRevocation,
+        /// The retired framed object, unread.
+        revocation: serde_json::Value,
     },
     /// [`FederationDirectory::put_signed_transport_destination`] (#443) — the
     /// AUTHENTICATED route-plane replication apply: the wire path edge's
@@ -809,33 +829,6 @@ pub enum DirectoryOp {
         /// Page cap.
         limit: u32,
     },
-    /// [`FederationDirectory::list_signed_key_records_since`] (v21.1.0,
-    /// CIRISPersist#507c) — bulk-list `SignedKeyRecord` wrappers since a
-    /// cursor, for the edge advertise/serve responder. Result rides
-    /// `SignedKeyRecords`. APPEND-ONLY.
-    ListSignedKeyRecordsSince {
-        /// Cursor: rows strictly after `(admitted_at, key_id)` (None ⇒ from
-        /// start).
-        ///
-        /// v31.4.0 (#682/#668) — the PAIR, and THIS node's admission position
-        /// rather than the producer's `scrub_timestamp`. A record signed in
-        /// January, replicated late and admitted in February, sorted under
-        /// January and was never served past it; and a resume on the instant
-        /// alone skips the remainder of any tie larger than one page.
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        /// Page cap.
-        limit: u32,
-    },
-    /// [`FederationDirectory::list_signed_identity_occurrences_since`]
-    /// (v21.1.0, CIRISPersist#507c). Structural mirror of
-    /// [`DirectoryOp::ListSignedKeyRecordsSince`]. Result rides
-    /// `SignedIdentityOccurrences`. APPEND-ONLY.
-    ListSignedIdentityOccurrencesSince {
-        /// Cursor: rows with `asserted_at > since` (None ⇒ from start).
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        /// Page cap.
-        limit: u32,
-    },
     /// [`FederationDirectory::list_signed_transport_destinations_since`]
     /// (v21.1.0, CIRISPersist#507c). Structural mirror of
     /// [`DirectoryOp::ListSignedKeyRecordsSince`]. Result rides
@@ -851,16 +844,6 @@ pub enum DirectoryOp {
     /// invariant). Result rides `Attestations`. APPEND-ONLY.
     ListAttestationsSince {
         /// Cursor: rows with `asserted_at > since` (None ⇒ from start).
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        /// Page cap.
-        limit: u32,
-    },
-    /// [`FederationDirectory::list_signed_identity_occurrence_revocations_since`]
-    /// (v21.1.0, CIRISPersist#507c). Structural mirror of
-    /// [`DirectoryOp::ListSignedKeyRecordsSince`]. Result rides
-    /// `SignedIdentityOccurrenceRevocationsSince`. APPEND-ONLY.
-    ListSignedIdentityOccurrenceRevocationsSince {
-        /// Cursor: rows with `revoked_at > since` (None ⇒ from start).
         since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         /// Page cap.
         limit: u32,
@@ -900,15 +883,6 @@ pub enum DirectoryOp {
     RevocationsFor {
         /// The subject whose revocations to list.
         revoked_key_id: String,
-    },
-    /// [`FederationDirectory::list_signed_revocations_since`] (v31.1.0,
-    /// CIRISPersist#655) — the exclusion plane's serve cursor. Result rides
-    /// `SignedRevocations`. APPEND-ONLY.
-    ListSignedRevocationsSince {
-        /// Cursor: rows with `scrub_timestamp > since` (None ⇒ from start).
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        /// Page cap.
-        limit: u32,
     },
     /// [`FederationDirectory::list_signed_accord_quorum_evidence_since`]
     /// (v31.1.0, CIRISPersist#662) — the signed accord EVIDENCE cursor.
@@ -1252,23 +1226,12 @@ pub enum DirectoryOpResult {
     /// v48.0.0 (CIRISPersist#860) — `list_signed_community_membership_widenings_since`.
     /// APPEND-ONLY.
     SignedCommunityMembershipWidenings(Vec<crate::federation::ServedCommunityMembershipWidening>),
-    /// `list_signed_key_records_since` (v21.1.0, CIRISPersist#507c).
-    /// APPEND-ONLY.
-    SignedKeyRecords(Vec<crate::federation::ServedKeyRecord>),
-    /// `list_signed_identity_occurrences_since` (v21.1.0, CIRISPersist#507c).
-    /// APPEND-ONLY.
-    SignedIdentityOccurrencesSince(Vec<crate::federation::ServedIdentityOccurrence>),
     /// `list_signed_transport_destinations_since` (v21.1.0,
     /// CIRISPersist#507c). APPEND-ONLY.
     SignedTransportDestinationsSince(Vec<crate::federation::ServedTransportDestination>),
     /// `list_attestations_since` (v21.1.0, CIRISPersist#507c) — federation-
     /// tier-only rows. APPEND-ONLY.
     Attestations(Vec<crate::federation::ServedAttestation>),
-    /// `list_signed_identity_occurrence_revocations_since` (v21.1.0,
-    /// CIRISPersist#507c). APPEND-ONLY.
-    SignedIdentityOccurrenceRevocationsSince(
-        Vec<crate::federation::ServedIdentityOccurrenceRevocation>,
-    ),
     /// `lookup_signed_record_by_content_hash` (v21.1.0, CIRISPersist#507b) —
     /// the re-serialized record bytes, or `None` on a miss/index-mismatch.
     /// APPEND-ONLY.
@@ -1279,9 +1242,6 @@ pub enum DirectoryOpResult {
     TransitEligibility(crate::federation::trust_root::TransitEligibility),
     /// `revocations_for` (v31.1.0, CIRISPersist#655). APPEND-ONLY.
     Revocations(Vec<Revocation>),
-    /// `list_signed_revocations_since` (v31.1.0, CIRISPersist#655).
-    /// APPEND-ONLY.
-    SignedRevocations(Vec<crate::federation::ServedRevocation>),
     /// `list_signed_accord_quorum_evidence_since` (v31.1.0,
     /// CIRISPersist#662). APPEND-ONLY.
     AccordQuorumEvidence(Vec<crate::federation::accord_carriage::AccordQuorumEvidence>),
@@ -1460,11 +1420,17 @@ pub async fn dispatch_directory_op(
         // #375 — the whole apply (plan + adopt_scrub_upgrade) runs INSIDE
         // persist's .so against persist's own vtable, so the capsule
         // consumer gets the real upgrade-aware outcome, not DO-NOTHING.
+        // v59.0.0 (sealed-transport floor, operator ruling 2026-10-19) — the
+        // framed key-record replication door is retired: a key replicates as
+        // its `key:record:v1` row (`ApplyReplicatedAttestation`).
         DirectoryOp::ApplyReplicatedKeyRecord { record } => {
-            match dir.apply_replicated_key_record(record).await {
-                Ok(outcome) => DirectoryOpResult::ReplicatedKeyOutcome(outcome),
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
-            }
+            let _ = record;
+            DirectoryOpResult::Err(
+                crate::federation::Error::EnvelopeKindRetired {
+                    kind: crate::federation::replication_policy::EnvelopeKind::Key,
+                }
+                .to_string(),
+            )
         }
         DirectoryOp::LookupIdentityForOccurrence { occurrence_key_id } => {
             match dir.lookup_identity_for_occurrence(&occurrence_key_id).await {
@@ -1488,11 +1454,15 @@ pub async fn dispatch_directory_op(
             Ok(v) => DirectoryOpResult::SignedReplicatedRecords(v),
             Err(e) => DirectoryOpResult::Err(e.to_string()),
         },
+        // v59.0.0 (sealed-transport floor) — the framed inbound door is retired.
         DirectoryOp::PutIdentityOccurrenceRevocation { revocation } => {
-            match dir.put_identity_occurrence_revocation(revocation).await {
-                Ok(()) => DirectoryOpResult::Unit,
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
-            }
+            let _ = revocation;
+            DirectoryOpResult::Err(
+                crate::federation::Error::EnvelopeKindRetired {
+                    kind: crate::federation::replication_policy::EnvelopeKind::IdentityOccurrenceRevocation,
+                }
+                .to_string(),
+            )
         }
         // #443 — the gate + monotonic apply run INSIDE persist's .so against
         // persist's own vtable; the consumer gets the policy outcome, and a
@@ -1636,12 +1606,6 @@ pub async fn dispatch_directory_op(
         DirectoryOp::RevocationsFor { revoked_key_id } => {
             match dir.revocations_for(&revoked_key_id).await {
                 Ok(v) => DirectoryOpResult::Revocations(v),
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
-            }
-        }
-        DirectoryOp::ListSignedRevocationsSince { since, limit } => {
-            match dir.list_signed_revocations_since(since, limit).await {
-                Ok(v) => DirectoryOpResult::SignedRevocations(v),
                 Err(e) => DirectoryOpResult::Err(e.to_string()),
             }
         }
@@ -1948,21 +1912,6 @@ pub async fn dispatch_directory_op(
                 Err(e) => DirectoryOpResult::Err(e.to_string()),
             }
         }
-        DirectoryOp::ListSignedKeyRecordsSince { since, limit } => {
-            match dir.list_signed_key_records_since(since, limit).await {
-                Ok(v) => DirectoryOpResult::SignedKeyRecords(v),
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
-            }
-        }
-        DirectoryOp::ListSignedIdentityOccurrencesSince { since, limit } => {
-            match dir
-                .list_signed_identity_occurrences_since(since, limit)
-                .await
-            {
-                Ok(v) => DirectoryOpResult::SignedIdentityOccurrencesSince(v),
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
-            }
-        }
         DirectoryOp::ListSignedTransportDestinationsSince { since, limit } => {
             match dir
                 .list_signed_transport_destinations_since(since, limit)
@@ -1975,15 +1924,6 @@ pub async fn dispatch_directory_op(
         DirectoryOp::ListAttestationsSince { since, limit } => {
             match dir.list_attestations_since(since, limit).await {
                 Ok(v) => DirectoryOpResult::Attestations(v),
-                Err(e) => DirectoryOpResult::Err(e.to_string()),
-            }
-        }
-        DirectoryOp::ListSignedIdentityOccurrenceRevocationsSince { since, limit } => {
-            match dir
-                .list_signed_identity_occurrence_revocations_since(since, limit)
-                .await
-            {
-                Ok(v) => DirectoryOpResult::SignedIdentityOccurrenceRevocationsSince(v),
                 Err(e) => DirectoryOpResult::Err(e.to_string()),
             }
         }
@@ -3520,25 +3460,6 @@ impl FederationDirectory for OpsDirectory {
             method: "list_communities_for_member",
         })
     }
-    async fn put_identity_occurrence_revocation(
-        &self,
-        revocation: SignedIdentityOccurrenceRevocation,
-    ) -> Result<(), Error> {
-        // #421 — routed (was Error::Unsupported): the wire apply for SIGNED
-        // revocations, so the replication bridge's
-        // `apply_identity_occurrence_revocation` reaches persist's gate
-        // (verify-before-mutation inside the .so) exactly like the occurrence.
-        match self
-            .run_op(&DirectoryOp::PutIdentityOccurrenceRevocation { revocation })
-            .await?
-        {
-            DirectoryOpResult::Unit => Ok(()),
-            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
-            _ => Err(Error::Backend(
-                "directory ops proxy: unexpected result variant".into(),
-            )),
-        }
-    }
     async fn put_family_membership_revocation(
         &self,
         revocation: SignedFamilyMembershipRevocation,
@@ -3963,44 +3884,6 @@ impl FederationDirectory for OpsDirectory {
         }
     }
 
-    /// v21.1.0 (CIRISPersist#507c) — the signed key-record bulk read via
-    /// the capsule, for the edge advertise/serve responder.
-    async fn list_signed_key_records_since(
-        &self,
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        limit: u32,
-    ) -> Result<Vec<crate::federation::ServedKeyRecord>, Error> {
-        match self
-            .run_op(&DirectoryOp::ListSignedKeyRecordsSince { since, limit })
-            .await?
-        {
-            DirectoryOpResult::SignedKeyRecords(v) => Ok(v),
-            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
-            _ => Err(Error::Backend(
-                "directory ops proxy: unexpected result variant".into(),
-            )),
-        }
-    }
-
-    /// v31.1.0 (CIRISPersist#655) — the exclusion plane's serve cursor,
-    /// routed. Structural mirror of [`Self::list_signed_key_records_since`].
-    async fn list_signed_revocations_since(
-        &self,
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        limit: u32,
-    ) -> Result<Vec<crate::federation::ServedRevocation>, Error> {
-        match self
-            .run_op(&DirectoryOp::ListSignedRevocationsSince { since, limit })
-            .await?
-        {
-            DirectoryOpResult::SignedRevocations(v) => Ok(v),
-            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
-            _ => Err(Error::Backend(
-                "directory ops proxy: unexpected result variant".into(),
-            )),
-        }
-    }
-
     /// v31.1.0 (CIRISPersist#662) — the signed accord EVIDENCE cursor, routed.
     async fn list_signed_accord_quorum_evidence_since(
         &self,
@@ -4065,25 +3948,6 @@ impl FederationDirectory for OpsDirectory {
 
     /// v21.1.0 (CIRISPersist#507c) — structural mirror of
     /// [`Self::list_signed_key_records_since`].
-    async fn list_signed_identity_occurrences_since(
-        &self,
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        limit: u32,
-    ) -> Result<Vec<crate::federation::ServedIdentityOccurrence>, Error> {
-        match self
-            .run_op(&DirectoryOp::ListSignedIdentityOccurrencesSince { since, limit })
-            .await?
-        {
-            DirectoryOpResult::SignedIdentityOccurrencesSince(v) => Ok(v),
-            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
-            _ => Err(Error::Backend(
-                "directory ops proxy: unexpected result variant".into(),
-            )),
-        }
-    }
-
-    /// v21.1.0 (CIRISPersist#507c) — structural mirror of
-    /// [`Self::list_signed_key_records_since`].
     async fn list_signed_transport_destinations_since(
         &self,
         since: Option<(chrono::DateTime<chrono::Utc>, String)>,
@@ -4114,25 +3978,6 @@ impl FederationDirectory for OpsDirectory {
             .await?
         {
             DirectoryOpResult::Attestations(v) => Ok(v),
-            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
-            _ => Err(Error::Backend(
-                "directory ops proxy: unexpected result variant".into(),
-            )),
-        }
-    }
-
-    /// v21.1.0 (CIRISPersist#507c) — structural mirror of
-    /// [`Self::list_signed_key_records_since`].
-    async fn list_signed_identity_occurrence_revocations_since(
-        &self,
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        limit: u32,
-    ) -> Result<Vec<crate::federation::ServedIdentityOccurrenceRevocation>, Error> {
-        match self
-            .run_op(&DirectoryOp::ListSignedIdentityOccurrenceRevocationsSince { since, limit })
-            .await?
-        {
-            DirectoryOpResult::SignedIdentityOccurrenceRevocationsSince(v) => Ok(v),
             DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
             _ => Err(Error::Backend(
                 "directory ops proxy: unexpected result variant".into(),
@@ -4868,18 +4713,8 @@ mod tests {
             other => panic!("expected Revocations, got {other:?}"),
         }
 
-        // Both serve cursors.
-        match run_op(
-            &rt,
-            &directory,
-            &DirectoryOp::ListSignedRevocationsSince {
-                since: None,
-                limit: 100,
-            },
-        ) {
-            DirectoryOpResult::SignedRevocations(v) => assert!(v.is_empty()),
-            other => panic!("expected SignedRevocations, got {other:?}"),
-        }
+        // The accord evidence serve cursor (v59.0.0: the framed revocation
+        // cursor is retired).
         match run_op(
             &rt,
             &directory,
@@ -5123,10 +4958,14 @@ mod tests {
     /// puts in the vtable a consumer reads at runtime. A single assertion
     /// comparing them to each other would hold trivially while both drifted.
     #[test]
-    fn abi_version_pinned_at_8() {
+    fn abi_version_pinned_at_9() {
         assert_eq!(
-            DIRECTORY_ABI_VERSION, 8,
-            "v58.0.0 (CIRISPersist#991): AttestationRefusalReason, inside the existing \
+            DIRECTORY_ABI_VERSION, 9,
+            "v59.0.0 (sealed-transport floor, operator ruling 2026-10-19): the framed \
+             key-plane listings are removed from the op and result wire and \
+             PutIdentityOccurrenceRevocation's payload is retyped — a consumer built against \
+             8 sends ops this host no longer decodes. Previous move: \
+             v58.0.0 (CIRISPersist#991): AttestationRefusalReason, inside the existing \
              ReplicatedAttestationOutcome result, gained KeyPlaneRefused — a consumer built \
              against 7 fails to decode it on the hot path (the v6 payload-type form). The \
              framed key-plane ops the slice first removed are restored with their v7 names \
@@ -5218,11 +5057,12 @@ mod tests {
     ///   instead of "pin floor too low".
     #[test]
     fn directory_op_wire_contract_is_pinned_682() {
-        // v58.0.0 (compat reads) — v57.0.0's digest: the framed key-plane ops
-        // are restored verbatim, so the enum body is v7's again.
+        // v59.0.0 (sealed-transport floor) — a BREAK: the framed key-plane
+        // ops are removed and `PutIdentityOccurrenceRevocation` retyped;
+        // DIRECTORY_ABI_VERSION 8 → 9.
         assert_eq!(
             structural_digest("DirectoryOp"),
-            "4efe656f9076f4b918efc8e122c6dfb422da3fb2e98fdbf52f4a6f9dbb17bce1",
+            "784929785eec65791e29a7c00cc24914f9f1751ad4e098d3e04b550e86eec931",
             "DirectoryOp's wire shape changed. GROWTH (appended a variant, \
              touched nothing existing) → re-pin this digest only. BREAK \
              (changed/renamed/removed/reordered an existing variant) → re-pin \
@@ -5264,10 +5104,11 @@ mod tests {
     /// (`ReachabilityVerdict::BeyondDepthCap`), not for this.
     #[test]
     fn directory_op_result_wire_contract_is_pinned_682() {
-        // v58.0.0 (compat reads) — v57.0.0's digest, as the op gate's.
+        // v59.0.0 (sealed-transport floor) — the four framed key-plane
+        // results removed (a BREAK, with the op gate's bump to 9).
         assert_eq!(
             structural_digest("DirectoryOpResult"),
-            "bf09a0103ca37a06866e6f8160dd01df41c8e10caded5660e3c2fa352b4e9262",
+            "2295b94a42f9da5c7d758c6a0764da0fca8953aaf408dcfd6d672f13a9eff827",
             "DirectoryOpResult's wire shape changed — same fork as the op gate: \
              growth re-pins, a break re-pins AND bumps DIRECTORY_ABI_VERSION."
         );
@@ -5454,17 +5295,15 @@ mod tests {
         unsafe { (directory.vtable.drop)(directory.data) };
     }
 
-    /// #375 — the anti-entropy-critical proof: an anchor-scrubbed record
-    /// for an EXISTING self-signed key_id UPGRADES *through the C-ABI
-    /// capsule* (the shape CIRISEdge's replication bridge holds). Backed by
-    /// a real SqliteBackend so the upgrade plane exists — `Upgraded` is an
-    /// outcome the pre-#375 default (`put_public_key` DO-NOTHING → `Unit`)
-    /// could never produce, so reaching it proves the capsule now routes to
-    /// the real upgrade-aware backend apply, not the insert-only fallback.
+    /// v59.0.0 (sealed-transport floor, operator ruling 2026-10-19) —
+    /// **I1146: the capsule's framed inbound key-plane ops are retired.**
+    /// `ApplyReplicatedKeyRecord` (the #375 upgrade path a pre-v59 Edge
+    /// drove) and `PutIdentityOccurrenceRevocation` answer the typed refusal
+    /// naming the kind, and store nothing; a key arrives as its
+    /// `key:record:v1` row through `ApplyReplicatedAttestation`.
     #[cfg(feature = "sqlite")]
     #[test]
-    fn apply_replicated_key_record_via_capsule_upgrades_sqlite() {
-        use crate::federation::register::ReplicatedKeyOutcome as O;
+    fn i1146_framed_inbound_ops_are_retired_sqlite() {
         use crate::federation::tier_ingest::test_support as ts;
         use crate::federation::types::identity_type;
         use crate::store::backend::Backend;
@@ -5479,92 +5318,64 @@ mod tests {
         });
         let dir: Arc<dyn FederationDirectory> = backend.clone();
         let directory = build_persist_directory(dir.clone());
-
-        // Seed the granting anchor, the node's single `user`-role owner, the
-        // self-signed boot row, and the single-owner binding (owner_of).
-        rt.block_on(async {
-            ts::register_hybrid_key(dir.as_ref(), "cap-anchor").await;
-            ts::register_identity_key(dir.as_ref(), "cap-owner", identity_type::USER).await;
-            dir.apply_replicated_key_record(SignedKeyRecord {
-                record: ts::replicated_key_record(
-                    "cap-node",
-                    identity_type::NODE,
-                    "cap-node",
-                    "cap-node",
-                    "v1",
-                ),
-            })
-            .await
-            .expect("seed self-signed");
-            dir.put_attestation(crate::federation::SignedAttestation {
-                attestation: ts::owner_binding_attestation(
-                    &uuid::Uuid::new_v4().to_string(),
-                    "cap-owner",
-                    "cap-node",
-                ),
-            })
-            .await
-            .expect("owner-binding");
-        });
-
-        // The UPGRADE, driven entirely through the capsule build_op path.
-        let scrubbed = ts::replicated_key_record(
-            "cap-node",
-            identity_type::NODE,
-            "cap-anchor",
-            "cap-anchor",
-            "v1",
-        );
-        let res = run_op(
-            &rt,
-            &directory,
-            &DirectoryOp::ApplyReplicatedKeyRecord {
-                record: SignedKeyRecord { record: scrubbed },
-            },
-        );
-        assert!(
-            matches!(res, DirectoryOpResult::ReplicatedKeyOutcome(O::Upgraded)),
-            "capsule apply must UPGRADE (not DO-NOTHING), got {res:?}"
-        );
-        // The backend row is really anchor-scrubbed now.
-        let row = rt
-            .block_on(dir.lookup_public_key("cap-node"))
-            .expect("lookup")
-            .expect("row");
-        assert_eq!(row.scrub_key_id, "cap-anchor");
-
-        // v24.2.0 (CIRISPersist#565) — a REFUSAL crosses the C-ABI
-        // serialized-op boundary carrying its reason. This is the requirement
-        // that makes the taxonomy worth owning: the capsule serializes the
-        // whole `DirectoryOpResult` to JSON and back, so if the reason did not
-        // survive that trip, the consumer that actually needs it (edge's
-        // replication bridge, which holds an `Arc<dyn FederationDirectory>`
-        // across the capsule) would be back to guessing from a message string.
-        let downgrade = ts::replicated_key_record(
+        let record = ts::replicated_key_record(
             "cap-node",
             identity_type::NODE,
             "cap-node",
             "cap-node",
             "v1",
         );
-        let res = run_op(
+        match run_op(
             &rt,
             &directory,
             &DirectoryOp::ApplyReplicatedKeyRecord {
-                record: SignedKeyRecord { record: downgrade },
+                record: SignedKeyRecord {
+                    record: record.clone(),
+                },
             },
-        );
-        assert!(
-            matches!(
-                res,
-                DirectoryOpResult::ReplicatedKeyOutcome(O::Refused {
-                    reason: crate::federation::register::KeyRefusalReason::Downgrade
-                })
+        ) {
+            DirectoryOpResult::Err(e) => assert!(
+                e.starts_with("federation_envelope_kind_retired: key "),
+                "I1146: {e}"
             ),
-            "capsule must carry the refusal REASON across the boundary, got {res:?}"
+            other => panic!("I1146: the framed key-record op: {other:?}"),
+        }
+        assert!(
+            rt.block_on(dir.lookup_public_key("cap-node"))
+                .unwrap()
+                .is_none(),
+            "I1146: nothing was stored"
         );
-
-        // SAFETY: single-drop, matched vtable.
+        match run_op(
+            &rt,
+            &directory,
+            &DirectoryOp::PutIdentityOccurrenceRevocation {
+                revocation: serde_json::json!({ "identity_occurrence_revocation": {} }),
+            },
+        ) {
+            DirectoryOpResult::Err(e) => assert!(
+                e.starts_with("federation_envelope_kind_retired: identity_occurrence_revocation"),
+                "I1146: {e}"
+            ),
+            other => panic!("I1146: the framed occurrence-revocation op: {other:?}"),
+        }
+        // The row door still takes the key.
+        let row = crate::federation::key_plane::plan_key_record_row(&record, &None).expect("row");
+        let res = run_op(
+            &rt,
+            &directory,
+            &DirectoryOp::ApplyReplicatedAttestation {
+                attestation: crate::federation::SignedAttestation { attestation: row },
+            },
+        );
+        assert!(
+            !matches!(res, DirectoryOpResult::Err(_)),
+            "I1146: the key:record:v1 row is admitted: {res:?}"
+        );
+        assert!(rt
+            .block_on(dir.lookup_public_key("cap-node"))
+            .unwrap()
+            .is_some());
         unsafe { (directory.vtable.drop)(directory.data) };
     }
 

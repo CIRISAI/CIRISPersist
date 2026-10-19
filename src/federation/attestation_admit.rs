@@ -394,9 +394,12 @@ where
         super::key_plane::occurrence_withdrawal_of(dir, &attestation.attestation).await?;
     // v59.0.0 (CIRISPersist#1099, CC 3.3.6.3) — the row as offered, for the
     // self-roster door: an eviction of a live roster key is a proposal.
-    let offered_withdrawal = occurrence_withdrawal
-        .as_ref()
-        .map(|_| attestation.attestation.clone());
+    // The genesis key's eviction (a `withdraws` of its `key:record:v1` row by
+    // another roster key) goes through the same door.
+    let genesis_withdrawal =
+        super::self_roster::genesis_withdrawal_of(dir, &attestation.attestation).await?;
+    let offered_withdrawal = (occurrence_withdrawal.is_some() || genesis_withdrawal.is_some())
+        .then(|| attestation.attestation.clone());
     // v59.0.0 (CIRISPersist#1099) — a proposal or an answer to one, executed
     // after it is stored.
     let roster_row = (super::self_roster::is_proposal_row(&attestation.attestation)
@@ -426,6 +429,9 @@ where
                     (&offered_withdrawal, &occurrence_withdrawal)
                 {
                     super::self_roster::gate_withdrawal(dir, offered, revocation).await?;
+                }
+                if let (Some(offered), Some(genesis)) = (&offered_withdrawal, &genesis_withdrawal) {
+                    super::self_roster::gate_genesis_withdrawal(dir, offered, genesis).await?;
                 }
                 execute_planned(dir, *planned).await?
             }

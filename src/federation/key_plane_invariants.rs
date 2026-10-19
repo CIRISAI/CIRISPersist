@@ -548,8 +548,10 @@ mod run {
         );
     }
 
-    /// I980 — the lazy rehome on sqlite: a pre-V198 state (rows deleted,
-    /// pointers NULL) on a file database, reopened by a fresh backend.
+    /// I980 — the rehome on sqlite: a pre-V198 state (rows deleted, pointers
+    /// NULL) on a file database, reopened by a fresh backend. v59.0.0
+    /// (sealed-transport floor): the rehome is EAGER, at open — the provable
+    /// record has its row before any write.
     #[cfg(feature = "sqlite")]
     #[tokio::test(flavor = "multi_thread")]
     async fn i980_sqlite() {
@@ -584,19 +586,10 @@ mod run {
             .await
             .unwrap();
         b.run_migrations().await.unwrap();
-        assert!(
-            bodies::key_row(b.as_dyn_directory(), &k).await.is_none(),
-            "I980: before the rehome"
-        );
-        // The first key-plane write rehomes.
-        b.put_public_key(crate::federation::SignedKeyRecord {
-            record: bodies::pop_record(&format!("i980-trigger-{t}")),
-        })
-        .await
-        .unwrap();
+        // v59.0.0 — no write in between: the open rehomed it.
         let row = bodies::key_row(b.as_dyn_directory(), &k)
             .await
-            .expect("I980: the provable legacy record is rehomed");
+            .expect("I980: the provable legacy record is rehomed at open");
         assert_eq!(
             row.asserted_at,
             crate::federation::admission::truncate_to_substrate_resolution(scrub_ts),

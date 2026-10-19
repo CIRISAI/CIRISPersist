@@ -80,9 +80,8 @@ threat-model citations because this crate's audit story is the point.
   ACTIVE `identity_occurrence` under it whose key is `user`-role (a node's own
   key and an agent's key are not roster keys; their occurrences are KEM
   targets, written as before). An ADDITION (a signed occurrence of a user-role
-  key not on the roster) or an EVICTION (a framed occurrence revocation, or a
-  `withdraws` against the pair's `identity:occurrence:v1` row, of a live
-  roster key) signed by one key of a roster of TWO OR MORE is a proposal
+  key not on the roster) or an EVICTION (a `withdraws` against the pair's
+  `identity:occurrence:v1` row, of a live roster key) signed by one key of a roster of TWO OR MORE is a proposal
   decided by `two_path::decide_all` under `W_SELF_SECS = 86 400` with target
   silence for evictions. At one key the addition still lands at once (the
   add-device approval is unchanged). A node's own key is not a roster key: a
@@ -91,9 +90,9 @@ threat-model citations because this crate's audit story is the point.
 - Witnesses I1130–I1140 on memory, sqlite and postgres, each door condition
   with a mutation that turns it red.
 - Every door that can change a roster asks `self_roster::gate` after its
-  signature gate and before any write: `put_identity_occurrence` and
-  `put_identity_occurrence_revocation` on memory, sqlite and postgres, and the
-  attestation door for an occurrence `withdraws`. A change that lands proceeds
+  signature gate and before any write: `put_identity_occurrence` on memory, sqlite and postgres, and the attestation
+  door for an occurrence `withdraws` (v59's sealed-transport cut removed the
+  framed revocation door; see Removed below). A change that lands proceeds
   exactly as before. One that does not is HELD and the door returns the new
   **`Error::SelfRosterNotLanded`** (`kind()` `federation_self_roster_not_landed`,
   Python `ValueError("federation_self_roster_not_landed: <decision>: <proposal_id>")`),
@@ -130,22 +129,22 @@ threat-model citations because this crate's audit story is the point.
 - Python: `Engine.self_roster_standing(identity_key_id)` (every open proposal,
   decided now), `Engine.execute_self_roster_due()`,
   `Engine.self_roster_vote_envelope(identity_key_id, proposal_id, assent)`.
-- **Compat (pre-v58 peers):** a pending proposal reaches neither the framed
-  occurrence/revocation planes nor the `identity:occurrence:v1` row stream;
-  once it lands it is served both ways. A v58 peer receives the proposal row
-  and refuses it (its signature is the carried object's).
+- **What a peer sees:** a pending proposal is not on the `identity:occurrence:v1`
+  row stream (and, since the sealed-transport cut below, there is no framed
+  carriage); once it lands it is served as a row. A v58 peer receives the
+  proposal row and refuses it (its signature is the carried object's).
 - Staged, not refused: the `device-<hex>-<fp>` roster key id
   (`self_roster::DEVICE_DERIVED_ROSTER_KEY_PREFIX`, `CLM-self-roster-key-id`)
   waits for CIRISServer#793 to ship `<fedID>-<fp>`.
-- **The genesis key is evictable** (CC 3.3.6.3): a framed occurrence
-  revocation of the self pair `(fedID, fedID)` signed by ANOTHER live roster
-  key is a roster eviction through the two paths. Once it lands the genesis
+- **The genesis key is evictable** (CC 3.3.6.3): a `withdraws` against the
+  genesis key's own `key:record:v1` row, signed by ANOTHER live roster key (and
+  attested to the fedID), is a roster eviction through the two paths. Once it lands the genesis
   key leaves the roster, `signer_acts_for` no longer lets it act for the self,
   and it is no steward; the fedID string keeps naming the self and its other
   keys act as it (`self_roster::genesis_evicted_at`, terminal: a later
-  assertion of the pair does not re-establish it). The genesis key revoking
-  its own pair, or a `withdraws` of the pair's row, retires its transport
-  self-occurrence as before and evicts nothing (I1141).
+  assertion does not re-establish it); the record stays held, so every row the
+  key signed while live still verifies. The genesis key withdrawing its own
+  record evicts nothing (I1141).
 - Not carried in this cut: re-asserting a live key's occurrence by another
   roster key (not a roster change; stays `signer_acts_for`).
 
@@ -188,6 +187,74 @@ behaviour-preserving:
   `consensus_protocol` (`quorum:M/N`, unanimous, weighted, custom,
   reverse_quorum) over co-signatures on one row at one instant: no window, no
   pending state, and a declared `M` is not `strict_majority`.
+
+### Removed — the framed key-plane compat reads (sealed-transport floor, operator ruling 2026-10-19)
+
+CC 5.3.3.5 E1 option (i) puts every RNS byte under a per-link hybrid seal with
+no classical fallback, enforced at once, so an unsealed pre-v58 peer is
+unreachable. v58's compat reads served exactly those peers; v59 drops them.
+Edge adopts v59 only in its sealed cut.
+
+- **Removed** from the `FederationDirectory` trait, the memory / sqlite /
+  postgres backends, the directory double, the capsule and the Python surface
+  (and its `.pyi`): `list_signed_key_records_since`,
+  `list_signed_revocations_since`, `list_signed_identity_occurrences_since`,
+  `list_signed_identity_occurrence_revocations_since`,
+  `list_signed_identity_occurrence_revocations_for`,
+  `put_identity_occurrence_revocation`, the types
+  `SignedIdentityOccurrenceRevocation` and `ServedIdentityOccurrenceRevocation`,
+  `admission::verify_signed_identity_occurrence_revocation`, and the framed
+  wire-index entries, reloads and refs of the four kinds (`Key`, `Revocation`,
+  `IdentityOccurrence`, `IdentityOccurrenceRevocation`; the four
+  `EnvelopeKind`s stay in the hashed vocabulary). Capsule ops
+  `ListSignedKeyRecordsSince`, `ListSignedRevocationsSince`,
+  `ListSignedIdentityOccurrencesSince`,
+  `ListSignedIdentityOccurrenceRevocationsSince` and their results are gone.
+  The v31.1.0 boot backfill of the framed `Revocation` index kind is gone with
+  it. The v58 mixed-fleet authoring rule (the framed occurrence revocation
+  beside the `withdraws` route) is retired.
+- **Refused inbound**: the framed key-record replication door
+  (`ApplyReplicatedKeyRecord` op, `Engine::apply_replicated_key_record`, the
+  Python `apply_replicated_key_record`) and the `PutIdentityOccurrenceRevocation`
+  op (its payload now raw JSON) answer the new terminal
+  **`Error::EnvelopeKindRetired`** — `kind()` `federation_envelope_kind_retired`,
+  Display `federation_envelope_kind_retired: <kind> …` with `<kind>` one of
+  `key`, `revocation`, `identity_occurrence`, `identity_occurrence_revocation`
+  (`replication_policy::retired_detail`; general, so any kind retired later
+  reuses it); Python `ValueError`, the type those doors' refusals had. A key
+  replicates as its `key:record:v1` row (`ApplyReplicatedAttestation`). The
+  trait method `apply_replicated_key_record` stays as the `key:record:v1` row
+  door's executor, not a wire door.
+- **Canonical occurrence-revocation doors**: a user-role self's roster key is
+  evicted through the two-path proposal (a `withdraws` against its
+  `identity:occurrence:v1` row); a node or agent occurrence is a single-signer
+  `withdraws` on its row.
+- **`DIRECTORY_ABI_VERSION` 8 → 9** (ops removed, one payload retyped).
+  `DirectoryOp` digest `784929785eec65791e29a7c00cc24914f9f1751ad4e098d3e04b550e86eec931`,
+  `DirectoryOpResult` digest `2295b94a42f9da5c7d758c6a0764da0fca8953aaf408dcfd6d672f13a9eff827`.
+- **Migration (one-way, at first open)**: the v58 lazy rehome is made eager —
+  `run_migrations` ends with `rehome_key_plane_at_open` on sqlite and postgres,
+  so every v57-shape key record, key revocation and signed occurrence that
+  verifies has its key-plane row before anything reads or serves. A record that
+  does not verify is held without a row (as v58) and counted in the one log
+  line the open writes (`KeyPlaneRehomeReport`). **V200** marks each framed
+  occurrence revocation already held as `legacy_framed`: it cannot be re-signed
+  as a `withdraws`, so its projection row stays; the occurrence fold keeps
+  reading it as revoked, and nothing un-revokes it.
+- Witnesses I1144 (a V195 store with keys, a key revocation, occurrences, a
+  route and a framed occurrence revocation migrates forward: every object is a
+  row or a fold, no key or route lost, the legacy-revoked occurrence stays
+  revoked; sqlite + postgres), I1145 (the framed reads refuse or resolve
+  nothing; every backend), I1146 (the capsule's retired ops answer the token),
+  I1147 (from disk: the removed symbols stay gone; carries v58's I1123). The
+  v58 compat witnesses I1120–I1123 and the framed-cursor witnesses
+  (`exercise_key_mutation_moves_serve_position`,
+  `exercise_late_replicated_key_record_is_served`, the #668/#682/#655 cursor
+  pins) are removed with what they measured; I980 now asserts the rehome at
+  open.
+- The genesis key's eviction (#1099 above) moves off the framed revocation: it
+  is a `withdraws` against the genesis key's own `key:record:v1` row, signed by
+  another live roster key and decided by the two paths; the record stays held.
 
 ## [58.0.0] - 2026-10-18
 

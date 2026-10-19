@@ -64,6 +64,47 @@ pub(crate) mod bodies {
         crate::federation::steward_purge::test_clock::set(None);
     }
 
+    /// `signer`'s `withdraws` of `f`'s `key:record:v1` row, attested to `f`:
+    /// the genesis key's eviction when `signer != f`.
+    pub(crate) async fn genesis_withdrawal(
+        d: &dyn FederationDirectory,
+        signer: &str,
+        f: &str,
+    ) -> Attestation {
+        let one = std::num::NonZeroU32::new(50).expect("n");
+        let mut pages = crate::federation::attestation_query::AttestationQuery::to(f, one)
+            .dimension(crate::federation::key_plane::KEY_RECORD_DIMENSION)
+            .pages();
+        let mut target = None;
+        while let Some(page) = pages.next(d).await.unwrap() {
+            target = page
+                .into_iter()
+                .find(|r| {
+                    crate::federation::key_plane::key_record_of_row(r)
+                        .is_some_and(|k| k.key_id == f)
+                })
+                .or(target);
+        }
+        let target = target.expect("the self holds its key:record:v1 row");
+        let id = uuid::Uuid::new_v4().to_string();
+        let mut w = ts::bare_attestation(
+            &id,
+            signer,
+            f,
+            &serde_json::json!({
+                "dimension": crate::federation::key_plane::KEY_RECORD_DIMENSION,
+                "references_attestation_id": target.attestation_id,
+                "withdrawal_reason": "the genesis key is lost",
+            }),
+        );
+        w.attestation_type = attestation_type::WITHDRAWS.into();
+        w.weight = None;
+        w.asserted_at = ms_now();
+        w.scrub_timestamp = w.asserted_at;
+        ts::seal_row_in_place(signer, &mut w);
+        w
+    }
+
     /// A self `f` with user-role devices `devices`, registered.
     pub(crate) async fn keys(d: &dyn FederationDirectory, ids: &[&str]) {
         for k in ids {
@@ -265,9 +306,9 @@ pub(crate) mod bodies {
     pub(crate) async fn i1133_the_thief_cannot_evict(d: &dyn FederationDirectory, tag: &str) {
         let (f, thief, owner) = (format!("f-{tag}"), format!("t-{tag}"), format!("o-{tag}"));
         three(d, &f, &thief, &owner).await;
-        let rev = ts::signed_occurrence_revocation(&thief, &f, &owner, ms_now()).await;
+        let w = ts::occurrence_withdrawal(d, &thief, &f, &owner, ms_now()).await;
         let p = pending(
-            d.put_identity_occurrence_revocation(rev).await,
+            d.put_attestation(w).await.map(|_| ()),
             "I1133: the thief's eviction",
         );
         assert!(active(d, &f, &owner).await, "I1133: refused at age 0");
@@ -532,11 +573,17 @@ pub(crate) mod bodies {
             format!("d2-{tag}"),
             format!("d3-{tag}"),
         );
-        three(d, &f, &d1, &d2).await;
-        keys(d, &[&d3]).await;
-        let rev = ts::signed_occurrence_revocation(&d1, &f, &f, ms_now()).await;
+        // The genesis key proves possession, so its record is a key:record:v1 row.
+        ts::register_identity_key(d, &f, it::USER).await;
+        keys(d, &[&d1, &d2, &d3]).await;
+        add(d, &f, &f, &d1, ms_now()).await.expect("one key");
+        let p2 = pending(add(d, &f, &f, &d2, ms_now()).await, "f adds d2");
+        vote(d, &d1, &f, &p2, true).await;
+        let w = genesis_withdrawal(d, &d1, &f).await;
         let p = pending(
-            d.put_identity_occurrence_revocation(rev).await,
+            d.put_attestation(SignedAttestation { attestation: w })
+                .await
+                .map(|_| ()),
             "I1141: d1 proposes the genesis key's eviction",
         );
         assert!(sr::roster_now(d, &f).await.unwrap().contains(&f));
@@ -564,19 +611,23 @@ pub(crate) mod bodies {
             "I1141: the self goes on without its genesis key"
         );
 
-        // The genesis key retiring its own pair is not an eviction.
+        // The key record stays held: every row the genesis key signed while
+        // live still verifies.
+        assert!(d.lookup_public_key(&f).await.unwrap().is_some());
+
+        // The genesis key withdrawing its own record is not an eviction.
         let (g, e1) = (format!("g-{tag}"), format!("e1-{tag}"));
-        keys(d, &[&g, &e1]).await;
+        ts::register_identity_key(d, &g, it::USER).await;
+        keys(d, &[&e1]).await;
         add(d, &g, &g, &e1, ms_now()).await.expect("one key");
-        d.put_identity_occurrence_revocation(
-            ts::signed_occurrence_revocation(&g, &g, &g, ms_now()).await,
-        )
-        .await
-        .expect("I1141: the genesis key retires its own self pair at once");
         assert!(
-            sr::roster_now(d, &g).await.unwrap().contains(&g),
-            "I1141: its own revocation evicts nothing"
+            sr::genesis_withdrawal_of(d, &genesis_withdrawal(d, &g, &g).await)
+                .await
+                .unwrap()
+                .is_none(),
+            "I1141: the genesis key's own withdraws evicts nothing"
         );
+        assert!(sr::roster_now(d, &g).await.unwrap().contains(&g));
     }
 
     /// **I1142** — the steward check's instant is bounded by W at admission
@@ -707,13 +758,6 @@ pub(crate) mod bodies {
         keys(d, &[&f, &d1, &d2]).await;
         add(d, &f, &f, &d1, ms_now()).await.expect("one key");
         let p = pending(add(d, &d1, &f, &d2, ms_now()).await, "I1138");
-        let framed = |d2: String| async move {
-            d.list_signed_identity_occurrences_since(None, 10_000)
-                .await
-                .unwrap()
-                .iter()
-                .any(|s| s.occurrence.identity_occurrence.occurrence_key_id == d2)
-        };
         let as_row = |d2: String| async move {
             crate::federation::key_plane::test_support::served_identity_occurrences(d, 10_000)
                 .await
@@ -722,18 +766,10 @@ pub(crate) mod bodies {
                 .any(|s| s.occurrence.identity_occurrence.occurrence_key_id == d2)
         };
         assert!(
-            !framed(d2.clone()).await,
-            "I1138: a pending add is served framed"
-        );
-        assert!(
             !as_row(d2.clone()).await,
             "I1138: a pending add is served as a row"
         );
         vote(d, &f, &f, &p, true).await;
-        assert!(
-            framed(d2.clone()).await,
-            "I1138: the landed add is served framed"
-        );
         assert!(
             as_row(d2.clone()).await,
             "I1138: the landed add is served as a row"

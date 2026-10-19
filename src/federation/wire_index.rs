@@ -250,21 +250,12 @@ pub async fn reload_record_bytes(
         Error::Backend(format!("signed_wire_index reload {what}: {e}"))
     };
     let bytes = match kind {
-        // v58.0.0 (compat reads, operator ruling 2026-10-18) — the key plane
-        // rides as attestation rows (`key:record:v1`, `key:revocation:v1`,
-        // `identity:occurrence:v1`: their entries are `Attestation`) AND keeps
-        // its four framed kinds below, so a pre-v58 peer following a framed ref
-        // is still served the framed object it can apply.
-        "Key" => {
-            let key_id = record_key_field(record_key_json, "key_id")?;
-            match dir.lookup_public_key(&key_id).await? {
-                Some(record) => Some(
-                    serde_json::to_vec(&super::SignedKeyRecord { record })
-                        .map_err(|e| to_bytes(e, "Key"))?,
-                ),
-                None => None,
-            }
-        }
+        // v59.0.0 (sealed-transport floor, operator ruling 2026-10-19) — the
+        // key plane's four framed kinds are retired: it rides only as
+        // attestation rows (`key:record:v1`, `key:revocation:v1`,
+        // `identity:occurrence:v1`: their entries are `Attestation`). A framed
+        // ref resolves to nothing.
+        "Key" | "Revocation" | "IdentityOccurrence" | "IdentityOccurrenceRevocation" => None,
         "Attestation" => {
             let attestation_id = record_key_field(record_key_json, "attestation_id")?;
             match dir.get_attestation(&attestation_id).await? {
@@ -287,40 +278,6 @@ pub async fn reload_record_bytes(
                 _ => None,
             }
         }
-        // v31.1.0 (CIRISPersist#655) — the key-level revocation plane. Reloads
-        // targeted through `revocations_for` (the subject read) and wraps in
-        // the SAME `SignedRevocation` shape `list_signed_revocations_since`
-        // returns, so both derivations hash identical bytes.
-        // v52.0.0 (#784) — located by the SUBJECT digest, never the
-        // label-bearing key_id (a digest-only row has no key_id at all).
-        "Revocation" => {
-            let subject = record_key_field(record_key_json, "revoked_key_sha256_ed25519_raw")?;
-            let revocation_id = record_key_field(record_key_json, "revocation_id")?;
-            let rows = dir.revocations_for_subject(&subject).await?;
-            match rows.into_iter().find(|r| r.revocation_id == revocation_id) {
-                Some(revocation) => Some(
-                    serde_json::to_vec(&super::SignedRevocation { revocation })
-                        .map_err(|e| to_bytes(e, "Revocation"))?,
-                ),
-                None => None,
-            }
-        }
-        "IdentityOccurrence" => {
-            let identity_key_id = record_key_field(record_key_json, "identity_key_id")?;
-            let occurrence_key_id = record_key_field(record_key_json, "occurrence_key_id")?;
-            let rows = dir
-                .list_signed_identity_occurrences_for(&identity_key_id)
-                .await?;
-            match rows
-                .into_iter()
-                .find(|r| r.identity_occurrence.occurrence_key_id == occurrence_key_id)
-            {
-                Some(r) => {
-                    Some(serde_json::to_vec(&r).map_err(|e| to_bytes(e, "IdentityOccurrence"))?)
-                }
-                None => None,
-            }
-        }
         "TransportDestination" => {
             let occurrence_key_id = record_key_field(record_key_json, "occurrence_key_id")?;
             let transport_kind = record_key_field(record_key_json, "transport_kind")?;
@@ -334,23 +291,6 @@ pub async fn reload_record_bytes(
                 Some(r) => {
                     Some(serde_json::to_vec(&r).map_err(|e| to_bytes(e, "TransportDestination"))?)
                 }
-                None => None,
-            }
-        }
-        "IdentityOccurrenceRevocation" => {
-            let identity_key_id = record_key_field(record_key_json, "identity_key_id")?;
-            let occurrence_key_id = record_key_field(record_key_json, "occurrence_key_id")?;
-            let rows = dir
-                .list_signed_identity_occurrence_revocations_for(&identity_key_id)
-                .await?;
-            match rows
-                .into_iter()
-                .find(|r| r.identity_occurrence_revocation.occurrence_key_id == occurrence_key_id)
-            {
-                Some(r) => Some(
-                    serde_json::to_vec(&r)
-                        .map_err(|e| to_bytes(e, "IdentityOccurrenceRevocation"))?,
-                ),
                 None => None,
             }
         }
@@ -615,26 +555,10 @@ pub async fn wire_refs_for_subject(
 ) -> Result<Vec<(&'static str, String, String)>, Error> {
     let mut out = Vec::new();
 
-    // Key — no subject-scoped signed read; filtered from the same bulk read
-    // the index is built from, which is what keeps it byte-exact.
-    // v31.4.0 (CIRISPersist#682) — hashed as the `SignedKeyRecord` wrapper, NOT
-    // as the `ServedKeyRecord` the cursor now returns. `admitted_at` is THIS
-    // node's position on the record and must stay out of a content hash, or one
-    // key record would hash differently on every node holding it — and the ref
-    // this node advertised would not resolve against the row it stored, because
-    // `entry_as_stored` reloads through `lookup_public_key` and wraps in
-    // `SignedKeyRecord`. Same treatment as the revocation plane (#655).
-    // v58.0.0 (compat reads, operator ruling 2026-10-18) — the subject's own
-    // `key:record:v1` row and the `identity:occurrence:v1` rows of its
-    // occurrences are attested ABOUT it, so they are refs of the Attestation
-    // slice below; the framed refs stay beside them for pre-v58 peers.
-    for r in dir.list_signed_key_records_since(None, u32::MAX).await? {
-        if r.record.key_id == subject_key_id {
-            let rk = record_key(&[("key_id", &r.record.key_id)]);
-            let wrapped = super::SignedKeyRecord { record: r.record };
-            out.push(("Key", content_hash_of(&wrapped)?, rk));
-        }
-    }
+    // v59.0.0 (sealed-transport floor) — the subject's own `key:record:v1` row
+    // and the `identity:occurrence:v1` rows of its occurrences are attested
+    // ABOUT it, so they are refs of the Attestation slice below; the framed
+    // key-plane refs are retired.
     // Every attestation about the subject is a ref ("what is about me"):
     // the whole slice, walked in pages.
     let mut pages = AttestationQuery::to(subject_key_id, FOLD_PAGE).pages();
@@ -654,13 +578,6 @@ pub async fn wire_refs_for_subject(
     // A revocation OF a key is squarely "what is about me", which is the axis
     // this read answers.
     for revocation in dir.revocations_for(subject_key_id).await? {
-        let rk = record_key(&[
-            (
-                "revoked_key_sha256_ed25519_raw",
-                &revocation.revoked_key_sha256_ed25519_raw,
-            ),
-            ("revocation_id", &revocation.revocation_id),
-        ]);
         // v58.0.0 (CIRISPersist#991, CC 2.4.1.1) — a revocation of the key is
         // also a `key:revocation:v1` row attested by its REVOKER (the subject is
         // the digest the row carries), so it is not in the Attestation slice
@@ -670,56 +587,6 @@ pub async fn wire_refs_for_subject(
             let row_rk = record_key(&[("attestation_id", &row.attestation_id)]);
             out.push(("Attestation", content_hash_of(&row)?, row_rk));
         }
-        let wrapped = super::SignedRevocation { revocation };
-        let hash = content_hash_of(&wrapped)?;
-        // v31.1.0 (CIRISPersist#655, PR #667 round-3) — ADVERTISE ONLY WHAT
-        // THIS NODE CAN SERVE.
-        //
-        // `signed_wire_index` is populated by the per-put hook, so on a
-        // database upgraded from before this cut the pre-existing revocations
-        // are not in it until the v31 migration's boot-time probe backfills
-        // them (see `migration.rs` — no operator action; this comment used to
-        // say "until an operator runs `rebuild_signed_wire_index`" and went
-        // stale when that became automatic).
-        // Advertising their hashes anyway hands a peer refs that resolve to
-        // `None` — a plane visible in principle and unreachable in practice,
-        // which is #655's own defect arriving through DEPLOYMENT ORDER rather
-        // than through a missing cursor.
-        //
-        // The check is the point-read itself, so "can I serve this?" is
-        // answered by the thing that would have to serve it rather than by a
-        // second rule that could disagree, and it self-corrects the moment the
-        // backfill runs.
-        //
-        // Cost, stated honestly rather than as "one indexed lookup": the point
-        // read is an indexed `signed_wire_index` hit AND a reload of the record
-        // through `reload_record_bytes`, whose `Revocation` arm re-reads the
-        // subject's revocations. So a subject holding n revocations pays n
-        // subject-reads here. n is 0 or 1 for essentially every key, and the
-        // alternative — advertising refs that resolve to nothing — is the
-        // defect. If a subject with many revocations ever becomes ordinary,
-        // this wants a batch "which of these hashes are indexed" read rather
-        // than a loop.
-        if dir
-            .lookup_signed_record_by_content_hash("Revocation", &hash)
-            .await?
-            .is_some()
-        {
-            out.push(("Revocation", hash, rk));
-        }
-    }
-    for r in dir
-        .list_signed_identity_occurrences_for(subject_key_id)
-        .await?
-    {
-        let rk = record_key(&[
-            ("identity_key_id", &r.identity_occurrence.identity_key_id),
-            (
-                "occurrence_key_id",
-                &r.identity_occurrence.occurrence_key_id,
-            ),
-        ]);
-        out.push(("IdentityOccurrence", content_hash_of(&r)?, rk));
     }
     // Transport destinations hang off the OCCURRENCE, so the subject's
     // occurrences are the key set — a subject with no occurrence has no routes.
@@ -739,22 +606,6 @@ pub async fn wire_refs_for_subject(
             out.push(("TransportDestination", content_hash_of(&r)?, rk));
         }
     }
-    for r in dir
-        .list_signed_identity_occurrence_revocations_for(subject_key_id)
-        .await?
-    {
-        let rk = record_key(&[
-            (
-                "identity_key_id",
-                &r.identity_occurrence_revocation.identity_key_id,
-            ),
-            (
-                "occurrence_key_id",
-                &r.identity_occurrence_revocation.occurrence_key_id,
-            ),
-        ]);
-        out.push(("IdentityOccurrenceRevocation", content_hash_of(&r)?, rk));
-    }
     Ok(out)
 }
 
@@ -771,19 +622,9 @@ pub async fn all_kind_hash_keys(
     dir: &dyn super::FederationDirectory,
 ) -> Result<Vec<(&'static str, String, String)>, Error> {
     let mut out = Vec::new();
-    // v31.4.0 (CIRISPersist#682) — hashed as the `SignedKeyRecord` wrapper, NOT
-    // as the `ServedKeyRecord` the cursor now returns: `admitted_at` is this
-    // node's position on the record and must stay out of a content hash, or one
-    // key record would hash differently on every node holding it. Same
-    // treatment as the revocation plane below (#655).
-    // v58.0.0 (compat reads, operator ruling 2026-10-18) — the key plane is
-    // indexed twice: as attestation rows (the Attestation scan below) and as
-    // its four framed kinds, which a pre-v58 peer still asks for.
-    for r in dir.list_signed_key_records_since(None, u32::MAX).await? {
-        let rk = record_key(&[("key_id", &r.record.key_id)]);
-        let wrapped = super::SignedKeyRecord { record: r.record };
-        out.push(("Key", content_hash_of(&wrapped)?, rk));
-    }
+    // v59.0.0 (sealed-transport floor) — the key plane is indexed once, as its
+    // attestation rows (the Attestation scan below); its four framed kinds
+    // are retired.
     // Federation-tier-only by construction (the E5 invariant).
     // v36.0.0 (#668) — hashed as the bare `Attestation`, never the
     // `ServedAttestation` wrapper: `admitted_at` is node-local and must stay
@@ -792,38 +633,6 @@ pub async fn all_kind_hash_keys(
     for a in dir.list_attestations_since(None, u32::MAX).await? {
         let rk = record_key(&[("attestation_id", &a.attestation.attestation_id)]);
         out.push(("Attestation", content_hash_of(&a.attestation)?, rk));
-    }
-    // v31.1.0 (CIRISPersist#655) — the key-level revocation plane. Hashed as
-    // the `SignedRevocation` wrapper, NOT as the `ServedRevocation` the cursor
-    // returns: `admitted_at` is this node's position on the record and must
-    // stay out of a content hash, or one revocation would hash differently on
-    // every node holding it.
-    for r in dir.list_signed_revocations_since(None, u32::MAX).await? {
-        let rk = record_key(&[
-            (
-                "revoked_key_sha256_ed25519_raw",
-                &r.revocation.revoked_key_sha256_ed25519_raw,
-            ),
-            ("revocation_id", &r.revocation.revocation_id),
-        ]);
-        let wrapped = super::SignedRevocation {
-            revocation: r.revocation,
-        };
-        out.push(("Revocation", content_hash_of(&wrapped)?, rk));
-    }
-    for r in dir
-        .list_signed_identity_occurrences_since(None, u32::MAX)
-        .await?
-    {
-        let o = &r.occurrence;
-        let rk = record_key(&[
-            ("identity_key_id", &o.identity_occurrence.identity_key_id),
-            (
-                "occurrence_key_id",
-                &o.identity_occurrence.occurrence_key_id,
-            ),
-        ]);
-        out.push(("IdentityOccurrence", content_hash_of(o)?, rk));
     }
     for r in dir
         .list_signed_transport_destinations_since(None, u32::MAX)
@@ -838,23 +647,6 @@ pub async fn all_kind_hash_keys(
             ("transport_kind", &d.transport_destination.transport_kind),
         ]);
         out.push(("TransportDestination", content_hash_of(d)?, rk));
-    }
-    for r in dir
-        .list_signed_identity_occurrence_revocations_since(None, u32::MAX)
-        .await?
-    {
-        let v = &r.revocation;
-        let rk = record_key(&[
-            (
-                "identity_key_id",
-                &v.identity_occurrence_revocation.identity_key_id,
-            ),
-            (
-                "occurrence_key_id",
-                &v.identity_occurrence_revocation.occurrence_key_id,
-            ),
-        ]);
-        out.push(("IdentityOccurrenceRevocation", content_hash_of(v)?, rk));
     }
     for r in dir.list_signed_families_since(None, u32::MAX).await? {
         let rk = record_key(&[("family_key_id", &r.family.family.family_key_id)]);

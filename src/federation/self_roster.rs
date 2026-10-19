@@ -18,8 +18,9 @@
 //! `formal/self_roster`'s **unilateral** configuration, which a stolen device
 //! wins in two steps (`unilateral3_stolen`). Now an addition (a signed
 //! `identity_occurrence` of a user-role key not on the roster) and an eviction
-//! (a framed occurrence revocation, or a `withdraws` against the pair's
-//! `identity:occurrence:v1` row, of a live roster key) are each a
+//! (a `withdraws` against the pair's `identity:occurrence:v1` row, of a live
+//! roster key; for the genesis key, against its own `key:record:v1` row) are
+//! each a
 //! **proposal**, decided by THE shared two-path function
 //! ([`super::two_path::decide_all`]) under [`policy`]:
 //!
@@ -30,9 +31,9 @@
 //!   strict majority of the other members objecting, and for an eviction only
 //!   if the target signed nothing since the proposal arrived.
 //!
-//! Every door that can change a roster — `put_identity_occurrence` and
-//! `put_identity_occurrence_revocation` on all three backends, and the
-//! attestation door for an occurrence `withdraws` — asks [`gate`] after its
+//! Every door that can change a roster — `put_identity_occurrence` on all
+//! three backends, and the attestation door for a `withdraws` of an occurrence
+//! row or of the genesis key's record — asks [`gate`] after its
 //! signature gate and before any write. A change that lands proceeds exactly
 //! as before. One that does not is HELD as a proposal row and the door
 //! returns [`Error::SelfRosterNotLanded`]; when it later lands (an answer
@@ -60,22 +61,15 @@
 //! counts on all of them. Answers are ordinary rows a roster key signs
 //! ([`vote_envelope`]).
 //!
-//! **What a pre-v58 peer sees.** Nothing pending: the framed occurrence and
-//! revocation planes serve the projection tables, which a proposal never
-//! reaches. Once a proposal lands, the effect is written as any other (the
-//! occurrence and its `identity:occurrence:v1` row; the revocation or the
-//! `withdraws` row) and is served framed and as a row. A v58 peer receives the
-//! proposal row itself on the attestation stream and refuses it (its
-//! signature is the carried object's, which a v58 generic verify does not
-//! read): it never applies a pending change as an effect.
+//! **What a peer sees.** Nothing pending: a proposal is not an
+//! `identity:occurrence:v1` row or a `withdraws`, and (v59.0.0, the
+//! sealed-transport cut) there is no framed carriage. Once a proposal lands
+//! the effect is written as any other row. A v58 peer receives the proposal
+//! row itself and refuses it (its signature is the carried object's, which a
+//! v58 generic verify does not read): it never applies a pending change.
 //!
 //! # Not carried in this cut (named, not hidden)
 //!
-//! - **The genesis key's eviction.** CC rules it evictable; no row carries it
-//!   yet without colliding with the transport self-occurrence's revocation
-//!   (`identity == occurrence`), so the door does not treat a revocation of
-//!   the self-pair as a roster change and `signer_acts_for` still lets the
-//!   genesis key act. Reported to CC.
 //! - **Re-asserting a live key's occurrence** (new KEM keys, a new transport
 //!   binding) is not a roster change and stays a `signer_acts_for` write.
 
@@ -88,10 +82,7 @@ use super::two_path::{
     self, Answers, LandingPath, Proposal, ProposalKind, TwoPathDecision, TwoPathPolicy,
     TwoPathRefusal,
 };
-use super::types::{
-    attestation_type, identity_type, Attestation, SignedIdentityOccurrence,
-    SignedIdentityOccurrenceRevocation,
-};
+use super::types::{attestation_type, identity_type, Attestation, SignedIdentityOccurrence};
 use super::{Error, FederationDirectory};
 
 /// `W_self` (CC 3.3.6.3): the lone path's window, 86 400 s.
@@ -146,10 +137,9 @@ pub mod field {
 pub mod carrier {
     /// A signed `identity_occurrence` (an addition).
     pub const IDENTITY_OCCURRENCE: &str = "identity_occurrence";
-    /// A `withdraws` row against the pair's `identity:occurrence:v1` row.
+    /// A `withdraws` row against the pair's `identity:occurrence:v1` row, or
+    /// (the genesis key's eviction) against the genesis key's `key:record:v1`.
     pub const WITHDRAWS: &str = "withdraws";
-    /// A framed signed occurrence revocation.
-    pub const OCCURRENCE_REVOCATION: &str = "identity_occurrence_revocation";
 }
 
 /// The node's clock for this door: THE purge clock (one clock read per door
@@ -297,13 +287,13 @@ where
 
 /// **Was the genesis key of `identity` evicted by `at`?** (CC 3.3.6.3: "the
 /// genesis key is roster key one and nothing more … the string survives as
-/// the self's name if that key is later evicted"). Its eviction is a SIGNED
-/// framed revocation of the self pair `(identity, identity)` by a key OTHER
-/// than the genesis key, in effect at `at` — the only shape the door lets
-/// through ([`gate`], two paths). It is terminal: unlike an occurrence
-/// (#421), a later assertion of the pair does not re-establish it. A
-/// revocation of the pair the genesis key signs itself, or a `withdraws` of
-/// the pair's row, retires its transport self-occurrence and evicts nothing.
+/// the self's name if that key is later evicted"). Its eviction is a held
+/// `withdraws` against the genesis key's own `key:record:v1` row, signed by a
+/// key OTHER than the genesis key at or before `at` — the only shape the door
+/// lets through ([`gate`], two paths; [`genesis_withdrawal_of`]). The record
+/// stays held (a key record's `withdraws` moves nothing on the key plane), so
+/// every row the key signed while live still verifies. It is terminal: no
+/// later assertion re-establishes it.
 pub async fn genesis_evicted_at<D>(
     dir: &D,
     identity: &str,
@@ -312,16 +302,52 @@ pub async fn genesis_evicted_at<D>(
 where
     D: FederationDirectory + ?Sized,
 {
-    Ok(dir
-        .list_signed_identity_occurrence_revocations_for(identity)
-        .await?
-        .iter()
-        .any(|r| {
-            let row = &r.identity_occurrence_revocation;
-            row.occurrence_key_id == identity
-                && r.attesting_key_id != identity
-                && row.effective_at <= at
-        }))
+    let mut pages = super::attestation_query::AttestationQuery::to(
+        identity,
+        super::attestation_query::FOLD_PAGE,
+    )
+    .types(&[attestation_type::WITHDRAWS])
+    .pages();
+    while let Some(page) = pages.next(dir).await? {
+        for w in page {
+            if w.attesting_key_id != identity
+                && w.asserted_at <= at
+                && genesis_withdrawal_of(dir, &w).await?.as_deref() == Some(identity)
+            {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// The self whose genesis key `row` evicts, when it is one: a `withdraws`
+/// attested to a user-role key `F`, naming `F`'s held `key:record:v1` row,
+/// signed by a key other than `F`. `None` for any other row (the genesis key
+/// withdrawing its own record is not an eviction).
+pub async fn genesis_withdrawal_of<D>(dir: &D, row: &Attestation) -> Result<Option<String>, Error>
+where
+    D: FederationDirectory + ?Sized,
+{
+    if row.attestation_type != attestation_type::WITHDRAWS {
+        return Ok(None);
+    }
+    let Some(target_id) =
+        super::precedence::references_attestation_id_from_envelope(&row.attestation_envelope)
+    else {
+        return Ok(None);
+    };
+    let Some(target) = dir.get_attestation(target_id).await? else {
+        return Ok(None);
+    };
+    let Some(record) = super::key_plane::key_record_of_row(&target) else {
+        return Ok(None);
+    };
+    let f = record.key_id;
+    if row.attesting_key_id == f || row.attested_key_id != f || !is_user_key(dir, &f).await? {
+        return Ok(None);
+    }
+    Ok(Some(f))
 }
 
 /// W, the past-freshness window (CIRISPersist#1049; CC 2.6.7, ruled 72 h):
@@ -424,8 +450,6 @@ pub enum Carried {
         /// The key it evicts.
         target_key_id: String,
     },
-    /// An eviction by a framed signed revocation.
-    Revocation(SignedIdentityOccurrenceRevocation),
 }
 
 impl Carried {
@@ -434,7 +458,7 @@ impl Carried {
     pub fn kind(&self) -> ProposalKind {
         match self {
             Self::Occurrence(_) => ProposalKind::Add,
-            Self::Withdraws { .. } | Self::Revocation(_) => ProposalKind::Evict,
+            Self::Withdraws { .. } => ProposalKind::Evict,
         }
     }
 
@@ -446,7 +470,6 @@ impl Carried {
             Self::Withdraws {
                 identity_key_id, ..
             } => identity_key_id,
-            Self::Revocation(s) => &s.identity_occurrence_revocation.identity_key_id,
         }
     }
 
@@ -456,7 +479,6 @@ impl Carried {
         match self {
             Self::Occurrence(s) => &s.identity_occurrence.occurrence_key_id,
             Self::Withdraws { target_key_id, .. } => target_key_id,
-            Self::Revocation(s) => &s.identity_occurrence_revocation.occurrence_key_id,
         }
     }
 
@@ -466,7 +488,6 @@ impl Carried {
         match self {
             Self::Occurrence(s) => &s.attesting_key_id,
             Self::Withdraws { row, .. } => &row.attesting_key_id,
-            Self::Revocation(s) => &s.attesting_key_id,
         }
     }
 
@@ -476,7 +497,6 @@ impl Carried {
         match self {
             Self::Occurrence(s) => s.identity_occurrence.asserted_at,
             Self::Withdraws { row, .. } => row.asserted_at,
-            Self::Revocation(s) => s.identity_occurrence_revocation.revoked_at,
         }
     }
 
@@ -484,7 +504,6 @@ impl Carried {
         match self {
             Self::Occurrence(_) => carrier::IDENTITY_OCCURRENCE,
             Self::Withdraws { .. } => carrier::WITHDRAWS,
-            Self::Revocation(_) => carrier::OCCURRENCE_REVOCATION,
         }
     }
 
@@ -498,16 +517,6 @@ impl Carried {
                 if let Some(o) = v.as_object_mut() {
                     o.remove("persist_row_hash");
                     o.remove("withdraws_admission_rule");
-                }
-                v
-            }
-            Self::Revocation(s) => {
-                let mut v = serde_json::to_value(s).map_err(encode)?;
-                if let Some(inner) = v
-                    .get_mut("identity_occurrence_revocation")
-                    .and_then(serde_json::Value::as_object_mut)
-                {
-                    inner.remove("persist_row_hash");
                 }
                 v
             }
@@ -544,12 +553,6 @@ impl Carried {
                 &s.signature.mldsa65_signature_base64,
                 &s.attesting_key_id,
                 s.identity_occurrence.asserted_at,
-            ),
-            Self::Revocation(s) => hybrid(
-                &s.signature.ed25519_signature_base64,
-                &s.signature.mldsa65_signature_base64,
-                &s.attesting_key_id,
-                s.identity_occurrence_revocation.revoked_at,
             ),
             Self::Withdraws { row, .. } => {
                 if row.scrub_signature_pqc.is_none() {
@@ -632,20 +635,6 @@ where
                 super::types::compute_persist_row_hash(&s.identity_occurrence)?;
             Carried::Occurrence(s)
         }
-        carrier::OCCURRENCE_REVOCATION => {
-            let mut inner = inner;
-            if let Some(o) = inner
-                .get_mut("identity_occurrence_revocation")
-                .and_then(serde_json::Value::as_object_mut)
-            {
-                o.insert("persist_row_hash".to_owned(), String::new().into());
-            }
-            let mut s: SignedIdentityOccurrenceRevocation = serde_json::from_value(inner)
-                .map_err(|e| malformed(row, &format!("identity_occurrence_revocation: {e}")))?;
-            s.identity_occurrence_revocation.persist_row_hash =
-                super::types::compute_persist_row_hash(&s.identity_occurrence_revocation)?;
-            Carried::Revocation(s)
-        }
         carrier::WITHDRAWS => {
             let mut inner = inner;
             if let Some(o) = inner.as_object_mut() {
@@ -654,17 +643,22 @@ where
             let mut w: Attestation = serde_json::from_value(inner)
                 .map_err(|e| malformed(row, &format!("withdraws: {e}")))?;
             w.persist_row_hash = super::types::compute_persist_row_hash(&w)?;
-            let Some(rev) = super::key_plane::occurrence_withdrawal_of(dir, &w).await? else {
-                return Err(Error::InvalidArgument(format!(
-                    "{DIMENSION_PROPOSAL} row {}: the withdraws it carries names no held \
-                     identity:occurrence:v1 row — re-offer once the occurrence row is held",
-                    row.attestation_id
-                )));
-            };
+            let (identity_key_id, target_key_id) =
+                if let Some(rev) = super::key_plane::occurrence_withdrawal_of(dir, &w).await? {
+                    (rev.identity_key_id, rev.occurrence_key_id)
+                } else if let Some(genesis) = genesis_withdrawal_of(dir, &w).await? {
+                    (genesis.clone(), genesis)
+                } else {
+                    return Err(Error::InvalidArgument(format!(
+                        "{DIMENSION_PROPOSAL} row {}: the withdraws it carries names no held \
+                         identity:occurrence:v1 or key:record:v1 row — re-offer once it is held",
+                        row.attestation_id
+                    )));
+                };
             Carried::Withdraws {
                 row: w,
-                identity_key_id: rev.identity_key_id,
-                target_key_id: rev.occurrence_key_id,
+                identity_key_id,
+                target_key_id,
             }
         }
         other => return Err(malformed(row, &format!("unknown carrier {other:?}"))),
@@ -706,9 +700,6 @@ where
 {
     match carried {
         Carried::Occurrence(s) => super::admission::verify_signed_identity_occurrence(dir, s).await,
-        Carried::Revocation(s) => {
-            super::admission::verify_signed_identity_occurrence_revocation(dir, s).await
-        }
         Carried::Withdraws {
             row,
             identity_key_id,
@@ -1011,13 +1002,14 @@ where
         return Ok(false);
     }
     if target == identity {
-        // The genesis key's eviction: a framed revocation of the self pair
-        // signed by ANOTHER roster key. The genesis key revoking its own pair
-        // retires its transport self-occurrence, as before; a `withdraws` of
-        // the pair is that retirement too ([`genesis_evicted_at`]).
-        return Ok(matches!(carried, Carried::Revocation(_))
-            && carried.proposer() != identity
-            && roster.contains(identity));
+        // The genesis key's eviction: a `withdraws` of its `key:record:v1` row
+        // signed by ANOTHER roster key ([`genesis_withdrawal_of`]). A
+        // `withdraws` of the self pair's occurrence row retires the transport
+        // self-occurrence, as before, and evicts nothing.
+        let Carried::Withdraws { row, .. } = carried else {
+            return Ok(false);
+        };
+        return Ok(genesis_withdrawal_of(dir, row).await?.is_some() && roster.contains(identity));
     }
     Ok(match carried.kind() {
         ProposalKind::Add => !roster.contains(target) && is_user_key(dir, target).await?,
@@ -1100,15 +1092,25 @@ where
     gate(dir, Carried::Occurrence(signed.clone())).await
 }
 
-/// [`gate`] for a framed revocation (`put_identity_occurrence_revocation`).
-pub async fn gate_revocation<D>(
+/// [`gate`] for a `withdraws` against the genesis key's `key:record:v1` row
+/// (the attestation door): the genesis key's eviction.
+pub async fn gate_genesis_withdrawal<D>(
     dir: &D,
-    signed: &SignedIdentityOccurrenceRevocation,
+    row: &Attestation,
+    identity: &str,
 ) -> Result<(), Error>
 where
     D: FederationDirectory + ?Sized,
 {
-    gate(dir, Carried::Revocation(signed.clone())).await
+    gate(
+        dir,
+        Carried::Withdraws {
+            row: row.clone(),
+            identity_key_id: identity.to_owned(),
+            target_key_id: identity.to_owned(),
+        },
+    )
+    .await
 }
 
 /// [`gate`] for a `withdraws` against an occurrence row (the attestation door).
@@ -1200,7 +1202,6 @@ where
         tried.insert(p.id.clone());
         let applied = match carried {
             Carried::Occurrence(s) => dir.put_identity_occurrence(s).await,
-            Carried::Revocation(s) => dir.put_identity_occurrence_revocation(s).await,
             Carried::Withdraws { row, .. } => dir
                 .put_attestation(super::SignedAttestation { attestation: row })
                 .await

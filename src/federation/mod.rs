@@ -366,8 +366,9 @@ pub mod key_grant;
 pub mod key_plane;
 // v58.0.0 (CIRISPersist#991) — I975–I980.
 pub(crate) mod key_plane_invariants;
-// v58.0.0 (compat reads, operator ruling 2026-10-18) — I1120–I1123.
-mod compat_reads_invariants;
+// v59.0.0 (sealed-transport floor, operator ruling 2026-10-19) — I1144–I1147:
+// the framed key plane is retired; a v57 store migrates onto the rows.
+mod key_plane_retired_invariants;
 // #848 §18 — the two-node witnesses I59–I67; `pub` under `test-anchor` so
 // consumers can drive them against their own backends.
 #[cfg(any(test, feature = "test-anchor"))]
@@ -740,13 +741,12 @@ pub use admission::{
     has_accord_conferred_role, has_accord_conferred_role_over_roster, is_canonical,
     is_canonical_effective, is_infra_attest, is_infra_attest_effective, op_withdraw_role,
     supersede_canonical, verify_canonical_supersede_authority, verify_canonical_withdraw_authority,
-    verify_signed_identity_occurrence_revocation, verify_signed_touch_claim,
-    verify_signed_transport_destination, verify_touch_claim_admission, withdraw_accord_role,
-    withdraw_accord_role_over_roster, withdraw_canonical_role, withdraw_infra_attest_role,
-    CanonicalWithdrawal, DimensionAdmissionPolicy, DimensionRejectionReason,
-    NamespaceConformanceReason, ReachabilityVerdict, ReservedPrefixRule, RoleWithdrawal,
-    ATTESTATION_LADDER_MECHANISMS, DEFAULT_MAX_TOUCH_SKEW, MINTED_NAMESPACE_FAMILIES,
-    UNREGISTERED_GATED_FAMILIES,
+    verify_signed_touch_claim, verify_signed_transport_destination, verify_touch_claim_admission,
+    withdraw_accord_role, withdraw_accord_role_over_roster, withdraw_canonical_role,
+    withdraw_infra_attest_role, CanonicalWithdrawal, DimensionAdmissionPolicy,
+    DimensionRejectionReason, NamespaceConformanceReason, ReachabilityVerdict, ReservedPrefixRule,
+    RoleWithdrawal, ATTESTATION_LADDER_MECHANISMS, DEFAULT_MAX_TOUCH_SKEW,
+    MINTED_NAMESPACE_FAMILIES, UNREGISTERED_GATED_FAMILIES,
 };
 pub use blackhole::{BlackholeRecord, BlackholeRules, RETICULUM_IDENTITY_HASH_LEN};
 pub use blobs::{
@@ -886,12 +886,11 @@ pub use types::{
     IdentityOccurrenceRevocation, KeyRecord, KnownHashEviction, KnownWireHash, LocationProof,
     PeerMetadataRow, PeerPolicyBlob, Revocation, ServedAttestation, ServedCommunity,
     ServedCommunityMembershipRevocation, ServedCommunityMembershipWidening, ServedFamily,
-    ServedFamilyMembershipRevocation, ServedIdentityOccurrence, ServedIdentityOccurrenceRevocation,
-    ServedKeyRecord, ServedLocationProof, ServedOrgMembership, ServedOrganization,
-    ServedPartnerRecord, ServedRevocation, ServedSignedPartnerRecord, ServedTransportDestination,
-    SignedAttestation, SignedCommunity, SignedCommunityMembershipRevocation,
-    SignedCommunityMembershipWidening, SignedFamily, SignedFamilyMembershipRevocation,
-    SignedIdentityOccurrence, SignedIdentityOccurrenceRevocation, SignedKeyRecord,
+    ServedFamilyMembershipRevocation, ServedIdentityOccurrence, ServedKeyRecord,
+    ServedLocationProof, ServedOrgMembership, ServedOrganization, ServedPartnerRecord,
+    ServedRevocation, ServedSignedPartnerRecord, ServedTransportDestination, SignedAttestation,
+    SignedCommunity, SignedCommunityMembershipRevocation, SignedCommunityMembershipWidening,
+    SignedFamily, SignedFamilyMembershipRevocation, SignedIdentityOccurrence, SignedKeyRecord,
     SignedLocationProof, SignedRevocation, SignedTouchClaim, SignedTrustGrant,
     SignedTrustRevocation, SignerForm, TrustClass, TrustFilter, TrustGrant, TrustRelationship,
     TrustRow, TrustType,
@@ -5216,17 +5215,6 @@ pub trait FederationDirectory: Send + Sync {
     //     `build_caller_admission` (Ask 6) and the deferred forward-
     //     secrecy key_grant gate (Ask 4) depend on.
 
-    /// v4.8.0 — record an identity-occurrence revocation (an occurrence
-    /// leaving a self-collective). Append-only; idempotent on the
-    /// `(identity_key_id, occurrence_key_id)` PK. Computes
-    /// `persist_row_hash` server-side. The V059 admission row is left
-    /// intact — effective state is the composition (see
-    /// [`Self::list_identity_occurrences_active`]).
-    async fn put_identity_occurrence_revocation(
-        &self,
-        revocation: SignedIdentityOccurrenceRevocation,
-    ) -> Result<(), Error>;
-
     /// v16.0.0 (CIRISPersist#421) — write a **trusted-local** occurrence
     /// revocation, bypassing the [`Self::put_identity_occurrence_revocation`]
     /// signature gate. For engine-internal writes on behalf of the local user
@@ -5243,25 +5231,6 @@ pub trait FederationDirectory: Send + Sync {
         let _ = revocation;
         Err(Error::Backend(
             "put_identity_occurrence_revocation_local not implemented for this backend".into(),
-        ))
-    }
-
-    /// v16.0.0 (CIRISPersist#421) — list the stored occurrence revocations of
-    /// `identity_key_id` **with their original signature container**,
-    /// reconstructed byte-exact from the persisted `{attesting_key_id,
-    /// signed_envelope, signature}` columns — the revocation twin of
-    /// [`Self::list_signed_identity_occurrences_for`], so a transport
-    /// replicator re-publishes a revocation it cannot re-sign. Signed-put rows
-    /// only (trusted-local NULL-signature rows omitted). Default impl errors;
-    /// backends override.
-    async fn list_signed_identity_occurrence_revocations_for(
-        &self,
-        identity_key_id: &str,
-    ) -> Result<Vec<SignedIdentityOccurrenceRevocation>, Error> {
-        let _ = identity_key_id;
-        Err(Error::Backend(
-            "list_signed_identity_occurrence_revocations_for not implemented for this backend"
-                .into(),
         ))
     }
 
@@ -5746,58 +5715,6 @@ pub trait FederationDirectory: Send + Sync {
     //     for `federation_keys` specifically — always-required so no
     //     filter applies at all.
 
-    /// v21.1.0 (CIRISPersist#507c) — bulk-list [`SignedKeyRecord`] wrappers
-    /// (one per `federation_keys` row) since a cursor. `since` filters on
-    /// `scrub_timestamp > since` (`None` = from the start — `scrub_timestamp`
-    /// is the row's registration time, when its scrub-signature was issued);
-    /// rows are ordered by `(scrub_timestamp ASC, key_id ASC)` so the cursor
-    /// is a stable resumption point, mirroring
-    /// [`Self::list_organizations_since`]. `limit` caps the page.
-    ///
-    /// **Every row qualifies.** Unlike the #504 keyless planes,
-    /// `federation_keys.scrub_signature_classical` is `NOT NULL` — a key
-    /// registration cannot be admitted unsigned, so there is no
-    /// legitimately-unsigned shape to filter out here. [`KeyRecord`] already
-    /// carries its own scrub-signature fields inline (it IS the signed
-    /// wrapper for read purposes); [`SignedKeyRecord`] exists only so the
-    /// write-input and bulk-read shapes match (`{ record: KeyRecord }`).
-    /// v31.4.0 (CIRISPersist#682, #668) — **BREAKING: resumes on THIS node's
-    /// admission position, as a PAIR.**
-    ///
-    /// `since` is `(admitted_at, key_id)` — the pair, not the instant alone.
-    /// The page is ordered by that pair and the filter is strictly greater than
-    /// it, so a tie larger than one page resumes correctly instead of skipping
-    /// its remainder (#668).
-    ///
-    /// It keys on `admitted_at` (receiver-stamped, monotonic) rather than
-    /// `scrub_timestamp` (the producer's clock). A record signed in January,
-    /// replicated late and admitted in February, used to sort under January and
-    /// was never served to a consumer past it — #655's defect on the identity
-    /// plane, which every other plane's verification resolves against (#682).
-    async fn list_signed_key_records_since(
-        &self,
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        limit: u32,
-    ) -> Result<Vec<ServedKeyRecord>, Error>;
-
-    /// v21.1.0 (CIRISPersist#507c) — bulk-list the full
-    /// [`SignedIdentityOccurrence`] wrappers (row + the detached
-    /// `{attesting_key_id, signed_envelope, signature}` container V102
-    /// added) since a cursor — the bulk-read mirror of
-    /// [`Self::list_signed_identity_occurrences_for`] (which is per-subject).
-    /// Pair-cursor contract per [`Self::list_organizations_since`] (#668);
-    /// the resume id is the compound of
-    /// `(identity_key_id, occurrence_key_id)`. `limit` caps the page.
-    ///
-    /// **Signed rows only**: a [`Self::put_identity_occurrence_local`]
-    /// trusted-local row (NULL signature columns) is never emitted — same
-    /// contract as the per-subject read.
-    async fn list_signed_identity_occurrences_since(
-        &self,
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        limit: u32,
-    ) -> Result<Vec<ServedIdentityOccurrence>, Error>;
-
     /// v21.1.0 (CIRISPersist#507c) — bulk-list the full
     /// [`self_at_login::SignedTransportDestination`] wrappers since a
     /// cursor — the bulk-read mirror of
@@ -6015,83 +5932,6 @@ pub trait FederationDirectory: Send + Sync {
     /// the closed slot does not register. Bounded by the number of DISTINCT
     /// types, not rows.
     async fn attestation_type_census(&self) -> Result<Vec<row_type::AttestationTypeCount>, Error>;
-
-    /// v21.1.0 (CIRISPersist#507c) — bulk-list the full
-    /// [`SignedIdentityOccurrenceRevocation`] wrappers since a cursor — the
-    /// bulk-read mirror of
-    /// [`Self::list_signed_identity_occurrence_revocations_for`].
-    /// Pair-cursor contract per [`Self::list_organizations_since`] (#668);
-    /// the resume id is the compound of
-    /// `(identity_key_id, occurrence_key_id)`. `limit` caps the page.
-    ///
-    /// **Signed rows only** (trusted-local NULL-signature rows omitted),
-    /// same contract as the per-subject read.
-    async fn list_signed_identity_occurrence_revocations_since(
-        &self,
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        limit: u32,
-    ) -> Result<Vec<ServedIdentityOccurrenceRevocation>, Error>;
-
-    /// v31.1.0 (CIRISPersist#655) — bulk-list [`ServedRevocation`]s (one per
-    /// `federation_revocations` row) since a cursor. v36.0.0 (#668) —
-    /// `since` is the `(admitted_at, revocation_id)` PAIR from
-    /// [`ServedRevocation::resume_pair`]; rows are ordered by that pair and
-    /// filtered strictly greater than it. V123 gave this plane the right
-    /// CLOCK; the pair gives it the right RESUME — half-fixed was worse than
-    /// untouched, because a tie larger than one page silently dropped its
-    /// remainder on the EXCLUSION plane. `limit` caps the page.
-    ///
-    /// # The cursor is THIS NODE's admission order, not the producer's clock
-    ///
-    /// It shipped keyed on `scrub_timestamp` and that was wrong, in the
-    /// ordinary case rather than the adversarial one: a revocation signed in
-    /// January and replicated late is admitted in February, and a consumer
-    /// whose cursor has passed January asks for `> February` and never sees it.
-    /// `check_revocation_scrub_skew` is a ceiling only, so an arbitrarily old
-    /// signed instant is admissible, and `check_revocation_anti_rollback` is
-    /// per-`revoked_key_id`, so it is silent about a first revocation for an
-    /// unseen subject. The exclusion is stored and permanently invisible —
-    /// #655's own defect, arriving through the cursor key.
-    ///
-    /// So the key is [`ServedRevocation::admitted_at`] (V123), which this node
-    /// stamps on admission. Same correction, same reason, as
-    /// [`Self::list_signed_accord_quorum_evidence_since`]'s `evidence_at`: the
-    /// receiver re-derives rather than trusts, for time as well as authority.
-    /// `scrub_timestamp` is unchanged and keeps every other job it had — it is
-    /// envelope-bound (#659) and it is the anti-rollback latch; it is simply
-    /// not this node's position in its own stream.
-    ///
-    /// # Why this plane needed only a cursor
-    ///
-    /// #655 found an exclusion plane that could be destroyed and never
-    /// rebuilt — every other replicated plane had a `list_signed_*_since` and
-    /// this one did not, so a DSAR erasure, an operator repair or a restored
-    /// backup removed an exclusion permanently and silently.
-    ///
-    /// Unlike `federation_role_withdrawals` (whose remedy is the accord
-    /// EVIDENCE plane — see
-    /// [`accord_carriage`](crate::federation::accord_carriage)), a revocation
-    /// row is **self-authenticating**: it carries `revocation_envelope` plus
-    /// the hybrid `scrub_signature_classical` / `scrub_signature_pqc` /
-    /// `scrub_key_id`, and the receive side already re-verifies that
-    /// signature, the #659 subject binding and the #502 E1 authorship gate
-    /// against its OWN registered directory inside
-    /// [`Self::put_revocation`]. Serving the row therefore ships evidence, not
-    /// a verdict; no re-derivation step is needed because the receiver was
-    /// already re-deriving.
-    ///
-    /// **Every row qualifies.** `scrub_signature_classical` is `NOT NULL` —
-    /// a revocation cannot be admitted unsigned — so, exactly as with
-    /// [`Self::list_signed_key_records_since`], there is no legitimately-
-    /// unsigned shape to filter out. [`Revocation`] carries its scrub-
-    /// signature fields inline (it IS the signed wrapper for read purposes);
-    /// [`SignedRevocation`] exists so the write-input and bulk-read shapes
-    /// match.
-    async fn list_signed_revocations_since(
-        &self,
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        limit: u32,
-    ) -> Result<Vec<ServedRevocation>, Error>;
 
     /// v31.1.0 (CIRISPersist#662) — bulk-list the
     /// [`accord_carriage::AccordQuorumEvidence`] bundles (V091
@@ -6761,14 +6601,12 @@ pub trait FederationDirectory: Send + Sync {
                 }
                 wrap(kind, rows)
             }
-            // v16.0.0 (#421): the revocation arm returns the SIGNED container
-            // (byte-exact re-publish; signed-put rows only) now that the
-            // revocation plane carries the #418 signature discipline.
-            K::IdentityOccurrenceRevocation => wrap(
-                kind,
-                self.list_signed_identity_occurrence_revocations_for(subject_key_id)
-                    .await?,
-            ),
+            // v59.0.0 (sealed-transport floor) — the framed occurrence
+            // revocation is retired; a revocation is a `withdraws` row (the
+            // Attestation arm).
+            K::IdentityOccurrenceRevocation => Err(Error::EnvelopeKindRetired {
+                kind: replication_policy::EnvelopeKind::IdentityOccurrenceRevocation,
+            }),
         }
     }
 
@@ -9847,6 +9685,29 @@ pub enum Error {
         plane: &'static str,
     },
 
+    /// v59.0.0 (sealed-transport floor, operator ruling 2026-10-19; CC 5.3.3.5
+    /// E1) — **an inbound object of a RETIRED framed kind.** A key record, a
+    /// key revocation, an identity occurrence or an occurrence revocation
+    /// replicates as its key-plane row (`key:record:v1`, `key:revocation:v1`,
+    /// `identity:occurrence:v1`, a `withdraws` of the occurrence row); the
+    /// framed carriage of those kinds is refused at its door. **Terminal**:
+    /// the same bytes are never admitted on this door. General on purpose —
+    /// any [`EnvelopeKind`](replication_policy::EnvelopeKind) retired later
+    /// reuses it. Stable `kind()` token `federation_envelope_kind_retired`;
+    /// the Display leads with it and names the kind (`key`, `revocation`,
+    /// `identity_occurrence`, `identity_occurrence_revocation`), so a capsule
+    /// consumer, which receives the Display, reads the token too.
+    #[error(
+        "federation_envelope_kind_retired: {} — the framed {} carriage is retired; it \
+         replicates as its key-plane row (sealed-transport floor, operator ruling 2026-10-19)",
+        replication_policy::retired_detail(*kind),
+        replication_policy::retired_detail(*kind)
+    )]
+    EnvelopeKindRetired {
+        /// The retired kind.
+        kind: replication_policy::EnvelopeKind,
+    },
+
     /// v59.0.0 (CIRISPersist#1099, CC 3.3.6.3) — **a self-roster change did
     /// not land.** An addition to or an eviction from a self's key roster
     /// (an `identity_occurrence` of a new user-role key; a revocation, framed
@@ -12293,6 +12154,7 @@ impl Error {
             Error::AttesterKeyUnknown { .. } => "federation_attester_key_unknown",
             Error::SignerDoesNotActFor { .. } => "federation_signer_not_acting_for",
             Error::SelfRosterNotLanded { .. } => "federation_self_roster_not_landed",
+            Error::EnvelopeKindRetired { .. } => "federation_envelope_kind_retired",
             Error::MalformedRow { .. } => "federation_malformed_row",
             Error::LicensureDelegatorNotAuthority { .. } => {
                 "federation_licensure_delegator_not_authority"

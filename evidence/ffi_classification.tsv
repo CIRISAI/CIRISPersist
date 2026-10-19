@@ -22,7 +22,7 @@
 # CC asked for this file because 53 testimonial rows living only in a gated TSV
 # is itself a testimonial-class state: the class should not exemplify its own wrong.
 #
-# Counts at this revision: empirical=203 deontic=185 testimonial=42 procedural=40 structural=40 epistemic=37 ontological=33 axiotic=19 nomological=17 pragmatic=6 axiomatic=3
+# Counts at this revision: empirical=203 deontic=185 testimonial=42 procedural=40 structural=40 epistemic=33 ontological=33 axiotic=19 nomological=17 pragmatic=6 axiomatic=3
 #
 class	binding	class_count	owner	symbol	frame
 axiomatic	binding	3	MODULE	namespace_manifest_version	
@@ -435,43 +435,39 @@ empirical	descriptive	203	Engine	wa_cert_get_by_kid
 empirical	descriptive	203	Engine	wa_cert_get_by_oauth	
 empirical	descriptive	203	Engine	wa_cert_list_by_role	
 empirical	descriptive	203	Engine	wa_cert_update_last_login	
-epistemic	descriptive	37	Engine	age_band_fine_json	
-epistemic	descriptive	37	Engine	age_band_json	
-epistemic	descriptive	37	Engine	blob_custody_json	
-epistemic	descriptive	37	Engine	cache_budget_bytes	
-epistemic	descriptive	37	Engine	cache_usage_bytes	
-epistemic	descriptive	37	Engine	capacity_state_json	
-epistemic	descriptive	37	Engine	chunks_of_manifest_json	
-epistemic	descriptive	37	Engine	corpus_shape	
-epistemic	descriptive	37	Engine	cross_agent_divergence	
-epistemic	descriptive	37	Engine	custody_view_json	
-epistemic	descriptive	37	Engine	dag_contains_chunk	
-epistemic	descriptive	37	Engine	describe_crossing	
-epistemic	descriptive	37	Engine	disk_pressure_state	
-epistemic	descriptive	37	Engine	durability_deficit_json	
-epistemic	descriptive	37	Engine	get_repository_statistics	
-epistemic	descriptive	37	Engine	lineage_head_json	
-epistemic	descriptive	37	Engine	list_purge_bundles_since_json	
-epistemic	descriptive	37	Engine	list_signed_accord_quorum_evidence_since	
-epistemic	descriptive	37	Engine	list_signed_communities_since	
-epistemic	descriptive	37	Engine	list_signed_community_membership_revocations_since	
-epistemic	descriptive	37	Engine	list_signed_families_since	
-epistemic	descriptive	37	Engine	list_signed_family_membership_revocations_since	
-epistemic	descriptive	37	Engine	list_signed_identity_occurrence_revocations_since	
-epistemic	descriptive	37	Engine	list_signed_identity_occurrences_for_json	
-epistemic	descriptive	37	Engine	list_signed_identity_occurrences_since	
-epistemic	descriptive	37	Engine	list_signed_key_records_since	
-epistemic	descriptive	37	Engine	list_signed_location_proofs_since	
-epistemic	descriptive	37	Engine	list_signed_partner_records_since	
-epistemic	descriptive	37	Engine	list_signed_revocations_since	
-epistemic	descriptive	37	Engine	list_signed_transport_destinations_since	
-epistemic	descriptive	37	Engine	node_state_json	
-epistemic	descriptive	37	Engine	peer_quota_observation_json	
-epistemic	descriptive	37	Engine	secrets_is_healthy	
-epistemic	descriptive	37	Engine	secrets_test_encryption	
-epistemic	descriptive	37	Engine	temporal_drift	
-epistemic	descriptive	37	Engine	verify_trace	
-epistemic	descriptive	37	ScoringFactorStream	summary	
+epistemic	descriptive	33	Engine	age_band_fine_json	
+epistemic	descriptive	33	Engine	age_band_json	
+epistemic	descriptive	33	Engine	blob_custody_json	
+epistemic	descriptive	33	Engine	cache_budget_bytes	
+epistemic	descriptive	33	Engine	cache_usage_bytes	
+epistemic	descriptive	33	Engine	capacity_state_json	
+epistemic	descriptive	33	Engine	chunks_of_manifest_json	
+epistemic	descriptive	33	Engine	corpus_shape	
+epistemic	descriptive	33	Engine	cross_agent_divergence	
+epistemic	descriptive	33	Engine	custody_view_json	
+epistemic	descriptive	33	Engine	dag_contains_chunk	
+epistemic	descriptive	33	Engine	describe_crossing	
+epistemic	descriptive	33	Engine	disk_pressure_state	
+epistemic	descriptive	33	Engine	durability_deficit_json	
+epistemic	descriptive	33	Engine	get_repository_statistics	
+epistemic	descriptive	33	Engine	lineage_head_json	
+epistemic	descriptive	33	Engine	list_purge_bundles_since_json	
+epistemic	descriptive	33	Engine	list_signed_accord_quorum_evidence_since	
+epistemic	descriptive	33	Engine	list_signed_communities_since	
+epistemic	descriptive	33	Engine	list_signed_community_membership_revocations_since	
+epistemic	descriptive	33	Engine	list_signed_families_since	
+epistemic	descriptive	33	Engine	list_signed_family_membership_revocations_since	
+epistemic	descriptive	33	Engine	list_signed_identity_occurrences_for_json	
+epistemic	descriptive	33	Engine	list_signed_location_proofs_since	
+epistemic	descriptive	33	Engine	list_signed_partner_records_since	
+epistemic	descriptive	33	Engine	list_signed_transport_destinations_since	
+epistemic	descriptive	33	Engine	node_state_json	
+epistemic	descriptive	33	Engine	peer_quota_observation_json	
+epistemic	descriptive	33	Engine	secrets_is_healthy	
+epistemic	descriptive	33	Engine	secrets_test_encryption	
+epistemic	descriptive	33	Engine	temporal_drift	
+epistemic	descriptive	33	Engine	verify_trace	
+epistemic	descriptive	33	ScoringFactorStream	summary	
 nomological	descriptive	17	Engine	audit_canonicalize_for_hash	
 nomological	descriptive	17	Engine	audit_canonicalize_for_signing	
 nomological	descriptive	17	Engine	canonicalize_envelope	

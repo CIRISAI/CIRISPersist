@@ -2318,26 +2318,14 @@ class Engine:
     def list_signed_family_membership_revocations_since(self, since_rfc3339: str | None, since_id: str | None, limit: int) -> str:
         """(derived) epistemic — v21.0.0 (CIRISPersist#504 FLOOR) — bulk-list the full SignedFamilyMembershipRevocation wrappers since a cursor, as a JSON array. Same contract as [..."""
 
-    def list_signed_identity_occurrence_revocations_since(self, since_rfc3339: str | None, since_id: str | None, limit: int) -> str:
-        """(derived) epistemic — v21.1.0 (CIRISPersist#507c) — bulk-list the full SignedIdentityOccurrenceRevocation wrappers since a cursor, as a JSON array. Signed rows only; ord..."""
-
     def list_signed_identity_occurrences_for_json(self, identity_key_id: str) -> str:
         """(derived) epistemic — v14.1.0 (CIRISPersist#418, replication read) — the signed-put occurrences of identity_key_id, each as a full SignedIdentityOccurrence JSON object (..."""
-
-    def list_signed_identity_occurrences_since(self, since_rfc3339: str | None, since_id: str | None, limit: int) -> str:
-        """(derived) epistemic — v21.1.0 (CIRISPersist#507c) — bulk-list the full SignedIdentityOccurrence wrappers since a cursor, as a JSON array. Signed rows only (trusted-local..."""
-
-    def list_signed_key_records_since(self, since_rfc3339: str | None, since_key_id: str | None, limit: int) -> str:
-        """(derived) epistemic — v31.4.0 (CIRISPersist#682, #668) — bulk-list ServedKeyRecords since a cursor, as a JSON array, ordered (admitted_at ASC, key_id ASC). Every federat..."""
 
     def list_signed_location_proofs_since(self, since_rfc3339: str | None, since_id: str | None, limit: int) -> str:
         """(derived) epistemic — v21.0.0 (CIRISPersist#504 FLOOR) — bulk-list the full SignedLocationProof wrappers since a cursor, as a JSON array. Same contract as [list_signed_f..."""
 
     def list_signed_partner_records_since(self, since_rfc3339: str | None, since_id: str | None, limit: int) -> str:
         """(derived) epistemic — v5.2.0 (CIRISPersist#194, CIRISEdge#65 v2 bridge) — bulk-list the full SignedPartnerRecord wrappers (row + the M-of-N steward signature set + thres..."""
-
-    def list_signed_revocations_since(self, since_rfc3339: str | None, since_id: str | None, limit: int) -> str:
-        """(derived) epistemic — v31.1.0 (CIRISPersist#655) — bulk-list ServedRevocations since a cursor, as a JSON array, ordered (admitted_at ASC, revocation_id ASC). The key-lev..."""
 
     def list_signed_transport_destinations_since(self, since_rfc3339: str | None, since_id: str | None, limit: int) -> str:
         """(derived) epistemic — v21.1.0 (CIRISPersist#507c) — bulk-list the full SignedTransportDestination wrappers since a cursor, as a JSON array. Signed rows only; RETIRED row..."""

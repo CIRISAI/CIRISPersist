@@ -90,6 +90,38 @@ pub const REVOCATION_MEMBER: &str = "revocation";
 /// occurrence under.
 pub const IDENTITY_OCCURRENCE_MEMBER: &str = "identity_occurrence";
 
+/// v59.0.0 (sealed-transport floor, operator ruling 2026-10-19) — what the
+/// one-way rehome at first open found: every v57-shape object it could give a
+/// row now has one; these are what it could not. Logged at open, one line,
+/// counted.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct KeyPlaneRehomeReport {
+    /// Keys held without a `key:record:v1` row (verify under neither rule).
+    pub keys_without_row: u64,
+    /// Key revocations held without a `key:revocation:v1` row.
+    pub revocations_without_row: u64,
+    /// Signed occurrences held without an `identity:occurrence:v1` row.
+    pub occurrences_without_row: u64,
+    /// Framed occurrence revocations kept as legacy projection rows (V200):
+    /// still revoking, never re-signed, never un-revoked.
+    pub legacy_framed_occurrence_revocations: u64,
+}
+
+impl KeyPlaneRehomeReport {
+    /// The counted log line.
+    pub(crate) fn log(&self, backend: &'static str) {
+        tracing::info!(
+            backend,
+            keys_without_row = self.keys_without_row,
+            revocations_without_row = self.revocations_without_row,
+            occurrences_without_row = self.occurrences_without_row,
+            legacy_framed_occurrence_revocations = self.legacy_framed_occurrence_revocations,
+            "key-plane rehome at open (v59.0.0): every verifiable v57-shape record has its row; \
+             the counted rest is held without one"
+        );
+    }
+}
+
 /// The three families of the key plane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyPlaneFamily {

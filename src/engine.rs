@@ -10095,16 +10095,19 @@ impl Engine {
     /// keeps `put_public_key`'s as-today semantics), so no caller can reach
     /// the upgrade unverified. This wrapper is pure dispatch.
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    ///
+    /// v59.0.0 (sealed-transport floor, operator ruling 2026-10-19) — RETIRED
+    /// as a wire door: refused [`Error::EnvelopeKindRetired`](crate::federation::Error::EnvelopeKindRetired)
+    /// (`key`). A key replicates as its `key:record:v1` row
+    /// ([`Self::apply_replicated_attestation`]), whose door runs the same apply.
     pub async fn apply_replicated_key_record(
         &self,
         record: crate::federation::SignedKeyRecord,
     ) -> Result<crate::federation::register::ReplicatedKeyOutcome, crate::federation::Error> {
-        match &self.backend {
-            #[cfg(feature = "postgres")]
-            BackendDispatch::Postgres(b) => b.apply_replicated_key_record(record).await,
-            #[cfg(feature = "sqlite")]
-            BackendDispatch::Sqlite(b) => b.apply_replicated_key_record(record).await,
-        }
+        let _ = record;
+        Err(crate::federation::Error::EnvelopeKindRetired {
+            kind: crate::federation::replication_policy::EnvelopeKind::Key,
+        })
     }
 
     /// v36.0.0 (CIRISPersist#624) — the **typed, pre-write replicated
@@ -10302,39 +10305,6 @@ impl Engine {
     //    not shipped: #542's lesson was a full {gate}×{backend} matrix passing
     //    while NO host could enable the thing. These four are the doors an
     //    operator or a carrier actually calls.
-
-    /// v31.1.0 (CIRISPersist#655) — **serve** the key-level revocation plane:
-    /// bulk-list [`ServedRevocation`](crate::federation::ServedRevocation)s
-    /// since a cursor (`admitted_at > since`, ordered `(admitted_at ASC,
-    /// revocation_id ASC)`).
-    ///
-    /// The cursor is THIS node's admission order, not the producer's
-    /// `scrub_timestamp`; resume from the last element's `admitted_at`. Keying
-    /// on the signed instant hid a revocation signed before a consumer's
-    /// cursor and replicated after it — stored, and permanently unservable.
-    ///
-    /// The plane could be destroyed and never rebuilt before this: every
-    /// other replicated plane had a `list_signed_*_since` and this one did
-    /// not, so a DSAR erasure, an operator repair or a restored backup
-    /// removed an exclusion permanently and silently. A revocation row is
-    /// self-authenticating, so serving it ships evidence — the receiver
-    /// re-verifies the hybrid scrub signature against its own directory
-    /// inside [`Self::deregister_federation_key`].
-    /// v36.0.0 (CIRISPersist#668) — `since` is the
-    /// `(admitted_at, revocation_id)` PAIR from
-    /// [`ServedRevocation::resume_pair`](crate::federation::ServedRevocation::resume_pair):
-    /// resumed on the instant alone, a tie larger than one page silently
-    /// dropped its remainder — on the exclusion plane.
-    #[cfg(any(feature = "postgres", feature = "sqlite"))]
-    pub async fn list_signed_revocations_since(
-        &self,
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        limit: u32,
-    ) -> Result<Vec<crate::federation::ServedRevocation>, crate::federation::Error> {
-        self.federation_directory()
-            .list_signed_revocations_since(since, limit)
-            .await
-    }
 
     /// v31.1.0 (CIRISPersist#662) — **serve** the signed accord EVIDENCE
     /// plane: the proposal + its hybrid-signed participation set, bundled per
