@@ -126,9 +126,12 @@ pub(crate) mod bodies {
         f: &Framed,
         with_revocation: bool,
     ) {
-        for k in [&f.identity, &f.occurrence] {
-            ts::register_identity_key(d, k, identity_type::USER).await;
-        }
+        // v59.0.0 (#1099) — the occurrence is an AGENT key: not a roster key of
+        // the self, so its framed revocation is not a roster eviction and lands
+        // at once (these witnesses hold the framed BYTES, not the roster rule;
+        // `self_roster_invariants` holds that).
+        ts::register_identity_key(d, &f.identity, identity_type::USER).await;
+        ts::register_identity_key(d, &f.occurrence, identity_type::AGENT).await;
         d.put_public_key(SignedKeyRecord {
             record: f.key.clone(),
         })
@@ -446,9 +449,12 @@ pub(crate) mod bodies {
         let framed_occ = format!("i1122-framed-{tag}");
         let withdrawn_occ = format!("i1122-withdrawn-{tag}");
         let at = ms(chrono::Utc::now() - chrono::Duration::seconds(300));
+        // v59.0.0 (#1099) — AGENT occurrences: not roster keys, so their
+        // revocations land at once (the roster rule is `self_roster_invariants`').
         for node in [a, b] {
-            for k in [&id, &framed_occ, &withdrawn_occ] {
-                ts::register_identity_key(node, k, identity_type::USER).await;
+            ts::register_identity_key(node, &id, identity_type::USER).await;
+            for k in [&framed_occ, &withdrawn_occ] {
+                ts::register_identity_key(node, k, identity_type::AGENT).await;
             }
         }
         for occ in [&framed_occ, &withdrawn_occ] {

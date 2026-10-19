@@ -369,3 +369,5 @@ sqlite	196	erasure_names_no_subject	7901078682725809118
 postgres	196	erasure_names_no_subject	3434703448561552849
 sqlite	198	key_plane_projections	8618884001430423445
 postgres	198	key_plane_projections	11252062762509407064
+sqlite	199	self_roster_proposals	2411818760403917388
+postgres	199	self_roster_proposals	10558628645746662638

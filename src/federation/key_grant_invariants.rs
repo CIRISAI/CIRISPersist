@@ -2490,7 +2490,16 @@ pub mod two_node {
         // row never vouches, for the node's own key or any other.
         {
             let sibling = format!("{tag}-sibling-{run}");
-            ts::register_hybrid_key_as(n.backend, &sibling, &sibling, USER).await;
+            // v59.0.0 (#1099) — an AGENT sibling: a node vouches for a
+            // non-roster key of its owner. A user-role key is a roster key, and
+            // a node is not one, so it cannot add one (CC 3.3.6.3; I1140).
+            ts::register_hybrid_key_as(
+                n.backend,
+                &sibling,
+                &sibling,
+                crate::federation::types::identity_type::AGENT,
+            )
+            .await;
             let at = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(
                 chrono::Utc::now().timestamp_millis(),
             )

@@ -170,6 +170,10 @@ pub(crate) const LIST_READ_BOUNDS: &[(&str, Bound)] = &[
         Bound::Open("one occurrence key's append-only assertion history (V161): grows with every renewal"),
     ),
     (
+        "list_open_self_roster_proposals",
+        Bound::Open("every open roster proposal of one self, or of every self for the sweep: a refused one stays open until the roster lets it land"),
+    ),
+    (
         "list_identity_occurrence_revocations_for",
         Bound::Schema("the revocations of one identity's occurrences: at most one per occurrence and effective instant"),
     ),

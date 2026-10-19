@@ -725,6 +725,10 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("composer_replay_held", ConnClass::Read),
     ("delete_attestation", ConnClass::Write),
     ("repair_withdraws_depth", ConnClass::Write),
+    // v59.0.0 (#1099) — the V199 self-roster receipts.
+    ("note_self_roster_proposal", ConnClass::Write),
+    ("list_open_self_roster_proposals", ConnClass::Read),
+    ("settle_self_roster_proposal", ConnClass::Write),
     ("store_pqc_completion", ConnClass::Write),
     ("store_planned_attestation", ConnClass::Write),
     ("store_planned_reseal", ConnClass::Write),

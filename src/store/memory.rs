@@ -5275,6 +5275,8 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         state
             .derived_detection_events
             .retain(|_, (id, _)| id != attestation_id);
+        // v59.0.0 (#1099) — the V199 receipt (ON DELETE CASCADE).
+        state.self_roster_proposals.remove(attestation_id);
         Ok(())
     }
 

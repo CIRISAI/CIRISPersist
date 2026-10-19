@@ -2,7 +2,9 @@
 //! `CLM-self-roster-two-paths`, `CLM-self-roster-authority`) — **the key
 //! roster of a self, and its door.**
 //!
-//! A self is one fedID. The keys that may sign as it are its **roster**: the
+//! A self is one fedID, a `user`-role identity (a node or an agent identity's
+//! occurrences are not a roster, and are written as before). The keys that
+//! may sign as it are its **roster**: the
 //! genesis key (the fedID's own key) and every ACTIVE `identity_occurrence`
 //! under it whose key carries the `user` role. A node's own key and an agent's
 //! key are not roster keys: CC 3.3.6.3 keeps "the node's own key" apart from
@@ -900,7 +902,9 @@ where
     D: FederationDirectory + ?Sized,
 {
     let (identity, target) = (carried.identity_key_id(), carried.target_key_id());
-    if target == identity {
+    // A self is a person (CC 3.3.6.3): a node or agent identity's
+    // occurrences are not a roster.
+    if target == identity || !is_user_key(dir, identity).await? {
         return Ok(false);
     }
     Ok(match carried.kind() {

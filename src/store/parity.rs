@@ -657,6 +657,11 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("from_str", Class::Plumbing),
     ("from_value", Class::Plumbing),
     ("from_wire_str", Class::Plumbing),
+    // v59.0.0 (CIRISPersist#1099) — the self-roster door: refuses (holds) a
+    // roster change one key of two or more signed.
+    ("gate_occurrence", Class::Gate),
+    ("gate_revocation", Class::Gate),
+    ("gate_withdrawal", Class::Gate),
     ("get", Class::Plumbing),
     ("get_accord_proposal", Class::Delegates),
     ("get_attestation", Class::Delegates),

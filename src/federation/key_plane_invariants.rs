@@ -373,9 +373,13 @@ pub(crate) mod bodies {
         let id = format!("i979-id-{tag}");
         let occ = format!("i979-occ-{tag}");
         let stranger = format!("i979-stranger-{tag}");
-        for k in [&id, &occ, &stranger] {
+        // v59.0.0 (#1099) — the occurrence is an AGENT key, not a roster key:
+        // the identity's withdrawal of it lands at once (the two-key roster
+        // rule is held by `self_roster_invariants`).
+        for k in [&id, &stranger] {
             ts::register_identity_key(b, k, identity_type::USER).await;
         }
+        ts::register_identity_key(b, &occ, identity_type::AGENT).await;
         let at = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(
             (chrono::Utc::now() - chrono::Duration::seconds(120)).timestamp_millis(),
         )

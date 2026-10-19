@@ -24,6 +24,9 @@
 //!   steward; a key of another self does neither.
 //! - **I1138 (compat)** — a pending addition is served neither framed nor as
 //!   an `identity:occurrence:v1` row; once it lands it is served both ways.
+//! - **I1140 (a node is not a roster key)** — a node its owner bound
+//!   publishes its own occurrence; its signature on a user-role key's is
+//!   refused `proposer_not_on_roster`, and nothing is held.
 //! - **I1139 (two nodes)** — a proposal and its assent delivered through the
 //!   attestation plane land on the receiving node too.
 
@@ -475,6 +478,40 @@ pub(crate) mod bodies {
         }
     }
 
+    /// **I1140** — a node is not a roster key: a node its owner bound may
+    /// still publish its own occurrence under the owner, but its signature on
+    /// a user-role key's occurrence is refused (`proposer_not_on_roster`) and
+    /// no proposal is held.
+    pub(crate) async fn i1140_a_node_does_not_add_roster_keys(
+        d: &dyn FederationDirectory,
+        tag: &str,
+    ) {
+        let (f, node, dev) = (format!("f-{tag}"), format!("n-{tag}"), format!("v-{tag}"));
+        keys(d, &[&f, &dev]).await;
+        ts::register_hybrid_key_as(d, &node, &node, it::NODE).await;
+        d.put_attestation(SignedAttestation {
+            attestation: binding(&f, &node),
+        })
+        .await
+        .expect("I1140: f owns the node");
+        add(d, &node, &f, &node, ms_now())
+            .await
+            .expect("I1140: a node publishes its own occurrence under its owner");
+        match add(d, &node, &f, &dev, ms_now()).await {
+            Err(Error::SelfRosterNotLanded {
+                decision: "proposer_not_on_roster",
+                ..
+            }) => {}
+            other => panic!("I1140: a node adding a user-role key: {other:?}"),
+        }
+        assert!(!active(d, &f, &dev).await);
+        assert!(d
+            .list_open_self_roster_proposals(Some(&f))
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
     /// **I1138** — compat: pending is served neither framed nor as a row.
     pub(crate) async fn i1138_pending_is_not_served(d: &dyn FederationDirectory, tag: &str) {
         let (f, d1, d2) = (format!("f-{tag}"), format!("d1-{tag}"), format!("d2-{tag}"));
@@ -620,6 +657,7 @@ mod tests {
     on_every_backend!(i1136, bodies::i1136_the_window_is_the_nodes);
     on_every_backend!(i1137, bodies::i1137_a_second_device_acts_as_its_self);
     on_every_backend!(i1138, bodies::i1138_pending_is_not_served);
+    on_every_backend!(i1140, bodies::i1140_a_node_does_not_add_roster_keys);
 
     mod i1139 {
         use super::*;
