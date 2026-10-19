@@ -32,6 +32,8 @@
 //!   sign for the self, and is no steward; the fedID string survives.
 //! - **I1142 (W bound)** — an evicted key signing inside its old live window
 //!   but more than W ago is refused `asserted_at_stale` at both steward gates.
+//! - **I1143 (withdrawn)** — a proposer's `withdraws` of its proposal row
+//!   takes it out of the decision; it never lands; the slot is free.
 //! - **I1139 (two nodes)** — a proposal and its assent delivered through the
 //!   attestation plane land on the receiving node too.
 
@@ -646,6 +648,59 @@ pub(crate) mod bodies {
         assert!(cbh::grant_is_authored_for(d, &fresh, &node).await.unwrap());
     }
 
+    /// **I1143** — a proposer withdraws its open proposal: it leaves the
+    /// standing set, never lands, and the proposer's one slot is free again.
+    pub(crate) async fn i1143_the_proposer_withdraws(d: &dyn FederationDirectory, tag: &str) {
+        let (f, d1, d2, d3) = (
+            format!("f-{tag}"),
+            format!("d1-{tag}"),
+            format!("d2-{tag}"),
+            format!("d3-{tag}"),
+        );
+        keys(d, &[&f, &d1, &d2, &d3]).await;
+        add(d, &f, &f, &d1, ms_now()).await.expect("one key");
+        let p = pending(
+            add(d, &d1, &f, &d2, ms_now()).await,
+            "I1143: d1 proposes d2",
+        );
+        let row = d.get_attestation(&p).await.unwrap().expect("held");
+        let id = uuid::Uuid::new_v4().to_string();
+        let mut w = ts::bare_attestation(
+            &id,
+            &d1,
+            &row.attested_key_id,
+            &serde_json::json!({ "references_attestation_id": p, "withdrawal_reason": "mine" }),
+        );
+        w.attestation_type = attestation_type::WITHDRAWS.into();
+        w.weight = None;
+        w.asserted_at = ms_now();
+        w.scrub_timestamp = w.asserted_at;
+        ts::seal_row_in_place(&d1, &mut w);
+        d.put_attestation(SignedAttestation { attestation: w })
+            .await
+            .expect("I1143: the proposer withdraws its proposal");
+        assert!(
+            sr::standing(d, &f).await.unwrap().is_empty(),
+            "I1143: withdrawn"
+        );
+        settle(d, &f).await;
+        assert!(d
+            .list_open_self_roster_proposals(Some(&f))
+            .await
+            .unwrap()
+            .is_empty());
+        vote(d, &f, &f, &p, true).await;
+        assert!(
+            !active(d, &f, &d2).await,
+            "I1143: a withdrawn proposal never lands"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let _ = pending(
+            add(d, &d1, &f, &d3, ms_now()).await,
+            "I1143: the slot is free",
+        );
+    }
+
     /// **I1138** — compat: pending is served neither framed nor as a row.
     pub(crate) async fn i1138_pending_is_not_served(d: &dyn FederationDirectory, tag: &str) {
         let (f, d1, d2) = (format!("f-{tag}"), format!("d1-{tag}"), format!("d2-{tag}"));
@@ -792,6 +847,7 @@ mod tests {
     on_every_backend!(i1137, bodies::i1137_a_second_device_acts_as_its_self);
     on_every_backend!(i1138, bodies::i1138_pending_is_not_served);
     on_every_backend!(i1140, bodies::i1140_a_node_does_not_add_roster_keys);
+    on_every_backend!(i1143, bodies::i1143_the_proposer_withdraws);
     on_every_backend!(i1141, bodies::i1141_the_genesis_key_is_evictable);
     on_every_backend!(
         i1142,

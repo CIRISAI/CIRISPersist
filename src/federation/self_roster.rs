@@ -858,7 +858,13 @@ pub struct Standing {
 struct Plan {
     roster: BTreeSet<String>,
     entries: Vec<(Proposal, Answers, Carried, TwoPathDecision)>,
+    /// Open proposals their proposer withdrew (a `withdraws` against the
+    /// proposal row): out of the decision, settled `withdrawn` by the executor.
+    withdrawn: Vec<String>,
 }
+
+/// The settle outcome of a proposal its proposer withdrew.
+pub const WITHDRAWN_OUTCOME: &str = "withdrawn";
 
 async fn plan<D>(
     dir: &D,
@@ -871,7 +877,18 @@ where
 {
     let roster = roster_now(dir, identity).await?;
     let mut held: Vec<(Proposal, Carried)> = Vec::new();
-    for receipt in dir.list_open_self_roster_proposals(Some(identity)).await? {
+    let receipts = dir.list_open_self_roster_proposals(Some(identity)).await?;
+    // A proposal leaves `pending` when its proposer withdraws its row (CC
+    // rc9 `2643ff1`: the self roster's open proposal is cleared by the
+    // proposer's withdraws).
+    let ids: Vec<String> = receipts.iter().map(|r| r.proposal_id.clone()).collect();
+    let composers = if ids.is_empty() {
+        Vec::new()
+    } else {
+        dir.list_composers_referencing_any(&ids, None, None).await?
+    };
+    let mut withdrawn = Vec::new();
+    for receipt in receipts {
         let Some(row) = dir.get_attestation(&receipt.proposal_id).await? else {
             continue;
         };
@@ -882,6 +899,16 @@ where
                 continue;
             }
         };
+        if composers.iter().any(|w| {
+            w.attestation_type == attestation_type::WITHDRAWS
+                && w.attesting_key_id == carried.proposer()
+                && super::precedence::references_attestation_id_from_envelope(
+                    &w.attestation_envelope,
+                ) == Some(receipt.proposal_id.as_str())
+        }) {
+            withdrawn.push(receipt.proposal_id);
+            continue;
+        }
         held.push((
             proposal_of(&carried, &receipt.proposal_id, receipt.received_at),
             carried,
@@ -911,7 +938,11 @@ where
             entries.push((p, a, c, d));
         }
     }
-    Ok(Plan { roster, entries })
+    Ok(Plan {
+        roster,
+        entries,
+        withdrawn,
+    })
 }
 
 fn proposal_of(carried: &Carried, id: &str, received_at: DateTime<Utc>) -> Proposal {
@@ -1144,6 +1175,10 @@ where
     loop {
         let now = roster_clock();
         let plan = plan(dir, identity, None, now).await?;
+        for id in &plan.withdrawn {
+            dir.settle_self_roster_proposal(id, WITHDRAWN_OUTCOME, now)
+                .await?;
+        }
         for (p, _, _, d) in &plan.entries {
             if matches!(
                 d,

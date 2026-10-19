@@ -44,6 +44,13 @@ threat-model citations because this crate's audit story is the point.
   `cancel_needs_everyone`, `cancel_above_enact`, `enact_below_strict_majority`,
   `floor_above_enact`, `cancel_by_single_voter`, `enact_needs_everyone`,
   `floor_below_two_voters` (not for `SameIdentity`), `window_below_floor`.
+- `cancel_over: CancelOver::{Base, Others}` (CC rc9 `2643ff1`, pin `d1b209f2`):
+  every community row cancels over ENACT's base, proposer counted; the self
+  roster over the others. A self-roster proposal its proposer withdraws (a
+  `withdraws` against its `objection:proposal:v1` row) leaves the decision and
+  settles `withdrawn` (I1143). The halt's `lapsed` and moderation's `tallied`
+  window outcomes are not built: neither door is in v59 and no vector reaches
+  them.
 - The self roster is `TwoPathPolicy::self_roster(86 400)`: strict majority of
   the roster forward, of the others reverse, floor `0/1` lifted to one key
   (`SameIdentity`), reversible, `AtWindow::StayOpen` (as `SelfRoster.tla`) —

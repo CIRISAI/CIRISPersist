@@ -194,15 +194,32 @@ impl FloorClass {
     }
 }
 
+/// What CANCEL's fraction runs over (CC rc9 `2643ff1`, `governance_policy.json`
+/// pin `d1b209f2`, every row).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelOver {
+    /// The same base as ENACT, proposer counted: every community row, and the
+    /// halt's majority confirm over the standing holders.
+    Base,
+    /// The base without the proposer, `|member \ {proposer}|`: the self
+    /// roster's "strict majority of the OTHER members" (`self_roster_add` /
+    /// `self_roster_evict`).
+    Others,
+}
+
 /// What the window's close does to a proposal below ENACT that the reverse
-/// path does not land.
+/// path does not land. Per family (CC rc9 `2643ff1`): `Cancel` for every
+/// community row, `StayOpen` for the self roster. The halt's `lapsed` and
+/// moderation's `tallied` outcomes are not variants here: neither door is in
+/// v59 and no vector exercises them; the cosigned custodian row has none.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AtWindow {
     /// It is cancelled ([`TwoPathDecision::Cancelled`]) — CC `formal/two_path`
     /// `TwoPath.tla` `WindowCloses`, the `governance_policy` decider.
     Cancel,
     /// It stays open for the forward path — CC `formal/self_roster`
-    /// `SelfRoster.tla`, where a proposal leaves `pending` only by `Execute`.
+    /// `SelfRoster.tla`, where a proposal leaves `pending` only by `Execute` —
+    /// until its proposer withdraws it (the door, `super::self_roster`).
     StayOpen,
 }
 
@@ -218,8 +235,8 @@ pub struct TwoPathPolicy {
     /// the proposal is cancelled (or, [`AtWindow::StayOpen`], kept from the
     /// reverse path). `None`: nothing cancels.
     pub cancel: Option<Threshold>,
-    /// Take the proposer out of CANCEL's base.
-    pub cancel_excludes_proposer: bool,
+    /// What CANCEL's count runs over.
+    pub cancel_over: CancelOver,
     /// The approval floor of the reverse path (proposer counted), consulted
     /// only at the window: silence alone never lands a proposal below it.
     pub floor: Option<Threshold>,
@@ -285,7 +302,7 @@ impl TwoPathPolicy {
             base: Base::StandingRoster,
             enact: Threshold::StrictMajority,
             cancel: Some(Threshold::StrictMajority),
-            cancel_excludes_proposer: true,
+            cancel_over: CancelOver::Others,
             floor: Some(Threshold::Fraction {
                 num: 0,
                 den: 1,
@@ -312,7 +329,7 @@ impl TwoPathPolicy {
             roster,
             proposer,
             Side::Reverse,
-            self.cancel_excludes_proposer,
+            self.cancel_over == CancelOver::Others,
         );
         self.resolve_over(fwd, rev)
     }
@@ -1191,7 +1208,7 @@ mod tests {
             base: Base::StandingRoster,
             enact: more(2, 3),
             cancel: Some(least(1, 3)),
-            cancel_excludes_proposer: false,
+            cancel_over: CancelOver::Base,
             floor: Some(least(1, 3)),
             floor_class: FloorClass::Voters,
             reverse_path: true,
@@ -1463,7 +1480,7 @@ mod tests {
                 base: Base::StandingRoster,
                 enact: frac(&row["enact"], Cmp::MoreThan).expect("a numeric enact"),
                 cancel: frac(&row["cancel"], Cmp::AtLeast),
-                cancel_excludes_proposer: false,
+                cancel_over: CancelOver::Base,
                 floor: frac(&row["floor"], Cmp::AtLeast),
                 floor_class: FloorClass::Voters,
                 reverse_path: row["reverse_path"].as_bool().expect("reverse_path"),
