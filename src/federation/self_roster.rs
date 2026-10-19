@@ -85,8 +85,8 @@ use chrono::{DateTime, Duration, Utc};
 
 use super::key_plane::{MintedFamily, PlaneSignature};
 use super::two_path::{
-    self, Answers, LandingPath, Proposal, ProposalKind, SilenceRule, TwoPathDecision,
-    TwoPathPolicy, TwoPathRefusal,
+    self, Answers, LandingPath, Proposal, ProposalKind, TwoPathDecision, TwoPathPolicy,
+    TwoPathRefusal,
 };
 use super::types::{
     attestation_type, identity_type, Attestation, SignedIdentityOccurrence,
@@ -100,12 +100,7 @@ pub const W_SELF_SECS: i64 = 86_400;
 /// The self roster's conditions on the two paths (CC 3.3.6.3).
 #[must_use]
 pub fn policy() -> TwoPathPolicy {
-    TwoPathPolicy {
-        window: Duration::seconds(W_SELF_SECS),
-        silence: SilenceRule::EvictOnly,
-        one_open_per_proposer: true,
-        one_open_per_target: true,
-    }
+    TwoPathPolicy::self_roster(Duration::seconds(W_SELF_SECS))
 }
 
 /// The proposal row's dimension (CC 3.1.9.2 `objection:{state}`; minted here).
@@ -947,11 +942,13 @@ where
         }
         return Ok(());
     }
+    // Terminal: no answer mends it. (`Cancelled` cannot arise under the self
+    // roster's `AtWindow::StayOpen`; a policy that cancels settles it here.)
     let refused_for_good = matches!(
         decision,
         TwoPathDecision::Refused {
             reason: TwoPathRefusal::ProposerNotOnRoster
-        }
+        } | TwoPathDecision::Cancelled
     );
     if !refused_for_good && dir.get_attestation(&id).await?.is_none() {
         dir.put_attestation(super::SignedAttestation { attestation: row })
@@ -1062,11 +1059,12 @@ where
         let now = roster_clock();
         let plan = plan(dir, identity, None, now).await?;
         for (p, _, _, d) in &plan.entries {
-            if *d
-                == (TwoPathDecision::Refused {
+            if matches!(
+                d,
+                TwoPathDecision::Refused {
                     reason: TwoPathRefusal::ProposerNotOnRoster,
-                })
-            {
+                } | TwoPathDecision::Cancelled
+            ) {
                 dir.settle_self_roster_proposal(&p.id, d.token(), now)
                     .await?;
             }

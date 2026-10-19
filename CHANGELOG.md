@@ -25,6 +25,29 @@ threat-model citations because this crate's audit story is the point.
   tokens: `proposer_not_on_roster`, `target_already_on_roster`,
   `target_not_on_roster`, `proposer_is_target`, `proposer_has_open_proposal`,
   `target_has_open_proposal`.
+- **The policy is data** (steward direction 2026-10-18; CC rc9 `fdabfe4`
+  `formal/two_path`; CIRISPersist#1100, CIRISConstitution#180):
+  `TwoPathPolicy { enact, cancel, floor, base, floor_class, at_window,
+  irreversible, window, silence, one_open_per_proposer, one_open_per_target }`.
+  Thresholds are `Threshold::{StrictMajority, MoreThan{num,den},
+  AtLeast{num,den}, Keys(k)}` resolved over `Base::StandingRoster`
+  (`Base::count`, so a future expected-active base is data). The reverse path
+  lands at the window only if objections stayed below CANCEL and approvals
+  (proposer counted) reached FLOOR; otherwise, under `AtWindow::Cancel`, the
+  proposal is `TwoPathDecision::Cancelled` (token `cancelled`). `irreversible`
+  removes the instant landing: a full ENACT quorum waits out the window and a
+  CANCEL quorum inside it stops it. `TwoPathPolicy::check_corridor(base_n,
+  floor_secs)` is `PolicyCorridor.lean`'s `inCorridor`, refusing with
+  `enact_by_single_voter`, `cancel_needs_everyone`, `cancel_above_enact`,
+  `enact_below_strict_majority`, `floor_above_enact`, `cancel_by_single_voter`,
+  `enact_needs_everyone`, `floor_below_two_voters` (unless
+  `FloorClass::SameIdentity`), `window_below_floor`. The self roster is
+  `TwoPathPolicy::self_roster`: strict majority both ways, floor one key
+  (`SameIdentity`), 86 400 s, reversible, `AtWindow::StayOpen` — its door's
+  behaviour is unchanged. It is in its own corridor at one and at three keys;
+  at two it is outside (`cancel_needs_everyone`), the stated two-key bound.
+  No community default is built: enact 2/3, cancel 1/3, floor 1/3 appears only
+  as a test's named example.
 - The six CC `formal/self_roster` traces (rc9 `cb0513c8`) are vendored under
   `tests/fixtures/self_roster/` and replayed as door tests: every `Execute` of
   `combined3_stolen`, `combined3_lost` and `combined4_mixed` lands (by the path

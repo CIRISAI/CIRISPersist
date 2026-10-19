@@ -83,9 +83,135 @@ pub enum SilenceRule {
     Never,
 }
 
-/// A door's conditions on the two paths.
+/// A threshold, resolved over a vote count's base `n` to the votes it needs
+/// ([`Self::votes`]). The forms are CC `formal/two_path` `PolicyCorridor.lean`'s:
+/// ENACT is read strictly (`votes · den > num · n`), CANCEL and FLOOR at least
+/// (`votes · den ≥ num · n`). No form ever resolves below one vote except a
+/// zero fraction, which the corridor refuses ([`TwoPathPolicy::check_corridor`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Threshold {
+    /// A strict majority: verify-core's
+    /// [`strict_majority`](ciris_verify_core::accord_genesis::strict_majority).
+    StrictMajority,
+    /// More than `num/den` of the base (`⌊num·n/den⌋ + 1`).
+    MoreThan {
+        /// Numerator.
+        num: u32,
+        /// Denominator (non-zero).
+        den: u32,
+    },
+    /// At least `num/den` of the base (`⌈num·n/den⌉`).
+    AtLeast {
+        /// Numerator.
+        num: u32,
+        /// Denominator (non-zero).
+        den: u32,
+    },
+    /// A fixed number of votes, whatever the base (the self roster's floor of
+    /// one key, which only [`FloorClass::SameIdentity`] may declare).
+    Keys(usize),
+}
+
+impl Threshold {
+    /// The votes this threshold needs over a base of `n`.
+    #[must_use]
+    pub fn votes(self, n: usize) -> usize {
+        let frac = |num: u32, den: u32, ceil: bool| -> usize {
+            let (num, den) = (num as usize, (den as usize).max(1));
+            if ceil {
+                (num * n).div_ceil(den)
+            } else {
+                num * n / den + 1
+            }
+        };
+        match self {
+            Self::StrictMajority => strict_majority(n),
+            Self::MoreThan { num, den } => frac(num, den, false),
+            Self::AtLeast { num, den } => frac(num, den, true),
+            Self::Keys(k) => k,
+        }
+    }
+}
+
+/// Which side of a proposal a count is taken on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Side {
+    /// Approvals (the proposer counted): ENACT and FLOOR.
+    Forward,
+    /// Objections from the others (a proposer does not object to itself):
+    /// CANCEL.
+    Reverse,
+}
+
+/// What a policy's thresholds are taken over (CIRISPersist#1100,
+/// CIRISConstitution#180). Only the standing roster is built; a future
+/// expected-active base is the steward's to define, and adding it is data:
+/// every threshold resolves through [`Self::count`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Base {
+    /// The live (standing) roster at the decision instant: every member for
+    /// the forward side, every member but the proposer for the reverse side.
+    StandingRoster,
+}
+
+impl Base {
+    /// The count `side`'s threshold resolves over.
+    #[must_use]
+    pub fn count(self, roster: &BTreeSet<String>, proposer: &str, side: Side) -> usize {
+        match self {
+            Self::StandingRoster => match side {
+                Side::Forward => roster.len(),
+                Side::Reverse => roster.len() - usize::from(roster.contains(proposer)),
+            },
+        }
+    }
+}
+
+/// Who the floor's voters are (CC rc9 `fdabfe4`, CIRISConstitution#180).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FloorClass {
+    /// Voters are distinct people: a floor below two voters is the chaos pole
+    /// (`zero_floor_is_chaos`), refused by the corridor.
+    Community,
+    /// Every voter is a key of ONE person (the self roster, CC 3.3.6.3): a
+    /// floor of one key is that person's own act, and is allowed.
+    SameIdentity,
+}
+
+/// What the window's close does to a proposal below ENACT that the reverse
+/// path does not land (cancel reached, or approvals below the floor).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AtWindow {
+    /// It is cancelled ([`TwoPathDecision::Cancelled`]) — CC `formal/two_path`
+    /// `TwoPath.tla` `WindowCloses`.
+    Cancel,
+    /// It stays open for the forward path — CC `formal/self_roster`
+    /// `SelfRoster.tla`, where a proposal leaves `pending` only by `Execute`.
+    StayOpen,
+}
+
+/// A door's policy on the two paths: three thresholds over one base, a
+/// window, irreversibility, and the per-door conditions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TwoPathPolicy {
+    /// The forward threshold over approvals (proposer counted): lands at once.
+    pub enact: Threshold,
+    /// The reverse threshold over the others' objections: the reverse path
+    /// cannot land a proposal whose objections reached it.
+    pub cancel: Threshold,
+    /// The approval floor of the reverse path (proposer counted): silence
+    /// alone never lands a proposal below it.
+    pub floor: Threshold,
+    /// What the thresholds resolve over.
+    pub base: Base,
+    /// Who the floor's voters are.
+    pub floor_class: FloorClass,
+    /// What the window's close does to a proposal the reverse path does not land.
+    pub at_window: AtWindow,
+    /// No instant landing: even a full ENACT quorum waits out the window, and
+    /// a CANCEL quorum inside it stops it (secrets destroyed, a hard delete,
+    /// a key destroyed).
+    pub irreversible: bool,
     /// The lone path's window, on the node's clock.
     pub window: Duration,
     /// The target-silence condition.
@@ -95,6 +221,145 @@ pub struct TwoPathPolicy {
     /// At most one open proposal of a kind names a target (the model's
     /// `~\E p \in pending : p.kind = kind /\ p.target = target`).
     pub one_open_per_target: bool,
+}
+
+impl TwoPathPolicy {
+    /// **The self roster's instance** (CC 3.3.6.3): ENACT a strict majority of
+    /// the live roster, proposer counted; CANCEL a strict majority of the
+    /// others; FLOOR one key ([`FloorClass::SameIdentity`]: every key is the
+    /// same person's); reversible; target silence for evictions; one open
+    /// proposal per proposer and per target; and, as `SelfRoster.tla` has it,
+    /// a proposal the window does not land stays open for the quorum path
+    /// ([`AtWindow::StayOpen`]). At one key ENACT is one vote: the add-device
+    /// approval.
+    #[must_use]
+    pub fn self_roster(window: Duration) -> Self {
+        Self {
+            enact: Threshold::StrictMajority,
+            cancel: Threshold::StrictMajority,
+            floor: Threshold::Keys(1),
+            base: Base::StandingRoster,
+            floor_class: FloorClass::SameIdentity,
+            at_window: AtWindow::StayOpen,
+            irreversible: false,
+            window,
+            silence: SilenceRule::EvictOnly,
+            one_open_per_proposer: true,
+            one_open_per_target: true,
+        }
+    }
+
+    /// **The corridor** (CC rc9 `formal/two_path/PolicyCorridor.lean`
+    /// `inCorridor`; CIRISPersist#1100, CIRISConstitution#180): is this policy,
+    /// over a base of `base_n` voters and a window floor of `floor_secs`,
+    /// between the rigidity pole and the chaos pole? Every threshold is
+    /// resolved over `base_n`. Clauses, in the order they are asked: enact
+    /// not reachable by one voter; cancel not needing everyone; cancel ≤
+    /// enact; enact ≥ a strict majority; floor ≤ enact; cancel not reachable
+    /// by one voter; enact not needing everyone (the four pole clauses waived
+    /// at `base_n = 1`, the unilateral one-key case); a floor of at
+    /// least two voters unless [`FloorClass::SameIdentity`]; the window at
+    /// least `floor_secs`.
+    ///
+    /// # Errors
+    ///
+    /// The first clause that fails, as a [`CorridorRefusal`].
+    pub fn check_corridor(&self, base_n: usize, floor_secs: i64) -> Result<(), CorridorRefusal> {
+        let (e, c, f) = (
+            self.enact.votes(base_n),
+            self.cancel.votes(base_n),
+            self.floor.votes(base_n),
+        );
+        let refuse = |r| Err(r);
+        let many = base_n > 1;
+        // The poles first, each by its own token (a later clause implies
+        // them, which would hide which pole a policy sits on).
+        if many && e <= 1 {
+            return refuse(CorridorRefusal::EnactBySingleVoter);
+        }
+        if many && c >= base_n {
+            return refuse(CorridorRefusal::CancelNeedsEveryone);
+        }
+        if c > e {
+            return refuse(CorridorRefusal::CancelAboveEnact);
+        }
+        if e < strict_majority(base_n) {
+            return refuse(CorridorRefusal::EnactBelowStrictMajority);
+        }
+        if f > e {
+            return refuse(CorridorRefusal::FloorAboveEnact);
+        }
+        if many && c <= 1 {
+            return refuse(CorridorRefusal::CancelBySingleVoter);
+        }
+        if many && e >= base_n {
+            return refuse(CorridorRefusal::EnactNeedsEveryone);
+        }
+        if f < 2 && self.floor_class != FloorClass::SameIdentity {
+            return refuse(CorridorRefusal::FloorBelowTwoVoters);
+        }
+        if self.window.num_seconds() < floor_secs {
+            return refuse(CorridorRefusal::WindowBelowFloor);
+        }
+        Ok(())
+    }
+}
+
+/// Why a policy is outside the corridor ([`TwoPathPolicy::check_corridor`]).
+/// Stable snake_case tokens ([`Self::as_str`]); APPEND-ONLY.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CorridorRefusal {
+    /// Cancelling takes more votes than enacting.
+    CancelAboveEnact,
+    /// Enacting takes less than a strict majority.
+    EnactBelowStrictMajority,
+    /// The reverse path's floor is above enact (it switches the reverse path off).
+    FloorAboveEnact,
+    /// One voter cancels (the rigidity pole: the single veto).
+    CancelBySingleVoter,
+    /// Enacting needs every voter (the rigidity pole: unanimity).
+    EnactNeedsEveryone,
+    /// One voter enacts (the chaos pole).
+    EnactBySingleVoter,
+    /// Cancelling needs every voter (the chaos pole: nothing stops a change).
+    CancelNeedsEveryone,
+    /// The reverse path lands on fewer than two voices (`zero_floor_is_chaos`),
+    /// and the policy is not [`FloorClass::SameIdentity`].
+    FloorBelowTwoVoters,
+    /// The window is below the family's floor.
+    WindowBelowFloor,
+}
+
+impl CorridorRefusal {
+    /// Every refusal, in declaration order.
+    pub const ALL: [Self; 9] = [
+        Self::CancelAboveEnact,
+        Self::EnactBelowStrictMajority,
+        Self::FloorAboveEnact,
+        Self::CancelBySingleVoter,
+        Self::EnactNeedsEveryone,
+        Self::EnactBySingleVoter,
+        Self::CancelNeedsEveryone,
+        Self::FloorBelowTwoVoters,
+        Self::WindowBelowFloor,
+    ];
+
+    /// The stable program token, identical to the serde spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CancelAboveEnact => "cancel_above_enact",
+            Self::EnactBelowStrictMajority => "enact_below_strict_majority",
+            Self::FloorAboveEnact => "floor_above_enact",
+            Self::CancelBySingleVoter => "cancel_by_single_voter",
+            Self::EnactNeedsEveryone => "enact_needs_everyone",
+            Self::EnactBySingleVoter => "enact_by_single_voter",
+            Self::CancelNeedsEveryone => "cancel_needs_everyone",
+            Self::FloorBelowTwoVoters => "floor_below_two_voters",
+            Self::WindowBelowFloor => "window_below_floor",
+        }
+    }
 }
 
 /// One proposal, as a door read it.
@@ -205,6 +470,10 @@ pub enum TwoPathDecision {
         /// Why.
         reason: TwoPathRefusal,
     },
+    /// Its window closed below ENACT with objections at CANCEL or approvals
+    /// below the floor, under [`AtWindow::Cancel`]: void, for good. Distinct
+    /// from a refusal, which is about the proposal's shape, not its answers.
+    Cancelled,
 }
 
 impl TwoPathDecision {
@@ -215,6 +484,7 @@ impl TwoPathDecision {
             Self::Lands { .. } => "lands",
             Self::Pending { .. } => "pending",
             Self::Refused { reason } => reason.as_str(),
+            Self::Cancelled => "cancelled",
         }
     }
 
@@ -282,18 +552,24 @@ pub fn decide(
         .filter(|k| !objectors.contains(k))
         .collect();
 
-    // QuorumLands: approvers ∪ {proposer} is a strict majority of the roster.
-    let quorum = strict_majority(roster.len());
+    let forward = policy.base.count(roster, &proposal.proposer, Side::Forward);
+    let reverse = policy.base.count(roster, &proposal.proposer, Side::Reverse);
+    let enact = policy.enact.votes(forward);
     let yes = approvers.len() + 1;
-    if yes >= quorum {
+    let objected = objectors.len() >= policy.cancel.votes(reverse);
+    let opens_at = proposal.received_at + policy.window;
+    let closed = now >= opens_at;
+
+    // QuorumLands: approvers ∪ {proposer} reach ENACT — at once, unless the
+    // change is irreversible, when it waits out the window and a CANCEL
+    // quorum inside it stops it.
+    if yes >= enact && (!policy.irreversible || (closed && !objected)) {
         return TwoPathDecision::Lands {
             path: LandingPath::Quorum,
         };
     }
 
     // LoneLands.
-    let others = roster.len() - 1;
-    let objected = objectors.len() >= strict_majority(others);
     let silence_asked = match policy.silence {
         SilenceRule::EvictOnly => proposal.kind == ProposalKind::Evict,
         SilenceRule::Never => false,
@@ -303,16 +579,21 @@ pub fn decide(
             .target_acts
             .iter()
             .any(|at| *at >= proposal.received_at);
-    let opens_at = proposal.received_at + policy.window;
     let lone_open = !objected && !spoke;
-    if lone_open && now >= opens_at {
-        return TwoPathDecision::Lands {
-            path: LandingPath::Lone,
-        };
+    let floored = yes >= policy.floor.votes(forward);
+    if closed {
+        if lone_open && floored {
+            return TwoPathDecision::Lands {
+                path: LandingPath::Lone,
+            };
+        }
+        if policy.at_window == AtWindow::Cancel {
+            return TwoPathDecision::Cancelled;
+        }
     }
     TwoPathDecision::Pending {
         earliest_lone_at: lone_open.then_some(opens_at),
-        needs: quorum - yes,
+        needs: enact.saturating_sub(yes),
     }
 }
 
@@ -348,7 +629,10 @@ pub fn decide_all<'p>(
                 .any(|q| q.kind == p.kind && q.target == p.target),
         };
         let d = decide(roster, p, answers, ahead, now, policy);
-        if !matches!(d, TwoPathDecision::Refused { .. }) {
+        if !matches!(
+            d,
+            TwoPathDecision::Refused { .. } | TwoPathDecision::Cancelled
+        ) {
             open.push(p);
         }
         out.push((p, d));
@@ -367,12 +651,7 @@ mod tests {
     const W: i64 = 86_400;
 
     fn policy() -> TwoPathPolicy {
-        TwoPathPolicy {
-            window: Duration::seconds(W),
-            silence: SilenceRule::EvictOnly,
-            one_open_per_proposer: true,
-            one_open_per_target: true,
-        }
+        TwoPathPolicy::self_roster(Duration::seconds(W))
     }
 
     fn keys(n: usize) -> Vec<String> {
@@ -729,6 +1008,216 @@ mod tests {
                 reason: TwoPathRefusal::TargetHasOpenProposal
             }
         );
+    }
+
+    fn community(at_window: AtWindow) -> TwoPathPolicy {
+        // CIRISConstitution#180's named example (data for #1100, not a default
+        // of this crate): enact 2/3, cancel 1/3, floor 1/3, 72 h.
+        TwoPathPolicy {
+            enact: Threshold::MoreThan { num: 2, den: 3 },
+            cancel: Threshold::AtLeast { num: 1, den: 3 },
+            floor: Threshold::AtLeast { num: 1, den: 3 },
+            base: Base::StandingRoster,
+            floor_class: FloorClass::Community,
+            at_window,
+            irreversible: false,
+            window: Duration::seconds(3 * W),
+            silence: SilenceRule::Never,
+            one_open_per_proposer: true,
+            one_open_per_target: true,
+        }
+    }
+
+    /// The threshold forms resolve as `PolicyCorridor.lean` reads them:
+    /// ENACT strictly, CANCEL and FLOOR at least.
+    #[test]
+    fn thresholds_resolve_as_the_corridor_model() {
+        let p = community(AtWindow::Cancel);
+        assert_eq!(
+            (p.enact.votes(10), p.cancel.votes(10)),
+            (7, 4),
+            "small_community_pays_full"
+        );
+        assert_eq!(
+            p.cancel.votes(10_000),
+            3_334,
+            "standing_fraction_dies_with_size"
+        );
+        for n in 0..=7 {
+            assert_eq!(Threshold::StrictMajority.votes(n), strict_majority(n));
+        }
+        assert_eq!(Threshold::Keys(1).votes(9), 1);
+    }
+
+    /// **Irreversible**: a full ENACT quorum stays pending until the window
+    /// closes, then lands; a CANCEL quorum inside the window stops it, and the
+    /// window's close cancels it.
+    #[test]
+    fn irreversible_waits_out_the_window_and_a_cancel_quorum_stops_it() {
+        let mut p = community(AtWindow::Cancel);
+        p.irreversible = true;
+        let r = roster(6);
+        let prop1 = prop(ProposalKind::Add, "d1", "spare", 0);
+        let all = answers(&["d2", "d3", "d4", "d5", "d6"], &[], &[]);
+        let d = |a: &Answers, now| decide(&r, &prop1, a, OpenAhead::default(), t(now), &p);
+        assert_eq!(
+            d(&all, 0),
+            TwoPathDecision::Pending {
+                earliest_lone_at: Some(t(3 * W)),
+                needs: 0
+            },
+            "a full quorum does not land an irreversible change at once"
+        );
+        assert!(!d(&all, 3 * W - 1).lands());
+        assert_eq!(
+            d(&all, 3 * W),
+            TwoPathDecision::Lands {
+                path: LandingPath::Quorum
+            }
+        );
+        let five_two = Answers {
+            approvers: set(&["d2", "d3", "d4", "d5"]),
+            objectors: set(&["d6"]),
+            target_acts: Vec::new(),
+        };
+        // 5 yes (proposer counted) ≥ enact 5; 1 objection < cancel 2: lands at the window.
+        assert!(d(&five_two, 3 * W).lands());
+        let blocked = Answers {
+            approvers: set(&["d2", "d3", "d4"]),
+            objectors: set(&["d5", "d6"]),
+            target_acts: Vec::new(),
+        };
+        assert!(!d(&blocked, 0).lands());
+        assert_eq!(d(&blocked, 3 * W), TwoPathDecision::Cancelled);
+        // Reversible, the same full quorum lands at once.
+        let reversible = community(AtWindow::Cancel);
+        assert!(decide(&r, &prop1, &all, OpenAhead::default(), t(0), &reversible).lands());
+    }
+
+    /// **Floor**: a lone proposal with no objection but approvals below the
+    /// floor is cancelled at its window; at the floor it lands.
+    #[test]
+    fn the_floor_cancels_silence_and_lands_at_the_floor() {
+        let p = community(AtWindow::Cancel);
+        let r = roster(6);
+        let lone = prop(ProposalKind::Add, "d1", "spare", 0);
+        let d = |a: &Answers, now| decide(&r, &lone, a, OpenAhead::default(), t(now), &p);
+        let silent = Answers::default();
+        assert!(matches!(d(&silent, 0), TwoPathDecision::Pending { .. }));
+        assert_eq!(
+            d(&silent, 3 * W),
+            TwoPathDecision::Cancelled,
+            "one voice by silence is the chaos pole's back door"
+        );
+        let one = answers(&["d2"], &[], &[]);
+        assert_eq!(
+            d(&one, 3 * W),
+            TwoPathDecision::Lands {
+                path: LandingPath::Lone
+            },
+            "2 of 6 approvals reach the 1/3 floor"
+        );
+        assert_eq!(TwoPathDecision::Cancelled.token(), "cancelled");
+        // The self roster's floor is one key: its silence still lands.
+        let sr = policy();
+        assert!(decide(&r, &lone, &silent, OpenAhead::default(), t(W), &sr).lands());
+    }
+
+    /// **The corridor**, clause by clause (PolicyCorridor.lean's examples).
+    #[test]
+    fn the_corridor_refuses_each_pole_by_its_token() {
+        let floor = W;
+        let ok = community(AtWindow::Cancel);
+        assert_eq!(ok.check_corridor(6, floor), Ok(()), "ruled_in_corridor");
+        assert_eq!(
+            ok.check_corridor(7, floor),
+            Ok(()),
+            "ruled_in_corridor_at_7"
+        );
+        let with = |f: &dyn Fn(&mut TwoPathPolicy)| {
+            let mut p = community(AtWindow::Cancel);
+            f(&mut p);
+            p
+        };
+        let cases: [(TwoPathPolicy, CorridorRefusal); 9] = [
+            (
+                with(&|p| p.enact = Threshold::MoreThan { num: 1, den: 7 }),
+                CorridorRefusal::EnactBySingleVoter,
+            ),
+            (
+                with(&|p| p.cancel = Threshold::AtLeast { num: 1, den: 1 }),
+                CorridorRefusal::CancelNeedsEveryone,
+            ),
+            (
+                with(&|p| {
+                    p.enact = Threshold::MoreThan { num: 1, den: 2 };
+                    p.cancel = Threshold::AtLeast { num: 5, den: 6 };
+                }),
+                CorridorRefusal::CancelAboveEnact,
+            ),
+            (
+                with(&|p| {
+                    p.enact = Threshold::AtLeast { num: 1, den: 3 };
+                    p.floor = Threshold::AtLeast { num: 1, den: 3 };
+                }),
+                CorridorRefusal::EnactBelowStrictMajority,
+            ),
+            (
+                with(&|p| p.floor = Threshold::AtLeast { num: 1, den: 1 }),
+                CorridorRefusal::FloorAboveEnact,
+            ),
+            (
+                with(&|p| p.cancel = Threshold::AtLeast { num: 1, den: 6 }),
+                CorridorRefusal::CancelBySingleVoter,
+            ),
+            (
+                with(&|p| p.enact = Threshold::MoreThan { num: 5, den: 6 }),
+                CorridorRefusal::EnactNeedsEveryone,
+            ),
+            (
+                with(&|p| p.floor = Threshold::AtLeast { num: 0, den: 1 }),
+                CorridorRefusal::FloorBelowTwoVoters,
+            ),
+            (
+                with(&|p| p.window = Duration::seconds(60)),
+                CorridorRefusal::WindowBelowFloor,
+            ),
+        ];
+        for (p, want) in cases {
+            assert_eq!(p.check_corridor(6, floor), Err(want), "{p:?}");
+        }
+        // A floor of one key is the self roster's, declared, not a silent case.
+        let mut one_key = community(AtWindow::Cancel);
+        one_key.floor = Threshold::Keys(1);
+        assert_eq!(
+            one_key.check_corridor(6, floor),
+            Err(CorridorRefusal::FloorBelowTwoVoters)
+        );
+        one_key.floor_class = FloorClass::SameIdentity;
+        assert_eq!(one_key.check_corridor(6, floor), Ok(()));
+        // The self roster is in its own corridor at three keys and one key; at
+        // two it is the stated bound (each side needs the other).
+        let sr = policy();
+        assert_eq!(
+            sr.check_corridor(3, W),
+            Ok(()),
+            "self_roster_in_own_corridor"
+        );
+        assert_eq!(
+            sr.check_corridor(1, W),
+            Ok(()),
+            "one key: the unilateral add"
+        );
+        assert_eq!(
+            sr.check_corridor(2, W),
+            Err(CorridorRefusal::CancelNeedsEveryone)
+        );
+        for r in CorridorRefusal::ALL {
+            assert_eq!(
+                serde_json::to_value(r).unwrap(),
+                serde_json::Value::String(r.as_str().into())
+            );
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────────
