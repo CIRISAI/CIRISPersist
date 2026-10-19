@@ -345,7 +345,9 @@ pub(crate) mod test_support {
         V52_NODES.lock().expect("v52 seam").contains(node)
     }
 
-    /// Admit (or stop admitting) the v52 shape for grants about `node`.
+    /// Admit (or stop admitting) the v52 shape for grants about `node`. Its
+    /// witnesses ride the sqlite / postgres test build.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     pub(crate) fn set_v52_shape(node: &str, on: bool) {
         let mut nodes = V52_NODES.lock().expect("v52 seam");
         if on {
