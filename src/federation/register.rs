@@ -3617,7 +3617,10 @@ mod tests {
 
     /// Apply one replicated record through the Engine wrapper.
     async fn apply_one(engine: &Engine, record: KeyRecord) -> ReplicatedKeyOutcome {
+        // v59.0.0: the Engine's framed door is retired; the trait method is
+        // the `key:record:v1` row door's executor, and this table is its.
         engine
+            .federation_directory()
             .apply_replicated_key_record(SignedKeyRecord { record })
             .await
             .expect("apply_replicated_key_record")
@@ -4033,6 +4036,7 @@ mod tests {
         // `Superseded` or `Inserted` here would be the canonical's own baked
         // record re-scrubbing itself — the hijack this test is named for.
         let outcome = engine
+            .federation_directory()
             .apply_replicated_key_record(sr.clone())
             .await
             .expect("apply");

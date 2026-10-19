@@ -38014,7 +38014,6 @@ mod tests {
             K::IdentityOccurrence,
             K::TransportDestination,
             K::Attestation,
-            K::IdentityOccurrenceRevocation,
         ] {
             assert!(
                 backend
@@ -38026,8 +38025,19 @@ mod tests {
             );
         }
 
+        // v59.0.0 — the framed occurrence revocation's carriage is retired.
+        assert!(matches!(
+            backend
+                .list_signed_records(K::IdentityOccurrenceRevocation, "node-x")
+                .await,
+            Err(crate::federation::Error::EnvelopeKindRetired { .. })
+        ));
+
         // An unknown subject is empty across all kinds.
-        for k in K::all() {
+        for k in K::all()
+            .iter()
+            .filter(|k| **k != K::IdentityOccurrenceRevocation)
+        {
             assert!(backend
                 .list_signed_records(*k, "nobody")
                 .await

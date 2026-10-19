@@ -4990,7 +4990,7 @@ mod tests {
              built for"
         );
         assert_eq!(
-            PERSIST_DIRECTORY_VTABLE.abi_version, 8,
+            PERSIST_DIRECTORY_VTABLE.abi_version, 9,
             "the shipped vtable must advertise what consumers pin against"
         );
     }

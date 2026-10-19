@@ -625,22 +625,28 @@ pub const SETTLE_EXEMPT: &[(EnvelopeKind, &str)] = &[
         EnvelopeKind::Key,
         "v58.0.0 (CIRISPersist#991): rides the attestation store as a key-plane row, whose \
          key-plane door settles a byte-identical re-offer (key_plane::apply_key_plane_row); \
-         the framed door a pre-v58 peer still drives is that family's own door, unchanged \
-         by the compat reads",
+         the framed door is retired (v59.0.0, sealed-transport floor) and answers \
+         federation_envelope_kind_retired",
     ),
     (
         EnvelopeKind::Revocation,
         "v58.0.0 (CIRISPersist#991): rides the attestation store as a key-plane row, whose \
          key-plane door settles a byte-identical re-offer (key_plane::apply_key_plane_row); \
-         the framed door a pre-v58 peer still drives is that family's own door, unchanged \
-         by the compat reads",
+         the framed door is retired (v59.0.0, sealed-transport floor) and answers \
+         federation_envelope_kind_retired",
     ),
     (
         EnvelopeKind::IdentityOccurrence,
         "v58.0.0 (CIRISPersist#991): rides the attestation store as a key-plane row, whose \
          key-plane door settles a byte-identical re-offer (key_plane::apply_key_plane_row); \
-         the framed door a pre-v58 peer still drives is that family's own door, unchanged \
-         by the compat reads",
+         the framed door is retired (v59.0.0, sealed-transport floor) and answers \
+         federation_envelope_kind_retired",
+    ),
+    (
+        EnvelopeKind::IdentityOccurrenceRevocation,
+        "v59.0.0 (sealed-transport floor, operator ruling 2026-10-19): the framed carriage is \
+         retired and has no door; an occurrence is revoked by a withdraws on its \
+         identity:occurrence:v1 row, which the attestation door settles",
     ),
 ];
 

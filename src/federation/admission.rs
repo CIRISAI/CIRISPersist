@@ -25876,6 +25876,37 @@ pub(crate) mod r2_test_support {
         );
     }
 
+    /// v59.0.0 — `refs` carries `subject`'s own `key:record:v1` row as an
+    /// Attestation ref, and that ref resolves to the row.
+    async fn assert_key_row_ref(
+        dir: &dyn FederationDirectory,
+        refs: &[(&'static str, String, String)],
+        subject: &str,
+        tag: &str,
+    ) {
+        let mut found = false;
+        for (kind, hash, _) in refs.iter().filter(|(k, _, _)| *k == "Attestation") {
+            let Some(bytes) = dir
+                .lookup_signed_record_by_content_hash(kind, hash)
+                .await
+                .unwrap_or_else(|e| panic!("[{tag}] lookup {kind}/{hash}: {e}"))
+            else {
+                continue;
+            };
+            let row: crate::federation::Attestation = serde_json::from_slice(&bytes)
+                .unwrap_or_else(|e| panic!("[{tag}] an Attestation ref's bytes: {e}"));
+            if crate::federation::key_plane::key_record_of_row(&row)
+                .is_some_and(|rec| rec.key_id == subject)
+            {
+                found = true;
+            }
+        }
+        assert!(
+            found,
+            "[{tag}] no resolving key:record:v1 ref for {subject}; got {refs:?}"
+        );
+    }
+
     /// v30.12.0 (CIRISPersist#634) — every ref
     /// [`wire_refs_for_subject`](crate::federation::wire_index::wire_refs_for_subject)
     /// returns for a subject MUST resolve through
@@ -25899,7 +25930,14 @@ pub(crate) mod r2_test_support {
 
         let subject = format!("wireref-subject-{tag}");
         let author = format!("wireref-author-{tag}");
-        crate::federation::tier_ingest::test_support::register_hybrid_key(dir, &subject).await;
+        // v59.0.0 — a self-signed, verifiable record, so the key is its
+        // `key:record:v1` row (the only carriage of a key on the wire).
+        crate::federation::tier_ingest::test_support::register_identity_key(
+            dir,
+            &subject,
+            crate::federation::types::identity_type::AGENT,
+        )
+        .await;
         crate::federation::tier_ingest::test_support::register_hybrid_key(dir, &author).await;
 
         let id = uuid::Uuid::new_v4().to_string();
@@ -25957,10 +25995,9 @@ pub(crate) mod r2_test_support {
             refs.iter().any(|(k, _, _)| *k == "Attestation"),
             "[{tag}] no Attestation ref for the seeded subject; got {refs:?}"
         );
-        assert!(
-            refs.iter().any(|(k, _, _)| *k == "Key"),
-            "[{tag}] no Key ref for the subject's own key record; got {refs:?}"
-        );
+        // v59.0.0 (sealed-transport floor) — the subject's key is advertised
+        // as its `key:record:v1` row; the framed `Key` ref is retired.
+        assert_key_row_ref(dir, &refs, &subject, tag).await;
 
         for (kind, content_hash, record_key) in &refs {
             let served = dir
@@ -26065,11 +26102,26 @@ pub(crate) mod r2_test_support {
             .await
             .unwrap_or_else(|e| panic!("[{tag}] wire_refs_for_subject: {e}"));
 
-        // NON-VACUITY. An empty ref set resolves every ref it returns.
+        // v59.0.0 (sealed-transport floor) — the framed `Key` ref is
+        // retired: the nanosecond record is not advertised in that form. The
+        // record above carries no verifiable seal, so it has no key-plane row;
+        // a verifiable one is carried as its row, and that ref must resolve.
         assert!(
-            refs.iter().any(|(k, _, _)| *k == "Key"),
-            "[{tag}] no Key ref for the registered subject; got {refs:?}"
+            !refs.iter().any(|(k, _, _)| *k == "Key"),
+            "[{tag}] a retired framed Key ref is advertised; got {refs:?}"
         );
+        let sealed = format!("{subject}-sealed");
+        crate::federation::tier_ingest::test_support::register_identity_key(
+            dir,
+            &sealed,
+            crate::federation::types::identity_type::AGENT,
+        )
+        .await;
+        let refs = crate::federation::wire_index::wire_refs_for_subject(dir, &sealed)
+            .await
+            .unwrap_or_else(|e| panic!("[{tag}] wire_refs_for_subject: {e}"));
+        // NON-VACUITY. An empty ref set resolves every ref it returns.
+        assert_key_row_ref(dir, &refs, &sealed, tag).await;
 
         for (kind, content_hash, record_key) in &refs {
             let served = dir
@@ -26282,12 +26334,19 @@ pub(crate) mod r2_test_support {
 
         // NON-VACUITY FIRST. An empty set resolves every ref it contains, so
         // without this the loop below passes on a fixture that seeded nothing.
-        for kind in ["Key", "Attestation", "LocationProof", "Family", "Community"] {
+        // v59.0.0 (sealed-transport floor) — a key is its `key:record:v1`
+        // row (an Attestation ref under a row id; 634/640 resolve it); the
+        // framed `Key` kind is never indexed.
+        for kind in ["Attestation", "LocationProof", "Family", "Community"] {
             assert!(
                 mine.iter().any(|(k, _, _)| *k == kind),
                 "[{tag}] no {kind} ref for the seeded fixture; got {mine:?}"
             );
         }
+        assert!(
+            !mine.iter().any(|(k, _, _)| *k == "Key"),
+            "[{tag}] a retired framed Key ref is indexed; got {mine:?}"
+        );
 
         for (kind, content_hash, record_key) in &mine {
             let served = dir

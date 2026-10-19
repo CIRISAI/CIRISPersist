@@ -32,7 +32,9 @@
 #[cfg(test)]
 pub(crate) mod bodies {
     use crate::federation::tier_ingest::test_support as ts;
-    use crate::federation::types::{identity_type, IdentityOccurrenceRevocation, Revocation};
+    use crate::federation::types::identity_type;
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    use crate::federation::types::{IdentityOccurrenceRevocation, Revocation};
     use crate::federation::{Error, FederationDirectory};
 
     fn ms(t: chrono::DateTime<chrono::Utc>) -> chrono::DateTime<chrono::Utc> {
@@ -40,6 +42,7 @@ pub(crate) mod bodies {
     }
 
     /// A self-revocation of `subject`, hybrid-sealed by it.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     pub(crate) fn revocation(subject: &str, at: chrono::DateTime<chrono::Utc>) -> Revocation {
         ts::seal_revocation(Revocation {
             revocation_id: uuid::Uuid::new_v4().to_string(),
@@ -107,6 +110,7 @@ pub(crate) mod bodies {
 
     /// The framed occurrence revocation a v57 node stored: typed columns and
     /// the V103 signature trio, as produced by the retired door's producer.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     pub(crate) async fn framed_revocation(
         s: &Seed,
     ) -> (IdentityOccurrenceRevocation, serde_json::Value, String) {
@@ -272,6 +276,7 @@ pub(crate) mod bodies {
 
     /// I1144's checks on a store migrated forward from V195, with no write
     /// in between.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     pub(crate) async fn i1144_after_migration<D: FederationDirectory + ?Sized>(
         d: &D,
         tag: &str,
@@ -359,6 +364,7 @@ pub(crate) mod bodies {
 
     /// I1144's count, read back from the open's rehome (idempotent: the
     /// same report the open logged).
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     pub(crate) fn i1144_report(
         tag: &str,
         report: crate::federation::key_plane::KeyPlaneRehomeReport,

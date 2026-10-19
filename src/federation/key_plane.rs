@@ -109,6 +109,7 @@ pub struct KeyPlaneRehomeReport {
 
 impl KeyPlaneRehomeReport {
     /// The counted log line.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     pub(crate) fn log(&self, backend: &'static str) {
         tracing::info!(
             backend,
