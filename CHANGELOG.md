@@ -25,29 +25,36 @@ threat-model citations because this crate's audit story is the point.
   tokens: `proposer_not_on_roster`, `target_already_on_roster`,
   `target_not_on_roster`, `proposer_is_target`, `proposer_has_open_proposal`,
   `target_has_open_proposal`.
-- **The policy is data** (steward direction 2026-10-18; CC rc9 `fdabfe4`
-  `formal/two_path`; CIRISPersist#1100, CIRISConstitution#180):
-  `TwoPathPolicy { enact, cancel, floor, base, floor_class, at_window,
-  irreversible, window, silence, one_open_per_proposer, one_open_per_target }`.
-  Thresholds are `Threshold::{StrictMajority, MoreThan{num,den},
-  AtLeast{num,den}, Keys(k)}` resolved over `Base::StandingRoster`
-  (`Base::count`, so a future expected-active base is data). The reverse path
-  lands at the window only if objections stayed below CANCEL and approvals
-  (proposer counted) reached FLOOR; otherwise, under `AtWindow::Cancel`, the
-  proposal is `TwoPathDecision::Cancelled` (token `cancelled`). `irreversible`
-  removes the instant landing: a full ENACT quorum waits out the window and a
-  CANCEL quorum inside it stops it. `TwoPathPolicy::check_corridor(base_n,
-  floor_secs)` is `PolicyCorridor.lean`'s `inCorridor`, refusing with
-  `enact_by_single_voter`, `cancel_needs_everyone`, `cancel_above_enact`,
-  `enact_below_strict_majority`, `floor_above_enact`, `cancel_by_single_voter`,
-  `enact_needs_everyone`, `floor_below_two_voters` (unless
-  `FloorClass::SameIdentity`), `window_below_floor`. The self roster is
-  `TwoPathPolicy::self_roster`: strict majority both ways, floor one key
-  (`SameIdentity`), 86 400 s, reversible, `AtWindow::StayOpen` — its door's
-  behaviour is unchanged. It is in its own corridor at one and at three keys;
-  at two it is outside (`cancel_needs_everyone`), the stated two-key bound.
-  No community default is built: enact 2/3, cancel 1/3, floor 1/3 appears only
-  as a test's named example.
+- **The policy is data** (steward rulings 2026-10-18; CC rc9 `formal/two_path`
+  `PolicyCorridor.lean`, `TwoPath.tla`, `tools/build_governance_policy.py`;
+  CIRISPersist#1100, CIRISConstitution#180): `TwoPathPolicy { base, enact,
+  cancel, cancel_excludes_proposer, floor, floor_class, reverse_path,
+  at_window, irreversible, window_secs, silence, one_open_per_proposer,
+  one_open_per_target }`. `Threshold::{StrictMajority, Fraction { num, den, cmp:
+  MoreThan | AtLeast }}` resolved over `Base::StandingRoster` (`Base::count`;
+  a future expected-active base is data). CANCEL and FLOOR are lifted to the
+  table's count minimum (`FloorClass::Voters` 2, `SameIdentity` 1); ENACT keeps
+  its own rule. `decide_counts` is the governance decider: ENACT lands at once
+  unless irreversible; before the window, pending; at the window, CANCEL
+  reached ⇒ `Cancelled { reason: cancel_reached }`, ENACT (irreversible) ⇒
+  lands, a floored silent reverse path ⇒ lands, else `Cancelled { reason:
+  below_floor | no_reverse_path | target_spoke }` (`AtWindow::Cancel`) — the
+  floor is consulted only at the window. `check_corridor(base_n,
+  family_floor_secs)` is `inCorridor`, refusing `enact_by_single_voter`,
+  `cancel_needs_everyone`, `cancel_above_enact`, `enact_below_strict_majority`,
+  `floor_above_enact`, `cancel_by_single_voter`, `enact_needs_everyone`,
+  `floor_below_two_voters` (not for `SameIdentity`), `window_below_floor`.
+- The self roster is `TwoPathPolicy::self_roster(86 400)`: strict majority of
+  the roster forward, of the others reverse, floor `0/1` lifted to one key
+  (`SameIdentity`), reversible, `AtWindow::StayOpen` (as `SelfRoster.tla`) —
+  its door is unchanged. In its own corridor at one and three keys; at two,
+  `cancel_needs_everyone` (the stated two-key bound).
+- CC's 732 governance policy vectors (rc9 `2643ff17`, `policy_sha256
+  d1b209f2…`, vendored as TEST fixtures under `tests/fixtures/governance_policy/`)
+  all replay through the struct: thresholds, verdict, path and cancel reason.
+  216 of them carry the provisional expected-active base (N = 10 000 → 344),
+  which is not built; they take their stated base count as given. No
+  community default or window floor is built beyond a test's named example.
 - The six CC `formal/self_roster` traces (rc9 `cb0513c8`) are vendored under
   `tests/fixtures/self_roster/` and replayed as door tests: every `Execute` of
   `combined3_stolen`, `combined3_lost` and `combined4_mixed` lands (by the path
@@ -123,10 +130,17 @@ threat-model citations because this crate's audit story is the point.
 - Staged, not refused: the `device-<hex>-<fp>` roster key id
   (`self_roster::DEVICE_DERIVED_ROSTER_KEY_PREFIX`, `CLM-self-roster-key-id`)
   waits for CIRISServer#793 to ship `<fedID>-<fp>`.
-- Not carried in this cut: the genesis key's eviction (no row carries it
-  without colliding with the transport self-occurrence's revocation), and
-  re-asserting a live key's occurrence by another roster key (not a roster
-  change; stays `signer_acts_for`).
+- **The genesis key is evictable** (CC 3.3.6.3): a framed occurrence
+  revocation of the self pair `(fedID, fedID)` signed by ANOTHER live roster
+  key is a roster eviction through the two paths. Once it lands the genesis
+  key leaves the roster, `signer_acts_for` no longer lets it act for the self,
+  and it is no steward; the fedID string keeps naming the self and its other
+  keys act as it (`self_roster::genesis_evicted_at`, terminal: a later
+  assertion of the pair does not re-establish it). The genesis key revoking
+  its own pair, or a `withdraws` of the pair's row, retires its transport
+  self-occurrence as before and evicts nothing (I1141).
+- Not carried in this cut: re-asserting a live key's occurrence by another
+  roster key (not a roster change; stays `signer_acts_for`).
 
 ### Changed — a live roster key acts as its self's steward (CIRISPersist#1099, CIRISServer#793, CC 3.3.6.3, `CLM-self-roster-authority`)
 
@@ -139,6 +153,13 @@ threat-model citations because this crate's audit story is the point.
   owner-binding's granter as the self it signed as (`self_of_at`), so a second
   device restating its owner's binding is the same one steward. A key of
   another self is refused at both.
+- The predicate's instant is bounded at admission by W (CIRISPersist#1049, CC
+  2.6.7, ruled 72 h; `self_roster::PAST_FRESHNESS_W_SECS`): a row admitted on a
+  roster key's standing at its signed `asserted_at` — a `for_key_id` consent
+  row, an owner-binding — is refused `asserted_at_stale` when that instant is
+  more than W behind this node's clock, so an evicted key cannot sign into the
+  window in which it was still live (I1142). A steward's own rows are not
+  bounded here.
 
 ### Fold survey — the two-path decision's relatives (CIRISPersist#1099 ruling 3)
 
