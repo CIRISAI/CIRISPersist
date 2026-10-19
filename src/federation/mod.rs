@@ -2809,6 +2809,14 @@ pub trait FederationDirectory: Send + Sync {
     /// Insert a new pubkey row. Idempotent on `key_id` collision with
     /// matching content (no-op); errors on `key_id` collision with
     /// differing content.
+    ///
+    /// v59.0.0 (CIRISPersist#1103, CC 2.6.8) — this is the UNCHECKED
+    /// executor for in-process callers (genesis seeding, the rehome, the
+    /// registration doors after they have checked). It does not run the
+    /// key-id fingerprint rule. External callers go through the gated
+    /// entries — `Engine::register_federation_key`, the capsule's
+    /// `PutPublicKey` op, Python `put_public_key` / `register_federation_key`
+    /// — which run [`register::check_key_id_fingerprint`] first.
     async fn put_public_key(&self, record: SignedKeyRecord) -> Result<(), Error>;
 
     /// v23.1.0 (CIRISPersist#554) — the hardware-attestation policy THIS

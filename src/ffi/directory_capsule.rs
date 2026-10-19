@@ -5261,6 +5261,34 @@ mod tests {
         drop(dir);
     }
 
+    /// **I1153 at the capsule's PutPublicKey** (CIRISPersist#1103): a host's
+    /// raw registration through the capsule refuses an id that does not name
+    /// its own key, and stores nothing. (The derived id is admitted by
+    /// [`put_then_lookup_public_key_round_trips`].)
+    #[test]
+    fn i1153_capsule_put_public_key_refuses_a_mismatched_id() {
+        let rt = test_runtime();
+        let (dir, directory) = memory_directory();
+        let rec = sample_key_record("i1153-capsule-bad");
+        match run_op(
+            &rt,
+            &directory,
+            &DirectoryOp::PutPublicKey {
+                record: SignedKeyRecord { record: rec },
+            },
+        ) {
+            DirectoryOpResult::Err(e) => assert!(
+                e.contains("key_id_fingerprint_mismatch") || e.contains("does not end in"),
+                "I1153: {e}"
+            ),
+            other => panic!("I1153: a mismatched id through PutPublicKey: {other:?}"),
+        }
+        assert!(rt
+            .block_on(dir.lookup_public_key("i1153-capsule-bad"))
+            .unwrap()
+            .is_none());
+    }
+
     #[test]
     fn put_then_lookup_public_key_round_trips() {
         let rt = test_runtime();
