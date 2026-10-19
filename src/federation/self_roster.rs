@@ -81,7 +81,7 @@
 
 use std::collections::BTreeSet;
 
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Utc};
 
 use super::key_plane::{MintedFamily, PlaneSignature};
 use super::two_path::{
@@ -100,7 +100,7 @@ pub const W_SELF_SECS: i64 = 86_400;
 /// The self roster's conditions on the two paths (CC 3.3.6.3).
 #[must_use]
 pub fn policy() -> TwoPathPolicy {
-    TwoPathPolicy::self_roster(Duration::seconds(W_SELF_SECS))
+    TwoPathPolicy::self_roster(W_SELF_SECS)
 }
 
 /// The proposal row's dimension (CC 3.1.9.2 `objection:{state}`; minted here).
@@ -948,7 +948,7 @@ where
         decision,
         TwoPathDecision::Refused {
             reason: TwoPathRefusal::ProposerNotOnRoster
-        } | TwoPathDecision::Cancelled
+        } | TwoPathDecision::Cancelled { .. }
     );
     if !refused_for_good && dir.get_attestation(&id).await?.is_none() {
         dir.put_attestation(super::SignedAttestation { attestation: row })
@@ -1063,7 +1063,7 @@ where
                 d,
                 TwoPathDecision::Refused {
                     reason: TwoPathRefusal::ProposerNotOnRoster,
-                } | TwoPathDecision::Cancelled
+                } | TwoPathDecision::Cancelled { .. }
             ) {
                 dir.settle_self_roster_proposal(&p.id, d.token(), now)
                     .await?;
