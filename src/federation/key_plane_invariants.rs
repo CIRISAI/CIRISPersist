@@ -25,10 +25,11 @@
 //!   attested by its signer about the identity; its revocation is a
 //!   `withdraws` on that row by the identity (admitted, the projection fed),
 //!   never by an unrelated key; the projection is its rebuild.
-//! - **I980 (the lazy rehome, sqlite and postgres)** — a pre-V198 key record
-//!   that proves possession gets its row at the first key-plane write of a
-//!   fresh backend, asserted at its own `scrub_timestamp`; one that cannot
-//!   stays held without a row and the gate names it.
+//! - **I980 (the rehome, sqlite and postgres)** — a pre-V198 key record
+//!   that proves possession gets its row when a fresh backend opens (v58:
+//!   at its first key-plane write; v59.0.0: eager, at `run_migrations`),
+//!   asserted at its own `scrub_timestamp`; one that cannot stays held
+//!   without a row and the gate names it.
 
 #[cfg(test)]
 pub(crate) mod bodies {
@@ -696,7 +697,7 @@ mod run {
     }
 
     /// I980 on postgres: the pre-V198 state on the same database, read by a
-    /// fresh backend.
+    /// fresh backend; v59.0.0, rehomed at open.
     #[cfg(feature = "postgres")]
     #[tokio::test(flavor = "multi_thread")]
     async fn i980_postgres() {
@@ -731,18 +732,10 @@ mod run {
             .await
             .unwrap();
         b.run_migrations().await.unwrap();
-        assert!(
-            bodies::key_row(b.as_dyn_directory(), &k).await.is_none(),
-            "I980: before the rehome"
-        );
-        b.put_public_key(crate::federation::SignedKeyRecord {
-            record: bodies::pop_record(&format!("i980-trigger-{t}")),
-        })
-        .await
-        .unwrap();
+        // v59.0.0 — no write in between: the open rehomed it.
         let row = bodies::key_row(b.as_dyn_directory(), &k)
             .await
-            .expect("I980: the provable legacy record is rehomed");
+            .expect("I980: the provable legacy record is rehomed at open");
         assert_eq!(
             row.asserted_at,
             crate::federation::admission::truncate_to_substrate_resolution(scrub_ts),

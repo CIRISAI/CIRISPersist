@@ -277,7 +277,6 @@ pub(crate) mod bodies {
         tag: &str,
         s: &Seed,
         r: &Revocation,
-        report: crate::federation::key_plane::KeyPlaneRehomeReport,
     ) {
         use crate::federation::key_plane as kp;
         let rows = |dim: &'static str| async move {
@@ -356,6 +355,14 @@ pub(crate) mod bodies {
                 .is_empty(),
             "[{tag}] I1144: the route was lost"
         );
+    }
+
+    /// I1144's count, read back from the open's rehome (idempotent: the
+    /// same report the open logged).
+    pub(crate) fn i1144_report(
+        tag: &str,
+        report: crate::federation::key_plane::KeyPlaneRehomeReport,
+    ) {
         // The rehome's count: one legacy framed occurrence revocation, kept.
         assert_eq!(
             report.legacy_framed_occurrence_revocations, 1,
@@ -518,8 +525,8 @@ mod run {
         let framed = bodies::framed_revocation(&s).await;
         bodies::seed_raw_sqlite(&old, &r, &framed).await;
         old.run_migrations().await.unwrap();
-        let report = old.rehome_key_plane_at_open().await.unwrap();
-        bodies::i1144_after_migration(&old, &t, &s, &r, report).await;
+        bodies::i1144_after_migration(&old, &t, &s, &r).await;
+        bodies::i1144_report(&t, old.rehome_key_plane_at_open().await.unwrap());
     }
 
     #[cfg(feature = "postgres")]
@@ -546,8 +553,8 @@ mod run {
         let framed = bodies::framed_revocation(&s).await;
         bodies::seed_raw_postgres(&old, &r, &framed).await;
         old.run_migrations().await.unwrap();
-        let report = old.rehome_key_plane_at_open().await.unwrap();
-        bodies::i1144_after_migration(&old, &t, &s, &r, report).await;
+        bodies::i1144_after_migration(&old, &t, &s, &r).await;
+        bodies::i1144_report(&t, old.rehome_key_plane_at_open().await.unwrap());
         eprintln!("i1144_postgres: RAN");
     }
 
