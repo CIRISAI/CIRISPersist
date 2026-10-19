@@ -812,17 +812,17 @@ pub(crate) mod bodies {
             keys(d, &[&f, &d1, &peer]).await;
             ts::register_hybrid_key_as(d, &node, &node, it::NODE).await;
         }
-        // d1 live since five days ago, and still live.
+        // d1 live since five days ago, and still live; f owns the node since
+        // then. d1 acts for f on f's standing — so W is asked — at 4 and 3.5
+        // days ago, both more than W.
         add(a, &f, &f, &d1, days(5)).await.expect("one key");
-        let mut bind = binding(&d1, &node);
-        bind.asserted_at = days(4);
-        bind.scrub_timestamp = bind.asserted_at;
-        ts::seal_row_in_place(&d1, &mut bind);
-        a.put_attestation(SignedAttestation {
-            attestation: bind.clone(),
-        })
-        .await
-        .expect("I1149: a live key's owner-binding older than W admits");
+        let mut own = binding(&f, &node);
+        own.asserted_at = days(5) + chrono::Duration::hours(1);
+        own.scrub_timestamp = own.asserted_at;
+        ts::seal_row_in_place(&f, &mut own);
+        a.put_attestation(SignedAttestation { attestation: own })
+            .await
+            .expect("I1149: f owns the node");
         let mut old = grant(&d1, &peer, &node);
         old.asserted_at = days(4);
         old.scrub_timestamp = old.asserted_at;
@@ -832,6 +832,15 @@ pub(crate) mod bodies {
         })
         .await
         .expect("I1149: a live key's grant older than W admits");
+        let mut bind = binding(&d1, &node);
+        bind.asserted_at = days(4) + chrono::Duration::hours(12);
+        bind.scrub_timestamp = bind.asserted_at;
+        ts::seal_row_in_place(&d1, &mut bind);
+        a.put_attestation(SignedAttestation {
+            attestation: bind.clone(),
+        })
+        .await
+        .expect("I1149: a live key's owner-binding restatement older than W admits");
 
         // The fresh node: the roster, then A's attestation stream.
         add(b, &f, &f, &d1, days(5)).await.expect("one key on B");
