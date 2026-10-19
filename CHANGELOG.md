@@ -59,6 +59,36 @@ threat-model citations because this crate's audit story is the point.
   Witness **I1153** (`key_id_fingerprint_invariants`, memory, sqlite,
   postgres; and the registration door on sqlite, postgres).
 
+### Added — the owner may author the community-trust capture grant (CIRISPersist#1096, CC 3.3.1 rc9 `1a46e03`, `CLM-consent-community-trust-owner-authored`)
+
+- `consent:community_trust:v1` admits an OWNER-authored grant beside the
+  node's own: attester a live roster key of the owner's fedID at the grant's
+  `asserted_at` (`self_roster::acts_as_steward_at`, with its W bound
+  `check_roster_act_fresh` — the one steward predicate, not a second),
+  attested the node. Anyone else is refused
+  **`community_trust_attester_not_owner`** (`InvalidArgument`, Python
+  `ValueError`, the type this gate always had; it replaces the v52 "a capture
+  grant is the NODE's own row" refusal).
+- In BOTH forms `subject_key_ids` names the node, its owner at `asserted_at`
+  and the agent key that acts on it (a held `agent`-role key); a NEW grant
+  missing one is refused **`community_trust_subjects_incomplete`**. Each named
+  party withdraws (rule 2); only the attester recants.
+- The fold (`fold_community_trust`) and the read door
+  (`community_trust_consent_for`, no longer filtered to the node's own rows)
+  group both forms by `attested_key_id`; the latest grant after the boundary
+  `R` governs, and a revocation of any grant — the owner's recant of its own
+  included — ends every grant at or before `R`. An agent key's withdrawal is a
+  boundary over grants only; captured traces stand.
+- Grandfathered: a held node-authored grant in the v52 shape (the owner
+  alone) keeps counting, its byte-identical re-offer is admitted as held, and
+  the sqlite / postgres open counts them in one log line
+  (`legacy_community_trust_grants_at_open`,
+  `community_trust_consent::is_legacy_node_authored_grant`); nothing stored
+  is refused or rewritten.
+- Fixtures I950, I536, I538 and I148 now name all three parties. Witness
+  **I1154** (memory, sqlite, postgres; the open-time count on sqlite,
+  postgres).
+
 ### Added — the two-path decision (CIRISPersist#1099, CC 3.3.6.3, `CLM-self-roster-two-paths`)
 
 - `federation::two_path` — ONE pure, backend-free decision for "one actor

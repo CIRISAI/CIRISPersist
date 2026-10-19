@@ -176,7 +176,10 @@ pub(crate) mod bodies {
             }),
         );
         grant.attestation_type = attestation_type::SCORES.to_owned();
-        grant.subject_key_ids = vec![owner.clone()];
+        // v59.0.0 (CIRISPersist#1096) — the node, its owner and the agent key.
+        let agent = k("agent");
+        ts::register_hybrid_key(dd, &agent).await;
+        grant.subject_key_ids = vec![node.clone(), owner.clone(), agent];
         ts::seal_row_in_place(&node, &mut grant);
         let grant = SignedAttestation { attestation: grant };
         let now = truncate(chrono::Utc::now());

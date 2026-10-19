@@ -16804,6 +16804,22 @@
     "path#symbol": "src/federation/register.rs#check_key_id_fingerprint",
     "tsv_target": "evidence/cc_impl.tsv",
     "manifest_round": "cc-rc9-1103"
+   },
+   {
+    "decimal_id": "3.3.1",
+    "claim_id": "CLM-consent-community-trust-owner-authored",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/community_trust_consent.rs#check_community_trust_grant_admission",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc9-1096"
+   },
+   {
+    "decimal_id": "3.3.1",
+    "claim_id": "CLM-consent-community-trust-owner-authored",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/community_trust_consent.rs#fold_community_trust",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc9-1096"
    }
   ],
   "CIRISServer": [

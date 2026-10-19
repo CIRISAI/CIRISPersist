@@ -152,6 +152,9 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // v59.0.0 (sealed-transport floor) — the eager rehome at open: a data
     // sweep that fails only on the substrate's own terms.
     ("rehome_key_plane_at_open", Class::Plumbing),
+    // v59.0.0 (CIRISPersist#1096) — the open's count of grandfathered
+    // capture grants; logs, refuses nothing.
+    ("legacy_community_trust_grants_at_open", Class::Plumbing),
     ("sqlite_sync_key_record_row", Class::Plumbing),
     ("sqlite_sync_occurrence_row", Class::Plumbing),
     ("sqlite_drop_key_record_rows", Class::Plumbing),

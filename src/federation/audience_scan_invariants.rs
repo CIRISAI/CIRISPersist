@@ -907,7 +907,10 @@ pub(crate) mod bodies {
             }),
             chrono::Utc::now(),
         );
-        ct.subject_key_ids = vec![alice.clone(), bob.clone()];
+        // v59.0.0 (CIRISPersist#1096) — the node, its owner and the agent key.
+        let ct_agent = format!("i536-ctagent-{s}");
+        ts::register_hybrid_key(d, &ct_agent).await;
+        ct.subject_key_ids = vec![target.clone(), alice.clone(), bob.clone(), ct_agent];
         ts::reseal(&mut ct);
         put(d, ct)
             .await
@@ -1406,7 +1409,8 @@ pub(crate) mod bodies {
                 }),
                 now + chrono::Duration::milliseconds(i),
             );
-            ct.subject_key_ids = vec![stewards[0].clone(), agents[i as usize].clone()];
+            // v59.0.0 (CIRISPersist#1096) — the node, its owner, the agent key.
+            ct.subject_key_ids = vec![t.clone(), stewards[0].clone(), agents[i as usize].clone()];
             ts::reseal(&mut ct);
             put_patiently(d, ct, "I538 community_trust").await;
         }

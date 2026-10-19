@@ -137,6 +137,39 @@ impl PostgresBackend {
     /// v59.0.0 (sealed-transport floor, operator ruling 2026-10-19) — the
     /// lazy rehome run eagerly at open ([`Self::rehome_legacy_key_plane`]),
     /// then counted and logged ([`KeyPlaneRehomeReport`](crate::federation::key_plane::KeyPlaneRehomeReport)).
+    /// v59.0.0 (CIRISPersist#1096) — the postgres twin of sqlite's: the held
+    /// node-authored `consent:community_trust` grants in the v52 shape,
+    /// counted and logged once at open. Returns the count.
+    pub(crate) async fn legacy_community_trust_grants_at_open(
+        &self,
+    ) -> Result<u64, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let rows = client
+            .query(
+                "SELECT attestation_id FROM cirislens.federation_attestations \
+                  WHERE attestation_type = 'scores' \
+                    AND attesting_key_id = attested_key_id \
+                    AND (attestation_envelope::jsonb ->> 'dimension') \
+                        LIKE 'consent:community_trust%'",
+                &[],
+            )
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("community_trust scan: {e}")))?;
+        let ids = rows
+            .iter()
+            .map(|r| r.try_get::<_, String>(0))
+            .collect::<Result<Vec<String>, _>>()
+            .map_err(|e| crate::federation::Error::Backend(format!("community_trust scan: {e}")))?;
+        drop(client);
+        crate::federation::community_trust_consent::log_legacy_node_authored_grants(
+            self, &ids, "postgres",
+        )
+        .await
+    }
+
     pub(crate) async fn rehome_key_plane_at_open(
         &self,
     ) -> Result<crate::federation::key_plane::KeyPlaneRehomeReport, crate::federation::Error> {
@@ -3712,6 +3745,10 @@ impl Backend for PostgresBackend {
             self.rehome_key_plane_at_open()
                 .await
                 .map_err(|e| Error::Backend(format!("key-plane rehome at open: {e}")))?;
+            // v59.0.0 (CIRISPersist#1096) — count, never rewrite.
+            self.legacy_community_trust_grants_at_open()
+                .await
+                .map_err(|e| Error::Backend(format!("community_trust grandfather count: {e}")))?;
             return Ok(());
         }
         migration_guard::note_phase_entered();
@@ -3882,6 +3919,11 @@ impl Backend for PostgresBackend {
         self.rehome_key_plane_at_open()
             .await
             .map_err(|e| Error::Backend(format!("key-plane rehome at open: {e}")))?;
+        // v59.0.0 (CIRISPersist#1096) — count, never rewrite, the held
+        // node-authored capture grants in the v52 shape.
+        self.legacy_community_trust_grants_at_open()
+            .await
+            .map_err(|e| Error::Backend(format!("community_trust grandfather count: {e}")))?;
         Ok(())
     }
 
