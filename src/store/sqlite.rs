@@ -28757,10 +28757,34 @@ impl SqliteBackend {
                          WHERE attestation_id IS NULL AND signature IS NOT NULL",
                     )?,
                     legacy_framed_occurrence_revocations: legacy,
+                    carriers: Default::default(),
                 })
             })
             .await
             .map_err(|e| crate::federation::Error::Backend(format!("rehome report: {e}")))?;
+        // v59.0.0 (CIRISPersist#1104) — each held legacy framed occurrence
+        // revocation gets its carrier row where the structural rule admits it.
+        let legacy = self
+            .read(
+                |conn| -> Result<Vec<(String, String, String)>, rusqlite::Error> {
+                    let mut stmt = conn.prepare(
+                        "SELECT attesting_key_id, signed_envelope, signature \
+                       FROM federation_identity_occurrence_revocations \
+                      WHERE legacy_framed = 1 AND signed_envelope IS NOT NULL \
+                        AND signature IS NOT NULL AND attesting_key_id IS NOT NULL",
+                    )?;
+                    let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+                    rows.collect()
+                },
+            )
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("carrier scan: {e}")))?;
+        let mut report = report;
+        report.carriers = crate::federation::occurrence_revocation_carrier::migrate_legacy_framed(
+            self,
+            crate::federation::occurrence_revocation_carrier::framed_of_columns(legacy),
+        )
+        .await?;
         report.log("sqlite");
         Ok(report)
     }

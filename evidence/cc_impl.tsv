@@ -347,3 +347,5 @@ decimal_id	claim_id	repo	path#symbol	crate@version
 2.6.8	CLM-key-id-fingerprint-verified	CIRISPersist	src/federation/register.rs#check_key_id_fingerprint	ciris-persist@58.0.0
 3.3.1	CLM-consent-community-trust-owner-authored	CIRISPersist	src/federation/community_trust_consent.rs#check_community_trust_grant_admission	ciris-persist@58.0.0
 3.3.1	CLM-consent-community-trust-owner-authored	CIRISPersist	src/federation/community_trust_consent.rs#fold_community_trust	ciris-persist@58.0.0
+3.1.5	CLM-occurrence-revocation-carrier	CIRISPersist	src/federation/occurrence_revocation_carrier.rs#carrier_row	ciris-persist@58.0.0
+3.1.5	CLM-occurrence-revocation-carrier	CIRISPersist	src/federation/occurrence_revocation_carrier.rs#check_carrier_admission	ciris-persist@58.0.0

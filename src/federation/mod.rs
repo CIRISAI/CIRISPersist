@@ -364,6 +364,11 @@ pub mod key_digest;
 pub mod key_grant;
 // v58.0.0 (CIRISPersist#991 plane 1; CC 3.1.3) — the key plane as rows.
 pub mod key_plane;
+// v59.0.0 (CIRISPersist#1104, CC 3.1.5) — the legacy occurrence revocation's
+// carrier row, `identity:occurrence_revocation:v1`.
+pub mod occurrence_revocation_carrier;
+#[cfg(test)]
+mod occurrence_revocation_carrier_invariants;
 // v58.0.0 (CIRISPersist#991) — I975–I980.
 pub(crate) mod key_plane_invariants;
 // v59.0.0 (sealed-transport floor, operator ruling 2026-10-19) — I1144–I1147:
@@ -12121,6 +12126,12 @@ pub mod malformed_row {
     /// verify-core fedcode's fingerprint of the record's OWN Ed25519 public
     /// key.
     pub const KEY_ID_FINGERPRINT_MISMATCH: &str = "key_id_fingerprint_mismatch";
+    /// v59.0.0 (CIRISPersist#1104; CC 3.1.5 rc9 `c901645`,
+    /// `CLM-occurrence-revocation-carrier`) — an
+    /// `identity:occurrence_revocation:v1` carrier for a user self's
+    /// occurrence, not cosigned by a strict majority of the self's current
+    /// live roster: a legacy revocation does not bypass the two-path door.
+    pub const CARRIER_WITHOUT_ROSTER_QUORUM: &str = "carrier_without_roster_quorum";
 
     /// Every token, for the from-disk witnesses and adopters' tables.
     pub const ALL: &[&str] = &[
@@ -12136,6 +12147,7 @@ pub mod malformed_row {
         TRANSIT_KEX_KEY_REUSE,
         AGGREGATE_SOURCE_DUPLICATE,
         KEY_ID_FINGERPRINT_MISMATCH,
+        CARRIER_WITHOUT_ROSTER_QUORUM,
     ];
 }
 

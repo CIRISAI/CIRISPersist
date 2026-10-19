@@ -161,6 +161,12 @@ where
     if super::self_roster::verify_proposal_row(directory, row).await? {
         return Ok(());
     }
+    // v59.0.0 (CIRISPersist#1104) — a legacy occurrence revocation's carrier
+    // is minted from the framed object it carries; its admission is
+    // structural (`occurrence_revocation_carrier`).
+    if super::occurrence_revocation_carrier::verify_carrier_row(directory, row).await? {
+        return Ok(());
+    }
     verify_envelope_signed_row(directory, row).await
 }
 

@@ -6152,6 +6152,14 @@ impl PyEngine {
                     let backend = pg.clone();
                     runtime.block_on(async move {
                         use crate::federation::FederationDirectory;
+                        // v59.0.0 (CIRISPersist#1103, CC 2.6.8) — the id
+                        // names its own key.
+                        crate::federation::register::check_key_id_fingerprint(
+                            backend.as_ref(),
+                            &record.record,
+                        )
+                        .await
+                        .map_err(federation_err_to_py)?;
                         backend
                             .put_public_key(record)
                             .await
@@ -6205,6 +6213,14 @@ impl PyEngine {
                     let backend = sq.clone();
                     runtime.block_on(async move {
                         use crate::federation::FederationDirectory;
+                        // v59.0.0 (CIRISPersist#1103, CC 2.6.8) — the id
+                        // names its own key.
+                        crate::federation::register::check_key_id_fingerprint(
+                            backend.as_ref(),
+                            &record.record,
+                        )
+                        .await
+                        .map_err(federation_err_to_py)?;
                         backend
                             .put_public_key(record)
                             .await

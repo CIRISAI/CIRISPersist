@@ -392,6 +392,11 @@ where
     let consent_change = super::consent_list_change_of(dir, &attestation.attestation).await;
     let occurrence_withdrawal =
         super::key_plane::occurrence_withdrawal_of(dir, &attestation.attestation).await?;
+    // v59.0.0 (CIRISPersist#1104) — an admitted carrier feeds the same
+    // projection as a `withdraws` of the occurrence row.
+    let carried_revocation =
+        super::occurrence_revocation_carrier::carrier_of_row(&attestation.attestation)
+            .and_then(|f| f.revocation().ok());
     // v59.0.0 (CIRISPersist#1099, CC 3.3.6.3) — the row as offered, for the
     // self-roster door: an eviction of a live roster key is a proposal. The
     // genesis key's eviction (a `withdraws` of the self pair's occurrence row
@@ -453,7 +458,8 @@ where
     // already revoked by either route keeps the revocation it holds: the first
     // to land fixes the instants, and neither route rewrites (or un-revokes)
     // the other.
-    if let (Ok(AttestationOutcome::Inserted), Some(revocation)) = (&outcome, occurrence_withdrawal)
+    if let (Ok(AttestationOutcome::Inserted), Some(revocation)) =
+        (&outcome, occurrence_withdrawal.or(carried_revocation))
     {
         let held = dir
             .list_identity_occurrence_revocations_for(&revocation.identity_key_id)

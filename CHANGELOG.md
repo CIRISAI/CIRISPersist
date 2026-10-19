@@ -35,7 +35,8 @@ threat-model citations because this crate's audit story is the point.
 ### Security — a key id names its own key (CIRISPersist#1103, CC 2.6.8 rc9 `957d1dd`, `CLM-key-id-fingerprint-verified`)
 
 - At the DOOR only — registration (`Engine::register_federation_key`, Python
-  `register_federation_key`) and first contact (a `key:record:v1` row offered
+  `register_federation_key`, and a host's raw registration: the capsule's
+  `PutPublicKey` op and Python `put_public_key`) and first contact (a `key:record:v1` row offered
   through `put_attestation` / `apply_replicated_attestation` /
   `ApplyReplicatedAttestation`, the proof-of-possession door) — a key whose
   `key_id` does not end in `-<fp>` is refused `federation_malformed_row` with
@@ -88,6 +89,40 @@ threat-model citations because this crate's audit story is the point.
 - Fixtures I950, I536, I538 and I148 now name all three parties. Witness
   **I1154** (memory, sqlite, postgres; the open-time count on sqlite,
   postgres).
+
+### Added — the legacy occurrence revocation's carrier row (CIRISPersist#1104, CC 3.1.5 rc9 `c901645`, `CLM-occurrence-revocation-carrier`)
+
+- **`identity:occurrence_revocation:v1`**
+  (`federation::occurrence_revocation_carrier`): persist mints it from a held
+  framed occurrence revocation the way the key plane mints its rows.
+  - Attester is the revoker; the framed object rides under `occurrence_revocation`.
+  - The signature columns are the object's own hybrid signature.
+  - id = `sha256("ciris:identity:occurrence_revocation:v1:" ‖ JCS(object))[..16]`.
+  - Score −1, never withdrawn.
+  - Federation scope: the key plane's global reach, so a stranger holding the
+    occurrence receives it.
+  - A receiver re-derives the row and refuses a byte difference.
+  - Domain and rules: `FSD/KEY_PLANE_ROWS.md`.
+- **Admission is structural, never an instant**
+  (`check_carrier_admission`):
+  - a `node` or `agent` identity's occurrence is admitted;
+  - a user self's is admitted only when cosigned (row `additional_scrubs`,
+    hybrid over the row envelope) by a strict majority of its CURRENT live
+    roster (`self_roster::roster_now`, verify-core `strict_majority`);
+  - otherwise it is refused `federation_malformed_row` with the appended
+    reason **`carrier_without_roster_quorum`**.
+  A backdated framed object freshly signed by one key is refused whatever its
+  instant. An admitted carrier projects the revocation on every node that
+  admits it.
+- **Migration at open**: every held `legacy_framed` revocation is offered as
+  its carrier. The rehome report gains `carriers`: minted; `without_quorum`,
+  a user self's pairs NAMED in the open's log line for the owner to re-propose
+  through the two-path door; and `not_carried`. Nothing held is rewritten.
+- **The one predicate** (for CIRISEdge):
+  **`key_plane::occurrence_revoked_by(dir, row) -> Option<(identity, occurrence)>`**
+  recognises a `withdraws` of an `identity:occurrence:v1` row and a carrier.
+- Witness **I1155** (memory, sqlite, postgres; the migration on sqlite,
+  postgres); I1144 asserts its legacy revocation is carried.
 
 ### Added — the two-path decision (CIRISPersist#1099, CC 3.3.6.3, `CLM-self-roster-two-paths`)
 

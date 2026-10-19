@@ -1413,10 +1413,17 @@ pub async fn dispatch_directory_op(
             Ok(()) => DirectoryOpResult::Unit,
             Err(e) => DirectoryOpResult::Err(e.to_string()),
         },
-        DirectoryOp::PutPublicKey { record } => match dir.put_public_key(record).await {
-            Ok(()) => DirectoryOpResult::Unit,
-            Err(e) => DirectoryOpResult::Err(e.to_string()),
-        },
+        // v59.0.0 (CIRISPersist#1103, CC 2.6.8) — a host's registration
+        // through the capsule is a door: the id names its own key.
+        DirectoryOp::PutPublicKey { record } => {
+            match crate::federation::register::check_key_id_fingerprint(dir, &record.record).await {
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+                Ok(()) => match dir.put_public_key(record).await {
+                    Ok(()) => DirectoryOpResult::Unit,
+                    Err(e) => DirectoryOpResult::Err(e.to_string()),
+                },
+            }
+        }
         // #375 — the whole apply (plan + adopt_scrub_upgrade) runs INSIDE
         // persist's .so against persist's own vtable, so the capsule
         // consumer gets the real upgrade-aware outcome, not DO-NOTHING.
@@ -5250,7 +5257,10 @@ mod tests {
     fn put_then_lookup_public_key_round_trips() {
         let rt = test_runtime();
         let (dir, directory) = memory_directory();
-        let rec = sample_key_record("primitive-abc");
+        // v59.0.0 (CIRISPersist#1103) — the capsule's PutPublicKey is a door:
+        // the id names its own key.
+        let key_id = crate::federation::tier_ingest::test_support::fp_key_id("primitive-abc");
+        let rec = sample_key_record(&key_id);
 
         // PutPublicKey via the capsule → Unit.
         let put = run_op(
@@ -5272,7 +5282,7 @@ mod tests {
             &rt,
             &directory,
             &DirectoryOp::LookupPublicKey {
-                key_id: "primitive-abc".into(),
+                key_id: key_id.clone(),
             },
         );
         let via_capsule = match looked {
@@ -5282,13 +5292,13 @@ mod tests {
 
         // Assert it matches calling the method directly on the backend.
         let via_direct = rt
-            .block_on(dir.lookup_public_key("primitive-abc"))
+            .block_on(dir.lookup_public_key(&key_id))
             .expect("direct lookup");
         assert_eq!(
             via_capsule, via_direct,
             "capsule result must equal direct call"
         );
-        assert_eq!(via_capsule.expect("some").key_id, "primitive-abc");
+        assert_eq!(via_capsule.expect("some").key_id, key_id);
 
         // Keep `directory.data` owned by us; drop it through the vtable.
         // SAFETY: single-drop, matched vtable.
@@ -5907,23 +5917,26 @@ mod tests {
         ));
         let proxy = build_ops_directory(directory, executor).expect("abi ok");
 
-        let rec = sample_key_record("primitive-ops");
+        // v59.0.0 (CIRISPersist#1103) — the capsule's PutPublicKey is a door:
+        // the id names its own key.
+        let key_id = crate::federation::tier_ingest::test_support::fp_key_id("primitive-ops");
+        let rec = sample_key_record(&key_id);
         rt.block_on(proxy.put_public_key(SignedKeyRecord {
             record: rec.clone(),
         }))
         .expect("proxy put_public_key");
 
         let via_proxy = rt
-            .block_on(proxy.lookup_public_key("primitive-ops"))
+            .block_on(proxy.lookup_public_key(&key_id))
             .expect("proxy lookup_public_key");
         let via_direct = rt
-            .block_on(dir.lookup_public_key("primitive-ops"))
+            .block_on(dir.lookup_public_key(&key_id))
             .expect("direct lookup");
         assert_eq!(
             via_proxy, via_direct,
             "proxy result must equal a direct backend call"
         );
-        assert_eq!(via_proxy.expect("some").key_id, "primitive-ops");
+        assert_eq!(via_proxy.expect("some").key_id, key_id);
     }
 
     /// CIRISPersist#785 — the known-hash surface through the **consumer-side

@@ -211,7 +211,37 @@ impl PostgresBackend {
             )
             .await
             .unwrap_or(0),
+            carriers: Default::default(),
         };
+        // v59.0.0 (CIRISPersist#1104) — each held legacy framed occurrence
+        // revocation gets its carrier row where the structural rule admits it.
+        let legacy = client
+            .query(
+                "SELECT attesting_key_id, signed_envelope::text, signature::text \
+                   FROM cirislens.federation_identity_occurrence_revocations \
+                  WHERE legacy_framed AND signed_envelope IS NOT NULL \
+                    AND signature IS NOT NULL AND attesting_key_id IS NOT NULL",
+                &[],
+            )
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("carrier scan: {e}")))?
+            .iter()
+            .map(|r| {
+                Ok((
+                    r.try_get::<_, String>(0)?,
+                    r.try_get::<_, String>(1)?,
+                    r.try_get::<_, String>(2)?,
+                ))
+            })
+            .collect::<Result<Vec<_>, tokio_postgres::Error>>()
+            .map_err(|e| crate::federation::Error::Backend(format!("carrier scan: {e}")))?;
+        drop(client);
+        let mut report = report;
+        report.carriers = crate::federation::occurrence_revocation_carrier::migrate_legacy_framed(
+            self,
+            crate::federation::occurrence_revocation_carrier::framed_of_columns(legacy),
+        )
+        .await?;
         report.log("postgres");
         Ok(report)
     }

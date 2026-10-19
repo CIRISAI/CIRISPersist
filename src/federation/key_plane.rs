@@ -94,7 +94,7 @@ pub const IDENTITY_OCCURRENCE_MEMBER: &str = "identity_occurrence";
 /// one-way rehome at first open found: every v57-shape object it could give a
 /// row now has one; these are what it could not. Logged at open, one line,
 /// counted.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct KeyPlaneRehomeReport {
     /// Keys held without a `key:record:v1` row (verify under neither rule).
     pub keys_without_row: u64,
@@ -105,6 +105,10 @@ pub struct KeyPlaneRehomeReport {
     /// Framed occurrence revocations kept as legacy projection rows (V200):
     /// still revoking, never re-signed, never un-revoked.
     pub legacy_framed_occurrence_revocations: u64,
+    /// v59.0.0 (CIRISPersist#1104) — what the carrier migration did with
+    /// them: minted carriers, and the user-self revocations without a roster
+    /// quorum (named, for their owners to re-propose through the door).
+    pub carriers: super::occurrence_revocation_carrier::CarrierMigration,
 }
 
 impl KeyPlaneRehomeReport {
@@ -117,8 +121,13 @@ impl KeyPlaneRehomeReport {
             revocations_without_row = self.revocations_without_row,
             occurrences_without_row = self.occurrences_without_row,
             legacy_framed_occurrence_revocations = self.legacy_framed_occurrence_revocations,
+            occurrence_revocation_carriers = self.carriers.minted,
+            carriers_without_roster_quorum = ?self.carriers.without_quorum,
+            carriers_not_carried = ?self.carriers.not_carried,
             "key-plane rehome at open (v59.0.0): every verifiable v57-shape record has its row; \
-             the counted rest is held without one"
+             the counted rest is held without one; a user self's legacy occurrence revocation \
+             without a roster quorum stays local — its owner re-proposes it through the two-path \
+             door (CIRISPersist#1104)"
         );
     }
 }
@@ -694,6 +703,9 @@ pub fn revocation_of_row(row: &Attestation) -> Option<super::types::Revocation> 
 #[must_use]
 pub fn is_never_withdrawn(row: &Attestation) -> bool {
     KeyPlaneFamily::of_row(row) == Some(KeyPlaneFamily::KeyRevocation)
+        // v59.0.0 (CIRISPersist#1104, CC 3.1.5) — nor is an occurrence
+        // revocation's carrier.
+        || super::occurrence_revocation_carrier::is_carrier_row(row)
 }
 
 /// The rebuild gate's rendering of one `federation_revocations` projection
@@ -1046,6 +1058,34 @@ where
         witness_set: Vec::new(),
         persist_row_hash: String::new(),
     }))
+}
+
+/// v59.0.0 (CIRISPersist#1104; for CIRISEdge) — **the one predicate**: does
+/// `row` revoke an occurrence, and which? `Some((identity, occurrence))` for
+/// a `withdraws` whose target is a held `identity:occurrence:v1` row, and for
+/// an `identity:occurrence_revocation:v1` carrier; `None` for any other row
+/// (or a `withdraws` whose target this node does not hold). Whether the row
+/// is ADMITTED is the door's; this names what it would revoke.
+///
+/// # Errors
+///
+/// A backend failure reading the `withdraws` target.
+pub async fn occurrence_revoked_by<D>(
+    dir: &D,
+    row: &Attestation,
+) -> Result<Option<(String, String)>, Error>
+where
+    D: super::FederationDirectory + ?Sized,
+{
+    if let Some(framed) = super::occurrence_revocation_carrier::carrier_of_row(row) {
+        return Ok(framed
+            .revocation()
+            .ok()
+            .map(|r| (r.identity_key_id, r.occurrence_key_id)));
+    }
+    Ok(occurrence_withdrawal_of(dir, row)
+        .await?
+        .map(|r| (r.identity_key_id, r.occurrence_key_id)))
 }
 
 /// The rebuild gate's rendering of one SIGNED `federation_identity_occurrences`

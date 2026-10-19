@@ -424,6 +424,14 @@ pub(crate) mod bodies {
             (0, 0, 0),
             "[{tag}] I1144: every v57 record here verifies: {report:?}"
         );
+        // v59.0.0 (CIRISPersist#1104) — the legacy revocation (a self whose
+        // roster is its genesis key alone: a strict majority of one) is
+        // carried as an `identity:occurrence_revocation:v1` row.
+        assert_eq!(
+            (report.carriers.minted, report.carriers.without_quorum.len()),
+            (1, 0),
+            "[{tag}] I1144: the legacy revocation's carrier: {report:?}"
+        );
     }
 
     /// I1148's v57 self: a user-role genesis key `f` (verifiable) and its
