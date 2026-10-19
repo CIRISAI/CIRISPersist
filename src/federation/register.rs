@@ -1448,6 +1448,92 @@ where
     )
 }
 
+/// v59.0.0 (CIRISPersist#1103; CC 2.6.8 rc9 `957d1dd`,
+/// `CLM-key-id-fingerprint-verified`) — the `-<fp>` suffix a `key_id` must
+/// carry: verify-core fedcode's fingerprint ([`ciris_verify_core::fedcode`],
+/// the first `KEY_ID_FINGERPRINT_LEN` lowercase base32 characters of
+/// SHA-256 over the raw Ed25519 public key), taken from
+/// `fedcode::derive_key_id` so persist does not re-implement it. `None` when
+/// the base64 is not 32 raw bytes (the registration gate refuses that on its
+/// own terms).
+#[must_use]
+pub fn key_id_fingerprint(pubkey_ed25519_base64: &str) -> Option<String> {
+    use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+    let raw = B64.decode(pubkey_ed25519_base64).ok()?;
+    if raw.len() != 32 {
+        return None;
+    }
+    let id = ciris_verify_core::fedcode::derive_key_id("", &raw);
+    id.strip_prefix("id-").map(str::to_owned)
+}
+
+/// v59.0.0 (CIRISPersist#1103) — is `record` one the genesis bundle pin or a
+/// family vouches for, exempt from the fingerprint rule? A bundle-pinned
+/// anchor (an accord holder or a serve node of the pinned
+/// [`GenesisBundle`](super::genesis::bundle::GenesisBundle), the accord
+/// holders this build seeds, under the SAME Ed25519 key) or a held family's
+/// id. Keyed off the bundle and the families, never a string prefix.
+async fn fingerprint_exempt<F>(directory: &F, record: &KeyRecord) -> Result<bool, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let pinned = |r: &super::SignedKeyRecord| {
+        r.record.key_id == record.key_id
+            && r.record.pubkey_ed25519_base64 == record.pubkey_ed25519_base64
+    };
+    let bundle = super::genesis::canonical_genesis_bundle();
+    if bundle.holders.iter().chain(&bundle.serve_nodes).any(pinned)
+        || super::genesis::effective_accord_holder_records()
+            .iter()
+            .any(pinned)
+    {
+        return Ok(true);
+    }
+    if bundle.family_key_id == record.key_id {
+        return Ok(true);
+    }
+    Ok(directory.lookup_family(&record.key_id).await?.is_some())
+}
+
+/// v59.0.0 (CIRISPersist#1103; CC 2.6.8 rc9 `957d1dd`,
+/// `CLM-key-id-fingerprint-verified`) — **the door's fingerprint rule**: a
+/// key registered ([`Engine::register_federation_key`](crate::Engine::register_federation_key),
+/// Python `register_federation_key`) or introduced at first contact (the
+/// `key:record:v1` proof-of-possession door) must name itself
+/// `<label>-<fp>`, `fp` = [`key_id_fingerprint`] of the record's OWN Ed25519
+/// key — so a peer cannot substitute another key under an id. Exempt:
+/// [`fingerprint_exempt`] (the bundle-pinned anchors and family ids, which
+/// the genesis pin verifies). Checked at the door only: a key already held
+/// under a non-matching id is GRANDFATHERED (it resolves, nothing re-keys
+/// it), but it cannot be registered or introduced again under that id. The
+/// roster-id form (`device-<hex>-<fp>`) is a separate rule; this one reads
+/// only the suffix.
+///
+/// # Errors
+///
+/// [`Error::MalformedRow`] ([`malformed_row::KEY_ID_FINGERPRINT_MISMATCH`](super::malformed_row::KEY_ID_FINGERPRINT_MISMATCH)).
+pub async fn check_key_id_fingerprint<F>(directory: &F, record: &KeyRecord) -> Result<(), Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let Some(fp) = key_id_fingerprint(&record.pubkey_ed25519_base64) else {
+        // Not 32 raw bytes: the registration gate refuses it on its own terms.
+        return Ok(());
+    };
+    if record.key_id.ends_with(&format!("-{fp}")) || fingerprint_exempt(directory, record).await? {
+        return Ok(());
+    }
+    Err(Error::malformed_row(
+        "key_registration",
+        super::malformed_row::KEY_ID_FINGERPRINT_MISMATCH,
+        format!(
+            "key_id {:?} does not end in -{fp}, the fingerprint of its own Ed25519 key (CC \
+             2.6.8, CLM-key-id-fingerprint-verified)",
+            record.key_id
+        ),
+    ))
+}
+
 /// v58.0.0 (CIRISPersist#991, CC 3.1.3) — **proof of possession**: the key
 /// record is the key's claim of itself. Its base scrub is the key's own
 /// (`scrub_key_id == key_id`) and verifies, hybrid and Strict, over the
@@ -3234,7 +3320,10 @@ mod tests {
         let directory = engine.federation_directory();
 
         // (a) valid hybrid-signed registration → ADMITTED + stored.
-        let valid_id = format!("peer-valid-{run_tag}");
+        // v59.0.0 (CIRISPersist#1103, CC 2.6.8) — the id names its own key.
+        let valid_id = crate::federation::tier_ingest::test_support::fp_key_id(&format!(
+            "peer-valid-{run_tag}"
+        ));
         let rec =
             signed_self_record(&valid_id, identity_type::AGENT, None, false, false, false).await;
         engine
@@ -3257,7 +3346,9 @@ mod tests {
         // missing (a wrong-curve key was stored unchallenged and only failed
         // at read). Self-signed (scrub_key_id == key_id) so it reaches the
         // store path directly.
-        let wrongcurve_id = format!("peer-wrongcurve-{run_tag}");
+        let wrongcurve_id = crate::federation::tier_ingest::test_support::fp_key_id(&format!(
+            "peer-wrongcurve-{run_tag}"
+        ));
         let mut wrongcurve = signed_self_record(
             &wrongcurve_id,
             identity_type::AGENT,
@@ -3288,7 +3379,9 @@ mod tests {
 
         // (b) bad/missing ML-DSA-65 (hybrid-pending under Strict) →
         // REJECTED, NOT stored. THE load-bearing fail-secure guard.
-        let pending_id = format!("peer-pending-{run_tag}");
+        let pending_id = crate::federation::tier_ingest::test_support::fp_key_id(&format!(
+            "peer-pending-{run_tag}"
+        ));
         let pending = signed_self_record(
             &pending_id,
             identity_type::AGENT,
@@ -3317,7 +3410,9 @@ mod tests {
         );
 
         // (b') bad Ed25519 signature → REJECTED, NOT stored.
-        let bad_ed_id = format!("peer-bad-ed-{run_tag}");
+        let bad_ed_id = crate::federation::tier_ingest::test_support::fp_key_id(&format!(
+            "peer-bad-ed-{run_tag}"
+        ));
         let bad_ed = signed_self_record(
             &bad_ed_id,
             identity_type::AGENT,
@@ -3343,7 +3438,9 @@ mod tests {
 
         // (c) tampered registration_envelope (sig doesn't match) →
         // REJECTED.
-        let tampered_id = format!("peer-tampered-{run_tag}");
+        let tampered_id = crate::federation::tier_ingest::test_support::fp_key_id(&format!(
+            "peer-tampered-{run_tag}"
+        ));
         let tampered = signed_self_record(
             &tampered_id,
             identity_type::AGENT,
@@ -3371,7 +3468,9 @@ mod tests {
         // hardware attestation → REJECTED (existing accord-holder gate
         // in put_public_key is preserved — the registration is
         // hybrid-valid but the accord_holder gate refuses it).
-        let accord_id = format!("peer-accord-{run_tag}");
+        let accord_id = crate::federation::tier_ingest::test_support::fp_key_id(&format!(
+            "peer-accord-{run_tag}"
+        ));
         let accord = signed_self_record(
             &accord_id,
             identity_type::ACCORD_HOLDER,
@@ -3396,7 +3495,9 @@ mod tests {
 
         // (f) non-hybrid algorithm → REJECTED (existing check preserved;
         // caught by the registration gate's fail-fast).
-        let nonhybrid_id = format!("peer-nonhybrid-{run_tag}");
+        let nonhybrid_id = crate::federation::tier_ingest::test_support::fp_key_id(&format!(
+            "peer-nonhybrid-{run_tag}"
+        ));
         let mut nonhybrid = signed_self_record(
             &nonhybrid_id,
             identity_type::AGENT,
@@ -3425,7 +3526,9 @@ mod tests {
         // register a fresh peer then deregister it via a revocation;
         // a revocation row is then queryable for the key (the consumer
         // applies its policy on read and ceases admitting).
-        let dereg_id = format!("peer-dereg-{run_tag}");
+        let dereg_id = crate::federation::tier_ingest::test_support::fp_key_id(&format!(
+            "peer-dereg-{run_tag}"
+        ));
         let dereg =
             signed_self_record(&dereg_id, identity_type::AGENT, None, false, false, false).await;
         engine
@@ -3587,6 +3690,59 @@ mod tests {
             .await
             .expect("construct sqlite engine");
         run_register_matrix(&engine, "sqlite").await;
+    }
+
+    /// **I1153 at the registration door** (CIRISPersist#1103, CC 2.6.8):
+    /// `Engine::register_federation_key` refuses an id that does not name its
+    /// own key and admits one that does.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    async fn i1153_registration_door(engine: &Engine, run_tag: &str) {
+        let bad = format!("i1153-reg-bad-{run_tag}");
+        let rec = signed_self_record(&bad, identity_type::AGENT, None, false, false, false).await;
+        match engine
+            .register_federation_key(SignedKeyRecord { record: rec })
+            .await
+        {
+            Err(Error::MalformedRow {
+                reason: "key_id_fingerprint_mismatch",
+                ..
+            }) => {}
+            other => panic!("I1153: a mismatched id registered: {other:?}"),
+        }
+        let good = crate::federation::tier_ingest::test_support::fp_key_id(&format!(
+            "i1153-reg-{run_tag}"
+        ));
+        let rec = signed_self_record(&good, identity_type::AGENT, None, false, false, false).await;
+        engine
+            .register_federation_key(SignedKeyRecord { record: rec })
+            .await
+            .expect("I1153: a matching id registers");
+        let dir = engine.federation_directory();
+        assert!(dir.lookup_public_key(&good).await.unwrap().is_some());
+        assert!(dir.lookup_public_key(&bad).await.unwrap().is_none());
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn i1153_registration_door_sqlite() {
+        let engine = Engine::with_signer(test_signer(), "sqlite::memory:")
+            .await
+            .expect("construct sqlite engine");
+        i1153_registration_door(&engine, "sqlite").await;
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn i1153_registration_door_postgres() {
+        let Some(dsn) = crate::test_pg::dsn() else {
+            return;
+        };
+        let engine = Engine::with_signer(test_signer(), &dsn)
+            .await
+            .expect("construct postgres engine");
+        i1153_registration_door(&engine, &format!("pg-{}", uuid::Uuid::new_v4().simple())).await;
+        eprintln!("i1153_registration_door_postgres: RAN");
     }
 
     #[cfg(feature = "postgres")]

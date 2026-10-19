@@ -5318,13 +5318,10 @@ mod tests {
         });
         let dir: Arc<dyn FederationDirectory> = backend.clone();
         let directory = build_persist_directory(dir.clone());
-        let record = ts::replicated_key_record(
-            "cap-node",
-            identity_type::NODE,
-            "cap-node",
-            "cap-node",
-            "v1",
-        );
+        // v59.0.0 (CIRISPersist#1103) — the id names its own key.
+        let cap_node = ts::fp_key_id("cap-node");
+        let record =
+            ts::replicated_key_record(&cap_node, identity_type::NODE, &cap_node, &cap_node, "v1");
         match run_op(
             &rt,
             &directory,
@@ -5341,7 +5338,7 @@ mod tests {
             other => panic!("I1146: the framed key-record op: {other:?}"),
         }
         assert!(
-            rt.block_on(dir.lookup_public_key("cap-node"))
+            rt.block_on(dir.lookup_public_key(&cap_node))
                 .unwrap()
                 .is_none(),
             "I1146: nothing was stored"
@@ -5373,7 +5370,7 @@ mod tests {
             "I1146: the key:record:v1 row is admitted: {res:?}"
         );
         assert!(rt
-            .block_on(dir.lookup_public_key("cap-node"))
+            .block_on(dir.lookup_public_key(&cap_node))
             .unwrap()
             .is_some());
         unsafe { (directory.vtable.drop)(directory.data) };

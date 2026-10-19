@@ -1165,6 +1165,10 @@ where
             })?;
             let held_signer = held_signer_of(dir, &record).await?;
             check_canonical_plane_row(row, &plan_key_record_row(&record, &held_signer)?)?;
+            // v59.0.0 (CIRISPersist#1103, CC 2.6.8) — first contact: the id
+            // names its own key (a held key under a non-matching id is
+            // grandfathered where it is, never introduced again).
+            super::register::check_key_id_fingerprint(dir, &record).await?;
             use super::register::ReplicatedKeyOutcome as O;
             Ok(
                 match dir

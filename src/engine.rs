@@ -10026,6 +10026,9 @@ impl Engine {
         // Verify BEFORE store. A reject returns here and never reaches
         // put_public_key, so a rejected registration leaves no trace.
         crate::federation::verify_key_registration(directory.as_ref(), &record.record).await?;
+        // v59.0.0 (CIRISPersist#1103, CC 2.6.8) — the id names its own key.
+        crate::federation::register::check_key_id_fingerprint(directory.as_ref(), &record.record)
+            .await?;
         // Verified — store. put_public_key re-applies the accord_holder
         // hardware-attestation gate + algorithm check + persist_row_hash
         // + idempotent insert; we deliberately keep those there.

@@ -1139,6 +1139,24 @@ pub mod test_support {
         )
     }
 
+    /// v59.0.0 (CIRISPersist#1103, CC 2.6.8) — a key id that names its own
+    /// key: `<label padded to 32 bytes>-<fp>`. The test signer seeds from the
+    /// FIRST 32 BYTES of an id, so the suffix does not move the key, and `fp`
+    /// is the fingerprint of that key.
+    pub fn fp_key_id(label: &str) -> String {
+        let mut base = label.to_owned();
+        while base.len() < 32 {
+            base.push('0');
+        }
+        let (ed, _) = hybrid_pubkeys(&base);
+        let id = format!(
+            "{base}-{}",
+            crate::federation::register::key_id_fingerprint(&ed).expect("32-byte test key")
+        );
+        debug_assert_eq!(hybrid_pubkeys(&id).0, ed, "the suffix moved the key");
+        id
+    }
+
     /// `key_id`'s registered hybrid pubkeys, base64. Use these to fill a
     /// `KeyRecord`'s `pubkey_ed25519_base64` / `pubkey_ml_dsa_65_base64`
     /// so the registered key matches what [`sign_envelope`] signs with.

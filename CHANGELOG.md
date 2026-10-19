@@ -32,6 +32,33 @@ threat-model citations because this crate's audit story is the point.
   (`tests/aggregation_tier.rs#i1152_member_commitment_unique`, memory, sqlite,
   postgres).
 
+### Security — a key id names its own key (CIRISPersist#1103, CC 2.6.8 rc9 `957d1dd`, `CLM-key-id-fingerprint-verified`)
+
+- At the DOOR only — registration (`Engine::register_federation_key`, Python
+  `register_federation_key`) and first contact (a `key:record:v1` row offered
+  through `put_attestation` / `apply_replicated_attestation` /
+  `ApplyReplicatedAttestation`, the proof-of-possession door) — a key whose
+  `key_id` does not end in `-<fp>` is refused `federation_malformed_row` with
+  the appended reason **`key_id_fingerprint_mismatch`** (Python
+  `ValueError("federation_malformed_row: key_registration:
+  key_id_fingerprint_mismatch")`). `fp` is verify-core fedcode's fingerprint
+  of the record's OWN raw Ed25519 key (`ciris_verify_core::fedcode`, via
+  `register::key_id_fingerprint`; not re-implemented). One check,
+  `register::check_key_id_fingerprint`, after the registration signature
+  verifies.
+- Exempt, keyed off the bundle and the families (never a string prefix): an
+  accord holder or serve node of the pinned genesis bundle, or an accord
+  holder this build seeds, under the SAME Ed25519 key; the bundle's family id;
+  a held family's id.
+- Grandfathered: a key already held under a non-matching id still resolves
+  and nothing re-keys it, but it is refused when registered or offered at
+  first contact again under that id. `device-<hex>-<fp>` passes (the
+  roster-id form is a separate rule).
+- Fixtures: the registration matrix, I976/I977 and I1146 now name their keys
+  with `tier_ingest::test_support::fp_key_id` (the rule was not loosened).
+  Witness **I1153** (`key_id_fingerprint_invariants`, memory, sqlite,
+  postgres; and the registration door on sqlite, postgres).
+
 ### Added — the two-path decision (CIRISPersist#1099, CC 3.3.6.3, `CLM-self-roster-two-paths`)
 
 - `federation::two_path` — ONE pure, backend-free decision for "one actor

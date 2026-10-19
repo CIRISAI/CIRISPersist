@@ -369,6 +369,9 @@ pub(crate) mod key_plane_invariants;
 // v59.0.0 (sealed-transport floor, operator ruling 2026-10-19) — I1144–I1147:
 // the framed key plane is retired; a v57 store migrates onto the rows.
 mod key_plane_retired_invariants;
+// v59.0.0 (CIRISPersist#1103, CC 2.6.8) — I1153: a key id names its own key.
+#[cfg(test)]
+mod key_id_fingerprint_invariants;
 // #848 §18 — the two-node witnesses I59–I67; `pub` under `test-anchor` so
 // consumers can drive them against their own backends.
 #[cfg(any(test, feature = "test-anchor"))]
@@ -12112,6 +12115,12 @@ pub mod malformed_row {
     /// padded list shares the distinct list's root while inflating the count
     /// the mass-dominance gate reads; refused before anything is hashed.
     pub const AGGREGATE_SOURCE_DUPLICATE: &str = "aggregate_source_duplicate";
+    /// v59.0.0 (CIRISPersist#1103; CC 2.6.8 rc9 `957d1dd`,
+    /// `CLM-key-id-fingerprint-verified`) — a key registered or introduced at
+    /// first contact under a `key_id` that does not end in `-<fp>`, `fp` being
+    /// verify-core fedcode's fingerprint of the record's OWN Ed25519 public
+    /// key.
+    pub const KEY_ID_FINGERPRINT_MISMATCH: &str = "key_id_fingerprint_mismatch";
 
     /// Every token, for the from-disk witnesses and adopters' tables.
     pub const ALL: &[&str] = &[
@@ -12126,6 +12135,7 @@ pub mod malformed_row {
         TRANSIT_KEX_WRONG_LENGTH,
         TRANSIT_KEX_KEY_REUSE,
         AGGREGATE_SOURCE_DUPLICATE,
+        KEY_ID_FINGERPRINT_MISMATCH,
     ];
 }
 

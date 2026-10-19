@@ -6307,6 +6307,13 @@ impl PyEngine {
                         )
                         .await
                         .map_err(federation_err_to_py)?;
+                        // v59.0.0 (CIRISPersist#1103, CC 2.6.8).
+                        crate::federation::register::check_key_id_fingerprint(
+                            backend.as_ref(),
+                            &record.record,
+                        )
+                        .await
+                        .map_err(federation_err_to_py)?;
                         backend
                             .put_public_key(record)
                             .await
@@ -6319,6 +6326,13 @@ impl PyEngine {
                     runtime.block_on(async move {
                         use crate::federation::FederationDirectory;
                         crate::federation::verify_key_registration(
+                            backend.as_ref(),
+                            &record.record,
+                        )
+                        .await
+                        .map_err(federation_err_to_py)?;
+                        // v59.0.0 (CIRISPersist#1103, CC 2.6.8).
+                        crate::federation::register::check_key_id_fingerprint(
                             backend.as_ref(),
                             &record.record,
                         )

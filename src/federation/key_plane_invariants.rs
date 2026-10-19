@@ -153,7 +153,8 @@ pub(crate) mod bodies {
     /// I976 — proof of possession, at the plan and at the attestation door;
     /// a genuine row replicates to a fresh node.
     pub(crate) async fn i976_proof_of_possession<B: AttestationStore>(a: &B, fresh: &B, tag: &str) {
-        let x = format!("i976-x-{tag}");
+        // v59.0.0 (CIRISPersist#1103) — the id names its own key.
+        let x = ts::fp_key_id(&format!("i976-x-{tag}"));
         let y = format!("i976-y-{tag}");
         // x's pubkeys, y's private key, claiming x as the signer.
         let (edx, mldsax) = ts::hybrid_pubkeys(&x);
@@ -233,7 +234,8 @@ pub(crate) mod bodies {
 
     /// I977 — the order rule: retryable until the signer's key row is held.
     pub(crate) async fn i977_order_rule<B: AttestationStore>(a: &B, fresh: &B, tag: &str) {
-        let k = format!("i977-k-{tag}");
+        // v59.0.0 (CIRISPersist#1103) — the id names its own key.
+        let k = ts::fp_key_id(&format!("i977-k-{tag}"));
         a.put_public_key(SignedKeyRecord {
             record: pop_record(&k),
         })
