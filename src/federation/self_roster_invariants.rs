@@ -34,6 +34,8 @@
 //!   `withdraws` of its `key:record:v1` row, evict nothing.
 //! - **I1142 (W bound)** — an evicted key signing inside its old live window
 //!   but more than W ago is refused `asserted_at_stale` at both steward gates.
+//! - **I1151 (a pre-door withdraws)** — another key's `withdraws` of the self
+//!   pair admitted before the door (no landed receipt) evicts nothing.
 //! - **I1149 (W spares a live key)** — a still-live roster key's grant and
 //!   owner-binding older than W admit, and replicate to a fresh node.
 //! - **I1143 (withdrawn)** — a proposer's `withdraws` of its proposal row
@@ -743,6 +745,52 @@ pub(crate) mod bodies {
         assert!(cbh::grant_is_authored_for(d, &fresh, &node).await.unwrap());
     }
 
+    /// **I1151** — a `withdraws` of the self pair `(F, F)` by another roster
+    /// key that a node admitted BEFORE the door (v58's admission: the plan
+    /// and the store, no roster gate) evicts nothing: it has no landed
+    /// receipt (CC 3.3.6.3, rc9 69fd22e).
+    pub(crate) async fn i1151_a_pre_door_withdraws_evicts_nothing<D>(d: &D, tag: &str)
+    where
+        D: FederationDirectory + crate::federation::attestation_admit::AttestationStore,
+    {
+        use crate::federation::attestation_admit as aa;
+        let dd: &dyn FederationDirectory = d;
+        let (f, d1) = (format!("f-{tag}"), format!("d1-{tag}"));
+        ts::register_identity_key(dd, &f, it::USER).await;
+        keys(dd, &[&d1]).await;
+        add(dd, &f, &f, &f, ms_now())
+            .await
+            .expect("the transport self-occurrence");
+        add(dd, &f, &f, &d1, ms_now()).await.expect("one key");
+        let w = genesis_withdrawal(dd, &d1, &f).await;
+        let id = w.attestation_id.clone();
+        let plan = aa::plan_put_attestation(
+            d,
+            SignedAttestation { attestation: w },
+            &crate::federation::replication::admission::WriteOrigin::Authored,
+            aa::PlanInstants {
+                fold_at: ms_now(),
+                received_at: chrono::Utc::now(),
+            },
+        )
+        .await
+        .expect("I1151: v58's admission plans it");
+        let aa::AttestationPlan::Insert(planned) = plan else {
+            panic!("I1151: expected an insert plan");
+        };
+        d.store_planned_attestation(*planned)
+            .await
+            .expect("I1151: stored as v58 stored it");
+        assert!(d.get_attestation(&id).await.unwrap().is_some());
+        assert!(
+            sr::roster_now(dd, &f).await.unwrap().contains(&f),
+            "I1151: a pre-door withdraws of the self pair evicted the genesis key"
+        );
+        assert!(sr::acts_as_steward_at(dd, &f, &f, chrono::Utc::now())
+            .await
+            .unwrap());
+    }
+
     /// **I1149** — W bounds only a key that is NOT live now (CC 3.3.6.3, rc9
     /// 69fd22e): a still-live roster key's consent grant and owner-binding,
     /// signed more than W ago, admit on the node that saw them and on a fresh
@@ -1004,6 +1052,7 @@ mod tests {
     on_every_backend!(i1140, bodies::i1140_a_node_does_not_add_roster_keys);
     on_every_backend!(i1143, bodies::i1143_the_proposer_withdraws);
     on_every_backend!(i1141, bodies::i1141_the_genesis_key_is_evictable);
+    on_every_backend!(i1151, bodies::i1151_a_pre_door_withdraws_evicts_nothing);
     on_every_backend!(
         i1142,
         bodies::i1142_an_evicted_key_cannot_sign_into_its_old_window
