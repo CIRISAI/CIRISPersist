@@ -174,6 +174,10 @@ pub(crate) const LIST_READ_BOUNDS: &[(&str, Bound)] = &[
         Bound::Open("every open roster proposal of one self, or of every self for the sweep: a refused one stays open until the roster lets it land"),
     ),
     (
+        "list_settled_self_roster_proposals",
+        Bound::Open("every settled roster proposal of one self: grows with each roster change the self makes"),
+    ),
+    (
         "list_identity_occurrence_revocations_for",
         Bound::Schema("the revocations of one identity's occurrences: at most one per occurrence and effective instant"),
     ),

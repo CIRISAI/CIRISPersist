@@ -5294,6 +5294,9 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             "insert_known_wire_hash",
             content_hash,
         )?;
+        // v59.0.0 — a peer's advertisement of a framed key-plane hash is
+        // refused: that carriage is retired.
+        crate::federation::replication_policy::refuse_retired_framed(kind)?;
         let mut state = self.state.lock().expect("memory backend lock");
         // Matches the SQL backends' upsert: the same hash arrives on every
         // wrap of edge's re-sweep, and `last_advertised_at` must MOVE on each
@@ -7136,6 +7139,29 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             .cloned()
             .collect();
         out.sort_by(|a, b| (a.received_at, &a.proposal_id).cmp(&(b.received_at, &b.proposal_id)));
+        Ok(out)
+    }
+
+    async fn list_settled_self_roster_proposals(
+        &self,
+        identity_key_id: &str,
+    ) -> Result<Vec<crate::federation::self_roster::SelfRosterReceipt>, crate::federation::Error>
+    {
+        let state = self.state.lock().expect("memory backend lock");
+        let held: std::collections::HashSet<&str> = state
+            .federation_attestations
+            .iter()
+            .map(|a| a.attestation_id.as_str())
+            .collect();
+        let mut out: Vec<_> = state
+            .self_roster_proposals
+            .values()
+            .filter(|r| r.settled_at.is_some() && r.identity_key_id == identity_key_id)
+            // V199's ON DELETE CASCADE: a receipt whose row is gone is gone.
+            .filter(|r| held.contains(r.proposal_id.as_str()))
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| (a.settled_at, &a.proposal_id).cmp(&(b.settled_at, &b.proposal_id)));
         Ok(out)
     }
 

@@ -165,6 +165,31 @@ pub fn retired_detail(kind: EnvelopeKind) -> String {
     out
 }
 
+/// v59.0.0 (sealed-transport floor, operator ruling 2026-10-19) — the kinds
+/// whose FRAMED carriage is retired: a key-plane object travels only as its
+/// row (an `Attestation`). They stay in the hashed vocabulary.
+pub const RETIRED_FRAMED: [EnvelopeKind; 4] = [
+    EnvelopeKind::Key,
+    EnvelopeKind::Revocation,
+    EnvelopeKind::IdentityOccurrence,
+    EnvelopeKind::IdentityOccurrenceRevocation,
+];
+
+/// v59.0.0 — refuse a wire-kind token (`EnvelopeKind::as_str()`) naming a
+/// [`RETIRED_FRAMED`] kind, at the replication path's own doors (a peer's
+/// advertisement of a framed hash): a peer's framed object is never taken in
+/// to be re-authored locally as a row.
+///
+/// # Errors
+///
+/// [`Error::EnvelopeKindRetired`](super::Error::EnvelopeKindRetired).
+pub fn refuse_retired_framed(kind: &str) -> Result<(), super::Error> {
+    match RETIRED_FRAMED.into_iter().find(|k| k.as_str() == kind) {
+        Some(kind) => Err(super::Error::EnvelopeKindRetired { kind }),
+        None => Ok(()),
+    }
+}
+
 impl EnvelopeKind {
     /// Every kind, in the canonical (manifest-hashed) order. APPENDED, never
     /// inserted — the order is hashed.

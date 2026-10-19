@@ -134,7 +134,7 @@ impl FaultInjectingDirectory {
     }
 }
 
-// 111 delegations, generated. Every one: fault first, then delegate.
+// 112 delegations, generated. Every one: fault first, then delegate.
 #[async_trait::async_trait]
 impl FederationDirectory for FaultInjectingDirectory {
     async fn apply_replicated_accord_evidence(
@@ -725,6 +725,17 @@ impl FederationDirectory for FaultInjectingDirectory {
             return Err(e);
         }
         self.inner.list_partner_records_since(since, limit).await
+    }
+    async fn list_settled_self_roster_proposals(
+        &self,
+        identity_key_id: &str,
+    ) -> Result<Vec<self_roster::SelfRosterReceipt>, Error> {
+        if let Some(e) = self.faulted("list_settled_self_roster_proposals") {
+            return Err(e);
+        }
+        self.inner
+            .list_settled_self_roster_proposals(identity_key_id)
+            .await
     }
     async fn list_signed_accord_quorum_evidence_since(
         &self,

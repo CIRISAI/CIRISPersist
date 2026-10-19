@@ -5264,6 +5264,21 @@ pub trait FederationDirectory: Send + Sync {
         })
     }
 
+    /// v59.0.0 (CIRISPersist#1099, V199; CC 3.3.6.3 rc9 69fd22e) — this
+    /// node's SETTLED self-roster proposals of one self, ordered
+    /// `(settled_at, proposal_id)`: what the door decided, read by
+    /// [`self_roster::genesis_evicted_at`] (a genesis eviction counts only
+    /// as a landed one).
+    async fn list_settled_self_roster_proposals(
+        &self,
+        identity_key_id: &str,
+    ) -> Result<Vec<self_roster::SelfRosterReceipt>, Error> {
+        let _ = identity_key_id;
+        Err(Error::Unsupported {
+            method: "list_settled_self_roster_proposals",
+        })
+    }
+
     /// v59.0.0 (CIRISPersist#1099, V199) — settle an open proposal: executed
     /// (`lands_quorum` / `lands_lone`) or refused for good. Write-once: a
     /// settled or unknown proposal is left as it is.

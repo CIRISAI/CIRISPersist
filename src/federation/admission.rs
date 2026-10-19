@@ -9425,33 +9425,9 @@ pub async fn check_withdraws_admission_at(
     // issuer acts for the identity: the identity itself or a live occurrence
     // of it (the `signer_acts_for` rule the occurrence door runs). Rule 1 for
     // the row's own signer, 2 for the identity, 4 for another live occurrence.
-    // v59.0.0 (CIRISPersist#1099, CC 3.3.6.3) — the genesis key's eviction: a
-    // `withdraws` of a user-role key's `key:record:v1` row by ANOTHER key that
-    // acts for it (a live roster key of the self), attested to the key. The
-    // self-roster door decides whether it lands; the record stays held.
-    if let Some(record) = crate::federation::key_plane::key_record_of_row(&target) {
-        if row.attesting_key_id != record.key_id {
-            if row.attested_key_id != record.key_id {
-                return Err(Error::malformed_row(
-                    "genesis_withdraws",
-                    super::malformed_row::TYPED_DIVERGES_FROM_ENVELOPE,
-                    format!(
-                        "a withdraws of {}'s key:record:v1 row by {} must be attested to {} \
-                         (CC 3.3.6.3, the genesis key's eviction)",
-                        record.key_id, row.attesting_key_id, record.key_id
-                    ),
-                ));
-            }
-            check_signer_acts_for(
-                directory,
-                &row.attesting_key_id,
-                &record.key_id,
-                "genesis_withdraws",
-            )
-            .await?;
-            return Ok(Some(4));
-        }
-    }
+    // v59.0.0 (CIRISPersist#1099, CC 3.3.6.3) — the genesis key's eviction is
+    // one of these: a `withdraws` of the self pair `(fedID, fedID)`'s row by
+    // another roster key, which the self-roster door then decides.
     if let Some(signed) = crate::federation::key_plane::occurrence_of_row(&target) {
         let identity = &signed.identity_occurrence.identity_key_id;
         check_signer_acts_for(

@@ -195,7 +195,7 @@ impl FloorClass {
 }
 
 /// What CANCEL's fraction runs over (CC rc9 `2643ff1`, `governance_policy.json`
-/// pin `d1b209f2`, every row).
+/// pin `b7d2370d`, every row).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CancelOver {
     /// The same base as ENACT, proposer counted: every community row, and the
@@ -1442,7 +1442,7 @@ mod tests {
     }
 
     /// CC's governance policy vectors (`tests/fixtures/governance_policy`,
-    /// rc9 `2643ff17`): every family row is a [`TwoPathPolicy`], its
+    /// rc9 `69fd22e`, pin `b7d2370d`): every family row is a [`TwoPathPolicy`], its
     /// thresholds resolve to the vector's, and [`TwoPathPolicy::decide_counts`]
     /// returns the vector's verdict, path and reason — all 732. A vector over
     /// a non-standing base (the provisional expected-active law, not built)

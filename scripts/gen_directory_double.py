@@ -61,6 +61,7 @@ DELEGATED_DEFAULTS = (
     # the V199 self-roster proposal ledger.
     "note_self_roster_proposal",
     "list_open_self_roster_proposals",
+    "list_settled_self_roster_proposals",
     "settle_self_roster_proposal",
     # v53.1.6 — defaulted `Unsupported`, overridden by every backend (the
     # V150 cohort_target seek has no unbounded twin to compose).

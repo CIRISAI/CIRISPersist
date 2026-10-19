@@ -8592,6 +8592,9 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             "insert_known_wire_hash",
             content_hash,
         )?;
+        // v59.0.0 — a peer's advertisement of a framed key-plane hash is
+        // refused: that carriage is retired.
+        crate::federation::replication_policy::refuse_retired_framed(kind)?;
         let client = self.pool().get().await.map_err(|e| {
             crate::federation::Error::Backend(format!("insert_known_wire_hash pool: {e}"))
         })?;
@@ -10804,6 +10807,28 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             )
             .await
             .map_err(|e| crate::federation::Error::Backend(format!("self-roster receipts: {e}")))?;
+        rows.iter().map(pg_self_roster_receipt).collect()
+    }
+
+    async fn list_settled_self_roster_proposals(
+        &self,
+        identity_key_id: &str,
+    ) -> Result<Vec<crate::federation::self_roster::SelfRosterReceipt>, crate::federation::Error>
+    {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let rows = client
+            .query(
+                "SELECT attestation_id, identity_key_id, received_at, settled_at, outcome \
+                   FROM cirislens.federation_self_roster_proposals \
+                  WHERE settled_at IS NOT NULL AND identity_key_id = $1 \
+                  ORDER BY settled_at, attestation_id",
+                &[&identity_key_id],
+            )
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("self-roster settled: {e}")))?;
         rows.iter().map(pg_self_roster_receipt).collect()
     }
 

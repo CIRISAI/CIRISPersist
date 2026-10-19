@@ -27,11 +27,15 @@
 //! - **I1140 (a node is not a roster key)** — a node its owner bound
 //!   publishes its own occurrence; its signature on a user-role key's is
 //!   refused `proposer_not_on_roster`, and nothing is held.
-//! - **I1141 (genesis eviction)** — another roster key's framed revocation of
-//!   the self pair lands by quorum; the genesis key leaves the roster, cannot
-//!   sign for the self, and is no steward; the fedID string survives.
+//! - **I1141 (genesis eviction)** — another roster key's `withdraws` of the
+//!   self pair `(F, F)`'s occurrence row lands by quorum; the genesis key
+//!   leaves the roster, cannot sign for the self, and is no steward; the fedID
+//!   string survives. The genesis key's own `withdraws` of that row, and any
+//!   `withdraws` of its `key:record:v1` row, evict nothing.
 //! - **I1142 (W bound)** — an evicted key signing inside its old live window
 //!   but more than W ago is refused `asserted_at_stale` at both steward gates.
+//! - **I1149 (W spares a live key)** — a still-live roster key's grant and
+//!   owner-binding older than W admit, and replicate to a fresh node.
 //! - **I1143 (withdrawn)** — a proposer's `withdraws` of its proposal row
 //!   takes it out of the decision; it never lands; the slot is free.
 //! - **I1139 (two nodes)** — a proposal and its assent delivered through the
@@ -64,9 +68,22 @@ pub(crate) mod bodies {
         crate::federation::steward_purge::test_clock::set(None);
     }
 
-    /// `signer`'s `withdraws` of `f`'s `key:record:v1` row, attested to `f`:
-    /// the genesis key's eviction when `signer != f`.
+    /// `signer`'s `withdraws` of the self pair `(f, f)`'s
+    /// `identity:occurrence:v1` row (the transport self-occurrence): the
+    /// genesis key's eviction when `signer != f` (CC 3.3.6.3, rc9 69fd22e).
     pub(crate) async fn genesis_withdrawal(
+        d: &dyn FederationDirectory,
+        signer: &str,
+        f: &str,
+    ) -> Attestation {
+        ts::occurrence_withdrawal(d, signer, f, f, ms_now())
+            .await
+            .attestation
+    }
+
+    /// `signer`'s `withdraws` of `f`'s `key:record:v1` row, attested to `f`:
+    /// NOT an eviction — the record stays a valid key.
+    pub(crate) async fn key_record_withdrawal(
         d: &dyn FederationDirectory,
         signer: &str,
         f: &str,
@@ -560,12 +577,14 @@ pub(crate) mod bodies {
             .is_empty());
     }
 
-    /// **I1141** — the genesis key is evictable: another roster key's framed
-    /// revocation of the self pair is a proposal, lands by quorum, and then
-    /// the genesis key is off the roster, cannot sign for the self, and is no
-    /// steward — while the fedID string keeps naming the self and its other
-    /// keys act as it. The genesis key revoking its own pair (its transport
-    /// self-occurrence) lands at once and evicts nothing.
+    /// **I1141** — the genesis key is evictable (CC 3.3.6.3, rc9 69fd22e):
+    /// another roster key's `withdraws` of the self pair `(F, F)`'s occurrence
+    /// row is a proposal, lands by quorum, and then the genesis key is off the
+    /// roster, cannot sign for the self, and is no steward — while the fedID
+    /// string keeps naming the self, its other keys act as it, and its key
+    /// record stays a valid key. The genesis key's own `withdraws` of that row
+    /// retires its transport self-occurrence and evicts nothing; a `withdraws`
+    /// of the genesis key's `key:record:v1` row evicts nothing.
     pub(crate) async fn i1141_the_genesis_key_is_evictable(d: &dyn FederationDirectory, tag: &str) {
         let (f, d1, d2, d3) = (
             format!("f-{tag}"),
@@ -576,9 +595,25 @@ pub(crate) mod bodies {
         // The genesis key proves possession, so its record is a key:record:v1 row.
         ts::register_identity_key(d, &f, it::USER).await;
         keys(d, &[&d1, &d2, &d3]).await;
+        add(d, &f, &f, &f, ms_now())
+            .await
+            .expect("the transport self-occurrence");
         add(d, &f, &f, &d1, ms_now()).await.expect("one key");
         let p2 = pending(add(d, &f, &f, &d2, ms_now()).await, "f adds d2");
         vote(d, &d1, &f, &p2, true).await;
+
+        // A `withdraws` of the genesis key's RECORD is no eviction.
+        let _ = d
+            .put_attestation(SignedAttestation {
+                attestation: key_record_withdrawal(d, &d1, &f).await,
+            })
+            .await;
+        sr::execute_for(d, &f).await.unwrap();
+        assert!(
+            sr::roster_now(d, &f).await.unwrap().contains(&f),
+            "I1141: a key:record withdraws evicted the genesis key"
+        );
+
         let w = genesis_withdrawal(d, &d1, &f).await;
         let p = pending(
             d.put_attestation(SignedAttestation { attestation: w })
@@ -615,19 +650,28 @@ pub(crate) mod bodies {
         // live still verifies.
         assert!(d.lookup_public_key(&f).await.unwrap().is_some());
 
-        // The genesis key withdrawing its own record is not an eviction.
+        // The genesis key withdrawing its own pair is not an eviction: it
+        // retires the transport self-occurrence, at once.
         let (g, e1) = (format!("g-{tag}"), format!("e1-{tag}"));
         ts::register_identity_key(d, &g, it::USER).await;
         keys(d, &[&e1]).await;
+        add(d, &g, &g, &g, ms_now())
+            .await
+            .expect("g's transport self-occurrence");
         add(d, &g, &g, &e1, ms_now()).await.expect("one key");
+        let own = genesis_withdrawal(d, &g, &g).await;
         assert!(
-            sr::genesis_withdrawal_of(d, &genesis_withdrawal(d, &g, &g).await)
-                .await
-                .unwrap()
-                .is_none(),
-            "I1141: the genesis key's own withdraws evicts nothing"
+            sr::genesis_withdrawal_of(d, &own).await.unwrap().is_none(),
+            "I1141: the genesis key's own withdraws is no eviction"
         );
-        assert!(sr::roster_now(d, &g).await.unwrap().contains(&g));
+        d.put_attestation(SignedAttestation { attestation: own })
+            .await
+            .expect("I1141: g retires its transport self-occurrence at once");
+        assert!(!active(d, &g, &g).await, "I1141: the self pair is retired");
+        assert!(
+            sr::roster_now(d, &g).await.unwrap().contains(&g),
+            "I1141: the genesis key's own withdraws evicted it"
+        );
     }
 
     /// **I1142** — the steward check's instant is bounded by W at admission
@@ -697,6 +741,81 @@ pub(crate) mod bodies {
         .await
         .expect("I1142: d2's grant now is inside W");
         assert!(cbh::grant_is_authored_for(d, &fresh, &node).await.unwrap());
+    }
+
+    /// **I1149** — W bounds only a key that is NOT live now (CC 3.3.6.3, rc9
+    /// 69fd22e): a still-live roster key's consent grant and owner-binding,
+    /// signed more than W ago, admit on the node that saw them and on a fresh
+    /// node the history is replayed to.
+    pub(crate) async fn i1149_a_live_keys_old_rows_replicate(
+        a: &dyn FederationDirectory,
+        b: &dyn FederationDirectory,
+        tag: &str,
+    ) {
+        use crate::federation::consent_by_humans as cbh;
+        let (f, d1, node, peer) = (
+            format!("f-{tag}"),
+            format!("d1-{tag}"),
+            format!("n-{tag}"),
+            format!("p-{tag}"),
+        );
+        let days = |n: i64| ms_now() - chrono::Duration::days(n);
+        for d in [a, b] {
+            keys(d, &[&f, &d1, &peer]).await;
+            ts::register_hybrid_key_as(d, &node, &node, it::NODE).await;
+        }
+        // d1 live since five days ago, and still live.
+        add(a, &f, &f, &d1, days(5)).await.expect("one key");
+        let mut bind = binding(&d1, &node);
+        bind.asserted_at = days(4);
+        bind.scrub_timestamp = bind.asserted_at;
+        ts::seal_row_in_place(&d1, &mut bind);
+        a.put_attestation(SignedAttestation {
+            attestation: bind.clone(),
+        })
+        .await
+        .expect("I1149: a live key's owner-binding older than W admits");
+        let mut old = grant(&d1, &peer, &node);
+        old.asserted_at = days(4);
+        old.scrub_timestamp = old.asserted_at;
+        ts::seal_row_in_place(&d1, &mut old);
+        a.put_attestation(SignedAttestation {
+            attestation: old.clone(),
+        })
+        .await
+        .expect("I1149: a live key's grant older than W admits");
+
+        // The fresh node: the roster, then A's attestation stream.
+        add(b, &f, &f, &d1, days(5)).await.expect("one key on B");
+        let mut since = None;
+        loop {
+            let page = a
+                .list_attestations_since(since.clone(), 1_000)
+                .await
+                .unwrap();
+            let Some(last) = page.last() else { break };
+            since = Some(last.resume_pair());
+            for s in &page {
+                let _ = b
+                    .apply_replicated_attestation(SignedAttestation {
+                        attestation: s.attestation.clone(),
+                    })
+                    .await;
+            }
+            if page.len() < 1_000 {
+                break;
+            }
+        }
+        for (what, id) in [
+            ("owner-binding", &bind.attestation_id),
+            ("grant", &old.attestation_id),
+        ] {
+            assert!(
+                b.get_attestation(id).await.unwrap().is_some(),
+                "I1149: the fresh node refused the live key's old {what}"
+            );
+        }
+        assert!(cbh::grant_is_authored_for(b, &old, &node).await.unwrap());
     }
 
     /// **I1143** — a proposer withdraws its open proposal: it leaves the
@@ -889,6 +1008,56 @@ mod tests {
         i1142,
         bodies::i1142_an_evicted_key_cannot_sign_into_its_old_window
     );
+
+    mod i1149 {
+        use super::*;
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn memory() {
+            let (a, b) = (
+                crate::store::memory::MemoryBackend::new(),
+                crate::store::memory::MemoryBackend::new(),
+            );
+            bodies::i1149_a_live_keys_old_rows_replicate(&a, &b, &tag("m")).await;
+        }
+
+        #[cfg(feature = "sqlite")]
+        #[tokio::test(flavor = "multi_thread")]
+        async fn sqlite() {
+            use crate::store::Backend as _;
+            let a = crate::store::sqlite::SqliteBackend::open_in_memory()
+                .await
+                .unwrap();
+            a.run_migrations().await.unwrap();
+            let b = crate::store::sqlite::SqliteBackend::open_in_memory()
+                .await
+                .unwrap();
+            b.run_migrations().await.unwrap();
+            bodies::i1149_a_live_keys_old_rows_replicate(&a, &b, &tag("s")).await;
+        }
+
+        #[cfg(feature = "postgres")]
+        #[tokio::test(flavor = "multi_thread")]
+        async fn postgres() {
+            use crate::store::Backend as _;
+            let Some(dsn_a) = crate::test_pg::empty_dsn() else {
+                return;
+            };
+            let Some(dsn_b) = crate::test_pg::empty_dsn() else {
+                return;
+            };
+            let a = crate::store::postgres::PostgresBackend::connect(&dsn_a)
+                .await
+                .unwrap();
+            a.run_migrations().await.unwrap();
+            let b = crate::store::postgres::PostgresBackend::connect(&dsn_b)
+                .await
+                .unwrap();
+            b.run_migrations().await.unwrap();
+            bodies::i1149_a_live_keys_old_rows_replicate(&a, &b, &tag("p")).await;
+            eprintln!("i1149: RAN");
+        }
+    }
 
     mod i1139 {
         use super::*;

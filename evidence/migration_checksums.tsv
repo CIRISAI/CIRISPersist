@@ -373,3 +373,5 @@ sqlite	199	self_roster_proposals	2411818760403917388
 postgres	199	self_roster_proposals	10558628645746662638
 sqlite	200	legacy_framed_occurrence_revocations	13764224007912318846
 postgres	200	legacy_framed_occurrence_revocations	1831514606684552061
+sqlite	201	self_roster_settled_index	15053344025319008484
+postgres	201	self_roster_settled_index	10153111305644630646

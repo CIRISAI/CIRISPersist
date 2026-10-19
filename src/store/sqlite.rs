@@ -6300,6 +6300,9 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             "insert_known_wire_hash",
             content_hash,
         )?;
+        // v59.0.0 — a peer's advertisement of a framed key-plane hash is
+        // refused: that carriage is retired.
+        crate::federation::replication_policy::refuse_retired_framed(kind)?;
         let kind = kind.to_owned();
         let hash = content_hash.to_owned();
         let by = advertised_by.map(str::to_owned);
@@ -8596,6 +8599,28 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             })
             .await
             .map_err(|e| crate::federation::Error::Backend(format!("self-roster receipts: {e}")))?;
+        rows.into_iter().map(SelfRosterRow::into_receipt).collect()
+    }
+
+    async fn list_settled_self_roster_proposals(
+        &self,
+        identity_key_id: &str,
+    ) -> Result<Vec<crate::federation::self_roster::SelfRosterReceipt>, crate::federation::Error>
+    {
+        let identity = identity_key_id.to_owned();
+        let rows = self
+            .read(move |conn| -> Result<Vec<SelfRosterRow>, rusqlite::Error> {
+                let mut stmt = conn.prepare(
+                    "SELECT attestation_id, identity_key_id, received_at, settled_at, outcome \
+                       FROM federation_self_roster_proposals \
+                      WHERE settled_at IS NOT NULL AND identity_key_id = ?1 \
+                      ORDER BY settled_at, attestation_id",
+                )?;
+                let rows = stmt.query_map(rusqlite::params![identity], self_roster_row)?;
+                rows.collect()
+            })
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("self-roster settled: {e}")))?;
         rows.into_iter().map(SelfRosterRow::into_receipt).collect()
     }
 

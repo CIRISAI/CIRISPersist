@@ -44,7 +44,7 @@ threat-model citations because this crate's audit story is the point.
   `cancel_needs_everyone`, `cancel_above_enact`, `enact_below_strict_majority`,
   `floor_above_enact`, `cancel_by_single_voter`, `enact_needs_everyone`,
   `floor_below_two_voters` (not for `SameIdentity`), `window_below_floor`.
-- `cancel_over: CancelOver::{Base, Others}` (CC rc9 `2643ff1`, pin `d1b209f2`):
+- `cancel_over: CancelOver::{Base, Others}` (CC rc9 `2643ff1`; table re-pinned `b7d2370d` at `69fd22e`):
   every community row cancels over ENACT's base, proposer counted; the self
   roster over the others. A self-roster proposal its proposer withdraws (a
   `withdraws` against its `objection:proposal:v1` row) leaves the decision and
@@ -56,8 +56,8 @@ threat-model citations because this crate's audit story is the point.
   (`SameIdentity`), reversible, `AtWindow::StayOpen` (as `SelfRoster.tla`) —
   its door is unchanged. In its own corridor at one and three keys; at two,
   `cancel_needs_everyone` (the stated two-key bound).
-- CC's 732 governance policy vectors (rc9 `2643ff17`, `policy_sha256
-  d1b209f2…`, vendored as TEST fixtures under `tests/fixtures/governance_policy/`)
+- CC's 732 governance policy vectors (rc9 `69fd22e`, `policy_sha256
+  b7d2370d…`, vendored as TEST fixtures under `tests/fixtures/governance_policy/`)
   all replay through the struct: thresholds, verdict, path and cancel reason.
   216 of them carry the provisional expected-active base (N = 10 000 → 344),
   which is not built; they take their stated base count as given. No
@@ -136,15 +136,22 @@ threat-model citations because this crate's audit story is the point.
 - Staged, not refused: the `device-<hex>-<fp>` roster key id
   (`self_roster::DEVICE_DERIVED_ROSTER_KEY_PREFIX`, `CLM-self-roster-key-id`)
   waits for CIRISServer#793 to ship `<fedID>-<fp>`.
-- **The genesis key is evictable** (CC 3.3.6.3): a `withdraws` against the
-  genesis key's own `key:record:v1` row, signed by ANOTHER live roster key (and
-  attested to the fedID), is a roster eviction through the two paths. Once it lands the genesis
-  key leaves the roster, `signer_acts_for` no longer lets it act for the self,
-  and it is no steward; the fedID string keeps naming the self and its other
-  keys act as it (`self_roster::genesis_evicted_at`, terminal: a later
-  assertion does not re-establish it); the record stays held, so every row the
-  key signed while live still verifies. The genesis key withdrawing its own
-  record evicts nothing (I1141).
+- **The genesis key is evictable** (CC 3.3.6.3, rc9 `69fd22e`): an
+  identity-occurrence revocation of the pair `(fedID, fedID)` by ANOTHER live
+  roster key — a `withdraws` against the self pair's `identity:occurrence:v1`
+  row (the transport self-occurrence) — is a roster eviction through the two
+  paths. It counts only once it LANDED: this node's door settled its proposal
+  `lands_quorum` / `lands_lone` (V199; `list_settled_self_roster_proposals`,
+  indexed by **V201**). Once it lands the genesis key leaves the roster,
+  `signer_acts_for` no longer lets it act for the self, and it is no steward;
+  the fedID string keeps naming the self and its other keys act as it
+  (`self_roster::genesis_evicted_at`, terminal: a later assertion does not
+  re-establish it); its key record stays held and valid, so every row the key
+  signed while live still verifies. The genesis key's own `withdraws` of that
+  row retires its transport self-occurrence and evicts nothing; a `withdraws`
+  of its `key:record:v1` row evicts nothing; a revocation of the pair admitted
+  before the door (a v58 `withdraws`, or a framed one kept `legacy_framed`)
+  evicts nothing (I1141, I1148).
 - Not carried in this cut: re-asserting a live key's occurrence by another
   roster key (not a roster change; stays `signer_acts_for`).
 
@@ -162,10 +169,13 @@ threat-model citations because this crate's audit story is the point.
 - The predicate's instant is bounded at admission by W (CIRISPersist#1049, CC
   2.6.7, ruled 72 h; `self_roster::PAST_FRESHNESS_W_SECS`): a row admitted on a
   roster key's standing at its signed `asserted_at` — a `for_key_id` consent
-  row, an owner-binding — is refused `asserted_at_stale` when that instant is
-  more than W behind this node's clock, so an evicted key cannot sign into the
-  window in which it was still live (I1142). A steward's own rows are not
-  bounded here.
+  row, an owner-binding — by a key that is NOT a live roster key of that self
+  at receipt (evicted or revoked since) is refused `asserted_at_stale` when that
+  instant is more than W behind this node's clock, so an evicted key cannot
+  sign into the window in which it was still live (I1142). A key that is live
+  now is admitted at any age, so a new device or node syncing a self's history
+  admits its old rows (I1149; CC 3.3.6.3 rc9 `69fd22e`). A steward's own rows
+  are not bounded here.
 
 ### Fold survey — the two-path decision's relatives (CIRISPersist#1099 ruling 3)
 
@@ -253,8 +263,20 @@ Edge adopts v59 only in its sealed cut.
   pins) are removed with what they measured; I980 now asserts the rehome at
   open.
 - The genesis key's eviction (#1099 above) moves off the framed revocation: it
-  is a `withdraws` against the genesis key's own `key:record:v1` row, signed by
-  another live roster key and decided by the two paths; the record stays held.
+  is a `withdraws` against the self pair `(fedID, fedID)`'s
+  `identity:occurrence:v1` row, signed by another live roster key and landed
+  through the two paths.
+- **The replication path takes in no framed object**: a peer's advertisement
+  of a hash of a retired kind (`insert_known_wire_hash`, the wire-index ingest)
+  is refused `federation_envelope_kind_retired: <detail>`
+  (`replication_policy::RETIRED_FRAMED`, `refuse_retired_framed`), so no
+  framed body is fetched to be re-authored locally as a row. The authoring
+  doors `put_revocation` / `put_identity_occurrence` (and the capsule's
+  `PutRevocation` / `PutIdentityOccurrence`) stay: their objects become rows.
+  persist runs no sync loop of its own that routes a framed `Revocation` or
+  `IdentityOccurrence` into them; a host's loop must not (I1150). The trait
+  method `apply_replicated_key_record` stays as the `key:record:v1` row door's
+  executor; every external entry to it (capsule op, Engine, Python) refuses.
 
 ## [58.0.0] - 2026-10-18
 

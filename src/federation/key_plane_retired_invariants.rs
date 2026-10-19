@@ -24,6 +24,16 @@
 //!   `federation_envelope_kind_retired: key` /
 //!   `…: identity_occurrence_revocation` (in `ffi::directory_capsule`'s tests,
 //!   which own the capsule fixture).
+//! - **I1148 (a pre-door revocation evicts no genesis key, sqlite +
+//!   postgres)** — a V195 store holding another key's framed revocation of
+//!   the self pair `(F, F)` migrates forward with `F` still on the roster and
+//!   acting as the self; the same act through the two-path door evicts it.
+//! - **I1150 (the replication path takes in no framed object, every
+//!   backend)** — a peer's advertisement of a hash of each retired kind is
+//!   refused at the wire-index ingest (`insert_known_wire_hash`); the
+//!   authoring doors `put_identity_occurrence` / `put_revocation` still land
+//!   rows. (The capsule's `ApplyReplicatedKeyRecord` and
+//!   `PutIdentityOccurrenceRevocation` are I1146's.)
 //! - **I1147 (the compat reads stay gone, from disk)** — no trait method,
 //!   backend impl, capsule op, Python method or stub carries a retired listing
 //!   or the framed revocation door (comments stripped); the v58 I1123 gate
@@ -34,7 +44,8 @@ pub(crate) mod bodies {
     use crate::federation::tier_ingest::test_support as ts;
     use crate::federation::types::identity_type;
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
-    use crate::federation::types::{IdentityOccurrenceRevocation, Revocation};
+    use crate::federation::types::IdentityOccurrenceRevocation;
+    use crate::federation::types::Revocation;
     use crate::federation::{Error, FederationDirectory};
 
     fn ms(t: chrono::DateTime<chrono::Utc>) -> chrono::DateTime<chrono::Utc> {
@@ -42,7 +53,6 @@ pub(crate) mod bodies {
     }
 
     /// A self-revocation of `subject`, hybrid-sealed by it.
-    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     pub(crate) fn revocation(subject: &str, at: chrono::DateTime<chrono::Utc>) -> Revocation {
         ts::seal_revocation(Revocation {
             revocation_id: uuid::Uuid::new_v4().to_string(),
@@ -114,15 +124,26 @@ pub(crate) mod bodies {
     pub(crate) async fn framed_revocation(
         s: &Seed,
     ) -> (IdentityOccurrenceRevocation, serde_json::Value, String) {
+        framed_revocation_of(&s.identity, &s.identity, &s.revoked).await
+    }
+
+    /// [`framed_revocation`] of the pair `(identity, occurrence)` signed by
+    /// `signer` (its one witness, stored as the attesting key).
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    pub(crate) async fn framed_revocation_of(
+        signer: &str,
+        identity: &str,
+        occurrence: &str,
+    ) -> (IdentityOccurrenceRevocation, serde_json::Value, String) {
         let at = ms(chrono::Utc::now() - chrono::Duration::seconds(60));
         let envelope = serde_json::json!({
-            "attesting_key_id": s.identity,
-            "identity_key_id": s.identity,
-            "occurrence_key_id": s.revoked,
+            "attesting_key_id": signer,
+            "identity_key_id": identity,
+            "occurrence_key_id": occurrence,
             "revoked_at": at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
             "effective_at": at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
         });
-        let id = ts::hybrid_identity(&s.identity);
+        let id = ts::hybrid_identity(signer);
         let (signed_envelope, signature) =
             ciris_verify_core::transport_binding::produce_signed_identity_occurrence(
                 id.as_ref(),
@@ -131,12 +152,12 @@ pub(crate) mod bodies {
             .await
             .expect("sign the v57 revocation envelope");
         let mut row = IdentityOccurrenceRevocation {
-            identity_key_id: s.identity.clone(),
-            occurrence_key_id: s.revoked.clone(),
+            identity_key_id: identity.to_owned(),
+            occurrence_key_id: occurrence.to_owned(),
             revoked_at: at,
             effective_at: at,
             reason: None,
-            witness_set: vec![s.identity.clone()],
+            witness_set: vec![signer.to_owned()],
             persist_row_hash: String::new(),
         };
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row).unwrap();
@@ -193,6 +214,16 @@ pub(crate) mod bodies {
             q(&r.revoked_key_sha256_ed25519_raw),
         ))
         .await;
+        seed_raw_framed_sqlite(b, framed).await;
+    }
+
+    /// The framed occurrence revocation alone, raw, on sqlite.
+    #[cfg(feature = "sqlite")]
+    pub(crate) async fn seed_raw_framed_sqlite(
+        b: &crate::store::sqlite::SqliteBackend,
+        framed: &(IdentityOccurrenceRevocation, serde_json::Value, String),
+    ) {
+        let ts = |t: chrono::DateTime<chrono::Utc>| q(&t.to_rfc3339());
         let (row, env, sig) = framed;
         b.test_execute(&format!(
             "INSERT INTO federation_identity_occurrence_revocations (\
@@ -206,7 +237,7 @@ pub(crate) mod bodies {
             ts(row.effective_at),
             q(&serde_json::to_string(&row.witness_set).unwrap()),
             q(&row.persist_row_hash),
-            q(&row.identity_key_id),
+            q(&row.witness_set[0]),
             q(&serde_json::to_string(env).unwrap()),
             q(sig),
             ts(chrono::Utc::now()),
@@ -253,6 +284,16 @@ pub(crate) mod bodies {
             q(&r.revoked_key_sha256_ed25519_raw),
         ))
         .await;
+        seed_raw_framed_postgres(b, framed).await;
+    }
+
+    /// The framed occurrence revocation alone, raw, on postgres.
+    #[cfg(feature = "postgres")]
+    pub(crate) async fn seed_raw_framed_postgres(
+        b: &crate::store::postgres::PostgresBackend,
+        framed: &(IdentityOccurrenceRevocation, serde_json::Value, String),
+    ) {
+        let ts = |t: chrono::DateTime<chrono::Utc>| format!("{}::timestamptz", q(&t.to_rfc3339()));
         let (row, env, sig) = framed;
         b.test_execute(&format!(
             "INSERT INTO cirislens.federation_identity_occurrence_revocations (\
@@ -266,7 +307,7 @@ pub(crate) mod bodies {
             ts(row.effective_at),
             q(&serde_json::to_string(&row.witness_set).unwrap()),
             q(&row.persist_row_hash),
-            q(&row.identity_key_id),
+            q(&row.witness_set[0]),
             q(&serde_json::to_string(env).unwrap()),
             q(sig),
             ts(chrono::Utc::now()),
@@ -385,6 +426,159 @@ pub(crate) mod bodies {
         );
     }
 
+    /// I1148's v57 self: a user-role genesis key `f` (verifiable) and its
+    /// transport self-occurrence `(f, f)`; `d1`, `d2` registered. (`d1`'s
+    /// occurrence, asserted at the same past instant, is added after the
+    /// migration: the v59 door this test drives reads V199.)
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    pub(crate) async fn seed_legacy_genesis<D: FederationDirectory + ?Sized>(
+        d: &D,
+        tag: &str,
+    ) -> (String, String, String) {
+        let (f, d1, d2) = (
+            format!("g57-f-{tag}"),
+            format!("g57-d1-{tag}"),
+            format!("g57-d2-{tag}"),
+        );
+        for k in [&f, &d1, &d2] {
+            ts::register_identity_key(d, k, identity_type::USER).await;
+        }
+        let at = ms(chrono::Utc::now() - chrono::Duration::seconds(300));
+        d.put_identity_occurrence(ts::signed_content_only_occurrence(&f, &f, &f, at).await)
+            .await
+            .expect("I1148: the v57 transport self-occurrence");
+        (f, d1, d2)
+    }
+
+    /// **I1148** — a pre-door revocation of the self pair does not evict the
+    /// genesis key (CC 3.3.6.3, rc9 69fd22e): after the migration, `d1`'s
+    /// legacy framed revocation of `(f, f)` has retired the transport
+    /// self-occurrence and nothing more — `f` is on the roster and acts as
+    /// the self. The same act through the door (a `withdraws` of the pair's
+    /// row by `d1`, landed by quorum) evicts it.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    pub(crate) async fn i1148_after_migration(
+        d: &dyn FederationDirectory,
+        f: &str,
+        d1: &str,
+        d2: &str,
+    ) {
+        use crate::federation::self_roster as sr;
+        use crate::federation::self_roster_invariants::bodies as srb;
+        let at = ms(chrono::Utc::now() - chrono::Duration::seconds(300));
+        srb::add(d, f, f, d1, at).await.expect("I1148: one key");
+        assert_eq!(
+            d.list_identity_occurrence_revocations_for(f)
+                .await
+                .unwrap()
+                .iter()
+                .filter(|r| r.occurrence_key_id == f)
+                .count(),
+            1,
+            "I1148: the legacy (f, f) revocation is held"
+        );
+        assert!(!srb::active(d, f, f).await, "I1148: the pair stays retired");
+        assert!(
+            sr::roster_now(d, f).await.unwrap().contains(f),
+            "I1148: a legacy revocation of the self pair evicted the genesis key"
+        );
+        assert!(sr::acts_as_steward_at(d, f, f, chrono::Utc::now())
+            .await
+            .unwrap());
+        // f adds d2 (two keys: d1 assents).
+        let p2 = srb::pending(
+            srb::add(d, f, f, d2, srb::ms_now()).await,
+            "I1148: f adds d2",
+        );
+        srb::vote(d, d1, f, &p2, true).await;
+        // The same act, through the door.
+        let w = srb::genesis_withdrawal(d, d1, f).await;
+        let p = srb::pending(
+            d.put_attestation(crate::federation::SignedAttestation { attestation: w })
+                .await
+                .map(|_| ()),
+            "I1148: d1 proposes the genesis key's eviction",
+        );
+        srb::vote(d, d2, f, &p, true).await;
+        assert!(
+            !sr::roster_now(d, f).await.unwrap().contains(f),
+            "I1148: the landed eviction did not evict"
+        );
+    }
+
+    /// **I1150** — the replication path takes in no framed key-plane object:
+    /// a peer's advertisement of a hash of each of the four retired kinds is
+    /// refused `federation_envelope_kind_retired: <detail>` at the wire-index
+    /// ingest (a live kind's still records); and the AUTHORING doors still
+    /// land their objects as rows (`put_identity_occurrence` →
+    /// `identity:occurrence:v1`, `put_revocation` → `key:revocation:v1`).
+    pub(crate) async fn i1150_replication_takes_no_framed_object(
+        d: &dyn FederationDirectory,
+        tag: &str,
+    ) {
+        use crate::federation::key_plane as kp;
+        use crate::federation::replication_policy as rp;
+        let hash = "ab".repeat(32);
+        let now = chrono::Utc::now();
+        for kind in rp::RETIRED_FRAMED {
+            match d
+                .insert_known_wire_hash(kind.as_str(), &hash, Some("a-peer"), now)
+                .await
+            {
+                Err(e @ Error::EnvelopeKindRetired { .. }) => {
+                    assert_eq!(e.kind(), "federation_envelope_kind_retired");
+                    assert!(
+                        e.to_string().starts_with(&format!(
+                            "federation_envelope_kind_retired: {}",
+                            rp::retired_detail(kind)
+                        )),
+                        "[{tag}] I1150: {e}"
+                    );
+                }
+                other => panic!(
+                    "[{tag}] I1150: a peer's framed {} advertisement was taken in: {other:?}",
+                    kind.as_str()
+                ),
+            }
+        }
+        d.insert_known_wire_hash("Attestation", &hash, Some("a-peer"), now)
+            .await
+            .unwrap_or_else(|e| panic!("[{tag}] I1150: a live kind's advertisement: {e}"));
+
+        // The authoring doors land rows.
+        let s = seed_doors(d, tag).await;
+        let held = d
+            .list_signed_identity_occurrences_for(&s.identity)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|o| o.identity_occurrence.occurrence_key_id == s.kept)
+            .expect("I1150: the authored occurrence is held");
+        let row_id = kp::occurrence_row(&held).unwrap().attestation_id;
+        assert!(
+            d.get_attestation(&row_id).await.unwrap().is_some(),
+            "[{tag}] I1150: the authored occurrence is not its identity:occurrence:v1 row"
+        );
+        let r = revocation(&s.subject, ms(now - chrono::Duration::seconds(30)));
+        d.put_revocation(crate::federation::SignedRevocation {
+            revocation: r.clone(),
+        })
+        .await
+        .expect("I1150: the authored key revocation");
+        let stored = d
+            .revocations_for(&s.subject)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|x| x.revocation_id == r.revocation_id)
+            .expect("I1150: the key revocation is held");
+        let row_id = kp::revocation_row(&stored).unwrap().attestation_id;
+        assert!(
+            d.get_attestation(&row_id).await.unwrap().is_some(),
+            "[{tag}] I1150: the authored key revocation is not its key:revocation:v1 row"
+        );
+    }
+
     /// **I1145** — the framed reads of a retired kind refuse or resolve nothing.
     pub(crate) async fn i1145_framed_reads_are_retired(d: &dyn FederationDirectory, tag: &str) {
         let s = seed_doors(d, tag).await;
@@ -459,6 +653,36 @@ mod run {
 
     fn tag(n: &str) -> String {
         format!("{n}-{}", &uuid::Uuid::new_v4().simple().to_string()[..12])
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn i1150_memory() {
+        let b = crate::store::memory::MemoryBackend::new();
+        bodies::i1150_replication_takes_no_framed_object(&b, &tag("i1150m")).await;
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn i1150_sqlite() {
+        let b = crate::store::sqlite::SqliteBackend::open_in_memory()
+            .await
+            .unwrap();
+        b.run_migrations().await.unwrap();
+        bodies::i1150_replication_takes_no_framed_object(&b, &tag("i1150s")).await;
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn i1150_postgres() {
+        let Some(dsn) = crate::test_pg::empty_dsn() else {
+            return;
+        };
+        let b = crate::store::postgres::PostgresBackend::connect(&dsn)
+            .await
+            .unwrap();
+        b.run_migrations().await.unwrap();
+        bodies::i1150_replication_takes_no_framed_object(&b, &tag("i1150p")).await;
+        eprintln!("i1150_postgres: RAN");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -562,6 +786,40 @@ mod run {
         bodies::i1144_after_migration(&old, &t, &s, &r).await;
         bodies::i1144_report(&t, old.rehome_key_plane_at_open().await.unwrap());
         eprintln!("i1144_postgres: RAN");
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn i1148_sqlite() {
+        let t = tag("i1148s");
+        let old = crate::store::sqlite::SqliteBackend::open_in_memory()
+            .await
+            .unwrap();
+        old.run_migrations_through(195).await.unwrap();
+        let (f, d1, d2) = bodies::seed_legacy_genesis(&old, &t).await;
+        bodies::seed_raw_framed_sqlite(&old, &bodies::framed_revocation_of(&d1, &f, &f).await)
+            .await;
+        old.run_migrations().await.unwrap();
+        bodies::i1148_after_migration(&old, &f, &d1, &d2).await;
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn i1148_postgres() {
+        let Some(dsn) = crate::test_pg::empty_dsn() else {
+            return;
+        };
+        let t = tag("i1148p");
+        let old = crate::store::postgres::PostgresBackend::connect(&dsn)
+            .await
+            .unwrap();
+        old.run_migrations_through(195).await.unwrap();
+        let (f, d1, d2) = bodies::seed_legacy_genesis(&old, &t).await;
+        bodies::seed_raw_framed_postgres(&old, &bodies::framed_revocation_of(&d1, &f, &f).await)
+            .await;
+        old.run_migrations().await.unwrap();
+        bodies::i1148_after_migration(&old, &f, &d1, &d2).await;
+        eprintln!("i1148_postgres: RAN");
     }
 
     /// **I1147** — the compat reads and the framed revocation door stay gone

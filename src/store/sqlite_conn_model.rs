@@ -718,6 +718,7 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     // v59.0.0 (sealed-transport floor) — the eager key-plane rehome at open.
     ("rehome_key_plane_at_open", ConnClass::Read),
     ("list_open_self_roster_proposals", ConnClass::Read),
+    ("list_settled_self_roster_proposals", ConnClass::Read),
     ("settle_self_roster_proposal", ConnClass::Write),
     ("store_pqc_completion", ConnClass::Write),
     ("store_planned_attestation", ConnClass::Write),

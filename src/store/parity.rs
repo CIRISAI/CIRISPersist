@@ -430,6 +430,9 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // shaped like a SHA-256 (reserved for an inline blob's one-leaf log). A
     // statement about the caller's input.
     ("refuse_reserved_stream_id", Class::Gate),
+    // v59.0.0 (sealed-transport floor) — refuses a peer's advertisement of a
+    // retired framed kind.
+    ("refuse_retired_framed", Class::Gate),
     // v52.0.0 (#953) — Plumbing: a pure shape test that names the inline blob
     // a stream id spells, inside the chunk-hash loader; it refuses nothing.
     ("inline_blob_of_stream_id", Class::Plumbing),
@@ -638,10 +641,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("from_wire_str", Class::Plumbing),
     // v59.0.0 (CIRISPersist#1099) — the self-roster door: refuses (holds) a
     // roster change one key of two or more signed.
-    ("gate_genesis_withdrawal", Class::Gate),
-    // Reads which self a `withdraws` of a key record evicts the genesis key
-    // of; refuses nothing (the gate after it decides).
-    ("genesis_withdrawal_of", Class::Plumbing),
     ("gate_occurrence", Class::Gate),
     ("gate_withdrawal", Class::Gate),
     ("get", Class::Plumbing),

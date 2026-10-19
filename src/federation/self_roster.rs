@@ -19,8 +19,8 @@
 //! wins in two steps (`unilateral3_stolen`). Now an addition (a signed
 //! `identity_occurrence` of a user-role key not on the roster) and an eviction
 //! (a `withdraws` against the pair's `identity:occurrence:v1` row, of a live
-//! roster key; for the genesis key, against its own `key:record:v1` row) are
-//! each a
+//! roster key; for the genesis key, against the self pair `(fedID, fedID)`'s
+//! row, signed by another roster key) are each a
 //! **proposal**, decided by THE shared two-path function
 //! ([`super::two_path::decide_all`]) under [`policy`]:
 //!
@@ -33,7 +33,7 @@
 //!
 //! Every door that can change a roster — `put_identity_occurrence` on all
 //! three backends, and the attestation door for a `withdraws` of an occurrence
-//! row or of the genesis key's record — asks [`gate`] after its
+//! row — asks [`gate`] after its
 //! signature gate and before any write. A change that lands proceeds exactly
 //! as before. One that does not is HELD as a proposal row and the door
 //! returns [`Error::SelfRosterNotLanded`]; when it later lands (an answer
@@ -137,8 +137,8 @@ pub mod field {
 pub mod carrier {
     /// A signed `identity_occurrence` (an addition).
     pub const IDENTITY_OCCURRENCE: &str = "identity_occurrence";
-    /// A `withdraws` row against the pair's `identity:occurrence:v1` row, or
-    /// (the genesis key's eviction) against the genesis key's `key:record:v1`.
+    /// A `withdraws` row against the pair's `identity:occurrence:v1` row —
+    /// for the genesis key's eviction, the self pair `(fedID, fedID)`'s row.
     pub const WITHDRAWS: &str = "withdraws";
 }
 
@@ -287,13 +287,22 @@ where
 
 /// **Was the genesis key of `identity` evicted by `at`?** (CC 3.3.6.3: "the
 /// genesis key is roster key one and nothing more … the string survives as
-/// the self's name if that key is later evicted"). Its eviction is a held
-/// `withdraws` against the genesis key's own `key:record:v1` row, signed by a
-/// key OTHER than the genesis key at or before `at` — the only shape the door
-/// lets through ([`gate`], two paths; [`genesis_withdrawal_of`]). The record
-/// stays held (a key record's `withdraws` moves nothing on the key plane), so
-/// every row the key signed while live still verifies. It is terminal: no
-/// later assertion re-establishes it.
+/// the self's name if that key is later evicted"; rc9 69fd22e). Its eviction
+/// is an identity-occurrence revocation of the pair `(fedID, fedID)` by
+/// another live roster key, LANDING under the two paths: a `withdraws`
+/// against the self pair's `identity:occurrence:v1` row (the transport
+/// self-occurrence), signed by a key other than the genesis key at or before
+/// `at` ([`genesis_withdrawal_of`]), whose proposal THIS node's door settled
+/// as landed (V199 `lands_quorum` / `lands_lone`), and which is held.
+///
+/// Nothing else evicts it: a revocation of the pair admitted before the
+/// door (a v58 `withdraws`, or a framed occurrence revocation kept as
+/// `legacy_framed`) keeps its old meaning, retiring the transport
+/// self-occurrence only; the genesis key's own `withdraws` of that row is the
+/// same; a `withdraws` of its `key:record:v1` row is no eviction (the record
+/// stays a valid key). The key record stays held, so every row the key signed
+/// while live still verifies. It is terminal: no later assertion
+/// re-establishes it.
 pub async fn genesis_evicted_at<D>(
     dir: &D,
     identity: &str,
@@ -302,6 +311,8 @@ pub async fn genesis_evicted_at<D>(
 where
     D: FederationDirectory + ?Sized,
 {
+    // The held rows of the eviction's shape, signed by `at`…
+    let mut candidates = BTreeSet::new();
     let mut pages = super::attestation_query::AttestationQuery::to(
         identity,
         super::attestation_query::FOLD_PAGE,
@@ -314,6 +325,27 @@ where
                 && w.asserted_at <= at
                 && genesis_withdrawal_of(dir, &w).await?.as_deref() == Some(identity)
             {
+                candidates.insert(w.attestation_id);
+            }
+        }
+    }
+    if candidates.is_empty() {
+        return Ok(false);
+    }
+    // …that THIS node's door landed (a pre-door one has no landed receipt).
+    let landed = [
+        landed_outcome(LandingPath::Quorum),
+        landed_outcome(LandingPath::Lone),
+    ];
+    for r in dir.list_settled_self_roster_proposals(identity).await? {
+        if !r.outcome.as_deref().is_some_and(|o| landed.contains(&o)) {
+            continue;
+        }
+        let Some(proposal) = dir.get_attestation(&r.proposal_id).await? else {
+            continue;
+        };
+        if let Ok(Carried::Withdraws { row, .. }) = carried_of_row(dir, &proposal).await {
+            if candidates.contains(&row.attestation_id) {
                 return Ok(true);
             }
         }
@@ -321,10 +353,12 @@ where
     Ok(false)
 }
 
-/// The self whose genesis key `row` evicts, when it is one: a `withdraws`
-/// attested to a user-role key `F`, naming `F`'s held `key:record:v1` row,
-/// signed by a key other than `F`. `None` for any other row (the genesis key
-/// withdrawing its own record is not an eviction).
+/// The self whose genesis key `row` would evict, when it is that shape: a
+/// `withdraws` naming the held `identity:occurrence:v1` row of a user-role
+/// self's pair `(F, F)`, signed by a key other than `F`. `None` for any other
+/// row — the genesis key withdrawing its own pair retires its transport
+/// self-occurrence and evicts nothing; a `withdraws` of `F`'s `key:record:v1`
+/// row is not this shape. Whether it LANDED is [`genesis_evicted_at`]'s.
 pub async fn genesis_withdrawal_of<D>(dir: &D, row: &Attestation) -> Result<Option<String>, Error>
 where
     D: FederationDirectory + ?Sized,
@@ -340,11 +374,15 @@ where
     let Some(target) = dir.get_attestation(target_id).await? else {
         return Ok(None);
     };
-    let Some(record) = super::key_plane::key_record_of_row(&target) else {
+    let Some(signed) = super::key_plane::occurrence_of_row(&target) else {
         return Ok(None);
     };
-    let f = record.key_id;
-    if row.attesting_key_id == f || row.attested_key_id != f || !is_user_key(dir, &f).await? {
+    let pair = &signed.identity_occurrence;
+    if pair.identity_key_id != pair.occurrence_key_id {
+        return Ok(None);
+    }
+    let f = pair.identity_key_id.clone();
+    if row.attesting_key_id == f || !is_user_key(dir, &f).await? {
         return Ok(None);
     }
     Ok(Some(f))
@@ -359,11 +397,14 @@ pub const PAST_FRESHNESS_W_SECS: i64 = 259_200;
 pub const ASSERTED_AT_STALE: &str = "asserted_at_stale";
 
 /// **The bound on [`acts_as_steward_at`]'s instant, at admission**
-/// (CIRISPersist#1049): a row whose author stands for one of `stewards`
-/// only as a roster key at the row's signed `asserted_at` is refused
-/// [`ASSERTED_AT_STALE`] when that instant is more than
-/// [`PAST_FRESHNESS_W_SECS`] behind this node's clock — so an evicted key
-/// cannot sign into the window in which it was still live. A steward's own
+/// (CIRISPersist#1049; CC 2.6.7 W as ruled in 3.3.6.3, rc9 69fd22e): a row
+/// whose author stands for one of `stewards` as a roster key at the row's
+/// signed `asserted_at` but is NOT a live roster key of that self at receipt
+/// (evicted or revoked since) is refused [`ASSERTED_AT_STALE`] when that
+/// instant is more than [`PAST_FRESHNESS_W_SECS`] behind this node's clock —
+/// so an evicted key cannot sign into the window in which it was still live.
+/// A key that is live now is admitted at any age: a new device or node
+/// syncing a self's history admits its legitimate old rows. A steward's own
 /// row, and a row whose author is no roster key of any of them, pass (the
 /// latter fails the steward check on its own terms).
 ///
@@ -383,11 +424,15 @@ where
         return Ok(());
     }
     let oldest = roster_clock() - chrono::Duration::seconds(PAST_FRESHNESS_W_SECS);
+    // (`now` below is the same clock: the receipt instant.)
     if asserted_at >= oldest {
         return Ok(());
     }
+    let now = roster_clock();
     for s in stewards {
-        if is_roster_key_at(dir, s, author, asserted_at).await? {
+        if is_roster_key_at(dir, s, author, asserted_at).await?
+            && !is_roster_key_at(dir, s, author, now).await?
+        {
             return Err(Error::InvalidArgument(format!(
                 "{ASSERTED_AT_STALE}: {author} signs as {s}'s roster key at {asserted_at}, more \
                  than W = {PAST_FRESHNESS_W_SECS} s before this node's clock — a roster act is \
@@ -1002,10 +1047,11 @@ where
         return Ok(false);
     }
     if target == identity {
-        // The genesis key's eviction: a `withdraws` of its `key:record:v1` row
-        // signed by ANOTHER roster key ([`genesis_withdrawal_of`]). A
-        // `withdraws` of the self pair's occurrence row retires the transport
-        // self-occurrence, as before, and evicts nothing.
+        // The genesis key's eviction: a `withdraws` of the self pair's
+        // `identity:occurrence:v1` row signed by ANOTHER roster key
+        // ([`genesis_withdrawal_of`]). The genesis key's own `withdraws` of
+        // that row retires the transport self-occurrence, as before, and
+        // evicts nothing.
         let Carried::Withdraws { row, .. } = carried else {
             return Ok(false);
         };
@@ -1044,6 +1090,11 @@ where
         .map(|(.., d)| *d)
         .ok_or_else(|| Error::Backend(format!("self-roster plan lost proposal {id}")))?;
     if let TwoPathDecision::Lands { path } = decision {
+        // (The genesis key's eviction never lands on first offer: its roster
+        // holds the proposer and the target, so no quorum stands before an
+        // answer names the held proposal row and no lone window has run on
+        // this node — its landed receipt, which [`genesis_evicted_at`] reads,
+        // is always written.)
         if dir.get_attestation(&id).await?.is_some() {
             dir.note_self_roster_proposal(&id, &identity, now).await?;
             dir.settle_self_roster_proposal(&id, landed_outcome(path), now)
@@ -1090,27 +1141,6 @@ where
     D: FederationDirectory + ?Sized,
 {
     gate(dir, Carried::Occurrence(signed.clone())).await
-}
-
-/// [`gate`] for a `withdraws` against the genesis key's `key:record:v1` row
-/// (the attestation door): the genesis key's eviction.
-pub async fn gate_genesis_withdrawal<D>(
-    dir: &D,
-    row: &Attestation,
-    identity: &str,
-) -> Result<(), Error>
-where
-    D: FederationDirectory + ?Sized,
-{
-    gate(
-        dir,
-        Carried::Withdraws {
-            row: row.clone(),
-            identity_key_id: identity.to_owned(),
-            target_key_id: identity.to_owned(),
-        },
-    )
-    .await
 }
 
 /// [`gate`] for a `withdraws` against an occurrence row (the attestation door).
