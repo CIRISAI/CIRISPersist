@@ -38,7 +38,8 @@ threat-model citations because this crate's audit story is the point.
 
 ### Changed — the self-key roster door is two-path, not unilateral (CIRISPersist#1099, CC 3.3.6.3, `CLM-self-roster-two-paths`; a defect, `formal/self_roster` `unilateral3_stolen`)
 
-- `federation::self_roster` — a self's **roster** is its genesis key plus every
+- `federation::self_roster` — a self is a `user`-role fedID (a node or agent
+  identity's occurrences are not a roster); its **roster** is its genesis key plus every
   ACTIVE `identity_occurrence` under it whose key is `user`-role (a node's own
   key and an agent's key are not roster keys; their occurrences are KEM
   targets, written as before). An ADDITION (a signed occurrence of a user-role
@@ -47,7 +48,11 @@ threat-model citations because this crate's audit story is the point.
   roster key) signed by one key of a roster of TWO OR MORE is a proposal
   decided by `two_path::decide_all` under `W_SELF_SECS = 86 400` with target
   silence for evictions. At one key the addition still lands at once (the
-  add-device approval is unchanged).
+  add-device approval is unchanged). A node's own key is not a roster key: a
+  node its owner bound still publishes its own occurrence, but its signature
+  on a user-role key's occurrence is refused `proposer_not_on_roster` (I1140).
+- Witnesses I1130–I1140 on memory, sqlite and postgres, each door condition
+  with a mutation that turns it red.
 - Every door that can change a roster asks `self_roster::gate` after its
   signature gate and before any write: `put_identity_occurrence` and
   `put_identity_occurrence_revocation` on memory, sqlite and postgres, and the
