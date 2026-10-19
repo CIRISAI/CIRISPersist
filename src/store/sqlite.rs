@@ -9750,6 +9750,9 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         // JCS(signed_envelope) against the pinned key of attesting_key_id,
         // typed projection ≡ envelope, signer_acts_for.
         crate::federation::admission::verify_signed_transport_destination(self, signed).await?;
+        // v59.0.0 (CIRISPersist#1106, CC 5.3.4) — a seated serve node's
+        // bundle-pinned transit pair rotates by holder quorum, not alone.
+        crate::federation::transport_rebind::check_serve_rotation(self, signed).await?;
         let d = signed.transport_destination.clone();
         let attesting = signed.attesting_key_id.clone();
         let envelope_json = serde_json::to_string(&signed.signed_envelope)

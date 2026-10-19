@@ -176,6 +176,10 @@ struct GenesisBundleWire {
     attestations: Vec<GenesisBundleMember>,
     authorizations: Vec<GenesisAuthorization>,
     produced_at: String,
+    /// v59.0.0 (CIRISPersist#1106, CC 5.3.4) — omitted when empty, so a v2 /
+    /// v3 bundle re-serializes byte for byte.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    serve_transport_destinations: Vec<super::super::self_at_login::SignedTransportDestination>,
 }
 
 /// The bundle as it is read: each `attestations` element is dispatched by its
@@ -190,6 +194,8 @@ struct GenesisBundleWireIn {
     attestations: Vec<serde_json::Value>,
     authorizations: Vec<GenesisAuthorization>,
     produced_at: String,
+    #[serde(default)]
+    serve_transport_destinations: Vec<super::super::self_at_login::SignedTransportDestination>,
 }
 
 impl TryFrom<GenesisBundleWireIn> for GenesisBundle {
@@ -240,6 +246,7 @@ impl TryFrom<GenesisBundleWireIn> for GenesisBundle {
             roster_records,
             authorizations: w.authorizations,
             produced_at: w.produced_at,
+            serve_transport_destinations: w.serve_transport_destinations,
         })
     }
 }
@@ -264,13 +271,28 @@ impl From<GenesisBundle> for GenesisBundleWire {
                 .collect(),
             authorizations: b.authorizations,
             produced_at: b.produced_at,
+            serve_transport_destinations: b.serve_transport_destinations,
         }
     }
 }
 
-/// The bundle version the v53 assembler emits: the first that carries the
-/// roster records (CC rc7). A version-2 bundle carries none.
-pub const GENESIS_BUNDLE_VERSION: u32 = 3;
+/// The bundle version the assembler emits. Version 3 (v53, CC rc7) is the
+/// first that carries the roster records (a version-2 bundle carries none);
+/// version 4 (v59.0.0, CIRISPersist#1106, CC 5.3.4 rc9 `6cde890`) the first
+/// that carries the serve nodes' signed transport destinations
+/// ([`GenesisBundle::serve_transport_destinations`]), bound by
+/// [`authorization_digest`].
+pub const GENESIS_BUNDLE_VERSION: u32 = 4;
+
+/// The first bundle version whose [`authorization_digest`] binds
+/// [`GenesisBundle::serve_transport_destinations`].
+pub const SERVE_TRANSPORT_DESTINATIONS_VERSION: u32 = 4;
+
+/// v59.0.0 (CIRISPersist#1106) — the stable token a bundle whose serve-node
+/// transport rows fail [`check_serve_transport_destinations`] is refused with
+/// (it leads the [`Error::GenesisBundleInvalid`] detail): the WHOLE bundle
+/// fails closed.
+pub const SERVE_TRANSPORT_DESTINATION_INVALID: &str = "genesis_serve_transport_destination_invalid";
 
 /// The assembled genesis artifact (wire-compatible with CIRISServer
 /// `mesh_genesis::GenesisBundle` — same field names, same persist row
@@ -306,6 +328,13 @@ pub struct GenesisBundle {
     /// Ceremony timestamp (RFC 3339) — in the digest, so two ceremonies
     /// are distinguishable.
     pub produced_at: String,
+    /// v59.0.0 (CIRISPersist#1106, CC 5.3.4 rc9 `6cde890`,
+    /// `CLM-bundle-seeds-transit-pairs`) — each seated serve node's signed
+    /// transport destination carrying its transit KEX pair, so a fresh node
+    /// holds a Rooted pair for every serve node offline. Wire member
+    /// `serve_transport_destinations`; version ≥ 4 only (bound by the digest);
+    /// empty, and omitted on the wire, below that.
+    pub serve_transport_destinations: Vec<super::super::self_at_login::SignedTransportDestination>,
 }
 
 impl GenesisBundle {
@@ -485,7 +514,7 @@ fn authorized_record_projection(
 /// so a future change back to returning a variable-length preimage fails the
 /// build instead of failing at a hardware token during a ceremony.
 pub fn authorization_digest(bundle: &GenesisBundle) -> Result<Vec<u8>, Error> {
-    let preimage = serde_json::json!({
+    let mut preimage = serde_json::json!({
         "version": bundle.version,
         "family_key_id": bundle.family_key_id,
         "consensus_protocol": bundle.consensus_protocol,
@@ -518,6 +547,28 @@ pub fn authorization_digest(bundle: &GenesisBundle) -> Result<Vec<u8>, Error> {
             .chain(bundle.roster_records.iter().map(GenesisRosterRecord::digest_projection))
             .collect::<Vec<_>>(),
     });
+    // v59.0.0 (CIRISPersist#1106) — version ≥ 4 ONLY: the serve nodes'
+    // transport rows, each projected to its signed content (signer and the
+    // exact signed envelope; the detached signature is evidence). A v2 / v3
+    // preimage carries no such member, so it is byte-identical to before.
+    if bundle.version >= SERVE_TRANSPORT_DESTINATIONS_VERSION {
+        if let Some(map) = preimage.as_object_mut() {
+            map.insert(
+                "serve_transport_destinations".to_owned(),
+                bundle
+                    .serve_transport_destinations
+                    .iter()
+                    .map(|r| {
+                        serde_json::json!({
+                            "attesting_key_id": r.attesting_key_id,
+                            "signed_envelope": r.signed_envelope,
+                        })
+                    })
+                    .collect::<Vec<_>>()
+                    .into(),
+            );
+        }
+    }
     let canonical = crate::verify::canonical::ceg_produce_canonicalize(&preimage)
         .map_err(|e| Error::InvalidArgument(format!("genesis digest canonicalize: {e}")))?;
     // v31.2.0 — HASH the canonical bytes. See this function's doc: until now it
@@ -633,6 +684,102 @@ pub enum GenesisPurgeAuthority<'a> {
     QuorumVerified(&'a QuorumVerifiedBundle<'a>),
 }
 
+/// v59.0.0 (CIRISPersist#1106, CC 5.3.4) — **the serve nodes' transport rows,
+/// structurally**, against the bundle's own `serve_nodes` (a fresh node does
+/// not hold them yet): every row is about and signed by a key in
+/// `serve_nodes` (hybrid 1-of-1 over `JCS(signed_envelope)` against that
+/// record's keys), carries a transit KEX pair, and passes the separation rule
+/// ([`check_transit_kex_pair`](super::super::self_at_login::check_transit_kex_pair))
+/// against its own link key and the node's signing keys. A bundle below
+/// version 4 must carry none (the digest does not bind them). Any failure
+/// fails the WHOLE bundle, [`SERVE_TRANSPORT_DESTINATION_INVALID`].
+///
+/// # Errors
+///
+/// [`Error::GenesisBundleInvalid`], detail led by the token.
+pub fn check_serve_transport_destinations(bundle: &GenesisBundle) -> Result<(), Error> {
+    use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+    use ciris_verify_core::threshold::{
+        verify_threshold_signatures, ThresholdMember, ThresholdSignature,
+    };
+    let refuse = |detail: String| Error::GenesisBundleInvalid {
+        detail: format!("{SERVE_TRANSPORT_DESTINATION_INVALID}: {detail}"),
+    };
+    if bundle.version < SERVE_TRANSPORT_DESTINATIONS_VERSION {
+        if bundle.serve_transport_destinations.is_empty() {
+            return Ok(());
+        }
+        return Err(refuse(format!(
+            "a version-{} bundle carries serve transport destinations its authorizations do not \
+             cover",
+            bundle.version
+        )));
+    }
+    for (i, row) in bundle.serve_transport_destinations.iter().enumerate() {
+        let td = &row.transport_destination;
+        let Some(node) = bundle
+            .serve_nodes
+            .iter()
+            .find(|n| n.record.key_id == row.attesting_key_id)
+        else {
+            return Err(refuse(format!(
+                "row [{i}] is signed by {:?}, which is not one of the bundle's serve nodes",
+                row.attesting_key_id
+            )));
+        };
+        if td.occurrence_key_id != row.attesting_key_id {
+            return Err(refuse(format!(
+                "row [{i}] is about {:?} but signed by {:?}: a serve node signs its own route",
+                td.occurrence_key_id, row.attesting_key_id
+            )));
+        }
+        let pair =
+            super::super::self_at_login::transit_kex_pair_from_envelope(&row.signed_envelope)
+                .map_err(|e| refuse(format!("row [{i}]: {e}")))?
+                .ok_or_else(|| refuse(format!("row [{i}] carries no transit KEX pair")))?;
+        let mut others: Vec<Vec<u8>> = Vec::new();
+        for b64 in [
+            td.transport_x25519_pubkey_base64.as_deref(),
+            td.transport_ed25519_pubkey_base64.as_deref(),
+            Some(node.record.pubkey_ed25519_base64.as_str()),
+            node.record.pubkey_ml_dsa_65_base64.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if let Ok(raw) = B64.decode(b64) {
+                others.push(raw);
+            }
+        }
+        let others: Vec<&[u8]> = others.iter().map(Vec::as_slice).collect();
+        super::super::self_at_login::check_transit_kex_pair(&pair, &others)
+            .map_err(|r| refuse(format!("row [{i}]: {}", r.as_str())))?;
+        let bytes = crate::verify::canonical::ceg_produce_canonicalize(&row.signed_envelope)
+            .map_err(|e| refuse(format!("row [{i}] canonicalize: {e}")))?;
+        let members = [ThresholdMember {
+            member_id: node.record.key_id.clone(),
+            ed25519_public_key_base64: node.record.pubkey_ed25519_base64.clone(),
+            mldsa65_public_key_base64: node.record.pubkey_ml_dsa_65_base64.clone(),
+            role: None,
+        }];
+        let sigs = [ThresholdSignature {
+            member_id: row.attesting_key_id.clone(),
+            ed25519_signature_base64: row.signature.ed25519_signature_base64.clone(),
+            mldsa65_signature_base64: row.signature.mldsa65_signature_base64.clone(),
+        }];
+        if row.signature.mldsa65_signature_base64.is_none()
+            || verify_threshold_signatures(&bytes, &members, &sigs, 1).is_err()
+        {
+            return Err(refuse(format!(
+                "row [{i}]: the hybrid signature does not verify against serve node {:?}'s \
+                 bundle record",
+                row.attesting_key_id
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// v19.1.0 (#490) — verify a bundle's holder quorum **against persist's own
 /// verified state**: each authorization's holder must resolve in THIS
 /// node's directory as a seated accord holder (the baked/effective roster),
@@ -651,6 +798,9 @@ where
     D: FederationDirectory + ?Sized,
 {
     let refuse = |detail: String| Error::GenesisBundleInvalid { detail };
+    // v59.0.0 (CIRISPersist#1106) — the serve nodes' transport rows are part
+    // of what the quorum authorizes; a bad one fails the whole bundle.
+    check_serve_transport_destinations(bundle)?;
 
     // Own roster: the effective accord holder key_ids (baked genesis).
     let roster: Vec<String> = super::effective_accord_holder_records()

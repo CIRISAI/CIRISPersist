@@ -349,3 +349,6 @@ decimal_id	claim_id	repo	path#symbol	crate@version
 3.3.1	CLM-consent-community-trust-owner-authored	CIRISPersist	src/federation/community_trust_consent.rs#fold_community_trust	ciris-persist@58.0.0
 3.1.5	CLM-occurrence-revocation-carrier	CIRISPersist	src/federation/occurrence_revocation_carrier.rs#carrier_row	ciris-persist@58.0.0
 3.1.5	CLM-occurrence-revocation-carrier	CIRISPersist	src/federation/occurrence_revocation_carrier.rs#check_carrier_admission	ciris-persist@58.0.0
+5.3.4	CLM-bundle-seeds-transit-pairs	CIRISPersist	src/federation/genesis/bundle.rs#check_serve_transport_destinations	ciris-persist@58.0.0
+5.3.4	CLM-bundle-seeds-transit-pairs	CIRISPersist	src/federation/genesis/mod.rs#seed_serve_transport_destinations	ciris-persist@58.0.0
+5.3.4	CLM-bundle-seeds-transit-pairs	CIRISPersist	src/federation/transport_rebind.rs#check_serve_rotation	ciris-persist@58.0.0

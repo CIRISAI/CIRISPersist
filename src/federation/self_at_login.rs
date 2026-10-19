@@ -448,6 +448,66 @@ pub struct TransitKexPair {
     pub ml_kem_768: Box<[u8; TRANSIT_KEX_ML_KEM_768_LEN]>,
 }
 
+/// v59.0.0 (CIRISPersist#1106, CIRISEdge) — why a transit pair fails
+/// [`check_transit_kex_pair`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransitKexRefusal {
+    /// The transit X25519 is byte-equal to one of the other keys.
+    X25519Reuse,
+    /// The transit ML-KEM-768 encapsulation key is byte-equal to one of them.
+    MlKem768Reuse,
+}
+
+impl TransitKexRefusal {
+    /// The stable token.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::X25519Reuse => "transit_kex_x25519_reuse",
+            Self::MlKem768Reuse => "transit_kex_ml_kem_768_reuse",
+        }
+    }
+}
+
+/// v59.0.0 (CIRISPersist#1106, CIRISEdge; CC 3.3.6.2 key separation) —
+/// **THE transit-pair separation rule, pure.** The pair's X25519 and
+/// ML-KEM-768 keys must not be byte-equal to any of `other_keys`. The
+/// admission gate's in-row check, the resolver [`transit_kex_pair_for`] and the
+/// genesis bundle's serve-node rows all call this, so the rule exists once.
+///
+/// # The `other_keys` contract (a caller that holds only a node's `key_id`
+/// and its announced pubkeys, e.g. a pairing-code path)
+///
+/// - **MUST** supply the node's pinned federation signing keys, raw: the
+///   Ed25519 public key (32 bytes) and the ML-DSA-65 public key (1952 bytes),
+///   and every transport key the node announces beside the pair: its
+///   Reticulum / link X25519 and Ed25519 (32 bytes each).
+/// - **MAY** supply the node's occurrence `encryption_pubkeys` (X25519,
+///   ML-KEM-768) and the transport keys of its other live bindings — what
+///   [`transit_kex_pair_for`] adds from the directory.
+/// - An omitted key weakens only the CROSS-ROW half of the check (reuse of a
+///   key published elsewhere); the in-row half is whatever the caller passes.
+///   Keys of different lengths never compare equal, so passing every key you
+///   hold is always safe.
+///
+/// # Errors
+///
+/// The first [`TransitKexRefusal`] found.
+pub fn check_transit_kex_pair(
+    pair: &TransitKexPair,
+    other_keys: &[&[u8]],
+) -> Result<(), TransitKexRefusal> {
+    for k in other_keys {
+        if *k == &pair.x25519[..] {
+            return Err(TransitKexRefusal::X25519Reuse);
+        }
+        if *k == &pair.ml_kem_768[..] {
+            return Err(TransitKexRefusal::MlKem768Reuse);
+        }
+    }
+    Ok(())
+}
+
 /// v56.0.0 (CIRISPersist#1077) — THE one reading of the transit KEX pair from a
 /// signed transport-destination envelope; the admission gate and the accessor
 /// both call it, so what admits is what reads.
@@ -713,10 +773,8 @@ pub async fn transit_kex_pair_for<D: crate::federation::FederationDirectory + ?S
             push(k.pubkey_ml_dsa_65_base64.as_deref());
         }
     }
-    if keys
-        .iter()
-        .any(|k| k[..] == pair.x25519[..] || k[..] == pair.ml_kem_768[..])
-    {
+    let others: Vec<&[u8]> = keys.iter().map(Vec::as_slice).collect();
+    if check_transit_kex_pair(&pair, &others).is_err() {
         return Ok(None);
     }
     Ok(Some(pair))
@@ -759,6 +817,37 @@ pub enum TransportDestinationApplyOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// v59.0.0 (CIRISPersist#1106) — the pure separation rule: a pair that
+    /// reuses none of the other keys passes; one whose X25519 or ML-KEM-768
+    /// equals a supplied key is refused with that half's token; keys of other
+    /// lengths never collide.
+    #[test]
+    fn check_transit_kex_pair_refuses_a_reused_key_1106() {
+        let pair = TransitKexPair {
+            x25519: [7u8; TRANSIT_KEX_X25519_LEN],
+            ml_kem_768: Box::new([9u8; TRANSIT_KEX_ML_KEM_768_LEN]),
+        };
+        let signing_ed = [1u8; 32];
+        let signing_mldsa = [2u8; 1952];
+        assert_eq!(
+            check_transit_kex_pair(&pair, &[&signing_ed, &signing_mldsa]),
+            Ok(())
+        );
+        assert_eq!(
+            check_transit_kex_pair(&pair, &[&signing_ed, &[7u8; 32]]),
+            Err(TransitKexRefusal::X25519Reuse)
+        );
+        assert_eq!(
+            check_transit_kex_pair(&pair, &[&[9u8; TRANSIT_KEX_ML_KEM_768_LEN][..]]),
+            Err(TransitKexRefusal::MlKem768Reuse)
+        );
+        assert_eq!(
+            TransitKexRefusal::X25519Reuse.as_str(),
+            "transit_kex_x25519_reuse"
+        );
+        assert_eq!(check_transit_kex_pair(&pair, &[]), Ok(()));
+    }
 
     /// v13.9.0 (CIRISPersist#413) — `BindingProvenance` back-compat: an untagged
     /// (pre-#413, NULL) row reads as `Rooted` (its authoritative-by-assumption

@@ -367,8 +367,11 @@ pub mod key_plane;
 // v59.0.0 (CIRISPersist#1104, CC 3.1.5) — the legacy occurrence revocation's
 // carrier row, `identity:occurrence_revocation:v1`.
 pub mod occurrence_revocation_carrier;
+// v59.0.0 (CIRISPersist#1106, CC 5.3.4) — a seated serve node's transit pair
+// rotates by the holders' quorum re-bind.
 #[cfg(test)]
 mod occurrence_revocation_carrier_invariants;
+pub mod transport_rebind;
 // v58.0.0 (CIRISPersist#991) — I975–I980.
 pub(crate) mod key_plane_invariants;
 // v59.0.0 (sealed-transport floor, operator ruling 2026-10-19) — I1144–I1147:

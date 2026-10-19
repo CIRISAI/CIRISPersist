@@ -124,6 +124,80 @@ threat-model citations because this crate's audit story is the point.
 - Witness **I1155** (memory, sqlite, postgres; the migration on sqlite,
   postgres); I1144 asserts its legacy revocation is carried.
 
+### Added — the genesis bundle seeds the serve nodes' transit pairs (v4) (CIRISPersist#1106, CC 5.3.4 rc9 `0edac07`, `CLM-bundle-seeds-transit-pairs`)
+
+- **`GENESIS_BUNDLE_VERSION` 3 → 4.** New member
+  **`serve_transport_destinations`** (wire name the same): each seated serve
+  node's signed `SignedTransportDestination` carrying its transit KEX pair.
+  - It is serde-defaulted and omitted when empty, so a v2 / v3 bundle parses,
+    re-serializes byte for byte and behaves as before.
+  - From version 4 the member is inside `authorization_digest`, each row
+    projected to `{attesting_key_id, signed_envelope}`. The v2 / v3 preimage is
+    byte-identical; the compiled-in v3 bundle's production authorizations
+    still verify.
+- **Bundle verification**:
+  - Done by `genesis::check_serve_transport_destinations`, run by
+    `verify_bundle_quorum` and at seeding.
+  - Every row must be about and signed by a key in that bundle's
+    `serve_nodes` (hybrid over `JCS(signed_envelope)` against the record's
+    keys), carry a transit pair, and pass the separation rule.
+  - Any failure fails the WHOLE bundle with
+    **`genesis_serve_transport_destination_invalid`**. A v3 bundle carrying
+    rows is refused.
+- **Seeding at first open**:
+  - `genesis::seed_serve_transport_destinations` runs after the serve nodes'
+    keys are seeded.
+  - It goes through the ORDINARY signed transport door, so the row lands
+    `Rooted` and `self_at_login::transit_kex_pair_for(serve_node)` returns it
+    on a fresh node with no network.
+- **The ceremony** carries `CeremonyInputs::serve_transport_destinations`
+  (each seated serve node's current signed row, gathered by the caller) and
+  an optional `bundle_version`. The test ceremony mints v4 with the test
+  node's row.
+- **Server must re-mint the pinned bundle.** The baked `canonical_seed.json`
+  stays v3 and seeds no pair until then.
+- **The AMEND ceremony** (`genesis::amend::AmendState`):
+  - It verifies the pinned bundle with the existing doors, then carries
+    holders, serve nodes, consensus protocol, rows, roster records and
+    `produced_at` byte for byte.
+  - It adds the member, and its one signing item is the authorization over the
+    new digest. It finishes at `max(charter M, strict_majority(roster))`
+    DISTINCT holder authorizations, then runs `verify_ceremony_outputs`.
+  - Refusals: **`genesis_amend_carried_bytes_changed`**,
+    **`genesis_amend_quorum_not_met`**, `genesis_amend_input_refused`.
+  - `verify_ceremony_outputs` still requires every holder's signature on the
+    accord FAMILY RECORD and every founder's on the community birth. Both are
+    carried bytes from the original unanimous ceremony, so an amend satisfies
+    them without re-signing. No door requires every holder's authorization.
+- **A serve node's pair rotates by holder quorum (CC 5.3.4, 3.3.6.2)**:
+  - The holders' re-bind is an attestation row **`transport:canonical_rebind:v1`**
+    (persist-named) about the serve node. It carries the node's new signed row,
+    is authored by a holder and cosigned in `additional_scrubs`.
+  - It is admitted at the accord charter's threshold
+    (`trust_root::family_quorum_over`), else
+    **`transport_rebind_without_holder_quorum`**.
+  - On admission it applies the carried row through the transport door, where
+    it supersedes the bundle-seeded binding.
+  - A UNILATERAL rotation that would retire a seated serve node's
+    bundle-pinned pair before a replacement is Rooted is refused
+    **`serve_transit_pair_rotation_before_rebind`**
+    (`transport_rebind::check_serve_rotation`, in every backend's transport
+    door).
+  - Resolver rule: one live binding per `(node, kind)`; the re-bind supersedes
+    the seeded row in that slot, so `transit_kex_pair_for` never sees both.
+  - "Seated" is read from the pinned bundle.
+  - A pair rotation needs this re-bind or a re-mint.
+- **`self_at_login::check_transit_kex_pair(pair, other_keys) ->
+  Result<(), TransitKexRefusal>`** is THE separation rule, pure and exported.
+  The admission's in-row check, the resolver and the bundle check call it.
+- Witnesses (`tests/test_ceremony_1106.rs`, feature `test-anchor`; memory,
+  sqlite, postgres):
+  - **I1157**: offline Rooted pair; non-serve signer, no pair and a swapped
+    row refused; v3 verifies and seeds none; the baked v3 still verifies.
+  - **I1158**: rotation by quorum.
+  - **I1159** `i1159_amend_is_two_of_three_for_every_holder_pair`: A+B, B+C
+    and A+C each boot; 1-of-3 refused; a carried byte refused.
+
 ### Changed — typed refusals CIRISEdge asked for (CIRISPersist#1064)
 
 - **Pending vs refused through the replication apply.** `AttestationRefusalReason`

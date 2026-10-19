@@ -436,6 +436,14 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // v59.0.0 (sealed-transport floor) — refuses a peer's advertisement of a
     // retired framed kind.
     ("refuse_retired_framed", Class::Gate),
+    // v59.0.0 (CIRISPersist#1106) — refuses a seated serve node's unilateral
+    // transit-pair rotation before a quorum re-bind.
+    ("check_serve_rotation", Class::Gate),
+    // Refuses a re-bind row without the holder quorum.
+    ("check_rebind_admission", Class::Gate),
+    // After an admitted re-bind: applies the carried row through the
+    // transport door (which runs its own gates).
+    ("after_admission", Class::Delegates),
     // v52.0.0 (#953) — Plumbing: a pure shape test that names the inline blob
     // a stream id spells, inside the chunk-hash loader; it refuses nothing.
     ("inline_blob_of_stream_id", Class::Plumbing),

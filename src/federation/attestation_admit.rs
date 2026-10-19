@@ -406,6 +406,10 @@ where
         .then(|| attestation.attestation.clone());
     // v59.0.0 (CIRISPersist#1099) — a proposal or an answer to one, executed
     // after it is stored.
+    // v59.0.0 (CIRISPersist#1106) — a quorum re-bind, applied after it is
+    // stored.
+    let rebind_row = super::transport_rebind::is_rebind_row(&attestation.attestation)
+        .then(|| attestation.attestation.clone());
     let roster_row = (super::self_roster::is_proposal_row(&attestation.attestation)
         || super::self_roster::answer_identity(&attestation.attestation).is_some())
     .then(|| attestation.attestation.clone());
@@ -447,6 +451,11 @@ where
         (&outcome, &roster_row)
     {
         super::self_roster::after_admission(dir, row).await;
+    }
+    if let (Ok(AttestationOutcome::Inserted | AttestationOutcome::AlreadyHeld), Some(row)) =
+        (&outcome, &rebind_row)
+    {
+        super::transport_rebind::after_admission(dir, row).await?;
     }
     // v58.0.0 (CIRISPersist#991, CC 3.3.6) — an admitted `withdraws` against an
     // `identity:occurrence:v1` row feeds the occurrence-revocation projection
@@ -1157,6 +1166,9 @@ where
         dir, &row, fold_at,
     )
     .await?;
+    // v59.0.0 (CIRISPersist#1106, CC 5.3.4) — a serve node's transit-pair
+    // re-bind is a holder-quorum act.
+    crate::federation::transport_rebind::check_rebind_admission(dir, &row).await?;
     // CC 3.1.3.3 — `custody:ack:v1` is a holder self-report, placed within
     // the blob's own cohort (v53.0.0, CIRISPersist#942 part 2).
     crate::federation::custody_ack::check_custody_ack_admission(dir, &row).await?;

@@ -16836,6 +16836,30 @@
     "path#symbol": "src/federation/occurrence_revocation_carrier.rs#check_carrier_admission",
     "tsv_target": "evidence/cc_impl.tsv",
     "manifest_round": "cc-rc9-1104"
+   },
+   {
+    "decimal_id": "5.3.4",
+    "claim_id": "CLM-bundle-seeds-transit-pairs",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/genesis/bundle.rs#check_serve_transport_destinations",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc9-1106"
+   },
+   {
+    "decimal_id": "5.3.4",
+    "claim_id": "CLM-bundle-seeds-transit-pairs",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/genesis/mod.rs#seed_serve_transport_destinations",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc9-1106"
+   },
+   {
+    "decimal_id": "5.3.4",
+    "claim_id": "CLM-bundle-seeds-transit-pairs",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/transport_rebind.rs#check_serve_rotation",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc9-1106"
    }
   ],
   "CIRISServer": [

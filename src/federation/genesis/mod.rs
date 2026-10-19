@@ -25,6 +25,9 @@
 //! anyway; the custody proof is the separate #268 CEG artifact). See
 //! `SqliteBackend::seed_genesis_accord_holders` / the Postgres twin.
 
+/// v59.0.0 (CIRISPersist#1106) — the AMEND ceremony: a pinned bundle plus the
+/// serve nodes' transport rows, authorized by the charter's quorum.
+pub mod amend;
 pub mod bundle;
 /// v53.0.0 (CIRISPersist#973, CC rc7) — the genesis ceremony assembler.
 pub mod ceremony;
@@ -41,9 +44,10 @@ pub mod test_anchor_block;
 #[cfg(feature = "test-anchor")]
 pub mod test_ceremony;
 pub use bundle::{
-    bake_assembled_genesis, parse_genesis_bundle, verify_bundle_quorum, BakeItemOutcome,
-    GenesisAuthorization, GenesisBakeReport, GenesisBundle, GenesisRosterRecord,
-    GENESIS_BUNDLE_VERSION,
+    bake_assembled_genesis, check_serve_transport_destinations, parse_genesis_bundle,
+    verify_bundle_quorum, BakeItemOutcome, GenesisAuthorization, GenesisBakeReport, GenesisBundle,
+    GenesisRosterRecord, GENESIS_BUNDLE_VERSION, SERVE_TRANSPORT_DESTINATIONS_VERSION,
+    SERVE_TRANSPORT_DESTINATION_INVALID,
 };
 #[cfg(feature = "test-anchor")]
 pub use test_anchor_block::*;
@@ -3267,6 +3271,9 @@ where
     }
     seed_canonical_servers(dir).await?;
     verify_canonical_seeded(dir).await?;
+    // v59.0.0 (CIRISPersist#1106, CC 5.3.4) — the serve nodes' transit pairs,
+    // once their keys are held.
+    seed_serve_transport_destinations(dir).await?;
     seed_delegation_plane(dir).await?;
     verify_delegation_plane_seeded(dir).await?;
     // v53.1.0 — the accord head again, now that the delegation plane holds
@@ -3279,6 +3286,54 @@ where
     // and the delegation plane above. Inert until a ceremony bakes the asset.
     seed_canonical_community(dir).await?;
     verify_canonical_community_seeded(dir).await?;
+    Ok(())
+}
+
+/// v59.0.0 (CIRISPersist#1106, CC 5.3.4 rc9 `6cde890`,
+/// `CLM-bundle-seeds-transit-pairs`) — **seed the serve nodes' transit pairs
+/// from the pinned bundle**, so a fresh node holds a Rooted pair for every
+/// seated serve node with no network. Each row goes through the ORDINARY
+/// signed transport-destination door
+/// ([`put_signed_transport_destination`](super::FederationDirectory::put_signed_transport_destination):
+/// the projection-equals-envelope check, the in-row separation rule, the
+/// node's own hybrid signature, `signer_acts_for`), never a side door, so it
+/// lands `Rooted` and `self_at_login::transit_kex_pair_for(node)` returns it.
+/// A row this node already holds a newer binding for (a quorum re-bind) is
+/// `Refused` by the monotonic apply and stays superseded. A v2 / v3 bundle
+/// carries none: nothing is seeded.
+///
+/// # Errors
+///
+/// [`GenesisFault::Divergent`] when the pinned rows fail the bundle's
+/// structural check or the door refuses one; `Unreadable` on a backend error.
+pub async fn seed_serve_transport_destinations<D>(dir: &D) -> Result<(), GenesisFault>
+where
+    D: super::FederationDirectory + ?Sized,
+{
+    let bundle = canonical_genesis_bundle();
+    let divergent = |detail: String| GenesisFault::Divergent {
+        leg: GenesisLeg::Canonical,
+        detail,
+    };
+    check_serve_transport_destinations(bundle).map_err(|e| divergent(e.to_string()))?;
+    for row in &bundle.serve_transport_destinations {
+        match dir.put_signed_transport_destination(row).await {
+            Ok(_) => {}
+            Err(super::Error::Backend(e)) => {
+                return Err(GenesisFault::Unreadable {
+                    leg: GenesisLeg::Canonical,
+                    detail: format!("serve transport destination seed: {e}"),
+                })
+            }
+            Err(e) => {
+                return Err(divergent(format!(
+                    "{SERVE_TRANSPORT_DESTINATION_INVALID}: the pinned bundle's transport row for \
+                     {} is refused by the transport door: {e}",
+                    row.attesting_key_id
+                )))
+            }
+        }
+    }
     Ok(())
 }
 
@@ -4703,6 +4758,7 @@ mod tests {
             roster_records: Vec::new(),
             authorizations: Vec::new(),
             produced_at: "2026-08-12T00:00:00Z".to_owned(),
+            serve_transport_destinations: Vec::new(),
         };
 
         super::bundle_delegation_plane_v31_shaped(&bundle).unwrap_or_else(|why| {

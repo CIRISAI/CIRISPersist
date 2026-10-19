@@ -5765,6 +5765,9 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // #443 — the admission gate BEFORE any write (before locking; the
         // gate locks state internally). Backend-symmetric.
         crate::federation::admission::verify_signed_transport_destination(self, signed).await?;
+        // v59.0.0 (CIRISPersist#1106, CC 5.3.4) — a seated serve node's
+        // bundle-pinned transit pair rotates by holder quorum, not alone.
+        crate::federation::transport_rebind::check_serve_rotation(self, signed).await?;
         let d = &signed.transport_destination;
         let (wire_index_key, fresh) = {
             let mut state = self.state.lock().expect("memory backend lock");

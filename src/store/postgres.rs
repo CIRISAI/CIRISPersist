@@ -11997,6 +11997,9 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         use crate::federation::TransportDestinationApplyOutcome as Outcome;
         // #443 — the admission gate BEFORE any write (one gate, all backends).
         crate::federation::admission::verify_signed_transport_destination(self, signed).await?;
+        // v59.0.0 (CIRISPersist#1106, CC 5.3.4) — a seated serve node's
+        // bundle-pinned transit pair rotates by holder quorum, not alone.
+        crate::federation::transport_rebind::check_serve_rotation(self, signed).await?;
         let d = &signed.transport_destination;
         let envelope_json = serde_json::to_string(&signed.signed_envelope)
             .map_err(|e| crate::federation::Error::Backend(format!("signed_envelope: {e}")))?;

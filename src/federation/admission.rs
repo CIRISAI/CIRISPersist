@@ -6080,7 +6080,10 @@ pub async fn verify_signed_transport_destination(
             .transport_x25519_pubkey_base64
             .as_deref()
             .and_then(|s| B64.decode(s).ok());
-        if link.as_deref() == Some(&pair.x25519[..]) {
+        // v59.0.0 (CIRISPersist#1106) — the one rule,
+        // `self_at_login::check_transit_kex_pair`.
+        let others: Vec<&[u8]> = link.iter().map(Vec::as_slice).collect();
+        if crate::federation::self_at_login::check_transit_kex_pair(pair, &others).is_err() {
             return Err(Error::malformed_row(
                 "transport_destination",
                 super::malformed_row::TRANSIT_KEX_KEY_REUSE,
