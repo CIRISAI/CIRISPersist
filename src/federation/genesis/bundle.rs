@@ -737,21 +737,25 @@ pub fn check_serve_transport_destinations(bundle: &GenesisBundle) -> Result<(), 
             super::super::self_at_login::transit_kex_pair_from_envelope(&row.signed_envelope)
                 .map_err(|e| refuse(format!("row [{i}]: {e}")))?
                 .ok_or_else(|| refuse(format!("row [{i}] carries no transit KEX pair")))?;
-        let mut others: Vec<Vec<u8>> = Vec::new();
-        for b64 in [
-            td.transport_x25519_pubkey_base64.as_deref(),
-            td.transport_ed25519_pubkey_base64.as_deref(),
-            Some(node.record.pubkey_ed25519_base64.as_str()),
-            node.record.pubkey_ml_dsa_65_base64.as_deref(),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            if let Ok(raw) = B64.decode(b64) {
-                others.push(raw);
-            }
-        }
-        let others: Vec<&[u8]> = others.iter().map(Vec::as_slice).collect();
+        let dec = |b64: Option<&str>| b64.and_then(|s| B64.decode(s).ok());
+        // (a) + (b): what a bundle carries about the node.
+        let others = super::super::self_at_login::TransitKexOtherKeys {
+            federation_signing: [
+                dec(Some(node.record.pubkey_ed25519_base64.as_str())),
+                dec(node.record.pubkey_ml_dsa_65_base64.as_deref()),
+            ]
+            .into_iter()
+            .flatten()
+            .collect(),
+            transport_identity: [
+                dec(td.transport_x25519_pubkey_base64.as_deref()),
+                dec(td.transport_ed25519_pubkey_base64.as_deref()),
+            ]
+            .into_iter()
+            .flatten()
+            .collect(),
+            ..Default::default()
+        };
         super::super::self_at_login::check_transit_kex_pair(&pair, &others)
             .map_err(|r| refuse(format!("row [{i}]: {}", r.as_str())))?;
         let bytes = crate::verify::canonical::ceg_produce_canonicalize(&row.signed_envelope)

@@ -124,7 +124,7 @@ threat-model citations because this crate's audit story is the point.
 - Witness **I1155** (memory, sqlite, postgres; the migration on sqlite,
   postgres); I1144 asserts its legacy revocation is carried.
 
-### Added — the genesis bundle seeds the serve nodes' transit pairs (v4) (CIRISPersist#1106, CC 5.3.4 rc9 `0edac07`, `CLM-bundle-seeds-transit-pairs`)
+### Added — the genesis bundle seeds the serve nodes' transit pairs (v4); amend mode (CIRISPersist#1106, CC 5.3.4 rc9 `0edac07`, `CLM-bundle-seeds-transit-pairs`)
 
 - **`GENESIS_BUNDLE_VERSION` 3 → 4.** New member
   **`serve_transport_destinations`** (wire name the same): each seated serve
@@ -187,9 +187,22 @@ threat-model citations because this crate's audit story is the point.
     the seeded row in that slot, so `transit_kex_pair_for` never sees both.
   - "Seated" is read from the pinned bundle.
   - A pair rotation needs this re-bind or a re-mint.
-- **`self_at_login::check_transit_kex_pair(pair, other_keys) ->
-  Result<(), TransitKexRefusal>`** is THE separation rule, pure and exported.
-  The admission's in-row check, the resolver and the bundle check call it.
+- **`self_at_login::check_transit_kex_pair(pair: &TransitKexPair, other_keys:
+  &TransitKexOtherKeys) -> Result<(), TransitKexRefusal>`** is THE
+  separation rule, pure and exported. The admission's in-row check, the
+  resolver and the bundle check call it.
+  - `TransitKexOtherKeys` types the four groups, so a caller cannot mislabel
+    one:
+    - (a) `federation_signing`: the node's Ed25519 and ML-DSA-65;
+    - (b) `transport_identity`: Reticulum X25519 and Ed25519 from the
+      occurrence binding and every live transport binding;
+    - (c) `encryption`: the occurrence's `encryption_pubkeys`;
+    - (d) `bound_identity_signing`: each bound identity's federation keys.
+  - A caller holding only `key_id`, its transport identity and its federation
+    key passes (a) + (b). Omitting (c) + (d) weakens only the cross-row half,
+    which the stored check (`transit_kex_pair_for`) closes.
+  - `TransitKexRefusal` tokens: `transit_kex_x25519_reuse`,
+    `transit_kex_ml_kem_768_reuse`.
 - Witnesses (`tests/test_ceremony_1106.rs`, feature `test-anchor`; memory,
   sqlite, postgres):
   - **I1157**: offline Rooted pair; non-serve signer, no pair and a swapped

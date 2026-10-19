@@ -469,39 +469,71 @@ impl TransitKexRefusal {
     }
 }
 
+/// v59.0.0 (CIRISPersist#1106, CIRISEdge) — the keys a transit pair must be
+/// separated from, in FOUR named groups (the groups
+/// [`transit_kex_pair_for`] gathers), typed so a caller cannot mislabel one.
+/// Each key is raw bytes (base64-decoded).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TransitKexOtherKeys {
+    /// (a) The node's federation signing keys: Ed25519 (32 bytes) and
+    /// ML-DSA-65 (1952 bytes).
+    pub federation_signing: Vec<Vec<u8>>,
+    /// (b) The node's transport identity: Reticulum X25519 and Ed25519, from
+    /// its occurrence binding and every live transport binding (including the
+    /// row's own link keys).
+    pub transport_identity: Vec<Vec<u8>>,
+    /// (c) The occurrence's `encryption_pubkeys` (X25519, ML-KEM-768), where
+    /// present.
+    pub encryption: Vec<Vec<u8>>,
+    /// (d) The federation signing keys of each identity the occurrence is
+    /// bound under.
+    pub bound_identity_signing: Vec<Vec<u8>>,
+}
+
+impl TransitKexOtherKeys {
+    fn all(&self) -> impl Iterator<Item = &[u8]> {
+        self.federation_signing
+            .iter()
+            .chain(&self.transport_identity)
+            .chain(&self.encryption)
+            .chain(&self.bound_identity_signing)
+            .map(Vec::as_slice)
+    }
+}
+
 /// v59.0.0 (CIRISPersist#1106, CIRISEdge; CC 3.3.6.2 key separation) —
 /// **THE transit-pair separation rule, pure.** The pair's X25519 and
-/// ML-KEM-768 keys must not be byte-equal to any of `other_keys`. The
+/// ML-KEM-768 keys must not be byte-equal to any key in `other_keys`. The
 /// admission gate's in-row check, the resolver [`transit_kex_pair_for`] and the
 /// genesis bundle's serve-node rows all call this, so the rule exists once.
 ///
-/// # The `other_keys` contract (a caller that holds only a node's `key_id`
-/// and its announced pubkeys, e.g. a pairing-code path)
+/// # The `other_keys` contract ([`TransitKexOtherKeys`])
 ///
-/// - **MUST** supply the node's pinned federation signing keys, raw: the
-///   Ed25519 public key (32 bytes) and the ML-DSA-65 public key (1952 bytes),
-///   and every transport key the node announces beside the pair: its
-///   Reticulum / link X25519 and Ed25519 (32 bytes each).
-/// - **MAY** supply the node's occurrence `encryption_pubkeys` (X25519,
-///   ML-KEM-768) and the transport keys of its other live bindings — what
-///   [`transit_kex_pair_for`] adds from the directory.
-/// - An omitted key weakens only the CROSS-ROW half of the check (reuse of a
-///   key published elsewhere); the in-row half is whatever the caller passes.
-///   Keys of different lengths never compare equal, so passing every key you
-///   hold is always safe.
+/// [`transit_kex_pair_for`] fills all four groups from the directory: (a) the
+/// node's federation signing keys; (b) its transport identity from its
+/// occurrence binding and every live transport binding; (c) the occurrence's
+/// `encryption_pubkeys`; (d) the federation signing keys of each identity the
+/// occurrence is bound under.
+///
+/// A caller holding only a node's `key_id`, its transport identity and its
+/// federation key (CIRISEdge's offline emit and pairing pin) passes **(a) +
+/// (b)**. Omitting (c) + (d) weakens only the CROSS-ROW half of the check
+/// (reuse of a key published on another plane), which the stored check —
+/// [`transit_kex_pair_for`] at use — closes. Keys of different lengths never
+/// compare equal, so passing every key you hold is always safe.
 ///
 /// # Errors
 ///
 /// The first [`TransitKexRefusal`] found.
 pub fn check_transit_kex_pair(
     pair: &TransitKexPair,
-    other_keys: &[&[u8]],
+    other_keys: &TransitKexOtherKeys,
 ) -> Result<(), TransitKexRefusal> {
-    for k in other_keys {
-        if *k == &pair.x25519[..] {
+    for k in other_keys.all() {
+        if k == &pair.x25519[..] {
             return Err(TransitKexRefusal::X25519Reuse);
         }
-        if *k == &pair.ml_kem_768[..] {
+        if k == &pair.ml_kem_768[..] {
             return Err(TransitKexRefusal::MlKem768Reuse);
         }
     }
@@ -739,41 +771,56 @@ pub async fn transit_kex_pair_for<D: crate::federation::FederationDirectory + ?S
         return Ok(None);
     };
 
-    let mut keys: Vec<Vec<u8>> = Vec::new();
-    let mut push = |b64: Option<&str>| {
-        if let Some(raw) = b64.and_then(|s| B64.decode(s).ok()) {
-            keys.push(raw);
-        }
-    };
+    let dec = |b64: Option<&str>| b64.and_then(|s| B64.decode(s).ok());
+    let mut others = TransitKexOtherKeys::default();
     for b in &live {
         let td = &b.transport_destination;
-        push(td.transport_x25519_pubkey_base64.as_deref());
-        push(td.transport_ed25519_pubkey_base64.as_deref());
+        others
+            .transport_identity
+            .extend(dec(td.transport_x25519_pubkey_base64.as_deref()));
+        others
+            .transport_identity
+            .extend(dec(td.transport_ed25519_pubkey_base64.as_deref()));
     }
     let occurrences = dir
         .list_identity_occurrences_by_occurrence_key(occurrence_key_id)
         .await?;
-    let mut signers: Vec<String> = vec![occurrence_key_id.to_owned()];
+    let mut bound: Vec<String> = Vec::new();
     for o in &occurrences {
         if let Some(k) = &o.encryption_pubkeys {
-            push(Some(&k.x25519_base64));
-            push(Some(&k.ml_kem_768_base64));
+            others.encryption.extend(dec(Some(&k.x25519_base64)));
+            others.encryption.extend(dec(Some(&k.ml_kem_768_base64)));
         }
         if let Some(t) = &o.transport_binding {
-            push(Some(&t.reticulum_x25519_pubkey_base64));
-            push(Some(&t.reticulum_ed25519_pubkey_base64));
+            others
+                .transport_identity
+                .extend(dec(Some(&t.reticulum_x25519_pubkey_base64)));
+            others
+                .transport_identity
+                .extend(dec(Some(&t.reticulum_ed25519_pubkey_base64)));
         }
-        signers.push(o.identity_key_id.clone());
+        bound.push(o.identity_key_id.clone());
     }
-    signers.sort();
-    signers.dedup();
-    for id in &signers {
+    if let Some(k) = dir.lookup_public_key(occurrence_key_id).await? {
+        others
+            .federation_signing
+            .extend(dec(Some(&k.pubkey_ed25519_base64)));
+        others
+            .federation_signing
+            .extend(dec(k.pubkey_ml_dsa_65_base64.as_deref()));
+    }
+    bound.sort();
+    bound.dedup();
+    for id in bound.iter().filter(|id| *id != occurrence_key_id) {
         if let Some(k) = dir.lookup_public_key(id).await? {
-            push(Some(&k.pubkey_ed25519_base64));
-            push(k.pubkey_ml_dsa_65_base64.as_deref());
+            others
+                .bound_identity_signing
+                .extend(dec(Some(&k.pubkey_ed25519_base64)));
+            others
+                .bound_identity_signing
+                .extend(dec(k.pubkey_ml_dsa_65_base64.as_deref()));
         }
     }
-    let others: Vec<&[u8]> = keys.iter().map(Vec::as_slice).collect();
     if check_transit_kex_pair(&pair, &others).is_err() {
         return Ok(None);
     }
@@ -828,25 +875,41 @@ mod tests {
             x25519: [7u8; TRANSIT_KEX_X25519_LEN],
             ml_kem_768: Box::new([9u8; TRANSIT_KEX_ML_KEM_768_LEN]),
         };
-        let signing_ed = [1u8; 32];
-        let signing_mldsa = [2u8; 1952];
+        let fed = TransitKexOtherKeys {
+            federation_signing: vec![vec![1u8; 32], vec![2u8; 1952]],
+            ..Default::default()
+        };
+        assert_eq!(check_transit_kex_pair(&pair, &fed), Ok(()));
+        // Each of the four groups is consulted.
+        for group in 0..4 {
+            let mut k = fed.clone();
+            let reused = vec![7u8; 32];
+            match group {
+                0 => k.federation_signing.push(reused),
+                1 => k.transport_identity.push(reused),
+                2 => k.encryption.push(reused),
+                _ => k.bound_identity_signing.push(reused),
+            }
+            assert_eq!(
+                check_transit_kex_pair(&pair, &k),
+                Err(TransitKexRefusal::X25519Reuse),
+                "group {group}"
+            );
+        }
+        let mut k = fed.clone();
+        k.encryption.push(vec![9u8; TRANSIT_KEX_ML_KEM_768_LEN]);
         assert_eq!(
-            check_transit_kex_pair(&pair, &[&signing_ed, &signing_mldsa]),
-            Ok(())
-        );
-        assert_eq!(
-            check_transit_kex_pair(&pair, &[&signing_ed, &[7u8; 32]]),
-            Err(TransitKexRefusal::X25519Reuse)
-        );
-        assert_eq!(
-            check_transit_kex_pair(&pair, &[&[9u8; TRANSIT_KEX_ML_KEM_768_LEN][..]]),
+            check_transit_kex_pair(&pair, &k),
             Err(TransitKexRefusal::MlKem768Reuse)
         );
         assert_eq!(
             TransitKexRefusal::X25519Reuse.as_str(),
             "transit_kex_x25519_reuse"
         );
-        assert_eq!(check_transit_kex_pair(&pair, &[]), Ok(()));
+        assert_eq!(
+            check_transit_kex_pair(&pair, &TransitKexOtherKeys::default()),
+            Ok(())
+        );
     }
 
     /// v13.9.0 (CIRISPersist#413) — `BindingProvenance` back-compat: an untagged

@@ -6082,7 +6082,10 @@ pub async fn verify_signed_transport_destination(
             .and_then(|s| B64.decode(s).ok());
         // v59.0.0 (CIRISPersist#1106) — the one rule,
         // `self_at_login::check_transit_kex_pair`.
-        let others: Vec<&[u8]> = link.iter().map(Vec::as_slice).collect();
+        let others = crate::federation::self_at_login::TransitKexOtherKeys {
+            transport_identity: link.into_iter().collect(),
+            ..Default::default()
+        };
         if crate::federation::self_at_login::check_transit_kex_pair(pair, &others).is_err() {
             return Err(Error::malformed_row(
                 "transport_destination",
