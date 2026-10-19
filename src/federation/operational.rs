@@ -5623,6 +5623,8 @@ pub mod test_support {
         label: &str,
     ) {
         let t0 = chrono::Utc::now();
+        // v59.0.0 — on the Attestation kind: a framed `Key` advertisement is
+        // refused at this door (the sealed-transport floor, I1150).
         // A hash this node has HEARD OF and does not hold. A REAL sha256 —
         // the insert door refuses anything that is not canonical lowercase
         // 64-hex, and it refused this fixture's earlier hand-built form,
@@ -5633,13 +5635,13 @@ pub mod test_support {
         let known_only = crate::federation::wire_index::content_hash_of_bytes(
             format!("known{label}").as_bytes(),
         );
-        dir.insert_known_wire_hash("Key", &known_only, Some("peer-1"), t0)
+        dir.insert_known_wire_hash("Attestation", &known_only, Some("peer-1"), t0)
             .await
             .unwrap_or_else(|e| panic!("({label}) insert_known_wire_hash: {e}"));
 
         // Direction 1: the known hash must NOT appear in the holdings read.
         let holdings = dir
-            .list_wire_hashes_since("Key", None, u32::MAX)
+            .list_wire_hashes_since("Attestation", None, u32::MAX)
             .await
             .unwrap_or_else(|e| panic!("({label}) list_wire_hashes_since: {e}"));
         assert!(
@@ -5655,7 +5657,7 @@ pub mod test_support {
         // table would pass direction 1 whenever the holdings set was empty,
         // which is exactly the state a fresh node is in.
         let known = dir
-            .list_known_wire_hashes_since("Key", None, u32::MAX)
+            .list_known_wire_hashes_since("Attestation", None, u32::MAX)
             .await
             .unwrap_or_else(|e| panic!("({label}) list_known_wire_hashes_since: {e}"));
         let mine = known
@@ -5699,12 +5701,12 @@ pub mod test_support {
         // ever inserted a hash nothing held, so its intersection was empty by
         // construction rather than by enforcement.
         if let Some(held) = holdings.first().cloned() {
-            dir.insert_known_wire_hash("Key", &held, Some("peer-1"), t0)
+            dir.insert_known_wire_hash("Attestation", &held, Some("peer-1"), t0)
                 .await
                 .unwrap_or_else(|e| panic!("({label}) insert held-and-known: {e}"));
 
             let holdings_after = dir
-                .list_wire_hashes_since("Key", None, u32::MAX)
+                .list_wire_hashes_since("Attestation", None, u32::MAX)
                 .await
                 .unwrap_or_else(|e| panic!("({label}) list_wire_hashes_since: {e}"));
             assert_eq!(
@@ -5720,7 +5722,7 @@ pub mod test_support {
                 "({label}) #785: the held hash vanished from holdings"
             );
             assert!(
-                dir.known_wire_hash_contains("Key", &held)
+                dir.known_wire_hash_contains("Attestation", &held)
                     .await
                     .unwrap_or_else(|e| panic!("({label}) contains: {e}")),
                 "({label}) #785: a hash that is BOTH held and advertised belongs \
@@ -5731,13 +5733,13 @@ pub mod test_support {
 
         // `contains` answers the KNOWN question only.
         assert!(
-            dir.known_wire_hash_contains("Key", &known_only)
+            dir.known_wire_hash_contains("Attestation", &known_only)
                 .await
                 .unwrap_or_else(|e| panic!("({label}) known_wire_hash_contains: {e}")),
             "({label}) the hash just inserted must be known"
         );
         assert!(
-            !dir.known_wire_hash_contains("Attestation", &known_only)
+            !dir.known_wire_hash_contains("Family", &known_only)
                 .await
                 .unwrap_or_else(|e| panic!("({label}) known_wire_hash_contains: {e}")),
             "({label}) the set is keyed by (kind, hash) — a hash known for one \

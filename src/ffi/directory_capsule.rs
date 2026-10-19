@@ -5153,7 +5153,7 @@ mod tests {
                     &rt,
                     &directory,
                     &DirectoryOp::InsertKnownWireHash {
-                        kind: "Key".into(),
+                        kind: "Attestation".into(),
                         content_hash: hash.clone(),
                         advertised_by: Some("peer-1".into()),
                         now,
@@ -5171,7 +5171,7 @@ mod tests {
                     &rt,
                     &directory,
                     &DirectoryOp::KnownWireHashContains {
-                        kind: "Key".into(),
+                        kind: "Attestation".into(),
                         content_hash: hash.clone(),
                     },
                 ),
@@ -5186,7 +5186,7 @@ mod tests {
             &rt,
             &directory,
             &DirectoryOp::ListKnownWireHashesSince {
-                kind: "Key".into(),
+                kind: "Attestation".into(),
                 after_content_hash: None,
                 limit: u32::MAX,
             },
@@ -5210,7 +5210,7 @@ mod tests {
             &rt,
             &directory,
             &DirectoryOp::ListWireHashesSince {
-                kind: "Key".into(),
+                kind: "Attestation".into(),
                 after_content_hash: None,
                 limit: u32::MAX,
             },
@@ -5959,20 +5959,20 @@ mod tests {
             .expect("literal is valid RFC-3339")
             .with_timezone(&chrono::Utc);
 
-        rt.block_on(proxy.insert_known_wire_hash("Key", &hash, Some("peer-1"), now))
+        rt.block_on(proxy.insert_known_wire_hash("Attestation", &hash, Some("peer-1"), now))
             .expect("#785: insert_known_wire_hash must route through the PROXY");
 
         assert!(
-            rt.block_on(proxy.known_wire_hash_contains("Key", &hash))
+            rt.block_on(proxy.known_wire_hash_contains("Attestation", &hash))
                 .expect("#785: known_wire_hash_contains must route through the PROXY"),
             "#785: the proxy must see what it wrote"
         );
 
         let via_proxy = rt
-            .block_on(proxy.list_known_wire_hashes_since("Key", None, u32::MAX))
+            .block_on(proxy.list_known_wire_hashes_since("Attestation", None, u32::MAX))
             .expect("#785: list_known_wire_hashes_since must route through the PROXY");
         let via_direct = rt
-            .block_on(dir.list_known_wire_hashes_since("Key", None, u32::MAX))
+            .block_on(dir.list_known_wire_hashes_since("Attestation", None, u32::MAX))
             .expect("direct list");
         assert_eq!(
             via_proxy, via_direct,
@@ -5981,7 +5981,7 @@ mod tests {
 
         // #780's read, whose whole defect was being unreachable from here.
         let held = rt
-            .block_on(proxy.list_wire_hashes_since("Key", None, u32::MAX))
+            .block_on(proxy.list_wire_hashes_since("Attestation", None, u32::MAX))
             .expect("#785: list_wire_hashes_since must route through the PROXY");
         assert!(
             !held.contains(&hash),
