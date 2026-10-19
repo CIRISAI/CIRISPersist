@@ -7,7 +7,7 @@ threat-model citations because this crate's audit story is the point.
 
 ## [Unreleased]
 
-## [59.0.0] - UNRELEASED
+## [59.0.0] - 2026-10-19
 
 ### Security — an aggregate's sources are distinct ids (CIRISPersist#1102, CC 6.1.1 rc9 `37494c0`, `CLM-member-commitment-unique`)
 
