@@ -1332,7 +1332,9 @@ def test_ciris_canonical_trust_root_surface_926() -> None:
         # its live community, and the pin verifies every holder.
         pinned = json.loads(eng.pin_trust_from_bundle_response_json(json.dumps(resp)))
         assert pinned["family"] == "humanity-accord", pinned
-        assert pinned["bundle_holders_verified"] == 3, pinned
+        # v59.1.0 — the baked bundle is the 2-of-3 v4 amend (A1 + B1), which
+        # meets the charter's 2/3; the carried charter keeps all three scrubs.
+        assert pinned["bundle_holders_verified"] == 2, pinned
         assert pinned["community"]["community_key_id"] == "ciris-canonical", pinned
         assert pinned["community"]["live"] is True, pinned
         now = "2026-06-25T00:00:00.000Z"
