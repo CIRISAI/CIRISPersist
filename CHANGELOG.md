@@ -7,6 +7,41 @@ threat-model citations because this crate's audit story is the point.
 
 ## [Unreleased]
 
+## [59.1.0] - 2026-10-20
+
+### Changed — the production genesis bundle is the v4 amend (CIRISPersist#1106, CC 5.3.4)
+
+- `src/federation/genesis/canonical_seed.json` is the production bundle
+  re-minted as **version 4** by the 2-of-3 amend (`genesis::amend::AmendState`)
+  in the holders' ceremony of 2026-10-20 (A1 and B1, on hardware, through
+  ciris-server 0.5.232's `/v1/accord/final-genesis/amend`). sha256
+  `d17c05c090c73851043cb67c5ba433907e174d3dddfc0e138bfc1f421e2d710b`,
+  181 437 bytes.
+- Carried byte for byte from the v53.1.1 final genesis (v3, sha256
+  `db5e8e83…`): family_key_id, holders, serve_nodes, consensus_protocol,
+  attestations (charter, grants, lifecycle, family record, canonical birth)
+  and produced_at. New: `serve_transport_destinations` with one row, signed by
+  and about `ciris-canonical-1-d7bdeu223k`, carrying the live canonical's
+  transit pair. Authorizations: A1 and B1, which is the charter's 2/3.
+- **Why it matters:** under the all-or-nothing transit seal (CC 5.3.3.5 E1),
+  a fresh node can seal to the canonical only through this seeded pair. A node
+  on v59.1.0 boots holding a Rooted pair for the canonical with no network.
+- Witness `tests/production_bundle_v4.rs#i1160_the_production_v4_bake_seeds_the_canonical_pair`:
+  on the REAL baked bytes, with no test anchor, `verify_ceremony_outputs`
+  accepts the bundle, `verify_bundle_quorum` counts A1 and B1, and a fresh
+  `Engine` (sqlite) resolves `transit_kex_pair_for(ciris-canonical-1-d7bdeu223k)`
+  byte-equal to the bundle's X25519 and ML-KEM-768 keys.
+- The pins that named the v3 facts move to the v4 facts (I500 hash, #551,
+  #554, I428c). The v3 bytes stay as `tests/fixtures/genesis/canonical_seed.v3.json`
+  so I1157's v3-preimage witness still proves the v3 digest is unchanged.
+
+### Evidence
+
+- `CLM-canonical-rebind` (3.1.5) gains its own rows, at
+  `transport_rebind.rs#check_rebind_admission` and `#check_serve_rotation`.
+  v59.0.0 had filed the rotation door only under CLM-bundle-seeds-transit-pairs
+  (found by CC at re-pin 20).
+
 ## [59.0.0] - 2026-10-19
 
 ### Security — an aggregate's sources are distinct ids (CIRISPersist#1102, CC 6.1.1 rc9 `37494c0`, `CLM-member-commitment-unique`)

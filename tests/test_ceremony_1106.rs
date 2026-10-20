@@ -249,21 +249,20 @@ async fn i1157_the_bundle_rows_are_checked() {
     );
 }
 
-/// **I1157** (v3 digest unchanged) — the compiled-in v3 bundle's
-/// authorizations, signed by the production holders over the pre-v59
-/// preimage, still verify: the v3 preimage is byte-identical.
+/// **I1157** (v3 digest unchanged) — the v53.1.1 final genesis (v3), whose
+/// authorizations the production holders signed over the pre-v59 preimage,
+/// still verifies: the v3 preimage is byte-identical. The v3 bytes are kept as
+/// a fixture since v59.1.0 baked the v4 amend.
 #[serial_test::serial(test_anchor_env)]
 #[tokio::test]
 async fn i1157_the_v3_preimage_is_unchanged() {
-    let bundle = canonical_genesis_bundle();
-    assert_eq!(
-        bundle.version, 3,
-        "the baked bundle stays v3 until Server re-mints"
-    );
+    let v3 = parse_genesis_bundle(include_str!("fixtures/genesis/canonical_seed.v3.json"))
+        .expect("the v3 fixture parses");
+    assert_eq!(v3.version, 3);
     let d = memory().await;
-    verify_bundle_quorum(&d, bundle)
+    verify_bundle_quorum(&d, &v3)
         .await
-        .expect("I1157: the baked v3 bundle's authorizations still verify");
+        .expect("I1157: the v3 final genesis's authorizations still verify");
 }
 
 /// **I1158** — a seated serve node's bundle-pinned pair rotates by holder

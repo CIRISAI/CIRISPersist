@@ -5102,8 +5102,8 @@ mod tests {
     fn embedded_seed_is_a_genesis_bundle_551() {
         let b = canonical_genesis_bundle();
         assert_eq!(
-            b.version, 3,
-            "v53.1.1: the final genesis is a version-3 bundle"
+            b.version, 4,
+            "v59.1.0: the production genesis is the v4 amend of the v53.1.1 final genesis"
         );
         assert_eq!(b.family_key_id, "humanity-accord");
         assert_eq!(b.consensus_protocol, "quorum:2/3");
@@ -5154,8 +5154,14 @@ mod tests {
             .collect();
         assert_eq!(
             auths,
-            ["A1", "B1", "C1"],
-            "v53.1.1: the final genesis carries every holder's authorization (3 over a 2/3 quorum)"
+            ["A1", "B1"],
+            "v59.1.0: the v4 amend (2026-10-20) carries A1 and B1's authorizations (2 over the charter's 2/3); \
+             the carried charter and genesis records keep all three holders' signatures"
+        );
+        assert_eq!(
+            b.serve_transport_destinations.len(),
+            1,
+            "v59.1.0: the v4 amend seeds the canonical's transit pair"
         );
         for a in &b.authorizations {
             assert!(

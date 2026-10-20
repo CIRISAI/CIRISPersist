@@ -891,14 +891,14 @@ fn i425_digest_binds_record_content_not_signatures() {
     // the authorization digest binds both heads.
     let baked_src = include_str!("../src/federation/genesis/canonical_seed.json");
     let baked = parse_genesis_bundle(baked_src).unwrap();
-    assert_eq!((baked.version, baked.roster_records.len()), (3, 2));
+    assert_eq!((baked.version, baked.roster_records.len()), (4, 2));
     // The bake is the ceremony's bytes: sha256 of the compiled-in artifact
     // equals the bundle_sha256 the ceremony host logged at `finish`. A re-bake
     // moves this pin on purpose; anything else that moves it is a tamper.
     use sha2::Digest as _;
     assert_eq!(
         hex::encode(sha2::Sha256::digest(baked_src.as_bytes())),
-        "db5e8e8391261dca10c7e701e18bcd26bd8f43ab8e5b8c11ede999ca0befe9f2",
+        "d17c05c090c73851043cb67c5ba433907e174d3dddfc0e138bfc1f421e2d710b",
         "the baked canonical_seed.json must be the final genesis's bytes (I500)"
     );
 }
@@ -1537,8 +1537,8 @@ async fn v2_bundle_keeps_the_root(
     let accord = ciris_verify_core::accord_genesis::HUMANITY_ACCORD_FAMILY_KEY_ID;
     assert_eq!(
         canonical_genesis_bundle().version,
-        3,
-        "v53.1.1: the shipped bundle is the final genesis"
+        4,
+        "v59.1.0: the shipped bundle is the v4 amend of the final genesis"
     );
     let digest = genesis_family_charter_digest();
     assert!(
