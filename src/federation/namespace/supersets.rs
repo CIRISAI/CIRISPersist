@@ -1759,7 +1759,9 @@ mod tests {
         // v59.0.0: +5 (CIRISPersist#1099, CC 3.3.6.3): CLM-self-roster-authority
         // at the steward predicate and its two gates (3), CLM-self-roster-two-paths
         // at the shared decision and the self-roster door (2).
-        const EXPECTED: usize = 311;
+        // v59.1.0: +2 (CLM-canonical-rebind: the rebind admission and the
+        // rotation door, CIRISPersist#1106).
+        const EXPECTED: usize = 313;
         assert_eq!(
             checked, EXPECTED,
             "checked {checked} version-pinned persist src/ rows, expected {EXPECTED}. \

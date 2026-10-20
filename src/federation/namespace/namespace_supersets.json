@@ -16860,6 +16860,22 @@
     "path#symbol": "src/federation/transport_rebind.rs#check_serve_rotation",
     "tsv_target": "evidence/cc_impl.tsv",
     "manifest_round": "cc-rc9-1106"
+   },
+   {
+    "decimal_id": "3.1.5",
+    "claim_id": "CLM-canonical-rebind",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/transport_rebind.rs#check_rebind_admission",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc9-1106"
+   },
+   {
+    "decimal_id": "3.1.5",
+    "claim_id": "CLM-canonical-rebind",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/transport_rebind.rs#check_serve_rotation",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc9-1106"
    }
   ],
   "CIRISServer": [
