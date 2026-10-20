@@ -450,6 +450,7 @@ pub(crate) mod bodies {
             roster_records: Vec::new(),
             authorizations: Vec::new(),
             produced_at: "2026-09-27T00:00:00Z".to_owned(),
+            serve_transport_destinations: Vec::new(),
         };
         let digest = authorization_digest(&bundle).unwrap();
         for s in signers {

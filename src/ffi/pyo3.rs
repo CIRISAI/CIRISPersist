@@ -6152,6 +6152,14 @@ impl PyEngine {
                     let backend = pg.clone();
                     runtime.block_on(async move {
                         use crate::federation::FederationDirectory;
+                        // v59.0.0 (CIRISPersist#1103, CC 2.6.8) — the id
+                        // names its own key.
+                        crate::federation::register::check_key_id_fingerprint(
+                            backend.as_ref(),
+                            &record.record,
+                        )
+                        .await
+                        .map_err(federation_err_to_py)?;
                         backend
                             .put_public_key(record)
                             .await
@@ -6205,6 +6213,14 @@ impl PyEngine {
                     let backend = sq.clone();
                     runtime.block_on(async move {
                         use crate::federation::FederationDirectory;
+                        // v59.0.0 (CIRISPersist#1103, CC 2.6.8) — the id
+                        // names its own key.
+                        crate::federation::register::check_key_id_fingerprint(
+                            backend.as_ref(),
+                            &record.record,
+                        )
+                        .await
+                        .map_err(federation_err_to_py)?;
                         backend
                             .put_public_key(record)
                             .await
@@ -6307,6 +6323,13 @@ impl PyEngine {
                         )
                         .await
                         .map_err(federation_err_to_py)?;
+                        // v59.0.0 (CIRISPersist#1103, CC 2.6.8).
+                        crate::federation::register::check_key_id_fingerprint(
+                            backend.as_ref(),
+                            &record.record,
+                        )
+                        .await
+                        .map_err(federation_err_to_py)?;
                         backend
                             .put_public_key(record)
                             .await
@@ -6319,6 +6342,13 @@ impl PyEngine {
                     runtime.block_on(async move {
                         use crate::federation::FederationDirectory;
                         crate::federation::verify_key_registration(
+                            backend.as_ref(),
+                            &record.record,
+                        )
+                        .await
+                        .map_err(federation_err_to_py)?;
+                        // v59.0.0 (CIRISPersist#1103, CC 2.6.8).
+                        crate::federation::register::check_key_id_fingerprint(
                             backend.as_ref(),
                             &record.record,
                         )
@@ -6422,52 +6452,24 @@ impl PyEngine {
     /// to raise it as a bare ValueError; `unverifiable_signature` is terminal;
     /// `"invalid_replaced"` means a stored record that failed verification was
     /// replaced by this one (same pubkeys, same claim, CIRISPersist#1044).
+    ///
+    /// v59.0.0 (sealed-transport floor, operator ruling 2026-10-19) — RETIRED:
+    /// a key replicates as its `key:record:v1` row
+    /// (`apply_replicated_attestation`). Raises `ValueError(
+    /// "federation_envelope_kind_retired: key")`, the type this door's refusals
+    /// always had.
     fn apply_replicated_key_record(
         &self,
         py: Python<'_>,
         signed_key_record_json: &str,
     ) -> PyResult<String> {
+        let _ = (py, signed_key_record_json);
         self.ensure_usable()?;
-        catch_panic(|| {
-            let runtime = self.runtime.clone();
-            let record: crate::federation::SignedKeyRecord =
-                serde_json::from_str(signed_key_record_json).map_err(|e| {
-                    PyValueError::new_err(format!("SignedKeyRecord JSON decode: {e}"))
-                })?;
-            let outcome = py.detach(|| match &self.backend {
-                #[cfg(feature = "postgres")]
-                BackendDispatch::Postgres(pg) => {
-                    let backend = pg.clone();
-                    runtime.block_on(async move {
-                        backend
-                            .apply_replicated_key_record(record)
-                            .await
-                            .map_err(federation_err_to_py)
-                    })
-                }
-                #[cfg(feature = "sqlite")]
-                BackendDispatch::Sqlite(sq) => {
-                    let backend = sq.clone();
-                    runtime.block_on(async move {
-                        backend
-                            .apply_replicated_key_record(record)
-                            .await
-                            .map_err(federation_err_to_py)
-                    })
-                }
-            })?;
-            // v36.0.0 (CIRISPersist#718) — was `to_value(..).as_str()`, which is
-            // `None` for `Refused { reason }` (an OBJECT since #565), so every
-            // key-plane REFUSAL raised `ValueError("outcome serialize")` instead
-            // of returning. #565 exists to make refusals typed and countable;
-            // on the surface Edge and Server actually consume, the refusal arm
-            // was unreachable and read as a serialization bug. Now canonical
-            // JSON, matching this cut's `apply_replicated_attestation` door —
-            // one shape for both apply planes.
-            serde_json::to_string(&outcome).map_err(|e| {
-                PyValueError::new_err(format!("apply_replicated_key_record outcome encode: {e}"))
-            })
-        })
+        Err(federation_err_to_py(
+            crate::federation::Error::EnvelopeKindRetired {
+                kind: crate::federation::replication_policy::EnvelopeKind::Key,
+            },
+        ))
     }
 
     /// v44.7.0 (CIRISPersist#864) — the local REBIND door, see
@@ -8731,56 +8733,6 @@ impl PyEngine {
         )
     }
 
-    /// v31.1.0 (CIRISPersist#655) — bulk-list `ServedRevocation`s since a
-    /// cursor, as a JSON array, ordered `(admitted_at ASC, revocation_id ASC)`.
-    /// The key-level exclusion plane's serve cursor: before this, the plane
-    /// could be destroyed and never rebuilt because nothing could serve it.
-    /// Every row qualifies (a revocation cannot be admitted unsigned).
-    ///
-    /// `since` and each element's `admitted_at` are THIS node's admission
-    /// order, not the producer's `scrub_timestamp` — resume from the last
-    /// element's `admitted_at`. Keying on the signed instant would hide a
-    /// revocation that was signed before your cursor and replicated after it.
-    #[pyo3(signature = (since_rfc3339, since_id, limit))]
-    fn list_signed_revocations_since(
-        &self,
-        py: Python<'_>,
-        since_rfc3339: Option<&str>,
-        since_id: Option<&str>,
-        limit: u32,
-    ) -> PyResult<String> {
-        self.ensure_usable()?;
-        let since = parse_pair_cursor("list_signed_revocations_since", since_rfc3339, since_id)?;
-        catch_panic(|| {
-            let runtime = self.runtime.clone();
-            py.detach(move || {
-                runtime.block_on(async move {
-                    use crate::federation::FederationDirectory;
-                    macro_rules! dispatch {
-                        ($backend:expr) => {{
-                            let b = $backend.clone();
-                            let rows = b
-                                .list_signed_revocations_since(since, limit)
-                                .await
-                                .map_err(federation_err_to_py)?;
-                            serde_json::to_string(&rows).map_err(|e| {
-                                PyRuntimeError::new_err(format!(
-                                    "signed revocation list JSON encode: {e}"
-                                ))
-                            })
-                        }};
-                    }
-                    match &self.backend {
-                        #[cfg(feature = "postgres")]
-                        BackendDispatch::Postgres(pg) => dispatch!(pg),
-                        #[cfg(feature = "sqlite")]
-                        BackendDispatch::Sqlite(sq) => dispatch!(sq),
-                    }
-                })
-            })
-        })
-    }
-
     /// v31.1.0 (CIRISPersist#662) — bulk-list the signed accord EVIDENCE
     /// bundles (proposal + its hybrid-signed participations) since a cursor,
     /// as a JSON array, ordered `(evidence_at ASC, proposal_digest ASC)`.
@@ -9219,127 +9171,6 @@ impl PyEngine {
         })
     }
 
-    /// v31.4.0 (CIRISPersist#682, #668) — bulk-list `ServedKeyRecord`s since a
-    /// cursor, as a JSON array, ordered `(admitted_at ASC, key_id ASC)`. Every
-    /// `federation_keys` row qualifies (the classical scrub signature is
-    /// required at admission, so there is no unsigned shape to filter).
-    ///
-    /// **BREAKING against v21.1.0 (#507c) in two ways, both deliberate.**
-    ///
-    /// The cursor is THIS node's `admitted_at`, not the producer's
-    /// `scrub_timestamp`: a record signed in January, replicated late and
-    /// admitted in February, used to sort under January and was never served to
-    /// a consumer past it — never, not late (#682).
-    ///
-    /// And it is the PAIR. `since_key_id` accompanies `since_rfc3339`; resume
-    /// from the last element's `admitted_at` and `record.key_id` together, or a
-    /// tie larger than one page loses its remainder (#668). Supplying one
-    /// without the other is refused rather than guessed — a half-cursor would
-    /// silently page as if from the start of that instant, re-serving rows.
-    #[pyo3(signature = (since_rfc3339, since_key_id, limit))]
-    fn list_signed_key_records_since(
-        &self,
-        py: Python<'_>,
-        since_rfc3339: Option<&str>,
-        since_key_id: Option<&str>,
-        limit: u32,
-    ) -> PyResult<String> {
-        self.ensure_usable()?;
-        let since_at = since_rfc3339.filter(|s| !s.is_empty());
-        let since_id = since_key_id.filter(|s| !s.is_empty());
-        let since =
-            match (since_at, since_id) {
-                (Some(s), Some(k)) => Some((
-                    chrono::DateTime::parse_from_rfc3339(s)
-                        .map_err(|e| PyValueError::new_err(format!("since_rfc3339 parse: {e}")))?
-                        .with_timezone(&chrono::Utc),
-                    k.to_owned(),
-                )),
-                (None, None) => None,
-                _ => return Err(PyValueError::new_err(
-                    "list_signed_key_records_since: the cursor is the PAIR (#668) — supply both \
-                     since_rfc3339 and since_key_id, or neither. Half a cursor would page from \
-                     the start of that instant and re-serve every row tied at it.",
-                )),
-            };
-        catch_panic(|| {
-            let runtime = self.runtime.clone();
-            py.detach(move || {
-                runtime.block_on(async move {
-                    use crate::federation::FederationDirectory;
-                    macro_rules! dispatch {
-                        ($backend:expr) => {{
-                            let b = $backend.clone();
-                            let rows = b
-                                .list_signed_key_records_since(since, limit)
-                                .await
-                                .map_err(federation_err_to_py)?;
-                            serde_json::to_string(&rows).map_err(|e| {
-                                PyRuntimeError::new_err(format!(
-                                    "signed key_record list JSON encode: {e}"
-                                ))
-                            })
-                        }};
-                    }
-                    match &self.backend {
-                        #[cfg(feature = "postgres")]
-                        BackendDispatch::Postgres(pg) => dispatch!(pg),
-                        #[cfg(feature = "sqlite")]
-                        BackendDispatch::Sqlite(sq) => dispatch!(sq),
-                    }
-                })
-            })
-        })
-    }
-
-    /// v21.1.0 (CIRISPersist#507c) — bulk-list the full
-    /// `SignedIdentityOccurrence` wrappers since a cursor, as a JSON array.
-    /// Signed rows only (trusted-local rows omitted); ordered `(asserted_at
-    /// ASC, identity_key_id ASC, occurrence_key_id ASC)`.
-    #[pyo3(signature = (since_rfc3339, since_id, limit))]
-    fn list_signed_identity_occurrences_since(
-        &self,
-        py: Python<'_>,
-        since_rfc3339: Option<&str>,
-        since_id: Option<&str>,
-        limit: u32,
-    ) -> PyResult<String> {
-        self.ensure_usable()?;
-        let since = parse_pair_cursor(
-            "list_signed_identity_occurrences_since",
-            since_rfc3339,
-            since_id,
-        )?;
-        catch_panic(|| {
-            let runtime = self.runtime.clone();
-            py.detach(move || {
-                runtime.block_on(async move {
-                    use crate::federation::FederationDirectory;
-                    macro_rules! dispatch {
-                        ($backend:expr) => {{
-                            let b = $backend.clone();
-                            let rows = b
-                                .list_signed_identity_occurrences_since(since, limit)
-                                .await
-                                .map_err(federation_err_to_py)?;
-                            serde_json::to_string(&rows).map_err(|e| {
-                                PyRuntimeError::new_err(format!(
-                                    "signed identity_occurrence list JSON encode: {e}"
-                                ))
-                            })
-                        }};
-                    }
-                    match &self.backend {
-                        #[cfg(feature = "postgres")]
-                        BackendDispatch::Postgres(pg) => dispatch!(pg),
-                        #[cfg(feature = "sqlite")]
-                        BackendDispatch::Sqlite(sq) => dispatch!(sq),
-                    }
-                })
-            })
-        })
-    }
-
     /// v21.1.0 (CIRISPersist#507c) — bulk-list the full
     /// `SignedTransportDestination` wrappers since a cursor, as a JSON
     /// array. Signed rows only; RETIRED rows ARE included (tombstones must
@@ -9418,54 +9249,6 @@ impl PyEngine {
                             serde_json::to_string(&rows).map_err(|e| {
                                 PyRuntimeError::new_err(format!(
                                     "attestation list JSON encode: {e}"
-                                ))
-                            })
-                        }};
-                    }
-                    match &self.backend {
-                        #[cfg(feature = "postgres")]
-                        BackendDispatch::Postgres(pg) => dispatch!(pg),
-                        #[cfg(feature = "sqlite")]
-                        BackendDispatch::Sqlite(sq) => dispatch!(sq),
-                    }
-                })
-            })
-        })
-    }
-
-    /// v21.1.0 (CIRISPersist#507c) — bulk-list the full
-    /// `SignedIdentityOccurrenceRevocation` wrappers since a cursor, as a
-    /// JSON array. Signed rows only; ordered `(revoked_at ASC,
-    /// identity_key_id ASC, occurrence_key_id ASC)`.
-    #[pyo3(signature = (since_rfc3339, since_id, limit))]
-    fn list_signed_identity_occurrence_revocations_since(
-        &self,
-        py: Python<'_>,
-        since_rfc3339: Option<&str>,
-        since_id: Option<&str>,
-        limit: u32,
-    ) -> PyResult<String> {
-        self.ensure_usable()?;
-        let since = parse_pair_cursor(
-            "list_signed_identity_occurrence_revocations_since",
-            since_rfc3339,
-            since_id,
-        )?;
-        catch_panic(|| {
-            let runtime = self.runtime.clone();
-            py.detach(move || {
-                runtime.block_on(async move {
-                    use crate::federation::FederationDirectory;
-                    macro_rules! dispatch {
-                        ($backend:expr) => {{
-                            let b = $backend.clone();
-                            let rows = b
-                                .list_signed_identity_occurrence_revocations_since(since, limit)
-                                .await
-                                .map_err(federation_err_to_py)?;
-                            serde_json::to_string(&rows).map_err(|e| {
-                                PyRuntimeError::new_err(format!(
-                                    "signed identity_occurrence_revocation list JSON encode: {e}"
                                 ))
                             })
                         }};
@@ -26005,6 +25788,60 @@ impl PyEngine {
         })
     }
 
+    /// v59.0.0 (CIRISPersist#1099, CC 3.3.6.3) — every open proposal to add
+    /// to or evict from `identity_key_id`'s key roster, decided now on this
+    /// node's clock: a JSON array of `{proposal, decision, decided_at,
+    /// approvers, objectors}`, `decision.outcome` one of `lands` / `pending` /
+    /// a refusal token. What a host shows the self's devices so they answer.
+    fn self_roster_standing(&self, py: Python<'_>, identity_key_id: &str) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let identity = identity_key_id.to_owned();
+            let engine = self.hold_engine_view();
+            py.detach(move || {
+                let standing = self
+                    .runtime
+                    .block_on(engine.self_roster_standing(&identity))
+                    .map_err(federation_err_to_py)?;
+                serde_json::to_string(&standing)
+                    .map_err(|e| PyRuntimeError::new_err(format!("standing JSON encode: {e}")))
+            })
+        })
+    }
+
+    /// v59.0.0 (CIRISPersist#1099, CC 3.3.6.3) — execute every open
+    /// self-roster proposal that lands now; returns how many landed. Run it
+    /// on a schedule: a proposal that lands by the lone path lands here.
+    fn execute_self_roster_due(&self, py: Python<'_>) -> PyResult<usize> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let engine = self.hold_engine_view();
+            py.detach(move || {
+                self.runtime
+                    .block_on(engine.execute_self_roster_due())
+                    .map_err(federation_err_to_py)
+            })
+        })
+    }
+
+    /// v59.0.0 (CIRISPersist#1099, CC 3.3.6.3) — the envelope of an answer to
+    /// a self-roster proposal (`assent=True`: an assent; `False`: an
+    /// objection), for a roster key of `identity_key_id` to sign and put as a
+    /// `scores` row attested to `identity_key_id`. JSON object.
+    fn self_roster_vote_envelope(
+        &self,
+        identity_key_id: &str,
+        proposal_id: &str,
+        assent: bool,
+    ) -> PyResult<String> {
+        serde_json::to_string(&crate::federation::self_roster::vote_envelope(
+            identity_key_id,
+            proposal_id,
+            assent,
+        ))
+        .map_err(|e| PyRuntimeError::new_err(format!("vote envelope JSON encode: {e}")))
+    }
+
     /// v44.6.0 (#857 §4) — `resolve_scoped_consent` keyed by ANY key that
     /// stands for the subject; the per-principal fold combined as a reverse
     /// quorum on the stop. Returns the stance name. FFI mirror of
@@ -33805,6 +33642,18 @@ fn fountain_store_err_to_py(e: crate::store::Error) -> PyErr {
         | Error::AggregationMetaRejected(_)
         | Error::StorageContention(_)
         | Error::Schema(_) => PyValueError::new_err(e.kind()),
+        // v59.0.0 (CIRISPersist#1102) — a malformed source list (a repeated
+        // id) is caller-fault and terminal: ValueError, the type a rejected
+        // aggregation always had, with the plane and reason beside the kind.
+        Error::MalformedRow(inner) => {
+            let kind = inner.kind();
+            match *inner {
+                crate::federation::Error::MalformedRow { plane, reason, .. } => {
+                    PyValueError::new_err(format!("{kind}: {plane}: {reason}"))
+                }
+                _ => PyValueError::new_err(kind),
+            }
+        }
         // v24.1.0 (CIRISPersist#559) — `MigrationLockTimeout` joins the
         // transient-shaped arm: nothing was written and re-running IS the
         // remedy, which is precisely what `RuntimeError` signals here. Its
@@ -34657,6 +34506,9 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         // Caller-fault → ValueError (4xx).
         crate::federation::Error::InvalidArgument(_)
         | crate::federation::Error::SignatureInvalid(_) => PyValueError::new_err(kind),
+        // v59.0.0 (CIRISPersist#1049) — typed out of `InvalidArgument`: the
+        // same kind and type.
+        crate::federation::Error::AssertedAtStale { .. } => PyValueError::new_err(kind),
         // v54.1.0 (CIRISPersist#1042) — the ordering gap keeps the Python
         // type of the arm it was split from (`SignatureInvalid` /
         // `FederationTierUnverified`, both ValueError); the KIND tells a
@@ -34666,6 +34518,20 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         // (ValueError), so it keeps that type; the KIND
         // (`federation_signer_not_acting_for`) marks it retryable.
         crate::federation::Error::SignerDoesNotActFor { .. } => PyValueError::new_err(kind),
+        // v59.0.0 (sealed-transport floor) — a retired framed kind keeps the
+        // type of the arms it replaces on those doors (ValueError); the detail
+        // names the kind.
+        crate::federation::Error::EnvelopeKindRetired { kind: k } => PyValueError::new_err(format!(
+            "{kind}: {}",
+            crate::federation::replication_policy::retired_detail(k)
+        )),
+        // v59.0.0 (CIRISPersist#1099) — the roster change is held as a
+        // proposal (or refused); the decision and the proposal id ride the kind.
+        crate::federation::Error::SelfRosterNotLanded {
+            decision,
+            ref proposal_id,
+            ..
+        } => PyValueError::new_err(format!("{kind}: {decision}: {proposal_id}")),
         // v55.0.0 (CIRISPersist#1055) — typed out of `InvalidArgument`
         // (ValueError), so it keeps that type; the plane and the TERMINAL
         // reason token ride with the kind.

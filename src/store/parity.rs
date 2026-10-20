@@ -135,36 +135,12 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // without a row — never refused there). The attestation door hands a
     // key-plane row to its family door (Delegates).
     ("plan_put_revocation", Class::Delegates),
-    // v58.0.0 (compat reads, operator ruling 2026-10-18) — the framed
-    // occurrence-revocation door's signature gate (v57's class), the
-    // restored listings' row decoders (v57's class), and the read the
-    // attestation door makes before feeding a `withdraws` into the occurrence
-    // revocation projection: Delegates, a backend read whose only effect is to
-    // skip a write the framed route already made (an error propagates, so it
-    // fails closed).
-    ("verify_signed_identity_occurrence_revocation", Class::Gate),
+    // The read the attestation door makes before feeding a `withdraws` into
+    // the occurrence revocation projection: Delegates, a backend read whose
+    // only effect is to skip a write a revocation already made (an error
+    // propagates, so it fails closed). v59.0.0 retired the framed door and the
+    // compat listings' decoders.
     ("list_identity_occurrence_revocations_for", Class::Delegates),
-    ("pg_row_to_key_record", Class::Delegates),
-    ("pg_row_to_revocation", Class::Delegates),
-    ("pg_row_to_signed_identity_occurrence", Class::Delegates),
-    (
-        "pg_row_to_signed_identity_occurrence_revocation",
-        Class::Delegates,
-    ),
-    ("sqlite_row_to_key_record", Class::Delegates),
-    ("sqlite_row_to_revocation", Class::Delegates),
-    ("sqlite_row_to_identity_occurrence", Class::Delegates),
-    (
-        "sqlite_row_to_identity_occurrence_revocation",
-        Class::Delegates,
-    ),
-    ("pg_row_to_identity_occurrence", Class::Delegates),
-    ("pg_row_to_identity_occurrence_revocation", Class::Delegates),
-    ("sqlite_row_to_signed_identity_occurrence", Class::Delegates),
-    (
-        "sqlite_row_to_signed_identity_occurrence_revocation",
-        Class::Delegates,
-    ),
     ("put_revocation_planned", Class::Plan),
     ("revocations_for_subject", Class::Plumbing),
     ("check_revocation_bound_lowers", Class::Gate),
@@ -173,6 +149,12 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("occurrence_withdrawal_of", Class::Plumbing),
     ("put_identity_occurrence_revocation_local", Class::Plumbing),
     ("rehome_legacy_key_plane", Class::Plumbing),
+    // v59.0.0 (sealed-transport floor) — the eager rehome at open: a data
+    // sweep that fails only on the substrate's own terms.
+    ("rehome_key_plane_at_open", Class::Plumbing),
+    // v59.0.0 (CIRISPersist#1096) — the open's count of grandfathered
+    // capture grants; logs, refuses nothing.
+    ("legacy_community_trust_grants_at_open", Class::Plumbing),
     ("sqlite_sync_key_record_row", Class::Plumbing),
     ("sqlite_sync_occurrence_row", Class::Plumbing),
     ("sqlite_drop_key_record_rows", Class::Plumbing),
@@ -451,6 +433,17 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // shaped like a SHA-256 (reserved for an inline blob's one-leaf log). A
     // statement about the caller's input.
     ("refuse_reserved_stream_id", Class::Gate),
+    // v59.0.0 (sealed-transport floor) — refuses a peer's advertisement of a
+    // retired framed kind.
+    ("refuse_retired_framed", Class::Gate),
+    // v59.0.0 (CIRISPersist#1106) — refuses a seated serve node's unilateral
+    // transit-pair rotation before a quorum re-bind.
+    ("check_serve_rotation", Class::Gate),
+    // Refuses a re-bind row without the holder quorum.
+    ("check_rebind_admission", Class::Gate),
+    // After an admitted re-bind: applies the carried row through the
+    // transport door (which runs its own gates).
+    ("after_admission", Class::Delegates),
     // v52.0.0 (#953) — Plumbing: a pure shape test that names the inline blob
     // a stream id spells, inside the chunk-hash loader; it refuses nothing.
     ("inline_blob_of_stream_id", Class::Plumbing),
@@ -657,6 +650,10 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("from_str", Class::Plumbing),
     ("from_value", Class::Plumbing),
     ("from_wire_str", Class::Plumbing),
+    // v59.0.0 (CIRISPersist#1099) — the self-roster door: refuses (holds) a
+    // roster change one key of two or more signed.
+    ("gate_occurrence", Class::Gate),
+    ("gate_withdrawal", Class::Gate),
     ("get", Class::Plumbing),
     ("get_accord_proposal", Class::Delegates),
     ("get_attestation", Class::Delegates),

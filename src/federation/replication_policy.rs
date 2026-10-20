@@ -145,6 +145,57 @@ pub enum EnvelopeKind {
     CommunityMembershipListing,
 }
 
+/// v59.0.0 (sealed-transport floor) — the detail an
+/// [`Error::EnvelopeKindRetired`](super::Error::EnvelopeKindRetired) names: the
+/// kind, snake_case (`key`, `revocation`, `identity_occurrence`,
+/// `identity_occurrence_revocation`, …).
+#[must_use]
+pub fn retired_detail(kind: EnvelopeKind) -> String {
+    let mut out = String::new();
+    for (i, c) in kind.as_str().chars().enumerate() {
+        if c.is_ascii_uppercase() {
+            if i > 0 {
+                out.push('_');
+            }
+            out.push(c.to_ascii_lowercase());
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// v59.0.0 (sealed-transport floor; CIRISEdge matches it) — the `kind()`
+/// token of [`Error::EnvelopeKindRetired`](super::Error::EnvelopeKindRetired):
+/// an inbound object of a retired framed kind. Its Display leads with this
+/// token, then `: <retired_detail>`.
+pub const ENVELOPE_KIND_RETIRED: &str = "federation_envelope_kind_retired";
+
+/// v59.0.0 (sealed-transport floor, operator ruling 2026-10-19) — the kinds
+/// whose FRAMED carriage is retired: a key-plane object travels only as its
+/// row (an `Attestation`). They stay in the hashed vocabulary.
+pub const RETIRED_FRAMED: [EnvelopeKind; 4] = [
+    EnvelopeKind::Key,
+    EnvelopeKind::Revocation,
+    EnvelopeKind::IdentityOccurrence,
+    EnvelopeKind::IdentityOccurrenceRevocation,
+];
+
+/// v59.0.0 — refuse a wire-kind token (`EnvelopeKind::as_str()`) naming a
+/// [`RETIRED_FRAMED`] kind, at the replication path's own doors (a peer's
+/// advertisement of a framed hash): a peer's framed object is never taken in
+/// to be re-authored locally as a row.
+///
+/// # Errors
+///
+/// [`Error::EnvelopeKindRetired`](super::Error::EnvelopeKindRetired).
+pub fn refuse_retired_framed(kind: &str) -> Result<(), super::Error> {
+    match RETIRED_FRAMED.into_iter().find(|k| k.as_str() == kind) {
+        Some(kind) => Err(super::Error::EnvelopeKindRetired { kind }),
+        None => Ok(()),
+    }
+}
+
 impl EnvelopeKind {
     /// Every kind, in the canonical (manifest-hashed) order. APPENDED, never
     /// inserted — the order is hashed.
@@ -605,22 +656,28 @@ pub const SETTLE_EXEMPT: &[(EnvelopeKind, &str)] = &[
         EnvelopeKind::Key,
         "v58.0.0 (CIRISPersist#991): rides the attestation store as a key-plane row, whose \
          key-plane door settles a byte-identical re-offer (key_plane::apply_key_plane_row); \
-         the framed door a pre-v58 peer still drives is that family's own door, unchanged \
-         by the compat reads",
+         the framed door is retired (v59.0.0, sealed-transport floor) and answers \
+         federation_envelope_kind_retired",
     ),
     (
         EnvelopeKind::Revocation,
         "v58.0.0 (CIRISPersist#991): rides the attestation store as a key-plane row, whose \
          key-plane door settles a byte-identical re-offer (key_plane::apply_key_plane_row); \
-         the framed door a pre-v58 peer still drives is that family's own door, unchanged \
-         by the compat reads",
+         the framed door is retired (v59.0.0, sealed-transport floor) and answers \
+         federation_envelope_kind_retired",
     ),
     (
         EnvelopeKind::IdentityOccurrence,
         "v58.0.0 (CIRISPersist#991): rides the attestation store as a key-plane row, whose \
          key-plane door settles a byte-identical re-offer (key_plane::apply_key_plane_row); \
-         the framed door a pre-v58 peer still drives is that family's own door, unchanged \
-         by the compat reads",
+         the framed door is retired (v59.0.0, sealed-transport floor) and answers \
+         federation_envelope_kind_retired",
+    ),
+    (
+        EnvelopeKind::IdentityOccurrenceRevocation,
+        "v59.0.0 (sealed-transport floor, operator ruling 2026-10-19): the framed carriage is \
+         retired and has no door; an occurrence is revoked by a withdraws on its \
+         identity:occurrence:v1 row, which the attestation door settles",
     ),
 ];
 

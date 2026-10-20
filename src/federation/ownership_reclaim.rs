@@ -1389,13 +1389,13 @@ mod tests {
             .await
             .expect("construct sqlite engine");
         let dir = engine.federation_directory();
-        rts::exercise_reclaim_ceremony(&*dir, "sq").await;
+        Box::pin(rts::exercise_reclaim_ceremony(&*dir, "sq")).await;
     }
 
     #[tokio::test]
     async fn ownership_reclaim_ceremony_memory() {
         let dir = crate::store::memory::MemoryBackend::new();
-        rts::exercise_reclaim_ceremony(&dir, "mem").await;
+        Box::pin(rts::exercise_reclaim_ceremony(&dir, "mem")).await;
     }
 
     #[cfg(feature = "postgres")]
@@ -1413,7 +1413,7 @@ mod tests {
             .expect("construct postgres engine");
         let dir = engine.federation_directory();
         let tag = format!("pg{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
-        rts::exercise_reclaim_ceremony(&*dir, &tag).await;
+        Box::pin(rts::exercise_reclaim_ceremony(&*dir, &tag)).await;
     }
 }
 

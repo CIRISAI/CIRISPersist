@@ -90,6 +90,48 @@ pub const REVOCATION_MEMBER: &str = "revocation";
 /// occurrence under.
 pub const IDENTITY_OCCURRENCE_MEMBER: &str = "identity_occurrence";
 
+/// v59.0.0 (sealed-transport floor, operator ruling 2026-10-19) — what the
+/// one-way rehome at first open found: every v57-shape object it could give a
+/// row now has one; these are what it could not. Logged at open, one line,
+/// counted.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct KeyPlaneRehomeReport {
+    /// Keys held without a `key:record:v1` row (verify under neither rule).
+    pub keys_without_row: u64,
+    /// Key revocations held without a `key:revocation:v1` row.
+    pub revocations_without_row: u64,
+    /// Signed occurrences held without an `identity:occurrence:v1` row.
+    pub occurrences_without_row: u64,
+    /// Framed occurrence revocations kept as legacy projection rows (V200):
+    /// still revoking, never re-signed, never un-revoked.
+    pub legacy_framed_occurrence_revocations: u64,
+    /// v59.0.0 (CIRISPersist#1104) — what the carrier migration did with
+    /// them: minted carriers, and the user-self revocations without a roster
+    /// quorum (named, for their owners to re-propose through the door).
+    pub carriers: super::occurrence_revocation_carrier::CarrierMigration,
+}
+
+impl KeyPlaneRehomeReport {
+    /// The counted log line.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    pub(crate) fn log(&self, backend: &'static str) {
+        tracing::info!(
+            backend,
+            keys_without_row = self.keys_without_row,
+            revocations_without_row = self.revocations_without_row,
+            occurrences_without_row = self.occurrences_without_row,
+            legacy_framed_occurrence_revocations = self.legacy_framed_occurrence_revocations,
+            occurrence_revocation_carriers = self.carriers.minted,
+            carriers_without_roster_quorum = ?self.carriers.without_quorum,
+            carriers_not_carried = ?self.carriers.not_carried,
+            "key-plane rehome at open (v59.0.0): every verifiable v57-shape record has its row; \
+             the counted rest is held without one; a user self's legacy occurrence revocation \
+             without a roster quorum stays local — its owner re-proposes it through the two-path \
+             door (CIRISPersist#1104)"
+        );
+    }
+}
+
 /// The three families of the key plane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyPlaneFamily {
@@ -201,12 +243,16 @@ fn canonical_bytes(v: &serde_json::Value) -> Result<Vec<u8>, Error> {
 /// `sha256(domain ‖ JCS(object))`, as a UUID. One signed object, one id, on
 /// every node: a re-offer is the same row, and a changed object (a new
 /// scrub, a completed hybrid, a rebind) is a new row that replaces the old.
-pub(crate) fn plane_attestation_id(
-    family: KeyPlaneFamily,
+///
+/// The same rule names every row persist mints from a signed object it
+/// verified: the key plane's three families and the self-roster proposal
+/// (`super::self_roster`), each under its own id domain.
+pub(crate) fn minted_attestation_id(
+    id_domain: &[u8],
     object: &serde_json::Value,
 ) -> Result<String, Error> {
     let mut h = Sha256::new();
-    h.update(family.id_domain());
+    h.update(id_domain);
     h.update(canonical_bytes(object)?);
     let digest = h.finalize();
     let mut b = [0u8; 16];
@@ -232,14 +278,54 @@ pub(crate) fn plane_row(
     asserted_at: chrono::DateTime<chrono::Utc>,
     signature: PlaneSignature,
 ) -> Result<Attestation, Error> {
+    minted_row(
+        MintedFamily {
+            dimension: family.dimension(),
+            member: family.member(),
+            score: family.score(),
+            id_domain: family.id_domain(),
+        },
+        attesting_key_id,
+        attested_key_id,
+        object,
+        asserted_at,
+        signature,
+    )
+}
+
+/// What names a family of minted rows: its dimension, the envelope member
+/// its signed object rides under, its score, and its id domain.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct MintedFamily {
+    /// The row's `dimension`.
+    pub(crate) dimension: &'static str,
+    /// The envelope member carrying the signed object.
+    pub(crate) member: &'static str,
+    /// The row's `score`.
+    pub(crate) score: i64,
+    /// The id domain (`sha256(domain ‖ JCS(object))`).
+    pub(crate) id_domain: &'static [u8],
+}
+
+/// [`plane_row`] for any [`MintedFamily`]: the one builder of a row persist
+/// mints from a signed object, so the key plane and the self-roster proposal
+/// (`super::self_roster`) cannot spell the row two ways.
+pub(crate) fn minted_row(
+    family: MintedFamily,
+    attesting_key_id: &str,
+    attested_key_id: &str,
+    object: serde_json::Value,
+    asserted_at: chrono::DateTime<chrono::Utc>,
+    signature: PlaneSignature,
+) -> Result<Attestation, Error> {
     let mut object = object;
     super::canonical_at_rest::canonicalize_in_place(&mut object)?;
-    let attestation_id = plane_attestation_id(family, &object)?;
+    let attestation_id = minted_attestation_id(family.id_domain, &object)?;
     let mut members = serde_json::Map::new();
-    members.insert("dimension".to_owned(), family.dimension().into());
-    members.insert("score".to_owned(), family.score().into());
+    members.insert("dimension".to_owned(), family.dimension.into());
+    members.insert("score".to_owned(), family.score.into());
     members.insert("confidence".to_owned(), 1.into());
-    members.insert(family.member().to_owned(), object);
+    members.insert(family.member.to_owned(), object);
     let envelope = serde_json::Value::Object(members);
     let mut row = Attestation {
         attestation_id,
@@ -617,6 +703,9 @@ pub fn revocation_of_row(row: &Attestation) -> Option<super::types::Revocation> 
 #[must_use]
 pub fn is_never_withdrawn(row: &Attestation) -> bool {
     KeyPlaneFamily::of_row(row) == Some(KeyPlaneFamily::KeyRevocation)
+        // v59.0.0 (CIRISPersist#1104, CC 3.1.5) — nor is an occurrence
+        // revocation's carrier.
+        || super::occurrence_revocation_carrier::is_carrier_row(row)
 }
 
 /// The rebuild gate's rendering of one `federation_revocations` projection
@@ -971,6 +1060,34 @@ where
     }))
 }
 
+/// v59.0.0 (CIRISPersist#1104; for CIRISEdge) — **the one predicate**: does
+/// `row` revoke an occurrence, and which? `Some((identity, occurrence))` for
+/// a `withdraws` whose target is a held `identity:occurrence:v1` row, and for
+/// an `identity:occurrence_revocation:v1` carrier; `None` for any other row
+/// (or a `withdraws` whose target this node does not hold). Whether the row
+/// is ADMITTED is the door's; this names what it would revoke.
+///
+/// # Errors
+///
+/// A backend failure reading the `withdraws` target.
+pub async fn occurrence_revoked_by<D>(
+    dir: &D,
+    row: &Attestation,
+) -> Result<Option<(String, String)>, Error>
+where
+    D: super::FederationDirectory + ?Sized,
+{
+    if let Some(framed) = super::occurrence_revocation_carrier::carrier_of_row(row) {
+        return Ok(framed
+            .revocation()
+            .ok()
+            .map(|r| (r.identity_key_id, r.occurrence_key_id)));
+    }
+    Ok(occurrence_withdrawal_of(dir, row)
+        .await?
+        .map(|r| (r.identity_key_id, r.occurrence_key_id)))
+}
+
 /// The rebuild gate's rendering of one SIGNED `federation_identity_occurrences`
 /// row: the signed occurrence and the `attestation_id` it names. A
 /// trusted-local (unsigned) occurrence is this node's own self-write, not a
@@ -1088,6 +1205,10 @@ where
             })?;
             let held_signer = held_signer_of(dir, &record).await?;
             check_canonical_plane_row(row, &plan_key_record_row(&record, &held_signer)?)?;
+            // v59.0.0 (CIRISPersist#1103, CC 2.6.8) — first contact: the id
+            // names its own key (a held key under a non-matching id is
+            // grandfathered where it is, never introduced again).
+            super::register::check_key_id_fingerprint(dir, &record).await?;
             use super::register::ReplicatedKeyOutcome as O;
             Ok(
                 match dir

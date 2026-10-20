@@ -453,13 +453,9 @@ Engine	list_signed_communities_since	epistemic
 Engine	list_signed_community_membership_revocations_since	epistemic	
 Engine	list_signed_families_since	epistemic	
 Engine	list_signed_family_membership_revocations_since	epistemic	
-Engine	list_signed_identity_occurrence_revocations_since	epistemic	
 Engine	list_signed_identity_occurrences_for_json	epistemic	
-Engine	list_signed_identity_occurrences_since	epistemic	
-Engine	list_signed_key_records_since	epistemic	
 Engine	list_signed_location_proofs_since	epistemic	
 Engine	list_signed_partner_records_since	epistemic
-Engine	list_signed_revocations_since	epistemic
 Engine	list_signed_transport_destinations_since	epistemic
 Engine	list_subscriptions	structural	
 Engine	list_tasks	empirical	
@@ -743,6 +739,9 @@ ScoringFactorStream	__len__	structural
 ScoringFactorStream	__next__	structural	
 ScoringFactorStream	summary	epistemic	
 Engine	consent_peers_by_principals	deontic	
+Engine	execute_self_roster_due	deontic	
+Engine	self_roster_standing	deontic	
+Engine	self_roster_vote_envelope	deontic	
 Engine	resolve_scoped_consent_by_principals	deontic	
 # v53.1.8 (CIRISPersist#1013) — `capacity_consent_stance` is DEONTIC: it is the
 # consent-before-scoring gate's own fold; a wrong answer admits or refuses a score.

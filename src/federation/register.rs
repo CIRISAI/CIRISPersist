@@ -1448,6 +1448,92 @@ where
     )
 }
 
+/// v59.0.0 (CIRISPersist#1103; CC 2.6.8 rc9 `957d1dd`,
+/// `CLM-key-id-fingerprint-verified`) — the `-<fp>` suffix a `key_id` must
+/// carry: verify-core fedcode's fingerprint ([`ciris_verify_core::fedcode`],
+/// the first `KEY_ID_FINGERPRINT_LEN` lowercase base32 characters of
+/// SHA-256 over the raw Ed25519 public key), taken from
+/// `fedcode::derive_key_id` so persist does not re-implement it. `None` when
+/// the base64 is not 32 raw bytes (the registration gate refuses that on its
+/// own terms).
+#[must_use]
+pub fn key_id_fingerprint(pubkey_ed25519_base64: &str) -> Option<String> {
+    use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+    let raw = B64.decode(pubkey_ed25519_base64).ok()?;
+    if raw.len() != 32 {
+        return None;
+    }
+    let id = ciris_verify_core::fedcode::derive_key_id("", &raw);
+    id.strip_prefix("id-").map(str::to_owned)
+}
+
+/// v59.0.0 (CIRISPersist#1103) — is `record` one the genesis bundle pin or a
+/// family vouches for, exempt from the fingerprint rule? A bundle-pinned
+/// anchor (an accord holder or a serve node of the pinned
+/// [`GenesisBundle`](super::genesis::bundle::GenesisBundle), the accord
+/// holders this build seeds, under the SAME Ed25519 key) or a held family's
+/// id. Keyed off the bundle and the families, never a string prefix.
+async fn fingerprint_exempt<F>(directory: &F, record: &KeyRecord) -> Result<bool, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let pinned = |r: &super::SignedKeyRecord| {
+        r.record.key_id == record.key_id
+            && r.record.pubkey_ed25519_base64 == record.pubkey_ed25519_base64
+    };
+    let bundle = super::genesis::canonical_genesis_bundle();
+    if bundle.holders.iter().chain(&bundle.serve_nodes).any(pinned)
+        || super::genesis::effective_accord_holder_records()
+            .iter()
+            .any(pinned)
+    {
+        return Ok(true);
+    }
+    if bundle.family_key_id == record.key_id {
+        return Ok(true);
+    }
+    Ok(directory.lookup_family(&record.key_id).await?.is_some())
+}
+
+/// v59.0.0 (CIRISPersist#1103; CC 2.6.8 rc9 `957d1dd`,
+/// `CLM-key-id-fingerprint-verified`) — **the door's fingerprint rule**: a
+/// key registered ([`Engine::register_federation_key`](crate::Engine::register_federation_key),
+/// Python `register_federation_key`) or introduced at first contact (the
+/// `key:record:v1` proof-of-possession door) must name itself
+/// `<label>-<fp>`, `fp` = [`key_id_fingerprint`] of the record's OWN Ed25519
+/// key — so a peer cannot substitute another key under an id. Exempt:
+/// [`fingerprint_exempt`] (the bundle-pinned anchors and family ids, which
+/// the genesis pin verifies). Checked at the door only: a key already held
+/// under a non-matching id is GRANDFATHERED (it resolves, nothing re-keys
+/// it), but it cannot be registered or introduced again under that id. The
+/// roster-id form (`device-<hex>-<fp>`) is a separate rule; this one reads
+/// only the suffix.
+///
+/// # Errors
+///
+/// [`Error::MalformedRow`] ([`malformed_row::KEY_ID_FINGERPRINT_MISMATCH`](super::malformed_row::KEY_ID_FINGERPRINT_MISMATCH)).
+pub async fn check_key_id_fingerprint<F>(directory: &F, record: &KeyRecord) -> Result<(), Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let Some(fp) = key_id_fingerprint(&record.pubkey_ed25519_base64) else {
+        // Not 32 raw bytes: the registration gate refuses it on its own terms.
+        return Ok(());
+    };
+    if record.key_id.ends_with(&format!("-{fp}")) || fingerprint_exempt(directory, record).await? {
+        return Ok(());
+    }
+    Err(Error::malformed_row(
+        "key_registration",
+        super::malformed_row::KEY_ID_FINGERPRINT_MISMATCH,
+        format!(
+            "key_id {:?} does not end in -{fp}, the fingerprint of its own Ed25519 key (CC \
+             2.6.8, CLM-key-id-fingerprint-verified)",
+            record.key_id
+        ),
+    ))
+}
+
 /// v58.0.0 (CIRISPersist#991, CC 3.1.3) — **proof of possession**: the key
 /// record is the key's claim of itself. Its base scrub is the key's own
 /// (`scrub_key_id == key_id`) and verifies, hybrid and Strict, over the
@@ -2409,389 +2495,6 @@ pub mod test_support {
             additional_scrubs: Vec::new(),
         }
     }
-
-    /// **v31.4.0 (CIRISPersist#682) — A RECORD REPLICATED LATE IS STILL SERVED,
-    /// on every backend.**
-    ///
-    /// The defect this witnesses, stated as the sequence it drives:
-    ///
-    /// 1. A consumer reads this node's key stream to the end and keeps its
-    ///    cursor.
-    /// 2. A record **signed a year ago** arrives — a peer that was offline
-    ///    reconnects and replicates — and this node admits it now.
-    /// 3. The consumer resumes.
-    ///
-    /// Keyed on `scrub_timestamp`, step 3 returns nothing: the row sorts a year
-    /// back, behind a cursor that has already passed it, and no retry ever
-    /// recovers it because its sort position is fixed by someone else's clock.
-    /// Not late — **never**. On the identity plane that means a peer that never
-    /// learns the key exists, and every signature by that key is unverifiable
-    /// there forever.
-    ///
-    /// Keyed on `admitted_at` it is served, because this node admitted it after
-    /// the cursor was taken.
-    ///
-    /// The old record is admitted SECOND on purpose. Admitting it first would
-    /// pass under either key, and prove nothing.
-    pub async fn exercise_late_replicated_key_record_is_served(
-        directory: &dyn FederationDirectory,
-        tag: &str,
-    ) -> Result<(), Error> {
-        let now = truncate_to_micros(chrono::Utc::now());
-        let early = format!("k682-early-{tag}");
-        let late = format!("k682-late-{tag}");
-
-        // (1) A record signed just now, admitted first. The consumer reads to
-        //     the end and keeps its cursor.
-        directory
-            .put_public_key(crate::federation::SignedKeyRecord {
-                record: self_scrubbed_record_signed_at(&early, now - chrono::Duration::minutes(1)),
-            })
-            .await?;
-        let first_pass = directory
-            .list_signed_key_records_since(None, u32::MAX)
-            .await?;
-        let cursor = first_pass
-            .iter()
-            .find(|r| r.record.key_id == early)
-            .map(|r| (r.admitted_at, r.record.key_id.clone()))
-            .unwrap_or_else(|| {
-                panic!("({tag}) #682: the freshly admitted record must be served at all")
-            });
-
-        // (2) THE LATE REPLICATION. Signed a year before the cursor, admitted
-        //     now. This is the everyday case, not an attack.
-        let stale_signed_at = now - chrono::Duration::days(365);
-        assert!(
-            stale_signed_at < cursor.0,
-            "({tag}) #682: the late record's signed instant must be BELOW the consumer's cursor, \
-             or the witness cannot distinguish the two keys"
-        );
-        directory
-            .put_public_key(crate::federation::SignedKeyRecord {
-                record: self_scrubbed_record_signed_at(&late, stale_signed_at),
-            })
-            .await?;
-
-        // (3) The consumer resumes from exactly where it stopped.
-        let resumed = directory
-            .list_signed_key_records_since(Some(cursor.clone()), u32::MAX)
-            .await?;
-        let served = resumed
-            .iter()
-            .find(|r| r.record.key_id == late)
-            .unwrap_or_else(|| {
-                panic!(
-                    "({tag}) #682: a key record signed a year ago and admitted NOW must still be \
-                     served to a consumer resuming from {cursor:?} — keyed on the producer's \
-                     `scrub_timestamp` it sorts a year back, behind the cursor, and is never \
-                     served to that consumer again. On the identity plane that is a peer that \
-                     never learns the key exists. Served: {:?}",
-                    resumed.iter().map(|r| &r.record.key_id).collect::<Vec<_>>()
-                )
-            });
-
-        // The position is THIS node's, and it is not the producer's instant.
-        assert!(
-            served.admitted_at > cursor.0,
-            "({tag}) #682: the served position must be this node's admission instant, strictly \
-             after the cursor — got {}, cursor {}",
-            served.admitted_at,
-            cursor.0
-        );
-        assert_eq!(
-            served.record.scrub_timestamp, stale_signed_at,
-            "({tag}) #682: `scrub_timestamp` keeps its job unchanged — it is the producer's \
-             assertion and is bound into the signed envelope; the fix adds a position beside it \
-             rather than rewriting it"
-        );
-
-        // And the record's own bytes carry no node-local field: one record must
-        // hash identically on every node while each keeps its own arrival
-        // order. That separation is the reason `admitted_at` lives on
-        // `ServedKeyRecord` and not on `KeyRecord`.
-        let stored = directory
-            .lookup_public_key(&late)
-            .await?
-            .unwrap_or_else(|| panic!("({tag}) #682: the late record must be stored"));
-        assert_eq!(
-            serde_json::to_vec(&crate::federation::SignedKeyRecord {
-                record: stored.clone()
-            })
-            .expect("serialize stored"),
-            serde_json::to_vec(&crate::federation::SignedKeyRecord {
-                record: served.record.clone()
-            })
-            .expect("serialize served"),
-            "({tag}) #682: the SERVED record must be byte-identical to the STORED one — the \
-             admission position rides beside the record, never inside it"
-        );
-        Ok(())
-    }
-
-    /// **v31.4.0 (CIRISPersist#668) — a tie LARGER THAN ONE PAGE resumes
-    /// instead of losing its remainder.**
-    ///
-    /// Call after planting: every `expected` row must already share ONE
-    /// `admitted_at`, and `expected.len()` must exceed `page`. The tie cannot
-    /// be produced through the write path — `monotonic_admission_instant`
-    /// allocates strictly above the last position, so two admissions on this
-    /// node never collide — but it is reachable in production two ways, which
-    /// is why this is planted rather than skipped:
-    ///
-    /// - the **V126 backfill** stamps every pre-existing row with its
-    ///   `scrub_timestamp`, and a batch replicated from one producer shares
-    ///   one; and
-    /// - two writers racing read the same `MAX` and tie (the postgres door
-    ///   reads over a connection pool, not under a process-local lock).
-    ///
-    /// Resumed on the instant ALONE, a page ends mid-tie and the next read asks
-    /// for `> instant`, which skips every remaining row at that instant —
-    /// silently, and permanently. Resumed on the `(instant, key_id)` PAIR it
-    /// continues where it stopped.
-    pub async fn assert_one_admission_instant_pages_exactly_once(
-        directory: &dyn FederationDirectory,
-        tag: &str,
-        expected: &[String],
-        page: u32,
-    ) -> Result<(), Error> {
-        assert!(
-            expected.len() > page as usize,
-            "({tag}) #668: the tie must be LARGER than one page or the witness cannot fail — \
-             {} rows against a page of {page}",
-            expected.len()
-        );
-        // The plant is verified, not assumed: a witness whose setup silently
-        // did nothing passes for the wrong reason.
-        let all = directory
-            .list_signed_key_records_since(None, u32::MAX)
-            .await?;
-        let tied: Vec<_> = all
-            .iter()
-            .filter(|r| expected.contains(&r.record.key_id))
-            .collect();
-        assert_eq!(
-            tied.len(),
-            expected.len(),
-            "({tag}) #668: every planted row must be readable before paging is measured"
-        );
-        let instants: std::collections::BTreeSet<_> = tied.iter().map(|r| r.admitted_at).collect();
-        assert_eq!(
-            instants.len(),
-            1,
-            "({tag}) #668: the planted rows must share exactly ONE admission instant, or this \
-             witness is not measuring a tie at all — got {instants:?}"
-        );
-
-        let mut cursor: Option<(chrono::DateTime<chrono::Utc>, String)> = None;
-        let mut seen: Vec<String> = Vec::new();
-        // A ceiling on page reads: without one, a cursor that fails to advance
-        // spins forever instead of failing.
-        let ceiling = all.len() * 2 + 8;
-        let mut pages = 0usize;
-        loop {
-            assert!(
-                pages < ceiling,
-                "({tag}) #668: the cursor stopped advancing — {pages} pages over {} rows",
-                all.len()
-            );
-            pages += 1;
-            let rows = directory
-                .list_signed_key_records_since(cursor.clone(), page)
-                .await?;
-            let Some(last) = rows.last() else { break };
-            for r in &rows {
-                if expected.contains(&r.record.key_id) {
-                    seen.push(r.record.key_id.clone());
-                }
-            }
-            cursor = Some((last.admitted_at, last.record.key_id.clone()));
-        }
-
-        let mut sorted = seen.clone();
-        sorted.sort();
-        let mut deduped = sorted.clone();
-        deduped.dedup();
-        assert_eq!(
-            sorted, deduped,
-            "({tag}) #668: a row was served TWICE while paging a tie — {seen:?}"
-        );
-        let mut want: Vec<String> = expected.to_vec();
-        want.sort();
-        assert_eq!(
-            sorted,
-            want,
-            "({tag}) #668: paging a tie of {} rows {page} at a time must yield every row EXACTLY \
-             once. Resumed on the instant alone, the read after the first page asks for \
-             `> instant` and skips the rest of the tie — silently, and forever.",
-            expected.len()
-        );
-        Ok(())
-    }
-
-    /// **v31.4.0 (CIRISPersist#682) — the admission position survives a
-    /// BACKWARD CLOCK STEP, on this backend's real write path.**
-    ///
-    /// Call after planting every stored position to `future` — an instant an
-    /// hour ahead of the wall clock, which is what a node looks like after an
-    /// NTP correction or a VM restore. Two admissions under a forward clock
-    /// would pass with a bare `Utc::now()` and prove nothing, which is why the
-    /// post-step state is planted rather than waited for.
-    ///
-    /// The allocator's rule is unit-tested in `federation::types`. What this
-    /// asserts, and a unit test cannot, is that it is actually WIRED into
-    /// `put_public_key` on this backend.
-    ///
-    /// It says nothing about the allocator reading the *fallback* position —
-    /// this plant writes the `admitted_at` column itself, which a bare
-    /// `MAX(admitted_at)` sees. That is a separate claim with its own witness:
-    /// [`assert_allocator_reads_the_fallback_position`].
-    pub async fn assert_key_admission_survives_backward_step(
-        directory: &dyn FederationDirectory,
-        tag: &str,
-        future: chrono::DateTime<chrono::Utc>,
-    ) -> Result<(), Error> {
-        // The plant is verified, not assumed.
-        let before = directory
-            .list_signed_key_records_since(None, u32::MAX)
-            .await?;
-        assert!(
-            !before.is_empty(),
-            "({tag}) #682: the backward-step plant needs at least one existing row"
-        );
-        let planted_max = before
-            .iter()
-            .map(|r| (r.admitted_at, r.record.key_id.clone()))
-            .max()
-            .expect("non-empty");
-        assert_eq!(
-            planted_max.0, future,
-            "({tag}) #682: the plant did not take — the last position handed out must be the \
-             stepped-forward instant, or the next admission is not being asked the question"
-        );
-
-        // The consumer has read everything and holds the post-step cursor.
-        let admitted_after_step = format!("k682-step-{tag}");
-        directory
-            .put_public_key(crate::federation::SignedKeyRecord {
-                record: self_scrubbed_record_signed_at(
-                    &admitted_after_step,
-                    truncate_to_micros(chrono::Utc::now()),
-                ),
-            })
-            .await?;
-
-        let resumed = directory
-            .list_signed_key_records_since(Some(planted_max.clone()), u32::MAX)
-            .await?;
-        let served = resumed
-            .iter()
-            .find(|r| r.record.key_id == admitted_after_step)
-            .unwrap_or_else(|| {
-                panic!(
-                    "({tag}) #682: a record admitted AFTER a backward clock step must still sort \
-                     after every row admitted before it. Stamped from the bare wall clock it \
-                     lands an hour BELOW the cursor {planted_max:?} a consumer already passed, \
-                     and `> since` skips it permanently. Served: {:?}",
-                    resumed.iter().map(|r| &r.record.key_id).collect::<Vec<_>>()
-                )
-            });
-        assert!(
-            served.admitted_at > future,
-            "({tag}) #682: the new position must be strictly above the stepped-forward one — got \
-             {}, planted {future}",
-            served.admitted_at
-        );
-        Ok(())
-    }
-
-    /// **v31.4.0 (CIRISPersist#682) — THE ALLOCATOR READS THE EXPRESSION THE
-    /// READER READS**, on the backends whose position can come from a fallback.
-    ///
-    /// Call after planting one row that has NO stored position, so its
-    /// effective position is its `scrub_timestamp` — and plant that instant in
-    /// the FUTURE, so the fallback is the largest position in the table.
-    ///
-    /// This is only reachable where the column is nullable: the sqlite dialect,
-    /// whose `ALTER TABLE` cannot add a NOT NULL column to a populated table
-    /// and cannot alter nullability in place, and memory, which mirrors it.
-    /// Postgres sets NOT NULL after the V126 backfill and has no such row, so
-    /// it correctly reads the bare column and is deliberately not driven here.
-    ///
-    /// The cursor already reads the fallback — `COALESCE(admitted_at,
-    /// scrub_timestamp)`, and `key_record_position` in memory. If the ALLOCATOR
-    /// does not, it is blind to a position the reader can see, and it stamps
-    /// the next admission BELOW that row. A consumer whose cursor has passed
-    /// the fallback row then never sees the new one: #682 exactly, re-entering
-    /// through the allocator instead of through the cursor.
-    pub async fn assert_allocator_reads_the_fallback_position(
-        directory: &dyn FederationDirectory,
-        tag: &str,
-        unstamped_key_id: &str,
-        fallback_at: chrono::DateTime<chrono::Utc>,
-    ) -> Result<(), Error> {
-        // The plant is verified, not assumed: the cursor must actually be
-        // serving this row AT its fallback instant, or the allocator is not
-        // being asked the question.
-        let before = directory
-            .list_signed_key_records_since(None, u32::MAX)
-            .await?;
-        let planted = before
-            .iter()
-            .find(|r| r.record.key_id == unstamped_key_id)
-            .unwrap_or_else(|| panic!("({tag}) #682: the unstamped row must be served at all"));
-        assert_eq!(
-            planted.admitted_at, fallback_at,
-            "({tag}) #682: the unstamped row's position must come from the FALLBACK — if it does \
-             not, the plant did not take and this witness cannot fail"
-        );
-        assert_eq!(
-            before
-                .iter()
-                .map(|r| r.admitted_at)
-                .max()
-                .expect("non-empty"),
-            fallback_at,
-            "({tag}) #682: the fallback row must hold the LARGEST position in the table, or an \
-             allocator that ignores it would still land above everything by accident"
-        );
-
-        let after_fallback = format!("k682-fb-{tag}");
-        directory
-            .put_public_key(crate::federation::SignedKeyRecord {
-                record: self_scrubbed_record_signed_at(
-                    &after_fallback,
-                    truncate_to_micros(chrono::Utc::now()),
-                ),
-            })
-            .await?;
-
-        let resumed = directory
-            .list_signed_key_records_since(
-                Some((fallback_at, unstamped_key_id.to_owned())),
-                u32::MAX,
-            )
-            .await?;
-        let served = resumed
-            .iter()
-            .find(|r| r.record.key_id == after_fallback)
-            .unwrap_or_else(|| {
-                panic!(
-                    "({tag}) #682: the next admission must sort ABOVE a row whose position comes \
-                     from the `scrub_timestamp` fallback. An allocator reading only the stored \
-                     column cannot see that row, stamps below it, and the new record is invisible \
-                     to every consumer already past it. Served: {:?}",
-                    resumed.iter().map(|r| &r.record.key_id).collect::<Vec<_>>()
-                )
-            });
-        assert!(
-            served.admitted_at > fallback_at,
-            "({tag}) #682: the new position must be strictly above the fallback one — got {}, \
-             fallback {fallback_at}",
-            served.admitted_at
-        );
-        Ok(())
-    }
 }
 
 #[cfg(test)]
@@ -3617,7 +3320,10 @@ mod tests {
         let directory = engine.federation_directory();
 
         // (a) valid hybrid-signed registration → ADMITTED + stored.
-        let valid_id = format!("peer-valid-{run_tag}");
+        // v59.0.0 (CIRISPersist#1103, CC 2.6.8) — the id names its own key.
+        let valid_id = crate::federation::tier_ingest::test_support::fp_key_id(&format!(
+            "peer-valid-{run_tag}"
+        ));
         let rec =
             signed_self_record(&valid_id, identity_type::AGENT, None, false, false, false).await;
         engine
@@ -3640,7 +3346,9 @@ mod tests {
         // missing (a wrong-curve key was stored unchallenged and only failed
         // at read). Self-signed (scrub_key_id == key_id) so it reaches the
         // store path directly.
-        let wrongcurve_id = format!("peer-wrongcurve-{run_tag}");
+        let wrongcurve_id = crate::federation::tier_ingest::test_support::fp_key_id(&format!(
+            "peer-wrongcurve-{run_tag}"
+        ));
         let mut wrongcurve = signed_self_record(
             &wrongcurve_id,
             identity_type::AGENT,
@@ -3671,7 +3379,9 @@ mod tests {
 
         // (b) bad/missing ML-DSA-65 (hybrid-pending under Strict) →
         // REJECTED, NOT stored. THE load-bearing fail-secure guard.
-        let pending_id = format!("peer-pending-{run_tag}");
+        let pending_id = crate::federation::tier_ingest::test_support::fp_key_id(&format!(
+            "peer-pending-{run_tag}"
+        ));
         let pending = signed_self_record(
             &pending_id,
             identity_type::AGENT,
@@ -3700,7 +3410,9 @@ mod tests {
         );
 
         // (b') bad Ed25519 signature → REJECTED, NOT stored.
-        let bad_ed_id = format!("peer-bad-ed-{run_tag}");
+        let bad_ed_id = crate::federation::tier_ingest::test_support::fp_key_id(&format!(
+            "peer-bad-ed-{run_tag}"
+        ));
         let bad_ed = signed_self_record(
             &bad_ed_id,
             identity_type::AGENT,
@@ -3726,7 +3438,9 @@ mod tests {
 
         // (c) tampered registration_envelope (sig doesn't match) →
         // REJECTED.
-        let tampered_id = format!("peer-tampered-{run_tag}");
+        let tampered_id = crate::federation::tier_ingest::test_support::fp_key_id(&format!(
+            "peer-tampered-{run_tag}"
+        ));
         let tampered = signed_self_record(
             &tampered_id,
             identity_type::AGENT,
@@ -3754,7 +3468,9 @@ mod tests {
         // hardware attestation → REJECTED (existing accord-holder gate
         // in put_public_key is preserved — the registration is
         // hybrid-valid but the accord_holder gate refuses it).
-        let accord_id = format!("peer-accord-{run_tag}");
+        let accord_id = crate::federation::tier_ingest::test_support::fp_key_id(&format!(
+            "peer-accord-{run_tag}"
+        ));
         let accord = signed_self_record(
             &accord_id,
             identity_type::ACCORD_HOLDER,
@@ -3779,7 +3495,9 @@ mod tests {
 
         // (f) non-hybrid algorithm → REJECTED (existing check preserved;
         // caught by the registration gate's fail-fast).
-        let nonhybrid_id = format!("peer-nonhybrid-{run_tag}");
+        let nonhybrid_id = crate::federation::tier_ingest::test_support::fp_key_id(&format!(
+            "peer-nonhybrid-{run_tag}"
+        ));
         let mut nonhybrid = signed_self_record(
             &nonhybrid_id,
             identity_type::AGENT,
@@ -3808,7 +3526,9 @@ mod tests {
         // register a fresh peer then deregister it via a revocation;
         // a revocation row is then queryable for the key (the consumer
         // applies its policy on read and ceases admitting).
-        let dereg_id = format!("peer-dereg-{run_tag}");
+        let dereg_id = crate::federation::tier_ingest::test_support::fp_key_id(&format!(
+            "peer-dereg-{run_tag}"
+        ));
         let dereg =
             signed_self_record(&dereg_id, identity_type::AGENT, None, false, false, false).await;
         engine
@@ -3972,6 +3692,59 @@ mod tests {
         run_register_matrix(&engine, "sqlite").await;
     }
 
+    /// **I1153 at the registration door** (CIRISPersist#1103, CC 2.6.8):
+    /// `Engine::register_federation_key` refuses an id that does not name its
+    /// own key and admits one that does.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    async fn i1153_registration_door(engine: &Engine, run_tag: &str) {
+        let bad = format!("i1153-reg-bad-{run_tag}");
+        let rec = signed_self_record(&bad, identity_type::AGENT, None, false, false, false).await;
+        match engine
+            .register_federation_key(SignedKeyRecord { record: rec })
+            .await
+        {
+            Err(Error::MalformedRow {
+                reason: "key_id_fingerprint_mismatch",
+                ..
+            }) => {}
+            other => panic!("I1153: a mismatched id registered: {other:?}"),
+        }
+        let good = crate::federation::tier_ingest::test_support::fp_key_id(&format!(
+            "i1153-reg-{run_tag}"
+        ));
+        let rec = signed_self_record(&good, identity_type::AGENT, None, false, false, false).await;
+        engine
+            .register_federation_key(SignedKeyRecord { record: rec })
+            .await
+            .expect("I1153: a matching id registers");
+        let dir = engine.federation_directory();
+        assert!(dir.lookup_public_key(&good).await.unwrap().is_some());
+        assert!(dir.lookup_public_key(&bad).await.unwrap().is_none());
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn i1153_registration_door_sqlite() {
+        let engine = Engine::with_signer(test_signer(), "sqlite::memory:")
+            .await
+            .expect("construct sqlite engine");
+        i1153_registration_door(&engine, "sqlite").await;
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn i1153_registration_door_postgres() {
+        let Some(dsn) = crate::test_pg::dsn() else {
+            return;
+        };
+        let engine = Engine::with_signer(test_signer(), &dsn)
+            .await
+            .expect("construct postgres engine");
+        i1153_registration_door(&engine, &format!("pg-{}", uuid::Uuid::new_v4().simple())).await;
+        eprintln!("i1153_registration_door_postgres: RAN");
+    }
+
     #[cfg(feature = "postgres")]
     #[tokio::test]
     #[serial_test::serial(postgres)]
@@ -4000,7 +3773,10 @@ mod tests {
 
     /// Apply one replicated record through the Engine wrapper.
     async fn apply_one(engine: &Engine, record: KeyRecord) -> ReplicatedKeyOutcome {
+        // v59.0.0: the Engine's framed door is retired; the trait method is
+        // the `key:record:v1` row door's executor, and this table is its.
         engine
+            .federation_directory()
             .apply_replicated_key_record(SignedKeyRecord { record })
             .await
             .expect("apply_replicated_key_record")
@@ -4416,6 +4192,7 @@ mod tests {
         // `Superseded` or `Inserted` here would be the canonical's own baked
         // record re-scrubbing itself — the hijack this test is named for.
         let outcome = engine
+            .federation_directory()
             .apply_replicated_key_record(sr.clone())
             .await
             .expect("apply");

@@ -25,10 +25,11 @@
 //!   attested by its signer about the identity; its revocation is a
 //!   `withdraws` on that row by the identity (admitted, the projection fed),
 //!   never by an unrelated key; the projection is its rebuild.
-//! - **I980 (the lazy rehome, sqlite and postgres)** — a pre-V198 key record
-//!   that proves possession gets its row at the first key-plane write of a
-//!   fresh backend, asserted at its own `scrub_timestamp`; one that cannot
-//!   stays held without a row and the gate names it.
+//! - **I980 (the rehome, sqlite and postgres)** — a pre-V198 key record
+//!   that proves possession gets its row when a fresh backend opens (v58:
+//!   at its first key-plane write; v59.0.0: eager, at `run_migrations`),
+//!   asserted at its own `scrub_timestamp`; one that cannot stays held
+//!   without a row and the gate names it.
 
 #[cfg(test)]
 pub(crate) mod bodies {
@@ -152,7 +153,8 @@ pub(crate) mod bodies {
     /// I976 — proof of possession, at the plan and at the attestation door;
     /// a genuine row replicates to a fresh node.
     pub(crate) async fn i976_proof_of_possession<B: AttestationStore>(a: &B, fresh: &B, tag: &str) {
-        let x = format!("i976-x-{tag}");
+        // v59.0.0 (CIRISPersist#1103) — the id names its own key.
+        let x = ts::fp_key_id(&format!("i976-x-{tag}"));
         let y = format!("i976-y-{tag}");
         // x's pubkeys, y's private key, claiming x as the signer.
         let (edx, mldsax) = ts::hybrid_pubkeys(&x);
@@ -232,7 +234,8 @@ pub(crate) mod bodies {
 
     /// I977 — the order rule: retryable until the signer's key row is held.
     pub(crate) async fn i977_order_rule<B: AttestationStore>(a: &B, fresh: &B, tag: &str) {
-        let k = format!("i977-k-{tag}");
+        // v59.0.0 (CIRISPersist#1103) — the id names its own key.
+        let k = ts::fp_key_id(&format!("i977-k-{tag}"));
         a.put_public_key(SignedKeyRecord {
             record: pop_record(&k),
         })
@@ -373,9 +376,13 @@ pub(crate) mod bodies {
         let id = format!("i979-id-{tag}");
         let occ = format!("i979-occ-{tag}");
         let stranger = format!("i979-stranger-{tag}");
-        for k in [&id, &occ, &stranger] {
+        // v59.0.0 (#1099) — the occurrence is an AGENT key, not a roster key:
+        // the identity's withdrawal of it lands at once (the two-key roster
+        // rule is held by `self_roster_invariants`).
+        for k in [&id, &stranger] {
             ts::register_identity_key(b, k, identity_type::USER).await;
         }
+        ts::register_identity_key(b, &occ, identity_type::AGENT).await;
         let at = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(
             (chrono::Utc::now() - chrono::Duration::seconds(120)).timestamp_millis(),
         )
@@ -544,8 +551,10 @@ mod run {
         );
     }
 
-    /// I980 — the lazy rehome on sqlite: a pre-V198 state (rows deleted,
-    /// pointers NULL) on a file database, reopened by a fresh backend.
+    /// I980 — the rehome on sqlite: a pre-V198 state (rows deleted, pointers
+    /// NULL) on a file database, reopened by a fresh backend. v59.0.0
+    /// (sealed-transport floor): the rehome is EAGER, at open — the provable
+    /// record has its row before any write.
     #[cfg(feature = "sqlite")]
     #[tokio::test(flavor = "multi_thread")]
     async fn i980_sqlite() {
@@ -580,19 +589,10 @@ mod run {
             .await
             .unwrap();
         b.run_migrations().await.unwrap();
-        assert!(
-            bodies::key_row(b.as_dyn_directory(), &k).await.is_none(),
-            "I980: before the rehome"
-        );
-        // The first key-plane write rehomes.
-        b.put_public_key(crate::federation::SignedKeyRecord {
-            record: bodies::pop_record(&format!("i980-trigger-{t}")),
-        })
-        .await
-        .unwrap();
+        // v59.0.0 — no write in between: the open rehomed it.
         let row = bodies::key_row(b.as_dyn_directory(), &k)
             .await
-            .expect("I980: the provable legacy record is rehomed");
+            .expect("I980: the provable legacy record is rehomed at open");
         assert_eq!(
             row.asserted_at,
             crate::federation::admission::truncate_to_substrate_resolution(scrub_ts),
@@ -699,7 +699,7 @@ mod run {
     }
 
     /// I980 on postgres: the pre-V198 state on the same database, read by a
-    /// fresh backend.
+    /// fresh backend; v59.0.0, rehomed at open.
     #[cfg(feature = "postgres")]
     #[tokio::test(flavor = "multi_thread")]
     async fn i980_postgres() {
@@ -734,18 +734,10 @@ mod run {
             .await
             .unwrap();
         b.run_migrations().await.unwrap();
-        assert!(
-            bodies::key_row(b.as_dyn_directory(), &k).await.is_none(),
-            "I980: before the rehome"
-        );
-        b.put_public_key(crate::federation::SignedKeyRecord {
-            record: bodies::pop_record(&format!("i980-trigger-{t}")),
-        })
-        .await
-        .unwrap();
+        // v59.0.0 — no write in between: the open rehomed it.
         let row = bodies::key_row(b.as_dyn_directory(), &k)
             .await
-            .expect("I980: the provable legacy record is rehomed");
+            .expect("I980: the provable legacy record is rehomed at open");
         assert_eq!(
             row.asserted_at,
             crate::federation::admission::truncate_to_substrate_resolution(scrub_ts),

@@ -392,6 +392,27 @@ where
     let consent_change = super::consent_list_change_of(dir, &attestation.attestation).await;
     let occurrence_withdrawal =
         super::key_plane::occurrence_withdrawal_of(dir, &attestation.attestation).await?;
+    // v59.0.0 (CIRISPersist#1104) — an admitted carrier feeds the same
+    // projection as a `withdraws` of the occurrence row.
+    let carried_revocation =
+        super::occurrence_revocation_carrier::carrier_of_row(&attestation.attestation)
+            .and_then(|f| f.revocation().ok());
+    // v59.0.0 (CIRISPersist#1099, CC 3.3.6.3) — the row as offered, for the
+    // self-roster door: an eviction of a live roster key is a proposal. The
+    // genesis key's eviction (a `withdraws` of the self pair's occurrence row
+    // by another roster key) is one of these.
+    let offered_withdrawal = occurrence_withdrawal
+        .is_some()
+        .then(|| attestation.attestation.clone());
+    // v59.0.0 (CIRISPersist#1099) — a proposal or an answer to one, executed
+    // after it is stored.
+    // v59.0.0 (CIRISPersist#1106) — a quorum re-bind, applied after it is
+    // stored.
+    let rebind_row = super::transport_rebind::is_rebind_row(&attestation.attestation)
+        .then(|| attestation.attestation.clone());
+    let roster_row = (super::self_roster::is_proposal_row(&attestation.attestation)
+        || super::self_roster::answer_identity(&attestation.attestation).is_some())
+    .then(|| attestation.attestation.clone());
     // v56.0.0 (CIRISPersist#934, CC review condition 1) — the ONE clock read
     // of this door, and the row's signed instant: the plan's two inputs. The
     // plan reads no clock of its own and the executor reads none either. A
@@ -411,13 +432,30 @@ where
                 }
                 AttestationOutcome::AlreadyHeld
             }
-            AttestationPlan::Insert(planned) => execute_planned(dir, *planned).await?,
+            AttestationPlan::Insert(planned) => {
+                if let (Some(offered), Some(revocation)) =
+                    (&offered_withdrawal, &occurrence_withdrawal)
+                {
+                    super::self_roster::gate_withdrawal(dir, offered, revocation).await?;
+                }
+                execute_planned(dir, *planned).await?
+            }
         };
         Ok(outcome)
     }
     .await;
     if let (Ok(AttestationOutcome::Inserted), Some((owner, node))) = (&outcome, consent_change) {
         super::rewrap_after_admission(dir, &owner, &node).await;
+    }
+    if let (Ok(AttestationOutcome::Inserted | AttestationOutcome::AlreadyHeld), Some(row)) =
+        (&outcome, &roster_row)
+    {
+        super::self_roster::after_admission(dir, row).await;
+    }
+    if let (Ok(AttestationOutcome::Inserted | AttestationOutcome::AlreadyHeld), Some(row)) =
+        (&outcome, &rebind_row)
+    {
+        super::transport_rebind::after_admission(dir, row).await?;
     }
     // v58.0.0 (CIRISPersist#991, CC 3.3.6) — an admitted `withdraws` against an
     // `identity:occurrence:v1` row feeds the occurrence-revocation projection
@@ -429,7 +467,8 @@ where
     // already revoked by either route keeps the revocation it holds: the first
     // to land fixes the instants, and neither route rewrites (or un-revokes)
     // the other.
-    if let (Ok(AttestationOutcome::Inserted), Some(revocation)) = (&outcome, occurrence_withdrawal)
+    if let (Ok(AttestationOutcome::Inserted), Some(revocation)) =
+        (&outcome, occurrence_withdrawal.or(carried_revocation))
     {
         let held = dir
             .list_identity_occurrence_revocations_for(&revocation.identity_key_id)
@@ -1127,6 +1166,9 @@ where
         dir, &row, fold_at,
     )
     .await?;
+    // v59.0.0 (CIRISPersist#1106, CC 5.3.4) — a serve node's transit-pair
+    // re-bind is a holder-quorum act.
+    crate::federation::transport_rebind::check_rebind_admission(dir, &row).await?;
     // CC 3.1.3.3 — `custody:ack:v1` is a holder self-report, placed within
     // the blob's own cohort (v53.0.0, CIRISPersist#942 part 2).
     crate::federation::custody_ack::check_custody_ack_admission(dir, &row).await?;

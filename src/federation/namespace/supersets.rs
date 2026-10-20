@@ -1756,7 +1756,10 @@ mod tests {
         // CLM-planes-as-rows: the key plane) and +4 (CC rc8 vendor,
         // CLM-polarity-admission) and +1 (CLM-halt-not-a-trust-leg's second
         // anchor, the retired halt-latched row replaced) over v57.0.0's 275.
-        const EXPECTED: usize = 297;
+        // v59.0.0: +5 (CIRISPersist#1099, CC 3.3.6.3): CLM-self-roster-authority
+        // at the steward predicate and its two gates (3), CLM-self-roster-two-paths
+        // at the shared decision and the self-roster door (2).
+        const EXPECTED: usize = 311;
         assert_eq!(
             checked, EXPECTED,
             "checked {checked} version-pinned persist src/ rows, expected {EXPECTED}. \

@@ -57,6 +57,12 @@ from pathlib import Path
 # predating this list, tracked separately rather than resolved by a sweep that
 # cannot tell a leaf from a composition.
 DELEGATED_DEFAULTS = (
+    # v59.0.0 (#1099) — defaulted `Unsupported`, overridden by every backend:
+    # the V199 self-roster proposal ledger.
+    "note_self_roster_proposal",
+    "list_open_self_roster_proposals",
+    "list_settled_self_roster_proposals",
+    "settle_self_roster_proposal",
     # v53.1.6 — defaulted `Unsupported`, overridden by every backend (the
     # V150 cohort_target seek has no unbounded twin to compose).
     "list_targeted_by_dimension_prefix",

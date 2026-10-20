@@ -2,10 +2,12 @@
 //! verification, and nothing else does.** Witnesses for
 //! [`replication_policy::settle_if_held`](super::replication_policy::settle_if_held).
 //!
-//! - **I230** (memory, sqlite, postgres) — every seeded kind (Key,
-//!   Attestation, Revocation, LocationProof, Family, Community), re-offered as
-//!   the bytes this node serves, answers "already held" through its door and
-//!   counts on `already_held_count`.
+//! - **I230** (memory, sqlite, postgres) — every seeded kind (Attestation —
+//!   which carries the key and its revocation as key-plane rows —
+//!   LocationProof, Family, Community), re-offered as the bytes this node
+//!   serves, answers "already held" through its door and counts on
+//!   `already_held_count`; the retired framed `Key` / `Revocation` kinds are
+//!   never indexed (v59.0.0).
 //! - **I231** — a differing body under a held id is not settled (the door
 //!   refuses it on its merits), and a held-but-purged row whose index entry
 //!   survives is not settled (it is admitted again).
@@ -208,22 +210,19 @@ pub(crate) mod bodies {
             .collect();
         // v58.0.0 (CIRISPersist#991) — the key and the revocation are
         // `key:record:v1` / `key:revocation:v1` rows: Attestation-kind entries
-        // under their row ids, settled by the key-plane door (I975+). Their
-        // framed `Key` / `Revocation` entries stay indexed beside the rows
-        // (compat reads, operator ruling 2026-10-18).
-        for kind in [
-            "Key",
-            "Attestation",
-            "Revocation",
-            "LocationProof",
-            "Family",
-            "Community",
-        ] {
+        // under their row ids, settled by the key-plane door (I975+). v59.0.0
+        // (sealed-transport floor) — their framed `Key` / `Revocation` entries
+        // are no longer indexed.
+        for kind in ["Attestation", "LocationProof", "Family", "Community"] {
             assert!(
                 mine.iter().any(|(k, _)| k == kind),
                 "[{tag}] I230: no {kind} ref seeded; got {mine:?}"
             );
         }
+        assert!(
+            !mine.iter().any(|(k, _)| k == "Key" || k == "Revocation"),
+            "[{tag}] I230: a retired framed kind is indexed; got {mine:?}"
+        );
 
         for (kind, hash) in &mine {
             let bytes = dir
@@ -237,13 +236,6 @@ pub(crate) mod bodies {
                 .expect("an indexed kind is an EnvelopeKind");
             let before = already_held_count(ek);
             match kind.as_str() {
-                "Key" => assert_eq!(
-                    dir.apply_replicated_key_record(serde_json::from_slice(&bytes).unwrap())
-                        .await
-                        .unwrap(),
-                    crate::federation::register::ReplicatedKeyOutcome::Unchanged,
-                    "[{tag}] I230 Key"
-                ),
                 "Attestation" => assert_eq!(
                     dir.put_attestation(SignedAttestation {
                         attestation: serde_json::from_slice(&bytes).unwrap(),
@@ -253,10 +245,6 @@ pub(crate) mod bodies {
                     AttestationOutcome::AlreadyHeld,
                     "[{tag}] I230 Attestation"
                 ),
-                "Revocation" => dir
-                    .put_revocation(serde_json::from_slice(&bytes).unwrap())
-                    .await
-                    .unwrap_or_else(|e| panic!("[{tag}] I230 Revocation re-offer: {e}")),
                 "LocationProof" => dir
                     .put_location_proof(serde_json::from_slice(&bytes).unwrap())
                     .await
@@ -273,15 +261,6 @@ pub(crate) mod bodies {
                     "[{tag}] I230 Community"
                 ),
                 other => panic!("[{tag}] I230: unexpected kind {other}"),
-            }
-            // A settle-exempt kind (`SETTLE_EXEMPT`: the framed Key and
-            // Revocation, whose doors are their families' own) answered held
-            // above without the #672 settle; every other kind settles.
-            if crate::federation::replication_policy::SETTLE_EXEMPT
-                .iter()
-                .any(|(k, _)| *k == ek)
-            {
-                continue;
             }
             assert!(
                 already_held_count(ek) > before,
@@ -459,12 +438,6 @@ mod from_disk {
         (EnvelopeKind::Attestation, "put_attestation_with_origin"),
         (EnvelopeKind::Family, "put_family"),
         (EnvelopeKind::Community, "put_community"),
-        // v58.0.0 (compat reads, operator ruling 2026-10-18) — the framed
-        // occurrence-revocation door is an authoring door again.
-        (
-            EnvelopeKind::IdentityOccurrenceRevocation,
-            "put_identity_occurrence_revocation",
-        ),
         (
             EnvelopeKind::FamilyMembershipRevocation,
             "put_family_membership_revocation",

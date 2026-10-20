@@ -258,6 +258,10 @@ struct State {
     /// put door admitted, append-only, unique on
     /// `(identity, occurrence, asserted_at, attesting)`.
     federation_identity_occurrence_history: Vec<crate::federation::OccurrenceAssertion>,
+    /// v59.0.0 (CIRISPersist#1099) — the V199 mirror: this node's self-roster
+    /// proposal ledger, keyed by the proposal row's `attestation_id`.
+    self_roster_proposals:
+        std::collections::BTreeMap<String, crate::federation::self_roster::SelfRosterReceipt>,
     /// v14.1.0 (CIRISPersist#418, replication read) — signature container for
     /// signed-put occurrences, keyed like `federation_identity_occurrences`
     /// (`(attesting_key_id, signed_envelope, signature)`). Absent for
@@ -291,18 +295,6 @@ struct State {
     /// removal/revocation rows. Keyed by the V067 composite PKs.
     federation_identity_occurrence_revocations:
         HashMap<(String, String), crate::federation::IdentityOccurrenceRevocation>,
-    /// v16.0.0 (CIRISPersist#421, replication read) — signature container for
-    /// signed-put occurrence REVOCATIONS, keyed like the revocation map
-    /// (`(attesting_key_id, signed_envelope, signature)`). Absent for
-    /// trusted-local rows. Mirror of `federation_identity_occurrence_sigs`.
-    federation_identity_occurrence_revocation_sigs: HashMap<
-        (String, String),
-        (
-            String,
-            serde_json::Value,
-            ciris_verify_core::transport_binding::TransportBindingSignature,
-        ),
-    >,
     /// v49.0.0 (#910.1, V154 mirror) — keyed on the three-part PK
     /// `(family, member, effective_at)`: a re-added member can be removed again.
     federation_family_membership_revocations: HashMap<
@@ -994,13 +986,13 @@ impl Default for MemoryBackend {
                 federation_peer_metadata: HashMap::new(),
                 federation_identity_occurrences: HashMap::new(),
                 federation_identity_occurrence_history: Vec::new(),
+                self_roster_proposals: std::collections::BTreeMap::new(),
                 federation_identity_occurrence_sigs: HashMap::new(),
                 federation_families: HashMap::new(),
                 federation_communities: HashMap::new(),
                 federation_group_current_version: HashMap::new(),
                 federation_group_versions: HashMap::new(),
                 federation_identity_occurrence_revocations: HashMap::new(),
-                federation_identity_occurrence_revocation_sigs: HashMap::new(),
                 federation_family_membership_revocations: HashMap::new(),
                 federation_family_membership_widenings: HashMap::new(),
                 federation_community_membership_listings: HashMap::new(),
@@ -1489,13 +1481,6 @@ impl MemoryBackend {
     /// v31.0.0 (CIRISPersist#646) — the Key-plane shorthand for
     /// [`index_stored_record`](Self::index_stored_record).
     async fn index_stored_key_row(&self, key_id: &str) -> Result<(), crate::federation::Error> {
-        // v58.0.0 (compat reads, operator ruling 2026-10-18) — the framed
-        // `Key` entry a pre-v58 peer asks for, beside the row's.
-        self.index_stored_record(
-            "Key",
-            &crate::federation::wire_index::record_key(&[("key_id", key_id)]),
-        )
-        .await?;
         // v58.0.0 (CIRISPersist#991) — the key's record rides as its
         // `key:record:v1` row: the entry is that row's (the Attestation kind).
         let row_id = {
@@ -5270,6 +5255,8 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         state
             .derived_detection_events
             .retain(|_, (id, _)| id != attestation_id);
+        // v59.0.0 (#1099) — the V199 receipt (ON DELETE CASCADE).
+        state.self_roster_proposals.remove(attestation_id);
         Ok(())
     }
 
@@ -5307,6 +5294,9 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             "insert_known_wire_hash",
             content_hash,
         )?;
+        // v59.0.0 — a peer's advertisement of a framed key-plane hash is
+        // refused: that carriage is retired.
+        crate::federation::replication_policy::refuse_retired_framed(kind)?;
         let mut state = self.state.lock().expect("memory backend lock");
         // Matches the SQL backends' upsert: the same hash arrives on every
         // wrap of edge's re-sweep, and `last_advertised_at` must MOVE on each
@@ -5521,6 +5511,9 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // v14.0.0 (CIRISPersist#418) — verify the signature gate BEFORE any write
         // (before locking; the gate locks state internally). Backend-symmetric.
         crate::federation::admission::verify_signed_identity_occurrence(self, &occurrence).await?;
+        // v59.0.0 (CIRISPersist#1099, CC 3.3.6.3) — a roster change lands by
+        // the two-path door or is held as a proposal.
+        crate::federation::self_roster::gate_occurrence(self, &occurrence).await?;
         let mut row = occurrence.identity_occurrence;
         crate::federation::check_device_class(&row.device_class)?;
         crate::federation::check_encryption_pubkeys(row.encryption_pubkeys.as_ref())?;
@@ -5530,8 +5523,6 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // v31.0.0 (CIRISPersist#646) — same for the wire-index derivation: it
         // reloads through the read surface, which takes this lock.
         let mut indexed: Option<String> = None;
-        // v58.0.0 (compat reads) — the framed `IdentityOccurrence` entry.
-        let mut framed_indexed: Option<String> = None;
         let projected_route = {
             let mut state = self.state.lock().expect("memory backend lock");
             if !state.federation_keys.contains_key(&row.identity_key_id) {
@@ -5591,10 +5582,6 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                 stamp_plane_position(&mut state, PLANE_IDENTITY_OCCURRENCE, resume, admitted_at);
                 // v58.0.0 (CIRISPersist#991) — and its `identity:occurrence:v1` row.
                 memory_sync_occurrence_row(&mut state, &key);
-                framed_indexed = Some(crate::federation::wire_index::record_key(&[
-                    ("identity_key_id", &key.0),
-                    ("occurrence_key_id", &key.1),
-                ]));
                 indexed = state
                     .federation_attestations
                     .iter()
@@ -5606,10 +5593,6 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // v58.0.0 (CIRISPersist#991) — the pair's `identity:occurrence:v1` row
         // is a wire-index entry (the Attestation kind); the framed
         // `IdentityOccurrence` entry stays beside it for pre-v58 peers.
-        if let Some(framed) = framed_indexed {
-            self.index_stored_record("IdentityOccurrence", &framed)
-                .await?;
-        }
         self.index_plane_row(indexed.as_deref()).await?;
         if let Some(route) = &projected_route {
             crate::federation::FederationDirectory::put_transport_destination(self, route).await?;
@@ -5782,6 +5765,9 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // #443 — the admission gate BEFORE any write (before locking; the
         // gate locks state internally). Backend-symmetric.
         crate::federation::admission::verify_signed_transport_destination(self, signed).await?;
+        // v59.0.0 (CIRISPersist#1106, CC 5.3.4) — a seated serve node's
+        // bundle-pinned transit pair rotates by holder quorum, not alone.
+        crate::federation::transport_rebind::check_serve_rotation(self, signed).await?;
         let d = &signed.transport_destination;
         let (wire_index_key, fresh) = {
             let mut state = self.state.lock().expect("memory backend lock");
@@ -7024,125 +7010,6 @@ impl crate::federation::FederationDirectory for MemoryBackend {
 
     // ─── v4.8.0 (CIRISPersist#161, CEG §11.7.1) — membership revocations.
 
-    async fn put_identity_occurrence_revocation(
-        &self,
-        revocation: crate::federation::SignedIdentityOccurrenceRevocation,
-    ) -> Result<(), crate::federation::Error> {
-        // v52.0.0 (CIRISPersist#672) — a re-offer of a held record settles here,
-        // before any verification (`replication_policy::settle_if_held`).
-        if crate::federation::replication_policy::settle_if_held(
-            self,
-            crate::federation::replication_policy::EnvelopeKind::IdentityOccurrenceRevocation,
-            &revocation,
-        )
-        .await?
-        {
-            return Ok(());
-        }
-        // v16.0.0 (CIRISPersist#421) — verify the signature gate BEFORE any
-        // write (before locking; the gate locks state internally).
-        crate::federation::admission::verify_signed_identity_occurrence_revocation(
-            self,
-            &revocation,
-        )
-        .await?;
-        let crate::federation::SignedIdentityOccurrenceRevocation {
-            identity_occurrence_revocation: mut row,
-            attesting_key_id,
-            signed_envelope,
-            signature,
-        } = revocation;
-        let wire_index_key = {
-            let mut state = self.state.lock().expect("memory backend lock");
-            for k in [&row.identity_key_id, &row.occurrence_key_id] {
-                if !state.federation_keys.contains_key(k) {
-                    return Err(crate::federation::Error::InvalidArgument(format!(
-                        "{k} does not exist in federation_keys"
-                    )));
-                }
-            }
-            row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
-            let key = (row.identity_key_id.clone(), row.occurrence_key_id.clone());
-            // v58.0.0 (compat reads) — the pair is already revoked, by either
-            // route (this door, or a `withdraws` on its `identity:occurrence:v1`
-            // row): the first revocation to land fixes the instants and a later
-            // one settles without a write, so neither route rewrites (or
-            // un-revokes) the other. The sqlite/postgres `ON CONFLICT DO
-            // NOTHING`.
-            if state
-                .federation_identity_occurrence_revocations
-                .contains_key(&key)
-            {
-                return Ok(());
-            }
-            // v21.1.0 (CIRISPersist#507b) — computed before the moves below
-            // consume `row` / `attesting_key_id` / `signed_envelope` / `signature`.
-            let wire_index_key = crate::federation::wire_index::record_key(&[
-                ("identity_key_id", &key.0),
-                ("occurrence_key_id", &key.1),
-            ]);
-            // #421 — store the signature container in lockstep so the replication
-            // read reconstructs the tuple that was put (mirror of the occurrence
-            // sig map).
-            state
-                .federation_identity_occurrence_revocation_sigs
-                .insert(key.clone(), (attesting_key_id, signed_envelope, signature));
-            let revoked_at = row.revoked_at;
-            let occurrence_key_id = row.occurrence_key_id.clone();
-            // v36.0.0 (#668) — serve position (V130 mirror).
-            let admitted_at = next_plane_position(
-                &state,
-                PLANE_IDENTITY_OCCURRENCE_REVOCATION,
-                identity_occurrence_revocation_rows(&state).into_iter(),
-            );
-            let resume = crate::federation::types::compound_resume_id(&[&key.0, &key.1]);
-            state
-                .federation_identity_occurrence_revocations
-                .insert(key, row);
-            stamp_plane_position(
-                &mut state,
-                PLANE_IDENTITY_OCCURRENCE_REVOCATION,
-                resume,
-                admitted_at,
-            );
-            // #446 de-projection (the projection's inverse): retire the LOCAL
-            // derived route materialized from this occurrence's binding. Narrow
-            // on purpose: only the signature-free projected/local row; a live
-            // SIGNED route retires via its own #443 signed-tombstone plane.
-            let route_key = (
-                occurrence_key_id,
-                crate::federation::types::OccurrenceTransportBinding::TRANSPORT_KIND.to_owned(),
-            );
-            if !state.transport_destination_sigs.contains_key(&route_key) {
-                // v36.0.0 (#668/#707-class) — a retirement is a
-                // consumer-visible rewrite (tombstones must gossip); the
-                // route's serve position moves with it.
-                let route_admitted_at = next_plane_position(
-                    &state,
-                    PLANE_TRANSPORT_DESTINATION,
-                    transport_destination_rows(&state).into_iter(),
-                );
-                let route_resume =
-                    crate::federation::types::compound_resume_id(&[&route_key.0, &route_key.1]);
-                if let Some(route) = state.transport_destinations.get_mut(&route_key) {
-                    if route.retired_at.is_none() {
-                        route.retired_at = Some(revoked_at);
-                        stamp_plane_position(
-                            &mut state,
-                            PLANE_TRANSPORT_DESTINATION,
-                            route_resume,
-                            route_admitted_at,
-                        );
-                    }
-                }
-            }
-            wire_index_key
-        };
-        self.index_stored_record("IdentityOccurrenceRevocation", &wire_index_key)
-            .await?;
-        Ok(())
-    }
-
     async fn put_identity_occurrence_revocation_local(
         &self,
         revocation: crate::federation::IdentityOccurrenceRevocation,
@@ -7219,6 +7086,99 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                         route_admitted_at,
                     );
                 }
+            }
+        }
+        Ok(())
+    }
+
+    async fn note_self_roster_proposal(
+        &self,
+        proposal_id: &str,
+        identity_key_id: &str,
+        received_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<crate::federation::self_roster::SelfRosterReceipt, crate::federation::Error> {
+        let mut state = self.state.lock().expect("memory backend lock");
+        // V199's FK: a receipt names a held row.
+        if !state
+            .federation_attestations
+            .iter()
+            .any(|a| a.attestation_id == proposal_id)
+        {
+            return Err(crate::federation::Error::InvalidArgument(format!(
+                "self-roster proposal {proposal_id} is not a held attestation"
+            )));
+        }
+        Ok(state
+            .self_roster_proposals
+            .entry(proposal_id.to_owned())
+            .or_insert_with(|| crate::federation::self_roster::SelfRosterReceipt {
+                proposal_id: proposal_id.to_owned(),
+                identity_key_id: identity_key_id.to_owned(),
+                received_at,
+                settled_at: None,
+                outcome: None,
+            })
+            .clone())
+    }
+
+    async fn list_open_self_roster_proposals(
+        &self,
+        identity_key_id: Option<&str>,
+    ) -> Result<Vec<crate::federation::self_roster::SelfRosterReceipt>, crate::federation::Error>
+    {
+        let state = self.state.lock().expect("memory backend lock");
+        let held: std::collections::HashSet<&str> = state
+            .federation_attestations
+            .iter()
+            .map(|a| a.attestation_id.as_str())
+            .collect();
+        let mut out: Vec<_> = state
+            .self_roster_proposals
+            .values()
+            .filter(|r| r.settled_at.is_none())
+            .filter(|r| identity_key_id.is_none_or(|i| r.identity_key_id == i))
+            // V199's ON DELETE CASCADE: a receipt whose row is gone is gone.
+            .filter(|r| held.contains(r.proposal_id.as_str()))
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| (a.received_at, &a.proposal_id).cmp(&(b.received_at, &b.proposal_id)));
+        Ok(out)
+    }
+
+    async fn list_settled_self_roster_proposals(
+        &self,
+        identity_key_id: &str,
+    ) -> Result<Vec<crate::federation::self_roster::SelfRosterReceipt>, crate::federation::Error>
+    {
+        let state = self.state.lock().expect("memory backend lock");
+        let held: std::collections::HashSet<&str> = state
+            .federation_attestations
+            .iter()
+            .map(|a| a.attestation_id.as_str())
+            .collect();
+        let mut out: Vec<_> = state
+            .self_roster_proposals
+            .values()
+            .filter(|r| r.settled_at.is_some() && r.identity_key_id == identity_key_id)
+            // V199's ON DELETE CASCADE: a receipt whose row is gone is gone.
+            .filter(|r| held.contains(r.proposal_id.as_str()))
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| (a.settled_at, &a.proposal_id).cmp(&(b.settled_at, &b.proposal_id)));
+        Ok(out)
+    }
+
+    async fn settle_self_roster_proposal(
+        &self,
+        proposal_id: &str,
+        outcome: &str,
+        settled_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), crate::federation::Error> {
+        let mut state = self.state.lock().expect("memory backend lock");
+        if let Some(r) = state.self_roster_proposals.get_mut(proposal_id) {
+            if r.settled_at.is_none() {
+                r.settled_at = Some(settled_at);
+                r.outcome = Some(outcome.to_owned());
             }
         }
         Ok(())
@@ -7520,40 +7480,6 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             .cloned()
             .collect();
         rows.sort_by(|a, b| a.occurrence_key_id.cmp(&b.occurrence_key_id));
-        Ok(rows)
-    }
-
-    async fn list_signed_identity_occurrence_revocations_for(
-        &self,
-        identity_key_id: &str,
-    ) -> Result<Vec<crate::federation::SignedIdentityOccurrenceRevocation>, crate::federation::Error>
-    {
-        let state = self.state.lock().expect("memory backend lock");
-        // #421 replication read: join each revocation with its stored signature
-        // container; trusted-local rows (no sig entry) are omitted.
-        let mut rows: Vec<crate::federation::SignedIdentityOccurrenceRevocation> = state
-            .federation_identity_occurrence_revocations
-            .iter()
-            .filter(|((id, _), _)| id == identity_key_id)
-            .filter_map(|(key, rev)| {
-                state
-                    .federation_identity_occurrence_revocation_sigs
-                    .get(key)
-                    .map(|(attesting_key_id, signed_envelope, signature)| {
-                        crate::federation::SignedIdentityOccurrenceRevocation {
-                            identity_occurrence_revocation: rev.clone(),
-                            attesting_key_id: attesting_key_id.clone(),
-                            signed_envelope: signed_envelope.clone(),
-                            signature: signature.clone(),
-                        }
-                    })
-            })
-            .collect();
-        rows.sort_by(|a, b| {
-            a.identity_occurrence_revocation
-                .occurrence_key_id
-                .cmp(&b.identity_occurrence_revocation.occurrence_key_id)
-        });
         Ok(rows)
     }
 
@@ -9143,98 +9069,6 @@ impl crate::federation::FederationDirectory for MemoryBackend {
     // ─── v21.1.0 (CIRISPersist#507c) — bulk signed-since reads for the 5
     //     PRIMARY signed planes.
 
-    async fn list_signed_key_records_since(
-        &self,
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        limit: u32,
-    ) -> Result<Vec<crate::federation::ServedKeyRecord>, crate::federation::Error> {
-        let state = self.state.lock().expect("memory backend lock");
-        // Every `federation_keys` row is signed — `scrub_signature_classical`
-        // is required at admission, so there is no filter to apply here.
-        //
-        // v31.4.0 (#682) — keyed on THIS node's `admitted_at`, not the
-        // producer's `scrub_timestamp`. A record signed in January, replicated
-        // late and admitted in February, sorted under January and was never
-        // served to a consumer past it. The side map is the memory analogue of
-        // the V126 column; a row without an entry falls back to
-        // `scrub_timestamp`, matching the sqlite dialect's
-        // `COALESCE(admitted_at, scrub_timestamp)`.
-        let position = |k: &crate::federation::KeyRecord| key_record_position(&state, k);
-        // v31.4.0 (#668) — compare the PAIR. Resuming on the instant alone
-        // skips the remainder of any tie larger than one page, silently.
-        let mut rows: Vec<_> = state
-            .federation_keys
-            .values()
-            .filter(|k| {
-                since
-                    .as_ref()
-                    .is_none_or(|(s_at, s_id)| (position(k), &k.key_id) > (*s_at, s_id))
-            })
-            .cloned()
-            .collect();
-        rows.sort_by(|a, b| {
-            position(a)
-                .cmp(&position(b))
-                .then_with(|| a.key_id.cmp(&b.key_id))
-        });
-        rows.truncate(limit as usize);
-        Ok(rows
-            .into_iter()
-            .map(|record| crate::federation::ServedKeyRecord {
-                admitted_at: position(&record),
-                record,
-            })
-            .collect())
-    }
-
-    /// v31.1.0 (CIRISPersist#655) — the exclusion plane's serve cursor.
-    /// Every row is signed (`scrub_signature_classical` is required at
-    /// admission), so — as with `list_signed_key_records_since` — no filter
-    /// applies.
-    /// v31.1.0 (CIRISPersist#655) — keyed on THIS node's admission order
-    /// (`admitted_at`, the V123 column on the SQL backends and the
-    /// `revocation_admitted_at` side map here), never the producer's
-    /// `scrub_timestamp`; see the trait doc for the late-replication case that
-    /// made the signed instant permanently hide a stored exclusion.
-    async fn list_signed_revocations_since(
-        &self,
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        limit: u32,
-    ) -> Result<Vec<crate::federation::ServedRevocation>, crate::federation::Error> {
-        let state = self.state.lock().expect("memory backend lock");
-        let mut rows: Vec<crate::federation::ServedRevocation> = state
-            .federation_revocations
-            .iter()
-            .filter_map(|r| {
-                // A row with no recorded admission instant predates the side
-                // map; fall back to its signed instant, exactly as the V123
-                // backfill does on the SQL backends.
-                let admitted_at = state
-                    .revocation_admitted_at
-                    .get(&r.revocation_id)
-                    .copied()
-                    .unwrap_or(r.scrub_timestamp);
-                // v36.0.0 (#668) — the PAIR, not the instant alone.
-                since
-                    .as_ref()
-                    .is_none_or(|(s_at, s_id)| {
-                        (admitted_at, r.revocation_id.as_str()) > (*s_at, s_id.as_str())
-                    })
-                    .then(|| crate::federation::ServedRevocation {
-                        revocation: r.clone(),
-                        admitted_at,
-                    })
-            })
-            .collect();
-        rows.sort_by(|a, b| {
-            a.admitted_at
-                .cmp(&b.admitted_at)
-                .then_with(|| a.revocation.revocation_id.cmp(&b.revocation.revocation_id))
-        });
-        rows.truncate(limit as usize);
-        Ok(rows)
-    }
-
     /// v31.1.0 (CIRISPersist#662) — the signed accord EVIDENCE cursor. Page
     /// selection is over PROPOSALS; the participation set for each is
     /// assembled by the shared
@@ -9298,72 +9132,6 @@ impl crate::federation::FederationDirectory for MemoryBackend {
     ) -> Result<crate::federation::accord_carriage::AccordEvidenceAdmission, crate::federation::Error>
     {
         crate::federation::accord_carriage::admit_replicated_accord_evidence(self, evidence).await
-    }
-
-    async fn list_signed_identity_occurrences_since(
-        &self,
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        limit: u32,
-    ) -> Result<Vec<crate::federation::ServedIdentityOccurrence>, crate::federation::Error> {
-        let state = self.state.lock().expect("memory backend lock");
-        let resume_id = |o: &crate::federation::IdentityOccurrence| {
-            crate::federation::types::compound_resume_id(&[
-                &o.identity_key_id,
-                &o.occurrence_key_id,
-            ])
-        };
-        let position = |o: &crate::federation::IdentityOccurrence| {
-            plane_position(
-                &state,
-                PLANE_IDENTITY_OCCURRENCE,
-                &resume_id(o),
-                o.asserted_at,
-            )
-        };
-        let since_parts = since.as_ref().map(|(s_at, s_id)| {
-            let [a, b] = crate::federation::types::split_resume_id::<2>(s_id);
-            (*s_at, a.to_owned(), b.to_owned())
-        });
-        // Signed-put rows only (join against the sig side-map); trusted-
-        // local rows (no sig entry) are omitted.
-        let mut rows: Vec<crate::federation::ServedIdentityOccurrence> = state
-            .federation_identity_occurrences
-            .iter()
-            .filter(|(_, occ)| {
-                since_parts.as_ref().is_none_or(|(s_at, s_a, s_b)| {
-                    (
-                        position(occ),
-                        occ.identity_key_id.as_str(),
-                        occ.occurrence_key_id.as_str(),
-                    ) > (*s_at, s_a.as_str(), s_b.as_str())
-                })
-            })
-            .filter_map(|(key, occ)| {
-                state.federation_identity_occurrence_sigs.get(key).map(
-                    |(attesting_key_id, signed_envelope, signature)| {
-                        crate::federation::ServedIdentityOccurrence {
-                            admitted_at: position(occ),
-                            occurrence: crate::federation::SignedIdentityOccurrence {
-                                identity_occurrence: occ.clone(),
-                                attesting_key_id: attesting_key_id.clone(),
-                                signed_envelope: signed_envelope.clone(),
-                                signature: signature.clone(),
-                            },
-                        }
-                    },
-                )
-            })
-            .collect();
-        rows.sort_by(|a, b| {
-            let ao = &a.occurrence.identity_occurrence;
-            let bo = &b.occurrence.identity_occurrence;
-            a.admitted_at
-                .cmp(&b.admitted_at)
-                .then_with(|| ao.identity_key_id.cmp(&bo.identity_key_id))
-                .then_with(|| ao.occurrence_key_id.cmp(&bo.occurrence_key_id))
-        });
-        rows.truncate(limit as usize);
-        Ok(rows)
     }
 
     async fn list_signed_transport_destinations_since(
@@ -9523,74 +9291,6 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             &rows,
             0,
         );
-        Ok(rows)
-    }
-
-    async fn list_signed_identity_occurrence_revocations_since(
-        &self,
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        limit: u32,
-    ) -> Result<Vec<crate::federation::ServedIdentityOccurrenceRevocation>, crate::federation::Error>
-    {
-        let state = self.state.lock().expect("memory backend lock");
-        let resume_id = |r: &crate::federation::IdentityOccurrenceRevocation| {
-            crate::federation::types::compound_resume_id(&[
-                &r.identity_key_id,
-                &r.occurrence_key_id,
-            ])
-        };
-        let position = |r: &crate::federation::IdentityOccurrenceRevocation| {
-            plane_position(
-                &state,
-                PLANE_IDENTITY_OCCURRENCE_REVOCATION,
-                &resume_id(r),
-                r.revoked_at,
-            )
-        };
-        let since_parts = since.as_ref().map(|(s_at, s_id)| {
-            let [a, b] = crate::federation::types::split_resume_id::<2>(s_id);
-            (*s_at, a.to_owned(), b.to_owned())
-        });
-        // Signed-put rows only — same contract as
-        // `list_signed_identity_occurrence_revocations_for`.
-        let mut rows: Vec<crate::federation::ServedIdentityOccurrenceRevocation> = state
-            .federation_identity_occurrence_revocations
-            .iter()
-            .filter(|(_, rev)| {
-                since_parts.as_ref().is_none_or(|(s_at, s_a, s_b)| {
-                    (
-                        position(rev),
-                        rev.identity_key_id.as_str(),
-                        rev.occurrence_key_id.as_str(),
-                    ) > (*s_at, s_a.as_str(), s_b.as_str())
-                })
-            })
-            .filter_map(|(key, rev)| {
-                state
-                    .federation_identity_occurrence_revocation_sigs
-                    .get(key)
-                    .map(|(attesting_key_id, signed_envelope, signature)| {
-                        crate::federation::ServedIdentityOccurrenceRevocation {
-                            admitted_at: position(rev),
-                            revocation: crate::federation::SignedIdentityOccurrenceRevocation {
-                                identity_occurrence_revocation: rev.clone(),
-                                attesting_key_id: attesting_key_id.clone(),
-                                signed_envelope: signed_envelope.clone(),
-                                signature: signature.clone(),
-                            },
-                        }
-                    })
-            })
-            .collect();
-        rows.sort_by(|a, b| {
-            let ar = &a.revocation.identity_occurrence_revocation;
-            let br = &b.revocation.identity_occurrence_revocation;
-            a.admitted_at
-                .cmp(&b.admitted_at)
-                .then_with(|| ar.identity_key_id.cmp(&br.identity_key_id))
-                .then_with(|| ar.occurrence_key_id.cmp(&br.occurrence_key_id))
-        });
-        rows.truncate(limit as usize);
         Ok(rows)
     }
 
@@ -12035,10 +11735,7 @@ impl crate::federation::key_plane::KeyPlaneStore for MemoryBackend {
             key
         };
         // v58.0.0 (CIRISPersist#991) — the revocation's row is a wire-index
-        // entry (the Attestation kind); the framed `Revocation` entry stays
-        // beside it for pre-v58 peers (compat reads).
-        self.index_stored_record("Revocation", &wire_index_key.1)
-            .await?;
+        // entry (the Attestation kind); v59.0.0 retired the framed entry.
         self.index_plane_row(Some(&wire_index_key.0)).await?;
         Ok(())
     }
@@ -13984,16 +13681,7 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.kind(), "federation_invalid_argument", "{err}");
 
-        // The soft face: announced + attributed + cursor moves.
-        let before = backend
-            .list_signed_key_records_since(None, u32::MAX)
-            .await
-            .unwrap();
-        let cursor = before
-            .iter()
-            .map(|r| (r.admitted_at, r.record.key_id.clone()))
-            .max()
-            .expect("at least the peer row");
+        // The soft face: announced + attributed.
         backend
             .remove_peer_record("peer-721", false, "operator rotation", Some("deleg-1"))
             .await
@@ -14010,16 +13698,6 @@ mod tests {
         assert_eq!(ev.detail["reason"], "operator rotation");
         assert_eq!(ev.detail["delegation_id"], "deleg-1");
         assert_eq!(ev.detail["hard"], false);
-        // The sibling key row re-serves past the old cursor (#707 class).
-        let after = backend
-            .list_signed_key_records_since(Some(cursor), u32::MAX)
-            .await
-            .unwrap();
-        assert!(
-            after.iter().any(|r| r.record.key_id == "peer-721"),
-            "the soft removal changed the served set — the key row must re-serve \
-             so synced peers learn it (#721/#707)"
-        );
     }
 
     /// v38.0.0 (CIRISPersist#721) — **the trust doors refuse the unproven.**
@@ -14565,189 +14243,9 @@ mod tests {
             );
     }
 
-    /// v31.1.0 (CIRISPersist#655, PR #667 round-4) — **the admission position
-    /// survives a backward clock step, on this backend's real write path.**
-    ///
-    /// Twin of the sqlite and postgres witnesses. The allocator's rule is
-    /// unit-tested in `federation::types`; this asserts it is WIRED into
-    /// `put_revocation` here. Two admissions under a forward clock would prove
-    /// nothing, so the post-step state is planted directly: the last position
-    /// handed out is moved an hour into the future — what a node looks like
-    /// after an NTP correction — and the next admission must still sort after
-    /// it, or it is invisible to every consumer already past that point.
-    #[tokio::test]
-    async fn admission_position_survives_a_backward_clock_step_memory_655() {
-        use crate::federation::FederationDirectory as _;
-        let backend = MemoryBackend::new();
-        for k in ["rvm-a", "rvm-b"] {
-            backend
-                .put_public_key(SignedKeyRecord {
-                    record: fix_key(k, k, k),
-                })
-                .await
-                .unwrap();
-        }
-        backend
-            .put_revocation(SignedRevocation {
-                revocation: fix_revocation("rvm-1", "rvm-a", "rvm-a", "rvm-a"),
-            })
-            .await
-            .expect("first revocation");
-
-        // THE BACKWARD STEP, as state.
-        let future = chrono::Utc::now() + chrono::Duration::hours(1);
-        {
-            let mut st = backend.state.lock().expect("memory backend lock");
-            for v in st.revocation_admitted_at.values_mut() {
-                *v = future;
-            }
-        }
-
-        backend
-            .put_revocation(SignedRevocation {
-                revocation: fix_revocation("rvm-2", "rvm-b", "rvm-b", "rvm-b"),
-            })
-            .await
-            .expect("second revocation");
-
-        let served = backend
-            .list_signed_revocations_since(Some((future, "rvm-1".to_owned())), u32::MAX)
-            .await
-            .unwrap();
-        assert!(
-            served.iter().any(|r| r.revocation.revocation_id == "rvm-2"),
-            "a revocation admitted after a backward clock step must still be served to a \
-             consumer resuming from the pre-step cursor"
-        );
-    }
-
     // ─── v31.4.0 (CIRISPersist#682 / #668) — the identity plane's serve
     //     cursor, memory arm. Assertion bodies shared with the sqlite and
     //     postgres arms; only the PLANT is backend-specific.
-
-    /// #682 — a key record signed a year ago and admitted now is still served
-    /// to a consumer whose cursor has passed that instant.
-    #[tokio::test]
-    async fn late_replicated_key_record_is_served_memory_682() {
-        let backend = MemoryBackend::new();
-        crate::federation::register::test_support::exercise_late_replicated_key_record_is_served(
-            &backend, "mem",
-        )
-        .await
-        .unwrap();
-    }
-
-    /// #668 — `limit + 2` rows sharing ONE admission instant page through with
-    /// every row seen exactly once.
-    ///
-    /// The tie is PLANTED because it cannot be produced through this backend's
-    /// write path: `monotonic_admission_instant` allocates strictly above the
-    /// last position, so two admissions here never collide. It is reachable in
-    /// production through the V126 backfill (every pre-existing row stamped
-    /// with its `scrub_timestamp`, and a batch from one producer shares one)
-    /// and through two writers racing the same `MAX`.
-    #[tokio::test]
-    async fn one_admission_instant_pages_exactly_once_memory_668() {
-        use crate::federation::register::test_support as rts;
-        let backend = MemoryBackend::new();
-        let ids: Vec<String> = (0..5).map(|i| format!("k668-mem-{i}")).collect();
-        for id in &ids {
-            backend
-                .put_public_key(SignedKeyRecord {
-                    record: rts::self_scrubbed_record_signed_at(id, chrono::Utc::now()),
-                })
-                .await
-                .unwrap();
-        }
-
-        // THE TIE, as state: every row collapses onto one instant.
-        let tied_at = chrono::Utc::now();
-        {
-            let mut st = backend.state.lock().expect("memory backend lock");
-            for id in &ids {
-                st.key_record_admitted_at.insert(id.clone(), tied_at);
-            }
-        }
-
-        rts::assert_one_admission_instant_pages_exactly_once(&backend, "mem", &ids, 3)
-            .await
-            .unwrap();
-    }
-
-    /// #682 — the admission position survives a backward clock step on this
-    /// backend's real write path. The post-step state is planted directly; two
-    /// admissions under a forward clock would pass with `Utc::now()` and prove
-    /// nothing.
-    #[tokio::test]
-    async fn key_admission_survives_a_backward_clock_step_memory_682() {
-        use crate::federation::register::test_support as rts;
-        let backend = MemoryBackend::new();
-        backend
-            .put_public_key(SignedKeyRecord {
-                record: rts::self_scrubbed_record_signed_at("k682-mem-a", chrono::Utc::now()),
-            })
-            .await
-            .unwrap();
-
-        // THE BACKWARD STEP, as state: the last position handed out is now an
-        // hour ahead of the wall clock.
-        let future = chrono::Utc::now() + chrono::Duration::hours(1);
-        {
-            let mut st = backend.state.lock().expect("memory backend lock");
-            for v in st.key_record_admitted_at.values_mut() {
-                *v = future;
-            }
-        }
-
-        rts::assert_key_admission_survives_backward_step(&backend, "mem", future)
-            .await
-            .unwrap();
-    }
-
-    /// #682 — the allocator reads the same position expression the cursor
-    /// orders by (`key_record_position`, which falls back to
-    /// `scrub_timestamp`), not just the side map.
-    ///
-    /// Memory mirrors the sqlite dialect here: a row with no entry in
-    /// `key_record_admitted_at` has an effective position of its
-    /// `scrub_timestamp`, and an allocator blind to that stamps below it.
-    #[tokio::test]
-    async fn allocator_reads_the_fallback_position_memory_682() {
-        use crate::federation::register::test_support as rts;
-        let backend = MemoryBackend::new();
-        backend
-            .put_public_key(SignedKeyRecord {
-                record: rts::self_scrubbed_record_signed_at("k682-mem-fb", chrono::Utc::now()),
-            })
-            .await
-            .unwrap();
-
-        // THE UNSTAMPED ROW, as state: the side-map entry removed and the
-        // `scrub_timestamp` moved an hour ahead, so the fallback is the largest
-        // position in the map.
-        let fallback_at = chrono::Utc::now() + chrono::Duration::hours(1);
-        {
-            let mut st = backend.state.lock().expect("memory backend lock");
-            assert!(
-                st.key_record_admitted_at.remove("k682-mem-fb").is_some(),
-                "the fallback plant must remove a stamp that was actually there"
-            );
-            let row = st
-                .federation_keys
-                .get_mut("k682-mem-fb")
-                .expect("seeded row");
-            row.scrub_timestamp = fallback_at;
-        }
-
-        rts::assert_allocator_reads_the_fallback_position(
-            &backend,
-            "mem",
-            "k682-mem-fb",
-            fallback_at,
-        )
-        .await
-        .unwrap();
-    }
 
     fn fix_revocation(id: &str, revoked: &str, revoking: &str, scrub_key_id: &str) -> Revocation {
         // v21.0.0 (#502 E1) — real hybrid sig by the revoking key.
@@ -18591,19 +18089,6 @@ mod tests {
             }
         }
         ts::assert_attestation_tie_pages_exactly_once(&backend, "mem", &ids, 3).await;
-    }
-
-    /// v36.0.0 (CIRISPersist#707) — a consumer-visible key mutation moves the
-    /// SERVE POSITION on memory (adopt_scrub_upgrade skips — unimplemented
-    /// here); grant/revoke_trust do not.
-    #[tokio::test]
-    async fn key_mutation_moves_serve_position_memory_707() {
-        let backend = MemoryBackend::new();
-        crate::federation::operational::test_support::exercise_key_mutation_moves_serve_position(
-            &backend, "mem",
-        )
-        .await
-        .expect("707 serve-position exercise");
     }
 
     /// v31.0.0 (CIRISPersist#659) — a signed revocation de-admits the key it

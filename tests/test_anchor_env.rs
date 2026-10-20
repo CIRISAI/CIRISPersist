@@ -210,6 +210,13 @@ async fn test_anchor_e2e_sw_root_blesses_node_and_roots() {
     ));
     let root_member = root.directory_member().unwrap();
     let node_member = node.directory_member().unwrap();
+    // v59.0.0 (#1103, CC 2.6.8) — a registered key id names its own key:
+    // `<label>-<fp>` over the node's own Ed25519 public key.
+    let node_key_id = ciris_verify_core::fedcode::derive_key_id(
+        "test-node",
+        &B64.decode(&node_member.ed25519_public_key_base64)
+            .expect("node ed25519 pubkey is base64"),
+    );
 
     // The HARNESS half of the #451 contract: self-scrub over persist's
     // pinned synthesized envelope (classical + bound PQC, sign_bound).
@@ -279,7 +286,7 @@ async fn test_anchor_e2e_sw_root_blesses_node_and_roots() {
     let verify_rec = produce_scrubbed_key_record(
         root.as_ref(),
         ScrubTarget {
-            key_id: "test-node-1".into(),
+            key_id: node_key_id.clone(),
             pubkey_ed25519_base64: node_member.ed25519_public_key_base64.clone(),
             pubkey_ml_dsa_65_base64: node_member
                 .mldsa65_public_key_base64
@@ -323,7 +330,7 @@ async fn test_anchor_e2e_sw_root_blesses_node_and_roots() {
     let ciris_persist::engine::BackendDispatch::Sqlite(sq) = engine.backend();
     let verdict = ciris_persist::federation::rooting::root_binding(
         &**sq,
-        "test-node-1",
+        &node_key_id,
         &node_member.ed25519_public_key_base64,
     )
     .await;

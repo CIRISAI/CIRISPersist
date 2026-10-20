@@ -148,8 +148,31 @@ pub fn mint_test_ceremony_scoped(
     produced_at: chrono::DateTime<chrono::Utc>,
     extra_scope: Option<&str>,
 ) -> Result<TestCeremonyOutputs, Error> {
-    let (block, holders, inputs) =
+    mint_test_ceremony_versioned(ed_seeds, node_seed, produced_at, extra_scope, None)
+}
+
+/// v59.0.0 (CIRISPersist#1106) — [`mint_test_ceremony_scoped`] at an explicit
+/// bundle version: `Some(3)` mints the pre-v59 shape (no serve transport
+/// rows), the base an AMEND turns into a v4; `None` is the current version,
+/// which carries the test serve node's signed transport destination
+/// ([`test_serve_transport_destination`]).
+///
+/// # Errors
+///
+/// As [`mint_test_ceremony`].
+pub fn mint_test_ceremony_versioned(
+    ed_seeds: &[[u8; 32]],
+    node_seed: &[u8; 32],
+    produced_at: chrono::DateTime<chrono::Utc>,
+    extra_scope: Option<&str>,
+    bundle_version: Option<u32>,
+) -> Result<TestCeremonyOutputs, Error> {
+    let (block, holders, mut inputs) =
         test_ceremony_inputs(ed_seeds, node_seed, produced_at, extra_scope)?;
+    if bundle_version.is_some_and(|v| v < super::bundle::SERVE_TRANSPORT_DESTINATIONS_VERSION) {
+        inputs.serve_transport_destinations.clear();
+    }
+    inputs.bundle_version = bundle_version;
     let mut state = super::ceremony::CeremonyState::plan(inputs).map_err(|e| bad("plan", e))?;
     sign_every_item(&mut state, &holders)?;
     let bundle = state.assemble().map_err(|e| bad("assemble", e))?;
@@ -323,8 +346,91 @@ pub fn test_ceremony_inputs(
             }),
         },
         produced_at,
+        serve_transport_destinations: vec![test_serve_transport_destination(
+            node_seed,
+            produced_at,
+            0x71,
+            0x72,
+        )?],
+        bundle_version: None,
     };
     Ok((block, holders, inputs))
+}
+
+/// v59.0.0 (CIRISPersist#1106) — the test serve node's signed Reticulum
+/// transport destination, carrying a transit KEX pair from fill bytes
+/// (`x_fill`, `m_fill`; key-separated from the node's keys and link key), at
+/// epoch 1, asserted at `asserted_at`, signed by the node's own software pair.
+///
+/// # Errors
+///
+/// A seed a signer rejects.
+pub fn test_serve_transport_destination(
+    node_seed: &[u8; 32],
+    asserted_at: chrono::DateTime<chrono::Utc>,
+    x_fill: u8,
+    m_fill: u8,
+) -> Result<crate::federation::self_at_login::SignedTransportDestination, Error> {
+    test_serve_transport_destination_at_epoch(node_seed, asserted_at, x_fill, m_fill, 1)
+}
+
+/// [`test_serve_transport_destination`] at an explicit `epoch` (a rotation).
+///
+/// # Errors
+///
+/// A seed a signer rejects.
+pub fn test_serve_transport_destination_at_epoch(
+    node_seed: &[u8; 32],
+    asserted_at: chrono::DateTime<chrono::Utc>,
+    x_fill: u8,
+    m_fill: u8,
+    epoch: u64,
+) -> Result<crate::federation::self_at_login::SignedTransportDestination, Error> {
+    use crate::federation::self_at_login as sal;
+    let asserted_at =
+        chrono::DateTime::<chrono::Utc>::from_timestamp_millis(asserted_at.timestamp_millis())
+            .ok_or_else(|| bad("transport row instant", "out of range"))?;
+    let row = sal::TransportDestination {
+        occurrence_key_id: TEST_CEREMONY_NODE_KEY_ID.to_owned(),
+        transport_kind: "reticulum".to_owned(),
+        destination: hex::encode([0x5Du8; 16]),
+        asserted_at,
+        last_seen_at: None,
+        transport_ed25519_pubkey_base64: Some(B64.encode([0x62u8; 32])),
+        transport_x25519_pubkey_base64: Some(B64.encode([0x61u8; 32])),
+        binding_provenance: sal::BindingProvenance::Rooted,
+        epoch,
+        retired_at: None,
+    };
+    let mut envelope = serde_json::to_value(&row).map_err(|e| bad("route envelope", e))?;
+    envelope
+        .as_object_mut()
+        .ok_or_else(|| bad("route envelope", "not an object"))?
+        .insert(
+            sal::TRANSIT_KEX_PUBKEYS_MEMBER.to_owned(),
+            serde_json::json!({
+                sal::TRANSIT_KEX_X25519_MEMBER: B64.encode([x_fill; sal::TRANSIT_KEX_X25519_LEN]),
+                sal::TRANSIT_KEX_ML_KEM_768_MEMBER:
+                    B64.encode(vec![m_fill; sal::TRANSIT_KEX_ML_KEM_768_LEN]),
+            }),
+        );
+    let node = Identity::from_seeds(
+        TEST_CEREMONY_NODE_KEY_ID,
+        node_seed,
+        &test_anchor_mldsa_seed(node_seed),
+    )?;
+    let bytes = crate::verify::canonical::ceg_produce_canonicalize(&envelope)
+        .map_err(|e| bad("route canonicalize", e))?;
+    let (ed, mldsa) = node.sign_bytes(&bytes);
+    Ok(sal::SignedTransportDestination {
+        transport_destination: row,
+        attesting_key_id: TEST_CEREMONY_NODE_KEY_ID.to_owned(),
+        signed_envelope: envelope,
+        signature: ciris_verify_core::transport_binding::TransportBindingSignature {
+            ed25519_signature_base64: ed,
+            mldsa65_signature_base64: Some(mldsa),
+        },
+    })
 }
 
 /// CIRISPersist#973 — [`install_test_ceremony_outputs`](super::install_test_ceremony_outputs)
@@ -339,4 +445,100 @@ pub fn test_ceremony_inputs(
 pub fn install_test_ceremony_outputs_json(bundle_json: &str) -> Result<(), Error> {
     super::install_test_ceremony_outputs(super::parse_genesis_bundle(bundle_json)?);
     Ok(())
+}
+
+/// v59.0.0 (CIRISPersist#1106) — the software holders of a test ceremony, in
+/// roster order (`test-accord-holder-{0,1,2}`), to sign with.
+///
+/// # Errors
+///
+/// A seed a signer rejects.
+pub fn test_ceremony_holders(ed_seeds: &[[u8; 32]]) -> Result<Vec<Identity>, Error> {
+    let block = mint_test_anchor_block(ed_seeds)?;
+    ed_seeds
+        .iter()
+        .zip(&block.holders)
+        .map(|(seed, h)| Identity::from_seeds(&h.key_id, seed, &test_anchor_mldsa_seed(seed)))
+        .collect()
+}
+
+/// v59.0.0 (CIRISPersist#1106) — one test holder's authorization of an AMEND
+/// over `bytes` ([`AmendState::authz_bytes`](super::amend::AmendState::authz_bytes)).
+#[must_use]
+pub fn test_amend_authorization(holder: &Identity, bytes: &[u8]) -> super::GenesisAuthorization {
+    let (classical, pqc) = holder.sign_bytes(bytes);
+    super::GenesisAuthorization {
+        holder_key_id: holder.key_id.clone(),
+        signature_classical: classical,
+        signature_pqc: pqc,
+    }
+}
+
+/// v59.0.0 (CIRISPersist#1106, CC 5.3.4) — the holders' quorum re-bind of a
+/// serve node's transport destination: a
+/// [`REBIND_DIMENSION`](crate::federation::transport_rebind::REBIND_DIMENSION)
+/// row about the node, carrying `carried`, signed by `signers[0]` and
+/// cosigned (`additional_scrubs`) by the rest, every scrub over the same
+/// canonical envelope.
+///
+/// # Errors
+///
+/// An envelope that does not canonicalize.
+pub fn test_rebind_row(
+    signers: &[&Identity],
+    carried: &crate::federation::self_at_login::SignedTransportDestination,
+    asserted_at: chrono::DateTime<chrono::Utc>,
+) -> Result<crate::federation::Attestation, Error> {
+    use crate::federation::transport_rebind as tr;
+    use crate::federation::types::{attestation_tier, attestation_type, cohort_scope, ScrubSig};
+    let asserted_at =
+        chrono::DateTime::<chrono::Utc>::from_timestamp_millis(asserted_at.timestamp_millis())
+            .ok_or_else(|| bad("re-bind instant", "out of range"))?;
+    let primary = signers.first().ok_or_else(|| bad("re-bind", "no signer"))?;
+    let mut row = crate::federation::Attestation {
+        attestation_id: uuid::Uuid::new_v4().to_string(),
+        attesting_key_id: primary.key_id.clone(),
+        attested_key_id: carried.transport_destination.occurrence_key_id.clone(),
+        attestation_type: attestation_type::SCORES.to_owned(),
+        weight: None,
+        asserted_at,
+        expires_at: None,
+        attestation_envelope: serde_json::json!({
+            "dimension": tr::REBIND_DIMENSION,
+            "score": 1,
+            "confidence": 1,
+            tr::REBIND_MEMBER: serde_json::to_value(carried).map_err(|e| bad("carried row", e))?,
+        }),
+        original_content_hash: String::new(),
+        scrub_signature_classical: String::new(),
+        scrub_signature_pqc: None,
+        scrub_key_id: primary.key_id.clone(),
+        scrub_timestamp: asserted_at,
+        pqc_completed_at: Some(asserted_at),
+        persist_row_hash: String::new(),
+        subject_key_ids: Vec::new(),
+        withdraws_admission_rule: None,
+        cohort_scope: cohort_scope::FEDERATION.to_owned(),
+        tier: attestation_tier::FEDERATION.to_owned(),
+        promoted_at: None,
+        additional_scrubs: Vec::new(),
+    };
+    crate::federation::envelope::RowMirror::stamp_local_row(&mut row, false)?;
+    crate::federation::canonical_at_rest::canonicalize_in_place(&mut row.attestation_envelope)?;
+    let canonical = crate::verify::canonical::ceg_produce_canonicalize(&row.attestation_envelope)
+        .map_err(|e| bad("re-bind canonicalize", e))?;
+    row.original_content_hash = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&canonical));
+    let (classical, pqc) = primary.sign_bytes(&canonical);
+    row.scrub_signature_classical = classical;
+    row.scrub_signature_pqc = Some(pqc);
+    for s in &signers[1..] {
+        let (classical, pqc) = s.sign_bytes(&canonical);
+        row.additional_scrubs.push(ScrubSig {
+            scrub_key_id: s.key_id.clone(),
+            scrub_signature_classical: classical,
+            scrub_signature_pqc: Some(pqc),
+            cosigned_at: None,
+        });
+    }
+    Ok(row)
 }

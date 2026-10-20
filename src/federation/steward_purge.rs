@@ -404,6 +404,13 @@ pub const ATTESTATION_PROJECTIONS: &[(&str, &str, ProjectionRemoval)] = &[
         "attestation_id",
         ProjectionRemoval::ForeignKeySetNull,
     ),
+    // v59.0.0 (CIRISPersist#1099; V199) — the self-roster door's node-local
+    // receipt of a proposal row leaves with the row.
+    (
+        "federation_self_roster_proposals",
+        "attestation_id",
+        ProjectionRemoval::ForeignKeyCascade,
+    ),
 ];
 
 /// Tables with an `*attestation_id` column that are NOT projections of a

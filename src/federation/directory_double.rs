@@ -134,7 +134,7 @@ impl FaultInjectingDirectory {
     }
 }
 
-// 113 delegations, generated. Every one: fault first, then delegate.
+// 112 delegations, generated. Every one: fault first, then delegate.
 #[async_trait::async_trait]
 impl FederationDirectory for FaultInjectingDirectory {
     async fn apply_replicated_accord_evidence(
@@ -664,6 +664,17 @@ impl FederationDirectory for FaultInjectingDirectory {
         }
         self.inner.list_location_proofs_for(subject_key_id).await
     }
+    async fn list_open_self_roster_proposals(
+        &self,
+        identity_key_id: Option<&str>,
+    ) -> Result<Vec<self_roster::SelfRosterReceipt>, Error> {
+        if let Some(e) = self.faulted("list_open_self_roster_proposals") {
+            return Err(e);
+        }
+        self.inner
+            .list_open_self_roster_proposals(identity_key_id)
+            .await
+    }
     async fn list_org_memberships_for(&self, org_id: &str) -> Result<Vec<OrgMembership>, Error> {
         if let Some(e) = self.faulted("list_org_memberships_for") {
             return Err(e);
@@ -714,6 +725,17 @@ impl FederationDirectory for FaultInjectingDirectory {
             return Err(e);
         }
         self.inner.list_partner_records_since(since, limit).await
+    }
+    async fn list_settled_self_roster_proposals(
+        &self,
+        identity_key_id: &str,
+    ) -> Result<Vec<self_roster::SelfRosterReceipt>, Error> {
+        if let Some(e) = self.faulted("list_settled_self_roster_proposals") {
+            return Err(e);
+        }
+        self.inner
+            .list_settled_self_roster_proposals(identity_key_id)
+            .await
     }
     async fn list_signed_accord_quorum_evidence_since(
         &self,
@@ -807,40 +829,6 @@ impl FederationDirectory for FaultInjectingDirectory {
             .list_signed_family_membership_widenings_since(since, limit)
             .await
     }
-    async fn list_signed_identity_occurrence_revocations_since(
-        &self,
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        limit: u32,
-    ) -> Result<Vec<ServedIdentityOccurrenceRevocation>, Error> {
-        if let Some(e) = self.faulted("list_signed_identity_occurrence_revocations_since") {
-            return Err(e);
-        }
-        self.inner
-            .list_signed_identity_occurrence_revocations_since(since, limit)
-            .await
-    }
-    async fn list_signed_identity_occurrences_since(
-        &self,
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        limit: u32,
-    ) -> Result<Vec<ServedIdentityOccurrence>, Error> {
-        if let Some(e) = self.faulted("list_signed_identity_occurrences_since") {
-            return Err(e);
-        }
-        self.inner
-            .list_signed_identity_occurrences_since(since, limit)
-            .await
-    }
-    async fn list_signed_key_records_since(
-        &self,
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        limit: u32,
-    ) -> Result<Vec<ServedKeyRecord>, Error> {
-        if let Some(e) = self.faulted("list_signed_key_records_since") {
-            return Err(e);
-        }
-        self.inner.list_signed_key_records_since(since, limit).await
-    }
     async fn list_signed_location_proofs_since(
         &self,
         since: Option<(chrono::DateTime<chrono::Utc>, String)>,
@@ -864,16 +852,6 @@ impl FederationDirectory for FaultInjectingDirectory {
         self.inner
             .list_signed_partner_records_since(since, limit)
             .await
-    }
-    async fn list_signed_revocations_since(
-        &self,
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        limit: u32,
-    ) -> Result<Vec<ServedRevocation>, Error> {
-        if let Some(e) = self.faulted("list_signed_revocations_since") {
-            return Err(e);
-        }
-        self.inner.list_signed_revocations_since(since, limit).await
     }
     async fn list_signed_transport_destinations_since(
         &self,
@@ -967,6 +945,19 @@ impl FederationDirectory for FaultInjectingDirectory {
         }
         self.inner
             .lookup_signed_record_by_content_hash(kind, content_hash)
+            .await
+    }
+    async fn note_self_roster_proposal(
+        &self,
+        proposal_id: &str,
+        identity_key_id: &str,
+        received_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<self_roster::SelfRosterReceipt, Error> {
+        if let Some(e) = self.faulted("note_self_roster_proposal") {
+            return Err(e);
+        }
+        self.inner
+            .note_self_roster_proposal(proposal_id, identity_key_id, received_at)
             .await
     }
     async fn project_key_grant_row(&self, row: &Attestation) -> Result<(), Error> {
@@ -1090,17 +1081,6 @@ impl FederationDirectory for FaultInjectingDirectory {
         }
         self.inner.put_identity_occurrence(occurrence).await
     }
-    async fn put_identity_occurrence_revocation(
-        &self,
-        revocation: SignedIdentityOccurrenceRevocation,
-    ) -> Result<(), Error> {
-        if let Some(e) = self.faulted("put_identity_occurrence_revocation") {
-            return Err(e);
-        }
-        self.inner
-            .put_identity_occurrence_revocation(revocation)
-            .await
-    }
     async fn put_location_proof(&self, proof: SignedLocationProof) -> Result<(), Error> {
         if let Some(e) = self.faulted("put_location_proof") {
             return Err(e);
@@ -1175,6 +1155,19 @@ impl FederationDirectory for FaultInjectingDirectory {
             return Err(e);
         }
         self.inner.set_consent_role(key_id, consent_role).await
+    }
+    async fn settle_self_roster_proposal(
+        &self,
+        proposal_id: &str,
+        outcome: &str,
+        settled_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), Error> {
+        if let Some(e) = self.faulted("settle_self_roster_proposal") {
+            return Err(e);
+        }
+        self.inner
+            .settle_self_roster_proposal(proposal_id, outcome, settled_at)
+            .await
     }
     async fn store_invalid_replaced_key_record(
         &self,

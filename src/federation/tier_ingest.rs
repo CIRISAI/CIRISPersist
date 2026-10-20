@@ -149,12 +149,6 @@ pub async fn verify_row_hybrid_signature<F>(directory: &F, row: &Attestation) ->
 where
     F: FederationDirectory + ?Sized,
 {
-    let reject = |reason: String| Error::FederationTierUnverified {
-        attestation_id: row.attestation_id.clone(),
-        attesting_key_id: row.attesting_key_id.clone(),
-        reason,
-    };
-
     // v58.0.0 (CIRISPersist#991, CC 3.1.3) — a key-plane row's signature is
     // its signed object's own, over the object's own bytes; the row is a pure
     // function of that object. The family's rule, not the generic one
@@ -162,7 +156,36 @@ where
     if super::key_plane::verify_plane_row(directory, row).await? {
         return Ok(());
     }
+    // v59.0.0 (CIRISPersist#1099) — a self-roster proposal row is minted from
+    // the signed object it carries, under the same rule.
+    if super::self_roster::verify_proposal_row(directory, row).await? {
+        return Ok(());
+    }
+    // v59.0.0 (CIRISPersist#1104) — a legacy occurrence revocation's carrier
+    // is minted from the framed object it carries; its admission is
+    // structural (`occurrence_revocation_carrier`).
+    if super::occurrence_revocation_carrier::verify_carrier_row(directory, row).await? {
+        return Ok(());
+    }
+    verify_envelope_signed_row(directory, row).await
+}
 
+/// v59.0.0 (CIRISPersist#1099) — [`verify_row_hybrid_signature`]'s generic
+/// rule alone: the row's own scrubs over its own canonical envelope, for a row
+/// that is not a minted one. The self-roster door verifies the `withdraws` a
+/// proposal carries with it (that row is never minted).
+pub(crate) async fn verify_envelope_signed_row<F>(
+    directory: &F,
+    row: &Attestation,
+) -> Result<(), Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let reject = |reason: String| Error::FederationTierUnverified {
+        attestation_id: row.attestation_id.clone(),
+        attesting_key_id: row.attesting_key_id.clone(),
+        reason,
+    };
     let computed_hash = verify_envelope_hybrid_signature(
         directory,
         &row.attesting_key_id,
@@ -1122,6 +1145,24 @@ pub mod test_support {
         )
     }
 
+    /// v59.0.0 (CIRISPersist#1103, CC 2.6.8) — a key id that names its own
+    /// key: `<label padded to 32 bytes>-<fp>`. The test signer seeds from the
+    /// FIRST 32 BYTES of an id, so the suffix does not move the key, and `fp`
+    /// is the fingerprint of that key.
+    pub fn fp_key_id(label: &str) -> String {
+        let mut base = label.to_owned();
+        while base.len() < 32 {
+            base.push('0');
+        }
+        let (ed, _) = hybrid_pubkeys(&base);
+        let id = format!(
+            "{base}-{}",
+            crate::federation::register::key_id_fingerprint(&ed).expect("32-byte test key")
+        );
+        debug_assert_eq!(hybrid_pubkeys(&id).0, ed, "the suffix moved the key");
+        id
+    }
+
     /// `key_id`'s registered hybrid pubkeys, base64. Use these to fill a
     /// `KeyRecord`'s `pubkey_ed25519_base64` / `pubkey_ml_dsa_65_base64`
     /// so the registered key matches what [`sign_envelope`] signs with.
@@ -1905,58 +1946,6 @@ pub mod test_support {
         }
     }
 
-    /// v50.0.0 (CIRISPersist#925 review item 5) — a SIGNED revocation of the
-    /// binding `{identity → occurrence}`, signed by `signer` (the identity or an
-    /// active occurrence of it), taking effect at `effective_at`. v58.0.0 (compat
-    /// reads) — the framed authoring door's input, beside [`occurrence_withdrawal`].
-    pub async fn signed_occurrence_revocation(
-        signer: &str,
-        identity: &str,
-        occurrence: &str,
-        effective_at: chrono::DateTime<chrono::Utc>,
-    ) -> crate::federation::SignedIdentityOccurrenceRevocation {
-        let ms = |t: chrono::DateTime<chrono::Utc>| {
-            chrono::DateTime::<chrono::Utc>::from_timestamp_millis(t.timestamp_millis())
-                .expect("ms instant")
-        };
-        let effective_at = ms(effective_at);
-        let revoked_at = effective_at;
-        let envelope = serde_json::json!({
-            "attesting_key_id": signer,
-            "identity_key_id": identity,
-            "occurrence_key_id": occurrence,
-            "revoked_at": revoked_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-            "effective_at": effective_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-        });
-        let id = Box::new(
-            ciris_verify_core::self_at_login::HybridSigningIdentity::new(
-                signer,
-                ed_signer(signer),
-                *mldsa_signer(signer),
-            ),
-        );
-        let (signed_envelope, signature) =
-            ciris_verify_core::transport_binding::produce_signed_identity_occurrence(
-                id.as_ref(),
-                envelope,
-            )
-            .await
-            .expect("sign revocation envelope");
-        crate::federation::SignedIdentityOccurrenceRevocation {
-            identity_occurrence_revocation: crate::federation::IdentityOccurrenceRevocation {
-                identity_key_id: identity.to_owned(),
-                occurrence_key_id: occurrence.to_owned(),
-                revoked_at,
-                effective_at,
-                reason: None,
-                witness_set: vec![signer.to_owned()],
-                persist_row_hash: String::new(),
-            },
-            attesting_key_id: signer.to_owned(),
-            signed_envelope,
-            signature,
-        }
-    }
     /// v58.0.0 (CIRISPersist#991, CC 3.3.6) — an occurrence's revocation: a
     /// `withdraws` against the pair's held `identity:occurrence:v1` row,
     /// hybrid-signed by `signer` (the identity or a live occurrence of it),

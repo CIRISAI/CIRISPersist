@@ -89,20 +89,50 @@ pub fn combine_principal_stances(stances: &[ConsentState]) -> ConsentState {
 /// `k`'s own live peers (the strict V109 projection) ∪ the peers of each
 /// steward's grants whose `for_key_id == k` (the V147 projection). A
 /// steward's grant for a sibling agent contributes nothing. Sorted, deduped.
+///
+/// v59.0.0 (CIRISPersist#1099, CC 3.3.6.3) — a steward's grant is one its
+/// author signs AS a steward ([`grant_is_authored_by_a_steward`]): the
+/// steward's own key, or a live roster key of the steward's self at the
+/// grant's `asserted_at`. Read over the live grants themselves (the V147
+/// projection's sources), so the ONE predicate decides here and in
+/// [`grant_is_authored_for`].
 pub async fn consent_peers_by_principals(
     directory: &dyn FederationDirectory,
     k: &str,
 ) -> Result<Vec<String>, Error> {
     let stewards = super::admission::steward_bindings_of(directory, k).await?;
     let mut out = directory.list_consent_peers(k).await?;
-    for (author, peer) in directory.list_consent_peers_for(k).await? {
-        if stewards.contains(&author) {
-            out.push(peer);
+    for g in directory.list_live_consent_grants_for(k).await? {
+        if grant_is_authored_by_a_steward(directory, &stewards, &g).await? {
+            out.extend(g.subject_key_ids.iter().cloned());
         }
     }
     out.sort();
     out.dedup();
     Ok(out)
+}
+
+/// v59.0.0 (CIRISPersist#1099, CC 3.3.6.3, `CLM-self-roster-authority`) — is
+/// `grant`'s author one of `stewards`, acting as that steward at the grant's
+/// signed instant ([`acts_as_steward_at`](super::self_roster::acts_as_steward_at))?
+async fn grant_is_authored_by_a_steward(
+    directory: &dyn FederationDirectory,
+    stewards: &[String],
+    grant: &super::Attestation,
+) -> Result<bool, Error> {
+    for s in stewards {
+        if super::self_roster::acts_as_steward_at(
+            directory,
+            s,
+            &grant.attesting_key_id,
+            grant.asserted_at,
+        )
+        .await?
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// v48.0.0 (CIRISPersist#905) — **the grants that cover `k`'s egress, by
@@ -134,6 +164,12 @@ pub async fn live_egress_grants_by_principals(
 /// `for_key_id`. The ONE predicate the promotion sweep's loader and the
 /// mesh crossing's `check_grant_covers` both ask — spelled once so "whose
 /// consent covers this producer" cannot drift between the two doors.
+///
+/// v59.0.0 (CIRISPersist#1099, CC 3.3.6.3) — "a steward authored it" is "a
+/// steward, or a live roster key of the steward's self at the grant's
+/// `asserted_at`" ([`acts_as_steward_at`](super::self_roster::acts_as_steward_at)):
+/// a second device of the same person signs as that person; a key of another
+/// self does not.
 pub async fn grant_is_authored_for(
     directory: &dyn super::FederationDirectory,
     grant: &super::Attestation,
@@ -146,7 +182,7 @@ pub async fn grant_is_authored_for(
         return Ok(false);
     }
     let stewards = super::admission::steward_bindings_of(directory, machine).await?;
-    Ok(stewards.iter().any(|s| s == &grant.attesting_key_id))
+    grant_is_authored_by_a_steward(directory, &stewards, grant).await
 }
 
 /// `k`'s own stance (the existing fold, unchanged) and, for each steward `p`,

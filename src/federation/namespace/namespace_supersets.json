@@ -16748,6 +16748,118 @@
     "path#symbol": "src/federation/admission.rs#check_dimension_case_rule",
     "tsv_target": "evidence/cc_impl.tsv",
     "manifest_round": "cc-rc8-vendor"
+   },
+   {
+    "decimal_id": "3.3.6.3",
+    "claim_id": "CLM-self-roster-authority",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/self_roster.rs#acts_as_steward_at",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc9-1099"
+   },
+   {
+    "decimal_id": "3.3.6.3",
+    "claim_id": "CLM-self-roster-authority",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/consent_by_humans.rs#grant_is_authored_for",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc9-1099"
+   },
+   {
+    "decimal_id": "3.3.6.3",
+    "claim_id": "CLM-self-roster-authority",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/admission.rs#check_single_node_owner_admission",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc9-1099"
+   },
+   {
+    "decimal_id": "3.3.6.3",
+    "claim_id": "CLM-self-roster-two-paths",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/two_path.rs#decide",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc9-1099"
+   },
+   {
+    "decimal_id": "3.3.6.3",
+    "claim_id": "CLM-self-roster-two-paths",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/self_roster.rs#gate",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc9-1099"
+   },
+   {
+    "decimal_id": "6.1.1",
+    "claim_id": "CLM-member-commitment-unique",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/fountain/aggregation.rs#check_distinct_sources",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc9-1102"
+   },
+   {
+    "decimal_id": "2.6.8",
+    "claim_id": "CLM-key-id-fingerprint-verified",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/register.rs#check_key_id_fingerprint",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc9-1103"
+   },
+   {
+    "decimal_id": "3.3.1",
+    "claim_id": "CLM-consent-community-trust-owner-authored",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/community_trust_consent.rs#check_community_trust_grant_admission",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc9-1096"
+   },
+   {
+    "decimal_id": "3.3.1",
+    "claim_id": "CLM-consent-community-trust-owner-authored",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/community_trust_consent.rs#fold_community_trust",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc9-1096"
+   },
+   {
+    "decimal_id": "3.1.5",
+    "claim_id": "CLM-occurrence-revocation-carrier",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/occurrence_revocation_carrier.rs#carrier_row",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc9-1104"
+   },
+   {
+    "decimal_id": "3.1.5",
+    "claim_id": "CLM-occurrence-revocation-carrier",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/occurrence_revocation_carrier.rs#check_carrier_admission",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc9-1104"
+   },
+   {
+    "decimal_id": "5.3.4",
+    "claim_id": "CLM-bundle-seeds-transit-pairs",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/genesis/bundle.rs#check_serve_transport_destinations",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc9-1106"
+   },
+   {
+    "decimal_id": "5.3.4",
+    "claim_id": "CLM-bundle-seeds-transit-pairs",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/genesis/mod.rs#seed_serve_transport_destinations",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc9-1106"
+   },
+   {
+    "decimal_id": "5.3.4",
+    "claim_id": "CLM-bundle-seeds-transit-pairs",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/transport_rebind.rs#check_serve_rotation",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "cc-rc9-1106"
    }
   ],
   "CIRISServer": [

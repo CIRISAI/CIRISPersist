@@ -108,6 +108,13 @@ pub enum AttestationRefusalReason {
     /// apply its object; the door's own reason is logged with the row id.
     /// APPENDED.
     KeyPlaneRefused,
+    /// v59.0.0 (CIRISPersist#1064, CIRISEdge) — a roster change the
+    /// self-roster door holds as an OPEN proposal (`pending`): it may land
+    /// when an answer arrives or the window closes, so a re-offer later can
+    /// succeed. Split out of [`Self::KeyPlaneRefused`], which keeps the
+    /// terminal reasons (a refused proposal, a family door's refusal).
+    /// APPENDED.
+    SelfRosterPending,
 }
 
 impl AttestationRefusalReason {
@@ -123,6 +130,28 @@ impl AttestationRefusalReason {
             Self::AlreadyPresentIdentical => "already_present_identical",
             Self::StoreConflict => "store_conflict",
             Self::KeyPlaneRefused => "key_plane_refused",
+            Self::SelfRosterPending => "self_roster_pending",
+        }
+    }
+
+    /// v59.0.0 (CIRISPersist#1064) — may a later re-offer of the row succeed?
+    /// `true` for [`Self::SelfRosterPending`] (the proposal may land) and
+    /// [`Self::StoreConflict`] (a lost race: "safe to re-offer"); `false` for
+    /// the terminal reasons. Beside `steward_purge::is_retryable`.
+    #[must_use]
+    pub const fn is_retryable(&self) -> bool {
+        matches!(self, Self::SelfRosterPending | Self::StoreConflict)
+    }
+
+    /// The reason a self-roster door's [`Error::SelfRosterNotLanded`] maps to:
+    /// [`Self::SelfRosterPending`] while the proposal is open, else the
+    /// terminal [`Self::KeyPlaneRefused`].
+    #[must_use]
+    pub fn of_self_roster_decision(decision: &str) -> Self {
+        if decision == "pending" {
+            Self::SelfRosterPending
+        } else {
+            Self::KeyPlaneRefused
         }
     }
 
@@ -133,6 +162,7 @@ impl AttestationRefusalReason {
         Self::AlreadyPresentIdentical,
         Self::StoreConflict,
         Self::KeyPlaneRefused,
+        Self::SelfRosterPending,
     ];
 }
 
@@ -341,18 +371,30 @@ where
     // read as a conflict.
     if super::key_plane::is_key_plane_row(incoming) {
         use super::key_plane::KeyPlaneApplied;
-        return Ok(
-            match super::key_plane::apply_key_plane_row(dir, incoming).await? {
-                KeyPlaneApplied::Changed => Outcome::Inserted,
-                KeyPlaneApplied::Unchanged => Outcome::Unchanged,
-                KeyPlaneApplied::Refused(reason) => {
-                    tracing::info!(attestation_id = %attestation_id, reason, "key-plane row refused");
-                    Outcome::Refused {
-                        reason: AttestationRefusalReason::KeyPlaneRefused,
-                    }
+        let applied = match super::key_plane::apply_key_plane_row(dir, incoming).await {
+            // v59.0.0 (CIRISPersist#1099) — a roster change held as a proposal
+            // (or refused) by the self-roster door: the occurrence did not
+            // land here, typed as the key-plane door's refusal.
+            Err(e @ Error::SelfRosterNotLanded { decision, .. }) => {
+                tracing::info!(attestation_id = %attestation_id, error = %e, "key-plane row held by the self-roster door");
+                // v59.0.0 (CIRISPersist#1064) — pending (retry) apart from
+                // refused (stop).
+                return Ok(Outcome::Refused {
+                    reason: AttestationRefusalReason::of_self_roster_decision(decision),
+                });
+            }
+            other => other?,
+        };
+        return Ok(match applied {
+            KeyPlaneApplied::Changed => Outcome::Inserted,
+            KeyPlaneApplied::Unchanged => Outcome::Unchanged,
+            KeyPlaneApplied::Refused(reason) => {
+                tracing::info!(attestation_id = %attestation_id, reason, "key-plane row refused");
+                Outcome::Refused {
+                    reason: AttestationRefusalReason::KeyPlaneRefused,
                 }
-            },
-        );
+            }
+        });
     }
     // v50.0.0 (CIRISPersist#916) — an owner-binding is the moment a minter
     // learns a member has a device; read before the row is moved.
@@ -439,6 +481,15 @@ where
         Err(e) if e.is_duplicate_key() => Ok(Outcome::Refused {
             reason: AttestationRefusalReason::StoreConflict,
         }),
+        // v59.0.0 (CIRISPersist#1099) — a `withdraws` evicting a live roster
+        // key, held as a proposal (or refused) by the self-roster door: the
+        // key-plane door's refusal, as for an occurrence row.
+        Err(e @ Error::SelfRosterNotLanded { decision, .. }) => {
+            tracing::info!(attestation_id = %attestation_id, error = %e, "occurrence withdraws held by the self-roster door");
+            Ok(Outcome::Refused {
+                reason: AttestationRefusalReason::of_self_roster_decision(decision),
+            })
+        }
         Err(e) => Err(e),
     }
 }

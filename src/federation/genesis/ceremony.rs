@@ -130,6 +130,18 @@ pub struct CeremonyInputs {
     /// THE ceremony instant. Every instant in every item derives from it; the
     /// assembler reads no clock. Truncated to microseconds at plan.
     pub produced_at: chrono::DateTime<chrono::Utc>,
+    /// v59.0.0 (CIRISPersist#1106, CC 5.3.4) — each seated serve node's
+    /// CURRENT signed transport destination, gathered by the caller before
+    /// authorization; carried into the bundle and bound by the digest
+    /// (version ≥ 4). Absent in a pre-v59 saved state.
+    #[serde(default)]
+    pub serve_transport_destinations:
+        Vec<crate::federation::self_at_login::SignedTransportDestination>,
+    /// v59.0.0 — the bundle version to emit; `None` is
+    /// [`GENESIS_BUNDLE_VERSION`]. A version below 4 carries no transport
+    /// rows (an older verifier's bundle, and a test's v3 base for an amend).
+    #[serde(default)]
+    pub bundle_version: Option<u32>,
 }
 
 /// One holder's hybrid signature over one item.
@@ -349,6 +361,32 @@ impl CeremonyState {
         let inputs = &self.inputs;
         if inputs.holders.is_empty() {
             return bad("a ceremony needs its accord holders".into());
+        }
+        // v59.0.0 (CIRISPersist#1106) — the version and the transport rows.
+        let version = inputs.bundle_version.unwrap_or(GENESIS_BUNDLE_VERSION);
+        if !(3..=GENESIS_BUNDLE_VERSION).contains(&version) {
+            return bad(format!(
+                "bundle version {version} is not one this assembler emits"
+            ));
+        }
+        if version < super::bundle::SERVE_TRANSPORT_DESTINATIONS_VERSION
+            && !inputs.serve_transport_destinations.is_empty()
+        {
+            return bad(format!(
+                "a version-{version} bundle carries no serve transport destinations"
+            ));
+        }
+        for row in &inputs.serve_transport_destinations {
+            if !inputs
+                .serve_nodes
+                .iter()
+                .any(|n| n.key_id == row.attesting_key_id)
+            {
+                return bad(format!(
+                    "serve transport destination signed by {} is not a seated serve node's",
+                    row.attesting_key_id
+                ));
+            }
         }
         let mut ids = std::collections::BTreeSet::new();
         for h in &inputs.holders {
@@ -740,7 +778,7 @@ impl CeremonyState {
     ) -> GenesisBundle {
         let primary = self.inputs.holders[0].record.key_id.clone();
         GenesisBundle {
-            version: GENESIS_BUNDLE_VERSION,
+            version: self.inputs.bundle_version.unwrap_or(GENESIS_BUNDLE_VERSION),
             family_key_id: self.inputs.family_key_id.clone(),
             holders: self.inputs.holders.clone(),
             serve_nodes: nodes
@@ -775,6 +813,7 @@ impl CeremonyState {
             ],
             authorizations,
             produced_at: self.inputs.produced_at.to_rfc3339(),
+            serve_transport_destinations: self.inputs.serve_transport_destinations.clone(),
         }
     }
 

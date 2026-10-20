@@ -170,6 +170,14 @@ pub(crate) const LIST_READ_BOUNDS: &[(&str, Bound)] = &[
         Bound::Open("one occurrence key's append-only assertion history (V161): grows with every renewal"),
     ),
     (
+        "list_open_self_roster_proposals",
+        Bound::Open("every open roster proposal of one self, or of every self for the sweep: a refused one stays open until the roster lets it land"),
+    ),
+    (
+        "list_settled_self_roster_proposals",
+        Bound::Open("every settled roster proposal of one self: grows with each roster change the self makes"),
+    ),
+    (
         "list_identity_occurrence_revocations_for",
         Bound::Schema("the revocations of one identity's occurrences: at most one per occurrence and effective instant"),
     ),
@@ -237,23 +245,15 @@ pub(crate) const LIST_READ_BOUNDS: &[(&str, Bound)] = &[
     ("list_signed_family_membership_revocations_since", Bound::Paged),
     ("list_signed_family_membership_widenings_since", Bound::Paged),
     (
-        "list_signed_identity_occurrence_revocations_for",
-        Bound::Schema("the signed twin of list_identity_occurrence_revocations_for"),
-    ),
-    ("list_signed_identity_occurrence_revocations_since", Bound::Paged),
-    (
         "list_signed_identity_occurrences_for",
         Bound::Schema("the signed twin of list_identity_occurrences_for: one per device"),
     ),
-    ("list_signed_identity_occurrences_since", Bound::Paged),
-    ("list_signed_key_records_since", Bound::Paged),
     ("list_signed_location_proofs_since", Bound::Paged),
     ("list_signed_partner_records_since", Bound::Paged),
     (
         "list_signed_records",
         Bound::Open("every replicated record of one kind for one subject; the history-bearing kinds grow"),
     ),
-    ("list_signed_revocations_since", Bound::Paged),
     (
         "list_signed_transport_destinations_for",
         Bound::Schema("the signed twin of list_transport_destinations_for: one row per transport kind"),
