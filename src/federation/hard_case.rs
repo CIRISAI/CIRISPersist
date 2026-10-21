@@ -911,6 +911,56 @@ pub(crate) mod test_support {
 mod tests {
     use super::*;
 
+    /// I1165 (v60.0.0) — with the tier filter gone, the body's agreement with
+    /// its row is the projection's only fence: a row projects only when its
+    /// dimension AND its id are the ones its body names. A peer's row whose
+    /// three disagree (either half alone) is not one a hard_case door wrote,
+    /// and lands in no `hard_case_events` table.
+    #[test]
+    fn i1165_a_row_whose_parts_disagree_does_not_project() {
+        use crate::federation::tier_ingest::test_support as ts;
+        let event = HardCaseEvent {
+            event_id: "i1165-parts".to_owned(),
+            kind: kind::CONSENT_SLA_BREACH.to_owned(),
+            target_key_id: None,
+            subject_key_id: None,
+            detail: serde_json::json!({}),
+            emitted_at: "2026-10-21T10:00:00Z".parse().unwrap(),
+        };
+        let row = |id: &str, envelope: serde_json::Value| {
+            let mut r = ts::bare_attestation(id, "i1165-node", "", &envelope);
+            r.attestation_type = super::super::types::attestation_type::SCORES.to_owned();
+            r
+        };
+        let id = hard_case_attestation_id(&event.event_id);
+        let whole = hard_case_envelope(&event).unwrap();
+        assert_eq!(
+            project_hard_case_row(&row(&id, whole.clone())).map(|e| e.event_id),
+            Some(event.event_id.clone()),
+            "I1165: a row whose parts agree projects, at any tier"
+        );
+        let mut fed = row(&id, whole.clone());
+        fed.tier = super::super::types::attestation_tier::FEDERATION.to_owned();
+        assert!(
+            project_hard_case_row(&fed).is_some(),
+            "I1165: tier-agnostic"
+        );
+        // The id disagrees, the dimension agrees.
+        assert_eq!(
+            project_hard_case_row(&row("not-the-derived-id", whole.clone())),
+            None,
+            "I1165: an id the body does not name"
+        );
+        // The dimension disagrees, the id agrees.
+        let mut other_dimension = whole;
+        other_dimension["dimension"] = serde_json::json!(hard_case_dimension("admin_action"));
+        assert_eq!(
+            project_hard_case_row(&row(&id, other_dimension)),
+            None,
+            "I1165: a dimension the body does not name"
+        );
+    }
+
     #[test]
     fn membership_change_event_id_is_deterministic_and_sub_second_idempotent() {
         let t0: DateTime<Utc> = "2026-06-12T10:00:00.100Z".parse().unwrap();

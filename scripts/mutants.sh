@@ -121,7 +121,11 @@ case "$tool" in
         # every mutant recompiles the whole crate from scratch.
         # --no-fail-fast: the matrix needs EVERY witness that fails, not the
         # first. --lib: the scope's witnesses are in-crate; the integration
-        # binaries would be built for every mutant and never run.
+        # binaries would be built for every mutant and never run. v60.0.0: it
+        # rides --cargo-arg, so the tool's BUILD is lib-only too; passed after
+        # `--` it reached nextest alone, and each mutant's build compiled and
+        # linked every integration test and example at once (forty linkers),
+        # which the 14 GB cargo_guard scope OOM-killed on the S0 scopes.
         # --profile mutants (.config/nextest.toml): a witness that hangs
         # under a mutant is killed at 60 s and reads as a FAIL of that
         # witness, not a 300 s tool timeout credited to no one. That holds
@@ -132,8 +136,9 @@ case "$tool" in
         CARGO_INCREMENTAL=1 timeout --signal=INT --kill-after=120 "$BUDGET" \
             "${pg[@]}" cargo mutants --test-tool nextest --features "$FEATURES" \
             --minimum-test-timeout 300 \
+            --cargo-arg=--lib \
             --jobs "$JOBS" --no-shuffle --output "$ABS_OUT" "${sel[@]}" "${shard_args[@]}" \
-            -- --lib --no-fail-fast --profile mutants -E "$filter" \
+            -- --no-fail-fast --profile mutants -E "$filter" \
             </dev/null >"$OUT/tool.log" 2>&1
         rc=$?
         raw="$ABS_OUT/mutants.out"

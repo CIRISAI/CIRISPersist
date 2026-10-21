@@ -13,7 +13,11 @@
 #   runs `--lib`.
 #
 # Grammar: docs/MUTATION_TESTING.md "Scope files".
-tests: test(/i1161|i1162_/)
+#   `i1162_only_a_test_anchor_build_reads_the_window_env` is a from-disk
+#   fence over where the variable is read, not a witness of these fns'
+#   logic: no generated mutant moves the read, so it would kill nothing and
+#   read UNVALIDATED (the S0b run, 2026-10-21). It runs in the lib suite.
+tests: test(/i1161|i1162_/) - test(i1162_only_a_test_anchor_build_reads_the_window_env)
 features: postgres,sqlite,server,test-anchor
 
 src/federation/admission.rs nodes_owned_by
