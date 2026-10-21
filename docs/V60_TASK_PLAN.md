@@ -59,7 +59,7 @@ its build.
 | S4 | consent and sweep planes on one plan | #934 step 4 | refactor | 1 day |
 | S5 | retire `memory.rs` onto sqlite in-memory | #1002 (+ folds #679, #681, #691, #720, #722, #787) | refactor, the only step that moves the total | 1–1½ days |
 | S6 | organisations as affiliations | #1036 (all five items), #1049, #1062, #1048 | migration + feature | 2 days |
-| S6v | vendor CC v1.0-rc9 at the tag (the steward said "cut RC9" 2026-10-21; CIRISConstitution#182) | registry re-vendor; the chain, governance-policy and vocabulary fixtures become runtime manifests; `check_corridor` at admission from the policy table | vendor | ½–1 day |
+| S6v | vendor CC v1.0-rc9 at the tag (tagged 2026-10-21, CC main 5d50c6bb; CIRISConstitution#182) | registry re-vendor; the chain, governance-policy and vocabulary fixtures become runtime manifests; `check_corridor` at admission from the policy table | vendor | ½–1 day |
 | S7 | release: evidence, CHANGELOG, Edge adoption, chain | — | — | ½ day |
 
 Not in v60, by decision: #1004 (the workspace split; it needs the plan/execute line S3–S5
@@ -294,7 +294,13 @@ Witnesses I12xx on both backends + mutations; `scope-s6-affiliations.txt`. Evide
 `CLM-licence-audience`, `CLM-licence-contest`. Expected: 3 typed tables and 3 wire kinds gone.
 
 
-### S6v — vendor CC v1.0-rc9 (after the tag exists)
+### S6v — vendor CC v1.0-rc9 (tagged 2026-10-21)
+
+Tag `v1.0-rc9` = CC main `5d50c6bb160ecbee99a66e1700597c029846e6b6` (tag object `a1c2bea5`).
+Verified from the local CC checkout: the diff from aa5ae9c to the tag is `tools/_md2latex.py`
+and the PDFs only; no manifest, registry, vector or Part byte changed, and the vendored
+`tests/fixtures/csd4/csd4_chain.json` sha256 equals `git show v1.0-rc9:manifests/csd4_chain.json`
+(b759e488…). S6v therefore vendors at 5d50c6bb and no longer waits on anything.
 
 Persist vendors tagged CC only (v58's slice V is the template: `scripts/check_vendored_cc.sh
 <tag>` must PASS; `manifest_diff.py` report in the CHANGELOG for Edge; every `VENDORED_*`
