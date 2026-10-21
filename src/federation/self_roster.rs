@@ -91,7 +91,79 @@ pub const W_SELF_SECS: i64 = 86_400;
 /// The self roster's conditions on the two paths (CC 3.3.6.3).
 #[must_use]
 pub fn policy() -> TwoPathPolicy {
-    TwoPathPolicy::self_roster(W_SELF_SECS)
+    TwoPathPolicy::self_roster(w_self_secs())
+}
+
+/// `W_self` as this node applies it: [`W_SELF_SECS`], on every production
+/// build. v60.0.0 (CIRISPersist#1111, CIRISServer#794 T11) — a `test-anchor`
+/// build whose test-anchor override is LIVE (the feature, the runtime arm and
+/// verify's anti-production tripwire: [`test_window`]) uses
+/// `CIRIS_TEST_W_SELF_SECS` instead, so a harness binary can watch a lone
+/// path land without waiting a day. The window still runs on the node's
+/// clock from the node's receipt; only its length moves.
+#[must_use]
+pub fn w_self_secs() -> i64 {
+    #[cfg(feature = "test-anchor")]
+    {
+        test_window::window(
+            super::genesis::test_anchor_override_active(),
+            test_window::env_secs(),
+        )
+    }
+    #[cfg(not(feature = "test-anchor"))]
+    {
+        W_SELF_SECS
+    }
+}
+
+/// v60.0.0 (CIRISPersist#1111) — the test harness's `W_self`. Compiled only
+/// with `feature = "test-anchor"`: a production build carries no read of
+/// [`test_window::ENV`] (I1162's from-disk half pins that every read of it
+/// sits in this module).
+#[cfg(feature = "test-anchor")]
+pub mod test_window {
+    /// The variable a test-anchor harness sets: whole seconds, in
+    /// `1..=`[`W_SELF_SECS`](super::W_SELF_SECS). It can shorten the window,
+    /// never lengthen it; any other value is ignored with a warning.
+    pub const ENV: &str = "CIRIS_TEST_W_SELF_SECS";
+
+    /// [`ENV`], read once per process.
+    pub(super) fn env_secs() -> Option<i64> {
+        static SECS: std::sync::OnceLock<Option<i64>> = std::sync::OnceLock::new();
+        *SECS.get_or_init(|| parse_secs(std::env::var(ENV).ok().as_deref()))
+    }
+
+    /// A value of [`ENV`]: whole seconds in `1..=`[`W_SELF_SECS`](super::W_SELF_SECS),
+    /// else `None` (with a warning when the variable was set).
+    #[must_use]
+    pub fn parse_secs(raw: Option<&str>) -> Option<i64> {
+        let raw = raw?;
+        let secs = raw
+            .trim()
+            .parse::<i64>()
+            .ok()
+            .filter(|s| (1..=super::W_SELF_SECS).contains(s));
+        if secs.is_none() {
+            tracing::warn!(
+                value = %raw,
+                "{ENV} is not whole seconds in 1..={}: W_self stays {}",
+                super::W_SELF_SECS,
+                super::W_SELF_SECS
+            );
+        }
+        secs
+    }
+
+    /// The window: `env_secs` when the test-anchor override is active, else
+    /// [`W_SELF_SECS`](super::W_SELF_SECS). An env value without the
+    /// override is inert.
+    #[must_use]
+    pub fn window(override_active: bool, env_secs: Option<i64>) -> i64 {
+        match env_secs {
+            Some(secs) if override_active => secs,
+            _ => super::W_SELF_SECS,
+        }
+    }
 }
 
 /// The proposal row's dimension (CC 3.1.9.2 `objection:{state}`; minted here).

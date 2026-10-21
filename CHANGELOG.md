@@ -9,6 +9,25 @@ threat-model citations because this crate's audit story is the point.
 
 ## [60.0.0] - UNRELEASED
 
+### Added — a test-anchor seam on `W_self` (CIRISPersist#1111, CIRISServer#794 T11)
+
+A `test-anchor` harness binary could not watch the self roster's lone path
+land: `W_SELF_SECS` is 86 400 s and the node clock's seam is `cfg(test)`-only.
+`self_roster::policy()` now reads `self_roster::w_self_secs()`, which is
+`W_SELF_SECS` on every production build. Under `feature = "test-anchor"`
+ONLY, and only while the test-anchor override is live (the existing fence:
+the feature, `CIRIS_TESTING_MODE`, a decodable `CIRIS_TEST_TRUST_ROOT`, and
+verify's anti-production tripwire), `CIRIS_TEST_W_SELF_SECS` (whole seconds
+in `1..=86400`, read once per process; it can shorten the window, never
+lengthen it) replaces it. The window still runs on the node's clock from the
+node's receipt. Witness **I1162**: armed with the variable set, an unanswered
+addition lands after the short window on sqlite and postgres; with the
+variable set and no override it does not
+(`tests/self_roster_test_window_1111.rs`, its own process: #738); the lib
+half pins the override condition and the parse, and a from-disk check pins
+every read of the variable inside the `#[cfg(feature = "test-anchor")]`
+module `self_roster::test_window`.
+
 ### Fixed — the nightly mutants job is green again (CIRISPersist#1112)
 
 The scheduled `mutants and powerset` job had been red every day since

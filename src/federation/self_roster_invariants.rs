@@ -1189,6 +1189,90 @@ mod tests {
         };
     }
 
+    /// **I1162** (#1111) — the harness window needs the live override: the
+    /// env value is the window only when the test-anchor override is active,
+    /// and a value outside `1..=W_SELF_SECS` is no value. The lone path
+    /// landing on the short window, end to end on sqlite and postgres, is
+    /// `tests/self_roster_test_window_1111.rs` (it arms the process env, which
+    /// no test under src/ may do: #738).
+    #[cfg(feature = "test-anchor")]
+    #[test]
+    fn i1162_the_test_window_needs_the_live_override() {
+        use crate::federation::self_roster::{test_window as tw, w_self_secs, W_SELF_SECS};
+        assert_eq!(
+            tw::window(true, Some(2)),
+            2,
+            "I1162: armed, the env's window"
+        );
+        assert_eq!(
+            tw::window(false, Some(2)),
+            W_SELF_SECS,
+            "I1162: the env without the override is inert"
+        );
+        assert_eq!(tw::window(true, None), W_SELF_SECS, "I1162: no value");
+        assert_eq!(tw::window(false, None), W_SELF_SECS, "I1162: neither");
+        assert_eq!(
+            w_self_secs(),
+            W_SELF_SECS,
+            "I1162: no lib test arms the override"
+        );
+        assert_eq!(tw::parse_secs(None), None, "I1162: unset");
+        assert_eq!(tw::parse_secs(Some(" 2 ")), Some(2), "I1162: whole seconds");
+        assert_eq!(tw::parse_secs(Some("1")), Some(1), "I1162: the floor");
+        assert_eq!(
+            tw::parse_secs(Some(&W_SELF_SECS.to_string())),
+            Some(W_SELF_SECS),
+            "I1162: the ceiling"
+        );
+        for bad in ["0", "-5", "86401", "2.5", "two", ""] {
+            assert_eq!(tw::parse_secs(Some(bad)), None, "I1162: {bad:?}");
+        }
+    }
+
+    /// **I1162** (#1111), from disk — a build without `test-anchor` carries
+    /// no read of the window variable: every mention of it, and every
+    /// environment read in `self_roster.rs`, sits inside the
+    /// `#[cfg(feature = "test-anchor")]` module `test_window`, and the one
+    /// call into that module sits under the same `cfg`.
+    #[test]
+    fn i1162_only_a_test_anchor_build_reads_the_window_env() {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/federation/self_roster.rs");
+        let text = std::fs::read_to_string(&path).expect("self_roster.rs");
+        let code: Vec<&str> = text
+            .lines()
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .collect();
+        let fence = "#[cfg(feature = \"test-anchor\")]";
+        let open = code
+            .iter()
+            .position(|l| l.trim() == "pub mod test_window {")
+            .expect("I1162: the test_window module");
+        assert_eq!(code[open - 1].trim(), fence, "I1162: test_window is fenced");
+        let close = open
+            + code[open..]
+                .iter()
+                .position(|l| *l == "}")
+                .expect("I1162: test_window closes");
+        let needles = ["CIRIS_TEST_W_SELF_SECS", "env::var", "env_secs("];
+        for (i, line) in code.iter().enumerate() {
+            if (open..=close).contains(&i) || !needles.iter().any(|n| line.contains(n)) {
+                continue;
+            }
+            // The one call outside: `w_self_secs`'s fenced block.
+            let fenced = code[..i].iter().rev().take(6).any(|l| l.trim() == fence);
+            assert!(
+                line.contains("test_window::env_secs()") && fenced,
+                "I1162: self_roster.rs:{} reads the window env outside the fence: {line}",
+                i + 1
+            );
+        }
+        assert!(
+            text.contains("CIRIS_TEST_W_SELF_SECS"),
+            "I1162: the scan reads the file that names the variable"
+        );
+    }
+
     on_every_backend!(i1130, bodies::i1130_one_key_adds_at_once);
     on_every_backend!(i1131, bodies::i1131_two_keys_quorum);
     on_every_backend!(i1132, bodies::i1132_lone_path_and_silence);
