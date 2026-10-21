@@ -59,6 +59,7 @@ its build.
 | S4 | consent and sweep planes on one plan | #934 step 4 | refactor | 1 day |
 | S5 | retire `memory.rs` onto sqlite in-memory | #1002 (+ folds #679, #681, #691, #720, #722, #787) | refactor, the only step that moves the total | 1–1½ days |
 | S6 | organisations as affiliations | #1036 (all five items), #1049, #1062, #1048 | migration + feature | 2 days |
+| S6v | vendor CC v1.0-rc9 at the tag (the steward said "cut RC9" 2026-10-21; CIRISConstitution#182) | registry re-vendor; the chain, governance-policy and vocabulary fixtures become runtime manifests; `check_corridor` at admission from the policy table | vendor | ½–1 day |
 | S7 | release: evidence, CHANGELOG, Edge adoption, chain | — | — | ½ day |
 
 Not in v60, by decision: #1004 (the workspace split; it needs the plan/execute line S3–S5
@@ -291,6 +292,23 @@ widening in `resolve_withdraws_admission_rule_at`), contest = `reconsideration:{
 Witnesses I12xx on both backends + mutations; `scope-s6-affiliations.txt`. Evidence:
 `CLM-authority-id-is-org-id`, `CLM-licence-authority-quorum`, `CLM-licence-judged-at-issuance`,
 `CLM-licence-audience`, `CLM-licence-contest`. Expected: 3 typed tables and 3 wire kinds gone.
+
+
+### S6v — vendor CC v1.0-rc9 (after the tag exists)
+
+Persist vendors tagged CC only (v58's slice V is the template: `scripts/check_vendored_cc.sh
+<tag>` must PASS; `manifest_diff.py` report in the CHANGELOG for Edge; every `VENDORED_*`
+pin and the binds oracle regenerated at the tag commit). rc9 adds, at least: `objection:{state}`
+with `proposal` and `assent`; `transport:canonical_rebind:v1`; `identity:occurrence_revocation:v1`;
+the refusal tokens persist named (`federation_set_semantics_unsorted` sorted-AND-unique,
+`federation_malformed_row` reasons `envelope_member_null`, `aggregate_source_duplicate`,
+`key_id_fingerprint_mismatch`, `carrier_without_roster_quorum`); CC 4.5.13's
+`governance_policy.json` (cancel_over, at_window, min_count) and `csd4_chain.json`. The
+fixtures vendored in v59/S0 (`governance_policy.json` b7d2370d, `csd4_chain.json` 5fe1c0f,
+the csd4 vocabulary/traces/requirements) move to runtime manifests at the tag's bytes, and
+`TwoPathPolicy::check_corridor` runs at admission against the vendored policy table (the one
+piece v59 left for the tag). The 732 governance vectors and the self_roster traces re-run
+at the tag's pins. Witness the pins; mutation scope `scope-s6v-vendor.txt`.
 
 ### S7 — release
 
