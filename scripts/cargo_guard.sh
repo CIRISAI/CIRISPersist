@@ -24,12 +24,22 @@
 #               a second guard does not race into the same headroom.
 #   3. CAP    — runs the command in a transient systemd user scope with
 #               MemoryMax=$CARGO_GUARD_MAX_GB (default 14 with one slot,
-#               11 with two, 7 with three), MemoryHigh one GB below it (the
-#               kernel throttles and reclaims before it kills), no swap, and
-#               memory.oom.group=1 so an OOM kills the WHOLE build (exit 137
-#               / "Killed") instead of one rustc, and the session that
-#               launched it survives. Falls back to no cap (with a warning)
-#               when systemd-run is not usable.
+#               11 with two, 7 with three), no swap, and memory.oom.group=1
+#               so an OOM kills the WHOLE build (exit 137 / "Killed")
+#               instead of one rustc, and the session that launched it
+#               survives. Falls back to no cap (with a warning) when
+#               systemd-run is not usable.
+#               NO MemoryHigh. 2026-10-21: a build throttled at its high mark
+#               is a sustained memory stall, which is what PSI measures;
+#               systemd-oomd (ManagedOOMMemoryPressure=kill on
+#               user@1000.service, limit 50 % for 20 s) saw 84 % and killed
+#               the TERMINAL scope (every agent in it), then the build. A
+#               hard cap fails fast inside the scope instead of stalling.
+#   3b. SHIELD — marks the CALLER's own cgroup (the terminal scope that
+#               launched the build) ManagedOOMPreference=avoid for the
+#               session's lifetime, so when oomd does fire it prefers the
+#               build scope over the terminal. User-manager units honour
+#               this for the owning user. Best effort; a warning if refused.
 #   4. JOBS   — exports CARGO_BUILD_JOBS and NEXTEST_TEST_THREADS unless
 #               already set: 4 with one or two slots, 2 with three or more.
 #
@@ -57,7 +67,6 @@ floor_gb="${CARGO_GUARD_FLOOR_GB:-8}"
 slots="${CARGO_GUARD_SLOTS:-2}"
 case "$slots" in 1) dmax=14; djobs=4;; 2) dmax=11; djobs=4;; *) dmax=7; djobs=2;; esac
 max_gb="${CARGO_GUARD_MAX_GB:-$dmax}"
-high_gb=$(( max_gb > 2 ? max_gb - 1 : max_gb ))
 stats="${CARGO_GUARD_STATS:-$HOME/.cache/cargo_guard_stats.log}"
 export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-$djobs}"
 export NEXTEST_TEST_THREADS="${NEXTEST_TEST_THREADS:-$djobs}"
@@ -84,9 +93,16 @@ while [ "$(avail_gb)" -lt "$floor_gb" ]; do
     fi
     sleep 20
 done
-echo "cargo_guard: slot $slot/$slots, $(avail_gb) GB available, cap ${max_gb} GB (high ${high_gb}), jobs $CARGO_BUILD_JOBS, threads $NEXTEST_TEST_THREADS: $*" >&2
+echo "cargo_guard: slot $slot/$slots, $(avail_gb) GB available, cap ${max_gb} GB, jobs $CARGO_BUILD_JOBS, threads $NEXTEST_TEST_THREADS: $*" >&2
 if command -v systemd-run >/dev/null 2>&1 \
    && systemd-run --user --scope -q -p MemoryMax=1M true >/dev/null 2>&1; then
+    # 3b. SHIELD the caller's scope from systemd-oomd's pressure kill.
+    caller_unit="$(cut -d: -f3 /proc/self/cgroup | awk -F/ '{print $NF}')"
+    case "$caller_unit" in
+        *.scope|*.service)
+            systemctl --user set-property --runtime "$caller_unit" ManagedOOMPreference=avoid >/dev/null 2>&1 \
+                || echo "cargo_guard: could not mark $caller_unit ManagedOOMPreference=avoid (oomd may still prefer the terminal)" >&2 ;;
+    esac
     unit="cargo-guard-$$-$(date +%s)"
     # 5. The scope exists only once systemd-run starts it; a detached helper
     # waits for it and samples until it vanishes.
@@ -102,7 +118,7 @@ if command -v systemd-run >/dev/null 2>&1 \
     # starts, so there is no window in which a fast allocator can be killed
     # alone and leave its siblings running.
     exec systemd-run --user --scope -q --unit="$unit" \
-        -p "MemoryMax=${max_gb}G" -p "MemoryHigh=${high_gb}G" -p MemorySwapMax=0 \
+        -p "MemoryMax=${max_gb}G" -p MemorySwapMax=0 \
         --setenv=CARGO_BUILD_JOBS --setenv=NEXTEST_TEST_THREADS \
         bash -c 'echo 1 > "/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup)/memory.oom.group" 2>/dev/null; exec "$@"' cargo_guard "$@"
 else
