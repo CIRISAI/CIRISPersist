@@ -202,7 +202,7 @@ done
 # The leg is skippable ONLY by CERTIFY_SKIP_PYTHON=1, and never silently — the
 # verdict table carries a SKIPPED line and the run stops claiming full
 # certification.
-ALL_KEYS="$LEGS default python fmt clippy pyi featmatrix wheelfeat docver pyo3sqlite dirdouble astgates weaver bitschanged mutmatrix cachetrim cacheunits evidencetsv evidenceptr evidenceptrcc sizetest sizereport floortoken$AXIS_KEYS"
+ALL_KEYS="$LEGS default python fmt clippy pyi featmatrix wheelfeat docver pyo3sqlite dirdouble astgates weaver bitschanged mutmatrix mutscopes cachetrim cacheunits evidencetsv evidenceptr evidenceptrcc sizetest sizereport floortoken$AXIS_KEYS"
 
 FOCUS_LEG=""; FOCUS_FILTER=""
 if [ "$MODE" = "focus" ]; then
@@ -581,6 +581,11 @@ run_bg bitschanged scripts/bits_changed_test.sh
 # v54.1.0 (CIRISPersist#1045 item 4, #1051) — the mutation matrix's reader,
 # verdict and allow-list grammar, against fixture tool outputs (no cargo).
 run_bg mutmatrix  python3 scripts/mutants_matrix_test.py
+# v60.0.0 (docs/V60_TASK_PLAN.md §3) — every mutation scope resolves, its
+# `tests:` filter is a well-formed filterset that names tests on disk, its
+# `features:` exist, and every allow-list line names an issue (from disk, no
+# cargo). The checker's own witnesses run first.
+run_bg mutscopes bash -c 'python3 scripts/mutants_scopes_check.py --self-test && python3 scripts/mutants_scopes_check.py'
 # v54.1.0 (CIRISPersist#1022) — the pre-save cache trim (fixture target/).
 run_bg cachetrim  python3 scripts/ci_cache_trim_test.py
 # v55.0.1 — the cache unit seal and the restore repair (fixture target/).
@@ -647,7 +652,7 @@ wait
 # before the expensive legs dispatch, is the point of the fast stage: a compile
 # break under `--features cirisnode` alone should cost seconds, not the full
 # test matrix first.
-FAST_GATES="fmt pyi featmatrix wheelfeat docver pyo3sqlite dirdouble astgates weaver bitschanged mutmatrix cachetrim cacheunits evidencetsv evidenceptr evidenceptrcc sizetest sizereport floortoken$AXIS_KEYS"
+FAST_GATES="fmt pyi featmatrix wheelfeat docver pyo3sqlite dirdouble astgates weaver bitschanged mutmatrix mutscopes cachetrim cacheunits evidencetsv evidenceptr evidenceptrcc sizetest sizereport floortoken$AXIS_KEYS"
 
 # Every `.rc` this run produced must be claimed by a key someone reads. The log
 # directory is wiped at startup, so anything here was written by this run.

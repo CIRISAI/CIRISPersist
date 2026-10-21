@@ -32,7 +32,8 @@
 #   MUTANTS_BUDGET_SECS   wall-time budget (default 7200). On expiry the tool
 #                         is interrupted and the matrix is written from what
 #                         finished, marked "complete": false.
-#   MUTANTS_FEATURES      cargo features (default postgres,sqlite,server). The
+#   MUTANTS_FEATURES      cargo features (default: the scope's `features:` line,
+#                         else postgres,sqlite,server). The
 #                         postgres witnesses need a DSN: the run goes through
 #                         scripts/pg_test_db.sh when the feature is on.
 #   MUTANTS_JOBS          parallel mutants (cargo-mutants -j; default 1). Each
@@ -62,7 +63,10 @@ if [ -z "$tool" ] || [ -z "$scope" ] || [ ! -f "$scope" ]; then
 fi
 
 BUDGET="${MUTANTS_BUDGET_SECS:-7200}"
-FEATURES="${MUTANTS_FEATURES:-postgres,sqlite,server}"
+# v60.0.0 — a scope may name its own features (`features:`); MUTANTS_FEATURES
+# still wins.
+scope_features="$(python3 scripts/mutants_matrix.py features "$scope")" || exit 2
+FEATURES="${MUTANTS_FEATURES:-${scope_features:-postgres,sqlite,server}}"
 JOBS="${MUTANTS_JOBS:-1}"
 SHARD="${MUTANTS_SHARD:-}"
 ALLOW="${MUTANTS_ALLOW:-scripts/mutants/allowed_survivors.txt}"

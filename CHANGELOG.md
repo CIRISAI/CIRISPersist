@@ -28,6 +28,34 @@ half pins the override condition and the parse, and a from-disk check pins
 every read of the variable inside the `#[cfg(feature = "test-anchor")]`
 module `self_roster::test_window`.
 
+### Added — one mutation discipline: a scope per slice, checked from disk (docs/V60_TASK_PLAN.md §3)
+
+Every slice since v53 ran its mutation round as an ad-hoc script outside the
+repo; nobody could re-run one, and the nightly matrix never learned the sites.
+From v60 each slice ships `scripts/mutants/scope-<slice>.txt` and runs it
+through `scripts/mutants.sh`; its matrix is the handoff's mutation table, and
+green is exit 0 with an empty `unvalidated.txt` (docs/MUTATION_TESTING.md
+"Per-slice scopes (v60)": the rule, a scope-file template, the brief
+paragraph agents copy).
+
+- `scripts/mutants_scopes_check.py` (stdlib, from disk): every scope resolves
+  through `mutants_matrix.py resolve`, its `tests:` filter is a well-formed
+  nextest filterset whose `test(...)` leaves match a `fn` or `mod` name under
+  `src/` or `tests/`, its `features:` exist in `Cargo.toml`, and every
+  `allowed_survivors.txt` line names an issue; `--self-test` shows it fails on
+  each. A certify fast gate (`mutscopes`, beside `mutmatrix`), and a step in
+  `ci.yml` and the nightly `mutants.yml`.
+- The scope grammar gains `features:` (read by `scripts/mutants.sh`;
+  `MUTANTS_FEATURES` still wins): a site under `cfg(feature = "test-anchor")`
+  mutated in a build without the feature is never compiled, and every mutant
+  in it would read MISSED.
+- `scripts/mutants/scope-s0-roster-seam.txt`: #1109 and #1111's doors
+  against I1161/I1162, the first scope with `features: …,test-anchor`.
+- `reports (non-gating)` runs `scripts/mutants_diff.sh origin/main` on every
+  `release-*` PR (it ran only on a `run-mutants` label), capped by
+  `MUTANTS_DIFF_BUDGET_SECS` (7200 s) inside the job's 150 minutes; the
+  summary lands in the step summary and the artifact.
+
 ### Fixed — the nightly mutants job is green again (CIRISPersist#1112)
 
 The scheduled `mutants and powerset` job had been red every day since

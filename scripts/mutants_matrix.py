@@ -7,6 +7,7 @@ arguments, and it turns the tool's raw output into ONE matrix format,
 whichever tool produced it.
 
     mutants_matrix.py tests <scope>                     the scope's nextest filterset
+    mutants_matrix.py features <scope>                  the scope's `features:` line (may be empty)
     mutants_matrix.py resolve cargo-mutants <scope> <diff-out>
                                                         cargo-mutants args, one per line;
                                                         writes the scope as a diff to <diff-out>
@@ -68,13 +69,20 @@ OUTCOMES = ("caught", "caught_out_of_scope", "crashed", "missed", "timeout", "un
 
 
 def parse_scope(path: str) -> dict:
-    scope = {"tests": None, "witnesses": [], "entries": []}
+    scope = {"tests": None, "witnesses": [], "entries": [], "features": None}
     for n, raw in enumerate(Path(path).read_text().splitlines(), 1):
         line = raw.split("#", 1)[0].strip()
         if not line:
             continue
         if line.startswith("tests:"):
             scope["tests"] = line[len("tests:"):].strip()
+            continue
+        # v60.0.0 — the cargo features the scope's sites compile under, when
+        # they are not mutants.sh's default (a `cfg(feature = "test-anchor")`
+        # site mutated in a build without the feature is never compiled, so
+        # every witness passes and the mutant reads MISSED).
+        if line.startswith("features:"):
+            scope["features"] = ",".join(line[len("features:"):].replace(",", " ").split())
             continue
         if line.startswith("witnesses:"):
             scope["witnesses"] += line[len("witnesses:"):].split()
@@ -684,6 +692,9 @@ def verdict(matrix: dict, allow: list[dict], repo_url: str = "") -> tuple[int, l
 def main(argv: list[str]) -> int:
     if len(argv) >= 3 and argv[1] == "tests":
         print(parse_scope(argv[2])["tests"])
+        return 0
+    if len(argv) == 3 and argv[1] == "features":
+        print(parse_scope(argv[2])["features"] or "")
         return 0
     if len(argv) in (4, 5) and argv[1] == "resolve":
         resolve(argv[2], argv[3], argv[4] if len(argv) == 5 else None)
