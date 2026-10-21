@@ -27,6 +27,21 @@ The scheduled `mutants and powerset` job had been red every day since
   MISSED guard mutants had no witness because the catalogue holds only
   well-formed units.
 
+### Fixed — `nodes_owned_by` returns the nodes a roster key announced (CIRISPersist#1109)
+
+`admission::nodes_owned_by(fedID)` sought its candidates only among the
+`delegates_to` owner-bindings the fedID's own key signed. A device joined by
+approval announces its node with its roster key (`<fedID>-<fp>`), and since
+v59.0.0 `owner_of` credits that binding to the fedID (`self_of_at`), so the
+forward walk named the self as owner while the reverse walk never placed the
+node. The seek now also reads the bindings every key bound as an occurrence
+of the fedID signed; the verdict is still `owner_of`, so `n ∈
+nodes_owned_by(U) ⟺ owner_of(n) == U` holds by construction and a key of
+another self, or a key that bound a node after its eviction, adds nothing.
+**`nodes_owned_by` now returns roster-key-announced nodes**: CIRISServer can
+delete its `announced_nodes_of` workaround. Witness **I1161** (memory,
+sqlite, postgres).
+
 ## [59.1.0] - 2026-10-20
 
 ### Changed — the production genesis bundle is the v4 amend (CIRISPersist#1106, CC 5.3.4)
