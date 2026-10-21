@@ -621,6 +621,7 @@ async fn equivocation_emits_hard_case_and_retains_both() {
         .list_hard_case_events(ciris_persist::federation::HardCaseFilter {
             kind: Some(WITNESS_EQUIVOCATION.to_owned()),
             since: None,
+            emitter_key_id: None,
         })
         .await
         .unwrap();
@@ -649,6 +650,7 @@ async fn equivocation_emits_hard_case_and_retains_both() {
         .list_hard_case_events(ciris_persist::federation::HardCaseFilter {
             kind: Some(WITNESS_EQUIVOCATION.to_owned()),
             since: None,
+            emitter_key_id: None,
         })
         .await
         .unwrap();

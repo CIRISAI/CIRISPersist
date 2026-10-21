@@ -375,3 +375,5 @@ sqlite	200	legacy_framed_occurrence_revocations	13764224007912318846
 postgres	200	legacy_framed_occurrence_revocations	1831514606684552061
 sqlite	201	self_roster_settled_index	15053344025319008484
 postgres	201	self_roster_settled_index	10153111305644630646
+sqlite	202	hard_case_event_emitter	6735624047132756008
+postgres	202	hard_case_event_emitter	11487871256818640586

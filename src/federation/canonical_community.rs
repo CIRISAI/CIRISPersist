@@ -1644,6 +1644,7 @@ where
         subject_key_id: Some(community_key_id.to_owned()),
         detail: serde_json::json!({ "reason": reason, "at": now.to_rfc3339() }),
         emitted_at: now,
+        emitter_key_id: String::new(),
     };
     match super::hard_case::record_observation(directory, event).await {
         Ok(()) => Ok(()),
@@ -2216,6 +2217,7 @@ where
         subject_key_id: Some(lineage_key_id.to_owned()),
         detail: serde_json::to_value(e).unwrap_or_default(),
         emitted_at: now,
+        emitter_key_id: String::new(),
     };
     match super::hard_case::record_observation(directory, event).await {
         Ok(()) => Ok(()),

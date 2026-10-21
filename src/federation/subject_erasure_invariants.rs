@@ -128,6 +128,7 @@ pub(crate) mod bodies {
         b.list_hard_case_events(crate::federation::hard_case::HardCaseFilter {
             kind: Some(crate::federation::hard_case::kind::TRACE_ERASURE.to_owned()),
             since: None,
+            emitter_key_id: None,
         })
         .await
         .unwrap()
@@ -504,6 +505,7 @@ pub(crate) mod bodies {
                 "detection_events_tombstoned": 1,
             }),
             emitted_at: chrono::Utc::now(),
+            emitter_key_id: String::new(),
         }
     }
 

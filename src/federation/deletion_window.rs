@@ -250,6 +250,7 @@ pub fn breach_event(
             "observed_at": now.to_rfc3339(),
         }),
         emitted_at: now,
+        emitter_key_id: String::new(),
     }
 }
 
@@ -303,6 +304,7 @@ pub fn retain_window_breach_event(
             "observed_at": now.to_rfc3339(),
         }),
         emitted_at: now,
+        emitter_key_id: String::new(),
     }
 }
 
@@ -325,6 +327,7 @@ pub fn malformed_event(row: &Attestation, now: DateTime<Utc>) -> HardCaseEvent {
             "observed_at": now.to_rfc3339(),
         }),
         emitted_at: now,
+        emitter_key_id: String::new(),
     }
 }
 
@@ -831,6 +834,7 @@ pub(crate) mod watch_witness {
         dir.list_hard_case_events(HardCaseFilter {
             kind: Some(kind.to_owned()),
             since: None,
+            emitter_key_id: None,
         })
         .await
         .expect("list_hard_case_events")

@@ -1565,6 +1565,7 @@ pub(crate) mod test_support {
             .list_hard_case_events(HardCaseFilter {
                 kind: Some(quarantine_kind.clone()),
                 since: None,
+                emitter_key_id: None,
             })
             .await
             .expect("list")
@@ -1602,6 +1603,7 @@ pub(crate) mod test_support {
             .list_hard_case_events(HardCaseFilter {
                 kind: Some(quarantine_kind),
                 since: None,
+                emitter_key_id: None,
             })
             .await
             .expect("list");

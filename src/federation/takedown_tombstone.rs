@@ -674,6 +674,7 @@ async fn record(
                     "origin": from,
                 }),
                 emitted_at: now,
+                emitter_key_id: String::new(),
             },
         )
         .await?;

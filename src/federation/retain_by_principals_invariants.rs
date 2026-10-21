@@ -295,6 +295,7 @@ pub(crate) mod bodies {
             .list_hard_case_events(HardCaseFilter {
                 kind: Some(kind::RETAIN_WINDOW_BREACH.to_owned()),
                 since: None,
+                emitter_key_id: None,
             })
             .await
             .unwrap();

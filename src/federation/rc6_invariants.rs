@@ -140,6 +140,7 @@ pub(crate) mod bodies {
         d.list_hard_case_events(HardCaseFilter {
             kind: Some(kind.to_owned()),
             since: None,
+            emitter_key_id: None,
         })
         .await
         .unwrap()

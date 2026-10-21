@@ -6854,6 +6854,7 @@ pub trait FederationDirectory: Send + Sync {
                         "cohort_key_id": group_key_id,
                     }),
                     emitted_at: now,
+                    emitter_key_id: String::new(),
                 },
             )
             .await?;
@@ -8990,6 +8991,7 @@ pub trait FederationDirectory: Send + Sync {
             .list_hard_case_events(hard_case::HardCaseFilter {
                 kind: Some(crate::witness::WITNESS_EQUIVOCATION.to_owned()),
                 since: None,
+                emitter_key_id: None,
             })
             .await?;
         let mut records = Vec::with_capacity(proofs.len());
@@ -9287,6 +9289,7 @@ pub trait FederationDirectory: Send + Sync {
                             "deadline": deadline.to_rfc3339(),
                         }),
                         emitted_at: now,
+                        emitter_key_id: String::new(),
                     })
                     .await?;
                     report.sla_breaches += 1;
@@ -9329,6 +9332,7 @@ pub trait FederationDirectory: Send + Sync {
                         "promotion_window_secs": promotion_window.as_secs(),
                     }),
                     emitted_at: now,
+                    emitter_key_id: String::new(),
                 })
                 .await?;
                 report.promotion_overdue += 1;
@@ -9387,6 +9391,7 @@ pub trait FederationDirectory: Send + Sync {
                     "promotion_window_secs": sla.as_secs(),
                 }),
                 emitted_at: now,
+                emitter_key_id: String::new(),
             })
             .await?;
             overdue.push(overdue_row(rev, now));

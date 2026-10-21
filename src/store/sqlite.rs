@@ -10168,10 +10168,12 @@ impl crate::federation::FederationDirectory for SqliteBackend {
     ) -> Result<Vec<crate::federation::HardCaseEvent>, crate::federation::Error> {
         let kind = filter.kind.clone();
         let since_s = filter.since.map(|t| t.to_rfc3339());
+        let emitter = filter.emitter_key_id.clone();
         self.read(
             move |conn| -> Result<Vec<crate::federation::HardCaseEvent>, rusqlite::Error> {
                 let mut sql = String::from(
-                    "SELECT event_id, kind, target_key_id, subject_key_id, detail, emitted_at \
+                    "SELECT event_id, kind, target_key_id, subject_key_id, detail, emitted_at, \
+                        emitter_key_id \
                  FROM hard_case_events",
                 );
                 let mut conds: Vec<String> = Vec::new();
@@ -10183,6 +10185,10 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                 if let Some(s) = since_s {
                     vals.push(s.into());
                     conds.push(format!("emitted_at >= ?{}", vals.len()));
+                }
+                if let Some(e) = emitter {
+                    vals.push(e.into());
+                    conds.push(format!("emitter_key_id = ?{}", vals.len()));
                 }
                 if !conds.is_empty() {
                     sql.push_str(" WHERE ");
@@ -13068,6 +13074,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                             "hard": hard,
                         }),
                         emitted_at: now,
+                        emitter_key_id: String::new(),
                     };
                     let plan = || -> Result<_, crate::federation::Error> {
                         let planned = crate::federation::attestation_admit::plan_hard_case_row(
@@ -21407,7 +21414,8 @@ impl crate::federation::attestation_admit::AttestationStore for SqliteBackend {
             let tx = conn.transaction()?;
             let legacy: Vec<crate::federation::HardCaseEvent> = {
                 let mut stmt = tx.prepare(
-                    "SELECT event_id, kind, target_key_id, subject_key_id, detail, emitted_at \
+                    "SELECT event_id, kind, target_key_id, subject_key_id, detail, emitted_at, \
+                            emitter_key_id \
                        FROM hard_case_events WHERE attestation_id IS NULL ORDER BY event_id",
                 )?;
                 let rows = stmt.query_map([], sqlite_row_to_hard_case_event)?;
@@ -23157,6 +23165,10 @@ fn sqlite_row_to_hard_case_event(
         detail: serde_json::from_str(&detail_s)
             .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new())),
         emitted_at: parse_rfc3339(&emitted_at),
+        // NULL only on a pre-v57 silo row the rehome has not moved yet.
+        emitter_key_id: row
+            .get::<_, Option<String>>("emitter_key_id")?
+            .unwrap_or_default(),
     })
 }
 
@@ -23650,8 +23662,9 @@ fn sqlite_project_hard_case(
     tx.execute(
         &format!(
             "INSERT INTO {table} \
-                (event_id, kind, target_key_id, subject_key_id, detail, emitted_at, attestation_id) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
+                (event_id, kind, target_key_id, subject_key_id, detail, emitted_at, attestation_id, \
+                 emitter_key_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"
         ),
         rusqlite::params![
             event.event_id,
@@ -23661,6 +23674,7 @@ fn sqlite_project_hard_case(
             detail,
             event.emitted_at.to_rfc3339(),
             attestation_id,
+            event.emitter_key_id,
         ],
     )?;
     Ok(())
@@ -33036,6 +33050,7 @@ mod tests {
             .list_hard_case_events(hard_case::HardCaseFilter {
                 kind: Some(hard_case::kind::FAMILY_MEMBERSHIP_CHANGE.into()),
                 since: None,
+                emitter_key_id: None,
             })
             .await
             .unwrap();
@@ -33594,6 +33609,7 @@ mod tests {
             subject_key_id: Some("subject-1".into()),
             detail: serde_json::json!({ "sla_days": 30 }),
             emitted_at: "2026-06-13T00:00:00Z".parse().unwrap(),
+            emitter_key_id: String::new(),
         };
         backend
             .record_hard_case(ev("hc-1", kind::CONSENT_SLA_BREACH))
@@ -33619,6 +33635,7 @@ mod tests {
             .list_hard_case_events(HardCaseFilter {
                 kind: Some(kind::CONSENT_SLA_BREACH.into()),
                 since: None,
+                emitter_key_id: None,
             })
             .await
             .unwrap();
@@ -33631,6 +33648,7 @@ mod tests {
             .list_hard_case_events(HardCaseFilter {
                 kind: None,
                 since: Some("2026-06-14T00:00:00Z".parse().unwrap()),
+                emitter_key_id: None,
             })
             .await
             .unwrap();
@@ -33708,6 +33726,7 @@ mod tests {
             .list_hard_case_events(HardCaseFilter {
                 kind: Some(kind::CONSENT_SLA_BREACH.into()),
                 since: None,
+                emitter_key_id: None,
             })
             .await
             .unwrap();
@@ -33825,6 +33844,7 @@ mod tests {
             .list_hard_case_events(HardCaseFilter {
                 kind: Some(kind::CONSENT_REVOCATION_PROMOTION_OVERDUE.into()),
                 since: None,
+                emitter_key_id: None,
             })
             .await
             .unwrap();
@@ -33838,6 +33858,7 @@ mod tests {
                 .list_hard_case_events(HardCaseFilter {
                     kind: Some(kind::CONSENT_REVOCATION_PROMOTION_OVERDUE.into()),
                     since: None,
+                    emitter_key_id: None,
                 })
                 .await
                 .unwrap()
@@ -33943,6 +33964,7 @@ mod tests {
             .list_hard_case_events(HardCaseFilter {
                 kind: Some(kind::CONSENT_REVOCATION_PROMOTION_OVERDUE.into()),
                 since: None,
+                emitter_key_id: None,
             })
             .await
             .unwrap();
@@ -33961,6 +33983,7 @@ mod tests {
                 .list_hard_case_events(HardCaseFilter {
                     kind: Some(kind::CONSENT_REVOCATION_PROMOTION_OVERDUE.into()),
                     since: None,
+                    emitter_key_id: None,
                 })
                 .await
                 .unwrap()
@@ -33977,6 +34000,7 @@ mod tests {
                 .list_hard_case_events(HardCaseFilter {
                     kind: Some(kind::CONSENT_REVOCATION_PROMOTION_OVERDUE.into()),
                     since: None,
+                    emitter_key_id: None,
                 })
                 .await
                 .unwrap()
@@ -37083,6 +37107,7 @@ mod tests {
             .list_hard_case_events(HardCaseFilter {
                 kind: Some(kind::RECIPIENT_EXCLUDED.into()),
                 since: None,
+                emitter_key_id: None,
             })
             .await
             .unwrap();
@@ -37444,6 +37469,7 @@ mod tests {
             .list_hard_case_events(HardCaseFilter {
                 kind: Some(kind::COMMUNITY_MEMBERSHIP_CHANGE.into()),
                 since: None,
+                emitter_key_id: None,
             })
             .await
             .unwrap();
@@ -38298,6 +38324,7 @@ mod tests {
             .list_hard_case_events(HardCaseFilter {
                 kind: Some(kind::FAMILY_MEMBERSHIP_CHANGE.into()),
                 since: None,
+                emitter_key_id: None,
             })
             .await
             .unwrap();
@@ -38309,6 +38336,7 @@ mod tests {
             .list_hard_case_events(HardCaseFilter {
                 kind: Some(kind::RECIPIENT_EXCLUDED.into()),
                 since: None,
+                emitter_key_id: None,
             })
             .await
             .unwrap();
@@ -41292,6 +41320,7 @@ mod tests {
             .list_hard_case_events(HardCaseFilter {
                 kind: Some(kind::CONSENT_REVOCATION_PROMOTION_OVERDUE.into()),
                 since: None,
+                emitter_key_id: None,
             })
             .await
             .unwrap();
@@ -48077,6 +48106,7 @@ mod tests {
             .list_hard_case_events(HardCaseFilter {
                 kind: Some(hard_case::kind::TRACE_ERASURE.into()),
                 since: None,
+                emitter_key_id: None,
             })
             .await
             .unwrap();

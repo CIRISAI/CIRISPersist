@@ -209,6 +209,7 @@ pub fn equivocation_hard_case(
             "witnesses": witnesses,
         }),
         emitted_at,
+        emitter_key_id: String::new(),
     }
 }
 

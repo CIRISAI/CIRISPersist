@@ -196,8 +196,11 @@
 //!   the local dry run names it inadmissible by that clause, and executing it
 //!   under a quorum notice, or applying a quorum-cosigned replicated bundle
 //!   naming it, is `purge_retraction_inadmissible` with nothing written; the
-//!   row survives. The v57 hold (`federation_hard_case_replication_held`) is the
-//!   mutation this witness kills: re-added at the crossing or at the put door
+//!   row survives. Each node's listing names every event's emitter, the key
+//!   that signed its row: B, recording one of its own, lists both with their
+//!   signers, and `HardCaseFilter::emitter_key_id` selects one node's. The
+//!   v57 hold (`federation_hard_case_replication_held`) is the mutation this
+//!   witness kills: re-added at the crossing or at the put door
 //!   (the replicated apply) it turns the crossing or B's apply red.
 
 #[cfg(test)]
@@ -3170,6 +3173,7 @@ pub(crate) mod bodies {
             subject_key_id: None,
             detail: serde_json::json!({"sla_days": 30}),
             emitted_at: crate::federation::admission::truncate_to_substrate_resolution(now()),
+            emitter_key_id: String::new(),
         };
         a.record_hard_case(event.clone())
             .await
@@ -3349,6 +3353,62 @@ pub(crate) mod bodies {
             b.get_attestation(&id).await.unwrap().is_some(),
             "I1165: the row survives on B"
         );
+
+        // ── B's listing names each event's emitter: the row's signer ──────
+        // The widened read set carries the floor it crosses (v60 ruling): B
+        // records an event of its own, so B's listing holds both nodes'
+        // events, each naming the key that signed its row.
+        const NODE_B: &str = "i1165-node-b";
+        ts::register_hybrid_key_as(b.as_dyn_directory(), NODE_B, NODE_B, identity_type::NODE).await;
+        b.set_node(NODE_B);
+        let own = HardCaseEvent {
+            event_id: format!("i1165-b-{}", uuid::Uuid::new_v4()),
+            target_key_id: Some("i1165-target-b".to_owned()),
+            ..event.clone()
+        };
+        b.record_hard_case(own.clone())
+            .await
+            .expect("I1165: B records an event of its own");
+        let listed = |filter: Option<&str>| {
+            let filter = hard_case::HardCaseFilter {
+                emitter_key_id: filter.map(str::to_owned),
+                ..hard_case::HardCaseFilter::default()
+            };
+            async move {
+                let mut pairs: Vec<(String, String)> = b
+                    .list_hard_case_events(filter)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|e| (e.event_id, e.emitter_key_id))
+                    .collect();
+                pairs.sort();
+                pairs
+            }
+        };
+        let mut both = vec![
+            (event.event_id.clone(), NODE_A.to_owned()),
+            (own.event_id.clone(), NODE_B.to_owned()),
+        ];
+        both.sort();
+        assert_eq!(
+            listed(None).await,
+            both,
+            "I1165: B lists A's replicated event beside its own, each naming its row's signer"
+        );
+        assert_eq!(
+            listed(Some(NODE_B)).await,
+            vec![(own.event_id.clone(), NODE_B.to_owned())],
+            "I1165: filtering on B's own key is the node-local view: A's event is excluded"
+        );
+        assert_eq!(
+            listed(Some(NODE_A)).await,
+            vec![(event.event_id.clone(), NODE_A.to_owned())],
+            "I1165: filtering on A's key returns exactly A's event"
+        );
+        check_projection_rebuild(b, SiloProjection::HardCaseEvents)
+            .await
+            .expect("I1165: B's hard_case_events, emitters included, is its rows' rebuild");
     }
 
     // ── I698 ──────────────────────────────────────────────────────────────

@@ -455,6 +455,7 @@ pub(crate) mod bodies {
             .list_hard_case_events(hard_case::HardCaseFilter {
                 kind: Some(hard_case::kind::RECIPIENT_EXCLUDED.to_owned()),
                 since: None,
+                emitter_key_id: None,
             })
             .await
             .unwrap();

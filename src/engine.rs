@@ -21537,6 +21537,7 @@ mod tests {
             .list_hard_case_events(HardCaseFilter {
                 kind: Some(kind::COMMUNITY_MEMBERSHIP_CHANGE.into()),
                 since: None,
+                emitter_key_id: None,
             })
             .await
             .expect("list events");
@@ -21622,6 +21623,7 @@ mod tests {
             .list_hard_case_events(HardCaseFilter {
                 kind: Some(kind::FAMILY_MEMBERSHIP_CHANGE.into()),
                 since: None,
+                emitter_key_id: None,
             })
             .await
             .expect("list family events");
@@ -21721,6 +21723,7 @@ mod tests {
             .list_hard_case_events(HardCaseFilter {
                 kind: Some(kind::DELETION_WINDOW_BREACH.to_string()),
                 since: None,
+                emitter_key_id: None,
             })
             .await
             .expect("list_hard_case_events");
