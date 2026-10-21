@@ -344,7 +344,7 @@ the tag, sha and evidence path for the pin.
 ## 6. Process rules (from memory, enforced by the lead)
 
 - Every cargo/nextest/maturin call and every `git commit` through `scripts/cargo_guard.sh`;
-  `CARGO_BUILD_JOBS=4`, `NEXTEST_TEST_THREADS=4`; one builder at a time.
+  `CARGO_BUILD_JOBS=4`, `NEXTEST_TEST_THREADS=4`; two guarded builds at a time (`CARGO_GUARD_SLOTS=2`, 11 GB caps; measured 2026-10-21: the sqlite lane peaks at 8.5 GB anonymous regardless of jobs, so jobs stay 4). Disk, not RAM, caps the worktree count: a warm target dir is 44 GB.
 - No `--no-verify`, no `--amend`, agents never push.
 - A shipped migration is immutable as bytes; the evidence tsv is generated from the manifest.
 - Each slice: cheap legs under `-D warnings`, the full lane INCLUDING `test-anchor` and python,

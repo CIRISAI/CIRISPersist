@@ -11,7 +11,7 @@
 # killer took the terminal scope (every agent in it), not the cargo that
 # grew. This wrapper makes a stray cargo the thing that dies instead:
 #
-#   1. SLOTS  — CARGO_GUARD_SLOTS builds at a time (default 1): `flock` on
+#   1. SLOTS  — CARGO_GUARD_SLOTS builds at a time (default 2): `flock` on
 #               $CARGO_GUARD_LOCK (slot 0, the pre-slot path every older
 #               checkout of this script still takes, so old and new guards
 #               contend on the same file) and $CARGO_GUARD_LOCK.<n> for
@@ -31,7 +31,15 @@
 #               launched it survives. Falls back to no cap (with a warning)
 #               when systemd-run is not usable.
 #   4. JOBS   — exports CARGO_BUILD_JOBS and NEXTEST_TEST_THREADS unless
-#               already set: 4 with one slot, 2 with two or more.
+#               already set: 4 with one or two slots, 2 with three or more.
+#
+# Measured 2026-10-21 (sqlite lane, warm tree, 3872 tests, this sampler):
+#   jobs 4 / threads 4 — peak anon 8.5 GB, peak file 4.0 GB, 625 s
+#   jobs 2 / threads 2 — peak anon 8.7 GB, peak file 4.1 GB, 1128 s
+# The anonymous peak is ONE process (rustc on the test crate), not the job
+# count, so narrowing jobs buys nothing and doubles the wall clock. Two
+# slots at 11 GB each (anon ~9 + reclaimable cache) fit a 31 GB box beside
+# ~2 GB of Claude processes, the PG container and an Edge session.
 #   5. STATS  — a sampler (scripts/cgroup_mem_sampler.sh) watches the scope
 #               and appends its peak ANONYMOUS memory (the part that OOMs;
 #               memory.peak also counts reclaimable page cache) to
@@ -46,8 +54,8 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 lock="${CARGO_GUARD_LOCK:-/tmp/cargo_guard.lock}"
 wait_secs="${CARGO_GUARD_WAIT_SECS:-3600}"
 floor_gb="${CARGO_GUARD_FLOOR_GB:-8}"
-slots="${CARGO_GUARD_SLOTS:-1}"
-case "$slots" in 1) dmax=14; djobs=4;; 2) dmax=11; djobs=2;; *) dmax=7; djobs=2;; esac
+slots="${CARGO_GUARD_SLOTS:-2}"
+case "$slots" in 1) dmax=14; djobs=4;; 2) dmax=11; djobs=4;; *) dmax=7; djobs=2;; esac
 max_gb="${CARGO_GUARD_MAX_GB:-$dmax}"
 high_gb=$(( max_gb > 2 ? max_gb - 1 : max_gb ))
 stats="${CARGO_GUARD_STATS:-$HOME/.cache/cargo_guard_stats.log}"
