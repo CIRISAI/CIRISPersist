@@ -1660,6 +1660,10 @@ jobs:
       # nightly job.
       - name: mutation matrix witnesses
         run: python3 scripts/mutants_matrix_test.py
+      # v60.0.0 (docs/V60_TASK_PLAN.md §3) — every scripts/mutants/scope-*.txt
+      # resolves, names tests that exist, and every allow-list line an issue.
+      - name: mutation scopes are well-formed (from disk)
+        run: python3 scripts/mutants_scopes_check.py --self-test && python3 scripts/mutants_scopes_check.py
       # v54.1.0 (#1022) — the pre-save trim removes this crate's outputs and no
       # dependency's (fixture target/, no cargo).
       - name: cache trim witnesses

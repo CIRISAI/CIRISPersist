@@ -1,0 +1,24 @@
+# Mutation scope: v60 slice S0 (docs/V60_TASK_PLAN.md §4 S0).
+#
+# - #1109: `admission::nodes_owned_by` seeks candidates among the bindings
+#   the person's own key AND every key bound as its occurrence signed; the
+#   verdict stays `owner_of`. Witness I1161 (memory, sqlite, postgres).
+# - #1111: the test-anchor W_self seam. `w_self_secs` / `test_window::window`
+#   / `test_window::parse_secs` compile only with `test-anchor`, hence the
+#   features line. Witness I1162 (lib half: the override condition, the
+#   parse, and the from-disk fence). `test_window::env_secs` (the OnceLock
+#   read of the process env) is NOT named: its only witness is the
+#   end-to-end target tests/self_roster_test_window_1111.rs, which arms the
+#   process env and so cannot be a lib test (#738), and scripts/mutants.sh
+#   runs `--lib`.
+#
+# Grammar: docs/MUTATION_TESTING.md "Scope files".
+#   `i1162_only_a_test_anchor_build_reads_the_window_env` is a from-disk
+#   fence over where the variable is read, not a witness of these fns'
+#   logic: no generated mutant moves the read, so it would kill nothing and
+#   read UNVALIDATED (the S0b run, 2026-10-21). It runs in the lib suite.
+tests: test(/i1161|i1162_/) - test(i1162_only_a_test_anchor_build_reads_the_window_env)
+features: postgres,sqlite,server,test-anchor
+
+src/federation/admission.rs nodes_owned_by
+src/federation/self_roster.rs policy w_self_secs window parse_secs

@@ -7,6 +7,149 @@ threat-model citations because this crate's audit story is the point.
 
 ## [Unreleased]
 
+## [60.0.0] - UNRELEASED
+
+### Changed — hard_case rows replicate (CIRISConstitution#170 closed)
+
+The steward ruled through CC (2026-10-21, CIRISConstitution#170 closed, rc9
+`6ce1674`): `hard_case:*` joins CC 2.4.1.1's unpurgeable accountability set,
+and no peer capability advertisement is needed (conformance is the guard).
+Persist already refused a hard_case purge (`ACCOUNTABILITY_RECORD_PREFIXES`,
+both purge doors and the replicated purge apply), so the v57 hold is lifted:
+a hard_case row crosses like any local row this node attests (the node signs
+as the actor) and a peer admits it at the put door and the replicated apply.
+
+- **Removed (clean break):** `Error::HardCaseReplicationHeld`, its kind
+  `federation_hard_case_replication_held` (`hard_case::refusal::REPLICATION_HELD`),
+  `hard_case::check_hard_case_replication_held`, and its Python arm (a
+  `RuntimeError`); no call site returns it any more. Nothing in the `.pyi`
+  named it.
+- **Changed:** `hard_case::project_hard_case_row` is tier-agnostic (the
+  detection projection's rule), and the put door (also the replicated apply)
+  projects a `hard_case:*` row into `hard_case_events` in the row's
+  transaction on every backend. Without both, a crossed row (moved to the
+  federation tier in place) and a peer's replicated row would each leave
+  `hard_case_events` different from its from-rows rebuild. A peer's events
+  are therefore listed by `list_hard_case_events` on the node that holds them.
+- Witness **I1165** (memory, sqlite, postgres): node A records a
+  `hard_case:consent_sla_breach:v1` row and crosses it; node B receives it
+  only through A's advertised wire hashes and point read, applies it
+  (`Inserted`), holds it at the federation tier, lists it, serves it, and
+  both nodes' `hard_case_events` equal their rebuilds; B's purge doors refuse
+  it as the accountability record (the dry run names it inadmissible; local
+  execution and a quorum-cosigned replicated bundle are both
+  `purge_retraction_inadmissible`, nothing written; the row survives). The
+  #607 conferral witness now expects the self-attested and conferred
+  hard_case rows ADMITTED where it expected the hold.
+- Evidence: `CLM-hard-case-on-base`'s row at the retired hold moves to the
+  replicated apply door (`attestation_apply.rs#apply_planned`);
+  `CLM-accountability-record-unpurgeable` (2.4.1.1) gains
+  `steward_purge.rs#accountability_record_of`.
+
+### Added — a test-anchor seam on `W_self` (CIRISPersist#1111, CIRISServer#794 T11)
+
+A `test-anchor` harness binary could not watch the self roster's lone path
+land: `W_SELF_SECS` is 86 400 s and the node clock's seam is `cfg(test)`-only.
+`self_roster::policy()` now reads `self_roster::w_self_secs()`, which is
+`W_SELF_SECS` on every production build. Under `feature = "test-anchor"`
+ONLY, and only while the test-anchor override is live (the existing fence:
+the feature, `CIRIS_TESTING_MODE`, a decodable `CIRIS_TEST_TRUST_ROOT`, and
+verify's anti-production tripwire), `CIRIS_TEST_W_SELF_SECS` (whole seconds
+in `1..=86400`, read once per process; it can shorten the window, never
+lengthen it) replaces it. The window still runs on the node's clock from the
+node's receipt. Witness **I1162**: armed with the variable set, an unanswered
+addition lands after the short window on sqlite and postgres; with the
+variable set and no override it does not
+(`tests/self_roster_test_window_1111.rs`, its own process: #738); the lib
+half pins the override condition and the parse, and a from-disk check pins
+every read of the variable inside the `#[cfg(feature = "test-anchor")]`
+module `self_roster::test_window`.
+
+### Added — one mutation discipline: a scope per slice, checked from disk (docs/V60_TASK_PLAN.md §3)
+
+Every slice since v53 ran its mutation round as an ad-hoc script outside the
+repo; nobody could re-run one, and the nightly matrix never learned the sites.
+From v60 each slice ships `scripts/mutants/scope-<slice>.txt` and runs it
+through `scripts/mutants.sh`; its matrix is the handoff's mutation table, and
+green is exit 0 with an empty `unvalidated.txt` (docs/MUTATION_TESTING.md
+"Per-slice scopes (v60)": the rule, a scope-file template, the brief
+paragraph agents copy).
+
+- `scripts/mutants_scopes_check.py` (stdlib, from disk): every scope resolves
+  through `mutants_matrix.py resolve`, its `tests:` filter is a well-formed
+  nextest filterset whose `test(...)` leaves match a `fn` or `mod` name under
+  `src/` or `tests/`, its `features:` exist in `Cargo.toml`, and every
+  `allowed_survivors.txt` line names an issue; `--self-test` shows it fails on
+  each. A certify fast gate (`mutscopes`, beside `mutmatrix`), and a step in
+  `ci.yml` and the nightly `mutants.yml`.
+- The scope grammar gains `features:` (read by `scripts/mutants.sh`;
+  `MUTANTS_FEATURES` still wins): a site under `cfg(feature = "test-anchor")`
+  mutated in a build without the feature is never compiled, and every mutant
+  in it would read MISSED.
+- `scripts/mutants/scope-s0-roster-seam.txt`: #1109 and #1111's doors
+  against I1161/I1162, the first scope with `features: …,test-anchor`.
+- `reports (non-gating)` runs `scripts/mutants_diff.sh origin/main` on every
+  `release-*` PR (it ran only on a `run-mutants` label), capped by
+  `MUTANTS_DIFF_BUDGET_SECS` (7200 s) inside the job's 150 minutes; the
+  summary lands in the step summary and the artifact.
+
+### Added — the CSD/4 coverage report (docs/V60_TASK_PLAN.md §3b, report-only)
+
+- `tests/fixtures/csd4/`: CIRISClient's `packaging/csd4/`
+  (`topology_vocabulary.json`, `traces.json`, `requirements.yaml`, `PIN.md`,
+  `topology_vocabulary.pin`) byte for byte, from CIRISClient main
+  `ab134ef2`; the README records the commit and the shas.
+- `tests/fixtures/csd4/csd4_chain.json`: CC's chain as data
+  (CIRISConstitution rc9 `manifests/csd4_chain.json`, byte for byte as last
+  changed at `6ce16745`; rc9 is untagged, so a fixture like
+  `governance_policy.json`): per atom its STATE_TABLE states, the invariants
+  and claims over them (`by_invariant` | `by_section`), each claim's evidence
+  pointers by repo, and the text's refusal tokens with their confidence.
+- `scripts/csd4_coverage.py` (stdlib, from disk) READS the join from the chain:
+  atom → claim → CIRISPersist `path#symbol` → the `evidence/cc_impl.tsv` row →
+  the `*_invariants.rs` files that name the symbol and the mutation scopes that
+  cover it. Gap lists: (a) chain refs with no row (or under another claim), and
+  rows no atom reaches; (b) atoms with persist claims but no witness or no
+  scope; (c) persist `kind()` tokens the text does not name, and text tokens
+  persist never emits, with `bold`/`after_refusal` confidence. `negatives.held`
+  and `values.ready` are listed as harness-level, not gaps. The `traces.json`
+  refused map and CEWPOS's "stops at rel[k]" relations (with an owner guess)
+  stay. `docs/CSD4_COVERAGE_v60_S0.md` is its run at the slice head. A
+  `reports (non-gating)` job runs it on every PR and weekly.
+
+### Fixed — the nightly mutants job is green again (CIRISPersist#1112)
+
+The scheduled `mutants and powerset` job had been red every day since
+2026-10-14 with seven unkilled mutants in `src/observe`, and nobody read it.
+
+- `count_read`'s walk over the active-fold mask is bounded by the mask's
+  popcount instead of `while mask != 0`. Each of the three operator mutants on
+  the clear-lowest-bit step made the old loop infinite; seventeen witnesses
+  hung to nextest's 60 s leash and the run outlived cargo-mutants' 300 s
+  timeout, which credits no witness (three TIMEOUTs). A witness cannot end an
+  infinite loop, so the bound makes the same mutants return at once with the
+  wrong fold credited, and **I1164** (a read inside three nested folds at
+  mask bits 0, 4 and 7 credits each exactly once) kills them.
+- **I1163**: `CatalogEntry::metrics_unit` refuses every malformed brace form
+  (`{}`, `ab}`, `abc`, `}`, `x}`, `{ab`, `{x`, `{`, `x`, empty). The four
+  MISSED guard mutants had no witness because the catalogue holds only
+  well-formed units.
+
+### Fixed — `nodes_owned_by` returns the nodes a roster key announced (CIRISPersist#1109)
+
+`admission::nodes_owned_by(fedID)` sought its candidates only among the
+`delegates_to` owner-bindings the fedID's own key signed. A device joined by
+approval announces its node with its roster key (`<fedID>-<fp>`), and since
+v59.0.0 `owner_of` credits that binding to the fedID (`self_of_at`), so the
+forward walk named the self as owner while the reverse walk never placed the
+node. The seek now also reads the bindings every key bound as an occurrence
+of the fedID signed; the verdict is still `owner_of`, so `n ∈
+nodes_owned_by(U) ⟺ owner_of(n) == U` holds by construction and a key of
+another self, or a key that bound a node after its eviction, adds nothing.
+**`nodes_owned_by` now returns roster-key-announced nodes**: CIRISServer can
+delete its `announced_nodes_of` workaround. Witness **I1161** (memory,
+sqlite, postgres).
+
 ## [59.1.0] - 2026-10-20
 
 ### Changed — the production genesis bundle is the v4 amend (CIRISPersist#1106, CC 5.3.4)

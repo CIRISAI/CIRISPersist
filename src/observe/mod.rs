@@ -306,11 +306,20 @@ pub fn record_read<R: ReadRow>(
 
 /// The counters half of a door read: the `(backend, door)` totals and every
 /// fold active on this task.
+///
+/// v60.0.0 (CIRISPersist#1112) — the walk over the mask is bounded by its
+/// popcount, not by `mask != 0`. Each of the three operator mutants on the
+/// clear-lowest-bit step (`&=` to `|=`, `-` to `+`, `-` to `/`) made the
+/// loop infinite: every witness that read inside a fold hung until nextest's
+/// 60 s leash, seventeen of them per mutant, and the run outlived the tool's
+/// 300 s timeout, which credits no witness. A witness cannot end an
+/// infinite loop; the bound makes the same mutants return at once with the
+/// wrong fold credited, which I692 and I1164 count.
 fn count_read(backend: StoreBackend, door: Door, n: u64, bytes: u64) {
     let c = counters();
     c.doors[backend as usize][door as usize].add(n, bytes);
     if let Ok(mut mask) = ACTIVE_FOLDS.try_with(|m| *m) {
-        while mask != 0 {
+        for _ in 0..mask.count_ones() {
             let i = mask.trailing_zeros() as usize;
             c.fold_reads[i].add(n, bytes);
             mask &= mask - 1;

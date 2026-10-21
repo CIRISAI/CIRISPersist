@@ -1761,7 +1761,11 @@ mod tests {
         // at the shared decision and the self-roster door (2).
         // v59.1.0: +2 (CLM-canonical-rebind: the rebind admission and the
         // rotation door, CIRISPersist#1106).
-        const EXPECTED: usize = 313;
+        // v60.0.0: +1 (CIRISConstitution#170 closed: CLM-accountability-
+        // record-unpurgeable at the steward purge's per-row question); the
+        // CLM-hard-case-on-base row at the retired hold moved to the
+        // replicated apply door (a move, not a new row).
+        const EXPECTED: usize = 314;
         assert_eq!(
             checked, EXPECTED,
             "checked {checked} version-pinned persist src/ rows, expected {EXPECTED}. \

@@ -221,6 +221,7 @@ decimal_id	claim_id	repo	path#symbol	crate@version
 2.4.1.1	CLM-purge-never-reaches-key	CIRISPersist	src/federation/steward_purge.rs#resolve_selection	ciris-persist@59.1.0
 2.4.1.1	CLM-accountability-record-unpurgeable	CIRISPersist	src/federation/migration.rs#accountability_record_family	ciris-persist@59.1.0
 2.4.1.1	CLM-accountability-record-unpurgeable	CIRISPersist	src/federation/steward_purge.rs#retraction_admissible	ciris-persist@59.1.0
+2.4.1.1	CLM-accountability-record-unpurgeable	CIRISPersist	src/federation/steward_purge.rs#accountability_record_of	ciris-persist@59.1.0
 3.1.5	CLM-trace-run-kind-refusal	CIRISPersist	src/federation/steward_purge.rs#refuse_mock_trace_attestation	ciris-persist@59.1.0
 3.1.5	CLM-trace-run-kind-refusal	CIRISPersist	src/schema/trace.rs#RUN_KINDS	ciris-persist@59.1.0
 4.5.3	CLM-purge-whole-or-not	CIRISPersist	src/federation/steward_purge.rs#purge_rows	ciris-persist@59.1.0
@@ -257,7 +258,7 @@ decimal_id	claim_id	repo	path#symbol	crate@version
 4.5.3	CLM-purge-projections-removed	CIRISPersist	src/store/sqlite.rs#purge_attestation_projections	ciris-persist@59.1.0
 4.5.3	CLM-purge-projections-removed	CIRISPersist	src/store/postgres.rs#purge_attestation_projections	ciris-persist@59.1.0
 3.1.9.4	CLM-hard-case-on-base	CIRISPersist	src/federation/attestation_admit.rs#plan_hard_case_row	ciris-persist@59.1.0
-3.1.9.4	CLM-hard-case-on-base	CIRISPersist	src/federation/hard_case.rs#check_hard_case_replication_held	ciris-persist@59.1.0
+3.1.9.4	CLM-hard-case-on-base	CIRISPersist	src/federation/attestation_apply.rs#apply_planned	ciris-persist@59.1.0
 3.1.9.4	CLM-hard-case-on-base	CIRISPersist	src/witness/compare.rs#equivocation_hard_case	ciris-persist@59.1.0
 3.4.8	CLM-detection-on-base	CIRISPersist	src/federation/attestation_admit.rs#plan_detection_row	ciris-persist@59.1.0
 3.4.8	CLM-detection-on-base	CIRISPersist	src/derived/detection_row.rs#project_detection_row	ciris-persist@59.1.0

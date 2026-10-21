@@ -85,6 +85,10 @@ jobs:
       - name: mutants_matrix self-test
         if: steps.gate.outputs.run == 'true'
         run: python3 scripts/mutants_matrix_test.py
+      # v60.0.0 — the scope this job is about to run resolves and names tests.
+      - name: mutation scopes are well-formed (from disk)
+        if: steps.gate.outputs.run == 'true'
+        run: python3 scripts/mutants_scopes_check.py --self-test && python3 scripts/mutants_scopes_check.py
       - name: mutation matrix and verdict
         if: steps.gate.outputs.run == 'true'
         env:

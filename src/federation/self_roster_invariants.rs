@@ -24,6 +24,9 @@
 //!   steward; a key of another self does neither.
 //! - **I1138 (compat)** — a pending addition is served neither framed nor as
 //!   an `identity:occurrence:v1` row; once it lands it is served both ways.
+//! - **I1161 (the reverse walk, #1109)** — `nodes_owned_by(fedID)` returns a
+//!   node a roster key bound; not one another self's key bound, and not one
+//!   a key bound after its eviction.
 //! - **I1140 (a node is not a roster key)** — a node its owner bound
 //!   publishes its own occurrence; its signature on a user-role key's is
 //!   refused `proposer_not_on_roster`, and nothing is held.
@@ -542,6 +545,90 @@ pub(crate) mod bodies {
         {
             Err(Error::NodeAlreadyOwned { .. }) => {}
             other => panic!("I1137: another self's key binding the node: {other:?}"),
+        }
+    }
+
+    /// **I1161** (#1109) — `nodes_owned_by` places a node a roster key
+    /// announced. A device joined by approval (`<fedID>-<fp>`) binds a node;
+    /// `owner_of` credits the binding to the self, and the reverse walk now
+    /// returns it. A node another self's roster key bound is that self's,
+    /// and a node a key bound AFTER its eviction is that key's own, so
+    /// neither is the self's. For every node, `n ∈ nodes_owned_by(f) ⟺
+    /// owner_of(n) == f`.
+    pub(crate) async fn i1161_nodes_owned_by_places_a_roster_keys_node(
+        d: &dyn FederationDirectory,
+        tag: &str,
+    ) {
+        use crate::federation::admission::{nodes_owned_by, owner_of};
+        let (f, d1, d2) = (
+            format!("f-{tag}"),
+            format!("f-{tag}-fp1"),
+            format!("f-{tag}-fp2"),
+        );
+        let (g, e1) = (format!("g-{tag}"), format!("g-{tag}-fp1"));
+        let nodes: Vec<String> = ["own", "dev", "other", "evicted"]
+            .iter()
+            .map(|n| format!("n-{n}-{tag}"))
+            .collect();
+        let [own, dev, other, evicted] = &nodes[..] else {
+            unreachable!()
+        };
+        three(d, &f, &d1, &d2).await;
+        keys(d, &[&g, &e1]).await;
+        add(d, &g, &g, &e1, ms_now()).await.expect("g's second key");
+        for n in &nodes {
+            ts::register_hybrid_key_as(d, n, n, it::NODE).await;
+        }
+        let bind = |author: &str, node: &str| SignedAttestation {
+            attestation: binding(author, node),
+        };
+        d.put_attestation(bind(&f, own))
+            .await
+            .expect("I1161: f binds a node with its own key");
+        d.put_attestation(bind(&d1, dev))
+            .await
+            .expect("I1161: f's approved device binds a node with its roster key");
+        d.put_attestation(bind(&e1, other))
+            .await
+            .expect("I1161: g's roster key binds a node");
+
+        // d2 leaves f's roster by quorum, then binds a node as itself.
+        let w = ts::occurrence_withdrawal(d, &f, &f, &d2, ms_now()).await;
+        let p = pending(
+            d.put_attestation(w).await.map(|_| ()),
+            "I1161: f's eviction of d2 at three keys",
+        );
+        vote(d, &d1, &f, &p, true).await;
+        assert!(!active(d, &f, &d2).await, "I1161: d2 was evicted");
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        d.put_attestation(bind(&d2, evicted))
+            .await
+            .expect("I1161: an evicted key binds a node as itself");
+
+        assert_eq!(owner_of(d, dev).await.unwrap(), Some(f.clone()));
+        assert_eq!(owner_of(d, evicted).await.unwrap(), Some(d2.clone()));
+        let mine = nodes_owned_by(d, &f).await.unwrap();
+        assert_eq!(
+            mine,
+            vec![dev.clone(), own.clone()],
+            "I1161: f owns its own node and its roster key's, nothing else"
+        );
+        assert_eq!(
+            nodes_owned_by(d, &g).await.unwrap(),
+            vec![other.clone()],
+            "I1161: g's roster key's node is g's"
+        );
+        assert_eq!(
+            nodes_owned_by(d, &d2).await.unwrap(),
+            vec![evicted.clone()],
+            "I1161: the evicted key's later node is its own"
+        );
+        for n in &nodes {
+            assert_eq!(
+                mine.contains(n),
+                owner_of(d, n).await.unwrap().as_deref() == Some(f.as_str()),
+                "I1161: {n}: nodes_owned_by and owner_of agree"
+            );
         }
     }
 
@@ -1102,6 +1189,90 @@ mod tests {
         };
     }
 
+    /// **I1162** (#1111) — the harness window needs the live override: the
+    /// env value is the window only when the test-anchor override is active,
+    /// and a value outside `1..=W_SELF_SECS` is no value. The lone path
+    /// landing on the short window, end to end on sqlite and postgres, is
+    /// `tests/self_roster_test_window_1111.rs` (it arms the process env, which
+    /// no test under src/ may do: #738).
+    #[cfg(feature = "test-anchor")]
+    #[test]
+    fn i1162_the_test_window_needs_the_live_override() {
+        use crate::federation::self_roster::{test_window as tw, w_self_secs, W_SELF_SECS};
+        assert_eq!(
+            tw::window(true, Some(2)),
+            2,
+            "I1162: armed, the env's window"
+        );
+        assert_eq!(
+            tw::window(false, Some(2)),
+            W_SELF_SECS,
+            "I1162: the env without the override is inert"
+        );
+        assert_eq!(tw::window(true, None), W_SELF_SECS, "I1162: no value");
+        assert_eq!(tw::window(false, None), W_SELF_SECS, "I1162: neither");
+        assert_eq!(
+            w_self_secs(),
+            W_SELF_SECS,
+            "I1162: no lib test arms the override"
+        );
+        assert_eq!(tw::parse_secs(None), None, "I1162: unset");
+        assert_eq!(tw::parse_secs(Some(" 2 ")), Some(2), "I1162: whole seconds");
+        assert_eq!(tw::parse_secs(Some("1")), Some(1), "I1162: the floor");
+        assert_eq!(
+            tw::parse_secs(Some(&W_SELF_SECS.to_string())),
+            Some(W_SELF_SECS),
+            "I1162: the ceiling"
+        );
+        for bad in ["0", "-5", "86401", "2.5", "two", ""] {
+            assert_eq!(tw::parse_secs(Some(bad)), None, "I1162: {bad:?}");
+        }
+    }
+
+    /// **I1162** (#1111), from disk — a build without `test-anchor` carries
+    /// no read of the window variable: every mention of it, and every
+    /// environment read in `self_roster.rs`, sits inside the
+    /// `#[cfg(feature = "test-anchor")]` module `test_window`, and the one
+    /// call into that module sits under the same `cfg`.
+    #[test]
+    fn i1162_only_a_test_anchor_build_reads_the_window_env() {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/federation/self_roster.rs");
+        let text = std::fs::read_to_string(&path).expect("self_roster.rs");
+        let code: Vec<&str> = text
+            .lines()
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .collect();
+        let fence = "#[cfg(feature = \"test-anchor\")]";
+        let open = code
+            .iter()
+            .position(|l| l.trim() == "pub mod test_window {")
+            .expect("I1162: the test_window module");
+        assert_eq!(code[open - 1].trim(), fence, "I1162: test_window is fenced");
+        let close = open
+            + code[open..]
+                .iter()
+                .position(|l| *l == "}")
+                .expect("I1162: test_window closes");
+        let needles = ["CIRIS_TEST_W_SELF_SECS", "env::var", "env_secs("];
+        for (i, line) in code.iter().enumerate() {
+            if (open..=close).contains(&i) || !needles.iter().any(|n| line.contains(n)) {
+                continue;
+            }
+            // The one call outside: `w_self_secs`'s fenced block.
+            let fenced = code[..i].iter().rev().take(6).any(|l| l.trim() == fence);
+            assert!(
+                line.contains("test_window::env_secs()") && fenced,
+                "I1162: self_roster.rs:{} reads the window env outside the fence: {line}",
+                i + 1
+            );
+        }
+        assert!(
+            text.contains("CIRIS_TEST_W_SELF_SECS"),
+            "I1162: the scan reads the file that names the variable"
+        );
+    }
+
     on_every_backend!(i1130, bodies::i1130_one_key_adds_at_once);
     on_every_backend!(i1131, bodies::i1131_two_keys_quorum);
     on_every_backend!(i1132, bodies::i1132_lone_path_and_silence);
@@ -1112,6 +1283,10 @@ mod tests {
     on_every_backend!(i1137, bodies::i1137_a_second_device_acts_as_its_self);
     on_every_backend!(i1138, bodies::i1138_pending_is_not_served);
     on_every_backend!(i1140, bodies::i1140_a_node_does_not_add_roster_keys);
+    on_every_backend!(
+        i1161,
+        bodies::i1161_nodes_owned_by_places_a_roster_keys_node
+    );
     on_every_backend!(i1143, bodies::i1143_the_proposer_withdraws);
     on_every_backend!(
         i1156,

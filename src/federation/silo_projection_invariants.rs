@@ -8,8 +8,8 @@
 //!   row on the plane, attested by the node key; then the from-rows rebuild
 //!   of `hard_case_events` is byte-equal to the live table
 //!   ([`check_projection_rebuild`](crate::federation::silo_projection::check_projection_rebuild)).
-//!   The row is unpurgeable (the accountability-record family) and does not
-//!   enter the federation tier (held replication).
+//!   The row is unpurgeable (the accountability-record family). (v60.0.0:
+//!   it replicates; I1165 witnesses the crossing and the peer's copy.)
 //! - **I961 (`detection_events`)** — `put_detection_event` (twice, plus an
 //!   idempotent re-put and a conflicting one), then the DSAR erasure of one
 //!   detection's trace: its signed row is hard-deleted under a tombstone
@@ -134,7 +134,7 @@ pub(crate) mod bodies {
                 .expect("I960: get")
                 .expect("I960: the event is a row");
             assert_eq!(row.attesting_key_id, node, "I960: attester = the node key");
-            assert_eq!(row.tier, "local", "I960: replication is held");
+            assert_eq!(row.tier, "local", "I960: the door writes the local tier");
             assert_eq!(row.attestation_type, "scores");
             assert_eq!(
                 hard_case::project_hard_case_row(&row).map(|e| e.event_id),
@@ -145,13 +145,6 @@ pub(crate) mod bodies {
             assert!(
                 crate::federation::migration::check_purge_admission(&row).is_err(),
                 "I960: a hard_case row is the accountability record"
-            );
-            // Held: it does not cross to the federation tier.
-            assert_eq!(
-                hard_case::check_hard_case_replication_held(&row)
-                    .unwrap_err()
-                    .kind(),
-                "federation_hard_case_replication_held"
             );
         }
         let rebuild = check_projection_rebuild(b, SiloProjection::HardCaseEvents)

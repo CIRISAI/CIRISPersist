@@ -10932,23 +10932,47 @@ pub async fn may_act_through(
 /// poisoned node must not make its owner's every consent grant unroutable.
 /// The forward walk still fails closed when that node is asked about
 /// directly.
+///
+/// v60.0.0 (CIRISPersist#1109) — **the candidates include the bindings the
+/// person's roster keys signed.** Since v59.0.0 `owner_of` names a binding's
+/// granter as the self it signed as ([`self_of_at`](super::self_roster::self_of_at)),
+/// so a device joined by approval that announces a node with its roster key
+/// makes the PERSON that node's owner; but the seek read only the rows the
+/// person's own key signed, and that node was never placed (CIRISServer
+/// carried an `announced_nodes_of` workaround). The seek now also reads every
+/// key ever bound as an occurrence of the person. That set over-approximates
+/// on purpose: whether a key's binding is the person's (live at the binding's
+/// `asserted_at`, not evicted before it, not another self's) is `owner_of`'s
+/// verdict below, the one predicate, so the `⟺` above still holds by
+/// construction.
 pub async fn nodes_owned_by<F: super::FederationDirectory + ?Sized>(
     directory: &F,
     person: &str,
 ) -> Result<Vec<String>, Error> {
+    let mut signers = std::collections::BTreeSet::from([person.to_owned()]);
+    signers.extend(
+        directory
+            .list_identity_occurrences_for(person)
+            .await?
+            .into_iter()
+            .map(|o| o.occurrence_key_id),
+    );
     let mut candidates = std::collections::BTreeSet::new();
-    // v53.1.6 — the type seek, not the person's whole history (`send_set_for`
-    // → `nodes_of` asks this per principal on every Edge memo refresh). The
-    // verdict is `owner_of` below, so the candidates need no composers.
-    let mut pages = AttestationQuery::by(person, FOLD_PAGE)
-        .types(&[super::types::attestation_type::DELEGATES_TO])
-        .pages();
-    while let Some(page) = pages.next(directory).await? {
-        for row in page {
-            if is_owner_binding_envelope(&row.attestation_envelope)
-                && !row.attested_key_id.is_empty()
-            {
-                candidates.insert(row.attested_key_id);
+    for signer in &signers {
+        // v53.1.6 — the type seek, not the signer's whole history
+        // (`send_set_for` → `nodes_of` asks this per principal on every Edge
+        // memo refresh). The verdict is `owner_of` below, so the candidates
+        // need no composers.
+        let mut pages = AttestationQuery::by(signer, FOLD_PAGE)
+            .types(&[super::types::attestation_type::DELEGATES_TO])
+            .pages();
+        while let Some(page) = pages.next(directory).await? {
+            for row in page {
+                if is_owner_binding_envelope(&row.attestation_envelope)
+                    && !row.attested_key_id.is_empty()
+                {
+                    candidates.insert(row.attested_key_id);
+                }
             }
         }
     }
@@ -26763,19 +26787,18 @@ pub(crate) mod r2_test_support {
         // self-attested row is not one, and refusing it would tighten past what
         // #607 asks.
         //
-        // v57.0.0 (CIRISPersist#988 item 2) — hard_case replication is held: a
-        // federation-tier `hard_case:` row is refused by the hold, which runs
-        // AFTER this gate. Reaching the hold is what proves the #607 gate
-        // admitted the row; a gate that refused it would name itself instead.
+        // v60.0.0 (CIRISConstitution#170 closed) — hard_case rows replicate:
+        // the v57 hold that stood after this gate is gone, so the row is
+        // ADMITTED and stored, which is what proves the #607 gate admitted it.
         let own = uuid::Uuid::new_v4().to_string();
-        let held = dir
-            .put_attestation(row(&own, &author))
+        dir.put_attestation(row(&own, &author))
             .await
-            .expect_err("v57: hard_case replication is held");
-        assert_eq!(
-            held.kind(),
-            "federation_hard_case_replication_held",
-            "a SELF-attested hard_case row must clear the #607 gate and reach the hold: {held}"
+            .unwrap_or_else(|e| {
+                panic!("a SELF-attested hard_case row must clear the #607 gate: {e}")
+            });
+        assert!(
+            dir.get_attestation(&own).await.expect("get").is_some(),
+            "a SELF-attested hard_case row is stored at the federation tier"
         );
 
         // ── (3) ABOUT ANOTHER PARTY, WITH a conferral — ADMITTED ──────────
@@ -26788,16 +26811,21 @@ pub(crate) mod r2_test_support {
         )
         .await;
         let conferred = uuid::Uuid::new_v4().to_string();
-        let held = dir
-            .put_attestation(row(&conferred, &victim))
+        dir.put_attestation(row(&conferred, &victim))
             .await
-            .expect_err("v57: hard_case replication is held");
-        assert_eq!(
-            held.kind(),
-            "federation_hard_case_replication_held",
-            "a substrate_persist CONFERRED infra:record_hard_case by this node's own trust \
-             root must clear the #607 gate and reach the hold — otherwise the admin ladder is \
-             unreachable and leg (1) passes vacuously: {held}"
+            .unwrap_or_else(|e| {
+                panic!(
+                    "a substrate_persist CONFERRED infra:record_hard_case by this node's own \
+                     trust root must clear the #607 gate — otherwise the admin ladder is \
+                     unreachable and leg (1) passes vacuously: {e}"
+                )
+            });
+        assert!(
+            dir.get_attestation(&conferred)
+                .await
+                .expect("get")
+                .is_some(),
+            "the conferred hard_case row is stored at the federation tier"
         );
     }
 

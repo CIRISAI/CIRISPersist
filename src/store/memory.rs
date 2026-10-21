@@ -3493,6 +3493,7 @@ impl crate::federation::attestation_admit::AttestationStore for MemoryBackend {
             withdraws_depth,
             projected_trace,
             projected_detection,
+            projected_hard_case,
             wire_index_key,
             ..
         } = planned;
@@ -3583,6 +3584,14 @@ impl crate::federation::attestation_admit::AttestationStore for MemoryBackend {
                     detection.detection_id.to_string(),
                     (row.attestation_id.clone(), detection),
                 );
+            }
+            // v60.0.0 (CIRISConstitution#170 closed) — the `hard_case_events`
+            // mirror of a replicated (or put) hard_case row, under the same
+            // lock.
+            if let Some(event) = projected_hard_case {
+                state
+                    .federation_hard_case_events
+                    .insert(event.event_id.clone(), (row.attestation_id.clone(), event));
             }
             // v36.0.0 (#668) — serve position (V130 mirror).
             let admitted_at = next_plane_position(
