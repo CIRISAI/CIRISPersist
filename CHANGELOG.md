@@ -7,6 +7,26 @@ threat-model citations because this crate's audit story is the point.
 
 ## [Unreleased]
 
+## [60.0.0] - UNRELEASED
+
+### Fixed — the nightly mutants job is green again (CIRISPersist#1112)
+
+The scheduled `mutants and powerset` job had been red every day since
+2026-10-14 with seven unkilled mutants in `src/observe`, and nobody read it.
+
+- `count_read`'s walk over the active-fold mask is bounded by the mask's
+  popcount instead of `while mask != 0`. Each of the three operator mutants on
+  the clear-lowest-bit step made the old loop infinite; seventeen witnesses
+  hung to nextest's 60 s leash and the run outlived cargo-mutants' 300 s
+  timeout, which credits no witness (three TIMEOUTs). A witness cannot end an
+  infinite loop, so the bound makes the same mutants return at once with the
+  wrong fold credited, and **I1164** (a read inside three nested folds at
+  mask bits 0, 4 and 7 credits each exactly once) kills them.
+- **I1163**: `CatalogEntry::metrics_unit` refuses every malformed brace form
+  (`{}`, `ab}`, `abc`, `}`, `x}`, `{ab`, `{x`, `{`, `x`, empty). The four
+  MISSED guard mutants had no witness because the catalogue holds only
+  well-formed units.
+
 ## [59.1.0] - 2026-10-20
 
 ### Changed — the production genesis bundle is the v4 amend (CIRISPersist#1106, CC 5.3.4)

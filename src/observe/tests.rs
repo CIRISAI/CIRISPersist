@@ -631,6 +631,99 @@ fn i692_a_read_inside_folds_returns_within_a_deadline() {
     assert_eq!(inner, (1, 1, 0, 1), "I692 the inner fold's credit");
 }
 
+// ── I1163–I1164 (#1112) ──────────────────────────────────────────────────
+
+/// **I1163** (#1112) — `metrics_unit` maps a UCUM annotation `{x}` to a
+/// count and refuses every malformed brace form. The catalogue holds only
+/// well-formed units, so I553 never reached the guard's refusing side: the
+/// guard replaced with `true`, either `&&` with `||`, and `>` with `>=` all
+/// survived the nightly matrix. Each malformed case below is the one input
+/// a mutant answers `Count` for.
+#[test]
+fn i1163_metrics_unit_refuses_every_malformed_brace_form() {
+    fn unit(u: &'static str) -> Option<metrics::Unit> {
+        catalog::CatalogEntry {
+            name: "i1163",
+            kind: catalog::MetricKind::Counter,
+            unit: u,
+            labels: &[],
+            description: "I1163",
+        }
+        .metrics_unit()
+    }
+    assert_eq!(unit("By"), Some(metrics::Unit::Bytes), "I1163 By");
+    assert_eq!(unit("{x}"), Some(metrics::Unit::Count), "I1163 {{x}}");
+    assert_eq!(unit("{row}"), Some(metrics::Unit::Count), "I1163 {{row}}");
+    // `>` → `>=`: the empty annotation is two bytes.
+    assert_eq!(unit("{}"), None, "I1163 {{}} is not an annotation");
+    // the first `&&` → `||`: long enough, no opening brace.
+    assert_eq!(unit("ab}"), None, "I1163 ab}} has no opening brace");
+    assert_eq!(unit("abc"), None, "I1163 abc has no braces");
+    // the second `&&` → `||`: a closing brace alone.
+    assert_eq!(unit("}"), None, "I1163 }} alone");
+    assert_eq!(unit("x}"), None, "I1163 x}} has no opening brace");
+    assert_eq!(unit("{ab"), None, "I1163 {{ab has no closing brace");
+    assert_eq!(unit("{x"), None, "I1163 {{x has no closing brace");
+    assert_eq!(unit("{"), None, "I1163 {{ alone");
+    assert_eq!(unit("x"), None, "I1163 x");
+    assert_eq!(unit(""), None, "I1163 empty");
+}
+
+/// **I1164** (#1112) — a read inside three nested folds credits each of
+/// them exactly once and no other fold. The three folds sit at mask bits 0,
+/// 4 and 7, so a credit step that clears the wrong bit (`&=` → `|=`), or
+/// none (`-` → `+`, `-` → `/`), credits fold 0 or the lowest fold twice and
+/// leaves a higher one uncredited. Like I692 it runs on its own thread
+/// behind a 5 s deadline, so a loop that never ends is this witness's red.
+#[test]
+fn i1164_a_read_credits_each_active_fold_exactly_once() {
+    const ACTIVE: [Fold; 3] = [
+        Fold::ResolveScopedStanceByPrincipals,
+        Fold::ResolveServeTier,
+        Fold::IsPublicGroup,
+    ];
+    assert_eq!(
+        ACTIVE.map(|f| f as u32),
+        [0, 4, 7],
+        "I1164 the folds' mask bits"
+    );
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let local = LocalCounters::install();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        rt.block_on(super::fold(
+            ACTIVE[0],
+            super::fold(
+                ACTIVE[1],
+                super::fold(ACTIVE[2], async {
+                    one_read(Door::AttestationQuery);
+                    one_read(Door::AttestationQuery);
+                }),
+            ),
+        ));
+        let snap = local.snapshot();
+        let _ = tx.send(
+            Fold::ALL
+                .iter()
+                .map(|f| (*f, snap.fold(*f)))
+                .collect::<Vec<_>>(),
+        );
+    });
+    let got = rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("I1164 a read inside three folds did not return within 5 s");
+    for (fold, tally) in got {
+        let want = if ACTIVE.contains(&fold) {
+            (1, 2, 0, 2)
+        } else {
+            (0, 0, 0, 0)
+        };
+        assert_eq!(tally, want, "I1164 {} credit", fold.label());
+    }
+}
+
 // ── I549 ─────────────────────────────────────────────────────────────────
 
 /// The probe's totals per door: (reads, rows, bytes).
