@@ -134,9 +134,14 @@ they are CC-owned, pinned, and already drive 134 instants. The cards are not (CS
 `stage: sketched`; `shows:` tags are UI contracts). So persist keys to the ATOMS, the trace
 steps and their refusal maps, never to a card's `shows:` tags, and the chain back to the
 formal models runs atom → `cc_ref` → CC claim id → persist evidence row → witness → mutation
-scope. CC has been asked (2026-10-21) for the chain as joinable data: atom → STATE_TABLE
-state → formal transition/invariant → claim ids; the refusal tokens per trace step; the
-owning repo per "stops at rel[k]" relation; and the pins. Persist builds against what exists.
+scope. CC delivered the chain as data the same day: `manifests/csd4_chain.json` at rc9 5fe1c0f
+(`tools/build_csd4_chain.py`, CI-diffed): per atom, `states[]` with the formal `model_ref`,
+`invariants[]`, `claims[]` with parsed evidence refs (1,035 point at CIRISPersist), and
+`refusal_tokens` (69, by section, with a bold/after_refusal confidence); `_meta.pins` carries
+the sha256 of STATE_TABLE.tsv (157 states), INVARIANTS.tsv (152 properties), the vocabulary,
+claims.tsv and evidence_pins.tsv. The per-step refusal map and the relation owner map are
+Server/CEWPOS data, not CC's. Persist vendors the chain as a test fixture until the v1.0-rc9
+tag and joins on it directly.
 
 **Tasks.**
 
