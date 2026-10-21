@@ -588,6 +588,28 @@ pub(crate) mod bodies {
         (v57.event_id, notice_id, v58.event_id)
     }
 
+    /// V202 over a row projected before the column existed: the event lists
+    /// with its row's signer as its emitter, and the emitter filter finds it.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    pub(crate) async fn i969_v202_backfills_the_signer<B>(b: &B, event_id: &str, node: &str)
+    where
+        B: FederationDirectory,
+    {
+        let listed = b
+            .list_hard_case_events(crate::federation::hard_case::HardCaseFilter {
+                emitter_key_id: Some(node.to_owned()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(
+            listed
+                .iter()
+                .any(|e| e.event_id == event_id && e.emitter_key_id == node),
+            "I969: V202 backfills the emitter from the row's signer: {listed:?}"
+        );
+    }
+
     /// After V196 ran over the seeded rows: the v57 row and its header are
     /// gone, a v58 row (seeded beside them) stays, and the projections are
     /// their rows' rebuild.
@@ -1225,11 +1247,18 @@ mod run {
             .await
             .unwrap();
         b.run_migrations_through(195).await.unwrap();
+        // Today's writers project `emitter_key_id` (V202): the column exists
+        // while they seed and is dropped before the rest of the migrations,
+        // so V196 and V202 run over the schema an upgrading node holds.
+        b.test_execute("ALTER TABLE hard_case_events ADD COLUMN emitter_key_id TEXT")
+            .await;
         let t = tag("i969s");
         let node = bodies::signing_node(&b, &t).await;
         b.set_node_key_id(&node.id);
         let agent = format!("{t}-agent");
         let (v57, notice, v58) = bodies::i969_seed(&b, &node.id, &agent).await;
+        b.test_execute("ALTER TABLE hard_case_events DROP COLUMN emitter_key_id")
+            .await;
         // A pre-v57 silo row naming its agent (written after the emitter
         // above, so the rehome has not moved it).
         b.test_execute(&format!(
@@ -1241,6 +1270,7 @@ mod run {
         .await;
         b.run_migrations().await.unwrap();
         bodies::i969_after_v196(&b, &v57, &notice, &v58, &agent).await;
+        bodies::i969_v202_backfills_the_signer(&b, &v58, &node.id).await;
         use crate::federation::FederationDirectory as _;
         assert!(
             b.list_hard_case_events(crate::federation::hard_case::HardCaseFilter::default())
@@ -1264,11 +1294,16 @@ mod run {
             .await
             .unwrap();
         b.run_migrations_through(195).await.unwrap();
+        // As i969_sqlite: the V202 column only while today's writers seed.
+        b.test_execute("ALTER TABLE cirislens.hard_case_events ADD COLUMN emitter_key_id TEXT")
+            .await;
         let t = tag("i969p");
         let node = bodies::signing_node(&b, &t).await;
         b.set_node_key_id(&node.id);
         let agent = format!("{t}-agent");
         let (v57, notice, v58) = bodies::i969_seed(&b, &node.id, &agent).await;
+        b.test_execute("ALTER TABLE cirislens.hard_case_events DROP COLUMN emitter_key_id")
+            .await;
         b.test_execute(&format!(
             "INSERT INTO cirislens.hard_case_events \
                 (event_id, kind, target_key_id, subject_key_id, detail, emitted_at) \
@@ -1278,6 +1313,7 @@ mod run {
         .await;
         b.run_migrations().await.unwrap();
         bodies::i969_after_v196(&b, &v57, &notice, &v58, &agent).await;
+        bodies::i969_v202_backfills_the_signer(&b, &v58, &node.id).await;
         use crate::federation::FederationDirectory as _;
         assert!(
             b.list_hard_case_events(crate::federation::hard_case::HardCaseFilter::default())
