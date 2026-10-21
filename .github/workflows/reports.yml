@@ -15,7 +15,7 @@
 #                       cargo llvm-cov per certify feature set (scripts/coverage.sh);
 #                       the legs are DERIVED (ci_feature_matrix.py legs), not listed
 #   csd4       PR, weekly, dispatch
-#                       the CSD/4 catalogue (tests/fixtures/csd4) joined to CC claims,
+#                       CC's CSD/4 chain (tests/fixtures/csd4/csd4_chain.json) joined to
 #                       evidence/cc_impl.tsv, the witnesses and the mutation scopes, with
 #                       the gap lists (scripts/csd4_coverage.py, v60.0.0)
 #   mutants-diff  PR labelled `run-mutants`, every `release-*` PR (v60.0.0), dispatch
@@ -198,9 +198,9 @@ jobs:
             target/coverage/${{ matrix.leg }}/html/
           retention-days: 30
 
-  # v60.0.0 (docs/V60_TASK_PLAN.md §3b, S0-csd) — report-only until CC
-  # publishes the atom -> state -> transition -> claim chain as data; then a
-  # certify gate. Reads CC's claims at rc9 and CEWPOS's catalogue at main.
+  # v60.0.0 (docs/V60_TASK_PLAN.md §3b, S0-csd) — report-only. The join reads
+  # CC's chain (tests/fixtures/csd4/csd4_chain.json, vendored from rc9) and
+  # CEWPOS's catalogue at main.
   csd4:
     name: CSD/4 coverage (report)
     if: >-
@@ -214,19 +214,13 @@ jobs:
       - uses: actions/checkout@v6
       - uses: actions/checkout@v6
         with:
-          repository: CIRISAI/CIRISConstitution
-          ref: rc9
-          path: _ext/CIRISConstitution
-      - uses: actions/checkout@v6
-        with:
           repository: CIRISAI/CEWPOS
           path: _ext/CEWPOS
       - name: CSD/4 coverage (report)
         run: |
           mkdir -p target/csd4
-          python3 scripts/csd4_coverage.py --cc-dir _ext/CIRISConstitution --cc-ref HEAD \
-            --cewpos-dir _ext/CEWPOS --out target/csd4/coverage.md
-          sed -n '/^## Gap counts/,/^### 1\./p' target/csd4/coverage.md | sed '$d' >> "$GITHUB_STEP_SUMMARY"
+          python3 scripts/csd4_coverage.py --cewpos-dir _ext/CEWPOS --out target/csd4/coverage.md
+          sed -n '/^## Gap counts/,/^### (a)/p' target/csd4/coverage.md | sed '$d' >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v7
         if: always()
         with:

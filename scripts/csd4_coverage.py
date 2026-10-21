@@ -1,40 +1,41 @@
 #!/usr/bin/env python3
-"""csd4_coverage.py — the CSD/4 catalogue joined to persist's evidence,
-witnesses and mutation scopes (docs/V60_TASK_PLAN.md §3b, S0-csd).
+"""csd4_coverage.py — CC's CSD/4 chain joined to persist's evidence,
+witnesses, mutation scopes and refusal tokens (docs/V60_TASK_PLAN.md §3b).
 
-    scripts/csd4_coverage.py [--out <report.md>] [--cc-dir <dir>] [--cc-ref <ref>]
-                             [--cewpos-dir <dir>]
+    scripts/csd4_coverage.py [--out <report.md>] [--cewpos-dir <dir>]
 
-A REPORT, NOT A GATE (v60). It becomes a certify gate once CC publishes the
-chain as joinable data (atom -> STATE_TABLE state -> formal transition ->
-claim ids; the refusal tokens per trace step; the owning repo per "stops at
-rel[k]" relation). Until then it joins what exists, from disk:
+A REPORT, NOT A GATE (v60). The join is READ from CC's chain manifest,
+tests/fixtures/csd4/csd4_chain.json (CIRISConstitution rc9
+`manifests/csd4_chain.json`, vendored byte for byte; see the fixture
+README), never guessed from `cc_ref` prefixes:
 
-  (a) every atom of tests/fixtures/csd4/topology_vocabulary.json, by each
-      decimal in its `cc_ref`, to the CC `constitution/claims.tsv` rows whose
-      `decimal_id` equals it or lies under it (`3.2` takes `3.2` and
-      `3.2.1.4`, never `3.20`); read with `git show <cc-ref>:...` from the
-      Constitution checkout (default ../CIRISConstitution at origin/rc9);
-  (b) those claim ids to persist's rows in evidence/cc_impl.tsv
-      (`path#symbol`);
-  (c) those symbols to the `*_invariants.rs` files under src/ that name them
-      (a word match outside comments is not required: a witness that names
-      the door in its doc comment counts, the S0-csd rule), and to every
-      scripts/mutants/scope-*.txt entry that covers the file (and, when the
-      entry names functions, the symbol); also every `*_invariants.rs` that
-      names the ATOM itself in backticks (the rule going forward);
-  (d) every key under `refused` in tests/fixtures/csd4/traces.json — the
-      relation after `rel[k]:`, or the whole key — to persist's token strings
-      (`const ..: &str = "…"` and `=> "…"` match arms in non-test src/);
-  (e) the "stops at rel[k]:<relation>" rows of CEWPOS
-      CSD4_CATALOGUE_AND_MIGRATION_PLAN.md (default ../CEWPOS), per
-      relation, with a best-effort owner guess: `persist` when the relation
-      or its stated reason names persist, or a compound relation name is a
-      persist token's component, else `unknown`.
+  atom -> chain atoms[a].claims[] (by_invariant | by_section)
+       -> claims[].evidence[] where repo == CIRISPersist -> `path#symbol`
+       -> the row in evidence/cc_impl.tsv
+       -> the `*_invariants.rs` files under src/ that name the symbol (for a
+          common name, only those that also name its module), and the
+          scripts/mutants/scope-*.txt entries that cover the file (and, when
+          the entry lists functions, the symbol).
 
-Output: a markdown report (stdout, or --out). Exit 0 whatever it finds; 2
-when an input cannot be read (the fixtures, the evidence tsv, the CC claims,
-the CEWPOS plan). Stdlib only.
+Gap lists:
+  (a) chain evidence refs to persist with no cc_impl.tsv row; and
+      cc_impl.tsv rows no atom reaches;
+  (b) atoms with persist claims but no witness file or no mutation scope;
+  (c) persist refusal tokens (the resolved value of every `Error::kind()`
+      arm) the text does not name (`refusal_tokens`; a `federation_<tok>`
+      kind counts as named by `<tok>`), and text tokens persist never emits
+      (no kind() returns it or its `federation_` form, no non-test string
+      literal spells it, no non-test fn is named it), with the text's
+      confidence (`bold` | `after_refusal`).
+
+Also: the traces.json `refused` map (CIRISServer harness output, which CC
+does not own: `_meta.not_here`) against persist's string literals, and the
+CEWPOS "stops at rel[k]" relations with an owner guess. Atoms with no claim
+BY DESIGN (`negatives.held`, `values.ready`: harness-level) are listed as
+such, not as gaps.
+
+Exit 0 whatever it finds; 2 when an input cannot be read or the chain's
+vocabulary pin disagrees with the vendored vocabulary. Stdlib only.
 """
 from __future__ import annotations
 
@@ -49,11 +50,18 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 FIX = REPO / "tests" / "fixtures" / "csd4"
+CHAIN = FIX / "csd4_chain.json"
 EVIDENCE = REPO / "evidence" / "cc_impl.tsv"
 SCOPES = REPO / "scripts" / "mutants"
-DECIMAL = re.compile(r"^\d+(?:\.\d+)*$")
+PERSIST = "CIRISPersist"
+# Atoms the chain gives no claim on purpose: harness-level preconditions of a
+# trace, not substrate state.
+HARNESS_ATOMS = {"negatives.held", "values.ready"}
 STOP = re.compile(r"stops at (rel\[\d+\]:([A-Za-z0-9_]+)):\s*(.*?)\)\s*\|\s*$")
-TOKEN_LIT = re.compile(r'(?:\bconst\s+[A-Z0-9_]+\s*:\s*&(?:\'static\s+)?str\s*=\s*|=>\s*)"([A-Za-z0-9_:.\-]{3,})"')
+LITERAL = re.compile(r'"([A-Za-z0-9_:.\-]{3,})"')
+CONST = re.compile(r"\bconst\s+([A-Z0-9_]+)\s*:\s*&(?:'static\s+)?str\s*=\s*\"([^\"]+)\"")
+KIND_FN = re.compile(r"pub fn kind\(&self\) -> &'static str \{")
+ARM = re.compile(r"=>\s*(?:\{\s*)?(?:\"([^\"]+)\"|([A-Za-z_][A-Za-z0-9_:]*::)?([A-Z][A-Z0-9_]+)\b)")
 
 
 def die(msg: str) -> None:
@@ -80,30 +88,33 @@ def strip_comments(src: str) -> str:
     return re.sub(r"//[^\n]*", "", src)
 
 
+def production(src: str) -> str:
+    """The text before the file's first inline `#[cfg(test)] mod x {` (a
+    `#[cfg(test)] mod x;` declaration is not a cut)."""
+    m = re.search(r"^\s*#\[cfg\(test\)\]\s*\n\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+\w+\s*\{", src, re.M)
+    return src[: m.start()] if m else src
+
+
 # ── inputs ──────────────────────────────────────────────────────────────────
 
 
-def load_atoms() -> dict:
-    return json.loads(read(FIX / "topology_vocabulary.json"))["atoms"]
+def load_chain() -> dict:
+    try:
+        chain = json.loads(read(CHAIN))
+    except json.JSONDecodeError as e:
+        die(f"{CHAIN}: {e}")
+    for k in ("_meta", "atoms", "refusal_tokens"):
+        if k not in chain:
+            die(f"{CHAIN}: no `{k}`")
+    vocab = hashlib.sha256((FIX / "topology_vocabulary.json").read_bytes()).hexdigest()
+    pinned = chain["_meta"].get("pins", {}).get("vocabulary_sha256")
+    if pinned != vocab:
+        die(f"the chain pins vocabulary {pinned}, the vendored topology_vocabulary.json is {vocab}")
+    return chain
 
 
 def load_traces() -> dict:
     return json.loads(read(FIX / "traces.json"))["entries"]
-
-
-def load_claims(cc_dir: Path, ref: str) -> tuple[list[dict], str]:
-    sha = git(cc_dir, "rev-parse", ref).strip()
-    text = git(cc_dir, "show", f"{sha}:constitution/claims.tsv")
-    rows = []
-    lines = text.splitlines()
-    head = lines[0].split("\t")
-    for line in lines[1:]:
-        if not line.strip() or line.startswith("#"):
-            continue
-        cells = dict(zip(head, line.split("\t")))
-        if cells.get("claim_id") and cells.get("decimal_id"):
-            rows.append(cells)
-    return rows, sha
 
 
 def load_evidence() -> list[dict]:
@@ -135,14 +146,43 @@ def witness_files() -> dict[str, str]:
     return {str(p.relative_to(REPO)): read(p) for p in sorted((REPO / "src").rglob("*_invariants.rs"))}
 
 
-def persist_tokens() -> dict[str, str]:
-    """token -> first file that spells it, from non-test src/."""
-    out: dict[str, str] = {}
+def src_files() -> list[tuple[str, str]]:
+    out = []
     for p in sorted((REPO / "src").rglob("*.rs")):
-        if p.name.endswith("_invariants.rs") or p.name == "tests.rs":
+        if p.name.endswith("_invariants.rs") or p.name == "tests.rs" or "/tests/" in str(p):
             continue
-        for tok in TOKEN_LIT.findall(strip_comments(read(p))):
-            out.setdefault(tok, str(p.relative_to(REPO)))
+        out.append((str(p.relative_to(REPO)), production(strip_comments(read(p)))))
+    return out
+
+
+def string_literals(files) -> dict[str, str]:
+    """literal -> first non-test src file that spells it."""
+    out: dict[str, str] = {}
+    for f, text in files:
+        for tok in LITERAL.findall(text):
+            out.setdefault(tok, f)
+    return out
+
+
+def refusal_kinds(files) -> dict[str, str]:
+    """Every value an `Error::kind()` arm returns -> the file of that kind().
+    A const arm (`hard_case::refusal::REPLICATION_HELD`) resolves by its last
+    segment against every `const NAME: &str = "…"` in src/; an unresolved one
+    is reported as `?NAME`."""
+    consts: dict[str, str] = {}
+    for _, text in files:
+        for name, val in CONST.findall(text):
+            consts.setdefault(name, val)
+    out: dict[str, str] = {}
+    for f, text in files:
+        for m in KIND_FN.finditer(text):
+            depth, i = 1, m.end()
+            while depth and i < len(text):
+                depth += {"{": 1, "}": -1}.get(text[i], 0)
+                i += 1
+            for lit, _, const in ARM.findall(text[m.end():i]):
+                tok = lit or consts.get(const, f"?{const}")
+                out.setdefault(tok, f)
     return out
 
 
@@ -164,14 +204,6 @@ def cewpos_stops(cewpos_dir: Path) -> tuple[list[dict], str]:
 # ── the join ────────────────────────────────────────────────────────────────
 
 
-def decimals(cc_ref: str) -> list[str]:
-    return [t for t in cc_ref.split() if DECIMAL.match(t)]
-
-
-def under(decimal: str, section: str) -> bool:
-    return decimal == section or decimal.startswith(section + ".")
-
-
 def word(sym: str) -> re.Pattern:
     return re.compile(r"\b" + re.escape(sym) + r"\b")
 
@@ -183,65 +215,115 @@ def distinctive(sym: str) -> bool:
 
 
 def witnesses_of(path: str, sym: str, witnesses: dict[str, str]) -> list[str]:
-    """The witness files that name `sym`; for a common name (`gate`, `plan`),
-    only those that also name its module (`self_roster`)."""
     pat, stem = word(sym), Path(path).stem
-    return [f for f, t in witnesses.items()
-            if pat.search(t) and (distinctive(sym) or stem in t)]
+    return [f for f, t in witnesses.items() if pat.search(t) and (distinctive(sym) or stem in t)]
 
 
-def join(atoms, claims, evidence, scopes, witnesses):
-    by_claim = defaultdict(list)
+def persist_refs(atom: dict) -> list[tuple[str, str, str, str]]:
+    """(claim_id, join, path, symbol) for every CIRISPersist evidence pointer."""
+    out = []
+    for c in atom.get("claims", []):
+        for e in c.get("evidence", []):
+            if e.get("repo") != PERSIST:
+                continue
+            for s in e.get("symbols") or [""]:
+                out.append((c["claim_id"], c.get("join", ""), e.get("path", ""), s))
+    return out
+
+
+def join(atoms, evidence, scopes, witnesses):
+    by_key = defaultdict(list)
     for e in evidence:
-        by_claim[e["claim"]].append(e)
+        by_key[(e["path"], e["symbol"])].append(e)
     sym_witness: dict[str, list[str]] = {}
-    out = {}
+    out, unresolved, reached = {}, [], set()
     for name, a in atoms.items():
-        secs = decimals(a.get("cc_ref", ""))
-        cl = sorted({c["claim_id"] for c in claims for s in secs if under(c["decimal_id"], s)})
-        rows = [e for c in cl for e in by_claim.get(c, [])]
-        syms = sorted({f"{e['path']}#{e['symbol']}" for e in rows})
-        wit, sco = set(), set()
-        for e in rows:
-            if e["path"].startswith("src/") and e["symbol"]:
-                key = f"{e['path']}#{e['symbol']}"
+        refs = persist_refs(a)
+        rows, wit, sco = set(), set(), set()
+        for claim, how, path, sym in refs:
+            hits = by_key.get((path, sym), [])
+            if not hits:
+                unresolved.append({"atom": name, "claim": claim, "ref": f"{path}#{sym}", "why": "no row"})
+                continue
+            if not any(h["claim"] == claim for h in hits):
+                unresolved.append({"atom": name, "claim": claim, "ref": f"{path}#{sym}",
+                                   "why": "row under " + ", ".join(sorted({h["claim"] for h in hits}))})
+            key = f"{path}#{sym}"
+            reached.add((path, sym))
+            rows.add(key)
+            if path.startswith("src/") and sym:
                 if key not in sym_witness:
-                    sym_witness[key] = witnesses_of(e["path"], e["symbol"], witnesses)
+                    sym_witness[key] = witnesses_of(path, sym, witnesses)
                 wit.update(sym_witness[key])
             for scope, file, fns in scopes:
-                if file == e["path"] and (not fns or e["symbol"] in fns):
+                if file == path and (not fns or sym in fns):
                     sco.add(scope)
         named = sorted(f for f, t in witnesses.items() if f"`{name}`" in t)
-        out[name] = {"plane": a.get("plane", ""), "cc_ref": a.get("cc_ref", ""), "decimals": secs,
-                     "claims": cl, "symbols": syms, "witnesses": sorted(wit), "scopes": sorted(sco),
-                     "named_by": named}
-    return out
+        out[name] = {"plane": a.get("plane", ""), "cc_ref": a.get("cc_ref", ""),
+                     "predicate": a.get("state_predicate", ""),
+                     "claims": sorted({c["claim_id"] for c in a.get("claims", [])}),
+                     "persist_claims": sorted({r[0] for r in refs}),
+                     "by_invariant": sorted({r[0] for r in refs if r[1] == "by_invariant"}),
+                     "rows": sorted(rows), "witnesses": sorted(wit), "scopes": sorted(sco),
+                     "named_by": named, "promised_by": a.get("promised_by", [])}
+    unreached = sorted({f"{e['path']}#{e['symbol']}\t{e['claim']}\t{e['decimal']}"
+                        for e in evidence if (e["path"], e["symbol"]) not in reached})
+    return out, unresolved, unreached
 
 
 def compound(tok: str) -> bool:
     return "_" in tok or ":" in tok
 
 
-def refusals(traces, tokens):
+KIND_PREFIX = "federation_"
+
+
+def kind_for(tok: str, kinds) -> str:
+    """The persist kind() token that spells `tok`: itself, or with the
+    `federation_` prefix persist's federation errors carry."""
+    for k in (tok, KIND_PREFIX + tok):
+        if k in kinds:
+            return k
+    return ""
+
+
+def fn_names(files) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for f, text in files:
+        for name in re.findall(r"\bfn\s+([a-z_][a-z0-9_]*)", text):
+            out.setdefault(name, f)
+    return out
+
+
+def text_tokens(chain, literals, kinds, fns):
+    out = []
+    for tok, secs in sorted(chain["refusal_tokens"].items()):
+        conf = sorted(set(secs.values()))
+        kind = kind_for(tok, kinds)
+        near = sorted(k for k in kinds if k != kind and tok in k)[:3]
+        out.append({"token": tok, "sections": sorted(secs), "confidence": "/".join(conf),
+                    "kind": kind, "literal": literals.get(tok, ""), "fn": fns.get(tok, ""), "near": near})
+    return out
+
+
+def trace_refusals(traces, literals):
     out = []
     for tid, e in sorted(traces.items(), key=lambda kv: int(kv[0][1:])):
         for key, reason in sorted(e.get("refused", {}).items()):
             tok = key.split(":", 1)[1] if ":" in key else key
-            # A one-word token (`agent`, `delegation`) spelled somewhere is an
-            # identity type or a label, not evidence persist emits the
-            # refusal: only a compound token's exact spelling counts.
-            exact = tok in tokens and compound(tok)
-            partial = sorted(t for t in tokens if tok in t and t != tok)[:4]
-            named = sorted({t for t in re.findall(r"[A-Za-z0-9_:.\-]{4,}", reason) if t in tokens})
-            if tok in tokens and not exact:
-                partial = [f"{tok} (a plain word in {tokens[tok]})"] + partial[:3]
+            # A one-word token (`agent`) spelled somewhere is an identity type
+            # or a label, not evidence persist emits the refusal.
+            exact = tok in literals and compound(tok)
+            partial = sorted(t for t in literals if tok in t and t != tok and compound(t))[:3]
+            named = sorted({t for t in re.findall(r"[A-Za-z0-9_:.\-]{4,}", reason)
+                            if t in literals and compound(t)})
             out.append({"trace": tid, "key": key, "token": tok, "exact": exact,
-                        "exact_file": tokens.get(tok, ""), "partial": partial,
-                        "reason_names": named, "reason": reason})
+                        "exact_file": literals.get(tok, ""), "partial": partial,
+                        "reason_names": named})
     return out
 
 
-def stops_by_relation(stops, tokens):
+def stops_by_relation(stops, literals):
     agg = defaultdict(lambda: {"csds": set(), "rels": set(), "reason": ""})
     for s in stops:
         a = agg[s["relation"]]
@@ -250,15 +332,15 @@ def stops_by_relation(stops, tokens):
         a["reason"] = a["reason"] or s["reason"]
     out = []
     for rel, a in sorted(agg.items(), key=lambda kv: (-len(kv[1]["csds"]), kv[0])):
-        tok_hits = sorted(t for t in tokens if re.search(r"(^|[_:.])" + re.escape(rel) + r"($|[_:.])", t)) \
+        hits = sorted(t for t in literals if re.search(r"(^|[_:.])" + re.escape(rel) + r"($|[_:.])", t)) \
             if compound(rel) else []
         why = []
         if re.search(r"\bpersist\b", a["reason"], re.IGNORECASE):
             why.append("the reason names persist")
-        if tok_hits:
-            why.append("persist spells " + ", ".join(f"`{t}`" for t in tok_hits[:3]))
-        out.append({"relation": rel, "csds": sorted(a["csds"]), "rels": sorted(a["rels"]),
-                    "owner": "persist" if why else "unknown", "why": "; ".join(why), "reason": a["reason"]})
+        if hits:
+            why.append("persist spells " + ", ".join(f"`{t}`" for t in hits[:3]))
+        out.append({"relation": rel, "csds": sorted(a["csds"]), "owner": "persist" if why else "unknown",
+                    "why": "; ".join(why), "reason": a["reason"]})
     return out
 
 
@@ -277,18 +359,33 @@ def esc(text: str) -> str:
     return text.replace("|", "\\|").replace("\n", " ")
 
 
-def report(j, refs, stops, meta) -> tuple[str, dict]:
-    no_claim = [a for a, r in j.items() if not r["symbols"]]
-    no_wit_or_scope = [a for a, r in j.items() if r["symbols"] and (not r["witnesses"] or not r["scopes"])]
-    never = [r for r in refs if not r["exact"]]
-    gaps = {"atoms_without_persist_claim": len(no_claim),
-            "atoms_with_claims_but_no_witness_or_no_scope": len(no_wit_or_scope),
-            "refusal_tokens_persist_never_emits": len(never)}
+def report(j, unresolved, unreached, texts, kinds, trace_refs, stops, meta) -> tuple[str, dict]:
+    harness = [a for a in j if a in HARNESS_ATOMS]
+    no_persist = [a for a, r in j.items() if not r["rows"] and a not in HARNESS_ATOMS]
+    no_wit_or_scope = [a for a, r in j.items() if r["rows"] and (not r["witnesses"] or not r["scopes"])]
+    text_names = {t["token"] for t in texts}
+    kinds_unnamed = sorted(k for k in kinds if k not in text_names
+                           and not (k.startswith(KIND_PREFIX) and k[len(KIND_PREFIX):] in text_names))
+    never = [t for t in texts if not (t["kind"] or t["literal"] or t["fn"])]
+    trace_never = [r for r in trace_refs if not r["exact"]]
+    gaps = {
+        "a1_chain_refs_without_row": len({(u["claim"], u["ref"]) for u in unresolved if u["why"] == "no row"}),
+        "a1b_chain_refs_row_under_other_claim": len({(u["claim"], u["ref"]) for u in unresolved
+                                                     if u["why"] != "no row"}),
+        "a2_rows_no_atom_reaches": len(unreached),
+        "b_atoms_with_persist_claims_no_witness_or_no_scope": len(no_wit_or_scope),
+        "b0_atoms_without_persist_claim": len(no_persist),
+        "c1_persist_kinds_text_does_not_name": len(kinds_unnamed),
+        "c2_text_tokens_persist_never_spells": len(never),
+        "trace_refused_keys_persist_never_spells": len(trace_never),
+        "harness_atoms": len(harness),
+    }
     L = []
     w = L.append
     w("# CSD/4 coverage — persist (v60 S0, report-only)")
     w("")
-    w("Generated by `scripts/csd4_coverage.py` (docs/V60_TASK_PLAN.md §3b). Do not hand-edit; re-run it.")
+    w("Generated by `scripts/csd4_coverage.py` from CC's chain manifest "
+      "(`tests/fixtures/csd4/csd4_chain.json`). Do not hand-edit; re-run it.")
     w("")
     w("| input | at |")
     w("|---|---|")
@@ -299,75 +396,120 @@ def report(j, refs, stops, meta) -> tuple[str, dict]:
     w("")
     w("| gap | count |")
     w("|---|---:|")
-    w(f"| atoms with no persist claim (no `cc_impl.tsv` row under any claim their `cc_ref` reaches) | {gaps['atoms_without_persist_claim']} |")
-    w(f"| atoms with persist claims but no witness or no mutation scope | {gaps['atoms_with_claims_but_no_witness_or_no_scope']} |")
-    w(f"| refusal tokens in `traces.json` persist never emits (no exact token string) | {gaps['refusal_tokens_persist_never_emits']} |")
+    w(f"| (a) chain evidence refs to persist with no `cc_impl.tsv` row (distinct claim, ref) | {gaps['a1_chain_refs_without_row']} |")
+    w(f"| (a) chain refs whose row sits under a different claim (distinct claim, ref) | {gaps['a1b_chain_refs_row_under_other_claim']} |")
+    w(f"| (a) `cc_impl.tsv` rows no atom reaches | {gaps['a2_rows_no_atom_reaches']} |")
+    w(f"| (b) atoms with persist claims but no witness or no mutation scope | {gaps['b_atoms_with_persist_claims_no_witness_or_no_scope']} |")
+    w(f"| (b) atoms whose claims carry no persist evidence (harness atoms excluded) | {gaps['b0_atoms_without_persist_claim']} |")
+    w(f"| (c) persist `kind()` tokens the text does not name | {gaps['c1_persist_kinds_text_does_not_name']} |")
+    w(f"| (c) text tokens (`refusal_tokens`) persist never spells (no kind, literal or fn) | {gaps['c2_text_tokens_persist_never_spells']} |")
+    w(f"| traces.json `refused` keys persist never spells | {gaps['trace_refused_keys_persist_never_spells']} |")
+    w(f"| harness-level atoms (no claim by design; not a gap) | {gaps['harness_atoms']} |")
     w("")
     n = len(j)
-    w(f"Of {n} atoms: {sum(1 for r in j.values() if r['claims'])} reach a CC claim, "
-      f"{sum(1 for r in j.values() if r['symbols'])} reach a persist evidence row, "
-      f"{sum(1 for r in j.values() if r['witnesses'])} reach a witness file through those rows, "
+    w(f"Of {n} atoms: {sum(1 for r in j.values() if r['claims'])} carry a CC claim, "
+      f"{sum(1 for r in j.values() if r['rows'])} reach a persist evidence row "
+      f"({sum(1 for r in j.values() if r['by_invariant'])} through a `by_invariant` claim), "
+      f"{sum(1 for r in j.values() if r['witnesses'])} reach a witness file, "
       f"{sum(1 for r in j.values() if r['scopes'])} reach a mutation scope, and "
       f"{sum(1 for r in j.values() if r['named_by'])} are named (in backticks) by a witness file.")
     w("")
-    w("Read the joins as UPPER bounds: a claim under an atom's section is not proof the claim realises the "
-      "atom's `state_predicate`, and a witness file that names a symbol is not proof it asserts the atom. The "
-      "chain becomes exact when CC publishes atom -> state -> transition -> claim ids.")
+    w("A `by_section` claim sits under the atom's CC section without a formal link to its state; a "
+      "`by_invariant` claim is the invariant over the atom's state variables. A witness file that names a "
+      "symbol is not proof it asserts the atom's `state_predicate`.")
     w("")
-    w("### 1. Atoms with no persist claim")
+    w("### (a) Chain evidence refs with no `cc_impl.tsv` row, or under another claim")
     w("")
-    w("| atom | plane | cc_ref | CC claims under it |")
+    w("| atom | claim | ref | finding |")
     w("|---|---|---|---|")
-    for a in no_claim:
-        r = j[a]
-        w(f"| `{a}` | {r['plane']} | {esc(r['cc_ref'])} | {len(r['claims'])} |")
+    for u in unresolved:
+        w(f"| `{u['atom']}` | `{u['claim']}` | `{u['ref']}` | {esc(u['why'])} |")
+    if not unresolved:
+        w("| — | — | — | none |")
     w("")
-    w("### 2. Atoms with claims but no witness or no scope")
+    w(f"### (a) `cc_impl.tsv` rows no atom reaches ({len(unreached)})")
+    w("")
+    w("The chain pins persist at `_meta.pins.evidence_pins.CIRISPersist`; rows added after it are "
+      "unreached until CC re-pins.")
+    w("")
+    w("| path#symbol | claim | decimal |")
+    w("|---|---|---|")
+    for r in unreached:
+        ref, claim, dec = r.split("\t")
+        w(f"| `{ref}` | `{claim}` | {dec} |")
+    w("")
+    w("### (b) Atoms with persist claims but no witness or no scope")
     w("")
     w("| atom | cc_ref | persist rows | witness files | scopes |")
     w("|---|---|---:|---:|---|")
     for a in no_wit_or_scope:
         r = j[a]
-        w(f"| `{a}` | {esc(r['cc_ref'])} | {len(r['symbols'])} | {len(r['witnesses'])} | {cell(r['scopes'])} |")
+        w(f"| `{a}` | {esc(r['cc_ref'])} | {len(r['rows'])} | {len(r['witnesses'])} | {cell(r['scopes'])} |")
     w("")
-    w("### 3. Refusal tokens persist never emits")
+    w("### (b) Atoms whose claims carry no persist evidence")
     w("")
-    w("The `refused` keys are the builder's relation stops (`rel[k]:<relation>`), not persist refusal tokens; "
-      "the join reads the relation. `persist strings in the reason` lists persist tokens the stated reason "
-      "spells (a lead, not a match).")
-    w("")
-    w("| trace | key | token | near persist strings | persist strings in the reason |")
-    w("|---|---|---|---|---|")
-    for r in never:
-        w(f"| {r['trace']} | `{r['key']}` | `{r['token']}` | {cell(r['partial'], 3)} | {cell(r['reason_names'], 3)} |")
-    w("")
-    w("## Refusal-map tokens persist spells (an exact compound token)")
-    w("")
-    w("| trace | key | token | spelled in |")
+    w("| atom | plane | cc_ref | CC claims |")
     w("|---|---|---|---|")
-    for r in refs:
-        if r["exact"]:
-            w(f"| {r['trace']} | `{r['key']}` | `{r['token']}` | `{r['exact_file']}` |")
-    if not any(r["exact"] for r in refs):
-        w("| — | — | — | none |")
+    for a in no_persist:
+        r = j[a]
+        w(f"| `{a}` | {r['plane']} | {esc(r['cc_ref'])} | {cell(r['claims'], 4)} |")
+    w("")
+    w("### Harness-level atoms (no claim by design)")
+    w("")
+    for a in harness:
+        w(f"- `{a}` ({j[a]['plane']}): {esc(j[a]['predicate'])}; promised by {cell(j[a]['promised_by'])}")
+    w("")
+    w("### (c) Persist `kind()` tokens the text does not name")
+    w("")
+    w("| token | kind() in |")
+    w("|---|---|")
+    for k in kinds_unnamed:
+        w(f"| `{k}` | `{kinds[k]}` |")
+    w("")
+    w("### (c) Text tokens and persist")
+    w("")
+    w("Every token CC's text names (`refusal_tokens`), with the text's confidence: `bold` (named as a "
+      "token) or `after_refusal` (the word after \"refusal\"). `kind()` = the persist error kind that returns "
+      "it (or it with the `federation_` prefix); `literal` = the first non-test src file with it as a string "
+      "literal; `fn` = a non-test src fn of that name (a predicate the text names). **never** = none of the "
+      "three.")
+    w("")
+    w("| token | sections | confidence | persist kind() | literal | fn | near kind() |")
+    w("|---|---|---|---|---|---|---|")
+    for t in texts:
+        miss = not (t["kind"] or t["literal"] or t["fn"])
+        w(f"| `{t['token']}` | {' '.join(t['sections'])} | {t['confidence']} | "
+          f"{('`' + t['kind'] + '`') if t['kind'] else ('**never**' if miss else '—')} | "
+          f"{('`' + t['literal'] + '`') if t['literal'] else '—'} | {('`' + t['fn'] + '`') if t['fn'] else '—'} | "
+          f"{cell(t['near'], 3)} |")
+    w("")
+    w("## traces.json `refused` keys persist never spells")
+    w("")
+    w("CIRISServer's harness output (CC does not own it: `_meta.not_here`). The keys are relation stops "
+      "(`rel[k]:<relation>`); the join reads the relation.")
+    w("")
+    w("| trace | key | near persist strings | persist strings in the reason |")
+    w("|---|---|---|---|")
+    for r in trace_never:
+        w(f"| {r['trace']} | `{r['key']}` | {cell(r['partial'], 3)} | {cell(r['reason_names'], 3)} |")
     w("")
     w("## \"Stops at rel[k]\" relations (CEWPOS catalogue), with an owner guess")
     w("")
-    w("`persist` when the stated reason names persist, or the relation is a compound name a persist token "
-      "spells; otherwise `unknown` (a one-word relation such as `agent` matches too much to guess from; CC "
-      "has been asked for the owning repo per relation).")
+    w("`persist` when the stated reason names persist, or the relation is a compound name a persist string "
+      "spells; otherwise `unknown` (the chain names the card relations CEWPOS/CIRISClient data).")
     w("")
     w("| relation | CSD rows | CSDs | owner guess | why | reason (first) |")
     w("|---|---:|---|---|---|---|")
     for s in stops:
-        w(f"| `{s['relation']}` | {len(s['csds'])} | {cell(s['csds'], 6)} | {s['owner']} | {esc(s['why']) or '—'} | {esc(s['reason'])[:160]} |")
+        w(f"| `{s['relation']}` | {len(s['csds'])} | {cell(s['csds'], 6)} | {s['owner']} | "
+          f"{esc(s['why']) or '—'} | {esc(s['reason'])[:160]} |")
     w("")
     w("## Per atom")
     w("")
-    w("| atom | plane | cc_ref | CC claims | persist symbols | witness files | scopes | named by |")
+    w("| atom | plane | cc_ref | persist claims | persist rows | witness files | scopes | named by |")
     w("|---|---|---|---|---|---|---|---|")
     for a, r in j.items():
-        w(f"| `{a}` | {r['plane']} | {esc(r['cc_ref'])} | {cell(r['claims'], 4)} | {cell(r['symbols'], 4)} | "
+        w(f"| `{a}` | {r['plane']} | {esc(r['cc_ref'])} | {cell(r['persist_claims'], 4)} | {cell(r['rows'], 4)} | "
           f"{cell(r['witnesses'], 4)} | {cell(r['scopes'])} | {cell(r['named_by'], 3)} |")
     w("")
     return "\n".join(L), gaps
@@ -376,26 +518,31 @@ def report(j, refs, stops, meta) -> tuple[str, dict]:
 def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--out")
-    ap.add_argument("--cc-dir", default=str(REPO.parent / "CIRISConstitution"))
-    ap.add_argument("--cc-ref", default="origin/rc9")
     ap.add_argument("--cewpos-dir", default=str(REPO.parent / "CEWPOS"))
     a = ap.parse_args(argv[1:])
-    atoms, traces = load_atoms(), load_traces()
-    claims, cc_sha = load_claims(Path(a.cc_dir), a.cc_ref)
+    chain = load_chain()
+    atoms, traces = chain["atoms"], load_traces()
     evidence = load_evidence()
     stops_raw, cew_sha = cewpos_stops(Path(a.cewpos_dir))
-    tokens = persist_tokens()
-    j = join(atoms, claims, evidence, load_scopes(), witness_files())
-    pin_sha = hashlib.sha256((FIX / "PIN.md").read_bytes()).hexdigest()
+    files = src_files()
+    literals, kinds, fns = string_literals(files), refusal_kinds(files), fn_names(files)
+    j, unresolved, unreached = join(atoms, evidence, load_scopes(), witness_files())
+    chain_sha = hashlib.sha256(CHAIN.read_bytes()).hexdigest()
+    pins = chain["_meta"].get("pins", {})
     head = subprocess.run(["git", "-C", str(REPO), "rev-parse", "--short", "HEAD"],
                           capture_output=True, text=True).stdout.strip() or "?"
     meta = {
-        "csd4 fixtures": f"`tests/fixtures/csd4/` (PIN.md sha256 `{pin_sha[:16]}…`; {len(atoms)} atoms, {len(traces)} traces)",
-        "CC claims": f"CIRISConstitution `{a.cc_ref}` = `{cc_sha}` `constitution/claims.tsv` ({len(claims)} claims)",
+        "CC chain": f"`tests/fixtures/csd4/csd4_chain.json` sha256 `{chain_sha[:16]}…` "
+                    f"(`_meta.chain_sha256` `{chain['_meta'].get('chain_sha256', '?')[:16]}…`; "
+                    f"{len(atoms)} atoms, {len(chain['refusal_tokens'])} text tokens; persist pinned at "
+                    f"`{pins.get('evidence_pins', {}).get(PERSIST, '?')}`)",
+        "traces": f"`tests/fixtures/csd4/traces.json` ({len(traces)} traces)",
         "persist evidence": f"`evidence/cc_impl.tsv` ({len(evidence)} rows) at persist `{head}`",
+        "persist kind() tokens": f"{len(kinds)} distinct",
         "CEWPOS": f"`CSD4_CATALOGUE_AND_MIGRATION_PLAN.md` at `{cew_sha}` ({len(stops_raw)} stop rows)",
     }
-    text, gaps = report(j, refusals(traces, tokens), stops_by_relation(stops_raw, tokens), meta)
+    text, gaps = report(j, unresolved, unreached, text_tokens(chain, literals, kinds, fns), kinds,
+                        trace_refusals(traces, literals), stops_by_relation(stops_raw, literals), meta)
     if a.out:
         Path(a.out).write_text(text + "\n", encoding="utf-8")
     else:
