@@ -31,6 +31,12 @@ as the actor) and a peer admits it at the put door and the replicated apply.
   federation tier in place) and a peer's replicated row would each leave
   `hard_case_events` different from its from-rows rebuild. A peer's events
   are therefore listed by `list_hard_case_events` on the node that holds them.
+- **Added:** the listing now includes replicated peers' events, each
+  carrying `HardCaseEvent::emitter_key_id` (the key that signed its row,
+  never `detail`); filter by `HardCaseFilter::emitter_key_id` for a
+  node-local view. **V202** (both dialects) adds the
+  `hard_case_events.emitter_key_id` column, backfilled from each projected
+  row's signer.
 - Witness **I1165** (memory, sqlite, postgres): node A records a
   `hard_case:consent_sla_breach:v1` row and crosses it; node B receives it
   only through A's advertised wire hashes and point read, applies it

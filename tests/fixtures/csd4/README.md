@@ -39,11 +39,15 @@ promise it; `refusal_tokens` (the tokens the text names, by section, with
 `scripts/csd4_coverage.py` reads the join from it instead of matching
 `cc_ref` prefixes against `claims.tsv`.
 
-- Source: CIRISConstitution `rc9` (untagged on 2026-10-21, so a fixture, like
-  `governance_policy.json`), file last changed at
-  `6ce16745e3e6f06874140d34e8ba709c8ed884ce` (the #170 commit; the branch tip
-  `aa5ae9c2` changes only the CHANGELOG), copied with `git show
-  origin/rc9:manifests/csd4_chain.json`.
+- Source: CIRISConstitution tag `v1.0-rc9` (tag object `a1c2bea5`), which
+  is CC `main` at `5d50c6bb160ecbee99a66e1700597c029846e6b6`. The file last
+  changed at `6ce16745e3e6f06874140d34e8ba709c8ed884ce` (the #170 commit, an
+  ancestor of the tag); the copy is byte-identical to CC's file at both
+  commits (checked with `git show v1.0-rc9:manifests/csd4_chain.json |
+  sha256sum` and the same at `6ce16745`). First copied with `git show
+  origin/rc9:manifests/csd4_chain.json` while rc9 was still untagged.
+- `PIN.md` stays CIRISClient's byte copy (its sha above): it pins the
+  catalogue, not this chain, so the rc9 tag is recorded here.
 - The manifest first landed at `5fe1c0f` (sha256 `5c7999540a0e382b…`); CC
   regenerated it three times since (64a1d1c, 4abba04, 6ce1674). The copy is
   the tip's, which carries the `CLM-accountability-record-unpurgeable`
