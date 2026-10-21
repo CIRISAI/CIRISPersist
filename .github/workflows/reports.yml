@@ -14,6 +14,10 @@
 #   coverage   weekly, dispatch
 #                       cargo llvm-cov per certify feature set (scripts/coverage.sh);
 #                       the legs are DERIVED (ci_feature_matrix.py legs), not listed
+#   csd4       PR, weekly, dispatch
+#                       the CSD/4 catalogue (tests/fixtures/csd4) joined to CC claims,
+#                       evidence/cc_impl.tsv, the witnesses and the mutation scopes, with
+#                       the gap lists (scripts/csd4_coverage.py, v60.0.0)
 #   mutants-diff  PR labelled `run-mutants`, every `release-*` PR (v60.0.0), dispatch
 #                       cargo-mutants on the changed lines only (scripts/mutants_diff.sh),
 #                       capped at MUTANTS_DIFF_BUDGET_SECS
@@ -39,7 +43,7 @@ on:
         required: false
         default: origin/main
       run:
-        description: 'which report(s): all | semver | coverage | mutants-diff'
+        description: 'which report(s): all | semver | coverage | csd4 | mutants-diff'
         required: false
         default: all
 
@@ -192,6 +196,42 @@ jobs:
             target/coverage/${{ matrix.leg }}/lcov.info
             target/coverage/${{ matrix.leg }}/summary.txt
             target/coverage/${{ matrix.leg }}/html/
+          retention-days: 30
+
+  # v60.0.0 (docs/V60_TASK_PLAN.md §3b, S0-csd) — report-only until CC
+  # publishes the atom -> state -> transition -> claim chain as data; then a
+  # certify gate. Reads CC's claims at rc9 and CEWPOS's catalogue at main.
+  csd4:
+    name: CSD/4 coverage (report)
+    if: >-
+      (github.event_name == 'pull_request' && github.event.action != 'labeled')
+      || github.event_name == 'schedule'
+      || (github.event_name == 'workflow_dispatch' && contains(fromJSON('["all","csd4"]'), inputs.run))
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/checkout@v6
+        with:
+          repository: CIRISAI/CIRISConstitution
+          ref: rc9
+          path: _ext/CIRISConstitution
+      - uses: actions/checkout@v6
+        with:
+          repository: CIRISAI/CEWPOS
+          path: _ext/CEWPOS
+      - name: CSD/4 coverage (report)
+        run: |
+          mkdir -p target/csd4
+          python3 scripts/csd4_coverage.py --cc-dir _ext/CIRISConstitution --cc-ref HEAD \
+            --cewpos-dir _ext/CEWPOS --out target/csd4/coverage.md
+          sed -n '/^## Gap counts/,/^### 1\./p' target/csd4/coverage.md | sed '$d' >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: csd4-coverage
+          path: target/csd4/coverage.md
           retention-days: 30
 
   # v60.0.0 (docs/V60_TASK_PLAN.md §3 item 4) — also on every `release-*` PR

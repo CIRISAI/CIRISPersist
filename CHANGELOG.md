@@ -56,6 +56,23 @@ paragraph agents copy).
   `MUTANTS_DIFF_BUDGET_SECS` (7200 s) inside the job's 150 minutes; the
   summary lands in the step summary and the artifact.
 
+### Added — the CSD/4 coverage report (docs/V60_TASK_PLAN.md §3b, report-only)
+
+- `tests/fixtures/csd4/`: CIRISClient's `packaging/csd4/`
+  (`topology_vocabulary.json`, `traces.json`, `requirements.yaml`, `PIN.md`,
+  `topology_vocabulary.pin`) byte for byte, from CIRISClient main
+  `ab134ef2`; the README records the commit and the shas.
+- `scripts/csd4_coverage.py` (stdlib, from disk): each atom by its `cc_ref` to
+  CC `claims.tsv` (rc9), to persist's `evidence/cc_impl.tsv` rows, to the
+  `*_invariants.rs` files that name those symbols and the mutation scopes that
+  cover them; each `refused` key in `traces.json` to persist's token strings;
+  and CEWPOS's "stops at rel[k]" relations with an owner guess.
+  `docs/CSD4_COVERAGE_v60_S0.md` is its first run: 19 atoms reach no persist
+  claim, 67 reach claims but no witness or no scope, and 58 refusal-map tokens
+  are spelled nowhere in persist (the map holds the builder's relation stops,
+  not persist refusal tokens). A `reports (non-gating)` job runs it on every
+  PR and weekly.
+
 ### Fixed — the nightly mutants job is green again (CIRISPersist#1112)
 
 The scheduled `mutants and powerset` job had been red every day since
