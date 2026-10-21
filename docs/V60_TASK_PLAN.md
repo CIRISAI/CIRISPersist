@@ -69,6 +69,13 @@ on doors S4–S6 move; writing them once on the shared plan is cheaper), #1105 (
 as a side effect if the key-plane read moves; otherwise v61), the retirement program
 (#1079–#1088, on Agent's sequencing). New downstream asks during v60 become tickets.
 
+Tickets filed during v60 (2026-10-21), all after v60 unless noted: #1101 serve-seat live owner
+check (steward: after v60); #1113 takedown reversal (CC 4.5.3 at rc10, per-holder window from
+`executed_at`); #1114 three `malformed_row` reasons appended (rides S6v if that slice has room);
+#1115 `observation:access_assumption:v1` family gate (CC#183 N1); #1116 occurrence build pin
+`build_manifest_hash` + `build_manifest_ref` (CC#183 N4). CC rc10 carries the text for all of
+them; their claims stay staged until built.
+
 ## 3. The mutation discipline (S0, then every slice)
 
 **Problem.** The repo has a centralized, gated mutation matrix (`scripts/mutants.sh`,
