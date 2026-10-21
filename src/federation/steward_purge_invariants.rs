@@ -3406,6 +3406,30 @@ pub(crate) mod bodies {
             vec![(event.event_id.clone(), NODE_A.to_owned())],
             "I1165: filtering on A's key returns exactly A's event"
         );
+        // The emitter arm composes with the `since` bound, inclusive at the
+        // event's own instant and exclusive one second past it.
+        let since = |at: chrono::DateTime<chrono::Utc>| hard_case::HardCaseFilter {
+            since: Some(at),
+            emitter_key_id: Some(NODE_A.to_owned()),
+            ..hard_case::HardCaseFilter::default()
+        };
+        assert_eq!(
+            b.list_hard_case_events(since(event.emitted_at))
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|e| e.event_id)
+                .collect::<Vec<_>>(),
+            vec![event.event_id.clone()],
+            "I1165: since = the event's instant still lists it (inclusive)"
+        );
+        assert!(
+            b.list_hard_case_events(since(event.emitted_at + chrono::Duration::seconds(1)))
+                .await
+                .unwrap()
+                .is_empty(),
+            "I1165: since past the event's instant lists nothing"
+        );
         check_projection_rebuild(b, SiloProjection::HardCaseEvents)
             .await
             .expect("I1165: B's hard_case_events, emitters included, is its rows' rebuild");
