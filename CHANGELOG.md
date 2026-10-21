@@ -62,16 +62,23 @@ paragraph agents copy).
   (`topology_vocabulary.json`, `traces.json`, `requirements.yaml`, `PIN.md`,
   `topology_vocabulary.pin`) byte for byte, from CIRISClient main
   `ab134ef2`; the README records the commit and the shas.
-- `scripts/csd4_coverage.py` (stdlib, from disk): each atom by its `cc_ref` to
-  CC `claims.tsv` (rc9), to persist's `evidence/cc_impl.tsv` rows, to the
-  `*_invariants.rs` files that name those symbols and the mutation scopes that
-  cover them; each `refused` key in `traces.json` to persist's token strings;
-  and CEWPOS's "stops at rel[k]" relations with an owner guess.
-  `docs/CSD4_COVERAGE_v60_S0.md` is its first run: 19 atoms reach no persist
-  claim, 67 reach claims but no witness or no scope, and 58 refusal-map tokens
-  are spelled nowhere in persist (the map holds the builder's relation stops,
-  not persist refusal tokens). A `reports (non-gating)` job runs it on every
-  PR and weekly.
+- `tests/fixtures/csd4/csd4_chain.json`: CC's chain as data
+  (CIRISConstitution rc9 `manifests/csd4_chain.json`, byte for byte as last
+  changed at `6ce16745`; rc9 is untagged, so a fixture like
+  `governance_policy.json`): per atom its STATE_TABLE states, the invariants
+  and claims over them (`by_invariant` | `by_section`), each claim's evidence
+  pointers by repo, and the text's refusal tokens with their confidence.
+- `scripts/csd4_coverage.py` (stdlib, from disk) READS the join from the chain:
+  atom → claim → CIRISPersist `path#symbol` → the `evidence/cc_impl.tsv` row →
+  the `*_invariants.rs` files that name the symbol and the mutation scopes that
+  cover it. Gap lists: (a) chain refs with no row (or under another claim), and
+  rows no atom reaches; (b) atoms with persist claims but no witness or no
+  scope; (c) persist `kind()` tokens the text does not name, and text tokens
+  persist never emits, with `bold`/`after_refusal` confidence. `negatives.held`
+  and `values.ready` are listed as harness-level, not gaps. The `traces.json`
+  refused map and CEWPOS's "stops at rel[k]" relations (with an owner guess)
+  stay. `docs/CSD4_COVERAGE_v60_S0.md` is its run at the slice head. A
+  `reports (non-gating)` job runs it on every PR and weekly.
 
 ### Fixed — the nightly mutants job is green again (CIRISPersist#1112)
 
