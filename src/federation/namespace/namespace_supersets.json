@@ -15786,6 +15786,15 @@
     "manifest_round": "cc-rc8-8c8f536-1052"
    },
    {
+    "decimal_id": "2.4.1.1",
+    "claim_id": "CLM-accountability-record-unpurgeable",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/steward_purge.rs#accountability_record_of",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v60-cc170",
+    "witness": "I1165 (memory, sqlite, postgres)"
+   },
+   {
     "decimal_id": "3.1.5",
     "claim_id": "CLM-trace-run-kind-refusal",
     "repo": "CIRISPersist",
@@ -16147,10 +16156,10 @@
     "decimal_id": "3.1.9.4",
     "claim_id": "CLM-hard-case-on-base",
     "repo": "CIRISPersist",
-    "path#symbol": "src/federation/hard_case.rs#check_hard_case_replication_held",
+    "path#symbol": "src/federation/attestation_apply.rs#apply_planned",
     "tsv_target": "evidence/cc_impl.tsv",
-    "manifest_round": "v57-988",
-    "witness": "I960 (memory, sqlite, postgres)"
+    "manifest_round": "v60-cc170",
+    "witness": "I1165 (memory, sqlite, postgres)"
    },
    {
     "decimal_id": "3.1.9.4",

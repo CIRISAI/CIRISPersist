@@ -21902,6 +21902,7 @@ impl crate::federation::attestation_admit::AttestationStore for SqliteBackend {
             row,
             projected_trace,
             projected_detection,
+            projected_hard_case,
             wire_index_key,
             ..
         } = planned;
@@ -21983,6 +21984,12 @@ impl crate::federation::attestation_admit::AttestationStore for SqliteBackend {
                         &row.attestation_id,
                         detection,
                     )?;
+                }
+                // v60.0.0 (CIRISConstitution#170 closed) — the
+                // `hard_case_events` projection of a replicated (or put)
+                // hard_case row, in the SAME transaction.
+                if let Some(event) = &projected_hard_case {
+                    sqlite_project_hard_case(&tx, "hard_case_events", &row.attestation_id, event)?;
                 }
                 if let Some(depth) = withdraws_depth {
                     tx.execute(

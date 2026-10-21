@@ -9,6 +9,43 @@ threat-model citations because this crate's audit story is the point.
 
 ## [60.0.0] - UNRELEASED
 
+### Changed — hard_case rows replicate (CIRISConstitution#170 closed)
+
+The steward ruled through CC (2026-10-21, CIRISConstitution#170 closed, rc9
+`6ce1674`): `hard_case:*` joins CC 2.4.1.1's unpurgeable accountability set,
+and no peer capability advertisement is needed (conformance is the guard).
+Persist already refused a hard_case purge (`ACCOUNTABILITY_RECORD_PREFIXES`,
+both purge doors and the replicated purge apply), so the v57 hold is lifted:
+a hard_case row crosses like any local row this node attests (the node signs
+as the actor) and a peer admits it at the put door and the replicated apply.
+
+- **Removed (clean break):** `Error::HardCaseReplicationHeld`, its kind
+  `federation_hard_case_replication_held` (`hard_case::refusal::REPLICATION_HELD`),
+  `hard_case::check_hard_case_replication_held`, and its Python arm (a
+  `RuntimeError`); no call site returns it any more. Nothing in the `.pyi`
+  named it.
+- **Changed:** `hard_case::project_hard_case_row` is tier-agnostic (the
+  detection projection's rule), and the put door (also the replicated apply)
+  projects a `hard_case:*` row into `hard_case_events` in the row's
+  transaction on every backend. Without both, a crossed row (moved to the
+  federation tier in place) and a peer's replicated row would each leave
+  `hard_case_events` different from its from-rows rebuild. A peer's events
+  are therefore listed by `list_hard_case_events` on the node that holds them.
+- Witness **I1165** (memory, sqlite, postgres): node A records a
+  `hard_case:consent_sla_breach:v1` row and crosses it; node B receives it
+  only through A's advertised wire hashes and point read, applies it
+  (`Inserted`), holds it at the federation tier, lists it, serves it, and
+  both nodes' `hard_case_events` equal their rebuilds; B's purge doors refuse
+  it as the accountability record (the dry run names it inadmissible; local
+  execution and a quorum-cosigned replicated bundle are both
+  `purge_retraction_inadmissible`, nothing written; the row survives). The
+  #607 conferral witness now expects the self-attested and conferred
+  hard_case rows ADMITTED where it expected the hold.
+- Evidence: `CLM-hard-case-on-base`'s row at the retired hold moves to the
+  replicated apply door (`attestation_apply.rs#apply_planned`);
+  `CLM-accountability-record-unpurgeable` (2.4.1.1) gains
+  `steward_purge.rs#accountability_record_of`.
+
 ### Added — a test-anchor seam on `W_self` (CIRISPersist#1111, CIRISServer#794 T11)
 
 A `test-anchor` harness binary could not watch the self roster's lone path

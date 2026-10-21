@@ -685,14 +685,10 @@ pub fn recipient_excluded_event_id(
 /// plane**, as the stable `kind()` tokens consumers key on. From-disk
 /// visible on purpose: the CHANGELOG, the Python surface and the gates all
 /// name these constants, never a spelling of their own.
+///
+/// v60.0.0 (CIRISConstitution#170 closed) — `federation_hard_case_replication_held`
+/// is gone: hard_case rows replicate like any attestation row.
 pub mod refusal {
-    /// A `hard_case:*` row offered to the federation tier (the crossing, the
-    /// put door, the replicated apply) while replication is held
-    /// ([`super::check_hard_case_replication_held`]). Unblocks when
-    /// CIRISConstitution#170 is ruled AND persist can tell which peers carry
-    /// the unpurgeable refusal (a peer capability advertisement, which
-    /// persist does not have today).
-    pub const REPLICATION_HELD: &str = "federation_hard_case_replication_held";
     /// This node cannot attest a `hard_case:*` row: it has no declared node
     /// key, or does not hold the one it declared. An act that must record
     /// one (an erasure, a peer removal, `record_hard_case`) is refused before
@@ -760,17 +756,20 @@ pub fn hard_case_envelope(event: &HardCaseEvent) -> Result<serde_json::Value, se
 }
 
 /// v57.0.0 (CIRISPersist#988 item 2; CLM-silo-projection-rebuildable) —
-/// **the projection, rows → `hard_case_events`.** The one function both the
-/// write step (in the same transaction as the row) and the from-rows rebuild
-/// call. `None` for every row that is not a local-tier `hard_case:*` row with
-/// a readable body: only the hard_case door writes those
-/// (`attestation_admit::plan_hard_case_row`), and the federation tier holds
-/// none while replication is held ([`check_hard_case_replication_held`]).
+/// **the projection, rows → `hard_case_events`.** The one function the
+/// hard_case door (in the same transaction as the row), the put door (also
+/// the replicated apply, in the row's transaction) and the from-rows rebuild
+/// call. `None` for every row that is not a `scores` `hard_case:*` row with a
+/// readable body whose dimension and id agree with it.
+///
+/// v60.0.0 (CIRISConstitution#170 closed) — tier-agnostic, as the detection
+/// projection is. The hold kept every hard_case row at the local tier, so the
+/// projection read the local tier alone; now the crossing moves this node's
+/// row to the federation tier in place, and a peer's row arrives at it, and
+/// the table must stay the rebuild of the rows held, both cases included.
 #[must_use]
 pub fn project_hard_case_row(row: &super::types::Attestation) -> Option<HardCaseEvent> {
-    if row.tier != super::types::attestation_tier::LOCAL
-        || row.attestation_type != super::types::attestation_type::SCORES
-    {
+    if row.attestation_type != super::types::attestation_type::SCORES {
         return None;
     }
     let dimension = row.attestation_envelope.get("dimension")?.as_str()?;
@@ -811,40 +810,6 @@ where
             Ok(())
         }
         other => other,
-    }
-}
-
-/// v57.0.0 (CIRISPersist#988 item 2; CC guidance on #988, 2026-10-13) — **the
-/// held replication.** A `hard_case:*` row does not enter the federation tier:
-/// not by the crossing (`crossing::plan_enter_mesh`), not by the put door
-/// (`attestation_admit::plan_put_attestation`, which is also the replicated
-/// apply). Its rows stay at the local tier, which no serve read returns, so
-/// no peer receives one.
-///
-/// Why held: a `hard_case` row is the node's accountability record and must
-/// be unpurgeable on every node that holds it. This node refuses to purge one
-/// (`migration::ACCOUNTABILITY_RECORD_PREFIXES`); a peer on an earlier
-/// release does not. CIRISConstitution#170 asks the steward to add
-/// `hard_case:*` to CC 2.4.1.1's unpurgeable set.
-///
-/// What unblocks it: #170 ruled, AND a way to know a peer carries the
-/// refusal (persist has no peer capability advertisement today). Then this
-/// check becomes a per-peer serve filter instead of a refusal here.
-pub fn check_hard_case_replication_held(
-    row: &super::types::Attestation,
-) -> Result<(), super::Error> {
-    match row
-        .attestation_envelope
-        .get("dimension")
-        .and_then(|d| d.as_str())
-    {
-        Some(dimension) if is_hard_case_dimension(dimension) => {
-            Err(super::Error::HardCaseReplicationHeld {
-                attestation_id: row.attestation_id.clone(),
-                dimension: dimension.to_owned(),
-            })
-        }
-        _ => Ok(()),
     }
 }
 

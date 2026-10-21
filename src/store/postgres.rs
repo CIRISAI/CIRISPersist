@@ -23762,6 +23762,18 @@ impl crate::federation::attestation_admit::AttestationStore for PostgresBackend 
                 )
                 .await?;
             }
+            // v60.0.0 (CIRISConstitution#170 closed) — the `hard_case_events`
+            // projection of a replicated (or put) hard_case row, in the row's
+            // transaction.
+            if let Some(event) = &planned.projected_hard_case {
+                pg_project_hard_case(
+                    &*tx,
+                    "cirislens.hard_case_events",
+                    &row.attestation_id,
+                    event,
+                )
+                .await?;
+            }
         }
         tx.commit()
             .await

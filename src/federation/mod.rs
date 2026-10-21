@@ -9996,26 +9996,6 @@ pub enum Error {
         reason: AdminActionRefusal,
     },
 
-    /// v57.0.0 (CIRISPersist#988 item 2) — a `hard_case:*` row offered to the
-    /// federation tier (the crossing, the put door or the replicated apply)
-    /// while its replication is held: a peer on an earlier release could purge
-    /// the node's accountability record, and persist cannot yet tell which
-    /// peers carry the refusal (CIRISConstitution#170). The row stays at the
-    /// local tier. Not a caller fault: the call is correct and the door is
-    /// held, so Python sees `RuntimeError` (the posture of `NoActorSignature`).
-    /// See [`hard_case::check_hard_case_replication_held`] for what unblocks it.
-    #[error(
-        "hard_case row {attestation_id} ({dimension}) does not enter the federation tier: \
-         hard_case replication is held until peers carry its unpurgeable refusal \
-         (CIRISConstitution#170)"
-    )]
-    HardCaseReplicationHeld {
-        /// The row offered.
-        attestation_id: String,
-        /// Its `hard_case:{kind}:v1` dimension.
-        dimension: String,
-    },
-
     /// v57.0.0 (CIRISPersist#988 item 2) — this node cannot attest a
     /// `hard_case:*` row (CC 3.1.9.4: the attester is the node key): it has
     /// no declared node key (`reason` [`hard_case::refusal::NODE_KEY_UNSET`])
@@ -12286,7 +12266,6 @@ impl Error {
             Error::LocalAttestationIdOccupied { .. } => "federation_local_attestation_id_occupied",
             Error::Conflict(_) => "federation_conflict",
             Error::AdminActionUnattributed { .. } => "federation_admin_action_unattributed",
-            Error::HardCaseReplicationHeld { .. } => hard_case::refusal::REPLICATION_HELD,
             Error::HardCaseAttesterUnavailable { .. } => hard_case::refusal::ATTESTER_UNAVAILABLE,
             Error::RevocationBoundInvalid { .. } => "federation_revocation_bound_invalid",
             Error::RevocationEnvelopeUnbound { .. } => "federation_revocation_envelope_unbound",

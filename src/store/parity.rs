@@ -178,7 +178,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // in-transaction emitters call `plan_hard_case_row` inside their own
     // transaction). The put plan's two new refusals are Gates.
     ("plan_hard_case_row", Class::Plan),
-    ("check_hard_case_replication_held", Class::Gate),
     // The detection plan's V008 shape refusal (a Gate); the two envelope
     // builders are serialization (Plumbing).
     ("detection_shape_refusal", Class::Gate),

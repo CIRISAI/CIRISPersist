@@ -35052,9 +35052,6 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
             method,
             needed_for,
         } => PyRuntimeError::new_err(format!("{kind}: {method} needs {needed_for}")),
-        // v57.0.0 (CIRISPersist#988 item 2) — a held door, not a fault: the
-        // row stays at the local tier until hard_case replication is unheld.
-        // RuntimeError, the posture of `NoActorSignature` above.
         // v57.0.0 (CIRISPersist#988 item 2) — the typed refusal of an act
         // that must record a hard_case row this node cannot attest. Its own
         // class (a `PersistError`): the remedy is host configuration, not
@@ -35063,13 +35060,6 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         crate::federation::Error::HardCaseAttesterUnavailable { .. } => {
             NodeIdentityRequired::new_err(format!("{kind}: {e}"))
         }
-        crate::federation::Error::HardCaseReplicationHeld {
-            attestation_id,
-            dimension,
-        } => PyRuntimeError::new_err(format!(
-            "{kind}: {attestation_id} ({dimension}) stays at the local tier while hard_case \
-             replication is held"
-        )),
     }
 }
 

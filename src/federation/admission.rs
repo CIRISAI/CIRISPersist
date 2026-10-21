@@ -26787,19 +26787,18 @@ pub(crate) mod r2_test_support {
         // self-attested row is not one, and refusing it would tighten past what
         // #607 asks.
         //
-        // v57.0.0 (CIRISPersist#988 item 2) — hard_case replication is held: a
-        // federation-tier `hard_case:` row is refused by the hold, which runs
-        // AFTER this gate. Reaching the hold is what proves the #607 gate
-        // admitted the row; a gate that refused it would name itself instead.
+        // v60.0.0 (CIRISConstitution#170 closed) — hard_case rows replicate:
+        // the v57 hold that stood after this gate is gone, so the row is
+        // ADMITTED and stored, which is what proves the #607 gate admitted it.
         let own = uuid::Uuid::new_v4().to_string();
-        let held = dir
-            .put_attestation(row(&own, &author))
+        dir.put_attestation(row(&own, &author))
             .await
-            .expect_err("v57: hard_case replication is held");
-        assert_eq!(
-            held.kind(),
-            "federation_hard_case_replication_held",
-            "a SELF-attested hard_case row must clear the #607 gate and reach the hold: {held}"
+            .unwrap_or_else(|e| {
+                panic!("a SELF-attested hard_case row must clear the #607 gate: {e}")
+            });
+        assert!(
+            dir.get_attestation(&own).await.expect("get").is_some(),
+            "a SELF-attested hard_case row is stored at the federation tier"
         );
 
         // ── (3) ABOUT ANOTHER PARTY, WITH a conferral — ADMITTED ──────────
@@ -26812,16 +26811,21 @@ pub(crate) mod r2_test_support {
         )
         .await;
         let conferred = uuid::Uuid::new_v4().to_string();
-        let held = dir
-            .put_attestation(row(&conferred, &victim))
+        dir.put_attestation(row(&conferred, &victim))
             .await
-            .expect_err("v57: hard_case replication is held");
-        assert_eq!(
-            held.kind(),
-            "federation_hard_case_replication_held",
-            "a substrate_persist CONFERRED infra:record_hard_case by this node's own trust \
-             root must clear the #607 gate and reach the hold — otherwise the admin ladder is \
-             unreachable and leg (1) passes vacuously: {held}"
+            .unwrap_or_else(|e| {
+                panic!(
+                    "a substrate_persist CONFERRED infra:record_hard_case by this node's own \
+                     trust root must clear the #607 gate — otherwise the admin ladder is \
+                     unreachable and leg (1) passes vacuously: {e}"
+                )
+            });
+        assert!(
+            dir.get_attestation(&conferred)
+                .await
+                .expect("get")
+                .is_some(),
+            "the conferred hard_case row is stored at the federation tier"
         );
     }
 

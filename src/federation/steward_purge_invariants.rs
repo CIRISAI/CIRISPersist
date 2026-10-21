@@ -185,6 +185,20 @@
 //! - **I666** — a `key:` (or `federation_keys:`) id is not a purge record:
 //!   `purge_selection_malformed`, naming `key:revocation` as key retirement's
 //!   own act.
+//! - **I1165** (v60.0.0; CIRISConstitution#170 closed, CC 2.4.1.1, 3.1.9.4;
+//!   memory, sqlite, postgres) — hard_case rows REPLICATE and stay
+//!   unpurgeable on the peer: node A records a `hard_case:{kind}:v1` row,
+//!   crosses it (the node signs as the actor), and advertises it; node B,
+//!   receiving it ONLY through A's advertised wire hashes and point read,
+//!   applies it (`Inserted`), holds it at the federation tier, projects it
+//!   into its `hard_case_events` (each node's table stays its rows' rebuild),
+//!   and serves it; B's purge doors refuse it as the accountability record:
+//!   the local dry run names it inadmissible by that clause, and executing it
+//!   under a quorum notice, or applying a quorum-cosigned replicated bundle
+//!   naming it, is `purge_retraction_inadmissible` with nothing written; the
+//!   row survives. The v57 hold (`federation_hard_case_replication_held`) is the
+//!   mutation this witness kills: re-added at the crossing or at the put door
+//!   (the replicated apply) it turns the crossing or B's apply red.
 
 #[cfg(test)]
 pub(crate) mod bodies {
@@ -3126,6 +3140,217 @@ pub(crate) mod bodies {
         }
     }
 
+    // ── I1165 ─────────────────────────────────────────────────────────────
+    /// I1165 — a hard_case row crosses on `a`, is delivered to `b` through
+    /// the planes, is held and projected there, and `b`'s purge doors refuse
+    /// it.
+    pub(crate) async fn i1165_hard_case_rows_replicate_and_stay_unpurgeable<D>(a: &D, b: &D)
+    where
+        D: Seams + crate::federation::attestation_admit::AttestationStore,
+    {
+        use crate::federation::attestation_apply::ReplicatedAttestationOutcome as O;
+        use crate::federation::hard_case::{self, HardCaseEvent};
+        use crate::federation::silo_projection::{check_projection_rebuild, SiloProjection};
+        use crate::federation::types::{attestation_tier, identity_type};
+        const NODE_A: &str = "i1165-node-a";
+        // B is rooted (its purge doors re-verify a bundle against its OWN
+        // root); A is a node of its own, distinct from B's.
+        root(b).await;
+        for d in [a, b] {
+            ts::register_hybrid_key_as(d.as_dyn_directory(), NODE_A, NODE_A, identity_type::NODE)
+                .await;
+        }
+        a.set_node(NODE_A);
+
+        // ── A records the event: a local-tier row, deferred signature ──────
+        let event = HardCaseEvent {
+            event_id: format!("i1165-{}", uuid::Uuid::new_v4()),
+            kind: hard_case::kind::CONSENT_SLA_BREACH.to_owned(),
+            target_key_id: Some("i1165-target".to_owned()),
+            subject_key_id: None,
+            detail: serde_json::json!({"sla_days": 30}),
+            emitted_at: crate::federation::admission::truncate_to_substrate_resolution(now()),
+        };
+        a.record_hard_case(event.clone())
+            .await
+            .expect("I1165: A records the event");
+        let id = hard_case::hard_case_attestation_id(&event.event_id);
+        let local = a
+            .get_attestation(&id)
+            .await
+            .unwrap()
+            .expect("I1165: the event is a row on A");
+        assert_eq!(local.tier, attestation_tier::LOCAL);
+        assert_eq!(
+            local.attesting_key_id, NODE_A,
+            "I1165: attester = A's node key"
+        );
+
+        // ── A crosses it: the node signs as the actor ──────────────────────
+        let ci = crate::federation::Audience::of_row(&local)
+            .and_then(|audience| {
+                crate::federation::crossing::describe(
+                    &local,
+                    audience,
+                    crate::federation::CrossingBasis::ProducerAuthority,
+                )
+            })
+            .expect("I1165: describable");
+        let crossed = a
+            .as_dyn_directory()
+            .enter_mesh(&id, &ci, &ts::actor_reseal(&local))
+            .await
+            .unwrap_or_else(|e| panic!("I1165: a hard_case row crosses (v60): {e}"));
+        assert!(
+            matches!(crossed, crate::federation::MeshCrossingOutcome::Crossed(_)),
+            "I1165: {crossed:?}"
+        );
+        let on_a = a
+            .get_attestation(&id)
+            .await
+            .unwrap()
+            .expect("I1165: held on A");
+        assert_eq!(on_a.tier, attestation_tier::FEDERATION, "I1165: crossed");
+        crate::federation::verify_row_hybrid_signature(a.as_dyn_directory(), &on_a)
+            .await
+            .expect("I1165: A's signature verifies as a peer will verify it");
+        // A's table still lists the event and is still its rows' rebuild.
+        assert!(
+            a.list_hard_case_events(hard_case::HardCaseFilter::default())
+                .await
+                .unwrap()
+                .iter()
+                .any(|e| e.event_id == event.event_id),
+            "I1165: A still lists its crossed event"
+        );
+        check_projection_rebuild(a, SiloProjection::HardCaseEvents)
+            .await
+            .expect("I1165: A's hard_case_events is its rows' rebuild after the crossing");
+
+        // ── B receives it through the planes: advertised hash, point read ──
+        let mut offered = None;
+        let mut cursor: Option<String> = None;
+        'pages: loop {
+            let page = a
+                .as_dyn_directory()
+                .list_wire_hashes_since("Attestation", cursor.as_deref(), 256)
+                .await
+                .unwrap();
+            if page.is_empty() {
+                break;
+            }
+            cursor = page.last().cloned();
+            for hash in &page {
+                let bytes = a
+                    .as_dyn_directory()
+                    .lookup_signed_record_by_content_hash("Attestation", hash)
+                    .await
+                    .unwrap()
+                    .unwrap_or_else(|| panic!("I1165: advertised-then-unfetchable: {hash}"));
+                let row: Attestation = serde_json::from_slice(&bytes).unwrap();
+                if row.attestation_id == id {
+                    offered = Some(row);
+                    break 'pages;
+                }
+            }
+        }
+        let offered = offered.expect("I1165: A advertises the crossed hard_case row");
+        let applied = b
+            .as_dyn_directory()
+            .apply_replicated_attestation(SignedAttestation {
+                attestation: offered,
+            })
+            .await
+            .unwrap_or_else(|e| panic!("I1165: B admits A's hard_case row (v60): {e}"));
+        assert_eq!(applied, O::Inserted, "I1165: B stores it");
+        let held = b
+            .get_attestation(&id)
+            .await
+            .unwrap()
+            .expect("I1165: held on B");
+        assert_eq!(held.tier, attestation_tier::FEDERATION);
+        assert_eq!(held.attesting_key_id, NODE_A);
+        assert!(
+            b.list_hard_case_events(hard_case::HardCaseFilter::default())
+                .await
+                .unwrap()
+                .iter()
+                .any(|e| e.event_id == event.event_id),
+            "I1165: B projects the replicated row into its hard_case_events"
+        );
+        check_projection_rebuild(b, SiloProjection::HardCaseEvents)
+            .await
+            .expect("I1165: B's hard_case_events is its rows' rebuild");
+        assert!(served_ids(b).await.contains(&id), "I1165: B serves it on");
+
+        // ── B's purge doors refuse it: the accountability record ───────────
+        assert_eq!(
+            sp::accountability_record_of(&held),
+            Some("hard_case:"),
+            "I1165: a hard_case row is in CC 2.4.1.1's unpurgeable set"
+        );
+        assert!(
+            crate::federation::migration::check_purge_admission(&held).is_err(),
+            "I1165: the reset purge door refuses it"
+        );
+        let dir = b.as_dyn_directory();
+        let ids = vec![format!("attestation:{id}")];
+        let t = now();
+        // The local door: the dry run names it inadmissible by the
+        // accountability clause, and executing under a quorum notice refuses.
+        let sel = PurgeSelection::ByIds { ids: ids.clone() };
+        let dry = sp::purge_dry_run(dir, &sel).await.unwrap();
+        assert!(
+            dry.inadmissible.iter().any(|w| w.record_id == ids[0]
+                && w.reason.contains("CLM-accountability-record-unpurgeable")),
+            "I1165 local: the dry run names it inadmissible: {:?}",
+            dry.inadmissible
+        );
+        let n = notice_for(&dry.notice_template, &[cc::FOUNDERS[0], cc::FOUNDERS[1]], t);
+        let e = rows_at(dir, &sel, &n, NODE, t)
+            .await
+            .expect_err("I1165: B's local purge refuses the accountability record");
+        let (tok, body) = refusal(&e);
+        assert_eq!(tok, token::RETRACTION_INADMISSIBLE, "I1165 local: {body}");
+        // The replicated door: a quorum-cosigned bundle from elsewhere.
+        let template = serde_json::json!({
+            "legal_basis": sp::STEWARD_PURGE_BASIS,
+            "content_sha256": sp::selection_digest(&ids),
+            "content_holder_key_ids": [],
+        });
+        let bundle = sp::PurgeBundle {
+            notice: notice_for(&template, &[cc::FOUNDERS[0], cc::FOUNDERS[1]], t),
+            record_ids: ids.clone(),
+            derived_from: vec![String::new(); ids.len()],
+            admitted_at: t,
+        };
+        let e = apply_at(dir, &bundle, NODE, t)
+            .await
+            .expect_err("I1165: a quorum-cosigned bundle cannot lift the accountability rule");
+        let (tok, body) = refusal(&e);
+        assert_eq!(
+            tok,
+            token::RETRACTION_INADMISSIBLE,
+            "I1165 replicated: {body}"
+        );
+        assert_eq!(body["record_id"], format!("attestation:{id}"));
+        let notice_id = sp::notice_terms(&bundle.notice.envelope).unwrap().notice_id;
+        assert!(dir.purge_execution(&notice_id).await.unwrap().is_none());
+        assert!(dir
+            .purge_tombstones_of(&notice_id)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(
+            !dir.purge_delete_tombstoned_attestation(&id).await.unwrap(),
+            "I1165: the delete door deletes nothing"
+        );
+        assert!(
+            b.get_attestation(&id).await.unwrap().is_some(),
+            "I1165: the row survives on B"
+        );
+    }
+
     // ── I698 ──────────────────────────────────────────────────────────────
     /// A federation-tier `trace:complete:v1` row in the MANIFEST form, by
     /// AGENT about itself, really signed; `run_kind` in the manifest when given.
@@ -4205,6 +4430,13 @@ mod run {
                 async fn i697() {
                     let Some(d) = $fresh.await else { return };
                     b::i697_a_tombstone_never_reaches_the_accountability_record(&d).await
+                }
+                #[tokio::test]
+                async fn i1165() {
+                    let (Some(a), Some(c)) = ($fresh.await, $fresh.await) else {
+                        return;
+                    };
+                    b::i1165_hard_case_rows_replicate_and_stay_unpurgeable(&a, &c).await
                 }
                 #[tokio::test]
                 async fn i698() {

@@ -120,6 +120,11 @@ pub(crate) struct PlannedAttestation {
     /// `detection:*` row carrying a detection body projects to, written in the
     /// row's transaction.
     pub(crate) projected_detection: Option<crate::derived::detection_row::DetectionProjection>,
+    /// v60.0.0 (CIRISConstitution#170 closed) — the `hard_case_events` row a
+    /// `hard_case:*` row carrying a readable event projects to, written in the
+    /// row's transaction: a peer's replicated row is in this node's table as
+    /// its rebuild has it, the detection precedent.
+    pub(crate) projected_hard_case: Option<super::hard_case::HardCaseEvent>,
     /// The signed-wire-index locator (#507b), federation tier only; the hash
     /// comes from the stored row (#646).
     pub(crate) wire_index_key: Option<String>,
@@ -1110,13 +1115,6 @@ where
     // dimension-keyed `capacity:*` self-emission arm. Backend-symmetric
     // with SQLite + Postgres.
     crate::federation::admission::check_reserved_prefix_admission(dir, &row).await?;
-    // v57.0.0 (CIRISPersist#988 item 2) — hard_case replication is held: a
-    // `hard_case:*` row does not enter the federation tier by this door either
-    // (it is also the replicated apply). AFTER the reserved-prefix gate, so the
-    // #607 conferral refusal still names itself for a third-party row and a
-    // row that clears it is the one the hold stops.
-    super::hard_case::check_hard_case_replication_held(&row)?;
-
     // v22.0.0 (CIRISConstitution#46) — CONSENT BEFORE SCORING. A
     // federation-tier `capacity:*` claim about subject S from attester P is
     // refused unless a live `analyze` consent from S covering P exists in
@@ -1237,6 +1235,9 @@ where
     // v57.0.0 (CIRISPersist#988 item 3) — the detection projection, read from
     // the row by the one function the rebuild calls too.
     let projected_detection = crate::derived::detection_row::project_detection_row(&row);
+    // v60.0.0 (CIRISConstitution#170 closed) — the hard_case projection, by
+    // the one function the hard_case door and the rebuild call too.
+    let projected_hard_case = super::hard_case::project_hard_case_row(&row);
     row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
     // v21.1.0 (CIRISPersist#507b) — wire-index this row (federation tier
     // only, the E5 invariant). v31.0.0 (CIRISPersist#646) — only the
@@ -1257,6 +1258,7 @@ where
         withdraws_depth,
         projected_trace,
         projected_detection,
+        projected_hard_case,
         wire_index_key,
         cycle_gated,
         received_at,
@@ -1809,8 +1811,8 @@ pub(crate) struct PlannedHardCase {
 /// ([`super::hard_case::hard_case_attestation_id`]). Its signature is
 /// deferred, as on every local-tier row this node attests (the
 /// `trace:complete:v1` precedent): the node signs as the actor at the
-/// crossing, and the crossing is held
-/// ([`super::hard_case::check_hard_case_replication_held`]).
+/// crossing (`Engine::enter_mesh`), and the crossed row replicates like any
+/// attestation row (v60.0.0, CIRISConstitution#170 closed).
 ///
 /// The gates, in order: the envelope size, the dimension gate, the reserved
 /// genesis ids, the mirror and instant stamp, the size of the row as stored,
