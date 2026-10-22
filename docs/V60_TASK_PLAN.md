@@ -101,6 +101,18 @@ S2 tokens registered on CC rc10 at 3.1.9.7 "Admission of a Goal" (10-22): `goal_
 self score = avoidance goal; amend / retire / disown = supersedes / withdraws / recants. Persist
 pins them against CIRISConstitution#67 in `RULES_NOT_ON_THE_ROW` until the next CC re-pin
 (S6v vendors the rc9 TAG, which predates them); repoint to CC 3.1.9.7 at that re-pin.
+Steward ruling on CC rc10 (post agent 2.16.3, 10-22), after v60, persist files the ticket when
+the agent's shape is final (claims staged on CIRISAgent#1316): CC 3.1.9.4 registers
+`deferral:request:v1` (agent occurrence key, the cell as audience) and
+`deferral:response:{approved|rejected}:v1` (the WA's own key seated in the live set at
+asserted_at; subject = the agent; references_attestation_id → the request) as the dimensions
+for what S1 just made `contribution:{subject_kind}:v1` rows with subject kinds
+DeferralRequest / DeferralResponse, so those two subject kinds move onto their own families.
+CC 3.1.5 adds `identity_amendment:v1` (agent occurrence key about its identity key; members
+`amendment_digest` hex64 + `authorized_by` uuid, both CC 2.1 rows) with the admission rule:
+refuse `identity_amendment_unauthorized` unless the cited response is admitted, approved,
+about this agent and signed by a key seated as a WA at the response's asserted_at.
+`wa_adjudication:{state}` closes to abandonment | seizure | successor.
 
 ## 3. The mutation discipline (S0, then every slice)
 
