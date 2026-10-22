@@ -228,7 +228,10 @@ mod tests {
     /// CIRISPersist#1098, which docs/V60_TASK_PLAN.md §2 keeps out of v60).
     /// Two reasons persist emits are named by NO CC text at the pin
     /// (`key_id_fingerprint_mismatch`, CIRISPersist#1103;
-    /// `carrier_without_roster_quorum`, CIRISPersist#1104). Both lists are
+    /// `carrier_without_roster_quorum`, CIRISPersist#1104), nor the three CC
+    /// rc10 appended after the tag (`content_hash_mismatch`,
+    /// `envelope_row_member_unknown`, `subject_key_id_malformed`,
+    /// CIRISPersist#1114, pinned here until the next re-pin). Both lists are
     /// latches: a re-vendor that names one, or a persist cut that emits
     /// `envelope_member_null`, reds this test until the line moves.
     #[test]
@@ -256,10 +259,14 @@ mod tests {
         // Named at rc9, not emitted (#1098 F4; out of v60).
         assert!(named.contains_key("envelope_member_null"));
         assert!(!malformed_row::ALL.contains(&"envelope_member_null"));
-        // Emitted, named by no CC text at the pin.
+        // Emitted, named by no CC text at the pin. The last three are CC rc10
+        // tokens (2.6.1.7 at `99bf187`, CIRISPersist#1114), after the tag.
         for reason in [
             malformed_row::KEY_ID_FINGERPRINT_MISMATCH,
             malformed_row::CARRIER_WITHOUT_ROSTER_QUORUM,
+            malformed_row::CONTENT_HASH_MISMATCH,
+            malformed_row::ENVELOPE_ROW_MEMBER_UNKNOWN,
+            malformed_row::SUBJECT_KEY_ID_MALFORMED,
         ] {
             assert!(
                 !named.contains_key(reason),

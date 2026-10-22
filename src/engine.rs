@@ -18349,9 +18349,17 @@ mod tests {
             .emit_attestation_self(bad)
             .await
             .expect_err("uppercase subject_key_id must be refused (#293)");
+        // v60.0.0 (CIRISPersist#1114) — typed out of `InvalidArgument` (the
+        // same Python ValueError) under its own reason.
         assert!(
-            matches!(err, crate::federation::Error::InvalidArgument(_)),
-            "expected InvalidArgument, got {err:?}"
+            matches!(
+                err,
+                crate::federation::Error::MalformedRow {
+                    reason: crate::federation::malformed_row::SUBJECT_KEY_ID_MALFORMED,
+                    ..
+                }
+            ),
+            "expected subject_key_id_malformed, got {err:?}"
         );
 
         // The canonical lowercase form of the SAME id is admitted — the rule

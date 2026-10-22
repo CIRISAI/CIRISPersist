@@ -6521,6 +6521,36 @@ pub fn check_instant_binding(
     Ok(())
 }
 
+/// v60.0.0 (CIRISPersist#1114; CC 2.6.1.7, rc10 `99bf187`) — the signed `row`
+/// mirror's member set is closed: a member outside the seven is refused
+/// `federation_malformed_row` / `envelope_row_member_unknown`, ahead of the
+/// typed read that would refuse it as `envelope_member_invalid`.
+pub(crate) fn check_row_mirror_members_closed(
+    row: &super::Attestation,
+    raw: &serde_json::Value,
+) -> Result<(), Error> {
+    use crate::federation::envelope::{paths, row_paths};
+    let unknown = raw.as_object().and_then(|members| {
+        members
+            .keys()
+            .find(|k| !row_paths::ALL.contains(&k.as_str()))
+    });
+    match unknown {
+        None => Ok(()),
+        Some(unknown) => Err(Error::malformed_row(
+            "attestation",
+            super::malformed_row::ENVELOPE_ROW_MEMBER_UNKNOWN,
+            format!(
+                "attestation {}: signed envelope `{}` carries `{unknown}`, which is not a \
+                 mirror member (members are exactly {:?}; the set is closed, CC 2.6.1.7)",
+                row.attestation_id,
+                paths::ROW,
+                row_paths::ALL,
+            ),
+        )),
+    }
+}
+
 /// v31.0.0 (CIRISPersist#643) — **THE TYPED-COLUMN BINDING GATE.**
 ///
 /// # What was open
@@ -6636,6 +6666,9 @@ pub fn check_row_column_binding(row: &super::Attestation) -> Result<(), Error> {
             ),
         ));
     };
+    // v60.0.0 (CIRISPersist#1114, CC 2.6.1.7 rc10) — an eighth member is its
+    // own reason, named, before the typed read refuses it as ill-typed.
+    check_row_mirror_members_closed(row, raw)?;
     let mirror: RowMirror = serde_json::from_value(raw.clone()).map_err(|e| {
         Error::malformed_row(
             "attestation",

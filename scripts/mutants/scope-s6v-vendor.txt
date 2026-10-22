@@ -15,11 +15,18 @@
 #   `registry`, `parse_polarity_classes` (the pins and the census witnesses in
 #   `registry::tests`, `scores_read_audit::tests`, the matcher's vector
 #   replay). `cc_manifests.rs` carries constants only (no mutant).
+# - CIRISPersist#1114 (CC 2.6.1.7 rc10): the three signed-object refusals with
+#   their own malformed_row reasons — `check_content_hash`,
+#   `check_row_mirror_members_closed`, `validate_subject_key_ids` — against
+#   I1309–I1311 (memory, sqlite, postgres) and I84 / I84b.
 #
 # Grammar: docs/MUTATION_TESTING.md "Scope files".
-tests: test(/governance_policy::|two_path::tests::|i1307|i1132|cc_manifests::|namespace::registry::tests::|namespace_match_vectors_replay|the_pinning_census_is_exactly|retaining_the_contradiction_count/)
+tests: test(/governance_policy::|two_path::tests::|i1307|i1132|cc_manifests::|namespace::registry::tests::|namespace_match_vectors_replay|the_pinning_census_is_exactly|retaining_the_contradiction_count|malformed_reasons_1114_invariants::|i84_malformed_subject_key_ids|i84b_/)
 
 src/federation/governance_policy.rs
 src/federation/two_path.rs check_corridor
 src/federation/self_roster.rs policy applied_window
 src/federation/namespace/registry.rs parse_manifest registry parse_polarity_classes
+src/federation/tier_ingest.rs check_content_hash
+src/federation/admission.rs check_row_mirror_members_closed
+src/federation/mod.rs validate_subject_key_ids

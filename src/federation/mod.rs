@@ -659,6 +659,10 @@ pub mod two_path;
 // v60.0.0 (S6v; CC 4.5.13) — the two-path policy table as runtime data, and
 // the corridor at admission.
 pub mod governance_policy;
+// v60.0.0 (CIRISPersist#1114) — I1309–I1311: three signed-object refusals
+// get their own malformed_row reasons, on every backend.
+#[cfg(test)]
+mod malformed_reasons_1114_invariants;
 // v59.0.0 (CIRISPersist#1099, CC 3.3.6.3) — the key roster of a self: the
 // two-path door its additions and evictions go through, and the steward
 // predicate (a live roster key signs as the fedID).
@@ -2604,10 +2608,17 @@ pub fn validate_subject_key_ids(subject_key_ids: &[String]) -> Result<(), Error>
     // diagnosis an operator staring at a rejected subject needs.
     for sid in subject_key_ids {
         let malformed = |why: &str| {
-            Err(Error::InvalidArgument(format!(
-                "subject_key_ids element must be a canonical lowercase key_id \
-                 (CC 2.3.2.1 / CC 2.6.3 / §0.6): {why}; got {sid:?}"
-            )))
+            // v60.0.0 (CIRISPersist#1114, CC 2.6.1.7 rc10) — typed out of
+            // `InvalidArgument` (ValueError, the same Python type) under the
+            // closed reason `subject_key_id_malformed`.
+            Err(Error::malformed_row(
+                "attestation",
+                malformed_row::SUBJECT_KEY_ID_MALFORMED,
+                format!(
+                    "subject_key_ids element must be a canonical lowercase key_id \
+                     (CC 2.3.2.1 / CC 2.6.3 / §0.6): {why}; got {sid:?}"
+                ),
+            ))
         };
         if sid.is_empty() {
             return malformed("empty");
@@ -12188,6 +12199,18 @@ pub mod malformed_row {
     /// `goal_id` / `declared_by_key_id` / `declared_at` / `scope` /
     /// `retired_at`) offered at a goal door that takes a body.
     pub const GOAL_TYPED_OBJECT_RETIRED: &str = "goal_typed_object_retired";
+    /// v60.0.0 (CIRISPersist#1114; CC 2.6.1.7, rc10 `99bf187`) — the row's
+    /// `original_content_hash` is not the SHA-256 of JCS(its envelope). Was a
+    /// `federation_tier_unverified` with a free-text reason.
+    pub const CONTENT_HASH_MISMATCH: &str = "content_hash_mismatch";
+    /// v60.0.0 (CIRISPersist#1114; CC 2.6.1.7 rc10) — the signed `row` mirror
+    /// carries a member outside its closed seven. Was
+    /// `envelope_member_invalid` (a serde refusal).
+    pub const ENVELOPE_ROW_MEMBER_UNKNOWN: &str = "envelope_row_member_unknown";
+    /// v60.0.0 (CIRISPersist#1114; CC 2.6.1.7 rc10) — a `subject_key_ids`
+    /// element is neither a canonical lowercase key_id nor the tagged
+    /// `canonical:sha256:<hex64>` form. Was a `federation_invalid_argument`.
+    pub const SUBJECT_KEY_ID_MALFORMED: &str = "subject_key_id_malformed";
 
     /// Every token, for the from-disk witnesses and adopters' tables.
     pub const ALL: &[&str] = &[
@@ -12207,6 +12230,9 @@ pub mod malformed_row {
         GOAL_META_ALIGNMENT,
         GOAL_BODY,
         GOAL_TYPED_OBJECT_RETIRED,
+        CONTENT_HASH_MISMATCH,
+        ENVELOPE_ROW_MEMBER_UNKNOWN,
+        SUBJECT_KEY_ID_MALFORMED,
     ];
 }
 

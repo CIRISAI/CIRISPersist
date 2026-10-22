@@ -464,10 +464,35 @@ commit.
 - Evidence: `CLM-governance-policy-table` (4.5.13) at
   `governance_policy.rs#PolicyTable::admit`; `CLM-policy-corridor` (4.2.1.1)
   at `governance_policy.rs#PolicyTable::check_corridor` and
-  `two_path.rs#TwoPathPolicy::check_corridor`; `EXPECTED` 323.
+  `two_path.rs#TwoPathPolicy::check_corridor` (`EXPECTED` 323 at this
+  commit; 326 with #1114 below).
 - Mutation: `scripts/mutants/scope-s6v-vendor.txt`, 97 mutants, two weekly
   shards in `mutants.yml`.
 - No migration. No store-trait method added or removed.
+
+### Changed — three signed-object refusals carry their own `malformed_row` reasons (CIRISPersist#1114, CC 2.6.1.7 rc10)
+
+The steward's ruling on CC rc10 `99bf187` (2026-10-21) appends three reasons
+to the closed `federation_malformed_row` set (appended, never reordered: the
+set is a hashed vocabulary). Each refusal keeps the Python type of the arm it
+replaces (`ValueError` throughout); only the `kind()` token and the reason move.
+
+| reason | condition | before |
+|---|---|---|
+| `content_hash_mismatch` | `original_content_hash` ≠ SHA-256 of JCS(envelope) (`tier_ingest::check_content_hash`) | `federation_tier_unverified`, free-text reason |
+| `envelope_row_member_unknown` | the signed `row` mirror carries an eighth member (`admission::check_row_mirror_members_closed`, ahead of the typed read) | `federation_malformed_row` / `envelope_member_invalid` |
+| `subject_key_id_malformed` | a `subject_key_ids` element is neither a canonical lowercase key_id nor `canonical:sha256:<hex64>` (`validate_subject_key_ids`, every door that asks it: the attestation door and `emit_attestation`) | `federation_invalid_argument` |
+
+- Edge: a sender that bounded `federation_tier_unverified` or
+  `federation_invalid_argument` as retryable now sees the TERMINAL
+  `federation_malformed_row` for these three; a mirror that is missing a
+  member is still `envelope_member_invalid`. The key-registration plane's own
+  `registration original_content_hash mismatch` is unchanged (not in #1114).
+- The three are rc10 tokens, after the `v1.0-rc9` tag persist vendors: I1308
+  latches them as "named by no CC text at the pin" until the next re-pin.
+- Witnesses I1309–I1311 (memory, sqlite, postgres) through `put_attestation`.
+- Evidence: `CLM-signed-object` (2.6.1.7) at the three symbols; `EXPECTED` 326.
+- Mutation: the three functions join `scope-s6v-vendor.txt`.
 
 ### Changed — hard_case rows replicate (CIRISConstitution#170 closed)
 

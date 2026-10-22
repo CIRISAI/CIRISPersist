@@ -16974,6 +16974,37 @@
     "tsv_target": "evidence/cc_impl.tsv",
     "manifest_round": "v60-s6v",
     "witness": "two_path the_corridor_refuses_each_pole_by_its_token (PolicyCorridor.lean's examples), I1305"
+   },
+   {
+    "decimal_id": "2.6.1.7",
+    "claim_id": "CLM-signed-object",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/tier_ingest.rs#check_content_hash",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v60-1114",
+    "tsv_comment_before": [
+     "# v60.0.0 (CIRISPersist#1114; CC 2.6.1.7, rc10 99bf187) — three signed-object refusals",
+     "# carry their own federation_malformed_row reasons."
+    ],
+    "witness": "I1309 (memory, sqlite, postgres): content_hash_mismatch"
+   },
+   {
+    "decimal_id": "2.6.1.7",
+    "claim_id": "CLM-signed-object",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/admission.rs#check_row_mirror_members_closed",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v60-1114",
+    "witness": "I1310 (memory, sqlite, postgres): envelope_row_member_unknown"
+   },
+   {
+    "decimal_id": "2.6.1.7",
+    "claim_id": "CLM-signed-object",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/mod.rs#validate_subject_key_ids",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v60-1114",
+    "witness": "I1311 (memory, sqlite, postgres), I84: subject_key_id_malformed"
    }
   ],
   "CIRISServer": [
