@@ -9,6 +9,160 @@ threat-model citations because this crate's audit story is the point.
 
 ## [60.0.0] - UNRELEASED
 
+### Changed — the cirisnode classes are `scores` rows (CIRISPersist#988 item 1, #803, #854)
+
+Signed attestations are the only state (CEWPOS). Every cirisnode class is a
+dimension CC 3.1.9 registers, so each is now a hybrid-signed `scores` row on
+the attestation plane, signed by its contributor's federation key, admitted by
+the plane's own door and replicated like any row. The `cirisnode.*` typed
+tables that held self-signed, Ed25519-only, never-replicated copies are gone.
+
+| class | row | admission |
+|---|---|---|
+| Contribution (CC 2.1) | `contribution:{subject_kind}:v1` | the plane's door |
+| vote | `vote:{contribution_id}:v1`, attested to the Contribution's author | the plane's door |
+| moderation event | `moderation:{allegation_type}:v1`, attested to and naming the accused | the moderation gate (`moderate` duty-holders) |
+| slashing | `slashing:{outcome}:v1`, naming the accused as subject | the plane's door |
+| reconsideration filing / ruling | `reconsideration:{grounds}:v1` (a ruling carries `outcome`) | the v59 subject-standing rule |
+| credits / expertise balance | `credits:{domain}:{language}:{subject}:v1` / `expertise:{domain}:{language}:v1`, this node → the contributor | the plane's door; PROJECTED into the ledgers |
+| takedown notice | `takedown_notice:{basis}:v1`, `subject_kind: takedown_notice`, score `-1` | NEW: the CC 4.5.5 duty-holder gate |
+
+- **The ledgers are projections** (CLM-silo-projection-rebuildable,
+  `federation::ledger_projection`). `credits_ledger` / `expertise_ledger` hold
+  the fold of THIS node's balance rows (a peer's balance about the same
+  contributor is held, never projected), the latest `(asserted_at,
+  attestation_id)` per key, written by the put door's executor in the row's
+  transaction on memory, sqlite and postgres. Each ledger row is a pure
+  function of one row: `last_updated_at` and `created_at` are both its signed
+  instant, and it carries the row's `attestation_id` (new column). New
+  `SiloProjection::CreditsLedger` / `ExpertiseLedger`; a pre-V203 balance
+  (no `attestation_id`) is a red in `check_projection_rebuild` until the
+  rehome (`Engine::cirisnode_rehome_ledgers`, run first by every balance
+  write) re-emits it as this node's row.
+- **The takedown notice is a row** (#803, CLM-takedown-notice-row). The put
+  door admits a `takedown_notice:{basis}:v1` row only from a duty-holder over
+  the content as this node holds it (`takedown_authority`, the decision the
+  tombstone door re-asks); the `steward_purge` leaf stays held shut (its
+  cosigned door is not built). `REGISTERED_FAMILIES_HELD_SHUT` narrows from
+  `takedown_notice:` to `takedown_notice:steward_purge:`. The tombstone door
+  takes the notice row (`TakedownNotice::of_row`), verifies its hybrid
+  signature against the signer's registered keys (an unknown signer is the
+  retryable `federation_attester_key_unknown`), holds the row, and its header
+  carries the row whole; `TakedownReport.notice_attestation_id` names it. A
+  notice row is about its content, never a binding of it: `content_binding`
+  skips the family. `LegalBasis` takes CC 3.3.2's wire strings: `dmca512`,
+  `dsa_article16` (`dmca_512` / `dsa_article_16` no longer decode); the
+  pinned-divergence test is deleted.
+- **Compat read, one release (v60.x, removed in v61):** a v59 peer's purge
+  bundle still carries its notice as the retired `takedown_notice`
+  CONTRIBUTION. `apply_replicated_takedown` still applies it (Ed25519
+  self-signature, as v59 verified it; basis read in CC's spelling; CC 4.5.5
+  re-asked here). The LOCAL door refuses the Contribution
+  (`takedown_unauthorised`, "retired").
+- **#854, one subject gate.** `SubjectGate` and
+  `validate_subject_key_ids_at` are removed; `validate_subject_key_ids` is the
+  rule at every door, a replicated row included, so an uppercase subject id
+  (the raw base64 pubkey the retired Contributions carried) is refused at
+  ingest. The canonical-spelling clauses run before the general uppercase one
+  so each refusal names its defect.
+- **Retired, refused by name:** a `key_grant` Contribution
+  (`cirisnode_key_grant_retired`; the key-grant plane, `key_grant:{axis}:v1`,
+  is the one door for a wrapped key), and a v59 typed envelope offered at a
+  cirisnode door (it carries `signature` / a contributor id:
+  `cirisnode_typed_object_retired`). New `cirisnode::Error::Retired` (its
+  `kind()` is the token) and `cirisnode::Error::Federation` (a plane refusal,
+  its `kind()` the plane's).
+- **V203** (sqlite + postgres twins): drops `contributions`, `votes`,
+  `moderation_events`, `slashing_attestations`, `reconsideration_requests`,
+  `reconsideration_attestations` and V056's two watch tables
+  (`cirisnode_consent_sla_watch`, `cirisnode_revocation_promotion_watch`,
+  nothing read them): 8 tables. Keeps the ledgers (with `attestation_id`),
+  `scheduled_takedown_actions`, `federation_delivery_attestations` and
+  `promotion_attestations`; their foreign keys into the dropped table go
+  (sqlite: staged and re-created under the final name; postgres: `DROP …
+  CASCADE` drops only the constraints) and the row-naming columns become
+  `TEXT` on postgres. Rewrites `purge_executions.legal_basis` to CC's
+  spelling. The dropped rows were self-signed by keys persist cannot re-sign;
+  nothing outside persist wrote these tables.
+- **Kept, with a row rule:** a promotion record's targets are rows held here
+  on the target kind's family (all or none; the `is_canonical` flip is gone
+  with the tables); a delivery attestation's announcement is a held
+  `contribution:federation_announcement:v1` row.
+
+**Python surface** (method names kept; each write plans the row and signs it
+with the engine's own composed hybrid signer):
+
+| method | v59 | v60 |
+|---|---|---|
+| `cirisnode_put_contribution` | `(envelope_json) -> None` | `(body_json) -> str` (the row id; a `takedown_notice` subject kind files the notice row) |
+| `cirisnode_cast_vote` | `(envelope_json) -> None` | `(body_json) -> str` (`{contribution_id, score, detail?, rationale?}`) |
+| `cirisnode_update_credits_ledger` | `(update_json) -> None` | `(update_json) -> str` |
+| `cirisnode_update_expertise_ledger` | `(update_json) -> None` | `(update_json) -> str` |
+| `cirisnode_put_moderation_event` | `(event_json) -> None` | `(body_json) -> str` (`{target_contributor, allegation_type, community_id, payload}`) |
+| `cirisnode_put_slashing_attestation` | `(att_json) -> None` | `(body_json) -> str` (`{moderation_id, outcome, payload}`) |
+| `cirisnode_put_reconsideration_request` | `(req_json) -> None` | `(body_json) -> str` (`{slashing_id, grounds, payload}`) |
+| `cirisnode_put_reconsideration_attestation` | `(att_json) -> None` | `(body_json) -> str` (`{request_id, outcome, payload}`) |
+| `cirisnode_list_contributions` | `(filter_json, cursor_json, limit)` | `(author_id, filter_json=None, cursor_json=None, limit=100)`; items are rows, the cursor an `AttestationCursor` |
+| `cirisnode_list_votes` | `(filter_json, cursor_json, limit)` | `(contribution_id, voter_id=None, cursor_json=None, limit=100)` |
+| `cirisnode_list_takedowns_for_filtered_json` | filter optional | `filter_json` must name `claimant_key_id`; items are notice rows |
+| `cirisnode_process_takedown_admission_json` | `(contribution_json)` | `(notice_attestation_id)`; the report adds `notice_attestation_id` |
+| `cirisnode_get_credits_ledger` / `_expertise_ledger` | — | the entry adds `attestation_id`; `created_at` is the row's instant |
+| `cirisnode_put_promotion_attestation` | — | `target_ids` are held row ids |
+| `cirisnode_put_delivery_attestation` | — | the announcement must be a held announcement row |
+| `cirisnode_rehome_ledgers` | — | NEW `() -> int` |
+| `cirisnode_check_ledger_projection` | — | NEW `(projection) -> str` (`credits_ledger` / `expertise_ledger`) |
+
+Removed: `cirisnode_list_takedowns_for_json`, `cirisnode_list_key_grants_for_json`,
+`cirisnode_list_key_grants_for_content_json`,
+`cirisnode_list_key_grants_for_filtered_json`,
+`cirisnode_list_key_grants_for_scope_epoch_json`,
+`cirisnode_put_key_grant_json`, `cirisnode_retire_key_grants_json`.
+Unchanged: `cirisnode_routable_contributors`, `cirisnode_read_vote_weight`,
+`cirisnode_list_delivery_attestations`, `cirisnode_count_delivery_attestations`.
+
+**Rust surface:** `NodeCoreService` keeps the ledger reads, the promotion
+record and the delivery attestations, and adds `legacy_ledger_rows`; the
+typed writes and list reads, `put_key_grant`, `retire_key_grants` and the
+media reads are gone, with `ContributionEnvelope`, `VoteEnvelope`,
+`ModerationEvent`, `SlashingAttestation`, `ReconsiderationRequest`,
+`ReconsiderationAttestation`, the old `ContributionsFilter`, `VotesFilter`,
+`ListCursor`, the list pages, `TakedownFilter`, `KeyGrantFilter`,
+`KeyGrantPayload` and its types, `RetireKeyGrantsOutcome`,
+`takedown_notice_from_contribution`, `check_moderation_or_reject`,
+`check_takedown_or_reject`, `payload_target_descriptor`,
+`Engine::list_takedowns_for` / `list_key_grants_for` and the sqlite
+backend's `set_admission_gate` (the plane's gate is the gate). New:
+`cirisnode::rows` (the planners, `decode_input`, the reads) and the
+`Engine::cirisnode_*` doors. `TakedownNoticePayload` drops `claimant_key_id`
+and `asserted_at` (the row's) and refuses unknown fields;
+`takedown_tombstone::takedown_terms` is `async (directory, notice, origin)`.
+**Edge adapts** (S7): `tests/federation_announcement.rs` writes the
+announcement through the removed `put_contribution`, and the durability
+test's local takedown builds a Contribution notice; the replicated purge
+bundle path needs no change this release.
+
+- Witnesses: **I1166** (memory, sqlite, postgres) the ledgers are this node's
+  rows, arrival-independent, a peer's balance never projected, byte-equal
+  rebuilds; **I1167** (memory, sqlite, postgres) each class admits as a row
+  and the moderation / reconsideration gates refuse the stranger;
+  **I1168** the retired objects refused by name; **I1169** (sqlite, postgres)
+  a legacy balance is red until superseded; **I1170** (sqlite and postgres
+  engines; and memory, sqlite, postgres for the binding) the notice row:
+  admitted for the subject, refused for a stranger, `steward_purge` held
+  shut, drives the tombstone door, never binds its content; the balance
+  doors, the rehome and the delivery attestation's row rule; **I1171**
+  (memory, sqlite, postgres) the one-release compat read; **I1172** one
+  subject gate at ingest; **I1173** (sqlite, postgres) V203 over an
+  upgrading node's populated store. The takedown witnesses (I786–I799, I772,
+  I778, I801) now build notice rows. Python:
+  `tests/python/test_cirisnode_rows_surface.py` (replaces the retired
+  `test_transit_key_grant_surface.py`; the transit grant is the key-grant
+  plane's, `test_key_grant_rows_surface.py`).
+- Mutation scope `scripts/mutants/scope-s1-cirisnode.txt`.
+- Evidence: CLM-takedown-notice-row (3.1.1) at the notice row's admission,
+  the door's row reader and the planner; CLM-silo-projection-rebuildable
+  (2.4.2) at the ledger projection; `EXPECTED` 318.
+
 ### Changed — hard_case rows replicate (CIRISConstitution#170 closed)
 
 The steward ruled through CC (2026-10-21, CIRISConstitution#170 closed, rc9

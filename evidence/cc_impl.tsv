@@ -355,3 +355,7 @@ decimal_id	claim_id	repo	path#symbol	crate@version
 5.3.4	CLM-bundle-seeds-transit-pairs	CIRISPersist	src/federation/transport_rebind.rs#check_serve_rotation	ciris-persist@59.1.0
 3.1.5	CLM-canonical-rebind	CIRISPersist	src/federation/transport_rebind.rs#check_rebind_admission	ciris-persist@59.1.0
 3.1.5	CLM-canonical-rebind	CIRISPersist	src/federation/transport_rebind.rs#check_serve_rotation	ciris-persist@59.1.0
+3.1.1	CLM-takedown-notice-row	CIRISPersist	src/federation/takedown_tombstone.rs#check_takedown_notice_row_admission	ciris-persist@59.1.0
+3.1.1	CLM-takedown-notice-row	CIRISPersist	src/federation/takedown_tombstone.rs#takedown_terms	ciris-persist@59.1.0
+3.1.1	CLM-takedown-notice-row	CIRISPersist	src/cirisnode/rows.rs#plan_takedown_notice_row	ciris-persist@59.1.0
+2.4.2	CLM-silo-projection-rebuildable	CIRISPersist	src/federation/ledger_projection.rs#project_ledger_row	ciris-persist@59.1.0
