@@ -96,6 +96,11 @@ Edge filed the asks the same day, all after v60: #1117 the accord M-of-N thresho
 majority over the standing roster) as a callable function; #1118 the five mesh_config keys
 (and, per the steward, the two symbol-count redundancy keys retire while `target_holders` and
 `min_viable_holders` stay); #1119 `delegation_scope::INFRA_RELAY`.
+S2 tokens registered on CC rc10 at 3.1.9.7 "Admission of a Goal" (10-22): `goal_meta_alignment_malformed`,
+`goal_body_malformed`, `goal_typed_object_retired`; scales self / cohort / federation; negative
+self score = avoidance goal; amend / retire / disown = supersedes / withdraws / recants. Persist
+pins them against CIRISConstitution#67 in `RULES_NOT_ON_THE_ROW` until the next CC re-pin
+(S6v vendors the rc9 TAG, which predates them); repoint to CC 3.1.9.7 at that re-pin.
 
 ## 3. The mutation discipline (S0, then every slice)
 
