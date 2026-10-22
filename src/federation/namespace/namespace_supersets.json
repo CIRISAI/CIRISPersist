@@ -16285,7 +16285,7 @@
      "# v60.0.0 (CIRISPersist#934 step 3) — every key-record write door decides in one",
      "# plan; each backend's executor stores its verdict and the key:record:v1 row."
     ],
-    "witness": "I1183, I1184, I1185, I1186, I1187, I1189, I1190 (memory, sqlite, postgres), I1188"
+    "witness": "I1183, I1184, I1185, I1186, I1187, I1189, I1190 (memory, sqlite, postgres), I1191 (sqlite, postgres), I1188"
    },
    {
     "decimal_id": "2.6.1.3",

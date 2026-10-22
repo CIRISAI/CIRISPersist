@@ -1473,10 +1473,11 @@ async fn plan_key_reanchor(
             detail: format!("re-anchor {}: pubkey change refused", row.key_id),
         });
     }
-    // Compared at the substrate's resolution (microseconds), on both sides:
-    // postgres holds the anchored instant rounded, so a nanosecond bundle
-    // record read as newer than itself there and re-anchored twice
-    // (v60.0.0, found by I1189 on postgres).
+    // Compared at the substrate's signed-instant resolution
+    // (`truncate_to_substrate_resolution`), on both sides: postgres holds the
+    // anchored instant rounded, so a nanosecond bundle record read as newer
+    // than itself there and re-anchored twice (v60.0.0, found by I1189 on
+    // postgres). The bake door's pre-check compares the same way (I1191).
     use super::admission::truncate_to_substrate_resolution as at_resolution;
     if at_resolution(row.valid_from) <= at_resolution(existing.valid_from) {
         return Err(Error::GenesisBundleInvalid {

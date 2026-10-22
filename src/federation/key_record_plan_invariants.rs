@@ -1,4 +1,4 @@
-//! v60.0.0 (CIRISPersist#934 step 3; CC 3.1.3, CC 3.4.7.1–3) — **I1183–I1190:
+//! v60.0.0 (CIRISPersist#934 step 3; CC 3.1.3, CC 3.4.7.1–3) — **I1183–I1191:
 //! the key-record write doors decide in ONE plan
 //! (`key_plane::plan_key_record_write`), and every backend stores exactly the
 //! plan's verdict through its one executor
@@ -51,6 +51,12 @@
 //!   the pubkey-change refusal; a successor the supersede policy refuses
 //!   (not canonical-scoped, its signed `valid_from` older) is `Conflict`
 //!   naming the policy; nothing moves.
+//! - **I1191 (the bake door's anti-rollback, sqlite and postgres)** — a held
+//!   anchor that is not the bundle's record but carries its nanosecond
+//!   `valid_from` is refused by the bake door's own check
+//!   (`serve node …: rollback refused`), the held row unmoved. RED on postgres
+//!   before v60.0.0: the rounded held instant read as older, the door handed
+//!   the record to the re-anchor, and only the plan's copy refused it.
 //! - **I1188 (the row step, unit)** — `key_record_row_step` keeps a row the
 //!   pointer already names, replaces any other, and drops the rows of an
 //!   unverifiable or absent record; `PlannedKeyRecord::raced` /
@@ -399,33 +405,85 @@ pub(crate) mod bodies {
         );
     }
 
-    /// I1189 — the re-anchor's own refusals.
-    pub(crate) async fn i1189_reanchor_refusals<B: KeyPlaneStore>(b: &B) {
-        use crate::federation::genesis::{self, bundle};
-        let d = b.as_dyn_directory();
+    /// The v2 ceremony's preconditions (the I1189 / I1191 setup): the holder
+    /// roster seeded, the pre-ceremony canonical anchor held (`prior` may
+    /// adjust it first), the constitutional family seeded.
+    async fn v2_ceremony_prerequisites<B: KeyPlaneStore>(b: &B, prior: fn(&mut KeyRecord)) {
+        use crate::federation::genesis;
         key_plane::seed_genesis_accord_holders_planned(
             b,
             &genesis::effective_accord_holder_records(),
         )
         .await
-        .expect("I1189: the holder roster seeds");
-        let prior: Vec<SignedKeyRecord> = serde_json::from_str(include_str!(concat!(
+        .expect("the holder roster seeds");
+        let records: Vec<SignedKeyRecord> = serde_json::from_str(include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/tests/fixtures/canonical_seed_pre_ceremony.json"
         )))
         .expect("pre-ceremony seed fixture parses");
-        for rec in prior {
-            b.put_public_key(rec)
-                .await
-                .expect("I1189: the prior anchor");
+        for mut rec in records {
+            prior(&mut rec.record);
+            b.put_public_key(rec).await.expect("the prior anchor");
         }
         genesis::seed_accord_family(b)
             .await
-            .expect("I1189: the constitutional family");
-        let artifact = include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/genesis_v2.json"
-        ));
+            .expect("the constitutional family");
+    }
+
+    /// The real v2 ceremony artifact.
+    const GENESIS_V2: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/genesis_v2.json"
+    ));
+
+    /// I1191 — the bake door's own anti-rollback, at substrate resolution.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub(crate) async fn i1191_bake_rollback_at_resolution<B: KeyPlaneStore>(b: &B) {
+        use crate::federation::genesis::bundle;
+        let parsed = bundle::parse_genesis_bundle(GENESIS_V2).unwrap();
+        let sn = parsed.serve_nodes[0].clone();
+        // The held anchor is NOT the bundle's record (another envelope and
+        // scrub set, so `same_record` does not shield it) but its `valid_from`
+        // is the bundle record's own nanosecond instant. sqlite and memory keep
+        // it whole; postgres keeps it rounded below the bundle's.
+        v2_ceremony_prerequisites(b, |r| {
+            r.valid_from = "2026-07-31T13:58:22.147317128Z".parse().unwrap();
+        })
+        .await;
+        assert_eq!(
+            sn.record.valid_from,
+            "2026-07-31T13:58:22.147317128Z"
+                .parse::<chrono::DateTime<chrono::Utc>>()
+                .unwrap(),
+            "I1191 precondition: the bundle record's instant"
+        );
+        let d = b.as_dyn_directory();
+        let before = held(d, &sn.record.key_id).await;
+        assert_ne!(
+            before.persist_row_hash, sn.record.persist_row_hash,
+            "I1191 precondition: not the same record"
+        );
+        match bundle::bake_assembled_genesis(d, GENESIS_V2).await {
+            Err(Error::GenesisBundleInvalid { detail })
+                if detail.starts_with("serve node") && detail.contains("rollback refused") => {}
+            o => panic!(
+                "I1191: the bake door itself refuses a record no newer than the held one at \
+                 substrate resolution, got {o:?}"
+            ),
+        }
+        assert_eq!(
+            held(d, &sn.record.key_id).await,
+            before,
+            "I1191: the held anchor does not move"
+        );
+    }
+
+    /// I1189 — the re-anchor's own refusals.
+    pub(crate) async fn i1189_reanchor_refusals<B: KeyPlaneStore>(b: &B) {
+        use crate::federation::genesis::bundle;
+        let d = b.as_dyn_directory();
+        v2_ceremony_prerequisites(b, |_| {}).await;
+        let artifact = GENESIS_V2;
         let report = bundle::bake_assembled_genesis(d, artifact)
             .await
             .expect("I1189: the real ceremony bakes");
@@ -1074,5 +1132,19 @@ mod backends {
         let Some(b) = postgres().await else { return };
         bodies::i1190_supersede(&b, &tag("p")).await;
         eprintln!("i1190_supersede_postgres: RAN");
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn i1191_bake_rollback_at_resolution_sqlite() {
+        bodies::i1191_bake_rollback_at_resolution(&sqlite().await).await;
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn i1191_bake_rollback_at_resolution_postgres() {
+        let Some(b) = postgres().await else { return };
+        bodies::i1191_bake_rollback_at_resolution(&b).await;
+        eprintln!("i1191_bake_rollback_at_resolution_postgres: RAN");
     }
 }

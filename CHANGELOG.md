@@ -318,7 +318,12 @@ invisible to it), and `SHARED_DOORS` holds them there.
   a bundle record with a nanosecond instant (the v2 ceremony's canonical is
   `…22.147317128Z`) read as 128 ns newer than itself, and re-offering it to
   `adopt_genesis_reanchor` re-wrote the row instead of refusing the
-  rollback. Both sides are now truncated to microseconds (I1189).
+  rollback. Both sides are now compared at the substrate's signed-instant
+  resolution (`truncate_to_substrate_resolution`; I1189). The bake door's
+  own pre-check (`bake_assembled_genesis`, serve nodes) had the same shape
+  and compares the same way: a held anchor carrying the bundle record's
+  nanosecond instant was read as older on postgres (I1191, sqlite and
+  postgres, red on postgres before the fix).
 - The canonical supersede settles a byte-identical re-offer before any
   verify (the #672 rule), instead of after the policy check, where an
   identical record could never arrive (`verify_canonical_supersede` refuses
@@ -337,6 +342,7 @@ Python signature changed, no migration.
   sqlite and postgres; **I1189** (memory, sqlite, postgres) the re-anchor's
   own refusals over the real v2 ceremony; **I1190** (memory, sqlite,
   postgres) the supersede's settle, pubkey-change and policy refusals;
+  **I1191** (sqlite, postgres) the bake door's anti-rollback at resolution;
   **I1188** (unit) the row step and the lost-race wording.
 - Mutation scope `scripts/mutants/scope-s3-key-plane.txt`: 129 mutants in
   three shards, 101 caught, 28 unviable, 0 missed, nothing allow-listed (two
