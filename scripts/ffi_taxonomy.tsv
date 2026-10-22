@@ -183,6 +183,10 @@ Engine	backfill_trace_attestations	procedural
 Engine	backfill_v020_trust_rows	procedural	
 Engine	bake_assembled_genesis	deontic	
 Engine	cache_stats	empirical	
+Engine	cirisnode_amend_goal_json	empirical	
+Engine	cirisnode_check_goal_projection	empirical	
+Engine	cirisnode_recant_goal_json	empirical	
+Engine	cirisnode_rehome_goals	axiotic	
 Engine	install_genesis_bundle_roster_json	deontic	
 Engine	blackhole_list_json	empirical	
 Engine	blackhole_prune_expired_iso	deontic	

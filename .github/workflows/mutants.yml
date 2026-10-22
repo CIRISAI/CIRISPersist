@@ -49,6 +49,9 @@ jobs:
           - {scope: scope-s1-cirisnode, shard: '2/5', id: s1-cirisnode-2-of-5, weekly: true}
           - {scope: scope-s1-cirisnode, shard: '3/5', id: s1-cirisnode-3-of-5, weekly: true}
           - {scope: scope-s1-cirisnode, shard: '4/5', id: s1-cirisnode-4-of-5, weekly: true}
+          - {scope: scope-s2-goals, shard: '0/3', id: s2-goals-0-of-3, weekly: true}
+          - {scope: scope-s2-goals, shard: '1/3', id: s2-goals-1-of-3, weekly: true}
+          - {scope: scope-s2-goals, shard: '2/3', id: s2-goals-2-of-3, weekly: true}
     services:
       postgres:
         image: ghcr.io/cirisai/postgres:16

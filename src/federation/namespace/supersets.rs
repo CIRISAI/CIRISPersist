@@ -1769,7 +1769,11 @@ mod tests {
         // CLM-takedown-notice-row at the notice row's admission, the door's
         // row reader and the planner (3); CLM-silo-projection-rebuildable at
         // the ledger projection (1).
-        const EXPECTED: usize = 318;
+        // v60.0.0 slice S2: +1 (CIRISPersist#988 item 4):
+        // CLM-silo-projection-rebuildable at the goals projection's fold; the
+        // M-1 row (CLM-nsproc-meta-goal-alignment-goal-scale) moved from the
+        // retired constructor to the admission gate (a move, not a new row).
+        const EXPECTED: usize = 319;
         assert_eq!(
             checked, EXPECTED,
             "checked {checked} version-pinned persist src/ rows, expected {EXPECTED}. \

@@ -51,11 +51,16 @@ pub enum SiloProjection {
     /// v60.0.0 (CIRISPersist#988 item 1, CC 3.1.9.6) — `expertise_ledger` ←
     /// this node's `expertise:{domain}:{language}` rows, the latest per key.
     ExpertiseLedger,
+    /// v60.0.0 (CIRISPersist#988 item 4, CC 3.1.9.7) — `goals` ← the
+    /// `goal:{scale}:v1` declarations this node holds, each folded with its
+    /// amendment chain and retractions ([`super::goal_projection`]). A
+    /// pre-V204 typed goal with no row is a red until the rehome moves it.
+    Goals,
 }
 
 impl SiloProjection {
     /// Every projection, in declaration order.
-    pub const ALL: [SiloProjection; 7] = [
+    pub const ALL: [SiloProjection; 8] = [
         Self::HardCaseEvents,
         Self::DetectionEvents,
         Self::FederationKeys,
@@ -63,6 +68,7 @@ impl SiloProjection {
         Self::IdentityOccurrences,
         Self::CreditsLedger,
         Self::ExpertiseLedger,
+        Self::Goals,
     ];
 
     /// The stable name: the projection's table name without a schema.
@@ -76,6 +82,7 @@ impl SiloProjection {
             Self::IdentityOccurrences => "federation_identity_occurrences",
             Self::CreditsLedger => "credits_ledger",
             Self::ExpertiseLedger => "expertise_ledger",
+            Self::Goals => "goals",
         }
     }
 }

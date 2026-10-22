@@ -238,11 +238,11 @@ struct State {
     /// queue_id. State-machine integrity enforced by the impl,
     /// matching the postgres CHECK constraints.
     outbound_queue: HashMap<String, crate::outbound::OutboundRow>,
-    /// v2.10.0 (CIRISPersist#114) — Federation goals (`goals`).
-    /// Keyed by `goal_id`. M-1 alignment is structurally guaranteed
-    /// by [`crate::federation::Goal`]'s constructor; the memory shim
-    /// stores the typed value verbatim.
-    federation_goals: HashMap<uuid::Uuid, crate::federation::Goal>,
+    /// v60.0.0 (CIRISPersist#988 item 4) — the `goals` projection of the
+    /// goal rows held, keyed by `goal_id` (the declaration's id), refolded by
+    /// the row executor ([`memory_project_goal`]).
+    federation_goals:
+        std::collections::BTreeMap<String, crate::federation::goal_projection::GoalProjection>,
     /// v3.2.0 (CIRISPersist#120) — Per-identity Reticulum blackhole
     /// rules, keyed by the 16-byte identity hash. Mirrors the V052
     /// PG/SQLite shape so behavioral parity tests pass against any
@@ -989,7 +989,7 @@ impl Default for MemoryBackend {
                 serve_positions: HashMap::new(),
                 federation_trust: HashMap::new(),
                 outbound_queue: HashMap::new(),
-                federation_goals: HashMap::new(),
+                federation_goals: std::collections::BTreeMap::new(),
                 federation_peer_metadata: HashMap::new(),
                 federation_identity_occurrences: HashMap::new(),
                 federation_identity_occurrence_history: Vec::new(),
@@ -3460,6 +3460,27 @@ impl crate::federation::attestation_admit::AttestationStore for MemoryBackend {
                 let rebuilt = rebuilt.values().map(|p| p.render()).collect();
                 return Ok(crate::federation::silo_projection::ProjectionRebuild { live, rebuilt });
             }
+            // v60.0.0 (CIRISPersist#988 item 4) — every goal declaration,
+            // refolded.
+            SiloProjection::Goals => {
+                let live = state
+                    .federation_goals
+                    .values()
+                    .map(|p| p.render())
+                    .collect();
+                let rebuilt = state
+                    .federation_attestations
+                    .iter()
+                    .filter(|a| crate::federation::goal_projection::is_goal_declaration(a))
+                    .filter_map(|a| {
+                        memory_project_goal(&state.federation_attestations, &a.attestation_id)
+                    })
+                    .map(|p| (p.goal_id.clone(), p.render()))
+                    .collect::<std::collections::BTreeMap<_, _>>()
+                    .into_values()
+                    .collect();
+                return Ok(crate::federation::silo_projection::ProjectionRebuild { live, rebuilt });
+            }
             SiloProjection::HardCaseEvents => {
                 let live = state
                     .federation_hard_case_events
@@ -3529,6 +3550,7 @@ impl crate::federation::attestation_admit::AttestationStore for MemoryBackend {
             projected_detection,
             projected_hard_case,
             projected_ledger,
+            projected_goal,
             wire_index_key,
             ..
         } = planned;
@@ -3648,6 +3670,16 @@ impl crate::federation::attestation_admit::AttestationStore for MemoryBackend {
                     .insert(row.attestation_id.clone(), depth);
             }
             state.federation_attestations.push(row);
+            // v60.0.0 (CIRISPersist#988 item 4) — the goal this row touches,
+            // refolded from the rows now held (this one included), under the
+            // same lock.
+            if let Some(goal_id) = &projected_goal {
+                let goals = memory_project_goal(&state.federation_attestations, goal_id);
+                match goals {
+                    Some(p) => state.federation_goals.insert(goal_id.clone(), p),
+                    None => state.federation_goals.remove(goal_id),
+                };
+            }
             stamp_plane_position(&mut state, PLANE_ATTESTATION, id_for_stamp, admitted_at);
             // Block-scoped: the MutexGuard ends HERE, before the projection
             // awaits (drop() alone does not satisfy rustc's Send analysis).
@@ -9747,45 +9779,14 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         Ok(rows)
     }
 
-    // ── Goals (v2.10.0, CIRISPersist#114) ──────────────────────────
-
-    async fn put_goal(
-        &self,
-        goal: crate::federation::Goal,
-    ) -> Result<(), crate::federation::Error> {
-        let mut state = self.state.lock().expect("memory backend lock");
-        // FK enforcement parity with postgres: declared_by_key_id
-        // must exist in federation_keys.
-        if !state.federation_keys.contains_key(&goal.declared_by_key_id) {
-            return Err(crate::federation::Error::InvalidArgument(format!(
-                "declared_by_key_id {} does not exist in federation_keys",
-                goal.declared_by_key_id
-            )));
-        }
-        // Idempotent on goal_id collision with matching content;
-        // conflict on differing content (same shape as
-        // put_public_key).
-        let new_hash = crate::federation::types::compute_persist_row_hash(&goal)?;
-        if let Some(existing) = state.federation_goals.get(&goal.goal_id) {
-            let existing_hash = crate::federation::types::compute_persist_row_hash(existing)?;
-            if existing_hash == new_hash {
-                return Ok(()); // exact duplicate — no-op
-            }
-            return Err(crate::federation::Error::Conflict(format!(
-                "goal_id {} already exists with different content",
-                goal.goal_id
-            )));
-        }
-        state.federation_goals.insert(goal.goal_id, goal);
-        Ok(())
-    }
+    // ── Goals: the projection's reads (v60.0.0, CIRISPersist#988 item 4) ──
 
     async fn get_goal(
         &self,
-        goal_id: uuid::Uuid,
+        goal_id: &str,
     ) -> Result<Option<crate::federation::Goal>, crate::federation::Error> {
         let state = self.state.lock().expect("memory backend lock");
-        Ok(state.federation_goals.get(&goal_id).cloned())
+        Ok(state.federation_goals.get(goal_id).map(|p| p.to_goal()))
     }
 
     async fn list_goals(
@@ -9796,60 +9797,29 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         let mut rows: Vec<crate::federation::Goal> = state
             .federation_goals
             .values()
+            .map(|p| p.to_goal())
             .filter(|g| {
-                if !filter.include_retired && g.retired_at.is_some() {
-                    return false;
-                }
-                if let Some(key) = &filter.declared_by_key_id {
-                    if &g.declared_by_key_id != key {
-                        return false;
-                    }
-                }
-                if let Some(dim) = filter.m1_dimension {
-                    if g.meta_goal_alignment.dimension != dim {
-                        return false;
-                    }
-                }
-                if let Some(kind) = &filter.scope_kind {
-                    if g.scope.scope_kind_str() != kind.as_str() {
-                        return false;
-                    }
-                }
-                if let Some(cohort) = &filter.cohort_id {
-                    if g.scope.cohort_id() != Some(cohort.as_str()) {
-                        return false;
-                    }
-                }
-                true
+                (filter.include_retired || g.retired_at.is_none())
+                    && filter
+                        .declared_by_key_id
+                        .as_ref()
+                        .is_none_or(|k| &g.declared_by_key_id == k)
+                    && filter
+                        .m1_dimension
+                        .is_none_or(|d| g.meta_goal_alignment.dimension == d)
+                    && filter.scale.as_deref().is_none_or(|s| g.scope.scale() == s)
+                    && filter
+                        .cohort_id
+                        .as_deref()
+                        .is_none_or(|c| g.scope.cohort_id() == Some(c))
             })
-            .cloned()
             .collect();
-        // Stable lex order by (declared_at, goal_id) — matches the
-        // SQL ORDER BY in the postgres + sqlite impls.
         rows.sort_by(|a, b| {
             a.declared_at
                 .cmp(&b.declared_at)
                 .then_with(|| a.goal_id.cmp(&b.goal_id))
         });
         Ok(rows)
-    }
-
-    async fn retire_goal(
-        &self,
-        goal_id: uuid::Uuid,
-        retired_at: chrono::DateTime<chrono::Utc>,
-    ) -> Result<(), crate::federation::Error> {
-        let mut state = self.state.lock().expect("memory backend lock");
-        let row = state.federation_goals.get_mut(&goal_id).ok_or_else(|| {
-            crate::federation::Error::InvalidArgument(format!("goal_id {goal_id} does not exist"))
-        })?;
-        // Idempotent: only set retired_at when the row is still
-        // live. A second call against an already-retired goal is a
-        // no-op (matches the `revoke_trust` shape).
-        if row.retired_at.is_none() {
-            row.retired_at = Some(retired_at);
-        }
-        Ok(())
     }
 
     // ── Peer-mutation surface (v3.1.0, CIRISPersist#117) ───────────
@@ -10759,6 +10729,36 @@ fn memory_project_ledger(
         .map(|h| (Some(h.attestation_id.as_str()), h.asserted_at));
     if crate::federation::ledger_projection::supersedes(held, &ledger) {
         ledgers.insert(key, ledger);
+    }
+}
+
+/// v60.0.0 (CIRISPersist#988 item 4) — the goal writer's fold over the held
+/// rows (the SQL executors' reads: a row by id; the federation-tier
+/// structural rows naming an id).
+fn memory_project_goal(
+    rows: &[crate::federation::Attestation],
+    goal_id: &str,
+) -> Option<crate::federation::goal_projection::GoalProjection> {
+    use crate::federation::types::attestation_tier::FEDERATION;
+    let get = |id: &str| -> Result<_, std::convert::Infallible> {
+        Ok(rows.iter().find(|r| r.attestation_id == id).cloned())
+    };
+    let naming = |id: &str| -> Result<Vec<_>, std::convert::Infallible> {
+        Ok(rows
+            .iter()
+            .filter(|r| {
+                r.tier == FEDERATION
+                    && crate::federation::precedence::is_structural_composer(&r.attestation_type)
+                    && crate::federation::precedence::references_attestation_id_from_envelope(
+                        &r.attestation_envelope,
+                    ) == Some(id)
+            })
+            .cloned()
+            .collect())
+    };
+    match crate::federation::goal_projection::refold_goal(goal_id, get, naming) {
+        Ok(p) => p,
+        Err(never) => match never {},
     }
 }
 

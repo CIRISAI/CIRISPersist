@@ -14277,7 +14277,7 @@
     "claim_id": "CLM-nsproc-meta-goal-alignment-goal-scale",
     "repo": "CIRISPersist",
     "crate": "ciris-persist@21.4.0",
-    "path#symbol": "src/federation/goal.rs#Goal::new",
+    "path#symbol": "src/federation/goal.rs#check_goal_row_admission",
     "tsv_target": "evidence/cc_impl.tsv",
     "field": "meta_goal_alignment",
     "prefix": "goal:{scale}"
@@ -16921,6 +16921,15 @@
     "tsv_target": "evidence/cc_impl.tsv",
     "manifest_round": "v60-s1",
     "witness": "I1166 (memory, sqlite, postgres), I1169 (sqlite, postgres)"
+   },
+   {
+    "decimal_id": "2.4.2",
+    "claim_id": "CLM-silo-projection-rebuildable",
+    "repo": "CIRISPersist",
+    "path#symbol": "src/federation/goal_projection.rs#fold_goal",
+    "tsv_target": "evidence/cc_impl.tsv",
+    "manifest_round": "v60-s2",
+    "witness": "I1177 (unit), I1178 (memory, sqlite, postgres), I1180 (sqlite and postgres engines)"
    }
   ],
   "CIRISServer": [
