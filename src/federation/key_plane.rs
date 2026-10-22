@@ -1328,11 +1328,11 @@ async fn plan_key_scrub_upgrade(
 }
 
 /// The canonical supersede's decision (CIRISPersist#405): an anchored
-/// successor of an anchored row with the same pubkeys and `node` (#925),
+/// successor of an anchored row with the same pubkeys and `node` (#925); a
+/// byte-identical re-offer settles there, ahead of every verify (#672); then
 /// the role gates on the successor (#543 H2: rotation is not a
-/// role-laundering path), the supersede policy re-verified from this node's
-/// own state (canonical scope, signed-envelope monotonicity, m-of-n); a
-/// byte-identical successor settles.
+/// role-laundering path) and the supersede policy re-verified from this
+/// node's own state (canonical scope, signed-envelope monotonicity, m-of-n).
 #[cfg(any(feature = "postgres", feature = "sqlite"))]
 async fn plan_key_supersede(
     dir: &dyn super::FederationDirectory,
@@ -1370,6 +1370,12 @@ async fn plan_key_supersede(
             row.key_id
         )));
     }
+    // A byte-identical re-offer of the held row settles ahead of every verify
+    // (the #672 rule): the held row already passed this door.
+    row.persist_row_hash = super::types::compute_persist_row_hash(&row)?;
+    if existing.persist_row_hash == row.persist_row_hash {
+        return Ok(KeyRecordPlan::Settled);
+    }
     dir.hardware_attestation_policy()
         .admit_key_record(&row, received_at)?;
     super::admission::check_infra_attest_role_admission(dir, &row).await?;
@@ -1380,10 +1386,6 @@ async fn plan_key_supersede(
             "supersede_canonical_record {}: supersede policy refused",
             row.key_id
         )));
-    }
-    row.persist_row_hash = super::types::compute_persist_row_hash(&row)?;
-    if existing.persist_row_hash == row.persist_row_hash {
-        return Ok(KeyRecordPlan::Settled);
     }
     Ok(KeyRecordPlan::Write(Box::new(PlannedKeyRecord::Rewrite {
         record: row,
@@ -1465,7 +1467,12 @@ async fn plan_key_reanchor(
             detail: format!("re-anchor {}: pubkey change refused", row.key_id),
         });
     }
-    if row.valid_from <= existing.valid_from {
+    // Compared at the substrate's resolution (microseconds), on both sides:
+    // postgres holds the anchored instant rounded, so a nanosecond bundle
+    // record read as newer than itself there and re-anchored twice
+    // (v60.0.0, found by I1189 on postgres).
+    use super::admission::truncate_to_substrate_resolution as at_resolution;
+    if at_resolution(row.valid_from) <= at_resolution(existing.valid_from) {
         return Err(Error::GenesisBundleInvalid {
             detail: format!(
                 "re-anchor {}: valid_from not newer than anchored — rollback refused",

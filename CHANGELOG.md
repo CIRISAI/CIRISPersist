@@ -313,6 +313,16 @@ invisible to it), and `SHARED_DOORS` holds them there.
   rewrite whose guard matched nothing now rolls back on every backend (the
   re-anchor committed its row step before refusing).
 - A memory rewrite keeps the held `consent_role`, as the SQL `SET` lists do.
+- **The genesis re-anchor's anti-rollback compares at the substrate's
+  resolution.** Postgres holds the anchored `valid_from` in microseconds, so
+  a bundle record with a nanosecond instant (the v2 ceremony's canonical is
+  `…22.147317128Z`) read as 128 ns newer than itself, and re-offering it to
+  `adopt_genesis_reanchor` re-wrote the row instead of refusing the
+  rollback. Both sides are now truncated to microseconds (I1189).
+- The canonical supersede settles a byte-identical re-offer before any
+  verify (the #672 rule), instead of after the policy check, where an
+  identical record could never arrive (`verify_canonical_supersede` refuses
+  it first).
 
 **Rust surface (clean break):** the inherent `SqliteBackend` /
 `PostgresBackend::{adopt_scrub_upgrade, supersede_canonical_record,
@@ -324,8 +334,10 @@ Python signature changed, no migration.
 - Witnesses: **I1183** (the insert door), **I1184** (the genesis seed),
   **I1185** (the scrub upgrade), **I1186** (the replicated apply), **I1187**
   (each executor's atomic re-assertion, every write shape), all on memory,
-  sqlite and postgres; **I1188** (unit) the row step and the lost-race
-  wording.
+  sqlite and postgres; **I1189** (memory, sqlite, postgres) the re-anchor's
+  own refusals over the real v2 ceremony; **I1190** (memory, sqlite,
+  postgres) the supersede's settle, pubkey-change and policy refusals;
+  **I1188** (unit) the row step and the lost-race wording.
 - Mutation scope `scripts/mutants/scope-s3-key-plane.txt`.
 - Evidence: CLM-planes-as-rows (3.1.3) at `key_plane::plan_key_record_write`;
   `EXPECTED` 320.

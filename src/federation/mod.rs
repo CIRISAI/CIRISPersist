@@ -383,7 +383,7 @@ pub(crate) mod key_plane_invariants;
 // v59.0.0 (sealed-transport floor, operator ruling 2026-10-19) — I1144–I1147:
 // the framed key plane is retired; a v57 store migrates onto the rows.
 mod key_plane_retired_invariants;
-// v60.0.0 (CIRISPersist#934 step 3) — I1183–I1188: the key-record write
+// v60.0.0 (CIRISPersist#934 step 3) — I1183–I1190: the key-record write
 // doors on one plan, every backend storing its verdict.
 mod key_record_plan_invariants;
 // v59.0.0 (CIRISPersist#1103, CC 2.6.8) — I1153: a key id names its own key.

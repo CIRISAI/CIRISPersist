@@ -10151,8 +10151,9 @@ fn is_key_record_row_of(row: &crate::federation::Attestation, key_id: &str) -> b
 fn memory_sync_key_record_row(state: &mut State, key_id: &str) {
     use crate::federation::key_plane::KeyRecordRowStep;
     let record = state.federation_keys.get(key_id);
+    // The base signer's held keys (for a self-scrubbed record the key
+    // itself, which proof of possession never consults).
     let held_signer = record
-        .filter(|r| r.scrub_key_id != r.key_id)
         .and_then(|r| state.federation_keys.get(&r.scrub_key_id))
         .map(|k| {
             (

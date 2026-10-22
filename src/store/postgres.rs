@@ -23877,8 +23877,10 @@ async fn pg_sync_key_record_row(
         }
         None => (None, None),
     };
+    // The base signer's held pubkeys (for a self-scrubbed record the key
+    // itself, which proof of possession never consults).
     let held_signer: crate::federation::key_plane::HeldSigner = match &record {
-        Some(r) if r.scrub_key_id != r.key_id => tx
+        Some(r) => tx
             .query_opt(
                 "SELECT pubkey_ed25519_base64, pubkey_ml_dsa_65_base64 \
                    FROM cirislens.federation_keys WHERE key_id = $1",
@@ -23893,7 +23895,7 @@ async fn pg_sync_key_record_row(
                 ))
             })
             .transpose()?,
-        _ => None,
+        None => None,
     };
     let KeyRecordRowStep::Replace(planned) = crate::federation::key_plane::key_record_row_step(
         record.as_ref(),

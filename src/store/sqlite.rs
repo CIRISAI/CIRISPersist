@@ -22237,10 +22237,11 @@ fn sqlite_sync_key_record_row(
         )
         .optional()?;
     let (record, current) = stored.map_or((None, None), |(r, c)| (Some(r), c));
-    // The base signer's held pubkeys, read in this transaction, when it is
-    // not the key itself (the pre-rc8 conferral shape).
+    // The base signer's held pubkeys, read in this transaction (the pre-rc8
+    // conferral shape; for a self-scrubbed record it is the key itself, which
+    // proof of possession never consults).
     let held_signer: crate::federation::key_plane::HeldSigner = match &record {
-        Some(r) if r.scrub_key_id != r.key_id => tx
+        Some(r) => tx
             .query_row(
                 "SELECT pubkey_ed25519_base64, pubkey_ml_dsa_65_base64 FROM federation_keys \
                   WHERE key_id = ?1",
@@ -22248,7 +22249,7 @@ fn sqlite_sync_key_record_row(
                 |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
             )
             .optional()?,
-        _ => None,
+        None => None,
     };
     let KeyRecordRowStep::Replace(planned) = crate::federation::key_plane::key_record_row_step(
         record.as_ref(),
