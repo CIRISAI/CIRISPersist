@@ -1,0 +1,32 @@
+# Mutation scope: v60 slice S1 — the cirisnode silos onto `scores` rows
+# (CIRISPersist#988 item 1, #803, #854; docs/V60_TASK_PLAN.md §4 S1).
+#
+# - The rows: `src/cirisnode/rows.rs` plans each class as a `scores` row
+#   (contribution / vote / moderation / slashing / reconsideration / credits /
+#   expertise / takedown notice), refuses the retired objects by name, and
+#   decides the promotion record's and the delivery attestation's row rules.
+#   Witnesses I1167 (memory, sqlite, postgres), I1168 (unit), I1170 (sqlite
+#   and postgres engines).
+# - The ledger projection: `src/federation/ledger_projection.rs` (the rule,
+#   the fold's order) and the three backends' writers. Witnesses I1166
+#   (memory, sqlite, postgres), I1169 (sqlite, postgres).
+# - The takedown notice as a row: its admission at the plane's put door, the
+#   door's row reader, the one-release compat read of a v59 Contribution, the
+#   CC spelling, and the binding fold that skips notice rows. Witnesses I1170,
+#   I1171, I786, I787, I789, I1107.
+# - #854: the one subject gate (`validate_subject_key_ids`). Witnesses I84,
+#   I1172.
+# - The migration (V203) is witnessed by I1173 and is not a mutation site.
+#
+# Grammar: docs/MUTATION_TESTING.md "Scope files".
+tests: test(/i1166|i1167|i1168|i1169|i1170|i1171|i1172|i1173|i84|i786|i787|i789|i1107|legal_basis|the_basis_table|extract_takedown_notice_payload/)
+features: postgres,sqlite,server,cirisnode
+
+src/cirisnode/rows.rs
+src/cirisnode/takedown_handler.rs
+src/federation/ledger_projection.rs
+src/federation/takedown_tombstone.rs cc_basis_spelling notice_basis_of_dimension is_notice_row notice_row_shape check_takedown_notice_row_admission takedown_terms legacy_contribution_terms hold_notice_row content_binding
+src/federation/mod.rs validate_subject_key_ids
+src/store/memory.rs memory_project_ledger
+src/store/sqlite.rs sqlite_project_ledger sqlite_ledger_projection_rebuild
+src/store/postgres.rs pg_project_ledger pg_ledger_projection_rebuild
