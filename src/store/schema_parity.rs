@@ -154,14 +154,6 @@ pub(crate) const PG_NARROWED_ID_COLUMNS: &[(&str, &str)] = &[
     ("cirisgraph.telemetry_metrics", "metric_id"),
     ("cirislens.audit_archives", "archive_id"),
     ("cirislens.audit_log", "entry_id"),
-    (
-        "cirislens.cirisnode_consent_sla_watch",
-        "target_contribution_id",
-    ),
-    (
-        "cirislens.cirisnode_revocation_promotion_watch",
-        "revocation_contribution_id",
-    ),
     ("cirislens.edge_detection_events", "detection_id"),
     ("cirislens.edge_outbound_queue", "queue_id"),
     ("cirislens.federation_trust_grants", "grant_id"),
@@ -170,30 +162,14 @@ pub(crate) const PG_NARROWED_ID_COLUMNS: &[(&str, &str)] = &[
     ("cirislens_derived.detection_events", "detection_id"),
     ("cirislens_secrets.access_log", "secret_uuid"),
     ("cirislens_secrets.secrets", "secret_uuid"),
-    ("cirisnode.contributions", "contribution_id"),
-    ("cirisnode.credits_ledger", "last_update_contribution"),
-    ("cirisnode.expertise_ledger", "last_update_contribution"),
-    (
-        "cirisnode.federation_delivery_attestations",
-        "announcement_id",
-    ),
-    ("cirisnode.moderation_events", "moderation_id"),
+    // v60.0.0 (CIRISPersist#988 item 1; V203) — the six typed cirisnode
+    // tables and V056's two watch tables are dropped, and V203 relaxed the
+    // kept tables' row-naming columns (`credits_ledger` /
+    // `expertise_ledger.last_update_contribution`,
+    // `federation_delivery_attestations.announcement_id`,
+    // `scheduled_takedown_actions.notice_contribution_id`) to `TEXT`: they name
+    // rows now. The promotion record's own id stays `uuid`.
     ("cirisnode.promotion_attestations", "attestation_id"),
-    (
-        "cirisnode.reconsideration_attestations",
-        "reconsideration_id",
-    ),
-    ("cirisnode.reconsideration_attestations", "request_id"),
-    ("cirisnode.reconsideration_requests", "request_id"),
-    ("cirisnode.reconsideration_requests", "slashing_id"),
-    (
-        "cirisnode.scheduled_takedown_actions",
-        "notice_contribution_id",
-    ),
-    ("cirisnode.slashing_attestations", "moderation_id"),
-    ("cirisnode.slashing_attestations", "slashing_id"),
-    ("cirisnode.votes", "contribution_id"),
-    ("cirisnode.votes", "vote_id"),
 ];
 
 /// A column whose `NOT NULL` differs between the two trees, with the reason.

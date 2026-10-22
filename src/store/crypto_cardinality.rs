@@ -121,37 +121,7 @@ pub(crate) const CRYPTO_COLUMNS: &[CryptoColumn] = &[
         shared_by: None,
     },
     CryptoColumn {
-        table: "cirisnode_contributions",
-        column: "scrub_signature_pqc",
-        shared_by: None,
-    },
-    CryptoColumn {
-        table: "cirisnode_moderation_events",
-        column: "scrub_signature_pqc",
-        shared_by: None,
-    },
-    CryptoColumn {
         table: "cirisnode_promotion_attestations",
-        column: "scrub_signature_pqc",
-        shared_by: None,
-    },
-    CryptoColumn {
-        table: "cirisnode_reconsideration_attestations",
-        column: "scrub_signature_pqc",
-        shared_by: None,
-    },
-    CryptoColumn {
-        table: "cirisnode_reconsideration_requests",
-        column: "scrub_signature_pqc",
-        shared_by: None,
-    },
-    CryptoColumn {
-        table: "cirisnode_slashing_attestations",
-        column: "scrub_signature_pqc",
-        shared_by: None,
-    },
-    CryptoColumn {
-        table: "cirisnode_votes",
         column: "scrub_signature_pqc",
         shared_by: None,
     },
@@ -301,6 +271,20 @@ mod tests {
             for line in sql.lines() {
                 let t = line.trim();
                 if t.starts_with("--") {
+                    continue;
+                }
+                // v60.0.0 (CIRISPersist#988 item 1; V203) — a DROP TABLE retires
+                // every column the table held: the history read to its end,
+                // as a DROP COLUMN retires one.
+                if let Some(rest) = t.strip_prefix("DROP TABLE ") {
+                    let rest = rest.strip_prefix("IF EXISTS ").unwrap_or(rest);
+                    let name = rest
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or("")
+                        .trim_end_matches(';')
+                        .to_owned();
+                    found.retain(|(table, _)| *table != name);
                     continue;
                 }
                 if let Some(rest) = t.strip_prefix("CREATE TABLE IF NOT EXISTS ") {

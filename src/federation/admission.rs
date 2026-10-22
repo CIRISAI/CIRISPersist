@@ -828,12 +828,12 @@ pub const REGISTERED_FAMILIES_HELD_SHUT: &[(&str, &str)] = &[
     ("archive_release:", "CIRISPersist#1083"),
     ("lawful_order:release:", "CIRISPersist#1083"),
     // CC 3.1.1 rc8 (CIRISConstitution#165) — `takedown_notice:{basis}:v1`, the
-    // notice AS A ROW: duty-holder-signed for the legal bases, cosigned by the
-    // trust root for `steward_purge`. Persist's notice is still the cirisnode
-    // `takedown_notice` Contribution (`takedown_tombstone`); the scores row and
-    // its signer rule are the silo re-home's (CIRISPersist#988). Held shut so
-    // no single key can mint a notice row before that door reads it.
-    ("takedown_notice:", "CIRISPersist#988"),
+    // notice AS A ROW. v60.0.0 (CIRISPersist#803) built the duty-holder door
+    // for the legal bases (`takedown_tombstone::check_takedown_notice_row_admission`,
+    // CC 4.5.5); the `steward_purge` leaf is cosigned under the trust root's
+    // consensus_protocol, a door not built in this cut, so it stays held: no
+    // single key can mint a steward purge notice row.
+    ("takedown_notice:steward_purge:", "CIRISPersist#988"),
 ];
 
 /// The reason token a [`REGISTERED_FAMILIES_HELD_SHUT`] refusal carries, on the
@@ -20462,6 +20462,9 @@ mod tests {
             "key_grant:epoch:v1",
             "key_grant:content:v1",
             "key_grant:stream:v1",
+            // v60.0.0 (#803) built the duty-holder notice row door.
+            "takedown_notice:dmca512:v1",
+            "takedown_notice:ncmec_csam:v1",
         ] {
             check_registered_family_not_held(open)
                 .unwrap_or_else(|e| panic!("I702 {open:?} is not held: {e}"));

@@ -143,33 +143,28 @@ pub fn verify_envelope_signed<T: Serialize>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cirisnode::types::{Cell, ContributionEnvelope, ContributionType};
+    use crate::cirisnode::types::{PromotionAttestation, TargetRowKind};
     use base64::engine::general_purpose::STANDARD as B64;
     use base64::Engine as _;
     use chrono::Utc;
     use ed25519_dalek::{Signer as _, SigningKey};
     use uuid::Uuid;
 
-    /// Build an envelope + sign it with the supplied key. Returns the
-    /// envelope with the live signature applied.
-    fn sign_contribution(key: &SigningKey, author_id: &str) -> ContributionEnvelope {
-        let mut env = ContributionEnvelope {
-            contribution_id: Uuid::new_v4().to_string(),
-            contribution_type: ContributionType::Proposal,
-            author_id: author_id.to_owned(),
-            subject: Cell {
-                domain: "test-domain".into(),
-                language: "en".into(),
-                subject: Some("arc_question".into()),
-            },
-            payload: serde_json::json!({"q": "test"}),
-            witness_set: None,
+    /// A promotion record (the one cirisnode object still verified here,
+    /// v60.0.0) signed with the supplied key.
+    fn sign_contribution(key: &SigningKey, author_id: &str) -> PromotionAttestation {
+        let mut env = PromotionAttestation {
+            attestation_id: Uuid::new_v4().to_string(),
+            target_kind: TargetRowKind::Contribution,
+            target_ids: vec![Uuid::new_v4().to_string()],
+            attested_by: author_id.to_owned(),
+            aggregate_evidence: serde_json::json!({"q": "test"}),
             signature: HybridSignature {
                 ed25519: String::new(),
                 ml_dsa_65: None,
                 signed_at: Utc::now(),
             },
-            submitted_at: Utc::now(),
+            attested_at: Utc::now(),
         };
         let canonical = canonical_bytes_for_envelope(&env).unwrap();
         let sig = key.sign(&canonical);
@@ -192,7 +187,7 @@ mod tests {
         let pubkey = B64.encode(key.verifying_key().to_bytes());
         let mut env = sign_contribution(&key, &pubkey);
         // Tamper after sign — flip a payload field.
-        env.payload = serde_json::json!({"q": "TAMPERED"});
+        env.aggregate_evidence = serde_json::json!({"q": "TAMPERED"});
         let err = verify_envelope_signed(&env, &env.signature, &pubkey).unwrap_err();
         assert!(
             matches!(err, Error::Signature(_)),
