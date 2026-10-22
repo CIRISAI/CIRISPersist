@@ -25,7 +25,7 @@ decimal_id	claim_id	repo	path#symbol	crate@version
 3.1.9.2	CLM-nsproc-community-id-moderation-allegation-type	CIRISPersist	src/federation/admission.rs#check_delegated_duty_scores_admission	ciris-persist@59.1.0
 3.1.9.2	CLM-nsproc-community-id-reconsideration-grounds	CIRISPersist	src/federation/admission.rs#named_moderator_holders	ciris-persist@59.1.0
 3.1.9.4	CLM-nsproc-kind-kind-discriminator-hard-case-kind	CIRISPersist	src/federation/admission.rs#check_reserved_prefix_admission	ciris-persist@59.1.0
-3.1.9.7	CLM-nsproc-meta-goal-alignment-goal-scale	CIRISPersist	src/federation/goal.rs#Goal::new	ciris-persist@59.1.0
+3.1.9.7	CLM-nsproc-meta-goal-alignment-goal-scale	CIRISPersist	src/federation/goal.rs#check_goal_row_admission	ciris-persist@59.1.0
 3.1.9.7	CLM-nsproc-goal-scope-goal-scale	CIRISPersist	src/federation/goal.rs#GoalScope	ciris-persist@59.1.0
 3.2	CLM-nsproc-delegated-scope-ownership	CIRISPersist	src/federation/admission.rs#check_node_agency_admission	ciris-persist@59.1.0
 3.2	CLM-nsproc-attested-key-id-ownership	CIRISPersist	src/federation/admission.rs#check_single_node_owner_admission	ciris-persist@59.1.0
@@ -359,3 +359,4 @@ decimal_id	claim_id	repo	path#symbol	crate@version
 3.1.1	CLM-takedown-notice-row	CIRISPersist	src/federation/takedown_tombstone.rs#takedown_terms	ciris-persist@59.1.0
 3.1.1	CLM-takedown-notice-row	CIRISPersist	src/cirisnode/rows.rs#plan_takedown_notice_row	ciris-persist@59.1.0
 2.4.2	CLM-silo-projection-rebuildable	CIRISPersist	src/federation/ledger_projection.rs#project_ledger_row	ciris-persist@59.1.0
+2.4.2	CLM-silo-projection-rebuildable	CIRISPersist	src/federation/goal_projection.rs#fold_goal	ciris-persist@59.1.0

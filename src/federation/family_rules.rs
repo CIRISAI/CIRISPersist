@@ -24,8 +24,8 @@
 //! `minted_by_persist` entries — scoped to the three families persist is the
 //! PRODUCER of, because CC 3.1.7 R2(a) is a producer obligation. R2(a) is not
 //! the whole exposure. Measured on the vendored rc5 @ 4b624513 cut, the minted
-//! set is **4 of 20** (three from #590, plus `mesh_config:` — CIRISPersist#570
-//! ask 1). v50.0.0 (CIRISPersist#924): CC's `_meta.case_rule.reserved_stems`
+//! set is **4 of 21** (three from #590, plus `mesh_config:` — CIRISPersist#570
+//! ask 1; v60.0.0 added `goal:`, CIRISPersist#988 item 4). v50.0.0 (CIRISPersist#924): CC's `_meta.case_rule.reserved_stems`
 //! now states the `capacity:` and `detection:` rules at the FAMILY (the
 //! CIRISConstitution#67 ask), so those two pins retired, and `licensure:`
 //! joined (CC made the row an open emitter; persist still rules on the
@@ -234,6 +234,27 @@ pub const RULES_NOT_ON_THE_ROW: &[PersistFamilyRule] = &[
     // on — not by a quorum, not by the lowest id, and not by a single-node
     // self. Being the only occurrence is not authority to act; it means
     // there is one place where nobody is home.
+    // v60.0.0 (CIRISPersist#988 item 4) — CC 3.1.9.7 registers
+    // `goal:{scale}` with `signed` polarity and no reserved rule; persist's
+    // M-1 invariant (v2.10.0, once a constructor's signature) is now the
+    // family's admission gate, and the amendment rule rides it.
+    PersistFamilyRule {
+        prefix: "goal:",
+        rule: "M-1 REQUIRED on the row: a goal declaration or amendment carries a \
+               well-formed meta_goal_alignment (a dimension in the seven M-1 dimensions, a \
+               non-empty rationale, an optional well-formed deliberation pointer) and a \
+               well-formed body (goal_text; cohort_id iff the scale is cohort), else \
+               federation_malformed_row; a supersedes of a held goal row is its declarer's \
+               amendment carrying the whole body",
+        enforced_at: &["federation::goal::check_goal_row_admission"],
+        gap: RowRuleGap::NoRuleOnTheRow,
+        minted_by_persist: false,
+        cc_ask: "CIRISConstitution#67 (family-level rule): the goal:{scale} row should state \
+                 the M-1 requirement (CIRISPersist#988 item 4, v60.0.0) as its reserved_rule \
+                 and register the three refusal reasons (goal_meta_alignment_malformed, \
+                 goal_body_malformed, goal_typed_object_retired), so a consumer reading the \
+                 classifier does not conclude the family is open",
+    },
     // v42.0.0 (CIRISPersist#814 part 1) — CC 3.1.1 ratified the duty family in
     // rc5; the persist-side evidence row (`CLM-duty` @ 3.1.1) publishes on
     // CIRISPersist#803, so until that lands the rule is enforced here and NOT
@@ -851,6 +872,10 @@ pub fn persist_ruled_prefixes() -> Vec<String> {
                 // Before rc7 the stem was a carrier ROW TYPE and was declared
                 // in `NOT_A_FAMILY_RULE`.
                 crate::federation::key_grant::KEY_GRANT_DIMENSION_PREFIX,
+                // v60.0.0 (CIRISPersist#988 item 4) — persist rules on
+                // `goal:`: the M-1 admission gate and the amendment rule
+                // (`goal::check_goal_row_admission`).
+                crate::federation::goal::GOAL_DIMENSION_PREFIX,
             ]
             .into_iter()
             .map(str::to_owned),
@@ -1142,9 +1167,9 @@ mod tests {
         // stop, so it is checked here rather than trusted.
         assert_eq!(
             RULES_NOT_ON_THE_ROW.len(),
-            20,
+            21,
             "the inventory now has {} entries; this module's doc says the minted set is \"4 of \
-             20\". Update BOTH numbers so the claim a reader acts on is the claim the build \
+             21\". Update BOTH numbers so the claim a reader acts on is the claim the build \
              checked.",
             RULES_NOT_ON_THE_ROW.len()
         );

@@ -12505,108 +12505,21 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         Ok(filtered)
     }
 
-    // ── Goals (v2.10.0, CIRISPersist#114) ──────────────────────────
-
-    async fn put_goal(
-        &self,
-        goal: crate::federation::Goal,
-    ) -> Result<(), crate::federation::Error> {
-        let new_hash = crate::federation::types::compute_persist_row_hash(&goal)?;
-        let canonical_text = crate::federation::canonicalize_goal_text(&goal.goal_text);
-        let scope_kind = goal.scope.scope_kind_str().to_owned();
-        let scope_cohort_id = goal.scope.cohort_id().map(|s| s.to_owned());
-        let meta_dimension = goal.meta_goal_alignment.dimension.as_str().to_owned();
-        let meta_deliberation_text: Option<String> =
-            match &goal.meta_goal_alignment.deliberation_ref {
-                Some(d) => Some(serde_json::to_string(d).map_err(|e| {
-                    crate::federation::Error::Backend(format!("deliberation_ref serialize: {e}"))
-                })?),
-                None => None,
-            };
-
-        let goal_id_text = goal.goal_id.to_string();
-        let goal_for_conflict = goal.clone();
-        let conflict_check = self
-            .read(move |conn| -> Result<Option<String>, rusqlite::Error> {
-                conn.query_row(
-                    "SELECT persist_row_hash FROM goals WHERE goal_id = ?1",
-                    [&goal_for_conflict.goal_id.to_string()],
-                    |r| r.get::<_, String>(0),
-                )
-                .optional()
-            })
-            .await
-            .map_err(|e| crate::federation::Error::Backend(format!("conflict check: {e}")))?;
-
-        if let Some(existing_hash) = conflict_check {
-            if existing_hash == new_hash {
-                return Ok(()); // exact duplicate — idempotent no-op
-            }
-            return Err(crate::federation::Error::Conflict(format!(
-                "goal_id {} already exists with different content",
-                goal.goal_id
-            )));
-        }
-
-        let declared_by = goal.declared_by_key_id.clone();
-        let declared_at_text = goal.declared_at.to_rfc3339();
-        let goal_text = goal.goal_text.clone();
-        let meta_rationale = goal.meta_goal_alignment.rationale.clone();
-        let retired_at_text = goal.retired_at.map(|t| t.to_rfc3339());
-        let new_hash_owned = new_hash;
-        self.write(move |conn| -> Result<(), rusqlite::Error> {
-            conn.execute(
-                "INSERT INTO goals (\
-                    goal_id, declared_by_key_id, declared_at, goal_text, \
-                    goal_text_canonical, scope_kind, scope_cohort_id, \
-                    meta_dimension, meta_rationale, meta_deliberation, \
-                    retired_at, persist_row_hash\
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-                rusqlite::params![
-                    goal_id_text,
-                    declared_by,
-                    declared_at_text,
-                    goal_text,
-                    canonical_text,
-                    scope_kind,
-                    scope_cohort_id,
-                    meta_dimension,
-                    meta_rationale,
-                    meta_deliberation_text,
-                    retired_at_text,
-                    new_hash_owned,
-                ],
-            )?;
-            Ok(())
-        })
-        .await
-        .map_err(|e| {
-            let msg = e.to_string();
-            // FK violation → InvalidArgument (matches memory shape).
-            if msg.contains("FOREIGN KEY") || msg.contains("foreign key") {
-                crate::federation::Error::InvalidArgument(format!(
-                    "FK constraint violated on put_goal: {msg}"
-                ))
-            } else {
-                crate::federation::Error::Backend(format!("insert goal: {msg}"))
-            }
-        })?;
-        Ok(())
-    }
+    // ── Goals: the projection's reads (v60.0.0, CIRISPersist#988 item 4) ──
 
     async fn get_goal(
         &self,
-        goal_id: uuid::Uuid,
+        goal_id: &str,
     ) -> Result<Option<crate::federation::Goal>, crate::federation::Error> {
-        let goal_id_text = goal_id.to_string();
+        let goal_id = goal_id.to_owned();
         self.read(
             move |conn| -> Result<Option<crate::federation::Goal>, rusqlite::Error> {
                 conn.query_row(
-                    "SELECT goal_id, declared_by_key_id, declared_at, goal_text, \
-                            scope_kind, scope_cohort_id, meta_dimension, meta_rationale, \
-                            meta_deliberation, retired_at \
-                     FROM goals WHERE goal_id = ?1",
-                    [&goal_id_text],
+                    &format!(
+                        "SELECT {SQLITE_GOAL_COLUMNS} FROM goals \
+                         WHERE goal_id = ?1 AND attestation_id IS NOT NULL"
+                    ),
+                    [&goal_id],
                     sqlite_row_to_goal,
                 )
                 .optional()
@@ -12620,7 +12533,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         &self,
         filter: crate::federation::GoalsFilter,
     ) -> Result<Vec<crate::federation::Goal>, crate::federation::Error> {
-        let mut where_parts: Vec<String> = Vec::new();
+        let mut where_parts: Vec<String> = vec!["attestation_id IS NOT NULL".to_owned()];
         let mut params: Vec<String> = Vec::new();
         if !filter.include_retired {
             where_parts.push("retired_at IS NULL".to_owned());
@@ -12633,26 +12546,17 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             params.push(dim.as_str().to_owned());
             where_parts.push(format!("meta_dimension = ?{}", params.len()));
         }
-        if let Some(kind) = filter.scope_kind {
-            params.push(kind);
-            where_parts.push(format!("scope_kind = ?{}", params.len()));
+        if let Some(scale) = filter.scale {
+            params.push(scale);
+            where_parts.push(format!("scale = ?{}", params.len()));
         }
         if let Some(cohort) = filter.cohort_id {
             params.push(cohort);
             where_parts.push(format!("scope_cohort_id = ?{}", params.len()));
         }
-        let where_sql = if where_parts.is_empty() {
-            String::new()
-        } else {
-            format!("WHERE {}", where_parts.join(" AND "))
-        };
         let sql = format!(
-            "SELECT goal_id, declared_by_key_id, declared_at, goal_text, \
-                    scope_kind, scope_cohort_id, meta_dimension, meta_rationale, \
-                    meta_deliberation, retired_at \
-             FROM goals \
-             {where_sql} \
-             ORDER BY declared_at, goal_id"
+            "SELECT {SQLITE_GOAL_COLUMNS} FROM goals WHERE {} ORDER BY declared_at, goal_id",
+            where_parts.join(" AND ")
         );
         self.read(
             move |conn| -> Result<Vec<crate::federation::Goal>, rusqlite::Error> {
@@ -12669,45 +12573,53 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         .map_err(|e| crate::federation::Error::Backend(format!("list_goals: {e}")))
     }
 
-    async fn retire_goal(
+    async fn legacy_goals(
         &self,
-        goal_id: uuid::Uuid,
-        retired_at: chrono::DateTime<chrono::Utc>,
-    ) -> Result<(), crate::federation::Error> {
-        // Idempotent: UPDATE ... WHERE retired_at IS NULL only flips
-        // the live row; a follow-up SELECT proves existence so a
-        // missing row surfaces as InvalidArgument and not a silent
-        // no-op.
-        let goal_id_text = goal_id.to_string();
-        let retired_at_text = retired_at.to_rfc3339();
-        let existed = self
-            .write(move |conn| -> Result<bool, rusqlite::Error> {
-                // First check existence so a missing row returns
-                // InvalidArgument rather than silently no-opping.
-                let exists: Option<i64> = conn
-                    .query_row(
-                        "SELECT 1 FROM goals WHERE goal_id = ?1",
-                        [&goal_id_text],
-                        |r| r.get(0),
-                    )
-                    .optional()?;
-                if exists.is_none() {
-                    return Ok(false);
-                }
-                conn.execute(
-                    "UPDATE goals SET retired_at = ?2 WHERE goal_id = ?1 AND retired_at IS NULL",
-                    rusqlite::params![goal_id_text, retired_at_text],
+    ) -> Result<Vec<crate::federation::LegacyGoal>, crate::federation::Error> {
+        self.read(
+            move |conn| -> Result<Vec<crate::federation::LegacyGoal>, rusqlite::Error> {
+                let mut stmt = conn.prepare(
+                    "SELECT goal_id, declared_by_key_id, goal_text, scale, scope_cohort_id, \
+                            meta_dimension, meta_rationale, meta_deliberation, retired_at \
+                     FROM goals WHERE attestation_id IS NULL ORDER BY goal_id",
                 )?;
-                Ok(true)
-            })
-            .await
-            .map_err(|e| crate::federation::Error::Backend(format!("retire_goal: {e}")))?;
-        if !existed {
-            return Err(crate::federation::Error::InvalidArgument(format!(
-                "goal_id {goal_id} does not exist"
-            )));
-        }
-        Ok(())
+                let rows = stmt
+                    .query_map([], |r| {
+                        let deliberation: Option<String> = r.get(7)?;
+                        let retired_at: Option<String> = r.get(8)?;
+                        Ok(crate::federation::LegacyGoal {
+                            goal_id: r.get(0)?,
+                            declared_by_key_id: r.get(1)?,
+                            goal_text: r.get(2)?,
+                            scale: r.get(3)?,
+                            cohort_id: r.get(4)?,
+                            meta_dimension: r.get(5)?,
+                            meta_rationale: r.get(6)?,
+                            meta_deliberation: deliberation.map(|d| {
+                                serde_json::from_str(&d).unwrap_or(serde_json::Value::String(d))
+                            }),
+                            retired: retired_at.is_some(),
+                        })
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            },
+        )
+        .await
+        .map_err(|e| crate::federation::Error::Backend(format!("legacy_goals: {e}")))
+    }
+
+    async fn delete_legacy_goal(&self, goal_id: &str) -> Result<(), crate::federation::Error> {
+        let goal_id = goal_id.to_owned();
+        self.write(move |conn| -> Result<(), rusqlite::Error> {
+            conn.execute(
+                "DELETE FROM goals WHERE goal_id = ?1 AND attestation_id IS NULL",
+                [&goal_id],
+            )?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| crate::federation::Error::Backend(format!("delete_legacy_goal: {e}")))
     }
 
     // ── Peer-mutation surface (v3.1.0, CIRISPersist#117) ───────────
@@ -21679,6 +21591,13 @@ impl crate::federation::attestation_admit::AttestationStore for SqliteBackend {
                         tx.rollback()?;
                         return Ok(rebuild);
                     }
+                    // v60.0.0 (CIRISPersist#988 item 4) — every goal
+                    // declaration, refolded through the live writer.
+                    SiloProjection::Goals => {
+                        let rebuild = sqlite_goal_projection_rebuild(&tx)?;
+                        tx.rollback()?;
+                        return Ok(rebuild);
+                    }
                 };
                 tx.execute_batch(&format!(
                     "CREATE TEMP TABLE {scratch} AS SELECT * FROM {live_table} WHERE 0"
@@ -21717,7 +21636,8 @@ impl crate::federation::attestation_admit::AttestationStore for SqliteBackend {
                         | SiloProjection::FederationRevocations
                         | SiloProjection::IdentityOccurrences
                         | SiloProjection::CreditsLedger
-                        | SiloProjection::ExpertiseLedger => {}
+                        | SiloProjection::ExpertiseLedger
+                        | SiloProjection::Goals => {}
                         SiloProjection::DetectionEvents => {
                             if let Some(event) =
                                 crate::derived::detection_row::project_detection_row_under(
@@ -21923,6 +21843,7 @@ impl crate::federation::attestation_admit::AttestationStore for SqliteBackend {
             projected_detection,
             projected_hard_case,
             projected_ledger,
+            projected_goal,
             wire_index_key,
             ..
         } = planned;
@@ -22016,6 +21937,12 @@ impl crate::federation::attestation_admit::AttestationStore for SqliteBackend {
                 // transaction, when it supersedes the held one.
                 if let Some(ledger) = &projected_ledger {
                     sqlite_project_ledger(&tx, None, ledger)?;
+                }
+                // v60.0.0 (CIRISPersist#988 item 4) — the goal this row
+                // touches, refolded from the rows now held (this one
+                // included), in the SAME transaction.
+                if let Some(goal_id) = &projected_goal {
+                    sqlite_project_goal(&tx, "goals", goal_id)?;
                 }
                 if let Some(depth) = withdraws_depth {
                     tx.execute(
@@ -24532,89 +24459,150 @@ fn sqlite_row_to_signed_community_membership_widening(
     })
 }
 
-/// v2.10.0 (CIRISPersist#114) — SQLite row → `Goal` projection.
-/// SELECT statements that consume this MUST include all the columns
-/// listed below (the typed converter pulls them by name); the
-/// `persist_row_hash` column is not part of the value — persist's
-/// `compute_persist_row_hash` recomputes it on demand from the
-/// serde-default JSON form.
+/// v60.0.0 (CIRISPersist#988 item 4) — the `goals` columns a read selects,
+/// in [`sqlite_row_to_goal`]'s order.
+const SQLITE_GOAL_COLUMNS: &str = "goal_id, declared_by_key_id, declared_at, goal_text, scale, \
+     scope_cohort_id, meta_dimension, meta_rationale, meta_deliberation, retired_at, \
+     attestation_id, score";
+
+/// v60.0.0 (CIRISPersist#988 item 4) — a projection row → [`Goal`](crate::federation::Goal).
+/// The CHECKs and the writer keep every column well-formed; a row that is not
+/// fails the read rather than inventing a value.
 fn sqlite_row_to_goal(row: &rusqlite::Row<'_>) -> rusqlite::Result<crate::federation::Goal> {
-    let goal_id_text: String = row.get("goal_id")?;
-    let goal_id = uuid::Uuid::parse_str(&goal_id_text).map_err(|e| {
+    let bad = |i: usize, e: String| {
         rusqlite::Error::FromSqlConversionFailure(
-            0,
+            i,
             rusqlite::types::Type::Text,
             Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
         )
-    })?;
-    let declared_at_text: String = row.get("declared_at")?;
-    let scope_kind: String = row.get("scope_kind")?;
-    let scope_cohort_id: Option<String> = row.get("scope_cohort_id")?;
-    let scope = match scope_kind.as_str() {
-        "single_declarer" => crate::federation::GoalScope::SingleDeclarer,
-        "federation" => crate::federation::GoalScope::Federation,
-        "cohort" => crate::federation::GoalScope::Cohort {
-            cohort_id: scope_cohort_id.ok_or_else(|| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    5,
-                    rusqlite::types::Type::Text,
-                    Box::new(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "scope_kind=cohort but scope_cohort_id is NULL (schema CHECK bypass?)",
-                    )),
-                )
-            })?,
-        },
-        other => {
-            return Err(rusqlite::Error::FromSqlConversionFailure(
-                4,
-                rusqlite::types::Type::Text,
-                Box::new(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("unknown scope_kind: {other}"),
-                )),
-            ));
-        }
     };
-    let meta_dimension_text: String = row.get("meta_dimension")?;
-    let dimension = crate::federation::M1Dimension::from_wire_str(&meta_dimension_text)
-        .ok_or_else(|| {
-            rusqlite::Error::FromSqlConversionFailure(
-                6,
-                rusqlite::types::Type::Text,
-                Box::new(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("unknown meta_dimension: {meta_dimension_text}"),
-                )),
-            )
-        })?;
-    let meta_rationale: String = row.get("meta_rationale")?;
-    let meta_deliberation_text: Option<String> = row.get("meta_deliberation")?;
-    let deliberation_ref: Option<crate::federation::DeliberationRef> = match meta_deliberation_text
-    {
-        None => None,
-        Some(s) if s.is_empty() => None,
-        Some(s) => Some(serde_json::from_str(&s).map_err(|e| {
-            rusqlite::Error::FromSqlConversionFailure(
-                8,
-                rusqlite::types::Type::Text,
-                Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
-            )
-        })?),
-    };
-    let retired_at_text: Option<String> = row.get("retired_at")?;
-    let alignment =
-        crate::federation::MetaGoalAlignment::new(dimension, meta_rationale, deliberation_ref);
-    let mut goal = crate::federation::Goal::new(
-        goal_id,
-        row.get("declared_by_key_id")?,
-        parse_rfc3339(&declared_at_text),
-        row.get("goal_text")?,
+    let scale: String = row.get(4)?;
+    let cohort: Option<String> = row.get(5)?;
+    let scope =
+        crate::federation::GoalScope::new(&scale, cohort.as_deref()).map_err(|e| bad(4, e))?;
+    let dimension: String = row.get(6)?;
+    let dimension = crate::federation::M1Dimension::from_wire_str(&dimension)
+        .ok_or_else(|| bad(6, format!("meta_dimension {dimension:?}")))?;
+    let deliberation: Option<String> = row.get(8)?;
+    let deliberation_ref = deliberation
+        .map(|d| serde_json::from_str(&d).map_err(|e| bad(8, e.to_string())))
+        .transpose()?;
+    let declared_at: String = row.get(2)?;
+    let retired_at: Option<String> = row.get(9)?;
+    Ok(crate::federation::Goal {
+        goal_id: row.get(0)?,
+        declared_by_key_id: row.get(1)?,
+        declared_at: parse_rfc3339(&declared_at),
+        goal_text: row.get(3)?,
         scope,
-        alignment,
-    );
-    goal.retired_at = retired_at_text.as_deref().map(parse_rfc3339);
-    Ok(goal)
+        meta_goal_alignment: crate::federation::MetaGoalAlignment::new(
+            dimension,
+            row.get(7)?,
+            deliberation_ref,
+        ),
+        score: row.get(11)?,
+        retired_at: retired_at.as_deref().map(parse_rfc3339),
+        attestation_id: row.get(10)?,
+    })
+}
+
+/// v60.0.0 (CIRISPersist#988 item 4) — **the goal writer**: refold the
+/// declaration `goal_id` from the rows held in `tx`
+/// ([`refold_goal`](crate::federation::goal_projection::refold_goal)) and
+/// replace its row in `table` (`goals`, or a rebuild's scratch table) with
+/// the result, or remove it. The live put step and the rebuild both write
+/// through this.
+fn sqlite_project_goal(
+    tx: &rusqlite::Transaction<'_>,
+    table: &str,
+    goal_id: &str,
+) -> Result<(), rusqlite::Error> {
+    let get = |id: &str| -> Result<Option<crate::federation::Attestation>, rusqlite::Error> {
+        tx.query_row(
+            &format!(
+                "SELECT {SQLITE_ATTESTATION_COLUMNS} FROM federation_attestations \
+                 WHERE attestation_id = ?1"
+            ),
+            [id],
+            sqlite_row_to_attestation,
+        )
+        .optional()
+    };
+    let naming = |id: &str| -> Result<Vec<crate::federation::Attestation>, rusqlite::Error> {
+        use crate::federation::types::attestation_type as t;
+        let mut stmt = tx.prepare_cached(&sqlite_attestations_referencing_sql())?;
+        let rows = stmt.query_map(
+            rusqlite::params![id, t::WITHDRAWS, t::RECANTS, t::SUPERSEDES],
+            sqlite_row_to_attestation,
+        )?;
+        rows.collect::<Result<Vec<_>, _>>()
+    };
+    let projected = crate::federation::goal_projection::refold_goal(goal_id, get, naming)?;
+    tx.execute(
+        &format!("DELETE FROM {table} WHERE goal_id = ?1"),
+        [goal_id],
+    )?;
+    let Some(p) = projected else {
+        return Ok(());
+    };
+    let at = crate::federation::ledger_projection::render_instant;
+    tx.execute(
+        &format!(
+            "INSERT INTO {table} (goal_id, declared_by_key_id, declared_at, goal_text, \
+                goal_text_canonical, scale, scope_cohort_id, meta_dimension, meta_rationale, \
+                meta_deliberation, retired_at, persist_row_hash, attestation_id, score) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)"
+        ),
+        rusqlite::params![
+            p.goal_id,
+            p.declared_by_key_id,
+            at(p.declared_at),
+            p.body.goal_text,
+            p.goal_text_canonical(),
+            p.body.scope.scale(),
+            p.body.scope.cohort_id(),
+            p.body.meta_goal_alignment.dimension.as_str(),
+            p.body.meta_goal_alignment.rationale,
+            p.meta_deliberation(),
+            p.retired_at.map(at),
+            p.persist_row_hash,
+            p.attestation_id,
+            p.body.score,
+        ],
+    )?;
+    Ok(())
+}
+
+/// v60.0.0 (CIRISPersist#988 item 4) — the goals' from-rows rebuild: every
+/// goal declaration held, refolded through the live writer into a scratch
+/// table of the live table's shape; both rendered with `quote()` of every
+/// column and sorted.
+fn sqlite_goal_projection_rebuild(
+    tx: &rusqlite::Transaction<'_>,
+) -> Result<crate::federation::silo_projection::ProjectionRebuild, rusqlite::Error> {
+    let scratch = "_rebuild_goals";
+    tx.execute_batch(&format!(
+        "CREATE TEMP TABLE {scratch} AS SELECT * FROM goals WHERE 0"
+    ))?;
+    let ids: Vec<String> = {
+        let mut stmt = tx.prepare(
+            "SELECT attestation_id FROM federation_attestations \
+             WHERE attestation_type = 'scores' AND substr(dimension, 1, length(?1)) = ?1 \
+             ORDER BY attestation_id",
+        )?;
+        let rows = stmt.query_map([crate::federation::goal::GOAL_DIMENSION_PREFIX], |r| {
+            r.get(0)
+        })?;
+        rows.collect::<Result<_, _>>()?
+    };
+    for id in &ids {
+        sqlite_project_goal(tx, scratch, id)?;
+    }
+    let mut live = sqlite_render_table(tx, "goals", "goals", "goal_id")?;
+    let mut rebuilt = sqlite_render_table(tx, "goals", scratch, "goal_id")?;
+    live.sort();
+    rebuilt.sort();
+    Ok(crate::federation::silo_projection::ProjectionRebuild { live, rebuilt })
 }
 
 // ─── ReadEngine impl (v1.x sovereign-mode parity, CIRISPersist#23) ──
@@ -50673,304 +50661,6 @@ mod tests {
             .unwrap();
         assert!(graph.edges.is_empty());
         assert_eq!(graph.root_key, "solo-key");
-    }
-
-    // ── v2.10.0 (CIRISPersist#114) — typed Goal primitive tests ────
-
-    fn fixture_goal(
-        backend_key: &str,
-        scope: crate::federation::GoalScope,
-        dimension: crate::federation::M1Dimension,
-        declared_at: chrono::DateTime<chrono::Utc>,
-    ) -> crate::federation::Goal {
-        crate::federation::Goal::new(
-            uuid::Uuid::new_v4(),
-            backend_key.into(),
-            declared_at,
-            format!("goal text for {backend_key}"),
-            scope,
-            crate::federation::MetaGoalAlignment::new(dimension, "rationale for goal".into(), None),
-        )
-    }
-
-    /// v2.10.0 (#114) — put + get_goal round-trip is byte-exact.
-    #[tokio::test]
-    async fn put_get_goal_round_trip_sqlite() {
-        let backend = SqliteBackend::open_in_memory().await.unwrap();
-        backend.run_migrations().await.unwrap();
-        backend
-            .put_public_key(SignedKeyRecord {
-                record: fed_key("declarer-k1", "agent-a", "declarer-k1"),
-            })
-            .await
-            .unwrap();
-        let when = "2026-05-28T12:00:00Z".parse().unwrap();
-        let goal = fixture_goal(
-            "declarer-k1",
-            crate::federation::GoalScope::SingleDeclarer,
-            crate::federation::M1Dimension::Plurality,
-            when,
-        );
-        backend.put_goal(goal.clone()).await.unwrap();
-        let fetched = backend.get_goal(goal.goal_id).await.unwrap();
-        assert_eq!(fetched, Some(goal));
-    }
-
-    /// v2.10.0 (#114) — list_goals filter combinations preserve
-    /// stable lex order by (declared_at, goal_id).
-    #[tokio::test]
-    async fn list_goals_filters_and_order_sqlite() {
-        let backend = SqliteBackend::open_in_memory().await.unwrap();
-        backend.run_migrations().await.unwrap();
-        backend
-            .put_public_key(SignedKeyRecord {
-                record: fed_key("k-a", "agent-a", "k-a"),
-            })
-            .await
-            .unwrap();
-        backend
-            .put_public_key(SignedKeyRecord {
-                record: fed_key("k-b", "agent-b", "k-b"),
-            })
-            .await
-            .unwrap();
-        let t0: chrono::DateTime<chrono::Utc> = "2026-05-28T12:00:00Z".parse().unwrap();
-        let t1: chrono::DateTime<chrono::Utc> = "2026-05-28T13:00:00Z".parse().unwrap();
-        let g_a_plurality = fixture_goal(
-            "k-a",
-            crate::federation::GoalScope::SingleDeclarer,
-            crate::federation::M1Dimension::Plurality,
-            t0,
-        );
-        let g_a_justice = fixture_goal(
-            "k-a",
-            crate::federation::GoalScope::Cohort {
-                cohort_id: "stewards".into(),
-            },
-            crate::federation::M1Dimension::Justice,
-            t1,
-        );
-        let g_b_plurality = fixture_goal(
-            "k-b",
-            crate::federation::GoalScope::Federation,
-            crate::federation::M1Dimension::Plurality,
-            t0,
-        );
-        for g in [
-            g_a_plurality.clone(),
-            g_a_justice.clone(),
-            g_b_plurality.clone(),
-        ] {
-            backend.put_goal(g).await.unwrap();
-        }
-        // Filter by key — only k-a's two.
-        let by_key = backend
-            .list_goals(crate::federation::GoalsFilter {
-                declared_by_key_id: Some("k-a".into()),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        assert_eq!(by_key.len(), 2);
-        assert!(by_key.iter().all(|g| g.declared_by_key_id == "k-a"));
-        // Stable order by declared_at, goal_id.
-        assert!(by_key[0].declared_at <= by_key[1].declared_at);
-        // Filter by dimension — Plurality across all declarers.
-        let by_dim = backend
-            .list_goals(crate::federation::GoalsFilter {
-                m1_dimension: Some(crate::federation::M1Dimension::Plurality),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        assert_eq!(by_dim.len(), 2);
-        // Filter by scope_kind cohort + cohort_id.
-        let by_cohort = backend
-            .list_goals(crate::federation::GoalsFilter {
-                scope_kind: Some("cohort".into()),
-                cohort_id: Some("stewards".into()),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        assert_eq!(by_cohort.len(), 1);
-        assert_eq!(by_cohort[0].goal_id, g_a_justice.goal_id);
-    }
-
-    /// v2.10.0 (#114) — all 7 M1Dimension variants round-trip.
-    #[tokio::test]
-    async fn all_m1_dimension_variants_round_trip_sqlite() {
-        let backend = SqliteBackend::open_in_memory().await.unwrap();
-        backend.run_migrations().await.unwrap();
-        backend
-            .put_public_key(SignedKeyRecord {
-                record: fed_key("k-all", "agent-all", "k-all"),
-            })
-            .await
-            .unwrap();
-        let when: chrono::DateTime<chrono::Utc> = "2026-05-28T12:00:00Z".parse().unwrap();
-        let all = [
-            crate::federation::M1Dimension::Sustainability,
-            crate::federation::M1Dimension::Adaptivity,
-            crate::federation::M1Dimension::Coherence,
-            crate::federation::M1Dimension::Plurality,
-            crate::federation::M1Dimension::Flourishing,
-            crate::federation::M1Dimension::Justice,
-            crate::federation::M1Dimension::Wonder,
-        ];
-        let mut ids = Vec::new();
-        for (i, dim) in all.iter().enumerate() {
-            let g = fixture_goal(
-                "k-all",
-                crate::federation::GoalScope::SingleDeclarer,
-                *dim,
-                when + chrono::Duration::seconds(i as i64),
-            );
-            ids.push((g.goal_id, *dim));
-            backend.put_goal(g).await.unwrap();
-        }
-        for (id, expected) in ids {
-            let got = backend.get_goal(id).await.unwrap().expect("present");
-            assert_eq!(got.meta_goal_alignment.dimension, expected);
-        }
-    }
-
-    /// v2.10.0 (#114) — Cohort scope round-trips; schema CHECK
-    /// rejects direct-SQL bypass (scope_kind = 'cohort' with
-    /// scope_cohort_id NULL).
-    #[tokio::test]
-    async fn cohort_scope_round_trip_and_check_rejects_bypass_sqlite() {
-        let backend = SqliteBackend::open_in_memory().await.unwrap();
-        backend.run_migrations().await.unwrap();
-        backend
-            .put_public_key(SignedKeyRecord {
-                record: fed_key("k-c", "agent-c", "k-c"),
-            })
-            .await
-            .unwrap();
-        let when: chrono::DateTime<chrono::Utc> = "2026-05-28T12:00:00Z".parse().unwrap();
-        let g = fixture_goal(
-            "k-c",
-            crate::federation::GoalScope::Cohort {
-                cohort_id: "cohort-1".into(),
-            },
-            crate::federation::M1Dimension::Plurality,
-            when,
-        );
-        backend.put_goal(g.clone()).await.unwrap();
-        let got = backend.get_goal(g.goal_id).await.unwrap().expect("present");
-        assert_eq!(got.scope.cohort_id(), Some("cohort-1"));
-
-        // Direct-SQL bypass attempt: scope_kind='cohort' without
-        // scope_cohort_id must hit the CHECK constraint.
-        let conn = backend.conn.clone();
-        let bypass_id = uuid::Uuid::new_v4().to_string();
-        let res = (move || -> Result<usize, rusqlite::Error> {
-            let conn = conn.lock();
-            conn.execute(
-                "INSERT INTO goals (\
-                    goal_id, declared_by_key_id, declared_at, goal_text, \
-                    goal_text_canonical, scope_kind, scope_cohort_id, \
-                    meta_dimension, meta_rationale, meta_deliberation, \
-                    retired_at, persist_row_hash\
-                 ) VALUES (?1, 'k-c', '2026-05-28T12:00:00Z', 'x', 'x', \
-                          'cohort', NULL, 'plurality', 'r', NULL, NULL, 'h')",
-                [bypass_id],
-            )
-        })();
-        assert!(
-            res.is_err(),
-            "schema CHECK must reject scope_kind='cohort' with NULL scope_cohort_id"
-        );
-    }
-
-    /// v2.10.0 (#114) — retire_goal sets retired_at; list_goals
-    /// with include_retired=false hides it; include_retired=true
-    /// includes it. Idempotent on second call.
-    #[tokio::test]
-    async fn retire_goal_hides_from_default_list_sqlite() {
-        let backend = SqliteBackend::open_in_memory().await.unwrap();
-        backend.run_migrations().await.unwrap();
-        backend
-            .put_public_key(SignedKeyRecord {
-                record: fed_key("k-r", "agent-r", "k-r"),
-            })
-            .await
-            .unwrap();
-        let when: chrono::DateTime<chrono::Utc> = "2026-05-28T12:00:00Z".parse().unwrap();
-        let g = fixture_goal(
-            "k-r",
-            crate::federation::GoalScope::SingleDeclarer,
-            crate::federation::M1Dimension::Wonder,
-            when,
-        );
-        backend.put_goal(g.clone()).await.unwrap();
-
-        let retired_at = when + chrono::Duration::hours(1);
-        backend.retire_goal(g.goal_id, retired_at).await.unwrap();
-
-        // Default (include_retired=false) hides it.
-        let live = backend
-            .list_goals(crate::federation::GoalsFilter::default())
-            .await
-            .unwrap();
-        assert!(live.iter().all(|x| x.goal_id != g.goal_id));
-
-        // include_retired=true includes it.
-        let all = backend
-            .list_goals(crate::federation::GoalsFilter {
-                include_retired: true,
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        let found = all.iter().find(|x| x.goal_id == g.goal_id).expect("found");
-        assert!(found.retired_at.is_some());
-
-        // Idempotent: second retire is a no-op and does not change
-        // retired_at.
-        let original_retired_at = found.retired_at.unwrap();
-        backend
-            .retire_goal(g.goal_id, retired_at + chrono::Duration::hours(1))
-            .await
-            .unwrap();
-        let again = backend.get_goal(g.goal_id).await.unwrap().expect("present");
-        assert_eq!(
-            again.retired_at,
-            Some(original_retired_at),
-            "second retire must not change retired_at"
-        );
-    }
-
-    /// v2.10.0 (#114) — put_goal with unknown declared_by_key_id
-    /// rejects on the FK constraint.
-    #[tokio::test]
-    async fn put_goal_rejects_unknown_declarer_sqlite() {
-        let backend = SqliteBackend::open_in_memory().await.unwrap();
-        backend.run_migrations().await.unwrap();
-        let when: chrono::DateTime<chrono::Utc> = "2026-05-28T12:00:00Z".parse().unwrap();
-        let g = fixture_goal(
-            "ghost-key",
-            crate::federation::GoalScope::SingleDeclarer,
-            crate::federation::M1Dimension::Coherence,
-            when,
-        );
-        let err = backend.put_goal(g).await.expect_err("FK must reject");
-        assert!(matches!(err, crate::federation::Error::InvalidArgument(_)));
-    }
-
-    /// v2.10.0 (#114) — retire_goal against an unknown goal_id is
-    /// InvalidArgument (not a silent no-op).
-    #[tokio::test]
-    async fn retire_goal_unknown_id_rejects_sqlite() {
-        let backend = SqliteBackend::open_in_memory().await.unwrap();
-        backend.run_migrations().await.unwrap();
-        let when = chrono::Utc::now();
-        let err = backend
-            .retire_goal(uuid::Uuid::new_v4(), when)
-            .await
-            .expect_err("missing goal_id must reject");
-        assert!(matches!(err, crate::federation::Error::InvalidArgument(_)));
     }
 
     // ── v3.1.0 (CIRISPersist#117) — peer-mutation surface ──────────

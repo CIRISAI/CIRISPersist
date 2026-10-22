@@ -21440,7 +21440,7 @@ mod tests {
         // family differs, so a gate keyed on anything but the `config:` stem
         // fails here.
         let control_id = id_of("control");
-        dir.put_attestation(row(&control_id, &stranger, &node, "goal:load:v1"))
+        dir.put_attestation(row(&control_id, &stranger, &node, "fidelity:load:v1"))
             .await
             .expect(
                 "(5) a NON-config:* third-party row must still ADMIT — the gate is \

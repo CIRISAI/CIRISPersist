@@ -14884,110 +14884,11 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         rows.into_iter().map(pg_row_to_trust_row).collect()
     }
 
-    // ── Goals (v2.10.0, CIRISPersist#114) ──────────────────────────
-
-    async fn put_goal(
-        &self,
-        goal: crate::federation::Goal,
-    ) -> Result<(), crate::federation::Error> {
-        let client = self
-            .get_client()
-            .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
-        let new_hash = crate::federation::types::compute_persist_row_hash(&goal)?;
-        let canonical_text = crate::federation::canonicalize_goal_text(&goal.goal_text);
-        let scope_kind = goal.scope.scope_kind_str();
-        let scope_cohort_id = goal.scope.cohort_id().map(|s| s.to_owned());
-        let meta_dimension = goal.meta_goal_alignment.dimension.as_str();
-        let meta_deliberation_value: Option<serde_json::Value> =
-            match &goal.meta_goal_alignment.deliberation_ref {
-                Some(d) => Some(serde_json::to_value(d).map_err(|e| {
-                    crate::federation::Error::Backend(format!("deliberation_ref serialize: {e}"))
-                })?),
-                None => None,
-            };
-
-        // Idempotent on (goal_id, persist_row_hash). ON CONFLICT DO
-        // NOTHING — same shape as put_public_key. If the row exists
-        // with a different hash we raise Conflict; otherwise the
-        // INSERT is a no-op.
-        let result = client
-            .execute(
-                "INSERT INTO cirislens.goals (\
-                    goal_id, declared_by_key_id, declared_at, goal_text, \
-                    goal_text_canonical, scope_kind, scope_cohort_id, \
-                    meta_dimension, meta_rationale, meta_deliberation, \
-                    retired_at, persist_row_hash\
-                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
-                 ON CONFLICT (goal_id) DO NOTHING",
-                &[
-                    &goal.goal_id,
-                    &goal.declared_by_key_id,
-                    &goal.declared_at,
-                    &goal.goal_text,
-                    &canonical_text,
-                    &scope_kind,
-                    &scope_cohort_id,
-                    &meta_dimension,
-                    &goal.meta_goal_alignment.rationale,
-                    &meta_deliberation_value,
-                    &goal.retired_at,
-                    &new_hash,
-                ],
-            )
-            .await
-            .map_err(|e| {
-                // tokio_postgres `Display` only shows "db error: ..."
-                // at the top level; the structured SQLSTATE +
-                // constraint name live on the DB-error payload.
-                let sqlstate = e.as_db_error().map(|d| d.code().code().to_owned());
-                let constraint = e
-                    .as_db_error()
-                    .and_then(|d| d.constraint().map(|s| s.to_owned()));
-                let msg = e.to_string();
-                match sqlstate.as_deref() {
-                    // 23503 = foreign_key_violation
-                    Some("23503") => crate::federation::Error::InvalidArgument(format!(
-                        "FK constraint violated on put_goal: {msg}"
-                    )),
-                    // 23514 = check_violation — disambiguate by
-                    // constraint name; goals_scope_cohort_discriminant
-                    // and the column CHECKs both fire here.
-                    Some("23514") => crate::federation::Error::InvalidArgument(format!(
-                        "CHECK constraint violated on put_goal \
-                         (constraint={:?}): {msg}",
-                        constraint.as_deref().unwrap_or("?")
-                    )),
-                    _ => crate::federation::Error::Backend(format!("insert goal: {msg}")),
-                }
-            })?;
-
-        if result == 0 {
-            let existing: Option<String> = client
-                .query_opt(
-                    "SELECT persist_row_hash FROM cirislens.goals WHERE goal_id = $1",
-                    &[&goal.goal_id],
-                )
-                .await
-                .map_err(|e| {
-                    crate::federation::Error::Backend(format!("put_goal conflict check: {e}"))
-                })?
-                .map(|r| r.get(0));
-            if let Some(existing_hash) = existing {
-                if existing_hash != new_hash {
-                    return Err(crate::federation::Error::Conflict(format!(
-                        "goal_id {} already exists with different content",
-                        goal.goal_id
-                    )));
-                }
-            }
-        }
-        Ok(())
-    }
+    // ── Goals: the projection's reads (v60.0.0, CIRISPersist#988 item 4) ──
 
     async fn get_goal(
         &self,
-        goal_id: uuid::Uuid,
+        goal_id: &str,
     ) -> Result<Option<crate::federation::Goal>, crate::federation::Error> {
         let client = self
             .get_client()
@@ -14995,10 +14896,10 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
         let row_opt = client
             .query_opt(
-                "SELECT goal_id, declared_by_key_id, declared_at, goal_text, \
-                        scope_kind, scope_cohort_id, meta_dimension, meta_rationale, \
-                        meta_deliberation, retired_at \
-                 FROM cirislens.goals WHERE goal_id = $1",
+                &format!(
+                    "SELECT {PG_GOAL_COLUMNS} FROM cirislens.goals \
+                     WHERE goal_id = $1 AND attestation_id IS NOT NULL"
+                ),
                 &[&goal_id],
             )
             .await
@@ -15014,83 +14915,87 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .get_client()
             .await
             .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
-        let mut where_parts: Vec<String> = Vec::new();
-        let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = Vec::new();
+        let mut where_parts: Vec<String> = vec!["attestation_id IS NOT NULL".to_owned()];
+        let mut params: Vec<String> = Vec::new();
         if !filter.include_retired {
             where_parts.push("retired_at IS NULL".to_owned());
         }
         if let Some(key) = filter.declared_by_key_id {
-            params.push(Box::new(key));
+            params.push(key);
             where_parts.push(format!("declared_by_key_id = ${}", params.len()));
         }
         if let Some(dim) = filter.m1_dimension {
-            params.push(Box::new(dim.as_str().to_owned()));
+            params.push(dim.as_str().to_owned());
             where_parts.push(format!("meta_dimension = ${}", params.len()));
         }
-        if let Some(kind) = filter.scope_kind {
-            params.push(Box::new(kind));
-            where_parts.push(format!("scope_kind = ${}", params.len()));
+        if let Some(scale) = filter.scale {
+            params.push(scale);
+            where_parts.push(format!("scale = ${}", params.len()));
         }
         if let Some(cohort) = filter.cohort_id {
-            params.push(Box::new(cohort));
+            params.push(cohort);
             where_parts.push(format!("scope_cohort_id = ${}", params.len()));
         }
-        let where_sql = if where_parts.is_empty() {
-            String::new()
-        } else {
-            format!("WHERE {}", where_parts.join(" AND "))
-        };
         let sql = format!(
-            "SELECT goal_id, declared_by_key_id, declared_at, goal_text, \
-                    scope_kind, scope_cohort_id, meta_dimension, meta_rationale, \
-                    meta_deliberation, retired_at \
-             FROM cirislens.goals \
-             {where_sql} \
-             ORDER BY declared_at, goal_id"
+            "SELECT {PG_GOAL_COLUMNS} FROM cirislens.goals WHERE {} \
+             ORDER BY declared_at, goal_id",
+            where_parts.join(" AND ")
         );
-        let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
-            params.iter().map(|p| p.as_ref() as _).collect();
+        let params_dyn: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
+            .iter()
+            .map(|p| p as &(dyn tokio_postgres::types::ToSql + Sync))
+            .collect();
         let rows = client
-            .query(&sql, &params_ref[..])
+            .query(&sql, &params_dyn)
             .await
             .map_err(|e| crate::federation::Error::Backend(format!("list_goals: {e}")))?;
         rows.into_iter().map(pg_row_to_goal).collect()
     }
 
-    async fn retire_goal(
+    async fn legacy_goals(
         &self,
-        goal_id: uuid::Uuid,
-        retired_at: chrono::DateTime<chrono::Utc>,
-    ) -> Result<(), crate::federation::Error> {
+    ) -> Result<Vec<crate::federation::LegacyGoal>, crate::federation::Error> {
+        let mk = crate::federation::Error::Backend;
+        let client = self.get_client().await.map_err(|e| mk(e.to_string()))?;
+        let rows = client
+            .query(
+                "SELECT goal_id, declared_by_key_id, goal_text, scale, scope_cohort_id, \
+                        meta_dimension, meta_rationale, meta_deliberation, \
+                        retired_at IS NOT NULL AS retired \
+                 FROM cirislens.goals WHERE attestation_id IS NULL ORDER BY goal_id",
+                &[],
+            )
+            .await
+            .map_err(|e| mk(format!("legacy_goals: {e}")))?;
+        rows.into_iter()
+            .map(|r| {
+                Ok(crate::federation::LegacyGoal {
+                    goal_id: r.safe_get_with(0, mk)?,
+                    declared_by_key_id: r.safe_get_with(1, mk)?,
+                    goal_text: r.safe_get_with(2, mk)?,
+                    scale: r.safe_get_with(3, mk)?,
+                    cohort_id: r.safe_get_with(4, mk)?,
+                    meta_dimension: r.safe_get_with(5, mk)?,
+                    meta_rationale: r.safe_get_with(6, mk)?,
+                    meta_deliberation: r.safe_get_with(7, mk)?,
+                    retired: r.safe_get_with(8, mk)?,
+                })
+            })
+            .collect()
+    }
+
+    async fn delete_legacy_goal(&self, goal_id: &str) -> Result<(), crate::federation::Error> {
         let client = self
             .get_client()
             .await
             .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
-        // Idempotent: WHERE retired_at IS NULL gates double-retire.
-        // Existence is established via a separate SELECT so a missing
-        // row surfaces as InvalidArgument and not a silent no-op.
-        let exists = client
-            .query_opt(
-                "SELECT 1 FROM cirislens.goals WHERE goal_id = $1",
+        client
+            .execute(
+                "DELETE FROM cirislens.goals WHERE goal_id = $1 AND attestation_id IS NULL",
                 &[&goal_id],
             )
             .await
-            .map_err(|e| {
-                crate::federation::Error::Backend(format!("retire_goal existence: {e}"))
-            })?;
-        if exists.is_none() {
-            return Err(crate::federation::Error::InvalidArgument(format!(
-                "goal_id {goal_id} does not exist"
-            )));
-        }
-        client
-            .execute(
-                "UPDATE cirislens.goals SET retired_at = $2 \
-                 WHERE goal_id = $1 AND retired_at IS NULL",
-                &[&goal_id, &retired_at],
-            )
-            .await
-            .map_err(|e| crate::federation::Error::Backend(format!("retire_goal update: {e}")))?;
+            .map_err(|e| crate::federation::Error::Backend(format!("delete_legacy_goal: {e}")))?;
         Ok(())
     }
 
@@ -23403,6 +23308,15 @@ impl crate::federation::attestation_admit::AttestationStore for PostgresBackend 
                 return pg_ledger_projection_rebuild(&mut client, projection, node.as_deref())
                     .await;
             }
+            // v60.0.0 (CIRISPersist#988 item 4) — every goal declaration,
+            // refolded through the live writer.
+            SiloProjection::Goals => {
+                let mut client = self
+                    .get_client()
+                    .await
+                    .map_err(|e| Error::Backend(e.to_string()))?;
+                return pg_goal_projection_rebuild(&mut client).await;
+            }
         };
         let mut client = self
             .get_client()
@@ -23436,7 +23350,8 @@ impl crate::federation::attestation_admit::AttestationStore for PostgresBackend 
                 | SiloProjection::FederationRevocations
                 | SiloProjection::IdentityOccurrences
                 | SiloProjection::CreditsLedger
-                | SiloProjection::ExpertiseLedger => {}
+                | SiloProjection::ExpertiseLedger
+                | SiloProjection::Goals => {}
                 SiloProjection::HardCaseEvents => {
                     if let Some(event) = crate::federation::hard_case::project_hard_case_row(&row) {
                         pg_project_hard_case(&*tx, scratch, &row.attestation_id, &event).await?;
@@ -23800,6 +23715,12 @@ impl crate::federation::attestation_admit::AttestationStore for PostgresBackend 
             // transaction, when it supersedes the held one.
             if let Some(ledger) = &planned.projected_ledger {
                 pg_project_ledger(&*tx, None, ledger).await?;
+            }
+            // v60.0.0 (CIRISPersist#988 item 4) — the goal this row touches,
+            // refolded from the rows now held (this one included), in the
+            // row's transaction.
+            if let Some(goal_id) = &planned.projected_goal {
+                pg_project_goal(&*tx, "cirislens.goals", goal_id).await?;
             }
         }
         tx.commit()
@@ -26173,70 +26094,205 @@ fn pg_row_to_signed_community_membership_widening(
     })
 }
 
-/// v2.10.0 (CIRISPersist#114) — Postgres row → [`crate::federation::Goal`].
-/// SELECT statements that consume this MUST include the typed
-/// columns the converter pulls by name; the `persist_row_hash`
-/// column is not part of the value (consumers recompute via
-/// `compute_persist_row_hash` on demand).
+/// v60.0.0 (CIRISPersist#988 item 4) — the `goals` columns a read selects.
+const PG_GOAL_COLUMNS: &str = "goal_id, declared_by_key_id, declared_at, goal_text, scale, \
+     scope_cohort_id, meta_dimension, meta_rationale, meta_deliberation, retired_at, \
+     attestation_id, score";
+
+/// v60.0.0 (CIRISPersist#988 item 4) — a projection row →
+/// [`Goal`](crate::federation::Goal). A row the CHECKs and the writer would
+/// not produce fails the read rather than inventing a value.
 fn pg_row_to_goal(
     row: tokio_postgres::Row,
 ) -> Result<crate::federation::Goal, crate::federation::Error> {
-    let mk_err = crate::federation::Error::Backend;
-    let goal_id: uuid::Uuid = row.safe_get_with("goal_id", mk_err)?;
-    let declared_by_key_id: String = row.safe_get_with("declared_by_key_id", mk_err)?;
-    let declared_at: chrono::DateTime<chrono::Utc> = row.safe_get_with("declared_at", mk_err)?;
-    let goal_text: String = row.safe_get_with("goal_text", mk_err)?;
-    let scope_kind: String = row.safe_get_with("scope_kind", mk_err)?;
-    let scope_cohort_id: Option<String> = row.safe_get_with("scope_cohort_id", mk_err)?;
-    let meta_dimension_text: String = row.safe_get_with("meta_dimension", mk_err)?;
-    let meta_rationale: String = row.safe_get_with("meta_rationale", mk_err)?;
-    let meta_deliberation: Option<serde_json::Value> =
-        row.safe_get_with("meta_deliberation", mk_err)?;
-    let retired_at: Option<chrono::DateTime<chrono::Utc>> =
-        row.safe_get_with("retired_at", mk_err)?;
-
-    let scope = match scope_kind.as_str() {
-        "single_declarer" => crate::federation::GoalScope::SingleDeclarer,
-        "federation" => crate::federation::GoalScope::Federation,
-        "cohort" => {
-            let cohort_id = scope_cohort_id.ok_or_else(|| {
-                crate::federation::Error::Backend(
-                    "scope_kind=cohort but scope_cohort_id IS NULL (CHECK bypass?)".into(),
-                )
-            })?;
-            crate::federation::GoalScope::Cohort { cohort_id }
-        }
-        other => {
-            return Err(crate::federation::Error::Backend(format!(
-                "unknown scope_kind: {other}"
-            )));
-        }
-    };
-    let dimension = crate::federation::M1Dimension::from_wire_str(&meta_dimension_text)
-        .ok_or_else(|| {
-            crate::federation::Error::Backend(format!(
-                "unknown meta_dimension: {meta_dimension_text}"
-            ))
-        })?;
-    let deliberation_ref: Option<crate::federation::DeliberationRef> = match meta_deliberation {
-        None => None,
-        Some(serde_json::Value::Null) => None,
-        Some(v) => Some(serde_json::from_value(v).map_err(|e| {
-            crate::federation::Error::Backend(format!("deliberation_ref decode: {e}"))
-        })?),
-    };
-    let alignment =
-        crate::federation::MetaGoalAlignment::new(dimension, meta_rationale, deliberation_ref);
-    let mut goal = crate::federation::Goal::new(
-        goal_id,
-        declared_by_key_id,
-        declared_at,
-        goal_text,
+    use crate::federation::Error;
+    let mk = Error::Backend;
+    let scale: String = row.safe_get_with("scale", mk)?;
+    let cohort: Option<String> = row.safe_get_with("scope_cohort_id", mk)?;
+    let scope = crate::federation::GoalScope::new(&scale, cohort.as_deref()).map_err(mk)?;
+    let dimension: String = row.safe_get_with("meta_dimension", mk)?;
+    let dimension = crate::federation::M1Dimension::from_wire_str(&dimension)
+        .ok_or_else(|| mk(format!("meta_dimension {dimension:?}")))?;
+    let deliberation: Option<serde_json::Value> = row.safe_get_with("meta_deliberation", mk)?;
+    let deliberation_ref = deliberation
+        .map(|v| serde_json::from_value(v).map_err(|e| mk(format!("deliberation_ref: {e}"))))
+        .transpose()?;
+    Ok(crate::federation::Goal {
+        goal_id: row.safe_get_with("goal_id", mk)?,
+        declared_by_key_id: row.safe_get_with("declared_by_key_id", mk)?,
+        declared_at: row.safe_get_with("declared_at", mk)?,
+        goal_text: row.safe_get_with("goal_text", mk)?,
         scope,
-        alignment,
-    );
-    goal.retired_at = retired_at;
-    Ok(goal)
+        meta_goal_alignment: crate::federation::MetaGoalAlignment::new(
+            dimension,
+            row.safe_get_with("meta_rationale", mk)?,
+            deliberation_ref,
+        ),
+        score: row.safe_get_with("score", mk)?,
+        retired_at: row.safe_get_with("retired_at", mk)?,
+        attestation_id: row.safe_get_with("attestation_id", mk)?,
+    })
+}
+
+/// v60.0.0 (CIRISPersist#988 item 4) — **the goal writer**: refold the
+/// declaration `goal_id` from the rows held in the transaction (the
+/// [`goal_projection`](crate::federation::goal_projection) steps, over the
+/// async client) and replace its row in `table` (`cirislens.goals`, or a
+/// rebuild's scratch table), or remove it. A transaction-scoped advisory lock
+/// on the goal serialises two writers refolding it. The live put step and
+/// the rebuild both write through this.
+async fn pg_project_goal<C>(
+    client: &C,
+    table: &str,
+    goal_id: &str,
+) -> Result<(), crate::federation::Error>
+where
+    C: tokio_postgres::GenericClient + Sync,
+{
+    use crate::federation::goal_projection as gp;
+    use crate::federation::types::attestation_type as t;
+    use crate::federation::Error;
+    client
+        .execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended('goal:' || $1, 0))",
+            &[&goal_id],
+        )
+        .await
+        .map_err(|e| Error::Backend(format!("goal lock: {e}")))?;
+    let get = |id: String| async move {
+        let r = client
+            .query_opt(
+                &format!(
+                    "SELECT {PG_ATTESTATION_COLUMNS} FROM cirislens.federation_attestations \
+                     WHERE attestation_id = $1"
+                ),
+                &[&id],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("goal row: {e}")))?;
+        r.map(pg_row_to_attestation).transpose()
+    };
+    let naming = |id: String| async move {
+        let rows = client
+            .query(
+                &format!(
+                    "SELECT {PG_ATTESTATION_COLUMNS} FROM cirislens.federation_attestations \
+                     WHERE tier = 'federation' AND attestation_type IN ($2, $3, $4) \
+                       AND (attestation_envelope::jsonb ->> 'references_attestation_id') = $1 \
+                     ORDER BY asserted_at DESC"
+                ),
+                &[&id, &t::WITHDRAWS, &t::RECANTS, &t::SUPERSEDES],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("goal composers: {e}")))?;
+        rows.into_iter()
+            .map(pg_row_to_attestation)
+            .collect::<Result<Vec<_>, Error>>()
+    };
+    // `refold_goal`'s three steps, over the async reads.
+    let projected = match get(goal_id.to_owned()).await? {
+        // `fold_goal` answers `None` for a row that is not a goal declaration.
+        Some(decl) => {
+            let naming_decl = naming(goal_id.to_owned()).await?;
+            let mut head = decl.clone();
+            let mut naming_head = naming_decl.clone();
+            for _ in 0..gp::MAX_GOAL_CHAIN {
+                let Some(next) = gp::chain_next(&decl, &naming_head).cloned() else {
+                    break;
+                };
+                naming_head = naming(next.attestation_id.clone()).await?;
+                head = next;
+            }
+            gp::fold_goal(&decl, &naming_decl, &head)
+        }
+        _ => None,
+    };
+    client
+        .execute(
+            &format!("DELETE FROM {table} WHERE goal_id = $1"),
+            &[&goal_id],
+        )
+        .await
+        .map_err(|e| Error::Backend(format!("goal delete: {e}")))?;
+    let Some(p) = projected else {
+        return Ok(());
+    };
+    let deliberation: Option<serde_json::Value> = p
+        .body
+        .meta_goal_alignment
+        .deliberation_ref
+        .as_ref()
+        .map(|d| serde_json::json!(d));
+    client
+        .execute(
+            &format!(
+                "INSERT INTO {table} (goal_id, declared_by_key_id, declared_at, goal_text, \
+                    goal_text_canonical, scale, scope_cohort_id, meta_dimension, \
+                    meta_rationale, meta_deliberation, retired_at, persist_row_hash, \
+                    attestation_id, score) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)"
+            ),
+            &[
+                &p.goal_id,
+                &p.declared_by_key_id,
+                &p.declared_at,
+                &p.body.goal_text,
+                &p.goal_text_canonical(),
+                &p.body.scope.scale(),
+                &p.body.scope.cohort_id(),
+                &p.body.meta_goal_alignment.dimension.as_str(),
+                &p.body.meta_goal_alignment.rationale,
+                &deliberation,
+                &p.retired_at,
+                &p.persist_row_hash,
+                &p.attestation_id,
+                &p.body.score,
+            ],
+        )
+        .await
+        .map_err(|e| Error::Backend(format!("goal insert: {e}")))?;
+    Ok(())
+}
+
+/// v60.0.0 (CIRISPersist#988 item 4) — the goals' from-rows rebuild: every
+/// goal declaration held, refolded through the live writer into a scratch
+/// table of the live table's shape; both rendered as `row_to_json(..)::text`
+/// and sorted.
+async fn pg_goal_projection_rebuild(
+    client: &mut deadpool_postgres::Object,
+) -> Result<crate::federation::silo_projection::ProjectionRebuild, crate::federation::Error> {
+    use crate::federation::Error;
+    let scratch = "_rebuild_goals";
+    let tx = client
+        .transaction()
+        .await
+        .map_err(|e| Error::Backend(format!("begin tx: {e}")))?;
+    tx.batch_execute(&format!(
+        "CREATE TEMP TABLE {scratch} (LIKE cirislens.goals INCLUDING DEFAULTS) ON COMMIT DROP"
+    ))
+    .await
+    .map_err(|e| Error::Backend(format!("goal rebuild scratch: {e}")))?;
+    let ids = tx
+        .query(
+            "SELECT attestation_id FROM cirislens.federation_attestations \
+             WHERE attestation_type = 'scores' AND substr(dimension, 1, length($1)) = $1 \
+             ORDER BY attestation_id",
+            &[&crate::federation::goal::GOAL_DIMENSION_PREFIX],
+        )
+        .await
+        .map_err(|e| Error::Backend(format!("goal rebuild rows: {e}")))?;
+    for r in ids {
+        let id: String = r.safe_get_with(0, Error::Backend)?;
+        pg_project_goal(&*tx, scratch, &id).await?;
+    }
+    let mut live = pg_render_table(&*tx, "cirislens.goals", "goal_id").await?;
+    let mut rebuilt = pg_render_table(&*tx, scratch, "goal_id").await?;
+    live.sort();
+    rebuilt.sort();
+    tx.rollback()
+        .await
+        .map_err(|e| Error::Backend(format!("goal rebuild rollback: {e}")))?;
+    Ok(crate::federation::silo_projection::ProjectionRebuild { live, rebuilt })
 }
 
 /// v0.3.5 (CIRISLens#8 ASK 3) — Convert a postgres row from
@@ -45728,345 +45784,6 @@ mod tests {
             .await
             .unwrap();
         assert!(graph.edges.is_empty());
-    }
-
-    // ── v2.10.0 (CIRISPersist#114) — typed Goal primitive tests ────
-
-    fn fixture_pg_goal(
-        declared_by_key_id: &str,
-        scope: crate::federation::GoalScope,
-        dimension: crate::federation::M1Dimension,
-        declared_at: chrono::DateTime<chrono::Utc>,
-    ) -> crate::federation::Goal {
-        crate::federation::Goal::new(
-            uuid::Uuid::new_v4(),
-            declared_by_key_id.into(),
-            declared_at,
-            format!("goal text for {declared_by_key_id}"),
-            scope,
-            crate::federation::MetaGoalAlignment::new(dimension, "pg rationale".into(), None),
-        )
-    }
-
-    /// v2.10.0 (#114) — put + get_goal round-trip is byte-exact on PG.
-    #[tokio::test]
-    #[serial_test::serial(postgres)]
-    async fn put_get_goal_round_trip_pg() {
-        use crate::federation::FederationDirectory;
-        let Some(dsn) = pg_dsn() else {
-            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
-            return;
-        };
-        let backend = PostgresBackend::connect(&dsn).await.unwrap();
-        backend.run_migrations().await.unwrap();
-        let kid = format!("k-goal-{}", uuid_like());
-        backend
-            .put_public_key(crate::federation::SignedKeyRecord {
-                record: fix_section_i_key(&kid, "agent-goal", chrono::Utc::now(), false),
-            })
-            .await
-            .unwrap();
-        let when: chrono::DateTime<chrono::Utc> = "2026-05-28T12:00:00Z".parse().unwrap();
-        let goal = fixture_pg_goal(
-            &kid,
-            crate::federation::GoalScope::SingleDeclarer,
-            crate::federation::M1Dimension::Plurality,
-            when,
-        );
-        backend.put_goal(goal.clone()).await.unwrap();
-        let fetched = backend.get_goal(goal.goal_id).await.unwrap();
-        assert_eq!(fetched, Some(goal));
-    }
-
-    /// v2.10.0 (#114) — list_goals filter combinations preserve
-    /// stable lex order by (declared_at, goal_id) on PG.
-    #[tokio::test]
-    #[serial_test::serial(postgres)]
-    async fn list_goals_filters_and_order_pg() {
-        use crate::federation::FederationDirectory;
-        let Some(dsn) = pg_dsn() else {
-            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
-            return;
-        };
-        let backend = PostgresBackend::connect(&dsn).await.unwrap();
-        backend.run_migrations().await.unwrap();
-        let suffix = uuid_like();
-        let k_a = format!("k-a-{suffix}");
-        let k_b = format!("k-b-{suffix}");
-        for (kid, ident) in [(&k_a, "agent-a"), (&k_b, "agent-b")] {
-            backend
-                .put_public_key(crate::federation::SignedKeyRecord {
-                    record: fix_section_i_key(kid, ident, chrono::Utc::now(), false),
-                })
-                .await
-                .unwrap();
-        }
-        let t0: chrono::DateTime<chrono::Utc> = "2026-05-28T12:00:00Z".parse().unwrap();
-        let t1: chrono::DateTime<chrono::Utc> = "2026-05-28T13:00:00Z".parse().unwrap();
-        let g_a_plurality = fixture_pg_goal(
-            &k_a,
-            crate::federation::GoalScope::SingleDeclarer,
-            crate::federation::M1Dimension::Plurality,
-            t0,
-        );
-        let cohort_name = format!("stewards-{suffix}");
-        let g_a_justice = fixture_pg_goal(
-            &k_a,
-            crate::federation::GoalScope::Cohort {
-                cohort_id: cohort_name.clone(),
-            },
-            crate::federation::M1Dimension::Justice,
-            t1,
-        );
-        let g_b_plurality = fixture_pg_goal(
-            &k_b,
-            crate::federation::GoalScope::Federation,
-            crate::federation::M1Dimension::Plurality,
-            t0,
-        );
-        for g in [
-            g_a_plurality.clone(),
-            g_a_justice.clone(),
-            g_b_plurality.clone(),
-        ] {
-            backend.put_goal(g).await.unwrap();
-        }
-        let by_key = backend
-            .list_goals(crate::federation::GoalsFilter {
-                declared_by_key_id: Some(k_a.clone()),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        assert_eq!(by_key.len(), 2);
-        assert!(by_key.iter().all(|g| g.declared_by_key_id == k_a));
-        assert!(by_key[0].declared_at <= by_key[1].declared_at);
-        let by_cohort = backend
-            .list_goals(crate::federation::GoalsFilter {
-                scope_kind: Some("cohort".into()),
-                cohort_id: Some(cohort_name.clone()),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        assert_eq!(by_cohort.len(), 1);
-        assert_eq!(by_cohort[0].goal_id, g_a_justice.goal_id);
-    }
-
-    /// v2.10.0 (#114) — all 7 M1Dimension variants round-trip on PG.
-    #[tokio::test]
-    #[serial_test::serial(postgres)]
-    async fn all_m1_dimension_variants_round_trip_pg() {
-        use crate::federation::FederationDirectory;
-        let Some(dsn) = pg_dsn() else {
-            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
-            return;
-        };
-        let backend = PostgresBackend::connect(&dsn).await.unwrap();
-        backend.run_migrations().await.unwrap();
-        let kid = format!("k-all-{}", uuid_like());
-        backend
-            .put_public_key(crate::federation::SignedKeyRecord {
-                record: fix_section_i_key(&kid, "agent-all", chrono::Utc::now(), false),
-            })
-            .await
-            .unwrap();
-        let when: chrono::DateTime<chrono::Utc> = "2026-05-28T12:00:00Z".parse().unwrap();
-        let all = [
-            crate::federation::M1Dimension::Sustainability,
-            crate::federation::M1Dimension::Adaptivity,
-            crate::federation::M1Dimension::Coherence,
-            crate::federation::M1Dimension::Plurality,
-            crate::federation::M1Dimension::Flourishing,
-            crate::federation::M1Dimension::Justice,
-            crate::federation::M1Dimension::Wonder,
-        ];
-        let mut ids = Vec::new();
-        for (i, dim) in all.iter().enumerate() {
-            let g = fixture_pg_goal(
-                &kid,
-                crate::federation::GoalScope::SingleDeclarer,
-                *dim,
-                when + chrono::Duration::seconds(i as i64),
-            );
-            ids.push((g.goal_id, *dim));
-            backend.put_goal(g).await.unwrap();
-        }
-        for (id, expected) in ids {
-            let got = backend.get_goal(id).await.unwrap().expect("present");
-            assert_eq!(got.meta_goal_alignment.dimension, expected);
-        }
-    }
-
-    /// v2.10.0 (#114) — Cohort scope round-trip + the
-    /// goals_scope_cohort_discriminant CHECK constraint rejects a
-    /// direct-SQL bypass.
-    #[tokio::test]
-    #[serial_test::serial(postgres)]
-    async fn cohort_scope_round_trip_and_check_rejects_bypass_pg() {
-        use crate::federation::FederationDirectory;
-        let Some(dsn) = pg_dsn() else {
-            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
-            return;
-        };
-        let backend = PostgresBackend::connect(&dsn).await.unwrap();
-        backend.run_migrations().await.unwrap();
-        let kid = format!("k-c-{}", uuid_like());
-        backend
-            .put_public_key(crate::federation::SignedKeyRecord {
-                record: fix_section_i_key(&kid, "agent-c", chrono::Utc::now(), false),
-            })
-            .await
-            .unwrap();
-        let when: chrono::DateTime<chrono::Utc> = "2026-05-28T12:00:00Z".parse().unwrap();
-        let g = fixture_pg_goal(
-            &kid,
-            crate::federation::GoalScope::Cohort {
-                cohort_id: format!("cohort-{}", uuid_like()),
-            },
-            crate::federation::M1Dimension::Plurality,
-            when,
-        );
-        backend.put_goal(g.clone()).await.unwrap();
-        let got = backend.get_goal(g.goal_id).await.unwrap().expect("present");
-        assert!(matches!(
-            got.scope,
-            crate::federation::GoalScope::Cohort { .. }
-        ));
-
-        // Direct-SQL bypass attempt: scope_kind='cohort' with
-        // scope_cohort_id NULL must hit the CHECK constraint.
-        let client = backend.get_client().await.unwrap();
-        let bypass_id = uuid::Uuid::new_v4();
-        let when_pg = chrono::Utc::now();
-        let res = client
-            .execute(
-                "INSERT INTO cirislens.goals (\
-                    goal_id, declared_by_key_id, declared_at, goal_text, \
-                    goal_text_canonical, scope_kind, scope_cohort_id, \
-                    meta_dimension, meta_rationale, meta_deliberation, \
-                    retired_at, persist_row_hash\
-                 ) VALUES ($1, $2, $3, 'x', 'x', 'cohort', NULL, \
-                          'plurality', 'r', NULL, NULL, 'h')",
-                &[&bypass_id, &kid, &when_pg],
-            )
-            .await;
-        assert!(
-            res.is_err(),
-            "schema CHECK must reject scope_kind='cohort' with NULL scope_cohort_id"
-        );
-    }
-
-    /// v2.10.0 (#114) — retire_goal hides from default list;
-    /// include_retired=true includes it; second retire is idempotent.
-    #[tokio::test]
-    #[serial_test::serial(postgres)]
-    async fn retire_goal_hides_from_default_list_pg() {
-        use crate::federation::FederationDirectory;
-        let Some(dsn) = pg_dsn() else {
-            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
-            return;
-        };
-        let backend = PostgresBackend::connect(&dsn).await.unwrap();
-        backend.run_migrations().await.unwrap();
-        let kid = format!("k-r-{}", uuid_like());
-        backend
-            .put_public_key(crate::federation::SignedKeyRecord {
-                record: fix_section_i_key(&kid, "agent-r", chrono::Utc::now(), false),
-            })
-            .await
-            .unwrap();
-        let when: chrono::DateTime<chrono::Utc> = "2026-05-28T12:00:00Z".parse().unwrap();
-        let g = fixture_pg_goal(
-            &kid,
-            crate::federation::GoalScope::SingleDeclarer,
-            crate::federation::M1Dimension::Wonder,
-            when,
-        );
-        backend.put_goal(g.clone()).await.unwrap();
-        let retired_at = when + chrono::Duration::hours(1);
-        backend.retire_goal(g.goal_id, retired_at).await.unwrap();
-        // Default list filtered by declarer should not include the
-        // retired goal.
-        let live = backend
-            .list_goals(crate::federation::GoalsFilter {
-                declared_by_key_id: Some(kid.clone()),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        assert!(live.iter().all(|x| x.goal_id != g.goal_id));
-        // include_retired=true includes it.
-        let all = backend
-            .list_goals(crate::federation::GoalsFilter {
-                declared_by_key_id: Some(kid.clone()),
-                include_retired: true,
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        let found = all.iter().find(|x| x.goal_id == g.goal_id).expect("found");
-        let original_retired_at = found.retired_at.expect("retired");
-        // Idempotent second retire.
-        backend
-            .retire_goal(g.goal_id, retired_at + chrono::Duration::hours(1))
-            .await
-            .unwrap();
-        let again = backend.get_goal(g.goal_id).await.unwrap().expect("present");
-        assert_eq!(
-            again.retired_at,
-            Some(original_retired_at),
-            "second retire must not change retired_at"
-        );
-    }
-
-    /// v2.10.0 (#114) — put_goal rejects with InvalidArgument when
-    /// declared_by_key_id is not in federation_keys (FK enforcement).
-    #[tokio::test]
-    #[serial_test::serial(postgres)]
-    async fn put_goal_rejects_unknown_declarer_pg() {
-        use crate::federation::FederationDirectory;
-        let Some(dsn) = pg_dsn() else {
-            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
-            return;
-        };
-        let backend = PostgresBackend::connect(&dsn).await.unwrap();
-        backend.run_migrations().await.unwrap();
-        let when: chrono::DateTime<chrono::Utc> = "2026-05-28T12:00:00Z".parse().unwrap();
-        let g = fixture_pg_goal(
-            &format!("ghost-{}", uuid_like()),
-            crate::federation::GoalScope::SingleDeclarer,
-            crate::federation::M1Dimension::Coherence,
-            when,
-        );
-        let err = backend.put_goal(g).await.expect_err("FK must reject");
-        assert!(
-            matches!(err, crate::federation::Error::InvalidArgument(_)),
-            "got: {err:?}"
-        );
-    }
-
-    /// v2.10.0 (#114) — retire_goal against unknown goal_id rejects
-    /// with InvalidArgument (not a silent no-op).
-    #[tokio::test]
-    #[serial_test::serial(postgres)]
-    async fn retire_goal_unknown_id_rejects_pg() {
-        use crate::federation::FederationDirectory;
-        let Some(dsn) = pg_dsn() else {
-            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
-            return;
-        };
-        let backend = PostgresBackend::connect(&dsn).await.unwrap();
-        backend.run_migrations().await.unwrap();
-        let when = chrono::Utc::now();
-        let err = backend
-            .retire_goal(uuid::Uuid::new_v4(), when)
-            .await
-            .expect_err("missing goal_id must reject");
-        assert!(
-            matches!(err, crate::federation::Error::InvalidArgument(_)),
-            "got: {err:?}"
-        );
     }
 
     // ── v3.1.0 (CIRISPersist#117) — peer-mutation surface ──────────

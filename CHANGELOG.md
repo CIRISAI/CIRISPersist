@@ -167,6 +167,106 @@ bundle path needs no change this release.
   the door's row reader and the planner; CLM-silo-projection-rebuildable
   (2.4.2) at the ledger projection; `EXPECTED` 318.
 
+### Changed — a Goal is a signed `goal:{scale}:v1` row (CIRISPersist#988 item 4, CC 3.1.9.7)
+
+Signed attestations are the only state. A Goal was a typed value written by
+`put_goal` into `goals`, never signed by its declarer and never replicated by
+persist. It is now the declarer's `scores` row on `goal:{scale}:v1`, and its
+lifecycle is the structural verbs:
+
+| act | row |
+|---|---|
+| declare | `scores` on `goal:{scale}:v1`; `goal_id` is its `attestation_id` |
+| amend | the declarer's `supersedes` naming the goal's current head, carrying the whole new body |
+| retire | the declarer's `withdraws` naming the declaration; `retired_at` is its signed instant |
+| "never mine" | the declarer's `recants` naming the declaration; the goal leaves the projection |
+
+- **The scale.** CC 3.1.9.7's open `{scale}` vocabulary: the v59 `GoalScope`
+  maps `single_declarer` → `self`, `cohort` → `cohort` (the cohort id as the
+  envelope member `cohort_id`), `federation` → `federation`; any other
+  lowercase vocabulary token admits as the registry admits it.
+- **M-1 is the family's admission gate** (`goal::check_goal_row_admission`,
+  run by the plane's put door for local and replicated rows): a goal
+  declaration or amendment whose envelope lacks a well-formed
+  `meta_goal_alignment` (a dimension in the seven, a non-empty rationale, an
+  optional well-formed `deliberation_ref`, nothing else) is
+  `federation_malformed_row` with reason **`goal_meta_alignment_malformed`**;
+  any other body defect (dimension not a clean `goal:{scale}:v1` leaf, empty
+  `goal_text`, `cohort_id` present iff not `cohort`, score outside `[-1, 1]`)
+  is **`goal_body_malformed`**. A `supersedes` naming a held goal row must be
+  its declarer's and carry the body (`federation_invalid_argument`
+  otherwise). Three reasons appended to `malformed_row::ALL`:
+  `goal_meta_alignment_malformed`, `goal_body_malformed`,
+  `goal_typed_object_retired`.
+- **A negative score** is the declarer's stance: positive pursues the stated
+  state of affairs, negative declares it a state the declarer works against
+  (an avoidance goal); the magnitude is the commitment. It is still a
+  declaration; it never retires or disowns anything.
+- **`goals` is a projection** (`goal_projection`, `SiloProjection::Goals`): one
+  row per declaration held (any declarer's), the head's body, written by the
+  attestation executor in the row's transaction on every backend and
+  byte-equal to its from-rows rebuild. Rows arriving out of order fold the
+  same (each row of a chain refolds its declaration). **V204** (both
+  dialects) rebuilds the table: `scope_kind` → `scale` (`single_declarer`
+  rewritten `self`; the closed scope CHECK dropped, the cohort discriminant
+  kept), `goal_id` TEXT on postgres, new `attestation_id` (the head row,
+  CASCADE) and `score`, `inserted_at` dropped (a write clock is not a
+  function of the rows). A pre-V204 goal keeps `attestation_id` NULL, is not
+  returned by the reads, and is red in the rebuild until
+  `Engine::rehome_legacy_goals` moves it: this node's own goal is re-signed as
+  a row (its retirement re-signed as a `withdraws`); another declarer's is
+  removed (persist cannot sign for it, and the typed row never carried its
+  signature); one the gate would refuse is removed.
+- **No replication compat read.** Persist never replicated a Goal (no
+  replication kind carried one); CIRISEdge carried its own `GoalDeclaration` /
+  `GoalRetirement` messages wrapping persist's `Goal`, which Edge retires at
+  S7. A goal now crosses as the row.
+
+**Python surface:**
+
+| method | v59 | v60 |
+|---|---|---|
+| `cirisnode_put_goal_json` | `(goal_json) -> None` (a typed `Goal`) | `(body_json) -> str` (`{goal_text, scale, cohort_id?, meta_goal_alignment, score?}`; returns the goal id; a v59 `Goal` raises `goal_typed_object_retired`) |
+| `cirisnode_retire_goal_json` | `(goal_id, retired_at_rfc3339) -> None` | `(goal_id) -> str` (the `withdraws` row id; the instant is the row's) |
+| `cirisnode_get_goal_json` | `goal_id` a UUID | `goal_id` the declaration's row id; the JSON carries `scale` / `cohort_id` (not `scope`), `score`, `attestation_id` |
+| `cirisnode_list_goals_json` | filter `scope_kind` | filter `scale`; unknown keys refused |
+| `cirisnode_amend_goal_json` | — | NEW `(goal_id, body_json) -> str` |
+| `cirisnode_recant_goal_json` | — | NEW `(goal_id) -> str` |
+| `cirisnode_rehome_goals` | — | NEW `() -> str` (`{"rehomed": n, "dropped": n}`) |
+| `cirisnode_check_goal_projection` | — | NEW `() -> str` (`{"live": n, "rebuilt": n}`) |
+
+**Rust surface (clean break):** `FederationDirectory::put_goal` and
+`retire_goal` are gone; `get_goal` takes `&str`; `legacy_goals` /
+`delete_legacy_goal` are added. `Goal::new` is gone and `Goal` is the
+projection's read type (`goal_id: String`, `scope`, `score`,
+`attestation_id`); `GoalScope` is a validated `{scale, cohort_id}`
+(`GoalScope::new`); `GoalsFilter::scope_kind` is `scale`. New: `GoalInput`,
+`LegacyGoal`, `GoalRehome`, `goal::{parse_goal_body, check_goal_row_admission,
+plan_goal_row, plan_goal_amendment_row, plan_goal_retraction_row,
+decode_goal_input}`, `goal_projection`, and `Engine::{put_goal, amend_goal,
+retire_goal, recant_goal, rehome_legacy_goals}`. **Edge adapts** (S7): its
+`GoalDeclaration` wraps `ciris_persist::federation::goal::Goal` and its test
+builds one with `Goal::new`; both retire with the two message types.
+
+- Witnesses: **I1174–I1176** (unit) the scales, the M-1 rule, the four
+  planners and the retired typed body refused by name; **I1177** (unit) the
+  fold; **I1178** (memory, sqlite, postgres) the projection through the put
+  door, out of order included; **I1179** (memory, sqlite, postgres) the M-1
+  gate at the door; **I1180** (sqlite and postgres engines) the four Engine
+  doors, the declarer rule and the rehome; **I1181** (sqlite, postgres) V204
+  over an upgrading store; **I1182** (memory, sqlite, postgres)
+  `approach:{goal_id}` binds the goal's row id. Python:
+  `tests/python/test_goal_rows_surface.py`.
+- Mutation scope `scripts/mutants/scope-s2-goals.txt`: 155 mutants in three
+  shards, 127 caught, 28 unviable, 0 missed, nothing allow-listed (two rounds:
+  the first left six survivors; four were witness gaps, now witnessed, and two
+  were equivalent forms of a redundant test, now removed). Weekly, three
+  shards, in `mutants.yml`.
+- Evidence: CLM-nsproc-meta-goal-alignment-goal-scale (3.1.9.7) moves from
+  the retired `Goal::new` to `check_goal_row_admission`;
+  CLM-silo-projection-rebuildable (2.4.2) at `goal_projection::fold_goal`;
+  `EXPECTED` 319.
+
 ### Changed — hard_case rows replicate (CIRISConstitution#170 closed)
 
 The steward ruled through CC (2026-10-21, CIRISConstitution#170 closed, rc9

@@ -2636,6 +2636,12 @@ class Engine:
     def cirisgraph_upsert_node(self, node_json: str, expected_version: int, bulk_import: bool = False) -> None:
         """(derived) empirical — v0.8.0 — Upsert a graph node with AV-48 optimistic-concurrency gate. Pass expected_version = 0 for new rows; current version for updates. [build-conditional: #[cfg(feature = "cirisgraph")]]"""
 
+    def cirisnode_amend_goal_json(self, goal_id: str, body_json: str) -> str:
+        """(derived) empirical — v60.0.0 — Amend a goal: the engine's supersedes of the goal's current head, carrying the whole new body (body_json as [Self::cirisnode_put_goal_jso..."""
+
+    def cirisnode_check_goal_projection(self) -> str:
+        """(derived) empirical — v60.0.0 — the goals projection's from-rows rebuild check. Returns JSON {"live": n, "rebuilt": n} when byte-equal; raises naming the first row that..."""
+
     def cirisnode_check_ledger_projection(self, projection: str) -> str:
         """(derived) empirical — v60.0.0 — the ledger projection's from-rows rebuild check: projection is credits_ledger or expertise_ledger. Returns JSON {"live": n, "rebuilt": n}... [build-conditional: #[cfg(feature = "cirisnode")]]"""
 
@@ -2643,7 +2649,7 @@ class Engine:
         """(derived) empirical — v2.1 (CIRISPersist#101) — Count delivery attestations for an announcement. [build-conditional: #[cfg(feature = "cirisnode")]]"""
 
     def cirisnode_get_goal_json(self, goal_id: str) -> str | None:
-        """(derived) empirical — Federation directory: fetch a Goal by goal_id."""
+        """(derived) empirical — Federation directory: the projected Goal whose declaration row is goal_id, as JSON, or None."""
 
     def cirisnode_list_contributions(self, author_id: str, filter_json: str | None = None, cursor_json: str | None = None, limit: int = 100) -> str:
         """(derived) empirical — v60.0.0 — author_id's Contribution rows, newest first. filter_json is an optional [ContributionsFilter](crate::cirisnode::ContributionsFilter) (con... [build-conditional: #[cfg(feature = "cirisnode")]]"""
@@ -2652,7 +2658,7 @@ class Engine:
         """(derived) empirical — v2.1 (CIRISPersist#101) — List all delivery attestations for an announcement, newest first. JSON array of DeliveryAttestation. [build-conditional: #[cfg(feature = "cirisnode")]]"""
 
     def cirisnode_list_goals_json(self, goals_filter_json: str) -> str:
-        """(derived) empirical — Federation directory: list goals matching goals_filter_json."""
+        """(derived) empirical — Federation directory: the projected goals matching goals_filter_json (declared_by_key_id, m1_dimension, scale, cohort_id, include_retired; all opti..."""
 
     def cirisnode_list_takedowns_for_filtered_json(self, target_content_sha256: str, filter_json: str | None = None, cursor_json: str | None = None, limit: int = 100) -> str:
         """(derived) empirical — v6.3.0 (CIRISPersist#135) → v60.0.0 — takedown notice rows over target_content_sha256, newest first. filter_json MUST name claimant_key_id (rows ar... [build-conditional: #[cfg(feature = "cirisnode")]]"""
@@ -2663,11 +2669,14 @@ class Engine:
     def cirisnode_put_contribution(self, body_json: str) -> str:
         """(derived) empirical — v60.0.0 — Put a Contribution: body_json is a [ContributionInput](crate::cirisnode::ContributionInput) (contribution_type, subject, payload, optiona... [build-conditional: #[cfg(feature = "cirisnode")]]"""
 
-    def cirisnode_put_goal_json(self, goal_json: str) -> None:
-        """(derived) empirical — Federation directory: insert a typed Goal."""
+    def cirisnode_put_goal_json(self, body_json: str) -> str:
+        """(derived) empirical — v60.0.0 — Declare a goal: body_json is a [GoalInput](crate::federation::GoalInput) (goal_text, scale, cohort_id for cohort, meta_goal_alignment, op..."""
 
-    def cirisnode_retire_goal_json(self, goal_id: str, retired_at_rfc3339: str) -> None:
-        """(derived) empirical — Federation directory: retire a Goal. Idempotent — a second call against an already-retired goal returns Ok without changing the stored retired_at."""
+    def cirisnode_recant_goal_json(self, goal_id: str) -> str:
+        """(derived) empirical — v60.0.0 — Disown a goal ("never mine"): the engine's recants of the declaration; the goal leaves the projection. Only the declarer recants. Returns..."""
+
+    def cirisnode_retire_goal_json(self, goal_id: str) -> str:
+        """(derived) empirical — v60.0.0 — Retire a goal: the engine's withdraws of the declaration; the goal's retired_at is that row's signed instant. Only the declarer retires;..."""
 
     def cohort_active_member_keys_json(self, cohort: str, group_key_id: str) -> str:
         """(derived) empirical — #249 Cut G1 (§2) — active roster of group_key_id resolved to pinned hybrid pubkeys. Returns a JSON array of [crate::federation::types::KeyRecord]...."""
@@ -3700,6 +3709,9 @@ class Engine:
 
     def cirisnode_read_vote_weight(self, contributor_id: str, domain: str, language: str, subject: str) -> str | None:
         """(derived) axiotic — v0.7.0 — Credits × expertise_multiplier × active_tier_multiplier per SCHEMA.md §5.2, from the projections. JSON VoteWeight or None. [build-conditional: #[cfg(feature = "cirisnode")]]"""
+
+    def cirisnode_rehome_goals(self) -> str:
+        """(derived) axiotic — v60.0.0 — Move every pre-V204 typed goal off the goals table: this node's own are re-signed as rows, any other declarer's removed. Returns JSON {"r..."""
 
     def cirisnode_rehome_ledgers(self) -> int:
         """(derived) axiotic — v60.0.0 — re-emit every pre-V203 ledger balance as this node's row (the rehome). Returns how many moved. [build-conditional: #[cfg(feature = "cirisnode")]]"""

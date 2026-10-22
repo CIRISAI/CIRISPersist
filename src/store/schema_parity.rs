@@ -157,7 +157,6 @@ pub(crate) const PG_NARROWED_ID_COLUMNS: &[(&str, &str)] = &[
     ("cirislens.edge_detection_events", "detection_id"),
     ("cirislens.edge_outbound_queue", "queue_id"),
     ("cirislens.federation_trust_grants", "grant_id"),
-    ("cirislens.goals", "goal_id"),
     ("cirislens.incident_records", "incident_id"),
     ("cirislens_derived.detection_events", "detection_id"),
     ("cirislens_secrets.access_log", "secret_uuid"),

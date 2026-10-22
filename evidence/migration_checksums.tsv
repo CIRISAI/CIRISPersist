@@ -379,3 +379,5 @@ sqlite	202	hard_case_event_emitter	6735624047132756008
 postgres	202	hard_case_event_emitter	11487871256818640586
 sqlite	203	cirisnode_silos_onto_scores	11439871028165941212
 postgres	203	cirisnode_silos_onto_scores	8784011894129432790
+sqlite	204	goals_projection	4384451092814095820
+postgres	204	goals_projection	5323446956852667524

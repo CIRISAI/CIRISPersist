@@ -130,6 +130,10 @@ pub(crate) struct PlannedAttestation {
     /// written in the row's transaction when it supersedes the held one
     /// ([`super::ledger_projection::supersedes`]).
     pub(crate) projected_ledger: Option<super::ledger_projection::LedgerProjection>,
+    /// v60.0.0 (CIRISPersist#988 item 4) — the goal declaration this row
+    /// touches ([`super::goal_projection::goal_to_refold`]): the executor
+    /// refolds its `goals` row in the row's transaction, after the insert.
+    pub(crate) projected_goal: Option<String>,
     /// The signed-wire-index locator (#507b), federation tier only; the hash
     /// comes from the stored row (#646).
     pub(crate) wire_index_key: Option<String>,
@@ -1052,6 +1056,11 @@ where
     // takedown authority decision for its signer over the content as this
     // node holds it. A no-op for every other row.
     crate::federation::takedown_tombstone::check_takedown_notice_row_admission(dir, &row).await?;
+    // v60.0.0 (CIRISPersist#988 item 4, CC 3.1.9.7) — the goal family's
+    // gate: a `goal:*` declaration or amendment carries a well-formed body and
+    // M-1 alignment, and a `supersedes` of a held goal is its declarer's
+    // amendment. A no-op for every other row.
+    crate::federation::goal::check_goal_row_admission(dir, &row).await?;
     // v44.6.0 (#857) — a machine author may name only itself in for_key_id.
     crate::federation::admission::check_consent_for_key_admission(dir, &row).await?;
 
@@ -1251,6 +1260,9 @@ where
     // `expertise:` rows only.
     let projected_ledger =
         super::ledger_projection::project_ledger_row(&row, dir.node_key_id().as_deref());
+    // v60.0.0 (CIRISPersist#988 item 4) — the goal declaration this row
+    // touches, refolded by the executor after the insert.
+    let projected_goal = super::goal_projection::goal_to_refold(dir, &row).await?;
     row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
     // v21.1.0 (CIRISPersist#507b) — wire-index this row (federation tier
     // only, the E5 invariant). v31.0.0 (CIRISPersist#646) — only the
@@ -1273,6 +1285,7 @@ where
         projected_detection,
         projected_hard_case,
         projected_ledger,
+        projected_goal,
         wire_index_key,
         cycle_gated,
         received_at,

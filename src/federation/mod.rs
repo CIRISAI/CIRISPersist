@@ -246,6 +246,9 @@ pub mod delegation_cycle_invariants;
 /// door refuses, at the store, an id the bundle does not carry (I954).
 #[cfg(test)]
 pub(crate) mod genesis_purge_door_invariants;
+/// v60.0.0 (CIRISPersist#988 item 4) — I1178–I1182, goals as rows.
+#[cfg(test)]
+mod goal_invariants;
 /// v54.0.0 (CIRISPersist#1033, CC 2.4.1.2.1) — the `grant` scope admits its
 /// holder (I591).
 #[cfg(test)]
@@ -356,6 +359,7 @@ pub mod emit;
 pub mod family_rules;
 pub mod genesis;
 pub mod goal;
+pub mod goal_projection;
 pub(crate) mod group_amendment;
 pub mod hardware_attestation;
 pub mod identity_aggregate;
@@ -785,8 +789,8 @@ pub use crossing::{
 };
 pub use freshness::{coalesce_touch_ts, TouchApplyOutcome};
 pub use goal::{
-    canonicalize_goal_text, DeliberationRef, Goal, GoalScope, GoalsFilter, M1Dimension,
-    MetaGoalAlignment,
+    canonicalize_goal_text, DeliberationRef, Goal, GoalInput, GoalRehome, GoalScope, GoalsFilter,
+    LegacyGoal, M1Dimension, MetaGoalAlignment,
 };
 pub use hard_case::{
     check_admin_action_attribution, AdminActionRefusal, ConsentPromotionOverdueRow, ConsentState,
@@ -8231,51 +8235,30 @@ pub trait FederationDirectory: Send + Sync {
         ))
     }
 
-    // ── Goals (v2.10.0, CIRISPersist#114) ──────────────────────────
+    // v60.0.0 (CIRISPersist#988 item 4) — a Goal is a signed
+    // `goal:{scale}:v1` row (see [`goal`]); the `goals` table is the
+    // projection of the goal rows this node holds ([`goal_projection`]),
+    // written by the attestation plane's executor in the row's transaction.
+    // There is no write door here: a goal is declared, amended, retired and
+    // disowned by rows (`Engine::put_goal` / `amend_goal` / `retire_goal` /
+    // `recant_goal`). These are the projection's reads.
     //
-    // The typed `Goal` primitive (see [`goal`]) carries M-1 alignment
-    // as a structural construction-time invariant — a Goal cannot be
-    // constructed without [`MetaGoalAlignment`]. The persistence
-    // surface mirrors that discipline: every write goes through a
-    // typed `Goal`, never a free-form JSON envelope.
-    //
-    // F-3 detector consumers (CIRISLensCore#23 / #24 / #26) walk
-    // these rows to aggregate goals by `declared_by_key_id` + scope +
-    // `m1_dimension`. The hot path skips retired goals (the
-    // `(retired_at IS NULL)` partial index), so `list_goals` defaults
-    // to live-only via `GoalsFilter::include_retired = false`.
-    //
-    // Defaults route to `Error::Backend(...)` so the memory shim and
-    // any future test-only backend compile cleanly; the real backends
-    // (postgres, sqlite) override every method.
+    // F-3 detector consumers (CIRISLensCore#23 / #24 / #26) walk these rows
+    // to aggregate goals by declarer, scale and M-1 dimension. The hot path
+    // skips retired goals (the `(retired_at IS NULL)` partial index), so
+    // `list_goals` defaults to live-only.
 
-    /// Insert a [`Goal`]. The row is persisted with a server-computed
-    /// `persist_row_hash` over the canonical bytes (same shape as
-    /// `KeyRecord` et al.). Errors:
-    /// - [`Error::InvalidArgument`] when `declared_by_key_id` is not
-    ///   present in `federation_keys` (FK enforcement).
-    /// - [`Error::Conflict`] when `goal_id` is already in the table
-    ///   with content that differs from the submitted row.
-    async fn put_goal(&self, goal: Goal) -> Result<(), Error> {
-        let _ = goal;
-        Err(Error::Backend(
-            "put_goal not implemented for this backend".into(),
-        ))
-    }
-
-    /// Fetch a single [`Goal`] by `goal_id`. Returns `None` when
-    /// absent.
-    async fn get_goal(&self, goal_id: uuid::Uuid) -> Result<Option<Goal>, Error> {
+    /// The projected [`Goal`] whose declaration is `goal_id`, or `None`.
+    async fn get_goal(&self, goal_id: &str) -> Result<Option<Goal>, Error> {
         let _ = goal_id;
         Err(Error::Backend(
             "get_goal not implemented for this backend".into(),
         ))
     }
 
-    /// Enumerate [`Goal`] rows matching `filter`. Fields AND-composed
-    /// (see [`GoalsFilter`]); retired rows are filtered out by
-    /// default. Returned in stable lex order by `(declared_at,
-    /// goal_id)` so callers can deterministically paginate.
+    /// The projected [`Goal`]s matching `filter` (AND-composed; retired
+    /// goals only with `include_retired`), in `(declared_at, goal_id)`
+    /// order.
     async fn list_goals(&self, filter: GoalsFilter) -> Result<Vec<Goal>, Error> {
         let _ = filter;
         Err(Error::Backend(
@@ -8283,26 +8266,18 @@ pub trait FederationDirectory: Send + Sync {
         ))
     }
 
-    /// Mark a [`Goal`] retired at `retired_at`. **Idempotent.** A
-    /// second call against an already-retired goal returns `Ok(())`
-    /// without changing the stored `retired_at` — the chosen
-    /// discipline matches [`revoke_trust`](Self::revoke_trust)'s
-    /// "soft-delete, idempotent" shape so consumers driving
-    /// retirement from a queue don't need to special-case the
-    /// race-replay window. Callers wanting strict-once semantics
-    /// MUST guard at their layer (the
-    /// [`Engine::receive_and_persist`](crate::Engine::receive_and_persist)
-    /// pattern uses content-hash dedup for that). When the row does
-    /// not exist, [`Error::InvalidArgument`] is returned.
-    async fn retire_goal(
-        &self,
-        goal_id: uuid::Uuid,
-        retired_at: chrono::DateTime<chrono::Utc>,
-    ) -> Result<(), Error> {
-        let _ = (goal_id, retired_at);
-        Err(Error::Backend(
-            "retire_goal not implemented for this backend".into(),
-        ))
+    /// v60.0.0 — the pre-V204 `goals` rows no row backs (`attestation_id`
+    /// NULL), for [`Engine::rehome_legacy_goals`](crate::Engine::rehome_legacy_goals).
+    /// A store that never held a typed goal has none.
+    async fn legacy_goals(&self) -> Result<Vec<LegacyGoal>, Error> {
+        Ok(Vec::new())
+    }
+
+    /// v60.0.0 — remove the pre-V204 `goals` row `goal_id` (only a row with no
+    /// `attestation_id`; a projection row is never touched).
+    async fn delete_legacy_goal(&self, goal_id: &str) -> Result<(), Error> {
+        let _ = goal_id;
+        Ok(())
     }
 
     // ── Peer-mutation surface (v3.1.0, CIRISPersist#117) ───────────
@@ -12166,6 +12141,20 @@ pub mod malformed_row {
     /// occurrence, not cosigned by a strict majority of the self's current
     /// live roster: a legacy revocation does not bypass the two-path door.
     pub const CARRIER_WITHOUT_ROSTER_QUORUM: &str = "carrier_without_roster_quorum";
+    /// v60.0.0 (CIRISPersist#988 item 4, CC 3.1.9.7) — a `goal:*` row (a
+    /// declaration or an amendment) whose `meta_goal_alignment` is missing or
+    /// ill-formed: a dimension outside the seven M-1 dimensions, an empty
+    /// rationale, an unknown member, an empty deliberation pointer.
+    pub const GOAL_META_ALIGNMENT: &str = "goal_meta_alignment_malformed";
+    /// v60.0.0 (CIRISPersist#988 item 4) — any other ill-formed goal body: a
+    /// dimension that is not a clean `goal:{scale}:v1` leaf, an empty
+    /// `goal_text`, a `cohort` scale without its `cohort_id` (or a `cohort_id`
+    /// on another scale), a score outside `[-1, 1]`.
+    pub const GOAL_BODY: &str = "goal_body_malformed";
+    /// v60.0.0 (CIRISPersist#988 item 4) — a v59 typed `Goal` (it carries
+    /// `goal_id` / `declared_by_key_id` / `declared_at` / `scope` /
+    /// `retired_at`) offered at a goal door that takes a body.
+    pub const GOAL_TYPED_OBJECT_RETIRED: &str = "goal_typed_object_retired";
 
     /// Every token, for the from-disk witnesses and adopters' tables.
     pub const ALL: &[&str] = &[
@@ -12182,6 +12171,9 @@ pub mod malformed_row {
         AGGREGATE_SOURCE_DUPLICATE,
         KEY_ID_FINGERPRINT_MISMATCH,
         CARRIER_WITHOUT_ROSTER_QUORUM,
+        GOAL_META_ALIGNMENT,
+        GOAL_BODY,
+        GOAL_TYPED_OBJECT_RETIRED,
     ];
 }
 

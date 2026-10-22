@@ -624,7 +624,6 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("put_family_local", ConnClass::Write),
     ("put_family_membership_revocation", ConnClass::Write),
     ("put_fountain_content", ConnClass::Write),
-    ("put_goal", ConnClass::Write),
     ("put_identity_occurrence", ConnClass::Write),
     ("put_identity_occurrence_local", ConnClass::Write),
     ("put_identity_occurrence_revocation_local", ConnClass::Write),
@@ -667,7 +666,6 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("repair_v070_checksum", ConnClass::Write),
     ("replay_abandoned", ConnClass::Write),
     ("resolve_scores", ConnClass::Read),
-    ("retire_goal", ConnClass::Write),
     ("revocations_for_subject", ConnClass::Read),
     ("revoke_trust", ConnClass::Write),
     // #845 (I55) — the nine documented steps, in one transaction: a free fn
@@ -747,6 +745,13 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     // its rebuild (into a scratch table, rolled back).
     ("sqlite_project_ledger", ConnClass::HelperWrite),
     ("sqlite_ledger_projection_rebuild", ConnClass::HelperWrite),
+    // v60.0.0 (CIRISPersist#988 item 4) — the goals projection's writer (the
+    // refold, on the executor's transaction) and its rebuild; the legacy
+    // goal reads and removals the rehome drives.
+    ("sqlite_project_goal", ConnClass::HelperWrite),
+    ("sqlite_goal_projection_rebuild", ConnClass::HelperWrite),
+    ("legacy_goals", ConnClass::Read),
+    ("delete_legacy_goal", ConnClass::Write),
     // v58.0.0 (CIRISPersist#991) — the key plane's rows and projections.
     ("sqlite_key_plane_present", ConnClass::HelperRead),
     ("sqlite_plane_rows", ConnClass::HelperRead),

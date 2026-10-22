@@ -307,6 +307,10 @@ did not fit its budget):
 - `scope-s0-roster-seam.txt` (v60.0.0, slice S0): `nodes_owned_by` (#1109,
   I1161) and the test-anchor `W_self` seam (#1111, I1162); the first scope
   with a `features:` line (`test-anchor`).
+- `scope-s2-goals.txt` (v60.0.0, slice S2): goals as `goal:{scale}:v1`
+  rows (#988 item 4): `goal.rs`, `goal_projection.rs` and the three
+  backends' goal writers, rebuilds and reads, against I1174–I1182. 155
+  mutants, three shards (`MUTANTS_SHARD=0/3` … `2/3`), on the weekly run.
 - `scope-observe-sites.txt`: the call sites in the 3k–28k-line backend and
   federation files that feed the counters. The issue's other starting modules
 (the `trust_root.rs` walks beyond `trust_root_valid`) are not yet scoped.

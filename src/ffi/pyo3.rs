@@ -16500,216 +16500,133 @@ impl PyEngine {
         })
     }
 
-    // ── v2.10.0 (CIRISPersist#114) — typed Goal PyO3 surface ───────
+    // ── v60.0.0 (CIRISPersist#988 item 4) — goals as rows ─────────────
     //
-    // Mirrors the existing FederationDirectory wire shape: JSON
-    // strings in/out for the typed `Goal` value; primitive types
-    // (goal_id UUID-string, RFC3339 timestamp) as direct &str args.
-    // Errors travel through `federation_err_to_py` for stable
-    // `kind()` tokens — same discipline as the rest of the federation
-    // wraps. M-1 alignment is structurally guaranteed by `Goal::new`;
-    // the JSON deserializer either lands a valid `Goal` (with M-1
-    // present) or raises `ValueError` at the FFI boundary.
+    // A Goal is this engine's signed `goal:{scale}:v1` row: the write doors
+    // take a body and return a row id; the reads return the `goals`
+    // projection. Errors travel through `federation_err_to_py` (stable
+    // `kind()` tokens).
 
-    /// Federation directory: insert a typed `Goal`.
-    ///
-    /// `goal_json` is a JSON string of `Goal` (see
-    /// [`crate::federation::goal::Goal`] for the shape). The JSON
-    /// deserializer enforces the M-1-required invariant: an envelope
-    /// without `meta_goal_alignment` raises `ValueError` before any
-    /// DB work happens.
-    ///
-    /// Raises `ValueError` on missing-FK (`declared_by_key_id` not in
-    /// `federation_keys`) or conflict (same `goal_id` with differing
-    /// content); raises `RuntimeError` on backend failure.
-    fn cirisnode_put_goal_json(&self, py: Python<'_>, goal_json: &str) -> PyResult<()> {
+    /// v60.0.0 — Declare a goal: `body_json` is a
+    /// [`GoalInput`](crate::federation::GoalInput) (`goal_text`, `scale`,
+    /// `cohort_id` for `cohort`, `meta_goal_alignment`, optional `score` in
+    /// `[-1, 1]`, default `1`). The engine signs the `goal:{scale}:v1` row.
+    /// Returns its `attestation_id`, the goal's id. A v59 typed Goal body
+    /// raises `ValueError` (`federation_malformed_row`,
+    /// `goal_typed_object_retired`); a body without a well-formed M-1
+    /// raises `ValueError` (`goal_meta_alignment_malformed`).
+    fn cirisnode_put_goal_json(&self, py: Python<'_>, body_json: &str) -> PyResult<String> {
         self.ensure_usable()?;
-        catch_panic(|| {
-            let runtime = self.runtime.clone();
-            let goal: crate::federation::Goal = serde_json::from_str(goal_json)
-                .map_err(|e| PyValueError::new_err(format!("Goal JSON decode: {e}")))?;
-            py.detach(move || match &self.backend {
-                #[cfg(feature = "postgres")]
-                BackendDispatch::Postgres(pg) => {
-                    let backend = pg.clone();
-                    runtime.block_on(async move {
-                        use crate::federation::FederationDirectory;
-                        backend.put_goal(goal).await.map_err(federation_err_to_py)
-                    })
-                }
-                #[cfg(feature = "sqlite")]
-                BackendDispatch::Sqlite(sq) => {
-                    let backend = sq.clone();
-                    runtime.block_on(async move {
-                        use crate::federation::FederationDirectory;
-                        backend.put_goal(goal).await.map_err(federation_err_to_py)
-                    })
-                }
-            })
-        })
+        let input =
+            crate::federation::goal::decode_goal_input(body_json).map_err(federation_err_to_py)?;
+        goal_row_id(self.purge_engine_call(py, move |engine| async move {
+            engine.put_goal(&input).await
+        })?)
     }
 
-    /// Federation directory: fetch a `Goal` by `goal_id`.
-    ///
-    /// `goal_id` is the UUID-as-text. Returns the JSON-encoded
-    /// `Goal` string, or `None` when absent.
+    /// v60.0.0 — Amend a goal: the engine's `supersedes` of the goal's
+    /// current head, carrying the whole new body (`body_json` as
+    /// [`Self::cirisnode_put_goal_json`]). Only the declarer amends. Returns
+    /// the amendment's row id; the goal's id is unchanged.
+    fn cirisnode_amend_goal_json(
+        &self,
+        py: Python<'_>,
+        goal_id: &str,
+        body_json: &str,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        let input =
+            crate::federation::goal::decode_goal_input(body_json).map_err(federation_err_to_py)?;
+        let goal_id = goal_id.to_owned();
+        goal_row_id(self.purge_engine_call(py, move |engine| async move {
+            engine.amend_goal(&goal_id, &input).await
+        })?)
+    }
+
+    /// v60.0.0 — Retire a goal: the engine's `withdraws` of the declaration;
+    /// the goal's `retired_at` is that row's signed instant. Only the
+    /// declarer retires; a second retirement is a no-op. Returns the row id.
+    fn cirisnode_retire_goal_json(&self, py: Python<'_>, goal_id: &str) -> PyResult<String> {
+        self.ensure_usable()?;
+        let goal_id = goal_id.to_owned();
+        goal_row_id(self.purge_engine_call(py, move |engine| async move {
+            engine.retire_goal(&goal_id).await
+        })?)
+    }
+
+    /// v60.0.0 — Disown a goal ("never mine"): the engine's `recants` of the
+    /// declaration; the goal leaves the projection. Only the declarer
+    /// recants. Returns the row id.
+    fn cirisnode_recant_goal_json(&self, py: Python<'_>, goal_id: &str) -> PyResult<String> {
+        self.ensure_usable()?;
+        let goal_id = goal_id.to_owned();
+        goal_row_id(self.purge_engine_call(py, move |engine| async move {
+            engine.recant_goal(&goal_id).await
+        })?)
+    }
+
+    /// Federation directory: the projected `Goal` whose declaration row is
+    /// `goal_id`, as JSON, or `None`.
     fn cirisnode_get_goal_json(&self, py: Python<'_>, goal_id: &str) -> PyResult<Option<String>> {
         self.ensure_usable()?;
-        catch_panic(|| {
-            let runtime = self.runtime.clone();
-            let goal_uuid = uuid::Uuid::parse_str(goal_id)
-                .map_err(|e| PyValueError::new_err(format!("goal_id is not a valid UUID: {e}")))?;
-            py.detach(move || match &self.backend {
-                #[cfg(feature = "postgres")]
-                BackendDispatch::Postgres(pg) => {
-                    let backend = pg.clone();
-                    runtime.block_on(async move {
-                        use crate::federation::FederationDirectory;
-                        let opt = backend
-                            .get_goal(goal_uuid)
-                            .await
-                            .map_err(federation_err_to_py)?;
-                        match opt {
-                            None => Ok(None),
-                            Some(goal) => Ok(Some(serde_json::to_string(&goal).map_err(|e| {
-                                PyRuntimeError::new_err(format!("Goal JSON encode: {e}"))
-                            })?)),
-                        }
-                    })
-                }
-                #[cfg(feature = "sqlite")]
-                BackendDispatch::Sqlite(sq) => {
-                    let backend = sq.clone();
-                    runtime.block_on(async move {
-                        use crate::federation::FederationDirectory;
-                        let opt = backend
-                            .get_goal(goal_uuid)
-                            .await
-                            .map_err(federation_err_to_py)?;
-                        match opt {
-                            None => Ok(None),
-                            Some(goal) => Ok(Some(serde_json::to_string(&goal).map_err(|e| {
-                                PyRuntimeError::new_err(format!("Goal JSON encode: {e}"))
-                            })?)),
-                        }
-                    })
-                }
-            })
-        })
+        let goal_id = goal_id.to_owned();
+        let out = self.purge_engine_call(py, move |engine| async move {
+            engine.federation_directory().get_goal(&goal_id).await
+        })?;
+        Ok((out != "null").then_some(out))
     }
 
-    /// Federation directory: list goals matching `goals_filter_json`.
-    ///
-    /// `goals_filter_json` shape:
-    /// `{"declared_by_key_id": str|null, "m1_dimension": str|null,
-    ///   "scope_kind": str|null, "cohort_id": str|null,
-    ///   "include_retired": bool}`.
-    /// All fields optional; `include_retired` defaults to false.
-    /// Returns a JSON-array string of `Goal` objects in stable order
-    /// `(declared_at, goal_id)`.
+    /// Federation directory: the projected goals matching
+    /// `goals_filter_json` (`declared_by_key_id`, `m1_dimension`, `scale`,
+    /// `cohort_id`, `include_retired`; all optional, unknown keys refused),
+    /// as a JSON array in `(declared_at, goal_id)` order.
     fn cirisnode_list_goals_json(
         &self,
         py: Python<'_>,
         goals_filter_json: &str,
     ) -> PyResult<String> {
         self.ensure_usable()?;
-        catch_panic(|| {
-            let runtime = self.runtime.clone();
-            let wire: GoalsFilterWire = serde_json::from_str(goals_filter_json)
-                .map_err(|e| PyValueError::new_err(format!("GoalsFilter JSON decode: {e}")))?;
-            let m1_dimension =
-                match wire.m1_dimension.as_deref() {
-                    None => None,
-                    Some(s) => Some(crate::federation::M1Dimension::from_wire_str(s).ok_or_else(
-                        || PyValueError::new_err(format!("unknown m1_dimension: {s}")),
-                    )?),
-                };
-            let filter = crate::federation::GoalsFilter {
-                declared_by_key_id: wire.declared_by_key_id,
-                m1_dimension,
-                scope_kind: wire.scope_kind,
-                cohort_id: wire.cohort_id,
-                include_retired: wire.include_retired,
-            };
-            py.detach(move || match &self.backend {
-                #[cfg(feature = "postgres")]
-                BackendDispatch::Postgres(pg) => {
-                    let backend = pg.clone();
-                    runtime.block_on(async move {
-                        use crate::federation::FederationDirectory;
-                        let rows = backend
-                            .list_goals(filter)
-                            .await
-                            .map_err(federation_err_to_py)?;
-                        serde_json::to_string(&rows).map_err(|e| {
-                            PyRuntimeError::new_err(format!("Vec<Goal> JSON encode: {e}"))
-                        })
-                    })
-                }
-                #[cfg(feature = "sqlite")]
-                BackendDispatch::Sqlite(sq) => {
-                    let backend = sq.clone();
-                    runtime.block_on(async move {
-                        use crate::federation::FederationDirectory;
-                        let rows = backend
-                            .list_goals(filter)
-                            .await
-                            .map_err(federation_err_to_py)?;
-                        serde_json::to_string(&rows).map_err(|e| {
-                            PyRuntimeError::new_err(format!("Vec<Goal> JSON encode: {e}"))
-                        })
-                    })
-                }
-            })
+        let wire: GoalsFilterWire = serde_json::from_str(goals_filter_json)
+            .map_err(|e| PyValueError::new_err(format!("GoalsFilter JSON decode: {e}")))?;
+        let m1_dimension = match wire.m1_dimension.as_deref() {
+            None => None,
+            Some(s) => Some(
+                crate::federation::M1Dimension::from_wire_str(s)
+                    .ok_or_else(|| PyValueError::new_err(format!("unknown m1_dimension: {s}")))?,
+            ),
+        };
+        let filter = crate::federation::GoalsFilter {
+            declared_by_key_id: wire.declared_by_key_id,
+            m1_dimension,
+            scale: wire.scale,
+            cohort_id: wire.cohort_id,
+            include_retired: wire.include_retired,
+        };
+        self.purge_engine_call(py, move |engine| async move {
+            engine.federation_directory().list_goals(filter).await
         })
     }
 
-    /// Federation directory: retire a `Goal`. Idempotent — a second
-    /// call against an already-retired goal returns `Ok` without
-    /// changing the stored `retired_at`.
-    ///
-    /// `goal_id` is the UUID-as-text. `retired_at_rfc3339` is the
-    /// retirement timestamp as RFC3339.
-    fn cirisnode_retire_goal_json(
-        &self,
-        py: Python<'_>,
-        goal_id: &str,
-        retired_at_rfc3339: &str,
-    ) -> PyResult<()> {
+    /// v60.0.0 — Move every pre-V204 typed goal off the `goals` table:
+    /// this node's own are re-signed as rows, any other declarer's removed.
+    /// Returns JSON `{"rehomed": n, "dropped": n}`.
+    fn cirisnode_rehome_goals(&self, py: Python<'_>) -> PyResult<String> {
         self.ensure_usable()?;
-        catch_panic(|| {
-            let runtime = self.runtime.clone();
-            let goal_uuid = uuid::Uuid::parse_str(goal_id)
-                .map_err(|e| PyValueError::new_err(format!("goal_id is not a valid UUID: {e}")))?;
-            let retired_at = chrono::DateTime::parse_from_rfc3339(retired_at_rfc3339)
-                .map(|t| t.with_timezone(&chrono::Utc))
-                .map_err(|e| {
-                    PyValueError::new_err(format!("retired_at is not valid RFC3339: {e}"))
-                })?;
-            py.detach(move || match &self.backend {
-                #[cfg(feature = "postgres")]
-                BackendDispatch::Postgres(pg) => {
-                    let backend = pg.clone();
-                    runtime.block_on(async move {
-                        use crate::federation::FederationDirectory;
-                        backend
-                            .retire_goal(goal_uuid, retired_at)
-                            .await
-                            .map_err(federation_err_to_py)
-                    })
-                }
-                #[cfg(feature = "sqlite")]
-                BackendDispatch::Sqlite(sq) => {
-                    let backend = sq.clone();
-                    runtime.block_on(async move {
-                        use crate::federation::FederationDirectory;
-                        backend
-                            .retire_goal(goal_uuid, retired_at)
-                            .await
-                            .map_err(federation_err_to_py)
-                    })
-                }
-            })
+        self.purge_engine_call(py, move |engine| async move {
+            engine.rehome_legacy_goals().await
+        })
+    }
+
+    /// v60.0.0 — the goals projection's from-rows rebuild check. Returns
+    /// JSON `{"live": n, "rebuilt": n}` when byte-equal; raises naming the
+    /// first row that differs (CLM-silo-projection-rebuildable).
+    fn cirisnode_check_goal_projection(&self, py: Python<'_>) -> PyResult<String> {
+        self.ensure_usable()?;
+        self.purge_engine_call(py, move |engine| async move {
+            let r = engine
+                .check_silo_projection(crate::federation::silo_projection::SiloProjection::Goals)
+                .await?;
+            Ok(serde_json::json!({"live": r.live.len(), "rebuilt": r.rebuilt.len()}))
         })
     }
 
@@ -33102,22 +33019,29 @@ struct TrustFilterWire {
     include_expired: bool,
 }
 
-/// v2.10.0 (CIRISPersist#114) — Wire shape for the `GoalsFilter` JSON
-/// dict that `cirisnode_list_goals_json` accepts from Python. All
-/// fields optional; `include_retired` defaults to false via
-/// `#[serde(default)]` — F-3 hot path skips retired by default.
+/// v60.0.0 (CIRISPersist#988 item 4) — the `GoalsFilter` JSON
+/// `cirisnode_list_goals_json` accepts. All fields optional; unknown keys
+/// (the v59 `scope_kind`) are refused rather than ignored.
 #[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct GoalsFilterWire {
     #[serde(default)]
     declared_by_key_id: Option<String>,
     #[serde(default)]
     m1_dimension: Option<String>,
     #[serde(default)]
-    scope_kind: Option<String>,
+    scale: Option<String>,
     #[serde(default)]
     cohort_id: Option<String>,
     #[serde(default)]
     include_retired: bool,
+}
+
+/// v60.0.0 — a goal door's row id, from the JSON string the engine call
+/// returns.
+fn goal_row_id(json: String) -> PyResult<String> {
+    serde_json::from_str(&json)
+        .map_err(|e| PyRuntimeError::new_err(format!("goal row id decode: {e}")))
 }
 
 /// v0.4.0 — Adapter implementing `PublicKeyDirectory` against the
