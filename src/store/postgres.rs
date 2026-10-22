@@ -23391,6 +23391,18 @@ impl crate::federation::attestation_admit::AttestationStore for PostgresBackend 
                     .map_err(|e| Error::Backend(e.to_string()))?;
                 return pg_occurrence_projection_rebuild(&**client).await;
             }
+            // v60.0.0 (CIRISPersist#988 item 1) — the ledgers: this node's rows
+            // on the family, folded through the live writer into a scratch
+            // table.
+            SiloProjection::CreditsLedger | SiloProjection::ExpertiseLedger => {
+                let node = crate::federation::FederationDirectory::node_key_id(self);
+                let mut client = self
+                    .get_client()
+                    .await
+                    .map_err(|e| Error::Backend(e.to_string()))?;
+                return pg_ledger_projection_rebuild(&mut client, projection, node.as_deref())
+                    .await;
+            }
         };
         let mut client = self
             .get_client()
@@ -23422,7 +23434,9 @@ impl crate::federation::attestation_admit::AttestationStore for PostgresBackend 
             match projection {
                 SiloProjection::FederationKeys
                 | SiloProjection::FederationRevocations
-                | SiloProjection::IdentityOccurrences => {}
+                | SiloProjection::IdentityOccurrences
+                | SiloProjection::CreditsLedger
+                | SiloProjection::ExpertiseLedger => {}
                 SiloProjection::HardCaseEvents => {
                     if let Some(event) = crate::federation::hard_case::project_hard_case_row(&row) {
                         pg_project_hard_case(&*tx, scratch, &row.attestation_id, &event).await?;
@@ -23780,6 +23794,12 @@ impl crate::federation::attestation_admit::AttestationStore for PostgresBackend 
                     event,
                 )
                 .await?;
+            }
+            // v60.0.0 (CIRISPersist#988 item 1) — the ledger projection of
+            // this node's `credits:` / `expertise:` row, in the row's
+            // transaction, when it supersedes the held one.
+            if let Some(ledger) = &planned.projected_ledger {
+                pg_project_ledger(&*tx, None, ledger).await?;
             }
         }
         tx.commit()
@@ -25406,6 +25426,184 @@ where
 /// v57.0.0 (CLM-silo-projection-rebuildable) — every row of `table`, in
 /// `order`, rendered as `row_to_json(t)::text`: Postgres's own text form of
 /// every column, so equal strings are equal rows.
+/// v60.0.0 (CIRISPersist#988 item 1) — the ledger table a projection writes,
+/// live (`None`) or a rebuild's scratch table.
+fn pg_ledger_table(
+    ledger: crate::federation::ledger_projection::Ledger,
+    scratch: Option<&str>,
+) -> String {
+    use crate::federation::ledger_projection::Ledger;
+    scratch.map(str::to_owned).unwrap_or_else(|| {
+        match ledger {
+            Ledger::Credits => "cirisnode.credits_ledger",
+            Ledger::Expertise => "cirisnode.expertise_ledger",
+        }
+        .to_owned()
+    })
+}
+
+/// v60.0.0 (CIRISPersist#988 item 1) — the ledger writer: read the row held
+/// on the projection's key, and replace it when the projection supersedes it
+/// ([`supersedes`](crate::federation::ledger_projection::supersedes)). The
+/// live put step and the rebuild both write through this.
+async fn pg_project_ledger<C>(
+    client: &C,
+    scratch: Option<&str>,
+    p: &crate::federation::ledger_projection::LedgerProjection,
+) -> Result<(), crate::federation::Error>
+where
+    C: tokio_postgres::GenericClient + Sync,
+{
+    use crate::federation::ledger_projection::{self as lp, LedgerBody};
+    use crate::federation::Error;
+    let table = pg_ledger_table(p.ledger(), scratch);
+    let (c, d, l, subj) = p.key();
+    let credits = matches!(p.body, LedgerBody::Credits(_));
+    let key_sql = if credits {
+        "contributor_id = $1 AND domain = $2 AND language = $3 AND subject = $4"
+    } else {
+        "contributor_id = $1 AND domain = $2 AND language = $3"
+    };
+    let key: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = if credits {
+        vec![&c, &d, &l, &subj]
+    } else {
+        vec![&c, &d, &l]
+    };
+    let held = client
+        .query_opt(
+            &format!(
+                "SELECT attestation_id, last_updated_at FROM {table} WHERE {key_sql} FOR UPDATE"
+            ),
+            &key,
+        )
+        .await
+        .map_err(|e| Error::Backend(format!("ledger read: {e}")))?;
+    let held: Option<(Option<String>, chrono::DateTime<chrono::Utc>)> = match held {
+        None => None,
+        Some(r) => Some((
+            r.safe_get_with(0, Error::Backend)?,
+            r.safe_get_with(1, Error::Backend)?,
+        )),
+    };
+    let held_view = held.as_ref().map(|(id, at)| (id.as_deref(), *at));
+    if !lp::supersedes(held_view, p) {
+        return Ok(());
+    }
+    client
+        .execute(&format!("DELETE FROM {table} WHERE {key_sql}"), &key)
+        .await
+        .map_err(|e| Error::Backend(format!("ledger delete: {e}")))?;
+    match &p.body {
+        LedgerBody::Credits(x) => {
+            client
+                .execute(
+                    &format!(
+                        "INSERT INTO {table} (contributor_id, domain, language, subject, balance, \
+                        last_update_contribution, last_updated_at, created_at, attestation_id) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $7, $8)"
+                    ),
+                    &[
+                        &x.contributor_id,
+                        &x.domain,
+                        &x.language,
+                        &x.subject,
+                        &x.balance,
+                        &x.source_contribution,
+                        &p.asserted_at,
+                        &p.attestation_id,
+                    ],
+                )
+                .await
+        }
+        LedgerBody::Expertise(x) => {
+            client
+                .execute(
+                    &format!(
+                    "INSERT INTO {table} (contributor_id, domain, language, expertise, is_active, \
+                        last_updated_at, last_update_contribution, created_at, attestation_id) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $6, $8)"
+                ),
+                    &[
+                        &x.contributor_id,
+                        &x.domain,
+                        &x.language,
+                        &x.expertise,
+                        &x.is_active,
+                        &p.asserted_at,
+                        &x.source_contribution,
+                        &p.attestation_id,
+                    ],
+                )
+                .await
+        }
+    }
+    .map_err(|e| Error::Backend(format!("ledger insert: {e}")))?;
+    Ok(())
+}
+
+/// v60.0.0 (CIRISPersist#988 item 1) — a ledger's from-rows rebuild: every
+/// row on the family, through [`project_ledger_row`](crate::federation::ledger_projection::project_ledger_row)
+/// and the live writer, into a scratch table of the live table's shape; both
+/// rendered as `row_to_json(..)::text` and sorted.
+async fn pg_ledger_projection_rebuild(
+    client: &mut deadpool_postgres::Object,
+    projection: crate::federation::silo_projection::SiloProjection,
+    node_key_id: Option<&str>,
+) -> Result<crate::federation::silo_projection::ProjectionRebuild, crate::federation::Error> {
+    use crate::federation::ledger_projection::{self as lp, Ledger};
+    use crate::federation::silo_projection::SiloProjection;
+    use crate::federation::Error;
+    let (ledger, family, scratch) = if projection == SiloProjection::CreditsLedger {
+        (
+            Ledger::Credits,
+            lp::CREDITS_PREFIX,
+            "_rebuild_credits_ledger",
+        )
+    } else {
+        (
+            Ledger::Expertise,
+            lp::EXPERTISE_PREFIX,
+            "_rebuild_expertise_ledger",
+        )
+    };
+    let live_table = pg_ledger_table(ledger, None);
+    let tx = client
+        .transaction()
+        .await
+        .map_err(|e| Error::Backend(format!("begin tx: {e}")))?;
+    tx.batch_execute(&format!(
+        "CREATE TEMP TABLE {scratch} (LIKE {live_table} INCLUDING DEFAULTS) ON COMMIT DROP"
+    ))
+    .await
+    .map_err(|e| Error::Backend(format!("ledger rebuild scratch: {e}")))?;
+    let rows = tx
+        .query(
+            &format!(
+                "SELECT {PG_ATTESTATION_COLUMNS} FROM cirislens.federation_attestations \
+                 WHERE substr(dimension, 1, length($1)) = $1 ORDER BY attestation_id"
+            ),
+            &[&family],
+        )
+        .await
+        .map_err(|e| Error::Backend(format!("ledger rebuild rows: {e}")))?;
+    for r in rows {
+        let row = pg_row_to_attestation(r)?;
+        if let Some(p) = lp::project_ledger_row(&row, node_key_id) {
+            if p.ledger() == ledger {
+                pg_project_ledger(&*tx, Some(scratch), &p).await?;
+            }
+        }
+    }
+    let mut live = pg_render_table(&*tx, &live_table, "contributor_id").await?;
+    let mut rebuilt = pg_render_table(&*tx, scratch, "contributor_id").await?;
+    live.sort();
+    rebuilt.sort();
+    tx.rollback()
+        .await
+        .map_err(|e| Error::Backend(format!("ledger rebuild rollback: {e}")))?;
+    Ok(crate::federation::silo_projection::ProjectionRebuild { live, rebuilt })
+}
+
 async fn pg_render_table<C>(
     client: &C,
     table: &str,
