@@ -32,8 +32,8 @@
 //!   `perceptual_hash_csam`, `court_order`) settles at once: the Engine
 //!   destroys the bytes on receipt, and the node records
 //!   `hard_case:fast_path_takedown` (CC 4.5.3 step 4). The fast path waives
-//!   the CC 4.5.1 quorum and the counter notice, never the duty-holder gate. A counter-notice basis (`dmca_512`,
-//!   `dsa_article_16`, `osa_illegal_content`, `community_standards`)
+//!   the CC 4.5.1 quorum and the counter notice, never the duty-holder gate. A counter-notice basis (`dmca512`,
+//!   `dsa_article16`, `osa_illegal_content`, `community_standards`)
 //!   withholds the bytes at once and settles after its counter-notice window,
 //!   when `purge_finalize` hard-deletes them. The age-gate basis
 //!   (`avmsd_age_inappropriate`) is not a removal: it writes no tombstone,
@@ -100,11 +100,54 @@ pub const IMMEDIATE_REMOVAL_BASES: &[&str] = &[
 /// windows in days (the cirisnode `LegalBasis::counter_notice_window_days`
 /// defaults, CEG 0.3 §5.6.8.4).
 pub const COUNTER_NOTICE_BASES: &[(&str, i64)] = &[
-    ("dmca_512", 10),
-    ("dsa_article_16", 14),
+    ("dmca512", 10),
+    ("dsa_article16", 14),
     ("osa_illegal_content", 14),
     ("community_standards", 30),
 ];
+
+/// v60.0.0 (CIRISPersist#803, CC 3.3.2) — the two pre-v60 spellings of a
+/// counter-notice basis and CC's wire string for each. Read ONLY by the
+/// replicated apply of a legacy Contribution notice (one release of compat,
+/// see [`apply_replicated_takedown`]); V203 rewrote every recorded header.
+pub const LEGACY_BASIS_SPELLINGS: &[(&str, &str)] =
+    &[("dmca_512", "dmca512"), ("dsa_article_16", "dsa_article16")];
+
+/// The CC wire string of a legacy basis spelling, or the input unchanged.
+#[must_use]
+pub fn cc_basis_spelling(basis: &str) -> &str {
+    LEGACY_BASIS_SPELLINGS
+        .iter()
+        .find(|(old, _)| *old == basis)
+        .map_or(basis, |(_, cc)| cc)
+}
+
+/// v60.0.0 (CIRISPersist#803, CC 3.1.1) — the `takedown_notice:{basis}:v1`
+/// family stem: a notice is a `scores` row on it.
+pub const NOTICE_DIMENSION_PREFIX: &str = "takedown_notice:";
+
+/// The notice row's dimension for `basis`.
+#[must_use]
+pub fn notice_dimension(basis: &str) -> String {
+    format!("{NOTICE_DIMENSION_PREFIX}{basis}:v1")
+}
+
+/// The `{basis}` of a `takedown_notice:{basis}:v1` dimension, or `None`.
+#[must_use]
+pub fn notice_basis_of_dimension(dimension: &str) -> Option<&str> {
+    let rest = dimension.strip_prefix(NOTICE_DIMENSION_PREFIX)?;
+    let basis = rest.strip_suffix(":v1")?;
+    (!basis.is_empty() && !basis.contains(':')).then_some(basis)
+}
+
+/// Is `row` a takedown notice row (a `scores` row on the
+/// `takedown_notice:` family)?
+#[must_use]
+pub fn is_notice_row(row: &super::Attestation) -> bool {
+    row.attestation_type == super::types::attestation_type::SCORES
+        && super::admission::envelope_dimension(&row.attestation_envelope)
+            .is_some_and(|d| d.starts_with(NOTICE_DIMENSION_PREFIX))
+}
 
 /// The age-gate basis: an age-assurance gate, not a removal.
 pub const AGE_GATE_BASIS: &str = "avmsd_age_inappropriate";
@@ -168,30 +211,66 @@ pub fn settles_at(execution: &PurgeExecution) -> chrono::DateTime<chrono::Utc> {
     }
 }
 
-/// A signed `takedown_notice` Contribution, as the cirisnode door verified and
-/// stored it: the `ContributionEnvelope` serialized to JSON, signature
-/// included. The door re-verifies it; nothing in it is trusted unverified.
+/// A takedown notice as the doors take it: `envelope` is the signed
+/// `takedown_notice:{basis}:v1` ROW (an [`Attestation`](super::Attestation),
+/// serialized), v60.0.0 (CIRISPersist#803, CC 3.1.1). The door re-verifies
+/// it; nothing in it is trusted unverified.
+///
+/// One release of compat (v60.x, removed in v61): a peer still on v59 serves
+/// its takedown bundles with the notice as the retired `takedown_notice`
+/// CONTRIBUTION (`ContributionEnvelope` JSON, self-signed Ed25519).
+/// [`apply_replicated_takedown`] still reads that shape; the local door does
+/// not.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TakedownNotice {
-    /// The envelope.
+    /// The notice row (or, replicated from a v59 peer, the legacy
+    /// Contribution envelope).
     pub envelope: serde_json::Value,
 }
 
+impl TakedownNotice {
+    /// The notice for a row.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Backend`] when the row does not serialize.
+    pub fn of_row(row: &super::Attestation) -> Result<Self, Error> {
+        Ok(Self {
+            envelope: serde_json::to_value(row)
+                .map_err(|e| Error::Backend(format!("notice row encode: {e}")))?,
+        })
+    }
+}
+
+/// Where a notice reached the door from: the compat read of a legacy
+/// Contribution is the replicated apply's alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoticeOrigin {
+    /// This node's own takedown door: a notice row only.
+    Local,
+    /// A peer's purge bundle: a notice row, or (v60.x compat) a v59 peer's
+    /// legacy Contribution.
+    Replicated,
+}
+
 /// A takedown notice's verified terms.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TakedownTerms {
-    /// `hex(sha256(JCS(envelope)))`, signature included — the notice id the
-    /// tombstone cites.
+    /// `hex(sha256(JCS(notice)))`, signature included — the notice id the
+    /// tombstone header is keyed by (the purge plane's 64-hex id, one shape
+    /// for takedown and purge). The notice ROW's `attestation_id` (CC 3.3.2:
+    /// "every notice has an attestation_id a tombstone cites") is inside the
+    /// header's `notice_jcs` and in [`Self::row`].
     pub notice_id: String,
-    /// The envelope's JCS text: the header's `notice_jcs`.
+    /// The notice's JCS text: the header's `notice_jcs`.
     pub notice_jcs: String,
-    /// The verified signer (`author_id`).
+    /// The verified signer (the row's `attesting_key_id`).
     pub signer: String,
-    /// The payload's `claimant_key_id`.
+    /// The notice's `claimant_key_id` (on a row, the signer).
     pub claimant_key_id: String,
     /// The content, lowercase hex.
     pub content_sha256: String,
-    /// The `legal_basis` wire string.
+    /// The `legal_basis` wire string (CC 3.3.2's spelling).
     pub legal_basis: String,
     /// Its disposition.
     pub disposition: TakedownDisposition,
@@ -199,6 +278,9 @@ pub struct TakedownTerms {
     pub asserted_at: chrono::DateTime<chrono::Utc>,
     /// When it stops authorising.
     pub expires_at: chrono::DateTime<chrono::Utc>,
+    /// The notice row, when the notice is one (`None` for a legacy
+    /// Contribution).
+    pub row: Option<super::Attestation>,
 }
 
 impl TakedownTerms {
@@ -217,10 +299,26 @@ fn is_hex64(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
-/// Is `envelope` a takedown notice Contribution (rather than a steward purge
-/// notice)? A shape question only; [`takedown_terms`] verifies it.
+/// Is `envelope` a takedown notice — a `takedown_notice:{basis}:v1` row, or
+/// (compat) a legacy `takedown_notice` Contribution — rather than a steward
+/// purge notice? A shape question only; [`takedown_terms`] verifies it.
 #[must_use]
 pub fn is_takedown_notice_envelope(envelope: &serde_json::Value) -> bool {
+    is_notice_row_value(envelope) || is_legacy_notice_contribution(envelope)
+}
+
+fn is_notice_row_value(envelope: &serde_json::Value) -> bool {
+    envelope
+        .get("attestation_type")
+        .and_then(serde_json::Value::as_str)
+        == Some(super::types::attestation_type::SCORES)
+        && envelope
+            .pointer("/attestation_envelope/dimension")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|d| d.starts_with(NOTICE_DIMENSION_PREFIX))
+}
+
+fn is_legacy_notice_contribution(envelope: &serde_json::Value) -> bool {
     envelope
         .pointer("/subject/subject")
         .and_then(serde_json::Value::as_str)
@@ -228,16 +326,159 @@ pub fn is_takedown_notice_envelope(envelope: &serde_json::Value) -> bool {
         && envelope.get("author_id").is_some()
 }
 
-/// Parse and VERIFY a takedown notice: its shape, the closed-set basis, and
-/// the signature over the envelope (the cirisnode track's own rule: the
-/// `author_id` IS the Ed25519 pubkey, the envelope minus its signature is the
-/// signed body, `Ed25519Fallback`, exactly as `put_contribution` verifies it).
-/// Every failure is [`token::UNAUTHORISED`].
+/// The members a notice row carries, read and SHAPE-checked (CC 3.1.1 /
+/// CC 3.3.2): `subject_kind` is `takedown_notice`; the dimension's basis is in
+/// the closed set and is the envelope's `legal_basis`; `content_sha256` is 64 lowercase hex; `claimant_key_id` is
+/// the row's signer; `jurisdiction`, `good_faith_statement` and `claim_text`
+/// are non-empty; `score` is `-1`; the row carries an `expires_at` after its
+/// `asserted_at`. Pure. The reason names the failed member.
 ///
 /// # Errors
 ///
-/// [`token::UNAUTHORISED`] naming the member or the failed check.
-pub fn takedown_terms(notice: &TakedownNotice) -> Result<TakedownTerms, Error> {
+/// The reason, as a string; the callers wrap it in their own refusal.
+pub fn notice_row_shape(row: &super::Attestation) -> Result<NoticeRowShape, String> {
+    let env = &row.attestation_envelope;
+    let dimension = super::admission::envelope_dimension(env)
+        .ok_or_else(|| "the notice row carries no dimension".to_owned())?;
+    let basis = notice_basis_of_dimension(dimension)
+        .ok_or_else(|| format!("{dimension:?} is not a takedown_notice:{{basis}}:v1 dimension"))?;
+    let s = |k: &str| -> Result<String, String> {
+        match env.get(k).and_then(serde_json::Value::as_str) {
+            Some(x) if !x.trim().is_empty() => Ok(x.to_owned()),
+            _ => Err(format!("the notice carries no non-empty `{k}`")),
+        }
+    };
+    if env.get("subject_kind").and_then(serde_json::Value::as_str)
+        != Some(TAKEDOWN_NOTICE_SUBJECT_KIND)
+    {
+        return Err(format!(
+            "the notice row carries no `subject_kind: {TAKEDOWN_NOTICE_SUBJECT_KIND}` (CC 3.1.1)"
+        ));
+    }
+    let legal_basis = s("legal_basis")?;
+    if legal_basis != basis {
+        return Err(format!(
+            "legal_basis {legal_basis:?} is not the dimension's basis {basis:?}"
+        ));
+    }
+    if basis == STEWARD_PURGE_BASIS {
+        return Err(format!(
+            "`{STEWARD_PURGE_BASIS}` is the trust root's cosigned purge, not a duty-holder \
+             takedown (its notice row's door is not built; CIRISPersist#988)"
+        ));
+    }
+    let disposition = basis_disposition(basis).ok_or_else(|| {
+        format!("legal_basis {basis:?} is not a takedown basis (the closed set of CC 3.3.2)")
+    })?;
+    let content_sha256 = s("content_sha256")?;
+    if !is_hex64(&content_sha256) {
+        return Err("content_sha256 is not 64 lowercase hex".to_owned());
+    }
+    let claimant_key_id = s("claimant_key_id")?;
+    if claimant_key_id != row.attesting_key_id {
+        return Err(format!(
+            "claimant_key_id {claimant_key_id:?} is not the row's signer {:?} (CC 3.3.2: the \
+             federation_keys row issuing the notice)",
+            row.attesting_key_id
+        ));
+    }
+    for k in ["jurisdiction", "good_faith_statement", "claim_text"] {
+        s(k)?;
+    }
+    if env.get("score").and_then(serde_json::Value::as_f64) != Some(-1.0) {
+        return Err("a takedown notice scores -1 (its family's polarity is `-1 only`)".to_owned());
+    }
+    let expires_at = row
+        .expires_at
+        .ok_or_else(|| "the notice row carries no expires_at".to_owned())?;
+    if expires_at <= row.asserted_at {
+        return Err("expires_at must be after asserted_at".to_owned());
+    }
+    Ok(NoticeRowShape {
+        content_sha256,
+        legal_basis,
+        disposition,
+        expires_at,
+    })
+}
+
+/// What [`notice_row_shape`] read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoticeRowShape {
+    /// The content, lowercase hex.
+    pub content_sha256: String,
+    /// The basis wire string.
+    pub legal_basis: String,
+    /// Its disposition.
+    pub disposition: TakedownDisposition,
+    /// The row's `expires_at`.
+    pub expires_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// v60.0.0 (CIRISPersist#803, CC 3.1.1, CC 4.5.5) — **the notice row's
+/// admission**, asked of every `takedown_notice:` row at the attestation
+/// plane's put door (a local emit and a peer's replicated row alike): the
+/// shape ([`notice_row_shape`]), then [`takedown_authority`] for its signer
+/// over the content as THIS node holds it. A no-op for every other row. The
+/// shape refusal and the authority refusal are both
+/// [`token::UNAUTHORISED`]; no binding held is [`token::CONTENT_UNBOUND`]
+/// (retryable).
+///
+/// # Errors
+///
+/// [`token::UNAUTHORISED`], [`token::CONTENT_UNBOUND`]; directory reads.
+pub async fn check_takedown_notice_row_admission(
+    directory: &dyn FederationDirectory,
+    row: &super::Attestation,
+) -> Result<(), Error> {
+    if !is_notice_row(row) {
+        return Ok(());
+    }
+    // A leaf of the family that is still held shut (the steward purge's
+    // cosigned notice) is refused as held, by the held-shut gate's own token.
+    if let Some(d) = super::admission::envelope_dimension(&row.attestation_envelope) {
+        super::admission::check_registered_family_not_held(d)?;
+    }
+    let shape = notice_row_shape(row).map_err(|reason| {
+        refused(
+            token::UNAUTHORISED,
+            serde_json::json!({"notice_id": row.attestation_id, "reason": reason}),
+        )
+    })?;
+    takedown_authority(
+        directory,
+        &row.attesting_key_id,
+        &shape.content_sha256,
+        &shape.legal_basis,
+    )
+    .await
+    .map_err(|e| match e {
+        Error::PurgeRefused { token, mut body } => {
+            body["notice_id"] = serde_json::json!(row.attestation_id);
+            Error::PurgeRefused { token, body }
+        }
+        other => other,
+    })
+}
+
+/// Parse and VERIFY a takedown notice. A notice ROW: its shape
+/// ([`notice_row_shape`]) and its hybrid signature, verified against the
+/// signer's REGISTERED keys as every row is (`verify_row_hybrid_signature`,
+/// Strict). A legacy Contribution, only from a peer's bundle
+/// (`origin = Replicated`, one release of compat): its shape and its
+/// self-signed Ed25519 signature, as v59 verified it, with its basis read in
+/// CC's spelling ([`cc_basis_spelling`]). Every failure is
+/// [`token::UNAUTHORISED`].
+///
+/// # Errors
+///
+/// [`token::UNAUTHORISED`] naming the member or the failed check; directory
+/// reads.
+pub async fn takedown_terms(
+    directory: &dyn FederationDirectory,
+    notice: &TakedownNotice,
+    origin: NoticeOrigin,
+) -> Result<TakedownTerms, Error> {
     let env = &notice.envelope;
     let jcs = ciris_verify_core::jcs::canonicalize(env).map_err(|e| {
         refused(
@@ -245,20 +486,80 @@ pub fn takedown_terms(notice: &TakedownNotice) -> Result<TakedownTerms, Error> {
             serde_json::json!({"reason": format!("the notice does not canonicalize: {e}")}),
         )
     })?;
-    let notice_id = hex::encode(sha2::Sha256::digest(&jcs));
-    let notice_jcs = String::from_utf8(jcs)
+    let notice_jcs = String::from_utf8(jcs.clone())
         .map_err(|e| Error::Backend(format!("notice JCS is not UTF-8: {e}")))?;
+    if is_notice_row_value(env) {
+        let row: super::Attestation = serde_json::from_value(env.clone()).map_err(|e| {
+            refused(
+                token::UNAUTHORISED,
+                serde_json::json!({"reason": format!("the notice row does not decode: {e}")}),
+            )
+        })?;
+        let unauth = |reason: String| {
+            refused(
+                token::UNAUTHORISED,
+                serde_json::json!({"notice_id": row.attestation_id, "reason": reason}),
+            )
+        };
+        let shape = notice_row_shape(&row).map_err(unauth)?;
+        super::tier_ingest::verify_row_hybrid_signature(directory, &row)
+            .await
+            .map_err(|e| match e {
+                // An ordering gap (the signer's key row has not landed here
+                // yet), never a bad signature: retryable, as at the put door.
+                e @ Error::AttesterKeyUnknown { .. } => e,
+                e => unauth(format!("the notice row's signature does not verify: {e}")),
+            })?;
+        return Ok(TakedownTerms {
+            notice_id: hex::encode(sha2::Sha256::digest(&jcs)),
+            notice_jcs,
+            signer: row.attesting_key_id.clone(),
+            claimant_key_id: row.attesting_key_id.clone(),
+            content_sha256: shape.content_sha256,
+            legal_basis: shape.legal_basis,
+            disposition: shape.disposition,
+            asserted_at: row.asserted_at,
+            expires_at: shape.expires_at,
+            row: Some(row),
+        });
+    }
+    let notice_id = hex::encode(sha2::Sha256::digest(&jcs));
     let unauth = |reason: String| {
         refused(
             token::UNAUTHORISED,
             serde_json::json!({"notice_id": notice_id, "reason": reason}),
         )
     };
-    if !is_takedown_notice_envelope(env) {
-        return Err(unauth(format!(
-            "not a `{TAKEDOWN_NOTICE_SUBJECT_KIND}` Contribution"
-        )));
+    if !is_legacy_notice_contribution(env) {
+        return Err(unauth(
+            "not a takedown_notice:{basis}:v1 row (CC 3.1.1, CC 3.3.2)".to_owned(),
+        ));
     }
+    if origin == NoticeOrigin::Local {
+        return Err(unauth(
+            "a takedown notice is a takedown_notice:{basis}:v1 row (CC 3.1.1); the \
+             `takedown_notice` Contribution is retired (v60.0.0, CIRISPersist#803)"
+                .to_owned(),
+        ));
+    }
+    legacy_contribution_terms(env, notice_id, notice_jcs)
+}
+
+/// v60.x COMPAT (remove in v61; CIRISPersist#803) — a v59 peer's legacy
+/// `takedown_notice` Contribution, verified as v59 verified it: the
+/// `author_id` IS the Ed25519 pubkey, the envelope minus its signature is the
+/// signed body, `Ed25519Fallback`. Its basis is read in CC's spelling.
+fn legacy_contribution_terms(
+    env: &serde_json::Value,
+    notice_id: String,
+    notice_jcs: String,
+) -> Result<TakedownTerms, Error> {
+    let unauth = |reason: String| {
+        refused(
+            token::UNAUTHORISED,
+            serde_json::json!({"notice_id": notice_id, "reason": reason}),
+        )
+    };
     let s = |v: Option<&serde_json::Value>, k: &str| -> Result<String, Error> {
         match v.and_then(serde_json::Value::as_str) {
             Some(x) if !x.trim().is_empty() => Ok(x.to_owned()),
@@ -277,8 +578,6 @@ pub fn takedown_terms(notice: &TakedownNotice) -> Result<TakedownTerms, Error> {
         &ed25519,
         ml_dsa,
         &signer,
-        // The cirisnode track has no per-contributor ML-DSA-65 key; the same
-        // pinned policy as `cirisnode::verify::verify_envelope_signed`.
         None,
         crate::verify::hybrid::HybridPolicy::Ed25519Fallback,
         None,
@@ -292,7 +591,7 @@ pub fn takedown_terms(notice: &TakedownNotice) -> Result<TakedownTerms, Error> {
         return Err(unauth("content_sha256 is not 64 lowercase hex".to_owned()));
     }
     let claimant_key_id = s(payload.get("claimant_key_id"), "claimant_key_id")?;
-    let legal_basis = s(payload.get("legal_basis"), "legal_basis")?;
+    let legal_basis = cc_basis_spelling(&s(payload.get("legal_basis"), "legal_basis")?).to_owned();
     let disposition = basis_disposition(&legal_basis).ok_or_else(|| {
         unauth(format!(
             "legal_basis {legal_basis:?} is not a takedown basis (the closed set of CC 3.3.2; \
@@ -320,6 +619,7 @@ pub fn takedown_terms(notice: &TakedownNotice) -> Result<TakedownTerms, Error> {
         disposition,
         asserted_at,
         expires_at,
+        row: None,
     })
 }
 
@@ -404,6 +704,13 @@ pub async fn content_binding(
     let mut out = ContentBinding::default();
     let now = chrono::Utc::now();
     for row in rows {
+        // v60.0.0 (CIRISPersist#803) — a takedown notice row is ABOUT the
+        // content, never a binding of it: its `evidence_refs` may name the
+        // digest, and a notice signer must not become a subject of the
+        // content it takes down.
+        if is_notice_row(&row) {
+            continue;
+        }
         if row.expires_at.is_some_and(|e| e <= now)
             || super::blob_tombstone::retiring_composer(directory, &row)
                 .await?
@@ -512,6 +819,10 @@ pub async fn takedown_authority(
 pub struct TakedownReport {
     /// The notice id the tombstone cites.
     pub notice_id: String,
+    /// v60.0.0 (CIRISPersist#803) — the notice row's `attestation_id` (`None`
+    /// for a v59 peer's legacy Contribution notice).
+    #[serde(default)]
+    pub notice_attestation_id: Option<String>,
     /// The content taken down, lowercase hex.
     pub content_sha256: String,
     /// The notice's `legal_basis`.
@@ -552,13 +863,41 @@ pub async fn takedown_tombstone(
     executed_by: &str,
 ) -> Result<TakedownReport, Error> {
     let now = sp::purge_clock();
-    let terms = takedown_terms(notice)?;
+    let terms = takedown_terms(directory, notice, NoticeOrigin::Local).await?;
     verify_takedown_authority(directory, &terms, now).await?;
+    hold_notice_row(directory, &terms).await?;
     record(directory, &terms, executed_by, origin::LOCAL, now).await
 }
 
+/// v60.0.0 (CIRISPersist#803) — the notice row the tombstone cites is HELD
+/// on this node's plane: a row not yet held goes through the put door (which
+/// asks [`check_takedown_notice_row_admission`] again), so every tombstone's
+/// `notice_id` names a row a reader can fetch. A legacy Contribution (compat)
+/// has no row to hold.
+async fn hold_notice_row(
+    directory: &dyn FederationDirectory,
+    terms: &TakedownTerms,
+) -> Result<(), Error> {
+    let Some(row) = &terms.row else {
+        return Ok(());
+    };
+    if directory
+        .get_attestation(&row.attestation_id)
+        .await?
+        .is_none()
+    {
+        directory
+            .put_attestation(super::SignedAttestation {
+                attestation: row.clone(),
+            })
+            .await?;
+    }
+    Ok(())
+}
+
 /// **Apply a replicated takedown** (a [`PurgeBundle`](super::steward_purge::PurgeBundle)
-/// whose notice is a takedown Contribution). The receiver trusts nothing the
+/// whose notice is a takedown notice row, or, for one release, a v59 peer's
+/// legacy Contribution). The receiver trusts nothing the
 /// sender says: it verifies the signature, re-asks CC 4.5.5 against its OWN
 /// state, and requires the bundle to name exactly the notice's own content on
 /// the bytes plane ([`token::NOT_BYTES_PLANE`]). An age-gate notice carries no
@@ -574,7 +913,7 @@ pub async fn apply_replicated_takedown(
     receiver_key_id: &str,
 ) -> Result<TakedownReport, Error> {
     let now = sp::purge_clock();
-    let terms = takedown_terms(notice)?;
+    let terms = takedown_terms(directory, notice, NoticeOrigin::Replicated).await?;
     if terms.disposition == TakedownDisposition::AgeGate {
         return Err(refused(
             token::UNAUTHORISED,
@@ -595,6 +934,7 @@ pub async fn apply_replicated_takedown(
         ));
     }
     verify_takedown_authority(directory, &terms, now).await?;
+    hold_notice_row(directory, &terms).await?;
     record(directory, &terms, receiver_key_id, origin::REPLICATED, now).await
 }
 
@@ -607,6 +947,7 @@ async fn record(
 ) -> Result<TakedownReport, Error> {
     let mut report = TakedownReport {
         notice_id: terms.notice_id.clone(),
+        notice_attestation_id: terms.row.as_ref().map(|r| r.attestation_id.clone()),
         content_sha256: terms.content_sha256.clone(),
         legal_basis: terms.legal_basis.clone(),
         disposition: terms.disposition,

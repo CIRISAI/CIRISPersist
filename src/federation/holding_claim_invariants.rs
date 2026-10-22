@@ -1480,7 +1480,7 @@ pub(crate) mod blob_bodies {
         establish(dir, "i778-producer", &owner.id, &hex::encode(sha)).await;
         let t = crate::federation::takedown_tombstone::takedown_tombstone(
             dir,
-            &notice(&owner, &hex::encode(sha), "dmca_512"),
+            &notice(&owner, &hex::encode(sha), "dmca512"),
             "i778-node",
         )
         .await
@@ -1601,7 +1601,7 @@ pub(crate) mod blob_bodies {
         establish(dir, "i778-producer", &owner.id, &hex::encode(claimed_sha)).await;
         crate::federation::takedown_tombstone::takedown_tombstone(
             dir,
-            &notice(&owner, &hex::encode(claimed_sha), "dmca_512"),
+            &notice(&owner, &hex::encode(claimed_sha), "dmca512"),
             "i778-node",
         )
         .await
