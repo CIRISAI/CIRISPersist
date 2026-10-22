@@ -92,6 +92,10 @@ to the key plane as an identity; refusal token `federation_rendezvous_key_not_an
 (CC 3.1.4 `rendezvous:route:v1` row, rc10); a rendezvous node holding a mailbox MUST be a
 serve seat (CC 5.4.6 item 6), so the mailbox surface rides on #1101's predicate. (4) Possession challenge (N6): weight rule is the interim;
 the challenger is staged for the durability tier's first release.
+Edge filed the asks the same day, all after v60: #1117 the accord M-of-N threshold (strict
+majority over the standing roster) as a callable function; #1118 the five mesh_config keys
+(and, per the steward, the two symbol-count redundancy keys retire while `target_holders` and
+`min_viable_holders` stay); #1119 `delegation_scope::INFRA_RELAY`.
 
 ## 3. The mutation discipline (S0, then every slice)
 
