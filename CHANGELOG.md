@@ -158,7 +158,11 @@ bundle path needs no change this release.
   `tests/python/test_cirisnode_rows_surface.py` (replaces the retired
   `test_transit_key_grant_surface.py`; the transit grant is the key-grant
   plane's, `test_key_grant_rows_surface.py`).
-- Mutation scope `scripts/mutants/scope-s1-cirisnode.txt`.
+- Mutation scope `scripts/mutants/scope-s1-cirisnode.txt`: 215 mutants in four
+  shards, 175 caught, 40 unviable, 0 missed, nothing allow-listed (two rounds:
+  the first left 43 survivors, each a check no witness distinguished; the
+  witnesses above kill them all). I1107 and I1173 are not in its `tests:`
+  (their sites, the held-shut table and V203's SQL, are not mutation sites).
 - Evidence: CLM-takedown-notice-row (3.1.1) at the notice row's admission,
   the door's row reader and the planner; CLM-silo-projection-rebuildable
   (2.4.2) at the ledger projection; `EXPECTED` 318.
