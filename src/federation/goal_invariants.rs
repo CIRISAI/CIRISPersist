@@ -371,6 +371,78 @@ pub(crate) mod bodies {
             "I1178: the earlier retirement is folded"
         );
         assert_eq!(live(b).await.len(), 3);
+
+        // Each goal folds only the rows naming ITS chain: goal E is amended,
+        // then goal F is amended later; a refold of E (its retirement) keeps
+        // E's own head, never F's later amendment.
+        let ge = sign(&alice, "scores", body("self", "e v0", 1.0)).await;
+        put(b, &ge).await.unwrap();
+        let e1 = sign(
+            &alice,
+            "supersedes",
+            naming(&ge.attestation_id, "scores", body("self", "e v1", 1.0)),
+        )
+        .await;
+        put(b, &e1).await.unwrap();
+        let gf = sign(&alice, "scores", body("self", "f v0", 1.0)).await;
+        put(b, &gf).await.unwrap();
+        let f1 = sign(
+            &alice,
+            "supersedes",
+            naming(&gf.attestation_id, "scores", body("self", "f v1", 1.0)),
+        )
+        .await;
+        put(b, &f1).await.unwrap();
+        let we = sign(
+            &alice,
+            "withdraws",
+            retraction("withdraws", &ge.attestation_id),
+        )
+        .await;
+        put(b, &we).await.unwrap();
+        let g = b.get_goal(&ge.attestation_id).await.unwrap().unwrap();
+        assert_eq!(
+            (g.goal_text.as_str(), g.attestation_id.as_str()),
+            ("e v1", e1.attestation_id.as_str()),
+            "I1178: a goal's head is the end of ITS chain"
+        );
+        assert_eq!(g.retired_at, Some(we.asserted_at));
+
+        // A LOCAL-tier retraction is not a federation retraction: a node's
+        // local scratch row naming F never retires it, whatever later row
+        // refolds F.
+        let local = crate::federation::types::LocalAttestationInput {
+            attestation_id: None,
+            attesting_key_id: alice.id.clone(),
+            attested_key_id: Some(alice.id.clone()),
+            attestation_type: "withdraws".into(),
+            weight: None,
+            expires_at: None,
+            attestation_envelope: EnvelopeCore::from_value(retraction(
+                "withdraws",
+                &gf.attestation_id,
+            ))
+            .unwrap(),
+            subject_key_ids: Vec::new(),
+            cohort_scope: cohort_scope::SELF.into(),
+            scrub_signature_classical: None,
+            scrub_signature_pqc: None,
+        };
+        let local_admitted = b.attestation_insert_local(local).await.is_ok();
+        let f2 = sign(
+            &alice,
+            "supersedes",
+            naming(&f1.attestation_id, "supersedes", body("self", "f v2", 1.0)),
+        )
+        .await;
+        put(b, &f2).await.unwrap();
+        let g = b.get_goal(&gf.attestation_id).await.unwrap().unwrap();
+        assert_eq!(g.goal_text, "f v2");
+        assert_eq!(
+            g.retired_at, None,
+            "I1178: a local-tier withdraws (admitted: {local_admitted}) retires nothing"
+        );
+        assert_eq!(live(b).await.len(), 5);
     }
 
     // ── I1179 ─────────────────────────────────────────────────────────────
@@ -560,8 +632,17 @@ pub(crate) mod engine_bodies {
             ("v2", a2.as_str())
         );
         assert_ne!(a1, a2);
+        let a1_row = dir.get_attestation(&a1).await.unwrap().unwrap();
+        assert_eq!(
+            a1_row.attestation_envelope["references_attestation_type"], "scores",
+            "I1180: the first amendment names the declaration"
+        );
         let a2_row = dir.get_attestation(&a2).await.unwrap().unwrap();
         assert!(a2_row.attestation_type == crate::federation::types::attestation_type::SUPERSEDES);
+        assert_eq!(
+            a2_row.attestation_envelope["references_attestation_type"], "supersedes",
+            "I1180: a later amendment names the amendment it replaces"
+        );
         assert_eq!(
             crate::federation::precedence::references_attestation_id_from_envelope(
                 &a2_row.attestation_envelope
@@ -640,8 +721,21 @@ pub(crate) mod engine_bodies {
             .unwrap();
         let rehomed = mine
             .iter()
-            .find(|g| g.goal_text == "legacy goal")
+            .find(|g| g.goal_text == format!("legacy goal of {me}"))
             .expect("I1180: the node's legacy goal is a row");
+        let every = dir
+            .list_goals(crate::federation::GoalsFilter {
+                include_retired: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(
+            every
+                .iter()
+                .all(|g| g.goal_text != format!("legacy goal of {other_id}")),
+            "I1180: another declarer's legacy goal is never re-signed as this node's"
+        );
         assert!(
             rehomed.retired_at.is_some(),
             "I1180: its retirement is re-signed"
@@ -752,7 +846,8 @@ mod run {
             "INSERT INTO {table} (goal_id, declared_by_key_id, declared_at, goal_text, \
              goal_text_canonical, scale, scope_cohort_id, meta_dimension, meta_rationale, \
              meta_deliberation, retired_at, persist_row_hash) VALUES ('legacy-{}', '{declarer}', \
-             '2026-01-01T00:00:00Z', 'legacy goal', 'legacy goal', 'cohort', 'c1', 'justice', \
+             '2026-01-01T00:00:00Z', 'legacy goal of {declarer}', 'legacy goal of {declarer}', \
+             'cohort', 'c1', 'justice', \
              'r', NULL, {retired}, 'h')",
             uuid::Uuid::new_v4().simple()
         )

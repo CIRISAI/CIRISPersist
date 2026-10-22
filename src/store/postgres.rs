@@ -26191,7 +26191,8 @@ where
     };
     // `refold_goal`'s three steps, over the async reads.
     let projected = match get(goal_id.to_owned()).await? {
-        Some(decl) if gp::is_goal_declaration(&decl) => {
+        // `fold_goal` answers `None` for a row that is not a goal declaration.
+        Some(decl) => {
             let naming_decl = naming(goal_id.to_owned()).await?;
             let mut head = decl.clone();
             let mut naming_head = naming_decl.clone();

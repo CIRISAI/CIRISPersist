@@ -254,9 +254,10 @@ pub async fn goal_to_refold(
         if is_goal_declaration(&target) {
             return Ok(Some(target.attestation_id));
         }
-        if target.attestation_type != attestation_type::SUPERSEDES
-            || goal_body_of(&target).is_none()
-        {
+        // Not a declaration: a link only if it carries a goal body (which,
+        // for a row that is not a `scores` declaration, means a goal
+        // `supersedes`).
+        if goal_body_of(&target).is_none() {
             return Ok(None);
         }
         match references_attestation_id_from_envelope(&target.attestation_envelope) {
