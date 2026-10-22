@@ -5338,6 +5338,15 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             .retain(|_, (id, _)| id != attestation_id);
         // v59.0.0 (#1099) — the V199 receipt (ON DELETE CASCADE).
         state.self_roster_proposals.remove(attestation_id);
+        // v60.0.0 (#988 items 1, 4) — the V203 ledger and V204 goal
+        // projections, CASCADE with the row they project (the SQL backends'
+        // foreign keys).
+        state
+            .cirisnode_ledgers
+            .retain(|_, p| p.attestation_id != attestation_id);
+        state
+            .federation_goals
+            .retain(|_, p| p.attestation_id != attestation_id);
         Ok(())
     }
 

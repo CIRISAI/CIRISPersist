@@ -224,6 +224,16 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("sqlite_project_ledger", Class::Plumbing),
     ("pg_project_ledger", Class::Plumbing),
     ("sqlite_ledger_projection_rebuild", Class::Plumbing),
+    // v60.0.0 (CIRISPersist#988 item 4) — the goals projection: the refold
+    // writers and the rebuild. Every decision is `goal_projection`'s (shared);
+    // these only read the held rows and write what the fold returns, failing
+    // on the substrate's own terms.
+    ("sqlite_project_goal", Class::Plumbing),
+    ("pg_project_goal", Class::Plumbing),
+    ("sqlite_goal_projection_rebuild", Class::Plumbing),
+    // Which declaration a put touches: a derivation answering `None` for a row
+    // that is not in a goal chain, never a refusal.
+    ("goal_to_refold", Class::Plumbing),
     // v58.0.0 (CIRISPersist#1094 item 2) — the DSAR door's erasure of
     // row-backed detections under the producer's rule-1 `withdraws`: the hard-delete
     // of the cited rows, the tombstone header + tombstone it builds (pure) and
@@ -518,6 +528,9 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // v60.0.0 (CIRISPersist#803) — the `takedown_notice:{basis}:v1` row's
     // shape and CC 4.5.5 duty-holder rule, in the shared plan.
     ("check_takedown_notice_row_admission", Class::Gate),
+    // v60.0.0 (CIRISPersist#988 item 4) — the goal family's M-1 and
+    // amendment gate, in the shared plan.
+    ("check_goal_row_admission", Class::Gate),
     // v44.6.0 (#857) — a machine author may name only itself in for_key_id;
     // refuses on the caller's input.
     ("check_consent_for_key_admission", Class::Gate),

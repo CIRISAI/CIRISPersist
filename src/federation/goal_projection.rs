@@ -34,9 +34,8 @@
 //! rows naming each link, and write what [`fold_goal`] returns.
 
 use super::goal::{canonicalize_goal_text, goal_body_of, GoalBody};
-use super::precedence::{
-    precedence_winner, references_attestation_id_from_envelope, retraction_entitled,
-};
+use super::precedence::references_attestation_id_from_envelope;
+use super::precedence::{precedence_winner, retraction_entitled};
 use super::types::{attestation_type, Attestation};
 
 /// The longest amendment chain the fold follows (a bound on the reads one
@@ -349,7 +348,9 @@ mod tests {
             Ok(all
                 .iter()
                 .filter(|r| {
-                    references_attestation_id_from_envelope(&r.attestation_envelope) == Some(id)
+                    crate::federation::precedence::is_structural_composer(&r.attestation_type)
+                        && references_attestation_id_from_envelope(&r.attestation_envelope)
+                            == Some(id)
                 })
                 .cloned()
                 .collect())

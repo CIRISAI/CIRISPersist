@@ -424,6 +424,13 @@ pub const ATTESTATION_PROJECTIONS: &[(&str, &str, ProjectionRemoval)] = &[
         "attestation_id",
         ProjectionRemoval::ForeignKeyCascade,
     ),
+    // v60.0.0 (CIRISPersist#988 item 4; V204) — `goals` is the projection of
+    // the goal rows; a goal leaves with the head row it projects.
+    (
+        "goals",
+        "attestation_id",
+        ProjectionRemoval::ForeignKeyCascade,
+    ),
 ];
 
 /// Tables with an `*attestation_id` column that are NOT projections of a

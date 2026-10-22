@@ -561,6 +561,7 @@ pub(crate) mod engine_bodies {
         );
         assert_ne!(a1, a2);
         let a2_row = dir.get_attestation(&a2).await.unwrap().unwrap();
+        assert!(a2_row.attestation_type == crate::federation::types::attestation_type::SUPERSEDES);
         assert_eq!(
             crate::federation::precedence::references_attestation_id_from_envelope(
                 &a2_row.attestation_envelope
